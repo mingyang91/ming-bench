@@ -55,4 +55,7 @@ pub enum EvalError {
 
     #[error("string is immutable at {span}")]
     ImmutableString { span: Span },
+
+    #[error("raised exception")]
+    SchemeRaise { value: Value },
 }

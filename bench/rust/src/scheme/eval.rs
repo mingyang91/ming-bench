@@ -200,7 +200,8 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     | "vector" | "make-vector" | "vector-ref" | "vector-set!"
                     | "vector-length" | "vector?" | "vector->list" | "list->vector"
                     | "apply" | "dynamic-wind" | "reverse"
-                    | "call/cc" | "call-with-current-continuation" => Ok(current_expr.clone()),
+                    | "call/cc" | "call-with-current-continuation"
+                    | "raise" | "with-exception-handler" => Ok(current_expr.clone()),
                     _ => Err(EvalError::UnboundVariable {
                         name: name.clone(),
                         span: *span,
@@ -380,6 +381,9 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                         }
                         "define-syntax" => {
                             return eval_define_syntax(&elems[1..], list_span, &current_env);
+                        }
+                        "guard" => {
+                            return eval_guard(&elems[1..], list_span, &current_env);
                         }
                         _ => {
                             // Check for macro application
@@ -1021,6 +1025,8 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, env: &Env) -> Result<Va
         "string-downcase" => builtin_string_downcase(args, span),
         "dynamic-wind" => builtin_dynamic_wind(args, span, env),
         "reverse" => builtin_reverse(args, span),
+        "raise" => builtin_raise(args, span),
+        "with-exception-handler" => builtin_with_exception_handler(args, span, env),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
             span,
@@ -2600,4 +2606,143 @@ fn builtin_list_to_vector(args: &[Value], span: Span) -> Result<Value, EvalError
         });
     };
     Ok(Value::vector(elems.clone()))
+}
+
+fn builtin_raise(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    Err(EvalError::SchemeRaise {
+        value: args[0].clone(),
+    })
+}
+
+fn builtin_with_exception_handler(
+    args: &[Value],
+    span: Span,
+    env: &Env,
+) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let handler = &args[0];
+    let thunk = &args[1];
+
+    match call_thunk(thunk, span, env) {
+        Ok(val) => Ok(val),
+        Err(EvalError::SchemeRaise { value }) => {
+            // Call the handler with the raised value
+            call_with_arg(handler, value, span, env)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Call a one-argument procedure with the given value.
+fn call_with_arg(func: &Value, arg: Value, span: Span, _env: &Env) -> Result<Value, EvalError> {
+    match func {
+        Value::Closure {
+            ref params,
+            ref rest_param,
+            ref body,
+            env: ref closure_env,
+        } => {
+            let local_env = bind_closure_args(params, rest_param, &[arg], closure_env, span)?;
+            eval(body, &local_env)
+        }
+        other => Err(EvalError::TypeMismatch {
+            expected: "procedure".to_string(),
+            got: other.to_string(),
+            span: other.span(),
+        }),
+    }
+}
+
+/// Evaluate `(guard (var clause ...) body ...)`.
+fn eval_guard(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "at least 2".to_string(),
+            got: args.len(),
+            span: form_span,
+        });
+    }
+    // First arg: (var clause1 clause2 ...)
+    let Value::List(guard_spec, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "guard clause list".to_string(),
+            got: args[0].to_string(),
+            span: args[0].span(),
+        });
+    };
+    if guard_spec.is_empty() {
+        return Err(EvalError::Parse {
+            message: "guard requires a variable".to_string(),
+            span: form_span,
+        });
+    }
+    let Value::Symbol(var_name, _) = &guard_spec[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "symbol".to_string(),
+            got: guard_spec[0].to_string(),
+            span: guard_spec[0].span(),
+        });
+    };
+    let clauses = &guard_spec[1..];
+    let body = &args[1..];
+
+    // Evaluate body expressions
+    let body_result = eval_body(body, env);
+
+    match body_result {
+        Ok(val) => Ok(val),
+        Err(EvalError::SchemeRaise { value }) => {
+            // Bind the raised value to var_name
+            let clause_env = Env::with_parent(env);
+            clause_env.define(var_name.clone(), value.clone());
+
+            // Try each clause
+            for clause in clauses {
+                let Value::List(parts, _) = clause else {
+                    return Err(EvalError::TypeMismatch {
+                        expected: "guard clause".to_string(),
+                        got: clause.to_string(),
+                        span: clause.span(),
+                    });
+                };
+                if parts.is_empty() {
+                    return Err(EvalError::Parse {
+                        message: "empty guard clause".to_string(),
+                        span: clause.span(),
+                    });
+                }
+                // Check for else clause
+                if matches!(&parts[0], Value::Symbol(s, _) if s == "else") {
+                    return eval_body(&parts[1..], &clause_env);
+                }
+                let test = eval(&parts[0], &clause_env)?;
+                if test.is_truthy() {
+                    if parts.len() == 1 {
+                        return Ok(test);
+                    }
+                    let mut last = Value::Void;
+                    for expr in &parts[1..] {
+                        last = eval(expr, &clause_env)?;
+                    }
+                    return Ok(last);
+                }
+            }
+            // No clause matched — re-raise
+            Err(EvalError::SchemeRaise { value })
+        }
+        Err(e) => Err(e),
+    }
 }
