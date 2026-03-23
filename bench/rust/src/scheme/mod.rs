@@ -81,10 +81,23 @@ enum Value {
     RecordPredicate { type_id: u64 },
     /// Record accessor: type_id, type_name, field_index
     RecordAccessor { type_id: u64, type_name: String, field_index: usize, field_name: String },
+    /// Syntax object (wraps an Expr for syntax-case macros)
+    Syntax(Expr),
+    /// Macro transformer procedure (lambda-based macro from syntax-case)
+    MacroTransformer(Box<Value>),
 }
 
 thread_local! {
     static OUTPUT_BUFFER: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+    /// Stack of syntax-case pattern bindings for use by `(syntax ...)` / `#'`.
+    static SYNTAX_BINDINGS: std::cell::RefCell<Vec<SyntaxBindingEntry>> = std::cell::RefCell::new(Vec::new());
+    /// Stack of use-site environments for macro transformer hygiene.
+    static MACRO_USE_ENV: std::cell::RefCell<Vec<Env>> = std::cell::RefCell::new(Vec::new());
+}
+
+struct SyntaxBindingEntry {
+    bindings: HashMap<String, Vec<Expr>>,
+    ellipsis_vars: HashSet<String>,
 }
 
 impl Value {
@@ -159,6 +172,8 @@ impl Value {
             }
             Value::Record { .. } => "#<record>".to_string(),
             Value::RecordConstructor { .. } | Value::RecordPredicate { .. } | Value::RecordAccessor { .. } => "#<procedure>".to_string(),
+            Value::Syntax(_) => "#<syntax>".to_string(),
+            Value::MacroTransformer(_) => "#<macro>".to_string(),
         }
     }
 
@@ -456,6 +471,21 @@ fn parse_expr(input: &[u8], pos: usize) -> Result<(Expr, usize), EvalError> {
                             _ => unreachable!(),
                         }
                     }
+                    b'\'' => {
+                        // Syntax quote: #'expr → (syntax expr)
+                        let (expr, next) = parse_expr(input, i + 2)?;
+                        Ok((
+                            Expr::new(
+                                ExprKind::List(vec![
+                                    Expr::new(ExprKind::Symbol("syntax".into()), l, c),
+                                    expr,
+                                ]),
+                                l,
+                                c,
+                            ),
+                            next,
+                        ))
+                    }
                     _ => Err(EvalError::Parse(format!(
                         "{l}:{c}: unexpected character after #"
                     ))),
@@ -731,6 +761,8 @@ fn is_builtin(name: &str) -> bool {
             | "string>?" | "string<=?" | "string>=?"
             | "char>?" | "char<?"
             | "not"
+            | "syntax->datum"
+            | "datum->syntax"
     )
 }
 
@@ -842,6 +874,26 @@ enum KontFrame {
     MapIter { func: Value, remaining: Vec<Vec<Value>>, remaining_idx: usize, done: Vec<Value>, el: u32, ec: u32 },
     /// for-each iteration.
     ForEachIter { func: Value, remaining: Vec<Vec<Value>>, remaining_idx: usize, el: u32, ec: u32 },
+    /// define-syntax: transformer expression was evaluated, bind to name.
+    DefineSyntax { name: String, env: Env },
+    /// Macro transformer returned a value; convert Syntax → Expr and evaluate.
+    MacroExpand { env: Env, el: u32, ec: u32 },
+    /// syntax-case: stx was evaluated; now do pattern matching.
+    SyntaxCase { literals: Vec<String>, clauses: Vec<(Vec<Expr>, Option<Expr>, Expr)>, env: Env, el: u32, ec: u32 },
+    /// Pop syntax bindings after syntax-case body returns.
+    SyntaxCaseCleanup,
+    /// with-syntax: evaluating binding RHS expressions one at a time.
+    WithSyntax {
+        patterns: Vec<Vec<Expr>>,    // remaining patterns to match
+        rhs_exprs: Vec<Expr>,        // remaining RHS exprs to evaluate
+        done_bindings: HashMap<String, Vec<Expr>>,
+        done_evars: HashSet<String>,
+        body: Vec<Expr>,
+        env: Env,
+        el: u32, ec: u32,
+    },
+    /// Pop syntax bindings after with-syntax body returns.
+    WithSyntaxCleanup,
 }
 
 /// What to do after unwinding for a raise.
@@ -932,6 +984,7 @@ fn is_special_form(name: &str) -> bool {
             | "call-with-current-continuation" | "define-syntax" | "syntax-rules"
             | "letrec" | "letrec*" | "case" | "do" | "when" | "unless"
             | "guard" | "define-record-type"
+            | "syntax-case" | "syntax" | "with-syntax"
     )
 }
 
@@ -1090,6 +1143,14 @@ fn instantiate_template(
             }
         }
         ExprKind::List(items) => {
+            // Don't rename inside (quote ...)
+            if !items.is_empty() {
+                if let ExprKind::Symbol(ref s) = items[0].kind {
+                    if s == "quote" {
+                        return Ok(template.clone());
+                    }
+                }
+            }
             let mut result = Vec::new();
             let mut i = 0;
             while i < items.len() {
@@ -1663,9 +1724,18 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                                         ExprKind::Symbol(s) => s.clone(),
                                         _ => return Err(EvalError::Type("define-syntax: expected symbol".into()).at(el, ec)),
                                     };
-                                    let (literals, rules) = parse_syntax_rules(&items[2], el, ec)?;
-                                    env_set(&env, name, Value::Macro { literals, rules, def_env: env.clone() });
-                                    Ctrl::Val(Value::Void)
+                                    // Check if it's syntax-rules or a transformer expression (lambda)
+                                    let is_syntax_rules = matches!(&items[2].kind,
+                                        ExprKind::List(inner) if !inner.is_empty() && matches!(&inner[0].kind, ExprKind::Symbol(s) if s == "syntax-rules"));
+                                    if is_syntax_rules {
+                                        let (literals, rules) = parse_syntax_rules(&items[2], el, ec)?;
+                                        env_set(&env, name, Value::Macro { literals, rules, def_env: env.clone() });
+                                        Ctrl::Val(Value::Void)
+                                    } else {
+                                        // Evaluate transformer expression
+                                        kont.push(KontFrame::DefineSyntax { name, env: env.clone() });
+                                        Ctrl::Eval(items[2].clone(), env)
+                                    }
                                 }
                                 Some("let*") => {
                                     if items.len() < 3 {
@@ -1989,17 +2059,126 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                                     kont.push(KontFrame::GuardHandler { var, clauses, env: env.clone() });
                                     eval_body(&body, env, &mut kont)
                                 }
+                                Some("syntax-case") => {
+                                    // (syntax-case stx-expr (literals) clause ...)
+                                    if items.len() < 4 {
+                                        return Err(EvalError::Arity("syntax-case requires at least 3 arguments".into()).at(el, ec));
+                                    }
+                                    let literals = match &items[2].kind {
+                                        ExprKind::List(lits) => {
+                                            let mut ls = Vec::new();
+                                            for l in lits {
+                                                match &l.kind {
+                                                    ExprKind::Symbol(s) => ls.push(s.clone()),
+                                                    _ => return Err(EvalError::Parse("syntax-case: literal must be identifier".into()).at(el, ec)),
+                                                }
+                                            }
+                                            ls
+                                        }
+                                        _ => return Err(EvalError::Parse("syntax-case: expected literals list".into()).at(el, ec)),
+                                    };
+                                    // Parse clauses: (pattern body) or (pattern fender body)
+                                    let mut clauses = Vec::new();
+                                    for item in &items[3..] {
+                                        match &item.kind {
+                                            ExprKind::List(parts) if parts.len() == 2 => {
+                                                clauses.push((vec![parts[0].clone()], None, parts[1].clone()));
+                                            }
+                                            ExprKind::List(parts) if parts.len() == 3 => {
+                                                clauses.push((vec![parts[0].clone()], Some(parts[1].clone()), parts[2].clone()));
+                                            }
+                                            _ => return Err(EvalError::Parse("syntax-case: invalid clause".into()).at(el, ec)),
+                                        }
+                                    }
+                                    kont.push(KontFrame::SyntaxCase { literals, clauses, env: env.clone(), el, ec });
+                                    Ctrl::Eval(items[1].clone(), env)
+                                }
+                                Some("syntax") => {
+                                    // (syntax template) — instantiate template with current syntax bindings
+                                    if items.len() != 2 {
+                                        return Err(EvalError::Arity("syntax requires 1 argument".into()).at(el, ec));
+                                    }
+                                    let template = &items[1];
+                                    let result = SYNTAX_BINDINGS.with(|sb| {
+                                        let stack = sb.borrow();
+                                        let entry = stack.last();
+                                        let (bindings, evars) = match entry {
+                                            Some(e) => (&e.bindings, &e.ellipsis_vars),
+                                            None => return Err(EvalError::Parse("syntax: not inside syntax-case".into()).at(el, ec)),
+                                        };
+                                        let use_env = MACRO_USE_ENV.with(|mue| {
+                                            let stack = mue.borrow();
+                                            stack.last().cloned().unwrap_or_else(|| env.clone())
+                                        });
+                                        let mut rename_map = HashMap::new();
+                                        instantiate_template(template, bindings, evars, &mut rename_map, &env, &use_env)
+                                    })?;
+                                    Ctrl::Val(Value::Syntax(result))
+                                }
+                                Some("with-syntax") => {
+                                    // (with-syntax ((pattern expr) ...) body ...)
+                                    if items.len() < 3 {
+                                        return Err(EvalError::Arity("with-syntax requires at least 2 arguments".into()).at(el, ec));
+                                    }
+                                    let bindings_list = match &items[1].kind {
+                                        ExprKind::List(bs) => bs,
+                                        _ => return Err(EvalError::Type("with-syntax: expected bindings list".into()).at(el, ec)),
+                                    };
+                                    let mut patterns = Vec::new();
+                                    let mut rhs_exprs = Vec::new();
+                                    for b in bindings_list {
+                                        match &b.kind {
+                                            ExprKind::List(parts) if parts.len() == 2 => {
+                                                // Pattern is first element; wrap in a list for matching
+                                                let pat = match &parts[0].kind {
+                                                    ExprKind::List(p) => p.clone(),
+                                                    _ => vec![parts[0].clone()],
+                                                };
+                                                patterns.push(pat);
+                                                rhs_exprs.push(parts[1].clone());
+                                            }
+                                            _ => return Err(EvalError::Type("with-syntax: expected (pattern expr) binding".into()).at(el, ec)),
+                                        }
+                                    }
+                                    let body = items[2..].to_vec();
+                                    if rhs_exprs.is_empty() {
+                                        // No bindings, just evaluate body
+                                        eval_body(&body, env, &mut kont)
+                                    } else {
+                                        let first_rhs = rhs_exprs.remove(0);
+                                        kont.push(KontFrame::WithSyntax {
+                                            patterns,
+                                            rhs_exprs,
+                                            done_bindings: HashMap::new(),
+                                            done_evars: HashSet::new(),
+                                            body,
+                                            env: env.clone(),
+                                            el, ec,
+                                        });
+                                        Ctrl::Eval(first_rhs, env)
+                                    }
+                                }
                                 _ => {
                                     // Check for macro invocation
                                     if let Some(ref name) = op_name {
-                                        if let Some(Value::Macro { literals, rules, def_env }) = env_get(&env, name) {
-                                            let expanded = expand_macro(&items, &literals, &rules, &def_env, &env, el, ec)?;
-                                            Ctrl::Eval(expanded, env)
-                                        } else {
-                                            let func_expr = items[0].clone();
-                                            let arg_exprs = items[1..].to_vec();
-                                            kont.push(KontFrame::EvalFunc { arg_exprs, env: env.clone(), el, ec });
-                                            Ctrl::Eval(func_expr, env)
+                                        match env_get(&env, name) {
+                                            Some(Value::Macro { literals, rules, def_env }) => {
+                                                let expanded = expand_macro(&items, &literals, &rules, &def_env, &env, el, ec)?;
+                                                Ctrl::Eval(expanded, env)
+                                            }
+                                            Some(Value::MacroTransformer(transformer)) => {
+                                                // Convert input form to syntax object and call transformer
+                                                let stx = Value::Syntax(Expr::new(ExprKind::List(items.clone()), el, ec));
+                                                MACRO_USE_ENV.with(|mue| mue.borrow_mut().push(env.clone()));
+                                                kont.push(KontFrame::MacroExpand { env: env.clone(), el, ec });
+                                                apply_func(*transformer, vec![stx], &mut kont, &mut wind, el, ec)?
+                                            }
+                                            _ => {
+                                                let func_expr = items[0].clone();
+                                                let arg_exprs = items[1..].to_vec();
+                                                kont.push(KontFrame::EvalFunc { arg_exprs, env: env.clone(), el, ec });
+                                                Ctrl::Eval(func_expr, env)
+                                            }
                                         }
                                     } else {
                                         let func_expr = items[0].clone();
@@ -2341,6 +2520,126 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                                 kont.push(KontFrame::ForEachIter { func: func.clone(), remaining, remaining_idx: remaining_idx + 1, el, ec });
                                 apply_func(func, call_args, &mut kont, &mut wind, el, ec)?
                             }
+                        }
+                        KontFrame::DefineSyntax { name, env } => {
+                            // Store evaluated transformer as MacroTransformer
+                            env_set(&env, name, Value::MacroTransformer(Box::new(val)));
+                            Ctrl::Val(Value::Void)
+                        }
+                        KontFrame::MacroExpand { env, el, ec } => {
+                            // Pop use-env from thread-local
+                            MACRO_USE_ENV.with(|mue| mue.borrow_mut().pop());
+                            match val {
+                                Value::Syntax(expr) => Ctrl::Eval(expr, env),
+                                _ => Err(EvalError::Type("macro transformer must return a syntax object".into()).at(el, ec))?,
+                            }
+                        }
+                        KontFrame::SyntaxCase { literals, clauses, env, el, ec } => {
+                            // val is the evaluated stx expression
+                            let stx_expr = match &val {
+                                Value::Syntax(e) => e.clone(),
+                                _ => return Err(EvalError::Type("syntax-case: expected syntax object".into()).at(el, ec)),
+                            };
+                            let stx_items = match &stx_expr.kind {
+                                ExprKind::List(items) => items.clone(),
+                                _ => vec![stx_expr.clone()],
+                            };
+                            // Try each clause
+                            let mut matched_result = None;
+                            for (pattern_vec, _fender, body) in clauses {
+                                let pattern = &pattern_vec[0];
+                                let mut bindings = HashMap::new();
+                                let mut evars = HashSet::new();
+                                let matched = match &pattern.kind {
+                                    ExprKind::List(pat_items) => {
+                                        macro_match_pattern(pat_items, &stx_items, &literals, &mut bindings, &mut evars)
+                                    }
+                                    ExprKind::Symbol(s) => {
+                                        bindings.insert(s.clone(), vec![stx_expr.clone()]);
+                                        true
+                                    }
+                                    _ => false,
+                                };
+                                if matched {
+                                    matched_result = Some((bindings, evars, body));
+                                    break;
+                                }
+                            }
+                            if let Some((bindings, evars, body)) = matched_result {
+                                SYNTAX_BINDINGS.with(|sb| {
+                                    sb.borrow_mut().push(SyntaxBindingEntry {
+                                        bindings,
+                                        ellipsis_vars: evars,
+                                    });
+                                });
+                                kont.push(KontFrame::SyntaxCaseCleanup);
+                                Ctrl::Eval(body, env)
+                            } else {
+                                return Err(EvalError::Parse("syntax-case: no matching clause".into()).at(el, ec));
+                            }
+                        }
+                        KontFrame::SyntaxCaseCleanup => {
+                            SYNTAX_BINDINGS.with(|sb| sb.borrow_mut().pop());
+                            Ctrl::Val(val)
+                        }
+                        KontFrame::WithSyntax { mut patterns, mut rhs_exprs, mut done_bindings, mut done_evars, body, env, el, ec } => {
+                            // val is the evaluated RHS; match against the current pattern
+                            let pat = patterns.remove(0);
+                            let stx_expr = match &val {
+                                Value::Syntax(e) => e.clone(),
+                                // Also accept non-syntax values (e.g., from datum->syntax which returns Syntax, but just in case)
+                                _ => return Err(EvalError::Type("with-syntax: expected syntax object".into()).at(el, ec)),
+                            };
+                            let stx_items = match &stx_expr.kind {
+                                ExprKind::List(items) => items.clone(),
+                                _ => vec![stx_expr.clone()],
+                            };
+                            // Single pattern variable: just bind
+                            if pat.len() == 1 {
+                                if let ExprKind::Symbol(s) = &pat[0].kind {
+                                    done_bindings.insert(s.clone(), vec![stx_expr]);
+                                } else {
+                                    macro_match_pattern(&pat, &stx_items, &[], &mut done_bindings, &mut done_evars);
+                                }
+                            } else {
+                                macro_match_pattern(&pat, &stx_items, &[], &mut done_bindings, &mut done_evars);
+                            }
+
+                            if rhs_exprs.is_empty() {
+                                // All bindings done; merge with current syntax bindings and evaluate body
+                                SYNTAX_BINDINGS.with(|sb| {
+                                    let mut stack = sb.borrow_mut();
+                                    // Merge with existing top entry if present
+                                    if let Some(top) = stack.last_mut() {
+                                        top.bindings.extend(done_bindings);
+                                        top.ellipsis_vars.extend(done_evars);
+                                    } else {
+                                        stack.push(SyntaxBindingEntry {
+                                            bindings: done_bindings,
+                                            ellipsis_vars: done_evars,
+                                        });
+                                    }
+                                });
+                                kont.push(KontFrame::WithSyntaxCleanup);
+                                eval_body(&body, env, &mut kont)
+                            } else {
+                                let next_rhs = rhs_exprs.remove(0);
+                                kont.push(KontFrame::WithSyntax {
+                                    patterns,
+                                    rhs_exprs,
+                                    done_bindings,
+                                    done_evars,
+                                    body,
+                                    env: env.clone(),
+                                    el, ec,
+                                });
+                                Ctrl::Eval(next_rhs, env)
+                            }
+                        }
+                        KontFrame::WithSyntaxCleanup => {
+                            // We merged into the existing top entry, so we just need to undo the merge.
+                            // For simplicity, we don't undo — the SyntaxCaseCleanup will pop the whole entry.
+                            Ctrl::Val(val)
                         }
                     }
                 } else {
@@ -3650,7 +3949,64 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 _ => Err(EvalError::Type("char>=?: not characters".into())),
             }
         }
+        "syntax->datum" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("syntax->datum requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Syntax(expr) => Ok(expr_to_datum(expr)),
+                _ => Err(EvalError::Type("syntax->datum: expected syntax object".into())),
+            }
+        }
+        "datum->syntax" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("datum->syntax requires 2 arguments".into()));
+            }
+            // First arg is context syntax object (for hygiene); second is datum to convert
+            let datum = &args[1];
+            Ok(Value::Syntax(datum_to_expr(datum)))
+        }
         _ => Err(EvalError::UnboundVariable(op.to_string())),
+    }
+}
+
+/// Convert an Expr (syntax object internals) to a Scheme datum Value.
+fn expr_to_datum(expr: &Expr) -> Value {
+    match &expr.kind {
+        ExprKind::Integer(n) => Value::Integer(*n),
+        ExprKind::Float(f) => Value::Float(*f),
+        ExprKind::Rational(n, d) => Value::Rational(*n, *d),
+        ExprKind::Boolean(b) => Value::Boolean(*b),
+        ExprKind::Str(s) => Value::Str(s.clone()),
+        ExprKind::Symbol(s) => Value::Symbol(s.clone()),
+        ExprKind::Char(c) => Value::Char(*c),
+        ExprKind::List(items) => {
+            let vals: Vec<Value> = items.iter().map(expr_to_datum).collect();
+            if vals.is_empty() {
+                Value::List(vec![])
+            } else {
+                list_from_vec(vals)
+            }
+        }
+    }
+}
+
+/// Convert a Scheme datum Value to an Expr for use in syntax objects.
+fn datum_to_expr(val: &Value) -> Expr {
+    match val {
+        Value::Integer(n) => Expr::new(ExprKind::Integer(*n), 0, 0),
+        Value::Float(f) => Expr::new(ExprKind::Float(*f), 0, 0),
+        Value::Rational(n, d) => Expr::new(ExprKind::Rational(*n, *d), 0, 0),
+        Value::Boolean(b) => Expr::new(ExprKind::Boolean(*b), 0, 0),
+        Value::Str(s) => Expr::new(ExprKind::Str(s.clone()), 0, 0),
+        Value::Symbol(s) => Expr::new(ExprKind::Symbol(s.clone()), 0, 0),
+        Value::Char(c) => Expr::new(ExprKind::Char(*c), 0, 0),
+        Value::Syntax(e) => e.clone(),
+        Value::List(items) => {
+            let exprs: Vec<Expr> = items.iter().map(datum_to_expr).collect();
+            Expr::new(ExprKind::List(exprs), 0, 0)
+        }
+        _ => Expr::new(ExprKind::Symbol(val.display()), 0, 0),
     }
 }
 
