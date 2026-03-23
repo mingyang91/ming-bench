@@ -10,7 +10,7 @@ type Bounce = SchemeVal | (() => Bounce);
 type SchemeVal =
   | { tag: 'number'; val: number; pos?: Pos }
   | { tag: 'boolean'; val: boolean; pos?: Pos }
-  | { tag: 'string'; val: string; pos?: Pos }
+  | { tag: 'string'; val: string; immutable?: boolean; pos?: Pos }
   | { tag: 'char'; val: string; pos?: Pos }
   | { tag: 'symbol'; val: string; pos?: Pos }
   | { tag: 'list'; val: SchemeVal[]; pos?: Pos }
@@ -167,7 +167,7 @@ function parseAtom(tok: Token): SchemeVal {
       if (c === '"') return '"';
       return c;
     });
-    return { tag: 'string', val: inner, pos: p };
+    return { tag: 'string', val: inner, immutable: true, pos: p };
   }
   if (tok.text.startsWith('#\\')) {
     const rest = tok.text.slice(2);
@@ -610,14 +610,41 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
     }
     case 'string-set!': {
       if (evalArgs.length !== 3) throw posError('string-set!: need exactly three args', p);
-      const target = evalArgs[0];
-      if (target.tag !== 'string') throw posError('string-set!: expected string', p);
-      const idx = toNumber(evalArgs[1], 'string-set!', p);
+      if (evalArgs[0].tag !== 'string') throw posError('string-set!: expected string', p);
+      if (evalArgs[0].immutable) throw posError('string-set!: strings are immutable', p);
+      const si = toNumber(evalArgs[1], 'string-set!', p);
       if (evalArgs[2].tag !== 'char') throw posError('string-set!: expected char', p);
-      const s = target.val;
-      if (idx < 0 || idx >= s.length) throw posError('string-set!: index out of range', p);
-      target.val = s.substring(0, idx) + evalArgs[2].val + s.substring(idx + 1);
+      const s0 = evalArgs[0].val;
+      if (si < 0 || si >= s0.length) throw posError('string-set!: index out of range', p);
+      evalArgs[0].val = s0.slice(0, si) + evalArgs[2].val + s0.slice(si + 1);
       return { tag: 'boolean', val: false };
+    }
+    // ── L14 String/char conversion ──
+    case 'string->list': {
+      if (evalArgs.length !== 1) throw posError('string->list: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'string') throw posError('string->list: expected string', p);
+      const chars = [...evalArgs[0].val].map(c => ({ tag: 'char' as const, val: c }));
+      return { tag: 'list', val: chars };
+    }
+    case 'list->string': {
+      if (evalArgs.length !== 1) throw posError('list->string: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'list') throw posError('list->string: expected list', p);
+      let str = '';
+      for (const el of evalArgs[0].val) {
+        if (el.tag !== 'char') throw posError('list->string: expected char in list', p);
+        str += el.val;
+      }
+      return { tag: 'string', val: str };
+    }
+    case 'char->integer': {
+      if (evalArgs.length !== 1) throw posError('char->integer: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'char') throw posError('char->integer: expected char', p);
+      return { tag: 'number', val: evalArgs[0].val.codePointAt(0)! };
+    }
+    case 'integer->char': {
+      if (evalArgs.length !== 1) throw posError('integer->char: need exactly one arg', p);
+      const n = toNumber(evalArgs[0], 'integer->char', p);
+      return { tag: 'char', val: String.fromCodePoint(n) };
     }
     case 'char?': {
       if (evalArgs.length !== 1) throw posError('char?: need exactly one arg', p);
@@ -837,7 +864,8 @@ const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=', 'not',
   'zero?', 'positive?', 'negative?', 'odd?', 'even?',
   'list-ref', 'list-tail', 'list?', 'assoc', 'eq?', 'equal?',
   'char-alphabetic?', 'char-numeric?', 'char-upcase', 'char-downcase', 'char=?', 'char<?',
-  'string=?', 'string<?', 'string-ci=?', 'string-upcase', 'string-downcase']);
+  'string=?', 'string<?', 'string-ci=?', 'string-upcase', 'string-downcase',
+  'string->list', 'list->string', 'char->integer', 'integer->char']);
 
 function parseParams(paramList: SchemeVal, p?: Pos): { params: string[]; rest?: string } {
   if (paramList.tag !== 'list') throw posError('params must be a list', p);
