@@ -28,6 +28,31 @@ thread_local! {
     static CONT_REGISTRY: RefCell<HashMap<usize, Rc<ContData>>> = RefCell::new(HashMap::new());
     static CONT_RETURN_VALUE: RefCell<Option<Value>> = RefCell::new(None);
     static CONT_RESULT_VALUE: RefCell<Option<Value>> = RefCell::new(None);
+    /// Set of cont_ids whose call/cc is still on the call stack.
+    static ACTIVE_CALLCC: RefCell<Vec<usize>> = RefCell::new(Vec::new());
+}
+
+/// Handle result from a non-tail body expression.
+/// Catches ContinuationReturn from escaped continuations (invoked outside
+/// their original call/cc dynamic extent) and discards them, allowing
+/// the body evaluation to continue with remaining expressions.
+/// Continuations invoked inside their active call/cc are propagated normally.
+fn catch_escaped_continuation(r: Result<Value, EvalError>) -> Result<(), EvalError> {
+    match r {
+        Ok(_) => Ok(()),
+        Err(EvalError::ContinuationReturn { cont_id }) => {
+            let is_active = ACTIVE_CALLCC.with(|ac| ac.borrow().contains(&cont_id));
+            if is_active {
+                // call/cc is still on the stack — propagate so it can catch
+                Err(EvalError::ContinuationReturn { cont_id })
+            } else {
+                // Escaped continuation — discard and continue
+                CONT_RETURN_VALUE.with(|v| { v.borrow_mut().take(); });
+                Ok(())
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn push_body_frame(exprs: &[Expr], env: &Env) {
@@ -50,6 +75,7 @@ fn init_cont_state() {
     CONT_REGISTRY.with(|cr| cr.borrow_mut().clear());
     CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = None);
     CONT_RESULT_VALUE.with(|v| *v.borrow_mut() = None);
+    ACTIVE_CALLCC.with(|ac| ac.borrow_mut().clear());
 }
 
 /// Evaluate a body (sequence of expressions) for continuation replay.
@@ -523,7 +549,7 @@ fn apply_tc(func: &Value, args: &[Value]) -> Result<Trampoline, EvalError> {
                     if i < body.len() - 1 {
                         let r = eval(expr, &local);
                         pop_body_frame();
-                        r?;
+                        catch_escaped_continuation(r)?;
                     } else {
                         pop_body_frame();
                         return Ok(Trampoline::TailCall {
@@ -548,7 +574,7 @@ fn apply_tc(func: &Value, args: &[Value]) -> Result<Trampoline, EvalError> {
                     if i < body.len() - 1 {
                         let r = eval(expr, &local);
                         pop_body_frame();
-                        r?;
+                        catch_escaped_continuation(r)?;
                     } else {
                         pop_body_frame();
                         return Ok(Trampoline::TailCall {
@@ -578,14 +604,17 @@ fn apply_tc(func: &Value, args: &[Value]) -> Result<Trampoline, EvalError> {
 
             let cont_val = Value::Continuation(cont_data);
 
-            match apply_value(&args[0], &[cont_val]) {
+            ACTIVE_CALLCC.with(|ac| ac.borrow_mut().push(id));
+            let result = match apply_value(&args[0], &[cont_val]) {
                 Ok(v) => Ok(Trampoline::Done(v)),
                 Err(EvalError::ContinuationReturn { cont_id }) if cont_id == id => {
                     let val = CONT_RETURN_VALUE.with(|v| v.borrow_mut().take().unwrap());
                     Ok(Trampoline::Done(val))
                 }
                 Err(e) => Err(e),
-            }
+            };
+            ACTIVE_CALLCC.with(|ac| ac.borrow_mut().retain(|&x| x != id));
+            result
         }
         Value::Continuation(cont_data) => {
             if args.len() != 1 {
@@ -781,7 +810,7 @@ fn eval_let_tc(args: &[Expr], env: &Env, span: Span) -> Result<Trampoline, EvalE
             if i < body.len() - 1 {
                 let r = eval(expr, &local);
                 pop_body_frame();
-                r?;
+                catch_escaped_continuation(r)?;
             } else {
                 pop_body_frame();
                 return Ok(Trampoline::TailCall {
@@ -816,7 +845,7 @@ fn eval_let_tc(args: &[Expr], env: &Env, span: Span) -> Result<Trampoline, EvalE
         if i < body.len() - 1 {
             let r = eval(expr, &local);
             pop_body_frame();
-            r?;
+            catch_escaped_continuation(r)?;
         } else {
             pop_body_frame();
             return Ok(Trampoline::TailCall {
@@ -837,7 +866,7 @@ fn eval_begin_tc(args: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
         if i < args.len() - 1 {
             let r = eval(expr, env);
             pop_body_frame();
-            r?;
+            catch_escaped_continuation(r)?;
         } else {
             pop_body_frame();
             return Ok(Trampoline::TailCall { expr: expr.clone(), env: env.clone() });
@@ -1479,14 +1508,27 @@ fn eval_top_level(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
     let mut last = Value::Void;
     for (i, expr) in exprs.iter().enumerate() {
         push_body_frame(&exprs[i..], env);
-        match eval(expr, env) {
-            Ok(v) => {
-                pop_body_frame();
-                last = v;
+        if i < exprs.len() - 1 {
+            match eval(expr, env) {
+                Ok(v) => {
+                    pop_body_frame();
+                    last = v;
+                }
+                Err(e) => {
+                    pop_body_frame();
+                    catch_escaped_continuation(Err(e))?;
+                }
             }
-            Err(e) => {
-                pop_body_frame();
-                return Err(e);
+        } else {
+            match eval(expr, env) {
+                Ok(v) => {
+                    pop_body_frame();
+                    last = v;
+                }
+                Err(e) => {
+                    pop_body_frame();
+                    return Err(e);
+                }
             }
         }
     }
