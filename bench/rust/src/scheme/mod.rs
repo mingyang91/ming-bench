@@ -4583,7 +4583,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let ctrl = Ctrl::Eval(exprs[0].clone(), env);
     let result = run_cek(ctrl, kont)?;
     let output = OUTPUT_BUFFER.with(|buf| buf.borrow().clone());
-    Ok((result.display(), output))
+    Ok((result.display_write(false), output))
 }
 
 /// Evaluate Scheme expressions with a step budget. Each CEK machine

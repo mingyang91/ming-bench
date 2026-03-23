@@ -1,1662 +1,1704 @@
 [
   {
-    "name": "l01_integer",
-    "level": 1,
+    "expected": "42",
     "fixture": "l01_integer.scm",
     "kind": "eval_str_ok",
-    "expected": "42"
+    "level": 1,
+    "name": "l01_integer"
   },
   {
-    "name": "l01_negative_integer",
-    "level": 1,
+    "expected": "-7",
     "fixture": "l01_negative_integer.scm",
     "kind": "eval_str_ok",
-    "expected": "-7"
+    "level": 1,
+    "name": "l01_negative_integer"
   },
   {
-    "name": "l01_true",
-    "level": 1,
+    "expected": "#t",
     "fixture": "l01_true.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 1,
+    "name": "l01_true"
   },
   {
-    "name": "l01_false",
-    "level": 1,
+    "expected": "#f",
     "fixture": "l01_false.scm",
     "kind": "eval_str_ok",
-    "expected": "#f"
+    "level": 1,
+    "name": "l01_false"
   },
   {
-    "name": "l01_string",
-    "level": 1,
+    "expected": "\"hello\"",
     "fixture": "l01_string.scm",
     "kind": "eval_str_ok",
-    "expected": "\"hello\""
+    "level": 1,
+    "name": "l01_string"
   },
   {
-    "name": "l01_add",
-    "level": 1,
+    "expected": "3",
     "fixture": "l01_add.scm",
     "kind": "eval_str_ok",
-    "expected": "3"
+    "level": 1,
+    "name": "l01_add"
   },
   {
-    "name": "l01_sub",
-    "level": 1,
+    "expected": "7",
     "fixture": "l01_sub.scm",
     "kind": "eval_str_ok",
-    "expected": "7"
+    "level": 1,
+    "name": "l01_sub"
   },
   {
-    "name": "l01_mul",
-    "level": 1,
+    "expected": "20",
     "fixture": "l01_mul.scm",
     "kind": "eval_str_ok",
-    "expected": "20"
+    "level": 1,
+    "name": "l01_mul"
   },
   {
-    "name": "l01_div",
-    "level": 1,
+    "expected": "5",
     "fixture": "l01_div.scm",
     "kind": "eval_str_ok",
-    "expected": "5"
+    "level": 1,
+    "name": "l01_div"
   },
   {
-    "name": "l01_variadic_add",
-    "level": 1,
+    "expected": "10",
     "fixture": "l01_variadic_add.scm",
     "kind": "eval_str_ok",
-    "expected": "10"
+    "level": 1,
+    "name": "l01_variadic_add"
   },
   {
-    "name": "l01_unary_minus",
-    "level": 1,
+    "expected": "-10",
     "fixture": "l01_unary_minus.scm",
     "kind": "eval_str_ok",
-    "expected": "-10"
+    "level": 1,
+    "name": "l01_unary_minus"
   },
   {
-    "name": "l01_nested_arith",
-    "level": 1,
+    "expected": "12",
     "fixture": "l01_nested_arith.scm",
     "kind": "eval_str_ok",
-    "expected": "12"
+    "level": 1,
+    "name": "l01_nested_arith"
   },
   {
-    "name": "l01_less_than",
-    "level": 1,
+    "expected": "#t",
     "fixture": "l01_less_than.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 1,
+    "name": "l01_less_than"
   },
   {
-    "name": "l01_greater_than",
-    "level": 1,
+    "expected": "#f",
     "fixture": "l01_greater_than.scm",
     "kind": "eval_str_ok",
-    "expected": "#f"
+    "level": 1,
+    "name": "l01_greater_than"
   },
   {
-    "name": "l01_equal",
-    "level": 1,
+    "expected": "#t",
     "fixture": "l01_equal.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 1,
+    "name": "l01_equal"
   },
   {
-    "name": "l01_less_equal",
-    "level": 1,
+    "expected": "#t",
     "fixture": "l01_less_equal.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 1,
+    "name": "l01_less_equal"
   },
   {
-    "name": "l01_not",
-    "level": 1,
+    "expected": "#f",
     "fixture": "l01_not.scm",
     "kind": "eval_str_ok",
-    "expected": "#f"
+    "level": 1,
+    "name": "l01_not"
   },
   {
-    "name": "l01_and",
-    "level": 1,
+    "expected": "#f",
     "fixture": "l01_and.scm",
     "kind": "eval_str_ok",
-    "expected": "#f"
+    "level": 1,
+    "name": "l01_and"
   },
   {
-    "name": "l01_or",
-    "level": 1,
+    "expected": "5",
     "fixture": "l01_or.scm",
     "kind": "eval_str_ok",
-    "expected": "5"
+    "level": 1,
+    "name": "l01_or"
   },
   {
-    "name": "l02_if_true",
-    "level": 2,
+    "expected": "1",
     "fixture": "l02_if_true.scm",
     "kind": "eval_str_ok",
-    "expected": "1"
+    "level": 2,
+    "name": "l02_if_true"
   },
   {
-    "name": "l02_if_false",
-    "level": 2,
+    "expected": "2",
     "fixture": "l02_if_false.scm",
     "kind": "eval_str_ok",
-    "expected": "2"
+    "level": 2,
+    "name": "l02_if_false"
   },
   {
-    "name": "l02_if_expr",
-    "level": 2,
+    "expected": "10",
     "fixture": "l02_if_expr.scm",
     "kind": "eval_str_ok",
-    "expected": "10"
+    "level": 2,
+    "name": "l02_if_expr"
   },
   {
-    "name": "l02_define_var",
-    "level": 2,
+    "expected": "5",
     "fixture": "l02_define_var.scm",
     "kind": "eval_str_ok",
-    "expected": "5"
+    "level": 2,
+    "name": "l02_define_var"
   },
   {
-    "name": "l02_define_use",
-    "level": 2,
+    "expected": "4",
     "fixture": "l02_define_use.scm",
     "kind": "eval_str_ok",
-    "expected": "4"
+    "level": 2,
+    "name": "l02_define_use"
   },
   {
-    "name": "l02_define_multi",
-    "level": 2,
+    "expected": "30",
     "fixture": "l02_define_multi.scm",
     "kind": "eval_str_ok",
-    "expected": "30"
+    "level": 2,
+    "name": "l02_define_multi"
   },
   {
-    "name": "l02_quote",
-    "level": 2,
+    "expected": "(1 2 3)",
     "fixture": "l02_quote.scm",
     "kind": "eval_str_ok",
-    "expected": "(1 2 3)"
+    "level": 2,
+    "name": "l02_quote"
   },
   {
-    "name": "l02_lambda_call",
-    "level": 2,
+    "expected": "6",
     "fixture": "l02_lambda_call.scm",
     "kind": "eval_str_ok",
-    "expected": "6"
+    "level": 2,
+    "name": "l02_lambda_call"
   },
   {
-    "name": "l02_lambda_multi_param",
-    "level": 2,
+    "expected": "7",
     "fixture": "l02_lambda_multi_param.scm",
     "kind": "eval_str_ok",
-    "expected": "7"
+    "level": 2,
+    "name": "l02_lambda_multi_param"
   },
   {
-    "name": "l02_define_fn",
-    "level": 2,
+    "expected": "25",
     "fixture": "l02_define_fn.scm",
     "kind": "eval_str_ok",
-    "expected": "25"
+    "level": 2,
+    "name": "l02_define_fn"
   },
   {
-    "name": "l02_closure",
-    "level": 2,
+    "expected": "7",
     "fixture": "l02_closure.scm",
     "kind": "eval_str_ok",
-    "expected": "7"
+    "level": 2,
+    "name": "l02_closure"
   },
   {
-    "name": "l02_higher_order",
-    "level": 2,
+    "expected": "2",
     "fixture": "l02_higher_order.scm",
     "kind": "eval_str_ok",
-    "expected": "2"
+    "level": 2,
+    "name": "l02_higher_order"
   },
   {
-    "name": "l02_factorial",
-    "level": 2,
+    "expected": "120",
     "fixture": "l02_factorial.scm",
     "kind": "eval_str_ok",
-    "expected": "120"
+    "level": 2,
+    "name": "l02_factorial"
   },
   {
-    "name": "l02_fibonacci",
-    "level": 2,
+    "expected": "55",
     "fixture": "l02_fibonacci.scm",
     "kind": "eval_str_ok",
-    "expected": "55"
+    "level": 2,
+    "name": "l02_fibonacci"
   },
   {
-    "name": "l03_cons",
-    "level": 3,
+    "expected": "(1)",
     "fixture": "l03_cons.scm",
     "kind": "eval_str_ok",
-    "expected": "(1)"
+    "level": 3,
+    "name": "l03_cons"
   },
   {
-    "name": "l03_cons_chain",
-    "level": 3,
+    "expected": "(1 2 3)",
     "fixture": "l03_cons_chain.scm",
     "kind": "eval_str_ok",
-    "expected": "(1 2 3)"
+    "level": 3,
+    "name": "l03_cons_chain"
   },
   {
-    "name": "l03_car",
-    "level": 3,
+    "expected": "1",
     "fixture": "l03_car.scm",
     "kind": "eval_str_ok",
-    "expected": "1"
+    "level": 3,
+    "name": "l03_car"
   },
   {
-    "name": "l03_cdr",
-    "level": 3,
+    "expected": "(2 3)",
     "fixture": "l03_cdr.scm",
     "kind": "eval_str_ok",
-    "expected": "(2 3)"
+    "level": 3,
+    "name": "l03_cdr"
   },
   {
-    "name": "l03_null_true",
-    "level": 3,
+    "expected": "#t",
     "fixture": "l03_null_true.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 3,
+    "name": "l03_null_true"
   },
   {
-    "name": "l03_null_false",
-    "level": 3,
+    "expected": "#f",
     "fixture": "l03_null_false.scm",
     "kind": "eval_str_ok",
-    "expected": "#f"
+    "level": 3,
+    "name": "l03_null_false"
   },
   {
-    "name": "l03_list",
-    "level": 3,
+    "expected": "(1 2 3)",
     "fixture": "l03_list.scm",
     "kind": "eval_str_ok",
-    "expected": "(1 2 3)"
+    "level": 3,
+    "name": "l03_list"
   },
   {
-    "name": "l03_length",
-    "level": 3,
+    "expected": "3",
     "fixture": "l03_length.scm",
     "kind": "eval_str_ok",
-    "expected": "3"
+    "level": 3,
+    "name": "l03_length"
   },
   {
-    "name": "l03_count",
-    "level": 3,
+    "expected": "3",
     "fixture": "l03_count.scm",
     "kind": "eval_str_ok",
-    "expected": "3"
+    "level": 3,
+    "name": "l03_count"
   },
   {
-    "name": "l03_append",
-    "level": 3,
+    "expected": "(1 2 3 4)",
     "fixture": "l03_append.scm",
     "kind": "eval_str_ok",
-    "expected": "(1 2 3 4)"
+    "level": 3,
+    "name": "l03_append"
   },
   {
-    "name": "l03_reverse",
-    "level": 3,
+    "expected": "(3 2 1)",
     "fixture": "l03_reverse.scm",
     "kind": "eval_str_ok",
-    "expected": "(3 2 1)"
+    "level": 3,
+    "name": "l03_reverse"
   },
   {
-    "name": "l03_map",
-    "level": 3,
+    "expected": "(1 4 9 16)",
     "fixture": "l03_map.scm",
     "kind": "eval_str_ok",
-    "expected": "(1 4 9 16)"
+    "level": 3,
+    "name": "l03_map"
   },
   {
-    "name": "l03_filter",
-    "level": 3,
+    "expected": "(3 4 5)",
     "fixture": "l03_filter.scm",
     "kind": "eval_str_ok",
-    "expected": "(3 4 5)"
+    "level": 3,
+    "name": "l03_filter"
   },
   {
-    "name": "l03_let",
-    "level": 3,
+    "expected": "3",
     "fixture": "l03_let.scm",
     "kind": "eval_str_ok",
-    "expected": "3"
+    "level": 3,
+    "name": "l03_let"
   },
   {
-    "name": "l03_nested_let",
-    "level": 3,
+    "expected": "6",
     "fixture": "l03_nested_let.scm",
     "kind": "eval_str_ok",
-    "expected": "6"
+    "level": 3,
+    "name": "l03_nested_let"
   },
   {
-    "name": "l03_begin",
-    "level": 3,
+    "expected": "3",
     "fixture": "l03_begin.scm",
     "kind": "eval_str_ok",
-    "expected": "3"
+    "level": 3,
+    "name": "l03_begin"
   },
   {
-    "name": "l03_cond",
-    "level": 3,
+    "expected": "20",
     "fixture": "l03_cond.scm",
     "kind": "eval_str_ok",
-    "expected": "20"
+    "level": 3,
+    "name": "l03_cond"
   },
   {
-    "name": "l03_cond_else",
-    "level": 3,
+    "expected": "2",
     "fixture": "l03_cond_else.scm",
     "kind": "eval_str_ok",
-    "expected": "2"
+    "level": 3,
+    "name": "l03_cond_else"
   },
   {
-    "name": "l03_begin_define",
-    "level": 3,
+    "expected": "2",
     "fixture": "l03_begin_define.scm",
     "kind": "eval_str_ok",
-    "expected": "2"
+    "level": 3,
+    "name": "l03_begin_define"
   },
   {
-    "name": "l03_string_pred",
-    "level": 3,
+    "expected": "#t",
     "fixture": "l03_string_pred.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 3,
+    "name": "l03_string_pred"
   },
   {
-    "name": "l03_number_pred",
-    "level": 3,
+    "expected": "#t",
     "fixture": "l03_number_pred.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 3,
+    "name": "l03_number_pred"
   },
   {
-    "name": "l03_boolean_pred",
-    "level": 3,
+    "expected": "#t",
     "fixture": "l03_boolean_pred.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 3,
+    "name": "l03_boolean_pred"
   },
   {
-    "name": "l03_pair_pred",
-    "level": 3,
+    "expected": "#t",
     "fixture": "l03_pair_pred.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 3,
+    "name": "l03_pair_pred"
   },
   {
-    "name": "l03_symbol_pred",
-    "level": 3,
+    "expected": "#t",
     "fixture": "l03_symbol_pred.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 3,
+    "name": "l03_symbol_pred"
   },
   {
-    "name": "l04_error_undefined_var",
-    "level": 4,
     "fixture": "l04_error_undefined_var.scm",
-    "kind": "eval_str_err_with_position"
+    "kind": "eval_str_err_with_position",
+    "level": 4,
+    "name": "l04_error_undefined_var"
   },
   {
-    "name": "l04_error_wrong_arg_count",
-    "level": 4,
     "fixture": "l04_error_wrong_arg_count.scm",
-    "kind": "eval_str_err_with_position"
+    "kind": "eval_str_err_with_position",
+    "level": 4,
+    "name": "l04_error_wrong_arg_count"
   },
   {
-    "name": "l04_error_type_mismatch",
-    "level": 4,
     "fixture": "l04_error_type_mismatch.scm",
-    "kind": "eval_str_err_with_position"
+    "kind": "eval_str_err_with_position",
+    "level": 4,
+    "name": "l04_error_type_mismatch"
   },
   {
-    "name": "l04_error_syntax",
-    "level": 4,
     "fixture": "l04_error_syntax.scm",
-    "kind": "eval_str_err_with_position"
+    "kind": "eval_str_err_with_position",
+    "level": 4,
+    "name": "l04_error_syntax"
   },
   {
-    "name": "l04_error_division_by_zero",
-    "level": 4,
     "fixture": "l04_error_division_by_zero.scm",
-    "kind": "eval_str_err_with_position"
-  },
-  {
-    "name": "l04_error_not_a_procedure",
+    "kind": "eval_str_err_with_position",
     "level": 4,
-    "fixture": "l04_error_not_a_procedure.scm",
-    "kind": "eval_str_err_with_position"
+    "name": "l04_error_division_by_zero"
   },
   {
-    "name": "l05_display_number",
-    "level": 5,
+    "fixture": "l04_error_not_a_procedure.scm",
+    "kind": "eval_str_err_with_position",
+    "level": 4,
+    "name": "l04_error_not_a_procedure"
+  },
+  {
+    "expected_output": "42",
     "fixture": "l05_display_number.scm",
     "kind": "eval_str_with_output",
-    "expected_output": "42"
+    "level": 5,
+    "name": "l05_display_number"
   },
   {
-    "name": "l05_display_string",
-    "level": 5,
+    "expected_output": "hello",
     "fixture": "l05_display_string.scm",
     "kind": "eval_str_with_output",
-    "expected_output": "hello"
+    "level": 5,
+    "name": "l05_display_string"
   },
   {
-    "name": "l05_write_string",
-    "level": 5,
+    "expected_output": "\"hello\"",
     "fixture": "l05_write_string.scm",
     "kind": "eval_str_with_output",
-    "expected_output": "\"hello\""
+    "level": 5,
+    "name": "l05_write_string"
   },
   {
-    "name": "l05_newline",
-    "level": 5,
+    "expected_output": "\n",
     "fixture": "l05_newline.scm",
     "kind": "eval_str_with_output",
-    "expected_output": "\n"
+    "level": 5,
+    "name": "l05_newline"
   },
   {
-    "name": "l05_display_list",
-    "level": 5,
+    "expected_output": "(1 2 3)",
     "fixture": "l05_display_list.scm",
     "kind": "eval_str_with_output",
-    "expected_output": "(1 2 3)"
+    "level": 5,
+    "name": "l05_display_list"
   },
   {
-    "name": "l05_multiple_display",
-    "level": 5,
+    "expected_output": "123",
     "fixture": "l05_multiple_display.scm",
     "kind": "eval_str_with_output",
-    "expected_output": "123"
+    "level": 5,
+    "name": "l05_multiple_display"
   },
   {
-    "name": "l05_string_append",
-    "level": 5,
+    "expected": "\"hello world\"",
     "fixture": "l05_string_append.scm",
     "kind": "eval_str_ok",
-    "expected": "\"hello world\""
+    "level": 5,
+    "name": "l05_string_append"
   },
   {
-    "name": "l05_string_length",
-    "level": 5,
+    "expected": "5",
     "fixture": "l05_string_length.scm",
     "kind": "eval_str_ok",
-    "expected": "5"
+    "level": 5,
+    "name": "l05_string_length"
   },
   {
-    "name": "l05_substring",
-    "level": 5,
+    "expected": "\"world\"",
     "fixture": "l05_substring.scm",
     "kind": "eval_str_ok",
-    "expected": "\"world\""
+    "level": 5,
+    "name": "l05_substring"
   },
   {
-    "name": "l05_string_to_number",
-    "level": 5,
+    "expected": "42",
     "fixture": "l05_string_to_number.scm",
     "kind": "eval_str_ok",
-    "expected": "42"
+    "level": 5,
+    "name": "l05_string_to_number"
   },
   {
-    "name": "l05_number_to_string",
-    "level": 5,
+    "expected": "\"42\"",
     "fixture": "l05_number_to_string.scm",
     "kind": "eval_str_ok",
-    "expected": "\"42\""
+    "level": 5,
+    "name": "l05_number_to_string"
   },
   {
-    "name": "l05_symbol_string_roundtrip",
-    "level": 5,
+    "expected": "hello",
     "fixture": "l05_symbol_string_roundtrip.scm",
     "kind": "eval_str_ok",
-    "expected": "hello"
+    "level": 5,
+    "name": "l05_symbol_string_roundtrip"
   },
   {
-    "name": "l05_string_ref_and_char",
-    "level": 5,
+    "expected": "#t",
     "fixture": "l05_string_ref_and_char.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 5,
+    "name": "l05_string_ref_and_char"
   },
   {
-    "name": "l06_string_set",
-    "level": 6,
+    "deprecated_after": 13,
+    "expected": "\"Horld\"",
     "fixture": "l06_string_set.scm",
     "kind": "eval_str_ok",
-    "expected": "\"Horld\"",
-    "deprecated_after": 13
+    "level": 6,
+    "name": "l06_string_set"
   },
   {
-    "name": "l06_string_copy",
-    "level": 6,
+    "expected": "\"hello\"",
     "fixture": "l06_string_copy.scm",
     "kind": "eval_str_ok",
-    "expected": "\"hello\""
+    "level": 6,
+    "name": "l06_string_copy"
   },
   {
-    "name": "l06_string_set_multiple",
-    "level": 6,
+    "deprecated_after": 13,
+    "expected": "\"HELLO\"",
     "fixture": "l06_string_set_multiple.scm",
     "kind": "eval_str_ok",
-    "expected": "\"HELLO\"",
-    "deprecated_after": 13
+    "level": 6,
+    "name": "l06_string_set_multiple"
   },
   {
-    "name": "l14_string_set_error",
-    "level": 14,
     "fixture": "l14_string_set_error.scm",
-    "kind": "eval_str_err"
+    "kind": "eval_str_err",
+    "level": 14,
+    "name": "l14_string_set_error"
   },
   {
-    "name": "l14_string_to_list",
-    "level": 14,
+    "expected": "(#\\h #\\e #\\l #\\l #\\o)",
     "fixture": "l14_string_to_list.scm",
     "kind": "eval_str_ok",
-    "expected": "(#\\h #\\e #\\l #\\l #\\o)"
+    "level": 14,
+    "name": "l14_string_to_list"
   },
   {
-    "name": "l14_list_to_string",
-    "level": 14,
+    "expected": "\"hello\"",
     "fixture": "l14_list_to_string.scm",
     "kind": "eval_str_ok",
-    "expected": "\"hello\""
+    "level": 14,
+    "name": "l14_list_to_string"
   },
   {
-    "name": "l14_string_transform_via_list",
-    "level": 14,
+    "expected": "\"HELLO\"",
     "fixture": "l14_string_transform_via_list.scm",
     "kind": "eval_str_ok",
-    "expected": "\"HELLO\""
+    "level": 14,
+    "name": "l14_string_transform_via_list"
   },
   {
-    "name": "l07_tco_loop",
-    "level": 7,
+    "expected": "done",
     "fixture": "l07_tco_loop.scm",
     "kind": "eval_str_ok",
-    "expected": "done"
+    "level": 7,
+    "name": "l07_tco_loop"
   },
   {
-    "name": "l07_tco_fact_iter",
-    "level": 7,
+    "expected": "2432902008176640000",
     "fixture": "l07_tco_fact_iter.scm",
     "kind": "eval_str_ok",
-    "expected": "2432902008176640000"
+    "level": 7,
+    "name": "l07_tco_fact_iter"
   },
   {
-    "name": "l07_tco_mutual_recursion",
-    "level": 7,
+    "expected": "#t",
     "fixture": "l07_tco_mutual_recursion.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 7,
+    "name": "l07_tco_mutual_recursion"
   },
   {
-    "name": "l07_tco_cond",
-    "level": 7,
+    "expected": "done",
     "fixture": "l07_tco_cond.scm",
     "kind": "eval_str_ok",
-    "expected": "done"
+    "level": 7,
+    "name": "l07_tco_cond"
   },
   {
-    "name": "l07_tco_named_let",
-    "level": 7,
+    "expected": "done",
     "fixture": "l07_tco_named_let.scm",
     "kind": "eval_str_ok",
-    "expected": "done"
+    "level": 7,
+    "name": "l07_tco_named_let"
   },
   {
-    "name": "l07_tco_and_or",
-    "level": 7,
+    "expected": "#t",
     "fixture": "l07_tco_and_or.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 7,
+    "name": "l07_tco_and_or"
   },
   {
-    "name": "l07_tco_begin",
-    "level": 7,
+    "expected": "done",
     "fixture": "l07_tco_begin.scm",
     "kind": "eval_str_ok",
-    "expected": "done"
+    "level": 7,
+    "name": "l07_tco_begin"
   },
   {
-    "name": "l07_tco_let_body",
-    "level": 7,
+    "expected": "done",
     "fixture": "l07_tco_let_body.scm",
     "kind": "eval_str_ok",
-    "expected": "done"
+    "level": 7,
+    "name": "l07_tco_let_body"
   },
   {
-    "name": "l08_set_basic",
-    "level": 8,
+    "expected": "2",
     "fixture": "l08_set_basic.scm",
     "kind": "eval_str_ok",
-    "expected": "2"
+    "level": 8,
+    "name": "l08_set_basic"
   },
   {
-    "name": "l08_set_unbound_error",
-    "level": 8,
     "fixture": "l08_set_unbound_error.scm",
-    "kind": "eval_str_err"
+    "kind": "eval_str_err",
+    "level": 8,
+    "name": "l08_set_unbound_error"
   },
   {
-    "name": "l08_counter",
-    "level": 8,
+    "expected": "3",
     "fixture": "l08_counter.scm",
     "kind": "eval_str_ok",
-    "expected": "3"
+    "level": 8,
+    "name": "l08_counter"
   },
   {
-    "name": "l08_shared_state",
-    "level": 8,
+    "expected": "42",
     "fixture": "l08_shared_state.scm",
     "kind": "eval_str_ok",
-    "expected": "42"
+    "level": 8,
+    "name": "l08_shared_state"
   },
   {
-    "name": "l08_set_in_loop",
-    "level": 8,
+    "expected": "55",
     "fixture": "l08_set_in_loop.scm",
     "kind": "eval_str_ok",
-    "expected": "55"
+    "level": 8,
+    "name": "l08_set_in_loop"
   },
   {
-    "name": "l09_rest_args",
-    "level": 9,
+    "expected": "(2 3)",
     "fixture": "l09_rest_args.scm",
     "kind": "eval_str_ok",
-    "expected": "(2 3)"
+    "level": 9,
+    "name": "l09_rest_args"
   },
   {
-    "name": "l09_rest_args_empty",
-    "level": 9,
+    "expected": "()",
     "fixture": "l09_rest_args_empty.scm",
     "kind": "eval_str_ok",
-    "expected": "()"
+    "level": 9,
+    "name": "l09_rest_args_empty"
   },
   {
-    "name": "l09_apply_builtin",
-    "level": 9,
+    "expected": "6",
     "fixture": "l09_apply_builtin.scm",
     "kind": "eval_str_ok",
-    "expected": "6"
+    "level": 9,
+    "name": "l09_apply_builtin"
   },
   {
-    "name": "l09_apply_prefix_args",
-    "level": 9,
+    "expected": "10",
     "fixture": "l09_apply_prefix_args.scm",
     "kind": "eval_str_ok",
-    "expected": "10"
+    "level": 9,
+    "name": "l09_apply_prefix_args"
   },
   {
-    "name": "l09_apply_user_fn",
-    "level": 9,
+    "expected": "15",
     "fixture": "l09_apply_user_fn.scm",
     "kind": "eval_str_ok",
-    "expected": "15"
+    "level": 9,
+    "name": "l09_apply_user_fn"
   },
   {
-    "name": "l09_apply_as_value",
-    "level": 9,
+    "expected": "6",
     "fixture": "l09_apply_as_value.scm",
     "kind": "eval_str_ok",
-    "expected": "6"
+    "level": 9,
+    "name": "l09_apply_as_value"
   },
   {
-    "name": "l10_callcc_nonlocal_exit",
-    "level": 10,
+    "expected": "42",
     "fixture": "l10_callcc_nonlocal_exit.scm",
     "kind": "eval_str_ok",
-    "expected": "42"
+    "level": 10,
+    "name": "l10_callcc_nonlocal_exit"
   },
   {
-    "name": "l10_callcc_no_escape",
-    "level": 10,
+    "expected": "7",
     "fixture": "l10_callcc_no_escape.scm",
     "kind": "eval_str_ok",
-    "expected": "7"
+    "level": 10,
+    "name": "l10_callcc_no_escape"
   },
   {
-    "name": "l10_callcc_early_return",
-    "level": 10,
+    "expected": "-2",
     "fixture": "l10_callcc_early_return.scm",
     "kind": "eval_str_ok",
-    "expected": "-2"
+    "level": 10,
+    "name": "l10_callcc_early_return"
   },
   {
-    "name": "l10_callcc_saved_continuation",
-    "level": 10,
+    "expected": "42",
     "fixture": "l10_callcc_saved_continuation.scm",
     "kind": "eval_str_ok",
-    "expected": "42"
+    "level": 10,
+    "name": "l10_callcc_saved_continuation"
   },
   {
-    "name": "l10_callcc_as_value",
-    "level": 10,
+    "expected": "11",
     "fixture": "l10_callcc_as_value.scm",
     "kind": "eval_str_ok",
-    "expected": "11"
+    "level": 10,
+    "name": "l10_callcc_as_value"
   },
   {
-    "name": "l10_callcc_reentrant",
-    "level": 10,
+    "expected": "3",
     "fixture": "l10_callcc_reentrant.scm",
     "kind": "eval_str_ok",
-    "expected": "3"
+    "level": 10,
+    "name": "l10_callcc_reentrant"
   },
   {
-    "name": "l10_callcc_exception_handler",
-    "level": 10,
+    "expected": "(error 42)",
     "fixture": "l10_callcc_exception_handler.scm",
     "kind": "eval_str_ok",
-    "expected": "(error 42)"
+    "level": 10,
+    "name": "l10_callcc_exception_handler"
   },
   {
-    "name": "l10_callcc_is_first_class",
-    "level": 10,
+    "expected": "7",
     "fixture": "l10_callcc_is_first_class.scm",
     "kind": "eval_str_ok",
-    "expected": "7"
+    "level": 10,
+    "name": "l10_callcc_is_first_class"
   },
   {
-    "name": "l10_callcc_resumes_lambda_body",
-    "level": 10,
+    "expected": "3",
     "fixture": "l10_callcc_resumes_lambda_body.scm",
     "kind": "eval_str_ok",
-    "expected": "3"
+    "level": 10,
+    "name": "l10_callcc_resumes_lambda_body"
   },
   {
-    "name": "l10_callcc_resumes_pending_application",
-    "level": 10,
+    "expected": "43",
     "fixture": "l10_callcc_resumes_pending_application.scm",
     "kind": "eval_str_ok",
-    "expected": "43"
+    "level": 10,
+    "name": "l10_callcc_resumes_pending_application"
   },
   {
-    "name": "l11_simple_macro",
-    "level": 11,
+    "expected": "1",
     "fixture": "l11_simple_macro.scm",
     "kind": "eval_str_ok",
-    "expected": "1"
+    "level": 11,
+    "name": "l11_simple_macro"
   },
   {
-    "name": "l11_my_and_macro",
-    "level": 11,
+    "expected": "3",
     "fixture": "l11_my_and_macro.scm",
     "kind": "eval_str_ok",
-    "expected": "3"
+    "level": 11,
+    "name": "l11_my_and_macro"
   },
   {
-    "name": "l11_swap_hygiene",
-    "level": 11,
+    "expected": "(2 1)",
     "fixture": "l11_swap_hygiene.scm",
     "kind": "eval_str_ok",
-    "expected": "(2 1)"
+    "level": 11,
+    "name": "l11_swap_hygiene"
   },
   {
-    "name": "l11_variadic_pattern",
-    "level": 11,
+    "expected": "(1 2 3)",
     "fixture": "l11_variadic_pattern.scm",
     "kind": "eval_str_ok",
-    "expected": "(1 2 3)"
+    "level": 11,
+    "name": "l11_variadic_pattern"
   },
   {
-    "name": "l11_nested_macro",
-    "level": 11,
+    "expected": "2",
     "fixture": "l11_nested_macro.scm",
     "kind": "eval_str_ok",
-    "expected": "2"
+    "level": 11,
+    "name": "l11_nested_macro"
   },
   {
-    "name": "l11_macro_keeps_definition_site_binding",
-    "level": 11,
+    "expected": "10",
     "fixture": "l11_macro_keeps_definition_site_binding.scm",
     "kind": "eval_str_ok",
-    "expected": "10"
+    "level": 11,
+    "name": "l11_macro_keeps_definition_site_binding"
   },
   {
-    "name": "l12_callcc_with_mutation",
-    "level": 12,
+    "expected": "4",
     "fixture": "l12_callcc_with_mutation.scm",
     "kind": "eval_str_ok",
-    "expected": "4"
+    "level": 12,
+    "name": "l12_callcc_with_mutation"
   },
   {
-    "name": "l12_macro_tco_loop",
-    "level": 12,
+    "expected": "1000000",
     "fixture": "l12_macro_tco_loop.scm",
     "kind": "eval_str_ok",
-    "expected": "1000000"
+    "level": 12,
+    "name": "l12_macro_tco_loop"
   },
   {
-    "name": "l12_callcc_try_catch",
-    "level": 12,
+    "expected": "(caught 42)",
     "fixture": "l12_callcc_try_catch.scm",
     "kind": "eval_str_ok",
-    "expected": "(caught 42)"
+    "level": 12,
+    "name": "l12_callcc_try_catch"
   },
   {
-    "name": "l12_coroutine_scheduler",
-    "level": 12,
+    "expected": "6",
     "fixture": "l12_coroutine_scheduler.scm",
     "kind": "eval_str_ok",
-    "expected": "6"
+    "level": 12,
+    "name": "l12_coroutine_scheduler"
   },
   {
-    "name": "l12_church_booleans_with_callcc",
-    "level": 12,
+    "expected": "yes",
     "fixture": "l12_church_booleans_with_callcc.scm",
     "kind": "eval_str_ok",
-    "expected": "yes"
+    "level": 12,
+    "name": "l12_church_booleans_with_callcc"
   },
   {
-    "name": "l15_equal_numbers",
-    "level": 15,
+    "expected": "#t",
     "fixture": "l15_equal_numbers.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 15,
+    "name": "l15_equal_numbers"
   },
   {
-    "name": "l15_equal_strings",
-    "level": 15,
+    "expected": "#t",
     "fixture": "l15_equal_strings.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 15,
+    "name": "l15_equal_strings"
   },
   {
-    "name": "l15_equal_nested_lists",
-    "level": 15,
+    "expected": "#t",
     "fixture": "l15_equal_nested_lists.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 15,
+    "name": "l15_equal_nested_lists"
   },
   {
-    "name": "l15_equal_different_types",
-    "level": 15,
+    "expected": "#f",
     "fixture": "l15_equal_different_types.scm",
     "kind": "eval_str_ok",
-    "expected": "#f"
+    "level": 15,
+    "name": "l15_equal_different_types"
   },
   {
-    "name": "l15_letrec_simple",
-    "level": 15,
+    "expected": "120",
     "fixture": "l15_letrec_simple.scm",
     "kind": "eval_str_ok",
-    "expected": "120"
+    "level": 15,
+    "name": "l15_letrec_simple"
   },
   {
-    "name": "l15_letrec_mutual",
-    "level": 15,
+    "expected": "#t",
     "fixture": "l15_letrec_mutual.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 15,
+    "name": "l15_letrec_mutual"
   },
   {
-    "name": "l15_letrec_star",
-    "level": 15,
+    "expected": "2",
     "fixture": "l15_letrec_star.scm",
     "kind": "eval_str_ok",
-    "expected": "2"
+    "level": 15,
+    "name": "l15_letrec_star"
   },
   {
-    "name": "l15_letrec_shadow",
-    "level": 15,
+    "expected": "42",
     "fixture": "l15_letrec_shadow.scm",
     "kind": "eval_str_ok",
-    "expected": "42"
+    "level": 15,
+    "name": "l15_letrec_shadow"
   },
   {
-    "name": "l15_case_symbol",
-    "level": 15,
+    "expected": "2",
     "fixture": "l15_case_symbol.scm",
     "kind": "eval_str_ok",
-    "expected": "2"
+    "level": 15,
+    "name": "l15_case_symbol"
   },
   {
-    "name": "l15_case_number",
-    "level": 15,
+    "expected": "\"two\"",
     "fixture": "l15_case_number.scm",
     "kind": "eval_str_ok",
-    "expected": "\"two\""
+    "level": 15,
+    "name": "l15_case_number"
   },
   {
-    "name": "l15_case_else",
-    "level": 15,
+    "expected": "0",
     "fixture": "l15_case_else.scm",
     "kind": "eval_str_ok",
-    "expected": "0"
+    "level": 15,
+    "name": "l15_case_else"
   },
   {
-    "name": "l15_case_no_match",
-    "level": 15,
+    "expected": "#t",
     "fixture": "l15_case_no_match.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 15,
+    "name": "l15_case_no_match"
   },
   {
-    "name": "l15_vector_create_ref",
-    "level": 15,
+    "expected": "2",
     "fixture": "l15_vector_create_ref.scm",
     "kind": "eval_str_ok",
-    "expected": "2"
+    "level": 15,
+    "name": "l15_vector_create_ref"
   },
   {
-    "name": "l15_vector_set",
-    "level": 15,
+    "expected": "42",
     "fixture": "l15_vector_set.scm",
     "kind": "eval_str_ok",
-    "expected": "42"
+    "level": 15,
+    "name": "l15_vector_set"
   },
   {
-    "name": "l15_vector_predicate",
-    "level": 15,
+    "expected": "(#t #f 3)",
     "fixture": "l15_vector_predicate.scm",
     "kind": "eval_str_ok",
-    "expected": "(#t #f 3)"
+    "level": 15,
+    "name": "l15_vector_predicate"
   },
   {
-    "name": "l15_vector_conversion",
-    "level": 15,
+    "expected": "(1 2 3)",
     "fixture": "l15_vector_conversion.scm",
     "kind": "eval_str_ok",
-    "expected": "(1 2 3)"
+    "level": 15,
+    "name": "l15_vector_conversion"
   },
   {
-    "name": "l15_vector_nested",
-    "level": 15,
+    "expected": "3",
     "fixture": "l15_vector_nested.scm",
     "kind": "eval_str_ok",
-    "expected": "3"
+    "level": 15,
+    "name": "l15_vector_nested"
   },
   {
-    "name": "l13_abs",
-    "level": 13,
+    "expected": "5",
     "fixture": "l13_abs.scm",
     "kind": "eval_str_ok",
-    "expected": "5"
+    "level": 13,
+    "name": "l13_abs"
   },
   {
-    "name": "l13_modulo",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_modulo.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_modulo"
   },
   {
-    "name": "l13_remainder",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_remainder.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_remainder"
   },
   {
-    "name": "l13_quotient",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_quotient.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_quotient"
   },
   {
-    "name": "l13_min_max",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_min_max.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_min_max"
   },
   {
-    "name": "l13_expt",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_expt.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_expt"
   },
   {
-    "name": "l13_zero",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_zero.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_zero"
   },
   {
-    "name": "l13_positive_negative",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_positive_negative.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_positive_negative"
   },
   {
-    "name": "l13_odd_even",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_odd_even.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_odd_even"
   },
   {
-    "name": "l13_combined",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_combined.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_combined"
   },
   {
-    "name": "l13_list_ref",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_list_ref.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_list_ref"
   },
   {
-    "name": "l13_list_tail",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_list_tail.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_list_tail"
   },
   {
-    "name": "l13_list_pred",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_list_pred.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_list_pred"
   },
   {
-    "name": "l13_assoc",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_assoc.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_assoc"
   },
   {
-    "name": "l13_map_multi",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_map_multi.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_map_multi"
   },
   {
-    "name": "l13_char_alpha",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_char_alpha.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_char_alpha"
   },
   {
-    "name": "l13_char_numeric",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_char_numeric.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_char_numeric"
   },
   {
-    "name": "l13_char_case",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_char_case.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_char_case"
   },
   {
-    "name": "l13_char_compare",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_char_compare.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_char_compare"
   },
   {
-    "name": "l13_char_literal",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_char_literal.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_char_literal"
   },
   {
-    "name": "l13_string_equal",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_string_equal.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_string_equal"
   },
   {
-    "name": "l13_string_less",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_string_less.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_string_less"
   },
   {
-    "name": "l13_string_ci",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_string_ci.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_string_ci"
   },
   {
-    "name": "l13_string_upcase",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_string_upcase.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_string_upcase"
   },
   {
-    "name": "l13_string_downcase",
-    "level": 13,
+    "expected": "#t",
     "fixture": "l13_string_downcase.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 13,
+    "name": "l13_string_downcase"
   },
   {
-    "name": "l16_dynamic_wind_basic",
-    "level": 16,
+    "expected": "((in body out) 42)",
     "fixture": "l16_dynamic_wind_basic.scm",
     "kind": "eval_str_ok",
-    "expected": "((in body out) 42)"
+    "level": 16,
+    "name": "l16_dynamic_wind_basic"
   },
   {
-    "name": "l16_dynamic_wind_nonlocal_exit",
-    "level": 16,
+    "expected": "(in body out)",
     "fixture": "l16_dynamic_wind_nonlocal_exit.scm",
     "kind": "eval_str_ok",
-    "expected": "(in body out)"
+    "level": 16,
+    "name": "l16_dynamic_wind_nonlocal_exit"
   },
   {
-    "name": "l16_dynamic_wind_reentry",
-    "level": 16,
+    "expected": "(in body out in body out)",
     "fixture": "l16_dynamic_wind_reentry.scm",
     "kind": "eval_str_ok",
-    "expected": "(in body out in body out)"
+    "level": 16,
+    "name": "l16_dynamic_wind_reentry"
   },
   {
-    "name": "l16_dynamic_wind_nested",
-    "level": 16,
+    "expected": "(outer-in inner-in inner-body inner-out outer-out)",
     "fixture": "l16_dynamic_wind_nested.scm",
     "kind": "eval_str_ok",
-    "expected": "(outer-in inner-in inner-body inner-out outer-out)"
+    "level": 16,
+    "name": "l16_dynamic_wind_nested"
   },
   {
-    "name": "l16_dynamic_wind_exit_nested",
-    "level": 16,
+    "expected": "(outer-in inner-in inner-out outer-out)",
     "fixture": "l16_dynamic_wind_exit_nested.scm",
     "kind": "eval_str_ok",
-    "expected": "(outer-in inner-in inner-out outer-out)"
+    "level": 16,
+    "name": "l16_dynamic_wind_exit_nested"
   },
   {
-    "name": "l16_dynamic_wind_value",
-    "level": 16,
+    "expected": "42",
     "fixture": "l16_dynamic_wind_value.scm",
     "kind": "eval_str_ok",
-    "expected": "42"
+    "level": 16,
+    "name": "l16_dynamic_wind_value"
   },
   {
-    "name": "l17_raise_basic",
-    "level": 17,
+    "expected": "42",
     "fixture": "l17_raise_basic.scm",
     "kind": "eval_str_ok",
-    "expected": "42"
+    "level": 17,
+    "name": "l17_raise_basic"
   },
   {
-    "name": "l17_guard_string",
-    "level": 17,
+    "expected": "\"caught: boom\"",
     "fixture": "l17_guard_string.scm",
     "kind": "eval_str_ok",
-    "expected": "\"caught: boom\""
+    "level": 17,
+    "name": "l17_guard_string"
   },
   {
-    "name": "l17_guard_else",
-    "level": 17,
+    "expected": "other",
     "fixture": "l17_guard_else.scm",
     "kind": "eval_str_ok",
-    "expected": "other"
+    "level": 17,
+    "name": "l17_guard_else"
   },
   {
-    "name": "l17_guard_no_raise",
-    "level": 17,
+    "expected": "30",
     "fixture": "l17_guard_no_raise.scm",
     "kind": "eval_str_ok",
-    "expected": "30"
+    "level": 17,
+    "name": "l17_guard_no_raise"
   },
   {
-    "name": "l17_with_exception_handler",
-    "level": 17,
+    "expected": "142",
     "fixture": "l17_with_exception_handler.scm",
     "kind": "eval_str_ok",
-    "expected": "142"
+    "level": 17,
+    "name": "l17_with_exception_handler"
   },
   {
-    "name": "l17_guard_with_dynamic_wind",
-    "level": 17,
+    "expected": "(caught fail (in body out))",
     "fixture": "l17_guard_with_dynamic_wind.scm",
     "kind": "eval_str_ok",
-    "expected": "(caught fail (in body out))"
+    "level": 17,
+    "name": "l17_guard_with_dynamic_wind"
   },
   {
-    "name": "l18_values_basic",
-    "level": 18,
+    "expected": "6",
     "fixture": "l18_values_basic.scm",
     "kind": "eval_str_ok",
-    "expected": "6"
+    "level": 18,
+    "name": "l18_values_basic"
   },
   {
-    "name": "l18_values_single",
-    "level": 18,
+    "expected": "42",
     "fixture": "l18_values_single.scm",
     "kind": "eval_str_ok",
-    "expected": "42"
+    "level": 18,
+    "name": "l18_values_single"
   },
   {
-    "name": "l18_values_receive",
-    "level": 18,
+    "expected": "(30 20 10)",
     "fixture": "l18_values_receive.scm",
     "kind": "eval_str_ok",
-    "expected": "(30 20 10)"
+    "level": 18,
+    "name": "l18_values_receive"
   },
   {
-    "name": "l18_values_let",
-    "level": 18,
+    "expected": "600",
     "fixture": "l18_values_let.scm",
     "kind": "eval_str_ok",
-    "expected": "600"
+    "level": 18,
+    "name": "l18_values_let"
   },
   {
-    "name": "l18_values_zero",
-    "level": 18,
+    "expected": "42",
     "fixture": "l18_values_zero.scm",
     "kind": "eval_str_ok",
-    "expected": "42"
+    "level": 18,
+    "name": "l18_values_zero"
   },
   {
-    "name": "l18_values_compose",
-    "level": 18,
+    "expected": "25",
     "fixture": "l18_values_compose.scm",
     "kind": "eval_str_ok",
-    "expected": "25"
+    "level": 18,
+    "name": "l18_values_compose"
   },
   {
-    "name": "l19_exact_basic",
-    "level": 19,
+    "expected": "(#t #t #t #f)",
     "fixture": "l19_exact_basic.scm",
     "kind": "eval_str_ok",
-    "expected": "(#t #t #t #f)"
+    "level": 19,
+    "name": "l19_exact_basic"
   },
   {
-    "name": "l19_rational_arithmetic",
-    "level": 19,
+    "expected": "(1 1/2 1/2 2/3)",
     "fixture": "l19_rational_arithmetic.scm",
     "kind": "eval_str_ok",
-    "expected": "(1 1/2 1/2 2/3)"
+    "level": 19,
+    "name": "l19_rational_arithmetic"
   },
   {
-    "name": "l19_exact_division",
-    "level": 19,
+    "expected": "(1/3 5/2 2)",
     "fixture": "l19_exact_division.scm",
     "kind": "eval_str_ok",
-    "expected": "(1/3 5/2 2)"
+    "level": 19,
+    "name": "l19_exact_division"
   },
   {
-    "name": "l19_exact_inexact_conversion",
-    "level": 19,
+    "expected": "(0.3333333333333333 1/2 5.0)",
     "fixture": "l19_exact_inexact_conversion.scm",
     "kind": "eval_str_ok",
-    "expected": "(0.3333333333333333 1/2 5.0)"
+    "level": 19,
+    "name": "l19_exact_inexact_conversion"
   },
   {
-    "name": "l19_rational_comparison",
-    "level": 19,
+    "expected": "(#t #t #t)",
     "fixture": "l19_rational_comparison.scm",
     "kind": "eval_str_ok",
-    "expected": "(#t #t #t)"
+    "level": 19,
+    "name": "l19_rational_comparison"
   },
   {
-    "name": "l19_numerator_denominator",
-    "level": 19,
+    "expected": "(3 4 5 1)",
     "fixture": "l19_numerator_denominator.scm",
     "kind": "eval_str_ok",
-    "expected": "(3 4 5 1)"
+    "level": 19,
+    "name": "l19_numerator_denominator"
   },
   {
-    "name": "l19_rational_simplify",
-    "level": 19,
+    "expected": "(3/2 10 1/3)",
     "fixture": "l19_rational_simplify.scm",
     "kind": "eval_str_ok",
-    "expected": "(3/2 10 1/3)"
+    "level": 19,
+    "name": "l19_rational_simplify"
   },
   {
-    "name": "l19_exact_predicates",
-    "level": 19,
+    "expected": "(#t #f #t #t)",
     "fixture": "l19_exact_predicates.scm",
     "kind": "eval_str_ok",
-    "expected": "(#t #f #t #t)"
+    "level": 19,
+    "name": "l19_exact_predicates"
   },
   {
-    "name": "l20_record_basic",
-    "level": 20,
+    "expected": "(#t 3 4)",
     "fixture": "l20_record_basic.scm",
     "kind": "eval_str_ok",
-    "expected": "(#t 3 4)"
+    "level": 20,
+    "name": "l20_record_basic"
   },
   {
-    "name": "l20_record_predicate",
-    "level": 20,
+    "expected": "(#t #f #f #f)",
     "fixture": "l20_record_predicate.scm",
     "kind": "eval_str_ok",
-    "expected": "(#t #f #f #f)"
+    "level": 20,
+    "name": "l20_record_predicate"
   },
   {
-    "name": "l20_record_multiple",
-    "level": 20,
+    "expected": "(#t #f #t #f)",
     "fixture": "l20_record_multiple.scm",
     "kind": "eval_str_ok",
-    "expected": "(#t #f #t #f)"
+    "level": 20,
+    "name": "l20_record_multiple"
   },
   {
-    "name": "l20_record_with_procedures",
-    "level": 20,
+    "expected": "(25 0 2)",
     "fixture": "l20_record_with_procedures.scm",
     "kind": "eval_str_ok",
-    "expected": "(25 0 2)"
+    "level": 20,
+    "name": "l20_record_with_procedures"
   },
   {
-    "name": "l20_record_nested",
-    "level": 20,
+    "expected": "(0 4)",
     "fixture": "l20_record_nested.scm",
     "kind": "eval_str_ok",
-    "expected": "(0 4)"
+    "level": 20,
+    "name": "l20_record_nested"
   },
   {
-    "name": "l21_set_cdr",
-    "level": 21,
+    "expected": "(10 . 20)",
     "fixture": "l21_set_cdr.scm",
     "kind": "eval_str_ok",
-    "expected": "(10 . 20)"
+    "level": 21,
+    "name": "l21_set_cdr"
   },
   {
-    "name": "l21_shared_structure",
-    "level": 21,
+    "expected": "99",
     "fixture": "l21_shared_structure.scm",
     "kind": "eval_str_ok",
-    "expected": "99"
+    "level": 21,
+    "name": "l21_shared_structure"
   },
   {
-    "name": "l21_circular_list_detection",
-    "level": 21,
+    "expected": "#f",
     "fixture": "l21_circular_list_detection.scm",
     "kind": "eval_str_ok",
-    "expected": "#f"
+    "level": 21,
+    "name": "l21_circular_list_detection"
   },
   {
-    "name": "l21_write_circular",
-    "level": 21,
+    "expected": "#t",
     "fixture": "l21_write_circular.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 21,
+    "name": "l21_write_circular"
   },
   {
-    "name": "l21_deep_recursion_no_leak",
-    "level": 21,
+    "expected": "done",
     "fixture": "l21_deep_recursion_no_leak.scm",
     "kind": "eval_str_ok",
-    "expected": "done"
+    "level": 21,
+    "name": "l21_deep_recursion_no_leak"
   },
   {
-    "name": "l22_syntax_case_basic",
-    "level": 22,
+    "expected": "2",
     "fixture": "l22_syntax_case_basic.scm",
     "kind": "eval_str_ok",
-    "expected": "2"
+    "level": 22,
+    "name": "l22_syntax_case_basic"
   },
   {
-    "name": "l22_syntax_case_with_guard",
-    "level": 22,
+    "expected": "(5 division-by-zero)",
     "fixture": "l22_syntax_case_with_guard.scm",
     "kind": "eval_str_ok",
-    "expected": "(5 division-by-zero)"
+    "level": 22,
+    "name": "l22_syntax_case_with_guard"
   },
   {
-    "name": "l22_syntax_case_hygiene",
-    "level": 22,
+    "expected": "(2 1 999)",
     "fixture": "l22_syntax_case_hygiene.scm",
     "kind": "eval_str_ok",
-    "expected": "(2 1 999)"
+    "level": 22,
+    "name": "l22_syntax_case_hygiene"
   },
   {
-    "name": "l22_syntax_case_datum",
-    "level": 22,
+    "expected": "15",
     "fixture": "l22_syntax_case_datum.scm",
     "kind": "eval_str_ok",
-    "expected": "15"
+    "level": 22,
+    "name": "l22_syntax_case_datum"
   },
   {
-    "name": "l22_syntax_case_ellipsis",
-    "level": 22,
+    "expected": "(1 2 3)",
     "fixture": "l22_syntax_case_ellipsis.scm",
     "kind": "eval_str_ok",
-    "expected": "(1 2 3)"
+    "level": 22,
+    "name": "l22_syntax_case_ellipsis"
   },
   {
-    "name": "l23_dynamic_wind_guard_combo",
-    "level": 23,
+    "expected": "(error \"oops\" (open work inner-open inner-close close))",
     "fixture": "l23_dynamic_wind_guard_combo.scm",
     "kind": "eval_str_ok",
-    "expected": "(error \"oops\" (open work inner-open inner-close close))"
+    "level": 23,
+    "name": "l23_dynamic_wind_guard_combo"
   },
   {
-    "name": "l23_values_with_callcc",
-    "level": 23,
+    "expected": "60",
     "fixture": "l23_values_with_callcc.scm",
     "kind": "eval_str_ok",
-    "expected": "60"
+    "level": 23,
+    "name": "l23_values_with_callcc"
   },
   {
-    "name": "l23_record_with_guard",
-    "level": 23,
+    "expected": "(caught 404 \"not found\")",
     "fixture": "l23_record_with_guard.scm",
     "kind": "eval_str_ok",
-    "expected": "(caught 404 \"not found\")"
+    "level": 23,
+    "name": "l23_record_with_guard"
   },
   {
-    "name": "l23_rational_in_data_structures",
-    "level": 23,
+    "expected": "(1 1/2 1)",
     "fixture": "l23_rational_in_data_structures.scm",
     "kind": "eval_str_ok",
-    "expected": "(1 1/2 1)"
+    "level": 23,
+    "name": "l23_rational_in_data_structures"
   },
   {
-    "name": "l23_macro_generates_record",
-    "level": 23,
+    "expected": "(0 0)",
     "fixture": "l23_macro_generates_record.scm",
     "kind": "eval_str_ok",
-    "expected": "(0 0)"
+    "level": 23,
+    "name": "l23_macro_generates_record"
   },
   {
-    "name": "l23_dynamic_wind_values",
-    "level": 23,
+    "expected": "(1 2 3)",
     "fixture": "l23_dynamic_wind_values.scm",
     "kind": "eval_str_ok",
-    "expected": "(1 2 3)"
+    "level": 23,
+    "name": "l23_dynamic_wind_values"
   },
   {
-    "name": "l23_tail_call_with_guard",
-    "level": 23,
+    "expected": "done",
     "fixture": "l23_tail_call_with_guard.scm",
     "kind": "eval_str_ok",
-    "expected": "done"
+    "level": 23,
+    "name": "l23_tail_call_with_guard"
   },
   {
-    "name": "l23_full_integration",
-    "level": 23,
+    "expected": "(#t 10/3 #f \"division by zero\")",
     "fixture": "l23_full_integration.scm",
     "kind": "eval_str_ok",
-    "expected": "(#t 10/3 #f \"division by zero\")"
+    "level": 23,
+    "name": "l23_full_integration"
   },
   {
-    "name": "l03_realworld_nqueens",
-    "level": 3,
+    "expected": "#t",
     "fixture": "l03_realworld_nqueens.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 3,
+    "name": "l03_realworld_nqueens"
   },
   {
-    "name": "l10_realworld_ctak",
-    "level": 10,
+    "expected": "#t",
     "fixture": "l10_realworld_ctak.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 10,
+    "name": "l10_realworld_ctak"
   },
   {
-    "name": "l23_realworld_browse",
-    "level": 23,
+    "expected": "#t",
     "fixture": "l23_realworld_browse.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 23,
+    "name": "l23_realworld_browse"
   },
   {
-    "name": "l23_realworld_peval",
-    "level": 23,
+    "expected": "#t",
     "fixture": "l23_realworld_peval.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 23,
+    "name": "l23_realworld_peval"
   },
   {
-    "name": "l21_realworld_scheme_eval",
-    "level": 21,
+    "expected": "#t",
     "fixture": "l21_realworld_scheme_eval.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 21,
+    "name": "l21_realworld_scheme_eval"
   },
   {
-    "name": "l15_realworld_sboyer",
-    "level": 15,
+    "expected": "#t",
     "fixture": "l15_realworld_sboyer.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 15,
+    "name": "l15_realworld_sboyer"
   },
   {
-    "name": "l21_realworld_conform",
-    "level": 21,
+    "expected": "#t",
     "fixture": "l21_realworld_conform.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 21,
+    "name": "l21_realworld_conform"
   },
   {
-    "name": "l26_realworld_dynamic",
-    "level": 26,
+    "expected": "#t",
     "fixture": "l26_realworld_dynamic.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 26,
+    "name": "l26_realworld_dynamic"
   },
   {
-    "name": "l24_case_lambda_basic",
-    "level": 24,
+    "expected": "#t",
     "fixture": "l24_case_lambda_basic.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 24,
+    "name": "l24_case_lambda_basic"
   },
   {
-    "name": "l24_case_lambda_higher_order",
-    "level": 24,
+    "expected": "#t",
     "fixture": "l24_case_lambda_higher_order.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 24,
+    "name": "l24_case_lambda_higher_order"
   },
   {
-    "name": "l24_case_lambda_procedure",
-    "level": 24,
+    "expected": "#t",
     "fixture": "l24_case_lambda_procedure.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 24,
+    "name": "l24_case_lambda_procedure"
   },
   {
-    "name": "l24_case_lambda_recursive",
-    "level": 24,
+    "expected": "3",
     "fixture": "l24_case_lambda_recursive.scm",
     "kind": "eval_str_ok",
-    "expected": "3"
+    "level": 24,
+    "name": "l24_case_lambda_recursive"
   },
   {
-    "name": "l24_case_lambda_rest",
-    "level": 24,
+    "expected": "#t",
     "fixture": "l24_case_lambda_rest.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 24,
+    "name": "l24_case_lambda_rest"
   },
   {
-    "name": "l25_procedure_lambda",
-    "level": 25,
+    "expected": "#t",
     "fixture": "l25_procedure_lambda.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 25,
+    "name": "l25_procedure_lambda"
   },
   {
-    "name": "l25_procedure_case_lambda",
-    "level": 25,
+    "expected": "#t",
     "fixture": "l25_procedure_case_lambda.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 25,
+    "name": "l25_procedure_case_lambda"
   },
   {
-    "name": "l25_procedure_builtin",
-    "level": 25,
+    "expected": "#t",
     "fixture": "l25_procedure_builtin.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 25,
+    "name": "l25_procedure_builtin"
   },
   {
-    "name": "l25_procedure_continuation",
-    "level": 25,
+    "expected": "#t",
     "fixture": "l25_procedure_continuation.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 25,
+    "name": "l25_procedure_continuation"
   },
   {
-    "name": "l25_procedure_non_callable",
-    "level": 25,
+    "expected": "#t",
     "fixture": "l25_procedure_non_callable.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 25,
+    "name": "l25_procedure_non_callable"
   },
   {
-    "name": "l15_do_basic",
-    "level": 15,
+    "expected": "10",
     "fixture": "l15_do_basic.scm",
     "kind": "eval_str_ok",
-    "expected": "10"
+    "level": 15,
+    "name": "l15_do_basic"
   },
   {
-    "name": "l15_do_parallel_step",
-    "level": 15,
+    "expected": "#t",
     "fixture": "l15_do_parallel_step.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 15,
+    "name": "l15_do_parallel_step"
   },
   {
-    "name": "l15_do_fibonacci",
-    "level": 15,
+    "expected": "#t",
     "fixture": "l15_do_fibonacci.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 15,
+    "name": "l15_do_fibonacci"
   },
   {
-    "name": "l15_do_no_step",
-    "level": 15,
+    "expected": "#t",
     "fixture": "l15_do_no_step.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 15,
+    "name": "l15_do_no_step"
   },
   {
-    "name": "l15_do_vector_fill",
-    "level": 15,
+    "expected": "#(0 1 4 9 16)",
     "fixture": "l15_do_vector_fill.scm",
     "kind": "eval_str_ok",
-    "expected": "#(0 1 4 9 16)"
+    "level": 15,
+    "name": "l15_do_vector_fill"
   },
   {
-    "name": "l26_realworld_alexpander",
-    "level": 26,
+    "expected": "#t",
     "fixture": "l26_realworld_alexpander.scm",
     "kind": "eval_str_ok",
-    "expected": "#t"
+    "level": 26,
+    "name": "l26_realworld_alexpander"
+  },
+  {
+    "expected": "done",
+    "fixture": "l28_memory_pressure.scm",
+    "kind": "eval_str_ok",
+    "level": 28,
+    "name": "l28_memory_pressure"
+  },
+  {
+    "expected": "100",
+    "fixture": "l28_deep_callcc_chain.scm",
+    "kind": "eval_str_ok",
+    "level": 28,
+    "name": "l28_deep_callcc_chain"
+  },
+  {
+    "expected": "1275",
+    "fixture": "l28_macro_expansion_stress.scm",
+    "kind": "eval_str_ok",
+    "level": 28,
+    "name": "l28_macro_expansion_stress"
+  },
+  {
+    "expected": "(if-ok cond-ok begin-ok let-ok and-ok or-ok case-ok)",
+    "fixture": "l28_tco_all_contexts.scm",
+    "kind": "eval_str_ok",
+    "level": 28,
+    "name": "l28_tco_all_contexts"
+  },
+  {
+    "expected": "49",
+    "fixture": "l28_large_env_chain.scm",
+    "kind": "eval_str_ok",
+    "level": 28,
+    "name": "l28_large_env_chain"
+  },
+  {
+    "expected": "10000",
+    "fixture": "l28_string_heavy.scm",
+    "kind": "eval_str_ok",
+    "level": 28,
+    "name": "l28_string_heavy"
   }
 ]
