@@ -14,7 +14,11 @@ impl Env {
     /// Create the default top-level environment with builtins.
     pub fn default_env() -> Rc<Self> {
         let mut bindings = HashMap::new();
-        for name in ["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not"] {
+        for name in [
+            "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+            "cons", "car", "cdr", "null?", "list", "length", "append",
+            "string?", "number?", "boolean?", "pair?", "symbol?",
+        ] {
             bindings.insert(name.into(), Value::Builtin(name.into()));
         }
         Rc::new(Self {
