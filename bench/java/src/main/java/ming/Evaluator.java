@@ -12,6 +12,10 @@ public class Evaluator {
     private StringBuilder outputBuffer;
     private int gensymCounter = 0;
 
+    // --- dynamic-wind infrastructure ---
+    record WindFrame(SchemeValue inThunk, SchemeValue outThunk) {}
+    private final List<WindFrame> windStack = new ArrayList<>();
+
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "if", "define", "lambda", "quote", "begin", "let", "let*", "set!",
         "cond", "and", "or", "call/cc", "call-with-current-continuation",
@@ -519,7 +523,8 @@ public class Evaluator {
     private Bounce evalCallCC(List<SchemeValue> args, Environment env, Cont k) {
         if (args.size() != 1) throw new EvalError("call/cc: needs exactly 1 argument");
         return new Bounce.More(() -> eval(args.get(0), env, proc -> {
-            var contVal = new SchemeValue.ContinuationVal(k);
+            var savedWind = new ArrayList<>(windStack);
+            var contVal = new SchemeValue.ContinuationVal(k, savedWind);
             return applyProc(proc, List.of(contVal), k);
         }));
     }
@@ -547,10 +552,14 @@ public class Evaluator {
         return new Bounce.More(() -> eval(first, env, withProc));
     }
 
+    @SuppressWarnings("unchecked")
     private Bounce applyProc(SchemeValue proc, List<SchemeValue> args, Cont k) {
         if (proc instanceof SchemeValue.ContinuationVal cont) {
             if (args.size() != 1) throw new EvalError("continuation: needs exactly 1 argument");
-            throw new ContinuationReturn(((Cont) cont.cont()).apply(args.getFirst()));
+            SchemeValue value = args.getFirst();
+            Cont capturedK = (Cont) cont.cont();
+            List<WindFrame> targetWind = (List<WindFrame>) cont.windStack();
+            return doWindTransition(targetWind, value, capturedK);
         }
         if (proc instanceof SchemeValue.LambdaVal lambda) {
             return applyLambda(lambda, args, k);
@@ -608,7 +617,8 @@ public class Evaluator {
         "string-upcase", "string-downcase",
         "vector", "make-vector", "vector-ref", "vector-set!",
         "vector-length", "vector?", "vector->list", "list->vector",
-        "apply", "call/cc", "call-with-current-continuation"
+        "apply", "call/cc", "call-with-current-continuation",
+        "dynamic-wind", "reverse"
     );
 
     private boolean isBuiltin(String name) { return BUILTINS.contains(name); }
@@ -682,6 +692,18 @@ public class Evaluator {
                 SchemeValue r = a.getLast();
                 for (int i = a.size() - 2; i >= 0; i--) r = appendTwo(a.get(i), r);
                 yield k.apply(r);
+            }
+            case "reverse" -> {
+                if (a.size() != 1) throw new EvalError("reverse: needs exactly 1 argument");
+                SchemeValue cur = a.getFirst();
+                SchemeValue rev = new SchemeValue.NilVal();
+                while (cur instanceof SchemeValue.PairVal p) {
+                    rev = new SchemeValue.PairVal(p.car(), rev);
+                    cur = p.cdr();
+                }
+                if (!(cur instanceof SchemeValue.NilVal))
+                    throw new EvalError("reverse: not a proper list");
+                yield k.apply(rev);
             }
             case "string?" -> typePred(a, SchemeValue.StringVal.class, k);
             case "number?" -> typePred(a, SchemeValue.IntVal.class, k);
@@ -1031,11 +1053,56 @@ public class Evaluator {
             }
             case "call/cc", "call-with-current-continuation" -> {
                 if (a.size() != 1) throw new EvalError("call/cc: needs exactly 1 argument");
-                var contVal = new SchemeValue.ContinuationVal(k);
+                var savedWind = new ArrayList<>(windStack);
+                var contVal = new SchemeValue.ContinuationVal(k, savedWind);
                 yield applyProc(a.getFirst(), List.of(contVal), k);
+            }
+            case "dynamic-wind" -> {
+                if (a.size() != 3) throw new EvalError("dynamic-wind: needs exactly 3 arguments");
+                SchemeValue inThunk = a.get(0), bodyThunk = a.get(1), outThunk = a.get(2);
+                WindFrame frame = new WindFrame(inThunk, outThunk);
+                yield applyProc(inThunk, List.of(), _v1 -> {
+                    windStack.add(frame);
+                    return applyProc(bodyThunk, List.of(), bodyResult -> {
+                        windStack.removeLast();
+                        return applyProc(outThunk, List.of(), _v2 -> k.apply(bodyResult));
+                    });
+                });
             }
             default -> throw new EvalError("unknown procedure: " + name);
         };
+    }
+
+    // --- Wind transition for continuations ---
+
+    @SuppressWarnings("unchecked")
+    private Bounce doWindTransition(List<WindFrame> target, SchemeValue value, Cont capturedK) {
+        int common = 0;
+        int minLen = Math.min(windStack.size(), target.size());
+        while (common < minLen && windStack.get(common) == target.get(common)) common++;
+
+        // Collect thunks: out-thunks (innermost first), then in-thunks (outermost first)
+        List<SchemeValue> thunks = new ArrayList<>();
+        for (int i = windStack.size() - 1; i >= common; i--) {
+            thunks.add(windStack.get(i).outThunk());
+        }
+        for (int i = common; i < target.size(); i++) {
+            thunks.add(target.get(i).inThunk());
+        }
+
+        // Update wind stack atomically
+        windStack.clear();
+        windStack.addAll(target);
+
+        return runThunkChain(thunks, 0, value, capturedK);
+    }
+
+    private Bounce runThunkChain(List<SchemeValue> thunks, int idx, SchemeValue value, Cont capturedK) {
+        if (idx >= thunks.size()) {
+            throw new ContinuationReturn(capturedK.apply(value));
+        }
+        return new Bounce.More(() -> applyProc(thunks.get(idx), List.of(),
+            _v -> runThunkChain(thunks, idx + 1, value, capturedK)));
     }
 
     // --- Macros ---

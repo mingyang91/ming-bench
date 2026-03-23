@@ -93,8 +93,10 @@ public sealed interface SchemeValue {
 
     final class ContinuationVal implements SchemeValue {
         private final Object cont;
-        public ContinuationVal(Object cont) { this.cont = cont; }
+        private final Object windStack;
+        public ContinuationVal(Object cont, Object windStack) { this.cont = cont; this.windStack = windStack; }
         public Object cont() { return cont; }
+        public Object windStack() { return windStack; }
         @Override public String display() { return "#<continuation>"; }
     }
 
