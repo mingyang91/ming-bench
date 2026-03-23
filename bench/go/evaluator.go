@@ -58,27 +58,47 @@ func makeLambda(params []string, body []*Value, closure *Env) *Value {
 	return &Value{Type: TypeLambda, Params: params, Body: body, Closure: closure}
 }
 
+// tailCall is a sentinel used by the trampoline to indicate a tail call.
+type tailCall struct {
+	expr *Value
+	env  *Env
+}
+
 // eval evaluates a single expression in the given environment.
+// Uses a trampoline loop for TCO.
 func eval(expr *Value, env *Env) (*Value, error) {
-	switch expr.Type {
-	case TypeInteger, TypeBoolean, TypeString, TypeChar:
-		return expr, nil
-	case TypeSymbol:
-		v, ok := env.get(expr.Str)
-		if !ok {
-			return nil, evalErrf(expr, "unbound variable: %s", expr.Str)
+	for {
+		switch expr.Type {
+		case TypeInteger, TypeBoolean, TypeString, TypeChar:
+			return expr, nil
+		case TypeSymbol:
+			v, ok := env.get(expr.Str)
+			if !ok {
+				return nil, evalErrf(expr, "unbound variable: %s", expr.Str)
+			}
+			return v, nil
+		case TypePair:
+			tc, result, err := evalList(expr, env)
+			if err != nil {
+				return nil, err
+			}
+			if tc != nil {
+				expr = tc.expr
+				env = tc.env
+				continue
+			}
+			return result, nil
+		case TypeNull:
+			return nil, evalErr(expr, "empty application")
+		default:
+			return nil, evalErr(expr, "cannot evaluate")
 		}
-		return v, nil
-	case TypePair:
-		return evalList(expr, env)
-	case TypeNull:
-		return nil, evalErr(expr, "empty application")
-	default:
-		return nil, evalErr(expr, "cannot evaluate")
 	}
 }
 
-func evalList(expr *Value, env *Env) (*Value, error) {
+// evalList handles special forms and function application.
+// Returns either a tailCall (for TCO) or a result value.
+func evalList(expr *Value, env *Env) (*tailCall, *Value, error) {
 	head := expr.Car
 	args := expr.Cdr
 
@@ -90,13 +110,15 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 		case "or":
 			return evalOr(args, env)
 		case "define":
-			return evalDefine(args, env, expr)
+			v, err := evalDefine(args, env, expr)
+			return nil, v, err
 		case "if":
 			return evalIf(args, env, expr)
 		case "quote":
-			return args.Car, nil
+			return nil, args.Car, nil
 		case "lambda":
-			return evalLambda(args, env)
+			v, err := evalLambda(args, env)
+			return nil, v, err
 		case "let":
 			return evalLet(args, env)
 		case "begin":
@@ -109,7 +131,7 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 	// Function application
 	fn, err := eval(head, env)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Evaluate arguments
@@ -118,9 +140,28 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 	for i, a := range argList {
 		v, err := eval(a, env)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		evalArgs[i] = v
+	}
+
+	// TCO: if applying a lambda, return a tail call
+	if fn.Type == TypeLambda {
+		if len(evalArgs) != len(fn.Params) {
+			return nil, nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(fn.Params), len(evalArgs))}
+		}
+		localEnv := newEnv(fn.Closure)
+		for i, p := range fn.Params {
+			localEnv.set(p, evalArgs[i])
+		}
+		// Evaluate all but last body expression, then tail-call the last
+		for i := 0; i < len(fn.Body)-1; i++ {
+			_, err := eval(fn.Body[i], localEnv)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		return &tailCall{expr: fn.Body[len(fn.Body)-1], env: localEnv}, nil, nil
 	}
 
 	result, err := applyProc(fn, evalArgs)
@@ -130,9 +171,9 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 			ee.Line = expr.Line
 			ee.Col = expr.Col
 		}
-		return nil, err
+		return nil, nil, err
 	}
-	return result, nil
+	return nil, result, nil
 }
 
 func evalDefine(args *Value, env *Env, expr *Value) (*Value, error) {
@@ -164,22 +205,22 @@ func evalDefine(args *Value, env *Env, expr *Value) (*Value, error) {
 	return nil, evalErr(expr, "bad define syntax")
 }
 
-func evalIf(args *Value, env *Env, expr *Value) (*Value, error) {
+func evalIf(args *Value, env *Env, expr *Value) (*tailCall, *Value, error) {
 	if args.Type == TypeNull {
-		return nil, evalErr(expr, "bad if syntax: missing condition")
+		return nil, nil, evalErr(expr, "bad if syntax: missing condition")
 	}
 	cond, err := eval(args.Car, env)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if isTruthy(cond) {
-		return eval(args.Cdr.Car, env)
+		return &tailCall{expr: args.Cdr.Car, env: env}, nil, nil
 	}
 	// else branch (if present)
 	if args.Cdr.Cdr.Type == TypePair {
-		return eval(args.Cdr.Cdr.Car, env)
+		return &tailCall{expr: args.Cdr.Cdr.Car, env: env}, nil, nil
 	}
-	return voidValue, nil
+	return nil, voidValue, nil
 }
 
 func evalLambda(args *Value, env *Env) (*Value, error) {
@@ -192,41 +233,45 @@ func evalLambda(args *Value, env *Env) (*Value, error) {
 	return makeLambda(params, body, env), nil
 }
 
-func evalAnd(args *Value, env *Env) (*Value, error) {
-	result := makeBool(true)
+func evalAnd(args *Value, env *Env) (*tailCall, *Value, error) {
+	if args.Type == TypeNull {
+		return nil, makeBool(true), nil
+	}
 	cur := args
-	for cur.Type == TypePair {
+	for cur.Cdr.Type == TypePair {
 		v, err := eval(cur.Car, env)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if !isTruthy(v) {
-			return v, nil
+			return nil, v, nil
 		}
-		result = v
 		cur = cur.Cdr
 	}
-	return result, nil
+	// Last expression is in tail position
+	return &tailCall{expr: cur.Car, env: env}, nil, nil
 }
 
-func evalOr(args *Value, env *Env) (*Value, error) {
-	result := makeBool(false)
+func evalOr(args *Value, env *Env) (*tailCall, *Value, error) {
+	if args.Type == TypeNull {
+		return nil, makeBool(false), nil
+	}
 	cur := args
-	for cur.Type == TypePair {
+	for cur.Cdr.Type == TypePair {
 		v, err := eval(cur.Car, env)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if isTruthy(v) {
-			return v, nil
+			return nil, v, nil
 		}
-		result = v
 		cur = cur.Cdr
 	}
-	return result, nil
+	// Last expression is in tail position
+	return &tailCall{expr: cur.Car, env: env}, nil, nil
 }
 
-func evalLet(args *Value, env *Env) (*Value, error) {
+func evalLet(args *Value, env *Env) (*tailCall, *Value, error) {
 	// Named let: (let name ((var init) ...) body ...)
 	if args.Car.Type == TypeSymbol {
 		name := args.Car.Str
@@ -241,7 +286,7 @@ func evalLet(args *Value, env *Env) (*Value, error) {
 			params = append(params, b.Car.Str)
 			val, err := eval(b.Cdr.Car, env)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			inits = append(inits, val)
 			cur = cur.Cdr
@@ -250,7 +295,18 @@ func evalLet(args *Value, env *Env) (*Value, error) {
 		localEnv := newEnv(env)
 		lambda := makeLambda(params, bodySlice, localEnv)
 		localEnv.set(name, lambda)
-		return applyProc(lambda, inits)
+		// Set up env and tail-call into the body
+		callEnv := newEnv(localEnv)
+		for i, p := range params {
+			callEnv.set(p, inits[i])
+		}
+		for i := 0; i < len(bodySlice)-1; i++ {
+			_, err := eval(bodySlice[i], callEnv)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		return &tailCall{expr: bodySlice[len(bodySlice)-1], env: callEnv}, nil, nil
 	}
 
 	// Regular let: (let ((var init) ...) body ...)
@@ -263,39 +319,39 @@ func evalLet(args *Value, env *Env) (*Value, error) {
 		name := binding.Car.Str
 		val, err := eval(binding.Cdr.Car, env)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		localEnv.set(name, val)
 		cur = cur.Cdr
 	}
-	var result *Value
-	var err error
-	bodyCur := body
-	for bodyCur.Type == TypePair {
-		result, err = eval(bodyCur.Car, localEnv)
+	// Evaluate body with tail position for last expr
+	bodySlice := listToSlice(body)
+	for i := 0; i < len(bodySlice)-1; i++ {
+		_, err := eval(bodySlice[i], localEnv)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		bodyCur = bodyCur.Cdr
 	}
-	return result, nil
+	return &tailCall{expr: bodySlice[len(bodySlice)-1], env: localEnv}, nil, nil
 }
 
-func evalBegin(args *Value, env *Env) (*Value, error) {
-	var result *Value = voidValue
-	var err error
+func evalBegin(args *Value, env *Env) (*tailCall, *Value, error) {
+	if args.Type == TypeNull {
+		return nil, voidValue, nil
+	}
 	cur := args
-	for cur.Type == TypePair {
-		result, err = eval(cur.Car, env)
+	for cur.Cdr.Type == TypePair {
+		_, err := eval(cur.Car, env)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		cur = cur.Cdr
 	}
-	return result, nil
+	// Last expression is in tail position
+	return &tailCall{expr: cur.Car, env: env}, nil, nil
 }
 
-func evalCond(args *Value, env *Env) (*Value, error) {
+func evalCond(args *Value, env *Env) (*tailCall, *Value, error) {
 	cur := args
 	for cur.Type == TypePair {
 		clause := cur.Car
@@ -306,20 +362,21 @@ func evalCond(args *Value, env *Env) (*Value, error) {
 		}
 		val, err := eval(test, env)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if isTruthy(val) {
 			if clause.Cdr.Type == TypeNull {
-				return val, nil
+				return nil, val, nil
 			}
 			return evalBegin(clause.Cdr, env)
 		}
 		cur = cur.Cdr
 	}
-	return voidValue, nil
+	return nil, voidValue, nil
 }
 
 // applyProc calls a procedure (builtin or lambda) with evaluated arguments.
+// Used only for non-tail-call positions now.
 func applyProc(fn *Value, args []*Value) (*Value, error) {
 	switch fn.Type {
 	case TypeBuiltin:
