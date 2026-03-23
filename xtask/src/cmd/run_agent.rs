@@ -765,11 +765,14 @@ fn inject_surprise_level(
                 }
             }
             Lang::Java => {
-                let src = hidden_dir.join("java/ConcurrencyTest.java");
-                let dst = bench_dir.join("java/src/test/java/ming/ConcurrencyTest.java");
+                // Copy L27Tests.java as a standalone main class (not JUnit)
+                let src = hidden_dir.join("java/L27Tests.java");
+                let dst = bench_dir.join("java/src/main/java/ming/L27Tests.java");
                 if src.is_file() {
                     let _ = fs::create_dir_all(dst.parent().expect("has parent"));
                     let _ = fs::copy(&src, &dst);
+                    // Force clean so shadowJar includes the new class
+                    let _ = run_cmd("./gradlew", &["clean"], &bench_dir.join("java"));
                 }
             }
             Lang::Scala => {
