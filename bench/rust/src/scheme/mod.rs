@@ -630,6 +630,66 @@ fn builtin_string_copy(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+// L14: string immutability helpers
+fn builtin_string_to_list(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("string->list requires exactly 1 argument".into()));
+    }
+    match &args[0] {
+        Value::Str(s) => {
+            let mut result = Value::Nil;
+            for ch in s.chars().rev() {
+                result = Value::Pair(Box::new(Value::Char(ch)), Box::new(result));
+            }
+            Ok(result)
+        }
+        _ => Err(EvalError::Type("string->list: expected string".into())),
+    }
+}
+
+fn builtin_list_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("list->string requires exactly 1 argument".into()));
+    }
+    let mut s = String::new();
+    let mut cur = args[0].clone();
+    loop {
+        match cur {
+            Value::Pair(car, cdr) => {
+                match *car {
+                    Value::Char(c) => s.push(c),
+                    _ => return Err(EvalError::Type("list->string: expected list of characters".into())),
+                }
+                cur = *cdr;
+            }
+            Value::Nil => break,
+            _ => return Err(EvalError::Type("list->string: expected proper list".into())),
+        }
+    }
+    Ok(Value::Str(s))
+}
+
+fn builtin_char_to_integer(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("char->integer requires exactly 1 argument".into()));
+    }
+    match &args[0] {
+        Value::Char(c) => Ok(Value::Integer(*c as i64)),
+        _ => Err(EvalError::Type("char->integer: expected character".into())),
+    }
+}
+
+fn builtin_integer_to_char(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("integer->char requires exactly 1 argument".into()));
+    }
+    let n = args[0].as_integer()?;
+    match char::from_u32(n as u32) {
+        Some(c) => Ok(Value::Char(c)),
+        None => Err(EvalError::Type("integer->char: invalid code point".into())),
+    }
+}
+
 fn builtin_string_ref(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::Arity("string-ref requires exactly 2 arguments".into()));
@@ -990,6 +1050,11 @@ fn default_env() -> Env {
         ("string-ci=?", builtin_string_ci_eq),
         ("string-upcase", builtin_string_upcase),
         ("string-downcase", builtin_string_downcase),
+        // L14: string immutability
+        ("string->list", builtin_string_to_list),
+        ("list->string", builtin_list_to_string),
+        ("char->integer", builtin_char_to_integer),
+        ("integer->char", builtin_integer_to_char),
     ];
     for &(name, func) in builtins {
         env_set(&env, name.to_string(), Value::Builtin(name, func));
@@ -1916,20 +1981,22 @@ fn eval_cek(initial_expr: Expr, initial_env: Env, initial_kont: Rc<Kont>) -> Res
                                     "string-set!" => {
                                         let args = &items[1..];
                                         if args.len() != 3 {
-                                            return Err(expr.wrap_err(EvalError::Arity("string-set! requires exactly 3 arguments".into())));
+                                            return Err(expr.wrap_err(EvalError::Arity("string-set! requires 3 arguments".into())));
                                         }
                                         let var_name = match &args[0].kind {
-                                            ExprKind::Symbol(name) => name.clone(),
+                                            ExprKind::Symbol(s) => s.clone(),
                                             _ => return Err(expr.wrap_err(EvalError::Type("string-set!: first argument must be a variable".into()))),
                                         };
+                                        let idx_expr = args[1].clone();
+                                        let char_expr = args[2].clone();
                                         kont = Rc::new(Kont::StringSetIdx {
                                             form: expr.clone(),
                                             var_name,
-                                            char_expr: args[2].clone(),
+                                            char_expr,
                                             env: env.clone(),
                                             next: kont,
                                         });
-                                        State::Eval(args[1].clone(), env)
+                                        State::Eval(idx_expr, env)
                                     }
                                     _ => unreachable!(),
                                 }
