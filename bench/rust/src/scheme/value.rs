@@ -33,6 +33,8 @@ pub enum Value {
         closure_env: Rc<Env>,
     },
     Continuation(CapturedCont),
+    /// A dotted pair (improper list): (a . b) where b is not a list.
+    DottedPair(Box<Value>, Box<Value>),
     SyntaxRules {
         literals: Vec<String>,
         rules: Vec<(Vec<Expr>, Expr)>,
@@ -58,6 +60,7 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Void, Value::Void) => true,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
+            (Value::DottedPair(a1, b1), Value::DottedPair(a2, b2)) => a1 == a2 && b1 == b2,
             (Value::Continuation(_), Value::Continuation(_)) => false,
             (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
             _ => false,
@@ -79,6 +82,7 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_display_string()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::DottedPair(a, b) => format!("({} . {})", a.to_display_string(), b.to_display_string()),
             Value::Void => "".into(),
             Value::Builtin(name) => format!("#<procedure:{}>", name),
             Value::Lambda { .. } => "#<procedure>".into(),
@@ -95,6 +99,7 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_display_output()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::DottedPair(a, b) => format!("({} . {})", a.to_display_output(), b.to_display_output()),
             Value::Continuation(_) => "#<continuation>".into(),
             Value::SyntaxRules { .. } => "#<macro>".into(),
             other => other.to_display_string(),

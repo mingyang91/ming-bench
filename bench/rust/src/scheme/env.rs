@@ -30,6 +30,16 @@ impl Env {
             "symbol->string", "string->symbol",
             "string-ref", "string-copy", "string-set!", "char?",
             "call/cc", "call-with-current-continuation",
+            "eq?", "equal?", "map",
+            "abs", "modulo", "remainder", "quotient",
+            "min", "max", "expt",
+            "zero?", "positive?", "negative?", "odd?", "even?",
+            "list-ref", "list-tail", "list?", "assoc",
+            "char-alphabetic?", "char-numeric?",
+            "char-upcase", "char-downcase",
+            "char=?", "char<?",
+            "string=?", "string<?", "string-ci=?",
+            "string-upcase", "string-downcase",
         ] {
             bindings.insert(name.into(), Value::Builtin(name.into()));
         }

@@ -36,6 +36,14 @@ enum Frame {
         env: Rc<Env>,
     },
     CondTest { clause_body: Vec<Expr>, rest_clauses: Vec<Expr>, env: Rc<Env> },
+    MapStep {
+        func: Value,
+        lists: Vec<Vec<Value>>,
+        index: usize,
+        results: Vec<Value>,
+        env: Rc<Env>,
+        span: Span,
+    },
 }
 
 /// CEK machine state.
@@ -667,6 +675,31 @@ fn step_ret(val: Value, frame: Frame, k: &mut Vec<Frame>) -> Result<State, EvalE
                 Ok(State::Eval(next_expr, env))
             }
         }
+        Frame::MapStep {
+            func,
+            lists,
+            index,
+            mut results,
+            env,
+            span,
+        } => {
+            results.push(val);
+            let next_index = index + 1;
+            if next_index >= lists[0].len() {
+                Ok(State::Ret(Value::List(results)))
+            } else {
+                let next_args: Vec<Value> = lists.iter().map(|l| l[next_index].clone()).collect();
+                k.push(Frame::MapStep {
+                    func: func.clone(),
+                    lists,
+                    index: next_index,
+                    results,
+                    env: Rc::clone(&env),
+                    span,
+                });
+                Ok(State::Apply(func, next_args, env, span))
+            }
+        }
         Frame::CondTest {
             clause_body,
             rest_clauses,
@@ -719,6 +752,43 @@ fn step_apply(
                 let f = args.remove(0);
                 args.extend(tail);
                 Ok(State::Apply(f, args, Rc::clone(env), span))
+            }
+            "map" => {
+                if args.len() < 2 {
+                    return Err(ErrorKind::WrongArgCount {
+                        expected: 2,
+                        got: args.len(),
+                    }
+                    .into());
+                }
+                let mut args = args;
+                let func = args.remove(0);
+                let mut lists: Vec<Vec<Value>> = Vec::new();
+                for arg in args {
+                    match arg {
+                        Value::List(l) => lists.push(l),
+                        other => {
+                            return Err(ErrorKind::TypeMismatch {
+                                expected: "list".into(),
+                                got: other.to_display_string(),
+                            }
+                            .into())
+                        }
+                    }
+                }
+                if lists.is_empty() || lists[0].is_empty() {
+                    return Ok(State::Ret(Value::List(Vec::new())));
+                }
+                let first_args: Vec<Value> = lists.iter().map(|l| l[0].clone()).collect();
+                k.push(Frame::MapStep {
+                    func: func.clone(),
+                    lists,
+                    index: 0,
+                    results: Vec::new(),
+                    env: Rc::clone(env),
+                    span,
+                });
+                Ok(State::Apply(func, first_args, Rc::clone(env), span))
             }
             "call/cc" | "call-with-current-continuation" => {
                 if args.len() != 1 {
@@ -954,14 +1024,118 @@ fn parse_let_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
 
 fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
     match name {
+        "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">="
+        | "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt"
+        | "zero?" | "positive?" | "negative?" | "odd?" | "even?" => {
+            apply_numeric_builtin(name, args)
+        }
+        "cons" | "car" | "cdr" | "null?" | "list" | "length" | "append"
+        | "list-ref" | "list-tail" | "list?" | "assoc" => {
+            apply_list_builtin(name, args)
+        }
+        "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase"
+        | "char=?" | "char<?" | "string=?" | "string<?" | "string-ci=?"
+        | "string-upcase" | "string-downcase" => {
+            apply_char_cmp_builtin(name, args)
+        }
+        "string-append" | "string-length" | "substring" | "string->number"
+        | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
+        | "string-copy" | "string-set!" => apply_string_builtin(name, args),
+        "not" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                }
+                .into());
+            }
+            Ok(Value::Boolean(!args[0].is_truthy()))
+        }
+        "string?" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
+        }
+        "number?" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+        }
+        "boolean?" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Boolean(_))))
+        }
+        "pair?" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            Ok(Value::Boolean(matches!(
+                &args[0],
+                Value::List(elems) if !elems.is_empty()
+            ) || matches!(&args[0], Value::DottedPair(_, _))))
+        }
+        "symbol?" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
+        }
+        "char?" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
+        }
+        "display" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            env.write_output(&args[0].to_display_output());
+            Ok(Value::Void)
+        }
+        "write" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            env.write_output(&args[0].to_display_string());
+            Ok(Value::Void)
+        }
+        "newline" => {
+            if !args.is_empty() {
+                return Err(ErrorKind::WrongArgCount { expected: 0, got: args.len() }.into());
+            }
+            env.write_output("\n");
+            Ok(Value::Void)
+        }
+        "eq?" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            Ok(Value::Boolean(scheme_eq(&args[0], &args[1])))
+        }
+        "equal?" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            Ok(Value::Boolean(args[0] == args[1]))
+        }
+        _ => Err(ErrorKind::NotAProcedure {
+            value: format!("#<procedure:{}>", name),
+        }
+        .into()),
+    }
+}
+
+fn apply_numeric_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
         "+" => arith_variadic(args, 0, |a, b| Ok(a + b)),
         "-" => {
             if args.is_empty() {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 1,
-                    got: 0,
-                }
-                .into());
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: 0 }.into());
             }
             if args.len() == 1 {
                 let n = require_int(&args[0])?;
@@ -979,11 +1153,7 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
         "*" => arith_variadic(args, 1, |a, b| Ok(a * b)),
         "/" => {
             if args.is_empty() {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 1,
-                    got: 0,
-                }
-                .into());
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: 0 }.into());
             }
             let first = require_int(&args[0])?;
             if args.len() == 1 {
@@ -1007,23 +1177,136 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
         "=" => compare_nums(args, |a, b| a == b),
         "<=" => compare_nums(args, |a, b| a <= b),
         ">=" => compare_nums(args, |a, b| a >= b),
-        "not" => {
+        "abs" => {
             if args.len() != 1 {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            let n = require_int(&args[0])?;
+            Ok(Value::Integer(n.abs()))
+        }
+        "modulo" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            let a = require_int(&args[0])?;
+            let b = require_int(&args[1])?;
+            if b == 0 {
+                return Err(ErrorKind::DivisionByZero.into());
+            }
+            let r = a % b;
+            let result = if r != 0 && (r > 0) != (b > 0) { r + b } else { r };
+            Ok(Value::Integer(result))
+        }
+        "remainder" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            let a = require_int(&args[0])?;
+            let b = require_int(&args[1])?;
+            if b == 0 {
+                return Err(ErrorKind::DivisionByZero.into());
+            }
+            Ok(Value::Integer(a % b))
+        }
+        "quotient" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            let a = require_int(&args[0])?;
+            let b = require_int(&args[1])?;
+            if b == 0 {
+                return Err(ErrorKind::DivisionByZero.into());
+            }
+            Ok(Value::Integer(a / b))
+        }
+        "min" => {
+            if args.is_empty() {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: 0 }.into());
+            }
+            let mut result = require_int(&args[0])?;
+            for arg in &args[1..] {
+                let n = require_int(arg)?;
+                if n < result {
+                    result = n;
+                }
+            }
+            Ok(Value::Integer(result))
+        }
+        "max" => {
+            if args.is_empty() {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: 0 }.into());
+            }
+            let mut result = require_int(&args[0])?;
+            for arg in &args[1..] {
+                let n = require_int(arg)?;
+                if n > result {
+                    result = n;
+                }
+            }
+            Ok(Value::Integer(result))
+        }
+        "expt" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            let base = require_int(&args[0])?;
+            let exp = require_int(&args[1])?;
+            if exp < 0 {
+                return Err(ErrorKind::TypeMismatch {
+                    expected: "non-negative exponent".into(),
+                    got: exp.to_string(),
                 }
                 .into());
             }
-            Ok(Value::Boolean(!args[0].is_truthy()))
+            Ok(Value::Integer(base.pow(exp as u32)))
         }
+        "zero?" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            let n = require_int(&args[0])?;
+            Ok(Value::Boolean(n == 0))
+        }
+        "positive?" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            let n = require_int(&args[0])?;
+            Ok(Value::Boolean(n > 0))
+        }
+        "negative?" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            let n = require_int(&args[0])?;
+            Ok(Value::Boolean(n < 0))
+        }
+        "odd?" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            let n = require_int(&args[0])?;
+            Ok(Value::Boolean(n % 2 != 0))
+        }
+        "even?" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            let n = require_int(&args[0])?;
+            Ok(Value::Boolean(n % 2 == 0))
+        }
+        _ => Err(ErrorKind::NotAProcedure {
+            value: format!("#<procedure:{}>", name),
+        }
+        .into()),
+    }
+}
+
+fn apply_list_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
         "cons" => {
             if args.len() != 2 {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 2,
-                    got: args.len(),
-                }
-                .into());
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
             }
             match &args[1] {
                 Value::List(tail) => {
@@ -1031,19 +1314,23 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
                     new_list.extend(tail.iter().cloned());
                     Ok(Value::List(new_list))
                 }
-                _ => Ok(Value::List(vec![args[0].clone(), args[1].clone()])),
+                Value::DottedPair(_, _) => Ok(Value::DottedPair(
+                    Box::new(args[0].clone()),
+                    Box::new(args[1].clone()),
+                )),
+                _ => Ok(Value::DottedPair(
+                    Box::new(args[0].clone()),
+                    Box::new(args[1].clone()),
+                )),
             }
         }
         "car" => {
             if args.len() != 1 {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                }
-                .into());
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             match &args[0] {
                 Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
+                Value::DottedPair(a, _) => Ok(*a.clone()),
                 _ => Err(ErrorKind::TypeMismatch {
                     expected: "pair".into(),
                     got: args[0].to_display_string(),
@@ -1053,14 +1340,11 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
         }
         "cdr" => {
             if args.len() != 1 {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                }
-                .into());
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             match &args[0] {
                 Value::List(elems) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec())),
+                Value::DottedPair(_, b) => Ok(*b.clone()),
                 _ => Err(ErrorKind::TypeMismatch {
                     expected: "pair".into(),
                     got: args[0].to_display_string(),
@@ -1070,11 +1354,7 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
         }
         "null?" => {
             if args.len() != 1 {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                }
-                .into());
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             Ok(Value::Boolean(matches!(
                 &args[0],
@@ -1084,11 +1364,7 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
         "list" => Ok(Value::List(args.to_vec())),
         "length" => {
             if args.len() != 1 {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                }
-                .into());
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             match &args[0] {
                 Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
@@ -1115,105 +1391,180 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
             }
             Ok(Value::List(result))
         }
-        "string?" => {
+        "list-ref" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            let elems = match &args[0] {
+                Value::List(l) => l,
+                other => {
+                    return Err(ErrorKind::TypeMismatch {
+                        expected: "list".into(),
+                        got: other.to_display_string(),
+                    }
+                    .into())
+                }
+            };
+            let idx = require_int(&args[1])? as usize;
+            if idx >= elems.len() {
+                return Err(ErrorKind::TypeMismatch {
+                    expected: "valid list index".into(),
+                    got: format!("index {} for list of length {}", idx, elems.len()),
+                }
+                .into());
+            }
+            Ok(elems[idx].clone())
+        }
+        "list-tail" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            let elems = match &args[0] {
+                Value::List(l) => l,
+                other => {
+                    return Err(ErrorKind::TypeMismatch {
+                        expected: "list".into(),
+                        got: other.to_display_string(),
+                    }
+                    .into())
+                }
+            };
+            let idx = require_int(&args[1])? as usize;
+            if idx > elems.len() {
+                return Err(ErrorKind::TypeMismatch {
+                    expected: "valid list index".into(),
+                    got: format!("index {} for list of length {}", idx, elems.len()),
+                }
+                .into());
+            }
+            Ok(Value::List(elems[idx..].to_vec()))
+        }
+        "list?" => {
             if args.len() != 1 {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                }
-                .into());
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
-            Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
+            Ok(Value::Boolean(matches!(&args[0], Value::List(_))))
         }
-        "number?" => {
+        "assoc" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            let key = &args[0];
+            let alist = match &args[1] {
+                Value::List(l) => l,
+                other => {
+                    return Err(ErrorKind::TypeMismatch {
+                        expected: "list".into(),
+                        got: other.to_display_string(),
+                    }
+                    .into())
+                }
+            };
+            for entry in alist {
+                match entry {
+                    Value::List(pair) if !pair.is_empty() => {
+                        if pair[0] == *key {
+                            return Ok(entry.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Value::Boolean(false))
+        }
+        _ => Err(ErrorKind::NotAProcedure {
+            value: format!("#<procedure:{}>", name),
+        }
+        .into()),
+    }
+}
+
+fn apply_char_cmp_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
+        "char-alphabetic?" => {
             if args.len() != 1 {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                }
-                .into());
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
-            Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+            let c = require_char(&args[0])?;
+            Ok(Value::Boolean(c.is_alphabetic()))
         }
-        "boolean?" => {
+        "char-numeric?" => {
             if args.len() != 1 {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                }
-                .into());
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
-            Ok(Value::Boolean(matches!(&args[0], Value::Boolean(_))))
+            let c = require_char(&args[0])?;
+            Ok(Value::Boolean(c.is_ascii_digit()))
         }
-        "pair?" => {
+        "char-upcase" => {
             if args.len() != 1 {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                }
-                .into());
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
-            Ok(Value::Boolean(matches!(
-                &args[0],
-                Value::List(elems) if !elems.is_empty()
-            )))
+            let c = require_char(&args[0])?;
+            Ok(Value::Char(c.to_ascii_uppercase()))
         }
-        "symbol?" => {
+        "char-downcase" => {
             if args.len() != 1 {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                }
-                .into());
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
-            Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
+            let c = require_char(&args[0])?;
+            Ok(Value::Char(c.to_ascii_lowercase()))
         }
-        "char?" => {
+        "char=?" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            let a = require_char(&args[0])?;
+            let b = require_char(&args[1])?;
+            Ok(Value::Boolean(a == b))
+        }
+        "char<?" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            let a = require_char(&args[0])?;
+            let b = require_char(&args[1])?;
+            Ok(Value::Boolean(a < b))
+        }
+        "string=?" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            let a = require_string(&args[0])?;
+            let b = require_string(&args[1])?;
+            Ok(Value::Boolean(*a.borrow() == *b.borrow()))
+        }
+        "string<?" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            let a = require_string(&args[0])?;
+            let b = require_string(&args[1])?;
+            Ok(Value::Boolean(*a.borrow() < *b.borrow()))
+        }
+        "string-ci=?" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            let a = require_string(&args[0])?;
+            let b = require_string(&args[1])?;
+            Ok(Value::Boolean(
+                a.borrow().to_lowercase() == b.borrow().to_lowercase(),
+            ))
+        }
+        "string-upcase" => {
             if args.len() != 1 {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                }
-                .into());
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
-            Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
+            let s = require_string(&args[0])?;
+            Ok(Value::new_str(s.borrow().to_uppercase()))
         }
-        "display" => {
+        "string-downcase" => {
             if args.len() != 1 {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                }
-                .into());
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
-            env.write_output(&args[0].to_display_output());
-            Ok(Value::Void)
+            let s = require_string(&args[0])?;
+            Ok(Value::new_str(s.borrow().to_lowercase()))
         }
-        "write" => {
-            if args.len() != 1 {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                }
-                .into());
-            }
-            env.write_output(&args[0].to_display_string());
-            Ok(Value::Void)
-        }
-        "newline" => {
-            if !args.is_empty() {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 0,
-                    got: args.len(),
-                }
-                .into());
-            }
-            env.write_output("\n");
-            Ok(Value::Void)
-        }
-        "string-append" | "string-length" | "substring" | "string->number"
-        | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
-        | "string-copy" | "string-set!" => apply_string_builtin(name, args),
         _ => Err(ErrorKind::NotAProcedure {
             value: format!("#<procedure:{}>", name),
         }
@@ -1455,6 +1806,43 @@ fn require_int(val: &Value) -> Result<i64, EvalError> {
             got: other.to_display_string(),
         }
         .into()),
+    }
+}
+
+fn require_char(val: &Value) -> Result<char, EvalError> {
+    match val {
+        Value::Char(c) => Ok(*c),
+        other => Err(ErrorKind::TypeMismatch {
+            expected: "char".into(),
+            got: other.to_display_string(),
+        }
+        .into()),
+    }
+}
+
+fn require_string(val: &Value) -> Result<&std::rc::Rc<std::cell::RefCell<String>>, EvalError> {
+    match val {
+        Value::Str(s) => Ok(s),
+        other => Err(ErrorKind::TypeMismatch {
+            expected: "string".into(),
+            got: other.to_display_string(),
+        }
+        .into()),
+    }
+}
+
+/// Scheme `eq?` — identity comparison (not structural equality).
+fn scheme_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::List(x), Value::List(y)) => x.is_empty() && y.is_empty(),
+        (Value::Void, Value::Void) => true,
+        (Value::Str(x), Value::Str(y)) => std::rc::Rc::ptr_eq(x, y),
+        (Value::Builtin(x), Value::Builtin(y)) => x == y,
+        _ => false,
     }
 }
 
