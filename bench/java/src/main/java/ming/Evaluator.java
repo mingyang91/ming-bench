@@ -28,6 +28,7 @@ public class Evaluator {
 
     record Located(Object value, int line, int col) {}
     record Token(Object value, int line, int col) {}
+    private static class VectorLiteral { final List<Object> elements; VectorLiteral(List<Object> elements) { this.elements = elements; } }
 
     private int errLine = 1;
     private int errCol = 1;
@@ -248,7 +249,7 @@ public class Evaluator {
     private String gensym(String base) { return base + "##" + (gensymCounter++); }
 
     private static final java.util.Set<String> SPECIAL_FORMS = java.util.Set.of(
-        "define", "if", "quote", "lambda", "and", "or", "let", "let*", "begin",
+        "define", "if", "quote", "quasiquote", "lambda", "and", "or", "let", "let*", "begin",
         "set!", "cond", "define-syntax", "syntax-rules",
         "letrec", "letrec*", "case", "do", "guard", "define-record-type",
         "syntax-case", "syntax", "with-syntax"
@@ -281,6 +282,14 @@ public class Evaluator {
                 tokens.add(new Token(")", line, col)); i++; col++;
             } else if (c == '\'') {
                 tokens.add(new Token("'", line, col)); i++; col++;
+            } else if (c == '`') {
+                tokens.add(new Token("`", line, col)); i++; col++;
+            } else if (c == ',') {
+                if (i + 1 < len && input.charAt(i + 1) == '@') {
+                    tokens.add(new Token(",@", line, col)); i += 2; col += 2;
+                } else {
+                    tokens.add(new Token(",", line, col)); i++; col++;
+                }
             } else if (c == '"') {
                 int startCol = col;
                 StringBuilder sb = new StringBuilder();
@@ -354,6 +363,9 @@ public class Evaluator {
                         // #' is syntax-quote shorthand
                         tokens.add(new Token("#'", line, startCol));
                         i += 2; col += 2;
+                    } else if (next == '(') {
+                        tokens.add(new Token("#(", line, startCol));
+                        i += 2; col += 2;
                     } else {
                         throw new EvalError(line + ":" + col + ": unknown token: #" + next);
                     }
@@ -417,12 +429,44 @@ public class Evaluator {
             quoteExpr.add(quoted);
             return new Located(quoteExpr, tok.line(), tok.col());
         }
+        if (tok.value().equals("`")) {
+            Object quoted = parse(tokens, pos);
+            List<Object> qqExpr = new ArrayList<>();
+            qqExpr.add("quasiquote");
+            qqExpr.add(quoted);
+            return new Located(qqExpr, tok.line(), tok.col());
+        }
+        if (tok.value().equals(",")) {
+            Object unquoted = parse(tokens, pos);
+            List<Object> uqExpr = new ArrayList<>();
+            uqExpr.add("unquote");
+            uqExpr.add(unquoted);
+            return new Located(uqExpr, tok.line(), tok.col());
+        }
+        if (tok.value().equals(",@")) {
+            Object spliced = parse(tokens, pos);
+            List<Object> usExpr = new ArrayList<>();
+            usExpr.add("unquote-splicing");
+            usExpr.add(spliced);
+            return new Located(usExpr, tok.line(), tok.col());
+        }
         if (tok.value().equals("#'")) {
             Object syntaxed = parse(tokens, pos);
             List<Object> syntaxExpr = new ArrayList<>();
             syntaxExpr.add("syntax");
             syntaxExpr.add(syntaxed);
             return new Located(syntaxExpr, tok.line(), tok.col());
+        }
+        if (tok.value().equals("#(")) {
+            List<Object> elems = new ArrayList<>();
+            while (pos[0] < tokens.size() && !tokens.get(pos[0]).value().equals(")")) {
+                elems.add(parse(tokens, pos));
+            }
+            if (pos[0] >= tokens.size()) {
+                throw new EvalError(tok.line() + ":" + tok.col() + ": missing closing parenthesis for vector literal");
+            }
+            pos[0]++;
+            return new Located(new VectorLiteral(elems), tok.line(), tok.col());
         }
         if (tok.value().equals("(")) {
             List<Object> list = new ArrayList<>();
@@ -443,7 +487,28 @@ public class Evaluator {
 
     private Object listToScheme(Object parsed) {
         if (parsed instanceof Located loc) return listToScheme(loc.value());
+        if (parsed instanceof VectorLiteral vl) {
+            Object[] data = new Object[vl.elements.size()];
+            for (int i = 0; i < vl.elements.size(); i++) {
+                data[i] = listToScheme(vl.elements.get(i));
+            }
+            return new SchemeVector(data);
+        }
         if (parsed instanceof List<?> list) {
+            // Handle dotted pair notation: (a b . c) => list has "." as second-to-last
+            int dotIdx = -1;
+            for (int i = 0; i < list.size(); i++) {
+                Object el = list.get(i);
+                if (el instanceof Located le) el = le.value();
+                if (el instanceof String s && s.equals(".")) { dotIdx = i; break; }
+            }
+            if (dotIdx >= 0 && dotIdx == list.size() - 2) {
+                Object result = listToScheme(list.get(list.size() - 1));
+                for (int i = dotIdx - 1; i >= 0; i--) {
+                    result = new Pair(listToScheme(list.get(i)), result);
+                }
+                return result;
+            }
             Object result = NIL;
             for (int i = list.size() - 1; i >= 0; i--) {
                 result = new Pair(listToScheme(list.get(i)), result);
@@ -556,6 +621,10 @@ public class Evaluator {
                     case "quote" -> {
                         if (list.size() != 2) throw posError("quote: expected 1 argument");
                         return k.apply(listToScheme(list.get(1)));
+                    }
+                    case "quasiquote" -> {
+                        if (list.size() != 2) throw posError("quasiquote: expected 1 argument");
+                        return evalQuasiquote(list.get(1), env, k);
                     }
                     case "lambda" -> {
                         if (list.size() < 3) throw posError("lambda: bad syntax");
@@ -958,6 +1027,15 @@ public class Evaluator {
         return new More(() -> eval(test, env, testResult -> {
             if (!isFalse(testResult)) {
                 if (finalClause.size() == 1) return k.apply(testResult);
+                // Check for => clause: (test => proc)
+                if (finalClause.size() == 3) {
+                    Object arrow = finalClause.get(1);
+                    if (arrow instanceof Located la) arrow = la.value();
+                    if (arrow instanceof String sa && sa.equals("=>")) {
+                        return new More(() -> eval(finalClause.get(2), env, proc ->
+                            applyProc(proc, List.of(testResult), k)));
+                    }
+                }
                 return evalBegin(finalClause, 1, env, k);
             }
             return evalCond(list, clauseIdx + 1, env, k);
@@ -1081,6 +1159,76 @@ public class Evaluator {
             env.define(names.get(idx), val);
             return evalLetrecStarBindings(names, initExprs, idx + 1, env, body, k);
         }));
+    }
+
+    // --- Quasiquote ---
+
+    private Bounce evalQuasiquote(Object tmpl, Env env, Cont k) throws EvalError {
+        return qqExpand(tmpl, env, k);
+    }
+
+    private Bounce qqExpand(Object tmpl, Env env, Cont k) throws EvalError {
+        Object t = tmpl;
+        if (t instanceof Located loc) t = loc.value();
+        // Check for (unquote expr) or (unquote-splicing expr) at the top level
+        if (t instanceof List<?> list && list.size() == 2) {
+            Object head = list.get(0);
+            if (head instanceof Located lh) head = lh.value();
+            if (head instanceof String s && s.equals("unquote")) {
+                return new More(() -> eval(list.get(1), env, k));
+            }
+        }
+        // It's a list - process elements, handling unquote-splicing
+        if (t instanceof List<?> list) {
+            return qqExpandList(list, 0, env, k);
+        }
+        if (t instanceof VectorLiteral vl) {
+            return qqExpandList(vl.elements, 0, env, vecListResult -> {
+                // Convert list result to vector
+                List<Object> items = new ArrayList<>();
+                Object cur = vecListResult;
+                while (cur instanceof Pair p) { items.add(p.car); cur = p.cdr; }
+                return k.apply(new SchemeVector(items.toArray()));
+            });
+        }
+        // Atom - just quote it
+        return k.apply(listToScheme(tmpl));
+    }
+
+    private Bounce qqExpandList(List<?> elements, int idx, Env env, Cont k) throws EvalError {
+        if (idx >= elements.size()) return k.apply(NIL);
+        // Check for dot notation: if next element is "." and it's the second-to-last
+        Object el = elements.get(idx);
+        Object elu = el;
+        if (elu instanceof Located loc) elu = loc.value();
+        if (elu instanceof String s && s.equals(".") && idx == elements.size() - 2) {
+            // Dotted tail - expand the last element as the cdr
+            return qqExpand(elements.get(idx + 1), env, k);
+        }
+        // Check if this element is (unquote-splicing expr)
+        if (elu instanceof List<?> sublist && sublist.size() == 2) {
+            Object head = sublist.get(0);
+            if (head instanceof Located lh) head = lh.value();
+            if (head instanceof String sh && sh.equals("unquote-splicing")) {
+                return new More(() -> eval(sublist.get(1), env, splicedVal -> {
+                    // splicedVal should be a list - append it with the rest
+                    return qqExpandList(elements, idx + 1, env, restVal ->
+                        appendScheme(splicedVal, restVal, k));
+                }));
+            }
+        }
+        // Regular element - expand it and cons with rest
+        return new More(() -> qqExpand(el, env, expandedEl ->
+            qqExpandList(elements, idx + 1, env, restVal ->
+                k.apply(new Pair(expandedEl, restVal)))));
+    }
+
+    private Bounce appendScheme(Object a, Object b, Cont k) throws EvalError {
+        if (a == NIL) return k.apply(b);
+        if (a instanceof Pair p) {
+            return appendScheme(p.cdr, b, rest -> k.apply(new Pair(p.car, rest)));
+        }
+        throw posError("unquote-splicing: expected list");
     }
 
     private Bounce evalCase(List<?> list, Env env, Cont k) throws EvalError {
@@ -1615,8 +1763,57 @@ public class Evaluator {
         if (proc instanceof NativeProc np) {
             return k.apply(np.apply(args));
         }
-        if (proc instanceof String p && isPrimitive(p)) {
-            return k.apply(applyPrimitive(p, args));
+        if (proc instanceof String p) {
+            // Handle CPS-special builtins that can be passed as first-class values
+            switch (p) {
+                case "map" -> {
+                    if (args.size() < 2) throw posError("map: expected at least 2 arguments");
+                    return cpsMap(args.get(0), new ArrayList<>(args.subList(1, args.size())), k);
+                }
+                case "for-each" -> {
+                    if (args.size() < 2) throw posError("for-each: expected at least 2 arguments");
+                    return cpsForEach(args.get(0), new ArrayList<>(args.subList(1, args.size())), k);
+                }
+                case "dynamic-wind" -> {
+                    if (args.size() != 3) throw posError("dynamic-wind: expected 3 arguments");
+                    return cpsDynamicWind(args.get(0), args.get(1), args.get(2), k);
+                }
+                case "raise" -> {
+                    if (args.size() != 1) throw posError("raise: expected 1 argument");
+                    return handleRaise(args.get(0));
+                }
+                case "with-exception-handler" -> {
+                    if (args.size() != 2) throw posError("with-exception-handler: expected 2 arguments");
+                    return cpsWithExceptionHandler(args.get(0), args.get(1), k);
+                }
+                case "values" -> {
+                    if (args.size() == 1) return k.apply(args.get(0));
+                    return k.apply(new MultipleValues(args));
+                }
+                case "call-with-values" -> {
+                    if (args.size() != 2) throw posError("call-with-values: expected 2 arguments");
+                    Object producer = args.get(0);
+                    Object consumer = args.get(1);
+                    return applyProc(producer, List.of(), producerResult -> {
+                        List<Object> consumerArgs;
+                        if (producerResult instanceof MultipleValues mv) {
+                            consumerArgs = mv.values;
+                        } else {
+                            consumerArgs = List.of(producerResult);
+                        }
+                        return applyProc(consumer, consumerArgs, k);
+                    });
+                }
+                case "apply" -> {
+                    Object[] applyResult = handleApply(args);
+                    @SuppressWarnings("unchecked")
+                    List<Object> newArgs = (List<Object>) applyResult[1];
+                    return applyProc(applyResult[0], newArgs, k);
+                }
+                default -> {
+                    if (isPrimitive(p)) return k.apply(applyPrimitive(p, args));
+                }
+            }
         }
         throw posError("not a procedure: " + schemeToString(proc));
     }
@@ -1657,7 +1854,8 @@ public class Evaluator {
             "make-string", "string",
             "string>?", "string<=?", "string>=?",
             "memv", "assq", "memq",
-            "syntax->datum", "datum->syntax"
+            "syntax->datum", "datum->syntax",
+            "error"
     );
 
     private boolean isPrimitive(String name) {
@@ -1694,11 +1892,11 @@ public class Evaluator {
                     yield result;
                 } catch (EvalError e) { throw posError("division by zero"); }
             }
-            case "<" -> { requireArgCount(args, 2, "<"); requireNumber(args.get(0), "<"); requireNumber(args.get(1), "<"); yield numCompare(args.get(0), args.get(1)) < 0; }
-            case ">" -> { requireArgCount(args, 2, ">"); requireNumber(args.get(0), ">"); requireNumber(args.get(1), ">"); yield numCompare(args.get(0), args.get(1)) > 0; }
-            case "=" -> { requireArgCount(args, 2, "="); requireNumber(args.get(0), "="); requireNumber(args.get(1), "="); yield numCompare(args.get(0), args.get(1)) == 0; }
-            case "<=" -> { requireArgCount(args, 2, "<="); requireNumber(args.get(0), "<="); requireNumber(args.get(1), "<="); yield numCompare(args.get(0), args.get(1)) <= 0; }
-            case ">=" -> { requireArgCount(args, 2, ">="); requireNumber(args.get(0), ">="); requireNumber(args.get(1), ">="); yield numCompare(args.get(0), args.get(1)) >= 0; }
+            case "<" -> { yield chainedCompare(args, "<", (a, b) -> numCompare(a, b) < 0); }
+            case ">" -> { yield chainedCompare(args, ">", (a, b) -> numCompare(a, b) > 0); }
+            case "=" -> { yield chainedCompare(args, "=", (a, b) -> numCompare(a, b) == 0); }
+            case "<=" -> { yield chainedCompare(args, "<=", (a, b) -> numCompare(a, b) <= 0); }
+            case ">=" -> { yield chainedCompare(args, ">=", (a, b) -> numCompare(a, b) >= 0); }
             case "cons" -> { requireArgCount(args, 2, "cons"); yield new Pair(args.get(0), args.get(1)); }
             case "car" -> {
                 requireArgCount(args, 1, "car");
@@ -2281,6 +2479,15 @@ public class Evaluator {
                 // In our simplified implementation, just return the datum (2nd arg)
                 yield args.get(1);
             }
+            case "error" -> {
+                if (args.isEmpty()) throw posError("error: expected at least 1 argument");
+                StringBuilder sb = new StringBuilder();
+                sb.append(schemeToString(args.get(0)));
+                for (int i = 1; i < args.size(); i++) {
+                    sb.append(" ").append(schemeToString(args.get(i)));
+                }
+                throw new EvalError(sb.toString());
+            }
             default -> throw posError("unbound variable: " + proc);
         };
     }
@@ -2807,6 +3014,18 @@ public class Evaluator {
         long[] ra = rparts(a), rb = rparts(b);
         if (rb[0] == 0) throw new EvalError("division by zero");
         return makeRational(ra[0] * rb[1], ra[1] * rb[0]);
+    }
+
+    @FunctionalInterface
+    private interface NumPred { boolean test(Object a, Object b); }
+
+    private Object chainedCompare(List<Object> args, String name, NumPred pred) throws EvalError {
+        if (args.size() < 2) throw posError(name + ": expected at least 2 arguments");
+        for (Object a : args) requireNumber(a, name);
+        for (int i = 0; i < args.size() - 1; i++) {
+            if (!pred.test(args.get(i), args.get(i + 1))) return Boolean.FALSE;
+        }
+        return Boolean.TRUE;
     }
 
     private static int numCompare(Object a, Object b) {
