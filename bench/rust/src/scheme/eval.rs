@@ -7,7 +7,7 @@ use crate::scheme::value::{Span, Value};
 
 const BUILTINS: &[&str] = &[
     "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
-    "cons", "car", "cdr", "null?", "list", "length", "append",
+    "cons", "car", "cdr", "null?", "list", "length", "append", "reverse",
     "string?", "number?", "boolean?", "pair?", "symbol?", "char?",
     "display", "write", "newline",
     "string-append", "string-length", "substring",
@@ -27,6 +27,7 @@ const BUILTINS: &[&str] = &[
     "eqv?",
     "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
     "vector?", "vector->list", "list->vector",
+    "dynamic-wind",
 ];
 
 pub fn default_env() -> Rc<RefCell<Env>> {
@@ -129,6 +130,36 @@ enum Frame {
         clauses: Vec<Value>,
         env: Rc<RefCell<Env>>,
     },
+    /// After in-thunk returns: push winder, call body-thunk
+    DynamicWindBody {
+        in_thunk: Value,
+        body_thunk: Value,
+        out_thunk: Value,
+    },
+    /// After body-thunk returns: pop winder, call out-thunk, then return body value
+    DynamicWindOut {
+        out_thunk: Value,
+    },
+    /// After out-thunk returns: yield the saved body value
+    DynamicWindDone {
+        body_value: Value,
+    },
+    /// Continuation restore: run wind thunks in sequence, then restore
+    DynamicWindRestore {
+        /// Winder to push after the thunk that just returned (if any)
+        pending_push: Option<Winder>,
+        /// Remaining (thunk, optional winder to push after call)
+        remaining: Vec<(Value, Option<Winder>)>,
+        cont_id: usize,
+        value: Value,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct Winder {
+    id: usize,
+    in_thunk: Value,
+    out_thunk: Value,
 }
 
 enum Control {
@@ -185,13 +216,24 @@ impl Kont {
 struct Machine {
     kont: Kont,
     saved_conts: Vec<Kont>,
+    winders: Vec<Winder>,
+    saved_winders: Vec<Vec<Winder>>,
+    winder_counter: usize,
     output: Rc<RefCell<String>>,
     gensym_counter: usize,
 }
 
 impl Machine {
     fn new(output: Rc<RefCell<String>>) -> Self {
-        Machine { kont: Kont::new(), saved_conts: Vec::new(), output, gensym_counter: 0 }
+        Machine {
+            kont: Kont::new(),
+            saved_conts: Vec::new(),
+            winders: Vec::new(),
+            saved_winders: Vec::new(),
+            winder_counter: 0,
+            output,
+            gensym_counter: 0,
+        }
     }
 
     fn run(&mut self, exprs: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
@@ -495,6 +537,50 @@ impl Machine {
             Frame::CaseKey { clauses, env } => {
                 self.dispatch_case(val, &clauses, &env)
             }
+            Frame::DynamicWindBody { in_thunk, body_thunk, out_thunk } => {
+                // in-thunk just returned — push winder, then call body-thunk
+                let id = self.winder_counter;
+                self.winder_counter += 1;
+                self.winders.push(Winder {
+                    id,
+                    in_thunk,
+                    out_thunk: out_thunk.clone(),
+                });
+                self.kont.push(Frame::DynamicWindOut {
+                    out_thunk,
+                });
+                Ok(Control::Apply(body_thunk, vec![], None))
+            }
+            Frame::DynamicWindOut { out_thunk } => {
+                // body-thunk just returned with `val` — pop winder, call out-thunk
+                self.winders.pop();
+                self.kont.push(Frame::DynamicWindDone { body_value: val });
+                Ok(Control::Apply(out_thunk, vec![], None))
+            }
+            Frame::DynamicWindDone { body_value } => {
+                // out-thunk just returned — yield the saved body value
+                Ok(Control::Continue(body_value))
+            }
+            Frame::DynamicWindRestore { pending_push, mut remaining, cont_id, value } => {
+                // A wind thunk just returned — apply pending push if any
+                if let Some(w) = pending_push {
+                    self.winders.push(w);
+                }
+                if let Some((thunk, push)) = remaining.first().cloned() {
+                    remaining.remove(0);
+                    self.kont.push(Frame::DynamicWindRestore {
+                        pending_push: push,
+                        remaining,
+                        cont_id,
+                        value,
+                    });
+                    Ok(Control::Apply(thunk, vec![], None))
+                } else {
+                    // All wind thunks done — now restore the actual continuation
+                    self.kont = self.saved_conts[cont_id].clone();
+                    self.restore_continuation(value)
+                }
+            }
         }
     }
 
@@ -541,8 +627,41 @@ impl Machine {
                     }.at(span));
                 }
                 let val = args.into_iter().next().expect("checked len");
-                self.kont = self.saved_conts[id].clone();
-                self.restore_continuation(val)
+                let target_winders = &self.saved_winders[id];
+                // Find common prefix length
+                let common = self.winders.iter().zip(target_winders.iter())
+                    .take_while(|(a, b)| a.id == b.id)
+                    .count();
+                let need_unwind = self.winders.len() > common;
+                let need_rewind = target_winders.len() > common;
+                if !need_unwind && !need_rewind {
+                    // No winding needed — direct restore
+                    self.kont = self.saved_conts[id].clone();
+                    self.restore_continuation(val)
+                } else {
+                    // Build action list: unwind out-thunks (innermost first),
+                    // then rewind in-thunks (outermost first)
+                    let mut actions: Vec<(Value, Option<Winder>)> = Vec::new();
+                    // Unwind
+                    for w in self.winders[common..].iter().rev() {
+                        actions.push((w.out_thunk.clone(), None));
+                    }
+                    // Pop unwound winders
+                    self.winders.truncate(common);
+                    // Rewind
+                    for w in &target_winders[common..] {
+                        actions.push((w.in_thunk.clone(), Some(w.clone())));
+                    }
+                    // Start calling the first thunk
+                    let (first_thunk, first_push) = actions.remove(0);
+                    self.kont.push(Frame::DynamicWindRestore {
+                        pending_push: first_push,
+                        remaining: actions,
+                        cont_id: id,
+                        value: val,
+                    });
+                    Ok(Control::Apply(first_thunk, vec![], span))
+                }
             }
             other => Err(EvalError::NotAProcedure { value: other.to_string() }.at(span)),
         }
@@ -564,8 +683,28 @@ impl Machine {
                 let proc = args.into_iter().next().expect("checked len");
                 let id = self.saved_conts.len();
                 self.saved_conts.push(self.kont.clone());
+                self.saved_winders.push(self.winders.clone());
                 let cont = Value::Continuation(id);
                 Ok(Control::Apply(proc, vec![cont], span))
+            }
+            "dynamic-wind" => {
+                if args.len() != 3 {
+                    return Err(EvalError::WrongArgCount {
+                        expected: 3, got: args.len(),
+                    }.at(span));
+                }
+                let mut it = args.into_iter();
+                let in_thunk = it.next().expect("checked len");
+                let body_thunk = it.next().expect("checked len");
+                let out_thunk = it.next().expect("checked len");
+                // Push frame to handle what happens after in-thunk returns
+                self.kont.push(Frame::DynamicWindBody {
+                    in_thunk: in_thunk.clone(),
+                    body_thunk,
+                    out_thunk,
+                });
+                // Call in-thunk with no arguments
+                Ok(Control::Apply(in_thunk, vec![], span))
             }
             "map" => {
                 if args.len() < 2 {
@@ -1501,6 +1640,21 @@ fn apply_builtin(
                     expected: "list".into(), got: format!("{other}"),
                 }),
                 (other, _) => Err(EvalError::TypeMismatch {
+                    expected: "list".into(), got: format!("{other}"),
+                }),
+            }
+        }
+        "reverse" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            match &args[0] {
+                Value::List(elems, _) => {
+                    let mut rev = elems.clone();
+                    rev.reverse();
+                    Ok(Value::List(rev, None))
+                }
+                other => Err(EvalError::TypeMismatch {
                     expected: "list".into(), got: format!("{other}"),
                 }),
             }
