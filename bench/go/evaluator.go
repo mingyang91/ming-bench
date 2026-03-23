@@ -365,6 +365,18 @@ func (e *env) set(name string, v *value) {
 	e.bindings[name] = v
 }
 
+// setExisting mutates an existing binding, walking up the chain. Returns false if unbound.
+func (e *env) setExisting(name string, v *value) bool {
+	if _, ok := e.bindings[name]; ok {
+		e.bindings[name] = v
+		return true
+	}
+	if e.parent != nil {
+		return e.parent.setExisting(name, v)
+	}
+	return false
+}
+
 // ---------- Interpreter ----------
 
 type interp struct {
@@ -435,6 +447,20 @@ func eval(e *expr, envir *env) (*value, error) {
 
 				case "define":
 					return evalDefine(e, envir)
+
+				case "set!":
+					if len(e.items) != 3 {
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: bad syntax", e.line, e.col)}
+					}
+					name := e.items[1].sval
+					val, err := eval(e.items[2], envir)
+					if err != nil {
+						return nil, err
+					}
+					if !envir.setExisting(name, val) {
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: unbound variable: %s", e.line, e.col, name)}
+					}
+					return voidVal, nil
 
 				case "if":
 					if len(e.items) < 3 || len(e.items) > 4 {
