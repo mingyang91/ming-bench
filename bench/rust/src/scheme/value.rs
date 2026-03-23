@@ -58,6 +58,11 @@ pub enum Value {
     SyntaxTransformer(Box<Value>),
     /// Multiple return values from `(values ...)`.
     MultipleValues(Vec<Value>),
+    /// A case-lambda with multiple clauses.
+    CaseLambda {
+        clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>)>,
+        closure_env: Rc<Env>,
+    },
     /// A record instance created by `define-record-type`.
     Record {
         type_tag: Rc<()>,
@@ -121,6 +126,7 @@ impl PartialEq for Value {
                     _ => false,
                 }
             }
+            (Value::CaseLambda { .. }, Value::CaseLambda { .. }) => false,
             (Value::Continuation(_), Value::Continuation(_)) => false,
             (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
             (Value::SyntaxObject(_), Value::SyntaxObject(_)) => false,
@@ -157,7 +163,7 @@ impl Value {
             Value::Pair(cell) => display_pair_chain(cell, Value::to_display_string),
             Value::Void => "".into(),
             Value::Builtin(name) => format!("#<procedure:{}>", name),
-            Value::Lambda { .. } => "#<procedure>".into(),
+            Value::Lambda { .. } | Value::CaseLambda { .. } => "#<procedure>".into(),
             Value::Continuation(_) => "#<continuation>".into(),
             Value::SyntaxRules { .. } => "#<macro>".into(),
             Value::SyntaxObject(_) => "#<syntax>".into(),

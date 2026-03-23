@@ -444,6 +444,7 @@ fn step_eval_list(
             "set!" => return step_set_bang(&elems[1..], env, k),
             "quote" => return eval_quote(&elems[1..]).map(State::Ret),
             "lambda" => return eval_lambda(&elems[1..], env).map(State::Ret),
+            "case-lambda" => return eval_case_lambda(&elems[1..], env).map(State::Ret),
             "begin" => return step_begin(&elems[1..], env, k),
             "and" => return step_and(&elems[1..], env, k),
             "or" => return step_or(&elems[1..], env, k),
@@ -2185,9 +2186,49 @@ fn step_apply(
                 Ok(begin_seq(&body, &local_env, k))
             }
         }
+        Value::CaseLambda { clauses, closure_env } => {
+            for (params, rest_param, body) in &clauses {
+                let matches = match rest_param {
+                    Some(_) => args.len() >= params.len(),
+                    None => args.len() == params.len(),
+                };
+                if matches {
+                    let local_env = bind_args(params, rest_param, args, &closure_env)?;
+                    if body.is_empty() {
+                        return Ok(State::Ret(Value::Void));
+                    } else {
+                        return Ok(begin_seq(body, &local_env, k));
+                    }
+                }
+            }
+            Err(ErrorKind::WrongArgCount {
+                expected: clauses.first().map_or(0, |(p, _, _)| p.len()),
+                got: args.len(),
+            }.into())
+        }
         Value::Continuation(captured) => {
             apply_continuation(captured, args, env, k, wind, span, handlers)
         }
+        Value::RecordConstructor { .. }
+        | Value::RecordPredicate { .. }
+        | Value::RecordAccessor { .. } => apply_record_op(func, args),
+        Value::SyntaxRules { .. } | Value::SyntaxTransformer(_) => Err(ErrorKind::NotAProcedure {
+            value: "#<macro>".into(),
+        }
+        .into()),
+        Value::SyntaxObject(_) => Err(ErrorKind::NotAProcedure {
+            value: "#<syntax>".into(),
+        }
+        .into()),
+        other => Err(ErrorKind::NotAProcedure {
+            value: other.to_display_string(),
+        }
+        .into()),
+    }
+}
+
+fn apply_record_op(func: Value, args: Vec<Value>) -> Result<State, EvalError> {
+    match func {
         Value::RecordConstructor { type_tag, type_name, field_names } => {
             if args.len() != field_names.len() {
                 return Err(ErrorKind::WrongArgCount {
@@ -2231,18 +2272,9 @@ fn step_apply(
                 }.into()),
             }
         }
-        Value::SyntaxRules { .. } | Value::SyntaxTransformer(_) => Err(ErrorKind::NotAProcedure {
-            value: "#<macro>".into(),
-        }
-        .into()),
-        Value::SyntaxObject(_) => Err(ErrorKind::NotAProcedure {
-            value: "#<syntax>".into(),
-        }
-        .into()),
-        other => Err(ErrorKind::NotAProcedure {
-            value: other.to_display_string(),
-        }
-        .into()),
+        _ => Err(ErrorKind::NotAProcedure {
+            value: func.to_display_string(),
+        }.into()),
     }
 }
 
@@ -2390,6 +2422,46 @@ fn eval_lambda(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
         params,
         rest_param,
         body,
+        closure_env: Rc::clone(env),
+    })
+}
+
+fn eval_case_lambda(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let mut clauses = Vec::new();
+    for clause in args {
+        let elems = match &clause.kind {
+            ExprKind::List(elems) => elems,
+            _ => {
+                return Err(ErrorKind::BadSyntax {
+                    form: "case-lambda".into(),
+                    message: "each clause must be a list".into(),
+                }
+                .into())
+            }
+        };
+        if elems.len() < 2 {
+            return Err(ErrorKind::BadSyntax {
+                form: "case-lambda".into(),
+                message: "each clause needs (params body...)".into(),
+            }
+            .into());
+        }
+        let (params, rest_param) = match &elems[0].kind {
+            ExprKind::List(param_exprs) => parse_params(param_exprs, "case-lambda")?,
+            ExprKind::Symbol(s) => (Vec::new(), Some(s.clone())),
+            _ => {
+                return Err(ErrorKind::BadSyntax {
+                    form: "case-lambda".into(),
+                    message: "expected parameter list".into(),
+                }
+                .into())
+            }
+        };
+        let body = elems[1..].to_vec();
+        clauses.push((params, rest_param, body));
+    }
+    Ok(Value::CaseLambda {
+        clauses,
         closure_env: Rc::clone(env),
     })
 }
@@ -2870,7 +2942,8 @@ fn apply_type_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             }
             Ok(Value::Boolean(matches!(
                 &args[0],
-                Value::Builtin(_) | Value::Lambda { .. } | Value::Continuation(_)
+                Value::Builtin(_) | Value::Lambda { .. } | Value::CaseLambda { .. }
+                | Value::Continuation(_)
                 | Value::RecordConstructor { .. } | Value::RecordPredicate { .. }
                 | Value::RecordAccessor { .. }
             )))
