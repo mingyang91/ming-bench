@@ -574,6 +574,10 @@ function makeGlobalEnv(): Env {
   // dynamic-wind is handled specially in applyCPS
   defBuiltin('dynamic-wind', (_args) => { throw new EvalError('dynamic-wind: internal error'); });
 
+  // raise and with-exception-handler are handled specially in applyCPS
+  defBuiltin('raise', (_args) => { throw new EvalError('raise: internal error'); });
+  defBuiltin('with-exception-handler', (_args) => { throw new EvalError('with-exception-handler: internal error'); });
+
   defBuiltin('number?', (args) => ({ tag: 'boolean', value: args[0].tag === 'number' }));
   defBuiltin('string?', (args) => ({ tag: 'boolean', value: args[0].tag === 'string' }));
   defBuiltin('boolean?', (args) => ({ tag: 'boolean', value: args[0].tag === 'boolean' }));
@@ -901,6 +905,30 @@ function evaluateLetBindingsCPS(bindings: SchemeVal[], idx: number, outerEnv: En
   });
 }
 
+function evaluateGuardClauses(clauses: SchemeVal[], idx: number, env: Env, k: K, exnVal: SchemeVal): TResult {
+  if (idx >= clauses.length) {
+    // No clause matched, re-raise
+    if (exHandlerStack.length === 0) {
+      throw new EvalError(`unhandled exception: ${writeVal(exnVal)}`);
+    }
+    const handler = exHandlerStack.pop()!;
+    return handler(exnVal);
+  }
+  const clause = (clauses[idx] as { tag: 'list'; value: SchemeVal[] }).value;
+  if (clause[0].tag === 'symbol' && clause[0].value === 'else') {
+    return evaluateSeqCPS(clause, 1, env, k);
+  }
+  return evaluateCPS(clause[0], env, (testVal) => {
+    if (isTruthy(testVal)) {
+      if (clause.length > 1) {
+        return evaluateSeqCPS(clause, 1, env, k);
+      }
+      return callK(k, testVal);
+    }
+    return evaluateGuardClauses(clauses, idx + 1, env, k, exnVal);
+  });
+}
+
 function doWindShift(from: WindEntry[], to: WindEntry[], then: () => TResult): TResult {
   // Find common prefix length (by identity)
   let common = 0;
@@ -960,6 +988,29 @@ function applyCPS(proc: SchemeVal, args: SchemeVal[], k: K, pos?: Pos): TResult 
         });
       });
     }
+    // raise: signal an exception
+    if (proc.name === 'raise') {
+      const val = args[0];
+      if (exHandlerStack.length === 0) {
+        throw new EvalError(`unhandled exception: ${writeVal(val)}`);
+      }
+      const handler = exHandlerStack.pop()!;
+      return handler(val);
+    }
+
+    // with-exception-handler: install low-level handler
+    if (proc.name === 'with-exception-handler') {
+      const [handlerProc, thunkProc] = args;
+      const handler: ExHandler = (val) => {
+        return applyCPS(handlerProc, [val], k);
+      };
+      exHandlerStack.push(handler);
+      return applyCPS(thunkProc, [], (result) => {
+        exHandlerStack.pop();
+        return callK(k, result);
+      });
+    }
+
     // apply: restructure args and delegate
     if (proc.name === 'apply') {
       const actualProc = args[0];
@@ -1302,6 +1353,32 @@ function evaluateCPS(expr: SchemeVal, env: Env, k: K): TResult {
       });
     }
 
+    if (op === 'guard') {
+      // (guard (var clause ...) body ...)
+      const guardSpec = (items[1] as { tag: 'list'; value: SchemeVal[] }).value;
+      const exnVar = (guardSpec[0] as { tag: 'symbol'; value: string }).value;
+      const clauses = guardSpec.slice(1);
+      const body = items.slice(2);
+
+      const guardK = k;
+      const guardWind = [...windStack];
+
+      const handler: ExHandler = (val) => {
+        const raiseWind = [...windStack];
+        return doWindShift(raiseWind, guardWind, () => {
+          const guardEnv = new Env(env);
+          guardEnv.define(exnVar, val);
+          return evaluateGuardClauses(clauses, 0, guardEnv, guardK, val);
+        });
+      };
+
+      exHandlerStack.push(handler);
+      return evaluateSeqCPS(body, 0, env, (result) => {
+        exHandlerStack.pop();
+        return callK(k, result);
+      });
+    }
+
     // Check for macro application
     try {
       const headVal = env.get(op);
@@ -1328,6 +1405,11 @@ let outputBuffer = '';
 
 type WindEntry = { inThunk: SchemeVal; outThunk: SchemeVal };
 let windStack: WindEntry[] = [];
+
+// ── Exception handler stack ─────────────────────────────────────────
+
+type ExHandler = (val: SchemeVal) => TResult;
+let exHandlerStack: ExHandler[] = [];
 
 // ── Display / Write formatting ─────────────────────────────────────
 
@@ -1380,6 +1462,7 @@ const display = writeVal;
 
 function evaluateProgram(exprs: SchemeVal[], env: Env): SchemeVal {
   windStack = [];
+  exHandlerStack = [];
   const topK: K = (val) => done(val);
   const result = evaluateSeqCPS(exprs, 0, env, topK);
   return runTrampoline(result);
