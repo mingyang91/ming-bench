@@ -25,6 +25,7 @@ enum TokenKind {
     LParen,
     RParen,
     Quote,
+    Syntax,
     Symbol(String),
     Int(i64),
     Float(f64),
@@ -114,6 +115,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                 let tok_col = col;
                 if i + 1 < chars.len() {
                     match chars[i + 1] {
+                        '\'' => {
+                            tokens.push(Token { kind: TokenKind::Syntax, line: tok_line, col: tok_col });
+                            i += 2;
+                            col += 2;
+                        }
                         't' => {
                             tokens.push(Token { kind: TokenKind::Bool(true), line: tok_line, col: tok_col });
                             i += 2;
@@ -219,6 +225,16 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError>
             Ok((
                 Value::List(
                     vec![Value::Symbol("quote".into(), Some(span)), inner],
+                    Some(span),
+                ),
+                next,
+            ))
+        }
+        TokenKind::Syntax => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((
+                Value::List(
+                    vec![Value::Symbol("syntax".into(), Some(span)), inner],
                     Some(span),
                 ),
                 next,

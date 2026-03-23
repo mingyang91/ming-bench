@@ -41,6 +41,11 @@ pub enum Value {
         type_id: usize,
         fields: Vec<Value>,
     },
+    MacroTransformer {
+        params: Vec<String>,
+        body: Vec<Value>,
+        env: Rc<RefCell<Env>>,
+    },
     Void,
 }
 
@@ -53,7 +58,7 @@ impl Value {
             | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_)
             | Value::Continuation(_) | Value::SyntaxRules { .. }
             | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
-            | Value::Void => None,
+            | Value::MacroTransformer { .. } | Value::Void => None,
         }
     }
 
@@ -157,6 +162,7 @@ impl PartialEq for Value {
             }
             (Value::Continuation(a), Value::Continuation(b)) => a == b,
             (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
+            (Value::MacroTransformer { .. }, Value::MacroTransformer { .. }) => false,
             (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Values(a), Value::Values(b)) => a == b,
             (Value::Record { type_id: a_id, fields: a_f },
@@ -214,6 +220,7 @@ impl PartialEq for Value {
             | (Value::Vector(_), _)
             | (Value::Values(_), _)
             | (Value::Record { .. }, _)
+            | (Value::MacroTransformer { .. }, _)
             | (Value::Void, _) => false,
         }
     }
@@ -380,6 +387,7 @@ impl fmt::Display for Value {
                 Ok(())
             }
             Value::Record { .. } => write!(f, "#<record>"),
+            Value::MacroTransformer { .. } => write!(f, "#<syntax>"),
             Value::Void => write!(f, ""),
         }
     }

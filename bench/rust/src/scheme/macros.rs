@@ -7,7 +7,7 @@ use crate::scheme::error::EvalError;
 use crate::scheme::value::Value;
 
 #[derive(Debug, Clone)]
-enum Binding {
+pub enum Binding {
     Single(Value),
     List(Vec<Value>),
 }
@@ -44,7 +44,7 @@ pub fn expand_syntax_rules(
 // Pattern matching
 // ---------------------------------------------------------------------------
 
-fn match_pattern(
+pub fn match_pattern(
     pattern: &[Value],
     input: &[Value],
     literals: &[String],
@@ -109,7 +109,7 @@ fn match_single(
         Value::Pair(_) | Value::Builtin(_) | Value::Closure { .. }
         | Value::Continuation(_) | Value::SyntaxRules { .. }
         | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
-        | Value::Void => false,
+        | Value::MacroTransformer { .. } | Value::Void => false,
     }
 }
 
@@ -121,13 +121,14 @@ fn is_ellipsis(val: &Value) -> bool {
 // Template expansion with hygiene
 // ---------------------------------------------------------------------------
 
-const SPECIAL_FORMS: &[&str] = &[
+pub const SPECIAL_FORMS: &[&str] = &[
     "if", "define", "lambda", "quote", "let", "begin", "cond", "set!",
     "and", "or", "define-syntax", "syntax-rules", "string-set!",
     "let*", "letrec", "letrec*", "case", "do",
+    "syntax-case", "syntax", "with-syntax",
 ];
 
-fn expand_template(
+pub fn expand_template(
     template: &Value,
     bindings: &HashMap<String, Binding>,
     literals: &[String],
@@ -164,6 +165,12 @@ fn expand_template(
             }
         }
         Value::List(elems, span) => {
+            // Don't expand inside (quote ...)
+            if let Some(Value::Symbol(s, _)) = elems.first() {
+                if s == "quote" {
+                    return Ok(template.clone());
+                }
+            }
             let mut result = Vec::new();
             let mut i = 0;
             while i < elems.len() {
@@ -200,11 +207,11 @@ fn expand_template(
         | Value::Pair(_) | Value::Builtin(_) | Value::Closure { .. }
         | Value::Continuation(_) | Value::SyntaxRules { .. }
         | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
-        | Value::Void => Ok(template.clone()),
+        | Value::MacroTransformer { .. } | Value::Void => Ok(template.clone()),
     }
 }
 
-fn find_ellipsis_var(template: &Value, bindings: &HashMap<String, Binding>) -> Option<String> {
+pub fn find_ellipsis_var(template: &Value, bindings: &HashMap<String, Binding>) -> Option<String> {
     match template {
         Value::Symbol(name, _) => {
             if matches!(bindings.get(name), Some(Binding::List(_))) {
@@ -226,6 +233,6 @@ fn find_ellipsis_var(template: &Value, bindings: &HashMap<String, Binding>) -> O
         | Value::Pair(_) | Value::Builtin(_) | Value::Closure { .. }
         | Value::Continuation(_) | Value::SyntaxRules { .. }
         | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
-        | Value::Void => None,
+        | Value::MacroTransformer { .. } | Value::Void => None,
     }
 }
