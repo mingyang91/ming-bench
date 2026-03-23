@@ -5,9 +5,8 @@ import SchemeValue.*
 /** Scheme interpreter entry point. Agents implement this object. */
 object Evaluator:
 
-  private def makeGlobalEnv(output: StringBuilder): Environment =
-    val env = Environment()
-    val builtins: List[(String, List[SchemeValue] => SchemeValue)] = List(
+  private def coreBuiltins(output: StringBuilder): List[(String, List[SchemeValue] => SchemeValue)] =
+    List(
       ("+", args => Builtins.arith(args, _ + _, 0)),
       ("*", args => Builtins.arith(args, _ * _, 1)),
       ("-", args => Builtins.subtractOp(args)),
@@ -49,7 +48,18 @@ object Evaluator:
       ("char->integer", args => BuiltinsExt.charToIntegerOp(args)),
       ("integer->char", args => BuiltinsExt.integerToCharOp(args)),
       ("apply", args => Builtins.applyOp(args)),
-      // L13 - Numeric utilities
+      ("eq?", args => Builtins.eqCheck(args)),
+      ("eqv?", args => Builtins.eqvCheck(args)),
+      ("equal?", args => Builtins.equalCheck(args)),
+      ("dynamic-wind", args => WindException.dynamicWindOp(args)),
+      ("raise", args => WindException.raiseOp(args)),
+      ("with-exception-handler", args => WindException.withExceptionHandlerOp(args)),
+      ("values", args => valuesOp(args)),
+      ("call-with-values", args => callWithValuesOp(args))
+    )
+
+  private def extBuiltins: List[(String, List[SchemeValue] => SchemeValue)] =
+    List(
       ("abs", args => BuiltinsExt.absOp(args)),
       ("modulo", args => BuiltinsExt.moduloOp(args)),
       ("remainder", args => BuiltinsExt.remainderOp(args)),
@@ -62,31 +72,23 @@ object Evaluator:
       ("negative?", args => BuiltinsExt.negativeCheck(args)),
       ("odd?", args => BuiltinsExt.oddCheck(args)),
       ("even?", args => BuiltinsExt.evenCheck(args)),
-      // L13 - List utilities
       ("list-ref", args => BuiltinsExt.listRefOp(args)),
       ("list-tail", args => BuiltinsExt.listTailOp(args)),
       ("list?", args => BuiltinsExt.listCheck(args)),
       ("assoc", args => BuiltinsExt.assocOp(args)),
       ("map", args => BuiltinsExt.mapOp(args)),
       ("reverse", args => BuiltinsExt.reverseOp(args)),
-      // L13 - eq? and equal?
-      ("eq?", args => Builtins.eqCheck(args)),
-      ("eqv?", args => Builtins.eqvCheck(args)),
-      ("equal?", args => Builtins.equalCheck(args)),
-      // L13 - Character utilities
       ("char-alphabetic?", args => BuiltinsExt.charAlphabeticCheck(args)),
       ("char-numeric?", args => BuiltinsExt.charNumericCheck(args)),
       ("char-upcase", args => BuiltinsExt.charUpcaseOp(args)),
       ("char-downcase", args => BuiltinsExt.charDowncaseOp(args)),
       ("char=?", args => BuiltinsExt.charEqualCheck(args)),
       ("char<?", args => BuiltinsExt.charLessCheck(args)),
-      // L13 - String comparison/case utilities
       ("string=?", args => BuiltinsExt.stringEqualCheck(args)),
       ("string<?", args => BuiltinsExt.stringLessCheck(args)),
       ("string-ci=?", args => BuiltinsExt.stringCiEqualCheck(args)),
       ("string-upcase", args => BuiltinsExt.stringUpcaseOp(args)),
       ("string-downcase", args => BuiltinsExt.stringDowncaseOp(args)),
-      // L15 - Vector operations
       ("vector", args => BuiltinsVector.vectorOp(args)),
       ("make-vector", args => BuiltinsVector.makeVectorOp(args)),
       ("vector-ref", args => BuiltinsVector.vectorRefOp(args)),
@@ -94,18 +96,35 @@ object Evaluator:
       ("vector-length", args => BuiltinsVector.vectorLengthOp(args)),
       ("vector?", args => BuiltinsVector.vectorCheck(args)),
       ("vector->list", args => BuiltinsVector.vectorToListOp(args)),
-      ("list->vector", args => BuiltinsVector.listToVectorOp(args)),
-      ("dynamic-wind", args => WindException.dynamicWindOp(args)),
-      ("raise", args => WindException.raiseOp(args)),
-      ("with-exception-handler", args => WindException.withExceptionHandlerOp(args))
+      ("list->vector", args => BuiltinsVector.listToVectorOp(args))
     )
-    builtins.foreach { (name, func) =>
+
+  private def makeGlobalEnv(output: StringBuilder): Environment =
+    val env = Environment()
+    (coreBuiltins(output) ++ extBuiltins).foreach { (name, func) =>
       env.define(name, BuiltinVal(name, func))
     }
     val callccFn = callccBuiltin()
     env.define("call/cc", callccFn)
     env.define("call-with-current-continuation", callccFn)
     env
+
+  /** values: single value is transparent, otherwise wrap in ValuesVal. */
+  private def valuesOp(args: List[SchemeValue]): SchemeValue =
+    args match
+      case single :: Nil => single
+      case _             => ValuesVal(args)
+
+  /** call-with-values: call producer, unpack values, pass to consumer. */
+  private def callWithValuesOp(args: List[SchemeValue]): SchemeValue =
+    args match
+      case producer :: consumer :: Nil =>
+        val produced = Interpreter.applyProc(producer, Nil)
+        val consumerArgs = produced match
+          case ValuesVal(vs) => vs
+          case single        => List(single)
+        Interpreter.applyProc(consumer, consumerArgs)
+      case _ => throw new EvalError("call-with-values: requires 2 arguments")
 
   /** Create the call/cc builtin function. */
   private def callccBuiltin(): SchemeValue =
