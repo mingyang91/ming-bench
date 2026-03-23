@@ -8,20 +8,20 @@ enum Value:
   case PairVal(car: Value, cdr: Value)
   case NilVal
   case SymbolVal(name: String)
-  case LambdaVal(params: List[String], body: List[Expr], closure: Env)
+  case LambdaVal(params: List[String], restParam: Option[String], body: List[Expr], closure: Env)
   case BuiltinVal(name: String, fn: List[Value] => Value)
   case CharVal(c: Char)
 
   def display: String = this match
-    case IntVal(n)           => n.toString
-    case BoolVal(b)          => if b then "#t" else "#f"
-    case StrVal(chars)       => s"\"${new String(chars)}\""
-    case NilVal              => "()"
-    case SymbolVal(name)     => name
-    case PairVal(_, _)       => displayList(this)
-    case LambdaVal(_, _, _)  => "#<procedure>"
-    case BuiltinVal(name, _) => s"#<procedure:$name>"
-    case CharVal(c)          => s"#\\$c"
+    case IntVal(n)             => n.toString
+    case BoolVal(b)            => if b then "#t" else "#f"
+    case StrVal(chars)         => s"\"${new String(chars)}\""
+    case NilVal                => "()"
+    case SymbolVal(name)       => name
+    case PairVal(_, _)         => displayList(this)
+    case LambdaVal(_, _, _, _) => "#<procedure>"
+    case BuiltinVal(name, _)   => s"#<procedure:$name>"
+    case CharVal(c)            => s"#\\$c"
 
   /** Display without quotes (for `display` builtin). */
   def displayNoQuotes: String = this match

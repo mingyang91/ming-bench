@@ -28,7 +28,11 @@ object Evaluator:
   private def makeGlobalEnv(output: StringBuilder = new StringBuilder): Env =
     val env = Env()
     Builtins.register(env, output)
+    registerApply(env)
     env
+
+  private def registerApply(env: Env): Unit =
+    env.define("apply", Value.BuiltinVal("apply", args => applyBuiltin(args)))
 
   /** Evaluate a sequence of expressions, returning the last value. Uses TCO for the last expr. */
   private def evalBody(exprs: List[Expr], env: Env): Value =
@@ -136,8 +140,8 @@ object Evaluator:
   /** Apply a procedure value to arguments. Returns Left for immediate result, Right for tail-call continuation. */
   private def applyProc(proc: Value, values: List[Value], pos: Option[Pos]): Either[Value, (Expr, Env)] =
     proc match
-      case LambdaVal(params, body, closure) =>
-        val localEnv = closure.extend(params, values)
+      case LambdaVal(params, restParam, body, closure) =>
+        val localEnv = closure.extendWithRest(params, restParam, values)
         body.init.foreach(eval(_, localEnv))
         Right((body.last, localEnv))
       case BuiltinVal(name, fn) =>
@@ -184,7 +188,7 @@ object Evaluator:
         val paramNames = pairs.map(_._1)
         val initVals   = pairs.map(_._2)
         val localEnv   = env.extend(Nil, Nil)
-        val lambda     = LambdaVal(paramNames, body, localEnv)
+        val lambda     = LambdaVal(paramNames, None, body, localEnv)
         localEnv.define(name, lambda)
         val callEnv = localEnv.extend(paramNames, initVals)
         body.init.foreach(eval(_, callEnv))
@@ -207,11 +211,8 @@ object Evaluator:
         val v = eval(valueExpr, env)
         env.define(name, v)
       case SList(Sym(name, _) :: params, _) :: body if body.nonEmpty =>
-        val paramNames = params.map {
-          case Sym(p, _) => p
-          case _         => evalError("define: non-symbol parameter", pos)
-        }
-        val lambda = LambdaVal(paramNames, body, env)
+        val (paramNames, restParam) = parseParams(params, "define", pos)
+        val lambda                  = LambdaVal(paramNames, restParam, body, env)
         env.define(name, lambda)
       case _ => evalError("define: bad syntax", pos)
 
@@ -232,9 +233,54 @@ object Evaluator:
   private def evalLambda(args: List[Expr], env: Env, pos: Option[Pos]): Value =
     args match
       case SList(params, _) :: body if body.nonEmpty =>
-        val paramNames = params.map {
-          case Sym(p, _) => p
-          case _         => evalError("lambda: non-symbol parameter", pos)
-        }
-        LambdaVal(paramNames, body, env)
+        val (paramNames, restParam) = parseParams(params, "lambda", pos)
+        LambdaVal(paramNames, restParam, body, env)
+      case Sym(restName, _) :: body if body.nonEmpty =>
+        LambdaVal(Nil, Some(restName), body, env)
       case _ => evalError("lambda: bad syntax", pos)
+
+  /** Parse a parameter list, handling dot notation for rest params. Returns (required params, optional rest param
+    * name).
+    */
+  private def parseParams(
+    params: List[Expr],
+    context: String,
+    pos: Option[Pos]
+  ): (List[String], Option[String]) =
+    val dotIdx = params.indexWhere { case Sym(".", _) => true; case _ => false }
+    if dotIdx < 0 then
+      val names = params.map {
+        case Sym(p, _) => p
+        case _         => evalError(s"$context: non-symbol parameter", pos)
+      }
+      (names, None)
+    else
+      if dotIdx != params.length - 2 then evalError(s"$context: bad dot syntax in parameters", pos)
+      val required = params.take(dotIdx).map {
+        case Sym(p, _) => p
+        case _         => evalError(s"$context: non-symbol parameter", pos)
+      }
+      val rest = params.last match
+        case Sym(p, _) => p
+        case _         => evalError(s"$context: non-symbol rest parameter", pos)
+      (required, Some(rest))
+
+  private def applyBuiltin(args: List[Value]): Value =
+    if args.length < 2 then throw new EvalError("apply: expected at least 2 arguments")
+    val proc         = args.head
+    val prefixArgs   = args.slice(1, args.length - 1)
+    val lastArg      = args.last
+    val trailingArgs = valueToList(lastArg)
+    val allArgs      = prefixArgs.toList ++ trailingArgs
+    callProc(proc, allArgs, None)
+
+  private def valueToList(v: Value): List[Value] =
+    v match
+      case Value.NilVal            => Nil
+      case Value.PairVal(car, cdr) => car :: valueToList(cdr)
+      case _                       => throw new EvalError("apply: last argument must be a list")
+
+  private def callProc(proc: Value, args: List[Value], pos: Option[Pos]): Value =
+    applyProc(proc, args, pos) match
+      case Left(v)            => v
+      case Right((expr, env)) => eval(expr, env)

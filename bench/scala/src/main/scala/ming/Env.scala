@@ -36,3 +36,15 @@ class Env(
     if names.length != values.length then
       throw new EvalError(s"expected ${names.length} arguments, got ${values.length}")
     Env(mutable.Map.from(names.zip(values)), Some(this))
+
+  def extendWithRest(names: List[String], restParam: Option[String], values: List[Value]): Env =
+    restParam match
+      case None => extend(names, values)
+      case Some(rest) =>
+        if values.length < names.length then
+          throw new EvalError(s"expected at least ${names.length} arguments, got ${values.length}")
+        val (required, extra) = values.splitAt(names.length)
+        val restList          = extra.foldRight(Value.NilVal: Value)((v, acc) => Value.PairVal(v, acc))
+        val bindings          = mutable.Map.from(names.zip(required))
+        bindings(rest) = restList
+        Env(bindings, Some(this))
