@@ -70,6 +70,7 @@ object Evaluator:
       ("map", args => BuiltinsExt.mapOp(args)),
       // L13 - eq? and equal?
       ("eq?", args => Builtins.eqCheck(args)),
+      ("eqv?", args => Builtins.eqvCheck(args)),
       ("equal?", args => Builtins.equalCheck(args)),
       // L13 - Character utilities
       ("char-alphabetic?", args => BuiltinsExt.charAlphabeticCheck(args)),
@@ -83,7 +84,16 @@ object Evaluator:
       ("string<?", args => BuiltinsExt.stringLessCheck(args)),
       ("string-ci=?", args => BuiltinsExt.stringCiEqualCheck(args)),
       ("string-upcase", args => BuiltinsExt.stringUpcaseOp(args)),
-      ("string-downcase", args => BuiltinsExt.stringDowncaseOp(args))
+      ("string-downcase", args => BuiltinsExt.stringDowncaseOp(args)),
+      // L15 - Vector operations
+      ("vector", args => BuiltinsVector.vectorOp(args)),
+      ("make-vector", args => BuiltinsVector.makeVectorOp(args)),
+      ("vector-ref", args => BuiltinsVector.vectorRefOp(args)),
+      ("vector-set!", args => BuiltinsVector.vectorSetOp(args)),
+      ("vector-length", args => BuiltinsVector.vectorLengthOp(args)),
+      ("vector?", args => BuiltinsVector.vectorCheck(args)),
+      ("vector->list", args => BuiltinsVector.vectorToListOp(args)),
+      ("list->vector", args => BuiltinsVector.listToVectorOp(args))
     )
     builtins.foreach { (name, func) =>
       env.define(name, BuiltinVal(name, func))

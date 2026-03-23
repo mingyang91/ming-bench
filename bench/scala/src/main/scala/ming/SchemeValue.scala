@@ -11,6 +11,7 @@ enum SchemeValue:
   case LambdaVal(params: List[String], restParam: Option[String], body: List[SchemeValue], closure: Environment)
   case CharVal(value: Char, pos: Option[SourcePos] = None)
   case MutableStringVal(chars: Array[Char], pos: Option[SourcePos] = None)
+  case VectorVal(elements: Array[SchemeValue], pos: Option[SourcePos] = None)
   case BuiltinVal(name: String, func: List[SchemeValue] => SchemeValue)
 
   case ContinuationVal(
@@ -34,6 +35,7 @@ enum SchemeValue:
     case ListVal(_, p)          => p
     case CharVal(_, p)          => p
     case MutableStringVal(_, p) => p
+    case VectorVal(_, p)        => p
     case _                      => None
 
   /** Format for `write` — strings are quoted. */
@@ -44,6 +46,7 @@ enum SchemeValue:
     case MutableStringVal(cs, _)              => s"\"${String(cs)}\""
     case SymbolVal(n, _)                      => n
     case CharVal(c, _)                        => s"#\\$c"
+    case VectorVal(es, _)                     => s"#(${es.map(_.display).mkString(" ")})"
     case ListVal(es, _)                       => s"(${es.map(_.display).mkString(" ")})"
     case PairVal(_, _)                        => displayPair(this)
     case LambdaVal(_, _, _, _)                => "#<procedure>"

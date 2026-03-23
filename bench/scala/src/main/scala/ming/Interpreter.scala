@@ -39,7 +39,7 @@ object Interpreter:
       curExpr match
         // Self-evaluating
         case IntVal(_, _) | BoolVal(_, _) | StringVal(_, _) | MutableStringVal(_, _) | CharVal(_, _) | PairVal(_, _) |
-            LambdaVal(_, _, _, _) | BuiltinVal(_, _) | ContinuationVal(_, _, _, _, _, _, _) |
+            VectorVal(_, _) | LambdaVal(_, _, _, _) | BuiltinVal(_, _) | ContinuationVal(_, _, _, _, _, _, _) |
             SyntaxRulesVal(_, _, _, _) | Void =>
           return curExpr
 
@@ -52,11 +52,6 @@ object Interpreter:
           throw new EvalError(posMsg("empty application", pos))
 
         // Special forms
-        case ListVal(SymbolVal("if", _) :: args, pos) =>
-          evalIf(args, pos, curEnv) match
-            case Done(v)          => return v
-            case TailCall(e, env) => curExpr = e; curEnv = env
-
         case ListVal(SymbolVal("define", _) :: args, pos) =>
           return SpecialForms.evalDefine(args, pos, curEnv)
 
@@ -74,28 +69,13 @@ object Interpreter:
           evalBodyInit(args, curEnv)
           curExpr = args.last
 
-        case ListVal(SymbolVal("and", _) :: args, _) =>
-          evalAnd(args, curEnv) match
-            case Done(v)          => return v
-            case TailCall(e, env) => curExpr = e; curEnv = env
-
-        case ListVal(SymbolVal("or", _) :: args, _) =>
-          evalOr(args, curEnv) match
-            case Done(v)          => return v
-            case TailCall(e, env) => curExpr = e; curEnv = env
-
-        case ListVal(SymbolVal("let", _) :: args, pos) =>
-          SpecialForms.evalLet(args, pos, curEnv) match
-            case Done(v)          => return v
-            case TailCall(e, env) => curExpr = e; curEnv = env
-
-        case ListVal(SymbolVal("cond", _) :: args, _) =>
-          SpecialForms.evalCond(args, curEnv) match
-            case Done(v)          => return v
-            case TailCall(e, env) => curExpr = e; curEnv = env
-
         case ListVal(SymbolVal("define-syntax", _) :: args, pos) =>
           return SpecialForms.evalDefineSyntax(args, pos, curEnv)
+
+        case ListVal(SymbolVal(name, _) :: args, pos) if tailCallForms.contains(name) =>
+          dispatchTailForm(name, args, pos, curEnv) match
+            case Done(v)          => return v
+            case TailCall(e, env) => curExpr = e; curEnv = env
 
         // Macro expansion
         case ListVal((sym @ SymbolVal(name, _)) :: _, pos) =>
@@ -116,6 +96,28 @@ object Interpreter:
 
     // Unreachable but needed for type checker
     throw new AssertionError("unreachable")
+
+  private val tailCallForms: Set[String] =
+    Set("if", "and", "or", "let", "cond", "letrec", "letrec*", "case", "do", "let*")
+
+  private def dispatchTailForm(
+    name: String,
+    args: List[SchemeValue],
+    pos: Option[SourcePos],
+    env: Environment
+  ): EvalResult =
+    name match
+      case "if"      => evalIf(args, pos, env)
+      case "and"     => evalAnd(args, env)
+      case "or"      => evalOr(args, env)
+      case "let"     => SpecialForms.evalLet(args, pos, env)
+      case "cond"    => SpecialForms.evalCond(args, env)
+      case "letrec"  => SpecialForms.evalLetrec(args, pos, env)
+      case "letrec*" => SpecialForms.evalLetrecStar(args, pos, env)
+      case "case"    => SpecialForms.evalCase(args, pos, env)
+      case "do"      => SpecialForms.evalDo(args, pos, env)
+      case "let*"    => SpecialForms.evalLetStar(args, pos, env)
+      case _         => throw new AssertionError(s"unreachable: $name")
 
   def applyProc(
     proc: SchemeValue,

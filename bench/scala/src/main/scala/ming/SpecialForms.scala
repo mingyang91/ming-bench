@@ -156,3 +156,137 @@ object SpecialForms:
         case SymbolVal(p, _) => p
         case _               => throw new EvalError(posMsg("expected parameter name after dot", pos))
       (fixed, Some(rest))
+
+  def evalLetrec(
+    args: List[SchemeValue],
+    pos: Option[SourcePos],
+    env: Environment
+  ): EvalResult =
+    args match
+      case ListVal(bindings, _) :: body if body.nonEmpty =>
+        val childEnv = env.child()
+        // Define all bindings as Void first (mutual visibility)
+        val names = bindings.map {
+          case ListVal(SymbolVal(n, _) :: _ :: Nil, _) => n
+          case _                                       => throw new EvalError(posMsg("letrec: bad binding", pos))
+        }
+        names.foreach(n => childEnv.define(n, Void))
+        // Evaluate init exprs in the child env and set
+        bindings.foreach {
+          case ListVal(SymbolVal(n, _) :: value :: Nil, _) =>
+            childEnv.define(n, Interpreter.eval(value, childEnv))
+          case _ => throw new EvalError(posMsg("letrec: bad binding", pos))
+        }
+        Interpreter.evalBodyInit(body, childEnv)
+        TailCall(body.last, childEnv)
+      case _ => throw new EvalError(posMsg("letrec: bad syntax", pos))
+
+  def evalLetrecStar(
+    args: List[SchemeValue],
+    pos: Option[SourcePos],
+    env: Environment
+  ): EvalResult =
+    args match
+      case ListVal(bindings, _) :: body if body.nonEmpty =>
+        val childEnv = env.child()
+        // Define and evaluate sequentially (each visible to the next)
+        bindings.foreach {
+          case ListVal(SymbolVal(n, _) :: value :: Nil, _) =>
+            childEnv.define(n, Interpreter.eval(value, childEnv))
+          case _ => throw new EvalError(posMsg("letrec*: bad binding", pos))
+        }
+        Interpreter.evalBodyInit(body, childEnv)
+        TailCall(body.last, childEnv)
+      case _ => throw new EvalError(posMsg("letrec*: bad syntax", pos))
+
+  def evalCase(
+    args: List[SchemeValue],
+    pos: Option[SourcePos],
+    env: Environment
+  ): EvalResult =
+    args match
+      case keyExpr :: clauses if clauses.nonEmpty =>
+        val key = Interpreter.eval(keyExpr, env)
+        evalCaseClauses(key, clauses, pos, env)
+      case _ => throw new EvalError(posMsg("case: bad syntax", pos))
+
+  private def evalCaseClauses(
+    key: SchemeValue,
+    clauses: List[SchemeValue],
+    pos: Option[SourcePos],
+    env: Environment
+  ): EvalResult =
+    var remaining = clauses
+    while remaining.nonEmpty do
+      remaining.head match
+        case ListVal(SymbolVal("else", _) :: body, _) =>
+          if body.isEmpty then return Done(Void)
+          Interpreter.evalBodyInit(body, env)
+          return TailCall(body.last, env)
+        case ListVal(ListVal(datums, _) :: body, _) =>
+          if datums.exists(d => Builtins.schemeEqv(key, d)) then
+            if body.isEmpty then return Done(Void)
+            Interpreter.evalBodyInit(body, env)
+            return TailCall(body.last, env)
+          remaining = remaining.tail
+        case _ => throw new EvalError(posMsg("case: bad clause", pos))
+    Done(Void)
+
+  def evalDo(
+    args: List[SchemeValue],
+    pos: Option[SourcePos],
+    env: Environment
+  ): EvalResult =
+    args match
+      case ListVal(varSpecs, _) :: ListVal(testAndExprs, _) :: body =>
+        if testAndExprs.isEmpty then throw new EvalError(posMsg("do: missing test", pos))
+        val test        = testAndExprs.head
+        val resultExprs = testAndExprs.tail
+        // Parse variable specs: (var init [step])
+        val specs = varSpecs.map {
+          case ListVal(SymbolVal(name, _) :: init :: step :: Nil, _) => (name, init, Some(step))
+          case ListVal(SymbolVal(name, _) :: init :: Nil, _)         => (name, init, None)
+          case _ => throw new EvalError(posMsg("do: bad variable spec", pos))
+        }
+        // Initialize
+        val doEnv = env.child()
+        specs.foreach { (name, init, _) =>
+          doEnv.define(name, Interpreter.eval(init, env))
+        }
+        // Iterate
+        while true do
+          val testResult = Interpreter.eval(test, doEnv)
+          if testResult.isTruthy then
+            if resultExprs.isEmpty then return Done(Void)
+            Interpreter.evalBodyInit(resultExprs, doEnv)
+            return TailCall(resultExprs.last, doEnv)
+          // Execute body
+          body.foreach(expr => Interpreter.eval(expr, doEnv))
+          // Parallel step: evaluate all steps with OLD values, then update
+          val newVals = specs.map { (name, _, stepOpt) =>
+            stepOpt match
+              case Some(step) => Some(Interpreter.eval(step, doEnv))
+              case None       => None
+          }
+          specs.zip(newVals).foreach { case ((name, _, _), valOpt) =>
+            valOpt.foreach(v => doEnv.define(name, v))
+          }
+        Done(Void) // unreachable
+      case _ => throw new EvalError(posMsg("do: bad syntax", pos))
+
+  def evalLetStar(
+    args: List[SchemeValue],
+    pos: Option[SourcePos],
+    env: Environment
+  ): EvalResult =
+    args match
+      case ListVal(bindings, _) :: body if body.nonEmpty =>
+        val childEnv = env.child()
+        bindings.foreach {
+          case ListVal(SymbolVal(n, _) :: value :: Nil, _) =>
+            childEnv.define(n, Interpreter.eval(value, childEnv))
+          case _ => throw new EvalError(posMsg("let*: bad binding", pos))
+        }
+        Interpreter.evalBodyInit(body, childEnv)
+        TailCall(body.last, childEnv)
+      case _ => throw new EvalError(posMsg("let*: bad syntax", pos))

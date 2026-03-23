@@ -149,6 +149,14 @@ object Builtins:
       case a :: b :: Nil => BoolVal(schemeEq(a, b))
       case _             => throw new EvalError("eq?: requires 2 arguments")
 
+  def eqvCheck(args: List[SchemeValue]): SchemeValue =
+    args match
+      case a :: b :: Nil => BoolVal(schemeEqv(a, b))
+      case _             => throw new EvalError("eqv?: requires 2 arguments")
+
+  /** eqv? — same as eq? for our integer-only interpreter. */
+  private[ming] def schemeEqv(a: SchemeValue, b: SchemeValue): Boolean = schemeEq(a, b)
+
   private def schemeEq(a: SchemeValue, b: SchemeValue): Boolean = (a, b) match
     case (IntVal(x, _), IntVal(y, _))       => x == y
     case (BoolVal(x, _), BoolVal(y, _))     => x == y
@@ -177,5 +185,7 @@ object Builtins:
       xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b))
     case (PairVal(a1, d1), PairVal(a2, d2)) =>
       schemeEqual(a1, a2) && schemeEqual(d1, d2)
+    case (VectorVal(xs, _), VectorVal(ys, _)) =>
+      xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b))
     case (Void, Void) => true
     case _            => false
