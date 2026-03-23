@@ -53,6 +53,20 @@ public class Evaluator {
 
     private List<WindEntry> windStack = new ArrayList<>();
 
+    // --- Exception handler stack ---
+    @FunctionalInterface private interface RaiseHandler { Bounce handle(Object value) throws EvalError; }
+
+    private static class HandlerRecord {
+        final RaiseHandler handler;
+        final List<WindEntry> savedWind;
+        HandlerRecord(RaiseHandler handler, List<WindEntry> savedWind) {
+            this.handler = handler;
+            this.savedWind = savedWind;
+        }
+    }
+
+    private final List<HandlerRecord> handlerStack = new ArrayList<>();
+
     private static class Continuation {
         final Cont k;
         final List<WindEntry> savedWind;
@@ -182,7 +196,7 @@ public class Evaluator {
     private static final java.util.Set<String> SPECIAL_FORMS = java.util.Set.of(
         "define", "if", "quote", "lambda", "and", "or", "let", "let*", "begin",
         "set!", "cond", "define-syntax", "syntax-rules",
-        "letrec", "letrec*", "case", "do"
+        "letrec", "letrec*", "case", "do", "guard"
     );
 
     private Object unwrapLoc(Object o) {
@@ -371,10 +385,10 @@ public class Evaluator {
             if (sym.equals("call/cc") || sym.equals("call-with-current-continuation")) {
                 return k.apply(CALL_CC);
             }
-            if (isPrimitive(sym)) return k.apply(sym);
             Object val = env.lookup(sym);
-            if (val == null) throw posError("unbound variable: " + sym);
-            return k.apply(val);
+            if (val != null) return k.apply(val);
+            if (isPrimitive(sym)) return k.apply(sym);
+            throw posError("unbound variable: " + sym);
         }
 
         if (expr instanceof EnvRef ref) {
@@ -538,6 +552,9 @@ public class Evaluator {
                     case "do" -> {
                         return evalDo(list, env, k);
                     }
+                    case "guard" -> {
+                        return evalGuard(list, env, k);
+                    }
                     case "define-syntax" -> {
                         if (list.size() != 3) throw posError("define-syntax: bad syntax");
                         Object dsName = list.get(1);
@@ -613,6 +630,14 @@ public class Evaluator {
                     if (proc instanceof String p && p.equals("dynamic-wind")) {
                         if (args.size() != 3) throw posError("dynamic-wind: expected 3 arguments");
                         return cpsDynamicWind(args.get(0), args.get(1), args.get(2), k);
+                    }
+                    if (proc instanceof String p && p.equals("raise")) {
+                        if (args.size() != 1) throw posError("raise: expected 1 argument");
+                        return handleRaise(args.get(0));
+                    }
+                    if (proc instanceof String p && p.equals("with-exception-handler")) {
+                        if (args.size() != 2) throw posError("with-exception-handler: expected 2 arguments");
+                        return cpsWithExceptionHandler(args.get(0), args.get(1), k);
                     }
                     return applyProc(proc, args, k);
                 });
@@ -1201,7 +1226,8 @@ public class Evaluator {
             "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
             "char=?", "char<?",
             "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
-            "map", "dynamic-wind", "reverse"
+            "map", "dynamic-wind", "reverse",
+            "raise", "with-exception-handler"
     );
 
     private boolean isPrimitive(String name) {
@@ -1602,6 +1628,8 @@ public class Evaluator {
             }
             case "map" -> throw posError("map: handled in eval");
             case "dynamic-wind" -> throw posError("dynamic-wind: handled in eval");
+            case "raise" -> throw posError("raise: handled in eval");
+            case "with-exception-handler" -> throw posError("with-exception-handler: handled in eval");
             case "reverse" -> {
                 requireArgCount(args, 1, "reverse");
                 Object lst = args.get(0);
@@ -1685,6 +1713,99 @@ public class Evaluator {
         return new More(() -> applyProc(entry.inThunk, List.of(), ignored -> {
             windStack.add(entry);
             return doRewind(to, idx + 1, after);
+        }));
+    }
+
+    // --- Exception handling (guard, raise, with-exception-handler) ---
+
+    private Bounce handleRaise(Object value) throws EvalError {
+        if (handlerStack.isEmpty()) {
+            throw posError("unhandled exception: " + schemeToString(value));
+        }
+        HandlerRecord record = handlerStack.remove(handlerStack.size() - 1);
+        return doWindTransition(windStack, record.savedWind, () -> record.handler.handle(value));
+    }
+
+    @SuppressWarnings("unchecked")
+    private Bounce evalGuard(List<?> list, Env env, Cont k) throws EvalError {
+        // (guard (var clause ...) body ...)
+        if (list.size() < 3) throw posError("guard: bad syntax");
+        Object clausesObj = list.get(1);
+        if (clausesObj instanceof Located lc) clausesObj = lc.value();
+        if (!(clausesObj instanceof List<?> clauses) || clauses.isEmpty())
+            throw posError("guard: bad syntax");
+
+        Object varObj = clauses.get(0);
+        if (varObj instanceof Located lv) varObj = lv.value();
+        if (!(varObj instanceof String guardVar)) throw posError("guard: expected variable");
+
+        final String fGuardVar = guardVar;
+        final List<?> guardClauses = clauses;
+        List<WindEntry> savedWind = new ArrayList<>(windStack);
+
+        // Push exception handler
+        handlerStack.add(new HandlerRecord(value -> {
+            Env guardEnv = new Env(env);
+            guardEnv.define(fGuardVar, value);
+            return evalGuardClauses(guardClauses, 1, guardEnv, value, k);
+        }, savedWind));
+
+        // Build body
+        Object body;
+        if (list.size() == 3) {
+            body = list.get(2);
+        } else {
+            List<Object> beginBody = new ArrayList<>();
+            beginBody.add("begin");
+            for (int i = 2; i < list.size(); i++) beginBody.add(list.get(i));
+            body = beginBody;
+        }
+
+        final Object finalBody = body;
+        Cont bodyK = result -> {
+            handlerStack.remove(handlerStack.size() - 1);
+            return k.apply(result);
+        };
+        return new More(() -> eval(finalBody, env, bodyK));
+    }
+
+    private Bounce evalGuardClauses(List<?> clauses, int idx, Env env, Object raisedValue, Cont k) throws EvalError {
+        if (idx >= clauses.size()) {
+            // No clause matched — re-raise
+            return handleRaise(raisedValue);
+        }
+        Object clauseObj = clauses.get(idx);
+        if (clauseObj instanceof Located lc) clauseObj = lc.value();
+        if (!(clauseObj instanceof List<?> clause) || clause.isEmpty())
+            throw posError("guard: bad clause");
+
+        Object test = clause.get(0);
+        Object testUnwrapped = test;
+        if (testUnwrapped instanceof Located lt) testUnwrapped = lt.value();
+        if (testUnwrapped instanceof String s && s.equals("else")) {
+            if (clause.size() == 1) return k.apply(raisedValue);
+            return evalBegin(clause, 1, env, k);
+        }
+
+        final List<?> finalClause = clause;
+        return new More(() -> eval(test, env, testResult -> {
+            if (!isFalse(testResult)) {
+                if (finalClause.size() == 1) return k.apply(testResult);
+                return evalBegin(finalClause, 1, env, k);
+            }
+            return evalGuardClauses(clauses, idx + 1, env, raisedValue, k);
+        }));
+    }
+
+    private Bounce cpsWithExceptionHandler(Object handler, Object thunk, Cont k) throws EvalError {
+        List<WindEntry> savedWind = new ArrayList<>(windStack);
+
+        handlerStack.add(new HandlerRecord(value ->
+            applyProc(handler, List.of(value), k), savedWind));
+
+        return new More(() -> applyProc(thunk, List.of(), result -> {
+            handlerStack.remove(handlerStack.size() - 1);
+            return k.apply(result);
         }));
     }
 
