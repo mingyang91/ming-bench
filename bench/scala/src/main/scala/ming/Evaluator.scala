@@ -169,10 +169,9 @@ object Evaluator extends EvalForms:
         evalCallCc(callccExpr, procExpr, env, pos, k)
 
       // Macro expansion
-      case SList(Sym(name, symPos) :: args, pos)
-          if env.lookupOption(name).exists(_.isInstanceOf[Value.MacroVal]) =>
+      case SList(Sym(name, symPos) :: args, pos) if env.lookupOption(name).exists(_.isInstanceOf[Value.MacroVal]) =>
         val Value.MacroVal(literals, rules, defEnv) = env.lookup(name, symPos): @unchecked
-        val expanded = Macro.expand(name, args, literals, rules, defEnv, env, pos)
+        val expanded                                = Macro.expand(name, args, literals, rules, defEnv, env, pos)
         tailEval(expanded, env, k)
 
       // General function application
@@ -183,11 +182,13 @@ object Evaluator extends EvalForms:
     args match
       case Nil => k(Nil)
       case head :: tail =>
-        eval(head, env, v =>
-          depth += 1
-          if depth >= MaxDepth then
-            Bounce.More(() => evalArgs(tail, env, vs => k(v :: vs)))
-          else evalArgs(tail, env, vs => k(v :: vs))
+        eval(
+          head,
+          env,
+          v =>
+            depth += 1
+            if depth >= MaxDepth then Bounce.More(() => evalArgs(tail, env, vs => k(v :: vs)))
+            else evalArgs(tail, env, vs => k(v :: vs))
         )
 
   private def applyProc(proc: Value, values: List[Value], pos: Option[Pos], k: K): Bounce =
