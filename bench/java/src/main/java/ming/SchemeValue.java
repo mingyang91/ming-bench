@@ -23,7 +23,15 @@ public sealed interface SchemeValue {
     record ListVal(List<SchemeValue> elements, int line, int col) implements SchemeValue {
         ListVal(List<SchemeValue> elements) { this(elements, 0, 0); }
     }
-    record PairVal(SchemeValue car, SchemeValue cdr) implements SchemeValue {}
+    final class PairVal implements SchemeValue {
+        private SchemeValue car;
+        private SchemeValue cdr;
+        PairVal(SchemeValue car, SchemeValue cdr) { this.car = car; this.cdr = cdr; }
+        public SchemeValue car() { return car; }
+        public SchemeValue cdr() { return cdr; }
+        public void setCar(SchemeValue v) { this.car = v; }
+        public void setCdr(SchemeValue v) { this.cdr = v; }
+    }
     record NilVal() implements SchemeValue {}
     record LambdaVal(List<String> params, String restParam, List<SchemeValue> body, Environment env) implements SchemeValue {
         LambdaVal(List<String> params, List<SchemeValue> body, Environment env) {
@@ -147,15 +155,22 @@ public sealed interface SchemeValue {
     }
 
     private static String displayPair(PairVal pair) {
+        java.util.IdentityHashMap<PairVal, Boolean> seen = new java.util.IdentityHashMap<>();
         StringBuilder sb = new StringBuilder("(");
+        seen.put(pair, Boolean.TRUE);
         sb.append(pair.car().display());
         SchemeValue rest = pair.cdr();
         while (rest instanceof PairVal p) {
+            if (seen.containsKey(p)) {
+                sb.append(" ...");
+                break;
+            }
+            seen.put(p, Boolean.TRUE);
             sb.append(' ');
             sb.append(p.car().display());
             rest = p.cdr();
         }
-        if (!(rest instanceof NilVal)) {
+        if (!(rest instanceof PairVal) && !(rest instanceof NilVal)) {
             sb.append(" . ");
             sb.append(rest.display());
         }

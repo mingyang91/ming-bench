@@ -32,7 +32,7 @@ public class Evaluator {
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "quote", "set!", "define", "lambda", "if", "begin", "cond", "and", "or",
-        "let", "letrec", "letrec*", "case", "do", "define-syntax", "syntax-rules", "guard",
+        "let", "let*", "letrec", "letrec*", "case", "do", "define-syntax", "syntax-rules", "guard",
         "define-record-type"
     );
 
@@ -213,6 +213,18 @@ public class Evaluator {
             if (args.getFirst() instanceof SchemeValue.PairVal p) return p.cdr();
             throw new EvalError("cdr: not a pair: " + args.getFirst().display());
         }));
+        env.define("set-car!", new SchemeValue.BuiltinVal("set-car!", args -> {
+            if (args.size() != 2) throw new EvalError("set-car! requires 2 arguments");
+            if (!(args.get(0) instanceof SchemeValue.PairVal p)) throw new EvalError("set-car!: not a pair");
+            p.setCar(args.get(1));
+            return new SchemeValue.VoidVal();
+        }));
+        env.define("set-cdr!", new SchemeValue.BuiltinVal("set-cdr!", args -> {
+            if (args.size() != 2) throw new EvalError("set-cdr! requires 2 arguments");
+            if (!(args.get(0) instanceof SchemeValue.PairVal p)) throw new EvalError("set-cdr!: not a pair");
+            p.setCdr(args.get(1));
+            return new SchemeValue.VoidVal();
+        }));
         env.define("null?", new SchemeValue.BuiltinVal("null?", args -> {
             if (args.size() != 1) throw new EvalError("null? requires exactly 1 argument");
             return new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.NilVal);
@@ -244,6 +256,32 @@ public class Evaluator {
             return result;
         }));
 
+        env.define("cadr", new SchemeValue.BuiltinVal("cadr", args -> {
+            if (!(args.getFirst() instanceof SchemeValue.PairVal p)) throw new EvalError("cadr: not a pair");
+            if (!(p.cdr() instanceof SchemeValue.PairVal p2)) throw new EvalError("cadr: not a pair");
+            return p2.car();
+        }));
+        env.define("cddr", new SchemeValue.BuiltinVal("cddr", args -> {
+            if (!(args.getFirst() instanceof SchemeValue.PairVal p)) throw new EvalError("cddr: not a pair");
+            if (!(p.cdr() instanceof SchemeValue.PairVal p2)) throw new EvalError("cddr: not a pair");
+            return p2.cdr();
+        }));
+        env.define("caar", new SchemeValue.BuiltinVal("caar", args -> {
+            if (!(args.getFirst() instanceof SchemeValue.PairVal p)) throw new EvalError("caar: not a pair");
+            if (!(p.car() instanceof SchemeValue.PairVal p2)) throw new EvalError("caar: not a pair");
+            return p2.car();
+        }));
+        env.define("cdar", new SchemeValue.BuiltinVal("cdar", args -> {
+            if (!(args.getFirst() instanceof SchemeValue.PairVal p)) throw new EvalError("cdar: not a pair");
+            if (!(p.car() instanceof SchemeValue.PairVal p2)) throw new EvalError("cdar: not a pair");
+            return p2.cdr();
+        }));
+        env.define("caddr", new SchemeValue.BuiltinVal("caddr", args -> {
+            if (!(args.getFirst() instanceof SchemeValue.PairVal p)) throw new EvalError("caddr: not a pair");
+            if (!(p.cdr() instanceof SchemeValue.PairVal p2)) throw new EvalError("caddr: not a pair");
+            if (!(p2.cdr() instanceof SchemeValue.PairVal p3)) throw new EvalError("caddr: not a pair");
+            return p3.car();
+        }));
         env.define("reverse", new SchemeValue.BuiltinVal("reverse", args -> {
             if (args.size() != 1) throw new EvalError("reverse requires exactly 1 argument");
             SchemeValue lst = args.getFirst();
@@ -298,6 +336,22 @@ public class Evaluator {
         }));
 
         // String operations
+        env.define("make-string", new SchemeValue.BuiltinVal("make-string", args -> {
+            if (args.isEmpty()) throw new EvalError("make-string requires at least 1 argument");
+            int n = (int) requireInt(args.get(0));
+            char c = args.size() > 1 && args.get(1) instanceof SchemeValue.CharVal cv ? cv.value() : ' ';
+            char[] chars = new char[n];
+            java.util.Arrays.fill(chars, c);
+            return new SchemeValue.StringVal(chars);
+        }));
+        env.define("string", new SchemeValue.BuiltinVal("string", args -> {
+            char[] chars = new char[args.size()];
+            for (int i = 0; i < args.size(); i++) {
+                if (!(args.get(i) instanceof SchemeValue.CharVal c)) throw new EvalError("string: not a character");
+                chars[i] = c.value();
+            }
+            return new SchemeValue.StringVal(chars);
+        }));
         env.define("string-append", new SchemeValue.BuiltinVal("string-append", args -> {
             StringBuilder sb = new StringBuilder();
             for (SchemeValue arg : args) {
@@ -395,6 +449,38 @@ public class Evaluator {
         env.define("even?", new SchemeValue.BuiltinVal("even?", args ->
             new SchemeValue.BoolVal(requireInt(args.getFirst()) % 2 == 0)));
 
+        env.define("gcd", new SchemeValue.BuiltinVal("gcd", args -> {
+            if (args.isEmpty()) return new SchemeValue.IntVal(0);
+            long result = Math.abs(requireInt(args.get(0)));
+            for (int i = 1; i < args.size(); i++) {
+                result = gcd(result, Math.abs(requireInt(args.get(i))));
+            }
+            return new SchemeValue.IntVal(result);
+        }));
+        env.define("lcm", new SchemeValue.BuiltinVal("lcm", args -> {
+            if (args.isEmpty()) return new SchemeValue.IntVal(1);
+            long result = Math.abs(requireInt(args.get(0)));
+            for (int i = 1; i < args.size(); i++) {
+                long b = Math.abs(requireInt(args.get(i)));
+                if (result == 0 || b == 0) { result = 0; } else {
+                    result = result / gcd(result, b) * b;
+                }
+            }
+            return new SchemeValue.IntVal(result);
+        }));
+        env.define("truncate", new SchemeValue.BuiltinVal("truncate", args -> {
+            SchemeValue v = args.getFirst();
+            if (v instanceof SchemeValue.IntVal) return v;
+            if (v instanceof SchemeValue.DoubleVal d) return new SchemeValue.IntVal((long) d.value());
+            throw new EvalError("truncate: not a number");
+        }));
+        env.define("round", new SchemeValue.BuiltinVal("round", args -> {
+            SchemeValue v = args.getFirst();
+            if (v instanceof SchemeValue.IntVal) return v;
+            if (v instanceof SchemeValue.DoubleVal d) return new SchemeValue.IntVal(Math.round(d.value()));
+            throw new EvalError("round: not a number");
+        }));
+
         // List utilities (L13)
         env.define("list-ref", new SchemeValue.BuiltinVal("list-ref", args -> {
             if (args.size() != 2) throw new EvalError("list-ref requires 2 arguments");
@@ -418,9 +504,19 @@ public class Evaluator {
             return lst;
         }));
         env.define("list?", new SchemeValue.BuiltinVal("list?", args -> {
-            SchemeValue v = args.getFirst();
-            while (v instanceof SchemeValue.PairVal p) v = p.cdr();
-            return new SchemeValue.BoolVal(v instanceof SchemeValue.NilVal);
+            // Floyd's tortoise-and-hare cycle detection
+            SchemeValue slow = args.getFirst(), fast = args.getFirst();
+            while (fast instanceof SchemeValue.PairVal fp) {
+                fast = fp.cdr();
+                if (fast instanceof SchemeValue.PairVal fp2) {
+                    fast = fp2.cdr();
+                } else {
+                    return new SchemeValue.BoolVal(fast instanceof SchemeValue.NilVal);
+                }
+                slow = ((SchemeValue.PairVal) slow).cdr();
+                if (slow == fast) return new SchemeValue.BoolVal(false); // cycle
+            }
+            return new SchemeValue.BoolVal(fast instanceof SchemeValue.NilVal);
         }));
         env.define("equal?", new SchemeValue.BuiltinVal("equal?", args -> {
             if (args.size() != 2) throw new EvalError("equal? requires 2 arguments");
@@ -435,6 +531,28 @@ public class Evaluator {
                     if (schemeEqual(entry.car(), key)) return p.car();
                 }
                 alist = p.cdr();
+            }
+            return new SchemeValue.BoolVal(false);
+        }));
+        env.define("assv", new SchemeValue.BuiltinVal("assv", args -> {
+            if (args.size() != 2) throw new EvalError("assv requires 2 arguments");
+            SchemeValue key = args.get(0);
+            SchemeValue alist = args.get(1);
+            while (alist instanceof SchemeValue.PairVal p) {
+                if (p.car() instanceof SchemeValue.PairVal entry) {
+                    if (eqv(entry.car(), key)) return p.car();
+                }
+                alist = p.cdr();
+            }
+            return new SchemeValue.BoolVal(false);
+        }));
+        env.define("member", new SchemeValue.BuiltinVal("member", args -> {
+            if (args.size() != 2) throw new EvalError("member requires 2 arguments");
+            SchemeValue obj = args.get(0);
+            SchemeValue lst = args.get(1);
+            while (lst instanceof SchemeValue.PairVal p) {
+                if (schemeEqual(p.car(), obj)) return lst;
+                lst = p.cdr();
             }
             return new SchemeValue.BoolVal(false);
         }));
@@ -584,6 +702,21 @@ public class Evaluator {
                 throw new EvalError("string<?: not strings");
             return new SchemeValue.BoolVal(a.value().compareTo(b.value()) < 0);
         }));
+        env.define("string>?", new SchemeValue.BuiltinVal("string>?", args -> {
+            if (!(args.get(0) instanceof SchemeValue.StringVal a) || !(args.get(1) instanceof SchemeValue.StringVal b))
+                throw new EvalError("string>?: not strings");
+            return new SchemeValue.BoolVal(a.value().compareTo(b.value()) > 0);
+        }));
+        env.define("string<=?", new SchemeValue.BuiltinVal("string<=?", args -> {
+            if (!(args.get(0) instanceof SchemeValue.StringVal a) || !(args.get(1) instanceof SchemeValue.StringVal b))
+                throw new EvalError("string<=?: not strings");
+            return new SchemeValue.BoolVal(a.value().compareTo(b.value()) <= 0);
+        }));
+        env.define("string>=?", new SchemeValue.BuiltinVal("string>=?", args -> {
+            if (!(args.get(0) instanceof SchemeValue.StringVal a) || !(args.get(1) instanceof SchemeValue.StringVal b))
+                throw new EvalError("string>=?: not strings");
+            return new SchemeValue.BoolVal(a.value().compareTo(b.value()) >= 0);
+        }));
         env.define("string-ci=?", new SchemeValue.BuiltinVal("string-ci=?", args -> {
             if (!(args.get(0) instanceof SchemeValue.StringVal a) || !(args.get(1) instanceof SchemeValue.StringVal b))
                 throw new EvalError("string-ci=?: not strings");
@@ -604,6 +737,14 @@ public class Evaluator {
             SchemeValue proc = args.getFirst();
             List<SchemeValue> lists = args.subList(1, args.size());
             return mapLoop(proc, lists, new ArrayList<>(), k);
+        }));
+
+        // for-each (CPS-aware)
+        env.define("for-each", new SchemeValue.CpsBuiltinVal("for-each", (args, k) -> {
+            if (args.size() < 2) return new Bounce.Err(new EvalError("for-each requires at least 2 arguments"));
+            SchemeValue proc = args.getFirst();
+            List<SchemeValue> lists = args.subList(1, args.size());
+            return forEachLoop(proc, lists, k);
         }));
 
         // string-set!
@@ -919,6 +1060,7 @@ public class Evaluator {
                 yield evalOr(elems, 1, env, k);
             }
             case "let" -> evalLet(elems, env, pos, k);
+            case "let*" -> evalLetStar(elems, env, pos, k);
             case "letrec" -> evalLetrec(elems, env, pos, false, k);
             case "letrec*" -> evalLetrec(elems, env, pos, true, k);
             case "case" -> evalCase(elems, env, pos, k);
@@ -1365,6 +1507,30 @@ public class Evaluator {
         }));
     }
 
+    private Bounce evalLetStar(List<SchemeValue> elems, Environment env, String pos, SchemeValue.Cont k) {
+        if (elems.size() < 3)
+            return new Bounce.Err(new EvalError("let* requires bindings and body at " + pos));
+        if (!(elems.get(1) instanceof SchemeValue.ListVal bindingsList))
+            return new Bounce.Err(new EvalError("let*: expected bindings list"));
+        Environment letEnv = new Environment(env);
+        List<SchemeValue> body = elems.subList(2, elems.size());
+        return evalLetStarBindings(bindingsList.elements(), 0, letEnv, body, k);
+    }
+
+    private Bounce evalLetStarBindings(List<SchemeValue> bindings, int idx,
+                                        Environment letEnv, List<SchemeValue> body, SchemeValue.Cont k) {
+        if (idx >= bindings.size()) return evalBody(body, letEnv, k);
+        SchemeValue b = bindings.get(idx);
+        if (!(b instanceof SchemeValue.ListVal binding) || binding.elements().size() != 2)
+            return new Bounce.Err(new EvalError("let*: invalid binding"));
+        if (!(binding.elements().get(0) instanceof SchemeValue.SymbolVal s))
+            return new Bounce.Err(new EvalError("let*: expected symbol in binding"));
+        return new Bounce.More(() -> eval(binding.elements().get(1), letEnv, val -> {
+            letEnv.define(s.name(), val);
+            return evalLetStarBindings(bindings, idx + 1, letEnv, body, k);
+        }));
+    }
+
     // ── letrec / letrec* ───────────────────────────────────────────────
 
     private Bounce evalLetrec(List<SchemeValue> elems, Environment env, String pos,
@@ -1787,7 +1953,29 @@ public class Evaluator {
         }
     }
 
+    private boolean eqv(SchemeValue a, SchemeValue b) {
+        if (a instanceof SchemeValue.SymbolVal sa && b instanceof SchemeValue.SymbolVal sb)
+            return sa.name().equals(sb.name());
+        if (a instanceof SchemeValue.IntVal ia && b instanceof SchemeValue.IntVal ib)
+            return ia.value() == ib.value();
+        if (a instanceof SchemeValue.RationalVal ra && b instanceof SchemeValue.RationalVal rb)
+            return ra.num() == rb.num() && ra.den() == rb.den();
+        if (a instanceof SchemeValue.DoubleVal da && b instanceof SchemeValue.DoubleVal db)
+            return da.value() == db.value();
+        if (a instanceof SchemeValue.BoolVal ba && b instanceof SchemeValue.BoolVal bb)
+            return ba.value() == bb.value();
+        if (a instanceof SchemeValue.CharVal ca && b instanceof SchemeValue.CharVal cb)
+            return ca.value() == cb.value();
+        if (a instanceof SchemeValue.NilVal && b instanceof SchemeValue.NilVal)
+            return true;
+        return a == b;
+    }
+
     private boolean schemeEqual(SchemeValue a, SchemeValue b) {
+        return schemeEqualCycle(a, b, new java.util.HashSet<>());
+    }
+
+    private boolean schemeEqualCycle(SchemeValue a, SchemeValue b, Set<Long> seen) {
         if (isNumeric(a) && isNumeric(b)) {
             try { return numericEquals(a, b); } catch (EvalError e) { return false; }
         }
@@ -1801,12 +1989,15 @@ public class Evaluator {
             return ca.value() == cb.value();
         if (a instanceof SchemeValue.NilVal && b instanceof SchemeValue.NilVal)
             return true;
-        if (a instanceof SchemeValue.PairVal pa && b instanceof SchemeValue.PairVal pb)
-            return schemeEqual(pa.car(), pb.car()) && schemeEqual(pa.cdr(), pb.cdr());
+        if (a instanceof SchemeValue.PairVal pa && b instanceof SchemeValue.PairVal pb) {
+            long key = ((long) System.identityHashCode(pa) << 32) | (System.identityHashCode(pb) & 0xFFFFFFFFL);
+            if (!seen.add(key)) return true; // cycle assumed equal
+            return schemeEqualCycle(pa.car(), pb.car(), seen) && schemeEqualCycle(pa.cdr(), pb.cdr(), seen);
+        }
         if (a instanceof SchemeValue.VectorVal va && b instanceof SchemeValue.VectorVal vb) {
             if (va.length() != vb.length()) return false;
             for (int i = 0; i < va.length(); i++) {
-                if (!schemeEqual(va.get(i), vb.get(i))) return false;
+                if (!schemeEqualCycle(va.get(i), vb.get(i), seen)) return false;
             }
             return true;
         }
@@ -1840,6 +2031,26 @@ public class Evaluator {
             newAcc.add(val);
             return mapLoop(proc, nextLists, newAcc, k);
         }));
+    }
+
+    private Bounce forEachLoop(SchemeValue proc, List<SchemeValue> lists, SchemeValue.Cont k) {
+        for (SchemeValue lst : lists) {
+            if (lst instanceof SchemeValue.NilVal) {
+                return k.apply(new SchemeValue.VoidVal());
+            }
+        }
+        List<SchemeValue> callArgs = new ArrayList<>(lists.size());
+        List<SchemeValue> nextLists = new ArrayList<>(lists.size());
+        for (SchemeValue lst : lists) {
+            if (!(lst instanceof SchemeValue.PairVal p)) {
+                return new Bounce.Err(new EvalError("for-each: not a proper list"));
+            }
+            callArgs.add(p.car());
+            nextLists.add(p.cdr());
+        }
+        return new Bounce.More(() -> applyProc(proc, callArgs, "for-each", ignored ->
+            forEachLoop(proc, nextLists, k)
+        ));
     }
 
     private long requireInt(SchemeValue val) throws EvalError {
