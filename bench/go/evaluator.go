@@ -21,6 +21,7 @@ const (
 	valVoid
 	valLambda
 	valBuiltin
+	valChar
 )
 
 type value struct {
@@ -34,6 +35,8 @@ type value struct {
 	params []string
 	body   []*expr
 	closure *env
+	// char
+	cval rune
 	// builtin function
 	builtin func(args []*value, line, col int) (*value, error)
 }
@@ -49,6 +52,8 @@ func symVal(s string) *value  { return &value{typ: valSymbol, sval: s} }
 func (v *value) isTruthy() bool {
 	return !(v.typ == valBool && !v.bval)
 }
+
+func charVal(c rune) *value { return &value{typ: valChar, cval: c} }
 
 func (v *value) String() string {
 	switch v.typ {
@@ -69,8 +74,35 @@ func (v *value) String() string {
 		return printList(v)
 	case valVoid:
 		return ""
+	case valChar:
+		return formatChar(v.cval)
 	}
 	return ""
+}
+
+// displayString returns the display representation (no quotes for strings).
+func (v *value) displayString() string {
+	switch v.typ {
+	case valString:
+		return v.sval
+	case valChar:
+		return string(v.cval)
+	default:
+		return v.String()
+	}
+}
+
+func formatChar(c rune) string {
+	switch c {
+	case ' ':
+		return `#\space`
+	case '\n':
+		return `#\newline`
+	case '\t':
+		return `#\tab`
+	default:
+		return `#\` + string(c)
+	}
 }
 
 func printList(v *value) string {
@@ -309,6 +341,12 @@ func (e *env) get(name string) (*value, bool) {
 
 func (e *env) set(name string, v *value) {
 	e.bindings[name] = v
+}
+
+// ---------- Interpreter ----------
+
+type interp struct {
+	output strings.Builder
 }
 
 // ---------- Evaluator ----------
@@ -664,7 +702,7 @@ func makeBuiltin(name string, fn func(args []*value, line, col int) (*value, err
 	return &value{typ: valBuiltin, sval: name, builtin: fn}
 }
 
-func makeGlobalEnv() *env {
+func makeGlobalEnv(ip *interp) *env {
 	e := newEnv(nil)
 
 	e.set("+", makeBuiltin("+", func(args []*value, line, col int) (*value, error) {
@@ -864,37 +902,158 @@ func makeGlobalEnv() *env {
 		return boolVal(args[0].typ == valSymbol), nil
 	}))
 
+	e.set("char?", makeBuiltin("char?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char?: expected 1 argument", line, col)}
+		}
+		return boolVal(args[0].typ == valChar), nil
+	}))
+
+	// I/O
+	e.set("display", makeBuiltin("display", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: display: expected 1 argument", line, col)}
+		}
+		ip.output.WriteString(args[0].displayString())
+		return voidVal, nil
+	}))
+
+	e.set("write", makeBuiltin("write", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: write: expected 1 argument", line, col)}
+		}
+		ip.output.WriteString(args[0].String())
+		return voidVal, nil
+	}))
+
+	e.set("newline", makeBuiltin("newline", func(args []*value, line, col int) (*value, error) {
+		ip.output.WriteByte('\n')
+		return voidVal, nil
+	}))
+
+	// String operations
+	e.set("string-append", makeBuiltin("string-append", func(args []*value, line, col int) (*value, error) {
+		var buf strings.Builder
+		for _, a := range args {
+			if a.typ != valString {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-append: expected string", line, col)}
+			}
+			buf.WriteString(a.sval)
+		}
+		return strVal(buf.String()), nil
+	}))
+
+	e.set("string-length", makeBuiltin("string-length", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-length: expected string", line, col)}
+		}
+		return intVal(int64(len([]rune(args[0].sval)))), nil
+	}))
+
+	e.set("substring", makeBuiltin("substring", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 3 || args[0].typ != valString || args[1].typ != valInt || args[2].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: substring: bad arguments", line, col)}
+		}
+		runes := []rune(args[0].sval)
+		start := int(args[1].ival)
+		end := int(args[2].ival)
+		if start < 0 || end < start || end > len(runes) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: substring: index out of range", line, col)}
+		}
+		return strVal(string(runes[start:end])), nil
+	}))
+
+	e.set("string->number", makeBuiltin("string->number", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->number: expected string", line, col)}
+		}
+		n, err := strconv.ParseInt(args[0].sval, 10, 64)
+		if err != nil {
+			return boolVal(false), nil
+		}
+		return intVal(n), nil
+	}))
+
+	e.set("number->string", makeBuiltin("number->string", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: number->string: expected number", line, col)}
+		}
+		return strVal(strconv.FormatInt(args[0].ival, 10)), nil
+	}))
+
+	e.set("symbol->string", makeBuiltin("symbol->string", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valSymbol {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: symbol->string: expected symbol", line, col)}
+		}
+		return strVal(args[0].sval), nil
+	}))
+
+	e.set("string->symbol", makeBuiltin("string->symbol", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->symbol: expected string", line, col)}
+		}
+		return symVal(args[0].sval), nil
+	}))
+
+	e.set("string-ref", makeBuiltin("string-ref", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 || args[0].typ != valString || args[1].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: bad arguments", line, col)}
+		}
+		runes := []rune(args[0].sval)
+		idx := int(args[1].ival)
+		if idx < 0 || idx >= len(runes) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: index out of range", line, col)}
+		}
+		return charVal(runes[idx]), nil
+	}))
+
 	return e
+}
+
+func evalInput(input string) (last *value, ip *interp, err error) {
+	tokens := tokenize(input)
+	exprs, parseErr := parse(tokens)
+	if parseErr != nil {
+		return nil, nil, parseErr
+	}
+	if len(exprs) == 0 {
+		return nil, &interp{}, nil
+	}
+
+	ip = &interp{}
+	env := makeGlobalEnv(ip)
+	for _, e := range exprs {
+		last, err = eval(e, env)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return last, ip, nil
 }
 
 // EvalStr evaluates one or more Scheme expressions and returns the string
 // representation of the last result.
 func EvalStr(input string) (string, error) {
-	tokens := tokenize(input)
-	exprs, err := parse(tokens)
+	last, _, err := evalInput(input)
 	if err != nil {
 		return "", err
 	}
-	if len(exprs) == 0 {
+	if last == nil {
 		return "", nil
 	}
-
-	env := makeGlobalEnv()
-	var last *value
-	for _, e := range exprs {
-		v, err := eval(e, env)
-		if err != nil {
-			return "", err
-		}
-		last = v
-	}
-
 	return last.String(), nil
 }
 
 // EvalStrWithOutput evaluates Scheme expressions and returns both the result
 // string and any captured output from display/write/newline.
 func EvalStrWithOutput(input string) (result string, output string, err error) {
-	r, err := EvalStr(input)
-	return r, "", err
+	last, ip, err := evalInput(input)
+	if err != nil {
+		return "", "", err
+	}
+	r := ""
+	if last != nil {
+		r = last.String()
+	}
+	return r, ip.output.String(), nil
 }
