@@ -18,6 +18,9 @@ const (
 	TokenString
 	TokenSymbol
 	TokenQuote
+	TokenQuasiquote
+	TokenUnquote
+	TokenUnquoteSplicing
 	TokenChar
 	TokenFloat
 	TokenRational
@@ -42,7 +45,7 @@ func Tokenize(input string) ([]Token, error) {
 		ch := input[i]
 
 		// Skip whitespace
-		if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' {
+		if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '\f' || ch == '\v' {
 			if ch == '\n' {
 				line++
 				col = 1
@@ -80,6 +83,28 @@ func Tokenize(input string) ([]Token, error) {
 			tokens = append(tokens, Token{Type: TokenQuote, Value: "'", Line: line, Col: col})
 			i++
 			col++
+			continue
+		}
+
+		// Quasiquote shorthand
+		if ch == '`' {
+			tokens = append(tokens, Token{Type: TokenQuasiquote, Value: "`", Line: line, Col: col})
+			i++
+			col++
+			continue
+		}
+
+		// Unquote / unquote-splicing
+		if ch == ',' {
+			if i+1 < len(input) && input[i+1] == '@' {
+				tokens = append(tokens, Token{Type: TokenUnquoteSplicing, Value: ",@", Line: line, Col: col})
+				i += 2
+				col += 2
+			} else {
+				tokens = append(tokens, Token{Type: TokenUnquote, Value: ",", Line: line, Col: col})
+				i++
+				col++
+			}
 			continue
 		}
 
@@ -281,6 +306,7 @@ func (e *SymbolExpr) Pos() (int, int) { return e.Line, e.Col }
 
 type ListExpr struct {
 	Elements  []Expr
+	Dot       Expr // non-nil for improper lists: (a b . c)
 	Line, Col int
 }
 
@@ -387,12 +413,71 @@ func (p *Parser) ParseExpr() (Expr, error) {
 			Col:  tok.Col,
 		}, nil
 
+	case TokenQuasiquote:
+		p.next()
+		inner, err := p.ParseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ListExpr{
+			Elements: []Expr{
+				&SymbolExpr{Name: "quasiquote", Line: tok.Line, Col: tok.Col},
+				inner,
+			},
+			Line: tok.Line,
+			Col:  tok.Col,
+		}, nil
+
+	case TokenUnquote:
+		p.next()
+		inner, err := p.ParseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ListExpr{
+			Elements: []Expr{
+				&SymbolExpr{Name: "unquote", Line: tok.Line, Col: tok.Col},
+				inner,
+			},
+			Line: tok.Line,
+			Col:  tok.Col,
+		}, nil
+
+	case TokenUnquoteSplicing:
+		p.next()
+		inner, err := p.ParseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ListExpr{
+			Elements: []Expr{
+				&SymbolExpr{Name: "unquote-splicing", Line: tok.Line, Col: tok.Col},
+				inner,
+			},
+			Line: tok.Line,
+			Col:  tok.Col,
+		}, nil
+
 	case TokenLParen:
 		p.next() // consume '('
 		var elements []Expr
+		var dot Expr
 		for p.peek().Type != TokenRParen {
 			if p.peek().Type == TokenEOF {
 				return nil, fmt.Errorf("%d:%d: unexpected end of input, expected ')'", tok.Line, tok.Col)
+			}
+			// Check for dot notation: (a b . c)
+			if p.peek().Type == TokenSymbol && p.peek().Value == "." && len(elements) > 0 {
+				p.next() // consume '.'
+				var err error
+				dot, err = p.ParseExpr()
+				if err != nil {
+					return nil, err
+				}
+				if p.peek().Type != TokenRParen {
+					return nil, fmt.Errorf("%d:%d: expected ')' after dotted pair", tok.Line, tok.Col)
+				}
+				break
 			}
 			elem, err := p.ParseExpr()
 			if err != nil {
@@ -401,7 +486,7 @@ func (p *Parser) ParseExpr() (Expr, error) {
 			elements = append(elements, elem)
 		}
 		p.next() // consume ')'
-		return &ListExpr{Elements: elements, Line: tok.Line, Col: tok.Col}, nil
+		return &ListExpr{Elements: elements, Dot: dot, Line: tok.Line, Col: tok.Col}, nil
 
 	case TokenRParen:
 		return nil, fmt.Errorf("%d:%d: unexpected ')'", tok.Line, tok.Col)

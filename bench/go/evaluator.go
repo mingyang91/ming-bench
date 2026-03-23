@@ -312,6 +312,13 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 					}
 					return quoteExpr(e.Elements[1]), nil
 
+				case "quasiquote":
+					if len(e.Elements) != 2 {
+						line, col := e.Pos()
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quasiquote: requires exactly 1 argument", line, col)}
+					}
+					return evalQuasiquote(e.Elements[1], env)
+
 				case "lambda":
 					return evalLambda(e, env)
 
@@ -641,7 +648,7 @@ func evalDefine(e *ListExpr, env *Env) (SchemeValue, error) {
 			line, col := e.Pos()
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", line, col)}
 		}
-		params, restParam, err := parseParams(target.Elements[1:], e)
+		params, restParam, err := parseParams(&ListExpr{Elements: target.Elements[1:], Dot: target.Dot}, e)
 		if err != nil {
 			return nil, err
 		}
@@ -682,7 +689,7 @@ func evalLambda(e *ListExpr, env *Env) (SchemeValue, error) {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad syntax", line, col)}
 	}
 
-	params, restParam, err := parseParams(paramList.Elements, e)
+	params, restParam, err := parseParams(paramList, e)
 	if err != nil {
 		return nil, err
 	}
@@ -713,7 +720,7 @@ func evalCaseLambda(e *ListExpr, env *Env) (SchemeValue, error) {
 		switch p := cl.Elements[0].(type) {
 		case *ListExpr:
 			var err error
-			params, restParam, err = parseParams(p.Elements, e)
+			params, restParam, err = parseParams(p, e)
 			if err != nil {
 				return nil, err
 			}
@@ -857,10 +864,10 @@ func applyFunc(proc SchemeValue, args []SchemeValue, callExpr *ListExpr, env *En
 
 // parseParams extracts parameter names and optional rest parameter from a param list.
 // Handles dot notation: (x y . rest)
-func parseParams(elements []Expr, callExpr *ListExpr) ([]string, string, error) {
+func parseParams(paramList *ListExpr, callExpr *ListExpr) ([]string, string, error) {
 	var params []string
 	var restParam string
-	for i, p := range elements {
+	for i, p := range paramList.Elements {
 		ps, ok := p.(*SymbolExpr)
 		if !ok {
 			line, col := callExpr.Pos()
@@ -868,11 +875,11 @@ func parseParams(elements []Expr, callExpr *ListExpr) ([]string, string, error) 
 		}
 		if ps.Name == "." {
 			// Next element is rest param, must be last
-			if i+2 != len(elements) {
+			if i+2 != len(paramList.Elements) {
 				line, col := callExpr.Pos()
 				return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: bad syntax", line, col)}
 			}
-			rs, ok := elements[i+1].(*SymbolExpr)
+			rs, ok := paramList.Elements[i+1].(*SymbolExpr)
 			if !ok {
 				line, col := callExpr.Pos()
 				return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: bad syntax", line, col)}
@@ -881,6 +888,15 @@ func parseParams(elements []Expr, callExpr *ListExpr) ([]string, string, error) 
 			break
 		}
 		params = append(params, ps.Name)
+	}
+	// Handle dotted pair syntax: (a b . rest)
+	if paramList.Dot != nil {
+		ds, ok := paramList.Dot.(*SymbolExpr)
+		if !ok {
+			line, col := callExpr.Pos()
+			return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: bad syntax", line, col)}
+		}
+		restParam = ds.Name
 	}
 	return params, restParam, nil
 }
@@ -1090,6 +1106,20 @@ func setupCond(e *ListExpr, env *Env) (Expr, *Env, bool, SchemeValue, error) {
 			if len(cl.Elements) == 1 {
 				return nil, nil, true, cond, nil
 			}
+			// (cond (test => proc)) - apply proc to test result
+			if len(cl.Elements) == 3 {
+				if arrow, ok := cl.Elements[1].(*SymbolExpr); ok && arrow.Name == "=>" {
+					proc, err := Eval(cl.Elements[2], env)
+					if err != nil {
+						return nil, nil, false, nil, err
+					}
+					result, err := applyFunc(proc, []SchemeValue{cond}, cl, env)
+					if err != nil {
+						return nil, nil, false, nil, err
+					}
+					return nil, nil, true, result, nil
+				}
+			}
 			body := cl.Elements[1:]
 			for _, b := range body[:len(body)-1] {
 				_, err := Eval(b, env)
@@ -1119,13 +1149,104 @@ func quoteExpr(expr Expr) SchemeValue {
 	case *SymbolExpr:
 		return &SchemeSymbol{Name: e.Name}
 	case *ListExpr:
-		var result SchemeValue = &SchemeEmpty{}
+		if len(e.Elements) == 0 && e.Dot == nil {
+			return &SchemeEmpty{}
+		}
+		var result SchemeValue
+		if e.Dot != nil {
+			result = quoteExpr(e.Dot)
+		} else {
+			result = &SchemeEmpty{}
+		}
 		for i := len(e.Elements) - 1; i >= 0; i-- {
 			result = &SchemePair{Car: quoteExpr(e.Elements[i]), Cdr: result}
 		}
 		return result
 	default:
 		return &SchemeVoid{}
+	}
+}
+
+// evalQuasiquote handles quasiquote (backtick) expressions.
+func evalQuasiquote(expr Expr, env *Env) (SchemeValue, error) {
+	switch e := expr.(type) {
+	case *ListExpr:
+		if len(e.Elements) == 0 {
+			return &SchemeEmpty{}, nil
+		}
+		// Check for (unquote x)
+		if sym, ok := e.Elements[0].(*SymbolExpr); ok && sym.Name == "unquote" {
+			if len(e.Elements) != 2 {
+				line, col := e.Pos()
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unquote: requires exactly 1 argument", line, col)}
+			}
+			return Eval(e.Elements[1], env)
+		}
+		// Build list, handling unquote-splicing
+		var result []SchemeValue
+		for _, elem := range e.Elements {
+			if le, ok := elem.(*ListExpr); ok && len(le.Elements) >= 1 {
+				if sym, ok := le.Elements[0].(*SymbolExpr); ok && sym.Name == "unquote-splicing" {
+					if len(le.Elements) != 2 {
+						line, col := le.Pos()
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unquote-splicing: requires exactly 1 argument", line, col)}
+					}
+					val, err := Eval(le.Elements[1], env)
+					if err != nil {
+						return nil, err
+					}
+					// Splice the list into result
+					items, err := schemeListToSlice(val)
+					if err != nil {
+						line, col := le.Pos()
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unquote-splicing: expected list, got %s", line, col, val.String())}
+					}
+					result = append(result, items...)
+					continue
+				}
+			}
+			val, err := evalQuasiquote(elem, env)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, val)
+		}
+		// Build list from result (handle dotted pair)
+		var list SchemeValue
+		if e.Dot != nil {
+			var err error
+			list, err = evalQuasiquote(e.Dot, env)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			list = &SchemeEmpty{}
+		}
+		for i := len(result) - 1; i >= 0; i-- {
+			list = &SchemePair{Car: result[i], Cdr: list}
+		}
+		return list, nil
+	default:
+		return quoteExpr(expr), nil
+	}
+}
+
+// schemeListToSlice converts a Scheme list value to a Go slice.
+func schemeListToSlice(val SchemeValue) ([]SchemeValue, error) {
+	var result []SchemeValue
+	curr := val
+	for {
+		switch v := curr.(type) {
+		case *SchemeEmpty:
+			return result, nil
+		case *SchemePair:
+			result = append(result, v.Car)
+			curr = v.Cdr
+		case *SchemeList:
+			return append(result, v.Elements...), nil
+		default:
+			return nil, fmt.Errorf("not a proper list")
+		}
 	}
 }
 

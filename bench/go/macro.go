@@ -268,6 +268,7 @@ func matchSinglePattern(pattern Expr, input Expr, literals []string, bindings *p
 var specialForms = map[string]bool{
 	"if": true, "let": true, "begin": true, "set!": true, "define": true,
 	"lambda": true, "cond": true, "and": true, "or": true, "quote": true,
+	"quasiquote": true, "unquote": true, "unquote-splicing": true,
 	"define-syntax": true, "syntax-rules": true, "let*": true, "letrec": true,
 	"letrec*": true, "case": true, "do": true,
 	"syntax-case": true, "syntax": true, "with-syntax": true,
