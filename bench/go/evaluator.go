@@ -2,6 +2,15 @@ package ming
 
 import "fmt"
 
+// evalErr creates an EvalError with position info from an expression.
+func evalErr(expr *Value, msg string) *EvalError {
+	return &EvalError{Message: msg, Line: expr.Line, Col: expr.Col}
+}
+
+func evalErrf(expr *Value, format string, args ...interface{}) *EvalError {
+	return evalErr(expr, fmt.Sprintf(format, args...))
+}
+
 // Environment holds variable bindings.
 type Env struct {
 	bindings map[string]*Value
@@ -53,15 +62,15 @@ func eval(expr *Value, env *Env) (*Value, error) {
 	case TypeSymbol:
 		v, ok := env.get(expr.Str)
 		if !ok {
-			return nil, &EvalError{Message: fmt.Sprintf("unbound variable: %s", expr.Str)}
+			return nil, evalErrf(expr, "unbound variable: %s", expr.Str)
 		}
 		return v, nil
 	case TypePair:
 		return evalList(expr, env)
 	case TypeNull:
-		return nil, &EvalError{Message: "empty application"}
+		return nil, evalErr(expr, "empty application")
 	default:
-		return nil, &EvalError{Message: "cannot evaluate"}
+		return nil, evalErr(expr, "cannot evaluate")
 	}
 }
 
@@ -77,9 +86,9 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 		case "or":
 			return evalOr(args, env)
 		case "define":
-			return evalDefine(args, env)
+			return evalDefine(args, env, expr)
 		case "if":
-			return evalIf(args, env)
+			return evalIf(args, env, expr)
 		case "quote":
 			return args.Car, nil
 		case "lambda":
@@ -110,10 +119,22 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 		evalArgs[i] = v
 	}
 
-	return applyProc(fn, evalArgs)
+	result, err := applyProc(fn, evalArgs)
+	if err != nil {
+		// Attach position from the call site if not already present
+		if ee, ok := err.(*EvalError); ok && ee.Line == 0 {
+			ee.Line = expr.Line
+			ee.Col = expr.Col
+		}
+		return nil, err
+	}
+	return result, nil
 }
 
-func evalDefine(args *Value, env *Env) (*Value, error) {
+func evalDefine(args *Value, env *Env, expr *Value) (*Value, error) {
+	if args.Type == TypeNull {
+		return nil, evalErr(expr, "bad define syntax")
+	}
 	target := args.Car
 	if target.Type == TypeSymbol {
 		// (define x expr)
@@ -136,10 +157,13 @@ func evalDefine(args *Value, env *Env) (*Value, error) {
 		env.set(name, makeLambda(params, body, env))
 		return voidValue, nil
 	}
-	return nil, &EvalError{Message: "bad define syntax"}
+	return nil, evalErr(expr, "bad define syntax")
 }
 
-func evalIf(args *Value, env *Env) (*Value, error) {
+func evalIf(args *Value, env *Env, expr *Value) (*Value, error) {
+	if args.Type == TypeNull {
+		return nil, evalErr(expr, "bad if syntax: missing condition")
+	}
 	cond, err := eval(args.Car, env)
 	if err != nil {
 		return nil, err
@@ -536,6 +560,9 @@ func builtinEnv() *Env {
 func EvalStr(input string) (string, error) {
 	exprs, err := readAll(input)
 	if err != nil {
+		if ee, ok := err.(*EvalError); ok {
+			return "", ee
+		}
 		return "", &EvalError{Message: err.Error()}
 	}
 	if len(exprs) == 0 {

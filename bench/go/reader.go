@@ -36,6 +36,9 @@ type Value struct {
 	Closure *Env
 	// Builtin function
 	BuiltinFunc func([]*Value) (*Value, error)
+	// Source position
+	Line int
+	Col  int
 }
 
 var voidValue = &Value{Type: TypeVoid}
@@ -101,10 +104,12 @@ func isTruthy(v *Value) bool {
 type reader struct {
 	input []rune
 	pos   int
+	line  int
+	col   int
 }
 
 func newReader(input string) *reader {
-	return &reader{input: []rune(input), pos: 0}
+	return &reader{input: []rune(input), pos: 0, line: 1, col: 1}
 }
 
 func (r *reader) atEnd() bool {
@@ -121,6 +126,12 @@ func (r *reader) peek() rune {
 func (r *reader) next() rune {
 	ch := r.input[r.pos]
 	r.pos++
+	if ch == '\n' {
+		r.line++
+		r.col = 1
+	} else {
+		r.col++
+	}
 	return ch
 }
 
@@ -143,28 +154,37 @@ func (r *reader) skipWhitespaceAndComments() {
 func (r *reader) readExpr() (*Value, error) {
 	r.skipWhitespaceAndComments()
 	if r.atEnd() {
-		return nil, fmt.Errorf("unexpected end of input")
+		return nil, &EvalError{Message: "unexpected end of input", Line: r.line, Col: r.col}
 	}
 
+	line, col := r.line, r.col
 	ch := r.peek()
 
+	var v *Value
+	var err error
 	switch {
 	case ch == '(':
-		return r.readList()
+		v, err = r.readList()
 	case ch == '\'':
 		r.next()
-		expr, err := r.readExpr()
-		if err != nil {
-			return nil, err
+		expr, err2 := r.readExpr()
+		if err2 != nil {
+			return nil, err2
 		}
-		return makePair(makeSymbol("quote"), makePair(expr, nullValue)), nil
+		v = makePair(makeSymbol("quote"), makePair(expr, nullValue))
 	case ch == '"':
-		return r.readString()
+		v, err = r.readString()
 	case ch == '#':
-		return r.readHash()
+		v, err = r.readHash()
 	default:
-		return r.readAtom()
+		v, err = r.readAtom()
 	}
+	if err != nil {
+		return nil, err
+	}
+	v.Line = line
+	v.Col = col
+	return v, nil
 }
 
 func (r *reader) readList() (*Value, error) {
@@ -173,7 +193,7 @@ func (r *reader) readList() (*Value, error) {
 	for {
 		r.skipWhitespaceAndComments()
 		if r.atEnd() {
-			return nil, fmt.Errorf("unexpected end of input in list")
+			return nil, &EvalError{Message: "unexpected end of input in list", Line: r.line, Col: r.col}
 		}
 		if r.peek() == ')' {
 			r.next()
@@ -197,7 +217,7 @@ func (r *reader) readString() (*Value, error) {
 	var buf []rune
 	for {
 		if r.atEnd() {
-			return nil, fmt.Errorf("unterminated string")
+			return nil, &EvalError{Message: "unterminated string", Line: r.line, Col: r.col}
 		}
 		ch := r.next()
 		if ch == '"' {
@@ -205,7 +225,7 @@ func (r *reader) readString() (*Value, error) {
 		}
 		if ch == '\\' {
 			if r.atEnd() {
-				return nil, fmt.Errorf("unterminated string escape")
+				return nil, &EvalError{Message: "unterminated string escape", Line: r.line, Col: r.col}
 			}
 			esc := r.next()
 			switch esc {
@@ -229,7 +249,7 @@ func (r *reader) readString() (*Value, error) {
 func (r *reader) readHash() (*Value, error) {
 	r.next() // consume '#'
 	if r.atEnd() {
-		return nil, fmt.Errorf("unexpected end of input after #")
+		return nil, &EvalError{Message: "unexpected end of input after #", Line: r.line, Col: r.col}
 	}
 	ch := r.next()
 	switch ch {
@@ -238,7 +258,7 @@ func (r *reader) readHash() (*Value, error) {
 	case 'f':
 		return makeBool(false), nil
 	default:
-		return nil, fmt.Errorf("unknown hash literal: #%c", ch)
+		return nil, &EvalError{Message: fmt.Sprintf("unknown hash literal: #%c", ch), Line: r.line, Col: r.col}
 	}
 }
 
