@@ -36,6 +36,9 @@ public class Evaluator {
     private int errLine = 1;
     private int errCol = 1;
 
+    // Output capture buffer (null when not capturing)
+    private StringBuilder outputBuf;
+
     private EvalError posError(String msg) {
         return new EvalError(errLine + ":" + errCol + ": " + msg);
     }
@@ -59,7 +62,17 @@ public class Evaluator {
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        throw new EvalError("not implemented");
+        List<Token> tokens = tokenize(input);
+        int[] pos = {0};
+        Env env = createGlobalEnv();
+        this.outputBuf = new StringBuilder();
+        Object lastResult = null;
+        while (pos[0] < tokens.size()) {
+            Object expr = parse(tokens, pos);
+            lastResult = eval(expr, env);
+        }
+        String resultStr = (lastResult == null || lastResult == VOID) ? "" : schemeToString(lastResult);
+        return new EvalResult(resultStr, this.outputBuf.toString());
     }
 
     private Env createGlobalEnv() {
@@ -542,7 +555,12 @@ public class Evaluator {
     private static final java.util.Set<String> PRIMITIVES = java.util.Set.of(
             "+", "-", "*", "/", "<", ">", "=", "<=", ">=",
             "cons", "car", "cdr", "null?", "list", "length", "append",
-            "not", "string?", "number?", "boolean?", "pair?", "symbol?"
+            "not", "string?", "number?", "boolean?", "pair?", "symbol?",
+            "display", "write", "newline",
+            "string-append", "string-length", "substring",
+            "string->number", "number->string",
+            "symbol->string", "string->symbol",
+            "string-ref", "char?"
     );
 
     private boolean isPrimitive(String name) {
@@ -667,6 +685,74 @@ public class Evaluator {
                 requireArgCount(args, 1, "symbol?");
                 yield args.get(0) instanceof String;
             }
+            case "char?" -> {
+                requireArgCount(args, 1, "char?");
+                yield args.get(0) instanceof SchemeChar;
+            }
+            case "display" -> {
+                requireArgCount(args, 1, "display");
+                if (outputBuf != null) outputBuf.append(displayString(args.get(0)));
+                yield VOID;
+            }
+            case "write" -> {
+                requireArgCount(args, 1, "write");
+                if (outputBuf != null) outputBuf.append(schemeToString(args.get(0)));
+                yield VOID;
+            }
+            case "newline" -> {
+                requireArgCount(args, 0, "newline");
+                if (outputBuf != null) outputBuf.append('\n');
+                yield VOID;
+            }
+            case "string-append" -> {
+                StringBuilder sb = new StringBuilder();
+                for (Object a : args) {
+                    if (!(a instanceof SchemeString s)) throw posError("string-append: expected string");
+                    sb.append(s.value());
+                }
+                yield new SchemeString(sb.toString());
+            }
+            case "string-length" -> {
+                requireArgCount(args, 1, "string-length");
+                if (!(args.get(0) instanceof SchemeString s)) throw posError("string-length: expected string");
+                yield (long) s.value().length();
+            }
+            case "substring" -> {
+                if (args.size() < 2 || args.size() > 3) throw posError("substring: expected 2-3 arguments");
+                if (!(args.get(0) instanceof SchemeString s)) throw posError("substring: expected string");
+                int start = (int) requireLong(args.get(1), "substring");
+                int end = args.size() == 3 ? (int) requireLong(args.get(2), "substring") : s.value().length();
+                yield new SchemeString(s.value().substring(start, end));
+            }
+            case "string->number" -> {
+                requireArgCount(args, 1, "string->number");
+                if (!(args.get(0) instanceof SchemeString s)) throw posError("string->number: expected string");
+                try {
+                    yield Long.parseLong(s.value());
+                } catch (NumberFormatException e) {
+                    yield Boolean.FALSE;
+                }
+            }
+            case "number->string" -> {
+                requireArgCount(args, 1, "number->string");
+                yield new SchemeString(String.valueOf(requireLong(args.get(0), "number->string")));
+            }
+            case "symbol->string" -> {
+                requireArgCount(args, 1, "symbol->string");
+                if (!(args.get(0) instanceof String s)) throw posError("symbol->string: expected symbol");
+                yield new SchemeString(s);
+            }
+            case "string->symbol" -> {
+                requireArgCount(args, 1, "string->symbol");
+                if (!(args.get(0) instanceof SchemeString s)) throw posError("string->symbol: expected string");
+                yield s.value();
+            }
+            case "string-ref" -> {
+                requireArgCount(args, 2, "string-ref");
+                if (!(args.get(0) instanceof SchemeString s)) throw posError("string-ref: expected string");
+                int idx = (int) requireLong(args.get(1), "string-ref");
+                yield new SchemeChar(s.value().charAt(idx));
+            }
             default -> throw posError("unbound variable: " + proc);
         };
     }
@@ -694,10 +780,17 @@ public class Evaluator {
 
     // --- Output formatting ---
 
+    private String displayString(Object val) {
+        if (val instanceof SchemeString s) return s.value();
+        if (val instanceof SchemeChar c) return String.valueOf(c.value());
+        return schemeToString(val);
+    }
+
     private String schemeToString(Object val) {
         if (val instanceof Long l) return l.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
+        if (val instanceof SchemeChar c) return "#\\" + c.value();
         if (val == NIL) return "()";
         if (val instanceof Pair) {
             StringBuilder sb = new StringBuilder("(");
@@ -732,4 +825,7 @@ public class Evaluator {
 
     // Internal type for Scheme strings (to distinguish from symbols which are Java Strings)
     record SchemeString(String value) {}
+
+    // Internal type for Scheme characters
+    record SchemeChar(char value) {}
 }
