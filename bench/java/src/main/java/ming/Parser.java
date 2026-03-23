@@ -28,6 +28,11 @@ public class Parser {
                 SchemeValue quoted = parseExpr();
                 yield new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quote", tok.line(), tok.col()), quoted), tok.line(), tok.col());
             }
+            case SYNTAX_QUOTE -> {
+                advance();
+                SchemeValue quoted = parseExpr();
+                yield new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("syntax", tok.line(), tok.col()), quoted), tok.line(), tok.col());
+            }
             case LPAREN -> parseList();
             case INTEGER -> { advance(); yield new SchemeValue.IntVal(Long.parseLong(tok.value())); }
             case RATIONAL -> {

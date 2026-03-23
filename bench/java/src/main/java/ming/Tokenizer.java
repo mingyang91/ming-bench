@@ -5,7 +5,7 @@ import java.util.List;
 
 public class Tokenizer {
     public enum TokenType {
-        LPAREN, RPAREN, QUOTE, SYMBOL, INTEGER, RATIONAL, DOUBLE, BOOLEAN, STRING, CHAR, EOF
+        LPAREN, RPAREN, QUOTE, SYNTAX_QUOTE, SYMBOL, INTEGER, RATIONAL, DOUBLE, BOOLEAN, STRING, CHAR, EOF
     }
 
     public record Token(TokenType type, String value, int pos, int line, int col) {}
@@ -104,6 +104,10 @@ public class Tokenizer {
         pos++; // skip #
         if (pos >= input.length()) throw new EvalError("Unexpected end after #");
         char c = input.charAt(pos);
+        if (c == '\'') {
+            pos++;
+            return token(TokenType.SYNTAX_QUOTE, "#'", start);
+        }
         if (c == 't') {
             pos++;
             // Check it's not part of a longer symbol like #true

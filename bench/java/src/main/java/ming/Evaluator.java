@@ -26,6 +26,12 @@ public class Evaluator {
     }
     private final List<WindRecord> windStack = new ArrayList<>();
 
+    // syntax-case pattern variable bindings stack
+    record SyntaxEnv(Map<String, SchemeValue> singles, Map<String, List<SchemeValue>> lists, Environment defEnv) {}
+    private final List<SyntaxEnv> syntaxEnvStack = new ArrayList<>();
+    // Hygiene bindings from syntax templates, applied at macro use site
+    private final Map<String, SchemeValue> pendingHygieneBindings = new HashMap<>();
+
     private String gensym(String prefix) {
         return prefix + "__" + (gensymCounter++);
     }
@@ -33,7 +39,7 @@ public class Evaluator {
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "quote", "set!", "define", "lambda", "if", "begin", "cond", "and", "or",
         "let", "let*", "letrec", "letrec*", "case", "do", "define-syntax", "syntax-rules", "guard",
-        "define-record-type"
+        "define-record-type", "syntax-case", "syntax", "with-syntax"
     );
 
     public String evalStr(String input) throws EvalError {
@@ -401,6 +407,16 @@ public class Evaluator {
         env.define("string-copy", new SchemeValue.BuiltinVal("string-copy", args -> {
             if (!(args.getFirst() instanceof SchemeValue.StringVal s)) throw new EvalError("string-copy: not a string");
             return new SchemeValue.StringVal(s.value().toCharArray());
+        }));
+
+        // syntax-case support (L22)
+        env.define("syntax->datum", new SchemeValue.BuiltinVal("syntax->datum", args -> {
+            if (args.size() != 1) throw new EvalError("syntax->datum requires 1 argument");
+            return args.getFirst(); // in our model, syntax objects are plain data
+        }));
+        env.define("datum->syntax", new SchemeValue.BuiltinVal("datum->syntax", args -> {
+            if (args.size() != 2) throw new EvalError("datum->syntax requires 2 arguments");
+            return args.get(1); // return the datum as-is (context is ignored in our simplified model)
         }));
 
         // Numeric utilities (L13)
@@ -964,6 +980,7 @@ public class Evaluator {
             case SchemeValue.CpsBuiltinVal v -> k.apply(v);
             case SchemeValue.ContinuationVal v -> k.apply(v);
             case SchemeValue.SyntaxRulesVal v -> k.apply(v);
+            case SchemeValue.MacroTransformerVal v -> k.apply(v);
             case SchemeValue.ValuesVal v -> k.apply(v);
             case SchemeValue.VectorVal v -> k.apply(v);
             case SchemeValue.RecordVal v -> k.apply(v);
@@ -995,6 +1012,17 @@ public class Evaluator {
                 if (val instanceof SchemeValue.SyntaxRulesVal macro) {
                     SchemeValue expanded = expandMacro(macro, elems, env);
                     return new Bounce.More(() -> eval(expanded, env, k));
+                }
+                if (val instanceof SchemeValue.MacroTransformerVal mt) {
+                    SchemeValue inputForm = listVal;
+                    return new Bounce.More(() -> applyProc(mt.transformer(), List.of(inputForm), pos, expanded -> {
+                        // Apply hygiene bindings from syntax templates to use-site env
+                        for (var entry : pendingHygieneBindings.entrySet()) {
+                            env.define(entry.getKey(), entry.getValue());
+                        }
+                        pendingHygieneBindings.clear();
+                        return new Bounce.More(() -> eval(expanded, env, k));
+                    }));
                 }
             } catch (EvalError ignored) {}
         }
@@ -1066,6 +1094,9 @@ public class Evaluator {
             case "case" -> evalCase(elems, env, pos, k);
             case "do" -> evalDo(elems, env, pos, k);
             case "define-syntax" -> evalDefineSyntax(elems, env, pos, k);
+            case "syntax-case" -> evalSyntaxCase(elems, env, pos, k);
+            case "syntax" -> evalSyntaxTemplate(elems, env, pos, k);
+            case "with-syntax" -> evalWithSyntax(elems, env, pos, k);
             case "guard" -> evalGuard(elems, env, pos, k);
             case "define-record-type" -> evalDefineRecordType(elems, env, pos, k);
             default -> null; // not a special form
@@ -1799,30 +1830,34 @@ public class Evaluator {
             return new Bounce.Err(new EvalError("define-syntax: expected symbol"));
         SchemeValue transformer = elems.get(2);
         if (!(transformer instanceof SchemeValue.ListVal tList) || tList.elements().isEmpty())
-            return new Bounce.Err(new EvalError("define-syntax: expected syntax-rules"));
+            return new Bounce.Err(new EvalError("define-syntax: expected transformer expression"));
         List<SchemeValue> tElems = tList.elements();
-        if (!(tElems.getFirst() instanceof SchemeValue.SymbolVal sr) || !sr.name().equals("syntax-rules"))
-            return new Bounce.Err(new EvalError("define-syntax: expected syntax-rules"));
-        if (tElems.size() < 2)
-            return new Bounce.Err(new EvalError("syntax-rules requires literals list"));
-        // Parse literals list
-        if (!(tElems.get(1) instanceof SchemeValue.ListVal litList))
-            return new Bounce.Err(new EvalError("syntax-rules: expected literals list"));
-        List<String> literals = new ArrayList<>();
-        for (SchemeValue lit : litList.elements()) {
-            if (lit instanceof SchemeValue.SymbolVal s) literals.add(s.name());
+        if (tElems.getFirst() instanceof SchemeValue.SymbolVal sr && sr.name().equals("syntax-rules")) {
+            // syntax-rules path
+            if (tElems.size() < 2)
+                return new Bounce.Err(new EvalError("syntax-rules requires literals list"));
+            if (!(tElems.get(1) instanceof SchemeValue.ListVal litList))
+                return new Bounce.Err(new EvalError("syntax-rules: expected literals list"));
+            List<String> literals = new ArrayList<>();
+            for (SchemeValue lit : litList.elements()) {
+                if (lit instanceof SchemeValue.SymbolVal s) literals.add(s.name());
+            }
+            List<SchemeValue> patterns = new ArrayList<>();
+            List<SchemeValue> templates = new ArrayList<>();
+            for (int i = 2; i < tElems.size(); i++) {
+                if (!(tElems.get(i) instanceof SchemeValue.ListVal clause) || clause.elements().size() != 2)
+                    return new Bounce.Err(new EvalError("syntax-rules: invalid clause"));
+                patterns.add(clause.elements().get(0));
+                templates.add(clause.elements().get(1));
+            }
+            env.define(nameSym.name(), new SchemeValue.SyntaxRulesVal(literals, patterns, templates, env));
+            return k.apply(new SchemeValue.VoidVal());
         }
-        // Parse pattern-template pairs
-        List<SchemeValue> patterns = new ArrayList<>();
-        List<SchemeValue> templates = new ArrayList<>();
-        for (int i = 2; i < tElems.size(); i++) {
-            if (!(tElems.get(i) instanceof SchemeValue.ListVal clause) || clause.elements().size() != 2)
-                return new Bounce.Err(new EvalError("syntax-rules: invalid clause"));
-            patterns.add(clause.elements().get(0));
-            templates.add(clause.elements().get(1));
-        }
-        env.define(nameSym.name(), new SchemeValue.SyntaxRulesVal(literals, patterns, templates, env));
-        return k.apply(new SchemeValue.VoidVal());
+        // lambda transformer path (syntax-case macros)
+        return new Bounce.More(() -> eval(transformer, env, transformerVal -> {
+            env.define(nameSym.name(), new SchemeValue.MacroTransformerVal(transformerVal, env));
+            return k.apply(new SchemeValue.VoidVal());
+        }));
     }
 
     private SchemeValue expandMacro(SchemeValue.SyntaxRulesVal macro, List<SchemeValue> inputElems,
@@ -1947,10 +1982,210 @@ public class Evaluator {
                 result.add(name);
             }
         } else if (template instanceof SchemeValue.ListVal list) {
+            // Skip quoted forms — quoted symbols should not be renamed
+            if (!list.elements().isEmpty() && list.elements().getFirst() instanceof SchemeValue.SymbolVal s
+                    && s.name().equals("quote")) {
+                return;
+            }
             for (SchemeValue elem : list.elements()) {
                 collectFreeSymbols(elem, patternVars, result);
             }
         }
+    }
+
+    // ── syntax-case macro system (L22) ─────────────────────────────
+
+    // (syntax-case expr (literals) clause ...)
+    // clause = (pattern body) or (pattern fender body)
+    private Bounce evalSyntaxCase(List<SchemeValue> elems, Environment env, String pos, SchemeValue.Cont k) {
+        if (elems.size() < 4)
+            return new Bounce.Err(new EvalError("syntax-case requires at least 3 arguments at " + pos));
+        SchemeValue exprForm = elems.get(1);
+        // Parse literals
+        if (!(elems.get(2) instanceof SchemeValue.ListVal litList))
+            return new Bounce.Err(new EvalError("syntax-case: expected literals list at " + pos));
+        List<String> literals = new ArrayList<>();
+        for (SchemeValue lit : litList.elements()) {
+            if (lit instanceof SchemeValue.SymbolVal s) literals.add(s.name());
+        }
+        // Evaluate the expression
+        return new Bounce.More(() -> eval(exprForm, env, inputVal -> {
+            // Convert input to a list for pattern matching
+            List<SchemeValue> inputElems = schemeValueToList(inputVal);
+            // Try each clause
+            for (int i = 3; i < elems.size(); i++) {
+                if (!(elems.get(i) instanceof SchemeValue.ListVal clause))
+                    return new Bounce.Err(new EvalError("syntax-case: invalid clause"));
+                List<SchemeValue> clauseElems = clause.elements();
+                if (clauseElems.size() < 2 || clauseElems.size() > 3)
+                    return new Bounce.Err(new EvalError("syntax-case: clause needs 2 or 3 parts"));
+
+                SchemeValue pattern = clauseElems.get(0);
+                SchemeValue body = clauseElems.size() == 3 ? clauseElems.get(2) : clauseElems.get(1);
+
+                Map<String, SchemeValue> singles = new HashMap<>();
+                Map<String, List<SchemeValue>> lists = new HashMap<>();
+
+                boolean matched;
+                if (pattern instanceof SchemeValue.ListVal patList) {
+                    matched = matchPattern(patList.elements(), inputElems, 0, 0, literals, singles, lists);
+                } else if (pattern instanceof SchemeValue.SymbolVal sym) {
+                    // Whole-form match
+                    singles.put(sym.name(), inputVal);
+                    matched = true;
+                } else {
+                    matched = false;
+                }
+
+                if (matched) {
+                    // Push syntax bindings
+                    SyntaxEnv senv = new SyntaxEnv(new HashMap<>(singles), new HashMap<>(lists), env);
+                    syntaxEnvStack.add(senv);
+                    // If there's a fender, evaluate it
+                    if (clauseElems.size() == 3) {
+                        SchemeValue fender = clauseElems.get(1);
+                        final SchemeValue bodyFinal = body;
+                        return new Bounce.More(() -> eval(fender, env, fenderVal -> {
+                            if (fenderVal.isTruthy()) {
+                                return new Bounce.More(() -> eval(bodyFinal, env, result -> {
+                                    syntaxEnvStack.removeLast();
+                                    return k.apply(result);
+                                }));
+                            }
+                            syntaxEnvStack.removeLast();
+                            return new Bounce.Err(new EvalError("syntax-case: fender failed, no more clauses"));
+                        }));
+                    }
+                    return new Bounce.More(() -> eval(body, env, result -> {
+                        syntaxEnvStack.removeLast();
+                        return k.apply(result);
+                    }));
+                }
+            }
+            return new Bounce.Err(new EvalError("syntax-case: no matching pattern at " + pos));
+        }));
+    }
+
+    // Convert a SchemeValue to a flat list for pattern matching
+    private List<SchemeValue> schemeValueToList(SchemeValue val) {
+        if (val instanceof SchemeValue.ListVal list) return list.elements();
+        if (val instanceof SchemeValue.PairVal pair) {
+            List<SchemeValue> result = new ArrayList<>();
+            SchemeValue cur = val;
+            while (cur instanceof SchemeValue.PairVal p) {
+                result.add(p.car());
+                cur = p.cdr();
+            }
+            if (!(cur instanceof SchemeValue.NilVal)) result.add(cur);
+            return result;
+        }
+        return List.of(val);
+    }
+
+    // (syntax template) — expand template using current syntax-case bindings
+    private Bounce evalSyntaxTemplate(List<SchemeValue> elems, Environment env, String pos, SchemeValue.Cont k) {
+        if (elems.size() != 2)
+            return new Bounce.Err(new EvalError("syntax requires 1 argument at " + pos));
+        SchemeValue template = elems.get(1);
+
+        if (syntaxEnvStack.isEmpty()) {
+            // No syntax-case context, just return the template as-is
+            return k.apply(template);
+        }
+
+        // Merge all syntax env bindings (bottom to top)
+        Map<String, SchemeValue> allSingles = new HashMap<>();
+        Map<String, List<SchemeValue>> allLists = new HashMap<>();
+        Environment defEnv = env;
+        for (SyntaxEnv senv : syntaxEnvStack) {
+            allSingles.putAll(senv.singles());
+            allLists.putAll(senv.lists());
+            defEnv = senv.defEnv();
+        }
+
+        // If template is just a symbol that's a pattern variable, return its value
+        if (template instanceof SchemeValue.SymbolVal sym) {
+            if (allSingles.containsKey(sym.name())) return k.apply(allSingles.get(sym.name()));
+            if (allLists.containsKey(sym.name())) {
+                List<SchemeValue> items = allLists.get(sym.name());
+                return k.apply(listToScheme(items));
+            }
+        }
+
+        // Expand template with hygiene
+        Set<String> patVars = new HashSet<>(allSingles.keySet());
+        patVars.addAll(allLists.keySet());
+
+        Set<String> freeSyms = new HashSet<>();
+        collectFreeSymbols(template, patVars, freeSyms);
+
+        Map<String, String> renames = new HashMap<>();
+        for (String sym : freeSyms) {
+            renames.put(sym, gensym(sym));
+        }
+
+        SchemeValue expanded = expandTemplate(template, allSingles, allLists, renames);
+
+        // Store renamed symbol bindings for the use-site env
+        for (var entry : renames.entrySet()) {
+            try {
+                SchemeValue val = defEnv.get(entry.getKey());
+                pendingHygieneBindings.put(entry.getValue(), val);
+            } catch (EvalError ignored) {
+                // Introduced binding — skip
+            }
+        }
+
+        return k.apply(expanded);
+    }
+
+    private SchemeValue listToScheme(List<SchemeValue> items) {
+        SchemeValue result = SchemeValue.NIL;
+        for (int i = items.size() - 1; i >= 0; i--) {
+            result = new SchemeValue.PairVal(items.get(i), result);
+        }
+        return result;
+    }
+
+    // (with-syntax ((pat expr) ...) body ...)
+    private Bounce evalWithSyntax(List<SchemeValue> elems, Environment env, String pos, SchemeValue.Cont k) {
+        if (elems.size() < 3)
+            return new Bounce.Err(new EvalError("with-syntax requires bindings and body at " + pos));
+        if (!(elems.get(1) instanceof SchemeValue.ListVal bindingsList))
+            return new Bounce.Err(new EvalError("with-syntax: expected bindings list at " + pos));
+
+        List<SchemeValue> bindings = bindingsList.elements();
+        // Evaluate bindings, then push merged syntax env, evaluate body, pop
+        return evalWithSyntaxBindings(bindings, 0, new HashMap<>(), new HashMap<>(), elems, env, pos, k);
+    }
+
+    private Bounce evalWithSyntaxBindings(List<SchemeValue> bindings, int idx,
+            Map<String, SchemeValue> singles, Map<String, List<SchemeValue>> lists,
+            List<SchemeValue> elems, Environment env, String pos, SchemeValue.Cont k) {
+        if (idx >= bindings.size()) {
+            // All bindings processed, push and evaluate body
+            SyntaxEnv senv = new SyntaxEnv(singles, lists, env);
+            syntaxEnvStack.add(senv);
+            return evalSequence(elems, 2, env, result -> {
+                syntaxEnvStack.removeLast();
+                return k.apply(result);
+            });
+        }
+        if (!(bindings.get(idx) instanceof SchemeValue.ListVal binding) || binding.elements().size() != 2)
+            return new Bounce.Err(new EvalError("with-syntax: invalid binding at " + pos));
+
+        SchemeValue pattern = binding.elements().get(0);
+        SchemeValue expr = binding.elements().get(1);
+
+        return new Bounce.More(() -> eval(expr, env, val -> {
+            if (pattern instanceof SchemeValue.SymbolVal sym) {
+                singles.put(sym.name(), val);
+            } else if (pattern instanceof SchemeValue.ListVal patList) {
+                List<SchemeValue> valElems = schemeValueToList(val);
+                matchPattern(patList.elements(), valElems, 0, 0, List.of(), singles, lists);
+            }
+            return evalWithSyntaxBindings(bindings, idx + 1, singles, lists, elems, env, pos, k);
+        }));
     }
 
     private boolean eqv(SchemeValue a, SchemeValue b) {

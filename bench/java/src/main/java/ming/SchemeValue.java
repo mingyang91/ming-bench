@@ -87,6 +87,8 @@ public sealed interface SchemeValue {
     record SyntaxRulesVal(List<String> literals, List<SchemeValue> patterns,
                            List<SchemeValue> templates, Environment defEnv) implements SchemeValue {}
 
+    record MacroTransformerVal(SchemeValue transformer, Environment defEnv) implements SchemeValue {}
+
     record ValuesVal(List<SchemeValue> values) implements SchemeValue {}
 
     /** Unique identity token for a record type (compared by reference). */
@@ -149,6 +151,7 @@ public sealed interface SchemeValue {
             case CpsBuiltinVal v -> "#<procedure:" + v.name() + ">";
             case ContinuationVal v -> "#<procedure>";
             case SyntaxRulesVal v -> "#<syntax>";
+            case MacroTransformerVal v -> "#<syntax>";
             case ValuesVal v -> "#<values>";
             case RecordVal v -> "#<record:" + v.tag.name + ">";
         };
