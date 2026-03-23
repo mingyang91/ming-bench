@@ -93,6 +93,21 @@ fn env_set(env: &Env, name: String, val: Value) {
     env.borrow_mut().bindings.insert(name, val);
 }
 
+fn env_set_existing(env: &Env, name: &str, val: Value) -> bool {
+    let has_key = env.borrow().bindings.contains_key(name);
+    if has_key {
+        env.borrow_mut().bindings.insert(name.to_string(), val);
+        true
+    } else {
+        let parent = env.borrow().parent.clone();
+        if let Some(ref p) = parent {
+            env_set_existing(p, name, val)
+        } else {
+            false
+        }
+    }
+}
+
 // --- Parser ---
 
 fn skip_whitespace(input: &[u8], pos: usize) -> usize {
@@ -475,6 +490,28 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                                     .at(el, ec))
                                 }
                             }
+                        }
+                        "set!" => {
+                            if items.len() != 3 {
+                                return Err(EvalError::Arity(
+                                    "set! requires exactly 2 arguments".into(),
+                                )
+                                .at(el, ec));
+                            }
+                            let name = match &items[1].kind {
+                                ExprKind::Symbol(s) => s.clone(),
+                                _ => {
+                                    return Err(EvalError::Type(
+                                        "set!: expected symbol".into(),
+                                    )
+                                    .at(el, ec))
+                                }
+                            };
+                            let val = eval(&items[2], &current_env)?;
+                            if !env_set_existing(&current_env, &name, val) {
+                                return Err(EvalError::UnboundVariable(name).at(el, ec));
+                            }
+                            return Ok(Value::Void);
                         }
                         "lambda" => {
                             if items.len() < 3 {
