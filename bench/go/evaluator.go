@@ -109,11 +109,7 @@ type contJumpError struct {
 
 func (e *contJumpError) Error() string { return "continuation jump" }
 
-// Internal context types stored in environment.
-type topIdxVal struct{ idx int }
-
-func (v *topIdxVal) String() string { return "" }
-
+// Internal context type stored in environment for let-skip.
 type letCtxVal struct {
 	letExpr *ListExpr
 	env     *Env
@@ -132,6 +128,12 @@ var activeContResume *contResumeInfo
 var activeLetSkip *letSkipInfo
 var contIDCounter int64
 
+// activeCallCCIDs tracks call/cc invocations currently on the call stack.
+var activeCallCCIDs = make(map[int64]bool)
+
+// currentTopExprIdx tracks which top-level expression is being evaluated.
+var currentTopExprIdx int
+
 // evalAllExprs evaluates a sequence of expressions with continuation jump support.
 func evalAllExprs(exprs []Expr, env *Env) (SchemeValue, error) {
 	activeContResume = nil
@@ -139,7 +141,7 @@ func evalAllExprs(exprs []Expr, env *Env) (SchemeValue, error) {
 
 	var result SchemeValue
 	for i := 0; i < len(exprs); i++ {
-		env.Set("$$top-idx$$", &topIdxVal{idx: i})
+		currentTopExprIdx = i
 		var err error
 		result, err = Eval(exprs[i], env)
 		if err != nil {
@@ -301,6 +303,9 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 					for _, b := range body[:len(body)-1] {
 						_, err := Eval(b, env)
 						if err != nil {
+							if jump, ok := err.(*contJumpError); ok && !activeCallCCIDs[jump.cont.id] {
+								continue
+							}
 							return nil, err
 						}
 					}
@@ -371,6 +376,10 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 				for _, bodyExpr := range fn.Body[:len(fn.Body)-1] {
 					_, err := Eval(bodyExpr, localEnv)
 					if err != nil {
+						// Catch stale continuation jumps at lambda boundary
+						if jump, ok := err.(*contJumpError); ok && !activeCallCCIDs[jump.cont.id] {
+							return jump.value, nil
+						}
 						return nil, err
 					}
 				}
@@ -508,11 +517,7 @@ func evalCallCC(args []SchemeValue, callExpr *ListExpr, env *Env) (SchemeValue, 
 		return val, nil
 	}
 
-	// Get context for the continuation
-	topExprIdx := 0
-	if v, ok := env.Get("$$top-idx$$"); ok {
-		topExprIdx = v.(*topIdxVal).idx
-	}
+	// Get let context for continuation
 	var letInfo *letSkipInfo
 	if v, ok := env.Get("$$let-ctx$$"); ok {
 		ctx := v.(*letCtxVal)
@@ -523,9 +528,13 @@ func evalCallCC(args []SchemeValue, callExpr *ListExpr, env *Env) (SchemeValue, 
 	cont := &SchemeContinuation{
 		id:         contID,
 		callccExpr: callExpr,
-		topExprIdx: topExprIdx,
+		topExprIdx: currentTopExprIdx,
 		letInfo:    letInfo,
 	}
+
+	// Track this call/cc as active (for escape detection)
+	activeCallCCIDs[contID] = true
+	defer delete(activeCallCCIDs, contID)
 
 	// Call the procedure with the continuation
 	result, err := applyFunc(proc, []SchemeValue{cont}, callExpr, env)
@@ -554,6 +563,10 @@ func applyFunc(proc SchemeValue, args []SchemeValue, callExpr *ListExpr, env *En
 		for _, bodyExpr := range fn.Body {
 			result, err = Eval(bodyExpr, localEnv)
 			if err != nil {
+				// Catch stale continuation jumps at lambda boundary
+				if jump, ok := err.(*contJumpError); ok && !activeCallCCIDs[jump.cont.id] {
+					return jump.value, nil
+				}
 				return nil, err
 			}
 		}
@@ -674,6 +687,9 @@ func setupLet(e *ListExpr, env *Env) (Expr, *Env, error) {
 		for _, b := range body[:len(body)-1] {
 			_, err := Eval(b, capturedEnv)
 			if err != nil {
+				if jump, ok := err.(*contJumpError); ok && !activeCallCCIDs[jump.cont.id] {
+					continue
+				}
 				return nil, nil, err
 			}
 		}
@@ -730,6 +746,9 @@ func setupLet(e *ListExpr, env *Env) (Expr, *Env, error) {
 		for _, bodyExpr := range body[:len(body)-1] {
 			_, err := Eval(bodyExpr, localEnv)
 			if err != nil {
+				if jump, ok := err.(*contJumpError); ok && !activeCallCCIDs[jump.cont.id] {
+					continue
+				}
 				return nil, nil, err
 			}
 		}
@@ -765,6 +784,9 @@ func setupLet(e *ListExpr, env *Env) (Expr, *Env, error) {
 	for _, bodyExpr := range body[:len(body)-1] {
 		_, err := Eval(bodyExpr, localEnv)
 		if err != nil {
+			if jump, ok := err.(*contJumpError); ok && !activeCallCCIDs[jump.cont.id] {
+				continue
+			}
 			return nil, nil, err
 		}
 	}
