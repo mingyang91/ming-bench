@@ -237,6 +237,8 @@ public class Evaluator {
             case SchemeValue.PairVal v -> v;
             case SchemeValue.VectorVal v -> v;
             case SchemeValue.ValuesVal v -> v;
+            case SchemeValue.RationalVal v -> v;
+            case SchemeValue.DoubleVal v -> v;
             case SchemeValue.Thunk v -> v; // pass through
             case SchemeValue.SymbolVal v -> {
                 try {
@@ -467,7 +469,7 @@ public class Evaluator {
             case "length" -> builtinLength(args, env, pos);
             case "append" -> builtinAppend(args, env, pos);
             case "string?" -> typePred(args, env, SchemeValue.StringVal.class, pos);
-            case "number?" -> typePred(args, env, SchemeValue.IntVal.class, pos);
+            case "number?" -> builtinNumberQ(args, env, pos);
             case "boolean?" -> typePred(args, env, SchemeValue.BoolVal.class, pos);
             case "pair?" -> builtinPairQ(args, env, pos);
             case "symbol?" -> typePred(args, env, SchemeValue.SymbolVal.class, pos);
@@ -550,47 +552,125 @@ public class Evaluator {
                 if (vals.size() == 1) yield vals.getFirst();
                 yield new SchemeValue.ValuesVal(vals);
             }
+            // L19 builtins
+            case "exact?" -> builtinExactQ(args, env, pos);
+            case "inexact?" -> builtinInexactQ(args, env, pos);
+            case "rational?" -> builtinRationalQ(args, env, pos);
+            case "integer?" -> builtinIntegerQ(args, env, pos);
+            case "exact->inexact" -> builtinExactToInexact(args, env, pos);
+            case "inexact->exact" -> builtinInexactToExact(args, env, pos);
+            case "numerator" -> builtinNumerator(args, env, pos);
+            case "denominator" -> builtinDenominator(args, env, pos);
             default -> null;
         };
     }
 
+    @FunctionalInterface
+    private interface DoublePred {
+        boolean test(double a, double b);
+    }
+
     private SchemeValue arith(List<SchemeValue> args, long identity, LongBinOp op, Environment env, SourcePos pos) throws EvalError {
-        long result = identity;
-        for (SchemeValue arg : args) {
-            result = op.apply(result, requireInt(eval(arg, env), pos));
+        // Evaluate all args first
+        List<SchemeValue> evaled = new ArrayList<>();
+        for (SchemeValue arg : args) evaled.add(eval(arg, env));
+        // Check if any is non-int numeric
+        boolean hasNonInt = false;
+        for (SchemeValue v : evaled) {
+            if (v instanceof SchemeValue.RationalVal || v instanceof SchemeValue.DoubleVal) { hasNonInt = true; break; }
         }
-        return new SchemeValue.IntVal(result, SourcePos.NONE);
+        if (!hasNonInt) {
+            long result = identity;
+            for (SchemeValue v : evaled) result = op.apply(result, requireInt(v, pos));
+            return new SchemeValue.IntVal(result, SourcePos.NONE);
+        }
+        // Mixed numeric: use generic numeric ops
+        SchemeValue result = new SchemeValue.IntVal(identity, SourcePos.NONE);
+        for (SchemeValue v : evaled) {
+            requireNumeric(v, pos);
+            if (identity == 0) result = numAdd(result, v);
+            else result = numMul(result, v);
+        }
+        return result;
     }
 
     private SchemeValue minus(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.isEmpty()) throw posError(pos, "-: need at least one argument");
-        if (args.size() == 1) {
-            return new SchemeValue.IntVal(-requireInt(eval(args.getFirst(), env), pos), SourcePos.NONE);
+        List<SchemeValue> evaled = new ArrayList<>();
+        for (SchemeValue arg : args) evaled.add(eval(arg, env));
+        boolean hasNonInt = false;
+        for (SchemeValue v : evaled) {
+            if (v instanceof SchemeValue.RationalVal || v instanceof SchemeValue.DoubleVal) { hasNonInt = true; break; }
         }
-        long result = requireInt(eval(args.getFirst(), env), pos);
-        for (int i = 1; i < args.size(); i++) {
-            result -= requireInt(eval(args.get(i), env), pos);
+        if (!hasNonInt) {
+            if (evaled.size() == 1) return new SchemeValue.IntVal(-requireInt(evaled.getFirst(), pos), SourcePos.NONE);
+            long result = requireInt(evaled.getFirst(), pos);
+            for (int i = 1; i < evaled.size(); i++) result -= requireInt(evaled.get(i), pos);
+            return new SchemeValue.IntVal(result, SourcePos.NONE);
         }
-        return new SchemeValue.IntVal(result, SourcePos.NONE);
+        SchemeValue first = evaled.getFirst();
+        requireNumeric(first, pos);
+        if (evaled.size() == 1) return numNeg(first);
+        SchemeValue result = first;
+        for (int i = 1; i < evaled.size(); i++) {
+            requireNumeric(evaled.get(i), pos);
+            result = numSub(result, evaled.get(i));
+        }
+        return result;
     }
 
     private SchemeValue divide(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.isEmpty()) throw posError(pos, "/: need at least one argument");
-        long result = requireInt(eval(args.getFirst(), env), pos);
-        for (int i = 1; i < args.size(); i++) {
-            long divisor = requireInt(eval(args.get(i), env), pos);
-            if (divisor == 0) throw posError(pos, "division by zero");
-            result /= divisor;
+        List<SchemeValue> evaled = new ArrayList<>();
+        for (SchemeValue arg : args) evaled.add(eval(arg, env));
+        SchemeValue result = evaled.getFirst();
+        requireNumeric(result, pos);
+        if (evaled.size() == 1) return numDiv(new SchemeValue.IntVal(1, SourcePos.NONE), result, pos);
+        for (int i = 1; i < evaled.size(); i++) {
+            requireNumeric(evaled.get(i), pos);
+            result = numDiv(result, evaled.get(i), pos);
         }
-        return new SchemeValue.IntVal(result, SourcePos.NONE);
+        return result;
     }
 
     private SchemeValue compare(List<SchemeValue> args, LongPred pred, Environment env, SourcePos pos) throws EvalError {
         if (args.size() < 2) throw posError(pos, "comparison needs at least 2 arguments");
-        long prev = requireInt(eval(args.getFirst(), env), pos);
-        for (int i = 1; i < args.size(); i++) {
-            long curr = requireInt(eval(args.get(i), env), pos);
-            if (!pred.test(prev, curr)) return new SchemeValue.BoolVal(false, SourcePos.NONE);
+        List<SchemeValue> evaled = new ArrayList<>();
+        for (SchemeValue arg : args) evaled.add(eval(arg, env));
+        return compareNumeric(evaled, pred, pos);
+    }
+
+    private SchemeValue compareNumeric(List<SchemeValue> evaled, LongPred pred, SourcePos pos) throws EvalError {
+        // For exact rationals, compare via cross-multiplication; for mixed, use double
+        boolean hasInexact = false;
+        for (SchemeValue v : evaled) {
+            requireNumeric(v, pos);
+            if (v instanceof SchemeValue.DoubleVal) hasInexact = true;
+        }
+        if (hasInexact) {
+            // Compare as doubles, but we need a DoublePred equivalent
+            // Map LongPred: the caller passes (a,b)->a<b etc for longs
+            // We convert to int comparison code: -1,0,1
+            double prev = toDouble(evaled.getFirst());
+            for (int i = 1; i < evaled.size(); i++) {
+                double curr = toDouble(evaled.get(i));
+                int cmp = Double.compare(prev, curr);
+                long cmpL = cmp < 0 ? -1 : cmp > 0 ? 1 : 0;
+                // pred expects: for "<", pred.test(a,b) = a < b
+                // We use: pred.test(cmpL, 0) which gives us cmp < 0 for "<", etc.
+                if (!pred.test(cmpL, 0)) return new SchemeValue.BoolVal(false, SourcePos.NONE);
+                prev = curr;
+            }
+            return new SchemeValue.BoolVal(true, SourcePos.NONE);
+        }
+        // All exact: compare via cross-multiplication for rationals
+        long[] prev = toRational(evaled.getFirst());
+        for (int i = 1; i < evaled.size(); i++) {
+            long[] curr = toRational(evaled.get(i));
+            // a/b vs c/d: compare a*d vs c*b
+            long lhs = prev[0] * curr[1];
+            long rhs = curr[0] * prev[1];
+            if (!pred.test(lhs, rhs)) return new SchemeValue.BoolVal(false, SourcePos.NONE);
             prev = curr;
         }
         return new SchemeValue.BoolVal(true, SourcePos.NONE);
@@ -1194,37 +1274,36 @@ public class Evaluator {
     private SchemeValue applyBuiltinEvaled(String name, List<SchemeValue> args, SourcePos pos) throws EvalError {
         return switch (name) {
             case "+" -> {
-                long result = 0;
-                for (SchemeValue a : args) result += requireInt(a, pos);
-                yield new SchemeValue.IntVal(result, SourcePos.NONE);
+                SchemeValue result = new SchemeValue.IntVal(0, SourcePos.NONE);
+                for (SchemeValue a : args) { requireNumeric(a, pos); result = numAdd(result, a); }
+                yield result;
             }
             case "-" -> {
                 if (args.isEmpty()) throw posError(pos, "-: need at least one argument");
-                if (args.size() == 1) yield new SchemeValue.IntVal(-requireInt(args.getFirst(), pos), SourcePos.NONE);
-                long r = requireInt(args.getFirst(), pos);
-                for (int i = 1; i < args.size(); i++) r -= requireInt(args.get(i), pos);
-                yield new SchemeValue.IntVal(r, SourcePos.NONE);
+                SchemeValue first = args.getFirst(); requireNumeric(first, pos);
+                if (args.size() == 1) yield numNeg(first);
+                SchemeValue r = first;
+                for (int i = 1; i < args.size(); i++) { requireNumeric(args.get(i), pos); r = numSub(r, args.get(i)); }
+                yield r;
             }
             case "*" -> {
-                long result = 1;
-                for (SchemeValue a : args) result *= requireInt(a, pos);
-                yield new SchemeValue.IntVal(result, SourcePos.NONE);
+                SchemeValue result = new SchemeValue.IntVal(1, SourcePos.NONE);
+                for (SchemeValue a : args) { requireNumeric(a, pos); result = numMul(result, a); }
+                yield result;
             }
             case "/" -> {
                 if (args.isEmpty()) throw posError(pos, "/: need at least one argument");
-                long r = requireInt(args.getFirst(), pos);
-                for (int i = 1; i < args.size(); i++) {
-                    long d = requireInt(args.get(i), pos);
-                    if (d == 0) throw posError(pos, "division by zero");
-                    r /= d;
-                }
-                yield new SchemeValue.IntVal(r, SourcePos.NONE);
+                SchemeValue first = args.getFirst(); requireNumeric(first, pos);
+                SchemeValue r = first;
+                if (args.size() == 1) yield numDiv(new SchemeValue.IntVal(1, SourcePos.NONE), r, pos);
+                for (int i = 1; i < args.size(); i++) { requireNumeric(args.get(i), pos); r = numDiv(r, args.get(i), pos); }
+                yield r;
             }
-            case "<" -> compareEvaled(args, (a, b) -> a < b, pos);
-            case ">" -> compareEvaled(args, (a, b) -> a > b, pos);
-            case "=" -> compareEvaled(args, (a, b) -> a == b, pos);
-            case "<=" -> compareEvaled(args, (a, b) -> a <= b, pos);
-            case ">=" -> compareEvaled(args, (a, b) -> a >= b, pos);
+            case "<" -> compareNumeric(args, (a, b) -> a < b, pos);
+            case ">" -> compareNumeric(args, (a, b) -> a > b, pos);
+            case "=" -> compareNumeric(args, (a, b) -> a == b, pos);
+            case "<=" -> compareNumeric(args, (a, b) -> a <= b, pos);
+            case ">=" -> compareNumeric(args, (a, b) -> a >= b, pos);
             case "not" -> {
                 if (args.size() != 1) throw posError(pos, "not: need exactly one argument");
                 yield new SchemeValue.BoolVal(!args.getFirst().isTruthy(), SourcePos.NONE);
@@ -1350,7 +1429,10 @@ public class Evaluator {
                 yield new SchemeValue.StringVal(s.value(), true, SourcePos.NONE);
             }
             case "string?" -> typePredEvaled(args, SchemeValue.StringVal.class, pos);
-            case "number?" -> typePredEvaled(args, SchemeValue.IntVal.class, pos);
+            case "number?" -> {
+                if (args.size() != 1) throw posError(pos, "number?: need exactly 1 argument");
+                yield new SchemeValue.BoolVal(isNumeric(args.getFirst()), SourcePos.NONE);
+            }
             case "boolean?" -> typePredEvaled(args, SchemeValue.BoolVal.class, pos);
             case "pair?" -> {
                 if (args.size() != 1) throw posError(pos, "pair?: need exactly 1 argument");
@@ -1691,19 +1773,54 @@ public class Evaluator {
                 }
                 yield evalContinuation(applyTail(consumer, vals, pos));
             }
+            // L19 builtins
+            case "exact?" -> {
+                if (args.size() != 1) throw posError(pos, "exact?: need exactly 1 argument");
+                yield new SchemeValue.BoolVal(isExact(args.getFirst()), SourcePos.NONE);
+            }
+            case "inexact?" -> {
+                if (args.size() != 1) throw posError(pos, "inexact?: need exactly 1 argument");
+                yield new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.DoubleVal, SourcePos.NONE);
+            }
+            case "rational?" -> {
+                if (args.size() != 1) throw posError(pos, "rational?: need exactly 1 argument");
+                yield new SchemeValue.BoolVal(isExact(args.getFirst()), SourcePos.NONE);
+            }
+            case "integer?" -> {
+                if (args.size() != 1) throw posError(pos, "integer?: need exactly 1 argument");
+                SchemeValue v = args.getFirst();
+                if (v instanceof SchemeValue.IntVal) yield new SchemeValue.BoolVal(true, SourcePos.NONE);
+                if (v instanceof SchemeValue.RationalVal r) yield new SchemeValue.BoolVal(r.den() == 1, SourcePos.NONE);
+                if (v instanceof SchemeValue.DoubleVal d) yield new SchemeValue.BoolVal(d.value() == Math.floor(d.value()) && !Double.isInfinite(d.value()), SourcePos.NONE);
+                yield new SchemeValue.BoolVal(false, SourcePos.NONE);
+            }
+            case "exact->inexact" -> {
+                if (args.size() != 1) throw posError(pos, "exact->inexact: need exactly 1 argument");
+                requireNumeric(args.getFirst(), pos);
+                yield new SchemeValue.DoubleVal(toDouble(args.getFirst()), SourcePos.NONE);
+            }
+            case "inexact->exact" -> {
+                if (args.size() != 1) throw posError(pos, "inexact->exact: need exactly 1 argument");
+                SchemeValue v = args.getFirst(); requireNumeric(v, pos);
+                if (isExact(v)) yield v;
+                yield doubleToExact(toDouble(v));
+            }
+            case "numerator" -> {
+                if (args.size() != 1) throw posError(pos, "numerator: need exactly 1 argument");
+                SchemeValue v = args.getFirst();
+                if (v instanceof SchemeValue.IntVal i) yield new SchemeValue.IntVal(i.value(), SourcePos.NONE);
+                if (v instanceof SchemeValue.RationalVal r) yield new SchemeValue.IntVal(r.num(), SourcePos.NONE);
+                throw posError(pos, "numerator: not a rational number");
+            }
+            case "denominator" -> {
+                if (args.size() != 1) throw posError(pos, "denominator: need exactly 1 argument");
+                SchemeValue v = args.getFirst();
+                if (v instanceof SchemeValue.IntVal) yield new SchemeValue.IntVal(1, SourcePos.NONE);
+                if (v instanceof SchemeValue.RationalVal r) yield new SchemeValue.IntVal(r.den(), SourcePos.NONE);
+                throw posError(pos, "denominator: not a rational number");
+            }
             default -> throw posError(pos, "unknown builtin: " + name);
         };
-    }
-
-    private SchemeValue compareEvaled(List<SchemeValue> args, LongPred pred, SourcePos pos) throws EvalError {
-        if (args.size() < 2) throw posError(pos, "comparison needs at least 2 arguments");
-        long prev = requireInt(args.getFirst(), pos);
-        for (int i = 1; i < args.size(); i++) {
-            long curr = requireInt(args.get(i), pos);
-            if (!pred.test(prev, curr)) return new SchemeValue.BoolVal(false, SourcePos.NONE);
-            prev = curr;
-        }
-        return new SchemeValue.BoolVal(true, SourcePos.NONE);
     }
 
     private SchemeValue typePredEvaled(List<SchemeValue> args, Class<? extends SchemeValue> type, SourcePos pos) throws EvalError {
@@ -1713,13 +1830,188 @@ public class Evaluator {
 
     private long requireInt(SchemeValue v, SourcePos pos) throws EvalError {
         if (v instanceof SchemeValue.IntVal i) return i.value();
+        if (v instanceof SchemeValue.RationalVal r && r.den() == 1) return r.num();
         throw posError(pos, "expected integer, got: " + v.display());
+    }
+
+    private static long gcd(long a, long b) {
+        a = Math.abs(a); b = Math.abs(b);
+        while (b != 0) { long t = b; b = a % b; a = t; }
+        return a;
+    }
+
+    private static SchemeValue makeRational(long num, long den) {
+        if (den < 0) { num = -num; den = -den; }
+        long g = gcd(Math.abs(num), den);
+        num /= g; den /= g;
+        if (den == 1) return new SchemeValue.IntVal(num, SourcePos.NONE);
+        return new SchemeValue.RationalVal(num, den, SourcePos.NONE);
+    }
+
+    private static boolean isNumeric(SchemeValue v) {
+        return v instanceof SchemeValue.IntVal || v instanceof SchemeValue.RationalVal || v instanceof SchemeValue.DoubleVal;
+    }
+
+    private static boolean isExact(SchemeValue v) {
+        return v instanceof SchemeValue.IntVal || v instanceof SchemeValue.RationalVal;
+    }
+
+    private static double toDouble(SchemeValue v) {
+        if (v instanceof SchemeValue.IntVal i) return (double) i.value();
+        if (v instanceof SchemeValue.RationalVal r) return (double) r.num() / r.den();
+        if (v instanceof SchemeValue.DoubleVal d) return d.value();
+        throw new IllegalArgumentException("not a number: " + v.display());
+    }
+
+    // Get numerator/denominator for exact arithmetic
+    private static long[] toRational(SchemeValue v) {
+        if (v instanceof SchemeValue.IntVal i) return new long[]{i.value(), 1};
+        if (v instanceof SchemeValue.RationalVal r) return new long[]{r.num(), r.den()};
+        throw new IllegalArgumentException("not exact: " + v.display());
+    }
+
+    private static SchemeValue numAdd(SchemeValue a, SchemeValue b) {
+        if (isExact(a) && isExact(b)) {
+            long[] ar = toRational(a), br = toRational(b);
+            return makeRational(ar[0] * br[1] + br[0] * ar[1], ar[1] * br[1]);
+        }
+        return new SchemeValue.DoubleVal(toDouble(a) + toDouble(b), SourcePos.NONE);
+    }
+
+    private static SchemeValue numSub(SchemeValue a, SchemeValue b) {
+        if (isExact(a) && isExact(b)) {
+            long[] ar = toRational(a), br = toRational(b);
+            return makeRational(ar[0] * br[1] - br[0] * ar[1], ar[1] * br[1]);
+        }
+        return new SchemeValue.DoubleVal(toDouble(a) - toDouble(b), SourcePos.NONE);
+    }
+
+    private static SchemeValue numMul(SchemeValue a, SchemeValue b) {
+        if (isExact(a) && isExact(b)) {
+            long[] ar = toRational(a), br = toRational(b);
+            return makeRational(ar[0] * br[0], ar[1] * br[1]);
+        }
+        return new SchemeValue.DoubleVal(toDouble(a) * toDouble(b), SourcePos.NONE);
+    }
+
+    private static SchemeValue numDiv(SchemeValue a, SchemeValue b, SourcePos pos) throws EvalError {
+        if (isExact(a) && isExact(b)) {
+            long[] ar = toRational(a), br = toRational(b);
+            if (br[0] == 0) throw posError(pos, "division by zero");
+            return makeRational(ar[0] * br[1], ar[1] * br[0]);
+        }
+        double d = toDouble(b);
+        if (d == 0) throw posError(pos, "division by zero");
+        return new SchemeValue.DoubleVal(toDouble(a) / d, SourcePos.NONE);
+    }
+
+    private static SchemeValue numNeg(SchemeValue a) {
+        if (a instanceof SchemeValue.IntVal i) return new SchemeValue.IntVal(-i.value(), SourcePos.NONE);
+        if (a instanceof SchemeValue.RationalVal r) return new SchemeValue.RationalVal(-r.num(), r.den(), SourcePos.NONE);
+        return new SchemeValue.DoubleVal(-toDouble(a), SourcePos.NONE);
+    }
+
+    private void requireNumeric(SchemeValue v, SourcePos pos) throws EvalError {
+        if (!isNumeric(v)) throw posError(pos, "expected number, got: " + v.display());
+    }
+
+    // --- L19 builtins ---
+
+    private SchemeValue builtinNumberQ(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "number?: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        return new SchemeValue.BoolVal(isNumeric(val), SourcePos.NONE);
+    }
+
+    private SchemeValue builtinExactQ(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "exact?: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        return new SchemeValue.BoolVal(isExact(val), SourcePos.NONE);
+    }
+
+    private SchemeValue builtinInexactQ(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "inexact?: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        return new SchemeValue.BoolVal(val instanceof SchemeValue.DoubleVal, SourcePos.NONE);
+    }
+
+    private SchemeValue builtinRationalQ(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "rational?: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        return new SchemeValue.BoolVal(isExact(val), SourcePos.NONE);
+    }
+
+    private SchemeValue builtinIntegerQ(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "integer?: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        if (val instanceof SchemeValue.IntVal) return new SchemeValue.BoolVal(true, SourcePos.NONE);
+        if (val instanceof SchemeValue.RationalVal r) return new SchemeValue.BoolVal(r.den() == 1, SourcePos.NONE);
+        if (val instanceof SchemeValue.DoubleVal d) {
+            double v = d.value();
+            return new SchemeValue.BoolVal(v == Math.floor(v) && !Double.isInfinite(v), SourcePos.NONE);
+        }
+        return new SchemeValue.BoolVal(false, SourcePos.NONE);
+    }
+
+    private SchemeValue builtinExactToInexact(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "exact->inexact: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        requireNumeric(val, pos);
+        return new SchemeValue.DoubleVal(toDouble(val), SourcePos.NONE);
+    }
+
+    private SchemeValue builtinInexactToExact(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "inexact->exact: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        requireNumeric(val, pos);
+        if (isExact(val)) return val;
+        // Convert double to rational via continued fraction / simple approach
+        double d = toDouble(val);
+        // Use the approach: multiply by power of 2 to get integer ratio
+        // For simple cases like 0.5, this works well
+        return doubleToExact(d);
+    }
+
+    private static SchemeValue doubleToExact(double d) {
+        if (d == Math.floor(d) && !Double.isInfinite(d)) {
+            return new SchemeValue.IntVal((long) d, SourcePos.NONE);
+        }
+        // Use the standard algorithm: d = integer + fraction, then represent as ratio
+        // Multiply by increasing powers of 10 until we get an integer, then simplify
+        boolean negative = d < 0;
+        double x = Math.abs(d);
+        // Find denominator as power of 2 (since doubles are binary fractions)
+        long den = 1;
+        double xScaled = x;
+        for (int i = 0; i < 53 && xScaled != Math.floor(xScaled); i++) {
+            xScaled *= 2;
+            den *= 2;
+        }
+        long num = Math.round(xScaled);
+        if (negative) num = -num;
+        return makeRational(num, den);
+    }
+
+    private SchemeValue builtinNumerator(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "numerator: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        if (val instanceof SchemeValue.IntVal i) return new SchemeValue.IntVal(i.value(), SourcePos.NONE);
+        if (val instanceof SchemeValue.RationalVal r) return new SchemeValue.IntVal(r.num(), SourcePos.NONE);
+        throw posError(pos, "numerator: not a rational number");
+    }
+
+    private SchemeValue builtinDenominator(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "denominator: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        if (val instanceof SchemeValue.IntVal) return new SchemeValue.IntVal(1, SourcePos.NONE);
+        if (val instanceof SchemeValue.RationalVal r) return new SchemeValue.IntVal(r.den(), SourcePos.NONE);
+        throw posError(pos, "denominator: not a rational number");
     }
 
     // --- L12 builtins ---
 
     private boolean schemeEqual(SchemeValue a, SchemeValue b) {
-        if (a instanceof SchemeValue.IntVal ai && b instanceof SchemeValue.IntVal bi) return ai.value() == bi.value();
+        if (isNumeric(a) && isNumeric(b)) return toDouble(a) == toDouble(b);
         if (a instanceof SchemeValue.BoolVal ab && b instanceof SchemeValue.BoolVal bb) return ab.value() == bb.value();
         if (a instanceof SchemeValue.StringVal as && b instanceof SchemeValue.StringVal bs) return as.value().equals(bs.value());
         if (a instanceof SchemeValue.SymbolVal as && b instanceof SchemeValue.SymbolVal bs) return as.name().equals(bs.name());
@@ -1744,6 +2036,8 @@ public class Evaluator {
     private boolean schemeEq(SchemeValue a, SchemeValue b) {
         if (a instanceof SchemeValue.SymbolVal as && b instanceof SchemeValue.SymbolVal bs) return as.name().equals(bs.name());
         if (a instanceof SchemeValue.IntVal ai && b instanceof SchemeValue.IntVal bi) return ai.value() == bi.value();
+        if (a instanceof SchemeValue.RationalVal ar && b instanceof SchemeValue.RationalVal br) return ar.num() == br.num() && ar.den() == br.den();
+        if (a instanceof SchemeValue.DoubleVal ad && b instanceof SchemeValue.DoubleVal bd) return ad.value() == bd.value();
         if (a instanceof SchemeValue.BoolVal ab && b instanceof SchemeValue.BoolVal bb) return ab.value() == bb.value();
         if (a instanceof SchemeValue.CharVal ac && b instanceof SchemeValue.CharVal bc) return ac.value() == bc.value();
         return a == b;
@@ -2066,6 +2360,8 @@ public class Evaluator {
 
     private boolean schemeEqv(SchemeValue a, SchemeValue b) {
         if (a instanceof SchemeValue.IntVal ai && b instanceof SchemeValue.IntVal bi) return ai.value() == bi.value();
+        if (a instanceof SchemeValue.RationalVal ar && b instanceof SchemeValue.RationalVal br) return ar.num() == br.num() && ar.den() == br.den();
+        if (a instanceof SchemeValue.DoubleVal ad && b instanceof SchemeValue.DoubleVal bd) return ad.value() == bd.value();
         if (a instanceof SchemeValue.BoolVal ab && b instanceof SchemeValue.BoolVal bb) return ab.value() == bb.value();
         if (a instanceof SchemeValue.SymbolVal as && b instanceof SchemeValue.SymbolVal bs) return as.name().equals(bs.name());
         if (a instanceof SchemeValue.CharVal ac && b instanceof SchemeValue.CharVal bc) return ac.value() == bc.value();

@@ -149,6 +149,22 @@ public class Parser {
             return new SchemeValue.IntVal(Long.parseLong(token), sp);
         } catch (NumberFormatException ignored) {}
 
+        // Try rational literal like 1/3, -2/5
+        int slashIdx = token.indexOf('/');
+        if (slashIdx > 0 && slashIdx < token.length() - 1) {
+            try {
+                long num = Long.parseLong(token.substring(0, slashIdx));
+                long den = Long.parseLong(token.substring(slashIdx + 1));
+                if (den != 0) return makeRational(num, den, sp);
+            } catch (NumberFormatException ignored) {}
+        }
+
+        // Try float
+        try {
+            double d = Double.parseDouble(token);
+            return new SchemeValue.DoubleVal(d, sp);
+        } catch (NumberFormatException ignored) {}
+
         // Otherwise it's a symbol
         return new SchemeValue.SymbolVal(token, sp);
     }
@@ -165,6 +181,19 @@ public class Parser {
                 break;
             }
         }
+    }
+
+    private static SchemeValue makeRational(long num, long den, SourcePos sp) {
+        if (den < 0) { num = -num; den = -den; }
+        long g = gcd(Math.abs(num), den);
+        num /= g; den /= g;
+        if (den == 1) return new SchemeValue.IntVal(num, sp);
+        return new SchemeValue.RationalVal(num, den, sp);
+    }
+
+    private static long gcd(long a, long b) {
+        while (b != 0) { long t = b; b = a % b; a = t; }
+        return a;
     }
 
     private boolean isDelimiter(char c) {

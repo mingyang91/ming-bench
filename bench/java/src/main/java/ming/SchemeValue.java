@@ -21,6 +21,8 @@ public sealed interface SchemeValue {
     record PairVal(SchemeValue car, SchemeValue cdr, SourcePos pos) implements SchemeValue {}
     record VectorVal(SchemeValue[] elements, SourcePos pos) implements SchemeValue {}
     record ValuesVal(List<SchemeValue> values) implements SchemeValue {}
+    record RationalVal(long num, long den, SourcePos pos) implements SchemeValue {}
+    record DoubleVal(double value, SourcePos pos) implements SchemeValue {}
 
     default SourcePos sourcePos() {
         return switch (this) {
@@ -38,6 +40,8 @@ public sealed interface SchemeValue {
             case PairVal v -> v.pos();
             case VectorVal v -> v.pos();
             case ValuesVal v -> SourcePos.NONE;
+            case RationalVal v -> v.pos();
+            case DoubleVal v -> v.pos();
         };
     }
 
@@ -49,6 +53,8 @@ public sealed interface SchemeValue {
     default String display() {
         return switch (this) {
             case IntVal v -> String.valueOf(v.value());
+            case RationalVal v -> v.num() + "/" + v.den();
+            case DoubleVal v -> formatDouble(v.value());
             case BoolVal v -> v.value() ? "#t" : "#f";
             case StringVal v -> "\"" + v.value() + "\"";
             case SymbolVal v -> v.name();
@@ -112,5 +118,13 @@ public sealed interface SchemeValue {
             }
             default -> display();
         };
+    }
+
+    static String formatDouble(double d) {
+        if (d == Math.floor(d) && !Double.isInfinite(d)) {
+            long l = (long) d;
+            return l + ".0";
+        }
+        return Double.toString(d);
     }
 }
