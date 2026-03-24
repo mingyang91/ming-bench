@@ -31,9 +31,10 @@ type Value struct {
 	car    *Value
 	cdr    *Value
 	// lambda fields
-	params []string
-	body   []*astNode
-	closure *env
+	params    []string
+	restParam string // variadic rest parameter (after dot)
+	body      []*astNode
+	closure   *env
 }
 
 func intVal(n int64) *Value   { return &Value{typ: valInt, ival: n} }
@@ -140,6 +141,7 @@ const (
 	tokSymbol
 	tokQuote
 	tokChar
+	tokDot
 	tokEOF
 )
 
@@ -302,6 +304,10 @@ func (l *lexer) readAtom(line, col int) (token, error) {
 	}
 	s := string(buf)
 
+	if s == "." {
+		return token{kind: tokDot, line: line, col: col}, nil
+	}
+
 	// Try parsing as integer
 	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return token{kind: tokNumber, ival: n, line: line, col: col}, nil
@@ -348,6 +354,8 @@ type astNode struct {
 	tok    token
 	// list
 	children []*astNode
+	hasDot   bool // true if list contains a dot (e.g., (a . b) or (x . rest))
+	dotPos   int  // index in children where dot appeared
 	line     int
 	col      int
 }
@@ -372,6 +380,14 @@ func (p *parser) parseExpr() (*astNode, error) {
 			}
 			if pk.kind == tokEOF {
 				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unexpected end of input", t.line, t.col)}
+			}
+			if pk.kind == tokDot {
+				// Consume dot
+				p.next()
+				// Mark this node as having a dot (store dot position)
+				node.hasDot = true
+				node.dotPos = len(node.children)
+				continue
 			}
 			child, err := p.parseExpr()
 			if err != nil {
@@ -540,22 +556,7 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 
 	// Lambda application
 	if op.typ == valLambda {
-		if len(args) != len(op.params) {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected %d, got %d", node.line, node.col, len(op.params), len(args))}
-		}
-		localEnv := newEnv(op.closure)
-		for i, param := range op.params {
-			localEnv.set(param, args[i])
-		}
-		var result *Value
-		for _, bodyExpr := range op.body {
-			var err error
-			result, err = eval(bodyExpr, localEnv, ip)
-			if err != nil {
-				return nil, err
-			}
-		}
-		return result, nil
+		return applyLambda(op, args, node, ip)
 	}
 
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", node.line, node.col)}
@@ -611,20 +612,28 @@ func evalDefine(node *astNode, e *env, ip *interp) (*Value, error) {
 		e.set(target.tok.sval, val)
 		return voidVal(), nil
 	}
-	// (define (f params...) body...)
+	// (define (f params...) body...) or (define (f x . rest) body...)
 	if !target.isAtom && len(target.children) >= 1 {
 		name := target.children[0]
 		if !name.isAtom || name.tok.kind != tokSymbol {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", node.line, node.col)}
 		}
-		params := make([]string, 0, len(target.children)-1)
-		for _, p := range target.children[1:] {
-			if !p.isAtom || p.tok.kind != tokSymbol {
-				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad parameter", node.line, node.col)}
-			}
-			params = append(params, p.tok.sval)
+		// Build a fake param node from the rest of target's children
+		paramNode := &astNode{
+			children: target.children[1:],
+			hasDot:   target.hasDot,
+			dotPos:   target.dotPos - 1, // adjust for name being first child
+			line:     target.line,
+			col:      target.col,
 		}
-		lam := &Value{typ: valLambda, params: params, body: node.children[2:], closure: e}
+		if target.hasDot && target.dotPos <= 0 {
+			paramNode.dotPos = 0
+		}
+		params, restParam, err := parseLambdaParams(paramNode)
+		if err != nil {
+			return nil, err
+		}
+		lam := &Value{typ: valLambda, params: params, restParam: restParam, body: node.children[2:], closure: e}
 		e.set(name.tok.sval, lam)
 		return voidVal(), nil
 	}
@@ -666,22 +675,49 @@ func evalIf(node *astNode, e *env, ip *interp) (*Value, error) {
 	return voidVal(), nil
 }
 
+func parseLambdaParams(paramNode *astNode) (params []string, restParam string, err error) {
+	if paramNode.isAtom {
+		// (lambda args body) — single symbol captures all args
+		if paramNode.tok.kind == tokSymbol {
+			return nil, paramNode.tok.sval, nil
+		}
+		return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad parameter list", paramNode.line, paramNode.col)}
+	}
+	if paramNode.hasDot {
+		// (x y . rest) — dotPos elements before dot, 1 after
+		for _, p := range paramNode.children[:paramNode.dotPos] {
+			if !p.isAtom || p.tok.kind != tokSymbol {
+				return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad parameter", paramNode.line, paramNode.col)}
+			}
+			params = append(params, p.tok.sval)
+		}
+		if paramNode.dotPos >= len(paramNode.children) {
+			return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: lambda: missing rest parameter after dot", paramNode.line, paramNode.col)}
+		}
+		rest := paramNode.children[paramNode.dotPos]
+		if !rest.isAtom || rest.tok.kind != tokSymbol {
+			return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad rest parameter", paramNode.line, paramNode.col)}
+		}
+		return params, rest.tok.sval, nil
+	}
+	for _, p := range paramNode.children {
+		if !p.isAtom || p.tok.kind != tokSymbol {
+			return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad parameter", paramNode.line, paramNode.col)}
+		}
+		params = append(params, p.tok.sval)
+	}
+	return params, "", nil
+}
+
 func evalLambda(node *astNode, e *env) (*Value, error) {
 	if len(node.children) < 3 {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad syntax", node.line, node.col)}
 	}
-	paramNode := node.children[1]
-	if paramNode.isAtom {
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad parameter list", node.line, node.col)}
+	params, restParam, err := parseLambdaParams(node.children[1])
+	if err != nil {
+		return nil, err
 	}
-	params := make([]string, 0, len(paramNode.children))
-	for _, p := range paramNode.children {
-		if !p.isAtom || p.tok.kind != tokSymbol {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad parameter", node.line, node.col)}
-		}
-		params = append(params, p.tok.sval)
-	}
-	return &Value{typ: valLambda, params: params, body: node.children[2:], closure: e}, nil
+	return &Value{typ: valLambda, params: params, restParam: restParam, body: node.children[2:], closure: e}, nil
 }
 
 func evalLet(node *astNode, e *env, ip *interp) (*Value, error) {
@@ -828,6 +864,14 @@ func quoteNode(node *astNode) *Value {
 	if len(node.children) == 0 {
 		return nilVal()
 	}
+	if node.hasDot {
+		// Dotted pair: elements before dotPos are car chain, element at dotPos is final cdr
+		result := quoteNode(node.children[node.dotPos])
+		for i := node.dotPos - 1; i >= 0; i-- {
+			result = &Value{typ: valPair, car: quoteNode(node.children[i]), cdr: result}
+		}
+		return result
+	}
 	result := nilVal()
 	for i := len(node.children) - 1; i >= 0; i-- {
 		result = &Value{typ: valPair, car: quoteNode(node.children[i]), cdr: result}
@@ -842,6 +886,50 @@ func requireInts(args []*Value, name string, node *astNode) error {
 		}
 	}
 	return nil
+}
+
+func applyLambda(op *Value, args []*Value, node *astNode, ip *interp) (*Value, error) {
+	if op.restParam != "" {
+		// Has rest parameter
+		if len(args) < len(op.params) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected at least %d, got %d", node.line, node.col, len(op.params), len(args))}
+		}
+		localEnv := newEnv(op.closure)
+		for i, param := range op.params {
+			localEnv.set(param, args[i])
+		}
+		// Collect remaining args into a list
+		rest := nilVal()
+		for i := len(args) - 1; i >= len(op.params); i-- {
+			rest = &Value{typ: valPair, car: args[i], cdr: rest}
+		}
+		localEnv.set(op.restParam, rest)
+		var result *Value
+		for _, bodyExpr := range op.body {
+			var err error
+			result, err = eval(bodyExpr, localEnv, ip)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	}
+	if len(args) != len(op.params) {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected %d, got %d", node.line, node.col, len(op.params), len(args))}
+	}
+	localEnv := newEnv(op.closure)
+	for i, param := range op.params {
+		localEnv.set(param, args[i])
+	}
+	var result *Value
+	for _, bodyExpr := range op.body {
+		var err error
+		result, err = eval(bodyExpr, localEnv, ip)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
 }
 
 func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value, error) {
@@ -1192,9 +1280,43 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		}
 		return charVal(runes[idx]), nil
 
+	case "apply":
+		return applyApply(args, node, ip)
+
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", node.line, node.col, name)}
 	}
+}
+
+func applyApply(args []*Value, node *astNode, ip *interp) (*Value, error) {
+	if len(args) < 2 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: need at least 2 arguments", node.line, node.col)}
+	}
+	fn := args[0]
+	// Last argument must be a list; prefix args are prepended
+	lastArg := args[len(args)-1]
+	// Collect prefix args
+	var allArgs []*Value
+	for _, a := range args[1 : len(args)-1] {
+		allArgs = append(allArgs, a)
+	}
+	// Unpack the last argument (a list)
+	v := lastArg
+	for v.typ == valPair {
+		allArgs = append(allArgs, v.car)
+		v = v.cdr
+	}
+	if v.typ != valNil {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: last argument is not a proper list", node.line, node.col)}
+	}
+
+	if fn.typ == valLambda {
+		return applyLambda(fn, allArgs, node, ip)
+	}
+	if fn.typ == valSymbol {
+		return applyBuiltin(fn.sval, allArgs, node, ip)
+	}
+	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: not a procedure", node.line, node.col)}
 }
 
 func makeGlobalEnv() *env {
@@ -1208,7 +1330,8 @@ func makeGlobalEnv() *env {
 		"string->number", "number->string",
 		"symbol->string", "string->symbol",
 		"string-ref",
-		"string-copy", "string-set!"}
+		"string-copy", "string-set!",
+		"apply"}
 	for _, name := range builtins {
 		e.set(name, symVal(name))
 	}
