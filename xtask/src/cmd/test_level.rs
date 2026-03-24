@@ -430,7 +430,7 @@ fn clippy_args(fix: bool, allow_dead_code: bool) -> Vec<&'static str> {
 }
 
 fn check_mod_size(proj: &Path, level: u32) -> Result<()> {
-    let mod_limit: usize = 500;
+    let mod_limit: usize = 1500;
 
     let mod_file = proj.join("bench/rust/src/scheme/mod.rs");
     if !mod_file.is_file() {

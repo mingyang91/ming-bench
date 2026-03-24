@@ -88,7 +88,7 @@ The orchestrator picks `strategies/{lang}/{strategy}.md` if it exists, otherwise
 
 To add a new strategy: create `bench/strategies/<lang>/<name>.md` and use `--strategy <name> --lang <lang>`.
 
-**Two-pass testing (quality-gate):** In levels mode, `run-agent` splits each quality-gate level into two agent invocations: (1) coding pass with plain `cargo xtask test` (no gate, same turn budget as default), (2) cleanup pass with `cargo xtask test --gate` (fresh session, 15 turns). The agent never sees clippy during coding — the orchestrator controls when quality checks run. Default strategy uses a single pass (no gate).
+**Two-pass testing (quality-gate):** In levels mode, `run-agent` splits each quality-gate level into two agent invocations with **different strategies**: (1) coding pass uses `default.md` strategy — the agent codes freely without quality constraints, same turn/token budget as default runs, (2) cleanup pass swaps CLAUDE.md to `quality-gate.md` — the agent sees strict QG rules and refactors working code to production quality, same tiered token budget as the coding pass. The strategy swap happens via symlink update between passes. Default strategy runs are single-pass (no swap, no cleanup).
 
 ## Session Analysis
 
@@ -130,7 +130,7 @@ Failed levels auto-retry up to 2 times if the failure was infrastructure (timeou
 
 **Regression checking:** After each level passes (before quality gate cleanup), the orchestrator re-runs all previously-passed levels against the current code. If any regress (e.g., L14 breaking L06's `string-set!`), a fix-it agent pass is launched with the **same tiered token cap as the coding pass**. If the fix-it pass fails to resolve the regressions, the run halts with `REGRESSION` status. Checkpoints: `REGFIX` (regressions fixed), `REGRESSION` (halted).
 
-**Quality-gate cleanup:** After regression check passes, quality-gate levels get an additional cleanup pass (50K token cap) with `cargo xtask test --gate`. The agent never sees clippy during coding — the orchestrator controls when quality checks run.
+**Quality-gate cleanup:** After regression check passes, quality-gate levels get an additional cleanup pass (same tiered token budget as coding) with `cargo xtask test --gate`. The cleanup agent sees the QG strategy (quality-gate.md) which encourages radical refactoring. The coding agent sees the default strategy and codes freely.
 
 ## Key Conventions
 

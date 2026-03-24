@@ -1,34 +1,40 @@
-# MING Scheme Interpreter
+# Quality Gate — Cleanup Pass
 
-Implement a Scheme interpreter in Rust. Read `SPEC.md` for the full specification.
+All tests for this level already pass. Your job is to **refactor the code to production quality** while keeping all tests green.
+
+## What To Do
+
+1. Run `cargo xtask test <level> --lang rust --gate` to see quality-gate violations
+2. Fix ALL violations — lints, nesting depth, function length, module size
+3. **Radical refactoring is encouraged.** Extract modules, split large functions, flatten nesting, improve abstractions. The code works — make it maintainable.
+4. Run `cargo xtask test all --lang rust` to verify no regressions
+5. Run `cargo xtask test <level> --lang rust --gate` again to confirm all violations are fixed
 
 ## Contract
 
-- Implement `eval_str` in `src/scheme/mod.rs`
-- Add error variants to `EvalError` in `src/scheme/error.rs` as needed
 - You may create any additional modules/files under `src/scheme/`
 - Do NOT modify test functions
 - Allowed external crates: `thiserror`, `log`, `env_logger` (already in Cargo.toml). Do NOT add any others.
 - **No `thread_local!` or `std::thread_local`.** All state must be passed explicitly through function parameters.
-- **Local `let mut` is permitted.** Prefer immutable bindings, but `let mut` inside a function body is fine for loop control and local accumulation. Mutable state must never escape the function — don't return `&mut`, don't store in struct fields, don't pass as `&mut` to other functions. If mutation needs to be shared, use explicit shared-ownership types.
-- **NEVER run `cargo test` directly on the host.** Always use `cargo xtask test`. This rule has NO exceptions.
+- **Local `let mut` is permitted.** Prefer immutable bindings, but `let mut` inside a function body is fine for loop control and local accumulation. Mutable state must never escape the function.
+- **NEVER run `cargo test` directly on the host.** Always use `cargo xtask test`.
 
 ## Build & Test
 
 ```bash
-cargo xtask test 01   # test level 1
-cargo xtask test all  # test all levels (300s timeout)
+cargo xtask test 01 --gate   # test level 1 with quality gate
+cargo xtask test all          # test all levels (300s timeout)
 ```
 
 Tests run in a container (1GB memory, 1 CPU). Per-level: 30s. Full suite: 300s.
 
-## Development Strategy
+## Refactoring Philosophy
 
-- **Implement levels in order (L1 → L26).** Each level builds on the previous.
-- **After implementing each level, run its tests before moving on.**
-- **If a level's tests fail, fix them before proceeding.**
-- **Code first, debug from test output.** Don't mentally simulate — let the test runner do that.
-- **Maximum 10 turns of reading before first code change.** If you haven't written or edited a file by turn 10, your analysis is too deep — write a first attempt and iterate from test failures. Tests are the source of truth, not mental simulation.
+- **Expanding blast radius to reduce tech debt is encouraged.** If adding a field to an enum touches 15 match sites, do it. The upfront cost is lower than compounding workarounds.
+- **Fix violations in touched files.** When modifying a file, fix issues in that file — don't defer.
+- **Proactive refactoring over workarounds.** If existing code doesn't accommodate a new feature cleanly, refactor the existing code rather than hacking around it.
+- **Extract modules aggressively.** If `mod.rs` exceeds 1500 lines, split it. Move evaluator, parser, builtins, macros, and continuations into separate files.
+- **Clear module boundaries.** Each module should have a single responsibility and a clean public API.
 
 ## Type Safety
 
@@ -63,8 +69,6 @@ Tests run in a container (1GB memory, 1 CPU). Per-level: 30s. Full suite: 300s.
       Value::List(l) => Err(Error::TypeMismatch),
   }
   ```
-
-- **Wrap values that cross subsystem boundaries.** If a `String` means different things in different contexts (identifier vs user text vs output), it needs a newtype. If a `bool` parameter controls behavior, it needs an enum.
 
 ## Code Style
 
@@ -115,66 +119,11 @@ Tests run in a container (1GB memory, 1 CPU). Per-level: 30s. Full suite: 300s.
 
 ### Functional Style (preferred, not mandatory)
 
-Prefer functional patterns when they make the code clearer. Use imperative style when it's simpler.
-
 - **Prefer iterator pipelines for collection transforms.**
-
-  ```rust
-  // Imperative — fine for complex logic
-  let mut results = Vec::new();
-  for item in items {
-      results.push(process(item));
-  }
-
-  // Functional — preferred when straightforward
-  let results: Vec<_> = items.iter().map(process).collect();
-  ```
-
 - **Prefer `collect::<Result<Vec<_>, _>>()?` for fallible transforms.**
-
-  ```rust
-  let parsed: Vec<_> = inputs.iter().map(parse).collect::<Result<_, _>>()?;
-  ```
-
 - **Prefer folds for recursive data construction.**
-
-  ```rust
-  let list = items.iter().rev().fold(Value::Nil, |acc, item| {
-      Value::Pair(Box::new(item.clone()), Box::new(acc))
-  });
-  ```
-
 - **Prefer `split_first()` and slice patterns over indexing.**
-
-  ```rust
-  // Bad
-  let first = args[0];
-  let rest = &args[1..];
-
-  // Good
-  let [first, rest @ ..] = args else {
-      return Err(Error::NotEnoughArgs);
-  };
-  ```
-
 - **Prefer declarative matching over flag variables.**
-
-  ```rust
-  // Bad
-  let mut found = None;
-  for entry in entries {
-      if entry.matches(key) { found = Some(entry.value()); break; }
-  }
-
-  // Good
-  let found = entries.iter().find_map(|e| e.matches(key).then(|| e.value()));
-  ```
-
-## Refactoring Philosophy
-
-- **Expanding blast radius to reduce tech debt is encouraged.** If adding a field to an enum touches 15 match sites, do it. The upfront cost is lower than compounding workarounds.
-- **Fix violations in touched files.** When modifying a file, fix issues in that file — don't defer.
-- **Proactive refactoring over workarounds.** If existing code doesn't accommodate a new feature cleanly, refactor the existing code rather than hacking around it.
 
 ## Structural Limits
 
@@ -182,11 +131,11 @@ Prefer functional patterns when they make the code clearer. Use imperative style
 |---|---|
 | Function length | 300 lines |
 | Nesting depth | 6 levels |
-| `mod.rs` impl lines | 500 |
+| `mod.rs` impl lines | 1500 |
 
 ## Lint Quick Reference
 
-These are enforced mechanically during `cargo xtask test`. Hard errors:
+These are enforced mechanically during `cargo xtask test --gate`. Hard errors:
 
 | Denied | Use instead |
 |---|---|

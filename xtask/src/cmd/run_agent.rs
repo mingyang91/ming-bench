@@ -254,21 +254,21 @@ fn create_worktree(
     }
     println!("Worktree created.");
 
-    symlink_strategy(args, agent_workdir)?;
+    symlink_strategy(&args.lang, &args.strategy, agent_workdir)?;
     copy_strategy_clippy(args, agent_workdir)?;
     // quality-gate lints are now enforced at runtime via `cargo xtask test`
     // (clippy flags in test_level.rs), not via Cargo feature patching.
     Ok(())
 }
 
-fn symlink_strategy(args: &RunAgentArgs, agent_workdir: &Path) -> Result<()> {
+fn symlink_strategy(lang: &str, strategy: &str, agent_workdir: &Path) -> Result<()> {
     // Look for per-language strategy first, fallback to base.
     // Strategies live at bench/strategies/ — one level up from bench/{lang}/.
-    let lang = crate::model::Lang::from_str(&args.lang).unwrap_or(crate::model::Lang::Rust);
+    let lang_enum = crate::model::Lang::from_str(lang).unwrap_or(crate::model::Lang::Rust);
     let bench_dir = agent_workdir.parent().expect("agent_workdir has parent");
 
-    let lang_rel = format!("strategies/{}/{}.md", lang.dir_name(), args.strategy);
-    let base_rel = format!("strategies/{}.md", args.strategy);
+    let lang_rel = format!("strategies/{}/{}.md", lang_enum.dir_name(), strategy);
+    let base_rel = format!("strategies/{}.md", strategy);
 
     // Check which file exists on the filesystem (bench_dir = bench/)
     let strategy_rel = if bench_dir.join(&lang_rel).is_file() {
@@ -595,6 +595,7 @@ fn run_levels_mode(
     let mut agent_exit = 0i32;
     let mut level_times: Vec<(String, i64, String)> = Vec::new();
     let mut passed_levels: Vec<&str> = Vec::new();
+    let is_qg = args.strategy.contains("quality-gate");
 
     for level in &LEVELS {
         if INTERRUPTED.load(Ordering::Relaxed) {
@@ -616,6 +617,11 @@ fn run_levels_mode(
             continue;
         }
 
+        // QG runs: swap to default strategy for coding pass (agent codes freely)
+        if is_qg {
+            symlink_strategy(&args.lang, "default", agent_workdir)?;
+        }
+
         let result = run_single_level(args, agent_workdir, worktree_dir, &level_dir, level)?;
         agent_exit = result.0;
         level_times.push((format!("L{level}"), result.1, result.2.clone()));
@@ -627,6 +633,7 @@ fn run_levels_mode(
         }
 
         // --- Step 1: Regression check (BEFORE quality gate) ---
+        // Regression fix agent also sees default strategy — correct, it's fixing functional breakage
         if let RegCheckOutcome::Broken = check_and_fix_regressions(
             args, agent_workdir, worktree_dir, &level_dir, level, &passed_levels, &lang,
         )? {
@@ -637,6 +644,10 @@ fn run_levels_mode(
         }
 
         // --- Step 2: Quality gate cleanup (AFTER regression is clean) ---
+        // QG runs: swap to QG strategy so cleanup agent sees strict rules
+        if is_qg {
+            symlink_strategy(&args.lang, &args.strategy, agent_workdir)?;
+        }
         maybe_run_gate_cleanup(args, agent_workdir, worktree_dir, &level_dir, level);
 
         commit_checkpoint(level, &result.2, result.1, worktree_dir);
@@ -1021,17 +1032,19 @@ fn run_quality_gate_cleanup(
     level_dir: &Path,
     level: &str,
 ) -> i32 {
-    use crate::model::GATE_CLEANUP_TOKEN_BUDGET;
-    println!("--- Level {level} cleanup (budget {GATE_CLEANUP_TOKEN_BUDGET} output tokens) ---");
+    use crate::model::output_tokens_for_level;
+    let level_num: u32 = level.parse().unwrap_or(1);
+    let cleanup_budget = output_tokens_for_level(level_num, None);
+    println!("--- Level {level} cleanup (budget {cleanup_budget} output tokens) ---");
     let cleanup_uuid = uuid_v4();
     let cleanup_prompt = format!(
-        "Level {level} tests pass. Fix any quality-gate warnings.\n\
-         Run `cargo xtask test {level} --lang {} --gate` to verify. Do not change test behavior.",
+        "Level {level} tests already pass. Read CLAUDE.md for quality-gate rules, then \
+         run `cargo xtask test {level} --lang {} --gate` and fix all violations.",
         args.lang
     );
     let output_file = level_dir.join("agent-output-cleanup.txt");
     let budget = BudgetOpts {
-        token_budget: Some(GATE_CLEANUP_TOKEN_BUDGET),
+        token_budget: Some(cleanup_budget),
         level_dir: Some(level_dir.to_path_buf()),
     };
     let _cleanup_exit = launch_agent(

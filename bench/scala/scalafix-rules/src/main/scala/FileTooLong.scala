@@ -3,7 +3,7 @@ import scalafix.lint.{Diagnostic, LintSeverity}
 import scala.meta._
 
 class FileTooLong extends SyntacticRule("FileTooLong") {
-  val maxLines = 500
+  val maxLines = 1500
 
   override def fix(implicit doc: SyntacticDocument): Patch = {
     val totalLines = doc.tree.pos.endLine + 1

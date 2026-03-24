@@ -440,8 +440,6 @@ pub const SAFETY_MAX_TURNS: u32 = 200;
 /// Token poll interval in seconds for the monitor thread.
 pub const TOKEN_POLL_INTERVAL_SECS: u64 = 5;
 
-/// Quality-gate cleanup pass safety cap.
-pub const GATE_CLEANUP_TOKEN_BUDGET: u64 = 50_000;
 
 /// Default turn limit for a given level number (kept as a fallback for
 /// agents without token monitoring, e.g. OpenCode).
