@@ -114,6 +114,9 @@ object Evaluator:
           case Some(v) => v
           case None    => throw new EvalError(s"unbound variable: $name")
       case Pair(Symbol("quote"), Pair(datum, Nil)) => datum
+      case Pair(Symbol("define"), rest)            => evalDefine(rest, env)
+      case Pair(Symbol("if"), rest)                => evalIf(rest, env)
+      case Pair(Symbol("lambda"), rest)            => evalLambda(rest, env)
       case Pair(Symbol("and"), args)               => evalAnd(args, env)
       case Pair(Symbol("or"), args)                => evalOr(args, env)
       case Pair(head, args) =>
@@ -121,6 +124,50 @@ object Evaluator:
         val argList = toList(args).map(a => eval(a, env))
         applyFunc(func, argList)
       case Void => Void
+
+  private def evalDefine(rest: Val, env: Env): Val =
+    rest match
+      // (define (f params...) body...) => (define f (lambda (params...) body...))
+      case Pair(Pair(Symbol(name), params), body) =>
+        val lambdaExpr = Pair(Symbol("lambda"), Pair(params, body))
+        val v          = eval(lambdaExpr, env)
+        env.define(name, v)
+        Void
+      // (define x expr)
+      case Pair(Symbol(name), Pair(valueExpr, Nil)) =>
+        val v = eval(valueExpr, env)
+        env.define(name, v)
+        Void
+      case _ => throw new EvalError("bad define syntax")
+
+  private def evalIf(rest: Val, env: Env): Val =
+    rest match
+      case Pair(cond, Pair(thenExpr, Pair(elseExpr, Nil))) =>
+        val condVal = eval(cond, env)
+        if condVal != Bool(false) then eval(thenExpr, env) else eval(elseExpr, env)
+      case Pair(cond, Pair(thenExpr, Nil)) =>
+        val condVal = eval(cond, env)
+        if condVal != Bool(false) then eval(thenExpr, env) else Void
+      case _ => throw new EvalError("bad if syntax")
+
+  private def evalLambda(rest: Val, env: Env): Val =
+    rest match
+      case Pair(params, body) =>
+        val paramNames = toList(params).map {
+          case Symbol(s) => s; case v => throw new EvalError(s"bad parameter: ${display(v)}")
+        }
+        val bodyList = toList(body)
+        if bodyList.isEmpty then throw new EvalError("lambda: empty body")
+        Builtin { args =>
+          if args.length != paramNames.length then
+            throw new EvalError(s"lambda: expected ${paramNames.length} arguments, got ${args.length}")
+          val childEnv = new Env(scala.collection.mutable.Map[String, Val](), Some(env))
+          paramNames.zip(args).foreach((p, a) => childEnv.define(p, a))
+          var result: Val = Void
+          for expr <- bodyList do result = eval(expr, childEnv)
+          result
+        }
+      case _ => throw new EvalError("bad lambda syntax")
 
   private def evalAnd(args: Val, env: Env): Val =
     args match
@@ -162,59 +209,11 @@ object Evaluator:
 
   private def defaultEnv(): Env =
     val m = scala.collection.mutable.Map[String, Val]()
-    def numericBinop(op: (Long, Long) => Long): Val = Builtin { args =>
-      val nums = args.map { case Num(n) => n; case v => throw new EvalError(s"not a number: ${display(v)}") }
-      Num(nums.reduce(op))
-    }
-
-    m("+") = Builtin { args =>
-      val nums = args.map { case Num(n) => n; case v => throw new EvalError(s"not a number: ${display(v)}") }
-      Num(nums.sum)
-    }
-    m("-") = Builtin { args =>
-      val nums = args.map { case Num(n) => n; case v => throw new EvalError(s"not a number: ${display(v)}") }
-      if nums.length == 1 then Num(-nums.head)
-      else Num(nums.reduce(_ - _))
-    }
-    m("*") = Builtin { args =>
-      val nums = args.map { case Num(n) => n; case v => throw new EvalError(s"not a number: ${display(v)}") }
-      Num(nums.product)
-    }
-    m("/") = Builtin { args =>
-      val nums = args.map { case Num(n) => n; case v => throw new EvalError(s"not a number: ${display(v)}") }
-      if nums.length < 2 then throw new EvalError("/ requires at least 2 arguments")
-      if nums.tail.contains(0L) then throw new EvalError("division by zero")
-      Num(nums.reduce(_ / _))
-    }
-    m("<") = Builtin { args =>
-      val nums = args.map { case Num(n) => n; case v => throw new EvalError(s"not a number: ${display(v)}") }
-      Bool(nums.sliding(2).forall { case Seq(a, b) => a < b; case _ => true })
-    }
-    m(">") = Builtin { args =>
-      val nums = args.map { case Num(n) => n; case v => throw new EvalError(s"not a number: ${display(v)}") }
-      Bool(nums.sliding(2).forall { case Seq(a, b) => a > b; case _ => true })
-    }
-    m("=") = Builtin { args =>
-      val nums = args.map { case Num(n) => n; case v => throw new EvalError(s"not a number: ${display(v)}") }
-      Bool(nums.sliding(2).forall { case Seq(a, b) => a == b; case _ => true })
-    }
-    m("<=") = Builtin { args =>
-      val nums = args.map { case Num(n) => n; case v => throw new EvalError(s"not a number: ${display(v)}") }
-      Bool(nums.sliding(2).forall { case Seq(a, b) => a <= b; case _ => true })
-    }
-    m(">=") = Builtin { args =>
-      val nums = args.map { case Num(n) => n; case v => throw new EvalError(s"not a number: ${display(v)}") }
-      Bool(nums.sliding(2).forall { case Seq(a, b) => a >= b; case _ => true })
-    }
-    m("not") = Builtin {
-      case List(Bool(false)) => Bool(true)
-      case List(_)           => Bool(false)
-      case _                 => throw new EvalError("not requires 1 argument")
-    }
+    Builtins.all.foreach((name, v) => m(name) = v)
     new Env(m, None)
 
   // --- Display ---
-  private def display(v: Val): String = v match
+  private[ming] def display(v: Val): String = v match
     case Num(n)       => n.toString
     case Bool(true)   => "#t"
     case Bool(false)  => "#f"
@@ -226,18 +225,16 @@ object Evaluator:
     case Builtin(_)   => "#<procedure>"
 
   private def displayList(v: Val): String =
-    val sb      = new StringBuilder("(")
-    var current = v
-    var first   = true
-    while current.isInstanceOf[Pair] do
-      val Pair(car, cdr) = current: @unchecked
-      if !first then sb.append(" ")
-      sb.append(display(car))
-      first = false
-      current = cdr
-    current match
+    val sb = new StringBuilder("(")
+    @scala.annotation.tailrec
+    def loop(current: Val, first: Boolean): Unit = current match
+      case Pair(car, cdr) =>
+        if !first then sb.append(" ")
+        sb.append(display(car))
+        loop(cdr, first = false)
       case Nil => ()
       case _   => sb.append(" . "); sb.append(display(current))
+    loop(v, first = true)
     sb.append(")")
     sb.toString
 
