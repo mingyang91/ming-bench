@@ -22,6 +22,10 @@ const (
 	tokFloat
 	tokRational
 	tokSyntaxQuote
+	tokBackquote
+	tokComma
+	tokCommaAt
+	tokHashParen
 	tokEOF
 )
 
@@ -43,7 +47,7 @@ func tokenize(input string) ([]token, error) {
 		ch := input[i]
 
 		// skip whitespace
-		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' {
 			if ch == '\n' {
 				line++
 				col = 1
@@ -82,6 +86,24 @@ func tokenize(input string) ([]token, error) {
 			col++
 			continue
 		}
+		if ch == '`' {
+			tokens = append(tokens, token{tokBackquote, "`", startLine, startCol})
+			i++
+			col++
+			continue
+		}
+		if ch == ',' {
+			if i+1 < len(input) && input[i+1] == '@' {
+				tokens = append(tokens, token{tokCommaAt, ",@", startLine, startCol})
+				i += 2
+				col += 2
+			} else {
+				tokens = append(tokens, token{tokComma, ",", startLine, startCol})
+				i++
+				col++
+			}
+			continue
+		}
 
 		// string literal
 		if ch == '"' {
@@ -116,9 +138,15 @@ func tokenize(input string) ([]token, error) {
 			continue
 		}
 
-		// #', #t, #f, #\char
+		// #', #(, #t, #f, #\char
 		if ch == '#' && i+1 < len(input) {
 			next := input[i+1]
+			if next == '(' {
+				tokens = append(tokens, token{tokHashParen, "#(", startLine, startCol})
+				i += 2
+				col += 2
+				continue
+			}
 			if next == '\'' {
 				tokens = append(tokens, token{tokSyntaxQuote, "#'", startLine, startCol})
 				i += 2
@@ -251,6 +279,7 @@ const (
 	ExprChar
 	ExprFloat
 	ExprRational
+	ExprDotList // (a b . c) - improper list
 )
 
 // parser
@@ -374,12 +403,86 @@ func (p *parser) parseExpr() (*Expr, error) {
 			Line: t.line, Col: t.col,
 		}, nil
 
+	case tokBackquote:
+		p.next()
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &Expr{
+			Kind: ExprList,
+			List: []*Expr{
+				{Kind: ExprSymbol, SVal: "quasiquote", Line: t.line, Col: t.col},
+				inner,
+			},
+			Line: t.line, Col: t.col,
+		}, nil
+
+	case tokComma:
+		p.next()
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &Expr{
+			Kind: ExprList,
+			List: []*Expr{
+				{Kind: ExprSymbol, SVal: "unquote", Line: t.line, Col: t.col},
+				inner,
+			},
+			Line: t.line, Col: t.col,
+		}, nil
+
+	case tokCommaAt:
+		p.next()
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &Expr{
+			Kind: ExprList,
+			List: []*Expr{
+				{Kind: ExprSymbol, SVal: "unquote-splicing", Line: t.line, Col: t.col},
+				inner,
+			},
+			Line: t.line, Col: t.col,
+		}, nil
+
+	case tokHashParen:
+		// #(elem ...) → (vector elem ...)
+		p.next()
+		elems := []*Expr{{Kind: ExprSymbol, SVal: "vector", Line: t.line, Col: t.col}}
+		for p.peek().kind != tokRParen {
+			if p.peek().kind == tokEOF {
+				return nil, fmt.Errorf("%d:%d: unexpected end of input in vector literal", t.line, t.col)
+			}
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, e)
+		}
+		p.next() // consume ')'
+		return &Expr{Kind: ExprList, List: elems, Line: t.line, Col: t.col}, nil
+
 	case tokLParen:
 		p.next()
 		var list []*Expr
+		isDotted := false
 		for p.peek().kind != tokRParen {
 			if p.peek().kind == tokEOF {
 				return nil, fmt.Errorf("%d:%d: unexpected end of input", t.line, t.col)
+			}
+			// Check for dotted pair: (a b . c)
+			if p.peek().kind == tokSymbol && p.peek().text == "." && len(list) > 0 {
+				p.next() // consume "."
+				isDotted = true
+				e, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				list = append(list, e)
+				break
 			}
 			e, err := p.parseExpr()
 			if err != nil {
@@ -387,7 +490,14 @@ func (p *parser) parseExpr() (*Expr, error) {
 			}
 			list = append(list, e)
 		}
+		if p.peek().kind != tokRParen {
+			return nil, fmt.Errorf("%d:%d: expected ')' after dotted pair", t.line, t.col)
+		}
 		p.next() // consume ')'
+		if isDotted {
+			// Mark as dotted pair - we'll use a special ExprDot kind
+			return &Expr{Kind: ExprDotList, List: list, Line: t.line, Col: t.col}, nil
+		}
 		return &Expr{Kind: ExprList, List: list, Line: t.line, Col: t.col}, nil
 
 	case tokRParen:

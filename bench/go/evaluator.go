@@ -336,6 +336,10 @@ func evalStep(expr *Expr, env *Env) (Value, error) {
 		return v, nil
 	case ExprList:
 		return evalList(expr, env)
+	case ExprDotList:
+		// Dotted list in expression position - treat as regular list for evaluation
+		// (this handles cases like (proc . args) which is the same as (proc args...))
+		return evalList(expr, env)
 	}
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unknown expression", expr.Line, expr.Col)}
 }
@@ -360,6 +364,8 @@ func evalList(expr *Expr, env *Env) (Value, error) {
 			return evalIf(expr, env)
 		case "quote":
 			return evalQuote(expr, env)
+		case "quasiquote":
+			return evalQuasiquote(expr, env)
 		case "lambda":
 			return evalLambda(expr, env)
 		case "let":
@@ -832,36 +838,38 @@ func numericCompare(name string, args []Value) (float64, float64, error) {
 	return a, b, nil
 }
 
-func builtinLt(args []Value) (Value, error) {
-	a, b, err := numericCompare("<", args)
-	if err != nil {
+func chainCompare(name string, args []Value, cmp func(a, b float64) bool) (Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("%s: expected at least 2 arguments", name)
+	}
+	if err := requireNumeric(name, args); err != nil {
 		return nil, err
 	}
-	return &BoolVal{Val: a < b}, nil
+	prev, _ := toFloat64(args[0])
+	for i := 1; i < len(args); i++ {
+		cur, _ := toFloat64(args[i])
+		if !cmp(prev, cur) {
+			return &BoolVal{Val: false}, nil
+		}
+		prev = cur
+	}
+	return &BoolVal{Val: true}, nil
+}
+
+func builtinLt(args []Value) (Value, error) {
+	return chainCompare("<", args, func(a, b float64) bool { return a < b })
 }
 
 func builtinGt(args []Value) (Value, error) {
-	a, b, err := numericCompare(">", args)
-	if err != nil {
-		return nil, err
-	}
-	return &BoolVal{Val: a > b}, nil
+	return chainCompare(">", args, func(a, b float64) bool { return a > b })
 }
 
 func builtinEq(args []Value) (Value, error) {
-	a, b, err := numericCompare("=", args)
-	if err != nil {
-		return nil, err
-	}
-	return &BoolVal{Val: a == b}, nil
+	return chainCompare("=", args, func(a, b float64) bool { return a == b })
 }
 
 func builtinLe(args []Value) (Value, error) {
-	a, b, err := numericCompare("<=", args)
-	if err != nil {
-		return nil, err
-	}
-	return &BoolVal{Val: a <= b}, nil
+	return chainCompare("<=", args, func(a, b float64) bool { return a <= b })
 }
 
 func builtinNot(args []Value) (Value, error) {
@@ -1242,15 +1250,33 @@ func evalDefine(expr *Expr, env *Env) (Value, error) {
 	}
 	target := expr.List[1]
 
-	// (define (f params...) body...)
-	if target.Kind == ExprList && len(target.List) > 0 {
+	// (define (f params...) body...) or (define (f params... . rest) body...)
+	if (target.Kind == ExprList || target.Kind == ExprDotList) && len(target.List) > 0 {
 		name := target.List[0]
 		if name.Kind != ExprSymbol {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol", name.Line, name.Col)}
 		}
-		params, rest, pErr := parseDottedParams(target.List[1:], "define")
-		if pErr != nil {
-			return nil, pErr
+		var params []string
+		var rest string
+		if target.Kind == ExprDotList {
+			// Last element is the rest param
+			for _, p := range target.List[1 : len(target.List)-1] {
+				if p.Kind != ExprSymbol {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected parameter name", p.Line, p.Col)}
+				}
+				params = append(params, p.SVal)
+			}
+			lastP := target.List[len(target.List)-1]
+			if lastP.Kind != ExprSymbol {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected rest parameter name", lastP.Line, lastP.Col)}
+			}
+			rest = lastP.SVal
+		} else {
+			var pErr error
+			params, rest, pErr = parseDottedParams(target.List[1:], "define")
+			if pErr != nil {
+				return nil, pErr
+			}
 		}
 		lam := &LambdaVal{Params: params, RestParam: rest, Body: expr.List[2:], Env: env}
 		env.Set(name.SVal, lam)
@@ -1293,6 +1319,89 @@ func evalQuote(expr *Expr, env *Env) (Value, error) {
 	return exprToValue(expr.List[1]), nil
 }
 
+func evalQuasiquote(expr *Expr, env *Env) (Value, error) {
+	if len(expr.List) != 2 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quasiquote: expected 1 argument", expr.Line, expr.Col)}
+	}
+	return qqExpand(expr.List[1], env, 1)
+}
+
+// qqExpand processes quasiquote templates at the given nesting depth.
+func qqExpand(e *Expr, env *Env, depth int) (Value, error) {
+	isList := e.Kind == ExprList || e.Kind == ExprDotList
+	if isList && len(e.List) == 2 && e.List[0].Kind == ExprSymbol {
+		switch e.List[0].SVal {
+		case "unquote":
+			if depth == 1 {
+				return eval(e.List[1], env)
+			}
+			inner, err := qqExpand(e.List[1], env, depth-1)
+			if err != nil {
+				return nil, err
+			}
+			return &PairVal{Car: &SymbolVal{Name: "unquote"}, Cdr: &PairVal{Car: inner, Cdr: &NilVal{}}}, nil
+		case "quasiquote":
+			inner, err := qqExpand(e.List[1], env, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			return &PairVal{Car: &SymbolVal{Name: "quasiquote"}, Cdr: &PairVal{Car: inner, Cdr: &NilVal{}}}, nil
+		}
+	}
+	if isList && len(e.List) >= 1 {
+		var parts []Value
+		for _, elem := range e.List {
+			if elem.Kind == ExprList && len(elem.List) == 2 && elem.List[0].Kind == ExprSymbol && elem.List[0].SVal == "unquote-splicing" {
+				if depth == 1 {
+					spliced, err := eval(elem.List[1], env)
+					if err != nil {
+						return nil, err
+					}
+					cur := spliced
+					for {
+						if _, ok := cur.(*NilVal); ok {
+							break
+						}
+						p, ok := cur.(*PairVal)
+						if !ok {
+							return nil, &EvalError{Message: "unquote-splicing: not a proper list"}
+						}
+						parts = append(parts, p.Car)
+						cur = p.Cdr
+					}
+				} else {
+					inner, err := qqExpand(elem.List[1], env, depth-1)
+					if err != nil {
+						return nil, err
+					}
+					parts = append(parts, &PairVal{Car: &SymbolVal{Name: "unquote-splicing"}, Cdr: &PairVal{Car: inner, Cdr: &NilVal{}}})
+				}
+			} else {
+				v, err := qqExpand(elem, env, depth)
+				if err != nil {
+					return nil, err
+				}
+				parts = append(parts, v)
+			}
+		}
+		if e.Kind == ExprDotList && len(parts) >= 2 {
+			// Dotted list: last element is cdr
+			result := parts[len(parts)-1]
+			for i := len(parts) - 2; i >= 0; i-- {
+				result = &PairVal{Car: parts[i], Cdr: result}
+			}
+			return result, nil
+		}
+		result := Value(&NilVal{})
+		for i := len(parts) - 1; i >= 0; i-- {
+			result = &PairVal{Car: parts[i], Cdr: result}
+		}
+		return result, nil
+	}
+	// Atom — return as-is (like quote)
+	return exprToValue(e), nil
+}
+
 func exprToValue(e *Expr) Value {
 	switch e.Kind {
 	case ExprInt:
@@ -1313,6 +1422,22 @@ func exprToValue(e *Expr) Value {
 			result = &PairVal{Car: exprToValue(e.List[i]), Cdr: result}
 		}
 		return result
+	case ExprDotList:
+		// (a b . c) — improper list, last element is the cdr
+		if len(e.List) < 2 {
+			return &VoidVal{}
+		}
+		result := exprToValue(e.List[len(e.List)-1]) // cdr of last pair
+		for i := len(e.List) - 2; i >= 0; i-- {
+			result = &PairVal{Car: exprToValue(e.List[i]), Cdr: result}
+		}
+		return result
+	case ExprChar:
+		return &CharVal{Val: e.RVal}
+	case ExprFloat:
+		return &FloatVal{Val: e.FVal}
+	case ExprRational:
+		return &RationalVal{Num: e.Num, Denom: e.Denom}
 	}
 	return &VoidVal{}
 }
@@ -1491,6 +1616,14 @@ func evalCond(expr *Expr, env *Env) (Value, error) {
 			if len(clause.List) == 1 {
 				return test, nil
 			}
+			// => clause: (test => proc) — call proc with test value
+			if len(clause.List) == 3 && clause.List[1].Kind == ExprSymbol && clause.List[1].SVal == "=>" {
+				proc, err := eval(clause.List[2], env)
+				if err != nil {
+					return nil, err
+				}
+				return applyProc(proc, []Value{test}, expr)
+			}
 			body := clause.List[1:]
 			for _, e := range body[:len(body)-1] {
 				_, err = eval(e, env)
@@ -1512,6 +1645,21 @@ func evalLambda(expr *Expr, env *Env) (Value, error) {
 	// Single symbol means all-variadic: (lambda args body)
 	if paramExpr.Kind == ExprSymbol {
 		return &LambdaVal{RestParam: paramExpr.SVal, Body: expr.List[2:], Env: env}, nil
+	}
+	if paramExpr.Kind == ExprDotList && len(paramExpr.List) >= 2 {
+		// (lambda (a b . rest) body)
+		var params []string
+		for _, p := range paramExpr.List[:len(paramExpr.List)-1] {
+			if p.Kind != ExprSymbol {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected parameter name", p.Line, p.Col)}
+			}
+			params = append(params, p.SVal)
+		}
+		lastP := paramExpr.List[len(paramExpr.List)-1]
+		if lastP.Kind != ExprSymbol {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected rest parameter name", lastP.Line, lastP.Col)}
+		}
+		return &LambdaVal{Params: params, RestParam: lastP.SVal, Body: expr.List[2:], Env: env}, nil
 	}
 	if paramExpr.Kind != ExprList {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected parameter list", paramExpr.Line, paramExpr.Col)}
@@ -1540,13 +1688,26 @@ func evalCaseLambda(expr *Expr, env *Env) (Value, error) {
 		if paramExpr.Kind == ExprSymbol {
 			// (args body...) — all variadic
 			rest = paramExpr.SVal
+		} else if paramExpr.Kind == ExprDotList && len(paramExpr.List) >= 2 {
+			// (x y . rest) dotted pair parameter list
+			for _, p := range paramExpr.List[:len(paramExpr.List)-1] {
+				if p.Kind != ExprSymbol {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: expected parameter name", p.Line, p.Col)}
+				}
+				params = append(params, p.SVal)
+			}
+			lastP := paramExpr.List[len(paramExpr.List)-1]
+			if lastP.Kind != ExprSymbol {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: expected rest parameter name", lastP.Line, lastP.Col)}
+			}
+			rest = lastP.SVal
 		} else if paramExpr.Kind == ExprList {
 			var err error
 			params, rest, err = parseDottedParams(paramExpr.List, "case-lambda")
 			if err != nil {
 				return nil, err
 			}
-		} else if paramExpr.Kind != ExprList {
+		} else {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: bad parameter list", paramExpr.Line, paramExpr.Col)}
 		}
 		clauses = append(clauses, CaseLambdaClause{Params: params, RestParam: rest, Body: body})
@@ -2549,11 +2710,7 @@ func builtinStringDowncase(args []Value) (Value, error) {
 }
 
 func builtinGe(args []Value) (Value, error) {
-	a, b, err := numericCompare(">=", args)
-	if err != nil {
-		return nil, err
-	}
-	return &BoolVal{Val: a >= b}, nil
+	return chainCompare(">=", args, func(a, b float64) bool { return a >= b })
 }
 
 // L11 builtins
