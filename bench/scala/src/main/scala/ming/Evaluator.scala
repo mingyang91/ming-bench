@@ -29,11 +29,11 @@ object Evaluator:
       }
       (names, None)
 
-  private def isTruthy(v: SchemeVal): Boolean = v match
+  private[ming] def isTruthy(v: SchemeVal): Boolean = v match
     case SchemeVal.BoolVal(false) => false
     case _                        => true
 
-  private def quoteToVal(expr: Expr): SchemeVal = expr match
+  private[ming] def quoteToVal(expr: Expr): SchemeVal = expr match
     case Expr.IntLit(n)    => SchemeVal.IntVal(n)
     case Expr.FloatLit(d)  => SchemeVal.FloatVal(d)
     case Expr.RatLit(n, d) => SchemeNum.makeRational(n, d)
@@ -43,7 +43,7 @@ object Evaluator:
     case Expr.Symbol(n)    => SchemeVal.SymVal(n)
     case Expr.SList(es)    => SchemeVal.ListVal(es.map(quoteToVal))
 
-  private def evalBody(body: List[Expr], env: Env): SchemeVal =
+  private[ming] def evalBody(body: List[Expr], env: Env): SchemeVal =
     body.foldLeft[SchemeVal](SchemeVal.Void)((_, e) => eval(e, env))
 
   private def posStr(expr: Expr): String =
@@ -52,7 +52,24 @@ object Evaluator:
 
   private val posPattern = ".*\\d+:\\d+.*".r
 
-  private def eval(expr: Expr, env: Env): SchemeVal =
+  private def evalDefineSyntax(
+    name: String,
+    lits: List[Expr],
+    rules: List[Expr],
+    env: Env
+  ): SchemeVal =
+    val literals = lits.map {
+      case Expr.Symbol(n) => n
+      case _              => throw new EvalError("syntax-rules: literals must be identifiers")
+    }.toSet
+    val ruleList = rules.map {
+      case Expr.SList(pat :: tmpl :: Nil) => (pat, tmpl)
+      case _                              => throw new EvalError("syntax-rules: invalid rule")
+    }
+    env.define(name, SchemeVal.Macro(literals, ruleList, env))
+    SchemeVal.Void
+
+  private[ming] def eval(expr: Expr, env: Env): SchemeVal =
     try
       expr match
         case Expr.IntLit(n)    => SchemeVal.IntVal(n)
@@ -114,30 +131,23 @@ object Evaluator:
                 Expr.Symbol("syntax-rules") :: Expr.SList(lits) :: rules
               ) :: Nil
             ) =>
-          val literals = lits.map {
-            case Expr.Symbol(n) => n
-            case _              => throw new EvalError("syntax-rules: literals must be identifiers")
-          }.toSet
-          val ruleList = rules.map {
-            case Expr.SList(pat :: tmpl :: Nil) => (pat, tmpl)
-            case _                              => throw new EvalError("syntax-rules: invalid rule")
-          }
-          env.define(name, SchemeVal.Macro(literals, ruleList, env))
-          SchemeVal.Void
+          evalDefineSyntax(name, lits, rules, env)
         case Expr.SList(
               Expr.Symbol("define-record-type") :: Expr.Symbol(typeName) ::
               Expr.SList(Expr.Symbol(ctorName) :: ctorFields) ::
               Expr.Symbol(predName) :: fieldDefs
             ) =>
           RecordType.defineRecordType(typeName, ctorName, ctorFields, predName, fieldDefs, env)
+        case Expr.SList(Expr.Symbol("letrec") :: Expr.SList(bindings) :: body) =>
+          evalLetrec(bindings, body, env)
+        case Expr.SList(Expr.Symbol("letrec*") :: Expr.SList(bindings) :: body) =>
+          evalLetrecStar(bindings, body, env)
+        case Expr.SList(Expr.Symbol("case") :: key :: clauses) =>
+          EvalForms.evalCase(eval(key, env), clauses, env)
+        case Expr.SList(Expr.Symbol("do") :: Expr.SList(varClauses) :: Expr.SList(testAndResult) :: bodyExprs) =>
+          EvalForms.evalDo(varClauses, testAndResult, bodyExprs, env)
         case Expr.SList(Expr.Symbol("case-lambda") :: clauseExprs) =>
-          val clauses = clauseExprs.map {
-            case Expr.SList(Expr.SList(params) :: body) =>
-              val (paramNames, restParam) = parseParams(params)
-              (paramNames, restParam, body, env)
-            case _ => throw new EvalError("case-lambda: invalid clause")
-          }
-          SchemeVal.CaseLambda(clauses)
+          evalCaseLambda(clauseExprs, env)
         case Expr.SList(Expr.Symbol(name) :: _) if MacroExpander.isMacro(name, env) =>
           env.lookup(name) match
             case m: SchemeVal.Macro => MacroExpander.expandAndEval(expr, name, m, env, eval)
@@ -149,6 +159,15 @@ object Evaluator:
         val msg = e.getMessage
         if posPattern.matches(msg) then throw e
         else throw new EvalError(s"$msg at ${posStr(expr)}")
+
+  private def evalCaseLambda(clauseExprs: List[Expr], env: Env): SchemeVal =
+    val clauses = clauseExprs.map {
+      case Expr.SList(Expr.SList(params) :: body) =>
+        val (paramNames, restParam) = parseParams(params)
+        (paramNames, restParam, body, env)
+      case _ => throw new EvalError("case-lambda: invalid clause")
+    }
+    SchemeVal.CaseLambda(clauses)
 
   def applyProc(fn: SchemeVal, evaledArgs: List[SchemeVal]): SchemeVal =
     fn match
@@ -244,6 +263,25 @@ object Evaluator:
         val v = eval(head, env)
         if isTruthy(v) then v
         else evalOr(tail, env, v)
+
+  private def evalLetrec(bindings: List[Expr], body: List[Expr], env: Env): SchemeVal =
+    val letEnv = new Env(mutable.Map.empty, Some(env))
+    val parsed = bindings.map {
+      case Expr.SList(Expr.Symbol(name) :: valExpr :: Nil) => (name, valExpr)
+      case _                                               => throw new EvalError("letrec: invalid binding")
+    }
+    for (name, _) <- parsed do letEnv.define(name, SchemeVal.Void)
+    for (name, valExpr) <- parsed do letEnv.define(name, eval(valExpr, letEnv))
+    evalBody(body, letEnv)
+
+  private def evalLetrecStar(bindings: List[Expr], body: List[Expr], env: Env): SchemeVal =
+    val letEnv = new Env(mutable.Map.empty, Some(env))
+    for b <- bindings do
+      b match
+        case Expr.SList(Expr.Symbol(name) :: valExpr :: Nil) =>
+          letEnv.define(name, eval(valExpr, letEnv))
+        case _ => throw new EvalError("letrec*: invalid binding")
+    evalBody(body, letEnv)
 
   def evalStr(input: String): String =
     val exprs = Parser.parse(input)

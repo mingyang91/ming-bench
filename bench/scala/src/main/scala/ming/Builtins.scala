@@ -146,7 +146,7 @@ object Builtins:
     )
   )
 
-  private def typePredicate(
+  private[ming] def typePredicate(
     name: String,
     test: SchemeVal => Boolean
   ): (String, SchemeVal) =
@@ -256,5 +256,7 @@ object Builtins:
       ++ NumericBuiltins.numericBuiltins
       ++ NumericBuiltins.listBuiltins
       ++ NumericBuiltins.exactnessBuiltins
+      ++ VectorBuiltins.vectorBuiltins
+      ++ VectorBuiltins.equalityBuiltins
     for (name, proc) <- allBuiltins do env.define(name, proc)
     env

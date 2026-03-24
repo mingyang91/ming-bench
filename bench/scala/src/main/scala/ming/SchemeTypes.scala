@@ -26,6 +26,7 @@ enum SchemeVal:
   case BuiltinProc(name: String, fn: List[SchemeVal] => SchemeVal)
   case Macro(literals: Set[String], rules: List[(Expr, Expr)], defEnv: Env)
   case CaseLambda(clauses: List[(List[String], Option[String], List[Expr], Env)])
+  case VectorVal(elems: Array[SchemeVal])
   case RecordVal(typeName: String, fields: Map[String, SchemeVal])
   case Void
 
@@ -46,16 +47,18 @@ enum SchemeVal:
     case CaseLambda(_)         => "#<procedure>"
     case BuiltinProc(name, _)  => s"#<procedure:$name>"
     case Macro(_, _, _)        => "#<macro>"
+    case VectorVal(elems)      => "#(" + elems.map(_.display).mkString(" ") + ")"
     case RecordVal(t, _)       => s"#<$t>"
     case Void                  => "#<void>"
 
   /** display format: no quotes on strings */
   def displayStr: String = this match
-    case StrVal(s)      => new String(s)
-    case ListVal(Nil)   => "()"
-    case ListVal(elems) => "(" + elems.map(_.displayStr).mkString(" ") + ")"
-    case PairVal(_, _)  => formatPair(_.displayStr)
-    case other          => other.display
+    case StrVal(s)        => new String(s)
+    case ListVal(Nil)     => "()"
+    case ListVal(elems)   => "(" + elems.map(_.displayStr).mkString(" ") + ")"
+    case VectorVal(elems) => "#(" + elems.map(_.displayStr).mkString(" ") + ")"
+    case PairVal(_, _)    => formatPair(_.displayStr)
+    case other            => other.display
 
   def isNumber: Boolean = this match
     case IntVal(_) | FloatVal(_) | RatVal(_, _) => true
