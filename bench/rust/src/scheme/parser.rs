@@ -161,6 +161,17 @@ impl Parser {
                     }
                 }
             }
+            Some('\'') => {
+                self.advance(); // skip '
+                let inner = self.parse_expr()?;
+                Ok(Spanned::new(
+                    Value::List(vec![
+                        Spanned::new(Value::Symbol("syntax".into()), span),
+                        inner,
+                    ]),
+                    span,
+                ))
+            }
             Some('\\') => {
                 self.advance(); // skip '\'
                 // Named characters

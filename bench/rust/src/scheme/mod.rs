@@ -3,6 +3,7 @@ mod cek;
 pub mod error;
 mod macros;
 mod parser;
+mod syntax_case;
 
 pub use error::EvalError;
 use error::Span;
@@ -26,6 +27,9 @@ pub(crate) type WindFrame = (Value, Value, u64); // in_thunk, out_thunk, marker
 thread_local! {
     pub(super) static WIND_STACK: RefCell<Vec<WindFrame>> = const { RefCell::new(Vec::new()) };
     pub(super) static EXCEPTION_HANDLERS: RefCell<Vec<ExceptionHandler>> = const { RefCell::new(Vec::new()) };
+    // syntax-case support: stack of pattern bindings and rename sink for hygiene
+    pub(super) static SYNTAX_CASE_BINDINGS: RefCell<Vec<macros::Bindings>> = const { RefCell::new(Vec::new()) };
+    pub(super) static SYNTAX_RENAME_SINK: RefCell<Vec<(String, Value)>> = const { RefCell::new(Vec::new()) };
 }
 
 #[derive(Clone)]
@@ -75,6 +79,7 @@ pub(crate) enum Value {
     RecordAccessor(u64, usize),           // type_id, field_index
     Continuation(Rc<Kont>, Vec<WindFrame>), // captured continuation + wind stack
     Values(Vec<Value>), // multiple return values (L21)
+    SyntaxTransformer(Box<Value>), // syntax-case macro transformer (wraps a Lambda)
     Void,
 }
 
@@ -97,6 +102,7 @@ impl PartialEq for Value {
             (Value::RecordAccessor(a, b), Value::RecordAccessor(c, d)) => a == c && b == d,
             (Value::Continuation(a, _), Value::Continuation(b, _)) => Rc::ptr_eq(a, b),
             (Value::Void, Value::Void) => true,
+            (Value::SyntaxTransformer(_), Value::SyntaxTransformer(_)) => false,
             _ => false,
         }
     }
@@ -150,7 +156,7 @@ impl Value {
             Value::Lambda(..) | Value::CaseLambda(..) | Value::Continuation(..) => "#<procedure>".into(),
             Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..) => "#<procedure>".into(),
             Value::Record(..) => "#<record>".into(),
-            Value::SyntaxRules { .. } => "#<syntax>".into(),
+            Value::SyntaxRules { .. } | Value::SyntaxTransformer(_) => "#<syntax>".into(),
             Value::Values(vs) => {
                 if vs.len() == 1 { vs[0].display_value() } else { "".into() }
             }
@@ -286,7 +292,7 @@ pub(super) fn env_update(env: &Env, name: &str, val: Value) -> bool {
 
 // --- TCO Trampoline ---
 
-enum Bounce {
+pub(super) enum Bounce {
     Done(Value),
     Tail(Spanned, Env),
 }
@@ -430,33 +436,50 @@ pub(super) fn eval_define_syntax(items: &[Spanned], env: &Env, span: Span) -> Re
     let Value::Symbol(macro_name) = &items[1].val else {
         return Err(EvalError::Type("define-syntax: expected symbol".into(), span));
     };
-    let Value::List(sr_parts) = &items[2].val else {
-        return Err(EvalError::Type("define-syntax: expected syntax-rules".into(), span));
+    let Value::List(parts) = &items[2].val else {
+        return Err(EvalError::Type("define-syntax: expected syntax-rules or lambda".into(), span));
     };
-    if sr_parts.is_empty() || !matches!(&sr_parts[0].val, Value::Symbol(s) if s == "syntax-rules") {
-        return Err(EvalError::Type("define-syntax: expected syntax-rules form".into(), span));
+    if parts.is_empty() {
+        return Err(EvalError::Type("define-syntax: empty transformer".into(), span));
     }
-    if sr_parts.len() < 2 {
-        return Err(EvalError::Arity("syntax-rules requires literals list".into(), span));
-    }
-    let Value::List(lit_list) = &sr_parts[1].val else {
-        return Err(EvalError::Type("syntax-rules: expected literals list".into(), span));
-    };
-    let literals: Vec<String> = lit_list.iter().filter_map(|l| {
-        if let Value::Symbol(s) = &l.val { Some(s.clone()) } else { None }
-    }).collect();
-    let mut rules = Vec::new();
-    for rule in &sr_parts[2..] {
-        let Value::List(parts) = &rule.val else {
-            return Err(EvalError::Type("syntax-rules: expected rule".into(), span));
-        };
-        if parts.len() != 2 {
-            return Err(EvalError::Arity("syntax-rules: rule needs pattern and template".into(), span));
+    match &parts[0].val {
+        Value::Symbol(s) if s == "syntax-rules" => {
+            if parts.len() < 2 {
+                return Err(EvalError::Arity("syntax-rules requires literals list".into(), span));
+            }
+            let Value::List(lit_list) = &parts[1].val else {
+                return Err(EvalError::Type("syntax-rules: expected literals list".into(), span));
+            };
+            let literals: Vec<String> = lit_list.iter().filter_map(|l| {
+                if let Value::Symbol(s) = &l.val { Some(s.clone()) } else { None }
+            }).collect();
+            let mut rules = Vec::new();
+            for rule in &parts[2..] {
+                let Value::List(rparts) = &rule.val else {
+                    return Err(EvalError::Type("syntax-rules: expected rule".into(), span));
+                };
+                if rparts.len() != 2 {
+                    return Err(EvalError::Arity("syntax-rules: rule needs pattern and template".into(), span));
+                }
+                rules.push((rparts[0].clone(), rparts[1].clone()));
+            }
+            let val = Value::SyntaxRules { literals, rules, def_env: env.clone() };
+            env_set(env, macro_name.clone(), val);
         }
-        rules.push((parts[0].clone(), parts[1].clone()));
+        Value::Symbol(s) if s == "lambda" => {
+            if parts.len() < 3 {
+                return Err(EvalError::Arity("lambda requires params and body".into(), span));
+            }
+            let Value::List(param_list) = &parts[1].val else {
+                return Err(EvalError::Type("lambda: expected parameter list".into(), span));
+            };
+            let (params, rest) = parse_params(param_list, "lambda", span)?;
+            let body = parts[2..].to_vec();
+            let lambda = Value::Lambda(params, rest, body, env.clone());
+            env_set(env, macro_name.clone(), Value::SyntaxTransformer(Box::new(lambda)));
+        }
+        _ => return Err(EvalError::Type("define-syntax: expected syntax-rules or lambda".into(), span)),
     }
-    let val = Value::SyntaxRules { literals, rules, def_env: env.clone() };
-    env_set(env, macro_name.clone(), val);
     Ok(())
 }
 
@@ -533,7 +556,7 @@ pub(super) fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, Eva
 fn eval_step(expr: &Spanned, env: &Env, out: &Output) -> Result<Bounce, EvalError> {
     let span = expr.span;
     match &expr.val {
-        Value::Integer(_) | Value::Float(_) | Value::Rational(..) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Pair(..) | Value::Lambda(..) | Value::CaseLambda(..) | Value::SyntaxRules { .. } | Value::Vector(..) | Value::Record(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..) | Value::Continuation(..) | Value::Values(..) => Ok(Bounce::Done(expr.val.clone())),
+        Value::Integer(_) | Value::Float(_) | Value::Rational(..) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Pair(..) | Value::Lambda(..) | Value::CaseLambda(..) | Value::SyntaxRules { .. } | Value::SyntaxTransformer(..) | Value::Vector(..) | Value::Record(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..) | Value::Continuation(..) | Value::Values(..) => Ok(Bounce::Done(expr.val.clone())),
         Value::Symbol(name) => {
             env_get(env, name).map(Bounce::Done).ok_or_else(|| EvalError::UnboundVariable(name.clone(), span))
         }
@@ -773,46 +796,32 @@ fn eval_step(expr: &Spanned, env: &Env, out: &Output) -> Result<Bounce, EvalErro
                         }
                     }
                     "define-syntax" => {
-                        if items.len() != 3 {
-                            return Err(EvalError::Arity("define-syntax requires 2 arguments".into(), span));
-                        }
-                        let Value::Symbol(macro_name) = &items[1].val else {
-                            return Err(EvalError::Type("define-syntax: expected symbol".into(), span));
-                        };
-                        let Value::List(sr_parts) = &items[2].val else {
-                            return Err(EvalError::Type("define-syntax: expected syntax-rules".into(), span));
-                        };
-                        if sr_parts.is_empty() || !matches!(&sr_parts[0].val, Value::Symbol(s) if s == "syntax-rules") {
-                            return Err(EvalError::Type("define-syntax: expected syntax-rules form".into(), span));
-                        }
-                        if sr_parts.len() < 2 {
-                            return Err(EvalError::Arity("syntax-rules requires literals list".into(), span));
-                        }
-                        let Value::List(lit_list) = &sr_parts[1].val else {
-                            return Err(EvalError::Type("syntax-rules: expected literals list".into(), span));
-                        };
-                        let literals: Vec<String> = lit_list.iter().filter_map(|l| {
-                            if let Value::Symbol(s) = &l.val { Some(s.clone()) } else { None }
-                        }).collect();
-                        let mut rules = Vec::new();
-                        for rule in &sr_parts[2..] {
-                            let Value::List(parts) = &rule.val else {
-                                return Err(EvalError::Type("syntax-rules: expected rule".into(), span));
-                            };
-                            if parts.len() != 2 {
-                                return Err(EvalError::Arity("syntax-rules: rule needs pattern and template".into(), span));
-                            }
-                            rules.push((parts[0].clone(), parts[1].clone()));
-                        }
-                        let val = Value::SyntaxRules { literals, rules, def_env: env.clone() };
-                        env_set(env, macro_name.clone(), val);
+                        eval_define_syntax(items, env, span)?;
                         return Ok(Bounce::Done(Value::Void));
+                    }
+                    "syntax-case" => {
+                        return syntax_case::eval_syntax_case(items, env, out, span);
+                    }
+                    "syntax" => {
+                        return syntax_case::eval_syntax_template(items, env, span);
+                    }
+                    "with-syntax" => {
+                        return syntax_case::eval_with_syntax(items, env, out, span);
                     }
                     _ => {
                         // Check for macro application
-                        if let Some(Value::SyntaxRules { ref literals, ref rules, ref def_env }) = env_get(env, name) {
-                            let expanded = expand_macro(items, literals, rules, def_env, env, span)?;
-                            return Ok(Bounce::Tail(expanded, env.clone()));
+                        if let Some(val) = env_get(env, name) {
+                            match val {
+                                Value::SyntaxRules { ref literals, ref rules, ref def_env } => {
+                                    let expanded = expand_macro(items, literals, rules, def_env, env, span)?;
+                                    return Ok(Bounce::Tail(expanded, env.clone()));
+                                }
+                                Value::SyntaxTransformer(ref transformer) => {
+                                    let expanded = syntax_case::expand_syntax_case_macro(items, transformer, env, out, span)?;
+                                    return Ok(Bounce::Tail(expanded, env.clone()));
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -1278,7 +1287,9 @@ fn make_global_env() -> Env {
                    // L20
                    "raise", "with-exception-handler", "guard",
                    // L21
-                   "values", "call-with-values"] {
+                   "values", "call-with-values",
+                   // L22
+                   "syntax->datum", "datum->syntax"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     env

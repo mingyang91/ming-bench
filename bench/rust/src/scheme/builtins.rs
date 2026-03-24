@@ -1106,6 +1106,15 @@ pub(crate) fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span
 
         "set-car!" | "set-cdr!" => builtin_pair_mutation(name, args, span),
 
+        "syntax->datum" => {
+            if args.len() != 1 { return Err(EvalError::Arity("syntax->datum requires 1 argument".into(), span)); }
+            Ok(args[0].clone())
+        }
+        "datum->syntax" => {
+            if args.len() != 2 { return Err(EvalError::Arity("datum->syntax requires 2 arguments".into(), span)); }
+            Ok(args[1].clone())
+        }
+
         "make-string" | "string" | "string<=?" | "string>=?" | "string>?" =>
             builtin_string_extra(name, args, span),
 

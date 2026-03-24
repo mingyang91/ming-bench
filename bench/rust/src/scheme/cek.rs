@@ -101,7 +101,7 @@ fn cek_eval_expr(expr: Spanned, env: Env, kont: Rc<Kont>, out: &Output) -> Resul
     match &expr.val {
         Value::Integer(_) | Value::Float(_) | Value::Rational(..) | Value::Boolean(_)
         | Value::Str(_) | Value::Char(_) | Value::Pair(..) | Value::Lambda(..)
-        | Value::CaseLambda(..) | Value::SyntaxRules { .. } | Value::Vector(..)
+        | Value::CaseLambda(..) | Value::SyntaxRules { .. } | Value::SyntaxTransformer(..) | Value::Vector(..)
         | Value::Record(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..)
         | Value::RecordAccessor(..) | Value::Continuation(..) | Value::Values(..) => {
             Ok(CekStep::Continue(CekState::ApplyKont(kont, expr.val.clone())))
@@ -303,10 +303,35 @@ fn cek_eval_expr(expr: Spanned, env: Env, kont: Rc<Kont>, out: &Output) -> Resul
                         let k = Rc::new(Kont::PopExceptionHandler { next: kont });
                         return eval_body_cek(&body, env, k);
                     }
+                    "syntax-case" | "syntax" | "with-syntax" => {
+                        // Delegate to tree-walker for syntax-case forms; wrap result in kont
+                        let out = &std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+                        let result = match name.as_str() {
+                            "syntax-case" => super::syntax_case::eval_syntax_case(items, &env, out, span),
+                            "syntax" => super::syntax_case::eval_syntax_template(items, &env, span),
+                            "with-syntax" => super::syntax_case::eval_with_syntax(items, &env, out, span),
+                            _ => unreachable!(),
+                        };
+                        match result {
+                            Ok(super::Bounce::Done(v)) => return Ok(CekStep::Continue(CekState::ApplyKont(kont, v))),
+                            Ok(super::Bounce::Tail(expr, env)) => return Ok(CekStep::Continue(CekState::Eval(expr, env, kont))),
+                            Err(e) => return Err(e),
+                        }
+                    }
                     _ => {
-                        if let Some(Value::SyntaxRules { ref literals, ref rules, ref def_env }) = env_get(&env, name) {
-                            let expanded = expand_macro(items, literals, rules, def_env, &env, span)?;
-                            return Ok(CekStep::Continue(CekState::Eval(expanded, env, kont)));
+                        if let Some(val) = env_get(&env, name) {
+                            match val {
+                                Value::SyntaxRules { ref literals, ref rules, ref def_env } => {
+                                    let expanded = expand_macro(items, literals, rules, def_env, &env, span)?;
+                                    return Ok(CekStep::Continue(CekState::Eval(expanded, env, kont)));
+                                }
+                                Value::SyntaxTransformer(ref transformer) => {
+                                    let out = &std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+                                    let expanded = super::syntax_case::expand_syntax_case_macro(items, transformer, &env, out, span)?;
+                                    return Ok(CekStep::Continue(CekState::Eval(expanded, env, kont)));
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }

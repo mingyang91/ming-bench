@@ -8,14 +8,14 @@ const SPECIAL_FORMS: &[&str] = &[
 ];
 
 #[derive(Clone)]
-enum PatternBinding {
+pub(super) enum PatternBinding {
     Single(Spanned),
     List(Vec<Spanned>),
 }
 
-type Bindings = HashMap<String, PatternBinding>;
+pub(super) type Bindings = HashMap<String, PatternBinding>;
 
-fn match_pattern(
+pub(super) fn match_pattern(
     pattern: &[Spanned],
     input: &[Spanned],
     literals: &[String],
@@ -52,7 +52,7 @@ fn match_pattern(
     ii == input.len()
 }
 
-fn match_single(
+pub(super) fn match_single(
     pattern: &Spanned,
     input: &Spanned,
     literals: &[String],
@@ -122,7 +122,7 @@ fn expand_ellipsis_template(
     }
 }
 
-fn instantiate_template(
+pub(super) fn instantiate_template(
     template: &Spanned,
     bindings: &Bindings,
     renames: &HashMap<String, String>,
@@ -141,6 +141,14 @@ fn instantiate_template(
             }
         }
         Value::List(elems) => {
+            // Don't substitute inside quoted forms
+            if !elems.is_empty() {
+                if let Value::Symbol(s) = &elems[0].val {
+                    if s == "quote" {
+                        return template.clone();
+                    }
+                }
+            }
             let mut result = Vec::new();
             let mut i = 0;
             while i < elems.len() {
@@ -160,7 +168,7 @@ fn instantiate_template(
     }
 }
 
-fn collect_free_vars(template: &Spanned, pattern_vars: &HashSet<String>) -> HashSet<String> {
+pub(super) fn collect_free_vars(template: &Spanned, pattern_vars: &HashSet<String>) -> HashSet<String> {
     match &template.val {
         Value::Symbol(name) if !pattern_vars.contains(name) && name != "..." => {
             let mut set = HashSet::new();
@@ -168,6 +176,14 @@ fn collect_free_vars(template: &Spanned, pattern_vars: &HashSet<String>) -> Hash
             set
         }
         Value::List(elems) => {
+            // Skip quoted forms — symbols inside quote are data, not references
+            if !elems.is_empty() {
+                if let Value::Symbol(s) = &elems[0].val {
+                    if s == "quote" {
+                        return HashSet::new();
+                    }
+                }
+            }
             let mut set = HashSet::new();
             for elem in elems {
                 set.extend(collect_free_vars(elem, pattern_vars));
