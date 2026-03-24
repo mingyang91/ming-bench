@@ -56,8 +56,9 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 
 // tailCall is a sentinel value for tail call optimization (trampoline).
 type tailCall struct {
-	expr *Expr
-	env  *Env
+	expr      *Expr
+	env       *Env
+	popFrames int // number of contFrameStack frames to pop after resolution
 }
 
 func (t *tailCall) String() string { return "" }
@@ -85,15 +86,27 @@ var exceptionHandlerStack []Value
 
 // eval evaluates an expression in the given environment using a trampoline for TCO.
 func eval(expr *Expr, env *Env) (Value, error) {
+	pendingPops := 0
 	for {
 		result, err := evalStep(expr, env)
 		if err != nil {
+			for i := 0; i < pendingPops; i++ {
+				if len(contFrameStack) > 0 {
+					contFrameStack = contFrameStack[:len(contFrameStack)-1]
+				}
+			}
 			return nil, err
 		}
 		if tc, ok := result.(*tailCall); ok {
+			pendingPops += tc.popFrames
 			expr = tc.expr
 			env = tc.env
 			continue
+		}
+		for i := 0; i < pendingPops; i++ {
+			if len(contFrameStack) > 0 {
+				contFrameStack = contFrameStack[:len(contFrameStack)-1]
+			}
 		}
 		return result, nil
 	}
@@ -172,21 +185,37 @@ func callWithContRecover(k *ContinuationVal, fn func() (Value, error)) (result V
 		return nil, err
 	}
 	// Resolve tail calls from proc
+	pendingPops := 0
 	for {
 		if tc, ok := result.(*tailCall); ok {
+			pendingPops += tc.popFrames
 			result, err = evalStep(tc.expr, tc.env)
 			if err != nil {
+				for i := 0; i < pendingPops; i++ {
+					if len(contFrameStack) > 0 {
+						contFrameStack = contFrameStack[:len(contFrameStack)-1]
+					}
+				}
 				return nil, err
 			}
 			continue
 		}
 		break
 	}
+	for i := 0; i < pendingPops; i++ {
+		if len(contFrameStack) > 0 {
+			contFrameStack = contFrameStack[:len(contFrameStack)-1]
+		}
+	}
 	return result, err
 }
 
 // callccInjectValue, when non-nil, makes the next call/cc return this value directly.
-var callccInjectValue *Value
+// callccInject holds the value to inject into a specific call/cc during continuation replay.
+var callccInject *struct {
+	value      Value
+	targetExpr *Expr // if non-nil, only the call/cc at this expression consumes the inject
+}
 
 // windDummyExpr is used for error context when calling wind thunks.
 var windDummyExpr = &Expr{Kind: ExprList, List: []*Expr{{Kind: ExprSymbol, SVal: "dynamic-wind"}}}
@@ -200,13 +229,25 @@ func callThunk(thunk Value, callExpr *Expr) (Value, error) {
 	if err != nil {
 		return nil, err
 	}
+	pendingPops := 0
 	for {
 		tc, ok := result.(*tailCall)
 		if !ok {
+			for i := 0; i < pendingPops; i++ {
+				if len(contFrameStack) > 0 {
+					contFrameStack = contFrameStack[:len(contFrameStack)-1]
+				}
+			}
 			return result, nil
 		}
+		pendingPops += tc.popFrames
 		result, err = evalStep(tc.expr, tc.env)
 		if err != nil {
+			for i := 0; i < pendingPops; i++ {
+				if len(contFrameStack) > 0 {
+					contFrameStack = contFrameStack[:len(contFrameStack)-1]
+				}
+			}
 			return nil, err
 		}
 	}
@@ -218,8 +259,14 @@ func execContinuation(cont *ContinuationVal, value Value) (Value, error) {
 	contFrameStack = nil
 	defer func() { contFrameStack = savedStack }()
 
-	// Set inject value so the next call/cc returns it directly
-	callccInjectValue = &value
+	// Note: dynamic-wind restoration is handled by frame replay re-evaluating
+	// the dynamic-wind expression, which naturally calls in/out thunks.
+
+	// Set inject value so the matching call/cc returns it directly
+	callccInject = &struct {
+		value      Value
+		targetExpr *Expr
+	}{value: value, targetExpr: cont.CallCCExpr}
 
 	var result Value
 	var err error
@@ -238,7 +285,20 @@ func execContinuation(cont *ContinuationVal, value Value) (Value, error) {
 
 		startIdx := frame.Idx
 		if !isInnermost {
-			// Outer frames: skip the expression at idx (handled by inner frames)
+			// Outer frames: complete define/set! at idx using inner result, then skip
+			expr := frame.Exprs[frame.Idx]
+			if expr.Kind == ExprList && len(expr.List) >= 3 && expr.List[0].Kind == ExprSymbol {
+				switch expr.List[0].SVal {
+				case "define":
+					if expr.List[1].Kind == ExprSymbol {
+						frame.Env.Set(expr.List[1].SVal, result)
+					}
+				case "set!":
+					if expr.List[1].Kind == ExprSymbol {
+						frame.Env.SetMut(expr.List[1].SVal, result)
+					}
+				}
+			}
 			startIdx = frame.Idx + 1
 		}
 		for i := startIdx; i < len(frame.Exprs); i++ {
@@ -363,7 +423,9 @@ func evalList(expr *Expr, env *Env) (Value, error) {
 	}
 
 	// apply
+	trackLambdaBody = true
 	result, err := applyProc(op, args, expr)
+	trackLambdaBody = false
 	if err != nil {
 		return nil, err
 	}
@@ -809,6 +871,10 @@ func builtinNot(args []Value) (Value, error) {
 	return &BoolVal{Val: !isTruthy(args[0])}, nil
 }
 
+// trackLambdaBody controls whether applyProc pushes contFrames for lambda bodies.
+// Only normal function applications (from evalList) should track body frames.
+var trackLambdaBody bool
+
 // applyProc applies a procedure (builtin or lambda) to arguments.
 func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 	switch fn := op.(type) {
@@ -838,6 +904,21 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 				rest = &PairVal{Car: args[i], Cdr: rest}
 			}
 			childEnv.Set(fn.RestParam, rest)
+		}
+		if len(fn.Body) > 1 && trackLambdaBody {
+			contFrameStack = append(contFrameStack, contFrame{Kind: frameBody, Exprs: fn.Body, Env: childEnv})
+			for i, bodyExpr := range fn.Body[:len(fn.Body)-1] {
+				contFrameStack[len(contFrameStack)-1].Idx = i
+				_, err := eval(bodyExpr, childEnv)
+				if err != nil {
+					if len(contFrameStack) > 0 {
+						contFrameStack = contFrameStack[:len(contFrameStack)-1]
+					}
+					return nil, err
+				}
+			}
+			contFrameStack[len(contFrameStack)-1].Idx = len(fn.Body) - 1
+			return &tailCall{expr: fn.Body[len(fn.Body)-1], env: childEnv, popFrames: 1}, nil
 		}
 		for _, bodyExpr := range fn.Body[:len(fn.Body)-1] {
 			_, err := eval(bodyExpr, childEnv)
@@ -1038,17 +1119,19 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: call/cc: expected 1 argument, got %d", callExpr.Line, callExpr.Col, len(args))}
 		}
 		// If an inject value is set (re-evaluation from continuation), return it directly
-		if callccInjectValue != nil {
-			val := *callccInjectValue
-			callccInjectValue = nil
-			return val, nil
+		if callccInject != nil {
+			if callccInject.targetExpr == nil || callccInject.targetExpr == callExpr {
+				val := callccInject.value
+				callccInject = nil
+				return val, nil
+			}
 		}
 		// Capture current continuation (snapshot the frame stack and wind stack)
 		frames := make([]contFrame, len(contFrameStack))
 		copy(frames, contFrameStack)
 		winds := make([]windRecord, len(dynamicWindStack))
 		copy(winds, dynamicWindStack)
-		k := &ContinuationVal{Frames: frames, WindStack: winds}
+		k := &ContinuationVal{Frames: frames, WindStack: winds, CallCCExpr: callExpr}
 		// Call proc(k) with escape continuation recovery
 		result, err := callWithContRecover(k, func() (Value, error) {
 			return applyProc(args[0], []Value{k}, callExpr)
@@ -1098,15 +1181,27 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 				return nil, err
 			}
 			// Resolve tail calls
+			handlerPops := 0
 			for {
 				if tc, ok := result.(*tailCall); ok {
+					handlerPops += tc.popFrames
 					result, err = evalStep(tc.expr, tc.env)
 					if err != nil {
+						for i := 0; i < handlerPops; i++ {
+							if len(contFrameStack) > 0 {
+								contFrameStack = contFrameStack[:len(contFrameStack)-1]
+							}
+						}
 						return nil, err
 					}
 					continue
 				}
 				break
+			}
+			for i := 0; i < handlerPops; i++ {
+				if len(contFrameStack) > 0 {
+					contFrameStack = contFrameStack[:len(contFrameStack)-1]
+				}
 			}
 			return result, nil
 		}

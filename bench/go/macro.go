@@ -121,9 +121,9 @@ func expandMacro(sv *SyntaxVal, callExpr *Expr, useEnv *Env) (Value, error) {
 						evalEnv.Set(gs, v)
 					}
 				}
-				return eval(expanded, evalEnv)
+				return &tailCall{expr: expanded, env: evalEnv}, nil
 			}
-			return eval(expanded, useEnv)
+			return &tailCall{expr: expanded, env: useEnv}, nil
 		}
 	}
 	return nil, &EvalError{Message: fmt.Sprintf("no matching pattern for macro %s", sv.Name)}
@@ -328,7 +328,16 @@ func expandTransformerMacro(tv *TransformerVal, callExpr *Expr, useEnv *Env) (Va
 		return nil, err
 	}
 	// Handle tail call from applyProc
-	if tc, ok := result.(*tailCall); ok {
+	for {
+		tc, ok := result.(*tailCall)
+		if !ok {
+			break
+		}
+		for i := 0; i < tc.popFrames; i++ {
+			if len(contFrameStack) > 0 {
+				contFrameStack = contFrameStack[:len(contFrameStack)-1]
+			}
+		}
 		result, err = eval(tc.expr, tc.env)
 		if err != nil {
 			return nil, err
@@ -347,7 +356,7 @@ func expandTransformerMacro(tv *TransformerVal, callExpr *Expr, useEnv *Env) (Va
 			}
 		}
 	}
-	return eval(resultStx.Expr, useEnv)
+	return &tailCall{expr: resultStx.Expr, env: useEnv}, nil
 }
 
 // evalSyntaxCase handles (syntax-case expr (literals...) clause...)
@@ -407,7 +416,7 @@ func evalSyntaxCase(expr *Expr, env *Env) (Value, error) {
 				continue
 			}
 		}
-		return eval(clause.List[bodyIdx], childEnv)
+		return &tailCall{expr: clause.List[bodyIdx], env: childEnv}, nil
 	}
 	return nil, &EvalError{Message: "syntax-case: no matching clause"}
 }

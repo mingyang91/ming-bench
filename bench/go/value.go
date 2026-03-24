@@ -369,8 +369,9 @@ type windRecord struct {
 
 // ContinuationVal represents a captured first-class continuation.
 type ContinuationVal struct {
-	Frames    []contFrame
-	WindStack []windRecord
+	Frames     []contFrame
+	WindStack  []windRecord
+	CallCCExpr *Expr // the call/cc expression that captured this continuation
 }
 
 func (v *ContinuationVal) String() string { return "#<continuation>" }
