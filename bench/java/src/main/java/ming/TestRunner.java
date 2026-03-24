@@ -40,6 +40,8 @@ public class TestRunner {
             L27Tests.main(new String[0]);
             return;
         }
+        // L28 has both fixture tests (run below) and standalone concurrent tests
+        boolean runL28Standalone = (benchLevel == 28);
 
         String testsJsonPath = System.getenv("TESTS_JSON");
         if (testsJsonPath == null || testsJsonPath.isEmpty()) {
@@ -75,6 +77,10 @@ public class TestRunner {
             String kind = tc.get("kind").getAsString();
 
             if (benchLevel > 0 && level > benchLevel) {
+                continue;
+            }
+            // Surprise levels (27+): only run tests AT that level, not all previous
+            if (benchLevel >= 27 && level < benchLevel) {
                 continue;
             }
 
@@ -155,6 +161,12 @@ public class TestRunner {
                 System.out.println("FAIL " + testName + ": " + e.getClass().getSimpleName() + ": " + e.getMessage());
                 failed++;
             }
+        }
+
+        if (runL28Standalone && failed == 0) {
+            System.out.println(passed + " passed, " + failed + " failed out of " + total + " fixture tests");
+            // L28 standalone concurrent tests — L28Tests.main calls System.exit
+            L28Tests.main(new String[0]);
         }
 
         System.out.println(passed + " passed, " + failed + " failed out of " + total + " tests");

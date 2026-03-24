@@ -392,7 +392,7 @@ public class Evaluator {
             }
         }
         String output = outputBuffer.toString();
-        String result = (lastResult == null || lastResult == VOID) ? null : schemeToString(lastResult);
+        String result = (lastResult == null || lastResult == VOID) ? null : displayString(lastResult);
         return new EvalResult(result, output);
     }
 
