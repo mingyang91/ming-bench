@@ -54,6 +54,35 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	return res.String(), buf.String(), nil
 }
 
+// EvalStrWithLimit evaluates Scheme expressions with a step budget.
+// Each eval dispatch counts as one step. Returns an error if the budget is exhausted.
+func EvalStrWithLimit(input string, maxSteps int) (string, error) {
+	exprs, err := parse(input)
+	if err != nil {
+		return "", &EvalError{Message: err.Error()}
+	}
+	if len(exprs) == 0 {
+		return "", &EvalError{Message: "empty input"}
+	}
+
+	stepLimitEnabled = true
+	stepLimit = maxSteps
+	defer func() {
+		stepLimitEnabled = false
+		stepLimit = 0
+	}()
+
+	env := defaultEnv(nil)
+	result, err := evalTopLevel(exprs, env)
+	if err != nil {
+		return "", err
+	}
+	if _, ok := result.(*VoidVal); ok {
+		return "", nil
+	}
+	return result.String(), nil
+}
+
 // tailCall is a sentinel value for tail call optimization (trampoline).
 type tailCall struct {
 	expr      *Expr
@@ -84,10 +113,25 @@ var windIDCounter int
 // exceptionHandlerStack tracks active exception handlers installed by with-exception-handler.
 var exceptionHandlerStack []Value
 
+// stepLimit tracks the remaining step budget. 0 means unlimited.
+var stepLimit int
+var stepLimitEnabled bool
+
 // eval evaluates an expression in the given environment using a trampoline for TCO.
 func eval(expr *Expr, env *Env) (Value, error) {
 	pendingPops := 0
 	for {
+		if stepLimitEnabled {
+			if stepLimit <= 0 {
+				for i := 0; i < pendingPops; i++ {
+					if len(contFrameStack) > 0 {
+						contFrameStack = contFrameStack[:len(contFrameStack)-1]
+					}
+				}
+				return nil, &EvalError{Message: "step limit exceeded"}
+			}
+			stepLimit--
+		}
 		result, err := evalStep(expr, env)
 		if err != nil {
 			for i := 0; i < pendingPops; i++ {
