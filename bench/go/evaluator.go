@@ -42,10 +42,19 @@ type value struct {
 	cval   rune
 	pair   *pair
 	lambda *lambda
+	mstr   *[]rune // mutable string buffer (set by string-copy)
 }
 
 var voidVal = value{kind: valVoid}
 var nullVal = value{kind: valNull}
+
+// strContent returns the string content, handling both immutable and mutable strings.
+func (v value) strContent() string {
+	if v.mstr != nil {
+		return string(*v.mstr)
+	}
+	return v.sval
+}
 
 func intVal(n int64) value  { return value{kind: valInteger, ival: n} }
 func boolVal(b bool) value  { return value{kind: valBoolean, bval: b} }
@@ -66,6 +75,9 @@ func (v value) String() string {
 		}
 		return "#f"
 	case valString:
+		if v.mstr != nil {
+			return `"` + string(*v.mstr) + `"`
+		}
 		return `"` + v.sval + `"`
 	case valSymbol:
 		return v.sval
@@ -88,6 +100,9 @@ func (v value) String() string {
 func (v value) displayStr() string {
 	switch v.kind {
 	case valString:
+		if v.mstr != nil {
+			return string(*v.mstr)
+		}
 		return v.sval
 	case valPair:
 		return "(" + displayPairInner(v) + ")"
@@ -400,6 +415,23 @@ func parseAtom(text string) value {
 	if text == "#f" {
 		return boolVal(false)
 	}
+	// Character literals: #\x, #\space, #\newline, #\tab
+	if len(text) >= 3 && text[0] == '#' && text[1] == '\\' {
+		name := text[2:]
+		switch name {
+		case "space":
+			return charVal(' ')
+		case "newline":
+			return charVal('\n')
+		case "tab":
+			return charVal('\t')
+		default:
+			runes := []rune(name)
+			if len(runes) == 1 {
+				return charVal(runes[0])
+			}
+		}
+	}
 	if len(text) >= 2 && text[0] == '"' && text[len(text)-1] == '"' {
 		return strVal(text[1 : len(text)-1])
 	}
@@ -608,7 +640,8 @@ func isBuiltin(name string) bool {
 		"string?", "number?", "boolean?", "pair?", "symbol?", "char?",
 		"display", "write", "newline",
 		"string-append", "string-length", "substring", "string-ref",
-		"string->number", "number->string", "symbol->string", "string->symbol":
+		"string->number", "number->string", "symbol->string", "string->symbol",
+		"string-copy", "string-set!":
 		return true
 	}
 	return false
@@ -837,7 +870,7 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 			if v.kind != valString {
 				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-append: expected string", e.line, e.col)}
 			}
-			sb.WriteString(v.sval)
+			sb.WriteString(v.strContent())
 		}
 		return strVal(sb.String()), nil
 
@@ -848,7 +881,7 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 		if args[0].kind != valString {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-length: expected string", e.line, e.col)}
 		}
-		return intVal(int64(len([]rune(args[0].sval)))), nil
+		return intVal(int64(len([]rune(args[0].strContent())))), nil
 
 	case "substring":
 		if len(args) != 3 {
@@ -857,7 +890,7 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 		if args[0].kind != valString || args[1].kind != valInteger || args[2].kind != valInteger {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: substring: invalid argument types", e.line, e.col)}
 		}
-		runes := []rune(args[0].sval)
+		runes := []rune(args[0].strContent())
 		start, end := int(args[1].ival), int(args[2].ival)
 		if start < 0 || end < start || end > len(runes) {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: substring: index out of range", e.line, e.col)}
@@ -871,7 +904,7 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 		if args[0].kind != valString || args[1].kind != valInteger {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: invalid argument types", e.line, e.col)}
 		}
-		runes := []rune(args[0].sval)
+		runes := []rune(args[0].strContent())
 		idx := int(args[1].ival)
 		if idx < 0 || idx >= len(runes) {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: index out of range", e.line, e.col)}
@@ -885,7 +918,7 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 		if args[0].kind != valString {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string->number: expected string", e.line, e.col)}
 		}
-		n, err := strconv.ParseInt(args[0].sval, 10, 64)
+		n, err := strconv.ParseInt(args[0].strContent(), 10, 64)
 		if err != nil {
 			return boolVal(false), nil
 		}
@@ -916,7 +949,37 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 		if args[0].kind != valString {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string->symbol: expected string", e.line, e.col)}
 		}
-		return symVal(args[0].sval), nil
+		return symVal(args[0].strContent()), nil
+
+	case "string-copy":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-copy: expected 1 argument", e.line, e.col)}
+		}
+		if args[0].kind != valString {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-copy: expected string", e.line, e.col)}
+		}
+		runes := []rune(args[0].strContent())
+		return value{kind: valString, mstr: &runes}, nil
+
+	case "string-set!":
+		if len(args) != 3 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected 3 arguments", e.line, e.col)}
+		}
+		if args[0].kind != valString || args[0].mstr == nil {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected mutable string", e.line, e.col)}
+		}
+		if args[1].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected integer index", e.line, e.col)}
+		}
+		if args[2].kind != valChar {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected char", e.line, e.col)}
+		}
+		idx := int(args[1].ival)
+		if idx < 0 || idx >= len(*args[0].mstr) {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: index out of range", e.line, e.col)}
+		}
+		(*args[0].mstr)[idx] = args[2].cval
+		return voidVal, nil
 	}
 
 	return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", e.line, e.col, name)}
