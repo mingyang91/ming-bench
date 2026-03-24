@@ -2,12 +2,14 @@ pub mod error;
 mod builtins;
 mod macros;
 mod parser;
+mod values;
 
 use parser::{parse_all, Expr, Pos};
 
 pub use error::EvalError;
 use builtins::apply_builtin;
 use macros::{eval_define_syntax, expand_macro};
+use values::{values_eq, values_equal, values_eqv, is_proper_list};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -33,7 +35,7 @@ pub(super) enum Value {
     Str(String),
     Symbol(String),
     List(Vec<Value>),
-    Pair(Box<Value>, Box<Value>),
+    Pair(Rc<RefCell<(Value, Value)>>),
     Lambda {
         params: Vec<String>,
         rest_param: Option<String>,
@@ -92,6 +94,51 @@ fn make_rational(n: i64, d: i64) -> Value {
     }
 }
 
+pub(super) fn make_pair(car: Value, cdr: Value) -> Value {
+    Value::Pair(Rc::new(RefCell::new((car, cdr))))
+}
+
+pub(super) fn vec_to_pair_chain(elems: &[Value]) -> Value {
+    let mut result = Value::List(vec![]);
+    for e in elems.iter().rev() {
+        result = make_pair(e.clone(), result);
+    }
+    result
+}
+
+/// Convert a list-like value (List or pair chain) to a Vec.
+/// Returns None if not a proper list.
+pub(super) fn to_list_vec(val: &Value) -> Option<Vec<Value>> {
+    match val {
+        Value::List(elems) => Some(elems.clone()),
+        Value::Pair(_) => {
+            let mut result = Vec::new();
+            let mut cur = val.clone();
+            loop {
+                match &cur {
+                    Value::List(elems) => {
+                        if elems.is_empty() {
+                            return Some(result);
+                        }
+                        result.extend(elems.iter().cloned());
+                        return Some(result);
+                    }
+                    Value::Pair(p) => {
+                        let (car, cdr) = {
+                            let b = p.borrow();
+                            (b.0.clone(), b.1.clone())
+                        };
+                        result.push(car);
+                        cur = cdr;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -119,16 +166,35 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            Value::Pair(a, d) => {
-                write!(f, "({a}")?;
-                let mut cur = d.as_ref();
+            Value::Pair(p) => {
+                use std::collections::HashSet;
+                let mut seen = HashSet::new();
+                seen.insert(Rc::as_ptr(p) as usize);
+                let pair = p.borrow();
+                write!(f, "({}", pair.0)?;
+                let mut cur = pair.1.clone();
+                drop(pair);
                 loop {
-                    match cur {
-                        Value::Pair(ca, cd) => {
-                            write!(f, " {ca}")?;
-                            cur = cd.as_ref();
+                    match &cur {
+                        Value::Pair(p2) => {
+                            let ptr = Rc::as_ptr(p2) as usize;
+                            if !seen.insert(ptr) {
+                                write!(f, " ...")?;
+                                break;
+                            }
+                            let p2b = p2.borrow();
+                            write!(f, " {}", p2b.0)?;
+                            let next = p2b.1.clone();
+                            drop(p2b);
+                            cur = next;
                         }
                         Value::List(elems) if elems.is_empty() => break,
+                        Value::List(elems) => {
+                            for e in elems {
+                                write!(f, " {e}")?;
+                            }
+                            break;
+                        }
                         other => {
                             write!(f, " . {other}")?;
                             break;
@@ -182,18 +248,38 @@ impl Value {
                 }
                 write!(f, ")")
             }
-            Value::Pair(a, d) => {
+            Value::Pair(p) => {
+                use std::collections::HashSet;
+                let mut seen = HashSet::new();
+                seen.insert(Rc::as_ptr(p) as usize);
+                let pair = p.borrow();
                 write!(f, "(")?;
-                a.display_fmt(f)?;
-                let mut cur = d.as_ref();
+                pair.0.display_fmt(f)?;
+                let mut cur = pair.1.clone();
+                drop(pair);
                 loop {
-                    match cur {
-                        Value::Pair(ca, cd) => {
+                    match &cur {
+                        Value::Pair(p2) => {
+                            let ptr = Rc::as_ptr(p2) as usize;
+                            if !seen.insert(ptr) {
+                                write!(f, " ...")?;
+                                break;
+                            }
+                            let p2b = p2.borrow();
                             write!(f, " ")?;
-                            ca.display_fmt(f)?;
-                            cur = cd.as_ref();
+                            p2b.0.display_fmt(f)?;
+                            let next = p2b.1.clone();
+                            drop(p2b);
+                            cur = next;
                         }
                         Value::List(elems) if elems.is_empty() => break,
+                        Value::List(elems) => {
+                            for e in elems {
+                                write!(f, " ")?;
+                                e.display_fmt(f)?;
+                            }
+                            break;
+                        }
                         other => {
                             write!(f, " . ")?;
                             other.display_fmt(f)?;
@@ -321,6 +407,15 @@ pub(super) const BUILTINS: &[&str] = &[
     "vector->list", "list->vector",
     "memq", "assq",
     "for-each",
+    "set-car!", "set-cdr!",
+    "error",
+    "caar", "cadr", "cdar", "cddr", "caddr", "cadddr", "cadar", "caddar",
+    "reverse",
+    "member", "assv",
+    "make-string", "string",
+    "truncate", "round",
+    "string>?", "string<=?", "string>=?",
+    "gcd", "lcm",
 ];
 
 // ---------- Trampoline for TCO ----------
@@ -1248,68 +1343,6 @@ fn eval_do(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Resu
                 env_set(&local_env, name.clone(), val);
             }
         }
-    }
-}
-
-pub(super) fn values_eqv(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Boolean(a), Value::Boolean(b)) => a == b,
-        (Value::Integer(a), Value::Integer(b)) => a == b,
-        (Value::Float(a), Value::Float(b)) => a == b,
-        (Value::Rational(an, ad), Value::Rational(bn, bd)) => an == bn && ad == bd,
-        (Value::Symbol(a), Value::Symbol(b)) => a == b,
-        (Value::Char(a), Value::Char(b)) => a == b,
-        (Value::Str(a), Value::Str(b)) => a == b,
-        (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
-        _ => false,
-    }
-}
-
-pub(super) fn values_eq(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Boolean(a), Value::Boolean(b)) => a == b,
-        (Value::Integer(a), Value::Integer(b)) => a == b,
-        (Value::Float(a), Value::Float(b)) => a == b,
-        (Value::Rational(an, ad), Value::Rational(bn, bd)) => an == bn && ad == bd,
-        (Value::Symbol(a), Value::Symbol(b)) => a == b,
-        (Value::Char(a), Value::Char(b)) => a == b,
-        (Value::Str(a), Value::Str(b)) => std::ptr::eq(a.as_str(), b.as_str()),
-        (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
-        (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
-        (Value::Void, Value::Void) => true,
-        _ => false,
-    }
-}
-
-fn values_equal(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Boolean(a), Value::Boolean(b)) => a == b,
-        (Value::Integer(a), Value::Integer(b)) => a == b,
-        (Value::Float(a), Value::Float(b)) => a == b,
-        (Value::Rational(an, ad), Value::Rational(bn, bd)) => an == bn && ad == bd,
-        (Value::Symbol(a), Value::Symbol(b)) => a == b,
-        (Value::Char(a), Value::Char(b)) => a == b,
-        (Value::Str(a), Value::Str(b)) => a == b,
-        (Value::List(a), Value::List(b)) => {
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| values_equal(x, y))
-        }
-        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => {
-            values_equal(a1, b1) && values_equal(a2, b2)
-        }
-        (Value::Vector(a), Value::Vector(b)) => {
-            let a = a.borrow();
-            let b = b.borrow();
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| values_equal(x, y))
-        }
-        _ => false,
-    }
-}
-
-fn is_proper_list(v: &Value) -> bool {
-    match v {
-        Value::List(_) => true,
-        Value::Pair(_, d) => is_proper_list(d),
-        _ => false,
     }
 }
 
