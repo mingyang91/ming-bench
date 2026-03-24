@@ -30,6 +30,8 @@ thread_local! {
     // syntax-case support: stack of pattern bindings and rename sink for hygiene
     pub(super) static SYNTAX_CASE_BINDINGS: RefCell<Vec<macros::Bindings>> = const { RefCell::new(Vec::new()) };
     pub(super) static SYNTAX_RENAME_SINK: RefCell<Vec<(String, Value)>> = const { RefCell::new(Vec::new()) };
+    /// Step limit for eval_str_with_limit: None = unlimited, Some(n) = n steps remaining.
+    pub(super) static STEP_LIMIT: RefCell<Option<u64>> = const { RefCell::new(None) };
 }
 
 #[derive(Clone)]
@@ -537,10 +539,25 @@ pub(super) fn expand_macro(
 
 // --- Evaluator ---
 
+/// Decrement step counter; return Err if budget exhausted.
+pub(super) fn check_step_limit() -> Result<(), EvalError> {
+    STEP_LIMIT.with(|sl| {
+        let mut opt = sl.borrow_mut();
+        if let Some(ref mut remaining) = *opt {
+            if *remaining == 0 {
+                return Err(EvalError::StepLimitExceeded);
+            }
+            *remaining -= 1;
+        }
+        Ok(())
+    })
+}
+
 pub(super) fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
     let mut cur = expr.clone();
     let mut cur_env = env.clone();
     loop {
+        check_step_limit()?;
         match eval_step(&cur, &cur_env, out)? {
             Bounce::Done(v) => return Ok(v),
             Bounce::Tail(next, next_env) => {
@@ -1466,6 +1483,22 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let last = eval_exprs(&exprs, &env, &out)?;
     let output = out.borrow().clone();
     Ok((last.display_value(), output))
+}
+
+/// Evaluate Scheme expressions with a step budget.
+/// Each eval dispatch counts as one step; exceeding the limit returns an error.
+pub fn eval_str_with_limit(input: &str, max_steps: u64) -> Result<String, EvalError> {
+    let mut parser = Parser::new(input);
+    let exprs = parser.parse_all()?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse("no expressions".into(), Span { line: 1, col: 1 }));
+    }
+    STEP_LIMIT.with(|sl| *sl.borrow_mut() = Some(max_steps));
+    let env = make_global_env();
+    let out = Rc::new(RefCell::new(String::new()));
+    let result = eval_exprs(&exprs, &env, &out);
+    STEP_LIMIT.with(|sl| *sl.borrow_mut() = None);
+    result.map(|v| v.display_value())
 }
 
 #[cfg(test)]

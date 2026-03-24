@@ -10,6 +10,7 @@ use super::{
     eval_string_set_standalone, eval_do, expand_macro,
     WindFrame, WIND_STACK, WIND_COUNTER,
     ExceptionHandler, EXCEPTION_HANDLERS,
+    check_step_limit,
 };
 use super::error::{EvalError, Span};
 use super::parser::{parse_params, parse_params_from_value};
@@ -43,6 +44,7 @@ pub(super) fn cek_eval(exprs: &[Spanned], env: &Env, out: &Output) -> Result<Val
     let mut state = CekState::Eval(exprs[0].clone(), env.clone(), kont);
 
     loop {
+        check_step_limit()?;
         match cek_step(state, out) {
             Ok(CekStep::Continue(next)) => state = next,
             Ok(CekStep::Done(v)) => return Ok(v),
@@ -1057,6 +1059,7 @@ pub(super) fn expr_uses_callcc(expr: &Spanned) -> bool {
 pub(super) fn cek_resume(kont: Rc<Kont>, value: Value, out: &Output) -> Result<Value, EvalError> {
     let mut state = CekState::ApplyKont(kont, value);
     loop {
+        check_step_limit()?;
         match cek_step(state, out) {
             Ok(CekStep::Continue(next)) => state = next,
             Ok(CekStep::Done(v)) => return Ok(v),

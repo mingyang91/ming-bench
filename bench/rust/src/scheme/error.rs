@@ -29,4 +29,6 @@ pub enum EvalError {
     ContinuationInvoked,
     #[error("uncaught exception")]
     SchemeRaise(super::Value),
+    #[error("step limit exceeded")]
+    StepLimitExceeded,
 }
