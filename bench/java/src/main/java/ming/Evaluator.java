@@ -135,7 +135,16 @@ public class Evaluator {
         "symbol->string", "string->symbol",
         "string-ref", "char?",
         "string-set!", "string-copy",
-        "apply"
+        "apply",
+        // L09
+        "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
+        "zero?", "positive?", "negative?", "odd?", "even?",
+        "list-ref", "list-tail", "list?", "assoc", "map",
+        "eq?", "equal?",
+        "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
+        "char=?", "char<?",
+        "string=?", "string<?", "string-ci=?",
+        "string-upcase", "string-downcase"
     };
 
     private Env makeTopLevelEnv() {
@@ -827,6 +836,221 @@ public class Evaluator {
                 }
                 return applyProcedure(proc, finalArgs);
             }
+            // L09 — Numeric utilities
+            case "abs" -> {
+                requireArgCount(op, args, 1);
+                return Math.abs(requireLong(args.get(0)));
+            }
+            case "modulo" -> {
+                requireArgCount(op, args, 2);
+                long a = requireLong(args.get(0));
+                long b = requireLong(args.get(1));
+                if (b == 0) throw new EvalError(posStr() + "modulo: division by zero");
+                long r = a % b;
+                if (r != 0 && ((r > 0) != (b > 0))) r += b;
+                return r;
+            }
+            case "remainder" -> {
+                requireArgCount(op, args, 2);
+                long a = requireLong(args.get(0));
+                long b = requireLong(args.get(1));
+                if (b == 0) throw new EvalError(posStr() + "remainder: division by zero");
+                return a % b;
+            }
+            case "quotient" -> {
+                requireArgCount(op, args, 2);
+                long a = requireLong(args.get(0));
+                long b = requireLong(args.get(1));
+                if (b == 0) throw new EvalError(posStr() + "quotient: division by zero");
+                // Truncate toward zero (Java default for long division)
+                return a / b;
+            }
+            case "min" -> {
+                if (args.isEmpty()) throw new EvalError(posStr() + "min: requires at least 1 argument");
+                long result = requireLong(args.get(0));
+                for (int i = 1; i < args.size(); i++) {
+                    long v = requireLong(args.get(i));
+                    if (v < result) result = v;
+                }
+                return result;
+            }
+            case "max" -> {
+                if (args.isEmpty()) throw new EvalError(posStr() + "max: requires at least 1 argument");
+                long result = requireLong(args.get(0));
+                for (int i = 1; i < args.size(); i++) {
+                    long v = requireLong(args.get(i));
+                    if (v > result) result = v;
+                }
+                return result;
+            }
+            case "expt" -> {
+                requireArgCount(op, args, 2);
+                long base = requireLong(args.get(0));
+                long exp = requireLong(args.get(1));
+                long result = 1;
+                for (long i = 0; i < exp; i++) result *= base;
+                return result;
+            }
+            case "zero?" -> {
+                requireArgCount(op, args, 1);
+                return requireLong(args.get(0)) == 0;
+            }
+            case "positive?" -> {
+                requireArgCount(op, args, 1);
+                return requireLong(args.get(0)) > 0;
+            }
+            case "negative?" -> {
+                requireArgCount(op, args, 1);
+                return requireLong(args.get(0)) < 0;
+            }
+            case "odd?" -> {
+                requireArgCount(op, args, 1);
+                return requireLong(args.get(0)) % 2 != 0;
+            }
+            case "even?" -> {
+                requireArgCount(op, args, 1);
+                return requireLong(args.get(0)) % 2 == 0;
+            }
+            // L09 — List utilities
+            case "list-ref" -> {
+                requireArgCount(op, args, 2);
+                Object lst = args.get(0);
+                int idx = (int) requireLong(args.get(1));
+                for (int i = 0; i < idx; i++) {
+                    if (!(lst instanceof Pair p)) throw new EvalError(posStr() + "list-ref: index out of range");
+                    lst = p.cdr();
+                }
+                if (!(lst instanceof Pair p)) throw new EvalError(posStr() + "list-ref: index out of range");
+                return p.car();
+            }
+            case "list-tail" -> {
+                requireArgCount(op, args, 2);
+                Object lst = args.get(0);
+                int idx = (int) requireLong(args.get(1));
+                for (int i = 0; i < idx; i++) {
+                    if (!(lst instanceof Pair p)) throw new EvalError(posStr() + "list-tail: index out of range");
+                    lst = p.cdr();
+                }
+                return lst;
+            }
+            case "list?" -> {
+                requireArgCount(op, args, 1);
+                Object obj = args.get(0);
+                while (obj instanceof Pair p) {
+                    obj = p.cdr();
+                }
+                return obj == NIL;
+            }
+            case "assoc" -> {
+                requireArgCount(op, args, 2);
+                Object key = args.get(0);
+                Object alist = args.get(1);
+                while (alist instanceof Pair p) {
+                    if (p.car() instanceof Pair entry) {
+                        if (schemeEqual(key, entry.car())) return entry;
+                    }
+                    alist = p.cdr();
+                }
+                return Boolean.FALSE;
+            }
+            case "map" -> {
+                if (args.size() < 2) throw new EvalError(posStr() + "map: requires at least 2 arguments");
+                Object proc = args.get(0);
+                List<Object> lists = new ArrayList<>();
+                for (int i = 1; i < args.size(); i++) lists.add(args.get(i));
+                List<Object> results = new ArrayList<>();
+                while (true) {
+                    // Check if any list is exhausted
+                    boolean done = false;
+                    for (Object l : lists) {
+                        if (!(l instanceof Pair)) { done = true; break; }
+                    }
+                    if (done) break;
+                    List<Object> callArgs = new ArrayList<>();
+                    for (int i = 0; i < lists.size(); i++) {
+                        Pair p = (Pair) lists.get(i);
+                        callArgs.add(p.car());
+                        lists.set(i, p.cdr());
+                    }
+                    results.add(applyProcedure(proc, callArgs));
+                }
+                Object result = NIL;
+                for (int i = results.size() - 1; i >= 0; i--) {
+                    result = new Pair(results.get(i), result);
+                }
+                return result;
+            }
+            // L09 — Equality
+            case "eq?" -> {
+                requireArgCount(op, args, 2);
+                return schemeEq(args.get(0), args.get(1));
+            }
+            case "equal?" -> {
+                requireArgCount(op, args, 2);
+                return schemeEqual(args.get(0), args.get(1));
+            }
+            // L09 — Character utilities
+            case "char-alphabetic?" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError(posStr() + "char-alphabetic?: not a character");
+                return Character.isLetter(c.value());
+            }
+            case "char-numeric?" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError(posStr() + "char-numeric?: not a character");
+                return Character.isDigit(c.value());
+            }
+            case "char-upcase" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError(posStr() + "char-upcase: not a character");
+                return new SchemeChar(Character.toUpperCase(c.value()));
+            }
+            case "char-downcase" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError(posStr() + "char-downcase: not a character");
+                return new SchemeChar(Character.toLowerCase(c.value()));
+            }
+            case "char=?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeChar a)) throw new EvalError(posStr() + "char=?: not a character");
+                if (!(args.get(1) instanceof SchemeChar b)) throw new EvalError(posStr() + "char=?: not a character");
+                return a.value() == b.value();
+            }
+            case "char<?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeChar a)) throw new EvalError(posStr() + "char<?: not a character");
+                if (!(args.get(1) instanceof SchemeChar b)) throw new EvalError(posStr() + "char<?: not a character");
+                return a.value() < b.value();
+            }
+            // L09 — String comparison and case
+            case "string=?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeString a)) throw new EvalError(posStr() + "string=?: not a string");
+                if (!(args.get(1) instanceof SchemeString b)) throw new EvalError(posStr() + "string=?: not a string");
+                return a.value().equals(b.value());
+            }
+            case "string<?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeString a)) throw new EvalError(posStr() + "string<?: not a string");
+                if (!(args.get(1) instanceof SchemeString b)) throw new EvalError(posStr() + "string<?: not a string");
+                return a.value().compareTo(b.value()) < 0;
+            }
+            case "string-ci=?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeString a)) throw new EvalError(posStr() + "string-ci=?: not a string");
+                if (!(args.get(1) instanceof SchemeString b)) throw new EvalError(posStr() + "string-ci=?: not a string");
+                return a.value().equalsIgnoreCase(b.value());
+            }
+            case "string-upcase" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError(posStr() + "string-upcase: not a string");
+                return new SchemeString(s.value().toUpperCase());
+            }
+            case "string-downcase" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError(posStr() + "string-downcase: not a string");
+                return new SchemeString(s.value().toLowerCase());
+            }
             default -> throw new EvalError(posStr() + "unbound variable: " + op);
         }
     }
@@ -847,6 +1071,25 @@ public class Evaluator {
         return datum;
     }
 
+    private boolean schemeEq(Object a, Object b) {
+        if (a == b) return true;
+        if (a instanceof Long && b instanceof Long) return a.equals(b);
+        if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
+        if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
+        // Symbols are Java Strings — use equals
+        if (a instanceof String && b instanceof String) return a.equals(b);
+        return false;
+    }
+
+    private boolean schemeEqual(Object a, Object b) {
+        if (schemeEq(a, b)) return true;
+        if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
+        if (a instanceof Pair pa && b instanceof Pair pb) {
+            return schemeEqual(pa.car(), pb.car()) && schemeEqual(pa.cdr(), pb.cdr());
+        }
+        return false;
+    }
+
     private boolean isFalse(Object val) {
         return val instanceof Boolean b && !b;
     }
@@ -864,6 +1107,7 @@ public class Evaluator {
 
     private String displayString(Object val) {
         if (val instanceof SchemeString s) return s.value();
+        if (val instanceof SchemeChar c) return String.valueOf(c.value());
         return schemeToString(val);
     }
 
@@ -871,7 +1115,14 @@ public class Evaluator {
         if (val instanceof Long l) return l.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
-        if (val instanceof SchemeChar c) return "#\\" + c.value();
+        if (val instanceof SchemeChar c) {
+            return switch (c.value()) {
+                case ' ' -> "#\\space";
+                case '\n' -> "#\\newline";
+                case '\t' -> "#\\tab";
+                default -> "#\\" + c.value();
+            };
+        }
         if (val == NIL) return "()";
         if (val instanceof Pair) {
             StringBuilder sb = new StringBuilder("(");
