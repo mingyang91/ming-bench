@@ -252,6 +252,22 @@ func displayPair(v *PairVal) string {
 	return buf.String()
 }
 
+// RecordType describes a record type created by define-record-type.
+type RecordType struct {
+	Name   string
+	Fields []string
+}
+
+// RecordVal represents an instance of a record type.
+type RecordVal struct {
+	Type   *RecordType
+	Fields []Value
+}
+
+func (v *RecordVal) String() string {
+	return fmt.Sprintf("#<%s>", v.Type.Name)
+}
+
 // isTruthy returns true for all values except #f.
 func isTruthy(v Value) bool {
 	if b, ok := v.(*BoolVal); ok {

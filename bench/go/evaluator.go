@@ -119,6 +119,8 @@ func evalList(expr *Expr, env *Env) (Value, error) {
 			return evalSet(expr, env)
 		case "define-syntax":
 			return evalDefineSyntax(expr, env)
+		case "define-record-type":
+			return evalDefineRecordType(expr, env)
 		}
 
 		// macro expansion: check if head symbol is bound to a SyntaxVal
@@ -1822,4 +1824,117 @@ func builtinRationalQ(args []Value) (Value, error) {
 		return nil, fmt.Errorf("rational?: expected 1 argument, got %d", len(args))
 	}
 	return &BoolVal{Val: isExact(args[0])}, nil
+}
+
+// evalDefineRecordType implements R7RS define-record-type.
+// (define-record-type <name> (<constructor> <field-name> ...) <predicate> (<field> <accessor>) ...)
+func evalDefineRecordType(expr *Expr, env *Env) (Value, error) {
+	args := expr.List[1:]
+	if len(args) < 3 {
+		return nil, &EvalError{Message: "define-record-type: bad syntax"}
+	}
+
+	// 1. Type name (symbol like <point>)
+	if args[0].Kind != ExprSymbol {
+		return nil, &EvalError{Message: "define-record-type: expected type name"}
+	}
+	typeName := args[0].SVal
+
+	// 2. Constructor spec: (<constructor-name> <field-name> ...)
+	if args[1].Kind != ExprList || len(args[1].List) < 1 {
+		return nil, &EvalError{Message: "define-record-type: expected constructor spec"}
+	}
+	ctorSpec := args[1].List
+	if ctorSpec[0].Kind != ExprSymbol {
+		return nil, &EvalError{Message: "define-record-type: expected constructor name"}
+	}
+	ctorName := ctorSpec[0].SVal
+	var ctorFields []string
+	for _, f := range ctorSpec[1:] {
+		if f.Kind != ExprSymbol {
+			return nil, &EvalError{Message: "define-record-type: expected field name in constructor"}
+		}
+		ctorFields = append(ctorFields, f.SVal)
+	}
+
+	// 3. Predicate name
+	if args[2].Kind != ExprSymbol {
+		return nil, &EvalError{Message: "define-record-type: expected predicate name"}
+	}
+	predName := args[2].SVal
+
+	// 4. Field specs: (<field-name> <accessor-name>) ...
+	type fieldSpec struct {
+		name     string
+		accessor string
+	}
+	var fields []fieldSpec
+	for _, fspec := range args[3:] {
+		if fspec.Kind != ExprList || len(fspec.List) < 2 {
+			return nil, &EvalError{Message: "define-record-type: bad field spec"}
+		}
+		if fspec.List[0].Kind != ExprSymbol || fspec.List[1].Kind != ExprSymbol {
+			return nil, &EvalError{Message: "define-record-type: expected symbols in field spec"}
+		}
+		fields = append(fields, fieldSpec{name: fspec.List[0].SVal, accessor: fspec.List[1].SVal})
+	}
+
+	// Build field name -> index mapping
+	allFieldNames := make([]string, len(fields))
+	fieldIndex := make(map[string]int, len(fields))
+	for i, f := range fields {
+		allFieldNames[i] = f.name
+		fieldIndex[f.name] = i
+	}
+
+	// Build constructor field order -> record field index
+	ctorIndices := make([]int, len(ctorFields))
+	for i, cf := range ctorFields {
+		idx, ok := fieldIndex[cf]
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("define-record-type: constructor field %s not in field specs", cf)}
+		}
+		ctorIndices[i] = idx
+	}
+
+	rt := &RecordType{Name: typeName, Fields: allFieldNames}
+
+	// Define constructor
+	env.Set(ctorName, &BuiltinFunc{Name: ctorName, Fn: func(args []Value) (Value, error) {
+		if len(args) != len(ctorFields) {
+			return nil, fmt.Errorf("%s: expected %d arguments, got %d", ctorName, len(ctorFields), len(args))
+		}
+		fvals := make([]Value, len(allFieldNames))
+		for i, idx := range ctorIndices {
+			fvals[idx] = args[i]
+		}
+		return &RecordVal{Type: rt, Fields: fvals}, nil
+	}})
+
+	// Define predicate
+	env.Set(predName, &BuiltinFunc{Name: predName, Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("%s: expected 1 argument, got %d", predName, len(args))
+		}
+		rv, ok := args[0].(*RecordVal)
+		return &BoolVal{Val: ok && rv.Type == rt}, nil
+	}})
+
+	// Define accessors
+	for _, f := range fields {
+		idx := fieldIndex[f.name]
+		accName := f.accessor
+		env.Set(accName, &BuiltinFunc{Name: accName, Fn: func(args []Value) (Value, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("%s: expected 1 argument, got %d", accName, len(args))
+			}
+			rv, ok := args[0].(*RecordVal)
+			if !ok || rv.Type != rt {
+				return nil, fmt.Errorf("%s: expected %s, got %s", accName, typeName, args[0].String())
+			}
+			return rv.Fields[idx], nil
+		}})
+	}
+
+	return &VoidVal{}, nil
 }
