@@ -111,6 +111,21 @@ function parse(tokens) {
             pos++; // skip (
             const elements = [];
             while (pos < tokens.length && tokens[pos].type !== 'rparen') {
+                if (tokens[pos].type === 'dot') {
+                    pos++; // skip dot
+                    const cdr = parseExpr();
+                    if (pos >= tokens.length || tokens[pos].type !== 'rparen')
+                        throw new EvalError('expected ) after dot expression');
+                    pos++; // skip )
+                    let result = cdr;
+                    for (let i = elements.length - 1; i >= 0; i--) {
+                        result = { tag: 'pair', car: elements[i], cdr: result };
+                    }
+                    if (result.tag === 'pair' || result.tag === 'symbol') {
+                        result.pos = p;
+                    }
+                    return result;
+                }
                 elements.push(parseExpr());
             }
             if (pos >= tokens.length)
@@ -471,6 +486,28 @@ function makeGlobalEnv(outputBuf) {
                 throw new EvalError('char? requires exactly 1 argument');
             return { tag: 'boolean', value: args[0].tag === 'char' };
         } });
+    // L08: apply
+    env.set('apply', { tag: 'procedure', value: (...args) => {
+            if (args.length < 2)
+                throw new EvalError('apply requires at least 2 arguments');
+            const func = args[0];
+            if (func.tag !== 'procedure')
+                throw new EvalError('apply: first argument must be a procedure');
+            // Last argument must be a list, prefix args come before it
+            const lastArg = args[args.length - 1];
+            const prefixArgs = args.slice(1, args.length - 1);
+            // Convert last arg (pair list) to array
+            const listArgs = [];
+            let cur = lastArg;
+            while (cur.tag === 'pair') {
+                listArgs.push(cur.car);
+                cur = cur.cdr;
+            }
+            if (cur.tag !== 'nil')
+                throw new EvalError('apply: last argument must be a proper list');
+            const allArgs = [...prefixArgs, ...listArgs];
+            return func.value(...allArgs);
+        } });
     return env;
 }
 // --- Evaluator ---
@@ -482,6 +519,56 @@ function posStr(p) {
 }
 function errAt(msg, p) {
     return new EvalError(`${posStr(p)}: ${msg}`);
+}
+function parseParams(params) {
+    if (params.tag === 'symbol') {
+        // (lambda args body) — all args captured as rest
+        return { names: [], rest: params.value };
+    }
+    if (params.tag === 'list') {
+        const names = params.value.map(p => {
+            if (p.tag !== 'symbol')
+                throw errAt('parameter must be a symbol', p.pos);
+            return p.value;
+        });
+        return { names, rest: null };
+    }
+    if (params.tag === 'pair') {
+        // Improper list from dotted notation: (a b . rest)
+        const names = [];
+        let cur = params;
+        while (cur.tag === 'pair') {
+            if (cur.car.tag !== 'symbol')
+                throw errAt('parameter must be a symbol', cur.car.pos);
+            names.push(cur.car.value);
+            cur = cur.cdr;
+        }
+        if (cur.tag !== 'symbol')
+            throw errAt('rest parameter must be a symbol', cur.pos);
+        return { names, rest: cur.value };
+    }
+    throw errAt('invalid parameter list', params.pos);
+}
+function makeProcedure(paramInfo, bodyExprs, closureEnv) {
+    return { tag: 'procedure', value: (...args) => {
+            const childEnv = new Env(closureEnv);
+            for (let i = 0; i < paramInfo.names.length; i++) {
+                childEnv.set(paramInfo.names[i], args[i]);
+            }
+            if (paramInfo.rest !== null) {
+                // Collect remaining args into a list
+                let restList = NIL;
+                for (let i = args.length - 1; i >= paramInfo.names.length; i--) {
+                    restList = { tag: 'pair', car: args[i], cdr: restList };
+                }
+                childEnv.set(paramInfo.rest, restList);
+            }
+            let result = { tag: 'void' };
+            for (const b of bodyExprs) {
+                result = evaluate(b, childEnv);
+            }
+            return result;
+        } };
 }
 function evaluate(expr, env) {
     switch (expr.tag) {
@@ -521,24 +608,21 @@ function evaluate(expr, env) {
                         if (target.tag === 'list' && target.value.length > 0 && target.value[0].tag === 'symbol') {
                             // (define (f params...) body...)
                             const name = target.value[0].value;
-                            const paramNames = target.value.slice(1).map(p => {
-                                if (p.tag !== 'symbol')
-                                    throw errAt('parameter must be a symbol', p.pos);
-                                return p.value;
-                            });
+                            const paramsForm = { tag: 'list', value: target.value.slice(1), pos: target.pos };
+                            const paramInfo = parseParams(paramsForm);
                             const bodyExprs = elems.slice(2);
-                            const proc = { tag: 'procedure', value: (...args) => {
-                                    const childEnv = new Env(env);
-                                    for (let i = 0; i < paramNames.length; i++) {
-                                        childEnv.set(paramNames[i], args[i]);
-                                    }
-                                    let result = { tag: 'void' };
-                                    for (const b of bodyExprs) {
-                                        result = evaluate(b, childEnv);
-                                    }
-                                    return result;
-                                } };
-                            env.set(name, proc);
+                            env.set(name, makeProcedure(paramInfo, bodyExprs, env));
+                            return { tag: 'void' };
+                        }
+                        if (target.tag === 'pair' && target.car.tag === 'symbol') {
+                            // (define (f x . rest) body...) — dotted param list parsed as pair
+                            const name = target.car.value;
+                            const paramInfo = parseParams(target.cdr);
+                            // The first pair element is the function name, rest is params
+                            // Actually target is (f x . rest) parsed as pair chain
+                            // target.car = f, target.cdr = pair(x, symbol:rest)
+                            const bodyExprs = elems.slice(2);
+                            env.set(name, makeProcedure(paramInfo, bodyExprs, env));
                             return { tag: 'void' };
                         }
                         throw errAt('invalid define syntax', expr.pos);
@@ -580,26 +664,9 @@ function evaluate(expr, env) {
                     case 'lambda': {
                         if (elems.length < 3)
                             throw errAt('lambda requires params and body', expr.pos);
-                        const params = elems[1];
-                        if (params.tag !== 'list')
-                            throw errAt('lambda params must be a list', expr.pos);
-                        const paramNames = params.value.map(p => {
-                            if (p.tag !== 'symbol')
-                                throw errAt('parameter must be a symbol', p.pos);
-                            return p.value;
-                        });
+                        const paramInfo = parseParams(elems[1]);
                         const bodyExprs = elems.slice(2);
-                        return { tag: 'procedure', value: (...args) => {
-                                const childEnv = new Env(env);
-                                for (let i = 0; i < paramNames.length; i++) {
-                                    childEnv.set(paramNames[i], args[i]);
-                                }
-                                let result = { tag: 'void' };
-                                for (const b of bodyExprs) {
-                                    result = evaluate(b, childEnv);
-                                }
-                                return result;
-                            } };
+                        return makeProcedure(paramInfo, bodyExprs, env);
                     }
                     case 'and': {
                         if (elems.length === 1)
