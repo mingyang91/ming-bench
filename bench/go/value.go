@@ -81,12 +81,18 @@ func (v *VoidVal) String() string { return "" }
 
 // LambdaVal represents a user-defined closure.
 type LambdaVal struct {
-	Params []string
-	Body   []*Expr
-	Env    *Env
+	Params    []string
+	RestParam string // variadic rest parameter (empty if none)
+	Body      []*Expr
+	Env       *Env
 }
 
 func (v *LambdaVal) String() string { return "#<procedure>" }
+
+// ApplyVal is the first-class apply procedure.
+type ApplyVal struct{}
+
+func (v *ApplyVal) String() string { return "#<procedure apply>" }
 
 // CharVal represents a Scheme character.
 type CharVal struct {

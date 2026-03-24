@@ -190,7 +190,7 @@ func isSymbolStart(ch byte) bool {
 	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
 		ch == '!' || ch == '$' || ch == '%' || ch == '&' || ch == '*' ||
 		ch == '/' || ch == ':' || ch == '<' || ch == '=' || ch == '>' ||
-		ch == '?' || ch == '_' || ch == '~' || ch == '^'
+		ch == '?' || ch == '_' || ch == '~' || ch == '^' || ch == '.'
 }
 
 // Expr is a parsed Scheme expression with position info.

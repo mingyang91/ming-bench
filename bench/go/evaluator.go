@@ -252,6 +252,9 @@ func defaultEnv(output *strings.Builder) *Env {
 	env.Set("string-copy", &BuiltinFunc{Name: "string-copy", Fn: builtinStringCopy})
 	env.Set("string-set!", &BuiltinFunc{Name: "string-set!", Fn: builtinStringSet})
 
+	// L08 builtins
+	env.Set("apply", &ApplyVal{})
+
 	return env
 }
 
@@ -388,12 +391,25 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 		}
 		return result, nil
 	case *LambdaVal:
-		if len(args) != len(fn.Params) {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: expected %d arguments, got %d", callExpr.Line, callExpr.Col, len(fn.Params), len(args))}
+		if fn.RestParam != "" {
+			if len(args) < len(fn.Params) {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: expected at least %d arguments, got %d", callExpr.Line, callExpr.Col, len(fn.Params), len(args))}
+			}
+		} else {
+			if len(args) != len(fn.Params) {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: expected %d arguments, got %d", callExpr.Line, callExpr.Col, len(fn.Params), len(args))}
+			}
 		}
 		childEnv := NewEnv(fn.Env)
 		for i, p := range fn.Params {
 			childEnv.Set(p, args[i])
+		}
+		if fn.RestParam != "" {
+			rest := Value(&NilVal{})
+			for i := len(args) - 1; i >= len(fn.Params); i-- {
+				rest = &PairVal{Car: args[i], Cdr: rest}
+			}
+			childEnv.Set(fn.RestParam, rest)
 		}
 		var result Value
 		var err error
@@ -404,6 +420,34 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 			}
 		}
 		return result, nil
+	case *ApplyVal:
+		// (apply proc arg1 ... argList)
+		if len(args) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: expected at least 2 arguments", callExpr.Line, callExpr.Col)}
+		}
+		proc := args[0]
+		lastArg := args[len(args)-1]
+		// Flatten last argument (must be a list) with prefix args
+		var flatArgs []Value
+		for _, a := range args[1 : len(args)-1] {
+			flatArgs = append(flatArgs, a)
+		}
+		// Convert last arg (scheme list) to slice
+		cur := lastArg
+		for {
+			switch v := cur.(type) {
+			case *PairVal:
+				flatArgs = append(flatArgs, v.Car)
+				cur = v.Cdr
+				continue
+			case *NilVal:
+				// done
+			default:
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: last argument must be a list", callExpr.Line, callExpr.Col)}
+			}
+			break
+		}
+		return applyProc(proc, flatArgs, callExpr)
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", callExpr.List[0].Line, callExpr.List[0].Col)}
 	}
@@ -421,14 +465,11 @@ func evalDefine(expr *Expr, env *Env) (Value, error) {
 		if name.Kind != ExprSymbol {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol", name.Line, name.Col)}
 		}
-		params := make([]string, len(target.List)-1)
-		for i, p := range target.List[1:] {
-			if p.Kind != ExprSymbol {
-				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected parameter name", p.Line, p.Col)}
-			}
-			params[i] = p.SVal
+		params, rest, pErr := parseDottedParams(target.List[1:], "define")
+		if pErr != nil {
+			return nil, pErr
 		}
-		lam := &LambdaVal{Params: params, Body: expr.List[2:], Env: env}
+		lam := &LambdaVal{Params: params, RestParam: rest, Body: expr.List[2:], Env: env}
 		env.Set(name.SVal, lam)
 		return &VoidVal{}, nil
 	}
@@ -641,17 +682,55 @@ func evalLambda(expr *Expr, env *Env) (Value, error) {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad syntax", expr.Line, expr.Col)}
 	}
 	paramExpr := expr.List[1]
+	// Single symbol means all-variadic: (lambda args body)
+	if paramExpr.Kind == ExprSymbol {
+		return &LambdaVal{RestParam: paramExpr.SVal, Body: expr.List[2:], Env: env}, nil
+	}
 	if paramExpr.Kind != ExprList {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected parameter list", paramExpr.Line, paramExpr.Col)}
 	}
-	params := make([]string, len(paramExpr.List))
-	for i, p := range paramExpr.List {
-		if p.Kind != ExprSymbol {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected parameter name", p.Line, p.Col)}
-		}
-		params[i] = p.SVal
+	params, rest, err := parseDottedParams(paramExpr.List, "lambda")
+	if err != nil {
+		return nil, err
 	}
-	return &LambdaVal{Params: params, Body: expr.List[2:], Env: env}, nil
+	return &LambdaVal{Params: params, RestParam: rest, Body: expr.List[2:], Env: env}, nil
+}
+
+// parseDottedParams parses a parameter list that may contain dot notation.
+// e.g. (x y . rest) -> params=["x","y"], rest="rest"
+// e.g. (x y) -> params=["x","y"], rest=""
+// e.g. (. rest) -> params=[], rest="rest"
+func parseDottedParams(plist []*Expr, context string) ([]string, string, error) {
+	dotIdx := -1
+	for i, p := range plist {
+		if p.Kind == ExprSymbol && p.SVal == "." {
+			dotIdx = i
+			break
+		}
+	}
+	if dotIdx == -1 {
+		// No dot, all fixed params
+		params := make([]string, len(plist))
+		for i, p := range plist {
+			if p.Kind != ExprSymbol {
+				return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected parameter name", p.Line, p.Col, context)}
+			}
+			params[i] = p.SVal
+		}
+		return params, "", nil
+	}
+	// dot found: must have exactly one symbol after it
+	if dotIdx+2 != len(plist) || plist[dotIdx+1].Kind != ExprSymbol {
+		return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: %s: bad dot syntax in parameters", plist[dotIdx].Line, plist[dotIdx].Col, context)}
+	}
+	params := make([]string, dotIdx)
+	for i := 0; i < dotIdx; i++ {
+		if plist[i].Kind != ExprSymbol {
+			return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected parameter name", plist[i].Line, plist[i].Col, context)}
+		}
+		params[i] = plist[i].SVal
+	}
+	return params, plist[dotIdx+1].SVal, nil
 }
 
 // L03 builtins
