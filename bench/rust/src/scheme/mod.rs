@@ -23,6 +23,9 @@ pub(crate) fn gensym(base: &str) -> String {
 
 pub(crate) type Output = Rc<RefCell<String>>;
 
+/// A single lambda clause: (params, rest_param, body, closure_env).
+pub(crate) type LambdaClause = (Vec<String>, Option<String>, Vec<Spanned>, Env);
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Value {
     Integer(i64),
@@ -40,6 +43,7 @@ pub(crate) enum Value {
         rules: Vec<(Spanned, Spanned)>, // (pattern, template)
         def_env: Env,
     },
+    CaseLambda(Vec<LambdaClause>), // clauses: (params, rest, body, env)
     Record(u64, Vec<Value>),              // type_id, field values
     RecordConstructor(u64, usize),        // type_id, field_count
     RecordPredicate(u64),                 // type_id
@@ -81,7 +85,7 @@ impl Value {
                 format!("({})", inner.join(" "))
             }
             Value::Pair(a, b) => format!("({} . {})", a.display_value(), b.display_value()),
-            Value::Lambda(..) => "#<procedure>".into(),
+            Value::Lambda(..) | Value::CaseLambda(..) => "#<procedure>".into(),
             Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..) => "#<procedure>".into(),
             Value::Record(..) => "#<record>".into(),
             Value::SyntaxRules { .. } => "#<syntax>".into(),
@@ -190,7 +194,7 @@ fn apply_macro(
 fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
     let span = expr.span;
     match &expr.val {
-        Value::Integer(_) | Value::Float(_) | Value::Rational(..) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Pair(..) | Value::Lambda(..) | Value::SyntaxRules { .. } | Value::Record(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..) => Ok(expr.val.clone()),
+        Value::Integer(_) | Value::Float(_) | Value::Rational(..) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Pair(..) | Value::Lambda(..) | Value::CaseLambda(..) | Value::SyntaxRules { .. } | Value::Record(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..) => Ok(expr.val.clone()),
         Value::Symbol(name) => {
             env_get(env, name).ok_or_else(|| EvalError::UnboundVariable(name.clone(), span))
         }
@@ -258,6 +262,25 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         };
                         let body = items[2..].to_vec();
                         return Ok(Value::Lambda(params, rest, body, env.clone()));
+                    }
+                    "case-lambda" => {
+                        let mut clauses = Vec::new();
+                        for clause in &items[1..] {
+                            let Value::List(parts) = &clause.val else {
+                                return Err(EvalError::Type("case-lambda: clause must be a list".into(), span));
+                            };
+                            if parts.is_empty() {
+                                return Err(EvalError::Arity("case-lambda: clause must have formals and body".into(), span));
+                            }
+                            let (params, rest) = match &parts[0].val {
+                                Value::List(param_list) => parse_params(param_list, "case-lambda", span)?,
+                                Value::Symbol(s) => (vec![], Some(s.clone())),
+                                _ => return Err(EvalError::Type("case-lambda: expected parameter list".into(), span)),
+                            };
+                            let body = parts[1..].to_vec();
+                            clauses.push((params, rest, body, env.clone()));
+                        }
+                        return Ok(Value::CaseLambda(clauses));
                     }
                     "let" => return eval_let(&items[1..], env, out, span),
                     "begin" => {
@@ -460,6 +483,19 @@ fn apply(func: &Value, args: &[Value], out: &Output, span: Span) -> Result<Value
                 }
                 Ok(result)
             }
+        }
+        Value::CaseLambda(clauses) => {
+            for (params, rest, body, closure_env) in clauses {
+                let matches = if rest.is_some() {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    return apply(&Value::Lambda(params.clone(), rest.clone(), body.clone(), closure_env.clone()), args, out, span);
+                }
+            }
+            Err(EvalError::Arity(format!("case-lambda: no matching clause for {} arguments", args.len()), span))
         }
         Value::RecordConstructor(type_id, field_count) => {
             if args.len() != *field_count {
@@ -1249,6 +1285,11 @@ fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span) -> Result
             if args.len() != 1 { return Err(EvalError::Arity("char? requires 1 argument".into(), span)); }
             Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
         }
+        "procedure?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("procedure? requires 1 argument".into(), span)); }
+            let is_proc = matches!(&args[0], Value::Lambda(..) | Value::CaseLambda(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..));
+            Ok(Value::Boolean(is_proc))
+        }
         "apply" => {
             if args.len() < 2 {
                 return Err(EvalError::Arity("apply requires at least 2 arguments".into(), span));
@@ -1342,7 +1383,9 @@ fn make_global_env() -> Env {
                    "integer?", "rational?",
                    "exact?", "inexact?",
                    "exact->inexact", "inexact->exact",
-                   "numerator", "denominator"] {
+                   "numerator", "denominator",
+                   // L13
+                   "procedure?"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     env
