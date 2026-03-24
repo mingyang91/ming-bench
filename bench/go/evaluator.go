@@ -20,6 +20,7 @@ const (
 	valNil // empty list
 	valVoid
 	valLambda
+	valChar
 )
 
 type Value struct {
@@ -39,6 +40,7 @@ func intVal(n int64) *Value   { return &Value{typ: valInt, ival: n} }
 func boolVal(b bool) *Value   { return &Value{typ: valBool, bval: b} }
 func strVal(s string) *Value  { return &Value{typ: valString, sval: s} }
 func symVal(s string) *Value  { return &Value{typ: valSymbol, sval: s} }
+func charVal(c rune) *Value   { return &Value{typ: valChar, ival: int64(c)} }
 func nilVal() *Value          { return &Value{typ: valNil} }
 func voidVal() *Value         { return &Value{typ: valVoid} }
 
@@ -61,6 +63,18 @@ func (v *Value) String() string {
 		return "(" + pairStr(v) + ")"
 	case valVoid:
 		return ""
+	case valChar:
+		ch := rune(v.ival)
+		switch ch {
+		case ' ':
+			return `#\space`
+		case '\n':
+			return `#\newline`
+		case '\t':
+			return `#\tab`
+		default:
+			return `#\` + string(ch)
+		}
 	case valLambda:
 		return "#<procedure>"
 	default:
@@ -80,8 +94,37 @@ func pairStr(v *Value) string {
 	return strings.Join(parts, " ") + " . " + v.String()
 }
 
+// displayStr returns the display representation (no quotes on strings).
+func (v *Value) displayStr() string {
+	switch v.typ {
+	case valString:
+		return v.sval
+	case valPair:
+		return "(" + pairDisplayStr(v) + ")"
+	default:
+		return v.String()
+	}
+}
+
+func pairDisplayStr(v *Value) string {
+	var parts []string
+	for v.typ == valPair {
+		parts = append(parts, v.car.displayStr())
+		v = v.cdr
+	}
+	if v.typ == valNil {
+		return strings.Join(parts, " ")
+	}
+	return strings.Join(parts, " ") + " . " + v.displayStr()
+}
+
 func isTruthy(v *Value) bool {
 	return !(v.typ == valBool && !v.bval)
+}
+
+// interp holds interpreter state including output buffer.
+type interp struct {
+	output strings.Builder
 }
 
 // ---------- Tokenizer ----------
@@ -375,11 +418,11 @@ func (e *env) set(name string, v *Value) {
 	e.vars[name] = v
 }
 
-func eval(node *astNode, e *env) (*Value, error) {
+func eval(node *astNode, e *env, ip *interp) (*Value, error) {
 	if node.isAtom {
 		return evalAtom(node, e)
 	}
-	return evalList(node, e)
+	return evalList(node, e, ip)
 }
 
 func evalAtom(node *astNode, e *env) (*Value, error) {
@@ -400,7 +443,7 @@ func evalAtom(node *astNode, e *env) (*Value, error) {
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unexpected token", t.line, t.col)}
 }
 
-func evalList(node *astNode, e *env) (*Value, error) {
+func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 	if len(node.children) == 0 {
 		return nilVal(), nil
 	}
@@ -410,13 +453,13 @@ func evalList(node *astNode, e *env) (*Value, error) {
 	if first.isAtom && first.tok.kind == tokSymbol {
 		switch first.tok.sval {
 		case "and":
-			return evalAnd(node, e)
+			return evalAnd(node, e, ip)
 		case "or":
-			return evalOr(node, e)
+			return evalOr(node, e, ip)
 		case "define":
-			return evalDefine(node, e)
+			return evalDefine(node, e, ip)
 		case "if":
-			return evalIf(node, e)
+			return evalIf(node, e, ip)
 		case "quote":
 			if len(node.children) != 2 {
 				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quote: need 1 argument", node.line, node.col)}
@@ -425,16 +468,16 @@ func evalList(node *astNode, e *env) (*Value, error) {
 		case "lambda":
 			return evalLambda(node, e)
 		case "let":
-			return evalLet(node, e)
+			return evalLet(node, e, ip)
 		case "begin":
-			return evalBegin(node, e)
+			return evalBegin(node, e, ip)
 		case "cond":
-			return evalCond(node, e)
+			return evalCond(node, e, ip)
 		}
 	}
 
 	// Evaluate operator
-	op, err := eval(first, e)
+	op, err := eval(first, e, ip)
 	if err != nil {
 		return nil, err
 	}
@@ -442,7 +485,7 @@ func evalList(node *astNode, e *env) (*Value, error) {
 	// Evaluate arguments
 	args := make([]*Value, 0, len(node.children)-1)
 	for _, child := range node.children[1:] {
-		v, err := eval(child, e)
+		v, err := eval(child, e, ip)
 		if err != nil {
 			return nil, err
 		}
@@ -451,7 +494,7 @@ func evalList(node *astNode, e *env) (*Value, error) {
 
 	// Built-in functions (symbol-based dispatch via the value)
 	if op.typ == valSymbol {
-		return applyBuiltin(op.sval, args, node)
+		return applyBuiltin(op.sval, args, node, ip)
 	}
 
 	// Lambda application
@@ -466,7 +509,7 @@ func evalList(node *astNode, e *env) (*Value, error) {
 		var result *Value
 		for _, bodyExpr := range op.body {
 			var err error
-			result, err = eval(bodyExpr, localEnv)
+			result, err = eval(bodyExpr, localEnv, ip)
 			if err != nil {
 				return nil, err
 			}
@@ -477,13 +520,13 @@ func evalList(node *astNode, e *env) (*Value, error) {
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", node.line, node.col)}
 }
 
-func evalAnd(node *astNode, e *env) (*Value, error) {
+func evalAnd(node *astNode, e *env, ip *interp) (*Value, error) {
 	if len(node.children) == 1 {
 		return boolVal(true), nil
 	}
 	var result *Value
 	for _, child := range node.children[1:] {
-		v, err := eval(child, e)
+		v, err := eval(child, e, ip)
 		if err != nil {
 			return nil, err
 		}
@@ -495,13 +538,13 @@ func evalAnd(node *astNode, e *env) (*Value, error) {
 	return result, nil
 }
 
-func evalOr(node *astNode, e *env) (*Value, error) {
+func evalOr(node *astNode, e *env, ip *interp) (*Value, error) {
 	if len(node.children) == 1 {
 		return boolVal(false), nil
 	}
 	var result *Value
 	for _, child := range node.children[1:] {
-		v, err := eval(child, e)
+		v, err := eval(child, e, ip)
 		if err != nil {
 			return nil, err
 		}
@@ -513,14 +556,14 @@ func evalOr(node *astNode, e *env) (*Value, error) {
 	return result, nil
 }
 
-func evalDefine(node *astNode, e *env) (*Value, error) {
+func evalDefine(node *astNode, e *env, ip *interp) (*Value, error) {
 	if len(node.children) < 3 {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", node.line, node.col)}
 	}
 	target := node.children[1]
 	if target.isAtom && target.tok.kind == tokSymbol {
 		// (define x expr)
-		val, err := eval(node.children[2], e)
+		val, err := eval(node.children[2], e, ip)
 		if err != nil {
 			return nil, err
 		}
@@ -547,19 +590,19 @@ func evalDefine(node *astNode, e *env) (*Value, error) {
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", node.line, node.col)}
 }
 
-func evalIf(node *astNode, e *env) (*Value, error) {
+func evalIf(node *astNode, e *env, ip *interp) (*Value, error) {
 	if len(node.children) < 3 || len(node.children) > 4 {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: if: bad syntax", node.line, node.col)}
 	}
-	cond, err := eval(node.children[1], e)
+	cond, err := eval(node.children[1], e, ip)
 	if err != nil {
 		return nil, err
 	}
 	if isTruthy(cond) {
-		return eval(node.children[2], e)
+		return eval(node.children[2], e, ip)
 	}
 	if len(node.children) == 4 {
-		return eval(node.children[3], e)
+		return eval(node.children[3], e, ip)
 	}
 	return voidVal(), nil
 }
@@ -582,7 +625,7 @@ func evalLambda(node *astNode, e *env) (*Value, error) {
 	return &Value{typ: valLambda, params: params, body: node.children[2:], closure: e}, nil
 }
 
-func evalLet(node *astNode, e *env) (*Value, error) {
+func evalLet(node *astNode, e *env, ip *interp) (*Value, error) {
 	if len(node.children) < 3 {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", node.line, node.col)}
 	}
@@ -613,7 +656,7 @@ func evalLet(node *astNode, e *env) (*Value, error) {
 		if !name.isAtom || name.tok.kind != tokSymbol {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad binding", node.line, node.col)}
 		}
-		val, err := eval(b.children[1], e)
+		val, err := eval(b.children[1], e, ip)
 		if err != nil {
 			return nil, err
 		}
@@ -634,7 +677,7 @@ func evalLet(node *astNode, e *env) (*Value, error) {
 		var result *Value
 		for _, bodyExpr := range node.children[offset+1:] {
 			var err error
-			result, err = eval(bodyExpr, callEnv)
+			result, err = eval(bodyExpr, callEnv, ip)
 			if err != nil {
 				return nil, err
 			}
@@ -649,7 +692,7 @@ func evalLet(node *astNode, e *env) (*Value, error) {
 	var result *Value
 	for _, bodyExpr := range node.children[offset+1:] {
 		var err error
-		result, err = eval(bodyExpr, localEnv)
+		result, err = eval(bodyExpr, localEnv, ip)
 		if err != nil {
 			return nil, err
 		}
@@ -657,14 +700,14 @@ func evalLet(node *astNode, e *env) (*Value, error) {
 	return result, nil
 }
 
-func evalBegin(node *astNode, e *env) (*Value, error) {
+func evalBegin(node *astNode, e *env, ip *interp) (*Value, error) {
 	if len(node.children) < 2 {
 		return voidVal(), nil
 	}
 	var result *Value
 	for _, child := range node.children[1:] {
 		var err error
-		result, err = eval(child, e)
+		result, err = eval(child, e, ip)
 		if err != nil {
 			return nil, err
 		}
@@ -672,7 +715,7 @@ func evalBegin(node *astNode, e *env) (*Value, error) {
 	return result, nil
 }
 
-func evalCond(node *astNode, e *env) (*Value, error) {
+func evalCond(node *astNode, e *env, ip *interp) (*Value, error) {
 	for _, clause := range node.children[1:] {
 		if clause.isAtom || len(clause.children) < 2 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cond: bad clause", node.line, node.col)}
@@ -682,21 +725,21 @@ func evalCond(node *astNode, e *env) (*Value, error) {
 			var result *Value
 			for _, expr := range clause.children[1:] {
 				var err error
-				result, err = eval(expr, e)
+				result, err = eval(expr, e, ip)
 				if err != nil {
 					return nil, err
 				}
 			}
 			return result, nil
 		}
-		cond, err := eval(test, e)
+		cond, err := eval(test, e, ip)
 		if err != nil {
 			return nil, err
 		}
 		if isTruthy(cond) {
 			var result *Value
 			for _, expr := range clause.children[1:] {
-				result, err = eval(expr, e)
+				result, err = eval(expr, e, ip)
 				if err != nil {
 					return nil, err
 				}
@@ -740,7 +783,7 @@ func requireInts(args []*Value, name string, node *astNode) error {
 	return nil
 }
 
-func applyBuiltin(name string, args []*Value, node *astNode) (*Value, error) {
+func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value, error) {
 	switch name {
 	case "+":
 		if err := requireInts(args, "+", node); err != nil {
@@ -949,6 +992,120 @@ func applyBuiltin(name string, args []*Value, node *astNode) (*Value, error) {
 		}
 		return boolVal(args[0].typ == valSymbol), nil
 
+	case "char?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char?: need 1 argument", node.line, node.col)}
+		}
+		return boolVal(args[0].typ == valChar), nil
+
+	case "display":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: display: need 1 argument", node.line, node.col)}
+		}
+		ip.output.WriteString(args[0].displayStr())
+		return voidVal(), nil
+
+	case "write":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: write: need 1 argument", node.line, node.col)}
+		}
+		ip.output.WriteString(args[0].String())
+		return voidVal(), nil
+
+	case "newline":
+		if len(args) != 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: newline: need 0 arguments", node.line, node.col)}
+		}
+		ip.output.WriteString("\n")
+		return voidVal(), nil
+
+	case "string-append":
+		var buf strings.Builder
+		for _, a := range args {
+			if a.typ != valString {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-append: expected string", node.line, node.col)}
+			}
+			buf.WriteString(a.sval)
+		}
+		return strVal(buf.String()), nil
+
+	case "string-length":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-length: need 1 argument", node.line, node.col)}
+		}
+		if args[0].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-length: expected string", node.line, node.col)}
+		}
+		return intVal(int64(len([]rune(args[0].sval)))), nil
+
+	case "substring":
+		if len(args) != 3 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: substring: need 3 arguments", node.line, node.col)}
+		}
+		if args[0].typ != valString || args[1].typ != valInt || args[2].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: substring: bad arguments", node.line, node.col)}
+		}
+		runes := []rune(args[0].sval)
+		start, end := int(args[1].ival), int(args[2].ival)
+		if start < 0 || end < start || end > len(runes) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: substring: index out of range", node.line, node.col)}
+		}
+		return strVal(string(runes[start:end])), nil
+
+	case "string->number":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->number: need 1 argument", node.line, node.col)}
+		}
+		if args[0].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->number: expected string", node.line, node.col)}
+		}
+		n, err := strconv.ParseInt(args[0].sval, 10, 64)
+		if err != nil {
+			return boolVal(false), nil
+		}
+		return intVal(n), nil
+
+	case "number->string":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: number->string: need 1 argument", node.line, node.col)}
+		}
+		if args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: number->string: expected number", node.line, node.col)}
+		}
+		return strVal(strconv.FormatInt(args[0].ival, 10)), nil
+
+	case "symbol->string":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: symbol->string: need 1 argument", node.line, node.col)}
+		}
+		if args[0].typ != valSymbol {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: symbol->string: expected symbol", node.line, node.col)}
+		}
+		return strVal(args[0].sval), nil
+
+	case "string->symbol":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->symbol: need 1 argument", node.line, node.col)}
+		}
+		if args[0].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->symbol: expected string", node.line, node.col)}
+		}
+		return symVal(args[0].sval), nil
+
+	case "string-ref":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: need 2 arguments", node.line, node.col)}
+		}
+		if args[0].typ != valString || args[1].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: bad arguments", node.line, node.col)}
+		}
+		runes := []rune(args[0].sval)
+		idx := int(args[1].ival)
+		if idx < 0 || idx >= len(runes) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: index out of range", node.line, node.col)}
+		}
+		return charVal(runes[idx]), nil
+
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", node.line, node.col, name)}
 	}
@@ -958,41 +1115,51 @@ func makeGlobalEnv() *env {
 	e := newEnv(nil)
 	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
 		"cons", "car", "cdr", "null?", "list", "length",
-		"number?", "string?", "boolean?", "pair?", "symbol?",
-		"append"}
+		"number?", "string?", "boolean?", "pair?", "symbol?", "char?",
+		"append",
+		"display", "write", "newline",
+		"string-append", "string-length", "substring",
+		"string->number", "number->string",
+		"symbol->string", "string->symbol",
+		"string-ref"}
 	for _, name := range builtins {
 		e.set(name, symVal(name))
 	}
 	return e
 }
 
-// EvalStr evaluates one or more Scheme expressions and returns the string
-// representation of the last result.
-func EvalStr(input string) (string, error) {
+func evalAll(input string) (result string, output string, err error) {
 	p := newParser(input)
 	nodes, err := p.parseAll()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if len(nodes) == 0 {
-		return "", &EvalError{Message: "empty input"}
+		return "", "", &EvalError{Message: "empty input"}
 	}
 
 	e := makeGlobalEnv()
+	ip := &interp{}
 	var last *Value
 	for _, node := range nodes {
-		v, err := eval(node, e)
+		v, err := eval(node, e, ip)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		last = v
 	}
-	return last.String(), nil
+	return last.String(), ip.output.String(), nil
+}
+
+// EvalStr evaluates one or more Scheme expressions and returns the string
+// representation of the last result.
+func EvalStr(input string) (string, error) {
+	r, _, err := evalAll(input)
+	return r, err
 }
 
 // EvalStrWithOutput evaluates Scheme expressions and returns both the result
 // string and any captured output from display/write/newline.
 func EvalStrWithOutput(input string) (result string, output string, err error) {
-	r, err := EvalStr(input)
-	return r, "", err
+	return evalAll(input)
 }
