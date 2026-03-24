@@ -51,6 +51,7 @@ pub fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
                     "let" => return eval_let(&elems[1..], expr.pos, env),
                     "begin" => return eval_begin(&elems[1..], env),
                     "cond" => return eval_cond(&elems[1..], env),
+                    "set!" => return eval_set(&elems[1..], expr.pos, env),
                     "string-set!" => return eval_string_set(&elems[1..], expr.pos, env),
                     _ => {}
                 }
@@ -96,6 +97,21 @@ fn eval_define(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalErr
         }
         _ => Err(EvalError::Syntax(format!("define: expected symbol or list at {}", fmt_pos(pos)))),
     }
+}
+
+fn eval_set(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Syntax(format!("set! requires exactly 2 arguments at {}", fmt_pos(pos))));
+    }
+    let name = match &args[0].kind {
+        ValueKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Syntax(format!("set!: expected symbol at {}", fmt_pos(pos)))),
+    };
+    let val = eval(&args[1], env)?;
+    if !env.set_existing(&name, val) {
+        return Err(EvalError::UnboundVariable(format!("{} at {}", name, fmt_pos(pos))));
+    }
+    Ok(Value::unpos(ValueKind::Void))
 }
 
 fn eval_if(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalError> {
