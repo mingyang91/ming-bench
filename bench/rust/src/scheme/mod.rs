@@ -74,6 +74,7 @@ pub(crate) enum Value {
     RecordPredicate(u64),                 // type_id
     RecordAccessor(u64, usize),           // type_id, field_index
     Continuation(Rc<Kont>, Vec<WindFrame>), // captured continuation + wind stack
+    Values(Vec<Value>), // multiple return values (L21)
     Void,
 }
 
@@ -150,6 +151,9 @@ impl Value {
             Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..) => "#<procedure>".into(),
             Value::Record(..) => "#<record>".into(),
             Value::SyntaxRules { .. } => "#<syntax>".into(),
+            Value::Values(vs) => {
+                if vs.len() == 1 { vs[0].display_value() } else { "".into() }
+            }
             Value::Void => "".into(),
         }
     }
@@ -360,6 +364,8 @@ pub(crate) enum Kont {
     // Exception handling (L20)
     PopExceptionHandler { next: Rc<Kont> },
     GuardTest { var: String, exn: Value, clauses: Vec<Spanned>, env: Env, next: Rc<Kont> },
+    // Multiple values (L21)
+    CallWithValuesConsumer { consumer: Value, next: Rc<Kont> },
 }
 
 // Kont is not Debug-derivable due to Value, but we don't need Debug
@@ -527,7 +533,7 @@ pub(super) fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, Eva
 fn eval_step(expr: &Spanned, env: &Env, out: &Output) -> Result<Bounce, EvalError> {
     let span = expr.span;
     match &expr.val {
-        Value::Integer(_) | Value::Float(_) | Value::Rational(..) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Pair(..) | Value::Lambda(..) | Value::CaseLambda(..) | Value::SyntaxRules { .. } | Value::Vector(..) | Value::Record(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..) | Value::Continuation(..) => Ok(Bounce::Done(expr.val.clone())),
+        Value::Integer(_) | Value::Float(_) | Value::Rational(..) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Pair(..) | Value::Lambda(..) | Value::CaseLambda(..) | Value::SyntaxRules { .. } | Value::Vector(..) | Value::Record(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..) | Value::Continuation(..) | Value::Values(..) => Ok(Bounce::Done(expr.val.clone())),
         Value::Symbol(name) => {
             env_get(env, name).map(Bounce::Done).ok_or_else(|| EvalError::UnboundVariable(name.clone(), span))
         }
@@ -1270,7 +1276,9 @@ fn make_global_env() -> Env {
                    // L19
                    "dynamic-wind",
                    // L20
-                   "raise", "with-exception-handler", "guard"] {
+                   "raise", "with-exception-handler", "guard",
+                   // L21
+                   "values", "call-with-values"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     env

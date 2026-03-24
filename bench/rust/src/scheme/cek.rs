@@ -103,7 +103,7 @@ fn cek_eval_expr(expr: Spanned, env: Env, kont: Rc<Kont>, out: &Output) -> Resul
         | Value::Str(_) | Value::Char(_) | Value::Pair(..) | Value::Lambda(..)
         | Value::CaseLambda(..) | Value::SyntaxRules { .. } | Value::Vector(..)
         | Value::Record(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..)
-        | Value::RecordAccessor(..) | Value::Continuation(..) => {
+        | Value::RecordAccessor(..) | Value::Continuation(..) | Value::Values(..) => {
             Ok(CekStep::Continue(CekState::ApplyKont(kont, expr.val.clone())))
         }
 
@@ -641,6 +641,14 @@ fn cek_apply_kont(kont: &Rc<Kont>, value: Value, out: &Output, is_resume: bool) 
             env_set(&guard_env, var.clone(), exn.clone());
             cek_eval_cond(clauses, &guard_env, DUMMY_SPAN, next.clone())
         }
+
+        Kont::CallWithValuesConsumer { consumer, next } => {
+            let args = match value {
+                Value::Values(vs) => vs,
+                other => vec![other],
+            };
+            cek_apply_func(consumer, &args, next.clone(), out, DUMMY_SPAN)
+        }
     }
 }
 
@@ -755,6 +763,22 @@ fn cek_apply_func(func: &Value, args: &[Value], kont: Rc<Kont>, out: &Output, sp
             EXCEPTION_HANDLERS.with(|h| h.borrow_mut().push(ExceptionHandler::Proc(handler)));
             let k = Rc::new(Kont::PopExceptionHandler { next: kont });
             cek_apply_func(&thunk, &[], k, out, span)
+        }
+        Value::Symbol(name) if name == "values" => {
+            if args.len() == 1 {
+                Ok(CekStep::Continue(CekState::ApplyKont(kont, args[0].clone())))
+            } else {
+                Ok(CekStep::Continue(CekState::ApplyKont(kont, Value::Values(args.to_vec()))))
+            }
+        }
+        Value::Symbol(name) if name == "call-with-values" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("call-with-values requires 2 arguments".into(), span));
+            }
+            let producer = args[0].clone();
+            let consumer = args[1].clone();
+            let k = Rc::new(Kont::CallWithValuesConsumer { consumer, next: kont });
+            cek_apply_func(&producer, &[], k, out, span)
         }
         Value::Symbol(name) if name == "dynamic-wind" => {
             if args.len() != 3 {
@@ -976,7 +1000,8 @@ fn cek_eval_letrec(args: &[Spanned], env: Env, kont: Rc<Kont>, _out: &Output, sp
 pub(super) fn expr_uses_callcc(expr: &Spanned) -> bool {
     match &expr.val {
         Value::Symbol(s) => s == "call/cc" || s == "call-with-current-continuation" || s == "dynamic-wind"
-            || s == "raise" || s == "with-exception-handler" || s == "guard",
+            || s == "raise" || s == "with-exception-handler" || s == "guard"
+            || s == "values" || s == "call-with-values",
         Value::List(items) => items.iter().any(expr_uses_callcc),
         _ => false,
     }
