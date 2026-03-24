@@ -95,6 +95,7 @@ const (
 	tokString
 	tokBool
 	tokSymbol
+	tokQuote
 	tokEOF
 )
 
@@ -174,6 +175,9 @@ func (l *lexer) nextToken() (token, error) {
 		return token{kind: tokRParen, line: line, col: col}, nil
 	case ch == '"':
 		return l.readString(line, col)
+	case ch == '\'':
+		l.advance()
+		return token{kind: tokQuote, line: line, col: col}, nil
 	case ch == '#':
 		l.advance()
 		next := l.peek()
@@ -307,6 +311,21 @@ func (p *parser) parseExpr() (*astNode, error) {
 			node.children = append(node.children, child)
 		}
 		return node, nil
+	case tokQuote:
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if inner == nil {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unexpected end of input after quote", t.line, t.col)}
+		}
+		return &astNode{
+			children: []*astNode{
+				{isAtom: true, tok: token{kind: tokSymbol, sval: "quote", line: t.line, col: t.col}, line: t.line, col: t.col},
+				inner,
+			},
+			line: t.line, col: t.col,
+		}, nil
 	case tokRParen:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unexpected ')'", t.line, t.col)}
 	case tokEOF:
@@ -405,6 +424,12 @@ func evalList(node *astNode, e *env) (*Value, error) {
 			return quoteNode(node.children[1]), nil
 		case "lambda":
 			return evalLambda(node, e)
+		case "let":
+			return evalLet(node, e)
+		case "begin":
+			return evalBegin(node, e)
+		case "cond":
+			return evalCond(node, e)
 		}
 	}
 
@@ -557,6 +582,131 @@ func evalLambda(node *astNode, e *env) (*Value, error) {
 	return &Value{typ: valLambda, params: params, body: node.children[2:], closure: e}, nil
 }
 
+func evalLet(node *astNode, e *env) (*Value, error) {
+	if len(node.children) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", node.line, node.col)}
+	}
+
+	// Named let: (let name ((var init) ...) body ...)
+	offset := 1
+	var loopName string
+	if node.children[1].isAtom && node.children[1].tok.kind == tokSymbol {
+		if len(node.children) < 4 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", node.line, node.col)}
+		}
+		loopName = node.children[1].tok.sval
+		offset = 2
+	}
+
+	bindings := node.children[offset]
+	if bindings.isAtom {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", node.line, node.col)}
+	}
+
+	params := make([]string, 0, len(bindings.children))
+	initVals := make([]*Value, 0, len(bindings.children))
+	for _, b := range bindings.children {
+		if b.isAtom || len(b.children) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad binding", node.line, node.col)}
+		}
+		name := b.children[0]
+		if !name.isAtom || name.tok.kind != tokSymbol {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad binding", node.line, node.col)}
+		}
+		val, err := eval(b.children[1], e)
+		if err != nil {
+			return nil, err
+		}
+		params = append(params, name.tok.sval)
+		initVals = append(initVals, val)
+	}
+
+	if loopName != "" {
+		// Create a lambda for the loop and bind it, then call with init vals
+		localEnv := newEnv(e)
+		lam := &Value{typ: valLambda, params: params, body: node.children[offset+1:], closure: localEnv}
+		localEnv.set(loopName, lam)
+		// Call with initial values
+		callEnv := newEnv(localEnv)
+		for i, p := range params {
+			callEnv.set(p, initVals[i])
+		}
+		var result *Value
+		for _, bodyExpr := range node.children[offset+1:] {
+			var err error
+			result, err = eval(bodyExpr, callEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	}
+
+	localEnv := newEnv(e)
+	for i, p := range params {
+		localEnv.set(p, initVals[i])
+	}
+	var result *Value
+	for _, bodyExpr := range node.children[offset+1:] {
+		var err error
+		result, err = eval(bodyExpr, localEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalBegin(node *astNode, e *env) (*Value, error) {
+	if len(node.children) < 2 {
+		return voidVal(), nil
+	}
+	var result *Value
+	for _, child := range node.children[1:] {
+		var err error
+		result, err = eval(child, e)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalCond(node *astNode, e *env) (*Value, error) {
+	for _, clause := range node.children[1:] {
+		if clause.isAtom || len(clause.children) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cond: bad clause", node.line, node.col)}
+		}
+		test := clause.children[0]
+		if test.isAtom && test.tok.kind == tokSymbol && test.tok.sval == "else" {
+			var result *Value
+			for _, expr := range clause.children[1:] {
+				var err error
+				result, err = eval(expr, e)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		cond, err := eval(test, e)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(cond) {
+			var result *Value
+			for _, expr := range clause.children[1:] {
+				result, err = eval(expr, e)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+	}
+	return voidVal(), nil
+}
+
 func quoteNode(node *astNode) *Value {
 	if node.isAtom {
 		switch node.tok.kind {
@@ -695,6 +845,110 @@ func applyBuiltin(name string, args []*Value, node *astNode) (*Value, error) {
 		}
 		return boolVal(!isTruthy(args[0])), nil
 
+	case "cons":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cons: need 2 arguments", node.line, node.col)}
+		}
+		return &Value{typ: valPair, car: args[0], cdr: args[1]}, nil
+
+	case "car":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: car: need 1 argument", node.line, node.col)}
+		}
+		if args[0].typ != valPair {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: car: expected pair", node.line, node.col)}
+		}
+		return args[0].car, nil
+
+	case "cdr":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cdr: need 1 argument", node.line, node.col)}
+		}
+		if args[0].typ != valPair {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cdr: expected pair", node.line, node.col)}
+		}
+		return args[0].cdr, nil
+
+	case "null?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: null?: need 1 argument", node.line, node.col)}
+		}
+		return boolVal(args[0].typ == valNil), nil
+
+	case "list":
+		result := nilVal()
+		for i := len(args) - 1; i >= 0; i-- {
+			result = &Value{typ: valPair, car: args[i], cdr: result}
+		}
+		return result, nil
+
+	case "length":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: length: need 1 argument", node.line, node.col)}
+		}
+		count := int64(0)
+		v := args[0]
+		for v.typ == valPair {
+			count++
+			v = v.cdr
+		}
+		if v.typ != valNil {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: length: not a proper list", node.line, node.col)}
+		}
+		return intVal(count), nil
+
+	case "append":
+		if len(args) == 0 {
+			return nilVal(), nil
+		}
+		// Append all lists together
+		var parts []*Value
+		for i := 0; i < len(args)-1; i++ {
+			v := args[i]
+			for v.typ == valPair {
+				parts = append(parts, v.car)
+				v = v.cdr
+			}
+			if v.typ != valNil {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: append: not a proper list", node.line, node.col)}
+			}
+		}
+		result := args[len(args)-1]
+		for i := len(parts) - 1; i >= 0; i-- {
+			result = &Value{typ: valPair, car: parts[i], cdr: result}
+		}
+		return result, nil
+
+	case "number?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: number?: need 1 argument", node.line, node.col)}
+		}
+		return boolVal(args[0].typ == valInt), nil
+
+	case "string?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string?: need 1 argument", node.line, node.col)}
+		}
+		return boolVal(args[0].typ == valString), nil
+
+	case "boolean?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: boolean?: need 1 argument", node.line, node.col)}
+		}
+		return boolVal(args[0].typ == valBool), nil
+
+	case "pair?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: pair?: need 1 argument", node.line, node.col)}
+		}
+		return boolVal(args[0].typ == valPair), nil
+
+	case "symbol?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: symbol?: need 1 argument", node.line, node.col)}
+		}
+		return boolVal(args[0].typ == valSymbol), nil
+
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", node.line, node.col, name)}
 	}
@@ -702,7 +956,10 @@ func applyBuiltin(name string, args []*Value, node *astNode) (*Value, error) {
 
 func makeGlobalEnv() *env {
 	e := newEnv(nil)
-	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not"}
+	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+		"cons", "car", "cdr", "null?", "list", "length",
+		"number?", "string?", "boolean?", "pair?", "symbol?",
+		"append"}
 	for _, name := range builtins {
 		e.set(name, symVal(name))
 	}
