@@ -109,6 +109,19 @@ fn env_set(env: &Env, name: String, val: Value) {
     env.borrow_mut().bindings.insert(name, val);
 }
 
+fn env_update(env: &Env, name: &str, val: Value) -> bool {
+    let mut inner = env.borrow_mut();
+    if inner.bindings.contains_key(name) {
+        inner.bindings.insert(name.to_string(), val);
+        return true;
+    }
+    if let Some(ref parent) = inner.parent {
+        env_update(parent, name, val)
+    } else {
+        false
+    }
+}
+
 // --- Parser ---
 
 struct Parser {
@@ -252,6 +265,23 @@ impl Parser {
                     Err(EvalError::Parse("invalid # literal".into(), span))
                 }
             }
+            Some('\\') => {
+                self.advance(); // skip '\'
+                // Named characters
+                let start = self.pos;
+                while self.pos < self.chars.len() && !is_delimiter(self.chars[self.pos]) {
+                    self.advance();
+                }
+                let name: String = self.chars[start..self.pos].iter().collect();
+                let c = match name.as_str() {
+                    "space" => ' ',
+                    "newline" => '\n',
+                    "tab" => '\t',
+                    s if s.chars().count() == 1 => s.chars().next().expect("single-char string has a first char"),
+                    _ => return Err(EvalError::Parse(format!("unknown character name: {name}"), span)),
+                };
+                Ok(Spanned::new(Value::Char(c), span))
+            }
             _ => Err(EvalError::Parse("invalid # literal".into(), span)),
         }
     }
@@ -381,6 +411,32 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                     "cond" => return eval_cond(&items[1..], env, out, span),
                     "and" => return eval_and(&items[1..], env, out),
                     "or" => return eval_or(&items[1..], env, out),
+                    "string-set!" => {
+                        if items.len() != 4 {
+                            return Err(EvalError::Arity("string-set! requires 3 arguments".into(), span));
+                        }
+                        let Value::Symbol(var_name) = &items[1].val else {
+                            return Err(EvalError::Type("string-set!: first argument must be a variable".into(), span));
+                        };
+                        let idx = as_integer(&eval(&items[2], env, out)?, span)? as usize;
+                        let ch = match eval(&items[3], env, out)? {
+                            Value::Char(c) => c,
+                            _ => return Err(EvalError::Type("string-set!: third argument must be a char".into(), span)),
+                        };
+                        let s = env_get(env, var_name).ok_or_else(|| EvalError::UnboundVariable(var_name.clone(), span))?;
+                        match s {
+                            Value::Str(st) => {
+                                let mut chars: Vec<char> = st.chars().collect();
+                                if idx >= chars.len() {
+                                    return Err(EvalError::Type("string-set!: index out of bounds".into(), span));
+                                }
+                                chars[idx] = ch;
+                                env_update(env, var_name, Value::Str(chars.into_iter().collect()));
+                                return Ok(Value::Void);
+                            }
+                            _ => return Err(EvalError::Type("string-set!: expected string".into(), span)),
+                        }
+                    }
                     "not" => {
                         if items.len() != 2 {
                             return Err(EvalError::Arity("not requires 1 argument".into(), span));
@@ -773,6 +829,13 @@ fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span) -> Result
                 _ => Err(EvalError::Type("string->symbol: expected string".into(), span)),
             }
         }
+        "string-copy" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string-copy requires 1 argument".into(), span)); }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Str(s.clone())),
+                _ => Err(EvalError::Type("string-copy: expected string".into(), span)),
+            }
+        }
         "string-ref" => {
             if args.len() != 2 { return Err(EvalError::Arity("string-ref requires 2 arguments".into(), span)); }
             let s = match &args[0] {
@@ -821,7 +884,7 @@ fn make_global_env() -> Env {
                    "string-append", "string-length", "substring",
                    "string->number", "number->string",
                    "symbol->string", "string->symbol",
-                   "string-ref", "char?"] {
+                   "string-ref", "string-copy", "char?"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     env
