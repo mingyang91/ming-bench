@@ -19,22 +19,39 @@ const (
 	valPair
 	valNull
 	valVoid
+	valLambda
 )
 
+type pair struct {
+	car value
+	cdr value
+}
+
+type lambda struct {
+	params []string
+	body   []*expr
+	env    *env
+}
+
 type value struct {
-	kind valueKind
-	ival int64
-	bval bool
-	sval string
+	kind   valueKind
+	ival   int64
+	bval   bool
+	sval   string
+	pair   *pair
+	lambda *lambda
 }
 
 var voidVal = value{kind: valVoid}
 var nullVal = value{kind: valNull}
 
-func intVal(n int64) value   { return value{kind: valInteger, ival: n} }
-func boolVal(b bool) value   { return value{kind: valBoolean, bval: b} }
-func strVal(s string) value  { return value{kind: valString, sval: s} }
-func symVal(s string) value  { return value{kind: valSymbol, sval: s} }
+func intVal(n int64) value  { return value{kind: valInteger, ival: n} }
+func boolVal(b bool) value  { return value{kind: valBoolean, bval: b} }
+func strVal(s string) value { return value{kind: valString, sval: s} }
+func symVal(s string) value { return value{kind: valSymbol, sval: s} }
+func pairVal(car, cdr value) value {
+	return value{kind: valPair, pair: &pair{car: car, cdr: cdr}}
+}
 
 func (v value) String() string {
 	switch v.kind {
@@ -53,13 +70,58 @@ func (v value) String() string {
 		return "()"
 	case valVoid:
 		return ""
+	case valPair:
+		return "(" + writePairInner(v) + ")"
+	case valLambda:
+		return "#<procedure>"
 	default:
 		return "<unknown>"
 	}
 }
 
+func writePairInner(v value) string {
+	var sb strings.Builder
+	sb.WriteString(v.pair.car.String())
+	cdr := v.pair.cdr
+	for cdr.kind == valPair {
+		sb.WriteByte(' ')
+		sb.WriteString(cdr.pair.car.String())
+		cdr = cdr.pair.cdr
+	}
+	if cdr.kind != valNull {
+		sb.WriteString(" . ")
+		sb.WriteString(cdr.String())
+	}
+	return sb.String()
+}
+
 func isTruthy(v value) bool {
 	return !(v.kind == valBoolean && !v.bval)
+}
+
+// ---------- Environment ----------
+
+type env struct {
+	bindings map[string]value
+	parent   *env
+}
+
+func newEnv(parent *env) *env {
+	return &env{bindings: make(map[string]value), parent: parent}
+}
+
+func (e *env) get(name string) (value, bool) {
+	if v, ok := e.bindings[name]; ok {
+		return v, true
+	}
+	if e.parent != nil {
+		return e.parent.get(name)
+	}
+	return value{}, false
+}
+
+func (e *env) set(name string, v value) {
+	e.bindings[name] = v
 }
 
 // ---------- AST ----------
@@ -86,6 +148,7 @@ type tokenKind int
 const (
 	tokLParen tokenKind = iota
 	tokRParen
+	tokQuote
 	tokAtom
 	tokEOF
 )
@@ -143,7 +206,7 @@ func (t *tokenizer) skipWhitespaceAndComments() {
 }
 
 func isDelimiter(ch rune) bool {
-	return ch == 0 || ch == '(' || ch == ')' || unicode.IsSpace(ch) || ch == ';' || ch == '"'
+	return ch == 0 || ch == '(' || ch == ')' || unicode.IsSpace(ch) || ch == ';' || ch == '"' || ch == '\''
 }
 
 func (t *tokenizer) next() (token, error) {
@@ -161,6 +224,10 @@ func (t *tokenizer) next() (token, error) {
 	if ch == ')' {
 		t.advance()
 		return token{kind: tokRParen, text: ")", line: line, col: col}, nil
+	}
+	if ch == '\'' {
+		t.advance()
+		return token{kind: tokQuote, text: "'", line: line, col: col}, nil
 	}
 
 	// String literal
@@ -238,6 +305,23 @@ func (p *parser) parseExpr() (*expr, error) {
 		return nil, &EvalError{Message: "unexpected end of input"}
 	}
 
+	if tok.kind == tokQuote {
+		p.pos++
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &expr{
+			kind: exprList,
+			list: []*expr{
+				{kind: exprAtom, atom: symVal("quote"), line: tok.line, col: tok.col},
+				inner,
+			},
+			line: tok.line,
+			col:  tok.col,
+		}, nil
+	}
+
 	if tok.kind == tokLParen {
 		p.pos++
 		var elems []*expr
@@ -266,30 +350,29 @@ func (p *parser) parseExpr() (*expr, error) {
 }
 
 func parseAtom(text string) value {
-	// Boolean
 	if text == "#t" {
 		return boolVal(true)
 	}
 	if text == "#f" {
 		return boolVal(false)
 	}
-	// String
 	if len(text) >= 2 && text[0] == '"' && text[len(text)-1] == '"' {
 		return strVal(text[1 : len(text)-1])
 	}
-	// Integer
 	if n, err := strconv.ParseInt(text, 10, 64); err == nil {
 		return intVal(n)
 	}
-	// Symbol
 	return symVal(text)
 }
 
 // ---------- Evaluator ----------
 
-func eval(e *expr) (value, error) {
+func evalInEnv(e *expr, env *env) (value, error) {
 	if e.kind == exprAtom {
 		if e.atom.kind == valSymbol {
+			if v, ok := env.get(e.atom.sval); ok {
+				return v, nil
+			}
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", e.line, e.col, e.atom.sval)}
 		}
 		return e.atom, nil
@@ -300,43 +383,189 @@ func eval(e *expr) (value, error) {
 		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: empty application", e.line, e.col)}
 	}
 
-	// Check for special forms
 	head := e.list[0]
 	if head.kind == exprAtom && head.atom.kind == valSymbol {
 		switch head.atom.sval {
+		case "define":
+			return evalDefine(e, env)
+		case "if":
+			return evalIf(e, env)
+		case "quote":
+			if len(e.list) != 2 {
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: quote: expected 1 argument", e.line, e.col)}
+			}
+			return quoteExpr(e.list[1]), nil
+		case "lambda":
+			return evalLambdaForm(e, env)
 		case "and":
-			return evalAnd(e)
+			return evalAnd(e, env)
 		case "or":
-			return evalOr(e)
+			return evalOr(e, env)
 		}
 	}
 
-	// Function call - evaluate operator
-	op, err := eval(head)
-	if err != nil {
-		// If it's an unbound variable, check if it's a builtin
-		if head.kind == exprAtom && head.atom.kind == valSymbol {
-			return evalBuiltin(head.atom.sval, e)
+	// Check if head is a builtin symbol not in env
+	if head.kind == exprAtom && head.atom.kind == valSymbol {
+		if _, ok := env.get(head.atom.sval); !ok && isBuiltin(head.atom.sval) {
+			// Evaluate args and call builtin
+			args := e.list[1:]
+			evaledArgs := make([]value, len(args))
+			for i, a := range args {
+				v, err := evalInEnv(a, env)
+				if err != nil {
+					return value{}, err
+				}
+				evaledArgs[i] = v
+			}
+			return evalBuiltin(head.atom.sval, evaledArgs, e)
 		}
+	}
+
+	// Evaluate operator
+	op, err := evalInEnv(head, env)
+	if err != nil {
 		return value{}, err
 	}
-	_ = op
-	return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure: %s", e.line, e.col, op.String())}
-}
 
-func evalBuiltin(name string, e *expr) (value, error) {
-	args := e.list[1:]
-
-	switch name {
-	case "+":
-		var sum int64 = 0
-		for _, a := range args {
-			v, err := eval(a)
+	// Lambda call
+	if op.kind == valLambda {
+		args := e.list[1:]
+		evaledArgs := make([]value, len(args))
+		for i, a := range args {
+			v, err := evalInEnv(a, env)
 			if err != nil {
 				return value{}, err
 			}
+			evaledArgs[i] = v
+		}
+		return callLambda(op.lambda, evaledArgs, e)
+	}
+
+	return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure: %s", e.line, e.col, op.String())}
+}
+
+func evalDefine(e *expr, env *env) (value, error) {
+	if len(e.list) < 3 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", e.line, e.col)}
+	}
+	target := e.list[1]
+
+	// (define (f args...) body...)
+	if target.kind == exprList && len(target.list) > 0 {
+		nameExpr := target.list[0]
+		if nameExpr.kind != exprAtom || nameExpr.atom.kind != valSymbol {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol", nameExpr.line, nameExpr.col)}
+		}
+		name := nameExpr.atom.sval
+		params := make([]string, len(target.list)-1)
+		for i, p := range target.list[1:] {
+			if p.kind != exprAtom || p.atom.kind != valSymbol {
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected parameter name", p.line, p.col)}
+			}
+			params[i] = p.atom.sval
+		}
+		lam := &lambda{params: params, body: e.list[2:], env: env}
+		env.set(name, value{kind: valLambda, lambda: lam})
+		return voidVal, nil
+	}
+
+	// (define x expr)
+	if target.kind != exprAtom || target.atom.kind != valSymbol {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol", target.line, target.col)}
+	}
+	if len(e.list) != 3 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected 1 expression", e.line, e.col)}
+	}
+	v, err := evalInEnv(e.list[2], env)
+	if err != nil {
+		return value{}, err
+	}
+	env.set(target.atom.sval, v)
+	return voidVal, nil
+}
+
+func evalIf(e *expr, env *env) (value, error) {
+	if len(e.list) < 3 || len(e.list) > 4 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: if: expected 2 or 3 arguments", e.line, e.col)}
+	}
+	cond, err := evalInEnv(e.list[1], env)
+	if err != nil {
+		return value{}, err
+	}
+	if isTruthy(cond) {
+		return evalInEnv(e.list[2], env)
+	}
+	if len(e.list) == 4 {
+		return evalInEnv(e.list[3], env)
+	}
+	return voidVal, nil
+}
+
+func evalLambdaForm(e *expr, env *env) (value, error) {
+	if len(e.list) < 3 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad syntax", e.line, e.col)}
+	}
+	paramExpr := e.list[1]
+	if paramExpr.kind != exprList {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected parameter list", paramExpr.line, paramExpr.col)}
+	}
+	params := make([]string, len(paramExpr.list))
+	for i, p := range paramExpr.list {
+		if p.kind != exprAtom || p.atom.kind != valSymbol {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected parameter name", p.line, p.col)}
+		}
+		params[i] = p.atom.sval
+	}
+	lam := &lambda{params: params, body: e.list[2:], env: env}
+	return value{kind: valLambda, lambda: lam}, nil
+}
+
+func callLambda(lam *lambda, args []value, callExpr *expr) (value, error) {
+	if len(args) != len(lam.params) {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: expected %d arguments, got %d", callExpr.line, callExpr.col, len(lam.params), len(args))}
+	}
+	callEnv := newEnv(lam.env)
+	for i, p := range lam.params {
+		callEnv.set(p, args[i])
+	}
+	var result value
+	var err error
+	for _, bodyExpr := range lam.body {
+		result, err = evalInEnv(bodyExpr, callEnv)
+		if err != nil {
+			return value{}, err
+		}
+	}
+	return result, nil
+}
+
+func quoteExpr(e *expr) value {
+	if e.kind == exprAtom {
+		return e.atom
+	}
+	// List -> build a proper list from pairs
+	result := nullVal
+	for i := len(e.list) - 1; i >= 0; i-- {
+		result = pairVal(quoteExpr(e.list[i]), result)
+	}
+	return result
+}
+
+func isBuiltin(name string) bool {
+	switch name {
+	case "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not":
+		return true
+	}
+	return false
+}
+
+func evalBuiltin(name string, args []value, e *expr) (value, error) {
+	switch name {
+	case "+":
+		var sum int64 = 0
+		for _, v := range args {
 			if v.kind != valInteger {
-				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: +: expected number, got %s", a.line, a.col, v.String())}
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: +: expected number", e.line, e.col)}
 			}
 			sum += v.ival
 		}
@@ -346,24 +575,16 @@ func evalBuiltin(name string, e *expr) (value, error) {
 		if len(args) == 0 {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected at least 1 argument", e.line, e.col)}
 		}
-		first, err := eval(args[0])
-		if err != nil {
-			return value{}, err
-		}
-		if first.kind != valInteger {
-			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected number", args[0].line, args[0].col)}
+		if args[0].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected number", e.line, e.col)}
 		}
 		if len(args) == 1 {
-			return intVal(-first.ival), nil
+			return intVal(-args[0].ival), nil
 		}
-		result := first.ival
-		for _, a := range args[1:] {
-			v, err := eval(a)
-			if err != nil {
-				return value{}, err
-			}
+		result := args[0].ival
+		for _, v := range args[1:] {
 			if v.kind != valInteger {
-				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected number", a.line, a.col)}
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected number", e.line, e.col)}
 			}
 			result -= v.ival
 		}
@@ -371,13 +592,9 @@ func evalBuiltin(name string, e *expr) (value, error) {
 
 	case "*":
 		var product int64 = 1
-		for _, a := range args {
-			v, err := eval(a)
-			if err != nil {
-				return value{}, err
-			}
+		for _, v := range args {
 			if v.kind != valInteger {
-				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: *: expected number", a.line, a.col)}
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: *: expected number", e.line, e.col)}
 			}
 			product *= v.ival
 		}
@@ -387,72 +604,53 @@ func evalBuiltin(name string, e *expr) (value, error) {
 		if len(args) < 2 {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected at least 2 arguments", e.line, e.col)}
 		}
-		first, err := eval(args[0])
-		if err != nil {
-			return value{}, err
+		if args[0].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected number", e.line, e.col)}
 		}
-		if first.kind != valInteger {
-			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected number", args[0].line, args[0].col)}
-		}
-		result := first.ival
-		for _, a := range args[1:] {
-			v, err := eval(a)
-			if err != nil {
-				return value{}, err
-			}
+		result := args[0].ival
+		for _, v := range args[1:] {
 			if v.kind != valInteger {
-				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected number", a.line, a.col)}
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected number", e.line, e.col)}
 			}
 			if v.ival == 0 {
-				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: /: division by zero", a.line, a.col)}
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: /: division by zero", e.line, e.col)}
 			}
 			result /= v.ival
 		}
 		return intVal(result), nil
 
 	case "<":
-		return evalCompare(args, e, func(a, b int64) bool { return a < b }, "<")
+		return evalCompareVals(args, e, func(a, b int64) bool { return a < b }, "<")
 	case ">":
-		return evalCompare(args, e, func(a, b int64) bool { return a > b }, ">")
+		return evalCompareVals(args, e, func(a, b int64) bool { return a > b }, ">")
 	case "=":
-		return evalCompare(args, e, func(a, b int64) bool { return a == b }, "=")
+		return evalCompareVals(args, e, func(a, b int64) bool { return a == b }, "=")
 	case "<=":
-		return evalCompare(args, e, func(a, b int64) bool { return a <= b }, "<=")
+		return evalCompareVals(args, e, func(a, b int64) bool { return a <= b }, "<=")
 	case ">=":
-		return evalCompare(args, e, func(a, b int64) bool { return a >= b }, ">=")
+		return evalCompareVals(args, e, func(a, b int64) bool { return a >= b }, ">=")
 
 	case "not":
 		if len(args) != 1 {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: not: expected 1 argument, got %d", e.line, e.col, len(args))}
 		}
-		v, err := eval(args[0])
-		if err != nil {
-			return value{}, err
-		}
-		return boolVal(!isTruthy(v)), nil
+		return boolVal(!isTruthy(args[0])), nil
 	}
 
-	return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", e.list[0].line, e.list[0].col, name)}
+	return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", e.line, e.col, name)}
 }
 
-func evalCompare(args []*expr, e *expr, cmp func(int64, int64) bool, name string) (value, error) {
+func evalCompareVals(args []value, e *expr, cmp func(int64, int64) bool, name string) (value, error) {
 	if len(args) < 2 {
 		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected at least 2 arguments", e.line, e.col, name)}
 	}
-	prev, err := eval(args[0])
-	if err != nil {
-		return value{}, err
+	if args[0].kind != valInteger {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected number", e.line, e.col, name)}
 	}
-	if prev.kind != valInteger {
-		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected number", args[0].line, args[0].col, name)}
-	}
-	for _, a := range args[1:] {
-		v, err := eval(a)
-		if err != nil {
-			return value{}, err
-		}
+	prev := args[0]
+	for _, v := range args[1:] {
 		if v.kind != valInteger {
-			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected number", a.line, a.col, name)}
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected number", e.line, e.col, name)}
 		}
 		if !cmp(prev.ival, v.ival) {
 			return boolVal(false), nil
@@ -462,14 +660,14 @@ func evalCompare(args []*expr, e *expr, cmp func(int64, int64) bool, name string
 	return boolVal(true), nil
 }
 
-func evalAnd(e *expr) (value, error) {
+func evalAnd(e *expr, env *env) (value, error) {
 	args := e.list[1:]
 	if len(args) == 0 {
 		return boolVal(true), nil
 	}
 	var result value
 	for _, a := range args {
-		v, err := eval(a)
+		v, err := evalInEnv(a, env)
 		if err != nil {
 			return value{}, err
 		}
@@ -481,13 +679,13 @@ func evalAnd(e *expr) (value, error) {
 	return result, nil
 }
 
-func evalOr(e *expr) (value, error) {
+func evalOr(e *expr, env *env) (value, error) {
 	args := e.list[1:]
 	if len(args) == 0 {
 		return boolVal(false), nil
 	}
 	for _, a := range args {
-		v, err := eval(a)
+		v, err := evalInEnv(a, env)
 		if err != nil {
 			return value{}, err
 		}
@@ -500,14 +698,21 @@ func evalOr(e *expr) (value, error) {
 
 // ---------- Public API ----------
 
-// EvalStr evaluates one or more Scheme expressions and returns the string
-// representation of the last result.
+func makeTopLevelEnv() *env {
+	e := newEnv(nil)
+	// Register builtins as lambda-like values would be complex;
+	// instead we resolve them at call time via the environment lookup
+	// falling through to isBuiltin check.
+	return e
+}
+
 func EvalStr(input string) (string, error) {
 	tokens, err := tokenize(input)
 	if err != nil {
 		return "", err
 	}
 	p := &parser{tokens: tokens}
+	env := makeTopLevelEnv()
 
 	var lastVal value
 	hasResult := false
@@ -516,7 +721,7 @@ func EvalStr(input string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		v, err := eval(e)
+		v, err := evalInEnv(e, env)
 		if err != nil {
 			return "", err
 		}
@@ -532,8 +737,6 @@ func EvalStr(input string) (string, error) {
 	return lastVal.String(), nil
 }
 
-// EvalStrWithOutput evaluates Scheme expressions and returns both the result
-// string and any captured output from display/write/newline.
 func EvalStrWithOutput(input string) (result string, output string, err error) {
 	r, err := EvalStr(input)
 	return r, "", err
