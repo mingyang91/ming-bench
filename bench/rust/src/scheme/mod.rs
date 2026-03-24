@@ -14,7 +14,9 @@ enum Val {
     Int(i64),
     Bool(bool),
     Str(String),
-    List(Vec<Val>),
+    Symbol(String),
+    Pair(Box<Val>, Box<Val>),
+    Nil,
     Lambda {
         params: Vec<String>,
         body: Vec<Expr>,
@@ -30,13 +32,26 @@ impl fmt::Display for Val {
             Val::Bool(true) => write!(f, "#t"),
             Val::Bool(false) => write!(f, "#f"),
             Val::Str(s) => write!(f, "\"{}\"", s),
-            Val::List(items) => {
+            Val::Symbol(s) => write!(f, "{s}"),
+            Val::Nil => write!(f, "()"),
+            Val::Pair(_, _) => {
                 write!(f, "(")?;
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " ")?;
+                let mut cur = self;
+                let mut first = true;
+                loop {
+                    match cur {
+                        Val::Pair(car, cdr) => {
+                            if !first { write!(f, " ")?; }
+                            first = false;
+                            write!(f, "{car}")?;
+                            cur = cdr;
+                        }
+                        Val::Nil => break,
+                        other => {
+                            write!(f, " . {other}")?;
+                            break;
+                        }
                     }
-                    write!(f, "{item}")?;
                 }
                 write!(f, ")")
             }
@@ -241,8 +256,14 @@ fn quote_expr(expr: &Expr) -> Val {
         Expr::Int(n) => Val::Int(*n),
         Expr::Bool(b) => Val::Bool(*b),
         Expr::Str(s) => Val::Str(s.clone()),
-        Expr::Symbol(s) => Val::Str(s.clone()), // symbols display as bare names; using Str for now
-        Expr::List(items) => Val::List(items.iter().map(quote_expr).collect()),
+        Expr::Symbol(s) => Val::Symbol(s.clone()),
+        Expr::List(items) => {
+            let mut result = Val::Nil;
+            for item in items.iter().rev() {
+                result = Val::Pair(Box::new(quote_expr(item)), Box::new(result));
+            }
+            result
+        }
     }
 }
 
@@ -344,6 +365,112 @@ fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
                             env: env.clone(),
                         });
                     }
+                    "let" => {
+                        if list.len() < 3 {
+                            return Err(EvalError::Parse("let: bad syntax".into()));
+                        }
+                        // Named let: (let name ((var init) ...) body ...)
+                        if let Expr::Symbol(name) = &list[1] {
+                            if list.len() < 4 {
+                                return Err(EvalError::Parse("let: bad syntax".into()));
+                            }
+                            let bindings = match &list[2] {
+                                Expr::List(b) => b,
+                                _ => return Err(EvalError::Parse("let: expected bindings list".into())),
+                            };
+                            let mut params = Vec::new();
+                            let mut init_vals = Vec::new();
+                            for binding in bindings {
+                                match binding {
+                                    Expr::List(pair) if pair.len() == 2 => {
+                                        let pname = match &pair[0] {
+                                            Expr::Symbol(s) => s.clone(),
+                                            _ => return Err(EvalError::Parse("let: expected symbol".into())),
+                                        };
+                                        let val = eval(&pair[1], env)?;
+                                        params.push(pname);
+                                        init_vals.push(val);
+                                    }
+                                    _ => return Err(EvalError::Parse("let: bad binding".into())),
+                                }
+                            }
+                            let let_env = new_env(Some(env.clone()));
+                            let body = list[3..].to_vec();
+                            let lambda = Val::Lambda {
+                                params: params.clone(),
+                                body,
+                                env: let_env.clone(),
+                            };
+                            env_set(&let_env, name.clone(), lambda);
+                            // Now call it with init values
+                            let call_env = new_env(Some(let_env.clone()));
+                            for (p, v) in params.iter().zip(init_vals) {
+                                env_set(&call_env, p.clone(), v);
+                            }
+                            let mut result = Val::Void;
+                            for expr in &list[3..] {
+                                result = eval(expr, &call_env)?;
+                            }
+                            return Ok(result);
+                        }
+                        let bindings = match &list[1] {
+                            Expr::List(b) => b,
+                            _ => return Err(EvalError::Parse("let: expected bindings list".into())),
+                        };
+                        let let_env = new_env(Some(env.clone()));
+                        for binding in bindings {
+                            match binding {
+                                Expr::List(pair) if pair.len() == 2 => {
+                                    let name = match &pair[0] {
+                                        Expr::Symbol(s) => s.clone(),
+                                        _ => return Err(EvalError::Parse("let: expected symbol".into())),
+                                    };
+                                    let val = eval(&pair[1], env)?;
+                                    env_set(&let_env, name, val);
+                                }
+                                _ => return Err(EvalError::Parse("let: bad binding".into())),
+                            }
+                        }
+                        let mut result = Val::Void;
+                        for expr in &list[2..] {
+                            result = eval(expr, &let_env)?;
+                        }
+                        return Ok(result);
+                    }
+                    "begin" => {
+                        let mut result = Val::Void;
+                        for expr in &list[1..] {
+                            result = eval(expr, env)?;
+                        }
+                        return Ok(result);
+                    }
+                    "cond" => {
+                        for clause in &list[1..] {
+                            match clause {
+                                Expr::List(parts) if !parts.is_empty() => {
+                                    if let Expr::Symbol(s) = &parts[0] {
+                                        if s == "else" {
+                                            let mut result = Val::Void;
+                                            for expr in &parts[1..] {
+                                                result = eval(expr, env)?;
+                                            }
+                                            return Ok(result);
+                                        }
+                                    }
+                                    let cond_val = eval(&parts[0], env)?;
+                                    if is_truthy(&cond_val) {
+                                        let mut result = cond_val;
+                                        for expr in &parts[1..] {
+                                            result = eval(expr, env)?;
+                                        }
+                                        return Ok(result);
+                                    }
+                                }
+                                _ => return Err(EvalError::Parse("cond: bad clause".into())),
+                            }
+                        }
+                        return Ok(Val::Void);
+                    }
                     "and" => {
                         let mut result = Val::Bool(true);
                         for arg in &list[1..] {
@@ -405,7 +532,9 @@ fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
 }
 
 fn is_builtin(op: &str) -> bool {
-    matches!(op, "+" | "-" | "*" | "/" | "=" | "<" | ">" | "<=" | ">=" | "not")
+    matches!(op, "+" | "-" | "*" | "/" | "=" | "<" | ">" | "<=" | ">=" | "not"
+        | "cons" | "car" | "cdr" | "null?" | "list" | "length" | "append"
+        | "string?" | "number?" | "boolean?" | "pair?" | "symbol?")
 }
 
 fn apply_builtin(op: &str, args: &[Val]) -> Result<Val, EvalError> {
@@ -496,6 +625,106 @@ fn apply_builtin(op: &str, args: &[Val]) -> Result<Val, EvalError> {
                 return Err(EvalError::Arity("not: need exactly 1 argument".into()));
             }
             Ok(Val::Bool(!is_truthy(&args[0])))
+        }
+        "cons" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("cons: need exactly 2 arguments".into()));
+            }
+            Ok(Val::Pair(Box::new(args[0].clone()), Box::new(args[1].clone())))
+        }
+        "car" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("car: need exactly 1 argument".into()));
+            }
+            match &args[0] {
+                Val::Pair(car, _) => Ok(*car.clone()),
+                _ => Err(EvalError::Type("car: expected pair".into())),
+            }
+        }
+        "cdr" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("cdr: need exactly 1 argument".into()));
+            }
+            match &args[0] {
+                Val::Pair(_, cdr) => Ok(*cdr.clone()),
+                _ => Err(EvalError::Type("cdr: expected pair".into())),
+            }
+        }
+        "null?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("null?: need exactly 1 argument".into()));
+            }
+            Ok(Val::Bool(matches!(args[0], Val::Nil)))
+        }
+        "list" => {
+            let mut result = Val::Nil;
+            for item in args.iter().rev() {
+                result = Val::Pair(Box::new(item.clone()), Box::new(result));
+            }
+            Ok(result)
+        }
+        "length" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("length: need exactly 1 argument".into()));
+            }
+            let mut count = 0i64;
+            let mut cur = &args[0];
+            loop {
+                match cur {
+                    Val::Nil => break,
+                    Val::Pair(_, cdr) => {
+                        count += 1;
+                        cur = cdr;
+                    }
+                    _ => return Err(EvalError::Type("length: expected list".into())),
+                }
+            }
+            Ok(Val::Int(count))
+        }
+        "append" => {
+            if args.is_empty() {
+                return Ok(Val::Nil);
+            }
+            // Concatenate all list arguments
+            let mut result = args.last().unwrap().clone();
+            for arg in args[..args.len()-1].iter().rev() {
+                let mut items = Vec::new();
+                let mut cur = arg;
+                loop {
+                    match cur {
+                        Val::Nil => break,
+                        Val::Pair(car, cdr) => {
+                            items.push(*car.clone());
+                            cur = cdr;
+                        }
+                        _ => return Err(EvalError::Type("append: expected list".into())),
+                    }
+                }
+                for item in items.into_iter().rev() {
+                    result = Val::Pair(Box::new(item), Box::new(result));
+                }
+            }
+            Ok(result)
+        }
+        "string?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string?: need 1 argument".into())); }
+            Ok(Val::Bool(matches!(args[0], Val::Str(_))))
+        }
+        "number?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("number?: need 1 argument".into())); }
+            Ok(Val::Bool(matches!(args[0], Val::Int(_))))
+        }
+        "boolean?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("boolean?: need 1 argument".into())); }
+            Ok(Val::Bool(matches!(args[0], Val::Bool(_))))
+        }
+        "pair?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("pair?: need 1 argument".into())); }
+            Ok(Val::Bool(matches!(args[0], Val::Pair(_, _))))
+        }
+        "symbol?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("symbol?: need 1 argument".into())); }
+            Ok(Val::Bool(matches!(args[0], Val::Symbol(_))))
         }
         _ => Err(EvalError::UnboundVariable(op.into())),
     }
