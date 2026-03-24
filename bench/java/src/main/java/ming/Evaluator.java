@@ -52,6 +52,9 @@ public class Evaluator {
     record WindEntry(Object inThunk, Object outThunk) {}
     private List<WindEntry> windStack = new ArrayList<>();
 
+    // Exception handler stack for with-exception-handler
+    private List<Object> exceptionHandlerStack = new ArrayList<>();
+
     private EvalError error(String msg) {
         return new EvalError(currentLine + ":" + currentCol + " " + msg);
     }
@@ -627,10 +630,81 @@ public class Evaluator {
                             windStack.remove(windStack.size() - 1);
                             apply(dwOut, List.of());
                             throw ci;
+                        } catch (SchemeRaise sr) {
+                            windStack.remove(windStack.size() - 1);
+                            apply(dwOut, List.of());
+                            throw sr;
                         }
                         windStack.remove(windStack.size() - 1);
                         apply(dwOut, List.of());
                         return dwResult;
+                    }
+                    case "guard" -> {
+                        // (guard (var clause ...) body ...)
+                        if (list.size() < 3) throw error("guard: bad syntax");
+                        Object clauseSpec = list.get(1);
+                        if (clauseSpec instanceof Located loc) clauseSpec = loc.value();
+                        if (!(clauseSpec instanceof List<?> clauseList) || clauseList.isEmpty())
+                            throw error("guard: bad syntax");
+                        Object varObj = clauseList.get(0);
+                        if (varObj instanceof Located vl) varObj = vl.value();
+                        if (!(varObj instanceof String)) throw error("guard: variable must be a symbol");
+                        String var = (String) varObj;
+                        // Evaluate body, catching SchemeRaise
+                        Object bodyResult;
+                        try {
+                            bodyResult = null;
+                            for (int bi = 2; bi < list.size(); bi++) {
+                                bodyResult = eval(list.get(bi), env);
+                            }
+                            return bodyResult;
+                        } catch (SchemeRaise sr) {
+                            // Bind exception to var in a new env
+                            Environment guardEnv = new Environment(env);
+                            guardEnv.define(var, sr.value);
+                            // Evaluate clauses like cond
+                            for (int ci = 1; ci < clauseList.size(); ci++) {
+                                Object clause = clauseList.get(ci);
+                                if (clause instanceof Located cl) clause = cl.value();
+                                if (!(clause instanceof List<?> clist) || clist.isEmpty())
+                                    throw error("guard: bad clause");
+                                Object test = clist.get(0);
+                                if (test instanceof Located tl) test = tl.value();
+                                // Check for else clause
+                                if ("else".equals(test) || (test instanceof String && "else".equals(test))) {
+                                    Object result = VOID;
+                                    for (int ei = 1; ei < clist.size(); ei++) {
+                                        result = eval(clist.get(ei), guardEnv);
+                                    }
+                                    return result;
+                                }
+                                Object testResult = eval(clist.get(0), guardEnv);
+                                if (!Boolean.FALSE.equals(testResult)) {
+                                    if (clist.size() == 1) return testResult;
+                                    Object result = VOID;
+                                    for (int ei = 1; ei < clist.size(); ei++) {
+                                        result = eval(clist.get(ei), guardEnv);
+                                    }
+                                    return result;
+                                }
+                            }
+                            // No clause matched — re-raise
+                            throw sr;
+                        }
+                    }
+                    case "with-exception-handler" -> {
+                        if (list.size() != 3) throw error("with-exception-handler: expected 2 arguments");
+                        Object handler = eval(list.get(1), env);
+                        Object thunk = eval(list.get(2), env);
+                        exceptionHandlerStack.add(handler);
+                        try {
+                            Object result = apply(thunk, List.of());
+                            exceptionHandlerStack.remove(exceptionHandlerStack.size() - 1);
+                            return result;
+                        } catch (SchemeRaise sr) {
+                            exceptionHandlerStack.remove(exceptionHandlerStack.size() - 1);
+                            throw sr;
+                        }
                     }
                     case "call/cc", "call-with-current-continuation" -> {
                         if (list.size() != 2) throw error("call/cc: expected 1 argument");
@@ -764,6 +838,15 @@ public class Evaluator {
         ContinuationInvoked(SchemeContinuation k, Object v) {
             super(null, null, true, false);
             this.continuation = k;
+            this.value = v;
+        }
+    }
+
+    // Exception support for raise/guard/with-exception-handler
+    static class SchemeRaise extends RuntimeException {
+        final Object value;
+        SchemeRaise(Object v) {
+            super(null, null, true, false);
             this.value = v;
         }
     }
@@ -1437,6 +1520,19 @@ public class Evaluator {
     }
 
     {
+        // raise as a builtin procedure (not special form, so user code can shadow it)
+        globalEnv.define("raise", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("raise: expected 1 argument");
+            Object raised = args.get(0);
+            if (!exceptionHandlerStack.isEmpty()) {
+                Object handler = exceptionHandlerStack.remove(exceptionHandlerStack.size() - 1);
+                apply(handler, List.of(raised));
+                // Handler returned without escaping — re-raise
+                exceptionHandlerStack.add(handler);
+            }
+            throw new SchemeRaise(raised);
+        });
+
         // Register arithmetic and comparison builtins
         globalEnv.define("+", (BuiltinProc) args -> arith(args, "+"));
         globalEnv.define("-", (BuiltinProc) args -> arith(args, "-"));
