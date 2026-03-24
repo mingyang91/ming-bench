@@ -62,61 +62,74 @@ object Evaluator:
   private def evalBody(body: List[Expr], env: Env): SchemeVal =
     body.foldLeft[SchemeVal](SchemeVal.Void)((_, e) => eval(e, env))
 
-  private def eval(expr: Expr, env: Env): SchemeVal = expr match
-    case Expr.IntLit(n)    => SchemeVal.IntVal(n)
-    case Expr.BoolLit(b)   => SchemeVal.BoolVal(b)
-    case Expr.StrLit(s)    => SchemeVal.StrVal(s)
-    case Expr.Symbol(name) => env.lookup(name)
-    case Expr.SList(Nil)   => SchemeVal.ListVal(Nil)
-    case Expr.SList(Expr.Symbol("quote") :: arg :: Nil) =>
-      quoteToVal(arg)
-    case Expr.SList(Expr.Symbol("if") :: cond :: thenBr :: elseBr :: Nil) =>
-      if isTruthy(eval(cond, env)) then eval(thenBr, env)
-      else eval(elseBr, env)
-    case Expr.SList(Expr.Symbol("if") :: cond :: thenBr :: Nil) =>
-      if isTruthy(eval(cond, env)) then eval(thenBr, env) else SchemeVal.Void
-    case Expr.SList(
-          Expr.Symbol("define") :: Expr.SList(
-            Expr.Symbol(name) :: params
-          ) :: body
-        ) =>
-      val paramNames = params.map {
-        case Expr.Symbol(n) => n
-        case _              => throw new EvalError("define: expected parameter name")
-      }
-      env.define(name, SchemeVal.Procedure(paramNames, body, env))
-      SchemeVal.Void
-    case Expr.SList(
-          Expr.Symbol("define") :: Expr.Symbol(name) :: value :: Nil
-        ) =>
-      env.define(name, eval(value, env))
-      SchemeVal.Void
-    case Expr.SList(Expr.Symbol("lambda") :: Expr.SList(params) :: body) =>
-      val paramNames = params.map {
-        case Expr.Symbol(n) => n
-        case _              => throw new EvalError("lambda: expected parameter name")
-      }
-      SchemeVal.Procedure(paramNames, body, env)
-    case Expr.SList(
-          Expr.Symbol("let") :: Expr.Symbol(name) :: Expr.SList(
-            bindings
-          ) :: body
-        ) =>
-      evalNamedLet(name, bindings, body, env)
-    case Expr.SList(
-          Expr.Symbol("let") :: Expr.SList(bindings) :: body
-        ) =>
-      evalLet(bindings, body, env)
-    case Expr.SList(Expr.Symbol("begin") :: exprs) =>
-      evalBody(exprs, env)
-    case Expr.SList(Expr.Symbol("cond") :: clauses) =>
-      evalCond(clauses, env)
-    case Expr.SList(Expr.Symbol("and") :: args) =>
-      evalAnd(args, env)
-    case Expr.SList(Expr.Symbol("or") :: args) =>
-      evalOr(args, env)
-    case Expr.SList(head :: args) =>
-      applyProc(eval(head, env), args.map(a => eval(a, env)))
+  private def posStr(expr: Expr): String =
+    val p = Parser.positions.get(expr)
+    if p != null then s"${p._1}:${p._2}" else "1:1"
+
+  private val posPattern = ".*\\d+:\\d+.*".r
+
+  private def eval(expr: Expr, env: Env): SchemeVal =
+    try
+      expr match
+        case Expr.IntLit(n)    => SchemeVal.IntVal(n)
+        case Expr.BoolLit(b)   => SchemeVal.BoolVal(b)
+        case Expr.StrLit(s)    => SchemeVal.StrVal(s)
+        case Expr.Symbol(name) => env.lookup(name)
+        case Expr.SList(Nil)   => SchemeVal.ListVal(Nil)
+        case Expr.SList(Expr.Symbol("quote") :: arg :: Nil) =>
+          quoteToVal(arg)
+        case Expr.SList(Expr.Symbol("if") :: cond :: thenBr :: elseBr :: Nil) =>
+          if isTruthy(eval(cond, env)) then eval(thenBr, env)
+          else eval(elseBr, env)
+        case Expr.SList(Expr.Symbol("if") :: cond :: thenBr :: Nil) =>
+          if isTruthy(eval(cond, env)) then eval(thenBr, env) else SchemeVal.Void
+        case Expr.SList(
+              Expr.Symbol("define") :: Expr.SList(
+                Expr.Symbol(name) :: params
+              ) :: body
+            ) =>
+          val paramNames = params.map {
+            case Expr.Symbol(n) => n
+            case _              => throw new EvalError("define: expected parameter name")
+          }
+          env.define(name, SchemeVal.Procedure(paramNames, body, env))
+          SchemeVal.Void
+        case Expr.SList(
+              Expr.Symbol("define") :: Expr.Symbol(name) :: value :: Nil
+            ) =>
+          env.define(name, eval(value, env))
+          SchemeVal.Void
+        case Expr.SList(Expr.Symbol("lambda") :: Expr.SList(params) :: body) =>
+          val paramNames = params.map {
+            case Expr.Symbol(n) => n
+            case _              => throw new EvalError("lambda: expected parameter name")
+          }
+          SchemeVal.Procedure(paramNames, body, env)
+        case Expr.SList(
+              Expr.Symbol("let") :: Expr.Symbol(name) :: Expr.SList(
+                bindings
+              ) :: body
+            ) =>
+          evalNamedLet(name, bindings, body, env)
+        case Expr.SList(
+              Expr.Symbol("let") :: Expr.SList(bindings) :: body
+            ) =>
+          evalLet(bindings, body, env)
+        case Expr.SList(Expr.Symbol("begin") :: exprs) =>
+          evalBody(exprs, env)
+        case Expr.SList(Expr.Symbol("cond") :: clauses) =>
+          evalCond(clauses, env)
+        case Expr.SList(Expr.Symbol("and") :: args) =>
+          evalAnd(args, env)
+        case Expr.SList(Expr.Symbol("or") :: args) =>
+          evalOr(args, env)
+        case Expr.SList(head :: args) =>
+          applyProc(eval(head, env), args.map(a => eval(a, env)))
+    catch
+      case e: EvalError =>
+        val msg = e.getMessage
+        if posPattern.matches(msg) then throw e
+        else throw new EvalError(s"$msg at ${posStr(expr)}")
 
   private def applyProc(fn: SchemeVal, evaledArgs: List[SchemeVal]): SchemeVal =
     fn match
