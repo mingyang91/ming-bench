@@ -75,6 +75,29 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                 i += 1; col += 1;
                 tokens.push(Token { kind: TokenKind::Atom(format!("\"{}\"", s)), pos: start_pos });
             }
+            '#' if i + 1 < chars.len() && chars[i + 1] == '\\' => {
+                let start_pos = cur_pos;
+                // Character literal: #\x or #\space etc.
+                i += 2; col += 2;
+                if i < chars.len() {
+                    // Check for named characters (e.g., #\space, #\newline)
+                    let ch_start = i;
+                    if chars[i].is_alphabetic() {
+                        while i < chars.len() && chars[i].is_alphabetic() {
+                            i += 1; col += 1;
+                        }
+                        let name: String = chars[ch_start..i].iter().collect();
+                        tokens.push(Token { kind: TokenKind::Atom(format!("#\\{}", name)), pos: start_pos });
+                    } else {
+                        // Single character like #\( or #\)
+                        let c = chars[i];
+                        i += 1; col += 1;
+                        tokens.push(Token { kind: TokenKind::Atom(format!("#\\{}", c)), pos: start_pos });
+                    }
+                } else {
+                    tokens.push(Token { kind: TokenKind::Atom("#\\".to_string()), pos: start_pos });
+                }
+            }
             _ => {
                 let start_pos = cur_pos;
                 let start = i;
@@ -129,6 +152,16 @@ fn parse_atom(s: &str, pos: Pos) -> Value {
         ValueKind::Boolean(true)
     } else if s == "#f" {
         ValueKind::Boolean(false)
+    } else if s.starts_with("#\\") {
+        let rest = &s[2..];
+        let ch = match rest {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            c if c.len() == 1 => c.chars().next().unwrap(),
+            _ => return Value::new(ValueKind::Symbol(s.to_string()), pos),
+        };
+        ValueKind::Char(ch)
     } else if s.starts_with('"') && s.ends_with('"') {
         ValueKind::Str(s[1..s.len()-1].to_string())
     } else if let Ok(n) = s.parse::<i64>() {

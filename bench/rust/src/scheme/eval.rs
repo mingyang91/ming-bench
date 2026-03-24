@@ -51,6 +51,7 @@ pub fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
                     "let" => return eval_let(&elems[1..], expr.pos, env),
                     "begin" => return eval_begin(&elems[1..], env),
                     "cond" => return eval_cond(&elems[1..], env),
+                    "string-set!" => return eval_string_set(&elems[1..], expr.pos, env),
                     _ => {}
                 }
             }
@@ -261,6 +262,32 @@ fn eval_cond(clauses: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
             return Ok(result);
         }
     }
+    Ok(Value::unpos(ValueKind::Void))
+}
+
+fn eval_string_set(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Syntax(format!("string-set! requires 3 arguments at {}", fmt_pos(pos))));
+    }
+    let var_name = match &args[0].kind {
+        ValueKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Syntax(format!("string-set! expects a variable at {}", fmt_pos(pos)))),
+    };
+    let s_val = env.get(&var_name).ok_or_else(|| EvalError::UnboundVariable(format!("{} at {}", var_name, fmt_pos(pos))))?;
+    let mut s = match &s_val.kind {
+        ValueKind::Str(s) => s.clone(),
+        _ => return Err(EvalError::Type(format!("string-set!: not a string at {}", fmt_pos(pos)))),
+    };
+    let idx = eval(&args[1], env)?.as_integer().ok_or_else(|| EvalError::Type(format!("string-set!: index not a number at {}", fmt_pos(pos))))? as usize;
+    let ch = match eval(&args[2], env)?.kind {
+        ValueKind::Char(c) => c,
+        _ => return Err(EvalError::Type(format!("string-set!: not a char at {}", fmt_pos(pos)))),
+    };
+    if idx >= s.len() {
+        return Err(EvalError::Runtime(format!("string-set!: index out of range at {}", fmt_pos(pos))));
+    }
+    unsafe { s.as_bytes_mut()[idx] = ch as u8; }
+    env.set_existing(&var_name, Value::unpos(ValueKind::Str(s)));
     Ok(Value::unpos(ValueKind::Void))
 }
 
@@ -548,6 +575,15 @@ fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, Eva
                 return Err(EvalError::Runtime(format!("string-ref: index out of range at {}", fmt_pos(call_pos))));
             }
             Ok(Value::unpos(ValueKind::Char(s.as_bytes()[idx] as char)))
+        }
+        "string-copy" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("string-copy requires 1 argument at {}", fmt_pos(call_pos))));
+            }
+            match &args[0].kind {
+                ValueKind::Str(s) => Ok(Value::unpos(ValueKind::Str(s.clone()))),
+                _ => Err(EvalError::Type(format!("string-copy: not a string at {}", fmt_pos(call_pos)))),
+            }
         }
         "char?" => {
             if args.len() != 1 {

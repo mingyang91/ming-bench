@@ -32,6 +32,17 @@ impl Env {
         self.bindings.borrow_mut().insert(name, val);
     }
 
+    pub fn set_existing(&self, name: &str, val: Value) -> bool {
+        if self.bindings.borrow().contains_key(name) {
+            self.bindings.borrow_mut().insert(name.to_string(), val);
+            true
+        } else if let Some(ref parent) = self.parent {
+            parent.set_existing(name, val)
+        } else {
+            false
+        }
+    }
+
     pub fn default_env() -> Rc<Env> {
         let env = Env::new(None);
         for name in &["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
@@ -40,7 +51,8 @@ impl Env {
                       "display", "write", "newline",
                       "string-append", "string-length", "substring",
                       "string->number", "number->string",
-                      "symbol->string", "string->symbol", "string-ref"] {
+                      "symbol->string", "string->symbol", "string-ref",
+                      "string-copy"] {
             env.set(name.to_string(), Value::unpos(ValueKind::Symbol(name.to_string())));
         }
         env
