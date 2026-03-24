@@ -656,6 +656,290 @@ fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, Eva
             combined.extend(tail);
             apply(func, &combined, call_pos)
         }
+        // L09: Numeric utilities
+        "abs" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("abs requires 1 argument at {}", fmt_pos(call_pos)))); }
+            let n = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("abs: not a number at {}", fmt_pos(call_pos))))?;
+            Ok(Value::unpos(ValueKind::Integer(n.abs())))
+        }
+        "modulo" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("modulo requires 2 arguments at {}", fmt_pos(call_pos)))); }
+            let a = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("modulo: not a number at {}", fmt_pos(call_pos))))?;
+            let b = args[1].as_integer().ok_or_else(|| EvalError::Type(format!("modulo: not a number at {}", fmt_pos(call_pos))))?;
+            if b == 0 { return Err(EvalError::Runtime(format!("modulo: division by zero at {}", fmt_pos(call_pos)))); }
+            let r = a % b;
+            let result = if r == 0 || (r > 0) == (b > 0) { r } else { r + b };
+            Ok(Value::unpos(ValueKind::Integer(result)))
+        }
+        "remainder" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("remainder requires 2 arguments at {}", fmt_pos(call_pos)))); }
+            let a = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("remainder: not a number at {}", fmt_pos(call_pos))))?;
+            let b = args[1].as_integer().ok_or_else(|| EvalError::Type(format!("remainder: not a number at {}", fmt_pos(call_pos))))?;
+            if b == 0 { return Err(EvalError::Runtime(format!("remainder: division by zero at {}", fmt_pos(call_pos)))); }
+            Ok(Value::unpos(ValueKind::Integer(a % b)))
+        }
+        "quotient" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("quotient requires 2 arguments at {}", fmt_pos(call_pos)))); }
+            let a = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("quotient: not a number at {}", fmt_pos(call_pos))))?;
+            let b = args[1].as_integer().ok_or_else(|| EvalError::Type(format!("quotient: not a number at {}", fmt_pos(call_pos))))?;
+            if b == 0 { return Err(EvalError::Runtime(format!("quotient: division by zero at {}", fmt_pos(call_pos)))); }
+            Ok(Value::unpos(ValueKind::Integer(a / b)))
+        }
+        "min" => {
+            if args.is_empty() { return Err(EvalError::Arity(format!("min requires at least 1 argument at {}", fmt_pos(call_pos)))); }
+            let mut result = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("min: not a number at {}", fmt_pos(call_pos))))?;
+            for a in &args[1..] {
+                let n = a.as_integer().ok_or_else(|| EvalError::Type(format!("min: not a number at {}", fmt_pos(call_pos))))?;
+                if n < result { result = n; }
+            }
+            Ok(Value::unpos(ValueKind::Integer(result)))
+        }
+        "max" => {
+            if args.is_empty() { return Err(EvalError::Arity(format!("max requires at least 1 argument at {}", fmt_pos(call_pos)))); }
+            let mut result = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("max: not a number at {}", fmt_pos(call_pos))))?;
+            for a in &args[1..] {
+                let n = a.as_integer().ok_or_else(|| EvalError::Type(format!("max: not a number at {}", fmt_pos(call_pos))))?;
+                if n > result { result = n; }
+            }
+            Ok(Value::unpos(ValueKind::Integer(result)))
+        }
+        "expt" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("expt requires 2 arguments at {}", fmt_pos(call_pos)))); }
+            let base = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("expt: not a number at {}", fmt_pos(call_pos))))?;
+            let exp = args[1].as_integer().ok_or_else(|| EvalError::Type(format!("expt: not a number at {}", fmt_pos(call_pos))))?;
+            if exp < 0 {
+                Ok(Value::unpos(ValueKind::Integer(0)))
+            } else {
+                Ok(Value::unpos(ValueKind::Integer(base.pow(exp as u32))))
+            }
+        }
+        "zero?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("zero? requires 1 argument at {}", fmt_pos(call_pos)))); }
+            let n = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("zero?: not a number at {}", fmt_pos(call_pos))))?;
+            Ok(Value::unpos(ValueKind::Boolean(n == 0)))
+        }
+        "positive?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("positive? requires 1 argument at {}", fmt_pos(call_pos)))); }
+            let n = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("positive?: not a number at {}", fmt_pos(call_pos))))?;
+            Ok(Value::unpos(ValueKind::Boolean(n > 0)))
+        }
+        "negative?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("negative? requires 1 argument at {}", fmt_pos(call_pos)))); }
+            let n = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("negative?: not a number at {}", fmt_pos(call_pos))))?;
+            Ok(Value::unpos(ValueKind::Boolean(n < 0)))
+        }
+        "odd?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("odd? requires 1 argument at {}", fmt_pos(call_pos)))); }
+            let n = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("odd?: not a number at {}", fmt_pos(call_pos))))?;
+            Ok(Value::unpos(ValueKind::Boolean(n % 2 != 0)))
+        }
+        "even?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("even? requires 1 argument at {}", fmt_pos(call_pos)))); }
+            let n = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("even?: not a number at {}", fmt_pos(call_pos))))?;
+            Ok(Value::unpos(ValueKind::Boolean(n % 2 == 0)))
+        }
+        "integer?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("integer? requires 1 argument at {}", fmt_pos(call_pos)))); }
+            Ok(Value::unpos(ValueKind::Boolean(matches!(&args[0].kind, ValueKind::Integer(_)))))
+        }
+        // L09: List utilities
+        "list-ref" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("list-ref requires 2 arguments at {}", fmt_pos(call_pos)))); }
+            let elems = match &args[0].kind {
+                ValueKind::List(e) => e,
+                _ => return Err(EvalError::Type(format!("list-ref: not a list at {}", fmt_pos(call_pos)))),
+            };
+            let idx = args[1].as_integer().ok_or_else(|| EvalError::Type(format!("list-ref: not a number at {}", fmt_pos(call_pos))))? as usize;
+            if idx >= elems.len() {
+                return Err(EvalError::Runtime(format!("list-ref: index out of range at {}", fmt_pos(call_pos))));
+            }
+            Ok(elems[idx].clone())
+        }
+        "list-tail" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("list-tail requires 2 arguments at {}", fmt_pos(call_pos)))); }
+            let elems = match &args[0].kind {
+                ValueKind::List(e) => e,
+                _ => return Err(EvalError::Type(format!("list-tail: not a list at {}", fmt_pos(call_pos)))),
+            };
+            let idx = args[1].as_integer().ok_or_else(|| EvalError::Type(format!("list-tail: not a number at {}", fmt_pos(call_pos))))? as usize;
+            if idx > elems.len() {
+                return Err(EvalError::Runtime(format!("list-tail: index out of range at {}", fmt_pos(call_pos))));
+            }
+            Ok(Value::unpos(ValueKind::List(elems[idx..].to_vec())))
+        }
+        "list?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("list? requires 1 argument at {}", fmt_pos(call_pos)))); }
+            let result = match &args[0].kind {
+                ValueKind::List(elems) => {
+                    // A proper list has no dot notation
+                    !(elems.len() >= 3 && matches!(&elems[elems.len() - 2].kind, ValueKind::Symbol(s) if s == "."))
+                }
+                _ => false,
+            };
+            Ok(Value::unpos(ValueKind::Boolean(result)))
+        }
+        "assoc" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("assoc requires 2 arguments at {}", fmt_pos(call_pos)))); }
+            let key = &args[0];
+            let alist = match &args[1].kind {
+                ValueKind::List(e) => e,
+                _ => return Err(EvalError::Type(format!("assoc: not a list at {}", fmt_pos(call_pos)))),
+            };
+            for pair in alist {
+                if let ValueKind::List(p) = &pair.kind {
+                    if !p.is_empty() && p[0] == *key {
+                        return Ok(pair.clone());
+                    }
+                }
+            }
+            Ok(Value::unpos(ValueKind::Boolean(false)))
+        }
+        "equal?" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("equal? requires 2 arguments at {}", fmt_pos(call_pos)))); }
+            Ok(Value::unpos(ValueKind::Boolean(args[0] == args[1])))
+        }
+        "eqv?" | "eq?" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("{} requires 2 arguments at {}", name, fmt_pos(call_pos)))); }
+            Ok(Value::unpos(ValueKind::Boolean(args[0] == args[1])))
+        }
+        "map" => {
+            if args.len() < 2 { return Err(EvalError::Arity(format!("map requires at least 2 arguments at {}", fmt_pos(call_pos)))); }
+            let func = &args[0];
+            let lists: Vec<&Vec<Value>> = args[1..].iter().map(|a| match &a.kind {
+                ValueKind::List(e) => Ok(e),
+                _ => Err(EvalError::Type(format!("map: not a list at {}", fmt_pos(call_pos)))),
+            }).collect::<Result<Vec<_>, _>>()?;
+            let min_len = lists.iter().map(|l| l.len()).min().unwrap_or(0);
+            let mut result = Vec::new();
+            for i in 0..min_len {
+                let func_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+                result.push(apply(func, &func_args, call_pos)?);
+            }
+            Ok(Value::unpos(ValueKind::List(result)))
+        }
+        "for-each" => {
+            if args.len() < 2 { return Err(EvalError::Arity(format!("for-each requires at least 2 arguments at {}", fmt_pos(call_pos)))); }
+            let func = &args[0];
+            let lists: Vec<&Vec<Value>> = args[1..].iter().map(|a| match &a.kind {
+                ValueKind::List(e) => Ok(e),
+                _ => Err(EvalError::Type(format!("for-each: not a list at {}", fmt_pos(call_pos)))),
+            }).collect::<Result<Vec<_>, _>>()?;
+            let min_len = lists.iter().map(|l| l.len()).min().unwrap_or(0);
+            for i in 0..min_len {
+                let func_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+                apply(func, &func_args, call_pos)?;
+            }
+            Ok(Value::unpos(ValueKind::Void))
+        }
+        "reverse" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("reverse requires 1 argument at {}", fmt_pos(call_pos)))); }
+            let elems = match &args[0].kind {
+                ValueKind::List(e) => e,
+                _ => return Err(EvalError::Type(format!("reverse: not a list at {}", fmt_pos(call_pos)))),
+            };
+            let mut rev = elems.clone();
+            rev.reverse();
+            Ok(Value::unpos(ValueKind::List(rev)))
+        }
+        // L09: Character utilities
+        "char-alphabetic?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("char-alphabetic? requires 1 argument at {}", fmt_pos(call_pos)))); }
+            match &args[0].kind {
+                ValueKind::Char(c) => Ok(Value::unpos(ValueKind::Boolean(c.is_alphabetic()))),
+                _ => Err(EvalError::Type(format!("char-alphabetic?: not a char at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "char-numeric?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("char-numeric? requires 1 argument at {}", fmt_pos(call_pos)))); }
+            match &args[0].kind {
+                ValueKind::Char(c) => Ok(Value::unpos(ValueKind::Boolean(c.is_ascii_digit()))),
+                _ => Err(EvalError::Type(format!("char-numeric?: not a char at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "char-upcase" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("char-upcase requires 1 argument at {}", fmt_pos(call_pos)))); }
+            match &args[0].kind {
+                ValueKind::Char(c) => Ok(Value::unpos(ValueKind::Char(c.to_ascii_uppercase()))),
+                _ => Err(EvalError::Type(format!("char-upcase: not a char at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "char-downcase" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("char-downcase requires 1 argument at {}", fmt_pos(call_pos)))); }
+            match &args[0].kind {
+                ValueKind::Char(c) => Ok(Value::unpos(ValueKind::Char(c.to_ascii_lowercase()))),
+                _ => Err(EvalError::Type(format!("char-downcase: not a char at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "char=?" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("char=? requires 2 arguments at {}", fmt_pos(call_pos)))); }
+            match (&args[0].kind, &args[1].kind) {
+                (ValueKind::Char(a), ValueKind::Char(b)) => Ok(Value::unpos(ValueKind::Boolean(a == b))),
+                _ => Err(EvalError::Type(format!("char=?: not chars at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "char<?" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("char<? requires 2 arguments at {}", fmt_pos(call_pos)))); }
+            match (&args[0].kind, &args[1].kind) {
+                (ValueKind::Char(a), ValueKind::Char(b)) => Ok(Value::unpos(ValueKind::Boolean(a < b))),
+                _ => Err(EvalError::Type(format!("char<?: not chars at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "char->integer" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("char->integer requires 1 argument at {}", fmt_pos(call_pos)))); }
+            match &args[0].kind {
+                ValueKind::Char(c) => Ok(Value::unpos(ValueKind::Integer(*c as i64))),
+                _ => Err(EvalError::Type(format!("char->integer: not a char at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "integer->char" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("integer->char requires 1 argument at {}", fmt_pos(call_pos)))); }
+            let n = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("integer->char: not a number at {}", fmt_pos(call_pos))))?;
+            Ok(Value::unpos(ValueKind::Char(char::from_u32(n as u32).unwrap_or('\0'))))
+        }
+        "make-string" => {
+            if args.is_empty() || args.len() > 2 { return Err(EvalError::Arity(format!("make-string requires 1-2 arguments at {}", fmt_pos(call_pos)))); }
+            let len = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("make-string: not a number at {}", fmt_pos(call_pos))))? as usize;
+            let ch = if args.len() == 2 {
+                match &args[1].kind { ValueKind::Char(c) => *c, _ => return Err(EvalError::Type(format!("make-string: not a char at {}", fmt_pos(call_pos)))) }
+            } else { '\0' };
+            Ok(Value::unpos(ValueKind::Str(std::iter::repeat(ch).take(len).collect())))
+        }
+        // L09: String utilities
+        "string=?" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("string=? requires 2 arguments at {}", fmt_pos(call_pos)))); }
+            match (&args[0].kind, &args[1].kind) {
+                (ValueKind::Str(a), ValueKind::Str(b)) => Ok(Value::unpos(ValueKind::Boolean(a == b))),
+                _ => Err(EvalError::Type(format!("string=?: not strings at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "string<?" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("string<? requires 2 arguments at {}", fmt_pos(call_pos)))); }
+            match (&args[0].kind, &args[1].kind) {
+                (ValueKind::Str(a), ValueKind::Str(b)) => Ok(Value::unpos(ValueKind::Boolean(a < b))),
+                _ => Err(EvalError::Type(format!("string<?: not strings at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "string-ci=?" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("string-ci=? requires 2 arguments at {}", fmt_pos(call_pos)))); }
+            match (&args[0].kind, &args[1].kind) {
+                (ValueKind::Str(a), ValueKind::Str(b)) => Ok(Value::unpos(ValueKind::Boolean(a.to_lowercase() == b.to_lowercase()))),
+                _ => Err(EvalError::Type(format!("string-ci=?: not strings at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "string-upcase" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("string-upcase requires 1 argument at {}", fmt_pos(call_pos)))); }
+            match &args[0].kind {
+                ValueKind::Str(s) => Ok(Value::unpos(ValueKind::Str(s.to_uppercase()))),
+                _ => Err(EvalError::Type(format!("string-upcase: not a string at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "string-downcase" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("string-downcase requires 1 argument at {}", fmt_pos(call_pos)))); }
+            match &args[0].kind {
+                ValueKind::Str(s) => Ok(Value::unpos(ValueKind::Str(s.to_lowercase()))),
+                _ => Err(EvalError::Type(format!("string-downcase: not a string at {}", fmt_pos(call_pos)))),
+            }
+        }
         _ => Err(EvalError::UnboundVariable(format!("{} at {}", name, fmt_pos(call_pos)))),
     }
 }

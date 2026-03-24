@@ -52,7 +52,18 @@ impl Env {
                       "string-append", "string-length", "substring",
                       "string->number", "number->string",
                       "symbol->string", "string->symbol", "string-ref",
-                      "string-copy", "apply"] {
+                      "string-copy", "apply",
+                      // L09
+                      "abs", "modulo", "remainder", "quotient",
+                      "min", "max", "expt",
+                      "zero?", "positive?", "negative?", "odd?", "even?",
+                      "list-ref", "list-tail", "list?", "assoc", "map", "equal?", "eqv?", "eq?",
+                      "char-alphabetic?", "char-numeric?",
+                      "char-upcase", "char-downcase", "char=?", "char<?",
+                      "string=?", "string<?", "string-ci=?",
+                      "string-upcase", "string-downcase",
+                      "integer?", "char->integer", "integer->char",
+                      "make-string", "for-each", "reverse"] {
             env.set(name.to_string(), Value::unpos(ValueKind::Symbol(name.to_string())));
         }
         env
