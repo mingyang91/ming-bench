@@ -1438,6 +1438,52 @@ pub(super) enum PatternBinding {
     Repeated(Vec<Expr>),
 }
 
+fn cek_run_with_limit(exprs: &[Expr], env: &Env, output: &mut String, max_steps: u64) -> Result<Value, EvalError> {
+    if exprs.is_empty() {
+        return Ok(Value::Void);
+    }
+    let mut wind_stack: Vec<WindEntry> = vec![];
+    let mut handler_stack: Vec<HandlerEntry> = vec![];
+    let kont = halt_kont();
+    let mut state = eval_body_state(exprs, env.clone(), kont);
+    let mut steps: u64 = 0;
+    loop {
+        steps += 1;
+        if steps > max_steps {
+            return Err(EvalError::StepLimitExceeded(
+                format!("exceeded {max_steps} steps"),
+            ));
+        }
+        match state {
+            State::Done(val) => return Ok(val),
+            State::Eval(ref expr, ref env, ref kont) => {
+                let e = expr.clone();
+                let env = env.clone();
+                let kont = kont.clone();
+                state = cek_eval(&e, &env, kont, output)?;
+            }
+            State::Apply(val, kont) => {
+                state = cek_apply_kont(val, &kont, &mut wind_stack, &mut handler_stack, output)?;
+            }
+            State::Invoke(func, args, pos, kont) => {
+                state = cek_invoke(func, args, pos, kont, &mut wind_stack, &mut handler_stack, output)?;
+            }
+        }
+    }
+}
+
+/// Evaluate with a step limit. Returns error if budget exceeded.
+pub fn eval_str_with_limit(input: &str, max_steps: u64) -> Result<String, EvalError> {
+    let exprs = parse_all(input)?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse("empty input".into()));
+    }
+    let env = default_env();
+    let mut output = String::new();
+    let result = cek_run_with_limit(&exprs, &env, &mut output, max_steps)?;
+    Ok(result.to_string())
+}
+
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {

@@ -13,4 +13,6 @@ pub enum EvalError {
     DivisionByZero(String),
     #[error("unhandled exception: {0}")]
     Exception(String),
+    #[error("step limit exceeded: {0}")]
+    StepLimitExceeded(String),
 }
