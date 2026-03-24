@@ -147,6 +147,8 @@ func evalList(expr *Expr, env *Env) (Value, error) {
 			return evalDefineRecordType(expr, env)
 		case "case-lambda":
 			return evalCaseLambda(expr, env)
+		case "let*":
+			return evalLetStar(expr, env)
 		case "letrec":
 			return evalLetrec(expr, env)
 		case "letrec*":
@@ -329,6 +331,11 @@ func defaultEnv(output *strings.Builder) *Env {
 	env.Set("list-tail", &BuiltinFunc{Name: "list-tail", Fn: builtinListTail})
 	env.Set("list?", &BuiltinFunc{Name: "list?", Fn: builtinListQ})
 	env.Set("assoc", &BuiltinFunc{Name: "assoc", Fn: builtinAssoc})
+	env.Set("assq", &BuiltinFunc{Name: "assq", Fn: builtinAssq})
+	env.Set("assv", &BuiltinFunc{Name: "assv", Fn: builtinAssv})
+	env.Set("member", &BuiltinFunc{Name: "member", Fn: builtinMember})
+	env.Set("memq", &BuiltinFunc{Name: "memq", Fn: builtinMemq})
+	env.Set("memv", &BuiltinFunc{Name: "memv", Fn: builtinMemv})
 	env.Set("equal?", &BuiltinFunc{Name: "equal?", Fn: builtinEqualQ})
 	env.Set("eq?", &BuiltinFunc{Name: "eq?", Fn: builtinEqQ})
 	env.Set("map", &MapVal{})
@@ -360,6 +367,23 @@ func defaultEnv(output *strings.Builder) *Env {
 	env.Set("rational?", &BuiltinFunc{Name: "rational?", Fn: builtinRationalQ})
 	env.Set("procedure?", &BuiltinFunc{Name: "procedure?", Fn: builtinProcedureQ})
 
+	// L17 builtins — pair mutation
+	env.Set("set-car!", &BuiltinFunc{Name: "set-car!", Fn: builtinSetCar})
+	env.Set("set-cdr!", &BuiltinFunc{Name: "set-cdr!", Fn: builtinSetCdr})
+
+	// L17 builtins — cxr compositions
+	env.Set("caar", &BuiltinFunc{Name: "caar", Fn: func(args []Value) (Value, error) { return cxr(args, "caar", "aa") }})
+	env.Set("cadr", &BuiltinFunc{Name: "cadr", Fn: func(args []Value) (Value, error) { return cxr(args, "cadr", "da") }})
+	env.Set("cdar", &BuiltinFunc{Name: "cdar", Fn: func(args []Value) (Value, error) { return cxr(args, "cdar", "ad") }})
+	env.Set("cddr", &BuiltinFunc{Name: "cddr", Fn: func(args []Value) (Value, error) { return cxr(args, "cddr", "dd") }})
+	env.Set("caddr", &BuiltinFunc{Name: "caddr", Fn: func(args []Value) (Value, error) { return cxr(args, "caddr", "dda") }})
+	env.Set("cdddr", &BuiltinFunc{Name: "cdddr", Fn: func(args []Value) (Value, error) { return cxr(args, "cdddr", "ddd") }})
+	env.Set("cadddr", &BuiltinFunc{Name: "cadddr", Fn: func(args []Value) (Value, error) { return cxr(args, "cadddr", "ddda") }})
+	env.Set("caddar", &BuiltinFunc{Name: "caddar", Fn: func(args []Value) (Value, error) { return cxr(args, "caddar", "adda") }})
+
+	// L17 builtins — for-each
+	env.Set("for-each", &BuiltinFunc{Name: "for-each", Fn: builtinForEach})
+
 	// L14 builtins — vectors
 	env.Set("vector", &BuiltinFunc{Name: "vector", Fn: builtinVector})
 	env.Set("make-vector", &BuiltinFunc{Name: "make-vector", Fn: builtinMakeVector})
@@ -370,6 +394,15 @@ func defaultEnv(output *strings.Builder) *Env {
 	env.Set("vector->list", &BuiltinFunc{Name: "vector->list", Fn: builtinVectorToList})
 	env.Set("list->vector", &BuiltinFunc{Name: "list->vector", Fn: builtinListToVector})
 	env.Set("eqv?", &BuiltinFunc{Name: "eqv?", Fn: builtinEqvQ})
+	env.Set("gcd", &BuiltinFunc{Name: "gcd", Fn: builtinGcd})
+	env.Set("lcm", &BuiltinFunc{Name: "lcm", Fn: builtinLcm})
+	env.Set("truncate", &BuiltinFunc{Name: "truncate", Fn: builtinTruncate})
+	env.Set("round", &BuiltinFunc{Name: "round", Fn: builtinRound})
+	env.Set("make-string", &BuiltinFunc{Name: "make-string", Fn: builtinMakeString})
+	env.Set("string", &BuiltinFunc{Name: "string", Fn: builtinStringConstructor})
+	env.Set("string>?", &BuiltinFunc{Name: "string>?", Fn: builtinStringGtQ})
+	env.Set("string<=?", &BuiltinFunc{Name: "string<=?", Fn: builtinStringLeQ})
+	env.Set("string>=?", &BuiltinFunc{Name: "string>=?", Fn: builtinStringGeQ})
 	env.Set("reverse", &BuiltinFunc{Name: "reverse", Fn: builtinReverse})
 	env.Set("error", &BuiltinFunc{Name: "error", Fn: builtinError})
 
@@ -903,6 +936,36 @@ func evalLet(expr *Expr, env *Env) (Value, error) {
 	return &tailCall{expr: body[len(body)-1], env: childEnv}, nil
 }
 
+func evalLetStar(expr *Expr, env *Env) (Value, error) {
+	// (let* ((var val) ...) body...)
+	if len(expr.List) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: bad syntax", expr.Line, expr.Col)}
+	}
+	bindingsExpr := expr.List[1]
+	if bindingsExpr.Kind != ExprList {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: expected bindings list", bindingsExpr.Line, bindingsExpr.Col)}
+	}
+	childEnv := NewEnv(env)
+	for _, b := range bindingsExpr.List {
+		if b.Kind != ExprList || len(b.List) != 2 || b.List[0].Kind != ExprSymbol {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: bad binding", b.Line, b.Col)}
+		}
+		val, err := eval(b.List[1], childEnv)
+		if err != nil {
+			return nil, err
+		}
+		childEnv.Set(b.List[0].SVal, val)
+	}
+	body := expr.List[2:]
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := eval(bodyExpr, childEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &tailCall{expr: body[len(body)-1], env: childEnv}, nil
+}
+
 func evalBegin(expr *Expr, env *Env) (Value, error) {
 	if len(expr.List) < 2 {
 		return &VoidVal{}, nil
@@ -937,7 +1000,7 @@ func evalSet(expr *Expr, env *Env) (Value, error) {
 
 func evalCond(expr *Expr, env *Env) (Value, error) {
 	for _, clause := range expr.List[1:] {
-		if clause.Kind != ExprList || len(clause.List) < 2 {
+		if clause.Kind != ExprList || len(clause.List) < 1 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cond: bad clause", clause.Line, clause.Col)}
 		}
 		// else clause
@@ -956,6 +1019,10 @@ func evalCond(expr *Expr, env *Env) (Value, error) {
 			return nil, err
 		}
 		if isTruthy(test) {
+			// Single-expression clause: return the test value
+			if len(clause.List) == 1 {
+				return test, nil
+			}
 			body := clause.List[1:]
 			for _, e := range body[:len(body)-1] {
 				_, err = eval(e, env)
@@ -1571,20 +1638,40 @@ func builtinListQ(args []Value) (Value, error) {
 	if len(args) != 1 {
 		return nil, fmt.Errorf("list?: expected 1 argument, got %d", len(args))
 	}
-	cur := args[0]
+	// Tortoise-and-hare cycle detection
+	slow := args[0]
+	fast := args[0]
 	for {
-		switch v := cur.(type) {
-		case *NilVal:
-			return &BoolVal{Val: true}, nil
-		case *PairVal:
-			cur = v.Cdr
-		default:
+		// Advance fast by 2
+		fp, ok := fast.(*PairVal)
+		if !ok {
+			_, isNil := fast.(*NilVal)
+			return &BoolVal{Val: isNil}, nil
+		}
+		fast = fp.Cdr
+		fp2, ok := fast.(*PairVal)
+		if !ok {
+			_, isNil := fast.(*NilVal)
+			return &BoolVal{Val: isNil}, nil
+		}
+		fast = fp2.Cdr
+		// Advance slow by 1
+		slow = slow.(*PairVal).Cdr
+		// If they meet, it's circular
+		if slow == fast {
 			return &BoolVal{Val: false}, nil
 		}
 	}
 }
 
+type equalPair struct{ a, b Value }
+
 func schemeEqual(a, b Value) bool {
+	seen := make(map[equalPair]bool)
+	return schemeEqualRec(a, b, seen)
+}
+
+func schemeEqualRec(a, b Value, seen map[equalPair]bool) bool {
 	switch av := a.(type) {
 	case *IntVal:
 		if bv, ok := b.(*IntVal); ok {
@@ -1611,7 +1698,12 @@ func schemeEqual(a, b Value) bool {
 		return ok
 	case *PairVal:
 		if bv, ok := b.(*PairVal); ok {
-			return schemeEqual(av.Car, bv.Car) && schemeEqual(av.Cdr, bv.Cdr)
+			key := equalPair{a, b}
+			if seen[key] {
+				return true // already comparing these, assume equal
+			}
+			seen[key] = true
+			return schemeEqualRec(av.Car, bv.Car, seen) && schemeEqualRec(av.Cdr, bv.Cdr, seen)
 		}
 	case *VectorVal:
 		if bv, ok := b.(*VectorVal); ok {
@@ -1619,14 +1711,22 @@ func schemeEqual(a, b Value) bool {
 				return false
 			}
 			for i := range av.Elems {
-				if !schemeEqual(av.Elems[i], bv.Elems[i]) {
+				if !schemeEqualRec(av.Elems[i], bv.Elems[i], seen) {
 					return false
 				}
 			}
 			return true
 		}
+	case *RationalVal:
+		if bv, ok := b.(*RationalVal); ok {
+			return av.Num == bv.Num && av.Denom == bv.Denom
+		}
+	case *FloatVal:
+		if bv, ok := b.(*FloatVal); ok {
+			return av.Val == bv.Val
+		}
 	}
-	return false
+	return a == b
 }
 
 func builtinEqualQ(args []Value) (Value, error) {
@@ -1689,6 +1789,148 @@ func builtinAssoc(args []Value) (Value, error) {
 			cur = v.Cdr
 		default:
 			return nil, fmt.Errorf("assoc: expected list")
+		}
+	}
+}
+
+// schemeEq tests eq? identity (pointer equality for compound, value equality for atoms).
+func schemeEq(a, b Value) bool {
+	switch av := a.(type) {
+	case *IntVal:
+		if bv, ok := b.(*IntVal); ok {
+			return av.Val == bv.Val
+		}
+	case *BoolVal:
+		if bv, ok := b.(*BoolVal); ok {
+			return av.Val == bv.Val
+		}
+	case *SymbolVal:
+		if bv, ok := b.(*SymbolVal); ok {
+			return av.Name == bv.Name
+		}
+	case *CharVal:
+		if bv, ok := b.(*CharVal); ok {
+			return av.Val == bv.Val
+		}
+	case *NilVal:
+		_, ok := b.(*NilVal)
+		return ok
+	case *VoidVal:
+		_, ok := b.(*VoidVal)
+		return ok
+	}
+	return a == b
+}
+
+func builtinAssq(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("assq: expected 2 arguments, got %d", len(args))
+	}
+	key := args[0]
+	cur := args[1]
+	for {
+		switch v := cur.(type) {
+		case *NilVal:
+			return &BoolVal{Val: false}, nil
+		case *PairVal:
+			pair, ok := v.Car.(*PairVal)
+			if !ok {
+				return nil, fmt.Errorf("assq: expected list of pairs")
+			}
+			if schemeEq(pair.Car, key) {
+				return pair, nil
+			}
+			cur = v.Cdr
+		default:
+			return nil, fmt.Errorf("assq: expected list")
+		}
+	}
+}
+
+func builtinAssv(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("assv: expected 2 arguments, got %d", len(args))
+	}
+	key := args[0]
+	cur := args[1]
+	for {
+		switch v := cur.(type) {
+		case *NilVal:
+			return &BoolVal{Val: false}, nil
+		case *PairVal:
+			pair, ok := v.Car.(*PairVal)
+			if !ok {
+				return nil, fmt.Errorf("assv: expected list of pairs")
+			}
+			if schemeEqv(pair.Car, key) {
+				return pair, nil
+			}
+			cur = v.Cdr
+		default:
+			return nil, fmt.Errorf("assv: expected list")
+		}
+	}
+}
+
+func builtinMember(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("member: expected 2 arguments, got %d", len(args))
+	}
+	key := args[0]
+	cur := args[1]
+	for {
+		switch v := cur.(type) {
+		case *NilVal:
+			return &BoolVal{Val: false}, nil
+		case *PairVal:
+			if schemeEqual(v.Car, key) {
+				return v, nil
+			}
+			cur = v.Cdr
+		default:
+			return nil, fmt.Errorf("member: expected list")
+		}
+	}
+}
+
+func builtinMemq(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("memq: expected 2 arguments, got %d", len(args))
+	}
+	key := args[0]
+	cur := args[1]
+	for {
+		switch v := cur.(type) {
+		case *NilVal:
+			return &BoolVal{Val: false}, nil
+		case *PairVal:
+			if schemeEq(v.Car, key) {
+				return v, nil
+			}
+			cur = v.Cdr
+		default:
+			return nil, fmt.Errorf("memq: expected list")
+		}
+	}
+}
+
+func builtinMemv(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("memv: expected 2 arguments, got %d", len(args))
+	}
+	key := args[0]
+	cur := args[1]
+	for {
+		switch v := cur.(type) {
+		case *NilVal:
+			return &BoolVal{Val: false}, nil
+		case *PairVal:
+			if schemeEqv(v.Car, key) {
+				return v, nil
+			}
+			cur = v.Cdr
+		default:
+			return nil, fmt.Errorf("memv: expected list")
 		}
 	}
 }
@@ -2560,4 +2802,300 @@ func builtinIntegerToChar(args []Value) (Value, error) {
 		return nil, fmt.Errorf("integer->char: expected integer, got %s", args[0].String())
 	}
 	return &CharVal{Val: rune(n.Val)}, nil
+}
+
+// --- L17: Pair mutation ---
+
+func builtinSetCar(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("set-car!: expected 2 arguments, got %d", len(args))
+	}
+	p, ok := args[0].(*PairVal)
+	if !ok {
+		return nil, fmt.Errorf("set-car!: expected pair, got %s", args[0].String())
+	}
+	p.Car = args[1]
+	return &VoidVal{}, nil
+}
+
+func builtinSetCdr(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("set-cdr!: expected 2 arguments, got %d", len(args))
+	}
+	p, ok := args[0].(*PairVal)
+	if !ok {
+		return nil, fmt.Errorf("set-cdr!: expected pair, got %s", args[0].String())
+	}
+	p.Cdr = args[1]
+	return &VoidVal{}, nil
+}
+
+// cxr implements compositions of car/cdr.
+// ops is a string like "da" for cadr: read right-to-left, 'a'=car, 'd'=cdr.
+func cxr(args []Value, name, ops string) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%s: expected 1 argument, got %d", name, len(args))
+	}
+	v := args[0]
+	for i := 0; i < len(ops); i++ {
+		p, ok := v.(*PairVal)
+		if !ok {
+			return nil, fmt.Errorf("%s: expected pair, got %s", name, v.String())
+		}
+		if ops[i] == 'a' {
+			v = p.Car
+		} else {
+			v = p.Cdr
+		}
+	}
+	return v, nil
+}
+
+// builtinForEach implements (for-each proc list1 ...).
+func builtinForEach(args []Value) (Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("for-each: expected at least 2 arguments, got %d", len(args))
+	}
+	proc := args[0]
+	lists := args[1:]
+	for {
+		// Check if any list is exhausted
+		anyDone := false
+		for _, l := range lists {
+			if _, ok := l.(*NilVal); ok {
+				anyDone = true
+				break
+			}
+		}
+		if anyDone {
+			break
+		}
+		// Collect heads and advance
+		callArgs := make([]Value, len(lists))
+		for i := range lists {
+			p, ok := lists[i].(*PairVal)
+			if !ok {
+				return nil, fmt.Errorf("for-each: expected list")
+			}
+			callArgs[i] = p.Car
+			lists[i] = p.Cdr
+		}
+		_, err := callProc(proc, callArgs)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &VoidVal{}, nil
+}
+
+// callProc calls a procedure without needing a callExpr (for use from builtins).
+func callProc(proc Value, args []Value) (Value, error) {
+	switch fn := proc.(type) {
+	case *BuiltinFunc:
+		return fn.Fn(args)
+	case *LambdaVal:
+		if fn.RestParam != "" {
+			if len(args) < len(fn.Params) {
+				return nil, fmt.Errorf("expected at least %d arguments, got %d", len(fn.Params), len(args))
+			}
+		} else {
+			if len(args) != len(fn.Params) {
+				return nil, fmt.Errorf("expected %d arguments, got %d", len(fn.Params), len(args))
+			}
+		}
+		childEnv := NewEnv(fn.Env)
+		for i, p := range fn.Params {
+			childEnv.Set(p, args[i])
+		}
+		if fn.RestParam != "" {
+			rest := Value(&NilVal{})
+			for i := len(args) - 1; i >= len(fn.Params); i-- {
+				rest = &PairVal{Car: args[i], Cdr: rest}
+			}
+			childEnv.Set(fn.RestParam, rest)
+		}
+		var result Value
+		var err error
+		for _, bodyExpr := range fn.Body {
+			result, err = eval(bodyExpr, childEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	case *CaseLambdaVal:
+		for _, clause := range fn.Clauses {
+			if clause.RestParam != "" {
+				if len(args) < len(clause.Params) {
+					continue
+				}
+			} else {
+				if len(args) != len(clause.Params) {
+					continue
+				}
+			}
+			childEnv := NewEnv(fn.Env)
+			for i, p := range clause.Params {
+				childEnv.Set(p, args[i])
+			}
+			if clause.RestParam != "" {
+				rest := Value(&NilVal{})
+				for i := len(args) - 1; i >= len(clause.Params); i-- {
+					rest = &PairVal{Car: args[i], Cdr: rest}
+				}
+				childEnv.Set(clause.RestParam, rest)
+			}
+			var result Value
+			var err error
+			for _, bodyExpr := range clause.Body {
+				result, err = eval(bodyExpr, childEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		return nil, fmt.Errorf("no matching clause for %d arguments", len(args))
+	default:
+		return nil, fmt.Errorf("not a procedure: %s", proc.String())
+	}
+}
+
+func builtinGcd(args []Value) (Value, error) {
+	if len(args) == 0 {
+		return &IntVal{Val: 0}, nil
+	}
+	result := int64(0)
+	for _, a := range args {
+		n, ok := a.(*IntVal)
+		if !ok {
+			return nil, fmt.Errorf("gcd: expected integer, got %s", a.String())
+		}
+		result = gcd(result, n.Val)
+	}
+	if result < 0 {
+		result = -result
+	}
+	return &IntVal{Val: result}, nil
+}
+
+func builtinLcm(args []Value) (Value, error) {
+	if len(args) == 0 {
+		return &IntVal{Val: 1}, nil
+	}
+	result := int64(1)
+	for _, a := range args {
+		n, ok := a.(*IntVal)
+		if !ok {
+			return nil, fmt.Errorf("lcm: expected integer, got %s", a.String())
+		}
+		v := n.Val
+		if v < 0 {
+			v = -v
+		}
+		if v == 0 {
+			return &IntVal{Val: 0}, nil
+		}
+		result = result / gcd(result, v) * v
+	}
+	return &IntVal{Val: result}, nil
+}
+
+func builtinTruncate(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("truncate: expected 1 argument, got %d", len(args))
+	}
+	switch n := args[0].(type) {
+	case *IntVal:
+		return n, nil
+	case *FloatVal:
+		return &FloatVal{Val: math.Trunc(n.Val)}, nil
+	case *RationalVal:
+		return &IntVal{Val: n.Num / n.Denom}, nil
+	default:
+		return nil, fmt.Errorf("truncate: expected number, got %s", args[0].String())
+	}
+}
+
+func builtinRound(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("round: expected 1 argument, got %d", len(args))
+	}
+	switch n := args[0].(type) {
+	case *IntVal:
+		return n, nil
+	case *FloatVal:
+		return &FloatVal{Val: math.RoundToEven(n.Val)}, nil
+	case *RationalVal:
+		return &IntVal{Val: int64(math.RoundToEven(float64(n.Num) / float64(n.Denom)))}, nil
+	default:
+		return nil, fmt.Errorf("round: expected number, got %s", args[0].String())
+	}
+}
+
+func builtinMakeString(args []Value) (Value, error) {
+	if len(args) < 1 || len(args) > 2 {
+		return nil, fmt.Errorf("make-string: expected 1-2 arguments, got %d", len(args))
+	}
+	n, ok := args[0].(*IntVal)
+	if !ok {
+		return nil, fmt.Errorf("make-string: expected integer, got %s", args[0].String())
+	}
+	ch := rune(' ')
+	if len(args) == 2 {
+		c, ok := args[1].(*CharVal)
+		if !ok {
+			return nil, fmt.Errorf("make-string: expected char, got %s", args[1].String())
+		}
+		ch = c.Val
+	}
+	return &StringVal{Val: strings.Repeat(string(ch), int(n.Val))}, nil
+}
+
+func builtinStringConstructor(args []Value) (Value, error) {
+	var buf strings.Builder
+	for _, a := range args {
+		c, ok := a.(*CharVal)
+		if !ok {
+			return nil, fmt.Errorf("string: expected char, got %s", a.String())
+		}
+		buf.WriteRune(c.Val)
+	}
+	return &StringVal{Val: buf.String()}, nil
+}
+
+func builtinStringGtQ(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("string>?: expected 2 arguments, got %d", len(args))
+	}
+	a, ok1 := args[0].(*StringVal)
+	b, ok2 := args[1].(*StringVal)
+	if !ok1 || !ok2 {
+		return nil, fmt.Errorf("string>?: expected strings")
+	}
+	return &BoolVal{Val: a.Val > b.Val}, nil
+}
+
+func builtinStringLeQ(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("string<=?: expected 2 arguments, got %d", len(args))
+	}
+	a, ok1 := args[0].(*StringVal)
+	b, ok2 := args[1].(*StringVal)
+	if !ok1 || !ok2 {
+		return nil, fmt.Errorf("string<=?: expected strings")
+	}
+	return &BoolVal{Val: a.Val <= b.Val}, nil
+}
+
+func builtinStringGeQ(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("string>=?: expected 2 arguments, got %d", len(args))
+	}
+	a, ok1 := args[0].(*StringVal)
+	b, ok2 := args[1].(*StringVal)
+	if !ok1 || !ok2 {
+		return nil, fmt.Errorf("string>=?: expected strings")
+	}
+	return &BoolVal{Val: a.Val >= b.Val}, nil
 }

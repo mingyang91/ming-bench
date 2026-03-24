@@ -41,7 +41,7 @@ func newMacroBindings() *macroBindings {
 
 var specialForms = map[string]bool{
 	"define": true, "if": true, "quote": true, "lambda": true,
-	"let": true, "begin": true, "cond": true, "set!": true,
+	"let": true, "let*": true, "begin": true, "cond": true, "set!": true,
 	"and": true, "or": true, "define-syntax": true, "syntax-rules": true,
 	"else": true,
 }

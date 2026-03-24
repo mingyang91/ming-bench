@@ -146,6 +146,7 @@ type PairVal struct {
 func (v *PairVal) String() string {
 	var buf strings.Builder
 	buf.WriteByte('(')
+	visited := make(map[*PairVal]bool)
 	cur := Value(v)
 	first := true
 	for {
@@ -153,6 +154,11 @@ func (v *PairVal) String() string {
 		if !ok {
 			break
 		}
+		if visited[p] {
+			buf.WriteString(" ...")
+			break
+		}
+		visited[p] = true
 		if !first {
 			buf.WriteByte(' ')
 		}
@@ -161,8 +167,10 @@ func (v *PairVal) String() string {
 		cur = p.Cdr
 	}
 	if _, ok := cur.(*NilVal); !ok {
-		buf.WriteString(" . ")
-		buf.WriteString(cur.String())
+		if p, ok := cur.(*PairVal); !ok || !visited[p] {
+			buf.WriteString(" . ")
+			buf.WriteString(cur.String())
+		}
 	}
 	buf.WriteByte(')')
 	return buf.String()
@@ -261,6 +269,7 @@ func displayVector(v *VectorVal) string {
 func displayPair(v *PairVal) string {
 	var buf strings.Builder
 	buf.WriteByte('(')
+	visited := make(map[*PairVal]bool)
 	cur := Value(v)
 	first := true
 	for {
@@ -268,6 +277,11 @@ func displayPair(v *PairVal) string {
 		if !ok {
 			break
 		}
+		if visited[p] {
+			buf.WriteString(" ...")
+			break
+		}
+		visited[p] = true
 		if !first {
 			buf.WriteByte(' ')
 		}
@@ -276,8 +290,10 @@ func displayPair(v *PairVal) string {
 		cur = p.Cdr
 	}
 	if _, ok := cur.(*NilVal); !ok {
-		buf.WriteString(" . ")
-		buf.WriteString(DisplayString(cur))
+		if p, ok := cur.(*PairVal); !ok || !visited[p] {
+			buf.WriteString(" . ")
+			buf.WriteString(DisplayString(cur))
+		}
 	}
 	buf.WriteByte(')')
 	return buf.String()
