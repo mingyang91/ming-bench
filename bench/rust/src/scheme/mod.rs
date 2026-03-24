@@ -178,18 +178,23 @@ fn env_update(env: &Env, name: &str, val: Value) -> bool {
     }
 }
 
+// --- TCO Trampoline ---
+
+enum Bounce {
+    Done(Value),
+    Tail(Spanned, Env),
+}
+
 // --- Macros (syntax-rules) ---
 
-
-fn apply_macro(
+fn expand_macro(
     items: &[Spanned],
     literals: &[String],
     rules: &[(Spanned, Spanned)],
     def_env: &Env,
     env: &Env,
-    out: &Output,
     span: Span,
-) -> Result<Value, EvalError> {
+) -> Result<Spanned, EvalError> {
     let Some((expanded, renames)) = macros::try_expand(items, literals, rules) else {
         return Err(EvalError::Type("no matching pattern for macro".into(), span));
     };
@@ -198,17 +203,31 @@ fn apply_macro(
             env_set(env, gs.clone(), val);
         }
     }
-    eval(&expanded, env, out)
+    Ok(expanded)
 }
 
 // --- Evaluator ---
 
 fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
+    let mut cur = expr.clone();
+    let mut cur_env = env.clone();
+    loop {
+        match eval_step(&cur, &cur_env, out)? {
+            Bounce::Done(v) => return Ok(v),
+            Bounce::Tail(next, next_env) => {
+                cur = next;
+                cur_env = next_env;
+            }
+        }
+    }
+}
+
+fn eval_step(expr: &Spanned, env: &Env, out: &Output) -> Result<Bounce, EvalError> {
     let span = expr.span;
     match &expr.val {
-        Value::Integer(_) | Value::Float(_) | Value::Rational(..) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Pair(..) | Value::Lambda(..) | Value::CaseLambda(..) | Value::SyntaxRules { .. } | Value::Vector(..) | Value::Record(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..) => Ok(expr.val.clone()),
+        Value::Integer(_) | Value::Float(_) | Value::Rational(..) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Pair(..) | Value::Lambda(..) | Value::CaseLambda(..) | Value::SyntaxRules { .. } | Value::Vector(..) | Value::Record(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..) => Ok(Bounce::Done(expr.val.clone())),
         Value::Symbol(name) => {
-            env_get(env, name).ok_or_else(|| EvalError::UnboundVariable(name.clone(), span))
+            env_get(env, name).map(Bounce::Done).ok_or_else(|| EvalError::UnboundVariable(name.clone(), span))
         }
         Value::List(items) => {
             if items.is_empty() {
@@ -221,7 +240,7 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         if items.len() != 2 {
                             return Err(EvalError::Arity("quote requires 1 argument".into(), span));
                         }
-                        return Ok(items[1].val.clone());
+                        return Ok(Bounce::Done(items[1].val.clone()));
                     }
                     "if" => {
                         if items.len() < 3 || items.len() > 4 {
@@ -229,11 +248,11 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         }
                         let cond = eval(&items[1], env, out)?;
                         if cond.is_truthy() {
-                            return eval(&items[2], env, out);
+                            return Ok(Bounce::Tail(items[2].clone(), env.clone()));
                         } else if items.len() == 4 {
-                            return eval(&items[3], env, out);
+                            return Ok(Bounce::Tail(items[3].clone(), env.clone()));
                         } else {
-                            return Ok(Value::Void);
+                            return Ok(Bounce::Done(Value::Void));
                         }
                     }
                     "define" => {
@@ -244,7 +263,7 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                             Value::Symbol(var_name) => {
                                 let val = eval(&items[2], env, out)?;
                                 env_set(env, var_name.clone(), val);
-                                return Ok(Value::Void);
+                                return Ok(Bounce::Done(Value::Void));
                             }
                             Value::List(sig) => {
                                 if sig.is_empty() {
@@ -258,7 +277,7 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                                 let body = items[2..].to_vec();
                                 let lambda = Value::Lambda(params, rest, body, env.clone());
                                 env_set(env, func_name, lambda);
-                                return Ok(Value::Void);
+                                return Ok(Bounce::Done(Value::Void));
                             }
                             _ => return Err(EvalError::Type("define: expected symbol or list".into(), span)),
                         }
@@ -273,7 +292,7 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                             _ => return Err(EvalError::Type("lambda: expected parameter list".into(), span)),
                         };
                         let body = items[2..].to_vec();
-                        return Ok(Value::Lambda(params, rest, body, env.clone()));
+                        return Ok(Bounce::Done(Value::Lambda(params, rest, body, env.clone())));
                     }
                     "case-lambda" => {
                         let mut clauses = Vec::new();
@@ -292,15 +311,17 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                             let body = parts[1..].to_vec();
                             clauses.push((params, rest, body, env.clone()));
                         }
-                        return Ok(Value::CaseLambda(clauses));
+                        return Ok(Bounce::Done(Value::CaseLambda(clauses)));
                     }
-                    "let" => return eval_let(&items[1..], env, out, span),
+                    "let" => return eval_let_step(&items[1..], env, out, span),
                     "begin" => {
-                        let mut result = Value::Void;
-                        for expr in &items[1..] {
-                            result = eval(expr, env, out)?;
+                        if items.len() <= 1 {
+                            return Ok(Bounce::Done(Value::Void));
                         }
-                        return Ok(result);
+                        for e in &items[1..items.len()-1] {
+                            eval(e, env, out)?;
+                        }
+                        return Ok(Bounce::Tail(items[items.len()-1].clone(), env.clone()));
                     }
                     "set!" => {
                         if items.len() != 3 {
@@ -313,11 +334,11 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         if !env_update(env, name, val) {
                             return Err(EvalError::UnboundVariable(name.clone(), span));
                         }
-                        return Ok(Value::Void);
+                        return Ok(Bounce::Done(Value::Void));
                     }
-                    "cond" => return eval_cond(&items[1..], env, out, span),
-                    "and" => return eval_and(&items[1..], env, out),
-                    "or" => return eval_or(&items[1..], env, out),
+                    "cond" => return eval_cond_step(&items[1..], env, out, span),
+                    "and" => return eval_and_step(&items[1..], env, out),
+                    "or" => return eval_or_step(&items[1..], env, out),
                     "string-set!" => {
                         if items.len() != 4 {
                             return Err(EvalError::Arity("string-set! requires 3 arguments".into(), span));
@@ -349,14 +370,14 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         }
                         chars[idx] = ch;
                         env_update(env, &name, Value::Str(chars.into_iter().collect()));
-                        return Ok(Value::Void);
+                        return Ok(Bounce::Done(Value::Void));
                     }
                     "not" => {
                         if items.len() != 2 {
                             return Err(EvalError::Arity("not requires 1 argument".into(), span));
                         }
                         let v = eval(&items[1], env, out)?;
-                        return Ok(Value::Boolean(!v.is_truthy()));
+                        return Ok(Bounce::Done(Value::Boolean(!v.is_truthy())));
                     }
                     "define-record-type" => {
                         // (define-record-type <name> (ctor field...) pred (field accessor)...)
@@ -408,12 +429,12 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                                 .ok_or_else(|| EvalError::Type(format!("define-record-type: unknown field {}", field_name), span))?;
                             env_set(env, accessor_name, Value::RecordAccessor(type_id, idx));
                         }
-                        return Ok(Value::Void);
+                        return Ok(Bounce::Done(Value::Void));
                     }
-                    "letrec" => return eval_letrec(&items[1..], env, out, span),
-                    "letrec*" => return eval_letrec(&items[1..], env, out, span),
-                    "case" => return eval_case(&items[1..], env, out, span),
-                    "do" => return eval_do(&items[1..], env, out, span),
+                    "letrec" => return eval_letrec_step(&items[1..], env, out, span),
+                    "letrec*" => return eval_letrec_step(&items[1..], env, out, span),
+                    "case" => return eval_case_step(&items[1..], env, out, span),
+                    "do" => return Ok(Bounce::Done(eval_do(&items[1..], env, out, span)?)),
                     "define-syntax" => {
                         if items.len() != 3 {
                             return Err(EvalError::Arity("define-syntax requires 2 arguments".into(), span));
@@ -448,12 +469,13 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         }
                         let val = Value::SyntaxRules { literals, rules, def_env: env.clone() };
                         env_set(env, macro_name.clone(), val);
-                        return Ok(Value::Void);
+                        return Ok(Bounce::Done(Value::Void));
                     }
                     _ => {
                         // Check for macro application
                         if let Some(Value::SyntaxRules { ref literals, ref rules, ref def_env }) = env_get(env, name) {
-                            return apply_macro(items, literals, rules, def_env, env, out, span);
+                            let expanded = expand_macro(items, literals, rules, def_env, env, span)?;
+                            return Ok(Bounce::Tail(expanded, env.clone()));
                         }
                     }
                 }
@@ -462,50 +484,60 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
             let func = eval(head, env, out)?;
             let args: Result<Vec<Value>, _> = items[1..].iter().map(|a| eval(a, env, out)).collect();
             let args = args?;
-            apply(&func, &args, out, span)
+            apply_step(&func, &args, out, span)
         }
-        Value::Void => Ok(Value::Void),
+        Value::Void => Ok(Bounce::Done(Value::Void)),
     }
 }
 
-fn apply(func: &Value, args: &[Value], out: &Output, span: Span) -> Result<Value, EvalError> {
+/// Set up a lambda environment: bind params and optional rest param.
+fn bind_lambda_env(
+    params: &[String], rest: &Option<String>, args: &[Value],
+    closure_env: &Env, span: Span,
+) -> Result<Env, EvalError> {
+    let local_env = new_env(Some(closure_env.clone()));
+    if let Some(rest_name) = rest {
+        if args.len() < params.len() {
+            return Err(EvalError::Arity(format!(
+                "expected at least {} arguments, got {}", params.len(), args.len()
+            ), span));
+        }
+        for (param, arg) in params.iter().zip(args.iter()) {
+            env_set(&local_env, param.clone(), arg.clone());
+        }
+        let rest_list = args[params.len()..].iter()
+            .map(|a| Spanned::new(a.clone(), DUMMY_SPAN))
+            .collect();
+        env_set(&local_env, rest_name.clone(), Value::List(rest_list));
+    } else {
+        if args.len() != params.len() {
+            return Err(EvalError::Arity(format!(
+                "expected {} arguments, got {}", params.len(), args.len()
+            ), span));
+        }
+        for (param, arg) in params.iter().zip(args.iter()) {
+            env_set(&local_env, param.clone(), arg.clone());
+        }
+    }
+    Ok(local_env)
+}
+
+/// Evaluate body expressions, returning a Bounce for the last (tail position).
+fn eval_body_step(body: &[Spanned], env: &Env, out: &Output) -> Result<Bounce, EvalError> {
+    if body.is_empty() {
+        return Ok(Bounce::Done(Value::Void));
+    }
+    for expr in &body[..body.len()-1] {
+        eval(expr, env, out)?;
+    }
+    Ok(Bounce::Tail(body[body.len()-1].clone(), env.clone()))
+}
+
+fn apply_step(func: &Value, args: &[Value], out: &Output, span: Span) -> Result<Bounce, EvalError> {
     match func {
         Value::Lambda(params, rest, body, closure_env) => {
-            if let Some(rest_name) = rest {
-                if args.len() < params.len() {
-                    return Err(EvalError::Arity(format!(
-                        "expected at least {} arguments, got {}", params.len(), args.len()
-                    ), span));
-                }
-                let local_env = new_env(Some(closure_env.clone()));
-                for (param, arg) in params.iter().zip(args.iter()) {
-                    env_set(&local_env, param.clone(), arg.clone());
-                }
-                let rest_list = args[params.len()..].iter()
-                    .map(|a| Spanned::new(a.clone(), DUMMY_SPAN))
-                    .collect();
-                env_set(&local_env, rest_name.clone(), Value::List(rest_list));
-                let mut result = Value::Void;
-                for expr in body {
-                    result = eval(expr, &local_env, out)?;
-                }
-                Ok(result)
-            } else {
-                if args.len() != params.len() {
-                    return Err(EvalError::Arity(format!(
-                        "expected {} arguments, got {}", params.len(), args.len()
-                    ), span));
-                }
-                let local_env = new_env(Some(closure_env.clone()));
-                for (param, arg) in params.iter().zip(args.iter()) {
-                    env_set(&local_env, param.clone(), arg.clone());
-                }
-                let mut result = Value::Void;
-                for expr in body {
-                    result = eval(expr, &local_env, out)?;
-                }
-                Ok(result)
-            }
+            let local_env = bind_lambda_env(params, rest, args, closure_env, span)?;
+            eval_body_step(body, &local_env, out)
         }
         Value::CaseLambda(clauses) => {
             for (params, rest, body, closure_env) in clauses {
@@ -515,7 +547,8 @@ fn apply(func: &Value, args: &[Value], out: &Output, span: Span) -> Result<Value
                     args.len() == params.len()
                 };
                 if matches {
-                    return apply(&Value::Lambda(params.clone(), rest.clone(), body.clone(), closure_env.clone()), args, out, span);
+                    let local_env = bind_lambda_env(params, rest, args, closure_env, span)?;
+                    return eval_body_step(body, &local_env, out);
                 }
             }
             Err(EvalError::Arity(format!("case-lambda: no matching clause for {} arguments", args.len()), span))
@@ -524,56 +557,62 @@ fn apply(func: &Value, args: &[Value], out: &Output, span: Span) -> Result<Value
             if args.len() != *field_count {
                 return Err(EvalError::Arity(format!("record constructor expects {} arguments, got {}", field_count, args.len()), span));
             }
-            Ok(Value::Record(*type_id, args.to_vec()))
+            Ok(Bounce::Done(Value::Record(*type_id, args.to_vec())))
         }
         Value::RecordPredicate(type_id) => {
             if args.len() != 1 {
                 return Err(EvalError::Arity("record predicate requires 1 argument".into(), span));
             }
-            Ok(Value::Boolean(matches!(&args[0], Value::Record(tid, _) if tid == type_id)))
+            Ok(Bounce::Done(Value::Boolean(matches!(&args[0], Value::Record(tid, _) if tid == type_id))))
         }
         Value::RecordAccessor(type_id, idx) => {
             if args.len() != 1 {
                 return Err(EvalError::Arity("record accessor requires 1 argument".into(), span));
             }
             match &args[0] {
-                Value::Record(tid, fields) if tid == type_id => Ok(fields[*idx].clone()),
+                Value::Record(tid, fields) if tid == type_id => Ok(Bounce::Done(fields[*idx].clone())),
                 _ => Err(EvalError::Type("record accessor: wrong record type".into(), span)),
             }
         }
-        Value::Symbol(name) => apply_builtin(name, args, out, span, apply),
+        Value::Symbol(name) => Ok(Bounce::Done(apply_builtin(name, args, out, span, apply)?)),
         _ => Err(EvalError::Type("not a procedure".into(), span)),
     }
 }
 
-fn eval_and(exprs: &[Spanned], env: &Env, out: &Output) -> Result<Value, EvalError> {
-    if exprs.is_empty() {
-        return Ok(Value::Boolean(true));
+fn apply(func: &Value, args: &[Value], out: &Output, span: Span) -> Result<Value, EvalError> {
+    match apply_step(func, args, out, span)? {
+        Bounce::Done(v) => Ok(v),
+        Bounce::Tail(expr, env) => eval(&expr, &env, out),
     }
-    let mut result = Value::Boolean(true);
-    for expr in exprs {
-        result = eval(expr, env, out)?;
-        if !result.is_truthy() {
-            return Ok(result);
-        }
-    }
-    Ok(result)
 }
 
-fn eval_or(exprs: &[Spanned], env: &Env, out: &Output) -> Result<Value, EvalError> {
+fn eval_and_step(exprs: &[Spanned], env: &Env, out: &Output) -> Result<Bounce, EvalError> {
     if exprs.is_empty() {
-        return Ok(Value::Boolean(false));
+        return Ok(Bounce::Done(Value::Boolean(true)));
     }
-    for expr in exprs {
+    for expr in &exprs[..exprs.len()-1] {
+        let result = eval(expr, env, out)?;
+        if !result.is_truthy() {
+            return Ok(Bounce::Done(result));
+        }
+    }
+    Ok(Bounce::Tail(exprs[exprs.len()-1].clone(), env.clone()))
+}
+
+fn eval_or_step(exprs: &[Spanned], env: &Env, out: &Output) -> Result<Bounce, EvalError> {
+    if exprs.is_empty() {
+        return Ok(Bounce::Done(Value::Boolean(false)));
+    }
+    for expr in &exprs[..exprs.len()-1] {
         let result = eval(expr, env, out)?;
         if result.is_truthy() {
-            return Ok(result);
+            return Ok(Bounce::Done(result));
         }
     }
-    Ok(Value::Boolean(false))
+    Ok(Bounce::Tail(exprs[exprs.len()-1].clone(), env.clone()))
 }
 
-fn eval_let(args: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<Value, EvalError> {
+fn eval_let_step(args: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<Bounce, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity("let requires bindings and body".into(), span));
     }
@@ -602,18 +641,13 @@ fn eval_let(args: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<Val
         }
         let body = args[2..].to_vec();
         let loop_env = new_env(Some(env.clone()));
-        let lambda = Value::Lambda(params.clone(), None, body, loop_env.clone());
+        let lambda = Value::Lambda(params.clone(), None, body.clone(), loop_env.clone());
         env_set(&loop_env, name.clone(), lambda);
         let call_env = new_env(Some(loop_env));
         for (p, v) in params.iter().zip(inits.iter()) {
             env_set(&call_env, p.clone(), v.clone());
         }
-        let body_ref = &args[2..];
-        let mut result = Value::Void;
-        for expr in body_ref {
-            result = eval(expr, &call_env, out)?;
-        }
-        return Ok(result);
+        return eval_body_step(&body, &call_env, out);
     }
     // Regular let: (let ((var init) ...) body...)
     if args.len() < 2 {
@@ -636,14 +670,10 @@ fn eval_let(args: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<Val
         let val = eval(&pair[1], env, out)?;
         env_set(&local_env, name.clone(), val);
     }
-    let mut result = Value::Void;
-    for expr in &args[1..] {
-        result = eval(expr, &local_env, out)?;
-    }
-    Ok(result)
+    eval_body_step(&args[1..], &local_env, out)
 }
 
-fn eval_cond(clauses: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<Value, EvalError> {
+fn eval_cond_step(clauses: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<Bounce, EvalError> {
     for clause in clauses {
         let Value::List(parts) = &clause.val else {
             return Err(EvalError::Type("cond: expected list clause".into(), span));
@@ -653,26 +683,21 @@ fn eval_cond(clauses: &[Spanned], env: &Env, out: &Output, span: Span) -> Result
         }
         if let Value::Symbol(s) = &parts[0].val {
             if s == "else" {
-                let mut result = Value::Void;
-                for expr in &parts[1..] {
-                    result = eval(expr, env, out)?;
-                }
-                return Ok(result);
+                return eval_body_step(&parts[1..], env, out);
             }
         }
         let test = eval(&parts[0], env, out)?;
         if test.is_truthy() {
-            let mut result = test;
-            for expr in &parts[1..] {
-                result = eval(expr, env, out)?;
+            if parts.len() == 1 {
+                return Ok(Bounce::Done(test));
             }
-            return Ok(result);
+            return eval_body_step(&parts[1..], env, out);
         }
     }
-    Ok(Value::Void)
+    Ok(Bounce::Done(Value::Void))
 }
 
-fn eval_letrec(args: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<Value, EvalError> {
+fn eval_letrec_step(args: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<Bounce, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity("letrec requires bindings and body".into(), span));
     }
@@ -701,14 +726,10 @@ fn eval_letrec(args: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<
         let val = eval(&pair[1], &local_env, out)?;
         env_set(&local_env, names[i].clone(), val);
     }
-    let mut result = Value::Void;
-    for expr in &args[1..] {
-        result = eval(expr, &local_env, out)?;
-    }
-    Ok(result)
+    eval_body_step(&args[1..], &local_env, out)
 }
 
-fn eval_case(args: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<Value, EvalError> {
+fn eval_case_step(args: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<Bounce, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity("case requires key and clauses".into(), span));
     }
@@ -723,11 +744,7 @@ fn eval_case(args: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<Va
         // Check for else clause
         if let Value::Symbol(s) = &parts[0].val {
             if s == "else" {
-                let mut result = Value::Void;
-                for expr in &parts[1..] {
-                    result = eval(expr, env, out)?;
-                }
-                return Ok(result);
+                return eval_body_step(&parts[1..], env, out);
             }
         }
         // Datum list
@@ -736,15 +753,11 @@ fn eval_case(args: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<Va
         };
         for datum in datums {
             if values_eqv(&key, &datum.val) {
-                let mut result = Value::Void;
-                for expr in &parts[1..] {
-                    result = eval(expr, env, out)?;
-                }
-                return Ok(result);
+                return eval_body_step(&parts[1..], env, out);
             }
         }
     }
-    Ok(Value::Void)
+    Ok(Bounce::Done(Value::Void))
 }
 
 
