@@ -306,6 +306,7 @@ function displayVal(val, seen) {
         case 'list': return `(${val.value.map(v => displayVal(v, seen)).join(' ')})`;
         case 'record': return `#<record:${val.typeName}>`;
         case 'vector': return `#(${val.value.map(v => displayVal(v, seen)).join(' ')})`;
+        case 'values': return val.values.map(v => displayVal(v, seen)).join('\n');
     }
 }
 function writeVal(val, seen) {
@@ -1228,6 +1229,15 @@ function makeGlobalEnv(outputBuf) {
     env.set('raise', raiseProc);
     const wehProc = { tag: 'procedure', value: (..._args) => { throw new EvalError('with-exception-handler must be applied in CPS context'); }, _withExceptionHandler: true };
     env.set('with-exception-handler', wehProc);
+    // L21: values, call-with-values
+    const valuesProc = { tag: 'procedure', value: (...args) => {
+            if (args.length === 1)
+                return args[0];
+            return { tag: 'values', values: args };
+        }, _values: true };
+    env.set('values', valuesProc);
+    const cwvProc = { tag: 'procedure', value: (..._args) => { throw new EvalError('call-with-values must be applied in CPS context'); }, _callWithValues: true };
+    env.set('call-with-values', cwvProc);
     // cxr helpers
     const cxr = (ops) => ({ tag: 'procedure', value: (...args) => {
             if (args.length !== 1)
@@ -1724,6 +1734,24 @@ function applyK(func, args, k, pos) {
             if (idx >= 0)
                 exceptionHandlers.splice(idx, 1);
             return k(result);
+        }, pos);
+    }
+    // L21: values
+    if (func.tag === 'procedure' && func._values) {
+        if (args.length === 1)
+            return k(args[0]);
+        return k({ tag: 'values', values: args });
+    }
+    // L21: call-with-values
+    if (func.tag === 'procedure' && func._callWithValues) {
+        if (args.length !== 2)
+            throw errAt('call-with-values requires 2 arguments', pos);
+        const [producer, consumer] = args;
+        return applyK(producer, [], (result) => {
+            if (result.tag === 'values') {
+                return applyK(consumer, result.values, k, pos);
+            }
+            return applyK(consumer, [result], k, pos);
         }, pos);
     }
     // dynamic-wind

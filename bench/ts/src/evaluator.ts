@@ -29,11 +29,12 @@ type SchemeValBase =
   | { tag: 'list'; value: SchemeVal[] }
   | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }
   | { tag: 'nil' }
-  | { tag: 'procedure'; value: (...args: SchemeVal[]) => SchemeVal; _closure?: { params: { names: string[]; rest: string | null }; body: SchemeVal[]; env: Env }; _callcc?: boolean; _cont?: Cont; _capturedWind?: WindEntry[]; _dynamicWind?: boolean; _raise?: boolean; _withExceptionHandler?: boolean; _caseClauses?: { clauses: { paramInfo: { names: string[]; rest: string | null }; bodyExprs: SchemeVal[] }[]; closureEnv: Env } }
+  | { tag: 'procedure'; value: (...args: SchemeVal[]) => SchemeVal; _closure?: { params: { names: string[]; rest: string | null }; body: SchemeVal[]; env: Env }; _callcc?: boolean; _cont?: Cont; _capturedWind?: WindEntry[]; _dynamicWind?: boolean; _raise?: boolean; _withExceptionHandler?: boolean; _values?: boolean; _callWithValues?: boolean; _caseClauses?: { clauses: { paramInfo: { names: string[]; rest: string | null }; bodyExprs: SchemeVal[] }[]; closureEnv: Env } }
   | { tag: 'void' }
   | { tag: 'macro'; literals: string[]; rules: { pattern: SchemeVal; template: SchemeVal }[]; defEnv: Env }
   | { tag: 'record'; typeName: string; typeId: symbol; fields: Map<string, SchemeVal> }
-  | { tag: 'vector'; value: SchemeVal[] };
+  | { tag: 'vector'; value: SchemeVal[] }
+  | { tag: 'values'; values: SchemeVal[] };
 
 type SchemeVal = SchemeValBase & { pos?: Pos };
 
@@ -311,6 +312,7 @@ function displayVal(val: SchemeVal, seen?: Set<SchemeVal>): string {
     case 'list': return `(${val.value.map(v => displayVal(v, seen)).join(' ')})`;
     case 'record': return `#<record:${val.typeName}>`;
     case 'vector': return `#(${val.value.map(v => displayVal(v, seen)).join(' ')})`;
+    case 'values': return val.values.map(v => displayVal(v, seen)).join('\n');
   }
 }
 
@@ -1137,6 +1139,15 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   const wehProc: SchemeVal = { tag: 'procedure', value: (..._args: SchemeVal[]) => { throw new EvalError('with-exception-handler must be applied in CPS context'); }, _withExceptionHandler: true };
   env.set('with-exception-handler', wehProc);
 
+  // L21: values, call-with-values
+  const valuesProc: SchemeVal = { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length === 1) return args[0];
+    return { tag: 'values', values: args };
+  }, _values: true };
+  env.set('values', valuesProc);
+  const cwvProc: SchemeVal = { tag: 'procedure', value: (..._args: SchemeVal[]) => { throw new EvalError('call-with-values must be applied in CPS context'); }, _callWithValues: true };
+  env.set('call-with-values', cwvProc);
+
   // cxr helpers
   const cxr = (ops: string) => ({ tag: 'procedure' as const, value: (...args: SchemeVal[]) => {
     if (args.length !== 1) throw new EvalError(`c${ops}r requires exactly 1 argument`);
@@ -1662,6 +1673,24 @@ function applyK(func: SchemeVal, args: SchemeVal[], k: Cont, pos?: Pos): Bounce 
       const idx = exceptionHandlers.indexOf(entry);
       if (idx >= 0) exceptionHandlers.splice(idx, 1);
       return k(result);
+    }, pos);
+  }
+
+  // L21: values
+  if (func.tag === 'procedure' && func._values) {
+    if (args.length === 1) return k(args[0]);
+    return k({ tag: 'values', values: args });
+  }
+
+  // L21: call-with-values
+  if (func.tag === 'procedure' && func._callWithValues) {
+    if (args.length !== 2) throw errAt('call-with-values requires 2 arguments', pos);
+    const [producer, consumer] = args;
+    return applyK(producer, [], (result) => {
+      if (result.tag === 'values') {
+        return applyK(consumer, result.values, k, pos);
+      }
+      return applyK(consumer, [result], k, pos);
     }, pos);
   }
 
