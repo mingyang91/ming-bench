@@ -240,7 +240,12 @@ function displayVal(val: SchemeVal): string {
 function writeVal(val: SchemeVal): string {
   switch (val.tag) {
     case 'string': return `"${strContent(val)}"`; // with quotes for write
-    case 'char': return `#\\${val.value}`;
+    case 'char': {
+      if (val.value === ' ') return '#\\space';
+      if (val.value === '\n') return '#\\newline';
+      if (val.value === '\t') return '#\\tab';
+      return `#\\${val.value}`;
+    }
     default: return displayVal(val);
   }
 }
@@ -476,6 +481,256 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   env.set('char?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
     if (args.length !== 1) throw new EvalError('char? requires exactly 1 argument');
     return { tag: 'boolean', value: args[0].tag === 'char' };
+  }});
+
+  // eq? and equal?
+  env.set('eq?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 2) throw new EvalError('eq? requires exactly 2 arguments');
+    const [a, b] = args;
+    if (a.tag !== b.tag) return { tag: 'boolean', value: false };
+    if (a.tag === 'nil') return { tag: 'boolean', value: true };
+    if (a.tag === 'number' && b.tag === 'number') return { tag: 'boolean', value: a.value === b.value };
+    if (a.tag === 'boolean' && b.tag === 'boolean') return { tag: 'boolean', value: a.value === b.value };
+    if (a.tag === 'symbol' && b.tag === 'symbol') return { tag: 'boolean', value: a.value === b.value };
+    if (a.tag === 'char' && b.tag === 'char') return { tag: 'boolean', value: a.value === b.value };
+    if (a.tag === 'string' && b.tag === 'string') return { tag: 'boolean', value: a === b };
+    return { tag: 'boolean', value: a === b };
+  }});
+
+  const schemeEqual = (a: SchemeVal, b: SchemeVal): boolean => {
+    if (a.tag !== b.tag) return false;
+    if (a.tag === 'nil') return true;
+    if (a.tag === 'number' && b.tag === 'number') return a.value === b.value;
+    if (a.tag === 'boolean' && b.tag === 'boolean') return a.value === b.value;
+    if (a.tag === 'symbol' && b.tag === 'symbol') return a.value === b.value;
+    if (a.tag === 'char' && b.tag === 'char') return a.value === b.value;
+    if (a.tag === 'string' && b.tag === 'string') return strContent(a) === strContent(b as SchemeVal & { tag: 'string' });
+    if (a.tag === 'pair' && b.tag === 'pair') return schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr);
+    return a === b;
+  };
+
+  env.set('equal?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 2) throw new EvalError('equal? requires exactly 2 arguments');
+    return { tag: 'boolean', value: schemeEqual(args[0], args[1]) };
+  }});
+
+  // map (supports multiple lists)
+  env.set('map', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length < 2) throw new EvalError('map requires at least 2 arguments');
+    const func = args[0];
+    if (func.tag !== 'procedure') throw new EvalError('map: first argument must be a procedure');
+    const lists = args.slice(1);
+    const results: SchemeVal[] = [];
+    // Convert lists to arrays of pairs for iteration
+    let cursors: SchemeVal[] = lists;
+    while (true) {
+      // Check if any list is exhausted
+      if (cursors.some(c => c.tag === 'nil')) break;
+      if (cursors.some(c => c.tag !== 'pair')) throw new EvalError('map: expected proper list');
+      const callArgs = cursors.map(c => (c as any).car as SchemeVal);
+      results.push(func.value(...callArgs));
+      cursors = cursors.map(c => (c as any).cdr as SchemeVal);
+    }
+    let result: SchemeVal = NIL;
+    for (let i = results.length - 1; i >= 0; i--) {
+      result = { tag: 'pair', car: results[i], cdr: result };
+    }
+    return result;
+  }});
+
+  // for-each (like map but discards results)
+  env.set('for-each', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length < 2) throw new EvalError('for-each requires at least 2 arguments');
+    const func = args[0];
+    if (func.tag !== 'procedure') throw new EvalError('for-each: first argument must be a procedure');
+    const lists = args.slice(1);
+    let cursors: SchemeVal[] = lists;
+    while (true) {
+      if (cursors.some(c => c.tag === 'nil')) break;
+      if (cursors.some(c => c.tag !== 'pair')) throw new EvalError('for-each: expected proper list');
+      const callArgs = cursors.map(c => (c as any).car as SchemeVal);
+      func.value(...callArgs);
+      cursors = cursors.map(c => (c as any).cdr as SchemeVal);
+    }
+    return { tag: 'void' };
+  }});
+
+  // L09: Numeric utilities
+  env.set('abs', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('abs: expected number');
+    return { tag: 'number', value: Math.abs(args[0].value) };
+  }});
+
+  env.set('modulo', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 2 || args[0].tag !== 'number' || args[1].tag !== 'number')
+      throw new EvalError('modulo: expected two numbers');
+    const [a, b] = [args[0].value, args[1].value];
+    if (b === 0) throw new EvalError('modulo: division by zero');
+    return { tag: 'number', value: ((a % b) + b) % b };
+  }});
+
+  env.set('remainder', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 2 || args[0].tag !== 'number' || args[1].tag !== 'number')
+      throw new EvalError('remainder: expected two numbers');
+    const [a, b] = [args[0].value, args[1].value];
+    if (b === 0) throw new EvalError('remainder: division by zero');
+    return { tag: 'number', value: a % b };
+  }});
+
+  env.set('quotient', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 2 || args[0].tag !== 'number' || args[1].tag !== 'number')
+      throw new EvalError('quotient: expected two numbers');
+    const [a, b] = [args[0].value, args[1].value];
+    if (b === 0) throw new EvalError('quotient: division by zero');
+    return { tag: 'number', value: Math.trunc(a / b) };
+  }});
+
+  env.set('min', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length === 0) throw new EvalError('min: requires at least one argument');
+    const nums = args.map(a => { if (a.tag !== 'number') throw new EvalError('min: expected number'); return a.value; });
+    return { tag: 'number', value: Math.min(...nums) };
+  }});
+
+  env.set('max', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length === 0) throw new EvalError('max: requires at least one argument');
+    const nums = args.map(a => { if (a.tag !== 'number') throw new EvalError('max: expected number'); return a.value; });
+    return { tag: 'number', value: Math.max(...nums) };
+  }});
+
+  env.set('expt', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 2 || args[0].tag !== 'number' || args[1].tag !== 'number')
+      throw new EvalError('expt: expected two numbers');
+    return { tag: 'number', value: Math.pow(args[0].value, args[1].value) };
+  }});
+
+  // L09: Numeric predicates
+  env.set('zero?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('zero?: expected number');
+    return { tag: 'boolean', value: args[0].value === 0 };
+  }});
+
+  env.set('positive?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('positive?: expected number');
+    return { tag: 'boolean', value: args[0].value > 0 };
+  }});
+
+  env.set('negative?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('negative?: expected number');
+    return { tag: 'boolean', value: args[0].value < 0 };
+  }});
+
+  env.set('odd?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('odd?: expected number');
+    return { tag: 'boolean', value: args[0].value % 2 !== 0 };
+  }});
+
+  env.set('even?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('even?: expected number');
+    return { tag: 'boolean', value: args[0].value % 2 === 0 };
+  }});
+
+  // L09: List utilities
+  env.set('list-ref', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 2 || args[1].tag !== 'number') throw new EvalError('list-ref: expected list and number');
+    let cur = args[0];
+    let idx = args[1].value;
+    while (idx > 0 && cur.tag === 'pair') { cur = cur.cdr; idx--; }
+    if (cur.tag !== 'pair') throw new EvalError('list-ref: index out of range');
+    return cur.car;
+  }});
+
+  env.set('list-tail', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 2 || args[1].tag !== 'number') throw new EvalError('list-tail: expected list and number');
+    let cur = args[0];
+    let idx = args[1].value;
+    while (idx > 0) {
+      if (cur.tag !== 'pair') throw new EvalError('list-tail: index out of range');
+      cur = cur.cdr;
+      idx--;
+    }
+    return cur;
+  }});
+
+  env.set('list?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1) throw new EvalError('list? requires exactly 1 argument');
+    let cur = args[0];
+    while (cur.tag === 'pair') cur = cur.cdr;
+    return { tag: 'boolean', value: cur.tag === 'nil' };
+  }});
+
+  // L09: assoc
+  env.set('assoc', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 2) throw new EvalError('assoc requires exactly 2 arguments');
+    const key = args[0];
+    let cur = args[1];
+    while (cur.tag === 'pair') {
+      const entry = cur.car;
+      if (entry.tag === 'pair' && schemeEqual(entry.car, key)) return entry;
+      cur = cur.cdr;
+    }
+    return { tag: 'boolean', value: false };
+  }});
+
+  // L09: Character utilities
+  env.set('char-alphabetic?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'char') throw new EvalError('char-alphabetic?: expected char');
+    return { tag: 'boolean', value: /^[a-zA-Z]$/.test(args[0].value) };
+  }});
+
+  env.set('char-numeric?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'char') throw new EvalError('char-numeric?: expected char');
+    return { tag: 'boolean', value: /^[0-9]$/.test(args[0].value) };
+  }});
+
+  env.set('char-upcase', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'char') throw new EvalError('char-upcase: expected char');
+    return { tag: 'char', value: args[0].value.toUpperCase() };
+  }});
+
+  env.set('char-downcase', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'char') throw new EvalError('char-downcase: expected char');
+    return { tag: 'char', value: args[0].value.toLowerCase() };
+  }});
+
+  env.set('char=?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 2 || args[0].tag !== 'char' || args[1].tag !== 'char')
+      throw new EvalError('char=?: expected two chars');
+    return { tag: 'boolean', value: args[0].value === args[1].value };
+  }});
+
+  env.set('char<?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 2 || args[0].tag !== 'char' || args[1].tag !== 'char')
+      throw new EvalError('char<?: expected two chars');
+    return { tag: 'boolean', value: args[0].value < args[1].value };
+  }});
+
+  // L09: String comparison/conversion
+  env.set('string=?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string')
+      throw new EvalError('string=?: expected two strings');
+    return { tag: 'boolean', value: strContent(args[0]) === strContent(args[1]) };
+  }});
+
+  env.set('string<?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string')
+      throw new EvalError('string<?: expected two strings');
+    return { tag: 'boolean', value: strContent(args[0]) < strContent(args[1]) };
+  }});
+
+  env.set('string-ci=?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string')
+      throw new EvalError('string-ci=?: expected two strings');
+    return { tag: 'boolean', value: strContent(args[0]).toLowerCase() === strContent(args[1]).toLowerCase() };
+  }});
+
+  env.set('string-upcase', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string-upcase: expected string');
+    return { tag: 'string', value: strContent(args[0]).toUpperCase() };
+  }});
+
+  env.set('string-downcase', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string-downcase: expected string');
+    return { tag: 'string', value: strContent(args[0]).toLowerCase() };
   }});
 
   // L08: apply
