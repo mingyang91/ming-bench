@@ -82,9 +82,10 @@ object Builtins:
       case _          => throw new EvalError("eqv? requires 2 arguments")
     },
     "procedure?" -> Builtin {
-      case List(Builtin(_)) => Bool(true)
-      case List(_)          => Bool(false)
-      case _                => throw new EvalError("procedure? requires 1 argument")
+      case List(Builtin(_))          => Bool(true)
+      case List(Closure(_, _, _, _)) => Bool(true)
+      case List(_)                   => Bool(false)
+      case _                         => throw new EvalError("procedure? requires 1 argument")
     }
   )
 

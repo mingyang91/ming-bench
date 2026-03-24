@@ -20,6 +20,7 @@ object Display:
     case Void                => "#<void>"
     case Pair(_, _)          => writeList(v)
     case Builtin(_)          => "#<procedure>"
+    case Closure(_, _, _, _) => "#<procedure>"
     case MacroTransformer(_) => "#<macro>"
     case Record(tag, _)      => s"#<record:$tag>"
     case Vector(elems)       => "#(" + elems.map(write).mkString(" ") + ")"
