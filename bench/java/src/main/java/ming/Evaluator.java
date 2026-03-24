@@ -40,6 +40,14 @@ public class Evaluator {
     // Output buffer for display/write/newline
     private StringBuilder outputBuffer = new StringBuilder();
 
+    // Continuation support
+    private Object pendingCallCCValue = null;
+    private boolean hasPendingCallCC = false;
+    private Environment replayEnv = null;
+    private int currentTopLevelIndex = 0;
+    private List<Object> currentBodyExprs = null;
+    private Environment currentBodyEnv = null;
+
     private EvalError error(String msg) {
         return new EvalError(currentLine + ":" + currentCol + " " + msg);
     }
@@ -53,10 +61,26 @@ public class Evaluator {
     public String evalStr(String input) throws EvalError {
         List<Token> tokens = tokenize(input);
         int[] pos = {0};
-        Object lastResult = null;
+        List<Object> exprs = new ArrayList<>();
         while (pos[0] < tokens.size()) {
-            Object expr = parse(tokens, pos);
-            lastResult = eval(expr, globalEnv);
+            exprs.add(parse(tokens, pos));
+        }
+        Object lastResult = null;
+        int i = 0;
+        while (i < exprs.size()) {
+            try {
+                currentTopLevelIndex = i;
+                currentBodyExprs = null;
+                currentBodyEnv = null;
+                lastResult = eval(exprs.get(i), globalEnv);
+                i++;
+            } catch (ContinuationInvoked ci) {
+                SchemeContinuation k = ci.continuation;
+                hasPendingCallCC = true;
+                pendingCallCCValue = ci.value;
+                replayEnv = (k.bodyEnv != null && k.bodyEnv != globalEnv) ? k.bodyEnv : null;
+                i = k.topLevelIndex;
+            }
         }
         if (lastResult == null) {
             throw new EvalError("1:1 no expression");
@@ -68,10 +92,26 @@ public class Evaluator {
         outputBuffer = new StringBuilder();
         List<Token> tokens = tokenize(input);
         int[] pos = {0};
-        Object lastResult = null;
+        List<Object> exprs = new ArrayList<>();
         while (pos[0] < tokens.size()) {
-            Object expr = parse(tokens, pos);
-            lastResult = eval(expr, globalEnv);
+            exprs.add(parse(tokens, pos));
+        }
+        Object lastResult = null;
+        int i = 0;
+        while (i < exprs.size()) {
+            try {
+                currentTopLevelIndex = i;
+                currentBodyExprs = null;
+                currentBodyEnv = null;
+                lastResult = eval(exprs.get(i), globalEnv);
+                i++;
+            } catch (ContinuationInvoked ci) {
+                SchemeContinuation k = ci.continuation;
+                hasPendingCallCC = true;
+                pendingCallCCValue = ci.value;
+                replayEnv = (k.bodyEnv != null && k.bodyEnv != globalEnv) ? k.bodyEnv : null;
+                i = k.topLevelIndex;
+            }
         }
         String output = outputBuffer.toString();
         if (lastResult == null) {
@@ -353,6 +393,8 @@ public class Evaluator {
                     case "begin" -> {
                         // TCO: eval all but last, tail-call last
                         if (list.size() <= 1) return VOID;
+                        currentBodyExprs = new ArrayList<>(list.subList(1, list.size()));
+                        currentBodyEnv = env;
                         for (int i = 1; i < list.size() - 1; i++) {
                             eval(list.get(i), env);
                         }
@@ -442,18 +484,26 @@ public class Evaluator {
 
                         // Regular let
                         if (!(second instanceof List<?> bindings)) throw error("let: bad bindings");
-                        Environment letEnv = new Environment(env);
-                        for (Object b : bindings) {
-                            if (b instanceof Located loc) b = loc.value();
-                            if (!(b instanceof List<?> binding) || binding.size() != 2)
-                                throw error("let: bad binding");
-                            Object varObj = binding.get(0);
-                            if (varObj instanceof Located loc) varObj = loc.value();
-                            if (!(varObj instanceof String varName))
-                                throw error("let: bad binding variable");
-                            Object val = eval(binding.get(1), env);
-                            letEnv.define(varName, val);
+                        Environment letEnv;
+                        if (replayEnv != null && replayEnv.getParent() == env) {
+                            letEnv = replayEnv;
+                            replayEnv = null;
+                        } else {
+                            letEnv = new Environment(env);
+                            for (Object b : bindings) {
+                                if (b instanceof Located loc) b = loc.value();
+                                if (!(b instanceof List<?> binding) || binding.size() != 2)
+                                    throw error("let: bad binding");
+                                Object varObj = binding.get(0);
+                                if (varObj instanceof Located loc) varObj = loc.value();
+                                if (!(varObj instanceof String varName))
+                                    throw error("let: bad binding variable");
+                                Object val = eval(binding.get(1), env);
+                                letEnv.define(varName, val);
+                            }
                         }
+                        currentBodyExprs = new ArrayList<>(list.subList(2, list.size()));
+                        currentBodyEnv = letEnv;
                         for (int i = 2; i < list.size() - 1; i++) {
                             eval(list.get(i), letEnv);
                         }
@@ -554,6 +604,26 @@ public class Evaluator {
                     }
                     case "case" -> { return evalCase(list, env); }
                     case "do" -> { return evalDo(list, env); }
+                    case "call/cc", "call-with-current-continuation" -> {
+                        if (list.size() != 2) throw error("call/cc: expected 1 argument");
+                        if (hasPendingCallCC) {
+                            hasPendingCallCC = false;
+                            Object val = pendingCallCCValue;
+                            pendingCallCCValue = null;
+                            return val;
+                        }
+                        Object ccProc = eval(list.get(1), env);
+                        SchemeContinuation k = new SchemeContinuation();
+                        k.topLevelIndex = currentTopLevelIndex;
+                        k.bodyExprs = currentBodyExprs;
+                        k.bodyEnv = currentBodyEnv;
+                        try {
+                            return apply(ccProc, List.of(k));
+                        } catch (ContinuationInvoked ci) {
+                            if (ci.continuation == k) return ci.value;
+                            throw ci;
+                        }
+                    }
                 }
                 // Check for macro usage
                 try {
@@ -579,6 +649,8 @@ public class Evaluator {
             // TCO: for Lambda/CaseLambda, set up env and tail-call last body expr
             if (proc instanceof Lambda lambda) {
                 env = applyLambdaEnv(lambda, args);
+                currentBodyExprs = lambda.body;
+                currentBodyEnv = env;
                 for (int i = 0; i < lambda.body.size() - 1; i++) {
                     eval(lambda.body.get(i), env);
                 }
@@ -605,6 +677,10 @@ public class Evaluator {
             if (proc instanceof BuiltinProc bp) {
                 return bp.apply(args);
             }
+            if (proc instanceof SchemeContinuation cont) {
+                if (args.size() != 1) throw error("continuation: expected 1 argument");
+                throw new ContinuationInvoked(cont, args.get(0));
+            }
             throw error("not a procedure: " + schemeToString(proc));
         }
         throw error("cannot evaluate: " + expr);
@@ -622,6 +698,11 @@ public class Evaluator {
                 throw error("wrong number of arguments: expected " + lambda.params.size() + ", got " + args.size());
             }
         }
+        if (replayEnv != null && replayEnv.getParent() == lambda.closure) {
+            Environment restored = replayEnv;
+            replayEnv = null;
+            return restored;
+        }
         Environment callEnv = new Environment(lambda.closure);
         for (int i = 0; i < lambda.params.size(); i++) {
             callEnv.define(lambda.params.get(i), args.get(i));
@@ -638,6 +719,23 @@ public class Evaluator {
 
     // Marker for tail call from helper methods
     private record TailCall(Object expr, Environment env) {}
+
+    // Continuation support for call/cc
+    static class SchemeContinuation {
+        List<Object> bodyExprs;
+        Environment bodyEnv;
+        int topLevelIndex;
+    }
+
+    static class ContinuationInvoked extends RuntimeException {
+        final SchemeContinuation continuation;
+        final Object value;
+        ContinuationInvoked(SchemeContinuation k, Object v) {
+            super(null, null, true, false);
+            this.continuation = k;
+            this.value = v;
+        }
+    }
 
     // letrec/letrec* with TCO support - returns TailCall for last body expr
     @SuppressWarnings("unchecked")
@@ -1250,6 +1348,8 @@ public class Evaluator {
                 }
                 callEnv.define(lambda.restParam, rest);
             }
+            currentBodyExprs = lambda.body;
+            currentBodyEnv = callEnv;
             Object result = VOID;
             for (Object bodyExpr : lambda.body) {
                 result = eval(bodyExpr, callEnv);
@@ -1272,6 +1372,10 @@ public class Evaluator {
         }
         if (proc instanceof BuiltinProc bp) {
             return bp.apply(args);
+        }
+        if (proc instanceof SchemeContinuation cont) {
+            if (args.size() != 1) throw error("continuation: expected 1 argument");
+            throw new ContinuationInvoked(cont, args.get(0));
         }
         throw error("not a procedure: " + schemeToString(proc));
     }
@@ -1374,7 +1478,7 @@ public class Evaluator {
         globalEnv.define("procedure?", (BuiltinProc) args -> {
             if (args.size() != 1) throw error("procedure?: expected 1 argument");
             Object val = args.get(0);
-            return val instanceof Lambda || val instanceof CaseLambda || val instanceof BuiltinProc;
+            return val instanceof Lambda || val instanceof CaseLambda || val instanceof BuiltinProc || val instanceof SchemeContinuation;
         });
 
         // Output
@@ -2140,6 +2244,30 @@ public class Evaluator {
             if (args.size() != 1) throw error("rational?: expected 1 argument");
             return isExact(args.get(0));
         });
+
+        // call/cc as first-class value
+        BuiltinProc callCCBuiltin = args -> {
+            if (args.size() != 1) throw error("call/cc: expected 1 argument");
+            if (hasPendingCallCC) {
+                hasPendingCallCC = false;
+                Object val = pendingCallCCValue;
+                pendingCallCCValue = null;
+                return val;
+            }
+            Object proc = args.get(0);
+            SchemeContinuation k = new SchemeContinuation();
+            k.topLevelIndex = currentTopLevelIndex;
+            k.bodyExprs = currentBodyExprs;
+            k.bodyEnv = currentBodyEnv;
+            try {
+                return apply(proc, List.of(k));
+            } catch (ContinuationInvoked ci) {
+                if (ci.continuation == k) return ci.value;
+                throw ci;
+            }
+        };
+        globalEnv.define("call/cc", callCCBuiltin);
+        globalEnv.define("call-with-current-continuation", callCCBuiltin);
     }
 
     // Convert any numeric value to Rational
@@ -2311,6 +2439,7 @@ public class Evaluator {
         if (val instanceof SchemeChar ch) return "#\\" + ch.value();
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof CaseLambda) return "#<procedure>";
+        if (val instanceof SchemeContinuation) return "#<continuation>";
         if (val instanceof SchemeVector v) {
             if (!seen.add(v)) return "#<circular>";
             StringBuilder sb = new StringBuilder("#(");

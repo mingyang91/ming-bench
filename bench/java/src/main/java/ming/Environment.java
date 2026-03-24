@@ -31,6 +31,8 @@ public class Environment {
         throw new EvalError("unbound variable: " + name);
     }
 
+    public Environment getParent() { return parent; }
+
     public Object lookup(String name) throws EvalError {
         if (bindings.containsKey(name)) {
             return bindings.get(name);
