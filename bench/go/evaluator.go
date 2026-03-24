@@ -34,10 +34,10 @@ func applyAny(op *Value, args []*Value, node *astNode, ip *interp) (*Value, erro
 	case valGoFunc:
 		return op.goFunc(args)
 	case valContinuation:
-		if len(args) != 1 {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: expected 1 argument", node.line, node.col)}
+		if len(args) == 1 {
+			panic(&contInvoke{cont: op, value: args[0]})
 		}
-		panic(&contInvoke{cont: op, value: args[0]})
+		panic(&contInvoke{cont: op, value: &Value{typ: valMultipleValues, vals: args}})
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: call-with-values: not a procedure", node.line, node.col)}
 	}
@@ -953,6 +953,21 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 			if err != nil {
 				return nil, err
 			}
+			// If expansion is a define form, copy hygiene bindings into the
+			// use-site env so that the defined name is visible after the macro.
+			if !expanded.isAtom && len(expanded.children) > 0 {
+				head := expanded.children[0]
+				if head.isAtom && head.tok.kind == tokSymbol &&
+					(head.tok.sval == "define" || head.tok.sval == "define-syntax" || head.tok.sval == "define-record-type") {
+					// Copy gensym bindings from wrapper into use-site env
+					if expandEnv != nil && expandEnv.parent == e {
+						for k, v := range expandEnv.vars {
+							e.set(k, v)
+						}
+					}
+					return evalTail(expanded, e)
+				}
+			}
 			return evalTail(expanded, expandEnv)
 		}
 	}
@@ -990,10 +1005,10 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 
 	// Continuation application
 	if op.typ == valContinuation {
-		if len(args) != 1 {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: expected 1 argument", node.line, node.col)}
+		if len(args) == 1 {
+			panic(&contInvoke{cont: op, value: args[0]})
 		}
-		panic(&contInvoke{cont: op, value: args[0]})
+		panic(&contInvoke{cont: op, value: &Value{typ: valMultipleValues, vals: args}})
 	}
 
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", node.line, node.col)}
@@ -3143,10 +3158,10 @@ func applyApply(args []*Value, node *astNode, ip *interp) (*Value, error) {
 		return fn.goFunc(allArgs)
 	}
 	if fn.typ == valContinuation {
-		if len(allArgs) != 1 {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: continuation expects 1 argument", node.line, node.col)}
+		if len(allArgs) == 1 {
+			panic(&contInvoke{cont: fn, value: allArgs[0]})
 		}
-		panic(&contInvoke{cont: fn, value: allArgs[0]})
+		panic(&contInvoke{cont: fn, value: &Value{typ: valMultipleValues, recordFields: allArgs}})
 	}
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: not a procedure", node.line, node.col)}
 }

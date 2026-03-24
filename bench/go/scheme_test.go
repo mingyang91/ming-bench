@@ -163,3 +163,5 @@ func TestL21(t *testing.T) { runLevelTests(t, 21) }
 func TestL22(t *testing.T) { runLevelTests(t, 22) }
 func TestL23(t *testing.T) { runLevelTests(t, 23) }
 func TestL24(t *testing.T) { runLevelTests(t, 24) }
+func TestL25(t *testing.T) { runLevelTests(t, 25) }
+func TestL26(t *testing.T) { runLevelTests(t, 26) }
