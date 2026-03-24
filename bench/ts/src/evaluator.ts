@@ -1994,7 +1994,7 @@ function expandQuasiquote(tmpl: SchemeVal, env: Env): SchemeVal {
 
 // --- Eval ---
 
-function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
+function evalScheme(initExpr: SchemeVal, initEnv: Env, maxSteps?: number): SchemeVal {
   let ctrl: SchemeVal | null = initExpr;
   let env: Env = initEnv;
   let kont: Kont = null;  // halt
@@ -2180,9 +2180,13 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
   }
 
   // Main CEK loop
+  let stepCount = 0;
   while (true) {
     try {
       for (;;) {
+        if (maxSteps !== undefined && ++stepCount > maxSteps) {
+          throw new EvalError('step limit exceeded');
+        }
         if (ctrl !== null) {
           // === EVAL PHASE ===
           const expr: SchemeVal = ctrl;
@@ -3102,6 +3106,17 @@ export function evalStr(input: string): string {
  * Evaluate Scheme expressions and return both the result string
  * and any captured output from display/write/newline.
  */
+export function evalStrWithLimit(input: string, maxSteps: number): string {
+  const exprs = parseAll(input);
+  if (exprs.length === 0) throw new EvalError('no expressions');
+  const outputBuf: string[] = [];
+  const env = makeGlobalEnv(outputBuf);
+  const beginExpr: SchemeVal = exprs.length === 1 ? exprs[0]
+    : { tag: 'list', elements: [{ tag: 'symbol', value: 'begin' }, ...exprs] };
+  const result = evalScheme(beginExpr, env, maxSteps);
+  return schemeToString(result);
+}
+
 export function evalStrWithOutput(input: string): { result: string; output: string } {
   const exprs = parseAll(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
