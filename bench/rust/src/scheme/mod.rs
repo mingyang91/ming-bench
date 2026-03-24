@@ -322,31 +322,34 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         if items.len() != 4 {
                             return Err(EvalError::Arity("string-set! requires 3 arguments".into(), span));
                         }
-                        let Value::Symbol(var_name) = &items[1].val else {
-                            return Err(EvalError::Type("string-set!: first argument must be a variable".into(), span));
+                        // string-set! on a literal string is an error (immutable)
+                        if matches!(&items[1].val, Value::Str(_)) {
+                            return Err(EvalError::Type("string-set!: strings are immutable".into(), span));
+                        }
+                        let name = match &items[1].val {
+                            Value::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Type("string-set!: expected string variable".into(), span)),
                         };
-                        let idx_val = eval(&items[2], env, out)?;
-                        let Value::Integer(idx_n) = &idx_val else {
-                            return Err(EvalError::Type("string-set!: index must be integer".into(), span));
+                        let s_val = env_get(env, &name).ok_or_else(|| EvalError::UnboundVariable(name.clone(), span))?;
+                        let s = match s_val {
+                            Value::Str(s) => s,
+                            _ => return Err(EvalError::Type("string-set!: expected string".into(), span)),
                         };
-                        let idx = *idx_n as usize;
+                        let idx = match eval(&items[2], env, out)? {
+                            Value::Integer(n) => n as usize,
+                            _ => return Err(EvalError::Type("string-set!: expected integer index".into(), span)),
+                        };
                         let ch = match eval(&items[3], env, out)? {
                             Value::Char(c) => c,
-                            _ => return Err(EvalError::Type("string-set!: third argument must be a char".into(), span)),
+                            _ => return Err(EvalError::Type("string-set!: expected char".into(), span)),
                         };
-                        let s = env_get(env, var_name).ok_or_else(|| EvalError::UnboundVariable(var_name.clone(), span))?;
-                        match s {
-                            Value::Str(st) => {
-                                let mut chars: Vec<char> = st.chars().collect();
-                                if idx >= chars.len() {
-                                    return Err(EvalError::Type("string-set!: index out of bounds".into(), span));
-                                }
-                                chars[idx] = ch;
-                                env_update(env, var_name, Value::Str(chars.into_iter().collect()));
-                                return Ok(Value::Void);
-                            }
-                            _ => return Err(EvalError::Type("string-set!: expected string".into(), span)),
+                        let mut chars: Vec<char> = s.chars().collect();
+                        if idx >= chars.len() {
+                            return Err(EvalError::Type("string-set!: index out of bounds".into(), span));
                         }
+                        chars[idx] = ch;
+                        env_update(env, &name, Value::Str(chars.into_iter().collect()));
+                        return Ok(Value::Void);
                     }
                     "not" => {
                         if items.len() != 2 {
@@ -847,7 +850,10 @@ fn make_global_env() -> Env {
                    // L14
                    "vector", "make-vector", "vector-ref", "vector-set!",
                    "vector-length", "vector?", "vector->list", "list->vector",
-                   "assq", "memq"] {
+                   "assq", "memq",
+                   // L15
+                   "string->list", "list->string",
+                   "char->integer", "integer->char"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     env

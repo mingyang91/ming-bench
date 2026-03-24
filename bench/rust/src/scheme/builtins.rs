@@ -503,6 +503,47 @@ fn builtin_string_char_io(name: &str, args: &[Value], out: &Output, span: Span) 
                 _ => Err(EvalError::Type("string->symbol: expected string".into(), span)),
             }
         }
+        "string->list" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string->list requires 1 argument".into(), span)); }
+            match &args[0] {
+                Value::Str(s) => {
+                    let items: Vec<Spanned> = s.chars().map(|c| Spanned { val: Value::Char(c), span }).collect();
+                    Ok(Value::List(items))
+                }
+                _ => Err(EvalError::Type("string->list: expected string".into(), span)),
+            }
+        }
+        "list->string" => {
+            if args.len() != 1 { return Err(EvalError::Arity("list->string requires 1 argument".into(), span)); }
+            match &args[0] {
+                Value::List(items) => {
+                    let mut s = String::new();
+                    for item in items {
+                        match &item.val {
+                            Value::Char(c) => s.push(*c),
+                            _ => return Err(EvalError::Type("list->string: expected list of chars".into(), span)),
+                        }
+                    }
+                    Ok(Value::Str(s))
+                }
+                _ => Err(EvalError::Type("list->string: expected list".into(), span)),
+            }
+        }
+        "char->integer" => {
+            if args.len() != 1 { return Err(EvalError::Arity("char->integer requires 1 argument".into(), span)); }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Integer(*c as i64)),
+                _ => Err(EvalError::Type("char->integer: expected char".into(), span)),
+            }
+        }
+        "integer->char" => {
+            if args.len() != 1 { return Err(EvalError::Arity("integer->char requires 1 argument".into(), span)); }
+            let n = as_integer(&args[0], span)?;
+            match char::from_u32(n as u32) {
+                Some(c) => Ok(Value::Char(c)),
+                None => Err(EvalError::Type("integer->char: invalid code point".into(), span)),
+            }
+        }
         "string-copy" => {
             if args.len() != 1 { return Err(EvalError::Arity("string-copy requires 1 argument".into(), span)); }
             match &args[0] {
@@ -619,6 +660,8 @@ pub(crate) fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span
         | "string->number" | "number->string"
         | "symbol->string" | "string->symbol"
         | "string-copy" | "string-ref"
+        | "string->list" | "list->string"
+        | "char->integer" | "integer->char"
         | "char-alphabetic?" | "char-numeric?"
         | "char-upcase" | "char-downcase" | "char=?" | "char<?"
         | "string=?" | "string<?" | "string-ci=?"
