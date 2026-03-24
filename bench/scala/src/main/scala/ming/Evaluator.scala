@@ -94,6 +94,10 @@ object Evaluator:
   // --- exception handler stack ---
   private[ming] var raiseHandlers: List[Val => Bounce] = List.empty
 
+  // --- Step limiting ---
+  private[ming] var stepLimit: Long = -1L
+  private[ming] var stepCount: Long = 0L
+
   // --- Position tracking ---
   private[ming] var lastPos = "1:1"
 
@@ -133,6 +137,10 @@ object Evaluator:
       b match
         case BDone(v) => return v
         case BMore(thunk) =>
+          if stepLimit >= 0 then
+            stepCount += 1
+            if stepCount > stepLimit then
+              throw new EvalError("step limit exceeded")
           try b = thunk()
           catch
             case jump: ContinuationJump => b = jump.bounce
@@ -286,3 +294,21 @@ object Evaluator:
         try k(applyBuiltinChecked(f, args))
         catch case jump: ContinuationJump => jump.bounce
       case _ => error(s"not a procedure: ${Display.write(func)}")
+
+  // ======== Public API forwarding (for munit tests) ========
+
+  def evalStr(input: String): String = Interpreter.evalStr(input)
+
+  def evalStrWithOutput(input: String): (String, String) = Interpreter.evalStrWithOutput(input)
+
+  // ======== Step-limited evaluation ========
+
+  def evalStrWithLimit(input: String, maxSteps: Long): String =
+    stepLimit = maxSteps
+    stepCount = 0L
+    try
+      val result = Interpreter.runProgram(input)
+      Display.write(result)
+    finally
+      stepLimit = -1L
+      stepCount = 0L

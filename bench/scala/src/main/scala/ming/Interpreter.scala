@@ -23,7 +23,7 @@ object Interpreter:
     env.define("call-with-current-continuation", CallCCVal)
     env
 
-  private def runProgram(input: String): Val =
+  private[ming] def runProgram(input: String): Val =
     Evaluator.windingStack = List.empty
     Evaluator.raiseHandlers = List.empty
     val parser = new Parser(input)
