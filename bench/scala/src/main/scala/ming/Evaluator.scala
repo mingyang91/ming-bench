@@ -1,5 +1,7 @@
 package ming
 
+import scala.collection.mutable
+
 object Evaluator:
 
   // --- AST ---
@@ -9,6 +11,23 @@ object Evaluator:
     case Str(value: String)
     case Sym(name: String)
     case Lst(elems: List[Expr])
+    case Lambda(params: List[String], body: List[Expr], closure: Env)
+
+  // --- Environment ---
+  private class Env(val bindings: mutable.Map[String, Expr], val parent: Option[Env]):
+
+    def lookup(name: String): Expr =
+      bindings.get(name) match
+        case Some(v) => v
+        case None =>
+          parent match
+            case Some(p) => p.lookup(name)
+            case None    => throw EvalError(s"unbound variable: $name")
+
+    def define(name: String, value: Expr): Unit =
+      bindings(name) = value
+
+    def child(): Env = Env(mutable.Map.empty, Some(this))
 
   // --- Parser ---
   private class Parser(input: String):
@@ -84,7 +103,6 @@ object Evaluator:
       val c = advance()
       c match
         case 't' =>
-          // ensure not part of longer token
           if pos < input.length && !isDelimiter(peek) then throw EvalError(s"unexpected character after #t")
           Expr.Bool(true)
         case 'f' =>
@@ -105,19 +123,48 @@ object Evaluator:
         case None    => Expr.Sym(token)
 
   // --- Evaluation ---
-  private type Env = Map[String, Expr]
-
   private def eval(expr: Expr, env: Env): Expr = expr match
-    case Expr.Num(_) | Expr.Bool(_) | Expr.Str(_) => expr
-    case Expr.Sym(name) =>
-      env.getOrElse(name, throw EvalError(s"unbound variable: $name"))
-    case Expr.Lst(Nil)                     => throw EvalError("empty application")
+    case Expr.Num(_) | Expr.Bool(_) | Expr.Str(_) | Expr.Lambda(_, _, _) => expr
+    case Expr.Sym(name)                                                  => env.lookup(name)
+    case Expr.Lst(Nil)                                                   => throw EvalError("empty application")
+    case Expr.Lst(Expr.Sym("quote") :: args) =>
+      if args.length != 1 then throw EvalError("quote: need exactly 1 argument")
+      args.head
+    case Expr.Lst(Expr.Sym("if") :: args) =>
+      if args.length < 2 || args.length > 3 then throw EvalError("if: need 2 or 3 arguments")
+      val cond = eval(args.head, env)
+      if !isFalsy(cond) then eval(args(1), env)
+      else if args.length == 3 then eval(args(2), env)
+      else Expr.Bool(false) // unspecified
+    case Expr.Lst(Expr.Sym("define") :: args) =>
+      args match
+        case Expr.Sym(name) :: value :: Nil =>
+          env.define(name, eval(value, env))
+          Expr.Bool(false) // unspecified
+        case Expr.Lst(Expr.Sym(name) :: params) :: body if body.nonEmpty =>
+          val paramNames = params.map {
+            case Expr.Sym(p) => p
+            case other       => throw EvalError(s"define: invalid parameter: ${display(other)}")
+          }
+          val lambda = Expr.Lambda(paramNames, body, env)
+          env.define(name, lambda)
+          Expr.Bool(false)
+        case _ => throw EvalError("define: invalid syntax")
+    case Expr.Lst(Expr.Sym("lambda") :: args) =>
+      args match
+        case Expr.Lst(params) :: body if body.nonEmpty =>
+          val paramNames = params.map {
+            case Expr.Sym(p) => p
+            case other       => throw EvalError(s"lambda: invalid parameter: ${display(other)}")
+          }
+          Expr.Lambda(paramNames, body, env)
+        case _ => throw EvalError("lambda: invalid syntax")
     case Expr.Lst(Expr.Sym("and") :: args) => evalAnd(args, env)
     case Expr.Lst(Expr.Sym("or") :: args)  => evalOr(args, env)
     case Expr.Lst(op :: args) =>
       val func          = eval(op, env)
       val evaluatedArgs = args.map(a => eval(a, env))
-      apply(func, evaluatedArgs)
+      applyProc(func, evaluatedArgs)
 
   private def evalAnd(args: List[Expr], env: Env): Expr = args match
     case Nil         => Expr.Bool(true)
@@ -137,9 +184,17 @@ object Evaluator:
     case Expr.Bool(false) => true
     case _                => false
 
-  private def apply(func: Expr, args: List[Expr]): Expr = func match
+  private def applyProc(func: Expr, args: List[Expr]): Expr = func match
     case Expr.Sym(name) => applyBuiltin(name, args)
-    case _              => throw EvalError(s"not a procedure: ${display(func)}")
+    case Expr.Lambda(params, body, closure) =>
+      if params.length != args.length then
+        throw EvalError(s"lambda: expected ${params.length} arguments, got ${args.length}")
+      val localEnv = closure.child()
+      params.zip(args).foreach((p, a) => localEnv.define(p, a))
+      var result: Expr = Expr.Bool(false)
+      for e <- body do result = eval(e, localEnv)
+      result
+    case _ => throw EvalError(s"not a procedure: ${display(func)}")
 
   private def applyBuiltin(name: String, args: List[Expr]): Expr = name match
     case "+" =>
@@ -186,32 +241,28 @@ object Evaluator:
     case _           => throw EvalError(s"expected number, got ${display(e)}")
 
   private def display(e: Expr): String = e match
-    case Expr.Num(n)      => n.toString
-    case Expr.Bool(true)  => "#t"
-    case Expr.Bool(false) => "#f"
-    case Expr.Str(s)      => "\"" + s + "\""
-    case Expr.Sym(name)   => name
-    case Expr.Lst(elems)  => "(" + elems.map(display).mkString(" ") + ")"
+    case Expr.Num(n)          => n.toString
+    case Expr.Bool(true)      => "#t"
+    case Expr.Bool(false)     => "#f"
+    case Expr.Str(s)          => "\"" + s + "\""
+    case Expr.Sym(name)       => name
+    case Expr.Lst(elems)      => "(" + elems.map(display).mkString(" ") + ")"
+    case Expr.Lambda(_, _, _) => "#<procedure>"
 
   // --- Public API ---
+  private def makeTopLevelEnv(): Env =
+    val env      = Env(mutable.Map.empty, None)
+    val builtins = List("+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not")
+    for name <- builtins do env.define(name, Expr.Sym(name))
+    env
+
   def evalStr(input: String): String =
     val parser = Parser(input)
     val exprs  = parser.parseAll()
     if exprs.isEmpty then throw EvalError("no expressions")
-    val builtinEnv: Env = Map(
-      "+"   -> Expr.Sym("+"),
-      "-"   -> Expr.Sym("-"),
-      "*"   -> Expr.Sym("*"),
-      "/"   -> Expr.Sym("/"),
-      "<"   -> Expr.Sym("<"),
-      ">"   -> Expr.Sym(">"),
-      "="   -> Expr.Sym("="),
-      "<="  -> Expr.Sym("<="),
-      ">="  -> Expr.Sym(">="),
-      "not" -> Expr.Sym("not")
-    )
+    val env          = makeTopLevelEnv()
     var result: Expr = Expr.Bool(false)
-    for e <- exprs do result = eval(e, builtinEnv)
+    for e <- exprs do result = eval(e, env)
     display(result)
 
   def evalStrWithOutput(input: String): (String, String) =
