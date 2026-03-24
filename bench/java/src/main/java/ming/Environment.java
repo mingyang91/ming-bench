@@ -20,13 +20,13 @@ public class Environment {
     }
 
     public void set(String name, Object value) throws EvalError {
-        if (bindings.containsKey(name)) {
-            bindings.put(name, value);
-            return;
-        }
-        if (parent != null) {
-            parent.set(name, value);
-            return;
+        Environment e = this;
+        while (e != null) {
+            if (e.bindings.containsKey(name)) {
+                e.bindings.put(name, value);
+                return;
+            }
+            e = e.parent;
         }
         throw new EvalError("unbound variable: " + name);
     }
@@ -34,11 +34,12 @@ public class Environment {
     public Environment getParent() { return parent; }
 
     public Object lookup(String name) throws EvalError {
-        if (bindings.containsKey(name)) {
-            return bindings.get(name);
-        }
-        if (parent != null) {
-            return parent.lookup(name);
+        Environment e = this;
+        while (e != null) {
+            Object val = e.bindings.get(name);
+            if (val != null) return val;
+            if (e.bindings.containsKey(name)) return null;
+            e = e.parent;
         }
         throw new EvalError("unbound variable: " + name);
     }

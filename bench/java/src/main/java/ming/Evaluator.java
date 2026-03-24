@@ -152,7 +152,7 @@ public class Evaluator {
         if (lastResult == null) {
             throw new EvalError("1:1 no expression");
         }
-        return new EvalResult(schemeToString(lastResult), output);
+        return new EvalResult(displayString(lastResult), output);
     }
 
     public String evalStrWithLimit(String input, int maxSteps) throws EvalError {
@@ -576,7 +576,7 @@ public class Evaluator {
     private Object eval(Object expr, Environment env) throws EvalError {
         int guardBase = guardHandlerStack.size();
         try {
-        while (true) {  // trampoline loop for TCO
+        trampoline: while (true) {  // trampoline loop for TCO
         try {
         // Step-limited evaluation check
         if (stepLimit >= 0) {
@@ -894,18 +894,11 @@ public class Evaluator {
                         if (list.size() < 3) throw error("when: bad syntax");
                         Object test = eval(list.get(1), env);
                         if (!Boolean.FALSE.equals(test)) {
-                            List<?> whenBody = list.subList(2, list.size());
-                            if (whenBody.size() > 1) {
-                                ContinuationFrame _f = new ContinuationFrame(whenBody, env, 0);
-                                frameStack.add(_f);
-                                for (int i = 0; i < whenBody.size() - 1; i++) {
-                                    _f.currentIdx = i;
-                                    eval((Object) whenBody.get(i), env);
-                                }
-                                frameStack.remove(frameStack.size() - 1);
+                            Object whenResult = evalBody(list.subList(2, list.size()), env);
+                            if (whenResult instanceof TailCall tc) {
+                                expr = tc.expr; env = tc.env; continue;
                             }
-                            expr = list.get(list.size() - 1);
-                            continue;
+                            return whenResult;
                         }
                         return VOID;
                     }
@@ -913,114 +906,33 @@ public class Evaluator {
                         if (list.size() < 3) throw error("unless: bad syntax");
                         Object test = eval(list.get(1), env);
                         if (Boolean.FALSE.equals(test)) {
-                            List<?> unlessBody = list.subList(2, list.size());
-                            if (unlessBody.size() > 1) {
-                                ContinuationFrame _f = new ContinuationFrame(unlessBody, env, 0);
-                                frameStack.add(_f);
-                                for (int i = 0; i < unlessBody.size() - 1; i++) {
-                                    _f.currentIdx = i;
-                                    eval((Object) unlessBody.get(i), env);
-                                }
-                                frameStack.remove(frameStack.size() - 1);
+                            Object unlessResult = evalBody(list.subList(2, list.size()), env);
+                            if (unlessResult instanceof TailCall tc) {
+                                expr = tc.expr; env = tc.env; continue;
                             }
-                            expr = list.get(list.size() - 1);
-                            continue;
+                            return unlessResult;
                         }
                         return VOID;
                     }
-                    case "case" -> { return evalCase(list, env); }
+                    case "case" -> {
+                        Object caseResult = evalCase(list, env);
+                        if (caseResult instanceof TailCall tc) {
+                            expr = tc.expr; env = tc.env; continue;
+                        }
+                        return caseResult;
+                    }
                     case "do" -> { return evalDo(list, env); }
-                    case "dynamic-wind" -> {
-                        if (list.size() != 4) throw error("dynamic-wind: expected 3 arguments");
-                        Object dwIn = eval(list.get(1), env);
-                        Object dwBody = eval(list.get(2), env);
-                        Object dwOut = eval(list.get(3), env);
-                        // Protect replay state from in/out thunk side effects
-                        var savedReplay = replayEnv;
-                        replayEnv = null;
-                        apply(dwIn, List.of());
-                        replayEnv = savedReplay;
-                        WindEntry wEntry = new WindEntry(dwIn, dwOut);
-                        windStack.add(wEntry);
-                        Object dwResult;
-                        try {
-                            dwResult = apply(dwBody, List.of());
-                        } catch (ContinuationInvoked ci) {
-                            windStack.remove(windStack.size() - 1);
-                            apply(dwOut, List.of());
-                            throw ci;
-                        } catch (SchemeRaise sr) {
-                            windStack.remove(windStack.size() - 1);
-                            apply(dwOut, List.of());
-                            throw sr;
-                        }
-                        windStack.remove(windStack.size() - 1);
-                        apply(dwOut, List.of());
-                        return dwResult;
-                    }
+                    case "dynamic-wind" -> { return evalDynamicWind(list, env); }
                     case "guard" -> {
-                        // (guard (var clause ...) body ...)
-                        if (list.size() < 3) throw error("guard: bad syntax");
-                        Object clauseSpec = list.get(1);
-                        if (clauseSpec instanceof Located loc) clauseSpec = loc.value();
-                        if (!(clauseSpec instanceof List<?> clauseList) || clauseList.isEmpty())
-                            throw error("guard: bad syntax");
-                        Object varObj = clauseList.get(0);
-                        if (varObj instanceof Located vl) varObj = vl.value();
-                        if (!(varObj instanceof String)) throw error("guard: variable must be a symbol");
-                        String guardVar = (String) varObj;
-                        // Evaluate non-tail body expressions with try/catch
-                        try {
-                            for (int bi = 2; bi < list.size() - 1; bi++) {
-                                eval(list.get(bi), env);
-                            }
-                        } catch (SchemeRaise sr) {
-                            return evalGuardClauses(guardVar, clauseList, sr.value, env);
+                        Object guardResult = evalGuard(list, env);
+                        if (guardResult instanceof TailCall tc) {
+                            expr = tc.expr; env = tc.env; continue;
                         }
-                        // Push handler for tail expression (enables TCO through guard)
-                        guardHandlerStack.add(new GuardHandler(guardVar, clauseList, env));
-                        expr = list.get(list.size() - 1);
-                        continue;
+                        return guardResult;
                     }
-                    case "with-exception-handler" -> {
-                        if (list.size() != 3) throw error("with-exception-handler: expected 2 arguments");
-                        Object handler = eval(list.get(1), env);
-                        Object thunk = eval(list.get(2), env);
-                        exceptionHandlerStack.add(handler);
-                        try {
-                            Object result = apply(thunk, List.of());
-                            exceptionHandlerStack.remove(exceptionHandlerStack.size() - 1);
-                            return result;
-                        } catch (SchemeRaise sr) {
-                            exceptionHandlerStack.remove(exceptionHandlerStack.size() - 1);
-                            throw sr;
-                        }
-                    }
+                    case "with-exception-handler" -> { return evalWithExceptionHandler(list, env); }
                     case "call/cc", "call-with-current-continuation" -> {
-                        if (list.size() != 2) throw error("call/cc: expected 1 argument");
-                        if (hasPendingCallCC) {
-                            hasPendingCallCC = false;
-                            Object val = pendingCallCCValue;
-                            pendingCallCCValue = null;
-                            replayEnv = null;
-                            return val;
-                        }
-                        Object ccProc = eval(list.get(1), env);
-                        SchemeContinuation k = new SchemeContinuation();
-                        k.topLevelIndex = currentTopLevelIndex;
-                        k.bodyExprs = currentBodyExprs;
-                        k.bodyEnv = currentBodyEnv;
-                        k.savedWindStack = new ArrayList<>(windStack);
-                        k.savedFrameStack = copyFrameStack();
-                        try {
-                            Object ccResult = apply(ccProc, List.of(k));
-                            k.active = false;
-                            return ccResult;
-                        } catch (ContinuationInvoked ci) {
-                            k.active = false;
-                            if (ci.continuation == k) return ci.value;
-                            throw ci;
-                        }
+                        return evalCallCC(list, env);
                     }
                 }
                 // Check for macro usage
@@ -1041,7 +953,7 @@ public class Evaluator {
 
             // Function application
             Object proc = eval(head, env);
-            List<Object> args = new ArrayList<>();
+            List<Object> args = new ArrayList<>(list.size() - 1);
             for (int i = 1; i < list.size(); i++) {
                 args.add(eval(list.get(i), env));
             }
@@ -1507,11 +1419,11 @@ public class Evaluator {
             if (datums instanceof Located loc) datums = loc.value();
             // else clause
             if (datums instanceof String s && s.equals("else")) {
-                Object result = VOID;
-                for (int j = 1; j < cl.size(); j++) {
-                    result = eval(cl.get(j), env);
+                if (cl.size() == 1) return VOID;
+                for (int j = 1; j < cl.size() - 1; j++) {
+                    eval(cl.get(j), env);
                 }
-                return result;
+                return new TailCall(cl.get(cl.size() - 1), env);
             }
             // datums is a list of values
             if (!(datums instanceof List<?> datumList)) throw error("case: bad clause");
@@ -1521,11 +1433,11 @@ public class Evaluator {
                 // Convert to cons-cell data for quoted symbols etc
                 datum = listToConsCells(datum);
                 if (eqv(key, datum)) {
-                    Object result = VOID;
-                    for (int j = 1; j < cl.size(); j++) {
-                        result = eval(cl.get(j), env);
+                    if (cl.size() == 1) return VOID;
+                    for (int j = 1; j < cl.size() - 1; j++) {
+                        eval(cl.get(j), env);
                     }
-                    return result;
+                    return new TailCall(cl.get(cl.size() - 1), env);
                 }
             }
         }
@@ -1541,6 +1453,112 @@ public class Evaluator {
         if (a instanceof SchemeChar && b instanceof SchemeChar) return a.equals(b);
         if (a instanceof String && b instanceof String) return a.equals(b);
         return false;
+    }
+
+    // Helper: evaluate body exprs, return TailCall for last
+    private Object evalBody(List<?> body, Environment env) throws EvalError {
+        if (body.isEmpty()) return VOID;
+        if (body.size() > 1) {
+            ContinuationFrame _f = new ContinuationFrame(body, env, 0);
+            frameStack.add(_f);
+            for (int i = 0; i < body.size() - 1; i++) {
+                _f.currentIdx = i;
+                eval((Object) body.get(i), env);
+            }
+            frameStack.remove(frameStack.size() - 1);
+        }
+        return new TailCall(body.get(body.size() - 1), env);
+    }
+
+    private Object evalDynamicWind(List<?> list, Environment env) throws EvalError {
+        if (list.size() != 4) throw error("dynamic-wind: expected 3 arguments");
+        Object dwIn = eval(list.get(1), env);
+        Object dwBody = eval(list.get(2), env);
+        Object dwOut = eval(list.get(3), env);
+        var savedReplay = replayEnv;
+        replayEnv = null;
+        apply(dwIn, List.of());
+        replayEnv = savedReplay;
+        WindEntry wEntry = new WindEntry(dwIn, dwOut);
+        windStack.add(wEntry);
+        Object dwResult;
+        try {
+            dwResult = apply(dwBody, List.of());
+        } catch (ContinuationInvoked ci) {
+            windStack.remove(windStack.size() - 1);
+            apply(dwOut, List.of());
+            throw ci;
+        } catch (SchemeRaise sr) {
+            windStack.remove(windStack.size() - 1);
+            apply(dwOut, List.of());
+            throw sr;
+        }
+        windStack.remove(windStack.size() - 1);
+        apply(dwOut, List.of());
+        return dwResult;
+    }
+
+    private Object evalWithExceptionHandler(List<?> list, Environment env) throws EvalError {
+        if (list.size() != 3) throw error("with-exception-handler: expected 2 arguments");
+        Object handler = eval(list.get(1), env);
+        Object thunk = eval(list.get(2), env);
+        exceptionHandlerStack.add(handler);
+        try {
+            Object result = apply(thunk, List.of());
+            exceptionHandlerStack.remove(exceptionHandlerStack.size() - 1);
+            return result;
+        } catch (SchemeRaise sr) {
+            exceptionHandlerStack.remove(exceptionHandlerStack.size() - 1);
+            throw sr;
+        }
+    }
+
+    private Object evalGuard(List<?> list, Environment env) throws EvalError {
+        if (list.size() < 3) throw error("guard: bad syntax");
+        Object clauseSpec = list.get(1);
+        if (clauseSpec instanceof Located loc) clauseSpec = loc.value();
+        if (!(clauseSpec instanceof List<?> clauseList) || clauseList.isEmpty())
+            throw error("guard: bad syntax");
+        Object varObj = clauseList.get(0);
+        if (varObj instanceof Located vl) varObj = vl.value();
+        if (!(varObj instanceof String)) throw error("guard: variable must be a symbol");
+        String guardVar = (String) varObj;
+        try {
+            for (int bi = 2; bi < list.size() - 1; bi++) {
+                eval(list.get(bi), env);
+            }
+        } catch (SchemeRaise sr) {
+            return evalGuardClauses(guardVar, clauseList, sr.value, env);
+        }
+        guardHandlerStack.add(new GuardHandler(guardVar, clauseList, env));
+        return new TailCall(list.get(list.size() - 1), env);
+    }
+
+    private Object evalCallCC(List<?> list, Environment env) throws EvalError {
+        if (list.size() != 2) throw error("call/cc: expected 1 argument");
+        if (hasPendingCallCC) {
+            hasPendingCallCC = false;
+            Object val = pendingCallCCValue;
+            pendingCallCCValue = null;
+            replayEnv = null;
+            return val;
+        }
+        Object ccProc = eval(list.get(1), env);
+        SchemeContinuation k = new SchemeContinuation();
+        k.topLevelIndex = currentTopLevelIndex;
+        k.bodyExprs = currentBodyExprs;
+        k.bodyEnv = currentBodyEnv;
+        k.savedWindStack = new ArrayList<>(windStack);
+        k.savedFrameStack = copyFrameStack();
+        try {
+            Object ccResult = apply(ccProc, List.of(k));
+            k.active = false;
+            return ccResult;
+        } catch (ContinuationInvoked ci) {
+            k.active = false;
+            if (ci.continuation == k) return ci.value;
+            throw ci;
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -3315,9 +3333,11 @@ public class Evaluator {
             if (op.equals("*")) return 1L;
             throw error(op + ": need at least 1 argument");
         }
-        // Check all args are numbers
+        // Check all args are numbers and detect inexact in single pass
+        boolean inexact = false;
         for (Object a : args) {
-            if (!isNumber(a)) throw error(op + ": not a number");
+            if (a instanceof Double) { inexact = true; }
+            else if (!(a instanceof Long) && !(a instanceof Rational)) throw error(op + ": not a number");
         }
         // Unary minus
         if (op.equals("-") && args.size() == 1) {
@@ -3326,9 +3346,6 @@ public class Evaluator {
             if (val instanceof Rational r) return normalizeExact(r.negate());
             return -((Double) val);
         }
-        // Check if any arg is inexact (Double)
-        boolean inexact = false;
-        for (Object a : args) { if (a instanceof Double) { inexact = true; break; } }
         if (inexact) {
             double result = toDouble(args.get(0));
             for (int i = 1; i < args.size(); i++) {
