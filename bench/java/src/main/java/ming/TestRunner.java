@@ -11,7 +11,14 @@ import java.nio.file.Path;
 
 public class TestRunner {
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
+        // Run in a thread with a larger stack to handle deeply recursive Scheme programs
+        Thread thread = new Thread(null, () -> run(args), "eval-thread", 64 * 1024 * 1024);
+        thread.start();
+        thread.join();
+    }
+
+    private static void run(String[] args) {
         if (args.length < 1) {
             System.err.println("Usage: java ming.TestRunner <level|all>");
             System.exit(2);

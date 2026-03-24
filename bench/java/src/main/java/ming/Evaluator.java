@@ -154,7 +154,8 @@ public class Evaluator {
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "define", "define-syntax", "define-record-type", "set!", "if", "quote", "lambda",
         "case-lambda", "and", "or", "begin", "cond", "let", "let*", "letrec", "letrec*", "case", "do",
-        "when", "unless", "quasiquote", "syntax-case", "syntax", "with-syntax"
+        "when", "unless", "quasiquote", "syntax-case", "syntax", "with-syntax",
+        "guard", "raise", "with-exception-handler", "dynamic-wind"
     );
 
     // Internal string wrapper to distinguish from symbols (mutable for string-set!)
@@ -1407,8 +1408,10 @@ public class Evaluator {
             }
 
             if (proc instanceof SchemeContinuation cont) {
-                if (args.size() != 1) throw new EvalError(posStr() + "continuation expects 1 argument");
-                throw new ContinuationInvoked(cont, args.get(0));
+                Object value;
+                if (args.size() == 1) value = args.get(0);
+                else value = new SchemeValues(args);
+                throw new ContinuationInvoked(cont, value);
             }
 
             if (proc instanceof Lambda lam) {
@@ -1521,8 +1524,10 @@ public class Evaluator {
 
     private Object applyProcedure(Object proc, List<Object> args) throws EvalError {
         if (proc instanceof SchemeContinuation cont) {
-            if (args.size() != 1) throw new EvalError(posStr() + "continuation expects 1 argument");
-            throw new ContinuationInvoked(cont, args.get(0));
+            Object value;
+            if (args.size() == 1) value = args.get(0);
+            else value = new SchemeValues(args);
+            throw new ContinuationInvoked(cont, value);
         }
         if (proc instanceof Lambda lam) {
             return applyLambda(lam, args);
