@@ -167,5 +167,68 @@ object Builtins:
         if b == 0 then throw new EvalError("remainder: division by zero")
         Num(a % b)
       case _ => throw new EvalError("remainder requires 2 numeric arguments")
+    },
+    // --- L05: I/O ---
+    "display" -> Builtin {
+      case List(v) =>
+        Evaluator.outputBuffer.append(Evaluator.displayVal(v))
+        Void
+      case _ => throw new EvalError("display requires 1 argument")
+    },
+    "write" -> Builtin {
+      case List(v) =>
+        Evaluator.outputBuffer.append(Evaluator.display(v))
+        Void
+      case _ => throw new EvalError("write requires 1 argument")
+    },
+    "newline" -> Builtin {
+      case scala.List() =>
+        Evaluator.outputBuffer.append("\n")
+        Void
+      case _ => throw new EvalError("newline requires 0 arguments")
+    },
+    // --- L05: String operations ---
+    "string-append" -> Builtin { args =>
+      val strs = args.map {
+        case Str(s) => s
+        case v      => throw new EvalError(s"string-append: not a string: ${Evaluator.display(v)}")
+      }
+      Str(strs.mkString)
+    },
+    "string-length" -> Builtin {
+      case List(Str(s)) => Num(s.length.toLong)
+      case _            => throw new EvalError("string-length requires 1 string argument")
+    },
+    "substring" -> Builtin {
+      case List(Str(s), Num(start), Num(end)) =>
+        Str(s.substring(start.toInt, end.toInt))
+      case _ => throw new EvalError("substring requires a string and two integers")
+    },
+    "string->number" -> Builtin {
+      case List(Str(s)) =>
+        try Num(s.toLong)
+        catch case _: NumberFormatException => Bool(false)
+      case _ => throw new EvalError("string->number requires 1 string argument")
+    },
+    "number->string" -> Builtin {
+      case List(Num(n)) => Str(n.toString)
+      case _            => throw new EvalError("number->string requires 1 numeric argument")
+    },
+    "symbol->string" -> Builtin {
+      case List(Symbol(name)) => Str(name)
+      case _                  => throw new EvalError("symbol->string requires 1 symbol argument")
+    },
+    "string->symbol" -> Builtin {
+      case List(Str(s)) => Symbol(s)
+      case _            => throw new EvalError("string->symbol requires 1 string argument")
+    },
+    "string-ref" -> Builtin {
+      case List(Str(s), Num(i)) => SchemeChar(s.charAt(i.toInt))
+      case _                    => throw new EvalError("string-ref requires a string and an integer")
+    },
+    "char?" -> Builtin {
+      case List(SchemeChar(_)) => Bool(true)
+      case List(_)             => Bool(false)
+      case _                   => throw new EvalError("char? requires 1 argument")
     }
   )

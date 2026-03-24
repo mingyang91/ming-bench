@@ -11,10 +11,14 @@ object Evaluator:
     case Symbol(name: String)
     case Pair(car: Val, cdr: Val)
     case Nil
+    case SchemeChar(c: scala.Char)
     case Void
     case Builtin(f: List[Val] => Val)
 
   import Val.*
+
+  // --- Output capture ---
+  private[ming] val outputBuffer = new StringBuilder
 
   // --- Position tracking ---
   private var lastPos = "1:1"
@@ -215,17 +219,39 @@ object Evaluator:
     Builtins.all.foreach((name, v) => m(name) = v)
     new Env(m, None)
 
-  // --- Display ---
+  // --- Display (write-style, with quotes) ---
   private[ming] def display(v: Val): String = v match
-    case Num(n)       => n.toString
-    case Bool(true)   => "#t"
-    case Bool(false)  => "#f"
-    case Str(s)       => "\"" + s + "\""
-    case Symbol(name) => name
-    case Nil          => "()"
-    case Void         => "#<void>"
-    case Pair(_, _)   => displayList(v)
-    case Builtin(_)   => "#<procedure>"
+    case Num(n)        => n.toString
+    case Bool(true)    => "#t"
+    case Bool(false)   => "#f"
+    case Str(s)        => "\"" + s + "\""
+    case SchemeChar(c) => s"#\\$c"
+    case Symbol(name)  => name
+    case Nil           => "()"
+    case Void          => "#<void>"
+    case Pair(_, _)    => displayList(v)
+    case Builtin(_)    => "#<procedure>"
+
+  // --- Display (display-style, no quotes on strings) ---
+  private[ming] def displayVal(v: Val): String = v match
+    case Str(s)        => s
+    case SchemeChar(c) => c.toString
+    case Pair(_, _)    => displayListVal(v)
+    case _             => display(v)
+
+  private def displayListVal(v: Val): String =
+    val sb = new StringBuilder("(")
+    @scala.annotation.tailrec
+    def loop(current: Val, first: Boolean): Unit = current match
+      case Pair(car, cdr) =>
+        if !first then sb.append(" ")
+        sb.append(displayVal(car))
+        loop(cdr, first = false)
+      case Nil => ()
+      case _   => sb.append(" . "); sb.append(displayVal(current))
+    loop(v, first = true)
+    sb.append(")")
+    sb.toString
 
   private def displayList(v: Val): String =
     val sb = new StringBuilder("(")
@@ -254,5 +280,15 @@ object Evaluator:
     display(result)
 
   def evalStrWithOutput(input: String): (String, String) =
-    val result = evalStr(input)
-    (result, "")
+    outputBuffer.clear()
+    val parser = new Parser(input)
+    val exprs  = parser.parseAllWithPositions()
+    if exprs.isEmpty then throw new EvalError("no expressions")
+    val env         = defaultEnv()
+    var result: Val = Void
+    for (expr, line, col) <- exprs do
+      lastPos = s"$line:$col"
+      result = eval(expr, env)
+    val output = outputBuffer.toString
+    outputBuffer.clear()
+    (display(result), output)
