@@ -24,6 +24,25 @@ func evalTail(node *astNode, e *env) (*Value, error) {
 	return nil, &tailCallErr{node, e}
 }
 
+// applyAny applies any callable (lambda, builtin symbol, goFunc) with full resolution.
+func applyAny(op *Value, args []*Value, node *astNode, ip *interp) (*Value, error) {
+	switch op.typ {
+	case valLambda:
+		return applyLambdaFull(op, args, node, ip)
+	case valSymbol:
+		return applyBuiltin(op.sval, args, node, ip)
+	case valGoFunc:
+		return op.goFunc(args)
+	case valContinuation:
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: expected 1 argument", node.line, node.col)}
+		}
+		panic(&contInvoke{cont: op, value: args[0]})
+	default:
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: call-with-values: not a procedure", node.line, node.col)}
+	}
+}
+
 // applyLambdaFull calls applyLambda and resolves any tail call via eval.
 // Use this when a fully resolved value is needed (e.g., inside map).
 func applyLambdaFull(op *Value, args []*Value, node *astNode, ip *interp) (*Value, error) {
@@ -58,6 +77,7 @@ const (
 	valGoFunc
 	valVector
 	valContinuation
+	valMultipleValues
 )
 
 type Value struct {
@@ -88,6 +108,8 @@ type Value struct {
 	// continuation fields (L18)
 	contTag     *contTag
 	contCapture *contCapture
+	// multiple values (L21)
+	vals []*Value
 }
 
 type caseClause struct {
@@ -319,6 +341,12 @@ func (v *Value) String() string {
 			parts[i] = el.String()
 		}
 		return "#(" + strings.Join(parts, " ") + ")"
+	case valMultipleValues:
+		parts := make([]string, len(v.vals))
+		for i, el := range v.vals {
+			parts[i] = el.String()
+		}
+		return strings.Join(parts, "\n")
 	default:
 		return "<unknown>"
 	}
@@ -2648,6 +2676,29 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		}
 		return evalDynamicWind(args[0], args[1], args[2], node, ip)
 
+	case "values":
+		if len(args) == 1 {
+			return args[0], nil
+		}
+		return &Value{typ: valMultipleValues, vals: args}, nil
+
+	case "call-with-values":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: call-with-values: need 2 arguments", node.line, node.col)}
+		}
+		producer, consumer := args[0], args[1]
+		produced, err := applyAny(producer, nil, node, ip)
+		if err != nil {
+			return nil, err
+		}
+		var consumerArgs []*Value
+		if produced.typ == valMultipleValues {
+			consumerArgs = produced.vals
+		} else {
+			consumerArgs = []*Value{produced}
+		}
+		return applyAny(consumer, consumerArgs, node, ip)
+
 	case "raise":
 		if len(args) != 1 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: raise: need 1 argument", node.line, node.col)}
@@ -3255,7 +3306,8 @@ func makeGlobalEnv() *env {
 		"member", "assv",
 		"call/cc", "call-with-current-continuation",
 		"dynamic-wind",
-		"raise", "with-exception-handler"}
+		"raise", "with-exception-handler",
+		"values", "call-with-values"}
 	for _, name := range builtins {
 		e.set(name, symVal(name))
 	}
