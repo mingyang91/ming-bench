@@ -120,6 +120,32 @@ object StringBuiltins:
       case List(Str(a), Str(b)) => Bool(new String(a) < new String(b))
       case _                    => throw new EvalError("string<? requires 2 string arguments")
     },
+    "string>?" -> Builtin {
+      case List(Str(a), Str(b)) => Bool(new String(a) > new String(b))
+      case _                    => throw new EvalError("string>? requires 2 string arguments")
+    },
+    "string<=?" -> Builtin {
+      case List(Str(a), Str(b)) => Bool(new String(a) <= new String(b))
+      case _                    => throw new EvalError("string<=? requires 2 string arguments")
+    },
+    "string>=?" -> Builtin {
+      case List(Str(a), Str(b)) => Bool(new String(a) >= new String(b))
+      case _                    => throw new EvalError("string>=? requires 2 string arguments")
+    },
+    "make-string" -> Builtin {
+      case List(Num(n)) =>
+        Str(Array.fill(n.toInt)(' '))
+      case List(Num(n), SchemeChar(c)) =>
+        Str(Array.fill(n.toInt)(c))
+      case _ => throw new EvalError("make-string requires 1-2 arguments")
+    },
+    "string" -> Builtin { args =>
+      val chars = args.map {
+        case SchemeChar(c) => c
+        case v             => throw new EvalError(s"string: not a character: ${Display.write(v)}")
+      }
+      Str(chars.toArray)
+    },
     "string-ci=?" -> Builtin {
       case List(Str(a), Str(b)) =>
         Bool(new String(a).equalsIgnoreCase(new String(b)))

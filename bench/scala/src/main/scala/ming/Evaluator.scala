@@ -3,28 +3,37 @@ package ming
 /** Scheme interpreter entry point. */
 object Evaluator:
 
-  enum Val:
-    case Num(n: Long)
-    case Bool(b: Boolean)
-    case Str(chars: Array[Char])
-    case Symbol(name: String)
-    case Pair(car: Val, cdr: Val)
-    case Nil
-    case SchemeChar(c: scala.Char)
-    case Void
-    case Rational(num: Long, den: Long)
-    case Inexact(d: Double)
-    case Builtin(f: List[Val] => Val)
-    case MacroTransformer(expand: Val => Val)
-    case Record(tag: String, fields: Array[Val])
-    case Vector(elems: Array[Val])
+  /** Value type hierarchy. */
+  sealed abstract class Val
 
-    case Closure(
+  object Val:
+    case class Num(n: Long)                            extends Val
+    case class Bool(b: Boolean)                        extends Val
+    case class Str(chars: Array[Char])                 extends Val
+    case class Symbol(name: String)                    extends Val
+    case object Nil                                    extends Val
+    case class SchemeChar(c: scala.Char)               extends Val
+    case object Void                                   extends Val
+    case class Rational(num: Long, den: Long)          extends Val
+    case class Inexact(d: Double)                      extends Val
+    case class Builtin(f: List[Val] => Val)            extends Val
+    case class MacroTransformer(expand: Val => Val)    extends Val
+    case class Record(tag: String, fields: Array[Val]) extends Val
+    case class Vector(elems: Array[Val])               extends Val
+
+    case class Closure(
       params: List[String],
       restParam: Option[String],
       body: List[Val],
       closureEnv: Env
-    )
+    ) extends Val
+
+    /** Mutable pair (cons cell). Uses reference equality. */
+    class Pair(var car: Val, var cdr: Val) extends Val
+
+    object Pair:
+      def apply(car: Val, cdr: Val): Pair    = new Pair(car, cdr)
+      def unapply(p: Pair): Some[(Val, Val)] = Some((p.car, p.cdr))
 
   import Val.*
   import TcoForms.TcoResult
@@ -160,18 +169,18 @@ object Evaluator:
         Done(SpecialForms.evalDo(rest, curEnv, eval, error))
       case Pair(Symbol("define-syntax"), Pair(Symbol(name), Pair(sr, Nil))) =>
         Done(Macros.evalDefineSyntax(name, sr, curEnv))
-      case p @ Pair(Symbol(name), _) =>
+      case Pair(Symbol(name), pArgs) =>
         curEnv.lookup(name) match
-          case Some(MacroTransformer(expand)) => Continue(expand(p), curEnv)
+          case Some(MacroTransformer(expand)) => Continue(expand(curExpr), curEnv)
           case _ =>
-            val func           = eval(Symbol(name), curEnv)
-            val Pair(_, pArgs) = p: @unchecked
-            val argList        = toList(pArgs).map(a => eval(a, curEnv))
+            val func    = eval(Symbol(name), curEnv)
+            val argList = toList(pArgs).map(a => eval(a, curEnv))
             TcoForms.applyFuncTco(func, argList, eval, error, applyBuiltinChecked)
       case Pair(head, args) =>
         val func    = eval(head, curEnv)
         val argList = toList(args).map(a => eval(a, curEnv))
         TcoForms.applyFuncTco(func, argList, eval, error, applyBuiltinChecked)
+      case _ => null // safety fallback
 
   private def evalDefine(rest: Val, env: Env): Val =
     rest match

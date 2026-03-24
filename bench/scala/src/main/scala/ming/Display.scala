@@ -18,7 +18,7 @@ object Display:
     case Symbol(name)        => name
     case Nil                 => "()"
     case Void                => "#<void>"
-    case Pair(_, _)          => writeList(v)
+    case _: Pair             => writeList(v)
     case Builtin(_)          => "#<procedure>"
     case Closure(_, _, _, _) => "#<procedure>"
     case MacroTransformer(_) => "#<macro>"
@@ -29,34 +29,66 @@ object Display:
   def show(v: Val): String = v match
     case Str(chars)    => new String(chars)
     case SchemeChar(c) => c.toString
-    case Pair(_, _)    => showList(v)
+    case _: Pair       => showList(v)
     case Vector(elems) => "#(" + elems.map(show).mkString(" ") + ")"
     case _             => write(v)
 
+  /** Write a list/pair with cycle detection. */
   private def writeList(v: Val): String =
-    val sb = new StringBuilder("(")
-    @scala.annotation.tailrec
-    def loop(current: Val, first: Boolean): Unit = current match
-      case Pair(car, cdr) =>
-        if !first then sb.append(" ")
-        sb.append(write(car))
-        loop(cdr, first = false)
-      case Nil => ()
-      case _   => sb.append(" . "); sb.append(write(current))
-    loop(v, first = true)
+    val visited = java.util.Collections.newSetFromMap(
+      new java.util.IdentityHashMap[Pair, java.lang.Boolean]()
+    )
+    val sb      = new StringBuilder("(")
+    var current = v
+    var first   = true
+    var done    = false
+    while !done do
+      current match
+        case p: Pair =>
+          if visited.contains(p) then
+            if !first then sb.append(" ")
+            sb.append("...")
+            done = true
+          else
+            visited.add(p)
+            if !first then sb.append(" ")
+            sb.append(write(p.car))
+            current = p.cdr
+            first = false
+        case Nil => done = true
+        case _ =>
+          sb.append(" . ")
+          sb.append(write(current))
+          done = true
     sb.append(")")
     sb.toString
 
+  /** Show a list/pair with cycle detection. */
   private def showList(v: Val): String =
-    val sb = new StringBuilder("(")
-    @scala.annotation.tailrec
-    def loop(current: Val, first: Boolean): Unit = current match
-      case Pair(car, cdr) =>
-        if !first then sb.append(" ")
-        sb.append(show(car))
-        loop(cdr, first = false)
-      case Nil => ()
-      case _   => sb.append(" . "); sb.append(show(current))
-    loop(v, first = true)
+    val visited = java.util.Collections.newSetFromMap(
+      new java.util.IdentityHashMap[Pair, java.lang.Boolean]()
+    )
+    val sb      = new StringBuilder("(")
+    var current = v
+    var first   = true
+    var done    = false
+    while !done do
+      current match
+        case p: Pair =>
+          if visited.contains(p) then
+            if !first then sb.append(" ")
+            sb.append("...")
+            done = true
+          else
+            visited.add(p)
+            if !first then sb.append(" ")
+            sb.append(show(p.car))
+            current = p.cdr
+            first = false
+        case Nil => done = true
+        case _ =>
+          sb.append(" . ")
+          sb.append(show(current))
+          done = true
     sb.append(")")
     sb.toString

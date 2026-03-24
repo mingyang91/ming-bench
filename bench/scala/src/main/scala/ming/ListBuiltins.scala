@@ -9,12 +9,13 @@ object ListBuiltins:
   val all: List[(String, Val)] = List(
     "length" -> Builtin {
       case List(lst) =>
-        @scala.annotation.tailrec
-        def len(v: Val, n: Long): Long = v match
-          case Nil          => n
-          case Pair(_, cdr) => len(cdr, n + 1)
-          case _            => throw new EvalError("length: not a proper list")
-        Num(len(lst, 0))
+        var n   = 0L
+        var cur = lst
+        while cur != Nil do
+          cur match
+            case p: Pair => n += 1; cur = p.cdr
+            case _       => throw new EvalError("length: not a proper list")
+        Num(n)
       case _ => throw new EvalError("length requires 1 argument")
     },
     "append" -> Builtin { args =>
@@ -26,12 +27,13 @@ object ListBuiltins:
     },
     "reverse" -> Builtin {
       case List(lst) =>
-        @scala.annotation.tailrec
-        def rev(v: Val, acc: Val): Val = v match
-          case Nil            => acc
-          case Pair(car, cdr) => rev(cdr, Pair(car, acc))
-          case _              => throw new EvalError("reverse: not a proper list")
-        rev(lst, Nil)
+        var acc: Val = Nil
+        var cur      = lst
+        while cur != Nil do
+          cur match
+            case p: Pair => acc = Pair(p.car, acc); cur = p.cdr
+            case _       => throw new EvalError("reverse: not a proper list")
+        acc
       case _ => throw new EvalError("reverse requires 1 argument")
     },
     "map" -> Builtin { args =>
@@ -62,43 +64,66 @@ object ListBuiltins:
     },
     "list?" -> Builtin {
       case List(v) =>
-        @scala.annotation.tailrec
-        def isProperList(x: Val): Boolean = x match
-          case Nil          => true
-          case Pair(_, cdr) => isProperList(cdr)
-          case _            => false
-        Bool(isProperList(v))
+        // Floyd's cycle detection (tortoise-and-hare)
+        def isList: Boolean =
+          var slow: Val = v
+          var fast: Val = v
+          while true do
+            // Move fast by 2
+            fast match
+              case f1: Pair =>
+                f1.cdr match
+                  case f2: Pair => fast = f2.cdr
+                  case Nil      => return true
+                  case _        => return false // improper
+              case Nil => return true
+              case _   => return false // not a list
+            // Move slow by 1
+            slow match
+              case s: Pair => slow = s.cdr
+              case _       => return true // shouldn't happen
+            // Check cycle
+            (slow, fast) match
+              case (s: Pair, f: Pair) if s eq f => return false
+              case _                            => ()
+          false // unreachable
+        Bool(isList)
       case _ => throw new EvalError("list? requires 1 argument")
     },
     "list-ref" -> Builtin {
       case List(lst, Num(idx)) =>
-        @scala.annotation.tailrec
-        def ref(v: Val, i: Long): Val = v match
-          case Pair(car, cdr) => if i == 0 then car else ref(cdr, i - 1)
-          case _              => throw new EvalError("list-ref: index out of range")
-        ref(lst, idx)
+        var cur = lst
+        var i   = idx
+        while i > 0 do
+          cur match
+            case p: Pair => cur = p.cdr; i -= 1
+            case _       => throw new EvalError("list-ref: index out of range")
+        cur match
+          case p: Pair => p.car
+          case _       => throw new EvalError("list-ref: index out of range")
       case _ => throw new EvalError("list-ref requires a list and an integer")
     },
     "list-tail" -> Builtin {
       case List(lst, Num(idx)) =>
-        @scala.annotation.tailrec
-        def tail(v: Val, i: Long): Val =
-          if i == 0 then v
-          else
-            v match
-              case Pair(_, cdr) => tail(cdr, i - 1)
-              case _            => throw new EvalError("list-tail: index out of range")
-        tail(lst, idx)
+        var cur = lst
+        var i   = idx
+        while i > 0 do
+          cur match
+            case p: Pair => cur = p.cdr; i -= 1
+            case _       => throw new EvalError("list-tail: index out of range")
+        cur
       case _ => throw new EvalError("list-tail requires a list and an integer")
     },
     "assoc" -> Builtin {
       case List(key, lst) =>
-        @scala.annotation.tailrec
         def search(v: Val): Val = v match
           case Nil => Bool(false)
-          case Pair(entry @ Pair(k, _), rest) =>
-            if Builtins.schemeEqual(k, key) then entry else search(rest)
-          case _ => throw new EvalError("assoc: not a proper association list")
+          case p: Pair =>
+            p.car match
+              case entry @ Pair(k, _) =>
+                if Builtins.schemeEqual(k, key) then entry else search(p.cdr)
+              case _ => throw new EvalError("assoc: not a proper association list")
+          case _ => throw new EvalError("assoc: not a proper list")
         search(lst)
       case _ => throw new EvalError("assoc requires 2 arguments")
     }

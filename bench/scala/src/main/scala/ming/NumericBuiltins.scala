@@ -234,5 +234,51 @@ object NumericBuiltins:
       case List(Num(_) | Rational(_, _)) => Bool(false)
       case List(_)                       => Bool(false)
       case _                             => throw new EvalError("inexact? requires 1 argument")
+    },
+    "gcd" -> Builtin { args =>
+      if args.isEmpty then Num(0)
+      else
+        def g(a: Long, b: Long): Long = if b == 0 then a else g(b, a % b)
+        val nums = args.map {
+          case Num(n) => math.abs(n)
+          case v      => throw new EvalError(s"gcd: not an integer: ${Display.write(v)}")
+        }
+        Num(nums.reduce(g))
+    },
+    "lcm" -> Builtin { args =>
+      if args.isEmpty then Num(1)
+      else
+        def g(a: Long, b: Long): Long = if b == 0 then a else g(b, a % b)
+        def l(a: Long, b: Long): Long = if a == 0 && b == 0 then 0 else math.abs(a / g(a, b) * b)
+        val nums = args.map {
+          case Num(n) => math.abs(n)
+          case v      => throw new EvalError(s"lcm: not an integer: ${Display.write(v)}")
+        }
+        Num(nums.reduce(l))
+    },
+    "truncate" -> Builtin {
+      case List(Num(n))     => Num(n)
+      case List(Inexact(d)) => Num(d.toLong)
+      case _                => throw new EvalError("truncate requires 1 numeric argument")
+    },
+    "round" -> Builtin {
+      case List(Num(n))     => Num(n)
+      case List(Inexact(d)) => Num(math.round(d))
+      case _                => throw new EvalError("round requires 1 numeric argument")
+    },
+    "floor" -> Builtin {
+      case List(Num(n))     => Num(n)
+      case List(Inexact(d)) => Num(math.floor(d).toLong)
+      case _                => throw new EvalError("floor requires 1 numeric argument")
+    },
+    "ceiling" -> Builtin {
+      case List(Num(n))     => Num(n)
+      case List(Inexact(d)) => Num(math.ceil(d).toLong)
+      case _                => throw new EvalError("ceiling requires 1 numeric argument")
+    },
+    "sqrt" -> Builtin {
+      case List(Num(n))     => Inexact(math.sqrt(n.toDouble))
+      case List(Inexact(d)) => Inexact(math.sqrt(d))
+      case _                => throw new EvalError("sqrt requires 1 numeric argument")
     }
   )
