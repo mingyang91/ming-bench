@@ -2,9 +2,11 @@ package ming
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"unicode"
+	"unsafe"
 )
 
 // ---------- Tail Call Optimization ----------
@@ -317,8 +319,14 @@ func (v *Value) String() string {
 }
 
 func pairStr(v *Value) string {
+	seen := make(map[*Value]bool)
 	var parts []string
 	for v.typ == valPair {
+		if seen[v] {
+			parts = append(parts, "...")
+			return strings.Join(parts, " ")
+		}
+		seen[v] = true
 		parts = append(parts, v.car.String())
 		v = v.cdr
 	}
@@ -347,8 +355,14 @@ func (v *Value) displayStr() string {
 }
 
 func pairDisplayStr(v *Value) string {
+	seen := make(map[*Value]bool)
 	var parts []string
 	for v.typ == valPair {
+		if seen[v] {
+			parts = append(parts, "...")
+			return strings.Join(parts, " ")
+		}
+		seen[v] = true
 		parts = append(parts, v.car.displayStr())
 		v = v.cdr
 	}
@@ -356,6 +370,10 @@ func pairDisplayStr(v *Value) string {
 		return strings.Join(parts, " ")
 	}
 	return strings.Join(parts, " ") + " . " + v.displayStr()
+}
+
+func ptrPair(a, b *Value) [2]uintptr {
+	return [2]uintptr{uintptr(unsafe.Pointer(a)), uintptr(unsafe.Pointer(b))}
 }
 
 func isTruthy(v *Value) bool {
@@ -802,6 +820,8 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 			return evalCaseLambda(node, e)
 		case "let":
 			return evalLet(node, e, ip)
+		case "let*":
+			return evalLetStar(node, e, ip)
 		case "begin":
 			return evalBegin(node, e, ip)
 		case "cond":
@@ -1125,6 +1145,42 @@ func evalLet(node *astNode, e *env, ip *interp) (*Value, error) {
 	return voidVal(), nil
 }
 
+func evalLetStar(node *astNode, e *env, ip *interp) (*Value, error) {
+	if len(node.children) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: bad syntax", node.line, node.col)}
+	}
+	bindings := node.children[1]
+	if bindings.isAtom {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: bad syntax", node.line, node.col)}
+	}
+	localEnv := newEnv(e)
+	for _, b := range bindings.children {
+		if b.isAtom || len(b.children) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: bad binding", node.line, node.col)}
+		}
+		name := b.children[0]
+		if !name.isAtom || name.tok.kind != tokSymbol {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: bad binding", node.line, node.col)}
+		}
+		val, err := eval(b.children[1], localEnv, ip)
+		if err != nil {
+			return nil, err
+		}
+		localEnv.set(name.tok.sval, val)
+	}
+	body := node.children[2:]
+	for i, bodyExpr := range body {
+		if i == len(body)-1 {
+			return evalTail(bodyExpr, localEnv)
+		}
+		_, err := eval(bodyExpr, localEnv, ip)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return voidVal(), nil
+}
+
 func evalBegin(node *astNode, e *env, ip *interp) (*Value, error) {
 	if len(node.children) < 2 {
 		return voidVal(), nil
@@ -1144,7 +1200,7 @@ func evalBegin(node *astNode, e *env, ip *interp) (*Value, error) {
 
 func evalCond(node *astNode, e *env, ip *interp) (*Value, error) {
 	for _, clause := range node.children[1:] {
-		if clause.isAtom || len(clause.children) < 2 {
+		if clause.isAtom || len(clause.children) < 1 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cond: bad clause", node.line, node.col)}
 		}
 		test := clause.children[0]
@@ -1167,6 +1223,9 @@ func evalCond(node *astNode, e *env, ip *interp) (*Value, error) {
 		}
 		if isTruthy(cond) {
 			body := clause.children[1:]
+			if len(body) == 0 {
+				return cond, nil // (cond (test)) returns test value
+			}
 			for i, expr := range body {
 				if i == len(body)-1 {
 					return evalTail(expr, e)
@@ -1874,11 +1933,19 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		if len(args) != 1 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list?: need 1 argument", node.line, node.col)}
 		}
-		v := args[0]
-		for v.typ == valPair {
-			v = v.cdr
+		slow, fast := args[0], args[0]
+		for fast.typ == valPair {
+			fast = fast.cdr
+			if fast.typ != valPair {
+				break
+			}
+			fast = fast.cdr
+			slow = slow.cdr
+			if slow == fast {
+				return boolVal(false), nil // cycle detected
+			}
 		}
-		return boolVal(v.typ == valNil), nil
+		return boolVal(fast.typ == valNil), nil
 
 	case "assoc":
 		if len(args) != 2 {
@@ -2131,6 +2198,208 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: denominator: expected rational", node.line, node.col)}
 		}
 
+	case "caar":
+		if len(args) != 1 || args[0].typ != valPair || args[0].car.typ != valPair {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: caar: expected pair", node.line, node.col)}
+		}
+		return args[0].car.car, nil
+	case "cadr":
+		if len(args) != 1 || args[0].typ != valPair || args[0].cdr.typ != valPair {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cadr: expected pair", node.line, node.col)}
+		}
+		return args[0].cdr.car, nil
+	case "cdar":
+		if len(args) != 1 || args[0].typ != valPair || args[0].car.typ != valPair {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cdar: expected pair", node.line, node.col)}
+		}
+		return args[0].car.cdr, nil
+	case "cddr":
+		if len(args) != 1 || args[0].typ != valPair || args[0].cdr.typ != valPair {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cddr: expected pair", node.line, node.col)}
+		}
+		return args[0].cdr.cdr, nil
+	case "caddr":
+		if len(args) != 1 || args[0].typ != valPair || args[0].cdr.typ != valPair || args[0].cdr.cdr.typ != valPair {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: caddr: expected pair", node.line, node.col)}
+		}
+		return args[0].cdr.cdr.car, nil
+
+	case "set-car!":
+		if len(args) != 2 || args[0].typ != valPair {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set-car!: expected pair and value", node.line, node.col)}
+		}
+		args[0].car = args[1]
+		return voidVal(), nil
+
+	case "set-cdr!":
+		if len(args) != 2 || args[0].typ != valPair {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set-cdr!: expected pair and value", node.line, node.col)}
+		}
+		args[0].cdr = args[1]
+		return voidVal(), nil
+
+	case "for-each":
+		return applyForEach(args, node, ip)
+
+	case "reverse":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: reverse: need 1 argument", node.line, node.col)}
+		}
+		result := nilVal()
+		v := args[0]
+		for v.typ == valPair {
+			result = &Value{typ: valPair, car: v.car, cdr: result}
+			v = v.cdr
+		}
+		return result, nil
+
+	case "error":
+		if len(args) < 1 {
+			return nil, &EvalError{Message: "error"}
+		}
+		msg := args[0].displayStr()
+		if len(args) > 1 {
+			parts := make([]string, len(args)-1)
+			for i, a := range args[1:] {
+				parts[i] = a.String()
+			}
+			msg += " " + strings.Join(parts, " ")
+		}
+		return nil, &EvalError{Message: msg}
+
+	case "gcd":
+		if len(args) == 0 {
+			return intVal(0), nil
+		}
+		result := args[0].ival
+		if result < 0 {
+			result = -result
+		}
+		for _, a := range args[1:] {
+			result = gcd64(result, abs64(a.ival))
+		}
+		return intVal(result), nil
+
+	case "lcm":
+		if len(args) == 0 {
+			return intVal(1), nil
+		}
+		result := abs64(args[0].ival)
+		for _, a := range args[1:] {
+			b := abs64(a.ival)
+			if result == 0 || b == 0 {
+				result = 0
+			} else {
+				result = result / gcd64(result, b) * b
+			}
+		}
+		return intVal(result), nil
+
+	case "truncate":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: truncate: need 1 argument", node.line, node.col)}
+		}
+		switch args[0].typ {
+		case valInt:
+			return args[0], nil
+		case valFloat:
+			return intVal(int64(args[0].fval)), nil
+		case valRational:
+			return intVal(args[0].ival / args[0].dval), nil
+		default:
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: truncate: expected number", node.line, node.col)}
+		}
+
+	case "round":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: round: need 1 argument", node.line, node.col)}
+		}
+		switch args[0].typ {
+		case valInt:
+			return args[0], nil
+		case valFloat:
+			return intVal(int64(math.RoundToEven(args[0].fval))), nil
+		case valRational:
+			f := float64(args[0].ival) / float64(args[0].dval)
+			return intVal(int64(math.RoundToEven(f))), nil
+		default:
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: round: expected number", node.line, node.col)}
+		}
+
+	case "make-string":
+		if len(args) < 1 || len(args) > 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: make-string: need 1-2 arguments", node.line, node.col)}
+		}
+		if args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: make-string: expected integer length", node.line, node.col)}
+		}
+		n := int(args[0].ival)
+		ch := rune(0)
+		if len(args) == 2 && args[1].typ == valChar {
+			ch = rune(args[1].ival)
+		}
+		runes := make([]rune, n)
+		for i := range runes {
+			runes[i] = ch
+		}
+		return strVal(string(runes)), nil
+
+	case "string":
+		runes := make([]rune, len(args))
+		for i, a := range args {
+			if a.typ != valChar {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string: expected char", node.line, node.col)}
+			}
+			runes[i] = rune(a.ival)
+		}
+		return strVal(string(runes)), nil
+
+	case "string>?":
+		if len(args) != 2 || args[0].typ != valString || args[1].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string>?: expected strings", node.line, node.col)}
+		}
+		return boolVal(args[0].sval > args[1].sval), nil
+
+	case "string<=?":
+		if len(args) != 2 || args[0].typ != valString || args[1].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string<=?: expected strings", node.line, node.col)}
+		}
+		return boolVal(args[0].sval <= args[1].sval), nil
+
+	case "string>=?":
+		if len(args) != 2 || args[0].typ != valString || args[1].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string>=?: expected strings", node.line, node.col)}
+		}
+		return boolVal(args[0].sval >= args[1].sval), nil
+
+	case "member":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: member: need 2 arguments", node.line, node.col)}
+		}
+		lst := args[1]
+		for lst.typ == valPair {
+			if valEqual(args[0], lst.car) {
+				return lst, nil
+			}
+			lst = lst.cdr
+		}
+		return boolVal(false), nil
+
+	case "assv":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: assv: need 2 arguments", node.line, node.col)}
+		}
+		key := args[0]
+		alist := args[1]
+		for alist.typ == valPair {
+			entry := alist.car
+			if entry.typ == valPair && valEqv(key, entry.car) {
+				return entry, nil
+			}
+			alist = alist.cdr
+		}
+		return boolVal(false), nil
+
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", node.line, node.col, name)}
 	}
@@ -2163,6 +2432,13 @@ func valEq(a, b *Value) bool {
 }
 
 func valEqual(a, b *Value) bool {
+	return valEqualSeen(a, b, make(map[[2]uintptr]bool))
+}
+
+func valEqualSeen(a, b *Value, seen map[[2]uintptr]bool) bool {
+	if a == b {
+		return true
+	}
 	if a.typ != b.typ {
 		return false
 	}
@@ -2184,13 +2460,18 @@ func valEqual(a, b *Value) bool {
 	case valNil:
 		return true
 	case valPair:
-		return valEqual(a.car, b.car) && valEqual(a.cdr, b.cdr)
+		key := ptrPair(a, b)
+		if seen[key] {
+			return true // assume equal for cycles
+		}
+		seen[key] = true
+		return valEqualSeen(a.car, b.car, seen) && valEqualSeen(a.cdr, b.cdr, seen)
 	case valVector:
 		if len(a.recordFields) != len(b.recordFields) {
 			return false
 		}
 		for i := range a.recordFields {
-			if !valEqual(a.recordFields[i], b.recordFields[i]) {
+			if !valEqualSeen(a.recordFields[i], b.recordFields[i], seen) {
 				return false
 			}
 		}
@@ -2235,6 +2516,8 @@ func applyMap(args []*Value, node *astNode, ip *interp) (*Value, error) {
 			v, err = applyLambdaFull(fn, callArgs, node, ip)
 		} else if fn.typ == valSymbol {
 			v, err = applyBuiltin(fn.sval, callArgs, node, ip)
+		} else if fn.typ == valGoFunc {
+			v, err = fn.goFunc(callArgs)
 		} else {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: map: not a procedure", node.line, node.col)}
 		}
@@ -2253,6 +2536,51 @@ func applyMap(args []*Value, node *astNode, ip *interp) (*Value, error) {
 		result = &Value{typ: valPair, car: results[i], cdr: result}
 	}
 	return result, nil
+}
+
+func applyForEach(args []*Value, node *astNode, ip *interp) (*Value, error) {
+	if len(args) < 2 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: for-each: need at least 2 arguments", node.line, node.col)}
+	}
+	fn := args[0]
+	lists := make([]*Value, len(args)-1)
+	copy(lists, args[1:])
+	for {
+		allPair := true
+		for _, l := range lists {
+			if l.typ == valNil {
+				allPair = false
+				break
+			}
+			if l.typ != valPair {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: for-each: not a proper list", node.line, node.col)}
+			}
+		}
+		if !allPair {
+			break
+		}
+		callArgs := make([]*Value, len(lists))
+		for i, l := range lists {
+			callArgs[i] = l.car
+		}
+		var err error
+		if fn.typ == valLambda {
+			_, err = applyLambdaFull(fn, callArgs, node, ip)
+		} else if fn.typ == valSymbol {
+			_, err = applyBuiltin(fn.sval, callArgs, node, ip)
+		} else if fn.typ == valGoFunc {
+			_, err = fn.goFunc(callArgs)
+		} else {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: for-each: not a procedure", node.line, node.col)}
+		}
+		if err != nil {
+			return nil, err
+		}
+		for i, l := range lists {
+			lists[i] = l.cdr
+		}
+	}
+	return voidVal(), nil
 }
 
 func applyApply(args []*Value, node *astNode, ip *interp) (*Value, error) {
@@ -2282,6 +2610,9 @@ func applyApply(args []*Value, node *astNode, ip *interp) (*Value, error) {
 	}
 	if fn.typ == valSymbol {
 		return applyBuiltin(fn.sval, allArgs, node, ip)
+	}
+	if fn.typ == valGoFunc {
+		return fn.goFunc(allArgs)
 	}
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: not a procedure", node.line, node.col)}
 }
@@ -2515,7 +2846,14 @@ func makeGlobalEnv() *env {
 		"numerator", "denominator",
 		"eqv?",
 		"vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
-		"vector->list", "list->vector"}
+		"vector->list", "list->vector",
+		"caar", "cadr", "cdar", "cddr", "caddr",
+		"set-car!", "set-cdr!",
+		"for-each", "reverse", "error",
+		"gcd", "lcm", "truncate", "round",
+		"make-string", "string",
+		"string>?", "string<=?", "string>=?",
+		"member", "assv"}
 	for _, name := range builtins {
 		e.set(name, symVal(name))
 	}
