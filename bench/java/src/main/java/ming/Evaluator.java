@@ -345,6 +345,7 @@ public class Evaluator {
         "string-ci<?", "string-ci>?", "string-ci<=?", "string-ci>=?",
         "complex?", "real?",
         "write-char",
+        "dynamic-wind",
         "call-with-current-continuation", "call/cc",
         "call-with-input-file", "call-with-output-file",
         "input-port?", "output-port?", "current-input-port", "current-output-port",
@@ -2210,6 +2211,22 @@ public class Evaluator {
                 if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError(posStr() + "write-char: not a character");
                 outputBuffer.append(c.value());
                 return VOID;
+            }
+            case "dynamic-wind" -> {
+                requireArgCount(op, args, 3);
+                Object inThunk = args.get(0);
+                Object bodyThunk = args.get(1);
+                Object outThunk = args.get(2);
+                applyProcedure(inThunk, List.of());
+                Object result;
+                try {
+                    result = applyProcedure(bodyThunk, List.of());
+                } catch (ContinuationInvoked ci) {
+                    applyProcedure(outThunk, List.of());
+                    throw ci;
+                }
+                applyProcedure(outThunk, List.of());
+                return result;
             }
             case "call-with-current-continuation", "call/cc" -> {
                 requireArgCount(op, args, 1);
