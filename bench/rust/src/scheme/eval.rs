@@ -31,7 +31,7 @@ fn fmt_pos(pos: Pos) -> String {
 pub fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
     match &expr.kind {
         ValueKind::Integer(_) | ValueKind::Rational(_, _) | ValueKind::Float(_) | ValueKind::Boolean(_) | ValueKind::Str(_) | ValueKind::Char(_) => Ok(expr.clone()),
-        ValueKind::Lambda { .. } | ValueKind::SyntaxRules { .. } | ValueKind::Record { .. } | ValueKind::RecordConstructor { .. } | ValueKind::RecordPredicate { .. } | ValueKind::RecordAccessor { .. } => Ok(expr.clone()),
+        ValueKind::Lambda { .. } | ValueKind::CaseLambda { .. } | ValueKind::SyntaxRules { .. } | ValueKind::Record { .. } | ValueKind::RecordConstructor { .. } | ValueKind::RecordPredicate { .. } | ValueKind::RecordAccessor { .. } => Ok(expr.clone()),
         ValueKind::Symbol(name) => {
             env.get(name).ok_or_else(|| EvalError::UnboundVariable(
                 format!("{} at {}", name, fmt_pos(expr.pos))
@@ -56,6 +56,7 @@ pub fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
                     "string-set!" => return eval_string_set(&elems[1..], expr.pos, env),
                     "define-syntax" => return eval_define_syntax(&elems[1..], expr.pos, env),
                     "define-record-type" => return eval_define_record_type(&elems[1..], expr.pos, env),
+                    "case-lambda" => return eval_case_lambda(&elems[1..], expr.pos, env),
                     _ => {}
                 }
                 // Check if symbol is bound to a macro
@@ -298,6 +299,25 @@ fn eval_lambda(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalErr
     Ok(Value::new(ValueKind::Lambda { params, rest_param, body, env: Rc::clone(env) }, pos))
 }
 
+fn eval_case_lambda(clauses: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalError> {
+    let mut parsed_clauses = Vec::new();
+    for clause in clauses {
+        match &clause.kind {
+            ValueKind::List(elems) if elems.len() >= 2 => {
+                let (params, rest_param) = match &elems[0].kind {
+                    ValueKind::List(param_elems) => parse_params(param_elems)?,
+                    ValueKind::Symbol(s) => (vec![], Some(s.clone())),
+                    _ => return Err(EvalError::Syntax(format!("case-lambda: expected parameter list at {}", fmt_pos(elems[0].pos)))),
+                };
+                let body = elems[1..].to_vec();
+                parsed_clauses.push((params, rest_param, body, Rc::clone(env)));
+            }
+            _ => return Err(EvalError::Syntax(format!("case-lambda: bad clause at {}", fmt_pos(clause.pos)))),
+        }
+    }
+    Ok(Value::new(ValueKind::CaseLambda { clauses: parsed_clauses }, pos))
+}
+
 fn eval_and(exprs: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
     if exprs.is_empty() {
         return Ok(Value::unpos(ValueKind::Boolean(true)));
@@ -488,6 +508,33 @@ fn apply(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, EvalError
                 }
                 Ok(result)
             }
+        }
+        ValueKind::CaseLambda { clauses } => {
+            for (params, rest_param, body, closure_env) in clauses {
+                let matches = if rest_param.is_some() {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    let local_env = Env::new(Some(Rc::clone(closure_env)));
+                    for (param, arg) in params.iter().zip(args.iter()) {
+                        local_env.set(param.clone(), arg.clone());
+                    }
+                    if let Some(ref rest) = rest_param {
+                        let rest_args = args[params.len()..].to_vec();
+                        local_env.set(rest.clone(), Value::unpos(ValueKind::List(rest_args)));
+                    }
+                    let mut result = Value::unpos(ValueKind::Void);
+                    for expr in body {
+                        result = eval(expr, &local_env)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            Err(EvalError::Arity(format!(
+                "case-lambda: no matching clause for {} arguments at {}", args.len(), fmt_pos(call_pos)
+            )))
         }
         ValueKind::RecordConstructor { type_id, type_name, field_names } => {
             if args.len() != field_names.len() {
@@ -796,6 +843,13 @@ fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, Eva
         "symbol?" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("symbol? requires 1 argument at {}", fmt_pos(call_pos)))); }
             Ok(Value::unpos(ValueKind::Boolean(matches!(&args[0].kind, ValueKind::Symbol(_)))))
+        }
+        "procedure?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("procedure? requires 1 argument at {}", fmt_pos(call_pos)))); }
+            Ok(Value::unpos(ValueKind::Boolean(matches!(&args[0].kind,
+                ValueKind::Lambda { .. } | ValueKind::CaseLambda { .. } |
+                ValueKind::RecordConstructor { .. } | ValueKind::RecordPredicate { .. } | ValueKind::RecordAccessor { .. }
+            ))))
         }
         "display" => {
             if args.len() != 1 {

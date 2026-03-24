@@ -65,6 +65,7 @@ impl Env {
                       "integer?", "char->integer", "integer->char",
                       "make-string", "for-each", "reverse",
                       // L11
+                      "procedure?",
                       "exact?", "inexact?", "rational?",
                       "exact->inexact", "inexact->exact",
                       "numerator", "denominator"] {

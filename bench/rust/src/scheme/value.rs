@@ -50,6 +50,9 @@ pub enum ValueKind {
         type_name: String,
         field_name: String,
     },
+    CaseLambda {
+        clauses: Vec<(Vec<String>, Option<String>, Vec<Value>, Rc<Env>)>,
+    },
     Void,
 }
 
@@ -124,7 +127,7 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_display()).collect();
                 format!("({})", inner.join(" "))
             }
-            ValueKind::Lambda { .. } => "#<procedure>".to_string(),
+            ValueKind::Lambda { .. } | ValueKind::CaseLambda { .. } => "#<procedure>".to_string(),
             ValueKind::SyntaxRules { .. } => "#<syntax>".to_string(),
             ValueKind::Record { type_name, .. } => format!("#<{}>", type_name),
             ValueKind::RecordConstructor { .. } | ValueKind::RecordPredicate { .. } | ValueKind::RecordAccessor { .. } => "#<procedure>".to_string(),
