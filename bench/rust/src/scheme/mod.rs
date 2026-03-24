@@ -408,6 +408,19 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         }
                         return Ok(result);
                     }
+                    "set!" => {
+                        if items.len() != 3 {
+                            return Err(EvalError::Arity("set! requires 2 arguments".into(), span));
+                        }
+                        let Value::Symbol(name) = &items[1].val else {
+                            return Err(EvalError::Type("set!: first argument must be a symbol".into(), span));
+                        };
+                        let val = eval(&items[2], env, out)?;
+                        if !env_update(env, name, val) {
+                            return Err(EvalError::UnboundVariable(name.clone(), span));
+                        }
+                        return Ok(Value::Void);
+                    }
                     "cond" => return eval_cond(&items[1..], env, out, span),
                     "and" => return eval_and(&items[1..], env, out),
                     "or" => return eval_or(&items[1..], env, out),
