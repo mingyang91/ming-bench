@@ -8,7 +8,7 @@ type SchemeVal =
   | { tag: 'number'; value: number; exact?: boolean; pos?: Pos }
   | { tag: 'rational'; num: number; den: number; pos?: Pos }
   | { tag: 'boolean'; value: boolean; pos?: Pos }
-  | { tag: 'string'; value: string; pos?: Pos }
+  | { tag: 'string'; value: string; mutable?: boolean; pos?: Pos }
   | { tag: 'symbol'; value: string; pos?: Pos }
   | { tag: 'char'; value: string; pos?: Pos }
   | { tag: 'list'; elements: SchemeVal[]; dotted?: boolean; pos?: Pos }
@@ -572,7 +572,36 @@ function makeGlobalEnv(outputBuf: string[]): Env {
   defBuiltin('string-copy', (args, p) => {
     if (args.length !== 1) throw new EvalError(`${fmtPos(p)}string-copy: expected 1 arg`);
     if (args[0].tag !== 'string') throw new EvalError(`${fmtPos(p)}string-copy: expected string`);
-    return { tag: 'string', value: args[0].value };
+    return { tag: 'string', value: args[0].value, mutable: true };
+  });
+
+  defBuiltin('string->list', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}string->list: expected 1 arg`);
+    if (args[0].tag !== 'string') throw new EvalError(`${fmtPos(p)}string->list: expected string`);
+    const chars = [...args[0].value].map(c => ({ tag: 'char' as const, value: c }));
+    return { tag: 'list', elements: chars };
+  });
+
+  defBuiltin('list->string', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}list->string: expected 1 arg`);
+    if (args[0].tag !== 'list') throw new EvalError(`${fmtPos(p)}list->string: expected list`);
+    const str = args[0].elements.map(e => {
+      if (e.tag !== 'char') throw new EvalError(`${fmtPos(p)}list->string: expected list of chars`);
+      return e.value;
+    }).join('');
+    return { tag: 'string', value: str, mutable: true };
+  });
+
+  defBuiltin('char->integer', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}char->integer: expected 1 arg`);
+    if (args[0].tag !== 'char') throw new EvalError(`${fmtPos(p)}char->integer: expected char`);
+    return { tag: 'number', value: args[0].value.codePointAt(0)! };
+  });
+
+  defBuiltin('integer->char', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}integer->char: expected 1 arg`);
+    if (args[0].tag !== 'number') throw new EvalError(`${fmtPos(p)}integer->char: expected number`);
+    return { tag: 'char', value: String.fromCodePoint(args[0].value) };
   });
 
   defBuiltin('char?', (args, p) => {
@@ -1369,9 +1398,10 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
 
         if (name === 'string-set!') {
           if (elems.length !== 4) throw new EvalError(`${fmtPos(expr.pos)}string-set!: expected 3 args`);
-          if (elems[1].tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}string-set!: first arg must be a variable`);
+          if (elems[1].tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}string-set!: strings are immutable`);
           const strVal = envLookup(env, elems[1].value);
           if (!strVal || strVal.tag !== 'string') throw new EvalError(`${fmtPos(expr.pos)}string-set!: expected string variable`);
+          if (!strVal.mutable) throw new EvalError(`${fmtPos(expr.pos)}string-set!: strings are immutable`);
           const idx = evalScheme(elems[2], env);
           if (idx.tag !== 'number') throw new EvalError(`${fmtPos(expr.pos)}string-set!: expected number index`);
           const ch = evalScheme(elems[3], env);
@@ -1379,7 +1409,7 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
           const s = strVal.value;
           const i = idx.value;
           if (i < 0 || i >= s.length) throw new EvalError(`${fmtPos(expr.pos)}string-set!: index out of range`);
-          envSet(env, elems[1].value, { tag: 'string', value: s.slice(0, i) + ch.value + s.slice(i + 1) });
+          strVal.value = s.slice(0, i) + ch.value + s.slice(i + 1);
           return { tag: 'void' };
         }
 
