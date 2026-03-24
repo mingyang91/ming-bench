@@ -298,6 +298,16 @@ public class Evaluator {
     // Stack of outer body contexts saved when let handler overwrites contBody
     private final List<ContFrame> contBodySaveStack = new ArrayList<>();
 
+    // Step-limited evaluation
+    private long stepCount;
+    private long stepLimit; // 0 = unlimited
+
+    private void checkStepLimit() throws EvalError {
+        if (stepLimit > 0 && ++stepCount > stepLimit) {
+            throw new EvalError("step limit exceeded");
+        }
+    }
+
     private int replayTargetSerial() { return replayTargetCallccSerial; }
 
     public String evalStr(String input) throws EvalError {
@@ -337,6 +347,17 @@ public class Evaluator {
             throw new EvalError("no expression");
         }
         return schemeToString(lastResult);
+    }
+
+    public String evalStrWithLimit(String input, long maxSteps) throws EvalError {
+        stepLimit = maxSteps;
+        stepCount = 0;
+        try {
+            return evalStr(input);
+        } finally {
+            stepLimit = 0;
+            stepCount = 0;
+        }
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
@@ -714,6 +735,7 @@ public class Evaluator {
     @SuppressWarnings("unchecked")
     private Object eval(Object expr, Env env) throws EvalError {
         tco: while (true) { // TCO trampoline
+        checkStepLimit();
         if (expr instanceof Located loc) {
             currentPos = loc.pos();
             expr = loc.value();

@@ -35,6 +35,12 @@ public class TestRunner {
             }
         }
 
+        // Surprise levels with standalone test runners
+        if (benchLevel == 27) {
+            L27Tests.main(new String[0]);
+            return;
+        }
+
         String testsJsonPath = System.getenv("TESTS_JSON");
         if (testsJsonPath == null || testsJsonPath.isEmpty()) {
             testsJsonPath = "../tests.json";
