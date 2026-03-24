@@ -32,7 +32,7 @@ private[ming] object Macros:
   private def error(msg: String): Nothing =
     throw new EvalError(msg)
 
-  def evalDefineSyntax(name: String, syntaxRules: Val, env: Evaluator.Env): Val =
+  def evalDefineSyntax(name: String, syntaxRules: Val, env: Env): Val =
     syntaxRules match
       case Pair(Symbol("syntax-rules"), Pair(literalsList, rulesList)) =>
         val literals = Evaluator.toList(literalsList).map {
@@ -53,7 +53,7 @@ private[ming] object Macros:
     form: Val,
     literals: List[String],
     rules: List[(Val, Val)],
-    defEnv: Evaluator.Env
+    defEnv: Env
   ): Val =
     def tryRules(remaining: List[(Val, Val)]): Val = remaining match
       case scala.Nil => error(s"no matching syntax-rules pattern for ${Display.write(form)}")
@@ -171,7 +171,7 @@ private[ming] object Macros:
     template: Val,
     bindings: Map[String, Either[Val, List[Val]]],
     patVars: Set[String],
-    defEnv: Evaluator.Env
+    defEnv: Env
   ): Val =
     val allSyms  = collectAllSymbols(template)
     val freeSyms = allSyms -- patVars -- specialFormNames - "..."
@@ -190,7 +190,7 @@ private[ming] object Macros:
   private def expandInner(
     template: Val,
     bindings: Map[String, Either[Val, List[Val]]],
-    defEnv: Evaluator.Env,
+    defEnv: Env,
     renameMap: Map[String, String],
     patVars: Set[String]
   ): Val =
@@ -216,7 +216,7 @@ private[ming] object Macros:
   private def expandElements(
     elems: List[Val],
     bindings: Map[String, Either[Val, List[Val]]],
-    defEnv: Evaluator.Env,
+    defEnv: Env,
     renameMap: Map[String, String],
     patVars: Set[String]
   ): List[Val] =

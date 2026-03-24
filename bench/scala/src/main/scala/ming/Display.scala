@@ -9,6 +9,8 @@ object Display:
   /** Write-style display (with quotes on strings). */
   def write(v: Val): String = v match
     case Num(n)              => n.toString
+    case Rational(n, d)      => s"$n/$d"
+    case Inexact(d)          => d.toString
     case Bool(true)          => "#t"
     case Bool(false)         => "#f"
     case Str(chars)          => "\"" + new String(chars) + "\""

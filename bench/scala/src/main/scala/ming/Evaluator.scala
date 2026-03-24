@@ -13,12 +13,28 @@ object Evaluator:
     case Nil
     case SchemeChar(c: scala.Char)
     case Void
+    case Rational(num: Long, den: Long) // exact rational, always simplified, den > 1
+    case Inexact(d: Double)             // inexact number
     case Builtin(f: List[Val] => Val)
     case MacroTransformer(expand: Val => Val)
 
   import Val.*
 
   private[ming] def mkStr(s: String): Val = Str(s.toCharArray)
+
+  /** Create a rational, simplifying and converting to Num if denominator is 1. */
+  private[ming] def mkRational(num: Long, den: Long): Val =
+    if den == 0 then throw new EvalError("division by zero")
+    val sign = if den < 0 then -1 else 1
+    val n    = num * sign
+    val d    = den * sign
+    val g    = gcd(math.abs(n), d)
+    val sn   = n / g
+    val sd   = d / g
+    if sd == 1 then Num(sn) else Rational(sn, sd)
+
+  private def gcd(a: Long, b: Long): Long =
+    if b == 0 then a else gcd(b, a % b)
 
   private[ming] def strValue(v: Val): String = v match
     case Str(chars) => new String(chars)
@@ -36,8 +52,9 @@ object Evaluator:
   // --- Evaluator ---
   private def eval(expr: Val, env: Env): Val =
     expr match
-      case Num(_) | Bool(_) | Str(_) | SchemeChar(_) | Builtin(_) | MacroTransformer(_) => expr
-      case Nil                                                                          => Nil
+      case Num(_) | Bool(_) | Str(_) | SchemeChar(_) | Builtin(_) | MacroTransformer(_) | Rational(_, _) | Inexact(_) =>
+        expr
+      case Nil => Nil
       case Symbol(name) =>
         env.lookup(name) match
           case Some(v) => v
@@ -123,7 +140,7 @@ object Evaluator:
               error(s"lambda: expected at least ${paramNames.length} arguments, got ${args.length}")
           else if args.length != paramNames.length then
             error(s"lambda: expected ${paramNames.length} arguments, got ${args.length}")
-          val childEnv = new Env(scala.collection.mutable.Map[String, Val](), Some(env))
+          val childEnv = Env.empty(Some(env))
           paramNames.zip(args).foreach((p, a) => childEnv.define(p, a))
           restParam.foreach { rp =>
             val restArgs = args.drop(paramNames.length)
@@ -202,11 +219,11 @@ object Evaluator:
         }
         val bodyList = toList(body)
         if bodyList.isEmpty then error("let: empty body")
-        val childEnv = new Env(scala.collection.mutable.Map[String, Val](), Some(env))
+        val childEnv = Env.empty(Some(env))
         val loopFunc = Builtin { args =>
           if args.length != paramNames.length then
             error(s"named let $name: expected ${paramNames.length} arguments, got ${args.length}")
-          val loopEnv = new Env(scala.collection.mutable.Map[String, Val](), Some(childEnv))
+          val loopEnv = Env.empty(Some(childEnv))
           paramNames.zip(args).foreach((p, a) => loopEnv.define(p, a))
           var result: Val = Void
           for expr <- bodyList do result = eval(expr, loopEnv)
@@ -214,14 +231,14 @@ object Evaluator:
         }
         childEnv.define(name, loopFunc)
         // Initial call
-        val loopEnv = new Env(scala.collection.mutable.Map[String, Val](), Some(childEnv))
+        val loopEnv = Env.empty(Some(childEnv))
         paramNames.zip(initVals).foreach((p, a) => loopEnv.define(p, a))
         var result: Val = Void
         for expr <- bodyList do result = eval(expr, loopEnv)
         result
       // Regular let: (let ((var init) ...) body ...)
       case Pair(bindings, body) =>
-        val childEnv = new Env(scala.collection.mutable.Map[String, Val](), Some(env))
+        val childEnv = Env.empty(Some(env))
         for binding <- toList(bindings) do
           binding match
             case Pair(Symbol(name), Pair(valueExpr, Nil)) =>
@@ -248,22 +265,10 @@ object Evaluator:
           else throw e
     case _ => error(s"not a procedure: ${Display.write(func)}")
 
-  // --- Environment ---
-  private[ming] class Env(bindings: scala.collection.mutable.Map[String, Val], parent: Option[Env]):
-
-    def lookup(name: String): Option[Val] =
-      bindings.get(name).orElse(parent.flatMap(_.lookup(name)))
-    def define(name: String, value: Val): Unit = bindings(name) = value
-
-    def set(name: String, value: Val): Boolean =
-      if bindings.contains(name) then
-        bindings(name) = value; true
-      else parent.exists(_.set(name, value))
-
   private def defaultEnv(): Env =
-    val m = scala.collection.mutable.Map[String, Val]()
-    Builtins.all.foreach((name, v) => m(name) = v)
-    new Env(m, None)
+    val env = Env.empty()
+    Builtins.all.foreach((name, v) => env.define(name, v))
+    env
 
   // --- Public API ---
   def evalStr(input: String): String =

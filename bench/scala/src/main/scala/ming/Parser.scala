@@ -128,4 +128,18 @@ private[ming] class Parser(input: String):
     if token.isEmpty then throw new EvalError(s"unexpected character: ${input(pos)}")
     token.toLongOption match
       case Some(n) => Num(n)
-      case None    => Symbol(token)
+      case None    =>
+        // Try rational literal: num/den
+        val slashIdx = token.indexOf('/')
+        if slashIdx > 0 && slashIdx < token.length - 1 then
+          val numPart = token.substring(0, slashIdx)
+          val denPart = token.substring(slashIdx + 1)
+          (numPart.toLongOption, denPart.toLongOption) match
+            case (Some(n), Some(d)) =>
+              if d == 0 then throw new EvalError("division by zero in rational literal")
+              Evaluator.mkRational(n, d)
+            case _ => Symbol(token)
+        else
+          token.toDoubleOption match
+            case Some(d) => Inexact(d)
+            case None    => Symbol(token)
