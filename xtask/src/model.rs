@@ -451,19 +451,25 @@ pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
         return t;
     }
     match level_num {
-        1..=3 => 45,
-        4..=6 => 30,   // error quality, strings, mutable strings
-        7..=9 => 60,   // TCO, set!, variadic (architecturally hard)
-        10..=12 => 90, // call/cc, macros, integration
-        13..=14 => 45, // builtins, string immutability (req change)
-        15 => 60,      // equality, letrec, case, vectors
-        16..=18 => 60, // dynamic-wind, guard, values
-        19..=20 => 75, // exact arith, records
-        21..=23 => 90, // pair mutation, syntax-case, final integration
-        24..=25 => 60, // tech-debt: case-lambda, procedure?
-        26 => 90,      // real-world integration stress
-        27 => 90,      // concurrent evaluation (thread safety)
-        28 => 90,      // performance & memory stress
+        1..=6 => 30,    // foundation: atoms, lambda, lists, errors, strings
+        7..=8 => 45,    // set!, variadic/apply
+        9 => 45,        // numeric/char utils (many builtins)
+        10 => 60,       // macros (syntax-rules)
+        11..=13 => 45,  // rationals, records, case-lambda (additive)
+        14 => 60,       // vectors, letrec, do, equal?
+        15 => 45,       // string immutability (breaking change)
+        16 => 90,       // TCO — retrofit into large codebase ★
+        17 => 90,       // pair mutation — Rc<RefCell> rewrite ★
+        18 => 120,      // call/cc — CEK machine transformation ★
+        19..=21 => 75,  // dynamic-wind, guard, values (need call/cc)
+        22 => 90,       // syntax-case
+        23 => 60,       // procedure? on all callable types
+        24 => 90,       // integration (call/cc + macros + mutation + TCO)
+        25 => 90,       // final integration (all features)
+        26 => 90,       // real-world integration stress
+        27 => 90,       // step-limited evaluation (hidden)
+        28 => 90,       // concurrent evaluation (hidden)
+        29 => 90,       // performance & memory stress (hidden)
         _ => 75,
     }
 }
@@ -474,31 +480,41 @@ pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
 /// dead-loop runaway from burning the bill. Set generously so legitimate
 /// work never hits them. Only infinite loops or stuck agents should trigger.
 ///
-///   L01-L06 (foundation, errors, strings)         → 100K
-///   L07-L09 (TCO, set!, variadic)                 → 100K
-///   L10-L12 (call/cc, macros, integration)        → 500K
-///   L13-L14 (builtins, string immutability)       → 100K
-///   L15     (equality, letrec, case, vectors, do) → 200K
-///   L16-L18 (dynamic-wind, guard, values)         → 200K
-///   L19-L20 (exact arith, records)                → 200K
-///   L21-L23 (pair mutation, syntax-case, final)   → 500K
-///   L24-L25 (tech-debt)                           → 100K
-///   L26     (real-world integration stress)        → 500K
+///   L01-L06 (foundation, errors, strings)           → 100K
+///   L07-L08 (set!, variadic/apply)                  → 100K
+///   L09     (numeric/char utils — many builtins)    → 100K
+///   L10     (macros / syntax-rules)                 → 200K
+///   L11-L13 (rationals, records, case-lambda)       → 100K
+///   L14     (vectors, letrec, do, equal?)           → 200K
+///   L15     (string immutability — breaking change) → 100K
+///   L16     (TCO — late retrofit) ★                 → 200K
+///   L17     (pair mutation — Rc<RefCell>) ★          → 500K
+///   L18     (call/cc — CEK machine) ★               → 500K
+///   L19-L21 (dynamic-wind, guard, values)           → 200K
+///   L22     (syntax-case)                           → 500K
+///   L23     (procedure?)                            → 100K
+///   L24     (integration)                           → 500K
+///   L25     (final integration)                     → 500K
+///   L26     (real-world integration stress)         → 500K
 pub fn output_tokens_for_level(level_num: u32, max_tokens: Option<u64>) -> u64 {
     if let Some(t) = max_tokens {
         return t;
     }
     match level_num {
         1..=6 => 100_000,
-        7..=9 => 100_000,
-        10..=12 => 500_000,
-        13..=14 => 100_000,
-        15 => 200_000,
-        16..=18 => 200_000,
-        19..=20 => 200_000,
-        21..=23 => 500_000,
-        24..=25 => 100_000,
-        26 => 500_000,
+        7..=8 => 100_000,
+        9 => 100_000,
+        10 => 200_000,
+        11..=13 => 100_000,
+        14 => 200_000,
+        15 => 100_000,
+        16 => 200_000,      // TCO retrofit ★
+        17 => 500_000,      // pair mutation ★
+        18 => 500_000,      // call/cc CEK ★
+        19..=21 => 200_000, // dynamic-wind, guard, values
+        22 => 500_000,      // syntax-case
+        23 => 100_000,      // procedure?
+        24..=26 => 500_000, // integration + stress
         _ => 200_000,
     }
 }

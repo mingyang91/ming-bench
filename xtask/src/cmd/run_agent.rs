@@ -667,6 +667,7 @@ fn run_levels_mode(
 const SURPRISE_LEVELS: &[(&str, &str)] = &[
     ("27", "Step-Limited Evaluation"),
     ("28", "Concurrent Evaluation & Performance Stress"),
+    // NOTE: If adding L29+, update inject_surprise_level() and hidden/ files.
 ];
 
 /// Inject hidden test files into the agent's worktree and run surprise levels.

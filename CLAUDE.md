@@ -104,17 +104,23 @@ Output token safety caps (by level tier):
 | Levels | Tier | Safety Cap |
 |--------|------|-----------|
 | L01-L06 | Foundation/Error/Strings | 100K |
-| L07-L09 | TCO/set!/Variadic | 100K |
-| L10-L12 | call/cc/Macros/Integration | 500K |
-| L13-L14 | Builtins/String Immutability | 100K |
-| L15 | Equality/Letrec/Case/Vectors/Do | 200K |
-| L16-L18 | dynamic-wind/guard/values | 200K |
-| L19-L20 | Rationals/Records | 200K |
-| L21-L23 | Pair Mutation/syntax-case/Final Integration | 500K |
-| L24-L25 | Tech-debt: case-lambda/procedure? | 100K |
-| L26     | Real-world integration stress | 500K |
-| L27     | Step-limited eval (surprise) | 500K |
-| L28     | Concurrency + perf stress (surprise) | 500K |
+| L07-L08 | set!/Variadic | 100K |
+| L09 | Numeric/Char Utils | 100K |
+| L10 | Macros (syntax-rules) | 200K |
+| L11-L13 | Rationals/Records/case-lambda | 100K |
+| L14 | Vectors/letrec/do/equal? | 200K |
+| L15 | String Immutability (breaking) | 100K |
+| L16 | TCO (late retrofit) ★ | 200K |
+| L17 | Pair Mutation (Rc\<RefCell\>) ★ | 500K |
+| L18 | call/cc (CEK rewrite) ★ | 500K |
+| L19-L21 | dynamic-wind/guard/values | 200K |
+| L22 | syntax-case | 500K |
+| L23 | procedure? | 100K |
+| L24-L26 | Integration/Final/Real-world stress | 500K |
+| L27 | Step-limited eval (surprise) | 500K |
+| L28 | Concurrency + perf stress (surprise) | 500K |
+
+**Difficulty wall at L16-L18:** These three levels force architectural rewrites against a large (~2500 line) codebase: L16 retrofits TCO into 15+ special forms, L17 converts pairs to shared-mutable (`Rc<RefCell<...>>`), L18 transforms the tree-walker into a CEK machine. Earlier levels are additive; these are disruptive. This ordering creates differentiation — agents that build clean, modular code in L01-L15 survive the wall; agents with accumulated tech debt stall.
 
 **Surprise levels (L27-L28):** Hidden from agents until L26 passes. Content lives in `bench/hidden/`. The orchestrator injects test files, fixtures, and SPEC text into the agent's worktree after L26, then launches new agent sessions. Agents see only L01-L26 in SPEC.md and tests.json — no hint of concurrency or step limiting. This tests accumulated tech debt: L27 punishes recursive eval (must add step counter), L28 punishes shared mutable state (must be thread-safe).
 
