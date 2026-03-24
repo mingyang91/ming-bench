@@ -128,6 +128,18 @@ function tokenize(input: string): Token[] {
       continue;
     }
     if (ch === "'") { tokens.push({ text: "'", pos: { line, col } }); advance(); continue; }
+    if (ch === '`') { tokens.push({ text: '`', pos: { line, col } }); advance(); continue; }
+    if (ch === ',') {
+      const startPos = { line, col };
+      advance();
+      if (i < input.length && input[i] === '@') {
+        advance();
+        tokens.push({ text: ',@', pos: startPos });
+      } else {
+        tokens.push({ text: ',', pos: startPos });
+      }
+      continue;
+    }
     if (ch === '#' && i + 1 < input.length && input[i + 1] === "'") {
       tokens.push({ text: "#'", pos: { line, col } }); advance(); advance(); continue;
     }
@@ -162,12 +174,46 @@ function parse(tokens: Token[], idx: number): [SchemeVal, number] {
   if (token.text === '(') {
     const elements: SchemeVal[] = [];
     idx++;
+    let dotted = false;
+    let dotCdr: SchemeVal | undefined;
     while (idx < tokens.length && tokens[idx].text !== ')') {
+      if (tokens[idx].text === '.' && !dotted) {
+        // Check if this is dot notation (not symbol "...")
+        // It's a dot if next token is not ')' and the token after that is ')'
+        // or more precisely: exactly one expr follows before ')'
+        const savedIdx = idx;
+        idx++; // skip '.'
+        if (idx < tokens.length && tokens[idx].text !== ')') {
+          const [val, next] = parse(tokens, idx);
+          if (next < tokens.length && tokens[next].text === ')') {
+            dotted = true;
+            dotCdr = val;
+            idx = next;
+            continue;
+          }
+          // Not actually a dot pair — treat '.' as symbol
+          elements.push({ tag: 'symbol', value: '.', pos: tokens[savedIdx].pos });
+          elements.push(val);
+          idx = next;
+          continue;
+        }
+        // '.' right before ')' — treat as symbol
+        elements.push({ tag: 'symbol', value: '.', pos: tokens[savedIdx].pos });
+        continue;
+      }
       const [val, next] = parse(tokens, idx);
       elements.push(val);
       idx = next;
     }
     if (idx >= tokens.length) throw new EvalError('missing closing paren');
+    if (dotted && dotCdr !== undefined) {
+      // Build a proper chain of pairs for dotted list
+      let result: SchemeVal = dotCdr;
+      for (let i = elements.length - 1; i >= 0; i--) {
+        result = { tag: 'pair', car: elements[i], cdr: result };
+      }
+      return [result, idx + 1];
+    }
     return [{ tag: 'list', elements, pos: p }, idx + 1];
   }
 
@@ -181,6 +227,21 @@ function parse(tokens: Token[], idx: number): [SchemeVal, number] {
   if (token.text === "#'") {
     const [val, next] = parse(tokens, idx + 1);
     return [{ tag: 'list', elements: [{ tag: 'symbol', value: 'syntax', pos: p }, val], pos: p }, next];
+  }
+
+  if (token.text === '`') {
+    const [val, next] = parse(tokens, idx + 1);
+    return [{ tag: 'list', elements: [{ tag: 'symbol', value: 'quasiquote', pos: p }, val], pos: p }, next];
+  }
+
+  if (token.text === ',') {
+    const [val, next] = parse(tokens, idx + 1);
+    return [{ tag: 'list', elements: [{ tag: 'symbol', value: 'unquote', pos: p }, val], pos: p }, next];
+  }
+
+  if (token.text === ',@') {
+    const [val, next] = parse(tokens, idx + 1);
+    return [{ tag: 'list', elements: [{ tag: 'symbol', value: 'unquote-splicing', pos: p }, val], pos: p }, next];
   }
 
   if (token.text === '#t') return [{ tag: 'boolean', value: true, pos: p }, idx + 1];
@@ -337,6 +398,33 @@ function displayString(val: SchemeVal, seen?: Set<SchemeVal>): string {
 
 function fmtPos(p?: Pos): string {
   return p ? `${p.line}:${p.col}: ` : '';
+}
+
+function parseParamsFromVal(val: SchemeVal, pos?: Pos): { params: string[]; restParam?: string } {
+  // Handle pair chains (from dotted list parsing): (a b . rest) → pair chain
+  if (val.tag === 'pair') {
+    const params: string[] = [];
+    let cur: SchemeVal = val;
+    while (cur.tag === 'pair') {
+      if (cur.car.tag !== 'symbol') throw new EvalError(`${fmtPos(pos)}parameter must be a symbol`);
+      params.push(cur.car.value);
+      cur = cur.cdr;
+    }
+    if (cur.tag === 'symbol') {
+      return { params, restParam: cur.value };
+    }
+    if (isNullVal(cur)) {
+      return { params };
+    }
+    throw new EvalError(`${fmtPos(pos)}invalid parameter list`);
+  }
+  if (val.tag === 'list') {
+    return parseParams(val.elements, pos);
+  }
+  if (val.tag === 'symbol') {
+    return { params: [], restParam: val.value };
+  }
+  throw new EvalError(`${fmtPos(pos)}invalid parameter list`);
 }
 
 function parseParams(elements: SchemeVal[], pos?: Pos): { params: string[]; restParam?: string } {
@@ -555,33 +643,48 @@ function makeGlobalEnv(outputBuf: string[]): Env {
   });
 
   defBuiltin('<', (args, p) => {
-    if (args.length !== 2) throw new EvalError(`${fmtPos(p)}<: expected 2 args`);
+    if (args.length < 2) throw new EvalError(`${fmtPos(p)}<: expected at least 2 args`);
     expectNumeric(args, '<', p);
-    return { tag: 'boolean', value: toFloat(args[0], '<', p) < toFloat(args[1], '<', p) };
+    for (let i = 0; i < args.length - 1; i++) {
+      if (!(toFloat(args[i], '<', p) < toFloat(args[i + 1], '<', p))) return { tag: 'boolean', value: false };
+    }
+    return { tag: 'boolean', value: true };
   });
 
   defBuiltin('>', (args, p) => {
-    if (args.length !== 2) throw new EvalError(`${fmtPos(p)}>: expected 2 args`);
+    if (args.length < 2) throw new EvalError(`${fmtPos(p)}>: expected at least 2 args`);
     expectNumeric(args, '>', p);
-    return { tag: 'boolean', value: toFloat(args[0], '>', p) > toFloat(args[1], '>', p) };
+    for (let i = 0; i < args.length - 1; i++) {
+      if (!(toFloat(args[i], '>', p) > toFloat(args[i + 1], '>', p))) return { tag: 'boolean', value: false };
+    }
+    return { tag: 'boolean', value: true };
   });
 
   defBuiltin('=', (args, p) => {
-    if (args.length !== 2) throw new EvalError(`${fmtPos(p)}=: expected 2 args`);
+    if (args.length < 2) throw new EvalError(`${fmtPos(p)}=: expected at least 2 args`);
     expectNumeric(args, '=', p);
-    return { tag: 'boolean', value: toFloat(args[0], '=', p) === toFloat(args[1], '=', p) };
+    for (let i = 0; i < args.length - 1; i++) {
+      if (toFloat(args[i], '=', p) !== toFloat(args[i + 1], '=', p)) return { tag: 'boolean', value: false };
+    }
+    return { tag: 'boolean', value: true };
   });
 
   defBuiltin('<=', (args, p) => {
-    if (args.length !== 2) throw new EvalError(`${fmtPos(p)}<=: expected 2 args`);
+    if (args.length < 2) throw new EvalError(`${fmtPos(p)}<=: expected at least 2 args`);
     expectNumeric(args, '<=', p);
-    return { tag: 'boolean', value: toFloat(args[0], '<=', p) <= toFloat(args[1], '<=', p) };
+    for (let i = 0; i < args.length - 1; i++) {
+      if (!(toFloat(args[i], '<=', p) <= toFloat(args[i + 1], '<=', p))) return { tag: 'boolean', value: false };
+    }
+    return { tag: 'boolean', value: true };
   });
 
   defBuiltin('>=', (args, p) => {
-    if (args.length !== 2) throw new EvalError(`${fmtPos(p)}>=: expected 2 args`);
+    if (args.length < 2) throw new EvalError(`${fmtPos(p)}>=: expected at least 2 args`);
     expectNumeric(args, '>=', p);
-    return { tag: 'boolean', value: toFloat(args[0], '>=', p) >= toFloat(args[1], '>=', p) };
+    for (let i = 0; i < args.length - 1; i++) {
+      if (!(toFloat(args[i], '>=', p) >= toFloat(args[i + 1], '>=', p))) return { tag: 'boolean', value: false };
+    }
+    return { tag: 'boolean', value: true };
   });
 
   // List operations
@@ -859,7 +962,7 @@ function makeGlobalEnv(outputBuf: string[]): Env {
   defBuiltin('reverse', (args, p) => {
     if (args.length !== 1) throw new EvalError(`${fmtPos(p)}reverse: expected 1 arg`);
     if (args[0].tag !== 'list' && args[0].tag !== 'pair') throw new EvalError(`${fmtPos(p)}reverse: expected list`);
-    return arrayToSchemeList(toArray(args[0]).reverse());
+    return arrayToSchemeList(toArray(args[0]).slice().reverse());
   });
 
   defBuiltin('null?', (args, p) => {
@@ -1314,19 +1417,19 @@ function makeGlobalEnv(outputBuf: string[]): Env {
   defBuiltin('list-tail', (args, p) => {
     if (args.length !== 2) throw new EvalError(`${fmtPos(p)}list-tail: expected 2 args`);
     if (args[1].tag !== 'number') throw new EvalError(`${fmtPos(p)}list-tail: expected number`);
-    const idx = args[1].value;
-    if (args[0].tag === 'pair') {
-      let cur: SchemeVal = args[0];
-      for (let i = 0; i < idx; i++) {
-        if (cur.tag !== 'pair') throw new EvalError(`${fmtPos(p)}list-tail: index out of range`);
+    let remaining = args[1].value;
+    let cur: SchemeVal = args[0];
+    while (remaining > 0) {
+      if (cur.tag === 'pair') {
         cur = cur.cdr;
+        remaining--;
+      } else if (cur.tag === 'list') {
+        return { tag: 'list', elements: cur.elements.slice(remaining) } as SchemeVal;
+      } else {
+        throw new EvalError(`${fmtPos(p)}list-tail: index out of range`);
       }
-      return cur;
     }
-    if (args[0].tag === 'list') {
-      return { tag: 'list', elements: args[0].elements.slice(idx) } as SchemeVal;
-    }
-    throw new EvalError(`${fmtPos(p)}list-tail: expected list`);
+    return cur;
   });
 
   defBuiltin('list?', (args, p) => {
@@ -1338,9 +1441,9 @@ function makeGlobalEnv(outputBuf: string[]): Env {
     let slow: SchemeVal = v;
     let fast: SchemeVal = v;
     while (true) {
-      if (fast.tag !== 'pair') return { tag: 'boolean', value: isNullVal(fast) };
+      if (fast.tag !== 'pair') return { tag: 'boolean', value: isNullVal(fast) || (fast.tag === 'list' && !fast.dotted) };
       fast = fast.cdr;
-      if (fast.tag !== 'pair') return { tag: 'boolean', value: isNullVal(fast) };
+      if (fast.tag !== 'pair') return { tag: 'boolean', value: isNullVal(fast) || (fast.tag === 'list' && !fast.dotted) };
       fast = fast.cdr;
       slow = (slow as { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }).cdr;
       if (slow === fast) return { tag: 'boolean', value: false }; // cycle
@@ -1603,6 +1706,10 @@ function makeGlobalEnv(outputBuf: string[]): Env {
   const raiseBuiltin: SchemeVal = { tag: 'builtin', name: 'raise', func: () => { throw new Error('raise: must be intercepted by CEK machine'); } };
   envDefine(env, 'raise', raiseBuiltin);
 
+  // error — handled specially by the CEK machine (raises an error object)
+  const errorBuiltin: SchemeVal = { tag: 'builtin', name: 'error', func: () => { throw new Error('error: must be intercepted by CEK machine'); } };
+  envDefine(env, 'error', errorBuiltin);
+
   // with-exception-handler — handled specially by the CEK machine
   const wehBuiltin: SchemeVal = { tag: 'builtin', name: 'with-exception-handler', func: () => { throw new Error('with-exception-handler: must be intercepted by CEK machine'); } };
   envDefine(env, 'with-exception-handler', wehBuiltin);
@@ -1623,7 +1730,7 @@ function makeGlobalEnv(outputBuf: string[]): Env {
 // --- Macro support ---
 
 const SPECIAL_FORMS = new Set([
-  'quote', 'if', 'define', 'lambda', 'and', 'or', 'not', 'begin',
+  'quote', 'quasiquote', 'if', 'define', 'lambda', 'and', 'or', 'not', 'begin',
   'cond', 'set!', 'string-set!', 'let', 'let*', 'letrec', 'letrec*', 'case', 'do',
   'define-syntax', 'define-record-type', 'case-lambda', 'guard',
   'syntax-case', 'syntax', 'with-syntax'
@@ -1807,6 +1914,84 @@ function applyCaseLambda(func: Extract<SchemeVal, { tag: 'case-lambda' }>, args:
   throw new EvalError(`${fmtPos(callPos)}no matching clause for ${args.length} arguments`);
 }
 
+// --- Quasiquote ---
+
+function expandQuasiquote(tmpl: SchemeVal, env: Env): SchemeVal {
+  function qq(t: SchemeVal, depth: number): SchemeVal {
+    if (t.tag === 'list' && t.elements.length === 2 && t.elements[0].tag === 'symbol' && t.elements[0].value === 'unquote') {
+      if (depth === 0) {
+        return evalScheme(t.elements[1], env);
+      }
+      return { tag: 'list', elements: [{ tag: 'symbol', value: 'unquote' }, qq(t.elements[1], depth - 1)] };
+    }
+    if (t.tag === 'list' && t.elements.length === 2 && t.elements[0].tag === 'symbol' && t.elements[0].value === 'quasiquote') {
+      return { tag: 'list', elements: [{ tag: 'symbol', value: 'quasiquote' }, qq(t.elements[1], depth + 1)] };
+    }
+    if (t.tag === 'list') {
+      const result: SchemeVal[] = [];
+      for (const el of t.elements) {
+        if (el.tag === 'list' && el.elements.length === 2 && el.elements[0].tag === 'symbol' && el.elements[0].value === 'unquote-splicing') {
+          if (depth === 0) {
+            const spliced = evalScheme(el.elements[1], env);
+            const arr = toArray(spliced);
+            result.push(...arr);
+            continue;
+          }
+        }
+        result.push(qq(el, depth));
+      }
+      return { tag: 'list', elements: result };
+    }
+    if (t.tag === 'pair') {
+      // Check for (unquote x) in pair form
+      if (t.car.tag === 'symbol' && t.car.value === 'unquote') {
+        // (unquote . (x . nil))
+        const inner = t.cdr;
+        if (inner.tag === 'pair' && isNullVal(inner.cdr)) {
+          if (depth === 0) return evalScheme(inner.car, env);
+          return { tag: 'pair', car: t.car, cdr: { tag: 'pair', car: qq(inner.car, depth - 1), cdr: inner.cdr } };
+        }
+      }
+      if (t.car.tag === 'symbol' && t.car.value === 'quasiquote') {
+        const inner = t.cdr;
+        if (inner.tag === 'pair' && isNullVal(inner.cdr)) {
+          return { tag: 'pair', car: t.car, cdr: { tag: 'pair', car: qq(inner.car, depth + 1), cdr: inner.cdr } };
+        }
+      }
+      // Check for splicing in car
+      const car = t.car;
+      if (car.tag === 'list' && car.elements.length === 2 && car.elements[0].tag === 'symbol' && car.elements[0].value === 'unquote-splicing' && depth === 0) {
+        const spliced = evalScheme(car.elements[1], env);
+        const arr = toArray(spliced);
+        const qqCdr = qq(t.cdr, depth);
+        // append spliced to cdr
+        let result: SchemeVal = qqCdr;
+        for (let i = arr.length - 1; i >= 0; i--) {
+          result = { tag: 'pair', car: arr[i], cdr: result };
+        }
+        return result;
+      }
+      return { tag: 'pair', car: qq(t.car, depth), cdr: qq(t.cdr, depth) };
+    }
+    if (t.tag === 'vector') {
+      const result: SchemeVal[] = [];
+      for (const el of t.elements) {
+        if (el.tag === 'list' && el.elements.length === 2 && el.elements[0].tag === 'symbol' && el.elements[0].value === 'unquote-splicing') {
+          if (depth === 0) {
+            const spliced = evalScheme(el.elements[1], env);
+            result.push(...toArray(spliced));
+            continue;
+          }
+        }
+        result.push(qq(el, depth));
+      }
+      return { tag: 'vector', elements: result };
+    }
+    return t;
+  }
+  return qq(tmpl, 0);
+}
+
 // --- Eval ---
 
 function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
@@ -1894,6 +2079,14 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
     if (func.tag === 'builtin' && func.name === 'raise') {
       if (args.length !== 1) throw new EvalError(`${fmtPos(pos)}raise: expected 1 argument`);
       throw new SchemeRaiseSignal(args[0]);
+    }
+    if (func.tag === 'builtin' && func.name === 'error') {
+      if (args.length < 1) throw new EvalError(`${fmtPos(pos)}error: expected at least 1 argument`);
+      let msg = displayString(args[0]);
+      for (let i = 1; i < args.length; i++) {
+        msg += ' ' + schemeToString(args[i]);
+      }
+      throw new SchemeRaiseSignal({ tag: 'string', value: msg });
     }
     if (func.tag === 'builtin' && func.name === 'with-exception-handler') {
       if (args.length !== 2) throw new EvalError(`${fmtPos(pos)}with-exception-handler: expected 2 arguments`);
@@ -2021,6 +2214,11 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
                   val = elems[1]; break;
                 }
 
+                if (name === 'quasiquote') {
+                  if (elems.length !== 2) throw new EvalError(`${fmtPos(expr.pos)}quasiquote: wrong argument count`);
+                  val = expandQuasiquote(elems[1], env); break;
+                }
+
                 if (name === 'if') {
                   if (elems.length < 3 || elems.length > 4) throw new EvalError(`${fmtPos(expr.pos)}if: wrong argument count`);
                   kont = { tag: 'if-test', thenE: elems[2], elseE: elems.length === 4 ? elems[3] : undefined, env, next: kont };
@@ -2028,14 +2226,21 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
                 }
 
                 if (name === 'define') {
-                  if (elems.length < 3) throw new EvalError(`${fmtPos(expr.pos)}define: wrong argument count`);
+                  if (elems.length < 2) throw new EvalError(`${fmtPos(expr.pos)}define: wrong argument count`);
                   if (elems[1].tag === 'symbol') {
+                    if (elems.length < 3) throw new EvalError(`${fmtPos(expr.pos)}define: wrong argument count`);
                     kont = { tag: 'define', name: elems[1].value, env, next: kont };
                     ctrl = elems[2]; break;
                   }
                   if (elems[1].tag === 'list' && elems[1].elements.length > 0 && elems[1].elements[0].tag === 'symbol') {
                     const fnName = elems[1].elements[0].value;
                     const { params, restParam } = parseParams(elems[1].elements.slice(1), expr.pos);
+                    envDefine(env, fnName, { tag: 'lambda', params, restParam, body: elems.slice(2), env });
+                    val = { tag: 'void' }; break;
+                  }
+                  if (elems[1].tag === 'pair' && elems[1].car.tag === 'symbol') {
+                    const fnName = elems[1].car.value;
+                    const { params, restParam } = parseParamsFromVal(elems[1].cdr, expr.pos);
                     envDefine(env, fnName, { tag: 'lambda', params, restParam, body: elems.slice(2), env });
                     val = { tag: 'void' }; break;
                   }
@@ -2046,6 +2251,10 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
                   if (elems.length < 3) throw new EvalError(`${fmtPos(expr.pos)}lambda: wrong argument count`);
                   if (elems[1].tag === 'symbol') {
                     val = { tag: 'lambda', params: [], restParam: elems[1].value, body: elems.slice(2), env }; break;
+                  }
+                  if (elems[1].tag === 'pair') {
+                    const { params, restParam } = parseParamsFromVal(elems[1], expr.pos);
+                    val = { tag: 'lambda', params, restParam, body: elems.slice(2), env }; break;
                   }
                   if (elems[1].tag !== 'list') throw new EvalError(`${fmtPos(expr.pos)}lambda: params must be a list`);
                   const { params, restParam } = parseParams(elems[1].elements, expr.pos);
@@ -2059,9 +2268,7 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
                     if (clause.tag !== 'list' || clause.elements.length < 2)
                       throw new EvalError(`${fmtPos(expr.pos)}case-lambda: invalid clause`);
                     const paramForm = clause.elements[0];
-                    if (paramForm.tag !== 'list')
-                      throw new EvalError(`${fmtPos(expr.pos)}case-lambda: params must be a list`);
-                    const { params, restParam } = parseParams(paramForm.elements, expr.pos);
+                    const { params, restParam } = parseParamsFromVal(paramForm, expr.pos);
                     clauses.push({ params, restParam, body: clause.elements.slice(1) });
                   }
                   val = { tag: 'case-lambda', clauses, env, pos: expr.pos }; break;
