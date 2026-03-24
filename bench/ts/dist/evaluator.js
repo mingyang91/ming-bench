@@ -1425,7 +1425,7 @@ function gensym(base) {
 const SPECIAL_FORMS = new Set([
     'define', 'set!', 'if', 'quote', 'lambda', 'case-lambda', 'and', 'or', 'begin',
     'let', 'let*', 'letrec', 'letrec*', 'cond', 'case', 'do', 'define-syntax', 'syntax-rules', 'define-record-type',
-    'syntax-case', 'syntax', 'with-syntax',
+    'syntax-case', 'syntax', 'with-syntax', 'guard',
 ]);
 let syntaxCaseStack = [];
 function collectPatternVarNames(pattern, literals) {
@@ -1725,7 +1725,7 @@ function applyK(func, args, k, pos) {
     }
     // Continuation invocation (with wind transition)
     if (func.tag === 'procedure' && func._cont) {
-        const val = args.length > 0 ? args[0] : { tag: 'void' };
+        const val = args.length > 1 ? { tag: 'values', values: args } : args.length > 0 ? args[0] : { tag: 'void' };
         const targetWind = func._capturedWind || [];
         return doWindTransition(targetWind, () => func._cont(val));
     }
@@ -2496,7 +2496,7 @@ function evalK(expr, env, k) {
                             const idx = exceptionHandlers.indexOf(entry);
                             if (idx >= 0)
                                 exceptionHandlers.splice(idx, 1);
-                            return k(result);
+                            return { tag: 'bounce', fn: () => k(result) };
                         });
                     }
                     case 'define-record-type': {

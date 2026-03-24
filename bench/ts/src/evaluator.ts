@@ -1341,7 +1341,7 @@ function gensym(base: string): string {
 const SPECIAL_FORMS = new Set([
   'define', 'set!', 'if', 'quote', 'lambda', 'case-lambda', 'and', 'or', 'begin',
   'let', 'let*', 'letrec', 'letrec*', 'cond', 'case', 'do', 'define-syntax', 'syntax-rules', 'define-record-type',
-  'syntax-case', 'syntax', 'with-syntax',
+  'syntax-case', 'syntax', 'with-syntax', 'guard',
 ]);
 
 interface PatternBindings {
@@ -1674,7 +1674,7 @@ function applyK(func: SchemeVal, args: SchemeVal[], k: Cont, pos?: Pos): Bounce 
 
   // Continuation invocation (with wind transition)
   if (func.tag === 'procedure' && func._cont) {
-    const val = args.length > 0 ? args[0] : ({ tag: 'void' } as SchemeVal);
+    const val = args.length > 1 ? ({ tag: 'values', values: args } as SchemeVal) : args.length > 0 ? args[0] : ({ tag: 'void' } as SchemeVal);
     const targetWind = func._capturedWind || [];
     return doWindTransition(targetWind, () => func._cont!(val));
   }
@@ -2386,7 +2386,7 @@ function evalK(expr: SchemeVal, env: Env, k: Cont): Bounce {
             return evalSeqK(bodyExprs, 0, env, (result) => {
               const idx = exceptionHandlers.indexOf(entry);
               if (idx >= 0) exceptionHandlers.splice(idx, 1);
-              return k(result);
+              return { tag: 'bounce', fn: () => k(result) };
             });
           }
           case 'define-record-type': {
