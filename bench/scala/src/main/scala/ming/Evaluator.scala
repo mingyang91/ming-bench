@@ -17,6 +17,7 @@ object Evaluator:
     case Builtin(f: List[Val] => Val)
     case MacroTransformer(expand: Val => Val)
     case Record(tag: String, fields: Array[Val])
+    case Vector(elems: Array[Val])
 
   import Val.*
 
@@ -53,7 +54,7 @@ object Evaluator:
   private def eval(expr: Val, env: Env): Val =
     expr match
       case Num(_) | Bool(_) | Str(_) | SchemeChar(_) | Builtin(_) | MacroTransformer(_) | Rational(_, _) | Inexact(_) |
-          Record(_, _) =>
+          Record(_, _) | Vector(_) =>
         expr
       case Nil => Nil
       case Symbol(name) =>
@@ -75,7 +76,17 @@ object Evaluator:
       case Pair(Symbol("or"), args)                 => evalOr(args, env)
       case Pair(Symbol("define-record-type"), rest) => Records.evalDefineRecordType(rest, env, error)
       case Pair(Symbol("case-lambda"), clausesList) =>
-        evalCaseLambda(clausesList, env)
+        SpecialForms.evalCaseLambda(clausesList, env, eval, parseParams, error)
+      case Pair(Symbol("let*"), rest) =>
+        SpecialForms.evalLetStar(rest, env, eval, error)
+      case Pair(Symbol("letrec"), rest) =>
+        SpecialForms.evalLetrec(rest, env, eval, error)
+      case Pair(Symbol("letrec*"), rest) =>
+        SpecialForms.evalLetrecStar(rest, env, eval, error)
+      case Pair(Symbol("case"), rest) =>
+        SpecialForms.evalCase(rest, env, eval, error)
+      case Pair(Symbol("do"), rest) =>
+        SpecialForms.evalDo(rest, env, eval, error)
       case Pair(Symbol("define-syntax"), Pair(Symbol(name), Pair(sr, Nil))) =>
         Macros.evalDefineSyntax(name, sr, env)
       case p @ Pair(Symbol(name), _) =>
@@ -155,36 +166,6 @@ object Evaluator:
           result
         }
       case _ => error("bad lambda syntax")
-
-  private def evalCaseLambda(clausesList: Val, env: Env): Val =
-    val clauses = toList(clausesList).map { clause =>
-      clause match
-        case Pair(params, body) =>
-          val (paramNames, restParam) = parseParams(params)
-          val bodyList                = toList(body)
-          if bodyList.isEmpty then error("case-lambda: empty body")
-          (paramNames, restParam, bodyList)
-        case _ => error("bad case-lambda clause")
-    }
-    Builtin { args =>
-      val matched = clauses.find { (paramNames, restParam, _) =>
-        if restParam.isDefined then args.length >= paramNames.length
-        else args.length == paramNames.length
-      }
-      matched match
-        case Some((paramNames, restParam, bodyList)) =>
-          val childEnv = Env.empty(Some(env))
-          paramNames.zip(args).foreach((p, a) => childEnv.define(p, a))
-          restParam.foreach { rp =>
-            val restArgs = args.drop(paramNames.length)
-            childEnv.define(rp, restArgs.foldRight(Nil: Val)((a, acc) => Pair(a, acc)))
-          }
-          var result: Val = Void
-          for expr <- bodyList do result = eval(expr, childEnv)
-          result
-        case None =>
-          error(s"case-lambda: no matching clause for ${args.length} arguments")
-    }
 
   private def evalAnd(args: Val, env: Env): Val =
     args match

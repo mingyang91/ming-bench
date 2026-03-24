@@ -22,12 +22,14 @@ object Display:
     case Builtin(_)          => "#<procedure>"
     case MacroTransformer(_) => "#<macro>"
     case Record(tag, _)      => s"#<record:$tag>"
+    case Vector(elems)       => "#(" + elems.map(write).mkString(" ") + ")"
 
   /** Display-style (no quotes on strings). */
   def show(v: Val): String = v match
     case Str(chars)    => new String(chars)
     case SchemeChar(c) => c.toString
     case Pair(_, _)    => showList(v)
+    case Vector(elems) => "#(" + elems.map(show).mkString(" ") + ")"
     case _             => write(v)
 
   private def writeList(v: Val): String =

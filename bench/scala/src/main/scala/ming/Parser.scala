@@ -75,6 +75,16 @@ private[ming] class Parser(input: String):
               val c = input(pos)
               advance()
               SchemeChar(c)
+          case '(' =>
+            advance() // skip (
+            val elems = scala.collection.mutable.ArrayBuffer[Val]()
+            skipWhitespace()
+            while pos < input.length && input(pos) != ')' do
+              elems += parseExpr()
+              skipWhitespace()
+            if pos >= input.length then throw new EvalError("unterminated vector literal")
+            advance() // skip )
+            Evaluator.Val.Vector(elems.toArray)
           case other => throw new EvalError(s"unexpected character after #: $other")
       case _ =>
         parseAtom()
