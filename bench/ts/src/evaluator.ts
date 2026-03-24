@@ -83,6 +83,17 @@ function parse(tokens: Token[], idx: number): [SchemeVal, number] {
   if (token.text === '#t') return [{ tag: 'boolean', value: true, pos: p }, idx + 1];
   if (token.text === '#f') return [{ tag: 'boolean', value: false, pos: p }, idx + 1];
 
+  if (token.text.startsWith('#\\')) {
+    const rest = token.text.slice(2);
+    let ch: string;
+    if (rest === 'space') ch = ' ';
+    else if (rest === 'newline') ch = '\n';
+    else if (rest === 'tab') ch = '\t';
+    else if (rest.length === 1) ch = rest;
+    else throw new EvalError(`invalid character literal: ${token.text}`);
+    return [{ tag: 'char', value: ch, pos: p }, idx + 1];
+  }
+
   if (token.text.startsWith('"')) {
     const inner = token.text.slice(1, -1)
       .replace(/\\n/g, '\n')
@@ -369,6 +380,12 @@ function makeGlobalEnv(outputBuf: string[]): Env {
     return { tag: 'char', value: args[0].value[idx] };
   });
 
+  defBuiltin('string-copy', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}string-copy: expected 1 arg`);
+    if (args[0].tag !== 'string') throw new EvalError(`${fmtPos(p)}string-copy: expected string`);
+    return { tag: 'string', value: args[0].value };
+  });
+
   defBuiltin('char?', (args, p) => {
     if (args.length !== 1) throw new EvalError(`${fmtPos(p)}char?: expected 1 arg`);
     return { tag: 'boolean', value: args[0].tag === 'char' };
@@ -496,6 +513,22 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
               return result;
             }
           }
+          return { tag: 'void' };
+        }
+
+        if (name === 'string-set!') {
+          if (elems.length !== 4) throw new EvalError(`${fmtPos(expr.pos)}string-set!: expected 3 args`);
+          if (elems[1].tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}string-set!: first arg must be a variable`);
+          const strVal = env.get(elems[1].value);
+          if (!strVal || strVal.tag !== 'string') throw new EvalError(`${fmtPos(expr.pos)}string-set!: expected string variable`);
+          const idx = evalScheme(elems[2], env);
+          if (idx.tag !== 'number') throw new EvalError(`${fmtPos(expr.pos)}string-set!: expected number index`);
+          const ch = evalScheme(elems[3], env);
+          if (ch.tag !== 'char') throw new EvalError(`${fmtPos(expr.pos)}string-set!: expected char`);
+          const s = strVal.value;
+          const i = idx.value;
+          if (i < 0 || i >= s.length) throw new EvalError(`${fmtPos(expr.pos)}string-set!: index out of range`);
+          env.set(elems[1].value, { tag: 'string', value: s.slice(0, i) + ch.value + s.slice(i + 1) });
           return { tag: 'void' };
         }
 
