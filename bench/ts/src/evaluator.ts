@@ -1255,6 +1255,8 @@ function applyCaseLambda(func: Extract<SchemeVal, { tag: 'case-lambda' }>, args:
 // --- Eval ---
 
 function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
+  // Trampoline loop for tail-call optimization
+  trampoline: while (true) {
   switch (expr.tag) {
     case 'number':
     case 'rational':
@@ -1284,8 +1286,8 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
         if (name === 'if') {
           if (elems.length < 3 || elems.length > 4) throw new EvalError(`${fmtPos(expr.pos)}if: wrong argument count`);
           const cond = evalScheme(elems[1], env);
-          if (isTruthy(cond)) return evalScheme(elems[2], env);
-          if (elems.length === 4) return evalScheme(elems[3], env);
+          if (isTruthy(cond)) { expr = elems[2]; continue; }
+          if (elems.length === 4) { expr = elems[3]; continue; }
           return { tag: 'void' };
         }
 
@@ -1333,21 +1335,23 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
         }
 
         if (name === 'and') {
-          let result: SchemeVal = { tag: 'boolean', value: true };
-          for (let i = 1; i < elems.length; i++) {
-            result = evalScheme(elems[i], env);
+          if (elems.length === 1) return { tag: 'boolean', value: true };
+          for (let i = 1; i < elems.length - 1; i++) {
+            const result = evalScheme(elems[i], env);
             if (!isTruthy(result)) return result;
           }
-          return result;
+          // Tail position: last expression
+          expr = elems[elems.length - 1]; continue;
         }
 
         if (name === 'or') {
-          let result: SchemeVal = { tag: 'boolean', value: false };
-          for (let i = 1; i < elems.length; i++) {
-            result = evalScheme(elems[i], env);
+          if (elems.length === 1) return { tag: 'boolean', value: false };
+          for (let i = 1; i < elems.length - 1; i++) {
+            const result = evalScheme(elems[i], env);
             if (isTruthy(result)) return result;
           }
-          return result;
+          // Tail position: last expression
+          expr = elems[elems.length - 1]; continue;
         }
 
         if (name === 'not') {
@@ -1357,11 +1361,12 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
         }
 
         if (name === 'begin') {
-          let result: SchemeVal = { tag: 'void' };
-          for (let i = 1; i < elems.length; i++) {
-            result = evalScheme(elems[i], env);
+          if (elems.length === 1) return { tag: 'void' };
+          for (let i = 1; i < elems.length - 1; i++) {
+            evalScheme(elems[i], env);
           }
-          return result;
+          // Tail position: last expression
+          expr = elems[elems.length - 1]; continue;
         }
 
         if (name === 'cond') {
@@ -1370,19 +1375,19 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
             if (clause.tag !== 'list' || clause.elements.length < 2)
               throw new EvalError(`${fmtPos(expr.pos)}cond: invalid clause`);
             if (clause.elements[0].tag === 'symbol' && clause.elements[0].value === 'else') {
-              let result: SchemeVal = { tag: 'void' };
-              for (let j = 1; j < clause.elements.length; j++) {
-                result = evalScheme(clause.elements[j], env);
+              for (let j = 1; j < clause.elements.length - 1; j++) {
+                evalScheme(clause.elements[j], env);
               }
-              return result;
+              // Tail position: last expression in clause
+              expr = clause.elements[clause.elements.length - 1]; continue trampoline;
             }
             const test = evalScheme(clause.elements[0], env);
             if (isTruthy(test)) {
-              let result: SchemeVal = { tag: 'void' };
-              for (let j = 1; j < clause.elements.length; j++) {
-                result = evalScheme(clause.elements[j], env);
+              for (let j = 1; j < clause.elements.length - 1; j++) {
+                evalScheme(clause.elements[j], env);
               }
-              return result;
+              // Tail position: last expression in clause
+              expr = clause.elements[clause.elements.length - 1]; continue trampoline;
             }
           }
           return { tag: 'void' };
@@ -1432,16 +1437,15 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
             const loopEnv = childEnv(env);
             const lambda: SchemeVal = { tag: 'lambda', params, body, env: loopEnv };
             envDefine(loopEnv, loopName, lambda);
-            // Call with initial values
+            // Call with initial values — TCO: set up env and continue
             const callEnv = childEnv(loopEnv);
             for (let i = 0; i < params.length; i++) {
               envDefine(callEnv, params[i], inits[i]);
             }
-            let result: SchemeVal = { tag: 'void' };
-            for (const bodyExpr of body) {
-              result = evalScheme(bodyExpr, callEnv);
+            for (let i = 0; i < body.length - 1; i++) {
+              evalScheme(body[i], callEnv);
             }
-            return result;
+            expr = body[body.length - 1]; env = callEnv; continue;
           }
           // Regular let: (let ((var init) ...) body ...)
           if (elems[1].tag !== 'list') throw new EvalError(`${fmtPos(expr.pos)}let: bindings must be a list`);
@@ -1452,11 +1456,11 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
             const val = evalScheme(binding.elements[1], env);
             envDefine(letEnv, binding.elements[0].value, val);
           }
-          let letResult: SchemeVal = { tag: 'void' };
-          for (let i = 2; i < elems.length; i++) {
-            letResult = evalScheme(elems[i], letEnv);
+          // Tail position: last body expression
+          for (let i = 2; i < elems.length - 1; i++) {
+            evalScheme(elems[i], letEnv);
           }
-          return letResult;
+          expr = elems[elems.length - 1]; env = letEnv; continue;
         }
 
         if (name === 'letrec') {
@@ -1478,11 +1482,11 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
             const val = evalScheme(initExprs[i], letrecEnv);
             envSet(letrecEnv, names[i], val);
           }
-          let result: SchemeVal = { tag: 'void' };
-          for (let i = 2; i < elems.length; i++) {
-            result = evalScheme(elems[i], letrecEnv);
+          // Tail position: last body expression
+          for (let i = 2; i < elems.length - 1; i++) {
+            evalScheme(elems[i], letrecEnv);
           }
-          return result;
+          expr = elems[elems.length - 1]; env = letrecEnv; continue;
         }
 
         if (name === 'letrec*') {
@@ -1503,11 +1507,11 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
             const val = evalScheme(lsInits[i], letrecEnv);
             envSet(letrecEnv, lsNames[i], val);
           }
-          let result: SchemeVal = { tag: 'void' };
-          for (let i = 2; i < elems.length; i++) {
-            result = evalScheme(elems[i], letrecEnv);
+          // Tail position: last body expression
+          for (let i = 2; i < elems.length - 1; i++) {
+            evalScheme(elems[i], letrecEnv);
           }
-          return result;
+          expr = elems[elems.length - 1]; env = letrecEnv; continue;
         }
 
         if (name === 'case') {
@@ -1519,11 +1523,10 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
               throw new EvalError(`${fmtPos(expr.pos)}case: invalid clause`);
             const datums = clause.elements[0];
             if (datums.tag === 'symbol' && datums.value === 'else') {
-              let result: SchemeVal = { tag: 'void' };
-              for (let j = 1; j < clause.elements.length; j++) {
-                result = evalScheme(clause.elements[j], env);
+              for (let j = 1; j < clause.elements.length - 1; j++) {
+                evalScheme(clause.elements[j], env);
               }
-              return result;
+              expr = clause.elements[clause.elements.length - 1]; continue trampoline;
             }
             if (datums.tag !== 'list') throw new EvalError(`${fmtPos(expr.pos)}case: datums must be a list`);
             let matched = false;
@@ -1538,11 +1541,10 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
               }
             }
             if (matched) {
-              let result: SchemeVal = { tag: 'void' };
-              for (let j = 1; j < clause.elements.length; j++) {
-                result = evalScheme(clause.elements[j], env);
+              for (let j = 1; j < clause.elements.length - 1; j++) {
+                evalScheme(clause.elements[j], env);
               }
-              return result;
+              expr = clause.elements[clause.elements.length - 1]; continue trampoline;
             }
           }
           return { tag: 'void' };
@@ -1579,11 +1581,10 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
             const testResult = evalScheme(testExpr, doEnv);
             if (isTruthy(testResult)) {
               if (resultExprs.length === 0) return { tag: 'void' };
-              let result: SchemeVal = { tag: 'void' };
-              for (const re of resultExprs) {
-                result = evalScheme(re, doEnv);
+              for (let ri = 0; ri < resultExprs.length - 1; ri++) {
+                evalScheme(resultExprs[ri], doEnv);
               }
-              return result;
+              expr = resultExprs[resultExprs.length - 1]; env = doEnv; break;
             }
             // Execute body
             for (const bodyExpr of doBody) {
@@ -1605,6 +1606,7 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
               }
             }
           }
+          continue;
         }
 
         if (name === 'define-record-type') {
@@ -1686,7 +1688,7 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
         const maybeMacro = envLookup(env, name);
         if (maybeMacro && maybeMacro.tag === 'macro') {
           const expanded = expandMacroCall(maybeMacro, expr);
-          return evalScheme(expanded, env);
+          expr = expanded; continue;
         }
       }
 
@@ -1711,15 +1713,44 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
         if (func.restParam) {
           envDefine(callEnv, func.restParam, { tag: 'list', elements: args.slice(func.params.length) });
         }
-        let result: SchemeVal = { tag: 'void' };
-        for (const bodyExpr of func.body) {
-          result = evalScheme(bodyExpr, callEnv);
+        // TCO: eval all but last body expression, then loop on last
+        for (let i = 0; i < func.body.length - 1; i++) {
+          evalScheme(func.body[i], callEnv);
         }
-        return result;
+        expr = func.body[func.body.length - 1]; env = callEnv; continue;
       }
 
       if (func.tag === 'case-lambda') {
-        return applyCaseLambda(func, args, expr.pos);
+        // Inline case-lambda dispatch for TCO
+        let matched = false;
+        for (const clause of func.clauses) {
+          if (clause.restParam) {
+            if (args.length >= clause.params.length) {
+              const callEnv = childEnv(func.env);
+              for (let i = 0; i < clause.params.length; i++) {
+                envDefine(callEnv, clause.params[i], args[i]);
+              }
+              envDefine(callEnv, clause.restParam, { tag: 'list', elements: args.slice(clause.params.length) });
+              for (let i = 0; i < clause.body.length - 1; i++) {
+                evalScheme(clause.body[i], callEnv);
+              }
+              expr = clause.body[clause.body.length - 1]; env = callEnv; matched = true; break;
+            }
+          } else {
+            if (args.length === clause.params.length) {
+              const callEnv = childEnv(func.env);
+              for (let i = 0; i < clause.params.length; i++) {
+                envDefine(callEnv, clause.params[i], args[i]);
+              }
+              for (let i = 0; i < clause.body.length - 1; i++) {
+                evalScheme(clause.body[i], callEnv);
+              }
+              expr = clause.body[clause.body.length - 1]; env = callEnv; matched = true; break;
+            }
+          }
+        }
+        if (matched) continue;
+        throw new EvalError(`${fmtPos(expr.pos)}no matching clause for ${args.length} arguments`);
       }
 
       throw new EvalError(`${fmtPos(expr.pos)}not a procedure: ${schemeToString(func)}`);
@@ -1734,6 +1765,7 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
     case 'void':
       return expr;
   }
+  } // end while(true)
 }
 
 /**
