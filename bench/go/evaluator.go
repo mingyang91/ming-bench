@@ -33,6 +33,7 @@ const (
 	valTailCall
 	valContinuation
 	valMultipleValues
+	valSyntax // wraps an *expr for syntax-case macros
 )
 
 type tailCall struct {
@@ -62,10 +63,11 @@ type syntaxRule struct {
 }
 
 type macro struct {
-	name     string
-	literals []string
-	rules    []syntaxRule
-	defEnv   *env // definition-site environment for hygiene
+	name        string
+	literals    []string
+	rules       []syntaxRule
+	defEnv      *env   // definition-site environment for hygiene
+	transformer *value // non-nil for procedural (syntax-case) macros
 }
 
 type recordType struct {
@@ -97,6 +99,7 @@ type value struct {
 	cont      kont           // for valContinuation
 	wind      []*windEntry   // captured wind stack for valContinuation
 	multiVals *[]value       // for valMultipleValues
+	syntaxExpr *expr         // for valSyntax
 }
 
 var voidVal = value{kind: valVoid}
@@ -255,6 +258,8 @@ func (v value) String() string {
 		}
 		sb.WriteByte(')')
 		return sb.String()
+	case valSyntax:
+		return "#<syntax>"
 	default:
 		return "<unknown>"
 	}
@@ -337,9 +342,10 @@ func isTruthy(v value) bool {
 // ---------- Environment ----------
 
 type env struct {
-	bindings map[string]value
-	parent   *env
-	output   *strings.Builder // non-nil only on root env
+	bindings       map[string]value
+	parent         *env
+	output         *strings.Builder          // non-nil only on root env
+	syntaxBindings map[string][]*expr         // pattern var bindings from syntax-case
 }
 
 func newEnv(parent *env) *env {
@@ -370,6 +376,18 @@ func (e *env) setExisting(name string, v value) bool {
 		return e.parent.setExisting(name, v)
 	}
 	return false
+}
+
+func (e *env) getSyntaxBinding(name string) ([]*expr, bool) {
+	if e.syntaxBindings != nil {
+		if v, ok := e.syntaxBindings[name]; ok {
+			return v, true
+		}
+	}
+	if e.parent != nil {
+		return e.parent.getSyntaxBinding(name)
+	}
+	return nil, false
 }
 
 func (e *env) getOutput() *strings.Builder {
@@ -407,6 +425,7 @@ const (
 	tokLParen tokenKind = iota
 	tokRParen
 	tokQuote
+	tokSyntaxQuote // #'
 	tokAtom
 	tokEOF
 )
@@ -486,6 +505,13 @@ func (t *tokenizer) next() (token, error) {
 	if ch == '\'' {
 		t.advance()
 		return token{kind: tokQuote, text: "'", line: line, col: col}, nil
+	}
+
+	// Syntax quote: #'
+	if ch == '#' && t.pos+1 < len(t.input) && t.input[t.pos+1] == '\'' {
+		t.advance() // #
+		t.advance() // '
+		return token{kind: tokSyntaxQuote, text: "#'", line: line, col: col}, nil
 	}
 
 	// String literal
@@ -573,6 +599,23 @@ func (p *parser) parseExpr() (*expr, error) {
 			kind: exprList,
 			list: []*expr{
 				{kind: exprAtom, atom: symVal("quote"), line: tok.line, col: tok.col},
+				inner,
+			},
+			line: tok.line,
+			col:  tok.col,
+		}, nil
+	}
+
+	if tok.kind == tokSyntaxQuote {
+		p.pos++
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &expr{
+			kind: exprList,
+			list: []*expr{
+				{kind: exprAtom, atom: symVal("syntax"), line: tok.line, col: tok.col},
 				inner,
 			},
 			line: tok.line,
@@ -713,6 +756,12 @@ func evalCore(e *expr, env *env) (value, error) {
 			return evalCond(e, env)
 		case "define-syntax":
 			return evalDefineSyntax(e, env)
+		case "syntax-case":
+			return evalSyntaxCase(e, env)
+		case "syntax":
+			return evalSyntaxForm(e, env)
+		case "with-syntax":
+			return evalWithSyntax(e, env)
 		case "define-record-type":
 			return evalDefineRecordType(e, env)
 		case "letrec":
@@ -1058,7 +1107,8 @@ func isBuiltin(name string) bool {
 		"caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "cadddr",
 		"call/cc", "call-with-current-continuation",
 		"dynamic-wind",
-		"values", "call-with-values":
+		"values", "call-with-values",
+		"syntax->datum", "datum->syntax":
 		return true
 	}
 	return false
@@ -2198,6 +2248,23 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 			cur = cur.pair.cdr
 		}
 		return boolVal(false), nil
+
+	case "syntax->datum":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: syntax->datum: expected 1 argument", e.line, e.col)}
+		}
+		if args[0].kind != valSyntax {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: syntax->datum: expected syntax object", e.line, e.col)}
+		}
+		return quoteExpr(args[0].syntaxExpr), nil
+
+	case "datum->syntax":
+		if len(args) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: datum->syntax: expected 2 arguments", e.line, e.col)}
+		}
+		// First arg is a syntax object providing hygiene context (ignored for simplicity)
+		// Second arg is a datum to convert to syntax
+		return value{kind: valSyntax, syntaxExpr: valueToExpr(args[1])}, nil
 	}
 
 	return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", e.line, e.col, name)}
@@ -2862,11 +2929,25 @@ func evalDefineSyntax(e *expr, environ *env) (value, error) {
 	name := nameExpr.atom.sval
 
 	transformer := e.list[2]
+
+	// Check if transformer is a lambda (procedural macro / syntax-case style)
+	if transformer.kind == exprList && len(transformer.list) >= 1 &&
+		transformer.list[0].kind == exprAtom && transformer.list[0].atom.sval == "lambda" {
+		// Evaluate the lambda to get a closure
+		proc, err := evalInEnv(transformer, environ)
+		if err != nil {
+			return value{}, err
+		}
+		m := &macro{name: name, defEnv: environ, transformer: &proc}
+		environ.set(name, value{kind: valMacro, macro: m})
+		return voidVal, nil
+	}
+
 	if transformer.kind != exprList || len(transformer.list) < 2 {
-		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules", e.line, e.col)}
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules or lambda", e.line, e.col)}
 	}
 	if transformer.list[0].kind != exprAtom || transformer.list[0].atom.sval != "syntax-rules" {
-		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules", e.line, e.col)}
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules or lambda", e.line, e.col)}
 	}
 
 	// Parse (syntax-rules (literals...) clause ...)
@@ -2906,6 +2987,19 @@ func evalDefineSyntax(e *expr, environ *env) (value, error) {
 
 // expandMacro tries each rule in order; returns expanded AST expr.
 func expandMacro(m *macro, callExpr *expr, callEnv *env) (*expr, error) {
+	// Procedural (syntax-case) macro: call the transformer with the call form as a syntax object
+	if m.transformer != nil {
+		stxObj := value{kind: valSyntax, syntaxExpr: callExpr}
+		result, err := callValue(*m.transformer, []value{stxObj}, callExpr, callEnv)
+		if err != nil {
+			return nil, err
+		}
+		if result.kind != valSyntax {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: transformer must return a syntax object", callExpr.line, callExpr.col, m.name)}
+		}
+		return result.syntaxExpr, nil
+	}
+
 	args := callExpr.list[1:] // arguments to the macro call
 	for _, rule := range m.rules {
 		bindings := make(map[string][]*expr) // pattern var -> list of matched exprs
@@ -3060,6 +3154,212 @@ func collectTemplateIdents(tmpl *expr, patVars map[string]bool, renames map[stri
 	}
 }
 
+// ---------- syntax-case ----------
+
+// evalSyntaxCase implements (syntax-case stx-expr (literals...) clause ...)
+// Each clause is (pattern body) or (pattern fender body).
+func evalSyntaxCase(e *expr, environ *env) (value, error) {
+	if len(e.list) < 4 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-case: bad syntax", e.line, e.col)}
+	}
+	// Evaluate the syntax expression
+	stxVal, err := evalInEnv(e.list[1], environ)
+	if err != nil {
+		return value{}, err
+	}
+	if stxVal.kind != valSyntax {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-case: expected syntax object", e.line, e.col)}
+	}
+	stxExpr := stxVal.syntaxExpr
+
+	// Parse literals
+	litExpr := e.list[2]
+	if litExpr.kind != exprList {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-case: expected literal list", e.line, e.col)}
+	}
+	var literals []string
+	for _, l := range litExpr.list {
+		if l.kind == exprAtom && l.atom.kind == valSymbol {
+			literals = append(literals, l.atom.sval)
+		}
+	}
+
+	// Try each clause
+	for _, clause := range e.list[3:] {
+		if clause.kind != exprList || len(clause.list) < 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-case: bad clause", e.line, e.col)}
+		}
+		pat := clause.list[0]
+		var fender *expr
+		var body *expr
+		if len(clause.list) == 3 {
+			fender = clause.list[1]
+			body = clause.list[2]
+		} else {
+			body = clause.list[1]
+		}
+
+		// Pattern match the whole stxExpr against the pattern
+		bindings := make(map[string][]*expr)
+		if !matchSyntaxCasePattern(pat, stxExpr, literals, bindings) {
+			continue
+		}
+
+		// Check fender if present
+		if fender != nil {
+			fenderEnv := newEnv(environ)
+			fenderEnv.syntaxBindings = bindings
+			fv, ferr := evalInEnv(fender, fenderEnv)
+			if ferr != nil {
+				return value{}, ferr
+			}
+			if !isTruthy(fv) {
+				continue
+			}
+		}
+
+		// Create environment with syntax bindings and evaluate body
+		bodyEnv := newEnv(environ)
+		bodyEnv.syntaxBindings = bindings
+		return evalInEnv(body, bodyEnv)
+	}
+	return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-case: no matching pattern", e.line, e.col)}
+}
+
+// matchSyntaxCasePattern matches a pattern expression against a syntax object expression.
+// Unlike syntax-rules patterns, the pattern here includes the macro name position.
+func matchSyntaxCasePattern(pat *expr, stx *expr, literals []string, bindings map[string][]*expr) bool {
+	if pat.kind == exprAtom && pat.atom.kind == valSymbol {
+		name := pat.atom.sval
+		if name == "_" {
+			return true
+		}
+		if isLiteral(name, literals) {
+			return stx.kind == exprAtom && stx.atom.kind == valSymbol && stx.atom.sval == name
+		}
+		// Pattern variable - bind to the syntax expression
+		bindings[name] = []*expr{stx}
+		return true
+	}
+	if pat.kind == exprList && stx.kind == exprList {
+		return matchPattern(pat.list, stx.list, literals, bindings)
+	}
+	// Atom pattern must match atom syntax literally
+	if pat.kind == exprAtom && stx.kind == exprAtom {
+		return pat.atom.String() == stx.atom.String()
+	}
+	return false
+}
+
+// evalSyntaxForm implements (syntax template) — the #'(...) form.
+// Expands pattern variables from the enclosing syntax-case.
+func evalSyntaxForm(e *expr, environ *env) (value, error) {
+	if len(e.list) != 2 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: syntax: expected 1 argument", e.line, e.col)}
+	}
+	tmpl := e.list[1]
+
+	// Collect syntax bindings from environment
+	bindings := collectAllSyntaxBindings(environ)
+
+	// Expand the template with bindings, no hygiene renames needed for syntax-case
+	// (hygiene is handled by the scoping of let/lambda in the expanded code)
+	renames := make(map[string]string)
+	expanded := expandTemplate(tmpl, bindings, renames, e)
+	return value{kind: valSyntax, syntaxExpr: expanded}, nil
+}
+
+// collectAllSyntaxBindings walks the env chain collecting syntax bindings.
+func collectAllSyntaxBindings(e *env) map[string][]*expr {
+	result := make(map[string][]*expr)
+	for cur := e; cur != nil; cur = cur.parent {
+		if cur.syntaxBindings != nil {
+			for k, v := range cur.syntaxBindings {
+				if _, exists := result[k]; !exists {
+					result[k] = v
+				}
+			}
+		}
+	}
+	return result
+}
+
+// evalWithSyntax implements (with-syntax ((pat expr) ...) body ...)
+func evalWithSyntax(e *expr, environ *env) (value, error) {
+	if len(e.list) < 3 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: with-syntax: bad syntax", e.line, e.col)}
+	}
+	bindingsList := e.list[1]
+	if bindingsList.kind != exprList {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: with-syntax: expected binding list", e.line, e.col)}
+	}
+
+	bodyEnv := newEnv(environ)
+	bodyEnv.syntaxBindings = make(map[string][]*expr)
+
+	// Copy parent syntax bindings
+	for k, v := range collectAllSyntaxBindings(environ) {
+		bodyEnv.syntaxBindings[k] = v
+	}
+
+	for _, binding := range bindingsList.list {
+		if binding.kind != exprList || len(binding.list) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: with-syntax: bad binding", e.line, e.col)}
+		}
+		pat := binding.list[0]
+		exprVal, err := evalInEnv(binding.list[1], environ)
+		if err != nil {
+			return value{}, err
+		}
+		if exprVal.kind != valSyntax {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: with-syntax: expected syntax object", e.line, e.col)}
+		}
+		// Match pattern against syntax object
+		newBindings := make(map[string][]*expr)
+		if !matchSyntaxCasePattern(pat, exprVal.syntaxExpr, nil, newBindings) {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: with-syntax: pattern match failed", e.line, e.col)}
+		}
+		for k, v := range newBindings {
+			bodyEnv.syntaxBindings[k] = v
+		}
+	}
+
+	// Evaluate body expressions
+	var result value
+	for _, bodyExpr := range e.list[2:] {
+		var err error
+		result, err = evalInEnv(bodyExpr, bodyEnv)
+		if err != nil {
+			return value{}, err
+		}
+	}
+	return result, nil
+}
+
+// valueToExpr converts a value back to an AST expr (for datum->syntax).
+func valueToExpr(v value) *expr {
+	switch v.kind {
+	case valSymbol:
+		return &expr{kind: exprAtom, atom: v}
+	case valPair:
+		var elems []*expr
+		cur := v
+		for cur.kind == valPair {
+			elems = append(elems, valueToExpr(cur.pair.car))
+			cur = cur.pair.cdr
+		}
+		if cur.kind != valNull {
+			// Improper list — just append the cdr as last element
+			elems = append(elems, valueToExpr(cur))
+		}
+		return &expr{kind: exprList, list: elems}
+	case valNull:
+		return &expr{kind: exprList, list: nil}
+	default:
+		return &expr{kind: exprAtom, atom: v}
+	}
+}
+
 // ---------- define-record-type ----------
 
 func evalDefineRecordType(e *expr, environ *env) (value, error) {
@@ -3197,7 +3497,7 @@ var (
 
 func isSpecialForm(name string) bool {
 	switch name {
-	case "define", "set!", "if", "quote", "lambda", "and", "or", "let", "let*", "begin", "cond", "define-syntax", "define-record-type", "letrec", "letrec*", "case", "do", "case-lambda":
+	case "define", "set!", "if", "quote", "lambda", "and", "or", "let", "let*", "begin", "cond", "define-syntax", "define-record-type", "letrec", "letrec*", "case", "do", "case-lambda", "syntax-case", "syntax", "with-syntax":
 		return true
 	}
 	return false
@@ -3308,6 +3608,7 @@ func makeTopLevelEnv() *env {
 		"dynamic-wind",
 		"raise", "with-exception-handler",
 		"values", "call-with-values",
+		"syntax->datum", "datum->syntax",
 	}
 	for _, name := range builtins {
 		e.set(name, builtinVal(name))

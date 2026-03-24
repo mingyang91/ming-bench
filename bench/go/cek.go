@@ -497,6 +497,27 @@ func (m *cekM) stepEval() error {
 			return m.cekDo(e, environ, k)
 		case "guard":
 			return m.cekGuard(e, environ, k)
+		case "syntax-case":
+			v, err := evalSyntaxCase(e, environ)
+			if err != nil {
+				return err
+			}
+			m.setApply(v, k)
+			return nil
+		case "syntax":
+			v, err := evalSyntaxForm(e, environ)
+			if err != nil {
+				return err
+			}
+			m.setApply(v, k)
+			return nil
+		case "with-syntax":
+			v, err := evalWithSyntax(e, environ)
+			if err != nil {
+				return err
+			}
+			m.setApply(v, k)
+			return nil
 		}
 	}
 
