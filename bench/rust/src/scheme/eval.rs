@@ -5,6 +5,24 @@ use std::rc::Rc;
 use crate::scheme::EvalError;
 use crate::scheme::parser::{Expr, ExprKind, Span};
 
+thread_local! {
+    pub static OUTPUT_BUFFER: RefCell<String> = RefCell::new(String::new());
+}
+
+pub fn with_output_capture<F, T>(f: F) -> (T, String)
+where
+    F: FnOnce() -> T,
+{
+    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().clear());
+    let result = f();
+    let output = OUTPUT_BUFFER.with(|buf| buf.borrow().clone());
+    (result, output)
+}
+
+fn emit_output(s: &str) {
+    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().push_str(s));
+}
+
 fn fmt_span(span: Span) -> String {
     format!("{}:{}", span.line, span.col)
 }
@@ -30,6 +48,7 @@ pub enum Value {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
     Symbol(String),
     Pair(Box<Value>, Box<Value>),
     Nil,
@@ -48,6 +67,7 @@ impl PartialEq for Value {
             (Value::Integer(a), Value::Integer(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Nil, Value::Nil) => true,
             (Value::Void, Value::Void) => true,
@@ -59,12 +79,40 @@ impl PartialEq for Value {
 }
 
 impl Value {
+    /// write-style display (strings get quotes) — used for eval_str return values
     pub fn to_display(&self) -> String {
+        self.fmt_value(true)
+    }
+
+    /// display-style output (strings without quotes) — used for `display` builtin
+    pub fn to_display_output(&self) -> String {
+        self.fmt_value(false)
+    }
+
+    fn fmt_value(&self, write_mode: bool) -> String {
         match self {
             Value::Integer(n) => n.to_string(),
             Value::Boolean(true) => "#t".into(),
             Value::Boolean(false) => "#f".into(),
-            Value::Str(s) => format!("\"{}\"", s),
+            Value::Str(s) => {
+                if write_mode {
+                    format!("\"{}\"", s)
+                } else {
+                    s.clone()
+                }
+            }
+            Value::Char(c) => {
+                if write_mode {
+                    match c {
+                        ' ' => "#\\space".into(),
+                        '\n' => "#\\newline".into(),
+                        '\t' => "#\\tab".into(),
+                        _ => format!("#\\{}", c),
+                    }
+                } else {
+                    c.to_string()
+                }
+            }
             Value::Symbol(s) => s.clone(),
             Value::Nil => "()".into(),
             Value::Pair(_, _) => {
@@ -76,13 +124,13 @@ impl Value {
                         Value::Pair(car, cdr) => {
                             if !first { out.push(' '); }
                             first = false;
-                            out.push_str(&car.to_display());
+                            out.push_str(&car.fmt_value(write_mode));
                             cur = cdr;
                         }
                         Value::Nil => break,
                         other => {
                             out.push_str(" . ");
-                            out.push_str(&other.to_display());
+                            out.push_str(&other.fmt_value(write_mode));
                             break;
                         }
                     }
@@ -115,7 +163,11 @@ impl Env {
         let mut bindings = HashMap::new();
         for name in ["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
                      "cons", "car", "cdr", "null?", "list", "length", "append",
-                     "pair?", "number?", "string?", "boolean?", "symbol?"] {
+                     "pair?", "number?", "string?", "boolean?", "symbol?", "char?",
+                     "display", "write", "newline",
+                     "string-append", "string-length", "substring",
+                     "string->number", "number->string",
+                     "symbol->string", "string->symbol", "string-ref"] {
             bindings.insert(name.to_string(), Value::Builtin(name.to_string()));
         }
         Env(Rc::new(RefCell::new(EnvInner {
@@ -589,6 +641,89 @@ fn apply_builtin(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
         "symbol?" => {
             if args.len() != 1 { return Err(EvalError::Arity("symbol? requires 1 argument".into())); }
             Ok(Value::Boolean(matches!(args[0], Value::Symbol(_))))
+        }
+        "char?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("char? requires 1 argument".into())); }
+            Ok(Value::Boolean(matches!(args[0], Value::Char(_))))
+        }
+        "display" => {
+            if args.len() != 1 { return Err(EvalError::Arity("display requires 1 argument".into())); }
+            emit_output(&args[0].to_display_output());
+            Ok(Value::Void)
+        }
+        "write" => {
+            if args.len() != 1 { return Err(EvalError::Arity("write requires 1 argument".into())); }
+            emit_output(&args[0].to_display());
+            Ok(Value::Void)
+        }
+        "newline" => {
+            if !args.is_empty() { return Err(EvalError::Arity("newline requires 0 arguments".into())); }
+            emit_output("\n");
+            Ok(Value::Void)
+        }
+        "string-append" => {
+            let mut result = String::new();
+            for a in args {
+                match a {
+                    Value::Str(s) => result.push_str(s),
+                    _ => return Err(EvalError::Type("string-append: expected string".into())),
+                }
+            }
+            Ok(Value::Str(result))
+        }
+        "string-length" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string-length requires 1 argument".into())); }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Integer(s.len() as i64)),
+                _ => Err(EvalError::Type("string-length: expected string".into())),
+            }
+        }
+        "substring" => {
+            if args.len() != 3 { return Err(EvalError::Arity("substring requires 3 arguments".into())); }
+            let s = match &args[0] { Value::Str(s) => s, _ => return Err(EvalError::Type("substring: expected string".into())) };
+            let start = expect_int(&args[1])? as usize;
+            let end = expect_int(&args[2])? as usize;
+            if end > s.len() || start > end {
+                return Err(EvalError::Runtime("substring: index out of range".into()));
+            }
+            Ok(Value::Str(s[start..end].to_string()))
+        }
+        "string->number" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string->number requires 1 argument".into())); }
+            match &args[0] {
+                Value::Str(s) => match s.parse::<i64>() {
+                    Ok(n) => Ok(Value::Integer(n)),
+                    Err(_) => Ok(Value::Boolean(false)),
+                },
+                _ => Err(EvalError::Type("string->number: expected string".into())),
+            }
+        }
+        "number->string" => {
+            if args.len() != 1 { return Err(EvalError::Arity("number->string requires 1 argument".into())); }
+            Ok(Value::Str(expect_int(&args[0])?.to_string()))
+        }
+        "symbol->string" => {
+            if args.len() != 1 { return Err(EvalError::Arity("symbol->string requires 1 argument".into())); }
+            match &args[0] {
+                Value::Symbol(s) => Ok(Value::Str(s.clone())),
+                _ => Err(EvalError::Type("symbol->string: expected symbol".into())),
+            }
+        }
+        "string->symbol" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string->symbol requires 1 argument".into())); }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Symbol(s.clone())),
+                _ => Err(EvalError::Type("string->symbol: expected string".into())),
+            }
+        }
+        "string-ref" => {
+            if args.len() != 2 { return Err(EvalError::Arity("string-ref requires 2 arguments".into())); }
+            let s = match &args[0] { Value::Str(s) => s, _ => return Err(EvalError::Type("string-ref: expected string".into())) };
+            let idx = expect_int(&args[1])? as usize;
+            if idx >= s.len() {
+                return Err(EvalError::Runtime("string-ref: index out of range".into()));
+            }
+            Ok(Value::Char(s.as_bytes()[idx] as char))
         }
         _ => Err(EvalError::Runtime(format!("unknown builtin: {}", name))),
     }
