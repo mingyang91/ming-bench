@@ -24,8 +24,17 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let exprs = parser::parse(input)?;
+    let env = Env::default_env();
+    let (result, output) = eval::with_output_capture(|| {
+        let mut result = value::Value::unpos(ValueKind::Void);
+        for expr in exprs {
+            result = eval::eval(&expr, &env)?;
+        }
+        Ok(result.to_display())
+    });
+    Ok((result?, output))
 }
 
 #[cfg(test)]

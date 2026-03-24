@@ -36,7 +36,11 @@ impl Env {
         let env = Env::new(None);
         for name in &["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
                       "cons", "car", "cdr", "null?", "list", "length", "append",
-                      "string?", "number?", "boolean?", "pair?", "symbol?"] {
+                      "string?", "number?", "boolean?", "pair?", "symbol?", "char?",
+                      "display", "write", "newline",
+                      "string-append", "string-length", "substring",
+                      "string->number", "number->string",
+                      "symbol->string", "string->symbol", "string-ref"] {
             env.set(name.to_string(), Value::unpos(ValueKind::Symbol(name.to_string())));
         }
         env

@@ -1,8 +1,27 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::scheme::env::Env;
 use crate::scheme::value::{Value, ValueKind, Pos};
 use crate::scheme::EvalError;
+
+thread_local! {
+    static OUTPUT_BUFFER: RefCell<String> = RefCell::new(String::new());
+}
+
+pub fn with_output_capture<F, T>(f: F) -> (T, String)
+where
+    F: FnOnce() -> T,
+{
+    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().clear());
+    let result = f();
+    let output = OUTPUT_BUFFER.with(|buf| buf.borrow().clone());
+    (result, output)
+}
+
+fn push_output(s: &str) {
+    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().push_str(s));
+}
 
 fn fmt_pos(pos: Pos) -> String {
     format!("{}:{}", pos.0, pos.1)
@@ -10,7 +29,7 @@ fn fmt_pos(pos: Pos) -> String {
 
 pub fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
     match &expr.kind {
-        ValueKind::Integer(_) | ValueKind::Boolean(_) | ValueKind::Str(_) => Ok(expr.clone()),
+        ValueKind::Integer(_) | ValueKind::Boolean(_) | ValueKind::Str(_) | ValueKind::Char(_) => Ok(expr.clone()),
         ValueKind::Lambda { .. } => Ok(expr.clone()),
         ValueKind::Symbol(name) => {
             env.get(name).ok_or_else(|| EvalError::UnboundVariable(
@@ -421,6 +440,120 @@ fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, Eva
         "symbol?" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("symbol? requires 1 argument at {}", fmt_pos(call_pos)))); }
             Ok(Value::unpos(ValueKind::Boolean(matches!(&args[0].kind, ValueKind::Symbol(_)))))
+        }
+        "display" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("display requires 1 argument at {}", fmt_pos(call_pos))));
+            }
+            push_output(&args[0].to_display_output());
+            Ok(Value::unpos(ValueKind::Void))
+        }
+        "write" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("write requires 1 argument at {}", fmt_pos(call_pos))));
+            }
+            push_output(&args[0].to_write_output());
+            Ok(Value::unpos(ValueKind::Void))
+        }
+        "newline" => {
+            if !args.is_empty() {
+                return Err(EvalError::Arity(format!("newline takes 0 arguments at {}", fmt_pos(call_pos))));
+            }
+            push_output("\n");
+            Ok(Value::unpos(ValueKind::Void))
+        }
+        "string-append" => {
+            let mut result = String::new();
+            for a in args {
+                match &a.kind {
+                    ValueKind::Str(s) => result.push_str(s),
+                    _ => return Err(EvalError::Type(format!("string-append: not a string at {}", fmt_pos(call_pos)))),
+                }
+            }
+            Ok(Value::unpos(ValueKind::Str(result)))
+        }
+        "string-length" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("string-length requires 1 argument at {}", fmt_pos(call_pos))));
+            }
+            match &args[0].kind {
+                ValueKind::Str(s) => Ok(Value::unpos(ValueKind::Integer(s.len() as i64))),
+                _ => Err(EvalError::Type(format!("string-length: not a string at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "substring" => {
+            if args.len() != 3 {
+                return Err(EvalError::Arity(format!("substring requires 3 arguments at {}", fmt_pos(call_pos))));
+            }
+            let s = match &args[0].kind {
+                ValueKind::Str(s) => s,
+                _ => return Err(EvalError::Type(format!("substring: not a string at {}", fmt_pos(call_pos)))),
+            };
+            let start = args[1].as_integer().ok_or_else(|| EvalError::Type(format!("substring: not a number at {}", fmt_pos(call_pos))))? as usize;
+            let end = args[2].as_integer().ok_or_else(|| EvalError::Type(format!("substring: not a number at {}", fmt_pos(call_pos))))? as usize;
+            if start > end || end > s.len() {
+                return Err(EvalError::Runtime(format!("substring: index out of range at {}", fmt_pos(call_pos))));
+            }
+            Ok(Value::unpos(ValueKind::Str(s[start..end].to_string())))
+        }
+        "string->number" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("string->number requires 1 argument at {}", fmt_pos(call_pos))));
+            }
+            match &args[0].kind {
+                ValueKind::Str(s) => {
+                    match s.parse::<i64>() {
+                        Ok(n) => Ok(Value::unpos(ValueKind::Integer(n))),
+                        Err(_) => Ok(Value::unpos(ValueKind::Boolean(false))),
+                    }
+                }
+                _ => Err(EvalError::Type(format!("string->number: not a string at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "number->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("number->string requires 1 argument at {}", fmt_pos(call_pos))));
+            }
+            let n = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("number->string: not a number at {}", fmt_pos(call_pos))))?;
+            Ok(Value::unpos(ValueKind::Str(n.to_string())))
+        }
+        "symbol->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("symbol->string requires 1 argument at {}", fmt_pos(call_pos))));
+            }
+            match &args[0].kind {
+                ValueKind::Symbol(s) => Ok(Value::unpos(ValueKind::Str(s.clone()))),
+                _ => Err(EvalError::Type(format!("symbol->string: not a symbol at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "string->symbol" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("string->symbol requires 1 argument at {}", fmt_pos(call_pos))));
+            }
+            match &args[0].kind {
+                ValueKind::Str(s) => Ok(Value::unpos(ValueKind::Symbol(s.clone()))),
+                _ => Err(EvalError::Type(format!("string->symbol: not a string at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "string-ref" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("string-ref requires 2 arguments at {}", fmt_pos(call_pos))));
+            }
+            let s = match &args[0].kind {
+                ValueKind::Str(s) => s,
+                _ => return Err(EvalError::Type(format!("string-ref: not a string at {}", fmt_pos(call_pos)))),
+            };
+            let idx = args[1].as_integer().ok_or_else(|| EvalError::Type(format!("string-ref: not a number at {}", fmt_pos(call_pos))))? as usize;
+            if idx >= s.len() {
+                return Err(EvalError::Runtime(format!("string-ref: index out of range at {}", fmt_pos(call_pos))));
+            }
+            Ok(Value::unpos(ValueKind::Char(s.as_bytes()[idx] as char)))
+        }
+        "char?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("char? requires 1 argument at {}", fmt_pos(call_pos))));
+            }
+            Ok(Value::unpos(ValueKind::Boolean(matches!(&args[0].kind, ValueKind::Char(_)))))
         }
         _ => Err(EvalError::UnboundVariable(format!("{} at {}", name, fmt_pos(call_pos)))),
     }

@@ -10,6 +10,7 @@ pub enum ValueKind {
     Boolean(bool),
     Str(String),
     Symbol(String),
+    Char(char),
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
@@ -45,6 +46,11 @@ impl Value {
             ValueKind::Boolean(false) => "#f".to_string(),
             ValueKind::Str(s) => format!("\"{}\"", s),
             ValueKind::Symbol(s) => s.clone(),
+            ValueKind::Char(c) => format!("#\\{}", match *c {
+                ' ' => "space".to_string(),
+                '\n' => "newline".to_string(),
+                ch => ch.to_string(),
+            }),
             ValueKind::List(elems) => {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_display()).collect();
                 format!("({})", inner.join(" "))
@@ -52,6 +58,24 @@ impl Value {
             ValueKind::Lambda { .. } => "#<procedure>".to_string(),
             ValueKind::Void => "".to_string(),
         }
+    }
+
+    /// Format for `display` — strings without quotes, chars as raw characters
+    pub fn to_display_output(&self) -> String {
+        match &self.kind {
+            ValueKind::Str(s) => s.clone(),
+            ValueKind::Char(c) => c.to_string(),
+            ValueKind::List(elems) => {
+                let inner: Vec<String> = elems.iter().map(|v| v.to_display()).collect();
+                format!("({})", inner.join(" "))
+            }
+            _ => self.to_display(),
+        }
+    }
+
+    /// Format for `write` — strings with quotes (same as to_display for most types)
+    pub fn to_write_output(&self) -> String {
+        self.to_display()
     }
 
     pub fn as_integer(&self) -> Option<i64> {
@@ -70,6 +94,7 @@ impl PartialEq for Value {
             (ValueKind::Boolean(a), ValueKind::Boolean(b)) => a == b,
             (ValueKind::Str(a), ValueKind::Str(b)) => a == b,
             (ValueKind::Symbol(a), ValueKind::Symbol(b)) => a == b,
+            (ValueKind::Char(a), ValueKind::Char(b)) => a == b,
             (ValueKind::List(a), ValueKind::List(b)) => a == b,
             (ValueKind::Void, ValueKind::Void) => true,
             _ => false,
