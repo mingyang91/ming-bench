@@ -22,6 +22,7 @@ const (
 	valLambda
 	valChar
 	valBuiltin
+	valMacro
 )
 
 type pair struct {
@@ -36,6 +37,18 @@ type lambda struct {
 	env       *env
 }
 
+type syntaxRule struct {
+	pattern  []*expr // pattern elements after the macro name
+	template *expr
+}
+
+type macro struct {
+	name     string
+	literals []string
+	rules    []syntaxRule
+	defEnv   *env // definition-site environment for hygiene
+}
+
 type value struct {
 	kind   valueKind
 	ival   int64
@@ -44,6 +57,7 @@ type value struct {
 	cval   rune
 	pair   *pair
 	lambda *lambda
+	macro  *macro
 	mstr   *[]rune // mutable string buffer (set by string-copy)
 }
 
@@ -510,6 +524,19 @@ func evalInEnv(e *expr, env *env) (value, error) {
 			return evalBegin(e, env)
 		case "cond":
 			return evalCond(e, env)
+		case "define-syntax":
+			return evalDefineSyntax(e, env)
+		}
+	}
+
+	// Check for macro application
+	if head.kind == exprAtom && head.atom.kind == valSymbol {
+		if v, ok := env.get(head.atom.sval); ok && v.kind == valMacro {
+			expanded, err := expandMacro(v.macro, e, env)
+			if err != nil {
+				return value{}, err
+			}
+			return evalInEnv(expanded, env)
 		}
 	}
 
@@ -1623,6 +1650,304 @@ func evalCond(e *expr, env *env) (value, error) {
 
 func builtinVal(name string) value {
 	return value{kind: valBuiltin, sval: name}
+}
+
+// ---------- Macros (syntax-rules) ----------
+
+var macroCounter int
+
+func freshName(base string) string {
+	macroCounter++
+	return fmt.Sprintf("%s@@%d", base, macroCounter)
+}
+
+func evalDefineSyntax(e *expr, environ *env) (value, error) {
+	if len(e.list) != 3 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: bad syntax", e.line, e.col)}
+	}
+	nameExpr := e.list[1]
+	if nameExpr.kind != exprAtom || nameExpr.atom.kind != valSymbol {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected symbol", e.line, e.col)}
+	}
+	name := nameExpr.atom.sval
+
+	transformer := e.list[2]
+	if transformer.kind != exprList || len(transformer.list) < 2 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules", e.line, e.col)}
+	}
+	if transformer.list[0].kind != exprAtom || transformer.list[0].atom.sval != "syntax-rules" {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules", e.line, e.col)}
+	}
+
+	// Parse (syntax-rules (literals...) clause ...)
+	if len(transformer.list) < 2 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-rules: bad syntax", e.line, e.col)}
+	}
+	litExpr := transformer.list[1]
+	if litExpr.kind != exprList {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-rules: expected literal list", e.line, e.col)}
+	}
+	var literals []string
+	for _, l := range litExpr.list {
+		if l.kind != exprAtom || l.atom.kind != valSymbol {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-rules: literals must be identifiers", e.line, e.col)}
+		}
+		literals = append(literals, l.atom.sval)
+	}
+
+	var rules []syntaxRule
+	for _, clause := range transformer.list[2:] {
+		if clause.kind != exprList || len(clause.list) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-rules: bad clause", e.line, e.col)}
+		}
+		pat := clause.list[0]
+		tmpl := clause.list[1]
+		if pat.kind != exprList || len(pat.list) == 0 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-rules: pattern must be a list", e.line, e.col)}
+		}
+		// pat.list[0] is the macro name placeholder, rest is the pattern
+		rules = append(rules, syntaxRule{pattern: pat.list[1:], template: tmpl})
+	}
+
+	m := &macro{name: name, literals: literals, rules: rules, defEnv: environ}
+	environ.set(name, value{kind: valMacro, macro: m})
+	return voidVal, nil
+}
+
+// expandMacro tries each rule in order; returns expanded AST expr.
+func expandMacro(m *macro, callExpr *expr, callEnv *env) (*expr, error) {
+	args := callExpr.list[1:] // arguments to the macro call
+	for _, rule := range m.rules {
+		bindings := make(map[string][]*expr) // pattern var -> list of matched exprs
+		if matchPattern(rule.pattern, args, m.literals, bindings) {
+			// Build rename map for hygiene: any template-introduced identifier
+			// that is not a pattern variable gets renamed.
+			patVars := collectPatternVars(rule.pattern, m.literals)
+			renames := make(map[string]string) // original -> fresh
+			collectTemplateIdents(rule.template, patVars, renames, m.defEnv)
+			// Create bindings in defEnv for renamed identifiers
+			hygieneEnv := newEnv(m.defEnv)
+			for orig, fresh := range renames {
+				if v, ok := m.defEnv.get(orig); ok {
+					hygieneEnv.set(fresh, v)
+				}
+			}
+			// Also alias renamed identifiers in callEnv so set!/get works
+			for orig, fresh := range renames {
+				// The renamed ident should resolve in the *call* environment only
+				// if it was defined there. For definition-site hygiene, we install
+				// in callEnv pointing to the defEnv value.
+				if v, ok := m.defEnv.get(orig); ok {
+					callEnv.set(fresh, v)
+				}
+			}
+			expanded := expandTemplate(rule.template, bindings, renames, callExpr)
+			return expanded, nil
+		}
+	}
+	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: no matching pattern", callExpr.line, callExpr.col, m.name)}
+}
+
+// matchPattern matches a pattern against args. pattern and args are slices of *expr.
+// bindings maps pattern variable names to matched expressions.
+func matchPattern(pattern []*expr, args []*expr, literals []string, bindings map[string][]*expr) bool {
+	pi := 0
+	ai := 0
+	for pi < len(pattern) {
+		// Check for ellipsis: current pattern element followed by ...
+		if pi+1 < len(pattern) && isEllipsis(pattern[pi+1]) {
+			patVar := pattern[pi]
+			if patVar.kind != exprAtom || patVar.atom.kind != valSymbol {
+				return false
+			}
+			varName := patVar.atom.sval
+			// Collect remaining args (greedy, since ellipsis is typically last)
+			// Number of remaining required pattern elements after the ellipsis
+			remaining := len(pattern) - pi - 2
+			available := len(args) - ai - remaining
+			if available < 0 {
+				return false
+			}
+			var matched []*expr
+			for i := 0; i < available; i++ {
+				matched = append(matched, args[ai+i])
+			}
+			bindings[varName] = matched
+			ai += available
+			pi += 2 // skip pattern var and ellipsis
+			continue
+		}
+
+		if ai >= len(args) {
+			return false
+		}
+
+		pat := pattern[pi]
+		arg := args[ai]
+
+		if pat.kind == exprAtom && pat.atom.kind == valSymbol {
+			name := pat.atom.sval
+			if isLiteral(name, literals) {
+				// Must match literally
+				if arg.kind != exprAtom || arg.atom.kind != valSymbol || arg.atom.sval != name {
+					return false
+				}
+			} else if name == "_" {
+				// Wildcard, matches anything
+			} else {
+				// Pattern variable
+				bindings[name] = []*expr{arg}
+			}
+		} else if pat.kind == exprList && arg.kind == exprList {
+			// Recursively match sub-patterns
+			if !matchPattern(pat.list, arg.list, literals, bindings) {
+				return false
+			}
+		} else {
+			return false
+		}
+		pi++
+		ai++
+	}
+	return ai == len(args)
+}
+
+func isEllipsis(e *expr) bool {
+	return e.kind == exprAtom && e.atom.kind == valSymbol && e.atom.sval == "..."
+}
+
+func isLiteral(name string, literals []string) bool {
+	for _, l := range literals {
+		if l == name {
+			return true
+		}
+	}
+	return false
+}
+
+// collectPatternVars returns the set of pattern variable names.
+func collectPatternVars(pattern []*expr, literals []string) map[string]bool {
+	vars := make(map[string]bool)
+	for i, p := range pattern {
+		if isEllipsis(p) {
+			continue
+		}
+		_ = i
+		if p.kind == exprAtom && p.atom.kind == valSymbol {
+			name := p.atom.sval
+			if !isLiteral(name, literals) && name != "_" && name != "..." {
+				vars[name] = true
+			}
+		} else if p.kind == exprList {
+			for k, v := range collectPatternVars(p.list, literals) {
+				vars[k] = v
+			}
+		}
+	}
+	return vars
+}
+
+// collectTemplateIdents finds identifiers in the template that are NOT pattern variables
+// and creates fresh renames for them (hygiene).
+func collectTemplateIdents(tmpl *expr, patVars map[string]bool, renames map[string]string, defEnv *env) {
+	if tmpl.kind == exprAtom && tmpl.atom.kind == valSymbol {
+		name := tmpl.atom.sval
+		if !patVars[name] && name != "..." && !isSpecialForm(name) && !isBuiltin(name) {
+			// Only rename if the identifier is bound in the definition env
+			// (i.e., it refers to a definition-site binding worth preserving)
+			if _, bound := defEnv.get(name); bound {
+				if _, already := renames[name]; !already {
+					renames[name] = freshName(name)
+				}
+			}
+		}
+		return
+	}
+	if tmpl.kind == exprList {
+		for _, child := range tmpl.list {
+			collectTemplateIdents(child, patVars, renames, defEnv)
+		}
+	}
+}
+
+func isSpecialForm(name string) bool {
+	switch name {
+	case "define", "set!", "if", "quote", "lambda", "and", "or", "let", "begin", "cond", "define-syntax":
+		return true
+	}
+	return false
+}
+
+// expandTemplate substitutes pattern variables and applies renames.
+func expandTemplate(tmpl *expr, bindings map[string][]*expr, renames map[string]string, callExpr *expr) *expr {
+	if tmpl.kind == exprAtom {
+		if tmpl.atom.kind == valSymbol {
+			name := tmpl.atom.sval
+			// Pattern variable (non-ellipsis context)
+			if vals, ok := bindings[name]; ok && len(vals) == 1 {
+				return vals[0]
+			}
+			// Hygiene rename
+			if fresh, ok := renames[name]; ok {
+				return &expr{kind: exprAtom, atom: symVal(fresh), line: callExpr.line, col: callExpr.col}
+			}
+		}
+		return tmpl
+	}
+
+	// List template
+	var result []*expr
+	for i := 0; i < len(tmpl.list); i++ {
+		child := tmpl.list[i]
+		// Check if next element is ellipsis
+		if i+1 < len(tmpl.list) && isEllipsis(tmpl.list[i+1]) {
+			// Expand the ellipsis pattern
+			expanded := expandEllipsis(child, bindings, renames, callExpr)
+			result = append(result, expanded...)
+			i++ // skip ellipsis
+			continue
+		}
+		result = append(result, expandTemplate(child, bindings, renames, callExpr))
+	}
+	return &expr{kind: exprList, list: result, line: callExpr.line, col: callExpr.col}
+}
+
+// expandEllipsis expands a template element that is followed by ...
+func expandEllipsis(tmpl *expr, bindings map[string][]*expr, renames map[string]string, callExpr *expr) []*expr {
+	// Find the ellipsis variable in this template
+	ellipsisVar := findEllipsisVar(tmpl, bindings)
+	if ellipsisVar == "" {
+		return nil
+	}
+	vals := bindings[ellipsisVar]
+	var result []*expr
+	for i := range vals {
+		// Create a single-element binding for this iteration
+		iterBindings := make(map[string][]*expr)
+		for k, v := range bindings {
+			iterBindings[k] = v
+		}
+		iterBindings[ellipsisVar] = []*expr{vals[i]}
+		result = append(result, expandTemplate(tmpl, iterBindings, renames, callExpr))
+	}
+	return result
+}
+
+// findEllipsisVar finds the pattern variable in a template that has multiple bindings.
+func findEllipsisVar(tmpl *expr, bindings map[string][]*expr) string {
+	if tmpl.kind == exprAtom && tmpl.atom.kind == valSymbol {
+		if _, ok := bindings[tmpl.atom.sval]; ok {
+			return tmpl.atom.sval
+		}
+	}
+	if tmpl.kind == exprList {
+		for _, child := range tmpl.list {
+			if v := findEllipsisVar(child, bindings); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
 }
 
 func makeTopLevelEnv() *env {
