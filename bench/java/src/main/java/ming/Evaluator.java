@@ -107,10 +107,13 @@ public class Evaluator {
     // Internal string wrapper to distinguish from symbols (mutable for string-set!)
     static class SchemeString {
         private char[] chars;
+        private boolean immutable;
         SchemeString(String value) { this.chars = value.toCharArray(); }
+        SchemeString(String value, boolean immutable) { this.chars = value.toCharArray(); this.immutable = immutable; }
         String value() { return new String(chars); }
         char charAt(int i) { return chars[i]; }
         int length() { return chars.length; }
+        boolean isImmutable() { return immutable; }
         void setChar(int i, char c) { chars[i] = c; }
         SchemeString copy() { return new SchemeString(value()); }
     }
@@ -219,6 +222,7 @@ public class Evaluator {
         "symbol->string", "string->symbol",
         "string-ref", "char?",
         "string-set!", "string-copy",
+        "string->list", "list->string", "char->integer", "integer->char",
         "apply",
         // L09
         "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
@@ -297,7 +301,7 @@ public class Evaluator {
                     i++; col++;
                 }
                 if (i < input.length()) { i++; col++; } // skip closing quote
-                tokens.add(new SchemeString(sb.toString()));
+                tokens.add(new SchemeString(sb.toString(), true));
                 tokenPositions.add(startPos);
             } else if (c == '#') {
                 Pos startPos = new Pos(line, col);
@@ -1220,7 +1224,7 @@ public class Evaluator {
             case "symbol->string" -> {
                 requireArgCount(op, args, 1);
                 if (!(args.get(0) instanceof String sym)) throw new EvalError(posStr() + "symbol->string: not a symbol");
-                return new SchemeString(sym);
+                return new SchemeString(sym, true);
             }
             case "string->symbol" -> {
                 requireArgCount(op, args, 1);
@@ -1236,8 +1240,10 @@ public class Evaluator {
             case "string-set!" -> {
                 requireArgCount(op, args, 3);
                 if (!(args.get(0) instanceof SchemeString s)) throw new EvalError(posStr() + "string-set!: not a string");
+                if (s.isImmutable()) throw new EvalError(posStr() + "string-set!: string is immutable");
                 int idx = (int) requireLong(args.get(1));
                 if (!(args.get(2) instanceof SchemeChar c)) throw new EvalError(posStr() + "string-set!: not a character");
+                if (idx < 0 || idx >= s.length()) throw new EvalError(posStr() + "string-set!: index out of range");
                 s.setChar(idx, c.value());
                 return VOID;
             }
@@ -1245,6 +1251,37 @@ public class Evaluator {
                 requireArgCount(op, args, 1);
                 if (!(args.get(0) instanceof SchemeString s)) throw new EvalError(posStr() + "string-copy: not a string");
                 return s.copy();
+            }
+            case "string->list" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError(posStr() + "string->list: not a string");
+                Object result = NIL;
+                for (int i = s.length() - 1; i >= 0; i--) {
+                    result = new Pair(new SchemeChar(s.charAt(i)), result);
+                }
+                return result;
+            }
+            case "list->string" -> {
+                requireArgCount(op, args, 1);
+                StringBuilder sb = new StringBuilder();
+                Object cur = args.get(0);
+                while (cur instanceof Pair pair) {
+                    if (!(pair.car() instanceof SchemeChar c)) throw new EvalError(posStr() + "list->string: not a character");
+                    sb.append(c.value());
+                    cur = pair.cdr();
+                }
+                if (cur != NIL) throw new EvalError(posStr() + "list->string: not a proper list");
+                return new SchemeString(sb.toString());
+            }
+            case "char->integer" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError(posStr() + "char->integer: not a character");
+                return (long) c.value();
+            }
+            case "integer->char" -> {
+                requireArgCount(op, args, 1);
+                long n = requireLong(args.get(0));
+                return new SchemeChar((char) n);
             }
             case "apply" -> {
                 if (args.size() < 2) throw new EvalError(posStr() + "apply: requires at least 2 arguments");
