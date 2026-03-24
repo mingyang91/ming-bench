@@ -79,27 +79,41 @@ object Evaluator:
     case Str(chars) => new String(chars)
     case _          => throw new EvalError(s"not a string: ${Display.write(v)}")
 
-  // --- Output capture ---
-  private[ming] val outputBuffer = new StringBuilder
+  // --- Thread-local interpreter state (each thread gets its own) ---
 
-  // --- Mutable string tracking ---
-  private[ming] val mutableStrings: java.util.Set[Array[Char]] =
-    java.util.Collections.newSetFromMap(
-      new java.util.IdentityHashMap[Array[Char], java.lang.Boolean]()
+  private val _outputBuffer: ThreadLocal[StringBuilder] =
+    ThreadLocal.withInitial(() => new StringBuilder)
+  private[ming] def outputBuffer: StringBuilder = _outputBuffer.get()
+
+  private val _mutableStrings: ThreadLocal[java.util.Set[Array[Char]]] =
+    ThreadLocal.withInitial(() =>
+      java.util.Collections.newSetFromMap(
+        new java.util.IdentityHashMap[Array[Char], java.lang.Boolean]()
+      )
     )
+  private[ming] def mutableStrings: java.util.Set[Array[Char]] = _mutableStrings.get()
 
-  // --- dynamic-wind winding stack ---
-  private[ming] var windingStack: List[(Val, Val)] = List.empty
+  private val _windingStack: ThreadLocal[List[(Val, Val)]] =
+    ThreadLocal.withInitial(() => List.empty)
+  private[ming] def windingStack: List[(Val, Val)] = _windingStack.get()
+  private[ming] def windingStack_=(v: List[(Val, Val)]): Unit = _windingStack.set(v)
 
-  // --- exception handler stack ---
-  private[ming] var raiseHandlers: List[Val => Bounce] = List.empty
+  private val _raiseHandlers: ThreadLocal[List[Val => Bounce]] =
+    ThreadLocal.withInitial(() => List.empty)
+  private[ming] def raiseHandlers: List[Val => Bounce] = _raiseHandlers.get()
+  private[ming] def raiseHandlers_=(v: List[Val => Bounce]): Unit = _raiseHandlers.set(v)
 
-  // --- Step limiting ---
-  private[ming] var stepLimit: Long = -1L
-  private[ming] var stepCount: Long = 0L
+  private val _stepLimit: ThreadLocal[Long] = ThreadLocal.withInitial(() => -1L)
+  private[ming] def stepLimit: Long = _stepLimit.get()
+  private[ming] def stepLimit_=(v: Long): Unit = _stepLimit.set(v)
 
-  // --- Position tracking ---
-  private[ming] var lastPos = "1:1"
+  private val _stepCount: ThreadLocal[Long] = ThreadLocal.withInitial(() => 0L)
+  private[ming] def stepCount: Long = _stepCount.get()
+  private[ming] def stepCount_=(v: Long): Unit = _stepCount.set(v)
+
+  private val _lastPos: ThreadLocal[String] = ThreadLocal.withInitial(() => "1:1")
+  private[ming] def lastPos: String = _lastPos.get()
+  private[ming] def lastPos_=(v: String): Unit = _lastPos.set(v)
 
   private[ming] def error(msg: String): Nothing =
     throw new EvalError(s"$lastPos: $msg")
@@ -138,7 +152,7 @@ object Evaluator:
         case BDone(v) => return v
         case BMore(thunk) =>
           if stepLimit >= 0 then
-            stepCount += 1
+            stepCount = stepCount + 1
             if stepCount > stepLimit then
               throw new EvalError("step limit exceeded")
           try b = thunk()
