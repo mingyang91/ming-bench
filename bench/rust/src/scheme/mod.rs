@@ -323,65 +323,95 @@ pub(super) const BUILTINS: &[&str] = &[
     "for-each",
 ];
 
+// ---------- Trampoline for TCO ----------
+
+enum Tramp {
+    Val(Value),
+    Tail(Expr, Env),
+}
+
 fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    let mut t = eval_tc(expr, env, output)?;
+    loop {
+        match t {
+            Tramp::Val(v) => return Ok(v),
+            Tramp::Tail(e, nenv) => t = eval_tc(&e, &nenv, output)?,
+        }
+    }
+}
+
+fn eval_tc(expr: &Expr, env: &Env, output: &mut String) -> Result<Tramp, EvalError> {
     let p = expr.pos();
     match expr {
-        Expr::Integer(n, _) => Ok(Value::Integer(*n)),
-        Expr::Float(f, _) => Ok(Value::Float(*f)),
-        Expr::Rational(n, d, _) => Ok(make_rational(*n, *d)),
-        Expr::Boolean(b, _) => Ok(Value::Boolean(*b)),
-        Expr::Str(s, _) => Ok(Value::Str(s.clone())),
-        Expr::Char(c, _) => Ok(Value::Char(*c)),
+        Expr::Integer(n, _) => Ok(Tramp::Val(Value::Integer(*n))),
+        Expr::Float(f, _) => Ok(Tramp::Val(Value::Float(*f))),
+        Expr::Rational(n, d, _) => Ok(Tramp::Val(make_rational(*n, *d))),
+        Expr::Boolean(b, _) => Ok(Tramp::Val(Value::Boolean(*b))),
+        Expr::Str(s, _) => Ok(Tramp::Val(Value::Str(s.clone()))),
+        Expr::Char(c, _) => Ok(Tramp::Val(Value::Char(*c))),
         Expr::Symbol(name, _) => {
-            env_get(env, name).ok_or_else(|| EvalError::UnboundVariable(format!("{p}: {name}")))
+            env_get(env, name)
+                .map(Tramp::Val)
+                .ok_or_else(|| EvalError::UnboundVariable(format!("{p}: {name}")))
         }
         Expr::List(elems, _) => {
             if elems.is_empty() {
-                return Ok(Value::List(vec![]));
+                return Ok(Tramp::Val(Value::List(vec![])));
             }
-            // Check for special forms
             if let Expr::Symbol(op, _) = &elems[0] {
                 match op.as_str() {
-                    "define" => return eval_define(&elems[1..], p, env, output),
-                    "if" => return eval_if(&elems[1..], p, env, output),
+                    "define" => return Ok(Tramp::Val(eval_define(&elems[1..], p, env, output)?)),
+                    "if" => {
+                        if elems.len() < 3 || elems.len() > 4 {
+                            return Err(EvalError::Arity(format!("{p}: if requires 2 or 3 arguments")));
+                        }
+                        let cond = eval(&elems[1], env, output)?;
+                        if is_truthy(&cond) {
+                            return Ok(Tramp::Tail(elems[2].clone(), env.clone()));
+                        } else if elems.len() == 4 {
+                            return Ok(Tramp::Tail(elems[3].clone(), env.clone()));
+                        } else {
+                            return Ok(Tramp::Val(Value::Void));
+                        }
+                    }
                     "quote" => {
                         if elems.len() != 2 {
                             return Err(EvalError::Arity(format!("{p}: quote expects 1 argument")));
                         }
-                        return Ok(expr_to_value(&elems[1]));
+                        return Ok(Tramp::Val(expr_to_value(&elems[1])));
                     }
-                    "lambda" => return eval_lambda(&elems[1..], p, env),
-                    "case-lambda" => return eval_case_lambda(&elems[1..], p, env),
-                    "let" => return eval_let(&elems[1..], p, env, output),
-                    "begin" => return eval_begin(&elems[1..], env, output),
-                    "cond" => return eval_cond(&elems[1..], env, output),
-                    "and" => return eval_and(&elems[1..], env, output),
-                    "or" => return eval_or(&elems[1..], env, output),
-                    "set!" => return eval_set_bang(&elems[1..], p, env, output),
-                    "string-set!" => return eval_string_set(&elems[1..], p, env, output),
+                    "lambda" => return Ok(Tramp::Val(eval_lambda(&elems[1..], p, env)?)),
+                    "case-lambda" => return Ok(Tramp::Val(eval_case_lambda(&elems[1..], p, env)?)),
+                    "let" => return eval_let_tc(&elems[1..], p, env, output),
+                    "begin" => return eval_begin_tc(&elems[1..], env, output),
+                    "cond" => return eval_cond_tc(&elems[1..], env, output),
+                    "and" => return eval_and_tc(&elems[1..], env, output),
+                    "or" => return eval_or_tc(&elems[1..], env, output),
+                    "set!" => return Ok(Tramp::Val(eval_set_bang(&elems[1..], p, env, output)?)),
+                    "string-set!" => return Ok(Tramp::Val(eval_string_set(&elems[1..], p, env, output)?)),
                     "not" => {
                         if elems.len() != 2 {
                             return Err(EvalError::Arity(format!("{p}: not expects 1 argument")));
                         }
                         let val = eval(&elems[1], env, output)?;
-                        return Ok(Value::Boolean(!is_truthy(&val)));
+                        return Ok(Tramp::Val(Value::Boolean(!is_truthy(&val))));
                     }
-                    "define-syntax" => return eval_define_syntax(&elems[1..], p, env),
-                    "define-record-type" => return eval_define_record_type(&elems[1..], p, env),
-                    "letrec" => return eval_letrec(&elems[1..], p, env, output),
-                    "letrec*" => return eval_letrec_star(&elems[1..], p, env, output),
-                    "case" => return eval_case(&elems[1..], p, env, output),
-                    "do" => return eval_do(&elems[1..], p, env, output),
-                    "let*" => return eval_let_star(&elems[1..], p, env, output),
+                    "define-syntax" => return Ok(Tramp::Val(eval_define_syntax(&elems[1..], p, env)?)),
+                    "define-record-type" => return Ok(Tramp::Val(eval_define_record_type(&elems[1..], p, env)?)),
+                    "letrec" => return eval_letrec_tc(&elems[1..], p, env, output),
+                    "letrec*" => return eval_letrec_star_tc(&elems[1..], p, env, output),
+                    "case" => return Ok(Tramp::Val(eval_case(&elems[1..], p, env, output)?)),
+                    "do" => return Ok(Tramp::Val(eval_do(&elems[1..], p, env, output)?)),
+                    "let*" => return eval_let_star_tc(&elems[1..], p, env, output),
                     "when" => {
                         if elems.len() < 3 {
                             return Err(EvalError::Arity(format!("{p}: when requires test and body")));
                         }
                         let test = eval(&elems[1], env, output)?;
                         if is_truthy(&test) {
-                            return eval_begin(&elems[2..], env, output);
+                            return eval_begin_tc(&elems[2..], env, output);
                         }
-                        return Ok(Value::Void);
+                        return Ok(Tramp::Val(Value::Void));
                     }
                     "unless" => {
                         if elems.len() < 3 {
@@ -389,22 +419,22 @@ fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError>
                         }
                         let test = eval(&elems[1], env, output)?;
                         if !is_truthy(&test) {
-                            return eval_begin(&elems[2..], env, output);
+                            return eval_begin_tc(&elems[2..], env, output);
                         }
-                        return Ok(Value::Void);
+                        return Ok(Tramp::Val(Value::Void));
                     }
                     _ => {
                         // Check for macro invocation
                         if let Some(Value::Macro { literals, rules, def_env }) = env_get(env, op) {
                             let (expanded, hygiene_bindings) = expand_macro(&literals, &rules, elems, p, &def_env)?;
                             if hygiene_bindings.is_empty() {
-                                return eval(&expanded, env, output);
+                                return Ok(Tramp::Tail(expanded, env.clone()));
                             }
                             let hyg_env = new_env(Some(env.clone()));
                             for (name, val) in hygiene_bindings {
                                 env_set(&hyg_env, name, val);
                             }
-                            return eval(&expanded, &hyg_env, output);
+                            return Ok(Tramp::Tail(expanded, hyg_env));
                         }
                     }
                 }
@@ -415,7 +445,7 @@ fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError>
                 .iter()
                 .map(|e| eval(e, env, output))
                 .collect::<Result<_, _>>()?;
-            apply_func(&func, &args, p, output)
+            apply_func_tc(&func, args, p, output)
         }
     }
 }
@@ -471,20 +501,6 @@ fn eval_define(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> 
             Ok(Value::Void)
         }
         _ => Err(EvalError::Parse(format!("{call_pos}: define: expected symbol or list"))),
-    }
-}
-
-fn eval_if(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
-    if args.len() < 2 || args.len() > 3 {
-        return Err(EvalError::Arity(format!("{call_pos}: if requires 2 or 3 arguments")));
-    }
-    let cond = eval(&args[0], env, output)?;
-    if is_truthy(&cond) {
-        eval(&args[1], env, output)
-    } else if args.len() == 3 {
-        eval(&args[2], env, output)
-    } else {
-        Ok(Value::Void)
     }
 }
 
@@ -553,31 +569,30 @@ fn eval_case_lambda(args: &[Expr], call_pos: Pos, env: &Env) -> Result<Value, Ev
     Ok(Value::CaseLambda { clauses })
 }
 
-fn eval_and(exprs: &[Expr], env: &Env, output: &mut String) -> Result<Value, EvalError> {
+fn eval_and_tc(exprs: &[Expr], env: &Env, output: &mut String) -> Result<Tramp, EvalError> {
     if exprs.is_empty() {
-        return Ok(Value::Boolean(true));
+        return Ok(Tramp::Val(Value::Boolean(true)));
     }
-    let mut result = Value::Boolean(true);
-    for e in exprs {
-        result = eval(e, env, output)?;
+    for e in &exprs[..exprs.len() - 1] {
+        let result = eval(e, env, output)?;
         if !is_truthy(&result) {
-            return Ok(result);
+            return Ok(Tramp::Val(result));
         }
     }
-    Ok(result)
+    Ok(Tramp::Tail(exprs.last().expect("non-empty and").clone(), env.clone()))
 }
 
-fn eval_or(exprs: &[Expr], env: &Env, output: &mut String) -> Result<Value, EvalError> {
+fn eval_or_tc(exprs: &[Expr], env: &Env, output: &mut String) -> Result<Tramp, EvalError> {
     if exprs.is_empty() {
-        return Ok(Value::Boolean(false));
+        return Ok(Tramp::Val(Value::Boolean(false)));
     }
-    for e in exprs {
+    for e in &exprs[..exprs.len() - 1] {
         let result = eval(e, env, output)?;
         if is_truthy(&result) {
-            return Ok(result);
+            return Ok(Tramp::Val(result));
         }
     }
-    Ok(Value::Boolean(false))
+    Ok(Tramp::Tail(exprs.last().expect("non-empty or").clone(), env.clone()))
 }
 
 fn eval_set_bang(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
@@ -627,7 +642,7 @@ fn eval_string_set(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String)
     Ok(Value::Void)
 }
 
-fn eval_let(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+fn eval_let_tc(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Tramp, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity(format!("{call_pos}: let requires bindings and body")));
     }
@@ -667,11 +682,14 @@ fn eval_let(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Res
         for (param, init) in params.iter().zip(inits.iter()) {
             env_set(&local_env, param.clone(), init.clone());
         }
-        let mut result = Value::Void;
-        for expr in &args[2..] {
-            result = eval(expr, &local_env, output)?;
+        let body_exprs = &args[2..];
+        if body_exprs.is_empty() {
+            return Ok(Tramp::Val(Value::Void));
         }
-        return Ok(result);
+        for expr in &body_exprs[..body_exprs.len() - 1] {
+            eval(expr, &local_env, output)?;
+        }
+        return Ok(Tramp::Tail(body_exprs.last().expect("non-empty named-let body").clone(), local_env));
     }
     let bindings_expr = match &args[0] {
         Expr::List(b, _) => b,
@@ -691,47 +709,47 @@ fn eval_let(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Res
             _ => return Err(EvalError::Parse(format!("{call_pos}: let: invalid binding"))),
         }
     }
-    let mut result = Value::Void;
-    for expr in &args[1..] {
-        result = eval(expr, &local_env, output)?;
+    let body = &args[1..];
+    if body.is_empty() {
+        return Ok(Tramp::Val(Value::Void));
     }
-    Ok(result)
+    for expr in &body[..body.len() - 1] {
+        eval(expr, &local_env, output)?;
+    }
+    Ok(Tramp::Tail(body.last().expect("non-empty let body").clone(), local_env))
 }
 
-fn eval_begin(args: &[Expr], env: &Env, output: &mut String) -> Result<Value, EvalError> {
-    let mut result = Value::Void;
-    for expr in args {
-        result = eval(expr, env, output)?;
+fn eval_begin_tc(args: &[Expr], env: &Env, output: &mut String) -> Result<Tramp, EvalError> {
+    if args.is_empty() {
+        return Ok(Tramp::Val(Value::Void));
     }
-    Ok(result)
+    for expr in &args[..args.len() - 1] {
+        eval(expr, env, output)?;
+    }
+    Ok(Tramp::Tail(args.last().expect("non-empty begin").clone(), env.clone()))
 }
 
-fn eval_cond(clauses: &[Expr], env: &Env, output: &mut String) -> Result<Value, EvalError> {
+fn eval_cond_tc(clauses: &[Expr], env: &Env, output: &mut String) -> Result<Tramp, EvalError> {
     for clause in clauses {
         match clause {
             Expr::List(parts, _) if !parts.is_empty() => {
                 if let Expr::Symbol(s, _) = &parts[0] {
                     if s == "else" {
-                        let mut result = Value::Void;
-                        for expr in &parts[1..] {
-                            result = eval(expr, env, output)?;
-                        }
-                        return Ok(result);
+                        return eval_begin_tc(&parts[1..], env, output);
                     }
                 }
                 let test = eval(&parts[0], env, output)?;
                 if is_truthy(&test) {
-                    let mut result = test;
-                    for expr in &parts[1..] {
-                        result = eval(expr, env, output)?;
+                    if parts.len() == 1 {
+                        return Ok(Tramp::Val(test));
                     }
-                    return Ok(result);
+                    return eval_begin_tc(&parts[1..], env, output);
                 }
             }
             _ => return Err(EvalError::Parse("cond: invalid clause".into())),
         }
     }
-    Ok(Value::Void)
+    Ok(Tramp::Val(Value::Void))
 }
 
 // ---------- define-record-type ----------
@@ -795,53 +813,12 @@ fn eval_define_record_type(args: &[Expr], p: Pos, env: &Env) -> Result<Value, Ev
         }
     }
 
-    // Define constructor as a lambda that creates a Record value
-    let ctor_fields_clone = ctor_fields.clone();
-    let type_name_clone = type_name.clone();
-    // We store the constructor as a lambda that builds the record
-    // Using a closure-like approach: store type_id, type_name, and field names in the env
-    // and use a Builtin-like approach. Actually, let's define the constructor and accessors
-    // by inserting lambdas into the environment.
-
-    // Constructor: takes N args, returns Record { type_id, fields: [(name, val), ...] }
-    // We'll implement this by defining a special builtin-like value.
-    // Simplest approach: define them as Lambda values that capture the type info.
-
-    // Actually, the cleanest approach is to create the constructor and accessor functions
-    // as actual Rust closures stored in the environment. But our Value doesn't support closures.
-    // Instead, let's synthesize Scheme code and eval it.
-
-    // Alternative: Create a special constructor entry in the env and handle it in apply_func.
-    // Let's use a simpler approach: create synthetic lambdas using Expr.
-
-    // Create constructor body that returns a record
-    // We'll use a special internal form: the constructor is a Lambda whose body
-    // we handle specially. Actually, the simplest approach is:
-    // Store type metadata in the env and build lambdas that reference it.
-
-    // Cleanest: add a RecordConstructor and RecordAccessor variant... but that's heavy.
-    // Let's just use a different approach: store the record as a tagged list internally
-    // but with a special tag that makes predicates work.
-
-    // Actually, let's just add constructor/predicate/accessor as Lambda values
-    // that we build from Expr nodes programmatically.
-
-    // Simplest: build the record as Value::Record and create the functions via
-    // special Value variants. Let me just add RecordConstructor/Predicate/Accessor
-    // to keep it clean.
-
-    // Actually, the absolute simplest approach: define them using synthetic code strings.
-    // But that's fragile. Let me just handle it directly.
-
-    // Store constructor info
-    let ctor_type_id = type_id;
-    let ctor_type_name_str = type_name_clone.clone();
-    let ctor_field_names = ctor_fields_clone.clone();
+    let ctor_field_names = ctor_fields.clone();
 
     // Define constructor function
     env_set(env, ctor_name, Value::RecordConstructor {
-        type_id: ctor_type_id,
-        type_name: ctor_type_name_str,
+        type_id,
+        type_name: type_name.clone(),
         field_names: ctor_field_names,
     });
 
@@ -996,7 +973,75 @@ fn apply_func(func: &Value, args: &[Value], call_pos: Pos, output: &mut String) 
     }
 }
 
-fn eval_letrec(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+/// TCO-aware function application: returns Tramp::Tail for Lambda/CaseLambda last body expr.
+fn apply_func_tc(func: &Value, args: Vec<Value>, call_pos: Pos, output: &mut String) -> Result<Tramp, EvalError> {
+    match func {
+        Value::Lambda { params, rest_param, body, env } => {
+            let local_env = new_env(Some(env.clone()));
+            if let Some(rest) = rest_param {
+                if args.len() < params.len() {
+                    return Err(EvalError::Arity(format!(
+                        "{call_pos}: expected at least {} arguments, got {}",
+                        params.len(), args.len()
+                    )));
+                }
+                for (param, arg) in params.iter().zip(args.iter()) {
+                    env_set(&local_env, param.clone(), arg.clone());
+                }
+                env_set(&local_env, rest.clone(), Value::List(args[params.len()..].to_vec()));
+            } else {
+                if args.len() != params.len() {
+                    return Err(EvalError::Arity(format!(
+                        "{call_pos}: expected {} arguments, got {}",
+                        params.len(), args.len()
+                    )));
+                }
+                for (param, arg) in params.iter().zip(args.iter()) {
+                    env_set(&local_env, param.clone(), arg.clone());
+                }
+            }
+            if body.is_empty() {
+                return Ok(Tramp::Val(Value::Void));
+            }
+            for expr in &body[..body.len() - 1] {
+                eval(expr, &local_env, output)?;
+            }
+            Ok(Tramp::Tail(body.last().expect("non-empty lambda body").clone(), local_env))
+        }
+        Value::CaseLambda { clauses } => {
+            for clause in clauses {
+                let matches = if clause.rest_param.is_some() {
+                    args.len() >= clause.params.len()
+                } else {
+                    args.len() == clause.params.len()
+                };
+                if matches {
+                    let local_env = new_env(Some(clause.env.clone()));
+                    for (param, arg) in clause.params.iter().zip(args.iter()) {
+                        env_set(&local_env, param.clone(), arg.clone());
+                    }
+                    if let Some(ref rest) = clause.rest_param {
+                        env_set(&local_env, rest.clone(), Value::List(args[clause.params.len()..].to_vec()));
+                    }
+                    if clause.body.is_empty() {
+                        return Ok(Tramp::Val(Value::Void));
+                    }
+                    for expr in &clause.body[..clause.body.len() - 1] {
+                        eval(expr, &local_env, output)?;
+                    }
+                    return Ok(Tramp::Tail(clause.body.last().expect("non-empty case-lambda body").clone(), local_env));
+                }
+            }
+            Err(EvalError::Arity(format!(
+                "{call_pos}: no matching case-lambda clause for {} arguments",
+                args.len()
+            )))
+        }
+        _ => Ok(Tramp::Val(apply_func(func, &args, call_pos, output)?)),
+    }
+}
+
+fn eval_letrec_tc(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Tramp, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity(format!("{call_pos}: letrec requires bindings and body")));
     }
@@ -1027,14 +1072,17 @@ fn eval_letrec(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> 
         let val = eval(init_expr, &local_env, output)?;
         env_set(&local_env, name.clone(), val);
     }
-    let mut result = Value::Void;
-    for expr in &args[1..] {
-        result = eval(expr, &local_env, output)?;
+    let body = &args[1..];
+    if body.is_empty() {
+        return Ok(Tramp::Val(Value::Void));
     }
-    Ok(result)
+    for expr in &body[..body.len() - 1] {
+        eval(expr, &local_env, output)?;
+    }
+    Ok(Tramp::Tail(body.last().expect("non-empty letrec body").clone(), local_env))
 }
 
-fn eval_letrec_star(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+fn eval_letrec_star_tc(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Tramp, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity(format!("{call_pos}: letrec* requires bindings and body")));
     }
@@ -1056,14 +1104,17 @@ fn eval_letrec_star(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String
             _ => return Err(EvalError::Parse(format!("{call_pos}: letrec*: invalid binding"))),
         }
     }
-    let mut result = Value::Void;
-    for expr in &args[1..] {
-        result = eval(expr, &local_env, output)?;
+    let body = &args[1..];
+    if body.is_empty() {
+        return Ok(Tramp::Val(Value::Void));
     }
-    Ok(result)
+    for expr in &body[..body.len() - 1] {
+        eval(expr, &local_env, output)?;
+    }
+    Ok(Tramp::Tail(body.last().expect("non-empty letrec* body").clone(), local_env))
 }
 
-fn eval_let_star(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+fn eval_let_star_tc(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Tramp, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity(format!("{call_pos}: let* requires bindings and body")));
     }
@@ -1085,11 +1136,14 @@ fn eval_let_star(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -
             _ => return Err(EvalError::Parse(format!("{call_pos}: let*: invalid binding"))),
         }
     }
-    let mut result = Value::Void;
-    for expr in &args[1..] {
-        result = eval(expr, &local_env, output)?;
+    let body = &args[1..];
+    if body.is_empty() {
+        return Ok(Tramp::Val(Value::Void));
     }
-    Ok(result)
+    for expr in &body[..body.len() - 1] {
+        eval(expr, &local_env, output)?;
+    }
+    Ok(Tramp::Tail(body.last().expect("non-empty let* body").clone(), local_env))
 }
 
 fn eval_seq(exprs: &[Expr], env: &Env, output: &mut String) -> Result<Value, EvalError> {
