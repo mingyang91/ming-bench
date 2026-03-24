@@ -1507,7 +1507,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let env = default_env();
     let mut output = String::new();
     let result = cek_run(&exprs, &env, &mut output)?;
-    Ok((result.to_string(), output))
+    Ok((format!("{}", values::DisplayValue(&result)), output))
 }
 
 #[cfg(test)]
