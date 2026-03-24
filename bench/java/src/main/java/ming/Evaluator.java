@@ -976,6 +976,14 @@ public class Evaluator {
                             Object test = eval(clauseHead, env);
                             if (!isFalse(test)) {
                                 if (clause.size() == 1) return test;
+                                // Handle => clause: (test => proc)
+                                if (clause.size() == 3) {
+                                    Object arrow = unwrap(clause.get(1));
+                                    if (arrow instanceof String s && s.equals("=>")) {
+                                        Object proc = eval(clause.get(2), env);
+                                        return applyProcedure(proc, List.of(test));
+                                    }
+                                }
                                 for (int j = 1; j < clause.size() - 1; j++) {
                                     eval(clause.get(j), env);
                                 }
@@ -1602,24 +1610,39 @@ public class Evaluator {
                 return makeExact(num, den);
             }
             case "<" -> {
-                requireArgCount(op, args, 2);
-                return numCompare(args.get(0), args.get(1)) < 0;
+                if (args.size() < 2) throw new EvalError(posStr() + "<: expected at least 2 arguments");
+                for (int i = 0; i < args.size() - 1; i++) {
+                    if (!(numCompare(args.get(i), args.get(i + 1)) < 0)) return false;
+                }
+                return true;
             }
             case ">" -> {
-                requireArgCount(op, args, 2);
-                return numCompare(args.get(0), args.get(1)) > 0;
+                if (args.size() < 2) throw new EvalError(posStr() + ">: expected at least 2 arguments");
+                for (int i = 0; i < args.size() - 1; i++) {
+                    if (!(numCompare(args.get(i), args.get(i + 1)) > 0)) return false;
+                }
+                return true;
             }
             case "=" -> {
-                requireArgCount(op, args, 2);
-                return numCompare(args.get(0), args.get(1)) == 0;
+                if (args.size() < 2) throw new EvalError(posStr() + "=: expected at least 2 arguments");
+                for (int i = 0; i < args.size() - 1; i++) {
+                    if (!(numCompare(args.get(i), args.get(i + 1)) == 0)) return false;
+                }
+                return true;
             }
             case "<=" -> {
-                requireArgCount(op, args, 2);
-                return numCompare(args.get(0), args.get(1)) <= 0;
+                if (args.size() < 2) throw new EvalError(posStr() + "<=: expected at least 2 arguments");
+                for (int i = 0; i < args.size() - 1; i++) {
+                    if (!(numCompare(args.get(i), args.get(i + 1)) <= 0)) return false;
+                }
+                return true;
             }
             case ">=" -> {
-                requireArgCount(op, args, 2);
-                return numCompare(args.get(0), args.get(1)) >= 0;
+                if (args.size() < 2) throw new EvalError(posStr() + ">=: expected at least 2 arguments");
+                for (int i = 0; i < args.size() - 1; i++) {
+                    if (!(numCompare(args.get(i), args.get(i + 1)) >= 0)) return false;
+                }
+                return true;
             }
             case "not" -> {
                 requireArgCount(op, args, 1);
@@ -2832,9 +2855,21 @@ public class Evaluator {
                     return eval(list.get(1), env);
                 }
             }
+            // Check for dotted pair syntax: (a b . c)
+            int dotIdx = -1;
+            for (int i = 0; i < list.size(); i++) {
+                Object el = list.get(i);
+                if (el instanceof Located loc2) el = loc2.value();
+                if (el instanceof String s && s.equals(".") && i > 0 && i == list.size() - 2) {
+                    dotIdx = i;
+                    break;
+                }
+            }
             // Process each element, handling unquote-splicing
             List<Object> elems = new ArrayList<>();
-            for (Object elem : list) {
+            int limit = dotIdx >= 0 ? dotIdx : list.size();
+            for (int idx = 0; idx < limit; idx++) {
+                Object elem = list.get(idx);
                 Object raw = unwrap(elem);
                 if (raw instanceof List<?> innerList && !innerList.isEmpty()) {
                     Object innerHead = unwrap(innerList.get(0));
@@ -2851,7 +2886,7 @@ public class Evaluator {
                 }
                 elems.add(evalQuasiquote(elem, env));
             }
-            Object result = NIL;
+            Object result = dotIdx >= 0 ? evalQuasiquote(list.get(dotIdx + 1), env) : NIL;
             for (int i = elems.size() - 1; i >= 0; i--) {
                 result = new Pair(elems.get(i), result);
             }
@@ -2867,6 +2902,23 @@ public class Evaluator {
             datum = loc.value();
         }
         if (datum instanceof List<?> list) {
+            // Handle dotted pair syntax: (a b . c) -> Pair(a, Pair(b, c))
+            int dotIdx = -1;
+            for (int i = 0; i < list.size(); i++) {
+                Object el = list.get(i);
+                if (el instanceof Located loc2) el = loc2.value();
+                if (el instanceof String s && s.equals(".") && i > 0 && i == list.size() - 2) {
+                    dotIdx = i;
+                    break;
+                }
+            }
+            if (dotIdx >= 0) {
+                Object result = quoteDatum(list.get(dotIdx + 1));
+                for (int i = dotIdx - 1; i >= 0; i--) {
+                    result = new Pair(quoteDatum(list.get(i)), result);
+                }
+                return result;
+            }
             Object result = NIL;
             for (int i = list.size() - 1; i >= 0; i--) {
                 result = new Pair(quoteDatum(list.get(i)), result);
