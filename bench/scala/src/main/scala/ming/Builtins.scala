@@ -12,6 +12,11 @@ object Builtins:
 
   private def numericArgs(args: List[Val]): List[Long] = args.map(requireNum)
 
+  private def schemeEqual(a: Val, b: Val): Boolean = (a, b) match
+    case (Str(c1), Str(c2))           => java.util.Arrays.equals(c1, c2)
+    case (Pair(a1, d1), Pair(a2, d2)) => schemeEqual(a1, a2) && schemeEqual(d1, d2)
+    case _                            => a == b
+
   val all: List[(String, Val)] = List(
     "+" -> Builtin { args =>
       Num(numericArgs(args).sum)
@@ -148,7 +153,7 @@ object Builtins:
       case _ => throw new EvalError("filter requires 2 arguments")
     },
     "equal?" -> Builtin {
-      case List(a, b) => Bool(a == b)
+      case List(a, b) => Bool(schemeEqual(a, b))
       case _          => throw new EvalError("equal? requires 2 arguments")
     },
     "abs" -> Builtin {
@@ -190,41 +195,53 @@ object Builtins:
     // --- L05: String operations ---
     "string-append" -> Builtin { args =>
       val strs = args.map {
-        case Str(s) => s
-        case v      => throw new EvalError(s"string-append: not a string: ${Evaluator.display(v)}")
+        case Str(chars) => new String(chars)
+        case v          => throw new EvalError(s"string-append: not a string: ${Evaluator.display(v)}")
       }
-      Str(strs.mkString)
+      Evaluator.mkStr(strs.mkString)
     },
     "string-length" -> Builtin {
-      case List(Str(s)) => Num(s.length.toLong)
-      case _            => throw new EvalError("string-length requires 1 string argument")
+      case List(Str(chars)) => Num(chars.length.toLong)
+      case _                => throw new EvalError("string-length requires 1 string argument")
     },
     "substring" -> Builtin {
-      case List(Str(s), Num(start), Num(end)) =>
-        Str(s.substring(start.toInt, end.toInt))
+      case List(Str(chars), Num(start), Num(end)) =>
+        Evaluator.mkStr(new String(chars).substring(start.toInt, end.toInt))
       case _ => throw new EvalError("substring requires a string and two integers")
     },
     "string->number" -> Builtin {
-      case List(Str(s)) =>
+      case List(Str(chars)) =>
+        val s = new String(chars)
         try Num(s.toLong)
         catch case _: NumberFormatException => Bool(false)
       case _ => throw new EvalError("string->number requires 1 string argument")
     },
     "number->string" -> Builtin {
-      case List(Num(n)) => Str(n.toString)
+      case List(Num(n)) => Evaluator.mkStr(n.toString)
       case _            => throw new EvalError("number->string requires 1 numeric argument")
     },
     "symbol->string" -> Builtin {
-      case List(Symbol(name)) => Str(name)
+      case List(Symbol(name)) => Evaluator.mkStr(name)
       case _                  => throw new EvalError("symbol->string requires 1 symbol argument")
     },
     "string->symbol" -> Builtin {
-      case List(Str(s)) => Symbol(s)
-      case _            => throw new EvalError("string->symbol requires 1 string argument")
+      case List(Str(chars)) => Symbol(new String(chars))
+      case _                => throw new EvalError("string->symbol requires 1 string argument")
     },
     "string-ref" -> Builtin {
-      case List(Str(s), Num(i)) => SchemeChar(s.charAt(i.toInt))
-      case _                    => throw new EvalError("string-ref requires a string and an integer")
+      case List(Str(chars), Num(i)) => SchemeChar(chars(i.toInt))
+      case _                        => throw new EvalError("string-ref requires a string and an integer")
+    },
+    // --- L06: Mutable strings ---
+    "string-set!" -> Builtin {
+      case List(Str(chars), Num(i), SchemeChar(c)) =>
+        chars(i.toInt) = c
+        Void
+      case _ => throw new EvalError("string-set! requires a string, an integer, and a character")
+    },
+    "string-copy" -> Builtin {
+      case List(Str(chars)) => Str(chars.clone())
+      case _                => throw new EvalError("string-copy requires 1 string argument")
     },
     "char?" -> Builtin {
       case List(SchemeChar(_)) => Bool(true)

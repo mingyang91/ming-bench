@@ -7,7 +7,7 @@ object Evaluator:
   enum Val:
     case Num(n: Long)
     case Bool(b: Boolean)
-    case Str(s: String)
+    case Str(chars: Array[Char])
     case Symbol(name: String)
     case Pair(car: Val, cdr: Val)
     case Nil
@@ -16,6 +16,12 @@ object Evaluator:
     case Builtin(f: List[Val] => Val)
 
   import Val.*
+
+  private[ming] def mkStr(s: String): Val = Str(s.toCharArray)
+
+  private[ming] def strValue(v: Val): String = v match
+    case Str(chars) => new String(chars)
+    case _          => throw new EvalError(s"not a string: ${display(v)}")
 
   // --- Output capture ---
   private[ming] val outputBuffer = new StringBuilder
@@ -29,8 +35,8 @@ object Evaluator:
   // --- Evaluator ---
   private def eval(expr: Val, env: Env): Val =
     expr match
-      case Num(_) | Bool(_) | Str(_) => expr
-      case Nil                       => Nil
+      case Num(_) | Bool(_) | Str(_) | SchemeChar(_) => expr
+      case Nil                                       => Nil
       case Symbol(name) =>
         env.lookup(name) match
           case Some(v) => v
@@ -224,7 +230,7 @@ object Evaluator:
     case Num(n)        => n.toString
     case Bool(true)    => "#t"
     case Bool(false)   => "#f"
-    case Str(s)        => "\"" + s + "\""
+    case Str(chars)    => "\"" + new String(chars) + "\""
     case SchemeChar(c) => s"#\\$c"
     case Symbol(name)  => name
     case Nil           => "()"
@@ -234,7 +240,7 @@ object Evaluator:
 
   // --- Display (display-style, no quotes on strings) ---
   private[ming] def displayVal(v: Val): String = v match
-    case Str(s)        => s
+    case Str(chars)    => new String(chars)
     case SchemeChar(c) => c.toString
     case Pair(_, _)    => displayListVal(v)
     case _             => display(v)

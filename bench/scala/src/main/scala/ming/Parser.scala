@@ -54,8 +54,27 @@ private[ming] class Parser(input: String):
         advance()
         if pos >= input.length then throw new EvalError("unexpected end of input after #")
         input(pos) match
-          case 't'   => advance(); Bool(true)
-          case 'f'   => advance(); Bool(false)
+          case 't' => advance(); Bool(true)
+          case 'f' => advance(); Bool(false)
+          case '\\' =>
+            advance() // skip backslash
+            if pos >= input.length then throw new EvalError("unexpected end of input in character literal")
+            // Check for named characters
+            val startCh = pos
+            if input(pos).isLetter then
+              while pos < input.length && input(pos).isLetter do advance()
+              val name = input.substring(startCh, pos)
+              if name.length == 1 then SchemeChar(name.charAt(0))
+              else
+                name.toLowerCase match
+                  case "space"   => SchemeChar(' ')
+                  case "newline" => SchemeChar('\n')
+                  case "tab"     => SchemeChar('\t')
+                  case _         => throw new EvalError(s"unknown character name: $name")
+            else
+              val c = input(pos)
+              advance()
+              SchemeChar(c)
           case other => throw new EvalError(s"unexpected character after #: $other")
       case _ =>
         parseAtom()
@@ -97,7 +116,7 @@ private[ming] class Parser(input: String):
       advance()
     if pos >= input.length then throw new EvalError("unterminated string")
     advance() // skip closing "
-    Str(sb.toString)
+    Str(sb.toString.toCharArray)
 
   private def parseAtom(): Val =
     val start = pos
