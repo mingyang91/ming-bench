@@ -359,6 +359,7 @@ public class Evaluator {
                     }
                     case "define-syntax" -> { return evalDefineSyntax(list, env); }
                     case "define-record-type" -> { return evalDefineRecordType(list, env); }
+                    case "case-lambda" -> { return evalCaseLambda(list, env); }
                 }
                 // Check for macro usage
                 try {
@@ -466,6 +467,43 @@ public class Evaluator {
             body.add(list.get(i));
         }
         return new Lambda(params, restParam, body, env);
+    }
+
+    private Object evalCaseLambda(List<?> list, Environment env) throws EvalError {
+        if (list.size() < 2) throw error("case-lambda: bad syntax");
+        List<Lambda> clauses = new ArrayList<>();
+        for (int i = 1; i < list.size(); i++) {
+            Object clause = list.get(i);
+            if (clause instanceof Located loc) clause = loc.value();
+            if (!(clause instanceof List<?> cl) || cl.size() < 2) {
+                throw error("case-lambda: bad clause");
+            }
+            Object paramList = cl.get(0);
+            if (paramList instanceof Located loc) paramList = loc.value();
+            if (!(paramList instanceof List<?> plist)) throw error("case-lambda: bad parameters");
+            List<String> params = new ArrayList<>();
+            String restParam = null;
+            for (int j = 0; j < plist.size(); j++) {
+                Object p = plist.get(j);
+                if (p instanceof Located loc) p = loc.value();
+                if (!(p instanceof String s)) throw error("case-lambda: bad parameter");
+                if (s.equals(".")) {
+                    if (j + 1 >= plist.size()) throw error("case-lambda: missing rest parameter after dot");
+                    Object rp = plist.get(j + 1);
+                    if (rp instanceof Located loc) rp = loc.value();
+                    if (!(rp instanceof String rest)) throw error("case-lambda: bad rest parameter");
+                    restParam = rest;
+                    break;
+                }
+                params.add(s);
+            }
+            List<Object> body = new ArrayList<>();
+            for (int j = 1; j < cl.size(); j++) {
+                body.add(cl.get(j));
+            }
+            clauses.add(new Lambda(params, restParam, body, env));
+        }
+        return new CaseLambda(clauses);
     }
 
     private Object evalBegin(List<?> list, Environment env) throws EvalError {
@@ -919,6 +957,20 @@ public class Evaluator {
             }
             return result;
         }
+        if (proc instanceof CaseLambda cl) {
+            for (Lambda clause : cl.clauses) {
+                if (clause.restParam != null) {
+                    if (args.size() >= clause.params.size()) {
+                        return apply(clause, args);
+                    }
+                } else {
+                    if (args.size() == clause.params.size()) {
+                        return apply(clause, args);
+                    }
+                }
+            }
+            throw error("case-lambda: no matching clause for " + args.size() + " arguments");
+        }
         if (proc instanceof BuiltinProc bp) {
             return bp.apply(args);
         }
@@ -1019,6 +1071,11 @@ public class Evaluator {
         globalEnv.define("symbol?", (BuiltinProc) args -> {
             if (args.size() != 1) throw error("symbol?: expected 1 argument");
             return args.get(0) instanceof String;
+        });
+        globalEnv.define("procedure?", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("procedure?: expected 1 argument");
+            Object val = args.get(0);
+            return val instanceof Lambda || val instanceof CaseLambda || val instanceof BuiltinProc;
         });
 
         // Output
@@ -1602,6 +1659,7 @@ public class Evaluator {
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
         if (val instanceof SchemeChar ch) return "#\\" + ch.value();
         if (val instanceof Lambda) return "#<procedure>";
+        if (val instanceof CaseLambda) return "#<procedure>";
         if (val == NIL) return "()";
         if (val instanceof Pair) {
             StringBuilder sb = new StringBuilder("(");
