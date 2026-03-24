@@ -258,25 +258,25 @@ object Evaluator:
           case List(proc) => applyK(proc, List(ContinuationVal(k, windingStack)), k)
           case _          => error("call/cc requires 1 argument")
       case ContinuationVal(savedK, savedWinds) =>
-        args match
-          case List(v) =>
-            val currentWinds = windingStack
-            val commonLen    = WindGuard.commonWindTailLength(currentWinds, savedWinds)
-            val toUnwind     = currentWinds.take(currentWinds.length - commonLen).map(_._2)
-            val toRewind     = savedWinds.take(savedWinds.length - commonLen).reverse.map(_._1)
+        val v = args match
+          case List(single) => single
+          case _            => MultipleValues(args)
+        val currentWinds = windingStack
+        val commonLen    = WindGuard.commonWindTailLength(currentWinds, savedWinds)
+        val toUnwind     = currentWinds.take(currentWinds.length - commonLen).map(_._2)
+        val toRewind     = savedWinds.take(savedWinds.length - commonLen).reverse.map(_._1)
+        WindGuard.runThunks(
+          toUnwind,
+          BMore { () =>
             WindGuard.runThunks(
-              toUnwind,
+              toRewind,
               BMore { () =>
-                WindGuard.runThunks(
-                  toRewind,
-                  BMore { () =>
-                    windingStack = savedWinds
-                    savedK(v)
-                  }
-                )
+                windingStack = savedWinds
+                savedK(v)
               }
             )
-          case _ => error("continuation requires 1 argument")
+          }
+        )
       case Closure(params, restParam, body, closureEnv) =>
         val callEnv = setupClosureEnv(params, restParam, body, closureEnv, args)
         evalSeqK(body, callEnv, k)

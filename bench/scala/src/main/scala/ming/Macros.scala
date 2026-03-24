@@ -29,7 +29,16 @@ private[ming] object Macros:
     "syntax",
     "with-syntax",
     "let*",
-    "letrec"
+    "letrec",
+    "letrec*",
+    "case",
+    "case-lambda",
+    "do",
+    "define-record-type",
+    "dynamic-wind",
+    "guard",
+    "with-exception-handler",
+    "call-with-values"
   )
 
   private def error(msg: String): Nothing =
