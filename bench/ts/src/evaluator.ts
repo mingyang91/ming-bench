@@ -15,6 +15,7 @@ type SchemeVal =
   | { tag: 'builtin'; name: string; func: (args: SchemeVal[], callPos?: Pos) => SchemeVal; pos?: Pos }
   | { tag: 'lambda'; params: string[]; restParam?: string; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'macro'; literals: string[]; rules: { pattern: SchemeVal; template: SchemeVal }[]; defEnv: Env; pos?: Pos }
+  | { tag: 'record'; typeName: string; fields: Map<string, SchemeVal>; pos?: Pos }
   | { tag: 'void'; pos?: Pos };
 
 // --- Parser ---
@@ -158,6 +159,7 @@ function schemeToString(val: SchemeVal): string {
     case 'builtin': return `#<procedure:${val.name}>`;
     case 'lambda': return '#<procedure>';
     case 'macro': return '#<macro>';
+    case 'record': return `#<record:${val.typeName}>`;
     case 'void': return '';
   }
 }
@@ -933,7 +935,7 @@ function makeGlobalEnv(outputBuf: string[]): Env {
 
 const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'lambda', 'and', 'or', 'not', 'begin',
-  'cond', 'set!', 'string-set!', 'let', 'define-syntax'
+  'cond', 'set!', 'string-set!', 'let', 'define-syntax', 'define-record-type'
 ]);
 
 type MacroBindings = Map<string, SchemeVal | SchemeVal[]>;
@@ -1271,6 +1273,57 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
           return letResult;
         }
 
+        if (name === 'define-record-type') {
+          // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+          if (elems.length < 4) throw new EvalError(`${fmtPos(expr.pos)}define-record-type: invalid syntax`);
+          if (elems[1].tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}define-record-type: expected type name`);
+          const typeName = elems[1].value;
+          const ctorForm = elems[2];
+          if (ctorForm.tag !== 'list' || ctorForm.elements.length < 1 || ctorForm.elements[0].tag !== 'symbol')
+            throw new EvalError(`${fmtPos(expr.pos)}define-record-type: invalid constructor`);
+          const ctorName = ctorForm.elements[0].value;
+          const ctorFields = ctorForm.elements.slice(1).map(e => {
+            if (e.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}define-record-type: field must be symbol`);
+            return e.value;
+          });
+          if (elems[3].tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}define-record-type: expected predicate name`);
+          const predName = elems[3].value;
+          const fieldAccessors: { field: string; accessor: string }[] = [];
+          for (let i = 4; i < elems.length; i++) {
+            const fd = elems[i];
+            if (fd.tag !== 'list' || fd.elements.length < 2 || fd.elements[0].tag !== 'symbol' || fd.elements[1].tag !== 'symbol')
+              throw new EvalError(`${fmtPos(expr.pos)}define-record-type: invalid field spec`);
+            fieldAccessors.push({ field: fd.elements[0].value, accessor: fd.elements[1].value });
+          }
+          // Define constructor
+          envDefine(env, ctorName, { tag: 'builtin', name: ctorName, func: (args, callPos) => {
+            if (args.length !== ctorFields.length)
+              throw new EvalError(`${fmtPos(callPos)}${ctorName}: expected ${ctorFields.length} arguments, got ${args.length}`);
+            const fields = new Map<string, SchemeVal>();
+            for (let i = 0; i < ctorFields.length; i++) {
+              fields.set(ctorFields[i], args[i]);
+            }
+            return { tag: 'record', typeName, fields };
+          }});
+          // Define predicate
+          envDefine(env, predName, { tag: 'builtin', name: predName, func: (args, callPos) => {
+            if (args.length !== 1) throw new EvalError(`${fmtPos(callPos)}${predName}: expected 1 argument`);
+            return { tag: 'boolean', value: args[0].tag === 'record' && args[0].typeName === typeName };
+          }});
+          // Define accessors
+          for (const { field, accessor } of fieldAccessors) {
+            envDefine(env, accessor, { tag: 'builtin', name: accessor, func: (args, callPos) => {
+              if (args.length !== 1) throw new EvalError(`${fmtPos(callPos)}${accessor}: expected 1 argument`);
+              if (args[0].tag !== 'record' || args[0].typeName !== typeName)
+                throw new EvalError(`${fmtPos(callPos)}${accessor}: not a ${typeName}`);
+              const val = args[0].fields.get(field);
+              if (val === undefined) throw new EvalError(`${fmtPos(callPos)}${accessor}: field ${field} not found`);
+              return val;
+            }});
+          }
+          return { tag: 'void' };
+        }
+
         if (name === 'define-syntax') {
           if (elems.length !== 3) throw new EvalError(`${fmtPos(expr.pos)}define-syntax: expected 2 args`);
           if (elems[1].tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}define-syntax: expected symbol`);
@@ -1337,6 +1390,7 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
     case 'builtin':
     case 'lambda':
     case 'macro':
+    case 'record':
     case 'void':
       return expr;
   }
