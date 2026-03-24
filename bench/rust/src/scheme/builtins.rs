@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::{
-    as_integer, apply_func, is_proper_list, make_pair, make_rational, to_list_vec,
+    as_integer, is_proper_list, make_pair, make_rational, to_list_vec,
     value_to_f64, values_eq, values_equal, values_eqv, vec_to_pair_chain,
     DisplayValue, EvalError, Pos, Value,
 };
@@ -380,7 +380,7 @@ fn float_to_rational(f: f64) -> (i64, i64) {
     (sign * n, d)
 }
 
-fn apply_list_builtin(name: &str, args: &[Value], call_pos: Pos, output: &mut String) -> Result<Value, EvalError> {
+fn apply_list_builtin(name: &str, args: &[Value], call_pos: Pos, _output: &mut String) -> Result<Value, EvalError> {
     match name {
         "cons" => {
             if args.len() != 2 {
@@ -510,17 +510,9 @@ fn apply_list_builtin(name: &str, args: &[Value], call_pos: Pos, output: &mut St
             }
             Ok(Value::Boolean(false))
         }
-        "apply" => {
-            if args.len() < 2 {
-                return Err(EvalError::Arity(format!("{call_pos}: apply requires at least 2 arguments")));
-            }
-            let func = &args[0];
-            let last = &args[args.len() - 1];
-            let tail = to_list_vec(last)
-                .ok_or_else(|| EvalError::Type(format!("{call_pos}: apply: last argument must be a list")))?;
-            let mut combined = args[1..args.len() - 1].to_vec();
-            combined.extend(tail);
-            apply_func(func, &combined, call_pos, output)
+        "apply" | "map" | "for-each" | "call/cc" | "call-with-current-continuation" => {
+            // Handled by cek_invoke
+            unreachable!("builtin '{}' is handled by the CEK machine", name)
         }
         "eq?" => {
             if args.len() != 2 {
@@ -533,22 +525,6 @@ fn apply_list_builtin(name: &str, args: &[Value], call_pos: Pos, output: &mut St
                 return Err(EvalError::Arity(format!("{call_pos}: equal? requires 2 arguments")));
             }
             Ok(Value::Boolean(values_equal(&args[0], &args[1])))
-        }
-        "map" => {
-            if args.len() < 2 {
-                return Err(EvalError::Arity(format!("{call_pos}: map requires at least 2 arguments")));
-            }
-            let func = &args[0];
-            let lists: Vec<Vec<Value>> = args[1..].iter().map(|a|
-                to_list_vec(a).ok_or_else(|| EvalError::Type(format!("{call_pos}: map: expected list")))
-            ).collect::<Result<_, _>>()?;
-            let len = lists[0].len();
-            let mut result = Vec::new();
-            for i in 0..len {
-                let map_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-                result.push(apply_func(func, &map_args, call_pos, output)?);
-            }
-            Ok(vec_to_pair_chain(&result))
         }
         "boolean?" => {
             if args.len() != 1 {
@@ -992,21 +968,6 @@ fn apply_pair_misc_builtin(name: &str, args: &[Value], call_pos: Pos, output: &m
             }
             Ok(Value::Boolean(false))
         }
-        "for-each" => {
-            if args.len() < 2 {
-                return Err(EvalError::Arity(format!("{call_pos}: for-each requires at least 2 arguments")));
-            }
-            let func = &args[0];
-            let lists: Vec<Vec<Value>> = args[1..].iter().map(|a|
-                to_list_vec(a).ok_or_else(|| EvalError::Type(format!("{call_pos}: for-each: expected list")))
-            ).collect::<Result<_, _>>()?;
-            let len = lists[0].len();
-            for i in 0..len {
-                let map_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-                apply_func(func, &map_args, call_pos, output)?;
-            }
-            Ok(Value::Void)
-        }
         "set-car!" => {
             if args.len() != 2 {
                 return Err(EvalError::Arity(format!("{call_pos}: set-car! requires 2 arguments")));
@@ -1196,6 +1157,7 @@ pub(super) fn apply_builtin(name: &str, args: &[Value], call_pos: Pos, output: &
                 Value::Lambda { .. }
                     | Value::CaseLambda { .. }
                     | Value::Builtin(_)
+                    | Value::Continuation(_)
                     | Value::RecordConstructor { .. }
                     | Value::RecordPredicate { .. }
                     | Value::RecordAccessor { .. }
