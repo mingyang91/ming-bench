@@ -10,7 +10,9 @@ public class Evaluator {
      * representation of the last result.
      */
     public String evalStr(String input) throws EvalError {
-        throw new EvalError("not implemented");
+        Parser parser = new Parser(input);
+        Interpreter interpreter = new Interpreter();
+        return interpreter.evalProgram(parser.parseProgram()).render();
     }
 
     /**
@@ -18,6 +20,6 @@ public class Evaluator {
      * and any captured output from display/write/newline.
      */
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        throw new EvalError("not implemented");
+        return new EvalResult(evalStr(input), "");
     }
 }
