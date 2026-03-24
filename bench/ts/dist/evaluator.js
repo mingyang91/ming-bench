@@ -12,40 +12,53 @@ function listToConsPairs(lst) {
 function tokenize(input) {
     const tokens = [];
     let i = 0;
+    let line = 1;
+    let col = 1;
+    function advance() {
+        if (input[i] === '\n') {
+            line++;
+            col = 1;
+        }
+        else {
+            col++;
+        }
+        i++;
+    }
     while (i < input.length) {
         const ch = input[i];
         // skip whitespace
         if (/\s/.test(ch)) {
-            i++;
+            advance();
             continue;
         }
         // skip line comments
         if (ch === ';') {
             while (i < input.length && input[i] !== '\n')
-                i++;
+                advance();
             continue;
         }
+        const tokLine = line, tokCol = col;
         if (ch === '(') {
-            tokens.push({ type: 'lparen', value: '(' });
-            i++;
+            tokens.push({ type: 'lparen', value: '(', line: tokLine, col: tokCol });
+            advance();
             continue;
         }
         if (ch === ')') {
-            tokens.push({ type: 'rparen', value: ')' });
-            i++;
+            tokens.push({ type: 'rparen', value: ')', line: tokLine, col: tokCol });
+            advance();
             continue;
         }
         if (ch === '\'') {
-            tokens.push({ type: 'quote', value: '\'' });
-            i++;
+            tokens.push({ type: 'quote', value: '\'', line: tokLine, col: tokCol });
+            advance();
             continue;
         }
         if (ch === '"') {
             let s = '';
-            i++; // skip opening quote
+            advance(); // skip opening quote
             while (i < input.length && input[i] !== '"') {
                 if (input[i] === '\\') {
-                    i++;
+                    advance();
                     if (i < input.length) {
                         if (input[i] === 'n')
                             s += '\n';
@@ -62,23 +75,24 @@ function tokenize(input) {
                 else {
                     s += input[i];
                 }
-                i++;
+                advance();
             }
-            i++; // skip closing quote
-            tokens.push({ type: 'string', value: s });
+            if (i < input.length)
+                advance(); // skip closing quote
+            tokens.push({ type: 'string', value: s, line: tokLine, col: tokCol });
             continue;
         }
         // atom
         let atom = '';
         while (i < input.length && !/[\s()";]/.test(input[i])) {
             atom += input[i];
-            i++;
+            advance();
         }
         if (atom === '.') {
-            tokens.push({ type: 'dot', value: '.' });
+            tokens.push({ type: 'dot', value: '.', line: tokLine, col: tokCol });
         }
         else {
-            tokens.push({ type: 'atom', value: atom });
+            tokens.push({ type: 'atom', value: atom, line: tokLine, col: tokCol });
         }
     }
     return tokens;
@@ -89,6 +103,7 @@ function parse(tokens) {
         if (pos >= tokens.length)
             throw new EvalError('unexpected end of input');
         const tok = tokens[pos];
+        const p = { line: tok.line, col: tok.col };
         if (tok.type === 'lparen') {
             pos++; // skip (
             const elements = [];
@@ -98,7 +113,7 @@ function parse(tokens) {
             if (pos >= tokens.length)
                 throw new EvalError('missing closing parenthesis');
             pos++; // skip )
-            return { tag: 'list', value: elements };
+            return { tag: 'list', value: elements, pos: p };
         }
         if (tok.type === 'rparen') {
             throw new EvalError('unexpected )');
@@ -106,22 +121,22 @@ function parse(tokens) {
         if (tok.type === 'quote') {
             pos++;
             const quoted = parseExpr();
-            return { tag: 'list', value: [{ tag: 'symbol', value: 'quote' }, quoted] };
+            return { tag: 'list', value: [{ tag: 'symbol', value: 'quote', pos: p }, quoted], pos: p };
         }
         if (tok.type === 'string') {
             pos++;
-            return { tag: 'string', value: tok.value };
+            return { tag: 'string', value: tok.value, pos: p };
         }
         // atom
         pos++;
         const v = tok.value;
         if (v === '#t')
-            return { tag: 'boolean', value: true };
+            return { tag: 'boolean', value: true, pos: p };
         if (v === '#f')
-            return { tag: 'boolean', value: false };
+            return { tag: 'boolean', value: false, pos: p };
         if (/^-?\d+$/.test(v))
-            return { tag: 'number', value: parseInt(v, 10) };
-        return { tag: 'symbol', value: v };
+            return { tag: 'number', value: parseInt(v, 10), pos: p };
+        return { tag: 'symbol', value: v, pos: p };
     }
     const exprs = [];
     while (pos < tokens.length) {
@@ -307,25 +322,39 @@ function makeGlobalEnv() {
 function isFalsy(val) {
     return val.tag === 'boolean' && val.value === false;
 }
+function posStr(p) {
+    return p ? `${p.line}:${p.col}` : '?:?';
+}
+function errAt(msg, p) {
+    return new EvalError(`${posStr(p)}: ${msg}`);
+}
 function evaluate(expr, env) {
     switch (expr.tag) {
         case 'number':
         case 'boolean':
         case 'string':
             return expr;
-        case 'symbol':
-            return env.get(expr.value);
+        case 'symbol': {
+            try {
+                return env.get(expr.value);
+            }
+            catch (e) {
+                if (e instanceof EvalError)
+                    throw errAt(e.message, expr.pos);
+                throw e;
+            }
+        }
         case 'list': {
             const elems = expr.value;
             if (elems.length === 0)
-                throw new EvalError('empty application');
+                throw errAt('empty application', expr.pos);
             const first = elems[0];
             // Special forms
             if (first.tag === 'symbol') {
                 switch (first.value) {
                     case 'define': {
                         if (elems.length < 3)
-                            throw new EvalError('define requires at least 2 arguments');
+                            throw errAt('define requires at least 2 arguments', expr.pos);
                         const target = elems[1];
                         if (target.tag === 'symbol') {
                             // (define x expr)
@@ -338,7 +367,7 @@ function evaluate(expr, env) {
                             const name = target.value[0].value;
                             const paramNames = target.value.slice(1).map(p => {
                                 if (p.tag !== 'symbol')
-                                    throw new EvalError('parameter must be a symbol');
+                                    throw errAt('parameter must be a symbol', p.pos);
                                 return p.value;
                             });
                             const bodyExprs = elems.slice(2);
@@ -356,11 +385,11 @@ function evaluate(expr, env) {
                             env.set(name, proc);
                             return { tag: 'void' };
                         }
-                        throw new EvalError('invalid define syntax');
+                        throw errAt('invalid define syntax', expr.pos);
                     }
                     case 'if': {
                         if (elems.length < 3)
-                            throw new EvalError('if requires at least 2 arguments');
+                            throw errAt('if requires at least 2 arguments', expr.pos);
                         const cond = evaluate(elems[1], env);
                         if (!isFalsy(cond)) {
                             return evaluate(elems[2], env);
@@ -372,18 +401,18 @@ function evaluate(expr, env) {
                     }
                     case 'quote': {
                         if (elems.length !== 2)
-                            throw new EvalError('quote requires exactly 1 argument');
+                            throw errAt('quote requires exactly 1 argument', expr.pos);
                         return listToConsPairs(elems[1]);
                     }
                     case 'lambda': {
                         if (elems.length < 3)
-                            throw new EvalError('lambda requires params and body');
+                            throw errAt('lambda requires params and body', expr.pos);
                         const params = elems[1];
                         if (params.tag !== 'list')
-                            throw new EvalError('lambda params must be a list');
+                            throw errAt('lambda params must be a list', expr.pos);
                         const paramNames = params.value.map(p => {
                             if (p.tag !== 'symbol')
-                                throw new EvalError('parameter must be a symbol');
+                                throw errAt('parameter must be a symbol', p.pos);
                             return p.value;
                         });
                         const bodyExprs = elems.slice(2);
@@ -430,22 +459,22 @@ function evaluate(expr, env) {
                     }
                     case 'let': {
                         if (elems.length < 3)
-                            throw new EvalError('let requires bindings and body');
+                            throw errAt('let requires bindings and body', expr.pos);
                         // Named let: (let name ((var init) ...) body ...)
                         if (elems[1].tag === 'symbol') {
                             if (elems.length < 4)
-                                throw new EvalError('named let requires bindings and body');
+                                throw errAt('named let requires bindings and body', expr.pos);
                             const loopName = elems[1].value;
                             const bindingsList = elems[2];
                             if (bindingsList.tag !== 'list')
-                                throw new EvalError('let bindings must be a list');
+                                throw errAt('let bindings must be a list', expr.pos);
                             const paramNames = [];
                             const initVals = [];
                             for (const binding of bindingsList.value) {
                                 if (binding.tag !== 'list' || binding.value.length !== 2)
-                                    throw new EvalError('invalid let binding');
+                                    throw errAt('invalid let binding', binding.pos);
                                 if (binding.value[0].tag !== 'symbol')
-                                    throw new EvalError('let binding name must be a symbol');
+                                    throw errAt('let binding name must be a symbol', binding.pos);
                                 paramNames.push(binding.value[0].value);
                                 initVals.push(evaluate(binding.value[1], env));
                             }
@@ -474,14 +503,14 @@ function evaluate(expr, env) {
                         // Regular let: (let ((var init) ...) body ...)
                         const bindings = elems[1];
                         if (bindings.tag !== 'list')
-                            throw new EvalError('let bindings must be a list');
+                            throw errAt('let bindings must be a list', expr.pos);
                         const childEnv = new Env(env);
                         for (const binding of bindings.value) {
                             if (binding.tag !== 'list' || binding.value.length !== 2)
-                                throw new EvalError('invalid let binding');
+                                throw errAt('invalid let binding', binding.pos);
                             const name = binding.value[0];
                             if (name.tag !== 'symbol')
-                                throw new EvalError('let binding name must be a symbol');
+                                throw errAt('let binding name must be a symbol', name.pos);
                             const val = evaluate(binding.value[1], env);
                             childEnv.set(name.value, val);
                         }
@@ -495,7 +524,7 @@ function evaluate(expr, env) {
                         for (let i = 1; i < elems.length; i++) {
                             const clause = elems[i];
                             if (clause.tag !== 'list' || clause.value.length < 1)
-                                throw new EvalError('invalid cond clause');
+                                throw errAt('invalid cond clause', clause.pos);
                             const test = clause.value[0];
                             if (test.tag === 'symbol' && test.value === 'else') {
                                 let result = { tag: 'void' };
@@ -522,12 +551,20 @@ function evaluate(expr, env) {
             // Function application
             const func = evaluate(first, env);
             if (func.tag !== 'procedure')
-                throw new EvalError('not a procedure');
+                throw errAt('not a procedure', expr.pos);
             const args = elems.slice(1).map(a => evaluate(a, env));
-            return func.value(...args);
+            try {
+                return func.value(...args);
+            }
+            catch (e) {
+                if (e instanceof EvalError && !/^\d+:/.test(e.message)) {
+                    throw errAt(e.message, expr.pos);
+                }
+                throw e;
+            }
         }
         default:
-            throw new EvalError('cannot evaluate');
+            throw errAt('cannot evaluate', expr.pos);
     }
 }
 function display(val) {
