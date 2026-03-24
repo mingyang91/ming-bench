@@ -2,6 +2,10 @@ pub mod error;
 
 pub use error::EvalError;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 #[derive(Debug, Clone, PartialEq)]
 enum Value {
     Integer(i64),
@@ -9,6 +13,7 @@ enum Value {
     Str(String),
     Symbol(String),
     List(Vec<Value>),
+    Lambda(Vec<String>, Vec<Value>, Env), // params, body, closure env
     Void,
 }
 
@@ -24,6 +29,7 @@ impl Value {
                 let inner: Vec<String> = items.iter().map(|v| v.display_value()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Lambda(..) => "#<procedure>".into(),
             Value::Void => "".into(),
         }
     }
@@ -31,6 +37,38 @@ impl Value {
     fn is_truthy(&self) -> bool {
         !matches!(self, Value::Boolean(false))
     }
+}
+
+// --- Environment ---
+
+type Env = Rc<RefCell<EnvInner>>;
+
+#[derive(Debug, PartialEq)]
+struct EnvInner {
+    bindings: HashMap<String, Value>,
+    parent: Option<Env>,
+}
+
+fn new_env(parent: Option<Env>) -> Env {
+    Rc::new(RefCell::new(EnvInner {
+        bindings: HashMap::new(),
+        parent,
+    }))
+}
+
+fn env_get(env: &Env, name: &str) -> Option<Value> {
+    let inner = env.borrow();
+    if let Some(val) = inner.bindings.get(name) {
+        Some(val.clone())
+    } else if let Some(ref parent) = inner.parent {
+        env_get(parent, name)
+    } else {
+        None
+    }
+}
+
+fn env_set(env: &Env, name: String, val: Value) {
+    env.borrow_mut().bindings.insert(name, val);
 }
 
 // --- Parser ---
@@ -180,14 +218,23 @@ fn is_delimiter(c: char) -> bool {
     c.is_whitespace() || c == '(' || c == ')' || c == '"' || c == ';'
 }
 
+fn extract_symbol_list(values: &[Value], context: &str) -> Result<Vec<String>, EvalError> {
+    values
+        .iter()
+        .map(|v| match v {
+            Value::Symbol(s) => Ok(s.clone()),
+            _ => Err(EvalError::Type(format!("{context}: expected symbol in parameter list"))),
+        })
+        .collect()
+}
+
 // --- Evaluator ---
 
-fn eval(val: &Value) -> Result<Value, EvalError> {
+fn eval(val: &Value, env: &Env) -> Result<Value, EvalError> {
     match val {
-        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) => Ok(val.clone()),
+        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Lambda(..) => Ok(val.clone()),
         Value::Symbol(name) => {
-            // Builtins are only callable, not self-evaluating
-            Err(EvalError::UnboundVariable(name.clone()))
+            env_get(env, name).ok_or_else(|| EvalError::UnboundVariable(name.clone()))
         }
         Value::List(items) => {
             if items.is_empty() {
@@ -196,37 +243,116 @@ fn eval(val: &Value) -> Result<Value, EvalError> {
             let head = &items[0];
             if let Value::Symbol(name) = head {
                 match name.as_str() {
-                    // Special forms
-                    "and" => return eval_and(&items[1..]),
-                    "or" => return eval_or(&items[1..]),
+                    "quote" => {
+                        if items.len() != 2 {
+                            return Err(EvalError::Arity("quote requires 1 argument".into()));
+                        }
+                        return Ok(items[1].clone());
+                    }
+                    "if" => {
+                        if items.len() < 3 || items.len() > 4 {
+                            return Err(EvalError::Arity("if requires 2 or 3 arguments".into()));
+                        }
+                        let cond = eval(&items[1], env)?;
+                        if cond.is_truthy() {
+                            return eval(&items[2], env);
+                        } else if items.len() == 4 {
+                            return eval(&items[3], env);
+                        } else {
+                            return Ok(Value::Void);
+                        }
+                    }
+                    "define" => {
+                        if items.len() < 3 {
+                            return Err(EvalError::Arity("define requires at least 2 arguments".into()));
+                        }
+                        match &items[1] {
+                            Value::Symbol(var_name) => {
+                                let val = eval(&items[2], env)?;
+                                env_set(env, var_name.clone(), val);
+                                return Ok(Value::Void);
+                            }
+                            Value::List(sig) => {
+                                // (define (f params...) body...)
+                                if sig.is_empty() {
+                                    return Err(EvalError::Parse("define: empty signature".into()));
+                                }
+                                let func_name = match &sig[0] {
+                                    Value::Symbol(s) => s.clone(),
+                                    _ => return Err(EvalError::Type("define: expected symbol for function name".into())),
+                                };
+                                let params = extract_symbol_list(&sig[1..], "define")?;
+                                let body = items[2..].to_vec();
+                                let lambda = Value::Lambda(params, body, env.clone());
+                                env_set(env, func_name, lambda);
+                                return Ok(Value::Void);
+                            }
+                            _ => return Err(EvalError::Type("define: expected symbol or list".into())),
+                        }
+                    }
+                    "lambda" => {
+                        if items.len() < 3 {
+                            return Err(EvalError::Arity("lambda requires at least 2 arguments".into()));
+                        }
+                        let Value::List(param_list) = &items[1] else {
+                            return Err(EvalError::Type("lambda: expected parameter list".into()));
+                        };
+                        let params = extract_symbol_list(param_list, "lambda")?;
+                        let body = items[2..].to_vec();
+                        return Ok(Value::Lambda(params, body, env.clone()));
+                    }
+                    "and" => return eval_and(&items[1..], env),
+                    "or" => return eval_or(&items[1..], env),
                     "not" => {
                         if items.len() != 2 {
                             return Err(EvalError::Arity("not requires 1 argument".into()));
                         }
-                        let v = eval(&items[1])?;
+                        let v = eval(&items[1], env)?;
                         return Ok(Value::Boolean(!v.is_truthy()));
-                    }
-                    // Builtins
-                    "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" => {
-                        let args: Result<Vec<Value>, _> = items[1..].iter().map(eval).collect();
-                        return apply_builtin(name, &args?);
                     }
                     _ => {}
                 }
             }
-            Err(EvalError::Type("not a procedure".into()))
+            // Function application
+            let func = eval(head, env)?;
+            let args: Result<Vec<Value>, _> = items[1..].iter().map(|a| eval(a, env)).collect();
+            let args = args?;
+            apply(&func, &args)
         }
         Value::Void => Ok(Value::Void),
     }
 }
 
-fn eval_and(exprs: &[Value]) -> Result<Value, EvalError> {
+fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
+    match func {
+        Value::Lambda(params, body, closure_env) => {
+            if args.len() != params.len() {
+                return Err(EvalError::Arity(format!(
+                    "expected {} arguments, got {}", params.len(), args.len()
+                )));
+            }
+            let local_env = new_env(Some(closure_env.clone()));
+            for (param, arg) in params.iter().zip(args.iter()) {
+                env_set(&local_env, param.clone(), arg.clone());
+            }
+            let mut result = Value::Void;
+            for expr in body {
+                result = eval(expr, &local_env)?;
+            }
+            Ok(result)
+        }
+        Value::Symbol(name) => apply_builtin(name, args),
+        _ => Err(EvalError::Type("not a procedure".into())),
+    }
+}
+
+fn eval_and(exprs: &[Value], env: &Env) -> Result<Value, EvalError> {
     if exprs.is_empty() {
         return Ok(Value::Boolean(true));
     }
     let mut result = Value::Boolean(true);
     for expr in exprs {
-        result = eval(expr)?;
+        result = eval(expr, env)?;
         if !result.is_truthy() {
             return Ok(result);
         }
@@ -234,12 +360,12 @@ fn eval_and(exprs: &[Value]) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-fn eval_or(exprs: &[Value]) -> Result<Value, EvalError> {
+fn eval_or(exprs: &[Value], env: &Env) -> Result<Value, EvalError> {
     if exprs.is_empty() {
         return Ok(Value::Boolean(false));
     }
     for expr in exprs {
-        let result = eval(expr)?;
+        let result = eval(expr, env)?;
         if result.is_truthy() {
             return Ok(result);
         }
@@ -321,6 +447,15 @@ fn compare_nums(args: &[Value], cmp: impl Fn(i64, i64) -> bool) -> Result<Value,
     Ok(Value::Boolean(true))
 }
 
+fn make_global_env() -> Env {
+    let env = new_env(None);
+    // Register builtins as symbols that apply_builtin knows
+    for name in &["+", "-", "*", "/", "<", ">", "=", "<=", ">="] {
+        env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
+    }
+    env
+}
+
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
@@ -329,9 +464,10 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     if exprs.is_empty() {
         return Err(EvalError::Parse("no expressions".into()));
     }
+    let env = make_global_env();
     let mut last = Value::Void;
     for expr in &exprs {
-        last = eval(expr)?;
+        last = eval(expr, &env)?;
     }
     Ok(last.display_value())
 }
