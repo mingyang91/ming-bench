@@ -241,8 +241,19 @@ func matchPatternNode(pattern *astNode, input *astNode, bindings map[string]*pat
 		return tokensMatch(pattern.tok, input.tok)
 	}
 
+	// Pattern is a vector: #(pat ...)
+	if pattern.isVector {
+		if input.isAtom || !input.isVector {
+			return false
+		}
+		return matchElements(pattern.children, input.children, bindings, literals)
+	}
+
 	// Pattern is a list
 	if input.isAtom {
+		return false
+	}
+	if input.isVector {
 		return false
 	}
 	return matchElements(pattern.children, input.children, bindings, literals)
@@ -318,6 +329,7 @@ func expandTemplate(tmpl *astNode, bindings map[string]*patBinding, renameMap ma
 
 	return &astNode{
 		children: children,
+		isVector: tmpl.isVector,
 		line:     tmpl.line,
 		col:      tmpl.col,
 	}

@@ -479,6 +479,10 @@ const (
 	tokDot
 	tokEOF
 	tokSyntaxQuote
+	tokHashLParen
+	tokBackquote
+	tokComma
+	tokCommaAt
 )
 
 type token struct {
@@ -562,6 +566,16 @@ func (l *lexer) nextToken() (token, error) {
 	case ch == '\'':
 		l.advance()
 		return token{kind: tokQuote, line: line, col: col}, nil
+	case ch == '`':
+		l.advance()
+		return token{kind: tokBackquote, line: line, col: col}, nil
+	case ch == ',':
+		l.advance()
+		if l.pos < len(l.input) && l.peek() == '@' {
+			l.advance()
+			return token{kind: tokCommaAt, line: line, col: col}, nil
+		}
+		return token{kind: tokComma, line: line, col: col}, nil
 	case ch == '#':
 		l.advance()
 		next := l.peek()
@@ -599,6 +613,9 @@ func (l *lexer) nextToken() (token, error) {
 		} else if next == '\'' {
 			l.advance()
 			return token{kind: tokSyntaxQuote, line: line, col: col}, nil
+		} else if next == '(' {
+			l.advance()
+			return token{kind: tokHashLParen, line: line, col: col}, nil
 		}
 		return token{}, &EvalError{Message: fmt.Sprintf("%d:%d: unexpected character after #", line, col)}
 	default:
@@ -715,6 +732,7 @@ type astNode struct {
 	children []*astNode
 	hasDot   bool // true if list contains a dot (e.g., (a . b) or (x . rest))
 	dotPos   int  // index in children where dot appeared
+	isVector bool // true if this is a #(...) vector literal
 	line     int
 	col      int
 }
@@ -770,6 +788,51 @@ func (p *parser) parseExpr() (*astNode, error) {
 			},
 			line: t.line, col: t.col,
 		}, nil
+	case tokBackquote:
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if inner == nil {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unexpected end of input after backquote", t.line, t.col)}
+		}
+		return &astNode{
+			children: []*astNode{
+				{isAtom: true, tok: token{kind: tokSymbol, sval: "quasiquote", line: t.line, col: t.col}, line: t.line, col: t.col},
+				inner,
+			},
+			line: t.line, col: t.col,
+		}, nil
+	case tokComma:
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if inner == nil {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unexpected end of input after comma", t.line, t.col)}
+		}
+		return &astNode{
+			children: []*astNode{
+				{isAtom: true, tok: token{kind: tokSymbol, sval: "unquote", line: t.line, col: t.col}, line: t.line, col: t.col},
+				inner,
+			},
+			line: t.line, col: t.col,
+		}, nil
+	case tokCommaAt:
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if inner == nil {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unexpected end of input after ,@", t.line, t.col)}
+		}
+		return &astNode{
+			children: []*astNode{
+				{isAtom: true, tok: token{kind: tokSymbol, sval: "unquote-splicing", line: t.line, col: t.col}, line: t.line, col: t.col},
+				inner,
+			},
+			line: t.line, col: t.col,
+		}, nil
 	case tokSyntaxQuote:
 		inner, err := p.parseExpr()
 		if err != nil {
@@ -785,6 +848,27 @@ func (p *parser) parseExpr() (*astNode, error) {
 			},
 			line: t.line, col: t.col,
 		}, nil
+	case tokHashLParen:
+		node := &astNode{line: t.line, col: t.col, isVector: true}
+		for {
+			pk, err := p.peek()
+			if err != nil {
+				return nil, err
+			}
+			if pk.kind == tokRParen {
+				p.next()
+				break
+			}
+			if pk.kind == tokEOF {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unexpected end of input in vector literal", t.line, t.col)}
+			}
+			child, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			node.children = append(node.children, child)
+		}
+		return node, nil
 	case tokRParen:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unexpected ')'", t.line, t.col)}
 	case tokEOF:
@@ -850,6 +934,17 @@ func eval(node *astNode, e *env, ip *interp) (*Value, error) {
 		if node.isAtom {
 			return evalAtom(node, e)
 		}
+		if node.isVector {
+			elems := make([]*Value, len(node.children))
+			for i, c := range node.children {
+				v, err := eval(c, e, ip)
+				if err != nil {
+					return nil, err
+				}
+				elems[i] = v
+			}
+			return &Value{typ: valVector, recordFields: elems}, nil
+		}
 		val, err := evalList(node, e, ip)
 		if err != nil {
 			if tc, ok := err.(*tailCallErr); ok {
@@ -909,6 +1004,11 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quote: need 1 argument", node.line, node.col)}
 			}
 			return quoteNode(node.children[1]), nil
+		case "quasiquote":
+			if len(node.children) != 2 {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quasiquote: need 1 argument", node.line, node.col)}
+			}
+			return evalQuasiquote(node.children[1], e, ip)
 		case "lambda":
 			return evalLambda(node, e)
 		case "case-lambda":
@@ -1669,6 +1769,112 @@ func evalBegin(node *astNode, e *env, ip *interp) (*Value, error) {
 	return voidVal(), nil // unreachable
 }
 
+func evalQuasiquote(node *astNode, e *env, ip *interp) (*Value, error) {
+	if node.isAtom {
+		return quoteNode(node), nil
+	}
+	// Check for (unquote x)
+	if len(node.children) == 2 && !node.isVector {
+		head := node.children[0]
+		if head.isAtom && head.tok.kind == tokSymbol && head.tok.sval == "unquote" {
+			return eval(node.children[1], e, ip)
+		}
+	}
+	// Vector: #(...)
+	if node.isVector {
+		var elems []*Value
+		for _, child := range node.children {
+			if !child.isAtom && len(child.children) == 2 {
+				h := child.children[0]
+				if h.isAtom && h.tok.kind == tokSymbol && h.tok.sval == "unquote-splicing" {
+					v, err := eval(child.children[1], e, ip)
+					if err != nil {
+						return nil, err
+					}
+					for v.typ == valPair {
+						elems = append(elems, v.car)
+						v = v.cdr
+					}
+					continue
+				}
+			}
+			v, err := evalQuasiquote(child, e, ip)
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, v)
+		}
+		return &Value{typ: valVector, recordFields: elems}, nil
+	}
+	// List
+	if len(node.children) == 0 {
+		return nilVal(), nil
+	}
+	// Handle dotted lists
+	if node.hasDot {
+		result, err := evalQuasiquote(node.children[node.dotPos], e, ip)
+		if err != nil {
+			return nil, err
+		}
+		for i := node.dotPos - 1; i >= 0; i-- {
+			child := node.children[i]
+			if !child.isAtom && len(child.children) == 2 {
+				h := child.children[0]
+				if h.isAtom && h.tok.kind == tokSymbol && h.tok.sval == "unquote-splicing" {
+					v, err := eval(child.children[1], e, ip)
+					if err != nil {
+						return nil, err
+					}
+					// Splice: append the spliced list in front of result
+					var items []*Value
+					for v.typ == valPair {
+						items = append(items, v.car)
+						v = v.cdr
+					}
+					for j := len(items) - 1; j >= 0; j-- {
+						result = &Value{typ: valPair, car: items[j], cdr: result}
+					}
+					continue
+				}
+			}
+			v, err := evalQuasiquote(child, e, ip)
+			if err != nil {
+				return nil, err
+			}
+			result = &Value{typ: valPair, car: v, cdr: result}
+		}
+		return result, nil
+	}
+	// Proper list — check for splicing
+	var items []*Value
+	for _, child := range node.children {
+		if !child.isAtom && len(child.children) == 2 {
+			h := child.children[0]
+			if h.isAtom && h.tok.kind == tokSymbol && h.tok.sval == "unquote-splicing" {
+				v, err := eval(child.children[1], e, ip)
+				if err != nil {
+					return nil, err
+				}
+				for v.typ == valPair {
+					items = append(items, v.car)
+					v = v.cdr
+				}
+				continue
+			}
+		}
+		v, err := evalQuasiquote(child, e, ip)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, v)
+	}
+	result := nilVal()
+	for i := len(items) - 1; i >= 0; i-- {
+		result = &Value{typ: valPair, car: items[i], cdr: result}
+	}
+	return result, nil
+}
+
 func evalCond(node *astNode, e *env, ip *interp) (*Value, error) {
 	for _, clause := range node.children[1:] {
 		if clause.isAtom || len(clause.children) < 1 {
@@ -1696,6 +1902,23 @@ func evalCond(node *astNode, e *env, ip *interp) (*Value, error) {
 			body := clause.children[1:]
 			if len(body) == 0 {
 				return cond, nil // (cond (test)) returns test value
+			}
+			// Handle (test => proc) form
+			if len(body) == 2 && body[0].isAtom && body[0].tok.kind == tokSymbol && body[0].tok.sval == "=>" {
+				proc, err := eval(body[1], e, ip)
+				if err != nil {
+					return nil, err
+				}
+				if proc.typ == valLambda {
+					return applyLambdaFull(proc, []*Value{cond}, node, ip)
+				}
+				if proc.typ == valSymbol {
+					return applyBuiltin(proc.sval, []*Value{cond}, node, ip)
+				}
+				if proc.typ == valGoFunc {
+					return proc.goFunc([]*Value{cond})
+				}
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cond =>: not a procedure", node.line, node.col)}
 			}
 			for i, expr := range body {
 				if i == len(body)-1 {
@@ -1730,6 +1953,14 @@ func quoteNode(node *astNode) *Value {
 		case tokSymbol:
 			return symVal(node.tok.sval)
 		}
+	}
+	// Vector literal
+	if node.isVector {
+		elems := make([]*Value, len(node.children))
+		for i, c := range node.children {
+			elems[i] = quoteNode(c)
+		}
+		return &Value{typ: valVector, recordFields: elems}
 	}
 	// List
 	if len(node.children) == 0 {
@@ -1897,50 +2128,33 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		}
 		return result, nil
 
-	case "<":
-		if len(args) != 2 {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: <: need 2 arguments", node.line, node.col)}
+	case "<", ">", "=", "<=", ">=":
+		if len(args) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: need at least 2 arguments", node.line, node.col, name)}
 		}
-		if err := requireNums(args, "<", node); err != nil {
+		if err := requireNums(args, name, node); err != nil {
 			return nil, err
 		}
-		return boolVal(numCmp(args[0], args[1]) < 0), nil
-
-	case ">":
-		if len(args) != 2 {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: >: need 2 arguments", node.line, node.col)}
+		for i := 0; i < len(args)-1; i++ {
+			c := numCmp(args[i], args[i+1])
+			ok := false
+			switch name {
+			case "<":
+				ok = c < 0
+			case ">":
+				ok = c > 0
+			case "=":
+				ok = c == 0
+			case "<=":
+				ok = c <= 0
+			case ">=":
+				ok = c >= 0
+			}
+			if !ok {
+				return boolVal(false), nil
+			}
 		}
-		if err := requireNums(args, ">", node); err != nil {
-			return nil, err
-		}
-		return boolVal(numCmp(args[0], args[1]) > 0), nil
-
-	case "=":
-		if len(args) != 2 {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: =: need 2 arguments", node.line, node.col)}
-		}
-		if err := requireNums(args, "=", node); err != nil {
-			return nil, err
-		}
-		return boolVal(numCmp(args[0], args[1]) == 0), nil
-
-	case "<=":
-		if len(args) != 2 {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: <=: need 2 arguments", node.line, node.col)}
-		}
-		if err := requireNums(args, "<=", node); err != nil {
-			return nil, err
-		}
-		return boolVal(numCmp(args[0], args[1]) <= 0), nil
-
-	case ">=":
-		if len(args) != 2 {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: >=: need 2 arguments", node.line, node.col)}
-		}
-		if err := requireNums(args, ">=", node); err != nil {
-			return nil, err
-		}
-		return boolVal(numCmp(args[0], args[1]) >= 0), nil
+		return boolVal(true), nil
 
 	case "not":
 		if len(args) != 1 {
@@ -2927,6 +3141,65 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		}
 		return boolVal(false), nil
 
+	case "assq":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: assq: need 2 arguments", node.line, node.col)}
+		}
+		key := args[0]
+		alist := args[1]
+		for alist.typ == valPair {
+			entry := alist.car
+			if entry.typ == valPair && valEq(key, entry.car) {
+				return entry, nil
+			}
+			alist = alist.cdr
+		}
+		return boolVal(false), nil
+
+	case "memq":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: memq: need 2 arguments", node.line, node.col)}
+		}
+		lst := args[1]
+		for lst.typ == valPair {
+			if valEq(args[0], lst.car) {
+				return lst, nil
+			}
+			lst = lst.cdr
+		}
+		return boolVal(false), nil
+
+	case "memv":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: memv: need 2 arguments", node.line, node.col)}
+		}
+		lst := args[1]
+		for lst.typ == valPair {
+			if valEqv(args[0], lst.car) {
+				return lst, nil
+			}
+			lst = lst.cdr
+		}
+		return boolVal(false), nil
+
+	case "make-list":
+		if len(args) < 1 || len(args) > 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: make-list: need 1 or 2 arguments", node.line, node.col)}
+		}
+		if args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: make-list: expected integer", node.line, node.col)}
+		}
+		n := int(args[0].ival)
+		fill := nilVal()
+		if len(args) == 2 {
+			fill = args[1]
+		}
+		result := nilVal()
+		for i := 0; i < n; i++ {
+			result = &Value{typ: valPair, car: fill, cdr: result}
+		}
+		return result, nil
+
 	case "syntax->datum":
 		if len(args) != 1 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax->datum: need 1 argument", node.line, node.col)}
@@ -3408,7 +3681,7 @@ var builtinNames = []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not"
 	"gcd", "lcm", "truncate", "round",
 	"make-string", "string",
 	"string>?", "string<=?", "string>=?",
-	"member", "assv",
+	"member", "memq", "memv", "assv", "assq", "make-list",
 	"call/cc", "call-with-current-continuation",
 	"dynamic-wind",
 	"raise", "with-exception-handler",

@@ -271,6 +271,14 @@ func syntaxToDatumValue(node *astNode) *Value {
 			return symVal(node.tok.sval)
 		}
 	}
+	// Vector literal
+	if node.isVector {
+		elems := make([]*Value, len(node.children))
+		for i, c := range node.children {
+			elems[i] = syntaxToDatumValue(c)
+		}
+		return &Value{typ: valVector, recordFields: elems}
+	}
 	// List: convert to proper list
 	if len(node.children) == 0 {
 		return nilVal()
@@ -314,6 +322,12 @@ func valueToAstNode(v *Value) *astNode {
 			return &astNode{children: children, hasDot: true, dotPos: len(children) - 1}
 		}
 		return &astNode{children: children}
+	case valVector:
+		children := make([]*astNode, len(v.recordFields))
+		for i, el := range v.recordFields {
+			children[i] = valueToAstNode(el)
+		}
+		return &astNode{children: children, isVector: true}
 	case valSyntax:
 		return v.syntaxNode
 	default:
