@@ -25,6 +25,9 @@ private[ming] object Macros:
     "or",
     "define-syntax",
     "syntax-rules",
+    "syntax-case",
+    "syntax",
+    "with-syntax",
     "let*",
     "letrec"
   )
@@ -44,7 +47,15 @@ private[ming] object Macros:
           case _                                  => error("syntax-rules: bad rule")
         }
         val defEnv                  = env
-        val transformer: Val => Val = (form: Val) => expandSyntaxRules(form, literals, rules, defEnv)
+        val defNames                = env.boundNames
+        val transformer: Val => Val = (form: Val) => expandSyntaxRules(form, literals, rules, defEnv, defNames)
+        env.define(name, MacroTransformer(transformer))
+        Void
+      case Pair(Symbol("lambda"), _) =>
+        val closure     = Interpreter.eval(syntaxRules, env)
+        val defEnv      = env
+        val defNames    = env.boundNames
+        val transformer = SyntaxCase.makeTransformer(closure, defEnv, defNames)
         env.define(name, MacroTransformer(transformer))
         Void
       case _ => error("bad define-syntax")
@@ -53,7 +64,8 @@ private[ming] object Macros:
     form: Val,
     literals: List[String],
     rules: List[(Val, Val)],
-    defEnv: Env
+    defEnv: Env,
+    defNames: Set[String] = Set.empty
   ): Val =
     def tryRules(remaining: List[(Val, Val)]): Val = remaining match
       case scala.Nil => error(s"no matching syntax-rules pattern for ${Display.write(form)}")
@@ -61,13 +73,13 @@ private[ming] object Macros:
         matchSyntaxPattern(pattern, form, literals) match
           case Some(bindings) =>
             val patVars = collectPatternVars(pattern, literals)
-            expandTemplate(template, bindings, patVars, defEnv)
+            expandTemplate(template, bindings, patVars, defEnv, Some(defNames))
           case None => tryRules(rest)
     tryRules(rules)
 
   // --- Pattern matching ---
 
-  private def toElements(v: Val): List[Val] = v match
+  private[ming] def toElements(v: Val): List[Val] = v match
     case Nil            => List.empty
     case Pair(car, cdr) => car :: toElements(cdr)
     case _              => List(v)
@@ -82,7 +94,7 @@ private[ming] object Macros:
         matchPatternList(toElements(patRest), Evaluator.toList(inpRest), literals)
       case _ => None
 
-  private def matchPatternList(
+  private[ming] def matchPatternList(
     patElems: List[Val],
     inputs: List[Val],
     literals: List[String]
@@ -115,7 +127,7 @@ private[ming] object Macros:
     case _ :: Symbol("...") :: rest => countFixed(rest)
     case _ :: rest                  => 1 + countFixed(rest)
 
-  private def matchPatternSingle(
+  private[ming] def matchPatternSingle(
     input: Val,
     literals: List[String],
     pattern: Val
@@ -136,11 +148,11 @@ private[ming] object Macros:
         if input == Nil then Some(Map.empty) else None
       case Bool(b) =>
         input match
-          case Bool(b2) if b == b2 => Some(Map.empty);
+          case Bool(b2) if b == b2 => Some(Map.empty)
           case _                   => None
       case Num(n) =>
         input match
-          case Num(n2) if n == n2 => Some(Map.empty);
+          case Num(n2) if n == n2 => Some(Map.empty)
           case _                  => None
       case _ => None
 
@@ -159,7 +171,7 @@ private[ming] object Macros:
       v -> Right(values)
     }.toMap
 
-  private def collectPatternVars(pattern: Val, literals: List[String]): Set[String] =
+  private[ming] def collectPatternVars(pattern: Val, literals: List[String]): Set[String] =
     pattern match
       case Symbol(name) if name != "_" && name != "..." && !literals.contains(name) => Set(name)
       case Pair(car, cdr) => collectPatternVars(car, literals) ++ collectPatternVars(cdr, literals)
@@ -171,21 +183,23 @@ private[ming] object Macros:
     template: Val,
     bindings: Map[String, Either[Val, List[Val]]],
     patVars: Set[String],
-    defEnv: Env
+    defEnv: Env,
+    defBoundNames: Option[Set[String]] = None
   ): Val =
-    val allSyms  = collectAllSymbols(template)
-    val freeSyms = allSyms -- patVars -- specialFormNames - "..."
+    val allSyms    = collectAllSymbols(template)
+    val freeSyms   = allSyms -- patVars -- specialFormNames - "..."
+    val knownNames = defBoundNames.getOrElse(defEnv.boundNames)
     val renameMap = freeSyms.flatMap { sym =>
-      defEnv.lookup(sym) match
-        case None    => Some(sym -> gensym(sym))
-        case Some(_) => None
+      if knownNames.contains(sym) then None
+      else Some(sym -> gensym(sym))
     }.toMap
     expandInner(template, bindings, defEnv, renameMap, patVars)
 
   private def collectAllSymbols(v: Val): Set[String] = v match
-    case Symbol(name)   => Set(name)
-    case Pair(car, cdr) => collectAllSymbols(car) ++ collectAllSymbols(cdr)
-    case _              => Set.empty
+    case Symbol(name)             => Set(name)
+    case Pair(Symbol("quote"), _) => Set.empty
+    case Pair(car, cdr)           => collectAllSymbols(car) ++ collectAllSymbols(cdr)
+    case _                        => Set.empty
 
   private def expandInner(
     template: Val,
@@ -206,7 +220,8 @@ private[ming] object Macros:
           case Some(MacroTransformer(_)) => Symbol(name)
           case Some(v)                   => v
           case None                      => Symbol(name)
-      case Symbol(_) => template
+      case Symbol(_)                => template
+      case Pair(Symbol("quote"), _) => template
       case Pair(_, _) =>
         val elems    = toElements(template)
         val expanded = expandElements(elems, bindings, defEnv, renameMap, patVars)
@@ -244,7 +259,7 @@ private[ming] object Macros:
         expandInner(tmpl, bindings, defEnv, renameMap, patVars) ::
           expandElements(rest, bindings, defEnv, renameMap, patVars)
 
-  private def findEllipsisVars(
+  private[ming] def findEllipsisVars(
     tmpl: Val,
     bindings: Map[String, Either[Val, List[Val]]]
   ): Set[String] =

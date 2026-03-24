@@ -18,6 +18,11 @@ private[ming] class Env(
       bindings(name) = value; true
     else parent.exists(_.set(name, value))
 
+  /** Snapshot all currently bound names (for hygiene). */
+  def boundNames: Set[String] =
+    val names = bindings.keySet.toSet
+    parent.map(p => names ++ p.boundNames).getOrElse(names)
+
 private[ming] object Env:
 
   def empty(parent: Option[Env] = None): Env =

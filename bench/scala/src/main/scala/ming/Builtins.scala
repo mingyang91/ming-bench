@@ -139,6 +139,14 @@ object Builtins:
         Bool(result)
       case _ => throw new EvalError("eqv? requires 2 arguments")
     },
+    "syntax->datum" -> Builtin {
+      case List(v) => v // In our simplified representation, syntax objects are plain values
+      case _       => throw new EvalError("syntax->datum requires 1 argument")
+    },
+    "datum->syntax" -> Builtin {
+      case List(_, datum) => datum // context is ignored in our simplified implementation
+      case _              => throw new EvalError("datum->syntax requires 2 arguments")
+    },
     "procedure?" -> Builtin {
       case List(Builtin(_))          => Bool(true)
       case List(Closure(_, _, _, _)) => Bool(true)

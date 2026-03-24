@@ -206,6 +206,12 @@ object Evaluator:
         )
       case Pair(Symbol("define-syntax"), Pair(Symbol(name), Pair(sr, Nil))) =>
         k(Macros.evalDefineSyntax(name, sr, env))
+      case Pair(Symbol("syntax-case"), rest) =>
+        SyntaxCase.evalSyntaxCaseK(rest, env, k)
+      case Pair(Symbol("syntax"), Pair(template, Nil)) =>
+        k(SyntaxCase.expandSyntaxTemplate(template, env))
+      case Pair(Symbol("with-syntax"), rest) =>
+        SyntaxCase.evalWithSyntaxK(rest, env, k)
       case Pair(Symbol(name), pArgs) =>
         env.lookup(name) match
           case Some(MacroTransformer(expand)) => evalK(expand(expr), env, k)

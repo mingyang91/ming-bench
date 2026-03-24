@@ -85,6 +85,10 @@ private[ming] class Parser(input: String):
             if pos >= input.length then throw new EvalError("unterminated vector literal")
             advance() // skip )
             Evaluator.Val.Vector(elems.toArray)
+          case '\'' =>
+            advance() // skip '
+            val e = parseExpr()
+            Pair(Symbol("syntax"), Pair(e, Nil))
           case other => throw new EvalError(s"unexpected character after #: $other")
       case _ =>
         parseAtom()
