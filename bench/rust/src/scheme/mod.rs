@@ -24,5 +24,14 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     Ok((result?, output))
 }
 
+pub fn eval_str_with_limit(input: &str, max_steps: u64) -> Result<String, EvalError> {
+    let exprs = parser::parse(input)?;
+    let env = Env::default_env();
+    eval::STEP_LIMIT.with(|sl| sl.set(Some(max_steps)));
+    let result = eval::eval_program(&exprs, &env);
+    eval::STEP_LIMIT.with(|sl| sl.set(None));
+    Ok(result?.to_display())
+}
+
 #[cfg(test)]
 mod tests;

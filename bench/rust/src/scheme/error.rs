@@ -17,4 +17,7 @@ pub enum EvalError {
 
     #[error("continuation invoked")]
     ContinuationReturn,
+
+    #[error("step limit exceeded")]
+    StepLimitExceeded,
 }

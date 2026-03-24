@@ -11,6 +11,7 @@ static RECORD_TYPE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     pub static OUTPUT_BUFFER: RefCell<String> = RefCell::new(String::new());
+    pub static STEP_LIMIT: Cell<Option<u64>> = Cell::new(None);
 }
 
 pub fn with_output_capture<F, T>(f: F) -> (T, String)
@@ -1173,6 +1174,19 @@ fn eval_with_stack(initial_expr: &Expr, initial_env: &Env, initial_stack: Vec<Fr
         }
 
         // === PHASE: Evaluate cur_expr ===
+        // Step-limit check
+        let exceeded = STEP_LIMIT.with(|sl| {
+            if let Some(remaining) = sl.get() {
+                if remaining == 0 {
+                    return true;
+                }
+                sl.set(Some(remaining - 1));
+            }
+            false
+        });
+        if exceeded {
+            return Err(EvalError::StepLimitExceeded);
+        }
         let span = cur_expr.span;
 
         // Fast path for atoms
