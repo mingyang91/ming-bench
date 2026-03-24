@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode"
 )
 
@@ -3119,11 +3120,11 @@ func builtinVal(name string) value {
 
 // ---------- Macros (syntax-rules) ----------
 
-var macroCounter int
+var macroCounter int64
 
 func freshName(base string) string {
-	macroCounter++
-	return fmt.Sprintf("%s@@%d", base, macroCounter)
+	n := atomic.AddInt64(&macroCounter, 1)
+	return fmt.Sprintf("%s@@%d", base, n)
 }
 
 func evalDefineSyntax(e *expr, environ *env) (value, error) {
@@ -3873,10 +3874,10 @@ func makeTopLevelEnv() *env {
 	return e
 }
 
-func evalWithEnv(input string, environ *env) (string, error) {
+func evalRaw(input string, environ *env) (value, error) {
 	tokens, err := tokenize(input)
 	if err != nil {
-		return "", err
+		return value{}, err
 	}
 	p := &parser{tokens: tokens}
 
@@ -3884,12 +3885,16 @@ func evalWithEnv(input string, environ *env) (string, error) {
 	for p.peek().kind != tokEOF {
 		e, err := p.parseExpr()
 		if err != nil {
-			return "", err
+			return value{}, err
 		}
 		exprs = append(exprs, e)
 	}
 
-	val, err := cekEvalProgram(exprs, environ)
+	return cekEvalProgram(exprs, environ)
+}
+
+func evalWithEnv(input string, environ *env) (string, error) {
+	val, err := evalRaw(input, environ)
 	if err != nil {
 		return "", err
 	}
@@ -3909,7 +3914,14 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	environ := makeTopLevelEnv()
 	var buf strings.Builder
 	environ.output = &buf
-	r, err := evalWithEnv(input, environ)
+	val, err := evalRaw(input, environ)
+	if err != nil {
+		return "", "", err
+	}
+	r := ""
+	if val.kind != valVoid {
+		r = val.displayStr()
+	}
 	return r, buf.String(), err
 }
 
