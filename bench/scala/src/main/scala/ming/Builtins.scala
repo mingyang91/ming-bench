@@ -142,6 +142,8 @@ object Builtins:
     "procedure?" -> Builtin {
       case List(Builtin(_))          => Bool(true)
       case List(Closure(_, _, _, _)) => Bool(true)
+      case List(_: ContinuationVal)  => Bool(true)
+      case List(CallCCVal)           => Bool(true)
       case List(_)                   => Bool(false)
       case _                         => throw new EvalError("procedure? requires 1 argument")
     },

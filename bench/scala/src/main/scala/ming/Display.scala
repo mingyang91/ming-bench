@@ -21,6 +21,8 @@ object Display:
     case _: Pair             => writeList(v)
     case Builtin(_)          => "#<procedure>"
     case Closure(_, _, _, _) => "#<procedure>"
+    case _: ContinuationVal  => "#<continuation>"
+    case CallCCVal           => "#<procedure>"
     case MacroTransformer(_) => "#<macro>"
     case Record(tag, _)      => s"#<record:$tag>"
     case Vector(elems)       => "#(" + elems.map(write).mkString(" ") + ")"

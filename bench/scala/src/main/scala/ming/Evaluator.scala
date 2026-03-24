@@ -1,10 +1,20 @@
 package ming
 
-/** Scheme interpreter entry point. */
+/** Scheme interpreter entry point — CPS-based with first-class continuations. */
 object Evaluator:
 
   /** Value type hierarchy. */
   sealed abstract class Val
+
+  // CPS trampoline types (declared before Val subtypes that reference them)
+  type Cont = Val => Bounce
+
+  sealed trait Bounce
+  case class BDone(v: Val)              extends Bounce
+  case class BMore(thunk: () => Bounce) extends Bounce
+
+  /** Thrown when a continuation is invoked from non-CPS code (inside a Builtin). */
+  class ContinuationJump(val bounce: Bounce) extends Throwable(null, null, true, false)
 
   object Val:
     case class Num(n: Long)                            extends Val
@@ -35,9 +45,13 @@ object Evaluator:
       def apply(car: Val, cdr: Val): Pair    = new Pair(car, cdr)
       def unapply(p: Pair): Some[(Val, Val)] = Some((p.car, p.cdr))
 
+    /** A captured continuation (first-class). */
+    case class ContinuationVal(k: Cont) extends Val
+
+    /** The call/cc primitive as a first-class value. */
+    case object CallCCVal extends Val
+
   import Val.*
-  import TcoForms.TcoResult
-  import TcoForms.TcoResult.*
 
   private[ming] def mkStr(s: String): Val = Str(s.toCharArray)
 
@@ -62,7 +76,7 @@ object Evaluator:
   // --- Output capture ---
   private[ming] val outputBuffer = new StringBuilder
 
-  // --- Mutable string tracking (string-copy creates mutable strings) ---
+  // --- Mutable string tracking ---
   private[ming] val mutableStrings: java.util.Set[Array[Char]] =
     java.util.Collections.newSetFromMap(
       new java.util.IdentityHashMap[Array[Char], java.lang.Boolean]()
@@ -71,10 +85,10 @@ object Evaluator:
   // --- Position tracking ---
   private var lastPos = "1:1"
 
-  private def error(msg: String): Nothing =
+  private[ming] def error(msg: String): Nothing =
     throw new EvalError(s"$lastPos: $msg")
 
-  // --- Helper: set up closure call environment ---
+  // --- Closure env setup ---
   private[ming] def setupClosureEnv(
     params: List[String],
     restParam: Option[String],
@@ -94,131 +108,111 @@ object Evaluator:
     }
     callEnv
 
-  /** Dispatch a TcoResult: either continue the trampoline or return a value. */
-  private inline def dispatchTco(
-    result: TcoResult,
-    curExpr: Array[Val],
-    curEnv: Array[Env]
-  ): Val | scala.Null =
-    result match
-      case Continue(e, env) => curExpr(0) = e; curEnv(0) = env; null
-      case Done(v)          => v
-
-  // --- Evaluator (trampoline for TCO) ---
-  private def eval(expr0: Val, env0: Env): Val =
-    val curExprArr = Array[Val](expr0)
-    val curEnvArr  = Array[Env](env0)
-
-    while true do
-      val curExpr = curExprArr(0)
-      val curEnv  = curEnvArr(0)
-      val result  = evalStep(curExpr, curEnv)
-      if result != null then
-        val v = dispatchTco(result, curExprArr, curEnvArr)
-        if v != null then return v
-      else return curExpr
-
-    throw new RuntimeException("unreachable")
-
-  /** Evaluate one step. Returns null for self-evaluating, TcoResult otherwise. */
-  private def evalStep(curExpr: Val, curEnv: Env): TcoResult | scala.Null =
-    curExpr match
-      case Num(_) | Bool(_) | Str(_) | SchemeChar(_) | Builtin(_) | MacroTransformer(_) | Rational(_, _) | Inexact(_) |
-          Record(_, _) | Vector(_) | Closure(_, _, _, _) =>
-        null
-      case Nil  => null
-      case Void => null
-      case Symbol(name) =>
-        Done(curEnv.lookup(name).getOrElse(error(s"unbound variable: $name")))
-      case Pair(Symbol("quote"), Pair(datum, Nil)) => Done(datum)
-      case Pair(Symbol("define"), rest)            => Done(evalDefine(rest, curEnv))
-      case Pair(Symbol("set!"), Pair(Symbol(name), Pair(valueExpr, Nil))) =>
-        val v = eval(valueExpr, curEnv)
-        if !curEnv.set(name, v) then error(s"unbound variable: $name")
-        Done(Void)
-      case Pair(Symbol("if"), rest) =>
-        TcoForms.evalIf(rest, curEnv, eval, error)
-      case Pair(Symbol("lambda"), rest) => Done(evalLambda(rest, curEnv))
-      case Pair(Symbol("begin"), body) =>
-        val exprs = toList(body)
-        if exprs.isEmpty then Done(Void)
-        else
-          for e <- exprs.init do eval(e, curEnv)
-          Continue(exprs.last, curEnv)
-      case Pair(Symbol("cond"), clauses) =>
-        TcoForms.evalCond(clauses, curEnv, eval, error)
-      case Pair(Symbol("let"), rest) =>
-        TcoForms.evalLet(rest, curEnv, eval, error)
-      case Pair(Symbol("and"), args) =>
-        TcoForms.evalAnd(args, curEnv, eval)
-      case Pair(Symbol("or"), args) =>
-        TcoForms.evalOr(args, curEnv, eval)
-      case Pair(Symbol("define-record-type"), rest) =>
-        Done(Records.evalDefineRecordType(rest, curEnv, error))
-      case Pair(Symbol("case-lambda"), clausesList) =>
-        Done(SpecialForms.evalCaseLambda(clausesList, curEnv, eval, parseParams, error))
-      case Pair(Symbol("let*"), rest) =>
-        Done(SpecialForms.evalLetStar(rest, curEnv, eval, error))
-      case Pair(Symbol("letrec"), rest) =>
-        Done(SpecialForms.evalLetrec(rest, curEnv, eval, error))
-      case Pair(Symbol("letrec*"), rest) =>
-        Done(SpecialForms.evalLetrecStar(rest, curEnv, eval, error))
-      case Pair(Symbol("case"), rest) =>
-        Done(SpecialForms.evalCase(rest, curEnv, eval, error))
-      case Pair(Symbol("do"), rest) =>
-        Done(SpecialForms.evalDo(rest, curEnv, eval, error))
-      case Pair(Symbol("define-syntax"), Pair(Symbol(name), Pair(sr, Nil))) =>
-        Done(Macros.evalDefineSyntax(name, sr, curEnv))
-      case Pair(Symbol(name), pArgs) =>
-        curEnv.lookup(name) match
-          case Some(MacroTransformer(expand)) => Continue(expand(curExpr), curEnv)
-          case _ =>
-            val func    = eval(Symbol(name), curEnv)
-            val argList = toList(pArgs).map(a => eval(a, curEnv))
-            TcoForms.applyFuncTco(func, argList, eval, error, applyBuiltinChecked)
-      case Pair(head, args) =>
-        val func    = eval(head, curEnv)
-        val argList = toList(args).map(a => eval(a, curEnv))
-        TcoForms.applyFuncTco(func, argList, eval, error, applyBuiltinChecked)
-      case _ => null // safety fallback
-
-  private def evalDefine(rest: Val, env: Env): Val =
-    rest match
-      case Pair(Pair(Symbol(name), params), body) =>
-        val lambdaExpr = Pair(Symbol("lambda"), Pair(params, body))
-        env.define(name, eval(lambdaExpr, env))
-        Void
-      case Pair(Symbol(name), Pair(valueExpr, Nil)) =>
-        env.define(name, eval(valueExpr, env))
-        Void
-      case _ => error("bad define syntax")
-
-  /** Parse parameter list, returning (fixed params, optional rest param). */
-  private def parseParams(params: Val): (List[String], Option[String]) =
-    params match
-      case Nil          => (List.empty, None)
-      case Symbol(name) => (List.empty, Some(name))
-      case Pair(Symbol(name), rest) =>
-        rest match
-          case Symbol(restName) => (List(name), Some(restName))
-          case _ =>
-            val (more, restParam) = parseParams(rest)
-            (name :: more, restParam)
-      case _ => error(s"bad parameter: ${Display.write(params)}")
-
-  private def evalLambda(rest: Val, env: Env): Val =
-    rest match
-      case Pair(params, body) =>
-        val (paramNames, restParam) = parseParams(params)
-        val bodyList                = toList(body)
-        if bodyList.isEmpty then error("lambda: empty body")
-        Closure(paramNames, restParam, bodyList, env)
-      case _ => error("bad lambda syntax")
-
   private[ming] def toList(v: Val): List[Val] = v match
     case Nil            => List.empty
     case Pair(car, cdr) => car :: toList(cdr)
     case _              => error("improper list")
+
+  // ======== Trampoline runner ========
+
+  private def trampoline(b0: Bounce): Val =
+    var b = b0
+    while true do
+      b match
+        case BDone(v) => return v
+        case BMore(thunk) =>
+          try b = thunk()
+          catch case jump: ContinuationJump => b = jump.bounce
+    throw new RuntimeException("unreachable")
+
+  // ======== CPS Evaluator core ========
+
+  private[ming] def evalK(expr: Val, env: Env, k: Cont): Bounce = BMore { () =>
+    expr match
+      case _: Num | _: Bool | _: Str | _: SchemeChar | _: Builtin | _: MacroTransformer | _: Rational | _: Inexact |
+          _: Record | _: Vector | _: Closure | _: ContinuationVal | CallCCVal =>
+        k(expr)
+      case Nil  => k(Nil)
+      case Void => k(Void)
+      case Symbol(name) =>
+        k(env.lookup(name).getOrElse(error(s"unbound variable: $name")))
+      case Pair(Symbol("quote"), Pair(datum, Nil)) => k(datum)
+      case Pair(Symbol("define"), rest)            => SpecialForms.evalDefineK(rest, env, k)
+      case Pair(Symbol("set!"), Pair(Symbol(name), Pair(valueExpr, Nil))) =>
+        evalK(
+          valueExpr,
+          env,
+          v =>
+            if !env.set(name, v) then error(s"unbound variable: $name")
+            k(Void)
+        )
+      case Pair(Symbol("if"), rest)                 => SpecialForms.evalIfK(rest, env, k)
+      case Pair(Symbol("lambda"), rest)             => k(SpecialForms.evalLambda(rest, env))
+      case Pair(Symbol("begin"), body)              => evalSeqK(toList(body), env, k)
+      case Pair(Symbol("cond"), clauses)            => SpecialForms.evalCondK(clauses, env, k)
+      case Pair(Symbol("let"), rest)                => BindingForms.evalLetK(rest, env, k)
+      case Pair(Symbol("and"), args)                => SpecialForms.evalAndK(toList(args), env, k)
+      case Pair(Symbol("or"), args)                 => SpecialForms.evalOrK(toList(args), env, k)
+      case Pair(Symbol("define-record-type"), rest) => k(Records.evalDefineRecordType(rest, env, error))
+      case Pair(Symbol("case-lambda"), clausesList) => k(SpecialForms.evalCaseLambda(clausesList, env))
+      case Pair(Symbol("let*"), rest)               => BindingForms.evalLetStarK(rest, env, k)
+      case Pair(Symbol("letrec"), rest)             => BindingForms.evalLetrecK(rest, env, k)
+      case Pair(Symbol("letrec*"), rest)            => BindingForms.evalLetrecStarK(rest, env, k)
+      case Pair(Symbol("case"), rest)               => SpecialForms.evalCaseK(rest, env, k)
+      case Pair(Symbol("do"), rest)                 => BindingForms.evalDoK(rest, env, k)
+      case Pair(Symbol("define-syntax"), Pair(Symbol(name), Pair(sr, Nil))) =>
+        k(Macros.evalDefineSyntax(name, sr, env))
+      case Pair(Symbol(name), pArgs) =>
+        env.lookup(name) match
+          case Some(MacroTransformer(expand)) => evalK(expand(expr), env, k)
+          case Some(func) =>
+            evalListK(toList(pArgs), env, argList => applyK(func, argList, k))
+          case None => error(s"unbound variable: $name")
+      case Pair(head, args) =>
+        evalK(head, env, func => evalListK(toList(args), env, argList => applyK(func, argList, k)))
+      case _ => k(expr)
+  }
+
+  // ======== Argument list evaluation (right-to-left for correct call/cc semantics) ========
+
+  private def evalListK(exprs: List[Val], env: Env, k: List[Val] => Bounce): Bounce =
+    val reversed = exprs.reverse
+    def loop(remaining: List[Val], acc: List[Val]): Bounce =
+      remaining match
+        case scala.Nil => k(acc)
+        case head :: tail =>
+          evalK(head, env, v => BMore(() => loop(tail, v :: acc)))
+    loop(reversed, scala.Nil)
+
+  // ======== Sequence evaluation (left-to-right, last in tail position) ========
+
+  private[ming] def evalSeqK(exprs: List[Val], env: Env, k: Cont): Bounce =
+    exprs match
+      case scala.Nil         => k(Void)
+      case last :: scala.Nil => evalK(last, env, k)
+      case head :: tail      => evalK(head, env, _ => BMore(() => evalSeqK(tail, env, k)))
+
+  // ======== Function application (CPS) ========
+
+  private def applyK(func: Val, args: List[Val], k: Cont): Bounce =
+    func match
+      case CallCCVal =>
+        args match
+          case List(proc) => applyK(proc, List(ContinuationVal(k)), k)
+          case _          => error("call/cc requires 1 argument")
+      case ContinuationVal(savedK) =>
+        args match
+          case List(v) => savedK(v)
+          case _       => error("continuation requires 1 argument")
+      case Closure(params, restParam, body, closureEnv) =>
+        val callEnv = setupClosureEnv(params, restParam, body, closureEnv, args)
+        evalSeqK(body, callEnv, k)
+      case Builtin(f) =>
+        try k(applyBuiltinChecked(f, args))
+        catch case jump: ContinuationJump => jump.bounce
+      case _ => error(s"not a procedure: ${Display.write(func)}")
+
+  // ======== Non-CPS wrappers ========
 
   private def applyBuiltinChecked(f: List[Val] => Val, args: List[Val]): Val =
     try f(args)
@@ -227,30 +221,52 @@ object Evaluator:
         if !e.getMessage.matches(".*\\d+:\\d+.*") then error(e.getMessage)
         else throw e
 
+  private[ming] def eval(expr: Val, env: Env): Val =
+    trampoline(evalK(expr, env, v => BDone(v)))
+
   private[ming] def applyFunc(func: Val, args: List[Val]): Val = func match
     case Closure(params, restParam, body, closureEnv) =>
       val callEnv     = setupClosureEnv(params, restParam, body, closureEnv, args)
       var result: Val = Void
       for expr <- body do result = eval(expr, callEnv)
       result
+    case ContinuationVal(savedK) =>
+      args match
+        case List(v) => throw new ContinuationJump(savedK(v))
+        case _       => error("continuation requires 1 argument")
+    case CallCCVal =>
+      args match
+        case List(proc) => trampoline(applyK(CallCCVal, args, v => BDone(v)))
+        case _          => error("call/cc requires 1 argument")
     case Builtin(f) => applyBuiltinChecked(f, args)
     case _          => error(s"not a procedure: ${Display.write(func)}")
+
+  // ======== Default environment ========
 
   private def defaultEnv(): Env =
     val env = Env.empty()
     Builtins.all.foreach((name, v) => env.define(name, v))
+    env.define("call/cc", CallCCVal)
+    env.define("call-with-current-continuation", CallCCVal)
     env
 
-  // --- Public API ---
+  // ======== Public API ========
+
   def evalStr(input: String): String =
     val parser = new Parser(input)
     val exprs  = parser.parseAllWithPositions()
     if exprs.isEmpty then throw new EvalError("no expressions")
-    val env         = defaultEnv()
-    var result: Val = Void
-    for (expr, line, col) <- exprs do
-      lastPos = s"$line:$col"
-      result = eval(expr, env)
+    val env = defaultEnv()
+    def evalTopLevel(remaining: List[(Val, Int, Int)], k: Cont): Bounce =
+      remaining match
+        case scala.Nil => k(Void)
+        case (expr, line, col) :: scala.Nil =>
+          lastPos = s"$line:$col"
+          evalK(expr, env, k)
+        case (expr, line, col) :: rest =>
+          lastPos = s"$line:$col"
+          evalK(expr, env, _ => BMore(() => evalTopLevel(rest, k)))
+    val result = trampoline(evalTopLevel(exprs, v => BDone(v)))
     Display.write(result)
 
   def evalStrWithOutput(input: String): (String, String) =
@@ -258,11 +274,17 @@ object Evaluator:
     val parser = new Parser(input)
     val exprs  = parser.parseAllWithPositions()
     if exprs.isEmpty then throw new EvalError("no expressions")
-    val env         = defaultEnv()
-    var result: Val = Void
-    for (expr, line, col) <- exprs do
-      lastPos = s"$line:$col"
-      result = eval(expr, env)
+    val env = defaultEnv()
+    def evalTopLevel(remaining: List[(Val, Int, Int)], k: Cont): Bounce =
+      remaining match
+        case scala.Nil => k(Void)
+        case (expr, line, col) :: scala.Nil =>
+          lastPos = s"$line:$col"
+          evalK(expr, env, k)
+        case (expr, line, col) :: rest =>
+          lastPos = s"$line:$col"
+          evalK(expr, env, _ => BMore(() => evalTopLevel(rest, k)))
+    val result = trampoline(evalTopLevel(exprs, v => BDone(v)))
     val output = outputBuffer.toString
     outputBuffer.clear()
     (Display.write(result), output)
