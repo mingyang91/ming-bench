@@ -9,6 +9,6 @@ pub enum EvalError {
     Arity(String),
     #[error("unbound variable: {0}")]
     UnboundVariable(String),
-    #[error("division by zero")]
-    DivisionByZero,
+    #[error("division by zero: {0}")]
+    DivisionByZero(String),
 }
