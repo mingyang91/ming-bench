@@ -184,6 +184,18 @@ class Env {
   set(name: string, value: SchemeVal): void {
     this.bindings.set(name, value);
   }
+
+  update(name: string, value: SchemeVal): void {
+    if (this.bindings.has(name)) {
+      this.bindings.set(name, value);
+      return;
+    }
+    if (this.parent) {
+      this.parent.update(name, value);
+      return;
+    }
+    throw new EvalError(`unbound variable: ${name}`);
+  }
 }
 
 function displayVal(val: SchemeVal): string {
@@ -526,6 +538,19 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
               return { tag: 'void' };
             }
             throw errAt('invalid define syntax', expr.pos);
+          }
+          case 'set!': {
+            if (elems.length !== 3) throw errAt('set! requires exactly 2 arguments', expr.pos);
+            const target = elems[1];
+            if (target.tag !== 'symbol') throw errAt('set! target must be a symbol', expr.pos);
+            const val = evaluate(elems[2], env);
+            try {
+              env.update(target.value, val);
+            } catch (e) {
+              if (e instanceof EvalError) throw errAt(e.message, expr.pos);
+              throw e;
+            }
+            return { tag: 'void' };
           }
           case 'if': {
             if (elems.length < 3) throw errAt('if requires at least 2 arguments', expr.pos);
