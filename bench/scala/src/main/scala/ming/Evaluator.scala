@@ -74,6 +74,8 @@ object Evaluator:
       case Pair(Symbol("and"), args)                => evalAnd(args, env)
       case Pair(Symbol("or"), args)                 => evalOr(args, env)
       case Pair(Symbol("define-record-type"), rest) => Records.evalDefineRecordType(rest, env, error)
+      case Pair(Symbol("case-lambda"), clausesList) =>
+        evalCaseLambda(clausesList, env)
       case Pair(Symbol("define-syntax"), Pair(Symbol(name), Pair(sr, Nil))) =>
         Macros.evalDefineSyntax(name, sr, env)
       case p @ Pair(Symbol(name), _) =>
@@ -154,6 +156,36 @@ object Evaluator:
         }
       case _ => error("bad lambda syntax")
 
+  private def evalCaseLambda(clausesList: Val, env: Env): Val =
+    val clauses = toList(clausesList).map { clause =>
+      clause match
+        case Pair(params, body) =>
+          val (paramNames, restParam) = parseParams(params)
+          val bodyList                = toList(body)
+          if bodyList.isEmpty then error("case-lambda: empty body")
+          (paramNames, restParam, bodyList)
+        case _ => error("bad case-lambda clause")
+    }
+    Builtin { args =>
+      val matched = clauses.find { (paramNames, restParam, _) =>
+        if restParam.isDefined then args.length >= paramNames.length
+        else args.length == paramNames.length
+      }
+      matched match
+        case Some((paramNames, restParam, bodyList)) =>
+          val childEnv = Env.empty(Some(env))
+          paramNames.zip(args).foreach((p, a) => childEnv.define(p, a))
+          restParam.foreach { rp =>
+            val restArgs = args.drop(paramNames.length)
+            childEnv.define(rp, restArgs.foldRight(Nil: Val)((a, acc) => Pair(a, acc)))
+          }
+          var result: Val = Void
+          for expr <- bodyList do result = eval(expr, childEnv)
+          result
+        case None =>
+          error(s"case-lambda: no matching clause for ${args.length} arguments")
+    }
+
   private def evalAnd(args: Val, env: Env): Val =
     args match
       case Nil          => Bool(true)
@@ -185,73 +217,10 @@ object Evaluator:
       result
 
   private def evalCond(clauses: Val, env: Env): Val =
-    clauses match
-      case Nil => Void
-      case Pair(clause, rest) =>
-        val clauseList = toList(clause)
-        if clauseList.isEmpty then error("bad cond clause")
-        clauseList.head match
-          case Symbol("else") =>
-            var result: Val = Void
-            for expr <- clauseList.tail do result = eval(expr, env)
-            result
-          case test =>
-            val v = eval(test, env)
-            if v != Bool(false) then
-              if clauseList.tail.isEmpty then v
-              else
-                var result: Val = Void
-                for expr <- clauseList.tail do result = eval(expr, env)
-                result
-            else evalCond(rest, env)
-      case _ => error("bad cond syntax")
+    LetForms.evalCond(clauses, env, eval, error)
 
   private def evalLet(rest: Val, env: Env): Val =
-    rest match
-      // Named let: (let name ((var init) ...) body ...)
-      case Pair(Symbol(name), Pair(bindings, body)) =>
-        val bindingList = toList(bindings)
-        val paramNames = bindingList.map {
-          case Pair(Symbol(p), Pair(_, Nil)) => p
-          case _                             => error("bad named let binding")
-        }
-        val initVals = bindingList.map {
-          case Pair(_, Pair(v, Nil)) => eval(v, env)
-          case _                     => error("bad named let binding")
-        }
-        val bodyList = toList(body)
-        if bodyList.isEmpty then error("let: empty body")
-        val childEnv = Env.empty(Some(env))
-        val loopFunc = Builtin { args =>
-          if args.length != paramNames.length then
-            error(s"named let $name: expected ${paramNames.length} arguments, got ${args.length}")
-          val loopEnv = Env.empty(Some(childEnv))
-          paramNames.zip(args).foreach((p, a) => loopEnv.define(p, a))
-          var result: Val = Void
-          for expr <- bodyList do result = eval(expr, loopEnv)
-          result
-        }
-        childEnv.define(name, loopFunc)
-        // Initial call
-        val loopEnv = Env.empty(Some(childEnv))
-        paramNames.zip(initVals).foreach((p, a) => loopEnv.define(p, a))
-        var result: Val = Void
-        for expr <- bodyList do result = eval(expr, loopEnv)
-        result
-      // Regular let: (let ((var init) ...) body ...)
-      case Pair(bindings, body) =>
-        val childEnv = Env.empty(Some(env))
-        for binding <- toList(bindings) do
-          binding match
-            case Pair(Symbol(name), Pair(valueExpr, Nil)) =>
-              childEnv.define(name, eval(valueExpr, env))
-            case _ => error("bad let binding")
-        val bodyList = toList(body)
-        if bodyList.isEmpty then error("let: empty body")
-        var result: Val = Void
-        for expr <- bodyList do result = eval(expr, childEnv)
-        result
-      case _ => error("bad let syntax")
+    LetForms.evalLet(rest, env, eval, error)
 
   private[ming] def toList(v: Val): List[Val] = v match
     case Nil            => List.empty
