@@ -20,17 +20,29 @@ type SchemeVal =
   | { tag: 'record'; typeName: string; fields: Map<string, SchemeVal>; pos?: Pos }
   | { tag: 'case-lambda'; clauses: { params: string[]; restParam?: string; body: SchemeVal[] }[]; env: Env; pos?: Pos }
   | { tag: 'void'; pos?: Pos }
-  | { tag: 'continuation'; kont: Kont; pos?: Pos };
+  | { tag: 'continuation'; kont: Kont; windStack?: any; pos?: Pos };
+
+interface WindFrame { inThunk: SchemeVal; outThunk: SchemeVal }
 
 // --- CEK Machine Continuation Types ---
 
 class ContinuationReturn {
-  constructor(public kont: Kont, public value: SchemeVal) {}
+  constructor(public kont: Kont, public value: SchemeVal, public windStack: WindFrame[] = []) {}
 }
 
-type Kont = KontFrame | null;
+type Kont = KontFrame | DwFrame | null;
 
 type KontFrame = { next: Kont } & KontData;
+
+// Dynamic-wind continuation frame (separate from KontData to avoid TypeScript union size issues)
+interface DwFrame {
+  tag: 'dw';
+  phase: number;
+  next: Kont;
+  bodyThunk?: SchemeVal; outThunk?: SchemeVal; inThunk?: SchemeVal;
+  result?: SchemeVal;
+  unwindOuts?: SchemeVal[]; rewindFrames?: WindFrame[];
+}
 
 type KontData =
   | { tag: 'seq'; exprs: SchemeVal[]; idx: number; env: Env }
@@ -1107,7 +1119,7 @@ function makeGlobalEnv(outputBuf: string[]): Env {
       } else if (func.tag === 'case-lambda') {
         result.push(applyCaseLambda(func, callArgs, p));
       } else if (func.tag === 'continuation') {
-        throw new ContinuationReturn(func.kont, callArgs[0] ?? { tag: 'void' });
+        throw new ContinuationReturn(func.kont, callArgs[0] ?? { tag: 'void' }, func.windStack);
       } else {
         throw new EvalError(`${fmtPos(p)}map: not a procedure`);
       }
@@ -1143,7 +1155,7 @@ function makeGlobalEnv(outputBuf: string[]): Env {
       } else if (func.tag === 'case-lambda') {
         applyCaseLambda(func, callArgs, p);
       } else if (func.tag === 'continuation') {
-        throw new ContinuationReturn(func.kont, callArgs[0] ?? { tag: 'void' });
+        throw new ContinuationReturn(func.kont, callArgs[0] ?? { tag: 'void' }, func.windStack);
       } else {
         throw new EvalError(`${fmtPos(p)}for-each: not a procedure`);
       }
@@ -1469,7 +1481,7 @@ function makeGlobalEnv(outputBuf: string[]): Env {
       return result;
     }
     if (func.tag === 'case-lambda') return applyCaseLambda(func, callArgs, p);
-    if (func.tag === 'continuation') throw new ContinuationReturn(func.kont, callArgs[0] ?? { tag: 'void' });
+    if (func.tag === 'continuation') throw new ContinuationReturn(func.kont, callArgs[0] ?? { tag: 'void' }, func.windStack);
     throw new EvalError(`${fmtPos(p)}apply: not a procedure`);
   });
 
@@ -1534,6 +1546,10 @@ function makeGlobalEnv(outputBuf: string[]): Env {
   const callccBuiltin: SchemeVal = { tag: 'builtin', name: 'call/cc', func: () => { throw new Error('call/cc: must be intercepted by CEK machine'); } };
   envDefine(env, 'call/cc', callccBuiltin);
   envDefine(env, 'call-with-current-continuation', callccBuiltin);
+
+  // dynamic-wind — handled specially by the CEK machine
+  const dwBuiltin: SchemeVal = { tag: 'builtin', name: 'dynamic-wind', func: () => { throw new Error('dynamic-wind: must be intercepted by CEK machine'); } };
+  envDefine(env, 'dynamic-wind', dwBuiltin);
 
   return env;
 }
@@ -1731,6 +1747,8 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
   let env: Env = initEnv;
   let kont: Kont = null;  // halt
   let val: SchemeVal = { tag: 'void' };
+  let windStack: WindFrame[] = [];
+  let windTarget: { kont: Kont; val: SchemeVal; windStack: WindFrame[] } | null = null;
 
   // Deep copy continuation chain (needed for call/cc to snapshot mutable frames)
   function copyKont(k: Kont): Kont {
@@ -1742,19 +1760,55 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
     return { ...k, next: rest } as KontFrame;
   }
 
+  // Wind transition: unwind current, rewind target, then resume continuation
+  function invokeContinuation(targetKont: Kont, targetWindStack: WindFrame[], value: SchemeVal): void {
+    let commonLen = 0;
+    const minLen = Math.min(windStack.length, targetWindStack.length);
+    while (commonLen < minLen && windStack[commonLen] === targetWindStack[commonLen]) commonLen++;
+
+    const unwindOuts = windStack.slice(commonLen).reverse().map(f => f.outThunk);
+    const rewindFrames = targetWindStack.slice(commonLen);
+
+    if (unwindOuts.length === 0 && rewindFrames.length === 0) {
+      kont = targetKont;
+      val = value;
+      ctrl = null;
+      return;
+    }
+
+    windTarget = { kont: targetKont, val: value, windStack: targetWindStack };
+
+    if (unwindOuts.length > 0) {
+      windStack.pop();
+      const first = unwindOuts[0];
+      const restOuts = unwindOuts.slice(1);
+      kont = { tag: 'dw', phase: 3, next: null, unwindOuts: restOuts, rewindFrames };
+      applyFunc(first, [], undefined);
+    } else {
+      windStack.push(rewindFrames[0]);
+      kont = { tag: 'dw', phase: 3, next: null, unwindOuts: [], rewindFrames: rewindFrames.slice(1) };
+      applyFunc(rewindFrames[0].inThunk, [], undefined);
+    }
+  }
+
   // Apply a function to arguments (may set ctrl/env/kont/val)
   function applyFunc(func: SchemeVal, args: SchemeVal[], pos?: Pos): void {
     if (func.tag === 'builtin' && func.name === 'call/cc') {
       if (args.length !== 1) throw new EvalError(`${fmtPos(pos)}call/cc: expected 1 argument`);
       const proc = args[0];
-      const kontVal: SchemeVal = { tag: 'continuation', kont: copyKont(kont) };
+      const kontVal: SchemeVal = { tag: 'continuation', kont: copyKont(kont), windStack: [...windStack] };
       applyFunc(proc, [kontVal], pos);
       return;
     }
+    if (func.tag === 'builtin' && func.name === 'dynamic-wind') {
+      if (args.length !== 3) throw new EvalError(`${fmtPos(pos)}dynamic-wind: expected 3 arguments`);
+      const [inThunk, bodyThunk, outThunk] = args;
+      kont = { tag: 'dw', phase: 0, next: kont, bodyThunk, outThunk, inThunk };
+      applyFunc(inThunk, [], pos);
+      return;
+    }
     if (func.tag === 'continuation') {
-      kont = func.kont;
-      val = args.length > 0 ? args[0] : { tag: 'void' };
-      ctrl = null;
+      invokeContinuation(func.kont, func.windStack, args.length > 0 ? args[0] : { tag: 'void' });
       return;
     }
     if (func.tag === 'builtin') {
@@ -1831,7 +1885,7 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
       for (;;) {
         if (ctrl !== null) {
           // === EVAL PHASE ===
-          const expr = ctrl;
+          const expr: SchemeVal = ctrl;
           ctrl = null;
 
           switch (expr.tag) {
@@ -1849,7 +1903,7 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
               val = expr; break;
 
             case 'list': {
-              const elems = expr.elements;
+              const elems: SchemeVal[] = expr.elements;
               if (elems.length === 0) throw new EvalError(`${fmtPos(expr.pos)}empty application`);
 
               if (elems[0].tag === 'symbol') {
@@ -2085,7 +2139,7 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
                   if (ctorForm.tag !== 'list' || ctorForm.elements.length < 1 || ctorForm.elements[0].tag !== 'symbol')
                     throw new EvalError(`${fmtPos(expr.pos)}define-record-type: invalid constructor`);
                   const ctorName = ctorForm.elements[0].value;
-                  const ctorFields = ctorForm.elements.slice(1).map(e => {
+                  const ctorFields = ctorForm.elements.slice(1).map((e: SchemeVal) => {
                     if (e.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}define-record-type: field must be symbol`);
                     return e.value;
                   });
@@ -2131,7 +2185,7 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
                     throw new EvalError(`${fmtPos(expr.pos)}define-syntax: expected syntax-rules`);
                   if (sr.elements[1].tag !== 'list')
                     throw new EvalError(`${fmtPos(expr.pos)}syntax-rules: expected literals list`);
-                  const literals = sr.elements[1].elements.map(e => {
+                  const literals = sr.elements[1].elements.map((e: SchemeVal) => {
                     if (e.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}syntax-rules: literals must be symbols`);
                     return e.value;
                   });
@@ -2162,7 +2216,45 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
           // === APPLY-KONT PHASE ===
           if (kont === null) return val;
 
-          const frame = kont;
+          // Handle dynamic-wind frames separately (not in KontData union)
+          if (kont.tag === 'dw') {
+            const dw = kont as DwFrame;
+            if (dw.phase === 0) {
+              windStack.push({ inThunk: dw.inThunk!, outThunk: dw.outThunk! });
+              kont = { tag: 'dw', phase: 1, next: dw.next, outThunk: dw.outThunk, inThunk: dw.inThunk };
+              applyFunc(dw.bodyThunk!, []);
+            } else if (dw.phase === 1) {
+              const bodyResult = val;
+              windStack.pop();
+              kont = { tag: 'dw', phase: 2, next: dw.next, result: bodyResult };
+              applyFunc(dw.outThunk!, []);
+            } else if (dw.phase === 2) {
+              val = dw.result!;
+              kont = dw.next;
+            } else {
+              // phase 3: wind transition
+              const uo = dw.unwindOuts!;
+              const rf = dw.rewindFrames!;
+              if (uo.length > 0) {
+                windStack.pop();
+                kont = { tag: 'dw', phase: 3, next: null, unwindOuts: uo.slice(1), rewindFrames: rf };
+                applyFunc(uo[0], []);
+              } else if (rf.length > 0) {
+                windStack.push(rf[0]);
+                kont = { tag: 'dw', phase: 3, next: null, unwindOuts: [], rewindFrames: rf.slice(1) };
+                applyFunc(rf[0].inThunk, []);
+              } else {
+                const t = windTarget!;
+                windTarget = null;
+                windStack = [...t.windStack];
+                kont = t.kont;
+                val = t.val;
+              }
+            }
+            break;
+          }
+
+          const frame = kont as KontFrame;
           switch (frame.tag) {
             case 'seq': {
               // Discard val, eval next. Last is tail position.
@@ -2219,8 +2311,8 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
             }
 
             case 'let-init': {
-              const vals = [...frame.vals, val];
-              const nextIdx = vals.length;
+              const vals: SchemeVal[] = [...frame.vals, val];
+              const nextIdx: number = vals.length;
               if (nextIdx < frame.inits.length) {
                 kont = { ...frame, vals }; ctrl = frame.inits[nextIdx]; env = frame.outerEnv; break;
               }
@@ -2410,14 +2502,13 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
               kont = { tag: 'do-test', varNames: frame.varNames, stepExprs: frame.stepExprs, testExpr: frame.testExpr, resultExprs: frame.resultExprs, bodyExprs: frame.bodyExprs, env: frame.env, next: frame.next };
               ctrl = frame.testExpr; env = frame.env; break;
             }
+
           }
         }
       }
     } catch (e) {
       if (e instanceof ContinuationReturn) {
-        kont = e.kont;
-        val = e.value;
-        ctrl = null;
+        invokeContinuation(e.kont, e.windStack, e.value);
         continue;
       }
       throw e;
