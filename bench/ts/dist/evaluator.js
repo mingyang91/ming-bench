@@ -263,7 +263,7 @@ class Env {
         throw new EvalError(`unbound variable: ${name}`);
     }
 }
-function displayVal(val) {
+function displayVal(val, seen) {
     switch (val.tag) {
         case 'number': {
             if (val.exact === false && Number.isInteger(val.value))
@@ -277,25 +277,36 @@ function displayVal(val) {
         case 'char': return val.value;
         case 'nil': return '()';
         case 'pair': {
+            if (!seen)
+                seen = new Set();
+            if (seen.has(val))
+                return '(...)';
+            seen.add(val);
             let parts = [];
             let cur = val;
             while (cur.tag === 'pair') {
-                parts.push(displayVal(cur.car));
+                if (cur !== val && seen.has(cur)) {
+                    parts.push('...');
+                    break;
+                }
+                if (cur !== val)
+                    seen.add(cur);
+                parts.push(displayVal(cur.car, seen));
                 cur = cur.cdr;
             }
-            if (cur.tag === 'nil')
+            if (cur.tag === 'nil' || seen.has(cur))
                 return `(${parts.join(' ')})`;
-            return `(${parts.join(' ')} . ${displayVal(cur)})`;
+            return `(${parts.join(' ')} . ${displayVal(cur, seen)})`;
         }
         case 'void': return '';
         case 'procedure': return '#<procedure>';
         case 'macro': return '#<macro>';
-        case 'list': return `(${val.value.map(displayVal).join(' ')})`;
+        case 'list': return `(${val.value.map(v => displayVal(v, seen)).join(' ')})`;
         case 'record': return `#<record:${val.typeName}>`;
-        case 'vector': return `#(${val.value.map(displayVal).join(' ')})`;
+        case 'vector': return `#(${val.value.map(v => displayVal(v, seen)).join(' ')})`;
     }
 }
-function writeVal(val) {
+function writeVal(val, seen) {
     switch (val.tag) {
         case 'string': return `"${strContent(val)}"`; // with quotes for write
         case 'char': {
@@ -307,20 +318,31 @@ function writeVal(val) {
                 return '#\\tab';
             return `#\\${val.value}`;
         }
-        case 'vector': return `#(${val.value.map(writeVal).join(' ')})`;
-        case 'list': return `(${val.value.map(writeVal).join(' ')})`;
+        case 'vector': return `#(${val.value.map(v => writeVal(v, seen)).join(' ')})`;
+        case 'list': return `(${val.value.map(v => writeVal(v, seen)).join(' ')})`;
         case 'pair': {
+            if (!seen)
+                seen = new Set();
+            if (seen.has(val))
+                return '(...)';
+            seen.add(val);
             const parts = [];
             let cur = val;
             while (cur.tag === 'pair') {
-                parts.push(writeVal(cur.car));
+                if (cur !== val && seen.has(cur)) {
+                    parts.push('...');
+                    break;
+                }
+                if (cur !== val)
+                    seen.add(cur);
+                parts.push(writeVal(cur.car, seen));
                 cur = cur.cdr;
             }
-            if (cur.tag === 'nil')
+            if (cur.tag === 'nil' || seen.has(cur))
                 return `(${parts.join(' ')})`;
-            return `(${parts.join(' ')} . ${writeVal(cur)})`;
+            return `(${parts.join(' ')} . ${writeVal(cur, seen)})`;
         }
-        default: return displayVal(val);
+        default: return displayVal(val, seen);
     }
 }
 function schemeEqv(a, b) {
@@ -475,6 +497,22 @@ function makeGlobalEnv(outputBuf) {
                 throw new EvalError('cons requires exactly 2 arguments');
             return { tag: 'pair', car: args[0], cdr: args[1] };
         } });
+    env.set('set-car!', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 2)
+                throw new EvalError('set-car! requires exactly 2 arguments');
+            if (args[0].tag !== 'pair')
+                throw new EvalError('set-car!: not a pair');
+            args[0].car = args[1];
+            return { tag: 'void' };
+        } });
+    env.set('set-cdr!', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 2)
+                throw new EvalError('set-cdr! requires exactly 2 arguments');
+            if (args[0].tag !== 'pair')
+                throw new EvalError('set-cdr!: not a pair');
+            args[0].cdr = args[1];
+            return { tag: 'void' };
+        } });
     env.set('car', { tag: 'procedure', value: (...args) => {
             if (args.length !== 1)
                 throw new EvalError('car requires exactly 1 argument');
@@ -505,12 +543,20 @@ function makeGlobalEnv(outputBuf) {
             if (args.length !== 1)
                 throw new EvalError('length requires exactly 1 argument');
             let count = 0;
-            let cur = args[0];
-            while (cur.tag === 'pair') {
+            let slow = args[0];
+            let fast = args[0];
+            while (fast.tag === 'pair') {
+                fast = fast.cdr;
                 count++;
-                cur = cur.cdr;
+                if (fast.tag !== 'pair')
+                    break;
+                fast = fast.cdr;
+                count++;
+                slow = slow.cdr;
+                if (slow === fast)
+                    throw new EvalError('length: circular list');
             }
-            if (cur.tag !== 'nil')
+            if (fast.tag !== 'nil')
                 throw new EvalError('length: not a proper list');
             return { tag: 'number', value: count };
         } });
@@ -727,6 +773,7 @@ function makeGlobalEnv(outputBuf) {
                 return { tag: 'boolean', value: a === b };
             return { tag: 'boolean', value: a === b };
         } });
+    const equalSeen = new Set();
     const schemeEqual = (a, b) => {
         if (isNumeric(a) && isNumeric(b))
             return toFloat(a) === toFloat(b);
@@ -744,8 +791,16 @@ function makeGlobalEnv(outputBuf) {
             return a.value === b.value;
         if (a.tag === 'string' && b.tag === 'string')
             return strContent(a) === strContent(b);
-        if (a.tag === 'pair' && b.tag === 'pair')
-            return schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr);
+        if (a.tag === 'pair' && b.tag === 'pair') {
+            // Use object identity to detect cycles
+            const key = `${a.__id || (a.__id = ++equalIdCounter)},${b.__id || (b.__id = ++equalIdCounter)}`;
+            if (equalSeen.has(key))
+                return true; // assume equal if revisited
+            equalSeen.add(key);
+            const result = schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr);
+            equalSeen.delete(key);
+            return result;
+        }
         if (a.tag === 'vector' && b.tag === 'vector') {
             if (a.value.length !== b.value.length)
                 return false;
@@ -1053,10 +1108,18 @@ function makeGlobalEnv(outputBuf) {
     env.set('list?', { tag: 'procedure', value: (...args) => {
             if (args.length !== 1)
                 throw new EvalError('list? requires exactly 1 argument');
-            let cur = args[0];
-            while (cur.tag === 'pair')
-                cur = cur.cdr;
-            return { tag: 'boolean', value: cur.tag === 'nil' };
+            let slow = args[0];
+            let fast = args[0];
+            while (fast.tag === 'pair') {
+                fast = fast.cdr;
+                if (fast.tag !== 'pair')
+                    break;
+                fast = fast.cdr;
+                slow = slow.cdr;
+                if (slow === fast)
+                    return { tag: 'boolean', value: false }; // cycle
+            }
+            return { tag: 'boolean', value: fast.tag === 'nil' };
         } });
     // L09: assoc
     env.set('assoc', { tag: 'procedure', value: (...args) => {
@@ -1151,6 +1214,146 @@ function makeGlobalEnv(outputBuf) {
             const allArgs = [...prefixArgs, ...listArgs];
             return func.value(...allArgs);
         } });
+    // cxr helpers
+    const cxr = (ops) => ({ tag: 'procedure', value: (...args) => {
+            if (args.length !== 1)
+                throw new EvalError(`c${ops}r requires exactly 1 argument`);
+            let cur = args[0];
+            for (let i = ops.length - 1; i >= 0; i--) {
+                if (cur.tag !== 'pair')
+                    throw new EvalError(`c${ops}r: not a pair`);
+                cur = ops[i] === 'a' ? cur.car : cur.cdr;
+            }
+            return cur;
+        } });
+    env.set('caar', cxr('aa'));
+    env.set('cadr', cxr('ad'));
+    env.set('cdar', cxr('da'));
+    env.set('cddr', cxr('dd'));
+    env.set('caaar', cxr('aaa'));
+    env.set('caadr', cxr('aad'));
+    env.set('caddr', cxr('add'));
+    env.set('cdddr', cxr('ddd'));
+    env.set('caddar', cxr('adda'));
+    env.set('cadddr', cxr('addd'));
+    // L17: error
+    env.set('error', { tag: 'procedure', value: (...args) => {
+            if (args.length === 0)
+                throw new EvalError('error');
+            const parts = args.map(a => displayVal(a));
+            throw new EvalError(parts.join(' '));
+        } });
+    // reverse
+    env.set('reverse', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1)
+                throw new EvalError('reverse requires exactly 1 argument');
+            let result = NIL;
+            let cur = args[0];
+            while (cur.tag === 'pair') {
+                result = { tag: 'pair', car: cur.car, cdr: result };
+                cur = cur.cdr;
+            }
+            return result;
+        } });
+    // make-string
+    env.set('make-string', { tag: 'procedure', value: (...args) => {
+            if (args.length < 1 || args[0].tag !== 'number')
+                throw new EvalError('make-string: expected number');
+            const n = args[0].value;
+            const ch = args.length > 1 && args[1].tag === 'char' ? args[1].value : '\0';
+            return { tag: 'string', value: '', chars: Array(n).fill(ch) };
+        } });
+    // string (from chars)
+    env.set('string', { tag: 'procedure', value: (...args) => {
+            const chars = [];
+            for (const a of args) {
+                if (a.tag !== 'char')
+                    throw new EvalError('string: expected char');
+                chars.push(a.value);
+            }
+            return { tag: 'string', value: chars.join('') };
+        } });
+    // string comparisons
+    env.set('string>?', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string')
+                throw new EvalError('string>?: expected two strings');
+            return { tag: 'boolean', value: strContent(args[0]) > strContent(args[1]) };
+        } });
+    env.set('string<=?', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string')
+                throw new EvalError('string<=?: expected two strings');
+            return { tag: 'boolean', value: strContent(args[0]) <= strContent(args[1]) };
+        } });
+    env.set('string>=?', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string')
+                throw new EvalError('string>=?: expected two strings');
+            return { tag: 'boolean', value: strContent(args[0]) >= strContent(args[1]) };
+        } });
+    // member (uses equal?)
+    env.set('member', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 2)
+                throw new EvalError('member requires exactly 2 arguments');
+            let cur = args[1];
+            while (cur.tag === 'pair') {
+                if (schemeEqual(args[0], cur.car))
+                    return cur;
+                cur = cur.cdr;
+            }
+            return { tag: 'boolean', value: false };
+        } });
+    // assv (uses eqv?)
+    env.set('assv', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 2)
+                throw new EvalError('assv requires exactly 2 arguments');
+            const key = args[0];
+            let cur = args[1];
+            while (cur.tag === 'pair') {
+                const entry = cur.car;
+                if (entry.tag === 'pair' && schemeEqv(entry.car, key))
+                    return entry;
+                cur = cur.cdr;
+            }
+            return { tag: 'boolean', value: false };
+        } });
+    // gcd (as builtin procedure)
+    env.set('gcd', { tag: 'procedure', value: (...args) => {
+            if (args.length === 0)
+                return { tag: 'number', value: 0 };
+            let result = 0;
+            for (const a of args) {
+                if (a.tag !== 'number')
+                    throw new EvalError('gcd: expected number');
+                result = gcd(result, Math.abs(a.value));
+            }
+            return { tag: 'number', value: result };
+        } });
+    // lcm
+    env.set('lcm', { tag: 'procedure', value: (...args) => {
+            if (args.length === 0)
+                return { tag: 'number', value: 1 };
+            let result = 1;
+            for (const a of args) {
+                if (a.tag !== 'number')
+                    throw new EvalError('lcm: expected number');
+                const v = Math.abs(a.value);
+                if (v === 0)
+                    return { tag: 'number', value: 0 };
+                result = (result / gcd(result, v)) * v;
+            }
+            return { tag: 'number', value: result };
+        } });
+    // truncate
+    env.set('truncate', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1 || !isNumeric(args[0]))
+                throw new EvalError('truncate: expected number');
+            return { tag: 'number', value: Math.trunc(toFloat(args[0])) };
+        } });
+    // round
+    env.set('round', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1 || !isNumeric(args[0]))
+                throw new EvalError('round: expected number');
+            return { tag: 'number', value: Math.round(toFloat(args[0])) };
+        } });
     return env;
 }
 // --- Evaluator ---
@@ -1165,13 +1368,14 @@ function errAt(msg, p) {
 }
 // --- Macro support (L10) ---
 let gensymCounter = 0;
+let equalIdCounter = 0;
 const resolvedSymbols = new Map();
 function gensym(base) {
     return `__gs_${base}_${gensymCounter++}`;
 }
 const SPECIAL_FORMS = new Set([
     'define', 'set!', 'if', 'quote', 'lambda', 'case-lambda', 'and', 'or', 'begin',
-    'let', 'letrec', 'letrec*', 'cond', 'case', 'do', 'define-syntax', 'syntax-rules', 'define-record-type',
+    'let', 'let*', 'letrec', 'letrec*', 'cond', 'case', 'do', 'define-syntax', 'syntax-rules', 'define-record-type',
 ]);
 function collectPatternVarNames(pattern, literals) {
     if (pattern.tag === 'symbol') {
@@ -1627,6 +1831,28 @@ function evaluate(exprIn, envIn) {
                                 childEnv.set(name.value, val);
                             }
                             // Tail: last body expr
+                            for (let i = 2; i < elems.length - 1; i++) {
+                                evaluate(elems[i], childEnv);
+                            }
+                            expr = elems[elems.length - 1];
+                            env = childEnv;
+                            continue trampoline;
+                        }
+                        case 'let*': {
+                            if (elems.length < 3)
+                                throw errAt('let* requires bindings and body', expr.pos);
+                            const bindings = elems[1];
+                            if (bindings.tag !== 'list')
+                                throw errAt('let* bindings must be a list', expr.pos);
+                            const childEnv = new Env(env);
+                            for (const binding of bindings.value) {
+                                if (binding.tag !== 'list' || binding.value.length !== 2)
+                                    throw errAt('invalid let* binding', binding.pos);
+                                if (binding.value[0].tag !== 'symbol')
+                                    throw errAt('let* binding name must be a symbol', binding.pos);
+                                const val = evaluate(binding.value[1], childEnv);
+                                childEnv.set(binding.value[0].value, val);
+                            }
                             for (let i = 2; i < elems.length - 1; i++) {
                                 evaluate(elems[i], childEnv);
                             }
