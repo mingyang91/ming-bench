@@ -769,7 +769,7 @@ fn builtin_type_predicate(name: &str, args: &[Value], span: Span) -> Result<Valu
         "pair?" => matches!(val, Value::List(items) if !items.is_empty()) || matches!(val, Value::Pair(..)),
         "symbol?" => matches!(val, Value::Symbol(_)),
         "char?" => matches!(val, Value::Char(_)),
-        "procedure?" => matches!(val, Value::Lambda(..) | Value::CaseLambda(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..) | Value::Continuation(..)),
+        "procedure?" => matches!(val, Value::Lambda(..) | Value::CaseLambda(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..) | Value::Continuation(..)) || matches!(val, Value::Symbol(s) if is_builtin_name(s)),
         _ => return Err(EvalError::UnboundVariable(name.into(), span)),
     };
     Ok(Value::Boolean(result))
@@ -1047,6 +1047,53 @@ fn builtin_string_extra(name: &str, args: &[Value], span: Span) -> Result<Value,
         }
         _ => Err(EvalError::UnboundVariable(name.into(), span)),
     }
+}
+
+pub(crate) fn is_builtin_name(name: &str) -> bool {
+    matches!(name,
+        "+" | "-" | "*" | "/" | "modulo" | "remainder"
+        | "<" | ">" | "=" | "<=" | ">="
+        | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
+        | "abs" | "quotient" | "min" | "max" | "expt"
+        | "cons" | "car" | "cdr" | "null?" | "list" | "length" | "append"
+        | "list?" | "list-ref" | "list-tail" | "assoc"
+        | "map" | "for-each" | "reverse"
+        | "display" | "write" | "newline"
+        | "string-append" | "string-length" | "substring"
+        | "string->number" | "number->string"
+        | "symbol->string" | "string->symbol"
+        | "string-copy" | "string-ref"
+        | "string->list" | "list->string"
+        | "char->integer" | "integer->char"
+        | "char-alphabetic?" | "char-numeric?"
+        | "char-upcase" | "char-downcase" | "char=?" | "char<?"
+        | "string=?" | "string<?" | "string-ci=?"
+        | "string-upcase" | "string-downcase"
+        | "number?" | "integer?" | "rational?" | "exact?" | "inexact?"
+        | "boolean?" | "string?" | "pair?" | "symbol?" | "char?"
+        | "procedure?"
+        | "exact->inexact" | "inexact->exact" | "numerator" | "denominator"
+        | "gcd" | "lcm" | "truncate" | "round"
+        | "apply"
+        | "equal?" | "eq?" | "eqv?"
+        | "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length"
+        | "vector?" | "vector->list" | "list->vector"
+        | "assq" | "assv" | "memq" | "memv" | "member"
+        | "error"
+        | "set-car!" | "set-cdr!"
+        | "syntax->datum" | "datum->syntax"
+        | "make-string" | "string" | "string<=?" | "string>=?" | "string>?"
+        | "call/cc" | "call-with-current-continuation"
+        | "dynamic-wind"
+        | "raise" | "with-exception-handler" | "guard"
+        | "values" | "call-with-values"
+    ) || is_dynamic_car_cdr(name)
+}
+
+fn is_dynamic_car_cdr(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() >= 3 && bytes[0] == b'c' && bytes[bytes.len()-1] == b'r'
+        && bytes[1..bytes.len()-1].iter().all(|&b| b == b'a' || b == b'd')
 }
 
 pub(crate) fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span, apply_fn: ApplyFn) -> Result<Value, EvalError> {
