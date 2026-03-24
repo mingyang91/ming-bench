@@ -17,6 +17,28 @@ object ApplyBuiltins:
     )
   )
 
+  def valuesBuiltins: List[(String, SchemeVal)] = List(
+    "values" -> SchemeVal.BuiltinProc(
+      "values",
+      args =>
+        if args.length == 1 then args.head
+        else SchemeVal.ValuesVal(args)
+    ),
+    "call-with-values" -> SchemeVal.BuiltinProc(
+      "call-with-values",
+      {
+        case List(producer, consumer) =>
+          val result = Evaluator.applyProc(producer, Nil)
+          val consumerArgs = result match
+            case SchemeVal.ValuesVal(vals) => vals
+            case single                    => List(single)
+          Evaluator.applyProc(consumer, consumerArgs)
+        case args =>
+          throw new EvalError(s"call-with-values: expected 2 arguments, got ${args.length}")
+      }
+    )
+  )
+
   def callccBuiltin: List[(String, SchemeVal)] =
     val impl: List[SchemeVal] => SchemeVal = {
       case List(proc) =>

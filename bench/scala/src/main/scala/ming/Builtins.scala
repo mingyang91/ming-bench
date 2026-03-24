@@ -242,5 +242,6 @@ object Builtins:
       ++ VectorBuiltins.vectorBuiltins
       ++ VectorBuiltins.equalityBuiltins
       ++ ApplyBuiltins.callccBuiltin
+      ++ ApplyBuiltins.valuesBuiltins
     for (name, proc) <- allBuiltins do env.define(name, proc)
     env
