@@ -68,8 +68,16 @@ public class Evaluator {
     private record SyntaxTransformer(List<String> literals, List<Object[]> clauses, Env defEnv) {}
     private record EllipsisList(List<Object> elements) {}
 
+    // syntax-case transformer (procedural macro)
+    private record SyntaxCaseTransformer(Lambda proc, Env defEnv) {}
+    private record SyntaxBinding(Object value) {}
+
     private int gensymCounter = 0;
     private String gensym(String base) { return "__" + base + "_" + (gensymCounter++); }
+
+    // Context for syntax template expansion (set during syntax-case macro invocation)
+    private Env syntaxDefEnv;
+    private Env syntaxUseEnv;
 
     // --- Record types (define-record-type) ---
 
@@ -102,7 +110,7 @@ public class Evaluator {
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "define", "define-syntax", "define-record-type", "set!", "if", "quote", "lambda",
         "case-lambda", "and", "or", "begin", "cond", "let", "let*", "letrec", "letrec*", "case", "do",
-        "when", "unless", "quasiquote"
+        "when", "unless", "quasiquote", "syntax-case", "syntax", "with-syntax"
     );
 
     // Internal string wrapper to distinguish from symbols (mutable for string-set!)
@@ -372,7 +380,8 @@ public class Evaluator {
         "eof-object?", "read", "read-char", "peek-char",
         "with-exception-handler", "raise", "raise-continuable",
         "error", "error-object-message", "error-object?",
-        "values", "call-with-values"
+        "values", "call-with-values",
+        "syntax->datum", "datum->syntax"
     };
 
     private Env makeTopLevelEnv() {
@@ -453,7 +462,11 @@ public class Evaluator {
                 Pos startPos = new Pos(line, col);
                 if (i + 1 < input.length()) {
                     char next = input.charAt(i + 1);
-                    if (next == '(') {
+                    if (next == '\'') {
+                        tokens.add("#'");
+                        tokenPositions.add(startPos);
+                        i += 2; col += 2;
+                    } else if (next == '(') {
                         tokens.add("#(");
                         tokenPositions.add(startPos);
                         i += 2; col += 2;
@@ -546,6 +559,14 @@ public class Evaluator {
         Pos tokenPos = tokenPositions.get(tokenIdx);
         Object token = tokens.get(pos[0]);
         pos[0]++;
+        if (token.equals("#'")) {
+            // #'expr -> (syntax expr)
+            Object quoted = parse(tokens, pos);
+            List<Object> syntaxExpr = new ArrayList<>();
+            syntaxExpr.add(new Located("syntax", tokenPos));
+            syntaxExpr.add(quoted);
+            return new Located(syntaxExpr, tokenPos);
+        }
         if (token.equals("'")) {
             // 'expr -> (quote expr)
             Object quoted = parse(tokens, pos);
@@ -679,26 +700,35 @@ public class Evaluator {
                         Object macroNameObj = unwrap(list.get(1));
                         if (!(macroNameObj instanceof String macroName)) throw new EvalError(posStr() + "define-syntax: expected symbol");
                         Object srFormObj = unwrap(list.get(2));
-                        if (!(srFormObj instanceof List<?> srForm) || srForm.isEmpty()) throw new EvalError(posStr() + "define-syntax: expected syntax-rules");
-                        Object srHead = unwrap(srForm.get(0));
-                        if (!(srHead instanceof String srStr) || !srStr.equals("syntax-rules")) throw new EvalError(posStr() + "define-syntax: expected syntax-rules");
-                        if (srForm.size() < 2) throw new EvalError(posStr() + "syntax-rules: bad syntax");
-                        Object litsObj = unwrap(srForm.get(1));
-                        List<String> literals = new ArrayList<>();
-                        if (litsObj instanceof List<?> litsList) {
-                            for (Object l : litsList) {
-                                Object ul = unwrap(l);
-                                if (ul instanceof String s) literals.add(s);
+                        if (srFormObj instanceof List<?> srForm && !srForm.isEmpty()) {
+                            Object srHead = unwrap(srForm.get(0));
+                            if (srHead instanceof String srStr && srStr.equals("syntax-rules")) {
+                                if (srForm.size() < 2) throw new EvalError(posStr() + "syntax-rules: bad syntax");
+                                Object litsObj = unwrap(srForm.get(1));
+                                List<String> literals = new ArrayList<>();
+                                if (litsObj instanceof List<?> litsList) {
+                                    for (Object l : litsList) {
+                                        Object ul = unwrap(l);
+                                        if (ul instanceof String s) literals.add(s);
+                                    }
+                                }
+                                List<Object[]> clauses = new ArrayList<>();
+                                for (int ci = 2; ci < srForm.size(); ci++) {
+                                    Object clauseObj = unwrap(srForm.get(ci));
+                                    if (!(clauseObj instanceof List<?> clause) || clause.size() != 2) throw new EvalError(posStr() + "syntax-rules: bad clause");
+                                    clauses.add(new Object[]{unwrapDeep(clause.get(0)), unwrapDeep(clause.get(1))});
+                                }
+                                env.define(macroName, new SyntaxTransformer(literals, clauses, env));
+                                return VOID;
                             }
                         }
-                        List<Object[]> clauses = new ArrayList<>();
-                        for (int i = 2; i < srForm.size(); i++) {
-                            Object clauseObj = unwrap(srForm.get(i));
-                            if (!(clauseObj instanceof List<?> clause) || clause.size() != 2) throw new EvalError(posStr() + "syntax-rules: bad clause");
-                            clauses.add(new Object[]{unwrapDeep(clause.get(0)), unwrapDeep(clause.get(1))});
+                        // Not syntax-rules — evaluate the expression (e.g., lambda transformer)
+                        Object transformerVal = eval(list.get(2), env);
+                        if (transformerVal instanceof Lambda lam) {
+                            env.define(macroName, new SyntaxCaseTransformer(lam, env));
+                            return VOID;
                         }
-                        env.define(macroName, new SyntaxTransformer(literals, clauses, env));
-                        return VOID;
+                        throw new EvalError(posStr() + "define-syntax: expected syntax-rules or procedure");
                     }
                     case "define-record-type" -> {
                         // (define-record-type <name> (constructor field...) predicate (field accessor)...)
@@ -1151,6 +1181,92 @@ public class Evaluator {
                         if (list.size() != 2) throw new EvalError(posStr() + "quasiquote: bad syntax");
                         return evalQuasiquote(list.get(1), env);
                     }
+                    case "syntax-case" -> {
+                        // (syntax-case expr (literals) clause ...)
+                        if (list.size() < 4) throw new EvalError(posStr() + "syntax-case: bad syntax");
+                        Object stxVal = eval(list.get(1), env);
+                        Object input = stxVal;
+                        // Parse literals
+                        Object litsObj = unwrap(list.get(2));
+                        List<String> scLiterals = new ArrayList<>();
+                        if (litsObj instanceof List<?> litsList) {
+                            for (Object l : litsList) {
+                                Object ul = unwrap(l);
+                                if (ul instanceof String s) scLiterals.add(s);
+                            }
+                        }
+                        for (int ci = 3; ci < list.size(); ci++) {
+                            Object clauseObj = unwrap(list.get(ci));
+                            if (!(clauseObj instanceof List<?> clause) || clause.size() < 2)
+                                throw new EvalError(posStr() + "syntax-case: bad clause");
+                            Object pattern = unwrapDeep(clause.get(0));
+                            Map<String, Object> scBindings = new HashMap<>();
+                            if (matchPattern(pattern, input, scLiterals, scBindings)) {
+                                Env clauseEnv = new Env(env);
+                                for (Map.Entry<String, Object> e : scBindings.entrySet()) {
+                                    clauseEnv.define(e.getKey(), new SyntaxBinding(e.getValue()));
+                                }
+                                if (clause.size() == 3) {
+                                    // (pattern fender body)
+                                    Object fender = clause.get(1);
+                                    Object fenderResult = eval(fender, clauseEnv);
+                                    if (isFalse(fenderResult)) continue;
+                                    return eval(clause.get(2), clauseEnv);
+                                } else {
+                                    // (pattern body)
+                                    return eval(clause.get(1), clauseEnv);
+                                }
+                            }
+                        }
+                        throw new EvalError(posStr() + "syntax-case: no matching pattern");
+                    }
+                    case "syntax" -> {
+                        // (syntax template) — template expansion using SyntaxBinding from env
+                        if (list.size() != 2) throw new EvalError(posStr() + "syntax: bad syntax");
+                        Object template = unwrapDeep(list.get(1));
+                        Map<String, Object> syntaxBindings = collectSyntaxBindings(env);
+                        // Single symbol shortcut
+                        if (template instanceof String sym && syntaxBindings.containsKey(sym)) {
+                            return syntaxBindings.get(sym);
+                        }
+                        Set<String> patVars = new HashSet<>(syntaxBindings.keySet());
+                        Map<String, String> scGensymMap = new HashMap<>();
+                        collectTemplateSymbols(template, patVars, List.of(), scGensymMap);
+                        Object expanded = expandTemplate(template, syntaxBindings, scGensymMap);
+                        // Inject definition-site bindings for gensym'd symbols
+                        if (syntaxUseEnv != null && syntaxDefEnv != null) {
+                            for (Map.Entry<String, String> entry : scGensymMap.entrySet()) {
+                                try {
+                                    Object val = syntaxDefEnv.lookup(entry.getKey());
+                                    syntaxUseEnv.define(entry.getValue(), val);
+                                } catch (EvalError e2) { /* template-introduced, skip */ }
+                            }
+                        }
+                        return expanded;
+                    }
+                    case "with-syntax" -> {
+                        // (with-syntax ((pat expr) ...) body ...)
+                        if (list.size() < 3) throw new EvalError(posStr() + "with-syntax: bad syntax");
+                        Object wsBindingsObj = unwrap(list.get(1));
+                        if (!(wsBindingsObj instanceof List<?> wsBindingsList))
+                            throw new EvalError(posStr() + "with-syntax: bad syntax");
+                        Env wsEnv = new Env(env);
+                        for (Object b : wsBindingsList) {
+                            Object ub = unwrap(b);
+                            if (!(ub instanceof List<?> binding) || binding.size() != 2)
+                                throw new EvalError(posStr() + "with-syntax: bad binding");
+                            Object pat = unwrap(binding.get(0));
+                            if (!(pat instanceof String patName))
+                                throw new EvalError(posStr() + "with-syntax: expected symbol pattern");
+                            Object val = eval(binding.get(1), env);
+                            wsEnv.define(patName, new SyntaxBinding(val));
+                        }
+                        Object wsResult = VOID;
+                        for (int wi = 2; wi < list.size(); wi++) {
+                            wsResult = eval(list.get(wi), wsEnv);
+                        }
+                        return wsResult;
+                    }
                 }
             }
 
@@ -1160,6 +1276,27 @@ public class Evaluator {
                     Object macroVal = env.lookup(macroSym);
                     if (macroVal instanceof SyntaxTransformer st) {
                         expr = expandMacro(st, list, env); continue;
+                    }
+                    if (macroVal instanceof SyntaxCaseTransformer sct) {
+                        List<Object> unwrappedForm = new ArrayList<>();
+                        for (Object o : list) unwrappedForm.add(unwrapDeep(o));
+                        Env savedDefEnv = syntaxDefEnv;
+                        Env savedUseEnv = syntaxUseEnv;
+                        syntaxDefEnv = sct.defEnv();
+                        syntaxUseEnv = env;
+                        try {
+                            Env lambdaEnv = new Env(sct.proc().closureEnv());
+                            lambdaEnv.define(sct.proc().params().get(0), unwrappedForm);
+                            Object result = null;
+                            for (Object bodyExpr : sct.proc().body()) {
+                                result = eval(bodyExpr, lambdaEnv);
+                            }
+                            expr = result;
+                        } finally {
+                            syntaxDefEnv = savedDefEnv;
+                            syntaxUseEnv = savedUseEnv;
+                        }
+                        continue;
                     }
                 } catch (EvalError e) { /* not bound, fall through */ }
             }
@@ -2390,6 +2527,14 @@ public class Evaluator {
                 }
                 return applyProcedure(consumer, consumerArgs);
             }
+            case "syntax->datum" -> {
+                requireArgCount(op, args, 1);
+                return args.get(0);
+            }
+            case "datum->syntax" -> {
+                requireArgCount(op, args, 2);
+                return args.get(1);
+            }
             default -> throw new EvalError(posStr() + "unbound variable: " + op);
         }
     }
@@ -2404,6 +2549,20 @@ public class Evaluator {
             return result;
         }
         return obj;
+    }
+
+    private Map<String, Object> collectSyntaxBindings(Env env) {
+        Map<String, Object> result = new HashMap<>();
+        Env current = env;
+        while (current != null) {
+            for (Map.Entry<String, Object> e : current.bindings.entrySet()) {
+                if (e.getValue() instanceof SyntaxBinding sb && !result.containsKey(e.getKey())) {
+                    result.put(e.getKey(), sb.value());
+                }
+            }
+            current = current.parent;
+        }
+        return result;
     }
 
     @SuppressWarnings("unchecked")
@@ -2491,6 +2650,8 @@ public class Evaluator {
                 gensymMap.put(sym, gensym(sym));
             }
         } else if (template instanceof List<?> list) {
+            // Skip contents of (quote ...) forms — quoted symbols should not be gensym'd
+            if (!list.isEmpty() && list.get(0) instanceof String s && s.equals("quote")) return;
             for (Object item : list) collectTemplateSymbols(item, patVars, literals, gensymMap);
         }
     }
