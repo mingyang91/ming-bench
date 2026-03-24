@@ -59,6 +59,8 @@ public class Evaluator {
 
     private record Lambda(List<String> params, String restParam, List<Object> body, Env closureEnv) {}
 
+    private record CaseLambda(List<Lambda> clauses) {}
+
     // Builtin procedure wrapper
     private record Builtin(String name) {}
 
@@ -89,7 +91,7 @@ public class Evaluator {
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "define", "define-syntax", "define-record-type", "set!", "if", "quote", "lambda",
-        "and", "or", "begin", "cond", "let"
+        "case-lambda", "and", "or", "begin", "cond", "let"
     );
 
     // Internal string wrapper to distinguish from symbols (mutable for string-set!)
@@ -219,7 +221,9 @@ public class Evaluator {
         "string-upcase", "string-downcase",
         // L11
         "exact?", "inexact?", "exact->inexact", "inexact->exact",
-        "numerator", "denominator", "integer?", "rational?"
+        "numerator", "denominator", "integer?", "rational?",
+        // L13
+        "procedure?"
     };
 
     private Env makeTopLevelEnv() {
@@ -582,6 +586,40 @@ public class Evaluator {
                         List<Object> body = new ArrayList<>(list.subList(2, list.size()));
                         return new Lambda(params, restParam, body, env);
                     }
+                    case "case-lambda" -> {
+                        if (list.size() < 2) throw new EvalError(posStr() + "case-lambda: bad syntax");
+                        List<Lambda> clauses = new ArrayList<>();
+                        for (int ci = 1; ci < list.size(); ci++) {
+                            Object clauseRaw = unwrap(list.get(ci));
+                            if (!(clauseRaw instanceof List<?> clause) || clause.size() < 2)
+                                throw new EvalError(posStr() + "case-lambda: bad clause");
+                            Object paramSpec = unwrap(clause.get(0));
+                            if (!(paramSpec instanceof List<?> paramList))
+                                throw new EvalError(posStr() + "case-lambda: parameters must be a list");
+                            List<String> params = new ArrayList<>();
+                            String restParam = null;
+                            for (int pi = 0; pi < paramList.size(); pi++) {
+                                Object rawP = unwrap(paramList.get(pi));
+                                if (rawP instanceof String s && s.equals(".")) {
+                                    if (pi + 1 < paramList.size()) {
+                                        Object rp = unwrap(paramList.get(pi + 1));
+                                        if (!(rp instanceof String rpName))
+                                            throw new EvalError(posStr() + "case-lambda: rest parameter must be a symbol");
+                                        restParam = rpName;
+                                        break;
+                                    } else {
+                                        throw new EvalError(posStr() + "case-lambda: bad syntax after dot");
+                                    }
+                                }
+                                if (!(rawP instanceof String s))
+                                    throw new EvalError(posStr() + "case-lambda: parameter must be a symbol");
+                                params.add(s);
+                            }
+                            List<Object> body = new ArrayList<>(clause.subList(1, clause.size()));
+                            clauses.add(new Lambda(params, restParam, body, env));
+                        }
+                        return new CaseLambda(clauses);
+                    }
                     case "and" -> {
                         Object result = Boolean.TRUE;
                         for (int i = 1; i < list.size(); i++) {
@@ -720,6 +758,10 @@ public class Evaluator {
                 return applyLambda(lam, args);
             }
 
+            if (proc instanceof CaseLambda cl) {
+                return applyCaseLambda(cl, args);
+            }
+
             if (proc instanceof Builtin b) {
                 return applyBuiltin(b.name(), args);
             }
@@ -774,9 +816,24 @@ public class Evaluator {
         return result;
     }
 
+    private Object applyCaseLambda(CaseLambda cl, List<Object> args) throws EvalError {
+        for (Lambda lam : cl.clauses()) {
+            int required = lam.params().size();
+            if (lam.restParam() != null) {
+                if (args.size() >= required) return applyLambda(lam, args);
+            } else {
+                if (args.size() == required) return applyLambda(lam, args);
+            }
+        }
+        throw new EvalError(posStr() + "case-lambda: no matching clause for " + args.size() + " arguments");
+    }
+
     private Object applyProcedure(Object proc, List<Object> args) throws EvalError {
         if (proc instanceof Lambda lam) {
             return applyLambda(lam, args);
+        }
+        if (proc instanceof CaseLambda cl) {
+            return applyCaseLambda(cl, args);
         }
         if (proc instanceof Builtin b) {
             return applyBuiltin(b.name(), args);
@@ -1319,6 +1376,13 @@ public class Evaluator {
                 requireArgCount(op, args, 1);
                 Object a = args.get(0);
                 return a instanceof Long || a instanceof SchemeRational;
+            }
+            // L13
+            case "procedure?" -> {
+                requireArgCount(op, args, 1);
+                Object a = args.get(0);
+                return a instanceof Lambda || a instanceof CaseLambda || a instanceof Builtin
+                    || a instanceof RecordConstructor || a instanceof RecordPredicate || a instanceof RecordAccessor;
             }
             default -> throw new EvalError(posStr() + "unbound variable: " + op);
         }
