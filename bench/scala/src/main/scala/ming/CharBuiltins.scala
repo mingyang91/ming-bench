@@ -78,6 +78,30 @@ object CharBuiltins:
         case _ => throw new EvalError("string<?: expected 2 strings")
       }
     ),
+    "string>?" -> SchemeVal.BuiltinProc(
+      "string>?",
+      {
+        case List(SchemeVal.StrVal(a), SchemeVal.StrVal(b)) =>
+          SchemeVal.BoolVal(new String(a).compareTo(new String(b)) > 0)
+        case _ => throw new EvalError("string>?: expected 2 strings")
+      }
+    ),
+    "string<=?" -> SchemeVal.BuiltinProc(
+      "string<=?",
+      {
+        case List(SchemeVal.StrVal(a), SchemeVal.StrVal(b)) =>
+          SchemeVal.BoolVal(new String(a).compareTo(new String(b)) <= 0)
+        case _ => throw new EvalError("string<=?: expected 2 strings")
+      }
+    ),
+    "string>=?" -> SchemeVal.BuiltinProc(
+      "string>=?",
+      {
+        case List(SchemeVal.StrVal(a), SchemeVal.StrVal(b)) =>
+          SchemeVal.BoolVal(new String(a).compareTo(new String(b)) >= 0)
+        case _ => throw new EvalError("string>=?: expected 2 strings")
+      }
+    ),
     "string-ci=?" -> SchemeVal.BuiltinProc(
       "string-ci=?",
       {

@@ -22,8 +22,8 @@ object Equality:
     case (SchemeVal.StrVal(x), SchemeVal.StrVal(y))           => java.util.Arrays.equals(x, y)
     case (SchemeVal.ListVal(xs), SchemeVal.ListVal(ys)) =>
       xs.length == ys.length && xs.zip(ys).forall((a, b) => equalCheck(a, b))
-    case (SchemeVal.PairVal(a1, d1), SchemeVal.PairVal(a2, d2)) =>
-      equalCheck(a1, a2) && equalCheck(d1, d2)
+    case (SchemeVal.PairVal(p1), SchemeVal.PairVal(p2)) =>
+      equalCheck(p1.car, p2.car) && equalCheck(p1.cdr, p2.cdr)
     case (SchemeVal.VectorVal(xs), SchemeVal.VectorVal(ys)) =>
       xs.length == ys.length && xs.zip(ys).forall((a, b) => equalCheck(a, b))
     case _ => false

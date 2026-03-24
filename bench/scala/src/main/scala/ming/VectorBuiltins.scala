@@ -19,7 +19,11 @@ object VectorBuiltins:
       {
         case List(SchemeVal.VectorVal(elems), SchemeVal.IntVal(i)) =>
           elems(i.toInt)
-        case _ => throw new EvalError("vector-ref: invalid arguments")
+        case List(v, SchemeVal.IntVal(i)) =>
+          throw new EvalError(s"vector-ref: expected vector, got ${v.display}")
+        case List(SchemeVal.VectorVal(_), idx) =>
+          throw new EvalError(s"vector-ref: expected integer index, got ${idx.display}")
+        case args => throw new EvalError(s"vector-ref: invalid arguments (${args.length} args)")
       }
     ),
     "vector-set!" -> SchemeVal.BuiltinProc(
@@ -42,15 +46,25 @@ object VectorBuiltins:
     "vector->list" -> SchemeVal.BuiltinProc(
       "vector->list",
       {
-        case List(SchemeVal.VectorVal(elems)) => SchemeVal.ListVal(elems.toList)
+        case List(SchemeVal.VectorVal(elems)) => SchemeVal.schemeList(elems.toList)
         case _                                => throw new EvalError("vector->list: invalid arguments")
       }
     ),
     "list->vector" -> SchemeVal.BuiltinProc(
       "list->vector",
       {
-        case List(SchemeVal.ListVal(elems)) => SchemeVal.VectorVal(elems.toArray)
-        case _                              => throw new EvalError("list->vector: invalid arguments")
+        case List(v @ (SchemeVal.PairVal(_) | SchemeVal.ListVal(_))) =>
+          SchemeVal.VectorVal(SchemeVal.toScalaList(v).toArray)
+        case _ => throw new EvalError("list->vector: invalid arguments")
+      }
+    ),
+    "vector-fill!" -> SchemeVal.BuiltinProc(
+      "vector-fill!",
+      {
+        case List(SchemeVal.VectorVal(elems), fill) =>
+          for i <- elems.indices do elems(i) = fill
+          SchemeVal.Void
+        case _ => throw new EvalError("vector-fill!: invalid arguments")
       }
     )
   )
@@ -73,16 +87,7 @@ object VectorBuiltins:
     "eq?" -> SchemeVal.BuiltinProc(
       "eq?",
       {
-        case List(a, b) =>
-          SchemeVal.BoolVal(
-            (a, b) match
-              case (SchemeVal.IntVal(x), SchemeVal.IntVal(y))       => x == y
-              case (SchemeVal.BoolVal(x), SchemeVal.BoolVal(y))     => x == y
-              case (SchemeVal.CharVal(x), SchemeVal.CharVal(y))     => x == y
-              case (SchemeVal.SymVal(x), SchemeVal.SymVal(y))       => x == y
-              case (SchemeVal.ListVal(Nil), SchemeVal.ListVal(Nil)) => true
-              case _                                                => a eq b
-          )
+        case List(a, b) => SchemeVal.BoolVal(SchemeVal.schemeEq(a, b))
         case args => throw new EvalError(s"eq?: expected 2 arguments, got ${args.length}")
       }
     )

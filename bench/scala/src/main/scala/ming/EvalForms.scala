@@ -63,6 +63,19 @@ object EvalForms:
         case _ => throw new EvalError("let: invalid binding")
     Evaluator.evalBodyTail(body, letEnv)
 
+  def evalLetStar(
+    bindings: List[Expr],
+    body: List[Expr],
+    env: Env
+  ): SchemeVal =
+    val letEnv = new Env(mutable.Map.empty, Some(env))
+    for b <- bindings do
+      b match
+        case Expr.SList(Expr.Symbol(name) :: valExpr :: Nil) =>
+          letEnv.define(name, Evaluator.eval(valExpr, letEnv))
+        case _ => throw new EvalError("let*: invalid binding")
+    Evaluator.evalBodyTail(body, letEnv)
+
   def evalNamedLet(
     name: String,
     bindings: List[Expr],
@@ -86,6 +99,16 @@ object EvalForms:
       case Nil => SchemeVal.Void
       case Expr.SList(Expr.Symbol("else") :: body) :: _ =>
         Evaluator.evalBodyTail(body, env)
+      case Expr.SList(test :: Expr.Symbol("=>") :: proc :: Nil) :: rest =>
+        val v = Evaluator.eval(test, env)
+        if Evaluator.isTruthy(v) then
+          val fn = Evaluator.eval(proc, env)
+          Evaluator.applyProc(fn, List(v))
+        else evalCond(rest, env)
+      case Expr.SList(test :: Nil) :: rest =>
+        val v = Evaluator.eval(test, env)
+        if Evaluator.isTruthy(v) then v
+        else evalCond(rest, env)
       case Expr.SList(test :: body) :: rest =>
         if Evaluator.isTruthy(Evaluator.eval(test, env)) then Evaluator.evalBodyTail(body, env)
         else evalCond(rest, env)

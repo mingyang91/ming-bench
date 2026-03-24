@@ -2,6 +2,8 @@ package ming
 
 import scala.collection.mutable
 
+class MutablePair(var car: SchemeVal, var cdr: SchemeVal)
+
 enum Expr:
   case IntLit(value: Long)
   case FloatLit(value: Double)
@@ -21,7 +23,7 @@ enum SchemeVal:
   case SymVal(name: String)
   case CharVal(value: Char)
   case ListVal(elems: List[SchemeVal])
-  case PairVal(car: SchemeVal, cdr: SchemeVal)
+  case PairVal(pair: MutablePair)
   case Procedure(params: List[String], restParam: Option[String], body: List[Expr], env: Env)
   case BuiltinProc(name: String, fn: List[SchemeVal] => SchemeVal)
   case Macro(literals: Set[String], rules: List[(Expr, Expr)], defEnv: Env)
@@ -43,7 +45,7 @@ enum SchemeVal:
     case CharVal(c)            => s"#\\$c"
     case ListVal(Nil)          => "()"
     case ListVal(elems)        => "(" + elems.map(_.display).mkString(" ") + ")"
-    case PairVal(_, _)         => formatPair(_.display)
+    case PairVal(_)            => formatPair(_.display)
     case Procedure(_, _, _, _) => "#<procedure>"
     case CaseLambda(_)         => "#<procedure>"
     case BuiltinProc(name, _)  => s"#<procedure:$name>"
@@ -59,7 +61,7 @@ enum SchemeVal:
     case ListVal(Nil)     => "()"
     case ListVal(elems)   => "(" + elems.map(_.displayStr).mkString(" ") + ")"
     case VectorVal(elems) => "#(" + elems.map(_.displayStr).mkString(" ") + ")"
-    case PairVal(_, _)    => formatPair(_.displayStr)
+    case PairVal(_)       => formatPair(_.displayStr)
     case other            => other.display
 
   def isNumber: Boolean = this match
@@ -72,15 +74,22 @@ enum SchemeVal:
     case _         => displayStr
 
   private def formatPair(fmt: SchemeVal => String): String =
-    val sb             = new StringBuilder("(")
+    val sb    = new StringBuilder("(")
     var cur: SchemeVal = this
-    var first          = true
+    var first = true
+    val seen  = java.util.Collections.newSetFromMap(
+      new java.util.IdentityHashMap[MutablePair, java.lang.Boolean]()
+    )
     while cur.isInstanceOf[PairVal] do
+      val PairVal(p) = cur: @unchecked
+      if seen.contains(p) then
+        sb.append(" ...")
+        return sb.append(")").toString
+      seen.add(p)
       if !first then sb.append(" ")
       first = false
-      val PairVal(h, t) = cur: @unchecked
-      sb.append(fmt(h))
-      cur = t
+      sb.append(fmt(p.car))
+      cur = p.cdr
     cur match
       case ListVal(Nil) => ()
       case ListVal(elems) =>
@@ -89,6 +98,57 @@ enum SchemeVal:
         sb.append(" . ").append(fmt(other))
     sb.append(")")
     sb.toString
+
+object SchemeVal:
+  /** Build a proper list (PairVal chain terminated by ListVal(Nil)) from a Scala list */
+  def schemeList(elems: List[SchemeVal]): SchemeVal =
+    elems.foldRight(ListVal(Nil): SchemeVal)((e, acc) => PairVal(new MutablePair(e, acc)))
+
+  /** Extract a Scala List from a proper Scheme list (PairVal chain or ListVal) */
+  def toScalaList(v: SchemeVal): List[SchemeVal] =
+    val buf = List.newBuilder[SchemeVal]
+    var cur = v
+    while true do
+      cur match
+        case PairVal(p)     => buf += p.car; cur = p.cdr
+        case ListVal(Nil)   => return buf.result()
+        case ListVal(elems) => return buf.result() ++ elems
+        case _ => throw new EvalError(s"not a proper list")
+    buf.result()
+
+  /** Check if a value is a proper list (with cycle detection via tortoise-and-hare) */
+  def isProperList(v: SchemeVal): Boolean =
+    var slow = v
+    var fast = v
+    while true do
+      // fast step 1
+      fast match
+        case PairVal(p) => fast = p.cdr
+        case ListVal(_) => return true
+        case _          => return false
+      // fast step 2
+      fast match
+        case PairVal(p) => fast = p.cdr
+        case ListVal(_) => return true
+        case _          => return false
+      // slow step 1
+      slow match
+        case PairVal(p) => slow = p.cdr
+        case _          => return true
+      // cycle check — compare MutablePair identity
+      (slow, fast) match
+        case (PairVal(s), PairVal(f)) if s eq f => return false
+        case _ => ()
+    false
+
+  /** eq? semantics: reference equality for most types, value equality for immediates */
+  def schemeEq(a: SchemeVal, b: SchemeVal): Boolean = (a, b) match
+    case (SymVal(x), SymVal(y))       => x == y
+    case (IntVal(x), IntVal(y))       => x == y
+    case (BoolVal(x), BoolVal(y))     => x == y
+    case (CharVal(x), CharVal(y))     => x == y
+    case (ListVal(Nil), ListVal(Nil)) => true
+    case _                            => a eq b
 
 class Env(
   val bindings: mutable.Map[String, SchemeVal],

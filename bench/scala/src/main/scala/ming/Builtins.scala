@@ -79,8 +79,7 @@ object Builtins:
     "cons" -> SchemeVal.BuiltinProc(
       "cons",
       {
-        case List(a, SchemeVal.ListVal(elems)) => SchemeVal.ListVal(a :: elems)
-        case List(a, b)                        => SchemeVal.PairVal(a, b)
+        case List(a, b) => SchemeVal.PairVal(new MutablePair(a, b))
         case args =>
           throw new EvalError(s"cons: expected 2 arguments, got ${args.length}")
       }
@@ -88,8 +87,8 @@ object Builtins:
     "car" -> SchemeVal.BuiltinProc(
       "car",
       {
+        case List(SchemeVal.PairVal(p))      => p.car
         case List(SchemeVal.ListVal(h :: _)) => h
-        case List(SchemeVal.PairVal(h, _))   => h
         case List(SchemeVal.ListVal(Nil)) =>
           throw new EvalError("car: empty list")
         case List(other) =>
@@ -101,8 +100,8 @@ object Builtins:
     "cdr" -> SchemeVal.BuiltinProc(
       "cdr",
       {
+        case List(SchemeVal.PairVal(p))      => p.cdr
         case List(SchemeVal.ListVal(_ :: t)) => SchemeVal.ListVal(t)
-        case List(SchemeVal.PairVal(_, t))   => t
         case List(SchemeVal.ListVal(Nil)) =>
           throw new EvalError("cdr: empty list")
         case List(other) =>
@@ -120,12 +119,12 @@ object Builtins:
           throw new EvalError(s"null?: expected 1 argument, got ${args.length}")
       }
     ),
-    "list" -> SchemeVal.BuiltinProc("list", args => SchemeVal.ListVal(args)),
+    "list" -> SchemeVal.BuiltinProc("list", args => SchemeVal.schemeList(args)),
     "length" -> SchemeVal.BuiltinProc(
       "length",
       {
-        case List(SchemeVal.ListVal(elems)) =>
-          SchemeVal.IntVal(elems.length.toLong)
+        case List(v @ (SchemeVal.PairVal(_) | SchemeVal.ListVal(_))) =>
+          SchemeVal.IntVal(SchemeVal.toScalaList(v).length.toLong)
         case List(other) =>
           throw new EvalError(s"length: expected list, got ${other.display}")
         case args =>
@@ -137,12 +136,72 @@ object Builtins:
     "append" -> SchemeVal.BuiltinProc(
       "append",
       args =>
-        val lists = args.map {
-          case SchemeVal.ListVal(elems) => elems
-          case other =>
-            throw new EvalError(s"append: expected list, got ${other.display}")
-        }
-        SchemeVal.ListVal(lists.flatten)
+        if args.isEmpty then SchemeVal.ListVal(Nil)
+        else
+          val lists = args.map {
+            case v @ (SchemeVal.PairVal(_) | SchemeVal.ListVal(_)) => SchemeVal.toScalaList(v)
+            case other =>
+              throw new EvalError(s"append: expected list, got ${other.display}")
+          }
+          SchemeVal.schemeList(lists.flatten)
+    ),
+    "set-car!" -> SchemeVal.BuiltinProc(
+      "set-car!",
+      {
+        case List(SchemeVal.PairVal(p), v) =>
+          p.car = v
+          SchemeVal.Void
+        case List(other, _) =>
+          throw new EvalError(s"set-car!: expected pair, got ${other.display}")
+        case args =>
+          throw new EvalError(s"set-car!: expected 2 arguments, got ${args.length}")
+      }
+    ),
+    "set-cdr!" -> SchemeVal.BuiltinProc(
+      "set-cdr!",
+      {
+        case List(SchemeVal.PairVal(p), v) =>
+          p.cdr = v
+          SchemeVal.Void
+        case List(other, _) =>
+          throw new EvalError(s"set-cdr!: expected pair, got ${other.display}")
+        case args =>
+          throw new EvalError(s"set-cdr!: expected 2 arguments, got ${args.length}")
+      }
+    )
+  )
+
+  private def pairAccessorBuiltins: List[(String, SchemeVal)] =
+    def getCar(v: SchemeVal): SchemeVal = v match
+      case SchemeVal.PairVal(p)      => p.car
+      case SchemeVal.ListVal(h :: _) => h
+      case other => throw new EvalError(s"car: expected pair, got ${other.display}")
+    def getCdr(v: SchemeVal): SchemeVal = v match
+      case SchemeVal.PairVal(p)      => p.cdr
+      case SchemeVal.ListVal(_ :: t) => SchemeVal.ListVal(t)
+      case other => throw new EvalError(s"cdr: expected pair, got ${other.display}")
+    def makeCxr(name: String, ops: String): (String, SchemeVal) =
+      val fn: SchemeVal => SchemeVal = ops.foldRight((v: SchemeVal) => v) { (c, acc) =>
+        val op = if c == 'a' then getCar else getCdr
+        v => acc(op(v))
+      }
+      name -> SchemeVal.BuiltinProc(name, {
+        case List(v) => fn(v)
+        case a => throw new EvalError(s"$name: expected 1 argument, got ${a.length}")
+      })
+    // Generate all c[ad]{2,4}r combinations
+    val ops = List("a", "d")
+    val twoLevel = for a <- ops; b <- ops yield (s"c${a}${b}r", s"$a$b")
+    val threeLevel = for a <- ops; b <- ops; c <- ops yield (s"c${a}${b}${c}r", s"$a$b$c")
+    val fourLevel = for a <- ops; b <- ops; c <- ops; d <- ops yield (s"c${a}${b}${c}${d}r", s"$a$b$c$d")
+    (twoLevel ++ threeLevel ++ fourLevel).map((name, ops) => makeCxr(name, ops))
+
+  private def errorBuiltin: List[(String, SchemeVal)] = List(
+    "error" -> SchemeVal.BuiltinProc(
+      "error",
+      args =>
+        val msg = args.map(_.displayStr).mkString(" ")
+        throw new EvalError(s"error: $msg")
     )
   )
 
@@ -180,8 +239,8 @@ object Builtins:
     typePredicate(
       "pair?",
       {
+        case SchemeVal.PairVal(_)      => true
         case SchemeVal.ListVal(_ :: _) => true
-        case SchemeVal.PairVal(_, _)   => true
         case _                         => false
       }
     ),
@@ -235,7 +294,7 @@ object Builtins:
         if args.length < 2 then throw new EvalError("apply: expected at least 2 arguments")
         val fn = args.head
         val lastArg = args.last match
-          case SchemeVal.ListVal(elems) => elems
+          case v @ (SchemeVal.PairVal(_) | SchemeVal.ListVal(_)) => SchemeVal.toScalaList(v)
           case other => throw new EvalError(s"apply: last argument must be a list, got ${other.display}")
         val prefixArgs = args.slice(1, args.length - 1)
         val allArgs    = prefixArgs ++ lastArg
@@ -249,10 +308,12 @@ object Builtins:
       ++ comparisonBuiltins
       ++ logicBuiltins
       ++ listBuiltins
+      ++ pairAccessorBuiltins
       ++ typePredicateBuiltins
       ++ ioBuiltins
       ++ StringBuiltins.all
       ++ applyBuiltin
+      ++ errorBuiltin
       ++ NumericBuiltins.numericBuiltins
       ++ NumericBuiltins.listBuiltins
       ++ NumericBuiltins.exactnessBuiltins

@@ -80,6 +80,25 @@ object StringBuiltins:
           )
       }
     ),
+    "string" -> SchemeVal.BuiltinProc(
+      "string",
+      args =>
+        val chars = args.map {
+          case SchemeVal.CharVal(c) => c
+          case other => throw new EvalError(s"string: expected char, got ${other.display}")
+        }
+        SchemeVal.StrVal(chars.toArray)
+    ),
+    "make-string" -> SchemeVal.BuiltinProc(
+      "make-string",
+      {
+        case List(SchemeVal.IntVal(n)) =>
+          SchemeVal.StrVal(Array.fill(n.toInt)('\u0000'))
+        case List(SchemeVal.IntVal(n), SchemeVal.CharVal(c)) =>
+          SchemeVal.StrVal(Array.fill(n.toInt)(c))
+        case _ => throw new EvalError("make-string: expected (length) or (length, char)")
+      }
+    ),
     "string-ref" -> SchemeVal.BuiltinProc(
       "string-ref",
       {
@@ -159,7 +178,7 @@ object StringBuiltins:
       "string->list",
       {
         case List(SchemeVal.StrVal(s)) =>
-          SchemeVal.ListVal(s.map(SchemeVal.CharVal(_)).toList)
+          SchemeVal.schemeList(s.map(SchemeVal.CharVal(_)).toList)
         case List(other) =>
           throw new EvalError(
             s"string->list: expected string, got ${other.display}"
@@ -173,7 +192,8 @@ object StringBuiltins:
     "list->string" -> SchemeVal.BuiltinProc(
       "list->string",
       {
-        case List(SchemeVal.ListVal(elems)) =>
+        case List(v @ (SchemeVal.PairVal(_) | SchemeVal.ListVal(_))) =>
+          val elems = SchemeVal.toScalaList(v)
           val chars = elems.map {
             case SchemeVal.CharVal(c) => c
             case other =>

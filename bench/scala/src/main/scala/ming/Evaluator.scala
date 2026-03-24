@@ -41,7 +41,7 @@ object Evaluator:
     case Expr.StrLit(s)    => SchemeVal.StrVal(s.toCharArray)
     case Expr.CharLit(c)   => SchemeVal.CharVal(c)
     case Expr.Symbol(n)    => SchemeVal.SymVal(n)
-    case Expr.SList(es)    => SchemeVal.ListVal(es.map(quoteToVal))
+    case Expr.SList(es)    => SchemeVal.schemeList(es.map(quoteToVal))
 
   /** Evaluate all body exprs, returning the last value (fully evaluated) */
   private[ming] def evalBody(body: List[Expr], env: Env): SchemeVal =
@@ -130,6 +130,8 @@ object Evaluator:
         case Expr.SList(Expr.Symbol("lambda") :: Expr.SList(params) :: body) =>
           val (paramNames, restParam) = parseParams(params)
           SchemeVal.Procedure(paramNames, restParam, body, env)
+        case Expr.SList(Expr.Symbol("lambda") :: Expr.Symbol(restName) :: body) =>
+          SchemeVal.Procedure(Nil, Some(restName), body, env)
         case Expr.SList(
               Expr.Symbol("let") :: Expr.Symbol(name) :: Expr.SList(
                 bindings
@@ -140,6 +142,8 @@ object Evaluator:
               Expr.Symbol("let") :: Expr.SList(bindings) :: body
             ) =>
           EvalForms.evalLet(bindings, body, env)
+        case Expr.SList(Expr.Symbol("let*") :: Expr.SList(bindings) :: body) =>
+          EvalForms.evalLetStar(bindings, body, env)
         case Expr.SList(Expr.Symbol("begin") :: exprs) =>
           evalBodyTail(exprs, env)
         case Expr.SList(Expr.Symbol("cond") :: clauses) =>
@@ -148,6 +152,12 @@ object Evaluator:
           EvalForms.evalAnd(args, env)
         case Expr.SList(Expr.Symbol("or") :: args) =>
           EvalForms.evalOr(args, env)
+        case Expr.SList(Expr.Symbol("when") :: test :: body) =>
+          if isTruthy(eval(test, env)) then evalBodyTail(body, env)
+          else SchemeVal.Void
+        case Expr.SList(Expr.Symbol("unless") :: test :: body) =>
+          if !isTruthy(eval(test, env)) then evalBodyTail(body, env)
+          else SchemeVal.Void
         case Expr.SList(
               Expr.Symbol("define-syntax") :: Expr.Symbol(name) :: Expr.SList(
                 Expr.Symbol("syntax-rules") :: Expr.SList(lits) :: rules
@@ -203,7 +213,7 @@ object Evaluator:
           if evaledArgs.length < params.length then
             throw new EvalError(s"expected at least ${params.length} arguments, got ${evaledArgs.length}")
           params.zip(evaledArgs).foreach((p, v) => newEnv.define(p, v))
-          newEnv.define(restParam.get, SchemeVal.ListVal(evaledArgs.drop(params.length)))
+          newEnv.define(restParam.get, SchemeVal.schemeList(evaledArgs.drop(params.length)))
         else
           if evaledArgs.length != params.length then
             throw new EvalError(s"expected ${params.length} arguments, got ${evaledArgs.length}")
