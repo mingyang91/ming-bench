@@ -15,4 +15,7 @@ pub enum EvalError {
 
     #[error("runtime error: {0}")]
     Runtime(String),
+
+    #[error("syntax error: {0}")]
+    Syntax(String),
 }
