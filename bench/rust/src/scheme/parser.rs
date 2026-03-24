@@ -28,7 +28,11 @@ pub enum ExprKind {
 enum TokenKind {
     LParen,
     RParen,
+    VectorOpen, // #(
     Quote,
+    Quasiquote,
+    Unquote,
+    UnquoteSplicing,
     SyntaxQuote,
     Integer(i64),
     Float(f64),
@@ -55,7 +59,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
     while i < chars.len() {
         match chars[i] {
             '\n' => { line += 1; col = 1; i += 1; }
-            ' ' | '\t' | '\r' => { col += 1; i += 1; }
+            ' ' | '\t' | '\r' | '\x0C' => { col += 1; i += 1; }
             ';' => {
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;
@@ -73,6 +77,19 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
             '\'' => {
                 tokens.push(Token { kind: TokenKind::Quote, span: Span { line, col } });
                 i += 1; col += 1;
+            }
+            '`' => {
+                tokens.push(Token { kind: TokenKind::Quasiquote, span: Span { line, col } });
+                i += 1; col += 1;
+            }
+            ',' => {
+                if i + 1 < chars.len() && chars[i + 1] == '@' {
+                    tokens.push(Token { kind: TokenKind::UnquoteSplicing, span: Span { line, col } });
+                    i += 2; col += 2;
+                } else {
+                    tokens.push(Token { kind: TokenKind::Unquote, span: Span { line, col } });
+                    i += 1; col += 1;
+                }
             }
             '"' => {
                 let start_col = col;
@@ -138,6 +155,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                                 _ => return Err(EvalError::Parse(format!("unknown character name: #\\{} at {}:{}", name, line, start_col))),
                             };
                             tokens.push(Token { kind: TokenKind::Char(ch), span: Span { line, col: start_col } });
+                        }
+                        '(' => {
+                            tokens.push(Token { kind: TokenKind::VectorOpen, span: Span { line, col: start_col } });
+                            i += 2; col += 2;
                         }
                         _ => return Err(EvalError::Parse(format!("unexpected #{} at {}:{}", chars[i + 1], line, col))),
                     }
@@ -241,6 +262,36 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Expr, usize), EvalError> 
                 span,
             }, next))
         }
+        TokenKind::Quasiquote => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((Expr {
+                kind: ExprKind::List(vec![
+                    Expr { kind: ExprKind::Symbol("quasiquote".into()), span },
+                    inner,
+                ]),
+                span,
+            }, next))
+        }
+        TokenKind::Unquote => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((Expr {
+                kind: ExprKind::List(vec![
+                    Expr { kind: ExprKind::Symbol("unquote".into()), span },
+                    inner,
+                ]),
+                span,
+            }, next))
+        }
+        TokenKind::UnquoteSplicing => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((Expr {
+                kind: ExprKind::List(vec![
+                    Expr { kind: ExprKind::Symbol("unquote-splicing".into()), span },
+                    inner,
+                ]),
+                span,
+            }, next))
+        }
         TokenKind::SyntaxQuote => {
             let (inner, next) = parse_expr(tokens, pos + 1)?;
             Ok((Expr {
@@ -250,6 +301,24 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Expr, usize), EvalError> 
                 ]),
                 span,
             }, next))
+        }
+        TokenKind::VectorOpen => {
+            let mut items = Vec::new();
+            let mut i = pos + 1;
+            loop {
+                if i >= tokens.len() {
+                    return Err(EvalError::Parse(format!("unclosed vector literal at {}:{}", span.line, span.col)));
+                }
+                if matches!(&tokens[i].kind, TokenKind::RParen) {
+                    // Desugar #(a b c) into (vector a b c)
+                    let mut elems = vec![Expr { kind: ExprKind::Symbol("vector".into()), span }];
+                    elems.extend(items);
+                    return Ok((Expr { kind: ExprKind::List(elems), span }, i + 1));
+                }
+                let (expr, next) = parse_expr(tokens, i)?;
+                items.push(expr);
+                i = next;
+            }
         }
         TokenKind::RParen => Err(EvalError::Parse(format!("unexpected ) at {}:{}", span.line, span.col))),
     }

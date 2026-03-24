@@ -421,7 +421,7 @@ impl Env {
                      "apply", "eq?", "equal?", "map", "for-each", "reverse",
                      "set-car!", "set-cdr!",
                      "caar", "cadr", "cdar", "cddr", "caddr", "cadddr",
-                     "memq", "member", "assq", "assv",
+                     "memq", "memv", "member", "assq", "assv",
                      "abs", "modulo", "remainder", "quotient", "min", "max",
                      "gcd", "lcm", "truncate", "round", "floor", "ceiling", "expt",
                      "zero?", "positive?", "negative?", "odd?", "even?",
@@ -437,7 +437,7 @@ impl Env {
                      "vector-length", "vector?", "vector->list", "list->vector",
                      "call/cc", "call-with-current-continuation",
                      "dynamic-wind",
-                     "raise", "with-exception-handler",
+                     "raise", "error", "with-exception-handler",
                      "values", "call-with-values",
                      "syntax->datum", "datum->syntax"] {
             bindings.insert(name.to_string(), Value::Builtin(name.to_string()));
@@ -576,6 +576,28 @@ fn apply_into(
             let consumer = it.next().unwrap();
             stack.push(Frame::CallWithValuesConsumer { consumer });
             return apply_into(producer, vec![], cur_expr, cur_env, stack, returning, span);
+        }
+        if name == "error" {
+            if args.is_empty() {
+                return Err(EvalError::Arity(format!("error requires at least 1 argument at {}", fmt_span(span))));
+            }
+            // Build error message: "msg: irritant1 irritant2 ..."
+            let msg = args[0].to_display();
+            let full_msg = if args.len() > 1 {
+                let irritants: Vec<String> = args[1..].iter().map(|v| v.to_display()).collect();
+                format!("{}: {}", msg, irritants.join(" "))
+            } else {
+                msg
+            };
+            let error_val = Value::Str(full_msg, false);
+            // Raise the error value
+            let handler = EXCEPTION_HANDLERS.with(|h| h.borrow_mut().pop());
+            if let Some(handler) = handler {
+                stack.push(Frame::RaiseResult);
+                return apply_into(handler, vec![error_val], cur_expr, cur_env, stack, returning, span);
+            } else {
+                return Err(EvalError::Runtime(format!("error: {}", error_val.to_display())));
+            }
         }
         if name == "raise" {
             if args.len() != 1 {
@@ -1182,6 +1204,13 @@ fn eval_with_stack(initial_expr: &Expr, initial_env: &Env, initial_stack: Vec<Fr
             match name.as_str() {
                 // Immediate value forms
                 "quote" => { returning = Some(eval_quote(&items[1..], span)?); continue; }
+                "quasiquote" => {
+                    if items.len() != 2 {
+                        return Err(EvalError::Parse(format!("quasiquote requires exactly 1 argument at {}", fmt_span(span))));
+                    }
+                    returning = Some(eval_quasiquote(&items[1], &cur_env)?);
+                    continue;
+                }
                 "lambda" => { returning = Some(eval_lambda(&items[1..], &cur_env, span)?); continue; }
                 "case-lambda" => { returning = Some(eval_case_lambda(&items[1..], &cur_env, span)?); continue; }
                 "define-syntax" => { returning = Some(eval_define_syntax(&items[1..], &cur_env, span)?); continue; }
@@ -1288,6 +1317,7 @@ fn eval_with_stack(initial_expr: &Expr, initial_env: &Env, initial_stack: Vec<Fr
                     let clauses = &items[1..];
                     let mut tail_body: Option<Vec<Expr>> = None;
                     let mut direct_result: Option<Value> = None;
+                    let mut applied_arrow = false;
                     for clause in clauses {
                         match &clause.kind {
                             ExprKind::List(parts) if !parts.is_empty() => {
@@ -1300,7 +1330,13 @@ fn eval_with_stack(initial_expr: &Expr, initial_env: &Env, initial_stack: Vec<Fr
                                 }
                                 let test_val = eval(&parts[0], &cur_env)?;
                                 if test_val.is_truthy() {
-                                    if parts.len() == 1 {
+                                    if parts.len() == 3 && matches!(&parts[1].kind, ExprKind::Symbol(s) if s == "=>") {
+                                        // (test => proc) — apply proc to test result
+                                        let proc = eval(&parts[2], &cur_env)?;
+                                        let span = parts[2].span;
+                                        apply_into(proc, vec![test_val], &mut cur_expr, &mut cur_env, &mut stack, &mut returning, span)?;
+                                        applied_arrow = true;
+                                    } else if parts.len() == 1 {
                                         direct_result = Some(test_val);
                                     } else {
                                         tail_body = Some(parts[1..].to_vec());
@@ -1310,6 +1346,9 @@ fn eval_with_stack(initial_expr: &Expr, initial_env: &Env, initial_stack: Vec<Fr
                             }
                             _ => return Err(EvalError::Runtime(format!("cond: bad clause at {}", fmt_span(clause.span)))),
                         }
+                    }
+                    if applied_arrow {
+                        continue;
                     }
                     if let Some(val) = direct_result {
                         returning = Some(val);
@@ -1739,6 +1778,91 @@ fn eval_quote(args: &[Expr], span: Span) -> Result<Value, EvalError> {
     Ok(expr_to_value(&args[0]))
 }
 
+fn eval_quasiquote(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
+    match &expr.kind {
+        ExprKind::List(items) if !items.is_empty() => {
+            // Check for (unquote x)
+            if let ExprKind::Symbol(s) = &items[0].kind {
+                if s == "unquote" && items.len() == 2 {
+                    return eval(&items[1], env);
+                }
+            }
+            // Check for dotted pair: (a b ... . tail)
+            let has_dot = items.len() >= 3 && matches!(&items[items.len() - 2].kind, ExprKind::Symbol(s) if s == ".");
+            if has_dot {
+                let proper_items = &items[..items.len() - 2];
+                let tail_expr = &items[items.len() - 1];
+                let mut result = eval_quasiquote(tail_expr, env)?;
+                for item in proper_items.iter().rev() {
+                    // Check for (unquote-splicing x)
+                    if let ExprKind::List(sub) = &item.kind {
+                        if sub.len() == 2 {
+                            if let ExprKind::Symbol(s) = &sub[0].kind {
+                                if s == "unquote-splicing" {
+                                    let spliced = eval(&sub[1], env)?;
+                                    // Append spliced list in front of result
+                                    let mut elems = Vec::new();
+                                    let mut cur = spliced;
+                                    loop {
+                                        match cur {
+                                            Value::Pair(p) => {
+                                                let (car, cdr) = { let b = p.borrow(); (b.0.clone(), b.1.clone()) };
+                                                elems.push(car);
+                                                cur = cdr;
+                                            }
+                                            Value::Nil => break,
+                                            _ => { elems.push(cur); break; }
+                                        }
+                                    }
+                                    for e in elems.into_iter().rev() {
+                                        result = cons(e, result);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    result = cons(eval_quasiquote(item, env)?, result);
+                }
+                return Ok(result);
+            }
+            // Regular list: build from elements, handling splicing
+            let mut elements: Vec<Value> = Vec::new();
+            for item in items {
+                if let ExprKind::List(sub) = &item.kind {
+                    if sub.len() == 2 {
+                        if let ExprKind::Symbol(s) = &sub[0].kind {
+                            if s == "unquote-splicing" {
+                                let spliced = eval(&sub[1], env)?;
+                                let mut cur = spliced;
+                                loop {
+                                    match cur {
+                                        Value::Pair(p) => {
+                                            let (car, cdr) = { let b = p.borrow(); (b.0.clone(), b.1.clone()) };
+                                            elements.push(car);
+                                            cur = cdr;
+                                        }
+                                        Value::Nil => break,
+                                        _ => { elements.push(cur); break; }
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+                elements.push(eval_quasiquote(item, env)?);
+            }
+            let mut result = Value::Nil;
+            for e in elements.into_iter().rev() {
+                result = cons(e, result);
+            }
+            Ok(result)
+        }
+        _ => Ok(expr_to_value(expr)),
+    }
+}
+
 fn expr_to_value(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Integer(n) => Value::Integer(*n),
@@ -1749,6 +1873,19 @@ fn expr_to_value(expr: &Expr) -> Value {
         ExprKind::Char(c) => Value::Char(*c),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
         ExprKind::List(items) => {
+            // Check for dotted pair: (a b . c) where "." is the second-to-last element
+            if items.len() >= 3 {
+                if let ExprKind::Symbol(s) = &items[items.len() - 2].kind {
+                    if s == "." {
+                        // Dotted pair: everything before "." cons'd onto the last element
+                        let mut result = expr_to_value(&items[items.len() - 1]);
+                        for item in items[..items.len() - 2].iter().rev() {
+                            result = cons(expr_to_value(item), result);
+                        }
+                        return result;
+                    }
+                }
+            }
             let mut result = Value::Nil;
             for item in items.iter().rev() {
                 result = cons(expr_to_value(item), result);
@@ -3055,6 +3192,24 @@ fn apply_builtin(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
                     }
                     Value::Nil => return Ok(Value::Boolean(false)),
                     _ => return Err(EvalError::Type("memq: expected list".into())),
+                }
+            }
+        }
+        "memv" => {
+            if args.len() != 2 { return Err(EvalError::Arity("memv requires 2 arguments".into())); }
+            let key = &args[0];
+            let mut cur = args[1].clone();
+            loop {
+                match cur {
+                    Value::Pair(p) => {
+                        let car = p.borrow().0.clone();
+                        if eqv(key, &car) {
+                            return Ok(Value::Pair(p));
+                        }
+                        cur = p.borrow().1.clone();
+                    }
+                    Value::Nil => return Ok(Value::Boolean(false)),
+                    _ => return Err(EvalError::Type("memv: expected list".into())),
                 }
             }
         }
