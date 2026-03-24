@@ -73,6 +73,38 @@ pub(super) fn cek_eval_define(
             env_set(env, name, lambda);
             Ok(State::Apply(Value::Void, kont))
         }
+        Expr::DottedList(sig, rest_sym, _) => {
+            if sig.is_empty() {
+                return Err(EvalError::Parse(format!("{p}: define: empty signature")));
+            }
+            let name = match &sig[0] {
+                Expr::Symbol(s, _) => s.clone(),
+                _ => {
+                    return Err(EvalError::Parse(format!(
+                        "{p}: define: expected function name"
+                    )))
+                }
+            };
+            let (params, _) = parse_params(&sig[1..], p)?;
+            let rest_param = match rest_sym.as_ref() {
+                Expr::Symbol(s, _) => Some(s.clone()),
+                _ => return Err(EvalError::Parse(format!(
+                    "{p}: define: expected symbol for rest parameter"
+                ))),
+            };
+            let body = args[1..].to_vec();
+            if body.is_empty() {
+                return Err(EvalError::Arity(format!("{p}: define: empty body")));
+            }
+            let lambda = Value::Lambda {
+                params,
+                rest_param,
+                body,
+                env: env.clone(),
+            };
+            env_set(env, name, lambda);
+            Ok(State::Apply(Value::Void, kont))
+        }
         _ => Err(EvalError::Parse(format!(
             "{p}: define: expected symbol or list"
         ))),
@@ -369,10 +401,21 @@ pub(super) fn cek_eval_cond(
                         return Ok(eval_body_state(&parts[1..], env.clone(), kont));
                     }
                 }
+                // Check for (test => proc) form
+                let is_arrow = parts.len() == 3
+                    && matches!(&parts[1], Expr::Symbol(s, _) if s == "=>");
                 let mut dummy_output = String::new();
                 if let Some(test_result) = eval_simple(&parts[0], env, &mut dummy_output) {
                     let test_val = test_result?;
                     if is_truthy(&test_val) {
+                        if is_arrow {
+                            // (test => proc): evaluate proc then apply to test_val
+                            let kont = Rc::new(KontFrame::EvCondArrow {
+                                test_val: test_val.clone(),
+                                next: kont,
+                            });
+                            return Ok(State::Eval(parts[2].clone(), env.clone(), kont));
+                        }
                         if parts.len() <= 1 {
                             return Ok(State::Apply(test_val, kont));
                         }
@@ -570,6 +613,13 @@ pub(super) fn expr_to_value(expr: &Expr) -> Value {
         Expr::Symbol(s, _) => Value::Symbol(s.clone()),
         Expr::Char(c, _) => Value::Char(*c),
         Expr::List(elems, _) => Value::List(elems.iter().map(expr_to_value).collect()),
+        Expr::DottedList(elems, tail, _) => {
+            // Build nested pairs: (a b . c) -> Pair(a, Pair(b, c))
+            let tail_val = expr_to_value(tail);
+            elems.iter().rev().fold(tail_val, |acc, e| {
+                Value::Pair(std::rc::Rc::new(std::cell::RefCell::new((expr_to_value(e), acc))))
+            })
+        }
     }
 }
 
@@ -622,6 +672,21 @@ pub(super) fn eval_lambda(
     }
     let (params, rest_param) = match &args[0] {
         Expr::List(elems, _) => parse_params(elems, call_pos)?,
+        Expr::DottedList(elems, tail, _) => {
+            // (lambda (a b . rest) body) — dotted pair notation for variadic
+            let (params, _) = parse_params(elems, call_pos)?;
+            let rest = match tail.as_ref() {
+                Expr::Symbol(s, _) => s.clone(),
+                _ => return Err(EvalError::Parse(format!(
+                    "{call_pos}: lambda: expected symbol for rest parameter"
+                ))),
+            };
+            (params, Some(rest))
+        }
+        Expr::Symbol(s, _) => {
+            // (lambda args body) — single symbol catches all args as rest
+            (vec![], Some(s.clone()))
+        }
         _ => {
             return Err(EvalError::Parse(format!(
                 "{call_pos}: lambda: expected parameter list"
@@ -658,6 +723,16 @@ pub(super) fn eval_case_lambda(
                 }
                 let (params, rest_param) = match &clause_elems[0] {
                     Expr::List(elems, _) => parse_params(elems, call_pos)?,
+                    Expr::DottedList(elems, tail, _) => {
+                        let (params, _) = parse_params(elems, call_pos)?;
+                        let rest = match tail.as_ref() {
+                            Expr::Symbol(s, _) => s.clone(),
+                            _ => return Err(EvalError::Parse(format!(
+                                "{call_pos}: case-lambda: expected symbol for rest parameter"
+                            ))),
+                        };
+                        (params, Some(rest))
+                    }
                     _ => {
                         return Err(EvalError::Parse(format!(
                             "{call_pos}: case-lambda: expected parameter list"

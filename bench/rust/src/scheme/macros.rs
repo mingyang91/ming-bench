@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
-    env_get, env_set, Env, EvalError, Expr, PatternBinding, Pos, Value, BUILTINS, SPECIAL_FORMS,
+    env_get, env_set, new_env, Env, EvalError, Expr, Kont, PatternBinding, Pos,
+    State, Value, BUILTINS, SPECIAL_FORMS,
 };
 use super::forms::eval_lambda;
 
@@ -136,6 +137,26 @@ pub(super) fn match_pattern(
                 false
             }
         }
+        Expr::DottedList(pelems, ptail, _) => {
+            // Match dotted pattern like (a b . rest) against input list
+            if let Expr::List(ielems, _) = input {
+                if ielems.len() < pelems.len() {
+                    return false;
+                }
+                // Match the fixed elements
+                for (pe, ie) in pelems.iter().zip(ielems.iter()) {
+                    if !match_pattern(pe, ie, literals, bindings) {
+                        return false;
+                    }
+                }
+                // Match the tail against the rest of the input as a list
+                let rest = &ielems[pelems.len()..];
+                let rest_expr = Expr::List(rest.to_vec(), super::parser::Pos::default());
+                match_pattern(ptail, &rest_expr, literals, bindings)
+            } else {
+                false
+            }
+        }
         Expr::Integer(n, _) => matches!(input, Expr::Integer(m, _) if *m == *n),
         Expr::Boolean(b, _) => matches!(input, Expr::Boolean(c, _) if *c == *b),
         Expr::Str(s, _) => matches!(input, Expr::Str(t, _) if t == s),
@@ -230,6 +251,12 @@ fn collect_pattern_var_names_inner(pattern: &Expr, literals: &[String], vars: &m
                 collect_pattern_var_names_inner(e, literals, vars);
             }
         }
+        Expr::DottedList(elems, tail, _) => {
+            for e in elems {
+                collect_pattern_var_names_inner(e, literals, vars);
+            }
+            collect_pattern_var_names_inner(tail, literals, vars);
+        }
         _ => {}
     }
 }
@@ -274,6 +301,12 @@ fn collect_free_inner(
             for e in elems {
                 collect_free_inner(e, pattern_vars, special, builtins, result);
             }
+        }
+        Expr::DottedList(elems, tail, _) => {
+            for e in elems {
+                collect_free_inner(e, pattern_vars, special, builtins, result);
+            }
+            collect_free_inner(tail, pattern_vars, special, builtins, result);
         }
         _ => {}
     }
@@ -334,6 +367,21 @@ fn expand_template(
             }
             Expr::List(result, *pos)
         }
+        Expr::DottedList(elems, tail, pos) => {
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                if i + 1 < elems.len() && is_ellipsis(&elems[i + 1]) {
+                    expand_ellipsis_template(&elems[i], bindings, hygiene_map, &mut result);
+                    i += 2;
+                    continue;
+                }
+                result.push(expand_template(&elems[i], bindings, hygiene_map));
+                i += 1;
+            }
+            let new_tail = Box::new(expand_template(tail, bindings, hygiene_map));
+            Expr::DottedList(result, new_tail, *pos)
+        }
         _ => template.clone(),
     }
 }
@@ -353,6 +401,12 @@ fn find_repeated_vars(
             for e in elems {
                 vars.extend(find_repeated_vars(e, bindings));
             }
+        }
+        Expr::DottedList(elems, tail, _) => {
+            for e in elems {
+                vars.extend(find_repeated_vars(e, bindings));
+            }
+            vars.extend(find_repeated_vars(tail, bindings));
         }
         _ => {}
     }
@@ -432,6 +486,12 @@ fn collect_syntax_env_bindings(
                 collect_syntax_env_bindings(e, env, bindings);
             }
         }
+        Expr::DottedList(elems, tail, _) => {
+            for e in elems {
+                collect_syntax_env_bindings(e, env, bindings);
+            }
+            collect_syntax_env_bindings(tail, env, bindings);
+        }
         _ => {}
     }
 }
@@ -448,6 +508,33 @@ pub(super) fn value_to_expr(val: &Value) -> Expr {
         Value::Symbol(s) => Expr::Symbol(s.clone(), p),
         Value::Char(c) => Expr::Char(*c, p),
         Value::List(elems) => Expr::List(elems.iter().map(value_to_expr).collect(), p),
+        Value::Pair(_pair) => {
+            // Convert pair chain to DottedList or List
+            let mut elems = Vec::new();
+            let mut cur = val.clone();
+            loop {
+                match &cur {
+                    Value::Pair(p_inner) => {
+                        let (car, cdr) = {
+                            let b = p_inner.borrow();
+                            (b.0.clone(), b.1.clone())
+                        };
+                        elems.push(value_to_expr(&car));
+                        cur = cdr;
+                    }
+                    Value::List(items) if items.is_empty() => {
+                        return Expr::List(elems, p);
+                    }
+                    Value::List(items) => {
+                        elems.extend(items.iter().map(value_to_expr));
+                        return Expr::List(elems, p);
+                    }
+                    _ => {
+                        return Expr::DottedList(elems, Box::new(value_to_expr(&cur)), p);
+                    }
+                }
+            }
+        }
         Value::SyntaxObject(expr, _) => (**expr).clone(),
         _ => Expr::Symbol(format!("{val}"), p),
     }
@@ -495,5 +582,57 @@ pub(super) fn expand_macro(
 
     Err(EvalError::Parse(format!(
         "{call_pos}: no matching syntax-rules pattern"
+    )))
+}
+
+pub(super) fn handle_syntax_case(
+    stx_val: Value,
+    literals: &[String],
+    clauses: &[Expr],
+    env: &Env,
+    kont: Kont,
+    pos: Pos,
+) -> Result<State, EvalError> {
+    let stx_expr = match &stx_val {
+        Value::SyntaxObject(expr, _) => (**expr).clone(),
+        other => value_to_expr(other),
+    };
+
+    for clause in clauses {
+        let clause_elems = match clause {
+            Expr::List(elems, _) if elems.len() >= 2 => elems,
+            _ => {
+                return Err(EvalError::Parse(format!(
+                    "{pos}: syntax-case: invalid clause"
+                )))
+            }
+        };
+
+        let pattern = &clause_elems[0];
+        let body = &clause_elems[clause_elems.len() - 1];
+
+        let mut bindings = HashMap::new();
+        if match_pattern(pattern, &stx_expr, literals, &mut bindings) {
+            let clause_env = new_env(Some(env.clone()));
+            for (name, binding) in bindings {
+                match binding {
+                    PatternBinding::Single(expr) => {
+                        env_set(
+                            &clause_env,
+                            name,
+                            Value::SyntaxObject(Box::new(expr), vec![]),
+                        );
+                    }
+                    PatternBinding::Repeated(exprs) => {
+                        env_set(&clause_env, name, Value::SyntaxList(exprs));
+                    }
+                }
+            }
+            return Ok(State::Eval(body.clone(), clause_env, kont));
+        }
+    }
+
+    Err(EvalError::Parse(format!(
+        "{pos}: syntax-case: no matching clause"
     )))
 }

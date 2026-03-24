@@ -31,7 +31,11 @@ enum Token {
     LParen,
     RParen,
     Quote,
+    Quasiquote,
+    Unquote,
+    UnquoteSplicing,
     SyntaxQuote,
+    VectorOpen,
     Symbol(String),
     Integer(i64),
     Float(f64),
@@ -110,7 +114,7 @@ fn tokenize(input: &str) -> Result<Vec<SpannedToken>, EvalError> {
                 line += 1;
                 col = 1;
             }
-            ' ' | '\t' | '\r' => {
+            ' ' | '\t' | '\r' | '\x0c' => {
                 i += 1;
                 col += 1;
             }
@@ -134,6 +138,23 @@ fn tokenize(input: &str) -> Result<Vec<SpannedToken>, EvalError> {
                 tokens.push(SpannedToken { token: Token::Quote, pos: Pos::new(line, col) });
                 i += 1;
                 col += 1;
+            }
+            '`' => {
+                tokens.push(SpannedToken { token: Token::Quasiquote, pos: Pos::new(line, col) });
+                i += 1;
+                col += 1;
+            }
+            ',' => {
+                let start_pos = Pos::new(line, col);
+                if i + 1 < chars.len() && chars[i + 1] == '@' {
+                    tokens.push(SpannedToken { token: Token::UnquoteSplicing, pos: start_pos });
+                    i += 2;
+                    col += 2;
+                } else {
+                    tokens.push(SpannedToken { token: Token::Unquote, pos: start_pos });
+                    i += 1;
+                    col += 1;
+                }
             }
             '"' => {
                 let start_pos = Pos::new(line, col);
@@ -190,6 +211,11 @@ fn tokenize(input: &str) -> Result<Vec<SpannedToken>, EvalError> {
                             i += 2;
                             col += 2;
                         }
+                        '(' => {
+                            tokens.push(SpannedToken { token: Token::VectorOpen, pos: start_pos });
+                            i += 2;
+                            col += 2;
+                        }
                         '\\' => {
                             let (ch, advance) = parse_char_literal(&chars, i + 2, start_pos)?;
                             i += 2 + advance;
@@ -211,7 +237,7 @@ fn tokenize(input: &str) -> Result<Vec<SpannedToken>, EvalError> {
                 let start_pos = Pos::new(line, col);
                 let start = i;
                 while i < chars.len()
-                    && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '(' | ')' | ';' | '"' | '\'')
+                    && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '(' | ')' | ';' | '"' | '\'' | '`' | ',')
                 {
                     i += 1;
                     col += 1;
@@ -237,6 +263,8 @@ pub(crate) enum Expr {
     Symbol(String, Pos),
     Char(char, Pos),
     List(Vec<Expr>, Pos),
+    /// Dotted list: (a b . c) — elements before dot, and the tail after dot
+    DottedList(Vec<Expr>, Box<Expr>, Pos),
 }
 
 impl Expr {
@@ -249,7 +277,8 @@ impl Expr {
             | Expr::Str(_, p)
             | Expr::Symbol(_, p)
             | Expr::Char(_, p)
-            | Expr::List(_, p) => *p,
+            | Expr::List(_, p)
+            | Expr::DottedList(_, _, p) => *p,
         }
     }
 }
@@ -301,22 +330,68 @@ fn parse(tokens: &[SpannedToken], pos: &mut usize) -> Result<Expr, EvalError> {
             let inner = parse(tokens, pos)?;
             Ok(Expr::List(vec![Expr::Symbol("quote".into(), src_pos), inner], src_pos))
         }
+        Token::Quasiquote => {
+            *pos += 1;
+            let inner = parse(tokens, pos)?;
+            Ok(Expr::List(vec![Expr::Symbol("quasiquote".into(), src_pos), inner], src_pos))
+        }
+        Token::Unquote => {
+            *pos += 1;
+            let inner = parse(tokens, pos)?;
+            Ok(Expr::List(vec![Expr::Symbol("unquote".into(), src_pos), inner], src_pos))
+        }
+        Token::UnquoteSplicing => {
+            *pos += 1;
+            let inner = parse(tokens, pos)?;
+            Ok(Expr::List(vec![Expr::Symbol("unquote-splicing".into(), src_pos), inner], src_pos))
+        }
         Token::SyntaxQuote => {
             *pos += 1;
             let inner = parse(tokens, pos)?;
             Ok(Expr::List(vec![Expr::Symbol("syntax".into(), src_pos), inner], src_pos))
         }
+        Token::VectorOpen => {
+            *pos += 1;
+            let mut elems = vec![Expr::Symbol("vector".into(), src_pos)];
+            while *pos < tokens.len() && tokens[*pos].token != Token::RParen {
+                elems.push(parse(tokens, pos)?);
+            }
+            if *pos >= tokens.len() {
+                return Err(EvalError::Parse(format!("{src_pos}: missing closing paren for #(")));
+            }
+            *pos += 1;
+            Ok(Expr::List(elems, src_pos))
+        }
         Token::LParen => {
             *pos += 1;
             let mut elems = Vec::new();
+            let mut is_dotted = false;
+            let mut tail = None;
             while *pos < tokens.len() && tokens[*pos].token != Token::RParen {
-                elems.push(parse(tokens, pos)?);
+                let elem = parse(tokens, pos)?;
+                // Check for dot notation: (a b . c)
+                if let Expr::Symbol(ref s, _) = elem {
+                    if s == "." && !elems.is_empty() {
+                        // Next element is the tail
+                        if *pos >= tokens.len() || tokens[*pos].token == Token::RParen {
+                            return Err(EvalError::Parse(format!("{src_pos}: expected expression after dot")));
+                        }
+                        tail = Some(Box::new(parse(tokens, pos)?));
+                        is_dotted = true;
+                        break;
+                    }
+                }
+                elems.push(elem);
             }
             if *pos >= tokens.len() {
                 return Err(EvalError::Parse(format!("{src_pos}: missing closing paren")));
             }
             *pos += 1;
-            Ok(Expr::List(elems, src_pos))
+            if is_dotted {
+                Ok(Expr::DottedList(elems, tail.expect("dotted list must have tail"), src_pos))
+            } else {
+                Ok(Expr::List(elems, src_pos))
+            }
         }
         Token::RParen => Err(EvalError::Parse(format!("{src_pos}: unexpected )"))),
     }

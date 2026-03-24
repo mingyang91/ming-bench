@@ -4,6 +4,7 @@ mod forms;
 mod macros;
 mod parser;
 mod values;
+mod quasiquote;
 mod wind;
 
 use parser::{parse_all, Expr, Pos};
@@ -16,8 +17,9 @@ use forms::{
     cek_eval_string_set, case_clause_matches, eval_case_lambda, eval_define_record_type,
     eval_lambda, expr_to_value, make_begin,
 };
-use macros::{eval_define_syntax, expand_macro, expand_syntax_form, match_pattern};
+use macros::{eval_define_syntax, expand_macro, expand_syntax_form, handle_syntax_case};
 use values::{values_eq, values_equal, values_eqv, is_proper_list, to_list_vec};
+use quasiquote::eval_quasiquote;
 use wind::{apply_wind_step, apply_continuation};
 
 use std::cell::RefCell;
@@ -262,7 +264,7 @@ pub(super) const BUILTINS: &[&str] = &[
     "eqv?",
     "vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
     "vector->list", "list->vector",
-    "memq", "assq",
+    "memq", "memv", "assq",
     "for-each",
     "set-car!", "set-cdr!",
     "error",
@@ -305,6 +307,8 @@ pub(super) enum KontFrame {
     EvOr { rest: Vec<Expr>, env: Env, next: Kont },
     /// Cond: evaluated test — if truthy eval body, else try rest_clauses
     EvCondTest { body: Vec<Expr>, rest_clauses: Vec<Expr>, env: Env, next: Kont },
+    /// Cond arrow: test was truthy, proc evaluated — apply proc to test_val
+    EvCondArrow { test_val: Value, next: Kont },
     /// Let bindings (inits evaluated in outer_env, bound in local_env)
     EvLetBind { name: String, rest: Vec<(String, Expr)>, outer_env: Env, local_env: Env, body: Vec<Expr>, next: Kont },
     /// Let*/letrec bindings (inits evaluated in local_env)
@@ -508,6 +512,12 @@ fn cek_eval(expr: &Expr, env: &Env, kont: Kont, _output: &mut String) -> Result<
                         }
                         return Ok(State::Apply(expr_to_value(&elems[1]), kont));
                     }
+                    "quasiquote" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Arity(format!("{p}: quasiquote expects 1 argument")));
+                        }
+                        return eval_quasiquote(&elems[1], env, kont);
+                    }
                     "lambda" => return Ok(State::Apply(eval_lambda(&elems[1..], p, env)?, kont)),
                     "case-lambda" => return Ok(State::Apply(eval_case_lambda(&elems[1..], p, env)?, kont)),
                     "let" => return cek_eval_let(&elems[1..], p, env, kont),
@@ -698,64 +708,18 @@ fn cek_eval(expr: &Expr, env: &Env, kont: Kont, _output: &mut String) -> Result<
             });
             Ok(State::Eval(elems[0].clone(), env.clone(), kont))
         }
+        Expr::DottedList(elems, tail, _) => {
+            // Evaluate as a literal dotted pair/improper list
+            let tail_val = expr_to_value(tail);
+            let val = elems.iter().rev().fold(tail_val, |acc, e| {
+                Value::Pair(Rc::new(RefCell::new((expr_to_value(e), acc))))
+            });
+            Ok(State::Apply(val, kont))
+        }
     }
 }
 
 /// Handle syntax-case pattern matching after stx-expr has been evaluated.
-fn handle_syntax_case(
-    stx_val: Value,
-    literals: &[String],
-    clauses: &[Expr],
-    env: &Env,
-    kont: Kont,
-    pos: Pos,
-) -> Result<State, EvalError> {
-    let stx_expr = match &stx_val {
-        Value::SyntaxObject(expr, _) => (**expr).clone(),
-        // If not a syntax object, convert value to expr for matching
-        other => macros::value_to_expr(other),
-    };
-
-    for clause in clauses {
-        let clause_elems = match clause {
-            Expr::List(elems, _) if elems.len() >= 2 => elems,
-            _ => {
-                return Err(EvalError::Parse(format!(
-                    "{pos}: syntax-case: invalid clause"
-                )))
-            }
-        };
-
-        let pattern = &clause_elems[0];
-        let body = &clause_elems[clause_elems.len() - 1];
-
-        let mut bindings = std::collections::HashMap::new();
-        if match_pattern(pattern, &stx_expr, literals, &mut bindings) {
-            // Bind pattern vars as SyntaxObject/SyntaxList in a new env
-            let clause_env = new_env(Some(env.clone()));
-            for (name, binding) in bindings {
-                match binding {
-                    PatternBinding::Single(expr) => {
-                        env_set(
-                            &clause_env,
-                            name,
-                            Value::SyntaxObject(Box::new(expr), vec![]),
-                        );
-                    }
-                    PatternBinding::Repeated(exprs) => {
-                        env_set(&clause_env, name, Value::SyntaxList(exprs));
-                    }
-                }
-            }
-            return Ok(State::Eval(body.clone(), clause_env, kont));
-        }
-    }
-
-    Err(EvalError::Parse(format!(
-        "{pos}: syntax-case: no matching clause"
-    )))
-}
-
 /// CEK step: return a value to a continuation.
 fn cek_apply_kont(val: Value, kont: &Kont, wind_stack: &mut Vec<WindEntry>, handler_stack: &mut Vec<HandlerEntry>, _output: &mut String) -> Result<State, EvalError> {
     match kont.as_ref() {
@@ -869,16 +833,13 @@ fn cek_apply_kont(val: Value, kont: &Kont, wind_stack: &mut Vec<WindEntry>, hand
         }
 
         KontFrame::EvCondTest { body, rest_clauses, env, next } => {
-            if is_truthy(&val) {
-                if body.is_empty() {
-                    // (cond (test)) — return test value
-                    Ok(State::Apply(val, next.clone()))
-                } else {
-                    Ok(eval_body_state(body, env.clone(), next.clone()))
-                }
-            } else {
-                cek_eval_cond(rest_clauses, env, next.clone())
-            }
+            cek_apply_cond_test(val, body, rest_clauses, env, next.clone())
+        }
+
+        KontFrame::EvCondArrow { test_val, next } => {
+            // val is the proc, test_val is the result of test
+            // Apply proc to test_val
+            Ok(State::Invoke(val, vec![test_val.clone()], Pos::default(), next.clone()))
         }
 
         KontFrame::EvLetBind { name, rest, outer_env, local_env, body, next } => {
@@ -952,18 +913,7 @@ fn cek_apply_kont(val: Value, kont: &Kont, wind_stack: &mut Vec<WindEntry>, hand
         }
 
         KontFrame::EvCaseKey { clauses, env, next } => {
-            // val is the case key
-            for clause in clauses {
-                let Expr::List(parts, _) = clause else { continue };
-                if parts.is_empty() { continue; }
-                if matches!(&parts[0], Expr::Symbol(s, _) if s == "else") {
-                    return Ok(eval_body_state(&parts[1..], env.clone(), next.clone()));
-                }
-                if case_clause_matches(&val, parts) {
-                    return Ok(eval_body_state(&parts[1..], env.clone(), next.clone()));
-                }
-            }
-            Ok(State::Apply(Value::Void, next.clone()))
+            cek_apply_case_key(val, clauses, env, next.clone())
         }
 
         KontFrame::EvMap { func, lists, idx, results, pos, next } => {
@@ -1098,6 +1048,46 @@ fn cek_apply_kont(val: Value, kont: &Kont, wind_stack: &mut Vec<WindEntry>, hand
             }
         }
     }
+}
+
+/// Handle a `cond` test result: dispatch to body, arrow form, or next clause.
+fn cek_apply_cond_test(val: Value, body: &[Expr], rest_clauses: &[Expr], env: &Env, next: Kont) -> Result<State, EvalError> {
+    if is_truthy(&val) {
+        // Check for (test => proc) form
+        if body.len() == 2 {
+            if let Expr::Symbol(s, _) = &body[0] {
+                if s == "=>" {
+                    let kont = Rc::new(KontFrame::EvCondArrow {
+                        test_val: val,
+                        next,
+                    });
+                    return Ok(State::Eval(body[1].clone(), env.clone(), kont));
+                }
+            }
+        }
+        if body.is_empty() {
+            Ok(State::Apply(val, next))
+        } else {
+            Ok(eval_body_state(body, env.clone(), next))
+        }
+    } else {
+        cek_eval_cond(rest_clauses, env, next)
+    }
+}
+
+/// Evaluate a `case` expression's clauses against a key value.
+fn cek_apply_case_key(val: Value, clauses: &[Expr], env: &Env, next: Kont) -> Result<State, EvalError> {
+    for clause in clauses {
+        let Expr::List(parts, _) = clause else { continue };
+        if parts.is_empty() { continue; }
+        if matches!(&parts[0], Expr::Symbol(s, _) if s == "else") {
+            return Ok(eval_body_state(&parts[1..], env.clone(), next));
+        }
+        if case_clause_matches(&val, parts) {
+            return Ok(eval_body_state(&parts[1..], env.clone(), next));
+        }
+    }
+    Ok(State::Apply(Value::Void, next))
 }
 
 /// CEK step: invoke a function with arguments.
@@ -1436,7 +1426,7 @@ pub(super) fn value_to_f64(v: &Value, call_pos: Pos) -> Result<f64, EvalError> {
 pub(super) static RECORD_TYPE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(super) const SPECIAL_FORMS: &[&str] = &[
-    "define", "if", "quote", "lambda", "case-lambda", "let", "begin", "cond", "and", "or",
+    "define", "if", "quote", "quasiquote", "lambda", "case-lambda", "let", "begin", "cond", "and", "or",
     "set!", "string-set!", "not", "define-syntax", "syntax-rules",
     "letrec", "letrec*", "case", "do", "let*", "when", "unless", "guard",
     "syntax-case", "syntax", "with-syntax",
