@@ -56,6 +56,7 @@ pub enum Value {
     Builtin(String),
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Expr>,
         env: Rc<RefCell<EnvInner>>,
     },
@@ -168,7 +169,8 @@ impl Env {
                      "string-append", "string-length", "substring",
                      "string->number", "number->string",
                      "symbol->string", "string->symbol", "string-ref",
-                     "string-copy", "make-string", "char->integer", "integer->char"] {
+                     "string-copy", "make-string", "char->integer", "integer->char",
+                     "apply"] {
             bindings.insert(name.to_string(), Value::Builtin(name.to_string()));
         }
         Env(Rc::new(RefCell::new(EnvInner {
@@ -270,13 +272,11 @@ fn eval_define(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError>
         }
         ExprKind::List(parts) if !parts.is_empty() => {
             if let ExprKind::Symbol(name) = &parts[0].kind {
-                let params: Vec<String> = parts[1..].iter().map(|p| {
-                    if let ExprKind::Symbol(s) = &p.kind { Ok(s.clone()) }
-                    else { Err(EvalError::Runtime(format!("parameter must be a symbol at {}", fmt_span(p.span)))) }
-                }).collect::<Result<_, _>>()?;
+                let (params, rest_param) = parse_params(&parts[1..], span)?;
                 let body = args[1..].to_vec();
                 let lambda = Value::Lambda {
                     params,
+                    rest_param,
                     body,
                     env: env.0.clone(),
                 };
@@ -328,22 +328,43 @@ fn expr_to_value(expr: &Expr) -> Value {
     }
 }
 
+fn parse_params(parts: &[Expr], span: Span) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut params = Vec::new();
+    let mut rest_param = None;
+    let mut i = 0;
+    while i < parts.len() {
+        if let ExprKind::Symbol(s) = &parts[i].kind {
+            if s == "." {
+                if i + 1 < parts.len() && i + 2 == parts.len() {
+                    if let ExprKind::Symbol(rest) = &parts[i + 1].kind {
+                        rest_param = Some(rest.clone());
+                        break;
+                    }
+                }
+                return Err(EvalError::Runtime(format!("bad dot syntax in params at {}", fmt_span(span))));
+            }
+            params.push(s.clone());
+        } else {
+            return Err(EvalError::Runtime(format!("parameter must be a symbol at {}", fmt_span(parts[i].span))));
+        }
+        i += 1;
+    }
+    Ok((params, rest_param))
+}
+
 fn eval_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Runtime(format!("lambda requires params and body at {}", fmt_span(span))));
     }
-    let params = match &args[0].kind {
-        ExprKind::List(parts) => {
-            parts.iter().map(|p| {
-                if let ExprKind::Symbol(s) = &p.kind { Ok(s.clone()) }
-                else { Err(EvalError::Runtime(format!("parameter must be a symbol at {}", fmt_span(p.span)))) }
-            }).collect::<Result<Vec<_>, _>>()?
-        }
+    let (params, rest_param) = match &args[0].kind {
+        ExprKind::List(parts) => parse_params(parts, span)?,
+        ExprKind::Symbol(s) => (vec![], Some(s.clone())),
         _ => return Err(EvalError::Runtime(format!("lambda: expected parameter list at {}", fmt_span(span)))),
     };
     let body = args[1..].to_vec();
     Ok(Value::Lambda {
         params,
+        rest_param,
         body,
         env: env.0.clone(),
     })
@@ -352,8 +373,14 @@ fn eval_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError>
 fn apply_func(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
     match func {
         Value::Builtin(_) => apply_builtin(func, args),
-        Value::Lambda { params, body, env } => {
-            if args.len() != params.len() {
+        Value::Lambda { params, rest_param, body, env } => {
+            if let Some(_) = rest_param {
+                if args.len() < params.len() {
+                    return Err(EvalError::Arity(format!(
+                        "expected at least {} arguments, got {}", params.len(), args.len()
+                    )));
+                }
+            } else if args.len() != params.len() {
                 return Err(EvalError::Arity(format!(
                     "expected {} arguments, got {}", params.len(), args.len()
                 )));
@@ -362,6 +389,14 @@ fn apply_func(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
             let local_env = Env::child(&parent_env);
             for (name, val) in params.iter().zip(args.iter()) {
                 local_env.define(name.clone(), val.clone());
+            }
+            if let Some(rest) = rest_param {
+                let rest_args = &args[params.len()..];
+                let mut list = Value::Nil;
+                for v in rest_args.iter().rev() {
+                    list = Value::Pair(Box::new(v.clone()), Box::new(list));
+                }
+                local_env.define(rest.clone(), list);
             }
             let mut result = Value::Void;
             for expr in body {
@@ -429,6 +464,7 @@ fn eval_let(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
         let local_env = Env::child(env);
         let lambda = Value::Lambda {
             params: params.clone(),
+            rest_param: None,
             body,
             env: local_env.0.clone(),
         };
@@ -816,6 +852,30 @@ fn apply_builtin(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
             if args.len() != 1 { return Err(EvalError::Arity("integer->char requires 1 argument".into())); }
             let n = expect_int(&args[0])?;
             Ok(Value::Char(char::from_u32(n as u32).unwrap_or('\u{FFFD}')))
+        }
+        "apply" => {
+            if args.len() < 2 {
+                return Err(EvalError::Arity("apply requires at least 2 arguments".into()));
+            }
+            let func = &args[0];
+            let last = &args[args.len() - 1];
+            // Collect the last argument (must be a list) into a Vec
+            let mut tail_args = Vec::new();
+            let mut cur = last;
+            loop {
+                match cur {
+                    Value::Pair(car, cdr) => {
+                        tail_args.push((**car).clone());
+                        cur = cdr;
+                    }
+                    Value::Nil => break,
+                    _ => return Err(EvalError::Type("apply: last argument must be a list".into())),
+                }
+            }
+            // Combine prefix args (between func and last) with tail args
+            let mut all_args: Vec<Value> = args[1..args.len()-1].to_vec();
+            all_args.extend(tail_args);
+            apply_func(func, &all_args)
         }
         _ => Err(EvalError::Runtime(format!("unknown builtin: {}", name))),
     }
