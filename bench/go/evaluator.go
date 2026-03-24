@@ -24,6 +24,8 @@ const (
 	valMacro
 	valFloat
 	valRational
+	valRecord
+	valGoFunc
 )
 
 type Value struct {
@@ -41,7 +43,20 @@ type Value struct {
 	body      []*astNode
 	closure   *env
 	macro     *syntaxRulesMacro
+	// record fields
+	recordTag    *recordType
+	recordFields []*Value
+	// native Go function
+	goFunc func([]*Value) (*Value, error)
+	goName string // name for display
 }
+
+type recordType struct {
+	name       string
+	fieldNames []string
+}
+
+var recordTypeCounter int
 
 func intVal(n int64) *Value    { return &Value{typ: valInt, ival: n} }
 func boolVal(b bool) *Value    { return &Value{typ: valBool, bval: b} }
@@ -246,6 +261,10 @@ func (v *Value) String() string {
 		return "#<procedure>"
 	case valMacro:
 		return "#<macro>"
+	case valRecord:
+		return "#<record>"
+	case valGoFunc:
+		return "#<procedure>"
 	default:
 		return "<unknown>"
 	}
@@ -726,6 +745,8 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 			return evalSet(node, e, ip)
 		case "define-syntax":
 			return evalDefineSyntax(node, e)
+		case "define-record-type":
+			return evalDefineRecordType(node, e)
 		}
 
 		// Check if symbol resolves to a macro
@@ -762,6 +783,11 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 	// Lambda application
 	if op.typ == valLambda {
 		return applyLambda(op, args, node, ip)
+	}
+
+	// Native Go function application
+	if op.typ == valGoFunc {
+		return op.goFunc(args)
 	}
 
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", node.line, node.col)}
@@ -2049,6 +2075,111 @@ func evalAll(input string) (result string, output string, err error) {
 		last = v
 	}
 	return last.String(), ip.output.String(), nil
+}
+
+// evalDefineRecordType implements R7RS define-record-type.
+// (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+func evalDefineRecordType(node *astNode, e *env) (*Value, error) {
+	// Expect at least 4 children: define-record-type, <name>, (constructor fields...), predicate, field-specs...
+	if len(node.children) < 4 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: bad syntax", node.line, node.col)}
+	}
+
+	// Parse type name
+	typeName := node.children[1]
+	if !typeName.isAtom || typeName.tok.kind != tokSymbol {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: expected type name", node.line, node.col)}
+	}
+
+	// Parse constructor: (constructor-name field ...)
+	ctorNode := node.children[2]
+	if ctorNode.isAtom || len(ctorNode.children) < 1 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: bad constructor", node.line, node.col)}
+	}
+	ctorName := ctorNode.children[0].tok.sval
+	var ctorFields []string
+	for _, c := range ctorNode.children[1:] {
+		ctorFields = append(ctorFields, c.tok.sval)
+	}
+
+	// Parse predicate name
+	predNode := node.children[3]
+	if !predNode.isAtom || predNode.tok.kind != tokSymbol {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: expected predicate name", node.line, node.col)}
+	}
+	predName := predNode.tok.sval
+
+	// Parse field specs: (field-name accessor-name)
+	// Build a map from field name to its index in the constructor
+	fieldIndex := make(map[string]int)
+	for i, f := range ctorFields {
+		fieldIndex[f] = i
+	}
+
+	// Create the record type descriptor
+	rt := &recordType{
+		name:       typeName.tok.sval,
+		fieldNames: ctorFields,
+	}
+	recordTypeCounter++
+
+	// Define constructor
+	numFields := len(ctorFields)
+	e.set(ctorName, &Value{
+		typ:    valGoFunc,
+		goName: ctorName,
+		goFunc: func(args []*Value) (*Value, error) {
+			if len(args) != numFields {
+				return nil, &EvalError{Message: fmt.Sprintf("constructor %s: expected %d args, got %d", ctorName, numFields, len(args))}
+			}
+			fields := make([]*Value, numFields)
+			copy(fields, args)
+			return &Value{typ: valRecord, recordTag: rt, recordFields: fields}, nil
+		},
+	})
+
+	// Define predicate
+	e.set(predName, &Value{
+		typ:    valGoFunc,
+		goName: predName,
+		goFunc: func(args []*Value) (*Value, error) {
+			if len(args) != 1 {
+				return nil, &EvalError{Message: fmt.Sprintf("%s: expected 1 arg", predName)}
+			}
+			return boolVal(args[0].typ == valRecord && args[0].recordTag == rt), nil
+		},
+	})
+
+	// Define field accessors
+	for i := 4; i < len(node.children); i++ {
+		fieldSpec := node.children[i]
+		if fieldSpec.isAtom || len(fieldSpec.children) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: bad field spec", node.line, node.col)}
+		}
+		fieldName := fieldSpec.children[0].tok.sval
+		accessorName := fieldSpec.children[1].tok.sval
+		idx, ok := fieldIndex[fieldName]
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: unknown field %s", node.line, node.col, fieldName)}
+		}
+		capturedIdx := idx
+		capturedAccessor := accessorName
+		e.set(accessorName, &Value{
+			typ:    valGoFunc,
+			goName: accessorName,
+			goFunc: func(args []*Value) (*Value, error) {
+				if len(args) != 1 {
+					return nil, &EvalError{Message: fmt.Sprintf("%s: expected 1 arg", capturedAccessor)}
+				}
+				if args[0].typ != valRecord || args[0].recordTag != rt {
+					return nil, &EvalError{Message: fmt.Sprintf("%s: not a %s record", capturedAccessor, rt.name)}
+				}
+				return args[0].recordFields[capturedIdx], nil
+			},
+		})
+	}
+
+	return voidVal(), nil
 }
 
 // EvalStr evaluates one or more Scheme expressions and returns the string
