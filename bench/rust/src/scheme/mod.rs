@@ -19,7 +19,7 @@ enum Value {
     Char(char),
     Symbol(String),
     List(Vec<Spanned>),
-    Lambda(Vec<String>, Vec<Spanned>, Env), // params, body, closure env
+    Lambda(Vec<String>, Option<String>, Vec<Spanned>, Env), // params, rest_param, body, closure env
     Void,
 }
 
@@ -317,14 +317,37 @@ fn is_delimiter(c: char) -> bool {
     c.is_whitespace() || c == '(' || c == ')' || c == '"' || c == ';'
 }
 
-fn extract_symbol_list(values: &[Spanned], context: &str, span: Span) -> Result<Vec<String>, EvalError> {
-    values
-        .iter()
-        .map(|v| match &v.val {
-            Value::Symbol(s) => Ok(s.clone()),
-            _ => Err(EvalError::Type(format!("{context}: expected symbol in parameter list"), span)),
-        })
-        .collect()
+/// Parse a parameter list, returning (fixed_params, optional_rest_param).
+/// Handles dot notation: `(x y . rest)` → (["x", "y"], Some("rest"))
+fn parse_params(values: &[Spanned], context: &str, span: Span) -> Result<(Vec<String>, Option<String>), EvalError> {
+    // Look for dot
+    let dot_pos = values.iter().position(|v| matches!(&v.val, Value::Symbol(s) if s == "."));
+    if let Some(pos) = dot_pos {
+        if pos + 1 != values.len() - 1 {
+            return Err(EvalError::Parse(format!("{context}: malformed dot parameter list"), span));
+        }
+        let fixed: Result<Vec<String>, _> = values[..pos]
+            .iter()
+            .map(|v| match &v.val {
+                Value::Symbol(s) => Ok(s.clone()),
+                _ => Err(EvalError::Type(format!("{context}: expected symbol in parameter list"), span)),
+            })
+            .collect();
+        let rest = match &values[pos + 1].val {
+            Value::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Type(format!("{context}: expected symbol after dot"), span)),
+        };
+        Ok((fixed?, Some(rest)))
+    } else {
+        let params: Result<Vec<String>, _> = values
+            .iter()
+            .map(|v| match &v.val {
+                Value::Symbol(s) => Ok(s.clone()),
+                _ => Err(EvalError::Type(format!("{context}: expected symbol in parameter list"), span)),
+            })
+            .collect();
+        Ok((params?, None))
+    }
 }
 
 // --- Evaluator ---
@@ -380,9 +403,9 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                                     Value::Symbol(s) => s.clone(),
                                     _ => return Err(EvalError::Type("define: expected symbol for function name".into(), span)),
                                 };
-                                let params = extract_symbol_list(&sig[1..], "define", span)?;
+                                let (params, rest) = parse_params(&sig[1..], "define", span)?;
                                 let body = items[2..].to_vec();
-                                let lambda = Value::Lambda(params, body, env.clone());
+                                let lambda = Value::Lambda(params, rest, body, env.clone());
                                 env_set(env, func_name, lambda);
                                 return Ok(Value::Void);
                             }
@@ -393,12 +416,13 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         if items.len() < 3 {
                             return Err(EvalError::Arity("lambda requires at least 2 arguments".into(), span));
                         }
-                        let Value::List(param_list) = &items[1].val else {
-                            return Err(EvalError::Type("lambda: expected parameter list".into(), span));
+                        let (params, rest) = match &items[1].val {
+                            Value::List(param_list) => parse_params(param_list, "lambda", span)?,
+                            Value::Symbol(s) => (vec![], Some(s.clone())), // (lambda args body)
+                            _ => return Err(EvalError::Type("lambda: expected parameter list".into(), span)),
                         };
-                        let params = extract_symbol_list(param_list, "lambda", span)?;
                         let body = items[2..].to_vec();
-                        return Ok(Value::Lambda(params, body, env.clone()));
+                        return Ok(Value::Lambda(params, rest, body, env.clone()));
                     }
                     "let" => return eval_let(&items[1..], env, out, span),
                     "begin" => {
@@ -472,21 +496,42 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
 
 fn apply(func: &Value, args: &[Value], out: &Output, span: Span) -> Result<Value, EvalError> {
     match func {
-        Value::Lambda(params, body, closure_env) => {
-            if args.len() != params.len() {
-                return Err(EvalError::Arity(format!(
-                    "expected {} arguments, got {}", params.len(), args.len()
-                ), span));
+        Value::Lambda(params, rest, body, closure_env) => {
+            if let Some(rest_name) = rest {
+                if args.len() < params.len() {
+                    return Err(EvalError::Arity(format!(
+                        "expected at least {} arguments, got {}", params.len(), args.len()
+                    ), span));
+                }
+                let local_env = new_env(Some(closure_env.clone()));
+                for (param, arg) in params.iter().zip(args.iter()) {
+                    env_set(&local_env, param.clone(), arg.clone());
+                }
+                let rest_list = args[params.len()..].iter()
+                    .map(|a| Spanned::new(a.clone(), DUMMY_SPAN))
+                    .collect();
+                env_set(&local_env, rest_name.clone(), Value::List(rest_list));
+                let mut result = Value::Void;
+                for expr in body {
+                    result = eval(expr, &local_env, out)?;
+                }
+                Ok(result)
+            } else {
+                if args.len() != params.len() {
+                    return Err(EvalError::Arity(format!(
+                        "expected {} arguments, got {}", params.len(), args.len()
+                    ), span));
+                }
+                let local_env = new_env(Some(closure_env.clone()));
+                for (param, arg) in params.iter().zip(args.iter()) {
+                    env_set(&local_env, param.clone(), arg.clone());
+                }
+                let mut result = Value::Void;
+                for expr in body {
+                    result = eval(expr, &local_env, out)?;
+                }
+                Ok(result)
             }
-            let local_env = new_env(Some(closure_env.clone()));
-            for (param, arg) in params.iter().zip(args.iter()) {
-                env_set(&local_env, param.clone(), arg.clone());
-            }
-            let mut result = Value::Void;
-            for expr in body {
-                result = eval(expr, &local_env, out)?;
-            }
-            Ok(result)
         }
         Value::Symbol(name) => apply_builtin(name, args, out, span),
         _ => Err(EvalError::Type("not a procedure".into(), span)),
@@ -549,7 +594,7 @@ fn eval_let(args: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<Val
         }
         let body = args[2..].to_vec();
         let loop_env = new_env(Some(env.clone()));
-        let lambda = Value::Lambda(params.clone(), body, loop_env.clone());
+        let lambda = Value::Lambda(params.clone(), None, body, loop_env.clone());
         env_set(&loop_env, name.clone(), lambda);
         let call_env = new_env(Some(loop_env));
         for (p, v) in params.iter().zip(inits.iter()) {
@@ -861,6 +906,20 @@ fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span) -> Result
                 None => Err(EvalError::Type("string-ref: index out of bounds".into(), span)),
             }
         }
+        "apply" => {
+            if args.len() < 2 {
+                return Err(EvalError::Arity("apply requires at least 2 arguments".into(), span));
+            }
+            let func = &args[0];
+            let last = &args[args.len() - 1];
+            let tail = match last {
+                Value::List(items) => items.iter().map(|s| s.val.clone()).collect::<Vec<_>>(),
+                _ => return Err(EvalError::Type("apply: last argument must be a list".into(), span)),
+            };
+            let mut all_args: Vec<Value> = args[1..args.len()-1].to_vec();
+            all_args.extend(tail);
+            apply(func, &all_args, out, span)
+        }
         _ => Err(EvalError::UnboundVariable(name.into(), span)),
     }
 }
@@ -897,7 +956,8 @@ fn make_global_env() -> Env {
                    "string-append", "string-length", "substring",
                    "string->number", "number->string",
                    "symbol->string", "string->symbol",
-                   "string-ref", "string-copy", "char?"] {
+                   "string-ref", "string-copy", "char?",
+                   "apply"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     env
