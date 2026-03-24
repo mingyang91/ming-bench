@@ -1,0 +1,14 @@
+/home/my/.zeroclaw/workspace/workspace/cx-java-def-r21/bench/java/l06_proj/target/release/deps/thiserror-53629db432a29258.d: /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /home/my/.zeroclaw/workspace/workspace/cx-java-def-r21/bench/java/l06_proj/target/release/build/thiserror-42081aea37541d44/out/private.rs
+
+/home/my/.zeroclaw/workspace/workspace/cx-java-def-r21/bench/java/l06_proj/target/release/deps/libthiserror-53629db432a29258.rlib: /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /home/my/.zeroclaw/workspace/workspace/cx-java-def-r21/bench/java/l06_proj/target/release/build/thiserror-42081aea37541d44/out/private.rs
+
+/home/my/.zeroclaw/workspace/workspace/cx-java-def-r21/bench/java/l06_proj/target/release/deps/libthiserror-53629db432a29258.rmeta: /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /home/my/.zeroclaw/workspace/workspace/cx-java-def-r21/bench/java/l06_proj/target/release/build/thiserror-42081aea37541d44/out/private.rs
+
+/home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs:
+/home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs:
+/home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs:
+/home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs:
+/home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs:
+/home/my/.zeroclaw/workspace/workspace/cx-java-def-r21/bench/java/l06_proj/target/release/build/thiserror-42081aea37541d44/out/private.rs:
+
+# env-dep:OUT_DIR=/home/my/.zeroclaw/workspace/workspace/cx-java-def-r21/bench/java/l06_proj/target/release/build/thiserror-42081aea37541d44/out

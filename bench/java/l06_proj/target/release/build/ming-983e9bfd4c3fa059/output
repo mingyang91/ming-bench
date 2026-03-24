@@ -1,0 +1,2 @@
+cargo:rerun-if-changed=../tests.json
+cargo:rerun-if-changed=../fixtures
