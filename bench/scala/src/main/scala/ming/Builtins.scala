@@ -171,31 +171,6 @@ object Builtins:
     )
   )
 
-  private def pairAccessorBuiltins: List[(String, SchemeVal)] =
-    def getCar(v: SchemeVal): SchemeVal = v match
-      case SchemeVal.PairVal(p)      => p.car
-      case SchemeVal.ListVal(h :: _) => h
-      case other => throw new EvalError(s"car: expected pair, got ${other.display}")
-    def getCdr(v: SchemeVal): SchemeVal = v match
-      case SchemeVal.PairVal(p)      => p.cdr
-      case SchemeVal.ListVal(_ :: t) => SchemeVal.ListVal(t)
-      case other => throw new EvalError(s"cdr: expected pair, got ${other.display}")
-    def makeCxr(name: String, ops: String): (String, SchemeVal) =
-      val fn: SchemeVal => SchemeVal = ops.foldRight((v: SchemeVal) => v) { (c, acc) =>
-        val op = if c == 'a' then getCar else getCdr
-        v => acc(op(v))
-      }
-      name -> SchemeVal.BuiltinProc(name, {
-        case List(v) => fn(v)
-        case a => throw new EvalError(s"$name: expected 1 argument, got ${a.length}")
-      })
-    // Generate all c[ad]{2,4}r combinations
-    val ops = List("a", "d")
-    val twoLevel = for a <- ops; b <- ops yield (s"c${a}${b}r", s"$a$b")
-    val threeLevel = for a <- ops; b <- ops; c <- ops yield (s"c${a}${b}${c}r", s"$a$b$c")
-    val fourLevel = for a <- ops; b <- ops; c <- ops; d <- ops yield (s"c${a}${b}${c}${d}r", s"$a$b$c$d")
-    (twoLevel ++ threeLevel ++ fourLevel).map((name, ops) => makeCxr(name, ops))
-
   private def errorBuiltin: List[(String, SchemeVal)] = List(
     "error" -> SchemeVal.BuiltinProc(
       "error",
@@ -308,15 +283,16 @@ object Builtins:
       ++ comparisonBuiltins
       ++ logicBuiltins
       ++ listBuiltins
-      ++ pairAccessorBuiltins
+      ++ PairAccessorBuiltins.all
       ++ typePredicateBuiltins
       ++ ioBuiltins
       ++ StringBuiltins.all
       ++ applyBuiltin
       ++ errorBuiltin
       ++ NumericBuiltins.numericBuiltins
-      ++ NumericBuiltins.listBuiltins
+      ++ NumericBuiltins.mathBuiltins
       ++ NumericBuiltins.exactnessBuiltins
+      ++ ListSearchBuiltins.all
       ++ VectorBuiltins.vectorBuiltins
       ++ VectorBuiltins.equalityBuiltins
     for (name, proc) <- allBuiltins do env.define(name, proc)

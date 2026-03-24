@@ -74,10 +74,10 @@ enum SchemeVal:
     case _         => displayStr
 
   private def formatPair(fmt: SchemeVal => String): String =
-    val sb    = new StringBuilder("(")
+    val sb             = new StringBuilder("(")
     var cur: SchemeVal = this
-    var first = true
-    val seen  = java.util.Collections.newSetFromMap(
+    var first          = true
+    val seen = java.util.Collections.newSetFromMap(
       new java.util.IdentityHashMap[MutablePair, java.lang.Boolean]()
     )
     while cur.isInstanceOf[PairVal] do
@@ -100,6 +100,7 @@ enum SchemeVal:
     sb.toString
 
 object SchemeVal:
+
   /** Build a proper list (PairVal chain terminated by ListVal(Nil)) from a Scala list */
   def schemeList(elems: List[SchemeVal]): SchemeVal =
     elems.foldRight(ListVal(Nil): SchemeVal)((e, acc) => PairVal(new MutablePair(e, acc)))
@@ -113,7 +114,7 @@ object SchemeVal:
         case PairVal(p)     => buf += p.car; cur = p.cdr
         case ListVal(Nil)   => return buf.result()
         case ListVal(elems) => return buf.result() ++ elems
-        case _ => throw new EvalError(s"not a proper list")
+        case _              => throw new EvalError(s"not a proper list")
     buf.result()
 
   /** Check if a value is a proper list (with cycle detection via tortoise-and-hare) */
@@ -138,7 +139,7 @@ object SchemeVal:
       // cycle check — compare MutablePair identity
       (slow, fast) match
         case (PairVal(s), PairVal(f)) if s eq f => return false
-        case _ => ()
+        case _                                  => ()
     false
 
   /** eq? semantics: reference equality for most types, value equality for immediates */

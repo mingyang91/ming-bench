@@ -185,9 +185,7 @@ object Evaluator:
             case m: SchemeVal.Macro => MacroExpander.expandAndEval(expr, name, m, env, eval)
             case _                  => throw new EvalError(s"$name: expected macro")
         case Expr.SList(head :: args) =>
-          val fn         = eval(head, env)
-          val evaledArgs = args.map(a => eval(a, env))
-          applyProcInner(fn, evaledArgs)
+          applyProcInner(eval(head, env), args.map(a => eval(a, env)))
     catch
       case e: EvalError =>
         val msg = e.getMessage

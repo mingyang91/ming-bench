@@ -79,13 +79,19 @@ object StringBuiltins:
             s"number->string: expected 1 argument, got ${args.length}"
           )
       }
-    ),
+    )
+  )
+
+  private def stringFactoryOps: List[(String, SchemeVal)] = List(
     "string" -> SchemeVal.BuiltinProc(
       "string",
       args =>
         val chars = args.map {
           case SchemeVal.CharVal(c) => c
-          case other => throw new EvalError(s"string: expected char, got ${other.display}")
+          case other =>
+            throw new EvalError(
+              s"string: expected char, got ${other.display}"
+            )
         }
         SchemeVal.StrVal(chars.toArray)
     ),
@@ -96,7 +102,10 @@ object StringBuiltins:
           SchemeVal.StrVal(Array.fill(n.toInt)('\u0000'))
         case List(SchemeVal.IntVal(n), SchemeVal.CharVal(c)) =>
           SchemeVal.StrVal(Array.fill(n.toInt)(c))
-        case _ => throw new EvalError("make-string: expected (length) or (length, char)")
+        case _ =>
+          throw new EvalError(
+            "make-string: expected (length) or (length, char)"
+          )
       }
     ),
     "string-ref" -> SchemeVal.BuiltinProc(
@@ -243,4 +252,4 @@ object StringBuiltins:
   )
 
   def all: List[(String, SchemeVal)] =
-    coreStringOps ++ symbolConversionOps ++ mutationOps ++ CharBuiltins.all
+    coreStringOps ++ stringFactoryOps ++ symbolConversionOps ++ mutationOps ++ CharBuiltins.all

@@ -88,7 +88,7 @@ object VectorBuiltins:
       "eq?",
       {
         case List(a, b) => SchemeVal.BoolVal(SchemeVal.schemeEq(a, b))
-        case args => throw new EvalError(s"eq?: expected 2 arguments, got ${args.length}")
+        case args       => throw new EvalError(s"eq?: expected 2 arguments, got ${args.length}")
       }
     )
   )
