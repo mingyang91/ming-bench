@@ -147,6 +147,16 @@ type kontCondTest struct {
 
 func (*kontCondTest) isKont() {}
 
+// cond => arrow: proc evaluated, now apply to test value
+type kontCondArrow struct {
+	testVal  value
+	callExpr *expr
+	env      *env
+	parent   kont
+}
+
+func (*kontCondArrow) isKont() {}
+
 type kontCaseKey struct {
 	clauses []*expr
 	env     *env
@@ -446,6 +456,16 @@ func (m *cekM) stepEval() error {
 				return &EvalError{Message: fmt.Sprintf("%d:%d: quote: expected 1 argument", e.line, e.col)}
 			}
 			m.setApply(quoteExpr(e.list[1]), k)
+			return nil
+		case "quasiquote":
+			if len(e.list) != 2 {
+				return &EvalError{Message: fmt.Sprintf("%d:%d: quasiquote: expected 1 argument", e.line, e.col)}
+			}
+			v, err := evalQuasiquote(e.list[1], environ)
+			if err != nil {
+				return err
+			}
+			m.setApply(v, k)
 			return nil
 		case "lambda":
 			v, err := evalLambdaForm(e, environ)
@@ -1026,9 +1046,18 @@ func (m *cekM) stepApply() error {
 				m.setApply(val, kk.parent)
 				return nil
 			}
+			// (cond (test => proc)) — evaluate proc then apply to test value
+			if len(kk.body) == 2 && kk.body[0].kind == exprAtom && kk.body[0].atom.kind == valSymbol && kk.body[0].atom.sval == "=>" {
+				m.setEval(kk.body[1], kk.env, &kontCondArrow{testVal: val, callExpr: kk.body[1], env: kk.env, parent: kk.parent})
+				return nil
+			}
 			return m.evalBody(kk.body, kk.env, kk.parent)
 		}
 		return m.evalCondClauses(kk.rest, kk.env, kk.parent)
+
+	case *kontCondArrow:
+		// val is the proc; apply it to the test value
+		return m.applyProc(val, []value{kk.testVal}, kk.callExpr, kk.env, kk.parent)
 
 	case *kontCaseKey:
 		return m.evalCaseClauses(val, kk.clauses, kk.env, kk.parent)

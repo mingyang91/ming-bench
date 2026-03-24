@@ -425,7 +425,10 @@ const (
 	tokLParen tokenKind = iota
 	tokRParen
 	tokQuote
-	tokSyntaxQuote // #'
+	tokSyntaxQuote    // #'
+	tokQuasiquote     // `
+	tokUnquote        // ,
+	tokUnquoteSplice  // ,@
 	tokAtom
 	tokEOF
 )
@@ -483,7 +486,7 @@ func (t *tokenizer) skipWhitespaceAndComments() {
 }
 
 func isDelimiter(ch rune) bool {
-	return ch == 0 || ch == '(' || ch == ')' || unicode.IsSpace(ch) || ch == ';' || ch == '"' || ch == '\''
+	return ch == 0 || ch == '(' || ch == ')' || unicode.IsSpace(ch) || ch == ';' || ch == '"' || ch == '\'' || ch == '`' || ch == ','
 }
 
 func (t *tokenizer) next() (token, error) {
@@ -505,6 +508,19 @@ func (t *tokenizer) next() (token, error) {
 	if ch == '\'' {
 		t.advance()
 		return token{kind: tokQuote, text: "'", line: line, col: col}, nil
+	}
+
+	if ch == '`' {
+		t.advance()
+		return token{kind: tokQuasiquote, text: "`", line: line, col: col}, nil
+	}
+	if ch == ',' {
+		t.advance()
+		if t.pos < len(t.input) && t.peek() == '@' {
+			t.advance()
+			return token{kind: tokUnquoteSplice, text: ",@", line: line, col: col}, nil
+		}
+		return token{kind: tokUnquote, text: ",", line: line, col: col}, nil
 	}
 
 	// Syntax quote: #'
@@ -616,6 +632,57 @@ func (p *parser) parseExpr() (*expr, error) {
 			kind: exprList,
 			list: []*expr{
 				{kind: exprAtom, atom: symVal("syntax"), line: tok.line, col: tok.col},
+				inner,
+			},
+			line: tok.line,
+			col:  tok.col,
+		}, nil
+	}
+
+	if tok.kind == tokQuasiquote {
+		p.pos++
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &expr{
+			kind: exprList,
+			list: []*expr{
+				{kind: exprAtom, atom: symVal("quasiquote"), line: tok.line, col: tok.col},
+				inner,
+			},
+			line: tok.line,
+			col:  tok.col,
+		}, nil
+	}
+
+	if tok.kind == tokUnquote {
+		p.pos++
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &expr{
+			kind: exprList,
+			list: []*expr{
+				{kind: exprAtom, atom: symVal("unquote"), line: tok.line, col: tok.col},
+				inner,
+			},
+			line: tok.line,
+			col:  tok.col,
+		}, nil
+	}
+
+	if tok.kind == tokUnquoteSplice {
+		p.pos++
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &expr{
+			kind: exprList,
+			list: []*expr{
+				{kind: exprAtom, atom: symVal("unquote-splicing"), line: tok.line, col: tok.col},
 				inner,
 			},
 			line: tok.line,
@@ -738,6 +805,11 @@ func evalCore(e *expr, env *env) (value, error) {
 				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: quote: expected 1 argument", e.line, e.col)}
 			}
 			return quoteExpr(e.list[1]), nil
+		case "quasiquote":
+			if len(e.list) != 2 {
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: quasiquote: expected 1 argument", e.line, e.col)}
+			}
+			return evalQuasiquote(e.list[1], env)
 		case "lambda":
 			return evalLambdaForm(e, env)
 		case "case-lambda":
@@ -1026,8 +1098,93 @@ func parseDottedParams(plist []*expr, e *expr) ([]string, string, error) {
 	return params, restParam, nil
 }
 
+// evalQuasiquote processes a quasiquote expression, evaluating unquote and unquote-splicing
+func evalQuasiquote(e *expr, env *env) (value, error) {
+	if e.kind == exprAtom {
+		return e.atom, nil
+	}
+	// Check for (unquote expr)
+	if len(e.list) == 2 && e.list[0].kind == exprAtom && e.list[0].atom.kind == valSymbol && e.list[0].atom.sval == "unquote" {
+		return evalInEnv(e.list[1], env)
+	}
+	// Build list, handling unquote-splicing
+	result := nullVal
+	var items []value
+	for i := 0; i < len(e.list); i++ {
+		child := e.list[i]
+		if child.kind == exprList && len(child.list) == 2 && child.list[0].kind == exprAtom && child.list[0].atom.kind == valSymbol && child.list[0].atom.sval == "unquote-splicing" {
+			v, err := evalInEnv(child.list[1], env)
+			if err != nil {
+				return value{}, err
+			}
+			// Splice the list
+			cur := v
+			for cur.kind == valPair {
+				items = append(items, cur.pair.car)
+				cur = cur.pair.cdr
+			}
+		} else {
+			v, err := evalQuasiquote(child, env)
+			if err != nil {
+				return value{}, err
+			}
+			items = append(items, v)
+		}
+	}
+	// Check for dotted list: if the parsed list has a dot
+	n := len(e.list)
+	if n >= 3 && e.list[n-2].kind == exprAtom && e.list[n-2].atom.kind == valSymbol && e.list[n-2].atom.sval == "." {
+		// Rebuild: items will have included the "." symbol and the tail
+		// We need to redo this properly for dotted quasiquote
+		items = nil
+		for i := 0; i < n-2; i++ {
+			child := e.list[i]
+			if child.kind == exprList && len(child.list) == 2 && child.list[0].kind == exprAtom && child.list[0].atom.kind == valSymbol && child.list[0].atom.sval == "unquote-splicing" {
+				v, err := evalInEnv(child.list[1], env)
+				if err != nil {
+					return value{}, err
+				}
+				cur := v
+				for cur.kind == valPair {
+					items = append(items, cur.pair.car)
+					cur = cur.pair.cdr
+				}
+			} else {
+				v, err := evalQuasiquote(child, env)
+				if err != nil {
+					return value{}, err
+				}
+				items = append(items, v)
+			}
+		}
+		// Evaluate tail
+		tail, err := evalQuasiquote(e.list[n-1], env)
+		if err != nil {
+			return value{}, err
+		}
+		result = tail
+		for i := len(items) - 1; i >= 0; i-- {
+			result = pairVal(items[i], result)
+		}
+		return result, nil
+	}
+	// Build proper list
+	for i := len(items) - 1; i >= 0; i-- {
+		result = pairVal(items[i], result)
+	}
+	return result, nil
+}
+
 func callLambda(lam *lambda, args []value, callExpr *expr) (value, error) {
 	v, err := callLambdaTail(lam, args, callExpr)
+	for err == nil && v.kind == valTailCall {
+		v, err = evalCore(v.tc.expr, v.tc.env)
+	}
+	return v, err
+}
+
+func callProcValue(proc value, args []value, callExpr *expr, environ *env) (value, error) {
+	v, err := callValueTail(proc, args, callExpr, environ)
 	for err == nil && v.kind == valTailCall {
 		v, err = evalCore(v.tc.expr, v.tc.env)
 	}
@@ -1070,9 +1227,22 @@ func quoteExpr(e *expr) value {
 	if e.kind == exprAtom {
 		return e.atom
 	}
-	// List -> build a proper list from pairs
+	// Check for dotted pair: (a b ... . last)
+	n := len(e.list)
+	if n >= 3 {
+		dot := e.list[n-2]
+		if dot.kind == exprAtom && dot.atom.kind == valSymbol && dot.atom.sval == "." {
+			// Dotted pair: build improper list
+			result := quoteExpr(e.list[n-1])
+			for i := n - 3; i >= 0; i-- {
+				result = pairVal(quoteExpr(e.list[i]), result)
+			}
+			return result
+		}
+	}
+	// Proper list
 	result := nullVal
-	for i := len(e.list) - 1; i >= 0; i-- {
+	for i := n - 1; i >= 0; i-- {
 		result = pairVal(quoteExpr(e.list[i]), result)
 	}
 	return result
@@ -1103,7 +1273,7 @@ func isBuiltin(name string) bool {
 		"set-car!", "set-cdr!", "for-each", "reverse", "error",
 		"gcd", "lcm", "truncate", "round",
 		"make-string", "string", "string>?", "string<=?", "string>=?",
-		"memv", "assv", "member",
+		"memq", "memv", "assq", "assv", "member",
 		"caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "cadddr",
 		"call/cc", "call-with-current-continuation",
 		"dynamic-wind",
@@ -2098,6 +2268,9 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 		msg := "error"
 		if len(args) > 0 {
 			msg = args[0].displayStr()
+			for _, a := range args[1:] {
+				msg += a.String()
+			}
 		}
 		return value{}, &EvalError{Message: msg}
 
@@ -2209,6 +2382,19 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 		}
 		return boolVal(args[0].strContent() >= args[1].strContent()), nil
 
+	case "memq":
+		if len(args) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: memq: expected 2 arguments", e.line, e.col)}
+		}
+		cur := args[1]
+		for cur.kind == valPair {
+			if valuesEq(args[0], cur.pair.car) {
+				return cur, nil
+			}
+			cur = cur.pair.cdr
+		}
+		return boolVal(false), nil
+
 	case "memv":
 		if len(args) != 2 {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: memv: expected 2 arguments", e.line, e.col)}
@@ -2217,6 +2403,20 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 		for cur.kind == valPair {
 			if valuesEqv(args[0], cur.pair.car) {
 				return cur, nil
+			}
+			cur = cur.pair.cdr
+		}
+		return boolVal(false), nil
+
+	case "assq":
+		if len(args) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: assq: expected 2 arguments", e.line, e.col)}
+		}
+		cur := args[1]
+		for cur.kind == valPair {
+			entry := cur.pair.car
+			if entry.kind == valPair && valuesEq(args[0], entry.pair.car) {
+				return entry, nil
 			}
 			cur = cur.pair.cdr
 		}
@@ -2644,6 +2844,14 @@ func evalCond(e *expr, env *env) (value, error) {
 			if len(body) == 0 {
 				return cond, nil // (cond (test)) returns test value
 			}
+			// (cond (test => proc)) — call proc with test value
+			if len(body) == 2 && body[0].kind == exprAtom && body[0].atom.kind == valSymbol && body[0].atom.sval == "=>" {
+				proc, err := evalInEnv(body[1], env)
+				if err != nil {
+					return value{}, err
+				}
+				return callProcValue(proc, []value{cond}, e, env)
+			}
 			for _, bodyExpr := range body[:len(body)-1] {
 				_, err = evalInEnv(bodyExpr, env)
 				if err != nil {
@@ -3038,25 +3246,62 @@ func matchPattern(pattern []*expr, args []*expr, literals []string, bindings map
 	pi := 0
 	ai := 0
 	for pi < len(pattern) {
+		// Check for dotted pattern: (a b . rest)
+		// In our flat representation: [a, b, ".", rest]
+		if pi+2 == len(pattern) && pattern[pi].kind == exprAtom && pattern[pi].atom.kind == valSymbol && pattern[pi].atom.sval == "." {
+			// "." followed by rest-pattern var
+			restPat := pattern[pi+1]
+			if restPat.kind == exprAtom && restPat.atom.kind == valSymbol {
+				name := restPat.atom.sval
+				if name != "_" {
+					// Build a list expr from remaining args
+					restExpr := &expr{kind: exprList, list: args[ai:]}
+					bindings[name] = []*expr{restExpr}
+				}
+				return true
+			}
+			return false
+		}
+
 		// Check for ellipsis: current pattern element followed by ...
 		if pi+1 < len(pattern) && isEllipsis(pattern[pi+1]) {
 			patVar := pattern[pi]
-			if patVar.kind != exprAtom || patVar.atom.kind != valSymbol {
-				return false
-			}
-			varName := patVar.atom.sval
-			// Collect remaining args (greedy, since ellipsis is typically last)
 			// Number of remaining required pattern elements after the ellipsis
-			remaining := len(pattern) - pi - 2
+			remaining := countRequiredAfterEllipsis(pattern[pi+2:])
 			available := len(args) - ai - remaining
 			if available < 0 {
 				return false
 			}
-			var matched []*expr
-			for i := 0; i < available; i++ {
-				matched = append(matched, args[ai+i])
+			if patVar.kind == exprAtom && patVar.atom.kind == valSymbol {
+				varName := patVar.atom.sval
+				if varName != "_" && !isLiteral(varName, literals) {
+					var matched []*expr
+					for i := 0; i < available; i++ {
+						matched = append(matched, args[ai+i])
+					}
+					bindings[varName] = matched
+				}
+			} else if patVar.kind == exprList {
+				// Ellipsis over a sub-pattern like ((a b) ...)
+				var matched []*expr
+				for i := 0; i < available; i++ {
+					subBindings := make(map[string][]*expr)
+					if args[ai+i].kind != exprList {
+						return false
+					}
+					if !matchPattern(patVar.list, args[ai+i].list, literals, subBindings) {
+						return false
+					}
+					// Merge sub-bindings: each var accumulates
+					for k, v := range subBindings {
+						bindings[k] = append(bindings[k], v...)
+					}
+					matched = append(matched, args[ai+i])
+				}
+				_ = matched
+			} else {
+				return false
 			}
-			bindings[varName] = matched
 			ai += available
 			pi += 2 // skip pattern var and ellipsis
 			continue
@@ -3094,6 +3339,18 @@ func matchPattern(pattern []*expr, args []*expr, literals []string, bindings map
 		ai++
 	}
 	return ai == len(args)
+}
+
+// countRequiredAfterEllipsis counts non-ellipsis pattern elements remaining
+func countRequiredAfterEllipsis(pattern []*expr) int {
+	count := 0
+	for i := 0; i < len(pattern); i++ {
+		if isEllipsis(pattern[i]) {
+			continue
+		}
+		count++
+	}
+	return count
 }
 
 func isEllipsis(e *expr) bool {
@@ -3497,7 +3754,7 @@ var (
 
 func isSpecialForm(name string) bool {
 	switch name {
-	case "define", "set!", "if", "quote", "lambda", "and", "or", "let", "let*", "begin", "cond", "define-syntax", "define-record-type", "letrec", "letrec*", "case", "do", "case-lambda", "syntax-case", "syntax", "with-syntax":
+	case "define", "set!", "if", "quote", "quasiquote", "lambda", "and", "or", "let", "let*", "begin", "cond", "define-syntax", "define-record-type", "letrec", "letrec*", "case", "do", "case-lambda", "syntax-case", "syntax", "with-syntax":
 		return true
 	}
 	return false
@@ -3602,7 +3859,7 @@ func makeTopLevelEnv() *env {
 		"set-car!", "set-cdr!", "for-each", "reverse", "error",
 		"gcd", "lcm", "truncate", "round",
 		"make-string", "string", "string>?", "string<=?", "string>=?",
-		"memv", "assv", "member",
+		"memq", "memv", "assq", "assv", "member",
 		"caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "cadddr",
 		"call/cc", "call-with-current-continuation",
 		"dynamic-wind",
