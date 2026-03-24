@@ -1,8 +1,10 @@
 pub mod error;
 mod macros;
+mod parser;
 
 pub use error::EvalError;
 use error::Span;
+use parser::{Parser, parse_params};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -23,6 +25,8 @@ pub(crate) type Output = Rc<RefCell<String>>;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Value {
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64), // numerator, denominator (always simplified, denom > 0)
     Boolean(bool),
     Str(String),
     Char(char),
@@ -55,6 +59,8 @@ impl Value {
     fn display_value(&self) -> String {
         match self {
             Value::Integer(n) => n.to_string(),
+            Value::Float(f) => format_float(*f),
+            Value::Rational(n, d) => format!("{}/{}", n, d),
             Value::Boolean(true) => "#t".into(),
             Value::Boolean(false) => "#f".into(),
             Value::Str(s) => format!("\"{}\"", s),
@@ -88,6 +94,14 @@ impl Value {
             Value::Pair(a, b) => format!("({} . {})", a.format_display(), b.format_display()),
             _ => self.display_value(),
         }
+    }
+
+    fn is_exact_number(&self) -> bool {
+        matches!(self, Value::Integer(_) | Value::Rational(..))
+    }
+
+    fn is_number(&self) -> bool {
+        matches!(self, Value::Integer(_) | Value::Float(_) | Value::Rational(..))
     }
 
     fn is_truthy(&self) -> bool {
@@ -140,234 +154,6 @@ fn env_update(env: &Env, name: &str, val: Value) -> bool {
     }
 }
 
-// --- Parser ---
-
-struct Parser {
-    chars: Vec<char>,
-    pos: usize,
-    line: usize,
-    col: usize,
-}
-
-impl Parser {
-    fn new(input: &str) -> Self {
-        Self {
-            chars: input.chars().collect(),
-            pos: 0,
-            line: 1,
-            col: 1,
-        }
-    }
-
-    fn current_span(&self) -> Span {
-        Span { line: self.line, col: self.col }
-    }
-
-    fn advance(&mut self) {
-        if self.pos < self.chars.len() {
-            if self.chars[self.pos] == '\n' {
-                self.line += 1;
-                self.col = 1;
-            } else {
-                self.col += 1;
-            }
-            self.pos += 1;
-        }
-    }
-
-    fn skip_whitespace(&mut self) {
-        while self.pos < self.chars.len() {
-            if self.chars[self.pos].is_whitespace() {
-                self.advance();
-            } else if self.chars[self.pos] == ';' {
-                while self.pos < self.chars.len() && self.chars[self.pos] != '\n' {
-                    self.advance();
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
-    }
-
-    fn parse_expr(&mut self) -> Result<Spanned, EvalError> {
-        self.skip_whitespace();
-        let span = self.current_span();
-        match self.peek() {
-            None => Err(EvalError::Parse("unexpected end of input".into(), span)),
-            Some('(') => self.parse_list(),
-            Some('"') => self.parse_string(),
-            Some('#') => self.parse_hash(),
-            Some('\'') => {
-                self.advance();
-                let inner = self.parse_expr()?;
-                Ok(Spanned::new(
-                    Value::List(vec![
-                        Spanned::new(Value::Symbol("quote".into()), span),
-                        inner,
-                    ]),
-                    span,
-                ))
-            }
-            Some(_) => self.parse_atom(),
-        }
-    }
-
-    fn parse_list(&mut self) -> Result<Spanned, EvalError> {
-        let span = self.current_span();
-        self.advance(); // skip '('
-        let mut items = Vec::new();
-        loop {
-            self.skip_whitespace();
-            match self.peek() {
-                None => return Err(EvalError::Parse("unterminated list".into(), span)),
-                Some(')') => {
-                    self.advance();
-                    return Ok(Spanned::new(Value::List(items), span));
-                }
-                _ => items.push(self.parse_expr()?),
-            }
-        }
-    }
-
-    fn parse_string(&mut self) -> Result<Spanned, EvalError> {
-        let span = self.current_span();
-        self.advance();
-        let mut s = String::new();
-        loop {
-            match self.chars.get(self.pos) {
-                None => return Err(EvalError::Parse("unterminated string".into(), span)),
-                Some('\\') => {
-                    self.advance();
-                    match self.chars.get(self.pos) {
-                        Some('n') => { s.push('\n'); self.advance(); }
-                        Some('t') => { s.push('\t'); self.advance(); }
-                        Some('\\') => { s.push('\\'); self.advance(); }
-                        Some('"') => { s.push('"'); self.advance(); }
-                        Some(c) => { s.push(*c); self.advance(); }
-                        None => return Err(EvalError::Parse("unterminated escape".into(), span)),
-                    }
-                }
-                Some('"') => {
-                    self.advance();
-                    return Ok(Spanned::new(Value::Str(s), span));
-                }
-                Some(c) => {
-                    s.push(*c);
-                    self.advance();
-                }
-            }
-        }
-    }
-
-    fn parse_hash(&mut self) -> Result<Spanned, EvalError> {
-        let span = self.current_span();
-        self.advance();
-        match self.peek() {
-            Some('t') => {
-                self.advance();
-                if self.peek().is_none_or(is_delimiter) {
-                    Ok(Spanned::new(Value::Boolean(true), span))
-                } else {
-                    Err(EvalError::Parse("invalid # literal".into(), span))
-                }
-            }
-            Some('f') => {
-                self.advance();
-                if self.peek().is_none_or(is_delimiter) {
-                    Ok(Spanned::new(Value::Boolean(false), span))
-                } else {
-                    Err(EvalError::Parse("invalid # literal".into(), span))
-                }
-            }
-            Some('\\') => {
-                self.advance(); // skip '\'
-                // Named characters
-                let start = self.pos;
-                while self.pos < self.chars.len() && !is_delimiter(self.chars[self.pos]) {
-                    self.advance();
-                }
-                let name: String = self.chars[start..self.pos].iter().collect();
-                let c = match name.as_str() {
-                    "space" => ' ',
-                    "newline" => '\n',
-                    "tab" => '\t',
-                    s if s.chars().count() == 1 => s.chars().next().expect("single-char string has a first char"),
-                    _ => return Err(EvalError::Parse(format!("unknown character name: {name}"), span)),
-                };
-                Ok(Spanned::new(Value::Char(c), span))
-            }
-            _ => Err(EvalError::Parse("invalid # literal".into(), span)),
-        }
-    }
-
-    fn parse_atom(&mut self) -> Result<Spanned, EvalError> {
-        let span = self.current_span();
-        let start = self.pos;
-        while self.pos < self.chars.len() && !is_delimiter(self.chars[self.pos]) {
-            self.advance();
-        }
-        let token: String = self.chars[start..self.pos].iter().collect();
-        if let Ok(n) = token.parse::<i64>() {
-            Ok(Spanned::new(Value::Integer(n), span))
-        } else {
-            Ok(Spanned::new(Value::Symbol(token), span))
-        }
-    }
-
-    fn parse_all(&mut self) -> Result<Vec<Spanned>, EvalError> {
-        let mut exprs = Vec::new();
-        loop {
-            self.skip_whitespace();
-            if self.pos >= self.chars.len() {
-                break;
-            }
-            exprs.push(self.parse_expr()?);
-        }
-        Ok(exprs)
-    }
-}
-
-fn is_delimiter(c: char) -> bool {
-    c.is_whitespace() || c == '(' || c == ')' || c == '"' || c == ';'
-}
-
-/// Parse a parameter list, returning (fixed_params, optional_rest_param).
-/// Handles dot notation: `(x y . rest)` → (["x", "y"], Some("rest"))
-fn parse_params(values: &[Spanned], context: &str, span: Span) -> Result<(Vec<String>, Option<String>), EvalError> {
-    // Look for dot
-    let dot_pos = values.iter().position(|v| matches!(&v.val, Value::Symbol(s) if s == "."));
-    if let Some(pos) = dot_pos {
-        if pos + 1 != values.len() - 1 {
-            return Err(EvalError::Parse(format!("{context}: malformed dot parameter list"), span));
-        }
-        let fixed: Result<Vec<String>, _> = values[..pos]
-            .iter()
-            .map(|v| match &v.val {
-                Value::Symbol(s) => Ok(s.clone()),
-                _ => Err(EvalError::Type(format!("{context}: expected symbol in parameter list"), span)),
-            })
-            .collect();
-        let rest = match &values[pos + 1].val {
-            Value::Symbol(s) => s.clone(),
-            _ => return Err(EvalError::Type(format!("{context}: expected symbol after dot"), span)),
-        };
-        Ok((fixed?, Some(rest)))
-    } else {
-        let params: Result<Vec<String>, _> = values
-            .iter()
-            .map(|v| match &v.val {
-                Value::Symbol(s) => Ok(s.clone()),
-                _ => Err(EvalError::Type(format!("{context}: expected symbol in parameter list"), span)),
-            })
-            .collect();
-        Ok((params?, None))
-    }
-}
-
 // --- Macros (syntax-rules) ---
 
 
@@ -396,7 +182,7 @@ fn apply_macro(
 fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
     let span = expr.span;
     match &expr.val {
-        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Pair(..) | Value::Lambda(..) | Value::SyntaxRules { .. } => Ok(expr.val.clone()),
+        Value::Integer(_) | Value::Float(_) | Value::Rational(..) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Pair(..) | Value::Lambda(..) | Value::SyntaxRules { .. } => Ok(expr.val.clone()),
         Value::Symbol(name) => {
             env_get(env, name).ok_or_else(|| EvalError::UnboundVariable(name.clone(), span))
         }
@@ -746,48 +532,148 @@ fn eval_cond(clauses: &[Spanned], env: &Env, out: &Output, span: Span) -> Result
     Ok(Value::Void)
 }
 
+fn format_float(f: f64) -> String {
+    let s = format!("{}", f);
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        s
+    } else {
+        format!("{}.0", s)
+    }
+}
+
+fn gcd_val(a: i64, b: i64) -> i64 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+pub(crate) fn make_rational(n: i64, d: i64) -> Value {
+    let sign = if d < 0 { -1 } else { 1 };
+    let n = n * sign;
+    let d = d * sign;
+    let g = gcd_val(n, d);
+    let (n, d) = (n / g, d / g);
+    if d == 1 { Value::Integer(n) } else { Value::Rational(n, d) }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Num {
+    Exact(i64, i64),
+    Inexact(f64),
+}
+
+impl Num {
+    fn from_value(v: &Value, span: Span) -> Result<Num, EvalError> {
+        match v {
+            Value::Integer(n) => Ok(Num::Exact(*n, 1)),
+            Value::Rational(n, d) => Ok(Num::Exact(*n, *d)),
+            Value::Float(f) => Ok(Num::Inexact(*f)),
+            _ => Err(EvalError::Type(format!("expected number, got {:?}", v), span)),
+        }
+    }
+
+    fn to_value(self) -> Value {
+        match self {
+            Num::Exact(n, d) => make_rational(n, d),
+            Num::Inexact(f) => Value::Float(f),
+        }
+    }
+
+    fn to_f64(self) -> f64 {
+        match self {
+            Num::Exact(n, d) => n as f64 / d as f64,
+            Num::Inexact(f) => f,
+        }
+    }
+
+    fn add(self, other: Num) -> Num {
+        match (self, other) {
+            (Num::Exact(n1, d1), Num::Exact(n2, d2)) => Num::Exact(n1 * d2 + n2 * d1, d1 * d2),
+            (a, b) => Num::Inexact(a.to_f64() + b.to_f64()),
+        }
+    }
+
+    fn sub(self, other: Num) -> Num {
+        match (self, other) {
+            (Num::Exact(n1, d1), Num::Exact(n2, d2)) => Num::Exact(n1 * d2 - n2 * d1, d1 * d2),
+            (a, b) => Num::Inexact(a.to_f64() - b.to_f64()),
+        }
+    }
+
+    fn mul(self, other: Num) -> Num {
+        match (self, other) {
+            (Num::Exact(n1, d1), Num::Exact(n2, d2)) => Num::Exact(n1 * n2, d1 * d2),
+            (a, b) => Num::Inexact(a.to_f64() * b.to_f64()),
+        }
+    }
+
+    fn div(self, other: Num, span: Span) -> Result<Num, EvalError> {
+        match (self, other) {
+            (Num::Exact(n1, d1), Num::Exact(n2, d2)) => {
+                if n2 == 0 { return Err(EvalError::DivisionByZero(span)); }
+                Ok(Num::Exact(n1 * d2, d1 * n2))
+            }
+            (a, b) => {
+                let d = b.to_f64();
+                if d == 0.0 { return Err(EvalError::DivisionByZero(span)); }
+                Ok(Num::Inexact(a.to_f64() / d))
+            }
+        }
+    }
+
+    fn neg(self) -> Num {
+        match self {
+            Num::Exact(n, d) => Num::Exact(-n, d),
+            Num::Inexact(f) => Num::Inexact(-f),
+        }
+    }
+}
+
 fn builtin_arithmetic(name: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
     match name {
         "+" => {
-            let mut sum: i64 = 0;
+            let mut sum = Num::Exact(0, 1);
             for a in args {
-                sum += as_integer(a, span)?;
+                sum = sum.add(Num::from_value(a, span)?);
             }
-            Ok(Value::Integer(sum))
+            Ok(sum.to_value())
         }
         "-" => {
             if args.is_empty() {
                 return Err(EvalError::Arity("- requires at least 1 argument".into(), span));
             }
             if args.len() == 1 {
-                return Ok(Value::Integer(-as_integer(&args[0], span)?));
+                return Ok(Num::from_value(&args[0], span)?.neg().to_value());
             }
-            let mut result = as_integer(&args[0], span)?;
+            let mut result = Num::from_value(&args[0], span)?;
             for a in &args[1..] {
-                result -= as_integer(a, span)?;
+                result = result.sub(Num::from_value(a, span)?);
             }
-            Ok(Value::Integer(result))
+            Ok(result.to_value())
         }
         "*" => {
-            let mut product: i64 = 1;
+            let mut product = Num::Exact(1, 1);
             for a in args {
-                product *= as_integer(a, span)?;
+                product = product.mul(Num::from_value(a, span)?);
             }
-            Ok(Value::Integer(product))
+            Ok(product.to_value())
         }
         "/" => {
             if args.is_empty() {
                 return Err(EvalError::Arity("/ requires at least 1 argument".into(), span));
             }
-            let mut result = as_integer(&args[0], span)?;
-            for a in &args[1..] {
-                let d = as_integer(a, span)?;
-                if d == 0 {
-                    return Err(EvalError::DivisionByZero(span));
-                }
-                result /= d;
+            let mut result = Num::from_value(&args[0], span)?;
+            if args.len() == 1 {
+                return Ok(Num::Exact(1, 1).div(result, span)?.to_value());
             }
-            Ok(Value::Integer(result))
+            for a in &args[1..] {
+                result = result.div(Num::from_value(a, span)?, span)?;
+            }
+            Ok(result.to_value())
         }
         "modulo" | "remainder" => {
             if args.len() != 2 {
@@ -1199,7 +1085,68 @@ fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span) -> Result
 
         "number?" => {
             if args.len() != 1 { return Err(EvalError::Arity("number? requires 1 argument".into(), span)); }
+            Ok(Value::Boolean(args[0].is_number()))
+        }
+        "integer?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("integer? requires 1 argument".into(), span)); }
             Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+        }
+        "rational?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("rational? requires 1 argument".into(), span)); }
+            Ok(Value::Boolean(args[0].is_exact_number()))
+        }
+        "exact?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("exact? requires 1 argument".into(), span)); }
+            Ok(Value::Boolean(args[0].is_exact_number()))
+        }
+        "inexact?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("inexact? requires 1 argument".into(), span)); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Float(_))))
+        }
+        "exact->inexact" => {
+            if args.len() != 1 { return Err(EvalError::Arity("exact->inexact requires 1 argument".into(), span)); }
+            let n = Num::from_value(&args[0], span)?;
+            Ok(Value::Float(n.to_f64()))
+        }
+        "inexact->exact" => {
+            if args.len() != 1 { return Err(EvalError::Arity("inexact->exact requires 1 argument".into(), span)); }
+            match &args[0] {
+                Value::Integer(_) | Value::Rational(..) => Ok(args[0].clone()),
+                Value::Float(f) => {
+                    let f = *f;
+                    if f == f.floor() && f.is_finite() {
+                        Ok(Value::Integer(f as i64))
+                    } else {
+                        // Convert via string to find decimal places
+                        let s = format!("{}", f);
+                        if let Some(dot_pos) = s.find('.') {
+                            let decimals = s.len() - dot_pos - 1;
+                            let denom = 10_i64.pow(decimals as u32);
+                            let numer = (f * denom as f64).round() as i64;
+                            Ok(make_rational(numer, denom))
+                        } else {
+                            Ok(Value::Integer(f as i64))
+                        }
+                    }
+                }
+                _ => Err(EvalError::Type("inexact->exact: expected number".into(), span)),
+            }
+        }
+        "numerator" => {
+            if args.len() != 1 { return Err(EvalError::Arity("numerator requires 1 argument".into(), span)); }
+            match &args[0] {
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Rational(n, _) => Ok(Value::Integer(*n)),
+                _ => Err(EvalError::Type("numerator: expected rational".into(), span)),
+            }
+        }
+        "denominator" => {
+            if args.len() != 1 { return Err(EvalError::Arity("denominator requires 1 argument".into(), span)); }
+            match &args[0] {
+                Value::Integer(_) => Ok(Value::Integer(1)),
+                Value::Rational(_, d) => Ok(Value::Integer(*d)),
+                _ => Err(EvalError::Type("denominator: expected rational".into(), span)),
+            }
         }
         "boolean?" => {
             if args.len() != 1 { return Err(EvalError::Arity("boolean? requires 1 argument".into(), span)); }
@@ -1254,13 +1201,13 @@ fn as_integer(val: &Value, span: Span) -> Result<i64, EvalError> {
     }
 }
 
-fn compare_nums(args: &[Value], cmp: impl Fn(i64, i64) -> bool, span: Span) -> Result<Value, EvalError> {
+fn compare_nums(args: &[Value], cmp: impl Fn(f64, f64) -> bool, span: Span) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity("comparison requires at least 2 arguments".into(), span));
     }
-    let mut prev = as_integer(&args[0], span)?;
+    let mut prev = Num::from_value(&args[0], span)?.to_f64();
     for a in &args[1..] {
-        let curr = as_integer(a, span)?;
+        let curr = Num::from_value(a, span)?.to_f64();
         if !cmp(prev, curr) {
             return Ok(Value::Boolean(false));
         }
@@ -1272,6 +1219,10 @@ fn compare_nums(args: &[Value], cmp: impl Fn(i64, i64) -> bool, span: Span) -> R
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
+        (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
+        (Value::Integer(n), Value::Rational(n2, d2)) => *n * d2 == *n2,
+        (Value::Rational(n1, d1), Value::Integer(n)) => *n1 == *n * d1,
         (Value::Boolean(a), Value::Boolean(b)) => a == b,
         (Value::Str(a), Value::Str(b)) => a == b,
         (Value::Char(a), Value::Char(b)) => a == b,
@@ -1305,7 +1256,12 @@ fn make_global_env() -> Env {
                    "char-alphabetic?", "char-numeric?",
                    "char-upcase", "char-downcase", "char=?", "char<?",
                    "string=?", "string<?", "string-ci=?",
-                   "string-upcase", "string-downcase"] {
+                   "string-upcase", "string-downcase",
+                   // L11
+                   "integer?", "rational?",
+                   "exact?", "inexact?",
+                   "exact->inexact", "inexact->exact",
+                   "numerator", "denominator"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     env
