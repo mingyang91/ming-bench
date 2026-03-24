@@ -9,6 +9,7 @@ type SchemeVal =
   | { tag: 'symbol'; value: string }
   | { tag: 'list'; elements: SchemeVal[] }
   | { tag: 'builtin'; name: string; func: (args: SchemeVal[]) => SchemeVal }
+  | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env }
   | { tag: 'void' };
 
 // --- Parser ---
@@ -109,6 +110,7 @@ function schemeToString(val: SchemeVal): string {
     case 'symbol': return val.value;
     case 'list': return `(${val.elements.map(schemeToString).join(' ')})`;
     case 'builtin': return `#<procedure:${val.name}>`;
+    case 'lambda': return '#<procedure>';
     case 'void': return '';
   }
 }
@@ -204,6 +206,49 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
       if (elems[0].tag === 'symbol') {
         const name = elems[0].value;
 
+        if (name === 'quote') {
+          if (elems.length !== 2) throw new EvalError('quote: wrong argument count');
+          return elems[1];
+        }
+
+        if (name === 'if') {
+          if (elems.length < 3 || elems.length > 4) throw new EvalError('if: wrong argument count');
+          const cond = evalScheme(elems[1], env);
+          if (isTruthy(cond)) return evalScheme(elems[2], env);
+          if (elems.length === 4) return evalScheme(elems[3], env);
+          return { tag: 'void' };
+        }
+
+        if (name === 'define') {
+          if (elems.length < 3) throw new EvalError('define: wrong argument count');
+          if (elems[1].tag === 'symbol') {
+            const val = evalScheme(elems[2], env);
+            env.set(elems[1].value, val);
+            return { tag: 'void' };
+          }
+          if (elems[1].tag === 'list' && elems[1].elements.length > 0 && elems[1].elements[0].tag === 'symbol') {
+            const fnName = elems[1].elements[0].value;
+            const params = elems[1].elements.slice(1).map(p => {
+              if (p.tag !== 'symbol') throw new EvalError('define: parameter must be a symbol');
+              return p.value;
+            });
+            const lambda: SchemeVal = { tag: 'lambda', params, body: elems.slice(2), env };
+            env.set(fnName, lambda);
+            return { tag: 'void' };
+          }
+          throw new EvalError('define: invalid syntax');
+        }
+
+        if (name === 'lambda') {
+          if (elems.length < 3) throw new EvalError('lambda: wrong argument count');
+          if (elems[1].tag !== 'list') throw new EvalError('lambda: params must be a list');
+          const params = elems[1].elements.map(p => {
+            if (p.tag !== 'symbol') throw new EvalError('lambda: parameter must be a symbol');
+            return p.value;
+          });
+          return { tag: 'lambda', params, body: elems.slice(2), env };
+        }
+
         if (name === 'and') {
           let result: SchemeVal = { tag: 'boolean', value: true };
           for (let i = 1; i < elems.length; i++) {
@@ -237,10 +282,24 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
         return func.func(args);
       }
 
+      if (func.tag === 'lambda') {
+        if (args.length !== func.params.length) throw new EvalError('wrong number of arguments');
+        const childEnv: Env = new Map(func.env);
+        for (let i = 0; i < func.params.length; i++) {
+          childEnv.set(func.params[i], args[i]);
+        }
+        let result: SchemeVal = { tag: 'void' };
+        for (const bodyExpr of func.body) {
+          result = evalScheme(bodyExpr, childEnv);
+        }
+        return result;
+      }
+
       throw new EvalError(`not a procedure: ${schemeToString(func)}`);
     }
 
     case 'builtin':
+    case 'lambda':
     case 'void':
       return expr;
   }
