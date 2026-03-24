@@ -19,6 +19,7 @@ enum Value {
     Char(char),
     Symbol(String),
     List(Vec<Spanned>),
+    Pair(Box<Value>, Box<Value>), // improper pair (a . b) where b is not a list
     Lambda(Vec<String>, Option<String>, Vec<Spanned>, Env), // params, rest_param, body, closure env
     Void,
 }
@@ -54,6 +55,7 @@ impl Value {
                 let inner: Vec<String> = items.iter().map(|v| v.val.display_value()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Pair(a, b) => format!("({} . {})", a.display_value(), b.display_value()),
             Value::Lambda(..) => "#<procedure>".into(),
             Value::Void => "".into(),
         }
@@ -68,6 +70,7 @@ impl Value {
                 let inner: Vec<String> = items.iter().map(|v| v.val.format_display()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Pair(a, b) => format!("({} . {})", a.format_display(), b.format_display()),
             _ => self.display_value(),
         }
     }
@@ -355,7 +358,7 @@ fn parse_params(values: &[Spanned], context: &str, span: Span) -> Result<(Vec<St
 fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
     let span = expr.span;
     match &expr.val {
-        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Lambda(..) => Ok(expr.val.clone()),
+        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Pair(..) | Value::Lambda(..) => Ok(expr.val.clone()),
         Value::Symbol(name) => {
             env_get(env, name).ok_or_else(|| EvalError::UnboundVariable(name.clone(), span))
         }
@@ -664,7 +667,7 @@ fn eval_cond(clauses: &[Spanned], env: &Env, out: &Output, span: Span) -> Result
     Ok(Value::Void)
 }
 
-fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span) -> Result<Value, EvalError> {
+fn builtin_arithmetic(name: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
     match name {
         "+" => {
             let mut sum: i64 = 0;
@@ -721,6 +724,62 @@ fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span) -> Result
         "=" => compare_nums(args, |a, b| a == b, span),
         "<=" => compare_nums(args, |a, b| a <= b, span),
         ">=" => compare_nums(args, |a, b| a >= b, span),
+        "zero?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("zero? requires 1 argument".into(), span)); }
+            Ok(Value::Boolean(as_integer(&args[0], span)? == 0))
+        }
+        "positive?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("positive? requires 1 argument".into(), span)); }
+            Ok(Value::Boolean(as_integer(&args[0], span)? > 0))
+        }
+        "negative?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("negative? requires 1 argument".into(), span)); }
+            Ok(Value::Boolean(as_integer(&args[0], span)? < 0))
+        }
+        "odd?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("odd? requires 1 argument".into(), span)); }
+            Ok(Value::Boolean(as_integer(&args[0], span)? % 2 != 0))
+        }
+        "even?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("even? requires 1 argument".into(), span)); }
+            Ok(Value::Boolean(as_integer(&args[0], span)? % 2 == 0))
+        }
+        "abs" => {
+            if args.len() != 1 { return Err(EvalError::Arity("abs requires 1 argument".into(), span)); }
+            Ok(Value::Integer(as_integer(&args[0], span)?.abs()))
+        }
+        "quotient" => {
+            if args.len() != 2 { return Err(EvalError::Arity("quotient requires 2 arguments".into(), span)); }
+            let a = as_integer(&args[0], span)?;
+            let b = as_integer(&args[1], span)?;
+            if b == 0 { return Err(EvalError::DivisionByZero(span)); }
+            Ok(Value::Integer(a / b))
+        }
+        "min" => {
+            if args.is_empty() { return Err(EvalError::Arity("min requires at least 1 argument".into(), span)); }
+            let mut m = as_integer(&args[0], span)?;
+            for a in &args[1..] { m = m.min(as_integer(a, span)?); }
+            Ok(Value::Integer(m))
+        }
+        "max" => {
+            if args.is_empty() { return Err(EvalError::Arity("max requires at least 1 argument".into(), span)); }
+            let mut m = as_integer(&args[0], span)?;
+            for a in &args[1..] { m = m.max(as_integer(a, span)?); }
+            Ok(Value::Integer(m))
+        }
+        "expt" => {
+            if args.len() != 2 { return Err(EvalError::Arity("expt requires 2 arguments".into(), span)); }
+            let base = as_integer(&args[0], span)?;
+            let exp = as_integer(&args[1], span)?;
+            if exp < 0 { return Err(EvalError::Type("expt: negative exponent".into(), span)); }
+            Ok(Value::Integer(base.pow(exp as u32)))
+        }
+        _ => Err(EvalError::UnboundVariable(name.into(), span)),
+    }
+}
+
+fn builtin_list(name: &str, args: &[Value], out: &Output, span: Span) -> Result<Value, EvalError> {
+    match name {
         "cons" => {
             if args.len() != 2 {
                 return Err(EvalError::Arity("cons requires 2 arguments".into(), span));
@@ -732,10 +791,7 @@ fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span) -> Result
                     Ok(Value::List(new_list))
                 }
                 _ => {
-                    Ok(Value::List(vec![
-                        Spanned::new(args[0].clone(), DUMMY_SPAN),
-                        Spanned::new(args[1].clone(), DUMMY_SPAN),
-                    ]))
+                    Ok(Value::Pair(Box::new(args[0].clone()), Box::new(args[1].clone())))
                 }
             }
         }
@@ -745,6 +801,7 @@ fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span) -> Result
             }
             match &args[0] {
                 Value::List(items) if !items.is_empty() => Ok(items[0].val.clone()),
+                Value::Pair(a, _) => Ok(*a.clone()),
                 _ => Err(EvalError::Type("car: not a pair".into(), span)),
             }
         }
@@ -754,6 +811,7 @@ fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span) -> Result
             }
             match &args[0] {
                 Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
+                Value::Pair(_, b) => Ok(*b.clone()),
                 _ => Err(EvalError::Type("cdr: not a pair".into(), span)),
             }
         }
@@ -790,31 +848,84 @@ fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span) -> Result
             }
             Ok(Value::List(result))
         }
-        "number?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("number? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+        "list?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("list? requires 1 argument".into(), span)); }
+            Ok(Value::Boolean(matches!(&args[0], Value::List(_))))
         }
-        "boolean?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("boolean? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(matches!(&args[0], Value::Boolean(_))))
+        "list-ref" => {
+            if args.len() != 2 { return Err(EvalError::Arity("list-ref requires 2 arguments".into(), span)); }
+            let items = match &args[0] {
+                Value::List(items) => items,
+                _ => return Err(EvalError::Type("list-ref: not a list".into(), span)),
+            };
+            let idx = as_integer(&args[1], span)? as usize;
+            items.get(idx).map(|s| s.val.clone())
+                .ok_or_else(|| EvalError::Type("list-ref: index out of bounds".into(), span))
         }
-        "string?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("string? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
+        "list-tail" => {
+            if args.len() != 2 { return Err(EvalError::Arity("list-tail requires 2 arguments".into(), span)); }
+            let items = match &args[0] {
+                Value::List(items) => items,
+                _ => return Err(EvalError::Type("list-tail: not a list".into(), span)),
+            };
+            let idx = as_integer(&args[1], span)? as usize;
+            if idx > items.len() {
+                return Err(EvalError::Type("list-tail: index out of bounds".into(), span));
+            }
+            Ok(Value::List(items[idx..].to_vec()))
         }
-        "pair?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("pair? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(matches!(&args[0], Value::List(items) if !items.is_empty())))
+        "assoc" => {
+            if args.len() != 2 { return Err(EvalError::Arity("assoc requires 2 arguments".into(), span)); }
+            let key = &args[0];
+            let alist = match &args[1] {
+                Value::List(items) => items,
+                _ => return Err(EvalError::Type("assoc: not a list".into(), span)),
+            };
+            for entry in alist {
+                if let Value::List(pair) = &entry.val {
+                    if !pair.is_empty() && values_equal(&pair[0].val, key) {
+                        return Ok(entry.val.clone());
+                    }
+                }
+            }
+            Ok(Value::Boolean(false))
         }
-        "symbol?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("symbol? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
+        "map" => {
+            if args.len() < 2 { return Err(EvalError::Arity("map requires at least 2 arguments".into(), span)); }
+            let func = &args[0];
+            let lists: Vec<&Vec<Spanned>> = args[1..].iter().map(|a| match a {
+                Value::List(items) => Ok(items),
+                _ => Err(EvalError::Type("map: expected list".into(), span)),
+            }).collect::<Result<_, _>>()?;
+            let len = lists[0].len();
+            let mut result = Vec::new();
+            for i in 0..len {
+                let call_args: Vec<Value> = lists.iter().map(|l| l[i].val.clone()).collect();
+                let val = apply(func, &call_args, out, span)?;
+                result.push(Spanned::new(val, DUMMY_SPAN));
+            }
+            Ok(Value::List(result))
         }
-        "char?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("char? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
+        "for-each" => {
+            if args.len() < 2 { return Err(EvalError::Arity("for-each requires at least 2 arguments".into(), span)); }
+            let func = &args[0];
+            let lists: Vec<&Vec<Spanned>> = args[1..].iter().map(|a| match a {
+                Value::List(items) => Ok(items),
+                _ => Err(EvalError::Type("for-each: expected list".into(), span)),
+            }).collect::<Result<_, _>>()?;
+            let len = lists[0].len();
+            for i in 0..len {
+                let call_args: Vec<Value> = lists.iter().map(|l| l[i].val.clone()).collect();
+                apply(func, &call_args, out, span)?;
+            }
+            Ok(Value::Void)
         }
-        // I/O
+        _ => Err(EvalError::UnboundVariable(name.into(), span)),
+    }
+}
+
+fn builtin_string_char_io(name: &str, args: &[Value], out: &Output, span: Span) -> Result<Value, EvalError> {
+    match name {
         "display" => {
             if args.len() != 1 { return Err(EvalError::Arity("display requires 1 argument".into(), span)); }
             out.borrow_mut().push_str(&args[0].format_display());
@@ -830,7 +941,6 @@ fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span) -> Result
             out.borrow_mut().push('\n');
             Ok(Value::Void)
         }
-        // String operations
         "string-append" => {
             let mut result = String::new();
             for a in args {
@@ -906,6 +1016,132 @@ fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span) -> Result
                 None => Err(EvalError::Type("string-ref: index out of bounds".into(), span)),
             }
         }
+        "char-alphabetic?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("char-alphabetic? requires 1 argument".into(), span)); }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_alphabetic())),
+                _ => Err(EvalError::Type("char-alphabetic?: expected char".into(), span)),
+            }
+        }
+        "char-numeric?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("char-numeric? requires 1 argument".into(), span)); }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_ascii_digit())),
+                _ => Err(EvalError::Type("char-numeric?: expected char".into(), span)),
+            }
+        }
+        "char-upcase" => {
+            if args.len() != 1 { return Err(EvalError::Arity("char-upcase requires 1 argument".into(), span)); }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Char(c.to_ascii_uppercase())),
+                _ => Err(EvalError::Type("char-upcase: expected char".into(), span)),
+            }
+        }
+        "char-downcase" => {
+            if args.len() != 1 { return Err(EvalError::Arity("char-downcase requires 1 argument".into(), span)); }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Char(c.to_ascii_lowercase())),
+                _ => Err(EvalError::Type("char-downcase: expected char".into(), span)),
+            }
+        }
+        "char=?" => {
+            if args.len() != 2 { return Err(EvalError::Arity("char=? requires 2 arguments".into(), span)); }
+            match (&args[0], &args[1]) {
+                (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a == b)),
+                _ => Err(EvalError::Type("char=?: expected chars".into(), span)),
+            }
+        }
+        "char<?" => {
+            if args.len() != 2 { return Err(EvalError::Arity("char<? requires 2 arguments".into(), span)); }
+            match (&args[0], &args[1]) {
+                (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a < b)),
+                _ => Err(EvalError::Type("char<?: expected chars".into(), span)),
+            }
+        }
+        "string=?" => {
+            if args.len() != 2 { return Err(EvalError::Arity("string=? requires 2 arguments".into(), span)); }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a == b)),
+                _ => Err(EvalError::Type("string=?: expected strings".into(), span)),
+            }
+        }
+        "string<?" => {
+            if args.len() != 2 { return Err(EvalError::Arity("string<? requires 2 arguments".into(), span)); }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a < b)),
+                _ => Err(EvalError::Type("string<?: expected strings".into(), span)),
+            }
+        }
+        "string-ci=?" => {
+            if args.len() != 2 { return Err(EvalError::Arity("string-ci=? requires 2 arguments".into(), span)); }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a.to_lowercase() == b.to_lowercase())),
+                _ => Err(EvalError::Type("string-ci=?: expected strings".into(), span)),
+            }
+        }
+        "string-upcase" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string-upcase requires 1 argument".into(), span)); }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Str(s.to_uppercase())),
+                _ => Err(EvalError::Type("string-upcase: expected string".into(), span)),
+            }
+        }
+        "string-downcase" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string-downcase requires 1 argument".into(), span)); }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
+                _ => Err(EvalError::Type("string-downcase: expected string".into(), span)),
+            }
+        }
+        _ => Err(EvalError::UnboundVariable(name.into(), span)),
+    }
+}
+
+fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span) -> Result<Value, EvalError> {
+    match name {
+        "+" | "-" | "*" | "/" | "modulo" | "remainder"
+        | "<" | ">" | "=" | "<=" | ">="
+        | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
+        | "abs" | "quotient" | "min" | "max" | "expt" => builtin_arithmetic(name, args, span),
+
+        "cons" | "car" | "cdr" | "null?" | "list" | "length" | "append"
+        | "list?" | "list-ref" | "list-tail" | "assoc"
+        | "map" | "for-each" => builtin_list(name, args, out, span),
+
+        "display" | "write" | "newline"
+        | "string-append" | "string-length" | "substring"
+        | "string->number" | "number->string"
+        | "symbol->string" | "string->symbol"
+        | "string-copy" | "string-ref"
+        | "char-alphabetic?" | "char-numeric?"
+        | "char-upcase" | "char-downcase" | "char=?" | "char<?"
+        | "string=?" | "string<?" | "string-ci=?"
+        | "string-upcase" | "string-downcase" => builtin_string_char_io(name, args, out, span),
+
+        "number?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("number? requires 1 argument".into(), span)); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+        }
+        "boolean?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("boolean? requires 1 argument".into(), span)); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Boolean(_))))
+        }
+        "string?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string? requires 1 argument".into(), span)); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
+        }
+        "pair?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("pair? requires 1 argument".into(), span)); }
+            Ok(Value::Boolean(matches!(&args[0], Value::List(items) if !items.is_empty()) || matches!(&args[0], Value::Pair(..))))
+        }
+        "symbol?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("symbol? requires 1 argument".into(), span)); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
+        }
+        "char?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("char? requires 1 argument".into(), span)); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
+        }
         "apply" => {
             if args.len() < 2 {
                 return Err(EvalError::Arity("apply requires at least 2 arguments".into(), span));
@@ -919,6 +1155,14 @@ fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span) -> Result
             let mut all_args: Vec<Value> = args[1..args.len()-1].to_vec();
             all_args.extend(tail);
             apply(func, &all_args, out, span)
+        }
+        "equal?" => {
+            if args.len() != 2 { return Err(EvalError::Arity("equal? requires 2 arguments".into(), span)); }
+            Ok(Value::Boolean(values_equal(&args[0], &args[1])))
+        }
+        "eq?" | "eqv?" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("{name} requires 2 arguments"), span)); }
+            Ok(Value::Boolean(values_equal(&args[0], &args[1])))
         }
         _ => Err(EvalError::UnboundVariable(name.into(), span)),
     }
@@ -946,18 +1190,43 @@ fn compare_nums(args: &[Value], cmp: impl Fn(i64, i64) -> bool, span: Span) -> R
     Ok(Value::Boolean(true))
 }
 
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+        (Value::Str(a), Value::Str(b)) => a == b,
+        (Value::Char(a), Value::Char(b)) => a == b,
+        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+        (Value::List(a), Value::List(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| values_equal(&x.val, &y.val))
+        }
+        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => values_equal(a1, b1) && values_equal(a2, b2),
+        _ => false,
+    }
+}
+
 fn make_global_env() -> Env {
     let env = new_env(None);
     for name in &["+", "-", "*", "/", "<", ">", "=", "<=", ">=",
                    "cons", "car", "cdr", "null?", "list", "length", "append",
                    "number?", "boolean?", "string?", "pair?", "symbol?",
-                   "modulo", "remainder",
+                   "modulo", "remainder", "quotient",
                    "display", "write", "newline",
                    "string-append", "string-length", "substring",
                    "string->number", "number->string",
                    "symbol->string", "string->symbol",
                    "string-ref", "string-copy", "char?",
-                   "apply"] {
+                   "apply",
+                   "equal?", "eq?", "eqv?",
+                   // L09
+                   "zero?", "positive?", "negative?", "odd?", "even?",
+                   "abs", "min", "max", "expt",
+                   "list?", "list-ref", "list-tail", "assoc",
+                   "map", "for-each",
+                   "char-alphabetic?", "char-numeric?",
+                   "char-upcase", "char-downcase", "char=?", "char<?",
+                   "string=?", "string<?", "string-ci=?",
+                   "string-upcase", "string-downcase"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     env
