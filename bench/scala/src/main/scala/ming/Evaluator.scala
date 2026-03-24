@@ -44,6 +44,10 @@ object Evaluator:
   // --- Output capture ---
   private[ming] val outputBuffer = new StringBuilder
 
+  // --- Mutable string tracking (string-copy creates mutable strings) ---
+  private[ming] val mutableStrings: java.util.Set[Array[Char]] =
+    java.util.Collections.newSetFromMap(new java.util.IdentityHashMap[Array[Char], java.lang.Boolean]())
+
   // --- Position tracking ---
   private var lastPos = "1:1"
 
