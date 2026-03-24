@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -81,7 +81,20 @@ pub enum Value {
         env: Rc<RefCell<EnvInner>>,
     },
     Vector(Rc<RefCell<Vec<Value>>>),
-    Continuation(Rc<Vec<Frame>>),
+    Continuation(Rc<ContinuationData>),
+}
+
+#[derive(Debug, Clone)]
+pub struct ContinuationData {
+    pub stack: Vec<Frame>,
+    pub winds: Vec<WindEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WindEntry {
+    pub id: u64,
+    pub in_thunk: Value,
+    pub out_thunk: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -97,10 +110,23 @@ pub enum Frame {
     // Re-evaluating application frame: used in restored continuations
     // Re-evaluates all args except hole_index (which gets the continuation's value)
     AppReEval { func: Value, arg_exprs: Vec<Expr>, hole_index: usize, env: Env, span: Span },
+    // dynamic-wind frames
+    DynamicWindAfterIn { body_thunk: Value, out_thunk: Value, in_thunk: Value },
+    DynamicWindAfterBody { out_thunk: Value, in_thunk: Value },
+    DynamicWindAfterOut { body_result: Value },
+    // Continuation wind transition: unwind out-thunks then rewind in-thunks
+    DynamicWindTransition {
+        remaining_outs: Vec<Value>,    // out-thunks still to call (innermost first)
+        rewind_entries: Vec<WindEntry>, // entries to push + call in-thunk (outermost first)
+        target: Rc<ContinuationData>,
+        value: Value,
+    },
 }
 
 thread_local! {
-    static CONTINUATION_JUMP: RefCell<Option<(Vec<Frame>, Value)>> = RefCell::new(None);
+    static CONTINUATION_JUMP: RefCell<Option<(ContinuationData, Value)>> = RefCell::new(None);
+    static WIND_STACK: RefCell<Vec<WindEntry>> = RefCell::new(Vec::new());
+    static NEXT_WIND_ID: Cell<u64> = Cell::new(0);
 }
 
 fn gcd(a: i64, b: i64) -> i64 {
@@ -369,7 +395,8 @@ impl Env {
                      "eqv?",
                      "vector", "make-vector", "vector-ref", "vector-set!",
                      "vector-length", "vector?", "vector->list", "list->vector",
-                     "call/cc", "call-with-current-continuation"] {
+                     "call/cc", "call-with-current-continuation",
+                     "dynamic-wind"] {
             bindings.insert(name.to_string(), Value::Builtin(name.to_string()));
         }
         Env(Rc::new(RefCell::new(EnvInner {
@@ -461,8 +488,22 @@ fn apply_into(
                     };
                 }
             }
-            let cont = Value::Continuation(Rc::new(cont_stack));
+            let cont_winds = WIND_STACK.with(|w| w.borrow().clone());
+            let cont = Value::Continuation(Rc::new(ContinuationData { stack: cont_stack, winds: cont_winds }));
             return apply_into(proc, vec![cont], cur_expr, cur_env, stack, returning, span);
+        }
+        if name == "dynamic-wind" {
+            if args.len() != 3 {
+                return Err(EvalError::Arity(format!("dynamic-wind requires exactly 3 arguments at {}", fmt_span(span))));
+            }
+            let mut it = args.into_iter();
+            let in_thunk = it.next().unwrap();
+            let body_thunk = it.next().unwrap();
+            let out_thunk = it.next().unwrap();
+            // Push frame for after in-thunk returns
+            stack.push(Frame::DynamicWindAfterIn { body_thunk, out_thunk: out_thunk.clone(), in_thunk: in_thunk.clone() });
+            // Call in-thunk
+            return apply_into(in_thunk, vec![], cur_expr, cur_env, stack, returning, span);
         }
     }
 
@@ -537,19 +578,102 @@ fn apply_into(
             }
             Err(EvalError::Arity(format!("no matching clause for {} arguments in case-lambda", nargs)))
         }
-        Value::Continuation(saved_stack) => {
+        Value::Continuation(cont_data) => {
             if args.len() != 1 {
                 return Err(EvalError::Arity("continuation expects 1 argument".into()));
             }
-            *stack = saved_stack.as_ref().clone();
-            *returning = Some(args.into_iter().next().unwrap());
-            Ok(())
+            let value = args.into_iter().next().unwrap();
+            invoke_continuation(cont_data, value, cur_expr, cur_env, stack, returning, span)
         }
         other => {
             let result = apply_builtin(&other, &args).map_err(|e| with_span(e, span))?;
             *returning = Some(result);
             Ok(())
         }
+    }
+}
+
+fn invoke_continuation(
+    cont_data: Rc<ContinuationData>,
+    value: Value,
+    cur_expr: &mut Expr,
+    cur_env: &mut Env,
+    stack: &mut Vec<Frame>,
+    returning: &mut Option<Value>,
+    span: Span,
+) -> Result<(), EvalError> {
+    let current_winds = WIND_STACK.with(|w| w.borrow().clone());
+    let target_winds = &cont_data.winds;
+
+    let common = current_winds.iter().zip(target_winds.iter())
+        .take_while(|(a, b)| a.id == b.id).count();
+
+    // Out-thunks: current[common..] in reverse (innermost first)
+    let remaining_outs: Vec<Value> = current_winds[common..].iter().rev()
+        .map(|w| w.out_thunk.clone()).collect();
+    // In-entries: target[common..] (outermost first)
+    let rewind_entries: Vec<WindEntry> = cont_data.winds[common..].to_vec();
+
+    if remaining_outs.is_empty() && rewind_entries.is_empty() {
+        // No winding needed
+        *stack = cont_data.stack.clone();
+        *returning = Some(value);
+        Ok(())
+    } else {
+        // Start wind transition
+        stack.clear();
+        // Pop current winds down to common prefix
+        WIND_STACK.with(|w| {
+            let mut ws = w.borrow_mut();
+            ws.truncate(common);
+        });
+        if remaining_outs.is_empty() {
+            // Go straight to rewinding
+            start_rewind(rewind_entries, cont_data, value, cur_expr, cur_env, stack, returning, span)
+        } else {
+            let mut outs = remaining_outs;
+            let first_out = outs.remove(0);
+            stack.push(Frame::DynamicWindTransition {
+                remaining_outs: outs,
+                rewind_entries,
+                target: cont_data,
+                value,
+            });
+            // Call first out-thunk
+            apply_into(first_out, vec![], cur_expr, cur_env, stack, returning, span)
+        }
+    }
+}
+
+fn start_rewind(
+    mut entries: Vec<WindEntry>,
+    cont_data: Rc<ContinuationData>,
+    value: Value,
+    cur_expr: &mut Expr,
+    cur_env: &mut Env,
+    stack: &mut Vec<Frame>,
+    returning: &mut Option<Value>,
+    span: Span,
+) -> Result<(), EvalError> {
+    if entries.is_empty() {
+        // Done rewinding, restore continuation
+        WIND_STACK.with(|w| *w.borrow_mut() = cont_data.winds.clone());
+        *stack = cont_data.stack.clone();
+        *returning = Some(value);
+        Ok(())
+    } else {
+        let entry = entries.remove(0);
+        let in_thunk = entry.in_thunk.clone();
+        // Push entry to wind stack
+        WIND_STACK.with(|w| w.borrow_mut().push(entry));
+        stack.push(Frame::DynamicWindTransition {
+            remaining_outs: vec![],
+            rewind_entries: entries,
+            target: cont_data,
+            value,
+        });
+        // Call in-thunk
+        apply_into(in_thunk, vec![], cur_expr, cur_env, stack, returning, span)
     }
 }
 
@@ -664,6 +788,48 @@ fn eval_with_stack(initial_expr: &Expr, initial_env: &Env, initial_stack: Vec<Fr
                         }
                     }
                     apply_into(func, all_args, &mut cur_expr, &mut cur_env, &mut stack, &mut returning, span)?;
+                    continue;
+                }
+                Frame::DynamicWindAfterIn { body_thunk, out_thunk, in_thunk } => {
+                    // in-thunk just returned; push wind entry, call body-thunk
+                    let id = NEXT_WIND_ID.with(|c| { let v = c.get(); c.set(v + 1); v });
+                    WIND_STACK.with(|w| w.borrow_mut().push(WindEntry {
+                        id, in_thunk, out_thunk: out_thunk.clone(),
+                    }));
+                    let span = cur_expr.span;
+                    stack.push(Frame::DynamicWindAfterBody { out_thunk, in_thunk: Value::Void });
+                    apply_into(body_thunk, vec![], &mut cur_expr, &mut cur_env, &mut stack, &mut returning, span)?;
+                    continue;
+                }
+                Frame::DynamicWindAfterBody { out_thunk, .. } => {
+                    // body-thunk just returned; pop wind entry, call out-thunk
+                    let body_result = val;
+                    WIND_STACK.with(|w| w.borrow_mut().pop());
+                    let span = cur_expr.span;
+                    stack.push(Frame::DynamicWindAfterOut { body_result });
+                    apply_into(out_thunk, vec![], &mut cur_expr, &mut cur_env, &mut stack, &mut returning, span)?;
+                    continue;
+                }
+                Frame::DynamicWindAfterOut { body_result } => {
+                    // out-thunk just returned; return the body's result
+                    returning = Some(body_result);
+                    continue;
+                }
+                Frame::DynamicWindTransition { remaining_outs, rewind_entries, target, value } => {
+                    let span = cur_expr.span;
+                    if !remaining_outs.is_empty() {
+                        let mut outs = remaining_outs;
+                        let next_out = outs.remove(0);
+                        stack.push(Frame::DynamicWindTransition {
+                            remaining_outs: outs,
+                            rewind_entries,
+                            target,
+                            value,
+                        });
+                        apply_into(next_out, vec![], &mut cur_expr, &mut cur_env, &mut stack, &mut returning, span)?;
+                    } else {
+                        start_rewind(rewind_entries, target, value, &mut cur_expr, &mut cur_env, &mut stack, &mut returning, span)?;
+                    }
                     continue;
                 }
             }
@@ -1248,12 +1414,12 @@ fn eval_case_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalE
 
 fn apply_func(func: &Value, args: Vec<Value>) -> Result<Value, EvalError> {
     match func {
-        Value::Continuation(saved_stack) => {
+        Value::Continuation(cont_data) => {
             if args.len() != 1 {
                 return Err(EvalError::Arity("continuation expects 1 argument".into()));
             }
             CONTINUATION_JUMP.with(|c| {
-                *c.borrow_mut() = Some((saved_stack.as_ref().clone(), args.into_iter().next().unwrap()));
+                *c.borrow_mut() = Some((cont_data.as_ref().clone(), args.into_iter().next().unwrap()));
             });
             Err(EvalError::ContinuationReturn)
         }
