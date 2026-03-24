@@ -3125,5 +3125,5 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   const beginExpr: SchemeVal = exprs.length === 1 ? exprs[0]
     : { tag: 'list', elements: [{ tag: 'symbol', value: 'begin' }, ...exprs] };
   const result = evalScheme(beginExpr, env);
-  return { result: schemeToString(result), output: outputBuf.join('') };
+  return { result: displayString(result), output: outputBuf.join('') };
 }
