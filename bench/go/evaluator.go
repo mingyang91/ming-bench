@@ -113,6 +113,15 @@ func evalList(expr *Expr, env *Env) (Value, error) {
 			return evalCond(expr, env)
 		case "set!":
 			return evalSet(expr, env)
+		case "define-syntax":
+			return evalDefineSyntax(expr, env)
+		}
+
+		// macro expansion: check if head symbol is bound to a SyntaxVal
+		if v, ok := env.Get(head.SVal); ok {
+			if sv, ok := v.(*SyntaxVal); ok {
+				return expandMacro(sv, expr, env)
+			}
 		}
 	}
 
