@@ -1,6 +1,8 @@
 pub mod error;
+mod builtins;
 
 pub use error::EvalError;
+use builtins::apply_builtin;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -15,6 +17,7 @@ enum Value {
     Str(String),
     Symbol(String),
     List(Vec<Value>),
+    Pair(Box<Value>, Box<Value>),
     Lambda {
         params: Vec<String>,
         rest_param: Option<String>,
@@ -44,7 +47,30 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            Value::Char(c) => write!(f, "#\\{c}"),
+            Value::Pair(a, d) => {
+                write!(f, "({a}")?;
+                let mut cur = d.as_ref();
+                loop {
+                    match cur {
+                        Value::Pair(ca, cd) => {
+                            write!(f, " {ca}")?;
+                            cur = cd.as_ref();
+                        }
+                        Value::List(elems) if elems.is_empty() => break,
+                        other => {
+                            write!(f, " . {other}")?;
+                            break;
+                        }
+                    }
+                }
+                write!(f, ")")
+            }
+            Value::Char(c) => match c {
+                ' ' => write!(f, "#\\space"),
+                '\n' => write!(f, "#\\newline"),
+                '\t' => write!(f, "#\\tab"),
+                _ => write!(f, "#\\{c}"),
+            },
             Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::Builtin(name) => write!(f, "#<builtin:{name}>"),
             Value::Void => write!(f, ""),
@@ -57,6 +83,7 @@ impl Value {
     fn display_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Str(s) => write!(f, "{s}"),
+            Value::Char(c) => write!(f, "{c}"),
             Value::List(elems) => {
                 write!(f, "(")?;
                 for (i, e) in elems.iter().enumerate() {
@@ -64,6 +91,27 @@ impl Value {
                         write!(f, " ")?;
                     }
                     e.display_fmt(f)?;
+                }
+                write!(f, ")")
+            }
+            Value::Pair(a, d) => {
+                write!(f, "(")?;
+                a.display_fmt(f)?;
+                let mut cur = d.as_ref();
+                loop {
+                    match cur {
+                        Value::Pair(ca, cd) => {
+                            write!(f, " ")?;
+                            ca.display_fmt(f)?;
+                            cur = cd.as_ref();
+                        }
+                        Value::List(elems) if elems.is_empty() => break,
+                        other => {
+                            write!(f, " . ")?;
+                            other.display_fmt(f)?;
+                            break;
+                        }
+                    }
                 }
                 write!(f, ")")
             }
@@ -435,7 +483,14 @@ const BUILTINS: &[&str] = &[
     "string->number", "number->string",
     "symbol->string", "string->symbol",
     "string-ref", "char?", "string-copy",
-    "apply",
+    "apply", "eq?", "equal?", "map",
+    "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
+    "zero?", "positive?", "negative?", "odd?", "even?",
+    "list-ref", "list-tail", "list?", "assoc",
+    "char=?", "char<?", "char-alphabetic?", "char-numeric?",
+    "char-upcase", "char-downcase",
+    "string=?", "string<?", "string-ci=?",
+    "string-upcase", "string-downcase",
 ];
 
 fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
@@ -834,304 +889,39 @@ fn apply_func(func: &Value, args: &[Value], call_pos: Pos, output: &mut String) 
     }
 }
 
-fn apply_builtin(name: &str, args: &[Value], call_pos: Pos, output: &mut String) -> Result<Value, EvalError> {
-    match name {
-        "+" => {
-            let mut sum: i64 = 0;
-            for a in args {
-                sum += as_integer(a, call_pos)?;
-            }
-            Ok(Value::Integer(sum))
+fn values_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+        (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+        (Value::Char(a), Value::Char(b)) => a == b,
+        (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
+        _ => false,
+    }
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+        (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+        (Value::Char(a), Value::Char(b)) => a == b,
+        (Value::Str(a), Value::Str(b)) => a == b,
+        (Value::List(a), Value::List(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| values_equal(x, y))
         }
-        "-" => {
-            if args.is_empty() {
-                return Err(EvalError::Arity(format!("{call_pos}: - requires at least 1 argument")));
-            }
-            if args.len() == 1 {
-                return Ok(Value::Integer(-as_integer(&args[0], call_pos)?));
-            }
-            let mut result = as_integer(&args[0], call_pos)?;
-            for a in &args[1..] {
-                result -= as_integer(a, call_pos)?;
-            }
-            Ok(Value::Integer(result))
+        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => {
+            values_equal(a1, b1) && values_equal(a2, b2)
         }
-        "*" => {
-            let mut product: i64 = 1;
-            for a in args {
-                product *= as_integer(a, call_pos)?;
-            }
-            Ok(Value::Integer(product))
-        }
-        "/" => {
-            if args.len() < 2 {
-                return Err(EvalError::Arity(format!("{call_pos}: / requires at least 2 arguments")));
-            }
-            let mut result = as_integer(&args[0], call_pos)?;
-            for a in &args[1..] {
-                let divisor = as_integer(a, call_pos)?;
-                if divisor == 0 {
-                    return Err(EvalError::DivisionByZero(format!("{call_pos}: division by zero")));
-                }
-                result /= divisor;
-            }
-            Ok(Value::Integer(result))
-        }
-        "<" => {
-            if args.len() != 2 {
-                return Err(EvalError::Arity(format!("{call_pos}: < requires 2 arguments")));
-            }
-            Ok(Value::Boolean(as_integer(&args[0], call_pos)? < as_integer(&args[1], call_pos)?))
-        }
-        ">" => {
-            if args.len() != 2 {
-                return Err(EvalError::Arity(format!("{call_pos}: > requires 2 arguments")));
-            }
-            Ok(Value::Boolean(as_integer(&args[0], call_pos)? > as_integer(&args[1], call_pos)?))
-        }
-        "=" => {
-            if args.len() != 2 {
-                return Err(EvalError::Arity(format!("{call_pos}: = requires 2 arguments")));
-            }
-            Ok(Value::Boolean(as_integer(&args[0], call_pos)? == as_integer(&args[1], call_pos)?))
-        }
-        "<=" => {
-            if args.len() != 2 {
-                return Err(EvalError::Arity(format!("{call_pos}: <= requires 2 arguments")));
-            }
-            Ok(Value::Boolean(as_integer(&args[0], call_pos)? <= as_integer(&args[1], call_pos)?))
-        }
-        ">=" => {
-            if args.len() != 2 {
-                return Err(EvalError::Arity(format!("{call_pos}: >= requires 2 arguments")));
-            }
-            Ok(Value::Boolean(as_integer(&args[0], call_pos)? >= as_integer(&args[1], call_pos)?))
-        }
-        "cons" => {
-            if args.len() != 2 {
-                return Err(EvalError::Arity(format!("{call_pos}: cons requires 2 arguments")));
-            }
-            match &args[1] {
-                Value::List(elems) => {
-                    let mut new_list = vec![args[0].clone()];
-                    new_list.extend(elems.iter().cloned());
-                    Ok(Value::List(new_list))
-                }
-                _ => {
-                    Ok(Value::List(vec![args[0].clone(), args[1].clone()]))
-                }
-            }
-        }
-        "car" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: car requires 1 argument")));
-            }
-            match &args[0] {
-                Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
-                _ => Err(EvalError::Type(format!("{call_pos}: car: not a pair"))),
-            }
-        }
-        "cdr" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: cdr requires 1 argument")));
-            }
-            match &args[0] {
-                Value::List(elems) if !elems.is_empty() => {
-                    Ok(Value::List(elems[1..].to_vec()))
-                }
-                _ => Err(EvalError::Type(format!("{call_pos}: cdr: not a pair"))),
-            }
-        }
-        "null?" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: null? requires 1 argument")));
-            }
-            Ok(Value::Boolean(matches!(&args[0], Value::List(e) if e.is_empty())))
-        }
-        "list" => Ok(Value::List(args.to_vec())),
-        "length" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: length requires 1 argument")));
-            }
-            match &args[0] {
-                Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
-                _ => Err(EvalError::Type(format!("{call_pos}: length: not a list"))),
-            }
-        }
-        "append" => {
-            let mut result = Vec::new();
-            for arg in args {
-                match arg {
-                    Value::List(elems) => result.extend(elems.iter().cloned()),
-                    _ => return Err(EvalError::Type(format!("{call_pos}: append: not a list"))),
-                }
-            }
-            Ok(Value::List(result))
-        }
-        "number?" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: number? requires 1 argument")));
-            }
-            Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
-        }
-        "boolean?" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: boolean? requires 1 argument")));
-            }
-            Ok(Value::Boolean(matches!(&args[0], Value::Boolean(_))))
-        }
-        "string?" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: string? requires 1 argument")));
-            }
-            Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
-        }
-        "pair?" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: pair? requires 1 argument")));
-            }
-            Ok(Value::Boolean(matches!(&args[0], Value::List(e) if !e.is_empty())))
-        }
-        "symbol?" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: symbol? requires 1 argument")));
-            }
-            Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
-        }
-        "display" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: display requires 1 argument")));
-            }
-            let s = format!("{}", DisplayValue(&args[0]));
-            output.push_str(&s);
-            Ok(Value::Void)
-        }
-        "write" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: write requires 1 argument")));
-            }
-            let s = format!("{}", &args[0]);
-            output.push_str(&s);
-            Ok(Value::Void)
-        }
-        "newline" => {
-            if !args.is_empty() {
-                return Err(EvalError::Arity(format!("{call_pos}: newline takes 0 arguments")));
-            }
-            output.push('\n');
-            Ok(Value::Void)
-        }
-        "string-append" => {
-            let mut result = String::new();
-            for a in args {
-                match a {
-                    Value::Str(s) => result.push_str(s),
-                    _ => return Err(EvalError::Type(format!("{call_pos}: string-append: expected string"))),
-                }
-            }
-            Ok(Value::Str(result))
-        }
-        "string-length" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: string-length requires 1 argument")));
-            }
-            match &args[0] {
-                Value::Str(s) => Ok(Value::Integer(s.len() as i64)),
-                _ => Err(EvalError::Type(format!("{call_pos}: string-length: expected string"))),
-            }
-        }
-        "substring" => {
-            if args.len() != 3 {
-                return Err(EvalError::Arity(format!("{call_pos}: substring requires 3 arguments")));
-            }
-            let s = match &args[0] {
-                Value::Str(s) => s,
-                _ => return Err(EvalError::Type(format!("{call_pos}: substring: expected string"))),
-            };
-            let start = as_integer(&args[1], call_pos)? as usize;
-            let end = as_integer(&args[2], call_pos)? as usize;
-            Ok(Value::Str(s[start..end].to_string()))
-        }
-        "string->number" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: string->number requires 1 argument")));
-            }
-            match &args[0] {
-                Value::Str(s) => match s.parse::<i64>() {
-                    Ok(n) => Ok(Value::Integer(n)),
-                    Err(_) => Ok(Value::Boolean(false)),
-                },
-                _ => Err(EvalError::Type(format!("{call_pos}: string->number: expected string"))),
-            }
-        }
-        "number->string" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: number->string requires 1 argument")));
-            }
-            let n = as_integer(&args[0], call_pos)?;
-            Ok(Value::Str(n.to_string()))
-        }
-        "symbol->string" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: symbol->string requires 1 argument")));
-            }
-            match &args[0] {
-                Value::Symbol(s) => Ok(Value::Str(s.clone())),
-                _ => Err(EvalError::Type(format!("{call_pos}: symbol->string: expected symbol"))),
-            }
-        }
-        "string->symbol" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: string->symbol requires 1 argument")));
-            }
-            match &args[0] {
-                Value::Str(s) => Ok(Value::Symbol(s.clone())),
-                _ => Err(EvalError::Type(format!("{call_pos}: string->symbol: expected string"))),
-            }
-        }
-        "string-ref" => {
-            if args.len() != 2 {
-                return Err(EvalError::Arity(format!("{call_pos}: string-ref requires 2 arguments")));
-            }
-            let s = match &args[0] {
-                Value::Str(s) => s,
-                _ => return Err(EvalError::Type(format!("{call_pos}: string-ref: expected string"))),
-            };
-            let idx = as_integer(&args[1], call_pos)? as usize;
-            Ok(Value::Char(s.chars().nth(idx).ok_or_else(|| {
-                EvalError::Type(format!("{call_pos}: string-ref: index out of range"))
-            })?))
-        }
-        "char?" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: char? requires 1 argument")));
-            }
-            Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
-        }
-        "string-copy" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: string-copy requires 1 argument")));
-            }
-            match &args[0] {
-                Value::Str(s) => Ok(Value::Str(s.clone())),
-                _ => Err(EvalError::Type(format!("{call_pos}: string-copy: expected string"))),
-            }
-        }
-        "apply" => {
-            if args.len() < 2 {
-                return Err(EvalError::Arity(format!("{call_pos}: apply requires at least 2 arguments")));
-            }
-            let func = &args[0];
-            let last = &args[args.len() - 1];
-            let tail = match last {
-                Value::List(elems) => elems.clone(),
-                _ => return Err(EvalError::Type(format!("{call_pos}: apply: last argument must be a list"))),
-            };
-            let mut combined = args[1..args.len() - 1].to_vec();
-            combined.extend(tail);
-            apply_func(func, &combined, call_pos, output)
-        }
-        _ => Err(EvalError::UnboundVariable(format!("{call_pos}: {name}"))),
+        _ => false,
+    }
+}
+
+fn is_proper_list(v: &Value) -> bool {
+    match v {
+        Value::List(_) => true,
+        Value::Pair(_, d) => is_proper_list(d),
+        _ => false,
     }
 }
 
