@@ -393,6 +393,29 @@ const (
 	frameSet                          // pending set!
 )
 
+// SyntaxObjectVal wraps an Expr as a first-class syntax object (for syntax-case).
+type SyntaxObjectVal struct {
+	Expr    *Expr
+	Gensyms map[string]string // introduced identifier → gensym'd name
+	DefEnv  *Env              // environment at syntax template creation (for hygiene)
+}
+
+func (v *SyntaxObjectVal) String() string { return "#<syntax>" }
+
+// SyntaxListVal wraps a list of Exprs for ellipsis pattern variables.
+type SyntaxListVal struct {
+	Exprs []*Expr
+}
+
+func (v *SyntaxListVal) String() string { return "#<syntax-list>" }
+
+// TransformerVal wraps a procedure used as a macro transformer (syntax-case style).
+type TransformerVal struct {
+	Proc Value
+}
+
+func (v *TransformerVal) String() string { return "#<transformer>" }
+
 // isTruthy returns true for all values except #f.
 func isTruthy(v Value) bool {
 	if b, ok := v.(*BoolVal); ok {

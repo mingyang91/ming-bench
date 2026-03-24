@@ -21,6 +21,7 @@ const (
 	tokChar
 	tokFloat
 	tokRational
+	tokSyntaxQuote
 	tokEOF
 )
 
@@ -115,9 +116,15 @@ func tokenize(input string) ([]token, error) {
 			continue
 		}
 
-		// #t, #f, #\char
+		// #', #t, #f, #\char
 		if ch == '#' && i+1 < len(input) {
 			next := input[i+1]
+			if next == '\'' {
+				tokens = append(tokens, token{tokSyntaxQuote, "#'", startLine, startCol})
+				i += 2
+				col += 2
+				continue
+			}
 			if next == 't' || next == 'f' {
 				// check it's not part of a longer symbol
 				if i+2 >= len(input) || isDelimiter(input[i+2]) {
@@ -347,6 +354,21 @@ func (p *parser) parseExpr() (*Expr, error) {
 			Kind: ExprList,
 			List: []*Expr{
 				{Kind: ExprSymbol, SVal: "quote", Line: t.line, Col: t.col},
+				inner,
+			},
+			Line: t.line, Col: t.col,
+		}, nil
+
+	case tokSyntaxQuote:
+		p.next()
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &Expr{
+			Kind: ExprList,
+			List: []*Expr{
+				{Kind: ExprSymbol, SVal: "syntax", Line: t.line, Col: t.col},
 				inner,
 			},
 			Line: t.line, Col: t.col,

@@ -328,12 +328,21 @@ func evalList(expr *Expr, env *Env) (Value, error) {
 			return evalDo(expr, env)
 		case "guard":
 			return evalGuard(expr, env)
+		case "syntax-case":
+			return evalSyntaxCase(expr, env)
+		case "syntax":
+			return evalSyntaxTemplate(expr, env)
+		case "with-syntax":
+			return evalWithSyntax(expr, env)
 		}
 
-		// macro expansion: check if head symbol is bound to a SyntaxVal
+		// macro expansion: check if head symbol is bound to a SyntaxVal or TransformerVal
 		if v, ok := env.Get(head.SVal); ok {
 			if sv, ok := v.(*SyntaxVal); ok {
 				return expandMacro(sv, expr, env)
+			}
+			if tv, ok := v.(*TransformerVal); ok {
+				return expandTransformerMacro(tv, expr, env)
 			}
 		}
 	}
@@ -591,6 +600,10 @@ func defaultEnv(output *strings.Builder) *Env {
 	// L21 builtins — values & call-with-values
 	env.Set("values", &BuiltinFunc{Name: "values", Fn: builtinValues})
 	env.Set("call-with-values", &CallWithValuesVal{})
+
+	// L22 builtins — syntax-case support
+	env.Set("syntax->datum", &BuiltinFunc{Name: "syntax->datum", Fn: builtinSyntaxToDatum})
+	env.Set("datum->syntax", &BuiltinFunc{Name: "datum->syntax", Fn: builtinDatumToSyntax})
 
 	return env
 }
@@ -3580,4 +3593,26 @@ func evalGuard(expr *Expr, env *Env) (Value, error) {
 
 	// No clause matched — re-raise
 	panic(&schemeRaise{value: raised.value})
+}
+
+// --- L22 builtins ---
+
+func builtinSyntaxToDatum(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("syntax->datum: expected 1 argument, got %d", len(args))
+	}
+	stx, ok := args[0].(*SyntaxObjectVal)
+	if !ok {
+		return nil, fmt.Errorf("syntax->datum: expected syntax object, got %s", args[0].String())
+	}
+	return syntaxToValue(stx.Expr)
+}
+
+func builtinDatumToSyntax(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("datum->syntax: expected 2 arguments, got %d", len(args))
+	}
+	// First arg is context syntax object (used for lexical context), second is datum
+	e := valueToExpr(args[1])
+	return &SyntaxObjectVal{Expr: e}, nil
 }
