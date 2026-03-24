@@ -191,14 +191,35 @@ public class Evaluator {
                     i++; col++;
                 }
                 String tok = sb.toString();
-                try {
-                    tokens.add(new Token(Long.parseLong(tok), line, startCol));
-                } catch (NumberFormatException e) {
+                Object parsed = parseNumber(tok);
+                if (parsed != null) {
+                    tokens.add(new Token(parsed, line, startCol));
+                } else {
                     tokens.add(new Token(tok, line, startCol));
                 }
             }
         }
         return tokens;
+    }
+
+    private static Object parseNumber(String tok) {
+        // Try integer
+        try { return Long.parseLong(tok); } catch (NumberFormatException ignored) {}
+        // Try rational N/D
+        int slash = tok.indexOf('/');
+        if (slash > 0 && slash < tok.length() - 1) {
+            try {
+                long num = Long.parseLong(tok.substring(0, slash));
+                long den = Long.parseLong(tok.substring(slash + 1));
+                if (den == 0) return null;
+                Rational r = Rational.of(num, den);
+                if (r.isInteger()) return r.toLong();
+                return r;
+            } catch (NumberFormatException ignored) {}
+        }
+        // Try floating point
+        try { return Double.parseDouble(tok); } catch (NumberFormatException ignored) {}
+        return null;
     }
 
     // --- Parser ---
@@ -266,7 +287,7 @@ public class Evaluator {
             return eval(me.form(), me.env());
         }
 
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
+        if (expr instanceof Long || expr instanceof Double || expr instanceof Rational || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
             return expr;
         }
         if (expr instanceof String symbol) {
@@ -905,7 +926,7 @@ public class Evaluator {
         // Type predicates
         globalEnv.define("number?", (BuiltinProc) args -> {
             if (args.size() != 1) throw error("number?: expected 1 argument");
-            return args.get(0) instanceof Long;
+            return isNumber(args.get(0));
         });
         globalEnv.define("string?", (BuiltinProc) args -> {
             if (args.size() != 1) throw error("string?: expected 1 argument");
@@ -965,16 +986,16 @@ public class Evaluator {
         globalEnv.define("string->number", (BuiltinProc) args -> {
             if (args.size() != 1) throw error("string->number: expected 1 argument");
             if (!(args.get(0) instanceof SchemeString s)) throw error("string->number: not a string");
-            try {
-                return Long.parseLong(s.value());
-            } catch (NumberFormatException e) {
-                return Boolean.FALSE;
-            }
+            Object parsed = parseNumber(s.value());
+            return parsed != null ? parsed : Boolean.FALSE;
         });
         globalEnv.define("number->string", (BuiltinProc) args -> {
             if (args.size() != 1) throw error("number->string: expected 1 argument");
-            if (!(args.get(0) instanceof Long n)) throw error("number->string: not a number");
-            return new SchemeString(n.toString());
+            Object val = args.get(0);
+            if (val instanceof Long n) return new SchemeString(n.toString());
+            if (val instanceof Rational r) return new SchemeString(r.toString());
+            if (val instanceof Double d) return new SchemeString(String.valueOf(d));
+            throw error("number->string: not a number");
         });
 
         // Symbol/String conversion
@@ -1021,6 +1042,8 @@ public class Evaluator {
             Object a = args.get(0), b = args.get(1);
             if (a == b) return true;
             if (a instanceof Long && b instanceof Long) return a.equals(b);
+            if (a instanceof Rational && b instanceof Rational) return a.equals(b);
+            if (a instanceof Double && b instanceof Double) return a.equals(b);
             if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
             if (a instanceof SchemeChar && b instanceof SchemeChar) return a.equals(b);
             if (a instanceof String && b instanceof String) return a.equals(b);
@@ -1036,8 +1059,11 @@ public class Evaluator {
         // Numeric utilities
         globalEnv.define("abs", (BuiltinProc) args -> {
             if (args.size() != 1) throw error("abs: expected 1 argument");
-            if (!(args.get(0) instanceof Long n)) throw error("abs: not a number");
-            return Math.abs(n);
+            Object val = args.get(0);
+            if (val instanceof Long n) return Math.abs(n);
+            if (val instanceof Rational r) return normalizeExact(Rational.of(Math.abs(r.numerator()), r.denominator()));
+            if (val instanceof Double d) return Math.abs(d);
+            throw error("abs: not a number");
         });
         globalEnv.define("modulo", (BuiltinProc) args -> {
             if (args.size() != 2) throw error("modulo: expected 2 arguments");
@@ -1102,18 +1128,27 @@ public class Evaluator {
         // Number predicates
         globalEnv.define("zero?", (BuiltinProc) args -> {
             if (args.size() != 1) throw error("zero?: expected 1 argument");
-            if (!(args.get(0) instanceof Long n)) throw error("zero?: not a number");
-            return n == 0L;
+            Object val = args.get(0);
+            if (val instanceof Long n) return n == 0L;
+            if (val instanceof Rational r) return r.numerator() == 0;
+            if (val instanceof Double d) return d == 0.0;
+            throw error("zero?: not a number");
         });
         globalEnv.define("positive?", (BuiltinProc) args -> {
             if (args.size() != 1) throw error("positive?: expected 1 argument");
-            if (!(args.get(0) instanceof Long n)) throw error("positive?: not a number");
-            return n > 0L;
+            Object val = args.get(0);
+            if (val instanceof Long n) return n > 0L;
+            if (val instanceof Rational r) return r.numerator() > 0;
+            if (val instanceof Double d) return d > 0.0;
+            throw error("positive?: not a number");
         });
         globalEnv.define("negative?", (BuiltinProc) args -> {
             if (args.size() != 1) throw error("negative?: expected 1 argument");
-            if (!(args.get(0) instanceof Long n)) throw error("negative?: not a number");
-            return n < 0L;
+            Object val = args.get(0);
+            if (val instanceof Long n) return n < 0L;
+            if (val instanceof Rational r) return r.numerator() < 0;
+            if (val instanceof Double d) return d < 0.0;
+            throw error("negative?: not a number");
         });
         globalEnv.define("odd?", (BuiltinProc) args -> {
             if (args.size() != 1) throw error("odd?: expected 1 argument");
@@ -1282,6 +1317,95 @@ public class Evaluator {
             }
             return apply(proc, callArgs);
         });
+
+        // L11: Exact/Inexact predicates and conversions
+        globalEnv.define("exact?", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("exact?: expected 1 argument");
+            return isExact(args.get(0));
+        });
+        globalEnv.define("inexact?", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("inexact?: expected 1 argument");
+            return args.get(0) instanceof Double;
+        });
+        globalEnv.define("exact->inexact", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("exact->inexact: expected 1 argument");
+            if (!isNumber(args.get(0))) throw error("exact->inexact: not a number");
+            return toDouble(args.get(0));
+        });
+        globalEnv.define("inexact->exact", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("inexact->exact: expected 1 argument");
+            Object val = args.get(0);
+            if (val instanceof Long || val instanceof Rational) return val;
+            if (val instanceof Double d) {
+                // Convert double to exact rational
+                if (d == Math.floor(d) && !Double.isInfinite(d)) return (long) d.doubleValue();
+                // Use BigDecimal-like approach: find rational representation
+                long bits = Double.doubleToLongBits(d);
+                long mantissa = bits & 0x000fffffffffffffL;
+                int exponent = (int) ((bits >> 52) & 0x7ffL) - 1023 - 52;
+                mantissa |= 0x0010000000000000L; // implicit leading 1
+                if ((bits & 0x8000000000000000L) != 0) mantissa = -mantissa;
+                if (exponent >= 0) {
+                    return normalizeExact(Rational.of(mantissa << exponent, 1));
+                } else {
+                    return normalizeExact(Rational.of(mantissa, 1L << (-exponent)));
+                }
+            }
+            throw error("inexact->exact: not a number");
+        });
+        globalEnv.define("numerator", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("numerator: expected 1 argument");
+            Object val = args.get(0);
+            if (val instanceof Long l) return l;
+            if (val instanceof Rational r) return r.numerator();
+            throw error("numerator: not an exact number");
+        });
+        globalEnv.define("denominator", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("denominator: expected 1 argument");
+            Object val = args.get(0);
+            if (val instanceof Long) return 1L;
+            if (val instanceof Rational r) return r.denominator();
+            throw error("denominator: not an exact number");
+        });
+        globalEnv.define("integer?", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("integer?: expected 1 argument");
+            Object val = args.get(0);
+            if (val instanceof Long) return true;
+            if (val instanceof Rational r) return r.isInteger();
+            if (val instanceof Double d) return d == Math.floor(d) && !Double.isInfinite(d);
+            return false;
+        });
+        globalEnv.define("rational?", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("rational?: expected 1 argument");
+            return isExact(args.get(0));
+        });
+    }
+
+    // Convert any numeric value to Rational
+    private Rational toRational(Object val) throws EvalError {
+        if (val instanceof Long l) return Rational.of(l, 1);
+        if (val instanceof Rational r) return r;
+        throw error("not an exact number");
+    }
+
+    private boolean isExact(Object val) {
+        return val instanceof Long || val instanceof Rational;
+    }
+
+    private boolean isNumber(Object val) {
+        return val instanceof Long || val instanceof Double || val instanceof Rational;
+    }
+
+    private double toDouble(Object val) throws EvalError {
+        if (val instanceof Long l) return l.doubleValue();
+        if (val instanceof Double d) return d;
+        if (val instanceof Rational r) return r.toDouble();
+        throw error("not a number");
+    }
+
+    // Normalize: if Rational with denom==1, return Long
+    private Object normalizeExact(Rational r) {
+        return r.isInteger() ? r.toLong() : r;
     }
 
     // Arithmetic on already-evaluated args
@@ -1291,47 +1415,76 @@ public class Evaluator {
             if (op.equals("*")) return 1L;
             throw error(op + ": need at least 1 argument");
         }
+        // Check all args are numbers
+        for (Object a : args) {
+            if (!isNumber(a)) throw error(op + ": not a number");
+        }
+        // Unary minus
         if (op.equals("-") && args.size() == 1) {
             Object val = args.get(0);
-            if (!(val instanceof Long)) throw error("-: not a number");
-            return -((Long) val);
+            if (val instanceof Long l) return -l;
+            if (val instanceof Rational r) return normalizeExact(r.negate());
+            return -((Double) val);
         }
-        Object first = args.get(0);
-        if (!(first instanceof Long)) throw error(op + ": not a number");
-        long result = (Long) first;
+        // Check if any arg is inexact (Double)
+        boolean inexact = false;
+        for (Object a : args) { if (a instanceof Double) { inexact = true; break; } }
+        if (inexact) {
+            double result = toDouble(args.get(0));
+            for (int i = 1; i < args.size(); i++) {
+                double v = toDouble(args.get(i));
+                switch (op) {
+                    case "+" -> result += v;
+                    case "-" -> result -= v;
+                    case "*" -> result *= v;
+                    case "/" -> { if (v == 0) throw error("division by zero"); result /= v; }
+                }
+            }
+            return result;
+        }
+        // All exact: use Rational arithmetic
+        Rational result = toRational(args.get(0));
         for (int i = 1; i < args.size(); i++) {
-            Object val = args.get(i);
-            if (!(val instanceof Long)) throw error(op + ": not a number");
-            long v = (Long) val;
+            Rational v = toRational(args.get(i));
             switch (op) {
-                case "+" -> result += v;
-                case "-" -> result -= v;
-                case "*" -> result *= v;
+                case "+" -> result = result.add(v);
+                case "-" -> result = result.subtract(v);
+                case "*" -> result = result.multiply(v);
                 case "/" -> {
-                    if (v == 0) throw error("division by zero");
-                    result /= v;
+                    if (v.numerator() == 0) throw error("division by zero");
+                    result = result.divide(v);
                 }
             }
         }
-        return result;
+        return normalizeExact(result);
     }
 
     private Object cmp(List<Object> args, String op) throws EvalError {
         if (args.size() != 2) throw error(op + ": expected 2 arguments");
-        Object a = args.get(0);
-        Object b = args.get(1);
-        if (!(a instanceof Long la) || !(b instanceof Long lb)) {
-            throw error(op + ": not a number");
+        Object a = args.get(0), b = args.get(1);
+        if (!isNumber(a) || !isNumber(b)) throw error(op + ": not a number");
+        // If both exact, compare as rationals to avoid floating point issues
+        if (isExact(a) && isExact(b)) {
+            Rational ra = toRational(a), rb = toRational(b);
+            long diff = ra.numerator() * rb.denominator() - rb.numerator() * ra.denominator();
+            return switch (op) {
+                case "<" -> diff < 0;
+                case ">" -> diff > 0;
+                case "=" -> diff == 0;
+                case "<=" -> diff <= 0;
+                case ">=" -> diff >= 0;
+                default -> false;
+            };
         }
-        boolean result = switch (op) {
-            case "<" -> la < lb;
-            case ">" -> la > lb;
-            case "=" -> la.equals(lb);
-            case "<=" -> la <= lb;
-            case ">=" -> la >= lb;
+        double da = toDouble(a), db = toDouble(b);
+        return switch (op) {
+            case "<" -> da < db;
+            case ">" -> da > db;
+            case "=" -> da == db;
+            case "<=" -> da <= db;
+            case ">=" -> da >= db;
             default -> false;
         };
-        return result;
     }
 
     private void checkArgs(List<?> list, int expected, String name) throws EvalError {
@@ -1343,6 +1496,8 @@ public class Evaluator {
     private boolean schemeEqual(Object a, Object b) {
         if (a == b) return true;
         if (a instanceof Long && b instanceof Long) return a.equals(b);
+        if (a instanceof Rational && b instanceof Rational) return a.equals(b);
+        if (a instanceof Double && b instanceof Double) return a.equals(b);
         if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
         if (a instanceof String && b instanceof String) return a.equals(b);
         if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
@@ -1359,6 +1514,14 @@ public class Evaluator {
     @SuppressWarnings("unchecked")
     static String schemeToString(Object val) {
         if (val instanceof Long) return val.toString();
+        if (val instanceof Rational r) return r.toString();
+        if (val instanceof Double d) {
+            if (d == Math.floor(d) && !Double.isInfinite(d) && Math.abs(d) < 1e15) {
+                // Format as e.g. "5.0" not "5"
+                return String.valueOf(d);
+            }
+            return String.valueOf(d);
+        }
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
         if (val instanceof SchemeChar ch) return "#\\" + ch.value();
