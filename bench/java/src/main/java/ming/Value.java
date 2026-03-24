@@ -2,11 +2,15 @@ package ming;
 
 import java.util.List;
 
-sealed interface Value permits Value.IntegerValue, Value.BooleanValue, Value.StringValue, Value.SymbolValue, Value.ListValue, Value.VoidValue, Value.BuiltinProcedure, Value.ClosureValue {
+sealed interface Value permits Value.IntegerValue, Value.BooleanValue, Value.StringValue, Value.CharacterValue, Value.SymbolValue, Value.ListValue, Value.VoidValue, Value.BuiltinProcedure, Value.ClosureValue {
     String render();
 
     default boolean isTruthy() {
         return true;
+    }
+
+    default String renderForDisplay() {
+        return render();
     }
 
     private static String escapeString(String value) {
@@ -25,6 +29,15 @@ sealed interface Value permits Value.IntegerValue, Value.BooleanValue, Value.Str
         }
         builder.append('"');
         return builder.toString();
+    }
+
+    private static String renderCharacter(char value) {
+        return switch (value) {
+            case ' ' -> "#\\space";
+            case '\n' -> "#\\newline";
+            case '\t' -> "#\\tab";
+            default -> "#\\" + value;
+        };
     }
 
     record IntegerValue(long value) implements Value {
@@ -51,6 +64,23 @@ sealed interface Value permits Value.IntegerValue, Value.BooleanValue, Value.Str
         public String render() {
             return escapeString(value);
         }
+
+        @Override
+        public String renderForDisplay() {
+            return value;
+        }
+    }
+
+    record CharacterValue(char value) implements Value {
+        @Override
+        public String render() {
+            return renderCharacter(value);
+        }
+
+        @Override
+        public String renderForDisplay() {
+            return Character.toString(value);
+        }
     }
 
     record SymbolValue(String name) implements Value {
@@ -67,6 +97,15 @@ sealed interface Value permits Value.IntegerValue, Value.BooleanValue, Value.Str
 
         @Override
         public String render() {
+            return renderList(false);
+        }
+
+        @Override
+        public String renderForDisplay() {
+            return renderList(true);
+        }
+
+        private String renderList(boolean displayMode) {
             if (elements.isEmpty()) {
                 return "()";
             }
@@ -77,7 +116,8 @@ sealed interface Value permits Value.IntegerValue, Value.BooleanValue, Value.Str
                 if (i > 0) {
                     builder.append(' ');
                 }
-                builder.append(elements.get(i).render());
+                Value element = elements.get(i);
+                builder.append(displayMode ? element.renderForDisplay() : element.render());
             }
             builder.append(')');
             return builder.toString();

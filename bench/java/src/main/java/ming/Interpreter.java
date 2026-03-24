@@ -5,6 +5,7 @@ import java.util.List;
 
 final class Interpreter {
     private final Environment global = new Environment(null);
+    private final StringBuilder output = new StringBuilder();
 
     Value evalProgram(List<Expr> program) throws EvalError {
         Value last = null;
@@ -15,6 +16,10 @@ final class Interpreter {
             throw EvalError.syntax(new SourcePos(1, 1), "empty program");
         }
         return last;
+    }
+
+    String capturedOutput() {
+        return output.toString();
     }
 
     private Value eval(Expr expr, Environment env) throws EvalError {
@@ -297,7 +302,12 @@ final class Interpreter {
         return switch (name) {
             case "+", "-", "*", "/", "<", ">", "=", "<=", "not",
                     "cons", "car", "cdr", "null?", "list", "length", "append",
-                    "string?", "number?", "boolean?", "pair?", "symbol?" ->
+                    "string?", "number?", "boolean?", "pair?", "symbol?",
+                    "display", "write", "newline",
+                    "string-append", "string-length", "substring",
+                    "string->number", "number->string",
+                    "symbol->string", "string->symbol",
+                    "string-ref", "char?" ->
                     new Value.BuiltinProcedure(name);
             default -> null;
         };
@@ -378,8 +388,44 @@ final class Interpreter {
             case "boolean?" -> predicate("boolean?", arguments, pos, value -> value instanceof Value.BooleanValue);
             case "pair?" -> predicate("pair?", arguments, pos, value -> value instanceof Value.ListValue listValue && !listValue.elements().isEmpty());
             case "symbol?" -> predicate("symbol?", arguments, pos, value -> value instanceof Value.SymbolValue);
+            case "display" -> display(arguments, pos);
+            case "write" -> write(arguments, pos);
+            case "newline" -> newline(arguments, pos);
+            case "string-append" -> stringAppend(arguments);
+            case "string-length" -> stringLength(arguments, pos);
+            case "substring" -> substring(arguments, pos);
+            case "string->number" -> stringToNumber(arguments, pos);
+            case "number->string" -> numberToString(arguments, pos);
+            case "symbol->string" -> symbolToString(arguments, pos);
+            case "string->symbol" -> stringToSymbol(arguments, pos);
+            case "string-ref" -> stringRef(arguments, pos);
+            case "char?" -> predicate("char?", arguments, pos, value -> value instanceof Value.CharacterValue);
             default -> throw new EvalError(pos, "unknown procedure: " + name);
         };
+    }
+
+    private Value display(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
+        if (arguments.size() != 1) {
+            throw EvalError.arity(pos, "display", "expected exactly 1 argument");
+        }
+        output.append(arguments.get(0).value().renderForDisplay());
+        return new Value.VoidValue();
+    }
+
+    private Value write(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
+        if (arguments.size() != 1) {
+            throw EvalError.arity(pos, "write", "expected exactly 1 argument");
+        }
+        output.append(arguments.get(0).value().render());
+        return new Value.VoidValue();
+    }
+
+    private Value newline(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
+        if (!arguments.isEmpty()) {
+            throw EvalError.arity(pos, "newline", "expected exactly 0 arguments");
+        }
+        output.append('\n');
+        return new Value.VoidValue();
     }
 
     private Value add(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
@@ -523,6 +569,87 @@ final class Interpreter {
         return new Value.ListValue(combined);
     }
 
+    private Value stringAppend(List<EvaluatedArgument> arguments) throws EvalError {
+        StringBuilder builder = new StringBuilder();
+        for (EvaluatedArgument argument : arguments) {
+            builder.append(expectString(argument, "string-append"));
+        }
+        return new Value.StringValue(builder.toString());
+    }
+
+    private Value stringLength(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
+        if (arguments.size() != 1) {
+            throw EvalError.arity(pos, "string-length", "expected exactly 1 argument");
+        }
+        return new Value.IntegerValue(expectString(arguments.get(0), "string-length").length());
+    }
+
+    private Value substring(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
+        if (arguments.size() != 3) {
+            throw EvalError.arity(pos, "substring", "expected exactly 3 arguments");
+        }
+
+        String value = expectString(arguments.get(0), "substring");
+        long start = expectInteger(arguments.get(1), "substring");
+        long end = expectInteger(arguments.get(2), "substring");
+        if (start < 0 || start > value.length()) {
+            throw new EvalError(arguments.get(1).pos(), "substring: start index out of range");
+        }
+        if (end < start || end > value.length()) {
+            throw new EvalError(arguments.get(2).pos(), "substring: end index out of range");
+        }
+
+        return new Value.StringValue(value.substring((int) start, (int) end));
+    }
+
+    private Value stringToNumber(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
+        if (arguments.size() != 1) {
+            throw EvalError.arity(pos, "string->number", "expected exactly 1 argument");
+        }
+
+        String value = expectString(arguments.get(0), "string->number");
+        try {
+            return new Value.IntegerValue(Long.parseLong(value));
+        } catch (NumberFormatException e) {
+            return new Value.BooleanValue(false);
+        }
+    }
+
+    private Value numberToString(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
+        if (arguments.size() != 1) {
+            throw EvalError.arity(pos, "number->string", "expected exactly 1 argument");
+        }
+        return new Value.StringValue(Long.toString(expectInteger(arguments.get(0), "number->string")));
+    }
+
+    private Value symbolToString(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
+        if (arguments.size() != 1) {
+            throw EvalError.arity(pos, "symbol->string", "expected exactly 1 argument");
+        }
+        return new Value.StringValue(expectSymbol(arguments.get(0), "symbol->string"));
+    }
+
+    private Value stringToSymbol(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
+        if (arguments.size() != 1) {
+            throw EvalError.arity(pos, "string->symbol", "expected exactly 1 argument");
+        }
+        return new Value.SymbolValue(expectString(arguments.get(0), "string->symbol"));
+    }
+
+    private Value stringRef(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
+        if (arguments.size() != 2) {
+            throw EvalError.arity(pos, "string-ref", "expected exactly 2 arguments");
+        }
+
+        String value = expectString(arguments.get(0), "string-ref");
+        long index = expectInteger(arguments.get(1), "string-ref");
+        if (index < 0 || index >= value.length()) {
+            throw new EvalError(arguments.get(1).pos(), "string-ref: index out of range");
+        }
+
+        return new Value.CharacterValue(value.charAt((int) index));
+    }
+
     private Value predicate(String name, List<EvaluatedArgument> arguments, SourcePos pos, ValuePredicate predicate)
             throws EvalError {
         if (arguments.size() != 1) {
@@ -544,6 +671,20 @@ final class Interpreter {
             throw EvalError.type(argument.pos(), name + " expects a non-empty list");
         }
         return listValue;
+    }
+
+    private String expectString(EvaluatedArgument argument, String name) throws EvalError {
+        if (argument.value() instanceof Value.StringValue stringValue) {
+            return stringValue.value();
+        }
+        throw EvalError.type(argument.pos(), name + " expects string arguments");
+    }
+
+    private String expectSymbol(EvaluatedArgument argument, String name) throws EvalError {
+        if (argument.value() instanceof Value.SymbolValue symbolValue) {
+            return symbolValue.name();
+        }
+        throw EvalError.type(argument.pos(), name + " expects symbol arguments");
     }
 
     private long expectInteger(EvaluatedArgument argument, String name) throws EvalError {
