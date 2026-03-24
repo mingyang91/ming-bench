@@ -45,7 +45,8 @@ public class Evaluator {
         "letrec", "letrec*", "case", "do", "when", "unless",
         "syntax-case", "syntax", "with-syntax",
         "guard", "raise", "with-exception-handler",
-        "call/cc", "call-with-current-continuation", "dynamic-wind", "case-lambda"
+        "call/cc", "call-with-current-continuation", "dynamic-wind", "case-lambda",
+        "quasiquote", "unquote", "unquote-splicing"
     );
 
     // Output buffer for display/write/newline
@@ -82,6 +83,9 @@ public class Evaluator {
 
     // Expression wrapper with source position
     record Located(Object value, int line, int col) {}
+
+    // Dotted list from parser: (a b . c) => elements=[a, b], tail=c
+    record DottedList(List<Object> elements, Object tail) {}
 
     public String evalStr(String input) throws EvalError {
         List<Token> tokens = tokenize(input);
@@ -169,6 +173,19 @@ public class Evaluator {
                 tokens.add(new Token("'", line, col));
                 i++;
                 col++;
+            } else if (c == '`') {
+                tokens.add(new Token("`", line, col));
+                i++;
+                col++;
+            } else if (c == ',') {
+                int startCol = col;
+                i++; col++;
+                if (i < input.length() && input.charAt(i) == '@') {
+                    tokens.add(new Token(",@", line, startCol));
+                    i++; col++;
+                } else {
+                    tokens.add(new Token(",", line, startCol));
+                }
             } else if (c == '(') {
                 tokens.add(new Token("(", line, col));
                 i++;
@@ -220,6 +237,9 @@ public class Evaluator {
                         i += 2; col += 2;
                     } else if (next == '\'') {
                         tokens.add(new Token("#'", line, startCol));
+                        i += 2; col += 2;
+                    } else if (next == '(') {
+                        tokens.add(new Token("#(", line, startCol));
                         i += 2; col += 2;
                     } else if (next == '\\') {
                         // Character literal: #\x, #\space, #\newline, #\tab
@@ -309,6 +329,33 @@ public class Evaluator {
             quoteExpr.add(rawQuoted);
             return new Located(quoteExpr, token.line(), token.col());
         }
+        if (token.value().equals("`")) {
+            pos[0]++;
+            Object quoted = parse(tokens, pos);
+            Object rawQuoted = quoted instanceof Located loc ? loc.value() : quoted;
+            List<Object> qqExpr = new ArrayList<>();
+            qqExpr.add("quasiquote");
+            qqExpr.add(rawQuoted);
+            return new Located(qqExpr, token.line(), token.col());
+        }
+        if (token.value().equals(",")) {
+            pos[0]++;
+            Object unq = parse(tokens, pos);
+            Object rawUnq = unq instanceof Located loc ? loc.value() : unq;
+            List<Object> uqExpr = new ArrayList<>();
+            uqExpr.add("unquote");
+            uqExpr.add(rawUnq);
+            return new Located(uqExpr, token.line(), token.col());
+        }
+        if (token.value().equals(",@")) {
+            pos[0]++;
+            Object unq = parse(tokens, pos);
+            Object rawUnq = unq instanceof Located loc ? loc.value() : unq;
+            List<Object> usExpr = new ArrayList<>();
+            usExpr.add("unquote-splicing");
+            usExpr.add(rawUnq);
+            return new Located(usExpr, token.line(), token.col());
+        }
         if (token.value().equals("#'")) {
             pos[0]++;
             Object synExpr = parse(tokens, pos);
@@ -318,16 +365,41 @@ public class Evaluator {
             syntaxExpr.add(rawSynExpr);
             return new Located(syntaxExpr, token.line(), token.col());
         }
+        if (token.value().equals("#(")) {
+            pos[0]++;
+            List<Object> elems = new ArrayList<>();
+            while (pos[0] < tokens.size() && !tokens.get(pos[0]).value().equals(")")) {
+                elems.add(parse(tokens, pos));
+            }
+            if (pos[0] >= tokens.size()) {
+                throw new EvalError(token.line() + ":" + token.col() + " missing closing parenthesis for vector literal");
+            }
+            pos[0]++;
+            Object[] arr = elems.toArray();
+            return new Located(new SchemeVector(arr), token.line(), token.col());
+        }
         if (token.value().equals("(")) {
             pos[0]++;
             List<Object> list = new ArrayList<>();
+            Object dotTail = null;
             while (pos[0] < tokens.size() && !tokens.get(pos[0]).value().equals(")")) {
+                // Check for dotted pair notation
+                if (pos[0] < tokens.size() && ".".equals(tokens.get(pos[0]).value())) {
+                    // Peek: is this a lone dot (i.e., not part of a longer symbol like "...")?
+                    pos[0]++; // skip the dot
+                    dotTail = parse(tokens, pos);
+                    break;
+                }
                 list.add(parse(tokens, pos));
             }
             if (pos[0] >= tokens.size()) {
                 throw new EvalError(token.line() + ":" + token.col() + " missing closing parenthesis");
             }
             pos[0]++;
+            if (dotTail != null) {
+                // Build improper list as DottedList marker
+                return new Located(new DottedList(list, dotTail), token.line(), token.col());
+            }
             return new Located(list, token.line(), token.col());
         } else if (token.value().equals(")")) {
             throw new EvalError(token.line() + ":" + token.col() + " unexpected )");
@@ -343,6 +415,20 @@ public class Evaluator {
         if (datum instanceof Located loc) {
             return listToConsCells(loc.value());
         }
+        if (datum instanceof DottedList dl) {
+            Object result = listToConsCells(dl.tail());
+            for (int i = dl.elements().size() - 1; i >= 0; i--) {
+                result = new Pair(listToConsCells(dl.elements().get(i)), result);
+            }
+            return result;
+        }
+        if (datum instanceof SchemeVector vec) {
+            Object[] elems = new Object[vec.length()];
+            for (int i = 0; i < vec.length(); i++) {
+                elems[i] = listToConsCells(vec.ref(i));
+            }
+            return new SchemeVector(elems);
+        }
         if (datum instanceof List<?> list) {
             Object result = NIL;
             for (int i = list.size() - 1; i >= 0; i--) {
@@ -351,6 +437,122 @@ public class Evaluator {
             return result;
         }
         return datum;
+    }
+
+    // --- Quasiquote expansion ---
+
+    private Object expandQuasiquote(Object tmpl, Environment env, int depth) throws EvalError {
+        if (tmpl instanceof Located loc) tmpl = loc.value();
+
+        if (tmpl instanceof List<?> list) {
+            if (!list.isEmpty()) {
+                Object h = list.get(0);
+                if (h instanceof Located loc) h = loc.value();
+                if ("unquote".equals(h)) {
+                    if (list.size() != 2) throw error("unquote: expected 1 argument");
+                    if (depth == 0) {
+                        return eval(list.get(1), env);
+                    } else {
+                        // Nested unquote: decrease depth
+                        Object inner = expandQuasiquote(list.get(1), env, depth - 1);
+                        return new Pair("unquote", new Pair(inner, NIL));
+                    }
+                }
+                if ("quasiquote".equals(h)) {
+                    if (list.size() != 2) throw error("quasiquote: expected 1 argument");
+                    Object inner = expandQuasiquote(list.get(1), env, depth + 1);
+                    return new Pair("quasiquote", new Pair(inner, NIL));
+                }
+            }
+            // Process list elements, handling unquote-splicing
+            Object result = NIL;
+            List<Object> expanded = new ArrayList<>();
+            for (int i = 0; i < list.size(); i++) {
+                Object elem = list.get(i);
+                Object rawElem = elem instanceof Located loc ? loc.value() : elem;
+                if (rawElem instanceof List<?> subList && !subList.isEmpty()) {
+                    Object subHead = subList.get(0);
+                    if (subHead instanceof Located loc) subHead = loc.value();
+                    if ("unquote-splicing".equals(subHead) && depth == 0) {
+                        if (subList.size() != 2) throw error("unquote-splicing: expected 1 argument");
+                        Object spliced = eval(subList.get(1), env);
+                        // spliced should be a list — append its elements
+                        while (spliced instanceof Pair p) {
+                            expanded.add(p.car);
+                            spliced = p.cdr;
+                        }
+                        continue;
+                    }
+                    if ("unquote-splicing".equals(subHead) && depth > 0) {
+                        Object inner = expandQuasiquote(subList.get(1), env, depth - 1);
+                        expanded.add(new Pair("unquote-splicing", new Pair(inner, NIL)));
+                        continue;
+                    }
+                }
+                expanded.add(expandQuasiquote(elem, env, depth));
+            }
+            // Check if original list had a dot pair (improper list)
+            // For now, build a proper list from expanded elements
+            for (int i = expanded.size() - 1; i >= 0; i--) {
+                result = new Pair(expanded.get(i), result);
+            }
+            return result;
+        }
+
+        if (tmpl instanceof DottedList dl) {
+            // Expand elements and tail
+            Object result = expandQuasiquote(dl.tail(), env, depth);
+            for (int i = dl.elements().size() - 1; i >= 0; i--) {
+                Object elem = dl.elements().get(i);
+                Object rawElem = elem instanceof Located loc ? loc.value() : elem;
+                if (rawElem instanceof List<?> subList && !subList.isEmpty()) {
+                    Object subHead = subList.get(0);
+                    if (subHead instanceof Located loc) subHead = loc.value();
+                    if ("unquote-splicing".equals(subHead) && depth == 0) {
+                        if (subList.size() != 2) throw error("unquote-splicing: expected 1 argument");
+                        Object spliced = eval(subList.get(1), env);
+                        // Append spliced list in front of result
+                        List<Object> splicedElems = new ArrayList<>();
+                        while (spliced instanceof Pair p) {
+                            splicedElems.add(p.car);
+                            spliced = p.cdr;
+                        }
+                        for (int j = splicedElems.size() - 1; j >= 0; j--) {
+                            result = new Pair(splicedElems.get(j), result);
+                        }
+                        continue;
+                    }
+                }
+                result = new Pair(expandQuasiquote(elem, env, depth), result);
+            }
+            return result;
+        }
+
+        if (tmpl instanceof SchemeVector vec) {
+            List<Object> expanded = new ArrayList<>();
+            for (int i = 0; i < vec.length(); i++) {
+                Object elem = vec.ref(i);
+                Object rawElem = elem instanceof Located loc ? loc.value() : elem;
+                if (rawElem instanceof List<?> subList && !subList.isEmpty()) {
+                    Object subHead = subList.get(0);
+                    if (subHead instanceof Located loc) subHead = loc.value();
+                    if ("unquote-splicing".equals(subHead) && depth == 0) {
+                        if (subList.size() != 2) throw error("unquote-splicing: expected 1 argument");
+                        Object spliced = eval(subList.get(1), env);
+                        while (spliced instanceof Pair p) {
+                            expanded.add(p.car);
+                            spliced = p.cdr;
+                        }
+                        continue;
+                    }
+                }
+                expanded.add(expandQuasiquote(elem, env, depth));
+            }
+            return new SchemeVector(expanded.toArray());
+        }
+
+        // Atom: just convert to cons cells (handles strings, numbers, booleans, symbols, chars)
+        return listToConsCells(tmpl);
     }
 
     // --- Evaluator (with trampoline TCO) ---
@@ -374,7 +576,7 @@ public class Evaluator {
             continue;
         }
 
-        if (expr instanceof Long || expr instanceof Double || expr instanceof Rational || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
+        if (expr instanceof Long || expr instanceof Double || expr instanceof Rational || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar || expr instanceof SchemeVector) {
             return expr;
         }
         if (expr instanceof String symbol) {
@@ -431,6 +633,10 @@ public class Evaluator {
                         if (list.size() != 2) throw error("quote: expected 1 argument");
                         return listToConsCells(list.get(1));
                     }
+                    case "quasiquote" -> {
+                        if (list.size() != 2) throw error("quasiquote: expected 1 argument");
+                        return expandQuasiquote(list.get(1), env, 0);
+                    }
                     case "lambda" -> { return evalLambda(list, env); }
                     case "begin" -> {
                         // TCO: eval all but last, tail-call last
@@ -476,6 +682,13 @@ public class Evaluator {
                             Object testVal = eval(test, env);
                             if (!Boolean.FALSE.equals(testVal)) {
                                 if (cl.size() == 1) return testVal;
+                                // Check for => form: (test => proc)
+                                Object second = cl.get(1);
+                                if (second instanceof Located loc2) second = loc2.value();
+                                if ("=>".equals(second) && cl.size() == 3) {
+                                    Object proc = eval(cl.get(2), env);
+                                    return apply(proc, List.of(testVal));
+                                }
                                 for (int j = 1; j < cl.size() - 1; j++) {
                                     eval(cl.get(j), env);
                                 }
@@ -1134,67 +1347,82 @@ public class Evaluator {
     private Object evalDefine(List<?> list, Environment env) throws EvalError {
         if (list.size() < 3) throw error("define: bad syntax");
         Object target = list.get(1);
-        // Unwrap Located
         if (target instanceof Located loc) target = loc.value();
         if (target instanceof String name) {
             Object val = eval(list.get(2), env);
             env.define(name, val);
             return VOID;
         }
-        if (target instanceof List<?> sig) {
-            // Unwrap Located elements in signature
+        // (define (name params...) body) or (define (name params... . rest) body)
+        String name;
+        List<String> params = new ArrayList<>();
+        String restParam = null;
+        if (target instanceof DottedList dl) {
+            Object first = dl.elements().isEmpty() ? null : dl.elements().get(0);
+            if (first instanceof Located loc) first = loc.value();
+            if (!(first instanceof String n)) throw error("define: bad syntax");
+            name = n;
+            for (int i = 1; i < dl.elements().size(); i++) {
+                Object p = dl.elements().get(i);
+                if (p instanceof Located loc) p = loc.value();
+                if (!(p instanceof String s)) throw error("define: bad parameter");
+                params.add(s);
+            }
+            Object tail = dl.tail();
+            if (tail instanceof Located loc) tail = loc.value();
+            if (!(tail instanceof String rest)) throw error("define: bad rest parameter");
+            restParam = rest;
+        } else if (target instanceof List<?> sig) {
             Object first = sig.isEmpty() ? null : sig.get(0);
             if (first instanceof Located loc) first = loc.value();
-            if (sig.isEmpty() || !(first instanceof String name)) {
-                throw error("define: bad syntax");
-            }
-            List<String> params = new ArrayList<>();
-            String restParam = null;
+            if (sig.isEmpty() || !(first instanceof String n)) throw error("define: bad syntax");
+            name = n;
             for (int i = 1; i < sig.size(); i++) {
                 Object p = sig.get(i);
                 if (p instanceof Located loc) p = loc.value();
                 if (!(p instanceof String s)) throw error("define: bad parameter");
-                if (s.equals(".")) {
-                    if (i + 1 >= sig.size()) throw error("define: missing rest parameter after dot");
-                    Object rp = sig.get(i + 1);
-                    if (rp instanceof Located loc) rp = loc.value();
-                    if (!(rp instanceof String rest)) throw error("define: bad rest parameter");
-                    restParam = rest;
-                    break;
-                }
                 params.add(s);
             }
-            List<Object> body = new ArrayList<>();
-            for (int i = 2; i < list.size(); i++) {
-                body.add(list.get(i));
-            }
-            Lambda lambda = new Lambda(params, restParam, body, env);
-            env.define(name, lambda);
-            return VOID;
+        } else {
+            throw error("define: bad syntax");
         }
-        throw error("define: bad syntax");
+        List<Object> body = new ArrayList<>();
+        for (int i = 2; i < list.size(); i++) {
+            body.add(list.get(i));
+        }
+        Lambda lambda = new Lambda(params, restParam, body, env);
+        env.define(name, lambda);
+        return VOID;
     }
 
     private Object evalLambda(List<?> list, Environment env) throws EvalError {
         if (list.size() < 3) throw error("lambda: bad syntax");
         Object paramList = list.get(1);
         if (paramList instanceof Located loc) paramList = loc.value();
-        if (!(paramList instanceof List<?> plist)) throw error("lambda: bad parameters");
         List<String> params = new ArrayList<>();
         String restParam = null;
-        for (int i = 0; i < plist.size(); i++) {
-            Object p = plist.get(i);
-            if (p instanceof Located loc) p = loc.value();
-            if (!(p instanceof String s)) throw error("lambda: bad parameter");
-            if (s.equals(".")) {
-                if (i + 1 >= plist.size()) throw error("lambda: missing rest parameter after dot");
-                Object rp = plist.get(i + 1);
-                if (rp instanceof Located loc) rp = loc.value();
-                if (!(rp instanceof String rest)) throw error("lambda: bad rest parameter");
-                restParam = rest;
-                break;
+        if (paramList instanceof DottedList dl) {
+            for (Object p : dl.elements()) {
+                if (p instanceof Located loc) p = loc.value();
+                if (!(p instanceof String s)) throw error("lambda: bad parameter");
+                params.add(s);
             }
-            params.add(s);
+            Object tail = dl.tail();
+            if (tail instanceof Located loc) tail = loc.value();
+            if (!(tail instanceof String rest)) throw error("lambda: bad rest parameter");
+            restParam = rest;
+        } else if (paramList instanceof String sym) {
+            // (lambda args body) — single rest param
+            restParam = sym;
+        } else if (paramList instanceof List<?> plist) {
+            for (int i = 0; i < plist.size(); i++) {
+                Object p = plist.get(i);
+                if (p instanceof Located loc) p = loc.value();
+                if (!(p instanceof String s)) throw error("lambda: bad parameter");
+                params.add(s);
+            }
+        } else {
+            throw error("lambda: bad parameters");
         }
         List<Object> body = new ArrayList<>();
         for (int i = 2; i < list.size(); i++) {
@@ -1214,22 +1442,27 @@ public class Evaluator {
             }
             Object paramList = cl.get(0);
             if (paramList instanceof Located loc) paramList = loc.value();
-            if (!(paramList instanceof List<?> plist)) throw error("case-lambda: bad parameters");
             List<String> params = new ArrayList<>();
             String restParam = null;
-            for (int j = 0; j < plist.size(); j++) {
-                Object p = plist.get(j);
-                if (p instanceof Located loc) p = loc.value();
-                if (!(p instanceof String s)) throw error("case-lambda: bad parameter");
-                if (s.equals(".")) {
-                    if (j + 1 >= plist.size()) throw error("case-lambda: missing rest parameter after dot");
-                    Object rp = plist.get(j + 1);
-                    if (rp instanceof Located loc) rp = loc.value();
-                    if (!(rp instanceof String rest)) throw error("case-lambda: bad rest parameter");
-                    restParam = rest;
-                    break;
+            if (paramList instanceof DottedList dl) {
+                for (Object p : dl.elements()) {
+                    if (p instanceof Located loc) p = loc.value();
+                    if (!(p instanceof String s)) throw error("case-lambda: bad parameter");
+                    params.add(s);
                 }
-                params.add(s);
+                Object tail = dl.tail();
+                if (tail instanceof Located loc) tail = loc.value();
+                if (!(tail instanceof String rest)) throw error("case-lambda: bad rest parameter");
+                restParam = rest;
+            } else if (paramList instanceof List<?> plist) {
+                for (int j = 0; j < plist.size(); j++) {
+                    Object p = plist.get(j);
+                    if (p instanceof Located loc) p = loc.value();
+                    if (!(p instanceof String s)) throw error("case-lambda: bad parameter");
+                    params.add(s);
+                }
+            } else {
+                throw error("case-lambda: bad parameters");
             }
             List<Object> body = new ArrayList<>();
             for (int j = 1; j < cl.size(); j++) {
@@ -1484,6 +1717,18 @@ public class Evaluator {
 
     private Object unwrapDeep(Object obj) {
         if (obj instanceof Located loc) return unwrapDeep(loc.value());
+        if (obj instanceof DottedList dl) {
+            List<Object> elems = new ArrayList<>();
+            for (Object item : dl.elements()) elems.add(unwrapDeep(item));
+            return new DottedList(elems, unwrapDeep(dl.tail()));
+        }
+        if (obj instanceof SchemeVector vec) {
+            Object[] elems = new Object[vec.length()];
+            for (int i = 0; i < vec.length(); i++) {
+                elems[i] = unwrapDeep(vec.ref(i));
+            }
+            return new SchemeVector(elems);
+        }
         if (obj instanceof List<?> list) {
             List<Object> result = new ArrayList<>();
             for (Object item : list) result.add(unwrapDeep(item));
@@ -1606,6 +1851,7 @@ public class Evaluator {
         return true;
     }
 
+    @SuppressWarnings("unchecked")
     private boolean matchOne(Object pattern, Object input,
             Map<String, Object> bindings, List<String> literals, Set<String> ellipsisVars) {
         if (pattern instanceof String sym) {
@@ -1613,6 +1859,26 @@ public class Evaluator {
             if (literals.contains(sym)) return sym.equals(input);
             bindings.put(sym, input);
             return true;
+        }
+        if (pattern instanceof DottedList dl) {
+            // Pattern like (a b . rest) — match elements, then bind rest to remaining
+            if (!(input instanceof List<?> inList)) return false;
+            if (inList.size() < dl.elements().size()) return false;
+            for (int i = 0; i < dl.elements().size(); i++) {
+                if (!matchOne(dl.elements().get(i), inList.get(i), bindings, literals, ellipsisVars))
+                    return false;
+            }
+            // Remaining input elements become a list bound to the tail pattern
+            List<Object> remaining = new ArrayList<>(inList.subList(dl.elements().size(), inList.size()));
+            return matchOne(dl.tail(), remaining, bindings, literals, ellipsisVars);
+        }
+        if (pattern instanceof SchemeVector patVec) {
+            if (!(input instanceof SchemeVector inVec)) return false;
+            List<Object> patElems = new ArrayList<>();
+            for (int i = 0; i < patVec.length(); i++) patElems.add(patVec.ref(i));
+            List<Object> inElems = new ArrayList<>();
+            for (int i = 0; i < inVec.length(); i++) inElems.add(inVec.ref(i));
+            return matchPattern(patElems, inElems, bindings, literals, ellipsisVars);
         }
         if (pattern instanceof List<?> patList) {
             if (!(input instanceof List<?> inList)) return false;
@@ -1626,6 +1892,11 @@ public class Evaluator {
         if (pattern instanceof String sym) {
             if (!"_".equals(sym) && !"...".equals(sym) && !literals.contains(sym))
                 vars.add(sym);
+        } else if (pattern instanceof DottedList dl) {
+            for (Object item : dl.elements()) collectPatternVars(item, vars, literals);
+            collectPatternVars(dl.tail(), vars, literals);
+        } else if (pattern instanceof SchemeVector vec) {
+            for (int i = 0; i < vec.length(); i++) collectPatternVars(vec.ref(i), vars, literals);
         } else if (pattern instanceof List<?> list) {
             for (Object item : list) collectPatternVars(item, vars, literals);
         }
@@ -1633,6 +1904,13 @@ public class Evaluator {
 
     private void collectSymbols(Object template, Set<String> syms) {
         if (template instanceof String s) { syms.add(s); }
+        else if (template instanceof DottedList dl) {
+            for (Object item : dl.elements()) collectSymbols(item, syms);
+            collectSymbols(dl.tail(), syms);
+        }
+        else if (template instanceof SchemeVector vec) {
+            for (int i = 0; i < vec.length(); i++) collectSymbols(vec.ref(i), syms);
+        }
         else if (template instanceof List<?> list) {
             // Don't collect symbols inside (quote ...) — they're literal data
             if (!list.isEmpty() && "quote".equals(list.get(0))) return;
@@ -1647,6 +1925,64 @@ public class Evaluator {
             if (bindings.containsKey(sym) && !ellipsisVars.contains(sym)) return bindings.get(sym);
             if (renameMap.containsKey(sym)) return renameMap.get(sym);
             return sym;
+        }
+        if (template instanceof DottedList dl) {
+            List<Object> expandedElems = new ArrayList<>();
+            for (int i = 0; i < dl.elements().size(); i++) {
+                Object elem = dl.elements().get(i);
+                if (i + 1 < dl.elements().size() && "...".equals(dl.elements().get(i + 1))) {
+                    Set<String> subEllipsis = new HashSet<>();
+                    collectSymbols(elem, subEllipsis);
+                    subEllipsis.retainAll(ellipsisVars);
+                    if (!subEllipsis.isEmpty()) {
+                        String firstVar = subEllipsis.iterator().next();
+                        List<Object> varValues = (List<Object>) bindings.get(firstVar);
+                        int count = varValues.size();
+                        for (int j = 0; j < count; j++) {
+                            Map<String, Object> iterBindings = new HashMap<>(bindings);
+                            for (String ev : subEllipsis) {
+                                iterBindings.put(ev, ((List<Object>) bindings.get(ev)).get(j));
+                            }
+                            Set<String> noEllipsis = new HashSet<>(ellipsisVars);
+                            noEllipsis.removeAll(subEllipsis);
+                            expandedElems.add(expandTemplate(elem, iterBindings, noEllipsis, renameMap));
+                        }
+                    }
+                    i++;
+                    continue;
+                }
+                expandedElems.add(expandTemplate(elem, bindings, ellipsisVars, renameMap));
+            }
+            Object expandedTail = expandTemplate(dl.tail(), bindings, ellipsisVars, renameMap);
+            return new DottedList(expandedElems, expandedTail);
+        }
+        if (template instanceof SchemeVector vec) {
+            List<Object> result = new ArrayList<>();
+            for (int i = 0; i < vec.length(); i++) {
+                if (i + 1 < vec.length() && "...".equals(vec.ref(i + 1))) {
+                    Set<String> subEllipsis = new HashSet<>();
+                    collectSymbols(vec.ref(i), subEllipsis);
+                    subEllipsis.retainAll(ellipsisVars);
+                    if (!subEllipsis.isEmpty()) {
+                        String firstVar = subEllipsis.iterator().next();
+                        List<Object> varValues = (List<Object>) bindings.get(firstVar);
+                        int count = varValues.size();
+                        for (int j = 0; j < count; j++) {
+                            Map<String, Object> iterBindings = new HashMap<>(bindings);
+                            for (String ev : subEllipsis) {
+                                iterBindings.put(ev, ((List<Object>) bindings.get(ev)).get(j));
+                            }
+                            Set<String> noEllipsis = new HashSet<>(ellipsisVars);
+                            noEllipsis.removeAll(subEllipsis);
+                            result.add(expandTemplate(vec.ref(i), iterBindings, noEllipsis, renameMap));
+                        }
+                    }
+                    i++;
+                    continue;
+                }
+                result.add(expandTemplate(vec.ref(i), bindings, ellipsisVars, renameMap));
+            }
+            return new SchemeVector(result.toArray());
         }
         if (template instanceof List<?> list) {
             List<Object> result = new ArrayList<>();
@@ -2856,6 +3192,65 @@ public class Evaluator {
             }
             return apply(consumer, vals);
         });
+
+        globalEnv.define("number->string", (BuiltinProc) args -> {
+            if (args.size() < 1 || args.size() > 2) throw error("number->string: expected 1-2 arguments");
+            Object num = args.get(0);
+            int radix = 10;
+            if (args.size() == 2) {
+                if (!(args.get(1) instanceof Long r)) throw error("number->string: radix must be integer");
+                radix = r.intValue();
+            }
+            if (num instanceof Long l) {
+                return new SchemeString(Long.toString(l, radix), false);
+            } else if (num instanceof Double d) {
+                return new SchemeString(Double.toString(d), false);
+            } else if (num instanceof Rational rat) {
+                return new SchemeString(rat.toString(), false);
+            }
+            throw error("number->string: not a number");
+        });
+
+        globalEnv.define("string->number", (BuiltinProc) args -> {
+            if (args.size() < 1 || args.size() > 2) throw error("string->number: expected 1-2 arguments");
+            if (!(args.get(0) instanceof SchemeString s)) throw error("string->number: expected string");
+            int radix = 10;
+            if (args.size() == 2) {
+                if (!(args.get(1) instanceof Long r)) throw error("string->number: radix must be integer");
+                radix = r.intValue();
+            }
+            try {
+                return Long.parseLong(s.value(), radix);
+            } catch (NumberFormatException e) {
+                try {
+                    return Double.parseDouble(s.value());
+                } catch (NumberFormatException e2) {
+                    return Boolean.FALSE;
+                }
+            }
+        });
+
+        globalEnv.define("char->integer", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("char->integer: expected 1 argument");
+            if (!(args.get(0) instanceof SchemeChar c)) throw error("char->integer: not a character");
+            return (long) c.value();
+        });
+
+        globalEnv.define("integer->char", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("integer->char: expected 1 argument");
+            if (!(args.get(0) instanceof Long n)) throw error("integer->char: not an integer");
+            return new SchemeChar((char) n.intValue());
+        });
+
+        globalEnv.define("error", (BuiltinProc) args -> {
+            if (args.isEmpty()) throw error("error");
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < args.size(); i++) {
+                if (i > 0) sb.append(" ");
+                sb.append(schemeToString(args.get(i)));
+            }
+            throw error(sb.toString());
+        });
     }
 
     // Convert any numeric value to Rational
@@ -2944,31 +3339,36 @@ public class Evaluator {
     }
 
     private Object cmp(List<Object> args, String op) throws EvalError {
-        if (args.size() != 2) throw error(op + ": expected 2 arguments");
-        Object a = args.get(0), b = args.get(1);
-        if (!isNumber(a) || !isNumber(b)) throw error(op + ": not a number");
-        // If both exact, compare as rationals to avoid floating point issues
-        if (isExact(a) && isExact(b)) {
-            Rational ra = toRational(a), rb = toRational(b);
-            long diff = ra.numerator() * rb.denominator() - rb.numerator() * ra.denominator();
-            return switch (op) {
-                case "<" -> diff < 0;
-                case ">" -> diff > 0;
-                case "=" -> diff == 0;
-                case "<=" -> diff <= 0;
-                case ">=" -> diff >= 0;
-                default -> false;
-            };
+        if (args.size() < 2) throw error(op + ": expected at least 2 arguments");
+        for (int i = 0; i < args.size() - 1; i++) {
+            Object a = args.get(i), b = args.get(i + 1);
+            if (!isNumber(a) || !isNumber(b)) throw error(op + ": not a number");
+            boolean result;
+            if (isExact(a) && isExact(b)) {
+                Rational ra = toRational(a), rb = toRational(b);
+                long diff = ra.numerator() * rb.denominator() - rb.numerator() * ra.denominator();
+                result = switch (op) {
+                    case "<" -> diff < 0;
+                    case ">" -> diff > 0;
+                    case "=" -> diff == 0;
+                    case "<=" -> diff <= 0;
+                    case ">=" -> diff >= 0;
+                    default -> false;
+                };
+            } else {
+                double da = toDouble(a), db = toDouble(b);
+                result = switch (op) {
+                    case "<" -> da < db;
+                    case ">" -> da > db;
+                    case "=" -> da == db;
+                    case "<=" -> da <= db;
+                    case ">=" -> da >= db;
+                    default -> false;
+                };
+            }
+            if (!result) return Boolean.FALSE;
         }
-        double da = toDouble(a), db = toDouble(b);
-        return switch (op) {
-            case "<" -> da < db;
-            case ">" -> da > db;
-            case "=" -> da == db;
-            case "<=" -> da <= db;
-            case ">=" -> da >= db;
-            default -> false;
-        };
+        return Boolean.TRUE;
     }
 
     private void checkArgs(List<?> list, int expected, String name) throws EvalError {
