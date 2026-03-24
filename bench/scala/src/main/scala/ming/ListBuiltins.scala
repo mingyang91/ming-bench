@@ -23,7 +23,8 @@ object ListBuiltins:
         case Nil            => b
         case Pair(car, cdr) => Pair(car, appendTwo(cdr, b))
         case _              => throw new EvalError("append: not a proper list")
-      args.foldRight(Nil: Val)((a, acc) => appendTwo(a, acc))
+      if args.isEmpty then Nil
+      else args.init.foldRight(args.last)((a, acc) => appendTwo(a, acc))
     },
     "reverse" -> Builtin {
       case List(lst) =>

@@ -156,7 +156,9 @@ object Evaluator:
       case Symbol(name) =>
         k(env.lookup(name).getOrElse(error(s"unbound variable: $name")))
       case Pair(Symbol("quote"), Pair(datum, Nil)) => k(datum)
-      case Pair(Symbol("define"), rest)            => SpecialForms.evalDefineK(rest, env, k)
+      case Pair(Symbol("quasiquote"), Pair(template, Nil)) =>
+        Quasiquote.evalQuasiquoteK(template, env, k)
+      case Pair(Symbol("define"), rest) => SpecialForms.evalDefineK(rest, env, k)
       case Pair(Symbol("set!"), Pair(Symbol(name), Pair(valueExpr, Nil))) =>
         evalK(
           valueExpr,

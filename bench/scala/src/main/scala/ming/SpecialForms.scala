@@ -58,8 +58,11 @@ private[ming] object SpecialForms:
               env,
               v =>
                 if v != Bool(false) then
-                  if clauseList.tail.isEmpty then k(v)
-                  else Evaluator.evalSeqK(clauseList.tail, env, k)
+                  clauseList.tail match
+                    case Symbol("=>") :: procExpr :: scala.Nil =>
+                      Evaluator.evalK(procExpr, env, proc => Evaluator.applyK(proc, List(v), k))
+                    case scala.Nil => k(v)
+                    case _         => Evaluator.evalSeqK(clauseList.tail, env, k)
                 else BMore(() => evalCondK(rest, env, k))
             )
       case _ => Evaluator.error("bad cond syntax")

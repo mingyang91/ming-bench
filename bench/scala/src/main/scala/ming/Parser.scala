@@ -48,6 +48,19 @@ private[ming] class Parser(input: String):
         advance()
         val e = parseExpr()
         Pair(Symbol("quote"), Pair(e, Nil))
+      case '`' =>
+        advance()
+        val e = parseExpr()
+        Pair(Symbol("quasiquote"), Pair(e, Nil))
+      case ',' =>
+        advance()
+        if pos < input.length && input(pos) == '@' then
+          advance()
+          val e = parseExpr()
+          Pair(Symbol("unquote-splicing"), Pair(e, Nil))
+        else
+          val e = parseExpr()
+          Pair(Symbol("unquote"), Pair(e, Nil))
       case '"' =>
         parseString()
       case '#' =>
