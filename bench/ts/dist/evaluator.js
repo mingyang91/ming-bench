@@ -6,6 +6,9 @@ function strContent(v) {
     return v.chars ? v.chars.join('') : v.value;
 }
 function listToConsPairs(lst) {
+    if (lst.tag === 'pair') {
+        return { tag: 'pair', car: listToConsPairs(lst.car), cdr: listToConsPairs(lst.cdr) };
+    }
     if (lst.tag !== 'list')
         return lst;
     let result = NIL;
@@ -105,6 +108,22 @@ function tokenize(input) {
             advance();
             continue;
         }
+        if (ch === '`') {
+            tokens.push({ type: 'quasiquote', value: '`', line: tokLine, col: tokCol });
+            advance();
+            continue;
+        }
+        if (ch === ',') {
+            advance();
+            if (i < input.length && input[i] === '@') {
+                tokens.push({ type: 'unquote-splicing', value: ',@', line: tokLine, col: tokCol });
+                advance();
+            }
+            else {
+                tokens.push({ type: 'unquote', value: ',', line: tokLine, col: tokCol });
+            }
+            continue;
+        }
         if (ch === '"') {
             let s = '';
             advance(); // skip opening quote
@@ -201,6 +220,21 @@ function parse(tokens) {
             pos++;
             const inner = parseExpr();
             return { tag: 'list', value: [{ tag: 'symbol', value: 'syntax', pos: p }, inner], pos: p };
+        }
+        if (tok.type === 'quasiquote') {
+            pos++;
+            const inner = parseExpr();
+            return { tag: 'list', value: [{ tag: 'symbol', value: 'quasiquote', pos: p }, inner], pos: p };
+        }
+        if (tok.type === 'unquote') {
+            pos++;
+            const inner = parseExpr();
+            return { tag: 'list', value: [{ tag: 'symbol', value: 'unquote', pos: p }, inner], pos: p };
+        }
+        if (tok.type === 'unquote-splicing') {
+            pos++;
+            const inner = parseExpr();
+            return { tag: 'list', value: [{ tag: 'symbol', value: 'unquote-splicing', pos: p }, inner], pos: p };
         }
         if (tok.type === 'string') {
             pos++;
@@ -1364,6 +1398,63 @@ function makeGlobalEnv(outputBuf) {
             }
             return { tag: 'boolean', value: false };
         } });
+    // memq (uses eq?)
+    env.set('memq', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 2)
+                throw new EvalError('memq requires exactly 2 arguments');
+            let cur = args[1];
+            while (cur.tag === 'pair') {
+                if (args[0] === cur.car || schemeEqv(args[0], cur.car) && (args[0].tag === 'symbol' || args[0].tag === 'boolean' || args[0].tag === 'char'))
+                    return cur;
+                if (args[0].tag === 'symbol' && cur.car.tag === 'symbol' && args[0].value === cur.car.value)
+                    return cur;
+                if (args[0].tag === 'boolean' && cur.car.tag === 'boolean' && args[0].value === cur.car.value)
+                    return cur;
+                if (args[0].tag === 'number' && cur.car.tag === 'number' && args[0].value === cur.car.value)
+                    return cur;
+                if (args[0].tag === 'char' && cur.car.tag === 'char' && args[0].value === cur.car.value)
+                    return cur;
+                cur = cur.cdr;
+            }
+            return { tag: 'boolean', value: false };
+        } });
+    // memv (uses eqv?)
+    env.set('memv', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 2)
+                throw new EvalError('memv requires exactly 2 arguments');
+            let cur = args[1];
+            while (cur.tag === 'pair') {
+                if (schemeEqv(args[0], cur.car))
+                    return cur;
+                cur = cur.cdr;
+            }
+            return { tag: 'boolean', value: false };
+        } });
+    // assq (uses eq?)
+    env.set('assq', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 2)
+                throw new EvalError('assq requires exactly 2 arguments');
+            const key = args[0];
+            let cur = args[1];
+            while (cur.tag === 'pair') {
+                const entry = cur.car;
+                if (entry.tag === 'pair') {
+                    const k = entry.car;
+                    if (key === k)
+                        return entry;
+                    if (key.tag === 'symbol' && k.tag === 'symbol' && key.value === k.value)
+                        return entry;
+                    if (key.tag === 'boolean' && k.tag === 'boolean' && key.value === k.value)
+                        return entry;
+                    if (key.tag === 'number' && k.tag === 'number' && key.value === k.value)
+                        return entry;
+                    if (key.tag === 'char' && k.tag === 'char' && key.value === k.value)
+                        return entry;
+                }
+                cur = cur.cdr;
+            }
+            return { tag: 'boolean', value: false };
+        } });
     // gcd (as builtin procedure)
     env.set('gcd', { tag: 'procedure', value: (...args) => {
             if (args.length === 0)
@@ -1867,6 +1958,92 @@ function resolveSymbol(name, env, pos) {
         throw errAt(`unbound variable: ${name}`, pos);
     }
 }
+function expandQuasiquote(tmpl, depth, env, k) {
+    if (tmpl.tag === 'list' && tmpl.value.length === 2 && tmpl.value[0].tag === 'symbol' && tmpl.value[0].value === 'unquote') {
+        if (depth === 0) {
+            return evalK(tmpl.value[1], env, k);
+        }
+        else {
+            return expandQuasiquote(tmpl.value[1], depth - 1, env, inner => k({ tag: 'list', value: [{ tag: 'symbol', value: 'unquote' }, inner] }));
+        }
+    }
+    if (tmpl.tag === 'list' && tmpl.value.length === 2 && tmpl.value[0].tag === 'symbol' && tmpl.value[0].value === 'quasiquote') {
+        return expandQuasiquote(tmpl.value[1], depth + 1, env, inner => k({ tag: 'list', value: [{ tag: 'symbol', value: 'quasiquote' }, inner] }));
+    }
+    if (tmpl.tag === 'list') {
+        // Check for unquote-splicing in elements
+        const elems = tmpl.value;
+        function buildList(i, acc, k2) {
+            if (i >= elems.length) {
+                let result = NIL;
+                for (let j = acc.length - 1; j >= 0; j--) {
+                    result = { tag: 'pair', car: acc[j], cdr: result };
+                }
+                return k2(result);
+            }
+            const el = elems[i];
+            if (el.tag === 'list' && el.value.length === 2 && el.value[0].tag === 'symbol' && el.value[0].value === 'unquote-splicing') {
+                if (depth === 0) {
+                    return evalK(el.value[1], env, spliced => {
+                        const items = [...acc];
+                        let cur = spliced;
+                        while (cur.tag === 'pair') {
+                            items.push(cur.car);
+                            cur = cur.cdr;
+                        }
+                        if (cur.tag === 'list') {
+                            for (const x of cur.value)
+                                items.push(x);
+                        }
+                        return buildList(i + 1, items, k2);
+                    });
+                }
+                else {
+                    return expandQuasiquote(el.value[1], depth - 1, env, inner => {
+                        const newEl = { tag: 'list', value: [{ tag: 'symbol', value: 'unquote-splicing' }, inner] };
+                        return buildList(i + 1, [...acc, newEl], k2);
+                    });
+                }
+            }
+            return expandQuasiquote(el, depth, env, expanded => {
+                return buildList(i + 1, [...acc, expanded], k2);
+            });
+        }
+        return buildList(0, [], k);
+    }
+    if (tmpl.tag === 'pair') {
+        // Check car for unquote-splicing
+        if (tmpl.car.tag === 'list' && tmpl.car.value.length === 2 && tmpl.car.value[0].tag === 'symbol' && tmpl.car.value[0].value === 'unquote-splicing' && depth === 0) {
+            return evalK(tmpl.car.value[1], env, spliced => {
+                return expandQuasiquote(tmpl.cdr, depth, env, expandedCdr => {
+                    // Append spliced list to expandedCdr
+                    let result = expandedCdr;
+                    const items = [];
+                    let cur = spliced;
+                    while (cur.tag === 'pair') {
+                        items.push(cur.car);
+                        cur = cur.cdr;
+                    }
+                    if (cur.tag === 'list') {
+                        for (const x of cur.value)
+                            items.push(x);
+                    }
+                    for (let j = items.length - 1; j >= 0; j--) {
+                        result = { tag: 'pair', car: items[j], cdr: result };
+                    }
+                    return k(result);
+                });
+            });
+        }
+        return expandQuasiquote(tmpl.car, depth, env, expandedCar => {
+            return expandQuasiquote(tmpl.cdr, depth, env, expandedCdr => {
+                return k({ tag: 'pair', car: expandedCar, cdr: expandedCdr });
+            });
+        });
+    }
+    // Atom / self-evaluating — return as-is (like quote)
+    return k(listToConsPairs(tmpl));
+}
 function evalK(expr, env, k) {
     switch (expr.tag) {
         case 'number':
@@ -1948,6 +2125,11 @@ function evalK(expr, env, k) {
                         if (elems.length !== 2)
                             throw errAt('quote requires exactly 1 argument', expr.pos);
                         return k(listToConsPairs(elems[1]));
+                    }
+                    case 'quasiquote': {
+                        if (elems.length !== 2)
+                            throw errAt('quasiquote requires exactly 1 argument', expr.pos);
+                        return expandQuasiquote(elems[1], 0, env, k);
                     }
                     case 'lambda': {
                         if (elems.length < 3)
@@ -2127,6 +2309,12 @@ function evalK(expr, env, k) {
                                 if (!isFalsy(testVal)) {
                                     if (clause.value.length === 1)
                                         return k(testVal);
+                                    // Support (test => proc) syntax
+                                    if (clause.value.length === 3 && clause.value[1].tag === 'symbol' && clause.value[1].value === '=>') {
+                                        return evalK(clause.value[2], env, (proc) => {
+                                            return applyK(proc, [testVal], k, expr.pos);
+                                        });
+                                    }
                                     return evalSeqK(clause.value.slice(1), 0, env, k);
                                 }
                                 return { tag: 'bounce', fn: () => tryCond(i + 1) };
