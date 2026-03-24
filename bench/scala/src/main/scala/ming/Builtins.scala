@@ -200,6 +200,21 @@ object Builtins:
     )
   )
 
+  private def applyBuiltin: List[(String, SchemeVal)] = List(
+    "apply" -> SchemeVal.BuiltinProc(
+      "apply",
+      args =>
+        if args.length < 2 then throw new EvalError("apply: expected at least 2 arguments")
+        val fn = args.head
+        val lastArg = args.last match
+          case SchemeVal.ListVal(elems) => elems
+          case other => throw new EvalError(s"apply: last argument must be a list, got ${other.display}")
+        val prefixArgs = args.slice(1, args.length - 1)
+        val allArgs    = prefixArgs ++ lastArg
+        Evaluator.applyProc(fn, allArgs)
+    )
+  )
+
   def makeGlobalEnv(): Env =
     val env = new Env(mutable.Map.empty, None)
     val allBuiltins = arithmeticBuiltins
@@ -209,5 +224,6 @@ object Builtins:
       ++ typePredicateBuiltins
       ++ ioBuiltins
       ++ StringBuiltins.all
+      ++ applyBuiltin
     for (name, proc) <- allBuiltins do env.define(name, proc)
     env

@@ -17,21 +17,21 @@ enum SchemeVal:
   case SymVal(name: String)
   case CharVal(value: Char)
   case ListVal(elems: List[SchemeVal])
-  case Procedure(params: List[String], body: List[Expr], env: Env)
+  case Procedure(params: List[String], restParam: Option[String], body: List[Expr], env: Env)
   case BuiltinProc(name: String, fn: List[SchemeVal] => SchemeVal)
   case Void
 
   def display: String = this match
-    case IntVal(n)            => n.toString
-    case BoolVal(b)           => if b then "#t" else "#f"
-    case StrVal(s)            => "\"" + new String(s) + "\""
-    case SymVal(n)            => n
-    case CharVal(c)           => s"#\\$c"
-    case ListVal(Nil)         => "()"
-    case ListVal(elems)       => "(" + elems.map(_.display).mkString(" ") + ")"
-    case Procedure(_, _, _)   => "#<procedure>"
-    case BuiltinProc(name, _) => s"#<procedure:$name>"
-    case Void                 => "#<void>"
+    case IntVal(n)             => n.toString
+    case BoolVal(b)            => if b then "#t" else "#f"
+    case StrVal(s)             => "\"" + new String(s) + "\""
+    case SymVal(n)             => n
+    case CharVal(c)            => s"#\\$c"
+    case ListVal(Nil)          => "()"
+    case ListVal(elems)        => "(" + elems.map(_.display).mkString(" ") + ")"
+    case Procedure(_, _, _, _) => "#<procedure>"
+    case BuiltinProc(name, _)  => s"#<procedure:$name>"
+    case Void                  => "#<void>"
 
   /** display format: no quotes on strings */
   def displayStr: String = this match
@@ -71,6 +71,29 @@ class Env(
 object Evaluator:
 
   val outputBuffer: ThreadLocal[StringBuilder] = ThreadLocal.withInitial(() => new StringBuilder)
+
+  /** Parse a parameter list, handling dot notation for rest params */
+  private def parseParams(params: List[Expr]): (List[String], Option[String]) =
+    val dotIdx = params.indexWhere {
+      case Expr.Symbol(".") => true
+      case _                => false
+    }
+    if dotIdx >= 0 then
+      if dotIdx != params.length - 2 then throw new EvalError("lambda: invalid dot notation in parameters")
+      val fixed = params.take(dotIdx).map {
+        case Expr.Symbol(n) => n
+        case _              => throw new EvalError("lambda: expected parameter name")
+      }
+      val rest = params(dotIdx + 1) match
+        case Expr.Symbol(n) => n
+        case _              => throw new EvalError("lambda: expected parameter name after dot")
+      (fixed, Some(rest))
+    else
+      val names = params.map {
+        case Expr.Symbol(n) => n
+        case _              => throw new EvalError("lambda: expected parameter name")
+      }
+      (names, None)
 
   private def isTruthy(v: SchemeVal): Boolean = v match
     case SchemeVal.BoolVal(false) => false
@@ -114,11 +137,8 @@ object Evaluator:
                 Expr.Symbol(name) :: params
               ) :: body
             ) =>
-          val paramNames = params.map {
-            case Expr.Symbol(n) => n
-            case _              => throw new EvalError("define: expected parameter name")
-          }
-          env.define(name, SchemeVal.Procedure(paramNames, body, env))
+          val (paramNames, restParam) = parseParams(params)
+          env.define(name, SchemeVal.Procedure(paramNames, restParam, body, env))
           SchemeVal.Void
         case Expr.SList(
               Expr.Symbol("define") :: Expr.Symbol(name) :: value :: Nil
@@ -131,11 +151,8 @@ object Evaluator:
           env.set(name, eval(value, env))
           SchemeVal.Void
         case Expr.SList(Expr.Symbol("lambda") :: Expr.SList(params) :: body) =>
-          val paramNames = params.map {
-            case Expr.Symbol(n) => n
-            case _              => throw new EvalError("lambda: expected parameter name")
-          }
-          SchemeVal.Procedure(paramNames, body, env)
+          val (paramNames, restParam) = parseParams(params)
+          SchemeVal.Procedure(paramNames, restParam, body, env)
         case Expr.SList(
               Expr.Symbol("let") :: Expr.Symbol(name) :: Expr.SList(
                 bindings
@@ -162,12 +179,20 @@ object Evaluator:
         if posPattern.matches(msg) then throw e
         else throw new EvalError(s"$msg at ${posStr(expr)}")
 
-  private def applyProc(fn: SchemeVal, evaledArgs: List[SchemeVal]): SchemeVal =
+  def applyProc(fn: SchemeVal, evaledArgs: List[SchemeVal]): SchemeVal =
     fn match
       case SchemeVal.BuiltinProc(_, f) => f(evaledArgs)
-      case SchemeVal.Procedure(params, body, closureEnv) =>
+      case SchemeVal.Procedure(params, restParam, body, closureEnv) =>
         val newEnv = new Env(mutable.Map.empty, Some(closureEnv))
-        params.zip(evaledArgs).foreach((p, v) => newEnv.define(p, v))
+        if restParam.isDefined then
+          if evaledArgs.length < params.length then
+            throw new EvalError(s"expected at least ${params.length} arguments, got ${evaledArgs.length}")
+          params.zip(evaledArgs).foreach((p, v) => newEnv.define(p, v))
+          newEnv.define(restParam.get, SchemeVal.ListVal(evaledArgs.drop(params.length)))
+        else
+          if evaledArgs.length != params.length then
+            throw new EvalError(s"expected ${params.length} arguments, got ${evaledArgs.length}")
+          params.zip(evaledArgs).foreach((p, v) => newEnv.define(p, v))
         evalBody(body, newEnv)
       case other => throw new EvalError(s"not a procedure: ${other.display}")
 
@@ -182,7 +207,7 @@ object Evaluator:
       case _                                      => throw new EvalError("let: invalid binding")
     }.unzip
     val letEnv = new Env(mutable.Map.empty, Some(env))
-    val proc   = SchemeVal.Procedure(paramNames, body, letEnv)
+    val proc   = SchemeVal.Procedure(paramNames, None, body, letEnv)
     letEnv.define(name, proc)
     val initVals = initExprs.map(e => eval(e, env))
     val callEnv  = new Env(mutable.Map.empty, Some(letEnv))
