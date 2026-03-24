@@ -13,6 +13,7 @@ impl std::fmt::Display for Span {
 
 /// Evaluation error type for the Scheme interpreter.
 #[derive(Debug, PartialEq, thiserror::Error)]
+#[allow(private_interfaces)]
 pub enum EvalError {
     #[error("parse error at {1}: {0}")]
     Parse(String, Span),
@@ -26,4 +27,6 @@ pub enum EvalError {
     DivisionByZero(Span),
     #[error("internal: continuation invoked")]
     ContinuationInvoked,
+    #[error("uncaught exception")]
+    SchemeRaise(super::Value),
 }

@@ -9,6 +9,7 @@ use super::{
     apply, eval_define_record_type, eval_define_syntax,
     eval_string_set_standalone, eval_do, expand_macro,
     WindFrame, WIND_STACK, WIND_COUNTER,
+    ExceptionHandler, EXCEPTION_HANDLERS,
 };
 use super::error::{EvalError, Span};
 use super::parser::parse_params;
@@ -48,6 +49,39 @@ pub(super) fn cek_eval(exprs: &[Spanned], env: &Env, out: &Output) -> Result<Val
             Err(EvalError::ContinuationInvoked) => {
                 let (kont, value) = CONT_JUMP.with(|c| c.borrow_mut().take().expect("CONT_JUMP must be set after ContinuationInvoked"));
                 state = CekState::ResumeKont(kont, value);
+            }
+            Err(EvalError::SchemeRaise(exn)) => {
+                let handler = EXCEPTION_HANDLERS.with(|h| h.borrow_mut().pop());
+                match handler {
+                    Some(ExceptionHandler::Guard { var, clauses, env, kont, winds }) => {
+                        let current_winds = WIND_STACK.with(|ws| ws.borrow().clone());
+                        let common = current_winds.iter().zip(winds.iter())
+                            .take_while(|(a, b)| a.2 == b.2).count();
+                        let guard_test_kont = Rc::new(Kont::GuardTest {
+                            var, exn, clauses, env, next: kont,
+                        });
+                        if common == current_winds.len() && common == winds.len() {
+                            state = CekState::ApplyKont(guard_test_kont, Value::Void);
+                        } else {
+                            match start_wind_transition(
+                                &current_winds[common..], &winds[common..],
+                                guard_test_kont, Value::Void, false, out, DUMMY_SPAN,
+                            ) {
+                                Ok(CekStep::Continue(s)) => state = s,
+                                Ok(CekStep::Done(v)) => return Ok(v),
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
+                    Some(ExceptionHandler::Proc(handler_proc)) => {
+                        match cek_apply_func(&handler_proc, &[exn], Rc::new(Kont::Halt), out, DUMMY_SPAN) {
+                            Ok(CekStep::Continue(s)) => state = s,
+                            Ok(CekStep::Done(v)) => return Ok(v),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    None => return Err(EvalError::SchemeRaise(exn)),
+                }
             }
             Err(e) => return Err(e),
         }
@@ -242,6 +276,32 @@ fn cek_eval_expr(expr: Spanned, env: Env, kont: Rc<Kont>, out: &Output) -> Resul
                     "define-syntax" => {
                         eval_define_syntax(items, &env, span)?;
                         return Ok(CekStep::Continue(CekState::ApplyKont(kont, Value::Void)));
+                    }
+                    "guard" => {
+                        if items.len() < 3 {
+                            return Err(EvalError::Arity("guard requires clauses and body".into(), span));
+                        }
+                        let Value::List(clause_spec) = &items[1].val else {
+                            return Err(EvalError::Type("guard: expected clause specification".into(), span));
+                        };
+                        if clause_spec.is_empty() {
+                            return Err(EvalError::Arity("guard: empty clause specification".into(), span));
+                        }
+                        let Value::Symbol(var) = &clause_spec[0].val else {
+                            return Err(EvalError::Type("guard: expected variable name".into(), span));
+                        };
+                        let clauses = clause_spec[1..].to_vec();
+                        let body = items[2..].to_vec();
+                        let winds = WIND_STACK.with(|ws| ws.borrow().clone());
+                        EXCEPTION_HANDLERS.with(|h| h.borrow_mut().push(ExceptionHandler::Guard {
+                            var: var.clone(),
+                            clauses,
+                            env: env.clone(),
+                            kont: kont.clone(),
+                            winds,
+                        }));
+                        let k = Rc::new(Kont::PopExceptionHandler { next: kont });
+                        return eval_body_cek(&body, env, k);
                     }
                     _ => {
                         if let Some(Value::SyntaxRules { ref literals, ref rules, ref def_env }) = env_get(&env, name) {
@@ -569,6 +629,18 @@ fn cek_apply_kont(kont: &Rc<Kont>, value: Value, out: &Output, is_resume: bool) 
                 Ok(CekStep::Continue(CekState::ApplyKont(target_kont.clone(), target_value.clone())))
             }
         }
+
+        Kont::PopExceptionHandler { next } => {
+            EXCEPTION_HANDLERS.with(|h| h.borrow_mut().pop());
+            Ok(CekStep::Continue(CekState::ApplyKont(next.clone(), value)))
+        }
+
+        Kont::GuardTest { var, exn, clauses, env, next } => {
+            // Bind var to exn in a new env, then evaluate clauses like cond
+            let guard_env = new_env(Some(env.clone()));
+            env_set(&guard_env, var.clone(), exn.clone());
+            cek_eval_cond(clauses, &guard_env, DUMMY_SPAN, next.clone())
+        }
     }
 }
 
@@ -667,6 +739,22 @@ fn cek_apply_func(func: &Value, args: &[Value], kont: Rc<Kont>, out: &Output, sp
             let winds = WIND_STACK.with(|ws| ws.borrow().clone());
             let cont_val = Value::Continuation(kont.clone(), winds);
             cek_apply_func(&args[0], &[cont_val], kont, out, span)
+        }
+        Value::Symbol(name) if name == "raise" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("raise requires 1 argument".into(), span));
+            }
+            Err(EvalError::SchemeRaise(args[0].clone()))
+        }
+        Value::Symbol(name) if name == "with-exception-handler" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("with-exception-handler requires 2 arguments".into(), span));
+            }
+            let handler = args[0].clone();
+            let thunk = args[1].clone();
+            EXCEPTION_HANDLERS.with(|h| h.borrow_mut().push(ExceptionHandler::Proc(handler)));
+            let k = Rc::new(Kont::PopExceptionHandler { next: kont });
+            cek_apply_func(&thunk, &[], k, out, span)
         }
         Value::Symbol(name) if name == "dynamic-wind" => {
             if args.len() != 3 {
@@ -887,7 +975,8 @@ fn cek_eval_letrec(args: &[Spanned], env: Env, kont: Rc<Kont>, _out: &Output, sp
 /// Check if an expression (or any sub-expression) references call/cc.
 pub(super) fn expr_uses_callcc(expr: &Spanned) -> bool {
     match &expr.val {
-        Value::Symbol(s) => s == "call/cc" || s == "call-with-current-continuation" || s == "dynamic-wind",
+        Value::Symbol(s) => s == "call/cc" || s == "call-with-current-continuation" || s == "dynamic-wind"
+            || s == "raise" || s == "with-exception-handler" || s == "guard",
         Value::List(items) => items.iter().any(expr_uses_callcc),
         _ => false,
     }

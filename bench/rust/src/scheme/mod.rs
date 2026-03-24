@@ -25,6 +25,19 @@ pub(crate) type WindFrame = (Value, Value, u64); // in_thunk, out_thunk, marker
 
 thread_local! {
     pub(super) static WIND_STACK: RefCell<Vec<WindFrame>> = const { RefCell::new(Vec::new()) };
+    pub(super) static EXCEPTION_HANDLERS: RefCell<Vec<ExceptionHandler>> = const { RefCell::new(Vec::new()) };
+}
+
+#[derive(Clone)]
+pub(crate) enum ExceptionHandler {
+    Proc(Value),
+    Guard {
+        var: String,
+        clauses: Vec<Spanned>,
+        env: Env,
+        kont: Rc<Kont>,
+        winds: Vec<WindFrame>,
+    },
 }
 
 pub(crate) fn gensym(base: &str) -> String {
@@ -344,6 +357,9 @@ pub(crate) enum Kont {
         value: Value,
         is_resume: bool,
     },
+    // Exception handling (L20)
+    PopExceptionHandler { next: Rc<Kont> },
+    GuardTest { var: String, exn: Value, clauses: Vec<Spanned>, env: Env, next: Rc<Kont> },
 }
 
 // Kont is not Debug-derivable due to Value, but we don't need Debug
@@ -1252,7 +1268,9 @@ fn make_global_env() -> Env {
                    // L18
                    "call/cc", "call-with-current-continuation",
                    // L19
-                   "dynamic-wind"] {
+                   "dynamic-wind",
+                   // L20
+                   "raise", "with-exception-handler", "guard"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     env
