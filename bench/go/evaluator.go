@@ -1138,10 +1138,13 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 		})
 		return result, err
 	case *ContinuationVal:
-		if len(args) != 1 {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: expected 1 argument, got %d", callExpr.Line, callExpr.Col, len(args))}
+		if len(args) == 0 {
+			panic(&contJump{cont: fn, value: &VoidVal{}})
+		} else if len(args) == 1 {
+			panic(&contJump{cont: fn, value: args[0]})
+		} else {
+			panic(&contJump{cont: fn, value: &ValuesVal{Vals: args}})
 		}
-		panic(&contJump{cont: fn, value: args[0]})
 	case *WithExceptionHandlerVal:
 		if len(args) != 2 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: with-exception-handler: expected 2 arguments, got %d", callExpr.Line, callExpr.Col, len(args))}

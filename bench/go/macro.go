@@ -44,6 +44,10 @@ var specialForms = map[string]bool{
 	"let": true, "let*": true, "begin": true, "cond": true, "set!": true,
 	"and": true, "or": true, "define-syntax": true, "syntax-rules": true,
 	"else": true, "syntax-case": true, "syntax": true, "with-syntax": true,
+	"guard": true, "define-record-type": true, "do": true, "case": true,
+	"letrec": true, "letrec*": true, "case-lambda": true, "dynamic-wind": true,
+	"raise": true, "with-exception-handler": true, "call/cc": true,
+	"call-with-current-continuation": true, "call-with-values": true, "values": true,
 }
 
 // evalDefineSyntax handles (define-syntax name transformer)
@@ -115,13 +119,11 @@ func expandMacro(sv *SyntaxVal, callExpr *Expr, useEnv *Env) (Value, error) {
 			expanded := expandTemplate(rule.Template, bindings, gensyms)
 
 			if len(gensyms) > 0 {
-				evalEnv := NewEnv(useEnv)
 				for orig, gs := range gensyms {
 					if v, ok := sv.DefEnv.Get(orig); ok {
-						evalEnv.Set(gs, v)
+						useEnv.Set(gs, v)
 					}
 				}
-				return &tailCall{expr: expanded, env: evalEnv}, nil
 			}
 			return &tailCall{expr: expanded, env: useEnv}, nil
 		}
