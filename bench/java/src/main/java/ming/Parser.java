@@ -37,8 +37,16 @@ final class Parser {
             case '(' -> parseList();
             case '"' -> parseString();
             case '#' -> parseBoolean();
+            case '\'' -> parseQuoteShorthand();
             default -> parseAtom();
         };
+    }
+
+    private Expr parseQuoteShorthand() throws EvalError {
+        SourcePos pos = currentPos();
+        advance();
+        Expr quoted = parseExpr();
+        return new Expr.ListExpr(List.of(new Expr.SymbolExpr("quote", pos), quoted), pos);
     }
 
     private Expr parseList() throws EvalError {
