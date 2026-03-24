@@ -400,6 +400,11 @@ type contInvoke struct {
 	value *Value // the argument passed to the continuation
 }
 
+// schemeRaise is the panic value used by (raise v).
+type schemeRaise struct {
+	value *Value
+}
+
 type bodyCtx struct {
 	exprs []*astNode // body expressions of the enclosing let/letrec
 	idx   int        // current expression index
@@ -874,6 +879,8 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 			return evalDo(node, e, ip)
 		case "call/cc", "call-with-current-continuation":
 			return evalCallCCForm(node, e, ip)
+		case "guard":
+			return evalGuard(node, e, ip)
 		}
 
 		// Check if symbol resolves to a macro
@@ -1136,6 +1143,140 @@ func evalDynamicWind(inThunk, bodyThunk, outThunk *Value, node *astNode, ip *int
 		return nil, err
 	}
 
+	return result, nil
+}
+
+// ---------- raise / guard / with-exception-handler (L20) ----------
+
+// evalGuard implements (guard (var clause ...) body ...).
+// It catches exceptions raised in body and tests them against cond-like clauses.
+func evalGuard(node *astNode, e *env, ip *interp) (*Value, error) {
+	if len(node.children) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: bad syntax", node.line, node.col)}
+	}
+	clauseNode := node.children[1]
+	if clauseNode.isAtom || len(clauseNode.children) < 2 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: bad syntax", node.line, node.col)}
+	}
+	varNode := clauseNode.children[0]
+	if !varNode.isAtom || varNode.tok.kind != tokSymbol {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: variable must be a symbol", node.line, node.col)}
+	}
+	varName := varNode.tok.sval
+	clauses := clauseNode.children[1:]
+	bodyExprs := node.children[2:]
+
+	// Try evaluating body, catching any raised exception
+	var bodyResult *Value
+	var bodyErr error
+	var raised *schemeRaise
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if sr, ok := r.(*schemeRaise); ok {
+					raised = sr
+					return
+				}
+				panic(r) // not ours
+			}
+		}()
+		for _, expr := range bodyExprs {
+			bodyResult, bodyErr = eval(expr, e, ip)
+			if bodyErr != nil {
+				return
+			}
+		}
+	}()
+
+	if bodyErr != nil {
+		return nil, bodyErr
+	}
+	if raised == nil {
+		return bodyResult, nil
+	}
+
+	// Exception was raised — bind the variable and test clauses
+	guardEnv := newEnv(e)
+	guardEnv.set(varName, raised.value)
+
+	for _, clause := range clauses {
+		if clause.isAtom {
+			continue
+		}
+		if len(clause.children) == 0 {
+			continue
+		}
+		test := clause.children[0]
+		// Check for else clause
+		if test.isAtom && test.tok.kind == tokSymbol && test.tok.sval == "else" {
+			// Evaluate else body
+			var result *Value
+			for _, expr := range clause.children[1:] {
+				r, err := eval(expr, guardEnv, ip)
+				if err != nil {
+					return nil, err
+				}
+				result = r
+			}
+			return result, nil
+		}
+		// Evaluate test
+		testVal, err := eval(test, guardEnv, ip)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(testVal) {
+			if len(clause.children) == 1 {
+				return testVal, nil
+			}
+			var result *Value
+			for _, expr := range clause.children[1:] {
+				r, err := eval(expr, guardEnv, ip)
+				if err != nil {
+					return nil, err
+				}
+				result = r
+			}
+			return result, nil
+		}
+	}
+
+	// No clause matched — re-raise
+	panic(&schemeRaise{value: raised.value})
+}
+
+// applyWithExceptionHandler implements (with-exception-handler handler thunk).
+func applyWithExceptionHandler(handler, thunk *Value, node *astNode, ip *interp) (*Value, error) {
+	var result *Value
+	var thunkErr error
+	var raised *schemeRaise
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if sr, ok := r.(*schemeRaise); ok {
+					raised = sr
+					return
+				}
+				panic(r)
+			}
+		}()
+		result, thunkErr = callThunk(thunk, node, ip)
+	}()
+
+	if thunkErr != nil {
+		return nil, thunkErr
+	}
+	if raised != nil {
+		// Call handler with the raised value
+		if handler.typ == valLambda {
+			return applyLambdaFull(handler, []*Value{raised.value}, node, ip)
+		} else if handler.typ == valGoFunc {
+			return handler.goFunc([]*Value{raised.value})
+		}
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: with-exception-handler: handler is not a procedure", node.line, node.col)}
+	}
 	return result, nil
 }
 
@@ -2507,6 +2648,18 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		}
 		return evalDynamicWind(args[0], args[1], args[2], node, ip)
 
+	case "raise":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: raise: need 1 argument", node.line, node.col)}
+		}
+		panic(&schemeRaise{value: args[0]})
+
+	case "with-exception-handler":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: with-exception-handler: need 2 arguments", node.line, node.col)}
+		}
+		return applyWithExceptionHandler(args[0], args[1], node, ip)
+
 	case "gcd":
 		if len(args) == 0 {
 			return intVal(0), nil
@@ -3101,7 +3254,8 @@ func makeGlobalEnv() *env {
 		"string>?", "string<=?", "string>=?",
 		"member", "assv",
 		"call/cc", "call-with-current-continuation",
-		"dynamic-wind"}
+		"dynamic-wind",
+		"raise", "with-exception-handler"}
 	for _, name := range builtins {
 		e.set(name, symVal(name))
 	}
@@ -3139,11 +3293,16 @@ func evalAll(input string) (result string, output string, err error) {
 		var ci *contInvoke
 		var evalErr error
 
+		var sr *schemeRaise
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
 					if c, ok := r.(*contInvoke); ok {
 						ci = c
+						return
+					}
+					if s, ok := r.(*schemeRaise); ok {
+						sr = s
 						return
 					}
 					panic(r) // re-panic non-continuation panics
@@ -3167,6 +3326,9 @@ func evalAll(input string) (result string, output string, err error) {
 
 		if evalErr != nil {
 			return "", "", evalErr
+		}
+		if sr != nil {
+			return "", "", &EvalError{Message: "unhandled exception: " + sr.value.String()}
 		}
 		if ci == nil {
 			break // no continuation invocation, evaluation complete
