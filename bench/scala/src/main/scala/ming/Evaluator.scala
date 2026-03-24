@@ -12,6 +12,9 @@ object Evaluator:
   private[ming] val currentBodyCtx: ThreadLocal[BodyContext] = ThreadLocal.withInitial(() => null)
   private[ming] val pendingCCReturn: ThreadLocal[SchemeVal]  = ThreadLocal.withInitial(() => null)
 
+  // --- dynamic-wind support ---
+  private[ming] val windStack: ThreadLocal[List[WindEntry]] = ThreadLocal.withInitial(() => Nil)
+
   private[ming] def isTruthy(v: SchemeVal): Boolean = v match
     case SchemeVal.BoolVal(false) => false
     case _                        => true
@@ -37,6 +40,13 @@ object Evaluator:
           else if cr.body ne null then
             // Reentry targets an inner body: evaluate it directly
             result = evalBody(cr.body, cr.bodyEnv, cr.startIdx)
+            // Unwind back to caller's wind state
+            var cur = windStack.get()
+            while (cur ne cr.callerWind) && cur.nonEmpty do
+              val entry = cur.head
+              cur = cur.tail
+              windStack.set(cur)
+              applyProc(entry.outThunk, Nil)
             i += 1
           else throw cr
       finally currentBodyCtx.set(prev)
@@ -108,7 +118,8 @@ object Evaluator:
       contId,
       if ctx != null then ctx.body else null,
       if ctx != null then ctx.idx else 0,
-      if ctx != null then ctx.env else null
+      if ctx != null then ctx.env else null,
+      windStack.get()
     )
     try applyProc(proc, List(cont))
     catch case cr: ContinuationReturn if cr.contId == contId => cr.value
@@ -198,6 +209,22 @@ object Evaluator:
       evalCallCC(procExpr, env)
     case Expr.Symbol("call-with-current-continuation") :: procExpr :: Nil =>
       evalCallCC(procExpr, env)
+    case Expr.Symbol("dynamic-wind") :: inExpr :: bodyExpr :: outExpr :: Nil =>
+      val inThunk   = eval(inExpr, env)
+      val bodyThunk = eval(bodyExpr, env)
+      val outThunk  = eval(outExpr, env)
+      val entry     = new WindEntry(inThunk, outThunk)
+      windStack.set(entry :: windStack.get())
+      applyProc(inThunk, Nil)
+      val result =
+        try applyProc(bodyThunk, Nil)
+        catch
+          case cr: ContinuationReturn =>
+            // Wind already unwound by continuation invocation
+            throw cr
+      windStack.set(windStack.get().tail)
+      applyProc(outThunk, Nil)
+      result
     case Expr.Symbol(name) :: _ if MacroExpander.isMacro(name, env) =>
       env.lookup(name) match
         case m: SchemeVal.Macro => MacroExpander.expandAndEval(expr, name, m, env, eval)
@@ -240,10 +267,13 @@ object Evaluator:
             applyProcInner(SchemeVal.Procedure(params, restParam, body, closureEnv), evaledArgs)
           case None =>
             throw new EvalError(s"case-lambda: no matching clause for ${evaledArgs.length} arguments")
-      case SchemeVal.ContinuationVal(id, body, startIdx, bodyEnv) =>
+      case SchemeVal.ContinuationVal(id, body, startIdx, bodyEnv, savedWind) =>
         if evaledArgs.length != 1 then
           throw new EvalError(s"continuation: expected 1 argument, got ${evaledArgs.length}")
-        throw new ContinuationReturn(id, evaledArgs.head, body, startIdx, bodyEnv)
+        // Save caller's wind before transition, perform wind transition, then jump
+        val callerWind = windStack.get()
+        DynamicWind.doWindTransition(callerWind, savedWind)
+        throw new ContinuationReturn(id, evaledArgs.head, body, startIdx, bodyEnv, callerWind)
       case other => throw new EvalError(s"not a procedure: ${other.display}")
 
   /** Public apply: always fully evaluates (trampolines TailCall) */

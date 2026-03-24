@@ -4,6 +4,8 @@ import scala.collection.mutable
 
 class MutablePair(var car: SchemeVal, var cdr: SchemeVal)
 
+class WindEntry(val inThunk: SchemeVal, val outThunk: SchemeVal)
+
 enum Expr:
   case IntLit(value: Long)
   case FloatLit(value: Double)
@@ -28,7 +30,7 @@ enum SchemeVal:
   case BuiltinProc(name: String, fn: List[SchemeVal] => SchemeVal)
   case Macro(literals: Set[String], rules: List[(Expr, Expr)], defEnv: Env)
   case CaseLambda(clauses: List[(List[String], Option[String], List[Expr], Env)])
-  case ContinuationVal(id: Long, body: List[Expr], startIdx: Int, bodyEnv: Env)
+  case ContinuationVal(id: Long, body: List[Expr], startIdx: Int, bodyEnv: Env, savedWind: List[WindEntry])
   case VectorVal(elems: Array[SchemeVal])
   case RecordVal(typeName: String, fields: Map[String, SchemeVal])
   case TailCall(expr: Expr, env: Env)
@@ -39,23 +41,23 @@ enum SchemeVal:
     case FloatVal(d) =>
       if d == d.toLong.toDouble && !d.isInfinite then s"${d.toLong}.0"
       else d.toString
-    case RatVal(n, d)                => s"$n/$d"
-    case BoolVal(b)                  => if b then "#t" else "#f"
-    case StrVal(s)                   => "\"" + new String(s) + "\""
-    case SymVal(n)                   => n
-    case CharVal(c)                  => s"#\\$c"
-    case ListVal(Nil)                => "()"
-    case ListVal(elems)              => "(" + elems.map(_.display).mkString(" ") + ")"
-    case PairVal(_)                  => formatPair(_.display)
-    case Procedure(_, _, _, _)       => "#<procedure>"
-    case CaseLambda(_)               => "#<procedure>"
-    case ContinuationVal(_, _, _, _) => "#<continuation>"
-    case BuiltinProc(name, _)        => s"#<procedure:$name>"
-    case Macro(_, _, _)              => "#<macro>"
-    case VectorVal(elems)            => "#(" + elems.map(_.display).mkString(" ") + ")"
-    case RecordVal(t, _)             => s"#<$t>"
-    case TailCall(_, _)              => "#<tail-call>"
-    case Void                        => "#<void>"
+    case RatVal(n, d)                   => s"$n/$d"
+    case BoolVal(b)                     => if b then "#t" else "#f"
+    case StrVal(s)                      => "\"" + new String(s) + "\""
+    case SymVal(n)                      => n
+    case CharVal(c)                     => s"#\\$c"
+    case ListVal(Nil)                   => "()"
+    case ListVal(elems)                 => "(" + elems.map(_.display).mkString(" ") + ")"
+    case PairVal(_)                     => formatPair(_.display)
+    case Procedure(_, _, _, _)          => "#<procedure>"
+    case CaseLambda(_)                  => "#<procedure>"
+    case ContinuationVal(_, _, _, _, _) => "#<continuation>"
+    case BuiltinProc(name, _)           => s"#<procedure:$name>"
+    case Macro(_, _, _)                 => "#<macro>"
+    case VectorVal(elems)               => "#(" + elems.map(_.display).mkString(" ") + ")"
+    case RecordVal(t, _)                => s"#<$t>"
+    case TailCall(_, _)                 => "#<tail-call>"
+    case Void                           => "#<void>"
 
   /** display format: no quotes on strings */
   def displayStr: String = this match
@@ -186,6 +188,7 @@ class ContinuationReturn(
   val value: SchemeVal,
   val body: List[Expr],
   val startIdx: Int,
-  val bodyEnv: Env
+  val bodyEnv: Env,
+  val callerWind: List[WindEntry] = Nil
 ) extends Throwable(null, null, true, false):
   override def fillInStackTrace(): Throwable = this
