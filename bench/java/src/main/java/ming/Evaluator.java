@@ -1,7 +1,11 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 public class Evaluator {
 
@@ -18,6 +22,19 @@ public class Evaluator {
     // Position tracking for error messages
     private int currentLine = 1;
     private int currentCol = 1;
+
+    // Gensym counter for hygienic macros
+    private int gensymCounter = 0;
+    private String gensym(String prefix) { return prefix + "$" + (gensymCounter++); }
+
+    // Macro representation
+    record SyntaxRule(Object pattern, Object template) {}
+    record SyntaxRulesDef(List<String> literals, List<SyntaxRule> rules, Environment defEnv) {}
+
+    private static final Set<String> SPECIAL_FORMS = Set.of(
+        "if", "let", "begin", "set!", "define", "lambda", "quote", "cond",
+        "and", "or", "not", "define-syntax", "syntax-rules"
+    );
 
     // Output buffer for display/write/newline
     private StringBuilder outputBuffer = new StringBuilder();
@@ -245,6 +262,10 @@ public class Evaluator {
             return eval(loc.value(), env);
         }
 
+        if (expr instanceof MacroExpansion me) {
+            return eval(me.form(), me.env());
+        }
+
         if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
             return expr;
         }
@@ -315,7 +336,16 @@ public class Evaluator {
                         Object val = eval(list.get(1), env);
                         return Boolean.FALSE.equals(val) ? Boolean.TRUE : Boolean.FALSE;
                     }
+                    case "define-syntax" -> { return evalDefineSyntax(list, env); }
                 }
+                // Check for macro usage
+                try {
+                    Object headVal = env.lookup(op);
+                    if (headVal instanceof SyntaxRulesDef sr) {
+                        Object expanded = expandMacro(sr, list, env);
+                        return eval(expanded, env);
+                    }
+                } catch (EvalError ignored) {}
             }
 
             // Function application
@@ -514,6 +544,254 @@ public class Evaluator {
             result = eval(list.get(i), letEnv);
         }
         return result;
+    }
+
+    // --- Macros ---
+
+    @SuppressWarnings("unchecked")
+    private Object evalDefineSyntax(List<?> list, Environment env) throws EvalError {
+        if (list.size() != 3) throw error("define-syntax: bad syntax");
+        Object nameObj = list.get(1);
+        if (nameObj instanceof Located loc) nameObj = loc.value();
+        if (!(nameObj instanceof String name)) throw error("define-syntax: expected name");
+
+        Object transformer = list.get(2);
+        if (transformer instanceof Located loc) transformer = loc.value();
+        if (!(transformer instanceof List<?> tlist) || tlist.size() < 2)
+            throw error("define-syntax: expected syntax-rules");
+
+        Object srHead = tlist.get(0);
+        if (srHead instanceof Located loc) srHead = loc.value();
+        if (!"syntax-rules".equals(srHead)) throw error("define-syntax: expected syntax-rules");
+
+        Object litsObj = tlist.get(1);
+        if (litsObj instanceof Located loc) litsObj = loc.value();
+        if (!(litsObj instanceof List<?> litsList)) throw error("syntax-rules: expected literals list");
+        List<String> literals = new ArrayList<>();
+        for (Object lit : litsList) {
+            if (lit instanceof Located loc) lit = loc.value();
+            if (lit instanceof String s) literals.add(s);
+        }
+
+        List<SyntaxRule> rules = new ArrayList<>();
+        for (int i = 2; i < tlist.size(); i++) {
+            Object rule = tlist.get(i);
+            if (rule instanceof Located loc) rule = loc.value();
+            if (!(rule instanceof List<?> rlist) || rlist.size() != 2)
+                throw error("syntax-rules: bad rule");
+            Object pattern = unwrapDeep(rlist.get(0));
+            Object template = unwrapDeep(rlist.get(1));
+            rules.add(new SyntaxRule(pattern, template));
+        }
+
+        env.define(name, new SyntaxRulesDef(literals, rules, env));
+        return VOID;
+    }
+
+    private Object unwrapDeep(Object obj) {
+        if (obj instanceof Located loc) return unwrapDeep(loc.value());
+        if (obj instanceof List<?> list) {
+            List<Object> result = new ArrayList<>();
+            for (Object item : list) result.add(unwrapDeep(item));
+            return result;
+        }
+        return obj;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object expandMacro(SyntaxRulesDef sr, List<?> inputForm, Environment useEnv) throws EvalError {
+        List<Object> input = new ArrayList<>();
+        for (Object item : inputForm) input.add(unwrapDeep(item));
+
+        for (SyntaxRule rule : sr.rules) {
+            if (!(rule.pattern() instanceof List<?> patList)) continue;
+            Map<String, Object> bindings = new HashMap<>();
+            Set<String> ellipsisVars = new HashSet<>();
+
+            // Skip position 0 (macro keyword) in both pattern and input
+            List<Object> patArgs = new ArrayList<>(patList.subList(1, patList.size()));
+            List<Object> inArgs = new ArrayList<>(input.subList(1, input.size()));
+
+            if (matchPattern(patArgs, inArgs, bindings, sr.literals, ellipsisVars)) {
+                // Collect pattern variable names
+                Set<String> patVars = new HashSet<>();
+                collectPatternVars(patArgs, patVars, sr.literals);
+
+                // Apply hygiene: rename introduced symbols
+                Map<String, String> renameMap = new HashMap<>();
+                Set<String> templateSyms = new HashSet<>();
+                collectSymbols(rule.template(), templateSyms);
+                for (String sym : templateSyms) {
+                    if (patVars.contains(sym) || SPECIAL_FORMS.contains(sym) || "...".equals(sym))
+                        continue;
+                    // This is an introduced symbol
+                    String gs = gensym(sym);
+                    renameMap.put(sym, gs);
+                }
+
+                Object expanded = expandTemplate(rule.template(), bindings, ellipsisVars, renameMap);
+
+                // Bind gensyms for symbols that exist in definition env
+                Environment wrapEnv = new Environment(useEnv);
+                for (Map.Entry<String, String> entry : renameMap.entrySet()) {
+                    try {
+                        Object val = sr.defEnv.lookup(entry.getKey());
+                        wrapEnv.define(entry.getValue(), val);
+                    } catch (EvalError ignored) {
+                        // Symbol doesn't exist in def env (e.g., tmp in swap!)
+                        // Leave unbound - will be bound by the expansion itself (e.g., let)
+                    }
+                }
+
+                // If we created any gensym bindings, wrap the form to eval in that env
+                if (!renameMap.isEmpty()) {
+                    // Return a special wrapper that eval handles
+                    return new MacroExpansion(expanded, wrapEnv);
+                }
+                return expanded;
+            }
+        }
+        throw error("no matching macro pattern");
+    }
+
+    record MacroExpansion(Object form, Environment env) {}
+
+    @SuppressWarnings("unchecked")
+    private boolean matchPattern(List<Object> pattern, List<Object> input,
+            Map<String, Object> bindings, List<String> literals, Set<String> ellipsisVars) {
+        // Check for ellipsis in pattern
+        int ellipsisIdx = -1;
+        for (int i = 0; i < pattern.size(); i++) {
+            if ("...".equals(pattern.get(i))) {
+                ellipsisIdx = i;
+                break;
+            }
+        }
+
+        if (ellipsisIdx == -1) {
+            // No ellipsis - exact length match
+            if (pattern.size() != input.size()) return false;
+            for (int i = 0; i < pattern.size(); i++) {
+                if (!matchOne(pattern.get(i), input.get(i), bindings, literals, ellipsisVars))
+                    return false;
+            }
+            return true;
+        }
+
+        // Has ellipsis
+        int repeatedIdx = ellipsisIdx - 1;
+        int afterCount = pattern.size() - ellipsisIdx - 1;
+        int minRequired = repeatedIdx + afterCount;
+        if (input.size() < minRequired) return false;
+
+        // Match elements before the repeated pattern
+        for (int i = 0; i < repeatedIdx; i++) {
+            if (!matchOne(pattern.get(i), input.get(i), bindings, literals, ellipsisVars))
+                return false;
+        }
+
+        // Collect vars in repeated pattern
+        Object repeatedPat = pattern.get(repeatedIdx);
+        Set<String> repeatVars = new HashSet<>();
+        collectPatternVars(List.of(repeatedPat), repeatVars, literals);
+        for (String v : repeatVars) {
+            bindings.put(v, new ArrayList<>());
+            ellipsisVars.add(v);
+        }
+
+        int repeatCount = input.size() - minRequired;
+        for (int i = 0; i < repeatCount; i++) {
+            Map<String, Object> sub = new HashMap<>();
+            Set<String> subEllipsis = new HashSet<>();
+            if (!matchOne(repeatedPat, input.get(repeatedIdx + i), sub, literals, subEllipsis))
+                return false;
+            for (String v : repeatVars) {
+                ((List<Object>) bindings.get(v)).add(sub.get(v));
+            }
+        }
+
+        // Match elements after ellipsis
+        for (int i = 0; i < afterCount; i++) {
+            if (!matchOne(pattern.get(ellipsisIdx + 1 + i),
+                    input.get(input.size() - afterCount + i), bindings, literals, ellipsisVars))
+                return false;
+        }
+        return true;
+    }
+
+    private boolean matchOne(Object pattern, Object input,
+            Map<String, Object> bindings, List<String> literals, Set<String> ellipsisVars) {
+        if (pattern instanceof String sym) {
+            if ("_".equals(sym)) return true;
+            if (literals.contains(sym)) return sym.equals(input);
+            bindings.put(sym, input);
+            return true;
+        }
+        if (pattern instanceof List<?> patList) {
+            if (!(input instanceof List<?> inList)) return false;
+            return matchPattern((List<Object>) patList, (List<Object>) inList, bindings, literals, ellipsisVars);
+        }
+        if (pattern instanceof Long || pattern instanceof Boolean) return pattern.equals(input);
+        return false;
+    }
+
+    private void collectPatternVars(Object pattern, Set<String> vars, List<String> literals) {
+        if (pattern instanceof String sym) {
+            if (!"_".equals(sym) && !"...".equals(sym) && !literals.contains(sym))
+                vars.add(sym);
+        } else if (pattern instanceof List<?> list) {
+            for (Object item : list) collectPatternVars(item, vars, literals);
+        }
+    }
+
+    private void collectSymbols(Object template, Set<String> syms) {
+        if (template instanceof String s) { syms.add(s); }
+        else if (template instanceof List<?> list) {
+            for (Object item : list) collectSymbols(item, syms);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object expandTemplate(Object template, Map<String, Object> bindings,
+            Set<String> ellipsisVars, Map<String, String> renameMap) throws EvalError {
+        if (template instanceof String sym) {
+            if (bindings.containsKey(sym) && !ellipsisVars.contains(sym)) return bindings.get(sym);
+            if (renameMap.containsKey(sym)) return renameMap.get(sym);
+            return sym;
+        }
+        if (template instanceof List<?> list) {
+            List<Object> result = new ArrayList<>();
+            for (int i = 0; i < list.size(); i++) {
+                // Check if next element is ellipsis
+                if (i + 1 < list.size() && "...".equals(list.get(i + 1))) {
+                    // Find ellipsis vars in this sub-template
+                    Set<String> subEllipsis = new HashSet<>();
+                    collectSymbols(list.get(i), subEllipsis);
+                    subEllipsis.retainAll(ellipsisVars);
+
+                    if (!subEllipsis.isEmpty()) {
+                        String firstVar = subEllipsis.iterator().next();
+                        List<Object> varValues = (List<Object>) bindings.get(firstVar);
+                        int count = varValues.size();
+                        for (int j = 0; j < count; j++) {
+                            // Create single-value bindings for this iteration
+                            Map<String, Object> iterBindings = new HashMap<>(bindings);
+                            for (String ev : subEllipsis) {
+                                iterBindings.put(ev, ((List<Object>) bindings.get(ev)).get(j));
+                            }
+                            Set<String> noEllipsis = new HashSet<>(ellipsisVars);
+                            noEllipsis.removeAll(subEllipsis);
+                            result.add(expandTemplate(list.get(i), iterBindings, noEllipsis, renameMap));
+                        }
+                    }
+                    i++; // skip the ...
+                    continue;
+                }
+                result.add(expandTemplate(list.get(i), bindings, ellipsisVars, renameMap));
+            }
+            return result;
+        }
+        return template;
     }
 
     private Object apply(Object proc, List<Object> args) throws EvalError {
