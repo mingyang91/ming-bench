@@ -2,6 +2,7 @@ package ming
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -15,6 +16,101 @@ type IntVal struct {
 }
 
 func (v *IntVal) String() string { return fmt.Sprintf("%d", v.Val) }
+
+// RationalVal represents an exact rational number (num/denom, always simplified, denom > 0).
+type RationalVal struct {
+	Num   int64
+	Denom int64
+}
+
+func (v *RationalVal) String() string { return fmt.Sprintf("%d/%d", v.Num, v.Denom) }
+
+// FloatVal represents an inexact number.
+type FloatVal struct {
+	Val float64
+}
+
+func (v *FloatVal) String() string {
+	s := strconv.FormatFloat(v.Val, 'f', -1, 64)
+	// Ensure there's always a decimal point
+	if !strings.Contains(s, ".") {
+		s += ".0"
+	}
+	return s
+}
+
+// gcd computes the greatest common divisor (always positive).
+func gcd(a, b int64) int64 {
+	if a < 0 {
+		a = -a
+	}
+	if b < 0 {
+		b = -b
+	}
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+// makeRational creates a simplified rational or integer value.
+func makeRational(num, denom int64) Value {
+	if denom == 0 {
+		return nil // should not happen
+	}
+	if denom < 0 {
+		num, denom = -num, -denom
+	}
+	g := gcd(num, denom)
+	num /= g
+	denom /= g
+	if denom == 1 {
+		return &IntVal{Val: num}
+	}
+	return &RationalVal{Num: num, Denom: denom}
+}
+
+// isNumeric returns true if the value is a number (int, rational, or float).
+func isNumeric(v Value) bool {
+	switch v.(type) {
+	case *IntVal, *RationalVal, *FloatVal:
+		return true
+	}
+	return false
+}
+
+// toFloat64 converts any numeric value to float64.
+func toFloat64(v Value) (float64, bool) {
+	switch n := v.(type) {
+	case *IntVal:
+		return float64(n.Val), true
+	case *RationalVal:
+		return float64(n.Num) / float64(n.Denom), true
+	case *FloatVal:
+		return n.Val, true
+	}
+	return 0, false
+}
+
+// isExact returns true if the value is an exact number.
+func isExact(v Value) bool {
+	switch v.(type) {
+	case *IntVal, *RationalVal:
+		return true
+	}
+	return false
+}
+
+// toRational converts exact numbers to (num, denom) form.
+func toRational(v Value) (int64, int64, bool) {
+	switch n := v.(type) {
+	case *IntVal:
+		return n.Val, 1, true
+	case *RationalVal:
+		return n.Num, n.Denom, true
+	}
+	return 0, 0, false
+}
 
 type BoolVal struct {
 	Val bool

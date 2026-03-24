@@ -19,6 +19,8 @@ const (
 	tokSymbol
 	tokQuote
 	tokChar
+	tokFloat
+	tokRational
 	tokEOF
 )
 
@@ -166,9 +168,13 @@ func tokenize(input string) ([]token, error) {
 				col++
 			}
 			text := input[start:i]
-			// try to parse as number
+			// try to parse as integer
 			if _, err := strconv.ParseInt(text, 10, 64); err == nil {
 				tokens = append(tokens, token{tokNumber, text, startLine, startCol})
+			} else if isRationalLiteral(text) {
+				tokens = append(tokens, token{tokRational, text, startLine, startCol})
+			} else if _, err := strconv.ParseFloat(text, 64); err == nil {
+				tokens = append(tokens, token{tokFloat, text, startLine, startCol})
 			} else {
 				tokens = append(tokens, token{tokSymbol, text, startLine, startCol})
 			}
@@ -186,6 +192,23 @@ func isDelimiter(ch byte) bool {
 		ch == '(' || ch == ')' || ch == '"' || ch == ';'
 }
 
+// isRationalLiteral checks if text matches pattern like "1/3", "-2/5", etc.
+func isRationalLiteral(text string) bool {
+	slash := strings.IndexByte(text, '/')
+	if slash <= 0 || slash == len(text)-1 {
+		return false
+	}
+	numPart := text[:slash]
+	denomPart := text[slash+1:]
+	if _, err := strconv.ParseInt(numPart, 10, 64); err != nil {
+		return false
+	}
+	if _, err := strconv.ParseInt(denomPart, 10, 64); err != nil {
+		return false
+	}
+	return true
+}
+
 func isSymbolStart(ch byte) bool {
 	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
 		ch == '!' || ch == '$' || ch == '%' || ch == '&' || ch == '*' ||
@@ -198,6 +221,9 @@ type Expr struct {
 	Kind ExprKind
 	// atom value
 	IVal   int64
+	FVal   float64
+	Num    int64 // rational numerator
+	Denom  int64 // rational denominator
 	SVal   string
 	BVal   bool
 	RVal   rune
@@ -216,6 +242,8 @@ const (
 	ExprSymbol
 	ExprList
 	ExprChar
+	ExprFloat
+	ExprRational
 )
 
 // parser
@@ -259,6 +287,18 @@ func (p *parser) parseExpr() (*Expr, error) {
 		p.next()
 		n, _ := strconv.ParseInt(t.text, 10, 64)
 		return &Expr{Kind: ExprInt, IVal: n, Line: t.line, Col: t.col}, nil
+
+	case tokFloat:
+		p.next()
+		f, _ := strconv.ParseFloat(t.text, 64)
+		return &Expr{Kind: ExprFloat, FVal: f, Line: t.line, Col: t.col}, nil
+
+	case tokRational:
+		p.next()
+		slash := strings.IndexByte(t.text, '/')
+		num, _ := strconv.ParseInt(t.text[:slash], 10, 64)
+		denom, _ := strconv.ParseInt(t.text[slash+1:], 10, 64)
+		return &Expr{Kind: ExprRational, Num: num, Denom: denom, Line: t.line, Col: t.col}, nil
 
 	case tokBool:
 		p.next()

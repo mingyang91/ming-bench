@@ -65,6 +65,10 @@ func eval(expr *Expr, env *Env) (Value, error) {
 	switch expr.Kind {
 	case ExprInt:
 		return &IntVal{Val: expr.IVal}, nil
+	case ExprFloat:
+		return &FloatVal{Val: expr.FVal}, nil
+	case ExprRational:
+		return makeRational(expr.Num, expr.Denom), nil
 	case ExprBool:
 		return &BoolVal{Val: expr.BVal}, nil
 	case ExprString:
@@ -305,6 +309,16 @@ func defaultEnv(output *strings.Builder) *Env {
 	env.Set("string-downcase", &BuiltinFunc{Name: "string-downcase", Fn: builtinStringDowncase})
 	env.Set(">=", &BuiltinFunc{Name: ">=", Fn: builtinGe})
 
+	// L11 builtins — exact arithmetic & rationals
+	env.Set("exact?", &BuiltinFunc{Name: "exact?", Fn: builtinExactQ})
+	env.Set("inexact?", &BuiltinFunc{Name: "inexact?", Fn: builtinInexactQ})
+	env.Set("exact->inexact", &BuiltinFunc{Name: "exact->inexact", Fn: builtinExactToInexact})
+	env.Set("inexact->exact", &BuiltinFunc{Name: "inexact->exact", Fn: builtinInexactToExact})
+	env.Set("numerator", &BuiltinFunc{Name: "numerator", Fn: builtinNumerator})
+	env.Set("denominator", &BuiltinFunc{Name: "denominator", Fn: builtinDenominator})
+	env.Set("integer?", &BuiltinFunc{Name: "integer?", Fn: builtinIntegerQ})
+	env.Set("rational?", &BuiltinFunc{Name: "rational?", Fn: builtinRationalQ})
+
 	return env
 }
 
@@ -320,108 +334,186 @@ func requireInts(name string, args []Value) ([]int64, error) {
 	return nums, nil
 }
 
+// hasInexact returns true if any argument is a FloatVal.
+func hasInexact(args []Value) bool {
+	for _, a := range args {
+		if _, ok := a.(*FloatVal); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// requireNumeric checks all args are numeric.
+func requireNumeric(name string, args []Value) error {
+	for _, a := range args {
+		if !isNumeric(a) {
+			return fmt.Errorf("%s: expected number, got %s", name, a.String())
+		}
+	}
+	return nil
+}
+
+// addRat adds two rationals: a/b + c/d = (ad+bc)/bd
+func addRat(an, ad, bn, bd int64) (int64, int64) {
+	return an*bd + bn*ad, ad * bd
+}
+
+// subRat subtracts two rationals: a/b - c/d = (ad-bc)/bd
+func subRat(an, ad, bn, bd int64) (int64, int64) {
+	return an*bd - bn*ad, ad * bd
+}
+
+// mulRat multiplies two rationals: a/b * c/d = ac/bd
+func mulRat(an, ad, bn, bd int64) (int64, int64) {
+	return an * bn, ad * bd
+}
+
+// divRat divides two rationals: a/b / c/d = ad/bc
+func divRat(an, ad, bn, bd int64) (int64, int64) {
+	return an * bd, ad * bn
+}
+
 func builtinAdd(args []Value) (Value, error) {
-	nums, err := requireInts("+", args)
-	if err != nil {
+	if err := requireNumeric("+", args); err != nil {
 		return nil, err
 	}
-	var sum int64
-	for _, n := range nums {
-		sum += n
+	if hasInexact(args) {
+		var sum float64
+		for _, a := range args {
+			f, _ := toFloat64(a)
+			sum += f
+		}
+		return &FloatVal{Val: sum}, nil
 	}
-	return &IntVal{Val: sum}, nil
+	rn, rd := int64(0), int64(1)
+	for _, a := range args {
+		an, ad, _ := toRational(a)
+		rn, rd = addRat(rn, rd, an, ad)
+	}
+	return makeRational(rn, rd), nil
 }
 
 func builtinSub(args []Value) (Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("-: need at least 1 argument")
 	}
-	nums, err := requireInts("-", args)
-	if err != nil {
+	if err := requireNumeric("-", args); err != nil {
 		return nil, err
 	}
-	if len(nums) == 1 {
-		return &IntVal{Val: -nums[0]}, nil
+	if hasInexact(args) {
+		f0, _ := toFloat64(args[0])
+		if len(args) == 1 {
+			return &FloatVal{Val: -f0}, nil
+		}
+		for _, a := range args[1:] {
+			f, _ := toFloat64(a)
+			f0 -= f
+		}
+		return &FloatVal{Val: f0}, nil
 	}
-	result := nums[0]
-	for _, n := range nums[1:] {
-		result -= n
+	an, ad, _ := toRational(args[0])
+	if len(args) == 1 {
+		return makeRational(-an, ad), nil
 	}
-	return &IntVal{Val: result}, nil
+	for _, a := range args[1:] {
+		bn, bd, _ := toRational(a)
+		an, ad = subRat(an, ad, bn, bd)
+	}
+	return makeRational(an, ad), nil
 }
 
 func builtinMul(args []Value) (Value, error) {
-	nums, err := requireInts("*", args)
-	if err != nil {
+	if err := requireNumeric("*", args); err != nil {
 		return nil, err
 	}
-	result := int64(1)
-	for _, n := range nums {
-		result *= n
+	if hasInexact(args) {
+		result := 1.0
+		for _, a := range args {
+			f, _ := toFloat64(a)
+			result *= f
+		}
+		return &FloatVal{Val: result}, nil
 	}
-	return &IntVal{Val: result}, nil
+	rn, rd := int64(1), int64(1)
+	for _, a := range args {
+		an, ad, _ := toRational(a)
+		rn, rd = mulRat(rn, rd, an, ad)
+	}
+	return makeRational(rn, rd), nil
 }
 
 func builtinDiv(args []Value) (Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("/: need at least 2 arguments")
 	}
-	nums, err := requireInts("/", args)
-	if err != nil {
+	if err := requireNumeric("/", args); err != nil {
 		return nil, err
 	}
-	result := nums[0]
-	for _, n := range nums[1:] {
-		if n == 0 {
+	if hasInexact(args) {
+		f0, _ := toFloat64(args[0])
+		for _, a := range args[1:] {
+			f, _ := toFloat64(a)
+			if f == 0 {
+				return nil, fmt.Errorf("/: division by zero")
+			}
+			f0 /= f
+		}
+		return &FloatVal{Val: f0}, nil
+	}
+	an, ad, _ := toRational(args[0])
+	for _, a := range args[1:] {
+		bn, bd, _ := toRational(a)
+		if bn == 0 {
 			return nil, fmt.Errorf("/: division by zero")
 		}
-		result /= n
+		an, ad = divRat(an, ad, bn, bd)
 	}
-	return &IntVal{Val: result}, nil
+	return makeRational(an, ad), nil
+}
+
+func numericCompare(name string, args []Value) (float64, float64, error) {
+	if len(args) != 2 {
+		return 0, 0, fmt.Errorf("%s: expected 2 arguments", name)
+	}
+	if err := requireNumeric(name, args); err != nil {
+		return 0, 0, err
+	}
+	a, _ := toFloat64(args[0])
+	b, _ := toFloat64(args[1])
+	return a, b, nil
 }
 
 func builtinLt(args []Value) (Value, error) {
-	if len(args) != 2 {
-		return nil, fmt.Errorf("<: expected 2 arguments")
-	}
-	nums, err := requireInts("<", args)
+	a, b, err := numericCompare("<", args)
 	if err != nil {
 		return nil, err
 	}
-	return &BoolVal{Val: nums[0] < nums[1]}, nil
+	return &BoolVal{Val: a < b}, nil
 }
 
 func builtinGt(args []Value) (Value, error) {
-	if len(args) != 2 {
-		return nil, fmt.Errorf(">: expected 2 arguments")
-	}
-	nums, err := requireInts(">", args)
+	a, b, err := numericCompare(">", args)
 	if err != nil {
 		return nil, err
 	}
-	return &BoolVal{Val: nums[0] > nums[1]}, nil
+	return &BoolVal{Val: a > b}, nil
 }
 
 func builtinEq(args []Value) (Value, error) {
-	if len(args) != 2 {
-		return nil, fmt.Errorf("=: expected 2 arguments")
-	}
-	nums, err := requireInts("=", args)
+	a, b, err := numericCompare("=", args)
 	if err != nil {
 		return nil, err
 	}
-	return &BoolVal{Val: nums[0] == nums[1]}, nil
+	return &BoolVal{Val: a == b}, nil
 }
 
 func builtinLe(args []Value) (Value, error) {
-	if len(args) != 2 {
-		return nil, fmt.Errorf("<=: expected 2 arguments")
-	}
-	nums, err := requireInts("<=", args)
+	a, b, err := numericCompare("<=", args)
 	if err != nil {
 		return nil, err
 	}
-	return &BoolVal{Val: nums[0] <= nums[1]}, nil
+	return &BoolVal{Val: a <= b}, nil
 }
 
 func builtinNot(args []Value) (Value, error) {
@@ -938,8 +1030,7 @@ func builtinNumberQ(args []Value) (Value, error) {
 	if len(args) != 1 {
 		return nil, fmt.Errorf("number?: expected 1 argument")
 	}
-	_, ok := args[0].(*IntVal)
-	return &BoolVal{Val: ok}, nil
+	return &BoolVal{Val: isNumeric(args[0])}, nil
 }
 
 func builtinStringQ(args []Value) (Value, error) {
@@ -1603,12 +1694,132 @@ func builtinStringDowncase(args []Value) (Value, error) {
 }
 
 func builtinGe(args []Value) (Value, error) {
-	if len(args) != 2 {
-		return nil, fmt.Errorf(">=: expected 2 arguments")
-	}
-	nums, err := requireInts(">=", args)
+	a, b, err := numericCompare(">=", args)
 	if err != nil {
 		return nil, err
 	}
-	return &BoolVal{Val: nums[0] >= nums[1]}, nil
+	return &BoolVal{Val: a >= b}, nil
+}
+
+// L11 builtins
+
+func builtinExactQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("exact?: expected 1 argument, got %d", len(args))
+	}
+	return &BoolVal{Val: isExact(args[0])}, nil
+}
+
+func builtinInexactQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("inexact?: expected 1 argument, got %d", len(args))
+	}
+	_, ok := args[0].(*FloatVal)
+	return &BoolVal{Val: ok}, nil
+}
+
+func builtinExactToInexact(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("exact->inexact: expected 1 argument, got %d", len(args))
+	}
+	f, ok := toFloat64(args[0])
+	if !ok {
+		return nil, fmt.Errorf("exact->inexact: expected number, got %s", args[0].String())
+	}
+	return &FloatVal{Val: f}, nil
+}
+
+func builtinInexactToExact(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("inexact->exact: expected 1 argument, got %d", len(args))
+	}
+	switch n := args[0].(type) {
+	case *IntVal:
+		return n, nil
+	case *RationalVal:
+		return n, nil
+	case *FloatVal:
+		// Convert float to rational using continued fraction approximation
+		// For simple cases like 0.5 -> 1/2
+		num, denom := float64ToRational(n.Val)
+		return makeRational(num, denom), nil
+	default:
+		return nil, fmt.Errorf("inexact->exact: expected number, got %s", args[0].String())
+	}
+}
+
+// float64ToRational converts a float64 to a rational approximation.
+func float64ToRational(f float64) (int64, int64) {
+	if f == 0 {
+		return 0, 1
+	}
+	sign := int64(1)
+	if f < 0 {
+		sign = -1
+		f = -f
+	}
+	// Use the standard approach: multiply by power of 2 to get integer ratio
+	// For common fractions, check if f*denom is close to integer
+	for denom := int64(1); denom <= 1000000; denom++ {
+		num := f * float64(denom)
+		rounded := math.Round(num)
+		if math.Abs(num-rounded) < 1e-9 {
+			return sign * int64(rounded), denom
+		}
+	}
+	// fallback
+	return sign * int64(math.Round(f*1000000)), 1000000
+}
+
+func builtinNumerator(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("numerator: expected 1 argument, got %d", len(args))
+	}
+	switch n := args[0].(type) {
+	case *IntVal:
+		return n, nil
+	case *RationalVal:
+		return &IntVal{Val: n.Num}, nil
+	default:
+		return nil, fmt.Errorf("numerator: expected exact number, got %s", args[0].String())
+	}
+}
+
+func builtinDenominator(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("denominator: expected 1 argument, got %d", len(args))
+	}
+	switch args[0].(type) {
+	case *IntVal:
+		return &IntVal{Val: 1}, nil
+	case *RationalVal:
+		return &IntVal{Val: args[0].(*RationalVal).Denom}, nil
+	default:
+		return nil, fmt.Errorf("denominator: expected exact number, got %s", args[0].String())
+	}
+}
+
+func builtinIntegerQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("integer?: expected 1 argument, got %d", len(args))
+	}
+	switch n := args[0].(type) {
+	case *IntVal:
+		return &BoolVal{Val: true}, nil
+	case *RationalVal:
+		// 4/2 simplifies to IntVal, so a RationalVal always has denom != 1
+		_ = n
+		return &BoolVal{Val: false}, nil
+	case *FloatVal:
+		return &BoolVal{Val: n.Val == math.Floor(n.Val)}, nil
+	default:
+		return &BoolVal{Val: false}, nil
+	}
+}
+
+func builtinRationalQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("rational?: expected 1 argument, got %d", len(args))
+	}
+	return &BoolVal{Val: isExact(args[0])}, nil
 }
