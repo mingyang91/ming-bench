@@ -16,7 +16,8 @@ type SchemeValBase =
   | { tag: 'nil' }
   | { tag: 'procedure'; value: (...args: SchemeVal[]) => SchemeVal }
   | { tag: 'void' }
-  | { tag: 'macro'; literals: string[]; rules: { pattern: SchemeVal; template: SchemeVal }[]; defEnv: Env };
+  | { tag: 'macro'; literals: string[]; rules: { pattern: SchemeVal; template: SchemeVal }[]; defEnv: Env }
+  | { tag: 'record'; typeName: string; typeId: symbol; fields: Map<string, SchemeVal> };
 
 type SchemeVal = SchemeValBase & { pos?: Pos };
 
@@ -287,6 +288,7 @@ function displayVal(val: SchemeVal): string {
     case 'procedure': return '#<procedure>';
     case 'macro': return '#<macro>';
     case 'list': return `(${val.value.map(displayVal).join(' ')})`;
+    case 'record': return `#<record:${val.typeName}>`;
   }
 }
 
@@ -938,7 +940,7 @@ function gensym(base: string): string {
 
 const SPECIAL_FORMS = new Set([
   'define', 'set!', 'if', 'quote', 'lambda', 'and', 'or', 'begin',
-  'let', 'cond', 'define-syntax', 'syntax-rules',
+  'let', 'cond', 'define-syntax', 'syntax-rules', 'define-record-type',
 ]);
 
 interface PatternBindings {
@@ -1402,6 +1404,64 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
               macroRules.push({ pattern: rule.value[0], template: rule.value[1] });
             }
             env.set(macroName, { tag: 'macro', literals: macroLiterals, rules: macroRules, defEnv: env });
+            return { tag: 'void' };
+          }
+          case 'define-record-type': {
+            // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+            if (elems.length < 4) throw errAt('define-record-type requires at least 3 arguments', expr.pos);
+            const nameForm = elems[1];
+            if (nameForm.tag !== 'symbol') throw errAt('define-record-type: expected type name', expr.pos);
+            const typeName = nameForm.value;
+            const typeId = Symbol(typeName);
+
+            const ctorForm = elems[2];
+            if (ctorForm.tag !== 'list' || ctorForm.value.length < 1)
+              throw errAt('define-record-type: expected constructor', expr.pos);
+            const ctorName = ctorForm.value[0];
+            if (ctorName.tag !== 'symbol') throw errAt('define-record-type: constructor name must be a symbol', expr.pos);
+            const ctorFields = ctorForm.value.slice(1).map(f => {
+              if (f.tag !== 'symbol') throw errAt('define-record-type: field name must be a symbol', f.pos);
+              return f.value;
+            });
+
+            const predForm = elems[3];
+            if (predForm.tag !== 'symbol') throw errAt('define-record-type: expected predicate name', expr.pos);
+
+            // Constructor
+            env.set(ctorName.value, { tag: 'procedure', value: (...args: SchemeVal[]) => {
+              if (args.length !== ctorFields.length)
+                throw new EvalError(`${ctorName.value}: expected ${ctorFields.length} arguments, got ${args.length}`);
+              const fields = new Map<string, SchemeVal>();
+              for (let i = 0; i < ctorFields.length; i++) {
+                fields.set(ctorFields[i], args[i]);
+              }
+              return { tag: 'record', typeName, typeId, fields };
+            }});
+
+            // Predicate
+            env.set(predForm.value, { tag: 'procedure', value: (...args: SchemeVal[]) => {
+              if (args.length !== 1) throw new EvalError(`${predForm.value}: expected 1 argument`);
+              return { tag: 'boolean', value: args[0].tag === 'record' && args[0].typeId === typeId };
+            }});
+
+            // Field accessors
+            for (let i = 4; i < elems.length; i++) {
+              const fieldDef = elems[i];
+              if (fieldDef.tag !== 'list' || fieldDef.value.length < 2)
+                throw errAt('define-record-type: expected (field accessor)', fieldDef.pos);
+              const fieldName = fieldDef.value[0];
+              const accessorName = fieldDef.value[1];
+              if (fieldName.tag !== 'symbol' || accessorName.tag !== 'symbol')
+                throw errAt('define-record-type: field/accessor must be symbols', fieldDef.pos);
+              const fn = fieldName.value;
+              env.set(accessorName.value, { tag: 'procedure', value: (...args: SchemeVal[]) => {
+                if (args.length !== 1) throw new EvalError(`${accessorName.value}: expected 1 argument`);
+                if (args[0].tag !== 'record' || args[0].typeId !== typeId)
+                  throw new EvalError(`${accessorName.value}: expected ${typeName}`);
+                return args[0].fields.get(fn)!;
+              }});
+            }
+
             return { tag: 'void' };
           }
         }
