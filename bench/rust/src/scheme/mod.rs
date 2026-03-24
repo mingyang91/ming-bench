@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug, Clone)]
 enum Value {
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64), // numerator, denominator (always simplified, denom > 0, denom != 1)
     Boolean(bool),
     Str(String),
     Symbol(String),
@@ -35,10 +37,40 @@ enum Value {
     Void,
 }
 
+fn gcd(a: i64, b: i64) -> i64 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+fn make_rational(n: i64, d: i64) -> Value {
+    let (n, d) = if d < 0 { (-n, -d) } else { (n, d) };
+    let g = gcd(n.abs(), d);
+    let (n, d) = (n / g, d / g);
+    if d == 1 {
+        Value::Integer(n)
+    } else {
+        Value::Rational(n, d)
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Integer(n) => write!(f, "{n}"),
+            Value::Float(v) => {
+                let s = format!("{v}");
+                if s.contains('.') || s.contains('e') || s.contains('E') || s.contains("inf") || s.contains("NaN") {
+                    write!(f, "{s}")
+                } else {
+                    write!(f, "{s}.0")
+                }
+            }
+            Value::Rational(n, d) => write!(f, "{n}/{d}"),
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
             Value::Str(s) => write!(f, "\"{s}\""),
@@ -223,6 +255,8 @@ enum Token {
     Quote,
     Symbol(String),
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64),
     Boolean(bool),
     Str(String),
     Char(char),
@@ -259,6 +293,28 @@ fn parse_char_literal(chars: &[char], pos: usize, start_pos: Pos) -> Result<(cha
         _ => return Err(EvalError::Parse(format!("{start_pos}: unknown character name: {name}"))),
     };
     Ok((ch, consumed))
+}
+
+fn parse_word_token(word: &str) -> Token {
+    if let Ok(n) = word.parse::<i64>() {
+        return Token::Integer(n);
+    }
+    if let Some(slash) = word.find('/') {
+        if slash > 0 && slash < word.len() - 1 {
+            if let (Ok(n), Ok(d)) = (word[..slash].parse::<i64>(), word[slash+1..].parse::<i64>()) {
+                if d != 0 {
+                    return Token::Rational(n, d);
+                }
+            }
+        }
+        return Token::Symbol(word.to_string());
+    }
+    if let Ok(f) = word.parse::<f64>() {
+        if word.contains('.') {
+            return Token::Float(f);
+        }
+    }
+    Token::Symbol(word.to_string())
 }
 
 fn tokenize(input: &str) -> Result<Vec<SpannedToken>, EvalError> {
@@ -377,11 +433,8 @@ fn tokenize(input: &str) -> Result<Vec<SpannedToken>, EvalError> {
                     col += 1;
                 }
                 let word: String = chars[start..i].iter().collect();
-                if let Ok(n) = word.parse::<i64>() {
-                    tokens.push(SpannedToken { token: Token::Integer(n), pos: start_pos });
-                } else {
-                    tokens.push(SpannedToken { token: Token::Symbol(word), pos: start_pos });
-                }
+                let token = parse_word_token(&word);
+                tokens.push(SpannedToken { token, pos: start_pos });
             }
         }
     }
@@ -393,6 +446,8 @@ fn tokenize(input: &str) -> Result<Vec<SpannedToken>, EvalError> {
 #[derive(Debug, Clone)]
 enum Expr {
     Integer(i64, Pos),
+    Float(f64, Pos),
+    Rational(i64, i64, Pos),
     Boolean(bool, Pos),
     Str(String, Pos),
     Symbol(String, Pos),
@@ -404,6 +459,8 @@ impl Expr {
     fn pos(&self) -> Pos {
         match self {
             Expr::Integer(_, p)
+            | Expr::Float(_, p)
+            | Expr::Rational(_, _, p)
             | Expr::Boolean(_, p)
             | Expr::Str(_, p)
             | Expr::Symbol(_, p)
@@ -424,6 +481,16 @@ fn parse(tokens: &[SpannedToken], pos: &mut usize) -> Result<Expr, EvalError> {
             let n = *n;
             *pos += 1;
             Ok(Expr::Integer(n, src_pos))
+        }
+        Token::Float(f) => {
+            let f = *f;
+            *pos += 1;
+            Ok(Expr::Float(f, src_pos))
+        }
+        Token::Rational(n, d) => {
+            let (n, d) = (*n, *d);
+            *pos += 1;
+            Ok(Expr::Rational(n, d, src_pos))
         }
         Token::Boolean(b) => {
             let b = *b;
@@ -494,6 +561,9 @@ const BUILTINS: &[&str] = &[
     "apply", "eq?", "equal?", "map",
     "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
     "zero?", "positive?", "negative?", "odd?", "even?",
+    "integer?", "rational?", "exact?", "inexact?",
+    "exact->inexact", "inexact->exact",
+    "numerator", "denominator",
     "list-ref", "list-tail", "list?", "assoc",
     "char=?", "char<?", "char-alphabetic?", "char-numeric?",
     "char-upcase", "char-downcase",
@@ -505,6 +575,8 @@ fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError>
     let p = expr.pos();
     match expr {
         Expr::Integer(n, _) => Ok(Value::Integer(*n)),
+        Expr::Float(f, _) => Ok(Value::Float(*f)),
+        Expr::Rational(n, d, _) => Ok(make_rational(*n, *d)),
         Expr::Boolean(b, _) => Ok(Value::Boolean(*b)),
         Expr::Str(s, _) => Ok(Value::Str(s.clone())),
         Expr::Char(c, _) => Ok(Value::Char(*c)),
@@ -572,6 +644,8 @@ fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError>
 fn expr_to_value(expr: &Expr) -> Value {
     match expr {
         Expr::Integer(n, _) => Value::Integer(*n),
+        Expr::Float(f, _) => Value::Float(*f),
+        Expr::Rational(n, d, _) => make_rational(*n, *d),
         Expr::Boolean(b, _) => Value::Boolean(*b),
         Expr::Str(s, _) => Value::Str(s.clone()),
         Expr::Symbol(s, _) => Value::Symbol(s.clone()),
@@ -864,6 +938,15 @@ fn as_integer(v: &Value, call_pos: Pos) -> Result<i64, EvalError> {
     }
 }
 
+fn value_to_f64(v: &Value, call_pos: Pos) -> Result<f64, EvalError> {
+    match v {
+        Value::Integer(n) => Ok(*n as f64),
+        Value::Float(f) => Ok(*f),
+        Value::Rational(n, d) => Ok(*n as f64 / *d as f64),
+        _ => Err(EvalError::Type(format!("{call_pos}: expected number, got {v}"))),
+    }
+}
+
 fn apply_func(func: &Value, args: &[Value], call_pos: Pos, output: &mut String) -> Result<Value, EvalError> {
     match func {
         Value::Builtin(name) => apply_builtin(name, args, call_pos, output),
@@ -915,6 +998,8 @@ fn values_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Boolean(a), Value::Boolean(b)) => a == b,
         (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
+        (Value::Rational(an, ad), Value::Rational(bn, bd)) => an == bn && ad == bd,
         (Value::Symbol(a), Value::Symbol(b)) => a == b,
         (Value::Char(a), Value::Char(b)) => a == b,
         (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
@@ -926,6 +1011,8 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Boolean(a), Value::Boolean(b)) => a == b,
         (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
+        (Value::Rational(an, ad), Value::Rational(bn, bd)) => an == bn && ad == bd,
         (Value::Symbol(a), Value::Symbol(b)) => a == b,
         (Value::Char(a), Value::Char(b)) => a == b,
         (Value::Str(a), Value::Str(b)) => a == b,
