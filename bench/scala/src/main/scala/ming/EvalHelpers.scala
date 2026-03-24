@@ -25,6 +25,32 @@ object EvalHelpers:
       }
       (names, None)
 
+  /** Convert a SchemeVal to an Expr (for datum->syntax) */
+  def valToExpr(v: SchemeVal): Expr = v match
+    case SchemeVal.IntVal(n)      => Expr.IntLit(n)
+    case SchemeVal.FloatVal(d)    => Expr.FloatLit(d)
+    case SchemeVal.RatVal(n, d)   => Expr.RatLit(n, d)
+    case SchemeVal.BoolVal(b)     => Expr.BoolLit(b)
+    case SchemeVal.StrVal(s)      => Expr.StrLit(new String(s))
+    case SchemeVal.SymVal(n)      => Expr.Symbol(n)
+    case SchemeVal.CharVal(c)     => Expr.CharLit(c)
+    case SchemeVal.ListVal(Nil)   => Expr.SList(Nil)
+    case SchemeVal.ListVal(elems) => Expr.SList(elems.map(valToExpr))
+    case SchemeVal.SyntaxObj(e)   => e
+    case _                        => throw new EvalError(s"cannot convert to syntax: ${v.display}")
+
+  /** Convert an Expr to a SchemeVal (for syntax->datum) */
+  def exprToVal(e: Expr): SchemeVal = e match
+    case Expr.IntLit(n)    => SchemeVal.IntVal(n)
+    case Expr.FloatLit(d)  => SchemeVal.FloatVal(d)
+    case Expr.RatLit(n, d) => SchemeNum.makeRational(n, d)
+    case Expr.BoolLit(b)   => SchemeVal.BoolVal(b)
+    case Expr.StrLit(s)    => SchemeVal.StrVal(s.toCharArray)
+    case Expr.Symbol(n)    => SchemeVal.SymVal(n)
+    case Expr.CharLit(c)   => SchemeVal.CharVal(c)
+    case Expr.SList(Nil)   => SchemeVal.ListVal(Nil)
+    case Expr.SList(elems) => SchemeVal.ListVal(elems.map(exprToVal))
+
   def quoteToVal(expr: Expr): SchemeVal = expr match
     case Expr.IntLit(n)    => SchemeVal.IntVal(n)
     case Expr.FloatLit(d)  => SchemeVal.FloatVal(d)

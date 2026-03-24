@@ -6,22 +6,16 @@ object Evaluator:
 
   val outputBuffer: ThreadLocal[StringBuilder] = ThreadLocal.withInitial(() => new StringBuilder)
 
-  // --- call/cc support ---
   private val contIdCounter                                  = new java.util.concurrent.atomic.AtomicLong(0)
   private[ming] def nextContId(): Long                       = contIdCounter.incrementAndGet()
   private[ming] val currentBodyCtx: ThreadLocal[BodyContext] = ThreadLocal.withInitial(() => null)
   private[ming] val pendingCCReturn: ThreadLocal[SchemeVal]  = ThreadLocal.withInitial(() => null)
-
-  // --- dynamic-wind support ---
-  private[ming] val windStack: ThreadLocal[List[WindEntry]] = ThreadLocal.withInitial(() => Nil)
+  private[ming] val windStack: ThreadLocal[List[WindEntry]]  = ThreadLocal.withInitial(() => Nil)
 
   private[ming] def isTruthy(v: SchemeVal): Boolean = v match
     case SchemeVal.BoolVal(false) => false
     case _                        => true
 
-  /** Evaluate all body exprs, returning the last value (fully evaluated). Handles ContinuationReturn for reentrant
-    * continuation support.
-    */
   private[ming] def evalBody(body: List[Expr], env: Env, startIdx: Int = 0): SchemeVal =
     var result: SchemeVal = SchemeVal.Void
     var i                 = startIdx
@@ -52,9 +46,6 @@ object Evaluator:
       finally currentBodyCtx.set(prev)
     result
 
-  /** Evaluate all but last body expr; return TailCall for the last (for TCO). Pushes body context for each expression
-    * so call/cc can capture it.
-    */
   private[ming] def evalBodyTail(body: List[Expr], env: Env): SchemeVal =
     if body.isEmpty then SchemeVal.Void
     else
@@ -88,7 +79,6 @@ object Evaluator:
     env.define(name, SchemeVal.Macro(literals, ruleList, env))
     SchemeVal.Void
 
-  /** Trampoline: resolve TailCall chain into a final value */
   private def trampoline(initial: SchemeVal): SchemeVal =
     var result = initial
     while result.isInstanceOf[SchemeVal.TailCall] do
@@ -96,11 +86,9 @@ object Evaluator:
       result = evalInner(e, env)
     result
 
-  /** Public eval: always returns a fully evaluated value (trampolines internally) */
   private[ming] def eval(expr: Expr, env: Env): SchemeVal =
     trampoline(evalInner(expr, env))
 
-  /** Handle call/cc as a special form */
   private def evalCallCC(procExpr: Expr, env: Env): SchemeVal =
     val pending = pendingCCReturn.get()
     if pending != null then
@@ -110,7 +98,6 @@ object Evaluator:
       val proc = eval(procExpr, env)
       performCallCC(proc)
 
-  /** Shared call/cc logic: create continuation, call proc, handle escape */
   private[ming] def performCallCC(proc: SchemeVal): SchemeVal =
     val ctx    = currentBodyCtx.get()
     val contId = nextContId()
@@ -124,7 +111,6 @@ object Evaluator:
     try applyProc(proc, List(cont))
     catch case cr: ContinuationReturn if cr.contId == contId => cr.value
 
-  /** Inner eval: may return TailCall for tail positions */
   private def evalInner(expr: Expr, env: Env): SchemeVal =
     try
       expr match
@@ -143,7 +129,6 @@ object Evaluator:
         if posPattern.matches(msg) then throw e
         else throw new EvalError(s"$msg at ${posStr(expr)}")
 
-  /** Dispatch on S-expression forms */
   private def evalSList(elems: List[Expr], expr: Expr, env: Env): SchemeVal = elems match
     case Nil => SchemeVal.ListVal(Nil)
     case Expr.Symbol("quote") :: arg :: Nil =>
@@ -191,6 +176,10 @@ object Evaluator:
           Expr.Symbol("syntax-rules") :: Expr.SList(lits) :: rules
         ) :: Nil =>
       evalDefineSyntax(name, lits, rules, env)
+    case Expr.Symbol("define-syntax") :: Expr.Symbol(name) :: transformerExpr :: Nil =>
+      val proc = eval(transformerExpr, env)
+      env.define(name, SchemeVal.MacroTransformer(proc, env))
+      SchemeVal.Void
     case Expr.Symbol("define-record-type") :: Expr.Symbol(typeName) ::
         Expr.SList(Expr.Symbol(ctorName) :: ctorFields) ::
         Expr.Symbol(predName) :: fieldDefs =>
@@ -210,35 +199,23 @@ object Evaluator:
     case Expr.Symbol("call-with-current-continuation") :: procExpr :: Nil =>
       evalCallCC(procExpr, env)
     case Expr.Symbol("dynamic-wind") :: inExpr :: bodyExpr :: outExpr :: Nil =>
-      val inThunk   = eval(inExpr, env)
-      val bodyThunk = eval(bodyExpr, env)
-      val outThunk  = eval(outExpr, env)
-      val entry     = new WindEntry(inThunk, outThunk)
-      windStack.set(entry :: windStack.get())
-      applyProc(inThunk, Nil)
-      val result =
-        try applyProc(bodyThunk, Nil)
-        catch
-          case cr: ContinuationReturn =>
-            // Wind already unwound by continuation invocation
-            throw cr
-          case sr: SchemeRaise =>
-            windStack.set(windStack.get().tail)
-            applyProc(outThunk, Nil)
-            throw sr
-      windStack.set(windStack.get().tail)
-      applyProc(outThunk, Nil)
-      result
+      evalDynamicWind(inExpr, bodyExpr, outExpr, env)
     case Expr.Symbol("guard") :: Expr.SList(Expr.Symbol(varName) :: clauses) :: body =>
       EvalForms.evalGuard(varName, clauses, body, env)
+    case Expr.Symbol("syntax-case") :: stxExpr :: Expr.SList(lits) :: clauses =>
+      SyntaxCaseEval.evalSyntaxCase(stxExpr, lits, clauses, env)
+    case Expr.Symbol("syntax") :: tmpl :: Nil =>
+      SyntaxCaseEval.evalSyntaxForm(tmpl, env)
+    case Expr.Symbol("with-syntax") :: Expr.SList(bindings) :: body =>
+      SyntaxCaseEval.evalWithSyntax(bindings, body, env)
     case Expr.Symbol(name) :: _ if MacroExpander.isMacro(name, env) =>
       env.lookup(name) match
-        case m: SchemeVal.Macro => MacroExpander.expandAndEval(expr, name, m, env, eval)
-        case _                  => throw new EvalError(s"$name: expected macro")
+        case m: SchemeVal.Macro             => MacroExpander.expandAndEval(expr, name, m, env, eval)
+        case mt: SchemeVal.MacroTransformer => SyntaxCaseEval.expandSyntaxCaseMacro(expr, name, mt, env)
+        case _                              => throw new EvalError(s"$name: expected macro")
     case head :: args =>
       applyProcInner(eval(head, env), args.map(a => eval(a, env)))
 
-  /** Inner apply: may return TailCall for procedure bodies (used from evalInner) */
   private def applyProcInner(fn: SchemeVal, evaledArgs: List[SchemeVal]): SchemeVal =
     fn match
       case SchemeVal.BuiltinProc(_, f) => f(evaledArgs)
@@ -273,7 +250,6 @@ object Evaluator:
         throw new ContinuationReturn(id, evaledArgs.head, body, startIdx, bodyEnv, callerWind)
       case other => throw new EvalError(s"not a procedure: ${other.display}")
 
-  /** Public apply: always fully evaluates (trampolines TailCall) */
   def applyProc(fn: SchemeVal, evaledArgs: List[SchemeVal]): SchemeVal =
     trampoline(applyProcInner(fn, evaledArgs))
 
@@ -281,6 +257,26 @@ object Evaluator:
     val exprs = Parser.parse(input)
     val env   = Builtins.makeGlobalEnv()
     evalBody(exprs, env).display
+
+  private def evalDynamicWind(inExpr: Expr, bodyExpr: Expr, outExpr: Expr, env: Env): SchemeVal =
+    val inThunk   = eval(inExpr, env)
+    val bodyThunk = eval(bodyExpr, env)
+    val outThunk  = eval(outExpr, env)
+    val entry     = new WindEntry(inThunk, outThunk)
+    windStack.set(entry :: windStack.get())
+    applyProc(inThunk, Nil)
+    val result =
+      try applyProc(bodyThunk, Nil)
+      catch
+        case cr: ContinuationReturn =>
+          throw cr
+        case sr: SchemeRaise =>
+          windStack.set(windStack.get().tail)
+          applyProc(outThunk, Nil)
+          throw sr
+    windStack.set(windStack.get().tail)
+    applyProc(outThunk, Nil)
+    result
 
   def evalStrWithOutput(input: String): (String, String) =
     val buf = outputBuffer.get()

@@ -74,6 +74,9 @@ object Parser:
         case '\'' =>
           buf += Token("'", line, col)
           i += 1; col += 1
+        case '#' if i + 1 < input.length && input(i + 1) == '\'' =>
+          buf += Token("#'", line, col)
+          i += 2; col += 2
         case '"' =>
           val startCol    = col
           val (tok, next) = tokenizeString(input, i + 1)
@@ -120,6 +123,11 @@ object Parser:
       case "'" =>
         val (inner, next) = parseExpr(tokens, pos + 1)
         val expr          = Expr.SList(List(Expr.Symbol("quote"), inner))
+        positions.put(expr, (tok.line, tok.col))
+        (expr, next)
+      case "#'" =>
+        val (inner, next) = parseExpr(tokens, pos + 1)
+        val expr          = Expr.SList(List(Expr.Symbol("syntax"), inner))
         positions.put(expr, (tok.line, tok.col))
         (expr, next)
       case _ =>

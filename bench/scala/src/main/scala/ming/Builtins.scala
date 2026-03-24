@@ -243,5 +243,22 @@ object Builtins:
       ++ VectorBuiltins.equalityBuiltins
       ++ ApplyBuiltins.callccBuiltin
       ++ ApplyBuiltins.valuesBuiltins
-    for (name, proc) <- allBuiltins do env.define(name, proc)
+    val syntaxBuiltins: List[(String, SchemeVal)] = List(
+      "syntax->datum" -> SchemeVal.BuiltinProc(
+        "syntax->datum",
+        {
+          case List(SchemeVal.SyntaxObj(e)) => EvalHelpers.exprToVal(e)
+          case List(other) => throw new EvalError(s"syntax->datum: expected syntax object, got ${other.display}")
+          case args        => throw new EvalError(s"syntax->datum: expected 1 argument, got ${args.length}")
+        }
+      ),
+      "datum->syntax" -> SchemeVal.BuiltinProc(
+        "datum->syntax",
+        {
+          case List(_, datum) => SchemeVal.SyntaxObj(EvalHelpers.valToExpr(datum))
+          case args           => throw new EvalError(s"datum->syntax: expected 2 arguments, got ${args.length}")
+        }
+      )
+    )
+    for (name, proc) <- allBuiltins ++ syntaxBuiltins do env.define(name, proc)
     env

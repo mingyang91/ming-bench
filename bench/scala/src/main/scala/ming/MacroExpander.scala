@@ -6,9 +6,13 @@ object MacroExpander:
 
   private var gensymCounter = 0L
 
-  private def gensym(base: String): String =
+  private[ming] def gensym(base: String): String =
     gensymCounter += 1
     s"$base##$gensymCounter"
+
+  // Thread-local renaming map for syntax-case macro expansion
+  val currentRenaming: ThreadLocal[mutable.Map[String, String]] =
+    ThreadLocal.withInitial(() => null)
 
   private val specialFormNames = Set(
     "quote",
@@ -17,16 +21,32 @@ object MacroExpander:
     "set!",
     "lambda",
     "let",
+    "let*",
     "begin",
     "cond",
     "and",
     "or",
+    "when",
+    "unless",
     "define-syntax",
-    "syntax-rules"
+    "syntax-rules",
+    "syntax-case",
+    "syntax",
+    "with-syntax",
+    "letrec",
+    "letrec*",
+    "case",
+    "do",
+    "case-lambda",
+    "call/cc",
+    "call-with-current-continuation",
+    "dynamic-wind",
+    "guard",
+    "define-record-type"
   )
 
   def isMacro(name: String, env: Env): Boolean =
-    env.lookupOpt(name).exists(_.isInstanceOf[SchemeVal.Macro])
+    env.lookupOpt(name).exists(v => v.isInstanceOf[SchemeVal.Macro] || v.isInstanceOf[SchemeVal.MacroTransformer])
 
   def collectPatVars(expr: Expr, literals: Set[String]): Set[String] =
     expr match
@@ -168,3 +188,57 @@ object MacroExpander:
     }.headOption
 
     matched.getOrElse(throw new EvalError(s"$macroName: no matching syntax rule"))
+
+  /** Expand a syntax template (used by syntax-case's #' / syntax form) */
+  def expandSyntaxTemplate(
+    tmpl: Expr,
+    env: Env,
+    renaming: mutable.Map[String, String]
+  ): Expr =
+    tmpl match
+      case Expr.Symbol(n) =>
+        env.lookupOpt(n) match
+          case Some(_: SchemeVal.SyntaxObj) =>
+            env.lookup(n).asInstanceOf[SchemeVal.SyntaxObj].expr
+          case Some(_: SchemeVal.SyntaxList) =>
+            throw new EvalError(s"syntax: ellipsis variable $n without ellipsis")
+          case _ =>
+            if specialFormNames.contains(n) || n == "..." || n == "_" then tmpl
+            else Expr.Symbol(renaming.getOrElseUpdate(n, gensym(n)))
+      case Expr.SList(Expr.Symbol("quote") :: _) => tmpl
+      case Expr.SList(elems) =>
+        Expr.SList(expandSyntaxTemplateList(elems, env, renaming))
+      case other => other
+
+  private def expandSyntaxTemplateList(
+    elems: List[Expr],
+    env: Env,
+    renaming: mutable.Map[String, String]
+  ): List[Expr] =
+    elems match
+      case Nil => Nil
+      case tmpl :: Expr.Symbol("...") :: rest =>
+        findEllipsisSyntaxVar(tmpl, env) match
+          case Some((name, items)) =>
+            val expanded = items.map { e =>
+              val childEnv = new Env(mutable.Map.empty, Some(env))
+              childEnv.define(name, SchemeVal.SyntaxObj(e))
+              expandSyntaxTemplate(tmpl, childEnv, renaming)
+            }
+            expanded ++ expandSyntaxTemplateList(rest, env, renaming)
+          case None =>
+            expandSyntaxTemplate(tmpl, env, renaming) ::
+              expandSyntaxTemplateList(rest, env, renaming)
+      case tmpl :: rest =>
+        expandSyntaxTemplate(tmpl, env, renaming) ::
+          expandSyntaxTemplateList(rest, env, renaming)
+
+  private def findEllipsisSyntaxVar(tmpl: Expr, env: Env): Option[(String, List[Expr])] =
+    tmpl match
+      case Expr.Symbol(n) =>
+        env.lookupOpt(n) match
+          case Some(SchemeVal.SyntaxList(es)) => Some((n, es))
+          case _                              => None
+      case Expr.SList(elems) =>
+        elems.iterator.flatMap(e => findEllipsisSyntaxVar(e, env)).nextOption()
+      case _ => None

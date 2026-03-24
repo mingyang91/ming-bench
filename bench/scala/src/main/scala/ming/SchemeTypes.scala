@@ -35,6 +35,9 @@ enum SchemeVal:
   case RecordVal(typeName: String, fields: Map[String, SchemeVal])
   case TailCall(expr: Expr, env: Env)
   case ValuesVal(vals: List[SchemeVal])
+  case SyntaxObj(expr: Expr)
+  case SyntaxList(exprs: List[Expr])
+  case MacroTransformer(proc: SchemeVal, defEnv: Env)
   case Void
 
   def display: String = this match
@@ -59,6 +62,9 @@ enum SchemeVal:
     case RecordVal(t, _)                => s"#<$t>"
     case TailCall(_, _)                 => "#<tail-call>"
     case ValuesVal(vals)                => vals.map(_.display).mkString(" ")
+    case SyntaxObj(_)                   => "#<syntax>"
+    case SyntaxList(_)                  => "#<syntax-list>"
+    case MacroTransformer(_, _)         => "#<macro>"
     case Void                           => "#<void>"
 
   /** display format: no quotes on strings */
