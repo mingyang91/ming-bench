@@ -21,6 +21,7 @@ const (
 	valVoid
 	valLambda
 	valChar
+	valBuiltin
 )
 
 type pair struct {
@@ -29,9 +30,10 @@ type pair struct {
 }
 
 type lambda struct {
-	params []string
-	body   []*expr
-	env    *env
+	params    []string
+	restParam string // variadic rest parameter (empty if none)
+	body      []*expr
+	env       *env
 }
 
 type value struct {
@@ -90,6 +92,8 @@ func (v value) String() string {
 	case valChar:
 		return fmt.Sprintf("#\\%c", v.cval)
 	case valLambda:
+		return "#<procedure>"
+	case valBuiltin:
 		return "#<procedure>"
 	default:
 		return "<unknown>"
@@ -500,44 +504,62 @@ func evalInEnv(e *expr, env *env) (value, error) {
 		}
 	}
 
-	// Check if head is a builtin symbol not in env
-	if head.kind == exprAtom && head.atom.kind == valSymbol {
-		if _, ok := env.get(head.atom.sval); !ok && isBuiltin(head.atom.sval) {
-			// Evaluate args and call builtin
-			args := e.list[1:]
-			evaledArgs := make([]value, len(args))
-			for i, a := range args {
-				v, err := evalInEnv(a, env)
-				if err != nil {
-					return value{}, err
-				}
-				evaledArgs[i] = v
-			}
-			return evalBuiltin(head.atom.sval, evaledArgs, e, env)
-		}
-	}
-
 	// Evaluate operator
 	op, err := evalInEnv(head, env)
 	if err != nil {
 		return value{}, err
 	}
 
-	// Lambda call
-	if op.kind == valLambda {
-		args := e.list[1:]
-		evaledArgs := make([]value, len(args))
-		for i, a := range args {
-			v, err := evalInEnv(a, env)
-			if err != nil {
-				return value{}, err
-			}
-			evaledArgs[i] = v
+	// Evaluate arguments
+	args := e.list[1:]
+	evaledArgs := make([]value, len(args))
+	for i, a := range args {
+		v, err := evalInEnv(a, env)
+		if err != nil {
+			return value{}, err
 		}
-		return callLambda(op.lambda, evaledArgs, e)
+		evaledArgs[i] = v
 	}
 
-	return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure: %s", e.line, e.col, op.String())}
+	return callValue(op, evaledArgs, e, env)
+}
+
+func callValue(op value, args []value, callExpr *expr, environ *env) (value, error) {
+	switch op.kind {
+	case valLambda:
+		return callLambda(op.lambda, args, callExpr)
+	case valBuiltin:
+		if op.sval == "apply" {
+			return evalApply(args, callExpr, environ)
+		}
+		return evalBuiltin(op.sval, args, callExpr, environ)
+	default:
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure: %s", callExpr.line, callExpr.col, op.String())}
+	}
+}
+
+func evalApply(args []value, e *expr, environ *env) (value, error) {
+	if len(args) < 2 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: apply: expected at least 2 arguments", e.line, e.col)}
+	}
+	fn := args[0]
+	// Last argument must be a list; prefix args come before it
+	lastArg := args[len(args)-1]
+	// Collect prefix args
+	var allArgs []value
+	for _, a := range args[1 : len(args)-1] {
+		allArgs = append(allArgs, a)
+	}
+	// Flatten the last argument (must be a list)
+	cur := lastArg
+	for cur.kind == valPair {
+		allArgs = append(allArgs, cur.pair.car)
+		cur = cur.pair.cdr
+	}
+	if cur.kind != valNull {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: apply: last argument must be a proper list", e.line, e.col)}
+	}
+	return callValue(fn, allArgs, e, environ)
 }
 
 func evalDefine(e *expr, env *env) (value, error) {
@@ -546,21 +568,18 @@ func evalDefine(e *expr, env *env) (value, error) {
 	}
 	target := e.list[1]
 
-	// (define (f args...) body...)
+	// (define (f args...) body...) or (define (f args . rest) body...)
 	if target.kind == exprList && len(target.list) > 0 {
 		nameExpr := target.list[0]
 		if nameExpr.kind != exprAtom || nameExpr.atom.kind != valSymbol {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol", nameExpr.line, nameExpr.col)}
 		}
 		name := nameExpr.atom.sval
-		params := make([]string, len(target.list)-1)
-		for i, p := range target.list[1:] {
-			if p.kind != exprAtom || p.atom.kind != valSymbol {
-				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected parameter name", p.line, p.col)}
-			}
-			params[i] = p.atom.sval
+		params, restParam, err := parseDottedParams(target.list[1:], e)
+		if err != nil {
+			return value{}, err
 		}
-		lam := &lambda{params: params, body: e.list[2:], env: env}
+		lam := &lambda{params: params, restParam: restParam, body: e.list[2:], env: env}
 		env.set(name, value{kind: valLambda, lambda: lam})
 		return voidVal, nil
 	}
@@ -620,27 +639,68 @@ func evalLambdaForm(e *expr, env *env) (value, error) {
 		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad syntax", e.line, e.col)}
 	}
 	paramExpr := e.list[1]
+	// (lambda args body) — single symbol means all-rest
+	if paramExpr.kind == exprAtom && paramExpr.atom.kind == valSymbol {
+		lam := &lambda{restParam: paramExpr.atom.sval, body: e.list[2:], env: env}
+		return value{kind: valLambda, lambda: lam}, nil
+	}
 	if paramExpr.kind != exprList {
 		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected parameter list", paramExpr.line, paramExpr.col)}
 	}
-	params := make([]string, len(paramExpr.list))
-	for i, p := range paramExpr.list {
-		if p.kind != exprAtom || p.atom.kind != valSymbol {
-			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected parameter name", p.line, p.col)}
-		}
-		params[i] = p.atom.sval
+	params, restParam, err := parseDottedParams(paramExpr.list, e)
+	if err != nil {
+		return value{}, err
 	}
-	lam := &lambda{params: params, body: e.list[2:], env: env}
+	lam := &lambda{params: params, restParam: restParam, body: e.list[2:], env: env}
 	return value{kind: valLambda, lambda: lam}, nil
 }
 
+// parseDottedParams parses a parameter list that may contain dot notation: (a b . rest)
+func parseDottedParams(plist []*expr, e *expr) ([]string, string, error) {
+	var params []string
+	var restParam string
+	for i, p := range plist {
+		if p.kind == exprAtom && p.atom.kind == valSymbol && p.atom.sval == "." {
+			// Next element is the rest param
+			if i+1 >= len(plist) || i+2 != len(plist) {
+				return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: bad dot in parameter list", p.line, p.col)}
+			}
+			rp := plist[i+1]
+			if rp.kind != exprAtom || rp.atom.kind != valSymbol {
+				return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: expected symbol after dot", rp.line, rp.col)}
+			}
+			restParam = rp.atom.sval
+			return params, restParam, nil
+		}
+		if p.kind != exprAtom || p.atom.kind != valSymbol {
+			return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: expected parameter name", p.line, p.col)}
+		}
+		params = append(params, p.atom.sval)
+	}
+	return params, restParam, nil
+}
+
 func callLambda(lam *lambda, args []value, callExpr *expr) (value, error) {
-	if len(args) != len(lam.params) {
-		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: expected %d arguments, got %d", callExpr.line, callExpr.col, len(lam.params), len(args))}
+	if lam.restParam != "" {
+		if len(args) < len(lam.params) {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: expected at least %d arguments, got %d", callExpr.line, callExpr.col, len(lam.params), len(args))}
+		}
+	} else {
+		if len(args) != len(lam.params) {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: expected %d arguments, got %d", callExpr.line, callExpr.col, len(lam.params), len(args))}
+		}
 	}
 	callEnv := newEnv(lam.env)
 	for i, p := range lam.params {
 		callEnv.set(p, args[i])
+	}
+	if lam.restParam != "" {
+		// Collect remaining args into a list
+		rest := nullVal
+		for i := len(args) - 1; i >= len(lam.params); i-- {
+			rest = pairVal(args[i], rest)
+		}
+		callEnv.set(lam.restParam, rest)
 	}
 	var result value
 	var err error
@@ -1193,11 +1253,24 @@ func evalCond(e *expr, env *env) (value, error) {
 
 // ---------- Public API ----------
 
+func builtinVal(name string) value {
+	return value{kind: valBuiltin, sval: name}
+}
+
 func makeTopLevelEnv() *env {
 	e := newEnv(nil)
-	// Register builtins as lambda-like values would be complex;
-	// instead we resolve them at call time via the environment lookup
-	// falling through to isBuiltin check.
+	builtins := []string{
+		"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+		"cons", "car", "cdr", "null?", "list", "length", "append",
+		"string?", "number?", "boolean?", "pair?", "symbol?", "char?",
+		"display", "write", "newline",
+		"string-append", "string-length", "substring", "string-ref",
+		"string->number", "number->string", "symbol->string", "string->symbol",
+		"string-copy", "string-set!", "apply",
+	}
+	for _, name := range builtins {
+		e.set(name, builtinVal(name))
+	}
 	return e
 }
 
