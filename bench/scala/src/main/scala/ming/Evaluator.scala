@@ -11,14 +11,8 @@ object Evaluator:
   private[ming] val currentBodyCtx: ThreadLocal[BodyContext] = ThreadLocal.withInitial(() => null)
   private[ming] val pendingCCReturn: ThreadLocal[SchemeVal]  = ThreadLocal.withInitial(() => null)
   private[ming] val windStack: ThreadLocal[List[WindEntry]]  = ThreadLocal.withInitial(() => Nil)
+  private[ming] val inReentry: ThreadLocal[Boolean]          = ThreadLocal.withInitial(() => false)
 
-  // Flag: true when we are re-evaluating a body due to continuation re-entry.
-  // During re-entry, performCallCC skips creating new continuations to avoid
-  // re-triggering side effects from call/cc lambdas that have already executed.
-  private[ming] val inReentry: ThreadLocal[Boolean] = ThreadLocal.withInitial(() => false)
-
-  // Track bodies currently being evaluated by evalBody (identity-based set).
-  // Used by the trampoline to decide whether to handle ContinuationReturn locally.
   private[ming] val activeBodies: ThreadLocal[java.util.Set[List[Expr]]] =
     ThreadLocal.withInitial(() =>
       java.util.Collections.newSetFromMap(
@@ -79,10 +73,6 @@ object Evaluator:
         currentBodyCtx.set(BodyContext(body, idx, env))
         try eval(body(idx), env)
         finally currentBodyCtx.set(prev)
-      // For multi-expression bodies, set context for the tail position so that
-      // call/cc in the tail expression captures this body's context (not the caller's).
-      // Single-expression bodies inherit the caller's context, which allows
-      // continuations to target the enclosing evalBody for proper re-entry.
       if body.length > 1 then currentBodyCtx.set(BodyContext(body, body.length - 1, env))
       SchemeVal.TailCall(body.last, env)
 
@@ -94,13 +84,32 @@ object Evaluator:
 
   private def trampoline(initial: SchemeVal): SchemeVal =
     var result = initial
-    while result.isInstanceOf[SchemeVal.TailCall] do
-      val SchemeVal.TailCall(e, env) = result: @unchecked
-      try result = evalInner(e, env)
-      catch
-        case cr: ContinuationReturn if (cr.body ne null) && !activeBodies.get().contains(cr.body) =>
-          pendingCCReturn.set(cr.value)
-          result = reenterInnerBody(cr)
+    while result.isInstanceOf[SchemeVal.TailCall] || result.isInstanceOf[SchemeVal.GuardTailCall] do
+      result match
+        case SchemeVal.TailCall(e, env) =>
+          try result = evalInner(e, env)
+          catch
+            case cr: ContinuationReturn if (cr.body ne null) && !activeBodies.get().contains(cr.body) =>
+              pendingCCReturn.set(cr.value)
+              result = reenterInnerBody(cr)
+        case gtc: SchemeVal.GuardTailCall =>
+          try
+            result = evalBodyTail(gtc.body, gtc.env)
+            var guardActive = true
+            while guardActive && result.isInstanceOf[SchemeVal.TailCall] do
+              val SchemeVal.TailCall(e, env2) = result: @unchecked
+              try result = evalInner(e, env2)
+              catch
+                case cr: ContinuationReturn if (cr.body ne null) && !activeBodies.get().contains(cr.body) =>
+                  pendingCCReturn.set(cr.value)
+                  result = reenterInnerBody(cr)
+              if result.isInstanceOf[SchemeVal.GuardTailCall] then guardActive = false
+          catch
+            case sr: SchemeRaise =>
+              val guardEnv = new Env(mutable.Map.empty, Some(gtc.env))
+              guardEnv.define(gtc.varName, sr.value)
+              result = EvalForms.evalGuardClauses(sr.value, gtc.clauses, guardEnv)
+        case _ => () // unreachable
     result
 
   private[ming] def eval(expr: Expr, env: Env): SchemeVal =
@@ -116,11 +125,7 @@ object Evaluator:
       performCallCC(proc)
 
   private[ming] def performCallCC(proc: SchemeVal): SchemeVal =
-    if inReentry.get() then
-      // During continuation re-entry, skip creating new continuations.
-      // This prevents re-triggering side effects (like yield-val) from
-      // call/cc lambdas that were already executed in the original run.
-      SchemeVal.Void
+    if inReentry.get() then SchemeVal.Void
     else
       val ctx    = currentBodyCtx.get()
       val contId = nextContId()
@@ -134,7 +139,7 @@ object Evaluator:
       try applyProc(proc, List(cont))
       catch case cr: ContinuationReturn if cr.contId == contId => cr.value
 
-  private def evalInner(expr: Expr, env: Env): SchemeVal =
+  private[ming] def evalInner(expr: Expr, env: Env): SchemeVal =
     try
       expr match
         case Expr.IntLit(n)    => SchemeVal.IntVal(n)
@@ -224,7 +229,7 @@ object Evaluator:
     case Expr.Symbol("dynamic-wind") :: inExpr :: bodyExpr :: outExpr :: Nil =>
       DynamicWind.evalDynamicWind(eval(inExpr, env), eval(bodyExpr, env), eval(outExpr, env))
     case Expr.Symbol("guard") :: Expr.SList(Expr.Symbol(varName) :: clauses) :: body =>
-      EvalForms.evalGuard(varName, clauses, body, env)
+      SchemeVal.GuardTailCall(varName, clauses, body, env)
     case Expr.Symbol("syntax-case") :: stxExpr :: Expr.SList(lits) :: clauses =>
       SyntaxCaseEval.evalSyntaxCase(stxExpr, lits, clauses, env)
     case Expr.Symbol("syntax") :: tmpl :: Nil =>
@@ -265,12 +270,13 @@ object Evaluator:
           case None =>
             throw new EvalError(s"case-lambda: no matching clause for ${evaledArgs.length} arguments")
       case SchemeVal.ContinuationVal(id, body, startIdx, bodyEnv, savedWind) =>
-        if evaledArgs.length != 1 then
-          throw new EvalError(s"continuation: expected 1 argument, got ${evaledArgs.length}")
-        // Save caller's wind before transition, perform wind transition, then jump
+        val value = evaledArgs match
+          case Nil      => SchemeVal.Void
+          case v :: Nil => v
+          case vs       => SchemeVal.ValuesVal(vs)
         val callerWind = windStack.get()
         DynamicWind.doWindTransition(callerWind, savedWind)
-        throw new ContinuationReturn(id, evaledArgs.head, body, startIdx, bodyEnv, callerWind)
+        throw new ContinuationReturn(id, value, body, startIdx, bodyEnv, callerWind)
       case other => throw new EvalError(s"not a procedure: ${other.display}")
 
   def applyProc(fn: SchemeVal, evaledArgs: List[SchemeVal]): SchemeVal =

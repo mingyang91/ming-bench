@@ -181,9 +181,9 @@ object MacroExpander:
         val patVars  = patElems.tail.flatMap(e => collectPatVars(e, m.literals)).toSet
         val renaming = mutable.Map[String, String]()
         val expanded = expand(template, bindings, renaming, patVars, m.literals, macroName)
-        val evalEnv  = new Env(mutable.Map.empty, Some(useEnv))
-        for (origName, gsName) <- renaming do m.defEnv.lookupOpt(origName).foreach(v => evalEnv.define(gsName, v))
-        evalFn(expanded, evalEnv)
+        // Define gensym bindings in useEnv so that define forms bind at the use site
+        for (origName, gsName) <- renaming do m.defEnv.lookupOpt(origName).foreach(v => useEnv.define(gsName, v))
+        evalFn(expanded, useEnv)
       }
     }.headOption
 

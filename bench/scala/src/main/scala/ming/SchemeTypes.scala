@@ -34,6 +34,7 @@ enum SchemeVal:
   case VectorVal(elems: Array[SchemeVal])
   case RecordVal(typeName: String, fields: Map[String, SchemeVal])
   case TailCall(expr: Expr, env: Env)
+  case GuardTailCall(varName: String, clauses: List[Expr], body: List[Expr], env: Env)
   case ValuesVal(vals: List[SchemeVal])
   case SyntaxObj(expr: Expr)
   case SyntaxList(exprs: List[Expr])
@@ -61,6 +62,7 @@ enum SchemeVal:
     case VectorVal(elems)               => "#(" + elems.map(_.display).mkString(" ") + ")"
     case RecordVal(t, _)                => s"#<$t>"
     case TailCall(_, _)                 => "#<tail-call>"
+    case GuardTailCall(_, _, _, _)      => "#<guard-tail-call>"
     case ValuesVal(vals)                => vals.map(_.display).mkString(" ")
     case SyntaxObj(_)                   => "#<syntax>"
     case SyntaxList(_)                  => "#<syntax-list>"

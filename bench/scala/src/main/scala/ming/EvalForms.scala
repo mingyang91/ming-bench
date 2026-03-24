@@ -164,7 +164,7 @@ object EvalForms:
         guardEnv.define(varName, sr.value)
         evalGuardClauses(sr.value, clauses, guardEnv)
 
-  private def evalGuardClauses(
+  private[ming] def evalGuardClauses(
     raised: SchemeVal,
     clauses: List[Expr],
     env: Env
