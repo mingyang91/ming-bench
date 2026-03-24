@@ -21,7 +21,7 @@ final class Parser {
             skipIgnored();
         }
         if (expressions.isEmpty()) {
-            throw new EvalError("empty program");
+            throw EvalError.syntax(currentPos(), "empty program");
         }
         return List.copyOf(expressions);
     }

@@ -12,7 +12,7 @@ final class Interpreter {
             last = eval(expr, global);
         }
         if (last == null) {
-            throw new EvalError("empty program");
+            throw EvalError.syntax(new SourcePos(1, 1), "empty program");
         }
         return last;
     }
@@ -37,20 +37,20 @@ final class Interpreter {
         if (operator instanceof Expr.SymbolExpr symbolExpr) {
             List<Expr> arguments = elements.subList(1, elements.size());
             return switch (symbolExpr.name()) {
-                case "define" -> evalDefine(arguments, env, listExpr.pos());
-                case "if" -> evalIf(arguments, env, listExpr.pos());
-                case "quote" -> evalQuote(arguments, listExpr.pos());
-                case "lambda" -> evalLambda(arguments, env, listExpr.pos());
+                case "define" -> evalDefine(arguments, env, symbolExpr.pos());
+                case "if" -> evalIf(arguments, env, symbolExpr.pos());
+                case "quote" -> evalQuote(arguments, symbolExpr.pos());
+                case "lambda" -> evalLambda(arguments, env, symbolExpr.pos());
                 case "begin" -> evalBegin(arguments, env);
-                case "let" -> evalLet(arguments, env, listExpr.pos());
-                case "cond" -> evalCond(arguments, env, listExpr.pos());
+                case "let" -> evalLet(arguments, env, symbolExpr.pos());
+                case "cond" -> evalCond(arguments, env, symbolExpr.pos());
                 case "and" -> evalAnd(arguments, env);
                 case "or" -> evalOr(arguments, env);
-                default -> apply(eval(operator, env), arguments, env, listExpr.pos());
+                default -> apply(eval(operator, env), operator, arguments, env);
             };
         }
 
-        return apply(eval(operator, env), elements.subList(1, elements.size()), env, listExpr.pos());
+        return apply(eval(operator, env), operator, elements.subList(1, elements.size()), env);
     }
 
     private Value evalDefine(List<Expr> arguments, Environment env, SourcePos pos) throws EvalError {
@@ -234,7 +234,7 @@ final class Interpreter {
         List<String> parameters = new ArrayList<>(parameterExprs.size());
         for (Expr parameterExpr : parameterExprs) {
             if (!(parameterExpr instanceof Expr.SymbolExpr symbolExpr)) {
-                throw EvalError.syntax(pos, "parameters must be symbols");
+                throw EvalError.syntax(parameterExpr.pos(), "parameters must be symbols");
             }
             parameters.add(symbolExpr.name());
         }
@@ -303,11 +303,12 @@ final class Interpreter {
         };
     }
 
-    private Value apply(Value operator, List<Expr> argumentExprs, Environment env, SourcePos pos) throws EvalError {
+    private Value apply(Value operator, Expr operatorExpr, List<Expr> argumentExprs, Environment env) throws EvalError {
         return switch (operator) {
-            case Value.BuiltinProcedure builtinProcedure -> applyBuiltin(builtinProcedure.name(), argumentExprs, env, pos);
-            case Value.ClosureValue closureValue -> applyClosure(closureValue, argumentExprs, env, pos);
-            default -> throw new EvalError(pos, "attempted to call non-procedure");
+            case Value.BuiltinProcedure builtinProcedure -> applyBuiltin(
+                    builtinProcedure.name(), argumentExprs, env, operatorExpr.pos());
+            case Value.ClosureValue closureValue -> applyClosure(closureValue, argumentExprs, env, operatorExpr.pos());
+            default -> throw new EvalError(operatorExpr.pos(), "attempted to call non-procedure");
         };
     }
 
@@ -344,8 +345,16 @@ final class Interpreter {
         return arguments;
     }
 
+    private List<EvaluatedArgument> evalArgumentsWithPositions(List<Expr> argumentExprs, Environment env) throws EvalError {
+        List<EvaluatedArgument> arguments = new ArrayList<>(argumentExprs.size());
+        for (Expr argumentExpr : argumentExprs) {
+            arguments.add(new EvaluatedArgument(eval(argumentExpr, env), argumentExpr.pos()));
+        }
+        return List.copyOf(arguments);
+    }
+
     private Value applyBuiltin(String name, List<Expr> argumentExprs, Environment env, SourcePos pos) throws EvalError {
-        List<Value> arguments = evalArguments(argumentExprs, env);
+        List<EvaluatedArgument> arguments = evalArgumentsWithPositions(argumentExprs, env);
 
         return switch (name) {
             case "+" -> add(arguments, pos);
@@ -373,62 +382,64 @@ final class Interpreter {
         };
     }
 
-    private Value add(List<Value> arguments, SourcePos pos) throws EvalError {
+    private Value add(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
         long total = 0;
-        for (Value argument : arguments) {
-            total += expectInteger(argument, pos, "+");
+        for (EvaluatedArgument argument : arguments) {
+            total += expectInteger(argument, "+");
         }
         return new Value.IntegerValue(total);
     }
 
-    private Value subtract(List<Value> arguments, SourcePos pos) throws EvalError {
+    private Value subtract(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
         if (arguments.isEmpty()) {
             throw EvalError.arity(pos, "-", "expected at least 1 argument");
         }
 
-        long result = expectInteger(arguments.get(0), pos, "-");
+        long result = expectInteger(arguments.get(0), "-");
         if (arguments.size() == 1) {
             return new Value.IntegerValue(-result);
         }
 
         for (int i = 1; i < arguments.size(); i++) {
-            result -= expectInteger(arguments.get(i), pos, "-");
+            result -= expectInteger(arguments.get(i), "-");
         }
         return new Value.IntegerValue(result);
     }
 
-    private Value multiply(List<Value> arguments, SourcePos pos) throws EvalError {
+    private Value multiply(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
         long product = 1;
-        for (Value argument : arguments) {
-            product *= expectInteger(argument, pos, "*");
+        for (EvaluatedArgument argument : arguments) {
+            product *= expectInteger(argument, "*");
         }
         return new Value.IntegerValue(product);
     }
 
-    private Value divide(List<Value> arguments, SourcePos pos) throws EvalError {
+    private Value divide(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
         if (arguments.size() < 2) {
             throw EvalError.arity(pos, "/", "expected at least 2 arguments");
         }
 
-        long result = expectInteger(arguments.get(0), pos, "/");
+        long result = expectInteger(arguments.get(0), "/");
         for (int i = 1; i < arguments.size(); i++) {
-            long divisor = expectInteger(arguments.get(i), pos, "/");
+            EvaluatedArgument argument = arguments.get(i);
+            long divisor = expectInteger(argument, "/");
             if (divisor == 0) {
-                throw new EvalError(pos, "division by zero");
+                throw new EvalError(argument.pos(), "division by zero");
             }
             result /= divisor;
         }
         return new Value.IntegerValue(result);
     }
 
-    private Value compare(List<Value> arguments, SourcePos pos, String name, LongComparison comparison) throws EvalError {
+    private Value compare(List<EvaluatedArgument> arguments, SourcePos pos, String name, LongComparison comparison)
+            throws EvalError {
         if (arguments.size() <= 1) {
             return new Value.BooleanValue(true);
         }
 
-        long previous = expectInteger(arguments.get(0), pos, name);
+        long previous = expectInteger(arguments.get(0), name);
         for (int i = 1; i < arguments.size(); i++) {
-            long current = expectInteger(arguments.get(i), pos, name);
+            long current = expectInteger(arguments.get(i), name);
             if (!comparison.test(previous, current)) {
                 return new Value.BooleanValue(false);
             }
@@ -437,106 +448,114 @@ final class Interpreter {
         return new Value.BooleanValue(true);
     }
 
-    private Value not(List<Value> arguments, SourcePos pos) throws EvalError {
+    private Value not(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
         if (arguments.size() != 1) {
             throw EvalError.arity(pos, "not", "expected exactly 1 argument");
         }
-        return new Value.BooleanValue(!arguments.get(0).isTruthy());
+        return new Value.BooleanValue(!arguments.get(0).value().isTruthy());
     }
 
-    private Value cons(List<Value> arguments, SourcePos pos) throws EvalError {
+    private Value cons(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
         if (arguments.size() != 2) {
             throw EvalError.arity(pos, "cons", "expected exactly 2 arguments");
         }
 
-        Value tail = arguments.get(1);
+        Value tail = arguments.get(1).value();
         if (!(tail instanceof Value.ListValue listValue)) {
-            throw EvalError.type(pos, "cons expects a list as its second argument");
+            throw EvalError.type(arguments.get(1).pos(), "cons expects a list as its second argument");
         }
 
         List<Value> elements = new ArrayList<>(listValue.elements().size() + 1);
-        elements.add(arguments.get(0));
+        elements.add(arguments.get(0).value());
         elements.addAll(listValue.elements());
         return new Value.ListValue(elements);
     }
 
-    private Value car(List<Value> arguments, SourcePos pos) throws EvalError {
+    private Value car(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
         if (arguments.size() != 1) {
             throw EvalError.arity(pos, "car", "expected exactly 1 argument");
         }
 
-        Value.ListValue listValue = expectNonEmptyList(arguments.get(0), pos, "car");
+        Value.ListValue listValue = expectNonEmptyList(arguments.get(0), "car");
         return listValue.elements().get(0);
     }
 
-    private Value cdr(List<Value> arguments, SourcePos pos) throws EvalError {
+    private Value cdr(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
         if (arguments.size() != 1) {
             throw EvalError.arity(pos, "cdr", "expected exactly 1 argument");
         }
 
-        Value.ListValue listValue = expectNonEmptyList(arguments.get(0), pos, "cdr");
+        Value.ListValue listValue = expectNonEmptyList(arguments.get(0), "cdr");
         return new Value.ListValue(listValue.elements().subList(1, listValue.elements().size()));
     }
 
-    private Value nullPredicate(List<Value> arguments, SourcePos pos) throws EvalError {
+    private Value nullPredicate(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
         if (arguments.size() != 1) {
             throw EvalError.arity(pos, "null?", "expected exactly 1 argument");
         }
-        return new Value.BooleanValue(arguments.get(0) instanceof Value.ListValue listValue && listValue.elements().isEmpty());
+        return new Value.BooleanValue(
+                arguments.get(0).value() instanceof Value.ListValue listValue && listValue.elements().isEmpty());
     }
 
-    private Value list(List<Value> arguments) {
-        return new Value.ListValue(arguments);
+    private Value list(List<EvaluatedArgument> arguments) {
+        List<Value> values = new ArrayList<>(arguments.size());
+        for (EvaluatedArgument argument : arguments) {
+            values.add(argument.value());
+        }
+        return new Value.ListValue(values);
     }
 
-    private Value length(List<Value> arguments, SourcePos pos) throws EvalError {
+    private Value length(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
         if (arguments.size() != 1) {
             throw EvalError.arity(pos, "length", "expected exactly 1 argument");
         }
 
-        Value.ListValue listValue = expectList(arguments.get(0), pos, "length");
+        Value.ListValue listValue = expectList(arguments.get(0), "length");
         return new Value.IntegerValue(listValue.elements().size());
     }
 
-    private Value append(List<Value> arguments, SourcePos pos) throws EvalError {
+    private Value append(List<EvaluatedArgument> arguments, SourcePos pos) throws EvalError {
         List<Value> combined = new ArrayList<>();
-        for (Value argument : arguments) {
-            Value.ListValue listValue = expectList(argument, pos, "append");
+        for (EvaluatedArgument argument : arguments) {
+            Value.ListValue listValue = expectList(argument, "append");
             combined.addAll(listValue.elements());
         }
         return new Value.ListValue(combined);
     }
 
-    private Value predicate(String name, List<Value> arguments, SourcePos pos, ValuePredicate predicate) throws EvalError {
+    private Value predicate(String name, List<EvaluatedArgument> arguments, SourcePos pos, ValuePredicate predicate)
+            throws EvalError {
         if (arguments.size() != 1) {
             throw EvalError.arity(pos, name, "expected exactly 1 argument");
         }
-        return new Value.BooleanValue(predicate.test(arguments.get(0)));
+        return new Value.BooleanValue(predicate.test(arguments.get(0).value()));
     }
 
-    private Value.ListValue expectList(Value value, SourcePos pos, String name) throws EvalError {
-        if (value instanceof Value.ListValue listValue) {
+    private Value.ListValue expectList(EvaluatedArgument argument, String name) throws EvalError {
+        if (argument.value() instanceof Value.ListValue listValue) {
             return listValue;
         }
-        throw EvalError.type(pos, name + " expects list arguments");
+        throw EvalError.type(argument.pos(), name + " expects list arguments");
     }
 
-    private Value.ListValue expectNonEmptyList(Value value, SourcePos pos, String name) throws EvalError {
-        Value.ListValue listValue = expectList(value, pos, name);
+    private Value.ListValue expectNonEmptyList(EvaluatedArgument argument, String name) throws EvalError {
+        Value.ListValue listValue = expectList(argument, name);
         if (listValue.elements().isEmpty()) {
-            throw EvalError.type(pos, name + " expects a non-empty list");
+            throw EvalError.type(argument.pos(), name + " expects a non-empty list");
         }
         return listValue;
     }
 
-    private long expectInteger(Value value, SourcePos pos, String name) throws EvalError {
-        if (value instanceof Value.IntegerValue integerValue) {
+    private long expectInteger(EvaluatedArgument argument, String name) throws EvalError {
+        if (argument.value() instanceof Value.IntegerValue integerValue) {
             return integerValue.value();
         }
-        throw EvalError.type(pos, name + " expects integer arguments");
+        throw EvalError.type(argument.pos(), name + " expects integer arguments");
     }
 
     private record Binding(String name, Expr valueExpr) {}
+
+    private record EvaluatedArgument(Value value, SourcePos pos) {}
 
     @FunctionalInterface
     private interface LongComparison {
