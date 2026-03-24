@@ -68,6 +68,12 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quote requires 1 argument", sym.Line, sym.Col)}
 				}
 				return quoteExpr(e.Elems[1])
+			case "begin":
+				return evalBegin(e.Elems[1:], env)
+			case "let":
+				return evalLet(e, env)
+			case "cond":
+				return evalCond(e, env)
 			case "and":
 				return evalAnd(e.Elems[1:], env)
 			case "or":
@@ -257,6 +263,126 @@ func evalOr(exprs []Expr, env *Env) (Value, error) {
 	return result, nil
 }
 
+func evalBegin(exprs []Expr, env *Env) (Value, error) {
+	var result Value = &VoidVal{}
+	for _, e := range exprs {
+		var err error
+		result, err = evalExpr(e, env)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalLet(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Elems) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let requires bindings and body", e.Line, e.Col)}
+	}
+
+	// Named let: (let name ((var init) ...) body ...)
+	if sym, ok := e.Elems[1].(*SymbolExpr); ok {
+		if len(e.Elems) < 4 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: named let requires bindings and body", e.Line, e.Col)}
+		}
+		bindList, ok := e.Elems[2].(*ListExpr)
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: expected binding list", e.Line, e.Col)}
+		}
+		params := make([]string, len(bindList.Elems))
+		initVals := make([]Value, len(bindList.Elems))
+		for i, b := range bindList.Elems {
+			pair, ok := b.(*ListExpr)
+			if !ok || len(pair.Elems) != 2 {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad binding", e.Line, e.Col)}
+			}
+			ps, ok := pair.Elems[0].(*SymbolExpr)
+			if !ok {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: expected symbol", e.Line, e.Col)}
+			}
+			params[i] = ps.Name
+			v, err := evalExpr(pair.Elems[1], env)
+			if err != nil {
+				return nil, err
+			}
+			initVals[i] = v
+		}
+		// Create a lambda and bind it in a new env
+		letEnv := newEnv(env)
+		lambda := &LambdaVal{Params: params, Body: e.Elems[3:], Env: letEnv}
+		letEnv.set(sym.Name, lambda)
+		// Call with initial values
+		callEnv := newEnv(letEnv)
+		for i, p := range params {
+			callEnv.set(p, initVals[i])
+		}
+		var result Value
+		for _, bodyExpr := range e.Elems[3:] {
+			var err error
+			result, err = evalExpr(bodyExpr, callEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	}
+
+	// Regular let: (let ((var init) ...) body ...)
+	bindList, ok := e.Elems[1].(*ListExpr)
+	if !ok {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: expected binding list", e.Line, e.Col)}
+	}
+	letEnv := newEnv(env)
+	for _, b := range bindList.Elems {
+		pair, ok := b.(*ListExpr)
+		if !ok || len(pair.Elems) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad binding", e.Line, e.Col)}
+		}
+		ps, ok := pair.Elems[0].(*SymbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: expected symbol", e.Line, e.Col)}
+		}
+		v, err := evalExpr(pair.Elems[1], env)
+		if err != nil {
+			return nil, err
+		}
+		letEnv.set(ps.Name, v)
+	}
+	var result Value
+	for _, bodyExpr := range e.Elems[2:] {
+		var err error
+		result, err = evalExpr(bodyExpr, letEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalCond(e *ListExpr, env *Env) (Value, error) {
+	for _, clause := range e.Elems[1:] {
+		cl, ok := clause.(*ListExpr)
+		if !ok || len(cl.Elems) == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cond: bad clause", e.Line, e.Col)}
+		}
+		// else clause
+		if sym, ok := cl.Elems[0].(*SymbolExpr); ok && sym.Name == "else" {
+			return evalBegin(cl.Elems[1:], env)
+		}
+		test, err := evalExpr(cl.Elems[0], env)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(test) {
+			if len(cl.Elems) == 1 {
+				return test, nil
+			}
+			return evalBegin(cl.Elems[1:], env)
+		}
+	}
+	return &VoidVal{}, nil
+}
+
 func makeGlobalEnv() *Env {
 	env := newEnv(nil)
 
@@ -334,6 +460,144 @@ func makeGlobalEnv() *Env {
 	env.set("=", &BuiltinFunc{Name: "=", Fn: makeCompare("=", func(a, b int64) bool { return a == b })})
 	env.set("<=", &BuiltinFunc{Name: "<=", Fn: makeCompare("<=", func(a, b int64) bool { return a <= b })})
 	env.set(">=", &BuiltinFunc{Name: ">=", Fn: makeCompare(">=", func(a, b int64) bool { return a >= b })})
+
+	// List operations
+	env.set("cons", &BuiltinFunc{Name: "cons", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "cons: need 2 arguments"}
+		}
+		return &PairVal{Car: args[0], Cdr: args[1]}, nil
+	}})
+
+	env.set("car", &BuiltinFunc{Name: "car", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "car: need 1 argument"}
+		}
+		p, ok := args[0].(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "car: not a pair"}
+		}
+		return p.Car, nil
+	}})
+
+	env.set("cdr", &BuiltinFunc{Name: "cdr", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "cdr: need 1 argument"}
+		}
+		p, ok := args[0].(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "cdr: not a pair"}
+		}
+		return p.Cdr, nil
+	}})
+
+	env.set("null?", &BuiltinFunc{Name: "null?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "null?: need 1 argument"}
+		}
+		_, isNil := args[0].(*NilVal)
+		return &BoolVal{Val: isNil}, nil
+	}})
+
+	env.set("list", &BuiltinFunc{Name: "list", Fn: func(args []Value) (Value, error) {
+		var result Value = &NilVal{}
+		for i := len(args) - 1; i >= 0; i-- {
+			result = &PairVal{Car: args[i], Cdr: result}
+		}
+		return result, nil
+	}})
+
+	env.set("length", &BuiltinFunc{Name: "length", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "length: need 1 argument"}
+		}
+		var count int64
+		cur := args[0]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				break
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "length: not a proper list"}
+			}
+			count++
+			cur = p.Cdr
+		}
+		return &IntVal{Val: count}, nil
+	}})
+
+	env.set("append", &BuiltinFunc{Name: "append", Fn: func(args []Value) (Value, error) {
+		if len(args) == 0 {
+			return &NilVal{}, nil
+		}
+		if len(args) == 1 {
+			return args[0], nil
+		}
+		// Build result from right to left
+		result := args[len(args)-1]
+		for i := len(args) - 2; i >= 0; i-- {
+			cur := args[i]
+			// Collect elements of this list
+			var elems []Value
+			for {
+				if _, ok := cur.(*NilVal); ok {
+					break
+				}
+				p, ok := cur.(*PairVal)
+				if !ok {
+					return nil, &EvalError{Message: "append: not a proper list"}
+				}
+				elems = append(elems, p.Car)
+				cur = p.Cdr
+			}
+			for j := len(elems) - 1; j >= 0; j-- {
+				result = &PairVal{Car: elems[j], Cdr: result}
+			}
+		}
+		return result, nil
+	}})
+
+	// Type predicates
+	env.set("number?", &BuiltinFunc{Name: "number?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "number?: need 1 argument"}
+		}
+		_, ok := args[0].(*IntVal)
+		return &BoolVal{Val: ok}, nil
+	}})
+
+	env.set("string?", &BuiltinFunc{Name: "string?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string?: need 1 argument"}
+		}
+		_, ok := args[0].(*StringVal)
+		return &BoolVal{Val: ok}, nil
+	}})
+
+	env.set("boolean?", &BuiltinFunc{Name: "boolean?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "boolean?: need 1 argument"}
+		}
+		_, ok := args[0].(*BoolVal)
+		return &BoolVal{Val: ok}, nil
+	}})
+
+	env.set("pair?", &BuiltinFunc{Name: "pair?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "pair?: need 1 argument"}
+		}
+		_, ok := args[0].(*PairVal)
+		return &BoolVal{Val: ok}, nil
+	}})
+
+	env.set("symbol?", &BuiltinFunc{Name: "symbol?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "symbol?: need 1 argument"}
+		}
+		_, ok := args[0].(*SymbolVal)
+		return &BoolVal{Val: ok}, nil
+	}})
 
 	return env
 }
