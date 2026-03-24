@@ -242,3 +242,20 @@ object MacroExpander:
       case Expr.SList(elems) =>
         elems.iterator.flatMap(e => findEllipsisSyntaxVar(e, env)).nextOption()
       case _ => None
+
+  def defineFromSyntaxRules(
+    name: String,
+    lits: List[Expr],
+    rules: List[Expr],
+    env: Env
+  ): SchemeVal =
+    val literals = lits.map {
+      case Expr.Symbol(n) => n
+      case _              => throw new EvalError("syntax-rules: literals must be identifiers")
+    }.toSet
+    val ruleList = rules.map {
+      case Expr.SList(pat :: tmpl :: Nil) => (pat, tmpl)
+      case _                              => throw new EvalError("syntax-rules: invalid rule")
+    }
+    env.define(name, SchemeVal.Macro(literals, ruleList, env))
+    SchemeVal.Void

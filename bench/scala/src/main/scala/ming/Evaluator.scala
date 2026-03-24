@@ -12,39 +12,64 @@ object Evaluator:
   private[ming] val pendingCCReturn: ThreadLocal[SchemeVal]  = ThreadLocal.withInitial(() => null)
   private[ming] val windStack: ThreadLocal[List[WindEntry]]  = ThreadLocal.withInitial(() => Nil)
 
+  // Flag: true when we are re-evaluating a body due to continuation re-entry.
+  // During re-entry, performCallCC skips creating new continuations to avoid
+  // re-triggering side effects from call/cc lambdas that have already executed.
+  private[ming] val inReentry: ThreadLocal[Boolean] = ThreadLocal.withInitial(() => false)
+
+  // Track bodies currently being evaluated by evalBody (identity-based set).
+  // Used by the trampoline to decide whether to handle ContinuationReturn locally.
+  private[ming] val activeBodies: ThreadLocal[java.util.Set[List[Expr]]] =
+    ThreadLocal.withInitial(() =>
+      java.util.Collections.newSetFromMap(
+        new java.util.IdentityHashMap[List[Expr], java.lang.Boolean]()
+      )
+    )
+
   private[ming] def isTruthy(v: SchemeVal): Boolean = v match
     case SchemeVal.BoolVal(false) => false
     case _                        => true
 
   private[ming] def evalBody(body: List[Expr], env: Env, startIdx: Int = 0): SchemeVal =
-    var result: SchemeVal = SchemeVal.Void
-    var i                 = startIdx
-    while i < body.length do
-      val prev = currentBodyCtx.get()
-      currentBodyCtx.set(BodyContext(body, i, env))
-      try
-        result = eval(body(i), env)
-        i += 1
-      catch
-        case cr: ContinuationReturn =>
-          pendingCCReturn.set(cr.value)
-          if (cr.body ne null) && (cr.body eq body) then
-            // Reentry targets this body: restart from the stored index
-            i = cr.startIdx
-          else if cr.body ne null then
-            // Reentry targets an inner body: evaluate it directly
-            result = evalBody(cr.body, cr.bodyEnv, cr.startIdx)
-            // Unwind back to caller's wind state
-            var cur = windStack.get()
-            while (cur ne cr.callerWind) && cur.nonEmpty do
-              val entry = cur.head
-              cur = cur.tail
-              windStack.set(cur)
-              applyProc(entry.outThunk, Nil)
-            i += 1
-          else throw cr
-      finally currentBodyCtx.set(prev)
-    result
+    val bodies = activeBodies.get()
+    bodies.add(body)
+    try
+      var result: SchemeVal = SchemeVal.Void
+      var i                 = startIdx
+      while i < body.length do
+        val prev = currentBodyCtx.get()
+        currentBodyCtx.set(BodyContext(body, i, env))
+        try
+          result = eval(body(i), env)
+          i += 1
+        catch
+          case cr: ContinuationReturn =>
+            pendingCCReturn.set(cr.value)
+            if (cr.body ne null) && (cr.body eq body) then i = cr.startIdx
+            else if cr.body ne null then
+              result = reenterInnerBody(cr)
+              i += 1
+            else throw cr
+        finally currentBodyCtx.set(prev)
+      result
+    finally bodies.remove(body)
+
+  private def reenterInnerBody(cr: ContinuationReturn): SchemeVal =
+    val prevReentry = inReentry.get()
+    inReentry.set(true)
+    try
+      val result = evalBody(cr.body, cr.bodyEnv, cr.startIdx)
+      unwindToCallerWind(cr.callerWind)
+      result
+    finally inReentry.set(prevReentry)
+
+  private def unwindToCallerWind(callerWind: List[WindEntry]): Unit =
+    var cur = windStack.get()
+    while (cur ne callerWind) && cur.nonEmpty do
+      val entry = cur.head
+      cur = cur.tail
+      windStack.set(cur)
+      applyProc(entry.outThunk, Nil)
 
   private[ming] def evalBodyTail(body: List[Expr], env: Env): SchemeVal =
     if body.isEmpty then SchemeVal.Void
@@ -54,6 +79,11 @@ object Evaluator:
         currentBodyCtx.set(BodyContext(body, idx, env))
         try eval(body(idx), env)
         finally currentBodyCtx.set(prev)
+      // For multi-expression bodies, set context for the tail position so that
+      // call/cc in the tail expression captures this body's context (not the caller's).
+      // Single-expression bodies inherit the caller's context, which allows
+      // continuations to target the enclosing evalBody for proper re-entry.
+      if body.length > 1 then currentBodyCtx.set(BodyContext(body, body.length - 1, env))
       SchemeVal.TailCall(body.last, env)
 
   private def posStr(expr: Expr): String =
@@ -62,28 +92,15 @@ object Evaluator:
 
   private val posPattern = ".*\\d+:\\d+.*".r
 
-  private def evalDefineSyntax(
-    name: String,
-    lits: List[Expr],
-    rules: List[Expr],
-    env: Env
-  ): SchemeVal =
-    val literals = lits.map {
-      case Expr.Symbol(n) => n
-      case _              => throw new EvalError("syntax-rules: literals must be identifiers")
-    }.toSet
-    val ruleList = rules.map {
-      case Expr.SList(pat :: tmpl :: Nil) => (pat, tmpl)
-      case _                              => throw new EvalError("syntax-rules: invalid rule")
-    }
-    env.define(name, SchemeVal.Macro(literals, ruleList, env))
-    SchemeVal.Void
-
   private def trampoline(initial: SchemeVal): SchemeVal =
     var result = initial
     while result.isInstanceOf[SchemeVal.TailCall] do
       val SchemeVal.TailCall(e, env) = result: @unchecked
-      result = evalInner(e, env)
+      try result = evalInner(e, env)
+      catch
+        case cr: ContinuationReturn if (cr.body ne null) && !activeBodies.get().contains(cr.body) =>
+          pendingCCReturn.set(cr.value)
+          result = reenterInnerBody(cr)
     result
 
   private[ming] def eval(expr: Expr, env: Env): SchemeVal =
@@ -99,17 +116,23 @@ object Evaluator:
       performCallCC(proc)
 
   private[ming] def performCallCC(proc: SchemeVal): SchemeVal =
-    val ctx    = currentBodyCtx.get()
-    val contId = nextContId()
-    val cont = SchemeVal.ContinuationVal(
-      contId,
-      if ctx != null then ctx.body else null,
-      if ctx != null then ctx.idx else 0,
-      if ctx != null then ctx.env else null,
-      windStack.get()
-    )
-    try applyProc(proc, List(cont))
-    catch case cr: ContinuationReturn if cr.contId == contId => cr.value
+    if inReentry.get() then
+      // During continuation re-entry, skip creating new continuations.
+      // This prevents re-triggering side effects (like yield-val) from
+      // call/cc lambdas that were already executed in the original run.
+      SchemeVal.Void
+    else
+      val ctx    = currentBodyCtx.get()
+      val contId = nextContId()
+      val cont = SchemeVal.ContinuationVal(
+        contId,
+        if ctx != null then ctx.body else null,
+        if ctx != null then ctx.idx else 0,
+        if ctx != null then ctx.env else null,
+        windStack.get()
+      )
+      try applyProc(proc, List(cont))
+      catch case cr: ContinuationReturn if cr.contId == contId => cr.value
 
   private def evalInner(expr: Expr, env: Env): SchemeVal =
     try
@@ -175,7 +198,7 @@ object Evaluator:
     case Expr.Symbol("define-syntax") :: Expr.Symbol(name) :: Expr.SList(
           Expr.Symbol("syntax-rules") :: Expr.SList(lits) :: rules
         ) :: Nil =>
-      evalDefineSyntax(name, lits, rules, env)
+      MacroExpander.defineFromSyntaxRules(name, lits, rules, env)
     case Expr.Symbol("define-syntax") :: Expr.Symbol(name) :: transformerExpr :: Nil =>
       val proc = eval(transformerExpr, env)
       env.define(name, SchemeVal.MacroTransformer(proc, env))
@@ -199,7 +222,7 @@ object Evaluator:
     case Expr.Symbol("call-with-current-continuation") :: procExpr :: Nil =>
       evalCallCC(procExpr, env)
     case Expr.Symbol("dynamic-wind") :: inExpr :: bodyExpr :: outExpr :: Nil =>
-      evalDynamicWind(inExpr, bodyExpr, outExpr, env)
+      DynamicWind.evalDynamicWind(eval(inExpr, env), eval(bodyExpr, env), eval(outExpr, env))
     case Expr.Symbol("guard") :: Expr.SList(Expr.Symbol(varName) :: clauses) :: body =>
       EvalForms.evalGuard(varName, clauses, body, env)
     case Expr.Symbol("syntax-case") :: stxExpr :: Expr.SList(lits) :: clauses =>
@@ -257,26 +280,6 @@ object Evaluator:
     val exprs = Parser.parse(input)
     val env   = Builtins.makeGlobalEnv()
     evalBody(exprs, env).display
-
-  private def evalDynamicWind(inExpr: Expr, bodyExpr: Expr, outExpr: Expr, env: Env): SchemeVal =
-    val inThunk   = eval(inExpr, env)
-    val bodyThunk = eval(bodyExpr, env)
-    val outThunk  = eval(outExpr, env)
-    val entry     = new WindEntry(inThunk, outThunk)
-    windStack.set(entry :: windStack.get())
-    applyProc(inThunk, Nil)
-    val result =
-      try applyProc(bodyThunk, Nil)
-      catch
-        case cr: ContinuationReturn =>
-          throw cr
-        case sr: SchemeRaise =>
-          windStack.set(windStack.get().tail)
-          applyProc(outThunk, Nil)
-          throw sr
-    windStack.set(windStack.get().tail)
-    applyProc(outThunk, Nil)
-    result
 
   def evalStrWithOutput(input: String): (String, String) =
     val buf = outputBuffer.get()

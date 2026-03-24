@@ -15,6 +15,27 @@ object DynamicWind:
       bb = bb.tail
     aa.length
 
+  def evalDynamicWind(
+    inThunk: SchemeVal,
+    bodyThunk: SchemeVal,
+    outThunk: SchemeVal
+  ): SchemeVal =
+    val entry = new WindEntry(inThunk, outThunk)
+    Evaluator.windStack.set(entry :: Evaluator.windStack.get())
+    Evaluator.applyProc(inThunk, Nil)
+    val result =
+      try Evaluator.applyProc(bodyThunk, Nil)
+      catch
+        case cr: ContinuationReturn =>
+          throw cr
+        case sr: SchemeRaise =>
+          Evaluator.windStack.set(Evaluator.windStack.get().tail)
+          Evaluator.applyProc(outThunk, Nil)
+          throw sr
+    Evaluator.windStack.set(Evaluator.windStack.get().tail)
+    Evaluator.applyProc(outThunk, Nil)
+    result
+
   /** Perform wind/unwind when switching between dynamic extents */
   def doWindTransition(from: List[WindEntry], to: List[WindEntry]): Unit =
     val commonLen = commonTailLength(from, to)
