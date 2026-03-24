@@ -493,6 +493,11 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
     return { tag: 'boolean', value: args[0].tag === 'symbol' };
   }});
 
+  env.set('procedure?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1) throw new EvalError('procedure? requires exactly 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'procedure' };
+  }});
+
   // I/O builtins (L05)
   env.set('display', { tag: 'procedure', value: (...args: SchemeVal[]) => {
     if (args.length !== 1) throw new EvalError('display requires exactly 1 argument');
@@ -939,7 +944,7 @@ function gensym(base: string): string {
 }
 
 const SPECIAL_FORMS = new Set([
-  'define', 'set!', 'if', 'quote', 'lambda', 'and', 'or', 'begin',
+  'define', 'set!', 'if', 'quote', 'lambda', 'case-lambda', 'and', 'or', 'begin',
   'let', 'cond', 'define-syntax', 'syntax-rules', 'define-record-type',
 ]);
 
@@ -1275,6 +1280,50 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             const paramInfo = parseParams(elems[1]);
             const bodyExprs = elems.slice(2);
             return makeProcedure(paramInfo, bodyExprs, env);
+          }
+          case 'case-lambda': {
+            if (elems.length < 2) throw errAt('case-lambda requires at least one clause', expr.pos);
+            const clauses: { paramInfo: { names: string[]; rest: string | null }; bodyExprs: SchemeVal[] }[] = [];
+            for (let i = 1; i < elems.length; i++) {
+              const clause = elems[i];
+              if (clause.tag !== 'list' || clause.value.length < 2)
+                throw errAt('case-lambda clause must have params and body', clause.pos);
+              const paramInfo = parseParams(clause.value[0]);
+              const bodyExprs = clause.value.slice(1);
+              clauses.push({ paramInfo, bodyExprs });
+            }
+            const closureEnv = env;
+            return { tag: 'procedure', value: (...args: SchemeVal[]) => {
+              for (const cl of clauses) {
+                if (cl.paramInfo.rest !== null) {
+                  if (args.length >= cl.paramInfo.names.length) {
+                    const childEnv = new Env(closureEnv);
+                    for (let j = 0; j < cl.paramInfo.names.length; j++) {
+                      childEnv.set(cl.paramInfo.names[j], args[j]);
+                    }
+                    let restList: SchemeVal = NIL;
+                    for (let j = args.length - 1; j >= cl.paramInfo.names.length; j--) {
+                      restList = { tag: 'pair', car: args[j], cdr: restList };
+                    }
+                    childEnv.set(cl.paramInfo.rest, restList);
+                    let result: SchemeVal = { tag: 'void' };
+                    for (const b of cl.bodyExprs) result = evaluate(b, childEnv);
+                    return result;
+                  }
+                } else {
+                  if (args.length === cl.paramInfo.names.length) {
+                    const childEnv = new Env(closureEnv);
+                    for (let j = 0; j < cl.paramInfo.names.length; j++) {
+                      childEnv.set(cl.paramInfo.names[j], args[j]);
+                    }
+                    let result: SchemeVal = { tag: 'void' };
+                    for (const b of cl.bodyExprs) result = evaluate(b, childEnv);
+                    return result;
+                  }
+                }
+              }
+              throw new EvalError(`no matching clause for ${args.length} arguments`);
+            }};
           }
           case 'and': {
             if (elems.length === 1) return { tag: 'boolean', value: true };
