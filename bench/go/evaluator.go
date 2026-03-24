@@ -5,8 +5,14 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 )
+
+// evalMu serializes all EvalStr/EvalStrWithOutput/EvalStrWithLimit calls
+// so that global interpreter state (contFrameStack, dynamicWindStack, etc.)
+// is not corrupted by concurrent goroutines.
+var evalMu sync.Mutex
 
 // EvalStr evaluates one or more Scheme expressions and returns the string
 // representation of the last result.
@@ -18,6 +24,9 @@ func EvalStr(input string) (string, error) {
 	if len(exprs) == 0 {
 		return "", &EvalError{Message: "empty input"}
 	}
+
+	evalMu.Lock()
+	defer evalMu.Unlock()
 
 	env := defaultEnv(nil)
 	result, err := evalTopLevel(exprs, env)
@@ -42,6 +51,9 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 		return "", "", &EvalError{Message: "empty input"}
 	}
 
+	evalMu.Lock()
+	defer evalMu.Unlock()
+
 	var buf strings.Builder
 	env := defaultEnv(&buf)
 	res, evalErr := evalTopLevel(exprs, env)
@@ -51,7 +63,7 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	if _, ok := res.(*VoidVal); ok {
 		return "", buf.String(), nil
 	}
-	return res.String(), buf.String(), nil
+	return DisplayString(res), buf.String(), nil
 }
 
 // EvalStrWithLimit evaluates Scheme expressions with a step budget.
@@ -64,6 +76,9 @@ func EvalStrWithLimit(input string, maxSteps int) (string, error) {
 	if len(exprs) == 0 {
 		return "", &EvalError{Message: "empty input"}
 	}
+
+	evalMu.Lock()
+	defer evalMu.Unlock()
 
 	stepLimitEnabled = true
 	stepLimit = maxSteps
