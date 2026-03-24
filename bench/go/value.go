@@ -79,6 +79,15 @@ type VoidVal struct{}
 
 func (v *VoidVal) String() string { return "" }
 
+// LambdaVal represents a user-defined closure.
+type LambdaVal struct {
+	Params []string
+	Body   []*Expr
+	Env    *Env
+}
+
+func (v *LambdaVal) String() string { return "#<procedure>" }
+
 // isTruthy returns true for all values except #f.
 func isTruthy(v Value) bool {
 	if b, ok := v.(*BoolVal); ok {

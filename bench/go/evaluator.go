@@ -71,6 +71,14 @@ func evalList(expr *Expr, env *Env) (Value, error) {
 			return evalAnd(expr, env)
 		case "or":
 			return evalOr(expr, env)
+		case "define":
+			return evalDefine(expr, env)
+		case "if":
+			return evalIf(expr, env)
+		case "quote":
+			return evalQuote(expr, env)
+		case "lambda":
+			return evalLambda(expr, env)
 		}
 	}
 
@@ -90,14 +98,9 @@ func evalList(expr *Expr, env *Env) (Value, error) {
 	}
 
 	// apply
-	fn, ok := op.(*BuiltinFunc)
-	if !ok {
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", head.Line, head.Col)}
-	}
-	result, err := fn.Fn(args)
+	result, err := applyProc(op, args, expr)
 	if err != nil {
-		// wrap with position if not already positioned
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s", expr.Line, expr.Col, err.Error())}
+		return nil, err
 	}
 	return result, nil
 }
@@ -283,4 +286,137 @@ func builtinNot(args []Value) (Value, error) {
 		return nil, fmt.Errorf("not: expected 1 argument")
 	}
 	return &BoolVal{Val: !isTruthy(args[0])}, nil
+}
+
+// applyProc applies a procedure (builtin or lambda) to arguments.
+func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
+	switch fn := op.(type) {
+	case *BuiltinFunc:
+		result, err := fn.Fn(args)
+		if err != nil {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s", callExpr.Line, callExpr.Col, err.Error())}
+		}
+		return result, nil
+	case *LambdaVal:
+		if len(args) != len(fn.Params) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: expected %d arguments, got %d", callExpr.Line, callExpr.Col, len(fn.Params), len(args))}
+		}
+		childEnv := NewEnv(fn.Env)
+		for i, p := range fn.Params {
+			childEnv.Set(p, args[i])
+		}
+		var result Value
+		var err error
+		for _, bodyExpr := range fn.Body {
+			result, err = eval(bodyExpr, childEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	default:
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", callExpr.List[0].Line, callExpr.List[0].Col)}
+	}
+}
+
+func evalDefine(expr *Expr, env *Env) (Value, error) {
+	if len(expr.List) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", expr.Line, expr.Col)}
+	}
+	target := expr.List[1]
+
+	// (define (f params...) body...)
+	if target.Kind == ExprList && len(target.List) > 0 {
+		name := target.List[0]
+		if name.Kind != ExprSymbol {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol", name.Line, name.Col)}
+		}
+		params := make([]string, len(target.List)-1)
+		for i, p := range target.List[1:] {
+			if p.Kind != ExprSymbol {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected parameter name", p.Line, p.Col)}
+			}
+			params[i] = p.SVal
+		}
+		lam := &LambdaVal{Params: params, Body: expr.List[2:], Env: env}
+		env.Set(name.SVal, lam)
+		return &VoidVal{}, nil
+	}
+
+	// (define x val)
+	if target.Kind != ExprSymbol {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol", target.Line, target.Col)}
+	}
+	val, err := eval(expr.List[2], env)
+	if err != nil {
+		return nil, err
+	}
+	env.Set(target.SVal, val)
+	return &VoidVal{}, nil
+}
+
+func evalIf(expr *Expr, env *Env) (Value, error) {
+	if len(expr.List) < 3 || len(expr.List) > 4 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: if: bad syntax", expr.Line, expr.Col)}
+	}
+	cond, err := eval(expr.List[1], env)
+	if err != nil {
+		return nil, err
+	}
+	if isTruthy(cond) {
+		return eval(expr.List[2], env)
+	}
+	if len(expr.List) == 4 {
+		return eval(expr.List[3], env)
+	}
+	return &VoidVal{}, nil
+}
+
+func evalQuote(expr *Expr, env *Env) (Value, error) {
+	if len(expr.List) != 2 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quote: expected 1 argument", expr.Line, expr.Col)}
+	}
+	return exprToValue(expr.List[1]), nil
+}
+
+func exprToValue(e *Expr) Value {
+	switch e.Kind {
+	case ExprInt:
+		return &IntVal{Val: e.IVal}
+	case ExprBool:
+		return &BoolVal{Val: e.BVal}
+	case ExprString:
+		return &StringVal{Val: e.SVal}
+	case ExprSymbol:
+		return &SymbolVal{Name: e.SVal}
+	case ExprList:
+		if len(e.List) == 0 {
+			return &NilVal{}
+		}
+		// Build proper list from elements
+		result := Value(&NilVal{})
+		for i := len(e.List) - 1; i >= 0; i-- {
+			result = &PairVal{Car: exprToValue(e.List[i]), Cdr: result}
+		}
+		return result
+	}
+	return &VoidVal{}
+}
+
+func evalLambda(expr *Expr, env *Env) (Value, error) {
+	if len(expr.List) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad syntax", expr.Line, expr.Col)}
+	}
+	paramExpr := expr.List[1]
+	if paramExpr.Kind != ExprList {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected parameter list", paramExpr.Line, paramExpr.Col)}
+	}
+	params := make([]string, len(paramExpr.List))
+	for i, p := range paramExpr.List {
+		if p.Kind != ExprSymbol {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected parameter name", p.Line, p.Col)}
+		}
+		params[i] = p.SVal
+	}
+	return &LambdaVal{Params: params, Body: expr.List[2:], Env: env}, nil
 }
