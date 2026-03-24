@@ -1675,9 +1675,17 @@ function makeProcedure(paramInfo: { names: string[]; rest: string | null }, body
 
 // --- CPS Evaluator (for call/cc support) ---
 
-function runBounce(b: Bounce): SchemeVal {
+function runBounce(b: Bounce, maxSteps?: number): SchemeVal {
   let bounce = b;
-  while (bounce.tag === 'bounce') bounce = bounce.fn();
+  if (maxSteps !== undefined) {
+    let steps = 0;
+    while (bounce.tag === 'bounce') {
+      if (++steps > maxSteps) throw new EvalError('step limit exceeded');
+      bounce = bounce.fn();
+    }
+  } else {
+    while (bounce.tag === 'bounce') bounce = bounce.fn();
+  }
   return bounce.value;
 }
 
@@ -2671,6 +2679,20 @@ export function evalStr(input: string): string {
  * Evaluate Scheme expressions and return both the result string
  * and any captured output from display/write/newline.
  */
+export function evalStrWithLimit(input: string, maxSteps: number): string {
+  gensymCounter = 0;
+  resolvedSymbols.clear();
+  syntaxCaseStack = [];
+  windStack = [];
+  exceptionHandlers = [];
+  const tokens = tokenize(input);
+  const exprs = parse(tokens);
+  if (exprs.length === 0) throw new EvalError('no expressions');
+  const env = makeGlobalEnv();
+  const result = runBounce(evalSeqK(exprs, 0, env, (v) => ({ tag: 'done', value: v })), maxSteps);
+  return display(result);
+}
+
 export function evalStrWithOutput(input: string): { result: string; output: string } {
   gensymCounter = 0;
   resolvedSymbols.clear();
