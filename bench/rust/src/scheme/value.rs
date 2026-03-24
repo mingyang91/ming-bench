@@ -14,6 +14,7 @@ pub enum ValueKind {
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Value>,
         env: Rc<Env>,
     },

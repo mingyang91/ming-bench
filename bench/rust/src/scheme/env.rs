@@ -52,7 +52,7 @@ impl Env {
                       "string-append", "string-length", "substring",
                       "string->number", "number->string",
                       "symbol->string", "string->symbol", "string-ref",
-                      "string-copy"] {
+                      "string-copy", "apply"] {
             env.set(name.to_string(), Value::unpos(ValueKind::Symbol(name.to_string())));
         }
         env
