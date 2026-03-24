@@ -16,94 +16,6 @@ object Evaluator:
 
   import Val.*
 
-  // --- Parser ---
-  private class Parser(input: String):
-    private var pos = 0
-
-    def parseAll(): List[Val] =
-      val exprs = scala.collection.mutable.ListBuffer[Val]()
-      while
-        skipWhitespace()
-        pos < input.length
-      do exprs += parseExpr()
-      exprs.toList
-
-    private def skipWhitespace(): Unit =
-      while pos < input.length && (input(pos).isWhitespace || input(pos) == ';') do
-        if input(pos) == ';' then while pos < input.length && input(pos) != '\n' do pos += 1
-        else pos += 1
-
-    private def parseExpr(): Val =
-      skipWhitespace()
-      if pos >= input.length then throw new EvalError("unexpected end of input")
-      input(pos) match
-        case '(' =>
-          pos += 1
-          parseList()
-        case '\'' =>
-          pos += 1
-          val e = parseExpr()
-          Pair(Symbol("quote"), Pair(e, Nil))
-        case '"' =>
-          parseString()
-        case '#' =>
-          pos += 1
-          if pos >= input.length then throw new EvalError("unexpected end of input after #")
-          input(pos) match
-            case 't'   => pos += 1; Bool(true)
-            case 'f'   => pos += 1; Bool(false)
-            case other => throw new EvalError(s"unexpected character after #: $other")
-        case _ =>
-          parseAtom()
-
-    private def parseList(): Val =
-      skipWhitespace()
-      if pos >= input.length then throw new EvalError("unexpected end of input in list")
-      if input(pos) == ')' then
-        pos += 1
-        Nil
-      else
-        val first = parseExpr()
-        skipWhitespace()
-        if pos < input.length && input(pos) == '.' then
-          pos += 1
-          val rest = parseExpr()
-          skipWhitespace()
-          if pos >= input.length || input(pos) != ')' then throw new EvalError("expected ) after dotted pair")
-          pos += 1
-          Pair(first, rest)
-        else
-          val rest = parseList()
-          Pair(first, rest)
-
-    private def parseString(): Val =
-      pos += 1 // skip opening "
-      val sb = new StringBuilder
-      while pos < input.length && input(pos) != '"' do
-        if input(pos) == '\\' then
-          pos += 1
-          if pos >= input.length then throw new EvalError("unterminated string")
-          input(pos) match
-            case 'n'  => sb += '\n'
-            case 't'  => sb += '\t'
-            case '\\' => sb += '\\'
-            case '"'  => sb += '"'
-            case c    => sb += '\\'; sb += c
-        else sb += input(pos)
-        pos += 1
-      if pos >= input.length then throw new EvalError("unterminated string")
-      pos += 1 // skip closing "
-      Str(sb.toString)
-
-    private def parseAtom(): Val =
-      val start = pos
-      while pos < input.length && !input(pos).isWhitespace && !"()\"';".contains(input(pos)) do pos += 1
-      val token = input.substring(start, pos)
-      if token.isEmpty then throw new EvalError(s"unexpected character: ${input(pos)}")
-      token.toLongOption match
-        case Some(n) => Num(n)
-        case None    => Symbol(token)
-
   // --- Evaluator ---
   private def eval(expr: Val, env: Env): Val =
     expr match
@@ -117,6 +29,9 @@ object Evaluator:
       case Pair(Symbol("define"), rest)            => evalDefine(rest, env)
       case Pair(Symbol("if"), rest)                => evalIf(rest, env)
       case Pair(Symbol("lambda"), rest)            => evalLambda(rest, env)
+      case Pair(Symbol("begin"), body)             => evalBegin(body, env)
+      case Pair(Symbol("cond"), clauses)           => evalCond(clauses, env)
+      case Pair(Symbol("let"), rest)               => evalLet(rest, env)
       case Pair(Symbol("and"), args)               => evalAnd(args, env)
       case Pair(Symbol("or"), args)                => evalOr(args, env)
       case Pair(head, args) =>
@@ -191,12 +106,89 @@ object Evaluator:
           case _           => v
       case _ => throw new EvalError("bad or syntax")
 
+  private def evalBegin(body: Val, env: Env): Val =
+    val exprs = toList(body)
+    if exprs.isEmpty then Void
+    else
+      var result: Val = Void
+      for expr <- exprs do result = eval(expr, env)
+      result
+
+  private def evalCond(clauses: Val, env: Env): Val =
+    clauses match
+      case Nil => Void
+      case Pair(clause, rest) =>
+        val clauseList = toList(clause)
+        if clauseList.isEmpty then throw new EvalError("bad cond clause")
+        clauseList.head match
+          case Symbol("else") =>
+            var result: Val = Void
+            for expr <- clauseList.tail do result = eval(expr, env)
+            result
+          case test =>
+            val v = eval(test, env)
+            if v != Bool(false) then
+              if clauseList.tail.isEmpty then v
+              else
+                var result: Val = Void
+                for expr <- clauseList.tail do result = eval(expr, env)
+                result
+            else evalCond(rest, env)
+      case _ => throw new EvalError("bad cond syntax")
+
+  private def evalLet(rest: Val, env: Env): Val =
+    rest match
+      // Named let: (let name ((var init) ...) body ...)
+      case Pair(Symbol(name), Pair(bindings, body)) =>
+        val bindingList = toList(bindings)
+        val paramNames = bindingList.map {
+          case Pair(Symbol(p), Pair(_, Nil)) => p
+          case _                             => throw new EvalError("bad named let binding")
+        }
+        val initVals = bindingList.map {
+          case Pair(_, Pair(v, Nil)) => eval(v, env)
+          case _                     => throw new EvalError("bad named let binding")
+        }
+        val bodyList = toList(body)
+        if bodyList.isEmpty then throw new EvalError("let: empty body")
+        val childEnv = new Env(scala.collection.mutable.Map[String, Val](), Some(env))
+        val loopFunc = Builtin { args =>
+          if args.length != paramNames.length then
+            throw new EvalError(s"named let $name: expected ${paramNames.length} arguments, got ${args.length}")
+          val loopEnv = new Env(scala.collection.mutable.Map[String, Val](), Some(childEnv))
+          paramNames.zip(args).foreach((p, a) => loopEnv.define(p, a))
+          var result: Val = Void
+          for expr <- bodyList do result = eval(expr, loopEnv)
+          result
+        }
+        childEnv.define(name, loopFunc)
+        // Initial call
+        val loopEnv = new Env(scala.collection.mutable.Map[String, Val](), Some(childEnv))
+        paramNames.zip(initVals).foreach((p, a) => loopEnv.define(p, a))
+        var result: Val = Void
+        for expr <- bodyList do result = eval(expr, loopEnv)
+        result
+      // Regular let: (let ((var init) ...) body ...)
+      case Pair(bindings, body) =>
+        val childEnv = new Env(scala.collection.mutable.Map[String, Val](), Some(env))
+        for binding <- toList(bindings) do
+          binding match
+            case Pair(Symbol(name), Pair(valueExpr, Nil)) =>
+              childEnv.define(name, eval(valueExpr, env))
+            case _ => throw new EvalError("bad let binding")
+        val bodyList = toList(body)
+        if bodyList.isEmpty then throw new EvalError("let: empty body")
+        var result: Val = Void
+        for expr <- bodyList do result = eval(expr, childEnv)
+        result
+      case _ => throw new EvalError("bad let syntax")
+
   private def toList(v: Val): List[Val] = v match
     case Nil            => List.empty
     case Pair(car, cdr) => car :: toList(cdr)
     case _              => throw new EvalError("improper list")
 
-  private def applyFunc(func: Val, args: List[Val]): Val = func match
+  private[ming] def applyFunc(func: Val, args: List[Val]): Val = func match
     case Builtin(f) => f(args)
     case _          => throw new EvalError(s"not a procedure: ${display(func)}")
 
