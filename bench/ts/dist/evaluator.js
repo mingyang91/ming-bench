@@ -1,4 +1,5 @@
 import { EvalError } from './evalError.js';
+let windStack = [];
 const NIL = { tag: 'nil' };
 function strContent(v) {
     return v.chars ? v.chars.join('') : v.value;
@@ -1218,6 +1219,9 @@ function makeGlobalEnv(outputBuf) {
     const callccProc = { tag: 'procedure', value: (..._args) => { throw new EvalError('call/cc must be applied in CPS context'); }, _callcc: true };
     env.set('call/cc', callccProc);
     env.set('call-with-current-continuation', callccProc);
+    // L19: dynamic-wind
+    const dynamicWindProc = { tag: 'procedure', value: (..._args) => { throw new EvalError('dynamic-wind must be applied in CPS context'); }, _dynamicWind: true };
+    env.set('dynamic-wind', dynamicWindProc);
     // cxr helpers
     const cxr = (ops) => ({ tag: 'procedure', value: (...args) => {
             if (args.length !== 1)
@@ -1626,26 +1630,78 @@ function evalArgsRtoLK(exprs, env, k) {
     }
     return go(len - 1, new Array(len));
 }
+function doWindTransition(targetWind, then) {
+    // Find common prefix
+    let common = 0;
+    while (common < windStack.length && common < targetWind.length &&
+        windStack[common] === targetWind[common]) {
+        common++;
+    }
+    // Unwind: pop entries and call out-thunks (innermost first)
+    function unwind() {
+        if (windStack.length <= common)
+            return rewind(common);
+        const entry = windStack.pop();
+        return applyK(entry.outThunk, [], (_) => {
+            return { tag: 'bounce', fn: unwind };
+        });
+    }
+    // Rewind: push entries and call in-thunks (outermost first)
+    function rewind(i) {
+        if (i >= targetWind.length)
+            return { tag: 'bounce', fn: then };
+        const entry = targetWind[i];
+        windStack.push(entry);
+        return applyK(entry.inThunk, [], (_) => {
+            return { tag: 'bounce', fn: () => rewind(i + 1) };
+        });
+    }
+    return unwind();
+}
 function applyK(func, args, k, pos) {
     // call/cc: (call/cc proc) — proc receives the continuation
     if (func.tag === 'procedure' && func._callcc) {
         if (args.length !== 1)
             throw errAt('call/cc requires exactly 1 argument', pos);
         const proc = args[0];
+        const capturedWind = [...windStack];
         const contVal = {
             tag: 'procedure',
             value: (...cargs) => {
                 // For use from non-CPS context (e.g. map callback)
                 throw new EvalError('continuation invoked outside CPS context');
             },
-            _cont: k
+            _cont: k,
+            _capturedWind: capturedWind
         };
         return applyK(proc, [contVal], k, pos);
     }
-    // Continuation invocation
+    // Continuation invocation (with wind transition)
     if (func.tag === 'procedure' && func._cont) {
         const val = args.length > 0 ? args[0] : { tag: 'void' };
-        return { tag: 'bounce', fn: () => func._cont(val) };
+        const targetWind = func._capturedWind || [];
+        return doWindTransition(targetWind, () => func._cont(val));
+    }
+    // dynamic-wind
+    if (func.tag === 'procedure' && func._dynamicWind) {
+        if (args.length !== 3)
+            throw errAt('dynamic-wind requires 3 arguments', pos);
+        const [inThunk, bodyThunk, outThunk] = args;
+        // Call in-thunk
+        return applyK(inThunk, [], (_) => {
+            // Push wind entry
+            const entry = { inThunk, outThunk };
+            windStack.push(entry);
+            // Call body-thunk
+            return applyK(bodyThunk, [], (bodyResult) => {
+                // Pop wind entry
+                windStack.pop();
+                // Call out-thunk
+                return applyK(outThunk, [], (_) => {
+                    return k(bodyResult);
+                }, pos);
+            }, pos);
+        }, pos);
     }
     if (func.tag !== 'procedure')
         throw errAt('not a procedure', pos);
@@ -2252,6 +2308,7 @@ function display(val) {
 export function evalStr(input) {
     gensymCounter = 0;
     resolvedSymbols.clear();
+    windStack = [];
     const tokens = tokenize(input);
     const exprs = parse(tokens);
     if (exprs.length === 0)
@@ -2267,6 +2324,7 @@ export function evalStr(input) {
 export function evalStrWithOutput(input) {
     gensymCounter = 0;
     resolvedSymbols.clear();
+    windStack = [];
     const tokens = tokenize(input);
     const exprs = parse(tokens);
     if (exprs.length === 0)

@@ -8,6 +8,10 @@ interface Pos { line: number; col: number }
 type Bounce = { tag: 'done'; value: SchemeVal } | { tag: 'bounce'; fn: () => Bounce };
 type Cont = (val: SchemeVal) => Bounce;
 
+// dynamic-wind support
+type WindEntry = { inThunk: SchemeVal; outThunk: SchemeVal };
+let windStack: WindEntry[] = [];
+
 type SchemeValBase =
   | { tag: 'number'; value: number; exact?: boolean }
   | { tag: 'rational'; num: number; den: number }
@@ -18,7 +22,7 @@ type SchemeValBase =
   | { tag: 'list'; value: SchemeVal[] }
   | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }
   | { tag: 'nil' }
-  | { tag: 'procedure'; value: (...args: SchemeVal[]) => SchemeVal; _closure?: { params: { names: string[]; rest: string | null }; body: SchemeVal[]; env: Env }; _callcc?: boolean; _cont?: Cont; _caseClauses?: { clauses: { paramInfo: { names: string[]; rest: string | null }; bodyExprs: SchemeVal[] }[]; closureEnv: Env } }
+  | { tag: 'procedure'; value: (...args: SchemeVal[]) => SchemeVal; _closure?: { params: { names: string[]; rest: string | null }; body: SchemeVal[]; env: Env }; _callcc?: boolean; _cont?: Cont; _capturedWind?: WindEntry[]; _dynamicWind?: boolean; _caseClauses?: { clauses: { paramInfo: { names: string[]; rest: string | null }; bodyExprs: SchemeVal[] }[]; closureEnv: Env } }
   | { tag: 'void' }
   | { tag: 'macro'; literals: string[]; rules: { pattern: SchemeVal; template: SchemeVal }[]; defEnv: Env }
   | { tag: 'record'; typeName: string; typeId: symbol; fields: Map<string, SchemeVal> }
@@ -1116,6 +1120,10 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   env.set('call/cc', callccProc);
   env.set('call-with-current-continuation', callccProc);
 
+  // L19: dynamic-wind
+  const dynamicWindProc: SchemeVal = { tag: 'procedure', value: (..._args: SchemeVal[]) => { throw new EvalError('dynamic-wind must be applied in CPS context'); }, _dynamicWind: true };
+  env.set('dynamic-wind', dynamicWindProc);
+
   // cxr helpers
   const cxr = (ops: string) => ({ tag: 'procedure' as const, value: (...args: SchemeVal[]) => {
     if (args.length !== 1) throw new EvalError(`c${ops}r requires exactly 1 argument`);
@@ -1552,26 +1560,80 @@ function evalArgsRtoLK(exprs: SchemeVal[], env: Env, k: (args: SchemeVal[]) => B
   return go(len - 1, new Array(len));
 }
 
+function doWindTransition(targetWind: WindEntry[], then: () => Bounce): Bounce {
+  // Find common prefix
+  let common = 0;
+  while (common < windStack.length && common < targetWind.length &&
+         windStack[common] === targetWind[common]) {
+    common++;
+  }
+
+  // Unwind: pop entries and call out-thunks (innermost first)
+  function unwind(): Bounce {
+    if (windStack.length <= common) return rewind(common);
+    const entry = windStack.pop()!;
+    return applyK(entry.outThunk, [], (_) => {
+      return { tag: 'bounce', fn: unwind };
+    });
+  }
+
+  // Rewind: push entries and call in-thunks (outermost first)
+  function rewind(i: number): Bounce {
+    if (i >= targetWind.length) return { tag: 'bounce', fn: then };
+    const entry = targetWind[i];
+    windStack.push(entry);
+    return applyK(entry.inThunk, [], (_) => {
+      return { tag: 'bounce', fn: () => rewind(i + 1) };
+    });
+  }
+
+  return unwind();
+}
+
 function applyK(func: SchemeVal, args: SchemeVal[], k: Cont, pos?: Pos): Bounce {
   // call/cc: (call/cc proc) — proc receives the continuation
   if (func.tag === 'procedure' && func._callcc) {
     if (args.length !== 1) throw errAt('call/cc requires exactly 1 argument', pos);
     const proc = args[0];
+    const capturedWind = [...windStack];
     const contVal: SchemeVal = {
       tag: 'procedure',
       value: (...cargs: SchemeVal[]) => {
         // For use from non-CPS context (e.g. map callback)
         throw new EvalError('continuation invoked outside CPS context');
       },
-      _cont: k
+      _cont: k,
+      _capturedWind: capturedWind
     };
     return applyK(proc, [contVal], k, pos);
   }
 
-  // Continuation invocation
+  // Continuation invocation (with wind transition)
   if (func.tag === 'procedure' && func._cont) {
     const val = args.length > 0 ? args[0] : ({ tag: 'void' } as SchemeVal);
-    return { tag: 'bounce', fn: () => func._cont!(val) };
+    const targetWind = func._capturedWind || [];
+    return doWindTransition(targetWind, () => func._cont!(val));
+  }
+
+  // dynamic-wind
+  if (func.tag === 'procedure' && func._dynamicWind) {
+    if (args.length !== 3) throw errAt('dynamic-wind requires 3 arguments', pos);
+    const [inThunk, bodyThunk, outThunk] = args;
+    // Call in-thunk
+    return applyK(inThunk, [], (_) => {
+      // Push wind entry
+      const entry: WindEntry = { inThunk, outThunk };
+      windStack.push(entry);
+      // Call body-thunk
+      return applyK(bodyThunk, [], (bodyResult) => {
+        // Pop wind entry
+        windStack.pop();
+        // Call out-thunk
+        return applyK(outThunk, [], (_) => {
+          return k(bodyResult);
+        }, pos);
+      }, pos);
+    }, pos);
   }
 
   if (func.tag !== 'procedure') throw errAt('not a procedure', pos);
@@ -2127,6 +2189,7 @@ function display(val: SchemeVal): string {
 export function evalStr(input: string): string {
   gensymCounter = 0;
   resolvedSymbols.clear();
+  windStack = [];
   const tokens = tokenize(input);
   const exprs = parse(tokens);
   if (exprs.length === 0) throw new EvalError('no expressions');
@@ -2142,6 +2205,7 @@ export function evalStr(input: string): string {
 export function evalStrWithOutput(input: string): { result: string; output: string } {
   gensymCounter = 0;
   resolvedSymbols.clear();
+  windStack = [];
   const tokens = tokenize(input);
   const exprs = parse(tokens);
   if (exprs.length === 0) throw new EvalError('no expressions');
