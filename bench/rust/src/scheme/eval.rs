@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use crate::scheme::env::Env;
 use crate::scheme::value::{Value, ValueKind, Pos};
+use crate::scheme::macros;
 use crate::scheme::EvalError;
 
 thread_local! {
@@ -30,7 +31,7 @@ fn fmt_pos(pos: Pos) -> String {
 pub fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
     match &expr.kind {
         ValueKind::Integer(_) | ValueKind::Boolean(_) | ValueKind::Str(_) | ValueKind::Char(_) => Ok(expr.clone()),
-        ValueKind::Lambda { .. } => Ok(expr.clone()),
+        ValueKind::Lambda { .. } | ValueKind::SyntaxRules { .. } => Ok(expr.clone()),
         ValueKind::Symbol(name) => {
             env.get(name).ok_or_else(|| EvalError::UnboundVariable(
                 format!("{} at {}", name, fmt_pos(expr.pos))
@@ -53,10 +54,23 @@ pub fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
                     "cond" => return eval_cond(&elems[1..], env),
                     "set!" => return eval_set(&elems[1..], expr.pos, env),
                     "string-set!" => return eval_string_set(&elems[1..], expr.pos, env),
+                    "define-syntax" => return eval_define_syntax(&elems[1..], expr.pos, env),
                     _ => {}
+                }
+                // Check if symbol is bound to a macro
+                if let Some(val) = env.get(s) {
+                    if let ValueKind::SyntaxRules { ref literals, ref rules, ref def_env } = val.kind {
+                        let expanded = macros::expand_syntax_rules(rules, literals, elems, def_env, env)?;
+                        return eval(&expanded, env);
+                    }
                 }
             }
             let func = eval(&elems[0], env)?;
+            // Check if evaluated head is a macro (e.g. via gensym rename)
+            if let ValueKind::SyntaxRules { ref literals, ref rules, ref def_env } = func.kind {
+                let expanded = macros::expand_syntax_rules(rules, literals, elems, def_env, env)?;
+                return eval(&expanded, env);
+            }
             let args: Vec<Value> = elems[1..].iter()
                 .map(|e| eval(e, env))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -92,6 +106,51 @@ fn eval_define(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalErr
         }
         _ => Err(EvalError::Syntax(format!("define: expected symbol or list at {}", fmt_pos(pos)))),
     }
+}
+
+fn eval_define_syntax(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Syntax(format!("define-syntax requires 2 arguments at {}", fmt_pos(pos))));
+    }
+    let name = match &args[0].kind {
+        ValueKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Syntax(format!("define-syntax: expected symbol at {}", fmt_pos(pos)))),
+    };
+    // args[1] should be (syntax-rules (literals...) (pattern template) ...)
+    let sr = match &args[1].kind {
+        ValueKind::List(elems) => elems,
+        _ => return Err(EvalError::Syntax(format!("define-syntax: expected syntax-rules at {}", fmt_pos(pos)))),
+    };
+    if sr.is_empty() || !matches!(&sr[0].kind, ValueKind::Symbol(s) if s == "syntax-rules") {
+        return Err(EvalError::Syntax(format!("define-syntax: expected syntax-rules at {}", fmt_pos(pos))));
+    }
+    if sr.len() < 2 {
+        return Err(EvalError::Syntax(format!("syntax-rules requires literals and rules at {}", fmt_pos(pos))));
+    }
+    let literals = match &sr[1].kind {
+        ValueKind::List(lits) => {
+            lits.iter().map(|l| match &l.kind {
+                ValueKind::Symbol(s) => Ok(s.clone()),
+                _ => Err(EvalError::Syntax(format!("syntax-rules: literal must be symbol at {}", fmt_pos(l.pos)))),
+            }).collect::<Result<Vec<_>, _>>()?
+        }
+        _ => return Err(EvalError::Syntax(format!("syntax-rules: expected literal list at {}", fmt_pos(sr[1].pos)))),
+    };
+    let mut rules = Vec::new();
+    for rule in &sr[2..] {
+        match &rule.kind {
+            ValueKind::List(parts) if parts.len() == 2 => {
+                rules.push((parts[0].clone(), parts[1].clone()));
+            }
+            _ => return Err(EvalError::Syntax(format!("syntax-rules: bad rule at {}", fmt_pos(rule.pos)))),
+        }
+    }
+    env.set(name, Value::unpos(ValueKind::SyntaxRules {
+        literals,
+        rules,
+        def_env: Rc::clone(env),
+    }));
+    Ok(Value::unpos(ValueKind::Void))
 }
 
 fn eval_set(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalError> {

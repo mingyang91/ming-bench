@@ -6,6 +6,7 @@ mod parser;
 mod value;
 mod env;
 mod eval;
+mod macros;
 
 use env::Env;
 use value::ValueKind;

@@ -18,6 +18,11 @@ pub enum ValueKind {
         body: Vec<Value>,
         env: Rc<Env>,
     },
+    SyntaxRules {
+        literals: Vec<String>,
+        rules: Vec<(Value, Value)>,
+        def_env: Rc<Env>,
+    },
     Void,
 }
 
@@ -57,6 +62,7 @@ impl Value {
                 format!("({})", inner.join(" "))
             }
             ValueKind::Lambda { .. } => "#<procedure>".to_string(),
+            ValueKind::SyntaxRules { .. } => "#<syntax>".to_string(),
             ValueKind::Void => "".to_string(),
         }
     }
@@ -70,6 +76,7 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_display()).collect();
                 format!("({})", inner.join(" "))
             }
+            ValueKind::SyntaxRules { .. } => "#<syntax>".to_string(),
             _ => self.to_display(),
         }
     }
