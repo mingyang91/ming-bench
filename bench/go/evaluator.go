@@ -20,12 +20,9 @@ func EvalStr(input string) (string, error) {
 	}
 
 	env := defaultEnv(nil)
-	var result Value
-	for _, expr := range exprs {
-		result, err = eval(expr, env)
-		if err != nil {
-			return "", err
-		}
+	result, err := evalTopLevel(exprs, env)
+	if err != nil {
+		return "", err
 	}
 	// void produces empty string
 	if _, ok := result.(*VoidVal); ok {
@@ -47,12 +44,9 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 
 	var buf strings.Builder
 	env := defaultEnv(&buf)
-	var res Value
-	for _, expr := range exprs {
-		res, err = eval(expr, env)
-		if err != nil {
-			return "", "", err
-		}
+	res, evalErr := evalTopLevel(exprs, env)
+	if evalErr != nil {
+		return "", "", evalErr
 	}
 	if _, ok := res.(*VoidVal); ok {
 		return "", buf.String(), nil
@@ -68,6 +62,15 @@ type tailCall struct {
 
 func (t *tailCall) String() string { return "" }
 
+// contJump is panicked when a continuation is invoked, causing non-local transfer.
+type contJump struct {
+	cont  *ContinuationVal
+	value Value
+}
+
+// contFrameStack tracks the current evaluation context for continuation capture.
+var contFrameStack []contFrame
+
 // eval evaluates an expression in the given environment using a trampoline for TCO.
 func eval(expr *Expr, env *Env) (Value, error) {
 	for {
@@ -82,6 +85,130 @@ func eval(expr *Expr, env *Env) (Value, error) {
 		}
 		return result, nil
 	}
+}
+
+// evalTopLevel evaluates top-level expressions with continuation support.
+func evalTopLevel(exprs []*Expr, env *Env) (Value, error) {
+	contFrameStack = contFrameStack[:0]
+
+	result, err, cj := protectedEval(func() (Value, error) {
+		contFrameStack = append(contFrameStack, contFrame{Kind: frameTopLevel, Exprs: exprs, Env: env})
+		defer func() {
+			if len(contFrameStack) > 0 {
+				contFrameStack = contFrameStack[:len(contFrameStack)-1]
+			}
+		}()
+		var r Value
+		for i, expr := range exprs {
+			contFrameStack[len(contFrameStack)-1].Idx = i
+			var err error
+			r, err = eval(expr, env)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return r, nil
+	})
+
+	for cj != nil {
+		cont := cj.cont
+		val := cj.value
+		result, err, cj = protectedEval(func() (Value, error) {
+			return execContinuation(cont, val)
+		})
+	}
+
+	return result, err
+}
+
+// protectedEval runs fn and catches contJump panics.
+func protectedEval(fn func() (Value, error)) (result Value, err error, jump *contJump) {
+	defer func() {
+		if r := recover(); r != nil {
+			if cj, ok := r.(*contJump); ok {
+				jump = cj
+				return
+			}
+			panic(r)
+		}
+	}()
+	result, err = fn()
+	return result, err, nil
+}
+
+// callWithContRecover calls fn and catches escape continuation panics for the given continuation.
+func callWithContRecover(k *ContinuationVal, fn func() (Value, error)) (result Value, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if cj, ok := r.(*contJump); ok && cj.cont == k {
+				// Escape continuation: return the value directly
+				result = cj.value
+				err = nil
+				return
+			}
+			panic(r) // re-panic if not for us
+		}
+	}()
+	result, err = fn()
+	if err != nil {
+		return nil, err
+	}
+	// Resolve tail calls from proc
+	for {
+		if tc, ok := result.(*tailCall); ok {
+			result, err = evalStep(tc.expr, tc.env)
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+		break
+	}
+	return result, err
+}
+
+// callccInjectValue, when non-nil, makes the next call/cc return this value directly.
+var callccInjectValue *Value
+
+// execContinuation re-evaluates from a captured continuation's frames.
+func execContinuation(cont *ContinuationVal, value Value) (Value, error) {
+	savedStack := contFrameStack
+	contFrameStack = nil
+	defer func() { contFrameStack = savedStack }()
+
+	// Set inject value so the next call/cc returns it directly
+	callccInjectValue = &value
+
+	var result Value
+	var err error
+
+	// Frames are stored outermost-first. Process innermost-first.
+	for fi := len(cont.Frames) - 1; fi >= 0; fi-- {
+		frame := cont.Frames[fi]
+
+		// Set up frame stack: current frame + all outer frames (outermost first)
+		contFrameStack = contFrameStack[:0]
+		for i := 0; i <= fi; i++ {
+			contFrameStack = append(contFrameStack, cont.Frames[i])
+		}
+
+		isInnermost := fi == len(cont.Frames)-1
+
+		startIdx := frame.Idx
+		if !isInnermost {
+			// Outer frames: skip the expression at idx (handled by inner frames)
+			startIdx = frame.Idx + 1
+		}
+		for i := startIdx; i < len(frame.Exprs); i++ {
+			contFrameStack[len(contFrameStack)-1].Idx = i
+			result, err = eval(frame.Exprs[i], frame.Env)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return result, nil
 }
 
 // evalStep performs one step of evaluation, returning tailCall for tail positions.
@@ -405,6 +532,10 @@ func defaultEnv(output *strings.Builder) *Env {
 	env.Set("string>=?", &BuiltinFunc{Name: "string>=?", Fn: builtinStringGeQ})
 	env.Set("reverse", &BuiltinFunc{Name: "reverse", Fn: builtinReverse})
 	env.Set("error", &BuiltinFunc{Name: "error", Fn: builtinError})
+
+	// L18 builtins — first-class continuations
+	env.Set("call/cc", &CallCCVal{})
+	env.Set("call-with-current-continuation", &CallCCVal{})
 
 	return env
 }
@@ -779,6 +910,30 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 			result = &PairVal{Car: results[i], Cdr: result}
 		}
 		return result, nil
+	case *CallCCVal:
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: call/cc: expected 1 argument, got %d", callExpr.Line, callExpr.Col, len(args))}
+		}
+		// If an inject value is set (re-evaluation from continuation), return it directly
+		if callccInjectValue != nil {
+			val := *callccInjectValue
+			callccInjectValue = nil
+			return val, nil
+		}
+		// Capture current continuation (snapshot the frame stack)
+		frames := make([]contFrame, len(contFrameStack))
+		copy(frames, contFrameStack)
+		k := &ContinuationVal{Frames: frames}
+		// Call proc(k) with escape continuation recovery
+		result, err := callWithContRecover(k, func() (Value, error) {
+			return applyProc(args[0], []Value{k}, callExpr)
+		})
+		return result, err
+	case *ContinuationVal:
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: expected 1 argument, got %d", callExpr.Line, callExpr.Col, len(args))}
+		}
+		panic(&contJump{cont: fn, value: args[0]})
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", callExpr.List[0].Line, callExpr.List[0].Col)}
 	}
@@ -914,12 +1069,16 @@ func evalLet(expr *Expr, env *Env) (Value, error) {
 		for i, p := range params {
 			childEnv.Set(p, vals[i])
 		}
-		for _, bodyExpr := range body[:len(body)-1] {
+		contFrameStack = append(contFrameStack, contFrame{Kind: frameBody, Exprs: body, Env: childEnv})
+		defer func() { contFrameStack = contFrameStack[:len(contFrameStack)-1] }()
+		for i, bodyExpr := range body[:len(body)-1] {
+			contFrameStack[len(contFrameStack)-1].Idx = i
 			_, err := eval(bodyExpr, childEnv)
 			if err != nil {
 				return nil, err
 			}
 		}
+		contFrameStack[len(contFrameStack)-1].Idx = len(body) - 1
 		return &tailCall{expr: body[len(body)-1], env: childEnv}, nil
 	}
 
@@ -927,12 +1086,16 @@ func evalLet(expr *Expr, env *Env) (Value, error) {
 	for i, p := range params {
 		childEnv.Set(p, vals[i])
 	}
-	for _, bodyExpr := range body[:len(body)-1] {
+	contFrameStack = append(contFrameStack, contFrame{Kind: frameBody, Exprs: body, Env: childEnv})
+	defer func() { contFrameStack = contFrameStack[:len(contFrameStack)-1] }()
+	for i, bodyExpr := range body[:len(body)-1] {
+		contFrameStack[len(contFrameStack)-1].Idx = i
 		_, err := eval(bodyExpr, childEnv)
 		if err != nil {
 			return nil, err
 		}
 	}
+	contFrameStack[len(contFrameStack)-1].Idx = len(body) - 1
 	return &tailCall{expr: body[len(body)-1], env: childEnv}, nil
 }
 
@@ -957,12 +1120,16 @@ func evalLetStar(expr *Expr, env *Env) (Value, error) {
 		childEnv.Set(b.List[0].SVal, val)
 	}
 	body := expr.List[2:]
-	for _, bodyExpr := range body[:len(body)-1] {
+	contFrameStack = append(contFrameStack, contFrame{Kind: frameBody, Exprs: body, Env: childEnv})
+	defer func() { contFrameStack = contFrameStack[:len(contFrameStack)-1] }()
+	for i, bodyExpr := range body[:len(body)-1] {
+		contFrameStack[len(contFrameStack)-1].Idx = i
 		_, err := eval(bodyExpr, childEnv)
 		if err != nil {
 			return nil, err
 		}
 	}
+	contFrameStack[len(contFrameStack)-1].Idx = len(body) - 1
 	return &tailCall{expr: body[len(body)-1], env: childEnv}, nil
 }
 
@@ -971,12 +1138,16 @@ func evalBegin(expr *Expr, env *Env) (Value, error) {
 		return &VoidVal{}, nil
 	}
 	body := expr.List[1:]
-	for _, e := range body[:len(body)-1] {
+	contFrameStack = append(contFrameStack, contFrame{Kind: frameBody, Exprs: body, Env: env})
+	defer func() { contFrameStack = contFrameStack[:len(contFrameStack)-1] }()
+	for i, e := range body[:len(body)-1] {
+		contFrameStack[len(contFrameStack)-1].Idx = i
 		_, err := eval(e, env)
 		if err != nil {
 			return nil, err
 		}
 	}
+	contFrameStack[len(contFrameStack)-1].Idx = len(body) - 1
 	return &tailCall{expr: body[len(body)-1], env: env}, nil
 }
 
@@ -2329,7 +2500,7 @@ func builtinProcedureQ(args []Value) (Value, error) {
 		return nil, fmt.Errorf("procedure?: expected 1 argument, got %d", len(args))
 	}
 	switch args[0].(type) {
-	case *LambdaVal, *CaseLambdaVal, *BuiltinFunc, *ApplyVal, *MapVal:
+	case *LambdaVal, *CaseLambdaVal, *BuiltinFunc, *ApplyVal, *MapVal, *CallCCVal, *ContinuationVal:
 		return &BoolVal{Val: true}, nil
 	}
 	return &BoolVal{Val: false}, nil
@@ -2365,12 +2536,16 @@ func evalLetrec(expr *Expr, env *Env) (Value, error) {
 	}
 	// Evaluate body
 	body := expr.List[2:]
-	for _, bodyExpr := range body[:len(body)-1] {
+	contFrameStack = append(contFrameStack, contFrame{Kind: frameBody, Exprs: body, Env: childEnv})
+	defer func() { contFrameStack = contFrameStack[:len(contFrameStack)-1] }()
+	for i, bodyExpr := range body[:len(body)-1] {
+		contFrameStack[len(contFrameStack)-1].Idx = i
 		_, err := eval(bodyExpr, childEnv)
 		if err != nil {
 			return nil, err
 		}
 	}
+	contFrameStack[len(contFrameStack)-1].Idx = len(body) - 1
 	return &tailCall{expr: body[len(body)-1], env: childEnv}, nil
 }
 
@@ -2395,12 +2570,17 @@ func evalLetrecStar(expr *Expr, env *Env) (Value, error) {
 		childEnv.Set(b.List[0].SVal, val)
 	}
 	body := expr.List[2:]
-	for _, bodyExpr := range body[:len(body)-1] {
+	contFrameStack = append(contFrameStack, contFrame{Kind: frameBody, Exprs: body, Env: childEnv})
+	defer func() { contFrameStack = contFrameStack[:len(contFrameStack)-1] }()
+	for i, bodyExpr := range body[:len(body)-1] {
+		contFrameStack[len(contFrameStack)-1].Idx = i
+		contFrameStack[len(contFrameStack)-1].Idx = i
 		_, err := eval(bodyExpr, childEnv)
 		if err != nil {
 			return nil, err
 		}
 	}
+	contFrameStack[len(contFrameStack)-1].Idx = len(body) - 1
 	return &tailCall{expr: body[len(body)-1], env: childEnv}, nil
 }
 

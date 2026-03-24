@@ -333,6 +333,36 @@ func (v *VectorVal) String() string {
 	return buf.String()
 }
 
+// CallCCVal is the first-class call/cc procedure.
+type CallCCVal struct{}
+
+func (v *CallCCVal) String() string { return "#<procedure call/cc>" }
+
+// ContinuationVal represents a captured first-class continuation.
+type ContinuationVal struct {
+	Frames []contFrame
+}
+
+func (v *ContinuationVal) String() string { return "#<continuation>" }
+
+// contFrame represents one level of the evaluation context for continuation capture.
+type contFrame struct {
+	Kind    contFrameKind
+	Exprs   []*Expr // for body/topLevel
+	Env     *Env
+	Idx     int    // for body/topLevel: current expression index
+	VarName string // for define/set
+}
+
+type contFrameKind int
+
+const (
+	frameBody    contFrameKind = iota // let/begin/lambda body
+	frameTopLevel                     // top-level expression sequence
+	frameDefine                       // pending define
+	frameSet                          // pending set!
+)
+
 // isTruthy returns true for all values except #f.
 func isTruthy(v Value) bool {
 	if b, ok := v.(*BoolVal); ok {
