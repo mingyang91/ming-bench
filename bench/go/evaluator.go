@@ -22,11 +22,15 @@ const (
 	valLambda
 	valChar
 	valMacro
+	valFloat
+	valRational
 )
 
 type Value struct {
 	typ    valueType
 	ival   int64
+	fval   float64
+	dval   int64 // denominator for valRational
 	bval   bool
 	sval   string
 	car    *Value
@@ -39,13 +43,165 @@ type Value struct {
 	macro     *syntaxRulesMacro
 }
 
-func intVal(n int64) *Value   { return &Value{typ: valInt, ival: n} }
-func boolVal(b bool) *Value   { return &Value{typ: valBool, bval: b} }
-func strVal(s string) *Value  { return &Value{typ: valString, sval: s} }
-func symVal(s string) *Value  { return &Value{typ: valSymbol, sval: s} }
-func charVal(c rune) *Value   { return &Value{typ: valChar, ival: int64(c)} }
-func nilVal() *Value          { return &Value{typ: valNil} }
-func voidVal() *Value         { return &Value{typ: valVoid} }
+func intVal(n int64) *Value    { return &Value{typ: valInt, ival: n} }
+func boolVal(b bool) *Value    { return &Value{typ: valBool, bval: b} }
+func strVal(s string) *Value   { return &Value{typ: valString, sval: s} }
+func symVal(s string) *Value   { return &Value{typ: valSymbol, sval: s} }
+func charVal(c rune) *Value    { return &Value{typ: valChar, ival: int64(c)} }
+func floatVal(f float64) *Value { return &Value{typ: valFloat, fval: f} }
+func nilVal() *Value           { return &Value{typ: valNil} }
+func voidVal() *Value          { return &Value{typ: valVoid} }
+
+func gcd64(a, b int64) int64 {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+func abs64(n int64) int64 {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+func makeRational(num, den int64) *Value {
+	if den < 0 {
+		num, den = -num, -den
+	}
+	g := gcd64(abs64(num), den)
+	if g != 0 {
+		num, den = num/g, den/g
+	}
+	if den == 1 {
+		return intVal(num)
+	}
+	return &Value{typ: valRational, ival: num, dval: den}
+}
+
+func isNumeric(v *Value) bool {
+	return v.typ == valInt || v.typ == valFloat || v.typ == valRational
+}
+
+func isExact(v *Value) bool {
+	return v.typ == valInt || v.typ == valRational
+}
+
+func toFloat64(v *Value) float64 {
+	switch v.typ {
+	case valInt:
+		return float64(v.ival)
+	case valFloat:
+		return v.fval
+	case valRational:
+		return float64(v.ival) / float64(v.dval)
+	}
+	return 0
+}
+
+func toRatParts(v *Value) (int64, int64) {
+	switch v.typ {
+	case valInt:
+		return v.ival, 1
+	case valRational:
+		return v.ival, v.dval
+	}
+	return 0, 1
+}
+
+func numAdd(a, b *Value) *Value {
+	if a.typ == valFloat || b.typ == valFloat {
+		return floatVal(toFloat64(a) + toFloat64(b))
+	}
+	an, ad := toRatParts(a)
+	bn, bd := toRatParts(b)
+	return makeRational(an*bd+bn*ad, ad*bd)
+}
+
+func numSub(a, b *Value) *Value {
+	if a.typ == valFloat || b.typ == valFloat {
+		return floatVal(toFloat64(a) - toFloat64(b))
+	}
+	an, ad := toRatParts(a)
+	bn, bd := toRatParts(b)
+	return makeRational(an*bd-bn*ad, ad*bd)
+}
+
+func numMul(a, b *Value) *Value {
+	if a.typ == valFloat || b.typ == valFloat {
+		return floatVal(toFloat64(a) * toFloat64(b))
+	}
+	an, ad := toRatParts(a)
+	bn, bd := toRatParts(b)
+	return makeRational(an*bn, ad*bd)
+}
+
+func numDiv(a, b *Value) *Value {
+	if a.typ == valFloat || b.typ == valFloat {
+		return floatVal(toFloat64(a) / toFloat64(b))
+	}
+	an, ad := toRatParts(a)
+	bn, bd := toRatParts(b)
+	return makeRational(an*bd, ad*bn)
+}
+
+func numNeg(a *Value) *Value {
+	switch a.typ {
+	case valInt:
+		return intVal(-a.ival)
+	case valFloat:
+		return floatVal(-a.fval)
+	case valRational:
+		return &Value{typ: valRational, ival: -a.ival, dval: a.dval}
+	}
+	return a
+}
+
+func numCmp(a, b *Value) int {
+	if a.typ == valFloat || b.typ == valFloat {
+		af, bf := toFloat64(a), toFloat64(b)
+		if af < bf {
+			return -1
+		}
+		if af > bf {
+			return 1
+		}
+		return 0
+	}
+	an, ad := toRatParts(a)
+	bn, bd := toRatParts(b)
+	lhs := an * bd
+	rhs := bn * ad
+	if lhs < rhs {
+		return -1
+	}
+	if lhs > rhs {
+		return 1
+	}
+	return 0
+}
+
+func floatToExact(f float64) *Value {
+	if f == float64(int64(f)) {
+		return intVal(int64(f))
+	}
+	neg := f < 0
+	if neg {
+		f = -f
+	}
+	num := f
+	den := int64(1)
+	for num != float64(int64(num)) && den < (1<<52) {
+		num *= 2
+		den *= 2
+	}
+	n := int64(num)
+	if neg {
+		n = -n
+	}
+	return makeRational(n, den)
+}
 
 func (v *Value) String() string {
 	switch v.typ {
@@ -78,6 +234,14 @@ func (v *Value) String() string {
 		default:
 			return `#\` + string(ch)
 		}
+	case valFloat:
+		s := strconv.FormatFloat(v.fval, 'f', -1, 64)
+		if !strings.Contains(s, ".") {
+			s += ".0"
+		}
+		return s
+	case valRational:
+		return fmt.Sprintf("%d/%d", v.ival, v.dval)
 	case valLambda:
 		return "#<procedure>"
 	case valMacro:
@@ -140,6 +304,8 @@ const (
 	tokLParen tokenKind = iota
 	tokRParen
 	tokNumber
+	tokFloat
+	tokRational
 	tokString
 	tokBool
 	tokSymbol
@@ -153,6 +319,8 @@ type token struct {
 	kind tokenKind
 	sval string
 	ival int64
+	fval float64
+	dval int64
 	bval bool
 	line int
 	col  int
@@ -315,6 +483,24 @@ func (l *lexer) readAtom(line, col int) (token, error) {
 	// Try parsing as integer
 	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return token{kind: tokNumber, ival: n, line: line, col: col}, nil
+	}
+
+	// Try parsing as rational (e.g., 1/3, -1/3)
+	if idx := strings.Index(s, "/"); idx > 0 && idx < len(s)-1 {
+		numStr := s[:idx]
+		denStr := s[idx+1:]
+		if num, err := strconv.ParseInt(numStr, 10, 64); err == nil {
+			if den, err := strconv.ParseInt(denStr, 10, 64); err == nil && den != 0 {
+				return token{kind: tokRational, ival: num, dval: den, line: line, col: col}, nil
+			}
+		}
+	}
+
+	// Try parsing as float
+	if strings.Contains(s, ".") || strings.ContainsAny(s, "eE") {
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return token{kind: tokFloat, fval: f, line: line, col: col}, nil
+		}
 	}
 
 	return token{kind: tokSymbol, sval: s, line: line, col: col}, nil
@@ -487,6 +673,10 @@ func evalAtom(node *astNode, e *env) (*Value, error) {
 	switch t.kind {
 	case tokNumber:
 		return intVal(t.ival), nil
+	case tokFloat:
+		return floatVal(t.fval), nil
+	case tokRational:
+		return makeRational(t.ival, t.dval), nil
 	case tokBool:
 		return boolVal(t.bval), nil
 	case tokString:
@@ -865,6 +1055,10 @@ func quoteNode(node *astNode) *Value {
 		switch node.tok.kind {
 		case tokNumber:
 			return intVal(node.tok.ival)
+		case tokFloat:
+			return floatVal(node.tok.fval)
+		case tokRational:
+			return makeRational(node.tok.ival, node.tok.dval)
 		case tokBool:
 			return boolVal(node.tok.bval)
 		case tokString:
@@ -897,6 +1091,15 @@ func quoteNode(node *astNode) *Value {
 func requireInts(args []*Value, name string, node *astNode) error {
 	for _, a := range args {
 		if a.typ != valInt {
+			return &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected number", node.line, node.col, name)}
+		}
+	}
+	return nil
+}
+
+func requireNums(args []*Value, name string, node *astNode) error {
+	for _, a := range args {
+		if !isNumeric(a) {
 			return &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected number", node.line, node.col, name)}
 		}
 	}
@@ -950,101 +1153,107 @@ func applyLambda(op *Value, args []*Value, node *astNode, ip *interp) (*Value, e
 func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value, error) {
 	switch name {
 	case "+":
-		if err := requireInts(args, "+", node); err != nil {
+		if err := requireNums(args, "+", node); err != nil {
 			return nil, err
 		}
-		sum := int64(0)
-		for _, a := range args {
-			sum += a.ival
+		if len(args) == 0 {
+			return intVal(0), nil
 		}
-		return intVal(sum), nil
+		result := args[0]
+		for _, a := range args[1:] {
+			result = numAdd(result, a)
+		}
+		return result, nil
 
 	case "-":
 		if len(args) == 0 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: -: need at least 1 argument", node.line, node.col)}
 		}
-		if err := requireInts(args, "-", node); err != nil {
+		if err := requireNums(args, "-", node); err != nil {
 			return nil, err
 		}
 		if len(args) == 1 {
-			return intVal(-args[0].ival), nil
+			return numNeg(args[0]), nil
 		}
-		result := args[0].ival
+		result := args[0]
 		for _, a := range args[1:] {
-			result -= a.ival
+			result = numSub(result, a)
 		}
-		return intVal(result), nil
+		return result, nil
 
 	case "*":
-		if err := requireInts(args, "*", node); err != nil {
+		if err := requireNums(args, "*", node); err != nil {
 			return nil, err
 		}
-		product := int64(1)
-		for _, a := range args {
-			product *= a.ival
+		if len(args) == 0 {
+			return intVal(1), nil
 		}
-		return intVal(product), nil
+		result := args[0]
+		for _, a := range args[1:] {
+			result = numMul(result, a)
+		}
+		return result, nil
 
 	case "/":
 		if len(args) < 2 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: need at least 2 arguments", node.line, node.col)}
 		}
-		if err := requireInts(args, "/", node); err != nil {
+		if err := requireNums(args, "/", node); err != nil {
 			return nil, err
 		}
-		result := args[0].ival
+		result := args[0]
 		for _, a := range args[1:] {
-			if a.ival == 0 {
+			if toFloat64(a) == 0 {
 				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: division by zero", node.line, node.col)}
 			}
-			result /= a.ival
+			result = numDiv(result, a)
 		}
-		return intVal(result), nil
+		return result, nil
 
 	case "<":
 		if len(args) != 2 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: <: need 2 arguments", node.line, node.col)}
 		}
-		if err := requireInts(args, "<", node); err != nil {
+		if err := requireNums(args, "<", node); err != nil {
 			return nil, err
 		}
-		return boolVal(args[0].ival < args[1].ival), nil
+		return boolVal(numCmp(args[0], args[1]) < 0), nil
 
 	case ">":
 		if len(args) != 2 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: >: need 2 arguments", node.line, node.col)}
 		}
-		if err := requireInts(args, ">", node); err != nil {
+		if err := requireNums(args, ">", node); err != nil {
 			return nil, err
 		}
-		return boolVal(args[0].ival > args[1].ival), nil
+		return boolVal(numCmp(args[0], args[1]) > 0), nil
 
 	case "=":
 		if len(args) != 2 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: =: need 2 arguments", node.line, node.col)}
 		}
-		if err := requireInts(args, "=", node); err != nil {
+		if err := requireNums(args, "=", node); err != nil {
 			return nil, err
 		}
-		return boolVal(args[0].ival == args[1].ival), nil
+		return boolVal(numCmp(args[0], args[1]) == 0), nil
 
 	case "<=":
 		if len(args) != 2 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: <=: need 2 arguments", node.line, node.col)}
 		}
-		if err := requireInts(args, "<=", node); err != nil {
+		if err := requireNums(args, "<=", node); err != nil {
 			return nil, err
 		}
-		return boolVal(args[0].ival <= args[1].ival), nil
+		return boolVal(numCmp(args[0], args[1]) <= 0), nil
 
 	case ">=":
 		if len(args) != 2 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: >=: need 2 arguments", node.line, node.col)}
 		}
-		if err := requireInts(args, ">=", node); err != nil {
+		if err := requireNums(args, ">=", node); err != nil {
 			return nil, err
 		}
-		return boolVal(args[0].ival >= args[1].ival), nil
+		return boolVal(numCmp(args[0], args[1]) >= 0), nil
 
 	case "not":
 		if len(args) != 1 {
@@ -1130,7 +1339,7 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		if len(args) != 1 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: number?: need 1 argument", node.line, node.col)}
 		}
-		return boolVal(args[0].typ == valInt), nil
+		return boolVal(isNumeric(args[0])), nil
 
 	case "string?":
 		if len(args) != 1 {
@@ -1233,10 +1442,10 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		if len(args) != 1 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: number->string: need 1 argument", node.line, node.col)}
 		}
-		if args[0].typ != valInt {
+		if !isNumeric(args[0]) {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: number->string: expected number", node.line, node.col)}
 		}
-		return strVal(strconv.FormatInt(args[0].ival, 10)), nil
+		return strVal(args[0].String()), nil
 
 	case "symbol->string":
 		if len(args) != 1 {
@@ -1578,6 +1787,71 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		}
 		return charVal(rune(args[0].ival)), nil
 
+	case "integer?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: integer?: need 1 argument", node.line, node.col)}
+		}
+		return boolVal(args[0].typ == valInt), nil
+
+	case "rational?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: rational?: need 1 argument", node.line, node.col)}
+		}
+		return boolVal(args[0].typ == valInt || args[0].typ == valRational), nil
+
+	case "exact?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: exact?: need 1 argument", node.line, node.col)}
+		}
+		return boolVal(isExact(args[0])), nil
+
+	case "inexact?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: inexact?: need 1 argument", node.line, node.col)}
+		}
+		return boolVal(args[0].typ == valFloat), nil
+
+	case "exact->inexact":
+		if len(args) != 1 || !isNumeric(args[0]) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: exact->inexact: expected number", node.line, node.col)}
+		}
+		return floatVal(toFloat64(args[0])), nil
+
+	case "inexact->exact":
+		if len(args) != 1 || !isNumeric(args[0]) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: inexact->exact: expected number", node.line, node.col)}
+		}
+		if args[0].typ == valFloat {
+			return floatToExact(args[0].fval), nil
+		}
+		return args[0], nil
+
+	case "numerator":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: numerator: need 1 argument", node.line, node.col)}
+		}
+		switch args[0].typ {
+		case valInt:
+			return args[0], nil
+		case valRational:
+			return intVal(args[0].ival), nil
+		default:
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: numerator: expected rational", node.line, node.col)}
+		}
+
+	case "denominator":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: denominator: need 1 argument", node.line, node.col)}
+		}
+		switch args[0].typ {
+		case valInt:
+			return intVal(1), nil
+		case valRational:
+			return intVal(args[0].dval), nil
+		default:
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: denominator: expected rational", node.line, node.col)}
+		}
+
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", node.line, node.col, name)}
 	}
@@ -1590,6 +1864,10 @@ func valEq(a, b *Value) bool {
 	switch a.typ {
 	case valInt:
 		return a.ival == b.ival
+	case valFloat:
+		return a.fval == b.fval
+	case valRational:
+		return a.ival == b.ival && a.dval == b.dval
 	case valBool:
 		return a.bval == b.bval
 	case valChar:
@@ -1610,6 +1888,10 @@ func valEqual(a, b *Value) bool {
 	switch a.typ {
 	case valInt:
 		return a.ival == b.ival
+	case valFloat:
+		return a.fval == b.fval
+	case valRational:
+		return a.ival == b.ival && a.dval == b.dval
 	case valBool:
 		return a.bval == b.bval
 	case valChar:
@@ -1718,6 +2000,7 @@ func makeGlobalEnv() *env {
 	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
 		"cons", "car", "cdr", "null?", "list", "length",
 		"number?", "string?", "boolean?", "pair?", "symbol?", "char?",
+		"integer?", "rational?",
 		"append",
 		"display", "write", "newline",
 		"string-append", "string-length", "substring",
@@ -1736,7 +2019,9 @@ func makeGlobalEnv() *env {
 		"char=?", "char<?",
 		"string=?", "string<?", "string-ci=?",
 		"string-upcase", "string-downcase",
-		"char->integer", "integer->char"}
+		"char->integer", "integer->char",
+		"exact?", "inexact?", "exact->inexact", "inexact->exact",
+		"numerator", "denominator"}
 	for _, name := range builtins {
 		e.set(name, symVal(name))
 	}
