@@ -444,6 +444,7 @@ public class Evaluator {
 
     @SuppressWarnings("unchecked")
     private Object eval(Object expr, Env env) throws EvalError {
+        tco: while (true) { // TCO trampoline
         if (expr instanceof Located loc) {
             currentPos = loc.pos();
             expr = loc.value();
@@ -583,9 +584,9 @@ public class Evaluator {
                         if (list.size() < 3) throw new EvalError(posStr() + "if: bad syntax");
                         Object cond = eval(list.get(1), env);
                         if (!isFalse(cond)) {
-                            return eval(list.get(2), env);
+                            expr = list.get(2); continue;
                         } else if (list.size() > 3) {
-                            return eval(list.get(3), env);
+                            expr = list.get(3); continue;
                         } else {
                             return VOID;
                         }
@@ -657,27 +658,27 @@ public class Evaluator {
                         return new CaseLambda(clauses);
                     }
                     case "and" -> {
-                        Object result = Boolean.TRUE;
-                        for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
+                        if (list.size() == 1) return Boolean.TRUE;
+                        for (int i = 1; i < list.size() - 1; i++) {
+                            Object result = eval(list.get(i), env);
                             if (isFalse(result)) return result;
                         }
-                        return result;
+                        expr = list.get(list.size() - 1); continue;
                     }
                     case "or" -> {
-                        Object result = Boolean.FALSE;
-                        for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
+                        if (list.size() == 1) return Boolean.FALSE;
+                        for (int i = 1; i < list.size() - 1; i++) {
+                            Object result = eval(list.get(i), env);
                             if (!isFalse(result)) return result;
                         }
-                        return result;
+                        expr = list.get(list.size() - 1); continue;
                     }
                     case "begin" -> {
-                        Object result = VOID;
-                        for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
+                        if (list.size() == 1) return VOID;
+                        for (int i = 1; i < list.size() - 1; i++) {
+                            eval(list.get(i), env);
                         }
-                        return result;
+                        expr = list.get(list.size() - 1); continue;
                     }
                     case "cond" -> {
                         for (int i = 1; i < list.size(); i++) {
@@ -688,20 +689,19 @@ public class Evaluator {
                             Object clauseHead = clause.get(0);
                             Object rawClauseHead = unwrap(clauseHead);
                             if (rawClauseHead instanceof String s && s.equals("else")) {
-                                Object result = VOID;
-                                for (int j = 1; j < clause.size(); j++) {
-                                    result = eval(clause.get(j), env);
+                                for (int j = 1; j < clause.size() - 1; j++) {
+                                    eval(clause.get(j), env);
                                 }
-                                return result;
+                                if (clause.size() > 1) { expr = clause.get(clause.size() - 1); continue tco; }
+                                return VOID;
                             }
                             Object test = eval(clauseHead, env);
                             if (!isFalse(test)) {
                                 if (clause.size() == 1) return test;
-                                Object result = VOID;
-                                for (int j = 1; j < clause.size(); j++) {
-                                    result = eval(clause.get(j), env);
+                                for (int j = 1; j < clause.size() - 1; j++) {
+                                    eval(clause.get(j), env);
                                 }
-                                return result;
+                                expr = clause.get(clause.size() - 1); continue tco;
                             }
                         }
                         return VOID;
@@ -739,11 +739,10 @@ public class Evaluator {
                             for (int i = 0; i < params.size(); i++) {
                                 callEnv.define(params.get(i), initVals.get(i));
                             }
-                            Object result = VOID;
-                            for (Object bodyExpr : body) {
-                                result = eval(bodyExpr, callEnv);
+                            for (int i = 0; i < body.size() - 1; i++) {
+                                eval(body.get(i), callEnv);
                             }
-                            return result;
+                            expr = body.get(body.size() - 1); env = callEnv; continue;
                         }
 
                         // Regular let
@@ -762,11 +761,10 @@ public class Evaluator {
                             }
                             letEnv.define(name, eval(pair.get(1), env));
                         }
-                        Object result = VOID;
-                        for (int i = 2; i < list.size(); i++) {
-                            result = eval(list.get(i), letEnv);
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            eval(list.get(i), letEnv);
                         }
-                        return result;
+                        expr = list.get(list.size() - 1); env = letEnv; continue;
                     }
                     case "letrec" -> {
                         if (list.size() < 3) throw new EvalError(posStr() + "letrec: bad syntax");
@@ -789,11 +787,10 @@ public class Evaluator {
                         for (int i = 0; i < names.size(); i++) {
                             letrecEnv.define(names.get(i), eval(initExprs.get(i), letrecEnv));
                         }
-                        Object result = VOID;
-                        for (int i = 2; i < list.size(); i++) {
-                            result = eval(list.get(i), letrecEnv);
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            eval(list.get(i), letrecEnv);
                         }
-                        return result;
+                        expr = list.get(list.size() - 1); env = letrecEnv; continue;
                     }
                     case "letrec*" -> {
                         if (list.size() < 3) throw new EvalError(posStr() + "letrec*: bad syntax");
@@ -807,11 +804,10 @@ public class Evaluator {
                             if (!(nameObj instanceof String name)) throw new EvalError(posStr() + "letrec*: binding name must be a symbol");
                             letrecEnv.define(name, eval(bp.get(1), letrecEnv));
                         }
-                        Object result = VOID;
-                        for (int i = 2; i < list.size(); i++) {
-                            result = eval(list.get(i), letrecEnv);
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            eval(list.get(i), letrecEnv);
                         }
-                        return result;
+                        expr = list.get(list.size() - 1); env = letrecEnv; continue;
                     }
                     case "case" -> {
                         if (list.size() < 2) throw new EvalError(posStr() + "case: bad syntax");
@@ -822,22 +818,22 @@ public class Evaluator {
                                 throw new EvalError(posStr() + "case: bad clause");
                             Object datums = unwrap(clause.get(0));
                             if (datums instanceof String s && s.equals("else")) {
-                                Object result = VOID;
-                                for (int j = 1; j < clause.size(); j++) {
-                                    result = eval(clause.get(j), env);
+                                for (int j = 1; j < clause.size() - 1; j++) {
+                                    eval(clause.get(j), env);
                                 }
-                                return result;
+                                if (clause.size() > 1) { expr = clause.get(clause.size() - 1); continue tco; }
+                                return VOID;
                             }
                             if (!(datums instanceof List<?> datumList))
                                 throw new EvalError(posStr() + "case: expected datum list");
                             for (Object d : datumList) {
                                 Object datum = quoteDatum(d);
                                 if (schemeEqv(key, datum)) {
-                                    Object result = VOID;
-                                    for (int j = 1; j < clause.size(); j++) {
-                                        result = eval(clause.get(j), env);
+                                    for (int j = 1; j < clause.size() - 1; j++) {
+                                        eval(clause.get(j), env);
                                     }
-                                    return result;
+                                    if (clause.size() > 1) { expr = clause.get(clause.size() - 1); continue tco; }
+                                    return VOID;
                                 }
                             }
                         }
@@ -905,7 +901,7 @@ public class Evaluator {
                 try {
                     Object macroVal = env.lookup(macroSym);
                     if (macroVal instanceof SyntaxTransformer st) {
-                        return eval(expandMacro(st, list, env), env);
+                        expr = expandMacro(st, list, env); continue;
                     }
                 } catch (EvalError e) { /* not bound, fall through */ }
             }
@@ -920,11 +916,25 @@ public class Evaluator {
             }
 
             if (proc instanceof Lambda lam) {
-                return applyLambda(lam, args);
+                // TCO: inline lambda application into the trampoline
+                env = bindLambdaArgs(lam, args);
+                List<Object> body = lam.body();
+                for (int i = 0; i < body.size() - 1; i++) {
+                    eval(body.get(i), env);
+                }
+                expr = body.get(body.size() - 1);
+                continue;
             }
 
             if (proc instanceof CaseLambda cl) {
-                return applyCaseLambda(cl, args);
+                Lambda matched = matchCaseLambda(cl, args);
+                env = bindLambdaArgs(matched, args);
+                List<Object> body = matched.body();
+                for (int i = 0; i < body.size() - 1; i++) {
+                    eval(body.get(i), env);
+                }
+                expr = body.get(body.size() - 1);
+                continue;
             }
 
             if (proc instanceof Builtin b) {
@@ -950,9 +960,10 @@ public class Evaluator {
             throw new EvalError(posStr() + "not a procedure: " + schemeToString(proc));
         }
         throw new EvalError(posStr() + "cannot eval: " + expr);
+        } // end while(true) TCO trampoline
     }
 
-    private Object applyLambda(Lambda lam, List<Object> args) throws EvalError {
+    private Env bindLambdaArgs(Lambda lam, List<Object> args) throws EvalError {
         int required = lam.params().size();
         if (lam.restParam() != null) {
             if (args.size() < required) {
@@ -974,6 +985,11 @@ public class Evaluator {
             }
             callEnv.define(lam.restParam(), rest);
         }
+        return callEnv;
+    }
+
+    private Object applyLambda(Lambda lam, List<Object> args) throws EvalError {
+        Env callEnv = bindLambdaArgs(lam, args);
         Object result = VOID;
         for (Object bodyExpr : lam.body()) {
             result = eval(bodyExpr, callEnv);
@@ -982,12 +998,16 @@ public class Evaluator {
     }
 
     private Object applyCaseLambda(CaseLambda cl, List<Object> args) throws EvalError {
+        return applyLambda(matchCaseLambda(cl, args), args);
+    }
+
+    private Lambda matchCaseLambda(CaseLambda cl, List<Object> args) throws EvalError {
         for (Lambda lam : cl.clauses()) {
             int required = lam.params().size();
             if (lam.restParam() != null) {
-                if (args.size() >= required) return applyLambda(lam, args);
+                if (args.size() >= required) return lam;
             } else {
-                if (args.size() == required) return applyLambda(lam, args);
+                if (args.size() == required) return lam;
             }
         }
         throw new EvalError(posStr() + "case-lambda: no matching clause for " + args.size() + " arguments");
