@@ -80,7 +80,7 @@ object Evaluator:
       SchemeVal.TailCall(body.last, env)
 
   private def posStr(expr: Expr): String =
-    val p = Parser.positions.get(expr)
+    val p = Parser.positions.get().get(expr)
     if p != null then s"${p._1}:${p._2}" else "1:1"
 
   private val posPattern = ".*\\d+:\\d+.*".r

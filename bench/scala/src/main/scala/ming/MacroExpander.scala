@@ -4,11 +4,11 @@ import scala.collection.mutable
 
 object MacroExpander:
 
-  private var gensymCounter = 0L
+  private val gensymCounter = new java.util.concurrent.atomic.AtomicLong(0L)
 
   private[ming] def gensym(base: String): String =
-    gensymCounter += 1
-    s"$base##$gensymCounter"
+    val id = gensymCounter.incrementAndGet()
+    s"$base##$id"
 
   // Thread-local renaming map for syntax-case macro expansion
   val currentRenaming: ThreadLocal[mutable.Map[String, String]] =

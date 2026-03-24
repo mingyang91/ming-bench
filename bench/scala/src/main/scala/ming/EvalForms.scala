@@ -12,10 +12,10 @@ object EvalForms:
     clauses match
       case Nil => SchemeVal.Void
       case Expr.SList(Expr.Symbol("else") :: body) :: _ =>
-        Evaluator.evalBody(body, env)
+        Evaluator.evalBodyTail(body, env)
       case Expr.SList(Expr.SList(datums) :: body) :: rest =>
         val matched = datums.exists(d => Equality.eqvCheck(keyVal, EvalHelpers.quoteToVal(d)))
-        if matched then Evaluator.evalBody(body, env)
+        if matched then Evaluator.evalBodyTail(body, env)
         else evalCase(keyVal, rest, env)
       case _ => throw new EvalError("case: invalid clause")
 

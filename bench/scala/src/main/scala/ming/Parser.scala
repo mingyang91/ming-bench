@@ -5,13 +5,14 @@ import scala.collection.mutable
 object Parser:
 
   // Maps Expr instances (by reference identity) to (line, col) from source
-  val positions: java.util.IdentityHashMap[Expr, (Int, Int)] =
-    new java.util.IdentityHashMap()
+  // Thread-local to support concurrent evalStr calls
+  val positions: ThreadLocal[java.util.IdentityHashMap[Expr, (Int, Int)]] =
+    ThreadLocal.withInitial(() => new java.util.IdentityHashMap())
 
   private case class Token(text: String, line: Int, col: Int)
 
   def parse(input: String): List[Expr] =
-    positions.clear()
+    positions.get().clear()
     val tokens     = tokenize(input)
     val (exprs, _) = parseAll(tokens, 0)
     exprs
@@ -126,38 +127,38 @@ object Parser:
         end while
         if i >= tokens.length then throw new EvalError(s"missing closing parenthesis at ${tok.line}:${tok.col}")
         val expr = Expr.SList(buf.toList)
-        positions.put(expr, (tok.line, tok.col))
+        positions.get().put(expr, (tok.line, tok.col))
         (expr, i + 1)
       case ")" =>
         throw new EvalError(s"unexpected ) at ${tok.line}:${tok.col}")
       case "'" =>
         val (inner, next) = parseExpr(tokens, pos + 1)
         val expr          = Expr.SList(List(Expr.Symbol("quote"), inner))
-        positions.put(expr, (tok.line, tok.col))
+        positions.get().put(expr, (tok.line, tok.col))
         (expr, next)
       case "#'" =>
         val (inner, next) = parseExpr(tokens, pos + 1)
         val expr          = Expr.SList(List(Expr.Symbol("syntax"), inner))
-        positions.put(expr, (tok.line, tok.col))
+        positions.get().put(expr, (tok.line, tok.col))
         (expr, next)
       case "`" =>
         val (inner, next) = parseExpr(tokens, pos + 1)
         val expr          = Expr.SList(List(Expr.Symbol("quasiquote"), inner))
-        positions.put(expr, (tok.line, tok.col))
+        positions.get().put(expr, (tok.line, tok.col))
         (expr, next)
       case "," =>
         val (inner, next) = parseExpr(tokens, pos + 1)
         val expr          = Expr.SList(List(Expr.Symbol("unquote"), inner))
-        positions.put(expr, (tok.line, tok.col))
+        positions.get().put(expr, (tok.line, tok.col))
         (expr, next)
       case ",@" =>
         val (inner, next) = parseExpr(tokens, pos + 1)
         val expr          = Expr.SList(List(Expr.Symbol("unquote-splicing"), inner))
-        positions.put(expr, (tok.line, tok.col))
+        positions.get().put(expr, (tok.line, tok.col))
         (expr, next)
       case _ =>
         val expr = parseAtom(tok.text)
-        positions.put(expr, (tok.line, tok.col))
+        positions.get().put(expr, (tok.line, tok.col))
         (expr, pos + 1)
 
   private def parseRationalOrSymbol(tok: String): Expr =
