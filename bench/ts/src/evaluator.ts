@@ -181,6 +181,87 @@ function makeGlobalEnv(): Env {
     return { tag: 'boolean', value: nums[0] <= nums[1] };
   });
 
+  defBuiltin('>=', (args) => {
+    if (args.length !== 2) throw new EvalError('>=: expected 2 args');
+    const nums = expectNumbers(args, '>=');
+    return { tag: 'boolean', value: nums[0] >= nums[1] };
+  });
+
+  // List operations
+  defBuiltin('cons', (args) => {
+    if (args.length !== 2) throw new EvalError('cons: expected 2 args');
+    const [head, tail] = args;
+    if (tail.tag === 'list') {
+      return { tag: 'list', elements: [head, ...tail.elements] };
+    }
+    // Improper pair — for now treat as a 2-element list (dotted pairs come later)
+    return { tag: 'list', elements: [head, tail] };
+  });
+
+  defBuiltin('car', (args) => {
+    if (args.length !== 1) throw new EvalError('car: expected 1 arg');
+    if (args[0].tag !== 'list' || args[0].elements.length === 0)
+      throw new EvalError('car: expected non-empty list');
+    return args[0].elements[0];
+  });
+
+  defBuiltin('cdr', (args) => {
+    if (args.length !== 1) throw new EvalError('cdr: expected 1 arg');
+    if (args[0].tag !== 'list' || args[0].elements.length === 0)
+      throw new EvalError('cdr: expected non-empty list');
+    return { tag: 'list', elements: args[0].elements.slice(1) };
+  });
+
+  defBuiltin('null?', (args) => {
+    if (args.length !== 1) throw new EvalError('null?: expected 1 arg');
+    return { tag: 'boolean', value: args[0].tag === 'list' && args[0].elements.length === 0 };
+  });
+
+  defBuiltin('list', (args) => {
+    return { tag: 'list', elements: args };
+  });
+
+  defBuiltin('length', (args) => {
+    if (args.length !== 1) throw new EvalError('length: expected 1 arg');
+    if (args[0].tag !== 'list') throw new EvalError('length: expected list');
+    return { tag: 'number', value: args[0].elements.length };
+  });
+
+  defBuiltin('append', (args) => {
+    const result: SchemeVal[] = [];
+    for (const arg of args) {
+      if (arg.tag !== 'list') throw new EvalError('append: expected list');
+      result.push(...arg.elements);
+    }
+    return { tag: 'list', elements: result };
+  });
+
+  // Type predicates
+  defBuiltin('number?', (args) => {
+    if (args.length !== 1) throw new EvalError('number?: expected 1 arg');
+    return { tag: 'boolean', value: args[0].tag === 'number' };
+  });
+
+  defBuiltin('string?', (args) => {
+    if (args.length !== 1) throw new EvalError('string?: expected 1 arg');
+    return { tag: 'boolean', value: args[0].tag === 'string' };
+  });
+
+  defBuiltin('boolean?', (args) => {
+    if (args.length !== 1) throw new EvalError('boolean?: expected 1 arg');
+    return { tag: 'boolean', value: args[0].tag === 'boolean' };
+  });
+
+  defBuiltin('pair?', (args) => {
+    if (args.length !== 1) throw new EvalError('pair?: expected 1 arg');
+    return { tag: 'boolean', value: args[0].tag === 'list' && args[0].elements.length > 0 };
+  });
+
+  defBuiltin('symbol?', (args) => {
+    if (args.length !== 1) throw new EvalError('symbol?: expected 1 arg');
+    return { tag: 'boolean', value: args[0].tag === 'symbol' };
+  });
+
   return env;
 }
 
@@ -271,6 +352,87 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
           if (elems.length !== 2) throw new EvalError('not: wrong argument count');
           const val = evalScheme(elems[1], env);
           return { tag: 'boolean', value: !isTruthy(val) };
+        }
+
+        if (name === 'begin') {
+          let result: SchemeVal = { tag: 'void' };
+          for (let i = 1; i < elems.length; i++) {
+            result = evalScheme(elems[i], env);
+          }
+          return result;
+        }
+
+        if (name === 'cond') {
+          for (let i = 1; i < elems.length; i++) {
+            const clause = elems[i];
+            if (clause.tag !== 'list' || clause.elements.length < 2)
+              throw new EvalError('cond: invalid clause');
+            if (clause.elements[0].tag === 'symbol' && clause.elements[0].value === 'else') {
+              let result: SchemeVal = { tag: 'void' };
+              for (let j = 1; j < clause.elements.length; j++) {
+                result = evalScheme(clause.elements[j], env);
+              }
+              return result;
+            }
+            const test = evalScheme(clause.elements[0], env);
+            if (isTruthy(test)) {
+              let result: SchemeVal = { tag: 'void' };
+              for (let j = 1; j < clause.elements.length; j++) {
+                result = evalScheme(clause.elements[j], env);
+              }
+              return result;
+            }
+          }
+          return { tag: 'void' };
+        }
+
+        if (name === 'let') {
+          if (elems.length < 3) throw new EvalError('let: wrong argument count');
+          // Named let: (let name ((var init) ...) body ...)
+          if (elems[1].tag === 'symbol') {
+            const loopName = elems[1].value;
+            if (elems[2].tag !== 'list') throw new EvalError('let: bindings must be a list');
+            const bindings = elems[2].elements;
+            const params: string[] = [];
+            const inits: SchemeVal[] = [];
+            for (const b of bindings) {
+              if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
+                throw new EvalError('let: invalid binding');
+              params.push(b.elements[0].value);
+              inits.push(evalScheme(b.elements[1], env));
+            }
+            const body = elems.slice(3);
+            const lambda: SchemeVal = { tag: 'lambda', params, body, env };
+            // Create env where the loop name is bound to the lambda
+            const loopEnv: Env = new Map(env);
+            loopEnv.set(loopName, lambda);
+            // Update the lambda's closure to include itself
+            (lambda as any).env = loopEnv;
+            // Call with initial values
+            const childEnv: Env = new Map(loopEnv);
+            for (let i = 0; i < params.length; i++) {
+              childEnv.set(params[i], inits[i]);
+            }
+            let result: SchemeVal = { tag: 'void' };
+            for (const bodyExpr of body) {
+              result = evalScheme(bodyExpr, childEnv);
+            }
+            return result;
+          }
+          // Regular let: (let ((var init) ...) body ...)
+          if (elems[1].tag !== 'list') throw new EvalError('let: bindings must be a list');
+          const childEnv: Env = new Map(env);
+          for (const binding of elems[1].elements) {
+            if (binding.tag !== 'list' || binding.elements.length !== 2 || binding.elements[0].tag !== 'symbol')
+              throw new EvalError('let: invalid binding');
+            const val = evalScheme(binding.elements[1], env);
+            childEnv.set(binding.elements[0].value, val);
+          }
+          let letResult: SchemeVal = { tag: 'void' };
+          for (let i = 2; i < elems.length; i++) {
+            letResult = evalScheme(elems[i], childEnv);
+          }
+          return letResult;
         }
       }
 
