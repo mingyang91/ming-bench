@@ -343,6 +343,11 @@ type DynamicWindVal struct{}
 
 func (v *DynamicWindVal) String() string { return "#<procedure dynamic-wind>" }
 
+// WithExceptionHandlerVal is the first-class with-exception-handler procedure.
+type WithExceptionHandlerVal struct{}
+
+func (v *WithExceptionHandlerVal) String() string { return "#<procedure with-exception-handler>" }
+
 // windRecord tracks an active dynamic-wind extent.
 type windRecord struct {
 	id       int

@@ -68,12 +68,20 @@ type contJump struct {
 	value Value
 }
 
+// schemeRaise is panicked when (raise val) is called.
+type schemeRaise struct {
+	value Value
+}
+
 // contFrameStack tracks the current evaluation context for continuation capture.
 var contFrameStack []contFrame
 
 // dynamicWindStack tracks active dynamic-wind extents.
 var dynamicWindStack []windRecord
 var windIDCounter int
+
+// exceptionHandlerStack tracks active exception handlers installed by with-exception-handler.
+var exceptionHandlerStack []Value
 
 // eval evaluates an expression in the given environment using a trampoline for TCO.
 func eval(expr *Expr, env *Env) (Value, error) {
@@ -95,6 +103,7 @@ func eval(expr *Expr, env *Env) (Value, error) {
 func evalTopLevel(exprs []*Expr, env *Env) (Value, error) {
 	contFrameStack = contFrameStack[:0]
 	dynamicWindStack = dynamicWindStack[:0]
+	exceptionHandlerStack = exceptionHandlerStack[:0]
 
 	result, err, cj := protectedEval(func() (Value, error) {
 		contFrameStack = append(contFrameStack, contFrame{Kind: frameTopLevel, Exprs: exprs, Env: env})
@@ -126,12 +135,16 @@ func evalTopLevel(exprs []*Expr, env *Env) (Value, error) {
 	return result, err
 }
 
-// protectedEval runs fn and catches contJump panics.
+// protectedEval runs fn and catches contJump and schemeRaise panics.
 func protectedEval(fn func() (Value, error)) (result Value, err error, jump *contJump) {
 	defer func() {
 		if r := recover(); r != nil {
 			if cj, ok := r.(*contJump); ok {
 				jump = cj
+				return
+			}
+			if sr, ok := r.(*schemeRaise); ok {
+				err = &EvalError{Message: fmt.Sprintf("unhandled exception: %s", sr.value.String())}
 				return
 			}
 			panic(r)
@@ -313,6 +326,8 @@ func evalList(expr *Expr, env *Env) (Value, error) {
 			return evalCase(expr, env)
 		case "do":
 			return evalDo(expr, env)
+		case "guard":
+			return evalGuard(expr, env)
 		}
 
 		// macro expansion: check if head symbol is bound to a SyntaxVal
@@ -568,6 +583,10 @@ func defaultEnv(output *strings.Builder) *Env {
 
 	// L19 builtins — dynamic-wind
 	env.Set("dynamic-wind", &DynamicWindVal{})
+
+	// L20 builtins — exceptions
+	env.Set("raise", &BuiltinFunc{Name: "raise", Fn: builtinRaise})
+	env.Set("with-exception-handler", &WithExceptionHandlerVal{})
 
 	return env
 }
@@ -963,13 +982,17 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 		var bodyResult Value
 		var bodyErr error
 		var jumped *contJump
+		var raised *schemeRaise
 
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					if cj, ok := r.(*contJump); ok {
-						jumped = cj
-					} else {
+					switch v := r.(type) {
+					case *contJump:
+						jumped = v
+					case *schemeRaise:
+						raised = v
+					default:
 						panic(r)
 					}
 				}
@@ -985,6 +1008,9 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 
 		if jumped != nil {
 			panic(jumped)
+		}
+		if raised != nil {
+			panic(raised)
 		}
 		if bodyErr != nil {
 			return nil, bodyErr
@@ -1016,6 +1042,61 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: expected 1 argument, got %d", callExpr.Line, callExpr.Col, len(args))}
 		}
 		panic(&contJump{cont: fn, value: args[0]})
+	case *WithExceptionHandlerVal:
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: with-exception-handler: expected 2 arguments, got %d", callExpr.Line, callExpr.Col, len(args))}
+		}
+		handler, thunk := args[0], args[1]
+		exceptionHandlerStack = append(exceptionHandlerStack, handler)
+		var bodyResult Value
+		var bodyErr error
+		var raised *schemeRaise
+		var jumped *contJump
+		func() {
+			defer func() {
+				// Pop handler
+				if len(exceptionHandlerStack) > 0 {
+					exceptionHandlerStack = exceptionHandlerStack[:len(exceptionHandlerStack)-1]
+				}
+				if r := recover(); r != nil {
+					switch v := r.(type) {
+					case *schemeRaise:
+						raised = v
+					case *contJump:
+						jumped = v
+					default:
+						panic(r)
+					}
+				}
+			}()
+			bodyResult, bodyErr = callThunk(thunk, callExpr)
+		}()
+		if jumped != nil {
+			panic(jumped)
+		}
+		if raised != nil {
+			// Call the handler with the raised value
+			result, err := applyProc(handler, []Value{raised.value}, callExpr)
+			if err != nil {
+				return nil, err
+			}
+			// Resolve tail calls
+			for {
+				if tc, ok := result.(*tailCall); ok {
+					result, err = evalStep(tc.expr, tc.env)
+					if err != nil {
+						return nil, err
+					}
+					continue
+				}
+				break
+			}
+			return result, nil
+		}
+		if bodyErr != nil {
+			return nil, bodyErr
+		}
+		return bodyResult, nil
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", callExpr.List[0].Line, callExpr.List[0].Col)}
 	}
@@ -2582,7 +2663,7 @@ func builtinProcedureQ(args []Value) (Value, error) {
 		return nil, fmt.Errorf("procedure?: expected 1 argument, got %d", len(args))
 	}
 	switch args[0].(type) {
-	case *LambdaVal, *CaseLambdaVal, *BuiltinFunc, *ApplyVal, *MapVal, *CallCCVal, *ContinuationVal, *DynamicWindVal:
+	case *LambdaVal, *CaseLambdaVal, *BuiltinFunc, *ApplyVal, *MapVal, *CallCCVal, *ContinuationVal, *DynamicWindVal, *WithExceptionHandlerVal:
 		return &BoolVal{Val: true}, nil
 	}
 	return &BoolVal{Val: false}, nil
@@ -3360,4 +3441,111 @@ func builtinStringGeQ(args []Value) (Value, error) {
 		return nil, fmt.Errorf("string>=?: expected strings")
 	}
 	return &BoolVal{Val: a.Val >= b.Val}, nil
+}
+
+// builtinRaise implements (raise value).
+func builtinRaise(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("raise: expected 1 argument, got %d", len(args))
+	}
+	panic(&schemeRaise{value: args[0]})
+}
+
+// evalGuard implements the guard special form:
+// (guard (var clause ...) body ...)
+// where each clause is (test expr ...) or (else expr ...).
+func evalGuard(expr *Expr, env *Env) (Value, error) {
+	if len(expr.List) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: bad syntax", expr.Line, expr.Col)}
+	}
+	clauseList := expr.List[1]
+	if clauseList.Kind != ExprList || len(clauseList.List) < 2 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: bad syntax", expr.Line, expr.Col)}
+	}
+	varExpr := clauseList.List[0]
+	if varExpr.Kind != ExprSymbol {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: expected variable name", varExpr.Line, varExpr.Col)}
+	}
+	varName := varExpr.SVal
+	clauses := clauseList.List[1:]
+	bodyExprs := expr.List[2:]
+
+	// Evaluate body, catching schemeRaise panics
+	var bodyResult Value
+	var bodyErr error
+	var raised *schemeRaise
+	var jumped *contJump
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				switch v := r.(type) {
+				case *schemeRaise:
+					raised = v
+				case *contJump:
+					jumped = v
+				default:
+					panic(r)
+				}
+			}
+		}()
+		for _, e := range bodyExprs {
+			bodyResult, bodyErr = eval(e, env)
+			if bodyErr != nil {
+				return
+			}
+		}
+	}()
+
+	if jumped != nil {
+		panic(jumped)
+	}
+
+	if raised == nil {
+		// Body completed normally
+		return bodyResult, bodyErr
+	}
+
+	// Exception was raised — bind the variable and try clauses
+	guardEnv := NewEnv(env)
+	guardEnv.Set(varName, raised.value)
+
+	for _, clause := range clauses {
+		if clause.Kind != ExprList || len(clause.List) == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: bad clause", clause.Line, clause.Col)}
+		}
+		// Check for else clause
+		if clause.List[0].Kind == ExprSymbol && clause.List[0].SVal == "else" {
+			var result Value
+			for _, e := range clause.List[1:] {
+				var err error
+				result, err = eval(e, guardEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		// Evaluate the test
+		test, err := eval(clause.List[0], guardEnv)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(test) {
+			if len(clause.List) == 1 {
+				return test, nil
+			}
+			var result Value
+			for _, e := range clause.List[1:] {
+				result, err = eval(e, guardEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+	}
+
+	// No clause matched — re-raise
+	panic(&schemeRaise{value: raised.value})
 }
