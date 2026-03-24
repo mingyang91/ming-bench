@@ -25,6 +25,7 @@ enum SchemeVal:
   case Procedure(params: List[String], restParam: Option[String], body: List[Expr], env: Env)
   case BuiltinProc(name: String, fn: List[SchemeVal] => SchemeVal)
   case Macro(literals: Set[String], rules: List[(Expr, Expr)], defEnv: Env)
+  case CaseLambda(clauses: List[(List[String], Option[String], List[Expr], Env)])
   case RecordVal(typeName: String, fields: Map[String, SchemeVal])
   case Void
 
@@ -42,6 +43,7 @@ enum SchemeVal:
     case ListVal(elems)        => "(" + elems.map(_.display).mkString(" ") + ")"
     case PairVal(_, _)         => formatPair(_.display)
     case Procedure(_, _, _, _) => "#<procedure>"
+    case CaseLambda(_)         => "#<procedure>"
     case BuiltinProc(name, _)  => s"#<procedure:$name>"
     case Macro(_, _, _)        => "#<macro>"
     case RecordVal(t, _)       => s"#<$t>"

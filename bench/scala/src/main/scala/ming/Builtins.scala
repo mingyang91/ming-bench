@@ -186,7 +186,16 @@ object Builtins:
       }
     ),
     typePredicate("string?", _.isInstanceOf[SchemeVal.StrVal]),
-    typePredicate("symbol?", _.isInstanceOf[SchemeVal.SymVal])
+    typePredicate("symbol?", _.isInstanceOf[SchemeVal.SymVal]),
+    typePredicate(
+      "procedure?",
+      {
+        case _: SchemeVal.Procedure   => true
+        case _: SchemeVal.BuiltinProc => true
+        case _: SchemeVal.CaseLambda  => true
+        case _                        => false
+      }
+    )
   )
 
   private def ioBuiltins: List[(String, SchemeVal)] = List(
