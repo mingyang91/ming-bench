@@ -173,6 +173,18 @@ func (e *env) set(name string, v value) {
 	e.bindings[name] = v
 }
 
+// setExisting mutates an existing binding, walking up the chain. Returns false if unbound.
+func (e *env) setExisting(name string, v value) bool {
+	if _, ok := e.bindings[name]; ok {
+		e.bindings[name] = v
+		return true
+	}
+	if e.parent != nil {
+		return e.parent.setExisting(name, v)
+	}
+	return false
+}
+
 func (e *env) getOutput() *strings.Builder {
 	if e.output != nil {
 		return e.output
@@ -464,6 +476,8 @@ func evalInEnv(e *expr, env *env) (value, error) {
 		switch head.atom.sval {
 		case "define":
 			return evalDefine(e, env)
+		case "set!":
+			return evalSetBang(e, env)
 		case "if":
 			return evalIf(e, env)
 		case "quote":
@@ -563,6 +577,24 @@ func evalDefine(e *expr, env *env) (value, error) {
 		return value{}, err
 	}
 	env.set(target.atom.sval, v)
+	return voidVal, nil
+}
+
+func evalSetBang(e *expr, env *env) (value, error) {
+	if len(e.list) != 3 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: set!: bad syntax", e.line, e.col)}
+	}
+	target := e.list[1]
+	if target.kind != exprAtom || target.atom.kind != valSymbol {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: set!: expected symbol", target.line, target.col)}
+	}
+	v, err := evalInEnv(e.list[2], env)
+	if err != nil {
+		return value{}, err
+	}
+	if !env.setExisting(target.atom.sval, v) {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: set!: unbound variable %s", target.line, target.col, target.atom.sval)}
+	}
 	return voidVal, nil
 }
 
