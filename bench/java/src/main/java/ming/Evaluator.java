@@ -48,6 +48,10 @@ public class Evaluator {
     private List<Object> currentBodyExprs = null;
     private Environment currentBodyEnv = null;
 
+    // dynamic-wind support
+    record WindEntry(Object inThunk, Object outThunk) {}
+    private List<WindEntry> windStack = new ArrayList<>();
+
     private EvalError error(String msg) {
         return new EvalError(currentLine + ":" + currentCol + " " + msg);
     }
@@ -604,12 +608,37 @@ public class Evaluator {
                     }
                     case "case" -> { return evalCase(list, env); }
                     case "do" -> { return evalDo(list, env); }
+                    case "dynamic-wind" -> {
+                        if (list.size() != 4) throw error("dynamic-wind: expected 3 arguments");
+                        Object dwIn = eval(list.get(1), env);
+                        Object dwBody = eval(list.get(2), env);
+                        Object dwOut = eval(list.get(3), env);
+                        // Protect replay state from in/out thunk side effects
+                        var savedReplay = replayEnv;
+                        replayEnv = null;
+                        apply(dwIn, List.of());
+                        replayEnv = savedReplay;
+                        WindEntry wEntry = new WindEntry(dwIn, dwOut);
+                        windStack.add(wEntry);
+                        Object dwResult;
+                        try {
+                            dwResult = apply(dwBody, List.of());
+                        } catch (ContinuationInvoked ci) {
+                            windStack.remove(windStack.size() - 1);
+                            apply(dwOut, List.of());
+                            throw ci;
+                        }
+                        windStack.remove(windStack.size() - 1);
+                        apply(dwOut, List.of());
+                        return dwResult;
+                    }
                     case "call/cc", "call-with-current-continuation" -> {
                         if (list.size() != 2) throw error("call/cc: expected 1 argument");
                         if (hasPendingCallCC) {
                             hasPendingCallCC = false;
                             Object val = pendingCallCCValue;
                             pendingCallCCValue = null;
+                            replayEnv = null;
                             return val;
                         }
                         Object ccProc = eval(list.get(1), env);
@@ -617,6 +646,7 @@ public class Evaluator {
                         k.topLevelIndex = currentTopLevelIndex;
                         k.bodyExprs = currentBodyExprs;
                         k.bodyEnv = currentBodyEnv;
+                        k.savedWindStack = new ArrayList<>(windStack);
                         try {
                             return apply(ccProc, List.of(k));
                         } catch (ContinuationInvoked ci) {
@@ -725,6 +755,7 @@ public class Evaluator {
         List<Object> bodyExprs;
         Environment bodyEnv;
         int topLevelIndex;
+        List<WindEntry> savedWindStack;
     }
 
     static class ContinuationInvoked extends RuntimeException {
@@ -734,6 +765,25 @@ public class Evaluator {
             super(null, null, true, false);
             this.continuation = k;
             this.value = v;
+        }
+    }
+
+    private void doWindTransitions(List<WindEntry> targetStack) throws EvalError {
+        int commonLen = 0;
+        int minLen = Math.min(windStack.size(), targetStack.size());
+        while (commonLen < minLen && windStack.get(commonLen) == targetStack.get(commonLen)) {
+            commonLen++;
+        }
+        // Unwind: call out-thunks from top down to common prefix
+        for (int i = windStack.size() - 1; i >= commonLen; i--) {
+            WindEntry entry = windStack.remove(i);
+            apply(entry.outThunk(), List.of());
+        }
+        // Rewind: call in-thunks from common prefix up to target
+        for (int i = commonLen; i < targetStack.size(); i++) {
+            WindEntry entry = targetStack.get(i);
+            windStack.add(entry);
+            apply(entry.inThunk(), List.of());
         }
     }
 
@@ -2252,6 +2302,7 @@ public class Evaluator {
                 hasPendingCallCC = false;
                 Object val = pendingCallCCValue;
                 pendingCallCCValue = null;
+                replayEnv = null;
                 return val;
             }
             Object proc = args.get(0);
@@ -2259,6 +2310,7 @@ public class Evaluator {
             k.topLevelIndex = currentTopLevelIndex;
             k.bodyExprs = currentBodyExprs;
             k.bodyEnv = currentBodyEnv;
+            k.savedWindStack = new ArrayList<>(windStack);
             try {
                 return apply(proc, List.of(k));
             } catch (ContinuationInvoked ci) {
