@@ -1,6 +1,9 @@
 pub mod error;
 mod builtins;
 mod macros;
+mod parser;
+
+use parser::{parse_all, Expr, Pos};
 
 pub use error::EvalError;
 use builtins::apply_builtin;
@@ -37,6 +40,7 @@ pub(super) enum Value {
         body: Vec<Expr>,
         env: Env,
     },
+    Vector(Rc<RefCell<Vec<Value>>>),
     Char(char),
     Builtin(String),
     Macro {
@@ -133,6 +137,17 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Value::Vector(v) => {
+                let elems = v.borrow();
+                write!(f, "#(")?;
+                for (i, e) in elems.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{e}")?;
+                }
+                write!(f, ")")
+            }
             Value::Char(c) => match c {
                 ' ' => write!(f, "#\\space"),
                 '\n' => write!(f, "#\\newline"),
@@ -185,6 +200,17 @@ impl Value {
                             break;
                         }
                     }
+                }
+                write!(f, ")")
+            }
+            Value::Vector(v) => {
+                let elems = v.borrow();
+                write!(f, "#(")?;
+                for (i, e) in elems.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    e.display_fmt(f)?;
                 }
                 write!(f, ")")
             }
@@ -260,322 +286,6 @@ fn default_env() -> Env {
     env
 }
 
-// ---------- Source Position ----------
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct Pos {
-    line: usize,
-    col: usize,
-}
-
-impl Pos {
-    fn new(line: usize, col: usize) -> Self {
-        Self { line, col }
-    }
-}
-
-impl fmt::Display for Pos {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.line, self.col)
-    }
-}
-
-// ---------- Tokenizer ----------
-
-#[derive(Debug, Clone, PartialEq)]
-enum Token {
-    LParen,
-    RParen,
-    Quote,
-    Symbol(String),
-    Integer(i64),
-    Float(f64),
-    Rational(i64, i64),
-    Boolean(bool),
-    Str(String),
-    Char(char),
-}
-
-#[derive(Debug, Clone)]
-struct SpannedToken {
-    token: Token,
-    pos: Pos,
-}
-
-/// Parse a character literal starting at `pos` in `chars`.
-/// Returns the char and how many characters were consumed.
-fn parse_char_literal(chars: &[char], pos: usize, start_pos: Pos) -> Result<(char, usize), EvalError> {
-    if pos >= chars.len() {
-        return Err(EvalError::Parse(format!("{start_pos}: incomplete character literal")));
-    }
-    if !chars[pos].is_alphabetic() {
-        return Ok((chars[pos], 1));
-    }
-    let mut end = pos;
-    while end < chars.len() && chars[end].is_alphabetic() {
-        end += 1;
-    }
-    let name: String = chars[pos..end].iter().collect();
-    let consumed = end - pos;
-    if consumed == 1 {
-        return Ok((chars[pos], 1));
-    }
-    let ch = match name.as_str() {
-        "space" => ' ',
-        "newline" => '\n',
-        "tab" => '\t',
-        _ => return Err(EvalError::Parse(format!("{start_pos}: unknown character name: {name}"))),
-    };
-    Ok((ch, consumed))
-}
-
-fn parse_word_token(word: &str) -> Token {
-    if let Ok(n) = word.parse::<i64>() {
-        return Token::Integer(n);
-    }
-    if let Some(slash) = word.find('/') {
-        if slash > 0 && slash < word.len() - 1 {
-            if let (Ok(n), Ok(d)) = (word[..slash].parse::<i64>(), word[slash+1..].parse::<i64>()) {
-                if d != 0 {
-                    return Token::Rational(n, d);
-                }
-            }
-        }
-        return Token::Symbol(word.to_string());
-    }
-    if let Ok(f) = word.parse::<f64>() {
-        if word.contains('.') {
-            return Token::Float(f);
-        }
-    }
-    Token::Symbol(word.to_string())
-}
-
-fn tokenize(input: &str) -> Result<Vec<SpannedToken>, EvalError> {
-    let mut tokens = Vec::new();
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0;
-    let mut line = 1usize;
-    let mut col = 1usize;
-
-    while i < chars.len() {
-        match chars[i] {
-            '\n' => {
-                i += 1;
-                line += 1;
-                col = 1;
-            }
-            ' ' | '\t' | '\r' => {
-                i += 1;
-                col += 1;
-            }
-            ';' => {
-                while i < chars.len() && chars[i] != '\n' {
-                    i += 1;
-                    col += 1;
-                }
-            }
-            '(' => {
-                tokens.push(SpannedToken { token: Token::LParen, pos: Pos::new(line, col) });
-                i += 1;
-                col += 1;
-            }
-            ')' => {
-                tokens.push(SpannedToken { token: Token::RParen, pos: Pos::new(line, col) });
-                i += 1;
-                col += 1;
-            }
-            '\'' => {
-                tokens.push(SpannedToken { token: Token::Quote, pos: Pos::new(line, col) });
-                i += 1;
-                col += 1;
-            }
-            '"' => {
-                let start_pos = Pos::new(line, col);
-                i += 1;
-                col += 1;
-                let mut s = String::new();
-                while i < chars.len() && chars[i] != '"' {
-                    if chars[i] == '\\' && i + 1 < chars.len() {
-                        i += 1;
-                        col += 1;
-                        match chars[i] {
-                            'n' => s.push('\n'),
-                            't' => s.push('\t'),
-                            '\\' => s.push('\\'),
-                            '"' => s.push('"'),
-                            c => {
-                                s.push('\\');
-                                s.push(c);
-                            }
-                        }
-                    } else {
-                        if chars[i] == '\n' {
-                            line += 1;
-                            col = 0;
-                        }
-                        s.push(chars[i]);
-                    }
-                    i += 1;
-                    col += 1;
-                }
-                if i >= chars.len() {
-                    return Err(EvalError::Parse(format!("{start_pos}: unterminated string")));
-                }
-                i += 1;
-                col += 1;
-                tokens.push(SpannedToken { token: Token::Str(s), pos: start_pos });
-            }
-            '#' => {
-                let start_pos = Pos::new(line, col);
-                if i + 1 < chars.len() {
-                    match chars[i + 1] {
-                        't' => {
-                            tokens.push(SpannedToken { token: Token::Boolean(true), pos: start_pos });
-                            i += 2;
-                            col += 2;
-                        }
-                        'f' => {
-                            tokens.push(SpannedToken { token: Token::Boolean(false), pos: start_pos });
-                            i += 2;
-                            col += 2;
-                        }
-                        '\\' => {
-                            let (ch, advance) = parse_char_literal(&chars, i + 2, start_pos)?;
-                            i += 2 + advance;
-                            col += 2 + advance;
-                            tokens.push(SpannedToken { token: Token::Char(ch), pos: start_pos });
-                        }
-                        _ => {
-                            return Err(EvalError::Parse(format!(
-                                "{start_pos}: unexpected character after #: {}",
-                                chars[i + 1]
-                            )));
-                        }
-                    }
-                } else {
-                    return Err(EvalError::Parse(format!("{start_pos}: unexpected #")));
-                }
-            }
-            _ => {
-                let start_pos = Pos::new(line, col);
-                let start = i;
-                while i < chars.len()
-                    && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '(' | ')' | ';' | '"' | '\'')
-                {
-                    i += 1;
-                    col += 1;
-                }
-                let word: String = chars[start..i].iter().collect();
-                let token = parse_word_token(&word);
-                tokens.push(SpannedToken { token, pos: start_pos });
-            }
-        }
-    }
-    Ok(tokens)
-}
-
-// ---------- Parser ----------
-
-#[derive(Debug, Clone)]
-pub(super) enum Expr {
-    Integer(i64, Pos),
-    Float(f64, Pos),
-    Rational(i64, i64, Pos),
-    Boolean(bool, Pos),
-    Str(String, Pos),
-    Symbol(String, Pos),
-    Char(char, Pos),
-    List(Vec<Expr>, Pos),
-}
-
-impl Expr {
-    fn pos(&self) -> Pos {
-        match self {
-            Expr::Integer(_, p)
-            | Expr::Float(_, p)
-            | Expr::Rational(_, _, p)
-            | Expr::Boolean(_, p)
-            | Expr::Str(_, p)
-            | Expr::Symbol(_, p)
-            | Expr::Char(_, p)
-            | Expr::List(_, p) => *p,
-        }
-    }
-}
-
-fn parse(tokens: &[SpannedToken], pos: &mut usize) -> Result<Expr, EvalError> {
-    if *pos >= tokens.len() {
-        return Err(EvalError::Parse("unexpected end of input".into()));
-    }
-    let st = &tokens[*pos];
-    let src_pos = st.pos;
-    match &st.token {
-        Token::Integer(n) => {
-            let n = *n;
-            *pos += 1;
-            Ok(Expr::Integer(n, src_pos))
-        }
-        Token::Float(f) => {
-            let f = *f;
-            *pos += 1;
-            Ok(Expr::Float(f, src_pos))
-        }
-        Token::Rational(n, d) => {
-            let (n, d) = (*n, *d);
-            *pos += 1;
-            Ok(Expr::Rational(n, d, src_pos))
-        }
-        Token::Boolean(b) => {
-            let b = *b;
-            *pos += 1;
-            Ok(Expr::Boolean(b, src_pos))
-        }
-        Token::Str(s) => {
-            let s = s.clone();
-            *pos += 1;
-            Ok(Expr::Str(s, src_pos))
-        }
-        Token::Symbol(s) => {
-            let s = s.clone();
-            *pos += 1;
-            Ok(Expr::Symbol(s, src_pos))
-        }
-        Token::Char(c) => {
-            let c = *c;
-            *pos += 1;
-            Ok(Expr::Char(c, src_pos))
-        }
-        Token::Quote => {
-            *pos += 1;
-            let inner = parse(tokens, pos)?;
-            Ok(Expr::List(vec![Expr::Symbol("quote".into(), src_pos), inner], src_pos))
-        }
-        Token::LParen => {
-            *pos += 1;
-            let mut elems = Vec::new();
-            while *pos < tokens.len() && tokens[*pos].token != Token::RParen {
-                elems.push(parse(tokens, pos)?);
-            }
-            if *pos >= tokens.len() {
-                return Err(EvalError::Parse(format!("{src_pos}: missing closing paren")));
-            }
-            *pos += 1;
-            Ok(Expr::List(elems, src_pos))
-        }
-        Token::RParen => Err(EvalError::Parse(format!("{src_pos}: unexpected )"))),
-    }
-}
-
-fn parse_all(input: &str) -> Result<Vec<Expr>, EvalError> {
-    let tokens = tokenize(input)?;
-    let mut pos = 0;
-    let mut exprs = Vec::new();
-    while pos < tokens.len() {
-        exprs.push(parse(&tokens, &mut pos)?);
-    }
-    Ok(exprs)
-}
 
 // ---------- Evaluator ----------
 
@@ -604,6 +314,11 @@ pub(super) const BUILTINS: &[&str] = &[
     "string=?", "string<?", "string-ci=?",
     "string-upcase", "string-downcase",
     "procedure?",
+    "eqv?",
+    "vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
+    "vector->list", "list->vector",
+    "memq", "assq",
+    "for-each",
 ];
 
 fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
@@ -651,6 +366,31 @@ fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError>
                     }
                     "define-syntax" => return eval_define_syntax(&elems[1..], p, env),
                     "define-record-type" => return eval_define_record_type(&elems[1..], p, env),
+                    "letrec" => return eval_letrec(&elems[1..], p, env, output),
+                    "letrec*" => return eval_letrec_star(&elems[1..], p, env, output),
+                    "case" => return eval_case(&elems[1..], p, env, output),
+                    "do" => return eval_do(&elems[1..], p, env, output),
+                    "let*" => return eval_let_star(&elems[1..], p, env, output),
+                    "when" => {
+                        if elems.len() < 3 {
+                            return Err(EvalError::Arity(format!("{p}: when requires test and body")));
+                        }
+                        let test = eval(&elems[1], env, output)?;
+                        if is_truthy(&test) {
+                            return eval_begin(&elems[2..], env, output);
+                        }
+                        return Ok(Value::Void);
+                    }
+                    "unless" => {
+                        if elems.len() < 3 {
+                            return Err(EvalError::Arity(format!("{p}: unless requires test and body")));
+                        }
+                        let test = eval(&elems[1], env, output)?;
+                        if !is_truthy(&test) {
+                            return eval_begin(&elems[2..], env, output);
+                        }
+                        return Ok(Value::Void);
+                    }
                     _ => {
                         // Check for macro invocation
                         if let Some(Value::Macro { literals, rules, def_env }) = env_get(env, op) {
@@ -1254,7 +994,208 @@ fn apply_func(func: &Value, args: &[Value], call_pos: Pos, output: &mut String) 
     }
 }
 
-fn values_eq(a: &Value, b: &Value) -> bool {
+fn eval_letrec(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity(format!("{call_pos}: letrec requires bindings and body")));
+    }
+    let bindings_expr = match &args[0] {
+        Expr::List(b, _) => b,
+        _ => return Err(EvalError::Parse(format!("{call_pos}: letrec: expected bindings list"))),
+    };
+    let local_env = new_env(Some(env.clone()));
+    // First, bind all variables to Void
+    let mut names = Vec::new();
+    let mut init_exprs = Vec::new();
+    for b in bindings_expr {
+        match b {
+            Expr::List(pair, _) if pair.len() == 2 => {
+                if let Expr::Symbol(s, _) = &pair[0] {
+                    names.push(s.clone());
+                    init_exprs.push(&pair[1]);
+                    env_set(&local_env, s.clone(), Value::Void);
+                } else {
+                    return Err(EvalError::Parse(format!("{call_pos}: letrec: expected symbol")));
+                }
+            }
+            _ => return Err(EvalError::Parse(format!("{call_pos}: letrec: invalid binding"))),
+        }
+    }
+    // Evaluate init expressions in the local env and assign
+    for (name, init_expr) in names.iter().zip(init_exprs.iter()) {
+        let val = eval(init_expr, &local_env, output)?;
+        env_set(&local_env, name.clone(), val);
+    }
+    let mut result = Value::Void;
+    for expr in &args[1..] {
+        result = eval(expr, &local_env, output)?;
+    }
+    Ok(result)
+}
+
+fn eval_letrec_star(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity(format!("{call_pos}: letrec* requires bindings and body")));
+    }
+    let bindings_expr = match &args[0] {
+        Expr::List(b, _) => b,
+        _ => return Err(EvalError::Parse(format!("{call_pos}: letrec*: expected bindings list"))),
+    };
+    let local_env = new_env(Some(env.clone()));
+    for b in bindings_expr {
+        match b {
+            Expr::List(pair, _) if pair.len() == 2 => {
+                if let Expr::Symbol(s, _) = &pair[0] {
+                    let val = eval(&pair[1], &local_env, output)?;
+                    env_set(&local_env, s.clone(), val);
+                } else {
+                    return Err(EvalError::Parse(format!("{call_pos}: letrec*: expected symbol")));
+                }
+            }
+            _ => return Err(EvalError::Parse(format!("{call_pos}: letrec*: invalid binding"))),
+        }
+    }
+    let mut result = Value::Void;
+    for expr in &args[1..] {
+        result = eval(expr, &local_env, output)?;
+    }
+    Ok(result)
+}
+
+fn eval_let_star(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity(format!("{call_pos}: let* requires bindings and body")));
+    }
+    let bindings_expr = match &args[0] {
+        Expr::List(b, _) => b,
+        _ => return Err(EvalError::Parse(format!("{call_pos}: let*: expected bindings list"))),
+    };
+    let local_env = new_env(Some(env.clone()));
+    for b in bindings_expr {
+        match b {
+            Expr::List(pair, _) if pair.len() == 2 => {
+                if let Expr::Symbol(s, _) = &pair[0] {
+                    let val = eval(&pair[1], &local_env, output)?;
+                    env_set(&local_env, s.clone(), val);
+                } else {
+                    return Err(EvalError::Parse(format!("{call_pos}: let*: expected symbol")));
+                }
+            }
+            _ => return Err(EvalError::Parse(format!("{call_pos}: let*: invalid binding"))),
+        }
+    }
+    let mut result = Value::Void;
+    for expr in &args[1..] {
+        result = eval(expr, &local_env, output)?;
+    }
+    Ok(result)
+}
+
+fn eval_seq(exprs: &[Expr], env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    let mut result = Value::Void;
+    for expr in exprs {
+        result = eval(expr, env, output)?;
+    }
+    Ok(result)
+}
+
+fn case_clause_matches(key: &Value, parts: &[Expr]) -> bool {
+    if let Expr::List(datums, _) = &parts[0] {
+        datums.iter().any(|d| values_eqv(key, &expr_to_value(d)))
+    } else {
+        false
+    }
+}
+
+fn eval_case(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Arity(format!("{call_pos}: case requires key and clauses")));
+    }
+    let key = eval(&args[0], env, output)?;
+    for clause in &args[1..] {
+        let Expr::List(parts, _) = clause else { continue };
+        if parts.is_empty() { continue; }
+        // else clause
+        if matches!(&parts[0], Expr::Symbol(s, _) if s == "else") {
+            return eval_seq(&parts[1..], env, output);
+        }
+        // datum clause
+        if case_clause_matches(&key, parts) {
+            return eval_seq(&parts[1..], env, output);
+        }
+    }
+    Ok(Value::Void)
+}
+
+fn eval_do(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    // (do ((var init step) ...) (test expr ...) body ...)
+    if args.len() < 2 {
+        return Err(EvalError::Arity(format!("{call_pos}: do requires bindings and test")));
+    }
+    let bindings_expr = match &args[0] {
+        Expr::List(b, _) => b,
+        _ => return Err(EvalError::Parse(format!("{call_pos}: do: expected bindings list"))),
+    };
+    let test_clause = match &args[1] {
+        Expr::List(parts, _) if !parts.is_empty() => parts,
+        _ => return Err(EvalError::Parse(format!("{call_pos}: do: expected test clause"))),
+    };
+    let body = &args[2..];
+
+    // Parse bindings: (var init step?)
+    let mut var_names = Vec::new();
+    let mut step_exprs: Vec<Option<&Expr>> = Vec::new();
+    let local_env = new_env(Some(env.clone()));
+
+    for b in bindings_expr {
+        match b {
+            Expr::List(parts, _) if parts.len() >= 2 => {
+                if let Expr::Symbol(name, _) = &parts[0] {
+                    let init = eval(&parts[1], env, output)?;
+                    env_set(&local_env, name.clone(), init);
+                    var_names.push(name.clone());
+                    step_exprs.push(if parts.len() >= 3 { Some(&parts[2]) } else { None });
+                } else {
+                    return Err(EvalError::Parse(format!("{call_pos}: do: expected variable name")));
+                }
+            }
+            _ => return Err(EvalError::Parse(format!("{call_pos}: do: invalid binding"))),
+        }
+    }
+
+    loop {
+        // Test
+        let test_val = eval(&test_clause[0], &local_env, output)?;
+        if is_truthy(&test_val) {
+            // Evaluate result expressions
+            let mut result = Value::Void;
+            for expr in &test_clause[1..] {
+                result = eval(expr, &local_env, output)?;
+            }
+            return Ok(result);
+        }
+        // Evaluate body
+        for expr in body {
+            eval(expr, &local_env, output)?;
+        }
+        // Parallel step: evaluate all step expressions using current values
+        let mut new_vals = Vec::new();
+        for step in step_exprs.iter() {
+            if let Some(step_expr) = step {
+                new_vals.push(Some(eval(step_expr, &local_env, output)?));
+            } else {
+                new_vals.push(None);
+            }
+        }
+        // Update variables
+        for (i, name) in var_names.iter().enumerate() {
+            if let Some(val) = new_vals[i].take() {
+                env_set(&local_env, name.clone(), val);
+            }
+        }
+    }
+}
+
+pub(super) fn values_eqv(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Boolean(a), Value::Boolean(b)) => a == b,
         (Value::Integer(a), Value::Integer(b)) => a == b,
@@ -1262,7 +1203,24 @@ fn values_eq(a: &Value, b: &Value) -> bool {
         (Value::Rational(an, ad), Value::Rational(bn, bd)) => an == bn && ad == bd,
         (Value::Symbol(a), Value::Symbol(b)) => a == b,
         (Value::Char(a), Value::Char(b)) => a == b,
+        (Value::Str(a), Value::Str(b)) => a == b,
         (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
+        _ => false,
+    }
+}
+
+pub(super) fn values_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+        (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
+        (Value::Rational(an, ad), Value::Rational(bn, bd)) => an == bn && ad == bd,
+        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+        (Value::Char(a), Value::Char(b)) => a == b,
+        (Value::Str(a), Value::Str(b)) => std::ptr::eq(a.as_str(), b.as_str()),
+        (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
+        (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+        (Value::Void, Value::Void) => true,
         _ => false,
     }
 }
@@ -1281,6 +1239,11 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         }
         (Value::Pair(a1, a2), Value::Pair(b1, b2)) => {
             values_equal(a1, b1) && values_equal(a2, b2)
+        }
+        (Value::Vector(a), Value::Vector(b)) => {
+            let a = a.borrow();
+            let b = b.borrow();
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| values_equal(x, y))
         }
         _ => false,
     }
@@ -1301,6 +1264,7 @@ static RECORD_TYPE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub(super) const SPECIAL_FORMS: &[&str] = &[
     "define", "if", "quote", "lambda", "case-lambda", "let", "begin", "cond", "and", "or",
     "set!", "string-set!", "not", "define-syntax", "syntax-rules",
+    "letrec", "letrec*", "case", "do", "let*", "when", "unless",
 ];
 
 #[derive(Clone)]

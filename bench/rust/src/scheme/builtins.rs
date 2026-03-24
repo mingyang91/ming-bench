@@ -1,6 +1,9 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use super::{
     as_integer, apply_func, is_proper_list, make_rational, value_to_f64,
-    values_eq, values_equal, DisplayValue, EvalError, Pos, Value,
+    values_eq, values_equal, values_eqv, DisplayValue, EvalError, Pos, Value,
 };
 
 /// Internal numeric representation for mixed-type arithmetic.
@@ -806,6 +809,151 @@ pub(super) fn apply_builtin(name: &str, args: &[Value], call_pos: Pos, output: &
         | "char-upcase" | "char-downcase"
         | "string=?" | "string<?" | "string-ci=?"
         | "string-upcase" | "string-downcase" => apply_string_io_builtin(name, args, call_pos, output),
+
+        "eqv?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("{call_pos}: eqv? requires 2 arguments")));
+            }
+            Ok(Value::Boolean(values_eqv(&args[0], &args[1])))
+        }
+
+        "vector" => {
+            Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec()))))
+        }
+        "make-vector" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::Arity(format!("{call_pos}: make-vector requires 1 or 2 arguments")));
+            }
+            let len = as_integer(&args[0], call_pos)? as usize;
+            let fill = if args.len() == 2 { args[1].clone() } else { Value::Integer(0) };
+            Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; len]))))
+        }
+        "vector-ref" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("{call_pos}: vector-ref requires 2 arguments")));
+            }
+            match &args[0] {
+                Value::Vector(v) => {
+                    let idx = as_integer(&args[1], call_pos)? as usize;
+                    let v = v.borrow();
+                    if idx >= v.len() {
+                        return Err(EvalError::Type(format!("{call_pos}: vector-ref: index out of range")));
+                    }
+                    Ok(v[idx].clone())
+                }
+                _ => Err(EvalError::Type(format!("{call_pos}: vector-ref: expected vector"))),
+            }
+        }
+        "vector-set!" => {
+            if args.len() != 3 {
+                return Err(EvalError::Arity(format!("{call_pos}: vector-set! requires 3 arguments")));
+            }
+            match &args[0] {
+                Value::Vector(v) => {
+                    let idx = as_integer(&args[1], call_pos)? as usize;
+                    let mut v = v.borrow_mut();
+                    if idx >= v.len() {
+                        return Err(EvalError::Type(format!("{call_pos}: vector-set!: index out of range")));
+                    }
+                    v[idx] = args[2].clone();
+                    Ok(Value::Void)
+                }
+                _ => Err(EvalError::Type(format!("{call_pos}: vector-set!: expected vector"))),
+            }
+        }
+        "vector-length" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: vector-length requires 1 argument")));
+            }
+            match &args[0] {
+                Value::Vector(v) => Ok(Value::Integer(v.borrow().len() as i64)),
+                _ => Err(EvalError::Type(format!("{call_pos}: vector-length: expected vector"))),
+            }
+        }
+        "vector?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: vector? requires 1 argument")));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Vector(_))))
+        }
+        "vector->list" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: vector->list requires 1 argument")));
+            }
+            match &args[0] {
+                Value::Vector(v) => Ok(Value::List(v.borrow().clone())),
+                _ => Err(EvalError::Type(format!("{call_pos}: vector->list: expected vector"))),
+            }
+        }
+        "list->vector" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: list->vector requires 1 argument")));
+            }
+            match &args[0] {
+                Value::List(elems) => Ok(Value::Vector(Rc::new(RefCell::new(elems.clone())))),
+                _ => Err(EvalError::Type(format!("{call_pos}: list->vector: expected list"))),
+            }
+        }
+        "memq" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("{call_pos}: memq requires 2 arguments")));
+            }
+            let key = &args[0];
+            match &args[1] {
+                Value::List(elems) => {
+                    for (i, elem) in elems.iter().enumerate() {
+                        if values_eq(key, elem) {
+                            return Ok(Value::List(elems[i..].to_vec()));
+                        }
+                    }
+                    Ok(Value::Boolean(false))
+                }
+                _ => Err(EvalError::Type(format!("{call_pos}: memq: expected list"))),
+            }
+        }
+        "assq" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("{call_pos}: assq requires 2 arguments")));
+            }
+            let key = &args[0];
+            match &args[1] {
+                Value::List(alist) => {
+                    for entry in alist {
+                        match entry {
+                            Value::List(pair) if !pair.is_empty() => {
+                                if values_eq(key, &pair[0]) {
+                                    return Ok(entry.clone());
+                                }
+                            }
+                            Value::Pair(car, _) => {
+                                if values_eq(key, car) {
+                                    return Ok(entry.clone());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(Value::Boolean(false))
+                }
+                _ => Err(EvalError::Type(format!("{call_pos}: assq: expected list"))),
+            }
+        }
+        "for-each" => {
+            if args.len() < 2 {
+                return Err(EvalError::Arity(format!("{call_pos}: for-each requires at least 2 arguments")));
+            }
+            let func = &args[0];
+            let lists: Vec<&Vec<Value>> = args[1..].iter().map(|a| match a {
+                Value::List(elems) => Ok(elems),
+                _ => Err(EvalError::Type(format!("{call_pos}: for-each: expected list"))),
+            }).collect::<Result<_, _>>()?;
+            let len = lists[0].len();
+            for i in 0..len {
+                let map_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+                apply_func(func, &map_args, call_pos, output)?;
+            }
+            Ok(Value::Void)
+        }
 
         "procedure?" => {
             if args.len() != 1 {
