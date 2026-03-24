@@ -48,7 +48,7 @@ object ListBuiltins:
         def filterLoop(v: Val): Val = v match
           case Nil => Nil
           case Pair(car, cdr) =>
-            val result = Evaluator.applyFunc(func, List(car))
+            val result = Interpreter.applyFunc(func, List(car))
             if result != Bool(false) then Pair(car, filterLoop(cdr))
             else filterLoop(cdr)
           case _ => throw new EvalError("filter: not a proper list")
@@ -60,7 +60,7 @@ object ListBuiltins:
       val func    = args.head
       val prefix  = args.slice(1, args.length - 1)
       val allArgs = prefix ++ toArgList(args.last)
-      Evaluator.applyFunc(func, allArgs)
+      Interpreter.applyFunc(func, allArgs)
     },
     "list?" -> Builtin {
       case List(v) =>
@@ -132,7 +132,7 @@ object ListBuiltins:
   private def mapSingle(func: Val, lst: Val): Val = lst match
     case Nil => Nil
     case Pair(car, cdr) =>
-      val mapped = Evaluator.applyFunc(func, List(car))
+      val mapped = Interpreter.applyFunc(func, List(car))
       Pair(mapped, mapSingle(func, cdr))
     case _ => throw new EvalError("map: not a proper list")
 
@@ -148,7 +148,7 @@ object ListBuiltins:
         case Pair(_, cdr) => cdr
         case other        => other
       }
-      Pair(Evaluator.applyFunc(func, cars), mapMulti(func, cdrs))
+      Pair(Interpreter.applyFunc(func, cars), mapMulti(func, cdrs))
 
   private def toArgList(v: Val): List[Val] = v match
     case Nil            => List.empty

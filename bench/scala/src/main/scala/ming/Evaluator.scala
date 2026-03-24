@@ -45,8 +45,8 @@ object Evaluator:
       def apply(car: Val, cdr: Val): Pair    = new Pair(car, cdr)
       def unapply(p: Pair): Some[(Val, Val)] = Some((p.car, p.cdr))
 
-    /** A captured continuation (first-class). */
-    case class ContinuationVal(k: Cont) extends Val
+    /** A captured continuation (first-class), with saved winding stack. */
+    case class ContinuationVal(k: Cont, winds: List[(Val, Val)]) extends Val
 
     /** The call/cc primitive as a first-class value. */
     case object CallCCVal extends Val
@@ -82,8 +82,11 @@ object Evaluator:
       new java.util.IdentityHashMap[Array[Char], java.lang.Boolean]()
     )
 
+  // --- dynamic-wind winding stack ---
+  private[ming] var windingStack: List[(Val, Val)] = List.empty
+
   // --- Position tracking ---
-  private var lastPos = "1:1"
+  private[ming] var lastPos = "1:1"
 
   private[ming] def error(msg: String): Nothing =
     throw new EvalError(s"$lastPos: $msg")
@@ -115,7 +118,7 @@ object Evaluator:
 
   // ======== Trampoline runner ========
 
-  private def trampoline(b0: Bounce): Val =
+  private[ming] def trampoline(b0: Bounce): Val =
     var b = b0
     while true do
       b match
@@ -160,6 +163,39 @@ object Evaluator:
       case Pair(Symbol("letrec*"), rest)            => BindingForms.evalLetrecStarK(rest, env, k)
       case Pair(Symbol("case"), rest)               => SpecialForms.evalCaseK(rest, env, k)
       case Pair(Symbol("do"), rest)                 => BindingForms.evalDoK(rest, env, k)
+      case Pair(Symbol("dynamic-wind"), Pair(inExpr, Pair(bodyExpr, Pair(outExpr, Nil)))) =>
+        evalK(
+          inExpr,
+          env,
+          inThunk =>
+            evalK(
+              bodyExpr,
+              env,
+              bodyThunk =>
+                evalK(
+                  outExpr,
+                  env,
+                  outThunk =>
+                    applyK(
+                      inThunk,
+                      List.empty,
+                      _ =>
+                        BMore { () =>
+                          windingStack = (inThunk, outThunk) :: windingStack
+                          applyK(
+                            bodyThunk,
+                            List.empty,
+                            bodyVal =>
+                              BMore { () =>
+                                windingStack = windingStack.tail
+                                applyK(outThunk, List.empty, _ => k(bodyVal))
+                              }
+                          )
+                        }
+                    )
+                )
+            )
+        )
       case Pair(Symbol("define-syntax"), Pair(Symbol(name), Pair(sr, Nil))) =>
         k(Macros.evalDefineSyntax(name, sr, env))
       case Pair(Symbol(name), pArgs) =>
@@ -192,18 +228,58 @@ object Evaluator:
       case last :: scala.Nil => evalK(last, env, k)
       case head :: tail      => evalK(head, env, _ => BMore(() => evalSeqK(tail, env, k)))
 
+  // ======== dynamic-wind helpers ========
+
+  /** Find the length of the common tail of two winding stacks (by reference identity). */
+  private def commonWindTailLength(a: List[(Val, Val)], b: List[(Val, Val)]): Int =
+    var aa = a; var bb = b
+    if aa.length > bb.length then for _ <- 0 until (aa.length - bb.length) do aa = aa.tail
+    else for _ <- 0 until (bb.length - aa.length) do bb = bb.tail
+    while aa ne bb do
+      aa = aa.tail; bb = bb.tail
+    aa.length
+
+  /** Run a sequence of thunks (zero-arg procedures) in order, then continue with `then`. */
+  private def runThunks(thunks: List[Val], andThen: => Bounce): Bounce =
+    thunks match
+      case scala.Nil     => andThen
+      case thunk :: rest => applyK(thunk, List.empty, _ => BMore(() => runThunks(rest, andThen)))
+
   // ======== Function application (CPS) ========
 
-  private def applyK(func: Val, args: List[Val], k: Cont): Bounce =
+  private[ming] def applyBuiltinChecked(f: List[Val] => Val, args: List[Val]): Val =
+    try f(args)
+    catch
+      case e: EvalError =>
+        if !e.getMessage.matches(".*\\d+:\\d+.*") then error(e.getMessage)
+        else throw e
+
+  private[ming] def applyK(func: Val, args: List[Val], k: Cont): Bounce =
     func match
       case CallCCVal =>
         args match
-          case List(proc) => applyK(proc, List(ContinuationVal(k)), k)
+          case List(proc) => applyK(proc, List(ContinuationVal(k, windingStack)), k)
           case _          => error("call/cc requires 1 argument")
-      case ContinuationVal(savedK) =>
+      case ContinuationVal(savedK, savedWinds) =>
         args match
-          case List(v) => savedK(v)
-          case _       => error("continuation requires 1 argument")
+          case List(v) =>
+            val currentWinds = windingStack
+            val commonLen    = commonWindTailLength(currentWinds, savedWinds)
+            val toUnwind     = currentWinds.take(currentWinds.length - commonLen).map(_._2)     // out-thunks
+            val toRewind     = savedWinds.take(savedWinds.length - commonLen).reverse.map(_._1) // in-thunks
+            runThunks(
+              toUnwind,
+              BMore { () =>
+                runThunks(
+                  toRewind,
+                  BMore { () =>
+                    windingStack = savedWinds
+                    savedK(v)
+                  }
+                )
+              }
+            )
+          case _ => error("continuation requires 1 argument")
       case Closure(params, restParam, body, closureEnv) =>
         val callEnv = setupClosureEnv(params, restParam, body, closureEnv, args)
         evalSeqK(body, callEnv, k)
@@ -211,80 +287,3 @@ object Evaluator:
         try k(applyBuiltinChecked(f, args))
         catch case jump: ContinuationJump => jump.bounce
       case _ => error(s"not a procedure: ${Display.write(func)}")
-
-  // ======== Non-CPS wrappers ========
-
-  private def applyBuiltinChecked(f: List[Val] => Val, args: List[Val]): Val =
-    try f(args)
-    catch
-      case e: EvalError =>
-        if !e.getMessage.matches(".*\\d+:\\d+.*") then error(e.getMessage)
-        else throw e
-
-  private[ming] def eval(expr: Val, env: Env): Val =
-    trampoline(evalK(expr, env, v => BDone(v)))
-
-  private[ming] def applyFunc(func: Val, args: List[Val]): Val = func match
-    case Closure(params, restParam, body, closureEnv) =>
-      val callEnv     = setupClosureEnv(params, restParam, body, closureEnv, args)
-      var result: Val = Void
-      for expr <- body do result = eval(expr, callEnv)
-      result
-    case ContinuationVal(savedK) =>
-      args match
-        case List(v) => throw new ContinuationJump(savedK(v))
-        case _       => error("continuation requires 1 argument")
-    case CallCCVal =>
-      args match
-        case List(proc) => trampoline(applyK(CallCCVal, args, v => BDone(v)))
-        case _          => error("call/cc requires 1 argument")
-    case Builtin(f) => applyBuiltinChecked(f, args)
-    case _          => error(s"not a procedure: ${Display.write(func)}")
-
-  // ======== Default environment ========
-
-  private def defaultEnv(): Env =
-    val env = Env.empty()
-    Builtins.all.foreach((name, v) => env.define(name, v))
-    env.define("call/cc", CallCCVal)
-    env.define("call-with-current-continuation", CallCCVal)
-    env
-
-  // ======== Public API ========
-
-  def evalStr(input: String): String =
-    val parser = new Parser(input)
-    val exprs  = parser.parseAllWithPositions()
-    if exprs.isEmpty then throw new EvalError("no expressions")
-    val env = defaultEnv()
-    def evalTopLevel(remaining: List[(Val, Int, Int)], k: Cont): Bounce =
-      remaining match
-        case scala.Nil => k(Void)
-        case (expr, line, col) :: scala.Nil =>
-          lastPos = s"$line:$col"
-          evalK(expr, env, k)
-        case (expr, line, col) :: rest =>
-          lastPos = s"$line:$col"
-          evalK(expr, env, _ => BMore(() => evalTopLevel(rest, k)))
-    val result = trampoline(evalTopLevel(exprs, v => BDone(v)))
-    Display.write(result)
-
-  def evalStrWithOutput(input: String): (String, String) =
-    outputBuffer.clear()
-    val parser = new Parser(input)
-    val exprs  = parser.parseAllWithPositions()
-    if exprs.isEmpty then throw new EvalError("no expressions")
-    val env = defaultEnv()
-    def evalTopLevel(remaining: List[(Val, Int, Int)], k: Cont): Bounce =
-      remaining match
-        case scala.Nil => k(Void)
-        case (expr, line, col) :: scala.Nil =>
-          lastPos = s"$line:$col"
-          evalK(expr, env, k)
-        case (expr, line, col) :: rest =>
-          lastPos = s"$line:$col"
-          evalK(expr, env, _ => BMore(() => evalTopLevel(rest, k)))
-    val result = trampoline(evalTopLevel(exprs, v => BDone(v)))
-    val output = outputBuffer.toString
-    outputBuffer.clear()
-    (Display.write(result), output)

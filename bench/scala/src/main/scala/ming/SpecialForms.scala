@@ -137,7 +137,7 @@ private[ming] object SpecialForms:
             childEnv.define(rp, restArgs.foldRight(Nil: Val)((a, acc) => Pair(a, acc)))
           }
           var result: Val = Void
-          for expr <- bodyList do result = Evaluator.eval(expr, childEnv)
+          for expr <- bodyList do result = Interpreter.eval(expr, childEnv)
           result
         case None =>
           Evaluator.error(s"case-lambda: no matching clause for ${args.length} arguments")

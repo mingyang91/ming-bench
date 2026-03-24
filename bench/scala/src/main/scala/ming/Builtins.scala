@@ -156,7 +156,7 @@ object Builtins:
         while cur != Nil do
           cur match
             case p: Pair =>
-              Evaluator.applyFunc(func, List(p.car))
+              Interpreter.applyFunc(func, List(p.car))
               cur = p.cdr
             case _ => throw new EvalError("for-each: not a proper list")
         Void
@@ -167,7 +167,7 @@ object Builtins:
             case p: Pair => p.car
             case _       => throw new EvalError("for-each: not a proper list")
           }
-          Evaluator.applyFunc(func, cars)
+          Interpreter.applyFunc(func, cars)
           curs = curs.map {
             case p: Pair => p.cdr
             case other   => other
