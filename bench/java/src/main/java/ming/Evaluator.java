@@ -45,6 +45,12 @@ public class Evaluator {
         void define(String name, Object value) {
             bindings.put(name, value);
         }
+
+        void set(String name, Object value) throws EvalError {
+            if (bindings.containsKey(name)) { bindings.put(name, value); return; }
+            if (parent != null) { parent.set(name, value); return; }
+            throw new EvalError("unbound variable: " + name);
+        }
     }
 
     // --- Lambda (closure) ---
@@ -343,6 +349,18 @@ public class Evaluator {
                             env.define(fname, new Lambda(params, body, env));
                         } else {
                             throw new EvalError(posStr() + "define: bad syntax");
+                        }
+                        return VOID;
+                    }
+                    case "set!" -> {
+                        if (list.size() != 3) throw new EvalError(posStr() + "set!: bad syntax");
+                        Object nameObj = unwrap(list.get(1));
+                        if (!(nameObj instanceof String name)) throw new EvalError(posStr() + "set!: not a symbol");
+                        Object val = eval(list.get(2), env);
+                        try {
+                            env.set(name, val);
+                        } catch (EvalError e) {
+                            throw new EvalError(posStr() + e.getMessage());
                         }
                         return VOID;
                     }
