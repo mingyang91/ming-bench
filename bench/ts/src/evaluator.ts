@@ -20,7 +20,8 @@ type SchemeVal =
   | { tag: 'record'; typeName: string; fields: Map<string, SchemeVal>; pos?: Pos }
   | { tag: 'case-lambda'; clauses: { params: string[]; restParam?: string; body: SchemeVal[] }[]; env: Env; pos?: Pos }
   | { tag: 'void'; pos?: Pos }
-  | { tag: 'continuation'; kont: Kont; windStack?: any; pos?: Pos };
+  | { tag: 'continuation'; kont: Kont; windStack?: any; pos?: Pos }
+  | { tag: 'values'; values: SchemeVal[]; pos?: Pos };
 
 interface WindFrame { inThunk: SchemeVal; outThunk: SchemeVal }
 
@@ -85,6 +86,7 @@ type KontData =
   | { tag: 'do-step'; varNames: string[]; stepExprs: (SchemeVal|undefined)[]; stepIdx: number; newVals: (SchemeVal|undefined)[]; testExpr: SchemeVal; resultExprs: SchemeVal[]; bodyExprs: SchemeVal[]; env: Env }
   | { tag: 'handler-pop'; entry: ExHandlerEntry }
   | { tag: 'guard-clauses'; varName: string; clauses: SchemeVal[]; env: Env; pos?: Pos }
+  | { tag: 'cwv'; consumer: SchemeVal; pos?: Pos }
 ;
 
 // --- Parser ---
@@ -273,6 +275,7 @@ function schemeToString(val: SchemeVal, seen?: Set<SchemeVal>): string {
     case 'record': return `#<record:${val.typeName}>`;
     case 'continuation': return '#<continuation>';
     case 'void': return '';
+    case 'values': return val.values.map(v => schemeToString(v, seen)).join('\n');
   }
 }
 
@@ -1578,6 +1581,16 @@ function makeGlobalEnv(outputBuf: string[]): Env {
   const wehBuiltin: SchemeVal = { tag: 'builtin', name: 'with-exception-handler', func: () => { throw new Error('with-exception-handler: must be intercepted by CEK machine'); } };
   envDefine(env, 'with-exception-handler', wehBuiltin);
 
+  // values — returns multiple values; single value is transparent
+  defBuiltin('values', (args) => {
+    if (args.length === 1) return args[0];
+    return { tag: 'values', values: args };
+  });
+
+  // call-with-values — handled specially by the CEK machine
+  const cwvBuiltin: SchemeVal = { tag: 'builtin', name: 'call-with-values', func: () => { throw new Error('call-with-values: must be intercepted by CEK machine'); } };
+  envDefine(env, 'call-with-values', cwvBuiltin);
+
   return env;
 }
 
@@ -1846,6 +1859,13 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
       exceptionHandlers.push(entry);
       kont = { tag: 'handler-pop', entry, next: kont };
       applyFunc(thunk, [], pos);
+      return;
+    }
+    if (func.tag === 'builtin' && func.name === 'call-with-values') {
+      if (args.length !== 2) throw new EvalError(`${fmtPos(pos)}call-with-values: expected 2 arguments`);
+      const [producer, consumer] = args;
+      kont = { tag: 'cwv', consumer, pos, next: kont };
+      applyFunc(producer, [], pos);
       return;
     }
     if (func.tag === 'continuation') {
@@ -2570,6 +2590,18 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
                 if (idx >= 0) exceptionHandlers.splice(idx, 1);
               }
               kont = frame.next; break;
+            }
+
+            case 'cwv': {
+              // Producer returned val; spread multiple values to consumer
+              const producerResult = val;
+              kont = frame.next;
+              if (producerResult.tag === 'values') {
+                applyFunc(frame.consumer, producerResult.values, frame.pos);
+              } else {
+                applyFunc(frame.consumer, [producerResult], frame.pos);
+              }
+              break;
             }
 
             case 'guard-clauses': {
