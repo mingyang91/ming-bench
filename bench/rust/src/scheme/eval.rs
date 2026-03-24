@@ -167,7 +167,8 @@ impl Env {
                      "display", "write", "newline",
                      "string-append", "string-length", "substring",
                      "string->number", "number->string",
-                     "symbol->string", "string->symbol", "string-ref"] {
+                     "symbol->string", "string->symbol", "string-ref",
+                     "string-copy", "make-string", "char->integer", "integer->char"] {
             bindings.insert(name.to_string(), Value::Builtin(name.to_string()));
         }
         Env(Rc::new(RefCell::new(EnvInner {
@@ -191,6 +192,21 @@ impl Env {
         self.0.borrow_mut().bindings.insert(name, val);
     }
 
+    fn set(&self, name: &str, val: Value) -> Result<(), EvalError> {
+        let has_key = self.0.borrow().bindings.contains_key(name);
+        if has_key {
+            self.0.borrow_mut().bindings.insert(name.to_string(), val);
+            Ok(())
+        } else {
+            let parent = self.0.borrow().parent.clone();
+            if let Some(p) = parent {
+                Env(p).set(name, val)
+            } else {
+                Err(EvalError::UnboundVariable(format!("{}", name)))
+            }
+        }
+    }
+
     fn child(parent: &Env) -> Env {
         Env(Rc::new(RefCell::new(EnvInner {
             bindings: HashMap::new(),
@@ -205,6 +221,7 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Symbol(name) => {
             env.get(name)
                 .ok_or_else(|| EvalError::UnboundVariable(format!("{} at {}", name, fmt_span(span))))
@@ -225,6 +242,8 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "let" => return eval_let(&items[1..], env, span),
                     "begin" => return eval_begin(&items[1..], env),
                     "cond" => return eval_cond(&items[1..], env),
+                    "set!" => return eval_set(&items[1..], env, span),
+                    "string-set!" => return eval_string_set(&items[1..], env, span),
                     _ => {}
                 }
             }
@@ -297,6 +316,7 @@ fn expr_to_value(expr: &Expr) -> Value {
         ExprKind::Integer(n) => Value::Integer(*n),
         ExprKind::Boolean(b) => Value::Boolean(*b),
         ExprKind::Str(s) => Value::Str(s.clone()),
+        ExprKind::Char(c) => Value::Char(*c),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
         ExprKind::List(items) => {
             let mut result = Value::Nil;
@@ -452,6 +472,54 @@ fn eval_let(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
         }
         Ok(result)
     }
+}
+
+fn eval_set(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Runtime(format!("set! requires exactly 2 arguments at {}", fmt_span(span))));
+    }
+    let name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Runtime(format!("set!: first argument must be a symbol at {}", fmt_span(span)))),
+    };
+    if env.get(&name).is_none() {
+        return Err(EvalError::UnboundVariable(format!("{} at {}", name, fmt_span(span))));
+    }
+    let val = eval(&args[1], env)?;
+    env.set(&name, val)?;
+    Ok(Value::Void)
+}
+
+fn eval_string_set(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Arity(format!("string-set! requires 3 arguments at {}", fmt_span(span))));
+    }
+    // Evaluate all arguments
+    let target = eval(&args[0], env)?;
+    let idx_val = eval(&args[1], env)?;
+    let ch_val = eval(&args[2], env)?;
+
+    let mut s = match target {
+        Value::Str(s) => s,
+        _ => return Err(EvalError::Type("string-set!: expected string".into())),
+    };
+    let idx = expect_int(&idx_val)? as usize;
+    let ch = match ch_val {
+        Value::Char(c) => c,
+        _ => return Err(EvalError::Type("string-set!: expected char".into())),
+    };
+
+    if idx >= s.len() {
+        return Err(EvalError::Runtime("string-set!: index out of range".into()));
+    }
+    // SAFETY: we checked idx < len, and we're replacing a single byte with a single ASCII-range char
+    unsafe { s.as_bytes_mut()[idx] = ch as u8; }
+
+    // If the first arg was a variable, update it in the environment
+    if let ExprKind::Symbol(name) = &args[0].kind {
+        env.set(name, Value::Str(s)).ok();
+    }
+    Ok(Value::Void)
 }
 
 fn eval_begin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
@@ -724,6 +792,30 @@ fn apply_builtin(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::Runtime("string-ref: index out of range".into()));
             }
             Ok(Value::Char(s.as_bytes()[idx] as char))
+        }
+        "string-copy" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string-copy requires 1 argument".into())); }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Str(s.clone())),
+                _ => Err(EvalError::Type("string-copy: expected string".into())),
+            }
+        }
+        "make-string" => {
+            if args.is_empty() || args.len() > 2 { return Err(EvalError::Arity("make-string requires 1 or 2 arguments".into())); }
+            let len = expect_int(&args[0])? as usize;
+            let ch = if args.len() == 2 {
+                match &args[1] { Value::Char(c) => *c, _ => return Err(EvalError::Type("make-string: expected char".into())) }
+            } else { '\0' };
+            Ok(Value::Str(std::iter::repeat(ch).take(len).collect()))
+        }
+        "char->integer" => {
+            if args.len() != 1 { return Err(EvalError::Arity("char->integer requires 1 argument".into())); }
+            match &args[0] { Value::Char(c) => Ok(Value::Integer(*c as i64)), _ => Err(EvalError::Type("char->integer: expected char".into())) }
+        }
+        "integer->char" => {
+            if args.len() != 1 { return Err(EvalError::Arity("integer->char requires 1 argument".into())); }
+            let n = expect_int(&args[0])?;
+            Ok(Value::Char(char::from_u32(n as u32).unwrap_or('\u{FFFD}')))
         }
         _ => Err(EvalError::Runtime(format!("unknown builtin: {}", name))),
     }

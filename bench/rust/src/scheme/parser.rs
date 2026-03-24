@@ -17,6 +17,7 @@ pub enum ExprKind {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
     Symbol(String),
     List(Vec<Expr>),
 }
@@ -29,6 +30,7 @@ enum TokenKind {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
     Symbol(String),
 }
 
@@ -106,6 +108,27 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                             tokens.push(Token { kind: TokenKind::Boolean(false), span: Span { line, col: start_col } });
                             i += 2; col += 2;
                         }
+                        '\\' => {
+                            // Character literal: #\x, #\space, #\newline, #\tab
+                            i += 2; col += 2;
+                            if i >= chars.len() {
+                                return Err(EvalError::Parse(format!("unexpected end of character literal at {}:{}", line, start_col)));
+                            }
+                            let start_char = i;
+                            // Read a word (for named chars like space/newline/tab) or single char
+                            while i < chars.len() && !is_delimiter(chars[i]) {
+                                i += 1; col += 1;
+                            }
+                            let name: String = chars[start_char..i].iter().collect();
+                            let ch = match name.as_str() {
+                                "space" => ' ',
+                                "newline" => '\n',
+                                "tab" => '\t',
+                                s if s.chars().count() == 1 => s.chars().next().unwrap(),
+                                _ => return Err(EvalError::Parse(format!("unknown character name: #\\{} at {}:{}", name, line, start_col))),
+                            };
+                            tokens.push(Token { kind: TokenKind::Char(ch), span: Span { line, col: start_col } });
+                        }
                         _ => return Err(EvalError::Parse(format!("unexpected #{} at {}:{}", chars[i + 1], line, col))),
                     }
                 } else {
@@ -159,6 +182,7 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Expr, usize), EvalError> 
         TokenKind::Integer(n) => Ok((Expr { kind: ExprKind::Integer(*n), span }, pos + 1)),
         TokenKind::Boolean(b) => Ok((Expr { kind: ExprKind::Boolean(*b), span }, pos + 1)),
         TokenKind::Str(s) => Ok((Expr { kind: ExprKind::Str(s.clone()), span }, pos + 1)),
+        TokenKind::Char(c) => Ok((Expr { kind: ExprKind::Char(*c), span }, pos + 1)),
         TokenKind::Symbol(s) => Ok((Expr { kind: ExprKind::Symbol(s.clone()), span }, pos + 1)),
         TokenKind::LParen => {
             let mut items = Vec::new();
