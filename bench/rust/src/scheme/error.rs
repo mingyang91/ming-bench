@@ -24,4 +24,6 @@ pub enum EvalError {
     UnboundVariable(String, Span),
     #[error("division by zero at {0}")]
     DivisionByZero(Span),
+    #[error("internal: continuation invoked")]
+    ContinuationInvoked,
 }

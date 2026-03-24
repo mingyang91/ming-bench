@@ -769,7 +769,7 @@ fn builtin_type_predicate(name: &str, args: &[Value], span: Span) -> Result<Valu
         "pair?" => matches!(val, Value::List(items) if !items.is_empty()) || matches!(val, Value::Pair(..)),
         "symbol?" => matches!(val, Value::Symbol(_)),
         "char?" => matches!(val, Value::Char(_)),
-        "procedure?" => matches!(val, Value::Lambda(..) | Value::CaseLambda(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..)),
+        "procedure?" => matches!(val, Value::Lambda(..) | Value::CaseLambda(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..) | Value::Continuation(..)),
         _ => return Err(EvalError::UnboundVariable(name.into(), span)),
     };
     Ok(Value::Boolean(result))
