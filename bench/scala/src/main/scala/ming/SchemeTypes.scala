@@ -28,6 +28,7 @@ enum SchemeVal:
   case CaseLambda(clauses: List[(List[String], Option[String], List[Expr], Env)])
   case VectorVal(elems: Array[SchemeVal])
   case RecordVal(typeName: String, fields: Map[String, SchemeVal])
+  case TailCall(expr: Expr, env: Env)
   case Void
 
   def display: String = this match
@@ -49,6 +50,7 @@ enum SchemeVal:
     case Macro(_, _, _)        => "#<macro>"
     case VectorVal(elems)      => "#(" + elems.map(_.display).mkString(" ") + ")"
     case RecordVal(t, _)       => s"#<$t>"
+    case TailCall(_, _)        => "#<tail-call>"
     case Void                  => "#<void>"
 
   /** display format: no quotes on strings */

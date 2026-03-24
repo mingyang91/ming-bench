@@ -49,3 +49,81 @@ object EvalForms:
 
     if resultExprs.isEmpty then SchemeVal.Void
     else Evaluator.evalBody(resultExprs, doEnv)
+
+  def evalLet(
+    bindings: List[Expr],
+    body: List[Expr],
+    env: Env
+  ): SchemeVal =
+    val letEnv = new Env(mutable.Map.empty, Some(env))
+    for b <- bindings do
+      b match
+        case Expr.SList(Expr.Symbol(name) :: valExpr :: Nil) =>
+          letEnv.define(name, Evaluator.eval(valExpr, env))
+        case _ => throw new EvalError("let: invalid binding")
+    Evaluator.evalBodyTail(body, letEnv)
+
+  def evalNamedLet(
+    name: String,
+    bindings: List[Expr],
+    body: List[Expr],
+    env: Env
+  ): SchemeVal =
+    val (paramNames, initExprs) = bindings.map {
+      case Expr.SList(Expr.Symbol(p) :: v :: Nil) => (p, v)
+      case _                                      => throw new EvalError("let: invalid binding")
+    }.unzip
+    val letEnv = new Env(mutable.Map.empty, Some(env))
+    val proc   = SchemeVal.Procedure(paramNames, None, body, letEnv)
+    letEnv.define(name, proc)
+    val initVals = initExprs.map(e => Evaluator.eval(e, env))
+    val callEnv  = new Env(mutable.Map.empty, Some(letEnv))
+    paramNames.zip(initVals).foreach((p, v) => callEnv.define(p, v))
+    Evaluator.evalBodyTail(body, callEnv)
+
+  def evalCond(clauses: List[Expr], env: Env): SchemeVal =
+    clauses match
+      case Nil => SchemeVal.Void
+      case Expr.SList(Expr.Symbol("else") :: body) :: _ =>
+        Evaluator.evalBodyTail(body, env)
+      case Expr.SList(test :: body) :: rest =>
+        if Evaluator.isTruthy(Evaluator.eval(test, env)) then Evaluator.evalBodyTail(body, env)
+        else evalCond(rest, env)
+      case _ => throw new EvalError("cond: invalid clause")
+
+  def evalAnd(args: List[Expr], env: Env): SchemeVal =
+    args match
+      case Nil         => SchemeVal.BoolVal(true)
+      case head :: Nil => SchemeVal.TailCall(head, env)
+      case head :: tail =>
+        val v = Evaluator.eval(head, env)
+        if !Evaluator.isTruthy(v) then v
+        else evalAnd(tail, env)
+
+  def evalOr(args: List[Expr], env: Env): SchemeVal =
+    args match
+      case Nil         => SchemeVal.BoolVal(false)
+      case head :: Nil => SchemeVal.TailCall(head, env)
+      case head :: tail =>
+        val v = Evaluator.eval(head, env)
+        if Evaluator.isTruthy(v) then v
+        else evalOr(tail, env)
+
+  def evalLetrec(bindings: List[Expr], body: List[Expr], env: Env): SchemeVal =
+    val letEnv = new Env(mutable.Map.empty, Some(env))
+    val parsed = bindings.map {
+      case Expr.SList(Expr.Symbol(name) :: valExpr :: Nil) => (name, valExpr)
+      case _                                               => throw new EvalError("letrec: invalid binding")
+    }
+    for (name, _) <- parsed do letEnv.define(name, SchemeVal.Void)
+    for (name, valExpr) <- parsed do letEnv.define(name, Evaluator.eval(valExpr, letEnv))
+    Evaluator.evalBodyTail(body, letEnv)
+
+  def evalLetrecStar(bindings: List[Expr], body: List[Expr], env: Env): SchemeVal =
+    val letEnv = new Env(mutable.Map.empty, Some(env))
+    for b <- bindings do
+      b match
+        case Expr.SList(Expr.Symbol(name) :: valExpr :: Nil) =>
+          letEnv.define(name, Evaluator.eval(valExpr, letEnv))
+        case _ => throw new EvalError("letrec*: invalid binding")
+    Evaluator.evalBodyTail(body, letEnv)

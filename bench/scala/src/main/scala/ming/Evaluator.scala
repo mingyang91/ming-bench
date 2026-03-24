@@ -43,8 +43,16 @@ object Evaluator:
     case Expr.Symbol(n)    => SchemeVal.SymVal(n)
     case Expr.SList(es)    => SchemeVal.ListVal(es.map(quoteToVal))
 
+  /** Evaluate all body exprs, returning the last value (fully evaluated) */
   private[ming] def evalBody(body: List[Expr], env: Env): SchemeVal =
     body.foldLeft[SchemeVal](SchemeVal.Void)((_, e) => eval(e, env))
+
+  /** Evaluate all but last body expr; return TailCall for the last (for TCO) */
+  private[ming] def evalBodyTail(body: List[Expr], env: Env): SchemeVal =
+    if body.isEmpty then SchemeVal.Void
+    else
+      body.init.foreach(e => eval(e, env))
+      SchemeVal.TailCall(body.last, env)
 
   private def posStr(expr: Expr): String =
     val p = Parser.positions.get(expr)
@@ -69,7 +77,20 @@ object Evaluator:
     env.define(name, SchemeVal.Macro(literals, ruleList, env))
     SchemeVal.Void
 
+  /** Trampoline: resolve TailCall chain into a final value */
+  private def trampoline(initial: SchemeVal): SchemeVal =
+    var result = initial
+    while result.isInstanceOf[SchemeVal.TailCall] do
+      val SchemeVal.TailCall(e, env) = result: @unchecked
+      result = evalInner(e, env)
+    result
+
+  /** Public eval: always returns a fully evaluated value (trampolines internally) */
   private[ming] def eval(expr: Expr, env: Env): SchemeVal =
+    trampoline(evalInner(expr, env))
+
+  /** Inner eval: may return TailCall for tail positions */
+  private def evalInner(expr: Expr, env: Env): SchemeVal =
     try
       expr match
         case Expr.IntLit(n)    => SchemeVal.IntVal(n)
@@ -83,10 +104,11 @@ object Evaluator:
         case Expr.SList(Expr.Symbol("quote") :: arg :: Nil) =>
           quoteToVal(arg)
         case Expr.SList(Expr.Symbol("if") :: cond :: thenBr :: elseBr :: Nil) =>
-          if isTruthy(eval(cond, env)) then eval(thenBr, env)
-          else eval(elseBr, env)
+          if isTruthy(eval(cond, env)) then SchemeVal.TailCall(thenBr, env)
+          else SchemeVal.TailCall(elseBr, env)
         case Expr.SList(Expr.Symbol("if") :: cond :: thenBr :: Nil) =>
-          if isTruthy(eval(cond, env)) then eval(thenBr, env) else SchemeVal.Void
+          if isTruthy(eval(cond, env)) then SchemeVal.TailCall(thenBr, env)
+          else SchemeVal.Void
         case Expr.SList(
               Expr.Symbol("define") :: Expr.SList(
                 Expr.Symbol(name) :: params
@@ -113,19 +135,19 @@ object Evaluator:
                 bindings
               ) :: body
             ) =>
-          evalNamedLet(name, bindings, body, env)
+          EvalForms.evalNamedLet(name, bindings, body, env)
         case Expr.SList(
               Expr.Symbol("let") :: Expr.SList(bindings) :: body
             ) =>
-          evalLet(bindings, body, env)
+          EvalForms.evalLet(bindings, body, env)
         case Expr.SList(Expr.Symbol("begin") :: exprs) =>
-          evalBody(exprs, env)
+          evalBodyTail(exprs, env)
         case Expr.SList(Expr.Symbol("cond") :: clauses) =>
-          evalCond(clauses, env)
+          EvalForms.evalCond(clauses, env)
         case Expr.SList(Expr.Symbol("and") :: args) =>
-          evalAnd(args, env)
+          EvalForms.evalAnd(args, env)
         case Expr.SList(Expr.Symbol("or") :: args) =>
-          evalOr(args, env)
+          EvalForms.evalOr(args, env)
         case Expr.SList(
               Expr.Symbol("define-syntax") :: Expr.Symbol(name) :: Expr.SList(
                 Expr.Symbol("syntax-rules") :: Expr.SList(lits) :: rules
@@ -139,9 +161,9 @@ object Evaluator:
             ) =>
           RecordType.defineRecordType(typeName, ctorName, ctorFields, predName, fieldDefs, env)
         case Expr.SList(Expr.Symbol("letrec") :: Expr.SList(bindings) :: body) =>
-          evalLetrec(bindings, body, env)
+          EvalForms.evalLetrec(bindings, body, env)
         case Expr.SList(Expr.Symbol("letrec*") :: Expr.SList(bindings) :: body) =>
-          evalLetrecStar(bindings, body, env)
+          EvalForms.evalLetrecStar(bindings, body, env)
         case Expr.SList(Expr.Symbol("case") :: key :: clauses) =>
           EvalForms.evalCase(eval(key, env), clauses, env)
         case Expr.SList(Expr.Symbol("do") :: Expr.SList(varClauses) :: Expr.SList(testAndResult) :: bodyExprs) =>
@@ -153,7 +175,9 @@ object Evaluator:
             case m: SchemeVal.Macro => MacroExpander.expandAndEval(expr, name, m, env, eval)
             case _                  => throw new EvalError(s"$name: expected macro")
         case Expr.SList(head :: args) =>
-          applyProc(eval(head, env), args.map(a => eval(a, env)))
+          val fn         = eval(head, env)
+          val evaledArgs = args.map(a => eval(a, env))
+          applyProcInner(fn, evaledArgs)
     catch
       case e: EvalError =>
         val msg = e.getMessage
@@ -169,7 +193,8 @@ object Evaluator:
     }
     SchemeVal.CaseLambda(clauses)
 
-  def applyProc(fn: SchemeVal, evaledArgs: List[SchemeVal]): SchemeVal =
+  /** Inner apply: may return TailCall for procedure bodies (used from evalInner) */
+  private def applyProcInner(fn: SchemeVal, evaledArgs: List[SchemeVal]): SchemeVal =
     fn match
       case SchemeVal.BuiltinProc(_, f) => f(evaledArgs)
       case SchemeVal.Procedure(params, restParam, body, closureEnv) =>
@@ -183,7 +208,7 @@ object Evaluator:
           if evaledArgs.length != params.length then
             throw new EvalError(s"expected ${params.length} arguments, got ${evaledArgs.length}")
           params.zip(evaledArgs).foreach((p, v) => newEnv.define(p, v))
-        evalBody(body, newEnv)
+        evalBodyTail(body, newEnv)
       case SchemeVal.CaseLambda(clauses) =>
         val matching = clauses.find { (params, restParam, _, _) =>
           if restParam.isDefined then evaledArgs.length >= params.length
@@ -191,97 +216,14 @@ object Evaluator:
         }
         matching match
           case Some((params, restParam, body, closureEnv)) =>
-            applyProc(SchemeVal.Procedure(params, restParam, body, closureEnv), evaledArgs)
+            applyProcInner(SchemeVal.Procedure(params, restParam, body, closureEnv), evaledArgs)
           case None =>
             throw new EvalError(s"case-lambda: no matching clause for ${evaledArgs.length} arguments")
       case other => throw new EvalError(s"not a procedure: ${other.display}")
 
-  private def evalNamedLet(
-    name: String,
-    bindings: List[Expr],
-    body: List[Expr],
-    env: Env
-  ): SchemeVal =
-    val (paramNames, initExprs) = bindings.map {
-      case Expr.SList(Expr.Symbol(p) :: v :: Nil) => (p, v)
-      case _                                      => throw new EvalError("let: invalid binding")
-    }.unzip
-    val letEnv = new Env(mutable.Map.empty, Some(env))
-    val proc   = SchemeVal.Procedure(paramNames, None, body, letEnv)
-    letEnv.define(name, proc)
-    val initVals = initExprs.map(e => eval(e, env))
-    val callEnv  = new Env(mutable.Map.empty, Some(letEnv))
-    paramNames.zip(initVals).foreach((p, v) => callEnv.define(p, v))
-    evalBody(body, callEnv)
-
-  private def evalLet(
-    bindings: List[Expr],
-    body: List[Expr],
-    env: Env
-  ): SchemeVal =
-    val letEnv = new Env(mutable.Map.empty, Some(env))
-    for b <- bindings do
-      b match
-        case Expr.SList(Expr.Symbol(name) :: valExpr :: Nil) =>
-          letEnv.define(name, eval(valExpr, env))
-        case _ => throw new EvalError("let: invalid binding")
-    evalBody(body, letEnv)
-
-  @scala.annotation.tailrec
-  private def evalCond(clauses: List[Expr], env: Env): SchemeVal =
-    clauses match
-      case Nil => SchemeVal.Void
-      case Expr.SList(Expr.Symbol("else") :: body) :: _ =>
-        evalBody(body, env)
-      case Expr.SList(test :: body) :: rest =>
-        if isTruthy(eval(test, env)) then evalBody(body, env)
-        else evalCond(rest, env)
-      case _ => throw new EvalError("cond: invalid clause")
-
-  @scala.annotation.tailrec
-  private def evalAnd(
-    args: List[Expr],
-    env: Env,
-    last: SchemeVal = SchemeVal.BoolVal(true)
-  ): SchemeVal =
-    args match
-      case Nil => last
-      case head :: tail =>
-        val v = eval(head, env)
-        if !isTruthy(v) then v
-        else evalAnd(tail, env, v)
-
-  @scala.annotation.tailrec
-  private def evalOr(
-    args: List[Expr],
-    env: Env,
-    last: SchemeVal = SchemeVal.BoolVal(false)
-  ): SchemeVal =
-    args match
-      case Nil => last
-      case head :: tail =>
-        val v = eval(head, env)
-        if isTruthy(v) then v
-        else evalOr(tail, env, v)
-
-  private def evalLetrec(bindings: List[Expr], body: List[Expr], env: Env): SchemeVal =
-    val letEnv = new Env(mutable.Map.empty, Some(env))
-    val parsed = bindings.map {
-      case Expr.SList(Expr.Symbol(name) :: valExpr :: Nil) => (name, valExpr)
-      case _                                               => throw new EvalError("letrec: invalid binding")
-    }
-    for (name, _) <- parsed do letEnv.define(name, SchemeVal.Void)
-    for (name, valExpr) <- parsed do letEnv.define(name, eval(valExpr, letEnv))
-    evalBody(body, letEnv)
-
-  private def evalLetrecStar(bindings: List[Expr], body: List[Expr], env: Env): SchemeVal =
-    val letEnv = new Env(mutable.Map.empty, Some(env))
-    for b <- bindings do
-      b match
-        case Expr.SList(Expr.Symbol(name) :: valExpr :: Nil) =>
-          letEnv.define(name, eval(valExpr, letEnv))
-        case _ => throw new EvalError("letrec*: invalid binding")
-    evalBody(body, letEnv)
+  /** Public apply: always fully evaluates (trampolines TailCall) */
+  def applyProc(fn: SchemeVal, evaledArgs: List[SchemeVal]): SchemeVal =
+    trampoline(applyProcInner(fn, evaledArgs))
 
   def evalStr(input: String): String =
     val exprs = Parser.parse(input)
