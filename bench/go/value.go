@@ -94,6 +94,11 @@ type ApplyVal struct{}
 
 func (v *ApplyVal) String() string { return "#<procedure apply>" }
 
+// MapVal is the built-in map procedure.
+type MapVal struct{}
+
+func (v *MapVal) String() string { return "#<procedure map>" }
+
 // CharVal represents a Scheme character.
 type CharVal struct {
 	Val rune

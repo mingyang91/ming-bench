@@ -2,8 +2,10 @@ package ming
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // EvalStr evaluates one or more Scheme expressions and returns the string
@@ -255,6 +257,45 @@ func defaultEnv(output *strings.Builder) *Env {
 	// L08 builtins
 	env.Set("apply", &ApplyVal{})
 
+	// L09 builtins — numeric utilities
+	env.Set("abs", &BuiltinFunc{Name: "abs", Fn: builtinAbs})
+	env.Set("modulo", &BuiltinFunc{Name: "modulo", Fn: builtinModulo})
+	env.Set("remainder", &BuiltinFunc{Name: "remainder", Fn: builtinRemainder})
+	env.Set("quotient", &BuiltinFunc{Name: "quotient", Fn: builtinQuotient})
+	env.Set("min", &BuiltinFunc{Name: "min", Fn: builtinMin})
+	env.Set("max", &BuiltinFunc{Name: "max", Fn: builtinMax})
+	env.Set("expt", &BuiltinFunc{Name: "expt", Fn: builtinExpt})
+	env.Set("zero?", &BuiltinFunc{Name: "zero?", Fn: builtinZeroQ})
+	env.Set("positive?", &BuiltinFunc{Name: "positive?", Fn: builtinPositiveQ})
+	env.Set("negative?", &BuiltinFunc{Name: "negative?", Fn: builtinNegativeQ})
+	env.Set("odd?", &BuiltinFunc{Name: "odd?", Fn: builtinOddQ})
+	env.Set("even?", &BuiltinFunc{Name: "even?", Fn: builtinEvenQ})
+
+	// L09 builtins — list utilities
+	env.Set("list-ref", &BuiltinFunc{Name: "list-ref", Fn: builtinListRef})
+	env.Set("list-tail", &BuiltinFunc{Name: "list-tail", Fn: builtinListTail})
+	env.Set("list?", &BuiltinFunc{Name: "list?", Fn: builtinListQ})
+	env.Set("assoc", &BuiltinFunc{Name: "assoc", Fn: builtinAssoc})
+	env.Set("equal?", &BuiltinFunc{Name: "equal?", Fn: builtinEqualQ})
+	env.Set("eq?", &BuiltinFunc{Name: "eq?", Fn: builtinEqQ})
+	env.Set("map", &MapVal{})
+
+	// L09 builtins — char utilities
+	env.Set("char-alphabetic?", &BuiltinFunc{Name: "char-alphabetic?", Fn: builtinCharAlphaQ})
+	env.Set("char-numeric?", &BuiltinFunc{Name: "char-numeric?", Fn: builtinCharNumericQ})
+	env.Set("char-upcase", &BuiltinFunc{Name: "char-upcase", Fn: builtinCharUpcase})
+	env.Set("char-downcase", &BuiltinFunc{Name: "char-downcase", Fn: builtinCharDowncase})
+	env.Set("char=?", &BuiltinFunc{Name: "char=?", Fn: builtinCharEqQ})
+	env.Set("char<?", &BuiltinFunc{Name: "char<?", Fn: builtinCharLtQ})
+
+	// L09 builtins — string utilities
+	env.Set("string=?", &BuiltinFunc{Name: "string=?", Fn: builtinStringEqQ})
+	env.Set("string<?", &BuiltinFunc{Name: "string<?", Fn: builtinStringLtQ})
+	env.Set("string-ci=?", &BuiltinFunc{Name: "string-ci=?", Fn: builtinStringCiEqQ})
+	env.Set("string-upcase", &BuiltinFunc{Name: "string-upcase", Fn: builtinStringUpcase})
+	env.Set("string-downcase", &BuiltinFunc{Name: "string-downcase", Fn: builtinStringDowncase})
+	env.Set(">=", &BuiltinFunc{Name: ">=", Fn: builtinGe})
+
 	return env
 }
 
@@ -448,6 +489,60 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 			break
 		}
 		return applyProc(proc, flatArgs, callExpr)
+	case *MapVal:
+		// (map proc list1 list2 ...)
+		if len(args) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: map: expected at least 2 arguments", callExpr.Line, callExpr.Col)}
+		}
+		proc := args[0]
+		lists := args[1:]
+		// Convert each list arg to a slice
+		slices := make([][]Value, len(lists))
+		listLen := -1
+		for i, l := range lists {
+			var elems []Value
+			cur := l
+			for {
+				switch v := cur.(type) {
+				case *PairVal:
+					elems = append(elems, v.Car)
+					cur = v.Cdr
+					continue
+				case *NilVal:
+				default:
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: map: expected list", callExpr.Line, callExpr.Col)}
+				}
+				break
+			}
+			if listLen == -1 {
+				listLen = len(elems)
+			} else if len(elems) != listLen {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: map: lists must have equal length", callExpr.Line, callExpr.Col)}
+			}
+			slices[i] = elems
+		}
+		if listLen <= 0 {
+			return &NilVal{}, nil
+		}
+		// Apply proc to each set of elements
+		results := make([]Value, listLen)
+		for j := 0; j < listLen; j++ {
+			callArgs := make([]Value, len(slices))
+			for i := range slices {
+				callArgs[i] = slices[i][j]
+			}
+			var err error
+			results[j], err = applyProc(proc, callArgs, callExpr)
+			if err != nil {
+				return nil, err
+			}
+		}
+		// Build result list
+		result := Value(&NilVal{})
+		for i := len(results) - 1; i >= 0; i-- {
+			result = &PairVal{Car: results[i], Cdr: result}
+		}
+		return result, nil
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", callExpr.List[0].Line, callExpr.List[0].Col)}
 	}
@@ -1029,4 +1124,482 @@ func builtinStringSet(args []Value) (Value, error) {
 	runes[idx.Val] = ch.Val
 	s.Val = string(runes)
 	return &VoidVal{}, nil
+}
+
+// L09 builtins
+
+func builtinAbs(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("abs: expected 1 argument, got %d", len(args))
+	}
+	n, ok := args[0].(*IntVal)
+	if !ok {
+		return nil, fmt.Errorf("abs: expected number, got %s", args[0].String())
+	}
+	if n.Val < 0 {
+		return &IntVal{Val: -n.Val}, nil
+	}
+	return &IntVal{Val: n.Val}, nil
+}
+
+func builtinModulo(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("modulo: expected 2 arguments, got %d", len(args))
+	}
+	nums, err := requireInts("modulo", args)
+	if err != nil {
+		return nil, err
+	}
+	if nums[1] == 0 {
+		return nil, fmt.Errorf("modulo: division by zero")
+	}
+	// Go's % gives remainder (sign of dividend). Modulo takes sign of divisor.
+	r := nums[0] % nums[1]
+	if r != 0 && (r > 0) != (nums[1] > 0) {
+		r += nums[1]
+	}
+	return &IntVal{Val: r}, nil
+}
+
+func builtinRemainder(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("remainder: expected 2 arguments, got %d", len(args))
+	}
+	nums, err := requireInts("remainder", args)
+	if err != nil {
+		return nil, err
+	}
+	if nums[1] == 0 {
+		return nil, fmt.Errorf("remainder: division by zero")
+	}
+	return &IntVal{Val: nums[0] % nums[1]}, nil
+}
+
+func builtinQuotient(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("quotient: expected 2 arguments, got %d", len(args))
+	}
+	nums, err := requireInts("quotient", args)
+	if err != nil {
+		return nil, err
+	}
+	if nums[1] == 0 {
+		return nil, fmt.Errorf("quotient: division by zero")
+	}
+	// Truncated toward zero (Go default behavior)
+	return &IntVal{Val: nums[0] / nums[1]}, nil
+}
+
+func builtinMin(args []Value) (Value, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("min: expected at least 1 argument")
+	}
+	nums, err := requireInts("min", args)
+	if err != nil {
+		return nil, err
+	}
+	result := nums[0]
+	for _, n := range nums[1:] {
+		if n < result {
+			result = n
+		}
+	}
+	return &IntVal{Val: result}, nil
+}
+
+func builtinMax(args []Value) (Value, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("max: expected at least 1 argument")
+	}
+	nums, err := requireInts("max", args)
+	if err != nil {
+		return nil, err
+	}
+	result := nums[0]
+	for _, n := range nums[1:] {
+		if n > result {
+			result = n
+		}
+	}
+	return &IntVal{Val: result}, nil
+}
+
+func builtinExpt(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("expt: expected 2 arguments, got %d", len(args))
+	}
+	nums, err := requireInts("expt", args)
+	if err != nil {
+		return nil, err
+	}
+	base, exp := nums[0], nums[1]
+	if exp < 0 {
+		return &IntVal{Val: 0}, nil
+	}
+	result := int64(math.Pow(float64(base), float64(exp)))
+	return &IntVal{Val: result}, nil
+}
+
+func builtinZeroQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("zero?: expected 1 argument, got %d", len(args))
+	}
+	n, ok := args[0].(*IntVal)
+	if !ok {
+		return nil, fmt.Errorf("zero?: expected number, got %s", args[0].String())
+	}
+	return &BoolVal{Val: n.Val == 0}, nil
+}
+
+func builtinPositiveQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("positive?: expected 1 argument, got %d", len(args))
+	}
+	n, ok := args[0].(*IntVal)
+	if !ok {
+		return nil, fmt.Errorf("positive?: expected number, got %s", args[0].String())
+	}
+	return &BoolVal{Val: n.Val > 0}, nil
+}
+
+func builtinNegativeQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("negative?: expected 1 argument, got %d", len(args))
+	}
+	n, ok := args[0].(*IntVal)
+	if !ok {
+		return nil, fmt.Errorf("negative?: expected number, got %s", args[0].String())
+	}
+	return &BoolVal{Val: n.Val < 0}, nil
+}
+
+func builtinOddQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("odd?: expected 1 argument, got %d", len(args))
+	}
+	n, ok := args[0].(*IntVal)
+	if !ok {
+		return nil, fmt.Errorf("odd?: expected number, got %s", args[0].String())
+	}
+	return &BoolVal{Val: n.Val%2 != 0}, nil
+}
+
+func builtinEvenQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("even?: expected 1 argument, got %d", len(args))
+	}
+	n, ok := args[0].(*IntVal)
+	if !ok {
+		return nil, fmt.Errorf("even?: expected number, got %s", args[0].String())
+	}
+	return &BoolVal{Val: n.Val%2 == 0}, nil
+}
+
+func builtinListRef(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("list-ref: expected 2 arguments, got %d", len(args))
+	}
+	idx, ok := args[1].(*IntVal)
+	if !ok {
+		return nil, fmt.Errorf("list-ref: expected number, got %s", args[1].String())
+	}
+	cur := args[0]
+	for i := int64(0); i < idx.Val; i++ {
+		p, ok := cur.(*PairVal)
+		if !ok {
+			return nil, fmt.Errorf("list-ref: index out of range")
+		}
+		cur = p.Cdr
+	}
+	p, ok := cur.(*PairVal)
+	if !ok {
+		return nil, fmt.Errorf("list-ref: index out of range")
+	}
+	return p.Car, nil
+}
+
+func builtinListTail(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("list-tail: expected 2 arguments, got %d", len(args))
+	}
+	idx, ok := args[1].(*IntVal)
+	if !ok {
+		return nil, fmt.Errorf("list-tail: expected number, got %s", args[1].String())
+	}
+	cur := args[0]
+	for i := int64(0); i < idx.Val; i++ {
+		p, ok := cur.(*PairVal)
+		if !ok {
+			return nil, fmt.Errorf("list-tail: index out of range")
+		}
+		cur = p.Cdr
+	}
+	return cur, nil
+}
+
+func builtinListQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("list?: expected 1 argument, got %d", len(args))
+	}
+	cur := args[0]
+	for {
+		switch v := cur.(type) {
+		case *NilVal:
+			return &BoolVal{Val: true}, nil
+		case *PairVal:
+			cur = v.Cdr
+		default:
+			return &BoolVal{Val: false}, nil
+		}
+	}
+}
+
+func schemeEqual(a, b Value) bool {
+	switch av := a.(type) {
+	case *IntVal:
+		if bv, ok := b.(*IntVal); ok {
+			return av.Val == bv.Val
+		}
+	case *BoolVal:
+		if bv, ok := b.(*BoolVal); ok {
+			return av.Val == bv.Val
+		}
+	case *StringVal:
+		if bv, ok := b.(*StringVal); ok {
+			return av.Val == bv.Val
+		}
+	case *SymbolVal:
+		if bv, ok := b.(*SymbolVal); ok {
+			return av.Name == bv.Name
+		}
+	case *CharVal:
+		if bv, ok := b.(*CharVal); ok {
+			return av.Val == bv.Val
+		}
+	case *NilVal:
+		_, ok := b.(*NilVal)
+		return ok
+	case *PairVal:
+		if bv, ok := b.(*PairVal); ok {
+			return schemeEqual(av.Car, bv.Car) && schemeEqual(av.Cdr, bv.Cdr)
+		}
+	}
+	return false
+}
+
+func builtinEqualQ(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("equal?: expected 2 arguments, got %d", len(args))
+	}
+	return &BoolVal{Val: schemeEqual(args[0], args[1])}, nil
+}
+
+func builtinEqQ(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("eq?: expected 2 arguments, got %d", len(args))
+	}
+	a, b := args[0], args[1]
+	switch av := a.(type) {
+	case *IntVal:
+		if bv, ok := b.(*IntVal); ok {
+			return &BoolVal{Val: av.Val == bv.Val}, nil
+		}
+	case *BoolVal:
+		if bv, ok := b.(*BoolVal); ok {
+			return &BoolVal{Val: av.Val == bv.Val}, nil
+		}
+	case *SymbolVal:
+		if bv, ok := b.(*SymbolVal); ok {
+			return &BoolVal{Val: av.Name == bv.Name}, nil
+		}
+	case *CharVal:
+		if bv, ok := b.(*CharVal); ok {
+			return &BoolVal{Val: av.Val == bv.Val}, nil
+		}
+	case *NilVal:
+		_, ok := b.(*NilVal)
+		return &BoolVal{Val: ok}, nil
+	}
+	return &BoolVal{Val: a == b}, nil
+}
+
+func builtinAssoc(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("assoc: expected 2 arguments, got %d", len(args))
+	}
+	key := args[0]
+	cur := args[1]
+	for {
+		switch v := cur.(type) {
+		case *NilVal:
+			return &BoolVal{Val: false}, nil
+		case *PairVal:
+			pair, ok := v.Car.(*PairVal)
+			if !ok {
+				return nil, fmt.Errorf("assoc: expected list of pairs")
+			}
+			if schemeEqual(pair.Car, key) {
+				return pair, nil
+			}
+			cur = v.Cdr
+		default:
+			return nil, fmt.Errorf("assoc: expected list")
+		}
+	}
+}
+
+// Char builtins
+
+func builtinCharAlphaQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("char-alphabetic?: expected 1 argument, got %d", len(args))
+	}
+	c, ok := args[0].(*CharVal)
+	if !ok {
+		return nil, fmt.Errorf("char-alphabetic?: expected char, got %s", args[0].String())
+	}
+	return &BoolVal{Val: unicode.IsLetter(c.Val)}, nil
+}
+
+func builtinCharNumericQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("char-numeric?: expected 1 argument, got %d", len(args))
+	}
+	c, ok := args[0].(*CharVal)
+	if !ok {
+		return nil, fmt.Errorf("char-numeric?: expected char, got %s", args[0].String())
+	}
+	return &BoolVal{Val: unicode.IsDigit(c.Val)}, nil
+}
+
+func builtinCharUpcase(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("char-upcase: expected 1 argument, got %d", len(args))
+	}
+	c, ok := args[0].(*CharVal)
+	if !ok {
+		return nil, fmt.Errorf("char-upcase: expected char, got %s", args[0].String())
+	}
+	return &CharVal{Val: unicode.ToUpper(c.Val)}, nil
+}
+
+func builtinCharDowncase(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("char-downcase: expected 1 argument, got %d", len(args))
+	}
+	c, ok := args[0].(*CharVal)
+	if !ok {
+		return nil, fmt.Errorf("char-downcase: expected char, got %s", args[0].String())
+	}
+	return &CharVal{Val: unicode.ToLower(c.Val)}, nil
+}
+
+func builtinCharEqQ(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("char=?: expected 2 arguments, got %d", len(args))
+	}
+	a, ok := args[0].(*CharVal)
+	if !ok {
+		return nil, fmt.Errorf("char=?: expected char, got %s", args[0].String())
+	}
+	b, ok := args[1].(*CharVal)
+	if !ok {
+		return nil, fmt.Errorf("char=?: expected char, got %s", args[1].String())
+	}
+	return &BoolVal{Val: a.Val == b.Val}, nil
+}
+
+func builtinCharLtQ(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("char<?: expected 2 arguments, got %d", len(args))
+	}
+	a, ok := args[0].(*CharVal)
+	if !ok {
+		return nil, fmt.Errorf("char<?: expected char, got %s", args[0].String())
+	}
+	b, ok := args[1].(*CharVal)
+	if !ok {
+		return nil, fmt.Errorf("char<?: expected char, got %s", args[1].String())
+	}
+	return &BoolVal{Val: a.Val < b.Val}, nil
+}
+
+// String comparison builtins
+
+func builtinStringEqQ(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("string=?: expected 2 arguments, got %d", len(args))
+	}
+	a, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, fmt.Errorf("string=?: expected string, got %s", args[0].String())
+	}
+	b, ok := args[1].(*StringVal)
+	if !ok {
+		return nil, fmt.Errorf("string=?: expected string, got %s", args[1].String())
+	}
+	return &BoolVal{Val: a.Val == b.Val}, nil
+}
+
+func builtinStringLtQ(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("string<?: expected 2 arguments, got %d", len(args))
+	}
+	a, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, fmt.Errorf("string<?: expected string, got %s", args[0].String())
+	}
+	b, ok := args[1].(*StringVal)
+	if !ok {
+		return nil, fmt.Errorf("string<?: expected string, got %s", args[1].String())
+	}
+	return &BoolVal{Val: a.Val < b.Val}, nil
+}
+
+func builtinStringCiEqQ(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("string-ci=?: expected 2 arguments, got %d", len(args))
+	}
+	a, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, fmt.Errorf("string-ci=?: expected string, got %s", args[0].String())
+	}
+	b, ok := args[1].(*StringVal)
+	if !ok {
+		return nil, fmt.Errorf("string-ci=?: expected string, got %s", args[1].String())
+	}
+	return &BoolVal{Val: strings.EqualFold(a.Val, b.Val)}, nil
+}
+
+func builtinStringUpcase(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("string-upcase: expected 1 argument, got %d", len(args))
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, fmt.Errorf("string-upcase: expected string, got %s", args[0].String())
+	}
+	return &StringVal{Val: strings.ToUpper(s.Val)}, nil
+}
+
+func builtinStringDowncase(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("string-downcase: expected 1 argument, got %d", len(args))
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, fmt.Errorf("string-downcase: expected string, got %s", args[0].String())
+	}
+	return &StringVal{Val: strings.ToLower(s.Val)}, nil
+}
+
+func builtinGe(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf(">=: expected 2 arguments")
+	}
+	nums, err := requireInts(">=", args)
+	if err != nil {
+		return nil, err
+	}
+	return &BoolVal{Val: nums[0] >= nums[1]}, nil
 }
