@@ -2,6 +2,7 @@ package ming
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"unicode"
@@ -23,6 +24,8 @@ const (
 	valChar
 	valBuiltin
 	valMacro
+	valRational
+	valFloat
 )
 
 type pair struct {
@@ -55,6 +58,9 @@ type value struct {
 	bval   bool
 	sval   string
 	cval   rune
+	fval   float64
+	numer  int64 // rational numerator
+	denom  int64 // rational denominator (always > 0)
 	pair   *pair
 	lambda *lambda
 	macro  *macro
@@ -77,6 +83,66 @@ func boolVal(b bool) value  { return value{kind: valBoolean, bval: b} }
 func strVal(s string) value { return value{kind: valString, sval: s} }
 func symVal(s string) value { return value{kind: valSymbol, sval: s} }
 func charVal(c rune) value  { return value{kind: valChar, cval: c} }
+func floatVal(f float64) value { return value{kind: valFloat, fval: f} }
+
+func gcd(a, b int64) int64 {
+	if a < 0 {
+		a = -a
+	}
+	if b < 0 {
+		b = -b
+	}
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+// ratOrIntVal creates a rational value, simplifying to integer if denom==1.
+func ratOrIntVal(n, d int64) value {
+	if d == 0 {
+		panic("zero denominator")
+	}
+	if d < 0 {
+		n, d = -n, -d
+	}
+	g := gcd(n, d)
+	n, d = n/g, d/g
+	if d == 1 {
+		return intVal(n)
+	}
+	return value{kind: valRational, numer: n, denom: d}
+}
+
+func isNumber(v value) bool {
+	return v.kind == valInteger || v.kind == valRational || v.kind == valFloat
+}
+
+// toRational converts an integer or rational to (numer, denom).
+func toRational(v value) (int64, int64) {
+	switch v.kind {
+	case valInteger:
+		return v.ival, 1
+	case valRational:
+		return v.numer, v.denom
+	default:
+		panic("toRational on non-exact")
+	}
+}
+
+func toFloat64(v value) float64 {
+	switch v.kind {
+	case valInteger:
+		return float64(v.ival)
+	case valRational:
+		return float64(v.numer) / float64(v.denom)
+	case valFloat:
+		return v.fval
+	default:
+		return 0
+	}
+}
+
 func pairVal(car, cdr value) value {
 	return value{kind: valPair, pair: &pair{car: car, cdr: cdr}}
 }
@@ -114,6 +180,15 @@ func (v value) String() string {
 		default:
 			return fmt.Sprintf("#\\%c", v.cval)
 		}
+	case valRational:
+		return fmt.Sprintf("%d/%d", v.numer, v.denom)
+	case valFloat:
+		s := strconv.FormatFloat(v.fval, 'f', -1, 64)
+		// Ensure there's a decimal point
+		if !strings.Contains(s, ".") {
+			s += ".0"
+		}
+		return s
 	case valLambda:
 		return "#<procedure>"
 	case valBuiltin:
@@ -477,6 +552,21 @@ func parseAtom(text string) value {
 	if n, err := strconv.ParseInt(text, 10, 64); err == nil {
 		return intVal(n)
 	}
+	// Rational literal: digits/digits (e.g., 1/3, -3/4)
+	if idx := strings.Index(text, "/"); idx > 0 && idx < len(text)-1 {
+		nStr, dStr := text[:idx], text[idx+1:]
+		if n, err := strconv.ParseInt(nStr, 10, 64); err == nil {
+			if d, err2 := strconv.ParseInt(dStr, 10, 64); err2 == nil && d != 0 {
+				return ratOrIntVal(n, d)
+			}
+		}
+	}
+	// Float literal
+	if f, err := strconv.ParseFloat(text, 64); err == nil {
+		if strings.ContainsAny(text, ".eE") {
+			return floatVal(f)
+		}
+	}
 	return symVal(text)
 }
 
@@ -775,7 +865,10 @@ func isBuiltin(name string) bool {
 		"list-ref", "list-tail", "list?", "assoc", "map",
 		"char=?", "char<?", "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
 		"string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
-		"eq?", "equal?":
+		"eq?", "equal?",
+		"integer?", "rational?", "exact?", "inexact?",
+		"exact->inexact", "inexact->exact",
+		"numerator", "denominator":
 		return true
 	}
 	return false
@@ -784,73 +877,73 @@ func isBuiltin(name string) bool {
 func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error) {
 	switch name {
 	case "+":
-		var sum int64 = 0
+		result := intVal(0)
 		for _, v := range args {
-			if v.kind != valInteger {
+			if !isNumber(v) {
 				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: +: expected number", e.line, e.col)}
 			}
-			sum += v.ival
+			result = numAdd(result, v)
 		}
-		return intVal(sum), nil
+		return result, nil
 
 	case "-":
 		if len(args) == 0 {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected at least 1 argument", e.line, e.col)}
 		}
-		if args[0].kind != valInteger {
+		if !isNumber(args[0]) {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected number", e.line, e.col)}
 		}
 		if len(args) == 1 {
-			return intVal(-args[0].ival), nil
+			return numNeg(args[0]), nil
 		}
-		result := args[0].ival
+		result := args[0]
 		for _, v := range args[1:] {
-			if v.kind != valInteger {
+			if !isNumber(v) {
 				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected number", e.line, e.col)}
 			}
-			result -= v.ival
+			result = numSub(result, v)
 		}
-		return intVal(result), nil
+		return result, nil
 
 	case "*":
-		var product int64 = 1
+		result := intVal(1)
 		for _, v := range args {
-			if v.kind != valInteger {
+			if !isNumber(v) {
 				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: *: expected number", e.line, e.col)}
 			}
-			product *= v.ival
+			result = numMul(result, v)
 		}
-		return intVal(product), nil
+		return result, nil
 
 	case "/":
 		if len(args) < 2 {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected at least 2 arguments", e.line, e.col)}
 		}
-		if args[0].kind != valInteger {
+		if !isNumber(args[0]) {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected number", e.line, e.col)}
 		}
-		result := args[0].ival
+		result := args[0]
 		for _, v := range args[1:] {
-			if v.kind != valInteger {
+			if !isNumber(v) {
 				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected number", e.line, e.col)}
 			}
-			if v.ival == 0 {
+			if numIsZero(v) {
 				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: /: division by zero", e.line, e.col)}
 			}
-			result /= v.ival
+			result = numDiv(result, v)
 		}
-		return intVal(result), nil
+		return result, nil
 
 	case "<":
-		return evalCompareVals(args, e, func(a, b int64) bool { return a < b }, "<")
+		return evalNumCompare(args, e, func(a, b float64) bool { return a < b }, "<")
 	case ">":
-		return evalCompareVals(args, e, func(a, b int64) bool { return a > b }, ">")
+		return evalNumCompare(args, e, func(a, b float64) bool { return a > b }, ">")
 	case "=":
-		return evalCompareVals(args, e, func(a, b int64) bool { return a == b }, "=")
+		return evalNumCompare(args, e, func(a, b float64) bool { return a == b }, "=")
 	case "<=":
-		return evalCompareVals(args, e, func(a, b int64) bool { return a <= b }, "<=")
+		return evalNumCompare(args, e, func(a, b float64) bool { return a <= b }, "<=")
 	case ">=":
-		return evalCompareVals(args, e, func(a, b int64) bool { return a >= b }, ">=")
+		return evalNumCompare(args, e, func(a, b float64) bool { return a >= b }, ">=")
 
 	case "not":
 		if len(args) != 1 {
@@ -920,7 +1013,84 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 		if len(args) != 1 {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: number?: expected 1 argument", e.line, e.col)}
 		}
-		return boolVal(args[0].kind == valInteger), nil
+		return boolVal(isNumber(args[0])), nil
+
+	case "integer?":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: integer?: expected 1 argument", e.line, e.col)}
+		}
+		switch args[0].kind {
+		case valInteger:
+			return boolVal(true), nil
+		case valRational:
+			// 4/2 simplifies to integer, but if it's still rational, it's not integer
+			return boolVal(false), nil
+		case valFloat:
+			f := args[0].fval
+			return boolVal(f == math.Trunc(f) && !math.IsInf(f, 0) && !math.IsNaN(f)), nil
+		default:
+			return boolVal(false), nil
+		}
+
+	case "rational?":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: rational?: expected 1 argument", e.line, e.col)}
+		}
+		return boolVal(args[0].kind == valInteger || args[0].kind == valRational), nil
+
+	case "exact?":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: exact?: expected 1 argument", e.line, e.col)}
+		}
+		return boolVal(args[0].kind == valInteger || args[0].kind == valRational), nil
+
+	case "inexact?":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: inexact?: expected 1 argument", e.line, e.col)}
+		}
+		return boolVal(args[0].kind == valFloat), nil
+
+	case "exact->inexact":
+		if len(args) != 1 || !isNumber(args[0]) {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: exact->inexact: expected 1 number", e.line, e.col)}
+		}
+		return floatVal(toFloat64(args[0])), nil
+
+	case "inexact->exact":
+		if len(args) != 1 || !isNumber(args[0]) {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: inexact->exact: expected 1 number", e.line, e.col)}
+		}
+		if args[0].kind == valInteger || args[0].kind == valRational {
+			return args[0], nil
+		}
+		// Convert float to rational via continued fraction approximation
+		return floatToExact(args[0].fval), nil
+
+	case "numerator":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: numerator: expected 1 argument", e.line, e.col)}
+		}
+		switch args[0].kind {
+		case valInteger:
+			return args[0], nil
+		case valRational:
+			return intVal(args[0].numer), nil
+		default:
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: numerator: expected rational", e.line, e.col)}
+		}
+
+	case "denominator":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: denominator: expected 1 argument", e.line, e.col)}
+		}
+		switch args[0].kind {
+		case valInteger:
+			return intVal(1), nil
+		case valRational:
+			return intVal(args[0].denom), nil
+		default:
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: denominator: expected rational", e.line, e.col)}
+		}
 
 	case "boolean?":
 		if len(args) != 1 {
@@ -1052,20 +1222,23 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 		if args[0].kind != valString {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string->number: expected string", e.line, e.col)}
 		}
-		n, err := strconv.ParseInt(args[0].strContent(), 10, 64)
-		if err != nil {
-			return boolVal(false), nil
+		s := args[0].strContent()
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return intVal(n), nil
 		}
-		return intVal(n), nil
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return floatVal(f), nil
+		}
+		return boolVal(false), nil
 
 	case "number->string":
 		if len(args) != 1 {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: number->string: expected 1 argument", e.line, e.col)}
 		}
-		if args[0].kind != valInteger {
+		if !isNumber(args[0]) {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: number->string: expected number", e.line, e.col)}
 		}
-		return strVal(strconv.FormatInt(args[0].ival, 10)), nil
+		return strVal(args[0].String()), nil
 
 	case "symbol->string":
 		if len(args) != 1 {
@@ -1430,6 +1603,10 @@ func valuesEq(a, b value) bool {
 	switch a.kind {
 	case valInteger:
 		return a.ival == b.ival
+	case valRational:
+		return a.numer == b.numer && a.denom == b.denom
+	case valFloat:
+		return a.fval == b.fval
 	case valBoolean:
 		return a.bval == b.bval
 	case valSymbol:
@@ -1450,11 +1627,19 @@ func valuesEq(a, b value) bool {
 // valuesEqual implements equal? — deep structural equality.
 func valuesEqual(a, b value) bool {
 	if a.kind != b.kind {
+		// Cross-numeric comparison
+		if isNumber(a) && isNumber(b) {
+			return toFloat64(a) == toFloat64(b)
+		}
 		return false
 	}
 	switch a.kind {
 	case valInteger:
 		return a.ival == b.ival
+	case valRational:
+		return a.numer == b.numer && a.denom == b.denom
+	case valFloat:
+		return a.fval == b.fval
 	case valBoolean:
 		return a.bval == b.bval
 	case valSymbol:
@@ -1472,24 +1657,115 @@ func valuesEqual(a, b value) bool {
 	}
 }
 
-func evalCompareVals(args []value, e *expr, cmp func(int64, int64) bool, name string) (value, error) {
+func evalNumCompare(args []value, e *expr, cmp func(float64, float64) bool, name string) (value, error) {
 	if len(args) < 2 {
 		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected at least 2 arguments", e.line, e.col, name)}
 	}
-	if args[0].kind != valInteger {
+	if !isNumber(args[0]) {
 		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected number", e.line, e.col, name)}
 	}
-	prev := args[0]
+	prev := toFloat64(args[0])
 	for _, v := range args[1:] {
-		if v.kind != valInteger {
+		if !isNumber(v) {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected number", e.line, e.col, name)}
 		}
-		if !cmp(prev.ival, v.ival) {
+		cur := toFloat64(v)
+		if !cmp(prev, cur) {
 			return boolVal(false), nil
 		}
-		prev = v
+		prev = cur
 	}
 	return boolVal(true), nil
+}
+
+// ---------- Numeric tower arithmetic ----------
+
+func numIsZero(v value) bool {
+	switch v.kind {
+	case valInteger:
+		return v.ival == 0
+	case valRational:
+		return v.numer == 0
+	case valFloat:
+		return v.fval == 0
+	}
+	return false
+}
+
+func numNeg(v value) value {
+	switch v.kind {
+	case valInteger:
+		return intVal(-v.ival)
+	case valRational:
+		return value{kind: valRational, numer: -v.numer, denom: v.denom}
+	case valFloat:
+		return floatVal(-v.fval)
+	}
+	return v
+}
+
+func numAdd(a, b value) value {
+	if a.kind == valFloat || b.kind == valFloat {
+		return floatVal(toFloat64(a) + toFloat64(b))
+	}
+	an, ad := toRational(a)
+	bn, bd := toRational(b)
+	return ratOrIntVal(an*bd+bn*ad, ad*bd)
+}
+
+func numSub(a, b value) value {
+	if a.kind == valFloat || b.kind == valFloat {
+		return floatVal(toFloat64(a) - toFloat64(b))
+	}
+	an, ad := toRational(a)
+	bn, bd := toRational(b)
+	return ratOrIntVal(an*bd-bn*ad, ad*bd)
+}
+
+func numMul(a, b value) value {
+	if a.kind == valFloat || b.kind == valFloat {
+		return floatVal(toFloat64(a) * toFloat64(b))
+	}
+	an, ad := toRational(a)
+	bn, bd := toRational(b)
+	return ratOrIntVal(an*bn, ad*bd)
+}
+
+func numDiv(a, b value) value {
+	if a.kind == valFloat || b.kind == valFloat {
+		return floatVal(toFloat64(a) / toFloat64(b))
+	}
+	an, ad := toRational(a)
+	bn, bd := toRational(b)
+	return ratOrIntVal(an*bd, ad*bn)
+}
+
+// floatToExact converts a float64 to an exact rational using simple fraction approximation.
+func floatToExact(f float64) value {
+	if f == math.Trunc(f) {
+		return intVal(int64(f))
+	}
+	// Use a power-of-2 denominator approach for common cases
+	// Try denominators up to 2^30
+	const maxDenom int64 = 1 << 30
+	bestN, bestD := int64(0), int64(1)
+	bestErr := math.Abs(f)
+	for d := int64(1); d <= maxDenom; d++ {
+		n := int64(math.Round(f * float64(d)))
+		err := math.Abs(f - float64(n)/float64(d))
+		if err < bestErr {
+			bestN, bestD = n, d
+			bestErr = err
+			if err == 0 {
+				break
+			}
+		}
+		if err < 1e-15 {
+			bestN, bestD = n, d
+			break
+		}
+	}
+	return ratOrIntVal(bestN, bestD)
 }
 
 func evalAnd(e *expr, env *env) (value, error) {
@@ -1966,6 +2242,9 @@ func makeTopLevelEnv() *env {
 		"char=?", "char<?", "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
 		"string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
 		"eq?", "equal?",
+		"integer?", "rational?", "exact?", "inexact?",
+		"exact->inexact", "inexact->exact",
+		"numerator", "denominator",
 	}
 	for _, name := range builtins {
 		e.set(name, builtinVal(name))
