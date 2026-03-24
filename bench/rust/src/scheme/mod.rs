@@ -12,8 +12,8 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parser::parse_all(&tokens)?;
     let env = Env::default_env();
     let mut last = eval::Value::Void;
-    for expr in exprs {
-        last = eval::eval(&expr, &env)?;
+    for expr in &exprs {
+        last = eval::eval(expr, &env)?;
     }
     Ok(last.to_display())
 }
