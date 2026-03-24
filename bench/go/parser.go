@@ -18,6 +18,7 @@ const (
 	tokBool
 	tokSymbol
 	tokQuote
+	tokChar
 	tokEOF
 )
 
@@ -112,7 +113,7 @@ func tokenize(input string) ([]token, error) {
 			continue
 		}
 
-		// #t, #f
+		// #t, #f, #\char
 		if ch == '#' && i+1 < len(input) {
 			next := input[i+1]
 			if next == 't' || next == 'f' {
@@ -124,6 +125,34 @@ func tokenize(input string) ([]token, error) {
 					col += 2
 					continue
 				}
+			}
+			if next == '\\' {
+				// character literal
+				if i+2 >= len(input) {
+					return nil, fmt.Errorf("%d:%d: incomplete character literal", startLine, startCol)
+				}
+				// read the character name
+				j := i + 2
+				// read word characters for named chars (space, newline, tab)
+				if j < len(input) && ((input[j] >= 'a' && input[j] <= 'z') || (input[j] >= 'A' && input[j] <= 'Z')) {
+					start := j
+					for j < len(input) && !isDelimiter(input[j]) {
+						j++
+					}
+					name := input[start:j]
+					text := input[i:j]
+					col += j - i
+					i = j
+					tokens = append(tokens, token{tokChar, text, startLine, startCol})
+					_ = name
+					continue
+				}
+				// single non-alpha character like #\( or #\)
+				text := input[i : i+3]
+				i += 3
+				col += 3
+				tokens = append(tokens, token{tokChar, text, startLine, startCol})
+				continue
 			}
 		}
 
@@ -171,6 +200,7 @@ type Expr struct {
 	IVal   int64
 	SVal   string
 	BVal   bool
+	RVal   rune
 	// list
 	List []*Expr
 	// position
@@ -185,6 +215,7 @@ const (
 	ExprString
 	ExprSymbol
 	ExprList
+	ExprChar
 )
 
 // parser
@@ -232,6 +263,26 @@ func (p *parser) parseExpr() (*Expr, error) {
 	case tokBool:
 		p.next()
 		return &Expr{Kind: ExprBool, BVal: t.text == "#t", Line: t.line, Col: t.col}, nil
+
+	case tokChar:
+		p.next()
+		name := t.text[2:] // strip #\
+		var r rune
+		switch strings.ToLower(name) {
+		case "space":
+			r = ' '
+		case "newline":
+			r = '\n'
+		case "tab":
+			r = '\t'
+		default:
+			runes := []rune(name)
+			if len(runes) != 1 {
+				return nil, fmt.Errorf("%d:%d: invalid character literal %s", t.line, t.col, t.text)
+			}
+			r = runes[0]
+		}
+		return &Expr{Kind: ExprChar, RVal: r, Line: t.line, Col: t.col}, nil
 
 	case tokString:
 		p.next()

@@ -67,6 +67,8 @@ func eval(expr *Expr, env *Env) (Value, error) {
 		return &BoolVal{Val: expr.BVal}, nil
 	case ExprString:
 		return &StringVal{Val: expr.SVal}, nil
+	case ExprChar:
+		return &CharVal{Val: expr.RVal}, nil
 	case ExprSymbol:
 		v, ok := env.Get(expr.SVal)
 		if !ok {
@@ -243,6 +245,10 @@ func defaultEnv(output *strings.Builder) *Env {
 	env.Set("string->symbol", &BuiltinFunc{Name: "string->symbol", Fn: builtinStringToSymbol})
 	env.Set("string-ref", &BuiltinFunc{Name: "string-ref", Fn: builtinStringRef})
 	env.Set("char?", &BuiltinFunc{Name: "char?", Fn: builtinCharQ})
+
+	// L06 builtins — mutable strings
+	env.Set("string-copy", &BuiltinFunc{Name: "string-copy", Fn: builtinStringCopy})
+	env.Set("string-set!", &BuiltinFunc{Name: "string-set!", Fn: builtinStringSet})
 
 	return env
 }
@@ -886,4 +892,42 @@ func builtinCharQ(args []Value) (Value, error) {
 	}
 	_, ok := args[0].(*CharVal)
 	return &BoolVal{Val: ok}, nil
+}
+
+// L06 builtins
+
+func builtinStringCopy(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("string-copy: expected 1 argument, got %d", len(args))
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, fmt.Errorf("string-copy: expected string, got %s", args[0].String())
+	}
+	return &StringVal{Val: s.Val}, nil
+}
+
+func builtinStringSet(args []Value) (Value, error) {
+	if len(args) != 3 {
+		return nil, fmt.Errorf("string-set!: expected 3 arguments, got %d", len(args))
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, fmt.Errorf("string-set!: expected string, got %s", args[0].String())
+	}
+	idx, ok := args[1].(*IntVal)
+	if !ok {
+		return nil, fmt.Errorf("string-set!: expected number, got %s", args[1].String())
+	}
+	ch, ok := args[2].(*CharVal)
+	if !ok {
+		return nil, fmt.Errorf("string-set!: expected char, got %s", args[2].String())
+	}
+	runes := []rune(s.Val)
+	if idx.Val < 0 || int(idx.Val) >= len(runes) {
+		return nil, fmt.Errorf("string-set!: index out of range")
+	}
+	runes[idx.Val] = ch.Val
+	s.Val = string(runes)
+	return &VoidVal{}, nil
 }
