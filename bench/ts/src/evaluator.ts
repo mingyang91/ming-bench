@@ -30,6 +30,23 @@ class ContinuationReturn {
   constructor(public kont: Kont, public value: SchemeVal, public windStack: WindFrame[] = []) {}
 }
 
+class SchemeRaiseSignal {
+  constructor(public value: SchemeVal) {}
+}
+
+class ExHandlerEntry {
+  active = true;
+  constructor(
+    public type: 'weh' | 'guard',
+    public handler?: SchemeVal,           // weh only
+    public guardKont?: Kont,              // guard only
+    public guardWindStack?: WindFrame[],  // guard only
+    public guardClauses?: SchemeVal[],    // guard only
+    public guardVar?: string,             // guard only
+    public guardEnv?: Env,                // guard only
+  ) {}
+}
+
 type Kont = KontFrame | DwFrame | null;
 
 type KontFrame = { next: Kont } & KontData;
@@ -66,6 +83,8 @@ type KontData =
   | { tag: 'do-test'; varNames: string[]; stepExprs: (SchemeVal|undefined)[]; testExpr: SchemeVal; resultExprs: SchemeVal[]; bodyExprs: SchemeVal[]; env: Env }
   | { tag: 'do-body'; varNames: string[]; stepExprs: (SchemeVal|undefined)[]; testExpr: SchemeVal; resultExprs: SchemeVal[]; bodyExprs: SchemeVal[]; bodyIdx: number; env: Env }
   | { tag: 'do-step'; varNames: string[]; stepExprs: (SchemeVal|undefined)[]; stepIdx: number; newVals: (SchemeVal|undefined)[]; testExpr: SchemeVal; resultExprs: SchemeVal[]; bodyExprs: SchemeVal[]; env: Env }
+  | { tag: 'handler-pop'; entry: ExHandlerEntry }
+  | { tag: 'guard-clauses'; varName: string; clauses: SchemeVal[]; env: Env; pos?: Pos }
 ;
 
 // --- Parser ---
@@ -1551,6 +1570,14 @@ function makeGlobalEnv(outputBuf: string[]): Env {
   const dwBuiltin: SchemeVal = { tag: 'builtin', name: 'dynamic-wind', func: () => { throw new Error('dynamic-wind: must be intercepted by CEK machine'); } };
   envDefine(env, 'dynamic-wind', dwBuiltin);
 
+  // raise — handled specially by the CEK machine
+  const raiseBuiltin: SchemeVal = { tag: 'builtin', name: 'raise', func: () => { throw new Error('raise: must be intercepted by CEK machine'); } };
+  envDefine(env, 'raise', raiseBuiltin);
+
+  // with-exception-handler — handled specially by the CEK machine
+  const wehBuiltin: SchemeVal = { tag: 'builtin', name: 'with-exception-handler', func: () => { throw new Error('with-exception-handler: must be intercepted by CEK machine'); } };
+  envDefine(env, 'with-exception-handler', wehBuiltin);
+
   return env;
 }
 
@@ -1559,7 +1586,7 @@ function makeGlobalEnv(outputBuf: string[]): Env {
 const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'lambda', 'and', 'or', 'not', 'begin',
   'cond', 'set!', 'string-set!', 'let', 'let*', 'letrec', 'letrec*', 'case', 'do',
-  'define-syntax', 'define-record-type', 'case-lambda'
+  'define-syntax', 'define-record-type', 'case-lambda', 'guard'
 ]);
 
 type MacroBindings = Map<string, SchemeVal | SchemeVal[]>;
@@ -1749,6 +1776,7 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
   let val: SchemeVal = { tag: 'void' };
   let windStack: WindFrame[] = [];
   let windTarget: { kont: Kont; val: SchemeVal; windStack: WindFrame[] } | null = null;
+  const exceptionHandlers: ExHandlerEntry[] = [];
 
   // Deep copy continuation chain (needed for call/cc to snapshot mutable frames)
   function copyKont(k: Kont): Kont {
@@ -1805,6 +1833,19 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
       const [inThunk, bodyThunk, outThunk] = args;
       kont = { tag: 'dw', phase: 0, next: kont, bodyThunk, outThunk, inThunk };
       applyFunc(inThunk, [], pos);
+      return;
+    }
+    if (func.tag === 'builtin' && func.name === 'raise') {
+      if (args.length !== 1) throw new EvalError(`${fmtPos(pos)}raise: expected 1 argument`);
+      throw new SchemeRaiseSignal(args[0]);
+    }
+    if (func.tag === 'builtin' && func.name === 'with-exception-handler') {
+      if (args.length !== 2) throw new EvalError(`${fmtPos(pos)}with-exception-handler: expected 2 arguments`);
+      const [handler, thunk] = args;
+      const entry = new ExHandlerEntry('weh', handler);
+      exceptionHandlers.push(entry);
+      kont = { tag: 'handler-pop', entry, next: kont };
+      applyFunc(thunk, [], pos);
       return;
     }
     if (func.tag === 'continuation') {
@@ -2129,6 +2170,25 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
                   }
                   kont = { tag: 'do-init', specs, idx: 0, vals: [], testExpr, resultExprs, bodyExprs, outerEnv: env, pos: expr.pos, next: kont };
                   ctrl = specs[0].initExpr; break;
+                }
+
+                if (name === 'guard') {
+                  // (guard (var clause1 clause2 ...) body ...)
+                  if (elems.length < 3) throw new EvalError(`${fmtPos(expr.pos)}guard: wrong argument count`);
+                  const clauseForm = elems[1];
+                  if (clauseForm.tag !== 'list' || clauseForm.elements.length < 1 || clauseForm.elements[0].tag !== 'symbol')
+                    throw new EvalError(`${fmtPos(expr.pos)}guard: invalid syntax`);
+                  const varName = clauseForm.elements[0].value;
+                  const clauses = clauseForm.elements.slice(1);
+                  const body = elems.slice(2);
+                  // Capture guard's continuation and wind stack
+                  const guardKont = copyKont(kont);
+                  const guardWindStack = [...windStack];
+                  const entry = new ExHandlerEntry('guard', undefined, guardKont, guardWindStack, clauses, varName, env);
+                  exceptionHandlers.push(entry);
+                  kont = { tag: 'handler-pop', entry, next: kont };
+                  if (body.length > 1) kont = { tag: 'seq', exprs: body, idx: 1, env, next: kont };
+                  ctrl = body[0]; break;
                 }
 
                 if (name === 'define-record-type') {
@@ -2503,6 +2563,49 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
               ctrl = frame.testExpr; env = frame.env; break;
             }
 
+            case 'handler-pop': {
+              if (frame.entry.active) {
+                frame.entry.active = false;
+                const idx = exceptionHandlers.lastIndexOf(frame.entry);
+                if (idx >= 0) exceptionHandlers.splice(idx, 1);
+              }
+              kont = frame.next; break;
+            }
+
+            case 'guard-clauses': {
+              // val = exception value, evaluate cond-like clauses with var bound
+              const guardEnv = childEnv(frame.env);
+              envDefine(guardEnv, frame.varName, val);
+              // Process clauses like cond
+              const gclauses = frame.clauses;
+              kont = frame.next; env = guardEnv;
+              if (gclauses.length === 0) {
+                throw new EvalError(`${fmtPos(frame.pos)}guard: no matching clause`);
+              }
+              // Use cond-like processing
+              let matched = false;
+              for (let ci = 0; ci < gclauses.length; ci++) {
+                const clause = gclauses[ci];
+                if (clause.tag !== 'list' || clause.elements.length < 1)
+                  throw new EvalError(`${fmtPos(frame.pos)}guard: invalid clause`);
+                if (clause.elements[0].tag === 'symbol' && clause.elements[0].value === 'else') {
+                  const body = clause.elements.slice(1);
+                  if (body.length === 0) { val = { tag: 'void' }; matched = true; break; }
+                  if (body.length > 1) kont = { tag: 'seq', exprs: body, idx: 1, env: guardEnv, next: kont };
+                  ctrl = body[0]; matched = true; break;
+                }
+              }
+              if (!matched) {
+                // First clause test, then continue with rest via cond-test frames
+                const firstClause = gclauses[0];
+                if (firstClause.tag !== 'list') throw new EvalError(`${fmtPos(frame.pos)}guard: invalid clause`);
+                const restClauses = gclauses.slice(1);
+                kont = { tag: 'cond-test', clauseElems: firstClause.elements, restClauses, env: guardEnv, pos: frame.pos, next: kont };
+                ctrl = firstClause.elements[0]; env = guardEnv;
+              }
+              break;
+            }
+
           }
         }
       }
@@ -2510,6 +2613,40 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
       if (e instanceof ContinuationReturn) {
         invokeContinuation(e.kont, e.windStack, e.value);
         continue;
+      }
+      if (e instanceof SchemeRaiseSignal) {
+        // Find the topmost active handler
+        let handler: ExHandlerEntry | undefined;
+        while (exceptionHandlers.length > 0) {
+          const top = exceptionHandlers[exceptionHandlers.length - 1];
+          if (top.active) {
+            top.active = false;
+            exceptionHandlers.pop();
+            handler = top;
+            break;
+          }
+          exceptionHandlers.pop();
+        }
+        if (!handler) {
+          throw new EvalError(`unhandled exception: ${schemeToString(e.value)}`);
+        }
+        if (handler.type === 'weh') {
+          // Call handler procedure at current continuation (raise's continuation)
+          applyFunc(handler.handler!, [e.value]);
+          continue;
+        }
+        if (handler.type === 'guard') {
+          // Set up guard-clauses frame on top of guard's saved continuation
+          const guardClausesFrame: KontFrame = {
+            tag: 'guard-clauses',
+            varName: handler.guardVar!,
+            clauses: handler.guardClauses!,
+            env: handler.guardEnv!,
+            next: handler.guardKont!,
+          };
+          invokeContinuation(guardClausesFrame, handler.guardWindStack!, e.value);
+          continue;
+        }
       }
       throw e;
     }
