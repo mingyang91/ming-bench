@@ -32,6 +32,7 @@ const (
 	valVector
 	valTailCall
 	valContinuation
+	valMultipleValues
 )
 
 type tailCall struct {
@@ -93,8 +94,9 @@ type value struct {
 	clauses []*lambda   // case-lambda clauses
 	vec     *[]value   // vector storage (mutable)
 	tc      *tailCall  // tail call info (for valTailCall)
-	cont    kont           // for valContinuation
-	wind    []*windEntry   // captured wind stack for valContinuation
+	cont      kont           // for valContinuation
+	wind      []*windEntry   // captured wind stack for valContinuation
+	multiVals *[]value       // for valMultipleValues
 }
 
 var voidVal = value{kind: valVoid}
@@ -1055,7 +1057,8 @@ func isBuiltin(name string) bool {
 		"memv", "assv", "member",
 		"caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "cadddr",
 		"call/cc", "call-with-current-continuation",
-		"dynamic-wind":
+		"dynamic-wind",
+		"values", "call-with-values":
 		return true
 	}
 	return false
@@ -3304,6 +3307,7 @@ func makeTopLevelEnv() *env {
 		"call/cc", "call-with-current-continuation",
 		"dynamic-wind",
 		"raise", "with-exception-handler",
+		"values", "call-with-values",
 	}
 	for _, name := range builtins {
 		e.set(name, builtinVal(name))

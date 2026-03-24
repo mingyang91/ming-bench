@@ -353,6 +353,18 @@ type kontGuardElseBody struct {
 
 func (*kontGuardElseBody) isKont() {}
 
+// ---------- call-with-values ----------
+
+// After producer thunk returns, apply consumer to the produced values.
+type kontCallWithValues struct {
+	consumer value
+	callExpr *expr
+	callEnv  *env
+	parent   kont
+}
+
+func (*kontCallWithValues) isKont() {}
+
 // ---------- CEK machine ----------
 
 type cekM struct {
@@ -1209,6 +1221,16 @@ func (m *cekM) stepApply() error {
 		})
 		return nil
 
+	case *kontCallWithValues:
+		// Producer returned; unpack multiple values and apply consumer
+		var consumerArgs []value
+		if val.kind == valMultipleValues {
+			consumerArgs = *val.multiVals
+		} else {
+			consumerArgs = []value{val}
+		}
+		return m.applyProc(kk.consumer, consumerArgs, kk.callExpr, kk.callEnv, kk.parent)
+
 	default:
 		return &EvalError{Message: "internal: unknown continuation frame"}
 	}
@@ -1299,6 +1321,29 @@ func (m *cekM) applyBuiltinCEK(op value, args []value, callExpr *expr, callEnv *
 		return m.applyProc(inThunk, nil, callExpr, callEnv, &kontDynWindIn{
 			bodyThunk: bodyThunk, outThunk: outThunk, inThunk: inThunk,
 			callExpr: callExpr, callEnv: callEnv, parent: k,
+		})
+
+	case "values":
+		if len(args) == 1 {
+			// Single value is transparent
+			m.setApply(args[0], k)
+			return nil
+		}
+		mv := value{kind: valMultipleValues, multiVals: &args}
+		m.setApply(mv, k)
+		return nil
+
+	case "call-with-values":
+		if len(args) != 2 {
+			return &EvalError{Message: fmt.Sprintf("%d:%d: call-with-values: expected 2 arguments", callExpr.line, callExpr.col)}
+		}
+		producer, consumer := args[0], args[1]
+		// Call producer thunk with no args, then feed results to consumer
+		return m.applyProc(producer, nil, callExpr, callEnv, &kontCallWithValues{
+			consumer: consumer,
+			callExpr: callExpr,
+			callEnv:  callEnv,
+			parent:   k,
 		})
 
 	case "raise":
