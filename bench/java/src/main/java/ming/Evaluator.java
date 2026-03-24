@@ -5,13 +5,19 @@ import java.util.List;
 
 public class Evaluator {
 
+    private static final Object VOID = new Object() {
+        @Override public String toString() { return "#<void>"; }
+    };
+
+    private final Environment globalEnv = new Environment();
+
     public String evalStr(String input) throws EvalError {
         List<Object> tokens = tokenize(input);
         int[] pos = {0};
         Object lastResult = null;
         while (pos[0] < tokens.size()) {
             Object expr = parse(tokens, pos);
-            lastResult = eval(expr);
+            lastResult = eval(expr, globalEnv);
         }
         if (lastResult == null) {
             throw new EvalError("no expression");
@@ -88,7 +94,6 @@ public class Evaluator {
                     i++;
                 }
                 String tok = sb.toString();
-                // Try parsing as integer
                 try {
                     tokens.add(Long.parseLong(tok));
                 } catch (NumberFormatException e) {
@@ -128,38 +133,33 @@ public class Evaluator {
     // --- Evaluator ---
 
     @SuppressWarnings("unchecked")
-    private Object eval(Object expr) throws EvalError {
+    private Object eval(Object expr, Environment env) throws EvalError {
         if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString) {
             return expr;
         }
         if (expr instanceof String symbol) {
-            throw new EvalError("unbound variable: " + symbol);
+            return env.lookup(symbol);
         }
         if (expr instanceof List<?> list) {
             if (list.isEmpty()) {
                 throw new EvalError("empty application");
             }
             Object head = list.get(0);
+
+            // Special forms
             if (head instanceof String op) {
                 switch (op) {
-                    case "+" -> { return arith(list, op); }
-                    case "-" -> { return arith(list, op); }
-                    case "*" -> { return arith(list, op); }
-                    case "/" -> { return arith(list, op); }
-                    case "<" -> { return compare(list, op); }
-                    case ">" -> { return compare(list, op); }
-                    case "=" -> { return compare(list, op); }
-                    case "<=" -> { return compare(list, op); }
-                    case ">=" -> { return compare(list, op); }
-                    case "not" -> {
-                        checkArgs(list, 1, "not");
-                        Object val = eval(list.get(1));
-                        return Boolean.FALSE.equals(val) ? Boolean.TRUE : Boolean.FALSE;
+                    case "define" -> { return evalDefine(list, env); }
+                    case "if" -> { return evalIf(list, env); }
+                    case "quote" -> {
+                        if (list.size() != 2) throw new EvalError("quote: expected 1 argument");
+                        return list.get(1);
                     }
+                    case "lambda" -> { return evalLambda(list, env); }
                     case "and" -> {
                         Object result = Boolean.TRUE;
                         for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i));
+                            result = eval(list.get(i), env);
                             if (Boolean.FALSE.equals(result)) return Boolean.FALSE;
                         }
                         return result;
@@ -167,37 +167,145 @@ public class Evaluator {
                     case "or" -> {
                         Object result = Boolean.FALSE;
                         for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i));
+                            result = eval(list.get(i), env);
                             if (!Boolean.FALSE.equals(result)) return result;
                         }
                         return result;
                     }
+                    case "not" -> {
+                        checkArgs(list, 1, "not");
+                        Object val = eval(list.get(1), env);
+                        return Boolean.FALSE.equals(val) ? Boolean.TRUE : Boolean.FALSE;
+                    }
                 }
             }
-            throw new EvalError("not a procedure: " + schemeToString(head));
+
+            // Function application
+            Object proc = eval(head, env);
+            List<Object> args = new ArrayList<>();
+            for (int i = 1; i < list.size(); i++) {
+                args.add(eval(list.get(i), env));
+            }
+            return apply(proc, args);
         }
         throw new EvalError("cannot evaluate: " + expr);
     }
 
-    private Object arith(List<?> list, String op) throws EvalError {
-        if (list.size() == 1) {
-            // Zero args
+    @SuppressWarnings("unchecked")
+    private Object evalDefine(List<?> list, Environment env) throws EvalError {
+        if (list.size() < 3) throw new EvalError("define: bad syntax");
+        Object target = list.get(1);
+        if (target instanceof String name) {
+            // (define x expr)
+            Object val = eval(list.get(2), env);
+            env.define(name, val);
+            return VOID;
+        }
+        if (target instanceof List<?> sig) {
+            // (define (f params...) body...)
+            if (sig.isEmpty() || !(sig.get(0) instanceof String name)) {
+                throw new EvalError("define: bad syntax");
+            }
+            List<String> params = new ArrayList<>();
+            for (int i = 1; i < sig.size(); i++) {
+                if (!(sig.get(i) instanceof String p)) throw new EvalError("define: bad parameter");
+                params.add(p);
+            }
+            List<Object> body = new ArrayList<>();
+            for (int i = 2; i < list.size(); i++) {
+                body.add(list.get(i));
+            }
+            Lambda lambda = new Lambda(params, body, env);
+            env.define(name, lambda);
+            return VOID;
+        }
+        throw new EvalError("define: bad syntax");
+    }
+
+    private Object evalIf(List<?> list, Environment env) throws EvalError {
+        if (list.size() < 3 || list.size() > 4) throw new EvalError("if: bad syntax");
+        Object cond = eval(list.get(1), env);
+        if (!Boolean.FALSE.equals(cond)) {
+            return eval(list.get(2), env);
+        } else if (list.size() == 4) {
+            return eval(list.get(3), env);
+        }
+        return VOID;
+    }
+
+    private Object evalLambda(List<?> list, Environment env) throws EvalError {
+        if (list.size() < 3) throw new EvalError("lambda: bad syntax");
+        Object paramList = list.get(1);
+        if (!(paramList instanceof List<?> plist)) throw new EvalError("lambda: bad parameters");
+        List<String> params = new ArrayList<>();
+        for (Object p : plist) {
+            if (!(p instanceof String s)) throw new EvalError("lambda: bad parameter");
+            params.add(s);
+        }
+        List<Object> body = new ArrayList<>();
+        for (int i = 2; i < list.size(); i++) {
+            body.add(list.get(i));
+        }
+        return new Lambda(params, body, env);
+    }
+
+    private Object apply(Object proc, List<Object> args) throws EvalError {
+        if (proc instanceof Lambda lambda) {
+            if (args.size() != lambda.params.size()) {
+                throw new EvalError("wrong number of arguments: expected " + lambda.params.size() + ", got " + args.size());
+            }
+            Environment callEnv = new Environment(lambda.closure);
+            for (int i = 0; i < lambda.params.size(); i++) {
+                callEnv.define(lambda.params.get(i), args.get(i));
+            }
+            Object result = VOID;
+            for (Object bodyExpr : lambda.body) {
+                result = eval(bodyExpr, callEnv);
+            }
+            return result;
+        }
+        if (proc instanceof BuiltinProc bp) {
+            return bp.apply(args);
+        }
+        throw new EvalError("not a procedure: " + schemeToString(proc));
+    }
+
+    // Builtins are registered as BuiltinProc in the global env
+    @FunctionalInterface
+    interface BuiltinProc {
+        Object apply(List<Object> args) throws EvalError;
+    }
+
+    {
+        // Register arithmetic and comparison builtins
+        globalEnv.define("+", (BuiltinProc) args -> arith(args, "+"));
+        globalEnv.define("-", (BuiltinProc) args -> arith(args, "-"));
+        globalEnv.define("*", (BuiltinProc) args -> arith(args, "*"));
+        globalEnv.define("/", (BuiltinProc) args -> arith(args, "/"));
+        globalEnv.define("<", (BuiltinProc) args -> cmp(args, "<"));
+        globalEnv.define(">", (BuiltinProc) args -> cmp(args, ">"));
+        globalEnv.define("=", (BuiltinProc) args -> cmp(args, "="));
+        globalEnv.define("<=", (BuiltinProc) args -> cmp(args, "<="));
+        globalEnv.define(">=", (BuiltinProc) args -> cmp(args, ">="));
+    }
+
+    // Arithmetic on already-evaluated args
+    private Object arith(List<Object> args, String op) throws EvalError {
+        if (args.isEmpty()) {
             if (op.equals("+")) return 0L;
             if (op.equals("*")) return 1L;
             throw new EvalError(op + ": need at least 1 argument");
         }
-        if (op.equals("-") && list.size() == 2) {
-            // Unary minus
-            Object val = eval(list.get(1));
+        if (op.equals("-") && args.size() == 1) {
+            Object val = args.get(0);
             if (!(val instanceof Long)) throw new EvalError("-: not a number");
             return -((Long) val);
         }
-        long result;
-        Object first = eval(list.get(1));
+        Object first = args.get(0);
         if (!(first instanceof Long)) throw new EvalError(op + ": not a number");
-        result = (Long) first;
-        for (int i = 2; i < list.size(); i++) {
-            Object val = eval(list.get(i));
+        long result = (Long) first;
+        for (int i = 1; i < args.size(); i++) {
+            Object val = args.get(i);
             if (!(val instanceof Long)) throw new EvalError(op + ": not a number");
             long v = (Long) val;
             switch (op) {
@@ -213,10 +321,10 @@ public class Evaluator {
         return result;
     }
 
-    private Object compare(List<?> list, String op) throws EvalError {
-        checkArgs(list, 2, op);
-        Object a = eval(list.get(1));
-        Object b = eval(list.get(2));
+    private Object cmp(List<Object> args, String op) throws EvalError {
+        if (args.size() != 2) throw new EvalError(op + ": expected 2 arguments");
+        Object a = args.get(0);
+        Object b = args.get(1);
         if (!(a instanceof Long la) || !(b instanceof Long lb)) {
             throw new EvalError(op + ": not a number");
         }
@@ -239,10 +347,22 @@ public class Evaluator {
 
     // --- Output formatting ---
 
+    @SuppressWarnings("unchecked")
     static String schemeToString(Object val) {
         if (val instanceof Long) return val.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
+        if (val instanceof Lambda) return "#<procedure>";
+        if (val instanceof List<?> list) {
+            StringBuilder sb = new StringBuilder("(");
+            for (int i = 0; i < list.size(); i++) {
+                if (i > 0) sb.append(" ");
+                sb.append(schemeToString(list.get(i)));
+            }
+            sb.append(")");
+            return sb.toString();
+        }
+        if (val instanceof String s) return s; // symbol
         return val.toString();
     }
 }
