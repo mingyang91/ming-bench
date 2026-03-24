@@ -28,6 +28,7 @@ const (
 	valRational
 	valFloat
 	valRecord
+	valCaseLambda
 )
 
 type pair struct {
@@ -76,7 +77,8 @@ type value struct {
 	lambda *lambda
 	macro  *macro
 	mstr   *[]rune // mutable string buffer (set by string-copy)
-	rec    *record
+	rec     *record
+	clauses []*lambda // case-lambda clauses
 }
 
 var voidVal = value{kind: valVoid}
@@ -206,6 +208,8 @@ func (v value) String() string {
 	case valLambda:
 		return "#<procedure>"
 	case valBuiltin:
+		return "#<procedure>"
+	case valCaseLambda:
 		return "#<procedure>"
 	default:
 		return "<unknown>"
@@ -618,6 +622,8 @@ func evalInEnv(e *expr, env *env) (value, error) {
 			return quoteExpr(e.list[1]), nil
 		case "lambda":
 			return evalLambdaForm(e, env)
+		case "case-lambda":
+			return evalCaseLambda(e, env)
 		case "and":
 			return evalAnd(e, env)
 		case "or":
@@ -670,6 +676,8 @@ func callValue(op value, args []value, callExpr *expr, environ *env) (value, err
 	switch op.kind {
 	case valLambda:
 		return callLambda(op.lambda, args, callExpr)
+	case valCaseLambda:
+		return callCaseLambda(op.clauses, args, callExpr)
 	case valBuiltin:
 		if op.sval == "__native" {
 			nativeFuncsMu.Lock()
@@ -803,6 +811,41 @@ func evalLambdaForm(e *expr, env *env) (value, error) {
 	return value{kind: valLambda, lambda: lam}, nil
 }
 
+func evalCaseLambda(e *expr, env *env) (value, error) {
+	// (case-lambda (params body...) ...)
+	var clauses []*lambda
+	for _, clause := range e.list[1:] {
+		if clause.kind != exprList || len(clause.list) < 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: bad clause", clause.line, clause.col)}
+		}
+		paramExpr := clause.list[0]
+		if paramExpr.kind != exprList {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: expected parameter list", paramExpr.line, paramExpr.col)}
+		}
+		params, restParam, err := parseDottedParams(paramExpr.list, e)
+		if err != nil {
+			return value{}, err
+		}
+		clauses = append(clauses, &lambda{params: params, restParam: restParam, body: clause.list[1:], env: env})
+	}
+	return value{kind: valCaseLambda, clauses: clauses}, nil
+}
+
+func callCaseLambda(clauses []*lambda, args []value, callExpr *expr) (value, error) {
+	for _, lam := range clauses {
+		if lam.restParam != "" {
+			if len(args) >= len(lam.params) {
+				return callLambda(lam, args, callExpr)
+			}
+		} else {
+			if len(args) == len(lam.params) {
+				return callLambda(lam, args, callExpr)
+			}
+		}
+	}
+	return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: no matching clause for %d arguments", callExpr.line, callExpr.col, len(args))}
+}
+
 // parseDottedParams parses a parameter list that may contain dot notation: (a b . rest)
 func parseDottedParams(plist []*expr, e *expr) ([]string, string, error) {
 	var params []string
@@ -890,7 +933,8 @@ func isBuiltin(name string) bool {
 		"eq?", "equal?",
 		"integer?", "rational?", "exact?", "inexact?",
 		"exact->inexact", "inexact->exact",
-		"numerator", "denominator":
+		"numerator", "denominator",
+		"procedure?":
 		return true
 	}
 	return false
@@ -1131,6 +1175,13 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: symbol?: expected 1 argument", e.line, e.col)}
 		}
 		return boolVal(args[0].kind == valSymbol), nil
+
+	case "procedure?":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: procedure?: expected 1 argument", e.line, e.col)}
+		}
+		k := args[0].kind
+		return boolVal(k == valLambda || k == valBuiltin || k == valCaseLambda), nil
 
 	case "append":
 		if len(args) == 0 {
@@ -2402,6 +2453,7 @@ func makeTopLevelEnv() *env {
 		"integer?", "rational?", "exact?", "inexact?",
 		"exact->inexact", "inexact->exact",
 		"numerator", "denominator",
+		"procedure?",
 	}
 	for _, name := range builtins {
 		e.set(name, builtinVal(name))
