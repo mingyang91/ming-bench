@@ -14,4 +14,7 @@ pub enum EvalError {
 
     #[error("runtime error: {0}")]
     Runtime(String),
+
+    #[error("continuation invoked")]
+    ContinuationReturn,
 }

@@ -81,6 +81,26 @@ pub enum Value {
         env: Rc<RefCell<EnvInner>>,
     },
     Vector(Rc<RefCell<Vec<Value>>>),
+    Continuation(Rc<Vec<Frame>>),
+}
+
+#[derive(Debug, Clone)]
+pub enum Frame {
+    Seq { remaining: Vec<Expr>, env: Env },
+    IfCond { then_br: Expr, else_br: Option<Expr>, env: Env },
+    Define { name: String, env: Env },
+    SetBang { name: String, env: Env, span: Span },
+    And { remaining: Vec<Expr>, env: Env },
+    Or { remaining: Vec<Expr>, env: Env },
+    AppFunc { arg_exprs: Vec<Expr>, env: Env, span: Span },
+    AppArg { func: Value, done: Vec<Value>, remaining: Vec<Expr>, all_arg_exprs: Vec<Expr>, env: Env, span: Span },
+    // Re-evaluating application frame: used in restored continuations
+    // Re-evaluates all args except hole_index (which gets the continuation's value)
+    AppReEval { func: Value, arg_exprs: Vec<Expr>, hole_index: usize, env: Env, span: Span },
+}
+
+thread_local! {
+    static CONTINUATION_JUMP: RefCell<Option<(Vec<Frame>, Value)>> = RefCell::new(None);
 }
 
 fn gcd(a: i64, b: i64) -> i64 {
@@ -207,6 +227,7 @@ impl PartialEq for Value {
                 t1 == t2 && f1.iter().zip(f2.iter()).all(|((_, v1), (_, v2))| v1 == v2)
             }
             (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
+            (Value::Continuation(_), Value::Continuation(_)) => false,
             _ => false,
         }
     }
@@ -294,6 +315,7 @@ impl Value {
             Value::CaseLambda { .. } => "#<procedure>".into(),
             Value::Macro { .. } => "#<macro>".into(),
             Value::Record { type_name, .. } => format!("#<record:{}>", type_name),
+            Value::Continuation(_) => "#<continuation>".into(),
             Value::Vector(elems) => {
                 let inner: Vec<String> = elems.borrow().iter().map(|v| v.fmt_value(write_mode)).collect();
                 format!("#({})", inner.join(" "))
@@ -346,7 +368,8 @@ impl Env {
                      "procedure?",
                      "eqv?",
                      "vector", "make-vector", "vector-ref", "vector-set!",
-                     "vector-length", "vector?", "vector->list", "list->vector"] {
+                     "vector-length", "vector?", "vector->list", "list->vector",
+                     "call/cc", "call-with-current-continuation"] {
             bindings.insert(name.to_string(), Value::Builtin(name.to_string()));
         }
         Env(Rc::new(RefCell::new(EnvInner {
@@ -394,23 +417,273 @@ impl Env {
 }
 
 pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
-    let mut cur_expr = expr.clone();
-    let mut cur_env = env.clone();
+    eval_with_stack(expr, env, Vec::new())
+}
+
+pub fn eval_program(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if exprs.is_empty() {
+        return Ok(Value::Void);
+    }
+    let mut stack = Vec::new();
+    if exprs.len() > 1 {
+        stack.push(Frame::Seq { remaining: exprs[1..].to_vec(), env: env.clone() });
+    }
+    eval_with_stack(&exprs[0], env, stack)
+}
+
+fn apply_into(
+    func: Value,
+    args: Vec<Value>,
+    cur_expr: &mut Expr,
+    cur_env: &mut Env,
+    stack: &mut Vec<Frame>,
+    returning: &mut Option<Value>,
+    span: Span,
+) -> Result<(), EvalError> {
+    // Handle call/cc before consuming func
+    if let Value::Builtin(ref name) = func {
+        if name == "call/cc" || name == "call-with-current-continuation" {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("call/cc requires exactly 1 argument at {}", fmt_span(span))));
+            }
+            let proc = args.into_iter().next().unwrap();
+            // Capture continuation, transforming AppArg frames to AppReEval
+            let mut cont_stack = stack.clone();
+            for frame in cont_stack.iter_mut() {
+                if let Frame::AppArg { func: f, done, all_arg_exprs, env: e, span: s, .. } = frame {
+                    let hole_index = done.len();
+                    *frame = Frame::AppReEval {
+                        func: f.clone(),
+                        arg_exprs: all_arg_exprs.clone(),
+                        hole_index,
+                        env: e.clone(),
+                        span: *s,
+                    };
+                }
+            }
+            let cont = Value::Continuation(Rc::new(cont_stack));
+            return apply_into(proc, vec![cont], cur_expr, cur_env, stack, returning, span);
+        }
+    }
+
+    match func {
+        Value::Lambda { params, rest_param, body, env: fn_env } => {
+            if rest_param.is_some() {
+                if args.len() < params.len() {
+                    return Err(EvalError::Arity(format!(
+                        "expected at least {} arguments, got {}", params.len(), args.len()
+                    )));
+                }
+            } else if args.len() != params.len() {
+                return Err(EvalError::Arity(format!(
+                    "expected {} arguments, got {}", params.len(), args.len()
+                )));
+            }
+            let parent_env = Env(fn_env);
+            let local_env = Env::child(&parent_env);
+            let mut args_iter = args.into_iter();
+            for p in &params {
+                local_env.define(p.clone(), args_iter.next().unwrap());
+            }
+            if let Some(ref rest) = rest_param {
+                let rest_args: Vec<Value> = args_iter.collect();
+                let mut list = Value::Nil;
+                for v in rest_args.into_iter().rev() {
+                    list = cons(v, list);
+                }
+                local_env.define(rest.clone(), list);
+            }
+            if body.is_empty() {
+                *returning = Some(Value::Void);
+                return Ok(());
+            }
+            if body.len() > 1 {
+                stack.push(Frame::Seq { remaining: body[1..].to_vec(), env: local_env.clone() });
+            }
+            *cur_expr = body[0].clone();
+            *cur_env = local_env;
+            Ok(())
+        }
+        Value::CaseLambda { clauses, env: fn_env } => {
+            let nargs = args.len();
+            for (params, rest_param, body) in &clauses {
+                let matches = if rest_param.is_some() { nargs >= params.len() } else { nargs == params.len() };
+                if matches {
+                    let parent_env = Env(fn_env);
+                    let local_env = Env::child(&parent_env);
+                    let mut args_iter = args.into_iter();
+                    for p in params {
+                        local_env.define(p.clone(), args_iter.next().unwrap());
+                    }
+                    if let Some(rest) = rest_param {
+                        let rest_args: Vec<Value> = args_iter.collect();
+                        let mut list = Value::Nil;
+                        for v in rest_args.into_iter().rev() {
+                            list = cons(v, list);
+                        }
+                        local_env.define(rest.clone(), list);
+                    }
+                    if body.is_empty() {
+                        *returning = Some(Value::Void);
+                        return Ok(());
+                    }
+                    if body.len() > 1 {
+                        stack.push(Frame::Seq { remaining: body[1..].to_vec(), env: local_env.clone() });
+                    }
+                    *cur_expr = body[0].clone();
+                    *cur_env = local_env;
+                    return Ok(());
+                }
+            }
+            Err(EvalError::Arity(format!("no matching clause for {} arguments in case-lambda", nargs)))
+        }
+        Value::Continuation(saved_stack) => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("continuation expects 1 argument".into()));
+            }
+            *stack = saved_stack.as_ref().clone();
+            *returning = Some(args.into_iter().next().unwrap());
+            Ok(())
+        }
+        other => {
+            let result = apply_builtin(&other, &args).map_err(|e| with_span(e, span))?;
+            *returning = Some(result);
+            Ok(())
+        }
+    }
+}
+
+fn eval_with_stack(initial_expr: &Expr, initial_env: &Env, initial_stack: Vec<Frame>) -> Result<Value, EvalError> {
+    let mut cur_expr = initial_expr.clone();
+    let mut cur_env = initial_env.clone();
+    let mut stack = initial_stack;
+    let mut returning: Option<Value> = None;
 
     loop {
+        // === PHASE: Return value through frames ===
+        if let Some(val) = returning.take() {
+            if stack.is_empty() {
+                return Ok(val);
+            }
+            let frame = stack.pop().unwrap();
+            match frame {
+                Frame::Seq { mut remaining, env } => {
+                    cur_expr = remaining.remove(0);
+                    cur_env = env.clone();
+                    if !remaining.is_empty() {
+                        stack.push(Frame::Seq { remaining, env });
+                    }
+                    continue;
+                }
+                Frame::IfCond { then_br, else_br, env } => {
+                    if val.is_truthy() {
+                        cur_expr = then_br;
+                        cur_env = env;
+                    } else if let Some(eb) = else_br {
+                        cur_expr = eb;
+                        cur_env = env;
+                    } else {
+                        returning = Some(Value::Void);
+                    }
+                    continue;
+                }
+                Frame::Define { name, env } => {
+                    env.define(name, val);
+                    returning = Some(Value::Void);
+                    continue;
+                }
+                Frame::SetBang { name, env, span } => {
+                    env.set(&name, val).map_err(|e| with_span(e, span))?;
+                    returning = Some(Value::Void);
+                    continue;
+                }
+                Frame::And { mut remaining, env } => {
+                    if !val.is_truthy() {
+                        returning = Some(val);
+                        continue;
+                    }
+                    cur_expr = remaining.remove(0);
+                    cur_env = env.clone();
+                    if !remaining.is_empty() {
+                        stack.push(Frame::And { remaining, env });
+                    }
+                    continue;
+                }
+                Frame::Or { mut remaining, env } => {
+                    if val.is_truthy() {
+                        returning = Some(val);
+                        continue;
+                    }
+                    cur_expr = remaining.remove(0);
+                    cur_env = env.clone();
+                    if !remaining.is_empty() {
+                        stack.push(Frame::Or { remaining, env });
+                    }
+                    continue;
+                }
+                Frame::AppFunc { mut arg_exprs, env, span } => {
+                    let func = val;
+                    if arg_exprs.is_empty() {
+                        apply_into(func, vec![], &mut cur_expr, &mut cur_env, &mut stack, &mut returning, span)?;
+                    } else {
+                        let all = arg_exprs.clone();
+                        let first_arg = arg_exprs.remove(0);
+                        stack.push(Frame::AppArg {
+                            func,
+                            done: vec![],
+                            remaining: arg_exprs,
+                            all_arg_exprs: all,
+                            env: env.clone(),
+                            span,
+                        });
+                        cur_expr = first_arg;
+                        cur_env = env;
+                    }
+                    continue;
+                }
+                Frame::AppArg { func, mut done, mut remaining, all_arg_exprs, env, span } => {
+                    done.push(val);
+                    if remaining.is_empty() {
+                        apply_into(func, done, &mut cur_expr, &mut cur_env, &mut stack, &mut returning, span)?;
+                    } else {
+                        let next = remaining.remove(0);
+                        stack.push(Frame::AppArg { func, done, remaining, all_arg_exprs, env: env.clone(), span });
+                        cur_expr = next;
+                        cur_env = env;
+                    }
+                    continue;
+                }
+                Frame::AppReEval { func, arg_exprs, hole_index, env, span } => {
+                    // Re-evaluate all args except hole_index (which gets val)
+                    let mut all_args = Vec::new();
+                    for (i, expr) in arg_exprs.iter().enumerate() {
+                        if i == hole_index {
+                            all_args.push(val.clone());
+                        } else {
+                            all_args.push(eval(expr, &env)?);
+                        }
+                    }
+                    apply_into(func, all_args, &mut cur_expr, &mut cur_env, &mut stack, &mut returning, span)?;
+                    continue;
+                }
+            }
+        }
+
+        // === PHASE: Evaluate cur_expr ===
         let span = cur_expr.span;
 
-        // Fast path for atoms — all return immediately
+        // Fast path for atoms
         match &cur_expr.kind {
-            ExprKind::Integer(n) => return Ok(Value::Integer(*n)),
-            ExprKind::Float(f) => return Ok(Value::Float(*f)),
-            ExprKind::Rational(n, d) => return Ok(make_rational(*n, *d)),
-            ExprKind::Boolean(b) => return Ok(Value::Boolean(*b)),
-            ExprKind::Str(s) => return Ok(Value::Str(s.clone(), false)),
-            ExprKind::Char(c) => return Ok(Value::Char(*c)),
+            ExprKind::Integer(n) => { returning = Some(Value::Integer(*n)); continue; }
+            ExprKind::Float(f) => { returning = Some(Value::Float(*f)); continue; }
+            ExprKind::Rational(n, d) => { returning = Some(make_rational(*n, *d)); continue; }
+            ExprKind::Boolean(b) => { returning = Some(Value::Boolean(*b)); continue; }
+            ExprKind::Str(s) => { returning = Some(Value::Str(s.clone(), false)); continue; }
+            ExprKind::Char(c) => { returning = Some(Value::Char(*c)); continue; }
             ExprKind::Symbol(name) => {
-                return cur_env.get(name)
-                    .ok_or_else(|| EvalError::UnboundVariable(format!("{} at {}", name, fmt_span(span))));
+                returning = Some(cur_env.get(name)
+                    .ok_or_else(|| EvalError::UnboundVariable(format!("{} at {}", name, fmt_span(span))))?);
+                continue;
             }
             ExprKind::List(items) if items.is_empty() => {
                 return Err(EvalError::Runtime(format!("empty application at {}", fmt_span(span))));
@@ -418,8 +691,7 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
             ExprKind::List(_) => {} // handled below
         }
 
-        // Move items out of cur_expr to get owned Vec (avoids borrow issues)
-        let items = match cur_expr.kind {
+        let items = match std::mem::replace(&mut cur_expr.kind, ExprKind::Boolean(false)) {
             ExprKind::List(items) => items,
             _ => unreachable!(),
         };
@@ -427,75 +699,110 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
         // Check for special forms
         if let ExprKind::Symbol(ref name) = items[0].kind {
             match name.as_str() {
-                // Non-TCO forms — delegate to helpers
-                "define" => return eval_define(&items[1..], &cur_env, span),
-                "quote" => return eval_quote(&items[1..], span),
-                "lambda" => return eval_lambda(&items[1..], &cur_env, span),
-                "set!" => return eval_set(&items[1..], &cur_env, span),
-                "string-set!" => return eval_string_set(&items[1..], &cur_env, span),
-                "define-syntax" => return eval_define_syntax(&items[1..], &cur_env, span),
-                "define-record-type" => return eval_define_record_type(&items[1..], &cur_env, span),
-                "case-lambda" => return eval_case_lambda(&items[1..], &cur_env, span),
-                "do" => return eval_do(&items[1..], &cur_env, span),
+                // Immediate value forms
+                "quote" => { returning = Some(eval_quote(&items[1..], span)?); continue; }
+                "lambda" => { returning = Some(eval_lambda(&items[1..], &cur_env, span)?); continue; }
+                "case-lambda" => { returning = Some(eval_case_lambda(&items[1..], &cur_env, span)?); continue; }
+                "define-syntax" => { returning = Some(eval_define_syntax(&items[1..], &cur_env, span)?); continue; }
+                "define-record-type" => { returning = Some(eval_define_record_type(&items[1..], &cur_env, span)?); continue; }
+                "string-set!" => { returning = Some(eval_string_set(&items[1..], &cur_env, span)?); continue; }
+                "do" => { returning = Some(eval_do(&items[1..], &cur_env, span)?); continue; }
 
-                // TCO forms — tail positions use continue
+                // Frame-based forms
+                "define" => {
+                    let args = &items[1..];
+                    if args.len() < 2 {
+                        return Err(EvalError::Runtime(format!("define requires at least 2 arguments at {}", fmt_span(span))));
+                    }
+                    match &args[0].kind {
+                        ExprKind::Symbol(vname) => {
+                            stack.push(Frame::Define { name: vname.clone(), env: cur_env.clone() });
+                            cur_expr = args[1].clone();
+                            continue;
+                        }
+                        ExprKind::List(parts) if !parts.is_empty() => {
+                            if let ExprKind::Symbol(fname) = &parts[0].kind {
+                                let (params, rest_param) = parse_params(&parts[1..], span)?;
+                                let body = args[1..].to_vec();
+                                let lambda = Value::Lambda { params, rest_param, body, env: cur_env.0.clone() };
+                                cur_env.define(fname.clone(), lambda);
+                                returning = Some(Value::Void);
+                                continue;
+                            } else {
+                                return Err(EvalError::Runtime(format!("define: expected function name at {}", fmt_span(span))));
+                            }
+                        }
+                        _ => return Err(EvalError::Runtime(format!("define: bad syntax at {}", fmt_span(span)))),
+                    }
+                }
+                "set!" => {
+                    let args = &items[1..];
+                    if args.len() != 2 {
+                        return Err(EvalError::Runtime(format!("set! requires exactly 2 arguments at {}", fmt_span(span))));
+                    }
+                    let vname = match &args[0].kind {
+                        ExprKind::Symbol(s) => s.clone(),
+                        _ => return Err(EvalError::Runtime(format!("set!: first argument must be a symbol at {}", fmt_span(span)))),
+                    };
+                    if cur_env.get(&vname).is_none() {
+                        return Err(EvalError::UnboundVariable(format!("{} at {}", vname, fmt_span(span))));
+                    }
+                    stack.push(Frame::SetBang { name: vname, env: cur_env.clone(), span });
+                    cur_expr = args[1].clone();
+                    continue;
+                }
                 "if" => {
                     let args = &items[1..];
                     if args.len() < 2 || args.len() > 3 {
                         return Err(EvalError::Runtime(format!("if requires 2 or 3 arguments at {}", fmt_span(span))));
                     }
-                    let cond_val = eval(&args[0], &cur_env)?;
-                    if cond_val.is_truthy() {
-                        cur_expr = args[1].clone();
-                    } else if args.len() == 3 {
-                        cur_expr = args[2].clone();
-                    } else {
-                        return Ok(Value::Void);
-                    }
+                    stack.push(Frame::IfCond {
+                        then_br: args[1].clone(),
+                        else_br: args.get(2).cloned(),
+                        env: cur_env.clone(),
+                    });
+                    cur_expr = args[0].clone();
                     continue;
                 }
                 "begin" => {
-                    let args = &items[1..];
+                    let args = items[1..].to_vec();
                     if args.is_empty() {
-                        return Ok(Value::Void);
+                        returning = Some(Value::Void);
+                        continue;
                     }
-                    for e in &args[..args.len() - 1] {
-                        eval(e, &cur_env)?;
+                    if args.len() > 1 {
+                        stack.push(Frame::Seq { remaining: args[1..].to_vec(), env: cur_env.clone() });
                     }
-                    cur_expr = args[args.len() - 1].clone();
+                    cur_expr = args[0].clone();
                     continue;
                 }
                 "and" => {
-                    let args = &items[1..];
+                    let args = items[1..].to_vec();
                     if args.is_empty() {
-                        return Ok(Value::Boolean(true));
+                        returning = Some(Value::Boolean(true));
+                        continue;
                     }
-                    for e in &args[..args.len() - 1] {
-                        let result = eval(e, &cur_env)?;
-                        if !result.is_truthy() {
-                            return Ok(result);
-                        }
+                    if args.len() > 1 {
+                        stack.push(Frame::And { remaining: args[1..].to_vec(), env: cur_env.clone() });
                     }
-                    cur_expr = args[args.len() - 1].clone();
+                    cur_expr = args[0].clone();
                     continue;
                 }
                 "or" => {
-                    let args = &items[1..];
+                    let args = items[1..].to_vec();
                     if args.is_empty() {
-                        return Ok(Value::Boolean(false));
+                        returning = Some(Value::Boolean(false));
+                        continue;
                     }
-                    for e in &args[..args.len() - 1] {
-                        let result = eval(e, &cur_env)?;
-                        if result.is_truthy() {
-                            return Ok(result);
-                        }
+                    if args.len() > 1 {
+                        stack.push(Frame::Or { remaining: args[1..].to_vec(), env: cur_env.clone() });
                     }
-                    cur_expr = args[args.len() - 1].clone();
+                    cur_expr = args[0].clone();
                     continue;
                 }
                 "cond" => {
                     let clauses = &items[1..];
-                    let mut tail_expr: Option<Expr> = None;
+                    let mut tail_body: Option<Vec<Expr>> = None;
                     let mut direct_result: Option<Value> = None;
                     for clause in clauses {
                         match &clause.kind {
@@ -503,23 +810,16 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                                 let is_else = matches!(&parts[0].kind, ExprKind::Symbol(s) if s == "else");
                                 if is_else {
                                     if parts.len() >= 2 {
-                                        for e in &parts[1..parts.len() - 1] {
-                                            eval(e, &cur_env)?;
-                                        }
-                                        tail_expr = Some(parts[parts.len() - 1].clone());
+                                        tail_body = Some(parts[1..].to_vec());
                                     }
                                     break;
                                 }
                                 let test_val = eval(&parts[0], &cur_env)?;
                                 if test_val.is_truthy() {
                                     if parts.len() == 1 {
-                                        // (cond (test)) — return test value
                                         direct_result = Some(test_val);
                                     } else {
-                                        for e in &parts[1..parts.len() - 1] {
-                                            eval(e, &cur_env)?;
-                                        }
-                                        tail_expr = Some(parts[parts.len() - 1].clone());
+                                        tail_body = Some(parts[1..].to_vec());
                                     }
                                     break;
                                 }
@@ -528,13 +828,22 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         }
                     }
                     if let Some(val) = direct_result {
-                        return Ok(val);
-                    }
-                    if let Some(next) = tail_expr {
-                        cur_expr = next;
+                        returning = Some(val);
                         continue;
                     }
-                    return Ok(Value::Void);
+                    if let Some(body) = tail_body {
+                        if body.is_empty() {
+                            returning = Some(Value::Void);
+                        } else {
+                            if body.len() > 1 {
+                                stack.push(Frame::Seq { remaining: body[1..].to_vec(), env: cur_env.clone() });
+                            }
+                            cur_expr = body[0].clone();
+                        }
+                        continue;
+                    }
+                    returning = Some(Value::Void);
+                    continue;
                 }
                 "let" => {
                     let args = &items[1..];
@@ -565,23 +874,21 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         let body = args[2..].to_vec();
                         let local_env = Env::child(&cur_env);
                         let lambda = Value::Lambda {
-                            params: params.clone(),
-                            rest_param: None,
-                            body: body.clone(),
-                            env: local_env.0.clone(),
+                            params: params.clone(), rest_param: None, body: body.clone(), env: local_env.0.clone(),
                         };
                         local_env.define(loop_name.clone(), lambda);
                         for (p, v) in params.iter().zip(init_vals) {
                             local_env.define(p.clone(), v);
                         }
                         if body.is_empty() {
-                            return Ok(Value::Void);
+                            returning = Some(Value::Void);
+                        } else {
+                            if body.len() > 1 {
+                                stack.push(Frame::Seq { remaining: body[1..].to_vec(), env: local_env.clone() });
+                            }
+                            cur_expr = body[0].clone();
+                            cur_env = local_env;
                         }
-                        for e in &body[..body.len() - 1] {
-                            eval(e, &local_env)?;
-                        }
-                        cur_expr = body[body.len() - 1].clone();
-                        cur_env = local_env;
                         continue;
                     }
                     // Regular let
@@ -605,13 +912,14 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     }
                     let body = &args[1..];
                     if body.is_empty() {
-                        return Ok(Value::Void);
+                        returning = Some(Value::Void);
+                    } else {
+                        if body.len() > 1 {
+                            stack.push(Frame::Seq { remaining: body[1..body.len()].to_vec(), env: local_env.clone() });
+                        }
+                        cur_expr = body[0].clone();
+                        cur_env = local_env;
                     }
-                    for e in &body[..body.len() - 1] {
-                        eval(e, &local_env)?;
-                    }
-                    cur_expr = body[body.len() - 1].clone();
-                    cur_env = local_env;
                     continue;
                 }
                 "let*" => {
@@ -639,13 +947,14 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     }
                     let body = &args[1..];
                     if body.is_empty() {
-                        return Ok(Value::Void);
+                        returning = Some(Value::Void);
+                    } else {
+                        if body.len() > 1 {
+                            stack.push(Frame::Seq { remaining: body[1..body.len()].to_vec(), env: local_env.clone() });
+                        }
+                        cur_expr = body[0].clone();
+                        cur_env = local_env;
                     }
-                    for e in &body[..body.len() - 1] {
-                        eval(e, &local_env)?;
-                    }
-                    cur_expr = body[body.len() - 1].clone();
-                    cur_env = local_env;
                     continue;
                 }
                 "letrec" => {
@@ -680,13 +989,14 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     }
                     let body = &args[1..];
                     if body.is_empty() {
-                        return Ok(Value::Void);
+                        returning = Some(Value::Void);
+                    } else {
+                        if body.len() > 1 {
+                            stack.push(Frame::Seq { remaining: body[1..body.len()].to_vec(), env: local_env.clone() });
+                        }
+                        cur_expr = body[0].clone();
+                        cur_env = local_env;
                     }
-                    for e in &body[..body.len() - 1] {
-                        eval(e, &local_env)?;
-                    }
-                    cur_expr = body[body.len() - 1].clone();
-                    cur_env = local_env;
                     continue;
                 }
                 "letrec*" => {
@@ -721,13 +1031,14 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     }
                     let body = &args[1..];
                     if body.is_empty() {
-                        return Ok(Value::Void);
+                        returning = Some(Value::Void);
+                    } else {
+                        if body.len() > 1 {
+                            stack.push(Frame::Seq { remaining: body[1..body.len()].to_vec(), env: local_env.clone() });
+                        }
+                        cur_expr = body[0].clone();
+                        cur_env = local_env;
                     }
-                    for e in &body[..body.len() - 1] {
-                        eval(e, &local_env)?;
-                    }
-                    cur_expr = body[body.len() - 1].clone();
-                    cur_env = local_env;
                     continue;
                 }
                 "case" => {
@@ -736,16 +1047,13 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         return Err(EvalError::Runtime(format!("case requires at least a key at {}", fmt_span(span))));
                     }
                     let key = eval(&args[0], &cur_env)?;
-                    let mut tail_expr: Option<Expr> = None;
+                    let mut tail_body: Option<Vec<Expr>> = None;
                     for clause in &args[1..] {
                         match &clause.kind {
                             ExprKind::List(parts) if parts.len() >= 2 => {
                                 if let ExprKind::Symbol(s) = &parts[0].kind {
                                     if s == "else" {
-                                        for e in &parts[1..parts.len() - 1] {
-                                            eval(e, &cur_env)?;
-                                        }
-                                        tail_expr = Some(parts[parts.len() - 1].clone());
+                                        tail_body = Some(parts[1..].to_vec());
                                         break;
                                     }
                                 }
@@ -759,10 +1067,7 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                                         }
                                     }
                                     if matched {
-                                        for e in &parts[1..parts.len() - 1] {
-                                            eval(e, &cur_env)?;
-                                        }
-                                        tail_expr = Some(parts[parts.len() - 1].clone());
+                                        tail_body = Some(parts[1..].to_vec());
                                         break;
                                     }
                                 }
@@ -770,11 +1075,19 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                             _ => return Err(EvalError::Runtime(format!("case: bad clause at {}", fmt_span(clause.span)))),
                         }
                     }
-                    if let Some(next) = tail_expr {
-                        cur_expr = next;
-                        continue;
+                    if let Some(body) = tail_body {
+                        if body.is_empty() {
+                            returning = Some(Value::Void);
+                        } else {
+                            if body.len() > 1 {
+                                stack.push(Frame::Seq { remaining: body[1..].to_vec(), env: cur_env.clone() });
+                            }
+                            cur_expr = body[0].clone();
+                        }
+                    } else {
+                        returning = Some(Value::Void);
                     }
-                    return Ok(Value::Void);
+                    continue;
                 }
                 _ => {} // not a special form, fall through
             }
@@ -787,91 +1100,12 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
             }
         }
 
-        // General function application
-        let func = eval(&items[0], &cur_env)?;
-        let args: Vec<Value> = items[1..].iter()
-            .map(|e| eval(e, &cur_env))
-            .collect::<Result<_, _>>()?;
-
-        // TCO for lambda/case-lambda; builtins return directly
-        match func {
-            Value::Lambda { params, rest_param, body, env: fn_env } => {
-                if rest_param.is_some() {
-                    if args.len() < params.len() {
-                        return Err(EvalError::Arity(format!(
-                            "expected at least {} arguments, got {}", params.len(), args.len()
-                        )));
-                    }
-                } else if args.len() != params.len() {
-                    return Err(EvalError::Arity(format!(
-                        "expected {} arguments, got {}", params.len(), args.len()
-                    )));
-                }
-                let parent_env = Env(fn_env);
-                let local_env = Env::child(&parent_env);
-                let mut args_iter = args.into_iter();
-                for p in &params {
-                    local_env.define(p.clone(), args_iter.next().unwrap());
-                }
-                if let Some(ref rest) = rest_param {
-                    let rest_args: Vec<Value> = args_iter.collect();
-                    let mut list = Value::Nil;
-                    for v in rest_args.into_iter().rev() {
-                        list = cons(v, list);
-                    }
-                    local_env.define(rest.clone(), list);
-                }
-                if body.is_empty() {
-                    return Ok(Value::Void);
-                }
-                for e in &body[..body.len() - 1] {
-                    eval(e, &local_env)?;
-                }
-                cur_expr = body[body.len() - 1].clone();
-                cur_env = local_env;
-                continue;
-            }
-            Value::CaseLambda { clauses, env: fn_env } => {
-                let nargs = args.len();
-                let mut matched_idx = None;
-                for (i, (params, rest_param, _)) in clauses.iter().enumerate() {
-                    if if rest_param.is_some() { nargs >= params.len() } else { nargs == params.len() } {
-                        matched_idx = Some(i);
-                        break;
-                    }
-                }
-                if let Some(idx) = matched_idx {
-                    let (ref params, ref rest_param, ref body) = clauses[idx];
-                    let parent_env = Env(fn_env);
-                    let local_env = Env::child(&parent_env);
-                    let mut args_iter = args.into_iter();
-                    for p in params {
-                        local_env.define(p.clone(), args_iter.next().unwrap());
-                    }
-                    if let Some(ref rest) = rest_param {
-                        let rest_args: Vec<Value> = args_iter.collect();
-                        let mut list = Value::Nil;
-                        for v in rest_args.into_iter().rev() {
-                            list = cons(v, list);
-                        }
-                        local_env.define(rest.clone(), list);
-                    }
-                    if body.is_empty() {
-                        return Ok(Value::Void);
-                    }
-                    for e in &body[..body.len() - 1] {
-                        eval(e, &local_env)?;
-                    }
-                    cur_expr = body[body.len() - 1].clone();
-                    cur_env = local_env;
-                    continue;
-                }
-                return Err(EvalError::Arity(format!(
-                    "no matching clause for {} arguments in case-lambda", nargs
-                )));
-            }
-            _ => return apply_func(&func, args).map_err(|e| with_span(e, span)),
-        }
+        // General function application — use frames
+        let first = items[0].clone();
+        let rest: Vec<Expr> = items[1..].to_vec();
+        stack.push(Frame::AppFunc { arg_exprs: rest, env: cur_env.clone(), span });
+        cur_expr = first;
+        continue;
     }
 }
 
@@ -1014,6 +1248,15 @@ fn eval_case_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalE
 
 fn apply_func(func: &Value, args: Vec<Value>) -> Result<Value, EvalError> {
     match func {
+        Value::Continuation(saved_stack) => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("continuation expects 1 argument".into()));
+            }
+            CONTINUATION_JUMP.with(|c| {
+                *c.borrow_mut() = Some((saved_stack.as_ref().clone(), args.into_iter().next().unwrap()));
+            });
+            Err(EvalError::ContinuationReturn)
+        }
         Value::Builtin(_) => apply_builtin(func, &args),
         Value::Lambda { params, rest_param, body, env } => {
             if let Some(_) = rest_param {
@@ -1694,7 +1937,7 @@ fn apply_builtin(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
         }
         "procedure?" => {
             if args.len() != 1 { return Err(EvalError::Arity("procedure? requires 1 argument".into())); }
-            Ok(Value::Boolean(matches!(args[0], Value::Lambda { .. } | Value::Builtin(_) | Value::CaseLambda { .. })))
+            Ok(Value::Boolean(matches!(args[0], Value::Lambda { .. } | Value::Builtin(_) | Value::CaseLambda { .. } | Value::Continuation(_))))
         }
         "exact->inexact" => {
             if args.len() != 1 { return Err(EvalError::Arity("exact->inexact requires 1 argument".into())); }
