@@ -728,10 +728,11 @@ fn cek_apply_func(func: &Value, args: &[Value], kont: Rc<Kont>, out: &Output, sp
             Err(EvalError::Arity(format!("case-lambda: no matching clause for {} arguments", args.len()), span))
         }
         Value::Continuation(saved_kont, target_winds) => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity("continuation requires 1 argument".into(), span));
-            }
-            let value = args[0].clone();
+            let value = if args.len() == 1 {
+                args[0].clone()
+            } else {
+                Value::Values(args.to_vec())
+            };
             let current_winds = WIND_STACK.with(|ws| ws.borrow().clone());
             let common = current_winds.iter().zip(target_winds.iter())
                 .take_while(|(a, b)| a.2 == b.2).count();

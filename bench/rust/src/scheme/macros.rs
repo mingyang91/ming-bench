@@ -3,8 +3,13 @@ use std::collections::{HashMap, HashSet};
 use super::{gensym, Spanned, Value};
 
 const SPECIAL_FORMS: &[&str] = &[
-    "quote", "if", "define", "lambda", "let", "begin", "set!",
-    "cond", "and", "or", "not", "string-set!", "define-syntax", "syntax-rules",
+    "quote", "if", "define", "lambda", "let", "let*", "letrec", "letrec*",
+    "begin", "set!", "cond", "case", "and", "or", "not", "when", "unless",
+    "do", "string-set!", "define-syntax", "syntax-rules", "syntax-case",
+    "define-record-type", "case-lambda",
+    "guard", "raise", "raise-continuable", "with-exception-handler",
+    "dynamic-wind", "values", "call-with-values",
+    "call/cc", "call-with-current-continuation",
 ];
 
 #[derive(Clone)]
