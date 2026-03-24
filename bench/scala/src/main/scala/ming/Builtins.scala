@@ -247,5 +247,19 @@ object Builtins:
       case List(SchemeChar(_)) => Bool(true)
       case List(_)             => Bool(false)
       case _                   => throw new EvalError("char? requires 1 argument")
+    },
+    // --- L08: apply ---
+    "apply" -> Builtin { args =>
+      if args.length < 2 then throw new EvalError("apply requires at least 2 arguments")
+      val func    = args.head
+      val prefix  = args.slice(1, args.length - 1)
+      val lastArg = args.last
+      // Convert last argument (must be a list) to List[Val]
+      def toArgList(v: Val): List[Val] = v match
+        case Nil            => List.empty
+        case Pair(car, cdr) => car :: toArgList(cdr)
+        case _              => throw new EvalError("apply: last argument must be a list")
+      val allArgs = prefix ++ toArgList(lastArg)
+      Evaluator.applyFunc(func, allArgs)
     }
   )

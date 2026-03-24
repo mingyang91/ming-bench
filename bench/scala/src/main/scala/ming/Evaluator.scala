@@ -85,19 +85,37 @@ object Evaluator:
         if condVal != Bool(false) then eval(thenExpr, env) else Void
       case _ => error("bad if syntax")
 
+  /** Parse parameter list, returning (fixed params, optional rest param). */
+  private def parseParams(params: Val): (List[String], Option[String]) =
+    params match
+      case Nil          => (List.empty, None)
+      case Symbol(name) => (List.empty, Some(name)) // (lambda args body)
+      case Pair(Symbol(name), rest) =>
+        rest match
+          case Symbol(restName) => (List(name), Some(restName)) // last dotted element
+          case _ =>
+            val (more, restParam) = parseParams(rest)
+            (name :: more, restParam)
+      case _ => error(s"bad parameter: ${Display.write(params)}")
+
   private def evalLambda(rest: Val, env: Env): Val =
     rest match
       case Pair(params, body) =>
-        val paramNames = toList(params).map {
-          case Symbol(s) => s; case v => error(s"bad parameter: ${Display.write(v)}")
-        }
-        val bodyList = toList(body)
+        val (paramNames, restParam) = parseParams(params)
+        val bodyList                = toList(body)
         if bodyList.isEmpty then error("lambda: empty body")
         Builtin { args =>
-          if args.length != paramNames.length then
+          if restParam.isDefined then
+            if args.length < paramNames.length then
+              error(s"lambda: expected at least ${paramNames.length} arguments, got ${args.length}")
+          else if args.length != paramNames.length then
             error(s"lambda: expected ${paramNames.length} arguments, got ${args.length}")
           val childEnv = new Env(scala.collection.mutable.Map[String, Val](), Some(env))
           paramNames.zip(args).foreach((p, a) => childEnv.define(p, a))
+          restParam.foreach { rp =>
+            val restArgs = args.drop(paramNames.length)
+            childEnv.define(rp, restArgs.foldRight(Nil: Val)((a, acc) => Pair(a, acc)))
+          }
           var result: Val = Void
           for expr <- bodyList do result = eval(expr, childEnv)
           result
