@@ -37,8 +37,14 @@ private[ming] object SchemeParser:
       cursor.currentChar match
         case '('  => parseList(cursor.advance, Nil)
         case '"'  => parseString(cursor.advance, new StringBuilder)
-        case '\'' => fail(cursor, "quote syntax is not supported at level 01")
+        case '\'' => parseQuoted(cursor.advance)
+        case ')'  => fail(cursor, "unexpected )")
         case _    => parseAtom(cursor)
+
+  private def parseQuoted(cursor: Cursor): (Expr, Cursor) =
+    val next               = skipWhitespace(cursor)
+    val (quotedExpr, rest) = parseExpr(next)
+    (Expr.ListExpr(List(Expr.Symbol("quote"), quotedExpr)), rest)
 
   @tailrec
   private def parseList(cursor: Cursor, elementsReversed: List[Expr]): (Expr, Cursor) =
@@ -101,8 +107,15 @@ private[ming] object SchemeParser:
 
   @tailrec
   private def skipWhitespace(cursor: Cursor): Cursor =
-    if cursor.atEnd || !cursor.currentChar.isWhitespace then cursor
-    else skipWhitespace(cursor.advance)
+    if cursor.atEnd then cursor
+    else if cursor.currentChar.isWhitespace then skipWhitespace(cursor.advance)
+    else if cursor.currentChar == ';' then skipWhitespace(skipComment(cursor))
+    else cursor
+
+  @tailrec
+  private def skipComment(cursor: Cursor): Cursor =
+    if cursor.atEnd || cursor.currentChar == '\n' then cursor
+    else skipComment(cursor.advance)
 
   private def isDelimiter(char: Char): Boolean =
     char.isWhitespace || char == '(' || char == ')'

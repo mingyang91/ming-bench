@@ -1,0 +1,1039 @@
+diff -ruN /home/my/.zeroclaw/workspace/workspace/cx-scala-qg-r21/bench/rust/src/scheme/ast.rs /tmp/cx-rust-l03/bench/rust/src/scheme/ast.rs
+--- /home/my/.zeroclaw/workspace/workspace/cx-scala-qg-r21/bench/rust/src/scheme/ast.rs	1970-01-01 00:00:00.000000000 +0000
++++ /tmp/cx-rust-l03/bench/rust/src/scheme/ast.rs	2026-03-24 00:46:55.008364007 +0000
+@@ -0,0 +1,8 @@
++#[derive(Clone, Debug, PartialEq)]
++pub enum Expr {
++    Int(i64),
++    Bool(bool),
++    String(String),
++    Symbol(String),
++    List(Vec<Expr>),
++}
+diff -ruN /home/my/.zeroclaw/workspace/workspace/cx-scala-qg-r21/bench/rust/src/scheme/builtins.rs /tmp/cx-rust-l03/bench/rust/src/scheme/builtins.rs
+--- /home/my/.zeroclaw/workspace/workspace/cx-scala-qg-r21/bench/rust/src/scheme/builtins.rs	1970-01-01 00:00:00.000000000 +0000
++++ /tmp/cx-rust-l03/bench/rust/src/scheme/builtins.rs	2026-03-24 00:46:55.008364007 +0000
+@@ -0,0 +1,207 @@
++use super::env::EnvRef;
++use super::error::EvalError;
++use super::value::{list_from_vec, proper_list_to_vec, Value};
++
++pub fn install(env: &EnvRef) {
++    define(env, "+", builtin_add);
++    define(env, "-", builtin_sub);
++    define(env, "*", builtin_mul);
++    define(env, "/", builtin_div);
++    define(env, "<", builtin_lt);
++    define(env, ">", builtin_gt);
++    define(env, "=", builtin_eq);
++    define(env, "<=", builtin_le);
++    define(env, "not", builtin_not);
++    define(env, "cons", builtin_cons);
++    define(env, "car", builtin_car);
++    define(env, "cdr", builtin_cdr);
++    define(env, "null?", builtin_null);
++    define(env, "list", builtin_list);
++    define(env, "length", builtin_length);
++    define(env, "append", builtin_append);
++    define(env, "string?", builtin_string_pred);
++    define(env, "number?", builtin_number_pred);
++    define(env, "boolean?", builtin_boolean_pred);
++    define(env, "pair?", builtin_pair_pred);
++    define(env, "symbol?", builtin_symbol_pred);
++}
++
++fn define(env: &EnvRef, name: &'static str, func: fn(&[Value]) -> Result<Value, EvalError>) {
++    env.define(name, Value::builtin(name, func));
++}
++
++fn builtin_add(args: &[Value]) -> Result<Value, EvalError> {
++    let mut total = 0_i64;
++    for arg in args {
++        total += arg.as_number()?;
++    }
++    Ok(Value::Int(total))
++}
++
++fn builtin_sub(args: &[Value]) -> Result<Value, EvalError> {
++    if args.is_empty() {
++        return Err(EvalError::arity("-", "at least 1", 0));
++    }
++
++    let first = args[0].as_number()?;
++    if args.len() == 1 {
++        return Ok(Value::Int(-first));
++    }
++
++    let rest = args[1..]
++        .iter()
++        .try_fold(first, |acc, value| Ok(acc - value.as_number()?))?;
++    Ok(Value::Int(rest))
++}
++
++fn builtin_mul(args: &[Value]) -> Result<Value, EvalError> {
++    let mut total = 1_i64;
++    for arg in args {
++        total *= arg.as_number()?;
++    }
++    Ok(Value::Int(total))
++}
++
++fn builtin_div(args: &[Value]) -> Result<Value, EvalError> {
++    if args.len() < 2 {
++        return Err(EvalError::arity("/", "at least 2", args.len()));
++    }
++
++    let mut total = args[0].as_number()?;
++    for value in &args[1..] {
++        let divisor = value.as_number()?;
++        if divisor == 0 {
++            return Err(EvalError::division_by_zero());
++        }
++        total /= divisor;
++    }
++
++    Ok(Value::Int(total))
++}
++
++fn builtin_lt(args: &[Value]) -> Result<Value, EvalError> {
++    compare_numbers("<", args, |a, b| a < b)
++}
++
++fn builtin_gt(args: &[Value]) -> Result<Value, EvalError> {
++    compare_numbers(">", args, |a, b| a > b)
++}
++
++fn builtin_eq(args: &[Value]) -> Result<Value, EvalError> {
++    compare_numbers("=", args, |a, b| a == b)
++}
++
++fn builtin_le(args: &[Value]) -> Result<Value, EvalError> {
++    compare_numbers("<=", args, |a, b| a <= b)
++}
++
++fn builtin_not(args: &[Value]) -> Result<Value, EvalError> {
++    expect_exact_arity("not", args, 1)?;
++    Ok(Value::Bool(!args[0].is_truthy()))
++}
++
++fn builtin_cons(args: &[Value]) -> Result<Value, EvalError> {
++    expect_exact_arity("cons", args, 2)?;
++    Ok(Value::cons(args[0].clone(), args[1].clone()))
++}
++
++fn builtin_car(args: &[Value]) -> Result<Value, EvalError> {
++    expect_exact_arity("car", args, 1)?;
++    match &args[0] {
++        Value::Pair(pair) => Ok(pair.car.clone()),
++        other => Err(EvalError::type_error("pair", other.type_name())),
++    }
++}
++
++fn builtin_cdr(args: &[Value]) -> Result<Value, EvalError> {
++    expect_exact_arity("cdr", args, 1)?;
++    match &args[0] {
++        Value::Pair(pair) => Ok(pair.cdr.clone()),
++        other => Err(EvalError::type_error("pair", other.type_name())),
++    }
++}
++
++fn builtin_null(args: &[Value]) -> Result<Value, EvalError> {
++    expect_exact_arity("null?", args, 1)?;
++    Ok(Value::Bool(matches!(args[0], Value::Nil)))
++}
++
++fn builtin_list(args: &[Value]) -> Result<Value, EvalError> {
++    Ok(list_from_vec(args.to_vec()))
++}
++
++fn builtin_length(args: &[Value]) -> Result<Value, EvalError> {
++    expect_exact_arity("length", args, 1)?;
++    let items = proper_list_to_vec(&args[0])?;
++    Ok(Value::Int(items.len() as i64))
++}
++
++fn builtin_append(args: &[Value]) -> Result<Value, EvalError> {
++    if args.is_empty() {
++        return Ok(Value::Nil);
++    }
++
++    let mut result = args
++        .last()
++        .cloned()
++        .ok_or_else(|| EvalError::message("append requires arguments"))?;
++
++    for list in args[..args.len() - 1].iter().rev() {
++        let items = proper_list_to_vec(list)?;
++        for item in items.into_iter().rev() {
++            result = Value::cons(item, result);
++        }
++    }
++
++    Ok(result)
++}
++
++fn builtin_string_pred(args: &[Value]) -> Result<Value, EvalError> {
++    expect_exact_arity("string?", args, 1)?;
++    Ok(Value::Bool(matches!(args[0], Value::String(_))))
++}
++
++fn builtin_number_pred(args: &[Value]) -> Result<Value, EvalError> {
++    expect_exact_arity("number?", args, 1)?;
++    Ok(Value::Bool(matches!(args[0], Value::Int(_))))
++}
++
++fn builtin_boolean_pred(args: &[Value]) -> Result<Value, EvalError> {
++    expect_exact_arity("boolean?", args, 1)?;
++    Ok(Value::Bool(matches!(args[0], Value::Bool(_))))
++}
++
++fn builtin_pair_pred(args: &[Value]) -> Result<Value, EvalError> {
++    expect_exact_arity("pair?", args, 1)?;
++    Ok(Value::Bool(matches!(args[0], Value::Pair(_))))
++}
++
++fn builtin_symbol_pred(args: &[Value]) -> Result<Value, EvalError> {
++    expect_exact_arity("symbol?", args, 1)?;
++    Ok(Value::Bool(matches!(args[0], Value::Symbol(_))))
++}
++
++fn compare_numbers(
++    name: &'static str,
++    args: &[Value],
++    predicate: fn(i64, i64) -> bool,
++) -> Result<Value, EvalError> {
++    if args.len() < 2 {
++        return Err(EvalError::arity(name, "at least 2", args.len()));
++    }
++
++    let numbers = args
++        .iter()
++        .map(Value::as_number)
++        .collect::<Result<Vec<_>, _>>()?;
++    let is_valid = numbers.windows(2).all(|pair| predicate(pair[0], pair[1]));
++    Ok(Value::Bool(is_valid))
++}
++
++fn expect_exact_arity(name: &'static str, args: &[Value], expected: usize) -> Result<(), EvalError> {
++    if args.len() == expected {
++        return Ok(());
++    }
++
++    Err(EvalError::arity(name, expected.to_string(), args.len()))
++}
+diff -ruN /home/my/.zeroclaw/workspace/workspace/cx-scala-qg-r21/bench/rust/src/scheme/env.rs /tmp/cx-rust-l03/bench/rust/src/scheme/env.rs
+--- /home/my/.zeroclaw/workspace/workspace/cx-scala-qg-r21/bench/rust/src/scheme/env.rs	1970-01-01 00:00:00.000000000 +0000
++++ /tmp/cx-rust-l03/bench/rust/src/scheme/env.rs	2026-03-24 00:46:55.008364007 +0000
+@@ -0,0 +1,41 @@
++use std::cell::RefCell;
++use std::collections::HashMap;
++use std::rc::Rc;
++
++use super::value::Value;
++
++pub type EnvRef = Rc<Env>;
++
++#[derive(Debug)]
++pub struct Env {
++    parent: Option<EnvRef>,
++    bindings: RefCell<HashMap<String, Value>>,
++}
++
++impl Env {
++    pub fn new() -> EnvRef {
++        Rc::new(Self {
++            parent: None,
++            bindings: RefCell::new(HashMap::new()),
++        })
++    }
++
++    pub fn child(parent: &EnvRef) -> EnvRef {
++        Rc::new(Self {
++            parent: Some(Rc::clone(parent)),
++            bindings: RefCell::new(HashMap::new()),
++        })
++    }
++
++    pub fn define(&self, name: impl Into<String>, value: Value) {
++        self.bindings.borrow_mut().insert(name.into(), value);
++    }
++
++    pub fn lookup(&self, name: &str) -> Option<Value> {
++        if let Some(value) = self.bindings.borrow().get(name).cloned() {
++            return Some(value);
++        }
++
++        self.parent.as_ref().and_then(|parent| parent.lookup(name))
++    }
++}
+diff -ruN /home/my/.zeroclaw/workspace/workspace/cx-scala-qg-r21/bench/rust/src/scheme/error.rs /tmp/cx-rust-l03/bench/rust/src/scheme/error.rs
+--- /home/my/.zeroclaw/workspace/workspace/cx-scala-qg-r21/bench/rust/src/scheme/error.rs	2026-03-23 23:45:29.832378071 +0000
++++ /tmp/cx-rust-l03/bench/rust/src/scheme/error.rs	2026-03-24 00:46:55.008364007 +0000
+@@ -4,7 +4,71 @@
+ /// error type is not possible — the `eval_str` signature requires this type.
+ #[derive(Debug, PartialEq, thiserror::Error)]
+ pub enum EvalError {
+-    // Add variants as needed, e.g.:
+-    // #[error("unbound variable: {name}")]
+-    // UnboundVariable { name: String },
++    #[error("syntax error: {message}")]
++    Syntax { message: String },
++
++    #[error("unbound variable: {name}")]
++    UnboundVariable { name: String },
++
++    #[error("{name} expected {expected} argument(s), got {got}")]
++    Arity {
++        name: String,
++        expected: String,
++        got: usize,
++    },
++
++    #[error("expected {expected}, got {found}")]
++    TypeError { expected: String, found: String },
++
++    #[error("{found} is not a procedure")]
++    NotAProcedure { found: String },
++
++    #[error("division by zero")]
++    DivisionByZero,
++
++    #[error("{message}")]
++    Message { message: String },
++}
++
++impl EvalError {
++    pub fn syntax(message: impl Into<String>) -> Self {
++        Self::Syntax {
++            message: message.into(),
++        }
++    }
++
++    pub fn unbound_variable(name: impl Into<String>) -> Self {
++        Self::UnboundVariable { name: name.into() }
++    }
++
++    pub fn arity(name: impl Into<String>, expected: impl Into<String>, got: usize) -> Self {
++        Self::Arity {
++            name: name.into(),
++            expected: expected.into(),
++            got,
++        }
++    }
++
++    pub fn type_error(expected: impl Into<String>, found: impl Into<String>) -> Self {
++        Self::TypeError {
++            expected: expected.into(),
++            found: found.into(),
++        }
++    }
++
++    pub fn not_a_procedure(found: impl Into<String>) -> Self {
++        Self::NotAProcedure {
++            found: found.into(),
++        }
++    }
++
++    pub fn division_by_zero() -> Self {
++        Self::DivisionByZero
++    }
++
++    pub fn message(message: impl Into<String>) -> Self {
++        Self::Message {
++            message: message.into(),
++        }
++    }
+ }
+diff -ruN /home/my/.zeroclaw/workspace/workspace/cx-scala-qg-r21/bench/rust/src/scheme/evaluator.rs /tmp/cx-rust-l03/bench/rust/src/scheme/evaluator.rs
+--- /home/my/.zeroclaw/workspace/workspace/cx-scala-qg-r21/bench/rust/src/scheme/evaluator.rs	1970-01-01 00:00:00.000000000 +0000
++++ /tmp/cx-rust-l03/bench/rust/src/scheme/evaluator.rs	2026-03-24 00:47:05.532363992 +0000
+@@ -0,0 +1,332 @@
++use std::rc::Rc;
++
++use super::ast::Expr;
++use super::builtins;
++use super::env::{Env, EnvRef};
++use super::error::EvalError;
++use super::parser::parse_program;
++use super::value::{list_from_vec, Function, Value};
++
++pub struct Evaluator {
++    global: EnvRef,
++    output: String,
++}
++
++impl Evaluator {
++    pub fn new() -> Self {
++        let global = Env::new();
++        builtins::install(&global);
++
++        Self {
++            global,
++            output: String::new(),
++        }
++    }
++
++    pub fn eval(mut self, input: &str) -> Result<(Value, String), EvalError> {
++        let exprs = parse_program(input)?;
++        let global = Rc::clone(&self.global);
++        let result = self.eval_sequence(&exprs, &global)?;
++        Ok((result, self.output))
++    }
++
++    fn eval_sequence(&mut self, exprs: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
++        let mut last = Value::Void;
++
++        for expr in exprs {
++            last = self.eval_expr(expr, env)?;
++        }
++
++        Ok(last)
++    }
++
++    fn eval_expr(&mut self, expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
++        match expr {
++            Expr::Int(value) => Ok(Value::Int(*value)),
++            Expr::Bool(value) => Ok(Value::Bool(*value)),
++            Expr::String(value) => Ok(Value::String(value.clone())),
++            Expr::Symbol(name) => env
++                .lookup(name)
++                .ok_or_else(|| EvalError::unbound_variable(name.clone())),
++            Expr::List(items) => self.eval_list(items, env),
++        }
++    }
++
++    fn eval_list(&mut self, items: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
++        if items.is_empty() {
++            return Ok(Value::Nil);
++        }
++
++        match &items[0] {
++            Expr::Symbol(symbol) => match symbol.as_str() {
++                "quote" => self.eval_quote(&items[1..]),
++                "if" => self.eval_if(&items[1..], env),
++                "define" => self.eval_define(&items[1..], env),
++                "lambda" => self.eval_lambda(&items[1..], env),
++                "and" => self.eval_and(&items[1..], env),
++                "or" => self.eval_or(&items[1..], env),
++                "let" => self.eval_let(&items[1..], env),
++                "begin" => self.eval_sequence(&items[1..], env),
++                "cond" => self.eval_cond(&items[1..], env),
++                _ => self.eval_call(items, env),
++            },
++            _ => self.eval_call(items, env),
++        }
++    }
++
++    fn eval_quote(&self, args: &[Expr]) -> Result<Value, EvalError> {
++        if args.len() != 1 {
++            return Err(EvalError::arity("quote", 1.to_string(), args.len()));
++        }
++
++        Ok(quote_to_value(&args[0]))
++    }
++
++    fn eval_if(&mut self, args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
++        if args.len() != 3 {
++            return Err(EvalError::arity("if", 3.to_string(), args.len()));
++        }
++
++        let test = self.eval_expr(&args[0], env)?;
++        if test.is_truthy() {
++            self.eval_expr(&args[1], env)
++        } else {
++            self.eval_expr(&args[2], env)
++        }
++    }
++
++    fn eval_define(&mut self, args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
++        let (target, body) = args
++            .split_first()
++            .ok_or_else(|| EvalError::syntax("define requires a target"))?;
++
++        match target {
++            Expr::Symbol(name) => {
++                if body.len() != 1 {
++                    return Err(EvalError::arity("define", 2.to_string(), args.len()));
++                }
++
++                let value = self.eval_expr(&body[0], env)?;
++                env.define(name.clone(), value);
++                Ok(Value::Void)
++            }
++            Expr::List(signature) => {
++                let (name, params) = parse_signature(signature)?;
++                if body.is_empty() {
++                    return Err(EvalError::syntax("function definition requires a body"));
++                }
++
++                let function = Value::lambda(params, body.to_vec(), Rc::clone(env));
++                env.define(name, function);
++                Ok(Value::Void)
++            }
++            _ => Err(EvalError::syntax("invalid define target")),
++        }
++    }
++
++    fn eval_lambda(&self, args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
++        if args.len() < 2 {
++            return Err(EvalError::syntax("lambda requires parameters and a body"));
++        }
++
++        let params = parse_params(&args[0])?;
++        let body = args[1..].to_vec();
++        Ok(Value::lambda(params, body, Rc::clone(env)))
++    }
++
++    fn eval_and(&mut self, args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
++        let mut last = Value::Bool(true);
++
++        for expr in args {
++            last = self.eval_expr(expr, env)?;
++            if !last.is_truthy() {
++                return Ok(last);
++            }
++        }
++
++        Ok(last)
++    }
++
++    fn eval_or(&mut self, args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
++        for expr in args {
++            let value = self.eval_expr(expr, env)?;
++            if value.is_truthy() {
++                return Ok(value);
++            }
++        }
++
++        Ok(Value::Bool(false))
++    }
++
++    fn eval_let(&mut self, args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
++        if args.len() < 2 {
++            return Err(EvalError::syntax("let requires bindings and a body"));
++        }
++
++        match &args[0] {
++            Expr::Symbol(name) => self.eval_named_let(name, &args[1], &args[2..], env),
++            bindings => self.eval_plain_let(bindings, &args[1..], env),
++        }
++    }
++
++    fn eval_plain_let(
++        &mut self,
++        bindings_expr: &Expr,
++        body: &[Expr],
++        env: &EnvRef,
++    ) -> Result<Value, EvalError> {
++        let bindings = parse_bindings(bindings_expr)?;
++        let local = Env::child(env);
++
++        for (name, expr) in bindings {
++            let value = self.eval_expr(&expr, env)?;
++            local.define(name, value);
++        }
++
++        self.eval_sequence(body, &local)
++    }
++
++    fn eval_named_let(
++        &mut self,
++        name: &str,
++        bindings_expr: &Expr,
++        body: &[Expr],
++        env: &EnvRef,
++    ) -> Result<Value, EvalError> {
++        if body.is_empty() {
++            return Err(EvalError::syntax("named let requires a body"));
++        }
++
++        let bindings = parse_bindings(bindings_expr)?;
++        let params = bindings.iter().map(|(param, _)| param.clone()).collect();
++        let mut values = Vec::with_capacity(bindings.len());
++
++        for (_, expr) in &bindings {
++            values.push(self.eval_expr(expr, env)?);
++        }
++
++        let local = Env::child(env);
++        let function = Value::lambda(params, body.to_vec(), Rc::clone(&local));
++        local.define(name.to_string(), function.clone());
++        self.apply(function, values)
++    }
++
++    fn eval_cond(&mut self, clauses: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
++        for clause in clauses {
++            let Expr::List(items) = clause else {
++                return Err(EvalError::syntax("cond clause must be a list"));
++            };
++
++            let (test_expr, body) = items
++                .split_first()
++                .ok_or_else(|| EvalError::syntax("cond clause must not be empty"))?;
++
++            if matches!(test_expr, Expr::Symbol(symbol) if symbol == "else") {
++                return self.eval_sequence(body, env);
++            }
++
++            let test = self.eval_expr(test_expr, env)?;
++            if test.is_truthy() {
++                if body.is_empty() {
++                    return Ok(test);
++                }
++                return self.eval_sequence(body, env);
++            }
++        }
++
++        Ok(Value::Void)
++    }
++
++    fn eval_call(&mut self, items: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
++        let function = self.eval_expr(&items[0], env)?;
++        let mut args = Vec::with_capacity(items.len().saturating_sub(1));
++
++        for expr in &items[1..] {
++            args.push(self.eval_expr(expr, env)?);
++        }
++
++        self.apply(function, args)
++    }
++
++    fn apply(&mut self, function: Value, args: Vec<Value>) -> Result<Value, EvalError> {
++        match function {
++            Value::Function(callable) => match callable.as_ref() {
++                Function::Builtin { func, .. } => func(&args),
++                Function::Lambda { params, body, env } => {
++                    if params.len() != args.len() {
++                        return Err(EvalError::arity(
++                            "lambda",
++                            params.len().to_string(),
++                            args.len(),
++                        ));
++                    }
++
++                    let call_env = Env::child(env);
++                    for (param, value) in params.iter().zip(args) {
++                        call_env.define(param.clone(), value);
++                    }
++
++                    self.eval_sequence(body, &call_env)
++                }
++            },
++            other => Err(EvalError::not_a_procedure(other.type_name())),
++        }
++    }
++}
++
++fn parse_signature(signature: &[Expr]) -> Result<(String, Vec<String>), EvalError> {
++    let (name_expr, params_expr) = signature
++        .split_first()
++        .ok_or_else(|| EvalError::syntax("function definition requires a name"))?;
++
++    let Expr::Symbol(name) = name_expr else {
++        return Err(EvalError::syntax("function name must be a symbol"));
++    };
++
++    let params = params_expr
++        .iter()
++        .map(expect_symbol)
++        .collect::<Result<Vec<_>, _>>()?;
++    Ok((name.clone(), params))
++}
++
++fn parse_params(expr: &Expr) -> Result<Vec<String>, EvalError> {
++    match expr {
++        Expr::List(items) => items.iter().map(expect_symbol).collect(),
++        _ => Err(EvalError::syntax("lambda parameters must be a list")),
++    }
++}
++
++fn parse_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
++    let Expr::List(bindings) = expr else {
++        return Err(EvalError::syntax("let bindings must be a list"));
++    };
++
++    bindings
++        .iter()
++        .map(|binding| match binding {
++            Expr::List(items) if items.len() == 2 => {
++                let name = expect_symbol(&items[0])?;
++                Ok((name, items[1].clone()))
++            }
++            _ => Err(EvalError::syntax("binding must have the form (name expr)")),
++        })
++        .collect()
++}
++
++fn expect_symbol(expr: &Expr) -> Result<String, EvalError> {
++    match expr {
++        Expr::Symbol(symbol) => Ok(symbol.clone()),
++        _ => Err(EvalError::syntax("expected symbol")),
++    }
++}
++
++fn quote_to_value(expr: &Expr) -> Value {
++    match expr {
++        Expr::Int(value) => Value::Int(*value),
++        Expr::Bool(value) => Value::Bool(*value),
++        Expr::String(value) => Value::String(value.clone()),
++        Expr::Symbol(value) => Value::Symbol(value.clone()),
++        Expr::List(items) => list_from_vec(items.iter().map(quote_to_value).collect()),
++    }
++}
+diff -ruN /home/my/.zeroclaw/workspace/workspace/cx-scala-qg-r21/bench/rust/src/scheme/mod.rs /tmp/cx-rust-l03/bench/rust/src/scheme/mod.rs
+--- /home/my/.zeroclaw/workspace/workspace/cx-scala-qg-r21/bench/rust/src/scheme/mod.rs	2026-03-23 23:45:29.832378071 +0000
++++ /tmp/cx-rust-l03/bench/rust/src/scheme/mod.rs	2026-03-24 00:46:55.008364007 +0000
+@@ -1,7 +1,15 @@
++mod ast;
++mod builtins;
++mod env;
++mod evaluator;
+ pub mod error;
++mod parser;
++mod value;
+ 
+ pub use error::EvalError;
+ 
++use evaluator::Evaluator;
++
+ /// Evaluate one or more Scheme expressions and return the string
+ /// representation of the last result.
+ ///
+@@ -10,14 +18,16 @@
+ /// use ming::scheme::eval_str;
+ /// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
+ /// ```
+-pub fn eval_str(_input: &str) -> Result<String, EvalError> {
+-    todo!()
++pub fn eval_str(input: &str) -> Result<String, EvalError> {
++    let (value, _) = Evaluator::new().eval(input)?;
++    Ok(value.render())
+ }
+ 
+ /// Evaluate Scheme expressions, returning both the result value and
+ /// any output produced by `display`, `write`, or `newline`.
+-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
+-    todo!()
++pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
++    let (value, output) = Evaluator::new().eval(input)?;
++    Ok((value.render(), output))
+ }
+ 
+ #[cfg(test)]
+diff -ruN /home/my/.zeroclaw/workspace/workspace/cx-scala-qg-r21/bench/rust/src/scheme/parser.rs /tmp/cx-rust-l03/bench/rust/src/scheme/parser.rs
+--- /home/my/.zeroclaw/workspace/workspace/cx-scala-qg-r21/bench/rust/src/scheme/parser.rs	1970-01-01 00:00:00.000000000 +0000
++++ /tmp/cx-rust-l03/bench/rust/src/scheme/parser.rs	2026-03-24 00:46:55.008364007 +0000
+@@ -0,0 +1,157 @@
++use super::ast::Expr;
++use super::error::EvalError;
++
++pub fn parse_program(input: &str) -> Result<Vec<Expr>, EvalError> {
++    let mut parser = Parser::new(input);
++    let mut exprs = Vec::new();
++
++    parser.skip_ignored();
++    while !parser.is_done() {
++        exprs.push(parser.parse_expr()?);
++        parser.skip_ignored();
++    }
++
++    Ok(exprs)
++}
++
++struct Parser {
++    chars: Vec<char>,
++    pos: usize,
++}
++
++impl Parser {
++    fn new(input: &str) -> Self {
++        Self {
++            chars: input.chars().collect(),
++            pos: 0,
++        }
++    }
++
++    fn parse_expr(&mut self) -> Result<Expr, EvalError> {
++        self.skip_ignored();
++
++        match self.peek() {
++            Some('(') => self.parse_list(),
++            Some(')') => Err(EvalError::syntax("unexpected ')'")),
++            Some('\'') => {
++                self.pos += 1;
++                let quoted = self.parse_expr()?;
++                Ok(Expr::List(vec![Expr::Symbol("quote".to_string()), quoted]))
++            }
++            Some('"') => self.parse_string(),
++            Some(_) => self.parse_atom(),
++            None => Err(EvalError::syntax("unexpected end of input")),
++        }
++    }
++
++    fn parse_list(&mut self) -> Result<Expr, EvalError> {
++        self.expect('(')?;
++        let mut items = Vec::new();
++
++        loop {
++            self.skip_ignored();
++
++            match self.peek() {
++                Some(')') => {
++                    self.pos += 1;
++                    return Ok(Expr::List(items));
++                }
++                Some(_) => items.push(self.parse_expr()?),
++                None => return Err(EvalError::syntax("unterminated list")),
++            }
++        }
++    }
++
++    fn parse_string(&mut self) -> Result<Expr, EvalError> {
++        self.expect('"')?;
++        let mut value = String::new();
++
++        while let Some(ch) = self.bump() {
++            match ch {
++                '"' => return Ok(Expr::String(value)),
++                '\\' => {
++                    let escaped = match self.bump() {
++                        Some('n') => '\n',
++                        Some('t') => '\t',
++                        Some('"') => '"',
++                        Some('\\') => '\\',
++                        Some(other) => other,
++                        None => return Err(EvalError::syntax("unterminated string")),
++                    };
++                    value.push(escaped);
++                }
++                other => value.push(other),
++            }
++        }
++
++        Err(EvalError::syntax("unterminated string"))
++    }
++
++    fn parse_atom(&mut self) -> Result<Expr, EvalError> {
++        let start = self.pos;
++
++        while let Some(ch) = self.peek() {
++            if ch.is_whitespace() || matches!(ch, '(' | ')' | '\'' | ';') {
++                break;
++            }
++            self.pos += 1;
++        }
++
++        let token: String = self.chars[start..self.pos].iter().collect();
++        if token.is_empty() {
++            return Err(EvalError::syntax("unexpected token"));
++        }
++
++        match token.as_str() {
++            "#t" => Ok(Expr::Bool(true)),
++            "#f" => Ok(Expr::Bool(false)),
++            _ => match token.parse::<i64>() {
++                Ok(value) => Ok(Expr::Int(value)),
++                Err(_) => Ok(Expr::Symbol(token)),
++            },
++        }
++    }
++
++    fn skip_ignored(&mut self) {
++        loop {
++            while matches!(self.peek(), Some(ch) if ch.is_whitespace()) {
++                self.pos += 1;
++            }
++
++            if self.peek() == Some(';') {
++                while let Some(ch) = self.bump() {
++                    if ch == '\n' {
++                        break;
++                    }
++                }
++                continue;
++            }
++
++            break;
++        }
++    }
++
++    fn expect(&mut self, expected: char) -> Result<(), EvalError> {
++        match self.bump() {
++            Some(ch) if ch == expected => Ok(()),
++            Some(ch) => Err(EvalError::syntax(format!(
++                "expected '{expected}', found '{ch}'"
++            ))),
++            None => Err(EvalError::syntax(format!("expected '{expected}'"))),
++        }
++    }
++
++    fn peek(&self) -> Option<char> {
++        self.chars.get(self.pos).copied()
++    }
++
++    fn bump(&mut self) -> Option<char> {
++        let ch = self.peek()?;
++        self.pos += 1;
++        Some(ch)
++    }
++
++    fn is_done(&self) -> bool {
++        self.pos >= self.chars.len()
++    }
++}
+diff -ruN /home/my/.zeroclaw/workspace/workspace/cx-scala-qg-r21/bench/rust/src/scheme/value.rs /tmp/cx-rust-l03/bench/rust/src/scheme/value.rs
+--- /home/my/.zeroclaw/workspace/workspace/cx-scala-qg-r21/bench/rust/src/scheme/value.rs	1970-01-01 00:00:00.000000000 +0000
++++ /tmp/cx-rust-l03/bench/rust/src/scheme/value.rs	2026-03-24 00:46:55.008364007 +0000
+@@ -0,0 +1,152 @@
++use std::rc::Rc;
++
++use super::ast::Expr;
++use super::env::EnvRef;
++use super::error::EvalError;
++
++pub type BuiltinFn = fn(&[Value]) -> Result<Value, EvalError>;
++
++#[derive(Clone, Debug)]
++pub enum Value {
++    Int(i64),
++    Bool(bool),
++    String(String),
++    Symbol(String),
++    Nil,
++    Pair(Rc<PairCell>),
++    Function(Rc<Function>),
++    Void,
++}
++
++#[derive(Clone, Debug)]
++pub struct PairCell {
++    pub car: Value,
++    pub cdr: Value,
++}
++
++#[derive(Clone, Debug)]
++pub enum Function {
++    Builtin {
++        name: &'static str,
++        func: BuiltinFn,
++    },
++    Lambda {
++        params: Vec<String>,
++        body: Vec<Expr>,
++        env: EnvRef,
++    },
++}
++
++impl Value {
++    pub fn builtin(name: &'static str, func: BuiltinFn) -> Self {
++        Self::Function(Rc::new(Function::Builtin { name, func }))
++    }
++
++    pub fn lambda(params: Vec<String>, body: Vec<Expr>, env: EnvRef) -> Self {
++        Self::Function(Rc::new(Function::Lambda { params, body, env }))
++    }
++
++    pub fn cons(car: Value, cdr: Value) -> Self {
++        Self::Pair(Rc::new(PairCell { car, cdr }))
++    }
++
++    pub fn is_truthy(&self) -> bool {
++        !matches!(self, Self::Bool(false))
++    }
++
++    pub fn type_name(&self) -> &'static str {
++        match self {
++            Self::Int(_) => "number",
++            Self::Bool(_) => "boolean",
++            Self::String(_) => "string",
++            Self::Symbol(_) => "symbol",
++            Self::Nil => "null",
++            Self::Pair(_) => "pair",
++            Self::Function(_) => "procedure",
++            Self::Void => "void",
++        }
++    }
++
++    pub fn render(&self) -> String {
++        match self {
++            Self::Int(value) => value.to_string(),
++            Self::Bool(true) => "#t".to_string(),
++            Self::Bool(false) => "#f".to_string(),
++            Self::String(value) => render_string(value),
++            Self::Symbol(value) => value.clone(),
++            Self::Nil => "()".to_string(),
++            Self::Pair(pair) => {
++                let mut out = String::from("(");
++                render_pair(pair, &mut out);
++                out.push(')');
++                out
++            }
++            Self::Function(_) => "#<procedure>".to_string(),
++            Self::Void => "#<void>".to_string(),
++        }
++    }
++
++    pub fn as_number(&self) -> Result<i64, EvalError> {
++        match self {
++            Self::Int(value) => Ok(*value),
++            other => Err(EvalError::type_error("number", other.type_name())),
++        }
++    }
++}
++
++pub fn list_from_vec(items: Vec<Value>) -> Value {
++    items
++        .into_iter()
++        .rev()
++        .fold(Value::Nil, |tail, item| Value::cons(item, tail))
++}
++
++pub fn proper_list_to_vec(list: &Value) -> Result<Vec<Value>, EvalError> {
++    let mut items = Vec::new();
++    let mut current = list;
++
++    loop {
++        match current {
++            Value::Nil => return Ok(items),
++            Value::Pair(pair) => {
++                items.push(pair.car.clone());
++                current = &pair.cdr;
++            }
++            other => return Err(EvalError::type_error("proper list", other.type_name())),
++        }
++    }
++}
++
++fn render_pair(pair: &PairCell, out: &mut String) {
++    out.push_str(&pair.car.render());
++
++    match &pair.cdr {
++        Value::Nil => {}
++        Value::Pair(next) => {
++            out.push(' ');
++            render_pair(next, out);
++        }
++        tail => {
++            out.push_str(" . ");
++            out.push_str(&tail.render());
++        }
++    }
++}
++
++fn render_string(value: &str) -> String {
++    let mut rendered = String::with_capacity(value.len() + 2);
++    rendered.push('"');
++
++    for ch in value.chars() {
++        match ch {
++            '\\' => rendered.push_str("\\\\"),
++            '"' => rendered.push_str("\\\""),
++            '\n' => rendered.push_str("\\n"),
++            '\t' => rendered.push_str("\\t"),
++            other => rendered.push(other),
++        }
++    }
++
++    rendered.push('"');
++    rendered
++}
