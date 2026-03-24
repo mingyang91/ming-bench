@@ -295,15 +295,74 @@ type kontWindRewind struct {
 
 func (*kontWindRewind) isKont() {}
 
+// ---------- Exception handler frames ----------
+
+type handlerStackEntry struct {
+	handler   value        // handler proc (for with-exception-handler)
+	isGuard   bool         // true if this is a guard handler
+	varName   string       // guard variable name
+	clauses   []*expr      // guard clause expressions
+	guardEnv  *env         // guard's lexical environment
+	guardK    kont         // guard's continuation
+	guardWind []*windEntry // wind stack at guard point
+}
+
+// Pop exception handler on normal return from protected thunk.
+type kontPopHandler struct {
+	parent kont
+}
+
+func (*kontPopHandler) isKont() {}
+
+// After raise handler returns — error for non-continuable raise.
+type kontRaiseCheck struct {
+	parent kont
+}
+
+func (*kontRaiseCheck) isKont() {}
+
+// Guard clause test evaluation.
+type kontGuardClause struct {
+	body    []*expr // body exprs if test passes
+	rest    []*expr // remaining clauses to try
+	exnVal  value
+	varName string
+	env     *env // guard's original env (without var bound)
+	parent  kont // guard's continuation
+}
+
+func (*kontGuardClause) isKont() {}
+
+// After unwinding, start testing guard clauses.
+type kontGuardStartTest struct {
+	clauses []*expr
+	exnVal  value
+	varName string
+	env     *env // guard's original env
+	guardK  kont
+}
+
+func (*kontGuardStartTest) isKont() {}
+
+// After unwinding for else clause, evaluate else body.
+type kontGuardElseBody struct {
+	body   []*expr
+	env    *env
+	parent kont
+}
+
+func (*kontGuardElseBody) isKont() {}
+
 // ---------- CEK machine ----------
 
 type cekM struct {
-	ctrl    *expr
-	env     *env
-	val     value
-	kont    kont
-	isValue bool
-	wind    []*windEntry // dynamic-wind stack
+	ctrl     *expr
+	env      *env
+	val      value
+	kont     kont
+	isValue  bool
+	wind     []*windEntry        // dynamic-wind stack
+	handlers []*handlerStackEntry // exception handler stack
 }
 
 func (m *cekM) setEval(e *expr, environ *env, k kont) {
@@ -424,6 +483,8 @@ func (m *cekM) stepEval() error {
 			return m.cekCase(e, environ, k)
 		case "do":
 			return m.cekDo(e, environ, k)
+		case "guard":
+			return m.cekGuard(e, environ, k)
 		}
 	}
 
@@ -1086,6 +1147,68 @@ func (m *cekM) stepApply() error {
 		m.setApply(kk.targetVal, kk.targetK)
 		return nil
 
+	case *kontPopHandler:
+		if len(m.handlers) > 0 {
+			m.handlers = m.handlers[:len(m.handlers)-1]
+		}
+		m.setApply(val, kk.parent)
+		return nil
+
+	case *kontRaiseCheck:
+		// Handler returned normally for non-continuable raise — error
+		return &EvalError{Message: "raise: exception handler returned"}
+
+	case *kontGuardStartTest:
+		// Arrived after unwinding. val is the exception value (ignored, we use kk.exnVal).
+		guardEnv := newEnv(kk.env)
+		guardEnv.set(kk.varName, kk.exnVal)
+		clause := kk.clauses[0]
+		if clause.kind != exprList || len(clause.list) == 0 {
+			return &EvalError{Message: "guard: bad clause"}
+		}
+		if clause.list[0].kind == exprAtom && clause.list[0].atom.kind == valSymbol && clause.list[0].atom.sval == "else" {
+			return m.evalBody(clause.list[1:], guardEnv, kk.guardK)
+		}
+		m.setEval(clause.list[0], guardEnv, &kontGuardClause{
+			body: clause.list[1:], rest: kk.clauses[1:],
+			exnVal: kk.exnVal, varName: kk.varName, env: kk.env, parent: kk.guardK,
+		})
+		return nil
+
+	case *kontGuardElseBody:
+		// Arrived after unwinding for else. val is ignored.
+		return m.evalBody(kk.body, kk.env, kk.parent)
+
+	case *kontGuardClause:
+		if isTruthy(val) {
+			if len(kk.body) == 0 {
+				m.setApply(val, kk.parent)
+				return nil
+			}
+			guardEnv := newEnv(kk.env)
+			guardEnv.set(kk.varName, kk.exnVal)
+			return m.evalBody(kk.body, guardEnv, kk.parent)
+		}
+		// Test failed, try next clause
+		guardEnv := newEnv(kk.env)
+		guardEnv.set(kk.varName, kk.exnVal)
+		if len(kk.rest) == 0 {
+			// No more clauses, re-raise
+			return &EvalError{Message: fmt.Sprintf("unhandled exception: %s", kk.exnVal.String())}
+		}
+		clause := kk.rest[0]
+		if clause.kind != exprList || len(clause.list) == 0 {
+			return &EvalError{Message: "guard: bad clause"}
+		}
+		if clause.list[0].kind == exprAtom && clause.list[0].atom.kind == valSymbol && clause.list[0].atom.sval == "else" {
+			return m.evalBody(clause.list[1:], guardEnv, kk.parent)
+		}
+		m.setEval(clause.list[0], guardEnv, &kontGuardClause{
+			body: clause.list[1:], rest: kk.rest[1:],
+			exnVal: kk.exnVal, varName: kk.varName, env: kk.env, parent: kk.parent,
+		})
+		return nil
+
 	default:
 		return &EvalError{Message: "internal: unknown continuation frame"}
 	}
@@ -1177,6 +1300,20 @@ func (m *cekM) applyBuiltinCEK(op value, args []value, callExpr *expr, callEnv *
 			bodyThunk: bodyThunk, outThunk: outThunk, inThunk: inThunk,
 			callExpr: callExpr, callEnv: callEnv, parent: k,
 		})
+
+	case "raise":
+		if len(args) != 1 {
+			return &EvalError{Message: fmt.Sprintf("%d:%d: raise: expected 1 argument", callExpr.line, callExpr.col)}
+		}
+		return m.doRaise(args[0], callExpr, callEnv, k)
+
+	case "with-exception-handler":
+		if len(args) != 2 {
+			return &EvalError{Message: fmt.Sprintf("%d:%d: with-exception-handler: expected 2 arguments", callExpr.line, callExpr.col)}
+		}
+		handler, thunk := args[0], args[1]
+		m.handlers = append(m.handlers, &handlerStackEntry{handler: handler})
+		return m.applyProc(thunk, nil, callExpr, callEnv, &kontPopHandler{parent: k})
 
 	case "apply":
 		if len(args) < 2 {
@@ -1292,6 +1429,105 @@ func (m *cekM) doStartSteps(dt *kontDoTest) error {
 }
 
 // ---------- Continuation invocation with wind shifting ----------
+
+func (m *cekM) cekGuard(e *expr, environ *env, k kont) error {
+	// (guard (var clause ...) body ...)
+	if len(e.list) < 3 {
+		return &EvalError{Message: fmt.Sprintf("%d:%d: guard: bad syntax", e.line, e.col)}
+	}
+	header := e.list[1]
+	if header.kind != exprList || len(header.list) < 1 {
+		return &EvalError{Message: fmt.Sprintf("%d:%d: guard: expected (var clause ...)", e.line, e.col)}
+	}
+	varExpr := header.list[0]
+	if varExpr.kind != exprAtom || varExpr.atom.kind != valSymbol {
+		return &EvalError{Message: fmt.Sprintf("%d:%d: guard: expected variable name", varExpr.line, varExpr.col)}
+	}
+	varName := varExpr.atom.sval
+	clauses := header.list[1:]
+	body := e.list[2:]
+
+	// Save current wind stack for unwinding on exception
+	windCopy := make([]*windEntry, len(m.wind))
+	copy(windCopy, m.wind)
+
+	// Push guard handler
+	m.handlers = append(m.handlers, &handlerStackEntry{
+		isGuard:   true,
+		varName:   varName,
+		clauses:   clauses,
+		guardEnv:  environ,
+		guardK:    k,
+		guardWind: windCopy,
+	})
+
+	// Evaluate body; pop handler on normal completion
+	return m.evalBody(body, environ, &kontPopHandler{parent: k})
+}
+
+func (m *cekM) doRaise(exnVal value, callExpr *expr, callEnv *env, k kont) error {
+	if len(m.handlers) == 0 {
+		return &EvalError{Message: fmt.Sprintf("unhandled exception: %s", exnVal.String())}
+	}
+	entry := m.handlers[len(m.handlers)-1]
+	m.handlers = m.handlers[:len(m.handlers)-1]
+
+	if entry.isGuard {
+		// Unwind dynamic-wind to guard point, then test clauses.
+		// Build a kontGuardClause chain starting from the first clause.
+		guardK := entry.guardK
+		guardEnv := newEnv(entry.guardEnv)
+		guardEnv.set(entry.varName, exnVal)
+
+		// Build the target continuation: evaluate first clause test
+		var targetK kont
+		if len(entry.clauses) == 0 {
+			return &EvalError{Message: fmt.Sprintf("unhandled exception: %s", exnVal.String())}
+		}
+
+		// We'll create a special "landing" continuation that starts clause testing.
+		// Since invokeContinuation delivers a value to targetK, we use a kontGuardClause
+		// but we need to trigger the first test evaluation. We'll use a trick:
+		// deliver the exception value to a frame that starts clause testing.
+		clause := entry.clauses[0]
+		if clause.kind != exprList || len(clause.list) == 0 {
+			return &EvalError{Message: "guard: bad clause"}
+		}
+		// Check for else
+		if clause.list[0].kind == exprAtom && clause.list[0].atom.kind == valSymbol && clause.list[0].atom.sval == "else" {
+			// Unwind to guard point, then evaluate else body
+			targetK = &kontSeq{exprs: clause.list[1:], env: guardEnv, parent: guardK}
+			if len(clause.list[1:]) == 1 {
+				targetK = guardK // will eval single expr below
+			}
+			fakeContVal := value{kind: valContinuation, cont: targetK, wind: entry.guardWind}
+			// For else, we need to evaluate the body after unwinding.
+			// Use evalBody by going through a special path.
+			// Actually, let's use a simpler approach: unwind, then the value delivered
+			// is ignored and we evaluate else body.
+			// Hmm, invokeContinuation delivers arg to targetK.
+			// Let's make targetK something that discards the value and evaluates else body.
+			targetK = &kontGuardElseBody{body: clause.list[1:], env: guardEnv, parent: guardK}
+			fakeContVal = value{kind: valContinuation, cont: targetK, wind: entry.guardWind}
+			return m.invokeContinuation(fakeContVal, exnVal, callExpr, callEnv)
+		}
+
+		// Need to evaluate the test after unwinding. Set up a frame that,
+		// when it receives the exception value, evaluates the test.
+		targetK = &kontGuardStartTest{
+			clauses: entry.clauses,
+			exnVal:  exnVal,
+			varName: entry.varName,
+			env:     entry.guardEnv,
+			guardK:  guardK,
+		}
+		fakeContVal := value{kind: valContinuation, cont: targetK, wind: entry.guardWind}
+		return m.invokeContinuation(fakeContVal, exnVal, callExpr, callEnv)
+	}
+
+	// with-exception-handler: call handler procedure
+	return m.applyProc(entry.handler, []value{exnVal}, callExpr, callEnv, &kontRaiseCheck{parent: k})
+}
 
 func (m *cekM) invokeContinuation(contVal value, arg value, callExpr *expr, callEnv *env) error {
 	targetK := contVal.cont

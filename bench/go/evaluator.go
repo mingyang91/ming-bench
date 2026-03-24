@@ -3303,6 +3303,7 @@ func makeTopLevelEnv() *env {
 		"caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "cadddr",
 		"call/cc", "call-with-current-continuation",
 		"dynamic-wind",
+		"raise", "with-exception-handler",
 	}
 	for _, name := range builtins {
 		e.set(name, builtinVal(name))
