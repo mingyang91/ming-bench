@@ -15,6 +15,8 @@ pub struct Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64),
     Boolean(bool),
     Str(String),
     Char(char),
@@ -28,6 +30,8 @@ enum TokenKind {
     RParen,
     Quote,
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64),
     Boolean(bool),
     Str(String),
     Char(char),
@@ -144,6 +148,14 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                 let word: String = chars[start..i].iter().collect();
                 if let Ok(n) = word.parse::<i64>() {
                     tokens.push(Token { kind: TokenKind::Integer(n), span: Span { line, col: start_col } });
+                } else if let Some((n, d)) = parse_rational_literal(&word) {
+                    tokens.push(Token { kind: TokenKind::Rational(n, d), span: Span { line, col: start_col } });
+                } else if word.contains('.') || word.contains('e') || word.contains('E') {
+                    if let Ok(f) = word.parse::<f64>() {
+                        tokens.push(Token { kind: TokenKind::Float(f), span: Span { line, col: start_col } });
+                    } else {
+                        tokens.push(Token { kind: TokenKind::Symbol(word), span: Span { line, col: start_col } });
+                    }
                 } else {
                     tokens.push(Token { kind: TokenKind::Symbol(word), span: Span { line, col: start_col } });
                 }
@@ -151,6 +163,18 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
         }
     }
     Ok(tokens)
+}
+
+fn parse_rational_literal(s: &str) -> Option<(i64, i64)> {
+    let parts: Vec<&str> = s.splitn(2, '/').collect();
+    if parts.len() == 2 {
+        if let (Ok(n), Ok(d)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
+            if d != 0 {
+                return Some((n, d));
+            }
+        }
+    }
+    None
 }
 
 fn is_delimiter(c: char) -> bool {
@@ -180,6 +204,8 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Expr, usize), EvalError> 
     let span = tokens[pos].span;
     match &tokens[pos].kind {
         TokenKind::Integer(n) => Ok((Expr { kind: ExprKind::Integer(*n), span }, pos + 1)),
+        TokenKind::Float(f) => Ok((Expr { kind: ExprKind::Float(*f), span }, pos + 1)),
+        TokenKind::Rational(n, d) => Ok((Expr { kind: ExprKind::Rational(*n, *d), span }, pos + 1)),
         TokenKind::Boolean(b) => Ok((Expr { kind: ExprKind::Boolean(*b), span }, pos + 1)),
         TokenKind::Str(s) => Ok((Expr { kind: ExprKind::Str(s.clone()), span }, pos + 1)),
         TokenKind::Char(c) => Ok((Expr { kind: ExprKind::Char(*c), span }, pos + 1)),
