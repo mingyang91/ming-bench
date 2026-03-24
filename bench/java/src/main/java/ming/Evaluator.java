@@ -271,6 +271,19 @@ public class Evaluator {
             // Special forms
             if (rawHead instanceof String op) {
                 switch (op) {
+                    case "set!" -> {
+                        if (list.size() != 3) throw error("set!: bad syntax");
+                        Object setTarget = list.get(1);
+                        if (setTarget instanceof Located loc) setTarget = loc.value();
+                        if (!(setTarget instanceof String setName)) throw error("set!: not a variable");
+                        Object setVal = eval(list.get(2), env);
+                        try {
+                            env.set(setName, setVal);
+                        } catch (EvalError e) {
+                            throw error("set!: unbound variable: " + setName);
+                        }
+                        return VOID;
+                    }
                     case "define" -> { return evalDefine(list, env); }
                     case "if" -> { return evalIf(list, env); }
                     case "quote" -> {
