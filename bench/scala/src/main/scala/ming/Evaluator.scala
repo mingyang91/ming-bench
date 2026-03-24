@@ -2,7 +2,6 @@ package ming
 
 import scala.collection.mutable
 
-// --- AST ---
 enum Expr:
   case IntLit(value: Long)
   case BoolLit(value: Boolean)
@@ -10,112 +9,6 @@ enum Expr:
   case Symbol(name: String)
   case SList(elems: List[Expr])
 
-// --- Parser ---
-object Parser:
-
-  def parse(input: String): List[Expr] =
-    val tokens     = tokenize(input)
-    val (exprs, _) = parseAll(tokens, 0)
-    exprs
-
-  private def tokenizeString(input: String, start: Int): (String, Int) =
-    val sb = new StringBuilder("\"")
-    var i  = start
-    while i < input.length && input(i) != '"' do
-      if input(i) == '\\' then
-        i += 1
-        if i < input.length then
-          input(i) match
-            case 'n'   => sb.append('\n')
-            case 't'   => sb.append('\t')
-            case '\\'  => sb.append('\\')
-            case '"'   => sb.append('"')
-            case other => sb.append('\\'); sb.append(other)
-          i += 1
-        end if
-      else
-        sb.append(input(i))
-        i += 1
-    end while
-    if i < input.length then i += 1 // closing quote
-    sb.append('"')
-    (sb.toString, i)
-
-  private def isDelimiter(c: Char): Boolean =
-    c.isWhitespace || c == '(' || c == ')' || c == '"' || c == ';'
-
-  private def tokenizeBare(input: String, start: Int): (String, Int) =
-    val sb = new StringBuilder
-    var i  = start
-    while i < input.length && !isDelimiter(input(i)) do
-      sb.append(input(i))
-      i += 1
-    end while
-    (sb.toString, i)
-
-  private def tokenize(input: String): Array[String] =
-    val buf = mutable.ArrayBuffer[String]()
-    var i   = 0
-    while i < input.length do
-      input(i) match
-        case c if c.isWhitespace => i += 1
-        case ';'                 => while i < input.length && input(i) != '\n' do i += 1
-        case '('                 => buf += "("; i += 1
-        case ')'                 => buf += ")"; i += 1
-        case '\''                => buf += "'"; i += 1
-        case '"' =>
-          val (tok, next) = tokenizeString(input, i + 1)
-          buf += tok
-          i = next
-        case _ =>
-          val (tok, next) = tokenizeBare(input, i)
-          buf += tok
-          i = next
-    end while
-    buf.toArray
-
-  private def parseAll(tokens: Array[String], pos: Int): (List[Expr], Int) =
-    val buf = mutable.ListBuffer[Expr]()
-    var i   = pos
-    while i < tokens.length do
-      val (expr, next) = parseExpr(tokens, i)
-      buf += expr
-      i = next
-    end while
-    (buf.toList, i)
-
-  private def parseExpr(tokens: Array[String], pos: Int): (Expr, Int) =
-    if pos >= tokens.length then throw new EvalError("unexpected end of input")
-    val tok = tokens(pos)
-    tok match
-      case "(" =>
-        val buf = mutable.ListBuffer[Expr]()
-        var i   = pos + 1
-        while i < tokens.length && tokens(i) != ")" do
-          val (expr, next) = parseExpr(tokens, i)
-          buf += expr
-          i = next
-        end while
-        if i >= tokens.length then throw new EvalError("missing closing parenthesis")
-        (Expr.SList(buf.toList), i + 1)
-      case ")" =>
-        throw new EvalError("unexpected )")
-      case "'" =>
-        val (expr, next) = parseExpr(tokens, pos + 1)
-        (Expr.SList(List(Expr.Symbol("quote"), expr)), next)
-      case _ =>
-        (parseAtom(tok), pos + 1)
-
-  private def parseAtom(tok: String): Expr =
-    if tok == "#t" then Expr.BoolLit(true)
-    else if tok == "#f" then Expr.BoolLit(false)
-    else if tok.startsWith("\"") && tok.endsWith("\"") then Expr.StrLit(tok.substring(1, tok.length - 1))
-    else
-      tok.toLongOption match
-        case Some(n) => Expr.IntLit(n)
-        case None    => Expr.Symbol(tok)
-
-// --- Values ---
 enum SchemeVal:
   case IntVal(value: Long)
   case BoolVal(value: Boolean)
@@ -137,7 +30,6 @@ enum SchemeVal:
     case BuiltinProc(name, _) => s"#<procedure:$name>"
     case Void                 => "#<void>"
 
-// --- Environment ---
 class Env(val bindings: mutable.Map[String, SchemeVal], val parent: Option[Env]):
 
   def lookup(name: String): SchemeVal =
@@ -151,7 +43,6 @@ class Env(val bindings: mutable.Map[String, SchemeVal], val parent: Option[Env])
   def define(name: String, value: SchemeVal): Unit =
     bindings(name) = value
 
-// --- Evaluator ---
 object Evaluator:
 
   private def isTruthy(v: SchemeVal): Boolean = v match
@@ -228,12 +119,39 @@ object Evaluator:
 
     env
 
+  private def quoteToVal(expr: Expr): SchemeVal = expr match
+    case Expr.IntLit(n)  => SchemeVal.IntVal(n)
+    case Expr.BoolLit(b) => SchemeVal.BoolVal(b)
+    case Expr.StrLit(s)  => SchemeVal.StrVal(s)
+    case Expr.Symbol(n)  => SchemeVal.SymVal(n)
+    case Expr.SList(es)  => SchemeVal.ListVal(es.map(quoteToVal))
+
   private def eval(expr: Expr, env: Env): SchemeVal = expr match
     case Expr.IntLit(n)    => SchemeVal.IntVal(n)
     case Expr.BoolLit(b)   => SchemeVal.BoolVal(b)
     case Expr.StrLit(s)    => SchemeVal.StrVal(s)
     case Expr.Symbol(name) => env.lookup(name)
     case Expr.SList(Nil)   => SchemeVal.ListVal(Nil)
+    case Expr.SList(Expr.Symbol("quote") :: arg :: Nil) =>
+      quoteToVal(arg)
+    case Expr.SList(Expr.Symbol("if") :: cond :: thenBr :: elseBr :: Nil) =>
+      if isTruthy(eval(cond, env)) then eval(thenBr, env) else eval(elseBr, env)
+    case Expr.SList(Expr.Symbol("if") :: cond :: thenBr :: Nil) =>
+      if isTruthy(eval(cond, env)) then eval(thenBr, env) else SchemeVal.Void
+    case Expr.SList(Expr.Symbol("define") :: Expr.SList(Expr.Symbol(name) :: params) :: body) =>
+      val paramNames = params.map {
+        case Expr.Symbol(n) => n; case _ => throw new EvalError("define: expected parameter name")
+      }
+      env.define(name, SchemeVal.Procedure(paramNames, body, env))
+      SchemeVal.Void
+    case Expr.SList(Expr.Symbol("define") :: Expr.Symbol(name) :: value :: Nil) =>
+      env.define(name, eval(value, env))
+      SchemeVal.Void
+    case Expr.SList(Expr.Symbol("lambda") :: Expr.SList(params) :: body) =>
+      val paramNames = params.map {
+        case Expr.Symbol(n) => n; case _ => throw new EvalError("lambda: expected parameter name")
+      }
+      SchemeVal.Procedure(paramNames, body, env)
     case Expr.SList(Expr.Symbol("and") :: args) =>
       evalAnd(args, env)
     case Expr.SList(Expr.Symbol("or") :: args) =>
