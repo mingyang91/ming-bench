@@ -30,11 +30,20 @@ public class Evaluator {
     // Macro representation
     record SyntaxRule(Object pattern, Object template) {}
     record SyntaxRulesDef(List<String> literals, List<SyntaxRule> rules, Environment defEnv) {}
+    record SyntaxCaseTransformer(Lambda transformer, Environment defEnv) {}
+
+    // Syntax context for syntax-case pattern bindings
+    record SyntaxContext(Map<String, Object> bindings, Set<String> ellipsisVars,
+                         Set<String> patternVars, Environment defEnv) {}
+    private final List<SyntaxContext> syntaxContextStack = new ArrayList<>();
+    private final List<Environment> macroDefEnvStack = new ArrayList<>();
+    private final List<Environment> macroUseEnvStack = new ArrayList<>();
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "if", "let", "let*", "begin", "set!", "define", "lambda", "quote", "cond",
         "and", "or", "not", "define-syntax", "syntax-rules", "define-record-type",
-        "letrec", "letrec*", "case", "do", "when", "unless"
+        "letrec", "letrec*", "case", "do", "when", "unless",
+        "syntax-case", "syntax", "with-syntax"
     );
 
     // Output buffer for display/write/newline
@@ -198,6 +207,9 @@ public class Evaluator {
                     } else if (next == 'f') {
                         tokens.add(new Token(Boolean.FALSE, line, startCol));
                         i += 2; col += 2;
+                    } else if (next == '\'') {
+                        tokens.add(new Token("#'", line, startCol));
+                        i += 2; col += 2;
                     } else if (next == '\\') {
                         // Character literal: #\x, #\space, #\newline, #\tab
                         i += 2; col += 2;
@@ -285,6 +297,15 @@ public class Evaluator {
             quoteExpr.add("quote");
             quoteExpr.add(rawQuoted);
             return new Located(quoteExpr, token.line(), token.col());
+        }
+        if (token.value().equals("#'")) {
+            pos[0]++;
+            Object synExpr = parse(tokens, pos);
+            Object rawSynExpr = synExpr instanceof Located loc ? loc.value() : synExpr;
+            List<Object> syntaxExpr = new ArrayList<>();
+            syntaxExpr.add("syntax");
+            syntaxExpr.add(rawSynExpr);
+            return new Located(syntaxExpr, token.line(), token.col());
         }
         if (token.value().equals("(")) {
             pos[0]++;
@@ -544,6 +565,15 @@ public class Evaluator {
                         return Boolean.FALSE.equals(val) ? Boolean.TRUE : Boolean.FALSE;
                     }
                     case "define-syntax" -> { return evalDefineSyntax(list, env); }
+                    case "syntax-case" -> {
+                        return evalSyntaxCaseForm(list, env);
+                    }
+                    case "syntax" -> {
+                        return evalSyntaxForm(list);
+                    }
+                    case "with-syntax" -> {
+                        return evalWithSyntax(list, env);
+                    }
                     case "define-record-type" -> { return evalDefineRecordType(list, env); }
                     case "case-lambda" -> { return evalCaseLambda(list, env); }
                     case "letrec" -> {
@@ -734,6 +764,11 @@ public class Evaluator {
                     Object headVal = env.lookup(op);
                     if (headVal instanceof SyntaxRulesDef sr) {
                         Object expanded = expandMacro(sr, list, env);
+                        expr = expanded;
+                        continue;
+                    }
+                    if (headVal instanceof SyntaxCaseTransformer sct) {
+                        Object expanded = expandSyntaxCaseTransformer(sct, list, env);
                         expr = expanded;
                         continue;
                     }
@@ -1226,11 +1261,21 @@ public class Evaluator {
         Object transformer = list.get(2);
         if (transformer instanceof Located loc) transformer = loc.value();
         if (!(transformer instanceof List<?> tlist) || tlist.size() < 2)
-            throw error("define-syntax: expected syntax-rules");
+            throw error("define-syntax: expected syntax-rules or lambda");
 
         Object srHead = tlist.get(0);
         if (srHead instanceof Located loc) srHead = loc.value();
-        if (!"syntax-rules".equals(srHead)) throw error("define-syntax: expected syntax-rules");
+
+        if ("lambda".equals(srHead)) {
+            Object lambdaVal = eval(transformer, env);
+            if (lambdaVal instanceof Lambda lam) {
+                env.define(name, new SyntaxCaseTransformer(lam, env));
+                return VOID;
+            }
+            throw error("define-syntax: lambda did not evaluate to procedure");
+        }
+
+        if (!"syntax-rules".equals(srHead)) throw error("define-syntax: expected syntax-rules or lambda");
 
         Object litsObj = tlist.get(1);
         if (litsObj instanceof Located loc) litsObj = loc.value();
@@ -1415,6 +1460,8 @@ public class Evaluator {
     private void collectSymbols(Object template, Set<String> syms) {
         if (template instanceof String s) { syms.add(s); }
         else if (template instanceof List<?> list) {
+            // Don't collect symbols inside (quote ...) — they're literal data
+            if (!list.isEmpty() && "quote".equals(list.get(0))) return;
             for (Object item : list) collectSymbols(item, syms);
         }
     }
@@ -1460,6 +1507,181 @@ public class Evaluator {
             return result;
         }
         return template;
+    }
+
+    // --- syntax-case support ---
+
+    @SuppressWarnings("unchecked")
+    private Object expandSyntaxCaseTransformer(SyntaxCaseTransformer sct, List<?> inputForm, Environment useEnv) throws EvalError {
+        List<Object> input = new ArrayList<>();
+        for (Object item : inputForm) input.add(unwrapDeep(item));
+
+        macroDefEnvStack.add(sct.defEnv());
+        macroUseEnvStack.add(useEnv);
+        try {
+            Object result = apply(sct.transformer(), List.of(input));
+            return result;
+        } finally {
+            macroDefEnvStack.remove(macroDefEnvStack.size() - 1);
+            macroUseEnvStack.remove(macroUseEnvStack.size() - 1);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object evalSyntaxCaseForm(List<?> list, Environment env) throws EvalError {
+        // (syntax-case expr (literals) clause ...)
+        if (list.size() < 4) throw error("syntax-case: bad syntax");
+        Object inputVal = eval(list.get(1), env);
+
+        Object litsObj = list.get(2);
+        if (litsObj instanceof Located loc) litsObj = loc.value();
+        List<String> literals = new ArrayList<>();
+        if (litsObj instanceof List<?> litsList) {
+            for (Object lit : litsList) {
+                if (lit instanceof Located l) lit = l.value();
+                if (lit instanceof String s) literals.add(s);
+            }
+        }
+
+        // Unwrap input to a list
+        List<Object> inputList;
+        if (inputVal instanceof List<?> il) {
+            inputList = new ArrayList<>();
+            for (Object item : il) inputList.add(unwrapDeep(item));
+        } else {
+            throw error("syntax-case: expected list, got: " + schemeToString(inputVal));
+        }
+
+        for (int ci = 3; ci < list.size(); ci++) {
+            Object clause = list.get(ci);
+            if (clause instanceof Located loc) clause = loc.value();
+            if (!(clause instanceof List<?> clauseList) || clauseList.size() < 2)
+                throw error("syntax-case: bad clause");
+
+            Object pattern = unwrapDeep(clauseList.get(0));
+            Object output = clauseList.get(clauseList.size() - 1);
+            // Optional fender: (pattern fender output) has size 3
+            Object fender = clauseList.size() == 3 ? clauseList.get(1) : null;
+
+            if (!(pattern instanceof List<?> patList)) continue;
+            Map<String, Object> bindings = new HashMap<>();
+            Set<String> ellipsisVars = new HashSet<>();
+
+            // Match the full form (including keyword at position 0)
+            List<Object> patArgs = new ArrayList<>((List<Object>) patList);
+
+            if (matchPattern(patArgs, inputList, bindings, literals, ellipsisVars)) {
+                // Check fender if present
+                if (fender != null) {
+                    // Create env with pattern bindings for fender eval
+                    Environment fenderEnv = new Environment(env);
+                    for (var entry : bindings.entrySet()) {
+                        fenderEnv.define(entry.getKey(), entry.getValue());
+                    }
+                    Object fenderResult = eval(fender, fenderEnv);
+                    if (Boolean.FALSE.equals(fenderResult)) continue;
+                }
+
+                Set<String> patVars = new HashSet<>();
+                collectPatternVars(patArgs, patVars, literals);
+
+                Environment defEnv = macroDefEnvStack.isEmpty() ? env :
+                    macroDefEnvStack.get(macroDefEnvStack.size() - 1);
+
+                SyntaxContext ctx = new SyntaxContext(bindings, ellipsisVars, patVars, defEnv);
+                syntaxContextStack.add(ctx);
+                try {
+                    return eval(output, env);
+                } finally {
+                    syntaxContextStack.remove(syntaxContextStack.size() - 1);
+                }
+            }
+        }
+        throw error("syntax-case: no matching pattern");
+    }
+
+    private Object evalSyntaxForm(List<?> list) throws EvalError {
+        // (syntax template)
+        if (list.size() != 2) throw error("syntax: bad syntax");
+        Object template = unwrapDeep(list.get(1));
+
+        if (syntaxContextStack.isEmpty()) return template;
+
+        SyntaxContext ctx = syntaxContextStack.get(syntaxContextStack.size() - 1);
+
+        // Simple variable lookup
+        if (template instanceof String sym && ctx.bindings.containsKey(sym)
+                && !ctx.ellipsisVars.contains(sym)) {
+            return ctx.bindings.get(sym);
+        }
+
+        // Apply hygiene: rename introduced symbols
+        Map<String, String> renameMap = new HashMap<>();
+        Set<String> templateSyms = new HashSet<>();
+        collectSymbols(template, templateSyms);
+        for (String sym : templateSyms) {
+            if (ctx.patternVars.contains(sym) || SPECIAL_FORMS.contains(sym) || "...".equals(sym))
+                continue;
+            if (ctx.bindings.containsKey(sym)) continue;
+            String gs = gensym(sym);
+            renameMap.put(sym, gs);
+        }
+
+        Object expanded = expandTemplate(template, ctx.bindings, ctx.ellipsisVars, renameMap);
+
+        Environment useEnv = macroUseEnvStack.isEmpty() ? null :
+            macroUseEnvStack.get(macroUseEnvStack.size() - 1);
+
+        // Bind gensyms in use env (not a wrapper scope, to avoid trapping defines)
+        if (!renameMap.isEmpty() && useEnv != null) {
+            for (Map.Entry<String, String> entry : renameMap.entrySet()) {
+                try {
+                    Object val = ctx.defEnv.lookup(entry.getKey());
+                    useEnv.define(entry.getValue(), val);
+                } catch (EvalError ignored) {}
+            }
+        }
+        return expanded;
+    }
+
+    private Object evalWithSyntax(List<?> list, Environment env) throws EvalError {
+        // (with-syntax ((pattern expr) ...) body ...)
+        if (list.size() < 3) throw error("with-syntax: bad syntax");
+        Object bObj = list.get(1);
+        if (bObj instanceof Located loc) bObj = loc.value();
+        if (!(bObj instanceof List<?> bindList)) throw error("with-syntax: bad bindings");
+
+        if (syntaxContextStack.isEmpty()) throw error("with-syntax: not inside syntax-case");
+        SyntaxContext parentCtx = syntaxContextStack.get(syntaxContextStack.size() - 1);
+
+        Map<String, Object> newBindings = new HashMap<>(parentCtx.bindings());
+        Set<String> newEllipsis = new HashSet<>(parentCtx.ellipsisVars());
+        Set<String> newPatVars = new HashSet<>(parentCtx.patternVars());
+
+        for (Object b : bindList) {
+            if (b instanceof Located loc) b = loc.value();
+            if (!(b instanceof List<?> binding) || binding.size() != 2)
+                throw error("with-syntax: bad binding");
+            Object pat = binding.get(0);
+            if (pat instanceof Located loc) pat = loc.value();
+            if (!(pat instanceof String varName)) throw error("with-syntax: expected symbol");
+            Object val = eval(binding.get(1), env);
+            newBindings.put(varName, val);
+            newPatVars.add(varName);
+        }
+
+        SyntaxContext newCtx = new SyntaxContext(newBindings, newEllipsis, newPatVars, parentCtx.defEnv());
+        // Replace top of stack
+        syntaxContextStack.set(syntaxContextStack.size() - 1, newCtx);
+        try {
+            Object result = VOID;
+            for (int i = 2; i < list.size(); i++) {
+                result = eval(list.get(i), env);
+            }
+            return result;
+        } finally {
+            syntaxContextStack.set(syntaxContextStack.size() - 1, parentCtx);
+        }
     }
 
     private Object apply(Object proc, List<Object> args) throws EvalError {
@@ -1689,6 +1911,15 @@ public class Evaluator {
             if (!(args.get(0) instanceof String s)) throw error("symbol->string: not a symbol");
             return new SchemeString(s);
         });
+        globalEnv.define("syntax->datum", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("syntax->datum: expected 1 argument");
+            return args.get(0);
+        });
+        globalEnv.define("datum->syntax", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("datum->syntax: expected 2 arguments");
+            return args.get(1);
+        });
+
         globalEnv.define("string->symbol", (BuiltinProc) args -> {
             if (args.size() != 1) throw error("string->symbol: expected 1 argument");
             if (!(args.get(0) instanceof SchemeString s)) throw error("string->symbol: not a string");
