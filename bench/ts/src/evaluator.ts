@@ -7,7 +7,7 @@ interface Pos { line: number; col: number }
 type SchemeValBase =
   | { tag: 'number'; value: number }
   | { tag: 'boolean'; value: boolean }
-  | { tag: 'string'; value: string }
+  | { tag: 'string'; value: string; chars?: string[] }
   | { tag: 'symbol'; value: string }
   | { tag: 'char'; value: string }
   | { tag: 'list'; value: SchemeVal[] }
@@ -19,6 +19,10 @@ type SchemeValBase =
 type SchemeVal = SchemeValBase & { pos?: Pos };
 
 const NIL: SchemeVal = { tag: 'nil' };
+
+function strContent(v: SchemeVal & { tag: 'string' }): string {
+  return v.chars ? v.chars.join('') : v.value;
+}
 
 function listToConsPairs(lst: SchemeVal): SchemeVal {
   if (lst.tag !== 'list') return lst;
@@ -138,6 +142,16 @@ function parse(tokens: Token[]): SchemeVal[] {
     const v = tok.value;
     if (v === '#t') return { tag: 'boolean', value: true, pos: p };
     if (v === '#f') return { tag: 'boolean', value: false, pos: p };
+    if (v.startsWith('#\\')) {
+      const name = v.slice(2);
+      let ch: string;
+      if (name === 'space') ch = ' ';
+      else if (name === 'newline') ch = '\n';
+      else if (name === 'tab') ch = '\t';
+      else if (name.length === 1) ch = name;
+      else throw new EvalError(`unknown character name: ${name}`);
+      return { tag: 'char', value: ch, pos: p };
+    }
     if (/^-?\d+$/.test(v)) return { tag: 'number', value: parseInt(v, 10), pos: p };
     return { tag: 'symbol', value: v, pos: p };
   }
@@ -176,7 +190,7 @@ function displayVal(val: SchemeVal): string {
   switch (val.tag) {
     case 'number': return String(val.value);
     case 'boolean': return val.value ? '#t' : '#f';
-    case 'string': return val.value; // no quotes for display
+    case 'string': return strContent(val); // no quotes for display
     case 'symbol': return val.value;
     case 'char': return val.value;
     case 'nil': return '()';
@@ -198,7 +212,7 @@ function displayVal(val: SchemeVal): string {
 
 function writeVal(val: SchemeVal): string {
   switch (val.tag) {
-    case 'string': return `"${val.value}"`; // with quotes for write
+    case 'string': return `"${strContent(val)}"`; // with quotes for write
     case 'char': return `#\\${val.value}`;
     default: return displayVal(val);
   }
@@ -367,25 +381,25 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   env.set('string-append', { tag: 'procedure', value: (...args: SchemeVal[]) => {
     const strs = args.map(a => {
       if (a.tag !== 'string') throw new EvalError('string-append: expected string');
-      return a.value;
+      return strContent(a);
     });
     return { tag: 'string', value: strs.join('') };
   }});
 
   env.set('string-length', { tag: 'procedure', value: (...args: SchemeVal[]) => {
     if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string-length: expected string');
-    return { tag: 'number', value: args[0].value.length };
+    return { tag: 'number', value: strContent(args[0]).length };
   }});
 
   env.set('substring', { tag: 'procedure', value: (...args: SchemeVal[]) => {
     if (args.length !== 3 || args[0].tag !== 'string' || args[1].tag !== 'number' || args[2].tag !== 'number')
       throw new EvalError('substring: expected string, number, number');
-    return { tag: 'string', value: args[0].value.substring(args[1].value, args[2].value) };
+    return { tag: 'string', value: strContent(args[0]).substring(args[1].value, args[2].value) };
   }});
 
   env.set('string->number', { tag: 'procedure', value: (...args: SchemeVal[]) => {
     if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string->number: expected string');
-    const n = Number(args[0].value);
+    const n = Number(strContent(args[0]));
     if (isNaN(n)) return { tag: 'boolean', value: false };
     return { tag: 'number', value: n };
   }});
@@ -408,10 +422,28 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   env.set('string-ref', { tag: 'procedure', value: (...args: SchemeVal[]) => {
     if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'number')
       throw new EvalError('string-ref: expected string and number');
-    const s = args[0].value;
+    const s = strContent(args[0]);
     const i = args[1].value;
     if (i < 0 || i >= s.length) throw new EvalError('string-ref: index out of range');
     return { tag: 'char', value: s[i] };
+  }});
+
+  // L06: Mutable strings
+  env.set('string-copy', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string-copy: expected string');
+    const s = strContent(args[0]);
+    return { tag: 'string', value: '', chars: [...s] };
+  }});
+
+  env.set('string-set!', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 3 || args[0].tag !== 'string' || args[1].tag !== 'number' || args[2].tag !== 'char')
+      throw new EvalError('string-set!: expected mutable string, number, char');
+    const str = args[0];
+    if (!str.chars) throw new EvalError('string-set!: string is immutable');
+    const i = args[1].value;
+    if (i < 0 || i >= str.chars.length) throw new EvalError('string-set!: index out of range');
+    str.chars[i] = args[2].value;
+    return { tag: 'void' };
   }});
 
   env.set('char?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
@@ -441,6 +473,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
     case 'number':
     case 'boolean':
     case 'string':
+    case 'char':
       return expr;
 
     case 'symbol': {
