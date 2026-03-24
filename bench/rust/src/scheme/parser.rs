@@ -1,5 +1,7 @@
 use crate::scheme::error::{EvalError, Span};
 use crate::scheme::{make_rational, Spanned, Value};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 pub(crate) struct Parser {
     chars: Vec<char>,
@@ -140,6 +142,23 @@ impl Parser {
                     Ok(Spanned::new(Value::Boolean(false), span))
                 } else {
                     Err(EvalError::Parse("invalid # literal".into(), span))
+                }
+            }
+            Some('(') => {
+                // #( ... ) vector literal
+                self.advance(); // skip '('
+                let mut items = Vec::new();
+                loop {
+                    self.skip_whitespace();
+                    match self.peek() {
+                        None => return Err(EvalError::Parse("unterminated vector literal".into(), span)),
+                        Some(')') => {
+                            self.advance();
+                            let vals: Vec<Value> = items.iter().map(|s: &Spanned| s.val.clone()).collect();
+                            return Ok(Spanned::new(Value::Vector(Rc::new(RefCell::new(vals))), span));
+                        }
+                        _ => items.push(self.parse_expr()?),
+                    }
                 }
             }
             Some('\\') => {
