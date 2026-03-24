@@ -333,6 +333,18 @@ func (v *VectorVal) String() string {
 	return buf.String()
 }
 
+// ValuesVal wraps multiple return values from (values ...).
+type ValuesVal struct {
+	Vals []Value
+}
+
+func (v *ValuesVal) String() string { return "#<values>" }
+
+// CallWithValuesVal is the first-class call-with-values procedure.
+type CallWithValuesVal struct{}
+
+func (v *CallWithValuesVal) String() string { return "#<procedure call-with-values>" }
+
 // CallCCVal is the first-class call/cc procedure.
 type CallCCVal struct{}
 

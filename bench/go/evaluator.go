@@ -588,6 +588,10 @@ func defaultEnv(output *strings.Builder) *Env {
 	env.Set("raise", &BuiltinFunc{Name: "raise", Fn: builtinRaise})
 	env.Set("with-exception-handler", &WithExceptionHandlerVal{})
 
+	// L21 builtins — values & call-with-values
+	env.Set("values", &BuiltinFunc{Name: "values", Fn: builtinValues})
+	env.Set("call-with-values", &CallWithValuesVal{})
+
 	return env
 }
 
@@ -1097,6 +1101,25 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 			return nil, bodyErr
 		}
 		return bodyResult, nil
+	case *CallWithValuesVal:
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: call-with-values: expected 2 arguments, got %d", callExpr.Line, callExpr.Col, len(args))}
+		}
+		producer, consumer := args[0], args[1]
+		// Call producer with no arguments
+		producerResult, err := callThunk(producer, callExpr)
+		if err != nil {
+			return nil, err
+		}
+		// Unpack values
+		var consumerArgs []Value
+		if mv, ok := producerResult.(*ValuesVal); ok {
+			consumerArgs = mv.Vals
+		} else {
+			consumerArgs = []Value{producerResult}
+		}
+		// Apply consumer to the produced values
+		return applyProc(consumer, consumerArgs, callExpr)
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", callExpr.List[0].Line, callExpr.List[0].Col)}
 	}
@@ -2663,7 +2686,7 @@ func builtinProcedureQ(args []Value) (Value, error) {
 		return nil, fmt.Errorf("procedure?: expected 1 argument, got %d", len(args))
 	}
 	switch args[0].(type) {
-	case *LambdaVal, *CaseLambdaVal, *BuiltinFunc, *ApplyVal, *MapVal, *CallCCVal, *ContinuationVal, *DynamicWindVal, *WithExceptionHandlerVal:
+	case *LambdaVal, *CaseLambdaVal, *BuiltinFunc, *ApplyVal, *MapVal, *CallCCVal, *ContinuationVal, *DynamicWindVal, *WithExceptionHandlerVal, *CallWithValuesVal:
 		return &BoolVal{Val: true}, nil
 	}
 	return &BoolVal{Val: false}, nil
@@ -3449,6 +3472,15 @@ func builtinRaise(args []Value) (Value, error) {
 		return nil, fmt.Errorf("raise: expected 1 argument, got %d", len(args))
 	}
 	panic(&schemeRaise{value: args[0]})
+}
+
+func builtinValues(args []Value) (Value, error) {
+	if len(args) == 1 {
+		return args[0], nil // single value is transparent
+	}
+	vals := make([]Value, len(args))
+	copy(vals, args)
+	return &ValuesVal{Vals: vals}, nil
 }
 
 // evalGuard implements the guard special form:
