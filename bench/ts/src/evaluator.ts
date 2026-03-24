@@ -9,6 +9,7 @@ type SchemeVal =
   | { tag: 'boolean'; value: boolean; pos?: Pos }
   | { tag: 'string'; value: string; pos?: Pos }
   | { tag: 'symbol'; value: string; pos?: Pos }
+  | { tag: 'char'; value: string; pos?: Pos }
   | { tag: 'list'; elements: SchemeVal[]; pos?: Pos }
   | { tag: 'builtin'; name: string; func: (args: SchemeVal[], callPos?: Pos) => SchemeVal; pos?: Pos }
   | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env; pos?: Pos }
@@ -123,10 +124,20 @@ function schemeToString(val: SchemeVal): string {
     case 'boolean': return val.value ? '#t' : '#f';
     case 'string': return `"${val.value}"`;
     case 'symbol': return val.value;
+    case 'char': return `#\\${val.value === ' ' ? 'space' : val.value === '\n' ? 'newline' : val.value}`;
     case 'list': return `(${val.elements.map(schemeToString).join(' ')})`;
     case 'builtin': return `#<procedure:${val.name}>`;
     case 'lambda': return '#<procedure>';
     case 'void': return '';
+  }
+}
+
+function displayString(val: SchemeVal): string {
+  switch (val.tag) {
+    case 'string': return val.value;
+    case 'char': return val.value;
+    case 'list': return `(${val.elements.map(displayString).join(' ')})`;
+    default: return schemeToString(val);
   }
 }
 
@@ -145,7 +156,7 @@ function expectNumbers(args: SchemeVal[], name: string, pos?: Pos): number[] {
 
 type Env = Map<string, SchemeVal>;
 
-function makeGlobalEnv(): Env {
+function makeGlobalEnv(outputBuf: string[]): Env {
   const env: Env = new Map();
 
   const defBuiltin = (name: string, func: (args: SchemeVal[], callPos?: Pos) => SchemeVal) => {
@@ -280,6 +291,89 @@ function makeGlobalEnv(): Env {
     return { tag: 'boolean', value: args[0].tag === 'symbol' };
   });
 
+  // L05: Display/Write/Newline
+  defBuiltin('display', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}display: expected 1 arg`);
+    outputBuf.push(displayString(args[0]));
+    return { tag: 'void' };
+  });
+
+  defBuiltin('write', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}write: expected 1 arg`);
+    outputBuf.push(schemeToString(args[0]));
+    return { tag: 'void' };
+  });
+
+  defBuiltin('newline', (args, p) => {
+    if (args.length !== 0) throw new EvalError(`${fmtPos(p)}newline: expected 0 args`);
+    outputBuf.push('\n');
+    return { tag: 'void' };
+  });
+
+  // L05: String operations
+  defBuiltin('string-append', (args, p) => {
+    const strs = args.map(a => {
+      if (a.tag !== 'string') throw new EvalError(`${fmtPos(p)}string-append: expected string, got ${schemeToString(a)}`);
+      return a.value;
+    });
+    return { tag: 'string', value: strs.join('') };
+  });
+
+  defBuiltin('string-length', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}string-length: expected 1 arg`);
+    if (args[0].tag !== 'string') throw new EvalError(`${fmtPos(p)}string-length: expected string`);
+    return { tag: 'number', value: args[0].value.length };
+  });
+
+  defBuiltin('substring', (args, p) => {
+    if (args.length !== 3) throw new EvalError(`${fmtPos(p)}substring: expected 3 args`);
+    if (args[0].tag !== 'string') throw new EvalError(`${fmtPos(p)}substring: expected string`);
+    const nums = expectNumbers([args[1], args[2]], 'substring', p);
+    return { tag: 'string', value: args[0].value.slice(nums[0], nums[1]) };
+  });
+
+  defBuiltin('string->number', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}string->number: expected 1 arg`);
+    if (args[0].tag !== 'string') throw new EvalError(`${fmtPos(p)}string->number: expected string`);
+    const n = Number(args[0].value);
+    if (isNaN(n)) return { tag: 'boolean', value: false };
+    return { tag: 'number', value: n };
+  });
+
+  defBuiltin('number->string', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}number->string: expected 1 arg`);
+    if (args[0].tag !== 'number') throw new EvalError(`${fmtPos(p)}number->string: expected number`);
+    return { tag: 'string', value: String(args[0].value) };
+  });
+
+  // L05: Symbol/String conversion
+  defBuiltin('symbol->string', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}symbol->string: expected 1 arg`);
+    if (args[0].tag !== 'symbol') throw new EvalError(`${fmtPos(p)}symbol->string: expected symbol`);
+    return { tag: 'string', value: args[0].value };
+  });
+
+  defBuiltin('string->symbol', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}string->symbol: expected 1 arg`);
+    if (args[0].tag !== 'string') throw new EvalError(`${fmtPos(p)}string->symbol: expected string`);
+    return { tag: 'symbol', value: args[0].value };
+  });
+
+  // L05: Character operations
+  defBuiltin('string-ref', (args, p) => {
+    if (args.length !== 2) throw new EvalError(`${fmtPos(p)}string-ref: expected 2 args`);
+    if (args[0].tag !== 'string') throw new EvalError(`${fmtPos(p)}string-ref: expected string`);
+    if (args[1].tag !== 'number') throw new EvalError(`${fmtPos(p)}string-ref: expected number`);
+    const idx = args[1].value;
+    if (idx < 0 || idx >= args[0].value.length) throw new EvalError(`${fmtPos(p)}string-ref: index out of range`);
+    return { tag: 'char', value: args[0].value[idx] };
+  });
+
+  defBuiltin('char?', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}char?: expected 1 arg`);
+    return { tag: 'boolean', value: args[0].tag === 'char' };
+  });
+
   return env;
 }
 
@@ -290,6 +384,7 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
     case 'number':
     case 'boolean':
     case 'string':
+    case 'char':
       return expr;
 
     case 'symbol': {
@@ -492,7 +587,8 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
 export function evalStr(input: string): string {
   const exprs = parseAll(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
-  const env = makeGlobalEnv();
+  const outputBuf: string[] = [];
+  const env = makeGlobalEnv(outputBuf);
   let result: SchemeVal = { tag: 'void' };
   for (const expr of exprs) {
     result = evalScheme(expr, env);
@@ -505,5 +601,13 @@ export function evalStr(input: string): string {
  * and any captured output from display/write/newline.
  */
 export function evalStrWithOutput(input: string): { result: string; output: string } {
-  throw new EvalError('not implemented');
+  const exprs = parseAll(input);
+  if (exprs.length === 0) throw new EvalError('no expressions');
+  const outputBuf: string[] = [];
+  const env = makeGlobalEnv(outputBuf);
+  let result: SchemeVal = { tag: 'void' };
+  for (const expr of exprs) {
+    result = evalScheme(expr, env);
+  }
+  return { result: schemeToString(result), output: outputBuf.join('') };
 }
