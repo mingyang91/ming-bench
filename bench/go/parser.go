@@ -1,0 +1,305 @@
+package ming
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"unicode"
+)
+
+// token types
+type tokenKind int
+
+const (
+	tokLParen tokenKind = iota
+	tokRParen
+	tokQuote
+	tokNumber
+	tokString
+	tokBool
+	tokSymbol
+	tokEOF
+)
+
+type token struct {
+	kind tokenKind
+	text string
+	line int
+	col  int
+}
+
+// tokenize splits input into tokens.
+func tokenize(input string) ([]token, error) {
+	var tokens []token
+	i := 0
+	line := 1
+	col := 1
+
+	for i < len(input) {
+		ch := input[i]
+
+		// skip whitespace
+		if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' {
+			if ch == '\n' {
+				line++
+				col = 1
+			} else {
+				col++
+			}
+			i++
+			continue
+		}
+
+		// skip line comments
+		if ch == ';' {
+			for i < len(input) && input[i] != '\n' {
+				i++
+			}
+			continue
+		}
+
+		startCol := col
+
+		if ch == '(' {
+			tokens = append(tokens, token{tokLParen, "(", line, startCol})
+			i++
+			col++
+			continue
+		}
+		if ch == ')' {
+			tokens = append(tokens, token{tokRParen, ")", line, startCol})
+			i++
+			col++
+			continue
+		}
+		if ch == '\'' {
+			tokens = append(tokens, token{tokQuote, "'", line, startCol})
+			i++
+			col++
+			continue
+		}
+
+		// string literal
+		if ch == '"' {
+			var buf strings.Builder
+			i++
+			col++
+			for i < len(input) && input[i] != '"' {
+				if input[i] == '\\' && i+1 < len(input) {
+					i++
+					col++
+					switch input[i] {
+					case 'n':
+						buf.WriteByte('\n')
+					case 't':
+						buf.WriteByte('\t')
+					case '\\':
+						buf.WriteByte('\\')
+					case '"':
+						buf.WriteByte('"')
+					default:
+						buf.WriteByte(input[i])
+					}
+				} else {
+					if input[i] == '\n' {
+						line++
+						col = 0
+					}
+					buf.WriteByte(input[i])
+				}
+				i++
+				col++
+			}
+			if i >= len(input) {
+				return nil, fmt.Errorf("%d:%d: unterminated string", line, startCol)
+			}
+			i++ // skip closing "
+			col++
+			tokens = append(tokens, token{tokString, buf.String(), line, startCol})
+			continue
+		}
+
+		// #t, #f, #\ character literals
+		if ch == '#' {
+			if i+1 < len(input) {
+				next := input[i+1]
+				if next == 't' && (i+2 >= len(input) || isDelimiter(input[i+2])) {
+					tokens = append(tokens, token{tokBool, "#t", line, startCol})
+					i += 2
+					col += 2
+					continue
+				}
+				if next == 'f' && (i+2 >= len(input) || isDelimiter(input[i+2])) {
+					tokens = append(tokens, token{tokBool, "#f", line, startCol})
+					i += 2
+					col += 2
+					continue
+				}
+			}
+			// fall through to symbol
+		}
+
+		// number or symbol (including negative numbers)
+		if isSymbolStart(ch) || ch == '+' || ch == '-' || unicode.IsDigit(rune(ch)) {
+			start := i
+			i++
+			col++
+			for i < len(input) && !isDelimiter(input[i]) {
+				i++
+				col++
+			}
+			text := input[start:i]
+
+			// try to parse as integer
+			if n, err := strconv.ParseInt(text, 10, 64); err == nil {
+				tokens = append(tokens, token{tokNumber, text, line, startCol})
+				_ = n
+				continue
+			}
+
+			tokens = append(tokens, token{tokSymbol, text, line, startCol})
+			continue
+		}
+
+		return nil, fmt.Errorf("%d:%d: unexpected character '%c'", line, col, ch)
+	}
+
+	tokens = append(tokens, token{tokEOF, "", line, col})
+	return tokens, nil
+}
+
+func isDelimiter(ch byte) bool {
+	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' ||
+		ch == '(' || ch == ')' || ch == '"' || ch == ';'
+}
+
+func isSymbolStart(ch byte) bool {
+	return ch == '!' || ch == '$' || ch == '%' || ch == '&' || ch == '*' ||
+		ch == '/' || ch == ':' || ch == '<' || ch == '=' || ch == '>' ||
+		ch == '?' || ch == '_' || ch == '~' || ch == '#' || ch == '.' ||
+		ch == '^' ||
+		(ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+}
+
+// Expr is a parsed S-expression.
+type Expr interface {
+	pos() (int, int)
+}
+
+type NumberExpr struct {
+	Val  int64
+	Line int
+	Col  int
+}
+
+type StringExpr struct {
+	Val  string
+	Line int
+	Col  int
+}
+
+type BoolExpr struct {
+	Val  bool
+	Line int
+	Col  int
+}
+
+type SymbolExpr struct {
+	Name string
+	Line int
+	Col  int
+}
+
+type ListExpr struct {
+	Elems []Expr
+	Line  int
+	Col   int
+}
+
+func (e *NumberExpr) pos() (int, int) { return e.Line, e.Col }
+func (e *StringExpr) pos() (int, int) { return e.Line, e.Col }
+func (e *BoolExpr) pos() (int, int)   { return e.Line, e.Col }
+func (e *SymbolExpr) pos() (int, int) { return e.Line, e.Col }
+func (e *ListExpr) pos() (int, int)   { return e.Line, e.Col }
+
+type parser struct {
+	tokens []token
+	pos    int
+}
+
+func parse(input string) ([]Expr, error) {
+	tokens, err := tokenize(input)
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{tokens: tokens}
+	var exprs []Expr
+	for p.peek().kind != tokEOF {
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		exprs = append(exprs, expr)
+	}
+	return exprs, nil
+}
+
+func (p *parser) peek() token {
+	if p.pos >= len(p.tokens) {
+		return token{kind: tokEOF}
+	}
+	return p.tokens[p.pos]
+}
+
+func (p *parser) next() token {
+	t := p.peek()
+	p.pos++
+	return t
+}
+
+func (p *parser) parseExpr() (Expr, error) {
+	t := p.peek()
+	switch t.kind {
+	case tokNumber:
+		p.next()
+		n, _ := strconv.ParseInt(t.text, 10, 64)
+		return &NumberExpr{Val: n, Line: t.line, Col: t.col}, nil
+	case tokString:
+		p.next()
+		return &StringExpr{Val: t.text, Line: t.line, Col: t.col}, nil
+	case tokBool:
+		p.next()
+		return &BoolExpr{Val: t.text == "#t", Line: t.line, Col: t.col}, nil
+	case tokQuote:
+		p.next()
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ListExpr{
+			Elems: []Expr{&SymbolExpr{Name: "quote", Line: t.line, Col: t.col}, inner},
+			Line:  t.line,
+			Col:   t.col,
+		}, nil
+	case tokLParen:
+		p.next()
+		var elems []Expr
+		for p.peek().kind != tokRParen {
+			if p.peek().kind == tokEOF {
+				return nil, fmt.Errorf("%d:%d: unexpected end of input", t.line, t.col)
+			}
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, e)
+		}
+		p.next() // consume )
+		return &ListExpr{Elems: elems, Line: t.line, Col: t.col}, nil
+	case tokEOF:
+		return nil, fmt.Errorf("unexpected end of input")
+	default:
+		p.next()
+		return &SymbolExpr{Name: t.text, Line: t.line, Col: t.col}, nil
+	}
+}
