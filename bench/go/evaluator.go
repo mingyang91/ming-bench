@@ -52,6 +52,8 @@ type Value struct {
 	// native Go function
 	goFunc func([]*Value) (*Value, error)
 	goName string // name for display
+	// string immutability (L15)
+	immutable bool
 }
 
 type caseClause struct {
@@ -69,7 +71,8 @@ var recordTypeCounter int
 
 func intVal(n int64) *Value    { return &Value{typ: valInt, ival: n} }
 func boolVal(b bool) *Value    { return &Value{typ: valBool, bval: b} }
-func strVal(s string) *Value   { return &Value{typ: valString, sval: s} }
+func strVal(s string) *Value          { return &Value{typ: valString, sval: s} }
+func strValImmutable(s string) *Value { return &Value{typ: valString, sval: s, immutable: true} }
 func symVal(s string) *Value   { return &Value{typ: valSymbol, sval: s} }
 func charVal(c rune) *Value    { return &Value{typ: valChar, ival: int64(c)} }
 func floatVal(f float64) *Value { return &Value{typ: valFloat, fval: f} }
@@ -720,7 +723,7 @@ func evalAtom(node *astNode, e *env) (*Value, error) {
 	case tokBool:
 		return boolVal(t.bval), nil
 	case tokString:
-		return strVal(t.sval), nil
+		return strValImmutable(t.sval), nil
 	case tokChar:
 		return charVal(rune(t.ival)), nil
 	case tokSymbol:
@@ -1137,7 +1140,7 @@ func quoteNode(node *astNode) *Value {
 		case tokBool:
 			return boolVal(node.tok.bval)
 		case tokString:
-			return strVal(node.tok.sval)
+			return strValImmutable(node.tok.sval)
 		case tokChar:
 			return charVal(rune(node.tok.ival))
 		case tokSymbol:
@@ -1597,6 +1600,9 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		if args[0].typ != valString || args[1].typ != valInt || args[2].typ != valChar {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: bad arguments", node.line, node.col)}
 		}
+		if args[0].immutable {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: strings are immutable", node.line, node.col)}
+		}
 		runes := []rune(args[0].sval)
 		idx := int(args[1].ival)
 		if idx < 0 || idx >= len(runes) {
@@ -1605,6 +1611,38 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		runes[idx] = rune(args[2].ival)
 		args[0].sval = string(runes)
 		return voidVal(), nil
+
+	case "string->list":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->list: need 1 argument", node.line, node.col)}
+		}
+		if args[0].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->list: expected string", node.line, node.col)}
+		}
+		runes := []rune(args[0].sval)
+		result := nilVal()
+		for i := len(runes) - 1; i >= 0; i-- {
+			result = &Value{typ: valPair, car: charVal(runes[i]), cdr: result}
+		}
+		return result, nil
+
+	case "list->string":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list->string: need 1 argument", node.line, node.col)}
+		}
+		var runes []rune
+		cur := args[0]
+		for cur.typ == valPair {
+			if cur.car.typ != valChar {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list->string: expected list of characters", node.line, node.col)}
+			}
+			runes = append(runes, rune(cur.car.ival))
+			cur = cur.cdr
+		}
+		if cur.typ != valNil {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list->string: expected proper list", node.line, node.col)}
+		}
+		return strVal(string(runes)), nil
 
 	case "string-ref":
 		if len(args) != 2 {
@@ -2424,6 +2462,7 @@ func makeGlobalEnv() *env {
 		"symbol->string", "string->symbol",
 		"string-ref",
 		"string-copy", "string-set!",
+		"string->list", "list->string",
 		"apply", "map",
 		"abs", "modulo", "remainder", "quotient",
 		"min", "max", "expt",
