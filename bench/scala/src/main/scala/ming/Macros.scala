@@ -188,7 +188,7 @@ private[ming] object Macros:
   ): Val =
     val allSyms    = collectAllSymbols(template)
     val freeSyms   = allSyms -- patVars -- specialFormNames - "..."
-    val knownNames = defBoundNames.getOrElse(defEnv.boundNames)
+    val knownNames = defEnv.boundNames
     val renameMap = freeSyms.flatMap { sym =>
       if knownNames.contains(sym) then None
       else Some(sym -> gensym(sym))
