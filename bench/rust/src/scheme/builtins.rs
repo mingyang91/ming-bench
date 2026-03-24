@@ -783,6 +783,56 @@ fn apply_string_io_builtin(name: &str, args: &[Value], call_pos: Pos, output: &m
                 _ => Err(EvalError::Type(format!("{call_pos}: string-downcase: expected string"))),
             }
         }
+        "string->list" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: string->list requires 1 argument")));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::List(s.chars().map(Value::Char).collect())),
+                _ => Err(EvalError::Type(format!("{call_pos}: string->list: expected string"))),
+            }
+        }
+        "list->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: list->string requires 1 argument")));
+            }
+            match &args[0] {
+                Value::List(items) => {
+                    let mut s = String::new();
+                    for item in items {
+                        match item {
+                            Value::Char(c) => s.push(*c),
+                            _ => return Err(EvalError::Type(format!("{call_pos}: list->string: expected list of characters"))),
+                        }
+                    }
+                    Ok(Value::Str(s))
+                }
+                _ => Err(EvalError::Type(format!("{call_pos}: list->string: expected list"))),
+            }
+        }
+        "char->integer" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: char->integer requires 1 argument")));
+            }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Integer(*c as i64)),
+                _ => Err(EvalError::Type(format!("{call_pos}: char->integer: expected character"))),
+            }
+        }
+        "integer->char" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: integer->char requires 1 argument")));
+            }
+            match &args[0] {
+                Value::Integer(n) => {
+                    match char::from_u32(*n as u32) {
+                        Some(c) => Ok(Value::Char(c)),
+                        None => Err(EvalError::Type(format!("{call_pos}: integer->char: invalid code point {n}"))),
+                    }
+                }
+                _ => Err(EvalError::Type(format!("{call_pos}: integer->char: expected integer"))),
+            }
+        }
         _ => Err(EvalError::UnboundVariable(format!("{call_pos}: {name}"))),
     }
 }
@@ -808,7 +858,9 @@ pub(super) fn apply_builtin(name: &str, args: &[Value], call_pos: Pos, output: &
         | "char=?" | "char<?" | "char-alphabetic?" | "char-numeric?"
         | "char-upcase" | "char-downcase"
         | "string=?" | "string<?" | "string-ci=?"
-        | "string-upcase" | "string-downcase" => apply_string_io_builtin(name, args, call_pos, output),
+        | "string-upcase" | "string-downcase"
+        | "string->list" | "list->string"
+        | "char->integer" | "integer->char" => apply_string_io_builtin(name, args, call_pos, output),
 
         "eqv?" => {
             if args.len() != 2 {

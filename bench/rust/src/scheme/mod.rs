@@ -313,6 +313,8 @@ pub(super) const BUILTINS: &[&str] = &[
     "char-upcase", "char-downcase",
     "string=?", "string<?", "string-ci=?",
     "string-upcase", "string-downcase",
+    "string->list", "list->string",
+    "char->integer", "integer->char",
     "procedure?",
     "eqv?",
     "vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
