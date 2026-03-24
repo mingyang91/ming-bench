@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,6 +54,7 @@ pub enum ValueKind {
     CaseLambda {
         clauses: Vec<(Vec<String>, Option<String>, Vec<Value>, Rc<Env>)>,
     },
+    Vector(Rc<RefCell<Vec<Value>>>),
     Void,
 }
 
@@ -131,6 +133,11 @@ impl Value {
             ValueKind::SyntaxRules { .. } => "#<syntax>".to_string(),
             ValueKind::Record { type_name, .. } => format!("#<{}>", type_name),
             ValueKind::RecordConstructor { .. } | ValueKind::RecordPredicate { .. } | ValueKind::RecordAccessor { .. } => "#<procedure>".to_string(),
+            ValueKind::Vector(elems) => {
+                let elems = elems.borrow();
+                let inner: Vec<String> = elems.iter().map(|v| v.to_display()).collect();
+                format!("#({})", inner.join(" "))
+            }
             ValueKind::Void => "".to_string(),
         }
     }
@@ -146,7 +153,7 @@ impl Value {
                 format!("({})", inner.join(" "))
             }
             ValueKind::SyntaxRules { .. } => "#<syntax>".to_string(),
-            ValueKind::Record { .. } | ValueKind::RecordConstructor { .. } | ValueKind::RecordPredicate { .. } | ValueKind::RecordAccessor { .. } => self.to_display(),
+            ValueKind::Record { .. } | ValueKind::RecordConstructor { .. } | ValueKind::RecordPredicate { .. } | ValueKind::RecordAccessor { .. } | ValueKind::Vector(_) => self.to_display(),
             _ => self.to_display(),
         }
     }
@@ -185,6 +192,7 @@ impl PartialEq for Value {
             (ValueKind::Symbol(a), ValueKind::Symbol(b)) => a == b,
             (ValueKind::Char(a), ValueKind::Char(b)) => a == b,
             (ValueKind::List(a), ValueKind::List(b)) => a == b,
+            (ValueKind::Vector(a), ValueKind::Vector(b)) => *a.borrow() == *b.borrow(),
             (ValueKind::Void, ValueKind::Void) => true,
             _ => false,
         }

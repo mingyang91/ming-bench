@@ -68,7 +68,10 @@ impl Env {
                       "procedure?",
                       "exact?", "inexact?", "rational?",
                       "exact->inexact", "inexact->exact",
-                      "numerator", "denominator"] {
+                      "numerator", "denominator",
+                      // L14
+                      "vector", "make-vector", "vector-ref", "vector-set!",
+                      "vector-length", "vector?", "vector->list", "list->vector"] {
             env.set(name.to_string(), Value::unpos(ValueKind::Symbol(name.to_string())));
         }
         env

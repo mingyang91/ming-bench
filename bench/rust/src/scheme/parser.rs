@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use crate::scheme::value::{Value, ValueKind, Pos};
 use crate::scheme::EvalError;
 
@@ -24,6 +26,7 @@ enum TokenKind {
     LParen,
     RParen,
     Quote,
+    VecLParen,
     Atom(String),
 }
 
@@ -74,6 +77,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                 }
                 i += 1; col += 1;
                 tokens.push(Token { kind: TokenKind::Atom(format!("\"{}\"", s)), pos: start_pos });
+            }
+            '#' if i + 1 < chars.len() && chars[i + 1] == '(' => {
+                tokens.push(Token { kind: TokenKind::VecLParen, pos: cur_pos });
+                i += 2; col += 2;
             }
             '#' if i + 1 < chars.len() && chars[i + 1] == '\\' => {
                 let start_pos = cur_pos;
@@ -128,6 +135,22 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError>
                 }
                 if matches!(tokens[i].kind, TokenKind::RParen) {
                     return Ok((Value::new(ValueKind::List(elems), list_pos), i + 1));
+                }
+                let (expr, next) = parse_expr(tokens, i)?;
+                elems.push(expr);
+                i = next;
+            }
+        }
+        TokenKind::VecLParen => {
+            let vec_pos = token.pos;
+            let mut elems = Vec::new();
+            let mut i = pos + 1;
+            loop {
+                if i >= tokens.len() {
+                    return Err(EvalError::Parse("unclosed vector literal".into()));
+                }
+                if matches!(tokens[i].kind, TokenKind::RParen) {
+                    return Ok((Value::new(ValueKind::Vector(Rc::new(RefCell::new(elems))), vec_pos), i + 1));
                 }
                 let (expr, next) = parse_expr(tokens, i)?;
                 elems.push(expr);

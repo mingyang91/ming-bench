@@ -1,10 +1,14 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::scheme::env::Env;
 use crate::scheme::value::{Value, ValueKind, Pos, NumVal, make_rational_kind, next_record_type_id};
 use crate::scheme::macros;
 use crate::scheme::EvalError;
+
+static EVAL_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static MAX_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static OUTPUT_BUFFER: RefCell<String> = RefCell::new(String::new());
@@ -29,11 +33,28 @@ fn fmt_pos(pos: Pos) -> String {
 }
 
 pub fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
+    let mut cur_expr = expr.clone();
+    let mut cur_env = Rc::clone(env);
+    loop {
+        match eval_step(&cur_expr, &cur_env)? {
+            EvalResult::Done(v) => return Ok(v),
+            EvalResult::TailEval(e, en) => { cur_expr = e; cur_env = en; }
+        }
+    }
+}
+
+enum EvalResult {
+    Done(Value),
+    TailEval(Value, Rc<Env>),
+}
+
+#[inline(never)]
+fn eval_step(expr: &Value, env: &Rc<Env>) -> Result<EvalResult, EvalError> {
     match &expr.kind {
-        ValueKind::Integer(_) | ValueKind::Rational(_, _) | ValueKind::Float(_) | ValueKind::Boolean(_) | ValueKind::Str(_) | ValueKind::Char(_) => Ok(expr.clone()),
-        ValueKind::Lambda { .. } | ValueKind::CaseLambda { .. } | ValueKind::SyntaxRules { .. } | ValueKind::Record { .. } | ValueKind::RecordConstructor { .. } | ValueKind::RecordPredicate { .. } | ValueKind::RecordAccessor { .. } => Ok(expr.clone()),
+        ValueKind::Integer(_) | ValueKind::Rational(_, _) | ValueKind::Float(_) | ValueKind::Boolean(_) | ValueKind::Str(_) | ValueKind::Char(_) => Ok(EvalResult::Done(expr.clone())),
+        ValueKind::Lambda { .. } | ValueKind::CaseLambda { .. } | ValueKind::SyntaxRules { .. } | ValueKind::Record { .. } | ValueKind::RecordConstructor { .. } | ValueKind::RecordPredicate { .. } | ValueKind::RecordAccessor { .. } | ValueKind::Vector(_) => Ok(EvalResult::Done(expr.clone())),
         ValueKind::Symbol(name) => {
-            env.get(name).ok_or_else(|| EvalError::UnboundVariable(
+            env.get(name).map(EvalResult::Done).ok_or_else(|| EvalError::UnboundVariable(
                 format!("{} at {}", name, fmt_pos(expr.pos))
             ))
         }
@@ -43,27 +64,66 @@ pub fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
             }
             if let ValueKind::Symbol(ref s) = elems[0].kind {
                 match s.as_str() {
-                    "define" => return eval_define(&elems[1..], expr.pos, env),
-                    "if" => return eval_if(&elems[1..], expr.pos, env),
-                    "quote" => return eval_quote(&elems[1..], expr.pos),
-                    "lambda" => return eval_lambda(&elems[1..], expr.pos, env),
-                    "and" => return eval_and(&elems[1..], env),
-                    "or" => return eval_or(&elems[1..], env),
-                    "let" => return eval_let(&elems[1..], expr.pos, env),
-                    "begin" => return eval_begin(&elems[1..], env),
-                    "cond" => return eval_cond(&elems[1..], env),
-                    "set!" => return eval_set(&elems[1..], expr.pos, env),
-                    "string-set!" => return eval_string_set(&elems[1..], expr.pos, env),
-                    "define-syntax" => return eval_define_syntax(&elems[1..], expr.pos, env),
-                    "define-record-type" => return eval_define_record_type(&elems[1..], expr.pos, env),
-                    "case-lambda" => return eval_case_lambda(&elems[1..], expr.pos, env),
+                    "define" => return eval_define(&elems[1..], expr.pos, env).map(EvalResult::Done),
+                    "if" => {
+                        // TCO: return TailEval for the chosen branch
+                        let args = &elems[1..];
+                        if args.len() < 2 || args.len() > 3 {
+                            return Err(EvalError::Syntax(format!("if requires 2 or 3 arguments at {}", fmt_pos(expr.pos))));
+                        }
+                        let cond = eval(&args[0], env)?;
+                        if cond.is_truthy() {
+                            return Ok(EvalResult::TailEval(args[1].clone(), Rc::clone(env)));
+                        } else if args.len() == 3 {
+                            return Ok(EvalResult::TailEval(args[2].clone(), Rc::clone(env)));
+                        } else {
+                            return Ok(EvalResult::Done(Value::unpos(ValueKind::Void)));
+                        }
+                    }
+                    "quote" => return eval_quote(&elems[1..], expr.pos).map(EvalResult::Done),
+                    "lambda" => return eval_lambda(&elems[1..], expr.pos, env).map(EvalResult::Done),
+                    "and" => {
+                        let args = &elems[1..];
+                        if args.is_empty() { return Ok(EvalResult::Done(Value::unpos(ValueKind::Boolean(true)))); }
+                        for a in &args[..args.len()-1] {
+                            let r = eval(a, env)?;
+                            if !r.is_truthy() { return Ok(EvalResult::Done(r)); }
+                        }
+                        return Ok(EvalResult::TailEval(args.last().unwrap().clone(), Rc::clone(env)));
+                    }
+                    "or" => {
+                        let args = &elems[1..];
+                        if args.is_empty() { return Ok(EvalResult::Done(Value::unpos(ValueKind::Boolean(false)))); }
+                        for a in &args[..args.len()-1] {
+                            let r = eval(a, env)?;
+                            if r.is_truthy() { return Ok(EvalResult::Done(r)); }
+                        }
+                        return Ok(EvalResult::TailEval(args.last().unwrap().clone(), Rc::clone(env)));
+                    }
+                    "let" => return eval_let_tc(&elems[1..], expr.pos, env),
+                    "begin" => {
+                        let args = &elems[1..];
+                        if args.is_empty() { return Ok(EvalResult::Done(Value::unpos(ValueKind::Void))); }
+                        for a in &args[..args.len()-1] { eval(a, env)?; }
+                        return Ok(EvalResult::TailEval(args.last().unwrap().clone(), Rc::clone(env)));
+                    }
+                    "cond" => return eval_cond_tc(&elems[1..], env),
+                    "set!" => return eval_set(&elems[1..], expr.pos, env).map(EvalResult::Done),
+                    "string-set!" => return eval_string_set(&elems[1..], expr.pos, env).map(EvalResult::Done),
+                    "define-syntax" => return eval_define_syntax(&elems[1..], expr.pos, env).map(EvalResult::Done),
+                    "define-record-type" => return eval_define_record_type(&elems[1..], expr.pos, env).map(EvalResult::Done),
+                    "case-lambda" => return eval_case_lambda(&elems[1..], expr.pos, env).map(EvalResult::Done),
+                    "letrec" => return eval_letrec_tc(&elems[1..], expr.pos, env),
+                    "letrec*" => return eval_letrec_star_tc(&elems[1..], expr.pos, env),
+                    "case" => return eval_case_tc(&elems[1..], expr.pos, env),
+                    "do" => return eval_do(&elems[1..], expr.pos, env).map(EvalResult::Done),
                     _ => {}
                 }
                 // Check if symbol is bound to a macro
                 if let Some(val) = env.get(s) {
                     if let ValueKind::SyntaxRules { ref literals, ref rules, ref def_env } = val.kind {
                         let expanded = macros::expand_syntax_rules(rules, literals, elems, def_env, env)?;
-                        return eval(&expanded, env);
+                        return Ok(EvalResult::TailEval(expanded, Rc::clone(env)));
                     }
                 }
             }
@@ -71,15 +131,164 @@ pub fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
             // Check if evaluated head is a macro (e.g. via gensym rename)
             if let ValueKind::SyntaxRules { ref literals, ref rules, ref def_env } = func.kind {
                 let expanded = macros::expand_syntax_rules(rules, literals, elems, def_env, env)?;
-                return eval(&expanded, env);
+                return Ok(EvalResult::TailEval(expanded, Rc::clone(env)));
             }
             let args: Vec<Value> = elems[1..].iter()
                 .map(|e| eval(e, env))
                 .collect::<Result<Vec<_>, _>>()?;
-            apply(&func, &args, expr.pos)
+            apply_tc(&func, &args, expr.pos)
         }
-        ValueKind::Void => Ok(expr.clone()),
+        ValueKind::Void => Ok(EvalResult::Done(expr.clone())),
     }
+}
+
+fn eval_body_tc(body: &[Value], env: &Rc<Env>) -> Result<EvalResult, EvalError> {
+    if body.is_empty() { return Ok(EvalResult::Done(Value::unpos(ValueKind::Void))); }
+    for expr in &body[..body.len()-1] { eval(expr, env)?; }
+    Ok(EvalResult::TailEval(body.last().unwrap().clone(), Rc::clone(env)))
+}
+
+fn eval_let_tc(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<EvalResult, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Syntax(format!("let requires bindings and body at {}", fmt_pos(pos))));
+    }
+    if let ValueKind::Symbol(ref name) = args[0].kind {
+        if args.len() < 3 {
+            return Err(EvalError::Syntax(format!("named let requires bindings and body at {}", fmt_pos(pos))));
+        }
+        let bindings = match &args[1].kind {
+            ValueKind::List(b) => b,
+            _ => return Err(EvalError::Syntax(format!("let: expected binding list at {}", fmt_pos(args[1].pos)))),
+        };
+        let mut params = Vec::new();
+        let mut inits = Vec::new();
+        for binding in bindings {
+            match &binding.kind {
+                ValueKind::List(pair) if pair.len() == 2 => {
+                    params.push(match &pair[0].kind {
+                        ValueKind::Symbol(s) => s.clone(),
+                        _ => return Err(EvalError::Syntax(format!("let: expected symbol at {}", fmt_pos(pair[0].pos)))),
+                    });
+                    inits.push(eval(&pair[1], env)?);
+                }
+                _ => return Err(EvalError::Syntax(format!("let: bad binding at {}", fmt_pos(binding.pos)))),
+            }
+        }
+        let body = args[2..].to_vec();
+        let local_env = Env::new(Some(Rc::clone(env)));
+        let lambda = Value::new(ValueKind::Lambda { params: params.clone(), rest_param: None, body, env: Rc::clone(&local_env) }, pos);
+        local_env.set(name.clone(), lambda);
+        let func = local_env.get(name).unwrap();
+        return apply_tc(&func, &inits, pos);
+    }
+    let bindings = match &args[0].kind {
+        ValueKind::List(b) => b,
+        _ => return Err(EvalError::Syntax(format!("let: expected binding list at {}", fmt_pos(args[0].pos)))),
+    };
+    let local_env = Env::new(Some(Rc::clone(env)));
+    for binding in bindings {
+        match &binding.kind {
+            ValueKind::List(pair) if pair.len() == 2 => {
+                let name = match &pair[0].kind {
+                    ValueKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Syntax(format!("let: expected symbol in binding at {}", fmt_pos(pair[0].pos)))),
+                };
+                let val = eval(&pair[1], env)?;
+                local_env.set(name, val);
+            }
+            _ => return Err(EvalError::Syntax(format!("let: bad binding at {}", fmt_pos(binding.pos)))),
+        }
+    }
+    eval_body_tc(&args[1..], &local_env)
+}
+
+fn eval_cond_tc(clauses: &[Value], env: &Rc<Env>) -> Result<EvalResult, EvalError> {
+    for clause in clauses {
+        let parts = match &clause.kind {
+            ValueKind::List(p) => p,
+            _ => return Err(EvalError::Syntax(format!("cond: expected list clause at {}", fmt_pos(clause.pos)))),
+        };
+        if parts.is_empty() { continue; }
+        if let ValueKind::Symbol(ref s) = parts[0].kind {
+            if s == "else" { return eval_body_tc(&parts[1..], env); }
+        }
+        let test = eval(&parts[0], env)?;
+        if test.is_truthy() {
+            if parts.len() == 1 { return Ok(EvalResult::Done(test)); }
+            return eval_body_tc(&parts[1..], env);
+        }
+    }
+    Ok(EvalResult::Done(Value::unpos(ValueKind::Void)))
+}
+
+fn eval_letrec_tc(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<EvalResult, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Syntax(format!("letrec requires bindings and body at {}", fmt_pos(pos))));
+    }
+    let bindings = match &args[0].kind {
+        ValueKind::List(b) => b,
+        _ => return Err(EvalError::Syntax(format!("letrec: expected binding list at {}", fmt_pos(args[0].pos)))),
+    };
+    let local_env = Env::new(Some(Rc::clone(env)));
+    for binding in bindings {
+        if let ValueKind::List(pair) = &binding.kind {
+            if pair.len() == 2 { if let ValueKind::Symbol(s) = &pair[0].kind { local_env.set(s.clone(), Value::unpos(ValueKind::Void)); } }
+        }
+    }
+    for binding in bindings {
+        if let ValueKind::List(pair) = &binding.kind {
+            if let ValueKind::Symbol(s) = &pair[0].kind {
+                let val = eval(&pair[1], &local_env)?;
+                local_env.set(s.clone(), val);
+            }
+        }
+    }
+    eval_body_tc(&args[1..], &local_env)
+}
+
+fn eval_letrec_star_tc(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<EvalResult, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Syntax(format!("letrec* requires bindings and body at {}", fmt_pos(pos))));
+    }
+    let bindings = match &args[0].kind {
+        ValueKind::List(b) => b,
+        _ => return Err(EvalError::Syntax(format!("letrec*: expected binding list at {}", fmt_pos(args[0].pos)))),
+    };
+    let local_env = Env::new(Some(Rc::clone(env)));
+    for binding in bindings {
+        if let ValueKind::List(pair) = &binding.kind {
+            if pair.len() == 2 {
+                if let ValueKind::Symbol(s) = &pair[0].kind {
+                    let val = eval(&pair[1], &local_env)?;
+                    local_env.set(s.clone(), val);
+                }
+            }
+        }
+    }
+    eval_body_tc(&args[1..], &local_env)
+}
+
+fn eval_case_tc(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<EvalResult, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Syntax(format!("case requires key and clauses at {}", fmt_pos(pos))));
+    }
+    let key = eval(&args[0], env)?;
+    for clause in &args[1..] {
+        let parts = match &clause.kind {
+            ValueKind::List(p) => p,
+            _ => return Err(EvalError::Syntax(format!("case: expected clause at {}", fmt_pos(clause.pos)))),
+        };
+        if parts.is_empty() { continue; }
+        if let ValueKind::Symbol(ref s) = parts[0].kind {
+            if s == "else" { return eval_body_tc(&parts[1..], env); }
+        }
+        if let ValueKind::List(datums) = &parts[0].kind {
+            for datum in datums {
+                if eqv(&key, datum) { return eval_body_tc(&parts[1..], env); }
+            }
+        }
+    }
+    Ok(EvalResult::Done(Value::unpos(ValueKind::Void)))
 }
 
 fn eval_define(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalError> {
@@ -238,20 +447,6 @@ fn eval_set(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalError>
     Ok(Value::unpos(ValueKind::Void))
 }
 
-fn eval_if(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalError> {
-    if args.len() < 2 || args.len() > 3 {
-        return Err(EvalError::Syntax(format!("if requires 2 or 3 arguments at {}", fmt_pos(pos))));
-    }
-    let cond = eval(&args[0], env)?;
-    if cond.is_truthy() {
-        eval(&args[1], env)
-    } else if args.len() == 3 {
-        eval(&args[2], env)
-    } else {
-        Ok(Value::unpos(ValueKind::Void))
-    }
-}
-
 fn eval_quote(args: &[Value], pos: Pos) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::Syntax(format!("quote requires exactly 1 argument at {}", fmt_pos(pos))));
@@ -316,20 +511,6 @@ fn eval_case_lambda(clauses: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value,
         }
     }
     Ok(Value::new(ValueKind::CaseLambda { clauses: parsed_clauses }, pos))
-}
-
-fn eval_and(exprs: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
-    if exprs.is_empty() {
-        return Ok(Value::unpos(ValueKind::Boolean(true)));
-    }
-    let mut result = Value::unpos(ValueKind::Boolean(true));
-    for expr in exprs {
-        result = eval(expr, env)?;
-        if !result.is_truthy() {
-            return Ok(result);
-        }
-    }
-    Ok(result)
 }
 
 fn eval_or(exprs: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
@@ -471,65 +652,196 @@ fn eval_string_set(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, Eva
     Ok(Value::unpos(ValueKind::Void))
 }
 
+fn eval_letrec(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Syntax(format!("letrec requires bindings and body at {}", fmt_pos(pos))));
+    }
+    let bindings = match &args[0].kind {
+        ValueKind::List(b) => b,
+        _ => return Err(EvalError::Syntax(format!("letrec: expected binding list at {}", fmt_pos(args[0].pos)))),
+    };
+    let local_env = Env::new(Some(Rc::clone(env)));
+    for binding in bindings {
+        if let ValueKind::List(pair) = &binding.kind {
+            if pair.len() == 2 { if let ValueKind::Symbol(s) = &pair[0].kind { local_env.set(s.clone(), Value::unpos(ValueKind::Void)); } }
+        }
+    }
+    for binding in bindings {
+        if let ValueKind::List(pair) = &binding.kind {
+            if let ValueKind::Symbol(s) = &pair[0].kind {
+                let val = eval(&pair[1], &local_env)?;
+                local_env.set(s.clone(), val);
+            }
+        }
+    }
+    let mut result = Value::unpos(ValueKind::Void);
+    for expr in &args[1..] { result = eval(expr, &local_env)?; }
+    Ok(result)
+}
+
+fn eval_letrec_star(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Syntax(format!("letrec* requires bindings and body at {}", fmt_pos(pos))));
+    }
+    let bindings = match &args[0].kind {
+        ValueKind::List(b) => b,
+        _ => return Err(EvalError::Syntax(format!("letrec*: expected binding list at {}", fmt_pos(args[0].pos)))),
+    };
+    let local_env = Env::new(Some(Rc::clone(env)));
+    for binding in bindings {
+        if let ValueKind::List(pair) = &binding.kind {
+            if pair.len() == 2 {
+                if let ValueKind::Symbol(s) = &pair[0].kind {
+                    let val = eval(&pair[1], &local_env)?;
+                    local_env.set(s.clone(), val);
+                }
+            }
+        }
+    }
+    let mut result = Value::unpos(ValueKind::Void);
+    for expr in &args[1..] { result = eval(expr, &local_env)?; }
+    Ok(result)
+}
+
+fn eqv(a: &Value, b: &Value) -> bool {
+    match (&a.kind, &b.kind) {
+        (ValueKind::Integer(x), ValueKind::Integer(y)) => x == y,
+        (ValueKind::Rational(an, ad), ValueKind::Rational(bn, bd)) => an == bn && ad == bd,
+        (ValueKind::Float(x), ValueKind::Float(y)) => x == y,
+        (ValueKind::Boolean(x), ValueKind::Boolean(y)) => x == y,
+        (ValueKind::Symbol(x), ValueKind::Symbol(y)) => x == y,
+        (ValueKind::Char(x), ValueKind::Char(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn eval_case(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Syntax(format!("case requires key and clauses at {}", fmt_pos(pos))));
+    }
+    let key = eval(&args[0], env)?;
+    for clause in &args[1..] {
+        let parts = match &clause.kind {
+            ValueKind::List(p) => p,
+            _ => return Err(EvalError::Syntax(format!("case: expected clause at {}", fmt_pos(clause.pos)))),
+        };
+        if parts.is_empty() { continue; }
+        if let ValueKind::Symbol(ref s) = parts[0].kind {
+            if s == "else" {
+                let mut result = Value::unpos(ValueKind::Void);
+                for expr in &parts[1..] { result = eval(expr, env)?; }
+                return Ok(result);
+            }
+        }
+        if let ValueKind::List(datums) = &parts[0].kind {
+            for datum in datums {
+                if eqv(&key, datum) {
+                    let mut result = Value::unpos(ValueKind::Void);
+                    for expr in &parts[1..] { result = eval(expr, env)?; }
+                    return Ok(result);
+                }
+            }
+        }
+    }
+    Ok(Value::unpos(ValueKind::Void))
+}
+
+fn eval_do(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Syntax(format!("do requires bindings and test at {}", fmt_pos(pos))));
+    }
+    let bindings = match &args[0].kind {
+        ValueKind::List(b) => b,
+        _ => return Err(EvalError::Syntax(format!("do: expected binding list at {}", fmt_pos(args[0].pos)))),
+    };
+    let test_clause = match &args[1].kind {
+        ValueKind::List(t) if !t.is_empty() => t,
+        _ => return Err(EvalError::Syntax(format!("do: expected test clause at {}", fmt_pos(args[1].pos)))),
+    };
+    let body = &args[2..];
+    let mut var_names = Vec::new();
+    let mut step_exprs: Vec<Option<Value>> = Vec::new();
+    let local_env = Env::new(Some(Rc::clone(env)));
+    for binding in bindings {
+        let parts = match &binding.kind {
+            ValueKind::List(p) if p.len() >= 2 && p.len() <= 3 => p,
+            _ => return Err(EvalError::Syntax(format!("do: bad binding at {}", fmt_pos(binding.pos)))),
+        };
+        let name = match &parts[0].kind {
+            ValueKind::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Syntax(format!("do: expected symbol at {}", fmt_pos(parts[0].pos)))),
+        };
+        let init = eval(&parts[1], env)?;
+        local_env.set(name.clone(), init);
+        var_names.push(name);
+        step_exprs.push(if parts.len() == 3 { Some(parts[2].clone()) } else { None });
+    }
+    loop {
+        let test_result = eval(&test_clause[0], &local_env)?;
+        if test_result.is_truthy() {
+            if test_clause.len() > 1 {
+                let mut result = Value::unpos(ValueKind::Void);
+                for expr in &test_clause[1..] { result = eval(expr, &local_env)?; }
+                return Ok(result);
+            }
+            return Ok(Value::unpos(ValueKind::Void));
+        }
+        for expr in body { eval(expr, &local_env)?; }
+        let new_vals: Vec<Option<Value>> = step_exprs.iter()
+            .map(|step| match step {
+                Some(expr) => Ok(Some(eval(expr, &local_env)?)),
+                None => Ok(None),
+            })
+            .collect::<Result<Vec<_>, EvalError>>()?;
+        for (name, new_val) in var_names.iter().zip(new_vals.into_iter()) {
+            if let Some(val) = new_val { local_env.set(name.clone(), val); }
+        }
+    }
+}
+
 fn apply(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, EvalError> {
+    match apply_tc(func, args, call_pos)? {
+        EvalResult::Done(v) => Ok(v),
+        EvalResult::TailEval(e, en) => eval(&e, &en),
+    }
+}
+
+fn apply_tc(func: &Value, args: &[Value], call_pos: Pos) -> Result<EvalResult, EvalError> {
     match &func.kind {
-        ValueKind::Symbol(name) => apply_builtin(name, args, call_pos),
+        ValueKind::Symbol(name) => apply_builtin(name, args, call_pos).map(EvalResult::Done),
         ValueKind::Lambda { params, rest_param, body, env } => {
-            if let Some(ref rest) = rest_param {
+            let local_env = if let Some(ref rest) = rest_param {
                 if args.len() < params.len() {
                     return Err(EvalError::Arity(format!(
                         "expected at least {} arguments, got {} at {}", params.len(), args.len(), fmt_pos(call_pos)
                     )));
                 }
-                let local_env = Env::new(Some(Rc::clone(env)));
-                for (param, arg) in params.iter().zip(args.iter()) {
-                    local_env.set(param.clone(), arg.clone());
-                }
-                let rest_args = args[params.len()..].to_vec();
-                local_env.set(rest.clone(), Value::unpos(ValueKind::List(rest_args)));
-                let mut result = Value::unpos(ValueKind::Void);
-                for expr in body {
-                    result = eval(expr, &local_env)?;
-                }
-                Ok(result)
+                let le = Env::new(Some(Rc::clone(env)));
+                for (p, a) in params.iter().zip(args.iter()) { le.set(p.clone(), a.clone()); }
+                le.set(rest.clone(), Value::unpos(ValueKind::List(args[params.len()..].to_vec())));
+                le
             } else {
                 if args.len() != params.len() {
                     return Err(EvalError::Arity(format!(
                         "expected {} arguments, got {} at {}", params.len(), args.len(), fmt_pos(call_pos)
                     )));
                 }
-                let local_env = Env::new(Some(Rc::clone(env)));
-                for (param, arg) in params.iter().zip(args.iter()) {
-                    local_env.set(param.clone(), arg.clone());
-                }
-                let mut result = Value::unpos(ValueKind::Void);
-                for expr in body {
-                    result = eval(expr, &local_env)?;
-                }
-                Ok(result)
-            }
+                let le = Env::new(Some(Rc::clone(env)));
+                for (p, a) in params.iter().zip(args.iter()) { le.set(p.clone(), a.clone()); }
+                le
+            };
+            eval_body_tc(body, &local_env)
         }
         ValueKind::CaseLambda { clauses } => {
             for (params, rest_param, body, closure_env) in clauses {
-                let matches = if rest_param.is_some() {
-                    args.len() >= params.len()
-                } else {
-                    args.len() == params.len()
-                };
-                if matches {
-                    let local_env = Env::new(Some(Rc::clone(closure_env)));
-                    for (param, arg) in params.iter().zip(args.iter()) {
-                        local_env.set(param.clone(), arg.clone());
-                    }
+                let ok = if rest_param.is_some() { args.len() >= params.len() } else { args.len() == params.len() };
+                if ok {
+                    let le = Env::new(Some(Rc::clone(closure_env)));
+                    for (p, a) in params.iter().zip(args.iter()) { le.set(p.clone(), a.clone()); }
                     if let Some(ref rest) = rest_param {
-                        let rest_args = args[params.len()..].to_vec();
-                        local_env.set(rest.clone(), Value::unpos(ValueKind::List(rest_args)));
+                        le.set(rest.clone(), Value::unpos(ValueKind::List(args[params.len()..].to_vec())));
                     }
-                    let mut result = Value::unpos(ValueKind::Void);
-                    for expr in body {
-                        result = eval(expr, &local_env)?;
-                    }
-                    return Ok(result);
+                    return eval_body_tc(body, &le);
                 }
             }
             Err(EvalError::Arity(format!(
@@ -546,11 +858,11 @@ fn apply(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, EvalError
             let fields: Vec<(String, Value)> = field_names.iter().zip(args.iter())
                 .map(|(name, val)| (name.clone(), val.clone()))
                 .collect();
-            Ok(Value::unpos(ValueKind::Record {
+            Ok(EvalResult::Done(Value::unpos(ValueKind::Record {
                 type_id: *type_id,
                 type_name: type_name.clone(),
                 fields,
-            }))
+            })))
         }
         ValueKind::RecordPredicate { type_id } => {
             if args.len() != 1 {
@@ -559,7 +871,7 @@ fn apply(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, EvalError
                 )));
             }
             let is_match = matches!(&args[0].kind, ValueKind::Record { type_id: tid, .. } if tid == type_id);
-            Ok(Value::unpos(ValueKind::Boolean(is_match)))
+            Ok(EvalResult::Done(Value::unpos(ValueKind::Boolean(is_match))))
         }
         ValueKind::RecordAccessor { type_id, type_name, field_name } => {
             if args.len() != 1 {
@@ -571,7 +883,7 @@ fn apply(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, EvalError
                 ValueKind::Record { type_id: tid, fields, .. } if tid == type_id => {
                     fields.iter()
                         .find(|(name, _)| name == field_name)
-                        .map(|(_, val)| val.clone())
+                        .map(|(_, val)| EvalResult::Done(val.clone()))
                         .ok_or_else(|| EvalError::Runtime(format!(
                             "record {} has no field {} at {}", type_name, field_name, fmt_pos(call_pos)
                         )))
@@ -685,6 +997,7 @@ fn num_cmp(a: NumVal, b: NumVal) -> f64 {
     }
 }
 
+#[inline(never)]
 fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, EvalError> {
     match name {
         "+" => {
@@ -788,7 +1101,11 @@ fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, Eva
             }
             match &args[0].kind {
                 ValueKind::List(elems) if !elems.is_empty() => {
-                    Ok(Value::unpos(ValueKind::List(elems[1..].to_vec())))
+                    if elems.len() == 3 && matches!(&elems[1].kind, ValueKind::Symbol(s) if s == ".") {
+                        Ok(elems[2].clone())
+                    } else {
+                        Ok(Value::unpos(ValueKind::List(elems[1..].to_vec())))
+                    }
                 }
                 _ => Err(EvalError::Type(format!("cdr: not a pair at {}", fmt_pos(call_pos)))),
             }
@@ -1143,7 +1460,11 @@ fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, Eva
         }
         "eqv?" | "eq?" => {
             if args.len() != 2 { return Err(EvalError::Arity(format!("{} requires 2 arguments at {}", name, fmt_pos(call_pos)))); }
-            Ok(Value::unpos(ValueKind::Boolean(args[0] == args[1])))
+            let result = match (&args[0].kind, &args[1].kind) {
+                (ValueKind::Vector(a), ValueKind::Vector(b)) => Rc::ptr_eq(a, b),
+                _ => args[0] == args[1],
+            };
+            Ok(Value::unpos(ValueKind::Boolean(result)))
         }
         "map" => {
             if args.len() < 2 { return Err(EvalError::Arity(format!("map requires at least 2 arguments at {}", fmt_pos(call_pos)))); }
@@ -1317,7 +1638,7 @@ fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, Eva
                     } else {
                         // Use the fact that f = n/d, find simplest rational
                         // Multiply by power of 10 to clear decimals, then simplify
-                        let mut num = f;
+                        let num = f;
                         let mut den = 1i64;
                         // Scale up to integer
                         while (num * den as f64).fract().abs() > 1e-10 && den < 1_000_000_000 {
@@ -1343,6 +1664,66 @@ fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, Eva
                 ValueKind::Integer(_) => Ok(Value::unpos(ValueKind::Integer(1))),
                 ValueKind::Rational(_, d) => Ok(Value::unpos(ValueKind::Integer(*d))),
                 _ => Err(EvalError::Type(format!("denominator: not a rational at {}", fmt_pos(call_pos)))),
+            }
+        }
+        // L14: Vectors
+        "vector" => {
+            Ok(Value::unpos(ValueKind::Vector(Rc::new(RefCell::new(args.to_vec())))))
+        }
+        "make-vector" => {
+            if args.is_empty() || args.len() > 2 { return Err(EvalError::Arity(format!("make-vector requires 1-2 arguments at {}", fmt_pos(call_pos)))); }
+            let len = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("make-vector: not a number at {}", fmt_pos(call_pos))))? as usize;
+            let fill = if args.len() == 2 { args[1].clone() } else { Value::unpos(ValueKind::Integer(0)) };
+            Ok(Value::unpos(ValueKind::Vector(Rc::new(RefCell::new(vec![fill; len])))))
+        }
+        "vector-ref" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("vector-ref requires 2 arguments at {}", fmt_pos(call_pos)))); }
+            match &args[0].kind {
+                ValueKind::Vector(v) => {
+                    let idx = args[1].as_integer().ok_or_else(|| EvalError::Type(format!("vector-ref: not a number at {}", fmt_pos(call_pos))))? as usize;
+                    let elems = v.borrow();
+                    if idx >= elems.len() { return Err(EvalError::Runtime(format!("vector-ref: index out of range at {}", fmt_pos(call_pos)))); }
+                    Ok(elems[idx].clone())
+                }
+                _ => Err(EvalError::Type(format!("vector-ref: not a vector at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "vector-set!" => {
+            if args.len() != 3 { return Err(EvalError::Arity(format!("vector-set! requires 3 arguments at {}", fmt_pos(call_pos)))); }
+            match &args[0].kind {
+                ValueKind::Vector(v) => {
+                    let idx = args[1].as_integer().ok_or_else(|| EvalError::Type(format!("vector-set!: not a number at {}", fmt_pos(call_pos))))? as usize;
+                    let mut elems = v.borrow_mut();
+                    if idx >= elems.len() { return Err(EvalError::Runtime(format!("vector-set!: index out of range at {}", fmt_pos(call_pos)))); }
+                    elems[idx] = args[2].clone();
+                    Ok(Value::unpos(ValueKind::Void))
+                }
+                _ => Err(EvalError::Type(format!("vector-set!: not a vector at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "vector-length" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("vector-length requires 1 argument at {}", fmt_pos(call_pos)))); }
+            match &args[0].kind {
+                ValueKind::Vector(v) => Ok(Value::unpos(ValueKind::Integer(v.borrow().len() as i64))),
+                _ => Err(EvalError::Type(format!("vector-length: not a vector at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "vector?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("vector? requires 1 argument at {}", fmt_pos(call_pos)))); }
+            Ok(Value::unpos(ValueKind::Boolean(matches!(&args[0].kind, ValueKind::Vector(_)))))
+        }
+        "vector->list" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("vector->list requires 1 argument at {}", fmt_pos(call_pos)))); }
+            match &args[0].kind {
+                ValueKind::Vector(v) => Ok(Value::unpos(ValueKind::List(v.borrow().clone()))),
+                _ => Err(EvalError::Type(format!("vector->list: not a vector at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "list->vector" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("list->vector requires 1 argument at {}", fmt_pos(call_pos)))); }
+            match &args[0].kind {
+                ValueKind::List(elems) => Ok(Value::unpos(ValueKind::Vector(Rc::new(RefCell::new(elems.clone()))))),
+                _ => Err(EvalError::Type(format!("list->vector: not a list at {}", fmt_pos(call_pos)))),
             }
         }
         _ => Err(EvalError::UnboundVariable(format!("{} at {}", name, fmt_pos(call_pos)))),
