@@ -7,6 +7,25 @@ import java.util.Map;
 
 public class Evaluator {
 
+    // --- Position tracking ---
+
+    record Pos(int line, int col) {
+        @Override public String toString() { return line + ":" + col; }
+    }
+
+    private record Located(Object value, Pos pos) {}
+
+    private Pos currentPos = new Pos(1, 1);
+    private List<Pos> tokenPositions = new ArrayList<>();
+
+    private String posStr() {
+        return currentPos + ": ";
+    }
+
+    private static Object unwrap(Object obj) {
+        return obj instanceof Located loc ? loc.value() : obj;
+    }
+
     // --- Environment ---
 
     private static class Env {
@@ -52,6 +71,7 @@ public class Evaluator {
     };
 
     public String evalStr(String input) throws EvalError {
+        currentPos = new Pos(1, 1);
         List<Object> tokens = tokenize(input);
         int[] pos = {0};
         Env env = makeTopLevelEnv();
@@ -91,28 +111,35 @@ public class Evaluator {
 
     private List<Object> tokenize(String input) throws EvalError {
         List<Object> tokens = new ArrayList<>();
+        tokenPositions = new ArrayList<>();
         int i = 0;
+        int line = 1, col = 1;
         while (i < input.length()) {
             char c = input.charAt(i);
             if (Character.isWhitespace(c)) {
+                if (c == '\n') { line++; col = 1; } else { col++; }
                 i++;
             } else if (c == ';') {
-                while (i < input.length() && input.charAt(i) != '\n') i++;
+                while (i < input.length() && input.charAt(i) != '\n') { i++; col++; }
             } else if (c == '(') {
                 tokens.add("(");
-                i++;
+                tokenPositions.add(new Pos(line, col));
+                i++; col++;
             } else if (c == ')') {
                 tokens.add(")");
-                i++;
+                tokenPositions.add(new Pos(line, col));
+                i++; col++;
             } else if (c == '\'') {
                 tokens.add("'");
-                i++;
+                tokenPositions.add(new Pos(line, col));
+                i++; col++;
             } else if (c == '"') {
+                Pos startPos = new Pos(line, col);
                 StringBuilder sb = new StringBuilder();
-                i++; // skip opening quote
+                i++; col++; // skip opening quote
                 while (i < input.length() && input.charAt(i) != '"') {
                     if (input.charAt(i) == '\\') {
-                        i++;
+                        i++; col++;
                         if (i < input.length()) {
                             char esc = input.charAt(i);
                             switch (esc) {
@@ -124,35 +151,41 @@ public class Evaluator {
                             }
                         }
                     } else {
+                        if (input.charAt(i) == '\n') { line++; col = 0; }
                         sb.append(input.charAt(i));
                     }
-                    i++;
+                    i++; col++;
                 }
-                i++; // skip closing quote
+                if (i < input.length()) { i++; col++; } // skip closing quote
                 tokens.add(new SchemeString(sb.toString()));
+                tokenPositions.add(startPos);
             } else if (c == '#') {
+                Pos startPos = new Pos(line, col);
                 if (i + 1 < input.length()) {
                     char next = input.charAt(i + 1);
                     if (next == 't') {
                         tokens.add(Boolean.TRUE);
-                        i += 2;
+                        tokenPositions.add(startPos);
+                        i += 2; col += 2;
                     } else if (next == 'f') {
                         tokens.add(Boolean.FALSE);
-                        i += 2;
+                        tokenPositions.add(startPos);
+                        i += 2; col += 2;
                     } else {
-                        throw new EvalError("unexpected character after #: " + next);
+                        throw new EvalError(startPos + ": unexpected character after #: " + next);
                     }
                 } else {
-                    throw new EvalError("unexpected end after #");
+                    throw new EvalError(startPos + ": unexpected end after #");
                 }
             } else {
                 // symbol or number
+                Pos startPos = new Pos(line, col);
                 StringBuilder sb = new StringBuilder();
                 while (i < input.length() && !Character.isWhitespace(input.charAt(i))
                         && input.charAt(i) != '(' && input.charAt(i) != ')'
                         && input.charAt(i) != '"' && input.charAt(i) != ';') {
                     sb.append(input.charAt(i));
-                    i++;
+                    i++; col++;
                 }
                 String tok = sb.toString();
                 try {
@@ -160,6 +193,7 @@ public class Evaluator {
                 } catch (NumberFormatException e) {
                     tokens.add(tok); // symbol
                 }
+                tokenPositions.add(startPos);
             }
         }
         return tokens;
@@ -169,17 +203,19 @@ public class Evaluator {
 
     private Object parse(List<Object> tokens, int[] pos) throws EvalError {
         if (pos[0] >= tokens.size()) {
-            throw new EvalError("unexpected end of input");
+            throw new EvalError(currentPos + ": unexpected end of input");
         }
+        int tokenIdx = pos[0];
+        Pos tokenPos = tokenPositions.get(tokenIdx);
         Object token = tokens.get(pos[0]);
         pos[0]++;
         if (token.equals("'")) {
             // 'expr -> (quote expr)
             Object quoted = parse(tokens, pos);
             List<Object> quoteExpr = new ArrayList<>();
-            quoteExpr.add("quote");
+            quoteExpr.add(new Located("quote", tokenPos));
             quoteExpr.add(quoted);
-            return quoteExpr;
+            return new Located(quoteExpr, tokenPos);
         }
         if (token.equals("(")) {
             List<Object> list = new ArrayList<>();
@@ -187,14 +223,14 @@ public class Evaluator {
                 list.add(parse(tokens, pos));
             }
             if (pos[0] >= tokens.size()) {
-                throw new EvalError("missing closing parenthesis");
+                throw new EvalError(tokenPos + ": missing closing parenthesis");
             }
             pos[0]++; // skip )
-            return list;
+            return new Located(list, tokenPos);
         } else if (token.equals(")")) {
-            throw new EvalError("unexpected )");
+            throw new EvalError(tokenPos + ": unexpected )");
         } else {
-            return token;
+            return new Located(token, tokenPos);
         }
     }
 
@@ -202,48 +238,59 @@ public class Evaluator {
 
     @SuppressWarnings("unchecked")
     private Object eval(Object expr, Env env) throws EvalError {
+        if (expr instanceof Located loc) {
+            currentPos = loc.pos();
+            expr = loc.value();
+        }
+
         if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString) {
             return expr;
         }
         if (expr instanceof String sym) {
-            return env.lookup(sym);
+            try {
+                return env.lookup(sym);
+            } catch (EvalError e) {
+                throw new EvalError(posStr() + e.getMessage());
+            }
         }
         if (expr instanceof List<?> list) {
             if (list.isEmpty()) {
-                throw new EvalError("empty application");
+                throw new EvalError(posStr() + "empty application");
             }
             Object head = list.get(0);
+            Object rawHead = unwrap(head);
 
             // Special forms
-            if (head instanceof String op) {
+            if (rawHead instanceof String op) {
                 switch (op) {
                     case "define" -> {
-                        if (list.size() < 3) throw new EvalError("define: bad syntax");
-                        Object target = list.get(1);
+                        if (list.size() < 3) throw new EvalError(posStr() + "define: bad syntax");
+                        Object target = unwrap(list.get(1));
                         if (target instanceof String name) {
-                            // (define x expr)
                             env.define(name, eval(list.get(2), env));
                         } else if (target instanceof List<?> sig) {
                             // (define (f params...) body...)
-                            if (sig.isEmpty() || !(sig.get(0) instanceof String fname)) {
-                                throw new EvalError("define: bad syntax");
+                            Object rawFirst = sig.isEmpty() ? null : unwrap(sig.get(0));
+                            if (sig.isEmpty() || !(rawFirst instanceof String fname)) {
+                                throw new EvalError(posStr() + "define: bad syntax");
                             }
                             List<String> params = new ArrayList<>();
                             for (int i = 1; i < sig.size(); i++) {
-                                if (!(sig.get(i) instanceof String p)) {
-                                    throw new EvalError("define: parameter must be a symbol");
+                                Object p = unwrap(sig.get(i));
+                                if (!(p instanceof String s)) {
+                                    throw new EvalError(posStr() + "define: parameter must be a symbol");
                                 }
-                                params.add(p);
+                                params.add(s);
                             }
                             List<Object> body = new ArrayList<>(list.subList(2, list.size()));
-                            env.define((String) sig.get(0), new Lambda(params, body, env));
+                            env.define(fname, new Lambda(params, body, env));
                         } else {
-                            throw new EvalError("define: bad syntax");
+                            throw new EvalError(posStr() + "define: bad syntax");
                         }
                         return VOID;
                     }
                     case "if" -> {
-                        if (list.size() < 3) throw new EvalError("if: bad syntax");
+                        if (list.size() < 3) throw new EvalError(posStr() + "if: bad syntax");
                         Object cond = eval(list.get(1), env);
                         if (!isFalse(cond)) {
                             return eval(list.get(2), env);
@@ -254,19 +301,20 @@ public class Evaluator {
                         }
                     }
                     case "quote" -> {
-                        if (list.size() != 2) throw new EvalError("quote: bad syntax");
+                        if (list.size() != 2) throw new EvalError(posStr() + "quote: bad syntax");
                         return quoteDatum(list.get(1));
                     }
                     case "lambda" -> {
-                        if (list.size() < 3) throw new EvalError("lambda: bad syntax");
-                        Object paramSpec = list.get(1);
+                        if (list.size() < 3) throw new EvalError(posStr() + "lambda: bad syntax");
+                        Object paramSpec = unwrap(list.get(1));
                         if (!(paramSpec instanceof List<?> paramList)) {
-                            throw new EvalError("lambda: parameters must be a list");
+                            throw new EvalError(posStr() + "lambda: parameters must be a list");
                         }
                         List<String> params = new ArrayList<>();
                         for (Object p : paramList) {
-                            if (!(p instanceof String s)) {
-                                throw new EvalError("lambda: parameter must be a symbol");
+                            Object rawP = unwrap(p);
+                            if (!(rawP instanceof String s)) {
+                                throw new EvalError(posStr() + "lambda: parameter must be a symbol");
                             }
                             params.add(s);
                         }
@@ -298,17 +346,20 @@ public class Evaluator {
                     }
                     case "cond" -> {
                         for (int i = 1; i < list.size(); i++) {
-                            if (!(list.get(i) instanceof List<?> clause) || clause.isEmpty()) {
-                                throw new EvalError("cond: bad clause");
+                            Object clauseObj = unwrap(list.get(i));
+                            if (!(clauseObj instanceof List<?> clause) || clause.isEmpty()) {
+                                throw new EvalError(posStr() + "cond: bad clause");
                             }
-                            if (clause.get(0) instanceof String s && s.equals("else")) {
+                            Object clauseHead = clause.get(0);
+                            Object rawClauseHead = unwrap(clauseHead);
+                            if (rawClauseHead instanceof String s && s.equals("else")) {
                                 Object result = VOID;
                                 for (int j = 1; j < clause.size(); j++) {
                                     result = eval(clause.get(j), env);
                                 }
                                 return result;
                             }
-                            Object test = eval(clause.get(0), env);
+                            Object test = eval(clauseHead, env);
                             if (!isFalse(test)) {
                                 if (clause.size() == 1) return test;
                                 Object result = VOID;
@@ -321,21 +372,26 @@ public class Evaluator {
                         return VOID;
                     }
                     case "let" -> {
-                        if (list.size() < 3) throw new EvalError("let: bad syntax");
+                        if (list.size() < 3) throw new EvalError(posStr() + "let: bad syntax");
+                        Object second = unwrap(list.get(1));
+
                         // Named let: (let name ((var val) ...) body...)
-                        if (list.get(1) instanceof String loopName) {
-                            if (list.size() < 4) throw new EvalError("let: bad syntax");
-                            if (!(list.get(2) instanceof List<?> bindingsList)) {
-                                throw new EvalError("let: bindings must be a list");
+                        if (second instanceof String loopName) {
+                            if (list.size() < 4) throw new EvalError(posStr() + "let: bad syntax");
+                            Object bindsObj = unwrap(list.get(2));
+                            if (!(bindsObj instanceof List<?> bindingsList)) {
+                                throw new EvalError(posStr() + "let: bindings must be a list");
                             }
                             List<String> params = new ArrayList<>();
                             List<Object> initVals = new ArrayList<>();
                             for (Object binding : bindingsList) {
-                                if (!(binding instanceof List<?> bp) || bp.size() != 2) {
-                                    throw new EvalError("let: bad binding");
+                                Object rawBinding = unwrap(binding);
+                                if (!(rawBinding instanceof List<?> bp) || bp.size() != 2) {
+                                    throw new EvalError(posStr() + "let: bad binding");
                                 }
-                                if (!(bp.get(0) instanceof String pname)) {
-                                    throw new EvalError("let: binding name must be a symbol");
+                                Object pnameObj = unwrap(bp.get(0));
+                                if (!(pnameObj instanceof String pname)) {
+                                    throw new EvalError(posStr() + "let: binding name must be a symbol");
                                 }
                                 params.add(pname);
                                 initVals.add(eval(bp.get(1), env));
@@ -354,17 +410,20 @@ public class Evaluator {
                             }
                             return result;
                         }
+
                         // Regular let
-                        if (!(list.get(1) instanceof List<?> bindings)) {
-                            throw new EvalError("let: bindings must be a list");
+                        if (!(second instanceof List<?> bindings)) {
+                            throw new EvalError(posStr() + "let: bindings must be a list");
                         }
                         Env letEnv = new Env(env);
                         for (Object binding : bindings) {
-                            if (!(binding instanceof List<?> pair) || pair.size() != 2) {
-                                throw new EvalError("let: bad binding");
+                            Object rawBinding = unwrap(binding);
+                            if (!(rawBinding instanceof List<?> pair) || pair.size() != 2) {
+                                throw new EvalError(posStr() + "let: bad binding");
                             }
-                            if (!(pair.get(0) instanceof String name)) {
-                                throw new EvalError("let: binding name must be a symbol");
+                            Object nameObj = unwrap(pair.get(0));
+                            if (!(nameObj instanceof String name)) {
+                                throw new EvalError(posStr() + "let: binding name must be a symbol");
                             }
                             letEnv.define(name, eval(pair.get(1), env));
                         }
@@ -388,7 +447,7 @@ public class Evaluator {
 
             if (proc instanceof Lambda lam) {
                 if (args.size() != lam.params().size()) {
-                    throw new EvalError("wrong number of arguments: expected " + lam.params().size() + ", got " + args.size());
+                    throw new EvalError(posStr() + "wrong number of arguments: expected " + lam.params().size() + ", got " + args.size());
                 }
                 Env callEnv = new Env(lam.closureEnv());
                 for (int i = 0; i < lam.params().size(); i++) {
@@ -405,9 +464,9 @@ public class Evaluator {
                 return applyBuiltin(b.name(), args);
             }
 
-            throw new EvalError("not a procedure: " + schemeToString(proc));
+            throw new EvalError(posStr() + "not a procedure: " + schemeToString(proc));
         }
-        throw new EvalError("cannot eval: " + expr);
+        throw new EvalError(posStr() + "cannot eval: " + expr);
     }
 
     private Object applyBuiltin(String op, List<Object> args) throws EvalError {
@@ -418,7 +477,7 @@ public class Evaluator {
                 return sum;
             }
             case "-" -> {
-                if (args.isEmpty()) throw new EvalError("- requires at least 1 argument");
+                if (args.isEmpty()) throw new EvalError(posStr() + "- requires at least 1 argument");
                 if (args.size() == 1) return -requireLong(args.get(0));
                 long result = requireLong(args.get(0));
                 for (int i = 1; i < args.size(); i++) result -= requireLong(args.get(i));
@@ -430,11 +489,11 @@ public class Evaluator {
                 return product;
             }
             case "/" -> {
-                if (args.size() < 2) throw new EvalError("/ requires at least 2 arguments");
+                if (args.size() < 2) throw new EvalError(posStr() + "/ requires at least 2 arguments");
                 long result = requireLong(args.get(0));
                 for (int i = 1; i < args.size(); i++) {
                     long divisor = requireLong(args.get(i));
-                    if (divisor == 0) throw new EvalError("division by zero");
+                    if (divisor == 0) throw new EvalError(posStr() + "division by zero");
                     result /= divisor;
                 }
                 return result;
@@ -469,12 +528,12 @@ public class Evaluator {
             }
             case "car" -> {
                 requireArgCount(op, args, 1);
-                if (!(args.get(0) instanceof Pair p)) throw new EvalError("car: not a pair");
+                if (!(args.get(0) instanceof Pair p)) throw new EvalError(posStr() + "car: not a pair");
                 return p.car();
             }
             case "cdr" -> {
                 requireArgCount(op, args, 1);
-                if (!(args.get(0) instanceof Pair p)) throw new EvalError("cdr: not a pair");
+                if (!(args.get(0) instanceof Pair p)) throw new EvalError(posStr() + "cdr: not a pair");
                 return p.cdr();
             }
             case "null?" -> {
@@ -497,19 +556,17 @@ public class Evaluator {
                     count++;
                     obj = p.cdr();
                 }
-                if (obj != NIL) throw new EvalError("length: not a proper list");
+                if (obj != NIL) throw new EvalError(posStr() + "length: not a proper list");
                 return (long) count;
             }
             case "append" -> {
                 Object result = NIL;
-                // Process lists from right to left
                 for (int i = args.size() - 1; i >= 0; i--) {
                     Object lst = args.get(i);
                     if (lst == NIL) continue;
                     if (i == args.size() - 1) {
-                        result = lst; // last arg can be any object
+                        result = lst;
                     } else {
-                        // Prepend all elements of lst to result
                         List<Object> elems = new ArrayList<>();
                         Object cur = lst;
                         while (cur instanceof Pair p) {
@@ -543,13 +600,16 @@ public class Evaluator {
                 requireArgCount(op, args, 1);
                 return args.get(0) instanceof String;
             }
-            default -> throw new EvalError("unbound variable: " + op);
+            default -> throw new EvalError(posStr() + "unbound variable: " + op);
         }
     }
 
     // --- Helpers ---
 
     private Object quoteDatum(Object datum) {
+        if (datum instanceof Located loc) {
+            datum = loc.value();
+        }
         if (datum instanceof List<?> list) {
             Object result = NIL;
             for (int i = list.size() - 1; i >= 0; i--) {
@@ -566,12 +626,12 @@ public class Evaluator {
 
     private long requireLong(Object val) throws EvalError {
         if (val instanceof Long l) return l;
-        throw new EvalError("expected number, got: " + schemeToString(val));
+        throw new EvalError(posStr() + "expected number, got: " + schemeToString(val));
     }
 
     private void requireArgCount(String op, List<Object> args, int expected) throws EvalError {
         if (args.size() != expected) {
-            throw new EvalError(op + ": expected " + expected + " arguments, got " + args.size());
+            throw new EvalError(posStr() + op + ": expected " + expected + " arguments, got " + args.size());
         }
     }
 
