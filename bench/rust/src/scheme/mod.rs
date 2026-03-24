@@ -4,6 +4,7 @@ mod forms;
 mod macros;
 mod parser;
 mod values;
+mod wind;
 
 use parser::{parse_all, Expr, Pos};
 
@@ -17,6 +18,7 @@ use forms::{
 };
 use macros::{eval_define_syntax, expand_macro};
 use values::{values_eq, values_equal, values_eqv, is_proper_list};
+use wind::{apply_wind_step, apply_continuation};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -38,6 +40,19 @@ fn next_wind_id() -> u64 {
     WIND_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Exception handler stack entry.
+#[derive(Clone)]
+enum HandlerEntry {
+    Guard {
+        var: String,
+        clauses: Vec<Expr>,
+        env: Env,
+        kont: Kont,
+        wind_stack: Vec<WindEntry>,
+    },
+    User(Value),
+}
+
 fn common_prefix_len(a: &[WindEntry], b: &[WindEntry]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x.id == y.id).count()
 }
@@ -50,15 +65,11 @@ pub(super) struct CaseLambdaClause {
     env: Env,
 }
 
-// ---------- Continuation ----------
-
 pub(super) type Kont = Rc<KontFrame>;
 
 fn halt_kont() -> Kont {
     Rc::new(KontFrame::Halt)
 }
-
-// ---------- Value ----------
 
 /// A Scheme value.
 #[derive(Debug, Clone)]
@@ -419,7 +430,6 @@ fn default_env() -> Env {
     env
 }
 
-
 // ---------- Evaluator ----------
 
 pub(super) fn is_truthy(v: &Value) -> bool {
@@ -465,6 +475,7 @@ pub(super) const BUILTINS: &[&str] = &[
     "gcd", "lcm",
     "call/cc", "call-with-current-continuation",
     "dynamic-wind",
+    "raise", "with-exception-handler",
 ];
 
 // ---------- CEK Machine ----------
@@ -516,6 +527,16 @@ pub(super) enum KontFrame {
     EvWind { unwind_outs: Vec<Value>, rewind_ins: Vec<Value>, target_ws: Vec<WindEntry>, val: Value, target_kont: Kont, pos: Pos },
     /// Winding: after an out-thunk or in-thunk call, continue winding
     EvWindStep { unwind_outs: Vec<Value>, rewind_ins: Vec<Value>, target_ws: Vec<WindEntry>, val: Value, target_kont: Kont, pos: Pos },
+    /// guard: setup — push handler onto handler_stack, then eval body
+    EvGuardSetup { var: String, clauses: Vec<Expr>, body: Vec<Expr>, env: Env, next: Kont },
+    /// guard: pop handler on normal body return
+    EvGuardBody { next: Kont },
+    /// guard: evaluate cond clauses after exception (val = exception value)
+    EvGuardClauses { var: String, clauses: Vec<Expr>, env: Env, next: Kont },
+    /// with-exception-handler: pop handler on normal thunk return
+    EvWithExcHandler { next: Kont },
+    /// raise: error if handler returns from non-continuable raise
+    EvRaiseContinuationError,
 }
 
 impl fmt::Debug for KontFrame {
@@ -546,6 +567,7 @@ fn cek_run(exprs: &[Expr], env: &Env, output: &mut String) -> Result<Value, Eval
         return Ok(Value::Void);
     }
     let mut wind_stack: Vec<WindEntry> = vec![];
+    let mut handler_stack: Vec<HandlerEntry> = vec![];
     let kont = halt_kont();
     let mut state = eval_body_state(exprs, env.clone(), kont);
     loop {
@@ -558,10 +580,10 @@ fn cek_run(exprs: &[Expr], env: &Env, output: &mut String) -> Result<Value, Eval
                 state = cek_eval(&e, &env, kont, output)?;
             }
             State::Apply(val, kont) => {
-                state = cek_apply_kont(val, &kont, &mut wind_stack, output)?;
+                state = cek_apply_kont(val, &kont, &mut wind_stack, &mut handler_stack, output)?;
             }
             State::Invoke(func, args, pos, kont) => {
-                state = cek_invoke(func, args, pos, kont, &mut wind_stack, output)?;
+                state = cek_invoke(func, args, pos, kont, &mut wind_stack, &mut handler_stack, output)?;
             }
         }
     }
@@ -603,7 +625,8 @@ pub(super) fn eval_simple(expr: &Expr, env: &Env, output: &mut String) -> Option
                 if let Some(Value::Builtin(name)) = env_get(env, op) {
                     // Don't eagerly evaluate CPS-requiring builtins
                     if matches!(name.as_str(), "call/cc" | "call-with-current-continuation"
-                        | "apply" | "map" | "for-each" | "dynamic-wind") {
+                        | "apply" | "map" | "for-each" | "dynamic-wind"
+                        | "raise" | "with-exception-handler") {
                         return None;
                     }
                     let mut args = Vec::with_capacity(elems.len() - 1);
@@ -734,6 +757,26 @@ fn cek_eval(expr: &Expr, env: &Env, kont: Kont, _output: &mut String) -> Result<
                         let kont = Rc::new(KontFrame::EvIf { then_e: body_expr, else_e: None, env: env.clone(), next: kont });
                         return Ok(State::Eval(elems[1].clone(), env.clone(), kont));
                     }
+                    "guard" => {
+                        let vc = match &elems[1] {
+                            Expr::List(vc, _) if !vc.is_empty() => vc,
+                            _ => return Err(EvalError::Parse(format!("{p}: guard: expected (var clause ...)"))),
+                        };
+                        let var = match &vc[0] {
+                            Expr::Symbol(s, _) => s.clone(),
+                            _ => return Err(EvalError::Parse(format!("{p}: guard: expected variable"))),
+                        };
+                        let clauses = vc[1..].to_vec();
+                        let body = elems[2..].to_vec();
+                        let setup = Rc::new(KontFrame::EvGuardSetup {
+                            var,
+                            clauses,
+                            body,
+                            env: env.clone(),
+                            next: kont,
+                        });
+                        return Ok(State::Apply(Value::Void, setup));
+                    }
                     "unless" => {
                         if elems.len() < 3 {
                             return Err(EvalError::Arity(format!("{p}: unless requires test and body")));
@@ -786,7 +829,7 @@ fn cek_eval(expr: &Expr, env: &Env, kont: Kont, _output: &mut String) -> Result<
 }
 
 /// CEK step: return a value to a continuation.
-fn cek_apply_kont(val: Value, kont: &Kont, wind_stack: &mut Vec<WindEntry>, _output: &mut String) -> Result<State, EvalError> {
+fn cek_apply_kont(val: Value, kont: &Kont, wind_stack: &mut Vec<WindEntry>, handler_stack: &mut Vec<HandlerEntry>, _output: &mut String) -> Result<State, EvalError> {
     match kont.as_ref() {
         KontFrame::Halt => Ok(State::Done(val)),
 
@@ -1061,84 +1104,49 @@ fn cek_apply_kont(val: Value, kont: &Kont, wind_stack: &mut Vec<WindEntry>, _out
 
         KontFrame::EvWind { unwind_outs, rewind_ins, target_ws, val, target_kont, pos } |
         KontFrame::EvWindStep { unwind_outs, rewind_ins, target_ws, val, target_kont, pos } => {
-            if !unwind_outs.is_empty() {
-                // Pop from current wind stack and call out-thunk
-                wind_stack.pop();
-                let out_thunk = unwind_outs[0].clone();
-                let step = Rc::new(KontFrame::EvWindStep {
-                    unwind_outs: unwind_outs[1..].to_vec(),
-                    rewind_ins: rewind_ins.clone(),
-                    target_ws: target_ws.clone(),
-                    val: val.clone(),
-                    target_kont: target_kont.clone(),
-                    pos: *pos,
-                });
-                Ok(State::Invoke(out_thunk, vec![], *pos, step))
-            } else if !rewind_ins.is_empty() {
-                // Push to wind stack and call in-thunk
-                // Find the corresponding entry in target_ws
-                let entry = target_ws[wind_stack.len()].clone();
-                wind_stack.push(entry);
-                let in_thunk = rewind_ins[0].clone();
-                let step = Rc::new(KontFrame::EvWindStep {
-                    unwind_outs: vec![],
-                    rewind_ins: rewind_ins[1..].to_vec(),
-                    target_ws: target_ws.clone(),
-                    val: val.clone(),
-                    target_kont: target_kont.clone(),
-                    pos: *pos,
-                });
-                Ok(State::Invoke(in_thunk, vec![], *pos, step))
-            } else {
-                // All winding done; set final wind stack and apply continuation
-                *wind_stack = target_ws.clone();
-                apply_continuation(val.clone(), target_kont)
-            }
+            apply_wind_step(unwind_outs, rewind_ins, target_ws, val, target_kont, *pos, wind_stack)
         }
-    }
-}
 
-/// Apply a value to a captured continuation.
-/// When the continuation's top frame is EvCallArgs (meaning the call/cc was invoked
-/// during function argument evaluation), re-evaluate all argument expressions so that
-/// mutable bindings are re-read. This ensures correct behavior for reentrant continuations.
-fn apply_continuation(val: Value, k: &Kont) -> Result<State, EvalError> {
-    match k.as_ref() {
-        KontFrame::EvCallArgs { func, all_arg_exprs, eval_idx, env, pos, next, .. } => {
-            // Re-evaluate: pre_exprs (before call/cc) and post_exprs (after call/cc)
-            // with the call/cc result inserted at eval_idx
-            let pre_exprs = &all_arg_exprs[..*eval_idx];
-            let post_exprs = &all_arg_exprs[eval_idx + 1..];
-
-            // Bind val to a temp variable and build full arg list
-            let temp_name = format!("__cc_v_{}", *eval_idx);
-            let resume_env = new_env(Some(env.clone()));
-            env_set(&resume_env, temp_name.clone(), val);
-
-            let mut all_new: Vec<Expr> = pre_exprs.to_vec();
-            all_new.push(Expr::Symbol(temp_name, *pos));
-            all_new.extend(post_exprs.iter().cloned());
-
-            if all_new.is_empty() {
-                return Ok(State::Invoke(func.clone(), vec![], *pos, next.clone()));
-            }
-            let kont = Rc::new(KontFrame::EvCallArgs {
-                func: func.clone(),
-                all_arg_exprs: all_new.clone(),
-                eval_idx: 0,
-                done: vec![],
-                env: resume_env.clone(),
-                pos: *pos,
-                next: next.clone(),
+        KontFrame::EvGuardSetup { var, clauses, body, env, next } => {
+            // Push guard handler capturing current continuation and wind state
+            handler_stack.push(HandlerEntry::Guard {
+                var: var.clone(),
+                clauses: clauses.clone(),
+                env: env.clone(),
+                kont: next.clone(),
+                wind_stack: wind_stack.clone(),
             });
-            Ok(State::Eval(all_new[0].clone(), resume_env, kont))
+            let body_kont = Rc::new(KontFrame::EvGuardBody { next: next.clone() });
+            Ok(eval_body_state(body, env.clone(), body_kont))
         }
-        _ => Ok(State::Apply(val, k.clone())),
+
+        KontFrame::EvGuardBody { next } => {
+            // Body completed normally — pop guard handler
+            handler_stack.pop();
+            Ok(State::Apply(val, next.clone()))
+        }
+
+        KontFrame::EvGuardClauses { var, clauses, env, next } => {
+            // val is the exception value; bind var and evaluate cond clauses
+            let local_env = new_env(Some(env.clone()));
+            env_set(&local_env, var.clone(), val);
+            cek_eval_cond(clauses, &local_env, next.clone())
+        }
+
+        KontFrame::EvWithExcHandler { next } => {
+            // Thunk completed normally — pop handler
+            handler_stack.pop();
+            Ok(State::Apply(val, next.clone()))
+        }
+
+        KontFrame::EvRaiseContinuationError => {
+            Err(EvalError::Exception("handler returned from non-continuable exception".into()))
+        }
     }
 }
 
 /// CEK step: invoke a function with arguments.
-fn cek_invoke(func: Value, args: Vec<Value>, pos: Pos, kont: Kont, wind_stack: &mut Vec<WindEntry>, output: &mut String) -> Result<State, EvalError> {
+fn cek_invoke(func: Value, args: Vec<Value>, pos: Pos, kont: Kont, wind_stack: &mut Vec<WindEntry>, handler_stack: &mut Vec<HandlerEntry>, output: &mut String) -> Result<State, EvalError> {
     match &func {
         Value::Lambda { params, rest_param, body, env } => {
             let local_env = new_env(Some(env.clone()));
@@ -1222,7 +1230,7 @@ fn cek_invoke(func: Value, args: Vec<Value>, pos: Pos, kont: Kont, wind_stack: &
                     pos,
                 });
                 // Start the winding process
-                cek_apply_kont(Value::Void, &wind_kont, wind_stack, output)
+                cek_apply_kont(Value::Void, &wind_kont, wind_stack, handler_stack, output)
             }
         }
 
@@ -1238,6 +1246,63 @@ fn cek_invoke(func: Value, args: Vec<Value>, pos: Pos, kont: Kont, wind_stack: &
                     let cont_val = Value::Continuation(kont.clone(), wind_stack.clone());
                     let proc = args.into_iter().next().expect("arity checked above");
                     Ok(State::Invoke(proc, vec![cont_val], pos, kont))
+                }
+                "raise" => {
+                    if args.len() != 1 {
+                        return Err(EvalError::Arity(format!(
+                            "{pos}: raise expects 1 argument, got {}",
+                            args.len()
+                        )));
+                    }
+                    let exn = args.into_iter().next().expect("arity checked above");
+                    if handler_stack.is_empty() {
+                        return Err(EvalError::Exception(format!("{exn}")));
+                    }
+                    let handler = handler_stack.pop().expect("checked non-empty above");
+                    match handler {
+                        HandlerEntry::User(proc) => {
+                            let error_kont = Rc::new(KontFrame::EvRaiseContinuationError);
+                            Ok(State::Invoke(proc, vec![exn], pos, error_kont))
+                        }
+                        HandlerEntry::Guard { var, clauses, env, kont: guard_kont, wind_stack: guard_wind } => {
+                            let clause_kont = Rc::new(KontFrame::EvGuardClauses {
+                                var,
+                                clauses,
+                                env,
+                                next: guard_kont,
+                            });
+                            let current_ws = wind_stack.clone();
+                            let common = common_prefix_len(&current_ws, &guard_wind);
+                            let to_unwind: Vec<Value> = current_ws[common..].iter().rev().map(|e| e.out_thunk.clone()).collect();
+                            let to_rewind: Vec<Value> = guard_wind[common..].iter().map(|e| e.in_thunk.clone()).collect();
+                            if to_unwind.is_empty() && to_rewind.is_empty() {
+                                Ok(State::Apply(exn, clause_kont))
+                            } else {
+                                let wind_kont = Rc::new(KontFrame::EvWind {
+                                    unwind_outs: to_unwind,
+                                    rewind_ins: to_rewind,
+                                    target_ws: guard_wind,
+                                    val: exn,
+                                    target_kont: clause_kont,
+                                    pos,
+                                });
+                                cek_apply_kont(Value::Void, &wind_kont, wind_stack, handler_stack, output)
+                            }
+                        }
+                    }
+                }
+                "with-exception-handler" => {
+                    if args.len() != 2 {
+                        return Err(EvalError::Arity(format!(
+                            "{pos}: with-exception-handler expects 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let handler = args[0].clone();
+                    let thunk = args[1].clone();
+                    handler_stack.push(HandlerEntry::User(handler));
+                    let after_kont = Rc::new(KontFrame::EvWithExcHandler { next: kont });
+                    Ok(State::Invoke(thunk, vec![], pos, after_kont))
                 }
                 "dynamic-wind" => {
                     if args.len() != 3 {
@@ -1395,7 +1460,7 @@ pub(super) static RECORD_TYPE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub(super) const SPECIAL_FORMS: &[&str] = &[
     "define", "if", "quote", "lambda", "case-lambda", "let", "begin", "cond", "and", "or",
     "set!", "string-set!", "not", "define-syntax", "syntax-rules",
-    "letrec", "letrec*", "case", "do", "let*", "when", "unless",
+    "letrec", "letrec*", "case", "do", "let*", "when", "unless", "guard",
 ];
 
 #[derive(Clone)]

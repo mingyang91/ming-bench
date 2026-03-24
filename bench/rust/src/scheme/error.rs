@@ -11,4 +11,6 @@ pub enum EvalError {
     UnboundVariable(String),
     #[error("division by zero: {0}")]
     DivisionByZero(String),
+    #[error("unhandled exception: {0}")]
+    Exception(String),
 }
