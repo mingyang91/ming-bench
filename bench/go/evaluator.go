@@ -57,6 +57,17 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 		// check for special forms
 		if sym, ok := e.Elems[0].(*SymbolExpr); ok {
 			switch sym.Name {
+			case "define":
+				return evalDefine(e, env)
+			case "if":
+				return evalIf(e, env)
+			case "lambda":
+				return evalLambda(e, env)
+			case "quote":
+				if len(e.Elems) != 2 {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quote requires 1 argument", sym.Line, sym.Col)}
+				}
+				return quoteExpr(e.Elems[1])
 			case "and":
 				return evalAnd(e.Elems[1:], env)
 			case "or":
@@ -85,14 +96,135 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 				return nil, err
 			}
 		}
-		bf, ok := fn.(*BuiltinFunc)
-		if !ok {
+		switch f := fn.(type) {
+		case *BuiltinFunc:
+			return f.Fn(args)
+		case *LambdaVal:
+			if len(args) != len(f.Params) {
+				line, col := e.Elems[0].pos()
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected %d, got %d", line, col, len(f.Params), len(args))}
+			}
+			callEnv := newEnv(f.Env)
+			for i, p := range f.Params {
+				callEnv.set(p, args[i])
+			}
+			var result Value
+			for _, bodyExpr := range f.Body {
+				var err2 error
+				result, err2 = evalExpr(bodyExpr, callEnv)
+				if err2 != nil {
+					return nil, err2
+				}
+			}
+			return result, nil
+		default:
 			line, col := e.Elems[0].pos()
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", line, col)}
 		}
-		return bf.Fn(args)
 	}
 	return nil, &EvalError{Message: "unknown expression type"}
+}
+
+func evalDefine(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Elems) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define requires at least 2 arguments", e.Line, e.Col)}
+	}
+	switch target := e.Elems[1].(type) {
+	case *SymbolExpr:
+		// (define x expr)
+		val, err := evalExpr(e.Elems[2], env)
+		if err != nil {
+			return nil, err
+		}
+		env.set(target.Name, val)
+		return &VoidVal{}, nil
+	case *ListExpr:
+		// (define (f params...) body...)
+		if len(target.Elems) == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: empty name list", e.Line, e.Col)}
+		}
+		nameSym, ok := target.Elems[0].(*SymbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol", e.Line, e.Col)}
+		}
+		params := make([]string, len(target.Elems)-1)
+		for i, p := range target.Elems[1:] {
+			ps, ok := p.(*SymbolExpr)
+			if !ok {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol in parameter list", e.Line, e.Col)}
+			}
+			params[i] = ps.Name
+		}
+		lambda := &LambdaVal{Params: params, Body: e.Elems[2:], Env: env}
+		env.set(nameSym.Name, lambda)
+		return &VoidVal{}, nil
+	default:
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol or list", e.Line, e.Col)}
+	}
+}
+
+func evalIf(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Elems) < 3 || len(e.Elems) > 4 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: if requires 2 or 3 arguments", e.Line, e.Col)}
+	}
+	cond, err := evalExpr(e.Elems[1], env)
+	if err != nil {
+		return nil, err
+	}
+	if isTruthy(cond) {
+		return evalExpr(e.Elems[2], env)
+	}
+	if len(e.Elems) == 4 {
+		return evalExpr(e.Elems[3], env)
+	}
+	return &VoidVal{}, nil
+}
+
+func evalLambda(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Elems) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda requires params and body", e.Line, e.Col)}
+	}
+	paramList, ok := e.Elems[1].(*ListExpr)
+	if !ok {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected parameter list", e.Line, e.Col)}
+	}
+	params := make([]string, len(paramList.Elems))
+	for i, p := range paramList.Elems {
+		ps, ok := p.(*SymbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected symbol in parameter list", e.Line, e.Col)}
+		}
+		params[i] = ps.Name
+	}
+	return &LambdaVal{Params: params, Body: e.Elems[2:], Env: env}, nil
+}
+
+func quoteExpr(expr Expr) (Value, error) {
+	switch e := expr.(type) {
+	case *NumberExpr:
+		return &IntVal{Val: e.Val}, nil
+	case *StringExpr:
+		return &StringVal{Val: e.Val}, nil
+	case *BoolExpr:
+		return &BoolVal{Val: e.Val}, nil
+	case *SymbolExpr:
+		return &SymbolVal{Val: e.Name}, nil
+	case *ListExpr:
+		if len(e.Elems) == 0 {
+			return &NilVal{}, nil
+		}
+		// Build a proper list from the elements
+		var result Value = &NilVal{}
+		for i := len(e.Elems) - 1; i >= 0; i-- {
+			car, err := quoteExpr(e.Elems[i])
+			if err != nil {
+				return nil, err
+			}
+			result = &PairVal{Car: car, Cdr: result}
+		}
+		return result, nil
+	}
+	return nil, &EvalError{Message: "quote: unsupported expression type"}
 }
 
 func evalAnd(exprs []Expr, env *Env) (Value, error) {
