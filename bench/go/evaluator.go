@@ -30,7 +30,17 @@ const (
 	valRecord
 	valCaseLambda
 	valVector
+	valTailCall
 )
+
+type tailCall struct {
+	expr *expr
+	env  *env
+}
+
+func tailCallVal(e *expr, environ *env) value {
+	return value{kind: valTailCall, tc: &tailCall{expr: e, env: environ}}
+}
 
 type pair struct {
 	car value
@@ -79,8 +89,9 @@ type value struct {
 	macro  *macro
 	mstr   *[]rune // mutable string buffer (set by string-copy)
 	rec     *record
-	clauses []*lambda // case-lambda clauses
-	vec     *[]value  // vector storage (mutable)
+	clauses []*lambda   // case-lambda clauses
+	vec     *[]value   // vector storage (mutable)
+	tc      *tailCall  // tail call info (for valTailCall)
 }
 
 var voidVal = value{kind: valVoid}
@@ -614,7 +625,15 @@ func parseAtom(text string) value {
 
 // ---------- Evaluator ----------
 
-func evalInEnv(e *expr, env *env) (value, error) {
+func evalInEnv(e *expr, environ *env) (value, error) {
+	v, err := evalCore(e, environ)
+	for err == nil && v.kind == valTailCall {
+		v, err = evalCore(v.tc.expr, v.tc.env)
+	}
+	return v, err
+}
+
+func evalCore(e *expr, env *env) (value, error) {
 	if e.kind == exprAtom {
 		if e.atom.kind == valSymbol {
 			if v, ok := env.get(e.atom.sval); ok {
@@ -680,7 +699,7 @@ func evalInEnv(e *expr, env *env) (value, error) {
 			if err != nil {
 				return value{}, err
 			}
-			return evalInEnv(expanded, env)
+			return tailCallVal(expanded, env), nil
 		}
 	}
 
@@ -701,15 +720,23 @@ func evalInEnv(e *expr, env *env) (value, error) {
 		evaledArgs[i] = v
 	}
 
-	return callValue(op, evaledArgs, e, env)
+	return callValueTail(op, evaledArgs, e, env)
 }
 
 func callValue(op value, args []value, callExpr *expr, environ *env) (value, error) {
+	v, err := callValueTail(op, args, callExpr, environ)
+	for err == nil && v.kind == valTailCall {
+		v, err = evalCore(v.tc.expr, v.tc.env)
+	}
+	return v, err
+}
+
+func callValueTail(op value, args []value, callExpr *expr, environ *env) (value, error) {
 	switch op.kind {
 	case valLambda:
-		return callLambda(op.lambda, args, callExpr)
+		return callLambdaTail(op.lambda, args, callExpr)
 	case valCaseLambda:
-		return callCaseLambda(op.clauses, args, callExpr)
+		return callCaseLambdaTail(op.clauses, args, callExpr)
 	case valBuiltin:
 		if op.sval == "__native" {
 			nativeFuncsMu.Lock()
@@ -718,7 +745,7 @@ func callValue(op value, args []value, callExpr *expr, environ *env) (value, err
 			return fn(args)
 		}
 		if op.sval == "apply" {
-			return evalApply(args, callExpr, environ)
+			return evalApplyTail(args, callExpr, environ)
 		}
 		return evalBuiltin(op.sval, args, callExpr, environ)
 	default:
@@ -727,18 +754,23 @@ func callValue(op value, args []value, callExpr *expr, environ *env) (value, err
 }
 
 func evalApply(args []value, e *expr, environ *env) (value, error) {
+	v, err := evalApplyTail(args, e, environ)
+	for err == nil && v.kind == valTailCall {
+		v, err = evalCore(v.tc.expr, v.tc.env)
+	}
+	return v, err
+}
+
+func evalApplyTail(args []value, e *expr, environ *env) (value, error) {
 	if len(args) < 2 {
 		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: apply: expected at least 2 arguments", e.line, e.col)}
 	}
 	fn := args[0]
-	// Last argument must be a list; prefix args come before it
 	lastArg := args[len(args)-1]
-	// Collect prefix args
 	var allArgs []value
 	for _, a := range args[1 : len(args)-1] {
 		allArgs = append(allArgs, a)
 	}
-	// Flatten the last argument (must be a list)
 	cur := lastArg
 	for cur.kind == valPair {
 		allArgs = append(allArgs, cur.pair.car)
@@ -747,7 +779,7 @@ func evalApply(args []value, e *expr, environ *env) (value, error) {
 	if cur.kind != valNull {
 		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: apply: last argument must be a proper list", e.line, e.col)}
 	}
-	return callValue(fn, allArgs, e, environ)
+	return callValueTail(fn, allArgs, e, environ)
 }
 
 func evalDefine(e *expr, env *env) (value, error) {
@@ -814,10 +846,10 @@ func evalIf(e *expr, env *env) (value, error) {
 		return value{}, err
 	}
 	if isTruthy(cond) {
-		return evalInEnv(e.list[2], env)
+		return tailCallVal(e.list[2], env), nil
 	}
 	if len(e.list) == 4 {
-		return evalInEnv(e.list[3], env)
+		return tailCallVal(e.list[3], env), nil
 	}
 	return voidVal, nil
 }
@@ -864,14 +896,22 @@ func evalCaseLambda(e *expr, env *env) (value, error) {
 }
 
 func callCaseLambda(clauses []*lambda, args []value, callExpr *expr) (value, error) {
+	v, err := callCaseLambdaTail(clauses, args, callExpr)
+	for err == nil && v.kind == valTailCall {
+		v, err = evalCore(v.tc.expr, v.tc.env)
+	}
+	return v, err
+}
+
+func callCaseLambdaTail(clauses []*lambda, args []value, callExpr *expr) (value, error) {
 	for _, lam := range clauses {
 		if lam.restParam != "" {
 			if len(args) >= len(lam.params) {
-				return callLambda(lam, args, callExpr)
+				return callLambdaTail(lam, args, callExpr)
 			}
 		} else {
 			if len(args) == len(lam.params) {
-				return callLambda(lam, args, callExpr)
+				return callLambdaTail(lam, args, callExpr)
 			}
 		}
 	}
@@ -904,6 +944,14 @@ func parseDottedParams(plist []*expr, e *expr) ([]string, string, error) {
 }
 
 func callLambda(lam *lambda, args []value, callExpr *expr) (value, error) {
+	v, err := callLambdaTail(lam, args, callExpr)
+	for err == nil && v.kind == valTailCall {
+		v, err = evalCore(v.tc.expr, v.tc.env)
+	}
+	return v, err
+}
+
+func callLambdaTail(lam *lambda, args []value, callExpr *expr) (value, error) {
 	if lam.restParam != "" {
 		if len(args) < len(lam.params) {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: expected at least %d arguments, got %d", callExpr.line, callExpr.col, len(lam.params), len(args))}
@@ -918,22 +966,21 @@ func callLambda(lam *lambda, args []value, callExpr *expr) (value, error) {
 		callEnv.set(p, args[i])
 	}
 	if lam.restParam != "" {
-		// Collect remaining args into a list
 		rest := nullVal
 		for i := len(args) - 1; i >= len(lam.params); i-- {
 			rest = pairVal(args[i], rest)
 		}
 		callEnv.set(lam.restParam, rest)
 	}
-	var result value
-	var err error
-	for _, bodyExpr := range lam.body {
-		result, err = evalInEnv(bodyExpr, callEnv)
+	// Evaluate all body expressions except the last
+	for _, bodyExpr := range lam.body[:len(lam.body)-1] {
+		_, err := evalInEnv(bodyExpr, callEnv)
 		if err != nil {
 			return value{}, err
 		}
 	}
-	return result, nil
+	// Return tail call for the last body expression
+	return tailCallVal(lam.body[len(lam.body)-1], callEnv), nil
 }
 
 func quoteExpr(e *expr) value {
@@ -2028,18 +2075,18 @@ func evalAnd(e *expr, env *env) (value, error) {
 	if len(args) == 0 {
 		return boolVal(true), nil
 	}
-	var result value
-	for _, a := range args {
+	// Evaluate all but the last; short-circuit on false
+	for _, a := range args[:len(args)-1] {
 		v, err := evalInEnv(a, env)
 		if err != nil {
 			return value{}, err
 		}
-		result = v
 		if !isTruthy(v) {
 			return v, nil
 		}
 	}
-	return result, nil
+	// Tail call for the last expression
+	return tailCallVal(args[len(args)-1], env), nil
 }
 
 func evalOr(e *expr, env *env) (value, error) {
@@ -2047,7 +2094,8 @@ func evalOr(e *expr, env *env) (value, error) {
 	if len(args) == 0 {
 		return boolVal(false), nil
 	}
-	for _, a := range args {
+	// Evaluate all but last; short-circuit on truthy
+	for _, a := range args[:len(args)-1] {
 		v, err := evalInEnv(a, env)
 		if err != nil {
 			return value{}, err
@@ -2056,7 +2104,8 @@ func evalOr(e *expr, env *env) (value, error) {
 			return v, nil
 		}
 	}
-	return boolVal(false), nil
+	// Tail call for the last expression
+	return tailCallVal(args[len(args)-1], env), nil
 }
 
 func evalLet(e *expr, env *env) (value, error) {
@@ -2089,11 +2138,10 @@ func evalLet(e *expr, env *env) (value, error) {
 			}
 			initVals[i] = v
 		}
-		// Create a lambda for the loop and bind it in a new env
 		letEnv := newEnv(env)
 		lam := &lambda{params: params, body: e.list[3:], env: letEnv}
 		letEnv.set(loopName, value{kind: valLambda, lambda: lam})
-		return callLambda(lam, initVals, e)
+		return callLambdaTail(lam, initVals, e)
 	}
 
 	bindingsExpr := e.list[1]
@@ -2114,15 +2162,14 @@ func evalLet(e *expr, env *env) (value, error) {
 		}
 		letEnv.set(b.list[0].atom.sval, v)
 	}
-	var result value
-	var err error
-	for _, bodyExpr := range e.list[2:] {
-		result, err = evalInEnv(bodyExpr, letEnv)
+	body := e.list[2:]
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := evalInEnv(bodyExpr, letEnv)
 		if err != nil {
 			return value{}, err
 		}
 	}
-	return result, nil
+	return tailCallVal(body[len(body)-1], letEnv), nil
 }
 
 func evalBegin(e *expr, env *env) (value, error) {
@@ -2130,15 +2177,15 @@ func evalBegin(e *expr, env *env) (value, error) {
 	if len(args) == 0 {
 		return voidVal, nil
 	}
-	var result value
-	var err error
-	for _, a := range args {
-		result, err = evalInEnv(a, env)
+	// Evaluate all but the last
+	for _, a := range args[:len(args)-1] {
+		_, err := evalInEnv(a, env)
 		if err != nil {
 			return value{}, err
 		}
 	}
-	return result, nil
+	// Tail call for the last expression
+	return tailCallVal(args[len(args)-1], env), nil
 }
 
 func evalCond(e *expr, env *env) (value, error) {
@@ -2149,29 +2196,28 @@ func evalCond(e *expr, env *env) (value, error) {
 		}
 		// else clause
 		if clause.list[0].kind == exprAtom && clause.list[0].atom.kind == valSymbol && clause.list[0].atom.sval == "else" {
-			var result value
-			var err error
-			for _, bodyExpr := range clause.list[1:] {
-				result, err = evalInEnv(bodyExpr, env)
+			body := clause.list[1:]
+			for _, bodyExpr := range body[:len(body)-1] {
+				_, err := evalInEnv(bodyExpr, env)
 				if err != nil {
 					return value{}, err
 				}
 			}
-			return result, nil
+			return tailCallVal(body[len(body)-1], env), nil
 		}
 		cond, err := evalInEnv(clause.list[0], env)
 		if err != nil {
 			return value{}, err
 		}
 		if isTruthy(cond) {
-			var result value
-			for _, bodyExpr := range clause.list[1:] {
-				result, err = evalInEnv(bodyExpr, env)
+			body := clause.list[1:]
+			for _, bodyExpr := range body[:len(body)-1] {
+				_, err = evalInEnv(bodyExpr, env)
 				if err != nil {
 					return value{}, err
 				}
 			}
-			return result, nil
+			return tailCallVal(body[len(body)-1], env), nil
 		}
 	}
 	return voidVal, nil
@@ -2186,7 +2232,6 @@ func evalLetrec(e *expr, env *env) (value, error) {
 		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: expected bindings list", e.line, e.col)}
 	}
 	letEnv := newEnv(env)
-	// First, bind all variables to undefined (void)
 	names := make([]string, len(bindingsExpr.list))
 	for i, b := range bindingsExpr.list {
 		if b.kind != exprList || len(b.list) != 2 {
@@ -2198,7 +2243,6 @@ func evalLetrec(e *expr, env *env) (value, error) {
 		names[i] = b.list[0].atom.sval
 		letEnv.set(names[i], voidVal)
 	}
-	// Then evaluate all init expressions in the new env
 	for i, b := range bindingsExpr.list {
 		v, err := evalInEnv(b.list[1], letEnv)
 		if err != nil {
@@ -2206,15 +2250,14 @@ func evalLetrec(e *expr, env *env) (value, error) {
 		}
 		letEnv.set(names[i], v)
 	}
-	var result value
-	var err error
-	for _, bodyExpr := range e.list[2:] {
-		result, err = evalInEnv(bodyExpr, letEnv)
+	body := e.list[2:]
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := evalInEnv(bodyExpr, letEnv)
 		if err != nil {
 			return value{}, err
 		}
 	}
-	return result, nil
+	return tailCallVal(body[len(body)-1], letEnv), nil
 }
 
 func evalLetrecStar(e *expr, env *env) (value, error) {
@@ -2226,7 +2269,6 @@ func evalLetrecStar(e *expr, env *env) (value, error) {
 		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: letrec*: expected bindings list", e.line, e.col)}
 	}
 	letEnv := newEnv(env)
-	// Bind all to void first
 	for _, b := range bindingsExpr.list {
 		if b.kind != exprList || len(b.list) != 2 {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: letrec*: bad binding", b.line, b.col)}
@@ -2236,7 +2278,6 @@ func evalLetrecStar(e *expr, env *env) (value, error) {
 		}
 		letEnv.set(b.list[0].atom.sval, voidVal)
 	}
-	// Evaluate sequentially, each visible to the next
 	for _, b := range bindingsExpr.list {
 		v, err := evalInEnv(b.list[1], letEnv)
 		if err != nil {
@@ -2244,15 +2285,14 @@ func evalLetrecStar(e *expr, env *env) (value, error) {
 		}
 		letEnv.set(b.list[0].atom.sval, v)
 	}
-	var result value
-	var err error
-	for _, bodyExpr := range e.list[2:] {
-		result, err = evalInEnv(bodyExpr, letEnv)
+	body := e.list[2:]
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := evalInEnv(bodyExpr, letEnv)
 		if err != nil {
 			return value{}, err
 		}
 	}
-	return result, nil
+	return tailCallVal(body[len(body)-1], letEnv), nil
 }
 
 func evalCase(e *expr, env *env) (value, error) {
@@ -2270,14 +2310,14 @@ func evalCase(e *expr, env *env) (value, error) {
 		}
 		// else clause
 		if clause.list[0].kind == exprAtom && clause.list[0].atom.kind == valSymbol && clause.list[0].atom.sval == "else" {
-			var result value
-			for _, bodyExpr := range clause.list[1:] {
-				result, err = evalInEnv(bodyExpr, env)
+			body := clause.list[1:]
+			for _, bodyExpr := range body[:len(body)-1] {
+				_, err = evalInEnv(bodyExpr, env)
 				if err != nil {
 					return value{}, err
 				}
 			}
-			return result, nil
+			return tailCallVal(body[len(body)-1], env), nil
 		}
 		// ((datum ...) body ...)
 		datumList := clause.list[0]
@@ -2293,14 +2333,14 @@ func evalCase(e *expr, env *env) (value, error) {
 			}
 		}
 		if matched {
-			var result value
-			for _, bodyExpr := range clause.list[1:] {
-				result, err = evalInEnv(bodyExpr, env)
+			body := clause.list[1:]
+			for _, bodyExpr := range body[:len(body)-1] {
+				_, err = evalInEnv(bodyExpr, env)
 				if err != nil {
 					return value{}, err
 				}
 			}
-			return result, nil
+			return tailCallVal(body[len(body)-1], env), nil
 		}
 	}
 	return voidVal, nil
