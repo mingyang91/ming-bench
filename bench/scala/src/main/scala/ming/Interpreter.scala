@@ -25,6 +25,7 @@ object Interpreter:
 
   private def runProgram(input: String): Val =
     Evaluator.windingStack = List.empty
+    Evaluator.raiseHandlers = List.empty
     val parser = new Parser(input)
     val exprs  = parser.parseAllWithPositions()
     if exprs.isEmpty then throw new EvalError("no expressions")

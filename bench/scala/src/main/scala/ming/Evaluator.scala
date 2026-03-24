@@ -16,6 +16,9 @@ object Evaluator:
   /** Thrown when a continuation is invoked from non-CPS code (inside a Builtin). */
   class ContinuationJump(val bounce: Bounce) extends Throwable(null, null, true, false)
 
+  /** Thrown by `raise` to signal a Scheme exception. */
+  class SchemeRaise(val value: Val) extends Throwable(null, null, true, false)
+
   object Val:
     case class Num(n: Long)                            extends Val
     case class Bool(b: Boolean)                        extends Val
@@ -85,6 +88,9 @@ object Evaluator:
   // --- dynamic-wind winding stack ---
   private[ming] var windingStack: List[(Val, Val)] = List.empty
 
+  // --- exception handler stack ---
+  private[ming] var raiseHandlers: List[Val => Bounce] = List.empty
+
   // --- Position tracking ---
   private[ming] var lastPos = "1:1"
 
@@ -125,7 +131,14 @@ object Evaluator:
         case BDone(v) => return v
         case BMore(thunk) =>
           try b = thunk()
-          catch case jump: ContinuationJump => b = jump.bounce
+          catch
+            case jump: ContinuationJump => b = jump.bounce
+            case raise: SchemeRaise =>
+              if raiseHandlers.nonEmpty then
+                val handler = raiseHandlers.head
+                raiseHandlers = raiseHandlers.tail
+                b = handler(raise.value)
+              else throw new EvalError(s"unhandled exception: ${Display.write(raise.value)}")
     throw new RuntimeException("unreachable")
 
   // ======== CPS Evaluator core ========
@@ -164,38 +177,11 @@ object Evaluator:
       case Pair(Symbol("case"), rest)               => SpecialForms.evalCaseK(rest, env, k)
       case Pair(Symbol("do"), rest)                 => BindingForms.evalDoK(rest, env, k)
       case Pair(Symbol("dynamic-wind"), Pair(inExpr, Pair(bodyExpr, Pair(outExpr, Nil)))) =>
-        evalK(
-          inExpr,
-          env,
-          inThunk =>
-            evalK(
-              bodyExpr,
-              env,
-              bodyThunk =>
-                evalK(
-                  outExpr,
-                  env,
-                  outThunk =>
-                    applyK(
-                      inThunk,
-                      List.empty,
-                      _ =>
-                        BMore { () =>
-                          windingStack = (inThunk, outThunk) :: windingStack
-                          applyK(
-                            bodyThunk,
-                            List.empty,
-                            bodyVal =>
-                              BMore { () =>
-                                windingStack = windingStack.tail
-                                applyK(outThunk, List.empty, _ => k(bodyVal))
-                              }
-                          )
-                        }
-                    )
-                )
-            )
-        )
+        WindGuard.evalDynamicWindK(inExpr, bodyExpr, outExpr, env, k)
+      case Pair(Symbol("guard"), Pair(Pair(Symbol(varName), clauses), body)) =>
+        WindGuard.evalGuardK(varName, clauses, body, env, k)
+      case Pair(Symbol("with-exception-handler"), Pair(handlerExpr, Pair(thunkExpr, Nil))) =>
+        WindGuard.evalWithExceptionHandlerK(handlerExpr, thunkExpr, env, k)
       case Pair(Symbol("define-syntax"), Pair(Symbol(name), Pair(sr, Nil))) =>
         k(Macros.evalDefineSyntax(name, sr, env))
       case Pair(Symbol(name), pArgs) =>
@@ -228,23 +214,6 @@ object Evaluator:
       case last :: scala.Nil => evalK(last, env, k)
       case head :: tail      => evalK(head, env, _ => BMore(() => evalSeqK(tail, env, k)))
 
-  // ======== dynamic-wind helpers ========
-
-  /** Find the length of the common tail of two winding stacks (by reference identity). */
-  private def commonWindTailLength(a: List[(Val, Val)], b: List[(Val, Val)]): Int =
-    var aa = a; var bb = b
-    if aa.length > bb.length then for _ <- 0 until (aa.length - bb.length) do aa = aa.tail
-    else for _ <- 0 until (bb.length - aa.length) do bb = bb.tail
-    while aa ne bb do
-      aa = aa.tail; bb = bb.tail
-    aa.length
-
-  /** Run a sequence of thunks (zero-arg procedures) in order, then continue with `then`. */
-  private def runThunks(thunks: List[Val], andThen: => Bounce): Bounce =
-    thunks match
-      case scala.Nil     => andThen
-      case thunk :: rest => applyK(thunk, List.empty, _ => BMore(() => runThunks(rest, andThen)))
-
   // ======== Function application (CPS) ========
 
   private[ming] def applyBuiltinChecked(f: List[Val] => Val, args: List[Val]): Val =
@@ -264,13 +233,13 @@ object Evaluator:
         args match
           case List(v) =>
             val currentWinds = windingStack
-            val commonLen    = commonWindTailLength(currentWinds, savedWinds)
-            val toUnwind     = currentWinds.take(currentWinds.length - commonLen).map(_._2)     // out-thunks
-            val toRewind     = savedWinds.take(savedWinds.length - commonLen).reverse.map(_._1) // in-thunks
-            runThunks(
+            val commonLen    = WindGuard.commonWindTailLength(currentWinds, savedWinds)
+            val toUnwind     = currentWinds.take(currentWinds.length - commonLen).map(_._2)
+            val toRewind     = savedWinds.take(savedWinds.length - commonLen).reverse.map(_._1)
+            WindGuard.runThunks(
               toUnwind,
               BMore { () =>
-                runThunks(
+                WindGuard.runThunks(
                   toRewind,
                   BMore { () =>
                     windingStack = savedWinds

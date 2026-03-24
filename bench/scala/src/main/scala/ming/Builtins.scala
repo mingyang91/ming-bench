@@ -241,5 +241,9 @@ object Builtins:
           case _ => throw new EvalError("assv: not a proper list")
         search(lst)
       case _ => throw new EvalError("assv requires 2 arguments")
+    },
+    "raise" -> Builtin {
+      case List(v) => throw new Evaluator.SchemeRaise(v)
+      case _       => throw new EvalError("raise requires 1 argument")
     }
   )
