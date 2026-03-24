@@ -61,6 +61,13 @@ class Env(
   def define(name: String, value: SchemeVal): Unit =
     bindings(name) = value
 
+  def set(name: String, value: SchemeVal): Unit =
+    if bindings.contains(name) then bindings(name) = value
+    else
+      parent match
+        case Some(p) => p.set(name, value)
+        case None    => throw new EvalError(s"set!: unbound variable: $name")
+
 object Evaluator:
 
   val outputBuffer: ThreadLocal[StringBuilder] = ThreadLocal.withInitial(() => new StringBuilder)
@@ -117,6 +124,11 @@ object Evaluator:
               Expr.Symbol("define") :: Expr.Symbol(name) :: value :: Nil
             ) =>
           env.define(name, eval(value, env))
+          SchemeVal.Void
+        case Expr.SList(
+              Expr.Symbol("set!") :: Expr.Symbol(name) :: value :: Nil
+            ) =>
+          env.set(name, eval(value, env))
           SchemeVal.Void
         case Expr.SList(Expr.Symbol("lambda") :: Expr.SList(params) :: body) =>
           val paramNames = params.map {
