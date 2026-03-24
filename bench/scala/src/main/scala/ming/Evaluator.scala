@@ -34,12 +34,14 @@ object Evaluator:
     case _                        => true
 
   private def quoteToVal(expr: Expr): SchemeVal = expr match
-    case Expr.IntLit(n)  => SchemeVal.IntVal(n)
-    case Expr.BoolLit(b) => SchemeVal.BoolVal(b)
-    case Expr.StrLit(s)  => SchemeVal.StrVal(s.toCharArray)
-    case Expr.CharLit(c) => SchemeVal.CharVal(c)
-    case Expr.Symbol(n)  => SchemeVal.SymVal(n)
-    case Expr.SList(es)  => SchemeVal.ListVal(es.map(quoteToVal))
+    case Expr.IntLit(n)    => SchemeVal.IntVal(n)
+    case Expr.FloatLit(d)  => SchemeVal.FloatVal(d)
+    case Expr.RatLit(n, d) => SchemeNum.makeRational(n, d)
+    case Expr.BoolLit(b)   => SchemeVal.BoolVal(b)
+    case Expr.StrLit(s)    => SchemeVal.StrVal(s.toCharArray)
+    case Expr.CharLit(c)   => SchemeVal.CharVal(c)
+    case Expr.Symbol(n)    => SchemeVal.SymVal(n)
+    case Expr.SList(es)    => SchemeVal.ListVal(es.map(quoteToVal))
 
   private def evalBody(body: List[Expr], env: Env): SchemeVal =
     body.foldLeft[SchemeVal](SchemeVal.Void)((_, e) => eval(e, env))
@@ -54,6 +56,8 @@ object Evaluator:
     try
       expr match
         case Expr.IntLit(n)    => SchemeVal.IntVal(n)
+        case Expr.FloatLit(d)  => SchemeVal.FloatVal(d)
+        case Expr.RatLit(n, d) => SchemeNum.makeRational(n, d)
         case Expr.BoolLit(b)   => SchemeVal.BoolVal(b)
         case Expr.StrLit(s)    => SchemeVal.StrVal(s.toCharArray)
         case Expr.CharLit(c)   => SchemeVal.CharVal(c)

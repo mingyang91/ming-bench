@@ -4,6 +4,8 @@ import scala.collection.mutable
 
 enum Expr:
   case IntLit(value: Long)
+  case FloatLit(value: Double)
+  case RatLit(num: Long, den: Long)
   case BoolLit(value: Boolean)
   case StrLit(value: String)
   case Symbol(name: String)
@@ -12,6 +14,8 @@ enum Expr:
 
 enum SchemeVal:
   case IntVal(value: Long)
+  case FloatVal(value: Double)
+  case RatVal(num: Long, den: Long)
   case BoolVal(value: Boolean)
   case StrVal(value: Array[Char])
   case SymVal(name: String)
@@ -24,7 +28,11 @@ enum SchemeVal:
   case Void
 
   def display: String = this match
-    case IntVal(n)             => n.toString
+    case IntVal(n) => n.toString
+    case FloatVal(d) =>
+      if d == d.toLong.toDouble && !d.isInfinite then s"${d.toLong}.0"
+      else d.toString
+    case RatVal(n, d)          => s"$n/$d"
     case BoolVal(b)            => if b then "#t" else "#f"
     case StrVal(s)             => "\"" + new String(s) + "\""
     case SymVal(n)             => n
@@ -44,6 +52,10 @@ enum SchemeVal:
     case ListVal(elems) => "(" + elems.map(_.displayStr).mkString(" ") + ")"
     case PairVal(_, _)  => formatPair(_.displayStr)
     case other          => other.display
+
+  def isNumber: Boolean = this match
+    case IntVal(_) | FloatVal(_) | RatVal(_, _) => true
+    case _                                      => false
 
   /** write format: strings with quotes */
   def writeStr: String = this match

@@ -4,8 +4,10 @@ object NumericBuiltins:
 
   private def requireNums(name: String, args: List[SchemeVal]): List[Long] =
     args.map {
-      case SchemeVal.IntVal(n) => n
-      case other               => throw new EvalError(s"$name: expected number, got ${other.display}")
+      case SchemeVal.IntVal(n)    => n
+      case SchemeVal.FloatVal(d)  => d.toLong
+      case SchemeVal.RatVal(n, d) => n / d
+      case other                  => throw new EvalError(s"$name: expected number, got ${other.display}")
     }
 
   private def typePredicate(
@@ -25,9 +27,11 @@ object NumericBuiltins:
     "abs" -> SchemeVal.BuiltinProc(
       "abs",
       {
-        case List(SchemeVal.IntVal(n)) => SchemeVal.IntVal(math.abs(n))
-        case List(other)               => throw new EvalError(s"abs: expected number, got ${other.display}")
-        case args                      => throw new EvalError(s"abs: expected 1 argument, got ${args.length}")
+        case List(SchemeVal.IntVal(n))    => SchemeVal.IntVal(math.abs(n))
+        case List(SchemeVal.FloatVal(d))  => SchemeVal.FloatVal(math.abs(d))
+        case List(SchemeVal.RatVal(n, d)) => SchemeNum.makeRational(math.abs(n), d)
+        case List(other)                  => throw new EvalError(s"abs: expected number, got ${other.display}")
+        case args                         => throw new EvalError(s"abs: expected 1 argument, got ${args.length}")
       }
     ),
     "modulo" -> SchemeVal.BuiltinProc(
@@ -75,15 +79,16 @@ object NumericBuiltins:
         case _ => throw new EvalError("expt: expected 2 numbers")
       }
     ),
-    typePredicate("zero?", { case SchemeVal.IntVal(n) => n == 0; case _ => false }),
-    typePredicate("positive?", { case SchemeVal.IntVal(n) => n > 0; case _ => false }),
-    typePredicate("negative?", { case SchemeVal.IntVal(n) => n < 0; case _ => false }),
+    typePredicate("zero?", { case v if v.isNumber => SchemeNum.toDouble(v) == 0.0; case _ => false }),
+    typePredicate("positive?", { case v if v.isNumber => SchemeNum.toDouble(v) > 0.0; case _ => false }),
+    typePredicate("negative?", { case v if v.isNumber => SchemeNum.toDouble(v) < 0.0; case _ => false }),
     typePredicate("odd?", { case SchemeVal.IntVal(n) => n % 2 != 0; case _ => false }),
     typePredicate("even?", { case SchemeVal.IntVal(n) => n % 2 == 0; case _ => false })
   )
 
   private def schemeEqual(a: SchemeVal, b: SchemeVal): Boolean = (a, b) match
     case (SchemeVal.IntVal(x), SchemeVal.IntVal(y))   => x == y
+    case (x, y) if x.isNumber && y.isNumber           => SchemeNum.numEq(x, y)
     case (SchemeVal.BoolVal(x), SchemeVal.BoolVal(y)) => x == y
     case (SchemeVal.StrVal(x), SchemeVal.StrVal(y))   => java.util.Arrays.equals(x, y)
     case (SchemeVal.SymVal(x), SchemeVal.SymVal(y))   => x == y
@@ -94,6 +99,70 @@ object NumericBuiltins:
       schemeEqual(a1, a2) && schemeEqual(d1, d2)
     case (SchemeVal.Void, SchemeVal.Void) => true
     case _                                => false
+
+  def exactnessBuiltins: List[(String, SchemeVal)] = List(
+    typePredicate(
+      "exact?",
+      v =>
+        SchemeNum.requireNum("exact?", v); SchemeNum.isExact(v)
+    ),
+    typePredicate(
+      "inexact?",
+      v =>
+        SchemeNum.requireNum("inexact?", v); !SchemeNum.isExact(v)
+    ),
+    "exact->inexact" -> SchemeVal.BuiltinProc(
+      "exact->inexact",
+      {
+        case List(v) =>
+          SchemeNum.requireNum("exact->inexact", v)
+          SchemeVal.FloatVal(SchemeNum.toDouble(v))
+        case args =>
+          throw new EvalError(s"exact->inexact: expected 1 argument, got ${args.length}")
+      }
+    ),
+    "inexact->exact" -> SchemeVal.BuiltinProc(
+      "inexact->exact",
+      {
+        case List(SchemeVal.FloatVal(d)) =>
+          if d == d.toLong.toDouble && !d.isInfinite then SchemeVal.IntVal(d.toLong)
+          else
+            val bits     = java.lang.Double.doubleToLongBits(d)
+            val mantissa = (bits & 0xfffffffffffffL) | 0x10000000000000L
+            val exponent = ((bits >> 52) & 0x7ff).toInt - 1023 - 52
+            val sign     = if (bits >> 63) != 0 then -1L else 1L
+            if exponent >= 0 then SchemeVal.IntVal(sign * mantissa * (1L << exponent))
+            else SchemeNum.makeRational(sign * mantissa, 1L << (-exponent))
+        case List(v @ (SchemeVal.IntVal(_) | SchemeVal.RatVal(_, _))) => v
+        case List(other) =>
+          throw new EvalError(s"inexact->exact: expected number, got ${other.display}")
+        case args =>
+          throw new EvalError(s"inexact->exact: expected 1 argument, got ${args.length}")
+      }
+    ),
+    "numerator" -> SchemeVal.BuiltinProc(
+      "numerator",
+      {
+        case List(SchemeVal.IntVal(n))    => SchemeVal.IntVal(n)
+        case List(SchemeVal.RatVal(n, _)) => SchemeVal.IntVal(n)
+        case List(other) =>
+          throw new EvalError(s"numerator: expected rational, got ${other.display}")
+        case args =>
+          throw new EvalError(s"numerator: expected 1 argument, got ${args.length}")
+      }
+    ),
+    "denominator" -> SchemeVal.BuiltinProc(
+      "denominator",
+      {
+        case List(SchemeVal.IntVal(_))    => SchemeVal.IntVal(1)
+        case List(SchemeVal.RatVal(_, d)) => SchemeVal.IntVal(d)
+        case List(other) =>
+          throw new EvalError(s"denominator: expected rational, got ${other.display}")
+        case args =>
+          throw new EvalError(s"denominator: expected 1 argument, got ${args.length}")
+      }
+    )
+  )
 
   def listBuiltins: List[(String, SchemeVal)] = List(
     "list-ref" -> SchemeVal.BuiltinProc(

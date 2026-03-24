@@ -127,6 +127,22 @@ object Parser:
         positions.put(expr, (tok.line, tok.col))
         (expr, pos + 1)
 
+  private def parseRationalOrSymbol(tok: String): Expr =
+    val parts = tok.split('/')
+    if parts.length == 2 then
+      (parts(0).toLongOption, parts(1).toLongOption) match
+        case (Some(n), Some(d)) if d != 0 => Expr.RatLit(n, d)
+        case _                            => Expr.Symbol(tok)
+    else Expr.Symbol(tok)
+
+  private def parseNumericOrSymbol(tok: String): Expr =
+    tok.toLongOption match
+      case Some(n) => Expr.IntLit(n)
+      case None =>
+        tok.toDoubleOption match
+          case Some(d) => Expr.FloatLit(d)
+          case None    => Expr.Symbol(tok)
+
   private def parseAtom(tok: String): Expr =
     if tok == "#t" then Expr.BoolLit(true)
     else if tok == "#f" then Expr.BoolLit(false)
@@ -140,7 +156,5 @@ object Parser:
         case _                  => throw new EvalError(s"unknown character name: $charName")
       Expr.CharLit(c)
     else if tok.startsWith("\"") && tok.endsWith("\"") then Expr.StrLit(tok.substring(1, tok.length - 1))
-    else
-      tok.toLongOption match
-        case Some(n) => Expr.IntLit(n)
-        case None    => Expr.Symbol(tok)
+    else if tok.contains('/') && !tok.startsWith("/") then parseRationalOrSymbol(tok)
+    else parseNumericOrSymbol(tok)

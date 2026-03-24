@@ -4,11 +4,8 @@ import scala.collection.mutable
 
 object Builtins:
 
-  private def requireNums(name: String, args: List[SchemeVal]): List[Long] =
-    args.map {
-      case SchemeVal.IntVal(n) => n
-      case other               => throw new EvalError(s"$name: expected number, got ${other.display}")
-    }
+  private def requireNumVals(name: String, args: List[SchemeVal]): List[SchemeVal] =
+    args.map(v => SchemeNum.requireNum(name, v))
 
   private def isTruthy(v: SchemeVal): Boolean = v match
     case SchemeVal.BoolVal(false) => false
@@ -16,12 +13,12 @@ object Builtins:
 
   private def numericCmp(
     name: String,
-    op: (Long, Long) => Boolean
+    op: (SchemeVal, SchemeVal) => Boolean
   ): (String, SchemeVal) =
     name -> SchemeVal.BuiltinProc(
       name,
       args =>
-        val nums = requireNums(name, args)
+        val nums = requireNumVals(name, args)
         if nums.length < 2 then throw new EvalError(s"$name: expected at least 2 arguments")
         SchemeVal.BoolVal(nums.sliding(2).forall(w => op(w(0), w(1))))
     )
@@ -29,38 +26,42 @@ object Builtins:
   private def arithmeticBuiltins: List[(String, SchemeVal)] = List(
     "+" -> SchemeVal.BuiltinProc(
       "+",
-      args => SchemeVal.IntVal(requireNums("+", args).sum)
+      args =>
+        val nums = requireNumVals("+", args)
+        if nums.isEmpty then SchemeVal.IntVal(0)
+        else nums.reduce(SchemeNum.add)
     ),
     "-" -> SchemeVal.BuiltinProc(
       "-",
       args =>
-        val nums = requireNums("-", args)
+        val nums = requireNumVals("-", args)
         if nums.isEmpty then throw new EvalError("-: expected at least 1 argument")
-        if nums.length == 1 then SchemeVal.IntVal(-nums.head)
-        else SchemeVal.IntVal(nums.reduce(_ - _))
+        if nums.length == 1 then SchemeNum.negate(nums.head)
+        else nums.reduce(SchemeNum.sub)
     ),
     "*" -> SchemeVal.BuiltinProc(
       "*",
-      args => SchemeVal.IntVal(requireNums("*", args).product)
+      args =>
+        val nums = requireNumVals("*", args)
+        if nums.isEmpty then SchemeVal.IntVal(1)
+        else nums.reduce(SchemeNum.mul)
     ),
     "/" -> SchemeVal.BuiltinProc(
       "/",
       args =>
-        val nums = requireNums("/", args)
+        val nums = requireNumVals("/", args)
         if nums.isEmpty then throw new EvalError("/: expected at least 1 argument")
-        if nums.length == 1 then SchemeVal.IntVal(1 / nums.head)
-        else
-          nums.tail.foreach(d => if d == 0 then throw new EvalError("division by zero"))
-          SchemeVal.IntVal(nums.reduce(_ / _))
+        if nums.length == 1 then SchemeNum.div(SchemeVal.IntVal(1), nums.head)
+        else nums.reduce(SchemeNum.div)
     )
   )
 
   private def comparisonBuiltins: List[(String, SchemeVal)] = List(
-    numericCmp("<", _ < _),
-    numericCmp(">", _ > _),
-    numericCmp("=", _ == _),
-    numericCmp("<=", _ <= _),
-    numericCmp(">=", _ >= _)
+    numericCmp("<", SchemeNum.numLt),
+    numericCmp(">", SchemeNum.numGt),
+    numericCmp("=", SchemeNum.numEq),
+    numericCmp("<=", SchemeNum.numLe),
+    numericCmp(">=", SchemeNum.numGe)
   )
 
   private def logicBuiltins: List[(String, SchemeVal)] = List(
@@ -160,7 +161,22 @@ object Builtins:
 
   private def typePredicateBuiltins: List[(String, SchemeVal)] = List(
     typePredicate("boolean?", _.isInstanceOf[SchemeVal.BoolVal]),
-    typePredicate("number?", _.isInstanceOf[SchemeVal.IntVal]),
+    typePredicate("number?", _.isNumber),
+    typePredicate(
+      "integer?",
+      {
+        case SchemeVal.IntVal(_)   => true
+        case SchemeVal.FloatVal(d) => d == d.toLong.toDouble && !d.isInfinite
+        case _                     => false
+      }
+    ),
+    typePredicate(
+      "rational?",
+      {
+        case SchemeVal.IntVal(_) | SchemeVal.RatVal(_, _) => true
+        case _                                            => false
+      }
+    ),
     typePredicate(
       "pair?",
       {
@@ -230,5 +246,6 @@ object Builtins:
       ++ applyBuiltin
       ++ NumericBuiltins.numericBuiltins
       ++ NumericBuiltins.listBuiltins
+      ++ NumericBuiltins.exactnessBuiltins
     for (name, proc) <- allBuiltins do env.define(name, proc)
     env
