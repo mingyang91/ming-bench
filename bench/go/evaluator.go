@@ -26,6 +26,7 @@ const (
 	valRational
 	valRecord
 	valGoFunc
+	valVector
 )
 
 type Value struct {
@@ -273,6 +274,12 @@ func (v *Value) String() string {
 		return "#<record>"
 	case valGoFunc:
 		return "#<procedure>"
+	case valVector:
+		parts := make([]string, len(v.recordFields))
+		for i, el := range v.recordFields {
+			parts[i] = el.String()
+		}
+		return "#(" + strings.Join(parts, " ") + ")"
 	default:
 		return "<unknown>"
 	}
@@ -297,6 +304,12 @@ func (v *Value) displayStr() string {
 		return v.sval
 	case valPair:
 		return "(" + pairDisplayStr(v) + ")"
+	case valVector:
+		parts := make([]string, len(v.recordFields))
+		for i, el := range v.recordFields {
+			parts[i] = el.displayStr()
+		}
+		return "#(" + strings.Join(parts, " ") + ")"
 	default:
 		return v.String()
 	}
@@ -757,6 +770,14 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 			return evalDefineSyntax(node, e)
 		case "define-record-type":
 			return evalDefineRecordType(node, e)
+		case "letrec":
+			return evalLetrec(node, e, ip, false)
+		case "letrec*":
+			return evalLetrec(node, e, ip, true)
+		case "case":
+			return evalCase(node, e, ip)
+		case "do":
+			return evalDo(node, e, ip)
 		}
 
 		// Check if symbol resolves to a macro
@@ -1921,6 +1942,87 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		}
 		return args[0], nil
 
+	case "eqv?":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: eqv?: need 2 arguments", node.line, node.col)}
+		}
+		return boolVal(valEqv(args[0], args[1])), nil
+
+	case "vector":
+		elems := make([]*Value, len(args))
+		copy(elems, args)
+		return &Value{typ: valVector, recordFields: elems}, nil
+
+	case "make-vector":
+		if len(args) < 1 || len(args) > 2 || args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: make-vector: bad arguments", node.line, node.col)}
+		}
+		n := int(args[0].ival)
+		fill := intVal(0)
+		if len(args) == 2 {
+			fill = args[1]
+		}
+		elems := make([]*Value, n)
+		for i := range elems {
+			elems[i] = fill
+		}
+		return &Value{typ: valVector, recordFields: elems}, nil
+
+	case "vector-ref":
+		if len(args) != 2 || args[0].typ != valVector || args[1].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector-ref: bad arguments", node.line, node.col)}
+		}
+		idx := int(args[1].ival)
+		if idx < 0 || idx >= len(args[0].recordFields) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector-ref: index out of range", node.line, node.col)}
+		}
+		return args[0].recordFields[idx], nil
+
+	case "vector-set!":
+		if len(args) != 3 || args[0].typ != valVector || args[1].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector-set!: bad arguments", node.line, node.col)}
+		}
+		idx := int(args[1].ival)
+		if idx < 0 || idx >= len(args[0].recordFields) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector-set!: index out of range", node.line, node.col)}
+		}
+		args[0].recordFields[idx] = args[2]
+		return voidVal(), nil
+
+	case "vector-length":
+		if len(args) != 1 || args[0].typ != valVector {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector-length: expected vector", node.line, node.col)}
+		}
+		return intVal(int64(len(args[0].recordFields))), nil
+
+	case "vector?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector?: need 1 argument", node.line, node.col)}
+		}
+		return boolVal(args[0].typ == valVector), nil
+
+	case "vector->list":
+		if len(args) != 1 || args[0].typ != valVector {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector->list: expected vector", node.line, node.col)}
+		}
+		result := nilVal()
+		for i := len(args[0].recordFields) - 1; i >= 0; i-- {
+			result = &Value{typ: valPair, car: args[0].recordFields[i], cdr: result}
+		}
+		return result, nil
+
+	case "list->vector":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list->vector: need 1 argument", node.line, node.col)}
+		}
+		var elems []*Value
+		v := args[0]
+		for v.typ == valPair {
+			elems = append(elems, v.car)
+			v = v.cdr
+		}
+		return &Value{typ: valVector, recordFields: elems}, nil
+
 	case "numerator":
 		if len(args) != 1 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: numerator: need 1 argument", node.line, node.col)}
@@ -1971,6 +2073,8 @@ func valEq(a, b *Value) bool {
 		return a.sval == b.sval
 	case valNil:
 		return true
+	case valVoid:
+		return true
 	default:
 		return a == b
 	}
@@ -1999,6 +2103,16 @@ func valEqual(a, b *Value) bool {
 		return true
 	case valPair:
 		return valEqual(a.car, b.car) && valEqual(a.cdr, b.cdr)
+	case valVector:
+		if len(a.recordFields) != len(b.recordFields) {
+			return false
+		}
+		for i := range a.recordFields {
+			if !valEqual(a.recordFields[i], b.recordFields[i]) {
+				return false
+			}
+		}
+		return true
 	default:
 		return a == b
 	}
@@ -2090,6 +2204,213 @@ func applyApply(args []*Value, node *astNode, ip *interp) (*Value, error) {
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: not a procedure", node.line, node.col)}
 }
 
+// evalLetrec implements both letrec and letrec* forms.
+func evalLetrec(node *astNode, e *env, ip *interp, star bool) (*Value, error) {
+	if len(node.children) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: bad syntax", node.line, node.col)}
+	}
+	bindings := node.children[1]
+	if bindings.isAtom {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: bad syntax", node.line, node.col)}
+	}
+	localEnv := newEnv(e)
+	// First, bind all variables to undefined (void)
+	names := make([]string, 0, len(bindings.children))
+	for _, b := range bindings.children {
+		if b.isAtom || len(b.children) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: bad binding", node.line, node.col)}
+		}
+		name := b.children[0]
+		if !name.isAtom || name.tok.kind != tokSymbol {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: bad binding", node.line, node.col)}
+		}
+		names = append(names, name.tok.sval)
+		localEnv.set(name.tok.sval, voidVal())
+	}
+	// Now evaluate init expressions
+	if star {
+		// letrec*: evaluate sequentially, each init sees previous bindings
+		for i, b := range bindings.children {
+			val, err := eval(b.children[1], localEnv, ip)
+			if err != nil {
+				return nil, err
+			}
+			localEnv.set(names[i], val)
+		}
+	} else {
+		// letrec: evaluate all inits in localEnv, then assign
+		vals := make([]*Value, len(bindings.children))
+		for i, b := range bindings.children {
+			val, err := eval(b.children[1], localEnv, ip)
+			if err != nil {
+				return nil, err
+			}
+			vals[i] = val
+		}
+		for i, name := range names {
+			localEnv.set(name, vals[i])
+		}
+	}
+	// Evaluate body
+	var result *Value
+	for _, bodyExpr := range node.children[2:] {
+		var err error
+		result, err = eval(bodyExpr, localEnv, ip)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+// evalCase implements (case expr ((datum ...) body ...) ... (else body ...))
+func evalCase(node *astNode, e *env, ip *interp) (*Value, error) {
+	if len(node.children) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case: bad syntax", node.line, node.col)}
+	}
+	key, err := eval(node.children[1], e, ip)
+	if err != nil {
+		return nil, err
+	}
+	for _, clause := range node.children[2:] {
+		if clause.isAtom || len(clause.children) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case: bad clause", node.line, node.col)}
+		}
+		datums := clause.children[0]
+		// Check for else clause
+		if datums.isAtom && datums.tok.kind == tokSymbol && datums.tok.sval == "else" {
+			var result *Value
+			for _, bodyExpr := range clause.children[1:] {
+				result, err = eval(bodyExpr, e, ip)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		// Check if key matches any datum
+		if datums.isAtom {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case: bad clause", node.line, node.col)}
+		}
+		matched := false
+		for _, d := range datums.children {
+			dv := quoteNode(d)
+			if valEqv(key, dv) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			var result *Value
+			for _, bodyExpr := range clause.children[1:] {
+				result, err = eval(bodyExpr, e, ip)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+	}
+	return voidVal(), nil
+}
+
+// valEqv implements eqv? semantics
+func valEqv(a, b *Value) bool {
+	return valEq(a, b)
+}
+
+// evalDo implements (do ((var init step) ...) (test expr ...) body ...)
+func evalDo(node *astNode, e *env, ip *interp) (*Value, error) {
+	if len(node.children) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: do: bad syntax", node.line, node.col)}
+	}
+	bindingsNode := node.children[1]
+	testNode := node.children[2]
+	bodyExprs := node.children[3:]
+
+	if bindingsNode.isAtom {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: do: bad syntax", node.line, node.col)}
+	}
+	if testNode.isAtom || len(testNode.children) < 1 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: do: bad syntax", node.line, node.col)}
+	}
+
+	type doVar struct {
+		name    string
+		stepIdx int // index in bindingsNode.children, -1 if no step
+	}
+	vars := make([]doVar, 0, len(bindingsNode.children))
+	localEnv := newEnv(e)
+
+	// Initialize variables
+	for i, b := range bindingsNode.children {
+		if b.isAtom || len(b.children) < 2 || len(b.children) > 3 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: do: bad variable spec", node.line, node.col)}
+		}
+		name := b.children[0]
+		if !name.isAtom || name.tok.kind != tokSymbol {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: do: bad variable spec", node.line, node.col)}
+		}
+		initVal, err := eval(b.children[1], e, ip)
+		if err != nil {
+			return nil, err
+		}
+		stepIdx := -1
+		if len(b.children) == 3 {
+			stepIdx = i
+		}
+		vars = append(vars, doVar{name: name.tok.sval, stepIdx: stepIdx})
+		localEnv.set(name.tok.sval, initVal)
+	}
+
+	// Iterate
+	for {
+		// Evaluate test
+		testResult, err := eval(testNode.children[0], localEnv, ip)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(testResult) {
+			// Evaluate result expressions
+			if len(testNode.children) == 1 {
+				return voidVal(), nil
+			}
+			var result *Value
+			for _, expr := range testNode.children[1:] {
+				result, err = eval(expr, localEnv, ip)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		// Evaluate body (for side effects)
+		for _, bodyExpr := range bodyExprs {
+			_, err := eval(bodyExpr, localEnv, ip)
+			if err != nil {
+				return nil, err
+			}
+		}
+		// Compute step values (using current env, parallel update)
+		newVals := make([]*Value, len(vars))
+		for i, v := range vars {
+			if v.stepIdx >= 0 {
+				stepExpr := bindingsNode.children[v.stepIdx].children[2]
+				newVals[i], err = eval(stepExpr, localEnv, ip)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		// Update variables
+		for i, v := range vars {
+			if v.stepIdx >= 0 {
+				localEnv.set(v.name, newVals[i])
+			}
+		}
+	}
+}
+
 func makeGlobalEnv() *env {
 	e := newEnv(nil)
 	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
@@ -2116,7 +2437,10 @@ func makeGlobalEnv() *env {
 		"string-upcase", "string-downcase",
 		"char->integer", "integer->char",
 		"exact?", "inexact?", "exact->inexact", "inexact->exact",
-		"numerator", "denominator"}
+		"numerator", "denominator",
+		"eqv?",
+		"vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
+		"vector->list", "list->vector"}
 	for _, name := range builtins {
 		e.set(name, symVal(name))
 	}
