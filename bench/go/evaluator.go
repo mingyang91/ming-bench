@@ -139,6 +139,7 @@ const (
 	tokBool
 	tokSymbol
 	tokQuote
+	tokChar
 	tokEOF
 )
 
@@ -230,6 +231,31 @@ func (l *lexer) nextToken() (token, error) {
 		} else if next == 'f' {
 			l.advance()
 			return token{kind: tokBool, bval: false, line: line, col: col}, nil
+		} else if next == '\\' {
+			l.advance() // consume backslash
+			if l.pos >= len(l.input) {
+				return token{}, &EvalError{Message: fmt.Sprintf("%d:%d: unexpected end of character literal", line, col)}
+			}
+			// Read character name or single char
+			first := l.advance()
+			// Check for named characters
+			if unicode.IsLetter(first) && l.pos < len(l.input) && unicode.IsLetter(l.peek()) {
+				name := string(first)
+				for l.pos < len(l.input) && unicode.IsLetter(l.peek()) {
+					name += string(l.advance())
+				}
+				switch name {
+				case "space":
+					return token{kind: tokChar, ival: int64(' '), line: line, col: col}, nil
+				case "newline":
+					return token{kind: tokChar, ival: int64('\n'), line: line, col: col}, nil
+				case "tab":
+					return token{kind: tokChar, ival: int64('\t'), line: line, col: col}, nil
+				default:
+					return token{}, &EvalError{Message: fmt.Sprintf("%d:%d: unknown character name: %s", line, col, name)}
+				}
+			}
+			return token{kind: tokChar, ival: int64(first), line: line, col: col}, nil
 		}
 		return token{}, &EvalError{Message: fmt.Sprintf("%d:%d: unexpected character after #", line, col)}
 	default:
@@ -434,6 +460,8 @@ func evalAtom(node *astNode, e *env) (*Value, error) {
 		return boolVal(t.bval), nil
 	case tokString:
 		return strVal(t.sval), nil
+	case tokChar:
+		return charVal(rune(t.ival)), nil
 	case tokSymbol:
 		if v, ok := e.get(t.sval); ok {
 			return v, nil
@@ -759,6 +787,8 @@ func quoteNode(node *astNode) *Value {
 			return boolVal(node.tok.bval)
 		case tokString:
 			return strVal(node.tok.sval)
+		case tokChar:
+			return charVal(rune(node.tok.ival))
 		case tokSymbol:
 			return symVal(node.tok.sval)
 		}
@@ -1092,6 +1122,31 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		}
 		return symVal(args[0].sval), nil
 
+	case "string-copy":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-copy: need 1 argument", node.line, node.col)}
+		}
+		if args[0].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-copy: expected string", node.line, node.col)}
+		}
+		return strVal(args[0].sval), nil
+
+	case "string-set!":
+		if len(args) != 3 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: need 3 arguments", node.line, node.col)}
+		}
+		if args[0].typ != valString || args[1].typ != valInt || args[2].typ != valChar {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: bad arguments", node.line, node.col)}
+		}
+		runes := []rune(args[0].sval)
+		idx := int(args[1].ival)
+		if idx < 0 || idx >= len(runes) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: index out of range", node.line, node.col)}
+		}
+		runes[idx] = rune(args[2].ival)
+		args[0].sval = string(runes)
+		return voidVal(), nil
+
 	case "string-ref":
 		if len(args) != 2 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: need 2 arguments", node.line, node.col)}
@@ -1121,7 +1176,8 @@ func makeGlobalEnv() *env {
 		"string-append", "string-length", "substring",
 		"string->number", "number->string",
 		"symbol->string", "string->symbol",
-		"string-ref"}
+		"string-ref",
+		"string-copy", "string-set!"}
 	for _, name := range builtins {
 		e.set(name, symVal(name))
 	}
