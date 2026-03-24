@@ -78,6 +78,7 @@ const (
 	valVector
 	valContinuation
 	valMultipleValues
+	valSyntax
 )
 
 type Value struct {
@@ -110,6 +111,11 @@ type Value struct {
 	contCapture *contCapture
 	// multiple values (L21)
 	vals []*Value
+	// syntax object (L22)
+	syntaxNode    *astNode
+	syntaxMulti   []*astNode
+	syntaxRenames map[string]string
+	syntaxDefEnv  *env
 }
 
 type caseClause struct {
@@ -347,6 +353,8 @@ func (v *Value) String() string {
 			parts[i] = el.String()
 		}
 		return strings.Join(parts, "\n")
+	case valSyntax:
+		return "#<syntax>"
 	default:
 		return "<unknown>"
 	}
@@ -448,6 +456,8 @@ type interp struct {
 	topIdx       int                 // current top-level expression index
 	topEnv       *env                // top-level environment
 	innerBodyCtx *bodyCtx            // innermost let/letrec body context (nil if not in one)
+	// syntax-case support (L22)
+	macroDefEnv *env // definition-site env for current transformer macro expansion
 }
 
 // ---------- Tokenizer ----------
@@ -467,6 +477,7 @@ const (
 	tokChar
 	tokDot
 	tokEOF
+	tokSyntaxQuote
 )
 
 type token struct {
@@ -584,6 +595,9 @@ func (l *lexer) nextToken() (token, error) {
 				}
 			}
 			return token{kind: tokChar, ival: int64(first), line: line, col: col}, nil
+		} else if next == '\'' {
+			l.advance()
+			return token{kind: tokSyntaxQuote, line: line, col: col}, nil
 		}
 		return token{}, &EvalError{Message: fmt.Sprintf("%d:%d: unexpected character after #", line, col)}
 	default:
@@ -755,6 +769,21 @@ func (p *parser) parseExpr() (*astNode, error) {
 			},
 			line: t.line, col: t.col,
 		}, nil
+	case tokSyntaxQuote:
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if inner == nil {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unexpected end of input after #'", t.line, t.col)}
+		}
+		return &astNode{
+			children: []*astNode{
+				{isAtom: true, tok: token{kind: tokSymbol, sval: "syntax", line: t.line, col: t.col}, line: t.line, col: t.col},
+				inner,
+			},
+			line: t.line, col: t.col,
+		}, nil
 	case tokRParen:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unexpected ')'", t.line, t.col)}
 	case tokEOF:
@@ -894,7 +923,13 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 		case "set!":
 			return evalSet(node, e, ip)
 		case "define-syntax":
-			return evalDefineSyntax(node, e)
+			return evalDefineSyntax(node, e, ip)
+		case "syntax-case":
+			return evalSyntaxCase(node, e, ip)
+		case "syntax":
+			return evalSyntaxTemplate(node, e, ip)
+		case "with-syntax":
+			return evalWithSyntax(node, e, ip)
 		case "define-record-type":
 			return evalDefineRecordType(node, e)
 		case "letrec":
@@ -913,7 +948,7 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 
 		// Check if symbol resolves to a macro
 		if v, ok := e.get(first.tok.sval); ok && v.typ == valMacro {
-			expanded, expandEnv, err := expandMacro(v.macro, node, e)
+			expanded, expandEnv, err := expandMacro(v.macro, node, e, ip)
 			if err != nil {
 				return nil, err
 			}
@@ -2844,6 +2879,22 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		}
 		return boolVal(false), nil
 
+	case "syntax->datum":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax->datum: need 1 argument", node.line, node.col)}
+		}
+		if args[0].typ != valSyntax {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax->datum: expected syntax object", node.line, node.col)}
+		}
+		return syntaxToDatumValue(args[0].syntaxNode), nil
+
+	case "datum->syntax":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: datum->syntax: need 2 arguments", node.line, node.col)}
+		}
+		astN := valueToAstNode(args[1])
+		return &Value{typ: valSyntax, syntaxNode: astN}, nil
+
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", node.line, node.col, name)}
 	}
@@ -3307,7 +3358,8 @@ func makeGlobalEnv() *env {
 		"call/cc", "call-with-current-continuation",
 		"dynamic-wind",
 		"raise", "with-exception-handler",
-		"values", "call-with-values"}
+		"values", "call-with-values",
+		"syntax->datum", "datum->syntax"}
 	for _, name := range builtins {
 		e.set(name, symVal(name))
 	}

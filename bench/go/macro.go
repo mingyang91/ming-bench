@@ -10,9 +10,10 @@ func gensym(base string) string {
 }
 
 type syntaxRulesMacro struct {
-	literals []string
-	clauses  []macroClause
-	defEnv   *env
+	literals    []string
+	clauses     []macroClause
+	defEnv      *env
+	transformer *Value // lambda-based transformer for syntax-case macros
 }
 
 type macroClause struct {
@@ -28,11 +29,15 @@ type patBinding struct {
 
 var specialForms = map[string]bool{
 	"and": true, "or": true, "define": true, "if": true, "quote": true,
-	"lambda": true, "let": true, "begin": true, "cond": true, "set!": true,
-	"define-syntax": true, "syntax-rules": true,
+	"lambda": true, "let": true, "let*": true, "letrec": true, "letrec*": true,
+	"begin": true, "cond": true, "set!": true, "case": true, "do": true,
+	"define-syntax": true, "syntax-rules": true, "syntax-case": true,
+	"syntax": true, "with-syntax": true,
+	"case-lambda": true, "define-record-type": true,
+	"call/cc": true, "call-with-current-continuation": true, "guard": true,
 }
 
-func evalDefineSyntax(node *astNode, e *env) (*Value, error) {
+func evalDefineSyntax(node *astNode, e *env, ip *interp) (*Value, error) {
 	if len(node.children) != 3 {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: bad syntax", node.line, node.col)}
 	}
@@ -44,10 +49,22 @@ func evalDefineSyntax(node *astNode, e *env) (*Value, error) {
 
 	srNode := node.children[2]
 	if srNode.isAtom || len(srNode.children) < 2 {
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules", node.line, node.col)}
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules or lambda", node.line, node.col)}
 	}
+
+	// Check if it's a lambda transformer (syntax-case style)
+	if srNode.children[0].isAtom && srNode.children[0].tok.kind == tokSymbol && srNode.children[0].tok.sval == "lambda" {
+		transformer, err := eval(srNode, e, ip)
+		if err != nil {
+			return nil, err
+		}
+		macro := &syntaxRulesMacro{defEnv: e, transformer: transformer}
+		e.set(name, &Value{typ: valMacro, macro: macro})
+		return voidVal(), nil
+	}
+
 	if !(srNode.children[0].isAtom && srNode.children[0].tok.kind == tokSymbol && srNode.children[0].tok.sval == "syntax-rules") {
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules", node.line, node.col)}
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules or lambda", node.line, node.col)}
 	}
 
 	litNode := srNode.children[1]
@@ -81,7 +98,10 @@ func evalDefineSyntax(node *astNode, e *env) (*Value, error) {
 	return voidVal(), nil
 }
 
-func expandMacro(macro *syntaxRulesMacro, node *astNode, useEnv *env) (*astNode, *env, error) {
+func expandMacro(macro *syntaxRulesMacro, node *astNode, useEnv *env, ip *interp) (*astNode, *env, error) {
+	if macro.transformer != nil {
+		return expandTransformerMacro(macro, node, useEnv, ip)
+	}
 	for _, clause := range macro.clauses {
 		bindings := make(map[string]*patBinding)
 		if matchClause(clause.pattern, node, bindings, macro.literals) {
@@ -383,6 +403,11 @@ func collectNonPatternSymbolsHelper(node *astNode, bindings map[string]*patBindi
 				seen[name] = true
 			}
 		}
+		return
+	}
+	// Skip non-pattern symbols inside (quote ...) — they're data, not code
+	if len(node.children) >= 2 && node.children[0].isAtom &&
+		node.children[0].tok.kind == tokSymbol && node.children[0].tok.sval == "quote" {
 		return
 	}
 	for _, child := range node.children {
