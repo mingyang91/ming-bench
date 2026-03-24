@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::scheme::env::Env;
-use crate::scheme::value::{Value, ValueKind, Pos};
+use crate::scheme::value::{Value, ValueKind, Pos, NumVal, make_rational_kind};
 use crate::scheme::macros;
 use crate::scheme::EvalError;
 
@@ -30,7 +30,7 @@ fn fmt_pos(pos: Pos) -> String {
 
 pub fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
     match &expr.kind {
-        ValueKind::Integer(_) | ValueKind::Boolean(_) | ValueKind::Str(_) | ValueKind::Char(_) => Ok(expr.clone()),
+        ValueKind::Integer(_) | ValueKind::Rational(_, _) | ValueKind::Float(_) | ValueKind::Boolean(_) | ValueKind::Str(_) | ValueKind::Char(_) => Ok(expr.clone()),
         ValueKind::Lambda { .. } | ValueKind::SyntaxRules { .. } => Ok(expr.clone()),
         ValueKind::Symbol(name) => {
             env.get(name).ok_or_else(|| EvalError::UnboundVariable(
@@ -424,57 +424,162 @@ fn apply(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, EvalError
     }
 }
 
+fn numval_to_value(n: NumVal) -> Value {
+    match n {
+        NumVal::Int(i) => Value::unpos(ValueKind::Integer(i)),
+        NumVal::Rat(num, den) => Value::unpos(make_rational_kind(num, den)),
+        NumVal::Flt(f) => Value::unpos(ValueKind::Float(f)),
+    }
+}
+
+fn num_add(a: NumVal, b: NumVal) -> NumVal {
+    match (a, b) {
+        (NumVal::Flt(x), other) | (other, NumVal::Flt(x)) => NumVal::Flt(x + other.to_f64()),
+        (NumVal::Int(x), NumVal::Int(y)) => NumVal::Int(x + y),
+        (NumVal::Int(x), NumVal::Rat(n, d)) | (NumVal::Rat(n, d), NumVal::Int(x)) => {
+            NumVal::Rat(n + x * d, d)
+        }
+        (NumVal::Rat(n1, d1), NumVal::Rat(n2, d2)) => {
+            NumVal::Rat(n1 * d2 + n2 * d1, d1 * d2)
+        }
+    }
+}
+
+fn num_sub(a: NumVal, b: NumVal) -> NumVal {
+    match (a, b) {
+        (NumVal::Flt(x), y) => NumVal::Flt(x - y.to_f64()),
+        (x, NumVal::Flt(y)) => NumVal::Flt(x.to_f64() - y),
+        (NumVal::Int(x), NumVal::Int(y)) => NumVal::Int(x - y),
+        (NumVal::Int(x), NumVal::Rat(n, d)) => NumVal::Rat(x * d - n, d),
+        (NumVal::Rat(n, d), NumVal::Int(x)) => NumVal::Rat(n - x * d, d),
+        (NumVal::Rat(n1, d1), NumVal::Rat(n2, d2)) => {
+            NumVal::Rat(n1 * d2 - n2 * d1, d1 * d2)
+        }
+    }
+}
+
+fn num_mul(a: NumVal, b: NumVal) -> NumVal {
+    match (a, b) {
+        (NumVal::Flt(x), other) | (other, NumVal::Flt(x)) => NumVal::Flt(x * other.to_f64()),
+        (NumVal::Int(x), NumVal::Int(y)) => NumVal::Int(x * y),
+        (NumVal::Int(x), NumVal::Rat(n, d)) | (NumVal::Rat(n, d), NumVal::Int(x)) => {
+            NumVal::Rat(n * x, d)
+        }
+        (NumVal::Rat(n1, d1), NumVal::Rat(n2, d2)) => {
+            NumVal::Rat(n1 * n2, d1 * d2)
+        }
+    }
+}
+
+fn num_div(a: NumVal, b: NumVal) -> Option<NumVal> {
+    match (a, b) {
+        (NumVal::Flt(x), y) => Some(NumVal::Flt(x / y.to_f64())),
+        (x, NumVal::Flt(y)) => {
+            if y == 0.0 { return None; }
+            Some(NumVal::Flt(x.to_f64() / y))
+        }
+        (NumVal::Int(x), NumVal::Int(y)) => {
+            if y == 0 { return None; }
+            Some(NumVal::Rat(x, y))
+        }
+        (NumVal::Int(x), NumVal::Rat(n, d)) => {
+            if n == 0 { return None; }
+            Some(NumVal::Rat(x * d, n))
+        }
+        (NumVal::Rat(n, d), NumVal::Int(y)) => {
+            if y == 0 { return None; }
+            Some(NumVal::Rat(n, d * y))
+        }
+        (NumVal::Rat(n1, d1), NumVal::Rat(n2, d2)) => {
+            if n2 == 0 { return None; }
+            Some(NumVal::Rat(n1 * d2, d1 * n2))
+        }
+    }
+}
+
+/// Simplify a NumVal (reduce rationals)
+fn num_simplify(n: NumVal) -> NumVal {
+    match n {
+        NumVal::Rat(num, den) => {
+            let (num, den) = if den < 0 { (-num, -den) } else { (num, den) };
+            let g = crate::scheme::value::gcd(num.abs(), den);
+            let (num, den) = (num / g, den / g);
+            if den == 1 { NumVal::Int(num) } else { NumVal::Rat(num, den) }
+        }
+        other => other,
+    }
+}
+
+fn num_cmp(a: NumVal, b: NumVal) -> f64 {
+    // Returns a - b as f64 for comparison
+    match (a, b) {
+        (NumVal::Int(x), NumVal::Int(y)) => (x - y) as f64,
+        (NumVal::Flt(x), other) => x - other.to_f64(),
+        (other, NumVal::Flt(y)) => other.to_f64() - y,
+        (NumVal::Rat(n1, d1), NumVal::Rat(n2, d2)) => {
+            (n1 * d2 - n2 * d1) as f64
+        }
+        (NumVal::Int(x), NumVal::Rat(n, d)) => (x * d - n) as f64,
+        (NumVal::Rat(n, d), NumVal::Int(y)) => (n - y * d) as f64,
+    }
+}
+
 fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, EvalError> {
     match name {
         "+" => {
-            let mut sum: i64 = 0;
+            let mut acc = NumVal::Int(0);
             for a in args {
-                sum += a.as_integer().ok_or_else(|| EvalError::Type(format!("+ expects numbers at {}", fmt_pos(call_pos))))?;
+                let n = a.as_num().ok_or_else(|| EvalError::Type(format!("+ expects numbers at {}", fmt_pos(call_pos))))?;
+                acc = num_add(acc, n);
             }
-            Ok(Value::unpos(ValueKind::Integer(sum)))
+            Ok(numval_to_value(num_simplify(acc)))
         }
         "-" => {
             if args.is_empty() {
                 return Err(EvalError::Arity(format!("- requires at least 1 argument at {}", fmt_pos(call_pos))));
             }
-            let first = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("- expects numbers at {}", fmt_pos(call_pos))))?;
+            let first = args[0].as_num().ok_or_else(|| EvalError::Type(format!("- expects numbers at {}", fmt_pos(call_pos))))?;
             if args.len() == 1 {
-                Ok(Value::unpos(ValueKind::Integer(-first)))
+                let neg = match first {
+                    NumVal::Int(n) => NumVal::Int(-n),
+                    NumVal::Rat(n, d) => NumVal::Rat(-n, d),
+                    NumVal::Flt(f) => NumVal::Flt(-f),
+                };
+                Ok(numval_to_value(neg))
             } else {
-                let mut result = first;
+                let mut acc = first;
                 for a in &args[1..] {
-                    result -= a.as_integer().ok_or_else(|| EvalError::Type(format!("- expects numbers at {}", fmt_pos(call_pos))))?;
+                    let n = a.as_num().ok_or_else(|| EvalError::Type(format!("- expects numbers at {}", fmt_pos(call_pos))))?;
+                    acc = num_sub(acc, n);
                 }
-                Ok(Value::unpos(ValueKind::Integer(result)))
+                Ok(numval_to_value(num_simplify(acc)))
             }
         }
         "*" => {
-            let mut prod: i64 = 1;
+            let mut acc = NumVal::Int(1);
             for a in args {
-                prod *= a.as_integer().ok_or_else(|| EvalError::Type(format!("* expects numbers at {}", fmt_pos(call_pos))))?;
+                let n = a.as_num().ok_or_else(|| EvalError::Type(format!("* expects numbers at {}", fmt_pos(call_pos))))?;
+                acc = num_mul(acc, n);
             }
-            Ok(Value::unpos(ValueKind::Integer(prod)))
+            Ok(numval_to_value(num_simplify(acc)))
         }
         "/" => {
             if args.is_empty() {
                 return Err(EvalError::Arity(format!("/ requires at least 1 argument at {}", fmt_pos(call_pos))));
             }
-            let first = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("/ expects numbers at {}", fmt_pos(call_pos))))?;
+            let first = args[0].as_num().ok_or_else(|| EvalError::Type(format!("/ expects numbers at {}", fmt_pos(call_pos))))?;
             if args.len() == 1 {
-                if first == 0 {
-                    return Err(EvalError::Runtime(format!("division by zero at {}", fmt_pos(call_pos))));
-                }
-                Ok(Value::unpos(ValueKind::Integer(1 / first)))
+                let r = num_div(NumVal::Int(1), first)
+                    .ok_or_else(|| EvalError::Runtime(format!("division by zero at {}", fmt_pos(call_pos))))?;
+                Ok(numval_to_value(num_simplify(r)))
             } else {
-                let mut result = first;
+                let mut acc = first;
                 for a in &args[1..] {
-                    let d = a.as_integer().ok_or_else(|| EvalError::Type(format!("/ expects numbers at {}", fmt_pos(call_pos))))?;
-                    if d == 0 {
-                        return Err(EvalError::Runtime(format!("division by zero at {}", fmt_pos(call_pos))));
-                    }
-                    result /= d;
+                    let n = a.as_num().ok_or_else(|| EvalError::Type(format!("/ expects numbers at {}", fmt_pos(call_pos))))?;
+                    acc = num_div(acc, n)
+                        .ok_or_else(|| EvalError::Runtime(format!("division by zero at {}", fmt_pos(call_pos))))?;
                 }
-                Ok(Value::unpos(ValueKind::Integer(result)))
+                Ok(numval_to_value(num_simplify(acc)))
             }
         }
         "<" => cmp_op(args, |a, b| a < b, call_pos),
@@ -564,7 +669,7 @@ fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, Eva
         }
         "number?" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("number? requires 1 argument at {}", fmt_pos(call_pos)))); }
-            Ok(Value::unpos(ValueKind::Boolean(matches!(&args[0].kind, ValueKind::Integer(_)))))
+            Ok(Value::unpos(ValueKind::Boolean(args[0].as_num().is_some())))
         }
         "boolean?" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("boolean? requires 1 argument at {}", fmt_pos(call_pos)))); }
@@ -651,8 +756,13 @@ fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, Eva
             if args.len() != 1 {
                 return Err(EvalError::Arity(format!("number->string requires 1 argument at {}", fmt_pos(call_pos))));
             }
-            let n = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("number->string: not a number at {}", fmt_pos(call_pos))))?;
-            Ok(Value::unpos(ValueKind::Str(n.to_string())))
+            let s = match &args[0].kind {
+                ValueKind::Integer(n) => n.to_string(),
+                ValueKind::Rational(n, d) => format!("{}/{}", n, d),
+                ValueKind::Float(f) => format!("{}", f),
+                _ => return Err(EvalError::Type(format!("number->string: not a number at {}", fmt_pos(call_pos)))),
+            };
+            Ok(Value::unpos(ValueKind::Str(s)))
         }
         "symbol->string" => {
             if args.len() != 1 {
@@ -774,18 +884,18 @@ fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, Eva
         }
         "zero?" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("zero? requires 1 argument at {}", fmt_pos(call_pos)))); }
-            let n = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("zero?: not a number at {}", fmt_pos(call_pos))))?;
-            Ok(Value::unpos(ValueKind::Boolean(n == 0)))
+            let n = args[0].as_num().ok_or_else(|| EvalError::Type(format!("zero?: not a number at {}", fmt_pos(call_pos))))?;
+            Ok(Value::unpos(ValueKind::Boolean(n.to_f64() == 0.0)))
         }
         "positive?" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("positive? requires 1 argument at {}", fmt_pos(call_pos)))); }
-            let n = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("positive?: not a number at {}", fmt_pos(call_pos))))?;
-            Ok(Value::unpos(ValueKind::Boolean(n > 0)))
+            let n = args[0].as_num().ok_or_else(|| EvalError::Type(format!("positive?: not a number at {}", fmt_pos(call_pos))))?;
+            Ok(Value::unpos(ValueKind::Boolean(n.to_f64() > 0.0)))
         }
         "negative?" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("negative? requires 1 argument at {}", fmt_pos(call_pos)))); }
-            let n = args[0].as_integer().ok_or_else(|| EvalError::Type(format!("negative?: not a number at {}", fmt_pos(call_pos))))?;
-            Ok(Value::unpos(ValueKind::Boolean(n < 0)))
+            let n = args[0].as_num().ok_or_else(|| EvalError::Type(format!("negative?: not a number at {}", fmt_pos(call_pos))))?;
+            Ok(Value::unpos(ValueKind::Boolean(n.to_f64() < 0.0)))
         }
         "odd?" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("odd? requires 1 argument at {}", fmt_pos(call_pos)))); }
@@ -799,7 +909,13 @@ fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, Eva
         }
         "integer?" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("integer? requires 1 argument at {}", fmt_pos(call_pos)))); }
-            Ok(Value::unpos(ValueKind::Boolean(matches!(&args[0].kind, ValueKind::Integer(_)))))
+            let is_int = match &args[0].kind {
+                ValueKind::Integer(_) => true,
+                ValueKind::Rational(_, _) => false, // simplified rationals with den=1 become Integer
+                ValueKind::Float(f) => f.fract() == 0.0,
+                _ => false,
+            };
+            Ok(Value::unpos(ValueKind::Boolean(is_int)))
         }
         // L09: List utilities
         "list-ref" => {
@@ -999,19 +1115,82 @@ fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, Eva
                 _ => Err(EvalError::Type(format!("string-downcase: not a string at {}", fmt_pos(call_pos)))),
             }
         }
+        // L11: Exact arithmetic & rationals
+        "exact?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("exact? requires 1 argument at {}", fmt_pos(call_pos)))); }
+            let is_exact = matches!(&args[0].kind, ValueKind::Integer(_) | ValueKind::Rational(_, _));
+            Ok(Value::unpos(ValueKind::Boolean(is_exact)))
+        }
+        "inexact?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("inexact? requires 1 argument at {}", fmt_pos(call_pos)))); }
+            Ok(Value::unpos(ValueKind::Boolean(matches!(&args[0].kind, ValueKind::Float(_)))))
+        }
+        "rational?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("rational? requires 1 argument at {}", fmt_pos(call_pos)))); }
+            let is_rat = matches!(&args[0].kind, ValueKind::Integer(_) | ValueKind::Rational(_, _));
+            Ok(Value::unpos(ValueKind::Boolean(is_rat)))
+        }
+        "exact->inexact" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("exact->inexact requires 1 argument at {}", fmt_pos(call_pos)))); }
+            let n = args[0].as_num().ok_or_else(|| EvalError::Type(format!("exact->inexact: not a number at {}", fmt_pos(call_pos))))?;
+            Ok(Value::unpos(ValueKind::Float(n.to_f64())))
+        }
+        "inexact->exact" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("inexact->exact requires 1 argument at {}", fmt_pos(call_pos)))); }
+            let n = args[0].as_num().ok_or_else(|| EvalError::Type(format!("inexact->exact: not a number at {}", fmt_pos(call_pos))))?;
+            match n {
+                NumVal::Int(i) => Ok(Value::unpos(ValueKind::Integer(i))),
+                NumVal::Rat(num, den) => Ok(Value::unpos(make_rational_kind(num, den))),
+                NumVal::Flt(f) => {
+                    // Convert float to exact rational via continued fraction / simple approach
+                    // For 0.5 → 1/2, etc.
+                    if f.fract() == 0.0 {
+                        Ok(Value::unpos(ValueKind::Integer(f as i64)))
+                    } else {
+                        // Use the fact that f = n/d, find simplest rational
+                        // Multiply by power of 10 to clear decimals, then simplify
+                        let mut num = f;
+                        let mut den = 1i64;
+                        // Scale up to integer
+                        while (num * den as f64).fract().abs() > 1e-10 && den < 1_000_000_000 {
+                            den *= 10;
+                        }
+                        let inum = (f * den as f64).round() as i64;
+                        Ok(Value::unpos(make_rational_kind(inum, den)))
+                    }
+                }
+            }
+        }
+        "numerator" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("numerator requires 1 argument at {}", fmt_pos(call_pos)))); }
+            match &args[0].kind {
+                ValueKind::Integer(n) => Ok(Value::unpos(ValueKind::Integer(*n))),
+                ValueKind::Rational(n, _) => Ok(Value::unpos(ValueKind::Integer(*n))),
+                _ => Err(EvalError::Type(format!("numerator: not a rational at {}", fmt_pos(call_pos)))),
+            }
+        }
+        "denominator" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("denominator requires 1 argument at {}", fmt_pos(call_pos)))); }
+            match &args[0].kind {
+                ValueKind::Integer(_) => Ok(Value::unpos(ValueKind::Integer(1))),
+                ValueKind::Rational(_, d) => Ok(Value::unpos(ValueKind::Integer(*d))),
+                _ => Err(EvalError::Type(format!("denominator: not a rational at {}", fmt_pos(call_pos)))),
+            }
+        }
         _ => Err(EvalError::UnboundVariable(format!("{} at {}", name, fmt_pos(call_pos)))),
     }
 }
 
-fn cmp_op(args: &[Value], op: fn(i64, i64) -> bool, call_pos: Pos) -> Result<Value, EvalError> {
+fn cmp_op(args: &[Value], op: fn(f64, f64) -> bool, call_pos: Pos) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity(format!("comparison requires at least 2 arguments at {}", fmt_pos(call_pos))));
     }
-    let nums: Vec<i64> = args.iter()
-        .map(|a| a.as_integer().ok_or_else(|| EvalError::Type(format!("comparison expects numbers at {}", fmt_pos(call_pos)))))
+    let nums: Vec<NumVal> = args.iter()
+        .map(|a| a.as_num().ok_or_else(|| EvalError::Type(format!("comparison expects numbers at {}", fmt_pos(call_pos)))))
         .collect::<Result<Vec<_>, _>>()?;
     for w in nums.windows(2) {
-        if !op(w[0], w[1]) {
+        let diff = num_cmp(w[0], w[1]);
+        if !op(diff, 0.0) {
             return Ok(Value::unpos(ValueKind::Boolean(false)));
         }
     }

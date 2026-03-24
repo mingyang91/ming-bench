@@ -7,6 +7,8 @@ pub type Pos = (usize, usize);
 #[derive(Debug, Clone)]
 pub enum ValueKind {
     Integer(i64),
+    Rational(i64, i64), // numerator, denominator (always simplified, den > 0)
+    Float(f64),
     Boolean(bool),
     Str(String),
     Symbol(String),
@@ -24,6 +26,40 @@ pub enum ValueKind {
         def_env: Rc<Env>,
     },
     Void,
+}
+
+pub fn gcd(a: i64, b: i64) -> i64 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0 { let t = b; b = a % b; a = t; }
+    a
+}
+
+pub fn make_rational_kind(num: i64, den: i64) -> ValueKind {
+    let (num, den) = if den < 0 { (-num, -den) } else { (num, den) };
+    let g = gcd(num.abs(), den);
+    let (num, den) = (num / g, den / g);
+    if den == 1 { ValueKind::Integer(num) } else { ValueKind::Rational(num, den) }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum NumVal {
+    Int(i64),
+    Rat(i64, i64),
+    Flt(f64),
+}
+
+impl NumVal {
+    pub fn to_f64(self) -> f64 {
+        match self {
+            NumVal::Int(n) => n as f64,
+            NumVal::Rat(n, d) => n as f64 / d as f64,
+            NumVal::Flt(f) => f,
+        }
+    }
+
+    pub fn is_inexact(self) -> bool {
+        matches!(self, NumVal::Flt(_))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +84,8 @@ impl Value {
     pub fn to_display(&self) -> String {
         match &self.kind {
             ValueKind::Integer(n) => n.to_string(),
+            ValueKind::Rational(n, d) => format!("{}/{}", n, d),
+            ValueKind::Float(f) => format_float(*f),
             ValueKind::Boolean(true) => "#t".to_string(),
             ValueKind::Boolean(false) => "#f".to_string(),
             ValueKind::Str(s) => format!("\"{}\"", s),
@@ -72,6 +110,7 @@ impl Value {
         match &self.kind {
             ValueKind::Str(s) => s.clone(),
             ValueKind::Char(c) => c.to_string(),
+            ValueKind::Float(f) => format_float(*f),
             ValueKind::List(elems) => {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_display()).collect();
                 format!("({})", inner.join(" "))
@@ -90,6 +129,15 @@ impl Value {
         if let ValueKind::Integer(n) = self.kind { Some(n) } else { None }
     }
 
+    pub fn as_num(&self) -> Option<NumVal> {
+        match &self.kind {
+            ValueKind::Integer(n) => Some(NumVal::Int(*n)),
+            ValueKind::Rational(n, d) => Some(NumVal::Rat(*n, *d)),
+            ValueKind::Float(f) => Some(NumVal::Flt(*f)),
+            _ => None,
+        }
+    }
+
     pub fn fmt_pos(&self) -> String {
         format!("{}:{}", self.pos.0, self.pos.1)
     }
@@ -99,6 +147,8 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (&self.kind, &other.kind) {
             (ValueKind::Integer(a), ValueKind::Integer(b)) => a == b,
+            (ValueKind::Rational(an, ad), ValueKind::Rational(bn, bd)) => an == bn && ad == bd,
+            (ValueKind::Float(a), ValueKind::Float(b)) => a == b,
             (ValueKind::Boolean(a), ValueKind::Boolean(b)) => a == b,
             (ValueKind::Str(a), ValueKind::Str(b)) => a == b,
             (ValueKind::Symbol(a), ValueKind::Symbol(b)) => a == b,
@@ -107,6 +157,15 @@ impl PartialEq for Value {
             (ValueKind::Void, ValueKind::Void) => true,
             _ => false,
         }
+    }
+}
+
+fn format_float(f: f64) -> String {
+    if f.fract() == 0.0 && f.is_finite() {
+        format!("{:.1}", f)
+    } else {
+        let s = format!("{}", f);
+        s
     }
 }
 

@@ -166,6 +166,21 @@ fn parse_atom(s: &str, pos: Pos) -> Value {
         ValueKind::Str(s[1..s.len()-1].to_string())
     } else if let Ok(n) = s.parse::<i64>() {
         ValueKind::Integer(n)
+    } else if let Some(idx) = s.find('/') {
+        // Try parsing as rational n/d
+        let num_s = &s[..idx];
+        let den_s = &s[idx+1..];
+        if let (Ok(num), Ok(den)) = (num_s.parse::<i64>(), den_s.parse::<i64>()) {
+            if den != 0 {
+                crate::scheme::value::make_rational_kind(num, den)
+            } else {
+                ValueKind::Symbol(s.to_string())
+            }
+        } else {
+            ValueKind::Symbol(s.to_string())
+        }
+    } else if let Ok(f) = s.parse::<f64>() {
+        ValueKind::Float(f)
     } else {
         ValueKind::Symbol(s.to_string())
     };

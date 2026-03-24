@@ -63,7 +63,11 @@ impl Env {
                       "string=?", "string<?", "string-ci=?",
                       "string-upcase", "string-downcase",
                       "integer?", "char->integer", "integer->char",
-                      "make-string", "for-each", "reverse"] {
+                      "make-string", "for-each", "reverse",
+                      // L11
+                      "exact?", "inexact?", "rational?",
+                      "exact->inexact", "inexact->exact",
+                      "numerator", "denominator"] {
             env.set(name.to_string(), Value::unpos(ValueKind::Symbol(name.to_string())));
         }
         env
