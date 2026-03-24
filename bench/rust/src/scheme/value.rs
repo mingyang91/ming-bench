@@ -1,6 +1,13 @@
 use std::fmt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use crate::scheme::env::Env;
+
+static RECORD_TYPE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub fn next_record_type_id() -> u64 {
+    RECORD_TYPE_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 pub type Pos = (usize, usize);
 
@@ -24,6 +31,24 @@ pub enum ValueKind {
         literals: Vec<String>,
         rules: Vec<(Value, Value)>,
         def_env: Rc<Env>,
+    },
+    Record {
+        type_id: u64,
+        type_name: String,
+        fields: Vec<(String, Value)>,
+    },
+    RecordConstructor {
+        type_id: u64,
+        type_name: String,
+        field_names: Vec<String>,
+    },
+    RecordPredicate {
+        type_id: u64,
+    },
+    RecordAccessor {
+        type_id: u64,
+        type_name: String,
+        field_name: String,
     },
     Void,
 }
@@ -101,6 +126,8 @@ impl Value {
             }
             ValueKind::Lambda { .. } => "#<procedure>".to_string(),
             ValueKind::SyntaxRules { .. } => "#<syntax>".to_string(),
+            ValueKind::Record { type_name, .. } => format!("#<{}>", type_name),
+            ValueKind::RecordConstructor { .. } | ValueKind::RecordPredicate { .. } | ValueKind::RecordAccessor { .. } => "#<procedure>".to_string(),
             ValueKind::Void => "".to_string(),
         }
     }
@@ -116,6 +143,7 @@ impl Value {
                 format!("({})", inner.join(" "))
             }
             ValueKind::SyntaxRules { .. } => "#<syntax>".to_string(),
+            ValueKind::Record { .. } | ValueKind::RecordConstructor { .. } | ValueKind::RecordPredicate { .. } | ValueKind::RecordAccessor { .. } => self.to_display(),
             _ => self.to_display(),
         }
     }

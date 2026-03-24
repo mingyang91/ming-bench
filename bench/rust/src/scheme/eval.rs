@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::scheme::env::Env;
-use crate::scheme::value::{Value, ValueKind, Pos, NumVal, make_rational_kind};
+use crate::scheme::value::{Value, ValueKind, Pos, NumVal, make_rational_kind, next_record_type_id};
 use crate::scheme::macros;
 use crate::scheme::EvalError;
 
@@ -31,7 +31,7 @@ fn fmt_pos(pos: Pos) -> String {
 pub fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
     match &expr.kind {
         ValueKind::Integer(_) | ValueKind::Rational(_, _) | ValueKind::Float(_) | ValueKind::Boolean(_) | ValueKind::Str(_) | ValueKind::Char(_) => Ok(expr.clone()),
-        ValueKind::Lambda { .. } | ValueKind::SyntaxRules { .. } => Ok(expr.clone()),
+        ValueKind::Lambda { .. } | ValueKind::SyntaxRules { .. } | ValueKind::Record { .. } | ValueKind::RecordConstructor { .. } | ValueKind::RecordPredicate { .. } | ValueKind::RecordAccessor { .. } => Ok(expr.clone()),
         ValueKind::Symbol(name) => {
             env.get(name).ok_or_else(|| EvalError::UnboundVariable(
                 format!("{} at {}", name, fmt_pos(expr.pos))
@@ -55,6 +55,7 @@ pub fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
                     "set!" => return eval_set(&elems[1..], expr.pos, env),
                     "string-set!" => return eval_string_set(&elems[1..], expr.pos, env),
                     "define-syntax" => return eval_define_syntax(&elems[1..], expr.pos, env),
+                    "define-record-type" => return eval_define_record_type(&elems[1..], expr.pos, env),
                     _ => {}
                 }
                 // Check if symbol is bound to a macro
@@ -150,6 +151,74 @@ fn eval_define_syntax(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, 
         rules,
         def_env: Rc::clone(env),
     }));
+    Ok(Value::unpos(ValueKind::Void))
+}
+
+fn eval_define_record_type(args: &[Value], pos: Pos, env: &Rc<Env>) -> Result<Value, EvalError> {
+    // (define-record-type <name> (constructor field...) predicate (field accessor)...)
+    if args.len() < 3 {
+        return Err(EvalError::Syntax(format!("define-record-type requires at least 3 arguments at {}", fmt_pos(pos))));
+    }
+    let type_name = match &args[0].kind {
+        ValueKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Syntax(format!("define-record-type: expected type name at {}", fmt_pos(pos)))),
+    };
+    let type_id = next_record_type_id();
+
+    // Parse constructor: (constructor-name field-name ...)
+    let (constructor_name, constructor_fields) = match &args[1].kind {
+        ValueKind::List(elems) if !elems.is_empty() => {
+            let cname = match &elems[0].kind {
+                ValueKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Syntax(format!("define-record-type: expected constructor name at {}", fmt_pos(pos)))),
+            };
+            let fields: Vec<String> = elems[1..].iter().map(|e| match &e.kind {
+                ValueKind::Symbol(s) => Ok(s.clone()),
+                _ => Err(EvalError::Syntax(format!("define-record-type: expected field name at {}", fmt_pos(e.pos)))),
+            }).collect::<Result<Vec<_>, _>>()?;
+            (cname, fields)
+        }
+        _ => return Err(EvalError::Syntax(format!("define-record-type: expected constructor spec at {}", fmt_pos(pos)))),
+    };
+
+    // Parse predicate
+    let predicate_name = match &args[2].kind {
+        ValueKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Syntax(format!("define-record-type: expected predicate name at {}", fmt_pos(pos)))),
+    };
+
+    // Parse field accessors: (field-name accessor-name)
+    for field_spec in &args[3..] {
+        match &field_spec.kind {
+            ValueKind::List(elems) if elems.len() >= 2 => {
+                let field_name = match &elems[0].kind {
+                    ValueKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Syntax(format!("define-record-type: expected field name at {}", fmt_pos(field_spec.pos)))),
+                };
+                let accessor_name = match &elems[1].kind {
+                    ValueKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Syntax(format!("define-record-type: expected accessor name at {}", fmt_pos(field_spec.pos)))),
+                };
+                env.set(accessor_name, Value::unpos(ValueKind::RecordAccessor {
+                    type_id,
+                    type_name: type_name.clone(),
+                    field_name,
+                }));
+            }
+            _ => return Err(EvalError::Syntax(format!("define-record-type: expected field spec at {}", fmt_pos(field_spec.pos)))),
+        }
+    }
+
+    // Define constructor
+    env.set(constructor_name, Value::unpos(ValueKind::RecordConstructor {
+        type_id,
+        type_name: type_name.clone(),
+        field_names: constructor_fields,
+    }));
+
+    // Define predicate
+    env.set(predicate_name, Value::unpos(ValueKind::RecordPredicate { type_id }));
+
     Ok(Value::unpos(ValueKind::Void))
 }
 
@@ -418,6 +487,51 @@ fn apply(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, EvalError
                     result = eval(expr, &local_env)?;
                 }
                 Ok(result)
+            }
+        }
+        ValueKind::RecordConstructor { type_id, type_name, field_names } => {
+            if args.len() != field_names.len() {
+                return Err(EvalError::Arity(format!(
+                    "{} constructor expects {} arguments, got {} at {}",
+                    type_name, field_names.len(), args.len(), fmt_pos(call_pos)
+                )));
+            }
+            let fields: Vec<(String, Value)> = field_names.iter().zip(args.iter())
+                .map(|(name, val)| (name.clone(), val.clone()))
+                .collect();
+            Ok(Value::unpos(ValueKind::Record {
+                type_id: *type_id,
+                type_name: type_name.clone(),
+                fields,
+            }))
+        }
+        ValueKind::RecordPredicate { type_id } => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "record predicate expects 1 argument, got {} at {}", args.len(), fmt_pos(call_pos)
+                )));
+            }
+            let is_match = matches!(&args[0].kind, ValueKind::Record { type_id: tid, .. } if tid == type_id);
+            Ok(Value::unpos(ValueKind::Boolean(is_match)))
+        }
+        ValueKind::RecordAccessor { type_id, type_name, field_name } => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "record accessor expects 1 argument, got {} at {}", args.len(), fmt_pos(call_pos)
+                )));
+            }
+            match &args[0].kind {
+                ValueKind::Record { type_id: tid, fields, .. } if tid == type_id => {
+                    fields.iter()
+                        .find(|(name, _)| name == field_name)
+                        .map(|(_, val)| val.clone())
+                        .ok_or_else(|| EvalError::Runtime(format!(
+                            "record {} has no field {} at {}", type_name, field_name, fmt_pos(call_pos)
+                        )))
+                }
+                _ => Err(EvalError::Type(format!(
+                    "accessor {}: expected {} record at {}", field_name, type_name, fmt_pos(call_pos)
+                ))),
             }
         }
         _ => Err(EvalError::Type(format!("not a procedure: {} at {}", func, fmt_pos(call_pos)))),
