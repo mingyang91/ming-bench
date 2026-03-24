@@ -20,6 +20,7 @@ const (
 	valNull
 	valVoid
 	valLambda
+	valChar
 )
 
 type pair struct {
@@ -38,6 +39,7 @@ type value struct {
 	ival   int64
 	bval   bool
 	sval   string
+	cval   rune
 	pair   *pair
 	lambda *lambda
 }
@@ -49,6 +51,7 @@ func intVal(n int64) value  { return value{kind: valInteger, ival: n} }
 func boolVal(b bool) value  { return value{kind: valBoolean, bval: b} }
 func strVal(s string) value { return value{kind: valString, sval: s} }
 func symVal(s string) value { return value{kind: valSymbol, sval: s} }
+func charVal(c rune) value  { return value{kind: valChar, cval: c} }
 func pairVal(car, cdr value) value {
 	return value{kind: valPair, pair: &pair{car: car, cdr: cdr}}
 }
@@ -72,11 +75,41 @@ func (v value) String() string {
 		return ""
 	case valPair:
 		return "(" + writePairInner(v) + ")"
+	case valChar:
+		return fmt.Sprintf("#\\%c", v.cval)
 	case valLambda:
 		return "#<procedure>"
 	default:
 		return "<unknown>"
 	}
+}
+
+// displayStr returns the display representation (no quotes on strings).
+func (v value) displayStr() string {
+	switch v.kind {
+	case valString:
+		return v.sval
+	case valPair:
+		return "(" + displayPairInner(v) + ")"
+	default:
+		return v.String()
+	}
+}
+
+func displayPairInner(v value) string {
+	var sb strings.Builder
+	sb.WriteString(v.pair.car.displayStr())
+	cdr := v.pair.cdr
+	for cdr.kind == valPair {
+		sb.WriteByte(' ')
+		sb.WriteString(cdr.pair.car.displayStr())
+		cdr = cdr.pair.cdr
+	}
+	if cdr.kind != valNull {
+		sb.WriteString(" . ")
+		sb.WriteString(cdr.displayStr())
+	}
+	return sb.String()
 }
 
 func writePairInner(v value) string {
@@ -104,6 +137,7 @@ func isTruthy(v value) bool {
 type env struct {
 	bindings map[string]value
 	parent   *env
+	output   *strings.Builder // non-nil only on root env
 }
 
 func newEnv(parent *env) *env {
@@ -122,6 +156,16 @@ func (e *env) get(name string) (value, bool) {
 
 func (e *env) set(name string, v value) {
 	e.bindings[name] = v
+}
+
+func (e *env) getOutput() *strings.Builder {
+	if e.output != nil {
+		return e.output
+	}
+	if e.parent != nil {
+		return e.parent.getOutput()
+	}
+	return nil
 }
 
 // ---------- AST ----------
@@ -423,7 +467,7 @@ func evalInEnv(e *expr, env *env) (value, error) {
 				}
 				evaledArgs[i] = v
 			}
-			return evalBuiltin(head.atom.sval, evaledArgs, e)
+			return evalBuiltin(head.atom.sval, evaledArgs, e, env)
 		}
 	}
 
@@ -561,13 +605,16 @@ func isBuiltin(name string) bool {
 	switch name {
 	case "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
 		"cons", "car", "cdr", "null?", "list", "length", "append",
-		"string?", "number?", "boolean?", "pair?", "symbol?":
+		"string?", "number?", "boolean?", "pair?", "symbol?", "char?",
+		"display", "write", "newline",
+		"string-append", "string-length", "substring", "string-ref",
+		"string->number", "number->string", "symbol->string", "string->symbol":
 		return true
 	}
 	return false
 }
 
-func evalBuiltin(name string, args []value, e *expr) (value, error) {
+func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error) {
 	switch name {
 	case "+":
 		var sum int64 = 0
@@ -750,6 +797,126 @@ func evalBuiltin(name string, args []value, e *expr) (value, error) {
 			}
 		}
 		return result, nil
+
+	case "char?":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: char?: expected 1 argument", e.line, e.col)}
+		}
+		return boolVal(args[0].kind == valChar), nil
+
+	case "display":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: display: expected 1 argument", e.line, e.col)}
+		}
+		if out := environ.getOutput(); out != nil {
+			out.WriteString(args[0].displayStr())
+		}
+		return voidVal, nil
+
+	case "write":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: write: expected 1 argument", e.line, e.col)}
+		}
+		if out := environ.getOutput(); out != nil {
+			out.WriteString(args[0].String())
+		}
+		return voidVal, nil
+
+	case "newline":
+		if len(args) != 0 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: newline: expected 0 arguments", e.line, e.col)}
+		}
+		if out := environ.getOutput(); out != nil {
+			out.WriteByte('\n')
+		}
+		return voidVal, nil
+
+	case "string-append":
+		var sb strings.Builder
+		for _, v := range args {
+			if v.kind != valString {
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-append: expected string", e.line, e.col)}
+			}
+			sb.WriteString(v.sval)
+		}
+		return strVal(sb.String()), nil
+
+	case "string-length":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-length: expected 1 argument", e.line, e.col)}
+		}
+		if args[0].kind != valString {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-length: expected string", e.line, e.col)}
+		}
+		return intVal(int64(len([]rune(args[0].sval)))), nil
+
+	case "substring":
+		if len(args) != 3 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: substring: expected 3 arguments", e.line, e.col)}
+		}
+		if args[0].kind != valString || args[1].kind != valInteger || args[2].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: substring: invalid argument types", e.line, e.col)}
+		}
+		runes := []rune(args[0].sval)
+		start, end := int(args[1].ival), int(args[2].ival)
+		if start < 0 || end < start || end > len(runes) {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: substring: index out of range", e.line, e.col)}
+		}
+		return strVal(string(runes[start:end])), nil
+
+	case "string-ref":
+		if len(args) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: expected 2 arguments", e.line, e.col)}
+		}
+		if args[0].kind != valString || args[1].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: invalid argument types", e.line, e.col)}
+		}
+		runes := []rune(args[0].sval)
+		idx := int(args[1].ival)
+		if idx < 0 || idx >= len(runes) {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: index out of range", e.line, e.col)}
+		}
+		return charVal(runes[idx]), nil
+
+	case "string->number":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string->number: expected 1 argument", e.line, e.col)}
+		}
+		if args[0].kind != valString {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string->number: expected string", e.line, e.col)}
+		}
+		n, err := strconv.ParseInt(args[0].sval, 10, 64)
+		if err != nil {
+			return boolVal(false), nil
+		}
+		return intVal(n), nil
+
+	case "number->string":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: number->string: expected 1 argument", e.line, e.col)}
+		}
+		if args[0].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: number->string: expected number", e.line, e.col)}
+		}
+		return strVal(strconv.FormatInt(args[0].ival, 10)), nil
+
+	case "symbol->string":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: symbol->string: expected 1 argument", e.line, e.col)}
+		}
+		if args[0].kind != valSymbol {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: symbol->string: expected symbol", e.line, e.col)}
+		}
+		return strVal(args[0].sval), nil
+
+	case "string->symbol":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string->symbol: expected 1 argument", e.line, e.col)}
+		}
+		if args[0].kind != valString {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string->symbol: expected string", e.line, e.col)}
+		}
+		return symVal(args[0].sval), nil
 	}
 
 	return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", e.line, e.col, name)}
@@ -939,13 +1106,12 @@ func makeTopLevelEnv() *env {
 	return e
 }
 
-func EvalStr(input string) (string, error) {
+func evalWithEnv(input string, environ *env) (string, error) {
 	tokens, err := tokenize(input)
 	if err != nil {
 		return "", err
 	}
 	p := &parser{tokens: tokens}
-	env := makeTopLevelEnv()
 
 	var lastVal value
 	hasResult := false
@@ -954,7 +1120,7 @@ func EvalStr(input string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		v, err := evalInEnv(e, env)
+		v, err := evalInEnv(e, environ)
 		if err != nil {
 			return "", err
 		}
@@ -970,7 +1136,16 @@ func EvalStr(input string) (string, error) {
 	return lastVal.String(), nil
 }
 
+func EvalStr(input string) (string, error) {
+	environ := makeTopLevelEnv()
+	environ.output = &strings.Builder{} // output captured but discarded
+	return evalWithEnv(input, environ)
+}
+
 func EvalStrWithOutput(input string) (result string, output string, err error) {
-	r, err := EvalStr(input)
-	return r, "", err
+	environ := makeTopLevelEnv()
+	var buf strings.Builder
+	environ.output = &buf
+	r, err := evalWithEnv(input, environ)
+	return r, buf.String(), err
 }
