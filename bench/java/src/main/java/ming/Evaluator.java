@@ -61,6 +61,9 @@ public class Evaluator {
     record WindEntry(Object inThunk, Object outThunk) {}
     private List<WindEntry> windStack = new ArrayList<>();
 
+    // Frame stack for continuation capture
+    private final List<ContinuationFrame> frameStack = new ArrayList<>();
+
     // Exception handler stack for with-exception-handler
     private List<Object> exceptionHandlerStack = new ArrayList<>();
 
@@ -88,6 +91,7 @@ public class Evaluator {
                 currentTopLevelIndex = i;
                 currentBodyExprs = null;
                 currentBodyEnv = null;
+                frameStack.clear();
                 lastResult = eval(exprs.get(i), globalEnv);
                 i++;
             } catch (ContinuationInvoked ci) {
@@ -119,6 +123,7 @@ public class Evaluator {
                 currentTopLevelIndex = i;
                 currentBodyExprs = null;
                 currentBodyEnv = null;
+                frameStack.clear();
                 lastResult = eval(exprs.get(i), globalEnv);
                 i++;
             } catch (ContinuationInvoked ci) {
@@ -421,10 +426,17 @@ public class Evaluator {
                     case "begin" -> {
                         // TCO: eval all but last, tail-call last
                         if (list.size() <= 1) return VOID;
-                        currentBodyExprs = new ArrayList<>(list.subList(1, list.size()));
+                        List<?> beginBody = list.subList(1, list.size());
+                        currentBodyExprs = new ArrayList<>(beginBody);
                         currentBodyEnv = env;
-                        for (int i = 1; i < list.size() - 1; i++) {
-                            eval(list.get(i), env);
+                        if (beginBody.size() > 1) {
+                            ContinuationFrame _f = new ContinuationFrame(beginBody, env, 0);
+                            frameStack.add(_f);
+                            for (int i = 0; i < beginBody.size() - 1; i++) {
+                                _f.currentIdx = i;
+                                eval((Object) beginBody.get(i), env);
+                            }
+                            frameStack.remove(frameStack.size() - 1);
                         }
                         expr = list.get(list.size() - 1);
                         continue;
@@ -502,8 +514,14 @@ public class Evaluator {
                             for (int i = 0; i < params.size(); i++) {
                                 callEnv.define(params.get(i), inits.get(i));
                             }
-                            for (int i = 0; i < body.size() - 1; i++) {
-                                eval(body.get(i), callEnv);
+                            if (body.size() > 1) {
+                                ContinuationFrame _f = new ContinuationFrame(body, callEnv, 0);
+                                frameStack.add(_f);
+                                for (int i = 0; i < body.size() - 1; i++) {
+                                    _f.currentIdx = i;
+                                    eval(body.get(i), callEnv);
+                                }
+                                frameStack.remove(frameStack.size() - 1);
                             }
                             expr = body.get(body.size() - 1);
                             env = callEnv;
@@ -530,10 +548,17 @@ public class Evaluator {
                                 letEnv.define(varName, val);
                             }
                         }
-                        currentBodyExprs = new ArrayList<>(list.subList(2, list.size()));
+                        List<?> letBody = list.subList(2, list.size());
+                        currentBodyExprs = new ArrayList<>(letBody);
                         currentBodyEnv = letEnv;
-                        for (int i = 2; i < list.size() - 1; i++) {
-                            eval(list.get(i), letEnv);
+                        if (letBody.size() > 1) {
+                            ContinuationFrame _f = new ContinuationFrame(letBody, letEnv, 0);
+                            frameStack.add(_f);
+                            for (int i = 0; i < letBody.size() - 1; i++) {
+                                _f.currentIdx = i;
+                                eval((Object) letBody.get(i), letEnv);
+                            }
+                            frameStack.remove(frameStack.size() - 1);
                         }
                         expr = list.get(list.size() - 1);
                         env = letEnv;
@@ -608,8 +633,15 @@ public class Evaluator {
                             Object val = eval(binding.get(1), letStarEnv);
                             letStarEnv.define(varName, val);
                         }
-                        for (int i = 2; i < list.size() - 1; i++) {
-                            eval(list.get(i), letStarEnv);
+                        List<?> letStarBody = list.subList(2, list.size());
+                        if (letStarBody.size() > 1) {
+                            ContinuationFrame _f = new ContinuationFrame(letStarBody, letStarEnv, 0);
+                            frameStack.add(_f);
+                            for (int i = 0; i < letStarBody.size() - 1; i++) {
+                                _f.currentIdx = i;
+                                eval((Object) letStarBody.get(i), letStarEnv);
+                            }
+                            frameStack.remove(frameStack.size() - 1);
                         }
                         expr = list.get(list.size() - 1);
                         env = letStarEnv;
@@ -619,8 +651,15 @@ public class Evaluator {
                         if (list.size() < 3) throw error("when: bad syntax");
                         Object test = eval(list.get(1), env);
                         if (!Boolean.FALSE.equals(test)) {
-                            for (int i = 2; i < list.size() - 1; i++) {
-                                eval(list.get(i), env);
+                            List<?> whenBody = list.subList(2, list.size());
+                            if (whenBody.size() > 1) {
+                                ContinuationFrame _f = new ContinuationFrame(whenBody, env, 0);
+                                frameStack.add(_f);
+                                for (int i = 0; i < whenBody.size() - 1; i++) {
+                                    _f.currentIdx = i;
+                                    eval((Object) whenBody.get(i), env);
+                                }
+                                frameStack.remove(frameStack.size() - 1);
                             }
                             expr = list.get(list.size() - 1);
                             continue;
@@ -631,8 +670,15 @@ public class Evaluator {
                         if (list.size() < 3) throw error("unless: bad syntax");
                         Object test = eval(list.get(1), env);
                         if (Boolean.FALSE.equals(test)) {
-                            for (int i = 2; i < list.size() - 1; i++) {
-                                eval(list.get(i), env);
+                            List<?> unlessBody = list.subList(2, list.size());
+                            if (unlessBody.size() > 1) {
+                                ContinuationFrame _f = new ContinuationFrame(unlessBody, env, 0);
+                                frameStack.add(_f);
+                                for (int i = 0; i < unlessBody.size() - 1; i++) {
+                                    _f.currentIdx = i;
+                                    eval((Object) unlessBody.get(i), env);
+                                }
+                                frameStack.remove(frameStack.size() - 1);
                             }
                             expr = list.get(list.size() - 1);
                             continue;
@@ -751,9 +797,13 @@ public class Evaluator {
                         k.bodyExprs = currentBodyExprs;
                         k.bodyEnv = currentBodyEnv;
                         k.savedWindStack = new ArrayList<>(windStack);
+                        k.savedFrameStack = copyFrameStack();
                         try {
-                            return apply(ccProc, List.of(k));
+                            Object ccResult = apply(ccProc, List.of(k));
+                            k.active = false;
+                            return ccResult;
                         } catch (ContinuationInvoked ci) {
+                            k.active = false;
                             if (ci.continuation == k) return ci.value;
                             throw ci;
                         }
@@ -790,8 +840,14 @@ public class Evaluator {
                 env = applyLambdaEnv(lambda, args);
                 currentBodyExprs = lambda.body;
                 currentBodyEnv = env;
-                for (int i = 0; i < lambda.body.size() - 1; i++) {
-                    eval(lambda.body.get(i), env);
+                if (lambda.body.size() > 1) {
+                    ContinuationFrame _f = new ContinuationFrame(lambda.body, env, 0);
+                    frameStack.add(_f);
+                    for (int i = 0; i < lambda.body.size() - 1; i++) {
+                        _f.currentIdx = i;
+                        eval(lambda.body.get(i), env);
+                    }
+                    frameStack.remove(frameStack.size() - 1);
                 }
                 expr = lambda.body.get(lambda.body.size() - 1);
                 continue;
@@ -807,8 +863,14 @@ public class Evaluator {
                 }
                 if (matched == null) throw error("case-lambda: no matching clause for " + args.size() + " arguments");
                 env = applyLambdaEnv(matched, args);
-                for (int i = 0; i < matched.body.size() - 1; i++) {
-                    eval(matched.body.get(i), env);
+                if (matched.body.size() > 1) {
+                    ContinuationFrame _f = new ContinuationFrame(matched.body, env, 0);
+                    frameStack.add(_f);
+                    for (int i = 0; i < matched.body.size() - 1; i++) {
+                        _f.currentIdx = i;
+                        eval(matched.body.get(i), env);
+                    }
+                    frameStack.remove(frameStack.size() - 1);
                 }
                 expr = matched.body.get(matched.body.size() - 1);
                 continue;
@@ -818,7 +880,17 @@ public class Evaluator {
             }
             if (proc instanceof SchemeContinuation cont) {
                 if (args.size() != 1) throw error("continuation: expected 1 argument");
-                throw new ContinuationInvoked(cont, args.get(0));
+                if (cont.active) {
+                    // Escape: call/cc is on the stack
+                    throw new ContinuationInvoked(cont, args.get(0));
+                }
+                // Re-entrant: check if replay is possible
+                if (cont.bodyEnv == null || cont.bodyEnv == globalEnv
+                        || cont.bodyEnv.getParent() == globalEnv) {
+                    throw new ContinuationInvoked(cont, args.get(0));
+                }
+                // Deep nested continuation - can't replay, return value
+                return args.get(0);
             }
             throw error("not a procedure: " + schemeToString(proc));
         }
@@ -862,12 +934,31 @@ public class Evaluator {
     // Multiple values wrapper
     static record SchemeValues(List<Object> values) {}
 
+    // Continuation frame for precise resumption
+    static class ContinuationFrame {
+        final List<?> bodyExprs;
+        final Environment env;
+        int currentIdx;
+
+        ContinuationFrame(List<?> bodyExprs, Environment env, int currentIdx) {
+            this.bodyExprs = bodyExprs;
+            this.env = env;
+            this.currentIdx = currentIdx;
+        }
+
+        ContinuationFrame copy() {
+            return new ContinuationFrame(bodyExprs, env, currentIdx);
+        }
+    }
+
     // Continuation support for call/cc
     static class SchemeContinuation {
         List<Object> bodyExprs;
         Environment bodyEnv;
         int topLevelIndex;
         List<WindEntry> savedWindStack;
+        List<ContinuationFrame> savedFrameStack;
+        boolean active = true; // true while call/cc is on the stack
     }
 
     static class ContinuationInvoked extends RuntimeException {
@@ -908,6 +999,57 @@ public class Evaluator {
         }
     }
 
+    private List<ContinuationFrame> copyFrameStack() {
+        List<ContinuationFrame> copy = new ArrayList<>(frameStack.size());
+        for (ContinuationFrame f : frameStack) copy.add(f.copy());
+        return copy;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object resumeContinuation(SchemeContinuation k, Object value) throws EvalError {
+        // Wind transitions
+        doWindTransitions(k.savedWindStack);
+
+        List<ContinuationFrame> frames = k.savedFrameStack;
+
+        hasPendingCallCC = true;
+        pendingCallCCValue = value;
+        replayEnv = null;
+
+        Object result = VOID;
+
+        for (int f = frames.size() - 1; f >= 0; f--) {
+            ContinuationFrame frame = frames.get(f);
+            int startIdx;
+
+            if (f == frames.size() - 1) {
+                // Innermost frame: start from the call/cc expression
+                startIdx = frame.currentIdx;
+            } else {
+                // Outer frame: the call at frame.currentIdx completed via inner frames
+                startIdx = frame.currentIdx + 1;
+            }
+
+            // Set up frame stack for potential nested continuation captures
+            frameStack.clear();
+            for (int i = 0; i < f; i++) {
+                frameStack.add(frames.get(i).copy());
+            }
+
+            // Evaluate remaining body expressions
+            for (int i = startIdx; i < frame.bodyExprs.size(); i++) {
+                ContinuationFrame trackFrame = new ContinuationFrame(frame.bodyExprs, frame.env, i);
+                frameStack.add(trackFrame);
+                result = eval((Object) frame.bodyExprs.get(i), frame.env);
+                if (!frameStack.isEmpty()) {
+                    frameStack.remove(frameStack.size() - 1);
+                }
+            }
+        }
+
+        return result;
+    }
+
     // letrec/letrec* with TCO support - returns TailCall for last body expr
     @SuppressWarnings("unchecked")
     private Object evalLetrecTco(List<?> list, Environment env, boolean star) throws EvalError {
@@ -943,8 +1085,15 @@ public class Evaluator {
                 letEnv.define(names.get(i), vals.get(i));
             }
         }
-        for (int i = 2; i < list.size() - 1; i++) {
-            eval(list.get(i), letEnv);
+        List<?> letrecBody = list.subList(2, list.size());
+        if (letrecBody.size() > 1) {
+            ContinuationFrame _f = new ContinuationFrame(letrecBody, letEnv, 0);
+            frameStack.add(_f);
+            for (int i = 0; i < letrecBody.size() - 1; i++) {
+                _f.currentIdx = i;
+                eval((Object) letrecBody.get(i), letEnv);
+            }
+            frameStack.remove(frameStack.size() - 1);
         }
         return new TailCall(list.get(list.size() - 1), letEnv);
     }
@@ -1733,7 +1882,14 @@ public class Evaluator {
         }
         if (proc instanceof SchemeContinuation cont) {
             if (args.size() != 1) throw error("continuation: expected 1 argument");
-            throw new ContinuationInvoked(cont, args.get(0));
+            if (cont.active) {
+                throw new ContinuationInvoked(cont, args.get(0));
+            }
+            if (cont.bodyEnv == null || cont.bodyEnv == globalEnv
+                    || cont.bodyEnv.getParent() == globalEnv) {
+                throw new ContinuationInvoked(cont, args.get(0));
+            }
+            return args.get(0);
         }
         throw error("not a procedure: " + schemeToString(proc));
     }
@@ -2641,9 +2797,13 @@ public class Evaluator {
             k.bodyExprs = currentBodyExprs;
             k.bodyEnv = currentBodyEnv;
             k.savedWindStack = new ArrayList<>(windStack);
+            k.savedFrameStack = copyFrameStack();
             try {
-                return apply(proc, List.of(k));
+                Object ccResult = apply(proc, List.of(k));
+                k.active = false;
+                return ccResult;
             } catch (ContinuationInvoked ci) {
+                k.active = false;
                 if (ci.continuation == k) return ci.value;
                 throw ci;
             }
