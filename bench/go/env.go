@@ -23,3 +23,15 @@ func (e *Env) Get(name string) (Value, bool) {
 func (e *Env) Set(name string, val Value) {
 	e.bindings[name] = val
 }
+
+// SetMut mutates an existing binding (walks up scope chain). Returns false if unbound.
+func (e *Env) SetMut(name string, val Value) bool {
+	if _, ok := e.bindings[name]; ok {
+		e.bindings[name] = val
+		return true
+	}
+	if e.parent != nil {
+		return e.parent.SetMut(name, val)
+	}
+	return false
+}

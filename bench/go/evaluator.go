@@ -109,6 +109,8 @@ func evalList(expr *Expr, env *Env) (Value, error) {
 			return evalBegin(expr, env)
 		case "cond":
 			return evalCond(expr, env)
+		case "set!":
+			return evalSet(expr, env)
 		}
 	}
 
@@ -579,6 +581,24 @@ func evalBegin(expr *Expr, env *Env) (Value, error) {
 		}
 	}
 	return result, nil
+}
+
+func evalSet(expr *Expr, env *Env) (Value, error) {
+	if len(expr.List) != 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: bad syntax", expr.Line, expr.Col)}
+	}
+	target := expr.List[1]
+	if target.Kind != ExprSymbol {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: expected symbol", target.Line, target.Col)}
+	}
+	val, err := eval(expr.List[2], env)
+	if err != nil {
+		return nil, err
+	}
+	if !env.SetMut(target.SVal, val) {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: unbound variable: %s", target.Line, target.Col, target.SVal)}
+	}
+	return &VoidVal{}, nil
 }
 
 func evalCond(expr *Expr, env *Env) (Value, error) {
