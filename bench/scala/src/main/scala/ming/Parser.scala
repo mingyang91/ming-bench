@@ -88,7 +88,10 @@ private[ming] class Parser(input: String):
     else
       val first = parseExpr()
       skipWhitespace()
-      if pos < input.length && input(pos) == '.' then
+      if pos < input.length && input(pos) == '.' && (pos + 1 >= input.length || input(pos + 1).isWhitespace || input(
+          pos + 1
+        ) == ')')
+      then
         advance()
         val rest = parseExpr()
         skipWhitespace()

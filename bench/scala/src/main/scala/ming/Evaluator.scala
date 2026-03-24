@@ -14,6 +14,7 @@ object Evaluator:
     case SchemeChar(c: scala.Char)
     case Void
     case Builtin(f: List[Val] => Val)
+    case MacroTransformer(expand: Val => Val)
 
   import Val.*
 
@@ -35,8 +36,8 @@ object Evaluator:
   // --- Evaluator ---
   private def eval(expr: Val, env: Env): Val =
     expr match
-      case Num(_) | Bool(_) | Str(_) | SchemeChar(_) => expr
-      case Nil                                       => Nil
+      case Num(_) | Bool(_) | Str(_) | SchemeChar(_) | Builtin(_) | MacroTransformer(_) => expr
+      case Nil                                                                          => Nil
       case Symbol(name) =>
         env.lookup(name) match
           case Some(v) => v
@@ -54,6 +55,18 @@ object Evaluator:
         Void
       case Pair(Symbol("and"), args) => evalAnd(args, env)
       case Pair(Symbol("or"), args)  => evalOr(args, env)
+      case Pair(Symbol("define-syntax"), Pair(Symbol(name), Pair(sr, Nil))) =>
+        Macros.evalDefineSyntax(name, sr, env)
+      case p @ Pair(Symbol(name), _) =>
+        env.lookup(name) match
+          case Some(MacroTransformer(expand)) =>
+            eval(expand(p), env)
+          case _ =>
+            val func = eval(Symbol(name), env)
+            val argList = toList(p match
+              case Pair(_, a) => a;
+              case _          => Nil).map(a => eval(a, env))
+            applyFunc(func, argList)
       case Pair(head, args) =>
         val func    = eval(head, env)
         val argList = toList(args).map(a => eval(a, env))
@@ -221,7 +234,7 @@ object Evaluator:
         result
       case _ => error("bad let syntax")
 
-  private def toList(v: Val): List[Val] = v match
+  private[ming] def toList(v: Val): List[Val] = v match
     case Nil            => List.empty
     case Pair(car, cdr) => car :: toList(cdr)
     case _              => error("improper list")
@@ -236,7 +249,7 @@ object Evaluator:
     case _ => error(s"not a procedure: ${Display.write(func)}")
 
   // --- Environment ---
-  private class Env(bindings: scala.collection.mutable.Map[String, Val], parent: Option[Env]):
+  private[ming] class Env(bindings: scala.collection.mutable.Map[String, Val], parent: Option[Env]):
 
     def lookup(name: String): Option[Val] =
       bindings.get(name).orElse(parent.flatMap(_.lookup(name)))
