@@ -132,6 +132,7 @@ pub enum Frame {
     ExceptionHandlerPop,
     RaiseResult,
     GuardDispatch { var_name: String, clauses: Vec<Expr>, env: Env },
+    GuardCatcher { var_name: String, clauses: Vec<Expr>, env: Env },
     CallWithValuesConsumer { consumer: Value },
     // CPS let binding: evaluate init expressions one at a time so call/cc works
     LetBind {
@@ -159,6 +160,7 @@ thread_local! {
     static WIND_STACK: RefCell<Vec<WindEntry>> = RefCell::new(Vec::new());
     static NEXT_WIND_ID: Cell<u64> = Cell::new(0);
     static EXCEPTION_HANDLERS: RefCell<Vec<Value>> = RefCell::new(Vec::new());
+    static GUARD_EXCEPTION_VALUE: RefCell<Option<Value>> = RefCell::new(None);
 }
 
 fn gcd(a: i64, b: i64) -> i64 {
@@ -662,10 +664,14 @@ fn apply_into(
             Err(EvalError::Arity(format!("no matching clause for {} arguments in case-lambda", nargs)))
         }
         Value::Continuation(cont_data) => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity("continuation expects 1 argument".into()));
+            if args.is_empty() {
+                return Err(EvalError::Arity("continuation expects at least 1 argument".into()));
             }
-            let value = args.into_iter().next().unwrap();
+            let value = if args.len() == 1 {
+                args.into_iter().next().unwrap()
+            } else {
+                Value::Values(args)
+            };
             invoke_continuation(cont_data, value, cur_expr, cur_env, stack, returning, span)
         }
         other => {
@@ -921,82 +927,164 @@ fn eval_with_stack(initial_expr: &Expr, initial_env: &Env, initial_stack: Vec<Fr
                     continue;
                 }
                 Frame::RaiseResult => {
+                    // Check if this was a guard exception handler
+                    let guard_exn = GUARD_EXCEPTION_VALUE.with(|g| g.borrow_mut().take());
+                    if let Some(exn) = guard_exn {
+                        // Unwind stack to GuardCatcher, running dynamic-wind out-thunks
+                        let mut out_thunks = Vec::new();
+                        let mut guard_info = None;
+                        while let Some(frame) = stack.pop() {
+                            match frame {
+                                Frame::GuardCatcher { var_name, clauses, env } => {
+                                    guard_info = Some((var_name, clauses, env));
+                                    break;
+                                }
+                                Frame::DynamicWindAfterBody { out_thunk, .. } => {
+                                    WIND_STACK.with(|w| w.borrow_mut().pop());
+                                    out_thunks.push(out_thunk);
+                                }
+                                Frame::ExceptionHandlerPop => {
+                                    EXCEPTION_HANDLERS.with(|h| h.borrow_mut().pop());
+                                }
+                                _ => {} // drop frame
+                            }
+                        }
+                        let (var_name, clauses, env) = guard_info
+                            .ok_or_else(|| EvalError::Runtime("guard catcher not found".into()))?;
+                        // Run dynamic-wind out-thunks
+                        for thunk in &out_thunks {
+                            let _ = apply_func(thunk, vec![]);
+                        }
+                        // Dispatch guard clauses
+                        let local_env = Env::child(&env);
+                        local_env.define(var_name, exn.clone());
+                        let mut matched = false;
+                        for clause in &clauses {
+                            match &clause.kind {
+                                ExprKind::List(parts) if !parts.is_empty() => {
+                                    let is_else = matches!(&parts[0].kind, ExprKind::Symbol(s) if s == "else");
+                                    if is_else {
+                                        if parts.len() >= 2 {
+                                            if parts.len() > 2 {
+                                                stack.push(Frame::Seq { remaining: parts[2..].to_vec(), env: local_env.clone() });
+                                            }
+                                            cur_expr = parts[1].clone();
+                                            cur_env = local_env.clone();
+                                        } else {
+                                            returning = Some(Value::Void);
+                                        }
+                                        matched = true;
+                                        break;
+                                    }
+                                    let test_val = eval(&parts[0], &local_env)?;
+                                    if test_val.is_truthy() {
+                                        if parts.len() >= 2 {
+                                            if parts.len() > 2 {
+                                                stack.push(Frame::Seq { remaining: parts[2..].to_vec(), env: local_env.clone() });
+                                            }
+                                            cur_expr = parts[1].clone();
+                                            cur_env = local_env.clone();
+                                        } else {
+                                            returning = Some(test_val);
+                                        }
+                                        matched = true;
+                                        break;
+                                    }
+                                }
+                                _ => return Err(EvalError::Runtime("guard: bad clause".into())),
+                            }
+                        }
+                        if !matched {
+                            // Re-raise the exception
+                            let handler = EXCEPTION_HANDLERS.with(|h| h.borrow_mut().pop());
+                            let s = cur_expr.span;
+                            if let Some(handler) = handler {
+                                stack.push(Frame::RaiseResult);
+                                apply_into(handler, vec![exn], &mut cur_expr, &mut cur_env, &mut stack, &mut returning, s)?;
+                            } else {
+                                return Err(EvalError::Runtime(format!("unhandled exception: {}", exn.to_display())));
+                            }
+                        }
+                        continue;
+                    }
                     return Err(EvalError::Runtime("handler returned from non-continuable exception".into()));
                 }
                 Frame::GuardDispatch { var_name, clauses, env } => {
-                    // val is a pair: (#t . result) or (#f . exn)
-                    match &val {
+                    // Exception path: val is (cons #f exn) from handler via guard-k
+                    // Normal path: val is the body result directly (tail position)
+                    let is_exception = match &val {
                         Value::Pair(p) => {
-                            let (car, cdr) = { let b = p.borrow(); (b.0.clone(), b.1.clone()) };
-                            match &car {
-                                Value::Boolean(true) => {
-                                    returning = Some(cdr);
-                                    continue;
-                                }
-                                Value::Boolean(false) => {
-                                    let exn = cdr;
-                                    let local_env = Env::child(&env);
-                                    local_env.define(var_name, exn.clone());
-                                    let mut matched = false;
-                                    for clause in &clauses {
-                                        match &clause.kind {
-                                            ExprKind::List(parts) if !parts.is_empty() => {
-                                                let is_else = matches!(&parts[0].kind, ExprKind::Symbol(s) if s == "else");
-                                                if is_else {
-                                                    if parts.len() >= 2 {
-                                                        if parts.len() > 2 {
-                                                            stack.push(Frame::Seq { remaining: parts[2..].to_vec(), env: local_env.clone() });
-                                                        }
-                                                        cur_expr = parts[1].clone();
-                                                        cur_env = local_env.clone();
-                                                    } else {
-                                                        returning = Some(Value::Void);
-                                                    }
-                                                    matched = true;
-                                                    break;
-                                                }
-                                                let test_val = eval(&parts[0], &local_env)?;
-                                                if test_val.is_truthy() {
-                                                    if parts.len() >= 2 {
-                                                        if parts.len() > 2 {
-                                                            stack.push(Frame::Seq { remaining: parts[2..].to_vec(), env: local_env.clone() });
-                                                        }
-                                                        cur_expr = parts[1].clone();
-                                                        cur_env = local_env.clone();
-                                                    } else {
-                                                        returning = Some(test_val);
-                                                    }
-                                                    matched = true;
-                                                    break;
-                                                }
+                            let b = p.borrow();
+                            matches!(&b.0, Value::Boolean(false))
+                        }
+                        _ => false,
+                    };
+                    if is_exception {
+                        let exn = match &val {
+                            Value::Pair(p) => p.borrow().1.clone(),
+                            _ => unreachable!(),
+                        };
+                        let local_env = Env::child(&env);
+                        local_env.define(var_name, exn.clone());
+                        let mut matched = false;
+                        for clause in &clauses {
+                            match &clause.kind {
+                                ExprKind::List(parts) if !parts.is_empty() => {
+                                    let is_else = matches!(&parts[0].kind, ExprKind::Symbol(s) if s == "else");
+                                    if is_else {
+                                        if parts.len() >= 2 {
+                                            if parts.len() > 2 {
+                                                stack.push(Frame::Seq { remaining: parts[2..].to_vec(), env: local_env.clone() });
                                             }
-                                            _ => return Err(EvalError::Runtime("guard: bad clause".into())),
-                                        }
-                                    }
-                                    if !matched {
-                                        // Re-raise the exception
-                                        let handler = EXCEPTION_HANDLERS.with(|h| h.borrow_mut().pop());
-                                        let s = cur_expr.span;
-                                        if let Some(handler) = handler {
-                                            stack.push(Frame::RaiseResult);
-                                            apply_into(handler, vec![exn], &mut cur_expr, &mut cur_env, &mut stack, &mut returning, s)?;
+                                            cur_expr = parts[1].clone();
+                                            cur_env = local_env.clone();
                                         } else {
-                                            return Err(EvalError::Runtime(format!("unhandled exception: {}", exn.to_display())));
+                                            returning = Some(Value::Void);
                                         }
+                                        matched = true;
+                                        break;
                                     }
-                                    continue;
+                                    let test_val = eval(&parts[0], &local_env)?;
+                                    if test_val.is_truthy() {
+                                        if parts.len() >= 2 {
+                                            if parts.len() > 2 {
+                                                stack.push(Frame::Seq { remaining: parts[2..].to_vec(), env: local_env.clone() });
+                                            }
+                                            cur_expr = parts[1].clone();
+                                            cur_env = local_env.clone();
+                                        } else {
+                                            returning = Some(test_val);
+                                        }
+                                        matched = true;
+                                        break;
+                                    }
                                 }
-                                _ => {
-                                    returning = Some(val);
-                                    continue;
-                                }
+                                _ => return Err(EvalError::Runtime("guard: bad clause".into())),
                             }
                         }
-                        _ => {
-                            returning = Some(val);
-                            continue;
+                        if !matched {
+                            // Re-raise the exception
+                            let handler = EXCEPTION_HANDLERS.with(|h| h.borrow_mut().pop());
+                            let s = cur_expr.span;
+                            if let Some(handler) = handler {
+                                stack.push(Frame::RaiseResult);
+                                apply_into(handler, vec![exn], &mut cur_expr, &mut cur_env, &mut stack, &mut returning, s)?;
+                            } else {
+                                return Err(EvalError::Runtime(format!("unhandled exception: {}", exn.to_display())));
+                            }
                         }
+                        continue;
+                    } else {
+                        // Normal body return — pass through directly
+                        returning = Some(val);
+                        continue;
                     }
+                }
+                Frame::GuardCatcher { var_name: _, clauses: _, env: _ } => {
+                    // Normal body return — pop our exception handler, pass value through
+                    EXCEPTION_HANDLERS.with(|h| h.borrow_mut().pop());
+                    returning = Some(val);
+                    continue;
                 }
                 Frame::CallWithValuesConsumer { consumer } => {
                     let args = match val {
@@ -1535,43 +1623,21 @@ fn eval_with_stack(initial_expr: &Expr, initial_env: &Env, initial_stack: Vec<Fr
                     let clauses = guard_spec[1..].to_vec();
                     let body = args[1..].to_vec();
 
-                    // Generate unique names for the expansion
-                    let guard_k = gensym("guard-k");
-                    let guard_exn = gensym("guard-exn");
-
-                    let s = |name: &str| Expr { kind: ExprKind::Symbol(name.to_string()), span };
-                    let l = |items: Vec<Expr>| Expr { kind: ExprKind::List(items), span };
-
                     // Build body expression: (begin body ...) or just body[0]
                     let body_expr = if body.len() == 1 {
                         body[0].clone()
                     } else {
+                        let s = |name: &str| Expr { kind: ExprKind::Symbol(name.to_string()), span };
+                        let l = |items: Vec<Expr>| Expr { kind: ExprKind::List(items), span };
                         let mut begin_items = vec![s("begin")];
                         begin_items.extend(body);
                         l(begin_items)
                     };
 
-                    // (cons #t body-result)
-                    let normal_result = l(vec![s("cons"), Expr { kind: ExprKind::Boolean(true), span }, body_expr]);
-                    // (__guard-k (cons #t body-result))
-                    let normal_call = l(vec![s(&guard_k), normal_result]);
-                    // (cons #f __exn)
-                    let exn_result = l(vec![s("cons"), Expr { kind: ExprKind::Boolean(false), span }, s(&guard_exn)]);
-                    // (__guard-k (cons #f __exn))
-                    let exn_call = l(vec![s(&guard_k), exn_result]);
-                    // (lambda (__exn) (__guard-k (cons #f __exn)))
-                    let handler_lambda = l(vec![s("lambda"), l(vec![s(&guard_exn)]), exn_call]);
-                    // (lambda () (__guard-k (cons #t (begin body ...))))
-                    let body_lambda = l(vec![s("lambda"), l(vec![]), normal_call]);
-                    // (with-exception-handler handler body-lambda)
-                    let weh_call = l(vec![s("with-exception-handler"), handler_lambda, body_lambda]);
-                    // (lambda (__guard-k) (with-exception-handler ...))
-                    let callcc_lambda = l(vec![s("lambda"), l(vec![s(&guard_k)]), weh_call]);
-                    // (call/cc (lambda (__guard-k) ...))
-                    let callcc_expr = l(vec![s("call/cc"), callcc_lambda]);
-
-                    stack.push(Frame::GuardDispatch { var_name, clauses, env: cur_env.clone() });
-                    cur_expr = callcc_expr;
+                    // Direct guard: push catcher, install handler, evaluate body in tail position
+                    stack.push(Frame::GuardCatcher { var_name, clauses, env: cur_env.clone() });
+                    EXCEPTION_HANDLERS.with(|h| h.borrow_mut().push(Value::Builtin("__guard-exception".to_string())));
+                    cur_expr = body_expr;
                     continue;
                 }
                 _ => {} // not a special form, fall through
@@ -1762,11 +1828,16 @@ fn eval_case_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalE
 fn apply_func(func: &Value, args: Vec<Value>) -> Result<Value, EvalError> {
     match func {
         Value::Continuation(cont_data) => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity("continuation expects 1 argument".into()));
+            if args.is_empty() {
+                return Err(EvalError::Arity("continuation expects at least 1 argument".into()));
             }
+            let value = if args.len() == 1 {
+                args.into_iter().next().unwrap()
+            } else {
+                Value::Values(args)
+            };
             CONTINUATION_JUMP.with(|c| {
-                *c.borrow_mut() = Some((cont_data.as_ref().clone(), args.into_iter().next().unwrap()));
+                *c.borrow_mut() = Some((cont_data.as_ref().clone(), value));
             });
             Err(EvalError::ContinuationReturn)
         }
@@ -2223,11 +2294,11 @@ fn eval_do(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
         }
 
         // Evaluate step expressions (parallel update)
-        let new_values: Vec<Value> = var_names.iter().zip(step_exprs.iter()).zip(values.iter())
-            .map(|((_, step), old_val)| {
+        let new_values: Vec<Value> = var_names.iter().zip(step_exprs.iter())
+            .map(|(name, step)| {
                 match step {
                     Some(expr) => eval(expr, &iter_env),
-                    None => Ok(old_val.clone()),
+                    None => Ok(iter_env.get(name).unwrap()),
                 }
             })
             .collect::<Result<_, _>>()?;
@@ -2242,6 +2313,11 @@ fn apply_builtin(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
     };
 
     match name {
+        "__guard-exception" => {
+            if args.len() != 1 { return Err(EvalError::Arity("__guard-exception requires 1 argument".into())); }
+            GUARD_EXCEPTION_VALUE.with(|g| *g.borrow_mut() = Some(args[0].clone()));
+            return Ok(Value::Void);
+        }
         "+" => {
             let mut acc = to_num(&Value::Integer(0))?;
             for a in args {
