@@ -31,6 +31,7 @@ const (
 	valCaseLambda
 	valVector
 	valTailCall
+	valContinuation
 )
 
 type tailCall struct {
@@ -92,6 +93,7 @@ type value struct {
 	clauses []*lambda   // case-lambda clauses
 	vec     *[]value   // vector storage (mutable)
 	tc      *tailCall  // tail call info (for valTailCall)
+	cont    kont       // for valContinuation
 }
 
 var voidVal = value{kind: valVoid}
@@ -237,6 +239,8 @@ func (v value) String() string {
 		return "#<procedure>"
 	case valCaseLambda:
 		return "#<procedure>"
+	case valContinuation:
+		return "#<continuation>"
 	case valVector:
 		var sb strings.Builder
 		sb.WriteString("#(")
@@ -1048,7 +1052,8 @@ func isBuiltin(name string) bool {
 		"gcd", "lcm", "truncate", "round",
 		"make-string", "string", "string>?", "string<=?", "string>=?",
 		"memv", "assv", "member",
-		"caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "cadddr":
+		"caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "cadddr",
+		"call/cc", "call-with-current-continuation":
 		return true
 	}
 	return false
@@ -1337,7 +1342,7 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: procedure?: expected 1 argument", e.line, e.col)}
 		}
 		k := args[0].kind
-		return boolVal(k == valLambda || k == valBuiltin || k == valCaseLambda), nil
+		return boolVal(k == valLambda || k == valBuiltin || k == valCaseLambda || k == valContinuation), nil
 
 	case "append":
 		if len(args) == 0 {
@@ -3294,6 +3299,7 @@ func makeTopLevelEnv() *env {
 		"make-string", "string", "string>?", "string<=?", "string>=?",
 		"memv", "assv", "member",
 		"caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "cadddr",
+		"call/cc", "call-with-current-continuation",
 	}
 	for _, name := range builtins {
 		e.set(name, builtinVal(name))
@@ -3308,27 +3314,23 @@ func evalWithEnv(input string, environ *env) (string, error) {
 	}
 	p := &parser{tokens: tokens}
 
-	var lastVal value
-	hasResult := false
+	var exprs []*expr
 	for p.peek().kind != tokEOF {
 		e, err := p.parseExpr()
 		if err != nil {
 			return "", err
 		}
-		v, err := evalInEnv(e, environ)
-		if err != nil {
-			return "", err
-		}
-		if v.kind != valVoid {
-			lastVal = v
-			hasResult = true
-		}
+		exprs = append(exprs, e)
 	}
 
-	if !hasResult {
+	val, err := cekEvalProgram(exprs, environ)
+	if err != nil {
+		return "", err
+	}
+	if val.kind == valVoid {
 		return "", nil
 	}
-	return lastVal.String(), nil
+	return val.String(), nil
 }
 
 func EvalStr(input string) (string, error) {
