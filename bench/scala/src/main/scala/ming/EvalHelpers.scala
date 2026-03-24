@@ -59,4 +59,36 @@ object EvalHelpers:
     case Expr.StrLit(s)    => SchemeVal.StrVal(s.toCharArray)
     case Expr.CharLit(c)   => SchemeVal.CharVal(c)
     case Expr.Symbol(n)    => SchemeVal.SymVal(n)
-    case Expr.SList(es)    => SchemeVal.schemeList(es.map(quoteToVal))
+    case Expr.SList(es) =>
+      val dotIdx = es.indexWhere { case Expr.Symbol(".") => true; case _ => false }
+      if dotIdx >= 0 && dotIdx == es.length - 2 then
+        val heads = es.take(dotIdx).map(quoteToVal)
+        val tail  = quoteToVal(es.last)
+        heads.foldRight(tail)((h, t) => SchemeVal.PairVal(new MutablePair(h, t)))
+      else SchemeVal.schemeList(es.map(quoteToVal))
+
+  def evalQuasiquote(expr: Expr, env: Env): SchemeVal = expr match
+    case Expr.SList(List(Expr.Symbol("unquote"), inner)) =>
+      Evaluator.eval(inner, env)
+    case Expr.SList(es) =>
+      val dotIdx = es.indexWhere { case Expr.Symbol(".") => true; case _ => false }
+      if dotIdx >= 0 && dotIdx == es.length - 2 then
+        val heads = es.take(dotIdx).flatMap(expandQQElement(_, env))
+        val tail  = evalQuasiquote(es.last, env)
+        heads.foldRight(tail)((h, t) => SchemeVal.PairVal(new MutablePair(h, t)))
+      else
+        val expanded = es.flatMap(expandQQElement(_, env))
+        SchemeVal.schemeList(expanded)
+    case _ => quoteToVal(expr)
+
+  private def expandQQElement(expr: Expr, env: Env): List[SchemeVal] = expr match
+    case Expr.SList(List(Expr.Symbol("unquote"), inner)) =>
+      List(Evaluator.eval(inner, env))
+    case Expr.SList(List(Expr.Symbol("unquote-splicing"), inner)) =>
+      val v = Evaluator.eval(inner, env)
+      v match
+        case SchemeVal.ListVal(Nil)   => Nil
+        case SchemeVal.ListVal(elems) => elems
+        case SchemeVal.PairVal(_)     => SchemeVal.toScalaList(v)
+        case _                        => throw new EvalError(s"unquote-splicing: expected list, got ${v.display}")
+    case _ => List(evalQuasiquote(expr, env))

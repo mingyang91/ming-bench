@@ -74,6 +74,16 @@ object Parser:
         case '\'' =>
           buf += Token("'", line, col)
           i += 1; col += 1
+        case '`' =>
+          buf += Token("`", line, col)
+          i += 1; col += 1
+        case ',' =>
+          if i + 1 < input.length && input(i + 1) == '@' then
+            buf += Token(",@", line, col)
+            i += 2; col += 2
+          else
+            buf += Token(",", line, col)
+            i += 1; col += 1
         case '#' if i + 1 < input.length && input(i + 1) == '\'' =>
           buf += Token("#'", line, col)
           i += 2; col += 2
@@ -128,6 +138,21 @@ object Parser:
       case "#'" =>
         val (inner, next) = parseExpr(tokens, pos + 1)
         val expr          = Expr.SList(List(Expr.Symbol("syntax"), inner))
+        positions.put(expr, (tok.line, tok.col))
+        (expr, next)
+      case "`" =>
+        val (inner, next) = parseExpr(tokens, pos + 1)
+        val expr          = Expr.SList(List(Expr.Symbol("quasiquote"), inner))
+        positions.put(expr, (tok.line, tok.col))
+        (expr, next)
+      case "," =>
+        val (inner, next) = parseExpr(tokens, pos + 1)
+        val expr          = Expr.SList(List(Expr.Symbol("unquote"), inner))
+        positions.put(expr, (tok.line, tok.col))
+        (expr, next)
+      case ",@" =>
+        val (inner, next) = parseExpr(tokens, pos + 1)
+        val expr          = Expr.SList(List(Expr.Symbol("unquote-splicing"), inner))
         positions.put(expr, (tok.line, tok.col))
         (expr, next)
       case _ =>

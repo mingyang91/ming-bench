@@ -161,6 +161,8 @@ object Evaluator:
     case Nil => SchemeVal.ListVal(Nil)
     case Expr.Symbol("quote") :: arg :: Nil =>
       EvalHelpers.quoteToVal(arg)
+    case Expr.Symbol("quasiquote") :: arg :: Nil =>
+      EvalHelpers.evalQuasiquote(arg, env)
     case Expr.Symbol("if") :: cond :: thenBr :: elseBr :: Nil =>
       if isTruthy(eval(cond, env)) then SchemeVal.TailCall(thenBr, env)
       else SchemeVal.TailCall(elseBr, env)
@@ -293,6 +295,5 @@ object Evaluator:
     val exprs  = Parser.parse(input)
     val env    = Builtins.makeGlobalEnv()
     val result = evalBody(exprs, env).display
-    val output = buf.toString
-    buf.clear()
+    val output = buf.toString; buf.clear()
     (result, output)

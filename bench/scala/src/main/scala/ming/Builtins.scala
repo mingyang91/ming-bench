@@ -137,13 +137,17 @@ object Builtins:
       "append",
       args =>
         if args.isEmpty then SchemeVal.ListVal(Nil)
+        else if args.length == 1 then args.head
         else
-          val lists = args.map {
+          val init = args.init.map {
             case v @ (SchemeVal.PairVal(_) | SchemeVal.ListVal(_)) => SchemeVal.toScalaList(v)
             case other =>
               throw new EvalError(s"append: expected list, got ${other.display}")
           }
-          SchemeVal.schemeList(lists.flatten)
+          val allHeads = init.flatten
+          val last     = args.last
+          if allHeads.isEmpty then last
+          else allHeads.foldRight(last)((h, t) => SchemeVal.PairVal(new MutablePair(h, t)))
     ),
     "set-car!" -> SchemeVal.BuiltinProc(
       "set-car!",

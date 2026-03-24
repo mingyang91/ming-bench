@@ -103,6 +103,13 @@ object ListSearchBuiltins:
         case _              => throw new EvalError("memq: expected (key, list)")
       }
     ),
+    "memv" -> SchemeVal.BuiltinProc(
+      "memv",
+      {
+        case List(key, lst) => memqHelper(key, lst, Equality.eqvCheck)
+        case _              => throw new EvalError("memv: expected (key, list)")
+      }
+    ),
     "member" -> SchemeVal.BuiltinProc(
       "member",
       {
