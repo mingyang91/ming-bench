@@ -209,6 +209,18 @@ public class Evaluator {
         }
     }
 
+    // --- Exception handling (raise/guard/with-exception-handler) ---
+
+    private static class SchemeException extends RuntimeException {
+        final Object value;
+        SchemeException(Object value) {
+            super(null, null, true, false);
+            this.value = value;
+        }
+    }
+
+    private final List<java.util.function.Function<Object, Object>> exceptionHandlerStack = new ArrayList<>();
+
     private List<Object> allTopLevelExprs;
     private int currentTopLevelIndex;
     private boolean replaying;
@@ -242,6 +254,8 @@ public class Evaluator {
             } catch (ContinuationInvoked ci) {
                 lastResult = replayContinuation(ci, exprs);
                 i = (ci.cont.bodyExprs == exprs) ? exprs.size() : ci.cont.topLevelIndex + 1;
+            } catch (SchemeException se) {
+                throw new EvalError("unhandled exception: " + schemeToString(se.value));
             }
         }
         if (lastResult == null) {
@@ -278,6 +292,8 @@ public class Evaluator {
             } catch (ContinuationInvoked ci) {
                 lastResult = replayContinuation(ci, exprs);
                 i = (ci.cont.bodyExprs == exprs) ? exprs.size() : ci.cont.topLevelIndex + 1;
+            } catch (SchemeException se) {
+                throw new EvalError("unhandled exception: " + schemeToString(se.value));
             }
         }
         String output = outputBuffer.toString();
@@ -350,7 +366,9 @@ public class Evaluator {
         "call-with-input-file", "call-with-output-file",
         "input-port?", "output-port?", "current-input-port", "current-output-port",
         "open-input-file", "open-output-file", "close-input-port", "close-output-port",
-        "eof-object?", "read", "read-char", "peek-char"
+        "eof-object?", "read", "read-char", "peek-char",
+        "with-exception-handler", "raise", "raise-continuable",
+        "error", "error-object-message", "error-object?"
     };
 
     private Env makeTopLevelEnv() {
@@ -1083,6 +1101,47 @@ public class Evaluator {
                             expr = list.get(list.size() - 1); continue;
                         }
                         return VOID;
+                    }
+                    case "guard" -> {
+                        // (guard (var clause...) body...)
+                        if (list.size() < 3) throw new EvalError(posStr() + "guard: bad syntax");
+                        Object clauseSpec = unwrap(list.get(1));
+                        if (!(clauseSpec instanceof List<?> clauseList) || clauseList.size() < 2)
+                            throw new EvalError(posStr() + "guard: bad syntax");
+                        String exnVar = (String) unwrap(clauseList.get(0));
+                        List<Object> clauses = new ArrayList<>();
+                        for (int ci = 1; ci < clauseList.size(); ci++) clauses.add(clauseList.get(ci));
+                        List<Object> bodyExprs = new ArrayList<>();
+                        for (int bi = 2; bi < list.size(); bi++) bodyExprs.add(list.get(bi));
+
+                        try {
+                            Object result = null;
+                            for (int bi = 0; bi < bodyExprs.size(); bi++) {
+                                result = eval(bodyExprs.get(bi), env);
+                            }
+                            return result;
+                        } catch (SchemeException se) {
+                            Env guardEnv = new Env(env);
+                            guardEnv.define(exnVar, se.value);
+                            for (Object clause : clauses) {
+                                List<?> cl = (List<?>) unwrap(clause);
+                                Object test = unwrap(cl.get(0));
+                                if (test instanceof String s && s.equals("else")) {
+                                    Object r = null;
+                                    for (int ei = 1; ei < cl.size(); ei++) r = eval(cl.get(ei), guardEnv);
+                                    return r;
+                                }
+                                Object testResult = eval(test, guardEnv);
+                                if (!isFalse(testResult)) {
+                                    if (cl.size() == 1) return testResult;
+                                    Object r = null;
+                                    for (int ei = 1; ei < cl.size(); ei++) r = eval(cl.get(ei), guardEnv);
+                                    return r;
+                                }
+                            }
+                            // No clause matched, re-raise
+                            throw se;
+                        }
                     }
                     case "quasiquote" -> {
                         if (list.size() != 2) throw new EvalError(posStr() + "quasiquote: bad syntax");
@@ -2224,6 +2283,9 @@ public class Evaluator {
                 } catch (ContinuationInvoked ci) {
                     applyProcedure(outThunk, List.of());
                     throw ci;
+                } catch (SchemeException se) {
+                    applyProcedure(outThunk, List.of());
+                    throw se;
                 }
                 applyProcedure(outThunk, List.of());
                 return result;
@@ -2261,6 +2323,51 @@ public class Evaluator {
             case "current-input-port", "current-output-port" -> {
                 requireArgCount(op, args, 0);
                 return Boolean.FALSE; // stub
+            }
+            case "with-exception-handler" -> {
+                requireArgCount(op, args, 2);
+                Object handler = args.get(0);
+                Object thunk = args.get(1);
+                java.util.function.Function<Object, Object> handlerFn = (val) -> {
+                    try {
+                        return applyProcedure(handler, List.of(val));
+                    } catch (EvalError e) {
+                        throw new RuntimeException(e);
+                    }
+                };
+                exceptionHandlerStack.add(handlerFn);
+                try {
+                    return applyProcedure(thunk, List.of());
+                } catch (SchemeException se) {
+                    exceptionHandlerStack.remove(exceptionHandlerStack.size() - 1);
+                    return applyProcedure(handler, List.of(se.value));
+                } finally {
+                    if (!exceptionHandlerStack.isEmpty() && exceptionHandlerStack.get(exceptionHandlerStack.size() - 1) == handlerFn) {
+                        exceptionHandlerStack.remove(exceptionHandlerStack.size() - 1);
+                    }
+                }
+            }
+            case "raise", "raise-continuable" -> {
+                requireArgCount(op, args, 1);
+                Object val = args.get(0);
+                if (!exceptionHandlerStack.isEmpty()) {
+                    var handler = exceptionHandlerStack.get(exceptionHandlerStack.size() - 1);
+                    exceptionHandlerStack.remove(exceptionHandlerStack.size() - 1);
+                    try {
+                        handler.apply(val);
+                    } finally {
+                        // don't re-add - handler is popped per R7RS
+                    }
+                }
+                throw new SchemeException(val);
+            }
+            case "error-object-message" -> {
+                requireArgCount(op, args, 1);
+                return new SchemeString("error", false);
+            }
+            case "error-object?" -> {
+                requireArgCount(op, args, 1);
+                return Boolean.FALSE;
             }
             default -> throw new EvalError(posStr() + "unbound variable: " + op);
         }
