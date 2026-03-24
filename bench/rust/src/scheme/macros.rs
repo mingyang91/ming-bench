@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::{
     env_get, env_set, Env, EvalError, Expr, PatternBinding, Pos, Value, BUILTINS, SPECIAL_FORMS,
 };
+use super::forms::eval_lambda;
 
 static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -30,38 +31,38 @@ pub(super) fn eval_define_syntax(
             )))
         }
     };
-    let (literals, rules) = match &args[1] {
+    match &args[1] {
         Expr::List(elems, _) if !elems.is_empty() => {
             if let Expr::Symbol(s, _) = &elems[0] {
                 if s == "syntax-rules" {
-                    parse_syntax_rules(&elems[1..], call_pos)?
-                } else {
-                    return Err(EvalError::Parse(format!(
-                        "{call_pos}: define-syntax: expected syntax-rules"
-                    )));
+                    let (literals, rules) = parse_syntax_rules(&elems[1..], call_pos)?;
+                    env_set(
+                        env,
+                        name,
+                        Value::Macro {
+                            literals,
+                            rules,
+                            def_env: env.clone(),
+                        },
+                    );
+                    return Ok(Value::Void);
+                } else if s == "lambda" {
+                    // syntax-case transformer: (lambda (stx) body ...)
+                    let transformer = eval_lambda(&elems[1..], call_pos, env)?;
+                    env_set(
+                        env,
+                        name,
+                        Value::MacroTransformer(Box::new(transformer)),
+                    );
+                    return Ok(Value::Void);
                 }
-            } else {
-                return Err(EvalError::Parse(format!(
-                    "{call_pos}: define-syntax: expected syntax-rules"
-                )));
             }
         }
-        _ => {
-            return Err(EvalError::Parse(format!(
-                "{call_pos}: define-syntax: expected syntax-rules"
-            )))
-        }
-    };
-    env_set(
-        env,
-        name,
-        Value::Macro {
-            literals,
-            rules,
-            def_env: env.clone(),
-        },
-    );
-    Ok(Value::Void)
+        _ => {}
+    }
+    Err(EvalError::Parse(format!(
+        "{call_pos}: define-syntax: expected syntax-rules or lambda"
+    )))
 }
 
 type SyntaxRulesResult = Result<(Vec<String>, Vec<(Expr, Expr)>), EvalError>;
@@ -108,7 +109,7 @@ fn parse_syntax_rules(args: &[Expr], call_pos: Pos) -> SyntaxRulesResult {
     Ok((literals, rules))
 }
 
-fn match_pattern(
+pub(super) fn match_pattern(
     pattern: &Expr,
     input: &Expr,
     literals: &[String],
@@ -264,6 +265,12 @@ fn collect_free_inner(
             }
         }
         Expr::List(elems, _) => {
+            // Skip inside quote forms — quoted symbols are data, not free references
+            if let Some(Expr::Symbol(s, _)) = elems.first() {
+                if s == "quote" {
+                    return;
+                }
+            }
             for e in elems {
                 collect_free_inner(e, pattern_vars, special, builtins, result);
             }
@@ -308,6 +315,12 @@ fn expand_template(
             template.clone()
         }
         Expr::List(elems, pos) => {
+            // Don't expand inside quote forms
+            if let Some(Expr::Symbol(s, _)) = elems.first() {
+                if s == "quote" {
+                    return template.clone();
+                }
+            }
             let mut result = Vec::new();
             let mut i = 0;
             while i < elems.len() {
@@ -358,6 +371,86 @@ fn index_bindings(
         }
     }
     new_bindings
+}
+
+/// Expand a `syntax` (aka `#'`) template form using pattern variable bindings from the environment.
+/// Returns the expanded Expr and hygiene bindings.
+pub(super) fn expand_syntax_form(
+    template: &Expr,
+    env: &Env,
+) -> (Expr, Vec<(String, Value)>) {
+    // Collect pattern bindings from environment (SyntaxObject / SyntaxList entries)
+    let mut bindings = HashMap::new();
+    collect_syntax_env_bindings(template, env, &mut bindings);
+
+    let pattern_vars: HashSet<String> = bindings.keys().cloned().collect();
+    let free_syms = collect_template_free_symbols(template, &pattern_vars);
+
+    let mut hygiene_map = HashMap::new();
+    let mut hygiene_bindings = Vec::new();
+    for sym in &free_syms {
+        let gs = gensym(sym);
+        hygiene_map.insert(sym.clone(), gs.clone());
+        if let Some(val) = env_get(env, sym) {
+            hygiene_bindings.push((gs, val));
+        }
+    }
+
+    let expanded = expand_template(template, &bindings, &hygiene_map);
+    (expanded, hygiene_bindings)
+}
+
+fn collect_syntax_env_bindings(
+    template: &Expr,
+    env: &Env,
+    bindings: &mut HashMap<String, PatternBinding>,
+) {
+    match template {
+        Expr::Symbol(name, _) => {
+            if name != "..." && !bindings.contains_key(name) {
+                if let Some(val) = env_get(env, name) {
+                    match val {
+                        Value::SyntaxObject(expr, _) => {
+                            bindings.insert(name.clone(), PatternBinding::Single(*expr));
+                        }
+                        Value::SyntaxList(exprs) => {
+                            bindings.insert(name.clone(), PatternBinding::Repeated(exprs));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Expr::List(elems, _) => {
+            // Skip inside quote forms
+            if let Some(Expr::Symbol(s, _)) = elems.first() {
+                if s == "quote" {
+                    return;
+                }
+            }
+            for e in elems {
+                collect_syntax_env_bindings(e, env, bindings);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Convert a Value back to an Expr (inverse of expr_to_value).
+pub(super) fn value_to_expr(val: &Value) -> Expr {
+    let p = super::parser::Pos::default();
+    match val {
+        Value::Integer(n) => Expr::Integer(*n, p),
+        Value::Float(f) => Expr::Float(*f, p),
+        Value::Rational(n, d) => Expr::Rational(*n, *d, p),
+        Value::Boolean(b) => Expr::Boolean(*b, p),
+        Value::Str(s) => Expr::Str(s.clone(), p),
+        Value::Symbol(s) => Expr::Symbol(s.clone(), p),
+        Value::Char(c) => Expr::Char(*c, p),
+        Value::List(elems) => Expr::List(elems.iter().map(value_to_expr).collect(), p),
+        Value::SyntaxObject(expr, _) => (**expr).clone(),
+        _ => Expr::Symbol(format!("{val}"), p),
+    }
 }
 
 pub(super) fn expand_macro(

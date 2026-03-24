@@ -112,6 +112,39 @@ fn advance_pair(v: &Value) -> Option<Value> {
     }
 }
 
+/// Convert a list-like value (List or pair chain) to a Vec.
+/// Returns None if not a proper list.
+pub(super) fn to_list_vec(val: &Value) -> Option<Vec<Value>> {
+    match val {
+        Value::List(elems) => Some(elems.clone()),
+        Value::Pair(_) => {
+            let mut result = Vec::new();
+            let mut cur = val.clone();
+            loop {
+                match &cur {
+                    Value::List(elems) => {
+                        if elems.is_empty() {
+                            return Some(result);
+                        }
+                        result.extend(elems.iter().cloned());
+                        return Some(result);
+                    }
+                    Value::Pair(p) => {
+                        let (car, cdr) = {
+                            let b = p.borrow();
+                            (b.0.clone(), b.1.clone())
+                        };
+                        result.push(car);
+                        cur = cdr;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn is_proper_list(v: &Value) -> bool {
     match v {
         Value::List(_) => true,
@@ -226,7 +259,9 @@ impl fmt::Display for Value {
             },
             Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Continuation(..) => write!(f, "#<procedure>"),
             Value::Builtin(name) => write!(f, "#<builtin:{name}>"),
-            Value::Macro { .. } => write!(f, "#<macro>"),
+            Value::Macro { .. } | Value::MacroTransformer(_) => write!(f, "#<macro>"),
+            Value::SyntaxObject(..) => write!(f, "#<syntax>"),
+            Value::SyntaxList(_) => write!(f, "#<syntax-list>"),
             Value::Record { type_name, .. } => write!(f, "#<record:{type_name}>"),
             Value::RecordConstructor { .. }
             | Value::RecordPredicate { .. }
@@ -310,7 +345,7 @@ impl Value {
                 }
                 write!(f, ")")
             }
-            Value::Macro { .. } => write!(f, "#<macro>"),
+            Value::Macro { .. } | Value::MacroTransformer(_) => write!(f, "#<macro>"),
             other => fmt::Display::fmt(other, f),
         }
     }

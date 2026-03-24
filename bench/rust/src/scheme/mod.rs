@@ -16,8 +16,8 @@ use forms::{
     cek_eval_string_set, case_clause_matches, eval_case_lambda, eval_define_record_type,
     eval_lambda, expr_to_value, make_begin,
 };
-use macros::{eval_define_syntax, expand_macro};
-use values::{values_eq, values_equal, values_eqv, is_proper_list};
+use macros::{eval_define_syntax, expand_macro, expand_syntax_form, match_pattern};
+use values::{values_eq, values_equal, values_eqv, is_proper_list, to_list_vec};
 use wind::{apply_wind_step, apply_continuation};
 
 use std::cell::RefCell;
@@ -118,6 +118,9 @@ pub(super) enum Value {
     },
     Continuation(Kont, Vec<WindEntry>),
     Values(Vec<Value>),
+    MacroTransformer(Box<Value>),
+    SyntaxObject(Box<Expr>, Vec<(String, Value)>),  // (expr, hygiene_bindings)
+    SyntaxList(Vec<Expr>),
     Void,
 }
 
@@ -152,39 +155,6 @@ pub(super) fn vec_to_pair_chain(elems: &[Value]) -> Value {
         result = make_pair(e.clone(), result);
     }
     result
-}
-
-/// Convert a list-like value (List or pair chain) to a Vec.
-/// Returns None if not a proper list.
-pub(super) fn to_list_vec(val: &Value) -> Option<Vec<Value>> {
-    match val {
-        Value::List(elems) => Some(elems.clone()),
-        Value::Pair(_) => {
-            let mut result = Vec::new();
-            let mut cur = val.clone();
-            loop {
-                match &cur {
-                    Value::List(elems) => {
-                        if elems.is_empty() {
-                            return Some(result);
-                        }
-                        result.extend(elems.iter().cloned());
-                        return Some(result);
-                    }
-                    Value::Pair(p) => {
-                        let (car, cdr) = {
-                            let b = p.borrow();
-                            (b.0.clone(), b.1.clone())
-                        };
-                        result.push(car);
-                        cur = cdr;
-                    }
-                    _ => return None,
-                }
-            }
-        }
-        _ => None,
-    }
 }
 
 // ---------- Environment ----------
@@ -304,6 +274,7 @@ pub(super) const BUILTINS: &[&str] = &[
     "dynamic-wind",
     "raise", "with-exception-handler",
     "values", "call-with-values",
+    "syntax->datum", "datum->syntax",
 ];
 
 // ---------- CEK Machine ----------
@@ -367,6 +338,10 @@ pub(super) enum KontFrame {
     EvRaiseContinuationError,
     /// call-with-values: producer done, invoke consumer with result values
     EvCallWithValues { consumer: Value, pos: Pos, next: Kont },
+    /// syntax-case: stx-expr evaluated, now pattern-match
+    EvSyntaxCase { literals: Vec<String>, clauses: Vec<Expr>, env: Env, next: Kont },
+    /// macro transformer returned a syntax object, unwrap and evaluate
+    EvMacroExpand { env: Env, hygiene: Vec<(String, Value)>, next: Kont },
 }
 
 impl fmt::Debug for KontFrame {
@@ -618,14 +593,78 @@ fn cek_eval(expr: &Expr, env: &Env, kont: Kont, _output: &mut String) -> Result<
                         let kont = Rc::new(KontFrame::EvIf { then_e: body_expr, else_e: None, env: env.clone(), next: kont });
                         return Ok(State::Eval(not_test, env.clone(), kont));
                     }
+                    "syntax-case" => {
+                        // (syntax-case stx-expr (literal ...) clause ...)
+                        if elems.len() < 4 {
+                            return Err(EvalError::Arity(format!("{p}: syntax-case requires stx-expr, literals, and clauses")));
+                        }
+                        let literals = match &elems[2] {
+                            Expr::List(lits, _) => {
+                                lits.iter().map(|e| match e {
+                                    Expr::Symbol(s, _) => Ok(s.clone()),
+                                    _ => Err(EvalError::Parse(format!("{p}: syntax-case: literals must be symbols")))
+                                }).collect::<Result<Vec<_>, _>>()?
+                            }
+                            _ => return Err(EvalError::Parse(format!("{p}: syntax-case: expected literals list")))
+                        };
+                        let clauses = elems[3..].to_vec();
+                        // Try fast path for stx-expr
+                        if let Some(result) = eval_simple(&elems[1], env, _output) {
+                            let stx_val = result?;
+                            return handle_syntax_case(stx_val, &literals, &clauses, env, kont, p);
+                        }
+                        let kont = Rc::new(KontFrame::EvSyntaxCase {
+                            literals, clauses, env: env.clone(), next: kont
+                        });
+                        return Ok(State::Eval(elems[1].clone(), env.clone(), kont));
+                    }
+                    "syntax" => {
+                        // (syntax template) — aka #'template
+                        if elems.len() != 2 {
+                            return Err(EvalError::Arity(format!("{p}: syntax expects 1 argument")));
+                        }
+                        let template = &elems[1];
+                        // If it's a simple symbol bound to SyntaxObject, just return it
+                        if let Expr::Symbol(name, _) = template {
+                            if let Some(val @ Value::SyntaxObject(..)) = env_get(env, name) {
+                                return Ok(State::Apply(val, kont));
+                            }
+                        }
+                        let (expanded, hygiene) = expand_syntax_form(template, env);
+                        return Ok(State::Apply(
+                            Value::SyntaxObject(Box::new(expanded), hygiene),
+                            kont,
+                        ));
+                    }
+                    "with-syntax" => {
+                        // (with-syntax ((pat expr) ...) body ...)
+                        // Desugar to let
+                        let mut let_form = vec![Expr::Symbol("let".to_string(), p)];
+                        let_form.extend(elems[1..].iter().cloned());
+                        return cek_eval(&Expr::List(let_form, p), env, kont, _output);
+                    }
                     _ => {
                         // Check for macro invocation
-                        if let Some(Value::Macro { literals, rules, def_env }) = env_get(env, op) {
-                            let (expanded, hygiene_bindings) = expand_macro(&literals, &rules, elems, p, &def_env)?;
-                            let eval_env = make_hygiene_env(env, &hygiene_bindings);
-                            return Ok(State::Eval(expanded, eval_env, kont));
+                        if let Some(val) = env_get(env, op) {
+                            match val {
+                                Value::Macro { literals, rules, def_env } => {
+                                    let (expanded, hygiene_bindings) = expand_macro(&literals, &rules, elems, p, &def_env)?;
+                                    let eval_env = make_hygiene_env(env, &hygiene_bindings);
+                                    return Ok(State::Eval(expanded, eval_env, kont));
+                                }
+                                Value::MacroTransformer(transformer) => {
+                                    let call_expr = Expr::List(elems.clone(), p);
+                                    let stx_arg = Value::SyntaxObject(Box::new(call_expr), vec![]);
+                                    let expand_kont = Rc::new(KontFrame::EvMacroExpand {
+                                        env: env.clone(),
+                                        hygiene: vec![],
+                                        next: kont,
+                                    });
+                                    return Ok(State::Invoke(*transformer, vec![stx_arg], p, expand_kont));
+                                }
+                                _ => {} // Fall through to function call
+                            }
                         }
-                        // Fall through to function call
                     }
                 }
             }
@@ -657,6 +696,61 @@ fn cek_eval(expr: &Expr, env: &Env, kont: Kont, _output: &mut String) -> Result<
             Ok(State::Eval(elems[0].clone(), env.clone(), kont))
         }
     }
+}
+
+/// Handle syntax-case pattern matching after stx-expr has been evaluated.
+fn handle_syntax_case(
+    stx_val: Value,
+    literals: &[String],
+    clauses: &[Expr],
+    env: &Env,
+    kont: Kont,
+    pos: Pos,
+) -> Result<State, EvalError> {
+    let stx_expr = match &stx_val {
+        Value::SyntaxObject(expr, _) => (**expr).clone(),
+        // If not a syntax object, convert value to expr for matching
+        other => macros::value_to_expr(other),
+    };
+
+    for clause in clauses {
+        let clause_elems = match clause {
+            Expr::List(elems, _) if elems.len() >= 2 => elems,
+            _ => {
+                return Err(EvalError::Parse(format!(
+                    "{pos}: syntax-case: invalid clause"
+                )))
+            }
+        };
+
+        let pattern = &clause_elems[0];
+        let body = &clause_elems[clause_elems.len() - 1];
+
+        let mut bindings = std::collections::HashMap::new();
+        if match_pattern(pattern, &stx_expr, literals, &mut bindings) {
+            // Bind pattern vars as SyntaxObject/SyntaxList in a new env
+            let clause_env = new_env(Some(env.clone()));
+            for (name, binding) in bindings {
+                match binding {
+                    PatternBinding::Single(expr) => {
+                        env_set(
+                            &clause_env,
+                            name,
+                            Value::SyntaxObject(Box::new(expr), vec![]),
+                        );
+                    }
+                    PatternBinding::Repeated(exprs) => {
+                        env_set(&clause_env, name, Value::SyntaxList(exprs));
+                    }
+                }
+            }
+            return Ok(State::Eval(body.clone(), clause_env, kont));
+        }
+    }
+
+    Err(EvalError::Parse(format!(
+        "{pos}: syntax-case: no matching clause"
+    )))
 }
 
 /// CEK step: return a value to a continuation.
@@ -981,6 +1075,24 @@ fn cek_apply_kont(val: Value, kont: &Kont, wind_stack: &mut Vec<WindEntry>, hand
                 other => vec![other],
             };
             Ok(State::Invoke(consumer.clone(), args, *pos, next.clone()))
+        }
+
+        KontFrame::EvSyntaxCase { literals, clauses, env, next } => {
+            handle_syntax_case(val, literals, clauses, env, next.clone(), Pos::default())
+        }
+
+        KontFrame::EvMacroExpand { env, hygiene, next } => {
+            // Transformer returned a syntax object — unwrap and evaluate
+            match val {
+                Value::SyntaxObject(expr, mut stx_hygiene) => {
+                    stx_hygiene.extend(hygiene.iter().cloned());
+                    let eval_env = make_hygiene_env(env, &stx_hygiene);
+                    Ok(State::Eval(*expr, eval_env, next.clone()))
+                }
+                _ => Err(EvalError::Type(
+                    "macro transformer must return a syntax object".into(),
+                ))
+            }
         }
     }
 }
@@ -1325,6 +1437,7 @@ pub(super) const SPECIAL_FORMS: &[&str] = &[
     "define", "if", "quote", "lambda", "case-lambda", "let", "begin", "cond", "and", "or",
     "set!", "string-set!", "not", "define-syntax", "syntax-rules",
     "letrec", "letrec*", "case", "do", "let*", "when", "unless", "guard",
+    "syntax-case", "syntax", "with-syntax",
 ];
 
 #[derive(Clone)]

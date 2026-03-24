@@ -7,6 +7,7 @@ use super::{
     EvalError, Pos, Value,
 };
 use super::values::DisplayValue;
+use super::forms::expr_to_value;
 
 /// Internal numeric representation for mixed-type arithmetic.
 enum Num {
@@ -1285,6 +1286,24 @@ pub(super) fn apply_builtin(name: &str, args: &[Value], call_pos: Pos, output: &
                 }
             }
             Ok(Value::Integer(result))
+        }
+
+        "syntax->datum" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: syntax->datum expects 1 argument")));
+            }
+            match &args[0] {
+                Value::SyntaxObject(expr, _) => Ok(expr_to_value(expr)),
+                _ => Err(EvalError::Type(format!("{call_pos}: syntax->datum: expected syntax object, got {}", args[0]))),
+            }
+        }
+
+        "datum->syntax" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("{call_pos}: datum->syntax expects 2 arguments")));
+            }
+            let expr = super::macros::value_to_expr(&args[1]);
+            Ok(Value::SyntaxObject(Box::new(expr), vec![]))
         }
 
         _ => Err(EvalError::UnboundVariable(format!("{call_pos}: {name}"))),

@@ -5,6 +5,7 @@ use super::EvalError;
 // ---------- Source Position ----------
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Default)]
 pub(crate) struct Pos {
     line: usize,
     col: usize,
@@ -15,6 +16,7 @@ impl Pos {
         Self { line, col }
     }
 }
+
 
 impl fmt::Display for Pos {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -29,6 +31,7 @@ enum Token {
     LParen,
     RParen,
     Quote,
+    SyntaxQuote,
     Symbol(String),
     Integer(i64),
     Float(f64),
@@ -182,6 +185,11 @@ fn tokenize(input: &str) -> Result<Vec<SpannedToken>, EvalError> {
                             i += 2;
                             col += 2;
                         }
+                        '\'' => {
+                            tokens.push(SpannedToken { token: Token::SyntaxQuote, pos: start_pos });
+                            i += 2;
+                            col += 2;
+                        }
                         '\\' => {
                             let (ch, advance) = parse_char_literal(&chars, i + 2, start_pos)?;
                             i += 2 + advance;
@@ -292,6 +300,11 @@ fn parse(tokens: &[SpannedToken], pos: &mut usize) -> Result<Expr, EvalError> {
             *pos += 1;
             let inner = parse(tokens, pos)?;
             Ok(Expr::List(vec![Expr::Symbol("quote".into(), src_pos), inner], src_pos))
+        }
+        Token::SyntaxQuote => {
+            *pos += 1;
+            let inner = parse(tokens, pos)?;
+            Ok(Expr::List(vec![Expr::Symbol("syntax".into(), src_pos), inner], src_pos))
         }
         Token::LParen => {
             *pos += 1;
