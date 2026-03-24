@@ -21,6 +21,7 @@ object Display:
     case Pair(_, _)          => writeList(v)
     case Builtin(_)          => "#<procedure>"
     case MacroTransformer(_) => "#<macro>"
+    case Record(tag, _)      => s"#<record:$tag>"
 
   /** Display-style (no quotes on strings). */
   def show(v: Val): String = v match

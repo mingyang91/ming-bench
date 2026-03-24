@@ -3,7 +3,6 @@ package ming
 /** Scheme interpreter entry point. */
 object Evaluator:
 
-  // --- Value types ---
   enum Val:
     case Num(n: Long)
     case Bool(b: Boolean)
@@ -17,6 +16,7 @@ object Evaluator:
     case Inexact(d: Double)             // inexact number
     case Builtin(f: List[Val] => Val)
     case MacroTransformer(expand: Val => Val)
+    case Record(tag: String, fields: Array[Val])
 
   import Val.*
 
@@ -52,7 +52,8 @@ object Evaluator:
   // --- Evaluator ---
   private def eval(expr: Val, env: Env): Val =
     expr match
-      case Num(_) | Bool(_) | Str(_) | SchemeChar(_) | Builtin(_) | MacroTransformer(_) | Rational(_, _) | Inexact(_) =>
+      case Num(_) | Bool(_) | Str(_) | SchemeChar(_) | Builtin(_) | MacroTransformer(_) | Rational(_, _) | Inexact(_) |
+          Record(_, _) =>
         expr
       case Nil => Nil
       case Symbol(name) =>
@@ -70,8 +71,9 @@ object Evaluator:
         val v = eval(valueExpr, env)
         if !env.set(name, v) then error(s"unbound variable: $name")
         Void
-      case Pair(Symbol("and"), args) => evalAnd(args, env)
-      case Pair(Symbol("or"), args)  => evalOr(args, env)
+      case Pair(Symbol("and"), args)                => evalAnd(args, env)
+      case Pair(Symbol("or"), args)                 => evalOr(args, env)
+      case Pair(Symbol("define-record-type"), rest) => Records.evalDefineRecordType(rest, env, error)
       case Pair(Symbol("define-syntax"), Pair(Symbol(name), Pair(sr, Nil))) =>
         Macros.evalDefineSyntax(name, sr, env)
       case p @ Pair(Symbol(name), _) =>
