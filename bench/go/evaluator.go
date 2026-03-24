@@ -444,6 +444,17 @@ func (e *env) set(name string, v *Value) {
 	e.vars[name] = v
 }
 
+func (e *env) setMutate(name string, v *Value) bool {
+	if _, ok := e.vars[name]; ok {
+		e.vars[name] = v
+		return true
+	}
+	if e.parent != nil {
+		return e.parent.setMutate(name, v)
+	}
+	return false
+}
+
 func eval(node *astNode, e *env, ip *interp) (*Value, error) {
 	if node.isAtom {
 		return evalAtom(node, e)
@@ -501,6 +512,8 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 			return evalBegin(node, e, ip)
 		case "cond":
 			return evalCond(node, e, ip)
+		case "set!":
+			return evalSet(node, e, ip)
 		}
 	}
 
@@ -616,6 +629,24 @@ func evalDefine(node *astNode, e *env, ip *interp) (*Value, error) {
 		return voidVal(), nil
 	}
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", node.line, node.col)}
+}
+
+func evalSet(node *astNode, e *env, ip *interp) (*Value, error) {
+	if len(node.children) != 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: bad syntax", node.line, node.col)}
+	}
+	target := node.children[1]
+	if !target.isAtom || target.tok.kind != tokSymbol {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: not a variable", node.line, node.col)}
+	}
+	val, err := eval(node.children[2], e, ip)
+	if err != nil {
+		return nil, err
+	}
+	if !e.setMutate(target.tok.sval, val) {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: unbound variable: %s", target.tok.line, target.tok.col, target.tok.sval)}
+	}
+	return voidVal(), nil
 }
 
 func evalIf(node *astNode, e *env, ip *interp) (*Value, error) {
