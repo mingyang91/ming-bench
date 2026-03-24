@@ -25,6 +25,7 @@ enum SchemeVal:
   case Procedure(params: List[String], restParam: Option[String], body: List[Expr], env: Env)
   case BuiltinProc(name: String, fn: List[SchemeVal] => SchemeVal)
   case Macro(literals: Set[String], rules: List[(Expr, Expr)], defEnv: Env)
+  case RecordVal(typeName: String, fields: Map[String, SchemeVal])
   case Void
 
   def display: String = this match
@@ -43,6 +44,7 @@ enum SchemeVal:
     case Procedure(_, _, _, _) => "#<procedure>"
     case BuiltinProc(name, _)  => s"#<procedure:$name>"
     case Macro(_, _, _)        => "#<macro>"
+    case RecordVal(t, _)       => s"#<$t>"
     case Void                  => "#<void>"
 
   /** display format: no quotes on strings */
