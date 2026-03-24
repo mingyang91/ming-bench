@@ -222,6 +222,82 @@ function evaluate(expr, env) {
             // Special forms
             if (first.tag === 'symbol') {
                 switch (first.value) {
+                    case 'define': {
+                        if (elems.length < 3)
+                            throw new EvalError('define requires at least 2 arguments');
+                        const target = elems[1];
+                        if (target.tag === 'symbol') {
+                            // (define x expr)
+                            const val = evaluate(elems[2], env);
+                            env.set(target.value, val);
+                            return { tag: 'void' };
+                        }
+                        if (target.tag === 'list' && target.value.length > 0 && target.value[0].tag === 'symbol') {
+                            // (define (f params...) body...)
+                            const name = target.value[0].value;
+                            const paramNames = target.value.slice(1).map(p => {
+                                if (p.tag !== 'symbol')
+                                    throw new EvalError('parameter must be a symbol');
+                                return p.value;
+                            });
+                            const bodyExprs = elems.slice(2);
+                            const proc = { tag: 'procedure', value: (...args) => {
+                                    const childEnv = new Env(env);
+                                    for (let i = 0; i < paramNames.length; i++) {
+                                        childEnv.set(paramNames[i], args[i]);
+                                    }
+                                    let result = { tag: 'void' };
+                                    for (const b of bodyExprs) {
+                                        result = evaluate(b, childEnv);
+                                    }
+                                    return result;
+                                } };
+                            env.set(name, proc);
+                            return { tag: 'void' };
+                        }
+                        throw new EvalError('invalid define syntax');
+                    }
+                    case 'if': {
+                        if (elems.length < 3)
+                            throw new EvalError('if requires at least 2 arguments');
+                        const cond = evaluate(elems[1], env);
+                        if (!isFalsy(cond)) {
+                            return evaluate(elems[2], env);
+                        }
+                        else if (elems.length > 3) {
+                            return evaluate(elems[3], env);
+                        }
+                        return { tag: 'void' };
+                    }
+                    case 'quote': {
+                        if (elems.length !== 2)
+                            throw new EvalError('quote requires exactly 1 argument');
+                        return elems[1];
+                    }
+                    case 'lambda': {
+                        if (elems.length < 3)
+                            throw new EvalError('lambda requires params and body');
+                        const params = elems[1];
+                        if (params.tag !== 'list')
+                            throw new EvalError('lambda params must be a list');
+                        const paramNames = params.value.map(p => {
+                            if (p.tag !== 'symbol')
+                                throw new EvalError('parameter must be a symbol');
+                            return p.value;
+                        });
+                        const bodyExprs = elems.slice(2);
+                        return { tag: 'procedure', value: (...args) => {
+                                const childEnv = new Env(env);
+                                for (let i = 0; i < paramNames.length; i++) {
+                                    childEnv.set(paramNames[i], args[i]);
+                                }
+                                let result = { tag: 'void' };
+                                for (const b of bodyExprs) {
+                                    result = evaluate(b, childEnv);
+                                }
+                                return result;
+                            } };
+                    }
                     case 'and': {
                         if (elems.length === 1)
                             return { tag: 'boolean', value: true };
