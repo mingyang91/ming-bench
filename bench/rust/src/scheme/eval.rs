@@ -82,6 +82,7 @@ pub enum Value {
     },
     Vector(Rc<RefCell<Vec<Value>>>),
     Continuation(Rc<ContinuationData>),
+    Values(Vec<Value>),
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +126,7 @@ pub enum Frame {
     ExceptionHandlerPop,
     RaiseResult,
     GuardDispatch { var_name: String, clauses: Vec<Expr>, env: Env },
+    CallWithValuesConsumer { consumer: Value },
 }
 
 thread_local! {
@@ -347,6 +349,10 @@ impl Value {
             Value::Macro { .. } => "#<macro>".into(),
             Value::Record { type_name, .. } => format!("#<record:{}>", type_name),
             Value::Continuation(_) => "#<continuation>".into(),
+            Value::Values(vals) => {
+                let inner: Vec<String> = vals.iter().map(|v| v.fmt_value(write_mode)).collect();
+                format!("#<values:{}>", inner.join(" "))
+            }
             Value::Vector(elems) => {
                 let inner: Vec<String> = elems.borrow().iter().map(|v| v.fmt_value(write_mode)).collect();
                 format!("#({})", inner.join(" "))
@@ -402,7 +408,8 @@ impl Env {
                      "vector-length", "vector?", "vector->list", "list->vector",
                      "call/cc", "call-with-current-continuation",
                      "dynamic-wind",
-                     "raise", "with-exception-handler"] {
+                     "raise", "with-exception-handler",
+                     "values", "call-with-values"] {
             bindings.insert(name.to_string(), Value::Builtin(name.to_string()));
         }
         Env(Rc::new(RefCell::new(EnvInner {
@@ -521,6 +528,24 @@ fn apply_into(
             EXCEPTION_HANDLERS.with(|h| h.borrow_mut().push(handler));
             stack.push(Frame::ExceptionHandlerPop);
             return apply_into(thunk, vec![], cur_expr, cur_env, stack, returning, span);
+        }
+        if name == "values" {
+            if args.len() == 1 {
+                *returning = Some(args.into_iter().next().unwrap());
+            } else {
+                *returning = Some(Value::Values(args));
+            }
+            return Ok(());
+        }
+        if name == "call-with-values" {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("call-with-values requires 2 arguments at {}", fmt_span(span))));
+            }
+            let mut it = args.into_iter();
+            let producer = it.next().unwrap();
+            let consumer = it.next().unwrap();
+            stack.push(Frame::CallWithValuesConsumer { consumer });
+            return apply_into(producer, vec![], cur_expr, cur_env, stack, returning, span);
         }
         if name == "raise" {
             if args.len() != 1 {
@@ -944,6 +969,15 @@ fn eval_with_stack(initial_expr: &Expr, initial_env: &Env, initial_stack: Vec<Fr
                             continue;
                         }
                     }
+                }
+                Frame::CallWithValuesConsumer { consumer } => {
+                    let args = match val {
+                        Value::Values(vals) => vals,
+                        single => vec![single],
+                    };
+                    let span = cur_expr.span;
+                    apply_into(consumer, args, &mut cur_expr, &mut cur_env, &mut stack, &mut returning, span)?;
+                    continue;
                 }
             }
         }
