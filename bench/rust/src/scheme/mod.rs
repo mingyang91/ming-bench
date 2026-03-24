@@ -19,6 +19,13 @@ pub(super) const DUMMY_SPAN: Span = Span { line: 0, col: 0 };
 
 static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
 static RECORD_TYPE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static WIND_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) type WindFrame = (Value, Value, u64); // in_thunk, out_thunk, marker
+
+thread_local! {
+    pub(super) static WIND_STACK: RefCell<Vec<WindFrame>> = const { RefCell::new(Vec::new()) };
+}
 
 pub(crate) fn gensym(base: &str) -> String {
     let n = GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -53,7 +60,7 @@ pub(crate) enum Value {
     RecordConstructor(u64, usize),        // type_id, field_count
     RecordPredicate(u64),                 // type_id
     RecordAccessor(u64, usize),           // type_id, field_index
-    Continuation(Rc<Kont>),               // captured continuation
+    Continuation(Rc<Kont>, Vec<WindFrame>), // captured continuation + wind stack
     Void,
 }
 
@@ -74,7 +81,7 @@ impl PartialEq for Value {
             (Value::RecordConstructor(a, b), Value::RecordConstructor(c, d)) => a == c && b == d,
             (Value::RecordPredicate(a), Value::RecordPredicate(b)) => a == b,
             (Value::RecordAccessor(a, b), Value::RecordAccessor(c, d)) => a == c && b == d,
-            (Value::Continuation(a), Value::Continuation(b)) => Rc::ptr_eq(a, b),
+            (Value::Continuation(a, _), Value::Continuation(b, _)) => Rc::ptr_eq(a, b),
             (Value::Void, Value::Void) => true,
             _ => false,
         }
@@ -324,6 +331,18 @@ pub(crate) enum Kont {
         body: Vec<Spanned>,
         eval_env: Env,
         next: Rc<Kont>,
+    },
+    // dynamic-wind support
+    DynWindBody { body_thunk: Value, out_thunk: Value, in_thunk: Value, marker: u64, next: Rc<Kont> },
+    DynWindAfterBody { out_thunk: Value, next: Rc<Kont> },
+    DynWindAfterOut { body_value: Value, next: Rc<Kont> },
+    DynWindTransition {
+        out_thunks: Vec<Value>,
+        in_thunks: Vec<Value>,
+        rewind_frames: Vec<WindFrame>,
+        target_kont: Rc<Kont>,
+        value: Value,
+        is_resume: bool,
     },
 }
 
@@ -721,7 +740,7 @@ fn eval_step(expr: &Spanned, env: &Env, out: &Output) -> Result<Bounce, EvalErro
                         // Create a lightweight continuation (Halt kont).
                         // Non-escaping uses are caught here; escaping uses propagate
                         // ContinuationInvoked up to eval_smart which resumes the CEK machine.
-                        let cont_val = Value::Continuation(Rc::new(Kont::Halt));
+                        let cont_val = Value::Continuation(Rc::new(Kont::Halt), vec![]);
                         match apply(&proc, &[cont_val], out, span) {
                             Ok(v) => return Ok(Bounce::Done(v)),
                             Err(EvalError::ContinuationInvoked) => {
@@ -870,14 +889,34 @@ fn apply_step(func: &Value, args: &[Value], out: &Output, span: Span) -> Result<
                 _ => Err(EvalError::Type("record accessor: wrong record type".into(), span)),
             }
         }
-        Value::Continuation(kont) => {
+        Value::Continuation(kont, target_winds) => {
             if args.len() != 1 {
                 return Err(EvalError::Arity("continuation requires 1 argument".into(), span));
             }
-            cek::CONT_JUMP.with(|c| {
-                *c.borrow_mut() = Some((kont.clone(), args[0].clone()));
-            });
-            Err(EvalError::ContinuationInvoked)
+            let value = args[0].clone();
+            let current_winds = WIND_STACK.with(|ws| ws.borrow().clone());
+            let common = current_winds.iter().zip(target_winds.iter())
+                .take_while(|(a, b)| a.2 == b.2).count();
+            if common == current_winds.len() && common == target_winds.len() {
+                cek::CONT_JUMP.with(|c| {
+                    *c.borrow_mut() = Some((kont.clone(), value));
+                });
+                Err(EvalError::ContinuationInvoked)
+            } else {
+                let out_thunks: Vec<Value> = current_winds[common..].iter().rev()
+                    .map(|(_, o, _)| o.clone()).collect();
+                let in_thunks: Vec<Value> = target_winds[common..].iter()
+                    .map(|(i, _, _)| i.clone()).collect();
+                let rewind_frames: Vec<WindFrame> = target_winds[common..].to_vec();
+                let transition = Rc::new(Kont::DynWindTransition {
+                    out_thunks, in_thunks, rewind_frames,
+                    target_kont: kont.clone(), value, is_resume: true,
+                });
+                cek::CONT_JUMP.with(|c| {
+                    *c.borrow_mut() = Some((transition, Value::Void));
+                });
+                Err(EvalError::ContinuationInvoked)
+            }
         }
         Value::Symbol(name) => Ok(Bounce::Done(apply_builtin(name, args, out, span, apply)?)),
         _ => Err(EvalError::Type("not a procedure".into(), span)),
@@ -1211,7 +1250,9 @@ fn make_global_env() -> Env {
                    "cddaar", "cddadr", "cdddar", "cddddr",
                    "cadar", "cddar",
                    // L18
-                   "call/cc", "call-with-current-continuation"] {
+                   "call/cc", "call-with-current-continuation",
+                   // L19
+                   "dynamic-wind"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     env

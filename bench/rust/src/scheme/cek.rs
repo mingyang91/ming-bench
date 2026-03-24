@@ -1,11 +1,14 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use std::sync::atomic::Ordering;
+
 use super::{
     Value, Spanned, Env, Output, Kont, DUMMY_SPAN,
     env_get, env_set, env_update, new_env, bind_lambda_env,
     apply, eval_define_record_type, eval_define_syntax,
     eval_string_set_standalone, eval_do, expand_macro,
+    WindFrame, WIND_STACK, WIND_COUNTER,
 };
 use super::error::{EvalError, Span};
 use super::parser::parse_params;
@@ -356,7 +359,8 @@ fn cek_apply_kont(kont: &Rc<Kont>, value: Value, out: &Output, is_resume: bool) 
         }
 
         Kont::CallCC { captured, span } => {
-            let cont_val = Value::Continuation(captured.clone());
+            let winds = WIND_STACK.with(|ws| ws.borrow().clone());
+            let cont_val = Value::Continuation(captured.clone(), winds);
             cek_apply_func(&value, &[cont_val], captured.clone(), out, *span)
         }
 
@@ -515,6 +519,90 @@ fn cek_apply_kont(kont: &Rc<Kont>, value: Value, out: &Output, is_resume: bool) 
                 Ok(CekStep::Continue(CekState::Eval(remaining_inits[0].clone(), eval_env.clone(), k)))
             }
         }
+
+        Kont::DynWindBody { body_thunk, out_thunk, in_thunk, marker, next } => {
+            // in-thunk has returned; push wind frame and call body-thunk
+            WIND_STACK.with(|ws| ws.borrow_mut().push((in_thunk.clone(), out_thunk.clone(), *marker)));
+            let k = Rc::new(Kont::DynWindAfterBody { out_thunk: out_thunk.clone(), next: next.clone() });
+            cek_apply_func(body_thunk, &[], k, out, DUMMY_SPAN)
+        }
+
+        Kont::DynWindAfterBody { out_thunk, next } => {
+            // body-thunk has returned; pop wind frame and call out-thunk
+            WIND_STACK.with(|ws| ws.borrow_mut().pop());
+            let k = Rc::new(Kont::DynWindAfterOut { body_value: value, next: next.clone() });
+            cek_apply_func(out_thunk, &[], k, out, DUMMY_SPAN)
+        }
+
+        Kont::DynWindAfterOut { body_value, next } => {
+            // out-thunk has returned; deliver body's value
+            Ok(CekStep::Continue(CekState::ApplyKont(next.clone(), body_value.clone())))
+        }
+
+        Kont::DynWindTransition { out_thunks, in_thunks, rewind_frames, target_kont, value: target_value, is_resume } => {
+            // A thunk in the transition has returned (value ignored); continue transition
+            if !out_thunks.is_empty() {
+                WIND_STACK.with(|ws| ws.borrow_mut().pop());
+                let k = Rc::new(Kont::DynWindTransition {
+                    out_thunks: out_thunks[1..].to_vec(),
+                    in_thunks: in_thunks.clone(),
+                    rewind_frames: rewind_frames.clone(),
+                    target_kont: target_kont.clone(),
+                    value: target_value.clone(),
+                    is_resume: *is_resume,
+                });
+                cek_apply_func(&out_thunks[0], &[], k, out, DUMMY_SPAN)
+            } else if !in_thunks.is_empty() {
+                WIND_STACK.with(|ws| ws.borrow_mut().push(rewind_frames[0].clone()));
+                let k = Rc::new(Kont::DynWindTransition {
+                    out_thunks: vec![],
+                    in_thunks: in_thunks[1..].to_vec(),
+                    rewind_frames: rewind_frames[1..].to_vec(),
+                    target_kont: target_kont.clone(),
+                    value: target_value.clone(),
+                    is_resume: *is_resume,
+                });
+                cek_apply_func(&in_thunks[0], &[], k, out, DUMMY_SPAN)
+            } else if *is_resume {
+                Ok(CekStep::Continue(CekState::ResumeKont(target_kont.clone(), target_value.clone())))
+            } else {
+                Ok(CekStep::Continue(CekState::ApplyKont(target_kont.clone(), target_value.clone())))
+            }
+        }
+    }
+}
+
+fn start_wind_transition(
+    current_extra: &[WindFrame], target_extra: &[WindFrame],
+    target_kont: Rc<Kont>, value: Value, is_resume: bool,
+    out: &Output, span: Span,
+) -> Result<CekStep, EvalError> {
+    let out_thunks: Vec<Value> = current_extra.iter().rev().map(|(_, o, _)| o.clone()).collect();
+    let in_thunks: Vec<Value> = target_extra.iter().map(|(i, _, _)| i.clone()).collect();
+    let rewind_frames: Vec<WindFrame> = target_extra.to_vec();
+
+    // Kick off the first step of the transition
+    if !out_thunks.is_empty() {
+        WIND_STACK.with(|ws| ws.borrow_mut().pop());
+        let k = Rc::new(Kont::DynWindTransition {
+            out_thunks: out_thunks[1..].to_vec(),
+            in_thunks, rewind_frames,
+            target_kont, value, is_resume,
+        });
+        cek_apply_func(&out_thunks[0], &[], k, out, span)
+    } else if !in_thunks.is_empty() {
+        WIND_STACK.with(|ws| ws.borrow_mut().push(rewind_frames[0].clone()));
+        let k = Rc::new(Kont::DynWindTransition {
+            out_thunks: vec![],
+            in_thunks: in_thunks[1..].to_vec(),
+            rewind_frames: rewind_frames[1..].to_vec(),
+            target_kont, value, is_resume,
+        });
+        cek_apply_func(&in_thunks[0], &[], k, out, span)
+    } else if is_resume {
+        Ok(CekStep::Continue(CekState::ResumeKont(target_kont, value)))
+    } else {
+        Ok(CekStep::Continue(CekState::ApplyKont(target_kont, value)))
     }
 }
 
@@ -534,11 +622,22 @@ fn cek_apply_func(func: &Value, args: &[Value], kont: Rc<Kont>, out: &Output, sp
             }
             Err(EvalError::Arity(format!("case-lambda: no matching clause for {} arguments", args.len()), span))
         }
-        Value::Continuation(saved_kont) => {
+        Value::Continuation(saved_kont, target_winds) => {
             if args.len() != 1 {
                 return Err(EvalError::Arity("continuation requires 1 argument".into(), span));
             }
-            Ok(CekStep::Continue(CekState::ResumeKont(saved_kont.clone(), args[0].clone())))
+            let value = args[0].clone();
+            let current_winds = WIND_STACK.with(|ws| ws.borrow().clone());
+            let common = current_winds.iter().zip(target_winds.iter())
+                .take_while(|(a, b)| a.2 == b.2).count();
+            if common == current_winds.len() && common == target_winds.len() {
+                Ok(CekStep::Continue(CekState::ResumeKont(saved_kont.clone(), value)))
+            } else {
+                start_wind_transition(
+                    &current_winds[common..], &target_winds[common..],
+                    saved_kont.clone(), value, true, out, span,
+                )
+            }
         }
         Value::RecordConstructor(type_id, field_count) => {
             if args.len() != *field_count {
@@ -565,8 +664,23 @@ fn cek_apply_func(func: &Value, args: &[Value], kont: Rc<Kont>, out: &Output, sp
             if args.len() != 1 {
                 return Err(EvalError::Arity("call/cc requires 1 argument".into(), span));
             }
-            let cont_val = Value::Continuation(kont.clone());
+            let winds = WIND_STACK.with(|ws| ws.borrow().clone());
+            let cont_val = Value::Continuation(kont.clone(), winds);
             cek_apply_func(&args[0], &[cont_val], kont, out, span)
+        }
+        Value::Symbol(name) if name == "dynamic-wind" => {
+            if args.len() != 3 {
+                return Err(EvalError::Arity("dynamic-wind requires 3 arguments".into(), span));
+            }
+            let in_thunk = args[0].clone();
+            let body_thunk = args[1].clone();
+            let out_thunk = args[2].clone();
+            let marker = WIND_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let k = Rc::new(Kont::DynWindBody {
+                body_thunk, out_thunk: out_thunk.clone(), in_thunk: in_thunk.clone(),
+                marker, next: kont,
+            });
+            cek_apply_func(&in_thunk, &[], k, out, span)
         }
         Value::Symbol(name) => {
             let result = apply_builtin(name, args, out, span, apply)?;
@@ -773,7 +887,7 @@ fn cek_eval_letrec(args: &[Spanned], env: Env, kont: Rc<Kont>, _out: &Output, sp
 /// Check if an expression (or any sub-expression) references call/cc.
 pub(super) fn expr_uses_callcc(expr: &Spanned) -> bool {
     match &expr.val {
-        Value::Symbol(s) => s == "call/cc" || s == "call-with-current-continuation",
+        Value::Symbol(s) => s == "call/cc" || s == "call-with-current-continuation" || s == "dynamic-wind",
         Value::List(items) => items.iter().any(expr_uses_callcc),
         _ => false,
     }
