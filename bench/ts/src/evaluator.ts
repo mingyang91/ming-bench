@@ -304,6 +304,17 @@ function writeVal(val: SchemeVal): string {
       return `#\\${val.value}`;
     }
     case 'vector': return `#(${val.value.map(writeVal).join(' ')})`;
+    case 'list': return `(${val.value.map(writeVal).join(' ')})`;
+    case 'pair': {
+      const parts: string[] = [];
+      let cur: SchemeVal = val;
+      while (cur.tag === 'pair') {
+        parts.push(writeVal(cur.car));
+        cur = cur.cdr;
+      }
+      if (cur.tag === 'nil') return `(${parts.join(' ')})`;
+      return `(${parts.join(' ')} . ${writeVal(cur)})`;
+    }
     default: return displayVal(val);
   }
 }
@@ -590,13 +601,53 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
 
   env.set('string-set!', { tag: 'procedure', value: (...args: SchemeVal[]) => {
     if (args.length !== 3 || args[0].tag !== 'string' || args[1].tag !== 'number' || args[2].tag !== 'char')
-      throw new EvalError('string-set!: expected mutable string, number, char');
+      throw new EvalError('string-set!: expected string, index, char');
     const str = args[0];
-    if (!str.chars) throw new EvalError('string-set!: string is immutable');
-    const i = args[1].value;
-    if (i < 0 || i >= str.chars.length) throw new EvalError('string-set!: index out of range');
-    str.chars[i] = args[2].value;
+    if (!str.chars) throw new EvalError('string-set!: strings are immutable');
+    const idx = args[1].value;
+    if (idx < 0 || idx >= str.chars.length) throw new EvalError('string-set!: index out of range');
+    str.chars[idx] = args[2].value;
     return { tag: 'void' };
+  }});
+
+  env.set('string->list', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string->list: expected string');
+    const s = strContent(args[0]);
+    let result: SchemeVal = NIL;
+    for (let i = s.length - 1; i >= 0; i--) {
+      result = { tag: 'pair', car: { tag: 'char', value: s[i] }, cdr: result };
+    }
+    return result;
+  }});
+
+  env.set('list->string', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1) throw new EvalError('list->string: expected 1 argument');
+    let cur = args[0];
+    const chars: string[] = [];
+    while (cur.tag === 'list' ? cur.value.length > 0 : cur.tag === 'pair') {
+      if (cur.tag === 'list') {
+        for (const item of cur.value) {
+          if (item.tag !== 'char') throw new EvalError('list->string: expected list of characters');
+          chars.push(item.value);
+        }
+        break;
+      }
+      const p = cur as SchemeVal & { tag: 'pair' };
+      if (p.car.tag !== 'char') throw new EvalError('list->string: expected list of characters');
+      chars.push(p.car.value);
+      cur = p.cdr;
+    }
+    return { tag: 'string', value: chars.join('') };
+  }});
+
+  env.set('char->integer', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'char') throw new EvalError('char->integer: expected char');
+    return { tag: 'number', value: args[0].value.codePointAt(0)! };
+  }});
+
+  env.set('integer->char', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('integer->char: expected number');
+    return { tag: 'char', value: String.fromCodePoint(args[0].value) };
   }});
 
   env.set('char?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
