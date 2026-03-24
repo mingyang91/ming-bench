@@ -124,7 +124,8 @@ func (v *BoolVal) String() string {
 }
 
 type StringVal struct {
-	Val string
+	Val       string
+	Immutable bool
 }
 
 func (v *StringVal) String() string {

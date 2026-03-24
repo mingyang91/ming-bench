@@ -72,7 +72,7 @@ func eval(expr *Expr, env *Env) (Value, error) {
 	case ExprBool:
 		return &BoolVal{Val: expr.BVal}, nil
 	case ExprString:
-		return &StringVal{Val: expr.SVal}, nil
+		return &StringVal{Val: expr.SVal, Immutable: true}, nil
 	case ExprChar:
 		return &CharVal{Val: expr.RVal}, nil
 	case ExprSymbol:
@@ -278,6 +278,12 @@ func defaultEnv(output *strings.Builder) *Env {
 	// L06 builtins — mutable strings
 	env.Set("string-copy", &BuiltinFunc{Name: "string-copy", Fn: builtinStringCopy})
 	env.Set("string-set!", &BuiltinFunc{Name: "string-set!", Fn: builtinStringSet})
+
+	// L15 builtins — string immutability + char/integer conversion
+	env.Set("string->list", &BuiltinFunc{Name: "string->list", Fn: builtinStringToList})
+	env.Set("list->string", &BuiltinFunc{Name: "list->string", Fn: builtinListToString})
+	env.Set("char->integer", &BuiltinFunc{Name: "char->integer", Fn: builtinCharToInteger})
+	env.Set("integer->char", &BuiltinFunc{Name: "integer->char", Fn: builtinIntegerToChar})
 
 	// L08 builtins
 	env.Set("apply", &ApplyVal{})
@@ -782,7 +788,7 @@ func exprToValue(e *Expr) Value {
 	case ExprBool:
 		return &BoolVal{Val: e.BVal}
 	case ExprString:
-		return &StringVal{Val: e.SVal}
+		return &StringVal{Val: e.SVal, Immutable: true}
 	case ExprSymbol:
 		return &SymbolVal{Name: e.SVal}
 	case ExprList:
@@ -1309,19 +1315,22 @@ func builtinStringSet(args []Value) (Value, error) {
 	if !ok {
 		return nil, fmt.Errorf("string-set!: expected string, got %s", args[0].String())
 	}
+	if s.Immutable {
+		return nil, fmt.Errorf("string-set!: strings are immutable")
+	}
 	idx, ok := args[1].(*IntVal)
 	if !ok {
-		return nil, fmt.Errorf("string-set!: expected number, got %s", args[1].String())
+		return nil, fmt.Errorf("string-set!: expected integer index, got %s", args[1].String())
 	}
-	ch, ok := args[2].(*CharVal)
+	c, ok := args[2].(*CharVal)
 	if !ok {
-		return nil, fmt.Errorf("string-set!: expected char, got %s", args[2].String())
+		return nil, fmt.Errorf("string-set!: expected character, got %s", args[2].String())
 	}
 	runes := []rune(s.Val)
-	if idx.Val < 0 || int(idx.Val) >= len(runes) {
-		return nil, fmt.Errorf("string-set!: index out of range")
+	if idx.Val < 0 || idx.Val >= int64(len(runes)) {
+		return nil, fmt.Errorf("string-set!: index %d out of range for string of length %d", idx.Val, len(runes))
 	}
-	runes[idx.Val] = ch.Val
+	runes[idx.Val] = c.Val
 	s.Val = string(runes)
 	return &VoidVal{}, nil
 }
@@ -2468,4 +2477,68 @@ func builtinError(args []Value) (Value, error) {
 		}
 	}
 	return nil, fmt.Errorf("%s", strings.Join(parts, ""))
+}
+
+// L15 builtins — string immutability
+
+func builtinStringToList(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("string->list: expected 1 argument, got %d", len(args))
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, fmt.Errorf("string->list: expected string, got %s", args[0].String())
+	}
+	var result Value = &NilVal{}
+	runes := []rune(s.Val)
+	for i := len(runes) - 1; i >= 0; i-- {
+		result = &PairVal{Car: &CharVal{Val: runes[i]}, Cdr: result}
+	}
+	return result, nil
+}
+
+func builtinListToString(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("list->string: expected 1 argument, got %d", len(args))
+	}
+	var runes []rune
+	cur := args[0]
+	for {
+		if _, ok := cur.(*NilVal); ok {
+			break
+		}
+		p, ok := cur.(*PairVal)
+		if !ok {
+			return nil, fmt.Errorf("list->string: expected proper list of characters")
+		}
+		ch, ok := p.Car.(*CharVal)
+		if !ok {
+			return nil, fmt.Errorf("list->string: expected character, got %s", p.Car.String())
+		}
+		runes = append(runes, ch.Val)
+		cur = p.Cdr
+	}
+	return &StringVal{Val: string(runes)}, nil
+}
+
+func builtinCharToInteger(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("char->integer: expected 1 argument, got %d", len(args))
+	}
+	ch, ok := args[0].(*CharVal)
+	if !ok {
+		return nil, fmt.Errorf("char->integer: expected char, got %s", args[0].String())
+	}
+	return &IntVal{Val: int64(ch.Val)}, nil
+}
+
+func builtinIntegerToChar(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("integer->char: expected 1 argument, got %d", len(args))
+	}
+	n, ok := args[0].(*IntVal)
+	if !ok {
+		return nil, fmt.Errorf("integer->char: expected integer, got %s", args[0].String())
+	}
+	return &CharVal{Val: rune(n.Val)}, nil
 }
