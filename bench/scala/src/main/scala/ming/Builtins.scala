@@ -224,10 +224,11 @@ object Builtins:
     typePredicate(
       "procedure?",
       {
-        case _: SchemeVal.Procedure   => true
-        case _: SchemeVal.BuiltinProc => true
-        case _: SchemeVal.CaseLambda  => true
-        case _                        => false
+        case _: SchemeVal.Procedure       => true
+        case _: SchemeVal.BuiltinProc     => true
+        case _: SchemeVal.CaseLambda      => true
+        case _: SchemeVal.ContinuationVal => true
+        case _                            => false
       }
     )
   )
@@ -262,21 +263,6 @@ object Builtins:
     )
   )
 
-  private def applyBuiltin: List[(String, SchemeVal)] = List(
-    "apply" -> SchemeVal.BuiltinProc(
-      "apply",
-      args =>
-        if args.length < 2 then throw new EvalError("apply: expected at least 2 arguments")
-        val fn = args.head
-        val lastArg = args.last match
-          case v @ (SchemeVal.PairVal(_) | SchemeVal.ListVal(_)) => SchemeVal.toScalaList(v)
-          case other => throw new EvalError(s"apply: last argument must be a list, got ${other.display}")
-        val prefixArgs = args.slice(1, args.length - 1)
-        val allArgs    = prefixArgs ++ lastArg
-        Evaluator.applyProc(fn, allArgs)
-    )
-  )
-
   def makeGlobalEnv(): Env =
     val env = new Env(mutable.Map.empty, None)
     val allBuiltins = arithmeticBuiltins
@@ -287,7 +273,7 @@ object Builtins:
       ++ typePredicateBuiltins
       ++ ioBuiltins
       ++ StringBuiltins.all
-      ++ applyBuiltin
+      ++ ApplyBuiltins.applyBuiltin
       ++ errorBuiltin
       ++ NumericBuiltins.numericBuiltins
       ++ NumericBuiltins.mathBuiltins
@@ -295,5 +281,6 @@ object Builtins:
       ++ ListSearchBuiltins.all
       ++ VectorBuiltins.vectorBuiltins
       ++ VectorBuiltins.equalityBuiltins
+      ++ ApplyBuiltins.callccBuiltin
     for (name, proc) <- allBuiltins do env.define(name, proc)
     env

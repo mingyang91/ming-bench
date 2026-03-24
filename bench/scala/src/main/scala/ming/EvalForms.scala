@@ -14,7 +14,7 @@ object EvalForms:
       case Expr.SList(Expr.Symbol("else") :: body) :: _ =>
         Evaluator.evalBody(body, env)
       case Expr.SList(Expr.SList(datums) :: body) :: rest =>
-        val matched = datums.exists(d => Equality.eqvCheck(keyVal, Evaluator.quoteToVal(d)))
+        val matched = datums.exists(d => Equality.eqvCheck(keyVal, EvalHelpers.quoteToVal(d)))
         if matched then Evaluator.evalBody(body, env)
         else evalCase(keyVal, rest, env)
       case _ => throw new EvalError("case: invalid clause")
