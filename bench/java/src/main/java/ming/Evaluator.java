@@ -55,7 +55,7 @@ public class Evaluator {
 
     // --- Lambda (closure) ---
 
-    private record Lambda(List<String> params, List<Object> body, Env closureEnv) {}
+    private record Lambda(List<String> params, String restParam, List<Object> body, Env closureEnv) {}
 
     // Builtin procedure wrapper
     private record Builtin(String name) {}
@@ -134,7 +134,8 @@ public class Evaluator {
         "string->number", "number->string",
         "symbol->string", "string->symbol",
         "string-ref", "char?",
-        "string-set!", "string-copy"
+        "string-set!", "string-copy",
+        "apply"
     };
 
     private Env makeTopLevelEnv() {
@@ -332,21 +333,32 @@ public class Evaluator {
                         if (target instanceof String name) {
                             env.define(name, eval(list.get(2), env));
                         } else if (target instanceof List<?> sig) {
-                            // (define (f params...) body...)
+                            // (define (f params... . rest) body...)
                             Object rawFirst = sig.isEmpty() ? null : unwrap(sig.get(0));
                             if (sig.isEmpty() || !(rawFirst instanceof String fname)) {
                                 throw new EvalError(posStr() + "define: bad syntax");
                             }
                             List<String> params = new ArrayList<>();
+                            String restParam = null;
                             for (int i = 1; i < sig.size(); i++) {
                                 Object p = unwrap(sig.get(i));
+                                if (p instanceof String s && s.equals(".")) {
+                                    if (i + 1 < sig.size()) {
+                                        Object rp = unwrap(sig.get(i + 1));
+                                        if (!(rp instanceof String rpName)) throw new EvalError(posStr() + "define: rest parameter must be a symbol");
+                                        restParam = rpName;
+                                        break;
+                                    } else {
+                                        throw new EvalError(posStr() + "define: bad syntax after dot");
+                                    }
+                                }
                                 if (!(p instanceof String s)) {
                                     throw new EvalError(posStr() + "define: parameter must be a symbol");
                                 }
                                 params.add(s);
                             }
                             List<Object> body = new ArrayList<>(list.subList(2, list.size()));
-                            env.define(fname, new Lambda(params, body, env));
+                            env.define(fname, new Lambda(params, restParam, body, env));
                         } else {
                             throw new EvalError(posStr() + "define: bad syntax");
                         }
@@ -386,15 +398,26 @@ public class Evaluator {
                             throw new EvalError(posStr() + "lambda: parameters must be a list");
                         }
                         List<String> params = new ArrayList<>();
-                        for (Object p : paramList) {
-                            Object rawP = unwrap(p);
+                        String restParam = null;
+                        for (int pi = 0; pi < paramList.size(); pi++) {
+                            Object rawP = unwrap(paramList.get(pi));
+                            if (rawP instanceof String s && s.equals(".")) {
+                                if (pi + 1 < paramList.size()) {
+                                    Object rp = unwrap(paramList.get(pi + 1));
+                                    if (!(rp instanceof String rpName)) throw new EvalError(posStr() + "lambda: rest parameter must be a symbol");
+                                    restParam = rpName;
+                                    break;
+                                } else {
+                                    throw new EvalError(posStr() + "lambda: bad syntax after dot");
+                                }
+                            }
                             if (!(rawP instanceof String s)) {
                                 throw new EvalError(posStr() + "lambda: parameter must be a symbol");
                             }
                             params.add(s);
                         }
                         List<Object> body = new ArrayList<>(list.subList(2, list.size()));
-                        return new Lambda(params, body, env);
+                        return new Lambda(params, restParam, body, env);
                     }
                     case "and" -> {
                         Object result = Boolean.TRUE;
@@ -473,7 +496,7 @@ public class Evaluator {
                             }
                             List<Object> body = new ArrayList<>(list.subList(3, list.size()));
                             Env letEnv = new Env(env);
-                            Lambda loopLam = new Lambda(params, body, letEnv);
+                            Lambda loopLam = new Lambda(params, null, body, letEnv);
                             letEnv.define(loopName, loopLam);
                             Env callEnv = new Env(letEnv);
                             for (int i = 0; i < params.size(); i++) {
@@ -521,18 +544,7 @@ public class Evaluator {
             }
 
             if (proc instanceof Lambda lam) {
-                if (args.size() != lam.params().size()) {
-                    throw new EvalError(posStr() + "wrong number of arguments: expected " + lam.params().size() + ", got " + args.size());
-                }
-                Env callEnv = new Env(lam.closureEnv());
-                for (int i = 0; i < lam.params().size(); i++) {
-                    callEnv.define(lam.params().get(i), args.get(i));
-                }
-                Object result = VOID;
-                for (Object bodyExpr : lam.body()) {
-                    result = eval(bodyExpr, callEnv);
-                }
-                return result;
+                return applyLambda(lam, args);
             }
 
             if (proc instanceof Builtin b) {
@@ -542,6 +554,45 @@ public class Evaluator {
             throw new EvalError(posStr() + "not a procedure: " + schemeToString(proc));
         }
         throw new EvalError(posStr() + "cannot eval: " + expr);
+    }
+
+    private Object applyLambda(Lambda lam, List<Object> args) throws EvalError {
+        int required = lam.params().size();
+        if (lam.restParam() != null) {
+            if (args.size() < required) {
+                throw new EvalError(posStr() + "wrong number of arguments: expected at least " + required + ", got " + args.size());
+            }
+        } else {
+            if (args.size() != required) {
+                throw new EvalError(posStr() + "wrong number of arguments: expected " + required + ", got " + args.size());
+            }
+        }
+        Env callEnv = new Env(lam.closureEnv());
+        for (int i = 0; i < required; i++) {
+            callEnv.define(lam.params().get(i), args.get(i));
+        }
+        if (lam.restParam() != null) {
+            Object rest = NIL;
+            for (int i = args.size() - 1; i >= required; i--) {
+                rest = new Pair(args.get(i), rest);
+            }
+            callEnv.define(lam.restParam(), rest);
+        }
+        Object result = VOID;
+        for (Object bodyExpr : lam.body()) {
+            result = eval(bodyExpr, callEnv);
+        }
+        return result;
+    }
+
+    private Object applyProcedure(Object proc, List<Object> args) throws EvalError {
+        if (proc instanceof Lambda lam) {
+            return applyLambda(lam, args);
+        }
+        if (proc instanceof Builtin b) {
+            return applyBuiltin(b.name(), args);
+        }
+        throw new EvalError(posStr() + "not a procedure: " + schemeToString(proc));
     }
 
     private Object applyBuiltin(String op, List<Object> args) throws EvalError {
@@ -755,6 +806,26 @@ public class Evaluator {
                 requireArgCount(op, args, 1);
                 if (!(args.get(0) instanceof SchemeString s)) throw new EvalError(posStr() + "string-copy: not a string");
                 return s.copy();
+            }
+            case "apply" -> {
+                if (args.size() < 2) throw new EvalError(posStr() + "apply: requires at least 2 arguments");
+                Object proc = args.get(0);
+                // Last arg must be a list; preceding args are prepended
+                Object lastArg = args.get(args.size() - 1);
+                List<Object> finalArgs = new ArrayList<>();
+                for (int i = 1; i < args.size() - 1; i++) {
+                    finalArgs.add(args.get(i));
+                }
+                // Unpack the last argument (a list)
+                Object cur = lastArg;
+                while (cur instanceof Pair p) {
+                    finalArgs.add(p.car());
+                    cur = p.cdr();
+                }
+                if (cur != NIL && cur != null) {
+                    throw new EvalError(posStr() + "apply: last argument is not a proper list");
+                }
+                return applyProcedure(proc, finalArgs);
             }
             default -> throw new EvalError(posStr() + "unbound variable: " + op);
         }
