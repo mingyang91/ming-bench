@@ -8,8 +8,7 @@ mod eval;
 use eval::Env;
 
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
-    let tokens = parser::tokenize(input)?;
-    let exprs = parser::parse_all(&tokens)?;
+    let exprs = parser::parse(input)?;
     let env = Env::default_env();
     let mut last = eval::Value::Void;
     for expr in &exprs {
