@@ -467,6 +467,7 @@ fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError>
                     "cond" => return eval_cond(&elems[1..], env, output),
                     "and" => return eval_and(&elems[1..], env, output),
                     "or" => return eval_or(&elems[1..], env, output),
+                    "set!" => return eval_set_bang(&elems[1..], p, env, output),
                     "string-set!" => return eval_string_set(&elems[1..], p, env, output),
                     "not" => {
                         if elems.len() != 2 {
@@ -607,6 +608,21 @@ fn eval_or(exprs: &[Expr], env: &Env, output: &mut String) -> Result<Value, Eval
         }
     }
     Ok(Value::Boolean(false))
+}
+
+fn eval_set_bang(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity(format!("{call_pos}: set! requires 2 arguments")));
+    }
+    let name = match &args[0] {
+        Expr::Symbol(s, _) => s.clone(),
+        _ => return Err(EvalError::Parse(format!("{call_pos}: set!: expected symbol"))),
+    };
+    let val = eval(&args[1], env, output)?;
+    if !env_update(env, &name, val) {
+        return Err(EvalError::UnboundVariable(format!("{call_pos}: {name}")));
+    }
+    Ok(Value::Void)
 }
 
 fn eval_string_set(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
