@@ -170,6 +170,19 @@ func toFloat64(v value) float64 {
 	}
 }
 
+func toInt(v value) int64 {
+	switch v.kind {
+	case valInteger:
+		return v.ival
+	case valFloat:
+		return int64(v.fval)
+	case valRational:
+		return v.numer / v.denom
+	default:
+		return 0
+	}
+}
+
 func pairVal(car, cdr value) value {
 	return value{kind: valPair, pair: &pair{car: car, cdr: cdr}}
 }
@@ -267,10 +280,16 @@ func (v value) displayStr() string {
 }
 
 func displayPairInner(v value) string {
+	seen := map[*pair]bool{v.pair: true}
 	var sb strings.Builder
 	sb.WriteString(v.pair.car.displayStr())
 	cdr := v.pair.cdr
 	for cdr.kind == valPair {
+		if seen[cdr.pair] {
+			sb.WriteString(" ...")
+			return sb.String()
+		}
+		seen[cdr.pair] = true
 		sb.WriteByte(' ')
 		sb.WriteString(cdr.pair.car.displayStr())
 		cdr = cdr.pair.cdr
@@ -283,10 +302,16 @@ func displayPairInner(v value) string {
 }
 
 func writePairInner(v value) string {
+	seen := map[*pair]bool{v.pair: true}
 	var sb strings.Builder
 	sb.WriteString(v.pair.car.String())
 	cdr := v.pair.cdr
 	for cdr.kind == valPair {
+		if seen[cdr.pair] {
+			sb.WriteString(" ...")
+			return sb.String()
+		}
+		seen[cdr.pair] = true
 		sb.WriteByte(' ')
 		sb.WriteString(cdr.pair.car.String())
 		cdr = cdr.pair.cdr
@@ -673,6 +698,8 @@ func evalCore(e *expr, env *env) (value, error) {
 			return evalOr(e, env)
 		case "let":
 			return evalLet(e, env)
+		case "let*":
+			return evalLetStar(e, env)
 		case "begin":
 			return evalBegin(e, env)
 		case "cond":
@@ -1016,7 +1043,12 @@ func isBuiltin(name string) bool {
 		"numerator", "denominator",
 		"procedure?",
 		"vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
-		"vector->list", "list->vector":
+		"vector->list", "list->vector",
+		"set-car!", "set-cdr!", "for-each", "reverse", "error",
+		"gcd", "lcm", "truncate", "round",
+		"make-string", "string", "string>?", "string<=?", "string>=?",
+		"memv", "assv", "member",
+		"caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "cadddr":
 		return true
 	}
 	return false
@@ -1122,6 +1154,48 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: cdr: expected pair", e.line, e.col)}
 		}
 		return args[0].pair.cdr, nil
+
+	case "caar":
+		if len(args) != 1 || args[0].kind != valPair || args[0].pair.car.kind != valPair {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: caar: expected pair", e.line, e.col)}
+		}
+		return args[0].pair.car.pair.car, nil
+
+	case "cadr":
+		if len(args) != 1 || args[0].kind != valPair || args[0].pair.cdr.kind != valPair {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: cadr: expected pair", e.line, e.col)}
+		}
+		return args[0].pair.cdr.pair.car, nil
+
+	case "cdar":
+		if len(args) != 1 || args[0].kind != valPair || args[0].pair.car.kind != valPair {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: cdar: expected pair", e.line, e.col)}
+		}
+		return args[0].pair.car.pair.cdr, nil
+
+	case "cddr":
+		if len(args) != 1 || args[0].kind != valPair || args[0].pair.cdr.kind != valPair {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: cddr: expected pair", e.line, e.col)}
+		}
+		return args[0].pair.cdr.pair.cdr, nil
+
+	case "caddr":
+		if len(args) != 1 || args[0].kind != valPair || args[0].pair.cdr.kind != valPair || args[0].pair.cdr.pair.cdr.kind != valPair {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: caddr: expected pair", e.line, e.col)}
+		}
+		return args[0].pair.cdr.pair.cdr.pair.car, nil
+
+	case "cdddr":
+		if len(args) != 1 || args[0].kind != valPair || args[0].pair.cdr.kind != valPair || args[0].pair.cdr.pair.cdr.kind != valPair {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: cdddr: expected pair", e.line, e.col)}
+		}
+		return args[0].pair.cdr.pair.cdr.pair.cdr, nil
+
+	case "cadddr":
+		if len(args) != 1 || args[0].kind != valPair || args[0].pair.cdr.kind != valPair || args[0].pair.cdr.pair.cdr.kind != valPair || args[0].pair.cdr.pair.cdr.pair.cdr.kind != valPair {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: cadddr: expected pair", e.line, e.col)}
+		}
+		return args[0].pair.cdr.pair.cdr.pair.cdr.pair.car, nil
 
 	case "null?":
 		if len(args) != 1 {
@@ -1652,11 +1726,29 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 		if len(args) != 1 {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: list?: expected 1 argument", e.line, e.col)}
 		}
-		cur := args[0]
-		for cur.kind == valPair {
-			cur = cur.pair.cdr
+		// Tortoise-and-hare cycle detection
+		slow := args[0]
+		fast := args[0]
+		for {
+			if fast.kind == valNull {
+				return boolVal(true), nil
+			}
+			if fast.kind != valPair {
+				return boolVal(false), nil
+			}
+			fast = fast.pair.cdr
+			if fast.kind == valNull {
+				return boolVal(true), nil
+			}
+			if fast.kind != valPair {
+				return boolVal(false), nil
+			}
+			fast = fast.pair.cdr
+			slow = slow.pair.cdr
+			if slow.pair == fast.pair {
+				return boolVal(false), nil // cycle detected
+			}
 		}
-		return boolVal(cur.kind == valNull), nil
 
 	case "assoc":
 		if len(args) != 2 {
@@ -1877,6 +1969,225 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 			cur = cur.pair.cdr
 		}
 		return value{kind: valVector, vec: &elems}, nil
+
+	// --- L17 Pair mutation ---
+
+	case "set-car!":
+		if len(args) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: set-car!: expected 2 arguments", e.line, e.col)}
+		}
+		if args[0].kind != valPair {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: set-car!: expected pair", e.line, e.col)}
+		}
+		args[0].pair.car = args[1]
+		return voidVal, nil
+
+	case "set-cdr!":
+		if len(args) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: set-cdr!: expected 2 arguments", e.line, e.col)}
+		}
+		if args[0].kind != valPair {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: set-cdr!: expected pair", e.line, e.col)}
+		}
+		args[0].pair.cdr = args[1]
+		return voidVal, nil
+
+	case "for-each":
+		if len(args) < 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: for-each: expected at least 2 arguments", e.line, e.col)}
+		}
+		fn := args[0]
+		lists := make([]value, len(args)-1)
+		copy(lists, args[1:])
+		for {
+			feArgs := make([]value, len(lists))
+			done := false
+			for i, lst := range lists {
+				if lst.kind != valPair {
+					done = true
+					break
+				}
+				feArgs[i] = lst.pair.car
+			}
+			if done {
+				break
+			}
+			_, err := callValue(fn, feArgs, e, environ)
+			if err != nil {
+				return value{}, err
+			}
+			for i, lst := range lists {
+				lists[i] = lst.pair.cdr
+			}
+		}
+		return voidVal, nil
+
+	case "reverse":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: reverse: expected 1 argument", e.line, e.col)}
+		}
+		result := nullVal
+		cur := args[0]
+		for cur.kind == valPair {
+			result = pairVal(cur.pair.car, result)
+			cur = cur.pair.cdr
+		}
+		return result, nil
+
+	case "error":
+		msg := "error"
+		if len(args) > 0 {
+			msg = args[0].displayStr()
+		}
+		return value{}, &EvalError{Message: msg}
+
+	case "gcd":
+		if len(args) == 0 {
+			return intVal(0), nil
+		}
+		result := toInt(args[0])
+		for _, a := range args[1:] {
+			result = gcd(result, toInt(a))
+		}
+		if result < 0 {
+			result = -result
+		}
+		return intVal(result), nil
+
+	case "lcm":
+		if len(args) == 0 {
+			return intVal(1), nil
+		}
+		result := toInt(args[0])
+		if result < 0 {
+			result = -result
+		}
+		for _, a := range args[1:] {
+			b := toInt(a)
+			if b < 0 {
+				b = -b
+			}
+			if result == 0 || b == 0 {
+				result = 0
+			} else {
+				result = result / gcd(result, b) * b
+			}
+		}
+		return intVal(result), nil
+
+	case "truncate":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: truncate: expected 1 argument", e.line, e.col)}
+		}
+		switch args[0].kind {
+		case valInteger:
+			return args[0], nil
+		case valFloat:
+			return intVal(int64(args[0].fval)), nil
+		case valRational:
+			return intVal(args[0].numer / args[0].denom), nil
+		default:
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: truncate: expected number", e.line, e.col)}
+		}
+
+	case "round":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: round: expected 1 argument", e.line, e.col)}
+		}
+		switch args[0].kind {
+		case valInteger:
+			return args[0], nil
+		case valFloat:
+			return intVal(int64(math.RoundToEven(args[0].fval))), nil
+		case valRational:
+			f := float64(args[0].numer) / float64(args[0].denom)
+			return intVal(int64(math.RoundToEven(f))), nil
+		default:
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: round: expected number", e.line, e.col)}
+		}
+
+	case "make-string":
+		if len(args) < 1 || len(args) > 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: make-string: expected 1-2 arguments", e.line, e.col)}
+		}
+		n := int(toInt(args[0]))
+		ch := rune(0)
+		if len(args) == 2 && args[1].kind == valChar {
+			ch = args[1].cval
+		}
+		runes := make([]rune, n)
+		for i := range runes {
+			runes[i] = ch
+		}
+		return value{kind: valString, mstr: &runes}, nil
+
+	case "string":
+		runes := make([]rune, len(args))
+		for i, a := range args {
+			if a.kind != valChar {
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string: expected char", e.line, e.col)}
+			}
+			runes[i] = a.cval
+		}
+		return strVal(string(runes)), nil
+
+	case "string>?":
+		if len(args) != 2 || args[0].kind != valString || args[1].kind != valString {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string>?: expected 2 strings", e.line, e.col)}
+		}
+		return boolVal(args[0].strContent() > args[1].strContent()), nil
+
+	case "string<=?":
+		if len(args) != 2 || args[0].kind != valString || args[1].kind != valString {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string<=?: expected 2 strings", e.line, e.col)}
+		}
+		return boolVal(args[0].strContent() <= args[1].strContent()), nil
+
+	case "string>=?":
+		if len(args) != 2 || args[0].kind != valString || args[1].kind != valString {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string>=?: expected 2 strings", e.line, e.col)}
+		}
+		return boolVal(args[0].strContent() >= args[1].strContent()), nil
+
+	case "memv":
+		if len(args) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: memv: expected 2 arguments", e.line, e.col)}
+		}
+		cur := args[1]
+		for cur.kind == valPair {
+			if valuesEqv(args[0], cur.pair.car) {
+				return cur, nil
+			}
+			cur = cur.pair.cdr
+		}
+		return boolVal(false), nil
+
+	case "assv":
+		if len(args) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: assv: expected 2 arguments", e.line, e.col)}
+		}
+		cur := args[1]
+		for cur.kind == valPair {
+			entry := cur.pair.car
+			if entry.kind == valPair && valuesEqv(args[0], entry.pair.car) {
+				return entry, nil
+			}
+			cur = cur.pair.cdr
+		}
+		return boolVal(false), nil
+
+	case "member":
+		if len(args) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: member: expected 2 arguments", e.line, e.col)}
+		}
+		cur := args[1]
+		for cur.kind == valPair {
+			if valuesEqual(args[0], cur.pair.car) {
+				return cur, nil
+			}
+			cur = cur.pair.cdr
+		}
+		return boolVal(false), nil
 	}
 
 	return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", e.line, e.col, name)}
@@ -1915,48 +2226,58 @@ func valuesEq(a, b value) bool {
 	}
 }
 
-// valuesEqual implements equal? — deep structural equality.
+// valuesEqual implements equal? — deep structural equality with cycle detection.
 func valuesEqual(a, b value) bool {
-	if a.kind != b.kind {
-		// Cross-numeric comparison
-		if isNumber(a) && isNumber(b) {
-			return toFloat64(a) == toFloat64(b)
-		}
-		return false
-	}
-	switch a.kind {
-	case valInteger:
-		return a.ival == b.ival
-	case valRational:
-		return a.numer == b.numer && a.denom == b.denom
-	case valFloat:
-		return a.fval == b.fval
-	case valBoolean:
-		return a.bval == b.bval
-	case valSymbol:
-		return a.sval == b.sval
-	case valChar:
-		return a.cval == b.cval
-	case valString:
-		return a.strContent() == b.strContent()
-	case valNull:
-		return true
-	case valPair:
-		return valuesEqual(a.pair.car, b.pair.car) && valuesEqual(a.pair.cdr, b.pair.cdr)
-	case valVector:
-		av, bv := *a.vec, *b.vec
-		if len(av) != len(bv) {
+	type pairKey struct{ a, b *pair }
+	seen := map[pairKey]bool{}
+	var eq func(a, b value) bool
+	eq = func(a, b value) bool {
+		if a.kind != b.kind {
+			if isNumber(a) && isNumber(b) {
+				return toFloat64(a) == toFloat64(b)
+			}
 			return false
 		}
-		for i := range av {
-			if !valuesEqual(av[i], bv[i]) {
+		switch a.kind {
+		case valInteger:
+			return a.ival == b.ival
+		case valRational:
+			return a.numer == b.numer && a.denom == b.denom
+		case valFloat:
+			return a.fval == b.fval
+		case valBoolean:
+			return a.bval == b.bval
+		case valSymbol:
+			return a.sval == b.sval
+		case valChar:
+			return a.cval == b.cval
+		case valString:
+			return a.strContent() == b.strContent()
+		case valNull:
+			return true
+		case valPair:
+			k := pairKey{a.pair, b.pair}
+			if seen[k] {
+				return true
+			}
+			seen[k] = true
+			return eq(a.pair.car, b.pair.car) && eq(a.pair.cdr, b.pair.cdr)
+		case valVector:
+			av, bv := *a.vec, *b.vec
+			if len(av) != len(bv) {
 				return false
 			}
+			for i := range av {
+				if !eq(av[i], bv[i]) {
+					return false
+				}
+			}
+			return true
+		default:
+			return false
 		}
-		return true
-	default:
-		return false
 	}
+	return eq(a, b)
 }
 
 func evalNumCompare(args []value, e *expr, cmp func(float64, float64) bool, name string) (value, error) {
@@ -2172,6 +2493,38 @@ func evalLet(e *expr, env *env) (value, error) {
 	return tailCallVal(body[len(body)-1], letEnv), nil
 }
 
+func evalLetStar(e *expr, env *env) (value, error) {
+	if len(e.list) < 3 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: let*: bad syntax", e.line, e.col)}
+	}
+	bindingsExpr := e.list[1]
+	if bindingsExpr.kind != exprList {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: let*: expected bindings list", bindingsExpr.line, bindingsExpr.col)}
+	}
+	letEnv := newEnv(env)
+	for _, b := range bindingsExpr.list {
+		if b.kind != exprList || len(b.list) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: let*: bad binding", b.line, b.col)}
+		}
+		if b.list[0].kind != exprAtom || b.list[0].atom.kind != valSymbol {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: let*: expected symbol", b.list[0].line, b.list[0].col)}
+		}
+		v, err := evalInEnv(b.list[1], letEnv) // evaluate in letEnv, not env
+		if err != nil {
+			return value{}, err
+		}
+		letEnv.set(b.list[0].atom.sval, v)
+	}
+	body := e.list[2:]
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := evalInEnv(bodyExpr, letEnv)
+		if err != nil {
+			return value{}, err
+		}
+	}
+	return tailCallVal(body[len(body)-1], letEnv), nil
+}
+
 func evalBegin(e *expr, env *env) (value, error) {
 	args := e.list[1:]
 	if len(args) == 0 {
@@ -2191,7 +2544,7 @@ func evalBegin(e *expr, env *env) (value, error) {
 func evalCond(e *expr, env *env) (value, error) {
 	clauses := e.list[1:]
 	for _, clause := range clauses {
-		if clause.kind != exprList || len(clause.list) < 2 {
+		if clause.kind != exprList || len(clause.list) < 1 {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: cond: bad clause", clause.line, clause.col)}
 		}
 		// else clause
@@ -2211,6 +2564,9 @@ func evalCond(e *expr, env *env) (value, error) {
 		}
 		if isTruthy(cond) {
 			body := clause.list[1:]
+			if len(body) == 0 {
+				return cond, nil // (cond (test)) returns test value
+			}
 			for _, bodyExpr := range body[:len(body)-1] {
 				_, err = evalInEnv(bodyExpr, env)
 				if err != nil {
@@ -2831,7 +3187,7 @@ var (
 
 func isSpecialForm(name string) bool {
 	switch name {
-	case "define", "set!", "if", "quote", "lambda", "and", "or", "let", "begin", "cond", "define-syntax", "define-record-type", "letrec", "letrec*", "case", "do", "case-lambda":
+	case "define", "set!", "if", "quote", "lambda", "and", "or", "let", "let*", "begin", "cond", "define-syntax", "define-record-type", "letrec", "letrec*", "case", "do", "case-lambda":
 		return true
 	}
 	return false
@@ -2933,6 +3289,11 @@ func makeTopLevelEnv() *env {
 		"procedure?",
 		"vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
 		"vector->list", "list->vector",
+		"set-car!", "set-cdr!", "for-each", "reverse", "error",
+		"gcd", "lcm", "truncate", "round",
+		"make-string", "string", "string>?", "string<=?", "string>=?",
+		"memv", "assv", "member",
+		"caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "cadddr",
 	}
 	for _, name := range builtins {
 		e.set(name, builtinVal(name))
