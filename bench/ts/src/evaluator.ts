@@ -5,7 +5,8 @@ import { EvalError } from './evalError.js';
 interface Pos { line: number; col: number }
 
 type SchemeVal =
-  | { tag: 'number'; value: number; pos?: Pos }
+  | { tag: 'number'; value: number; exact?: boolean; pos?: Pos }
+  | { tag: 'rational'; num: number; den: number; pos?: Pos }
   | { tag: 'boolean'; value: boolean; pos?: Pos }
   | { tag: 'string'; value: string; pos?: Pos }
   | { tag: 'symbol'; value: string; pos?: Pos }
@@ -104,6 +105,13 @@ function parse(tokens: Token[], idx: number): [SchemeVal, number] {
     return [{ tag: 'string', value: inner, pos: p }, idx + 1];
   }
 
+  const ratMatch = token.text.match(/^(-?\d+)\/(\d+)$/);
+  if (ratMatch) {
+    const rn = parseInt(ratMatch[1], 10);
+    const rd = parseInt(ratMatch[2], 10);
+    return [makeRat(rn, rd, p), idx + 1];
+  }
+
   const num = Number(token.text);
   if (!isNaN(num) && token.text !== '') {
     return [{ tag: 'number', value: num, pos: p }, idx + 1];
@@ -132,7 +140,10 @@ function isTruthy(val: SchemeVal): boolean {
 
 function schemeToString(val: SchemeVal): string {
   switch (val.tag) {
-    case 'number': return String(val.value);
+    case 'number':
+      if (val.exact === false && Number.isInteger(val.value)) return val.value.toFixed(1);
+      return String(val.value);
+    case 'rational': return `${val.num}/${val.den}`;
     case 'boolean': return val.value ? '#t' : '#f';
     case 'string': return `"${val.value}"`;
     case 'symbol': return val.value;
@@ -195,6 +206,48 @@ function expectNumbers(args: SchemeVal[], name: string, pos?: Pos): number[] {
   });
 }
 
+// --- Rational helpers ---
+
+function gcd(a: number, b: number): number {
+  a = Math.abs(a); b = Math.abs(b);
+  while (b) { [a, b] = [b, a % b]; }
+  return a;
+}
+
+function makeRat(num: number, den: number, pos?: Pos): SchemeVal {
+  if (den === 0) throw new EvalError('division by zero');
+  if (den < 0) { num = -num; den = -den; }
+  const g = gcd(Math.abs(num), den);
+  num /= g; den /= g;
+  if (den === 1) return { tag: 'number', value: num, pos };
+  return { tag: 'rational', num, den, pos };
+}
+
+function isExactVal(v: SchemeVal): boolean {
+  if (v.tag === 'rational') return true;
+  if (v.tag === 'number') return v.exact !== false && Number.isInteger(v.value);
+  return false;
+}
+
+function toFloat(v: SchemeVal, name: string, pos?: Pos): number {
+  if (v.tag === 'number') return v.value;
+  if (v.tag === 'rational') return v.num / v.den;
+  throw new EvalError(`${fmtPos(pos)}${name}: expected number, got ${schemeToString(v)}`);
+}
+
+function toRatParts(v: SchemeVal): [number, number] {
+  if (v.tag === 'rational') return [v.num, v.den];
+  if (v.tag === 'number') return [v.value, 1];
+  throw new EvalError('not a number');
+}
+
+function expectNumeric(args: SchemeVal[], name: string, pos?: Pos): void {
+  for (const a of args) {
+    if (a.tag !== 'number' && a.tag !== 'rational')
+      throw new EvalError(`${fmtPos(pos)}${name}: expected number, got ${schemeToString(a)}`);
+  }
+}
+
 // --- Env ---
 
 interface Env {
@@ -237,57 +290,98 @@ function makeGlobalEnv(outputBuf: string[]): Env {
   };
 
   defBuiltin('+', (args, p) => {
-    const nums = expectNumbers(args, '+', p);
-    return { tag: 'number', value: nums.reduce((a, b) => a + b, 0) };
+    expectNumeric(args, '+', p);
+    if (args.every(a => isExactVal(a))) {
+      let num = 0, den = 1;
+      for (const a of args) {
+        const [an, ad] = toRatParts(a);
+        num = num * ad + an * den;
+        den = den * ad;
+      }
+      return makeRat(num, den);
+    }
+    return { tag: 'number', value: args.reduce((acc, a) => acc + toFloat(a, '+', p), 0) };
   });
 
   defBuiltin('-', (args, p) => {
     if (args.length === 0) throw new EvalError(`${fmtPos(p)}-: need at least 1 arg`);
-    const nums = expectNumbers(args, '-', p);
-    if (nums.length === 1) return { tag: 'number', value: -nums[0] };
-    return { tag: 'number', value: nums.slice(1).reduce((a, b) => a - b, nums[0]) };
+    expectNumeric(args, '-', p);
+    if (args.length === 1) {
+      if (isExactVal(args[0])) {
+        const [n, d] = toRatParts(args[0]);
+        return makeRat(-n, d);
+      }
+      return { tag: 'number', value: -toFloat(args[0], '-', p) };
+    }
+    if (args.every(a => isExactVal(a))) {
+      let [num, den] = toRatParts(args[0]);
+      for (let i = 1; i < args.length; i++) {
+        const [an, ad] = toRatParts(args[i]);
+        num = num * ad - an * den;
+        den = den * ad;
+      }
+      return makeRat(num, den);
+    }
+    const floats = args.map(a => toFloat(a, '-', p));
+    return { tag: 'number', value: floats.slice(1).reduce((a, b) => a - b, floats[0]) };
   });
 
   defBuiltin('*', (args, p) => {
-    const nums = expectNumbers(args, '*', p);
-    return { tag: 'number', value: nums.reduce((a, b) => a * b, 1) };
+    expectNumeric(args, '*', p);
+    if (args.every(a => isExactVal(a))) {
+      let num = 1, den = 1;
+      for (const a of args) {
+        const [an, ad] = toRatParts(a);
+        num *= an;
+        den *= ad;
+      }
+      return makeRat(num, den);
+    }
+    return { tag: 'number', value: args.reduce((acc, a) => acc * toFloat(a, '*', p), 1) };
   });
 
   defBuiltin('/', (args, p) => {
     if (args.length !== 2) throw new EvalError(`${fmtPos(p)}/: expected 2 args`);
-    const nums = expectNumbers(args, '/', p);
-    if (nums[1] === 0) throw new EvalError(`${fmtPos(p)}division by zero`);
-    return { tag: 'number', value: Math.trunc(nums[0] / nums[1]) };
+    expectNumeric(args, '/', p);
+    if (args.every(a => isExactVal(a))) {
+      const [an, ad] = toRatParts(args[0]);
+      const [bn, bd] = toRatParts(args[1]);
+      if (bn === 0) throw new EvalError(`${fmtPos(p)}division by zero`);
+      return makeRat(an * bd, ad * bn);
+    }
+    const d = toFloat(args[1], '/', p);
+    if (d === 0) throw new EvalError(`${fmtPos(p)}division by zero`);
+    return { tag: 'number', value: toFloat(args[0], '/', p) / d };
   });
 
   defBuiltin('<', (args, p) => {
     if (args.length !== 2) throw new EvalError(`${fmtPos(p)}<: expected 2 args`);
-    const nums = expectNumbers(args, '<', p);
-    return { tag: 'boolean', value: nums[0] < nums[1] };
+    expectNumeric(args, '<', p);
+    return { tag: 'boolean', value: toFloat(args[0], '<', p) < toFloat(args[1], '<', p) };
   });
 
   defBuiltin('>', (args, p) => {
     if (args.length !== 2) throw new EvalError(`${fmtPos(p)}>: expected 2 args`);
-    const nums = expectNumbers(args, '>', p);
-    return { tag: 'boolean', value: nums[0] > nums[1] };
+    expectNumeric(args, '>', p);
+    return { tag: 'boolean', value: toFloat(args[0], '>', p) > toFloat(args[1], '>', p) };
   });
 
   defBuiltin('=', (args, p) => {
     if (args.length !== 2) throw new EvalError(`${fmtPos(p)}=: expected 2 args`);
-    const nums = expectNumbers(args, '=', p);
-    return { tag: 'boolean', value: nums[0] === nums[1] };
+    expectNumeric(args, '=', p);
+    return { tag: 'boolean', value: toFloat(args[0], '=', p) === toFloat(args[1], '=', p) };
   });
 
   defBuiltin('<=', (args, p) => {
     if (args.length !== 2) throw new EvalError(`${fmtPos(p)}<=: expected 2 args`);
-    const nums = expectNumbers(args, '<=', p);
-    return { tag: 'boolean', value: nums[0] <= nums[1] };
+    expectNumeric(args, '<=', p);
+    return { tag: 'boolean', value: toFloat(args[0], '<=', p) <= toFloat(args[1], '<=', p) };
   });
 
   defBuiltin('>=', (args, p) => {
     if (args.length !== 2) throw new EvalError(`${fmtPos(p)}>=: expected 2 args`);
-    const nums = expectNumbers(args, '>=', p);
-    return { tag: 'boolean', value: nums[0] >= nums[1] };
+    expectNumeric(args, '>=', p);
+    return { tag: 'boolean', value: toFloat(args[0], '>=', p) >= toFloat(args[1], '>=', p) };
   });
 
   // List operations
@@ -346,7 +440,7 @@ function makeGlobalEnv(outputBuf: string[]): Env {
   // Type predicates
   defBuiltin('number?', (args, p) => {
     if (args.length !== 1) throw new EvalError(`${fmtPos(p)}number?: expected 1 arg`);
-    return { tag: 'boolean', value: args[0].tag === 'number' };
+    return { tag: 'boolean', value: args[0].tag === 'number' || args[0].tag === 'rational' };
   });
 
   defBuiltin('string?', (args, p) => {
@@ -472,8 +566,12 @@ function makeGlobalEnv(outputBuf: string[]): Env {
   });
 
   const schemeEqual = (a: SchemeVal, b: SchemeVal): boolean => {
+    if ((a.tag === 'number' || a.tag === 'rational') && (b.tag === 'number' || b.tag === 'rational')) {
+      if (a.tag === 'rational' && b.tag === 'rational') return a.num === b.num && a.den === b.den;
+      if (a.tag === 'number' && b.tag === 'number') return a.value === b.value;
+      return false;
+    }
     if (a.tag !== b.tag) return false;
-    if (a.tag === 'number' && b.tag === 'number') return a.value === b.value;
     if (a.tag === 'boolean' && b.tag === 'boolean') return a.value === b.value;
     if (a.tag === 'string' && b.tag === 'string') return a.value === b.value;
     if (a.tag === 'symbol' && b.tag === 'symbol') return a.value === b.value;
@@ -743,7 +841,59 @@ function makeGlobalEnv(outputBuf: string[]): Env {
 
   defBuiltin('integer?', (args, p) => {
     if (args.length !== 1) throw new EvalError(`${fmtPos(p)}integer?: expected 1 arg`);
+    if (args[0].tag === 'rational') return { tag: 'boolean', value: false };
     return { tag: 'boolean', value: args[0].tag === 'number' && Number.isInteger(args[0].value) };
+  });
+
+  // L11: Exact arithmetic & rationals
+  defBuiltin('exact?', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}exact?: expected 1 arg`);
+    return { tag: 'boolean', value: isExactVal(args[0]) };
+  });
+
+  defBuiltin('inexact?', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}inexact?: expected 1 arg`);
+    if (args[0].tag !== 'number' && args[0].tag !== 'rational') return { tag: 'boolean', value: false };
+    return { tag: 'boolean', value: !isExactVal(args[0]) };
+  });
+
+  defBuiltin('exact->inexact', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}exact->inexact: expected 1 arg`);
+    return { tag: 'number', value: toFloat(args[0], 'exact->inexact', p), exact: false };
+  });
+
+  defBuiltin('inexact->exact', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}inexact->exact: expected 1 arg`);
+    const f = toFloat(args[0], 'inexact->exact', p);
+    if (Number.isInteger(f)) return { tag: 'number', value: f };
+    const str = f.toString();
+    const decIdx = str.indexOf('.');
+    if (decIdx >= 0) {
+      const decimals = str.length - decIdx - 1;
+      const pow = Math.pow(10, decimals);
+      const num = Math.round(f * pow);
+      return makeRat(num, pow);
+    }
+    return { tag: 'number', value: f };
+  });
+
+  defBuiltin('numerator', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}numerator: expected 1 arg`);
+    if (args[0].tag === 'rational') return { tag: 'number', value: args[0].num };
+    if (args[0].tag === 'number' && isExactVal(args[0])) return { tag: 'number', value: args[0].value };
+    throw new EvalError(`${fmtPos(p)}numerator: expected exact number`);
+  });
+
+  defBuiltin('denominator', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}denominator: expected 1 arg`);
+    if (args[0].tag === 'rational') return { tag: 'number', value: args[0].den };
+    if (args[0].tag === 'number' && isExactVal(args[0])) return { tag: 'number', value: 1 };
+    throw new EvalError(`${fmtPos(p)}denominator: expected exact number`);
+  });
+
+  defBuiltin('rational?', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}rational?: expected 1 arg`);
+    return { tag: 'boolean', value: args[0].tag === 'rational' || (args[0].tag === 'number' && isExactVal(args[0])) };
   });
 
   // L08: apply
@@ -935,6 +1085,7 @@ function expandMacroCall(
 function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
   switch (expr.tag) {
     case 'number':
+    case 'rational':
     case 'boolean':
     case 'string':
     case 'char':
