@@ -117,6 +117,18 @@ fn env_set(env: &Env, name: String, val: Value) {
     env.borrow_mut().bindings.insert(name, val);
 }
 
+fn env_update(env: &Env, name: &str, val: Value) -> bool {
+    let mut inner = env.borrow_mut();
+    if inner.bindings.contains_key(name) {
+        inner.bindings.insert(name.to_string(), val);
+        true
+    } else if let Some(ref parent) = inner.parent {
+        env_update(parent, name, val)
+    } else {
+        false
+    }
+}
+
 fn default_env() -> Env {
     let env = new_env(None);
     for &name in BUILTINS {
@@ -156,12 +168,40 @@ enum Token {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
 }
 
 #[derive(Debug, Clone)]
 struct SpannedToken {
     token: Token,
     pos: Pos,
+}
+
+/// Parse a character literal starting at `pos` in `chars`.
+/// Returns the char and how many characters were consumed.
+fn parse_char_literal(chars: &[char], pos: usize, start_pos: Pos) -> Result<(char, usize), EvalError> {
+    if pos >= chars.len() {
+        return Err(EvalError::Parse(format!("{start_pos}: incomplete character literal")));
+    }
+    if !chars[pos].is_alphabetic() {
+        return Ok((chars[pos], 1));
+    }
+    let mut end = pos;
+    while end < chars.len() && chars[end].is_alphabetic() {
+        end += 1;
+    }
+    let name: String = chars[pos..end].iter().collect();
+    let consumed = end - pos;
+    if consumed == 1 {
+        return Ok((chars[pos], 1));
+    }
+    let ch = match name.as_str() {
+        "space" => ' ',
+        "newline" => '\n',
+        "tab" => '\t',
+        _ => return Err(EvalError::Parse(format!("{start_pos}: unknown character name: {name}"))),
+    };
+    Ok((ch, consumed))
 }
 
 fn tokenize(input: &str) -> Result<Vec<SpannedToken>, EvalError> {
@@ -253,6 +293,12 @@ fn tokenize(input: &str) -> Result<Vec<SpannedToken>, EvalError> {
                             i += 2;
                             col += 2;
                         }
+                        '\\' => {
+                            let (ch, advance) = parse_char_literal(&chars, i + 2, start_pos)?;
+                            i += 2 + advance;
+                            col += 2 + advance;
+                            tokens.push(SpannedToken { token: Token::Char(ch), pos: start_pos });
+                        }
                         _ => {
                             return Err(EvalError::Parse(format!(
                                 "{start_pos}: unexpected character after #: {}",
@@ -293,6 +339,7 @@ enum Expr {
     Boolean(bool, Pos),
     Str(String, Pos),
     Symbol(String, Pos),
+    Char(char, Pos),
     List(Vec<Expr>, Pos),
 }
 
@@ -303,6 +350,7 @@ impl Expr {
             | Expr::Boolean(_, p)
             | Expr::Str(_, p)
             | Expr::Symbol(_, p)
+            | Expr::Char(_, p)
             | Expr::List(_, p) => *p,
         }
     }
@@ -334,6 +382,11 @@ fn parse(tokens: &[SpannedToken], pos: &mut usize) -> Result<Expr, EvalError> {
             let s = s.clone();
             *pos += 1;
             Ok(Expr::Symbol(s, src_pos))
+        }
+        Token::Char(c) => {
+            let c = *c;
+            *pos += 1;
+            Ok(Expr::Char(c, src_pos))
         }
         Token::Quote => {
             *pos += 1;
@@ -380,7 +433,7 @@ const BUILTINS: &[&str] = &[
     "string-append", "string-length", "substring",
     "string->number", "number->string",
     "symbol->string", "string->symbol",
-    "string-ref", "char?",
+    "string-ref", "char?", "string-copy",
 ];
 
 fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
@@ -389,6 +442,7 @@ fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError>
         Expr::Integer(n, _) => Ok(Value::Integer(*n)),
         Expr::Boolean(b, _) => Ok(Value::Boolean(*b)),
         Expr::Str(s, _) => Ok(Value::Str(s.clone())),
+        Expr::Char(c, _) => Ok(Value::Char(*c)),
         Expr::Symbol(name, _) => {
             env_get(env, name).ok_or_else(|| EvalError::UnboundVariable(format!("{p}: {name}")))
         }
@@ -413,6 +467,7 @@ fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError>
                     "cond" => return eval_cond(&elems[1..], env, output),
                     "and" => return eval_and(&elems[1..], env, output),
                     "or" => return eval_or(&elems[1..], env, output),
+                    "string-set!" => return eval_string_set(&elems[1..], p, env, output),
                     "not" => {
                         if elems.len() != 2 {
                             return Err(EvalError::Arity(format!("{p}: not expects 1 argument")));
@@ -440,6 +495,7 @@ fn expr_to_value(expr: &Expr) -> Value {
         Expr::Boolean(b, _) => Value::Boolean(*b),
         Expr::Str(s, _) => Value::Str(s.clone()),
         Expr::Symbol(s, _) => Value::Symbol(s.clone()),
+        Expr::Char(c, _) => Value::Char(*c),
         Expr::List(elems, _) => Value::List(elems.iter().map(expr_to_value).collect()),
     }
 }
@@ -551,6 +607,38 @@ fn eval_or(exprs: &[Expr], env: &Env, output: &mut String) -> Result<Value, Eval
         }
     }
     Ok(Value::Boolean(false))
+}
+
+fn eval_string_set(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Arity(format!("{call_pos}: string-set! requires 3 arguments")));
+    }
+    let var_name = match &args[0] {
+        Expr::Symbol(name, _) => name.clone(),
+        _ => return Err(EvalError::Type(format!("{call_pos}: string-set!: first argument must be a variable"))),
+    };
+    let idx_val = eval(&args[1], env, output)?;
+    let idx = match &idx_val {
+        Value::Integer(n) => *n as usize,
+        _ => return Err(EvalError::Type(format!("{call_pos}: string-set!: expected integer index"))),
+    };
+    let ch = match eval(&args[2], env, output)? {
+        Value::Char(c) => c,
+        _ => return Err(EvalError::Type(format!("{call_pos}: string-set!: expected character"))),
+    };
+    let mut s = match env_get(env, &var_name) {
+        Some(Value::Str(s)) => s,
+        Some(_) => return Err(EvalError::Type(format!("{call_pos}: string-set!: expected string"))),
+        None => return Err(EvalError::UnboundVariable(format!("{call_pos}: {var_name}"))),
+    };
+    let mut chars: Vec<char> = s.chars().collect();
+    if idx >= chars.len() {
+        return Err(EvalError::Type(format!("{call_pos}: string-set!: index out of range")));
+    }
+    chars[idx] = ch;
+    s = chars.into_iter().collect();
+    env_update(env, &var_name, Value::Str(s));
+    Ok(Value::Void)
 }
 
 fn eval_let(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
@@ -966,6 +1054,15 @@ fn apply_builtin(name: &str, args: &[Value], call_pos: Pos, output: &mut String)
                 return Err(EvalError::Arity(format!("{call_pos}: char? requires 1 argument")));
             }
             Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
+        }
+        "string-copy" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: string-copy requires 1 argument")));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Str(s.clone())),
+                _ => Err(EvalError::Type(format!("{call_pos}: string-copy: expected string"))),
+            }
         }
         _ => Err(EvalError::UnboundVariable(format!("{call_pos}: {name}"))),
     }
