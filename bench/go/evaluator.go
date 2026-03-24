@@ -2,6 +2,8 @@ package ming
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 )
 
 // EvalStr evaluates one or more Scheme expressions and returns the string
@@ -15,7 +17,7 @@ func EvalStr(input string) (string, error) {
 		return "", &EvalError{Message: "empty input"}
 	}
 
-	env := defaultEnv()
+	env := defaultEnv(nil)
 	var result Value
 	for _, expr := range exprs {
 		result, err = eval(expr, env)
@@ -33,7 +35,27 @@ func EvalStr(input string) (string, error) {
 // EvalStrWithOutput evaluates Scheme expressions and returns both the result
 // string and any captured output from display/write/newline.
 func EvalStrWithOutput(input string) (result string, output string, err error) {
-	return "", "", &EvalError{Message: "not implemented"}
+	exprs, parseErr := parse(input)
+	if parseErr != nil {
+		return "", "", &EvalError{Message: parseErr.Error()}
+	}
+	if len(exprs) == 0 {
+		return "", "", &EvalError{Message: "empty input"}
+	}
+
+	var buf strings.Builder
+	env := defaultEnv(&buf)
+	var res Value
+	for _, expr := range exprs {
+		res, err = eval(expr, env)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	if _, ok := res.(*VoidVal); ok {
+		return "", buf.String(), nil
+	}
+	return res.String(), buf.String(), nil
 }
 
 // eval evaluates an expression in the given environment.
@@ -155,7 +177,7 @@ type BuiltinFunc struct {
 
 func (b *BuiltinFunc) String() string { return fmt.Sprintf("#<procedure %s>", b.Name) }
 
-func defaultEnv() *Env {
+func defaultEnv(output *strings.Builder) *Env {
 	env := NewEnv(nil)
 
 	env.Set("+", &BuiltinFunc{Name: "+", Fn: builtinAdd})
@@ -181,6 +203,46 @@ func defaultEnv() *Env {
 	env.Set("pair?", &BuiltinFunc{Name: "pair?", Fn: builtinPairQ})
 	env.Set("symbol?", &BuiltinFunc{Name: "symbol?", Fn: builtinSymbolQ})
 	env.Set("append", &BuiltinFunc{Name: "append", Fn: builtinAppend})
+
+	// L05 builtins — I/O
+	env.Set("display", &BuiltinFunc{Name: "display", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("display: expected 1 argument, got %d", len(args))
+		}
+		if output != nil {
+			output.WriteString(DisplayString(args[0]))
+		}
+		return &VoidVal{}, nil
+	}})
+	env.Set("write", &BuiltinFunc{Name: "write", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("write: expected 1 argument, got %d", len(args))
+		}
+		if output != nil {
+			output.WriteString(args[0].String())
+		}
+		return &VoidVal{}, nil
+	}})
+	env.Set("newline", &BuiltinFunc{Name: "newline", Fn: func(args []Value) (Value, error) {
+		if len(args) != 0 {
+			return nil, fmt.Errorf("newline: expected 0 arguments, got %d", len(args))
+		}
+		if output != nil {
+			output.WriteByte('\n')
+		}
+		return &VoidVal{}, nil
+	}})
+
+	// L05 builtins — string operations
+	env.Set("string-append", &BuiltinFunc{Name: "string-append", Fn: builtinStringAppend})
+	env.Set("string-length", &BuiltinFunc{Name: "string-length", Fn: builtinStringLength})
+	env.Set("substring", &BuiltinFunc{Name: "substring", Fn: builtinSubstring})
+	env.Set("string->number", &BuiltinFunc{Name: "string->number", Fn: builtinStringToNumber})
+	env.Set("number->string", &BuiltinFunc{Name: "number->string", Fn: builtinNumberToString})
+	env.Set("symbol->string", &BuiltinFunc{Name: "symbol->string", Fn: builtinSymbolToString})
+	env.Set("string->symbol", &BuiltinFunc{Name: "string->symbol", Fn: builtinStringToSymbol})
+	env.Set("string-ref", &BuiltinFunc{Name: "string-ref", Fn: builtinStringRef})
+	env.Set("char?", &BuiltinFunc{Name: "char?", Fn: builtinCharQ})
 
 	return env
 }
@@ -700,5 +762,128 @@ func builtinSymbolQ(args []Value) (Value, error) {
 		return nil, fmt.Errorf("symbol?: expected 1 argument")
 	}
 	_, ok := args[0].(*SymbolVal)
+	return &BoolVal{Val: ok}, nil
+}
+
+// L05 builtins
+
+func builtinStringAppend(args []Value) (Value, error) {
+	var buf strings.Builder
+	for _, a := range args {
+		s, ok := a.(*StringVal)
+		if !ok {
+			return nil, fmt.Errorf("string-append: expected string, got %s", a.String())
+		}
+		buf.WriteString(s.Val)
+	}
+	return &StringVal{Val: buf.String()}, nil
+}
+
+func builtinStringLength(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("string-length: expected 1 argument, got %d", len(args))
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, fmt.Errorf("string-length: expected string, got %s", args[0].String())
+	}
+	return &IntVal{Val: int64(len([]rune(s.Val)))}, nil
+}
+
+func builtinSubstring(args []Value) (Value, error) {
+	if len(args) != 3 {
+		return nil, fmt.Errorf("substring: expected 3 arguments, got %d", len(args))
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, fmt.Errorf("substring: expected string, got %s", args[0].String())
+	}
+	start, ok := args[1].(*IntVal)
+	if !ok {
+		return nil, fmt.Errorf("substring: expected number, got %s", args[1].String())
+	}
+	end, ok := args[2].(*IntVal)
+	if !ok {
+		return nil, fmt.Errorf("substring: expected number, got %s", args[2].String())
+	}
+	runes := []rune(s.Val)
+	if start.Val < 0 || end.Val < start.Val || int(end.Val) > len(runes) {
+		return nil, fmt.Errorf("substring: index out of range")
+	}
+	return &StringVal{Val: string(runes[start.Val:end.Val])}, nil
+}
+
+func builtinStringToNumber(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("string->number: expected 1 argument, got %d", len(args))
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, fmt.Errorf("string->number: expected string, got %s", args[0].String())
+	}
+	n, err := strconv.ParseInt(s.Val, 10, 64)
+	if err != nil {
+		return &BoolVal{Val: false}, nil
+	}
+	return &IntVal{Val: n}, nil
+}
+
+func builtinNumberToString(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("number->string: expected 1 argument, got %d", len(args))
+	}
+	n, ok := args[0].(*IntVal)
+	if !ok {
+		return nil, fmt.Errorf("number->string: expected number, got %s", args[0].String())
+	}
+	return &StringVal{Val: strconv.FormatInt(n.Val, 10)}, nil
+}
+
+func builtinSymbolToString(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("symbol->string: expected 1 argument, got %d", len(args))
+	}
+	s, ok := args[0].(*SymbolVal)
+	if !ok {
+		return nil, fmt.Errorf("symbol->string: expected symbol, got %s", args[0].String())
+	}
+	return &StringVal{Val: s.Name}, nil
+}
+
+func builtinStringToSymbol(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("string->symbol: expected 1 argument, got %d", len(args))
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, fmt.Errorf("string->symbol: expected string, got %s", args[0].String())
+	}
+	return &SymbolVal{Name: s.Val}, nil
+}
+
+func builtinStringRef(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("string-ref: expected 2 arguments, got %d", len(args))
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, fmt.Errorf("string-ref: expected string, got %s", args[0].String())
+	}
+	idx, ok := args[1].(*IntVal)
+	if !ok {
+		return nil, fmt.Errorf("string-ref: expected number, got %s", args[1].String())
+	}
+	runes := []rune(s.Val)
+	if idx.Val < 0 || int(idx.Val) >= len(runes) {
+		return nil, fmt.Errorf("string-ref: index out of range")
+	}
+	return &CharVal{Val: runes[idx.Val]}, nil
+}
+
+func builtinCharQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("char?: expected 1 argument, got %d", len(args))
+	}
+	_, ok := args[0].(*CharVal)
 	return &BoolVal{Val: ok}, nil
 }
