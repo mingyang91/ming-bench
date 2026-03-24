@@ -12,7 +12,7 @@ type SchemeVal =
   | { tag: 'char'; value: string; pos?: Pos }
   | { tag: 'list'; elements: SchemeVal[]; pos?: Pos }
   | { tag: 'builtin'; name: string; func: (args: SchemeVal[], callPos?: Pos) => SchemeVal; pos?: Pos }
-  | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env; pos?: Pos }
+  | { tag: 'lambda'; params: string[]; restParam?: string; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'void'; pos?: Pos };
 
 // --- Parser ---
@@ -154,6 +154,24 @@ function displayString(val: SchemeVal): string {
 
 function fmtPos(p?: Pos): string {
   return p ? `${p.line}:${p.col}: ` : '';
+}
+
+function parseParams(elements: SchemeVal[], pos?: Pos): { params: string[]; restParam?: string } {
+  const params: string[] = [];
+  let restParam: string | undefined;
+  for (let i = 0; i < elements.length; i++) {
+    const el = elements[i];
+    if (el.tag === 'symbol' && el.value === '.') {
+      if (i + 1 !== elements.length - 1) throw new EvalError(`${fmtPos(pos)}invalid dot in parameter list`);
+      const rest = elements[i + 1];
+      if (rest.tag !== 'symbol') throw new EvalError(`${fmtPos(pos)}rest parameter must be a symbol`);
+      restParam = rest.value;
+      break;
+    }
+    if (el.tag !== 'symbol') throw new EvalError(`${fmtPos(pos)}parameter must be a symbol`);
+    params.push(el.value);
+  }
+  return { params, restParam };
 }
 
 function expectNumbers(args: SchemeVal[], name: string, pos?: Pos): number[] {
@@ -421,6 +439,36 @@ function makeGlobalEnv(outputBuf: string[]): Env {
     return { tag: 'boolean', value: args[0].tag === 'char' };
   });
 
+  // L08: apply
+  defBuiltin('apply', (args, p) => {
+    if (args.length < 2) throw new EvalError(`${fmtPos(p)}apply: expected at least 2 args`);
+    const func = args[0];
+    const last = args[args.length - 1];
+    if (last.tag !== 'list') throw new EvalError(`${fmtPos(p)}apply: last argument must be a list`);
+    const callArgs = [...args.slice(1, -1), ...last.elements];
+    if (func.tag === 'builtin') return func.func(callArgs, p);
+    if (func.tag === 'lambda') {
+      if (func.restParam) {
+        if (callArgs.length < func.params.length) throw new EvalError(`${fmtPos(p)}wrong number of arguments`);
+      } else {
+        if (callArgs.length !== func.params.length) throw new EvalError(`${fmtPos(p)}wrong number of arguments`);
+      }
+      const callEnv = childEnv(func.env);
+      for (let i = 0; i < func.params.length; i++) {
+        envDefine(callEnv, func.params[i], callArgs[i]);
+      }
+      if (func.restParam) {
+        envDefine(callEnv, func.restParam, { tag: 'list', elements: callArgs.slice(func.params.length) });
+      }
+      let result: SchemeVal = { tag: 'void' };
+      for (const bodyExpr of func.body) {
+        result = evalScheme(bodyExpr, callEnv);
+      }
+      return result;
+    }
+    throw new EvalError(`${fmtPos(p)}apply: not a procedure`);
+  });
+
   return env;
 }
 
@@ -469,11 +517,8 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
           }
           if (elems[1].tag === 'list' && elems[1].elements.length > 0 && elems[1].elements[0].tag === 'symbol') {
             const fnName = elems[1].elements[0].value;
-            const params = elems[1].elements.slice(1).map(p => {
-              if (p.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}define: parameter must be a symbol`);
-              return p.value;
-            });
-            const lambda: SchemeVal = { tag: 'lambda', params, body: elems.slice(2), env };
+            const { params, restParam } = parseParams(elems[1].elements.slice(1), expr.pos);
+            const lambda: SchemeVal = { tag: 'lambda', params, restParam, body: elems.slice(2), env };
             envDefine(env, fnName, lambda);
             return { tag: 'void' };
           }
@@ -482,12 +527,13 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
 
         if (name === 'lambda') {
           if (elems.length < 3) throw new EvalError(`${fmtPos(expr.pos)}lambda: wrong argument count`);
+          if (elems[1].tag === 'symbol') {
+            // (lambda args body...) — all args as rest
+            return { tag: 'lambda', params: [], restParam: elems[1].value, body: elems.slice(2), env };
+          }
           if (elems[1].tag !== 'list') throw new EvalError(`${fmtPos(expr.pos)}lambda: params must be a list`);
-          const params = elems[1].elements.map(p => {
-            if (p.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}lambda: parameter must be a symbol`);
-            return p.value;
-          });
-          return { tag: 'lambda', params, body: elems.slice(2), env };
+          const { params, restParam } = parseParams(elems[1].elements, expr.pos);
+          return { tag: 'lambda', params, restParam, body: elems.slice(2), env };
         }
 
         if (name === 'and') {
@@ -626,10 +672,17 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
       }
 
       if (func.tag === 'lambda') {
-        if (args.length !== func.params.length) throw new EvalError(`${fmtPos(expr.pos)}wrong number of arguments`);
+        if (func.restParam) {
+          if (args.length < func.params.length) throw new EvalError(`${fmtPos(expr.pos)}wrong number of arguments`);
+        } else {
+          if (args.length !== func.params.length) throw new EvalError(`${fmtPos(expr.pos)}wrong number of arguments`);
+        }
         const callEnv = childEnv(func.env);
         for (let i = 0; i < func.params.length; i++) {
           envDefine(callEnv, func.params[i], args[i]);
+        }
+        if (func.restParam) {
+          envDefine(callEnv, func.restParam, { tag: 'list', elements: args.slice(func.params.length) });
         }
         let result: SchemeVal = { tag: 'void' };
         for (const bodyExpr of func.body) {
