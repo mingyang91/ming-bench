@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::scheme::value::Value;
+use crate::scheme::value::{Value, ValueKind};
 
 #[derive(Debug, Clone)]
 pub struct Env {
@@ -37,7 +37,7 @@ impl Env {
         for name in &["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
                       "cons", "car", "cdr", "null?", "list", "length", "append",
                       "string?", "number?", "boolean?", "pair?", "symbol?"] {
-            env.set(name.to_string(), Value::Symbol(name.to_string()));
+            env.set(name.to_string(), Value::unpos(ValueKind::Symbol(name.to_string())));
         }
         env
     }

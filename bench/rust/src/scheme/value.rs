@@ -2,8 +2,10 @@ use std::fmt;
 use std::rc::Rc;
 use crate::scheme::env::Env;
 
+pub type Pos = (usize, usize);
+
 #[derive(Debug, Clone)]
-pub enum Value {
+pub enum ValueKind {
     Integer(i64),
     Boolean(bool),
     Str(String),
@@ -17,43 +19,61 @@ pub enum Value {
     Void,
 }
 
-impl PartialEq for Value {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::Integer(a), Value::Integer(b)) => a == b,
-            (Value::Boolean(a), Value::Boolean(b)) => a == b,
-            (Value::Str(a), Value::Str(b)) => a == b,
-            (Value::Symbol(a), Value::Symbol(b)) => a == b,
-            (Value::List(a), Value::List(b)) => a == b,
-            (Value::Void, Value::Void) => true,
-            _ => false,
-        }
-    }
+#[derive(Debug, Clone)]
+pub struct Value {
+    pub kind: ValueKind,
+    pub pos: Pos,
 }
 
 impl Value {
+    pub fn new(kind: ValueKind, pos: Pos) -> Self {
+        Value { kind, pos }
+    }
+
+    pub fn unpos(kind: ValueKind) -> Self {
+        Value { kind, pos: (0, 0) }
+    }
+
     pub fn is_truthy(&self) -> bool {
-        !matches!(self, Value::Boolean(false))
+        !matches!(self.kind, ValueKind::Boolean(false))
     }
 
     pub fn to_display(&self) -> String {
-        match self {
-            Value::Integer(n) => n.to_string(),
-            Value::Boolean(true) => "#t".to_string(),
-            Value::Boolean(false) => "#f".to_string(),
-            Value::Str(s) => format!("\"{}\"", s),
-            Value::Symbol(s) => s.clone(),
-            Value::List(elems) => {
+        match &self.kind {
+            ValueKind::Integer(n) => n.to_string(),
+            ValueKind::Boolean(true) => "#t".to_string(),
+            ValueKind::Boolean(false) => "#f".to_string(),
+            ValueKind::Str(s) => format!("\"{}\"", s),
+            ValueKind::Symbol(s) => s.clone(),
+            ValueKind::List(elems) => {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_display()).collect();
                 format!("({})", inner.join(" "))
             }
-            Value::Lambda { .. } => "#<procedure>".to_string(),
-            Value::Void => "".to_string(),
+            ValueKind::Lambda { .. } => "#<procedure>".to_string(),
+            ValueKind::Void => "".to_string(),
         }
     }
 
     pub fn as_integer(&self) -> Option<i64> {
-        if let Value::Integer(n) = self { Some(*n) } else { None }
+        if let ValueKind::Integer(n) = self.kind { Some(n) } else { None }
+    }
+
+    pub fn fmt_pos(&self) -> String {
+        format!("{}:{}", self.pos.0, self.pos.1)
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.kind, &other.kind) {
+            (ValueKind::Integer(a), ValueKind::Integer(b)) => a == b,
+            (ValueKind::Boolean(a), ValueKind::Boolean(b)) => a == b,
+            (ValueKind::Str(a), ValueKind::Str(b)) => a == b,
+            (ValueKind::Symbol(a), ValueKind::Symbol(b)) => a == b,
+            (ValueKind::List(a), ValueKind::List(b)) => a == b,
+            (ValueKind::Void, ValueKind::Void) => true,
+            _ => false,
+        }
     }
 }
 
