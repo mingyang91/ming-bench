@@ -16,6 +16,7 @@ type SchemeVal =
   | { tag: 'lambda'; params: string[]; restParam?: string; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'macro'; literals: string[]; rules: { pattern: SchemeVal; template: SchemeVal }[]; defEnv: Env; pos?: Pos }
   | { tag: 'record'; typeName: string; fields: Map<string, SchemeVal>; pos?: Pos }
+  | { tag: 'case-lambda'; clauses: { params: string[]; restParam?: string; body: SchemeVal[] }[]; env: Env; pos?: Pos }
   | { tag: 'void'; pos?: Pos };
 
 // --- Parser ---
@@ -158,6 +159,7 @@ function schemeToString(val: SchemeVal): string {
     }
     case 'builtin': return `#<procedure:${val.name}>`;
     case 'lambda': return '#<procedure>';
+    case 'case-lambda': return '#<procedure>';
     case 'macro': return '#<macro>';
     case 'record': return `#<record:${val.typeName}>`;
     case 'void': return '';
@@ -465,6 +467,12 @@ function makeGlobalEnv(outputBuf: string[]): Env {
     return { tag: 'boolean', value: args[0].tag === 'symbol' };
   });
 
+  defBuiltin('procedure?', (args, p) => {
+    if (args.length !== 1) throw new EvalError(`${fmtPos(p)}procedure?: expected 1 arg`);
+    const t = args[0].tag;
+    return { tag: 'boolean', value: t === 'builtin' || t === 'lambda' || t === 'case-lambda' };
+  });
+
   // L05: Display/Write/Newline
   defBuiltin('display', (args, p) => {
     if (args.length !== 1) throw new EvalError(`${fmtPos(p)}display: expected 1 arg`);
@@ -618,6 +626,8 @@ function makeGlobalEnv(outputBuf: string[]): Env {
           res = evalScheme(bodyExpr, callEnv);
         }
         result.push(res);
+      } else if (func.tag === 'case-lambda') {
+        result.push(applyCaseLambda(func, callArgs, p));
       } else {
         throw new EvalError(`${fmtPos(p)}map: not a procedure`);
       }
@@ -649,6 +659,8 @@ function makeGlobalEnv(outputBuf: string[]): Env {
         for (const bodyExpr of func.body) {
           evalScheme(bodyExpr, callEnv);
         }
+      } else if (func.tag === 'case-lambda') {
+        applyCaseLambda(func, callArgs, p);
       } else {
         throw new EvalError(`${fmtPos(p)}for-each: not a procedure`);
       }
@@ -925,6 +937,7 @@ function makeGlobalEnv(outputBuf: string[]): Env {
       }
       return result;
     }
+    if (func.tag === 'case-lambda') return applyCaseLambda(func, callArgs, p);
     throw new EvalError(`${fmtPos(p)}apply: not a procedure`);
   });
 
@@ -935,7 +948,7 @@ function makeGlobalEnv(outputBuf: string[]): Env {
 
 const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'lambda', 'and', 'or', 'not', 'begin',
-  'cond', 'set!', 'string-set!', 'let', 'define-syntax', 'define-record-type'
+  'cond', 'set!', 'string-set!', 'let', 'define-syntax', 'define-record-type', 'case-lambda'
 ]);
 
 type MacroBindings = Map<string, SchemeVal | SchemeVal[]>;
@@ -1082,6 +1095,40 @@ function expandMacroCall(
   throw new EvalError('no matching macro pattern');
 }
 
+// --- case-lambda helper ---
+
+function applyCaseLambda(func: Extract<SchemeVal, { tag: 'case-lambda' }>, args: SchemeVal[], callPos?: Pos): SchemeVal {
+  for (const clause of func.clauses) {
+    if (clause.restParam) {
+      if (args.length >= clause.params.length) {
+        const callEnv = childEnv(func.env);
+        for (let i = 0; i < clause.params.length; i++) {
+          envDefine(callEnv, clause.params[i], args[i]);
+        }
+        envDefine(callEnv, clause.restParam, { tag: 'list', elements: args.slice(clause.params.length) });
+        let result: SchemeVal = { tag: 'void' };
+        for (const bodyExpr of clause.body) {
+          result = evalScheme(bodyExpr, callEnv);
+        }
+        return result;
+      }
+    } else {
+      if (args.length === clause.params.length) {
+        const callEnv = childEnv(func.env);
+        for (let i = 0; i < clause.params.length; i++) {
+          envDefine(callEnv, clause.params[i], args[i]);
+        }
+        let result: SchemeVal = { tag: 'void' };
+        for (const bodyExpr of clause.body) {
+          result = evalScheme(bodyExpr, callEnv);
+        }
+        return result;
+      }
+    }
+  }
+  throw new EvalError(`${fmtPos(callPos)}no matching clause for ${args.length} arguments`);
+}
+
 // --- Eval ---
 
 function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
@@ -1145,6 +1192,21 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
           if (elems[1].tag !== 'list') throw new EvalError(`${fmtPos(expr.pos)}lambda: params must be a list`);
           const { params, restParam } = parseParams(elems[1].elements, expr.pos);
           return { tag: 'lambda', params, restParam, body: elems.slice(2), env };
+        }
+
+        if (name === 'case-lambda') {
+          const clauses: { params: string[]; restParam?: string; body: SchemeVal[] }[] = [];
+          for (let i = 1; i < elems.length; i++) {
+            const clause = elems[i];
+            if (clause.tag !== 'list' || clause.elements.length < 2)
+              throw new EvalError(`${fmtPos(expr.pos)}case-lambda: invalid clause`);
+            const paramForm = clause.elements[0];
+            if (paramForm.tag !== 'list')
+              throw new EvalError(`${fmtPos(expr.pos)}case-lambda: params must be a list`);
+            const { params, restParam } = parseParams(paramForm.elements, expr.pos);
+            clauses.push({ params, restParam, body: clause.elements.slice(1) });
+          }
+          return { tag: 'case-lambda', clauses, env, pos: expr.pos };
         }
 
         if (name === 'and') {
@@ -1384,11 +1446,16 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
         return result;
       }
 
+      if (func.tag === 'case-lambda') {
+        return applyCaseLambda(func, args, expr.pos);
+      }
+
       throw new EvalError(`${fmtPos(expr.pos)}not a procedure: ${schemeToString(func)}`);
     }
 
     case 'builtin':
     case 'lambda':
+    case 'case-lambda':
     case 'macro':
     case 'record':
     case 'void':
