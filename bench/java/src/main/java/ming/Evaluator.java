@@ -33,7 +33,7 @@ public class Evaluator {
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "if", "let", "begin", "set!", "define", "lambda", "quote", "cond",
-        "and", "or", "not", "define-syntax", "syntax-rules"
+        "and", "or", "not", "define-syntax", "syntax-rules", "define-record-type"
     );
 
     // Output buffer for display/write/newline
@@ -358,6 +358,7 @@ public class Evaluator {
                         return Boolean.FALSE.equals(val) ? Boolean.TRUE : Boolean.FALSE;
                     }
                     case "define-syntax" -> { return evalDefineSyntax(list, env); }
+                    case "define-record-type" -> { return evalDefineRecordType(list, env); }
                 }
                 // Check for macro usage
                 try {
@@ -570,6 +571,81 @@ public class Evaluator {
     // --- Macros ---
 
     @SuppressWarnings("unchecked")
+    private Object evalDefineRecordType(List<?> list, Environment env) throws EvalError {
+        // (define-record-type <name> (constructor field...) predicate (field accessor) ...)
+        if (list.size() < 4) throw error("define-record-type: bad syntax");
+
+        // Type name
+        Object typeNameObj = list.get(1);
+        if (typeNameObj instanceof Located loc) typeNameObj = loc.value();
+        if (!(typeNameObj instanceof String typeName)) throw error("define-record-type: expected type name");
+
+        // Constructor: (constructor-name field ...)
+        Object ctorObj = list.get(2);
+        if (ctorObj instanceof Located loc) ctorObj = loc.value();
+        if (!(ctorObj instanceof List<?> ctorList) || ctorList.size() < 1)
+            throw error("define-record-type: expected constructor");
+        Object ctorNameObj = ctorList.get(0);
+        if (ctorNameObj instanceof Located loc) ctorNameObj = loc.value();
+        String ctorName = (String) ctorNameObj;
+        List<String> ctorFields = new ArrayList<>();
+        for (int i = 1; i < ctorList.size(); i++) {
+            Object f = ctorList.get(i);
+            if (f instanceof Located loc) f = loc.value();
+            ctorFields.add((String) f);
+        }
+
+        // Predicate name
+        Object predObj = list.get(3);
+        if (predObj instanceof Located loc) predObj = loc.value();
+        String predName = (String) predObj;
+
+        // Field accessors: (field-name accessor-name) ...
+        Map<String, String> fieldAccessors = new HashMap<>(); // accessor-name -> field-name
+        for (int i = 4; i < list.size(); i++) {
+            Object fieldSpec = list.get(i);
+            if (fieldSpec instanceof Located loc) fieldSpec = loc.value();
+            List<?> spec = (List<?>) fieldSpec;
+            Object fname = spec.get(0);
+            if (fname instanceof Located loc) fname = loc.value();
+            Object aname = spec.get(1);
+            if (aname instanceof Located loc) aname = loc.value();
+            fieldAccessors.put((String) aname, (String) fname);
+        }
+
+        // Define constructor
+        env.define(ctorName, (BuiltinProc) args -> {
+            if (args.size() != ctorFields.size())
+                throw new EvalError("1:1 " + ctorName + ": expected " + ctorFields.size() + " args");
+            Map<String, Object> fields = new HashMap<>();
+            for (int i = 0; i < ctorFields.size(); i++) {
+                fields.put(ctorFields.get(i), args.get(i));
+            }
+            return new SchemeRecord(typeName, fields);
+        });
+
+        // Define predicate
+        env.define(predName, (BuiltinProc) args -> {
+            if (args.size() != 1) throw new EvalError("1:1 " + predName + ": expected 1 arg");
+            return (args.get(0) instanceof SchemeRecord r && r.typeName().equals(typeName))
+                ? Boolean.TRUE : Boolean.FALSE;
+        });
+
+        // Define accessors
+        for (var entry : fieldAccessors.entrySet()) {
+            String accessorName = entry.getKey();
+            String fieldName = entry.getValue();
+            env.define(accessorName, (BuiltinProc) args -> {
+                if (args.size() != 1) throw new EvalError("1:1 " + accessorName + ": expected 1 arg");
+                if (!(args.get(0) instanceof SchemeRecord r) || !r.typeName().equals(typeName))
+                    throw new EvalError("1:1 " + accessorName + ": not a " + typeName);
+                return r.getField(fieldName);
+            });
+        }
+
+        return VOID;
+    }
+
     private Object evalDefineSyntax(List<?> list, Environment env) throws EvalError {
         if (list.size() != 3) throw error("define-syntax: bad syntax");
         Object nameObj = list.get(1);
