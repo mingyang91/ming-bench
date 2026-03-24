@@ -117,6 +117,7 @@ pub(super) enum Value {
         clauses: Vec<CaseLambdaClause>,
     },
     Continuation(Kont, Vec<WindEntry>),
+    Values(Vec<Value>),
     Void,
 }
 
@@ -183,180 +184,6 @@ pub(super) fn to_list_vec(val: &Value) -> Option<Vec<Value>> {
             }
         }
         _ => None,
-    }
-}
-
-impl fmt::Display for Value {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Value::Integer(n) => write!(f, "{n}"),
-            Value::Float(v) => {
-                let s = format!("{v}");
-                if s.contains('.') || s.contains('e') || s.contains('E') || s.contains("inf") || s.contains("NaN") {
-                    write!(f, "{s}")
-                } else {
-                    write!(f, "{s}.0")
-                }
-            }
-            Value::Rational(n, d) => write!(f, "{n}/{d}"),
-            Value::Boolean(true) => write!(f, "#t"),
-            Value::Boolean(false) => write!(f, "#f"),
-            Value::Str(s) => write!(f, "\"{s}\""),
-            Value::Symbol(s) => write!(f, "{s}"),
-            Value::List(elems) => {
-                write!(f, "(")?;
-                for (i, e) in elems.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " ")?;
-                    }
-                    write!(f, "{e}")?;
-                }
-                write!(f, ")")
-            }
-            Value::Pair(p) => {
-                use std::collections::HashSet;
-                let mut seen = HashSet::new();
-                seen.insert(Rc::as_ptr(p) as usize);
-                let pair = p.borrow();
-                write!(f, "({}", pair.0)?;
-                let mut cur = pair.1.clone();
-                drop(pair);
-                loop {
-                    match &cur {
-                        Value::Pair(p2) => {
-                            let ptr = Rc::as_ptr(p2) as usize;
-                            if !seen.insert(ptr) {
-                                write!(f, " ...")?;
-                                break;
-                            }
-                            let p2b = p2.borrow();
-                            write!(f, " {}", p2b.0)?;
-                            let next = p2b.1.clone();
-                            drop(p2b);
-                            cur = next;
-                        }
-                        Value::List(elems) if elems.is_empty() => break,
-                        Value::List(elems) => {
-                            for e in elems {
-                                write!(f, " {e}")?;
-                            }
-                            break;
-                        }
-                        other => {
-                            write!(f, " . {other}")?;
-                            break;
-                        }
-                    }
-                }
-                write!(f, ")")
-            }
-            Value::Vector(v) => {
-                let elems = v.borrow();
-                write!(f, "#(")?;
-                for (i, e) in elems.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " ")?;
-                    }
-                    write!(f, "{e}")?;
-                }
-                write!(f, ")")
-            }
-            Value::Char(c) => match c {
-                ' ' => write!(f, "#\\space"),
-                '\n' => write!(f, "#\\newline"),
-                '\t' => write!(f, "#\\tab"),
-                _ => write!(f, "#\\{c}"),
-            },
-            Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Continuation(..) => write!(f, "#<procedure>"),
-            Value::Builtin(name) => write!(f, "#<builtin:{name}>"),
-            Value::Macro { .. } => write!(f, "#<macro>"),
-            Value::Record { type_name, .. } => write!(f, "#<record:{type_name}>"),
-            Value::RecordConstructor { .. }
-            | Value::RecordPredicate { .. }
-            | Value::RecordAccessor { .. } => write!(f, "#<procedure>"),
-            Value::Void => write!(f, ""),
-        }
-    }
-}
-
-impl Value {
-    /// Format for `display` — strings without quotes.
-    fn display_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Value::Str(s) => write!(f, "{s}"),
-            Value::Char(c) => write!(f, "{c}"),
-            Value::List(elems) => {
-                write!(f, "(")?;
-                for (i, e) in elems.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " ")?;
-                    }
-                    e.display_fmt(f)?;
-                }
-                write!(f, ")")
-            }
-            Value::Pair(p) => {
-                use std::collections::HashSet;
-                let mut seen = HashSet::new();
-                seen.insert(Rc::as_ptr(p) as usize);
-                let pair = p.borrow();
-                write!(f, "(")?;
-                pair.0.display_fmt(f)?;
-                let mut cur = pair.1.clone();
-                drop(pair);
-                loop {
-                    match &cur {
-                        Value::Pair(p2) => {
-                            let ptr = Rc::as_ptr(p2) as usize;
-                            if !seen.insert(ptr) {
-                                write!(f, " ...")?;
-                                break;
-                            }
-                            let p2b = p2.borrow();
-                            write!(f, " ")?;
-                            p2b.0.display_fmt(f)?;
-                            let next = p2b.1.clone();
-                            drop(p2b);
-                            cur = next;
-                        }
-                        Value::List(elems) if elems.is_empty() => break,
-                        Value::List(elems) => {
-                            for e in elems {
-                                write!(f, " ")?;
-                                e.display_fmt(f)?;
-                            }
-                            break;
-                        }
-                        other => {
-                            write!(f, " . ")?;
-                            other.display_fmt(f)?;
-                            break;
-                        }
-                    }
-                }
-                write!(f, ")")
-            }
-            Value::Vector(v) => {
-                let elems = v.borrow();
-                write!(f, "#(")?;
-                for (i, e) in elems.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " ")?;
-                    }
-                    e.display_fmt(f)?;
-                }
-                write!(f, ")")
-            }
-            Value::Macro { .. } => write!(f, "#<macro>"),
-            other => fmt::Display::fmt(other, f),
-        }
-    }
-}
-
-struct DisplayValue<'a>(&'a Value);
-impl<'a> fmt::Display for DisplayValue<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.display_fmt(f)
     }
 }
 
@@ -476,6 +303,7 @@ pub(super) const BUILTINS: &[&str] = &[
     "call/cc", "call-with-current-continuation",
     "dynamic-wind",
     "raise", "with-exception-handler",
+    "values", "call-with-values",
 ];
 
 // ---------- CEK Machine ----------
@@ -537,6 +365,8 @@ pub(super) enum KontFrame {
     EvWithExcHandler { next: Kont },
     /// raise: error if handler returns from non-continuable raise
     EvRaiseContinuationError,
+    /// call-with-values: producer done, invoke consumer with result values
+    EvCallWithValues { consumer: Value, pos: Pos, next: Kont },
 }
 
 impl fmt::Debug for KontFrame {
@@ -626,7 +456,8 @@ pub(super) fn eval_simple(expr: &Expr, env: &Env, output: &mut String) -> Option
                     // Don't eagerly evaluate CPS-requiring builtins
                     if matches!(name.as_str(), "call/cc" | "call-with-current-continuation"
                         | "apply" | "map" | "for-each" | "dynamic-wind"
-                        | "raise" | "with-exception-handler") {
+                        | "raise" | "with-exception-handler"
+                        | "values" | "call-with-values") {
                         return None;
                     }
                     let mut args = Vec::with_capacity(elems.len() - 1);
@@ -1142,6 +973,15 @@ fn cek_apply_kont(val: Value, kont: &Kont, wind_stack: &mut Vec<WindEntry>, hand
         KontFrame::EvRaiseContinuationError => {
             Err(EvalError::Exception("handler returned from non-continuable exception".into()))
         }
+
+        KontFrame::EvCallWithValues { consumer, pos, next } => {
+            // Producer returned — unpack values and invoke consumer
+            let args = match val {
+                Value::Values(vals) => vals,
+                other => vec![other],
+            };
+            Ok(State::Invoke(consumer.clone(), args, *pos, next.clone()))
+        }
     }
 }
 
@@ -1303,6 +1143,30 @@ fn cek_invoke(func: Value, args: Vec<Value>, pos: Pos, kont: Kont, wind_stack: &
                     handler_stack.push(HandlerEntry::User(handler));
                     let after_kont = Rc::new(KontFrame::EvWithExcHandler { next: kont });
                     Ok(State::Invoke(thunk, vec![], pos, after_kont))
+                }
+                "values" => {
+                    if args.len() == 1 {
+                        // Single value is transparent
+                        Ok(State::Apply(args.into_iter().next().expect("len checked == 1"), kont))
+                    } else {
+                        Ok(State::Apply(Value::Values(args), kont))
+                    }
+                }
+                "call-with-values" => {
+                    if args.len() != 2 {
+                        return Err(EvalError::Arity(format!(
+                            "{pos}: call-with-values expects 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let producer = args[0].clone();
+                    let consumer = args[1].clone();
+                    let cwv_kont = Rc::new(KontFrame::EvCallWithValues {
+                        consumer,
+                        pos,
+                        next: kont,
+                    });
+                    Ok(State::Invoke(producer, vec![], pos, cwv_kont))
                 }
                 "dynamic-wind" => {
                     if args.len() != 3 {

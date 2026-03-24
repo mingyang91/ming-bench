@@ -4,8 +4,9 @@ use std::rc::Rc;
 use super::{
     as_integer, is_proper_list, make_pair, make_rational, to_list_vec,
     value_to_f64, values_eq, values_equal, values_eqv, vec_to_pair_chain,
-    DisplayValue, EvalError, Pos, Value,
+    EvalError, Pos, Value,
 };
+use super::values::DisplayValue;
 
 /// Internal numeric representation for mixed-type arithmetic.
 enum Num {
