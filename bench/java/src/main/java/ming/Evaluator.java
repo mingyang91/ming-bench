@@ -43,7 +43,9 @@ public class Evaluator {
         "if", "let", "let*", "begin", "set!", "define", "lambda", "quote", "cond",
         "and", "or", "not", "define-syntax", "syntax-rules", "define-record-type",
         "letrec", "letrec*", "case", "do", "when", "unless",
-        "syntax-case", "syntax", "with-syntax"
+        "syntax-case", "syntax", "with-syntax",
+        "guard", "raise", "with-exception-handler",
+        "call/cc", "call-with-current-continuation", "dynamic-wind", "case-lambda"
     );
 
     // Output buffer for display/write/newline
@@ -66,6 +68,10 @@ public class Evaluator {
 
     // Exception handler stack for with-exception-handler
     private List<Object> exceptionHandlerStack = new ArrayList<>();
+
+    // Guard handler stack for TCO-compatible guard
+    record GuardHandler(String var, List<?> clauseList, Environment env) {}
+    private final List<GuardHandler> guardHandlerStack = new ArrayList<>();
 
     private EvalError error(String msg) {
         return new EvalError(currentLine + ":" + currentCol + " " + msg);
@@ -351,7 +357,10 @@ public class Evaluator {
 
     @SuppressWarnings("unchecked")
     private Object eval(Object expr, Environment env) throws EvalError {
+        int guardBase = guardHandlerStack.size();
+        try {
         while (true) {  // trampoline loop for TCO
+        try {
         if (expr instanceof Located loc) {
             currentLine = loc.line();
             currentCol = loc.col();
@@ -725,48 +734,19 @@ public class Evaluator {
                         Object varObj = clauseList.get(0);
                         if (varObj instanceof Located vl) varObj = vl.value();
                         if (!(varObj instanceof String)) throw error("guard: variable must be a symbol");
-                        String var = (String) varObj;
-                        // Evaluate body, catching SchemeRaise
-                        Object bodyResult;
+                        String guardVar = (String) varObj;
+                        // Evaluate non-tail body expressions with try/catch
                         try {
-                            bodyResult = null;
-                            for (int bi = 2; bi < list.size(); bi++) {
-                                bodyResult = eval(list.get(bi), env);
+                            for (int bi = 2; bi < list.size() - 1; bi++) {
+                                eval(list.get(bi), env);
                             }
-                            return bodyResult;
                         } catch (SchemeRaise sr) {
-                            // Bind exception to var in a new env
-                            Environment guardEnv = new Environment(env);
-                            guardEnv.define(var, sr.value);
-                            // Evaluate clauses like cond
-                            for (int ci = 1; ci < clauseList.size(); ci++) {
-                                Object clause = clauseList.get(ci);
-                                if (clause instanceof Located cl) clause = cl.value();
-                                if (!(clause instanceof List<?> clist) || clist.isEmpty())
-                                    throw error("guard: bad clause");
-                                Object test = clist.get(0);
-                                if (test instanceof Located tl) test = tl.value();
-                                // Check for else clause
-                                if ("else".equals(test) || (test instanceof String && "else".equals(test))) {
-                                    Object result = VOID;
-                                    for (int ei = 1; ei < clist.size(); ei++) {
-                                        result = eval(clist.get(ei), guardEnv);
-                                    }
-                                    return result;
-                                }
-                                Object testResult = eval(clist.get(0), guardEnv);
-                                if (!Boolean.FALSE.equals(testResult)) {
-                                    if (clist.size() == 1) return testResult;
-                                    Object result = VOID;
-                                    for (int ei = 1; ei < clist.size(); ei++) {
-                                        result = eval(clist.get(ei), guardEnv);
-                                    }
-                                    return result;
-                                }
-                            }
-                            // No clause matched — re-raise
-                            throw sr;
+                            return evalGuardClauses(guardVar, clauseList, sr.value, env);
                         }
+                        // Push handler for tail expression (enables TCO through guard)
+                        guardHandlerStack.add(new GuardHandler(guardVar, clauseList, env));
+                        expr = list.get(list.size() - 1);
+                        continue;
                     }
                     case "with-exception-handler" -> {
                         if (list.size() != 3) throw error("with-exception-handler: expected 2 arguments");
@@ -879,23 +859,43 @@ public class Evaluator {
                 return bp.apply(args);
             }
             if (proc instanceof SchemeContinuation cont) {
-                if (args.size() != 1) throw error("continuation: expected 1 argument");
+                Object val;
+                if (args.size() == 1) {
+                    val = args.get(0);
+                } else {
+                    val = new SchemeValues(new ArrayList<>(args));
+                }
                 if (cont.active) {
                     // Escape: call/cc is on the stack
-                    throw new ContinuationInvoked(cont, args.get(0));
+                    throw new ContinuationInvoked(cont, val);
                 }
                 // Re-entrant: check if replay is possible
                 if (cont.bodyEnv == null || cont.bodyEnv == globalEnv
                         || cont.bodyEnv.getParent() == globalEnv) {
-                    throw new ContinuationInvoked(cont, args.get(0));
+                    throw new ContinuationInvoked(cont, val);
                 }
                 // Deep nested continuation - can't replay, return value
-                return args.get(0);
+                return val;
             }
             throw error("not a procedure: " + schemeToString(proc));
         }
         throw error("cannot evaluate: " + expr);
+        } catch (SchemeRaise sr) {
+            if (guardHandlerStack.size() > guardBase) {
+                GuardHandler gh = guardHandlerStack.remove(guardHandlerStack.size() - 1);
+                // Clean up any remaining handlers from this eval depth
+                while (guardHandlerStack.size() > guardBase)
+                    guardHandlerStack.remove(guardHandlerStack.size() - 1);
+                return evalGuardClauses(gh.var, gh.clauseList, sr.value, gh.env);
+            }
+            throw sr;
+        }
         } // end trampoline while
+        } finally {
+            // Clean up any guard handlers pushed during this eval call
+            while (guardHandlerStack.size() > guardBase)
+                guardHandlerStack.remove(guardHandlerStack.size() - 1);
+        }
     }
 
     // Helper: set up a Lambda call environment (for TCO in eval loop)
@@ -926,6 +926,38 @@ public class Evaluator {
             callEnv.define(lambda.restParam, rest);
         }
         return callEnv;
+    }
+
+    // Evaluate guard clauses (cond-like) against a raised exception
+    private Object evalGuardClauses(String var, List<?> clauseList, Object raised, Environment env) throws EvalError {
+        Environment guardEnv = new Environment(env);
+        guardEnv.define(var, raised);
+        for (int ci = 1; ci < clauseList.size(); ci++) {
+            Object clause = clauseList.get(ci);
+            if (clause instanceof Located cl) clause = cl.value();
+            if (!(clause instanceof List<?> clist) || clist.isEmpty())
+                throw error("guard: bad clause");
+            Object test = clist.get(0);
+            if (test instanceof Located tl) test = tl.value();
+            if ("else".equals(test) || (test instanceof String && "else".equals(test))) {
+                Object result = VOID;
+                for (int ei = 1; ei < clist.size(); ei++) {
+                    result = eval(clist.get(ei), guardEnv);
+                }
+                return result;
+            }
+            Object testResult = eval(clist.get(0), guardEnv);
+            if (!Boolean.FALSE.equals(testResult)) {
+                if (clist.size() == 1) return testResult;
+                Object result = VOID;
+                for (int ei = 1; ei < clist.size(); ei++) {
+                    result = eval(clist.get(ei), guardEnv);
+                }
+                return result;
+            }
+        }
+        // No clause matched — re-raise
+        throw new SchemeRaise(raised);
     }
 
     // Marker for tail call from helper methods
@@ -1493,22 +1525,15 @@ public class Evaluator {
 
                 Object expanded = expandTemplate(rule.template(), bindings, ellipsisVars, renameMap);
 
-                // Bind gensyms for symbols that exist in definition env
-                Environment wrapEnv = new Environment(useEnv);
+                // Bind gensyms directly in use env (not a wrapper scope, to avoid trapping defines)
                 for (Map.Entry<String, String> entry : renameMap.entrySet()) {
                     try {
                         Object val = sr.defEnv.lookup(entry.getKey());
-                        wrapEnv.define(entry.getValue(), val);
+                        useEnv.define(entry.getValue(), val);
                     } catch (EvalError ignored) {
                         // Symbol doesn't exist in def env (e.g., tmp in swap!)
                         // Leave unbound - will be bound by the expansion itself (e.g., let)
                     }
-                }
-
-                // If we created any gensym bindings, wrap the form to eval in that env
-                if (!renameMap.isEmpty()) {
-                    // Return a special wrapper that eval handles
-                    return new MacroExpansion(expanded, wrapEnv);
                 }
                 return expanded;
             }
