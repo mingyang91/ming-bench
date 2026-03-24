@@ -165,13 +165,43 @@ function expectNumbers(args: SchemeVal[], name: string, pos?: Pos): number[] {
 
 // --- Env ---
 
-type Env = Map<string, SchemeVal>;
+interface Env {
+  bindings: Map<string, SchemeVal>;
+  parent: Env | null;
+}
+
+function envLookup(env: Env, name: string): SchemeVal | undefined {
+  let cur: Env | null = env;
+  while (cur) {
+    const val = cur.bindings.get(name);
+    if (val !== undefined) return val;
+    cur = cur.parent;
+  }
+  return undefined;
+}
+
+function envSet(env: Env, name: string, val: SchemeVal): void {
+  let cur: Env | null = env;
+  while (cur) {
+    if (cur.bindings.has(name)) { cur.bindings.set(name, val); return; }
+    cur = cur.parent;
+  }
+  throw new EvalError(`set!: unbound variable: ${name}`);
+}
+
+function envDefine(env: Env, name: string, val: SchemeVal): void {
+  env.bindings.set(name, val);
+}
+
+function childEnv(parent: Env): Env {
+  return { bindings: new Map(), parent };
+}
 
 function makeGlobalEnv(outputBuf: string[]): Env {
-  const env: Env = new Map();
+  const env: Env = { bindings: new Map(), parent: null };
 
   const defBuiltin = (name: string, func: (args: SchemeVal[], callPos?: Pos) => SchemeVal) => {
-    env.set(name, { tag: 'builtin', name, func });
+    envDefine(env, name, { tag: 'builtin', name, func });
   };
 
   defBuiltin('+', (args, p) => {
@@ -405,7 +435,7 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
       return expr;
 
     case 'symbol': {
-      const val = env.get(expr.value);
+      const val = envLookup(env, expr.value);
       if (val === undefined) throw new EvalError(`${fmtPos(expr.pos)}unbound variable: ${expr.value}`);
       return val;
     }
@@ -434,7 +464,7 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
           if (elems.length < 3) throw new EvalError(`${fmtPos(expr.pos)}define: wrong argument count`);
           if (elems[1].tag === 'symbol') {
             const val = evalScheme(elems[2], env);
-            env.set(elems[1].value, val);
+            envDefine(env, elems[1].value, val);
             return { tag: 'void' };
           }
           if (elems[1].tag === 'list' && elems[1].elements.length > 0 && elems[1].elements[0].tag === 'symbol') {
@@ -444,7 +474,7 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
               return p.value;
             });
             const lambda: SchemeVal = { tag: 'lambda', params, body: elems.slice(2), env };
-            env.set(fnName, lambda);
+            envDefine(env, fnName, lambda);
             return { tag: 'void' };
           }
           throw new EvalError(`${fmtPos(expr.pos)}define: invalid syntax`);
@@ -516,10 +546,18 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
           return { tag: 'void' };
         }
 
+        if (name === 'set!') {
+          if (elems.length !== 3) throw new EvalError(`${fmtPos(expr.pos)}set!: wrong argument count`);
+          if (elems[1].tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}set!: first arg must be a symbol`);
+          const val = evalScheme(elems[2], env);
+          envSet(env, elems[1].value, val);
+          return { tag: 'void' };
+        }
+
         if (name === 'string-set!') {
           if (elems.length !== 4) throw new EvalError(`${fmtPos(expr.pos)}string-set!: expected 3 args`);
           if (elems[1].tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}string-set!: first arg must be a variable`);
-          const strVal = env.get(elems[1].value);
+          const strVal = envLookup(env, elems[1].value);
           if (!strVal || strVal.tag !== 'string') throw new EvalError(`${fmtPos(expr.pos)}string-set!: expected string variable`);
           const idx = evalScheme(elems[2], env);
           if (idx.tag !== 'number') throw new EvalError(`${fmtPos(expr.pos)}string-set!: expected number index`);
@@ -528,7 +566,7 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
           const s = strVal.value;
           const i = idx.value;
           if (i < 0 || i >= s.length) throw new EvalError(`${fmtPos(expr.pos)}string-set!: index out of range`);
-          env.set(elems[1].value, { tag: 'string', value: s.slice(0, i) + ch.value + s.slice(i + 1) });
+          envSet(env, elems[1].value, { tag: 'string', value: s.slice(0, i) + ch.value + s.slice(i + 1) });
           return { tag: 'void' };
         }
 
@@ -548,35 +586,32 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
               inits.push(evalScheme(b.elements[1], env));
             }
             const body = elems.slice(3);
-            const lambda: SchemeVal = { tag: 'lambda', params, body, env };
-            // Create env where the loop name is bound to the lambda
-            const loopEnv: Env = new Map(env);
-            loopEnv.set(loopName, lambda);
-            // Update the lambda's closure to include itself
-            (lambda as any).env = loopEnv;
+            const loopEnv = childEnv(env);
+            const lambda: SchemeVal = { tag: 'lambda', params, body, env: loopEnv };
+            envDefine(loopEnv, loopName, lambda);
             // Call with initial values
-            const childEnv: Env = new Map(loopEnv);
+            const callEnv = childEnv(loopEnv);
             for (let i = 0; i < params.length; i++) {
-              childEnv.set(params[i], inits[i]);
+              envDefine(callEnv, params[i], inits[i]);
             }
             let result: SchemeVal = { tag: 'void' };
             for (const bodyExpr of body) {
-              result = evalScheme(bodyExpr, childEnv);
+              result = evalScheme(bodyExpr, callEnv);
             }
             return result;
           }
           // Regular let: (let ((var init) ...) body ...)
           if (elems[1].tag !== 'list') throw new EvalError(`${fmtPos(expr.pos)}let: bindings must be a list`);
-          const childEnv: Env = new Map(env);
+          const letEnv = childEnv(env);
           for (const binding of elems[1].elements) {
             if (binding.tag !== 'list' || binding.elements.length !== 2 || binding.elements[0].tag !== 'symbol')
               throw new EvalError(`${fmtPos(expr.pos)}let: invalid binding`);
             const val = evalScheme(binding.elements[1], env);
-            childEnv.set(binding.elements[0].value, val);
+            envDefine(letEnv, binding.elements[0].value, val);
           }
           let letResult: SchemeVal = { tag: 'void' };
           for (let i = 2; i < elems.length; i++) {
-            letResult = evalScheme(elems[i], childEnv);
+            letResult = evalScheme(elems[i], letEnv);
           }
           return letResult;
         }
@@ -592,13 +627,13 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
 
       if (func.tag === 'lambda') {
         if (args.length !== func.params.length) throw new EvalError(`${fmtPos(expr.pos)}wrong number of arguments`);
-        const childEnv: Env = new Map(func.env);
+        const callEnv = childEnv(func.env);
         for (let i = 0; i < func.params.length; i++) {
-          childEnv.set(func.params[i], args[i]);
+          envDefine(callEnv, func.params[i], args[i]);
         }
         let result: SchemeVal = { tag: 'void' };
         for (const bodyExpr of func.body) {
-          result = evalScheme(bodyExpr, childEnv);
+          result = evalScheme(bodyExpr, callEnv);
         }
         return result;
       }
