@@ -8,6 +8,14 @@ public sealed interface SchemeValue {
     record StringVal(String value) implements SchemeValue {}
     record SymbolVal(String name) implements SchemeValue {}
     record ListVal(List<SchemeValue> elements) implements SchemeValue {}
+    record VoidVal() implements SchemeValue {}
+    record LambdaVal(List<String> params, List<SchemeValue> body, Environment env) implements SchemeValue {}
+    record BuiltinVal(String name, Builtin proc) implements SchemeValue {}
+
+    @FunctionalInterface
+    interface Builtin {
+        SchemeValue apply(SchemeValue[] args) throws EvalError;
+    }
 
     default String display() {
         return switch (this) {
@@ -24,6 +32,9 @@ public sealed interface SchemeValue {
                 sb.append(")");
                 yield sb.toString();
             }
+            case VoidVal v -> "#<void>";
+            case LambdaVal v -> "#<procedure>";
+            case BuiltinVal v -> "#<procedure:" + v.name() + ">";
         };
     }
 
