@@ -19,7 +19,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let env = Env::default_env();
     let (result, output) = eval::with_output_capture(|| {
         let last = eval::eval_program(&exprs, &env)?;
-        Ok::<_, EvalError>(last.to_display())
+        Ok::<_, EvalError>(last.to_display_output())
     });
     Ok((result?, output))
 }
