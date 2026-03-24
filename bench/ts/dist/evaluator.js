@@ -12,6 +12,53 @@ function listToConsPairs(lst) {
     }
     return result;
 }
+// --- Rational helpers ---
+function gcd(a, b) {
+    a = Math.abs(a);
+    b = Math.abs(b);
+    while (b) {
+        [a, b] = [b, a % b];
+    }
+    return a;
+}
+function makeRational(num, den) {
+    if (den === 0)
+        throw new EvalError('division by zero');
+    if (den < 0) {
+        num = -num;
+        den = -den;
+    }
+    const g = gcd(Math.abs(num), den);
+    num /= g;
+    den /= g;
+    if (den === 1)
+        return { tag: 'number', value: num };
+    return { tag: 'rational', num, den };
+}
+function isExact(v) {
+    if (v.tag === 'rational')
+        return true;
+    if (v.tag === 'number')
+        return v.exact !== false && Number.isInteger(v.value);
+    return false;
+}
+function toFloat(v) {
+    if (v.tag === 'number')
+        return v.value;
+    if (v.tag === 'rational')
+        return v.num / v.den;
+    throw new EvalError('expected number');
+}
+function toRational(v) {
+    if (v.tag === 'rational')
+        return { num: v.num, den: v.den };
+    if (v.tag === 'number')
+        return { num: v.value, den: 1 };
+    throw new EvalError('expected number');
+}
+function isNumeric(v) {
+    return v.tag === 'number' || v.tag === 'rational';
+}
 function tokenize(input) {
     const tokens = [];
     let i = 0;
@@ -167,8 +214,16 @@ function parse(tokens) {
                 throw new EvalError(`unknown character name: ${name}`);
             return { tag: 'char', value: ch, pos: p };
         }
+        if (/^-?\d+\/[1-9]\d*$/.test(v)) {
+            const idx = v.indexOf('/');
+            const r = makeRational(parseInt(v.substring(0, idx), 10), parseInt(v.substring(idx + 1), 10));
+            r.pos = p;
+            return r;
+        }
         if (/^-?\d+$/.test(v))
             return { tag: 'number', value: parseInt(v, 10), pos: p };
+        if (/^-?(\d+\.\d*|\d*\.\d+)$/.test(v))
+            return { tag: 'number', value: parseFloat(v), exact: false, pos: p };
         return { tag: 'symbol', value: v, pos: p };
     }
     const exprs = [];
@@ -210,7 +265,12 @@ class Env {
 }
 function displayVal(val) {
     switch (val.tag) {
-        case 'number': return String(val.value);
+        case 'number': {
+            if (val.exact === false && Number.isInteger(val.value))
+                return `${val.value}.0`;
+            return String(val.value);
+        }
+        case 'rational': return `${val.num}/${val.den}`;
         case 'boolean': return val.value ? '#t' : '#f';
         case 'string': return strContent(val); // no quotes for display
         case 'symbol': return val.value;
@@ -259,40 +319,108 @@ function makeGlobalEnv(outputBuf) {
             return { tag: 'number', value: nums.reduce(op, identity) };
         } });
     env.set('+', { tag: 'procedure', value: (...args) => {
-            const nums = args.map(a => { if (a.tag !== 'number')
-                throw new EvalError('expected number'); return a.value; });
-            return { tag: 'number', value: nums.reduce((a, b) => a + b, 0) };
+            for (const a of args)
+                if (!isNumeric(a))
+                    throw new EvalError('expected number');
+            if (args.length === 0)
+                return { tag: 'number', value: 0 };
+            if (args.every(isExact)) {
+                let rn = 0, rd = 1;
+                for (const a of args) {
+                    const r = toRational(a);
+                    rn = rn * r.den + r.num * rd;
+                    rd = rd * r.den;
+                    const g = gcd(Math.abs(rn), rd);
+                    rn /= g;
+                    rd /= g;
+                }
+                return makeRational(rn, rd);
+            }
+            return { tag: 'number', value: args.reduce((s, a) => s + toFloat(a), 0), exact: false };
         } });
     env.set('*', { tag: 'procedure', value: (...args) => {
-            const nums = args.map(a => { if (a.tag !== 'number')
-                throw new EvalError('expected number'); return a.value; });
-            return { tag: 'number', value: nums.reduce((a, b) => a * b, 1) };
+            for (const a of args)
+                if (!isNumeric(a))
+                    throw new EvalError('expected number');
+            if (args.length === 0)
+                return { tag: 'number', value: 1 };
+            if (args.every(isExact)) {
+                let rn = 1, rd = 1;
+                for (const a of args) {
+                    const r = toRational(a);
+                    rn *= r.num;
+                    rd *= r.den;
+                    const g = gcd(Math.abs(rn), rd);
+                    rn /= g;
+                    rd /= g;
+                }
+                return makeRational(rn, rd);
+            }
+            return { tag: 'number', value: args.reduce((s, a) => s * toFloat(a), 1), exact: false };
         } });
     env.set('-', { tag: 'procedure', value: (...args) => {
             if (args.length === 0)
                 throw new EvalError('- requires at least one argument');
-            const nums = args.map(a => { if (a.tag !== 'number')
-                throw new EvalError('expected number'); return a.value; });
+            for (const a of args)
+                if (!isNumeric(a))
+                    throw new EvalError('expected number');
+            if (args.every(isExact)) {
+                if (args.length === 1) {
+                    const r = toRational(args[0]);
+                    return makeRational(-r.num, r.den);
+                }
+                let { num: rn, den: rd } = toRational(args[0]);
+                for (let i = 1; i < args.length; i++) {
+                    const r = toRational(args[i]);
+                    rn = rn * r.den - r.num * rd;
+                    rd = rd * r.den;
+                    const g = gcd(Math.abs(rn), rd);
+                    rn /= g;
+                    rd /= g;
+                }
+                return makeRational(rn, rd);
+            }
+            const nums = args.map(toFloat);
             if (nums.length === 1)
-                return { tag: 'number', value: -nums[0] };
-            return { tag: 'number', value: nums.slice(1).reduce((a, b) => a - b, nums[0]) };
+                return { tag: 'number', value: -nums[0], exact: false };
+            return { tag: 'number', value: nums.slice(1).reduce((a, b) => a - b, nums[0]), exact: false };
         } });
     env.set('/', { tag: 'procedure', value: (...args) => {
             if (args.length < 2)
                 throw new EvalError('/ requires at least two arguments');
-            const nums = args.map(a => { if (a.tag !== 'number')
-                throw new EvalError('expected number'); return a.value; });
+            for (const a of args)
+                if (!isNumeric(a))
+                    throw new EvalError('expected number');
+            if (args.every(isExact)) {
+                let { num: rn, den: rd } = toRational(args[0]);
+                for (let i = 1; i < args.length; i++) {
+                    const r = toRational(args[i]);
+                    if (r.num === 0)
+                        throw new EvalError('division by zero');
+                    rn *= r.den;
+                    rd *= r.num;
+                    if (rd < 0) {
+                        rn = -rn;
+                        rd = -rd;
+                    }
+                    const g = gcd(Math.abs(rn), rd);
+                    rn /= g;
+                    rd /= g;
+                }
+                return makeRational(rn, rd);
+            }
+            const nums = args.map(toFloat);
             return { tag: 'number', value: nums.slice(1).reduce((a, b) => {
                     if (b === 0)
                         throw new EvalError('division by zero');
-                    return Math.trunc(a / b);
-                }, nums[0]) };
+                    return a / b;
+                }, nums[0]), exact: false };
         } });
     const cmpOp = (op) => ({ tag: 'procedure', value: (...args) => {
             if (args.length < 2)
                 throw new EvalError('comparison requires at least two arguments');
-            const nums = args.map(a => { if (a.tag !== 'number')
-                throw new EvalError('expected number'); return a.value; });
+            const nums = args.map(a => { if (!isNumeric(a))
+                throw new EvalError('expected number'); return toFloat(a); });
             for (let i = 0; i < nums.length - 1; i++) {
                 if (!op(nums[i], nums[i + 1]))
                     return { tag: 'boolean', value: false };
@@ -378,7 +506,7 @@ function makeGlobalEnv(outputBuf) {
     env.set('number?', { tag: 'procedure', value: (...args) => {
             if (args.length !== 1)
                 throw new EvalError('number? requires exactly 1 argument');
-            return { tag: 'boolean', value: args[0].tag === 'number' };
+            return { tag: 'boolean', value: isNumeric(args[0]) };
         } });
     env.set('string?', { tag: 'procedure', value: (...args) => {
             if (args.length !== 1)
@@ -506,6 +634,8 @@ function makeGlobalEnv(outputBuf) {
                 return { tag: 'boolean', value: true };
             if (a.tag === 'number' && b.tag === 'number')
                 return { tag: 'boolean', value: a.value === b.value };
+            if (a.tag === 'rational' && b.tag === 'rational')
+                return { tag: 'boolean', value: a.num === b.num && a.den === b.den };
             if (a.tag === 'boolean' && b.tag === 'boolean')
                 return { tag: 'boolean', value: a.value === b.value };
             if (a.tag === 'symbol' && b.tag === 'symbol')
@@ -517,6 +647,8 @@ function makeGlobalEnv(outputBuf) {
             return { tag: 'boolean', value: a === b };
         } });
     const schemeEqual = (a, b) => {
+        if (isNumeric(a) && isNumeric(b))
+            return toFloat(a) === toFloat(b);
         if (a.tag !== b.tag)
             return false;
         if (a.tag === 'nil')
@@ -661,6 +793,66 @@ function makeGlobalEnv(outputBuf) {
             if (args.length !== 1 || args[0].tag !== 'number')
                 throw new EvalError('even?: expected number');
             return { tag: 'boolean', value: args[0].value % 2 === 0 };
+        } });
+    // L11: Exact arithmetic & rationals
+    env.set('exact?', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1)
+                throw new EvalError('exact? requires exactly 1 argument');
+            return { tag: 'boolean', value: isExact(args[0]) };
+        } });
+    env.set('inexact?', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1)
+                throw new EvalError('inexact? requires exactly 1 argument');
+            return { tag: 'boolean', value: isNumeric(args[0]) && !isExact(args[0]) };
+        } });
+    env.set('exact->inexact', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1 || !isNumeric(args[0]))
+                throw new EvalError('exact->inexact: expected number');
+            return { tag: 'number', value: toFloat(args[0]), exact: false };
+        } });
+    env.set('inexact->exact', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1 || !isNumeric(args[0]))
+                throw new EvalError('inexact->exact: expected number');
+            if (isExact(args[0]))
+                return args[0];
+            const x = toFloat(args[0]);
+            if (Number.isInteger(x))
+                return { tag: 'number', value: x };
+            const str = x.toString();
+            const decIdx = str.indexOf('.');
+            if (decIdx === -1)
+                return { tag: 'number', value: x };
+            const decimals = str.length - decIdx - 1;
+            const den = Math.pow(10, decimals);
+            const num = Math.round(x * den);
+            const g = gcd(Math.abs(num), den);
+            return makeRational(num / g, den / g);
+        } });
+    env.set('numerator', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1 || !isNumeric(args[0]))
+                throw new EvalError('numerator: expected number');
+            const r = toRational(args[0]);
+            return { tag: 'number', value: r.num };
+        } });
+    env.set('denominator', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1 || !isNumeric(args[0]))
+                throw new EvalError('denominator: expected number');
+            const r = toRational(args[0]);
+            return { tag: 'number', value: r.den };
+        } });
+    env.set('integer?', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1)
+                throw new EvalError('integer? requires exactly 1 argument');
+            if (args[0].tag === 'number')
+                return { tag: 'boolean', value: Number.isInteger(args[0].value) };
+            if (args[0].tag === 'rational')
+                return { tag: 'boolean', value: false };
+            return { tag: 'boolean', value: false };
+        } });
+    env.set('rational?', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1)
+                throw new EvalError('rational? requires exactly 1 argument');
+            return { tag: 'boolean', value: isNumeric(args[0]) && isExact(args[0]) };
         } });
     // L09: List utilities
     env.set('list-ref', { tag: 'procedure', value: (...args) => {
@@ -1027,6 +1219,7 @@ function makeProcedure(paramInfo, bodyExprs, closureEnv) {
 function evaluate(expr, env) {
     switch (expr.tag) {
         case 'number':
+        case 'rational':
         case 'boolean':
         case 'string':
         case 'char':
