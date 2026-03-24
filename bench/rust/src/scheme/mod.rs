@@ -29,7 +29,7 @@ pub(crate) type Output = Rc<RefCell<String>>;
 /// A single lambda clause: (params, rest_param, body, closure_env).
 pub(crate) type LambdaClause = (Vec<String>, Option<String>, Vec<Spanned>, Env);
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) enum Value {
     Integer(i64),
     Float(f64),
@@ -39,7 +39,7 @@ pub(crate) enum Value {
     Char(char),
     Symbol(String),
     List(Vec<Spanned>),
-    Pair(Box<Value>, Box<Value>), // improper pair (a . b) where b is not a list
+    Pair(Rc<RefCell<(Value, Value)>>), // mutable cons cell
     Lambda(Vec<String>, Option<String>, Vec<Spanned>, Env), // params, rest_param, body, closure env
     SyntaxRules {
         literals: Vec<String>,
@@ -53,6 +53,33 @@ pub(crate) enum Value {
     RecordPredicate(u64),                 // type_id
     RecordAccessor(u64, usize),           // type_id, field_index
     Void,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
+            (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(a, b),
+            (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+            (Value::Record(t1, f1), Value::Record(t2, f2)) => t1 == t2 && f1 == f2,
+            (Value::RecordConstructor(a, b), Value::RecordConstructor(c, d)) => a == c && b == d,
+            (Value::RecordPredicate(a), Value::RecordPredicate(b)) => a == b,
+            (Value::RecordAccessor(a, b), Value::RecordAccessor(c, d)) => a == c && b == d,
+            (Value::Void, Value::Void) => true,
+            _ => false,
+        }
+    }
+}
+
+pub(crate) fn make_pair(car: Value, cdr: Value) -> Value {
+    Value::Pair(Rc::new(RefCell::new((car, cdr))))
 }
 
 /// A value annotated with its source position.
@@ -88,7 +115,10 @@ impl Value {
                 let inner: Vec<String> = items.iter().map(|v| v.val.display_value()).collect();
                 format!("({})", inner.join(" "))
             }
-            Value::Pair(a, b) => format!("({} . {})", a.display_value(), b.display_value()),
+            Value::Pair(cell) => {
+                let mut seen = std::collections::HashSet::new();
+                display_pair_chain(cell, &mut seen, false)
+            }
             Value::Vector(v) => {
                 let inner: Vec<String> = v.borrow().iter().map(|val| val.display_value()).collect();
                 format!("#({})", inner.join(" "))
@@ -110,7 +140,10 @@ impl Value {
                 let inner: Vec<String> = items.iter().map(|v| v.val.format_display()).collect();
                 format!("({})", inner.join(" "))
             }
-            Value::Pair(a, b) => format!("({} . {})", a.format_display(), b.format_display()),
+            Value::Pair(cell) => {
+                let mut seen = std::collections::HashSet::new();
+                display_pair_chain(cell, &mut seen, true)
+            }
             Value::Vector(v) => {
                 let inner: Vec<String> = v.borrow().iter().map(|val| val.format_display()).collect();
                 format!("#({})", inner.join(" "))
@@ -131,6 +164,52 @@ impl Value {
     fn is_truthy(&self) -> bool {
         !matches!(self, Value::Boolean(false))
     }
+
+    fn display_val(&self, display_mode: bool) -> String {
+        if display_mode { self.format_display() } else { self.display_value() }
+    }
+}
+
+fn display_pair_chain(cell: &Rc<RefCell<(Value, Value)>>, seen: &mut std::collections::HashSet<usize>, display_mode: bool) -> String {
+    let ptr = Rc::as_ptr(cell) as usize;
+    if !seen.insert(ptr) {
+        return "(...)".to_string();
+    }
+    let (car, cdr) = {
+        let inner = cell.borrow();
+        (inner.0.clone(), inner.1.clone())
+    };
+    let mut parts = vec![car.display_val(display_mode)];
+    let mut current = cdr;
+    loop {
+        match &current {
+            Value::List(items) if items.is_empty() => break,
+            Value::List(items) => {
+                for item in items {
+                    parts.push(item.val.display_val(display_mode));
+                }
+                break;
+            }
+            Value::Pair(cell2) => {
+                let ptr2 = Rc::as_ptr(cell2) as usize;
+                if !seen.insert(ptr2) {
+                    parts.push(". (...)".to_string());
+                    break;
+                }
+                let (car2, cdr2) = {
+                    let inner2 = cell2.borrow();
+                    (inner2.0.clone(), inner2.1.clone())
+                };
+                parts.push(car2.display_val(display_mode));
+                current = cdr2;
+            }
+            _ => {
+                parts.push(format!(". {}", current.display_val(display_mode)));
+                break;
+            }
+        }
+    }
+    format!("({})", parts.join(" "))
 }
 
 // --- Environment ---
@@ -431,8 +510,19 @@ fn eval_step(expr: &Spanned, env: &Env, out: &Output) -> Result<Bounce, EvalErro
                         }
                         return Ok(Bounce::Done(Value::Void));
                     }
+                    "let*" => return eval_let_star_step(&items[1..], env, out, span),
                     "letrec" => return eval_letrec_step(&items[1..], env, out, span),
                     "letrec*" => return eval_letrec_step(&items[1..], env, out, span),
+                    "when" => {
+                        if items.len() < 3 {
+                            return Err(EvalError::Arity("when requires test and body".into(), span));
+                        }
+                        let test = eval(&items[1], env, out)?;
+                        if test.is_truthy() {
+                            return eval_body_step(&items[2..], env, out);
+                        }
+                        return Ok(Bounce::Done(Value::Void));
+                    }
                     "case" => return eval_case_step(&items[1..], env, out, span),
                     "do" => return Ok(Bounce::Done(eval_do(&items[1..], env, out, span)?)),
                     "define-syntax" => {
@@ -673,6 +763,30 @@ fn eval_let_step(args: &[Spanned], env: &Env, out: &Output, span: Span) -> Resul
     eval_body_step(&args[1..], &local_env, out)
 }
 
+fn eval_let_star_step(args: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<Bounce, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity("let* requires bindings and body".into(), span));
+    }
+    let Value::List(bindings) = &args[0].val else {
+        return Err(EvalError::Type("let*: expected bindings list".into(), span));
+    };
+    let local_env = new_env(Some(env.clone()));
+    for b in bindings {
+        let Value::List(pair) = &b.val else {
+            return Err(EvalError::Type("let*: binding must be a list".into(), span));
+        };
+        if pair.len() != 2 {
+            return Err(EvalError::Arity("let*: binding must have 2 elements".into(), span));
+        }
+        let Value::Symbol(name) = &pair[0].val else {
+            return Err(EvalError::Type("let*: expected symbol in binding".into(), span));
+        };
+        let val = eval(&pair[1], &local_env, out)?;
+        env_set(&local_env, name.clone(), val);
+    }
+    eval_body_step(&args[1..], &local_env, out)
+}
+
 fn eval_cond_step(clauses: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<Bounce, EvalError> {
     for clause in clauses {
         let Value::List(parts) = &clause.val else {
@@ -866,7 +980,21 @@ fn make_global_env() -> Env {
                    "assq", "memq",
                    // L15
                    "string->list", "list->string",
-                   "char->integer", "integer->char"] {
+                   "char->integer", "integer->char",
+                   // L17
+                   "set-car!", "set-cdr!",
+                   "caar", "cadr", "cdar", "cddr", "caddr", "cdddr",
+                   "reverse", "member", "assv", "memv", "error",
+                   "gcd", "lcm", "truncate", "round",
+                   "make-string", "string",
+                   "string<=?", "string>=?", "string>?",
+                   // Dynamic c..r (4 levels)
+                   "caaar", "caadr", "cdaar", "cdadr",
+                   "caaaar", "caaadr", "caadar", "caaddr",
+                   "cadaar", "cadadr", "caddar", "cadddr",
+                   "cdaaar", "cdaadr", "cdadar", "cdaddr",
+                   "cddaar", "cddadr", "cdddar", "cddddr",
+                   "cadar", "cddar"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     env

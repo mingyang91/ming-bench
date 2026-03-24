@@ -2,7 +2,88 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::error::{EvalError, Span};
-use super::{DUMMY_SPAN, Output, Spanned, Value};
+use super::{Output, Value, make_pair};
+
+/// Convert a list-like Value (List or Pair chain) to a Vec<Value>.
+/// Returns None for improper lists or circular lists.
+fn collect_list(v: &Value) -> Option<Vec<Value>> {
+    match v {
+        Value::List(items) => Some(items.iter().map(|s| s.val.clone()).collect()),
+        Value::Pair(_) => {
+            let mut result = Vec::new();
+            let mut current = v.clone();
+            let mut seen = std::collections::HashSet::new();
+            loop {
+                match &current {
+                    Value::List(items) if items.is_empty() => return Some(result),
+                    Value::List(items) => {
+                        result.extend(items.iter().map(|s| s.val.clone()));
+                        return Some(result);
+                    }
+                    Value::Pair(cell) => {
+                        let ptr = Rc::as_ptr(cell) as usize;
+                        if !seen.insert(ptr) { return None; }
+                        let inner = cell.borrow();
+                        result.push(inner.0.clone());
+                        let next = inner.1.clone();
+                        drop(inner);
+                        current = next;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Convert a slice of Values to a proper list (chain of Pairs ending in empty List).
+fn vec_to_list(items: &[Value]) -> Value {
+    let mut result = Value::List(vec![]);
+    for item in items.iter().rev() {
+        result = make_pair(item.clone(), result);
+    }
+    result
+}
+
+/// Tortoise-and-hare cycle detection for proper list check.
+fn is_proper_list(v: &Value) -> bool {
+    let mut slow = v.clone();
+    let mut fast = v.clone();
+    loop {
+        // Advance fast by 2
+        for _ in 0..2 {
+            fast = match &fast {
+                Value::List(items) if items.is_empty() => return true,
+                Value::List(items) if items.len() == 1 => {
+                    // A single-element List followed by implicit null
+                    return true; // we'd need more context, but List is always proper
+                }
+                Value::List(_) => return true, // Vec-based lists are always proper
+                Value::Pair(cell) => {
+                    let inner = cell.borrow();
+                    inner.1.clone()
+                }
+                _ => return false, // improper
+            };
+        }
+        // Advance slow by 1
+        slow = match &slow {
+            Value::List(_) => return true,
+            Value::Pair(cell) => {
+                let inner = cell.borrow();
+                inner.1.clone()
+            }
+            _ => return false,
+        };
+        // Check if slow == fast (cycle)
+        if let (Value::Pair(a), Value::Pair(b)) = (&slow, &fast) {
+            if Rc::ptr_eq(a, b) {
+                return false; // cycle detected
+            }
+        }
+    }
+}
 
 fn format_float(f: f64) -> String {
     let s = format!("{f}");
@@ -145,7 +226,21 @@ pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::List(a), Value::List(b)) => {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| values_equal(&x.val, &y.val))
         }
-        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => values_equal(a1, b1) && values_equal(a2, b2),
+        (Value::Pair(a), Value::Pair(b)) => {
+            if Rc::ptr_eq(a, b) { return true; }
+            let (a_car, a_cdr) = { let i = a.borrow(); (i.0.clone(), i.1.clone()) };
+            let (b_car, b_cdr) = { let i = b.borrow(); (i.0.clone(), i.1.clone()) };
+            values_equal(&a_car, &b_car) && values_equal(&a_cdr, &b_cdr)
+        }
+        // Cross-type: Pair chain vs List
+        (Value::Pair(_), Value::List(_)) | (Value::List(_), Value::Pair(_)) => {
+            let a_items = collect_list(a);
+            let b_items = collect_list(b);
+            match (a_items, b_items) {
+                (Some(av), Some(bv)) => av.len() == bv.len() && av.iter().zip(bv.iter()).all(|(x, y)| values_equal(x, y)),
+                _ => false,
+            }
+        }
         (Value::Vector(a), Value::Vector(b)) => {
             let a = a.borrow();
             let b = b.borrow();
@@ -167,6 +262,7 @@ pub(crate) fn values_eqv(a: &Value, b: &Value) -> bool {
         (Value::Symbol(a), Value::Symbol(b)) => a == b,
         (Value::Str(a), Value::Str(b)) => a == b,
         (Value::Void, Value::Void) => true,
+        (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(a, b),
         (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
         _ => false,
     }
@@ -290,16 +386,7 @@ fn builtin_list(name: &str, args: &[Value], out: &Output, span: Span, apply_fn: 
             if args.len() != 2 {
                 return Err(EvalError::Arity("cons requires 2 arguments".into(), span));
             }
-            match &args[1] {
-                Value::List(tail) => {
-                    let mut new_list = vec![Spanned::new(args[0].clone(), DUMMY_SPAN)];
-                    new_list.extend(tail.iter().cloned());
-                    Ok(Value::List(new_list))
-                }
-                _ => {
-                    Ok(Value::Pair(Box::new(args[0].clone()), Box::new(args[1].clone())))
-                }
-            }
+            Ok(make_pair(args[0].clone(), args[1].clone()))
         }
         "car" => {
             if args.len() != 1 {
@@ -307,7 +394,7 @@ fn builtin_list(name: &str, args: &[Value], out: &Output, span: Span, apply_fn: 
             }
             match &args[0] {
                 Value::List(items) if !items.is_empty() => Ok(items[0].val.clone()),
-                Value::Pair(a, _) => Ok(*a.clone()),
+                Value::Pair(cell) => Ok(cell.borrow().0.clone()),
                 _ => Err(EvalError::Type("car: not a pair".into(), span)),
             }
         }
@@ -317,7 +404,7 @@ fn builtin_list(name: &str, args: &[Value], out: &Output, span: Span, apply_fn: 
             }
             match &args[0] {
                 Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
-                Value::Pair(_, b) => Ok(*b.clone()),
+                Value::Pair(cell) => Ok(cell.borrow().1.clone()),
                 _ => Err(EvalError::Type("cdr: not a pair".into(), span)),
             }
         }
@@ -327,70 +414,91 @@ fn builtin_list(name: &str, args: &[Value], out: &Output, span: Span, apply_fn: 
             }
             Ok(Value::Boolean(matches!(&args[0], Value::List(items) if items.is_empty())))
         }
-        "list" => Ok(Value::List(args.iter().map(|a| Spanned::new(a.clone(), DUMMY_SPAN)).collect())),
+        "list" => {
+            if args.is_empty() {
+                return Ok(Value::List(vec![]));
+            }
+            Ok(vec_to_list(args))
+        }
         "length" => {
             if args.len() != 1 {
                 return Err(EvalError::Arity("length requires 1 argument".into(), span));
             }
-            match &args[0] {
-                Value::List(items) => Ok(Value::Integer(items.len() as i64)),
-                _ => Err(EvalError::Type("length: not a list".into(), span)),
-            }
+            let items = collect_list(&args[0])
+                .ok_or_else(|| EvalError::Type("length: not a proper list".into(), span))?;
+            Ok(Value::Integer(items.len() as i64))
         }
         "append" => {
+            if args.is_empty() { return Ok(Value::List(vec![])); }
             let mut result = Vec::new();
             for (i, arg) in args.iter().enumerate() {
                 if i < args.len() - 1 {
-                    match arg {
-                        Value::List(items) => result.extend(items.iter().cloned()),
-                        _ => return Err(EvalError::Type("append: not a list".into(), span)),
-                    }
+                    let items = collect_list(arg)
+                        .ok_or_else(|| EvalError::Type("append: not a list".into(), span))?;
+                    result.extend(items);
                 } else {
-                    match arg {
-                        Value::List(items) => result.extend(items.iter().cloned()),
-                        _ => result.push(Spanned::new(arg.clone(), DUMMY_SPAN)),
+                    // Last arg can be anything (for improper list append)
+                    if let Some(items) = collect_list(arg) {
+                        result.extend(items);
+                    } else {
+                        // Improper append: build proper prefix then tack on last
+                        let tail = arg.clone();
+                        let mut lst = tail;
+                        for item in result.into_iter().rev() {
+                            lst = make_pair(item, lst);
+                        }
+                        return Ok(lst);
                     }
                 }
             }
-            Ok(Value::List(result))
+            Ok(vec_to_list(&result))
         }
         "list?" => {
             if args.len() != 1 { return Err(EvalError::Arity("list? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(matches!(&args[0], Value::List(_))))
+            match &args[0] {
+                Value::List(_) => Ok(Value::Boolean(true)),
+                Value::Pair(_) => {
+                    // Use tortoise-and-hare cycle detection
+                    Ok(Value::Boolean(is_proper_list(&args[0])))
+                }
+                _ => Ok(Value::Boolean(false)),
+            }
         }
         "list-ref" => {
             if args.len() != 2 { return Err(EvalError::Arity("list-ref requires 2 arguments".into(), span)); }
-            let items = match &args[0] {
-                Value::List(items) => items,
-                _ => return Err(EvalError::Type("list-ref: not a list".into(), span)),
-            };
+            let items = collect_list(&args[0])
+                .ok_or_else(|| EvalError::Type("list-ref: not a list".into(), span))?;
             let idx = as_integer(&args[1], span)? as usize;
-            items.get(idx).map(|s| s.val.clone())
+            items.get(idx).cloned()
                 .ok_or_else(|| EvalError::Type("list-ref: index out of bounds".into(), span))
         }
         "list-tail" => {
             if args.len() != 2 { return Err(EvalError::Arity("list-tail requires 2 arguments".into(), span)); }
-            let items = match &args[0] {
-                Value::List(items) => items,
-                _ => return Err(EvalError::Type("list-tail: not a list".into(), span)),
-            };
             let idx = as_integer(&args[1], span)? as usize;
-            if idx > items.len() {
-                return Err(EvalError::Type("list-tail: index out of bounds".into(), span));
+            // Walk the list structure idx times
+            let mut current = args[0].clone();
+            for _ in 0..idx {
+                current = match &current {
+                    Value::List(items) if !items.is_empty() => Value::List(items[1..].to_vec()),
+                    Value::Pair(cell) => cell.borrow().1.clone(),
+                    _ => return Err(EvalError::Type("list-tail: index out of bounds".into(), span)),
+                };
             }
-            Ok(Value::List(items[idx..].to_vec()))
+            Ok(current)
         }
         "assoc" => {
             if args.len() != 2 { return Err(EvalError::Arity("assoc requires 2 arguments".into(), span)); }
             let key = &args[0];
-            let alist = match &args[1] {
-                Value::List(items) => items,
-                _ => return Err(EvalError::Type("assoc: not a list".into(), span)),
-            };
-            for entry in alist {
-                if let Value::List(pair) = &entry.val {
-                    if !pair.is_empty() && values_equal(&pair[0].val, key) {
-                        return Ok(entry.val.clone());
+            let alist = collect_list(&args[1])
+                .ok_or_else(|| EvalError::Type("assoc: not a list".into(), span))?;
+            for entry in &alist {
+                if let Some(pair_items) = collect_list(entry) {
+                    if !pair_items.is_empty() && values_equal(&pair_items[0], key) {
+                        return Ok(entry.clone());
+                    }
+                } else if let Value::List(items) = entry {
+                    if !items.is_empty() && values_equal(&items[0].val, key) {
+                        return Ok(entry.clone());
                     }
                 }
             }
@@ -399,32 +507,36 @@ fn builtin_list(name: &str, args: &[Value], out: &Output, span: Span, apply_fn: 
         "map" => {
             if args.len() < 2 { return Err(EvalError::Arity("map requires at least 2 arguments".into(), span)); }
             let func = &args[0];
-            let lists: Vec<&Vec<Spanned>> = args[1..].iter().map(|a| match a {
-                Value::List(items) => Ok(items),
-                _ => Err(EvalError::Type("map: expected list".into(), span)),
+            let lists: Vec<Vec<Value>> = args[1..].iter().map(|a| {
+                collect_list(a).ok_or_else(|| EvalError::Type("map: expected list".into(), span))
             }).collect::<Result<_, _>>()?;
             let len = lists[0].len();
             let mut result = Vec::new();
             for i in 0..len {
-                let call_args: Vec<Value> = lists.iter().map(|l| l[i].val.clone()).collect();
-                let val = apply_fn(func, &call_args, out, span)?;
-                result.push(Spanned::new(val, DUMMY_SPAN));
+                let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+                result.push(apply_fn(func, &call_args, out, span)?);
             }
-            Ok(Value::List(result))
+            Ok(vec_to_list(&result))
         }
         "for-each" => {
             if args.len() < 2 { return Err(EvalError::Arity("for-each requires at least 2 arguments".into(), span)); }
             let func = &args[0];
-            let lists: Vec<&Vec<Spanned>> = args[1..].iter().map(|a| match a {
-                Value::List(items) => Ok(items),
-                _ => Err(EvalError::Type("for-each: expected list".into(), span)),
+            let lists: Vec<Vec<Value>> = args[1..].iter().map(|a| {
+                collect_list(a).ok_or_else(|| EvalError::Type("for-each: expected list".into(), span))
             }).collect::<Result<_, _>>()?;
             let len = lists[0].len();
             for i in 0..len {
-                let call_args: Vec<Value> = lists.iter().map(|l| l[i].val.clone()).collect();
+                let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
                 apply_fn(func, &call_args, out, span)?;
             }
             Ok(Value::Void)
+        }
+        "reverse" => {
+            if args.len() != 1 { return Err(EvalError::Arity("reverse requires 1 argument".into(), span)); }
+            let items = collect_list(&args[0])
+                .ok_or_else(|| EvalError::Type("reverse: not a list".into(), span))?;
+            let reversed: Vec<Value> = items.into_iter().rev().collect();
+            Ok(vec_to_list(&reversed))
         }
         _ => Err(EvalError::UnboundVariable(name.into(), span)),
     }
@@ -507,27 +619,24 @@ fn builtin_string_char_io(name: &str, args: &[Value], out: &Output, span: Span) 
             if args.len() != 1 { return Err(EvalError::Arity("string->list requires 1 argument".into(), span)); }
             match &args[0] {
                 Value::Str(s) => {
-                    let items: Vec<Spanned> = s.chars().map(|c| Spanned { val: Value::Char(c), span }).collect();
-                    Ok(Value::List(items))
+                    let items: Vec<Value> = s.chars().map(Value::Char).collect();
+                    Ok(vec_to_list(&items))
                 }
                 _ => Err(EvalError::Type("string->list: expected string".into(), span)),
             }
         }
         "list->string" => {
             if args.len() != 1 { return Err(EvalError::Arity("list->string requires 1 argument".into(), span)); }
-            match &args[0] {
-                Value::List(items) => {
-                    let mut s = String::new();
-                    for item in items {
-                        match &item.val {
-                            Value::Char(c) => s.push(*c),
-                            _ => return Err(EvalError::Type("list->string: expected list of chars".into(), span)),
-                        }
-                    }
-                    Ok(Value::Str(s))
+            let items = collect_list(&args[0])
+                .ok_or_else(|| EvalError::Type("list->string: expected list".into(), span))?;
+            let mut s = String::new();
+            for item in &items {
+                match item {
+                    Value::Char(c) => s.push(*c),
+                    _ => return Err(EvalError::Type("list->string: expected list of chars".into(), span)),
                 }
-                _ => Err(EvalError::Type("list->string: expected list".into(), span)),
             }
+            Ok(Value::Str(s))
         }
         "char->integer" => {
             if args.len() != 1 { return Err(EvalError::Arity("char->integer requires 1 argument".into(), span)); }
@@ -644,49 +753,30 @@ fn builtin_string_char_io(name: &str, args: &[Value], out: &Output, span: Span) 
     }
 }
 
-pub(crate) fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span, apply_fn: ApplyFn) -> Result<Value, EvalError> {
+fn builtin_type_predicate(name: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("{name} requires 1 argument"), span));
+    }
+    let val = &args[0];
+    let result = match name {
+        "number?" => val.is_number(),
+        "integer?" => matches!(val, Value::Integer(_)),
+        "rational?" => val.is_exact_number(),
+        "exact?" => val.is_exact_number(),
+        "inexact?" => matches!(val, Value::Float(_)),
+        "boolean?" => matches!(val, Value::Boolean(_)),
+        "string?" => matches!(val, Value::Str(_)),
+        "pair?" => matches!(val, Value::List(items) if !items.is_empty()) || matches!(val, Value::Pair(..)),
+        "symbol?" => matches!(val, Value::Symbol(_)),
+        "char?" => matches!(val, Value::Char(_)),
+        "procedure?" => matches!(val, Value::Lambda(..) | Value::CaseLambda(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..)),
+        _ => return Err(EvalError::UnboundVariable(name.into(), span)),
+    };
+    Ok(Value::Boolean(result))
+}
+
+fn builtin_numeric_convert(name: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
     match name {
-        "+" | "-" | "*" | "/" | "modulo" | "remainder"
-        | "<" | ">" | "=" | "<=" | ">="
-        | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
-        | "abs" | "quotient" | "min" | "max" | "expt" => builtin_arithmetic(name, args, span),
-
-        "cons" | "car" | "cdr" | "null?" | "list" | "length" | "append"
-        | "list?" | "list-ref" | "list-tail" | "assoc"
-        | "map" | "for-each" => builtin_list(name, args, out, span, apply_fn),
-
-        "display" | "write" | "newline"
-        | "string-append" | "string-length" | "substring"
-        | "string->number" | "number->string"
-        | "symbol->string" | "string->symbol"
-        | "string-copy" | "string-ref"
-        | "string->list" | "list->string"
-        | "char->integer" | "integer->char"
-        | "char-alphabetic?" | "char-numeric?"
-        | "char-upcase" | "char-downcase" | "char=?" | "char<?"
-        | "string=?" | "string<?" | "string-ci=?"
-        | "string-upcase" | "string-downcase" => builtin_string_char_io(name, args, out, span),
-
-        "number?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("number? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(args[0].is_number()))
-        }
-        "integer?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("integer? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
-        }
-        "rational?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("rational? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(args[0].is_exact_number()))
-        }
-        "exact?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("exact? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(args[0].is_exact_number()))
-        }
-        "inexact?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("inexact? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(matches!(&args[0], Value::Float(_))))
-        }
         "exact->inexact" => {
             if args.len() != 1 { return Err(EvalError::Arity("exact->inexact requires 1 argument".into(), span)); }
             let n = Num::from_value(&args[0], span)?;
@@ -731,57 +821,61 @@ pub(crate) fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span
                 _ => Err(EvalError::Type("denominator: expected rational".into(), span)),
             }
         }
-        "boolean?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("boolean? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(matches!(&args[0], Value::Boolean(_))))
+        "gcd" => {
+            if args.len() != 2 { return Err(EvalError::Arity("gcd requires 2 arguments".into(), span)); }
+            let a = as_integer(&args[0], span)?.abs();
+            let b = as_integer(&args[1], span)?.abs();
+            let mut x = a; let mut y = b;
+            while y != 0 { let t = y; y = x % y; x = t; }
+            Ok(Value::Integer(x))
         }
-        "string?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("string? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
+        "lcm" => {
+            if args.len() != 2 { return Err(EvalError::Arity("lcm requires 2 arguments".into(), span)); }
+            let a = as_integer(&args[0], span)?.abs();
+            let b = as_integer(&args[1], span)?.abs();
+            if a == 0 || b == 0 { return Ok(Value::Integer(0)); }
+            let mut x = a; let mut y = b;
+            while y != 0 { let t = y; y = x % y; x = t; }
+            Ok(Value::Integer(a / x * b))
         }
-        "pair?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("pair? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(matches!(&args[0], Value::List(items) if !items.is_empty()) || matches!(&args[0], Value::Pair(..))))
-        }
-        "symbol?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("symbol? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
-        }
-        "char?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("char? requires 1 argument".into(), span)); }
-            Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
-        }
-        "procedure?" => {
-            if args.len() != 1 { return Err(EvalError::Arity("procedure? requires 1 argument".into(), span)); }
-            let is_proc = matches!(&args[0], Value::Lambda(..) | Value::CaseLambda(..) | Value::RecordConstructor(..) | Value::RecordPredicate(..) | Value::RecordAccessor(..));
-            Ok(Value::Boolean(is_proc))
-        }
-        "apply" => {
-            if args.len() < 2 {
-                return Err(EvalError::Arity("apply requires at least 2 arguments".into(), span));
+        "truncate" => {
+            if args.len() != 1 { return Err(EvalError::Arity("truncate requires 1 argument".into(), span)); }
+            match &args[0] {
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Float(f) => Ok(Value::Integer(f.trunc() as i64)),
+                Value::Rational(n, d) => Ok(Value::Integer(n / d)),
+                _ => Err(EvalError::Type("truncate: expected number".into(), span)),
             }
-            let func = &args[0];
-            let last = &args[args.len() - 1];
-            let tail = match last {
-                Value::List(items) => items.iter().map(|s| s.val.clone()).collect::<Vec<_>>(),
-                _ => return Err(EvalError::Type("apply: last argument must be a list".into(), span)),
-            };
-            let mut all_args: Vec<Value> = args[1..args.len()-1].to_vec();
-            all_args.extend(tail);
-            apply_fn(func, &all_args, out, span)
         }
-        "equal?" => {
-            if args.len() != 2 { return Err(EvalError::Arity("equal? requires 2 arguments".into(), span)); }
-            Ok(Value::Boolean(values_equal(&args[0], &args[1])))
+        "round" => {
+            if args.len() != 1 { return Err(EvalError::Arity("round requires 1 argument".into(), span)); }
+            match &args[0] {
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Float(f) => Ok(Value::Integer(f.round() as i64)),
+                Value::Rational(n, d) => Ok(Value::Integer((*n as f64 / *d as f64).round() as i64)),
+                _ => Err(EvalError::Type("round: expected number".into(), span)),
+            }
         }
-        "eq?" | "eqv?" => {
-            if args.len() != 2 { return Err(EvalError::Arity(format!("{name} requires 2 arguments"), span)); }
-            Ok(Value::Boolean(values_eqv(&args[0], &args[1])))
-        }
-        // Vector operations
-        "vector" => {
-            Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec()))))
-        }
+        _ => Err(EvalError::UnboundVariable(name.into(), span)),
+    }
+}
+
+fn builtin_apply(args: &[Value], out: &Output, span: Span, apply_fn: ApplyFn) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity("apply requires at least 2 arguments".into(), span));
+    }
+    let func = &args[0];
+    let last = &args[args.len() - 1];
+    let tail = collect_list(last)
+        .ok_or_else(|| EvalError::Type("apply: last argument must be a list".into(), span))?;
+    let mut all_args: Vec<Value> = args[1..args.len()-1].to_vec();
+    all_args.extend(tail);
+    apply_fn(func, &all_args, out, span)
+}
+
+fn builtin_vector(name: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
+    match name {
+        "vector" => Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec())))),
         "make-vector" => {
             if args.is_empty() || args.len() > 2 {
                 return Err(EvalError::Arity("make-vector requires 1 or 2 arguments".into(), span));
@@ -831,47 +925,209 @@ pub(crate) fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span
             let Value::Vector(v) = &args[0] else {
                 return Err(EvalError::Type("vector->list: expected vector".into(), span));
             };
-            let items: Vec<Spanned> = v.borrow().iter().map(|val| Spanned::new(val.clone(), DUMMY_SPAN)).collect();
-            Ok(Value::List(items))
+            let items: Vec<Value> = v.borrow().to_vec();
+            Ok(vec_to_list(&items))
         }
         "list->vector" => {
             if args.len() != 1 { return Err(EvalError::Arity("list->vector requires 1 argument".into(), span)); }
-            let Value::List(items) = &args[0] else {
-                return Err(EvalError::Type("list->vector: expected list".into(), span));
-            };
-            let vals: Vec<Value> = items.iter().map(|s| s.val.clone()).collect();
-            Ok(Value::Vector(Rc::new(RefCell::new(vals))))
-        }
-        "assq" => {
-            if args.len() != 2 { return Err(EvalError::Arity("assq requires 2 arguments".into(), span)); }
-            let key = &args[0];
-            let alist = match &args[1] {
-                Value::List(items) => items,
-                _ => return Err(EvalError::Type("assq: not a list".into(), span)),
-            };
-            for entry in alist {
-                if let Value::List(pair) = &entry.val {
-                    if !pair.is_empty() && values_eqv(&pair[0].val, key) {
-                        return Ok(entry.val.clone());
-                    }
-                }
-            }
-            Ok(Value::Boolean(false))
-        }
-        "memq" => {
-            if args.len() != 2 { return Err(EvalError::Arity("memq requires 2 arguments".into(), span)); }
-            let key = &args[0];
-            let list = match &args[1] {
-                Value::List(items) => items,
-                _ => return Err(EvalError::Type("memq: not a list".into(), span)),
-            };
-            for (i, item) in list.iter().enumerate() {
-                if values_eqv(&item.val, key) {
-                    return Ok(Value::List(list[i..].to_vec()));
-                }
-            }
-            Ok(Value::Boolean(false))
+            let items = collect_list(&args[0])
+                .ok_or_else(|| EvalError::Type("list->vector: expected list".into(), span))?;
+            Ok(Value::Vector(Rc::new(RefCell::new(items))))
         }
         _ => Err(EvalError::UnboundVariable(name.into(), span)),
+    }
+}
+
+fn assoc_lookup<'a>(key: &Value, alist: &'a [Value], cmp: fn(&Value, &Value) -> bool) -> Option<&'a Value> {
+    for entry in alist {
+        match entry {
+            Value::Pair(cell) => {
+                let inner = cell.borrow();
+                if cmp(&inner.0, key) {
+                    return Some(entry);
+                }
+            }
+            Value::List(items) if !items.is_empty() => {
+                if cmp(&items[0].val, key) {
+                    return Some(entry);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn member_lookup(key: &Value, items: &[Value], cmp: fn(&Value, &Value) -> bool) -> Option<usize> {
+    items.iter().position(|item| cmp(item, key))
+}
+
+fn builtin_assoc_member(name: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity(format!("{name} requires 2 arguments"), span));
+    }
+    let key = &args[0];
+    match name {
+        "assq" | "assv" => {
+            let alist = collect_list(&args[1])
+                .ok_or_else(|| EvalError::Type(format!("{name}: not a list"), span))?;
+            match assoc_lookup(key, &alist, values_eqv) {
+                Some(entry) => Ok(entry.clone()),
+                None => Ok(Value::Boolean(false)),
+            }
+        }
+        "memq" | "memv" => {
+            let items = collect_list(&args[1])
+                .ok_or_else(|| EvalError::Type(format!("{name}: not a list"), span))?;
+            match member_lookup(key, &items, values_eqv) {
+                Some(i) => Ok(vec_to_list(&items[i..])),
+                None => Ok(Value::Boolean(false)),
+            }
+        }
+        "member" => {
+            let items = collect_list(&args[1])
+                .ok_or_else(|| EvalError::Type("member: not a list".into(), span))?;
+            match member_lookup(key, &items, values_equal) {
+                Some(i) => Ok(vec_to_list(&items[i..])),
+                None => Ok(Value::Boolean(false)),
+            }
+        }
+        _ => Err(EvalError::UnboundVariable(name.into(), span)),
+    }
+}
+
+fn builtin_pair_mutation(name: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity(format!("{name} requires 2 arguments"), span));
+    }
+    let Value::Pair(cell) = &args[0] else {
+        return Err(EvalError::Type(format!("{name}: not a pair"), span));
+    };
+    match name {
+        "set-car!" => cell.borrow_mut().0 = args[1].clone(),
+        "set-cdr!" => cell.borrow_mut().1 = args[1].clone(),
+        _ => return Err(EvalError::UnboundVariable(name.into(), span)),
+    }
+    Ok(Value::Void)
+}
+
+fn builtin_string_extra(name: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
+    match name {
+        "make-string" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::Arity("make-string requires 1 or 2 arguments".into(), span));
+            }
+            let len = as_integer(&args[0], span)? as usize;
+            let ch = if args.len() == 2 {
+                match &args[1] { Value::Char(c) => *c, _ => return Err(EvalError::Type("make-string: expected char".into(), span)) }
+            } else { '\0' };
+            Ok(Value::Str(std::iter::repeat_n(ch, len).collect()))
+        }
+        "string" => {
+            let mut s = String::new();
+            for a in args {
+                match a { Value::Char(c) => s.push(*c), _ => return Err(EvalError::Type("string: expected char".into(), span)) }
+            }
+            Ok(Value::Str(s))
+        }
+        "string<=?" | "string>=?" | "string>?" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("{name} requires 2 arguments"), span)); }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => {
+                    let result = match name {
+                        "string<=?" => a <= b,
+                        "string>=?" => a >= b,
+                        "string>?" => a > b,
+                        _ => false,
+                    };
+                    Ok(Value::Boolean(result))
+                }
+                _ => Err(EvalError::Type(format!("{name}: expected strings"), span)),
+            }
+        }
+        _ => Err(EvalError::UnboundVariable(name.into(), span)),
+    }
+}
+
+pub(crate) fn apply_builtin(name: &str, args: &[Value], out: &Output, span: Span, apply_fn: ApplyFn) -> Result<Value, EvalError> {
+    match name {
+        "+" | "-" | "*" | "/" | "modulo" | "remainder"
+        | "<" | ">" | "=" | "<=" | ">="
+        | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
+        | "abs" | "quotient" | "min" | "max" | "expt" => builtin_arithmetic(name, args, span),
+
+        "cons" | "car" | "cdr" | "null?" | "list" | "length" | "append"
+        | "list?" | "list-ref" | "list-tail" | "assoc"
+        | "map" | "for-each" | "reverse" => builtin_list(name, args, out, span, apply_fn),
+
+        "display" | "write" | "newline"
+        | "string-append" | "string-length" | "substring"
+        | "string->number" | "number->string"
+        | "symbol->string" | "string->symbol"
+        | "string-copy" | "string-ref"
+        | "string->list" | "list->string"
+        | "char->integer" | "integer->char"
+        | "char-alphabetic?" | "char-numeric?"
+        | "char-upcase" | "char-downcase" | "char=?" | "char<?"
+        | "string=?" | "string<?" | "string-ci=?"
+        | "string-upcase" | "string-downcase" => builtin_string_char_io(name, args, out, span),
+
+        "number?" | "integer?" | "rational?" | "exact?" | "inexact?"
+        | "boolean?" | "string?" | "pair?" | "symbol?" | "char?"
+        | "procedure?" => builtin_type_predicate(name, args, span),
+
+        "exact->inexact" | "inexact->exact" | "numerator" | "denominator"
+        | "gcd" | "lcm" | "truncate" | "round" => builtin_numeric_convert(name, args, span),
+
+        "apply" => builtin_apply(args, out, span, apply_fn),
+
+        "equal?" => {
+            if args.len() != 2 { return Err(EvalError::Arity("equal? requires 2 arguments".into(), span)); }
+            Ok(Value::Boolean(values_equal(&args[0], &args[1])))
+        }
+        "eq?" | "eqv?" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("{name} requires 2 arguments"), span)); }
+            Ok(Value::Boolean(values_eqv(&args[0], &args[1])))
+        }
+
+        "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length"
+        | "vector?" | "vector->list" | "list->vector" => builtin_vector(name, args, span),
+
+        "assq" | "assv" | "memq" | "memv" | "member" => builtin_assoc_member(name, args, span),
+
+        "error" => {
+            let msg = if args.is_empty() {
+                "error".to_string()
+            } else {
+                args.iter().map(|a| a.display_value()).collect::<Vec<_>>().join(" ")
+            };
+            Err(EvalError::Type(msg, span))
+        }
+
+        "set-car!" | "set-cdr!" => builtin_pair_mutation(name, args, span),
+
+        "make-string" | "string" | "string<=?" | "string>=?" | "string>?" =>
+            builtin_string_extra(name, args, span),
+
+        _ => {
+            // Dynamic c..r handler: c[ad]+r
+            let bytes = name.as_bytes();
+            if bytes.len() >= 3 && bytes[0] == b'c' && bytes[bytes.len()-1] == b'r'
+                && bytes[1..bytes.len()-1].iter().all(|&b| b == b'a' || b == b'd')
+            {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("{name} requires 1 argument"), span)); }
+                let ops = &bytes[1..bytes.len()-1];
+                let mut val = args[0].clone();
+                for &op in ops.iter().rev() {
+                    val = if op == b'a' {
+                        apply_builtin("car", &[val], out, span, apply_fn)?
+                    } else {
+                        apply_builtin("cdr", &[val], out, span, apply_fn)?
+                    };
+                }
+                return Ok(val);
+            }
+            Err(EvalError::UnboundVariable(name.into(), span))
+        }
     }
 }
