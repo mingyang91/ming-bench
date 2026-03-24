@@ -88,6 +88,46 @@ public class Evaluator {
     // Character wrapper
     record SchemeChar(char value) {}
 
+    // Exact rational number (always simplified, positive denominator)
+    static class SchemeRational {
+        final long num;
+        final long den;
+        SchemeRational(long num, long den) { this.num = num; this.den = den; }
+    }
+
+    private static long gcd(long a, long b) {
+        a = Math.abs(a); b = Math.abs(b);
+        while (b != 0) { long t = b; b = a % b; a = t; }
+        return a;
+    }
+
+    // Returns Long if den==1, else SchemeRational
+    private static Object makeExact(long num, long den) {
+        if (den < 0) { num = -num; den = -den; }
+        long g = gcd(num, den);
+        if (g > 0) { num /= g; den /= g; }
+        if (den == 1) return num;
+        return new SchemeRational(num, den);
+    }
+
+    private static boolean isNumber(Object val) {
+        return val instanceof Long || val instanceof Double || val instanceof SchemeRational;
+    }
+
+    private double toDouble(Object val) throws EvalError {
+        if (val instanceof Long l) return (double) l;
+        if (val instanceof Double d) return d;
+        if (val instanceof SchemeRational r) return (double) r.num / r.den;
+        throw new EvalError(posStr() + "expected number");
+    }
+
+    // Returns [num, den] for exact numbers
+    private long[] toRational(Object val) throws EvalError {
+        if (val instanceof Long l) return new long[]{l, 1};
+        if (val instanceof SchemeRational r) return new long[]{r.num, r.den};
+        throw new EvalError(posStr() + "expected exact number");
+    }
+
     // Cons pair
     record Pair(Object car, Object cdr) {}
 
@@ -158,7 +198,10 @@ public class Evaluator {
         "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
         "char=?", "char<?",
         "string=?", "string<?", "string-ci=?",
-        "string-upcase", "string-downcase"
+        "string-upcase", "string-downcase",
+        // L11
+        "exact?", "inexact?", "exact->inexact", "inexact->exact",
+        "numerator", "denominator", "integer?", "rational?"
     };
 
     private Env makeTopLevelEnv() {
@@ -275,15 +318,33 @@ public class Evaluator {
                     i++; col++;
                 }
                 String tok = sb.toString();
-                try {
-                    tokens.add(Long.parseLong(tok));
-                } catch (NumberFormatException e) {
-                    tokens.add(tok); // symbol
-                }
+                Object parsed = parseNumber(tok);
+                tokens.add(parsed != null ? parsed : tok);
                 tokenPositions.add(startPos);
             }
         }
         return tokens;
+    }
+
+    // Parse a token as a number: integer, rational (N/D), or float. Returns null if not a number.
+    private static Object parseNumber(String tok) {
+        // Try integer
+        try { return Long.parseLong(tok); } catch (NumberFormatException e) {}
+        // Try rational N/D
+        int slash = tok.indexOf('/');
+        if (slash > 0 && slash < tok.length() - 1) {
+            try {
+                long num = Long.parseLong(tok.substring(0, slash));
+                long den = Long.parseLong(tok.substring(slash + 1));
+                if (den != 0) return makeExact(num, den);
+            } catch (NumberFormatException e) {}
+        }
+        // Try float
+        try {
+            double d = Double.parseDouble(tok);
+            if (!Double.isInfinite(d) && !Double.isNaN(d)) return d;
+        } catch (NumberFormatException e) {}
+        return null;
     }
 
     // --- Parser ---
@@ -330,7 +391,7 @@ public class Evaluator {
             expr = loc.value();
         }
 
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
+        if (expr instanceof Long || expr instanceof Double || expr instanceof SchemeRational || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
             return expr;
         }
         if (expr instanceof String sym) {
@@ -657,51 +718,67 @@ public class Evaluator {
     private Object applyBuiltin(String op, List<Object> args) throws EvalError {
         switch (op) {
             case "+" -> {
-                long sum = 0;
-                for (Object a : args) sum += requireLong(a);
-                return sum;
+                if (args.isEmpty()) return 0L;
+                boolean inexact = false;
+                for (Object a : args) { if (!isNumber(a)) throw new EvalError(posStr() + "+: not a number"); if (a instanceof Double) inexact = true; }
+                if (inexact) { double s = 0; for (Object a : args) s += toDouble(a); return s; }
+                long num = 0, den = 1;
+                for (Object a : args) { long[] r = toRational(a); num = num * r[1] + r[0] * den; den *= r[1]; long g = gcd(Math.abs(num), Math.abs(den)); if (g > 0) { num /= g; den /= g; } }
+                return makeExact(num, den);
             }
             case "-" -> {
                 if (args.isEmpty()) throw new EvalError(posStr() + "- requires at least 1 argument");
-                if (args.size() == 1) return -requireLong(args.get(0));
-                long result = requireLong(args.get(0));
-                for (int i = 1; i < args.size(); i++) result -= requireLong(args.get(i));
-                return result;
+                boolean inexact = false;
+                for (Object a : args) { if (!isNumber(a)) throw new EvalError(posStr() + "-: not a number"); if (a instanceof Double) inexact = true; }
+                if (inexact) {
+                    double r = toDouble(args.get(0));
+                    if (args.size() == 1) return -r;
+                    for (int i = 1; i < args.size(); i++) r -= toDouble(args.get(i));
+                    return r;
+                }
+                long[] first = toRational(args.get(0));
+                long num = first[0], den = first[1];
+                if (args.size() == 1) return makeExact(-num, den);
+                for (int i = 1; i < args.size(); i++) { long[] r = toRational(args.get(i)); num = num * r[1] - r[0] * den; den *= r[1]; long g = gcd(Math.abs(num), Math.abs(den)); if (g > 0) { num /= g; den /= g; } }
+                return makeExact(num, den);
             }
             case "*" -> {
-                long product = 1;
-                for (Object a : args) product *= requireLong(a);
-                return product;
+                boolean inexact = false;
+                for (Object a : args) { if (!isNumber(a)) throw new EvalError(posStr() + "*: not a number"); if (a instanceof Double) inexact = true; }
+                if (inexact) { double p = 1; for (Object a : args) p *= toDouble(a); return p; }
+                long num = 1, den = 1;
+                for (Object a : args) { long[] r = toRational(a); num *= r[0]; den *= r[1]; long g = gcd(Math.abs(num), Math.abs(den)); if (g > 0) { num /= g; den /= g; } }
+                return makeExact(num, den);
             }
             case "/" -> {
                 if (args.size() < 2) throw new EvalError(posStr() + "/ requires at least 2 arguments");
-                long result = requireLong(args.get(0));
-                for (int i = 1; i < args.size(); i++) {
-                    long divisor = requireLong(args.get(i));
-                    if (divisor == 0) throw new EvalError(posStr() + "division by zero");
-                    result /= divisor;
-                }
-                return result;
+                boolean inexact = false;
+                for (Object a : args) { if (!isNumber(a)) throw new EvalError(posStr() + "/: not a number"); if (a instanceof Double) inexact = true; }
+                if (inexact) { double r = toDouble(args.get(0)); for (int i = 1; i < args.size(); i++) { double d = toDouble(args.get(i)); if (d == 0) throw new EvalError(posStr() + "division by zero"); r /= d; } return r; }
+                long[] first = toRational(args.get(0));
+                long num = first[0], den = first[1];
+                for (int i = 1; i < args.size(); i++) { long[] r = toRational(args.get(i)); if (r[0] == 0) throw new EvalError(posStr() + "division by zero"); num *= r[1]; den *= r[0]; long g = gcd(Math.abs(num), Math.abs(den)); if (g > 0) { num /= g; den /= g; } }
+                return makeExact(num, den);
             }
             case "<" -> {
                 requireArgCount(op, args, 2);
-                return requireLong(args.get(0)) < requireLong(args.get(1));
+                return numCompare(args.get(0), args.get(1)) < 0;
             }
             case ">" -> {
                 requireArgCount(op, args, 2);
-                return requireLong(args.get(0)) > requireLong(args.get(1));
+                return numCompare(args.get(0), args.get(1)) > 0;
             }
             case "=" -> {
                 requireArgCount(op, args, 2);
-                return requireLong(args.get(0)) == requireLong(args.get(1));
+                return numCompare(args.get(0), args.get(1)) == 0;
             }
             case "<=" -> {
                 requireArgCount(op, args, 2);
-                return requireLong(args.get(0)) <= requireLong(args.get(1));
+                return numCompare(args.get(0), args.get(1)) <= 0;
             }
             case ">=" -> {
                 requireArgCount(op, args, 2);
-                return requireLong(args.get(0)) >= requireLong(args.get(1));
+                return numCompare(args.get(0), args.get(1)) >= 0;
             }
             case "not" -> {
                 requireArgCount(op, args, 1);
@@ -771,7 +848,7 @@ public class Evaluator {
             }
             case "number?" -> {
                 requireArgCount(op, args, 1);
-                return args.get(0) instanceof Long;
+                return isNumber(args.get(0));
             }
             case "boolean?" -> {
                 requireArgCount(op, args, 1);
@@ -835,7 +912,8 @@ public class Evaluator {
             }
             case "number->string" -> {
                 requireArgCount(op, args, 1);
-                return new SchemeString(String.valueOf(requireLong(args.get(0))));
+                if (!isNumber(args.get(0))) throw new EvalError(posStr() + "number->string: not a number");
+                return new SchemeString(schemeToString(args.get(0)));
             }
             case "symbol->string" -> {
                 requireArgCount(op, args, 1);
@@ -1101,6 +1179,63 @@ public class Evaluator {
                 if (!(args.get(0) instanceof SchemeString s)) throw new EvalError(posStr() + "string-downcase: not a string");
                 return new SchemeString(s.value().toLowerCase());
             }
+            // L11 — Exact arithmetic & rationals
+            case "exact?" -> {
+                requireArgCount(op, args, 1);
+                Object a = args.get(0);
+                return a instanceof Long || a instanceof SchemeRational;
+            }
+            case "inexact?" -> {
+                requireArgCount(op, args, 1);
+                return args.get(0) instanceof Double;
+            }
+            case "exact->inexact" -> {
+                requireArgCount(op, args, 1);
+                return toDouble(args.get(0));
+            }
+            case "inexact->exact" -> {
+                requireArgCount(op, args, 1);
+                Object a = args.get(0);
+                if (a instanceof Long || a instanceof SchemeRational) return a;
+                if (a instanceof Double dd) {
+                    double d = dd;
+                    // Convert double to exact rational
+                    if (d == Math.floor(d) && !Double.isInfinite(d)) return (long) d;
+                    // Use continued fraction / multiply out
+                    long denom = 1;
+                    double val = d;
+                    while (val != Math.floor(val) && denom < 1000000000L) { val *= 2; denom *= 2; }
+                    return makeExact(Math.round(val), denom);
+                }
+                throw new EvalError(posStr() + "inexact->exact: not a number");
+            }
+            case "numerator" -> {
+                requireArgCount(op, args, 1);
+                Object a = args.get(0);
+                if (a instanceof Long l) return l;
+                if (a instanceof SchemeRational r) return r.num;
+                throw new EvalError(posStr() + "numerator: not a rational");
+            }
+            case "denominator" -> {
+                requireArgCount(op, args, 1);
+                Object a = args.get(0);
+                if (a instanceof Long) return 1L;
+                if (a instanceof SchemeRational r) return r.den;
+                throw new EvalError(posStr() + "denominator: not a rational");
+            }
+            case "integer?" -> {
+                requireArgCount(op, args, 1);
+                Object a = args.get(0);
+                if (a instanceof Long) return true;
+                if (a instanceof SchemeRational) return false; // already simplified, so den != 1
+                if (a instanceof Double d) return d == Math.floor(d) && !Double.isInfinite(d);
+                return false;
+            }
+            case "rational?" -> {
+                requireArgCount(op, args, 1);
+                Object a = args.get(0);
+                return a instanceof Long || a instanceof SchemeRational;
+            }
             default -> throw new EvalError(posStr() + "unbound variable: " + op);
         }
     }
@@ -1269,6 +1404,8 @@ public class Evaluator {
     private boolean schemeEq(Object a, Object b) {
         if (a == b) return true;
         if (a instanceof Long && b instanceof Long) return a.equals(b);
+        if (a instanceof Double && b instanceof Double) return a.equals(b);
+        if (a instanceof SchemeRational ra && b instanceof SchemeRational rb) return ra.num == rb.num && ra.den == rb.den;
         if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
         if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
         // Symbols are Java Strings — use equals
@@ -1283,6 +1420,17 @@ public class Evaluator {
             return schemeEqual(pa.car(), pb.car()) && schemeEqual(pa.cdr(), pb.cdr());
         }
         return false;
+    }
+
+    private int numCompare(Object a, Object b) throws EvalError {
+        if (!isNumber(a) || !isNumber(b)) throw new EvalError(posStr() + "comparison: not a number");
+        // If both exact, compare as rationals to avoid precision loss
+        if ((a instanceof Long || a instanceof SchemeRational) && (b instanceof Long || b instanceof SchemeRational)) {
+            long[] ra = toRational(a);
+            long[] rb = toRational(b);
+            return Long.compare(ra[0] * rb[1], rb[0] * ra[1]);
+        }
+        return Double.compare(toDouble(a), toDouble(b));
     }
 
     private boolean isFalse(Object val) {
@@ -1308,6 +1456,14 @@ public class Evaluator {
 
     private String schemeToString(Object val) {
         if (val instanceof Long l) return l.toString();
+        if (val instanceof Double d) {
+            if (d == Math.floor(d) && !Double.isInfinite(d) && Math.abs(d) < 1e15) {
+                // Format as integer-like: 5.0
+                return String.valueOf(d);
+            }
+            return String.valueOf(d);
+        }
+        if (val instanceof SchemeRational r) return r.num + "/" + r.den;
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
         if (val instanceof SchemeChar c) {
