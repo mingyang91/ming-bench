@@ -1,6 +1,8 @@
 package ming;
 
-sealed interface Value permits Value.IntegerValue, Value.BooleanValue, Value.StringValue {
+import java.util.List;
+
+sealed interface Value permits Value.IntegerValue, Value.BooleanValue, Value.StringValue, Value.SymbolValue, Value.ListValue, Value.VoidValue, Value.BuiltinProcedure, Value.ClosureValue {
     String render();
 
     default boolean isTruthy() {
@@ -48,6 +50,63 @@ sealed interface Value permits Value.IntegerValue, Value.BooleanValue, Value.Str
         @Override
         public String render() {
             return escapeString(value);
+        }
+    }
+
+    record SymbolValue(String name) implements Value {
+        @Override
+        public String render() {
+            return name;
+        }
+    }
+
+    record ListValue(List<Value> elements) implements Value {
+        public ListValue {
+            elements = List.copyOf(elements);
+        }
+
+        @Override
+        public String render() {
+            if (elements.isEmpty()) {
+                return "()";
+            }
+
+            StringBuilder builder = new StringBuilder();
+            builder.append('(');
+            for (int i = 0; i < elements.size(); i++) {
+                if (i > 0) {
+                    builder.append(' ');
+                }
+                builder.append(elements.get(i).render());
+            }
+            builder.append(')');
+            return builder.toString();
+        }
+    }
+
+    record VoidValue() implements Value {
+        @Override
+        public String render() {
+            return "#<void>";
+        }
+    }
+
+    record BuiltinProcedure(String name) implements Value {
+        @Override
+        public String render() {
+            return "#<procedure:" + name + ">";
+        }
+    }
+
+    record ClosureValue(List<String> parameters, List<Expr> body, Environment env) implements Value {
+        public ClosureValue {
+            parameters = List.copyOf(parameters);
+            body = List.copyOf(body);
+        }
+
+        @Override
+        public String render() {
+            return "#<procedure>";
         }
     }
 }
