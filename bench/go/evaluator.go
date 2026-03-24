@@ -19,6 +19,7 @@ const (
 	valPair
 	valNil // empty list
 	valVoid
+	valLambda
 )
 
 type Value struct {
@@ -28,6 +29,10 @@ type Value struct {
 	sval   string
 	car    *Value
 	cdr    *Value
+	// lambda fields
+	params []string
+	body   []*astNode
+	closure *env
 }
 
 func intVal(n int64) *Value   { return &Value{typ: valInt, ival: n} }
@@ -56,6 +61,8 @@ func (v *Value) String() string {
 		return "(" + pairStr(v) + ")"
 	case valVoid:
 		return ""
+	case valLambda:
+		return "#<procedure>"
 	default:
 		return "<unknown>"
 	}
@@ -387,6 +394,17 @@ func evalList(node *astNode, e *env) (*Value, error) {
 			return evalAnd(node, e)
 		case "or":
 			return evalOr(node, e)
+		case "define":
+			return evalDefine(node, e)
+		case "if":
+			return evalIf(node, e)
+		case "quote":
+			if len(node.children) != 2 {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quote: need 1 argument", node.line, node.col)}
+			}
+			return quoteNode(node.children[1]), nil
+		case "lambda":
+			return evalLambda(node, e)
 		}
 	}
 
@@ -409,6 +427,26 @@ func evalList(node *astNode, e *env) (*Value, error) {
 	// Built-in functions (symbol-based dispatch via the value)
 	if op.typ == valSymbol {
 		return applyBuiltin(op.sval, args, node)
+	}
+
+	// Lambda application
+	if op.typ == valLambda {
+		if len(args) != len(op.params) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected %d, got %d", node.line, node.col, len(op.params), len(args))}
+		}
+		localEnv := newEnv(op.closure)
+		for i, param := range op.params {
+			localEnv.set(param, args[i])
+		}
+		var result *Value
+		for _, bodyExpr := range op.body {
+			var err error
+			result, err = eval(bodyExpr, localEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
 	}
 
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", node.line, node.col)}
@@ -448,6 +486,99 @@ func evalOr(node *astNode, e *env) (*Value, error) {
 		}
 	}
 	return result, nil
+}
+
+func evalDefine(node *astNode, e *env) (*Value, error) {
+	if len(node.children) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", node.line, node.col)}
+	}
+	target := node.children[1]
+	if target.isAtom && target.tok.kind == tokSymbol {
+		// (define x expr)
+		val, err := eval(node.children[2], e)
+		if err != nil {
+			return nil, err
+		}
+		e.set(target.tok.sval, val)
+		return voidVal(), nil
+	}
+	// (define (f params...) body...)
+	if !target.isAtom && len(target.children) >= 1 {
+		name := target.children[0]
+		if !name.isAtom || name.tok.kind != tokSymbol {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", node.line, node.col)}
+		}
+		params := make([]string, 0, len(target.children)-1)
+		for _, p := range target.children[1:] {
+			if !p.isAtom || p.tok.kind != tokSymbol {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad parameter", node.line, node.col)}
+			}
+			params = append(params, p.tok.sval)
+		}
+		lam := &Value{typ: valLambda, params: params, body: node.children[2:], closure: e}
+		e.set(name.tok.sval, lam)
+		return voidVal(), nil
+	}
+	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", node.line, node.col)}
+}
+
+func evalIf(node *astNode, e *env) (*Value, error) {
+	if len(node.children) < 3 || len(node.children) > 4 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: if: bad syntax", node.line, node.col)}
+	}
+	cond, err := eval(node.children[1], e)
+	if err != nil {
+		return nil, err
+	}
+	if isTruthy(cond) {
+		return eval(node.children[2], e)
+	}
+	if len(node.children) == 4 {
+		return eval(node.children[3], e)
+	}
+	return voidVal(), nil
+}
+
+func evalLambda(node *astNode, e *env) (*Value, error) {
+	if len(node.children) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad syntax", node.line, node.col)}
+	}
+	paramNode := node.children[1]
+	if paramNode.isAtom {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad parameter list", node.line, node.col)}
+	}
+	params := make([]string, 0, len(paramNode.children))
+	for _, p := range paramNode.children {
+		if !p.isAtom || p.tok.kind != tokSymbol {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad parameter", node.line, node.col)}
+		}
+		params = append(params, p.tok.sval)
+	}
+	return &Value{typ: valLambda, params: params, body: node.children[2:], closure: e}, nil
+}
+
+func quoteNode(node *astNode) *Value {
+	if node.isAtom {
+		switch node.tok.kind {
+		case tokNumber:
+			return intVal(node.tok.ival)
+		case tokBool:
+			return boolVal(node.tok.bval)
+		case tokString:
+			return strVal(node.tok.sval)
+		case tokSymbol:
+			return symVal(node.tok.sval)
+		}
+	}
+	// List
+	if len(node.children) == 0 {
+		return nilVal()
+	}
+	result := nilVal()
+	for i := len(node.children) - 1; i >= 0; i-- {
+		result = &Value{typ: valPair, car: quoteNode(node.children[i]), cdr: result}
+	}
+	return result
 }
 
 func requireInts(args []*Value, name string, node *astNode) error {
