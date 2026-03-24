@@ -1087,6 +1087,58 @@ func doCallCC(f *Value, callNode *astNode, ip *interp) (*Value, error) {
 	return result, nil
 }
 
+// callThunk calls a zero-argument procedure (lambda or goFunc).
+func callThunk(proc *Value, node *astNode, ip *interp) (*Value, error) {
+	switch proc.typ {
+	case valLambda:
+		return applyLambdaFull(proc, nil, node, ip)
+	case valGoFunc:
+		return proc.goFunc(nil)
+	default:
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: dynamic-wind: argument is not a thunk", node.line, node.col)}
+	}
+}
+
+// evalDynamicWind implements (dynamic-wind in-thunk body-thunk out-thunk).
+// The in-thunk runs before body, out-thunk runs after — even on non-local exit via call/cc.
+func evalDynamicWind(inThunk, bodyThunk, outThunk *Value, node *astNode, ip *interp) (*Value, error) {
+	// Call in-thunk
+	if _, err := callThunk(inThunk, node, ip); err != nil {
+		return nil, err
+	}
+
+	// Call body-thunk with defer to ensure out-thunk runs on non-local exit
+	var result *Value
+	var bodyErr error
+	var panicVal interface{}
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// Non-local exit (continuation invocation) — call out-thunk before re-panicking
+				callThunk(outThunk, node, ip)
+				panicVal = r
+			}
+		}()
+		result, bodyErr = callThunk(bodyThunk, node, ip)
+	}()
+
+	if panicVal != nil {
+		panic(panicVal)
+	}
+
+	if bodyErr != nil {
+		return nil, bodyErr
+	}
+
+	// Normal exit — call out-thunk
+	if _, err := callThunk(outThunk, node, ip); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
 func evalDefine(node *astNode, e *env, ip *interp) (*Value, error) {
 	if len(node.children) < 3 {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", node.line, node.col)}
@@ -2449,6 +2501,12 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		}
 		return doCallCC(args[0], node, ip)
 
+	case "dynamic-wind":
+		if len(args) != 3 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: dynamic-wind: need 3 arguments", node.line, node.col)}
+		}
+		return evalDynamicWind(args[0], args[1], args[2], node, ip)
+
 	case "gcd":
 		if len(args) == 0 {
 			return intVal(0), nil
@@ -3042,7 +3100,8 @@ func makeGlobalEnv() *env {
 		"make-string", "string",
 		"string>?", "string<=?", "string>=?",
 		"member", "assv",
-		"call/cc", "call-with-current-continuation"}
+		"call/cc", "call-with-current-continuation",
+		"dynamic-wind"}
 	for _, name := range builtins {
 		e.set(name, symVal(name))
 	}
