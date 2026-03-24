@@ -12,6 +12,14 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[derive(Debug, Clone)]
+pub(super) struct CaseLambdaClause {
+    params: Vec<String>,
+    rest_param: Option<String>,
+    body: Vec<Expr>,
+    env: Env,
+}
+
 /// A Scheme value.
 #[derive(Debug, Clone)]
 pub(super) enum Value {
@@ -52,6 +60,9 @@ pub(super) enum Value {
     RecordAccessor {
         type_id: u64,
         field_name: String,
+    },
+    CaseLambda {
+        clauses: Vec<CaseLambdaClause>,
     },
     Void,
 }
@@ -128,7 +139,7 @@ impl fmt::Display for Value {
                 '\t' => write!(f, "#\\tab"),
                 _ => write!(f, "#\\{c}"),
             },
-            Value::Lambda { .. } => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::CaseLambda { .. } => write!(f, "#<procedure>"),
             Value::Builtin(name) => write!(f, "#<builtin:{name}>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
             Value::Record { type_name, .. } => write!(f, "#<record:{type_name}>"),
@@ -592,6 +603,7 @@ pub(super) const BUILTINS: &[&str] = &[
     "char-upcase", "char-downcase",
     "string=?", "string<?", "string-ci=?",
     "string-upcase", "string-downcase",
+    "procedure?",
 ];
 
 fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
@@ -622,6 +634,7 @@ fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError>
                         return Ok(expr_to_value(&elems[1]));
                     }
                     "lambda" => return eval_lambda(&elems[1..], p, env),
+                    "case-lambda" => return eval_case_lambda(&elems[1..], p, env),
                     "let" => return eval_let(&elems[1..], p, env, output),
                     "begin" => return eval_begin(&elems[1..], env, output),
                     "cond" => return eval_cond(&elems[1..], env, output),
@@ -772,6 +785,30 @@ fn eval_lambda(args: &[Expr], call_pos: Pos, env: &Env) -> Result<Value, EvalErr
         body,
         env: env.clone(),
     })
+}
+
+fn eval_case_lambda(args: &[Expr], call_pos: Pos, env: &Env) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Arity(format!("{call_pos}: case-lambda requires at least one clause")));
+    }
+    let mut clauses = Vec::new();
+    for arg in args {
+        match arg {
+            Expr::List(clause_elems, _) => {
+                if clause_elems.len() < 2 {
+                    return Err(EvalError::Parse(format!("{call_pos}: case-lambda clause needs params and body")));
+                }
+                let (params, rest_param) = match &clause_elems[0] {
+                    Expr::List(elems, _) => parse_params(elems, call_pos)?,
+                    _ => return Err(EvalError::Parse(format!("{call_pos}: case-lambda: expected parameter list"))),
+                };
+                let body = clause_elems[1..].to_vec();
+                clauses.push(CaseLambdaClause { params, rest_param, body, env: env.clone() });
+            }
+            _ => return Err(EvalError::Parse(format!("{call_pos}: case-lambda: expected clause list"))),
+        }
+    }
+    Ok(Value::CaseLambda { clauses })
 }
 
 fn eval_and(exprs: &[Expr], env: &Env, output: &mut String) -> Result<Value, EvalError> {
@@ -1141,6 +1178,38 @@ fn apply_func(func: &Value, args: &[Value], call_pos: Pos, output: &mut String) 
                 Ok(result)
             }
         }
+        Value::CaseLambda { clauses } => {
+            for clause in clauses {
+                if let Some(rest) = &clause.rest_param {
+                    if args.len() >= clause.params.len() {
+                        let local_env = new_env(Some(clause.env.clone()));
+                        for (param, arg) in clause.params.iter().zip(args.iter()) {
+                            env_set(&local_env, param.clone(), arg.clone());
+                        }
+                        env_set(&local_env, rest.clone(), Value::List(args[clause.params.len()..].to_vec()));
+                        let mut result = Value::Void;
+                        for expr in &clause.body {
+                            result = eval(expr, &local_env, output)?;
+                        }
+                        return Ok(result);
+                    }
+                } else if args.len() == clause.params.len() {
+                    let local_env = new_env(Some(clause.env.clone()));
+                    for (param, arg) in clause.params.iter().zip(args.iter()) {
+                        env_set(&local_env, param.clone(), arg.clone());
+                    }
+                    let mut result = Value::Void;
+                    for expr in &clause.body {
+                        result = eval(expr, &local_env, output)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            Err(EvalError::Arity(format!(
+                "{call_pos}: no matching case-lambda clause for {} arguments",
+                args.len()
+            )))
+        }
         Value::RecordConstructor { type_id, type_name, field_names } => {
             if args.len() != field_names.len() {
                 return Err(EvalError::Arity(format!(
@@ -1230,7 +1299,7 @@ fn is_proper_list(v: &Value) -> bool {
 static RECORD_TYPE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(super) const SPECIAL_FORMS: &[&str] = &[
-    "define", "if", "quote", "lambda", "let", "begin", "cond", "and", "or",
+    "define", "if", "quote", "lambda", "case-lambda", "let", "begin", "cond", "and", "or",
     "set!", "string-set!", "not", "define-syntax", "syntax-rules",
 ];
 

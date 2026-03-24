@@ -807,6 +807,21 @@ pub(super) fn apply_builtin(name: &str, args: &[Value], call_pos: Pos, output: &
         | "string=?" | "string<?" | "string-ci=?"
         | "string-upcase" | "string-downcase" => apply_string_io_builtin(name, args, call_pos, output),
 
+        "procedure?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: procedure? expects 1 argument")));
+            }
+            Ok(Value::Boolean(matches!(
+                &args[0],
+                Value::Lambda { .. }
+                    | Value::CaseLambda { .. }
+                    | Value::Builtin(_)
+                    | Value::RecordConstructor { .. }
+                    | Value::RecordPredicate { .. }
+                    | Value::RecordAccessor { .. }
+            )))
+        }
+
         _ => Err(EvalError::UnboundVariable(format!("{call_pos}: {name}"))),
     }
 }
