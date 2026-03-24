@@ -7,6 +7,34 @@ import (
 	"unicode"
 )
 
+// ---------- Tail Call Optimization ----------
+
+type tailCallErr struct {
+	node *astNode
+	env  *env
+}
+
+func (t *tailCallErr) Error() string { return "tail call" }
+
+// evalTail returns a tail-call sentinel instead of evaluating.
+// The eval trampoline catches this and continues the loop.
+func evalTail(node *astNode, e *env) (*Value, error) {
+	return nil, &tailCallErr{node, e}
+}
+
+// applyLambdaFull calls applyLambda and resolves any tail call via eval.
+// Use this when a fully resolved value is needed (e.g., inside map).
+func applyLambdaFull(op *Value, args []*Value, node *astNode, ip *interp) (*Value, error) {
+	val, err := applyLambda(op, args, node, ip)
+	if err != nil {
+		if tc, ok := err.(*tailCallErr); ok {
+			return eval(tc.node, tc.env, ip)
+		}
+		return nil, err
+	}
+	return val, nil
+}
+
 // ---------- Value types ----------
 
 type valueType int
@@ -705,10 +733,21 @@ func (e *env) setMutate(name string, v *Value) bool {
 }
 
 func eval(node *astNode, e *env, ip *interp) (*Value, error) {
-	if node.isAtom {
-		return evalAtom(node, e)
+	for {
+		if node.isAtom {
+			return evalAtom(node, e)
+		}
+		val, err := evalList(node, e, ip)
+		if err != nil {
+			if tc, ok := err.(*tailCallErr); ok {
+				node = tc.node
+				e = tc.env
+				continue
+			}
+			return nil, err
+		}
+		return val, nil
 	}
-	return evalList(node, e, ip)
 }
 
 func evalAtom(node *astNode, e *env) (*Value, error) {
@@ -789,7 +828,7 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 			if err != nil {
 				return nil, err
 			}
-			return eval(expanded, expandEnv, ip)
+			return evalTail(expanded, expandEnv)
 		}
 	}
 
@@ -831,36 +870,40 @@ func evalAnd(node *astNode, e *env, ip *interp) (*Value, error) {
 	if len(node.children) == 1 {
 		return boolVal(true), nil
 	}
-	var result *Value
-	for _, child := range node.children[1:] {
+	exprs := node.children[1:]
+	for i, child := range exprs {
+		if i == len(exprs)-1 {
+			return evalTail(child, e)
+		}
 		v, err := eval(child, e, ip)
 		if err != nil {
 			return nil, err
 		}
-		result = v
 		if !isTruthy(v) {
 			return v, nil
 		}
 	}
-	return result, nil
+	return boolVal(true), nil // unreachable
 }
 
 func evalOr(node *astNode, e *env, ip *interp) (*Value, error) {
 	if len(node.children) == 1 {
 		return boolVal(false), nil
 	}
-	var result *Value
-	for _, child := range node.children[1:] {
+	exprs := node.children[1:]
+	for i, child := range exprs {
+		if i == len(exprs)-1 {
+			return evalTail(child, e)
+		}
 		v, err := eval(child, e, ip)
 		if err != nil {
 			return nil, err
 		}
-		result = v
 		if isTruthy(v) {
 			return v, nil
 		}
 	}
-	return result, nil
+	return boolVal(false), nil // unreachable
 }
 
 func evalDefine(node *astNode, e *env, ip *interp) (*Value, error) {
@@ -932,10 +975,10 @@ func evalIf(node *astNode, e *env, ip *interp) (*Value, error) {
 		return nil, err
 	}
 	if isTruthy(cond) {
-		return eval(node.children[2], e, ip)
+		return evalTail(node.children[2], e)
 	}
 	if len(node.children) == 4 {
-		return eval(node.children[3], e, ip)
+		return evalTail(node.children[3], e)
 	}
 	return voidVal(), nil
 }
@@ -1052,45 +1095,51 @@ func evalLet(node *astNode, e *env, ip *interp) (*Value, error) {
 		for i, p := range params {
 			callEnv.set(p, initVals[i])
 		}
-		var result *Value
-		for _, bodyExpr := range node.children[offset+1:] {
-			var err error
-			result, err = eval(bodyExpr, callEnv, ip)
+		body := node.children[offset+1:]
+		for i, bodyExpr := range body {
+			if i == len(body)-1 {
+				return evalTail(bodyExpr, callEnv)
+			}
+			_, err := eval(bodyExpr, callEnv, ip)
 			if err != nil {
 				return nil, err
 			}
 		}
-		return result, nil
+		return voidVal(), nil
 	}
 
 	localEnv := newEnv(e)
 	for i, p := range params {
 		localEnv.set(p, initVals[i])
 	}
-	var result *Value
-	for _, bodyExpr := range node.children[offset+1:] {
-		var err error
-		result, err = eval(bodyExpr, localEnv, ip)
+	body := node.children[offset+1:]
+	for i, bodyExpr := range body {
+		if i == len(body)-1 {
+			return evalTail(bodyExpr, localEnv)
+		}
+		_, err := eval(bodyExpr, localEnv, ip)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	return voidVal(), nil
 }
 
 func evalBegin(node *astNode, e *env, ip *interp) (*Value, error) {
 	if len(node.children) < 2 {
 		return voidVal(), nil
 	}
-	var result *Value
-	for _, child := range node.children[1:] {
-		var err error
-		result, err = eval(child, e, ip)
+	exprs := node.children[1:]
+	for i, child := range exprs {
+		if i == len(exprs)-1 {
+			return evalTail(child, e)
+		}
+		_, err := eval(child, e, ip)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	return voidVal(), nil // unreachable
 }
 
 func evalCond(node *astNode, e *env, ip *interp) (*Value, error) {
@@ -1100,29 +1149,34 @@ func evalCond(node *astNode, e *env, ip *interp) (*Value, error) {
 		}
 		test := clause.children[0]
 		if test.isAtom && test.tok.kind == tokSymbol && test.tok.sval == "else" {
-			var result *Value
-			for _, expr := range clause.children[1:] {
-				var err error
-				result, err = eval(expr, e, ip)
+			body := clause.children[1:]
+			for i, expr := range body {
+				if i == len(body)-1 {
+					return evalTail(expr, e)
+				}
+				_, err := eval(expr, e, ip)
 				if err != nil {
 					return nil, err
 				}
 			}
-			return result, nil
+			return voidVal(), nil // unreachable
 		}
 		cond, err := eval(test, e, ip)
 		if err != nil {
 			return nil, err
 		}
 		if isTruthy(cond) {
-			var result *Value
-			for _, expr := range clause.children[1:] {
-				result, err = eval(expr, e, ip)
+			body := clause.children[1:]
+			for i, expr := range body {
+				if i == len(body)-1 {
+					return evalTail(expr, e)
+				}
+				_, err = eval(expr, e, ip)
 				if err != nil {
 					return nil, err
 				}
 			}
-			return result, nil
+			return voidVal(), nil // unreachable
 		}
 	}
 	return voidVal(), nil
@@ -1184,6 +1238,20 @@ func requireNums(args []*Value, name string, node *astNode) error {
 	return nil
 }
 
+// evalBodyTail evaluates all body expressions, returning a tail call for the last one.
+func evalBodyTail(body []*astNode, localEnv *env, ip *interp) (*Value, error) {
+	for i, bodyExpr := range body {
+		if i == len(body)-1 {
+			return evalTail(bodyExpr, localEnv)
+		}
+		_, err := eval(bodyExpr, localEnv, ip)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return voidVal(), nil
+}
+
 func applyLambda(op *Value, args []*Value, node *astNode, ip *interp) (*Value, error) {
 	// case-lambda: dispatch to matching clause
 	if op.caseClauses != nil {
@@ -1208,15 +1276,7 @@ func applyLambda(op *Value, args []*Value, node *astNode, ip *interp) (*Value, e
 				}
 				localEnv.set(cl.restParam, rest)
 			}
-			var result *Value
-			for _, bodyExpr := range cl.body {
-				var err error
-				result, err = eval(bodyExpr, localEnv, ip)
-				if err != nil {
-					return nil, err
-				}
-			}
-			return result, nil
+			return evalBodyTail(cl.body, localEnv, ip)
 		}
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: no matching clause for %d arguments", node.line, node.col, len(args))}
 	}
@@ -1235,15 +1295,7 @@ func applyLambda(op *Value, args []*Value, node *astNode, ip *interp) (*Value, e
 			rest = &Value{typ: valPair, car: args[i], cdr: rest}
 		}
 		localEnv.set(op.restParam, rest)
-		var result *Value
-		for _, bodyExpr := range op.body {
-			var err error
-			result, err = eval(bodyExpr, localEnv, ip)
-			if err != nil {
-				return nil, err
-			}
-		}
-		return result, nil
+		return evalBodyTail(op.body, localEnv, ip)
 	}
 	if len(args) != len(op.params) {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected %d, got %d", node.line, node.col, len(op.params), len(args))}
@@ -1252,15 +1304,7 @@ func applyLambda(op *Value, args []*Value, node *astNode, ip *interp) (*Value, e
 	for i, param := range op.params {
 		localEnv.set(param, args[i])
 	}
-	var result *Value
-	for _, bodyExpr := range op.body {
-		var err error
-		result, err = eval(bodyExpr, localEnv, ip)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
+	return evalBodyTail(op.body, localEnv, ip)
 }
 
 func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value, error) {
@@ -2188,7 +2232,7 @@ func applyMap(args []*Value, node *astNode, ip *interp) (*Value, error) {
 		var v *Value
 		var err error
 		if fn.typ == valLambda {
-			v, err = applyLambda(fn, callArgs, node, ip)
+			v, err = applyLambdaFull(fn, callArgs, node, ip)
 		} else if fn.typ == valSymbol {
 			v, err = applyBuiltin(fn.sval, callArgs, node, ip)
 		} else {
@@ -2290,15 +2334,7 @@ func evalLetrec(node *astNode, e *env, ip *interp, star bool) (*Value, error) {
 		}
 	}
 	// Evaluate body
-	var result *Value
-	for _, bodyExpr := range node.children[2:] {
-		var err error
-		result, err = eval(bodyExpr, localEnv, ip)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
+	return evalBodyTail(node.children[2:], localEnv, ip)
 }
 
 // evalCase implements (case expr ((datum ...) body ...) ... (else body ...))
