@@ -176,6 +176,9 @@ public class Evaluator {
         @Override public String toString() { return "()"; }
     };
 
+    // Multiple return values
+    private record SchemeValues(List<Object> values) {}
+
     // Void sentinel for define
     private static final Object VOID = new Object() {
         @Override public String toString() { return "#<void>"; }
@@ -368,7 +371,8 @@ public class Evaluator {
         "open-input-file", "open-output-file", "close-input-port", "close-output-port",
         "eof-object?", "read", "read-char", "peek-char",
         "with-exception-handler", "raise", "raise-continuable",
-        "error", "error-object-message", "error-object?"
+        "error", "error-object-message", "error-object?",
+        "values", "call-with-values"
     };
 
     private Env makeTopLevelEnv() {
@@ -2368,6 +2372,23 @@ public class Evaluator {
             case "error-object?" -> {
                 requireArgCount(op, args, 1);
                 return Boolean.FALSE;
+            }
+            case "values" -> {
+                if (args.size() == 1) return args.get(0);
+                return new SchemeValues(args);
+            }
+            case "call-with-values" -> {
+                requireArgCount(op, args, 2);
+                Object producer = args.get(0);
+                Object consumer = args.get(1);
+                Object produced = applyProcedure(producer, List.of());
+                List<Object> consumerArgs;
+                if (produced instanceof SchemeValues sv) {
+                    consumerArgs = sv.values();
+                } else {
+                    consumerArgs = List.of(produced);
+                }
+                return applyProcedure(consumer, consumerArgs);
             }
             default -> throw new EvalError(posStr() + "unbound variable: " + op);
         }
