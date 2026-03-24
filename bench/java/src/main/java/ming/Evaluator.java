@@ -351,17 +351,26 @@ public class Evaluator {
                 throw error("define: bad syntax");
             }
             List<String> params = new ArrayList<>();
+            String restParam = null;
             for (int i = 1; i < sig.size(); i++) {
                 Object p = sig.get(i);
                 if (p instanceof Located loc) p = loc.value();
                 if (!(p instanceof String s)) throw error("define: bad parameter");
+                if (s.equals(".")) {
+                    if (i + 1 >= sig.size()) throw error("define: missing rest parameter after dot");
+                    Object rp = sig.get(i + 1);
+                    if (rp instanceof Located loc) rp = loc.value();
+                    if (!(rp instanceof String rest)) throw error("define: bad rest parameter");
+                    restParam = rest;
+                    break;
+                }
                 params.add(s);
             }
             List<Object> body = new ArrayList<>();
             for (int i = 2; i < list.size(); i++) {
                 body.add(list.get(i));
             }
-            Lambda lambda = new Lambda(params, body, env);
+            Lambda lambda = new Lambda(params, restParam, body, env);
             env.define(name, lambda);
             return VOID;
         }
@@ -385,16 +394,26 @@ public class Evaluator {
         if (paramList instanceof Located loc) paramList = loc.value();
         if (!(paramList instanceof List<?> plist)) throw error("lambda: bad parameters");
         List<String> params = new ArrayList<>();
-        for (Object p : plist) {
+        String restParam = null;
+        for (int i = 0; i < plist.size(); i++) {
+            Object p = plist.get(i);
             if (p instanceof Located loc) p = loc.value();
             if (!(p instanceof String s)) throw error("lambda: bad parameter");
+            if (s.equals(".")) {
+                if (i + 1 >= plist.size()) throw error("lambda: missing rest parameter after dot");
+                Object rp = plist.get(i + 1);
+                if (rp instanceof Located loc) rp = loc.value();
+                if (!(rp instanceof String rest)) throw error("lambda: bad rest parameter");
+                restParam = rest;
+                break;
+            }
             params.add(s);
         }
         List<Object> body = new ArrayList<>();
         for (int i = 2; i < list.size(); i++) {
             body.add(list.get(i));
         }
-        return new Lambda(params, body, env);
+        return new Lambda(params, restParam, body, env);
     }
 
     private Object evalBegin(List<?> list, Environment env) throws EvalError {
@@ -463,7 +482,7 @@ public class Evaluator {
                 body.add(list.get(i));
             }
             Environment letEnv = new Environment(env);
-            Lambda lambda = new Lambda(params, body, letEnv);
+            Lambda lambda = new Lambda(params, null, body, letEnv);
             letEnv.define(name, lambda);
             Environment callEnv = new Environment(letEnv);
             for (int i = 0; i < params.size(); i++) {
@@ -499,12 +518,25 @@ public class Evaluator {
 
     private Object apply(Object proc, List<Object> args) throws EvalError {
         if (proc instanceof Lambda lambda) {
-            if (args.size() != lambda.params.size()) {
-                throw error("wrong number of arguments: expected " + lambda.params.size() + ", got " + args.size());
+            if (lambda.restParam != null) {
+                if (args.size() < lambda.params.size()) {
+                    throw error("wrong number of arguments: expected at least " + lambda.params.size() + ", got " + args.size());
+                }
+            } else {
+                if (args.size() != lambda.params.size()) {
+                    throw error("wrong number of arguments: expected " + lambda.params.size() + ", got " + args.size());
+                }
             }
             Environment callEnv = new Environment(lambda.closure);
             for (int i = 0; i < lambda.params.size(); i++) {
                 callEnv.define(lambda.params.get(i), args.get(i));
+            }
+            if (lambda.restParam != null) {
+                Object rest = NIL;
+                for (int i = args.size() - 1; i >= lambda.params.size(); i--) {
+                    rest = new Pair(args.get(i), rest);
+                }
+                callEnv.define(lambda.restParam, rest);
             }
             Object result = VOID;
             for (Object bodyExpr : lambda.body) {
@@ -703,6 +735,25 @@ public class Evaluator {
         globalEnv.define("char?", (BuiltinProc) args -> {
             if (args.size() != 1) throw error("char?: expected 1 argument");
             return args.get(0) instanceof SchemeChar;
+        });
+
+        // apply
+        globalEnv.define("apply", (BuiltinProc) args -> {
+            if (args.size() < 2) throw error("apply: expected at least 2 arguments");
+            Object proc = args.get(0);
+            // Last argument must be a list; prefix arguments are prepended
+            Object lastArg = args.get(args.size() - 1);
+            List<Object> callArgs = new ArrayList<>();
+            for (int i = 1; i < args.size() - 1; i++) {
+                callArgs.add(args.get(i));
+            }
+            // Unpack the last argument (a list) into callArgs
+            Object cur = lastArg;
+            while (cur instanceof Pair p) {
+                callArgs.add(p.car);
+                cur = p.cdr;
+            }
+            return apply(proc, callArgs);
         });
     }
 
