@@ -3912,3 +3912,29 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	r, err := evalWithEnv(input, environ)
 	return r, buf.String(), err
 }
+
+func EvalStrWithLimit(input string, maxSteps int) (string, error) {
+	environ := makeTopLevelEnv()
+	environ.output = &strings.Builder{}
+	tokens, err := tokenize(input)
+	if err != nil {
+		return "", err
+	}
+	p := &parser{tokens: tokens}
+	var exprs []*expr
+	for p.peek().kind != tokEOF {
+		e, err := p.parseExpr()
+		if err != nil {
+			return "", err
+		}
+		exprs = append(exprs, e)
+	}
+	val, err := cekEvalProgramWithLimit(exprs, environ, maxSteps)
+	if err != nil {
+		return "", err
+	}
+	if val.kind == valVoid {
+		return "", nil
+	}
+	return val.String(), nil
+}

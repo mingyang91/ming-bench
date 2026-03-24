@@ -385,6 +385,8 @@ type cekM struct {
 	isValue  bool
 	wind     []*windEntry        // dynamic-wind stack
 	handlers []*handlerStackEntry // exception handler stack
+	stepLimit int                 // 0 = unlimited
+	steps     int                 // current step count
 }
 
 func (m *cekM) setEval(e *expr, environ *env, k kont) {
@@ -402,6 +404,12 @@ func (m *cekM) setApply(v value, k kont) {
 
 func (m *cekM) run() (value, error) {
 	for {
+		if m.stepLimit > 0 {
+			m.steps++
+			if m.steps > m.stepLimit {
+				return value{}, fmt.Errorf("step limit exceeded")
+			}
+		}
 		if !m.isValue {
 			if err := m.stepEval(); err != nil {
 				return value{}, err
@@ -1693,10 +1701,14 @@ func (m *cekM) startRewind(entries []*windEntry, targetVal value, targetK kont, 
 // ---------- Top-level CEK entry ----------
 
 func cekEvalProgram(exprs []*expr, environ *env) (value, error) {
+	return cekEvalProgramWithLimit(exprs, environ, 0)
+}
+
+func cekEvalProgramWithLimit(exprs []*expr, environ *env, stepLimit int) (value, error) {
 	if len(exprs) == 0 {
 		return voidVal, nil
 	}
-	m := &cekM{}
+	m := &cekM{stepLimit: stepLimit}
 	var k kont = &kontHalt{}
 	if len(exprs) > 1 {
 		k = &kontTopSeq{
