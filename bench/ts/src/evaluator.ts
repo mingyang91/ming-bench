@@ -13,6 +13,7 @@ type SchemeVal =
   | { tag: 'list'; elements: SchemeVal[]; dotted?: boolean; pos?: Pos }
   | { tag: 'builtin'; name: string; func: (args: SchemeVal[], callPos?: Pos) => SchemeVal; pos?: Pos }
   | { tag: 'lambda'; params: string[]; restParam?: string; body: SchemeVal[]; env: Env; pos?: Pos }
+  | { tag: 'macro'; literals: string[]; rules: { pattern: SchemeVal; template: SchemeVal }[]; defEnv: Env; pos?: Pos }
   | { tag: 'void'; pos?: Pos };
 
 // --- Parser ---
@@ -145,6 +146,7 @@ function schemeToString(val: SchemeVal): string {
     }
     case 'builtin': return `#<procedure:${val.name}>`;
     case 'lambda': return '#<procedure>';
+    case 'macro': return '#<macro>';
     case 'void': return '';
   }
 }
@@ -777,6 +779,157 @@ function makeGlobalEnv(outputBuf: string[]): Env {
   return env;
 }
 
+// --- Macro support ---
+
+const SPECIAL_FORMS = new Set([
+  'quote', 'if', 'define', 'lambda', 'and', 'or', 'not', 'begin',
+  'cond', 'set!', 'string-set!', 'let', 'define-syntax'
+]);
+
+type MacroBindings = Map<string, SchemeVal | SchemeVal[]>;
+
+function getPatternVars(pattern: SchemeVal, literals: string[]): Set<string> {
+  const vars = new Set<string>();
+  function walk(p: SchemeVal) {
+    if (p.tag === 'symbol' && p.value !== '...' && p.value !== '_' && !literals.includes(p.value)) {
+      vars.add(p.value);
+    }
+    if (p.tag === 'list') {
+      for (const elem of p.elements) walk(elem);
+    }
+  }
+  walk(pattern);
+  return vars;
+}
+
+function matchPattern(pattern: SchemeVal, input: SchemeVal, literals: string[], bindings: MacroBindings): boolean {
+  if (pattern.tag === 'symbol') {
+    if (pattern.value === '_') return true;
+    if (literals.includes(pattern.value)) {
+      return input.tag === 'symbol' && input.value === pattern.value;
+    }
+    bindings.set(pattern.value, input);
+    return true;
+  }
+  if (pattern.tag === 'boolean' && input.tag === 'boolean') return pattern.value === input.value;
+  if (pattern.tag === 'number' && input.tag === 'number') return pattern.value === input.value;
+  if (pattern.tag === 'list' && input.tag === 'list') {
+    const patElems = pattern.elements;
+    const inpElems = input.elements;
+    let ellipsisIdx = -1;
+    for (let i = 0; i < patElems.length; i++) {
+      const pe = patElems[i];
+      if (pe.tag === 'symbol' && pe.value === '...') {
+        ellipsisIdx = i;
+        break;
+      }
+    }
+    if (ellipsisIdx === -1) {
+      if (patElems.length !== inpElems.length) return false;
+      for (let i = 0; i < patElems.length; i++) {
+        if (!matchPattern(patElems[i], inpElems[i], literals, bindings)) return false;
+      }
+      return true;
+    }
+    const beforeCount = ellipsisIdx - 1;
+    const afterCount = patElems.length - ellipsisIdx - 1;
+    if (inpElems.length < beforeCount + afterCount) return false;
+    for (let i = 0; i < beforeCount; i++) {
+      if (!matchPattern(patElems[i], inpElems[i], literals, bindings)) return false;
+    }
+    const repeatedPattern = patElems[ellipsisIdx - 1];
+    const repeatCount = inpElems.length - beforeCount - afterCount;
+    if (repeatedPattern.tag === 'symbol' && !literals.includes(repeatedPattern.value) && repeatedPattern.value !== '_') {
+      const matches: SchemeVal[] = [];
+      for (let i = 0; i < repeatCount; i++) {
+        matches.push(inpElems[beforeCount + i]);
+      }
+      bindings.set(repeatedPattern.value, matches);
+    }
+    for (let i = 0; i < afterCount; i++) {
+      if (!matchPattern(patElems[ellipsisIdx + 1 + i], inpElems[inpElems.length - afterCount + i], literals, bindings)) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+function findEllipsisVars(template: SchemeVal, bindings: MacroBindings): string[] {
+  const result: string[] = [];
+  if (template.tag === 'symbol') {
+    const val = bindings.get(template.value);
+    if (Array.isArray(val)) result.push(template.value);
+  }
+  if (template.tag === 'list') {
+    for (const elem of template.elements) {
+      result.push(...findEllipsisVars(elem, bindings));
+    }
+  }
+  return result;
+}
+
+function expandTemplate(
+  template: SchemeVal,
+  bindings: MacroBindings,
+  defEnv: Env,
+  patternVars: Set<string>
+): SchemeVal {
+  if (template.tag === 'symbol') {
+    const name = template.value;
+    if (patternVars.has(name) && bindings.has(name)) {
+      const val = bindings.get(name)!;
+      if (!Array.isArray(val)) return val;
+      throw new EvalError(`macro: ellipsis variable ${name} used without ...`);
+    }
+    if (!SPECIAL_FORMS.has(name) && !patternVars.has(name)) {
+      const defVal = envLookup(defEnv, name);
+      if (defVal !== undefined && defVal.tag !== 'macro') {
+        return defVal;
+      }
+    }
+    return template;
+  }
+  if (template.tag === 'list') {
+    const result: SchemeVal[] = [];
+    const elems = template.elements;
+    for (let i = 0; i < elems.length; i++) {
+      const next = elems[i + 1];
+      if (i + 1 < elems.length && next && next.tag === 'symbol' && next.value === '...') {
+        const evars = findEllipsisVars(elems[i], bindings);
+        if (evars.length > 0) {
+          const firstArr = bindings.get(evars[0]) as SchemeVal[];
+          for (let j = 0; j < firstArr.length; j++) {
+            const subBindings = new Map(bindings);
+            for (const v of evars) {
+              subBindings.set(v, (bindings.get(v) as SchemeVal[])[j]);
+            }
+            result.push(expandTemplate(elems[i], subBindings, defEnv, patternVars));
+          }
+        }
+        i++;
+        continue;
+      }
+      result.push(expandTemplate(elems[i], bindings, defEnv, patternVars));
+    }
+    return { tag: 'list', elements: result };
+  }
+  return template;
+}
+
+function expandMacroCall(
+  macro: { literals: string[]; rules: { pattern: SchemeVal; template: SchemeVal }[]; defEnv: Env },
+  input: SchemeVal
+): SchemeVal {
+  for (const rule of macro.rules) {
+    const bindings: MacroBindings = new Map();
+    if (matchPattern(rule.pattern, input, macro.literals, bindings)) {
+      const patternVars = getPatternVars(rule.pattern, macro.literals);
+      return expandTemplate(rule.template, bindings, macro.defEnv, patternVars);
+    }
+  }
+  throw new EvalError('no matching macro pattern');
+}
+
 // --- Eval ---
 
 function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
@@ -966,6 +1119,37 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
           }
           return letResult;
         }
+
+        if (name === 'define-syntax') {
+          if (elems.length !== 3) throw new EvalError(`${fmtPos(expr.pos)}define-syntax: expected 2 args`);
+          if (elems[1].tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}define-syntax: expected symbol`);
+          const sr = elems[2];
+          if (sr.tag !== 'list' || sr.elements.length < 2 ||
+              sr.elements[0].tag !== 'symbol' || sr.elements[0].value !== 'syntax-rules')
+            throw new EvalError(`${fmtPos(expr.pos)}define-syntax: expected syntax-rules`);
+          if (sr.elements[1].tag !== 'list')
+            throw new EvalError(`${fmtPos(expr.pos)}syntax-rules: expected literals list`);
+          const literals = sr.elements[1].elements.map(e => {
+            if (e.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}syntax-rules: literals must be symbols`);
+            return e.value;
+          });
+          const rules: { pattern: SchemeVal; template: SchemeVal }[] = [];
+          for (let i = 2; i < sr.elements.length; i++) {
+            const rule = sr.elements[i];
+            if (rule.tag !== 'list' || rule.elements.length !== 2)
+              throw new EvalError(`${fmtPos(expr.pos)}syntax-rules: invalid rule`);
+            rules.push({ pattern: rule.elements[0], template: rule.elements[1] });
+          }
+          envDefine(env, elems[1].value, { tag: 'macro', literals, rules, defEnv: env });
+          return { tag: 'void' };
+        }
+
+        // Macro expansion
+        const maybeMacro = envLookup(env, name);
+        if (maybeMacro && maybeMacro.tag === 'macro') {
+          const expanded = expandMacroCall(maybeMacro, expr);
+          return evalScheme(expanded, env);
+        }
       }
 
       // Function application
@@ -1001,6 +1185,7 @@ function evalScheme(expr: SchemeVal, env: Env): SchemeVal {
 
     case 'builtin':
     case 'lambda':
+    case 'macro':
     case 'void':
       return expr;
   }
