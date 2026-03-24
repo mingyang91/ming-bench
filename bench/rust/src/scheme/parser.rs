@@ -29,6 +29,7 @@ enum TokenKind {
     LParen,
     RParen,
     Quote,
+    SyntaxQuote,
     Integer(i64),
     Float(f64),
     Rational(i64, i64),
@@ -104,6 +105,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                 let start_col = col;
                 if i + 1 < chars.len() {
                     match chars[i + 1] {
+                        '\'' => {
+                            // #'expr => (syntax expr)
+                            tokens.push(Token { kind: TokenKind::SyntaxQuote, span: Span { line, col: start_col } });
+                            i += 2; col += 2;
+                        }
                         't' => {
                             tokens.push(Token { kind: TokenKind::Boolean(true), span: Span { line, col: start_col } });
                             i += 2; col += 2;
@@ -230,6 +236,16 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Expr, usize), EvalError> 
             Ok((Expr {
                 kind: ExprKind::List(vec![
                     Expr { kind: ExprKind::Symbol("quote".into()), span },
+                    inner,
+                ]),
+                span,
+            }, next))
+        }
+        TokenKind::SyntaxQuote => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((Expr {
+                kind: ExprKind::List(vec![
+                    Expr { kind: ExprKind::Symbol("syntax".into()), span },
                     inner,
                 ]),
                 span,
