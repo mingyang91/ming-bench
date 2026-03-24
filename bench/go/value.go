@@ -185,6 +185,21 @@ type LambdaVal struct {
 
 func (v *LambdaVal) String() string { return "#<procedure>" }
 
+// CaseLambdaClauses represents one clause of a case-lambda.
+type CaseLambdaClause struct {
+	Params    []string
+	RestParam string
+	Body      []*Expr
+}
+
+// CaseLambdaVal represents a case-lambda (multi-arity procedure).
+type CaseLambdaVal struct {
+	Clauses []CaseLambdaClause
+	Env     *Env
+}
+
+func (v *CaseLambdaVal) String() string { return "#<procedure>" }
+
 // ApplyVal is the first-class apply procedure.
 type ApplyVal struct{}
 

@@ -121,6 +121,8 @@ func evalList(expr *Expr, env *Env) (Value, error) {
 			return evalDefineSyntax(expr, env)
 		case "define-record-type":
 			return evalDefineRecordType(expr, env)
+		case "case-lambda":
+			return evalCaseLambda(expr, env)
 		}
 
 		// macro expansion: check if head symbol is bound to a SyntaxVal
@@ -320,6 +322,7 @@ func defaultEnv(output *strings.Builder) *Env {
 	env.Set("denominator", &BuiltinFunc{Name: "denominator", Fn: builtinDenominator})
 	env.Set("integer?", &BuiltinFunc{Name: "integer?", Fn: builtinIntegerQ})
 	env.Set("rational?", &BuiltinFunc{Name: "rational?", Fn: builtinRationalQ})
+	env.Set("procedure?", &BuiltinFunc{Name: "procedure?", Fn: builtinProcedureQ})
 
 	return env
 }
@@ -564,6 +567,49 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 			}
 		}
 		return result, nil
+	case *CaseLambdaVal:
+		// Find matching clause by arity
+		for _, clause := range fn.Clauses {
+			if clause.RestParam != "" {
+				if len(args) >= len(clause.Params) {
+					childEnv := NewEnv(fn.Env)
+					for i, p := range clause.Params {
+						childEnv.Set(p, args[i])
+					}
+					rest := Value(&NilVal{})
+					for i := len(args) - 1; i >= len(clause.Params); i-- {
+						rest = &PairVal{Car: args[i], Cdr: rest}
+					}
+					childEnv.Set(clause.RestParam, rest)
+					var result Value
+					var err error
+					for _, bodyExpr := range clause.Body {
+						result, err = eval(bodyExpr, childEnv)
+						if err != nil {
+							return nil, err
+						}
+					}
+					return result, nil
+				}
+			} else {
+				if len(args) == len(clause.Params) {
+					childEnv := NewEnv(fn.Env)
+					for i, p := range clause.Params {
+						childEnv.Set(p, args[i])
+					}
+					var result Value
+					var err error
+					for _, bodyExpr := range clause.Body {
+						result, err = eval(bodyExpr, childEnv)
+						if err != nil {
+							return nil, err
+						}
+					}
+					return result, nil
+				}
+			}
+		}
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: no matching clause for %d arguments", callExpr.Line, callExpr.Col, len(args))}
 	case *ApplyVal:
 		// (apply proc arg1 ... argList)
 		if len(args) < 2 {
@@ -892,6 +938,37 @@ func evalLambda(expr *Expr, env *Env) (Value, error) {
 		return nil, err
 	}
 	return &LambdaVal{Params: params, RestParam: rest, Body: expr.List[2:], Env: env}, nil
+}
+
+func evalCaseLambda(expr *Expr, env *Env) (Value, error) {
+	// (case-lambda (params body...) ...)
+	if len(expr.List) < 2 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: bad syntax", expr.Line, expr.Col)}
+	}
+	var clauses []CaseLambdaClause
+	for _, clauseExpr := range expr.List[1:] {
+		if clauseExpr.Kind != ExprList || len(clauseExpr.List) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: bad clause", clauseExpr.Line, clauseExpr.Col)}
+		}
+		paramExpr := clauseExpr.List[0]
+		body := clauseExpr.List[1:]
+		var params []string
+		var rest string
+		if paramExpr.Kind == ExprSymbol {
+			// (args body...) — all variadic
+			rest = paramExpr.SVal
+		} else if paramExpr.Kind == ExprList {
+			var err error
+			params, rest, err = parseDottedParams(paramExpr.List, "case-lambda")
+			if err != nil {
+				return nil, err
+			}
+		} else if paramExpr.Kind != ExprList {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: bad parameter list", paramExpr.Line, paramExpr.Col)}
+		}
+		clauses = append(clauses, CaseLambdaClause{Params: params, RestParam: rest, Body: body})
+	}
+	return &CaseLambdaVal{Clauses: clauses, Env: env}, nil
 }
 
 // parseDottedParams parses a parameter list that may contain dot notation.
@@ -1937,4 +2014,15 @@ func evalDefineRecordType(expr *Expr, env *Env) (Value, error) {
 	}
 
 	return &VoidVal{}, nil
+}
+
+func builtinProcedureQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("procedure?: expected 1 argument, got %d", len(args))
+	}
+	switch args[0].(type) {
+	case *LambdaVal, *CaseLambdaVal, *BuiltinFunc, *ApplyVal, *MapVal:
+		return &BoolVal{Val: true}, nil
+	}
+	return &BoolVal{Val: false}, nil
 }
