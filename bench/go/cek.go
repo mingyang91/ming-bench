@@ -235,6 +235,66 @@ type kontForEachK struct {
 
 func (*kontForEachK) isKont() {}
 
+// ---------- dynamic-wind frames ----------
+
+type windEntry struct {
+	inThunk  value
+	outThunk value
+}
+
+// After in-thunk finishes, push wind entry and call body-thunk.
+type kontDynWindIn struct {
+	bodyThunk value
+	outThunk  value
+	inThunk   value
+	callExpr  *expr
+	callEnv   *env
+	parent    kont
+}
+
+func (*kontDynWindIn) isKont() {}
+
+// After body-thunk finishes, pop wind entry and call out-thunk.
+type kontDynWindBody struct {
+	outThunk value
+	callExpr *expr
+	callEnv  *env
+	parent   kont
+}
+
+func (*kontDynWindBody) isKont() {}
+
+// After out-thunk finishes, return saved body result.
+type kontDynWindOut struct {
+	bodyResult value
+	parent     kont
+}
+
+func (*kontDynWindOut) isKont() {}
+
+// Unwind: call out-thunks one at a time.
+type kontWindUnwind struct {
+	outs      []value      // remaining out-thunks to call
+	rewindIns []*windEntry // entries to rewind after unwinding
+	targetVal value
+	targetK   kont
+	callExpr  *expr
+	callEnv   *env
+}
+
+func (*kontWindUnwind) isKont() {}
+
+// Rewind: call in-thunks one at a time.
+type kontWindRewind struct {
+	entries   []*windEntry // remaining entries to push/call-in
+	targetVal value
+	targetK   kont
+	callExpr  *expr
+	callEnv   *env
+}
+
+func (*kontWindRewind) isKont() {}
+
 // ---------- CEK machine ----------
 
 type cekM struct {
@@ -243,6 +303,7 @@ type cekM struct {
 	val     value
 	kont    kont
 	isValue bool
+	wind    []*windEntry // dynamic-wind stack
 }
 
 func (m *cekM) setEval(e *expr, environ *env, k kont) {
@@ -978,6 +1039,53 @@ func (m *cekM) stepApply() error {
 		}
 		return m.doForEachStep(kk.fn, nl, kk.callExpr, kk.callEnv, kk.parent)
 
+	case *kontDynWindIn:
+		// in-thunk done; push wind entry, call body-thunk
+		entry := &windEntry{inThunk: kk.inThunk, outThunk: kk.outThunk}
+		m.wind = append(m.wind, entry)
+		return m.applyProc(kk.bodyThunk, nil, kk.callExpr, kk.callEnv, &kontDynWindBody{
+			outThunk: kk.outThunk, callExpr: kk.callExpr, callEnv: kk.callEnv, parent: kk.parent,
+		})
+
+	case *kontDynWindBody:
+		// body done; pop wind entry, call out-thunk
+		if len(m.wind) > 0 {
+			m.wind = m.wind[:len(m.wind)-1]
+		}
+		return m.applyProc(kk.outThunk, nil, kk.callExpr, kk.callEnv, &kontDynWindOut{
+			bodyResult: val, parent: kk.parent,
+		})
+
+	case *kontDynWindOut:
+		// out-thunk done; return body result
+		m.setApply(kk.bodyResult, kk.parent)
+		return nil
+
+	case *kontWindUnwind:
+		// an out-thunk finished; continue unwinding or start rewinding
+		if len(kk.outs) > 0 {
+			return m.applyProc(kk.outs[0], nil, kk.callExpr, kk.callEnv, &kontWindUnwind{
+				outs: kk.outs[1:], rewindIns: kk.rewindIns,
+				targetVal: kk.targetVal, targetK: kk.targetK,
+				callExpr: kk.callExpr, callEnv: kk.callEnv,
+			})
+		}
+		return m.startRewind(kk.rewindIns, kk.targetVal, kk.targetK, kk.callExpr, kk.callEnv)
+
+	case *kontWindRewind:
+		// an in-thunk finished; push entry, continue rewinding or deliver value
+		if len(kk.entries) > 0 {
+			entry := kk.entries[0]
+			m.wind = append(m.wind, entry)
+			return m.applyProc(entry.inThunk, nil, kk.callExpr, kk.callEnv, &kontWindRewind{
+				entries: kk.entries[1:],
+				targetVal: kk.targetVal, targetK: kk.targetK,
+				callExpr: kk.callExpr, callEnv: kk.callEnv,
+			})
+		}
+		m.setApply(kk.targetVal, kk.targetK)
+		return nil
+
 	default:
 		return &EvalError{Message: "internal: unknown continuation frame"}
 	}
@@ -1006,8 +1114,7 @@ func (m *cekM) applyProc(op value, args []value, callExpr *expr, callEnv *env, k
 		if len(args) != 1 {
 			return &EvalError{Message: fmt.Sprintf("%d:%d: continuation: expected 1 argument", callExpr.line, callExpr.col)}
 		}
-		m.setApply(args[0], op.cont)
-		return nil
+		return m.invokeContinuation(op, args[0], callExpr, callEnv)
 	default:
 		return &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure: %s", callExpr.line, callExpr.col, op.String())}
 	}
@@ -1055,8 +1162,21 @@ func (m *cekM) applyBuiltinCEK(op value, args []value, callExpr *expr, callEnv *
 		if len(args) != 1 {
 			return &EvalError{Message: fmt.Sprintf("%d:%d: call/cc: expected 1 argument", callExpr.line, callExpr.col)}
 		}
-		contVal := value{kind: valContinuation, cont: k}
+		windCopy := make([]*windEntry, len(m.wind))
+		copy(windCopy, m.wind)
+		contVal := value{kind: valContinuation, cont: k, wind: windCopy}
 		return m.applyProc(args[0], []value{contVal}, callExpr, callEnv, k)
+
+	case "dynamic-wind":
+		if len(args) != 3 {
+			return &EvalError{Message: fmt.Sprintf("%d:%d: dynamic-wind: expected 3 arguments", callExpr.line, callExpr.col)}
+		}
+		inThunk, bodyThunk, outThunk := args[0], args[1], args[2]
+		// Call in-thunk first
+		return m.applyProc(inThunk, nil, callExpr, callEnv, &kontDynWindIn{
+			bodyThunk: bodyThunk, outThunk: outThunk, inThunk: inThunk,
+			callExpr: callExpr, callEnv: callEnv, parent: k,
+		})
 
 	case "apply":
 		if len(args) < 2 {
@@ -1169,6 +1289,68 @@ func (m *cekM) doStartSteps(dt *kontDoTest) error {
 		doEnv: dt.doEnv, parent: dt.parent,
 	})
 	return nil
+}
+
+// ---------- Continuation invocation with wind shifting ----------
+
+func (m *cekM) invokeContinuation(contVal value, arg value, callExpr *expr, callEnv *env) error {
+	targetK := contVal.cont
+	targetWind := contVal.wind
+
+	// Find common prefix length
+	commonLen := 0
+	for commonLen < len(m.wind) && commonLen < len(targetWind) && m.wind[commonLen] == targetWind[commonLen] {
+		commonLen++
+	}
+
+	// Out-thunks: current[commonLen:] in reverse (innermost first)
+	outsToCall := make([]value, 0, len(m.wind)-commonLen)
+	for i := len(m.wind) - 1; i >= commonLen; i-- {
+		outsToCall = append(outsToCall, m.wind[i].outThunk)
+	}
+
+	// Entries to rewind: target[commonLen:]
+	entriesToRewind := targetWind[commonLen:]
+
+	// No wind shifting needed
+	if len(outsToCall) == 0 && len(entriesToRewind) == 0 {
+		m.setApply(arg, targetK)
+		return nil
+	}
+
+	// Trim wind stack to common prefix
+	m.wind = m.wind[:commonLen]
+
+	if len(outsToCall) > 0 {
+		// Start unwinding: call first out-thunk
+		return m.applyProc(outsToCall[0], nil, callExpr, callEnv, &kontWindUnwind{
+			outs:      outsToCall[1:],
+			rewindIns: entriesToRewind,
+			targetVal: arg,
+			targetK:   targetK,
+			callExpr:  callExpr,
+			callEnv:   callEnv,
+		})
+	}
+
+	// No unwinding needed, start rewinding directly
+	return m.startRewind(entriesToRewind, arg, targetK, callExpr, callEnv)
+}
+
+// ---------- Wind helpers ----------
+
+func (m *cekM) startRewind(entries []*windEntry, targetVal value, targetK kont, callExpr *expr, callEnv *env) error {
+	if len(entries) == 0 {
+		m.setApply(targetVal, targetK)
+		return nil
+	}
+	entry := entries[0]
+	m.wind = append(m.wind, entry)
+	return m.applyProc(entry.inThunk, nil, callExpr, callEnv, &kontWindRewind{
+		entries:   entries[1:],
+		targetVal: targetVal, targetK: targetK,
+		callExpr: callExpr, callEnv: callEnv,
+	})
 }
 
 // ---------- Top-level CEK entry ----------

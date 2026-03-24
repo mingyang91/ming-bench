@@ -93,7 +93,8 @@ type value struct {
 	clauses []*lambda   // case-lambda clauses
 	vec     *[]value   // vector storage (mutable)
 	tc      *tailCall  // tail call info (for valTailCall)
-	cont    kont       // for valContinuation
+	cont    kont           // for valContinuation
+	wind    []*windEntry   // captured wind stack for valContinuation
 }
 
 var voidVal = value{kind: valVoid}
@@ -1053,7 +1054,8 @@ func isBuiltin(name string) bool {
 		"make-string", "string", "string>?", "string<=?", "string>=?",
 		"memv", "assv", "member",
 		"caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "cadddr",
-		"call/cc", "call-with-current-continuation":
+		"call/cc", "call-with-current-continuation",
+		"dynamic-wind":
 		return true
 	}
 	return false
@@ -3300,6 +3302,7 @@ func makeTopLevelEnv() *env {
 		"memv", "assv", "member",
 		"caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "cadddr",
 		"call/cc", "call-with-current-continuation",
+		"dynamic-wind",
 	}
 	for _, name := range builtins {
 		e.set(name, builtinVal(name))
