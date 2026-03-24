@@ -13,6 +13,7 @@ pub enum Expr {
 pub enum Token {
     LParen,
     RParen,
+    Quote,
     Integer(i64),
     Boolean(bool),
     Str(String),
@@ -33,6 +34,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
             }
             '(' => { tokens.push(Token::LParen); i += 1; }
             ')' => { tokens.push(Token::RParen); i += 1; }
+            '\'' => { tokens.push(Token::Quote); i += 1; }
             '"' => {
                 i += 1;
                 let mut s = String::new();
@@ -129,6 +131,10 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Expr, usize), EvalError> 
                 items.push(expr);
                 i = next;
             }
+        }
+        Token::Quote => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((Expr::List(vec![Expr::Symbol("quote".into()), inner]), next))
         }
         Token::RParen => Err(EvalError::Parse("unexpected )".into())),
     }
