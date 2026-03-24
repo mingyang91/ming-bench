@@ -1,12 +1,15 @@
 package ming
 
-import "fmt"
+import (
+	"fmt"
+	"sync/atomic"
+)
 
-var gensymCounter int
+var gensymCounter int64
 
 func gensym(base string) string {
-	gensymCounter++
-	return fmt.Sprintf("__%s_%d", base, gensymCounter)
+	n := atomic.AddInt64(&gensymCounter, 1)
+	return fmt.Sprintf("__%s_%d", base, n)
 }
 
 type syntaxRulesMacro struct {

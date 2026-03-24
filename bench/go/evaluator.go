@@ -5,6 +5,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"unicode"
 	"unsafe"
 )
@@ -129,7 +130,7 @@ type recordType struct {
 	fieldNames []string
 }
 
-var recordTypeCounter int
+var recordTypeCounter int64
 
 func intVal(n int64) *Value    { return &Value{typ: valInt, ival: n} }
 func boolVal(b bool) *Value    { return &Value{typ: valBool, bval: b} }
@@ -357,6 +358,18 @@ func (v *Value) String() string {
 		return "#<syntax>"
 	default:
 		return "<unknown>"
+	}
+}
+
+// displayString returns the display (unquoted) representation of a value.
+func (v *Value) displayString() string {
+	switch v.typ {
+	case valString:
+		return v.sval
+	case valChar:
+		return string(rune(v.ival))
+	default:
+		return v.String()
 	}
 }
 
@@ -3705,14 +3718,14 @@ func makeGlobalEnv() *env {
 	return e
 }
 
-func evalAll(input string) (result string, output string, err error) {
+func evalAllRaw(input string) (result *Value, output string, err error) {
 	p := newParser(input)
 	nodes, err := p.parseAll()
 	if err != nil {
-		return "", "", err
+		return nil, "", err
 	}
 	if len(nodes) == 0 {
-		return "", "", &EvalError{Message: "empty input"}
+		return nil, "", &EvalError{Message: "empty input"}
 	}
 
 	e := makeGlobalEnv()
@@ -3768,10 +3781,10 @@ func evalAll(input string) (result string, output string, err error) {
 		}()
 
 		if evalErr != nil {
-			return "", "", evalErr
+			return nil, "", evalErr
 		}
 		if sr != nil {
-			return "", "", &EvalError{Message: "unhandled exception: " + sr.value.String()}
+			return nil, "", &EvalError{Message: "unhandled exception: " + sr.value.String()}
 		}
 		if ci == nil {
 			break // no continuation invocation, evaluation complete
@@ -3784,7 +3797,7 @@ func evalAll(input string) (result string, output string, err error) {
 		}
 	}
 
-	return last.String(), ip.output.String(), nil
+	return last, ip.output.String(), nil
 }
 
 // evalDefineRecordType implements R7RS define-record-type.
@@ -3831,7 +3844,7 @@ func evalDefineRecordType(node *astNode, e *env) (*Value, error) {
 		name:       typeName.tok.sval,
 		fieldNames: ctorFields,
 	}
-	recordTypeCounter++
+	atomic.AddInt64(&recordTypeCounter, 1)
 
 	// Define constructor
 	numFields := len(ctorFields)
@@ -3893,16 +3906,23 @@ func evalDefineRecordType(node *astNode, e *env) (*Value, error) {
 }
 
 // EvalStr evaluates one or more Scheme expressions and returns the string
-// representation of the last result.
+// representation of the last result (write form).
 func EvalStr(input string) (string, error) {
-	r, _, err := evalAll(input)
-	return r, err
+	v, _, err := evalAllRaw(input)
+	if err != nil {
+		return "", err
+	}
+	return v.String(), nil
 }
 
 // EvalStrWithOutput evaluates Scheme expressions and returns both the result
-// string and any captured output from display/write/newline.
+// string (display form) and any captured output from display/write/newline.
 func EvalStrWithOutput(input string) (result string, output string, err error) {
-	return evalAll(input)
+	v, out, err := evalAllRaw(input)
+	if err != nil {
+		return "", "", err
+	}
+	return v.displayString(), out, nil
 }
 
 // EvalStrWithLimit evaluates Scheme expressions with a step budget.
