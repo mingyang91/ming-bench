@@ -29,6 +29,7 @@ const (
 	valFloat
 	valRecord
 	valCaseLambda
+	valVector
 )
 
 type pair struct {
@@ -79,6 +80,7 @@ type value struct {
 	mstr   *[]rune // mutable string buffer (set by string-copy)
 	rec     *record
 	clauses []*lambda // case-lambda clauses
+	vec     *[]value  // vector storage (mutable)
 }
 
 var voidVal = value{kind: valVoid}
@@ -211,6 +213,17 @@ func (v value) String() string {
 		return "#<procedure>"
 	case valCaseLambda:
 		return "#<procedure>"
+	case valVector:
+		var sb strings.Builder
+		sb.WriteString("#(")
+		for i, elem := range *v.vec {
+			if i > 0 {
+				sb.WriteByte(' ')
+			}
+			sb.WriteString(elem.String())
+		}
+		sb.WriteByte(')')
+		return sb.String()
 	default:
 		return "<unknown>"
 	}
@@ -226,6 +239,17 @@ func (v value) displayStr() string {
 		return v.sval
 	case valPair:
 		return "(" + displayPairInner(v) + ")"
+	case valVector:
+		var sb strings.Builder
+		sb.WriteString("#(")
+		for i, elem := range *v.vec {
+			if i > 0 {
+				sb.WriteByte(' ')
+			}
+			sb.WriteString(elem.displayStr())
+		}
+		sb.WriteByte(')')
+		return sb.String()
 	default:
 		return v.String()
 	}
@@ -638,6 +662,14 @@ func evalInEnv(e *expr, env *env) (value, error) {
 			return evalDefineSyntax(e, env)
 		case "define-record-type":
 			return evalDefineRecordType(e, env)
+		case "letrec":
+			return evalLetrec(e, env)
+		case "letrec*":
+			return evalLetrecStar(e, env)
+		case "case":
+			return evalCase(e, env)
+		case "do":
+			return evalDo(e, env)
 		}
 	}
 
@@ -930,11 +962,13 @@ func isBuiltin(name string) bool {
 		"list-ref", "list-tail", "list?", "assoc", "map",
 		"char=?", "char<?", "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
 		"string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
-		"eq?", "equal?",
+		"eq?", "eqv?", "equal?",
 		"integer?", "rational?", "exact?", "inexact?",
 		"exact->inexact", "inexact->exact",
 		"numerator", "denominator",
-		"procedure?":
+		"procedure?",
+		"vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
+		"vector->list", "list->vector":
 		return true
 	}
 	return false
@@ -1658,11 +1692,95 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 		}
 		return boolVal(valuesEq(args[0], args[1])), nil
 
+	case "eqv?":
+		if len(args) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: eqv?: expected 2 arguments", e.line, e.col)}
+		}
+		return boolVal(valuesEqv(args[0], args[1])), nil
+
 	case "equal?":
 		if len(args) != 2 {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: equal?: expected 2 arguments", e.line, e.col)}
 		}
 		return boolVal(valuesEqual(args[0], args[1])), nil
+
+	case "vector":
+		elems := make([]value, len(args))
+		copy(elems, args)
+		return value{kind: valVector, vec: &elems}, nil
+
+	case "make-vector":
+		if len(args) < 1 || len(args) > 2 || args[0].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: make-vector: expected integer size", e.line, e.col)}
+		}
+		n := int(args[0].ival)
+		fill := intVal(0)
+		if len(args) == 2 {
+			fill = args[1]
+		}
+		elems := make([]value, n)
+		for i := range elems {
+			elems[i] = fill
+		}
+		return value{kind: valVector, vec: &elems}, nil
+
+	case "vector-ref":
+		if len(args) != 2 || args[0].kind != valVector || args[1].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: vector-ref: expected vector and integer", e.line, e.col)}
+		}
+		idx := int(args[1].ival)
+		v := *args[0].vec
+		if idx < 0 || idx >= len(v) {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: vector-ref: index out of range", e.line, e.col)}
+		}
+		return v[idx], nil
+
+	case "vector-set!":
+		if len(args) != 3 || args[0].kind != valVector || args[1].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: vector-set!: expected vector, integer, and value", e.line, e.col)}
+		}
+		idx := int(args[1].ival)
+		v := *args[0].vec
+		if idx < 0 || idx >= len(v) {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: vector-set!: index out of range", e.line, e.col)}
+		}
+		(*args[0].vec)[idx] = args[2]
+		return voidVal, nil
+
+	case "vector-length":
+		if len(args) != 1 || args[0].kind != valVector {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: vector-length: expected vector", e.line, e.col)}
+		}
+		return intVal(int64(len(*args[0].vec))), nil
+
+	case "vector?":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: vector?: expected 1 argument", e.line, e.col)}
+		}
+		return boolVal(args[0].kind == valVector), nil
+
+	case "vector->list":
+		if len(args) != 1 || args[0].kind != valVector {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: vector->list: expected vector", e.line, e.col)}
+		}
+		v := *args[0].vec
+		result := nullVal
+		for i := len(v) - 1; i >= 0; i-- {
+			result = pairVal(v[i], result)
+		}
+		return result, nil
+
+	case "list->vector":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: list->vector: expected 1 argument", e.line, e.col)}
+		}
+		var elems []value
+		cur := args[0]
+		for cur.kind == valPair {
+			elems = append(elems, cur.pair.car)
+			cur = cur.pair.cdr
+		}
+		return value{kind: valVector, vec: &elems}, nil
 	}
 
 	return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", e.line, e.col, name)}
@@ -1688,10 +1806,14 @@ func valuesEq(a, b value) bool {
 		return a.cval == b.cval
 	case valNull:
 		return true
+	case valVoid:
+		return true
 	case valPair:
 		return a.pair == b.pair
 	case valString:
 		return a.mstr != nil && b.mstr != nil && a.mstr == b.mstr
+	case valVector:
+		return a.vec == b.vec
 	default:
 		return false
 	}
@@ -1725,6 +1847,17 @@ func valuesEqual(a, b value) bool {
 		return true
 	case valPair:
 		return valuesEqual(a.pair.car, b.pair.car) && valuesEqual(a.pair.cdr, b.pair.cdr)
+	case valVector:
+		av, bv := *a.vec, *b.vec
+		if len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if !valuesEqual(av[i], bv[i]) {
+				return false
+			}
+		}
+		return true
 	default:
 		return false
 	}
@@ -1993,6 +2126,259 @@ func evalCond(e *expr, env *env) (value, error) {
 		}
 	}
 	return voidVal, nil
+}
+
+func evalLetrec(e *expr, env *env) (value, error) {
+	if len(e.list) < 3 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: bad syntax", e.line, e.col)}
+	}
+	bindingsExpr := e.list[1]
+	if bindingsExpr.kind != exprList {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: expected bindings list", e.line, e.col)}
+	}
+	letEnv := newEnv(env)
+	// First, bind all variables to undefined (void)
+	names := make([]string, len(bindingsExpr.list))
+	for i, b := range bindingsExpr.list {
+		if b.kind != exprList || len(b.list) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: bad binding", b.line, b.col)}
+		}
+		if b.list[0].kind != exprAtom || b.list[0].atom.kind != valSymbol {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: expected symbol", b.list[0].line, b.list[0].col)}
+		}
+		names[i] = b.list[0].atom.sval
+		letEnv.set(names[i], voidVal)
+	}
+	// Then evaluate all init expressions in the new env
+	for i, b := range bindingsExpr.list {
+		v, err := evalInEnv(b.list[1], letEnv)
+		if err != nil {
+			return value{}, err
+		}
+		letEnv.set(names[i], v)
+	}
+	var result value
+	var err error
+	for _, bodyExpr := range e.list[2:] {
+		result, err = evalInEnv(bodyExpr, letEnv)
+		if err != nil {
+			return value{}, err
+		}
+	}
+	return result, nil
+}
+
+func evalLetrecStar(e *expr, env *env) (value, error) {
+	if len(e.list) < 3 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: letrec*: bad syntax", e.line, e.col)}
+	}
+	bindingsExpr := e.list[1]
+	if bindingsExpr.kind != exprList {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: letrec*: expected bindings list", e.line, e.col)}
+	}
+	letEnv := newEnv(env)
+	// Bind all to void first
+	for _, b := range bindingsExpr.list {
+		if b.kind != exprList || len(b.list) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: letrec*: bad binding", b.line, b.col)}
+		}
+		if b.list[0].kind != exprAtom || b.list[0].atom.kind != valSymbol {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: letrec*: expected symbol", b.list[0].line, b.list[0].col)}
+		}
+		letEnv.set(b.list[0].atom.sval, voidVal)
+	}
+	// Evaluate sequentially, each visible to the next
+	for _, b := range bindingsExpr.list {
+		v, err := evalInEnv(b.list[1], letEnv)
+		if err != nil {
+			return value{}, err
+		}
+		letEnv.set(b.list[0].atom.sval, v)
+	}
+	var result value
+	var err error
+	for _, bodyExpr := range e.list[2:] {
+		result, err = evalInEnv(bodyExpr, letEnv)
+		if err != nil {
+			return value{}, err
+		}
+	}
+	return result, nil
+}
+
+func evalCase(e *expr, env *env) (value, error) {
+	// (case expr ((datum ...) body ...) ... (else body ...))
+	if len(e.list) < 3 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: case: bad syntax", e.line, e.col)}
+	}
+	key, err := evalInEnv(e.list[1], env)
+	if err != nil {
+		return value{}, err
+	}
+	for _, clause := range e.list[2:] {
+		if clause.kind != exprList || len(clause.list) < 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: case: bad clause", clause.line, clause.col)}
+		}
+		// else clause
+		if clause.list[0].kind == exprAtom && clause.list[0].atom.kind == valSymbol && clause.list[0].atom.sval == "else" {
+			var result value
+			for _, bodyExpr := range clause.list[1:] {
+				result, err = evalInEnv(bodyExpr, env)
+				if err != nil {
+					return value{}, err
+				}
+			}
+			return result, nil
+		}
+		// ((datum ...) body ...)
+		datumList := clause.list[0]
+		if datumList.kind != exprList {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: case: expected datum list", clause.line, clause.col)}
+		}
+		matched := false
+		for _, datum := range datumList.list {
+			dv := quoteExpr(datum)
+			if valuesEqv(key, dv) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			var result value
+			for _, bodyExpr := range clause.list[1:] {
+				result, err = evalInEnv(bodyExpr, env)
+				if err != nil {
+					return value{}, err
+				}
+			}
+			return result, nil
+		}
+	}
+	return voidVal, nil
+}
+
+// valuesEqv implements eqv? — like eq? but compares numbers/chars by value.
+func valuesEqv(a, b value) bool {
+	if a.kind != b.kind {
+		return false
+	}
+	switch a.kind {
+	case valInteger:
+		return a.ival == b.ival
+	case valRational:
+		return a.numer == b.numer && a.denom == b.denom
+	case valFloat:
+		return a.fval == b.fval
+	case valBoolean:
+		return a.bval == b.bval
+	case valSymbol:
+		return a.sval == b.sval
+	case valChar:
+		return a.cval == b.cval
+	case valNull:
+		return true
+	case valPair:
+		return a.pair == b.pair
+	case valString:
+		return a.mstr != nil && b.mstr != nil && a.mstr == b.mstr
+	case valVector:
+		return a.vec == b.vec
+	default:
+		return false
+	}
+}
+
+func evalDo(e *expr, env *env) (value, error) {
+	// (do ((var init step) ...) (test expr ...) body ...)
+	if len(e.list) < 3 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: do: bad syntax", e.line, e.col)}
+	}
+	varSpecs := e.list[1]
+	if varSpecs.kind != exprList {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: do: expected variable specs", e.line, e.col)}
+	}
+	testClause := e.list[2]
+	if testClause.kind != exprList || len(testClause.list) < 1 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: do: expected test clause", e.line, e.col)}
+	}
+	bodyExprs := e.list[3:]
+
+	type doVar struct {
+		name    string
+		stepExpr *expr // nil if no step
+	}
+
+	vars := make([]doVar, len(varSpecs.list))
+	doEnv := newEnv(env)
+
+	// Initialize variables
+	for i, spec := range varSpecs.list {
+		if spec.kind != exprList || len(spec.list) < 2 || len(spec.list) > 3 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: do: bad variable spec", spec.line, spec.col)}
+		}
+		if spec.list[0].kind != exprAtom || spec.list[0].atom.kind != valSymbol {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: do: expected symbol", spec.list[0].line, spec.list[0].col)}
+		}
+		vars[i].name = spec.list[0].atom.sval
+		initVal, err := evalInEnv(spec.list[1], env)
+		if err != nil {
+			return value{}, err
+		}
+		doEnv.set(vars[i].name, initVal)
+		if len(spec.list) == 3 {
+			vars[i].stepExpr = spec.list[2]
+		}
+	}
+
+	// Iterate
+	for {
+		// Check test
+		testVal, err := evalInEnv(testClause.list[0], doEnv)
+		if err != nil {
+			return value{}, err
+		}
+		if isTruthy(testVal) {
+			// Evaluate result expressions
+			if len(testClause.list) > 1 {
+				var result value
+				for _, expr := range testClause.list[1:] {
+					result, err = evalInEnv(expr, doEnv)
+					if err != nil {
+						return value{}, err
+					}
+				}
+				return result, nil
+			}
+			return voidVal, nil
+		}
+
+		// Execute body
+		for _, bodyExpr := range bodyExprs {
+			_, err := evalInEnv(bodyExpr, doEnv)
+			if err != nil {
+				return value{}, err
+			}
+		}
+
+		// Evaluate all step expressions using current values (parallel)
+		newVals := make([]value, len(vars))
+		hasStep := make([]bool, len(vars))
+		for i, v := range vars {
+			if v.stepExpr != nil {
+				newVals[i], err = evalInEnv(v.stepExpr, doEnv)
+				if err != nil {
+					return value{}, err
+				}
+				hasStep[i] = true
+			}
+		}
+		// Update all at once
+		for i, v := range vars {
+			if hasStep[i] {
+				doEnv.set(v.name, newVals[i])
+			}
+		}
+	}
 }
 
 // ---------- Public API ----------
@@ -2356,7 +2742,7 @@ var (
 
 func isSpecialForm(name string) bool {
 	switch name {
-	case "define", "set!", "if", "quote", "lambda", "and", "or", "let", "begin", "cond", "define-syntax", "define-record-type":
+	case "define", "set!", "if", "quote", "lambda", "and", "or", "let", "begin", "cond", "define-syntax", "define-record-type", "letrec", "letrec*", "case", "do", "case-lambda":
 		return true
 	}
 	return false
@@ -2449,11 +2835,13 @@ func makeTopLevelEnv() *env {
 		"list-ref", "list-tail", "list?", "assoc", "map",
 		"char=?", "char<?", "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
 		"string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
-		"eq?", "equal?",
+		"eq?", "eqv?", "equal?",
 		"integer?", "rational?", "exact?", "inexact?",
 		"exact->inexact", "inexact->exact",
 		"numerator", "denominator",
 		"procedure?",
+		"vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
+		"vector->list", "list->vector",
 	}
 	for _, name := range builtins {
 		e.set(name, builtinVal(name))
