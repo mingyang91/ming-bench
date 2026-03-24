@@ -20,6 +20,7 @@ enum Value {
         body: Vec<Expr>,
         env: Env,
     },
+    Char(char),
     Builtin(String),
     Void,
 }
@@ -42,10 +43,38 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Value::Char(c) => write!(f, "#\\{c}"),
             Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::Builtin(name) => write!(f, "#<builtin:{name}>"),
             Value::Void => write!(f, ""),
         }
+    }
+}
+
+impl Value {
+    /// Format for `display` — strings without quotes.
+    fn display_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Str(s) => write!(f, "{s}"),
+            Value::List(elems) => {
+                write!(f, "(")?;
+                for (i, e) in elems.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    e.display_fmt(f)?;
+                }
+                write!(f, ")")
+            }
+            other => fmt::Display::fmt(other, f),
+        }
+    }
+}
+
+struct DisplayValue<'a>(&'a Value);
+impl<'a> fmt::Display for DisplayValue<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.display_fmt(f)
     }
 }
 
@@ -347,9 +376,14 @@ const BUILTINS: &[&str] = &[
     "+", "-", "*", "/", "<", ">", "=", "<=", ">=",
     "cons", "car", "cdr", "null?", "list", "length", "append",
     "number?", "boolean?", "string?", "pair?", "symbol?",
+    "display", "write", "newline",
+    "string-append", "string-length", "substring",
+    "string->number", "number->string",
+    "symbol->string", "string->symbol",
+    "string-ref", "char?",
 ];
 
-fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
+fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
     let p = expr.pos();
     match expr {
         Expr::Integer(n, _) => Ok(Value::Integer(*n)),
@@ -365,8 +399,8 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
             // Check for special forms
             if let Expr::Symbol(op, _) = &elems[0] {
                 match op.as_str() {
-                    "define" => return eval_define(&elems[1..], p, env),
-                    "if" => return eval_if(&elems[1..], p, env),
+                    "define" => return eval_define(&elems[1..], p, env, output),
+                    "if" => return eval_if(&elems[1..], p, env, output),
                     "quote" => {
                         if elems.len() != 2 {
                             return Err(EvalError::Arity(format!("{p}: quote expects 1 argument")));
@@ -374,28 +408,28 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         return Ok(expr_to_value(&elems[1]));
                     }
                     "lambda" => return eval_lambda(&elems[1..], p, env),
-                    "let" => return eval_let(&elems[1..], p, env),
-                    "begin" => return eval_begin(&elems[1..], env),
-                    "cond" => return eval_cond(&elems[1..], env),
-                    "and" => return eval_and(&elems[1..], env),
-                    "or" => return eval_or(&elems[1..], env),
+                    "let" => return eval_let(&elems[1..], p, env, output),
+                    "begin" => return eval_begin(&elems[1..], env, output),
+                    "cond" => return eval_cond(&elems[1..], env, output),
+                    "and" => return eval_and(&elems[1..], env, output),
+                    "or" => return eval_or(&elems[1..], env, output),
                     "not" => {
                         if elems.len() != 2 {
                             return Err(EvalError::Arity(format!("{p}: not expects 1 argument")));
                         }
-                        let val = eval(&elems[1], env)?;
+                        let val = eval(&elems[1], env, output)?;
                         return Ok(Value::Boolean(!is_truthy(&val)));
                     }
                     _ => {}
                 }
             }
             // Function call
-            let func = eval(&elems[0], env)?;
+            let func = eval(&elems[0], env, output)?;
             let args: Vec<Value> = elems[1..]
                 .iter()
-                .map(|e| eval(e, env))
+                .map(|e| eval(e, env, output))
                 .collect::<Result<_, _>>()?;
-            apply_func(&func, &args, p)
+            apply_func(&func, &args, p, output)
         }
     }
 }
@@ -410,7 +444,7 @@ fn expr_to_value(expr: &Expr) -> Value {
     }
 }
 
-fn eval_define(args: &[Expr], call_pos: Pos, env: &Env) -> Result<Value, EvalError> {
+fn eval_define(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity(format!("{call_pos}: define requires at least 2 arguments")));
     }
@@ -420,7 +454,7 @@ fn eval_define(args: &[Expr], call_pos: Pos, env: &Env) -> Result<Value, EvalErr
             if args.len() != 2 {
                 return Err(EvalError::Arity(format!("{call_pos}: define requires exactly 2 arguments")));
             }
-            let val = eval(&args[1], env)?;
+            let val = eval(&args[1], env, output)?;
             env_set(env, name.clone(), val);
             Ok(Value::Void)
         }
@@ -456,15 +490,15 @@ fn eval_define(args: &[Expr], call_pos: Pos, env: &Env) -> Result<Value, EvalErr
     }
 }
 
-fn eval_if(args: &[Expr], call_pos: Pos, env: &Env) -> Result<Value, EvalError> {
+fn eval_if(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(EvalError::Arity(format!("{call_pos}: if requires 2 or 3 arguments")));
     }
-    let cond = eval(&args[0], env)?;
+    let cond = eval(&args[0], env, output)?;
     if is_truthy(&cond) {
-        eval(&args[1], env)
+        eval(&args[1], env, output)
     } else if args.len() == 3 {
-        eval(&args[2], env)
+        eval(&args[2], env, output)
     } else {
         Ok(Value::Void)
     }
@@ -492,13 +526,13 @@ fn eval_lambda(args: &[Expr], call_pos: Pos, env: &Env) -> Result<Value, EvalErr
     })
 }
 
-fn eval_and(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
+fn eval_and(exprs: &[Expr], env: &Env, output: &mut String) -> Result<Value, EvalError> {
     if exprs.is_empty() {
         return Ok(Value::Boolean(true));
     }
     let mut result = Value::Boolean(true);
     for e in exprs {
-        result = eval(e, env)?;
+        result = eval(e, env, output)?;
         if !is_truthy(&result) {
             return Ok(result);
         }
@@ -506,12 +540,12 @@ fn eval_and(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-fn eval_or(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
+fn eval_or(exprs: &[Expr], env: &Env, output: &mut String) -> Result<Value, EvalError> {
     if exprs.is_empty() {
         return Ok(Value::Boolean(false));
     }
     for e in exprs {
-        let result = eval(e, env)?;
+        let result = eval(e, env, output)?;
         if is_truthy(&result) {
             return Ok(result);
         }
@@ -519,7 +553,7 @@ fn eval_or(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
     Ok(Value::Boolean(false))
 }
 
-fn eval_let(args: &[Expr], call_pos: Pos, env: &Env) -> Result<Value, EvalError> {
+fn eval_let(args: &[Expr], call_pos: Pos, env: &Env, output: &mut String) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity(format!("{call_pos}: let requires bindings and body")));
     }
@@ -539,7 +573,7 @@ fn eval_let(args: &[Expr], call_pos: Pos, env: &Env) -> Result<Value, EvalError>
                 Expr::List(pair, _) if pair.len() == 2 => {
                     if let Expr::Symbol(s, _) = &pair[0] {
                         params.push(s.clone());
-                        inits.push(eval(&pair[1], env)?);
+                        inits.push(eval(&pair[1], env, output)?);
                     } else {
                         return Err(EvalError::Parse(format!("{call_pos}: let: expected symbol in binding")));
                     }
@@ -560,7 +594,7 @@ fn eval_let(args: &[Expr], call_pos: Pos, env: &Env) -> Result<Value, EvalError>
         }
         let mut result = Value::Void;
         for expr in &args[2..] {
-            result = eval(expr, &local_env)?;
+            result = eval(expr, &local_env, output)?;
         }
         return Ok(result);
     }
@@ -573,7 +607,7 @@ fn eval_let(args: &[Expr], call_pos: Pos, env: &Env) -> Result<Value, EvalError>
         match b {
             Expr::List(pair, _) if pair.len() == 2 => {
                 if let Expr::Symbol(s, _) = &pair[0] {
-                    let val = eval(&pair[1], env)?;
+                    let val = eval(&pair[1], env, output)?;
                     env_set(&local_env, s.clone(), val);
                 } else {
                     return Err(EvalError::Parse(format!("{call_pos}: let: expected symbol in binding")));
@@ -584,20 +618,20 @@ fn eval_let(args: &[Expr], call_pos: Pos, env: &Env) -> Result<Value, EvalError>
     }
     let mut result = Value::Void;
     for expr in &args[1..] {
-        result = eval(expr, &local_env)?;
+        result = eval(expr, &local_env, output)?;
     }
     Ok(result)
 }
 
-fn eval_begin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+fn eval_begin(args: &[Expr], env: &Env, output: &mut String) -> Result<Value, EvalError> {
     let mut result = Value::Void;
     for expr in args {
-        result = eval(expr, env)?;
+        result = eval(expr, env, output)?;
     }
     Ok(result)
 }
 
-fn eval_cond(clauses: &[Expr], env: &Env) -> Result<Value, EvalError> {
+fn eval_cond(clauses: &[Expr], env: &Env, output: &mut String) -> Result<Value, EvalError> {
     for clause in clauses {
         match clause {
             Expr::List(parts, _) if !parts.is_empty() => {
@@ -605,16 +639,16 @@ fn eval_cond(clauses: &[Expr], env: &Env) -> Result<Value, EvalError> {
                     if s == "else" {
                         let mut result = Value::Void;
                         for expr in &parts[1..] {
-                            result = eval(expr, env)?;
+                            result = eval(expr, env, output)?;
                         }
                         return Ok(result);
                     }
                 }
-                let test = eval(&parts[0], env)?;
+                let test = eval(&parts[0], env, output)?;
                 if is_truthy(&test) {
                     let mut result = test;
                     for expr in &parts[1..] {
-                        result = eval(expr, env)?;
+                        result = eval(expr, env, output)?;
                     }
                     return Ok(result);
                 }
@@ -632,9 +666,9 @@ fn as_integer(v: &Value, call_pos: Pos) -> Result<i64, EvalError> {
     }
 }
 
-fn apply_func(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, EvalError> {
+fn apply_func(func: &Value, args: &[Value], call_pos: Pos, output: &mut String) -> Result<Value, EvalError> {
     match func {
-        Value::Builtin(name) => apply_builtin(name, args, call_pos),
+        Value::Builtin(name) => apply_builtin(name, args, call_pos, output),
         Value::Lambda {
             params, body, env, ..
         } => {
@@ -651,7 +685,7 @@ fn apply_func(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, Eval
             }
             let mut result = Value::Void;
             for expr in body {
-                result = eval(expr, &local_env)?;
+                result = eval(expr, &local_env, output)?;
             }
             Ok(result)
         }
@@ -659,7 +693,7 @@ fn apply_func(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, Eval
     }
 }
 
-fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, EvalError> {
+fn apply_builtin(name: &str, args: &[Value], call_pos: Pos, output: &mut String) -> Result<Value, EvalError> {
     match name {
         "+" => {
             let mut sum: i64 = 0;
@@ -823,6 +857,116 @@ fn apply_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, Eva
             }
             Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
         }
+        "display" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: display requires 1 argument")));
+            }
+            let s = format!("{}", DisplayValue(&args[0]));
+            output.push_str(&s);
+            Ok(Value::Void)
+        }
+        "write" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: write requires 1 argument")));
+            }
+            let s = format!("{}", &args[0]);
+            output.push_str(&s);
+            Ok(Value::Void)
+        }
+        "newline" => {
+            if !args.is_empty() {
+                return Err(EvalError::Arity(format!("{call_pos}: newline takes 0 arguments")));
+            }
+            output.push('\n');
+            Ok(Value::Void)
+        }
+        "string-append" => {
+            let mut result = String::new();
+            for a in args {
+                match a {
+                    Value::Str(s) => result.push_str(s),
+                    _ => return Err(EvalError::Type(format!("{call_pos}: string-append: expected string"))),
+                }
+            }
+            Ok(Value::Str(result))
+        }
+        "string-length" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: string-length requires 1 argument")));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Integer(s.len() as i64)),
+                _ => Err(EvalError::Type(format!("{call_pos}: string-length: expected string"))),
+            }
+        }
+        "substring" => {
+            if args.len() != 3 {
+                return Err(EvalError::Arity(format!("{call_pos}: substring requires 3 arguments")));
+            }
+            let s = match &args[0] {
+                Value::Str(s) => s,
+                _ => return Err(EvalError::Type(format!("{call_pos}: substring: expected string"))),
+            };
+            let start = as_integer(&args[1], call_pos)? as usize;
+            let end = as_integer(&args[2], call_pos)? as usize;
+            Ok(Value::Str(s[start..end].to_string()))
+        }
+        "string->number" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: string->number requires 1 argument")));
+            }
+            match &args[0] {
+                Value::Str(s) => match s.parse::<i64>() {
+                    Ok(n) => Ok(Value::Integer(n)),
+                    Err(_) => Ok(Value::Boolean(false)),
+                },
+                _ => Err(EvalError::Type(format!("{call_pos}: string->number: expected string"))),
+            }
+        }
+        "number->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: number->string requires 1 argument")));
+            }
+            let n = as_integer(&args[0], call_pos)?;
+            Ok(Value::Str(n.to_string()))
+        }
+        "symbol->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: symbol->string requires 1 argument")));
+            }
+            match &args[0] {
+                Value::Symbol(s) => Ok(Value::Str(s.clone())),
+                _ => Err(EvalError::Type(format!("{call_pos}: symbol->string: expected symbol"))),
+            }
+        }
+        "string->symbol" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: string->symbol requires 1 argument")));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Symbol(s.clone())),
+                _ => Err(EvalError::Type(format!("{call_pos}: string->symbol: expected string"))),
+            }
+        }
+        "string-ref" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("{call_pos}: string-ref requires 2 arguments")));
+            }
+            let s = match &args[0] {
+                Value::Str(s) => s,
+                _ => return Err(EvalError::Type(format!("{call_pos}: string-ref: expected string"))),
+            };
+            let idx = as_integer(&args[1], call_pos)? as usize;
+            Ok(Value::Char(s.chars().nth(idx).ok_or_else(|| {
+                EvalError::Type(format!("{call_pos}: string-ref: index out of range"))
+            })?))
+        }
+        "char?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: char? requires 1 argument")));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
+        }
         _ => Err(EvalError::UnboundVariable(format!("{call_pos}: {name}"))),
     }
 }
@@ -835,17 +979,28 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         return Err(EvalError::Parse("empty input".into()));
     }
     let env = default_env();
+    let mut output = String::new();
     let mut result = Value::Void;
     for expr in &exprs {
-        result = eval(expr, &env)?;
+        result = eval(expr, &env, &mut output)?;
     }
     Ok(result.to_string())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let exprs = parse_all(input)?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse("empty input".into()));
+    }
+    let env = default_env();
+    let mut output = String::new();
+    let mut result = Value::Void;
+    for expr in &exprs {
+        result = eval(expr, &env, &mut output)?;
+    }
+    Ok((result.to_string(), output))
 }
 
 #[cfg(test)]
