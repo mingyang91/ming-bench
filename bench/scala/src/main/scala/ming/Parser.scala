@@ -5,40 +5,57 @@ import Evaluator.Val.*
 
 /** S-expression parser for Scheme source code. */
 private[ming] class Parser(input: String):
-  private var pos = 0
+  private var pos  = 0
+  private var line = 1
+  private var col  = 1
 
   def parseAll(): List[Val] =
-    val exprs = scala.collection.mutable.ListBuffer[Val]()
+    parseAllWithPositions().map(_._1)
+
+  def parseAllWithPositions(): List[(Val, Int, Int)] =
+    val exprs = scala.collection.mutable.ListBuffer[(Val, Int, Int)]()
     while
       skipWhitespace()
       pos < input.length
-    do exprs += parseExpr()
+    do
+      val startLine = line
+      val startCol  = col
+      exprs += ((parseExpr(), startLine, startCol))
     exprs.toList
+
+  private def advance(): Char =
+    val c = input(pos)
+    pos += 1
+    if c == '\n' then
+      line += 1
+      col = 1
+    else col += 1
+    c
 
   private def skipWhitespace(): Unit =
     while pos < input.length && (input(pos).isWhitespace || input(pos) == ';') do
-      if input(pos) == ';' then while pos < input.length && input(pos) != '\n' do pos += 1
-      else pos += 1
+      if input(pos) == ';' then while pos < input.length && input(pos) != '\n' do advance()
+      else advance()
 
   private def parseExpr(): Val =
     skipWhitespace()
     if pos >= input.length then throw new EvalError("unexpected end of input")
     input(pos) match
       case '(' =>
-        pos += 1
+        advance()
         parseList()
       case '\'' =>
-        pos += 1
+        advance()
         val e = parseExpr()
         Pair(Symbol("quote"), Pair(e, Nil))
       case '"' =>
         parseString()
       case '#' =>
-        pos += 1
+        advance()
         if pos >= input.length then throw new EvalError("unexpected end of input after #")
         input(pos) match
-          case 't'   => pos += 1; Bool(true)
-          case 'f'   => pos += 1; Bool(false)
+          case 't'   => advance(); Bool(true)
+          case 'f'   => advance(); Bool(false)
           case other => throw new EvalError(s"unexpected character after #: $other")
       case _ =>
         parseAtom()
@@ -47,28 +64,28 @@ private[ming] class Parser(input: String):
     skipWhitespace()
     if pos >= input.length then throw new EvalError("unexpected end of input in list")
     if input(pos) == ')' then
-      pos += 1
+      advance()
       Nil
     else
       val first = parseExpr()
       skipWhitespace()
       if pos < input.length && input(pos) == '.' then
-        pos += 1
+        advance()
         val rest = parseExpr()
         skipWhitespace()
         if pos >= input.length || input(pos) != ')' then throw new EvalError("expected ) after dotted pair")
-        pos += 1
+        advance()
         Pair(first, rest)
       else
         val rest = parseList()
         Pair(first, rest)
 
   private def parseString(): Val =
-    pos += 1 // skip opening "
+    advance() // skip opening "
     val sb = new StringBuilder
     while pos < input.length && input(pos) != '"' do
       if input(pos) == '\\' then
-        pos += 1
+        advance()
         if pos >= input.length then throw new EvalError("unterminated string")
         input(pos) match
           case 'n'  => sb += '\n'
@@ -77,14 +94,14 @@ private[ming] class Parser(input: String):
           case '"'  => sb += '"'
           case c    => sb += '\\'; sb += c
       else sb += input(pos)
-      pos += 1
+      advance()
     if pos >= input.length then throw new EvalError("unterminated string")
-    pos += 1 // skip closing "
+    advance() // skip closing "
     Str(sb.toString)
 
   private def parseAtom(): Val =
     val start = pos
-    while pos < input.length && !input(pos).isWhitespace && !"()\"';".contains(input(pos)) do pos += 1
+    while pos < input.length && !input(pos).isWhitespace && !"()\"';".contains(input(pos)) do advance()
     val token = input.substring(start, pos)
     if token.isEmpty then throw new EvalError(s"unexpected character: ${input(pos)}")
     token.toLongOption match

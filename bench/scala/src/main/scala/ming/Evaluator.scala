@@ -16,6 +16,12 @@ object Evaluator:
 
   import Val.*
 
+  // --- Position tracking ---
+  private var lastPos = "1:1"
+
+  private def error(msg: String): Nothing =
+    throw new EvalError(s"$lastPos: $msg")
+
   // --- Evaluator ---
   private def eval(expr: Val, env: Env): Val =
     expr match
@@ -24,7 +30,7 @@ object Evaluator:
       case Symbol(name) =>
         env.lookup(name) match
           case Some(v) => v
-          case None    => throw new EvalError(s"unbound variable: $name")
+          case None    => error(s"unbound variable: $name")
       case Pair(Symbol("quote"), Pair(datum, Nil)) => datum
       case Pair(Symbol("define"), rest)            => evalDefine(rest, env)
       case Pair(Symbol("if"), rest)                => evalIf(rest, env)
@@ -53,7 +59,7 @@ object Evaluator:
         val v = eval(valueExpr, env)
         env.define(name, v)
         Void
-      case _ => throw new EvalError("bad define syntax")
+      case _ => error("bad define syntax")
 
   private def evalIf(rest: Val, env: Env): Val =
     rest match
@@ -63,26 +69,26 @@ object Evaluator:
       case Pair(cond, Pair(thenExpr, Nil)) =>
         val condVal = eval(cond, env)
         if condVal != Bool(false) then eval(thenExpr, env) else Void
-      case _ => throw new EvalError("bad if syntax")
+      case _ => error("bad if syntax")
 
   private def evalLambda(rest: Val, env: Env): Val =
     rest match
       case Pair(params, body) =>
         val paramNames = toList(params).map {
-          case Symbol(s) => s; case v => throw new EvalError(s"bad parameter: ${display(v)}")
+          case Symbol(s) => s; case v => error(s"bad parameter: ${display(v)}")
         }
         val bodyList = toList(body)
-        if bodyList.isEmpty then throw new EvalError("lambda: empty body")
+        if bodyList.isEmpty then error("lambda: empty body")
         Builtin { args =>
           if args.length != paramNames.length then
-            throw new EvalError(s"lambda: expected ${paramNames.length} arguments, got ${args.length}")
+            error(s"lambda: expected ${paramNames.length} arguments, got ${args.length}")
           val childEnv = new Env(scala.collection.mutable.Map[String, Val](), Some(env))
           paramNames.zip(args).foreach((p, a) => childEnv.define(p, a))
           var result: Val = Void
           for expr <- bodyList do result = eval(expr, childEnv)
           result
         }
-      case _ => throw new EvalError("bad lambda syntax")
+      case _ => error("bad lambda syntax")
 
   private def evalAnd(args: Val, env: Env): Val =
     args match
@@ -93,7 +99,7 @@ object Evaluator:
         v match
           case Bool(false) => Bool(false)
           case _           => evalAnd(rest, env)
-      case _ => throw new EvalError("bad and syntax")
+      case _ => error("bad and syntax")
 
   private def evalOr(args: Val, env: Env): Val =
     args match
@@ -104,7 +110,7 @@ object Evaluator:
         v match
           case Bool(false) => evalOr(rest, env)
           case _           => v
-      case _ => throw new EvalError("bad or syntax")
+      case _ => error("bad or syntax")
 
   private def evalBegin(body: Val, env: Env): Val =
     val exprs = toList(body)
@@ -119,7 +125,7 @@ object Evaluator:
       case Nil => Void
       case Pair(clause, rest) =>
         val clauseList = toList(clause)
-        if clauseList.isEmpty then throw new EvalError("bad cond clause")
+        if clauseList.isEmpty then error("bad cond clause")
         clauseList.head match
           case Symbol("else") =>
             var result: Val = Void
@@ -134,7 +140,7 @@ object Evaluator:
                 for expr <- clauseList.tail do result = eval(expr, env)
                 result
             else evalCond(rest, env)
-      case _ => throw new EvalError("bad cond syntax")
+      case _ => error("bad cond syntax")
 
   private def evalLet(rest: Val, env: Env): Val =
     rest match
@@ -143,18 +149,18 @@ object Evaluator:
         val bindingList = toList(bindings)
         val paramNames = bindingList.map {
           case Pair(Symbol(p), Pair(_, Nil)) => p
-          case _                             => throw new EvalError("bad named let binding")
+          case _                             => error("bad named let binding")
         }
         val initVals = bindingList.map {
           case Pair(_, Pair(v, Nil)) => eval(v, env)
-          case _                     => throw new EvalError("bad named let binding")
+          case _                     => error("bad named let binding")
         }
         val bodyList = toList(body)
-        if bodyList.isEmpty then throw new EvalError("let: empty body")
+        if bodyList.isEmpty then error("let: empty body")
         val childEnv = new Env(scala.collection.mutable.Map[String, Val](), Some(env))
         val loopFunc = Builtin { args =>
           if args.length != paramNames.length then
-            throw new EvalError(s"named let $name: expected ${paramNames.length} arguments, got ${args.length}")
+            error(s"named let $name: expected ${paramNames.length} arguments, got ${args.length}")
           val loopEnv = new Env(scala.collection.mutable.Map[String, Val](), Some(childEnv))
           paramNames.zip(args).foreach((p, a) => loopEnv.define(p, a))
           var result: Val = Void
@@ -175,22 +181,27 @@ object Evaluator:
           binding match
             case Pair(Symbol(name), Pair(valueExpr, Nil)) =>
               childEnv.define(name, eval(valueExpr, env))
-            case _ => throw new EvalError("bad let binding")
+            case _ => error("bad let binding")
         val bodyList = toList(body)
-        if bodyList.isEmpty then throw new EvalError("let: empty body")
+        if bodyList.isEmpty then error("let: empty body")
         var result: Val = Void
         for expr <- bodyList do result = eval(expr, childEnv)
         result
-      case _ => throw new EvalError("bad let syntax")
+      case _ => error("bad let syntax")
 
   private def toList(v: Val): List[Val] = v match
     case Nil            => List.empty
     case Pair(car, cdr) => car :: toList(cdr)
-    case _              => throw new EvalError("improper list")
+    case _              => error("improper list")
 
   private[ming] def applyFunc(func: Val, args: List[Val]): Val = func match
-    case Builtin(f) => f(args)
-    case _          => throw new EvalError(s"not a procedure: ${display(func)}")
+    case Builtin(f) =>
+      try f(args)
+      catch
+        case e: EvalError =>
+          if !e.getMessage.matches(".*\\d+:\\d+.*") then error(e.getMessage)
+          else throw e
+    case _ => error(s"not a procedure: ${display(func)}")
 
   // --- Environment ---
   private class Env(bindings: scala.collection.mutable.Map[String, Val], parent: Option[Env]):
@@ -233,11 +244,13 @@ object Evaluator:
   // --- Public API ---
   def evalStr(input: String): String =
     val parser = new Parser(input)
-    val exprs  = parser.parseAll()
+    val exprs  = parser.parseAllWithPositions()
     if exprs.isEmpty then throw new EvalError("no expressions")
     val env         = defaultEnv()
     var result: Val = Void
-    for expr <- exprs do result = eval(expr, env)
+    for (expr, line, col) <- exprs do
+      lastPos = s"$line:$col"
+      result = eval(expr, env)
     display(result)
 
   def evalStrWithOutput(input: String): (String, String) =
