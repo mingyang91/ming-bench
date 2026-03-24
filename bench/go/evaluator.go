@@ -957,6 +957,7 @@ func isBuiltin(name string) bool {
 		"string-append", "string-length", "substring", "string-ref",
 		"string->number", "number->string", "symbol->string", "string->symbol",
 		"string-copy", "string-set!",
+		"string->list", "list->string", "char->integer", "integer->char",
 		"abs", "modulo", "remainder", "quotient", "min", "max", "expt",
 		"zero?", "positive?", "negative?", "odd?", "even?",
 		"list-ref", "list-tail", "list?", "assoc", "map",
@@ -1379,8 +1380,12 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 		if len(args) != 3 {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected 3 arguments", e.line, e.col)}
 		}
-		if args[0].kind != valString || args[0].mstr == nil {
-			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected mutable string", e.line, e.col)}
+		if args[0].kind != valString {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected string", e.line, e.col)}
+		}
+		if args[0].mstr == nil {
+			// L15: literal strings are immutable
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: strings are immutable", e.line, e.col)}
 		}
 		if args[1].kind != valInteger {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected integer index", e.line, e.col)}
@@ -1388,12 +1393,56 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 		if args[2].kind != valChar {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected char", e.line, e.col)}
 		}
-		idx := int(args[1].ival)
-		if idx < 0 || idx >= len(*args[0].mstr) {
+		idx := args[1].ival
+		buf := *args[0].mstr
+		if idx < 0 || idx >= int64(len(buf)) {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: index out of range", e.line, e.col)}
 		}
-		(*args[0].mstr)[idx] = args[2].cval
+		buf[idx] = args[2].cval
 		return voidVal, nil
+
+	// --- L15 String Immutability / char-integer conversions ---
+
+	case "string->list":
+		if len(args) != 1 || args[0].kind != valString {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string->list: expected 1 string", e.line, e.col)}
+		}
+		runes := []rune(args[0].strContent())
+		result := value{kind: valNull}
+		for i := len(runes) - 1; i >= 0; i-- {
+			result = pairVal(charVal(runes[i]), result)
+		}
+		return result, nil
+
+	case "list->string":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: list->string: expected 1 argument", e.line, e.col)}
+		}
+		var runes []rune
+		cur := args[0]
+		for cur.kind == valPair {
+			if cur.pair.car.kind != valChar {
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: list->string: expected list of chars", e.line, e.col)}
+			}
+			runes = append(runes, cur.pair.car.cval)
+			cur = cur.pair.cdr
+		}
+		if cur.kind != valNull {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: list->string: expected proper list", e.line, e.col)}
+		}
+		return strVal(string(runes)), nil
+
+	case "char->integer":
+		if len(args) != 1 || args[0].kind != valChar {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: char->integer: expected 1 char", e.line, e.col)}
+		}
+		return intVal(int64(args[0].cval)), nil
+
+	case "integer->char":
+		if len(args) != 1 || args[0].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: integer->char: expected 1 integer", e.line, e.col)}
+		}
+		return charVal(rune(args[0].ival)), nil
 
 	// --- L09 Numeric utilities ---
 
@@ -2829,7 +2878,9 @@ func makeTopLevelEnv() *env {
 		"display", "write", "newline",
 		"string-append", "string-length", "substring", "string-ref",
 		"string->number", "number->string", "symbol->string", "string->symbol",
-		"string-copy", "string-set!", "apply",
+		"string-copy", "string-set!",
+		"string->list", "list->string", "char->integer", "integer->char",
+		"apply",
 		"abs", "modulo", "remainder", "quotient", "min", "max", "expt",
 		"zero?", "positive?", "negative?", "odd?", "even?",
 		"list-ref", "list-tail", "list?", "assoc", "map",
