@@ -34,7 +34,9 @@ impl Env {
 
     pub fn default_env() -> Rc<Env> {
         let env = Env::new(None);
-        for name in &["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not"] {
+        for name in &["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+                      "cons", "car", "cdr", "null?", "list", "length", "append",
+                      "string?", "number?", "boolean?", "pair?", "symbol?"] {
             env.set(name.to_string(), Value::Symbol(name.to_string()));
         }
         env
