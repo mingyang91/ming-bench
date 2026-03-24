@@ -69,8 +69,26 @@ public class Evaluator {
     private int gensymCounter = 0;
     private String gensym(String base) { return "__" + base + "_" + (gensymCounter++); }
 
+    // --- Record types (define-record-type) ---
+
+    private static class RecordType {
+        final String name;
+        final List<String> fieldNames;
+        RecordType(String name, List<String> fieldNames) { this.name = name; this.fieldNames = fieldNames; }
+    }
+
+    private static class SchemeRecord {
+        final RecordType type;
+        final Object[] fields;
+        SchemeRecord(RecordType type, Object[] fields) { this.type = type; this.fields = fields; }
+    }
+
+    private record RecordConstructor(RecordType type) {}
+    private record RecordPredicate(RecordType type) {}
+    private record RecordAccessor(RecordType type, int fieldIndex) {}
+
     private static final Set<String> SPECIAL_FORMS = Set.of(
-        "define", "define-syntax", "set!", "if", "quote", "lambda",
+        "define", "define-syntax", "define-record-type", "set!", "if", "quote", "lambda",
         "and", "or", "begin", "cond", "let"
     );
 
@@ -474,6 +492,41 @@ public class Evaluator {
                         env.define(macroName, new SyntaxTransformer(literals, clauses, env));
                         return VOID;
                     }
+                    case "define-record-type" -> {
+                        // (define-record-type <name> (constructor field...) predicate (field accessor)...)
+                        if (list.size() < 4) throw new EvalError(posStr() + "define-record-type: bad syntax");
+                        Object typeName = unwrap(list.get(1));
+                        if (!(typeName instanceof String)) throw new EvalError(posStr() + "define-record-type: expected type name");
+                        Object ctorSpec = unwrap(list.get(2));
+                        if (!(ctorSpec instanceof List<?> ctorList) || ctorList.isEmpty())
+                            throw new EvalError(posStr() + "define-record-type: bad constructor spec");
+                        String ctorName = (String) unwrap(ctorList.get(0));
+                        List<String> ctorFields = new ArrayList<>();
+                        for (int i = 1; i < ctorList.size(); i++) {
+                            ctorFields.add((String) unwrap(ctorList.get(i)));
+                        }
+                        Object predObj = unwrap(list.get(3));
+                        if (!(predObj instanceof String predName)) throw new EvalError(posStr() + "define-record-type: expected predicate name");
+                        // Collect field specs
+                        List<String> fieldNames = new ArrayList<>(ctorFields);
+                        RecordType rt = new RecordType((String) typeName, fieldNames);
+                        // Define constructor
+                        env.define(ctorName, new RecordConstructor(rt));
+                        // Define predicate
+                        env.define(predName, new RecordPredicate(rt));
+                        // Define accessors
+                        for (int i = 4; i < list.size(); i++) {
+                            Object fieldSpec = unwrap(list.get(i));
+                            if (!(fieldSpec instanceof List<?> fsList) || fsList.size() < 2)
+                                throw new EvalError(posStr() + "define-record-type: bad field spec");
+                            String fieldName = (String) unwrap(fsList.get(0));
+                            String accessorName = (String) unwrap(fsList.get(1));
+                            int idx = fieldNames.indexOf(fieldName);
+                            if (idx < 0) throw new EvalError(posStr() + "define-record-type: unknown field " + fieldName);
+                            env.define(accessorName, new RecordAccessor(rt, idx));
+                        }
+                        return VOID;
+                    }
                     case "set!" -> {
                         if (list.size() != 3) throw new EvalError(posStr() + "set!: bad syntax");
                         Object nameObj = unwrap(list.get(1));
@@ -671,6 +724,22 @@ public class Evaluator {
                 return applyBuiltin(b.name(), args);
             }
 
+            if (proc instanceof RecordConstructor rc) {
+                if (args.size() != rc.type().fieldNames.size())
+                    throw new EvalError(posStr() + "wrong number of arguments to record constructor");
+                return new SchemeRecord(rc.type(), args.toArray());
+            }
+            if (proc instanceof RecordPredicate rp) {
+                if (args.size() != 1) throw new EvalError(posStr() + "record predicate expects 1 argument");
+                return (args.get(0) instanceof SchemeRecord sr && sr.type == rp.type());
+            }
+            if (proc instanceof RecordAccessor ra) {
+                if (args.size() != 1) throw new EvalError(posStr() + "record accessor expects 1 argument");
+                if (!(args.get(0) instanceof SchemeRecord sr) || sr.type != ra.type())
+                    throw new EvalError(posStr() + "record accessor: wrong record type");
+                return sr.fields[ra.fieldIndex()];
+            }
+
             throw new EvalError(posStr() + "not a procedure: " + schemeToString(proc));
         }
         throw new EvalError(posStr() + "cannot eval: " + expr);
@@ -711,6 +780,21 @@ public class Evaluator {
         }
         if (proc instanceof Builtin b) {
             return applyBuiltin(b.name(), args);
+        }
+        if (proc instanceof RecordConstructor rc) {
+            if (args.size() != rc.type().fieldNames.size())
+                throw new EvalError(posStr() + "wrong number of arguments to record constructor");
+            return new SchemeRecord(rc.type(), args.toArray());
+        }
+        if (proc instanceof RecordPredicate rp) {
+            if (args.size() != 1) throw new EvalError(posStr() + "record predicate expects 1 argument");
+            return (args.get(0) instanceof SchemeRecord sr && sr.type == rp.type());
+        }
+        if (proc instanceof RecordAccessor ra) {
+            if (args.size() != 1) throw new EvalError(posStr() + "record accessor expects 1 argument");
+            if (!(args.get(0) instanceof SchemeRecord sr) || sr.type != ra.type())
+                throw new EvalError(posStr() + "record accessor: wrong record type");
+            return sr.fields[ra.fieldIndex()];
         }
         throw new EvalError(posStr() + "not a procedure: " + schemeToString(proc));
     }
