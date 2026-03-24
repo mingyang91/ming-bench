@@ -133,6 +133,25 @@ pub enum Frame {
     RaiseResult,
     GuardDispatch { var_name: String, clauses: Vec<Expr>, env: Env },
     CallWithValuesConsumer { consumer: Value },
+    // CPS let binding: evaluate init expressions one at a time so call/cc works
+    LetBind {
+        names: Vec<String>,         // all binding names
+        values: Vec<Value>,         // values evaluated so far
+        remaining_inits: Vec<Expr>, // remaining init expressions
+        eval_env: Env,              // env to evaluate inits in
+        local_env: Env,             // env to define bindings and evaluate body in
+        body: Vec<Expr>,            // body expressions
+    },
+    // CPS named-let binding: evaluate init expressions then set up loop
+    NamedLetBind {
+        loop_name: String,
+        params: Vec<String>,
+        values: Vec<Value>,
+        remaining_inits: Vec<Expr>,
+        eval_env: Env,
+        local_env: Env,
+        body: Vec<Expr>,
+    },
 }
 
 thread_local! {
@@ -988,6 +1007,58 @@ fn eval_with_stack(initial_expr: &Expr, initial_env: &Env, initial_stack: Vec<Fr
                     apply_into(consumer, args, &mut cur_expr, &mut cur_env, &mut stack, &mut returning, span)?;
                     continue;
                 }
+                Frame::LetBind { names, mut values, mut remaining_inits, eval_env, local_env, body } => {
+                    values.push(val);
+                    if remaining_inits.is_empty() {
+                        // All bindings evaluated, define them and set up body
+                        for (name, v) in names.into_iter().zip(values) {
+                            local_env.define(name, v);
+                        }
+                        if body.is_empty() {
+                            returning = Some(Value::Void);
+                        } else {
+                            if body.len() > 1 {
+                                stack.push(Frame::Seq { remaining: body[1..].to_vec(), env: local_env.clone() });
+                            }
+                            cur_expr = body[0].clone();
+                            cur_env = local_env;
+                        }
+                    } else {
+                        let next_init = remaining_inits.remove(0);
+                        stack.push(Frame::LetBind { names, values, remaining_inits, eval_env: eval_env.clone(), local_env, body });
+                        cur_expr = next_init;
+                        cur_env = eval_env;
+                    }
+                    continue;
+                }
+                Frame::NamedLetBind { loop_name, params, mut values, mut remaining_inits, eval_env, local_env, body } => {
+                    values.push(val);
+                    if remaining_inits.is_empty() {
+                        // All inits evaluated, set up named let
+                        let lambda = Value::Lambda {
+                            params: params.clone(), rest_param: None, body: body.clone(), env: local_env.0.clone(),
+                        };
+                        local_env.define(loop_name, lambda);
+                        for (p, v) in params.into_iter().zip(values) {
+                            local_env.define(p, v);
+                        }
+                        if body.is_empty() {
+                            returning = Some(Value::Void);
+                        } else {
+                            if body.len() > 1 {
+                                stack.push(Frame::Seq { remaining: body[1..].to_vec(), env: local_env.clone() });
+                            }
+                            cur_expr = body[0].clone();
+                            cur_env = local_env;
+                        }
+                    } else {
+                        let next_init = remaining_inits.remove(0);
+                        stack.push(Frame::NamedLetBind { loop_name, params, values, remaining_inits, eval_env: eval_env.clone(), local_env, body });
+                        cur_expr = next_init;
+                        cur_env = eval_env;
+                    }
+                    continue;
+                }
             }
         }
 
@@ -1176,19 +1247,19 @@ fn eval_with_stack(initial_expr: &Expr, initial_env: &Env, initial_stack: Vec<Fr
                         return Err(EvalError::Runtime(format!("let requires bindings and body at {}", fmt_span(span))));
                     }
                     if let ExprKind::Symbol(loop_name) = &args[0].kind {
-                        // Named let
+                        // Named let — CPS-aware
                         let bindings = match &args[1].kind {
                             ExprKind::List(b) => b,
                             _ => return Err(EvalError::Runtime(format!("let: expected bindings list at {}", fmt_span(span)))),
                         };
                         let mut params = Vec::new();
-                        let mut init_vals = Vec::new();
+                        let mut inits = Vec::new();
                         for b in bindings {
                             match &b.kind {
                                 ExprKind::List(pair) if pair.len() == 2 => {
                                     if let ExprKind::Symbol(p) = &pair[0].kind {
                                         params.push(p.clone());
-                                        init_vals.push(eval(&pair[1], &cur_env)?);
+                                        inits.push(pair[1].clone());
                                     } else {
                                         return Err(EvalError::Runtime(format!("let: binding name must be symbol at {}", fmt_span(b.span))));
                                     }
@@ -1198,36 +1269,50 @@ fn eval_with_stack(initial_expr: &Expr, initial_env: &Env, initial_stack: Vec<Fr
                         }
                         let body = args[2..].to_vec();
                         let local_env = Env::child(&cur_env);
-                        let lambda = Value::Lambda {
-                            params: params.clone(), rest_param: None, body: body.clone(), env: local_env.0.clone(),
-                        };
-                        local_env.define(loop_name.clone(), lambda);
-                        for (p, v) in params.iter().zip(init_vals) {
-                            local_env.define(p.clone(), v);
-                        }
-                        if body.is_empty() {
-                            returning = Some(Value::Void);
-                        } else {
-                            if body.len() > 1 {
-                                stack.push(Frame::Seq { remaining: body[1..].to_vec(), env: local_env.clone() });
+                        if inits.is_empty() {
+                            let lambda = Value::Lambda {
+                                params: params.clone(), rest_param: None, body: body.clone(), env: local_env.0.clone(),
+                            };
+                            local_env.define(loop_name.clone(), lambda);
+                            if body.is_empty() {
+                                returning = Some(Value::Void);
+                            } else {
+                                if body.len() > 1 {
+                                    stack.push(Frame::Seq { remaining: body[1..].to_vec(), env: local_env.clone() });
+                                }
+                                cur_expr = body[0].clone();
+                                cur_env = local_env;
                             }
-                            cur_expr = body[0].clone();
-                            cur_env = local_env;
+                        } else {
+                            let mut remaining_inits = inits;
+                            let first_init = remaining_inits.remove(0);
+                            stack.push(Frame::NamedLetBind {
+                                loop_name: loop_name.clone(),
+                                params,
+                                values: Vec::new(),
+                                remaining_inits,
+                                eval_env: cur_env.clone(),
+                                local_env,
+                                body,
+                            });
+                            cur_expr = first_init;
                         }
                         continue;
                     }
-                    // Regular let
+                    // Regular let — CPS-aware binding evaluation
                     let bindings = match &args[0].kind {
                         ExprKind::List(b) => b,
                         _ => return Err(EvalError::Runtime(format!("let: expected bindings list at {}", fmt_span(span)))),
                     };
                     let local_env = Env::child(&cur_env);
+                    let mut names = Vec::new();
+                    let mut inits = Vec::new();
                     for b in bindings {
                         match &b.kind {
                             ExprKind::List(pair) if pair.len() == 2 => {
                                 if let ExprKind::Symbol(bname) = &pair[0].kind {
-                                    let val = eval(&pair[1], &cur_env)?;
-                                    local_env.define(bname.clone(), val);
+                                    names.push(bname.clone());
+                                    inits.push(pair[1].clone());
                                 } else {
                                     return Err(EvalError::Runtime(format!("let: binding name must be symbol at {}", fmt_span(b.span))));
                                 }
@@ -1235,16 +1320,36 @@ fn eval_with_stack(initial_expr: &Expr, initial_env: &Env, initial_stack: Vec<Fr
                             _ => return Err(EvalError::Runtime(format!("let: bad binding at {}", fmt_span(b.span)))),
                         }
                     }
-                    let body = &args[1..];
-                    if body.is_empty() {
-                        returning = Some(Value::Void);
-                    } else {
-                        if body.len() > 1 {
-                            stack.push(Frame::Seq { remaining: body[1..body.len()].to_vec(), env: local_env.clone() });
+                    let body: Vec<Expr> = args[1..].to_vec();
+                    if inits.is_empty() {
+                        // No bindings, go straight to body
+                        for (name, v) in names.into_iter().zip(std::iter::empty::<Value>()) {
+                            local_env.define(name, v);
                         }
-                        cur_expr = body[0].clone();
-                        cur_env = local_env;
+                        let body = &args[1..];
+                        if body.is_empty() {
+                            returning = Some(Value::Void);
+                        } else {
+                            if body.len() > 1 {
+                                stack.push(Frame::Seq { remaining: body[1..body.len()].to_vec(), env: local_env.clone() });
+                            }
+                            cur_expr = body[0].clone();
+                            cur_env = local_env;
+                        }
+                        continue;
                     }
+                    let mut remaining_inits = inits;
+                    let first_init = remaining_inits.remove(0);
+                    stack.push(Frame::LetBind {
+                        names,
+                        values: Vec::new(),
+                        remaining_inits,
+                        eval_env: cur_env.clone(),
+                        local_env,
+                        body,
+                    });
+                    cur_expr = first_init;
+                    // cur_env stays as cur_env (parent env for regular let)
                     continue;
                 }
                 "let*" => {
