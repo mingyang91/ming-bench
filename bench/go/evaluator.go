@@ -2015,7 +2015,8 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		if len(args) != 1 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: procedure?: need 1 argument", node.line, node.col)}
 		}
-		return boolVal(args[0].typ == valLambda || args[0].typ == valGoFunc || args[0].typ == valContinuation), nil
+		v := args[0]
+		return boolVal(v.typ == valLambda || v.typ == valGoFunc || v.typ == valContinuation || (v.typ == valSymbol && builtinSet[v.sval])), nil
 
 	case "display":
 		if len(args) != 1 {
@@ -3317,50 +3318,59 @@ func evalDo(node *astNode, e *env, ip *interp) (*Value, error) {
 	}
 }
 
+var builtinSet = func() map[string]bool {
+	m := make(map[string]bool)
+	for _, name := range builtinNames {
+		m[name] = true
+	}
+	return m
+}()
+
+var builtinNames = []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+	"cons", "car", "cdr", "null?", "list", "length",
+	"number?", "string?", "boolean?", "pair?", "symbol?", "char?",
+	"integer?", "rational?", "procedure?",
+	"append",
+	"display", "write", "newline",
+	"string-append", "string-length", "substring",
+	"string->number", "number->string",
+	"symbol->string", "string->symbol",
+	"string-ref",
+	"string-copy", "string-set!",
+	"string->list", "list->string",
+	"apply", "map",
+	"abs", "modulo", "remainder", "quotient",
+	"min", "max", "expt",
+	"zero?", "positive?", "negative?", "odd?", "even?",
+	"list-ref", "list-tail", "list?", "assoc",
+	"eq?", "equal?",
+	"char-alphabetic?", "char-numeric?",
+	"char-upcase", "char-downcase",
+	"char=?", "char<?",
+	"string=?", "string<?", "string-ci=?",
+	"string-upcase", "string-downcase",
+	"char->integer", "integer->char",
+	"exact?", "inexact?", "exact->inexact", "inexact->exact",
+	"numerator", "denominator",
+	"eqv?",
+	"vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
+	"vector->list", "list->vector",
+	"caar", "cadr", "cdar", "cddr", "caddr",
+	"set-car!", "set-cdr!",
+	"for-each", "reverse", "error",
+	"gcd", "lcm", "truncate", "round",
+	"make-string", "string",
+	"string>?", "string<=?", "string>=?",
+	"member", "assv",
+	"call/cc", "call-with-current-continuation",
+	"dynamic-wind",
+	"raise", "with-exception-handler",
+	"values", "call-with-values",
+	"syntax->datum", "datum->syntax"}
+
 func makeGlobalEnv() *env {
 	e := newEnv(nil)
-	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
-		"cons", "car", "cdr", "null?", "list", "length",
-		"number?", "string?", "boolean?", "pair?", "symbol?", "char?",
-		"integer?", "rational?", "procedure?",
-		"append",
-		"display", "write", "newline",
-		"string-append", "string-length", "substring",
-		"string->number", "number->string",
-		"symbol->string", "string->symbol",
-		"string-ref",
-		"string-copy", "string-set!",
-		"string->list", "list->string",
-		"apply", "map",
-		"abs", "modulo", "remainder", "quotient",
-		"min", "max", "expt",
-		"zero?", "positive?", "negative?", "odd?", "even?",
-		"list-ref", "list-tail", "list?", "assoc",
-		"eq?", "equal?",
-		"char-alphabetic?", "char-numeric?",
-		"char-upcase", "char-downcase",
-		"char=?", "char<?",
-		"string=?", "string<?", "string-ci=?",
-		"string-upcase", "string-downcase",
-		"char->integer", "integer->char",
-		"exact?", "inexact?", "exact->inexact", "inexact->exact",
-		"numerator", "denominator",
-		"eqv?",
-		"vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
-		"vector->list", "list->vector",
-		"caar", "cadr", "cdar", "cddr", "caddr",
-		"set-car!", "set-cdr!",
-		"for-each", "reverse", "error",
-		"gcd", "lcm", "truncate", "round",
-		"make-string", "string",
-		"string>?", "string<=?", "string>=?",
-		"member", "assv",
-		"call/cc", "call-with-current-continuation",
-		"dynamic-wind",
-		"raise", "with-exception-handler",
-		"values", "call-with-values",
-		"syntax->datum", "datum->syntax"}
-	for _, name := range builtins {
+	for _, name := range builtinNames {
 		e.set(name, symVal(name))
 	}
 	return e
