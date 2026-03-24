@@ -1,4 +1,14 @@
 import { EvalError } from './evalError.js';
+const NIL = { tag: 'nil' };
+function listToConsPairs(lst) {
+    if (lst.tag !== 'list')
+        return lst;
+    let result = NIL;
+    for (let i = lst.value.length - 1; i >= 0; i--) {
+        result = { tag: 'pair', car: listToConsPairs(lst.value[i]), cdr: result };
+    }
+    return result;
+}
 function tokenize(input) {
     const tokens = [];
     let i = 0;
@@ -200,6 +210,97 @@ function makeGlobalEnv() {
                 throw new EvalError('not requires exactly one argument');
             return { tag: 'boolean', value: isFalsy(args[0]) };
         } });
+    // List primitives
+    env.set('cons', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 2)
+                throw new EvalError('cons requires exactly 2 arguments');
+            return { tag: 'pair', car: args[0], cdr: args[1] };
+        } });
+    env.set('car', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1)
+                throw new EvalError('car requires exactly 1 argument');
+            if (args[0].tag === 'pair')
+                return args[0].car;
+            throw new EvalError('car: not a pair');
+        } });
+    env.set('cdr', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1)
+                throw new EvalError('cdr requires exactly 1 argument');
+            if (args[0].tag === 'pair')
+                return args[0].cdr;
+            throw new EvalError('cdr: not a pair');
+        } });
+    env.set('null?', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1)
+                throw new EvalError('null? requires exactly 1 argument');
+            return { tag: 'boolean', value: args[0].tag === 'nil' };
+        } });
+    env.set('list', { tag: 'procedure', value: (...args) => {
+            let result = NIL;
+            for (let i = args.length - 1; i >= 0; i--) {
+                result = { tag: 'pair', car: args[i], cdr: result };
+            }
+            return result;
+        } });
+    env.set('length', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1)
+                throw new EvalError('length requires exactly 1 argument');
+            let count = 0;
+            let cur = args[0];
+            while (cur.tag === 'pair') {
+                count++;
+                cur = cur.cdr;
+            }
+            if (cur.tag !== 'nil')
+                throw new EvalError('length: not a proper list');
+            return { tag: 'number', value: count };
+        } });
+    env.set('append', { tag: 'procedure', value: (...args) => {
+            if (args.length === 0)
+                return NIL;
+            if (args.length === 1)
+                return args[0];
+            // Build result by appending all lists
+            let result = args[args.length - 1];
+            for (let i = args.length - 2; i >= 0; i--) {
+                const elems = [];
+                let cur = args[i];
+                while (cur.tag === 'pair') {
+                    elems.push(cur.car);
+                    cur = cur.cdr;
+                }
+                for (let j = elems.length - 1; j >= 0; j--) {
+                    result = { tag: 'pair', car: elems[j], cdr: result };
+                }
+            }
+            return result;
+        } });
+    // Type predicates
+    env.set('number?', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1)
+                throw new EvalError('number? requires exactly 1 argument');
+            return { tag: 'boolean', value: args[0].tag === 'number' };
+        } });
+    env.set('string?', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1)
+                throw new EvalError('string? requires exactly 1 argument');
+            return { tag: 'boolean', value: args[0].tag === 'string' };
+        } });
+    env.set('boolean?', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1)
+                throw new EvalError('boolean? requires exactly 1 argument');
+            return { tag: 'boolean', value: args[0].tag === 'boolean' };
+        } });
+    env.set('pair?', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1)
+                throw new EvalError('pair? requires exactly 1 argument');
+            return { tag: 'boolean', value: args[0].tag === 'pair' };
+        } });
+    env.set('symbol?', { tag: 'procedure', value: (...args) => {
+            if (args.length !== 1)
+                throw new EvalError('symbol? requires exactly 1 argument');
+            return { tag: 'boolean', value: args[0].tag === 'symbol' };
+        } });
     return env;
 }
 // --- Evaluator ---
@@ -272,7 +373,7 @@ function evaluate(expr, env) {
                     case 'quote': {
                         if (elems.length !== 2)
                             throw new EvalError('quote requires exactly 1 argument');
-                        return elems[1];
+                        return listToConsPairs(elems[1]);
                     }
                     case 'lambda': {
                         if (elems.length < 3)
@@ -320,6 +421,102 @@ function evaluate(expr, env) {
                         }
                         return result;
                     }
+                    case 'begin': {
+                        let result = { tag: 'void' };
+                        for (let i = 1; i < elems.length; i++) {
+                            result = evaluate(elems[i], env);
+                        }
+                        return result;
+                    }
+                    case 'let': {
+                        if (elems.length < 3)
+                            throw new EvalError('let requires bindings and body');
+                        // Named let: (let name ((var init) ...) body ...)
+                        if (elems[1].tag === 'symbol') {
+                            if (elems.length < 4)
+                                throw new EvalError('named let requires bindings and body');
+                            const loopName = elems[1].value;
+                            const bindingsList = elems[2];
+                            if (bindingsList.tag !== 'list')
+                                throw new EvalError('let bindings must be a list');
+                            const paramNames = [];
+                            const initVals = [];
+                            for (const binding of bindingsList.value) {
+                                if (binding.tag !== 'list' || binding.value.length !== 2)
+                                    throw new EvalError('invalid let binding');
+                                if (binding.value[0].tag !== 'symbol')
+                                    throw new EvalError('let binding name must be a symbol');
+                                paramNames.push(binding.value[0].value);
+                                initVals.push(evaluate(binding.value[1], env));
+                            }
+                            const bodyExprs = elems.slice(3);
+                            const childEnv = new Env(env);
+                            const loopProc = { tag: 'procedure', value: (...args) => {
+                                    const innerEnv = new Env(env);
+                                    for (let i = 0; i < paramNames.length; i++) {
+                                        innerEnv.set(paramNames[i], args[i]);
+                                    }
+                                    innerEnv.set(loopName, loopProc);
+                                    let result = { tag: 'void' };
+                                    for (const b of bodyExprs)
+                                        result = evaluate(b, innerEnv);
+                                    return result;
+                                } };
+                            childEnv.set(loopName, loopProc);
+                            for (let i = 0; i < paramNames.length; i++) {
+                                childEnv.set(paramNames[i], initVals[i]);
+                            }
+                            let result = { tag: 'void' };
+                            for (const b of bodyExprs)
+                                result = evaluate(b, childEnv);
+                            return result;
+                        }
+                        // Regular let: (let ((var init) ...) body ...)
+                        const bindings = elems[1];
+                        if (bindings.tag !== 'list')
+                            throw new EvalError('let bindings must be a list');
+                        const childEnv = new Env(env);
+                        for (const binding of bindings.value) {
+                            if (binding.tag !== 'list' || binding.value.length !== 2)
+                                throw new EvalError('invalid let binding');
+                            const name = binding.value[0];
+                            if (name.tag !== 'symbol')
+                                throw new EvalError('let binding name must be a symbol');
+                            const val = evaluate(binding.value[1], env);
+                            childEnv.set(name.value, val);
+                        }
+                        let result = { tag: 'void' };
+                        for (let i = 2; i < elems.length; i++) {
+                            result = evaluate(elems[i], childEnv);
+                        }
+                        return result;
+                    }
+                    case 'cond': {
+                        for (let i = 1; i < elems.length; i++) {
+                            const clause = elems[i];
+                            if (clause.tag !== 'list' || clause.value.length < 1)
+                                throw new EvalError('invalid cond clause');
+                            const test = clause.value[0];
+                            if (test.tag === 'symbol' && test.value === 'else') {
+                                let result = { tag: 'void' };
+                                for (let j = 1; j < clause.value.length; j++) {
+                                    result = evaluate(clause.value[j], env);
+                                }
+                                return result;
+                            }
+                            const testVal = evaluate(test, env);
+                            if (!isFalsy(testVal)) {
+                                if (clause.value.length === 1)
+                                    return testVal;
+                                let result = { tag: 'void' };
+                                for (let j = 1; j < clause.value.length; j++) {
+                                    result = evaluate(clause.value[j], env);
+                                }
+                                return result;
+                            }
+                        }
+                        return { tag: 'void' };
+                    }
                 }
             }
             // Function application
@@ -339,7 +536,20 @@ function display(val) {
         case 'boolean': return val.value ? '#t' : '#f';
         case 'string': return `"${val.value}"`;
         case 'symbol': return val.value;
+        case 'nil': return '()';
         case 'list': return `(${val.value.map(display).join(' ')})`;
+        case 'pair': {
+            let parts = [];
+            let cur = val;
+            while (cur.tag === 'pair') {
+                parts.push(display(cur.car));
+                cur = cur.cdr;
+            }
+            if (cur.tag === 'nil') {
+                return `(${parts.join(' ')})`;
+            }
+            return `(${parts.join(' ')} . ${display(cur)})`;
+        }
         case 'void': return '';
         case 'procedure': return '#<procedure>';
     }
