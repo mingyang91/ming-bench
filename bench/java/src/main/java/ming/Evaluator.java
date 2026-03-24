@@ -133,6 +133,31 @@ public class Evaluator {
                     } else if (next == 'f') {
                         tokens.add(new Token(Boolean.FALSE, line, startCol));
                         i += 2; col += 2;
+                    } else if (next == '\\') {
+                        // Character literal: #\x, #\space, #\newline, #\tab
+                        i += 2; col += 2;
+                        if (i >= input.length()) throw new EvalError(line + ":" + startCol + " unexpected end in character literal");
+                        // Try to read a named character or single character
+                        int nameStart = i;
+                        while (i < input.length()) {
+                            char ch = input.charAt(i);
+                            if (Character.isWhitespace(ch) || ch == '(' || ch == ')' || ch == '"' || ch == ';' || ch == '\'') break;
+                            i++; col++;
+                        }
+                        String charName = input.substring(nameStart, i);
+                        char charVal;
+                        if (charName.length() == 1) {
+                            charVal = charName.charAt(0);
+                        } else if (charName.equalsIgnoreCase("space")) {
+                            charVal = ' ';
+                        } else if (charName.equalsIgnoreCase("newline")) {
+                            charVal = '\n';
+                        } else if (charName.equalsIgnoreCase("tab")) {
+                            charVal = '\t';
+                        } else {
+                            throw new EvalError(line + ":" + startCol + " unknown character name: " + charName);
+                        }
+                        tokens.add(new Token(new SchemeChar(charVal), line, startCol));
                     } else {
                         throw new EvalError(line + ":" + col + " unexpected character after #: " + next);
                     }
@@ -220,7 +245,7 @@ public class Evaluator {
             return eval(loc.value(), env);
         }
 
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString) {
+        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
             return expr;
         }
         if (expr instanceof String symbol) {
@@ -639,6 +664,20 @@ public class Evaluator {
             if (args.size() != 1) throw error("string->symbol: expected 1 argument");
             if (!(args.get(0) instanceof SchemeString s)) throw error("string->symbol: not a string");
             return s.value();
+        });
+
+        globalEnv.define("string-copy", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("string-copy: expected 1 argument");
+            if (!(args.get(0) instanceof SchemeString s)) throw error("string-copy: not a string");
+            return new SchemeString(s.value());
+        });
+        globalEnv.define("string-set!", (BuiltinProc) args -> {
+            if (args.size() != 3) throw error("string-set!: expected 3 arguments");
+            if (!(args.get(0) instanceof SchemeString s)) throw error("string-set!: not a string");
+            if (!(args.get(1) instanceof Long idx)) throw error("string-set!: not a number");
+            if (!(args.get(2) instanceof SchemeChar ch)) throw error("string-set!: not a character");
+            s.setChar(idx.intValue(), ch.value());
+            return VOID;
         });
 
         // Character operations
