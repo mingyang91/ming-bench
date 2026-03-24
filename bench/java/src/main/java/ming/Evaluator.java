@@ -737,6 +737,255 @@ public class Evaluator {
             return args.get(0) instanceof SchemeChar;
         });
 
+        // eq? (identity/value equality for symbols, numbers, booleans, chars)
+        globalEnv.define("eq?", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("eq?: expected 2 arguments");
+            Object a = args.get(0), b = args.get(1);
+            if (a == b) return true;
+            if (a instanceof Long && b instanceof Long) return a.equals(b);
+            if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
+            if (a instanceof SchemeChar && b instanceof SchemeChar) return a.equals(b);
+            if (a instanceof String && b instanceof String) return a.equals(b);
+            return false;
+        });
+
+        // equal? (deep structural equality)
+        globalEnv.define("equal?", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("equal?: expected 2 arguments");
+            return schemeEqual(args.get(0), args.get(1));
+        });
+
+        // Numeric utilities
+        globalEnv.define("abs", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("abs: expected 1 argument");
+            if (!(args.get(0) instanceof Long n)) throw error("abs: not a number");
+            return Math.abs(n);
+        });
+        globalEnv.define("modulo", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("modulo: expected 2 arguments");
+            if (!(args.get(0) instanceof Long a)) throw error("modulo: not a number");
+            if (!(args.get(1) instanceof Long b)) throw error("modulo: not a number");
+            if (b == 0) throw error("modulo: division by zero");
+            long r = a % b;
+            if (r != 0 && ((r > 0) != (b > 0))) r += b;
+            return r;
+        });
+        globalEnv.define("remainder", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("remainder: expected 2 arguments");
+            if (!(args.get(0) instanceof Long a)) throw error("remainder: not a number");
+            if (!(args.get(1) instanceof Long b)) throw error("remainder: not a number");
+            if (b == 0) throw error("remainder: division by zero");
+            return a % b;
+        });
+        globalEnv.define("quotient", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("quotient: expected 2 arguments");
+            if (!(args.get(0) instanceof Long a)) throw error("quotient: not a number");
+            if (!(args.get(1) instanceof Long b)) throw error("quotient: not a number");
+            if (b == 0) throw error("quotient: division by zero");
+            // Truncation toward zero (Java default behavior)
+            return a / b;
+        });
+        globalEnv.define("min", (BuiltinProc) args -> {
+            if (args.isEmpty()) throw error("min: expected at least 1 argument");
+            if (!(args.get(0) instanceof Long result)) throw error("min: not a number");
+            long r = result;
+            for (int i = 1; i < args.size(); i++) {
+                if (!(args.get(i) instanceof Long v)) throw error("min: not a number");
+                if (v < r) r = v;
+            }
+            return r;
+        });
+        globalEnv.define("max", (BuiltinProc) args -> {
+            if (args.isEmpty()) throw error("max: expected at least 1 argument");
+            if (!(args.get(0) instanceof Long result)) throw error("max: not a number");
+            long r = result;
+            for (int i = 1; i < args.size(); i++) {
+                if (!(args.get(i) instanceof Long v)) throw error("max: not a number");
+                if (v > r) r = v;
+            }
+            return r;
+        });
+        globalEnv.define("expt", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("expt: expected 2 arguments");
+            if (!(args.get(0) instanceof Long base)) throw error("expt: not a number");
+            if (!(args.get(1) instanceof Long exp)) throw error("expt: not a number");
+            long result = 1;
+            long b = base;
+            long e = exp;
+            if (e < 0) return 0L; // integer expt with negative exp → 0
+            while (e > 0) {
+                if ((e & 1) == 1) result *= b;
+                b *= b;
+                e >>= 1;
+            }
+            return result;
+        });
+
+        // Number predicates
+        globalEnv.define("zero?", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("zero?: expected 1 argument");
+            if (!(args.get(0) instanceof Long n)) throw error("zero?: not a number");
+            return n == 0L;
+        });
+        globalEnv.define("positive?", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("positive?: expected 1 argument");
+            if (!(args.get(0) instanceof Long n)) throw error("positive?: not a number");
+            return n > 0L;
+        });
+        globalEnv.define("negative?", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("negative?: expected 1 argument");
+            if (!(args.get(0) instanceof Long n)) throw error("negative?: not a number");
+            return n < 0L;
+        });
+        globalEnv.define("odd?", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("odd?: expected 1 argument");
+            if (!(args.get(0) instanceof Long n)) throw error("odd?: not a number");
+            return n % 2 != 0;
+        });
+        globalEnv.define("even?", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("even?: expected 1 argument");
+            if (!(args.get(0) instanceof Long n)) throw error("even?: not a number");
+            return n % 2 == 0;
+        });
+
+        // List utilities
+        globalEnv.define("list-ref", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("list-ref: expected 2 arguments");
+            if (!(args.get(1) instanceof Long idx)) throw error("list-ref: not a number");
+            Object cur = args.get(0);
+            for (long i = 0; i < idx; i++) {
+                if (!(cur instanceof Pair p)) throw error("list-ref: index out of range");
+                cur = p.cdr;
+            }
+            if (!(cur instanceof Pair p)) throw error("list-ref: index out of range");
+            return p.car;
+        });
+        globalEnv.define("list-tail", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("list-tail: expected 2 arguments");
+            if (!(args.get(1) instanceof Long idx)) throw error("list-tail: not a number");
+            Object cur = args.get(0);
+            for (long i = 0; i < idx; i++) {
+                if (!(cur instanceof Pair p)) throw error("list-tail: index out of range");
+                cur = p.cdr;
+            }
+            return cur;
+        });
+        globalEnv.define("list?", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("list?: expected 1 argument");
+            Object cur = args.get(0);
+            while (cur instanceof Pair p) {
+                cur = p.cdr;
+            }
+            return cur == NIL;
+        });
+        globalEnv.define("assoc", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("assoc: expected 2 arguments");
+            Object key = args.get(0);
+            Object alist = args.get(1);
+            while (alist instanceof Pair p) {
+                if (p.car instanceof Pair entry) {
+                    if (schemeEqual(key, entry.car)) return entry;
+                }
+                alist = p.cdr;
+            }
+            return false;
+        });
+
+        // map (supports multiple lists)
+        globalEnv.define("map", (BuiltinProc) args -> {
+            if (args.size() < 2) throw error("map: expected at least 2 arguments");
+            Object proc = args.get(0);
+            List<Object> lists = new ArrayList<>();
+            for (int i = 1; i < args.size(); i++) {
+                lists.add(args.get(i));
+            }
+            List<Object> results = new ArrayList<>();
+            while (true) {
+                // Check if any list is exhausted
+                boolean done = false;
+                for (Object lst : lists) {
+                    if (!(lst instanceof Pair)) { done = true; break; }
+                }
+                if (done) break;
+                List<Object> callArgs = new ArrayList<>();
+                for (int i = 0; i < lists.size(); i++) {
+                    Pair p = (Pair) lists.get(i);
+                    callArgs.add(p.car);
+                    lists.set(i, p.cdr);
+                }
+                results.add(apply(proc, callArgs));
+            }
+            Object result = NIL;
+            for (int i = results.size() - 1; i >= 0; i--) {
+                result = new Pair(results.get(i), result);
+            }
+            return result;
+        });
+
+        // Character operations
+        globalEnv.define("char-alphabetic?", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("char-alphabetic?: expected 1 argument");
+            if (!(args.get(0) instanceof SchemeChar c)) throw error("char-alphabetic?: not a character");
+            return Character.isLetter(c.value());
+        });
+        globalEnv.define("char-numeric?", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("char-numeric?: expected 1 argument");
+            if (!(args.get(0) instanceof SchemeChar c)) throw error("char-numeric?: not a character");
+            return Character.isDigit(c.value());
+        });
+        globalEnv.define("char-upcase", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("char-upcase: expected 1 argument");
+            if (!(args.get(0) instanceof SchemeChar c)) throw error("char-upcase: not a character");
+            return new SchemeChar(Character.toUpperCase(c.value()));
+        });
+        globalEnv.define("char-downcase", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("char-downcase: expected 1 argument");
+            if (!(args.get(0) instanceof SchemeChar c)) throw error("char-downcase: not a character");
+            return new SchemeChar(Character.toLowerCase(c.value()));
+        });
+        globalEnv.define("char=?", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("char=?: expected 2 arguments");
+            if (!(args.get(0) instanceof SchemeChar a)) throw error("char=?: not a character");
+            if (!(args.get(1) instanceof SchemeChar b)) throw error("char=?: not a character");
+            return a.value() == b.value();
+        });
+        globalEnv.define("char<?", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("char<?: expected 2 arguments");
+            if (!(args.get(0) instanceof SchemeChar a)) throw error("char<?: not a character");
+            if (!(args.get(1) instanceof SchemeChar b)) throw error("char<?: not a character");
+            return a.value() < b.value();
+        });
+
+        // String comparison
+        globalEnv.define("string=?", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("string=?: expected 2 arguments");
+            if (!(args.get(0) instanceof SchemeString a)) throw error("string=?: not a string");
+            if (!(args.get(1) instanceof SchemeString b)) throw error("string=?: not a string");
+            return a.value().equals(b.value());
+        });
+        globalEnv.define("string<?", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("string<?: expected 2 arguments");
+            if (!(args.get(0) instanceof SchemeString a)) throw error("string<?: not a string");
+            if (!(args.get(1) instanceof SchemeString b)) throw error("string<?: not a string");
+            return a.value().compareTo(b.value()) < 0;
+        });
+        globalEnv.define("string-ci=?", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("string-ci=?: expected 2 arguments");
+            if (!(args.get(0) instanceof SchemeString a)) throw error("string-ci=?: not a string");
+            if (!(args.get(1) instanceof SchemeString b)) throw error("string-ci=?: not a string");
+            return a.value().equalsIgnoreCase(b.value());
+        });
+        globalEnv.define("string-upcase", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("string-upcase: expected 1 argument");
+            if (!(args.get(0) instanceof SchemeString s)) throw error("string-upcase: not a string");
+            return new SchemeString(s.value().toUpperCase());
+        });
+        globalEnv.define("string-downcase", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("string-downcase: expected 1 argument");
+            if (!(args.get(0) instanceof SchemeString s)) throw error("string-downcase: not a string");
+            return new SchemeString(s.value().toLowerCase());
+        });
+
         // apply
         globalEnv.define("apply", (BuiltinProc) args -> {
             if (args.size() < 2) throw error("apply: expected at least 2 arguments");
@@ -811,6 +1060,20 @@ public class Evaluator {
         if (list.size() - 1 != expected) {
             throw error(name + ": expected " + expected + " arguments, got " + (list.size() - 1));
         }
+    }
+
+    private boolean schemeEqual(Object a, Object b) {
+        if (a == b) return true;
+        if (a instanceof Long && b instanceof Long) return a.equals(b);
+        if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
+        if (a instanceof String && b instanceof String) return a.equals(b);
+        if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
+        if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
+        if (a instanceof Pair pa && b instanceof Pair pb) {
+            return schemeEqual(pa.car, pb.car) && schemeEqual(pa.cdr, pb.cdr);
+        }
+        if (a == NIL && b == NIL) return true;
+        return false;
     }
 
     // --- Output formatting ---
