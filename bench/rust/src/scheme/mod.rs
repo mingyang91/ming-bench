@@ -7,7 +7,7 @@ mod syntax_case;
 
 pub use error::EvalError;
 use error::Span;
-use parser::{Parser, parse_params};
+use parser::{Parser, parse_params, parse_params_from_value};
 use builtins::{apply_builtin, format_float_value, values_eqv};
 pub(crate) use builtins::make_rational;
 
@@ -322,6 +322,7 @@ pub(crate) enum Kont {
     Not { next: Rc<Kont> },
     WhenTest { body: Vec<Spanned>, env: Env, next: Rc<Kont> },
     CondTest { clause_body: Vec<Spanned>, remaining_clauses: Vec<Spanned>, env: Env, span: Span, next: Rc<Kont> },
+    CondArrow { test_value: Value, next: Rc<Kont> },
     CaseKey { clauses: Vec<Spanned>, env: Env, span: Span, next: Rc<Kont> },
     LetBind {
         current_name: String,
@@ -470,10 +471,7 @@ pub(super) fn eval_define_syntax(items: &[Spanned], env: &Env, span: Span) -> Re
             if parts.len() < 3 {
                 return Err(EvalError::Arity("lambda requires params and body".into(), span));
             }
-            let Value::List(param_list) = &parts[1].val else {
-                return Err(EvalError::Type("lambda: expected parameter list".into(), span));
-            };
-            let (params, rest) = parse_params(param_list, "lambda", span)?;
+            let (params, rest) = parse_params_from_value(&parts[1].val, "lambda", span)?;
             let body = parts[2..].to_vec();
             let lambda = Value::Lambda(params, rest, body, env.clone());
             env_set(env, macro_name.clone(), Value::SyntaxTransformer(Box::new(lambda)));
@@ -573,6 +571,13 @@ fn eval_step(expr: &Spanned, env: &Env, out: &Output) -> Result<Bounce, EvalErro
                         }
                         return Ok(Bounce::Done(items[1].val.clone()));
                     }
+                    "quasiquote" => {
+                        if items.len() != 2 {
+                            return Err(EvalError::Arity("quasiquote requires 1 argument".into(), span));
+                        }
+                        let result = expand_quasiquote(&items[1].val, env, out, 1, span)?;
+                        return Ok(Bounce::Done(result));
+                    }
                     "if" => {
                         if items.len() < 3 || items.len() > 4 {
                             return Err(EvalError::Arity("if requires 2 or 3 arguments".into(), span));
@@ -610,6 +615,18 @@ fn eval_step(expr: &Spanned, env: &Env, out: &Output) -> Result<Bounce, EvalErro
                                 env_set(env, func_name, lambda);
                                 return Ok(Bounce::Done(Value::Void));
                             }
+                            Value::Pair(cell) => {
+                                let (car, cdr) = { let b = cell.borrow(); (b.0.clone(), b.1.clone()) };
+                                let func_name = match car {
+                                    Value::Symbol(s) => s,
+                                    _ => return Err(EvalError::Type("define: expected symbol for function name".into(), span)),
+                                };
+                                let (params, rest) = parse_params_from_value(&cdr, "define", span)?;
+                                let body = items[2..].to_vec();
+                                let lambda = Value::Lambda(params, rest, body, env.clone());
+                                env_set(env, func_name, lambda);
+                                return Ok(Bounce::Done(Value::Void));
+                            }
                             _ => return Err(EvalError::Type("define: expected symbol or list".into(), span)),
                         }
                     }
@@ -617,11 +634,7 @@ fn eval_step(expr: &Spanned, env: &Env, out: &Output) -> Result<Bounce, EvalErro
                         if items.len() < 3 {
                             return Err(EvalError::Arity("lambda requires at least 2 arguments".into(), span));
                         }
-                        let (params, rest) = match &items[1].val {
-                            Value::List(param_list) => parse_params(param_list, "lambda", span)?,
-                            Value::Symbol(s) => (vec![], Some(s.clone())), // (lambda args body)
-                            _ => return Err(EvalError::Type("lambda: expected parameter list".into(), span)),
-                        };
+                        let (params, rest) = parse_params_from_value(&items[1].val, "lambda", span)?;
                         let body = items[2..].to_vec();
                         return Ok(Bounce::Done(Value::Lambda(params, rest, body, env.clone())));
                     }
@@ -634,11 +647,7 @@ fn eval_step(expr: &Spanned, env: &Env, out: &Output) -> Result<Bounce, EvalErro
                             if parts.is_empty() {
                                 return Err(EvalError::Arity("case-lambda: clause must have formals and body".into(), span));
                             }
-                            let (params, rest) = match &parts[0].val {
-                                Value::List(param_list) => parse_params(param_list, "case-lambda", span)?,
-                                Value::Symbol(s) => (vec![], Some(s.clone())),
-                                _ => return Err(EvalError::Type("case-lambda: expected parameter list".into(), span)),
-                            };
+                            let (params, rest) = parse_params_from_value(&parts[0].val, "case-lambda", span)?;
                             let body = parts[1..].to_vec();
                             clauses.push((params, rest, body, env.clone()));
                         }
@@ -1072,6 +1081,110 @@ fn eval_let_star_step(args: &[Spanned], env: &Env, out: &Output, span: Span) -> 
     eval_body_step(&args[1..], &local_env, out)
 }
 
+/// Tries to handle an `unquote-splicing` item during quasiquote expansion.
+/// Returns `Ok(true)` if the item was spliced into `result`, `Ok(false)` if not an unquote-splicing form.
+fn try_expand_splice(
+    item: &Spanned, env: &Env, out: &Output, depth: usize, span: Span, result: &mut Vec<Spanned>,
+) -> Result<bool, EvalError> {
+    let Value::List(sub) = &item.val else { return Ok(false) };
+    if sub.len() != 2 { return Ok(false) }
+    let Value::Symbol(s) = &sub[0].val else { return Ok(false) };
+    if s != "unquote-splicing" { return Ok(false) }
+
+    if depth != 1 {
+        let inner = expand_quasiquote(&sub[1].val, env, out, depth - 1, span)?;
+        result.push(Spanned::new(Value::List(vec![
+            sub[0].clone(),
+            Spanned::new(inner, sub[1].span),
+        ]), item.span));
+        return Ok(true);
+    }
+
+    let val = eval(&sub[1], env, out)?;
+    match val {
+        Value::List(elems) => {
+            result.extend(elems);
+        }
+        Value::Pair(_) => {
+            splice_pair_to_vec(val, span, result)?;
+        }
+        _ => return Err(EvalError::Type("unquote-splicing: not a list".into(), span)),
+    }
+    Ok(true)
+}
+
+fn splice_pair_to_vec(val: Value, span: Span, result: &mut Vec<Spanned>) -> Result<(), EvalError> {
+    let mut cur = val;
+    loop {
+        match cur {
+            Value::Pair(cell) => {
+                let (car, cdr) = { let b = cell.borrow(); (b.0.clone(), b.1.clone()) };
+                result.push(Spanned::new(car, span));
+                cur = cdr;
+            }
+            Value::List(items) if items.is_empty() => break,
+            _ => return Err(EvalError::Type("unquote-splicing: not a proper list".into(), span)),
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn expand_quasiquote(expr: &Value, env: &Env, out: &Output, depth: usize, span: Span) -> Result<Value, EvalError> {
+    match expr {
+        Value::List(items) if !items.is_empty() => {
+            if let Value::Symbol(s) = &items[0].val {
+                if s == "unquote" && items.len() == 2 {
+                    if depth == 1 {
+                        return eval(&items[1], env, out);
+                    } else {
+                        let inner = expand_quasiquote(&items[1].val, env, out, depth - 1, span)?;
+                        return Ok(Value::List(vec![
+                            items[0].clone(),
+                            Spanned::new(inner, items[1].span),
+                        ]));
+                    }
+                }
+                if s == "quasiquote" && items.len() == 2 {
+                    let inner = expand_quasiquote(&items[1].val, env, out, depth + 1, span)?;
+                    return Ok(Value::List(vec![
+                        items[0].clone(),
+                        Spanned::new(inner, items[1].span),
+                    ]));
+                }
+            }
+            // Process each element, handling unquote-splicing
+            let mut result = Vec::new();
+            for item in items {
+                if try_expand_splice(item, env, out, depth, span, &mut result)? {
+                    continue;
+                }
+                let expanded = expand_quasiquote(&item.val, env, out, depth, span)?;
+                result.push(Spanned::new(expanded, item.span));
+            }
+            Ok(Value::List(result))
+        }
+        Value::Pair(cell) => {
+            let (car, cdr) = { let b = cell.borrow(); (b.0.clone(), b.1.clone()) };
+            // Check for (unquote x) as a pair
+            if let Value::Symbol(s) = &car {
+                if s == "unquote" && depth == 1 {
+                    // cdr should be a list with one element
+                    if let Value::List(items) = &cdr {
+                        if items.len() == 1 {
+                            return eval(&items[0], env, out);
+                        }
+                    }
+                }
+            }
+            let expanded_car = expand_quasiquote(&car, env, out, depth, span)?;
+            let expanded_cdr = expand_quasiquote(&cdr, env, out, depth, span)?;
+            Ok(Value::Pair(Rc::new(RefCell::new((expanded_car, expanded_cdr)))))
+        }
+        _ => Ok(expr.clone()),
+    }
+}
+
+
 fn eval_cond_step(clauses: &[Spanned], env: &Env, out: &Output, span: Span) -> Result<Bounce, EvalError> {
     for clause in clauses {
         let Value::List(parts) = &clause.val else {
@@ -1089,6 +1202,13 @@ fn eval_cond_step(clauses: &[Spanned], env: &Env, out: &Output, span: Span) -> R
         if test.is_truthy() {
             if parts.len() == 1 {
                 return Ok(Bounce::Done(test));
+            }
+            if parts.len() == 2 && matches!(&parts[1].val, Value::Symbol(s) if s == "=>") {
+                return Err(EvalError::Arity("cond =>: missing procedure".into(), span));
+            }
+            if parts.len() >= 2 && matches!(&parts[1].val, Value::Symbol(s) if s == "=>") {
+                let proc = eval(&parts[2], env, out)?;
+                return apply_step(&proc, &[test], out, span);
             }
             return eval_body_step(&parts[1..], env, out);
         }

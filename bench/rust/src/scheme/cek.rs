@@ -12,7 +12,7 @@ use super::{
     ExceptionHandler, EXCEPTION_HANDLERS,
 };
 use super::error::{EvalError, Span};
-use super::parser::parse_params;
+use super::parser::{parse_params, parse_params_from_value};
 use super::builtins::{apply_builtin, values_eqv};
 
 pub(super) enum CekState {
@@ -127,6 +127,13 @@ fn cek_eval_expr(expr: Spanned, env: Env, kont: Rc<Kont>, out: &Output) -> Resul
                         }
                         return Ok(CekStep::Continue(CekState::ApplyKont(kont, items[1].val.clone())));
                     }
+                    "quasiquote" => {
+                        if items.len() != 2 {
+                            return Err(EvalError::Arity("quasiquote requires 1 argument".into(), span));
+                        }
+                        let result = super::expand_quasiquote(&items[1].val, &env, out, 1, span)?;
+                        return Ok(CekStep::Continue(CekState::ApplyKont(kont, result)));
+                    }
                     "if" => {
                         if items.len() < 3 || items.len() > 4 {
                             return Err(EvalError::Arity("if requires 2 or 3 arguments".into(), span));
@@ -158,6 +165,18 @@ fn cek_eval_expr(expr: Spanned, env: Env, kont: Rc<Kont>, out: &Output) -> Resul
                                 env_set(&env, func_name, lambda);
                                 return Ok(CekStep::Continue(CekState::ApplyKont(kont, Value::Void)));
                             }
+                            Value::Pair(cell) => {
+                                let (car, cdr) = { let b = cell.borrow(); (b.0.clone(), b.1.clone()) };
+                                let func_name = match car {
+                                    Value::Symbol(s) => s,
+                                    _ => return Err(EvalError::Type("define: expected symbol for function name".into(), span)),
+                                };
+                                let (params, rest) = parse_params_from_value(&cdr, "define", span)?;
+                                let body = items[2..].to_vec();
+                                let lambda = Value::Lambda(params, rest, body, env.clone());
+                                env_set(&env, func_name, lambda);
+                                return Ok(CekStep::Continue(CekState::ApplyKont(kont, Value::Void)));
+                            }
                             _ => return Err(EvalError::Type("define: expected symbol or list".into(), span)),
                         }
                     }
@@ -165,11 +184,7 @@ fn cek_eval_expr(expr: Spanned, env: Env, kont: Rc<Kont>, out: &Output) -> Resul
                         if items.len() < 3 {
                             return Err(EvalError::Arity("lambda requires at least 2 arguments".into(), span));
                         }
-                        let (params, rest) = match &items[1].val {
-                            Value::List(param_list) => parse_params(param_list, "lambda", span)?,
-                            Value::Symbol(s) => (vec![], Some(s.clone())),
-                            _ => return Err(EvalError::Type("lambda: expected parameter list".into(), span)),
-                        };
+                        let (params, rest) = parse_params_from_value(&items[1].val, "lambda", span)?;
                         let body = items[2..].to_vec();
                         return Ok(CekStep::Continue(CekState::ApplyKont(kont, Value::Lambda(params, rest, body, env))));
                     }
@@ -182,11 +197,7 @@ fn cek_eval_expr(expr: Spanned, env: Env, kont: Rc<Kont>, out: &Output) -> Resul
                             if parts.is_empty() {
                                 return Err(EvalError::Arity("case-lambda: clause must have formals and body".into(), span));
                             }
-                            let (params, rest) = match &parts[0].val {
-                                Value::List(param_list) => parse_params(param_list, "case-lambda", span)?,
-                                Value::Symbol(s) => (vec![], Some(s.clone())),
-                                _ => return Err(EvalError::Type("case-lambda: expected parameter list".into(), span)),
-                            };
+                            let (params, rest) = parse_params_from_value(&parts[0].val, "case-lambda", span)?;
                             let body = parts[1..].to_vec();
                             clauses.push((params, rest, body, env.clone()));
                         }
@@ -493,12 +504,21 @@ fn cek_apply_kont(kont: &Rc<Kont>, value: Value, out: &Output, is_resume: bool) 
             if value.is_truthy() {
                 if clause_body.is_empty() {
                     Ok(CekStep::Continue(CekState::ApplyKont(next.clone(), value)))
+                } else if clause_body.len() == 2 && matches!(&clause_body[0].val, Value::Symbol(s) if s == "=>") {
+                    // (cond (test => proc)) — evaluate proc, then apply it to test result
+                    let k = Rc::new(Kont::CondArrow { test_value: value, next: next.clone() });
+                    Ok(CekStep::Continue(CekState::Eval(clause_body[1].clone(), env.clone(), k)))
                 } else {
                     eval_body_cek(clause_body, env.clone(), next.clone())
                 }
             } else {
                 cek_eval_cond(remaining_clauses, env, *span, next.clone())
             }
+        }
+
+        Kont::CondArrow { test_value, next } => {
+            // value is the proc; apply it to test_value
+            cek_apply_func(&value, std::slice::from_ref(test_value), next.clone(), out, DUMMY_SPAN)
         }
 
         Kont::CaseKey { clauses, env, span, next } => {

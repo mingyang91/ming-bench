@@ -3,6 +3,14 @@ use crate::scheme::{make_rational, Spanned, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+fn build_dotted_pair(items: Vec<Spanned>, tail: Value) -> Value {
+    let mut result = tail;
+    for item in items.into_iter().rev() {
+        result = Value::Pair(Rc::new(RefCell::new((item.val, result))));
+    }
+    result
+}
+
 pub(crate) struct Parser {
     chars: Vec<char>,
     pos: usize,
@@ -73,6 +81,40 @@ impl Parser {
                     span,
                 ))
             }
+            Some('`') => {
+                self.advance();
+                let inner = self.parse_expr()?;
+                Ok(Spanned::new(
+                    Value::List(vec![
+                        Spanned::new(Value::Symbol("quasiquote".into()), span),
+                        inner,
+                    ]),
+                    span,
+                ))
+            }
+            Some(',') => {
+                self.advance();
+                if self.peek() == Some('@') {
+                    self.advance();
+                    let inner = self.parse_expr()?;
+                    Ok(Spanned::new(
+                        Value::List(vec![
+                            Spanned::new(Value::Symbol("unquote-splicing".into()), span),
+                            inner,
+                        ]),
+                        span,
+                    ))
+                } else {
+                    let inner = self.parse_expr()?;
+                    Ok(Spanned::new(
+                        Value::List(vec![
+                            Spanned::new(Value::Symbol("unquote".into()), span),
+                            inner,
+                        ]),
+                        span,
+                    ))
+                }
+            }
             Some(_) => self.parse_atom(),
         }
     }
@@ -88,6 +130,27 @@ impl Parser {
                 Some(')') => {
                     self.advance();
                     return Ok(Spanned::new(Value::List(items), span));
+                }
+                Some('.') => {
+                    // Check if this is a dot followed by a delimiter (dotted pair syntax)
+                    // vs a symbol starting with '.' (like "...")
+                    let next_pos = self.pos + 1;
+                    let is_dot_notation = next_pos >= self.chars.len()
+                        || is_delimiter(self.chars[next_pos]);
+                    if is_dot_notation && !items.is_empty() {
+                        self.advance(); // skip '.'
+                        self.skip_whitespace();
+                        let tail = self.parse_expr()?;
+                        self.skip_whitespace();
+                        if self.peek() != Some(')') {
+                            return Err(EvalError::Parse("expected ) after dotted pair tail".into(), span));
+                        }
+                        self.advance();
+                        let result = build_dotted_pair(items, tail.val);
+                        return Ok(Spanned::new(result, span));
+                    } else {
+                        items.push(self.parse_expr()?);
+                    }
                 }
                 _ => items.push(self.parse_expr()?),
             }
@@ -242,32 +305,40 @@ fn is_delimiter(c: char) -> bool {
 /// Parse a parameter list, returning (fixed_params, optional_rest_param).
 /// Handles dot notation: `(x y . rest)` → (["x", "y"], Some("rest"))
 pub(crate) fn parse_params(values: &[Spanned], context: &str, span: Span) -> Result<(Vec<String>, Option<String>), EvalError> {
-    // Look for dot
-    let dot_pos = values.iter().position(|v| matches!(&v.val, Value::Symbol(s) if s == "."));
-    if let Some(pos) = dot_pos {
-        if pos + 1 != values.len() - 1 {
-            return Err(EvalError::Parse(format!("{context}: malformed dot parameter list"), span));
+    let params: Result<Vec<String>, _> = values
+        .iter()
+        .map(|v| match &v.val {
+            Value::Symbol(s) => Ok(s.clone()),
+            _ => Err(EvalError::Type(format!("{context}: expected symbol in parameter list"), span)),
+        })
+        .collect();
+    Ok((params?, None))
+}
+
+/// Parse params from a Value that may be a List, Pair chain, or bare Symbol.
+pub(crate) fn parse_params_from_value(val: &Value, context: &str, span: Span) -> Result<(Vec<String>, Option<String>), EvalError> {
+    match val {
+        Value::List(items) => parse_params(items, context, span),
+        Value::Pair(_) => {
+            let mut params = Vec::new();
+            let mut current = val.clone();
+            loop {
+                match current {
+                    Value::Pair(cell) => {
+                        let (car, cdr) = { let b = cell.borrow(); (b.0.clone(), b.1.clone()) };
+                        match car {
+                            Value::Symbol(s) => params.push(s),
+                            _ => return Err(EvalError::Type(format!("{context}: expected symbol in parameter list"), span)),
+                        }
+                        current = cdr;
+                    }
+                    Value::Symbol(s) => return Ok((params, Some(s))),
+                    Value::List(items) if items.is_empty() => return Ok((params, None)),
+                    _ => return Err(EvalError::Type(format!("{context}: malformed parameter list"), span)),
+                }
+            }
         }
-        let fixed: Result<Vec<String>, _> = values[..pos]
-            .iter()
-            .map(|v| match &v.val {
-                Value::Symbol(s) => Ok(s.clone()),
-                _ => Err(EvalError::Type(format!("{context}: expected symbol in parameter list"), span)),
-            })
-            .collect();
-        let rest = match &values[pos + 1].val {
-            Value::Symbol(s) => s.clone(),
-            _ => return Err(EvalError::Type(format!("{context}: expected symbol after dot"), span)),
-        };
-        Ok((fixed?, Some(rest)))
-    } else {
-        let params: Result<Vec<String>, _> = values
-            .iter()
-            .map(|v| match &v.val {
-                Value::Symbol(s) => Ok(s.clone()),
-                _ => Err(EvalError::Type(format!("{context}: expected symbol in parameter list"), span)),
-            })
-            .collect();
-        Ok((params?, None))
+        Value::Symbol(s) => Ok((vec![], Some(s.clone()))),
+        _ => Err(EvalError::Type(format!("{context}: expected parameter list"), span)),
     }
 }
