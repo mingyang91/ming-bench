@@ -105,6 +105,25 @@ object Evaluator:
           evalAnd(args, env)
         case Expr.SList(Expr.Symbol("or") :: args) =>
           evalOr(args, env)
+        case Expr.SList(
+              Expr.Symbol("define-syntax") :: Expr.Symbol(name) :: Expr.SList(
+                Expr.Symbol("syntax-rules") :: Expr.SList(lits) :: rules
+              ) :: Nil
+            ) =>
+          val literals = lits.map {
+            case Expr.Symbol(n) => n
+            case _              => throw new EvalError("syntax-rules: literals must be identifiers")
+          }.toSet
+          val ruleList = rules.map {
+            case Expr.SList(pat :: tmpl :: Nil) => (pat, tmpl)
+            case _                              => throw new EvalError("syntax-rules: invalid rule")
+          }
+          env.define(name, SchemeVal.Macro(literals, ruleList, env))
+          SchemeVal.Void
+        case Expr.SList(Expr.Symbol(name) :: _) if MacroExpander.isMacro(name, env) =>
+          env.lookup(name) match
+            case m: SchemeVal.Macro => MacroExpander.expandAndEval(expr, name, m, env, eval)
+            case _                  => throw new EvalError(s"$name: expected macro")
         case Expr.SList(head :: args) =>
           applyProc(eval(head, env), args.map(a => eval(a, env)))
     catch

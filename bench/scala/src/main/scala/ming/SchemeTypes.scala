@@ -20,6 +20,7 @@ enum SchemeVal:
   case PairVal(car: SchemeVal, cdr: SchemeVal)
   case Procedure(params: List[String], restParam: Option[String], body: List[Expr], env: Env)
   case BuiltinProc(name: String, fn: List[SchemeVal] => SchemeVal)
+  case Macro(literals: Set[String], rules: List[(Expr, Expr)], defEnv: Env)
   case Void
 
   def display: String = this match
@@ -33,6 +34,7 @@ enum SchemeVal:
     case PairVal(_, _)         => formatPair(_.display)
     case Procedure(_, _, _, _) => "#<procedure>"
     case BuiltinProc(name, _)  => s"#<procedure:$name>"
+    case Macro(_, _, _)        => "#<macro>"
     case Void                  => "#<void>"
 
   /** display format: no quotes on strings */
@@ -79,6 +81,9 @@ class Env(
         parent match
           case Some(p) => p.lookup(name)
           case None    => throw new EvalError(s"unbound variable: $name")
+
+  def lookupOpt(name: String): Option[SchemeVal] =
+    bindings.get(name).orElse(parent.flatMap(_.lookupOpt(name)))
 
   def define(name: String, value: SchemeVal): Unit =
     bindings(name) = value
