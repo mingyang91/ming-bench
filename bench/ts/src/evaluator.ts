@@ -1819,13 +1819,29 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
   const exceptionHandlers: ExHandlerEntry[] = [];
 
   // Deep copy continuation chain (needed for call/cc to snapshot mutable frames)
+  // Iterative to avoid stack overflow on deep continuation chains (e.g. TCO inside guard)
   function copyKont(k: Kont): Kont {
     if (k === null) return null;
-    const rest = copyKont(k.next);
-    if (k.tag === 'ev-args') return { ...k, done: [...k.done], next: rest };
-    if (k.tag === 'do-step') return { ...k, newVals: [...k.newVals], next: rest };
-    if (rest === k.next) return k; // share unchanged frames
-    return { ...k, next: rest } as KontFrame;
+    const frames: (KontFrame | DwFrame)[] = [];
+    let cur: Kont = k;
+    while (cur !== null) { frames.push(cur); cur = cur.next; }
+    let result: Kont = null;
+    let changed = false;
+    for (let i = frames.length - 1; i >= 0; i--) {
+      const f = frames[i];
+      if (f.tag === 'ev-args') {
+        result = { ...f, done: [...f.done], next: result };
+        changed = true;
+      } else if (f.tag === 'do-step') {
+        result = { ...f, newVals: [...f.newVals], next: result };
+        changed = true;
+      } else if (!changed) {
+        result = f; // share unchanged tail
+      } else {
+        result = { ...f, next: result } as KontFrame;
+      }
+    }
+    return result;
   }
 
   // Wind transition: unwind current, rewind target, then resume continuation
@@ -1896,7 +1912,10 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
       return;
     }
     if (func.tag === 'continuation') {
-      invokeContinuation(func.kont, func.windStack, args.length > 0 ? args[0] : { tag: 'void' });
+      const value: SchemeVal = args.length === 0 ? { tag: 'void' }
+        : args.length === 1 ? args[0]
+        : { tag: 'values', values: args };
+      invokeContinuation(func.kont, func.windStack, value);
       return;
     }
     if (func.tag === 'builtin') {
@@ -2228,10 +2247,11 @@ function evalScheme(initExpr: SchemeVal, initEnv: Env): SchemeVal {
                   const varName = clauseForm.elements[0].value;
                   const clauses = clauseForm.elements.slice(1);
                   const body = elems.slice(2);
-                  // Capture guard's continuation and wind stack
-                  const guardKont = copyKont(kont);
+                  // Capture guard's continuation and wind stack (no deep copy needed;
+                  // guard's saved kont is only used once on exception, not shared like call/cc)
+                  const guardKont: Kont = kont;
                   const guardWindStack = [...windStack];
-                  const entry = new ExHandlerEntry('guard', undefined, guardKont, guardWindStack, clauses, varName, env);
+                  const entry: ExHandlerEntry = new ExHandlerEntry('guard', undefined, guardKont, guardWindStack, clauses, varName, env);
                   exceptionHandlers.push(entry);
                   kont = { tag: 'handler-pop', entry, next: kont };
                   if (body.length > 1) kont = { tag: 'seq', exprs: body, idx: 1, env, next: kont };
