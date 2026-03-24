@@ -74,6 +74,10 @@ public class Evaluator {
     record GuardHandler(String var, List<?> clauseList, Environment env) {}
     private final List<GuardHandler> guardHandlerStack = new ArrayList<>();
 
+    // Step-limited evaluation support
+    private int stepCounter = 0;
+    private int stepLimit = -1; // -1 means unlimited
+
     private EvalError error(String msg) {
         return new EvalError(currentLine + ":" + currentCol + " " + msg);
     }
@@ -149,6 +153,17 @@ public class Evaluator {
             throw new EvalError("1:1 no expression");
         }
         return new EvalResult(schemeToString(lastResult), output);
+    }
+
+    public String evalStrWithLimit(String input, int maxSteps) throws EvalError {
+        stepCounter = 0;
+        stepLimit = maxSteps;
+        try {
+            return evalStr(input);
+        } finally {
+            stepLimit = -1;
+            stepCounter = 0;
+        }
     }
 
     // --- Tokenizer ---
@@ -563,6 +578,12 @@ public class Evaluator {
         try {
         while (true) {  // trampoline loop for TCO
         try {
+        // Step-limited evaluation check
+        if (stepLimit >= 0) {
+            if (++stepCounter > stepLimit) {
+                throw new EvalError("step limit exceeded");
+            }
+        }
         if (expr instanceof Located loc) {
             currentLine = loc.line();
             currentCol = loc.col();
