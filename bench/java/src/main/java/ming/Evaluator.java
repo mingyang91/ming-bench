@@ -57,6 +57,9 @@ public class Evaluator {
     // Internal string wrapper to distinguish from symbols
     record SchemeString(String value) {}
 
+    // Character wrapper
+    record SchemeChar(char value) {}
+
     // Cons pair
     record Pair(Object car, Object cdr) {}
 
@@ -69,6 +72,9 @@ public class Evaluator {
     private static final Object VOID = new Object() {
         @Override public String toString() { return "#<void>"; }
     };
+
+    // Output buffer for display/write/newline
+    private StringBuilder outputBuffer = new StringBuilder();
 
     public String evalStr(String input) throws EvalError {
         currentPos = new Pos(1, 1);
@@ -90,13 +96,30 @@ public class Evaluator {
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        throw new EvalError("not implemented");
+        currentPos = new Pos(1, 1);
+        outputBuffer = new StringBuilder();
+        List<Object> tokens = tokenize(input);
+        int[] pos = {0};
+        Env env = makeTopLevelEnv();
+        Object lastResult = null;
+        while (pos[0] < tokens.size()) {
+            Object expr = parse(tokens, pos);
+            lastResult = eval(expr, env);
+        }
+        String output = outputBuffer.toString();
+        String result = (lastResult == null || lastResult == VOID) ? null : schemeToString(lastResult);
+        return new EvalResult(result, output);
     }
 
     private static final String[] BUILTIN_NAMES = {
         "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
         "cons", "car", "cdr", "null?", "list", "length", "append",
-        "string?", "number?", "boolean?", "pair?", "symbol?"
+        "string?", "number?", "boolean?", "pair?", "symbol?",
+        "display", "write", "newline",
+        "string-append", "string-length", "substring",
+        "string->number", "number->string",
+        "symbol->string", "string->symbol",
+        "string-ref", "char?"
     };
 
     private Env makeTopLevelEnv() {
@@ -600,6 +623,74 @@ public class Evaluator {
                 requireArgCount(op, args, 1);
                 return args.get(0) instanceof String;
             }
+            case "char?" -> {
+                requireArgCount(op, args, 1);
+                return args.get(0) instanceof SchemeChar;
+            }
+            case "display" -> {
+                requireArgCount(op, args, 1);
+                outputBuffer.append(displayString(args.get(0)));
+                return VOID;
+            }
+            case "write" -> {
+                requireArgCount(op, args, 1);
+                outputBuffer.append(schemeToString(args.get(0)));
+                return VOID;
+            }
+            case "newline" -> {
+                requireArgCount(op, args, 0);
+                outputBuffer.append('\n');
+                return VOID;
+            }
+            case "string-append" -> {
+                StringBuilder sb = new StringBuilder();
+                for (Object a : args) {
+                    if (!(a instanceof SchemeString s)) throw new EvalError(posStr() + "string-append: not a string");
+                    sb.append(s.value());
+                }
+                return new SchemeString(sb.toString());
+            }
+            case "string-length" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError(posStr() + "string-length: not a string");
+                return (long) s.value().length();
+            }
+            case "substring" -> {
+                requireArgCount(op, args, 3);
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError(posStr() + "substring: not a string");
+                int start = (int) requireLong(args.get(1));
+                int end = (int) requireLong(args.get(2));
+                return new SchemeString(s.value().substring(start, end));
+            }
+            case "string->number" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError(posStr() + "string->number: not a string");
+                try {
+                    return Long.parseLong(s.value());
+                } catch (NumberFormatException e) {
+                    return Boolean.FALSE;
+                }
+            }
+            case "number->string" -> {
+                requireArgCount(op, args, 1);
+                return new SchemeString(String.valueOf(requireLong(args.get(0))));
+            }
+            case "symbol->string" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof String sym)) throw new EvalError(posStr() + "symbol->string: not a symbol");
+                return new SchemeString(sym);
+            }
+            case "string->symbol" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError(posStr() + "string->symbol: not a string");
+                return s.value();
+            }
+            case "string-ref" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError(posStr() + "string-ref: not a string");
+                int idx = (int) requireLong(args.get(1));
+                return new SchemeChar(s.value().charAt(idx));
+            }
             default -> throw new EvalError(posStr() + "unbound variable: " + op);
         }
     }
@@ -635,10 +726,16 @@ public class Evaluator {
         }
     }
 
+    private String displayString(Object val) {
+        if (val instanceof SchemeString s) return s.value();
+        return schemeToString(val);
+    }
+
     private String schemeToString(Object val) {
         if (val instanceof Long l) return l.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
+        if (val instanceof SchemeChar c) return "#\\" + c.value();
         if (val == NIL) return "()";
         if (val instanceof Pair) {
             StringBuilder sb = new StringBuilder("(");
