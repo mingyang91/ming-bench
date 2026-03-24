@@ -46,9 +46,17 @@ type Value struct {
 	// record fields
 	recordTag    *recordType
 	recordFields []*Value
+	// case-lambda clauses
+	caseClauses []caseClause
 	// native Go function
 	goFunc func([]*Value) (*Value, error)
 	goName string // name for display
+}
+
+type caseClause struct {
+	params    []string
+	restParam string
+	body      []*astNode
 }
 
 type recordType struct {
@@ -735,6 +743,8 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 			return quoteNode(node.children[1]), nil
 		case "lambda":
 			return evalLambda(node, e)
+		case "case-lambda":
+			return evalCaseLambda(node, e)
 		case "let":
 			return evalLet(node, e, ip)
 		case "begin":
@@ -951,6 +961,24 @@ func evalLambda(node *astNode, e *env) (*Value, error) {
 	return &Value{typ: valLambda, params: params, restParam: restParam, body: node.children[2:], closure: e}, nil
 }
 
+func evalCaseLambda(node *astNode, e *env) (*Value, error) {
+	if len(node.children) < 2 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: bad syntax", node.line, node.col)}
+	}
+	var clauses []caseClause
+	for _, clause := range node.children[1:] {
+		if clause.isAtom || len(clause.children) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: bad clause", node.line, node.col)}
+		}
+		params, restParam, err := parseLambdaParams(clause.children[0])
+		if err != nil {
+			return nil, err
+		}
+		clauses = append(clauses, caseClause{params: params, restParam: restParam, body: clause.children[1:]})
+	}
+	return &Value{typ: valLambda, caseClauses: clauses, closure: e}, nil
+}
+
 func evalLet(node *astNode, e *env, ip *interp) (*Value, error) {
 	if len(node.children) < 3 {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", node.line, node.col)}
@@ -1133,6 +1161,41 @@ func requireNums(args []*Value, name string, node *astNode) error {
 }
 
 func applyLambda(op *Value, args []*Value, node *astNode, ip *interp) (*Value, error) {
+	// case-lambda: dispatch to matching clause
+	if op.caseClauses != nil {
+		for _, cl := range op.caseClauses {
+			if cl.restParam != "" {
+				if len(args) < len(cl.params) {
+					continue
+				}
+			} else {
+				if len(args) != len(cl.params) {
+					continue
+				}
+			}
+			localEnv := newEnv(op.closure)
+			for i, param := range cl.params {
+				localEnv.set(param, args[i])
+			}
+			if cl.restParam != "" {
+				rest := nilVal()
+				for i := len(args) - 1; i >= len(cl.params); i-- {
+					rest = &Value{typ: valPair, car: args[i], cdr: rest}
+				}
+				localEnv.set(cl.restParam, rest)
+			}
+			var result *Value
+			for _, bodyExpr := range cl.body {
+				var err error
+				result, err = eval(bodyExpr, localEnv, ip)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: no matching clause for %d arguments", node.line, node.col, len(args))}
+	}
 	if op.restParam != "" {
 		// Has rest parameter
 		if len(args) < len(op.params) {
@@ -1396,6 +1459,12 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char?: need 1 argument", node.line, node.col)}
 		}
 		return boolVal(args[0].typ == valChar), nil
+
+	case "procedure?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: procedure?: need 1 argument", node.line, node.col)}
+		}
+		return boolVal(args[0].typ == valLambda || args[0].typ == valGoFunc), nil
 
 	case "display":
 		if len(args) != 1 {
@@ -2026,7 +2095,7 @@ func makeGlobalEnv() *env {
 	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
 		"cons", "car", "cdr", "null?", "list", "length",
 		"number?", "string?", "boolean?", "pair?", "symbol?", "char?",
-		"integer?", "rational?",
+		"integer?", "rational?", "procedure?",
 		"append",
 		"display", "write", "newline",
 		"string-append", "string-length", "substring",
