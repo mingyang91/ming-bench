@@ -5,6 +5,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 )
 
@@ -26,6 +27,7 @@ const (
 	valMacro
 	valRational
 	valFloat
+	valRecord
 )
 
 type pair struct {
@@ -52,6 +54,15 @@ type macro struct {
 	defEnv   *env // definition-site environment for hygiene
 }
 
+type recordType struct {
+	name string
+}
+
+type record struct {
+	rtype  *recordType
+	fields []value
+}
+
 type value struct {
 	kind   valueKind
 	ival   int64
@@ -65,6 +76,7 @@ type value struct {
 	lambda *lambda
 	macro  *macro
 	mstr   *[]rune // mutable string buffer (set by string-copy)
+	rec    *record
 }
 
 var voidVal = value{kind: valVoid}
@@ -189,6 +201,8 @@ func (v value) String() string {
 			s += ".0"
 		}
 		return s
+	case valRecord:
+		return fmt.Sprintf("#<record:%s>", v.rec.rtype.name)
 	case valLambda:
 		return "#<procedure>"
 	case valBuiltin:
@@ -616,6 +630,8 @@ func evalInEnv(e *expr, env *env) (value, error) {
 			return evalCond(e, env)
 		case "define-syntax":
 			return evalDefineSyntax(e, env)
+		case "define-record-type":
+			return evalDefineRecordType(e, env)
 		}
 	}
 
@@ -655,6 +671,12 @@ func callValue(op value, args []value, callExpr *expr, environ *env) (value, err
 	case valLambda:
 		return callLambda(op.lambda, args, callExpr)
 	case valBuiltin:
+		if op.sval == "__native" {
+			nativeFuncsMu.Lock()
+			fn := nativeFuncs[int(op.ival)]
+			nativeFuncsMu.Unlock()
+			return fn(args)
+		}
 		if op.sval == "apply" {
 			return evalApply(args, callExpr, environ)
 		}
@@ -2146,9 +2168,144 @@ func collectTemplateIdents(tmpl *expr, patVars map[string]bool, renames map[stri
 	}
 }
 
+// ---------- define-record-type ----------
+
+func evalDefineRecordType(e *expr, environ *env) (value, error) {
+	// (define-record-type <name> (constructor field-name ...) predicate (field-name accessor) ...)
+	if len(e.list) < 4 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: bad syntax", e.line, e.col)}
+	}
+
+	// 1. Type name
+	nameExpr := e.list[1]
+	if nameExpr.kind != exprAtom || nameExpr.atom.kind != valSymbol {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: expected type name", e.line, e.col)}
+	}
+	rt := &recordType{name: nameExpr.atom.sval}
+
+	// 2. Constructor: (constructor-name field-name ...)
+	ctorExpr := e.list[2]
+	if ctorExpr.kind != exprList || len(ctorExpr.list) < 1 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: expected constructor", e.line, e.col)}
+	}
+	if ctorExpr.list[0].kind != exprAtom || ctorExpr.list[0].atom.kind != valSymbol {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: expected constructor name", e.line, e.col)}
+	}
+	ctorName := ctorExpr.list[0].atom.sval
+	ctorFields := make([]string, len(ctorExpr.list)-1)
+	for i := 1; i < len(ctorExpr.list); i++ {
+		if ctorExpr.list[i].kind != exprAtom || ctorExpr.list[i].atom.kind != valSymbol {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: expected field name", e.line, e.col)}
+		}
+		ctorFields[i-1] = ctorExpr.list[i].atom.sval
+	}
+
+	// 3. Predicate
+	predExpr := e.list[3]
+	if predExpr.kind != exprAtom || predExpr.atom.kind != valSymbol {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: expected predicate name", e.line, e.col)}
+	}
+	predName := predExpr.atom.sval
+
+	// 4. Field specs: (field-name accessor)
+	// Build mapping from field name to index based on constructor field order
+	fieldIndex := make(map[string]int)
+	for i, f := range ctorFields {
+		fieldIndex[f] = i
+	}
+
+	// Define constructor as a builtin lambda
+	numFields := len(ctorFields)
+	capturedRT := rt
+	environ.set(ctorName, value{kind: valBuiltin, sval: "__record-ctor-" + ctorName})
+
+	// We'll use lambda closures instead of builtins for cleaner implementation
+	// Constructor
+	ctorParams := make([]string, numFields)
+	copy(ctorParams, ctorFields)
+	environ.set(ctorName, makeLambdaVal(func(args []value) (value, error) {
+		if len(args) != numFields {
+			return value{}, &EvalError{Message: fmt.Sprintf("%s: expected %d arguments, got %d", ctorName, numFields, len(args))}
+		}
+		fields := make([]value, numFields)
+		copy(fields, args)
+		return value{kind: valRecord, rec: &record{rtype: capturedRT, fields: fields}}, nil
+	}))
+
+	// Predicate
+	environ.set(predName, makeLambdaVal(func(args []value) (value, error) {
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%s: expected 1 argument", predName)}
+		}
+		return boolVal(args[0].kind == valRecord && args[0].rec.rtype == capturedRT), nil
+	}))
+
+	// Field accessors
+	for i := 4; i < len(e.list); i++ {
+		fieldSpec := e.list[i]
+		if fieldSpec.kind != exprList || len(fieldSpec.list) < 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: bad field spec", e.line, e.col)}
+		}
+		fieldNameExpr := fieldSpec.list[0]
+		accessorExpr := fieldSpec.list[1]
+		if fieldNameExpr.kind != exprAtom || fieldNameExpr.atom.kind != valSymbol {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: expected field name", e.line, e.col)}
+		}
+		if accessorExpr.kind != exprAtom || accessorExpr.atom.kind != valSymbol {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: expected accessor name", e.line, e.col)}
+		}
+		fname := fieldNameExpr.atom.sval
+		accName := accessorExpr.atom.sval
+		idx, ok := fieldIndex[fname]
+		if !ok {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: unknown field %s", e.line, e.col, fname)}
+		}
+		capturedIdx := idx
+		capturedAccName := accName
+		environ.set(accName, makeLambdaVal(func(args []value) (value, error) {
+			if len(args) != 1 {
+				return value{}, &EvalError{Message: fmt.Sprintf("%s: expected 1 argument", capturedAccName)}
+			}
+			if args[0].kind != valRecord || args[0].rec.rtype != capturedRT {
+				return value{}, &EvalError{Message: fmt.Sprintf("%s: not a %s record", capturedAccName, capturedRT.name)}
+			}
+			return args[0].rec.fields[capturedIdx], nil
+		}))
+	}
+
+	return voidVal, nil
+}
+
+// nativeFunc wraps a Go function as a callable value.
+type nativeFunc struct {
+	fn func([]value) (value, error)
+}
+
+var valNative valueKind = -1 // sentinel, not used
+
+func makeLambdaVal(fn func([]value) (value, error)) value {
+	// We store native functions as builtins with a special wrapper
+	v := value{kind: valBuiltin, sval: "__native"}
+	// Store the function pointer via a closure-based approach using lambda
+	// Actually, let's use a different approach - store in a global registry
+	nativeFuncsMu.Lock()
+	id := nativeFuncCounter
+	nativeFuncCounter++
+	nativeFuncs[id] = fn
+	nativeFuncsMu.Unlock()
+	v.ival = int64(id)
+	return v
+}
+
+var (
+	nativeFuncs    = make(map[int]func([]value) (value, error))
+	nativeFuncCounter int
+	nativeFuncsMu  sync.Mutex
+)
+
 func isSpecialForm(name string) bool {
 	switch name {
-	case "define", "set!", "if", "quote", "lambda", "and", "or", "let", "begin", "cond", "define-syntax":
+	case "define", "set!", "if", "quote", "lambda", "and", "or", "let", "begin", "cond", "define-syntax", "define-record-type":
 		return true
 	}
 	return false
