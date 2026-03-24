@@ -237,9 +237,24 @@ func DisplayString(v Value) string {
 		return string(val.Val)
 	case *PairVal:
 		return displayPair(val)
+	case *VectorVal:
+		return displayVector(val)
 	default:
 		return v.String()
 	}
+}
+
+func displayVector(v *VectorVal) string {
+	var buf strings.Builder
+	buf.WriteString("#(")
+	for i, e := range v.Elems {
+		if i > 0 {
+			buf.WriteByte(' ')
+		}
+		buf.WriteString(DisplayString(e))
+	}
+	buf.WriteByte(')')
+	return buf.String()
 }
 
 func displayPair(v *PairVal) string {
@@ -281,6 +296,24 @@ type RecordVal struct {
 
 func (v *RecordVal) String() string {
 	return fmt.Sprintf("#<%s>", v.Type.Name)
+}
+
+// VectorVal represents a Scheme vector (fixed-size mutable array).
+type VectorVal struct {
+	Elems []Value
+}
+
+func (v *VectorVal) String() string {
+	var buf strings.Builder
+	buf.WriteString("#(")
+	for i, e := range v.Elems {
+		if i > 0 {
+			buf.WriteByte(' ')
+		}
+		buf.WriteString(e.String())
+	}
+	buf.WriteByte(')')
+	return buf.String()
 }
 
 // isTruthy returns true for all values except #f.
