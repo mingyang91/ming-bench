@@ -185,11 +185,14 @@ fn make_hygiene_env(base: &Env, bindings: &[(String, Value)]) -> Env {
     if bindings.is_empty() {
         return base.clone();
     }
-    let hyg_env = new_env(Some(base.clone()));
+    // Inject hygiene bindings directly into the base env so that
+    // macro-expanded `define` forms define in the caller's scope,
+    // not in a throwaway child scope.  Gensym names are unique so
+    // there is no collision risk.
     for (name, val) in bindings {
-        env_set(&hyg_env, name.clone(), val.clone());
+        env_set(base, name.clone(), val.clone());
     }
-    hyg_env
+    base.clone()
 }
 
 pub(super) fn env_get(env: &Env, name: &str) -> Option<Value> {
@@ -1152,13 +1155,12 @@ fn cek_invoke(func: Value, args: Vec<Value>, pos: Pos, kont: Kont, wind_stack: &
         }
 
         Value::Continuation(k, saved_ws) => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!(
-                    "{pos}: continuation expects 1 argument, got {}",
-                    args.len()
-                )));
-            }
-            let val = args.into_iter().next().expect("arity checked above");
+            // R7RS: continuations accept 0, 1, or multiple values.
+            let val = match args.len() {
+                0 => Value::Void,
+                1 => args.into_iter().next().expect("length checked"),
+                _ => Value::Values(args),
+            };
             // Do winding: unwind current, rewind to saved
             let current_ws = wind_stack.clone();
             let common = common_prefix_len(&current_ws, saved_ws);
