@@ -98,10 +98,9 @@ object Evaluator:
           case Some(MacroTransformer(expand)) =>
             eval(expand(p), env)
           case _ =>
-            val func = eval(Symbol(name), env)
-            val argList = toList(p match
-              case Pair(_, a) => a;
-              case _          => Nil).map(a => eval(a, env))
+            val func           = eval(Symbol(name), env)
+            val Pair(_, pArgs) = p: @unchecked
+            val argList        = toList(pArgs).map(a => eval(a, env))
             applyFunc(func, argList)
       case Pair(head, args) =>
         val func    = eval(head, env)

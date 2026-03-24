@@ -69,8 +69,7 @@ object StringBuiltins:
     // --- String mutation (L6) / immutability (L15) ---
     "string-set!" -> Builtin {
       case List(Str(chars), Num(i), SchemeChar(c)) =>
-        if !Evaluator.mutableStrings.contains(chars) then
-          throw new EvalError("string-set!: strings are immutable")
+        if !Evaluator.mutableStrings.contains(chars) then throw new EvalError("string-set!: strings are immutable")
         chars(i.toInt) = c
         Void
       case _ => throw new EvalError("string-set! requires a string, an integer, and a character")
@@ -144,17 +143,17 @@ object StringBuiltins:
       case List(lst) =>
         val chars = Evaluator.toList(lst).map {
           case SchemeChar(c) => c
-          case v => throw new EvalError(s"list->string: not a character: ${Display.write(v)}")
+          case v             => throw new EvalError(s"list->string: not a character: ${Display.write(v)}")
         }
         Evaluator.mkStr(new String(chars.toArray))
       case _ => throw new EvalError("list->string requires 1 argument")
     },
     "char->integer" -> Builtin {
       case List(SchemeChar(c)) => Num(c.toLong)
-      case _ => throw new EvalError("char->integer requires 1 character argument")
+      case _                   => throw new EvalError("char->integer requires 1 character argument")
     },
     "integer->char" -> Builtin {
       case List(Num(n)) => SchemeChar(n.toChar)
-      case _ => throw new EvalError("integer->char requires 1 integer argument")
+      case _            => throw new EvalError("integer->char requires 1 integer argument")
     }
   )
