@@ -17,7 +17,8 @@ type SchemeValBase =
   | { tag: 'procedure'; value: (...args: SchemeVal[]) => SchemeVal }
   | { tag: 'void' }
   | { tag: 'macro'; literals: string[]; rules: { pattern: SchemeVal; template: SchemeVal }[]; defEnv: Env }
-  | { tag: 'record'; typeName: string; typeId: symbol; fields: Map<string, SchemeVal> };
+  | { tag: 'record'; typeName: string; typeId: symbol; fields: Map<string, SchemeVal> }
+  | { tag: 'vector'; value: SchemeVal[] };
 
 type SchemeVal = SchemeValBase & { pos?: Pos };
 
@@ -289,6 +290,7 @@ function displayVal(val: SchemeVal): string {
     case 'macro': return '#<macro>';
     case 'list': return `(${val.value.map(displayVal).join(' ')})`;
     case 'record': return `#<record:${val.typeName}>`;
+    case 'vector': return `#(${val.value.map(displayVal).join(' ')})`;
   }
 }
 
@@ -301,8 +303,20 @@ function writeVal(val: SchemeVal): string {
       if (val.value === '\t') return '#\\tab';
       return `#\\${val.value}`;
     }
+    case 'vector': return `#(${val.value.map(writeVal).join(' ')})`;
     default: return displayVal(val);
   }
+}
+
+function schemeEqv(a: SchemeVal, b: SchemeVal): boolean {
+  if (a.tag !== b.tag) return false;
+  if (a.tag === 'nil') return true;
+  if (a.tag === 'number' && b.tag === 'number') return a.value === b.value;
+  if (a.tag === 'rational' && b.tag === 'rational') return a.num === b.num && a.den === b.den;
+  if (a.tag === 'boolean' && b.tag === 'boolean') return a.value === b.value;
+  if (a.tag === 'symbol' && b.tag === 'symbol') return a.value === b.value;
+  if (a.tag === 'char' && b.tag === 'char') return a.value === b.value;
+  return a === b;
 }
 
 function makeGlobalEnv(outputBuf?: string[]): Env {
@@ -596,6 +610,7 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
     const [a, b] = args;
     if (a.tag !== b.tag) return { tag: 'boolean', value: false };
     if (a.tag === 'nil') return { tag: 'boolean', value: true };
+    if (a.tag === 'void') return { tag: 'boolean', value: true };
     if (a.tag === 'number' && b.tag === 'number') return { tag: 'boolean', value: a.value === b.value };
     if (a.tag === 'rational' && b.tag === 'rational') return { tag: 'boolean', value: a.num === b.num && a.den === b.den };
     if (a.tag === 'boolean' && b.tag === 'boolean') return { tag: 'boolean', value: a.value === b.value };
@@ -615,12 +630,89 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
     if (a.tag === 'char' && b.tag === 'char') return a.value === b.value;
     if (a.tag === 'string' && b.tag === 'string') return strContent(a) === strContent(b as SchemeVal & { tag: 'string' });
     if (a.tag === 'pair' && b.tag === 'pair') return schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr);
+    if (a.tag === 'vector' && b.tag === 'vector') {
+      if (a.value.length !== b.value.length) return false;
+      for (let i = 0; i < a.value.length; i++) {
+        if (!schemeEqual(a.value[i], b.value[i])) return false;
+      }
+      return true;
+    }
     return a === b;
   };
 
   env.set('equal?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
     if (args.length !== 2) throw new EvalError('equal? requires exactly 2 arguments');
     return { tag: 'boolean', value: schemeEqual(args[0], args[1]) };
+  }});
+
+  // eqv? (like eq? but compares numbers/chars by value)
+  env.set('eqv?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 2) throw new EvalError('eqv? requires exactly 2 arguments');
+    const [a, b] = args;
+    if (a.tag !== b.tag) return { tag: 'boolean', value: false };
+    if (a.tag === 'nil') return { tag: 'boolean', value: true };
+    if (a.tag === 'number' && b.tag === 'number') return { tag: 'boolean', value: a.value === b.value };
+    if (a.tag === 'rational' && b.tag === 'rational') return { tag: 'boolean', value: a.num === b.num && a.den === b.den };
+    if (a.tag === 'boolean' && b.tag === 'boolean') return { tag: 'boolean', value: a.value === b.value };
+    if (a.tag === 'symbol' && b.tag === 'symbol') return { tag: 'boolean', value: a.value === b.value };
+    if (a.tag === 'char' && b.tag === 'char') return { tag: 'boolean', value: a.value === b.value };
+    return { tag: 'boolean', value: a === b };
+  }});
+
+  // Vector builtins
+  env.set('vector', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    return { tag: 'vector', value: [...args] };
+  }});
+
+  env.set('make-vector', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length < 1 || args[0].tag !== 'number') throw new EvalError('make-vector: expected number');
+    const size = args[0].value;
+    const fill: SchemeVal = args.length > 1 ? args[1] : { tag: 'number', value: 0 };
+    return { tag: 'vector', value: Array(size).fill(null).map(() => fill) };
+  }});
+
+  env.set('vector-ref', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 2 || args[0].tag !== 'vector' || args[1].tag !== 'number')
+      throw new EvalError('vector-ref: expected vector and number');
+    const idx = args[1].value;
+    if (idx < 0 || idx >= args[0].value.length) throw new EvalError('vector-ref: index out of range');
+    return args[0].value[idx];
+  }});
+
+  env.set('vector-set!', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 3 || args[0].tag !== 'vector' || args[1].tag !== 'number')
+      throw new EvalError('vector-set!: expected vector, number, value');
+    const idx = args[1].value;
+    if (idx < 0 || idx >= args[0].value.length) throw new EvalError('vector-set!: index out of range');
+    args[0].value[idx] = args[2];
+    return { tag: 'void' };
+  }});
+
+  env.set('vector-length', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'vector') throw new EvalError('vector-length: expected vector');
+    return { tag: 'number', value: args[0].value.length };
+  }});
+
+  env.set('vector?', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1) throw new EvalError('vector? requires exactly 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'vector' };
+  }});
+
+  env.set('vector->list', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1 || args[0].tag !== 'vector') throw new EvalError('vector->list: expected vector');
+    let result: SchemeVal = NIL;
+    for (let i = args[0].value.length - 1; i >= 0; i--) {
+      result = { tag: 'pair', car: args[0].value[i], cdr: result };
+    }
+    return result;
+  }});
+
+  env.set('list->vector', { tag: 'procedure', value: (...args: SchemeVal[]) => {
+    if (args.length !== 1) throw new EvalError('list->vector: expected list');
+    const elems: SchemeVal[] = [];
+    let cur = args[0];
+    while (cur.tag === 'pair') { elems.push(cur.car); cur = cur.cdr; }
+    return { tag: 'vector', value: elems };
   }});
 
   // map (supports multiple lists)
@@ -945,7 +1037,7 @@ function gensym(base: string): string {
 
 const SPECIAL_FORMS = new Set([
   'define', 'set!', 'if', 'quote', 'lambda', 'case-lambda', 'and', 'or', 'begin',
-  'let', 'cond', 'define-syntax', 'syntax-rules', 'define-record-type',
+  'let', 'letrec', 'letrec*', 'cond', 'case', 'do', 'define-syntax', 'syntax-rules', 'define-record-type',
 ]);
 
 interface PatternBindings {
@@ -1189,6 +1281,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
     case 'boolean':
     case 'string':
     case 'char':
+    case 'vector':
       return expr;
 
     case 'symbol': {
@@ -1429,6 +1522,130 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
               }
             }
             return { tag: 'void' };
+          }
+          case 'letrec': {
+            if (elems.length < 3) throw errAt('letrec requires bindings and body', expr.pos);
+            const bindings = elems[1];
+            if (bindings.tag !== 'list') throw errAt('letrec bindings must be a list', expr.pos);
+            const childEnv = new Env(env);
+            // First, bind all variables to undefined
+            const names: string[] = [];
+            for (const binding of bindings.value) {
+              if (binding.tag !== 'list' || binding.value.length !== 2)
+                throw errAt('invalid letrec binding', binding.pos);
+              if (binding.value[0].tag !== 'symbol') throw errAt('letrec binding name must be a symbol', binding.pos);
+              names.push(binding.value[0].value);
+              childEnv.set(binding.value[0].value, { tag: 'void' });
+            }
+            // Then evaluate inits in the child env and update
+            for (let i = 0; i < bindings.value.length; i++) {
+              const binding = bindings.value[i];
+              const val = evaluate((binding as any).value[1], childEnv);
+              childEnv.set(names[i], val);
+            }
+            let result: SchemeVal = { tag: 'void' };
+            for (let i = 2; i < elems.length; i++) {
+              result = evaluate(elems[i], childEnv);
+            }
+            return result;
+          }
+          case 'letrec*': {
+            if (elems.length < 3) throw errAt('letrec* requires bindings and body', expr.pos);
+            const bindings = elems[1];
+            if (bindings.tag !== 'list') throw errAt('letrec* bindings must be a list', expr.pos);
+            const childEnv = new Env(env);
+            for (const binding of bindings.value) {
+              if (binding.tag !== 'list' || binding.value.length !== 2)
+                throw errAt('invalid letrec* binding', binding.pos);
+              if (binding.value[0].tag !== 'symbol') throw errAt('letrec* binding name must be a symbol', binding.pos);
+              const val = evaluate(binding.value[1], childEnv);
+              childEnv.set(binding.value[0].value, val);
+            }
+            let result: SchemeVal = { tag: 'void' };
+            for (let i = 2; i < elems.length; i++) {
+              result = evaluate(elems[i], childEnv);
+            }
+            return result;
+          }
+          case 'case': {
+            if (elems.length < 2) throw errAt('case requires at least a key', expr.pos);
+            const key = evaluate(elems[1], env);
+            for (let i = 2; i < elems.length; i++) {
+              const clause = elems[i];
+              if (clause.tag !== 'list' || clause.value.length < 2)
+                throw errAt('invalid case clause', clause.pos);
+              const datums = clause.value[0];
+              if (datums.tag === 'symbol' && datums.value === 'else') {
+                let result: SchemeVal = { tag: 'void' };
+                for (let j = 1; j < clause.value.length; j++) {
+                  result = evaluate(clause.value[j], env);
+                }
+                return result;
+              }
+              if (datums.tag !== 'list') throw errAt('case clause datums must be a list', clause.pos);
+              let matched = false;
+              for (const datum of datums.value) {
+                const d = listToConsPairs(datum);
+                if (schemeEqv(key, d)) { matched = true; break; }
+              }
+              if (matched) {
+                let result: SchemeVal = { tag: 'void' };
+                for (let j = 1; j < clause.value.length; j++) {
+                  result = evaluate(clause.value[j], env);
+                }
+                return result;
+              }
+            }
+            return { tag: 'void' };
+          }
+          case 'do': {
+            // (do ((var init step) ...) (test expr ...) body ...)
+            if (elems.length < 3) throw errAt('do requires bindings and test', expr.pos);
+            const bindingsForm = elems[1];
+            const testForm = elems[2];
+            if (bindingsForm.tag !== 'list') throw errAt('do bindings must be a list', expr.pos);
+            if (testForm.tag !== 'list' || testForm.value.length < 1)
+              throw errAt('do test must be a list', expr.pos);
+
+            const vars: { name: string; step: SchemeVal | null }[] = [];
+            const childEnv = new Env(env);
+
+            for (const binding of bindingsForm.value) {
+              if (binding.tag !== 'list' || binding.value.length < 2)
+                throw errAt('invalid do binding', binding.pos);
+              if (binding.value[0].tag !== 'symbol') throw errAt('do variable must be a symbol', binding.pos);
+              const name = binding.value[0].value;
+              const init = evaluate(binding.value[1], env);
+              const step = binding.value.length > 2 ? binding.value[2] : null;
+              vars.push({ name, step });
+              childEnv.set(name, init);
+            }
+
+            // Iteration loop
+            while (true) {
+              // Test
+              const testVal = evaluate(testForm.value[0], childEnv);
+              if (!isFalsy(testVal)) {
+                // Test is true — evaluate result expressions
+                if (testForm.value.length === 1) return { tag: 'void' };
+                let result: SchemeVal = { tag: 'void' };
+                for (let i = 1; i < testForm.value.length; i++) {
+                  result = evaluate(testForm.value[i], childEnv);
+                }
+                return result;
+              }
+              // Execute body
+              for (let i = 3; i < elems.length; i++) {
+                evaluate(elems[i], childEnv);
+              }
+              // Parallel step: evaluate all steps with current values, then update
+              const newVals: (SchemeVal | null)[] = vars.map(v =>
+                v.step ? evaluate(v.step, childEnv) : null
+              );
+              for (let i = 0; i < vars.length; i++) {
+                if (newVals[i] !== null) childEnv.set(vars[i].name, newVals[i]!);
+              }
+            }
           }
           case 'define-syntax': {
             if (elems.length !== 3) throw errAt('define-syntax requires 2 arguments', expr.pos);
