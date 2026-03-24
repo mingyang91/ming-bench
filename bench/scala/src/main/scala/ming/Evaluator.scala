@@ -13,6 +13,9 @@ object Evaluator:
   private[ming] val windStack: ThreadLocal[List[WindEntry]]  = ThreadLocal.withInitial(() => Nil)
   private[ming] val inReentry: ThreadLocal[Boolean]          = ThreadLocal.withInitial(() => false)
 
+  private val stepCount: ThreadLocal[Long] = ThreadLocal.withInitial(() => 0L)
+  private val stepLimit: ThreadLocal[Long] = ThreadLocal.withInitial(() => -1L)
+
   private[ming] val activeBodies: ThreadLocal[java.util.Set[List[Expr]]] =
     ThreadLocal.withInitial(() =>
       java.util.Collections.newSetFromMap(
@@ -140,6 +143,11 @@ object Evaluator:
       catch case cr: ContinuationReturn if cr.contId == contId => cr.value
 
   private[ming] def evalInner(expr: Expr, env: Env): SchemeVal =
+    val limit = stepLimit.get()
+    if limit >= 0 then
+      val count = stepCount.get() + 1
+      stepCount.set(count)
+      if count > limit then throw new EvalError("step limit exceeded")
     try
       expr match
         case Expr.IntLit(n)    => SchemeVal.IntVal(n)
@@ -288,6 +296,17 @@ object Evaluator:
     val exprs = Parser.parse(input)
     val env   = Builtins.makeGlobalEnv()
     evalBody(exprs, env).display
+
+  def evalStrWithLimit(input: String, maxSteps: Int): String =
+    stepCount.set(0L)
+    stepLimit.set(maxSteps.toLong)
+    try
+      val exprs = Parser.parse(input)
+      val env   = Builtins.makeGlobalEnv()
+      evalBody(exprs, env).display
+    finally
+      stepLimit.set(-1L)
+      stepCount.set(0L)
 
   def evalStrWithOutput(input: String): (String, String) =
     val buf = outputBuffer.get()

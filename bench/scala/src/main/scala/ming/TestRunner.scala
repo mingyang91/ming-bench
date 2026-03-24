@@ -36,7 +36,7 @@ object TestRunner:
       val json = Files.readString(testsJsonPath)
       Gson().fromJson(json, classOf[JsonArray])
 
-    val results: List[TestResult] =
+    val jsonResults: List[TestResult] =
       testCases.iterator().asScala.toList.flatMap { elem =>
         val tc      = elem.getAsJsonObject
         val name    = tc.get("name").getAsString
@@ -55,6 +55,12 @@ object TestRunner:
           Some(runTest(name, kind, input, tc))
       }
 
+    val l27Results: List[TestResult] =
+      if benchLevel > 0 && benchLevel < 27 then Nil
+      else runL27Tests()
+
+    val results = jsonResults ++ l27Results
+
     results.foreach { r =>
       if r.passed then println(s"PASS ${r.name}")
       else println(s"FAIL ${r.name}: ${r.message}")
@@ -66,6 +72,48 @@ object TestRunner:
     println(s"$passed passed, $failed failed out of $total tests")
 
     if failed > 0 then System.exit(1)
+
+  private def runL27Tests(): List[TestResult] =
+    List(
+      l27Test("l27_step_limit_normal",
+        () => assertEquals("l27_step_limit_normal",
+          Evaluator.evalStrWithLimit("(+ 1 2)", 1000), "3")),
+      l27Test("l27_step_limit_loop_within_budget",
+        () => assertEquals("l27_step_limit_loop_within_budget",
+          Evaluator.evalStrWithLimit("(let loop ((n 50)) (if (= n 0) 'done (loop (- n 1))))", 10000), "done")),
+      l27Test("l27_step_limit_infinite_loop",
+        () => expectError("l27_step_limit_infinite_loop",
+          () => Evaluator.evalStrWithLimit("(let loop () (loop))", 1000))),
+      l27Test("l27_step_limit_exceeded",
+        () => expectError("l27_step_limit_exceeded",
+          () => Evaluator.evalStrWithLimit("(let loop ((n 1000)) (if (= n 0) 'done (loop (- n 1))))", 50))),
+      l27Test("l27_step_limit_factorial",
+        () => assertEquals("l27_step_limit_factorial",
+          Evaluator.evalStrWithLimit("(define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) (fact 10)", 10000), "3628800")),
+      l27Test("l27_normal_eval_unaffected",
+        () => assertEquals("l27_normal_eval_unaffected",
+          Evaluator.evalStr("(let loop ((n 100000)) (if (= n 0) 'done (loop (- n 1))))"), "done")),
+    )
+
+  private def l27Test(name: String, body: () => Unit): TestResult =
+    try
+      body()
+      TestResult(name, passed = true, "")
+    catch
+      case e: Exception =>
+        TestResult(name, passed = false, s"${e.getClass.getSimpleName}: ${e.getMessage}")
+
+  private def assertEquals(testName: String, actual: String, expected: String): Unit =
+    if actual != expected then
+      throw new RuntimeException(s"expected $expected got $actual")
+
+  private def expectError(testName: String, body: () => Any): Unit =
+    try
+      val result = body()
+      throw new RuntimeException(s"expected EvalError but got $result")
+    catch
+      case _: EvalError => () // expected
+      case e: RuntimeException => throw e
 
   private def runTest(
     name: String,
