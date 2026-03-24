@@ -459,6 +459,9 @@ type interp struct {
 	innerBodyCtx *bodyCtx            // innermost let/letrec body context (nil if not in one)
 	// syntax-case support (L22)
 	macroDefEnv *env // definition-site env for current transformer macro expansion
+	// step-limited evaluation (L27)
+	stepLimit int // 0 means unlimited
+	stepCount int
 }
 
 // ---------- Tokenizer ----------
@@ -931,6 +934,12 @@ func (e *env) setMutate(name string, v *Value) bool {
 
 func eval(node *astNode, e *env, ip *interp) (*Value, error) {
 	for {
+		if ip.stepLimit > 0 {
+			ip.stepCount++
+			if ip.stepCount > ip.stepLimit {
+				return nil, &EvalError{Message: "step limit exceeded"}
+			}
+		}
 		if node.isAtom {
 			return evalAtom(node, e)
 		}
@@ -3894,4 +3903,86 @@ func EvalStr(input string) (string, error) {
 // string and any captured output from display/write/newline.
 func EvalStrWithOutput(input string) (result string, output string, err error) {
 	return evalAll(input)
+}
+
+// EvalStrWithLimit evaluates Scheme expressions with a step budget.
+// Each eval dispatch counts as one step. Returns an error if the budget is exhausted.
+func EvalStrWithLimit(input string, maxSteps int) (string, error) {
+	p := newParser(input)
+	nodes, err := p.parseAll()
+	if err != nil {
+		return "", err
+	}
+	if len(nodes) == 0 {
+		return "", &EvalError{Message: "empty input"}
+	}
+
+	e := makeGlobalEnv()
+	ip := &interp{
+		ccOverrides: make(map[*astNode]*Value),
+		topExprs:    nodes,
+		topEnv:      e,
+		stepLimit:   maxSteps,
+	}
+
+	type evalTask struct {
+		isReplay bool
+		replayFn func(v *Value) (*Value, error)
+		value    *Value
+	}
+
+	task := &evalTask{isReplay: false}
+	var last *Value
+
+	for {
+		var ci *contInvoke
+		var evalErr error
+		var sr *schemeRaise
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if c, ok := r.(*contInvoke); ok {
+						ci = c
+						return
+					}
+					if s, ok := r.(*schemeRaise); ok {
+						sr = s
+						return
+					}
+					panic(r)
+				}
+			}()
+			if task.isReplay {
+				last, evalErr = task.replayFn(task.value)
+			} else {
+				for i, node := range nodes {
+					ip.topIdx = i
+					v, err := eval(node, e, ip)
+					if err != nil {
+						evalErr = err
+						return
+					}
+					last = v
+				}
+			}
+		}()
+
+		if evalErr != nil {
+			return "", evalErr
+		}
+		if sr != nil {
+			return "", &EvalError{Message: "unhandled exception: " + sr.value.String()}
+		}
+		if ci == nil {
+			break
+		}
+		task = &evalTask{
+			isReplay: true,
+			replayFn: ci.cont.contCapture.replayFn,
+			value:    ci.value,
+		}
+	}
+
+	return last.String(), nil
 }
