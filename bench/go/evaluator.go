@@ -104,7 +104,12 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 		}
 		switch f := fn.(type) {
 		case *BuiltinFunc:
-			return f.Fn(args)
+			result, ferr := f.Fn(args)
+			if ferr != nil {
+				line, col := e.Elems[0].pos()
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s", line, col, ferr.Error())}
+			}
+			return result, nil
 		case *LambdaVal:
 			if len(args) != len(f.Params) {
 				line, col := e.Elems[0].pos()
