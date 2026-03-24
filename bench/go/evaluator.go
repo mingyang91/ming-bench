@@ -401,6 +401,12 @@ func evalInEnv(e *expr, env *env) (value, error) {
 			return evalAnd(e, env)
 		case "or":
 			return evalOr(e, env)
+		case "let":
+			return evalLet(e, env)
+		case "begin":
+			return evalBegin(e, env)
+		case "cond":
+			return evalCond(e, env)
 		}
 	}
 
@@ -553,7 +559,9 @@ func quoteExpr(e *expr) value {
 
 func isBuiltin(name string) bool {
 	switch name {
-	case "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not":
+	case "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+		"cons", "car", "cdr", "null?", "list", "length", "append",
+		"string?", "number?", "boolean?", "pair?", "symbol?":
 		return true
 	}
 	return false
@@ -635,6 +643,113 @@ func evalBuiltin(name string, args []value, e *expr) (value, error) {
 			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: not: expected 1 argument, got %d", e.line, e.col, len(args))}
 		}
 		return boolVal(!isTruthy(args[0])), nil
+
+	case "cons":
+		if len(args) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: cons: expected 2 arguments, got %d", e.line, e.col, len(args))}
+		}
+		return pairVal(args[0], args[1]), nil
+
+	case "car":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: car: expected 1 argument, got %d", e.line, e.col, len(args))}
+		}
+		if args[0].kind != valPair {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: car: expected pair", e.line, e.col)}
+		}
+		return args[0].pair.car, nil
+
+	case "cdr":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: cdr: expected 1 argument, got %d", e.line, e.col, len(args))}
+		}
+		if args[0].kind != valPair {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: cdr: expected pair", e.line, e.col)}
+		}
+		return args[0].pair.cdr, nil
+
+	case "null?":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: null?: expected 1 argument, got %d", e.line, e.col, len(args))}
+		}
+		return boolVal(args[0].kind == valNull), nil
+
+	case "list":
+		result := nullVal
+		for i := len(args) - 1; i >= 0; i-- {
+			result = pairVal(args[i], result)
+		}
+		return result, nil
+
+	case "length":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: length: expected 1 argument, got %d", e.line, e.col, len(args))}
+		}
+		var count int64
+		cur := args[0]
+		for cur.kind == valPair {
+			count++
+			cur = cur.pair.cdr
+		}
+		if cur.kind != valNull {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: length: not a proper list", e.line, e.col)}
+		}
+		return intVal(count), nil
+
+	case "string?":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string?: expected 1 argument", e.line, e.col)}
+		}
+		return boolVal(args[0].kind == valString), nil
+
+	case "number?":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: number?: expected 1 argument", e.line, e.col)}
+		}
+		return boolVal(args[0].kind == valInteger), nil
+
+	case "boolean?":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: boolean?: expected 1 argument", e.line, e.col)}
+		}
+		return boolVal(args[0].kind == valBoolean), nil
+
+	case "pair?":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: pair?: expected 1 argument", e.line, e.col)}
+		}
+		return boolVal(args[0].kind == valPair), nil
+
+	case "symbol?":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: symbol?: expected 1 argument", e.line, e.col)}
+		}
+		return boolVal(args[0].kind == valSymbol), nil
+
+	case "append":
+		if len(args) == 0 {
+			return nullVal, nil
+		}
+		if len(args) == 1 {
+			return args[0], nil
+		}
+		// Append two lists
+		result := args[len(args)-1]
+		for i := len(args) - 2; i >= 0; i-- {
+			lst := args[i]
+			// Collect elements of lst
+			var elems []value
+			cur := lst
+			for cur.kind == valPair {
+				elems = append(elems, cur.pair.car)
+				cur = cur.pair.cdr
+			}
+			// Build from right
+			for j := len(elems) - 1; j >= 0; j-- {
+				result = pairVal(elems[j], result)
+			}
+		}
+		return result, nil
 	}
 
 	return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", e.line, e.col, name)}
@@ -694,6 +809,124 @@ func evalOr(e *expr, env *env) (value, error) {
 		}
 	}
 	return boolVal(false), nil
+}
+
+func evalLet(e *expr, env *env) (value, error) {
+	if len(e.list) < 3 {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", e.line, e.col)}
+	}
+	// Named let: (let name ((var init) ...) body...)
+	if e.list[1].kind == exprAtom && e.list[1].atom.kind == valSymbol {
+		if len(e.list) < 4 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", e.line, e.col)}
+		}
+		loopName := e.list[1].atom.sval
+		bindingsExpr := e.list[2]
+		if bindingsExpr.kind != exprList {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: let: expected bindings list", bindingsExpr.line, bindingsExpr.col)}
+		}
+		params := make([]string, len(bindingsExpr.list))
+		initVals := make([]value, len(bindingsExpr.list))
+		for i, b := range bindingsExpr.list {
+			if b.kind != exprList || len(b.list) != 2 {
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad binding", b.line, b.col)}
+			}
+			if b.list[0].kind != exprAtom || b.list[0].atom.kind != valSymbol {
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: let: expected symbol", b.list[0].line, b.list[0].col)}
+			}
+			params[i] = b.list[0].atom.sval
+			v, err := evalInEnv(b.list[1], env)
+			if err != nil {
+				return value{}, err
+			}
+			initVals[i] = v
+		}
+		// Create a lambda for the loop and bind it in a new env
+		letEnv := newEnv(env)
+		lam := &lambda{params: params, body: e.list[3:], env: letEnv}
+		letEnv.set(loopName, value{kind: valLambda, lambda: lam})
+		return callLambda(lam, initVals, e)
+	}
+
+	bindingsExpr := e.list[1]
+	if bindingsExpr.kind != exprList {
+		return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: let: expected bindings list", bindingsExpr.line, bindingsExpr.col)}
+	}
+	letEnv := newEnv(env)
+	for _, b := range bindingsExpr.list {
+		if b.kind != exprList || len(b.list) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad binding", b.line, b.col)}
+		}
+		if b.list[0].kind != exprAtom || b.list[0].atom.kind != valSymbol {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: let: expected symbol", b.list[0].line, b.list[0].col)}
+		}
+		v, err := evalInEnv(b.list[1], env)
+		if err != nil {
+			return value{}, err
+		}
+		letEnv.set(b.list[0].atom.sval, v)
+	}
+	var result value
+	var err error
+	for _, bodyExpr := range e.list[2:] {
+		result, err = evalInEnv(bodyExpr, letEnv)
+		if err != nil {
+			return value{}, err
+		}
+	}
+	return result, nil
+}
+
+func evalBegin(e *expr, env *env) (value, error) {
+	args := e.list[1:]
+	if len(args) == 0 {
+		return voidVal, nil
+	}
+	var result value
+	var err error
+	for _, a := range args {
+		result, err = evalInEnv(a, env)
+		if err != nil {
+			return value{}, err
+		}
+	}
+	return result, nil
+}
+
+func evalCond(e *expr, env *env) (value, error) {
+	clauses := e.list[1:]
+	for _, clause := range clauses {
+		if clause.kind != exprList || len(clause.list) < 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: cond: bad clause", clause.line, clause.col)}
+		}
+		// else clause
+		if clause.list[0].kind == exprAtom && clause.list[0].atom.kind == valSymbol && clause.list[0].atom.sval == "else" {
+			var result value
+			var err error
+			for _, bodyExpr := range clause.list[1:] {
+				result, err = evalInEnv(bodyExpr, env)
+				if err != nil {
+					return value{}, err
+				}
+			}
+			return result, nil
+		}
+		cond, err := evalInEnv(clause.list[0], env)
+		if err != nil {
+			return value{}, err
+		}
+		if isTruthy(cond) {
+			var result value
+			for _, bodyExpr := range clause.list[1:] {
+				result, err = evalInEnv(bodyExpr, env)
+				if err != nil {
+					return value{}, err
+				}
+			}
+			return result, nil
+		}
+	}
+	return voidVal, nil
 }
 
 // ---------- Public API ----------
