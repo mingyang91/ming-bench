@@ -8,7 +8,7 @@ object Builtins:
 
   private def requireNum(v: Val): Long = v match
     case Num(n) => n
-    case _      => throw new EvalError(s"not a number: ${Evaluator.display(v)}")
+    case _      => throw new EvalError(s"not a number: ${Display.write(v)}")
 
   private def numericArgs(args: List[Val]): List[Long] = args.map(requireNum)
 
@@ -61,12 +61,12 @@ object Builtins:
     },
     "car" -> Builtin {
       case List(Pair(a, _)) => a
-      case List(other)      => throw new EvalError(s"car: not a pair: ${Evaluator.display(other)}")
+      case List(other)      => throw new EvalError(s"car: not a pair: ${Display.write(other)}")
       case _                => throw new EvalError("car requires 1 argument")
     },
     "cdr" -> Builtin {
       case List(Pair(_, d)) => d
-      case List(other)      => throw new EvalError(s"cdr: not a pair: ${Evaluator.display(other)}")
+      case List(other)      => throw new EvalError(s"cdr: not a pair: ${Display.write(other)}")
       case _                => throw new EvalError("cdr requires 1 argument")
     },
     "list" -> Builtin { args =>
@@ -176,13 +176,13 @@ object Builtins:
     // --- L05: I/O ---
     "display" -> Builtin {
       case List(v) =>
-        Evaluator.outputBuffer.append(Evaluator.displayVal(v))
+        Evaluator.outputBuffer.append(Display.show(v))
         Void
       case _ => throw new EvalError("display requires 1 argument")
     },
     "write" -> Builtin {
       case List(v) =>
-        Evaluator.outputBuffer.append(Evaluator.display(v))
+        Evaluator.outputBuffer.append(Display.write(v))
         Void
       case _ => throw new EvalError("write requires 1 argument")
     },
@@ -196,7 +196,7 @@ object Builtins:
     "string-append" -> Builtin { args =>
       val strs = args.map {
         case Str(chars) => new String(chars)
-        case v          => throw new EvalError(s"string-append: not a string: ${Evaluator.display(v)}")
+        case v          => throw new EvalError(s"string-append: not a string: ${Display.write(v)}")
       }
       Evaluator.mkStr(strs.mkString)
     },

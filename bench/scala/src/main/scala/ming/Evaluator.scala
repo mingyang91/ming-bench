@@ -21,7 +21,7 @@ object Evaluator:
 
   private[ming] def strValue(v: Val): String = v match
     case Str(chars) => new String(chars)
-    case _          => throw new EvalError(s"not a string: ${display(v)}")
+    case _          => throw new EvalError(s"not a string: ${Display.write(v)}")
 
   // --- Output capture ---
   private[ming] val outputBuffer = new StringBuilder
@@ -48,8 +48,12 @@ object Evaluator:
       case Pair(Symbol("begin"), body)             => evalBegin(body, env)
       case Pair(Symbol("cond"), clauses)           => evalCond(clauses, env)
       case Pair(Symbol("let"), rest)               => evalLet(rest, env)
-      case Pair(Symbol("and"), args)               => evalAnd(args, env)
-      case Pair(Symbol("or"), args)                => evalOr(args, env)
+      case Pair(Symbol("set!"), Pair(Symbol(name), Pair(valueExpr, Nil))) =>
+        val v = eval(valueExpr, env)
+        if !env.set(name, v) then error(s"unbound variable: $name")
+        Void
+      case Pair(Symbol("and"), args) => evalAnd(args, env)
+      case Pair(Symbol("or"), args)  => evalOr(args, env)
       case Pair(head, args) =>
         val func    = eval(head, env)
         val argList = toList(args).map(a => eval(a, env))
@@ -85,7 +89,7 @@ object Evaluator:
     rest match
       case Pair(params, body) =>
         val paramNames = toList(params).map {
-          case Symbol(s) => s; case v => error(s"bad parameter: ${display(v)}")
+          case Symbol(s) => s; case v => error(s"bad parameter: ${Display.write(v)}")
         }
         val bodyList = toList(body)
         if bodyList.isEmpty then error("lambda: empty body")
@@ -211,7 +215,7 @@ object Evaluator:
         case e: EvalError =>
           if !e.getMessage.matches(".*\\d+:\\d+.*") then error(e.getMessage)
           else throw e
-    case _ => error(s"not a procedure: ${display(func)}")
+    case _ => error(s"not a procedure: ${Display.write(func)}")
 
   // --- Environment ---
   private class Env(bindings: scala.collection.mutable.Map[String, Val], parent: Option[Env]):
@@ -220,58 +224,15 @@ object Evaluator:
       bindings.get(name).orElse(parent.flatMap(_.lookup(name)))
     def define(name: String, value: Val): Unit = bindings(name) = value
 
+    def set(name: String, value: Val): Boolean =
+      if bindings.contains(name) then
+        bindings(name) = value; true
+      else parent.exists(_.set(name, value))
+
   private def defaultEnv(): Env =
     val m = scala.collection.mutable.Map[String, Val]()
     Builtins.all.foreach((name, v) => m(name) = v)
     new Env(m, None)
-
-  // --- Display (write-style, with quotes) ---
-  private[ming] def display(v: Val): String = v match
-    case Num(n)        => n.toString
-    case Bool(true)    => "#t"
-    case Bool(false)   => "#f"
-    case Str(chars)    => "\"" + new String(chars) + "\""
-    case SchemeChar(c) => s"#\\$c"
-    case Symbol(name)  => name
-    case Nil           => "()"
-    case Void          => "#<void>"
-    case Pair(_, _)    => displayList(v)
-    case Builtin(_)    => "#<procedure>"
-
-  // --- Display (display-style, no quotes on strings) ---
-  private[ming] def displayVal(v: Val): String = v match
-    case Str(chars)    => new String(chars)
-    case SchemeChar(c) => c.toString
-    case Pair(_, _)    => displayListVal(v)
-    case _             => display(v)
-
-  private def displayListVal(v: Val): String =
-    val sb = new StringBuilder("(")
-    @scala.annotation.tailrec
-    def loop(current: Val, first: Boolean): Unit = current match
-      case Pair(car, cdr) =>
-        if !first then sb.append(" ")
-        sb.append(displayVal(car))
-        loop(cdr, first = false)
-      case Nil => ()
-      case _   => sb.append(" . "); sb.append(displayVal(current))
-    loop(v, first = true)
-    sb.append(")")
-    sb.toString
-
-  private def displayList(v: Val): String =
-    val sb = new StringBuilder("(")
-    @scala.annotation.tailrec
-    def loop(current: Val, first: Boolean): Unit = current match
-      case Pair(car, cdr) =>
-        if !first then sb.append(" ")
-        sb.append(display(car))
-        loop(cdr, first = false)
-      case Nil => ()
-      case _   => sb.append(" . "); sb.append(display(current))
-    loop(v, first = true)
-    sb.append(")")
-    sb.toString
 
   // --- Public API ---
   def evalStr(input: String): String =
@@ -283,7 +244,7 @@ object Evaluator:
     for (expr, line, col) <- exprs do
       lastPos = s"$line:$col"
       result = eval(expr, env)
-    display(result)
+    Display.write(result)
 
   def evalStrWithOutput(input: String): (String, String) =
     outputBuffer.clear()
@@ -297,4 +258,4 @@ object Evaluator:
       result = eval(expr, env)
     val output = outputBuffer.toString
     outputBuffer.clear()
-    (display(result), output)
+    (Display.write(result), output)
