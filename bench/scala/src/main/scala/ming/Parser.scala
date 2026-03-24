@@ -130,6 +130,15 @@ object Parser:
   private def parseAtom(tok: String): Expr =
     if tok == "#t" then Expr.BoolLit(true)
     else if tok == "#f" then Expr.BoolLit(false)
+    else if tok.startsWith("#\\") then
+      val charName = tok.substring(2)
+      val c = charName match
+        case "space"            => ' '
+        case "newline"          => '\n'
+        case "tab"              => '\t'
+        case s if s.length == 1 => s.charAt(0)
+        case _                  => throw new EvalError(s"unknown character name: $charName")
+      Expr.CharLit(c)
     else if tok.startsWith("\"") && tok.endsWith("\"") then Expr.StrLit(tok.substring(1, tok.length - 1))
     else
       tok.toLongOption match

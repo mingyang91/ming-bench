@@ -200,77 +200,6 @@ object Builtins:
     )
   )
 
-  private def stringBuiltins: List[(String, SchemeVal)] = List(
-    "string-append" -> SchemeVal.BuiltinProc(
-      "string-append",
-      args =>
-        val strs = args.map {
-          case SchemeVal.StrVal(s) => s
-          case other               => throw new EvalError(s"string-append: expected string, got ${other.display}")
-        }
-        SchemeVal.StrVal(strs.mkString)
-    ),
-    "string-length" -> SchemeVal.BuiltinProc(
-      "string-length",
-      {
-        case List(SchemeVal.StrVal(s)) => SchemeVal.IntVal(s.length.toLong)
-        case List(other)               => throw new EvalError(s"string-length: expected string, got ${other.display}")
-        case args                      => throw new EvalError(s"string-length: expected 1 argument, got ${args.length}")
-      }
-    ),
-    "substring" -> SchemeVal.BuiltinProc(
-      "substring",
-      {
-        case List(SchemeVal.StrVal(s), SchemeVal.IntVal(start), SchemeVal.IntVal(end)) =>
-          SchemeVal.StrVal(s.substring(start.toInt, end.toInt))
-        case _ => throw new EvalError("substring: expected (string, start, end)")
-      }
-    ),
-    "string->number" -> SchemeVal.BuiltinProc(
-      "string->number",
-      {
-        case List(SchemeVal.StrVal(s)) =>
-          try SchemeVal.IntVal(s.toLong)
-          catch case _: NumberFormatException => SchemeVal.BoolVal(false)
-        case List(other) => throw new EvalError(s"string->number: expected string, got ${other.display}")
-        case args        => throw new EvalError(s"string->number: expected 1 argument, got ${args.length}")
-      }
-    ),
-    "number->string" -> SchemeVal.BuiltinProc(
-      "number->string",
-      {
-        case List(SchemeVal.IntVal(n)) => SchemeVal.StrVal(n.toString)
-        case List(other)               => throw new EvalError(s"number->string: expected number, got ${other.display}")
-        case args => throw new EvalError(s"number->string: expected 1 argument, got ${args.length}")
-      }
-    ),
-    "string-ref" -> SchemeVal.BuiltinProc(
-      "string-ref",
-      {
-        case List(SchemeVal.StrVal(s), SchemeVal.IntVal(i)) =>
-          SchemeVal.CharVal(s.charAt(i.toInt))
-        case _ => throw new EvalError("string-ref: expected (string, index)")
-      }
-    ),
-    "symbol->string" -> SchemeVal.BuiltinProc(
-      "symbol->string",
-      {
-        case List(SchemeVal.SymVal(n)) => SchemeVal.StrVal(n)
-        case List(other)               => throw new EvalError(s"symbol->string: expected symbol, got ${other.display}")
-        case args => throw new EvalError(s"symbol->string: expected 1 argument, got ${args.length}")
-      }
-    ),
-    "string->symbol" -> SchemeVal.BuiltinProc(
-      "string->symbol",
-      {
-        case List(SchemeVal.StrVal(s)) => SchemeVal.SymVal(s)
-        case List(other)               => throw new EvalError(s"string->symbol: expected string, got ${other.display}")
-        case args => throw new EvalError(s"string->symbol: expected 1 argument, got ${args.length}")
-      }
-    ),
-    typePredicate("char?", _.isInstanceOf[SchemeVal.CharVal])
-  )
-
   def makeGlobalEnv(): Env =
     val env = new Env(mutable.Map.empty, None)
     val allBuiltins = arithmeticBuiltins
@@ -279,6 +208,6 @@ object Builtins:
       ++ listBuiltins
       ++ typePredicateBuiltins
       ++ ioBuiltins
-      ++ stringBuiltins
+      ++ StringBuiltins.all
     for (name, proc) <- allBuiltins do env.define(name, proc)
     env

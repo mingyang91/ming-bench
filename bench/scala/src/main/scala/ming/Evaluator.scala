@@ -7,12 +7,13 @@ enum Expr:
   case BoolLit(value: Boolean)
   case StrLit(value: String)
   case Symbol(name: String)
+  case CharLit(value: Char)
   case SList(elems: List[Expr])
 
 enum SchemeVal:
   case IntVal(value: Long)
   case BoolVal(value: Boolean)
-  case StrVal(value: String)
+  case StrVal(value: Array[Char])
   case SymVal(name: String)
   case CharVal(value: Char)
   case ListVal(elems: List[SchemeVal])
@@ -23,7 +24,7 @@ enum SchemeVal:
   def display: String = this match
     case IntVal(n)            => n.toString
     case BoolVal(b)           => if b then "#t" else "#f"
-    case StrVal(s)            => "\"" + s + "\""
+    case StrVal(s)            => "\"" + new String(s) + "\""
     case SymVal(n)            => n
     case CharVal(c)           => s"#\\$c"
     case ListVal(Nil)         => "()"
@@ -34,14 +35,14 @@ enum SchemeVal:
 
   /** display format: no quotes on strings */
   def displayStr: String = this match
-    case StrVal(s)      => s
+    case StrVal(s)      => new String(s)
     case ListVal(Nil)   => "()"
     case ListVal(elems) => "(" + elems.map(_.displayStr).mkString(" ") + ")"
     case other          => other.display
 
   /** write format: strings with quotes */
   def writeStr: String = this match
-    case StrVal(s) => "\"" + s + "\""
+    case StrVal(s) => "\"" + new String(s) + "\""
     case _         => displayStr
 
 class Env(
@@ -71,7 +72,8 @@ object Evaluator:
   private def quoteToVal(expr: Expr): SchemeVal = expr match
     case Expr.IntLit(n)  => SchemeVal.IntVal(n)
     case Expr.BoolLit(b) => SchemeVal.BoolVal(b)
-    case Expr.StrLit(s)  => SchemeVal.StrVal(s)
+    case Expr.StrLit(s)  => SchemeVal.StrVal(s.toCharArray)
+    case Expr.CharLit(c) => SchemeVal.CharVal(c)
     case Expr.Symbol(n)  => SchemeVal.SymVal(n)
     case Expr.SList(es)  => SchemeVal.ListVal(es.map(quoteToVal))
 
@@ -89,7 +91,8 @@ object Evaluator:
       expr match
         case Expr.IntLit(n)    => SchemeVal.IntVal(n)
         case Expr.BoolLit(b)   => SchemeVal.BoolVal(b)
-        case Expr.StrLit(s)    => SchemeVal.StrVal(s)
+        case Expr.StrLit(s)    => SchemeVal.StrVal(s.toCharArray)
+        case Expr.CharLit(c)   => SchemeVal.CharVal(c)
         case Expr.Symbol(name) => env.lookup(name)
         case Expr.SList(Nil)   => SchemeVal.ListVal(Nil)
         case Expr.SList(Expr.Symbol("quote") :: arg :: Nil) =>
