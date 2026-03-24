@@ -31,25 +31,69 @@ public class Evaluator {
     // --- Environment ---
 
     private static class Env {
-        final Map<String, Object> bindings = new HashMap<>();
+        private static final int ARRAY_THRESHOLD = 16;
+        private String[] keys;
+        private Object[] vals;
+        private int size;
+        private Map<String, Object> map; // used when size > threshold
         final Env parent;
 
         Env(Env parent) {
             this.parent = parent;
+            this.keys = new String[4];
+            this.vals = new Object[4];
+            this.size = 0;
         }
 
         Object lookup(String name) throws EvalError {
-            if (bindings.containsKey(name)) return bindings.get(name);
+            if (map != null) {
+                Object v = map.get(name);
+                if (v != null) return v;
+                // null could mean not present or mapped to null; check explicitly for rare case
+                if (map.containsKey(name)) return v;
+            } else {
+                for (int i = size - 1; i >= 0; i--) {
+                    if (keys[i].equals(name)) return vals[i];
+                }
+            }
             if (parent != null) return parent.lookup(name);
             throw new EvalError("unbound variable: " + name);
         }
 
         void define(String name, Object value) {
-            bindings.put(name, value);
+            if (map != null) {
+                map.put(name, value);
+                return;
+            }
+            for (int i = size - 1; i >= 0; i--) {
+                if (keys[i].equals(name)) { vals[i] = value; return; }
+            }
+            if (size >= ARRAY_THRESHOLD) {
+                // Convert to HashMap
+                map = new HashMap<>(size * 2);
+                for (int i = 0; i < size; i++) map.put(keys[i], vals[i]);
+                map.put(name, value);
+                keys = null; vals = null;
+                return;
+            }
+            if (size == keys.length) {
+                int newCap = Math.min(keys.length * 2, ARRAY_THRESHOLD);
+                keys = java.util.Arrays.copyOf(keys, newCap);
+                vals = java.util.Arrays.copyOf(vals, newCap);
+            }
+            keys[size] = name;
+            vals[size] = value;
+            size++;
         }
 
         void set(String name, Object value) throws EvalError {
-            if (bindings.containsKey(name)) { bindings.put(name, value); return; }
+            if (map != null) {
+                if (map.containsKey(name)) { map.put(name, value); return; }
+            } else {
+                for (int i = size - 1; i >= 0; i--) {
+                    if (keys[i].equals(name)) { vals[i] = value; return; }
+                }
+            }
             if (parent != null) { parent.set(name, value); return; }
             throw new EvalError("unbound variable: " + name);
         }
@@ -197,16 +241,22 @@ public class Evaluator {
 
     // --- Continuation support (call/cc) ---
 
+    private record ContFrame(List<Object> bodyExprs, int bodyIndex, Env bodyEnv) {}
+
     private static class SchemeContinuation {
         final List<Object> bodyExprs;
         final int bodyIndex;
         final Env bodyEnv;
         final int topLevelIndex;
-        SchemeContinuation(List<Object> bodyExprs, int bodyIndex, Env bodyEnv, int topLevelIndex) {
+        final int callccSerial;
+        final List<ContFrame> outerFrames;
+        SchemeContinuation(List<Object> bodyExprs, int bodyIndex, Env bodyEnv, int topLevelIndex, int callccSerial, List<ContFrame> outerFrames) {
             this.bodyExprs = bodyExprs;
             this.bodyIndex = bodyIndex;
             this.bodyEnv = bodyEnv;
             this.topLevelIndex = topLevelIndex;
+            this.callccSerial = callccSerial;
+            this.outerFrames = outerFrames;
         }
     }
 
@@ -240,6 +290,14 @@ public class Evaluator {
     private List<Object> contBodyExprs;
     private int contBodyIndex;
     private Env contBodyEnv;
+    // Skip-count mechanism for multiple call/cc in same replay path
+    private int callccCount;
+    private boolean replaySkipCallcc;
+    private int replayTargetCallccSerial;
+    // Stack of outer body contexts saved when let handler overwrites contBody
+    private final List<ContFrame> contBodySaveStack = new ArrayList<>();
+
+    private int replayTargetSerial() { return replayTargetCallccSerial; }
 
     public String evalStr(String input) throws EvalError {
         currentPos = new Pos(1, 1);
@@ -259,12 +317,14 @@ public class Evaluator {
             contBodyExprs = exprs;
             contBodyIndex = i;
             contBodyEnv = env;
+            callccCount = 0;
+            contBodySaveStack.clear();
             try {
                 lastResult = eval(exprs.get(i), env);
                 i++;
             } catch (ContinuationInvoked ci) {
                 lastResult = replayContinuation(ci, exprs);
-                i = (ci.cont.bodyExprs == exprs) ? exprs.size() : ci.cont.topLevelIndex + 1;
+                i = exprs.size(); // replay handles all remaining expressions via outer frames
             } catch (SchemeException se) {
                 throw new EvalError("unhandled exception: " + schemeToString(se.value));
             }
@@ -297,12 +357,14 @@ public class Evaluator {
             contBodyExprs = exprs;
             contBodyIndex = i;
             contBodyEnv = env;
+            callccCount = 0;
+            contBodySaveStack.clear();
             try {
                 lastResult = eval(exprs.get(i), env);
                 i++;
             } catch (ContinuationInvoked ci) {
                 lastResult = replayContinuation(ci, exprs);
-                i = (ci.cont.bodyExprs == exprs) ? exprs.size() : ci.cont.topLevelIndex + 1;
+                i = exprs.size(); // replay handles all remaining expressions via outer frames
             } catch (SchemeException se) {
                 throw new EvalError("unhandled exception: " + schemeToString(se.value));
             }
@@ -315,11 +377,29 @@ public class Evaluator {
     private Object replayContinuation(ContinuationInvoked ci, List<Object> topExprs) throws EvalError {
         while (true) {
             try {
-                replaying = true;
-                replayValue = ci.value;
                 Object result = VOID;
+                // Replay the inner body (where call/cc was captured)
                 for (int j = ci.cont.bodyIndex; j < ci.cont.bodyExprs.size(); j++) {
+                    if (j == ci.cont.bodyIndex) {
+                        // First expression: enable skip-count replay
+                        replaySkipCallcc = true;
+                        callccCount = 0;
+                        replayTargetCallccSerial = ci.cont.callccSerial;
+                        replaying = true;
+                        replayValue = ci.value;
+                    } else {
+                        // Subsequent expressions: normal execution
+                        replaySkipCallcc = false;
+                    }
                     result = eval(ci.cont.bodyExprs.get(j), ci.cont.bodyEnv);
+                }
+                replaySkipCallcc = false;
+                // Continue with outer body frames (innermost to outermost)
+                for (int k = ci.cont.outerFrames.size() - 1; k >= 0; k--) {
+                    ContFrame frame = ci.cont.outerFrames.get(k);
+                    for (int j = frame.bodyIndex + 1; j < frame.bodyExprs.size(); j++) {
+                        result = eval(frame.bodyExprs.get(j), frame.bodyEnv);
+                    }
                 }
                 return result;
             } catch (ContinuationInvoked ci2) {
@@ -958,16 +1038,24 @@ public class Evaluator {
                             }
                             letEnv.define(name, eval(pair.get(1), env));
                         }
-                        List<Object> letBody = new ArrayList<>(list.subList(2, list.size()));
+                        // Save outer frame - skip if same body (TCO loop with let)
+                        if (contBodySaveStack.isEmpty() ||
+                            contBodySaveStack.get(contBodySaveStack.size() - 1).bodyExprs != contBodyExprs) {
+                            contBodySaveStack.add(new ContFrame(contBodyExprs, contBodyIndex, contBodyEnv));
+                        }
+                        @SuppressWarnings("unchecked")
+                        List<Object> letBodyList = (List<Object>) list;
                         for (int i = 2; i < list.size() - 1; i++) {
-                            contBodyExprs = letBody;
-                            contBodyIndex = i - 2;
+                            contBodyExprs = letBodyList;
+                            contBodyIndex = i;
                             contBodyEnv = letEnv;
+                            callccCount = 0;
                             eval(list.get(i), letEnv);
                         }
-                        contBodyExprs = letBody;
-                        contBodyIndex = letBody.size() - 1;
+                        contBodyExprs = letBodyList;
+                        contBodyIndex = list.size() - 1;
                         contBodyEnv = letEnv;
+                        callccCount = 0;
                         expr = list.get(list.size() - 1); env = letEnv; continue;
                     }
                     case "letrec" -> {
@@ -1305,9 +1393,17 @@ public class Evaluator {
             Object proc = eval(head, env);
 
             // Evaluate arguments
-            List<Object> args = new ArrayList<>();
-            for (int i = 1; i < list.size(); i++) {
-                args.add(eval(list.get(i), env));
+            List<Object> args;
+            switch (list.size()) {
+                case 1 -> args = List.of();
+                case 2 -> args = List.of(eval(list.get(1), env));
+                case 3 -> args = List.of(eval(list.get(1), env), eval(list.get(2), env));
+                default -> {
+                    args = new ArrayList<>(list.size() - 1);
+                    for (int i = 1; i < list.size(); i++) {
+                        args.add(eval(list.get(i), env));
+                    }
+                }
             }
 
             if (proc instanceof SchemeContinuation cont) {
@@ -1317,7 +1413,11 @@ public class Evaluator {
 
             if (proc instanceof Lambda lam) {
                 // TCO: inline lambda application into the trampoline
-                env = bindLambdaArgs(lam, args);
+                if (lam.params().isEmpty() && lam.restParam() == null && args.isEmpty()) {
+                    env = lam.closureEnv();  // Fast path: no params, reuse closure env
+                } else {
+                    env = bindLambdaArgs(lam, args);
+                }
                 List<Object> body = lam.body();
                 for (int i = 0; i < body.size() - 1; i++) {
                     eval(body.get(i), env);
@@ -2434,14 +2534,21 @@ public class Evaluator {
             case "call-with-current-continuation", "call/cc" -> {
                 requireArgCount(op, args, 1);
                 Object receiver = args.get(0);
-                if (replaying) {
-                    replaying = false;
-                    Object val = replayValue;
-                    replayValue = null;
-                    return val;
+                if (replaySkipCallcc) {
+                    int serial = callccCount++;
+                    if (replaying && serial == replayTargetSerial()) {
+                        replaying = false;
+                        Object val = replayValue;
+                        replayValue = null;
+                        return val;
+                    }
+                    // Skip this call/cc (not the target)
+                    return VOID;
                 }
+                int serial = callccCount++;
                 SchemeContinuation cont = new SchemeContinuation(
-                    contBodyExprs, contBodyIndex, contBodyEnv, currentTopLevelIndex);
+                    contBodyExprs, contBodyIndex, contBodyEnv, currentTopLevelIndex, serial,
+                    new ArrayList<>(contBodySaveStack));
                 try {
                     return applyProcedure(receiver, List.of(cont));
                 } catch (ContinuationInvoked ci) {
@@ -2555,9 +2662,17 @@ public class Evaluator {
         Map<String, Object> result = new HashMap<>();
         Env current = env;
         while (current != null) {
-            for (Map.Entry<String, Object> e : current.bindings.entrySet()) {
-                if (e.getValue() instanceof SyntaxBinding sb && !result.containsKey(e.getKey())) {
-                    result.put(e.getKey(), sb.value());
+            if (current.map != null) {
+                for (Map.Entry<String, Object> e : current.map.entrySet()) {
+                    if (e.getValue() instanceof SyntaxBinding sb && !result.containsKey(e.getKey())) {
+                        result.put(e.getKey(), sb.value());
+                    }
+                }
+            } else {
+                for (int i = 0; i < current.size; i++) {
+                    if (current.vals[i] instanceof SyntaxBinding sb && !result.containsKey(current.keys[i])) {
+                        result.put(current.keys[i], sb.value());
+                    }
                 }
             }
             current = current.parent;
