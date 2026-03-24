@@ -1,4 +1,5 @@
 import { EvalError } from './evalError.js';
+const VOID_VALUE = { kind: 'void' };
 class Parser {
     input;
     index = 0;
@@ -28,6 +29,9 @@ class Parser {
         }
         if (char === '"') {
             return this.parseString();
+        }
+        if (char === "'") {
+            return this.parseQuoteShorthand();
         }
         return this.parseAtom();
     }
@@ -85,6 +89,13 @@ class Parser {
         }
         throw new EvalError('unterminated string literal');
     }
+    parseQuoteShorthand() {
+        this.advance(); // '
+        return {
+            kind: 'list',
+            elements: [{ kind: 'symbol', name: 'quote' }, this.parseExpr()],
+        };
+    }
     parseAtom() {
         const start = this.index;
         while (!this.isAtEnd() && !this.isDelimiter(this.peek())) {
@@ -122,7 +133,7 @@ class Parser {
         }
     }
     isDelimiter(char) {
-        return /\s/u.test(char) || char === '(' || char === ')' || char === ';';
+        return /\s/u.test(char) || char === '(' || char === ')' || char === ';' || char === "'";
     }
     peek() {
         return this.input[this.index];
@@ -134,7 +145,26 @@ class Parser {
         return this.index >= this.input.length;
     }
 }
-function evaluate(expr) {
+class Environment {
+    parent;
+    bindings = new Map();
+    constructor(parent) {
+        this.parent = parent;
+    }
+    define(name, value) {
+        this.bindings.set(name, value);
+    }
+    lookup(name) {
+        if (this.bindings.has(name)) {
+            return this.bindings.get(name);
+        }
+        if (this.parent !== undefined) {
+            return this.parent.lookup(name);
+        }
+        throw new EvalError(`unbound variable: ${name}`);
+    }
+}
+function evaluate(expr, env) {
     switch (expr.kind) {
         case 'number':
             return expr.value;
@@ -143,92 +173,202 @@ function evaluate(expr) {
         case 'string':
             return expr.value;
         case 'symbol':
-            throw new EvalError(`unbound variable: ${expr.name}`);
+            return env.lookup(expr.name);
         case 'list':
-            return evaluateList(expr.elements);
+            return evaluateList(expr.elements, env);
     }
 }
-function evaluateList(elements) {
+function evaluateList(elements, env) {
     if (elements.length === 0) {
         throw new EvalError('cannot evaluate an empty list');
     }
     const [operator, ...arguments_] = elements;
-    if (operator.kind !== 'symbol') {
-        throw new EvalError('operator must be a symbol');
+    if (operator.kind === 'symbol') {
+        switch (operator.name) {
+            case 'quote':
+                return evaluateQuote(arguments_);
+            case 'if':
+                return evaluateIf(arguments_, env);
+            case 'define':
+                return evaluateDefine(arguments_, env);
+            case 'lambda':
+                return evaluateLambda(arguments_, env);
+            case 'and':
+                return evaluateAnd(arguments_, env);
+            case 'or':
+                return evaluateOr(arguments_, env);
+            default:
+                break;
+        }
     }
-    switch (operator.name) {
-        case 'and':
-            return evaluateAnd(arguments_);
-        case 'or':
-            return evaluateOr(arguments_);
-        case 'not':
-            return evaluateNot(arguments_);
-        case '+':
-            return evaluateAdd(arguments_);
-        case '-':
-            return evaluateSubtract(arguments_);
-        case '*':
-            return evaluateMultiply(arguments_);
-        case '/':
-            return evaluateDivide(arguments_);
-        case '<':
-            return evaluateComparison(arguments_, '<', (left, right) => left < right);
-        case '>':
-            return evaluateComparison(arguments_, '>', (left, right) => left > right);
-        case '=':
-            return evaluateComparison(arguments_, '=', (left, right) => left === right);
-        case '<=':
-            return evaluateComparison(arguments_, '<=', (left, right) => left <= right);
-        default:
-            throw new EvalError(`unknown procedure: ${operator.name}`);
+    const procedure = evaluate(operator, env);
+    const evaluatedArguments = arguments_.map((argument) => evaluate(argument, env));
+    return applyProcedure(procedure, evaluatedArguments);
+}
+function evaluateQuote(arguments_) {
+    assertExprArity('quote', arguments_, 1);
+    return quoteExpr(arguments_[0]);
+}
+function quoteExpr(expr) {
+    switch (expr.kind) {
+        case 'number':
+            return expr.value;
+        case 'boolean':
+            return expr.value;
+        case 'string':
+            return expr.value;
+        case 'symbol':
+            return { kind: 'symbol', name: expr.name };
+        case 'list':
+            return { kind: 'list', elements: expr.elements.map((element) => quoteExpr(element)) };
     }
 }
-function evaluateAnd(arguments_) {
+function evaluateIf(arguments_, env) {
+    assertExprArity('if', arguments_, 3);
+    const [condition, thenBranch, elseBranch] = arguments_;
+    return isTruthy(evaluate(condition, env))
+        ? evaluate(thenBranch, env)
+        : evaluate(elseBranch, env);
+}
+function evaluateDefine(arguments_, env) {
+    if (arguments_.length < 2) {
+        throw new EvalError('define: expected a name and a value');
+    }
+    const [target, ...rest] = arguments_;
+    if (target.kind === 'symbol') {
+        assertExprArity('define', arguments_, 2);
+        const value = evaluate(rest[0], env);
+        env.define(target.name, value);
+        return VOID_VALUE;
+    }
+    if (target.kind === 'list' && target.elements.length > 0) {
+        const [nameExpr, ...parameterExprs] = target.elements;
+        if (nameExpr.kind !== 'symbol') {
+            throw new EvalError('define: expected a function name');
+        }
+        if (rest.length === 0) {
+            throw new EvalError('define: expected a function body');
+        }
+        const closure = {
+            kind: 'closure',
+            params: parseParameterNames(parameterExprs),
+            body: rest,
+            env,
+        };
+        env.define(nameExpr.name, closure);
+        return VOID_VALUE;
+    }
+    throw new EvalError('define: invalid binding target');
+}
+function evaluateLambda(arguments_, env) {
+    if (arguments_.length < 2) {
+        throw new EvalError('lambda: expected parameters and a body');
+    }
+    const [parameterList, ...body] = arguments_;
+    return {
+        kind: 'closure',
+        params: parseParameterList(parameterList),
+        body,
+        env,
+    };
+}
+function parseParameterList(expr) {
+    if (expr.kind !== 'list') {
+        throw new EvalError('lambda: expected a parameter list');
+    }
+    return parseParameterNames(expr.elements);
+}
+function parseParameterNames(parameters) {
+    return parameters.map((parameter) => {
+        if (parameter.kind !== 'symbol') {
+            throw new EvalError('lambda: expected parameter names to be symbols');
+        }
+        return parameter.name;
+    });
+}
+function evaluateAnd(arguments_, env) {
     let result = true;
     for (const argument of arguments_) {
-        result = evaluate(argument);
+        result = evaluate(argument, env);
         if (!isTruthy(result)) {
             return result;
         }
     }
     return result;
 }
-function evaluateOr(arguments_) {
+function evaluateOr(arguments_, env) {
     for (const argument of arguments_) {
-        const value = evaluate(argument);
+        const value = evaluate(argument, env);
         if (isTruthy(value)) {
             return value;
         }
     }
     return false;
 }
-function evaluateNot(arguments_) {
-    assertArity('not', arguments_, 1);
-    return !isTruthy(evaluate(arguments_[0]));
-}
-function evaluateAdd(arguments_) {
-    const numbers = evaluateNumberArguments('+', arguments_, 0);
-    return numbers.reduce((sum, value) => sum + value, 0);
-}
-function evaluateSubtract(arguments_) {
-    const numbers = evaluateNumberArguments('-', arguments_, 1);
-    if (numbers.length === 1) {
-        return normalizeNumber(-numbers[0]);
+function applyProcedure(procedure, arguments_) {
+    if (isBuiltinValue(procedure)) {
+        return procedure.apply(arguments_);
     }
-    const [first, ...rest] = numbers;
-    return normalizeNumber(rest.reduce((difference, value) => difference - value, first));
-}
-function evaluateMultiply(arguments_) {
-    const numbers = evaluateNumberArguments('*', arguments_, 0);
-    return numbers.reduce((product, value) => product * value, 1);
-}
-function evaluateDivide(arguments_) {
-    const numbers = evaluateNumberArguments('/', arguments_, 1);
-    if (numbers.length === 1) {
-        return normalizeNumber(divideNumbers(1, numbers[0]));
+    if (isClosureValue(procedure)) {
+        if (arguments_.length !== procedure.params.length) {
+            throw new EvalError(`expected ${procedure.params.length} argument${procedure.params.length === 1 ? '' : 's'}`);
+        }
+        const callEnv = new Environment(procedure.env);
+        for (let index = 0; index < procedure.params.length; index += 1) {
+            callEnv.define(procedure.params[index], arguments_[index]);
+        }
+        let result = VOID_VALUE;
+        for (const expression of procedure.body) {
+            result = evaluate(expression, callEnv);
+        }
+        return result;
     }
-    const [first, ...rest] = numbers;
-    return normalizeNumber(rest.reduce((quotient, value) => divideNumbers(quotient, value), first));
+    throw new EvalError('attempted to call a non-procedure');
+}
+function isBuiltinValue(value) {
+    return typeof value === 'object' && value !== null && value.kind === 'builtin';
+}
+function isClosureValue(value) {
+    return typeof value === 'object' && value !== null && value.kind === 'closure';
+}
+function createGlobalEnvironment() {
+    const env = new Environment();
+    env.define('not', createBuiltin('not', (arguments_) => {
+        assertValueArity('not', arguments_, 1);
+        return !isTruthy(arguments_[0]);
+    }));
+    env.define('+', createBuiltin('+', (arguments_) => {
+        const numbers = evaluateNumberArguments('+', arguments_, 0);
+        return numbers.reduce((sum, value) => sum + value, 0);
+    }));
+    env.define('-', createBuiltin('-', (arguments_) => {
+        const numbers = evaluateNumberArguments('-', arguments_, 1);
+        if (numbers.length === 1) {
+            return normalizeNumber(-numbers[0]);
+        }
+        const [first, ...rest] = numbers;
+        return normalizeNumber(rest.reduce((difference, value) => difference - value, first));
+    }));
+    env.define('*', createBuiltin('*', (arguments_) => {
+        const numbers = evaluateNumberArguments('*', arguments_, 0);
+        return numbers.reduce((product, value) => product * value, 1);
+    }));
+    env.define('/', createBuiltin('/', (arguments_) => {
+        const numbers = evaluateNumberArguments('/', arguments_, 1);
+        if (numbers.length === 1) {
+            return normalizeNumber(divideNumbers(1, numbers[0]));
+        }
+        const [first, ...rest] = numbers;
+        return normalizeNumber(rest.reduce((quotient, value) => divideNumbers(quotient, value), first));
+    }));
+    env.define('<', createBuiltin('<', (arguments_) => evaluateComparison(arguments_, '<', (left, right) => left < right)));
+    env.define('>', createBuiltin('>', (arguments_) => evaluateComparison(arguments_, '>', (left, right) => left > right)));
+    env.define('=', createBuiltin('=', (arguments_) => evaluateComparison(arguments_, '=', (left, right) => left === right)));
+    env.define('<=', createBuiltin('<=', (arguments_) => evaluateComparison(arguments_, '<=', (left, right) => left <= right)));
+    return env;
+}
+function createBuiltin(name, apply) {
+    return { kind: 'builtin', name, apply };
 }
 function evaluateComparison(arguments_, name, comparator) {
     const numbers = evaluateNumberArguments(name, arguments_, 2);
@@ -245,14 +385,18 @@ function evaluateNumberArguments(name, arguments_, minimum) {
         throw new EvalError(`${name}: expected at least ${minimum} argument${plural}`);
     }
     return arguments_.map((argument) => {
-        const value = evaluate(argument);
-        if (typeof value !== 'number') {
+        if (typeof argument !== 'number') {
             throw new EvalError(`${name}: expected number`);
         }
-        return value;
+        return argument;
     });
 }
-function assertArity(name, arguments_, expected) {
+function assertExprArity(name, arguments_, expected) {
+    if (arguments_.length !== expected) {
+        throw new EvalError(`${name}: expected ${expected} argument${expected === 1 ? '' : 's'}`);
+    }
+}
+function assertValueArity(name, arguments_, expected) {
     if (arguments_.length !== expected) {
         throw new EvalError(`${name}: expected ${expected} argument${expected === 1 ? '' : 's'}`);
     }
@@ -279,7 +423,20 @@ function renderValue(value) {
     if (typeof value === 'number') {
         return String(normalizeNumber(value));
     }
-    return JSON.stringify(value);
+    if (typeof value === 'string') {
+        return JSON.stringify(value);
+    }
+    switch (value.kind) {
+        case 'symbol':
+            return value.name;
+        case 'list':
+            return `(${value.elements.map((element) => renderValue(element)).join(' ')})`;
+        case 'builtin':
+        case 'closure':
+            return '#<procedure>';
+        case 'void':
+            return '#<void>';
+    }
 }
 /**
  * Evaluate one or more Scheme expressions and return the string
@@ -290,9 +447,10 @@ export function evalStr(input) {
     if (program.length === 0) {
         throw new EvalError('expected at least one expression');
     }
-    let lastValue = false;
+    const env = createGlobalEnvironment();
+    let lastValue = VOID_VALUE;
     for (const expression of program) {
-        lastValue = evaluate(expression);
+        lastValue = evaluate(expression, env);
     }
     return renderValue(lastValue);
 }
