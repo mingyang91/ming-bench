@@ -1157,7 +1157,7 @@ pub(super) fn apply_builtin(name: &str, args: &[Value], call_pos: Pos, output: &
                 Value::Lambda { .. }
                     | Value::CaseLambda { .. }
                     | Value::Builtin(_)
-                    | Value::Continuation(_)
+                    | Value::Continuation(..)
                     | Value::RecordConstructor { .. }
                     | Value::RecordPredicate { .. }
                     | Value::RecordAccessor { .. }

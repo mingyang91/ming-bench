@@ -24,6 +24,24 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 
+/// A wind entry: unique id + in-thunk + out-thunk.
+#[derive(Debug, Clone)]
+pub(super) struct WindEntry {
+    id: u64,
+    in_thunk: Value,
+    out_thunk: Value,
+}
+
+static WIND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_wind_id() -> u64 {
+    WIND_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn common_prefix_len(a: &[WindEntry], b: &[WindEntry]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x.id == y.id).count()
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct CaseLambdaClause {
     params: Vec<String>,
@@ -87,7 +105,7 @@ pub(super) enum Value {
     CaseLambda {
         clauses: Vec<CaseLambdaClause>,
     },
-    Continuation(Kont),
+    Continuation(Kont, Vec<WindEntry>),
     Void,
 }
 
@@ -238,7 +256,7 @@ impl fmt::Display for Value {
                 '\t' => write!(f, "#\\tab"),
                 _ => write!(f, "#\\{c}"),
             },
-            Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Continuation(_) => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Continuation(..) => write!(f, "#<procedure>"),
             Value::Builtin(name) => write!(f, "#<builtin:{name}>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
             Value::Record { type_name, .. } => write!(f, "#<record:{type_name}>"),
@@ -446,6 +464,7 @@ pub(super) const BUILTINS: &[&str] = &[
     "string>?", "string<=?", "string>=?",
     "gcd", "lcm",
     "call/cc", "call-with-current-continuation",
+    "dynamic-wind",
 ];
 
 // ---------- CEK Machine ----------
@@ -487,6 +506,16 @@ pub(super) enum KontFrame {
     EvMap { func: Value, lists: Vec<Vec<Value>>, idx: usize, results: Vec<Value>, pos: Pos, next: Kont },
     /// ForEach: iterating
     EvForEach { func: Value, lists: Vec<Vec<Value>>, idx: usize, pos: Pos, next: Kont },
+    /// dynamic-wind: after in-thunk, call body
+    EvDynWindAfterIn { in_thunk: Value, body_thunk: Value, out_thunk: Value, pos: Pos, next: Kont },
+    /// dynamic-wind: after body, save result, call out-thunk
+    EvDynWindAfterBody { out_thunk: Value, pos: Pos, next: Kont },
+    /// dynamic-wind: after out-thunk, return saved body value
+    EvDynWindAfterOut { body_val: Value, next: Kont },
+    /// Winding: run unwind out-thunks then rewind in-thunks, then apply continuation
+    EvWind { unwind_outs: Vec<Value>, rewind_ins: Vec<Value>, target_ws: Vec<WindEntry>, val: Value, target_kont: Kont, pos: Pos },
+    /// Winding: after an out-thunk or in-thunk call, continue winding
+    EvWindStep { unwind_outs: Vec<Value>, rewind_ins: Vec<Value>, target_ws: Vec<WindEntry>, val: Value, target_kont: Kont, pos: Pos },
 }
 
 impl fmt::Debug for KontFrame {
@@ -516,6 +545,7 @@ fn cek_run(exprs: &[Expr], env: &Env, output: &mut String) -> Result<Value, Eval
     if exprs.is_empty() {
         return Ok(Value::Void);
     }
+    let mut wind_stack: Vec<WindEntry> = vec![];
     let kont = halt_kont();
     let mut state = eval_body_state(exprs, env.clone(), kont);
     loop {
@@ -528,10 +558,10 @@ fn cek_run(exprs: &[Expr], env: &Env, output: &mut String) -> Result<Value, Eval
                 state = cek_eval(&e, &env, kont, output)?;
             }
             State::Apply(val, kont) => {
-                state = cek_apply_kont(val, &kont, output)?;
+                state = cek_apply_kont(val, &kont, &mut wind_stack, output)?;
             }
             State::Invoke(func, args, pos, kont) => {
-                state = cek_invoke(func, args, pos, kont, output)?;
+                state = cek_invoke(func, args, pos, kont, &mut wind_stack, output)?;
             }
         }
     }
@@ -573,7 +603,7 @@ pub(super) fn eval_simple(expr: &Expr, env: &Env, output: &mut String) -> Option
                 if let Some(Value::Builtin(name)) = env_get(env, op) {
                     // Don't eagerly evaluate CPS-requiring builtins
                     if matches!(name.as_str(), "call/cc" | "call-with-current-continuation"
-                        | "apply" | "map" | "for-each") {
+                        | "apply" | "map" | "for-each" | "dynamic-wind") {
                         return None;
                     }
                     let mut args = Vec::with_capacity(elems.len() - 1);
@@ -756,7 +786,7 @@ fn cek_eval(expr: &Expr, env: &Env, kont: Kont, _output: &mut String) -> Result<
 }
 
 /// CEK step: return a value to a continuation.
-fn cek_apply_kont(val: Value, kont: &Kont, _output: &mut String) -> Result<State, EvalError> {
+fn cek_apply_kont(val: Value, kont: &Kont, wind_stack: &mut Vec<WindEntry>, _output: &mut String) -> Result<State, EvalError> {
     match kont.as_ref() {
         KontFrame::Halt => Ok(State::Done(val)),
 
@@ -1001,6 +1031,70 @@ fn cek_apply_kont(val: Value, kont: &Kont, _output: &mut String) -> Result<State
                 Ok(State::Invoke(func.clone(), next_args, *pos, new_kont))
             }
         }
+
+        KontFrame::EvDynWindAfterIn { in_thunk, body_thunk, out_thunk, pos, next } => {
+            // in-thunk finished; push wind entry, call body
+            let entry = WindEntry { id: next_wind_id(), in_thunk: in_thunk.clone(), out_thunk: out_thunk.clone() };
+            wind_stack.push(entry);
+            let after_body = Rc::new(KontFrame::EvDynWindAfterBody {
+                out_thunk: out_thunk.clone(),
+                pos: *pos,
+                next: next.clone(),
+            });
+            Ok(State::Invoke(body_thunk.clone(), vec![], *pos, after_body))
+        }
+
+        KontFrame::EvDynWindAfterBody { out_thunk, pos, next } => {
+            // body finished; pop wind entry, call out-thunk, save body value
+            wind_stack.pop();
+            let after_out = Rc::new(KontFrame::EvDynWindAfterOut {
+                body_val: val,
+                next: next.clone(),
+            });
+            Ok(State::Invoke(out_thunk.clone(), vec![], *pos, after_out))
+        }
+
+        KontFrame::EvDynWindAfterOut { body_val, next } => {
+            // out-thunk finished; return body value
+            Ok(State::Apply(body_val.clone(), next.clone()))
+        }
+
+        KontFrame::EvWind { unwind_outs, rewind_ins, target_ws, val, target_kont, pos } |
+        KontFrame::EvWindStep { unwind_outs, rewind_ins, target_ws, val, target_kont, pos } => {
+            if !unwind_outs.is_empty() {
+                // Pop from current wind stack and call out-thunk
+                wind_stack.pop();
+                let out_thunk = unwind_outs[0].clone();
+                let step = Rc::new(KontFrame::EvWindStep {
+                    unwind_outs: unwind_outs[1..].to_vec(),
+                    rewind_ins: rewind_ins.clone(),
+                    target_ws: target_ws.clone(),
+                    val: val.clone(),
+                    target_kont: target_kont.clone(),
+                    pos: *pos,
+                });
+                Ok(State::Invoke(out_thunk, vec![], *pos, step))
+            } else if !rewind_ins.is_empty() {
+                // Push to wind stack and call in-thunk
+                // Find the corresponding entry in target_ws
+                let entry = target_ws[wind_stack.len()].clone();
+                wind_stack.push(entry);
+                let in_thunk = rewind_ins[0].clone();
+                let step = Rc::new(KontFrame::EvWindStep {
+                    unwind_outs: vec![],
+                    rewind_ins: rewind_ins[1..].to_vec(),
+                    target_ws: target_ws.clone(),
+                    val: val.clone(),
+                    target_kont: target_kont.clone(),
+                    pos: *pos,
+                });
+                Ok(State::Invoke(in_thunk, vec![], *pos, step))
+            } else {
+                // All winding done; set final wind stack and apply continuation
+                *wind_stack = target_ws.clone();
+                apply_continuation(val.clone(), target_kont)
+            }
+        }
     }
 }
 
@@ -1044,7 +1138,7 @@ fn apply_continuation(val: Value, k: &Kont) -> Result<State, EvalError> {
 }
 
 /// CEK step: invoke a function with arguments.
-fn cek_invoke(func: Value, args: Vec<Value>, pos: Pos, kont: Kont, output: &mut String) -> Result<State, EvalError> {
+fn cek_invoke(func: Value, args: Vec<Value>, pos: Pos, kont: Kont, wind_stack: &mut Vec<WindEntry>, output: &mut String) -> Result<State, EvalError> {
     match &func {
         Value::Lambda { params, rest_param, body, env } => {
             let local_env = new_env(Some(env.clone()));
@@ -1097,7 +1191,7 @@ fn cek_invoke(func: Value, args: Vec<Value>, pos: Pos, kont: Kont, output: &mut 
             )))
         }
 
-        Value::Continuation(k) => {
+        Value::Continuation(k, saved_ws) => {
             if args.len() != 1 {
                 return Err(EvalError::Arity(format!(
                     "{pos}: continuation expects 1 argument, got {}",
@@ -1105,10 +1199,31 @@ fn cek_invoke(func: Value, args: Vec<Value>, pos: Pos, kont: Kont, output: &mut 
                 )));
             }
             let val = args.into_iter().next().expect("arity checked above");
-            // When the captured continuation has EvCallArgs at the top,
-            // re-evaluate all argument expressions so mutable bindings
-            // (like count in (+ count (call/cc ...))) are re-read.
-            apply_continuation(val, k)
+            // Do winding: unwind current, rewind to saved
+            let current_ws = wind_stack.clone();
+            let common = common_prefix_len(&current_ws, saved_ws);
+            // Unwind from innermost to outermost (reverse order)
+            let to_unwind: Vec<Value> = current_ws[common..].iter().rev().map(|e| e.out_thunk.clone()).collect();
+            // Rewind from outermost to innermost
+            let to_rewind: Vec<Value> = saved_ws[common..].iter().map(|e| e.in_thunk.clone()).collect();
+            if to_unwind.is_empty() && to_rewind.is_empty() {
+                // No winding needed
+                apply_continuation(val, k)
+            } else {
+                // Build winding continuation: unwind first, then rewind, then apply
+                let target_kont = k.clone();
+                let target_ws = saved_ws.clone();
+                let wind_kont = Rc::new(KontFrame::EvWind {
+                    unwind_outs: to_unwind,
+                    rewind_ins: to_rewind,
+                    target_ws,
+                    val: val.clone(),
+                    target_kont,
+                    pos,
+                });
+                // Start the winding process
+                cek_apply_kont(Value::Void, &wind_kont, wind_stack, output)
+            }
         }
 
         Value::Builtin(name) => {
@@ -1120,9 +1235,29 @@ fn cek_invoke(func: Value, args: Vec<Value>, pos: Pos, kont: Kont, output: &mut 
                             args.len()
                         )));
                     }
-                    let cont_val = Value::Continuation(kont.clone());
+                    let cont_val = Value::Continuation(kont.clone(), wind_stack.clone());
                     let proc = args.into_iter().next().expect("arity checked above");
                     Ok(State::Invoke(proc, vec![cont_val], pos, kont))
+                }
+                "dynamic-wind" => {
+                    if args.len() != 3 {
+                        return Err(EvalError::Arity(format!(
+                            "{pos}: dynamic-wind expects 3 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let in_thunk = args[0].clone();
+                    let body_thunk = args[1].clone();
+                    let out_thunk = args[2].clone();
+                    // Call in-thunk first; after it completes, EvDynWindAfterIn takes over
+                    let after_in = Rc::new(KontFrame::EvDynWindAfterIn {
+                        in_thunk: in_thunk.clone(),
+                        body_thunk,
+                        out_thunk,
+                        pos,
+                        next: kont,
+                    });
+                    Ok(State::Invoke(in_thunk, vec![], pos, after_in))
                 }
                 "apply" => {
                     if args.len() < 2 {
