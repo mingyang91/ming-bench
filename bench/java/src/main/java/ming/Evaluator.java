@@ -101,7 +101,8 @@ public class Evaluator {
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "define", "define-syntax", "define-record-type", "set!", "if", "quote", "lambda",
-        "case-lambda", "and", "or", "begin", "cond", "let", "letrec", "letrec*", "case", "do"
+        "case-lambda", "and", "or", "begin", "cond", "let", "let*", "letrec", "letrec*", "case", "do",
+        "when", "unless", "quasiquote"
     );
 
     // Internal string wrapper to distinguish from symbols (mutable for string-set!)
@@ -161,8 +162,14 @@ public class Evaluator {
         throw new EvalError(posStr() + "expected exact number");
     }
 
-    // Cons pair
-    record Pair(Object car, Object cdr) {}
+    // Cons pair (mutable for set-car!/set-cdr!)
+    static class Pair {
+        Object car;
+        Object cdr;
+        Pair(Object car, Object cdr) { this.car = car; this.cdr = cdr; }
+        Object car() { return car; }
+        Object cdr() { return cdr; }
+    }
 
     // Empty list sentinel
     static final Object NIL = new Object() {
@@ -240,7 +247,27 @@ public class Evaluator {
         "procedure?",
         // L14
         "eqv?", "vector", "make-vector", "vector-ref", "vector-set!",
-        "vector-length", "vector?", "vector->list", "list->vector"
+        "vector-length", "vector?", "vector->list", "list->vector",
+        // L17
+        "set-car!", "set-cdr!",
+        "caar", "cadr", "cdar", "cddr", "caddr", "cadddr",
+        "for-each", "memq", "memv", "member", "assq", "assv", "reverse",
+        "error",
+        "gcd", "lcm", "floor", "ceiling", "truncate", "round",
+        "sqrt", "exp", "log", "sin", "cos", "tan", "asin", "acos", "atan",
+        "make-string", "string",
+        "char>?", "char<=?", "char>=?",
+        "char-ci<?", "char-ci>?", "char-ci<=?", "char-ci>=?",
+        "char-whitespace?", "char-lower-case?",
+        "string>?", "string<=?", "string>=?",
+        "string-ci<?", "string-ci>?", "string-ci<=?", "string-ci>=?",
+        "complex?", "real?",
+        "write-char",
+        "call-with-current-continuation",
+        "call-with-input-file", "call-with-output-file",
+        "input-port?", "output-port?", "current-input-port", "current-output-port",
+        "open-input-file", "open-output-file", "close-input-port", "close-output-port",
+        "eof-object?", "read", "read-char", "peek-char"
     };
 
     private Env makeTopLevelEnv() {
@@ -277,6 +304,20 @@ public class Evaluator {
                 tokens.add("'");
                 tokenPositions.add(new Pos(line, col));
                 i++; col++;
+            } else if (c == '`') {
+                tokens.add("`");
+                tokenPositions.add(new Pos(line, col));
+                i++; col++;
+            } else if (c == ',') {
+                Pos startPos = new Pos(line, col);
+                i++; col++;
+                if (i < input.length() && input.charAt(i) == '@') {
+                    tokens.add(",@");
+                    i++; col++;
+                } else {
+                    tokens.add(",");
+                }
+                tokenPositions.add(startPos);
             } else if (c == '"') {
                 Pos startPos = new Pos(line, col);
                 StringBuilder sb = new StringBuilder();
@@ -407,6 +448,27 @@ public class Evaluator {
             quoteExpr.add(new Located("quote", tokenPos));
             quoteExpr.add(quoted);
             return new Located(quoteExpr, tokenPos);
+        }
+        if (token.equals("`")) {
+            Object quoted = parse(tokens, pos);
+            List<Object> qqExpr = new ArrayList<>();
+            qqExpr.add(new Located("quasiquote", tokenPos));
+            qqExpr.add(quoted);
+            return new Located(qqExpr, tokenPos);
+        }
+        if (token.equals(",")) {
+            Object unquoted = parse(tokens, pos);
+            List<Object> uqExpr = new ArrayList<>();
+            uqExpr.add(new Located("unquote", tokenPos));
+            uqExpr.add(unquoted);
+            return new Located(uqExpr, tokenPos);
+        }
+        if (token.equals(",@")) {
+            Object spliced = parse(tokens, pos);
+            List<Object> usExpr = new ArrayList<>();
+            usExpr.add(new Located("unquote-splicing", tokenPos));
+            usExpr.add(spliced);
+            return new Located(usExpr, tokenPos);
         }
         if (token.equals("#(")) {
             List<Object> elems = new ArrayList<>();
@@ -893,6 +955,49 @@ public class Evaluator {
                             }
                         }
                     }
+                    case "let*" -> {
+                        if (list.size() < 3) throw new EvalError(posStr() + "let*: bad syntax");
+                        Object bindsObj = unwrap(list.get(1));
+                        if (!(bindsObj instanceof List<?> bindingsList)) throw new EvalError(posStr() + "let*: bindings must be a list");
+                        Env letEnv = new Env(env);
+                        for (Object binding : bindingsList) {
+                            Object rawBinding = unwrap(binding);
+                            if (!(rawBinding instanceof List<?> bp) || bp.size() != 2) throw new EvalError(posStr() + "let*: bad binding");
+                            Object nameObj = unwrap(bp.get(0));
+                            if (!(nameObj instanceof String name)) throw new EvalError(posStr() + "let*: binding name must be a symbol");
+                            letEnv.define(name, eval(bp.get(1), letEnv));
+                        }
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            eval(list.get(i), letEnv);
+                        }
+                        expr = list.get(list.size() - 1); env = letEnv; continue;
+                    }
+                    case "when" -> {
+                        if (list.size() < 3) throw new EvalError(posStr() + "when: bad syntax");
+                        Object test = eval(list.get(1), env);
+                        if (!isFalse(test)) {
+                            for (int i = 2; i < list.size() - 1; i++) {
+                                eval(list.get(i), env);
+                            }
+                            expr = list.get(list.size() - 1); continue;
+                        }
+                        return VOID;
+                    }
+                    case "unless" -> {
+                        if (list.size() < 3) throw new EvalError(posStr() + "unless: bad syntax");
+                        Object test = eval(list.get(1), env);
+                        if (isFalse(test)) {
+                            for (int i = 2; i < list.size() - 1; i++) {
+                                eval(list.get(i), env);
+                            }
+                            expr = list.get(list.size() - 1); continue;
+                        }
+                        return VOID;
+                    }
+                    case "quasiquote" -> {
+                        if (list.size() != 2) throw new EvalError(posStr() + "quasiquote: bad syntax");
+                        return evalQuasiquote(list.get(1), env);
+                    }
                 }
             }
 
@@ -1140,11 +1245,17 @@ public class Evaluator {
                 Object obj = args.get(0);
                 if (obj == NIL) return 0L;
                 int count = 0;
-                while (obj instanceof Pair p) {
+                Object slow = obj, fast = obj;
+                while (fast instanceof Pair fp) {
+                    fast = fp.cdr();
                     count++;
-                    obj = p.cdr();
+                    if (!(fast instanceof Pair fp2)) break;
+                    fast = fp2.cdr();
+                    count++;
+                    slow = ((Pair) slow).cdr();
+                    if (slow == fast) throw new EvalError(posStr() + "length: circular list");
                 }
-                if (obj != NIL) throw new EvalError(posStr() + "length: not a proper list");
+                if (fast != NIL) throw new EvalError(posStr() + "length: not a proper list");
                 return (long) count;
             }
             case "append" -> {
@@ -1422,11 +1533,19 @@ public class Evaluator {
             }
             case "list?" -> {
                 requireArgCount(op, args, 1);
-                Object obj = args.get(0);
-                while (obj instanceof Pair p) {
-                    obj = p.cdr();
+                Object slow = args.get(0);
+                Object fast = args.get(0);
+                while (fast instanceof Pair fp) {
+                    fast = fp.cdr();
+                    if (!(fast instanceof Pair fp2)) {
+                        // fast reached end — check if it's NIL
+                        return fast == NIL;
+                    }
+                    fast = fp2.cdr();
+                    slow = ((Pair) slow).cdr();
+                    if (slow == fast) return Boolean.FALSE; // cycle detected
                 }
-                return obj == NIL;
+                return fast == NIL;
             }
             case "assoc" -> {
                 requireArgCount(op, args, 2);
@@ -1659,6 +1778,351 @@ public class Evaluator {
                 }
                 return new SchemeVector(elems.toArray());
             }
+            // L17 — Pair mutation
+            case "set-car!" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof Pair p)) throw new EvalError(posStr() + "set-car!: not a pair");
+                p.car = args.get(1);
+                return VOID;
+            }
+            case "set-cdr!" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof Pair p)) throw new EvalError(posStr() + "set-cdr!: not a pair");
+                p.cdr = args.get(1);
+                return VOID;
+            }
+            // cXr combinators
+            case "caar" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof Pair p1)) throw new EvalError(posStr() + "caar: not a pair");
+                if (!(p1.car() instanceof Pair p2)) throw new EvalError(posStr() + "caar: not a pair");
+                return p2.car();
+            }
+            case "cadr" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof Pair p1)) throw new EvalError(posStr() + "cadr: not a pair");
+                if (!(p1.cdr() instanceof Pair p2)) throw new EvalError(posStr() + "cadr: not a pair");
+                return p2.car();
+            }
+            case "cdar" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof Pair p1)) throw new EvalError(posStr() + "cdar: not a pair");
+                if (!(p1.car() instanceof Pair p2)) throw new EvalError(posStr() + "cdar: not a pair");
+                return p2.cdr();
+            }
+            case "cddr" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof Pair p1)) throw new EvalError(posStr() + "cddr: not a pair");
+                if (!(p1.cdr() instanceof Pair p2)) throw new EvalError(posStr() + "cddr: not a pair");
+                return p2.cdr();
+            }
+            case "caddr" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof Pair p1)) throw new EvalError(posStr() + "caddr: not a pair");
+                if (!(p1.cdr() instanceof Pair p2)) throw new EvalError(posStr() + "caddr: not a pair");
+                if (!(p2.cdr() instanceof Pair p3)) throw new EvalError(posStr() + "caddr: not a pair");
+                return p3.car();
+            }
+            case "cadddr" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof Pair p1)) throw new EvalError(posStr() + "cadddr: not a pair");
+                if (!(p1.cdr() instanceof Pair p2)) throw new EvalError(posStr() + "cadddr: not a pair");
+                if (!(p2.cdr() instanceof Pair p3)) throw new EvalError(posStr() + "cadddr: not a pair");
+                if (!(p3.cdr() instanceof Pair p4)) throw new EvalError(posStr() + "cadddr: not a pair");
+                return p4.car();
+            }
+            case "for-each" -> {
+                if (args.size() < 2) throw new EvalError(posStr() + "for-each: requires at least 2 arguments");
+                Object proc = args.get(0);
+                List<Object> lists = new ArrayList<>();
+                for (int i = 1; i < args.size(); i++) lists.add(args.get(i));
+                while (true) {
+                    boolean done = false;
+                    for (Object l : lists) {
+                        if (!(l instanceof Pair)) { done = true; break; }
+                    }
+                    if (done) break;
+                    List<Object> callArgs = new ArrayList<>();
+                    for (int i = 0; i < lists.size(); i++) {
+                        Pair p = (Pair) lists.get(i);
+                        callArgs.add(p.car());
+                        lists.set(i, p.cdr());
+                    }
+                    applyProcedure(proc, callArgs);
+                }
+                return VOID;
+            }
+            case "memq" -> {
+                requireArgCount(op, args, 2);
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof Pair p) {
+                    if (schemeEq(key, p.car())) return lst;
+                    lst = p.cdr();
+                }
+                return Boolean.FALSE;
+            }
+            case "member" -> {
+                requireArgCount(op, args, 2);
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof Pair p) {
+                    if (schemeEqual(key, p.car())) return lst;
+                    lst = p.cdr();
+                }
+                return Boolean.FALSE;
+            }
+            case "memv" -> {
+                requireArgCount(op, args, 2);
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof Pair p) {
+                    if (schemeEqv(key, p.car())) return lst;
+                    lst = p.cdr();
+                }
+                return Boolean.FALSE;
+            }
+            case "assq" -> {
+                requireArgCount(op, args, 2);
+                Object key = args.get(0);
+                Object alist = args.get(1);
+                while (alist instanceof Pair p) {
+                    if (p.car() instanceof Pair entry) {
+                        if (schemeEq(key, entry.car())) return entry;
+                    }
+                    alist = p.cdr();
+                }
+                return Boolean.FALSE;
+            }
+            case "assv" -> {
+                requireArgCount(op, args, 2);
+                Object key = args.get(0);
+                Object alist = args.get(1);
+                while (alist instanceof Pair p) {
+                    if (p.car() instanceof Pair entry) {
+                        if (schemeEqv(key, entry.car())) return entry;
+                    }
+                    alist = p.cdr();
+                }
+                return Boolean.FALSE;
+            }
+            case "reverse" -> {
+                requireArgCount(op, args, 1);
+                Object lst = args.get(0);
+                Object result = NIL;
+                while (lst instanceof Pair p) {
+                    result = new Pair(p.car(), result);
+                    lst = p.cdr();
+                }
+                return result;
+            }
+            case "error" -> {
+                if (args.isEmpty()) throw new EvalError("error");
+                StringBuilder sb = new StringBuilder();
+                sb.append(displayString(args.get(0)));
+                for (int i = 1; i < args.size(); i++) {
+                    sb.append(" ").append(schemeToString(args.get(i)));
+                }
+                throw new EvalError(sb.toString());
+            }
+            case "gcd" -> {
+                if (args.isEmpty()) return 0L;
+                long result = Math.abs(requireLong(args.get(0)));
+                for (int i = 1; i < args.size(); i++) {
+                    result = gcd(result, Math.abs(requireLong(args.get(i))));
+                }
+                return result;
+            }
+            case "lcm" -> {
+                if (args.isEmpty()) return 1L;
+                long result = Math.abs(requireLong(args.get(0)));
+                for (int i = 1; i < args.size(); i++) {
+                    long b = Math.abs(requireLong(args.get(i)));
+                    if (result == 0 || b == 0) { result = 0; } else { result = result / gcd(result, b) * b; }
+                }
+                return result;
+            }
+            case "floor" -> {
+                requireArgCount(op, args, 1);
+                if (args.get(0) instanceof Long l) return l;
+                return (long) Math.floor(toDouble(args.get(0)));
+            }
+            case "ceiling" -> {
+                requireArgCount(op, args, 1);
+                if (args.get(0) instanceof Long l) return l;
+                return (long) Math.ceil(toDouble(args.get(0)));
+            }
+            case "truncate" -> {
+                requireArgCount(op, args, 1);
+                if (args.get(0) instanceof Long l) return l;
+                double d = toDouble(args.get(0));
+                return (long)(d > 0 ? Math.floor(d) : Math.ceil(d));
+            }
+            case "round" -> {
+                requireArgCount(op, args, 1);
+                if (args.get(0) instanceof Long l) return l;
+                return Math.round(toDouble(args.get(0)));
+            }
+            case "sqrt" -> {
+                requireArgCount(op, args, 1);
+                return Math.sqrt(toDouble(args.get(0)));
+            }
+            case "exp" -> {
+                requireArgCount(op, args, 1);
+                return Math.exp(toDouble(args.get(0)));
+            }
+            case "log" -> {
+                requireArgCount(op, args, 1);
+                return Math.log(toDouble(args.get(0)));
+            }
+            case "sin" -> {
+                requireArgCount(op, args, 1);
+                return Math.sin(toDouble(args.get(0)));
+            }
+            case "cos" -> {
+                requireArgCount(op, args, 1);
+                return Math.cos(toDouble(args.get(0)));
+            }
+            case "tan" -> {
+                requireArgCount(op, args, 1);
+                return Math.tan(toDouble(args.get(0)));
+            }
+            case "asin" -> {
+                requireArgCount(op, args, 1);
+                return Math.asin(toDouble(args.get(0)));
+            }
+            case "acos" -> {
+                requireArgCount(op, args, 1);
+                return Math.acos(toDouble(args.get(0)));
+            }
+            case "atan" -> {
+                if (args.size() == 1) return Math.atan(toDouble(args.get(0)));
+                requireArgCount(op, args, 2);
+                return Math.atan2(toDouble(args.get(0)), toDouble(args.get(1)));
+            }
+            case "make-string" -> {
+                if (args.size() < 1 || args.size() > 2) throw new EvalError(posStr() + "make-string: expected 1-2 arguments");
+                int len = (int) requireLong(args.get(0));
+                char fill = args.size() > 1 && args.get(1) instanceof SchemeChar c ? c.value() : ' ';
+                char[] chars = new char[len];
+                java.util.Arrays.fill(chars, fill);
+                return new SchemeString(new String(chars));
+            }
+            case "string" -> {
+                StringBuilder sb = new StringBuilder();
+                for (Object a : args) {
+                    if (!(a instanceof SchemeChar c)) throw new EvalError(posStr() + "string: not a character");
+                    sb.append(c.value());
+                }
+                return new SchemeString(sb.toString());
+            }
+            case "char>?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeChar a) || !(args.get(1) instanceof SchemeChar b)) throw new EvalError(posStr() + "char>?: not a character");
+                return a.value() > b.value();
+            }
+            case "char<=?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeChar a) || !(args.get(1) instanceof SchemeChar b)) throw new EvalError(posStr() + "char<=?: not a character");
+                return a.value() <= b.value();
+            }
+            case "char>=?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeChar a) || !(args.get(1) instanceof SchemeChar b)) throw new EvalError(posStr() + "char>=?: not a character");
+                return a.value() >= b.value();
+            }
+            case "char-ci<?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeChar a) || !(args.get(1) instanceof SchemeChar b)) throw new EvalError(posStr() + "char-ci<?: not a character");
+                return Character.toLowerCase(a.value()) < Character.toLowerCase(b.value());
+            }
+            case "char-ci>?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeChar a) || !(args.get(1) instanceof SchemeChar b)) throw new EvalError(posStr() + "char-ci>?: not a character");
+                return Character.toLowerCase(a.value()) > Character.toLowerCase(b.value());
+            }
+            case "char-ci<=?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeChar a) || !(args.get(1) instanceof SchemeChar b)) throw new EvalError(posStr() + "char-ci<=?: not a character");
+                return Character.toLowerCase(a.value()) <= Character.toLowerCase(b.value());
+            }
+            case "char-ci>=?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeChar a) || !(args.get(1) instanceof SchemeChar b)) throw new EvalError(posStr() + "char-ci>=?: not a character");
+                return Character.toLowerCase(a.value()) >= Character.toLowerCase(b.value());
+            }
+            case "char-whitespace?" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError(posStr() + "char-whitespace?: not a character");
+                return Character.isWhitespace(c.value());
+            }
+            case "char-lower-case?" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError(posStr() + "char-lower-case?: not a character");
+                return Character.isLowerCase(c.value());
+            }
+            case "string>?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b)) throw new EvalError(posStr() + "string>?: not a string");
+                return a.value().compareTo(b.value()) > 0;
+            }
+            case "string<=?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b)) throw new EvalError(posStr() + "string<=?: not a string");
+                return a.value().compareTo(b.value()) <= 0;
+            }
+            case "string>=?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b)) throw new EvalError(posStr() + "string>=?: not a string");
+                return a.value().compareTo(b.value()) >= 0;
+            }
+            case "string-ci<?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b)) throw new EvalError(posStr() + "string-ci<?: not a string");
+                return a.value().compareToIgnoreCase(b.value()) < 0;
+            }
+            case "string-ci>?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b)) throw new EvalError(posStr() + "string-ci>?: not a string");
+                return a.value().compareToIgnoreCase(b.value()) > 0;
+            }
+            case "string-ci<=?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b)) throw new EvalError(posStr() + "string-ci<=?: not a string");
+                return a.value().compareToIgnoreCase(b.value()) <= 0;
+            }
+            case "string-ci>=?" -> {
+                requireArgCount(op, args, 2);
+                if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b)) throw new EvalError(posStr() + "string-ci>=?: not a string");
+                return a.value().compareToIgnoreCase(b.value()) >= 0;
+            }
+            case "complex?", "real?" -> {
+                requireArgCount(op, args, 1);
+                return isNumber(args.get(0));
+            }
+            case "write-char" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError(posStr() + "write-char: not a character");
+                outputBuffer.append(c.value());
+                return VOID;
+            }
+            case "call-with-current-continuation" -> {
+                throw new EvalError(posStr() + "call/cc not yet implemented");
+            }
+            case "call-with-input-file", "call-with-output-file",
+                 "open-input-file", "open-output-file",
+                 "close-input-port", "close-output-port",
+                 "read", "read-char", "peek-char" -> {
+                throw new EvalError(posStr() + op + ": I/O not supported");
+            }
+            case "input-port?", "output-port?", "eof-object?" -> {
+                requireArgCount(op, args, 1);
+                return Boolean.FALSE;
+            }
+            case "current-input-port", "current-output-port" -> {
+                requireArgCount(op, args, 0);
+                return Boolean.FALSE; // stub
+            }
             default -> throw new EvalError(posStr() + "unbound variable: " + op);
         }
     }
@@ -1808,6 +2272,46 @@ public class Evaluator {
         return null;
     }
 
+    // --- Quasiquote ---
+
+    @SuppressWarnings("unchecked")
+    private Object evalQuasiquote(Object tmpl, Env env) throws EvalError {
+        if (tmpl instanceof Located loc) tmpl = loc.value();
+        if (tmpl instanceof List<?> list) {
+            if (!list.isEmpty()) {
+                Object head = unwrap(list.get(0));
+                if (head instanceof String s && s.equals("unquote") && list.size() == 2) {
+                    return eval(list.get(1), env);
+                }
+            }
+            // Process each element, handling unquote-splicing
+            List<Object> elems = new ArrayList<>();
+            for (Object elem : list) {
+                Object raw = unwrap(elem);
+                if (raw instanceof List<?> innerList && !innerList.isEmpty()) {
+                    Object innerHead = unwrap(innerList.get(0));
+                    if (innerHead instanceof String s && s.equals("unquote-splicing") && innerList.size() == 2) {
+                        Object spliced = eval(innerList.get(1), env);
+                        // Splice the list into elems
+                        Object cur = spliced;
+                        while (cur instanceof Pair p) {
+                            elems.add(p.car());
+                            cur = p.cdr();
+                        }
+                        continue;
+                    }
+                }
+                elems.add(evalQuasiquote(elem, env));
+            }
+            Object result = NIL;
+            for (int i = elems.size() - 1; i >= 0; i--) {
+                result = new Pair(elems.get(i), result);
+            }
+            return result;
+        }
+        return quoteDatum(tmpl);
+    }
+
     // --- Helpers ---
 
     private Object quoteDatum(Object datum) {
@@ -1848,15 +2352,22 @@ public class Evaluator {
     }
 
     private boolean schemeEqual(Object a, Object b) {
+        return schemeEqualImpl(a, b, new HashSet<>());
+    }
+
+    private boolean schemeEqualImpl(Object a, Object b, Set<Long> seen) {
+        if (a == b) return true;
         if (schemeEq(a, b)) return true;
         if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
         if (a instanceof Pair pa && b instanceof Pair pb) {
-            return schemeEqual(pa.car(), pb.car()) && schemeEqual(pa.cdr(), pb.cdr());
+            long key = ((long) System.identityHashCode(pa) << 32) | (System.identityHashCode(pb) & 0xFFFFFFFFL);
+            if (!seen.add(key)) return true; // assume equal if we've seen this pair combo
+            return schemeEqualImpl(pa.car(), pb.car(), seen) && schemeEqualImpl(pa.cdr(), pb.cdr(), seen);
         }
         if (a instanceof SchemeVector va && b instanceof SchemeVector vb) {
             if (va.length() != vb.length()) return false;
             for (int i = 0; i < va.length(); i++) {
-                if (!schemeEqual(va.ref(i), vb.ref(i))) return false;
+                if (!schemeEqualImpl(va.ref(i), vb.ref(i), seen)) return false;
             }
             return true;
         }
@@ -1935,21 +2446,7 @@ public class Evaluator {
         }
         if (val == NIL) return "()";
         if (val instanceof Pair) {
-            StringBuilder sb = new StringBuilder("(");
-            Object cur = val;
-            boolean first = true;
-            while (cur instanceof Pair p) {
-                if (!first) sb.append(" ");
-                first = false;
-                sb.append(schemeToString(p.car()));
-                cur = p.cdr();
-            }
-            if (cur != NIL) {
-                sb.append(" . ");
-                sb.append(schemeToString(cur));
-            }
-            sb.append(")");
-            return sb.toString();
+            return pairToString(val, new HashSet<>());
         }
         if (val instanceof List<?> list) {
             StringBuilder sb = new StringBuilder("(");
@@ -1961,5 +2458,34 @@ public class Evaluator {
             return sb.toString();
         }
         return String.valueOf(val);
+    }
+
+    private String pairToString(Object val, Set<Object> seen) {
+        if (!(val instanceof Pair)) return schemeToString(val);
+        if (!seen.add(val)) return "...";
+        Pair firstPair = (Pair) val;
+        StringBuilder sb = new StringBuilder("(");
+        sb.append(objToStringCycleAware(firstPair.car(), seen));
+        Object cur = firstPair.cdr();
+        while (cur instanceof Pair p) {
+            if (!seen.add(p)) {
+                sb.append(" . ...");
+                break;
+            }
+            sb.append(" ");
+            sb.append(objToStringCycleAware(p.car(), seen));
+            cur = p.cdr();
+        }
+        if (!(cur instanceof Pair) && cur != NIL) {
+            sb.append(" . ");
+            sb.append(schemeToString(cur));
+        }
+        sb.append(")");
+        return sb.toString();
+    }
+
+    private String objToStringCycleAware(Object val, Set<Object> seen) {
+        if (val instanceof Pair) return pairToString(val, seen);
+        return schemeToString(val);
     }
 }
