@@ -90,7 +90,16 @@ func (v value) String() string {
 	case valPair:
 		return "(" + writePairInner(v) + ")"
 	case valChar:
-		return fmt.Sprintf("#\\%c", v.cval)
+		switch v.cval {
+		case ' ':
+			return "#\\space"
+		case '\n':
+			return "#\\newline"
+		case '\t':
+			return "#\\tab"
+		default:
+			return fmt.Sprintf("#\\%c", v.cval)
+		}
 	case valLambda:
 		return "#<procedure>"
 	case valBuiltin:
@@ -733,7 +742,13 @@ func isBuiltin(name string) bool {
 		"display", "write", "newline",
 		"string-append", "string-length", "substring", "string-ref",
 		"string->number", "number->string", "symbol->string", "string->symbol",
-		"string-copy", "string-set!":
+		"string-copy", "string-set!",
+		"abs", "modulo", "remainder", "quotient", "min", "max", "expt",
+		"zero?", "positive?", "negative?", "odd?", "even?",
+		"list-ref", "list-tail", "list?", "assoc", "map",
+		"char=?", "char<?", "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
+		"string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
+		"eq?", "equal?":
 		return true
 	}
 	return false
@@ -1072,9 +1087,362 @@ func evalBuiltin(name string, args []value, e *expr, environ *env) (value, error
 		}
 		(*args[0].mstr)[idx] = args[2].cval
 		return voidVal, nil
+
+	// --- L09 Numeric utilities ---
+
+	case "abs":
+		if len(args) != 1 || args[0].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: abs: expected 1 number", e.line, e.col)}
+		}
+		n := args[0].ival
+		if n < 0 {
+			n = -n
+		}
+		return intVal(n), nil
+
+	case "modulo":
+		if len(args) != 2 || args[0].kind != valInteger || args[1].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: modulo: expected 2 numbers", e.line, e.col)}
+		}
+		if args[1].ival == 0 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: modulo: division by zero", e.line, e.col)}
+		}
+		a, b := args[0].ival, args[1].ival
+		r := a % b
+		if r != 0 && (r < 0) != (b < 0) {
+			r += b
+		}
+		return intVal(r), nil
+
+	case "remainder":
+		if len(args) != 2 || args[0].kind != valInteger || args[1].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: remainder: expected 2 numbers", e.line, e.col)}
+		}
+		if args[1].ival == 0 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: remainder: division by zero", e.line, e.col)}
+		}
+		return intVal(args[0].ival % args[1].ival), nil
+
+	case "quotient":
+		if len(args) != 2 || args[0].kind != valInteger || args[1].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: quotient: expected 2 numbers", e.line, e.col)}
+		}
+		if args[1].ival == 0 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: quotient: division by zero", e.line, e.col)}
+		}
+		return intVal(args[0].ival / args[1].ival), nil
+
+	case "min":
+		if len(args) == 0 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: min: expected at least 1 argument", e.line, e.col)}
+		}
+		if args[0].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: min: expected number", e.line, e.col)}
+		}
+		result := args[0].ival
+		for _, v := range args[1:] {
+			if v.kind != valInteger {
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: min: expected number", e.line, e.col)}
+			}
+			if v.ival < result {
+				result = v.ival
+			}
+		}
+		return intVal(result), nil
+
+	case "max":
+		if len(args) == 0 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: max: expected at least 1 argument", e.line, e.col)}
+		}
+		if args[0].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: max: expected number", e.line, e.col)}
+		}
+		result := args[0].ival
+		for _, v := range args[1:] {
+			if v.kind != valInteger {
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: max: expected number", e.line, e.col)}
+			}
+			if v.ival > result {
+				result = v.ival
+			}
+		}
+		return intVal(result), nil
+
+	case "expt":
+		if len(args) != 2 || args[0].kind != valInteger || args[1].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: expt: expected 2 numbers", e.line, e.col)}
+		}
+		base, exp := args[0].ival, args[1].ival
+		var result int64 = 1
+		if exp < 0 {
+			return intVal(0), nil
+		}
+		for i := int64(0); i < exp; i++ {
+			result *= base
+		}
+		return intVal(result), nil
+
+	case "zero?":
+		if len(args) != 1 || args[0].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: zero?: expected 1 number", e.line, e.col)}
+		}
+		return boolVal(args[0].ival == 0), nil
+
+	case "positive?":
+		if len(args) != 1 || args[0].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: positive?: expected 1 number", e.line, e.col)}
+		}
+		return boolVal(args[0].ival > 0), nil
+
+	case "negative?":
+		if len(args) != 1 || args[0].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: negative?: expected 1 number", e.line, e.col)}
+		}
+		return boolVal(args[0].ival < 0), nil
+
+	case "odd?":
+		if len(args) != 1 || args[0].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: odd?: expected 1 number", e.line, e.col)}
+		}
+		return boolVal(args[0].ival%2 != 0), nil
+
+	case "even?":
+		if len(args) != 1 || args[0].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: even?: expected 1 number", e.line, e.col)}
+		}
+		return boolVal(args[0].ival%2 == 0), nil
+
+	// --- L09 List utilities ---
+
+	case "list-ref":
+		if len(args) != 2 || args[1].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: list-ref: expected list and integer", e.line, e.col)}
+		}
+		idx := args[1].ival
+		cur := args[0]
+		for i := int64(0); i < idx; i++ {
+			if cur.kind != valPair {
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: list-ref: index out of range", e.line, e.col)}
+			}
+			cur = cur.pair.cdr
+		}
+		if cur.kind != valPair {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: list-ref: index out of range", e.line, e.col)}
+		}
+		return cur.pair.car, nil
+
+	case "list-tail":
+		if len(args) != 2 || args[1].kind != valInteger {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: list-tail: expected list and integer", e.line, e.col)}
+		}
+		idx := args[1].ival
+		cur := args[0]
+		for i := int64(0); i < idx; i++ {
+			if cur.kind != valPair {
+				return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: list-tail: index out of range", e.line, e.col)}
+			}
+			cur = cur.pair.cdr
+		}
+		return cur, nil
+
+	case "list?":
+		if len(args) != 1 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: list?: expected 1 argument", e.line, e.col)}
+		}
+		cur := args[0]
+		for cur.kind == valPair {
+			cur = cur.pair.cdr
+		}
+		return boolVal(cur.kind == valNull), nil
+
+	case "assoc":
+		if len(args) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: assoc: expected 2 arguments", e.line, e.col)}
+		}
+		key := args[0]
+		cur := args[1]
+		for cur.kind == valPair {
+			entry := cur.pair.car
+			if entry.kind == valPair && valuesEqual(key, entry.pair.car) {
+				return entry, nil
+			}
+			cur = cur.pair.cdr
+		}
+		return boolVal(false), nil
+
+	case "map":
+		if len(args) < 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: map: expected at least 2 arguments", e.line, e.col)}
+		}
+		fn := args[0]
+		lists := args[1:]
+		result := nullVal
+		var results []value
+		for {
+			// Check if any list is exhausted
+			mapArgs := make([]value, len(lists))
+			done := false
+			for i, lst := range lists {
+				if lst.kind != valPair {
+					done = true
+					break
+				}
+				mapArgs[i] = lst.pair.car
+			}
+			if done {
+				break
+			}
+			v, err := callValue(fn, mapArgs, e, environ)
+			if err != nil {
+				return value{}, err
+			}
+			results = append(results, v)
+			// Advance all lists
+			for i, lst := range lists {
+				lists[i] = lst.pair.cdr
+			}
+		}
+		for i := len(results) - 1; i >= 0; i-- {
+			result = pairVal(results[i], result)
+		}
+		return result, nil
+
+	// --- L09 Character utilities ---
+
+	case "char=?":
+		if len(args) != 2 || args[0].kind != valChar || args[1].kind != valChar {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: char=?: expected 2 chars", e.line, e.col)}
+		}
+		return boolVal(args[0].cval == args[1].cval), nil
+
+	case "char<?":
+		if len(args) != 2 || args[0].kind != valChar || args[1].kind != valChar {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: char<?: expected 2 chars", e.line, e.col)}
+		}
+		return boolVal(args[0].cval < args[1].cval), nil
+
+	case "char-alphabetic?":
+		if len(args) != 1 || args[0].kind != valChar {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: char-alphabetic?: expected 1 char", e.line, e.col)}
+		}
+		return boolVal(unicode.IsLetter(args[0].cval)), nil
+
+	case "char-numeric?":
+		if len(args) != 1 || args[0].kind != valChar {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: char-numeric?: expected 1 char", e.line, e.col)}
+		}
+		return boolVal(unicode.IsDigit(args[0].cval)), nil
+
+	case "char-upcase":
+		if len(args) != 1 || args[0].kind != valChar {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: char-upcase: expected 1 char", e.line, e.col)}
+		}
+		return charVal(unicode.ToUpper(args[0].cval)), nil
+
+	case "char-downcase":
+		if len(args) != 1 || args[0].kind != valChar {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: char-downcase: expected 1 char", e.line, e.col)}
+		}
+		return charVal(unicode.ToLower(args[0].cval)), nil
+
+	// --- L09 String utilities ---
+
+	case "string=?":
+		if len(args) != 2 || args[0].kind != valString || args[1].kind != valString {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string=?: expected 2 strings", e.line, e.col)}
+		}
+		return boolVal(args[0].strContent() == args[1].strContent()), nil
+
+	case "string<?":
+		if len(args) != 2 || args[0].kind != valString || args[1].kind != valString {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string<?: expected 2 strings", e.line, e.col)}
+		}
+		return boolVal(args[0].strContent() < args[1].strContent()), nil
+
+	case "string-ci=?":
+		if len(args) != 2 || args[0].kind != valString || args[1].kind != valString {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-ci=?: expected 2 strings", e.line, e.col)}
+		}
+		return boolVal(strings.EqualFold(args[0].strContent(), args[1].strContent())), nil
+
+	case "string-upcase":
+		if len(args) != 1 || args[0].kind != valString {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-upcase: expected 1 string", e.line, e.col)}
+		}
+		return strVal(strings.ToUpper(args[0].strContent())), nil
+
+	case "string-downcase":
+		if len(args) != 1 || args[0].kind != valString {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: string-downcase: expected 1 string", e.line, e.col)}
+		}
+		return strVal(strings.ToLower(args[0].strContent())), nil
+
+	// --- L09 Equality ---
+
+	case "eq?":
+		if len(args) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: eq?: expected 2 arguments", e.line, e.col)}
+		}
+		return boolVal(valuesEq(args[0], args[1])), nil
+
+	case "equal?":
+		if len(args) != 2 {
+			return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: equal?: expected 2 arguments", e.line, e.col)}
+		}
+		return boolVal(valuesEqual(args[0], args[1])), nil
 	}
 
 	return value{}, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", e.line, e.col, name)}
+}
+
+// valuesEq implements eq? — identity comparison (same object or same atomic value).
+func valuesEq(a, b value) bool {
+	if a.kind != b.kind {
+		return false
+	}
+	switch a.kind {
+	case valInteger:
+		return a.ival == b.ival
+	case valBoolean:
+		return a.bval == b.bval
+	case valSymbol:
+		return a.sval == b.sval
+	case valChar:
+		return a.cval == b.cval
+	case valNull:
+		return true
+	case valPair:
+		return a.pair == b.pair
+	case valString:
+		return a.mstr != nil && b.mstr != nil && a.mstr == b.mstr
+	default:
+		return false
+	}
+}
+
+// valuesEqual implements equal? — deep structural equality.
+func valuesEqual(a, b value) bool {
+	if a.kind != b.kind {
+		return false
+	}
+	switch a.kind {
+	case valInteger:
+		return a.ival == b.ival
+	case valBoolean:
+		return a.bval == b.bval
+	case valSymbol:
+		return a.sval == b.sval
+	case valChar:
+		return a.cval == b.cval
+	case valString:
+		return a.strContent() == b.strContent()
+	case valNull:
+		return true
+	case valPair:
+		return valuesEqual(a.pair.car, b.pair.car) && valuesEqual(a.pair.cdr, b.pair.cdr)
+	default:
+		return false
+	}
 }
 
 func evalCompareVals(args []value, e *expr, cmp func(int64, int64) bool, name string) (value, error) {
@@ -1267,6 +1635,12 @@ func makeTopLevelEnv() *env {
 		"string-append", "string-length", "substring", "string-ref",
 		"string->number", "number->string", "symbol->string", "string->symbol",
 		"string-copy", "string-set!", "apply",
+		"abs", "modulo", "remainder", "quotient", "min", "max", "expt",
+		"zero?", "positive?", "negative?", "odd?", "even?",
+		"list-ref", "list-tail", "list?", "assoc", "map",
+		"char=?", "char<?", "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
+		"string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
+		"eq?", "equal?",
 	}
 	for _, name := range builtins {
 		e.set(name, builtinVal(name))
