@@ -19,6 +19,9 @@ public class Evaluator {
     private int currentLine = 1;
     private int currentCol = 1;
 
+    // Output buffer for display/write/newline
+    private StringBuilder outputBuffer = new StringBuilder();
+
     private EvalError error(String msg) {
         return new EvalError(currentLine + ":" + currentCol + " " + msg);
     }
@@ -44,7 +47,19 @@ public class Evaluator {
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        throw new EvalError("1:1 not implemented");
+        outputBuffer = new StringBuilder();
+        List<Token> tokens = tokenize(input);
+        int[] pos = {0};
+        Object lastResult = null;
+        while (pos[0] < tokens.size()) {
+            Object expr = parse(tokens, pos);
+            lastResult = eval(expr, globalEnv);
+        }
+        String output = outputBuffer.toString();
+        if (lastResult == null) {
+            throw new EvalError("1:1 no expression");
+        }
+        return new EvalResult(schemeToString(lastResult), output);
     }
 
     // --- Tokenizer ---
@@ -560,6 +575,83 @@ public class Evaluator {
             if (args.size() != 1) throw error("symbol?: expected 1 argument");
             return args.get(0) instanceof String;
         });
+
+        // Output
+        globalEnv.define("display", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("display: expected 1 argument");
+            outputBuffer.append(displayString(args.get(0)));
+            return VOID;
+        });
+        globalEnv.define("write", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("write: expected 1 argument");
+            outputBuffer.append(schemeToString(args.get(0)));
+            return VOID;
+        });
+        globalEnv.define("newline", (BuiltinProc) args -> {
+            if (args.size() != 0) throw error("newline: expected 0 arguments");
+            outputBuffer.append('\n');
+            return VOID;
+        });
+
+        // String operations
+        globalEnv.define("string-append", (BuiltinProc) args -> {
+            StringBuilder sb = new StringBuilder();
+            for (Object a : args) {
+                if (!(a instanceof SchemeString s)) throw error("string-append: not a string");
+                sb.append(s.value());
+            }
+            return new SchemeString(sb.toString());
+        });
+        globalEnv.define("string-length", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("string-length: expected 1 argument");
+            if (!(args.get(0) instanceof SchemeString s)) throw error("string-length: not a string");
+            return (long) s.value().length();
+        });
+        globalEnv.define("substring", (BuiltinProc) args -> {
+            if (args.size() != 3) throw error("substring: expected 3 arguments");
+            if (!(args.get(0) instanceof SchemeString s)) throw error("substring: not a string");
+            if (!(args.get(1) instanceof Long start)) throw error("substring: not a number");
+            if (!(args.get(2) instanceof Long end)) throw error("substring: not a number");
+            return new SchemeString(s.value().substring(start.intValue(), end.intValue()));
+        });
+        globalEnv.define("string->number", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("string->number: expected 1 argument");
+            if (!(args.get(0) instanceof SchemeString s)) throw error("string->number: not a string");
+            try {
+                return Long.parseLong(s.value());
+            } catch (NumberFormatException e) {
+                return Boolean.FALSE;
+            }
+        });
+        globalEnv.define("number->string", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("number->string: expected 1 argument");
+            if (!(args.get(0) instanceof Long n)) throw error("number->string: not a number");
+            return new SchemeString(n.toString());
+        });
+
+        // Symbol/String conversion
+        globalEnv.define("symbol->string", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("symbol->string: expected 1 argument");
+            if (!(args.get(0) instanceof String s)) throw error("symbol->string: not a symbol");
+            return new SchemeString(s);
+        });
+        globalEnv.define("string->symbol", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("string->symbol: expected 1 argument");
+            if (!(args.get(0) instanceof SchemeString s)) throw error("string->symbol: not a string");
+            return s.value();
+        });
+
+        // Character operations
+        globalEnv.define("string-ref", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("string-ref: expected 2 arguments");
+            if (!(args.get(0) instanceof SchemeString s)) throw error("string-ref: not a string");
+            if (!(args.get(1) instanceof Long idx)) throw error("string-ref: not a number");
+            return new SchemeChar(s.value().charAt(idx.intValue()));
+        });
+        globalEnv.define("char?", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("char?: expected 1 argument");
+            return args.get(0) instanceof SchemeChar;
+        });
     }
 
     // Arithmetic on already-evaluated args
@@ -625,6 +717,7 @@ public class Evaluator {
         if (val instanceof Long) return val.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
+        if (val instanceof SchemeChar ch) return "#\\" + ch.value();
         if (val instanceof Lambda) return "#<procedure>";
         if (val == NIL) return "()";
         if (val instanceof Pair) {
@@ -655,5 +748,28 @@ public class Evaluator {
         }
         if (val instanceof String s) return s; // symbol
         return val.toString();
+    }
+
+    static String displayString(Object val) {
+        if (val instanceof SchemeString s) return s.value();
+        if (val instanceof SchemeChar ch) return String.valueOf(ch.value());
+        if (val instanceof Pair) {
+            StringBuilder sb = new StringBuilder("(");
+            Object cur = val;
+            boolean first = true;
+            while (cur instanceof Pair p) {
+                if (!first) sb.append(" ");
+                first = false;
+                sb.append(displayString(p.car));
+                cur = p.cdr;
+            }
+            if (cur != NIL) {
+                sb.append(" . ");
+                sb.append(displayString(cur));
+            }
+            sb.append(")");
+            return sb.toString();
+        }
+        return schemeToString(val);
     }
 }
