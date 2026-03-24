@@ -60,8 +60,32 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	return res.String(), buf.String(), nil
 }
 
-// eval evaluates an expression in the given environment.
+// tailCall is a sentinel value for tail call optimization (trampoline).
+type tailCall struct {
+	expr *Expr
+	env  *Env
+}
+
+func (t *tailCall) String() string { return "" }
+
+// eval evaluates an expression in the given environment using a trampoline for TCO.
 func eval(expr *Expr, env *Env) (Value, error) {
+	for {
+		result, err := evalStep(expr, env)
+		if err != nil {
+			return nil, err
+		}
+		if tc, ok := result.(*tailCall); ok {
+			expr = tc.expr
+			env = tc.env
+			continue
+		}
+		return result, nil
+	}
+}
+
+// evalStep performs one step of evaluation, returning tailCall for tail positions.
+func evalStep(expr *Expr, env *Env) (Value, error) {
 	switch expr.Kind {
 	case ExprInt:
 		return &IntVal{Val: expr.IVal}, nil
@@ -168,10 +192,9 @@ func evalAnd(expr *Expr, env *Env) (Value, error) {
 	if len(expr.List) == 1 {
 		return &BoolVal{Val: true}, nil
 	}
-	var result Value
-	for _, e := range expr.List[1:] {
-		var err error
-		result, err = eval(e, env)
+	elems := expr.List[1:]
+	for _, e := range elems[:len(elems)-1] {
+		result, err := eval(e, env)
 		if err != nil {
 			return nil, err
 		}
@@ -179,17 +202,16 @@ func evalAnd(expr *Expr, env *Env) (Value, error) {
 			return result, nil
 		}
 	}
-	return result, nil
+	return &tailCall{expr: elems[len(elems)-1], env: env}, nil
 }
 
 func evalOr(expr *Expr, env *Env) (Value, error) {
 	if len(expr.List) == 1 {
 		return &BoolVal{Val: false}, nil
 	}
-	var result Value
-	for _, e := range expr.List[1:] {
-		var err error
-		result, err = eval(e, env)
+	elems := expr.List[1:]
+	for _, e := range elems[:len(elems)-1] {
+		result, err := eval(e, env)
 		if err != nil {
 			return nil, err
 		}
@@ -197,7 +219,7 @@ func evalOr(expr *Expr, env *Env) (Value, error) {
 			return result, nil
 		}
 	}
-	return result, nil
+	return &tailCall{expr: elems[len(elems)-1], env: env}, nil
 }
 
 // BuiltinFunc is a built-in procedure.
@@ -585,15 +607,13 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 			}
 			childEnv.Set(fn.RestParam, rest)
 		}
-		var result Value
-		var err error
-		for _, bodyExpr := range fn.Body {
-			result, err = eval(bodyExpr, childEnv)
+		for _, bodyExpr := range fn.Body[:len(fn.Body)-1] {
+			_, err := eval(bodyExpr, childEnv)
 			if err != nil {
 				return nil, err
 			}
 		}
-		return result, nil
+		return &tailCall{expr: fn.Body[len(fn.Body)-1], env: childEnv}, nil
 	case *CaseLambdaVal:
 		// Find matching clause by arity
 		for _, clause := range fn.Clauses {
@@ -608,15 +628,13 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 						rest = &PairVal{Car: args[i], Cdr: rest}
 					}
 					childEnv.Set(clause.RestParam, rest)
-					var result Value
-					var err error
-					for _, bodyExpr := range clause.Body {
-						result, err = eval(bodyExpr, childEnv)
+					for _, bodyExpr := range clause.Body[:len(clause.Body)-1] {
+						_, err := eval(bodyExpr, childEnv)
 						if err != nil {
 							return nil, err
 						}
 					}
-					return result, nil
+					return &tailCall{expr: clause.Body[len(clause.Body)-1], env: childEnv}, nil
 				}
 			} else {
 				if len(args) == len(clause.Params) {
@@ -624,15 +642,13 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 					for i, p := range clause.Params {
 						childEnv.Set(p, args[i])
 					}
-					var result Value
-					var err error
-					for _, bodyExpr := range clause.Body {
-						result, err = eval(bodyExpr, childEnv)
+					for _, bodyExpr := range clause.Body[:len(clause.Body)-1] {
+						_, err := eval(bodyExpr, childEnv)
 						if err != nil {
 							return nil, err
 						}
 					}
-					return result, nil
+					return &tailCall{expr: clause.Body[len(clause.Body)-1], env: childEnv}, nil
 				}
 			}
 		}
@@ -707,11 +723,22 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 			for i := range slices {
 				callArgs[i] = slices[i][j]
 			}
-			var err error
-			results[j], err = applyProc(proc, callArgs, callExpr)
+			v, err := applyProc(proc, callArgs, callExpr)
 			if err != nil {
 				return nil, err
 			}
+			// Resolve any tail calls from applyProc
+			for {
+				if tc, ok := v.(*tailCall); ok {
+					v, err = evalStep(tc.expr, tc.env)
+					if err != nil {
+						return nil, err
+					}
+					continue
+				}
+				break
+			}
+			results[j] = v
 		}
 		// Build result list
 		result := Value(&NilVal{})
@@ -766,10 +793,10 @@ func evalIf(expr *Expr, env *Env) (Value, error) {
 		return nil, err
 	}
 	if isTruthy(cond) {
-		return eval(expr.List[2], env)
+		return &tailCall{expr: expr.List[2], env: env}, nil
 	}
 	if len(expr.List) == 4 {
-		return eval(expr.List[3], env)
+		return &tailCall{expr: expr.List[3], env: env}, nil
 	}
 	return &VoidVal{}, nil
 }
@@ -854,45 +881,40 @@ func evalLet(expr *Expr, env *Env) (Value, error) {
 		for i, p := range params {
 			childEnv.Set(p, vals[i])
 		}
-		var result Value
-		var err error
-		for _, bodyExpr := range body {
-			result, err = eval(bodyExpr, childEnv)
+		for _, bodyExpr := range body[:len(body)-1] {
+			_, err := eval(bodyExpr, childEnv)
 			if err != nil {
 				return nil, err
 			}
 		}
-		return result, nil
+		return &tailCall{expr: body[len(body)-1], env: childEnv}, nil
 	}
 
 	childEnv := NewEnv(env)
 	for i, p := range params {
 		childEnv.Set(p, vals[i])
 	}
-	var result Value
-	var err error
-	for _, bodyExpr := range body {
-		result, err = eval(bodyExpr, childEnv)
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := eval(bodyExpr, childEnv)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	return &tailCall{expr: body[len(body)-1], env: childEnv}, nil
 }
 
 func evalBegin(expr *Expr, env *Env) (Value, error) {
 	if len(expr.List) < 2 {
 		return &VoidVal{}, nil
 	}
-	var result Value
-	var err error
-	for _, e := range expr.List[1:] {
-		result, err = eval(e, env)
+	body := expr.List[1:]
+	for _, e := range body[:len(body)-1] {
+		_, err := eval(e, env)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	return &tailCall{expr: body[len(body)-1], env: env}, nil
 }
 
 func evalSet(expr *Expr, env *Env) (Value, error) {
@@ -920,29 +942,28 @@ func evalCond(expr *Expr, env *Env) (Value, error) {
 		}
 		// else clause
 		if clause.List[0].Kind == ExprSymbol && clause.List[0].SVal == "else" {
-			var result Value
-			var err error
-			for _, e := range clause.List[1:] {
-				result, err = eval(e, env)
+			body := clause.List[1:]
+			for _, e := range body[:len(body)-1] {
+				_, err := eval(e, env)
 				if err != nil {
 					return nil, err
 				}
 			}
-			return result, nil
+			return &tailCall{expr: body[len(body)-1], env: env}, nil
 		}
 		test, err := eval(clause.List[0], env)
 		if err != nil {
 			return nil, err
 		}
 		if isTruthy(test) {
-			var result Value
-			for _, e := range clause.List[1:] {
-				result, err = eval(e, env)
+			body := clause.List[1:]
+			for _, e := range body[:len(body)-1] {
+				_, err = eval(e, env)
 				if err != nil {
 					return nil, err
 				}
 			}
-			return result, nil
+			return &tailCall{expr: body[len(body)-1], env: env}, nil
 		}
 	}
 	return &VoidVal{}, nil
@@ -2101,15 +2122,14 @@ func evalLetrec(expr *Expr, env *Env) (Value, error) {
 		childEnv.Set(names[i], val)
 	}
 	// Evaluate body
-	var result Value
-	var err error
-	for _, bodyExpr := range expr.List[2:] {
-		result, err = eval(bodyExpr, childEnv)
+	body := expr.List[2:]
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := eval(bodyExpr, childEnv)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	return &tailCall{expr: body[len(body)-1], env: childEnv}, nil
 }
 
 func evalLetrecStar(expr *Expr, env *Env) (Value, error) {
@@ -2132,15 +2152,14 @@ func evalLetrecStar(expr *Expr, env *Env) (Value, error) {
 		}
 		childEnv.Set(b.List[0].SVal, val)
 	}
-	var result Value
-	var err error
-	for _, bodyExpr := range expr.List[2:] {
-		result, err = eval(bodyExpr, childEnv)
+	body := expr.List[2:]
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := eval(bodyExpr, childEnv)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	return &tailCall{expr: body[len(body)-1], env: childEnv}, nil
 }
 
 func evalCase(expr *Expr, env *Env) (Value, error) {
@@ -2158,14 +2177,14 @@ func evalCase(expr *Expr, env *Env) (Value, error) {
 		}
 		// else clause
 		if clause.List[0].Kind == ExprSymbol && clause.List[0].SVal == "else" {
-			var result Value
-			for _, e := range clause.List[1:] {
-				result, err = eval(e, env)
+			body := clause.List[1:]
+			for _, e := range body[:len(body)-1] {
+				_, err = eval(e, env)
 				if err != nil {
 					return nil, err
 				}
 			}
-			return result, nil
+			return &tailCall{expr: body[len(body)-1], env: env}, nil
 		}
 		// datum list
 		if clause.List[0].Kind != ExprList {
@@ -2174,14 +2193,14 @@ func evalCase(expr *Expr, env *Env) (Value, error) {
 		for _, datum := range clause.List[0].List {
 			dv := exprToValue(datum)
 			if schemeEqv(key, dv) {
-				var result Value
-				for _, e := range clause.List[1:] {
-					result, err = eval(e, env)
+				body := clause.List[1:]
+				for _, e := range body[:len(body)-1] {
+					_, err = eval(e, env)
 					if err != nil {
 						return nil, err
 					}
 				}
-				return result, nil
+				return &tailCall{expr: body[len(body)-1], env: env}, nil
 			}
 		}
 	}
