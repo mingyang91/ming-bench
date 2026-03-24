@@ -1,5 +1,6 @@
 import { EvalError } from './evalError.js';
 let windStack = [];
+let exceptionHandlers = [];
 const NIL = { tag: 'nil' };
 function strContent(v) {
     return v.chars ? v.chars.join('') : v.value;
@@ -1222,6 +1223,11 @@ function makeGlobalEnv(outputBuf) {
     // L19: dynamic-wind
     const dynamicWindProc = { tag: 'procedure', value: (..._args) => { throw new EvalError('dynamic-wind must be applied in CPS context'); }, _dynamicWind: true };
     env.set('dynamic-wind', dynamicWindProc);
+    // L20: raise, with-exception-handler
+    const raiseProc = { tag: 'procedure', value: (..._args) => { throw new EvalError('raise must be applied in CPS context'); }, _raise: true };
+    env.set('raise', raiseProc);
+    const wehProc = { tag: 'procedure', value: (..._args) => { throw new EvalError('with-exception-handler must be applied in CPS context'); }, _withExceptionHandler: true };
+    env.set('with-exception-handler', wehProc);
     // cxr helpers
     const cxr = (ops) => ({ tag: 'procedure', value: (...args) => {
             if (args.length !== 1)
@@ -1681,6 +1687,44 @@ function applyK(func, args, k, pos) {
         const val = args.length > 0 ? args[0] : { tag: 'void' };
         const targetWind = func._capturedWind || [];
         return doWindTransition(targetWind, () => func._cont(val));
+    }
+    // L20: raise
+    if (func.tag === 'procedure' && func._raise) {
+        if (args.length !== 1)
+            throw errAt('raise requires exactly 1 argument', pos);
+        const val = args[0];
+        if (exceptionHandlers.length === 0) {
+            throw new EvalError(`unhandled exception: ${displayVal(val)}`);
+        }
+        const handler = exceptionHandlers.pop();
+        return doWindTransition(handler.wind, () => handler.handle(val));
+    }
+    // L20: with-exception-handler
+    if (func.tag === 'procedure' && func._withExceptionHandler) {
+        if (args.length !== 2)
+            throw errAt('with-exception-handler requires 2 arguments', pos);
+        const [handlerProc, thunk] = args;
+        const capturedWind = [...windStack];
+        const entry = {
+            wind: capturedWind,
+            handle: (exn) => {
+                return applyK(handlerProc, [exn], (_result) => {
+                    // Handler returned normally — re-raise
+                    if (exceptionHandlers.length === 0) {
+                        throw new EvalError(`handler returned from raise: ${displayVal(exn)}`);
+                    }
+                    const next = exceptionHandlers.pop();
+                    return doWindTransition(next.wind, () => next.handle(exn));
+                }, pos);
+            }
+        };
+        exceptionHandlers.push(entry);
+        return applyK(thunk, [], (result) => {
+            const idx = exceptionHandlers.indexOf(entry);
+            if (idx >= 0)
+                exceptionHandlers.splice(idx, 1);
+            return k(result);
+        }, pos);
     }
     // dynamic-wind
     if (func.tag === 'procedure' && func._dynamicWind) {
@@ -2207,6 +2251,62 @@ function evalK(expr, env, k) {
                         env.set(macroName, { tag: 'macro', literals: macroLiterals, rules: macroRules, defEnv: env });
                         return k({ tag: 'void' });
                     }
+                    case 'guard': {
+                        // (guard (exn clause ...) body ...)
+                        if (elems.length < 3)
+                            throw errAt('guard requires variable and body', expr.pos);
+                        const guardSpec = elems[1];
+                        if (guardSpec.tag !== 'list' || guardSpec.value.length < 1)
+                            throw errAt('guard requires (var clause ...)', expr.pos);
+                        const exnVar = guardSpec.value[0];
+                        if (exnVar.tag !== 'symbol')
+                            throw errAt('guard variable must be a symbol', expr.pos);
+                        const clauses = guardSpec.value.slice(1);
+                        const bodyExprs = elems.slice(2);
+                        const capturedWind = [...windStack];
+                        const guardEnv = new Env(env);
+                        const entry = {
+                            wind: capturedWind,
+                            handle: (exn) => {
+                                guardEnv.set(exnVar.value, exn);
+                                const tryClauses = (i) => {
+                                    if (i >= clauses.length) {
+                                        // No matching clause — re-raise
+                                        if (exceptionHandlers.length === 0) {
+                                            throw new EvalError(`unhandled exception: ${displayVal(exn)}`);
+                                        }
+                                        const next = exceptionHandlers.pop();
+                                        return doWindTransition(next.wind, () => next.handle(exn));
+                                    }
+                                    const clause = clauses[i];
+                                    if (clause.tag !== 'list' || clause.value.length < 1)
+                                        throw errAt('invalid guard clause', clause.pos);
+                                    const test = clause.value[0];
+                                    if (test.tag === 'symbol' && test.value === 'else') {
+                                        if (clause.value.length === 1)
+                                            return k({ tag: 'void' });
+                                        return evalSeqK(clause.value.slice(1), 0, guardEnv, k);
+                                    }
+                                    return evalK(test, guardEnv, (testVal) => {
+                                        if (!isFalsy(testVal)) {
+                                            if (clause.value.length === 1)
+                                                return k(testVal);
+                                            return evalSeqK(clause.value.slice(1), 0, guardEnv, k);
+                                        }
+                                        return { tag: 'bounce', fn: () => tryClauses(i + 1) };
+                                    });
+                                };
+                                return tryClauses(0);
+                            }
+                        };
+                        exceptionHandlers.push(entry);
+                        return evalSeqK(bodyExprs, 0, env, (result) => {
+                            const idx = exceptionHandlers.indexOf(entry);
+                            if (idx >= 0)
+                                exceptionHandlers.splice(idx, 1);
+                            return k(result);
+                        });
+                    }
                     case 'define-record-type': {
                         if (elems.length < 4)
                             throw errAt('define-record-type requires at least 3 arguments', expr.pos);
@@ -2309,6 +2409,7 @@ export function evalStr(input) {
     gensymCounter = 0;
     resolvedSymbols.clear();
     windStack = [];
+    exceptionHandlers = [];
     const tokens = tokenize(input);
     const exprs = parse(tokens);
     if (exprs.length === 0)
@@ -2325,6 +2426,7 @@ export function evalStrWithOutput(input) {
     gensymCounter = 0;
     resolvedSymbols.clear();
     windStack = [];
+    exceptionHandlers = [];
     const tokens = tokenize(input);
     const exprs = parse(tokens);
     if (exprs.length === 0)
