@@ -2705,5 +2705,5 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   const outputBuf: string[] = [];
   const env = makeGlobalEnv(outputBuf);
   const result = runBounce(evalSeqK(exprs, 0, env, (v) => ({ tag: 'done', value: v })));
-  return { result: display(result), output: outputBuf.join('') };
+  return { result: displayVal(result), output: outputBuf.join('') };
 }
