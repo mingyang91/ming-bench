@@ -1,5 +1,6 @@
 pub mod error;
 mod builtins;
+mod forms;
 mod macros;
 mod parser;
 mod values;
@@ -8,6 +9,12 @@ use parser::{parse_all, Expr, Pos};
 
 pub use error::EvalError;
 use builtins::apply_builtin;
+use forms::{
+    cek_eval_and, cek_eval_case, cek_eval_cond, cek_eval_define, cek_eval_do, cek_eval_let,
+    cek_eval_let_star, cek_eval_letrec, cek_eval_letrec_star, cek_eval_or,
+    cek_eval_string_set, case_clause_matches, eval_case_lambda, eval_define_record_type,
+    eval_lambda, expr_to_value, make_begin,
+};
 use macros::{eval_define_syntax, expand_macro};
 use values::{values_eq, values_equal, values_eqv, is_proper_list};
 
@@ -15,7 +22,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 #[derive(Debug, Clone)]
 pub(super) struct CaseLambdaClause {
@@ -27,7 +34,7 @@ pub(super) struct CaseLambdaClause {
 
 // ---------- Continuation ----------
 
-type Kont = Rc<KontFrame>;
+pub(super) type Kont = Rc<KontFrame>;
 
 fn halt_kont() -> Kont {
     Rc::new(KontFrame::Halt)
@@ -94,7 +101,7 @@ fn gcd(a: i64, b: i64) -> i64 {
     a
 }
 
-fn make_rational(n: i64, d: i64) -> Value {
+pub(super) fn make_rational(n: i64, d: i64) -> Value {
     let (n, d) = if d < 0 { (-n, -d) } else { (n, d) };
     let g = gcd(n.abs(), d);
     let (n, d) = (n / g, d / g);
@@ -341,11 +348,22 @@ impl fmt::Debug for EnvInner {
     }
 }
 
-fn new_env(parent: Option<Env>) -> Env {
+pub(super) fn new_env(parent: Option<Env>) -> Env {
     Rc::new(RefCell::new(EnvInner {
         bindings: HashMap::new(),
         parent,
     }))
+}
+
+fn make_hygiene_env(base: &Env, bindings: &[(String, Value)]) -> Env {
+    if bindings.is_empty() {
+        return base.clone();
+    }
+    let hyg_env = new_env(Some(base.clone()));
+    for (name, val) in bindings {
+        env_set(&hyg_env, name.clone(), val.clone());
+    }
+    hyg_env
 }
 
 pub(super) fn env_get(env: &Env, name: &str) -> Option<Value> {
@@ -386,7 +404,7 @@ fn default_env() -> Env {
 
 // ---------- Evaluator ----------
 
-fn is_truthy(v: &Value) -> bool {
+pub(super) fn is_truthy(v: &Value) -> bool {
     !matches!(v, Value::Boolean(false))
 }
 
@@ -482,7 +500,7 @@ impl fmt::Debug for KontFrame {
 }
 
 /// CEK machine state.
-enum State {
+pub(super) enum State {
     /// Evaluate an expression in an environment with a continuation
     Eval(Expr, Env, Kont),
     /// Return a value to a continuation
@@ -520,7 +538,7 @@ fn cek_run(exprs: &[Expr], env: &Env, output: &mut String) -> Result<Value, Eval
 }
 
 /// Set up state to evaluate a body (sequence of expressions).
-fn eval_body_state(body: &[Expr], env: Env, kont: Kont) -> State {
+pub(super) fn eval_body_state(body: &[Expr], env: Env, kont: Kont) -> State {
     if body.is_empty() {
         State::Apply(Value::Void, kont)
     } else if body.len() == 1 {
@@ -537,7 +555,7 @@ fn eval_body_state(body: &[Expr], env: Env, kont: Kont) -> State {
 
 /// Try to evaluate an expression eagerly without creating continuation frames.
 /// Returns None if the expression requires CPS (special forms, lambdas, call/cc, etc.)
-fn eval_simple(expr: &Expr, env: &Env, output: &mut String) -> Option<Result<Value, EvalError>> {
+pub(super) fn eval_simple(expr: &Expr, env: &Env, output: &mut String) -> Option<Result<Value, EvalError>> {
     match expr {
         Expr::Integer(n, _) => Some(Ok(Value::Integer(*n))),
         Expr::Float(f, _) => Some(Ok(Value::Float(*f))),
@@ -700,15 +718,7 @@ fn cek_eval(expr: &Expr, env: &Env, kont: Kont, _output: &mut String) -> Result<
                         // Check for macro invocation
                         if let Some(Value::Macro { literals, rules, def_env }) = env_get(env, op) {
                             let (expanded, hygiene_bindings) = expand_macro(&literals, &rules, elems, p, &def_env)?;
-                            let eval_env = if hygiene_bindings.is_empty() {
-                                env.clone()
-                            } else {
-                                let hyg_env = new_env(Some(env.clone()));
-                                for (name, val) in hygiene_bindings {
-                                    env_set(&hyg_env, name, val);
-                                }
-                                hyg_env
-                            };
+                            let eval_env = make_hygiene_env(env, &hygiene_bindings);
                             return Ok(State::Eval(expanded, eval_env, kont));
                         }
                         // Fall through to function call
@@ -828,9 +838,7 @@ fn cek_apply_kont(val: Value, kont: &Kont, _output: &mut String) -> Result<State
         }
 
         KontFrame::EvAnd { rest, env, next } => {
-            if !is_truthy(&val) {
-                Ok(State::Apply(val, next.clone()))
-            } else if rest.is_empty() {
+            if !is_truthy(&val) || rest.is_empty() {
                 Ok(State::Apply(val, next.clone()))
             } else if rest.len() == 1 {
                 Ok(State::Eval(rest[0].clone(), env.clone(), next.clone()))
@@ -845,9 +853,7 @@ fn cek_apply_kont(val: Value, kont: &Kont, _output: &mut String) -> Result<State
         }
 
         KontFrame::EvOr { rest, env, next } => {
-            if is_truthy(&val) {
-                Ok(State::Apply(val, next.clone()))
-            } else if rest.is_empty() {
+            if is_truthy(&val) || rest.is_empty() {
                 Ok(State::Apply(val, next.clone()))
             } else if rest.len() == 1 {
                 Ok(State::Eval(rest[0].clone(), env.clone(), next.clone()))
@@ -1098,7 +1104,7 @@ fn cek_invoke(func: Value, args: Vec<Value>, pos: Pos, kont: Kont, output: &mut 
                     args.len()
                 )));
             }
-            let val = args.into_iter().next().unwrap();
+            let val = args.into_iter().next().expect("arity checked above");
             // When the captured continuation has EvCallArgs at the top,
             // re-evaluate all argument expressions so mutable bindings
             // (like count in (+ count (call/cc ...))) are re-read.
@@ -1115,7 +1121,7 @@ fn cek_invoke(func: Value, args: Vec<Value>, pos: Pos, kont: Kont, output: &mut 
                         )));
                     }
                     let cont_val = Value::Continuation(kont.clone());
-                    let proc = args.into_iter().next().unwrap();
+                    let proc = args.into_iter().next().expect("arity checked above");
                     Ok(State::Invoke(proc, vec![cont_val], pos, kont))
                 }
                 "apply" => {
@@ -1231,583 +1237,6 @@ fn cek_invoke(func: Value, args: Vec<Value>, pos: Pos, kont: Kont, output: &mut 
     }
 }
 
-// ---------- CEK helpers for special forms ----------
-
-fn make_begin(exprs: &[Expr], p: Pos) -> Expr {
-    if exprs.len() == 1 {
-        exprs[0].clone()
-    } else {
-        let mut v = vec![Expr::Symbol("begin".to_string(), p)];
-        v.extend(exprs.iter().cloned());
-        Expr::List(v, p)
-    }
-}
-
-fn cek_eval_define(args: &[Expr], p: Pos, env: &Env, kont: Kont) -> Result<State, EvalError> {
-    if args.is_empty() {
-        return Err(EvalError::Arity(format!("{p}: define requires at least 2 arguments")));
-    }
-    match &args[0] {
-        Expr::Symbol(name, _) => {
-            if args.len() != 2 {
-                return Err(EvalError::Arity(format!("{p}: define requires exactly 2 arguments")));
-            }
-            let kont = Rc::new(KontFrame::EvDefine { name: name.clone(), env: env.clone(), next: kont });
-            Ok(State::Eval(args[1].clone(), env.clone(), kont))
-        }
-        Expr::List(sig, _) => {
-            if sig.is_empty() {
-                return Err(EvalError::Parse(format!("{p}: define: empty signature")));
-            }
-            let name = match &sig[0] {
-                Expr::Symbol(s, _) => s.clone(),
-                _ => return Err(EvalError::Parse(format!("{p}: define: expected function name"))),
-            };
-            let (params, rest_param) = parse_params(&sig[1..], p)?;
-            let body = args[1..].to_vec();
-            if body.is_empty() {
-                return Err(EvalError::Arity(format!("{p}: define: empty body")));
-            }
-            let lambda = Value::Lambda {
-                params,
-                rest_param,
-                body,
-                env: env.clone(),
-            };
-            env_set(env, name, lambda);
-            Ok(State::Apply(Value::Void, kont))
-        }
-        _ => Err(EvalError::Parse(format!("{p}: define: expected symbol or list"))),
-    }
-}
-
-fn cek_eval_let(args: &[Expr], p: Pos, env: &Env, kont: Kont) -> Result<State, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::Arity(format!("{p}: let requires bindings and body")));
-    }
-
-    // Named let: (let name ((var init) ...) body ...)
-    if let Expr::Symbol(loop_name, _) = &args[0] {
-        if args.len() < 3 {
-            return Err(EvalError::Arity(format!("{p}: named let requires bindings and body")));
-        }
-        let bindings_expr = match &args[1] {
-            Expr::List(b, _) => b,
-            _ => return Err(EvalError::Parse(format!("{p}: let: expected bindings list"))),
-        };
-        let mut params = Vec::new();
-        let mut binding_pairs: Vec<(String, Expr)> = Vec::new();
-        for b in bindings_expr {
-            match b {
-                Expr::List(pair, _) if pair.len() == 2 => {
-                    if let Expr::Symbol(s, _) = &pair[0] {
-                        params.push(s.clone());
-                        binding_pairs.push((s.clone(), pair[1].clone()));
-                    } else {
-                        return Err(EvalError::Parse(format!("{p}: let: expected symbol in binding")));
-                    }
-                }
-                _ => return Err(EvalError::Parse(format!("{p}: let: invalid binding"))),
-            }
-        }
-        let body = args[2..].to_vec();
-        let local_env = new_env(Some(env.clone()));
-        let lambda = Value::Lambda {
-            params: params.clone(),
-            rest_param: None,
-            body: body.clone(),
-            env: local_env.clone(),
-        };
-        env_set(&local_env, loop_name.clone(), lambda);
-
-        if binding_pairs.is_empty() {
-            return Ok(eval_body_state(&body, local_env, kont));
-        }
-        let (first_name, first_init) = binding_pairs[0].clone();
-        let rest = binding_pairs[1..].to_vec();
-        let kont = Rc::new(KontFrame::EvLetBind {
-            name: first_name,
-            rest,
-            outer_env: env.clone(),
-            local_env,
-            body,
-            next: kont,
-        });
-        return Ok(State::Eval(first_init, env.clone(), kont));
-    }
-
-    // Regular let
-    let bindings_expr = match &args[0] {
-        Expr::List(b, _) => b,
-        _ => return Err(EvalError::Parse(format!("{p}: let: expected bindings list"))),
-    };
-    let mut binding_pairs: Vec<(String, Expr)> = Vec::new();
-    for b in bindings_expr {
-        match b {
-            Expr::List(pair, _) if pair.len() == 2 => {
-                if let Expr::Symbol(s, _) = &pair[0] {
-                    binding_pairs.push((s.clone(), pair[1].clone()));
-                } else {
-                    return Err(EvalError::Parse(format!("{p}: let: expected symbol in binding")));
-                }
-            }
-            _ => return Err(EvalError::Parse(format!("{p}: let: invalid binding"))),
-        }
-    }
-    let body = args[1..].to_vec();
-    let local_env = new_env(Some(env.clone()));
-
-    if binding_pairs.is_empty() {
-        return Ok(eval_body_state(&body, local_env, kont));
-    }
-    let (first_name, first_init) = binding_pairs[0].clone();
-    let rest = binding_pairs[1..].to_vec();
-    let kont = Rc::new(KontFrame::EvLetBind {
-        name: first_name,
-        rest,
-        outer_env: env.clone(),
-        local_env,
-        body,
-        next: kont,
-    });
-    Ok(State::Eval(first_init, env.clone(), kont))
-}
-
-fn cek_eval_let_star(args: &[Expr], p: Pos, env: &Env, kont: Kont) -> Result<State, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::Arity(format!("{p}: let* requires bindings and body")));
-    }
-    let bindings_expr = match &args[0] {
-        Expr::List(b, _) => b,
-        _ => return Err(EvalError::Parse(format!("{p}: let*: expected bindings list"))),
-    };
-    let mut binding_pairs: Vec<(String, Expr)> = Vec::new();
-    for b in bindings_expr {
-        match b {
-            Expr::List(pair, _) if pair.len() == 2 => {
-                if let Expr::Symbol(s, _) = &pair[0] {
-                    binding_pairs.push((s.clone(), pair[1].clone()));
-                } else {
-                    return Err(EvalError::Parse(format!("{p}: let*: expected symbol")));
-                }
-            }
-            _ => return Err(EvalError::Parse(format!("{p}: let*: invalid binding"))),
-        }
-    }
-    let body = args[1..].to_vec();
-    let local_env = new_env(Some(env.clone()));
-
-    if binding_pairs.is_empty() {
-        return Ok(eval_body_state(&body, local_env, kont));
-    }
-    let (first_name, first_init) = binding_pairs[0].clone();
-    let rest = binding_pairs[1..].to_vec();
-    let kont = Rc::new(KontFrame::EvLetSeqBind {
-        name: first_name,
-        rest,
-        local_env: local_env.clone(),
-        body,
-        next: kont,
-    });
-    Ok(State::Eval(first_init, local_env, kont))
-}
-
-fn cek_eval_letrec(args: &[Expr], p: Pos, env: &Env, kont: Kont) -> Result<State, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::Arity(format!("{p}: letrec requires bindings and body")));
-    }
-    let bindings_expr = match &args[0] {
-        Expr::List(b, _) => b,
-        _ => return Err(EvalError::Parse(format!("{p}: letrec: expected bindings list"))),
-    };
-    let local_env = new_env(Some(env.clone()));
-    let mut binding_pairs: Vec<(String, Expr)> = Vec::new();
-    for b in bindings_expr {
-        match b {
-            Expr::List(pair, _) if pair.len() == 2 => {
-                if let Expr::Symbol(s, _) = &pair[0] {
-                    env_set(&local_env, s.clone(), Value::Void);
-                    binding_pairs.push((s.clone(), pair[1].clone()));
-                } else {
-                    return Err(EvalError::Parse(format!("{p}: letrec: expected symbol")));
-                }
-            }
-            _ => return Err(EvalError::Parse(format!("{p}: letrec: invalid binding"))),
-        }
-    }
-    let body = args[1..].to_vec();
-
-    if binding_pairs.is_empty() {
-        return Ok(eval_body_state(&body, local_env, kont));
-    }
-    let (first_name, first_init) = binding_pairs[0].clone();
-    let rest = binding_pairs[1..].to_vec();
-    let kont = Rc::new(KontFrame::EvLetSeqBind {
-        name: first_name,
-        rest,
-        local_env: local_env.clone(),
-        body,
-        next: kont,
-    });
-    Ok(State::Eval(first_init, local_env, kont))
-}
-
-fn cek_eval_letrec_star(args: &[Expr], p: Pos, env: &Env, kont: Kont) -> Result<State, EvalError> {
-    // Same implementation as letrec (evaluate inits in local_env sequentially)
-    cek_eval_letrec(args, p, env, kont)
-}
-
-fn cek_eval_and(exprs: &[Expr], env: &Env, kont: Kont) -> Result<State, EvalError> {
-    if exprs.is_empty() {
-        return Ok(State::Apply(Value::Boolean(true), kont));
-    }
-    if exprs.len() == 1 {
-        return Ok(State::Eval(exprs[0].clone(), env.clone(), kont));
-    }
-    let kont = Rc::new(KontFrame::EvAnd {
-        rest: exprs[1..].to_vec(),
-        env: env.clone(),
-        next: kont,
-    });
-    Ok(State::Eval(exprs[0].clone(), env.clone(), kont))
-}
-
-fn cek_eval_or(exprs: &[Expr], env: &Env, kont: Kont) -> Result<State, EvalError> {
-    if exprs.is_empty() {
-        return Ok(State::Apply(Value::Boolean(false), kont));
-    }
-    if exprs.len() == 1 {
-        return Ok(State::Eval(exprs[0].clone(), env.clone(), kont));
-    }
-    let kont = Rc::new(KontFrame::EvOr {
-        rest: exprs[1..].to_vec(),
-        env: env.clone(),
-        next: kont,
-    });
-    Ok(State::Eval(exprs[0].clone(), env.clone(), kont))
-}
-
-fn cek_eval_cond(clauses: &[Expr], env: &Env, kont: Kont) -> Result<State, EvalError> {
-    // Use a loop to avoid creating continuation frames for simple tests
-    let mut idx = 0;
-    while idx < clauses.len() {
-        let clause = &clauses[idx];
-        match clause {
-            Expr::List(parts, _) if !parts.is_empty() => {
-                if let Expr::Symbol(s, _) = &parts[0] {
-                    if s == "else" {
-                        return Ok(eval_body_state(&parts[1..], env.clone(), kont));
-                    }
-                }
-                // Fast path: try evaluating test eagerly
-                // (need a mutable output — use empty string since we're in a non-output context)
-                let mut dummy_output = String::new();
-                if let Some(test_result) = eval_simple(&parts[0], env, &mut dummy_output) {
-                    let test_val = test_result?;
-                    if is_truthy(&test_val) {
-                        if parts.len() <= 1 {
-                            return Ok(State::Apply(test_val, kont));
-                        }
-                        return Ok(eval_body_state(&parts[1..], env.clone(), kont));
-                    }
-                    // Test was false, try next clause
-                    idx += 1;
-                    continue;
-                }
-                // Slow path: need continuation for this test
-                let body = parts[1..].to_vec();
-                let rest = clauses[idx + 1..].to_vec();
-                let kont = Rc::new(KontFrame::EvCondTest {
-                    body,
-                    rest_clauses: rest,
-                    env: env.clone(),
-                    next: kont,
-                });
-                return Ok(State::Eval(parts[0].clone(), env.clone(), kont));
-            }
-            _ => return Err(EvalError::Parse("cond: invalid clause".into())),
-        }
-    }
-    Ok(State::Apply(Value::Void, kont))
-}
-
-fn cek_eval_case(args: &[Expr], p: Pos, env: &Env, kont: Kont) -> Result<State, EvalError> {
-    if args.is_empty() {
-        return Err(EvalError::Arity(format!("{p}: case requires key and clauses")));
-    }
-    let kont = Rc::new(KontFrame::EvCaseKey {
-        clauses: args[1..].to_vec(),
-        env: env.clone(),
-        next: kont,
-    });
-    Ok(State::Eval(args[0].clone(), env.clone(), kont))
-}
-
-fn cek_eval_string_set(args: &[Expr], p: Pos, env: &Env, kont: Kont) -> Result<State, EvalError> {
-    if args.len() != 3 {
-        return Err(EvalError::Arity(format!("{p}: string-set! requires 3 arguments")));
-    }
-    let var_name = match &args[0] {
-        Expr::Symbol(name, _) => name.clone(),
-        _ => return Err(EvalError::Type(format!("{p}: string-set!: first argument must be a variable"))),
-    };
-    let kont = Rc::new(KontFrame::EvStrSetIdx {
-        var_name,
-        char_expr: args[2].clone(),
-        env: env.clone(),
-        pos: p,
-        next: kont,
-    });
-    Ok(State::Eval(args[1].clone(), env.clone(), kont))
-}
-
-fn cek_eval_do(args: &[Expr], p: Pos, env: &Env, kont: Kont) -> Result<State, EvalError> {
-    // Note: do is desugared to named let, which is then handled by cek_eval_let.
-    // Desugar (do ((var init step?) ...) (test result...) body...)
-    // to (let __do ((var init) ...) (if test (begin result...) (begin body... (__do step...))))
-    if args.len() < 2 {
-        return Err(EvalError::Arity(format!("{p}: do requires bindings and test")));
-    }
-    let bindings_list = match &args[0] {
-        Expr::List(b, _) => b,
-        _ => return Err(EvalError::Parse(format!("{p}: do: expected bindings list"))),
-    };
-    let test_clause = match &args[1] {
-        Expr::List(parts, _) if !parts.is_empty() => parts,
-        _ => return Err(EvalError::Parse(format!("{p}: do: expected test clause"))),
-    };
-    let body = &args[2..];
-
-    let mut var_names = Vec::new();
-    let mut init_exprs = Vec::new();
-    let mut step_exprs = Vec::new();
-
-    for b in bindings_list {
-        match b {
-            Expr::List(parts, _) if parts.len() >= 2 => {
-                let name = match &parts[0] {
-                    Expr::Symbol(n, _) => n.clone(),
-                    _ => return Err(EvalError::Parse(format!("{p}: do: expected variable name"))),
-                };
-                init_exprs.push(parts[1].clone());
-                if parts.len() >= 3 {
-                    step_exprs.push(parts[2].clone());
-                } else {
-                    step_exprs.push(Expr::Symbol(name.clone(), p));
-                }
-                var_names.push(name);
-            }
-            _ => return Err(EvalError::Parse(format!("{p}: do: invalid binding"))),
-        }
-    }
-
-    let loop_name = "__do_loop__";
-
-    // Build named let bindings
-    let let_bindings: Vec<Expr> = var_names.iter().zip(init_exprs.iter())
-        .map(|(name, init)| Expr::List(vec![Expr::Symbol(name.clone(), p), init.clone()], p))
-        .collect();
-
-    // Build test result body
-    let result_body = if test_clause.len() == 1 {
-        // No result expressions, return void
-        Expr::List(vec![Expr::Symbol("begin".to_string(), p)], p)
-    } else if test_clause.len() == 2 {
-        test_clause[1].clone()
-    } else {
-        let mut begin = vec![Expr::Symbol("begin".to_string(), p)];
-        begin.extend(test_clause[1..].iter().cloned());
-        Expr::List(begin, p)
-    };
-
-    // Build loop call with step expressions
-    let mut loop_call_args = vec![Expr::Symbol(loop_name.to_string(), p)];
-    loop_call_args.extend(step_exprs);
-    let loop_call = Expr::List(loop_call_args, p);
-
-    // Build else branch
-    let else_body = if body.is_empty() {
-        loop_call
-    } else {
-        let mut begin = vec![Expr::Symbol("begin".to_string(), p)];
-        begin.extend(body.iter().cloned());
-        begin.push(loop_call);
-        Expr::List(begin, p)
-    };
-
-    // Build if expression
-    let if_expr = Expr::List(vec![
-        Expr::Symbol("if".to_string(), p),
-        test_clause[0].clone(),
-        result_body,
-        else_body,
-    ], p);
-
-    // Build named let
-    let named_let = Expr::List(vec![
-        Expr::Symbol("let".to_string(), p),
-        Expr::Symbol(loop_name.to_string(), p),
-        Expr::List(let_bindings, p),
-        if_expr,
-    ], p);
-
-    // The desugared form is a `let` expression, evaluate it via cek_eval_let
-    let Expr::List(let_elems, _) = &named_let else { unreachable!() };
-    cek_eval_let(&let_elems[1..], p, env, kont)
-}
-
-// ---------- Helpers ----------
-
-fn expr_to_value(expr: &Expr) -> Value {
-    match expr {
-        Expr::Integer(n, _) => Value::Integer(*n),
-        Expr::Float(f, _) => Value::Float(*f),
-        Expr::Rational(n, d, _) => make_rational(*n, *d),
-        Expr::Boolean(b, _) => Value::Boolean(*b),
-        Expr::Str(s, _) => Value::Str(s.clone()),
-        Expr::Symbol(s, _) => Value::Symbol(s.clone()),
-        Expr::Char(c, _) => Value::Char(*c),
-        Expr::List(elems, _) => Value::List(elems.iter().map(expr_to_value).collect()),
-    }
-}
-
-fn parse_params(param_exprs: &[Expr], call_pos: Pos) -> Result<(Vec<String>, Option<String>), EvalError> {
-    let mut params = Vec::new();
-    let mut rest_param = None;
-    let mut i = 0;
-    while i < param_exprs.len() {
-        match &param_exprs[i] {
-            Expr::Symbol(s, _) if s == "." => {
-                if i + 1 >= param_exprs.len() {
-                    return Err(EvalError::Parse(format!("{call_pos}: expected rest parameter after .")));
-                }
-                rest_param = Some(match &param_exprs[i + 1] {
-                    Expr::Symbol(s, _) => s.clone(),
-                    _ => return Err(EvalError::Parse(format!("{call_pos}: expected symbol for rest parameter"))),
-                });
-                break;
-            }
-            Expr::Symbol(s, _) => params.push(s.clone()),
-            _ => return Err(EvalError::Parse(format!("{call_pos}: expected parameter name"))),
-        }
-        i += 1;
-    }
-    Ok((params, rest_param))
-}
-
-fn eval_lambda(args: &[Expr], call_pos: Pos, env: &Env) -> Result<Value, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::Arity(format!("{call_pos}: lambda requires params and body")));
-    }
-    let (params, rest_param) = match &args[0] {
-        Expr::List(elems, _) => parse_params(elems, call_pos)?,
-        _ => return Err(EvalError::Parse(format!("{call_pos}: lambda: expected parameter list"))),
-    };
-    let body = args[1..].to_vec();
-    Ok(Value::Lambda {
-        params,
-        rest_param,
-        body,
-        env: env.clone(),
-    })
-}
-
-fn eval_case_lambda(args: &[Expr], call_pos: Pos, env: &Env) -> Result<Value, EvalError> {
-    if args.is_empty() {
-        return Err(EvalError::Arity(format!("{call_pos}: case-lambda requires at least one clause")));
-    }
-    let mut clauses = Vec::new();
-    for arg in args {
-        match arg {
-            Expr::List(clause_elems, _) => {
-                if clause_elems.len() < 2 {
-                    return Err(EvalError::Parse(format!("{call_pos}: case-lambda clause needs params and body")));
-                }
-                let (params, rest_param) = match &clause_elems[0] {
-                    Expr::List(elems, _) => parse_params(elems, call_pos)?,
-                    _ => return Err(EvalError::Parse(format!("{call_pos}: case-lambda: expected parameter list"))),
-                };
-                let body = clause_elems[1..].to_vec();
-                clauses.push(CaseLambdaClause { params, rest_param, body, env: env.clone() });
-            }
-            _ => return Err(EvalError::Parse(format!("{call_pos}: case-lambda: expected clause list"))),
-        }
-    }
-    Ok(Value::CaseLambda { clauses })
-}
-
-// ---------- define-record-type ----------
-
-fn eval_define_record_type(args: &[Expr], p: Pos, env: &Env) -> Result<Value, EvalError> {
-    if args.len() < 3 {
-        return Err(EvalError::Arity(format!("{p}: define-record-type requires at least 3 args")));
-    }
-    let type_name = match &args[0] {
-        Expr::Symbol(name, _) => name.clone(),
-        _ => return Err(EvalError::Parse(format!("{p}: define-record-type: expected type name"))),
-    };
-    let type_id = RECORD_TYPE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let (ctor_name, ctor_fields) = match &args[1] {
-        Expr::List(elems, _) if !elems.is_empty() => {
-            let name = match &elems[0] {
-                Expr::Symbol(n, _) => n.clone(),
-                _ => return Err(EvalError::Parse(format!("{p}: define-record-type: expected constructor name"))),
-            };
-            let fields: Vec<String> = elems[1..]
-                .iter()
-                .map(|e| match e {
-                    Expr::Symbol(n, _) => Ok(n.clone()),
-                    _ => Err(EvalError::Parse(format!("{p}: define-record-type: expected field name"))),
-                })
-                .collect::<Result<_, _>>()?;
-            (name, fields)
-        }
-        _ => return Err(EvalError::Parse(format!("{p}: define-record-type: expected constructor"))),
-    };
-    let pred_name = match &args[2] {
-        Expr::Symbol(name, _) => name.clone(),
-        _ => return Err(EvalError::Parse(format!("{p}: define-record-type: expected predicate name"))),
-    };
-    let mut field_accessors: Vec<(String, String)> = Vec::new();
-    for arg in &args[3..] {
-        match arg {
-            Expr::List(elems, _) if elems.len() == 2 => {
-                let field = match &elems[0] {
-                    Expr::Symbol(n, _) => n.clone(),
-                    _ => return Err(EvalError::Parse(format!("{p}: define-record-type: expected field name in accessor"))),
-                };
-                let accessor = match &elems[1] {
-                    Expr::Symbol(n, _) => n.clone(),
-                    _ => return Err(EvalError::Parse(format!("{p}: define-record-type: expected accessor name"))),
-                };
-                field_accessors.push((field, accessor));
-            }
-            _ => return Err(EvalError::Parse(format!("{p}: define-record-type: expected (field accessor)"))),
-        }
-    }
-    env_set(env, ctor_name, Value::RecordConstructor {
-        type_id,
-        type_name: type_name.clone(),
-        field_names: ctor_fields,
-    });
-    env_set(env, pred_name, Value::RecordPredicate { type_id });
-    for (field_name, accessor_name) in &field_accessors {
-        env_set(env, accessor_name.clone(), Value::RecordAccessor {
-            type_id,
-            field_name: field_name.clone(),
-        });
-    }
-    Ok(Value::Void)
-}
-
-fn case_clause_matches(key: &Value, parts: &[Expr]) -> bool {
-    if let Expr::List(datums, _) = &parts[0] {
-        datums.iter().any(|d| values_eqv(key, &expr_to_value(d)))
-    } else {
-        false
-    }
-}
-
 pub(super) fn as_integer(v: &Value, call_pos: Pos) -> Result<i64, EvalError> {
     match v {
         Value::Integer(n) => Ok(*n),
@@ -1826,7 +1255,7 @@ pub(super) fn value_to_f64(v: &Value, call_pos: Pos) -> Result<f64, EvalError> {
 
 // ---------- Macros (syntax-rules) ----------
 
-static RECORD_TYPE_COUNTER: AtomicU64 = AtomicU64::new(0);
+pub(super) static RECORD_TYPE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(super) const SPECIAL_FORMS: &[&str] = &[
     "define", "if", "quote", "lambda", "case-lambda", "let", "begin", "cond", "and", "or",
