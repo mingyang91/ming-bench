@@ -71,6 +71,10 @@ type contJump struct {
 // contFrameStack tracks the current evaluation context for continuation capture.
 var contFrameStack []contFrame
 
+// dynamicWindStack tracks active dynamic-wind extents.
+var dynamicWindStack []windRecord
+var windIDCounter int
+
 // eval evaluates an expression in the given environment using a trampoline for TCO.
 func eval(expr *Expr, env *Env) (Value, error) {
 	for {
@@ -90,6 +94,7 @@ func eval(expr *Expr, env *Env) (Value, error) {
 // evalTopLevel evaluates top-level expressions with continuation support.
 func evalTopLevel(exprs []*Expr, env *Env) (Value, error) {
 	contFrameStack = contFrameStack[:0]
+	dynamicWindStack = dynamicWindStack[:0]
 
 	result, err, cj := protectedEval(func() (Value, error) {
 		contFrameStack = append(contFrameStack, contFrame{Kind: frameTopLevel, Exprs: exprs, Env: env})
@@ -169,6 +174,30 @@ func callWithContRecover(k *ContinuationVal, fn func() (Value, error)) (result V
 
 // callccInjectValue, when non-nil, makes the next call/cc return this value directly.
 var callccInjectValue *Value
+
+// windDummyExpr is used for error context when calling wind thunks.
+var windDummyExpr = &Expr{Kind: ExprList, List: []*Expr{{Kind: ExprSymbol, SVal: "dynamic-wind"}}}
+
+// callThunk calls a zero-argument procedure and resolves tail calls.
+func callThunk(thunk Value, callExpr *Expr) (Value, error) {
+	if callExpr == nil {
+		callExpr = windDummyExpr
+	}
+	result, err := applyProc(thunk, []Value{}, callExpr)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		tc, ok := result.(*tailCall)
+		if !ok {
+			return result, nil
+		}
+		result, err = evalStep(tc.expr, tc.env)
+		if err != nil {
+			return nil, err
+		}
+	}
+}
 
 // execContinuation re-evaluates from a captured continuation's frames.
 func execContinuation(cont *ContinuationVal, value Value) (Value, error) {
@@ -536,6 +565,9 @@ func defaultEnv(output *strings.Builder) *Env {
 	// L18 builtins — first-class continuations
 	env.Set("call/cc", &CallCCVal{})
 	env.Set("call-with-current-continuation", &CallCCVal{})
+
+	// L19 builtins — dynamic-wind
+	env.Set("dynamic-wind", &DynamicWindVal{})
 
 	return env
 }
@@ -910,6 +942,54 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 			result = &PairVal{Car: results[i], Cdr: result}
 		}
 		return result, nil
+	case *DynamicWindVal:
+		if len(args) != 3 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: dynamic-wind: expected 3 arguments, got %d", callExpr.Line, callExpr.Col, len(args))}
+		}
+		inThunk, bodyThunk, outThunk := args[0], args[1], args[2]
+
+		// Call in-thunk
+		_, err := callThunk(inThunk, callExpr)
+		if err != nil {
+			return nil, err
+		}
+
+		// Push wind record
+		windIDCounter++
+		rec := windRecord{id: windIDCounter, inThunk: inThunk, outThunk: outThunk}
+		dynamicWindStack = append(dynamicWindStack, rec)
+
+		// Call body-thunk, ensuring out-thunk runs on any exit
+		var bodyResult Value
+		var bodyErr error
+		var jumped *contJump
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if cj, ok := r.(*contJump); ok {
+						jumped = cj
+					} else {
+						panic(r)
+					}
+				}
+				// Pop wind record
+				if len(dynamicWindStack) > 0 {
+					dynamicWindStack = dynamicWindStack[:len(dynamicWindStack)-1]
+				}
+				// Run out-thunk (ignore errors from out-thunk)
+				callThunk(outThunk, callExpr)
+			}()
+			bodyResult, bodyErr = callThunk(bodyThunk, callExpr)
+		}()
+
+		if jumped != nil {
+			panic(jumped)
+		}
+		if bodyErr != nil {
+			return nil, bodyErr
+		}
+		return bodyResult, nil
 	case *CallCCVal:
 		if len(args) != 1 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: call/cc: expected 1 argument, got %d", callExpr.Line, callExpr.Col, len(args))}
@@ -920,10 +1000,12 @@ func applyProc(op Value, args []Value, callExpr *Expr) (Value, error) {
 			callccInjectValue = nil
 			return val, nil
 		}
-		// Capture current continuation (snapshot the frame stack)
+		// Capture current continuation (snapshot the frame stack and wind stack)
 		frames := make([]contFrame, len(contFrameStack))
 		copy(frames, contFrameStack)
-		k := &ContinuationVal{Frames: frames}
+		winds := make([]windRecord, len(dynamicWindStack))
+		copy(winds, dynamicWindStack)
+		k := &ContinuationVal{Frames: frames, WindStack: winds}
 		// Call proc(k) with escape continuation recovery
 		result, err := callWithContRecover(k, func() (Value, error) {
 			return applyProc(args[0], []Value{k}, callExpr)
@@ -2500,7 +2582,7 @@ func builtinProcedureQ(args []Value) (Value, error) {
 		return nil, fmt.Errorf("procedure?: expected 1 argument, got %d", len(args))
 	}
 	switch args[0].(type) {
-	case *LambdaVal, *CaseLambdaVal, *BuiltinFunc, *ApplyVal, *MapVal, *CallCCVal, *ContinuationVal:
+	case *LambdaVal, *CaseLambdaVal, *BuiltinFunc, *ApplyVal, *MapVal, *CallCCVal, *ContinuationVal, *DynamicWindVal:
 		return &BoolVal{Val: true}, nil
 	}
 	return &BoolVal{Val: false}, nil

@@ -338,9 +338,22 @@ type CallCCVal struct{}
 
 func (v *CallCCVal) String() string { return "#<procedure call/cc>" }
 
+// DynamicWindVal is the first-class dynamic-wind procedure.
+type DynamicWindVal struct{}
+
+func (v *DynamicWindVal) String() string { return "#<procedure dynamic-wind>" }
+
+// windRecord tracks an active dynamic-wind extent.
+type windRecord struct {
+	id       int
+	inThunk  Value
+	outThunk Value
+}
+
 // ContinuationVal represents a captured first-class continuation.
 type ContinuationVal struct {
-	Frames []contFrame
+	Frames    []contFrame
+	WindStack []windRecord
 }
 
 func (v *ContinuationVal) String() string { return "#<continuation>" }
