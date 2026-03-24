@@ -57,6 +57,7 @@ const (
 	valRecord
 	valGoFunc
 	valVector
+	valContinuation
 )
 
 type Value struct {
@@ -84,6 +85,9 @@ type Value struct {
 	goName string // name for display
 	// string immutability (L15)
 	immutable bool
+	// continuation fields (L18)
+	contTag     *contTag
+	contCapture *contCapture
 }
 
 type caseClause struct {
@@ -307,6 +311,8 @@ func (v *Value) String() string {
 		return "#<record>"
 	case valGoFunc:
 		return "#<procedure>"
+	case valContinuation:
+		return "#<continuation>"
 	case valVector:
 		parts := make([]string, len(v.recordFields))
 		for i, el := range v.recordFields {
@@ -380,9 +386,35 @@ func isTruthy(v *Value) bool {
 	return !(v.typ == valBool && !v.bval)
 }
 
+// ---------- Continuation types (L18) ----------
+
+type contTag struct{} // unique identity per call/cc invocation
+
+type contCapture struct {
+	ccNode   *astNode                     // AST node of the call/cc call (for override matching)
+	replayFn func(v *Value) (*Value, error) // replays from the capture point with value v
+}
+
+type contInvoke struct {
+	cont  *Value // the continuation value being invoked
+	value *Value // the argument passed to the continuation
+}
+
+type bodyCtx struct {
+	exprs []*astNode // body expressions of the enclosing let/letrec
+	idx   int        // current expression index
+	env   *env       // environment for this body
+}
+
 // interp holds interpreter state including output buffer.
 type interp struct {
 	output strings.Builder
+	// continuation support
+	ccOverrides  map[*astNode]*Value // call/cc return value overrides for replay
+	topExprs     []*astNode          // top-level expressions
+	topIdx       int                 // current top-level expression index
+	topEnv       *env                // top-level environment
+	innerBodyCtx *bodyCtx            // innermost let/letrec body context (nil if not in one)
 }
 
 // ---------- Tokenizer ----------
@@ -840,6 +872,8 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 			return evalCase(node, e, ip)
 		case "do":
 			return evalDo(node, e, ip)
+		case "call/cc", "call-with-current-continuation":
+			return evalCallCCForm(node, e, ip)
 		}
 
 		// Check if symbol resolves to a macro
@@ -883,6 +917,14 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 		return op.goFunc(args)
 	}
 
+	// Continuation application
+	if op.typ == valContinuation {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: expected 1 argument", node.line, node.col)}
+		}
+		panic(&contInvoke{cont: op, value: args[0]})
+	}
+
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", node.line, node.col)}
 }
 
@@ -924,6 +966,125 @@ func evalOr(node *astNode, e *env, ip *interp) (*Value, error) {
 		}
 	}
 	return boolVal(false), nil // unreachable
+}
+
+// ---------- call/cc (L18) ----------
+
+// evalCallCCForm handles (call/cc f) and (call-with-current-continuation f) as special forms.
+func evalCallCCForm(node *astNode, e *env, ip *interp) (*Value, error) {
+	if len(node.children) != 2 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: call/cc: need 1 argument", node.line, node.col)}
+	}
+	// Check for override (reentrant replay)
+	if ip.ccOverrides != nil {
+		if ov, ok := ip.ccOverrides[node]; ok {
+			delete(ip.ccOverrides, node)
+			return ov, nil
+		}
+	}
+	f, err := eval(node.children[1], e, ip)
+	if err != nil {
+		return nil, err
+	}
+	return doCallCC(f, node, ip)
+}
+
+// doCallCC is the core call/cc implementation shared by the special form and builtin paths.
+func doCallCC(f *Value, callNode *astNode, ip *interp) (*Value, error) {
+	if f.typ != valLambda && f.typ != valGoFunc && f.typ != valContinuation {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: call/cc: argument must be a procedure", callNode.line, callNode.col)}
+	}
+
+	tag := &contTag{}
+
+	// Build replay function capturing the current evaluation context
+	var replayFn func(v *Value) (*Value, error)
+	if ip.innerBodyCtx != nil {
+		// call/cc is inside a let/letrec body — replay from the body level
+		bodyExprs := ip.innerBodyCtx.exprs
+		bodyIdx := ip.innerBodyCtx.idx
+		bodyEnv := ip.innerBodyCtx.env
+		topExprs := ip.topExprs
+		topIdx := ip.topIdx
+		topEnv := ip.topEnv
+		replayFn = func(v *Value) (*Value, error) {
+			if ip.ccOverrides == nil {
+				ip.ccOverrides = make(map[*astNode]*Value)
+			}
+			ip.ccOverrides[callNode] = v
+			var result *Value
+			for i := bodyIdx; i < len(bodyExprs); i++ {
+				r, err := eval(bodyExprs[i], bodyEnv, ip)
+				if err != nil {
+					return nil, err
+				}
+				result = r
+			}
+			for i := topIdx + 1; i < len(topExprs); i++ {
+				r, err := eval(topExprs[i], topEnv, ip)
+				if err != nil {
+					return nil, err
+				}
+				result = r
+			}
+			return result, nil
+		}
+	} else {
+		// call/cc at top level or inside a lambda — replay from the top-level expression
+		topExprs := ip.topExprs
+		topIdx := ip.topIdx
+		topEnv := ip.topEnv
+		replayFn = func(v *Value) (*Value, error) {
+			if ip.ccOverrides == nil {
+				ip.ccOverrides = make(map[*astNode]*Value)
+			}
+			ip.ccOverrides[callNode] = v
+			var result *Value
+			for i := topIdx; i < len(topExprs); i++ {
+				r, err := eval(topExprs[i], topEnv, ip)
+				if err != nil {
+					return nil, err
+				}
+				result = r
+			}
+			return result, nil
+		}
+	}
+
+	capture := &contCapture{ccNode: callNode, replayFn: replayFn}
+	k := &Value{typ: valContinuation, contTag: tag, contCapture: capture}
+
+	// Call f(k) with escape handling
+	var result *Value
+	var fErr error
+	escaped := false
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if ci, ok := r.(*contInvoke); ok && ci.cont.contTag == tag {
+					result = ci.value
+					escaped = true
+					return
+				}
+				panic(r) // not ours — re-panic
+			}
+		}()
+		if f.typ == valLambda {
+			result, fErr = applyLambdaFull(f, []*Value{k}, callNode, ip)
+		} else if f.typ == valGoFunc {
+			result, fErr = f.goFunc([]*Value{k})
+		} else if f.typ == valContinuation {
+			// (call/cc some-continuation) — invoke it with k
+			panic(&contInvoke{cont: f, value: k})
+		}
+	}()
+
+	_ = escaped
+	if fErr != nil {
+		return nil, fErr
+	}
+	return result, nil
 }
 
 func evalDefine(node *astNode, e *env, ip *interp) (*Value, error) {
@@ -1133,15 +1294,22 @@ func evalLet(node *astNode, e *env, ip *interp) (*Value, error) {
 		localEnv.set(p, initVals[i])
 	}
 	body := node.children[offset+1:]
+	// Track body context for call/cc continuation capture
+	savedCtx := ip.innerBodyCtx
+	ip.innerBodyCtx = &bodyCtx{exprs: body, env: localEnv}
 	for i, bodyExpr := range body {
+		ip.innerBodyCtx.idx = i
 		if i == len(body)-1 {
+			ip.innerBodyCtx = savedCtx
 			return evalTail(bodyExpr, localEnv)
 		}
 		_, err := eval(bodyExpr, localEnv, ip)
 		if err != nil {
+			ip.innerBodyCtx = savedCtx
 			return nil, err
 		}
 	}
+	ip.innerBodyCtx = savedCtx
 	return voidVal(), nil
 }
 
@@ -1591,7 +1759,7 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		if len(args) != 1 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: procedure?: need 1 argument", node.line, node.col)}
 		}
-		return boolVal(args[0].typ == valLambda || args[0].typ == valGoFunc), nil
+		return boolVal(args[0].typ == valLambda || args[0].typ == valGoFunc || args[0].typ == valContinuation), nil
 
 	case "display":
 		if len(args) != 1 {
@@ -2267,6 +2435,20 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 		}
 		return nil, &EvalError{Message: msg}
 
+	case "call/cc", "call-with-current-continuation":
+		// First-class use: (apply call/cc (list f)) or ((lambda (cc) (cc f)) call/cc)
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: call/cc: need 1 argument", node.line, node.col)}
+		}
+		// Check override for this call site
+		if ip.ccOverrides != nil {
+			if ov, ok := ip.ccOverrides[node]; ok {
+				delete(ip.ccOverrides, node)
+				return ov, nil
+			}
+		}
+		return doCallCC(args[0], node, ip)
+
 	case "gcd":
 		if len(args) == 0 {
 			return intVal(0), nil
@@ -2614,6 +2796,12 @@ func applyApply(args []*Value, node *astNode, ip *interp) (*Value, error) {
 	if fn.typ == valGoFunc {
 		return fn.goFunc(allArgs)
 	}
+	if fn.typ == valContinuation {
+		if len(allArgs) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: continuation expects 1 argument", node.line, node.col)}
+		}
+		panic(&contInvoke{cont: fn, value: allArgs[0]})
+	}
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: not a procedure", node.line, node.col)}
 }
 
@@ -2853,7 +3041,8 @@ func makeGlobalEnv() *env {
 		"gcd", "lcm", "truncate", "round",
 		"make-string", "string",
 		"string>?", "string<=?", "string>=?",
-		"member", "assv"}
+		"member", "assv",
+		"call/cc", "call-with-current-continuation"}
 	for _, name := range builtins {
 		e.set(name, symVal(name))
 	}
@@ -2871,15 +3060,66 @@ func evalAll(input string) (result string, output string, err error) {
 	}
 
 	e := makeGlobalEnv()
-	ip := &interp{}
-	var last *Value
-	for _, node := range nodes {
-		v, err := eval(node, e, ip)
-		if err != nil {
-			return "", "", err
-		}
-		last = v
+	ip := &interp{
+		ccOverrides: make(map[*astNode]*Value),
+		topExprs:    nodes,
+		topEnv:      e,
 	}
+
+	// Evaluation task: either normal top-level eval or a continuation replay
+	type evalTask struct {
+		isReplay bool
+		replayFn func(v *Value) (*Value, error)
+		value    *Value
+	}
+
+	task := &evalTask{isReplay: false}
+	var last *Value
+
+	for {
+		var ci *contInvoke
+		var evalErr error
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if c, ok := r.(*contInvoke); ok {
+						ci = c
+						return
+					}
+					panic(r) // re-panic non-continuation panics
+				}
+			}()
+			if task.isReplay {
+				last, evalErr = task.replayFn(task.value)
+			} else {
+				// Normal top-level evaluation
+				for i, node := range nodes {
+					ip.topIdx = i
+					v, err := eval(node, e, ip)
+					if err != nil {
+						evalErr = err
+						return
+					}
+					last = v
+				}
+			}
+		}()
+
+		if evalErr != nil {
+			return "", "", evalErr
+		}
+		if ci == nil {
+			break // no continuation invocation, evaluation complete
+		}
+		// A continuation was invoked — set up replay
+		task = &evalTask{
+			isReplay: true,
+			replayFn: ci.cont.contCapture.replayFn,
+			value:    ci.value,
+		}
+	}
+
 	return last.String(), ip.output.String(), nil
 }
 
