@@ -14,6 +14,7 @@ enum SchemeVal:
   case BoolVal(value: Boolean)
   case StrVal(value: String)
   case SymVal(name: String)
+  case CharVal(value: Char)
   case ListVal(elems: List[SchemeVal])
   case Procedure(params: List[String], body: List[Expr], env: Env)
   case BuiltinProc(name: String, fn: List[SchemeVal] => SchemeVal)
@@ -24,11 +25,24 @@ enum SchemeVal:
     case BoolVal(b)           => if b then "#t" else "#f"
     case StrVal(s)            => "\"" + s + "\""
     case SymVal(n)            => n
+    case CharVal(c)           => s"#\\$c"
     case ListVal(Nil)         => "()"
     case ListVal(elems)       => "(" + elems.map(_.display).mkString(" ") + ")"
     case Procedure(_, _, _)   => "#<procedure>"
     case BuiltinProc(name, _) => s"#<procedure:$name>"
     case Void                 => "#<void>"
+
+  /** display format: no quotes on strings */
+  def displayStr: String = this match
+    case StrVal(s)      => s
+    case ListVal(Nil)   => "()"
+    case ListVal(elems) => "(" + elems.map(_.displayStr).mkString(" ") + ")"
+    case other          => other.display
+
+  /** write format: strings with quotes */
+  def writeStr: String = this match
+    case StrVal(s) => "\"" + s + "\""
+    case _         => displayStr
 
 class Env(
   val bindings: mutable.Map[String, SchemeVal],
@@ -47,6 +61,8 @@ class Env(
     bindings(name) = value
 
 object Evaluator:
+
+  val outputBuffer: ThreadLocal[StringBuilder] = ThreadLocal.withInitial(() => new StringBuilder)
 
   private def isTruthy(v: SchemeVal): Boolean = v match
     case SchemeVal.BoolVal(false) => false
@@ -214,5 +230,11 @@ object Evaluator:
     evalBody(exprs, env).display
 
   def evalStrWithOutput(input: String): (String, String) =
-    val result = evalStr(input)
-    (result, "")
+    val buf = outputBuffer.get()
+    buf.clear()
+    val exprs  = Parser.parse(input)
+    val env    = Builtins.makeGlobalEnv()
+    val result = evalBody(exprs, env).display
+    val output = buf.toString
+    buf.clear()
+    (result, output)
