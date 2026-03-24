@@ -54,8 +54,16 @@ public class Evaluator {
     // Builtin procedure wrapper
     private record Builtin(String name) {}
 
-    // Internal string wrapper to distinguish from symbols
-    record SchemeString(String value) {}
+    // Internal string wrapper to distinguish from symbols (mutable for string-set!)
+    static class SchemeString {
+        private char[] chars;
+        SchemeString(String value) { this.chars = value.toCharArray(); }
+        String value() { return new String(chars); }
+        char charAt(int i) { return chars[i]; }
+        int length() { return chars.length; }
+        void setChar(int i, char c) { chars[i] = c; }
+        SchemeString copy() { return new SchemeString(value()); }
+    }
 
     // Character wrapper
     record SchemeChar(char value) {}
@@ -119,7 +127,8 @@ public class Evaluator {
         "string-append", "string-length", "substring",
         "string->number", "number->string",
         "symbol->string", "string->symbol",
-        "string-ref", "char?"
+        "string-ref", "char?",
+        "string-set!", "string-copy"
     };
 
     private Env makeTopLevelEnv() {
@@ -194,6 +203,31 @@ public class Evaluator {
                         tokens.add(Boolean.FALSE);
                         tokenPositions.add(startPos);
                         i += 2; col += 2;
+                    } else if (next == '\\') {
+                        // Character literal: #\x or #\space, #\newline, #\tab
+                        i += 2; col += 2;
+                        if (i >= input.length()) throw new EvalError(startPos + ": unexpected end after #\\");
+                        // Try to read a named character
+                        int charStart = i;
+                        while (i < input.length() && !Character.isWhitespace(input.charAt(i))
+                                && input.charAt(i) != '(' && input.charAt(i) != ')'
+                                && input.charAt(i) != '"' && input.charAt(i) != ';') {
+                            i++; col++;
+                        }
+                        String charName = input.substring(charStart, i);
+                        char ch;
+                        if (charName.length() == 1) {
+                            ch = charName.charAt(0);
+                        } else {
+                            ch = switch (charName.toLowerCase()) {
+                                case "space" -> ' ';
+                                case "newline" -> '\n';
+                                case "tab" -> '\t';
+                                default -> throw new EvalError(startPos + ": unknown character name: " + charName);
+                            };
+                        }
+                        tokens.add(new SchemeChar(ch));
+                        tokenPositions.add(startPos);
                     } else {
                         throw new EvalError(startPos + ": unexpected character after #: " + next);
                     }
@@ -266,7 +300,7 @@ public class Evaluator {
             expr = loc.value();
         }
 
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString) {
+        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
             return expr;
         }
         if (expr instanceof String sym) {
@@ -653,7 +687,7 @@ public class Evaluator {
             case "string-length" -> {
                 requireArgCount(op, args, 1);
                 if (!(args.get(0) instanceof SchemeString s)) throw new EvalError(posStr() + "string-length: not a string");
-                return (long) s.value().length();
+                return (long) s.length();
             }
             case "substring" -> {
                 requireArgCount(op, args, 3);
@@ -689,7 +723,20 @@ public class Evaluator {
                 requireArgCount(op, args, 2);
                 if (!(args.get(0) instanceof SchemeString s)) throw new EvalError(posStr() + "string-ref: not a string");
                 int idx = (int) requireLong(args.get(1));
-                return new SchemeChar(s.value().charAt(idx));
+                return new SchemeChar(s.charAt(idx));
+            }
+            case "string-set!" -> {
+                requireArgCount(op, args, 3);
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError(posStr() + "string-set!: not a string");
+                int idx = (int) requireLong(args.get(1));
+                if (!(args.get(2) instanceof SchemeChar c)) throw new EvalError(posStr() + "string-set!: not a character");
+                s.setChar(idx, c.value());
+                return VOID;
+            }
+            case "string-copy" -> {
+                requireArgCount(op, args, 1);
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError(posStr() + "string-copy: not a string");
+                return s.copy();
             }
             default -> throw new EvalError(posStr() + "unbound variable: " + op);
         }
