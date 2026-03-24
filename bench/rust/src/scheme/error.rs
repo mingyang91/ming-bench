@@ -27,8 +27,8 @@ pub enum EvalError {
     DivisionByZero(Span),
     #[error("internal: continuation invoked")]
     ContinuationInvoked,
-    #[error("uncaught exception")]
-    SchemeRaise(super::Value),
+    #[error("uncaught exception: {0}")]
+    SchemeRaise(String),
     #[error("step limit exceeded")]
     StepLimitExceeded,
 }

@@ -29,6 +29,9 @@ pub(super) enum CekStep {
 
 thread_local! {
     pub(super) static CONT_JUMP: RefCell<Option<(Rc<Kont>, Value)>> = const { RefCell::new(None) };
+    /// Holds the exception Value during internal raise/catch within the CEK loop.
+    /// SchemeRaise only carries a String for Send-safety; the actual Value lives here.
+    static RAISED_VALUE: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 pub(super) fn cek_eval(exprs: &[Spanned], env: &Env, out: &Output) -> Result<Value, EvalError> {
@@ -52,7 +55,9 @@ pub(super) fn cek_eval(exprs: &[Spanned], env: &Env, out: &Output) -> Result<Val
                 let (kont, value) = CONT_JUMP.with(|c| c.borrow_mut().take().expect("CONT_JUMP must be set after ContinuationInvoked"));
                 state = CekState::ResumeKont(kont, value);
             }
-            Err(EvalError::SchemeRaise(exn)) => {
+            Err(EvalError::SchemeRaise(exn_str)) => {
+                let exn = RAISED_VALUE.with(|rv| rv.borrow_mut().take())
+                    .unwrap_or_else(|| Value::Str(exn_str.clone()));
                 let handler = EXCEPTION_HANDLERS.with(|h| h.borrow_mut().pop());
                 match handler {
                     Some(ExceptionHandler::Guard { var, clauses, env, kont, winds }) => {
@@ -82,7 +87,7 @@ pub(super) fn cek_eval(exprs: &[Spanned], env: &Env, out: &Output) -> Result<Val
                             Err(e) => return Err(e),
                         }
                     }
-                    None => return Err(EvalError::SchemeRaise(exn)),
+                    None => return Err(EvalError::SchemeRaise(exn_str)),
                 }
             }
             Err(e) => return Err(e),
@@ -800,7 +805,8 @@ fn cek_apply_func(func: &Value, args: &[Value], kont: Rc<Kont>, out: &Output, sp
             if args.len() != 1 {
                 return Err(EvalError::Arity("raise requires 1 argument".into(), span));
             }
-            Err(EvalError::SchemeRaise(args[0].clone()))
+            RAISED_VALUE.with(|rv| *rv.borrow_mut() = Some(args[0].clone()));
+            Err(EvalError::SchemeRaise(args[0].display_value()))
         }
         Value::Symbol(name) if name == "with-exception-handler" => {
             if args.len() != 2 {

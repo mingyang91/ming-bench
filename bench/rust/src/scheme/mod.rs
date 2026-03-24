@@ -1456,9 +1456,20 @@ fn eval_exprs(exprs: &[Spanned], env: &Env, out: &Output) -> Result<Value, EvalE
     Ok(last)
 }
 
+/// Reset all thread-local state to ensure isolation between eval_str calls.
+fn reset_thread_locals() {
+    WIND_STACK.with(|ws| ws.borrow_mut().clear());
+    EXCEPTION_HANDLERS.with(|h| h.borrow_mut().clear());
+    SYNTAX_CASE_BINDINGS.with(|b| b.borrow_mut().clear());
+    SYNTAX_RENAME_SINK.with(|s| s.borrow_mut().clear());
+    STEP_LIMIT.with(|sl| *sl.borrow_mut() = None);
+    cek::CONT_JUMP.with(|c| *c.borrow_mut() = None);
+}
+
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
+    reset_thread_locals();
     let mut parser = Parser::new(input);
     let exprs = parser.parse_all()?;
     if exprs.is_empty() {
@@ -1473,6 +1484,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    reset_thread_locals();
     let mut parser = Parser::new(input);
     let exprs = parser.parse_all()?;
     if exprs.is_empty() {
@@ -1482,12 +1494,13 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let out = Rc::new(RefCell::new(String::new()));
     let last = eval_exprs(&exprs, &env, &out)?;
     let output = out.borrow().clone();
-    Ok((last.display_value(), output))
+    Ok((last.format_display(), output))
 }
 
 /// Evaluate Scheme expressions with a step budget.
 /// Each eval dispatch counts as one step; exceeding the limit returns an error.
 pub fn eval_str_with_limit(input: &str, max_steps: u64) -> Result<String, EvalError> {
+    reset_thread_locals();
     let mut parser = Parser::new(input);
     let exprs = parser.parse_all()?;
     if exprs.is_empty() {
