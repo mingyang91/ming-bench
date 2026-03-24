@@ -2,6 +2,11 @@ package ming
 
 object StringBuiltins:
 
+  // Track which Array[Char] instances are mutable (created by string-copy)
+  private val mutableStrings = java.util.Collections.newSetFromMap(
+    new java.util.IdentityHashMap[Array[Char], java.lang.Boolean]()
+  )
+
   private def typePredicate(
     name: String,
     test: SchemeVal => Boolean
@@ -87,7 +92,10 @@ object StringBuiltins:
     "string-copy" -> SchemeVal.BuiltinProc(
       "string-copy",
       {
-        case List(SchemeVal.StrVal(s)) => SchemeVal.StrVal(s.clone())
+        case List(SchemeVal.StrVal(s)) =>
+          val copy = s.clone()
+          mutableStrings.add(copy)
+          SchemeVal.StrVal(copy)
         case List(other)               => throw new EvalError(s"string-copy: expected string, got ${other.display}")
         case args                      => throw new EvalError(s"string-copy: expected 1 argument, got ${args.length}")
       }
@@ -96,9 +104,49 @@ object StringBuiltins:
       "string-set!",
       {
         case List(SchemeVal.StrVal(s), SchemeVal.IntVal(i), SchemeVal.CharVal(c)) =>
+          if !mutableStrings.contains(s) then
+            throw new EvalError("string-set!: strings are immutable")
           s(i.toInt) = c
           SchemeVal.Void
         case _ => throw new EvalError("string-set!: expected (string, index, char)")
+      }
+    ),
+    "string->list" -> SchemeVal.BuiltinProc(
+      "string->list",
+      {
+        case List(SchemeVal.StrVal(s)) =>
+          SchemeVal.ListVal(s.map(SchemeVal.CharVal(_)).toList)
+        case List(other) => throw new EvalError(s"string->list: expected string, got ${other.display}")
+        case args        => throw new EvalError(s"string->list: expected 1 argument, got ${args.length}")
+      }
+    ),
+    "list->string" -> SchemeVal.BuiltinProc(
+      "list->string",
+      {
+        case List(SchemeVal.ListVal(elems)) =>
+          val chars = elems.map {
+            case SchemeVal.CharVal(c) => c
+            case other => throw new EvalError(s"list->string: expected char, got ${other.display}")
+          }
+          SchemeVal.StrVal(chars.toArray)
+        case List(other) => throw new EvalError(s"list->string: expected list, got ${other.display}")
+        case args => throw new EvalError(s"list->string: expected 1 argument, got ${args.length}")
+      }
+    ),
+    "char->integer" -> SchemeVal.BuiltinProc(
+      "char->integer",
+      {
+        case List(SchemeVal.CharVal(c)) => SchemeVal.IntVal(c.toLong)
+        case List(other)                => throw new EvalError(s"char->integer: expected char, got ${other.display}")
+        case args                       => throw new EvalError(s"char->integer: expected 1 argument, got ${args.length}")
+      }
+    ),
+    "integer->char" -> SchemeVal.BuiltinProc(
+      "integer->char",
+      {
+        case List(SchemeVal.IntVal(n)) => SchemeVal.CharVal(n.toChar)
+        case List(other)               => throw new EvalError(s"integer->char: expected integer, got ${other.display}")
+        case args                      => throw new EvalError(s"integer->char: expected 1 argument, got ${args.length}")
       }
     )
   )
