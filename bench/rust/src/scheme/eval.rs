@@ -80,6 +80,7 @@ pub enum Value {
         clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>)>, // (params, rest_param, body)
         env: Rc<RefCell<EnvInner>>,
     },
+    Vector(Rc<RefCell<Vec<Value>>>),
 }
 
 fn gcd(a: i64, b: i64) -> i64 {
@@ -196,6 +197,7 @@ impl PartialEq for Value {
             (Value::Record { type_id: t1, fields: f1, .. }, Value::Record { type_id: t2, fields: f2, .. }) => {
                 t1 == t2 && f1.iter().zip(f2.iter()).all(|((_, v1), (_, v2))| v1 == v2)
             }
+            (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             _ => false,
         }
     }
@@ -272,6 +274,10 @@ impl Value {
             Value::CaseLambda { .. } => "#<procedure>".into(),
             Value::Macro { .. } => "#<macro>".into(),
             Value::Record { type_name, .. } => format!("#<record:{}>", type_name),
+            Value::Vector(elems) => {
+                let inner: Vec<String> = elems.borrow().iter().map(|v| v.fmt_value(write_mode)).collect();
+                format!("#({})", inner.join(" "))
+            }
         }
     }
 
@@ -311,7 +317,10 @@ impl Env {
                      "char-upcase", "char-downcase", "char=?", "char<?",
                      "string=?", "string<?", "string-ci=?",
                      "string-upcase", "string-downcase",
-                     "procedure?"] {
+                     "procedure?",
+                     "eqv?",
+                     "vector", "make-vector", "vector-ref", "vector-set!",
+                     "vector-length", "vector?", "vector->list", "list->vector"] {
             bindings.insert(name.to_string(), Value::Builtin(name.to_string()));
         }
         Env(Rc::new(RefCell::new(EnvInner {
@@ -392,6 +401,10 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "define-syntax" => return eval_define_syntax(&items[1..], env, span),
                     "define-record-type" => return eval_define_record_type(&items[1..], env, span),
                     "case-lambda" => return eval_case_lambda(&items[1..], env, span),
+                    "letrec" => return eval_letrec(&items[1..], env, span),
+                    "letrec*" => return eval_letrec_star(&items[1..], env, span),
+                    "case" => return eval_case(&items[1..], env, span),
+                    "do" => return eval_do(&items[1..], env, span),
                     _ => {}
                 }
                 // Check for macro application
@@ -406,7 +419,7 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                 .map(|e| eval(e, env))
                 .collect::<Result<_, _>>()?;
 
-            apply_func(&func, &args).map_err(|e| with_span(e, span))
+            apply_func(&func, args).map_err(|e| with_span(e, span))
         }
     }
 }
@@ -548,9 +561,9 @@ fn eval_case_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalE
     })
 }
 
-fn apply_func(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
+fn apply_func(func: &Value, args: Vec<Value>) -> Result<Value, EvalError> {
     match func {
-        Value::Builtin(_) => apply_builtin(func, args),
+        Value::Builtin(_) => apply_builtin(func, &args),
         Value::Lambda { params, rest_param, body, env } => {
             if let Some(_) = rest_param {
                 if args.len() < params.len() {
@@ -565,14 +578,15 @@ fn apply_func(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
             }
             let parent_env = Env(env.clone());
             let local_env = Env::child(&parent_env);
-            for (name, val) in params.iter().zip(args.iter()) {
-                local_env.define(name.clone(), val.clone());
+            let mut args_iter = args.into_iter();
+            for name in params {
+                local_env.define(name.clone(), args_iter.next().unwrap());
             }
             if let Some(rest) = rest_param {
-                let rest_args = &args[params.len()..];
+                let rest_args: Vec<Value> = args_iter.collect();
                 let mut list = Value::Nil;
-                for v in rest_args.iter().rev() {
-                    list = Value::Pair(Box::new(v.clone()), Box::new(list));
+                for v in rest_args.into_iter().rev() {
+                    list = Value::Pair(Box::new(v), Box::new(list));
                 }
                 local_env.define(rest.clone(), list);
             }
@@ -592,14 +606,15 @@ fn apply_func(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
                 if matches {
                     let parent_env = Env(env.clone());
                     let local_env = Env::child(&parent_env);
-                    for (name, val) in params.iter().zip(args.iter()) {
-                        local_env.define(name.clone(), val.clone());
+                    let mut args_iter = args.into_iter();
+                    for name in params {
+                        local_env.define(name.clone(), args_iter.next().unwrap());
                     }
                     if let Some(rest) = rest_param {
-                        let rest_args = &args[params.len()..];
+                        let rest_args: Vec<Value> = args_iter.collect();
                         let mut list = Value::Nil;
-                        for v in rest_args.iter().rev() {
-                            list = Value::Pair(Box::new(v.clone()), Box::new(list));
+                        for v in rest_args.into_iter().rev() {
+                            list = Value::Pair(Box::new(v), Box::new(list));
                         }
                         local_env.define(rest.clone(), list);
                     }
@@ -802,6 +817,210 @@ fn eval_cond(clauses: &[Expr], env: &Env) -> Result<Value, EvalError> {
         }
     }
     Ok(Value::Void)
+}
+
+fn eval_letrec(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Runtime(format!("letrec requires bindings and body at {}", fmt_span(span))));
+    }
+    let bindings = match &args[0].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(EvalError::Runtime(format!("letrec: expected bindings list at {}", fmt_span(span)))),
+    };
+    let local_env = Env::child(env);
+    // First, define all variables as Void
+    for b in bindings {
+        match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                if let ExprKind::Symbol(name) = &pair[0].kind {
+                    local_env.define(name.clone(), Value::Void);
+                } else {
+                    return Err(EvalError::Runtime(format!("letrec: binding name must be symbol at {}", fmt_span(b.span))));
+                }
+            }
+            _ => return Err(EvalError::Runtime(format!("letrec: bad binding at {}", fmt_span(b.span)))),
+        }
+    }
+    // Then evaluate init expressions in the local env and set them
+    for b in bindings {
+        if let ExprKind::List(pair) = &b.kind {
+            if let ExprKind::Symbol(name) = &pair[0].kind {
+                let val = eval(&pair[1], &local_env)?;
+                local_env.define(name.clone(), val);
+            }
+        }
+    }
+    let mut result = Value::Void;
+    for expr in &args[1..] {
+        result = eval(expr, &local_env)?;
+    }
+    Ok(result)
+}
+
+fn eval_letrec_star(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Runtime(format!("letrec* requires bindings and body at {}", fmt_span(span))));
+    }
+    let bindings = match &args[0].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(EvalError::Runtime(format!("letrec*: expected bindings list at {}", fmt_span(span)))),
+    };
+    let local_env = Env::child(env);
+    // Define all variables as Void first
+    for b in bindings {
+        match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                if let ExprKind::Symbol(name) = &pair[0].kind {
+                    local_env.define(name.clone(), Value::Void);
+                } else {
+                    return Err(EvalError::Runtime(format!("letrec*: binding name must be symbol at {}", fmt_span(b.span))));
+                }
+            }
+            _ => return Err(EvalError::Runtime(format!("letrec*: bad binding at {}", fmt_span(b.span)))),
+        }
+    }
+    // Evaluate sequentially (each sees previous bindings)
+    for b in bindings {
+        if let ExprKind::List(pair) = &b.kind {
+            if let ExprKind::Symbol(name) = &pair[0].kind {
+                let val = eval(&pair[1], &local_env)?;
+                local_env.define(name.clone(), val);
+            }
+        }
+    }
+    let mut result = Value::Void;
+    for expr in &args[1..] {
+        result = eval(expr, &local_env)?;
+    }
+    Ok(result)
+}
+
+fn eqv(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+        (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
+        (Value::Float(a), Value::Float(b)) => a == b,
+        (Value::Char(a), Value::Char(b)) => a == b,
+        (Value::Nil, Value::Nil) => true,
+        _ => false,
+    }
+}
+
+fn eval_case(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Runtime(format!("case requires at least a key at {}", fmt_span(span))));
+    }
+    let key = eval(&args[0], env)?;
+    for clause in &args[1..] {
+        match &clause.kind {
+            ExprKind::List(parts) if parts.len() >= 2 => {
+                // Check for else clause
+                if let ExprKind::Symbol(s) = &parts[0].kind {
+                    if s == "else" {
+                        let mut result = Value::Void;
+                        for expr in &parts[1..] {
+                            result = eval(expr, env)?;
+                        }
+                        return Ok(result);
+                    }
+                }
+                // Check datums list
+                if let ExprKind::List(datums) = &parts[0].kind {
+                    for datum in datums {
+                        let dval = expr_to_value(datum);
+                        if eqv(&key, &dval) {
+                            let mut result = Value::Void;
+                            for expr in &parts[1..] {
+                                result = eval(expr, env)?;
+                            }
+                            return Ok(result);
+                        }
+                    }
+                }
+            }
+            _ => return Err(EvalError::Runtime(format!("case: bad clause at {}", fmt_span(clause.span)))),
+        }
+    }
+    // No match, no else => void
+    Ok(Value::Void)
+}
+
+fn eval_do(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
+    // (do ((var init step) ...) (test expr ...) body ...)
+    if args.len() < 2 {
+        return Err(EvalError::Runtime(format!("do requires bindings and test at {}", fmt_span(span))));
+    }
+    let bindings = match &args[0].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(EvalError::Runtime(format!("do: expected bindings list at {}", fmt_span(span)))),
+    };
+    let test_clause = match &args[1].kind {
+        ExprKind::List(t) if !t.is_empty() => t,
+        _ => return Err(EvalError::Runtime(format!("do: expected test clause at {}", fmt_span(span)))),
+    };
+    let body = &args[2..];
+
+    // Parse bindings: (var init step?) ...
+    let mut var_names = Vec::new();
+    let mut init_exprs = Vec::new();
+    let mut step_exprs: Vec<Option<&Expr>> = Vec::new();
+    for b in bindings {
+        match &b.kind {
+            ExprKind::List(parts) if parts.len() >= 2 && parts.len() <= 3 => {
+                if let ExprKind::Symbol(name) = &parts[0].kind {
+                    var_names.push(name.clone());
+                    init_exprs.push(&parts[1]);
+                    step_exprs.push(if parts.len() == 3 { Some(&parts[2]) } else { None });
+                } else {
+                    return Err(EvalError::Runtime(format!("do: variable must be symbol at {}", fmt_span(b.span))));
+                }
+            }
+            _ => return Err(EvalError::Runtime(format!("do: bad binding at {}", fmt_span(b.span)))),
+        }
+    }
+
+    // Evaluate init values
+    let mut values: Vec<Value> = init_exprs.iter().map(|e| eval(e, env)).collect::<Result<_, _>>()?;
+
+    loop {
+        // Create environment for this iteration
+        let iter_env = Env::child(env);
+        for (name, val) in var_names.iter().zip(values.iter()) {
+            iter_env.define(name.clone(), val.clone());
+        }
+
+        // Test
+        let test_result = eval(&test_clause[0], &iter_env)?;
+        if test_result.is_truthy() {
+            // Evaluate result expressions
+            if test_clause.len() > 1 {
+                let mut result = Value::Void;
+                for expr in &test_clause[1..] {
+                    result = eval(expr, &iter_env)?;
+                }
+                return Ok(result);
+            }
+            return Ok(Value::Void);
+        }
+
+        // Evaluate body (for side effects)
+        for expr in body {
+            eval(expr, &iter_env)?;
+        }
+
+        // Evaluate step expressions (parallel update)
+        let new_values: Vec<Value> = var_names.iter().zip(step_exprs.iter()).zip(values.iter())
+            .map(|((_, step), old_val)| {
+                match step {
+                    Some(expr) => eval(expr, &iter_env),
+                    None => Ok(old_val.clone()),
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        values = new_values;
+    }
 }
 
 fn apply_builtin(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
@@ -1143,7 +1362,7 @@ fn apply_builtin(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
             // Combine prefix args (between func and last) with tail args
             let mut all_args: Vec<Value> = args[1..args.len()-1].to_vec();
             all_args.extend(tail_args);
-            apply_func(func, &all_args)
+            apply_func(func, all_args)
         }
         "eq?" => {
             if args.len() != 2 { return Err(EvalError::Arity("eq? requires 2 arguments".into())); }
@@ -1155,6 +1374,8 @@ fn apply_builtin(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
                 (Value::Float(a), Value::Float(b)) => a == b,
                 (Value::Char(a), Value::Char(b)) => a == b,
                 (Value::Nil, Value::Nil) => true,
+                (Value::Void, Value::Void) => true,
+                (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
                 _ => false,
             };
             Ok(Value::Boolean(result))
@@ -1184,7 +1405,7 @@ fn apply_builtin(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
             let mut results = Vec::new();
             for i in 0..len {
                 let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-                results.push(apply_func(func, &call_args)?);
+                results.push(apply_func(func, call_args)?);
             }
             for v in results.into_iter().rev() {
                 result = Value::Pair(Box::new(v), Box::new(result));
@@ -1376,6 +1597,83 @@ fn apply_builtin(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
         "string-downcase" => {
             if args.len() != 1 { return Err(EvalError::Arity("string-downcase requires 1 argument".into())); }
             match &args[0] { Value::Str(s) => Ok(Value::Str(s.to_lowercase())), _ => Err(EvalError::Type("string-downcase: expected string".into())) }
+        }
+        "eqv?" => {
+            if args.len() != 2 { return Err(EvalError::Arity("eqv? requires 2 arguments".into())); }
+            Ok(Value::Boolean(eqv(&args[0], &args[1])))
+        }
+        "vector" => {
+            Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec()))))
+        }
+        "make-vector" => {
+            if args.is_empty() || args.len() > 2 { return Err(EvalError::Arity("make-vector requires 1 or 2 arguments".into())); }
+            let len = expect_int(&args[0])? as usize;
+            let fill = if args.len() == 2 { args[1].clone() } else { Value::Integer(0) };
+            Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; len]))))
+        }
+        "vector-ref" => {
+            if args.len() != 2 { return Err(EvalError::Arity("vector-ref requires 2 arguments".into())); }
+            let idx = expect_int(&args[1])? as usize;
+            match &args[0] {
+                Value::Vector(v) => {
+                    let vec = v.borrow();
+                    if idx >= vec.len() { return Err(EvalError::Runtime("vector-ref: index out of range".into())); }
+                    Ok(vec[idx].clone())
+                }
+                _ => Err(EvalError::Type("vector-ref: expected vector".into())),
+            }
+        }
+        "vector-set!" => {
+            // Handled as special form for env mutation, but also support as builtin for apply
+            if args.len() != 3 { return Err(EvalError::Arity("vector-set! requires 3 arguments".into())); }
+            let idx = expect_int(&args[1])? as usize;
+            match &args[0] {
+                Value::Vector(v) => {
+                    let mut vec = v.borrow_mut();
+                    if idx >= vec.len() { return Err(EvalError::Runtime("vector-set!: index out of range".into())); }
+                    vec[idx] = args[2].clone();
+                    Ok(Value::Void)
+                }
+                _ => Err(EvalError::Type("vector-set!: expected vector".into())),
+            }
+        }
+        "vector-length" => {
+            if args.len() != 1 { return Err(EvalError::Arity("vector-length requires 1 argument".into())); }
+            match &args[0] {
+                Value::Vector(v) => Ok(Value::Integer(v.borrow().len() as i64)),
+                _ => Err(EvalError::Type("vector-length: expected vector".into())),
+            }
+        }
+        "vector?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("vector? requires 1 argument".into())); }
+            Ok(Value::Boolean(matches!(args[0], Value::Vector(_))))
+        }
+        "vector->list" => {
+            if args.len() != 1 { return Err(EvalError::Arity("vector->list requires 1 argument".into())); }
+            match &args[0] {
+                Value::Vector(v) => {
+                    let vec = v.borrow();
+                    let mut result = Value::Nil;
+                    for elem in vec.iter().rev() {
+                        result = Value::Pair(Box::new(elem.clone()), Box::new(result));
+                    }
+                    Ok(result)
+                }
+                _ => Err(EvalError::Type("vector->list: expected vector".into())),
+            }
+        }
+        "list->vector" => {
+            if args.len() != 1 { return Err(EvalError::Arity("list->vector requires 1 argument".into())); }
+            let mut elems = Vec::new();
+            let mut cur = &args[0];
+            loop {
+                match cur {
+                    Value::Pair(car, cdr) => { elems.push((**car).clone()); cur = cdr; }
+                    Value::Nil => break,
+                    _ => return Err(EvalError::Type("list->vector: expected list".into())),
+                }
+            }
+            Ok(Value::Vector(Rc::new(RefCell::new(elems))))
         }
         _ => {
             // Dynamic record type builtins
