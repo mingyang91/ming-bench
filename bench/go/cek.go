@@ -1277,10 +1277,16 @@ func (m *cekM) applyProc(op value, args []value, callExpr *expr, callEnv *env, k
 	case valBuiltin:
 		return m.applyBuiltinCEK(op, args, callExpr, callEnv, k)
 	case valContinuation:
-		if len(args) != 1 {
-			return &EvalError{Message: fmt.Sprintf("%d:%d: continuation: expected 1 argument", callExpr.line, callExpr.col)}
+		if len(args) == 0 {
+			return &EvalError{Message: fmt.Sprintf("%d:%d: continuation: expected at least 1 argument", callExpr.line, callExpr.col)}
 		}
-		return m.invokeContinuation(op, args[0], callExpr, callEnv)
+		var arg value
+		if len(args) == 1 {
+			arg = args[0]
+		} else {
+			arg = value{kind: valMultipleValues, multiVals: &args}
+		}
+		return m.invokeContinuation(op, arg, callExpr, callEnv)
 	default:
 		return &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure: %s", callExpr.line, callExpr.col, op.String())}
 	}
