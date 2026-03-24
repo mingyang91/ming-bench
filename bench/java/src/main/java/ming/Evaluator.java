@@ -184,15 +184,65 @@ public class Evaluator {
     // Output buffer for display/write/newline
     private StringBuilder outputBuffer = new StringBuilder();
 
+    // --- Continuation support (call/cc) ---
+
+    private static class SchemeContinuation {
+        final List<Object> bodyExprs;
+        final int bodyIndex;
+        final Env bodyEnv;
+        final int topLevelIndex;
+        SchemeContinuation(List<Object> bodyExprs, int bodyIndex, Env bodyEnv, int topLevelIndex) {
+            this.bodyExprs = bodyExprs;
+            this.bodyIndex = bodyIndex;
+            this.bodyEnv = bodyEnv;
+            this.topLevelIndex = topLevelIndex;
+        }
+    }
+
+    private static class ContinuationInvoked extends RuntimeException {
+        final SchemeContinuation cont;
+        final Object value;
+        ContinuationInvoked(SchemeContinuation cont, Object value) {
+            super(null, null, true, false);
+            this.cont = cont;
+            this.value = value;
+        }
+    }
+
+    private List<Object> allTopLevelExprs;
+    private int currentTopLevelIndex;
+    private boolean replaying;
+    private Object replayValue;
+    // Body context tracking for continuations
+    private List<Object> contBodyExprs;
+    private int contBodyIndex;
+    private Env contBodyEnv;
+
     public String evalStr(String input) throws EvalError {
         currentPos = new Pos(1, 1);
         List<Object> tokens = tokenize(input);
         int[] pos = {0};
         Env env = makeTopLevelEnv();
-        Object lastResult = null;
+        List<Object> exprs = new ArrayList<>();
         while (pos[0] < tokens.size()) {
-            Object expr = parse(tokens, pos);
-            lastResult = eval(expr, env);
+            exprs.add(parse(tokens, pos));
+        }
+        allTopLevelExprs = exprs;
+        replaying = false;
+        Object lastResult = null;
+        int i = 0;
+        while (i < exprs.size()) {
+            currentTopLevelIndex = i;
+            contBodyExprs = exprs;
+            contBodyIndex = i;
+            contBodyEnv = env;
+            try {
+                lastResult = eval(exprs.get(i), env);
+                i++;
+            } catch (ContinuationInvoked ci) {
+                lastResult = replayContinuation(ci, exprs);
+                i = (ci.cont.bodyExprs == exprs) ? exprs.size() : ci.cont.topLevelIndex + 1;
+            }
         }
         if (lastResult == null) {
             throw new EvalError("no expression");
@@ -209,14 +259,46 @@ public class Evaluator {
         List<Object> tokens = tokenize(input);
         int[] pos = {0};
         Env env = makeTopLevelEnv();
-        Object lastResult = null;
+        List<Object> exprs = new ArrayList<>();
         while (pos[0] < tokens.size()) {
-            Object expr = parse(tokens, pos);
-            lastResult = eval(expr, env);
+            exprs.add(parse(tokens, pos));
+        }
+        allTopLevelExprs = exprs;
+        replaying = false;
+        Object lastResult = null;
+        int i = 0;
+        while (i < exprs.size()) {
+            currentTopLevelIndex = i;
+            contBodyExprs = exprs;
+            contBodyIndex = i;
+            contBodyEnv = env;
+            try {
+                lastResult = eval(exprs.get(i), env);
+                i++;
+            } catch (ContinuationInvoked ci) {
+                lastResult = replayContinuation(ci, exprs);
+                i = (ci.cont.bodyExprs == exprs) ? exprs.size() : ci.cont.topLevelIndex + 1;
+            }
         }
         String output = outputBuffer.toString();
         String result = (lastResult == null || lastResult == VOID) ? null : schemeToString(lastResult);
         return new EvalResult(result, output);
+    }
+
+    private Object replayContinuation(ContinuationInvoked ci, List<Object> topExprs) throws EvalError {
+        while (true) {
+            try {
+                replaying = true;
+                replayValue = ci.value;
+                Object result = VOID;
+                for (int j = ci.cont.bodyIndex; j < ci.cont.bodyExprs.size(); j++) {
+                    result = eval(ci.cont.bodyExprs.get(j), ci.cont.bodyEnv);
+                }
+                return result;
+            } catch (ContinuationInvoked ci2) {
+                ci = ci2;
+            }
+        }
     }
 
     private static final String[] BUILTIN_NAMES = {
@@ -263,7 +345,7 @@ public class Evaluator {
         "string-ci<?", "string-ci>?", "string-ci<=?", "string-ci>=?",
         "complex?", "real?",
         "write-char",
-        "call-with-current-continuation",
+        "call-with-current-continuation", "call/cc",
         "call-with-input-file", "call-with-output-file",
         "input-port?", "output-port?", "current-input-port", "current-output-port",
         "open-input-file", "open-output-file", "close-input-port", "close-output-port",
@@ -823,9 +905,16 @@ public class Evaluator {
                             }
                             letEnv.define(name, eval(pair.get(1), env));
                         }
+                        List<Object> letBody = new ArrayList<>(list.subList(2, list.size()));
                         for (int i = 2; i < list.size() - 1; i++) {
+                            contBodyExprs = letBody;
+                            contBodyIndex = i - 2;
+                            contBodyEnv = letEnv;
                             eval(list.get(i), letEnv);
                         }
+                        contBodyExprs = letBody;
+                        contBodyIndex = letBody.size() - 1;
+                        contBodyEnv = letEnv;
                         expr = list.get(list.size() - 1); env = letEnv; continue;
                     }
                     case "letrec" -> {
@@ -1020,6 +1109,11 @@ public class Evaluator {
                 args.add(eval(list.get(i), env));
             }
 
+            if (proc instanceof SchemeContinuation cont) {
+                if (args.size() != 1) throw new EvalError(posStr() + "continuation expects 1 argument");
+                throw new ContinuationInvoked(cont, args.get(0));
+            }
+
             if (proc instanceof Lambda lam) {
                 // TCO: inline lambda application into the trampoline
                 env = bindLambdaArgs(lam, args);
@@ -1094,11 +1188,17 @@ public class Evaluator {
     }
 
     private Object applyLambda(Lambda lam, List<Object> args) throws EvalError {
+        List<Object> savedExprs = contBodyExprs;
+        int savedIndex = contBodyIndex;
+        Env savedEnv = contBodyEnv;
         Env callEnv = bindLambdaArgs(lam, args);
         Object result = VOID;
         for (Object bodyExpr : lam.body()) {
             result = eval(bodyExpr, callEnv);
         }
+        contBodyExprs = savedExprs;
+        contBodyIndex = savedIndex;
+        contBodyEnv = savedEnv;
         return result;
     }
 
@@ -1119,6 +1219,10 @@ public class Evaluator {
     }
 
     private Object applyProcedure(Object proc, List<Object> args) throws EvalError {
+        if (proc instanceof SchemeContinuation cont) {
+            if (args.size() != 1) throw new EvalError(posStr() + "continuation expects 1 argument");
+            throw new ContinuationInvoked(cont, args.get(0));
+        }
         if (proc instanceof Lambda lam) {
             return applyLambda(lam, args);
         }
@@ -1719,7 +1823,8 @@ public class Evaluator {
                 requireArgCount(op, args, 1);
                 Object a = args.get(0);
                 return a instanceof Lambda || a instanceof CaseLambda || a instanceof Builtin
-                    || a instanceof RecordConstructor || a instanceof RecordPredicate || a instanceof RecordAccessor;
+                    || a instanceof RecordConstructor || a instanceof RecordPredicate || a instanceof RecordAccessor
+                    || a instanceof SchemeContinuation;
             }
             // L14
             case "eqv?" -> {
@@ -2106,8 +2211,25 @@ public class Evaluator {
                 outputBuffer.append(c.value());
                 return VOID;
             }
-            case "call-with-current-continuation" -> {
-                throw new EvalError(posStr() + "call/cc not yet implemented");
+            case "call-with-current-continuation", "call/cc" -> {
+                requireArgCount(op, args, 1);
+                Object receiver = args.get(0);
+                if (replaying) {
+                    replaying = false;
+                    Object val = replayValue;
+                    replayValue = null;
+                    return val;
+                }
+                SchemeContinuation cont = new SchemeContinuation(
+                    contBodyExprs, contBodyIndex, contBodyEnv, currentTopLevelIndex);
+                try {
+                    return applyProcedure(receiver, List.of(cont));
+                } catch (ContinuationInvoked ci) {
+                    if (ci.cont == cont) {
+                        return ci.value;
+                    }
+                    throw ci;
+                }
             }
             case "call-with-input-file", "call-with-output-file",
                  "open-input-file", "open-output-file",
