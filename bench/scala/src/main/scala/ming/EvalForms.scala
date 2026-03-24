@@ -150,3 +150,39 @@ object EvalForms:
           letEnv.define(name, Evaluator.eval(valExpr, letEnv))
         case _ => throw new EvalError("letrec*: invalid binding")
     Evaluator.evalBodyTail(body, letEnv)
+
+  def evalGuard(
+    varName: String,
+    clauses: List[Expr],
+    body: List[Expr],
+    env: Env
+  ): SchemeVal =
+    try Evaluator.evalBody(body, env)
+    catch
+      case sr: SchemeRaise =>
+        val guardEnv = new Env(mutable.Map.empty, Some(env))
+        guardEnv.define(varName, sr.value)
+        evalGuardClauses(sr.value, clauses, guardEnv)
+
+  private def evalGuardClauses(
+    raised: SchemeVal,
+    clauses: List[Expr],
+    env: Env
+  ): SchemeVal =
+    clauses match
+      case Nil => throw new SchemeRaise(raised)
+      case Expr.SList(Expr.Symbol("else") :: body) :: _ =>
+        Evaluator.evalBody(body, env)
+      case Expr.SList(test :: body) :: rest =>
+        if Evaluator.isTruthy(Evaluator.eval(test, env)) then Evaluator.evalBody(body, env)
+        else evalGuardClauses(raised, rest, env)
+      case _ => throw new EvalError("guard: invalid clause")
+
+  def evalCaseLambda(clauseExprs: List[Expr], env: Env): SchemeVal =
+    val clauses = clauseExprs.map {
+      case Expr.SList(Expr.SList(params) :: body) =>
+        val (paramNames, restParam) = EvalHelpers.parseParams(params)
+        (paramNames, restParam, body, env)
+      case _ => throw new EvalError("case-lambda: invalid clause")
+    }
+    SchemeVal.CaseLambda(clauses)

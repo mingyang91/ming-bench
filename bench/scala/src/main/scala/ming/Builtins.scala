@@ -171,15 +171,6 @@ object Builtins:
     )
   )
 
-  private def errorBuiltin: List[(String, SchemeVal)] = List(
-    "error" -> SchemeVal.BuiltinProc(
-      "error",
-      args =>
-        val msg = args.map(_.displayStr).mkString(" ")
-        throw new EvalError(s"error: $msg")
-    )
-  )
-
   private[ming] def typePredicate(
     name: String,
     test: SchemeVal => Boolean
@@ -233,36 +224,6 @@ object Builtins:
     )
   )
 
-  private def ioBuiltins: List[(String, SchemeVal)] = List(
-    "display" -> SchemeVal.BuiltinProc(
-      "display",
-      {
-        case List(v) =>
-          Evaluator.outputBuffer.get().append(v.displayStr)
-          SchemeVal.Void
-        case args => throw new EvalError(s"display: expected 1 argument, got ${args.length}")
-      }
-    ),
-    "write" -> SchemeVal.BuiltinProc(
-      "write",
-      {
-        case List(v) =>
-          Evaluator.outputBuffer.get().append(v.writeStr)
-          SchemeVal.Void
-        case args => throw new EvalError(s"write: expected 1 argument, got ${args.length}")
-      }
-    ),
-    "newline" -> SchemeVal.BuiltinProc(
-      "newline",
-      {
-        case Nil =>
-          Evaluator.outputBuffer.get().append("\n")
-          SchemeVal.Void
-        case args => throw new EvalError(s"newline: expected 0 arguments, got ${args.length}")
-      }
-    )
-  )
-
   def makeGlobalEnv(): Env =
     val env = new Env(mutable.Map.empty, None)
     val allBuiltins = arithmeticBuiltins
@@ -271,10 +232,9 @@ object Builtins:
       ++ listBuiltins
       ++ PairAccessorBuiltins.all
       ++ typePredicateBuiltins
-      ++ ioBuiltins
+      ++ IOBuiltins.all
       ++ StringBuiltins.all
       ++ ApplyBuiltins.applyBuiltin
-      ++ errorBuiltin
       ++ NumericBuiltins.numericBuiltins
       ++ NumericBuiltins.mathBuiltins
       ++ NumericBuiltins.exactnessBuiltins

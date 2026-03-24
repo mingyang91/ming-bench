@@ -204,7 +204,7 @@ object Evaluator:
     case Expr.Symbol("do") :: Expr.SList(varClauses) :: Expr.SList(testAndResult) :: bodyExprs =>
       EvalForms.evalDo(varClauses, testAndResult, bodyExprs, env)
     case Expr.Symbol("case-lambda") :: clauseExprs =>
-      evalCaseLambda(clauseExprs, env)
+      EvalForms.evalCaseLambda(clauseExprs, env)
     case Expr.Symbol("call/cc") :: procExpr :: Nil =>
       evalCallCC(procExpr, env)
     case Expr.Symbol("call-with-current-continuation") :: procExpr :: Nil =>
@@ -222,24 +222,21 @@ object Evaluator:
           case cr: ContinuationReturn =>
             // Wind already unwound by continuation invocation
             throw cr
+          case sr: SchemeRaise =>
+            windStack.set(windStack.get().tail)
+            applyProc(outThunk, Nil)
+            throw sr
       windStack.set(windStack.get().tail)
       applyProc(outThunk, Nil)
       result
+    case Expr.Symbol("guard") :: Expr.SList(Expr.Symbol(varName) :: clauses) :: body =>
+      EvalForms.evalGuard(varName, clauses, body, env)
     case Expr.Symbol(name) :: _ if MacroExpander.isMacro(name, env) =>
       env.lookup(name) match
         case m: SchemeVal.Macro => MacroExpander.expandAndEval(expr, name, m, env, eval)
         case _                  => throw new EvalError(s"$name: expected macro")
     case head :: args =>
       applyProcInner(eval(head, env), args.map(a => eval(a, env)))
-
-  private def evalCaseLambda(clauseExprs: List[Expr], env: Env): SchemeVal =
-    val clauses = clauseExprs.map {
-      case Expr.SList(Expr.SList(params) :: body) =>
-        val (paramNames, restParam) = EvalHelpers.parseParams(params)
-        (paramNames, restParam, body, env)
-      case _ => throw new EvalError("case-lambda: invalid clause")
-    }
-    SchemeVal.CaseLambda(clauses)
 
   /** Inner apply: may return TailCall for procedure bodies (used from evalInner) */
   private def applyProcInner(fn: SchemeVal, evaledArgs: List[SchemeVal]): SchemeVal =
