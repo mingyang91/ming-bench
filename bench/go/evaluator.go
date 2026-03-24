@@ -1283,9 +1283,388 @@ func applyBuiltin(name string, args []*Value, node *astNode, ip *interp) (*Value
 	case "apply":
 		return applyApply(args, node, ip)
 
+	case "map":
+		return applyMap(args, node, ip)
+
+	case "abs":
+		if len(args) != 1 || args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: abs: expected number", node.line, node.col)}
+		}
+		n := args[0].ival
+		if n < 0 {
+			n = -n
+		}
+		return intVal(n), nil
+
+	case "modulo":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: modulo: need 2 arguments", node.line, node.col)}
+		}
+		if err := requireInts(args, "modulo", node); err != nil {
+			return nil, err
+		}
+		if args[1].ival == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: modulo: division by zero", node.line, node.col)}
+		}
+		r := args[0].ival % args[1].ival
+		// modulo takes sign of divisor
+		if r != 0 && (r < 0) != (args[1].ival < 0) {
+			r += args[1].ival
+		}
+		return intVal(r), nil
+
+	case "remainder":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: remainder: need 2 arguments", node.line, node.col)}
+		}
+		if err := requireInts(args, "remainder", node); err != nil {
+			return nil, err
+		}
+		if args[1].ival == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: remainder: division by zero", node.line, node.col)}
+		}
+		return intVal(args[0].ival % args[1].ival), nil
+
+	case "quotient":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quotient: need 2 arguments", node.line, node.col)}
+		}
+		if err := requireInts(args, "quotient", node); err != nil {
+			return nil, err
+		}
+		if args[1].ival == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quotient: division by zero", node.line, node.col)}
+		}
+		return intVal(args[0].ival / args[1].ival), nil
+
+	case "min":
+		if len(args) == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: min: need at least 1 argument", node.line, node.col)}
+		}
+		if err := requireInts(args, "min", node); err != nil {
+			return nil, err
+		}
+		m := args[0].ival
+		for _, a := range args[1:] {
+			if a.ival < m {
+				m = a.ival
+			}
+		}
+		return intVal(m), nil
+
+	case "max":
+		if len(args) == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: max: need at least 1 argument", node.line, node.col)}
+		}
+		if err := requireInts(args, "max", node); err != nil {
+			return nil, err
+		}
+		m := args[0].ival
+		for _, a := range args[1:] {
+			if a.ival > m {
+				m = a.ival
+			}
+		}
+		return intVal(m), nil
+
+	case "expt":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: expt: need 2 arguments", node.line, node.col)}
+		}
+		if err := requireInts(args, "expt", node); err != nil {
+			return nil, err
+		}
+		base, exp := args[0].ival, args[1].ival
+		result := int64(1)
+		for i := int64(0); i < exp; i++ {
+			result *= base
+		}
+		return intVal(result), nil
+
+	case "zero?":
+		if len(args) != 1 || args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: zero?: expected number", node.line, node.col)}
+		}
+		return boolVal(args[0].ival == 0), nil
+
+	case "positive?":
+		if len(args) != 1 || args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: positive?: expected number", node.line, node.col)}
+		}
+		return boolVal(args[0].ival > 0), nil
+
+	case "negative?":
+		if len(args) != 1 || args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: negative?: expected number", node.line, node.col)}
+		}
+		return boolVal(args[0].ival < 0), nil
+
+	case "odd?":
+		if len(args) != 1 || args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: odd?: expected number", node.line, node.col)}
+		}
+		return boolVal(args[0].ival%2 != 0), nil
+
+	case "even?":
+		if len(args) != 1 || args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: even?: expected number", node.line, node.col)}
+		}
+		return boolVal(args[0].ival%2 == 0), nil
+
+	case "list-ref":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list-ref: need 2 arguments", node.line, node.col)}
+		}
+		if args[1].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list-ref: expected integer index", node.line, node.col)}
+		}
+		idx := int(args[1].ival)
+		v := args[0]
+		for i := 0; i < idx; i++ {
+			if v.typ != valPair {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list-ref: index out of range", node.line, node.col)}
+			}
+			v = v.cdr
+		}
+		if v.typ != valPair {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list-ref: index out of range", node.line, node.col)}
+		}
+		return v.car, nil
+
+	case "list-tail":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list-tail: need 2 arguments", node.line, node.col)}
+		}
+		if args[1].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list-tail: expected integer index", node.line, node.col)}
+		}
+		idx := int(args[1].ival)
+		v := args[0]
+		for i := 0; i < idx; i++ {
+			if v.typ != valPair {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list-tail: index out of range", node.line, node.col)}
+			}
+			v = v.cdr
+		}
+		return v, nil
+
+	case "list?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list?: need 1 argument", node.line, node.col)}
+		}
+		v := args[0]
+		for v.typ == valPair {
+			v = v.cdr
+		}
+		return boolVal(v.typ == valNil), nil
+
+	case "assoc":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: assoc: need 2 arguments", node.line, node.col)}
+		}
+		key := args[0]
+		alist := args[1]
+		for alist.typ == valPair {
+			entry := alist.car
+			if entry.typ == valPair && valEqual(key, entry.car) {
+				return entry, nil
+			}
+			alist = alist.cdr
+		}
+		return boolVal(false), nil
+
+	case "eq?":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: eq?: need 2 arguments", node.line, node.col)}
+		}
+		return boolVal(valEq(args[0], args[1])), nil
+
+	case "equal?":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: equal?: need 2 arguments", node.line, node.col)}
+		}
+		return boolVal(valEqual(args[0], args[1])), nil
+
+	case "char-alphabetic?":
+		if len(args) != 1 || args[0].typ != valChar {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char-alphabetic?: expected char", node.line, node.col)}
+		}
+		return boolVal(unicode.IsLetter(rune(args[0].ival))), nil
+
+	case "char-numeric?":
+		if len(args) != 1 || args[0].typ != valChar {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char-numeric?: expected char", node.line, node.col)}
+		}
+		return boolVal(unicode.IsDigit(rune(args[0].ival))), nil
+
+	case "char-upcase":
+		if len(args) != 1 || args[0].typ != valChar {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char-upcase: expected char", node.line, node.col)}
+		}
+		return charVal(unicode.ToUpper(rune(args[0].ival))), nil
+
+	case "char-downcase":
+		if len(args) != 1 || args[0].typ != valChar {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char-downcase: expected char", node.line, node.col)}
+		}
+		return charVal(unicode.ToLower(rune(args[0].ival))), nil
+
+	case "char=?":
+		if len(args) != 2 || args[0].typ != valChar || args[1].typ != valChar {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char=?: expected chars", node.line, node.col)}
+		}
+		return boolVal(args[0].ival == args[1].ival), nil
+
+	case "char<?":
+		if len(args) != 2 || args[0].typ != valChar || args[1].typ != valChar {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char<?: expected chars", node.line, node.col)}
+		}
+		return boolVal(args[0].ival < args[1].ival), nil
+
+	case "string=?":
+		if len(args) != 2 || args[0].typ != valString || args[1].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string=?: expected strings", node.line, node.col)}
+		}
+		return boolVal(args[0].sval == args[1].sval), nil
+
+	case "string<?":
+		if len(args) != 2 || args[0].typ != valString || args[1].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string<?: expected strings", node.line, node.col)}
+		}
+		return boolVal(args[0].sval < args[1].sval), nil
+
+	case "string-ci=?":
+		if len(args) != 2 || args[0].typ != valString || args[1].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-ci=?: expected strings", node.line, node.col)}
+		}
+		return boolVal(strings.EqualFold(args[0].sval, args[1].sval)), nil
+
+	case "string-upcase":
+		if len(args) != 1 || args[0].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-upcase: expected string", node.line, node.col)}
+		}
+		return strVal(strings.ToUpper(args[0].sval)), nil
+
+	case "string-downcase":
+		if len(args) != 1 || args[0].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-downcase: expected string", node.line, node.col)}
+		}
+		return strVal(strings.ToLower(args[0].sval)), nil
+
+	case "char->integer":
+		if len(args) != 1 || args[0].typ != valChar {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char->integer: expected char", node.line, node.col)}
+		}
+		return intVal(args[0].ival), nil
+
+	case "integer->char":
+		if len(args) != 1 || args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: integer->char: expected integer", node.line, node.col)}
+		}
+		return charVal(rune(args[0].ival)), nil
+
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", node.line, node.col, name)}
 	}
+}
+
+func valEq(a, b *Value) bool {
+	if a.typ != b.typ {
+		return false
+	}
+	switch a.typ {
+	case valInt:
+		return a.ival == b.ival
+	case valBool:
+		return a.bval == b.bval
+	case valChar:
+		return a.ival == b.ival
+	case valSymbol:
+		return a.sval == b.sval
+	case valNil:
+		return true
+	default:
+		return a == b
+	}
+}
+
+func valEqual(a, b *Value) bool {
+	if a.typ != b.typ {
+		return false
+	}
+	switch a.typ {
+	case valInt:
+		return a.ival == b.ival
+	case valBool:
+		return a.bval == b.bval
+	case valChar:
+		return a.ival == b.ival
+	case valString:
+		return a.sval == b.sval
+	case valSymbol:
+		return a.sval == b.sval
+	case valNil:
+		return true
+	case valPair:
+		return valEqual(a.car, b.car) && valEqual(a.cdr, b.cdr)
+	default:
+		return a == b
+	}
+}
+
+func applyMap(args []*Value, node *astNode, ip *interp) (*Value, error) {
+	if len(args) < 2 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: map: need at least 2 arguments", node.line, node.col)}
+	}
+	fn := args[0]
+	lists := args[1:]
+	// Collect results
+	var results []*Value
+	for {
+		// Check if any list is exhausted
+		allPair := true
+		for _, l := range lists {
+			if l.typ == valNil {
+				allPair = false
+				break
+			}
+			if l.typ != valPair {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: map: not a proper list", node.line, node.col)}
+			}
+		}
+		if !allPair {
+			break
+		}
+		// Gather car of each list
+		callArgs := make([]*Value, len(lists))
+		for i, l := range lists {
+			callArgs[i] = l.car
+		}
+		// Apply fn
+		var v *Value
+		var err error
+		if fn.typ == valLambda {
+			v, err = applyLambda(fn, callArgs, node, ip)
+		} else if fn.typ == valSymbol {
+			v, err = applyBuiltin(fn.sval, callArgs, node, ip)
+		} else {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: map: not a procedure", node.line, node.col)}
+		}
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, v)
+		// Advance all lists
+		for i, l := range lists {
+			lists[i] = l.cdr
+		}
+	}
+	// Build result list
+	result := nilVal()
+	for i := len(results) - 1; i >= 0; i-- {
+		result = &Value{typ: valPair, car: results[i], cdr: result}
+	}
+	return result, nil
 }
 
 func applyApply(args []*Value, node *astNode, ip *interp) (*Value, error) {
@@ -1331,7 +1710,18 @@ func makeGlobalEnv() *env {
 		"symbol->string", "string->symbol",
 		"string-ref",
 		"string-copy", "string-set!",
-		"apply"}
+		"apply", "map",
+		"abs", "modulo", "remainder", "quotient",
+		"min", "max", "expt",
+		"zero?", "positive?", "negative?", "odd?", "even?",
+		"list-ref", "list-tail", "list?", "assoc",
+		"eq?", "equal?",
+		"char-alphabetic?", "char-numeric?",
+		"char-upcase", "char-downcase",
+		"char=?", "char<?",
+		"string=?", "string<?", "string-ci=?",
+		"string-upcase", "string-downcase",
+		"char->integer", "integer->char"}
 	for _, name := range builtins {
 		e.set(name, symVal(name))
 	}
