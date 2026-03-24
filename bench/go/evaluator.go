@@ -21,6 +21,7 @@ const (
 	valVoid
 	valLambda
 	valChar
+	valMacro
 )
 
 type Value struct {
@@ -35,6 +36,7 @@ type Value struct {
 	restParam string // variadic rest parameter (after dot)
 	body      []*astNode
 	closure   *env
+	macro     *syntaxRulesMacro
 }
 
 func intVal(n int64) *Value   { return &Value{typ: valInt, ival: n} }
@@ -78,6 +80,8 @@ func (v *Value) String() string {
 		}
 	case valLambda:
 		return "#<procedure>"
+	case valMacro:
+		return "#<macro>"
 	default:
 		return "<unknown>"
 	}
@@ -530,6 +534,17 @@ func evalList(node *astNode, e *env, ip *interp) (*Value, error) {
 			return evalCond(node, e, ip)
 		case "set!":
 			return evalSet(node, e, ip)
+		case "define-syntax":
+			return evalDefineSyntax(node, e)
+		}
+
+		// Check if symbol resolves to a macro
+		if v, ok := e.get(first.tok.sval); ok && v.typ == valMacro {
+			expanded, expandEnv, err := expandMacro(v.macro, node, e)
+			if err != nil {
+				return nil, err
+			}
+			return eval(expanded, expandEnv, ip)
 		}
 	}
 
