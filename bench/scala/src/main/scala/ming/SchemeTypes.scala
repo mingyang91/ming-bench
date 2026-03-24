@@ -1,0 +1,91 @@
+package ming
+
+import scala.collection.mutable
+
+enum Expr:
+  case IntLit(value: Long)
+  case BoolLit(value: Boolean)
+  case StrLit(value: String)
+  case Symbol(name: String)
+  case CharLit(value: Char)
+  case SList(elems: List[Expr])
+
+enum SchemeVal:
+  case IntVal(value: Long)
+  case BoolVal(value: Boolean)
+  case StrVal(value: Array[Char])
+  case SymVal(name: String)
+  case CharVal(value: Char)
+  case ListVal(elems: List[SchemeVal])
+  case PairVal(car: SchemeVal, cdr: SchemeVal)
+  case Procedure(params: List[String], restParam: Option[String], body: List[Expr], env: Env)
+  case BuiltinProc(name: String, fn: List[SchemeVal] => SchemeVal)
+  case Void
+
+  def display: String = this match
+    case IntVal(n)             => n.toString
+    case BoolVal(b)            => if b then "#t" else "#f"
+    case StrVal(s)             => "\"" + new String(s) + "\""
+    case SymVal(n)             => n
+    case CharVal(c)            => s"#\\$c"
+    case ListVal(Nil)          => "()"
+    case ListVal(elems)        => "(" + elems.map(_.display).mkString(" ") + ")"
+    case PairVal(_, _)         => formatPair(_.display)
+    case Procedure(_, _, _, _) => "#<procedure>"
+    case BuiltinProc(name, _)  => s"#<procedure:$name>"
+    case Void                  => "#<void>"
+
+  /** display format: no quotes on strings */
+  def displayStr: String = this match
+    case StrVal(s)      => new String(s)
+    case ListVal(Nil)   => "()"
+    case ListVal(elems) => "(" + elems.map(_.displayStr).mkString(" ") + ")"
+    case PairVal(_, _)  => formatPair(_.displayStr)
+    case other          => other.display
+
+  /** write format: strings with quotes */
+  def writeStr: String = this match
+    case StrVal(s) => "\"" + new String(s) + "\""
+    case _         => displayStr
+
+  private def formatPair(fmt: SchemeVal => String): String =
+    val sb             = new StringBuilder("(")
+    var cur: SchemeVal = this
+    var first          = true
+    while cur.isInstanceOf[PairVal] do
+      if !first then sb.append(" ")
+      first = false
+      val PairVal(h, t) = cur: @unchecked
+      sb.append(fmt(h))
+      cur = t
+    cur match
+      case ListVal(Nil) => ()
+      case ListVal(elems) =>
+        for e <- elems do sb.append(" ").append(fmt(e))
+      case other =>
+        sb.append(" . ").append(fmt(other))
+    sb.append(")")
+    sb.toString
+
+class Env(
+  val bindings: mutable.Map[String, SchemeVal],
+  val parent: Option[Env]
+):
+
+  def lookup(name: String): SchemeVal =
+    bindings.get(name) match
+      case Some(v) => v
+      case None =>
+        parent match
+          case Some(p) => p.lookup(name)
+          case None    => throw new EvalError(s"unbound variable: $name")
+
+  def define(name: String, value: SchemeVal): Unit =
+    bindings(name) = value
+
+  def set(name: String, value: SchemeVal): Unit =
+    if bindings.contains(name) then bindings(name) = value
+    else
+      parent match
+        case Some(p) => p.set(name, value)
+        case None    => throw new EvalError(s"set!: unbound variable: $name")

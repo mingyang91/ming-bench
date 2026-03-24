@@ -79,7 +79,7 @@ object Builtins:
       "cons",
       {
         case List(a, SchemeVal.ListVal(elems)) => SchemeVal.ListVal(a :: elems)
-        case List(a, b)                        => SchemeVal.ListVal(List(a, b))
+        case List(a, b)                        => SchemeVal.PairVal(a, b)
         case args =>
           throw new EvalError(s"cons: expected 2 arguments, got ${args.length}")
       }
@@ -88,6 +88,7 @@ object Builtins:
       "car",
       {
         case List(SchemeVal.ListVal(h :: _)) => h
+        case List(SchemeVal.PairVal(h, _))   => h
         case List(SchemeVal.ListVal(Nil)) =>
           throw new EvalError("car: empty list")
         case List(other) =>
@@ -100,6 +101,7 @@ object Builtins:
       "cdr",
       {
         case List(SchemeVal.ListVal(_ :: t)) => SchemeVal.ListVal(t)
+        case List(SchemeVal.PairVal(_, t))   => t
         case List(SchemeVal.ListVal(Nil)) =>
           throw new EvalError("cdr: empty list")
         case List(other) =>
@@ -163,6 +165,7 @@ object Builtins:
       "pair?",
       {
         case SchemeVal.ListVal(_ :: _) => true
+        case SchemeVal.PairVal(_, _)   => true
         case _                         => false
       }
     ),
@@ -225,5 +228,7 @@ object Builtins:
       ++ ioBuiltins
       ++ StringBuiltins.all
       ++ applyBuiltin
+      ++ NumericBuiltins.numericBuiltins
+      ++ NumericBuiltins.listBuiltins
     for (name, proc) <- allBuiltins do env.define(name, proc)
     env
