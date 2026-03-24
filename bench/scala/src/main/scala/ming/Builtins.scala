@@ -245,5 +245,10 @@ object Builtins:
     "raise" -> Builtin {
       case List(v) => throw new Evaluator.SchemeRaise(v)
       case _       => throw new EvalError("raise requires 1 argument")
+    },
+    "values" -> Builtin { args =>
+      args match
+        case List(single) => single
+        case _            => Val.MultipleValues(args)
     }
   )

@@ -8,24 +8,25 @@ object Display:
 
   /** Write-style display (with quotes on strings). */
   def write(v: Val): String = v match
-    case Num(n)              => n.toString
-    case Rational(n, d)      => s"$n/$d"
-    case Inexact(d)          => d.toString
-    case Bool(true)          => "#t"
-    case Bool(false)         => "#f"
-    case Str(chars)          => "\"" + new String(chars) + "\""
-    case SchemeChar(c)       => s"#\\$c"
-    case Symbol(name)        => name
-    case Nil                 => "()"
-    case Void                => "#<void>"
-    case _: Pair             => writeList(v)
-    case Builtin(_)          => "#<procedure>"
-    case Closure(_, _, _, _) => "#<procedure>"
-    case _: ContinuationVal  => "#<continuation>"
-    case CallCCVal           => "#<procedure>"
-    case MacroTransformer(_) => "#<macro>"
-    case Record(tag, _)      => s"#<record:$tag>"
-    case Vector(elems)       => "#(" + elems.map(write).mkString(" ") + ")"
+    case Num(n)               => n.toString
+    case Rational(n, d)       => s"$n/$d"
+    case Inexact(d)           => d.toString
+    case Bool(true)           => "#t"
+    case Bool(false)          => "#f"
+    case Str(chars)           => "\"" + new String(chars) + "\""
+    case SchemeChar(c)        => s"#\\$c"
+    case Symbol(name)         => name
+    case Nil                  => "()"
+    case Void                 => "#<void>"
+    case _: Pair              => writeList(v)
+    case Builtin(_)           => "#<procedure>"
+    case Closure(_, _, _, _)  => "#<procedure>"
+    case _: ContinuationVal   => "#<continuation>"
+    case CallCCVal            => "#<procedure>"
+    case MacroTransformer(_)  => "#<macro>"
+    case Record(tag, _)       => s"#<record:$tag>"
+    case Vector(elems)        => "#(" + elems.map(write).mkString(" ") + ")"
+    case MultipleValues(vals) => vals.map(write).mkString(" ")
 
   /** Display-style (no quotes on strings). */
   def show(v: Val): String = v match

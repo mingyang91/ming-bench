@@ -51,6 +51,9 @@ object Evaluator:
     /** A captured continuation (first-class), with saved winding stack. */
     case class ContinuationVal(k: Cont, winds: List[(Val, Val)]) extends Val
 
+    /** Multiple return values (from `values`). */
+    case class MultipleValues(vals: List[Val]) extends Val
+
     /** The call/cc primitive as a first-class value. */
     case object CallCCVal extends Val
 
@@ -182,6 +185,25 @@ object Evaluator:
         WindGuard.evalGuardK(varName, clauses, body, env, k)
       case Pair(Symbol("with-exception-handler"), Pair(handlerExpr, Pair(thunkExpr, Nil))) =>
         WindGuard.evalWithExceptionHandlerK(handlerExpr, thunkExpr, env, k)
+      case Pair(Symbol("call-with-values"), Pair(producerExpr, Pair(consumerExpr, Nil))) =>
+        evalK(
+          producerExpr,
+          env,
+          producer =>
+            evalK(
+              consumerExpr,
+              env,
+              consumer =>
+                applyK(
+                  producer,
+                  List.empty,
+                  prodResult =>
+                    prodResult match
+                      case MultipleValues(vals) => applyK(consumer, vals, k)
+                      case single               => applyK(consumer, List(single), k)
+                )
+            )
+        )
       case Pair(Symbol("define-syntax"), Pair(Symbol(name), Pair(sr, Nil))) =>
         k(Macros.evalDefineSyntax(name, sr, env))
       case Pair(Symbol(name), pArgs) =>
