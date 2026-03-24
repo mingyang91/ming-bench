@@ -445,6 +445,7 @@ type bodyCtx struct {
 	exprs []*astNode // body expressions of the enclosing let/letrec
 	idx   int        // current expression index
 	env   *env       // environment for this body
+	outer *bodyCtx   // enclosing body context (for chained let bodies)
 }
 
 // interp holds interpreter state including output buffer.
@@ -1059,6 +1060,19 @@ func evalCallCCForm(node *astNode, e *env, ip *interp) (*Value, error) {
 	return doCallCC(f, node, ip)
 }
 
+// nodeContains checks if target is a descendant of (or equal to) parent in the AST.
+func nodeContains(parent, target *astNode) bool {
+	if parent == target {
+		return true
+	}
+	for _, child := range parent.children {
+		if nodeContains(child, target) {
+			return true
+		}
+	}
+	return false
+}
+
 // doCallCC is the core call/cc implementation shared by the special form and builtin paths.
 func doCallCC(f *Value, callNode *astNode, ip *interp) (*Value, error) {
 	if f.typ != valLambda && f.typ != valGoFunc && f.typ != valContinuation {
@@ -1074,6 +1088,7 @@ func doCallCC(f *Value, callNode *astNode, ip *interp) (*Value, error) {
 		bodyExprs := ip.innerBodyCtx.exprs
 		bodyIdx := ip.innerBodyCtx.idx
 		bodyEnv := ip.innerBodyCtx.env
+		outerChain := ip.innerBodyCtx.outer
 		topExprs := ip.topExprs
 		topIdx := ip.topIdx
 		topEnv := ip.topEnv
@@ -1083,12 +1098,29 @@ func doCallCC(f *Value, callNode *astNode, ip *interp) (*Value, error) {
 			}
 			ip.ccOverrides[callNode] = v
 			var result *Value
-			for i := bodyIdx; i < len(bodyExprs); i++ {
+			// Determine start index: if call/cc is directly in the body expression's AST,
+			// replay from bodyIdx (override will intercept it). Otherwise, the call/cc was
+			// reached through a function call — skip past that call.
+			startIdx := bodyIdx
+			if !nodeContains(bodyExprs[bodyIdx], callNode) {
+				startIdx = bodyIdx + 1
+			}
+			for i := startIdx; i < len(bodyExprs); i++ {
 				r, err := eval(bodyExprs[i], bodyEnv, ip)
 				if err != nil {
 					return nil, err
 				}
 				result = r
+			}
+			// Walk up the chain of outer body contexts
+			for ctx := outerChain; ctx != nil; ctx = ctx.outer {
+				for i := ctx.idx + 1; i < len(ctx.exprs); i++ {
+					r, err := eval(ctx.exprs[i], ctx.env, ip)
+					if err != nil {
+						return nil, err
+					}
+					result = r
+				}
 			}
 			for i := topIdx + 1; i < len(topExprs); i++ {
 				r, err := eval(topExprs[i], topEnv, ip)
@@ -1552,7 +1584,7 @@ func evalLet(node *astNode, e *env, ip *interp) (*Value, error) {
 	body := node.children[offset+1:]
 	// Track body context for call/cc continuation capture
 	savedCtx := ip.innerBodyCtx
-	ip.innerBodyCtx = &bodyCtx{exprs: body, env: localEnv}
+	ip.innerBodyCtx = &bodyCtx{exprs: body, env: localEnv, outer: savedCtx}
 	for i, bodyExpr := range body {
 		ip.innerBodyCtx.idx = i
 		if i == len(body)-1 {
