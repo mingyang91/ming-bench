@@ -274,18 +274,22 @@ public class Evaluator {
         return datum;
     }
 
-    // --- Evaluator ---
+    // --- Evaluator (with trampoline TCO) ---
 
     @SuppressWarnings("unchecked")
     private Object eval(Object expr, Environment env) throws EvalError {
+        while (true) {  // trampoline loop for TCO
         if (expr instanceof Located loc) {
             currentLine = loc.line();
             currentCol = loc.col();
-            return eval(loc.value(), env);
+            expr = loc.value();
+            continue;
         }
 
         if (expr instanceof MacroExpansion me) {
-            return eval(me.form(), me.env());
+            expr = me.form();
+            env = me.env();
+            continue;
         }
 
         if (expr instanceof Long || expr instanceof Double || expr instanceof Rational || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
@@ -328,30 +332,154 @@ public class Evaluator {
                         return VOID;
                     }
                     case "define" -> { return evalDefine(list, env); }
-                    case "if" -> { return evalIf(list, env); }
+                    case "if" -> {
+                        // TCO: tail-call the chosen branch
+                        if (list.size() < 3 || list.size() > 4) throw error("if: bad syntax");
+                        Object cond = eval(list.get(1), env);
+                        if (!Boolean.FALSE.equals(cond)) {
+                            expr = list.get(2);
+                            continue;
+                        } else if (list.size() == 4) {
+                            expr = list.get(3);
+                            continue;
+                        }
+                        return VOID;
+                    }
                     case "quote" -> {
                         if (list.size() != 2) throw error("quote: expected 1 argument");
                         return listToConsCells(list.get(1));
                     }
                     case "lambda" -> { return evalLambda(list, env); }
-                    case "begin" -> { return evalBegin(list, env); }
-                    case "cond" -> { return evalCond(list, env); }
-                    case "let" -> { return evalLet(list, env); }
-                    case "and" -> {
-                        Object result = Boolean.TRUE;
+                    case "begin" -> {
+                        // TCO: eval all but last, tail-call last
+                        if (list.size() <= 1) return VOID;
+                        for (int i = 1; i < list.size() - 1; i++) {
+                            eval(list.get(i), env);
+                        }
+                        expr = list.get(list.size() - 1);
+                        continue;
+                    }
+                    case "cond" -> {
+                        // TCO: tail-call the last expr in matched clause
+                        Object condResult = VOID;
+                        boolean matched = false;
                         for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
+                            Object clause = list.get(i);
+                            if (clause instanceof Located loc) clause = loc.value();
+                            if (!(clause instanceof List<?> cl) || cl.isEmpty()) {
+                                throw error("cond: bad clause");
+                            }
+                            Object test = cl.get(0);
+                            Object rawTest = test instanceof Located loc ? loc.value() : test;
+                            if (rawTest instanceof String s && s.equals("else")) {
+                                for (int j = 1; j < cl.size() - 1; j++) {
+                                    eval(cl.get(j), env);
+                                }
+                                if (cl.size() > 1) {
+                                    expr = cl.get(cl.size() - 1);
+                                    matched = true;
+                                    break;
+                                }
+                                return VOID;
+                            }
+                            Object testVal = eval(test, env);
+                            if (!Boolean.FALSE.equals(testVal)) {
+                                if (cl.size() == 1) return testVal;
+                                for (int j = 1; j < cl.size() - 1; j++) {
+                                    eval(cl.get(j), env);
+                                }
+                                expr = cl.get(cl.size() - 1);
+                                matched = true;
+                                break;
+                            }
+                        }
+                        if (matched) continue;
+                        return VOID;
+                    }
+                    case "let" -> {
+                        // TCO: tail-call the last body expr
+                        if (list.size() < 3) throw error("let: bad syntax");
+                        Object second = list.get(1);
+                        if (second instanceof Located loc) second = loc.value();
+
+                        if (second instanceof String name) {
+                            // Named let
+                            if (list.size() < 4) throw error("let: bad syntax");
+                            Object bindingsList = list.get(2);
+                            if (bindingsList instanceof Located loc) bindingsList = loc.value();
+                            if (!(bindingsList instanceof List<?> bindings)) throw error("let: bad bindings");
+                            List<String> params = new ArrayList<>();
+                            List<Object> inits = new ArrayList<>();
+                            for (Object b : bindings) {
+                                if (b instanceof Located loc) b = loc.value();
+                                if (!(b instanceof List<?> binding) || binding.size() != 2)
+                                    throw error("let: bad binding");
+                                Object varObj = binding.get(0);
+                                if (varObj instanceof Located loc) varObj = loc.value();
+                                if (!(varObj instanceof String varName))
+                                    throw error("let: bad binding variable");
+                                params.add(varName);
+                                inits.add(eval(binding.get(1), env));
+                            }
+                            List<Object> body = new ArrayList<>();
+                            for (int i = 3; i < list.size(); i++) {
+                                body.add(list.get(i));
+                            }
+                            Environment letEnv = new Environment(env);
+                            Lambda lambda = new Lambda(params, null, body, letEnv);
+                            letEnv.define(name, lambda);
+                            Environment callEnv = new Environment(letEnv);
+                            for (int i = 0; i < params.size(); i++) {
+                                callEnv.define(params.get(i), inits.get(i));
+                            }
+                            for (int i = 0; i < body.size() - 1; i++) {
+                                eval(body.get(i), callEnv);
+                            }
+                            expr = body.get(body.size() - 1);
+                            env = callEnv;
+                            continue;
+                        }
+
+                        // Regular let
+                        if (!(second instanceof List<?> bindings)) throw error("let: bad bindings");
+                        Environment letEnv = new Environment(env);
+                        for (Object b : bindings) {
+                            if (b instanceof Located loc) b = loc.value();
+                            if (!(b instanceof List<?> binding) || binding.size() != 2)
+                                throw error("let: bad binding");
+                            Object varObj = binding.get(0);
+                            if (varObj instanceof Located loc) varObj = loc.value();
+                            if (!(varObj instanceof String varName))
+                                throw error("let: bad binding variable");
+                            Object val = eval(binding.get(1), env);
+                            letEnv.define(varName, val);
+                        }
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            eval(list.get(i), letEnv);
+                        }
+                        expr = list.get(list.size() - 1);
+                        env = letEnv;
+                        continue;
+                    }
+                    case "and" -> {
+                        // TCO: tail-call the last expression
+                        if (list.size() == 1) return Boolean.TRUE;
+                        for (int i = 1; i < list.size() - 1; i++) {
+                            Object result = eval(list.get(i), env);
                             if (Boolean.FALSE.equals(result)) return Boolean.FALSE;
                         }
-                        return result;
+                        expr = list.get(list.size() - 1);
+                        continue;
                     }
                     case "or" -> {
-                        Object result = Boolean.FALSE;
-                        for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
+                        // TCO: tail-call the last expression
+                        if (list.size() == 1) return Boolean.FALSE;
+                        for (int i = 1; i < list.size() - 1; i++) {
+                            Object result = eval(list.get(i), env);
                             if (!Boolean.FALSE.equals(result)) return result;
                         }
-                        return result;
+                        expr = list.get(list.size() - 1);
+                        continue;
                     }
                     case "not" -> {
                         checkArgs(list, 1, "not");
@@ -361,8 +489,21 @@ public class Evaluator {
                     case "define-syntax" -> { return evalDefineSyntax(list, env); }
                     case "define-record-type" -> { return evalDefineRecordType(list, env); }
                     case "case-lambda" -> { return evalCaseLambda(list, env); }
-                    case "letrec" -> { return evalLetrec(list, env, false); }
-                    case "letrec*" -> { return evalLetrec(list, env, true); }
+                    case "letrec" -> {
+                        // TCO: tail-call last body expr
+                        Object letrecResult = evalLetrecTco(list, env, false);
+                        if (letrecResult instanceof TailCall tc) {
+                            expr = tc.expr; env = tc.env; continue;
+                        }
+                        return letrecResult;
+                    }
+                    case "letrec*" -> {
+                        Object letrecResult = evalLetrecTco(list, env, true);
+                        if (letrecResult instanceof TailCall tc) {
+                            expr = tc.expr; env = tc.env; continue;
+                        }
+                        return letrecResult;
+                    }
                     case "case" -> { return evalCase(list, env); }
                     case "do" -> { return evalDo(list, env); }
                 }
@@ -371,7 +512,8 @@ public class Evaluator {
                     Object headVal = env.lookup(op);
                     if (headVal instanceof SyntaxRulesDef sr) {
                         Object expanded = expandMacro(sr, list, env);
-                        return eval(expanded, env);
+                        expr = expanded;
+                        continue;
                     }
                 } catch (EvalError ignored) {}
             }
@@ -385,9 +527,109 @@ public class Evaluator {
             // Restore call-site position for apply errors
             currentLine = callLine;
             currentCol = callCol;
-            return apply(proc, args);
+
+            // TCO: for Lambda/CaseLambda, set up env and tail-call last body expr
+            if (proc instanceof Lambda lambda) {
+                env = applyLambdaEnv(lambda, args);
+                for (int i = 0; i < lambda.body.size() - 1; i++) {
+                    eval(lambda.body.get(i), env);
+                }
+                expr = lambda.body.get(lambda.body.size() - 1);
+                continue;
+            }
+            if (proc instanceof CaseLambda cl) {
+                Lambda matched = null;
+                for (Lambda clause : cl.clauses) {
+                    if (clause.restParam != null) {
+                        if (args.size() >= clause.params.size()) { matched = clause; break; }
+                    } else {
+                        if (args.size() == clause.params.size()) { matched = clause; break; }
+                    }
+                }
+                if (matched == null) throw error("case-lambda: no matching clause for " + args.size() + " arguments");
+                env = applyLambdaEnv(matched, args);
+                for (int i = 0; i < matched.body.size() - 1; i++) {
+                    eval(matched.body.get(i), env);
+                }
+                expr = matched.body.get(matched.body.size() - 1);
+                continue;
+            }
+            if (proc instanceof BuiltinProc bp) {
+                return bp.apply(args);
+            }
+            throw error("not a procedure: " + schemeToString(proc));
         }
         throw error("cannot evaluate: " + expr);
+        } // end trampoline while
+    }
+
+    // Helper: set up a Lambda call environment (for TCO in eval loop)
+    private Environment applyLambdaEnv(Lambda lambda, List<Object> args) throws EvalError {
+        if (lambda.restParam != null) {
+            if (args.size() < lambda.params.size()) {
+                throw error("wrong number of arguments: expected at least " + lambda.params.size() + ", got " + args.size());
+            }
+        } else {
+            if (args.size() != lambda.params.size()) {
+                throw error("wrong number of arguments: expected " + lambda.params.size() + ", got " + args.size());
+            }
+        }
+        Environment callEnv = new Environment(lambda.closure);
+        for (int i = 0; i < lambda.params.size(); i++) {
+            callEnv.define(lambda.params.get(i), args.get(i));
+        }
+        if (lambda.restParam != null) {
+            Object rest = NIL;
+            for (int i = args.size() - 1; i >= lambda.params.size(); i--) {
+                rest = new Pair(args.get(i), rest);
+            }
+            callEnv.define(lambda.restParam, rest);
+        }
+        return callEnv;
+    }
+
+    // Marker for tail call from helper methods
+    private record TailCall(Object expr, Environment env) {}
+
+    // letrec/letrec* with TCO support - returns TailCall for last body expr
+    @SuppressWarnings("unchecked")
+    private Object evalLetrecTco(List<?> list, Environment env, boolean star) throws EvalError {
+        if (list.size() < 3) throw error("letrec: bad syntax");
+        Object bindingsObj = list.get(1);
+        if (bindingsObj instanceof Located loc) bindingsObj = loc.value();
+        if (!(bindingsObj instanceof List<?> bindings)) throw error("letrec: bad bindings");
+        Environment letEnv = new Environment(env);
+        List<String> names = new ArrayList<>();
+        List<Object> initExprs = new ArrayList<>();
+        for (Object b : bindings) {
+            if (b instanceof Located loc) b = loc.value();
+            if (!(b instanceof List<?> binding) || binding.size() != 2)
+                throw error("letrec: bad binding");
+            Object varObj = binding.get(0);
+            if (varObj instanceof Located loc) varObj = loc.value();
+            if (!(varObj instanceof String varName)) throw error("letrec: bad binding variable");
+            names.add(varName);
+            initExprs.add(binding.get(1));
+            letEnv.define(varName, VOID);
+        }
+        if (star) {
+            for (int i = 0; i < names.size(); i++) {
+                Object val = eval(initExprs.get(i), letEnv);
+                letEnv.define(names.get(i), val);
+            }
+        } else {
+            List<Object> vals = new ArrayList<>();
+            for (int i = 0; i < names.size(); i++) {
+                vals.add(eval(initExprs.get(i), letEnv));
+            }
+            for (int i = 0; i < names.size(); i++) {
+                letEnv.define(names.get(i), vals.get(i));
+            }
+        }
+        for (int i = 2; i < list.size() - 1; i++) {
+            eval(list.get(i), letEnv);
+        }
+        return new TailCall(list.get(list.size() - 1), letEnv);
     }
 
     @SuppressWarnings("unchecked")
@@ -433,17 +675,6 @@ public class Evaluator {
             return VOID;
         }
         throw error("define: bad syntax");
-    }
-
-    private Object evalIf(List<?> list, Environment env) throws EvalError {
-        if (list.size() < 3 || list.size() > 4) throw error("if: bad syntax");
-        Object cond = eval(list.get(1), env);
-        if (!Boolean.FALSE.equals(cond)) {
-            return eval(list.get(2), env);
-        } else if (list.size() == 4) {
-            return eval(list.get(3), env);
-        }
-        return VOID;
     }
 
     private Object evalLambda(List<?> list, Environment env) throws EvalError {
@@ -509,147 +740,6 @@ public class Evaluator {
             clauses.add(new Lambda(params, restParam, body, env));
         }
         return new CaseLambda(clauses);
-    }
-
-    private Object evalBegin(List<?> list, Environment env) throws EvalError {
-        Object result = VOID;
-        for (int i = 1; i < list.size(); i++) {
-            result = eval(list.get(i), env);
-        }
-        return result;
-    }
-
-    private Object evalCond(List<?> list, Environment env) throws EvalError {
-        for (int i = 1; i < list.size(); i++) {
-            Object clause = list.get(i);
-            if (clause instanceof Located loc) clause = loc.value();
-            if (!(clause instanceof List<?> cl) || cl.isEmpty()) {
-                throw error("cond: bad clause");
-            }
-            Object test = cl.get(0);
-            Object rawTest = test instanceof Located loc ? loc.value() : test;
-            if (rawTest instanceof String s && s.equals("else")) {
-                Object result = VOID;
-                for (int j = 1; j < cl.size(); j++) {
-                    result = eval(cl.get(j), env);
-                }
-                return result;
-            }
-            Object testVal = eval(test, env);
-            if (!Boolean.FALSE.equals(testVal)) {
-                Object result = testVal;
-                for (int j = 1; j < cl.size(); j++) {
-                    result = eval(cl.get(j), env);
-                }
-                return result;
-            }
-        }
-        return VOID;
-    }
-
-    @SuppressWarnings("unchecked")
-    private Object evalLet(List<?> list, Environment env) throws EvalError {
-        if (list.size() < 3) throw error("let: bad syntax");
-        Object second = list.get(1);
-        if (second instanceof Located loc) second = loc.value();
-
-        // Named let: (let name ((var init) ...) body...)
-        if (second instanceof String name) {
-            if (list.size() < 4) throw error("let: bad syntax");
-            Object bindingsList = list.get(2);
-            if (bindingsList instanceof Located loc) bindingsList = loc.value();
-            if (!(bindingsList instanceof List<?> bindings)) throw error("let: bad bindings");
-            List<String> params = new ArrayList<>();
-            List<Object> inits = new ArrayList<>();
-            for (Object b : bindings) {
-                if (b instanceof Located loc) b = loc.value();
-                if (!(b instanceof List<?> binding) || binding.size() != 2)
-                    throw error("let: bad binding");
-                Object varObj = binding.get(0);
-                if (varObj instanceof Located loc) varObj = loc.value();
-                if (!(varObj instanceof String varName))
-                    throw error("let: bad binding variable");
-                params.add(varName);
-                inits.add(eval(binding.get(1), env));
-            }
-            List<Object> body = new ArrayList<>();
-            for (int i = 3; i < list.size(); i++) {
-                body.add(list.get(i));
-            }
-            Environment letEnv = new Environment(env);
-            Lambda lambda = new Lambda(params, null, body, letEnv);
-            letEnv.define(name, lambda);
-            Environment callEnv = new Environment(letEnv);
-            for (int i = 0; i < params.size(); i++) {
-                callEnv.define(params.get(i), inits.get(i));
-            }
-            Object result = VOID;
-            for (Object bodyExpr : body) {
-                result = eval(bodyExpr, callEnv);
-            }
-            return result;
-        }
-
-        // Regular let: (let ((var init) ...) body...)
-        if (!(second instanceof List<?> bindings)) throw error("let: bad bindings");
-        Environment letEnv = new Environment(env);
-        for (Object b : bindings) {
-            if (b instanceof Located loc) b = loc.value();
-            if (!(b instanceof List<?> binding) || binding.size() != 2)
-                throw error("let: bad binding");
-            Object varObj = binding.get(0);
-            if (varObj instanceof Located loc) varObj = loc.value();
-            if (!(varObj instanceof String varName))
-                throw error("let: bad binding variable");
-            Object val = eval(binding.get(1), env);
-            letEnv.define(varName, val);
-        }
-        Object result = VOID;
-        for (int i = 2; i < list.size(); i++) {
-            result = eval(list.get(i), letEnv);
-        }
-        return result;
-    }
-
-    @SuppressWarnings("unchecked")
-    private Object evalLetrec(List<?> list, Environment env, boolean star) throws EvalError {
-        if (list.size() < 3) throw error("letrec: bad syntax");
-        Object bindingsObj = list.get(1);
-        if (bindingsObj instanceof Located loc) bindingsObj = loc.value();
-        if (!(bindingsObj instanceof List<?> bindings)) throw error("letrec: bad bindings");
-        Environment letEnv = new Environment(env);
-        List<String> names = new ArrayList<>();
-        List<Object> initExprs = new ArrayList<>();
-        for (Object b : bindings) {
-            if (b instanceof Located loc) b = loc.value();
-            if (!(b instanceof List<?> binding) || binding.size() != 2)
-                throw error("letrec: bad binding");
-            Object varObj = binding.get(0);
-            if (varObj instanceof Located loc) varObj = loc.value();
-            if (!(varObj instanceof String varName)) throw error("letrec: bad binding variable");
-            names.add(varName);
-            initExprs.add(binding.get(1));
-            letEnv.define(varName, VOID); // placeholder
-        }
-        if (star) {
-            for (int i = 0; i < names.size(); i++) {
-                Object val = eval(initExprs.get(i), letEnv);
-                letEnv.define(names.get(i), val);
-            }
-        } else {
-            List<Object> vals = new ArrayList<>();
-            for (int i = 0; i < names.size(); i++) {
-                vals.add(eval(initExprs.get(i), letEnv));
-            }
-            for (int i = 0; i < names.size(); i++) {
-                letEnv.define(names.get(i), vals.get(i));
-            }
-        }
-        Object result = VOID;
-        for (int i = 2; i < list.size(); i++) {
-            result = eval(list.get(i), letEnv);
-        }
-        return result;
     }
 
     @SuppressWarnings("unchecked")
