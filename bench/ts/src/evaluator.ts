@@ -4,6 +4,10 @@ import { EvalError } from './evalError.js';
 
 interface Pos { line: number; col: number }
 
+// CPS types for call/cc support
+type Bounce = { tag: 'done'; value: SchemeVal } | { tag: 'bounce'; fn: () => Bounce };
+type Cont = (val: SchemeVal) => Bounce;
+
 type SchemeValBase =
   | { tag: 'number'; value: number; exact?: boolean }
   | { tag: 'rational'; num: number; den: number }
@@ -14,7 +18,7 @@ type SchemeValBase =
   | { tag: 'list'; value: SchemeVal[] }
   | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }
   | { tag: 'nil' }
-  | { tag: 'procedure'; value: (...args: SchemeVal[]) => SchemeVal; _closure?: { params: { names: string[]; rest: string | null }; body: SchemeVal[]; env: Env } }
+  | { tag: 'procedure'; value: (...args: SchemeVal[]) => SchemeVal; _closure?: { params: { names: string[]; rest: string | null }; body: SchemeVal[]; env: Env }; _callcc?: boolean; _cont?: Cont; _caseClauses?: { clauses: { paramInfo: { names: string[]; rest: string | null }; bodyExprs: SchemeVal[] }[]; closureEnv: Env } }
   | { tag: 'void' }
   | { tag: 'macro'; literals: string[]; rules: { pattern: SchemeVal; template: SchemeVal }[]; defEnv: Env }
   | { tag: 'record'; typeName: string; typeId: symbol; fields: Map<string, SchemeVal> }
@@ -1107,6 +1111,11 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
     return func.value(...allArgs);
   }});
 
+  // L18: call/cc
+  const callccProc: SchemeVal = { tag: 'procedure', value: (..._args: SchemeVal[]) => { throw new EvalError('call/cc must be applied in CPS context'); }, _callcc: true };
+  env.set('call/cc', callccProc);
+  env.set('call-with-current-continuation', callccProc);
+
   // cxr helpers
   const cxr = (ops: string) => ({ tag: 'procedure' as const, value: (...args: SchemeVal[]) => {
     if (args.length !== 1) throw new EvalError(`c${ops}r requires exactly 1 argument`);
@@ -1507,22 +1516,125 @@ function makeProcedure(paramInfo: { names: string[]; rest: string | null }, body
     value: (...args: SchemeVal[]) => {
       const childEnv = new Env(closureEnv);
       bindArgs(childEnv, paramInfo, args);
-      let result: SchemeVal = { tag: 'void' };
-      for (const b of bodyExprs) {
-        result = evaluate(b, childEnv);
-      }
-      return result;
+      return runBounce(evalSeqK(bodyExprs, 0, childEnv, (v) => ({ tag: 'done', value: v })));
     },
     _closure: { params: paramInfo, body: bodyExprs, env: closureEnv }
   };
   return proc;
 }
 
-function evaluate(exprIn: SchemeVal, envIn: Env): SchemeVal {
-  let expr = exprIn;
-  let env = envIn;
+// --- CPS Evaluator (for call/cc support) ---
 
-  trampoline: while (true) {
+function runBounce(b: Bounce): SchemeVal {
+  let bounce = b;
+  while (bounce.tag === 'bounce') bounce = bounce.fn();
+  return bounce.value;
+}
+
+function evalSeqK(exprs: SchemeVal[], idx: number, env: Env, k: Cont): Bounce {
+  if (idx >= exprs.length) return k({ tag: 'void' });
+  if (idx === exprs.length - 1) return { tag: 'bounce', fn: () => evalK(exprs[idx], env, k) };
+  return evalK(exprs[idx], env, (_) => ({ tag: 'bounce', fn: () => evalSeqK(exprs, idx + 1, env, k) }));
+}
+
+// Right-to-left argument evaluation (matches Chez Scheme)
+function evalArgsRtoLK(exprs: SchemeVal[], env: Env, k: (args: SchemeVal[]) => Bounce): Bounce {
+  const len = exprs.length;
+  if (len === 0) return k([]);
+  // Evaluate from right to left, build result array
+  function go(i: number, acc: SchemeVal[]): Bounce {
+    if (i < 0) return k(acc);
+    return evalK(exprs[i], env, (v) => {
+      acc[i] = v;
+      return { tag: 'bounce', fn: () => go(i - 1, acc) };
+    });
+  }
+  return go(len - 1, new Array(len));
+}
+
+function applyK(func: SchemeVal, args: SchemeVal[], k: Cont, pos?: Pos): Bounce {
+  // call/cc: (call/cc proc) — proc receives the continuation
+  if (func.tag === 'procedure' && func._callcc) {
+    if (args.length !== 1) throw errAt('call/cc requires exactly 1 argument', pos);
+    const proc = args[0];
+    const contVal: SchemeVal = {
+      tag: 'procedure',
+      value: (...cargs: SchemeVal[]) => {
+        // For use from non-CPS context (e.g. map callback)
+        throw new EvalError('continuation invoked outside CPS context');
+      },
+      _cont: k
+    };
+    return applyK(proc, [contVal], k, pos);
+  }
+
+  // Continuation invocation
+  if (func.tag === 'procedure' && func._cont) {
+    const val = args.length > 0 ? args[0] : ({ tag: 'void' } as SchemeVal);
+    return { tag: 'bounce', fn: () => func._cont!(val) };
+  }
+
+  if (func.tag !== 'procedure') throw errAt('not a procedure', pos);
+
+  // User-defined closure — evaluate body in CPS
+  const cl = func._closure;
+  if (cl) {
+    const childEnv = new Env(cl.env);
+    bindArgs(childEnv, cl.params, args);
+    return evalSeqK(cl.body, 0, childEnv, k);
+  }
+
+  // Case-lambda
+  if (func._caseClauses) {
+    const { clauses, closureEnv } = func._caseClauses;
+    for (const cl of clauses) {
+      if (cl.paramInfo.rest !== null) {
+        if (args.length >= cl.paramInfo.names.length) {
+          const childEnv = new Env(closureEnv);
+          bindArgs(childEnv, cl.paramInfo, args);
+          return evalSeqK(cl.bodyExprs, 0, childEnv, k);
+        }
+      } else {
+        if (args.length === cl.paramInfo.names.length) {
+          const childEnv = new Env(closureEnv);
+          bindArgs(childEnv, cl.paramInfo, args);
+          return evalSeqK(cl.bodyExprs, 0, childEnv, k);
+        }
+      }
+    }
+    throw new EvalError(`no matching clause for ${args.length} arguments`);
+  }
+
+  // Native procedure
+  try {
+    const result = func.value(...args);
+    return k(result);
+  } catch (e) {
+    if (e instanceof EvalError && !/^\d+:/.test(e.message)) {
+      throw errAt(e.message, pos);
+    }
+    throw e;
+  }
+}
+
+function resolveSymbol(name: string, env: Env, pos?: Pos): SchemeVal {
+  try {
+    return env.get(name);
+  } catch {
+    const resolved = resolvedSymbols.get(name);
+    if (resolved) {
+      try {
+        return resolved.env.get(resolved.name);
+      } catch (e2) {
+        if (e2 instanceof EvalError) throw errAt(e2.message, pos);
+        throw e2;
+      }
+    }
+    throw errAt(`unbound variable: ${name}`, pos);
+  }
+}
+
+function evalK(expr: SchemeVal, env: Env, k: Cont): Bounce {
   switch (expr.tag) {
     case 'number':
     case 'rational':
@@ -1530,29 +1642,14 @@ function evaluate(exprIn: SchemeVal, envIn: Env): SchemeVal {
     case 'string':
     case 'char':
     case 'vector':
-      return expr;
+      return k(expr);
 
-    case 'symbol': {
-      try {
-        return env.get(expr.value);
-      } catch {
-        const resolved = resolvedSymbols.get(expr.value);
-        if (resolved) {
-          try {
-            return resolved.env.get(resolved.name);
-          } catch (e2) {
-            if (e2 instanceof EvalError) throw errAt(e2.message, expr.pos);
-            throw e2;
-          }
-        }
-        throw errAt(`unbound variable: ${expr.value}`, expr.pos);
-      }
-    }
+    case 'symbol':
+      return k(resolveSymbol(expr.value, env, expr.pos));
 
     case 'list': {
       const elems = expr.value;
       if (elems.length === 0) throw errAt('empty application', expr.pos);
-
       const first = elems[0];
 
       // Special forms
@@ -1562,26 +1659,25 @@ function evaluate(exprIn: SchemeVal, envIn: Env): SchemeVal {
             if (elems.length < 3) throw errAt('define requires at least 2 arguments', expr.pos);
             const target = elems[1];
             if (target.tag === 'symbol') {
-              // (define x expr)
-              const val = evaluate(elems[2], env);
-              env.set(target.value, val);
-              return { tag: 'void' };
+              return evalK(elems[2], env, (val) => {
+                env.set(target.value, val);
+                return k({ tag: 'void' });
+              });
             }
             if (target.tag === 'list' && target.value.length > 0 && target.value[0].tag === 'symbol') {
-              // (define (f params...) body...)
               const name = target.value[0].value;
               const paramsForm: SchemeVal = { tag: 'list', value: target.value.slice(1), pos: target.pos };
               const paramInfo = parseParams(paramsForm);
               const bodyExprs = elems.slice(2);
               env.set(name, makeProcedure(paramInfo, bodyExprs, env));
-              return { tag: 'void' };
+              return k({ tag: 'void' });
             }
             if (target.tag === 'pair' && target.car.tag === 'symbol') {
               const name = target.car.value;
               const paramInfo = parseParams(target.cdr);
               const bodyExprs = elems.slice(2);
               env.set(name, makeProcedure(paramInfo, bodyExprs, env));
-              return { tag: 'void' };
+              return k({ tag: 'void' });
             }
             throw errAt('invalid define syntax', expr.pos);
           }
@@ -1589,36 +1685,36 @@ function evaluate(exprIn: SchemeVal, envIn: Env): SchemeVal {
             if (elems.length !== 3) throw errAt('set! requires exactly 2 arguments', expr.pos);
             const target = elems[1];
             if (target.tag !== 'symbol') throw errAt('set! target must be a symbol', expr.pos);
-            const val = evaluate(elems[2], env);
-            try {
-              env.update(target.value, val);
-            } catch (e) {
-              if (e instanceof EvalError) throw errAt(e.message, expr.pos);
-              throw e;
-            }
-            return { tag: 'void' };
+            return evalK(elems[2], env, (val) => {
+              try {
+                env.update(target.value, val);
+              } catch (e) {
+                if (e instanceof EvalError) throw errAt(e.message, expr.pos);
+                throw e;
+              }
+              return k({ tag: 'void' });
+            });
           }
           case 'if': {
             if (elems.length < 3) throw errAt('if requires at least 2 arguments', expr.pos);
-            const cond = evaluate(elems[1], env);
-            if (!isFalsy(cond)) {
-              expr = elems[2];
-              continue trampoline;
-            } else if (elems.length > 3) {
-              expr = elems[3];
-              continue trampoline;
-            }
-            return { tag: 'void' };
+            return evalK(elems[1], env, (cond) => {
+              if (!isFalsy(cond)) {
+                return { tag: 'bounce', fn: () => evalK(elems[2], env, k) };
+              } else if (elems.length > 3) {
+                return { tag: 'bounce', fn: () => evalK(elems[3], env, k) };
+              }
+              return k({ tag: 'void' });
+            });
           }
           case 'quote': {
             if (elems.length !== 2) throw errAt('quote requires exactly 1 argument', expr.pos);
-            return listToConsPairs(elems[1]);
+            return k(listToConsPairs(elems[1]));
           }
           case 'lambda': {
             if (elems.length < 3) throw errAt('lambda requires params and body', expr.pos);
             const paramInfo = parseParams(elems[1]);
             const bodyExprs = elems.slice(2);
-            return makeProcedure(paramInfo, bodyExprs, env);
+            return k(makeProcedure(paramInfo, bodyExprs, env));
           }
           case 'case-lambda': {
             if (elems.length < 2) throw errAt('case-lambda requires at least one clause', expr.pos);
@@ -1632,155 +1728,149 @@ function evaluate(exprIn: SchemeVal, envIn: Env): SchemeVal {
               clauses.push({ paramInfo, bodyExprs });
             }
             const closureEnv = env;
-            return { tag: 'procedure', value: (...args: SchemeVal[]) => {
-              for (const cl of clauses) {
-                if (cl.paramInfo.rest !== null) {
-                  if (args.length >= cl.paramInfo.names.length) {
-                    const childEnv = new Env(closureEnv);
-                    bindArgs(childEnv, cl.paramInfo, args);
-                    let result: SchemeVal = { tag: 'void' };
-                    for (const b of cl.bodyExprs) result = evaluate(b, childEnv);
-                    return result;
-                  }
-                } else {
-                  if (args.length === cl.paramInfo.names.length) {
-                    const childEnv = new Env(closureEnv);
-                    bindArgs(childEnv, cl.paramInfo, args);
-                    let result: SchemeVal = { tag: 'void' };
-                    for (const b of cl.bodyExprs) result = evaluate(b, childEnv);
-                    return result;
+            const proc: SchemeVal = {
+              tag: 'procedure',
+              value: (...args: SchemeVal[]) => {
+                for (const cl of clauses) {
+                  if (cl.paramInfo.rest !== null) {
+                    if (args.length >= cl.paramInfo.names.length) {
+                      const childEnv = new Env(closureEnv);
+                      bindArgs(childEnv, cl.paramInfo, args);
+                      return runBounce(evalSeqK(cl.bodyExprs, 0, childEnv, (v) => ({ tag: 'done', value: v })));
+                    }
+                  } else {
+                    if (args.length === cl.paramInfo.names.length) {
+                      const childEnv = new Env(closureEnv);
+                      bindArgs(childEnv, cl.paramInfo, args);
+                      return runBounce(evalSeqK(cl.bodyExprs, 0, childEnv, (v) => ({ tag: 'done', value: v })));
+                    }
                   }
                 }
-              }
-              throw new EvalError(`no matching clause for ${args.length} arguments`);
-            }};
+                throw new EvalError(`no matching clause for ${args.length} arguments`);
+              },
+              _caseClauses: { clauses, closureEnv }
+            };
+            return k(proc);
           }
           case 'and': {
-            if (elems.length === 1) return { tag: 'boolean', value: true };
-            for (let i = 1; i < elems.length - 1; i++) {
-              const val = evaluate(elems[i], env);
-              if (isFalsy(val)) return val;
-            }
-            expr = elems[elems.length - 1];
-            continue trampoline;
+            if (elems.length === 1) return k({ tag: 'boolean', value: true });
+            const evalAnd = (i: number): Bounce => {
+              if (i === elems.length - 1) return { tag: 'bounce', fn: () => evalK(elems[i], env, k) };
+              return evalK(elems[i], env, (val) => {
+                if (isFalsy(val)) return k(val);
+                return { tag: 'bounce', fn: () => evalAnd(i + 1) };
+              });
+            };
+            return evalAnd(1);
           }
           case 'or': {
-            if (elems.length === 1) return { tag: 'boolean', value: false };
-            for (let i = 1; i < elems.length - 1; i++) {
-              const val = evaluate(elems[i], env);
-              if (!isFalsy(val)) return val;
-            }
-            expr = elems[elems.length - 1];
-            continue trampoline;
+            if (elems.length === 1) return k({ tag: 'boolean', value: false });
+            const evalOr = (i: number): Bounce => {
+              if (i === elems.length - 1) return { tag: 'bounce', fn: () => evalK(elems[i], env, k) };
+              return evalK(elems[i], env, (val) => {
+                if (!isFalsy(val)) return k(val);
+                return { tag: 'bounce', fn: () => evalOr(i + 1) };
+              });
+            };
+            return evalOr(1);
           }
           case 'begin': {
-            if (elems.length === 1) return { tag: 'void' };
-            for (let i = 1; i < elems.length - 1; i++) {
-              evaluate(elems[i], env);
-            }
-            expr = elems[elems.length - 1];
-            continue trampoline;
+            if (elems.length === 1) return k({ tag: 'void' });
+            return evalSeqK(elems.slice(1), 0, env, k);
           }
           case 'let': {
             if (elems.length < 3) throw errAt('let requires bindings and body', expr.pos);
-            // Named let: (let name ((var init) ...) body ...)
+            // Named let
             if (elems[1].tag === 'symbol') {
               if (elems.length < 4) throw errAt('named let requires bindings and body', expr.pos);
               const loopName = elems[1].value;
               const bindingsList = elems[2];
               if (bindingsList.tag !== 'list') throw errAt('let bindings must be a list', expr.pos);
               const paramNames: string[] = [];
-              const initVals: SchemeVal[] = [];
               for (const binding of bindingsList.value) {
                 if (binding.tag !== 'list' || binding.value.length !== 2)
                   throw errAt('invalid let binding', binding.pos);
                 if (binding.value[0].tag !== 'symbol') throw errAt('let binding name must be a symbol', binding.pos);
                 paramNames.push(binding.value[0].value);
-                initVals.push(evaluate(binding.value[1], env));
               }
               const bodyExprs = elems.slice(3);
               const paramInfo = { names: paramNames, rest: null as string | null };
-              // Create closure env that will contain the loop binding
-              const closureEnv = new Env(env);
-              const loopProc = makeProcedure(paramInfo, bodyExprs, closureEnv);
-              closureEnv.set(loopName, loopProc);
-              // Set up initial call env
-              const childEnv = new Env(closureEnv);
-              for (let i = 0; i < paramNames.length; i++) {
-                childEnv.set(paramNames[i], initVals[i]);
-              }
-              // Tail: eval body
-              for (let bi = 0; bi < bodyExprs.length - 1; bi++) {
-                evaluate(bodyExprs[bi], childEnv);
-              }
-              expr = bodyExprs[bodyExprs.length - 1];
-              env = childEnv;
-              continue trampoline;
+              const evalInits = (i: number, vals: SchemeVal[]): Bounce => {
+                if (i >= bindingsList.value.length) {
+                  const closureEnv = new Env(env);
+                  const loopProc = makeProcedure(paramInfo, bodyExprs, closureEnv);
+                  closureEnv.set(loopName, loopProc);
+                  const childEnv = new Env(closureEnv);
+                  for (let j = 0; j < paramNames.length; j++) childEnv.set(paramNames[j], vals[j]);
+                  return evalSeqK(bodyExprs, 0, childEnv, k);
+                }
+                return evalK((bindingsList.value[i] as any).value[1], env, (val) => {
+                  vals.push(val);
+                  return { tag: 'bounce', fn: () => evalInits(i + 1, vals) };
+                });
+              };
+              return evalInits(0, []);
             }
-            // Regular let: (let ((var init) ...) body ...)
+            // Regular let
             const bindings = elems[1];
             if (bindings.tag !== 'list') throw errAt('let bindings must be a list', expr.pos);
             const childEnv = new Env(env);
-            for (const binding of bindings.value) {
+            const evalBindings = (i: number): Bounce => {
+              if (i >= bindings.value.length) {
+                return evalSeqK(elems.slice(2), 0, childEnv, k);
+              }
+              const binding = bindings.value[i];
               if (binding.tag !== 'list' || binding.value.length !== 2)
                 throw errAt('invalid let binding', binding.pos);
               const name = binding.value[0];
               if (name.tag !== 'symbol') throw errAt('let binding name must be a symbol', name.pos);
-              const val = evaluate(binding.value[1], env);
-              childEnv.set(name.value, val);
-            }
-            // Tail: last body expr
-            for (let i = 2; i < elems.length - 1; i++) {
-              evaluate(elems[i], childEnv);
-            }
-            expr = elems[elems.length - 1];
-            env = childEnv;
-            continue trampoline;
+              return evalK(binding.value[1], env, (val) => {
+                childEnv.set(name.value, val);
+                return { tag: 'bounce', fn: () => evalBindings(i + 1) };
+              });
+            };
+            return evalBindings(0);
           }
           case 'let*': {
             if (elems.length < 3) throw errAt('let* requires bindings and body', expr.pos);
             const bindings = elems[1];
             if (bindings.tag !== 'list') throw errAt('let* bindings must be a list', expr.pos);
             const childEnv = new Env(env);
-            for (const binding of bindings.value) {
+            const evalBindings = (i: number): Bounce => {
+              if (i >= bindings.value.length) {
+                return evalSeqK(elems.slice(2), 0, childEnv, k);
+              }
+              const binding = bindings.value[i];
               if (binding.tag !== 'list' || binding.value.length !== 2)
                 throw errAt('invalid let* binding', binding.pos);
               if (binding.value[0].tag !== 'symbol') throw errAt('let* binding name must be a symbol', binding.pos);
-              const val = evaluate(binding.value[1], childEnv);
-              childEnv.set(binding.value[0].value, val);
-            }
-            for (let i = 2; i < elems.length - 1; i++) {
-              evaluate(elems[i], childEnv);
-            }
-            expr = elems[elems.length - 1];
-            env = childEnv;
-            continue trampoline;
+              return evalK((binding as any).value[1], childEnv, (val) => {
+                childEnv.set((binding as any).value[0].value, val);
+                return { tag: 'bounce', fn: () => evalBindings(i + 1) };
+              });
+            };
+            return evalBindings(0);
           }
           case 'cond': {
-            for (let i = 1; i < elems.length; i++) {
+            const tryCond = (i: number): Bounce => {
+              if (i >= elems.length) return k({ tag: 'void' });
               const clause = elems[i];
               if (clause.tag !== 'list' || clause.value.length < 1)
                 throw errAt('invalid cond clause', clause.pos);
               const test = clause.value[0];
               if (test.tag === 'symbol' && test.value === 'else') {
-                if (clause.value.length === 1) return { tag: 'void' };
-                for (let j = 1; j < clause.value.length - 1; j++) {
-                  evaluate(clause.value[j], env);
-                }
-                expr = clause.value[clause.value.length - 1];
-                continue trampoline;
+                if (clause.value.length === 1) return k({ tag: 'void' });
+                return evalSeqK(clause.value.slice(1), 0, env, k);
               }
-              const testVal = evaluate(test, env);
-              if (!isFalsy(testVal)) {
-                if (clause.value.length === 1) return testVal;
-                for (let j = 1; j < clause.value.length - 1; j++) {
-                  evaluate(clause.value[j], env);
+              return evalK(test, env, (testVal) => {
+                if (!isFalsy(testVal)) {
+                  if (clause.value.length === 1) return k(testVal);
+                  return evalSeqK(clause.value.slice(1), 0, env, k);
                 }
-                expr = clause.value[clause.value.length - 1];
-                continue trampoline;
-              }
-            }
-            return { tag: 'void' };
+                return { tag: 'bounce', fn: () => tryCond(i + 1) };
+              });
+            };
+            return tryCond(1);
           }
           case 'letrec': {
             if (elems.length < 3) throw errAt('letrec requires bindings and body', expr.pos);
@@ -1795,72 +1885,64 @@ function evaluate(exprIn: SchemeVal, envIn: Env): SchemeVal {
               names.push(binding.value[0].value);
               childEnv.set(binding.value[0].value, { tag: 'void' });
             }
-            for (let i = 0; i < bindings.value.length; i++) {
-              const binding = bindings.value[i];
-              const val = evaluate((binding as any).value[1], childEnv);
-              childEnv.set(names[i], val);
-            }
-            // Tail: last body expr
-            for (let i = 2; i < elems.length - 1; i++) {
-              evaluate(elems[i], childEnv);
-            }
-            expr = elems[elems.length - 1];
-            env = childEnv;
-            continue trampoline;
+            const evalLetrecBindings = (i: number): Bounce => {
+              if (i >= bindings.value.length) {
+                return evalSeqK(elems.slice(2), 0, childEnv, k);
+              }
+              return evalK((bindings.value[i] as any).value[1], childEnv, (val) => {
+                childEnv.set(names[i], val);
+                return { tag: 'bounce', fn: () => evalLetrecBindings(i + 1) };
+              });
+            };
+            return evalLetrecBindings(0);
           }
           case 'letrec*': {
             if (elems.length < 3) throw errAt('letrec* requires bindings and body', expr.pos);
             const bindings = elems[1];
             if (bindings.tag !== 'list') throw errAt('letrec* bindings must be a list', expr.pos);
             const childEnv = new Env(env);
-            for (const binding of bindings.value) {
+            const evalBindings = (i: number): Bounce => {
+              if (i >= bindings.value.length) {
+                return evalSeqK(elems.slice(2), 0, childEnv, k);
+              }
+              const binding = bindings.value[i];
               if (binding.tag !== 'list' || binding.value.length !== 2)
                 throw errAt('invalid letrec* binding', binding.pos);
               if (binding.value[0].tag !== 'symbol') throw errAt('letrec* binding name must be a symbol', binding.pos);
-              const val = evaluate(binding.value[1], childEnv);
-              childEnv.set(binding.value[0].value, val);
-            }
-            // Tail: last body expr
-            for (let i = 2; i < elems.length - 1; i++) {
-              evaluate(elems[i], childEnv);
-            }
-            expr = elems[elems.length - 1];
-            env = childEnv;
-            continue trampoline;
+              return evalK((binding as any).value[1], childEnv, (val) => {
+                childEnv.set((binding as any).value[0].value, val);
+                return { tag: 'bounce', fn: () => evalBindings(i + 1) };
+              });
+            };
+            return evalBindings(0);
           }
           case 'case': {
             if (elems.length < 2) throw errAt('case requires at least a key', expr.pos);
-            const key = evaluate(elems[1], env);
-            for (let i = 2; i < elems.length; i++) {
-              const clause = elems[i];
-              if (clause.tag !== 'list' || clause.value.length < 2)
-                throw errAt('invalid case clause', clause.pos);
-              const datums = clause.value[0];
-              if (datums.tag === 'symbol' && datums.value === 'else') {
-                for (let j = 1; j < clause.value.length - 1; j++) {
-                  evaluate(clause.value[j], env);
+            return evalK(elems[1], env, (key) => {
+              const tryClause = (i: number): Bounce => {
+                if (i >= elems.length) return k({ tag: 'void' });
+                const clause = elems[i];
+                if (clause.tag !== 'list' || clause.value.length < 2)
+                  throw errAt('invalid case clause', clause.pos);
+                const datums = clause.value[0];
+                if (datums.tag === 'symbol' && datums.value === 'else') {
+                  return evalSeqK(clause.value.slice(1), 0, env, k);
                 }
-                expr = clause.value[clause.value.length - 1];
-                continue trampoline;
-              }
-              if (datums.tag !== 'list') throw errAt('case clause datums must be a list', clause.pos);
-              let matched = false;
-              for (const datum of datums.value) {
-                const d = listToConsPairs(datum);
-                if (schemeEqv(key, d)) { matched = true; break; }
-              }
-              if (matched) {
-                for (let j = 1; j < clause.value.length - 1; j++) {
-                  evaluate(clause.value[j], env);
+                if (datums.tag !== 'list') throw errAt('case clause datums must be a list', clause.pos);
+                let matched = false;
+                for (const datum of datums.value) {
+                  const d = listToConsPairs(datum);
+                  if (schemeEqv(key, d)) { matched = true; break; }
                 }
-                expr = clause.value[clause.value.length - 1];
-                continue trampoline;
-              }
-            }
-            return { tag: 'void' };
+                if (matched) {
+                  return evalSeqK(clause.value.slice(1), 0, env, k);
+                }
+                return { tag: 'bounce', fn: () => tryClause(i + 1) };
+              };
+              return tryClause(2);
+            });
           }
           case 'do': {
-            // (do ((var init step) ...) (test expr ...) body ...)
             if (elems.length < 3) throw errAt('do requires bindings and test', expr.pos);
             const bindingsForm = elems[1];
             const testForm = elems[2];
@@ -1870,40 +1952,57 @@ function evaluate(exprIn: SchemeVal, envIn: Env): SchemeVal {
 
             const vars: { name: string; step: SchemeVal | null }[] = [];
             const childEnv = new Env(env);
-
             for (const binding of bindingsForm.value) {
               if (binding.tag !== 'list' || binding.value.length < 2)
                 throw errAt('invalid do binding', binding.pos);
               if (binding.value[0].tag !== 'symbol') throw errAt('do variable must be a symbol', binding.pos);
               const name = binding.value[0].value;
-              const init = evaluate(binding.value[1], env);
               const step = binding.value.length > 2 ? binding.value[2] : null;
               vars.push({ name, step });
-              childEnv.set(name, init);
             }
 
-            // Iteration loop
-            while (true) {
-              const testVal = evaluate(testForm.value[0], childEnv);
-              if (!isFalsy(testVal)) {
-                if (testForm.value.length === 1) return { tag: 'void' };
-                for (let i = 1; i < testForm.value.length - 1; i++) {
-                  evaluate(testForm.value[i], childEnv);
+            // Evaluate init values
+            const evalDoInits = (i: number): Bounce => {
+              if (i >= bindingsForm.value.length) return doLoop();
+              return evalK((bindingsForm.value[i] as any).value[1], env, (val) => {
+                childEnv.set(vars[i].name, val);
+                return { tag: 'bounce', fn: () => evalDoInits(i + 1) };
+              });
+            };
+
+            const doLoop = (): Bounce => {
+              return evalK(testForm.value[0], childEnv, (testVal) => {
+                if (!isFalsy(testVal)) {
+                  if (testForm.value.length === 1) return k({ tag: 'void' });
+                  return evalSeqK(testForm.value.slice(1), 0, childEnv, k);
                 }
-                expr = testForm.value[testForm.value.length - 1];
-                env = childEnv;
-                continue trampoline;
-              }
-              for (let i = 3; i < elems.length; i++) {
-                evaluate(elems[i], childEnv);
-              }
-              const newVals: (SchemeVal | null)[] = vars.map(v =>
-                v.step ? evaluate(v.step, childEnv) : null
-              );
-              for (let i = 0; i < vars.length; i++) {
-                if (newVals[i] !== null) childEnv.set(vars[i].name, newVals[i]!);
-              }
-            }
+                // Eval body
+                const evalBody = (j: number): Bounce => {
+                  if (j >= elems.length) return evalSteps(0, []);
+                  return evalK(elems[j], childEnv, (_) => ({ tag: 'bounce', fn: () => evalBody(j + 1) }));
+                };
+                // Eval step values
+                const evalSteps = (j: number, newVals: (SchemeVal | null)[]): Bounce => {
+                  if (j >= vars.length) {
+                    for (let m = 0; m < vars.length; m++) {
+                      if (newVals[m] !== null) childEnv.set(vars[m].name, newVals[m]!);
+                    }
+                    return { tag: 'bounce', fn: () => doLoop() };
+                  }
+                  if (vars[j].step) {
+                    return evalK(vars[j].step!, childEnv, (val) => {
+                      newVals.push(val);
+                      return { tag: 'bounce', fn: () => evalSteps(j + 1, newVals) };
+                    });
+                  }
+                  newVals.push(null);
+                  return { tag: 'bounce', fn: () => evalSteps(j + 1, newVals) };
+                };
+                return { tag: 'bounce', fn: () => evalBody(3) };
+              });
+            };
+
+            return evalDoInits(0);
           }
           case 'define-syntax': {
             if (elems.length !== 3) throw errAt('define-syntax requires 2 arguments', expr.pos);
@@ -1928,10 +2027,9 @@ function evaluate(exprIn: SchemeVal, envIn: Env): SchemeVal {
               macroRules.push({ pattern: rule.value[0], template: rule.value[1] });
             }
             env.set(macroName, { tag: 'macro', literals: macroLiterals, rules: macroRules, defEnv: env });
-            return { tag: 'void' };
+            return k({ tag: 'void' });
           }
           case 'define-record-type': {
-            // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
             if (elems.length < 4) throw errAt('define-record-type requires at least 3 arguments', expr.pos);
             const nameForm = elems[1];
             if (nameForm.tag !== 'symbol') throw errAt('define-record-type: expected type name', expr.pos);
@@ -1951,24 +2049,19 @@ function evaluate(exprIn: SchemeVal, envIn: Env): SchemeVal {
             const predForm = elems[3];
             if (predForm.tag !== 'symbol') throw errAt('define-record-type: expected predicate name', expr.pos);
 
-            // Constructor
             env.set(ctorName.value, { tag: 'procedure', value: (...args: SchemeVal[]) => {
               if (args.length !== ctorFields.length)
                 throw new EvalError(`${ctorName.value}: expected ${ctorFields.length} arguments, got ${args.length}`);
               const fields = new Map<string, SchemeVal>();
-              for (let i = 0; i < ctorFields.length; i++) {
-                fields.set(ctorFields[i], args[i]);
-              }
+              for (let i = 0; i < ctorFields.length; i++) fields.set(ctorFields[i], args[i]);
               return { tag: 'record', typeName, typeId, fields };
             }});
 
-            // Predicate
             env.set(predForm.value, { tag: 'procedure', value: (...args: SchemeVal[]) => {
               if (args.length !== 1) throw new EvalError(`${predForm.value}: expected 1 argument`);
               return { tag: 'boolean', value: args[0].tag === 'record' && args[0].typeId === typeId };
             }});
 
-            // Field accessors
             for (let i = 4; i < elems.length; i++) {
               const fieldDef = elems[i];
               if (fieldDef.tag !== 'list' || fieldDef.value.length < 2)
@@ -1986,7 +2079,7 @@ function evaluate(exprIn: SchemeVal, envIn: Env): SchemeVal {
               }});
             }
 
-            return { tag: 'void' };
+            return k({ tag: 'void' });
           }
         }
 
@@ -1999,43 +2092,27 @@ function evaluate(exprIn: SchemeVal, envIn: Env): SchemeVal {
           try { macroVal = env.get(first.value); } catch {}
         }
         if (macroVal && macroVal.tag === 'macro') {
-          expr = expandMacro(macroVal, expr);
-          continue trampoline;
+          const expanded = expandMacro(macroVal, expr);
+          return { tag: 'bounce', fn: () => evalK(expanded, env, k) };
         }
       }
 
-      // Function application
-      const func = evaluate(first, env);
-      if (func.tag !== 'procedure') throw errAt('not a procedure', expr.pos);
-      const args = elems.slice(1).map(a => evaluate(a, env));
-
-      // TCO: if this is a user-defined closure, trampoline through it
-      const cl = func._closure;
-      if (cl) {
-        const childEnv = new Env(cl.env);
-        bindArgs(childEnv, cl.params, args);
-        for (let bi = 0; bi < cl.body.length - 1; bi++) {
-          evaluate(cl.body[bi], childEnv);
-        }
-        expr = cl.body[cl.body.length - 1];
-        env = childEnv;
-        continue trampoline;
-      }
-
-      try {
-        return func.value(...args);
-      } catch (e) {
-        if (e instanceof EvalError && !/^\d+:/.test(e.message)) {
-          throw errAt(e.message, expr.pos);
-        }
-        throw e;
-      }
+      // Function application: evaluate operator, then args R-to-L, then apply
+      return evalK(first, env, (func) => {
+        return evalArgsRtoLK(elems.slice(1), env, (args) => {
+          return applyK(func, args, k, expr.pos);
+        });
+      });
     }
 
     default:
       throw errAt('cannot evaluate', expr.pos);
   }
-  }
+}
+
+// Synchronous evaluate wrapper (for use by .value callbacks from builtins like map)
+function evaluate(expr: SchemeVal, env: Env): SchemeVal {
+  return runBounce(evalK(expr, env, (v) => ({ tag: 'done', value: v })));
 }
 
 function display(val: SchemeVal): string {
@@ -2044,7 +2121,8 @@ function display(val: SchemeVal): string {
 
 /**
  * Evaluate one or more Scheme expressions and return the string
- * representation of the last result.
+ * representation of the last result. All expressions are chained
+ * in a single CPS chain so continuations can span across them.
  */
 export function evalStr(input: string): string {
   gensymCounter = 0;
@@ -2053,10 +2131,7 @@ export function evalStr(input: string): string {
   const exprs = parse(tokens);
   if (exprs.length === 0) throw new EvalError('no expressions');
   const env = makeGlobalEnv();
-  let result: SchemeVal = { tag: 'void' };
-  for (const expr of exprs) {
-    result = evaluate(expr, env);
-  }
+  const result = runBounce(evalSeqK(exprs, 0, env, (v) => ({ tag: 'done', value: v })));
   return display(result);
 }
 
@@ -2072,9 +2147,6 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   if (exprs.length === 0) throw new EvalError('no expressions');
   const outputBuf: string[] = [];
   const env = makeGlobalEnv(outputBuf);
-  let result: SchemeVal = { tag: 'void' };
-  for (const expr of exprs) {
-    result = evaluate(expr, env);
-  }
+  const result = runBounce(evalSeqK(exprs, 0, env, (v) => ({ tag: 'done', value: v })));
   return { result: display(result), output: outputBuf.join('') };
 }

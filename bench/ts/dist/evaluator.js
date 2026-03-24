@@ -1214,6 +1214,10 @@ function makeGlobalEnv(outputBuf) {
             const allArgs = [...prefixArgs, ...listArgs];
             return func.value(...allArgs);
         } });
+    // L18: call/cc
+    const callccProc = { tag: 'procedure', value: (..._args) => { throw new EvalError('call/cc must be applied in CPS context'); }, _callcc: true };
+    env.set('call/cc', callccProc);
+    env.set('call-with-current-continuation', callccProc);
     // cxr helpers
     const cxr = (ops) => ({ tag: 'procedure', value: (...args) => {
             if (args.length !== 1)
@@ -1586,90 +1590,177 @@ function makeProcedure(paramInfo, bodyExprs, closureEnv) {
         value: (...args) => {
             const childEnv = new Env(closureEnv);
             bindArgs(childEnv, paramInfo, args);
-            let result = { tag: 'void' };
-            for (const b of bodyExprs) {
-                result = evaluate(b, childEnv);
-            }
-            return result;
+            return runBounce(evalSeqK(bodyExprs, 0, childEnv, (v) => ({ tag: 'done', value: v })));
         },
         _closure: { params: paramInfo, body: bodyExprs, env: closureEnv }
     };
     return proc;
 }
-function evaluate(exprIn, envIn) {
-    let expr = exprIn;
-    let env = envIn;
-    trampoline: while (true) {
-        switch (expr.tag) {
-            case 'number':
-            case 'rational':
-            case 'boolean':
-            case 'string':
-            case 'char':
-            case 'vector':
-                return expr;
-            case 'symbol': {
-                try {
-                    return env.get(expr.value);
-                }
-                catch {
-                    const resolved = resolvedSymbols.get(expr.value);
-                    if (resolved) {
-                        try {
-                            return resolved.env.get(resolved.name);
-                        }
-                        catch (e2) {
-                            if (e2 instanceof EvalError)
-                                throw errAt(e2.message, expr.pos);
-                            throw e2;
-                        }
-                    }
-                    throw errAt(`unbound variable: ${expr.value}`, expr.pos);
+// --- CPS Evaluator (for call/cc support) ---
+function runBounce(b) {
+    let bounce = b;
+    while (bounce.tag === 'bounce')
+        bounce = bounce.fn();
+    return bounce.value;
+}
+function evalSeqK(exprs, idx, env, k) {
+    if (idx >= exprs.length)
+        return k({ tag: 'void' });
+    if (idx === exprs.length - 1)
+        return { tag: 'bounce', fn: () => evalK(exprs[idx], env, k) };
+    return evalK(exprs[idx], env, (_) => ({ tag: 'bounce', fn: () => evalSeqK(exprs, idx + 1, env, k) }));
+}
+// Right-to-left argument evaluation (matches Chez Scheme)
+function evalArgsRtoLK(exprs, env, k) {
+    const len = exprs.length;
+    if (len === 0)
+        return k([]);
+    // Evaluate from right to left, build result array
+    function go(i, acc) {
+        if (i < 0)
+            return k(acc);
+        return evalK(exprs[i], env, (v) => {
+            acc[i] = v;
+            return { tag: 'bounce', fn: () => go(i - 1, acc) };
+        });
+    }
+    return go(len - 1, new Array(len));
+}
+function applyK(func, args, k, pos) {
+    // call/cc: (call/cc proc) — proc receives the continuation
+    if (func.tag === 'procedure' && func._callcc) {
+        if (args.length !== 1)
+            throw errAt('call/cc requires exactly 1 argument', pos);
+        const proc = args[0];
+        const contVal = {
+            tag: 'procedure',
+            value: (...cargs) => {
+                // For use from non-CPS context (e.g. map callback)
+                throw new EvalError('continuation invoked outside CPS context');
+            },
+            _cont: k
+        };
+        return applyK(proc, [contVal], k, pos);
+    }
+    // Continuation invocation
+    if (func.tag === 'procedure' && func._cont) {
+        const val = args.length > 0 ? args[0] : { tag: 'void' };
+        return { tag: 'bounce', fn: () => func._cont(val) };
+    }
+    if (func.tag !== 'procedure')
+        throw errAt('not a procedure', pos);
+    // User-defined closure — evaluate body in CPS
+    const cl = func._closure;
+    if (cl) {
+        const childEnv = new Env(cl.env);
+        bindArgs(childEnv, cl.params, args);
+        return evalSeqK(cl.body, 0, childEnv, k);
+    }
+    // Case-lambda
+    if (func._caseClauses) {
+        const { clauses, closureEnv } = func._caseClauses;
+        for (const cl of clauses) {
+            if (cl.paramInfo.rest !== null) {
+                if (args.length >= cl.paramInfo.names.length) {
+                    const childEnv = new Env(closureEnv);
+                    bindArgs(childEnv, cl.paramInfo, args);
+                    return evalSeqK(cl.bodyExprs, 0, childEnv, k);
                 }
             }
-            case 'list': {
-                const elems = expr.value;
-                if (elems.length === 0)
-                    throw errAt('empty application', expr.pos);
-                const first = elems[0];
-                // Special forms
-                if (first.tag === 'symbol') {
-                    switch (first.value) {
-                        case 'define': {
-                            if (elems.length < 3)
-                                throw errAt('define requires at least 2 arguments', expr.pos);
-                            const target = elems[1];
-                            if (target.tag === 'symbol') {
-                                // (define x expr)
-                                const val = evaluate(elems[2], env);
+            else {
+                if (args.length === cl.paramInfo.names.length) {
+                    const childEnv = new Env(closureEnv);
+                    bindArgs(childEnv, cl.paramInfo, args);
+                    return evalSeqK(cl.bodyExprs, 0, childEnv, k);
+                }
+            }
+        }
+        throw new EvalError(`no matching clause for ${args.length} arguments`);
+    }
+    // Native procedure
+    try {
+        const result = func.value(...args);
+        return k(result);
+    }
+    catch (e) {
+        if (e instanceof EvalError && !/^\d+:/.test(e.message)) {
+            throw errAt(e.message, pos);
+        }
+        throw e;
+    }
+}
+function resolveSymbol(name, env, pos) {
+    try {
+        return env.get(name);
+    }
+    catch {
+        const resolved = resolvedSymbols.get(name);
+        if (resolved) {
+            try {
+                return resolved.env.get(resolved.name);
+            }
+            catch (e2) {
+                if (e2 instanceof EvalError)
+                    throw errAt(e2.message, pos);
+                throw e2;
+            }
+        }
+        throw errAt(`unbound variable: ${name}`, pos);
+    }
+}
+function evalK(expr, env, k) {
+    switch (expr.tag) {
+        case 'number':
+        case 'rational':
+        case 'boolean':
+        case 'string':
+        case 'char':
+        case 'vector':
+            return k(expr);
+        case 'symbol':
+            return k(resolveSymbol(expr.value, env, expr.pos));
+        case 'list': {
+            const elems = expr.value;
+            if (elems.length === 0)
+                throw errAt('empty application', expr.pos);
+            const first = elems[0];
+            // Special forms
+            if (first.tag === 'symbol') {
+                switch (first.value) {
+                    case 'define': {
+                        if (elems.length < 3)
+                            throw errAt('define requires at least 2 arguments', expr.pos);
+                        const target = elems[1];
+                        if (target.tag === 'symbol') {
+                            return evalK(elems[2], env, (val) => {
                                 env.set(target.value, val);
-                                return { tag: 'void' };
-                            }
-                            if (target.tag === 'list' && target.value.length > 0 && target.value[0].tag === 'symbol') {
-                                // (define (f params...) body...)
-                                const name = target.value[0].value;
-                                const paramsForm = { tag: 'list', value: target.value.slice(1), pos: target.pos };
-                                const paramInfo = parseParams(paramsForm);
-                                const bodyExprs = elems.slice(2);
-                                env.set(name, makeProcedure(paramInfo, bodyExprs, env));
-                                return { tag: 'void' };
-                            }
-                            if (target.tag === 'pair' && target.car.tag === 'symbol') {
-                                const name = target.car.value;
-                                const paramInfo = parseParams(target.cdr);
-                                const bodyExprs = elems.slice(2);
-                                env.set(name, makeProcedure(paramInfo, bodyExprs, env));
-                                return { tag: 'void' };
-                            }
-                            throw errAt('invalid define syntax', expr.pos);
+                                return k({ tag: 'void' });
+                            });
                         }
-                        case 'set!': {
-                            if (elems.length !== 3)
-                                throw errAt('set! requires exactly 2 arguments', expr.pos);
-                            const target = elems[1];
-                            if (target.tag !== 'symbol')
-                                throw errAt('set! target must be a symbol', expr.pos);
-                            const val = evaluate(elems[2], env);
+                        if (target.tag === 'list' && target.value.length > 0 && target.value[0].tag === 'symbol') {
+                            const name = target.value[0].value;
+                            const paramsForm = { tag: 'list', value: target.value.slice(1), pos: target.pos };
+                            const paramInfo = parseParams(paramsForm);
+                            const bodyExprs = elems.slice(2);
+                            env.set(name, makeProcedure(paramInfo, bodyExprs, env));
+                            return k({ tag: 'void' });
+                        }
+                        if (target.tag === 'pair' && target.car.tag === 'symbol') {
+                            const name = target.car.value;
+                            const paramInfo = parseParams(target.cdr);
+                            const bodyExprs = elems.slice(2);
+                            env.set(name, makeProcedure(paramInfo, bodyExprs, env));
+                            return k({ tag: 'void' });
+                        }
+                        throw errAt('invalid define syntax', expr.pos);
+                    }
+                    case 'set!': {
+                        if (elems.length !== 3)
+                            throw errAt('set! requires exactly 2 arguments', expr.pos);
+                        const target = elems[1];
+                        if (target.tag !== 'symbol')
+                            throw errAt('set! target must be a symbol', expr.pos);
+                        return evalK(elems[2], env, (val) => {
                             try {
                                 env.update(target.value, val);
                             }
@@ -1678,283 +1769,275 @@ function evaluate(exprIn, envIn) {
                                     throw errAt(e.message, expr.pos);
                                 throw e;
                             }
-                            return { tag: 'void' };
-                        }
-                        case 'if': {
-                            if (elems.length < 3)
-                                throw errAt('if requires at least 2 arguments', expr.pos);
-                            const cond = evaluate(elems[1], env);
+                            return k({ tag: 'void' });
+                        });
+                    }
+                    case 'if': {
+                        if (elems.length < 3)
+                            throw errAt('if requires at least 2 arguments', expr.pos);
+                        return evalK(elems[1], env, (cond) => {
                             if (!isFalsy(cond)) {
-                                expr = elems[2];
-                                continue trampoline;
+                                return { tag: 'bounce', fn: () => evalK(elems[2], env, k) };
                             }
                             else if (elems.length > 3) {
-                                expr = elems[3];
-                                continue trampoline;
+                                return { tag: 'bounce', fn: () => evalK(elems[3], env, k) };
                             }
-                            return { tag: 'void' };
+                            return k({ tag: 'void' });
+                        });
+                    }
+                    case 'quote': {
+                        if (elems.length !== 2)
+                            throw errAt('quote requires exactly 1 argument', expr.pos);
+                        return k(listToConsPairs(elems[1]));
+                    }
+                    case 'lambda': {
+                        if (elems.length < 3)
+                            throw errAt('lambda requires params and body', expr.pos);
+                        const paramInfo = parseParams(elems[1]);
+                        const bodyExprs = elems.slice(2);
+                        return k(makeProcedure(paramInfo, bodyExprs, env));
+                    }
+                    case 'case-lambda': {
+                        if (elems.length < 2)
+                            throw errAt('case-lambda requires at least one clause', expr.pos);
+                        const clauses = [];
+                        for (let i = 1; i < elems.length; i++) {
+                            const clause = elems[i];
+                            if (clause.tag !== 'list' || clause.value.length < 2)
+                                throw errAt('case-lambda clause must have params and body', clause.pos);
+                            const paramInfo = parseParams(clause.value[0]);
+                            const bodyExprs = clause.value.slice(1);
+                            clauses.push({ paramInfo, bodyExprs });
                         }
-                        case 'quote': {
-                            if (elems.length !== 2)
-                                throw errAt('quote requires exactly 1 argument', expr.pos);
-                            return listToConsPairs(elems[1]);
-                        }
-                        case 'lambda': {
-                            if (elems.length < 3)
-                                throw errAt('lambda requires params and body', expr.pos);
-                            const paramInfo = parseParams(elems[1]);
-                            const bodyExprs = elems.slice(2);
-                            return makeProcedure(paramInfo, bodyExprs, env);
-                        }
-                        case 'case-lambda': {
-                            if (elems.length < 2)
-                                throw errAt('case-lambda requires at least one clause', expr.pos);
-                            const clauses = [];
-                            for (let i = 1; i < elems.length; i++) {
-                                const clause = elems[i];
-                                if (clause.tag !== 'list' || clause.value.length < 2)
-                                    throw errAt('case-lambda clause must have params and body', clause.pos);
-                                const paramInfo = parseParams(clause.value[0]);
-                                const bodyExprs = clause.value.slice(1);
-                                clauses.push({ paramInfo, bodyExprs });
-                            }
-                            const closureEnv = env;
-                            return { tag: 'procedure', value: (...args) => {
-                                    for (const cl of clauses) {
-                                        if (cl.paramInfo.rest !== null) {
-                                            if (args.length >= cl.paramInfo.names.length) {
-                                                const childEnv = new Env(closureEnv);
-                                                bindArgs(childEnv, cl.paramInfo, args);
-                                                let result = { tag: 'void' };
-                                                for (const b of cl.bodyExprs)
-                                                    result = evaluate(b, childEnv);
-                                                return result;
-                                            }
-                                        }
-                                        else {
-                                            if (args.length === cl.paramInfo.names.length) {
-                                                const childEnv = new Env(closureEnv);
-                                                bindArgs(childEnv, cl.paramInfo, args);
-                                                let result = { tag: 'void' };
-                                                for (const b of cl.bodyExprs)
-                                                    result = evaluate(b, childEnv);
-                                                return result;
-                                            }
+                        const closureEnv = env;
+                        const proc = {
+                            tag: 'procedure',
+                            value: (...args) => {
+                                for (const cl of clauses) {
+                                    if (cl.paramInfo.rest !== null) {
+                                        if (args.length >= cl.paramInfo.names.length) {
+                                            const childEnv = new Env(closureEnv);
+                                            bindArgs(childEnv, cl.paramInfo, args);
+                                            return runBounce(evalSeqK(cl.bodyExprs, 0, childEnv, (v) => ({ tag: 'done', value: v })));
                                         }
                                     }
-                                    throw new EvalError(`no matching clause for ${args.length} arguments`);
-                                } };
-                        }
-                        case 'and': {
-                            if (elems.length === 1)
-                                return { tag: 'boolean', value: true };
-                            for (let i = 1; i < elems.length - 1; i++) {
-                                const val = evaluate(elems[i], env);
+                                    else {
+                                        if (args.length === cl.paramInfo.names.length) {
+                                            const childEnv = new Env(closureEnv);
+                                            bindArgs(childEnv, cl.paramInfo, args);
+                                            return runBounce(evalSeqK(cl.bodyExprs, 0, childEnv, (v) => ({ tag: 'done', value: v })));
+                                        }
+                                    }
+                                }
+                                throw new EvalError(`no matching clause for ${args.length} arguments`);
+                            },
+                            _caseClauses: { clauses, closureEnv }
+                        };
+                        return k(proc);
+                    }
+                    case 'and': {
+                        if (elems.length === 1)
+                            return k({ tag: 'boolean', value: true });
+                        const evalAnd = (i) => {
+                            if (i === elems.length - 1)
+                                return { tag: 'bounce', fn: () => evalK(elems[i], env, k) };
+                            return evalK(elems[i], env, (val) => {
                                 if (isFalsy(val))
-                                    return val;
-                            }
-                            expr = elems[elems.length - 1];
-                            continue trampoline;
-                        }
-                        case 'or': {
-                            if (elems.length === 1)
-                                return { tag: 'boolean', value: false };
-                            for (let i = 1; i < elems.length - 1; i++) {
-                                const val = evaluate(elems[i], env);
+                                    return k(val);
+                                return { tag: 'bounce', fn: () => evalAnd(i + 1) };
+                            });
+                        };
+                        return evalAnd(1);
+                    }
+                    case 'or': {
+                        if (elems.length === 1)
+                            return k({ tag: 'boolean', value: false });
+                        const evalOr = (i) => {
+                            if (i === elems.length - 1)
+                                return { tag: 'bounce', fn: () => evalK(elems[i], env, k) };
+                            return evalK(elems[i], env, (val) => {
                                 if (!isFalsy(val))
-                                    return val;
-                            }
-                            expr = elems[elems.length - 1];
-                            continue trampoline;
-                        }
-                        case 'begin': {
-                            if (elems.length === 1)
-                                return { tag: 'void' };
-                            for (let i = 1; i < elems.length - 1; i++) {
-                                evaluate(elems[i], env);
-                            }
-                            expr = elems[elems.length - 1];
-                            continue trampoline;
-                        }
-                        case 'let': {
-                            if (elems.length < 3)
-                                throw errAt('let requires bindings and body', expr.pos);
-                            // Named let: (let name ((var init) ...) body ...)
-                            if (elems[1].tag === 'symbol') {
-                                if (elems.length < 4)
-                                    throw errAt('named let requires bindings and body', expr.pos);
-                                const loopName = elems[1].value;
-                                const bindingsList = elems[2];
-                                if (bindingsList.tag !== 'list')
-                                    throw errAt('let bindings must be a list', expr.pos);
-                                const paramNames = [];
-                                const initVals = [];
-                                for (const binding of bindingsList.value) {
-                                    if (binding.tag !== 'list' || binding.value.length !== 2)
-                                        throw errAt('invalid let binding', binding.pos);
-                                    if (binding.value[0].tag !== 'symbol')
-                                        throw errAt('let binding name must be a symbol', binding.pos);
-                                    paramNames.push(binding.value[0].value);
-                                    initVals.push(evaluate(binding.value[1], env));
-                                }
-                                const bodyExprs = elems.slice(3);
-                                const paramInfo = { names: paramNames, rest: null };
-                                // Create closure env that will contain the loop binding
-                                const closureEnv = new Env(env);
-                                const loopProc = makeProcedure(paramInfo, bodyExprs, closureEnv);
-                                closureEnv.set(loopName, loopProc);
-                                // Set up initial call env
-                                const childEnv = new Env(closureEnv);
-                                for (let i = 0; i < paramNames.length; i++) {
-                                    childEnv.set(paramNames[i], initVals[i]);
-                                }
-                                // Tail: eval body
-                                for (let bi = 0; bi < bodyExprs.length - 1; bi++) {
-                                    evaluate(bodyExprs[bi], childEnv);
-                                }
-                                expr = bodyExprs[bodyExprs.length - 1];
-                                env = childEnv;
-                                continue trampoline;
-                            }
-                            // Regular let: (let ((var init) ...) body ...)
-                            const bindings = elems[1];
-                            if (bindings.tag !== 'list')
+                                    return k(val);
+                                return { tag: 'bounce', fn: () => evalOr(i + 1) };
+                            });
+                        };
+                        return evalOr(1);
+                    }
+                    case 'begin': {
+                        if (elems.length === 1)
+                            return k({ tag: 'void' });
+                        return evalSeqK(elems.slice(1), 0, env, k);
+                    }
+                    case 'let': {
+                        if (elems.length < 3)
+                            throw errAt('let requires bindings and body', expr.pos);
+                        // Named let
+                        if (elems[1].tag === 'symbol') {
+                            if (elems.length < 4)
+                                throw errAt('named let requires bindings and body', expr.pos);
+                            const loopName = elems[1].value;
+                            const bindingsList = elems[2];
+                            if (bindingsList.tag !== 'list')
                                 throw errAt('let bindings must be a list', expr.pos);
-                            const childEnv = new Env(env);
-                            for (const binding of bindings.value) {
+                            const paramNames = [];
+                            for (const binding of bindingsList.value) {
                                 if (binding.tag !== 'list' || binding.value.length !== 2)
                                     throw errAt('invalid let binding', binding.pos);
-                                const name = binding.value[0];
-                                if (name.tag !== 'symbol')
-                                    throw errAt('let binding name must be a symbol', name.pos);
-                                const val = evaluate(binding.value[1], env);
-                                childEnv.set(name.value, val);
-                            }
-                            // Tail: last body expr
-                            for (let i = 2; i < elems.length - 1; i++) {
-                                evaluate(elems[i], childEnv);
-                            }
-                            expr = elems[elems.length - 1];
-                            env = childEnv;
-                            continue trampoline;
-                        }
-                        case 'let*': {
-                            if (elems.length < 3)
-                                throw errAt('let* requires bindings and body', expr.pos);
-                            const bindings = elems[1];
-                            if (bindings.tag !== 'list')
-                                throw errAt('let* bindings must be a list', expr.pos);
-                            const childEnv = new Env(env);
-                            for (const binding of bindings.value) {
-                                if (binding.tag !== 'list' || binding.value.length !== 2)
-                                    throw errAt('invalid let* binding', binding.pos);
                                 if (binding.value[0].tag !== 'symbol')
-                                    throw errAt('let* binding name must be a symbol', binding.pos);
-                                const val = evaluate(binding.value[1], childEnv);
-                                childEnv.set(binding.value[0].value, val);
+                                    throw errAt('let binding name must be a symbol', binding.pos);
+                                paramNames.push(binding.value[0].value);
                             }
-                            for (let i = 2; i < elems.length - 1; i++) {
-                                evaluate(elems[i], childEnv);
-                            }
-                            expr = elems[elems.length - 1];
-                            env = childEnv;
-                            continue trampoline;
-                        }
-                        case 'cond': {
-                            for (let i = 1; i < elems.length; i++) {
-                                const clause = elems[i];
-                                if (clause.tag !== 'list' || clause.value.length < 1)
-                                    throw errAt('invalid cond clause', clause.pos);
-                                const test = clause.value[0];
-                                if (test.tag === 'symbol' && test.value === 'else') {
-                                    if (clause.value.length === 1)
-                                        return { tag: 'void' };
-                                    for (let j = 1; j < clause.value.length - 1; j++) {
-                                        evaluate(clause.value[j], env);
-                                    }
-                                    expr = clause.value[clause.value.length - 1];
-                                    continue trampoline;
+                            const bodyExprs = elems.slice(3);
+                            const paramInfo = { names: paramNames, rest: null };
+                            const evalInits = (i, vals) => {
+                                if (i >= bindingsList.value.length) {
+                                    const closureEnv = new Env(env);
+                                    const loopProc = makeProcedure(paramInfo, bodyExprs, closureEnv);
+                                    closureEnv.set(loopName, loopProc);
+                                    const childEnv = new Env(closureEnv);
+                                    for (let j = 0; j < paramNames.length; j++)
+                                        childEnv.set(paramNames[j], vals[j]);
+                                    return evalSeqK(bodyExprs, 0, childEnv, k);
                                 }
-                                const testVal = evaluate(test, env);
+                                return evalK(bindingsList.value[i].value[1], env, (val) => {
+                                    vals.push(val);
+                                    return { tag: 'bounce', fn: () => evalInits(i + 1, vals) };
+                                });
+                            };
+                            return evalInits(0, []);
+                        }
+                        // Regular let
+                        const bindings = elems[1];
+                        if (bindings.tag !== 'list')
+                            throw errAt('let bindings must be a list', expr.pos);
+                        const childEnv = new Env(env);
+                        const evalBindings = (i) => {
+                            if (i >= bindings.value.length) {
+                                return evalSeqK(elems.slice(2), 0, childEnv, k);
+                            }
+                            const binding = bindings.value[i];
+                            if (binding.tag !== 'list' || binding.value.length !== 2)
+                                throw errAt('invalid let binding', binding.pos);
+                            const name = binding.value[0];
+                            if (name.tag !== 'symbol')
+                                throw errAt('let binding name must be a symbol', name.pos);
+                            return evalK(binding.value[1], env, (val) => {
+                                childEnv.set(name.value, val);
+                                return { tag: 'bounce', fn: () => evalBindings(i + 1) };
+                            });
+                        };
+                        return evalBindings(0);
+                    }
+                    case 'let*': {
+                        if (elems.length < 3)
+                            throw errAt('let* requires bindings and body', expr.pos);
+                        const bindings = elems[1];
+                        if (bindings.tag !== 'list')
+                            throw errAt('let* bindings must be a list', expr.pos);
+                        const childEnv = new Env(env);
+                        const evalBindings = (i) => {
+                            if (i >= bindings.value.length) {
+                                return evalSeqK(elems.slice(2), 0, childEnv, k);
+                            }
+                            const binding = bindings.value[i];
+                            if (binding.tag !== 'list' || binding.value.length !== 2)
+                                throw errAt('invalid let* binding', binding.pos);
+                            if (binding.value[0].tag !== 'symbol')
+                                throw errAt('let* binding name must be a symbol', binding.pos);
+                            return evalK(binding.value[1], childEnv, (val) => {
+                                childEnv.set(binding.value[0].value, val);
+                                return { tag: 'bounce', fn: () => evalBindings(i + 1) };
+                            });
+                        };
+                        return evalBindings(0);
+                    }
+                    case 'cond': {
+                        const tryCond = (i) => {
+                            if (i >= elems.length)
+                                return k({ tag: 'void' });
+                            const clause = elems[i];
+                            if (clause.tag !== 'list' || clause.value.length < 1)
+                                throw errAt('invalid cond clause', clause.pos);
+                            const test = clause.value[0];
+                            if (test.tag === 'symbol' && test.value === 'else') {
+                                if (clause.value.length === 1)
+                                    return k({ tag: 'void' });
+                                return evalSeqK(clause.value.slice(1), 0, env, k);
+                            }
+                            return evalK(test, env, (testVal) => {
                                 if (!isFalsy(testVal)) {
                                     if (clause.value.length === 1)
-                                        return testVal;
-                                    for (let j = 1; j < clause.value.length - 1; j++) {
-                                        evaluate(clause.value[j], env);
-                                    }
-                                    expr = clause.value[clause.value.length - 1];
-                                    continue trampoline;
+                                        return k(testVal);
+                                    return evalSeqK(clause.value.slice(1), 0, env, k);
                                 }
-                            }
-                            return { tag: 'void' };
+                                return { tag: 'bounce', fn: () => tryCond(i + 1) };
+                            });
+                        };
+                        return tryCond(1);
+                    }
+                    case 'letrec': {
+                        if (elems.length < 3)
+                            throw errAt('letrec requires bindings and body', expr.pos);
+                        const bindings = elems[1];
+                        if (bindings.tag !== 'list')
+                            throw errAt('letrec bindings must be a list', expr.pos);
+                        const childEnv = new Env(env);
+                        const names = [];
+                        for (const binding of bindings.value) {
+                            if (binding.tag !== 'list' || binding.value.length !== 2)
+                                throw errAt('invalid letrec binding', binding.pos);
+                            if (binding.value[0].tag !== 'symbol')
+                                throw errAt('letrec binding name must be a symbol', binding.pos);
+                            names.push(binding.value[0].value);
+                            childEnv.set(binding.value[0].value, { tag: 'void' });
                         }
-                        case 'letrec': {
-                            if (elems.length < 3)
-                                throw errAt('letrec requires bindings and body', expr.pos);
-                            const bindings = elems[1];
-                            if (bindings.tag !== 'list')
-                                throw errAt('letrec bindings must be a list', expr.pos);
-                            const childEnv = new Env(env);
-                            const names = [];
-                            for (const binding of bindings.value) {
-                                if (binding.tag !== 'list' || binding.value.length !== 2)
-                                    throw errAt('invalid letrec binding', binding.pos);
-                                if (binding.value[0].tag !== 'symbol')
-                                    throw errAt('letrec binding name must be a symbol', binding.pos);
-                                names.push(binding.value[0].value);
-                                childEnv.set(binding.value[0].value, { tag: 'void' });
+                        const evalLetrecBindings = (i) => {
+                            if (i >= bindings.value.length) {
+                                return evalSeqK(elems.slice(2), 0, childEnv, k);
                             }
-                            for (let i = 0; i < bindings.value.length; i++) {
-                                const binding = bindings.value[i];
-                                const val = evaluate(binding.value[1], childEnv);
+                            return evalK(bindings.value[i].value[1], childEnv, (val) => {
                                 childEnv.set(names[i], val);
+                                return { tag: 'bounce', fn: () => evalLetrecBindings(i + 1) };
+                            });
+                        };
+                        return evalLetrecBindings(0);
+                    }
+                    case 'letrec*': {
+                        if (elems.length < 3)
+                            throw errAt('letrec* requires bindings and body', expr.pos);
+                        const bindings = elems[1];
+                        if (bindings.tag !== 'list')
+                            throw errAt('letrec* bindings must be a list', expr.pos);
+                        const childEnv = new Env(env);
+                        const evalBindings = (i) => {
+                            if (i >= bindings.value.length) {
+                                return evalSeqK(elems.slice(2), 0, childEnv, k);
                             }
-                            // Tail: last body expr
-                            for (let i = 2; i < elems.length - 1; i++) {
-                                evaluate(elems[i], childEnv);
-                            }
-                            expr = elems[elems.length - 1];
-                            env = childEnv;
-                            continue trampoline;
-                        }
-                        case 'letrec*': {
-                            if (elems.length < 3)
-                                throw errAt('letrec* requires bindings and body', expr.pos);
-                            const bindings = elems[1];
-                            if (bindings.tag !== 'list')
-                                throw errAt('letrec* bindings must be a list', expr.pos);
-                            const childEnv = new Env(env);
-                            for (const binding of bindings.value) {
-                                if (binding.tag !== 'list' || binding.value.length !== 2)
-                                    throw errAt('invalid letrec* binding', binding.pos);
-                                if (binding.value[0].tag !== 'symbol')
-                                    throw errAt('letrec* binding name must be a symbol', binding.pos);
-                                const val = evaluate(binding.value[1], childEnv);
+                            const binding = bindings.value[i];
+                            if (binding.tag !== 'list' || binding.value.length !== 2)
+                                throw errAt('invalid letrec* binding', binding.pos);
+                            if (binding.value[0].tag !== 'symbol')
+                                throw errAt('letrec* binding name must be a symbol', binding.pos);
+                            return evalK(binding.value[1], childEnv, (val) => {
                                 childEnv.set(binding.value[0].value, val);
-                            }
-                            // Tail: last body expr
-                            for (let i = 2; i < elems.length - 1; i++) {
-                                evaluate(elems[i], childEnv);
-                            }
-                            expr = elems[elems.length - 1];
-                            env = childEnv;
-                            continue trampoline;
-                        }
-                        case 'case': {
-                            if (elems.length < 2)
-                                throw errAt('case requires at least a key', expr.pos);
-                            const key = evaluate(elems[1], env);
-                            for (let i = 2; i < elems.length; i++) {
+                                return { tag: 'bounce', fn: () => evalBindings(i + 1) };
+                            });
+                        };
+                        return evalBindings(0);
+                    }
+                    case 'case': {
+                        if (elems.length < 2)
+                            throw errAt('case requires at least a key', expr.pos);
+                        return evalK(elems[1], env, (key) => {
+                            const tryClause = (i) => {
+                                if (i >= elems.length)
+                                    return k({ tag: 'void' });
                                 const clause = elems[i];
                                 if (clause.tag !== 'list' || clause.value.length < 2)
                                     throw errAt('invalid case clause', clause.pos);
                                 const datums = clause.value[0];
                                 if (datums.tag === 'symbol' && datums.value === 'else') {
-                                    for (let j = 1; j < clause.value.length - 1; j++) {
-                                        evaluate(clause.value[j], env);
-                                    }
-                                    expr = clause.value[clause.value.length - 1];
-                                    continue trampoline;
+                                    return evalSeqK(clause.value.slice(1), 0, env, k);
                                 }
                                 if (datums.tag !== 'list')
                                     throw errAt('case clause datums must be a list', clause.pos);
@@ -1967,208 +2050,204 @@ function evaluate(exprIn, envIn) {
                                     }
                                 }
                                 if (matched) {
-                                    for (let j = 1; j < clause.value.length - 1; j++) {
-                                        evaluate(clause.value[j], env);
-                                    }
-                                    expr = clause.value[clause.value.length - 1];
-                                    continue trampoline;
+                                    return evalSeqK(clause.value.slice(1), 0, env, k);
                                 }
-                            }
-                            return { tag: 'void' };
+                                return { tag: 'bounce', fn: () => tryClause(i + 1) };
+                            };
+                            return tryClause(2);
+                        });
+                    }
+                    case 'do': {
+                        if (elems.length < 3)
+                            throw errAt('do requires bindings and test', expr.pos);
+                        const bindingsForm = elems[1];
+                        const testForm = elems[2];
+                        if (bindingsForm.tag !== 'list')
+                            throw errAt('do bindings must be a list', expr.pos);
+                        if (testForm.tag !== 'list' || testForm.value.length < 1)
+                            throw errAt('do test must be a list', expr.pos);
+                        const vars = [];
+                        const childEnv = new Env(env);
+                        for (const binding of bindingsForm.value) {
+                            if (binding.tag !== 'list' || binding.value.length < 2)
+                                throw errAt('invalid do binding', binding.pos);
+                            if (binding.value[0].tag !== 'symbol')
+                                throw errAt('do variable must be a symbol', binding.pos);
+                            const name = binding.value[0].value;
+                            const step = binding.value.length > 2 ? binding.value[2] : null;
+                            vars.push({ name, step });
                         }
-                        case 'do': {
-                            // (do ((var init step) ...) (test expr ...) body ...)
-                            if (elems.length < 3)
-                                throw errAt('do requires bindings and test', expr.pos);
-                            const bindingsForm = elems[1];
-                            const testForm = elems[2];
-                            if (bindingsForm.tag !== 'list')
-                                throw errAt('do bindings must be a list', expr.pos);
-                            if (testForm.tag !== 'list' || testForm.value.length < 1)
-                                throw errAt('do test must be a list', expr.pos);
-                            const vars = [];
-                            const childEnv = new Env(env);
-                            for (const binding of bindingsForm.value) {
-                                if (binding.tag !== 'list' || binding.value.length < 2)
-                                    throw errAt('invalid do binding', binding.pos);
-                                if (binding.value[0].tag !== 'symbol')
-                                    throw errAt('do variable must be a symbol', binding.pos);
-                                const name = binding.value[0].value;
-                                const init = evaluate(binding.value[1], env);
-                                const step = binding.value.length > 2 ? binding.value[2] : null;
-                                vars.push({ name, step });
-                                childEnv.set(name, init);
-                            }
-                            // Iteration loop
-                            while (true) {
-                                const testVal = evaluate(testForm.value[0], childEnv);
+                        // Evaluate init values
+                        const evalDoInits = (i) => {
+                            if (i >= bindingsForm.value.length)
+                                return doLoop();
+                            return evalK(bindingsForm.value[i].value[1], env, (val) => {
+                                childEnv.set(vars[i].name, val);
+                                return { tag: 'bounce', fn: () => evalDoInits(i + 1) };
+                            });
+                        };
+                        const doLoop = () => {
+                            return evalK(testForm.value[0], childEnv, (testVal) => {
                                 if (!isFalsy(testVal)) {
                                     if (testForm.value.length === 1)
-                                        return { tag: 'void' };
-                                    for (let i = 1; i < testForm.value.length - 1; i++) {
-                                        evaluate(testForm.value[i], childEnv);
+                                        return k({ tag: 'void' });
+                                    return evalSeqK(testForm.value.slice(1), 0, childEnv, k);
+                                }
+                                // Eval body
+                                const evalBody = (j) => {
+                                    if (j >= elems.length)
+                                        return evalSteps(0, []);
+                                    return evalK(elems[j], childEnv, (_) => ({ tag: 'bounce', fn: () => evalBody(j + 1) }));
+                                };
+                                // Eval step values
+                                const evalSteps = (j, newVals) => {
+                                    if (j >= vars.length) {
+                                        for (let m = 0; m < vars.length; m++) {
+                                            if (newVals[m] !== null)
+                                                childEnv.set(vars[m].name, newVals[m]);
+                                        }
+                                        return { tag: 'bounce', fn: () => doLoop() };
                                     }
-                                    expr = testForm.value[testForm.value.length - 1];
-                                    env = childEnv;
-                                    continue trampoline;
-                                }
-                                for (let i = 3; i < elems.length; i++) {
-                                    evaluate(elems[i], childEnv);
-                                }
-                                const newVals = vars.map(v => v.step ? evaluate(v.step, childEnv) : null);
-                                for (let i = 0; i < vars.length; i++) {
-                                    if (newVals[i] !== null)
-                                        childEnv.set(vars[i].name, newVals[i]);
-                                }
-                            }
-                        }
-                        case 'define-syntax': {
-                            if (elems.length !== 3)
-                                throw errAt('define-syntax requires 2 arguments', expr.pos);
-                            if (elems[1].tag !== 'symbol')
-                                throw errAt('define-syntax: name must be a symbol', expr.pos);
-                            const macroName = elems[1].value;
-                            const transformer = elems[2];
-                            if (transformer.tag !== 'list' || transformer.value.length < 2 ||
-                                transformer.value[0].tag !== 'symbol' || transformer.value[0].value !== 'syntax-rules') {
-                                throw errAt('define-syntax: expected syntax-rules', expr.pos);
-                            }
-                            const srElems = transformer.value;
-                            if (srElems[1].tag !== 'list')
-                                throw errAt('syntax-rules: expected literals list', expr.pos);
-                            const macroLiterals = srElems[1].value.map(l => {
-                                if (l.tag !== 'symbol')
-                                    throw errAt('syntax-rules: literal must be a symbol', l.pos);
-                                return l.value;
-                            });
-                            const macroRules = [];
-                            for (let ri = 2; ri < srElems.length; ri++) {
-                                const rule = srElems[ri];
-                                if (rule.tag !== 'list' || rule.value.length !== 2)
-                                    throw errAt('syntax-rules: each rule must be (pattern template)', rule.pos);
-                                macroRules.push({ pattern: rule.value[0], template: rule.value[1] });
-                            }
-                            env.set(macroName, { tag: 'macro', literals: macroLiterals, rules: macroRules, defEnv: env });
-                            return { tag: 'void' };
-                        }
-                        case 'define-record-type': {
-                            // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
-                            if (elems.length < 4)
-                                throw errAt('define-record-type requires at least 3 arguments', expr.pos);
-                            const nameForm = elems[1];
-                            if (nameForm.tag !== 'symbol')
-                                throw errAt('define-record-type: expected type name', expr.pos);
-                            const typeName = nameForm.value;
-                            const typeId = Symbol(typeName);
-                            const ctorForm = elems[2];
-                            if (ctorForm.tag !== 'list' || ctorForm.value.length < 1)
-                                throw errAt('define-record-type: expected constructor', expr.pos);
-                            const ctorName = ctorForm.value[0];
-                            if (ctorName.tag !== 'symbol')
-                                throw errAt('define-record-type: constructor name must be a symbol', expr.pos);
-                            const ctorFields = ctorForm.value.slice(1).map(f => {
-                                if (f.tag !== 'symbol')
-                                    throw errAt('define-record-type: field name must be a symbol', f.pos);
-                                return f.value;
-                            });
-                            const predForm = elems[3];
-                            if (predForm.tag !== 'symbol')
-                                throw errAt('define-record-type: expected predicate name', expr.pos);
-                            // Constructor
-                            env.set(ctorName.value, { tag: 'procedure', value: (...args) => {
-                                    if (args.length !== ctorFields.length)
-                                        throw new EvalError(`${ctorName.value}: expected ${ctorFields.length} arguments, got ${args.length}`);
-                                    const fields = new Map();
-                                    for (let i = 0; i < ctorFields.length; i++) {
-                                        fields.set(ctorFields[i], args[i]);
+                                    if (vars[j].step) {
+                                        return evalK(vars[j].step, childEnv, (val) => {
+                                            newVals.push(val);
+                                            return { tag: 'bounce', fn: () => evalSteps(j + 1, newVals) };
+                                        });
                                     }
-                                    return { tag: 'record', typeName, typeId, fields };
-                                } });
-                            // Predicate
-                            env.set(predForm.value, { tag: 'procedure', value: (...args) => {
+                                    newVals.push(null);
+                                    return { tag: 'bounce', fn: () => evalSteps(j + 1, newVals) };
+                                };
+                                return { tag: 'bounce', fn: () => evalBody(3) };
+                            });
+                        };
+                        return evalDoInits(0);
+                    }
+                    case 'define-syntax': {
+                        if (elems.length !== 3)
+                            throw errAt('define-syntax requires 2 arguments', expr.pos);
+                        if (elems[1].tag !== 'symbol')
+                            throw errAt('define-syntax: name must be a symbol', expr.pos);
+                        const macroName = elems[1].value;
+                        const transformer = elems[2];
+                        if (transformer.tag !== 'list' || transformer.value.length < 2 ||
+                            transformer.value[0].tag !== 'symbol' || transformer.value[0].value !== 'syntax-rules') {
+                            throw errAt('define-syntax: expected syntax-rules', expr.pos);
+                        }
+                        const srElems = transformer.value;
+                        if (srElems[1].tag !== 'list')
+                            throw errAt('syntax-rules: expected literals list', expr.pos);
+                        const macroLiterals = srElems[1].value.map(l => {
+                            if (l.tag !== 'symbol')
+                                throw errAt('syntax-rules: literal must be a symbol', l.pos);
+                            return l.value;
+                        });
+                        const macroRules = [];
+                        for (let ri = 2; ri < srElems.length; ri++) {
+                            const rule = srElems[ri];
+                            if (rule.tag !== 'list' || rule.value.length !== 2)
+                                throw errAt('syntax-rules: each rule must be (pattern template)', rule.pos);
+                            macroRules.push({ pattern: rule.value[0], template: rule.value[1] });
+                        }
+                        env.set(macroName, { tag: 'macro', literals: macroLiterals, rules: macroRules, defEnv: env });
+                        return k({ tag: 'void' });
+                    }
+                    case 'define-record-type': {
+                        if (elems.length < 4)
+                            throw errAt('define-record-type requires at least 3 arguments', expr.pos);
+                        const nameForm = elems[1];
+                        if (nameForm.tag !== 'symbol')
+                            throw errAt('define-record-type: expected type name', expr.pos);
+                        const typeName = nameForm.value;
+                        const typeId = Symbol(typeName);
+                        const ctorForm = elems[2];
+                        if (ctorForm.tag !== 'list' || ctorForm.value.length < 1)
+                            throw errAt('define-record-type: expected constructor', expr.pos);
+                        const ctorName = ctorForm.value[0];
+                        if (ctorName.tag !== 'symbol')
+                            throw errAt('define-record-type: constructor name must be a symbol', expr.pos);
+                        const ctorFields = ctorForm.value.slice(1).map(f => {
+                            if (f.tag !== 'symbol')
+                                throw errAt('define-record-type: field name must be a symbol', f.pos);
+                            return f.value;
+                        });
+                        const predForm = elems[3];
+                        if (predForm.tag !== 'symbol')
+                            throw errAt('define-record-type: expected predicate name', expr.pos);
+                        env.set(ctorName.value, { tag: 'procedure', value: (...args) => {
+                                if (args.length !== ctorFields.length)
+                                    throw new EvalError(`${ctorName.value}: expected ${ctorFields.length} arguments, got ${args.length}`);
+                                const fields = new Map();
+                                for (let i = 0; i < ctorFields.length; i++)
+                                    fields.set(ctorFields[i], args[i]);
+                                return { tag: 'record', typeName, typeId, fields };
+                            } });
+                        env.set(predForm.value, { tag: 'procedure', value: (...args) => {
+                                if (args.length !== 1)
+                                    throw new EvalError(`${predForm.value}: expected 1 argument`);
+                                return { tag: 'boolean', value: args[0].tag === 'record' && args[0].typeId === typeId };
+                            } });
+                        for (let i = 4; i < elems.length; i++) {
+                            const fieldDef = elems[i];
+                            if (fieldDef.tag !== 'list' || fieldDef.value.length < 2)
+                                throw errAt('define-record-type: expected (field accessor)', fieldDef.pos);
+                            const fieldName = fieldDef.value[0];
+                            const accessorName = fieldDef.value[1];
+                            if (fieldName.tag !== 'symbol' || accessorName.tag !== 'symbol')
+                                throw errAt('define-record-type: field/accessor must be symbols', fieldDef.pos);
+                            const fn = fieldName.value;
+                            env.set(accessorName.value, { tag: 'procedure', value: (...args) => {
                                     if (args.length !== 1)
-                                        throw new EvalError(`${predForm.value}: expected 1 argument`);
-                                    return { tag: 'boolean', value: args[0].tag === 'record' && args[0].typeId === typeId };
+                                        throw new EvalError(`${accessorName.value}: expected 1 argument`);
+                                    if (args[0].tag !== 'record' || args[0].typeId !== typeId)
+                                        throw new EvalError(`${accessorName.value}: expected ${typeName}`);
+                                    return args[0].fields.get(fn);
                                 } });
-                            // Field accessors
-                            for (let i = 4; i < elems.length; i++) {
-                                const fieldDef = elems[i];
-                                if (fieldDef.tag !== 'list' || fieldDef.value.length < 2)
-                                    throw errAt('define-record-type: expected (field accessor)', fieldDef.pos);
-                                const fieldName = fieldDef.value[0];
-                                const accessorName = fieldDef.value[1];
-                                if (fieldName.tag !== 'symbol' || accessorName.tag !== 'symbol')
-                                    throw errAt('define-record-type: field/accessor must be symbols', fieldDef.pos);
-                                const fn = fieldName.value;
-                                env.set(accessorName.value, { tag: 'procedure', value: (...args) => {
-                                        if (args.length !== 1)
-                                            throw new EvalError(`${accessorName.value}: expected 1 argument`);
-                                        if (args[0].tag !== 'record' || args[0].typeId !== typeId)
-                                            throw new EvalError(`${accessorName.value}: expected ${typeName}`);
-                                        return args[0].fields.get(fn);
-                                    } });
-                            }
-                            return { tag: 'void' };
                         }
-                    }
-                    // Check for macro
-                    let macroVal = null;
-                    const resolvedSym = resolvedSymbols.get(first.value);
-                    if (resolvedSym) {
-                        try {
-                            macroVal = resolvedSym.env.get(resolvedSym.name);
-                        }
-                        catch { }
-                    }
-                    else {
-                        try {
-                            macroVal = env.get(first.value);
-                        }
-                        catch { }
-                    }
-                    if (macroVal && macroVal.tag === 'macro') {
-                        expr = expandMacro(macroVal, expr);
-                        continue trampoline;
+                        return k({ tag: 'void' });
                     }
                 }
-                // Function application
-                const func = evaluate(first, env);
-                if (func.tag !== 'procedure')
-                    throw errAt('not a procedure', expr.pos);
-                const args = elems.slice(1).map(a => evaluate(a, env));
-                // TCO: if this is a user-defined closure, trampoline through it
-                const cl = func._closure;
-                if (cl) {
-                    const childEnv = new Env(cl.env);
-                    bindArgs(childEnv, cl.params, args);
-                    for (let bi = 0; bi < cl.body.length - 1; bi++) {
-                        evaluate(cl.body[bi], childEnv);
+                // Check for macro
+                let macroVal = null;
+                const resolvedSym = resolvedSymbols.get(first.value);
+                if (resolvedSym) {
+                    try {
+                        macroVal = resolvedSym.env.get(resolvedSym.name);
                     }
-                    expr = cl.body[cl.body.length - 1];
-                    env = childEnv;
-                    continue trampoline;
+                    catch { }
                 }
-                try {
-                    return func.value(...args);
-                }
-                catch (e) {
-                    if (e instanceof EvalError && !/^\d+:/.test(e.message)) {
-                        throw errAt(e.message, expr.pos);
+                else {
+                    try {
+                        macroVal = env.get(first.value);
                     }
-                    throw e;
+                    catch { }
+                }
+                if (macroVal && macroVal.tag === 'macro') {
+                    const expanded = expandMacro(macroVal, expr);
+                    return { tag: 'bounce', fn: () => evalK(expanded, env, k) };
                 }
             }
-            default:
-                throw errAt('cannot evaluate', expr.pos);
+            // Function application: evaluate operator, then args R-to-L, then apply
+            return evalK(first, env, (func) => {
+                return evalArgsRtoLK(elems.slice(1), env, (args) => {
+                    return applyK(func, args, k, expr.pos);
+                });
+            });
         }
+        default:
+            throw errAt('cannot evaluate', expr.pos);
     }
+}
+// Synchronous evaluate wrapper (for use by .value callbacks from builtins like map)
+function evaluate(expr, env) {
+    return runBounce(evalK(expr, env, (v) => ({ tag: 'done', value: v })));
 }
 function display(val) {
     return writeVal(val);
 }
 /**
  * Evaluate one or more Scheme expressions and return the string
- * representation of the last result.
+ * representation of the last result. All expressions are chained
+ * in a single CPS chain so continuations can span across them.
  */
 export function evalStr(input) {
     gensymCounter = 0;
@@ -2178,10 +2257,7 @@ export function evalStr(input) {
     if (exprs.length === 0)
         throw new EvalError('no expressions');
     const env = makeGlobalEnv();
-    let result = { tag: 'void' };
-    for (const expr of exprs) {
-        result = evaluate(expr, env);
-    }
+    const result = runBounce(evalSeqK(exprs, 0, env, (v) => ({ tag: 'done', value: v })));
     return display(result);
 }
 /**
@@ -2197,9 +2273,6 @@ export function evalStrWithOutput(input) {
         throw new EvalError('no expressions');
     const outputBuf = [];
     const env = makeGlobalEnv(outputBuf);
-    let result = { tag: 'void' };
-    for (const expr of exprs) {
-        result = evaluate(expr, env);
-    }
+    const result = runBounce(evalSeqK(exprs, 0, env, (v) => ({ tag: 'done', value: v })));
     return { result: display(result), output: outputBuf.join('') };
 }
