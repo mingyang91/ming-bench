@@ -32,9 +32,9 @@ public class Evaluator {
     record SyntaxRulesDef(List<String> literals, List<SyntaxRule> rules, Environment defEnv) {}
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
-        "if", "let", "begin", "set!", "define", "lambda", "quote", "cond",
+        "if", "let", "let*", "begin", "set!", "define", "lambda", "quote", "cond",
         "and", "or", "not", "define-syntax", "syntax-rules", "define-record-type",
-        "letrec", "letrec*", "case", "do"
+        "letrec", "letrec*", "case", "do", "when", "unless"
     );
 
     // Output buffer for display/write/newline
@@ -503,6 +503,54 @@ public class Evaluator {
                             expr = tc.expr; env = tc.env; continue;
                         }
                         return letrecResult;
+                    }
+                    case "let*" -> {
+                        if (list.size() < 3) throw error("let*: bad syntax");
+                        Object bindingsObj = list.get(1);
+                        if (bindingsObj instanceof Located loc) bindingsObj = loc.value();
+                        if (!(bindingsObj instanceof List<?> bindings)) throw error("let*: bad bindings");
+                        Environment letStarEnv = new Environment(env);
+                        for (Object b : bindings) {
+                            if (b instanceof Located loc) b = loc.value();
+                            if (!(b instanceof List<?> binding) || binding.size() != 2)
+                                throw error("let*: bad binding");
+                            Object varObj = binding.get(0);
+                            if (varObj instanceof Located loc) varObj = loc.value();
+                            if (!(varObj instanceof String varName))
+                                throw error("let*: bad binding variable");
+                            Object val = eval(binding.get(1), letStarEnv);
+                            letStarEnv.define(varName, val);
+                        }
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            eval(list.get(i), letStarEnv);
+                        }
+                        expr = list.get(list.size() - 1);
+                        env = letStarEnv;
+                        continue;
+                    }
+                    case "when" -> {
+                        if (list.size() < 3) throw error("when: bad syntax");
+                        Object test = eval(list.get(1), env);
+                        if (!Boolean.FALSE.equals(test)) {
+                            for (int i = 2; i < list.size() - 1; i++) {
+                                eval(list.get(i), env);
+                            }
+                            expr = list.get(list.size() - 1);
+                            continue;
+                        }
+                        return VOID;
+                    }
+                    case "unless" -> {
+                        if (list.size() < 3) throw error("unless: bad syntax");
+                        Object test = eval(list.get(1), env);
+                        if (Boolean.FALSE.equals(test)) {
+                            for (int i = 2; i < list.size() - 1; i++) {
+                                eval(list.get(i), env);
+                            }
+                            expr = list.get(list.size() - 1);
+                            continue;
+                        }
+                        return VOID;
                     }
                     case "case" -> { return evalCase(list, env); }
                     case "do" -> { return evalDo(list, env); }
@@ -1665,11 +1713,19 @@ public class Evaluator {
         });
         globalEnv.define("list?", (BuiltinProc) args -> {
             if (args.size() != 1) throw error("list?: expected 1 argument");
-            Object cur = args.get(0);
-            while (cur instanceof Pair p) {
-                cur = p.cdr;
+            // Tortoise-and-hare cycle detection
+            Object slow = args.get(0);
+            Object fast = args.get(0);
+            while (fast instanceof Pair fp) {
+                fast = fp.cdr;
+                if (!(fast instanceof Pair fp2)) {
+                    return fast == NIL;
+                }
+                fast = fp2.cdr;
+                slow = ((Pair) slow).cdr;
+                if (slow == fast) return false; // cycle detected
             }
-            return cur == NIL;
+            return fast == NIL;
         });
         globalEnv.define("assoc", (BuiltinProc) args -> {
             if (args.size() != 2) throw error("assoc: expected 2 arguments");
@@ -1713,6 +1769,231 @@ public class Evaluator {
                 result = new Pair(results.get(i), result);
             }
             return result;
+        });
+
+        // cxr shortcuts
+        globalEnv.define("caar", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("caar: expected 1 argument");
+            if (!(args.get(0) instanceof Pair p)) throw error("caar: not a pair");
+            if (!(p.car instanceof Pair p2)) throw error("caar: car is not a pair");
+            return p2.car;
+        });
+        globalEnv.define("cadr", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("cadr: expected 1 argument");
+            if (!(args.get(0) instanceof Pair p)) throw error("cadr: not a pair");
+            if (!(p.cdr instanceof Pair p2)) throw error("cadr: cdr is not a pair");
+            return p2.car;
+        });
+        globalEnv.define("cdar", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("cdar: expected 1 argument");
+            if (!(args.get(0) instanceof Pair p)) throw error("cdar: not a pair");
+            if (!(p.car instanceof Pair p2)) throw error("cdar: car is not a pair");
+            return p2.cdr;
+        });
+        globalEnv.define("cddr", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("cddr: expected 1 argument");
+            if (!(args.get(0) instanceof Pair p)) throw error("cddr: not a pair");
+            if (!(p.cdr instanceof Pair p2)) throw error("cddr: cdr is not a pair");
+            return p2.cdr;
+        });
+
+        // member (equal?-based)
+        globalEnv.define("member", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("member: expected 2 arguments");
+            Object obj = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof Pair p) {
+                if (schemeEqual(obj, p.car)) return lst;
+                lst = p.cdr;
+            }
+            return false;
+        });
+        // memv (eqv?-based)
+        globalEnv.define("memv", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("memv: expected 2 arguments");
+            Object obj = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof Pair p) {
+                if (eqv(obj, p.car)) return lst;
+                lst = p.cdr;
+            }
+            return false;
+        });
+        // assq (eq?-based)
+        globalEnv.define("assq", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("assq: expected 2 arguments");
+            Object key = args.get(0);
+            Object alist = args.get(1);
+            while (alist instanceof Pair p) {
+                if (p.car instanceof Pair entry) {
+                    Object entryKey = entry.car;
+                    if (key == entryKey || (key instanceof Long && key.equals(entryKey))
+                        || (key instanceof String && key.equals(entryKey))) return entry;
+                }
+                alist = p.cdr;
+            }
+            return false;
+        });
+        // assv (eqv?-based)
+        globalEnv.define("assv", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("assv: expected 2 arguments");
+            Object key = args.get(0);
+            Object alist = args.get(1);
+            while (alist instanceof Pair p) {
+                if (p.car instanceof Pair entry) {
+                    if (eqv(key, entry.car)) return entry;
+                }
+                alist = p.cdr;
+            }
+            return false;
+        });
+        // memq (eq?-based)
+        globalEnv.define("memq", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("memq: expected 2 arguments");
+            Object obj = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof Pair p) {
+                if (obj == p.car || (obj instanceof Long && obj.equals(p.car))
+                    || (obj instanceof String && obj.equals(p.car))) return lst;
+                lst = p.cdr;
+            }
+            return false;
+        });
+        // gcd
+        globalEnv.define("gcd", (BuiltinProc) args -> {
+            if (args.isEmpty()) return 0L;
+            long result = numToLong(args.get(0));
+            if (result < 0) result = -result;
+            for (int i = 1; i < args.size(); i++) {
+                long b = numToLong(args.get(i));
+                if (b < 0) b = -b;
+                while (b != 0) { long t = b; b = result % b; result = t; }
+            }
+            return result;
+        });
+        // lcm
+        globalEnv.define("lcm", (BuiltinProc) args -> {
+            if (args.isEmpty()) return 1L;
+            long result = numToLong(args.get(0));
+            if (result < 0) result = -result;
+            for (int i = 1; i < args.size(); i++) {
+                long b = numToLong(args.get(i));
+                if (b < 0) b = -b;
+                if (result == 0 || b == 0) { result = 0; } else {
+                    long g = result; long tmp = b;
+                    while (tmp != 0) { long t = tmp; tmp = g % tmp; g = t; }
+                    result = result / g * b;
+                }
+            }
+            return result;
+        });
+        // truncate
+        globalEnv.define("truncate", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("truncate: expected 1 argument");
+            Object val = args.get(0);
+            if (val instanceof Long) return val;
+            if (val instanceof Double d) return (long) d.doubleValue();
+            if (val instanceof Rational r) return r.toLong();
+            throw error("truncate: not a number");
+        });
+        // round
+        globalEnv.define("round", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("round: expected 1 argument");
+            Object val = args.get(0);
+            if (val instanceof Long) return val;
+            if (val instanceof Double d) return Math.round(d);
+            if (val instanceof Rational r) return Math.round(r.toDouble());
+            throw error("round: not a number");
+        });
+        // make-string
+        globalEnv.define("make-string", (BuiltinProc) args -> {
+            if (args.size() < 1 || args.size() > 2) throw error("make-string: expected 1-2 arguments");
+            if (!(args.get(0) instanceof Long len)) throw error("make-string: not a number");
+            char fill = args.size() == 2 && args.get(1) instanceof SchemeChar c ? c.value() : '\0';
+            char[] chars = new char[len.intValue()];
+            java.util.Arrays.fill(chars, fill);
+            return new SchemeString(new String(chars));
+        });
+        // string (from chars)
+        globalEnv.define("string", (BuiltinProc) args -> {
+            StringBuilder sb = new StringBuilder();
+            for (Object a : args) {
+                if (!(a instanceof SchemeChar c)) throw error("string: not a character");
+                sb.append(c.value());
+            }
+            return new SchemeString(sb.toString());
+        });
+        // string>?
+        globalEnv.define("string>?", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("string>?: expected 2 arguments");
+            if (!(args.get(0) instanceof SchemeString a)) throw error("string>?: not a string");
+            if (!(args.get(1) instanceof SchemeString b)) throw error("string>?: not a string");
+            return a.value().compareTo(b.value()) > 0;
+        });
+        // string<=?
+        globalEnv.define("string<=?", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("string<=?: expected 2 arguments");
+            if (!(args.get(0) instanceof SchemeString a)) throw error("string<=?: not a string");
+            if (!(args.get(1) instanceof SchemeString b)) throw error("string<=?: not a string");
+            return a.value().compareTo(b.value()) <= 0;
+        });
+        // string>=?
+        globalEnv.define("string>=?", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("string>=?: expected 2 arguments");
+            if (!(args.get(0) instanceof SchemeString a)) throw error("string>=?: not a string");
+            if (!(args.get(1) instanceof SchemeString b)) throw error("string>=?: not a string");
+            return a.value().compareTo(b.value()) >= 0;
+        });
+
+        // reverse
+        globalEnv.define("reverse", (BuiltinProc) args -> {
+            if (args.size() != 1) throw error("reverse: expected 1 argument");
+            Object result = NIL;
+            Object cur = args.get(0);
+            while (cur instanceof Pair p) {
+                result = new Pair(p.car, result);
+                cur = p.cdr;
+            }
+            return result;
+        });
+
+        // for-each (supports multiple lists)
+        globalEnv.define("for-each", (BuiltinProc) args -> {
+            if (args.size() < 2) throw error("for-each: expected at least 2 arguments");
+            Object proc = args.get(0);
+            List<Object> lists = new ArrayList<>();
+            for (int i = 1; i < args.size(); i++) {
+                lists.add(args.get(i));
+            }
+            while (true) {
+                boolean done = false;
+                for (Object lst : lists) {
+                    if (!(lst instanceof Pair)) { done = true; break; }
+                }
+                if (done) break;
+                List<Object> callArgs = new ArrayList<>();
+                for (int i = 0; i < lists.size(); i++) {
+                    Pair p = (Pair) lists.get(i);
+                    callArgs.add(p.car);
+                    lists.set(i, p.cdr);
+                }
+                apply(proc, callArgs);
+            }
+            return VOID;
+        });
+
+        // Pair mutation
+        globalEnv.define("set-car!", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("set-car!: expected 2 arguments");
+            if (!(args.get(0) instanceof Pair p)) throw error("set-car!: not a pair");
+            p.car = args.get(1);
+            return VOID;
+        });
+        globalEnv.define("set-cdr!", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("set-cdr!: expected 2 arguments");
+            if (!(args.get(0) instanceof Pair p)) throw error("set-cdr!: not a pair");
+            p.cdr = args.get(1);
+            return VOID;
         });
 
         // Character operations
@@ -1883,6 +2164,13 @@ public class Evaluator {
         throw error("not a number");
     }
 
+    private long numToLong(Object val) throws EvalError {
+        if (val instanceof Long l) return l;
+        if (val instanceof Double d) return (long) d.doubleValue();
+        if (val instanceof Rational r) return r.toLong();
+        throw error("not a number");
+    }
+
     // Normalize: if Rational with denom==1, return Long
     private Object normalizeExact(Rational r) {
         return r.isInteger() ? r.toLong() : r;
@@ -1974,6 +2262,10 @@ public class Evaluator {
     }
 
     private boolean schemeEqual(Object a, Object b) {
+        return schemeEqualImpl(a, b, java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
+    }
+
+    private boolean schemeEqualImpl(Object a, Object b, Set<Object> seen) {
         if (a == b) return true;
         if (a instanceof Long && b instanceof Long) return a.equals(b);
         if (a instanceof Rational && b instanceof Rational) return a.equals(b);
@@ -1983,13 +2275,15 @@ public class Evaluator {
         if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
         if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
         if (a instanceof Pair pa && b instanceof Pair pb) {
-            return schemeEqual(pa.car, pb.car) && schemeEqual(pa.cdr, pb.cdr);
+            if (!seen.add(pa)) return true; // cycle — assume equal
+            boolean result = schemeEqualImpl(pa.car, pb.car, seen) && schemeEqualImpl(pa.cdr, pb.cdr, seen);
+            return result;
         }
         if (a == NIL && b == NIL) return true;
         if (a instanceof SchemeVector va && b instanceof SchemeVector vb) {
             if (va.length() != vb.length()) return false;
             for (int i = 0; i < va.length(); i++) {
-                if (!schemeEqual(va.ref(i), vb.ref(i))) return false;
+                if (!schemeEqualImpl(va.ref(i), vb.ref(i), seen)) return false;
             }
             return true;
         }
@@ -2000,11 +2294,14 @@ public class Evaluator {
 
     @SuppressWarnings("unchecked")
     static String schemeToString(Object val) {
+        return schemeToStringImpl(val, java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
+    }
+
+    private static String schemeToStringImpl(Object val, Set<Object> seen) {
         if (val instanceof Long) return val.toString();
         if (val instanceof Rational r) return r.toString();
         if (val instanceof Double d) {
             if (d == Math.floor(d) && !Double.isInfinite(d) && Math.abs(d) < 1e15) {
-                // Format as e.g. "5.0" not "5"
                 return String.valueOf(d);
             }
             return String.valueOf(d);
@@ -2015,28 +2312,33 @@ public class Evaluator {
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof CaseLambda) return "#<procedure>";
         if (val instanceof SchemeVector v) {
+            if (!seen.add(v)) return "#<circular>";
             StringBuilder sb = new StringBuilder("#(");
             for (int i = 0; i < v.length(); i++) {
                 if (i > 0) sb.append(" ");
-                sb.append(schemeToString(v.ref(i)));
+                sb.append(schemeToStringImpl(v.ref(i), seen));
             }
             sb.append(")");
             return sb.toString();
         }
         if (val == NIL) return "()";
         if (val instanceof Pair) {
+            if (!seen.add(val)) return "#<circular>";
             StringBuilder sb = new StringBuilder("(");
             Object cur = val;
             boolean first = true;
             while (cur instanceof Pair p) {
-                if (!first) sb.append(" ");
+                if (!first) {
+                    if (!seen.add(cur)) { sb.append(" . #<circular>"); break; }
+                    sb.append(" ");
+                }
                 first = false;
-                sb.append(schemeToString(p.car));
+                sb.append(schemeToStringImpl(p.car, seen));
                 cur = p.cdr;
             }
-            if (cur != NIL) {
+            if (cur != NIL && !(cur instanceof Pair)) {
                 sb.append(" . ");
-                sb.append(schemeToString(cur));
+                sb.append(schemeToStringImpl(cur, seen));
             }
             sb.append(")");
             return sb.toString();
@@ -2045,7 +2347,7 @@ public class Evaluator {
             StringBuilder sb = new StringBuilder("(");
             for (int i = 0; i < list.size(); i++) {
                 if (i > 0) sb.append(" ");
-                sb.append(schemeToString(list.get(i)));
+                sb.append(schemeToStringImpl(list.get(i), seen));
             }
             sb.append(")");
             return sb.toString();
@@ -2055,34 +2357,43 @@ public class Evaluator {
     }
 
     static String displayString(Object val) {
+        return displayStringImpl(val, java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
+    }
+
+    private static String displayStringImpl(Object val, Set<Object> seen) {
         if (val instanceof SchemeString s) return s.value();
         if (val instanceof SchemeChar ch) return String.valueOf(ch.value());
         if (val instanceof SchemeVector v) {
+            if (!seen.add(v)) return "#<circular>";
             StringBuilder sb = new StringBuilder("#(");
             for (int i = 0; i < v.length(); i++) {
                 if (i > 0) sb.append(" ");
-                sb.append(displayString(v.ref(i)));
+                sb.append(displayStringImpl(v.ref(i), seen));
             }
             sb.append(")");
             return sb.toString();
         }
         if (val instanceof Pair) {
+            if (!seen.add(val)) return "#<circular>";
             StringBuilder sb = new StringBuilder("(");
             Object cur = val;
             boolean first = true;
             while (cur instanceof Pair p) {
-                if (!first) sb.append(" ");
+                if (!first) {
+                    if (!seen.add(cur)) { sb.append(" . #<circular>"); break; }
+                    sb.append(" ");
+                }
                 first = false;
-                sb.append(displayString(p.car));
+                sb.append(displayStringImpl(p.car, seen));
                 cur = p.cdr;
             }
-            if (cur != NIL) {
+            if (cur != NIL && !(cur instanceof Pair)) {
                 sb.append(" . ");
-                sb.append(displayString(cur));
+                sb.append(displayStringImpl(cur, seen));
             }
             sb.append(")");
             return sb.toString();
         }
-        return schemeToString(val);
+        return schemeToStringImpl(val, seen);
     }
 }
