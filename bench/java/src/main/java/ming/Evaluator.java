@@ -824,6 +824,9 @@ public class Evaluator {
     // Marker for tail call from helper methods
     private record TailCall(Object expr, Environment env) {}
 
+    // Multiple values wrapper
+    static record SchemeValues(List<Object> values) {}
+
     // Continuation support for call/cc
     static class SchemeContinuation {
         List<Object> bodyExprs;
@@ -2416,6 +2419,27 @@ public class Evaluator {
         };
         globalEnv.define("call/cc", callCCBuiltin);
         globalEnv.define("call-with-current-continuation", callCCBuiltin);
+
+        // values: return multiple values (single value is transparent)
+        globalEnv.define("values", (BuiltinProc) args -> {
+            if (args.size() == 1) return args.get(0);
+            return new SchemeValues(args);
+        });
+
+        // call-with-values: (call-with-values producer consumer)
+        globalEnv.define("call-with-values", (BuiltinProc) args -> {
+            if (args.size() != 2) throw error("call-with-values: expected 2 arguments");
+            Object producer = args.get(0);
+            Object consumer = args.get(1);
+            Object produced = apply(producer, List.of());
+            List<Object> vals;
+            if (produced instanceof SchemeValues sv) {
+                vals = sv.values;
+            } else {
+                vals = List.of(produced);
+            }
+            return apply(consumer, vals);
+        });
     }
 
     // Convert any numeric value to Rational
