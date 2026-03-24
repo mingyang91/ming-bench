@@ -1,4 +1,5 @@
 pub mod error;
+mod macros;
 
 pub use error::EvalError;
 use error::Span;
@@ -6,13 +7,21 @@ use error::Span;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const DUMMY_SPAN: Span = Span { line: 0, col: 0 };
 
-type Output = Rc<RefCell<String>>;
+static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn gensym(base: &str) -> String {
+    let n = GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}__g{}", base, n)
+}
+
+pub(crate) type Output = Rc<RefCell<String>>;
 
 #[derive(Debug, Clone, PartialEq)]
-enum Value {
+pub(crate) enum Value {
     Integer(i64),
     Boolean(bool),
     Str(String),
@@ -21,18 +30,23 @@ enum Value {
     List(Vec<Spanned>),
     Pair(Box<Value>, Box<Value>), // improper pair (a . b) where b is not a list
     Lambda(Vec<String>, Option<String>, Vec<Spanned>, Env), // params, rest_param, body, closure env
+    SyntaxRules {
+        literals: Vec<String>,
+        rules: Vec<(Spanned, Spanned)>, // (pattern, template)
+        def_env: Env,
+    },
     Void,
 }
 
 /// A value annotated with its source position.
 #[derive(Debug, Clone, PartialEq)]
-struct Spanned {
-    val: Value,
-    span: Span,
+pub(crate) struct Spanned {
+    pub(crate) val: Value,
+    pub(crate) span: Span,
 }
 
 impl Spanned {
-    fn new(val: Value, span: Span) -> Self {
+    pub(crate) fn new(val: Value, span: Span) -> Self {
         Self { val, span }
     }
 }
@@ -57,6 +71,7 @@ impl Value {
             }
             Value::Pair(a, b) => format!("({} . {})", a.display_value(), b.display_value()),
             Value::Lambda(..) => "#<procedure>".into(),
+            Value::SyntaxRules { .. } => "#<syntax>".into(),
             Value::Void => "".into(),
         }
     }
@@ -82,10 +97,10 @@ impl Value {
 
 // --- Environment ---
 
-type Env = Rc<RefCell<EnvInner>>;
+pub(crate) type Env = Rc<RefCell<EnvInner>>;
 
 #[derive(Debug, PartialEq)]
-struct EnvInner {
+pub(crate) struct EnvInner {
     bindings: HashMap<String, Value>,
     parent: Option<Env>,
 }
@@ -97,7 +112,7 @@ fn new_env(parent: Option<Env>) -> Env {
     }))
 }
 
-fn env_get(env: &Env, name: &str) -> Option<Value> {
+pub(crate) fn env_get(env: &Env, name: &str) -> Option<Value> {
     let inner = env.borrow();
     if let Some(val) = inner.bindings.get(name) {
         Some(val.clone())
@@ -108,7 +123,7 @@ fn env_get(env: &Env, name: &str) -> Option<Value> {
     }
 }
 
-fn env_set(env: &Env, name: String, val: Value) {
+pub(crate) fn env_set(env: &Env, name: String, val: Value) {
     env.borrow_mut().bindings.insert(name, val);
 }
 
@@ -353,12 +368,35 @@ fn parse_params(values: &[Spanned], context: &str, span: Span) -> Result<(Vec<St
     }
 }
 
+// --- Macros (syntax-rules) ---
+
+
+fn apply_macro(
+    items: &[Spanned],
+    literals: &[String],
+    rules: &[(Spanned, Spanned)],
+    def_env: &Env,
+    env: &Env,
+    out: &Output,
+    span: Span,
+) -> Result<Value, EvalError> {
+    let Some((expanded, renames)) = macros::try_expand(items, literals, rules) else {
+        return Err(EvalError::Type("no matching pattern for macro".into(), span));
+    };
+    for (orig, gs) in &renames {
+        if let Some(val) = env_get(def_env, orig) {
+            env_set(env, gs.clone(), val);
+        }
+    }
+    eval(&expanded, env, out)
+}
+
 // --- Evaluator ---
 
 fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
     let span = expr.span;
     match &expr.val {
-        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Pair(..) | Value::Lambda(..) => Ok(expr.val.clone()),
+        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Pair(..) | Value::Lambda(..) | Value::SyntaxRules { .. } => Ok(expr.val.clone()),
         Value::Symbol(name) => {
             env_get(env, name).ok_or_else(|| EvalError::UnboundVariable(name.clone(), span))
         }
@@ -484,7 +522,48 @@ fn eval(expr: &Spanned, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         let v = eval(&items[1], env, out)?;
                         return Ok(Value::Boolean(!v.is_truthy()));
                     }
-                    _ => {}
+                    "define-syntax" => {
+                        if items.len() != 3 {
+                            return Err(EvalError::Arity("define-syntax requires 2 arguments".into(), span));
+                        }
+                        let Value::Symbol(macro_name) = &items[1].val else {
+                            return Err(EvalError::Type("define-syntax: expected symbol".into(), span));
+                        };
+                        let Value::List(sr_parts) = &items[2].val else {
+                            return Err(EvalError::Type("define-syntax: expected syntax-rules".into(), span));
+                        };
+                        if sr_parts.is_empty() || !matches!(&sr_parts[0].val, Value::Symbol(s) if s == "syntax-rules") {
+                            return Err(EvalError::Type("define-syntax: expected syntax-rules form".into(), span));
+                        }
+                        if sr_parts.len() < 2 {
+                            return Err(EvalError::Arity("syntax-rules requires literals list".into(), span));
+                        }
+                        let Value::List(lit_list) = &sr_parts[1].val else {
+                            return Err(EvalError::Type("syntax-rules: expected literals list".into(), span));
+                        };
+                        let literals: Vec<String> = lit_list.iter().filter_map(|l| {
+                            if let Value::Symbol(s) = &l.val { Some(s.clone()) } else { None }
+                        }).collect();
+                        let mut rules = Vec::new();
+                        for rule in &sr_parts[2..] {
+                            let Value::List(parts) = &rule.val else {
+                                return Err(EvalError::Type("syntax-rules: expected rule".into(), span));
+                            };
+                            if parts.len() != 2 {
+                                return Err(EvalError::Arity("syntax-rules: rule needs pattern and template".into(), span));
+                            }
+                            rules.push((parts[0].clone(), parts[1].clone()));
+                        }
+                        let val = Value::SyntaxRules { literals, rules, def_env: env.clone() };
+                        env_set(env, macro_name.clone(), val);
+                        return Ok(Value::Void);
+                    }
+                    _ => {
+                        // Check for macro application
+                        if let Some(Value::SyntaxRules { ref literals, ref rules, ref def_env }) = env_get(env, name) {
+                            return apply_macro(items, literals, rules, def_env, env, out, span);
+                        }
+                    }
                 }
             }
             // Function application
