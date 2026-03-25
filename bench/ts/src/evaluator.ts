@@ -100,6 +100,11 @@ interface RecordValue {
   fields: SchemeValue[];
 }
 
+interface MultipleValuesValue {
+  kind: 'multiple-values';
+  values: SchemeValue[];
+}
+
 interface VoidValue {
   kind: 'void';
 }
@@ -114,6 +119,7 @@ type SchemeValue =
   | PairValue
   | VectorValue
   | RecordValue
+  | MultipleValuesValue
   | VoidValue
   | ProcedureValue;
 
@@ -443,6 +449,15 @@ function createGlobalEnvironment(output: string[]): Environment {
     makeBuiltinProcedure('with-exception-handler', () => {
       throw new EvalError(
         'internal error: with-exception-handler must be applied through the evaluator',
+      );
+    }),
+  );
+  env.define('values', makeBuiltinProcedure('values', (args) => applyValues(args)));
+  env.define(
+    'call-with-values',
+    makeBuiltinProcedure('call-with-values', () => {
+      throw new EvalError(
+        'internal error: call-with-values must be applied through the evaluator',
       );
     }),
   );
@@ -1763,7 +1778,10 @@ function evaluateExpressions(
   }
 
   return evaluateExpression(expressions[index], env, (value) =>
-    evaluateExpressions(expressions, env, continuation, index + 1, [...values, value]),
+    evaluateExpressions(expressions, env, continuation, index + 1, [
+      ...values,
+      expectSingleValue(value),
+    ]),
   );
 }
 
@@ -1779,7 +1797,10 @@ function evaluateCallArguments(
   }
 
   return evaluateExpression(expressions[index], env, (value) =>
-    evaluateCallArguments(expressions, env, continuation, index - 1, [value, ...values]),
+    evaluateCallArguments(expressions, env, continuation, index - 1, [
+      expectSingleValue(value),
+      ...values,
+    ]),
   );
 }
 
@@ -1847,7 +1868,7 @@ function evaluateList(
     protectWithLocation(location, () =>
       evaluateCallArguments(items.slice(1), env, (args) =>
         protectWithLocation(location, () =>
-          applyProcedureStep(procedure, args, continuation, location),
+          applyProcedureStep(expectSingleValue(procedure), args, continuation, location),
         ),
       ),
     ),
@@ -1871,11 +1892,12 @@ function evaluateAnd(
   }
 
   return evaluateExpression(item, env, (result) =>
-    protectWithLocation(location, () =>
-      isTruthy(result)
+    protectWithLocation(location, () => {
+      const singleResult = expectSingleValue(result);
+      return isTruthy(singleResult)
         ? evaluateAnd(items, env, continuation, location, index + 1)
-        : continueWith(continuation, result),
-    ),
+        : continueWith(continuation, singleResult);
+    }),
   );
 }
 
@@ -1891,7 +1913,7 @@ function evaluateCase(
 
   return evaluateExpression(items[0], env, (key) =>
     protectWithLocation(location, () =>
-      evaluateCaseClauses(key, items.slice(1), env, continuation),
+      evaluateCaseClauses(expectSingleValue(key), items.slice(1), env, continuation),
     ),
   );
 }
@@ -1962,11 +1984,12 @@ function evaluateOr(
   }
 
   return evaluateExpression(item, env, (result) =>
-    protectWithLocation(location, () =>
-      isTruthy(result)
-        ? continueWith(continuation, result)
-        : evaluateOr(items, env, continuation, location, index + 1),
-    ),
+    protectWithLocation(location, () => {
+      const singleResult = expectSingleValue(result);
+      return isTruthy(singleResult)
+        ? continueWith(continuation, singleResult)
+        : evaluateOr(items, env, continuation, location, index + 1);
+    }),
   );
 }
 
@@ -2003,11 +2026,12 @@ function evaluateCond(
   }
 
   return evaluateExpression(testExpression, env, (testValue) =>
-    protectWithLocation(location, () =>
-      isTruthy(testValue)
-        ? evaluateCondBody(body, testValue, env, continuation)
-        : evaluateCond(items, env, continuation, location, index + 1),
-    ),
+    protectWithLocation(location, () => {
+      const singleTestValue = expectSingleValue(testValue);
+      return isTruthy(singleTestValue)
+        ? evaluateCondBody(body, singleTestValue, env, continuation)
+        : evaluateCond(items, env, continuation, location, index + 1);
+    }),
   );
 }
 
@@ -2087,7 +2111,7 @@ function defineVariable(
 
   return evaluateExpression(valueExpression, env, (value) =>
     protectWithLocation(location, () => {
-      defineIdentifier(name, env, value);
+      defineIdentifier(name, env, expectSingleValue(value));
       return continueWith(continuation, VOID_VALUE);
     }),
   );
@@ -2140,7 +2164,7 @@ function evaluateIf(
 
   return evaluateExpression(items[0], env, (condition) =>
     protectWithLocation(location, () => {
-      if (isTruthy(condition)) {
+      if (isTruthy(expectSingleValue(condition))) {
         return evaluateExpression(items[1], env, continuation);
       }
 
@@ -2179,7 +2203,7 @@ function evaluateSet(
 
   return evaluateExpression(items[1], env, (value) =>
     protectWithLocation(location, () => {
-      if (!setIdentifierValue(target, env, value)) {
+      if (!setIdentifierValue(target, env, expectSingleValue(value))) {
         throw new EvalError(`unbound variable: ${displayIdentifierName(target)}`);
       }
 
@@ -2259,9 +2283,10 @@ function evaluateGuardClauses(
   }
 
   return evaluateExpression(testExpression, env, (testValue) =>
-    protectWithLocation(location, () =>
-      isTruthy(testValue)
-        ? evaluateCondBody(body, testValue, env, continuation)
+    protectWithLocation(location, () => {
+      const singleTestValue = expectSingleValue(testValue);
+      return isTruthy(singleTestValue)
+        ? evaluateCondBody(body, singleTestValue, env, continuation)
         : evaluateGuardClauses(
             clauses,
             env,
@@ -2269,8 +2294,8 @@ function evaluateGuardClauses(
             exceptionValue,
             location,
             index + 1,
-          ),
-    ),
+          );
+    }),
   );
 }
 
@@ -2330,7 +2355,7 @@ function evaluateDoLoop(
 ): Computation {
   return evaluateExpression(testExpression, loopEnv, (testValue) =>
     protectWithLocation(location, () => {
-      if (isTruthy(testValue)) {
+      if (isTruthy(expectSingleValue(testValue))) {
         return resultExpressions.length === 0
           ? continueWith(continuation, VOID_VALUE)
           : evaluateSequenceInternal(resultExpressions, loopEnv, continuation);
@@ -2450,7 +2475,7 @@ function evaluateDoStepExpressions(
         continuation,
         location,
         bindingIndex + 1,
-        [...nextValues, value],
+        [...nextValues, expectSingleValue(value)],
       ),
     ),
   );
@@ -2517,7 +2542,7 @@ function evaluateLetStarBindings(
   const binding = bindings[index];
   return evaluateExpression(binding.valueExpression, letStarEnv, (value) =>
     protectWithLocation(location, () => {
-      defineIdentifier(binding.name, letStarEnv, value);
+      defineIdentifier(binding.name, letStarEnv, expectSingleValue(value));
       return evaluateLetStarBindings(
         bindings,
         body,
@@ -2650,7 +2675,7 @@ function evaluateSequentialRecursiveBindings(
 
   return evaluateExpression(bindingSpec.valueExpression, letrecEnv, (value) =>
     protectWithLocation(location, () => {
-      binding.value = value;
+      binding.value = expectSingleValue(value);
       return evaluateSequentialRecursiveBindings(
         bindings,
         body,
@@ -3081,6 +3106,8 @@ function applyBuiltinProcedure(
       return applyRaiseCps(args, location);
     case 'with-exception-handler':
       return applyWithExceptionHandlerCps(args, continuation, location);
+    case 'call-with-values':
+      return applyCallWithValuesCps(args, continuation, location);
     case 'apply':
       return applyApplyCps(args, continuation, location);
     case 'map':
@@ -3105,6 +3132,23 @@ function applyApplyCps(
   return applyProcedureStep(procedure, [...prefixArgs, ...finalArgs], continuation, location);
 }
 
+function applyCallWithValuesCps(
+  args: SchemeValue[],
+  continuation: Continuation,
+  location?: SourceLocation,
+): Computation {
+  expectExactArgCount('call-with-values', args, 2);
+
+  const [producer, consumer] = args;
+  return applyProcedureStep(
+    producer,
+    [],
+    (producedValue) =>
+      applyProcedureStep(consumer, unpackValues(producedValue), continuation, location),
+    location,
+  );
+}
+
 function applyMapCps(
   args: SchemeValue[],
   continuation: Continuation,
@@ -3127,7 +3171,7 @@ function applyMapCps(
     return applyProcedureStep(
       procedure,
       lists.map((list) => list[index]),
-      (value) => iterate(index + 1, [...results, value]),
+      (value) => iterate(index + 1, [...results, expectSingleValue(value)]),
       location,
     );
   };
@@ -3254,6 +3298,10 @@ function makeCompositePairAccessorProcedure(name: string): BuiltinProcedureValue
 function applyNot(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('not', args, 1);
   return booleanValue(!isTruthy(args[0]));
+}
+
+function applyValues(args: SchemeValue[]): SchemeValue {
+  return args.length === 1 ? args[0] : multipleValuesValue(args.slice());
 }
 
 function applyApply(args: SchemeValue[]): SchemeValue {
@@ -3848,6 +3896,14 @@ function expectNumber(value: SchemeValue, name: string): SchemeNumber {
   return value.value;
 }
 
+function expectSingleValue(value: SchemeValue): SchemeValue {
+  if (value.kind === 'multiple-values') {
+    throw new EvalError(`expected 1 value, got ${value.values.length}`);
+  }
+
+  return value;
+}
+
 function expectInteger(value: SchemeValue, name: string): number {
   const number = expectNumber(value, name);
   if (!isIntegerNumber(number)) {
@@ -4168,6 +4224,10 @@ function formatWrittenValue(value: SchemeValue, active: Set<object>): string {
       return active.has(value) ? '#<cycle>' : formatVector(value, active);
     case 'record':
       return `#<record:${value.recordType.name}>`;
+    case 'multiple-values':
+      return value.values.length === 0
+        ? '#<values>'
+        : `#<values ${value.values.map((item) => formatWrittenValue(item, active)).join(' ')}>`;
     case 'void':
       return '#<void>';
     case 'procedure':
@@ -4340,6 +4400,13 @@ function schemeEqv(left: SchemeValue, right: SchemeValue): boolean {
     case 'empty-list':
     case 'void':
       return true;
+    case 'multiple-values': {
+      const rightValues = (right as MultipleValuesValue).values;
+      return (
+        left.values.length === rightValues.length &&
+        left.values.every((value, index) => schemeEqv(value, rightValues[index]))
+      );
+    }
     case 'string':
     case 'pair':
     case 'vector':
@@ -4386,6 +4453,15 @@ function schemeEqualInternal(
     case 'empty-list':
     case 'void':
       return true;
+    case 'multiple-values': {
+      const rightValues = (right as MultipleValuesValue).values;
+      return (
+        left.values.length === rightValues.length &&
+        left.values.every((value, index) =>
+          schemeEqualInternal(value, rightValues[index], state),
+        )
+      );
+    }
     case 'pair':
       return compareCyclicValues(left, right as PairValue, state, () =>
         schemeEqualInternal(left.car, (right as PairValue).car, state) &&
@@ -4503,6 +4579,14 @@ function vectorValue(elements: SchemeValue[]): VectorValue {
 
 function recordValue(recordType: RecordTypeDefinition, fields: SchemeValue[]): RecordValue {
   return { kind: 'record', recordType, fields };
+}
+
+function multipleValuesValue(values: SchemeValue[]): MultipleValuesValue {
+  return { kind: 'multiple-values', values };
+}
+
+function unpackValues(value: SchemeValue): SchemeValue[] {
+  return value.kind === 'multiple-values' ? value.values : [value];
 }
 
 function isWhitespace(char: string): boolean {
