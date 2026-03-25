@@ -1,15 +1,18 @@
 use std::fmt;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-#[derive(Debug, Clone, PartialEq)]
+type Frame = Rc<RefCell<HashMap<String, Value>>>;
+
+#[derive(Debug, Clone)]
 pub struct LambdaData {
     pub params: Vec<String>,
     pub body: Vec<crate::scheme::parser::Expr>,
     pub env: Env,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
     Boolean(bool),
@@ -21,37 +24,57 @@ pub enum Value {
     Void,
 }
 
-/// Environment: a chain of scopes.
-#[derive(Debug, Clone, PartialEq)]
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Void, Value::Void) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Environment: a chain of scopes with shared mutable frames.
+#[derive(Debug, Clone)]
 pub struct Env {
-    frames: Vec<HashMap<String, Value>>,
+    frames: Vec<Frame>,
+}
+
+fn new_frame() -> Frame {
+    Rc::new(RefCell::new(HashMap::new()))
 }
 
 impl Env {
     pub fn new() -> Self {
         Env {
-            frames: vec![HashMap::new()],
+            frames: vec![new_frame()],
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<&Value> {
+    pub fn get(&self, name: &str) -> Option<Value> {
         for frame in self.frames.iter().rev() {
-            if let Some(v) = frame.get(name) {
+            if let Some(v) = frame.borrow().get(name).cloned() {
                 return Some(v);
             }
         }
         None
     }
 
-    pub fn define(&mut self, name: String, val: Value) {
-        self.frames.last_mut().unwrap().insert(name, val);
+    pub fn define(&self, name: String, val: Value) {
+        self.frames.last().unwrap().borrow_mut().insert(name, val);
     }
 
     /// Mutate an existing binding (searches from innermost frame outward).
-    pub fn set(&mut self, name: &str, val: Value) -> bool {
-        for frame in self.frames.iter_mut().rev() {
-            if frame.contains_key(name) {
-                frame.insert(name.to_string(), val);
+    pub fn set(&self, name: &str, val: Value) -> bool {
+        for frame in self.frames.iter().rev() {
+            let mut f = frame.borrow_mut();
+            if f.contains_key(name) {
+                f.insert(name.to_string(), val);
                 return true;
             }
         }
@@ -59,44 +82,14 @@ impl Env {
     }
 
     pub fn push_frame(&mut self) {
-        self.frames.push(HashMap::new());
+        self.frames.push(new_frame());
     }
 
-    pub fn pop_frame(&mut self) {
-        self.frames.pop();
-    }
-
-    /// Create a child env that extends this one with a new empty frame.
+    /// Create a child env that shares all existing frames plus a new one.
     pub fn child(&self) -> Self {
-        let mut new = self.clone();
-        new.push_frame();
-        new
-    }
-
-    /// Merge the bottom (top-level) frame from another env into ours.
-    pub fn merge_top_level(&mut self, other: &Env) {
-        if let Some(other_frame) = other.frames.first() {
-            if let Some(self_frame) = self.frames.first_mut() {
-                for (k, v) in other_frame {
-                    self_frame.insert(k.clone(), v.clone());
-                }
-            }
-        }
-    }
-
-    /// Merge all bindings from another env into ours (frame by frame).
-    /// For frames that exist in both, merge bindings. Extra frames from
-    /// `other` are appended.
-    pub fn merge_all(&mut self, other: &Env) {
-        for (i, other_frame) in other.frames.iter().enumerate() {
-            if i < self.frames.len() {
-                for (k, v) in other_frame {
-                    self.frames[i].insert(k.clone(), v.clone());
-                }
-            } else {
-                self.frames.push(other_frame.clone());
-            }
-        }
+        let mut frames = self.frames.clone(); // Rc clones = shared
+        frames.push(new_frame());
+        Env { frames }
     }
 }
 

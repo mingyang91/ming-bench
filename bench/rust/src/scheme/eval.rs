@@ -45,7 +45,7 @@ impl Evaluator {
             ExprKind::Str(s) => Ok(Value::Str(s.clone())),
             ExprKind::Symbol(s) => {
                 if let Some(v) = env.get(s) {
-                    return Ok(v.clone());
+                    return Ok(v);
                 }
                 if Self::is_builtin(s) {
                     return Ok(Value::Symbol(s.clone()));
@@ -73,6 +73,7 @@ impl Evaluator {
                 "cond" => return self.eval_cond(&elems[1..], env, call_pos),
                 "and" => return self.eval_and(&elems[1..], env),
                 "or" => return self.eval_or(&elems[1..], env),
+                "set!" => return self.eval_set(&elems[1..], env, call_pos),
                 "string-set!" => return self.eval_string_set(&elems[1..], env, call_pos),
                 "not" => {
                     if elems.len() != 2 {
@@ -106,9 +107,7 @@ impl Evaluator {
                         args.len()
                     )));
                 }
-                let mut call_env = data.env.clone();
-                call_env.merge_all(env);
-                call_env.push_frame();
+                let mut call_env = data.env.child();
                 for (p, a) in data.params.iter().zip(args.into_iter()) {
                     call_env.define(p.clone(), a);
                 }
@@ -126,6 +125,21 @@ impl Evaluator {
                 Err(EvalError::Type(format!("not a procedure: {} at {call_pos}", op)))
             }
         }
+    }
+
+    fn eval_set(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<Value, EvalError> {
+        if args.len() != 2 {
+            return Err(EvalError::Arity(format!("set!: expected 2 arguments at {pos}")));
+        }
+        let name = match &args[0].kind {
+            ExprKind::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Parse(format!("set!: expected symbol at {pos}"))),
+        };
+        let val = self.eval_in_env(&args[1], env)?;
+        if !env.set(&name, val) {
+            return Err(EvalError::UnboundVariable(format!("{name} at {pos}")));
+        }
+        Ok(Value::Void)
     }
 
     fn eval_define(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<Value, EvalError> {
@@ -262,7 +276,7 @@ impl Evaluator {
                 }
             }
             let body = args[2..].to_vec();
-            let mut loop_env = env.clone();
+            let loop_env = env.child();
             let lambda = Value::Lambda(Rc::new(LambdaData {
                 params: params.clone(),
                 body: body.clone(),
@@ -291,8 +305,7 @@ impl Evaluator {
             ExprKind::List(b) => b,
             _ => return Err(EvalError::Parse(format!("let: expected bindings list at {pos}"))),
         };
-        let mut new_env = env.clone();
-        new_env.push_frame();
+        let mut new_env = env.child();
         for binding in bindings {
             match &binding.kind {
                 ExprKind::List(pair) if pair.len() == 2 => {
@@ -330,7 +343,7 @@ impl Evaluator {
         };
         let s = env.get(&var_name).ok_or_else(|| {
             EvalError::UnboundVariable(format!("{var_name} at {pos}"))
-        })?.clone();
+        })?;
         match s {
             Value::Str(mut string) => {
                 let mut chars: Vec<char> = string.chars().collect();
