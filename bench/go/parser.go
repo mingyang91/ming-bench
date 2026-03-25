@@ -72,6 +72,20 @@ func (p *Parser) ParseExpr() (*Expr, error) {
 		return &Expr{Type: ExprSymbol, StrVal: tok.StrVal, Line: tok.Line, Col: tok.Col}, nil
 	case TokenLParen:
 		return p.parseList(tok.Line, tok.Col)
+	case TokenQuote:
+		inner, err := p.ParseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &Expr{
+			Type: ExprList,
+			Elements: []*Expr{
+				{Type: ExprSymbol, StrVal: "quote", Line: tok.Line, Col: tok.Col},
+				inner,
+			},
+			Line: tok.Line,
+			Col:  tok.Col,
+		}, nil
 	case TokenRParen:
 		return nil, fmt.Errorf("%d:%d: unexpected ')'", tok.Line, tok.Col)
 	case TokenEOF:

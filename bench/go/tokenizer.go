@@ -11,6 +11,7 @@ const (
 	TokenBoolean
 	TokenString
 	TokenSymbol
+	TokenQuote
 	TokenEOF
 )
 
@@ -90,6 +91,9 @@ func (t *Tokenizer) NextToken() (Token, error) {
 	case ch == ')':
 		t.advance()
 		return Token{Type: TokenRParen, Line: line, Col: col}, nil
+	case ch == '\'':
+		t.advance()
+		return Token{Type: TokenQuote, Line: line, Col: col}, nil
 	case ch == '"':
 		return t.readString(line, col)
 	case ch == '#':

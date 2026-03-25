@@ -15,6 +15,7 @@ const (
 	TypePair
 	TypeNull
 	TypeVoid
+	TypeLambda
 )
 
 type Value struct {
@@ -24,6 +25,10 @@ type Value struct {
 	StrVal  string
 	Car     *Value
 	Cdr     *Value
+	// Lambda fields
+	Params []string
+	Body   []*Expr
+	ClosureEnv *Env
 }
 
 var Void = &Value{Type: TypeVoid}
@@ -73,6 +78,8 @@ func (v *Value) Display() string {
 		return ""
 	case TypePair:
 		return displayList(v)
+	case TypeLambda:
+		return "#<procedure>"
 	}
 	return ""
 }
