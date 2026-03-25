@@ -2,14 +2,16 @@ package ming;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public class Evaluator {
 
     // ── Value types ──────────────────────────────────────────────
-    private sealed interface Val permits Val.Int, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda {
+    private sealed interface Val permits Val.Int, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda, Val.Macro {
         record Int(long value) implements Val {}
         record Bool(boolean value) implements Val {}
         final class Str implements Val {
@@ -26,6 +28,20 @@ public class Evaluator {
         record Void() implements Val {}
         record Builtin(String name, java.util.function.Function<List<Val>, Val> fn) implements Val {}
         record Lambda(List<String> params, String restParam, List<Val> body, Env closure) implements Val {}
+        final class Macro implements Val {
+            final String name;
+            final List<String> literals;
+            final List<Val> patterns;
+            final List<Val> templates;
+            final Env defEnv;
+            Macro(String name, List<String> literals, List<Val> patterns, List<Val> templates, Env defEnv) {
+                this.name = name;
+                this.literals = literals;
+                this.patterns = patterns;
+                this.templates = templates;
+                this.defEnv = defEnv;
+            }
+        }
     }
 
     // ── Token with position ─────────────────────────────────────
@@ -79,6 +95,11 @@ public class Evaluator {
 
     // ── Output capture ──────────────────────────────────────────
     private StringBuilder output = new StringBuilder();
+    private int gensymCounter = 0;
+    private String gensym(String base) { return base + "_g" + (gensymCounter++); }
+    private static final Set<String> SPECIAL_FORMS = Set.of(
+        "quote", "if", "define", "lambda", "set!", "begin", "let", "cond", "and", "or", "define-syntax"
+    );
 
     // ── Write representation (with quotes) ──────────────────────
     private static String writeVal(Val v) {
@@ -98,6 +119,7 @@ public class Evaluator {
             case Val.PairV p -> writePair(p);
             case Val.Builtin b -> "#<procedure:" + b.name() + ">";
             case Val.Lambda ignored -> "#<procedure>";
+            case Val.Macro m -> "#<macro:" + m.name + ">";
         };
     }
 
@@ -306,6 +328,7 @@ public class Evaluator {
             case Val.Chr c -> c;
             case Val.Builtin b -> b;
             case Val.Lambda l -> l;
+            case Val.Macro m -> m;
             case Val.Sym sym -> {
                 try {
                     yield env.lookup(sym.name());
@@ -351,11 +374,15 @@ public class Evaluator {
                 case "cond" -> { return evalCond(pair.cdr(), env); }
                 case "and" -> { return evalAnd(pair.cdr(), env); }
                 case "or" -> { return evalOr(pair.cdr(), env); }
+                case "define-syntax" -> { return evalDefineSyntax(pair, env); }
             }
         }
 
         // Function call
         Val fn = eval(head, env);
+        if (fn instanceof Val.Macro macro) {
+            return expandAndEvalMacro(macro, pair, env);
+        }
         List<Val> args = evalArgs(pair.cdr(), env);
         return applyFn(fn, args, pair);
     }
@@ -578,6 +605,198 @@ public class Evaluator {
             cur = p.cdr();
         }
         return result;
+    }
+
+    // ── Macros (L10) ────────────────────────────────────────────
+    private static class MatchResult {
+        final Map<String, Val> singles = new HashMap<>();
+        final Map<String, List<Val>> ellipsis = new HashMap<>();
+    }
+
+    private Val evalDefineSyntax(Val.PairV form, Env env) throws EvalError {
+        Val args = form.cdr();
+        if (!(args instanceof Val.PairV dp)) throw posError(form, "define-syntax: invalid syntax");
+        if (!(dp.car() instanceof Val.Sym macroName)) throw posError(form, "define-syntax: expected name");
+        if (!(dp.cdr() instanceof Val.PairV dp2)) throw posError(form, "define-syntax: expected syntax-rules");
+        Val srForm = dp2.car();
+        if (!(srForm instanceof Val.PairV srPair)) throw posError(form, "define-syntax: expected syntax-rules form");
+        if (!(srPair.car() instanceof Val.Sym srSym) || !srSym.name().equals("syntax-rules"))
+            throw posError(form, "define-syntax: expected syntax-rules");
+        Val srArgs = srPair.cdr();
+        if (!(srArgs instanceof Val.PairV srArgs1)) throw posError(form, "syntax-rules: expected literals list");
+        List<String> literals = new ArrayList<>();
+        Val litList = srArgs1.car();
+        while (litList instanceof Val.PairV lp) {
+            if (lp.car() instanceof Val.Sym ls) literals.add(ls.name());
+            litList = lp.cdr();
+        }
+        List<Val> patterns = new ArrayList<>();
+        List<Val> templates = new ArrayList<>();
+        Val clauses = srArgs1.cdr();
+        while (clauses instanceof Val.PairV cp) {
+            if (!(cp.car() instanceof Val.PairV clause)) throw posError(form, "syntax-rules: invalid clause");
+            patterns.add(clause.car());
+            if (!(clause.cdr() instanceof Val.PairV templatePair)) throw posError(form, "syntax-rules: missing template");
+            templates.add(templatePair.car());
+            clauses = cp.cdr();
+        }
+        env.define(macroName.name(), new Val.Macro(macroName.name(), literals, patterns, templates, env));
+        return new Val.Void();
+    }
+
+    private Val expandAndEvalMacro(Val.Macro macro, Val.PairV form, Env env) throws EvalError {
+        Val inputArgs = form.cdr();
+        for (int i = 0; i < macro.patterns.size(); i++) {
+            Val pattern = macro.patterns.get(i);
+            Val patternArgs = (pattern instanceof Val.PairV pp) ? pp.cdr() : new Val.Nil();
+            MatchResult match = new MatchResult();
+            if (doMatch(patternArgs, inputArgs, macro.literals, match)) {
+                Val template = macro.templates.get(i);
+                Set<String> patternVars = new HashSet<>();
+                patternVars.addAll(match.singles.keySet());
+                patternVars.addAll(match.ellipsis.keySet());
+                Map<String, String> renames = new HashMap<>();
+                Set<String> templateIds = new HashSet<>();
+                collectIdentifiers(template, templateIds);
+                for (String id : templateIds) {
+                    if (!patternVars.contains(id) && !SPECIAL_FORMS.contains(id)
+                            && !id.equals(macro.name) && !id.equals("...")) {
+                        renames.put(id, gensym(id));
+                    }
+                }
+                Val expanded = expandTemplate(template, match, renames);
+                for (Map.Entry<String, String> entry : renames.entrySet()) {
+                    try {
+                        Val defVal = macro.defEnv.lookup(entry.getKey());
+                        env.define(entry.getValue(), defVal);
+                    } catch (EvalError e) {
+                        // Not in defEnv — truly introduced identifier, no pre-binding needed
+                    }
+                }
+                return eval(expanded, env);
+            }
+        }
+        throw posError(form, "no matching pattern for macro " + macro.name);
+    }
+
+    private boolean doMatch(Val pattern, Val input, List<String> literals, MatchResult result) {
+        if (pattern instanceof Val.Sym sym) {
+            String name = sym.name();
+            if (name.equals("...")) return false;
+            if (literals.contains(name)) {
+                return input instanceof Val.Sym is && is.name().equals(name);
+            }
+            if (name.equals("_")) return true;
+            result.singles.put(name, input);
+            return true;
+        }
+        if (pattern instanceof Val.Nil) return input instanceof Val.Nil;
+        if (pattern instanceof Val.Bool pb) return input instanceof Val.Bool ib && pb.value() == ib.value();
+        if (pattern instanceof Val.Int pi) return input instanceof Val.Int ii && pi.value() == ii.value();
+        if (pattern instanceof Val.PairV) {
+            List<Val> patElems = collectList(pattern);
+            int ellipsisIdx = -1;
+            for (int j = 0; j < patElems.size(); j++) {
+                if (patElems.get(j) instanceof Val.Sym s && s.name().equals("...")) {
+                    ellipsisIdx = j;
+                    break;
+                }
+            }
+            if (ellipsisIdx >= 0) {
+                int fixedBefore = ellipsisIdx - 1;
+                Val cur = input;
+                for (int j = 0; j < fixedBefore; j++) {
+                    if (!(cur instanceof Val.PairV p)) return false;
+                    if (!doMatch(patElems.get(j), p.car(), literals, result)) return false;
+                    cur = p.cdr();
+                }
+                Val ellipsisPat = patElems.get(ellipsisIdx - 1);
+                if (ellipsisPat instanceof Val.Sym sym) {
+                    List<Val> matches = new ArrayList<>();
+                    while (cur instanceof Val.PairV p) {
+                        matches.add(p.car());
+                        cur = p.cdr();
+                    }
+                    if (!(cur instanceof Val.Nil)) return false;
+                    result.ellipsis.put(sym.name(), matches);
+                    return true;
+                }
+                return false;
+            } else {
+                Val patCur = pattern;
+                Val inpCur = input;
+                while (patCur instanceof Val.PairV patP) {
+                    if (!(inpCur instanceof Val.PairV inpP)) return false;
+                    if (!doMatch(patP.car(), inpP.car(), literals, result)) return false;
+                    patCur = patP.cdr();
+                    inpCur = inpP.cdr();
+                }
+                if (patCur instanceof Val.Nil) return inpCur instanceof Val.Nil;
+                return doMatch(patCur, inpCur, literals, result);
+            }
+        }
+        return false;
+    }
+
+    private Val expandTemplate(Val template, MatchResult bindings, Map<String, String> renames) {
+        if (template instanceof Val.Sym sym) {
+            String name = sym.name();
+            if (bindings.singles.containsKey(name)) return bindings.singles.get(name);
+            if (renames.containsKey(name)) return new Val.Sym(renames.get(name));
+            return template;
+        }
+        if (template instanceof Val.PairV) {
+            List<Val> elems = collectList(template);
+            List<Val> expanded = new ArrayList<>();
+            for (int i = 0; i < elems.size(); i++) {
+                if (i + 1 < elems.size() && elems.get(i + 1) instanceof Val.Sym s && s.name().equals("...")) {
+                    Val subTemplate = elems.get(i);
+                    Set<String> ellipsisVars = new HashSet<>();
+                    collectEllipsisVars(subTemplate, bindings, ellipsisVars);
+                    if (!ellipsisVars.isEmpty()) {
+                        String firstVar = ellipsisVars.iterator().next();
+                        List<Val> vals = bindings.ellipsis.get(firstVar);
+                        int count = vals != null ? vals.size() : 0;
+                        for (int j = 0; j < count; j++) {
+                            MatchResult sub = new MatchResult();
+                            sub.singles.putAll(bindings.singles);
+                            sub.ellipsis.putAll(bindings.ellipsis);
+                            for (String ev : ellipsisVars) {
+                                sub.singles.put(ev, bindings.ellipsis.get(ev).get(j));
+                            }
+                            expanded.add(expandTemplate(subTemplate, sub, renames));
+                        }
+                    }
+                    i++; // skip ...
+                } else {
+                    expanded.add(expandTemplate(elems.get(i), bindings, renames));
+                }
+            }
+            Val result = new Val.Nil();
+            for (int j = expanded.size() - 1; j >= 0; j--) {
+                result = new Val.PairV(expanded.get(j), result);
+            }
+            return result;
+        }
+        return template;
+    }
+
+    private void collectIdentifiers(Val template, Set<String> ids) {
+        if (template instanceof Val.Sym sym) {
+            ids.add(sym.name());
+        } else if (template instanceof Val.PairV pair) {
+            collectIdentifiers(pair.car(), ids);
+            collectIdentifiers(pair.cdr(), ids);
+        }
+    }
+
+    private void collectEllipsisVars(Val template, MatchResult bindings, Set<String> vars) {
+        if (template instanceof Val.Sym sym && bindings.ellipsis.containsKey(sym.name())) {
+            vars.add(sym.name());
+        } else if (template instanceof Val.PairV pair) {
+            collectEllipsisVars(pair.car(), bindings, vars);
+            collectEllipsisVars(pair.cdr(), bindings, vars);
+        }
     }
 
     // ── Builtins ────────────────────────────────────────────────
