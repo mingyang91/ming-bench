@@ -315,6 +315,22 @@ fn parse_integer_token(token: &str) -> Option<i64> {
     token.parse().ok()
 }
 
+fn line_col_at(input: &str, index: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut column = 1;
+
+    for ch in input[..index.min(input.len())].chars() {
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+
+    (line, column)
+}
+
 fn default_env() -> EnvRef {
     let env = Env::new();
 
@@ -1024,8 +1040,11 @@ fn expect_value_arity(name: &str, args: &[Value], expected: usize) -> Result<(),
 /// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let mut parser = Parser::new(input);
-    let exprs = parser.parse_program()?;
-    let value = eval_program(&exprs)?;
+    let exprs = parser.parse_program().map_err(|error| {
+        let (line, column) = line_col_at(input, parser.index);
+        error.with_position(line, column)
+    })?;
+    let value = eval_program(&exprs).map_err(|error| error.with_position(1, 1))?;
     Ok(value.render())
 }
 

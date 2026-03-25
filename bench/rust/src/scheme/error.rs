@@ -4,6 +4,14 @@
 /// error type is not possible — the `eval_str` signature requires this type.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum EvalError {
+    #[error("{source} at {line}:{column}")]
+    WithPosition {
+        line: usize,
+        column: usize,
+        #[source]
+        source: Box<EvalError>,
+    },
+
     #[error("syntax error: {message}")]
     SyntaxError { message: String },
 
@@ -37,4 +45,17 @@ pub enum EvalError {
 
     #[error("division by zero")]
     DivisionByZero,
+}
+
+impl EvalError {
+    pub fn with_position(self, line: usize, column: usize) -> Self {
+        match self {
+            Self::WithPosition { .. } => self,
+            source => Self::WithPosition {
+                line,
+                column,
+                source: Box::new(source),
+            },
+        }
+    }
 }
