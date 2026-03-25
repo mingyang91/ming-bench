@@ -37,6 +37,7 @@ public sealed interface SchemeValue {
     record CaseLambdaVal(List<LambdaVal> clauses) implements SchemeValue {}
     record RecordVal(Object tag, String typeName, String[] fieldNames, SchemeValue[] fields) implements SchemeValue {}
     record TailCall(SchemeValue expr, Environment env) implements SchemeValue {}
+    record ContinuationVal(Object cont) implements SchemeValue {}
     final class VectorVal implements SchemeValue {
         private final SchemeValue[] elements;
         public VectorVal(SchemeValue[] elements) { this.elements = elements; }
@@ -102,6 +103,7 @@ public sealed interface SchemeValue {
             case MacroVal v -> "#<macro>";
             case RecordVal v -> "#<record:" + v.typeName() + ">";
             case TailCall t -> "#<tailcall>";
+            case ContinuationVal v -> "#<continuation>";
             case VectorVal v -> {
                 var sb = new StringBuilder("#(");
                 for (int i = 0; i < v.length(); i++) {

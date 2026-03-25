@@ -20,6 +20,43 @@ public class Interpreter {
         "letrec", "letrec*", "case", "do", "when", "unless"
     );
 
+    // Sentinel for call/cc — identity-checked in applyProcCek
+    private static final SchemeValue.BuiltinVal CALL_CC_MARKER =
+        new SchemeValue.BuiltinVal("call/cc", null);
+    private static final SchemeValue.BuiltinVal APPLY_MARKER =
+        new SchemeValue.BuiltinVal("apply", null);
+
+    // ---- CEK machine types ----
+
+    sealed interface Cont {
+        record Halt() implements Cont {}
+        record Frame(CekHandler handler) implements Cont {}
+    }
+
+    @FunctionalInterface
+    interface CekHandler {
+        void apply(SchemeValue value) throws EvalError;
+    }
+
+    // CEK machine state (instance variables for performance)
+    private SchemeValue cControl;
+    private Environment cEnv;
+    private Cont cK;
+    private boolean cIsValue;
+
+    private void cekEval(SchemeValue expr, Environment env, Cont k) {
+        cControl = expr; cEnv = env; cK = k; cIsValue = false;
+    }
+    private void cekReturn(SchemeValue value, Cont k) {
+        cControl = value; cEnv = null; cK = k; cIsValue = true;
+    }
+
+    private record CekSaved(SchemeValue c, Environment e, Cont k, boolean v) {}
+    private CekSaved saveCek() { return new CekSaved(cControl, cEnv, cK, cIsValue); }
+    private void restoreCek(CekSaved s) { cControl = s.c; cEnv = s.e; cK = s.k; cIsValue = s.v; }
+
+    // ---- Constructor & builtins ----
+
     public Interpreter() {
         registerBuiltins();
     }
@@ -165,7 +202,6 @@ public class Interpreter {
         globals.define("append", new SchemeValue.BuiltinVal("append", args -> {
             if (args.length == 0) return NIL;
             if (args.length == 1) return args[0];
-            // Append all lists
             SchemeValue result = args[args.length - 1];
             for (int i = args.length - 2; i >= 0; i--) {
                 result = appendTwo(args[i], result);
@@ -199,7 +235,8 @@ public class Interpreter {
             if (args.length != 1) throw new EvalError("procedure?: expected 1 argument");
             return new SchemeValue.BoolVal(args[0] instanceof SchemeValue.LambdaVal
                 || args[0] instanceof SchemeValue.BuiltinVal
-                || args[0] instanceof SchemeValue.CaseLambdaVal);
+                || args[0] instanceof SchemeValue.CaseLambdaVal
+                || args[0] instanceof SchemeValue.ContinuationVal);
         }));
 
         // L05 builtins
@@ -365,8 +402,8 @@ public class Interpreter {
             return new SchemeValue.CharVal((char) n);
         }));
 
-        // L08 builtins
-        globals.define("apply", new SchemeValue.BuiltinVal("apply", this::applyProc));
+        // L08 builtins — apply is handled specially in CEK
+        globals.define("apply", APPLY_MARKER);
 
         // L09 builtins
         globals.define("abs", new SchemeValue.BuiltinVal("abs", args -> {
@@ -389,9 +426,7 @@ public class Interpreter {
             if (args.length != 2) throw new EvalError("quotient: expected 2 arguments");
             long a = asLong(args[0]), b = asLong(args[1]);
             if (b == 0) throw new EvalError("quotient: division by zero");
-            long q = a / b;
-            // Truncate toward zero (Java's default for long division)
-            return new SchemeValue.IntVal(q);
+            return new SchemeValue.IntVal(a / b);
         }));
         globals.define("min", new SchemeValue.BuiltinVal("min", args -> {
             if (args.length == 0) throw new EvalError("min: need at least one argument");
@@ -463,7 +498,6 @@ public class Interpreter {
         }));
         globals.define("list?", new SchemeValue.BuiltinVal("list?", args -> {
             if (args.length != 1) throw new EvalError("list?: expected 1 argument");
-            // Tortoise-and-hare cycle detection
             SchemeValue slow = args[0];
             SchemeValue fast = args[0];
             while (fast instanceof SchemeValue.PairVal fp) {
@@ -474,7 +508,7 @@ public class Interpreter {
                     return new SchemeValue.BoolVal(fast instanceof SchemeValue.ListVal l && l.elements().isEmpty());
                 }
                 slow = ((SchemeValue.PairVal) slow).cdr();
-                if (slow == fast) return new SchemeValue.BoolVal(false); // cycle
+                if (slow == fast) return new SchemeValue.BoolVal(false);
             }
             return new SchemeValue.BoolVal(fast instanceof SchemeValue.ListVal l && l.elements().isEmpty());
         }));
@@ -725,7 +759,6 @@ public class Interpreter {
             if (args.length < 2) throw new EvalError("map: expected at least 2 arguments");
             var proc = args[0];
             if (args.length == 2) {
-                // Single list
                 var result = new ArrayList<SchemeValue>();
                 SchemeValue cur = args[1];
                 while (cur instanceof SchemeValue.PairVal p) {
@@ -737,12 +770,10 @@ public class Interpreter {
                     out = new SchemeValue.PairVal(result.get(i), out);
                 return out;
             } else {
-                // Multi-list
                 SchemeValue[] lists = new SchemeValue[args.length - 1];
                 for (int i = 0; i < lists.length; i++) lists[i] = args[i + 1];
                 var result = new ArrayList<SchemeValue>();
                 while (true) {
-                    // Check if any list is exhausted
                     boolean allPairs = true;
                     for (var l : lists) {
                         if (!(l instanceof SchemeValue.PairVal)) { allPairs = false; break; }
@@ -842,7 +873,7 @@ public class Interpreter {
             return new SchemeValue.StringVal(s.value().toLowerCase());
         }));
 
-        // L11 builtins — exact arithmetic & rationals
+        // L11 builtins
         globals.define("exact?", new SchemeValue.BuiltinVal("exact?", args -> {
             if (args.length != 1) throw new EvalError("exact?: expected 1 argument");
             return new SchemeValue.BoolVal(args[0] instanceof SchemeValue.IntVal || args[0] instanceof SchemeValue.RationalVal);
@@ -897,6 +928,34 @@ public class Interpreter {
             if (args[0] instanceof SchemeValue.RationalVal r) return new SchemeValue.IntVal(r.den());
             throw new EvalError("denominator: expected rational");
         }));
+
+        // L18: call/cc
+        globals.define("call/cc", CALL_CC_MARKER);
+        globals.define("call-with-current-continuation", CALL_CC_MARKER);
+    }
+
+    // ---- CEK evaluation engine ----
+
+    // Track the last list expression being evaluated for error position reporting
+    private SchemeValue lastExpr;
+
+    private SchemeValue runCekLoop() throws EvalError {
+        while (true) {
+            if (cIsValue) {
+                if (cK instanceof Cont.Halt) return cControl;
+                try {
+                    ((Cont.Frame) cK).handler().apply(cControl);
+                } catch (EvalError e) {
+                    if (positions != null && lastExpr != null && !e.getMessage().matches(".*\\d+:\\d+.*")) {
+                        var pos = positions.get(lastExpr);
+                        if (pos != null) throw new EvalError(pos + ": " + e.getMessage());
+                    }
+                    throw e;
+                }
+            } else {
+                step();
+            }
+        }
     }
 
     public SchemeValue eval(SchemeValue expr) throws EvalError {
@@ -904,98 +963,117 @@ public class Interpreter {
     }
 
     public SchemeValue eval(SchemeValue expr, Environment env) throws EvalError {
-        while (true) {
-            SchemeValue result = evalStep(expr, env);
-            if (result instanceof SchemeValue.TailCall tc) {
-                expr = tc.expr();
-                env = tc.env();
-            } else {
-                return result;
-            }
+        var saved = saveCek();
+        cekEval(expr, env, new Cont.Halt());
+        try {
+            return runCekLoop();
+        } finally {
+            restoreCek(saved);
         }
     }
 
-    private SchemeValue evalStep(SchemeValue expr, Environment env) throws EvalError {
+    /** Evaluate a sequence of top-level expressions in a single CEK loop (for call/cc support). */
+    public SchemeValue evalAll(List<SchemeValue> exprs, Environment env) throws EvalError {
+        if (exprs.isEmpty()) return new SchemeValue.VoidVal();
+        if (exprs.size() == 1) return eval(exprs.get(0), env);
+        var saved = saveCek();
+        setupSequence(exprs, 0, env, new Cont.Halt());
         try {
-            return switch (expr) {
-                case SchemeValue.IntVal v -> v;
-                case SchemeValue.BoolVal v -> v;
-                case SchemeValue.StringVal v -> v;
-                case SchemeValue.VoidVal v -> v;
-                case SchemeValue.LambdaVal v -> v;
-                case SchemeValue.BuiltinVal v -> v;
-                case SchemeValue.CharVal v -> v;
-                case SchemeValue.DoubleVal v -> v;
-                case SchemeValue.RationalVal v -> v;
-                case SchemeValue.PairVal v -> v;
-                case SchemeValue.MacroVal v -> v;
-                case SchemeValue.RecordVal v -> v;
-                case SchemeValue.CaseLambdaVal v -> v;
-                case SchemeValue.VectorVal v -> v;
-                case SchemeValue.TailCall tc -> tc;
-                case SchemeValue.SymbolVal v -> env.get(v.name());
-                case SchemeValue.ListVal v -> evalList(v, env);
-            };
+            return runCekLoop();
+        } finally {
+            restoreCek(saved);
+        }
+    }
+
+    // ---- CEK step: evaluate current control expression ----
+
+    private void step() throws EvalError {
+        SchemeValue expr = cControl;
+        Environment env = cEnv;
+        Cont k = cK;
+
+        try {
+            switch (expr) {
+                case SchemeValue.IntVal v -> cekReturn(v, k);
+                case SchemeValue.BoolVal v -> cekReturn(v, k);
+                case SchemeValue.StringVal v -> cekReturn(v, k);
+                case SchemeValue.VoidVal v -> cekReturn(v, k);
+                case SchemeValue.LambdaVal v -> cekReturn(v, k);
+                case SchemeValue.BuiltinVal v -> cekReturn(v, k);
+                case SchemeValue.CharVal v -> cekReturn(v, k);
+                case SchemeValue.DoubleVal v -> cekReturn(v, k);
+                case SchemeValue.RationalVal v -> cekReturn(v, k);
+                case SchemeValue.PairVal v -> cekReturn(v, k);
+                case SchemeValue.MacroVal v -> cekReturn(v, k);
+                case SchemeValue.RecordVal v -> cekReturn(v, k);
+                case SchemeValue.CaseLambdaVal v -> cekReturn(v, k);
+                case SchemeValue.VectorVal v -> cekReturn(v, k);
+                case SchemeValue.ContinuationVal v -> cekReturn(v, k);
+                case SchemeValue.TailCall tc -> cekEval(tc.expr(), tc.env(), k);
+                case SchemeValue.SymbolVal v -> cekReturn(env.get(v.name()), k);
+                case SchemeValue.ListVal v -> stepList(v, env, k);
+            }
         } catch (EvalError e) {
             if (positions != null && !e.getMessage().matches(".*\\d+:\\d+.*")) {
                 var pos = positions.get(expr);
-                if (pos != null) {
-                    throw new EvalError(pos + ": " + e.getMessage());
-                }
+                if (pos != null) throw new EvalError(pos + ": " + e.getMessage());
             }
             throw e;
         }
     }
 
-    private SchemeValue evalList(SchemeValue.ListVal list, Environment env) throws EvalError {
+    private void stepList(SchemeValue.ListVal list, Environment env, Cont k) throws EvalError {
+        lastExpr = list;
         if (list.elements().isEmpty()) throw new EvalError("empty application");
 
         var first = list.elements().get(0);
         if (first instanceof SchemeValue.SymbolVal sym) {
-            return switch (sym.name()) {
-                case "define" -> evalDefine(list.elements(), env);
-                case "define-syntax" -> evalDefineSyntax(list.elements(), env);
-                case "define-record-type" -> evalDefineRecordType(list.elements(), env);
-                case "if" -> evalIf(list.elements(), env);
-                case "quote" -> evalQuote(list.elements());
-                case "lambda" -> evalLambda(list.elements(), env);
-                case "case-lambda" -> evalCaseLambda(list.elements(), env);
-                case "and" -> evalAnd(list.elements(), env);
-                case "or" -> evalOr(list.elements(), env);
-                case "let" -> evalLet(list.elements(), env);
-                case "let*" -> evalLetStar(list.elements(), env);
-                case "when" -> evalWhen(list.elements(), env);
-                case "unless" -> evalUnless(list.elements(), env);
-                case "begin" -> evalBegin(list.elements(), env);
-                case "cond" -> evalCond(list.elements(), env);
-                case "set!" -> evalSet(list.elements(), env);
-                case "letrec" -> evalLetrec(list.elements(), env);
-                case "letrec*" -> evalLetrecStar(list.elements(), env);
-                case "case" -> evalCase(list.elements(), env);
-                case "do" -> evalDo(list.elements(), env);
+            switch (sym.name()) {
+                case "define" -> { stepDefine(list.elements(), env, k); return; }
+                case "define-syntax" -> { cekReturn(evalDefineSyntax(list.elements(), env), k); return; }
+                case "define-record-type" -> { cekReturn(evalDefineRecordType(list.elements(), env), k); return; }
+                case "if" -> { stepIf(list.elements(), env, k); return; }
+                case "quote" -> { cekReturn(evalQuote(list.elements()), k); return; }
+                case "lambda" -> { cekReturn(evalLambda(list.elements(), env), k); return; }
+                case "case-lambda" -> { cekReturn(evalCaseLambda(list.elements(), env), k); return; }
+                case "and" -> { stepAnd(list.elements(), 1, env, k); return; }
+                case "or" -> { stepOr(list.elements(), 1, env, k); return; }
+                case "let" -> { stepLet(list.elements(), env, k); return; }
+                case "let*" -> { stepLetStar(list.elements(), env, k); return; }
+                case "when" -> { stepWhen(list.elements(), env, k); return; }
+                case "unless" -> { stepUnless(list.elements(), env, k); return; }
+                case "begin" -> { stepBegin(list.elements(), env, k); return; }
+                case "cond" -> { stepCond(list.elements(), 1, env, k); return; }
+                case "set!" -> { stepSet(list.elements(), env, k); return; }
+                case "letrec" -> { stepLetrec(list.elements(), env, k); return; }
+                case "letrec*" -> { stepLetrecStar(list.elements(), env, k); return; }
+                case "case" -> { stepCase(list.elements(), env, k); return; }
+                case "do" -> { stepDo(list.elements(), env, k); return; }
                 default -> {
                     SchemeValue resolved = null;
                     try { resolved = env.get(sym.name()); } catch (EvalError e) { /* not bound */ }
                     if (resolved instanceof SchemeValue.MacroVal macro) {
-                        yield evalMacroExpansion(macro, list, env);
+                        stepMacroExpansion(macro, list, env, k);
+                        return;
                     }
-                    yield evalApplication(list.elements(), env);
                 }
-            };
+            }
         }
-        return evalApplication(list.elements(), env);
+        stepApplication(list.elements(), env, k);
     }
 
-    private SchemeValue evalDefine(List<SchemeValue> elements, Environment env) throws EvalError {
+    // ---- Special forms (CEK-style) ----
+
+    private void stepDefine(List<SchemeValue> elements, Environment env, Cont k) throws EvalError {
         if (elements.size() < 3) throw new EvalError("define: bad syntax");
         var target = elements.get(1);
         if (target instanceof SchemeValue.SymbolVal sym) {
-            var val = eval(elements.get(2), env);
-            env.define(sym.name(), val);
-            return new SchemeValue.VoidVal();
+            cekEval(elements.get(2), env, new Cont.Frame(val -> {
+                env.define(sym.name(), val);
+                cekReturn(new SchemeValue.VoidVal(), k);
+            }));
         } else if (target instanceof SchemeValue.ListVal nameAndParams) {
-            if (nameAndParams.elements().isEmpty())
-                throw new EvalError("define: bad syntax");
+            if (nameAndParams.elements().isEmpty()) throw new EvalError("define: bad syntax");
             if (!(nameAndParams.elements().get(0) instanceof SchemeValue.SymbolVal fnName))
                 throw new EvalError("define: expected function name");
             var params = new ArrayList<String>();
@@ -1005,11 +1083,9 @@ public class Interpreter {
                 params.add(p.name());
             }
             var body = elements.subList(2, elements.size());
-            var lambda = new SchemeValue.LambdaVal(params, null, body, env);
-            env.define(fnName.name(), lambda);
-            return new SchemeValue.VoidVal();
+            env.define(fnName.name(), new SchemeValue.LambdaVal(params, null, body, env));
+            cekReturn(new SchemeValue.VoidVal(), k);
         } else if (target instanceof SchemeValue.PairVal pair) {
-            // Dotted pair: (define (name p1 p2 . rest) body)
             if (!(pair.car() instanceof SchemeValue.SymbolVal fnName))
                 throw new EvalError("define: expected function name");
             var params = new ArrayList<String>();
@@ -1021,268 +1097,177 @@ public class Interpreter {
                 params.add(s.name());
                 cur = p.cdr();
             }
-            if (cur instanceof SchemeValue.SymbolVal rest) {
-                restParam = rest.name();
-            } else if (!(cur instanceof SchemeValue.ListVal l && l.elements().isEmpty())) {
+            if (cur instanceof SchemeValue.SymbolVal rest) restParam = rest.name();
+            else if (!(cur instanceof SchemeValue.ListVal l && l.elements().isEmpty()))
                 throw new EvalError("define: bad syntax");
-            }
             var body = elements.subList(2, elements.size());
-            var lambda = new SchemeValue.LambdaVal(params, restParam, body, env);
-            env.define(fnName.name(), lambda);
-            return new SchemeValue.VoidVal();
+            env.define(fnName.name(), new SchemeValue.LambdaVal(params, restParam, body, env));
+            cekReturn(new SchemeValue.VoidVal(), k);
+        } else {
+            throw new EvalError("define: bad syntax");
         }
-        throw new EvalError("define: bad syntax");
     }
 
-    private SchemeValue evalIf(List<SchemeValue> elements, Environment env) throws EvalError {
+    private void stepIf(List<SchemeValue> elements, Environment env, Cont k) throws EvalError {
         if (elements.size() < 3) throw new EvalError("if: bad syntax");
-        var cond = eval(elements.get(1), env);
-        if (cond.isTruthy()) {
-            return new SchemeValue.TailCall(elements.get(2), env);
-        } else if (elements.size() > 3) {
-            return new SchemeValue.TailCall(elements.get(3), env);
-        }
-        return new SchemeValue.VoidVal();
+        var thenExpr = elements.get(2);
+        var hasElse = elements.size() > 3;
+        var elseExpr = hasElse ? elements.get(3) : null;
+        cekEval(elements.get(1), env, new Cont.Frame(condVal -> {
+            if (condVal.isTruthy()) cekEval(thenExpr, env, k);
+            else if (hasElse) cekEval(elseExpr, env, k);
+            else cekReturn(new SchemeValue.VoidVal(), k);
+        }));
     }
 
-    private SchemeValue evalQuote(List<SchemeValue> elements) throws EvalError {
-        if (elements.size() != 2) throw new EvalError("quote: expected 1 argument");
-        return quoteDatum(elements.get(1));
+    private void stepAnd(List<SchemeValue> elements, int index, Environment env, Cont k) throws EvalError {
+        if (index >= elements.size()) { cekReturn(new SchemeValue.BoolVal(true), k); return; }
+        if (index == elements.size() - 1) { cekEval(elements.get(index), env, k); return; }
+        cekEval(elements.get(index), env, new Cont.Frame(val -> {
+            if (!val.isTruthy()) cekReturn(val, k);
+            else stepAnd(elements, index + 1, env, k);
+        }));
     }
 
-    /** Convert reader ListVal to pair chains for quoted data. */
-    private SchemeValue quoteDatum(SchemeValue datum) {
-        if (datum instanceof SchemeValue.ListVal l) {
-            if (l.elements().isEmpty()) return NIL;
-            SchemeValue result = NIL;
-            for (int i = l.elements().size() - 1; i >= 0; i--) {
-                result = new SchemeValue.PairVal(quoteDatum(l.elements().get(i)), result);
-            }
-            return result;
-        }
-        if (datum instanceof SchemeValue.PairVal p) {
-            return new SchemeValue.PairVal(quoteDatum(p.car()), quoteDatum(p.cdr()));
-        }
-        return datum;
+    private void stepOr(List<SchemeValue> elements, int index, Environment env, Cont k) throws EvalError {
+        if (index >= elements.size()) { cekReturn(new SchemeValue.BoolVal(false), k); return; }
+        if (index == elements.size() - 1) { cekEval(elements.get(index), env, k); return; }
+        cekEval(elements.get(index), env, new Cont.Frame(val -> {
+            if (val.isTruthy()) cekReturn(val, k);
+            else stepOr(elements, index + 1, env, k);
+        }));
     }
 
-    private SchemeValue evalLambda(List<SchemeValue> elements, Environment env) throws EvalError {
-        if (elements.size() < 3) throw new EvalError("lambda: bad syntax");
-        var paramList = elements.get(1);
-        if (paramList instanceof SchemeValue.SymbolVal sym) {
-            // (lambda args body) — all args collected into single rest param
-            var body = elements.subList(2, elements.size());
-            return new SchemeValue.LambdaVal(List.of(), sym.name(), body, env);
-        }
-        if (paramList instanceof SchemeValue.PairVal pair) {
-            // Dotted pair: (lambda (p1 p2 . rest) body)
-            var params = new ArrayList<String>();
-            String restParam = null;
-            SchemeValue cur = pair;
-            while (cur instanceof SchemeValue.PairVal p) {
-                if (!(p.car() instanceof SchemeValue.SymbolVal s))
-                    throw new EvalError("lambda: expected parameter name");
-                params.add(s.name());
-                cur = p.cdr();
-            }
-            if (cur instanceof SchemeValue.SymbolVal rest) {
-                restParam = rest.name();
-            }
-            var body = elements.subList(2, elements.size());
-            return new SchemeValue.LambdaVal(params, restParam, body, env);
-        }
-        if (!(paramList instanceof SchemeValue.ListVal pl))
-            throw new EvalError("lambda: expected parameter list");
-        var params = new ArrayList<String>();
-        for (var p : pl.elements()) {
-            if (!(p instanceof SchemeValue.SymbolVal sym))
-                throw new EvalError("lambda: expected parameter name");
-            params.add(sym.name());
-        }
-        var body = elements.subList(2, elements.size());
-        return new SchemeValue.LambdaVal(params, null, body, env);
+    private void stepBegin(List<SchemeValue> elements, Environment env, Cont k) throws EvalError {
+        if (elements.size() == 1) { cekReturn(new SchemeValue.VoidVal(), k); return; }
+        setupSequence(elements, 1, env, k);
     }
 
-    private SchemeValue evalCaseLambda(List<SchemeValue> elements, Environment env) throws EvalError {
-        var clauses = new ArrayList<SchemeValue.LambdaVal>();
-        for (int i = 1; i < elements.size(); i++) {
-            if (!(elements.get(i) instanceof SchemeValue.ListVal clause) || clause.elements().size() < 2)
-                throw new EvalError("case-lambda: bad clause");
-            // Build a lambda for each clause by wrapping as (lambda params body...)
-            var lambdaElements = new ArrayList<SchemeValue>();
-            lambdaElements.add(new SchemeValue.SymbolVal("lambda"));
-            lambdaElements.addAll(clause.elements());
-            var lambda = evalLambda(lambdaElements, env);
-            clauses.add((SchemeValue.LambdaVal) lambda);
-        }
-        return new SchemeValue.CaseLambdaVal(clauses);
+    private void setupSequence(List<SchemeValue> exprs, int start, Environment env, Cont k) {
+        if (start >= exprs.size()) { cekReturn(new SchemeValue.VoidVal(), k); return; }
+        if (start == exprs.size() - 1) { cekEval(exprs.get(start), env, k); return; }
+        cekEval(exprs.get(start), env, new Cont.Frame(val -> {
+            setupSequence(exprs, start + 1, env, k);
+        }));
     }
 
-    private SchemeValue evalAnd(List<SchemeValue> elements, Environment env) throws EvalError {
-        if (elements.size() == 1) return new SchemeValue.BoolVal(true);
-        for (int i = 1; i < elements.size() - 1; i++) {
-            var result = eval(elements.get(i), env);
-            if (!result.isTruthy()) return result;
-        }
-        return new SchemeValue.TailCall(elements.get(elements.size() - 1), env);
+    private void stepSet(List<SchemeValue> elements, Environment env, Cont k) throws EvalError {
+        if (elements.size() != 3) throw new EvalError("set!: bad syntax");
+        if (!(elements.get(1) instanceof SchemeValue.SymbolVal sym))
+            throw new EvalError("set!: expected symbol");
+        cekEval(elements.get(2), env, new Cont.Frame(val -> {
+            env.set(sym.name(), val);
+            cekReturn(new SchemeValue.VoidVal(), k);
+        }));
     }
 
-    private SchemeValue evalOr(List<SchemeValue> elements, Environment env) throws EvalError {
-        if (elements.size() == 1) return new SchemeValue.BoolVal(false);
-        for (int i = 1; i < elements.size() - 1; i++) {
-            var result = eval(elements.get(i), env);
-            if (result.isTruthy()) return result;
-        }
-        return new SchemeValue.TailCall(elements.get(elements.size() - 1), env);
-    }
-
-    private SchemeValue evalLet(List<SchemeValue> elements, Environment env) throws EvalError {
+    private void stepLet(List<SchemeValue> elements, Environment env, Cont k) throws EvalError {
         if (elements.size() < 3) throw new EvalError("let: bad syntax");
-
-        // Named let: (let name ((var init) ...) body ...)
         if (elements.get(1) instanceof SchemeValue.SymbolVal loopName) {
-            if (elements.size() < 4) throw new EvalError("let: bad syntax");
-            if (!(elements.get(2) instanceof SchemeValue.ListVal bl))
-                throw new EvalError("let: expected bindings list");
-            var params = new ArrayList<String>();
-            var initVals = new ArrayList<SchemeValue>();
-            for (var binding : bl.elements()) {
-                if (!(binding instanceof SchemeValue.ListVal b) || b.elements().size() != 2)
-                    throw new EvalError("let: bad binding");
-                if (!(b.elements().get(0) instanceof SchemeValue.SymbolVal name))
-                    throw new EvalError("let: expected symbol in binding");
-                params.add(name.name());
-                initVals.add(eval(b.elements().get(1), env));
-            }
-            var body = elements.subList(3, elements.size());
-            var letEnv = new Environment(env);
-            var lambda = new SchemeValue.LambdaVal(params, null, body, letEnv);
-            letEnv.define(loopName.name(), lambda);
-            // Call with initial values
-            var callEnv = new Environment(letEnv);
-            for (int i = 0; i < params.size(); i++) {
-                callEnv.define(params.get(i), initVals.get(i));
-            }
-            for (int i = 0; i < body.size() - 1; i++) {
-                eval(body.get(i), callEnv);
-            }
-            return new SchemeValue.TailCall(body.get(body.size() - 1), callEnv);
+            stepNamedLet(elements, loopName, env, k);
+            return;
         }
-
-        // Regular let: (let ((var init) ...) body ...)
-        var bindings = elements.get(1);
-        if (!(bindings instanceof SchemeValue.ListVal bl))
+        if (!(elements.get(1) instanceof SchemeValue.ListVal bl))
             throw new EvalError("let: expected bindings list");
-        var letEnv = new Environment(env);
+        var names = new ArrayList<String>();
+        var inits = new ArrayList<SchemeValue>();
         for (var binding : bl.elements()) {
             if (!(binding instanceof SchemeValue.ListVal b) || b.elements().size() != 2)
                 throw new EvalError("let: bad binding");
             if (!(b.elements().get(0) instanceof SchemeValue.SymbolVal name))
                 throw new EvalError("let: expected symbol in binding");
-            var val = eval(b.elements().get(1), env);
-            letEnv.define(name.name(), val);
+            names.add(name.name());
+            inits.add(b.elements().get(1));
         }
-        for (int i = 2; i < elements.size() - 1; i++) {
-            eval(elements.get(i), letEnv);
-        }
-        return new SchemeValue.TailCall(elements.get(elements.size() - 1), letEnv);
+        var body = elements.subList(2, elements.size());
+        evalLetBindings(names, inits, 0, new ArrayList<>(), body, env, k);
     }
 
-    private SchemeValue evalLetStar(List<SchemeValue> elements, Environment env) throws EvalError {
-        if (elements.size() < 3) throw new EvalError("let*: bad syntax");
-        var bindings = elements.get(1);
-        if (!(bindings instanceof SchemeValue.ListVal bl))
-            throw new EvalError("let*: expected bindings list");
-        var letEnv = new Environment(env);
+    private void evalLetBindings(List<String> names, List<SchemeValue> inits, int index,
+                                  List<SchemeValue> vals, List<SchemeValue> body,
+                                  Environment outerEnv, Cont k) throws EvalError {
+        if (index >= inits.size()) {
+            var letEnv = new Environment(outerEnv);
+            for (int i = 0; i < names.size(); i++) letEnv.define(names.get(i), vals.get(i));
+            setupSequence(body, 0, letEnv, k);
+            return;
+        }
+        final var snapshot = List.copyOf(vals);
+        cekEval(inits.get(index), outerEnv, new Cont.Frame(val -> {
+            var newVals = new ArrayList<>(snapshot);
+            newVals.add(val);
+            evalLetBindings(names, inits, index + 1, newVals, body, outerEnv, k);
+        }));
+    }
+
+    private void stepNamedLet(List<SchemeValue> elements, SchemeValue.SymbolVal loopName,
+                               Environment env, Cont k) throws EvalError {
+        if (elements.size() < 4) throw new EvalError("let: bad syntax");
+        if (!(elements.get(2) instanceof SchemeValue.ListVal bl))
+            throw new EvalError("let: expected bindings list");
+        var params = new ArrayList<String>();
+        var initExprs = new ArrayList<SchemeValue>();
         for (var binding : bl.elements()) {
             if (!(binding instanceof SchemeValue.ListVal b) || b.elements().size() != 2)
-                throw new EvalError("let*: bad binding");
+                throw new EvalError("let: bad binding");
             if (!(b.elements().get(0) instanceof SchemeValue.SymbolVal name))
-                throw new EvalError("let*: expected symbol in binding");
-            var val = eval(b.elements().get(1), letEnv);
+                throw new EvalError("let: expected symbol in binding");
+            params.add(name.name());
+            initExprs.add(b.elements().get(1));
+        }
+        var body = elements.subList(3, elements.size());
+        var letEnv = new Environment(env);
+        var lambda = new SchemeValue.LambdaVal(params, null, body, letEnv);
+        letEnv.define(loopName.name(), lambda);
+        evalNamedLetInits(initExprs, 0, new ArrayList<>(), lambda, env, k);
+    }
+
+    private void evalNamedLetInits(List<SchemeValue> inits, int index, List<SchemeValue> vals,
+                                    SchemeValue.LambdaVal lambda, Environment env, Cont k) throws EvalError {
+        if (index >= inits.size()) {
+            applyLambdaCek(lambda, vals.toArray(new SchemeValue[0]), k);
+            return;
+        }
+        final var snapshot = List.copyOf(vals);
+        cekEval(inits.get(index), env, new Cont.Frame(val -> {
+            var newVals = new ArrayList<>(snapshot);
+            newVals.add(val);
+            evalNamedLetInits(inits, index + 1, newVals, lambda, env, k);
+        }));
+    }
+
+    private void stepLetStar(List<SchemeValue> elements, Environment env, Cont k) throws EvalError {
+        if (elements.size() < 3) throw new EvalError("let*: bad syntax");
+        if (!(elements.get(1) instanceof SchemeValue.ListVal bl))
+            throw new EvalError("let*: expected bindings list");
+        var letEnv = new Environment(env);
+        var body = elements.subList(2, elements.size());
+        evalLetStarBindings(bl.elements(), 0, letEnv, body, k);
+    }
+
+    private void evalLetStarBindings(List<SchemeValue> bindings, int index, Environment letEnv,
+                                      List<SchemeValue> body, Cont k) throws EvalError {
+        if (index >= bindings.size()) {
+            setupSequence(body, 0, letEnv, k);
+            return;
+        }
+        if (!(bindings.get(index) instanceof SchemeValue.ListVal b) || b.elements().size() != 2)
+            throw new EvalError("let*: bad binding");
+        if (!(b.elements().get(0) instanceof SchemeValue.SymbolVal name))
+            throw new EvalError("let*: expected symbol in binding");
+        cekEval(b.elements().get(1), letEnv, new Cont.Frame(val -> {
             letEnv.define(name.name(), val);
-        }
-        for (int i = 2; i < elements.size() - 1; i++) {
-            eval(elements.get(i), letEnv);
-        }
-        return new SchemeValue.TailCall(elements.get(elements.size() - 1), letEnv);
+            evalLetStarBindings(bindings, index + 1, letEnv, body, k);
+        }));
     }
 
-    private SchemeValue evalWhen(List<SchemeValue> elements, Environment env) throws EvalError {
-        if (elements.size() < 3) throw new EvalError("when: bad syntax");
-        var test = eval(elements.get(1), env);
-        if (test.isTruthy()) {
-            for (int i = 2; i < elements.size() - 1; i++) {
-                eval(elements.get(i), env);
-            }
-            return new SchemeValue.TailCall(elements.get(elements.size() - 1), env);
-        }
-        return new SchemeValue.VoidVal();
-    }
-
-    private SchemeValue evalUnless(List<SchemeValue> elements, Environment env) throws EvalError {
-        if (elements.size() < 3) throw new EvalError("unless: bad syntax");
-        var test = eval(elements.get(1), env);
-        if (!test.isTruthy()) {
-            for (int i = 2; i < elements.size() - 1; i++) {
-                eval(elements.get(i), env);
-            }
-            return new SchemeValue.TailCall(elements.get(elements.size() - 1), env);
-        }
-        return new SchemeValue.VoidVal();
-    }
-
-    private SchemeValue evalBegin(List<SchemeValue> elements, Environment env) throws EvalError {
-        if (elements.size() == 1) return new SchemeValue.VoidVal();
-        for (int i = 1; i < elements.size() - 1; i++) {
-            eval(elements.get(i), env);
-        }
-        return new SchemeValue.TailCall(elements.get(elements.size() - 1), env);
-    }
-
-    private SchemeValue evalCond(List<SchemeValue> elements, Environment env) throws EvalError {
-        for (int i = 1; i < elements.size(); i++) {
-            var clause = elements.get(i);
-            if (!(clause instanceof SchemeValue.ListVal cl) || cl.elements().isEmpty())
-                throw new EvalError("cond: bad clause");
-            var test = cl.elements().get(0);
-            if (test instanceof SchemeValue.SymbolVal sym && sym.name().equals("else")) {
-                for (int j = 1; j < cl.elements().size() - 1; j++) {
-                    eval(cl.elements().get(j), env);
-                }
-                if (cl.elements().size() > 1) {
-                    return new SchemeValue.TailCall(cl.elements().get(cl.elements().size() - 1), env);
-                }
-                return new SchemeValue.VoidVal();
-            }
-            var testVal = eval(test, env);
-            if (testVal.isTruthy()) {
-                if (cl.elements().size() == 1) return testVal;
-                for (int j = 1; j < cl.elements().size() - 1; j++) {
-                    eval(cl.elements().get(j), env);
-                }
-                return new SchemeValue.TailCall(cl.elements().get(cl.elements().size() - 1), env);
-            }
-        }
-        return new SchemeValue.VoidVal();
-    }
-
-    private SchemeValue evalSet(List<SchemeValue> elements, Environment env) throws EvalError {
-        if (elements.size() != 3) throw new EvalError("set!: bad syntax");
-        if (!(elements.get(1) instanceof SchemeValue.SymbolVal sym))
-            throw new EvalError("set!: expected symbol");
-        var val = eval(elements.get(2), env);
-        env.set(sym.name(), val);
-        return new SchemeValue.VoidVal();
-    }
-
-    private SchemeValue evalLetrec(List<SchemeValue> elements, Environment env) throws EvalError {
+    private void stepLetrec(List<SchemeValue> elements, Environment env, Cont k) throws EvalError {
         if (elements.size() < 3) throw new EvalError("letrec: bad syntax");
         if (!(elements.get(1) instanceof SchemeValue.ListVal bl))
             throw new EvalError("letrec: expected bindings list");
         var letEnv = new Environment(env);
-        // First, define all variables as void (so they're all visible)
         var names = new ArrayList<String>();
+        var initExprs = new ArrayList<SchemeValue>();
         for (var binding : bl.elements()) {
             if (!(binding instanceof SchemeValue.ListVal b) || b.elements().size() != 2)
                 throw new EvalError("letrec: bad binding");
@@ -1290,25 +1275,29 @@ public class Interpreter {
                 throw new EvalError("letrec: expected symbol in binding");
             names.add(name.name());
             letEnv.define(name.name(), new SchemeValue.VoidVal());
+            initExprs.add(b.elements().get(1));
         }
-        // Now evaluate inits in the letrec env (all bindings visible)
-        for (int i = 0; i < bl.elements().size(); i++) {
-            var b = (SchemeValue.ListVal) bl.elements().get(i);
-            var val = eval(b.elements().get(1), letEnv);
-            letEnv.set(names.get(i), val);
-        }
-        for (int i = 2; i < elements.size() - 1; i++) {
-            eval(elements.get(i), letEnv);
-        }
-        return new SchemeValue.TailCall(elements.get(elements.size() - 1), letEnv);
+        var body = elements.subList(2, elements.size());
+        evalLetrecBindings(names, initExprs, 0, letEnv, body, k);
     }
 
-    private SchemeValue evalLetrecStar(List<SchemeValue> elements, Environment env) throws EvalError {
+    private void evalLetrecBindings(List<String> names, List<SchemeValue> inits, int index,
+                                     Environment letEnv, List<SchemeValue> body, Cont k) throws EvalError {
+        if (index >= inits.size()) {
+            setupSequence(body, 0, letEnv, k);
+            return;
+        }
+        cekEval(inits.get(index), letEnv, new Cont.Frame(val -> {
+            letEnv.set(names.get(index), val);
+            evalLetrecBindings(names, inits, index + 1, letEnv, body, k);
+        }));
+    }
+
+    private void stepLetrecStar(List<SchemeValue> elements, Environment env, Cont k) throws EvalError {
         if (elements.size() < 3) throw new EvalError("letrec*: bad syntax");
         if (!(elements.get(1) instanceof SchemeValue.ListVal bl))
             throw new EvalError("letrec*: expected bindings list");
         var letEnv = new Environment(env);
-        // Define all as void first
         for (var binding : bl.elements()) {
             if (!(binding instanceof SchemeValue.ListVal b) || b.elements().size() != 2)
                 throw new EvalError("letrec*: bad binding");
@@ -1316,145 +1305,274 @@ public class Interpreter {
                 throw new EvalError("letrec*: expected symbol in binding");
             letEnv.define(name.name(), new SchemeValue.VoidVal());
         }
-        // Evaluate sequentially, each init sees previous values
-        for (var binding : bl.elements()) {
-            var b = (SchemeValue.ListVal) binding;
-            var name = ((SchemeValue.SymbolVal) b.elements().get(0)).name();
-            var val = eval(b.elements().get(1), letEnv);
+        var body = elements.subList(2, elements.size());
+        evalLetrecStarBindings(bl.elements(), 0, letEnv, body, k);
+    }
+
+    private void evalLetrecStarBindings(List<SchemeValue> bindings, int index, Environment letEnv,
+                                         List<SchemeValue> body, Cont k) throws EvalError {
+        if (index >= bindings.size()) {
+            setupSequence(body, 0, letEnv, k);
+            return;
+        }
+        var b = (SchemeValue.ListVal) bindings.get(index);
+        var name = ((SchemeValue.SymbolVal) b.elements().get(0)).name();
+        cekEval(b.elements().get(1), letEnv, new Cont.Frame(val -> {
             letEnv.set(name, val);
-        }
-        for (int i = 2; i < elements.size() - 1; i++) {
-            eval(elements.get(i), letEnv);
-        }
-        return new SchemeValue.TailCall(elements.get(elements.size() - 1), letEnv);
+            evalLetrecStarBindings(bindings, index + 1, letEnv, body, k);
+        }));
     }
 
-    private SchemeValue evalCase(List<SchemeValue> elements, Environment env) throws EvalError {
+    private void stepWhen(List<SchemeValue> elements, Environment env, Cont k) throws EvalError {
+        if (elements.size() < 3) throw new EvalError("when: bad syntax");
+        var body = elements.subList(2, elements.size());
+        cekEval(elements.get(1), env, new Cont.Frame(testVal -> {
+            if (testVal.isTruthy()) setupSequence(body, 0, env, k);
+            else cekReturn(new SchemeValue.VoidVal(), k);
+        }));
+    }
+
+    private void stepUnless(List<SchemeValue> elements, Environment env, Cont k) throws EvalError {
+        if (elements.size() < 3) throw new EvalError("unless: bad syntax");
+        var body = elements.subList(2, elements.size());
+        cekEval(elements.get(1), env, new Cont.Frame(testVal -> {
+            if (!testVal.isTruthy()) setupSequence(body, 0, env, k);
+            else cekReturn(new SchemeValue.VoidVal(), k);
+        }));
+    }
+
+    private void stepCond(List<SchemeValue> elements, int index, Environment env, Cont k) throws EvalError {
+        if (index >= elements.size()) { cekReturn(new SchemeValue.VoidVal(), k); return; }
+        var clause = elements.get(index);
+        if (!(clause instanceof SchemeValue.ListVal cl) || cl.elements().isEmpty())
+            throw new EvalError("cond: bad clause");
+        var test = cl.elements().get(0);
+        if (test instanceof SchemeValue.SymbolVal sym && sym.name().equals("else")) {
+            if (cl.elements().size() > 1) setupSequence(cl.elements(), 1, env, k);
+            else cekReturn(new SchemeValue.VoidVal(), k);
+            return;
+        }
+        var clauseBody = cl.elements().subList(1, cl.elements().size());
+        cekEval(test, env, new Cont.Frame(testVal -> {
+            if (testVal.isTruthy()) {
+                if (clauseBody.isEmpty()) cekReturn(testVal, k);
+                else setupSequence(clauseBody, 0, env, k);
+            } else {
+                stepCond(elements, index + 1, env, k);
+            }
+        }));
+    }
+
+    private void stepCase(List<SchemeValue> elements, Environment env, Cont k) throws EvalError {
         if (elements.size() < 2) throw new EvalError("case: bad syntax");
-        var key = eval(elements.get(1), env);
-        for (int i = 2; i < elements.size(); i++) {
-            if (!(elements.get(i) instanceof SchemeValue.ListVal clause) || clause.elements().isEmpty())
-                throw new EvalError("case: bad clause");
-            var datums = clause.elements().get(0);
-            // else clause
-            if (datums instanceof SchemeValue.SymbolVal sym && sym.name().equals("else")) {
-                for (int j = 1; j < clause.elements().size() - 1; j++) {
-                    eval(clause.elements().get(j), env);
-                }
-                if (clause.elements().size() > 1) {
-                    return new SchemeValue.TailCall(clause.elements().get(clause.elements().size() - 1), env);
-                }
-                return new SchemeValue.VoidVal();
-            }
-            // Normal clause: ((datum ...) expr ...)
-            if (!(datums instanceof SchemeValue.ListVal dl))
-                throw new EvalError("case: expected datum list");
-            for (var datum : dl.elements()) {
-                var qd = quoteDatum(datum);
-                if (schemeEq(key, qd)) {
-                    for (int j = 1; j < clause.elements().size() - 1; j++) {
-                        eval(clause.elements().get(j), env);
-                    }
-                    if (clause.elements().size() > 1) {
-                        return new SchemeValue.TailCall(clause.elements().get(clause.elements().size() - 1), env);
-                    }
-                    return new SchemeValue.VoidVal();
-                }
-            }
-        }
-        return new SchemeValue.VoidVal();
+        cekEval(elements.get(1), env, new Cont.Frame(key -> {
+            stepCaseClauses(key, elements, 2, env, k);
+        }));
     }
 
-    private SchemeValue evalDo(List<SchemeValue> elements, Environment env) throws EvalError {
-        // (do ((var init step) ...) (test expr ...) body ...)
+    private void stepCaseClauses(SchemeValue key, List<SchemeValue> elements, int index,
+                                  Environment env, Cont k) throws EvalError {
+        if (index >= elements.size()) { cekReturn(new SchemeValue.VoidVal(), k); return; }
+        if (!(elements.get(index) instanceof SchemeValue.ListVal clause) || clause.elements().isEmpty())
+            throw new EvalError("case: bad clause");
+        var datums = clause.elements().get(0);
+        if (datums instanceof SchemeValue.SymbolVal sym && sym.name().equals("else")) {
+            if (clause.elements().size() > 1) setupSequence(clause.elements(), 1, env, k);
+            else cekReturn(new SchemeValue.VoidVal(), k);
+            return;
+        }
+        if (!(datums instanceof SchemeValue.ListVal dl)) throw new EvalError("case: expected datum list");
+        for (var datum : dl.elements()) {
+            if (schemeEq(key, quoteDatum(datum))) {
+                if (clause.elements().size() > 1) setupSequence(clause.elements(), 1, env, k);
+                else cekReturn(new SchemeValue.VoidVal(), k);
+                return;
+            }
+        }
+        stepCaseClauses(key, elements, index + 1, env, k);
+    }
+
+    private void stepDo(List<SchemeValue> elements, Environment env, Cont k) throws EvalError {
         if (elements.size() < 3) throw new EvalError("do: bad syntax");
         if (!(elements.get(1) instanceof SchemeValue.ListVal varSpecs))
             throw new EvalError("do: expected variable specs");
         if (!(elements.get(2) instanceof SchemeValue.ListVal testClause) || testClause.elements().isEmpty())
             throw new EvalError("do: expected test clause");
-
-        // Parse variable specs
         var varNames = new ArrayList<String>();
-        var stepExprs = new ArrayList<SchemeValue>(); // null means no step
-        var doEnv = new Environment(env);
-
+        var initExprs = new ArrayList<SchemeValue>();
+        var stepExprs = new ArrayList<SchemeValue>();
         for (var spec : varSpecs.elements()) {
             if (!(spec instanceof SchemeValue.ListVal sl) || sl.elements().size() < 2)
                 throw new EvalError("do: bad variable spec");
             if (!(sl.elements().get(0) instanceof SchemeValue.SymbolVal name))
                 throw new EvalError("do: expected variable name");
             varNames.add(name.name());
-            var initVal = eval(sl.elements().get(1), env);
-            doEnv.define(name.name(), initVal);
+            initExprs.add(sl.elements().get(1));
             stepExprs.add(sl.elements().size() > 2 ? sl.elements().get(2) : null);
         }
+        var bodyExprs = elements.subList(3, elements.size());
+        evalDoInits(varNames, initExprs, stepExprs, testClause, bodyExprs, 0, new ArrayList<>(), env, k);
+    }
 
-        // Iterate
-        while (true) {
-            // Test
-            var testVal = eval(testClause.elements().get(0), doEnv);
+    private void evalDoInits(List<String> varNames, List<SchemeValue> initExprs, List<SchemeValue> stepExprs,
+                              SchemeValue.ListVal testClause, List<SchemeValue> bodyExprs,
+                              int index, List<SchemeValue> vals, Environment env, Cont k) throws EvalError {
+        if (index >= initExprs.size()) {
+            var doEnv = new Environment(env);
+            for (int i = 0; i < varNames.size(); i++) doEnv.define(varNames.get(i), vals.get(i));
+            doIteration(varNames, stepExprs, testClause, bodyExprs, doEnv, k);
+            return;
+        }
+        final var snapshot = List.copyOf(vals);
+        cekEval(initExprs.get(index), env, new Cont.Frame(val -> {
+            var newVals = new ArrayList<>(snapshot);
+            newVals.add(val);
+            evalDoInits(varNames, initExprs, stepExprs, testClause, bodyExprs, index + 1, newVals, env, k);
+        }));
+    }
+
+    private void doIteration(List<String> varNames, List<SchemeValue> stepExprs,
+                              SchemeValue.ListVal testClause, List<SchemeValue> bodyExprs,
+                              Environment doEnv, Cont k) throws EvalError {
+        cekEval(testClause.elements().get(0), doEnv, new Cont.Frame(testVal -> {
             if (testVal.isTruthy()) {
-                // Evaluate result expressions
-                if (testClause.elements().size() == 1) return new SchemeValue.VoidVal();
-                for (int i = 1; i < testClause.elements().size() - 1; i++) {
-                    eval(testClause.elements().get(i), doEnv);
-                }
-                return new SchemeValue.TailCall(testClause.elements().get(testClause.elements().size() - 1), doEnv);
+                if (testClause.elements().size() == 1) cekReturn(new SchemeValue.VoidVal(), k);
+                else setupSequence(testClause.elements(), 1, doEnv, k);
+            } else {
+                doBody(varNames, stepExprs, testClause, bodyExprs, 0, doEnv, k);
             }
+        }));
+    }
 
-            // Execute body
-            for (int i = 3; i < elements.size(); i++) {
-                eval(elements.get(i), doEnv);
-            }
+    private void doBody(List<String> varNames, List<SchemeValue> stepExprs,
+                         SchemeValue.ListVal testClause, List<SchemeValue> bodyExprs,
+                         int index, Environment doEnv, Cont k) throws EvalError {
+        if (index >= bodyExprs.size()) {
+            doStep(varNames, stepExprs, testClause, bodyExprs, 0, new ArrayList<>(), doEnv, k);
+            return;
+        }
+        cekEval(bodyExprs.get(index), doEnv, new Cont.Frame(val -> {
+            doBody(varNames, stepExprs, testClause, bodyExprs, index + 1, doEnv, k);
+        }));
+    }
 
-            // Parallel step: evaluate all step expressions before updating
-            var newVals = new SchemeValue[varNames.size()];
+    private void doStep(List<String> varNames, List<SchemeValue> stepExprs,
+                         SchemeValue.ListVal testClause, List<SchemeValue> bodyExprs,
+                         int index, List<SchemeValue> newVals, Environment doEnv, Cont k) throws EvalError {
+        if (index >= varNames.size()) {
             for (int i = 0; i < varNames.size(); i++) {
-                if (stepExprs.get(i) != null) {
-                    newVals[i] = eval(stepExprs.get(i), doEnv);
-                }
+                if (newVals.get(i) != null) doEnv.set(varNames.get(i), newVals.get(i));
             }
-            for (int i = 0; i < varNames.size(); i++) {
-                if (newVals[i] != null) {
-                    doEnv.set(varNames.get(i), newVals[i]);
-                }
-            }
+            doIteration(varNames, stepExprs, testClause, bodyExprs, doEnv, k);
+            return;
+        }
+        if (stepExprs.get(index) == null) {
+            var v = new ArrayList<>(newVals);
+            v.add(null);
+            doStep(varNames, stepExprs, testClause, bodyExprs, index + 1, v, doEnv, k);
+        } else {
+            final var snapshot = new ArrayList<>(newVals);
+            cekEval(stepExprs.get(index), doEnv, new Cont.Frame(val -> {
+                var fresh = new ArrayList<>(snapshot);
+                fresh.add(val);
+                doStep(varNames, stepExprs, testClause, bodyExprs, index + 1, fresh, doEnv, k);
+            }));
         }
     }
 
-    private SchemeValue evalApplication(List<SchemeValue> elements, Environment env) throws EvalError {
-        var proc = eval(elements.get(0), env);
-        var args = new SchemeValue[elements.size() - 1];
-        for (int i = 1; i < elements.size(); i++) {
-            args[i - 1] = eval(elements.get(i), env);
-        }
-        return applyTail(proc, args);
+    // ---- Application (CEK) ----
+
+    private void stepApplication(List<SchemeValue> elements, Environment env, Cont k) throws EvalError {
+        var argExprs = elements.subList(1, elements.size());
+        cekEval(elements.get(0), env, new Cont.Frame(proc -> {
+            // Evaluate arguments right-to-left (matching Chez Scheme behavior)
+            // This ensures call/cc in an argument position captures a continuation
+            // that re-evaluates earlier arguments from the (possibly mutated) environment.
+            evalArgsRTL(proc, argExprs, argExprs.size() - 1, new SchemeValue[argExprs.size()], env, k);
+        }));
     }
 
-    private SchemeValue applyTail(SchemeValue proc, SchemeValue[] args) throws EvalError {
+    private void evalArgsRTL(SchemeValue proc, List<SchemeValue> argExprs, int index,
+                              SchemeValue[] evaluatedArgs, Environment env, Cont k) throws EvalError {
+        if (index < 0) {
+            applyProcCek(proc, evaluatedArgs, k);
+            return;
+        }
+        final var snapshot = evaluatedArgs.clone();
+        cekEval(argExprs.get(index), env, new Cont.Frame(val -> {
+            var newArgs = snapshot.clone();
+            newArgs[index] = val;
+            evalArgsRTL(proc, argExprs, index - 1, newArgs, env, k);
+        }));
+    }
+
+    private void applyProcCek(SchemeValue proc, SchemeValue[] args, Cont k) throws EvalError {
+        // call/cc
+        if (proc == CALL_CC_MARKER) {
+            if (args.length != 1) throw new EvalError("call/cc: expected 1 argument");
+            SchemeValue f = args[0];
+            SchemeValue capturedK = new SchemeValue.ContinuationVal(k);
+            applyProcCek(f, new SchemeValue[]{capturedK}, k);
+            return;
+        }
+
+        // apply builtin
+        if (proc == APPLY_MARKER) {
+            if (args.length < 2) throw new EvalError("apply: expected at least 2 arguments");
+            var proc2 = args[0];
+            var lastArg = args[args.length - 1];
+            var allArgs = new ArrayList<SchemeValue>();
+            for (int i = 1; i < args.length - 1; i++) allArgs.add(args[i]);
+            SchemeValue cur = lastArg;
+            while (cur instanceof SchemeValue.PairVal p) {
+                allArgs.add(p.car());
+                cur = p.cdr();
+            }
+            if (!(cur instanceof SchemeValue.ListVal l && l.elements().isEmpty())) {
+                if (!(cur instanceof SchemeValue.ListVal))
+                    throw new EvalError("apply: last argument must be a list");
+            }
+            applyProcCek(proc2, allArgs.toArray(new SchemeValue[0]), k);
+            return;
+        }
+
+        // Continuation invocation
+        if (proc instanceof SchemeValue.ContinuationVal cv) {
+            SchemeValue value = args.length > 0 ? args[0] : new SchemeValue.VoidVal();
+            cekReturn(value, (Cont) cv.cont());
+            return;
+        }
+
+        // Lambda
         if (proc instanceof SchemeValue.LambdaVal lambda) {
-            var callEnv = bindLambdaArgs(lambda, args);
-            for (int i = 0; i < lambda.body().size() - 1; i++) {
-                eval(lambda.body().get(i), callEnv);
-            }
-            return new SchemeValue.TailCall(lambda.body().get(lambda.body().size() - 1), callEnv);
+            applyLambdaCek(lambda, args, k);
+            return;
         }
 
+        // Case-lambda
         if (proc instanceof SchemeValue.CaseLambdaVal cl) {
             for (var clause : cl.clauses()) {
                 boolean matches = clause.restParam() != null
                     ? args.length >= clause.params().size()
                     : args.length == clause.params().size();
-                if (matches) return applyTail(clause, args);
+                if (matches) { applyLambdaCek(clause, args, k); return; }
             }
             throw new EvalError("case-lambda: no matching clause for " + args.length + " arguments");
         }
 
+        // Builtin
         if (proc instanceof SchemeValue.BuiltinVal builtin) {
-            return builtin.proc().apply(args);
+            SchemeValue result = builtin.proc().apply(args);
+            cekReturn(result, k);
+            return;
         }
 
         throw new EvalError("not a procedure: " + proc.display());
+    }
+
+    private void applyLambdaCek(SchemeValue.LambdaVal lambda, SchemeValue[] args, Cont k) throws EvalError {
+        var callEnv = bindLambdaArgs(lambda, args);
+        setupSequence(lambda.body(), 0, callEnv, k);
     }
 
     private Environment bindLambdaArgs(SchemeValue.LambdaVal lambda, SchemeValue[] args) throws EvalError {
@@ -1480,35 +1598,16 @@ public class Interpreter {
         return callEnv;
     }
 
+    /** Recursive callProc for builtins (map, for-each) that need to call procedures. */
     private SchemeValue callProc(SchemeValue proc, SchemeValue[] args) throws EvalError {
         if (proc instanceof SchemeValue.LambdaVal lambda) {
-            var callEnv = new Environment(lambda.env());
-            if (lambda.restParam() != null) {
-                if (args.length < lambda.params().size())
-                    throw new EvalError("wrong number of arguments: expected at least " + lambda.params().size() + ", got " + args.length);
-                for (int i = 0; i < lambda.params().size(); i++) {
-                    callEnv.define(lambda.params().get(i), args[i]);
-                }
-                // Collect remaining args into rest list
-                SchemeValue rest = NIL;
-                for (int i = args.length - 1; i >= lambda.params().size(); i--) {
-                    rest = new SchemeValue.PairVal(args[i], rest);
-                }
-                callEnv.define(lambda.restParam(), rest);
-            } else {
-                if (args.length != lambda.params().size())
-                    throw new EvalError("wrong number of arguments: expected " + lambda.params().size() + ", got " + args.length);
-                for (int i = 0; i < lambda.params().size(); i++) {
-                    callEnv.define(lambda.params().get(i), args[i]);
-                }
-            }
+            var callEnv = bindLambdaArgs(lambda, args);
             SchemeValue result = new SchemeValue.VoidVal();
             for (var bodyExpr : lambda.body()) {
                 result = eval(bodyExpr, callEnv);
             }
             return result;
         }
-
         if (proc instanceof SchemeValue.CaseLambdaVal cl) {
             for (var clause : cl.clauses()) {
                 if (clause.restParam() != null) {
@@ -1519,15 +1618,110 @@ public class Interpreter {
             }
             throw new EvalError("case-lambda: no matching clause for " + args.length + " arguments");
         }
-
         if (proc instanceof SchemeValue.BuiltinVal builtin) {
             return builtin.proc().apply(args);
         }
-
         throw new EvalError("not a procedure: " + proc.display());
     }
 
+    // ---- Lambda/quote parsing (no sub-expression evaluation) ----
+
+    private SchemeValue evalQuote(List<SchemeValue> elements) throws EvalError {
+        if (elements.size() != 2) throw new EvalError("quote: expected 1 argument");
+        return quoteDatum(elements.get(1));
+    }
+
+    private SchemeValue quoteDatum(SchemeValue datum) {
+        if (datum instanceof SchemeValue.ListVal l) {
+            if (l.elements().isEmpty()) return NIL;
+            SchemeValue result = NIL;
+            for (int i = l.elements().size() - 1; i >= 0; i--) {
+                result = new SchemeValue.PairVal(quoteDatum(l.elements().get(i)), result);
+            }
+            return result;
+        }
+        if (datum instanceof SchemeValue.PairVal p) {
+            return new SchemeValue.PairVal(quoteDatum(p.car()), quoteDatum(p.cdr()));
+        }
+        return datum;
+    }
+
+    private SchemeValue evalLambda(List<SchemeValue> elements, Environment env) throws EvalError {
+        if (elements.size() < 3) throw new EvalError("lambda: bad syntax");
+        var paramList = elements.get(1);
+        if (paramList instanceof SchemeValue.SymbolVal sym) {
+            var body = elements.subList(2, elements.size());
+            return new SchemeValue.LambdaVal(List.of(), sym.name(), body, env);
+        }
+        if (paramList instanceof SchemeValue.PairVal pair) {
+            var params = new ArrayList<String>();
+            String restParam = null;
+            SchemeValue cur = pair;
+            while (cur instanceof SchemeValue.PairVal p) {
+                if (!(p.car() instanceof SchemeValue.SymbolVal s))
+                    throw new EvalError("lambda: expected parameter name");
+                params.add(s.name());
+                cur = p.cdr();
+            }
+            if (cur instanceof SchemeValue.SymbolVal rest) restParam = rest.name();
+            var body = elements.subList(2, elements.size());
+            return new SchemeValue.LambdaVal(params, restParam, body, env);
+        }
+        if (!(paramList instanceof SchemeValue.ListVal pl))
+            throw new EvalError("lambda: expected parameter list");
+        var params = new ArrayList<String>();
+        for (var p : pl.elements()) {
+            if (!(p instanceof SchemeValue.SymbolVal sym))
+                throw new EvalError("lambda: expected parameter name");
+            params.add(sym.name());
+        }
+        var body = elements.subList(2, elements.size());
+        return new SchemeValue.LambdaVal(params, null, body, env);
+    }
+
+    private SchemeValue evalCaseLambda(List<SchemeValue> elements, Environment env) throws EvalError {
+        var clauses = new ArrayList<SchemeValue.LambdaVal>();
+        for (int i = 1; i < elements.size(); i++) {
+            if (!(elements.get(i) instanceof SchemeValue.ListVal clause) || clause.elements().size() < 2)
+                throw new EvalError("case-lambda: bad clause");
+            var lambdaElements = new ArrayList<SchemeValue>();
+            lambdaElements.add(new SchemeValue.SymbolVal("lambda"));
+            lambdaElements.addAll(clause.elements());
+            var lambda = evalLambda(lambdaElements, env);
+            clauses.add((SchemeValue.LambdaVal) lambda);
+        }
+        return new SchemeValue.CaseLambdaVal(clauses);
+    }
+
     // ---- Macro support (Level 10) ----
+
+    private void stepMacroExpansion(SchemeValue.MacroVal macro, SchemeValue.ListVal form,
+                                    Environment env, Cont k) throws EvalError {
+        var literalSet = new HashSet<>(macro.literals());
+        for (int r = 0; r < macro.patterns().size(); r++) {
+            var pattern = macro.patterns().get(r);
+            var template = macro.templates().get(r);
+            var patternVars = collectPatternVars(pattern, literalSet);
+            var bindings = new HashMap<String, Object>();
+            if (matchPattern(pattern, form, literalSet, patternVars, bindings)) {
+                var renameMap = new HashMap<String, String>();
+                var preBindings = new HashMap<String, SchemeValue>();
+                collectTemplateRenames(template, patternVars, renameMap, preBindings, macro.defEnv());
+                var expanded = instantiateTemplate(template, bindings, renameMap);
+                if (!preBindings.isEmpty()) {
+                    var macroEnv = new Environment(env);
+                    for (var entry : preBindings.entrySet()) {
+                        macroEnv.define(entry.getKey(), entry.getValue());
+                    }
+                    cekEval(expanded, macroEnv, k);
+                } else {
+                    cekEval(expanded, env, k);
+                }
+                return;
+            }
+        }
+        throw new EvalError("no matching pattern for macro");
+    }
 
     private SchemeValue evalDefineSyntax(List<SchemeValue> elements, Environment env) throws EvalError {
         if (elements.size() != 3) throw new EvalError("define-syntax: bad syntax");
@@ -1559,14 +1753,9 @@ public class Interpreter {
     }
 
     private SchemeValue evalDefineRecordType(List<SchemeValue> elements, Environment env) throws EvalError {
-        // (define-record-type <name> (constructor field...) predicate (field accessor)...)
         if (elements.size() < 4) throw new EvalError("define-record-type: bad syntax");
-
-        // Type name
         if (!(elements.get(1) instanceof SchemeValue.SymbolVal typeName))
             throw new EvalError("define-record-type: expected type name");
-
-        // Constructor: (constructor-name field1 field2 ...)
         if (!(elements.get(2) instanceof SchemeValue.ListVal ctorList) || ctorList.elements().isEmpty())
             throw new EvalError("define-record-type: expected constructor");
         if (!(ctorList.elements().get(0) instanceof SchemeValue.SymbolVal ctorName))
@@ -1577,12 +1766,8 @@ public class Interpreter {
                 throw new EvalError("define-record-type: expected field name in constructor");
             ctorFields.add(f.name());
         }
-
-        // Predicate
         if (!(elements.get(3) instanceof SchemeValue.SymbolVal predName))
             throw new EvalError("define-record-type: expected predicate name");
-
-        // Field specs: (field accessor) starting at index 4
         var fieldNames = new ArrayList<String>();
         var accessorNames = new ArrayList<String>();
         for (int i = 4; i < elements.size(); i++) {
@@ -1595,18 +1780,11 @@ public class Interpreter {
             fieldNames.add(fieldSym.name());
             accessorNames.add(accSym.name());
         }
-
-        // Unique tag for this record type (identity-based)
         var tag = new Object();
         var fieldNamesArr = fieldNames.toArray(new String[0]);
-
-        // Build field index map for constructor
         var fieldIndexMap = new HashMap<String, Integer>();
-        for (int i = 0; i < fieldNames.size(); i++) {
-            fieldIndexMap.put(fieldNames.get(i), i);
-        }
+        for (int i = 0; i < fieldNames.size(); i++) fieldIndexMap.put(fieldNames.get(i), i);
 
-        // Define constructor
         env.define(ctorName.name(), new SchemeValue.BuiltinVal(ctorName.name(), args -> {
             if (args.length != ctorFields.size())
                 throw new EvalError(ctorName.name() + ": expected " + ctorFields.size() + " arguments");
@@ -1617,14 +1795,10 @@ public class Interpreter {
             }
             return new SchemeValue.RecordVal(tag, typeName.name(), fieldNamesArr, fields);
         }));
-
-        // Define predicate
         env.define(predName.name(), new SchemeValue.BuiltinVal(predName.name(), args -> {
             if (args.length != 1) throw new EvalError(predName.name() + ": expected 1 argument");
             return new SchemeValue.BoolVal(args[0] instanceof SchemeValue.RecordVal r && r.tag() == tag);
         }));
-
-        // Define accessors
         for (int i = 0; i < fieldNames.size(); i++) {
             final int idx = i;
             var accName = accessorNames.get(i);
@@ -1635,33 +1809,7 @@ public class Interpreter {
                 return r.fields()[idx];
             }));
         }
-
         return new SchemeValue.VoidVal();
-    }
-
-    private SchemeValue evalMacroExpansion(SchemeValue.MacroVal macro, SchemeValue.ListVal form, Environment env) throws EvalError {
-        var literalSet = new HashSet<>(macro.literals());
-        for (int r = 0; r < macro.patterns().size(); r++) {
-            var pattern = macro.patterns().get(r);
-            var template = macro.templates().get(r);
-            var patternVars = collectPatternVars(pattern, literalSet);
-            var bindings = new HashMap<String, Object>();
-            if (matchPattern(pattern, form, literalSet, patternVars, bindings)) {
-                var renameMap = new HashMap<String, String>();
-                var preBindings = new HashMap<String, SchemeValue>();
-                collectTemplateRenames(template, patternVars, renameMap, preBindings, macro.defEnv());
-                var expanded = instantiateTemplate(template, bindings, renameMap);
-                if (!preBindings.isEmpty()) {
-                    var macroEnv = new Environment(env);
-                    for (var entry : preBindings.entrySet()) {
-                        macroEnv.define(entry.getKey(), entry.getValue());
-                    }
-                    return eval(expanded, macroEnv);
-                }
-                return eval(expanded, env);
-            }
-        }
-        throw new EvalError("no matching pattern for macro");
     }
 
     private Set<String> collectPatternVars(SchemeValue pattern, Set<String> literals) {
@@ -1676,13 +1824,9 @@ public class Interpreter {
 
     private void collectPatternVarsHelper(SchemeValue v, Set<String> literals, Set<String> vars) {
         if (v instanceof SchemeValue.SymbolVal s) {
-            if (!s.name().equals("...") && !literals.contains(s.name())) {
-                vars.add(s.name());
-            }
+            if (!s.name().equals("...") && !literals.contains(s.name())) vars.add(s.name());
         } else if (v instanceof SchemeValue.ListVal l) {
-            for (var elem : l.elements()) {
-                collectPatternVarsHelper(elem, literals, vars);
-            }
+            for (var elem : l.elements()) collectPatternVarsHelper(elem, literals, vars);
         }
     }
 
@@ -1690,18 +1834,13 @@ public class Interpreter {
                                   Set<String> patVars, Map<String, Object> bindings) {
         if (pattern instanceof SchemeValue.SymbolVal s) {
             if (s.name().equals("_")) return true;
-            if (literals.contains(s.name())) {
+            if (literals.contains(s.name()))
                 return input instanceof SchemeValue.SymbolVal is && is.name().equals(s.name());
-            }
-            if (patVars.contains(s.name())) {
-                bindings.put(s.name(), input);
-                return true;
-            }
+            if (patVars.contains(s.name())) { bindings.put(s.name(), input); return true; }
             return true;
         }
-        if (pattern instanceof SchemeValue.ListVal pl && input instanceof SchemeValue.ListVal il) {
+        if (pattern instanceof SchemeValue.ListVal pl && input instanceof SchemeValue.ListVal il)
             return matchListPattern(pl.elements(), il.elements(), literals, patVars, bindings);
-        }
         if (pattern instanceof SchemeValue.IntVal a && input instanceof SchemeValue.IntVal b)
             return a.value() == b.value();
         if (pattern instanceof SchemeValue.BoolVal a && input instanceof SchemeValue.BoolVal b)
@@ -1715,48 +1854,35 @@ public class Interpreter {
         int ellipsisIdx = -1;
         for (int i = 0; i < pat.size(); i++) {
             if (pat.get(i) instanceof SchemeValue.SymbolVal s && s.name().equals("...")) {
-                ellipsisIdx = i;
-                break;
+                ellipsisIdx = i; break;
             }
         }
-
         if (ellipsisIdx == -1) {
             if (pat.size() != inp.size()) return false;
             for (int i = 0; i < pat.size(); i++) {
-                if (i == 0) continue; // skip keyword position
+                if (i == 0) continue;
                 if (!matchPattern(pat.get(i), inp.get(i), literals, patVars, bindings)) return false;
             }
             return true;
         }
-
-        // Has ellipsis at ellipsisIdx; variadic pattern is at ellipsisIdx-1
-        int varStart = ellipsisIdx - 1; // input index where variadic matching starts
+        int varStart = ellipsisIdx - 1;
         int afterCount = pat.size() - ellipsisIdx - 1;
         if (inp.size() < varStart + afterCount) return false;
-
-        // Match fixed elements before variadic (indices 1..ellipsisIdx-2)
         for (int i = 1; i < ellipsisIdx - 1; i++) {
             if (!matchPattern(pat.get(i), inp.get(i), literals, patVars, bindings)) return false;
         }
-
         int varCount = inp.size() - varStart - afterCount;
-
         SchemeValue varPat = pat.get(ellipsisIdx - 1);
         if (varPat instanceof SchemeValue.SymbolVal s && patVars.contains(s.name())) {
             var varBindings = new ArrayList<SchemeValue>();
-            for (int i = varStart; i < varStart + varCount; i++) {
-                varBindings.add(inp.get(i));
-            }
+            for (int i = varStart; i < varStart + varCount; i++) varBindings.add(inp.get(i));
             bindings.put(s.name(), varBindings);
         }
-
-        // Match fixed elements after ellipsis
         for (int i = 0; i < afterCount; i++) {
             int patIdx = ellipsisIdx + 1 + i;
             int inpIdx = varStart + varCount + i;
             if (!matchPattern(pat.get(patIdx), inp.get(inpIdx), literals, patVars, bindings)) return false;
         }
-
         return true;
     }
 
@@ -1767,10 +1893,7 @@ public class Interpreter {
         if (template instanceof SchemeValue.SymbolVal s) {
             String name = s.name();
             if (patternVars.contains(name) || name.equals("...") || SPECIAL_FORMS.contains(name)
-                    || renameMap.containsKey(name)) {
-                return;
-            }
-            // Don't rename macros (needed for recursive macro calls)
+                    || renameMap.containsKey(name)) return;
             try {
                 SchemeValue val = defEnv.get(name);
                 if (val instanceof SchemeValue.MacroVal) return;
@@ -1778,14 +1901,11 @@ public class Interpreter {
                 renameMap.put(name, gensym);
                 preBindings.put(gensym, val);
             } catch (EvalError e) {
-                // Not bound in defEnv - rename for hygiene (e.g. tmp in swap!)
                 String gensym = name + "__m" + (gensymCounter++);
                 renameMap.put(name, gensym);
             }
         } else if (template instanceof SchemeValue.ListVal l) {
-            for (var elem : l.elements()) {
-                collectTemplateRenames(elem, patternVars, renameMap, preBindings, defEnv);
-            }
+            for (var elem : l.elements()) collectTemplateRenames(elem, patternVars, renameMap, preBindings, defEnv);
         }
     }
 
@@ -1795,11 +1915,9 @@ public class Interpreter {
             if (bindings.containsKey(s.name())) {
                 Object val = bindings.get(s.name());
                 if (val instanceof SchemeValue sv) return sv;
-                return template; // ellipsis var used without ..., shouldn't happen
+                return template;
             }
-            if (renameMap.containsKey(s.name())) {
-                return new SchemeValue.SymbolVal(renameMap.get(s.name()));
-            }
+            if (renameMap.containsKey(s.name())) return new SchemeValue.SymbolVal(renameMap.get(s.name()));
             return template;
         }
         if (template instanceof SchemeValue.ListVal tl) {
@@ -1825,7 +1943,7 @@ public class Interpreter {
                             result.add(instantiateTemplate(subTemplate, singleBindings, renameMap));
                         }
                     }
-                    i++; // skip the ...
+                    i++;
                 } else {
                     result.add(instantiateTemplate(elems.get(i), bindings, renameMap));
                 }
@@ -1843,41 +1961,13 @@ public class Interpreter {
 
     private void findEllipsisVarsHelper(SchemeValue template, Map<String, Object> bindings, Set<String> vars) {
         if (template instanceof SchemeValue.SymbolVal s) {
-            if (bindings.containsKey(s.name()) && bindings.get(s.name()) instanceof List) {
-                vars.add(s.name());
-            }
+            if (bindings.containsKey(s.name()) && bindings.get(s.name()) instanceof List) vars.add(s.name());
         } else if (template instanceof SchemeValue.ListVal l) {
-            for (var elem : l.elements()) {
-                findEllipsisVarsHelper(elem, bindings, vars);
-            }
+            for (var elem : l.elements()) findEllipsisVarsHelper(elem, bindings, vars);
         }
     }
 
-    // ---- End macro support ----
-
-    private SchemeValue applyProc(SchemeValue[] args) throws EvalError {
-        if (args.length < 2) throw new EvalError("apply: expected at least 2 arguments");
-        var proc = args[0];
-        // Last arg must be a list; prefix args are prepended
-        var lastArg = args[args.length - 1];
-        var allArgs = new ArrayList<SchemeValue>();
-        // Add prefix args
-        for (int i = 1; i < args.length - 1; i++) {
-            allArgs.add(args[i]);
-        }
-        // Flatten last arg (must be a list)
-        SchemeValue cur = lastArg;
-        while (cur instanceof SchemeValue.PairVal p) {
-            allArgs.add(p.car());
-            cur = p.cdr();
-        }
-        if (!(cur instanceof SchemeValue.ListVal l && l.elements().isEmpty())) {
-            if (!(cur instanceof SchemeValue.ListVal)) {
-                throw new EvalError("apply: last argument must be a list");
-            }
-        }
-        return callProc(proc, allArgs.toArray(new SchemeValue[0]));
-    }
+    // ---- Utility methods ----
 
     @FunctionalInterface
     interface DoubleCmp { boolean test(double a, double b); }
@@ -1885,18 +1975,14 @@ public class Interpreter {
     private SchemeValue compareNum(SchemeValue[] args, DoubleCmp cmp) throws EvalError {
         if (args.length < 2) throw new EvalError("comparison needs at least 2 arguments");
         for (int i = 0; i < args.length - 1; i++) {
-            if (!cmp.test(toDouble(args[i]), toDouble(args[i + 1]))) {
-                return new SchemeValue.BoolVal(false);
-            }
+            if (!cmp.test(toDouble(args[i]), toDouble(args[i + 1]))) return new SchemeValue.BoolVal(false);
         }
         return new SchemeValue.BoolVal(true);
     }
 
     private static SchemeValue appendTwo(SchemeValue a, SchemeValue b) throws EvalError {
         if (a instanceof SchemeValue.ListVal l && l.elements().isEmpty()) return b;
-        if (a instanceof SchemeValue.PairVal p) {
-            return new SchemeValue.PairVal(p.car(), appendTwo(p.cdr(), b));
-        }
+        if (a instanceof SchemeValue.PairVal p) return new SchemeValue.PairVal(p.car(), appendTwo(p.cdr(), b));
         throw new EvalError("append: not a proper list");
     }
 
@@ -1904,8 +1990,6 @@ public class Interpreter {
         if (v instanceof SchemeValue.IntVal iv) return iv.value();
         throw new EvalError("expected number, got: " + v.display());
     }
-
-    // ---- Numeric tower helpers ----
 
     private static long gcd(long a, long b) {
         while (b != 0) { long t = b; b = a % b; a = t; }
@@ -2012,10 +2096,9 @@ public class Interpreter {
         if (a instanceof SchemeValue.StringVal sa && b instanceof SchemeValue.StringVal sb)
             return sa.value().equals(sb.value());
         if (a instanceof SchemeValue.PairVal pa && b instanceof SchemeValue.PairVal pb) {
-            // Use a pair-key for visited tracking to avoid treating (a,b) same as (a,c)
             long key = System.identityHashCode(pa) * 31L + System.identityHashCode(pb);
             Long boxedKey = key;
-            if (!visited.add(boxedKey)) return true; // assume equal on cycle
+            if (!visited.add(boxedKey)) return true;
             return schemeEqualSafe(pa.car(), pb.car(), visited) && schemeEqualSafe(pa.cdr(), pb.cdr(), visited);
         }
         if (a instanceof SchemeValue.ListVal la && b instanceof SchemeValue.ListVal lb)

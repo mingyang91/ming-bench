@@ -1,5 +1,7 @@
 package ming;
 
+import java.util.ArrayList;
+
 public class Evaluator {
     public String evalStr(String input) throws EvalError {
         var reader = new Reader(input);
@@ -7,10 +9,12 @@ public class Evaluator {
         if (exprs.isEmpty()) throw new EvalError("no expressions");
         var interp = new Interpreter();
         interp.setPositions(reader.getPositions());
-        SchemeValue result = null;
-        for (var expr : exprs) {
-            result = interp.eval(expr);
-        }
+        // Use evalAll to evaluate all expressions in a single CEK loop
+        // (required for call/cc to capture continuations across top-level expressions)
+        var beginElems = new ArrayList<SchemeValue>();
+        beginElems.add(new SchemeValue.SymbolVal("begin"));
+        beginElems.addAll(exprs);
+        SchemeValue result = interp.eval(new SchemeValue.ListVal(beginElems));
         return result.display();
     }
 
@@ -20,10 +24,10 @@ public class Evaluator {
         if (exprs.isEmpty()) throw new EvalError("no expressions");
         var interp = new Interpreter();
         interp.setPositions(reader.getPositions());
-        SchemeValue result = null;
-        for (var expr : exprs) {
-            result = interp.eval(expr);
-        }
+        var beginElems = new ArrayList<SchemeValue>();
+        beginElems.add(new SchemeValue.SymbolVal("begin"));
+        beginElems.addAll(exprs);
+        SchemeValue result = interp.eval(new SchemeValue.ListVal(beginElems));
         String resultStr = result.display();
         if (result instanceof SchemeValue.VoidVal) resultStr = "";
         return new EvalResult(resultStr, interp.getOutput());
