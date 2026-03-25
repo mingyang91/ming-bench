@@ -22,6 +22,8 @@ pub(crate) type BuiltinFn = fn(&[Val], &Env) -> Result<Val, EvalError>;
 #[derive(Clone)]
 pub(crate) enum Val {
     Int(i64),
+    Float(f64),
+    Rational(i64, i64),
     Bool(bool),
     Str(String),
     Char(char),
@@ -43,6 +45,30 @@ pub(crate) enum Val {
     Void,
 }
 
+fn gcd(mut a: i64, mut b: i64) -> i64 {
+    a = a.abs();
+    b = b.abs();
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+pub(crate) fn make_rational(n: i64, d: i64) -> Val {
+    if d == 0 {
+        return Val::Int(0); // shouldn't happen
+    }
+    let sign = if d < 0 { -1 } else { 1 };
+    let n = n * sign;
+    let d = d * sign;
+    let g = gcd(n.abs(), d);
+    let n = n / g;
+    let d = d / g;
+    if d == 1 { Val::Int(n) } else { Val::Rational(n, d) }
+}
+
 impl Val {
     fn is_truthy(&self) -> bool {
         !matches!(self, Val::Bool(false))
@@ -59,6 +85,14 @@ impl fmt::Display for Val {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Val::Int(n) => write!(f, "{n}"),
+            Val::Float(x) => {
+                if x.fract() == 0.0 && x.is_finite() {
+                    write!(f, "{:.1}", x)
+                } else {
+                    write!(f, "{}", x)
+                }
+            }
+            Val::Rational(n, d) => write!(f, "{}/{}", n, d),
             Val::Bool(true) => write!(f, "#t"),
             Val::Bool(false) => write!(f, "#f"),
             Val::Str(s) => write!(f, "\"{}\"", s),
@@ -173,6 +207,14 @@ impl Env {
             ("string-ci=?", builtin_string_ci_eq),
             ("string-upcase", builtin_string_upcase),
             ("string-downcase", builtin_string_downcase),
+            ("integer?", builtin_is_integer),
+            ("rational?", builtin_is_rational),
+            ("exact?", builtin_is_exact),
+            ("inexact?", builtin_is_inexact),
+            ("exact->inexact", builtin_exact_to_inexact),
+            ("inexact->exact", builtin_inexact_to_exact),
+            ("numerator", builtin_numerator),
+            ("denominator", builtin_denominator),
         ];
         for &(name, f) in builtins {
             frame.borrow_mut().insert(name.to_string(), Val::Builtin(f));
@@ -242,6 +284,8 @@ pub(crate) struct Expr {
 #[derive(Debug, Clone)]
 pub(crate) enum ExprKind {
     Int(i64),
+    Float(f64),
+    Rational(i64, i64),
     Bool(bool),
     Str(String),
     Char(char),
@@ -368,6 +412,32 @@ fn parse(tokens: &[Token]) -> Result<(Expr, usize), EvalError> {
         Ok((Expr::new(ExprKind::Char(ch), span), 1))
     } else if let Ok(n) = tok.text.parse::<i64>() {
         Ok((Expr::new(ExprKind::Int(n), span), 1))
+    } else if let Some(pos) = tok.text.find('/') {
+        // Try rational literal n/d
+        let num_part = &tok.text[..pos];
+        let den_part = &tok.text[pos+1..];
+        if let (Ok(n), Ok(d)) = (num_part.parse::<i64>(), den_part.parse::<i64>()) {
+            if d != 0 {
+                // Simplify the rational
+                let sign = if d < 0 { -1 } else { 1 };
+                let nn = n * sign;
+                let dd = d * sign;
+                let g = gcd(nn.abs(), dd);
+                let nn = nn / g;
+                let dd = dd / g;
+                if dd == 1 {
+                    Ok((Expr::new(ExprKind::Int(nn), span), 1))
+                } else {
+                    Ok((Expr::new(ExprKind::Rational(nn, dd), span), 1))
+                }
+            } else {
+                Ok((Expr::new(ExprKind::Symbol(tok.text.clone()), span), 1))
+            }
+        } else {
+            Ok((Expr::new(ExprKind::Symbol(tok.text.clone()), span), 1))
+        }
+    } else if let Ok(x) = tok.text.parse::<f64>() {
+        Ok((Expr::new(ExprKind::Float(x), span), 1))
     } else {
         Ok((Expr::new(ExprKind::Symbol(tok.text.clone()), span), 1))
     }
@@ -413,6 +483,8 @@ fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
     let span = expr.span;
     match &expr.kind {
         ExprKind::Int(n) => Ok(Val::Int(*n)),
+        ExprKind::Float(x) => Ok(Val::Float(*x)),
+        ExprKind::Rational(n, d) => Ok(Val::Rational(*n, *d)),
         ExprKind::Bool(b) => Ok(Val::Bool(*b)),
         ExprKind::Str(s) => Ok(Val::Str(s.clone())),
         ExprKind::Char(c) => Ok(Val::Char(*c)),
@@ -879,6 +951,8 @@ fn eval_quote(args: &[Expr], span: Span) -> Result<Val, EvalError> {
 fn expr_to_val(expr: &Expr) -> Result<Val, EvalError> {
     match &expr.kind {
         ExprKind::Int(n) => Ok(Val::Int(*n)),
+        ExprKind::Float(x) => Ok(Val::Float(*x)),
+        ExprKind::Rational(n, d) => Ok(Val::Rational(*n, *d)),
         ExprKind::Bool(b) => Ok(Val::Bool(*b)),
         ExprKind::Str(s) => Ok(Val::Str(s.clone())),
         ExprKind::Char(c) => Ok(Val::Char(*c)),

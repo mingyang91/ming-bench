@@ -1,72 +1,172 @@
-use super::{Val, Env, apply_val};
+use super::{Val, Env, apply_val, make_rational};
 use crate::scheme::error::EvalError;
 
-fn require_ints(args: &[Val], op: &str) -> Result<Vec<i64>, EvalError> {
-    args.iter().map(|a| match a {
-        Val::Int(n) => Ok(*n),
-        _ => Err(EvalError::Type(format!("{op}: expected number"))),
-    }).collect()
+// --- Numeric tower helpers ---
+
+// Internal representation for arithmetic
+enum Num {
+    Exact(i64, i64),   // (numerator, denominator), always simplified, d > 0
+    Inexact(f64),
 }
 
+fn val_to_num(v: &Val, op: &str) -> Result<Num, EvalError> {
+    match v {
+        Val::Int(n) => Ok(Num::Exact(*n, 1)),
+        Val::Rational(n, d) => Ok(Num::Exact(*n, *d)),
+        Val::Float(x) => Ok(Num::Inexact(*x)),
+        _ => Err(EvalError::Type(format!("{op}: expected number"))),
+    }
+}
+
+fn num_to_val(n: Num) -> Val {
+    match n {
+        Num::Exact(n, d) => make_rational(n, d),
+        Num::Inexact(x) => Val::Float(x),
+    }
+}
+
+fn num_to_f64(n: &Num) -> f64 {
+    match n {
+        Num::Exact(n, d) => *n as f64 / *d as f64,
+        Num::Inexact(x) => *x,
+    }
+}
+
+fn num_add(a: Num, b: Num) -> Num {
+    match (a, b) {
+        (Num::Exact(an, ad), Num::Exact(bn, bd)) => {
+            Num::Exact(an * bd + bn * ad, ad * bd)
+        }
+        (a, b) => Num::Inexact(num_to_f64(&a) + num_to_f64(&b)),
+    }
+}
+
+fn num_sub(a: Num, b: Num) -> Num {
+    match (a, b) {
+        (Num::Exact(an, ad), Num::Exact(bn, bd)) => {
+            Num::Exact(an * bd - bn * ad, ad * bd)
+        }
+        (a, b) => Num::Inexact(num_to_f64(&a) - num_to_f64(&b)),
+    }
+}
+
+fn num_mul(a: Num, b: Num) -> Num {
+    match (a, b) {
+        (Num::Exact(an, ad), Num::Exact(bn, bd)) => {
+            Num::Exact(an * bn, ad * bd)
+        }
+        (a, b) => Num::Inexact(num_to_f64(&a) * num_to_f64(&b)),
+    }
+}
+
+fn num_div(a: Num, b: Num) -> Result<Num, EvalError> {
+    match (a, b) {
+        (Num::Exact(an, ad), Num::Exact(bn, bd)) => {
+            if bn == 0 {
+                return Err(EvalError::Runtime("division by zero".into()));
+            }
+            Ok(Num::Exact(an * bd, ad * bn))
+        }
+        (a, b) => {
+            let bv = num_to_f64(&b);
+            if bv == 0.0 {
+                return Err(EvalError::Runtime("division by zero".into()));
+            }
+            Ok(Num::Inexact(num_to_f64(&a) / bv))
+        }
+    }
+}
+
+fn require_nums(args: &[Val], op: &str) -> Result<Vec<Num>, EvalError> {
+    args.iter().map(|a| val_to_num(a, op)).collect()
+}
+
+// --- Arithmetic builtins ---
+
 pub fn builtin_add(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    let nums = require_ints(args, "+")?;
-    Ok(Val::Int(nums.iter().sum()))
+    let nums = require_nums(args, "+")?;
+    let mut acc = Num::Exact(0, 1);
+    for n in nums {
+        acc = num_add(acc, n);
+    }
+    Ok(num_to_val(acc))
 }
 
 pub fn builtin_sub(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity("-: need at least 1 argument".into()));
     }
-    let nums = require_ints(args, "-")?;
+    let nums = require_nums(args, "-")?;
     if nums.len() == 1 {
-        Ok(Val::Int(-nums[0]))
+        let neg = match &nums[0] {
+            Num::Exact(n, d) => Num::Exact(-n, *d),
+            Num::Inexact(x) => Num::Inexact(-x),
+        };
+        Ok(num_to_val(neg))
     } else {
-        Ok(Val::Int(nums[0] - nums[1..].iter().sum::<i64>()))
+        let mut acc = nums.into_iter().next().expect("nums guaranteed non-empty for len >= 2");
+        for n in require_nums(&args[1..], "-")? {
+            acc = num_sub(acc, n);
+        }
+        Ok(num_to_val(acc))
     }
 }
 
 pub fn builtin_mul(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    let nums = require_ints(args, "*")?;
-    Ok(Val::Int(nums.iter().product()))
+    let nums = require_nums(args, "*")?;
+    let mut acc = Num::Exact(1, 1);
+    for n in nums {
+        acc = num_mul(acc, n);
+    }
+    Ok(num_to_val(acc))
 }
 
 pub fn builtin_div(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity("/: need at least 2 arguments".into()));
     }
-    let nums = require_ints(args, "/")?;
-    if nums[1..].contains(&0) {
-        return Err(EvalError::Runtime("division by zero".into()));
+    let nums = require_nums(args, "/")?;
+    let mut iter = nums.into_iter();
+    let mut acc = iter.next().expect("nums guaranteed non-empty after arity check");
+    for n in iter {
+        acc = num_div(acc, n)?;
     }
-    let mut result = nums[0];
-    for &n in &nums[1..] {
-        result /= n;
+    Ok(num_to_val(acc))
+}
+
+// --- Comparison builtins ---
+
+fn num_cmp_f64(a: &Val, op: &str) -> Result<f64, EvalError> {
+    match a {
+        Val::Int(n) => Ok(*n as f64),
+        Val::Float(x) => Ok(*x),
+        Val::Rational(n, d) => Ok(*n as f64 / *d as f64),
+        _ => Err(EvalError::Type(format!("{op}: expected number"))),
     }
-    Ok(Val::Int(result))
 }
 
 pub fn builtin_lt(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    let nums = require_ints(args, "<")?;
+    let nums: Vec<f64> = args.iter().map(|a| num_cmp_f64(a, "<")).collect::<Result<_, _>>()?;
     Ok(Val::Bool(nums.windows(2).all(|w| w[0] < w[1])))
 }
 
 pub fn builtin_gt(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    let nums = require_ints(args, ">")?;
+    let nums: Vec<f64> = args.iter().map(|a| num_cmp_f64(a, ">")).collect::<Result<_, _>>()?;
     Ok(Val::Bool(nums.windows(2).all(|w| w[0] > w[1])))
 }
 
 pub fn builtin_eq(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    let nums = require_ints(args, "=")?;
+    let nums: Vec<f64> = args.iter().map(|a| num_cmp_f64(a, "=")).collect::<Result<_, _>>()?;
     Ok(Val::Bool(nums.windows(2).all(|w| w[0] == w[1])))
 }
 
 pub fn builtin_le(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    let nums = require_ints(args, "<=")?;
+    let nums: Vec<f64> = args.iter().map(|a| num_cmp_f64(a, "<=")).collect::<Result<_, _>>()?;
     Ok(Val::Bool(nums.windows(2).all(|w| w[0] <= w[1])))
 }
 
 pub fn builtin_ge(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    let nums = require_ints(args, ">=")?;
+    let nums: Vec<f64> = args.iter().map(|a| num_cmp_f64(a, ">=")).collect::<Result<_, _>>()?;
     Ok(Val::Bool(nums.windows(2).all(|w| w[0] >= w[1])))
 }
 
@@ -154,7 +254,71 @@ pub fn builtin_is_boolean(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
 
 pub fn builtin_is_number(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("number?: expected 1 argument".into())); }
+    Ok(Val::Bool(matches!(args[0], Val::Int(_) | Val::Float(_) | Val::Rational(_, _))))
+}
+
+pub fn builtin_is_integer(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("integer?: expected 1 argument".into())); }
     Ok(Val::Bool(matches!(args[0], Val::Int(_))))
+}
+
+pub fn builtin_is_rational(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("rational?: expected 1 argument".into())); }
+    Ok(Val::Bool(matches!(args[0], Val::Int(_) | Val::Rational(_, _))))
+}
+
+pub fn builtin_is_exact(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("exact?: expected 1 argument".into())); }
+    Ok(Val::Bool(matches!(args[0], Val::Int(_) | Val::Rational(_, _))))
+}
+
+pub fn builtin_is_inexact(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("inexact?: expected 1 argument".into())); }
+    Ok(Val::Bool(matches!(args[0], Val::Float(_))))
+}
+
+pub fn builtin_exact_to_inexact(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("exact->inexact: expected 1 argument".into())); }
+    match &args[0] {
+        Val::Int(n) => Ok(Val::Float(*n as f64)),
+        Val::Rational(n, d) => Ok(Val::Float(*n as f64 / *d as f64)),
+        Val::Float(x) => Ok(Val::Float(*x)),
+        _ => Err(EvalError::Type("exact->inexact: expected number".into())),
+    }
+}
+
+pub fn builtin_inexact_to_exact(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("inexact->exact: expected 1 argument".into())); }
+    match &args[0] {
+        Val::Int(n) => Ok(Val::Int(*n)),
+        Val::Rational(n, d) => Ok(Val::Rational(*n, *d)),
+        Val::Float(x) => {
+            // Convert float to exact rational using continued fraction approximation
+            // For simple cases like 0.5 -> 1/2
+            let denom = 1_000_000_000i64;
+            let numer = (*x * denom as f64).round() as i64;
+            Ok(make_rational(numer, denom))
+        }
+        _ => Err(EvalError::Type("inexact->exact: expected number".into())),
+    }
+}
+
+pub fn builtin_numerator(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("numerator: expected 1 argument".into())); }
+    match &args[0] {
+        Val::Int(n) => Ok(Val::Int(*n)),
+        Val::Rational(n, _) => Ok(Val::Int(*n)),
+        _ => Err(EvalError::Type("numerator: expected rational number".into())),
+    }
+}
+
+pub fn builtin_denominator(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("denominator: expected 1 argument".into())); }
+    match &args[0] {
+        Val::Int(_) => Ok(Val::Int(1)),
+        Val::Rational(_, d) => Ok(Val::Int(*d)),
+        _ => Err(EvalError::Type("denominator: expected rational number".into())),
+    }
 }
 
 pub fn builtin_is_string(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
@@ -266,7 +430,10 @@ pub fn builtin_string_to_number(args: &[Val], _env: &Env) -> Result<Val, EvalErr
     match &args[0] {
         Val::Str(s) => match s.parse::<i64>() {
             Ok(n) => Ok(Val::Int(n)),
-            Err(_) => Ok(Val::Bool(false)),
+            Err(_) => match s.parse::<f64>() {
+                Ok(x) => Ok(Val::Float(x)),
+                Err(_) => Ok(Val::Bool(false)),
+            },
         },
         _ => Err(EvalError::Type("string->number: expected string".into())),
     }
@@ -276,6 +443,8 @@ pub fn builtin_number_to_string(args: &[Val], _env: &Env) -> Result<Val, EvalErr
     if args.len() != 1 { return Err(EvalError::Arity("number->string: expected 1 argument".into())); }
     match &args[0] {
         Val::Int(n) => Ok(Val::Str(n.to_string())),
+        Val::Float(x) => Ok(Val::Str(format!("{}", x))),
+        Val::Rational(n, d) => Ok(Val::Str(format!("{}/{}", n, d))),
         _ => Err(EvalError::Type("number->string: expected number".into())),
     }
 }
@@ -320,6 +489,8 @@ pub fn builtin_string_copy(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
 pub fn vals_equal(a: &Val, b: &Val) -> bool {
     match (a, b) {
         (Val::Int(x), Val::Int(y)) => x == y,
+        (Val::Float(x), Val::Float(y)) => x == y,
+        (Val::Rational(xn, xd), Val::Rational(yn, yd)) => xn == yn && xd == yd,
         (Val::Bool(x), Val::Bool(y)) => x == y,
         (Val::Str(x), Val::Str(y)) => x == y,
         (Val::Char(x), Val::Char(y)) => x == y,
@@ -350,61 +521,101 @@ pub fn builtin_eq_pred(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
 
 pub fn builtin_abs(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("abs: expected 1 argument".into())); }
-    match &args[0] { Val::Int(n) => Ok(Val::Int(n.abs())), _ => Err(EvalError::Type("abs: expected number".into())) }
+    match &args[0] {
+        Val::Int(n) => Ok(Val::Int(n.abs())),
+        Val::Float(x) => Ok(Val::Float(x.abs())),
+        Val::Rational(n, d) => Ok(Val::Rational(n.abs(), *d)),
+        _ => Err(EvalError::Type("abs: expected number".into())),
+    }
 }
 
 pub fn builtin_modulo(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 2 { return Err(EvalError::Arity("modulo: expected 2 arguments".into())); }
-    let nums = require_ints(args, "modulo")?;
-    if nums[1] == 0 { return Err(EvalError::Runtime("modulo: division by zero".into())); }
-    Ok(Val::Int(((nums[0] % nums[1]) + nums[1]) % nums[1]))
+    match (&args[0], &args[1]) {
+        (Val::Int(a), Val::Int(b)) => {
+            if *b == 0 { return Err(EvalError::Runtime("modulo: division by zero".into())); }
+            Ok(Val::Int(((a % b) + b) % b))
+        }
+        _ => Err(EvalError::Type("modulo: expected integers".into())),
+    }
 }
 
 pub fn builtin_remainder(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 2 { return Err(EvalError::Arity("remainder: expected 2 arguments".into())); }
-    let nums = require_ints(args, "remainder")?;
-    if nums[1] == 0 { return Err(EvalError::Runtime("remainder: division by zero".into())); }
-    Ok(Val::Int(nums[0] % nums[1]))
+    match (&args[0], &args[1]) {
+        (Val::Int(a), Val::Int(b)) => {
+            if *b == 0 { return Err(EvalError::Runtime("remainder: division by zero".into())); }
+            Ok(Val::Int(a % b))
+        }
+        _ => Err(EvalError::Type("remainder: expected integers".into())),
+    }
 }
 
 pub fn builtin_quotient(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 2 { return Err(EvalError::Arity("quotient: expected 2 arguments".into())); }
-    let nums = require_ints(args, "quotient")?;
-    if nums[1] == 0 { return Err(EvalError::Runtime("quotient: division by zero".into())); }
-    Ok(Val::Int(nums[0] / nums[1]))
+    match (&args[0], &args[1]) {
+        (Val::Int(a), Val::Int(b)) => {
+            if *b == 0 { return Err(EvalError::Runtime("quotient: division by zero".into())); }
+            Ok(Val::Int(a / b))
+        }
+        _ => Err(EvalError::Type("quotient: expected integers".into())),
+    }
 }
 
 pub fn builtin_min(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.is_empty() { return Err(EvalError::Arity("min: need at least 1 argument".into())); }
-    let nums = require_ints(args, "min")?;
-    Ok(Val::Int(*nums.iter().min().expect("non-empty after arity check")))
+    let nums: Vec<f64> = args.iter().map(|a| num_cmp_f64(a, "min")).collect::<Result<_, _>>()?;
+    let min_idx = nums.iter().enumerate().min_by(|(_, a), (_, b)| a.partial_cmp(b).expect("non-NaN after numeric coercion")).expect("nums non-empty after arity check").0;
+    Ok(args[min_idx].clone())
 }
 
 pub fn builtin_max(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.is_empty() { return Err(EvalError::Arity("max: need at least 1 argument".into())); }
-    let nums = require_ints(args, "max")?;
-    Ok(Val::Int(*nums.iter().max().expect("non-empty after arity check")))
+    let nums: Vec<f64> = args.iter().map(|a| num_cmp_f64(a, "max")).collect::<Result<_, _>>()?;
+    let max_idx = nums.iter().enumerate().max_by(|(_, a), (_, b)| a.partial_cmp(b).expect("non-NaN after numeric coercion")).expect("nums non-empty after arity check").0;
+    Ok(args[max_idx].clone())
 }
 
 pub fn builtin_expt(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 2 { return Err(EvalError::Arity("expt: expected 2 arguments".into())); }
-    let nums = require_ints(args, "expt")?;
-    Ok(Val::Int((nums[0] as i64).pow(nums[1] as u32)))
+    match (&args[0], &args[1]) {
+        (Val::Int(base), Val::Int(exp)) => Ok(Val::Int((*base).pow(*exp as u32))),
+        _ => {
+            let b = num_cmp_f64(&args[0], "expt")?;
+            let e = num_cmp_f64(&args[1], "expt")?;
+            Ok(Val::Float(b.powf(e)))
+        }
+    }
 }
 
 pub fn builtin_zero(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("zero?: expected 1 argument".into())); }
-    match &args[0] { Val::Int(n) => Ok(Val::Bool(*n == 0)), _ => Err(EvalError::Type("zero?: expected number".into())) }
+    match &args[0] {
+        Val::Int(n) => Ok(Val::Bool(*n == 0)),
+        Val::Float(x) => Ok(Val::Bool(*x == 0.0)),
+        Val::Rational(n, _) => Ok(Val::Bool(*n == 0)),
+        _ => Err(EvalError::Type("zero?: expected number".into())),
+    }
 }
 
 pub fn builtin_positive(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("positive?: expected 1 argument".into())); }
-    match &args[0] { Val::Int(n) => Ok(Val::Bool(*n > 0)), _ => Err(EvalError::Type("positive?: expected number".into())) }
+    match &args[0] {
+        Val::Int(n) => Ok(Val::Bool(*n > 0)),
+        Val::Float(x) => Ok(Val::Bool(*x > 0.0)),
+        Val::Rational(n, _) => Ok(Val::Bool(*n > 0)),
+        _ => Err(EvalError::Type("positive?: expected number".into())),
+    }
 }
 
 pub fn builtin_negative(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("negative?: expected 1 argument".into())); }
-    match &args[0] { Val::Int(n) => Ok(Val::Bool(*n < 0)), _ => Err(EvalError::Type("negative?: expected number".into())) }
+    match &args[0] {
+        Val::Int(n) => Ok(Val::Bool(*n < 0)),
+        Val::Float(x) => Ok(Val::Bool(*x < 0.0)),
+        Val::Rational(n, _) => Ok(Val::Bool(*n < 0)),
+        _ => Err(EvalError::Type("negative?: expected number".into())),
+    }
 }
 
 pub fn builtin_odd(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
