@@ -17,6 +17,7 @@ enum Val {
     Char(char),
     Symbol(String),
     List(Vec<Val>),
+    Pair(Box<Val>, Box<Val>),
     Lambda {
         params: Vec<String>,
         rest_param: Option<String>,
@@ -53,6 +54,21 @@ impl fmt::Display for Val {
                 for (i, e) in elems.iter().enumerate() {
                     if i > 0 { write!(f, " ")?; }
                     write!(f, "{e}")?;
+                }
+                write!(f, ")")
+            }
+            Val::Pair(a, b) => {
+                write!(f, "({a}")?;
+                let mut cur = b.as_ref();
+                loop {
+                    match cur {
+                        Val::Pair(ca, cb) => {
+                            write!(f, " {ca}")?;
+                            cur = cb.as_ref();
+                        }
+                        Val::List(v) if v.is_empty() => break,
+                        other => { write!(f, " . {other}")?; break; }
+                    }
                 }
                 write!(f, ")")
             }
@@ -112,6 +128,36 @@ impl Env {
             ("string-ref", builtin_string_ref),
             ("string-copy", builtin_string_copy),
             ("apply", builtin_apply),
+            ("equal?", builtin_equal),
+            ("eq?", builtin_eq_pred),
+            ("abs", builtin_abs),
+            ("modulo", builtin_modulo),
+            ("remainder", builtin_remainder),
+            ("quotient", builtin_quotient),
+            ("min", builtin_min),
+            ("max", builtin_max),
+            ("expt", builtin_expt),
+            ("zero?", builtin_zero),
+            ("positive?", builtin_positive),
+            ("negative?", builtin_negative),
+            ("odd?", builtin_odd),
+            ("even?", builtin_even),
+            ("list-ref", builtin_list_ref),
+            ("list-tail", builtin_list_tail),
+            ("list?", builtin_is_list),
+            ("assoc", builtin_assoc),
+            ("map", builtin_map),
+            ("char-alphabetic?", builtin_char_alphabetic),
+            ("char-numeric?", builtin_char_numeric),
+            ("char-upcase", builtin_char_upcase),
+            ("char-downcase", builtin_char_downcase),
+            ("char=?", builtin_char_eq),
+            ("char<?", builtin_char_lt),
+            ("string=?", builtin_string_eq),
+            ("string<?", builtin_string_lt),
+            ("string-ci=?", builtin_string_ci_eq),
+            ("string-upcase", builtin_string_upcase),
+            ("string-downcase", builtin_string_downcase),
         ];
         for &(name, f) in builtins {
             frame.borrow_mut().insert(name.to_string(), Val::Builtin(f));
@@ -775,8 +821,7 @@ fn builtin_cons(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
             Ok(Val::List(new))
         }
         _ => {
-            // cons pair (improper list) - for now treat as 2-element list
-            Ok(Val::List(vec![args[0].clone(), args[1].clone()]))
+            Ok(Val::Pair(Box::new(args[0].clone()), Box::new(args[1].clone())))
         }
     }
 }
@@ -787,6 +832,7 @@ fn builtin_car(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     }
     match &args[0] {
         Val::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
+        Val::Pair(a, _) => Ok(a.as_ref().clone()),
         _ => Err(EvalError::Type("car: expected non-empty list".into())),
     }
 }
@@ -797,6 +843,7 @@ fn builtin_cdr(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     }
     match &args[0] {
         Val::List(elems) if !elems.is_empty() => Ok(Val::List(elems[1..].to_vec())),
+        Val::Pair(_, b) => Ok(b.as_ref().clone()),
         _ => Err(EvalError::Type("cdr: expected non-empty list".into())),
     }
 }
@@ -855,7 +902,7 @@ fn builtin_is_symbol(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
 
 fn builtin_is_pair(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("pair?: expected 1 argument".into())); }
-    Ok(Val::Bool(matches!(&args[0], Val::List(v) if !v.is_empty())))
+    Ok(Val::Bool(matches!(&args[0], Val::List(v) if !v.is_empty()) || matches!(&args[0], Val::Pair(_, _))))
 }
 
 fn builtin_is_char(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
@@ -868,6 +915,31 @@ fn display_format(val: &Val) -> String {
     match val {
         Val::Str(s) => s.clone(),
         Val::Char(c) => c.to_string(),
+        Val::List(elems) => {
+            let mut out = String::from("(");
+            for (i, e) in elems.iter().enumerate() {
+                if i > 0 { out.push(' '); }
+                out.push_str(&display_format(e));
+            }
+            out.push(')');
+            out
+        }
+        Val::Pair(a, b) => {
+            let mut out = format!("({}", display_format(a));
+            let mut cur = b.as_ref();
+            loop {
+                match cur {
+                    Val::Pair(ca, cb) => {
+                        out.push_str(&format!(" {}", display_format(ca)));
+                        cur = cb.as_ref();
+                    }
+                    Val::List(v) if v.is_empty() => break,
+                    other => { out.push_str(&format!(" . {}", display_format(other))); break; }
+                }
+            }
+            out.push(')');
+            out
+        }
         other => other.to_string(),
     }
 }
@@ -1007,6 +1079,239 @@ fn builtin_string_copy(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
         Val::Str(s) => Ok(Val::Str(s.clone())),
         _ => Err(EvalError::Type("string-copy: expected string".into())),
     }
+}
+
+fn vals_equal(a: &Val, b: &Val) -> bool {
+    match (a, b) {
+        (Val::Int(x), Val::Int(y)) => x == y,
+        (Val::Bool(x), Val::Bool(y)) => x == y,
+        (Val::Str(x), Val::Str(y)) => x == y,
+        (Val::Char(x), Val::Char(y)) => x == y,
+        (Val::Symbol(x), Val::Symbol(y)) => x == y,
+        (Val::List(x), Val::List(y)) => x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| vals_equal(a, b)),
+        (Val::Pair(a1, b1), Val::Pair(a2, b2)) => vals_equal(a1, a2) && vals_equal(b1, b2),
+        _ => false,
+    }
+}
+
+fn builtin_equal(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("equal?: expected 2 arguments".into())); }
+    Ok(Val::Bool(vals_equal(&args[0], &args[1])))
+}
+
+fn builtin_eq_pred(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("eq?: expected 2 arguments".into())); }
+    let result = match (&args[0], &args[1]) {
+        (Val::Bool(a), Val::Bool(b)) => a == b,
+        (Val::Int(a), Val::Int(b)) => a == b,
+        (Val::Char(a), Val::Char(b)) => a == b,
+        (Val::Symbol(a), Val::Symbol(b)) => a == b,
+        (Val::List(a), Val::List(b)) => a.is_empty() && b.is_empty(),
+        _ => false,
+    };
+    Ok(Val::Bool(result))
+}
+
+fn builtin_abs(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("abs: expected 1 argument".into())); }
+    match &args[0] { Val::Int(n) => Ok(Val::Int(n.abs())), _ => Err(EvalError::Type("abs: expected number".into())) }
+}
+
+fn builtin_modulo(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("modulo: expected 2 arguments".into())); }
+    let nums = require_ints(args, "modulo")?;
+    if nums[1] == 0 { return Err(EvalError::Runtime("modulo: division by zero".into())); }
+    Ok(Val::Int(((nums[0] % nums[1]) + nums[1]) % nums[1]))
+}
+
+fn builtin_remainder(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("remainder: expected 2 arguments".into())); }
+    let nums = require_ints(args, "remainder")?;
+    if nums[1] == 0 { return Err(EvalError::Runtime("remainder: division by zero".into())); }
+    Ok(Val::Int(nums[0] % nums[1]))
+}
+
+fn builtin_quotient(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("quotient: expected 2 arguments".into())); }
+    let nums = require_ints(args, "quotient")?;
+    if nums[1] == 0 { return Err(EvalError::Runtime("quotient: division by zero".into())); }
+    Ok(Val::Int(nums[0] / nums[1]))
+}
+
+fn builtin_min(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.is_empty() { return Err(EvalError::Arity("min: need at least 1 argument".into())); }
+    let nums = require_ints(args, "min")?;
+    Ok(Val::Int(*nums.iter().min().expect("non-empty after arity check")))
+}
+
+fn builtin_max(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.is_empty() { return Err(EvalError::Arity("max: need at least 1 argument".into())); }
+    let nums = require_ints(args, "max")?;
+    Ok(Val::Int(*nums.iter().max().expect("non-empty after arity check")))
+}
+
+fn builtin_expt(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("expt: expected 2 arguments".into())); }
+    let nums = require_ints(args, "expt")?;
+    Ok(Val::Int((nums[0] as i64).pow(nums[1] as u32)))
+}
+
+fn builtin_zero(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("zero?: expected 1 argument".into())); }
+    match &args[0] { Val::Int(n) => Ok(Val::Bool(*n == 0)), _ => Err(EvalError::Type("zero?: expected number".into())) }
+}
+
+fn builtin_positive(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("positive?: expected 1 argument".into())); }
+    match &args[0] { Val::Int(n) => Ok(Val::Bool(*n > 0)), _ => Err(EvalError::Type("positive?: expected number".into())) }
+}
+
+fn builtin_negative(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("negative?: expected 1 argument".into())); }
+    match &args[0] { Val::Int(n) => Ok(Val::Bool(*n < 0)), _ => Err(EvalError::Type("negative?: expected number".into())) }
+}
+
+fn builtin_odd(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("odd?: expected 1 argument".into())); }
+    match &args[0] { Val::Int(n) => Ok(Val::Bool(n % 2 != 0)), _ => Err(EvalError::Type("odd?: expected number".into())) }
+}
+
+fn builtin_even(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("even?: expected 1 argument".into())); }
+    match &args[0] { Val::Int(n) => Ok(Val::Bool(n % 2 == 0)), _ => Err(EvalError::Type("even?: expected number".into())) }
+}
+
+fn builtin_list_ref(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("list-ref: expected 2 arguments".into())); }
+    let idx = match &args[1] { Val::Int(n) => *n as usize, _ => return Err(EvalError::Type("list-ref: expected integer".into())) };
+    match &args[0] {
+        Val::List(elems) => elems.get(idx).cloned().ok_or_else(|| EvalError::Runtime("list-ref: index out of range".into())),
+        _ => Err(EvalError::Type("list-ref: expected list".into())),
+    }
+}
+
+fn builtin_list_tail(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("list-tail: expected 2 arguments".into())); }
+    let idx = match &args[1] { Val::Int(n) => *n as usize, _ => return Err(EvalError::Type("list-tail: expected integer".into())) };
+    match &args[0] {
+        Val::List(elems) => {
+            if idx > elems.len() { return Err(EvalError::Runtime("list-tail: index out of range".into())); }
+            Ok(Val::List(elems[idx..].to_vec()))
+        }
+        _ => Err(EvalError::Type("list-tail: expected list".into())),
+    }
+}
+
+fn builtin_is_list(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("list?: expected 1 argument".into())); }
+    Ok(Val::Bool(matches!(&args[0], Val::List(_))))
+}
+
+fn builtin_assoc(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("assoc: expected 2 arguments".into())); }
+    let key = &args[0];
+    match &args[1] {
+        Val::List(alist) => {
+            for entry in alist {
+                match entry {
+                    Val::List(pair) if !pair.is_empty() => {
+                        if vals_equal(key, &pair[0]) {
+                            return Ok(entry.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Val::Bool(false))
+        }
+        _ => Err(EvalError::Type("assoc: expected list".into())),
+    }
+}
+
+fn builtin_map(args: &[Val], env: &Env) -> Result<Val, EvalError> {
+    if args.len() < 2 { return Err(EvalError::Arity("map: expected at least 2 arguments".into())); }
+    let func = &args[0];
+    let lists: Vec<&Vec<Val>> = args[1..].iter().map(|a| match a {
+        Val::List(v) => Ok(v),
+        _ => Err(EvalError::Type("map: expected list".into())),
+    }).collect::<Result<_, _>>()?;
+    let len = lists[0].len();
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let call_args: Vec<Val> = lists.iter().map(|l| l[i].clone()).collect();
+        result.push(apply_val(func, &call_args, env)?);
+    }
+    Ok(Val::List(result))
+}
+
+fn builtin_char_alphabetic(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("char-alphabetic?: expected 1 argument".into())); }
+    match &args[0] { Val::Char(c) => Ok(Val::Bool(c.is_alphabetic())), _ => Err(EvalError::Type("char-alphabetic?: expected char".into())) }
+}
+
+fn builtin_char_numeric(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("char-numeric?: expected 1 argument".into())); }
+    match &args[0] { Val::Char(c) => Ok(Val::Bool(c.is_ascii_digit())), _ => Err(EvalError::Type("char-numeric?: expected char".into())) }
+}
+
+fn builtin_char_upcase(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("char-upcase: expected 1 argument".into())); }
+    match &args[0] { Val::Char(c) => Ok(Val::Char(c.to_ascii_uppercase())), _ => Err(EvalError::Type("char-upcase: expected char".into())) }
+}
+
+fn builtin_char_downcase(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("char-downcase: expected 1 argument".into())); }
+    match &args[0] { Val::Char(c) => Ok(Val::Char(c.to_ascii_lowercase())), _ => Err(EvalError::Type("char-downcase: expected char".into())) }
+}
+
+fn builtin_char_eq(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("char=?: expected 2 arguments".into())); }
+    match (&args[0], &args[1]) {
+        (Val::Char(a), Val::Char(b)) => Ok(Val::Bool(a == b)),
+        _ => Err(EvalError::Type("char=?: expected chars".into())),
+    }
+}
+
+fn builtin_char_lt(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("char<?: expected 2 arguments".into())); }
+    match (&args[0], &args[1]) {
+        (Val::Char(a), Val::Char(b)) => Ok(Val::Bool(a < b)),
+        _ => Err(EvalError::Type("char<?: expected chars".into())),
+    }
+}
+
+fn builtin_string_eq(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("string=?: expected 2 arguments".into())); }
+    match (&args[0], &args[1]) {
+        (Val::Str(a), Val::Str(b)) => Ok(Val::Bool(a == b)),
+        _ => Err(EvalError::Type("string=?: expected strings".into())),
+    }
+}
+
+fn builtin_string_lt(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("string<?: expected 2 arguments".into())); }
+    match (&args[0], &args[1]) {
+        (Val::Str(a), Val::Str(b)) => Ok(Val::Bool(a < b)),
+        _ => Err(EvalError::Type("string<?: expected strings".into())),
+    }
+}
+
+fn builtin_string_ci_eq(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("string-ci=?: expected 2 arguments".into())); }
+    match (&args[0], &args[1]) {
+        (Val::Str(a), Val::Str(b)) => Ok(Val::Bool(a.to_lowercase() == b.to_lowercase())),
+        _ => Err(EvalError::Type("string-ci=?: expected strings".into())),
+    }
+}
+
+fn builtin_string_upcase(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("string-upcase: expected 1 argument".into())); }
+    match &args[0] { Val::Str(s) => Ok(Val::Str(s.to_uppercase())), _ => Err(EvalError::Type("string-upcase: expected string".into())) }
+}
+
+fn builtin_string_downcase(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("string-downcase: expected 1 argument".into())); }
+    match &args[0] { Val::Str(s) => Ok(Val::Str(s.to_lowercase())), _ => Err(EvalError::Type("string-downcase: expected string".into())) }
 }
 
 fn builtin_apply(args: &[Val], env: &Env) -> Result<Val, EvalError> {
