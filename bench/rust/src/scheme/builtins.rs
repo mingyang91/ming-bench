@@ -711,6 +711,7 @@ fn builtin_is_procedure(args: &[Value], _output: &mut String) -> Result<Value, E
     Ok(Value::Boolean(matches!(args[0],
         Value::Lambda { .. } | Value::Builtin(_) | Value::CaseLambda { .. }
         | Value::RecordConstructor { .. } | Value::RecordPredicate { .. } | Value::RecordAccessor { .. }
+        | Value::CallCC | Value::Continuation(_)
     )))
 }
 
@@ -1301,6 +1302,9 @@ pub(crate) fn make_global_env() -> Env {
         // L17: Pair mutation
         e.set("set-car!".into(), Value::Builtin(builtin_set_car));
         e.set("set-cdr!".into(), Value::Builtin(builtin_set_cdr));
+        // L18: call/cc
+        e.set("call/cc".into(), Value::CallCC);
+        e.set("call-with-current-continuation".into(), Value::CallCC);
         // c..r compositions (3-letter)
         e.set("caar".into(), Value::Builtin(builtin_caar));
         e.set("cadr".into(), Value::Builtin(builtin_cadr));

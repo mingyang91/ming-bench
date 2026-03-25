@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{eval, Ast, AstKind, Env, Environment, EvalError, Value};
+use super::{Ast, AstKind, Env, Environment, EvalError, Value};
 
 static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -217,14 +217,13 @@ fn find_ellipsis_var(
     }
 }
 
-pub(crate) fn expand_and_eval_macro(
+pub(crate) fn expand_macro_form(
     literals: &[String],
     rules: &[(Ast, Ast)],
     def_env: &Env,
     form: &[Ast],
     use_env: &Env,
-    output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<(Ast, Env), EvalError> {
     let form_args = &form[1..];
 
     for (pattern, template) in rules {
@@ -245,10 +244,10 @@ pub(crate) fn expand_and_eval_macro(
                         child_env.borrow_mut().set(gensym_name.clone(), val);
                     }
                 }
-                return eval(&expanded, &child_env, output);
+                return Ok((expanded, child_env));
             }
 
-            return eval(&expanded, use_env, output);
+            return Ok((expanded, Rc::clone(use_env)));
         }
     }
 
