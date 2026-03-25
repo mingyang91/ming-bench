@@ -14,8 +14,8 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parser::parse(input)?;
     let mut evaluator = Evaluator::new();
     let mut result = value::Value::Void;
-    for expr in exprs {
-        result = evaluator.eval(&expr)?;
+    for expr in &exprs {
+        result = evaluator.eval(expr)?;
     }
     match result {
         value::Value::Void => Ok("".into()),
