@@ -23,10 +23,13 @@ object Evaluator:
   def eval(expr: SchemeVal, env: Env): SchemeVal =
     try
       expr match
-        case SchemeVal.IntVal(_)    => expr
-        case SchemeVal.BoolVal(_)   => expr
-        case SchemeVal.StringVal(_) => expr
-        case SchemeVal.CharVal(_)   => expr
+        case SchemeVal.IntVal(_)              => expr
+        case SchemeVal.BoolVal(_)             => expr
+        case SchemeVal.StringVal(_)           => expr
+        case SchemeVal.CharVal(_)             => expr
+        case SchemeVal.BuiltinProc(_, _)      => expr
+        case SchemeVal.LambdaProc(_, _, _, _) => expr
+        case SchemeVal.MacroVal(_, _, _, _)   => expr
         case SchemeVal.Symbol(name) =>
           env.lookup(name) match
             case Some(v) => v
@@ -40,13 +43,23 @@ object Evaluator:
             case SchemeVal.Symbol("quote") =>
               if elems.tail.size != 1 then throw new EvalError("quote: expected 1 argument")
               elems.tail.head
-            case SchemeVal.Symbol("lambda") => evalLambda(elems.tail, env)
-            case SchemeVal.Symbol("and")    => evalAnd(elems.tail, env)
-            case SchemeVal.Symbol("or")     => evalOr(elems.tail, env)
-            case SchemeVal.Symbol("begin")  => evalBegin(elems.tail, env)
-            case SchemeVal.Symbol("let")    => evalLet(elems.tail, env)
-            case SchemeVal.Symbol("cond")   => evalCond(elems.tail, env)
-            case SchemeVal.Symbol("set!")   => evalSet(elems.tail, env)
+            case SchemeVal.Symbol("lambda")        => evalLambda(elems.tail, env)
+            case SchemeVal.Symbol("and")           => evalAnd(elems.tail, env)
+            case SchemeVal.Symbol("or")            => evalOr(elems.tail, env)
+            case SchemeVal.Symbol("begin")         => evalBegin(elems.tail, env)
+            case SchemeVal.Symbol("let")           => evalLet(elems.tail, env)
+            case SchemeVal.Symbol("cond")          => evalCond(elems.tail, env)
+            case SchemeVal.Symbol("set!")          => evalSet(elems.tail, env)
+            case SchemeVal.Symbol("define-syntax") => evalDefineSyntax(elems.tail, env)
+            case SchemeVal.Symbol(name) =>
+              env.lookup(name) match
+                case Some(m: SchemeVal.MacroVal) =>
+                  val expanded = Macro.expand(m.name, m.literals, m.rules, m.defEnv, SchemeVal.SList(elems))
+                  eval(expanded, env)
+                case _ =>
+                  val proc = eval(elems.head, env)
+                  val args = elems.tail.map(a => eval(a, env))
+                  apply(proc, args)
             case head =>
               val proc = eval(head, env)
               val args = elems.tail.map(a => eval(a, env))
@@ -196,6 +209,27 @@ object Evaluator:
                   else elems.tail.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, env))
                 else evalCond(rest, env)
           case _ => throw new EvalError("cond: bad clause")
+
+  private def evalDefineSyntax(args: List[SchemeVal], env: Env): SchemeVal =
+    args match
+      case SchemeVal.Symbol(name) :: SchemeVal.SList(srElems) :: Nil =>
+        srElems.head match
+          case SchemeVal.Symbol("syntax-rules") =>
+            val literals = srElems(1) match
+              case SchemeVal.SList(lits) =>
+                lits.map {
+                  case SchemeVal.Symbol(s) => s
+                  case other               => throw new EvalError(s"syntax-rules: expected literal, got $other")
+                }
+              case _ => throw new EvalError("syntax-rules: expected literal list")
+            val rules = srElems.drop(2).map {
+              case SchemeVal.SList(List(pattern, template)) => (pattern, template)
+              case _ => throw new EvalError("syntax-rules: expected (pattern template) clause")
+            }
+            env.define(name, SchemeVal.MacroVal(name, literals, rules, env))
+            SchemeVal.Void
+          case _ => throw new EvalError("define-syntax: expected syntax-rules")
+      case _ => throw new EvalError("define-syntax: bad syntax")
 
   private def evalSet(args: List[SchemeVal], env: Env): SchemeVal =
     args match

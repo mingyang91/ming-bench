@@ -12,6 +12,7 @@ enum SchemeVal:
   case Void
   case BuiltinProc(name: String, f: List[SchemeVal] => SchemeVal)
   case LambdaProc(params: List[String], body: List[SchemeVal], closure: Env, rest: Option[String] = None)
+  case MacroVal(name: String, literals: List[String], rules: List[(SchemeVal, SchemeVal)], defEnv: Env)
 
 object SchemeVal:
 
@@ -33,6 +34,7 @@ object SchemeVal:
     case Void                    => ""
     case BuiltinProc(name, _)    => s"#<procedure $name>"
     case LambdaProc(_, _, _, _)  => "#<procedure>"
+    case MacroVal(name, _, _, _) => s"#<macro $name>"
 
   /** display-style output (strings unquoted) */
   def displayOutput(v: SchemeVal): String = v match
