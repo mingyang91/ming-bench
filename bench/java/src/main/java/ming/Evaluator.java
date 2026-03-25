@@ -18,10 +18,16 @@ public class Evaluator {
         record Bool(boolean value) implements Val {}
         final class Str implements Val {
             private final char[] chars;
-            Str(String value) { this.chars = value.toCharArray(); }
+            private boolean immutable;
+            Str(String value) { this.chars = value.toCharArray(); this.immutable = false; }
+            static Str literal(String value) { Str s = new Str(value); s.immutable = true; return s; }
             String value() { return new String(chars); }
-            void setChar(int idx, char c) { chars[idx] = c; }
+            void setChar(int idx, char c) {
+                if (immutable) throw new RuntimeException("string-set!: string is immutable");
+                chars[idx] = c;
+            }
             int length() { return chars.length; }
+            boolean isImmutable() { return immutable; }
         }
         record Sym(String name) implements Val {}
         record Chr(char value) implements Val {}
@@ -357,7 +363,7 @@ public class Evaluator {
                     sb.append(raw.charAt(i));
                 }
             }
-            return new Val.Str(sb.toString());
+            return Val.Str.literal(sb.toString());
         }
         try {
             return new Val.Int(Long.parseLong(tok));
@@ -1513,10 +1519,43 @@ public class Evaluator {
         env.define("string-set!", new Val.Builtin("string-set!", args -> {
             checkArgCount(args, 3, "string-set!");
             if (!(args.get(0) instanceof Val.Str s)) throw new RuntimeException("string-set!: not a string");
-            int idx = (int) asInt(args.get(1));
+            if (!(args.get(1) instanceof Val.Int idx)) throw new RuntimeException("string-set!: not an integer");
             if (!(args.get(2) instanceof Val.Chr c)) throw new RuntimeException("string-set!: not a character");
-            s.setChar(idx, c.value());
+            int i = (int) idx.value();
+            if (i < 0 || i >= s.length()) throw new RuntimeException("string-set!: index out of range");
+            s.setChar(i, c.value());
             return new Val.Void();
+        }));
+        // L15 — string immutability helpers
+        env.define("string->list", new Val.Builtin("string->list", args -> {
+            checkArgCount(args, 1, "string->list");
+            if (!(args.get(0) instanceof Val.Str s)) throw new RuntimeException("string->list: not a string");
+            Val result = new Val.Nil();
+            String v = s.value();
+            for (int i = v.length() - 1; i >= 0; i--) {
+                result = new Val.PairV(new Val.Chr(v.charAt(i)), result);
+            }
+            return result;
+        }));
+        env.define("list->string", new Val.Builtin("list->string", args -> {
+            checkArgCount(args, 1, "list->string");
+            StringBuilder sb = new StringBuilder();
+            Val cur = args.get(0);
+            while (cur instanceof Val.PairV p) {
+                if (!(p.car() instanceof Val.Chr c)) throw new RuntimeException("list->string: not a character");
+                sb.append(c.value());
+                cur = p.cdr();
+            }
+            return new Val.Str(sb.toString());
+        }));
+        env.define("char->integer", new Val.Builtin("char->integer", args -> {
+            checkArgCount(args, 1, "char->integer");
+            if (!(args.get(0) instanceof Val.Chr c)) throw new RuntimeException("char->integer: not a character");
+            return new Val.Int((long) c.value());
+        }));
+        env.define("integer->char", new Val.Builtin("integer->char", args -> {
+            checkArgCount(args, 1, "integer->char");
+            return new Val.Chr((char) asInt(args.get(0)));
         }));
         // L09 — numeric utilities
         env.define("abs", new Val.Builtin("abs", args -> {
