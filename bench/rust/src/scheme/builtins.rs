@@ -711,7 +711,7 @@ fn builtin_is_procedure(args: &[Value], _output: &mut String) -> Result<Value, E
     Ok(Value::Boolean(matches!(args[0],
         Value::Lambda { .. } | Value::Builtin(_) | Value::CaseLambda { .. }
         | Value::RecordConstructor { .. } | Value::RecordPredicate { .. } | Value::RecordAccessor { .. }
-        | Value::CallCC | Value::Continuation(_)
+        | Value::CallCC | Value::DynamicWind | Value::Continuation(_, _)
     )))
 }
 
@@ -1305,6 +1305,8 @@ pub(crate) fn make_global_env() -> Env {
         // L18: call/cc
         e.set("call/cc".into(), Value::CallCC);
         e.set("call-with-current-continuation".into(), Value::CallCC);
+        // L19: dynamic-wind
+        e.set("dynamic-wind".into(), Value::DynamicWind);
         // c..r compositions (3-letter)
         e.set("caar".into(), Value::Builtin(builtin_caar));
         e.set("cadr".into(), Value::Builtin(builtin_cadr));

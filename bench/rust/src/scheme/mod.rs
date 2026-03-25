@@ -35,6 +35,7 @@ pub(crate) enum AstKind {
 // ---- Runtime values ----
 
 type Kont = Vec<Frame>;
+pub(crate) type Winders = Vec<Rc<(Value, Value)>>;
 
 #[derive(Debug, Clone)]
 pub(crate) enum Value {
@@ -85,7 +86,8 @@ pub(crate) enum Value {
     Vector(Rc<RefCell<Vec<Value>>>),
     Void,
     CallCC,
-    Continuation(Kont),
+    DynamicWind,
+    Continuation(Kont, Winders),
 }
 
 // ---- CEK Machine continuation frames ----
@@ -110,6 +112,10 @@ pub(crate) enum Frame {
     CaseKey { clauses: Vec<Ast>, env: Env },
     StringSetIdx { var_name: String, char_expr: Ast, env: Env },
     StringSetChar { var_name: String, idx: usize, env: Env },
+    DynWindAfterIn { entry: Rc<(Value, Value)>, body_thunk: Value },
+    DynWindAfterBody { out_thunk: Value },
+    DynWindAfterOut { result: Value },
+    ContinuationWind { out_thunks: Vec<Value>, in_entries: Winders, saved_kont: Kont, saved_winders: Winders, val: Value },
 }
 
 pub(crate) enum CekState {
@@ -297,7 +303,7 @@ impl Value {
             | Value::RecordConstructor { .. } | Value::RecordPredicate { .. }
             | Value::RecordAccessor { .. }
             | Value::CaseLambda { .. }
-            | Value::CallCC | Value::Continuation(_) => "#<procedure>".into(),
+            | Value::CallCC | Value::DynamicWind | Value::Continuation(_, _) => "#<procedure>".into(),
             Value::Vector(v) => {
                 let items = v.borrow();
                 let inner: Vec<String> = items.iter().map(|v| v.display_value()).collect();
@@ -404,8 +410,9 @@ fn ast_list(items: Vec<Ast>) -> Ast {
 /// Evaluate an AST node, wrapping any error with source position.
 pub(crate) fn eval(ast: &Ast, env: &Env, output: &mut String) -> Result<Value, EvalError> {
     let mut kont: Kont = Vec::new();
+    let mut winders: Winders = Vec::new();
     let state = CekState::Eval(ast.clone(), Rc::clone(env));
-    cek_run(state, &mut kont, output).map_err(|e| match e {
+    cek_run(state, &mut kont, &mut winders, output).map_err(|e| match e {
         EvalError::WithPosition(_, _, _) => e,
         _ => EvalError::WithPosition(Box::new(e), ast.line, ast.col),
     })
@@ -419,7 +426,7 @@ fn wrap_err(e: EvalError, pos: (usize, usize)) -> EvalError {
     }
 }
 
-fn cek_run(mut state: CekState, kont: &mut Kont, output: &mut String) -> Result<Value, EvalError> {
+fn cek_run(mut state: CekState, kont: &mut Kont, winders: &mut Winders, output: &mut String) -> Result<Value, EvalError> {
     let mut last_pos = (0usize, 0usize);
     loop {
         if let CekState::Eval(ref ast, _) = state {
@@ -433,7 +440,7 @@ fn cek_run(mut state: CekState, kont: &mut Kont, output: &mut String) -> Result<
                 match kont.pop() {
                     None => return Ok(val),
                     Some(frame) => {
-                        cek_apply_frame(frame, val, kont, output).map_err(|e| wrap_err(e, last_pos))?
+                        cek_apply_frame(frame, val, kont, winders, output).map_err(|e| wrap_err(e, last_pos))?
                     }
                 }
             }
@@ -939,6 +946,12 @@ fn cek_eval_do(args: &[Ast], env: &Env) -> Result<CekState, EvalError> {
 
 use cek::{cek_apply_frame, cek_eval_body};
 
+pub(crate) fn common_winder_prefix_len(a: &Winders, b: &Winders) -> usize {
+    a.iter().zip(b.iter())
+        .take_while(|(x, y)| Rc::ptr_eq(x, y))
+        .count()
+}
+
 // ---- Lambda / Parameter parsing ----
 
 fn eval_lambda(args: &[Ast], env: &Env) -> Result<Value, EvalError> {
@@ -1206,17 +1219,17 @@ fn apply(func: &Value, args: &[Value], output: &mut String) -> Result<Value, Eva
                 return Err(EvalError::Arity("call/cc requires 1 argument".into()));
             }
             // Fallback: create identity continuation
-            let cont = Value::Continuation(Vec::new());
+            let cont = Value::Continuation(Vec::new(), Vec::new());
             apply(&args[0], &[cont], output)
         }
-        Value::Continuation(saved_kont) => {
+        Value::Continuation(saved_kont, saved_winders) => {
             if args.len() != 1 {
                 return Err(EvalError::Arity("continuation requires 1 argument".into()));
             }
             if saved_kont.is_empty() {
                 Ok(args[0].clone())
             } else {
-                cek_run(CekState::Apply(args[0].clone()), &mut saved_kont.clone(), output)
+                cek_run(CekState::Apply(args[0].clone()), &mut saved_kont.clone(), &mut saved_winders.clone(), output)
             }
         }
         _ => Err(EvalError::Type(format!("not a procedure: {}", func.display_value()))),
@@ -1234,11 +1247,12 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         return Ok(Value::Void.display_value());
     }
     let mut kont: Kont = Vec::new();
+    let mut winders: Winders = Vec::new();
     if exprs.len() > 1 {
         kont.push(Frame::Seq { remaining: exprs[1..].to_vec(), env: Rc::clone(&env) });
     }
     let state = CekState::Eval(exprs[0].clone(), Rc::clone(&env));
-    let result = cek_run(state, &mut kont, &mut output)?;
+    let result = cek_run(state, &mut kont, &mut winders, &mut output)?;
     Ok(result.display_value())
 }
 
@@ -1253,11 +1267,12 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
         return Ok((Value::Void.display_value(), output));
     }
     let mut kont: Kont = Vec::new();
+    let mut winders: Winders = Vec::new();
     if exprs.len() > 1 {
         kont.push(Frame::Seq { remaining: exprs[1..].to_vec(), env: Rc::clone(&env) });
     }
     let state = CekState::Eval(exprs[0].clone(), Rc::clone(&env));
-    let result = cek_run(state, &mut kont, &mut output)?;
+    let result = cek_run(state, &mut kont, &mut winders, &mut output)?;
     Ok((result.display_value(), output))
 }
 

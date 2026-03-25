@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use super::{
-    ast_to_value, cek_eval_cond, eqv, vec_to_list, Ast, AstKind, CekState, Environment, Env,
-    EvalError, Frame, Kont, Value,
+    ast_to_value, cek_eval_cond, common_winder_prefix_len, eqv, vec_to_list, Ast, AstKind,
+    CekState, Environment, Env, EvalError, Frame, Kont, Value, Winders,
 };
 
 /// Helper: set up body evaluation in the CEK machine
@@ -36,7 +36,7 @@ pub(crate) fn bind_params(params: &[String], rest_param: &Option<String>, args: 
     Ok(local_env)
 }
 
-pub(crate) fn cek_apply_frame(frame: Frame, val: Value, kont: &mut Kont, output: &mut String) -> Result<CekState, EvalError> {
+pub(crate) fn cek_apply_frame(frame: Frame, val: Value, kont: &mut Kont, winders: &mut Winders, output: &mut String) -> Result<CekState, EvalError> {
     match frame {
         Frame::If { then_br, else_br, env } => {
             if val.is_truthy() {
@@ -97,7 +97,7 @@ pub(crate) fn cek_apply_frame(frame: Frame, val: Value, kont: &mut Kont, output:
         Frame::EvalFunc { args, env } => {
             // Right-to-left evaluation: evaluate last arg first
             if args.is_empty() {
-                cek_apply_func(val, Vec::new(), kont, output)
+                cek_apply_func(val, Vec::new(), kont, winders, output)
             } else {
                 let n = args.len();
                 kont.push(Frame::Args {
@@ -113,7 +113,7 @@ pub(crate) fn cek_apply_frame(frame: Frame, val: Value, kont: &mut Kont, output:
             done.push(val);
             if remaining.is_empty() {
                 done.reverse(); // restore left-to-right order
-                cek_apply_func(func, done, kont, output)
+                cek_apply_func(func, done, kont, winders, output)
             } else {
                 let n = remaining.len();
                 kont.push(Frame::Args {
@@ -127,8 +127,8 @@ pub(crate) fn cek_apply_frame(frame: Frame, val: Value, kont: &mut Kont, output:
         }
         Frame::CallCC => {
             // val is the procedure to call with the current continuation
-            let cont = Value::Continuation(kont.clone());
-            cek_apply_func(val, vec![cont], kont, output)
+            let cont = Value::Continuation(kont.clone(), winders.clone());
+            cek_apply_func(val, vec![cont], kont, winders, output)
         }
         Frame::LetBind { name, remaining, mut values, body, eval_env } => {
             values.push((name, val));
@@ -278,10 +278,55 @@ pub(crate) fn cek_apply_frame(frame: Frame, val: Value, kont: &mut Kont, output:
             env.borrow_mut().set_existing(&var_name, Value::Str(new_s));
             Ok(CekState::Apply(Value::Void))
         }
+        Frame::DynWindAfterIn { entry, body_thunk } => {
+            let out_thunk = entry.1.clone();
+            winders.push(entry);
+            kont.push(Frame::DynWindAfterBody { out_thunk });
+            cek_apply_func(body_thunk, vec![], kont, winders, output)
+        }
+        Frame::DynWindAfterBody { out_thunk } => {
+            winders.pop();
+            kont.push(Frame::DynWindAfterOut { result: val });
+            cek_apply_func(out_thunk, vec![], kont, winders, output)
+        }
+        Frame::DynWindAfterOut { result } => {
+            Ok(CekState::Apply(result))
+        }
+        Frame::ContinuationWind { mut out_thunks, in_entries, saved_kont, saved_winders, val } => {
+            if !out_thunks.is_empty() {
+                let thunk = out_thunks.remove(0);
+                winders.pop();
+                kont.push(Frame::ContinuationWind {
+                    out_thunks,
+                    in_entries,
+                    saved_kont,
+                    saved_winders,
+                    val,
+                });
+                cek_apply_func(thunk, vec![], kont, winders, output)
+            } else if !in_entries.is_empty() {
+                let entry = in_entries[0].clone();
+                let remaining = in_entries[1..].to_vec();
+                let in_thunk = entry.0.clone();
+                winders.push(entry);
+                kont.push(Frame::ContinuationWind {
+                    out_thunks: vec![],
+                    in_entries: remaining,
+                    saved_kont,
+                    saved_winders,
+                    val,
+                });
+                cek_apply_func(in_thunk, vec![], kont, winders, output)
+            } else {
+                *kont = saved_kont;
+                *winders = saved_winders;
+                Ok(CekState::Apply(val))
+            }
+        }
     }
 }
 
-pub(crate) fn cek_apply_func(func: Value, args: Vec<Value>, kont: &mut Kont, output: &mut String) -> Result<CekState, EvalError> {
+pub(crate) fn cek_apply_func(func: Value, args: Vec<Value>, kont: &mut Kont, winders: &mut Winders, output: &mut String) -> Result<CekState, EvalError> {
     match func {
         Value::Lambda { params, rest_param, body, env } => {
             let local_env = bind_params(&params, &rest_param, &args, &env)?;
@@ -314,20 +359,48 @@ pub(crate) fn cek_apply_func(func: Value, args: Vec<Value>, kont: &mut Kont, out
             let result = f(&args, output)?;
             Ok(CekState::Apply(result))
         }
+        Value::DynamicWind => {
+            if args.len() != 3 {
+                return Err(EvalError::Arity("dynamic-wind requires 3 arguments".into()));
+            }
+            let in_thunk = args[0].clone();
+            let body_thunk = args[1].clone();
+            let out_thunk = args[2].clone();
+            let entry = Rc::new((in_thunk.clone(), out_thunk));
+            kont.push(Frame::DynWindAfterIn { entry, body_thunk });
+            cek_apply_func(in_thunk, vec![], kont, winders, output)
+        }
         Value::CallCC => {
             if args.len() != 1 {
                 return Err(EvalError::Arity("call/cc requires exactly 1 argument".into()));
             }
             let proc = args.into_iter().next().expect("arity checked above");
-            let cont = Value::Continuation(kont.clone());
-            cek_apply_func(proc, vec![cont], kont, output)
+            let cont = Value::Continuation(kont.clone(), winders.clone());
+            cek_apply_func(proc, vec![cont], kont, winders, output)
         }
-        Value::Continuation(saved_kont) => {
+        Value::Continuation(saved_kont, saved_winders) => {
             if args.len() != 1 {
                 return Err(EvalError::Arity("continuation requires exactly 1 argument".into()));
             }
-            *kont = saved_kont;
-            Ok(CekState::Apply(args.into_iter().next().expect("arity checked above")))
+            let val = args.into_iter().next().expect("arity checked above");
+            let common = common_winder_prefix_len(winders, &saved_winders);
+            if winders.len() == common && saved_winders.len() == common {
+                *kont = saved_kont;
+                *winders = saved_winders;
+                Ok(CekState::Apply(val))
+            } else {
+                let out_thunks: Vec<Value> = winders[common..].iter().rev()
+                    .map(|entry| entry.1.clone()).collect();
+                let in_entries = saved_winders[common..].to_vec();
+                kont.push(Frame::ContinuationWind {
+                    out_thunks,
+                    in_entries,
+                    saved_kont,
+                    saved_winders,
+                    val,
+                });
+                Ok(CekState::Apply(Value::Void))
+            }
         }
         Value::RecordConstructor { type_id, type_name, field_names } => {
             if args.len() != field_names.len() {
