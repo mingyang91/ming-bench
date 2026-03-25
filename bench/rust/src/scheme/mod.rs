@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
+static RECORD_TYPE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn gensym(base: &str) -> String {
     let n = GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -51,6 +52,11 @@ enum Value {
         rules: Vec<(Vec<Expr>, Expr)>,
         def_env: Env,
     },
+    Record {
+        type_id: u64,
+        type_name: String,
+        fields: Vec<(String, Value)>,
+    },
     Void,
 }
 
@@ -87,6 +93,13 @@ impl fmt::Display for Value {
             }
             Value::Pair(a, b) => {
                 write!(f, "({a} . {b})")
+            }
+            Value::Record { type_name, fields, .. } => {
+                write!(f, "#<record:{type_name}")?;
+                for (name, val) in fields {
+                    write!(f, " {name}={val}")?;
+                }
+                write!(f, ">")
             }
             Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
@@ -733,6 +746,73 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                         chars[idx] = ch;
                         let new_str: String = chars.into_iter().collect();
                         env.set(var_name, Value::Str(new_str));
+                        return Ok(Value::Void);
+                    }
+                    "define-record-type" => {
+                        // (define-record-type <name> (constructor field-names...) predicate (field accessor)...)
+                        if elems.len() < 4 {
+                            return Err(EvalError::Syntax(format!("define-record-type requires at least 3 arguments at {span}")));
+                        }
+                        let type_name_str = match &elems[1].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Syntax(format!("define-record-type: expected type name at {span}"))),
+                        };
+                        let type_id = RECORD_TYPE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                        // Parse constructor: (constructor-name field-name ...)
+                        let (ctor_name, ctor_fields) = match &elems[2].kind {
+                            ExprKind::List(parts) if !parts.is_empty() => {
+                                let name = match &parts[0].kind {
+                                    ExprKind::Symbol(s) => s.clone(),
+                                    _ => return Err(EvalError::Syntax(format!("define-record-type: expected constructor name at {span}"))),
+                                };
+                                let fields: Vec<String> = parts[1..].iter().map(|p| match &p.kind {
+                                    ExprKind::Symbol(s) => Ok(s.clone()),
+                                    _ => Err(EvalError::Syntax(format!("define-record-type: expected field name at {span}"))),
+                                }).collect::<Result<_, _>>()?;
+                                (name, fields)
+                            }
+                            _ => return Err(EvalError::Syntax(format!("define-record-type: expected constructor at {span}"))),
+                        };
+                        // Parse predicate
+                        let pred_name = match &elems[3].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Syntax(format!("define-record-type: expected predicate name at {span}"))),
+                        };
+                        // Parse field accessors: (field-name accessor-name) ...
+                        let mut field_accessors: Vec<(String, String)> = Vec::new();
+                        for field_spec in &elems[4..] {
+                            match &field_spec.kind {
+                                ExprKind::List(parts) if parts.len() >= 2 => {
+                                    let field_name = match &parts[0].kind {
+                                        ExprKind::Symbol(s) => s.clone(),
+                                        _ => return Err(EvalError::Syntax(format!("define-record-type: expected field name at {span}"))),
+                                    };
+                                    let accessor_name = match &parts[1].kind {
+                                        ExprKind::Symbol(s) => s.clone(),
+                                        _ => return Err(EvalError::Syntax(format!("define-record-type: expected accessor name at {span}"))),
+                                    };
+                                    field_accessors.push((field_name, accessor_name));
+                                }
+                                _ => return Err(EvalError::Syntax(format!("define-record-type: bad field spec at {span}"))),
+                            }
+                        }
+
+                        // Encode metadata in builtin names so apply_builtin can decode them
+                        // Constructor: __rctor_<type_id>_<type_name>_<field1>,<field2>,...
+                        let fields_str = ctor_fields.join(",");
+                        let ctor_builtin = format!("__rctor_{}_{}_{}", type_id, type_name_str, fields_str);
+                        env.set(ctor_name, Value::Builtin(ctor_builtin));
+
+                        // Predicate: __rpred_<type_id>
+                        let pred_builtin = format!("__rpred_{}", type_id);
+                        env.set(pred_name, Value::Builtin(pred_builtin));
+
+                        // Accessors: __racc_<type_id>_<field_name>
+                        for (field_name, accessor_name) in &field_accessors {
+                            let acc_builtin = format!("__racc_{}_{}", type_id, field_name);
+                            env.set(accessor_name.clone(), Value::Builtin(acc_builtin));
+                        }
+
                         return Ok(Value::Void);
                     }
                     "define-syntax" => {
@@ -1508,6 +1588,56 @@ fn apply_builtin(name: &str, args: &[Value], call_span: Span, output: &mut Strin
                 _ => Err(EvalError::Type(format!("string-downcase: not a string at {call_span}"))),
             }
         }
+        _ if name.starts_with("__rctor_") => {
+            // __rctor_<type_id>_<type_name>_<field1>,<field2>,...
+            let rest = &name["__rctor_".len()..];
+            let mut parts = rest.splitn(3, '_');
+            let type_id: u64 = parts.next().unwrap().parse().unwrap();
+            let type_name = parts.next().unwrap().to_string();
+            let fields_str = parts.next().unwrap_or("");
+            let field_names: Vec<&str> = if fields_str.is_empty() { vec![] } else { fields_str.split(',').collect() };
+            if args.len() != field_names.len() {
+                return Err(EvalError::Arity(format!(
+                    "{type_name} constructor expects {} arguments, got {} at {call_span}", field_names.len(), args.len()
+                )));
+            }
+            let fields = field_names.iter().zip(args.iter())
+                .map(|(name, val)| (name.to_string(), val.clone()))
+                .collect();
+            Ok(Value::Record { type_id, type_name, fields })
+        }
+        _ if name.starts_with("__rpred_") => {
+            // __rpred_<type_id>
+            let type_id: u64 = name["__rpred_".len()..].parse().unwrap();
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("predicate requires 1 argument at {call_span}")));
+            }
+            match &args[0] {
+                Value::Record { type_id: tid, .. } if *tid == type_id => Ok(Value::Boolean(true)),
+                _ => Ok(Value::Boolean(false)),
+            }
+        }
+        _ if name.starts_with("__racc_") => {
+            // __racc_<type_id>_<field_name>
+            let rest = &name["__racc_".len()..];
+            let sep = rest.find('_').unwrap();
+            let type_id: u64 = rest[..sep].parse().unwrap();
+            let field_name = &rest[sep + 1..];
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("accessor requires 1 argument at {call_span}")));
+            }
+            match &args[0] {
+                Value::Record { type_id: tid, fields, .. } if *tid == type_id => {
+                    for (fname, val) in fields {
+                        if fname == field_name {
+                            return Ok(val.clone());
+                        }
+                    }
+                    Err(EvalError::Type(format!("record has no field {field_name} at {call_span}")))
+                }
+                _ => Err(EvalError::Type(format!("accessor: not a matching record at {call_span}"))),
+            }
+        }
         _ => Err(EvalError::Unbound(format!("{name} at {call_span}"))),
     }
 }
@@ -1669,7 +1799,7 @@ enum PatternBinding {
 
 fn is_macro_special(s: &str) -> bool {
     matches!(s, "quote" | "if" | "define" | "lambda" | "and" | "or"
-        | "let" | "begin" | "cond" | "set!" | "string-set!" | "define-syntax" | "...")
+        | "let" | "begin" | "cond" | "set!" | "string-set!" | "define-syntax" | "define-record-type" | "...")
 }
 
 fn match_syntax_pattern(
