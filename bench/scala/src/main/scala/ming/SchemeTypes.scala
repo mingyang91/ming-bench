@@ -10,6 +10,7 @@ private[ming] enum Expr:
   case Sym(name: String)
   case Lst(elems: List[Expr])
   case Lambda(params: List[String], restParam: Option[String], body: List[Expr], closure: Env)
+  case Pair(car: Expr, cdr: Expr)
 
   var line: Int = 0
   var col: Int  = 0

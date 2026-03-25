@@ -7,7 +7,7 @@ object Evaluator:
   private def eval(expr: Expr, env: Env): Expr =
     try
       expr match
-        case Expr.Num(_) | Expr.Bool(_) | Expr.Str(_) | Expr.Chr(_) | Expr.Lambda(_, _, _, _) =>
+        case Expr.Num(_) | Expr.Bool(_) | Expr.Str(_) | Expr.Chr(_) | Expr.Lambda(_, _, _, _) | Expr.Pair(_, _) =>
           expr
         case Expr.Sym(name) => env.lookup(name)
         case Expr.Lst(Nil)  => throw EvalError("empty application")
@@ -139,6 +139,7 @@ object Evaluator:
 
   private def applyProc(func: Expr, args: List[Expr]): Expr = func match
     case Expr.Sym(name) if name == "apply" => applyApply(args)
+    case Expr.Sym(name) if name == "map"   => applyMap(Expr.Sym("map"), args)
     case Expr.Sym(name)                    => applyBuiltin(name, args)
     case Expr.Lambda(params, restParam, body, closure) =>
       restParam match
@@ -156,6 +157,21 @@ object Evaluator:
           localEnv.define(rest, Expr.Lst(args.drop(params.length)))
           evalBody(body, localEnv)
     case _ => throw EvalError(s"not a procedure: ${display(func)}")
+
+  private def applyMap(fn: Expr, args: List[Expr]): Expr =
+    if args.length < 2 then throw EvalError("map: need at least 2 arguments")
+    val proc = args.head
+    val lists = args.tail.map {
+      case Expr.Lst(elems) => elems
+      case other           => throw EvalError(s"map: not a list: ${display(other)}")
+    }
+    val len = lists.head.length
+    if !lists.forall(_.length == len) then throw EvalError("map: lists must have equal length")
+    val result = (0 until len).toList.map { i =>
+      val argSlice = lists.map(_(i))
+      applyProc(proc, argSlice)
+    }
+    Expr.Lst(result)
 
   private def applyApply(args: List[Expr]): Expr =
     if args.length < 2 then throw EvalError("apply: need at least 2 arguments")
