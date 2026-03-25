@@ -24,4 +24,6 @@ private[ming] object EqualityOps:
       xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b))
     case (Expr.Pair(a1, d1), Expr.Pair(a2, d2)) =>
       schemeEqual(a1, a2) && schemeEqual(d1, d2)
+    case (Expr.Vec(xs), Expr.Vec(ys)) =>
+      xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b))
     case _ => false

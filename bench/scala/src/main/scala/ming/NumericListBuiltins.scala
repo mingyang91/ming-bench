@@ -80,7 +80,7 @@ private[ming] object NumericListBuiltins:
       case Expr.Lst(elems) =>
         elems
           .find {
-            case Expr.Lst(k :: _) => Builtins.schemeEqual(k, key)
+            case Expr.Lst(k :: _) => EqualityOps.schemeEqual(k, key)
             case _                => false
           }
           .getOrElse(Expr.Bool(false))

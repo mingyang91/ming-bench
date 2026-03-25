@@ -2,14 +2,16 @@ package ming
 
 object Evaluator:
 
-  import Builtins.{applyBuiltin, display, isFalsy}
+  import Builtins.{applyBuiltin, isFalsy}
 
-  private def eval(expr: Expr, env: Env): Expr =
+  private def display(e: Expr): String = Display.display(e)
+
+  private[ming] def eval(expr: Expr, env: Env): Expr =
     try
       expr match
         case Expr.Num(_) | Expr.Rational(_, _) | Expr.Real(_) | Expr.Bool(_) | Expr.Str(_) | Expr.Chr(_) |
             Expr.Lambda(_, _, _, _) | Expr.Pair(_, _) | Expr.Macro(_, _, _) | Expr.Record(_, _, _, _) |
-            Expr.CaseLambda(_, _) =>
+            Expr.CaseLambda(_, _) | Expr.Vec(_) =>
           expr
         case Expr.Sym(name) => env.lookup(name)
         case Expr.Lst(Nil)  => throw EvalError("empty application")
@@ -28,6 +30,10 @@ object Evaluator:
         case Expr.Lst(Expr.Sym("define-syntax") :: args)      => evalDefineSyntax(args, env)
         case Expr.Lst(Expr.Sym("define-record-type") :: args) => RecordOps.evalDefineRecordType(args, env)
         case Expr.Lst(Expr.Sym("case-lambda") :: clauses)     => evalCaseLambda(clauses, env)
+        case Expr.Lst(Expr.Sym("letrec") :: args)             => evalLetrec(args, env)
+        case Expr.Lst(Expr.Sym("letrec*") :: args)            => evalLetrecStar(args, env)
+        case Expr.Lst(Expr.Sym("case") :: args)               => evalCase(args, env)
+        case Expr.Lst(Expr.Sym("do") :: args)                 => evalDo(args, env)
         case Expr.Lst((head @ Expr.Sym(name)) :: _) if isMacro(name, env) =>
           val mac = env.lookup(name).asInstanceOf[Expr.Macro]
           val (expanded, hygieneEnv) =
@@ -53,7 +59,7 @@ object Evaluator:
       env.define(name, eval(value, env))
       Expr.Bool(false)
     case Expr.Lst(Expr.Sym(name) :: params) :: body if body.nonEmpty =>
-      val (paramNames, restParam) = extractParamsWithRest("define", params)
+      val (paramNames, restParam) = ParamUtils.extractParamsWithRest("define", params)
       env.define(name, Expr.Lambda(paramNames, restParam, body, env))
       Expr.Bool(false)
     case _ => throw EvalError("define: invalid syntax")
@@ -66,7 +72,7 @@ object Evaluator:
 
   private def evalLambda(args: List[Expr], env: Env): Expr = args match
     case Expr.Lst(params) :: body if body.nonEmpty =>
-      val (paramNames, restParam) = extractParamsWithRest("lambda", params)
+      val (paramNames, restParam) = ParamUtils.extractParamsWithRest("lambda", params)
       Expr.Lambda(paramNames, restParam, body, env)
     case Expr.Sym(restName) :: body if body.nonEmpty =>
       Expr.Lambda(Nil, Some(restName), body, env)
@@ -144,54 +150,105 @@ object Evaluator:
   private def evalCaseLambda(clauses: List[Expr], env: Env): Expr =
     val parsed = clauses.map {
       case Expr.Lst(Expr.Lst(params) :: body) if body.nonEmpty =>
-        val (paramNames, restParam) = extractParamsWithRest("case-lambda", params)
+        val (paramNames, restParam) = ParamUtils.extractParamsWithRest("case-lambda", params)
         (paramNames, restParam, body)
       case _ => throw EvalError("case-lambda: invalid clause")
     }
     Expr.CaseLambda(parsed, env)
 
-  private def evalBody(exprs: List[Expr], env: Env): Expr =
-    exprs.foldLeft(Expr.Bool(false): Expr)((_, e) => eval(e, env))
-
-  private def extractParamsWithRest(context: String, params: List[Expr]): (List[String], Option[String]) =
-    val dotIdx = params.indexWhere(_ == Expr.Sym("."))
-    if dotIdx >= 0 then
-      if dotIdx != params.length - 2 then throw EvalError(s"$context: invalid dot syntax")
-      val fixed = params.take(dotIdx).map {
-        case Expr.Sym(p) => p
-        case other       => throw EvalError(s"$context: invalid parameter: ${display(other)}")
+  private def evalLetrec(args: List[Expr], env: Env): Expr = args match
+    case Expr.Lst(bindings) :: body if body.nonEmpty =>
+      val letEnv = env.child()
+      // First define all variables as uninitialized (use #f placeholder)
+      val names = bindings.map {
+        case Expr.Lst(List(Expr.Sym(name), _)) => name
+        case _                                 => throw EvalError("letrec: invalid binding")
       }
-      val rest = params.last match
-        case Expr.Sym(p) => p
-        case other       => throw EvalError(s"$context: invalid rest parameter: ${display(other)}")
-      (fixed, Some(rest))
-    else
-      (
-        params.map {
-          case Expr.Sym(p) => p
-          case other       => throw EvalError(s"$context: invalid parameter: ${display(other)}")
-        },
-        None
-      )
+      for name <- names do letEnv.define(name, Expr.Bool(false))
+      // Now evaluate init expressions in the letrec environment and assign
+      for b <- bindings do
+        b match
+          case Expr.Lst(List(Expr.Sym(name), valueExpr)) =>
+            letEnv.define(name, eval(valueExpr, letEnv))
+          case _ => throw EvalError("letrec: invalid binding")
+      evalBody(body, letEnv)
+    case _ => throw EvalError("letrec: invalid syntax")
+
+  private def evalLetrecStar(args: List[Expr], env: Env): Expr = args match
+    case Expr.Lst(bindings) :: body if body.nonEmpty =>
+      val letEnv = env.child()
+      for b <- bindings do
+        b match
+          case Expr.Lst(List(Expr.Sym(name), valueExpr)) =>
+            letEnv.define(name, eval(valueExpr, letEnv))
+          case _ => throw EvalError("letrec*: invalid binding")
+      evalBody(body, letEnv)
+    case _ => throw EvalError("letrec*: invalid syntax")
+
+  private def evalCase(args: List[Expr], env: Env): Expr =
+    if args.isEmpty then throw EvalError("case: need key expression")
+    val key = eval(args.head, env)
+    evalCaseClauses(key, args.tail, env)
+
+  private def evalCaseClauses(key: Expr, clauses: List[Expr], env: Env): Expr = clauses match
+    case Nil                                     => Expr.Bool(false) // unspecified when no match
+    case Expr.Lst(Expr.Sym("else") :: body) :: _ => evalBody(body, env)
+    case Expr.Lst(Expr.Lst(datums) :: body) :: rest =>
+      if datums.exists(d => EqualityOps.eqv(key, d)) then evalBody(body, env)
+      else evalCaseClauses(key, rest, env)
+    case _ => throw EvalError("case: invalid clause")
+
+  private def evalDo(args: List[Expr], env: Env): Expr = args match
+    case Expr.Lst(varSpecs) :: Expr.Lst(testAndExprs) :: body =>
+      if testAndExprs.isEmpty then throw EvalError("do: need test expression")
+      val test        = testAndExprs.head
+      val resultExprs = testAndExprs.tail
+      // Parse variable specs: (var init step?)
+      val vars = varSpecs.map {
+        case Expr.Lst(Expr.Sym(name) :: init :: step :: Nil) => (name, init, Some(step))
+        case Expr.Lst(Expr.Sym(name) :: init :: Nil)         => (name, init, None)
+        case _                                               => throw EvalError("do: invalid variable spec")
+      }
+      val doEnv = env.child()
+      // Initialize variables
+      for (name, init, _) <- vars do doEnv.define(name, eval(init, env))
+      // Iteration loop
+      while true do
+        val testResult = eval(test, doEnv)
+        if !isFalsy(testResult) then
+          // Test passed — evaluate result expressions
+          if resultExprs.isEmpty then return testResult
+          else return evalBody(resultExprs, doEnv)
+        // Execute body
+        for expr <- body do eval(expr, doEnv)
+        // Parallel step: evaluate all steps using current values, then update
+        val newVals = vars.map {
+          case (_, _, Some(step)) => Some(eval(step, doEnv))
+          case (_, _, None)       => None
+        }
+        for ((name, _, _), newVal) <- vars.zip(newVals) do newVal.foreach(v => doEnv.define(name, v))
+      Expr.Bool(false) // unreachable
+    case _ => throw EvalError("do: invalid syntax")
+
+  private[ming] def evalBody(exprs: List[Expr], env: Env): Expr =
+    exprs.foldLeft(Expr.Bool(false): Expr)((_, e) => eval(e, env))
 
   private def applyProc(func: Expr, args: List[Expr]): Expr = func match
     case Expr.Sym(name) if name == "apply"              => applyApply(args)
-    case Expr.Sym(name) if name == "map"                => applyMap(Expr.Sym("map"), args)
+    case Expr.Sym(name) if name == "map"                => applyMap(args)
     case Expr.Sym(name) if name.startsWith("%%record-") => RecordOps.applyRecordOp(name, args)
     case Expr.Sym(name)                                 => applyBuiltin(name, args)
     case Expr.Lambda(params, restParam, body, closure) =>
+      val localEnv = closure.child()
+      params.zip(args).foreach((p, a) => localEnv.define(p, a))
       restParam match
         case None =>
           if params.length != args.length then
             throw EvalError(s"lambda: expected ${params.length} arguments, got ${args.length}")
-          val localEnv = closure.child()
-          params.zip(args).foreach((p, a) => localEnv.define(p, a))
           evalBody(body, localEnv)
         case Some(rest) =>
           if args.length < params.length then
             throw EvalError(s"lambda: expected at least ${params.length} arguments, got ${args.length}")
-          val localEnv = closure.child()
-          params.zip(args).foreach((p, a) => localEnv.define(p, a))
           localEnv.define(rest, Expr.Lst(args.drop(params.length)))
           evalBody(body, localEnv)
     case Expr.CaseLambda(clauses, closure) =>
@@ -210,7 +267,7 @@ object Evaluator:
           throw EvalError(s"case-lambda: no matching clause for ${args.length} arguments")
     case _ => throw EvalError(s"not a procedure: ${display(func)}")
 
-  private def applyMap(fn: Expr, args: List[Expr]): Expr =
+  private def applyMap(args: List[Expr]): Expr =
     if args.length < 2 then throw EvalError("map: need at least 2 arguments")
     val proc = args.head
     val lists = args.tail.map {
@@ -233,22 +290,3 @@ object Evaluator:
       case other           => throw EvalError(s"apply: last argument must be a list")
     val prefixArgs = args.slice(1, args.length - 1)
     applyProc(func, prefixArgs ++ lastArg)
-
-  def evalStr(input: String): String =
-    val parser = SchemeParser(input)
-    val exprs  = parser.parseAll()
-    if exprs.isEmpty then throw EvalError("no expressions")
-    val env = Builtins.makeTopLevelEnv()
-    display(exprs.foldLeft(Expr.Bool(false): Expr)((_, e) => eval(e, env)))
-
-  def evalStrWithOutput(input: String): (String, String) =
-    val parser = SchemeParser(input)
-    val exprs  = parser.parseAll()
-    if exprs.isEmpty then throw EvalError("no expressions")
-    val env = Builtins.makeTopLevelEnv()
-    val buf = new StringBuilder
-    Builtins.outputBuffer.set(buf)
-    try
-      val result = display(exprs.foldLeft(Expr.Bool(false): Expr)((_, e) => eval(e, env)))
-      (result, buf.toString)
-    finally Builtins.outputBuffer.remove()

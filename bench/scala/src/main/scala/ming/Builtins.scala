@@ -81,25 +81,20 @@ private[ming] object Builtins:
       Expr.Bool(EqualityOps.schemeEqual(args(0), args(1)))
     case "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?" | "char<?" =>
       StringBuiltins.applyCharBuiltin(name, args)
-    case "string=?"    => StringBuiltins.strCmp(name, args, _ == _)
-    case "string<?"    => StringBuiltins.strCmp(name, args, _ < _)
-    case "string-ci=?" => StringBuiltins.strCiCmp(name, args, _ == _)
-    case "string-upcase" =>
-      unary(name, args) {
-        case Expr.Str(s) => Expr.Str(new String(s).toUpperCase.toCharArray);
-        case _           => throw EvalError("string-upcase: not a string")
-      }
-    case "string-downcase" =>
-      unary(name, args) {
-        case Expr.Str(s) => Expr.Str(new String(s).toLowerCase.toCharArray);
-        case _           => throw EvalError("string-downcase: not a string")
-      }
+    case "string=?" | "string<?" | "string-ci=?" | "string-upcase" | "string-downcase" =>
+      StringBuiltins.applyStringBuiltin(name, args)
     case "exact?" | "inexact?" | "integer?" | "rational?" | "exact->inexact" | "inexact->exact" | "numerator" |
         "denominator" =>
       RationalBuiltins.applyRationalBuiltin(name, args)
     case "procedure?" => unary(name, args)(isProcedure)
-    case "apply"      => throw EvalError("apply: should be handled by applyProc")
-    case _            => throw EvalError(s"unknown procedure: $name")
+    case "eqv?" =>
+      if args.length != 2 then throw EvalError("eqv?: need exactly 2 arguments")
+      Expr.Bool(EqualityOps.eqv(args(0), args(1)))
+    case "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length" | "vector?" | "vector->list" |
+        "list->vector" =>
+      VectorBuiltins.applyVectorBuiltin(name, args)
+    case "apply" => throw EvalError("apply: should be handled by applyProc")
+    case _       => throw EvalError(s"unknown procedure: $name")
 
   private def isProcedure(e: Expr): Expr = e match
     case Expr.Lambda(_, _, _, _) | Expr.CaseLambda(_, _) => Expr.Bool(true)
@@ -181,34 +176,9 @@ private[ming] object Builtins:
     case Expr.Bool(false) => true
     case _                => false
 
-  def display(e: Expr): String = e match
-    case Expr.Num(n)         => n.toString
-    case Expr.Rational(n, d) => s"$n/$d"
-    case Expr.Real(v) =>
-      if v == v.floor && !v.isInfinite && !v.isNaN then
-        val l = v.toLong
-        if l.toDouble == v then s"$l.0"
-        else v.toString
-      else v.toString
-    case Expr.Bool(true)            => "#t"
-    case Expr.Bool(false)           => "#f"
-    case Expr.Str(s)                => "\"" + new String(s) + "\""
-    case Expr.Chr(c)                => s"#\\$c"
-    case Expr.Sym(name)             => name
-    case Expr.Lst(elems)            => "(" + elems.map(display).mkString(" ") + ")"
-    case Expr.Pair(a, d)            => s"(${display(a)} . ${display(d)})"
-    case Expr.Lambda(_, _, _, _)    => "#<procedure>"
-    case Expr.CaseLambda(_, _)      => "#<procedure>"
-    case Expr.Macro(_, _, _)        => "#<macro>"
-    case Expr.Record(name, _, _, _) => s"#<record:$name>"
+  def display(e: Expr): String = Display.display(e)
 
-  private def displayOutput(e: Expr): String = e match
-    case Expr.Str(s) => new String(s)
-    case other       => display(other)
-
-  def eqv(a: Expr, b: Expr): Boolean = EqualityOps.eqv(a, b)
-
-  def schemeEqual(a: Expr, b: Expr): Boolean = EqualityOps.schemeEqual(a, b)
+  private def displayOutput(e: Expr): String = Display.displayOutput(e)
 
   val builtinNames: List[String] = List(
     "+",
@@ -286,7 +256,16 @@ private[ming] object Builtins:
     "inexact->exact",
     "numerator",
     "denominator",
-    "procedure?"
+    "procedure?",
+    "eqv?",
+    "vector",
+    "make-vector",
+    "vector-ref",
+    "vector-set!",
+    "vector-length",
+    "vector?",
+    "vector->list",
+    "list->vector"
   )
 
   def makeTopLevelEnv(): Env =

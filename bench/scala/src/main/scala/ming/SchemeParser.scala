@@ -105,6 +105,16 @@ private[ming] class SchemeParser(input: String):
           case "tab"              => Expr.Chr('\t')
           case s if s.length == 1 => Expr.Chr(s.charAt(0))
           case _                  => throw EvalError(s"unknown character name: $token")
+      case '(' =>
+        // #( ... ) vector literal
+        val elems = List.newBuilder[Expr]
+        skipWhitespaceAndComments()
+        while pos < input.length && peek != ')' do
+          elems += parseExpr()
+          skipWhitespaceAndComments()
+        if pos >= input.length then throw EvalError("unmatched #(")
+        advance() // skip ')'
+        Expr.Vec(elems.result().toArray)
       case _ => throw EvalError(s"unexpected #$c")
 
   private def isDelimiter(c: Char): Boolean =

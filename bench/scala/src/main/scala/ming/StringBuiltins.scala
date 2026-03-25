@@ -66,6 +66,19 @@ private[ming] object StringBuiltins:
         case _                                => throw EvalError("string-ref: invalid arguments")
     case "char?" =>
       Builtins.unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Chr]))
+    case "string=?"    => strCmp(name, args, _ == _)
+    case "string<?"    => strCmp(name, args, _ < _)
+    case "string-ci=?" => strCiCmp(name, args, _ == _)
+    case "string-upcase" =>
+      Builtins.unary(name, args) {
+        case Expr.Str(s) => Expr.Str(new String(s).toUpperCase.toCharArray)
+        case _           => throw EvalError("string-upcase: not a string")
+      }
+    case "string-downcase" =>
+      Builtins.unary(name, args) {
+        case Expr.Str(s) => Expr.Str(new String(s).toLowerCase.toCharArray)
+        case _           => throw EvalError("string-downcase: not a string")
+      }
     case _ => throw EvalError(s"unknown procedure: $name")
 
   def applyCharBuiltin(name: String, args: List[Expr]): Expr = name match

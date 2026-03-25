@@ -77,19 +77,19 @@ object TestRunner:
       kind match
         case "eval_str_ok" =>
           val expected = tc.get("expected").getAsString
-          val result   = Evaluator.evalStr(input)
+          val result   = SchemeEntry.evalStr(input)
           if result == expected then TestResult(name, passed = true, "")
           else TestResult(name, passed = false, s"expected $expected got $result")
 
         case "eval_str_err" =>
           try
-            val result = Evaluator.evalStr(input)
+            val result = SchemeEntry.evalStr(input)
             TestResult(name, passed = false, s"expected EvalError but got $result")
           catch case _: EvalError => TestResult(name, passed = true, "")
 
         case "eval_str_err_with_position" =>
           try
-            val result = Evaluator.evalStr(input)
+            val result = SchemeEntry.evalStr(input)
             TestResult(name, passed = false, s"expected EvalError but got $result")
           catch
             case e: EvalError =>
@@ -103,7 +103,7 @@ object TestRunner:
 
         case "eval_str_with_output" =>
           val expectedOutput = tc.get("expected_output").getAsString
-          val (_, output)    = Evaluator.evalStrWithOutput(input)
+          val (_, output)    = SchemeEntry.evalStrWithOutput(input)
           if output == expectedOutput then TestResult(name, passed = true, "")
           else TestResult(name, passed = false, s"expected output $expectedOutput got $output")
 
