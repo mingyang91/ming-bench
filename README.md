@@ -1,4 +1,4 @@
-# MING — Ming Interpreter Nurture Gauntlet
+# MING — Ming Interpreter Nascent Game
 
 A benchmark framework for measuring how **prompt engineering strategies** affect coding agent performance. Agents build a Scheme interpreter from scratch — 240+ tests across 26 visible levels (+ 2 hidden surprise levels), from basic arithmetic to first-class continuations, hygienic macros, and exact arithmetic. Supports **5 languages**: Rust, Go, Java, TypeScript, and Scala.
 

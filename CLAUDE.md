@@ -1,4 +1,4 @@
-# MING — Ming Interpreter Nurture Gauntlet
+# MING — Ming Interpreter Nascent Game
 
 This is the benchmark framework that orchestrates coding agent evaluation. The agent workspace lives in `bench/` — do NOT modify test cases or agent instructions without understanding the experimental design.
 
