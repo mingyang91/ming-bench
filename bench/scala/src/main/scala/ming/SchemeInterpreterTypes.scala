@@ -20,7 +20,20 @@ private[ming] trait SchemeInterpreterTypes:
 
   sealed private[ming] trait EvalState
 
-  private[ming] type Resume = Value => EvalState
+  private[ming] trait Resume:
+    def apply(value: Value): EvalState
+
+  object Resume:
+
+    final case class Sequence(
+      expressions: List[Expr],
+      env: Env,
+      macros: MacroScope,
+      next: Resume
+    ) extends Resume:
+
+      override def apply(value: Value): EvalState =
+        EvalState.EvaluateSequence(expressions, env, macros, next)
 
   final class DynamicWindFrame private[ming] (
     val before: Value,

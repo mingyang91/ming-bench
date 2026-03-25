@@ -2,8 +2,8 @@ package ming
 
 private[ming] object SchemeInterpreterProcedureCalls:
 
-  import BuiltinSupport.{asList, requireAtLeast, singleArg, twoArgs}
-  import SchemeValues.{pack, unpack}
+  import BuiltinSupport.{asList, requireAtLeast}
+  import SchemeValues.pack
   import SchemeInterpreter.{EvalState, Expr, Resume, Value}
 
   private type EvalExprState =
@@ -65,7 +65,7 @@ private[ming] object SchemeInterpreterProcedureCalls:
       case Value.ValuesBuiltin =>
         cont(pack(args))
       case Value.CallWithValuesBuiltin =>
-        applyCallWithValuesState(args, pos, cont, recursiveApply)
+        SchemeInterpreterControlCalls.applyCallWithValuesState(args, pos, cont, recursiveApply)
       case Value.DynamicWindBuiltin =>
         SchemeDynamicWind.applyState(
           args,
@@ -90,9 +90,9 @@ private[ming] object SchemeInterpreterProcedureCalls:
           recursiveApply
         )
       case Value.CallWithCurrentContinuation =>
-        applyCallWithCurrentContinuationState(args, pos, cont, runtime, recursiveApply)
+        SchemeInterpreterControlCalls.applyCallWithCurrentContinuationState(args, pos, cont, runtime, recursiveApply)
       case continuation: Value.Continuation =>
-        resumeContinuationState(continuation, args, pos, runtime, recursiveApply)
+        SchemeInterpreterControlCalls.resumeContinuationState(continuation, args, pos, runtime, recursiveApply)
       case Value.Closure(params, body, closureEnv, closureMacros) =>
         applyUserProcedureState(
           params,
@@ -121,50 +121,6 @@ private[ming] object SchemeInterpreterProcedureCalls:
   private def recursiveApplyState(evalSequenceState: EvalSequenceState): ApplyProcedureState =
     (procedure, callArgs, callPos, callCont) =>
       applyProcedureState(procedure, callArgs, callPos, callCont, evalSequenceState)
-
-  private def applyCallWithValuesState(
-    args: List[Value],
-    pos: SourcePos,
-    cont: Resume,
-    recursiveApply: ApplyProcedureState
-  ): EvalState =
-    val (producer, consumer) = twoArgs("call-with-values", args, pos)
-    recursiveApply(
-      producer,
-      Nil,
-      pos,
-      produced => recursiveApply(consumer, unpack(produced), pos, cont)
-    )
-
-  private def applyCallWithCurrentContinuationState(
-    args: List[Value],
-    pos: SourcePos,
-    cont: Resume,
-    runtime: Runtime,
-    recursiveApply: ApplyProcedureState
-  ): EvalState =
-    val procedure = singleArg("call/cc", args, pos)
-    recursiveApply(
-      procedure,
-      List(SchemeDynamicWind.captureContinuation(cont, runtime)),
-      pos,
-      cont
-    )
-
-  private def resumeContinuationState(
-    continuation: Value.Continuation,
-    args: List[Value],
-    pos: SourcePos,
-    runtime: Runtime,
-    recursiveApply: ApplyProcedureState
-  ): EvalState =
-    val argument = singleArg("continuation", args, pos)
-    SchemeDynamicWind.resumeContinuationState(
-      continuation,
-      argument,
-      runtime,
-      recursiveApply
-    )
 
   private def applyUserProcedureState(
     params: LambdaParams,

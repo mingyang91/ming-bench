@@ -90,8 +90,7 @@ private[ming] object SchemeInterpreter extends SchemeInterpreterTypes:
       case head :: Nil =>
         EvalState.EvaluateExpr(head, env, macros, cont)
       case head :: tail =>
-        val next: Resume = _ => evalSequenceState(tail, env, macros, cont)
-        EvalState.EvaluateExpr(head, env, macros, next)
+        EvalState.EvaluateExpr(head, env, macros, Resume.Sequence(tail, env, macros, cont))
 
   private def evalExprState(expr: Expr, env: Env, macros: MacroScope, cont: Resume): EvalState =
     expr match
