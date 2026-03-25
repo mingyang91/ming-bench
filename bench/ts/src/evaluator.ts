@@ -84,6 +84,7 @@ interface ClosureProcedureValue {
   procedureKind: 'closure';
   name: string;
   params: string[];
+  restParam?: string;
   body: Expr[];
   env: Environment;
 }
@@ -211,6 +212,7 @@ function createGlobalEnvironment(output: string[]): Environment {
     ),
   );
   env.define('not', makeBuiltinProcedure('not', (args) => applyNot(args)));
+  env.define('apply', makeBuiltinProcedure('apply', (args) => applyApply(args)));
 
   env.define('cons', makeBuiltinProcedure('cons', (args) => applyCons(args)));
   env.define('car', makeBuiltinProcedure('car', (args) => applyCar(args)));
@@ -516,7 +518,7 @@ function evaluateDefine(items: Expr[], env: Environment): SchemeValue {
     throw new EvalError('function name must be a symbol');
   }
 
-  const params = readParameterListItems(target.items.slice(1));
+  const { params, restParam } = readParameterListItems(target.items.slice(1));
   const body = items.slice(1);
   if (body.length === 0) {
     throw new EvalError('function definition requires a body');
@@ -524,7 +526,7 @@ function evaluateDefine(items: Expr[], env: Environment): SchemeValue {
 
   const binding: Binding = { value: VOID_VALUE };
   env.defineBinding(name.value, binding);
-  binding.value = makeClosure(name.value, params, body, env);
+  binding.value = makeClosure(name.value, params, body, env, restParam);
   return VOID_VALUE;
 }
 
@@ -554,8 +556,8 @@ function evaluateNamedLambda(
   env: Environment,
   name: string,
 ): ClosureProcedureValue {
-  const { params, body } = parseLambdaParts(expression.items.slice(1));
-  return makeClosure(name, params, body, env);
+  const { params, restParam, body } = parseLambdaParts(expression.items.slice(1));
+  return makeClosure(name, params, body, env, restParam);
 }
 
 function evaluateIf(items: Expr[], env: Environment): SchemeValue {
@@ -576,8 +578,8 @@ function evaluateIf(items: Expr[], env: Environment): SchemeValue {
 }
 
 function evaluateLambda(items: Expr[], env: Environment): SchemeValue {
-  const { params, body } = parseLambdaParts(items);
-  return makeClosure('lambda', params, body, env);
+  const { params, restParam, body } = parseLambdaParts(items);
+  return makeClosure('lambda', params, body, env, restParam);
 }
 
 function evaluateSet(items: Expr[], env: Environment): SchemeValue {
@@ -667,36 +669,60 @@ function parseLetBindings(expression: Expr): LetBindingSpec[] {
   });
 }
 
-function parseLambdaParts(items: Expr[]): { params: string[]; body: Expr[] } {
+function parseLambdaParts(items: Expr[]): { params: string[]; restParam?: string; body: Expr[] } {
   if (items.length < 2) {
     throw new EvalError('lambda requires parameters and a body');
   }
 
-  const params = readParameterList(items[0]);
+  const { params, restParam } = readParameterList(items[0]);
   const body = items.slice(1);
-  return { params, body };
+  return { params, restParam, body };
 }
 
-function readParameterList(expression: Expr): string[] {
+function readParameterList(expression: Expr): { params: string[]; restParam?: string } {
+  if (expression.kind === 'symbol') {
+    return { params: [], restParam: readParameterName(expression) };
+  }
+
   if (expression.kind !== 'list') {
-    throw new EvalError('lambda parameters must be a list');
+    throw new EvalError('lambda parameters must be a list or symbol');
   }
 
   return readParameterListItems(expression.items);
 }
 
-function readParameterListItems(items: Expr[]): string[] {
-  return items.map((item) => {
-    if (item.kind !== 'symbol') {
-      throw new EvalError('lambda parameters must be symbols');
-    }
+function readParameterListItems(items: Expr[]): { params: string[]; restParam?: string } {
+  const dotIndex = items.findIndex((item) => item.kind === 'symbol' && item.value === '.');
+  if (dotIndex === -1) {
+    return { params: items.map((item) => readParameterName(item)) };
+  }
 
-    return item.value;
-  });
+  if (dotIndex === items.length - 1 || items.length !== dotIndex + 2) {
+    throw new EvalError('lambda rest parameter must be the final name');
+  }
+
+  return {
+    params: items.slice(0, dotIndex).map((item) => readParameterName(item)),
+    restParam: readParameterName(items[dotIndex + 1]),
+  };
 }
 
-function makeClosure(name: string, params: string[], body: Expr[], env: Environment): ClosureProcedureValue {
-  return { kind: 'procedure', procedureKind: 'closure', name, params, body, env };
+function readParameterName(item: Expr): string {
+  if (item.kind !== 'symbol' || item.value === '.') {
+    throw new EvalError('lambda parameters must be symbols');
+  }
+
+  return item.value;
+}
+
+function makeClosure(
+  name: string,
+  params: string[],
+  body: Expr[],
+  env: Environment,
+  restParam?: string,
+): ClosureProcedureValue {
+  return { kind: 'procedure', procedureKind: 'closure', name, params, restParam, body, env };
 }
 
 function evaluateQuote(items: Expr[]): SchemeValue {
@@ -743,11 +769,19 @@ function applyProcedure(value: SchemeValue, args: SchemeValue[]): SchemeValue {
     return value.apply(args);
   }
 
-  expectExactArgCount(value.name, args, value.params.length);
+  if (value.restParam === undefined) {
+    expectExactArgCount(value.name, args, value.params.length);
+  } else {
+    expectAtLeastArgCount(value.name, args, value.params.length);
+  }
 
   const callEnv = value.env.child();
   for (let index = 0; index < value.params.length; index += 1) {
     callEnv.define(value.params[index], args[index]);
+  }
+
+  if (value.restParam !== undefined) {
+    callEnv.define(value.restParam, arrayToList(args.slice(value.params.length)));
   }
 
   return evaluateSequence(value.body, callEnv);
@@ -773,6 +807,15 @@ function makePredicateProcedure(
 function applyNot(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('not', args, 1);
   return booleanValue(!isTruthy(args[0]));
+}
+
+function applyApply(args: SchemeValue[]): SchemeValue {
+  expectAtLeastArgCount('apply', args, 2);
+
+  const procedure = args[0];
+  const prefixArgs = args.slice(1, -1);
+  const finalArgs = expectList(args[args.length - 1], 'apply');
+  return applyProcedure(procedure, [...prefixArgs, ...finalArgs]);
 }
 
 function applyCons(args: SchemeValue[]): SchemeValue {
