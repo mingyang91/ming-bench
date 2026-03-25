@@ -3,6 +3,15 @@ package ming
 /** Entry in the dynamic-wind stack. Identity-compared for common-tail detection. */
 class WindEntry(val inThunk: SchemeVal, val outThunk: SchemeVal)
 
+/** Exception handler stack entries. */
+sealed trait ExceptionHandler
+
+object ExceptionHandler:
+  case class Proc(handler: SchemeVal, winds: List[WindEntry]) extends ExceptionHandler
+
+  case class Guard(exnVar: String, clauses: List[SchemeVal], env: Env, guardK: Cont, winds: List[WindEntry])
+      extends ExceptionHandler
+
 /** Continuation frames for the CEK machine. */
 sealed trait Cont
 
@@ -38,3 +47,11 @@ object Cont:
     targetK: Cont,
     targetWinds: List[WindEntry]
   ) extends Cont
+
+  // exception handling (L20)
+  case class WithHandlerK(k: Cont)                                                                  extends Cont
+  case object RaiseReturnErrorK                                                                     extends Cont
+  case class GuardAfterWindK(clauses: List[SchemeVal], exnValue: SchemeVal, env: Env, guardK: Cont) extends Cont
+
+  case class GuardTestK(body: List[SchemeVal], remaining: List[SchemeVal], exnValue: SchemeVal, env: Env, guardK: Cont)
+      extends Cont

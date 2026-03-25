@@ -7,6 +7,10 @@ object Evaluator:
   private[ming] val windStack: ThreadLocal[List[WindEntry]] =
     ThreadLocal.withInitial(() => Nil)
 
+  /** Thread-local exception handler stack (head = innermost handler). */
+  private[ming] val handlerStack: ThreadLocal[List[ExceptionHandler]] =
+    ThreadLocal.withInitial(() => Nil)
+
   private[ming] enum State:
     case Ev(expr: SchemeVal, env: Env, k: Cont)
     case Ko(value: SchemeVal, k: Cont)
@@ -106,6 +110,13 @@ object Evaluator:
         State.Ko(BindingForms.evalDo(args, env), k)
       case SchemeVal.SSymbol("let*") :: args =>
         LetForms.evalLetStarStep(args, env, k)
+      case SchemeVal.SSymbol("guard") :: args =>
+        args match
+          case SchemeVal.SList(SchemeVal.SSymbol(exnVar) :: clauses) :: body if body.nonEmpty =>
+            val handler = ExceptionHandler.Guard(exnVar, clauses, env, k, windStack.get())
+            handlerStack.set(handler :: handlerStack.get())
+            evalBodyCek(body, env, Cont.WithHandlerK(k))
+          case _ => throw new EvalError("guard: bad syntax")
       case SchemeVal.SSymbol(name) :: _ if env.lookup(name).exists(isMacro) =>
         val macro_   = env.get(name).asMatchedMacro
         val expanded = Macro.expand(macro_, SchemeVal.SList(elems))
@@ -187,6 +198,21 @@ object Evaluator:
       // in-thunk done during rewind; push entry onto wind stack
       windStack.set(entry :: windStack.get())
       DynWind.startWindActions(remaining, finalValue, targetK, targetWinds)(performApply)
+    // exception handling (L20)
+    case Cont.WithHandlerK(k2) =>
+      // Body/thunk completed normally — pop handler, return value
+      val hs = handlerStack.get()
+      if hs.nonEmpty then handlerStack.set(hs.tail)
+      State.Ko(v, k2)
+    case Cont.RaiseReturnErrorK =>
+      throw new EvalError("handler returned from non-continuable exception")
+    case Cont.GuardAfterWindK(clauses, exnValue, env, guardK) =>
+      ExceptionOps.evalGuardClauses(clauses, exnValue, env, guardK, performApply)
+    case Cont.GuardTestK(body, remaining, exnValue, env, guardK) =>
+      if isTruthy(v) then
+        if body.isEmpty then State.Ko(v, guardK)
+        else evalBodyCek(body, env, guardK)
+      else ExceptionOps.evalGuardClauses(remaining, exnValue, env, guardK, performApply)
 
   private def performApply(op: SchemeVal, args: List[SchemeVal], k: Cont): State =
     op match
@@ -212,6 +238,14 @@ object Evaluator:
         val (inThunk, bodyThunk, outThunk) = (args(0), args(1), args(2))
         val entry                          = new WindEntry(inThunk, outThunk)
         performApply(inThunk, Nil, Cont.DynWindAfterInK(bodyThunk, entry, k))
+      case SchemeVal.SSymbol("raise") =>
+        if args.length != 1 then throw new EvalError("raise: expected 1 argument")
+        ExceptionOps.handleRaise(args.head, k, performApply)
+      case SchemeVal.SSymbol("with-exception-handler") =>
+        if args.length != 2 then throw new EvalError("with-exception-handler: expected 2 arguments")
+        val (handler, thunk) = (args(0), args(1))
+        handlerStack.set(ExceptionHandler.Proc(handler, windStack.get()) :: handlerStack.get())
+        performApply(thunk, Nil, Cont.WithHandlerK(k))
       case SchemeVal.SSymbol(name)
           if name.startsWith("__record-ctor__:") ||
             name.startsWith("__record-pred__:") ||
@@ -232,6 +266,7 @@ object Evaluator:
 
   def evalStr(input: String): String =
     windStack.set(Nil)
+    handlerStack.set(Nil)
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw new EvalError("empty input")
     val env = makeGlobalEnv()
@@ -239,6 +274,7 @@ object Evaluator:
 
   def evalStrWithOutput(input: String): (String, String) =
     windStack.set(Nil)
+    handlerStack.set(Nil)
     val buf = HigherOrder.outputBuffer.get()
     buf.clear()
     val exprs = Parser.parseAll(input)

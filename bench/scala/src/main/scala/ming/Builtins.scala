@@ -124,7 +124,10 @@ object Builtins:
     "call/cc",
     "call-with-current-continuation",
     // L19
-    "dynamic-wind"
+    "dynamic-wind",
+    // L20
+    "raise",
+    "with-exception-handler"
   )
 
   private def isTruthy(v: SchemeVal): Boolean = v match
