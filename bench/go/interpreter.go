@@ -75,6 +75,33 @@ func baseEnv() *environment {
 	env.define("=", builtinCompare("="))
 	env.define("<=", builtinCompare("<="))
 	env.define("not", builtinNot())
+	env.define("cons", builtinCons())
+	env.define("car", builtinCar())
+	env.define("cdr", builtinCdr())
+	env.define("null?", builtinNull())
+	env.define("list", builtinList())
+	env.define("length", builtinLength())
+	env.define("append", builtinAppend())
+	env.define("string?", builtinPredicate(func(v value) bool {
+		_, ok := v.(stringValue)
+		return ok
+	}))
+	env.define("number?", builtinPredicate(func(v value) bool {
+		_, ok := v.(integerValue)
+		return ok
+	}))
+	env.define("boolean?", builtinPredicate(func(v value) bool {
+		_, ok := v.(booleanValue)
+		return ok
+	}))
+	env.define("pair?", builtinPredicate(func(v value) bool {
+		list, ok := v.(listValue)
+		return ok && len(list.elements) > 0
+	}))
+	env.define("symbol?", builtinPredicate(func(v value) bool {
+		_, ok := v.(symbolValue)
+		return ok
+	}))
 	return env
 }
 
@@ -135,6 +162,12 @@ func evalList(list listNode, env *environment) (value, error) {
 			return evalQuote(list.elements[1:])
 		case "lambda":
 			return evalLambda(list.elements[1:], env)
+		case "begin":
+			return evalBegin(list.elements[1:], env)
+		case "cond":
+			return evalCond(list.elements[1:], env)
+		case "let":
+			return evalLet(list.elements[1:], env)
 		}
 	}
 
@@ -261,6 +294,121 @@ func evalLambda(args []node, env *environment) (value, error) {
 		return nil, &EvalError{Message: "lambda parameters must be a list"}
 	}
 	return makeClosure(params.elements, args[1:], env)
+}
+
+func evalBegin(args []node, env *environment) (value, error) {
+	if len(args) == 0 {
+		return voidValue{}, nil
+	}
+	return evalSequence(args, env)
+}
+
+func evalCond(args []node, env *environment) (value, error) {
+	for i, clauseExpr := range args {
+		clause, ok := clauseExpr.(listNode)
+		if !ok || len(clause.elements) == 0 {
+			return nil, &EvalError{Message: "cond clauses must be non-empty lists"}
+		}
+
+		if name, ok := symbolName(clause.elements[0]); ok && name == "else" {
+			if i != len(args)-1 {
+				return nil, &EvalError{Message: "else clause must be last"}
+			}
+			if len(clause.elements) == 1 {
+				return voidValue{}, nil
+			}
+			return evalSequence(clause.elements[1:], env)
+		}
+
+		testValue, err := eval(clause.elements[0], env)
+		if err != nil {
+			return nil, err
+		}
+		if !isTruthy(testValue) {
+			continue
+		}
+		if len(clause.elements) == 1 {
+			return testValue, nil
+		}
+		return evalSequence(clause.elements[1:], env)
+	}
+	return voidValue{}, nil
+}
+
+func evalLet(args []node, env *environment) (value, error) {
+	if len(args) < 2 {
+		return nil, &EvalError{Message: "let expects bindings and a body"}
+	}
+
+	if name, ok := symbolName(args[0]); ok {
+		return evalNamedLet(name, args[1:], env)
+	}
+
+	bindingList, ok := args[0].(listNode)
+	if !ok {
+		return nil, &EvalError{Message: "let bindings must be a list"}
+	}
+
+	names, values, err := evalBindings(bindingList.elements, env)
+	if err != nil {
+		return nil, err
+	}
+
+	letEnv := newEnvironment(env)
+	for i, name := range names {
+		letEnv.define(name, values[i])
+	}
+	return evalSequence(args[1:], letEnv)
+}
+
+func evalNamedLet(name string, args []node, env *environment) (value, error) {
+	if len(args) < 2 {
+		return nil, &EvalError{Message: "named let expects bindings and a body"}
+	}
+
+	bindingList, ok := args[0].(listNode)
+	if !ok {
+		return nil, &EvalError{Message: "named let bindings must be a list"}
+	}
+
+	names, values, err := evalBindings(bindingList.elements, env)
+	if err != nil {
+		return nil, err
+	}
+
+	letEnv := newEnvironment(env)
+	proc := &closureValue{
+		params: names,
+		body:   args[1:],
+		env:    letEnv,
+	}
+	letEnv.define(name, proc)
+	return apply(proc, values)
+}
+
+func evalBindings(bindingExprs []node, env *environment) ([]string, []value, error) {
+	names := make([]string, len(bindingExprs))
+	values := make([]value, len(bindingExprs))
+	for i, bindingExpr := range bindingExprs {
+		binding, ok := bindingExpr.(listNode)
+		if !ok || len(binding.elements) != 2 {
+			return nil, nil, &EvalError{Message: "let bindings must contain name/value pairs"}
+		}
+
+		name, ok := symbolName(binding.elements[0])
+		if !ok {
+			return nil, nil, &EvalError{Message: "let binding names must be symbols"}
+		}
+
+		boundValue, err := eval(binding.elements[1], env)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		names[i] = name
+		values[i] = boundValue
+	}
+	return names, values, nil
 }
 
 func makeClosure(paramExprs []node, body []node, env *environment) (*closureValue, error) {
@@ -455,12 +603,140 @@ func builtinNot() builtinProc {
 	}
 }
 
+func builtinCons() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "cons expects exactly 2 arguments"}
+		}
+
+		list, ok := args[1].(listValue)
+		if !ok {
+			return nil, &EvalError{Message: "cons expects a list as its second argument"}
+		}
+
+		elements := make([]value, 0, len(list.elements)+1)
+		elements = append(elements, args[0])
+		elements = append(elements, list.elements...)
+		return listValue{elements: elements}, nil
+	}
+}
+
+func builtinCar() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "car expects exactly 1 argument"}
+		}
+
+		list, err := expectListValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		if len(list.elements) == 0 {
+			return nil, &EvalError{Message: "car expects a non-empty list"}
+		}
+		return list.elements[0], nil
+	}
+}
+
+func builtinCdr() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "cdr expects exactly 1 argument"}
+		}
+
+		list, err := expectListValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		if len(list.elements) == 0 {
+			return nil, &EvalError{Message: "cdr expects a non-empty list"}
+		}
+		return listValue{elements: copyValues(list.elements[1:])}, nil
+	}
+}
+
+func builtinNull() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "null? expects exactly 1 argument"}
+		}
+
+		list, ok := args[0].(listValue)
+		return booleanValue(ok && len(list.elements) == 0), nil
+	}
+}
+
+func builtinList() builtinProc {
+	return func(args []value) (value, error) {
+		return listValue{elements: copyValues(args)}, nil
+	}
+}
+
+func builtinLength() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "length expects exactly 1 argument"}
+		}
+
+		list, err := expectListValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return integerValue(len(list.elements)), nil
+	}
+}
+
+func builtinAppend() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) == 0 {
+			return listValue{elements: nil}, nil
+		}
+
+		var combined []value
+		for _, arg := range args {
+			list, err := expectListValue(arg)
+			if err != nil {
+				return nil, err
+			}
+			combined = append(combined, list.elements...)
+		}
+		return listValue{elements: copyValues(combined)}, nil
+	}
+}
+
+func builtinPredicate(check func(value) bool) builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "predicate expects exactly 1 argument"}
+		}
+		return booleanValue(check(args[0])), nil
+	}
+}
+
 func expectIntegerValue(v value) (int, error) {
 	n, ok := v.(integerValue)
 	if !ok {
 		return 0, &EvalError{Message: "expected integer"}
 	}
 	return int(n), nil
+}
+
+func expectListValue(v value) (listValue, error) {
+	list, ok := v.(listValue)
+	if !ok {
+		return listValue{}, &EvalError{Message: "expected list"}
+	}
+	return list, nil
+}
+
+func copyValues(values []value) []value {
+	if len(values) == 0 {
+		return nil
+	}
+
+	copied := make([]value, len(values))
+	copy(copied, values)
+	return copied
 }
 
 func datumFromNode(expr node) (value, error) {
