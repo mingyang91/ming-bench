@@ -166,6 +166,8 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("list-tail", builtinListTail())
 	env.define("append", builtinAppend())
 	env.define("apply", builtinApply())
+	env.define("values", builtinValues())
+	env.define("call-with-values", builtinCallWithValues())
 	env.define("map", builtinMap())
 	env.define("for-each", builtinForEach())
 	env.define("member", builtinMember())
@@ -2523,6 +2525,8 @@ func formatValue(v value) (string, error) {
 			parts[i] = formatted
 		}
 		return "#(" + strings.Join(parts, " ") + ")", nil
+	case multiValueValue:
+		return "", multiValueContextError(len(v.values))
 	case *recordValue:
 		return "#<record " + v.recordType.name + ">", nil
 	case builtinProc, *closureValue, *caseClosureValue, *continuationValue, *callCCProcValue, *dynamicWindProcValue, *raiseProcValue, *withExceptionHandlerProcValue:
@@ -2574,6 +2578,8 @@ func formatDisplayValue(v value) (string, error) {
 			parts[i] = formatted
 		}
 		return "(" + strings.Join(parts, " ") + ")", nil
+	case multiValueValue:
+		return "", multiValueContextError(len(v.values))
 	default:
 		return formatValue(v)
 	}
