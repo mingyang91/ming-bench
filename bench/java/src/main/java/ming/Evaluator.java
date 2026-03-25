@@ -11,7 +11,7 @@ import java.util.Set;
 public class Evaluator {
 
     // ── Value types ──────────────────────────────────────────────
-    private sealed interface Val permits Val.Int, Val.Rat, Val.Flo, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda, Val.Macro {
+    private sealed interface Val permits Val.Int, Val.Rat, Val.Flo, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda, Val.Macro, Val.RecordInstance {
         record Int(long value) implements Val {}
         record Rat(long num, long den) implements Val {}
         record Flo(double value) implements Val {}
@@ -30,6 +30,15 @@ public class Evaluator {
         record Void() implements Val {}
         record Builtin(String name, java.util.function.Function<List<Val>, Val> fn) implements Val {}
         record Lambda(List<String> params, String restParam, List<Val> body, Env closure) implements Val {}
+        final class RecordInstance implements Val {
+            final Object tag; // identity object for type distinction
+            final String typeName;
+            final String[] fieldNames;
+            final Val[] fields;
+            RecordInstance(Object tag, String typeName, String[] fieldNames, Val[] fields) {
+                this.tag = tag; this.typeName = typeName; this.fieldNames = fieldNames; this.fields = fields;
+            }
+        }
         final class Macro implements Val {
             final String name;
             final List<String> literals;
@@ -100,7 +109,7 @@ public class Evaluator {
     private int gensymCounter = 0;
     private String gensym(String base) { return base + "_g" + (gensymCounter++); }
     private static final Set<String> SPECIAL_FORMS = Set.of(
-        "quote", "if", "define", "lambda", "set!", "begin", "let", "cond", "and", "or", "define-syntax"
+        "quote", "if", "define", "lambda", "set!", "begin", "let", "cond", "and", "or", "define-syntax", "define-record-type"
     );
 
     // ── Write representation (with quotes) ──────────────────────
@@ -123,6 +132,7 @@ public class Evaluator {
             case Val.PairV p -> writePair(p);
             case Val.Builtin b -> "#<procedure:" + b.name() + ">";
             case Val.Lambda ignored -> "#<procedure>";
+            case Val.RecordInstance r -> "#<record:" + r.typeName + ">";
             case Val.Macro m -> "#<macro:" + m.name + ">";
         };
     }
@@ -352,6 +362,7 @@ public class Evaluator {
             case Val.Builtin b -> b;
             case Val.Lambda l -> l;
             case Val.Macro m -> m;
+            case Val.RecordInstance r -> r;
             case Val.Sym sym -> {
                 try {
                     yield env.lookup(sym.name());
@@ -398,6 +409,7 @@ public class Evaluator {
                 case "and" -> { return evalAnd(pair.cdr(), env); }
                 case "or" -> { return evalOr(pair.cdr(), env); }
                 case "define-syntax" -> { return evalDefineSyntax(pair, env); }
+                case "define-record-type" -> { return evalDefineRecordType(pair.cdr(), env, pair); }
             }
         }
 
@@ -634,6 +646,100 @@ public class Evaluator {
     private static class MatchResult {
         final Map<String, Val> singles = new HashMap<>();
         final Map<String, List<Val>> ellipsis = new HashMap<>();
+    }
+
+    private Val evalDefineRecordType(Val args, Env env, Val form) throws EvalError {
+        // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+        List<Val> parts = new ArrayList<>();
+        Val cur = args;
+        while (cur instanceof Val.PairV p) { parts.add(p.car()); cur = p.cdr(); }
+        if (parts.size() < 3) throw posError(form, "define-record-type: invalid syntax");
+
+        // type name
+        if (!(parts.get(0) instanceof Val.Sym typeSym)) throw posError(form, "define-record-type: expected type name");
+        String typeName = typeSym.name();
+
+        // constructor: (make-xxx field1 field2 ...)
+        if (!(parts.get(1) instanceof Val.PairV consPair)) throw posError(form, "define-record-type: expected constructor");
+        List<Val> consElems = new ArrayList<>();
+        Val cc = parts.get(1);
+        while (cc instanceof Val.PairV cp) { consElems.add(cp.car()); cc = cp.cdr(); }
+        if (consElems.isEmpty() || !(consElems.get(0) instanceof Val.Sym consNameSym))
+            throw posError(form, "define-record-type: expected constructor name");
+        String consName = consNameSym.name();
+        String[] consFields = new String[consElems.size() - 1];
+        for (int i = 1; i < consElems.size(); i++) {
+            if (!(consElems.get(i) instanceof Val.Sym fs)) throw posError(form, "define-record-type: expected field name");
+            consFields[i - 1] = fs.name();
+        }
+
+        // predicate
+        if (!(parts.get(2) instanceof Val.Sym predSym)) throw posError(form, "define-record-type: expected predicate name");
+        String predName = predSym.name();
+
+        // field specs: (field accessor) ...
+        String[] fieldNames = new String[parts.size() - 3];
+        String[] accessorNames = new String[parts.size() - 3];
+        for (int i = 3; i < parts.size(); i++) {
+            if (!(parts.get(i) instanceof Val.PairV fp)) throw posError(form, "define-record-type: expected field spec");
+            List<Val> fspec = new ArrayList<>();
+            Val fc = parts.get(i);
+            while (fc instanceof Val.PairV fcp) { fspec.add(fcp.car()); fc = fcp.cdr(); }
+            if (fspec.size() < 2) throw posError(form, "define-record-type: field spec needs name and accessor");
+            if (!(fspec.get(0) instanceof Val.Sym fnSym)) throw posError(form, "define-record-type: expected field name");
+            if (!(fspec.get(1) instanceof Val.Sym anSym)) throw posError(form, "define-record-type: expected accessor name");
+            fieldNames[i - 3] = fnSym.name();
+            accessorNames[i - 3] = anSym.name();
+        }
+
+        // Build field index map (field name -> index in fieldNames array)
+        Map<String, Integer> fieldIndex = new HashMap<>();
+        for (int i = 0; i < fieldNames.length; i++) fieldIndex.put(fieldNames[i], i);
+
+        // Build constructor field order -> field index mapping
+        int[] consFieldIdx = new int[consFields.length];
+        for (int i = 0; i < consFields.length; i++) {
+            Integer idx = fieldIndex.get(consFields[i]);
+            if (idx == null) throw posError(form, "define-record-type: constructor field " + consFields[i] + " not in field specs");
+            consFieldIdx[i] = idx;
+        }
+
+        // Use a unique tag object for this record type
+        final Object tag = new Object();
+        final int fieldCount = fieldNames.length;
+
+        // Define constructor
+        env.define(consName, new Val.Builtin(consName, cargs -> {
+            if (cargs.size() != consFields.length)
+                throw new RuntimeException(consName + ": expected " + consFields.length + " arguments, got " + cargs.size());
+            Val[] fields = new Val[fieldCount];
+            for (int i = 0; i < consFields.length; i++) {
+                fields[consFieldIdx[i]] = cargs.get(i);
+            }
+            return new Val.RecordInstance(tag, typeName, fieldNames, fields);
+        }));
+
+        // Define predicate
+        env.define(predName, new Val.Builtin(predName, pargs -> {
+            if (pargs.size() != 1)
+                throw new RuntimeException(predName + ": expected 1 argument, got " + pargs.size());
+            return new Val.Bool(pargs.get(0) instanceof Val.RecordInstance ri && ri.tag == tag);
+        }));
+
+        // Define accessors
+        for (int i = 0; i < fieldNames.length; i++) {
+            final int fi = i;
+            final String accName = accessorNames[i];
+            env.define(accName, new Val.Builtin(accName, aargs -> {
+                if (aargs.size() != 1)
+                    throw new RuntimeException(accName + ": expected 1 argument, got " + aargs.size());
+                if (!(aargs.get(0) instanceof Val.RecordInstance ri) || ri.tag != tag)
+                    throw new RuntimeException(accName + ": not a " + typeName);
+                return ri.fields[fi];
+            }));
+        }
+
+        return new Val.Void();
     }
 
     private Val evalDefineSyntax(Val.PairV form, Env env) throws EvalError {
