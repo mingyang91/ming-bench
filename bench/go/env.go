@@ -214,6 +214,9 @@ func makeGlobalEnv() *Env {
 	env.Set("call/cc", &Value{Type: TypeSymbol, StrVal: "builtin:call/cc"})
 	env.Set("call-with-current-continuation", &Value{Type: TypeSymbol, StrVal: "builtin:call/cc"})
 
+	// Dynamic wind (L19)
+	env.Set("dynamic-wind", &Value{Type: TypeSymbol, StrVal: "builtin:dynamic-wind"})
+
 	return env
 }
 

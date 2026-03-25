@@ -4,6 +4,13 @@ import "fmt"
 
 // ===================== CEK Machine Continuation Frames =====================
 
+// WindEntry represents one level of dynamic-wind nesting.
+type WindEntry struct {
+	InThunk  *Value
+	OutThunk *Value
+	Next     *WindEntry
+}
+
 type KTag int
 
 const (
@@ -23,6 +30,11 @@ const (
 	KLetrecBind
 	KLetrecStarBind
 	KCaseKey
+	KDynWindIn
+	KDynWindBody
+	KDynWindOut
+	KDynWindTransition
+	KDynWindRestore
 )
 
 type KontFrame struct {
@@ -45,6 +57,7 @@ type KontFrame struct {
 	Clauses    []*Expr
 	ClauseBody []*Expr
 	Result     *Value
+	Wind       *WindEntry
 }
 
 // ===================== Lambda/CaseLambda Binding =====================
@@ -125,6 +138,7 @@ func cekEval(startExpr *Expr, startEnv *Env, startKont *KontFrame) (*Value, erro
 	env := startEnv
 	kont := startKont
 	var val *Value
+	var windStack *WindEntry
 	evaluating := true
 
 	for {
@@ -472,7 +486,7 @@ func cekEval(startExpr *Expr, startEnv *Env, startKont *KontFrame) (*Value, erro
 				argExprs := kont.Exprs
 				if len(argExprs) == 0 {
 					err := cekApplyFunction(val, nil, kont.Next, kont.Env, kont.Line, kont.Col,
-						&expr, &env, &kont, &val, &evaluating)
+						&expr, &env, &kont, &val, &evaluating, &windStack)
 					if err != nil {
 						return nil, err
 					}
@@ -495,7 +509,7 @@ func cekEval(startExpr *Expr, startEnv *Env, startKont *KontFrame) (*Value, erro
 				copy(newVals[1:], kont.Vals)
 				if len(kont.Exprs) == 0 {
 					err := cekApplyFunction(kont.Fn, newVals, kont.Next, kont.Env, kont.Line, kont.Col,
-						&expr, &env, &kont, &val, &evaluating)
+						&expr, &env, &kont, &val, &evaluating, &windStack)
 					if err != nil {
 						return nil, err
 					}
@@ -680,6 +694,62 @@ func cekEval(startExpr *Expr, startEnv *Env, startKont *KontFrame) (*Value, erro
 					val = Void
 					kont = kont.Next
 				}
+
+			case KDynWindIn:
+				// In-thunk completed. Push wind entry, call body-thunk.
+				inThunk := kont.Vals[0]
+				bodyThunk := kont.Vals[1]
+				outThunk := kont.Vals[2]
+				prevWind := kont.Wind
+				windStack = &WindEntry{InThunk: inThunk, OutThunk: outThunk, Next: prevWind}
+				bodyKont := &KontFrame{
+					Tag:  KDynWindBody,
+					Vals: []*Value{outThunk},
+					Wind: prevWind,
+					Next: kont.Next,
+				}
+				err := cekApplyFunction(bodyThunk, nil, bodyKont, env, 0, 0,
+					&expr, &env, &kont, &val, &evaluating, &windStack)
+				if err != nil {
+					return nil, err
+				}
+
+			case KDynWindBody:
+				// Body completed. Pop wind entry, call out-thunk.
+				outThunk := kont.Vals[0]
+				bodyResult := val
+				windStack = kont.Wind // restore to pre-push
+				outKont := &KontFrame{
+					Tag:    KDynWindOut,
+					Result: bodyResult,
+					Next:   kont.Next,
+				}
+				err := cekApplyFunction(outThunk, nil, outKont, env, 0, 0,
+					&expr, &env, &kont, &val, &evaluating, &windStack)
+				if err != nil {
+					return nil, err
+				}
+
+			case KDynWindOut:
+				// Out-thunk completed. Return saved body result.
+				val = kont.Result
+				kont = kont.Next
+
+			case KDynWindTransition:
+				// Wind transition: update wind stack, call thunk.
+				windStack = kont.Wind
+				thunk := kont.Vals[0]
+				err := cekApplyFunction(thunk, nil, kont.Next, env, 0, 0,
+					&expr, &env, &kont, &val, &evaluating, &windStack)
+				if err != nil {
+					return nil, err
+				}
+
+			case KDynWindRestore:
+				// All transitions done. Restore val and wind stack.
+				val = kont.Result
+				windStack = kont.Wind
+				kont = kont.Next
 
 			default:
 				return nil, fmt.Errorf("unknown continuation tag: %d", kont.Tag)
@@ -872,7 +942,7 @@ func cekStartCondClause(clause *Expr, remaining []*Expr, condEnv *Env, nextKont 
 
 // cekApplyFunction handles applying a function to arguments within the CEK machine.
 func cekApplyFunction(fn *Value, args []*Value, outerKont *KontFrame, env *Env, line, col int,
-	exprP **Expr, envP **Env, kontP **KontFrame, valP **Value, evaluatingP *bool) error {
+	exprP **Expr, envP **Env, kontP **KontFrame, valP **Value, evaluatingP *bool, windStackP **WindEntry) error {
 	for {
 		if fn.Type == TypeSymbol && len(fn.StrVal) > 8 && fn.StrVal[:8] == "builtin:" {
 			switch fn.StrVal {
@@ -880,9 +950,24 @@ func cekApplyFunction(fn *Value, args []*Value, outerKont *KontFrame, env *Env, 
 				if len(args) != 1 {
 					return fmt.Errorf("%d:%d: call/cc requires exactly 1 argument", line, col)
 				}
-				contVal := &Value{Type: TypeContinuation, ContKont: outerKont}
+				contVal := &Value{Type: TypeContinuation, ContKont: outerKont, ContWind: *windStackP}
 				fn = args[0]
 				args = []*Value{contVal}
+				continue
+			case "builtin:dynamic-wind":
+				if len(args) != 3 {
+					return fmt.Errorf("%d:%d: dynamic-wind requires exactly 3 arguments", line, col)
+				}
+				inThunk, bodyThunk, outThunk := args[0], args[1], args[2]
+				windKont := &KontFrame{
+					Tag:  KDynWindIn,
+					Vals: []*Value{inThunk, bodyThunk, outThunk},
+					Wind: *windStackP,
+					Next: outerKont,
+				}
+				fn = inThunk
+				args = nil
+				outerKont = windKont
 				continue
 			case "builtin:apply":
 				if len(args) < 2 {
@@ -971,12 +1056,82 @@ func cekApplyFunction(fn *Value, args []*Value, outerKont *KontFrame, env *Env, 
 		if len(args) != 1 {
 			return fmt.Errorf("%d:%d: continuation expects exactly 1 argument", line, col)
 		}
-		*valP = args[0]
-		*kontP = fn.ContKont
+		contArg := args[0]
+		currentWind := *windStackP
+		targetWind := fn.ContWind
+		if currentWind == targetWind {
+			*valP = contArg
+			*kontP = fn.ContKont
+			*evaluatingP = false
+			return nil
+		}
+		// Build wind transition frames
+		common := commonWindPrefix(currentWind, targetWind)
+		type windOp struct {
+			thunk   *Value
+			newWind *WindEntry
+		}
+		var ops []windOp
+		// Unwind: call out-thunks from innermost to outermost
+		for w := currentWind; w != common; w = w.Next {
+			ops = append(ops, windOp{thunk: w.OutThunk, newWind: w.Next})
+		}
+		// Rewind: call in-thunks from outermost to innermost
+		var rewindEntries []*WindEntry
+		for w := targetWind; w != common; w = w.Next {
+			rewindEntries = append(rewindEntries, w)
+		}
+		for i := len(rewindEntries) - 1; i >= 0; i-- {
+			ops = append(ops, windOp{thunk: rewindEntries[i].InThunk, newWind: rewindEntries[i]})
+		}
+		// Build frame chain: restore frame at bottom, then transition frames
+		kont := &KontFrame{
+			Tag:    KDynWindRestore,
+			Result: contArg,
+			Wind:   targetWind,
+			Next:   fn.ContKont,
+		}
+		for i := len(ops) - 1; i >= 0; i-- {
+			kont = &KontFrame{
+				Tag:  KDynWindTransition,
+				Vals: []*Value{ops[i].thunk},
+				Wind: ops[i].newWind,
+				Next: kont,
+			}
+		}
+		// Kick off the transition chain
+		*valP = Void
+		*kontP = kont
 		*evaluatingP = false
 		return nil
 	}
 	return fmt.Errorf("%d:%d: not a procedure", line, col)
+}
+
+func commonWindPrefix(a, b *WindEntry) *WindEntry {
+	da, db := windDepth(a), windDepth(b)
+	for da > db {
+		a = a.Next
+		da--
+	}
+	for db > da {
+		b = b.Next
+		db--
+	}
+	for a != b {
+		a = a.Next
+		b = b.Next
+	}
+	return a
+}
+
+func windDepth(w *WindEntry) int {
+	n := 0
+	for w != nil {
+		n++
+		w = w.Next
+	}
+	return n
 }
 
 // ===================== Legacy Call Helpers (for builtins) =====================

@@ -73,6 +73,7 @@ type Value struct {
 	Mutable bool
 	// Continuation (for TypeContinuation)
 	ContKont *KontFrame
+	ContWind *WindEntry
 }
 
 var Void = &Value{Type: TypeVoid}
