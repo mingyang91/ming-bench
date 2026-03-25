@@ -12,6 +12,8 @@ type Expr struct {
 	Elements []*Expr
 	Line     int
 	Col      int
+	// For literal values injected by macro expansion (hygiene)
+	LitVal *Value
 }
 
 type ExprType int
@@ -23,6 +25,7 @@ const (
 	ExprSymbol
 	ExprList
 	ExprChar
+	ExprLiteral
 )
 
 type Parser struct {

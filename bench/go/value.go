@@ -17,6 +17,7 @@ const (
 	TypeVoid
 	TypeLambda
 	TypeChar
+	TypeMacro
 )
 
 type Value struct {
@@ -32,6 +33,8 @@ type Value struct {
 	RestParam string // variadic rest parameter (empty if none)
 	Body      []*Expr
 	ClosureEnv *Env
+	// Macro fields
+	Macro *SyntaxRulesMacro
 }
 
 var Void = &Value{Type: TypeVoid}

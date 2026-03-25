@@ -19,6 +19,8 @@ func Eval(expr *Expr, env *Env) (*Value, error) {
 			return nil, fmt.Errorf("%d:%d: unbound variable '%s'", expr.Line, expr.Col, expr.StrVal)
 		}
 		return val, nil
+	case ExprLiteral:
+		return expr.LitVal, nil
 	case ExprList:
 		return evalList(expr, env)
 	}
@@ -54,6 +56,16 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalCond(expr, env)
 		case "set!":
 			return evalSetBang(expr, env)
+		case "define-syntax":
+			return evalDefineSyntax(expr, env)
+		}
+		// Check for macro application
+		if val, ok := env.Get(head.StrVal); ok && val.Type == TypeMacro {
+			expanded, err := expandMacro(val.Macro, expr)
+			if err != nil {
+				return nil, err
+			}
+			return Eval(expanded, env)
 		}
 	}
 
@@ -81,6 +93,15 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 	// Call lambda
 	if fn.Type == TypeLambda {
 		return callLambda(fn, args, expr.Line, expr.Col)
+	}
+
+	// Macro from ExprLiteral
+	if fn.Type == TypeMacro {
+		expanded, err := expandMacro(fn.Macro, expr)
+		if err != nil {
+			return nil, err
+		}
+		return Eval(expanded, env)
 	}
 
 	return nil, fmt.Errorf("%d:%d: not a procedure", expr.Line, expr.Col)
