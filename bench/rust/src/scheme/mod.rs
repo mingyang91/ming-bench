@@ -10,6 +10,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+const VECTOR_LITERAL_MARKER: &str = "#%vector-literal";
+
 #[derive(Debug, Clone, PartialEq)]
 enum Expr {
     Number(Number),
@@ -653,6 +655,12 @@ impl<'a> Parser<'a> {
         match self.peek_char() {
             Some('(') => self.parse_list(),
             Some('\'') => self.parse_quote_shorthand(),
+            Some('`') => self.parse_quasiquote_shorthand(),
+            Some(',') if self.input[self.index..].starts_with(",@") => {
+                self.parse_unquote_splicing_shorthand()
+            }
+            Some(',') => self.parse_unquote_shorthand(),
+            Some('#') if self.input[self.index..].starts_with("#(") => self.parse_vector_literal(),
             Some('#') if self.input[self.index..].starts_with("#'") => {
                 self.parse_syntax_quote_shorthand()
             }
@@ -666,6 +674,34 @@ impl<'a> Parser<'a> {
         self.bump_char();
         let quoted = self.parse_expr()?;
         Ok(Expr::List(vec![Expr::Symbol("quote".to_string()), quoted]))
+    }
+
+    fn parse_quasiquote_shorthand(&mut self) -> Result<Expr, EvalError> {
+        self.bump_char();
+        let quoted = self.parse_expr()?;
+        Ok(Expr::List(vec![
+            Expr::Symbol("quasiquote".to_string()),
+            quoted,
+        ]))
+    }
+
+    fn parse_unquote_shorthand(&mut self) -> Result<Expr, EvalError> {
+        self.bump_char();
+        let quoted = self.parse_expr()?;
+        Ok(Expr::List(vec![
+            Expr::Symbol("unquote".to_string()),
+            quoted,
+        ]))
+    }
+
+    fn parse_unquote_splicing_shorthand(&mut self) -> Result<Expr, EvalError> {
+        self.bump_char();
+        self.bump_char();
+        let quoted = self.parse_expr()?;
+        Ok(Expr::List(vec![
+            Expr::Symbol("unquote-splicing".to_string()),
+            quoted,
+        ]))
     }
 
     fn parse_syntax_quote_shorthand(&mut self) -> Result<Expr, EvalError> {
@@ -693,6 +729,30 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Expr::List(items))
+    }
+
+    fn parse_vector_literal(&mut self) -> Result<Expr, EvalError> {
+        self.bump_char();
+        self.bump_char();
+        let mut items = Vec::new();
+
+        loop {
+            self.skip_ignored();
+
+            match self.peek_char() {
+                Some(')') => {
+                    self.bump_char();
+                    break;
+                }
+                Some(_) => items.push(self.parse_expr()?),
+                None => return Err(EvalError::UnexpectedEof),
+            }
+        }
+
+        let mut exprs = Vec::with_capacity(items.len() + 1);
+        exprs.push(Expr::Symbol(VECTOR_LITERAL_MARKER.to_string()));
+        exprs.extend(items);
+        Ok(Expr::List(exprs))
     }
 
     fn parse_string(&mut self) -> Result<Expr, EvalError> {
@@ -932,8 +992,11 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "list-tail", builtin_list_tail);
     define_builtin(&env, "list?", builtin_list_predicate);
     define_builtin(&env, "assoc", builtin_assoc);
+    define_builtin(&env, "assq", builtin_assq);
     define_builtin(&env, "assv", builtin_assv);
     define_builtin(&env, "member", builtin_member);
+    define_builtin(&env, "memq", builtin_memq);
+    define_builtin(&env, "memv", builtin_memv);
     define_builtin(&env, "map", builtin_map);
     define_builtin(&env, "for-each", builtin_for_each);
     define_builtin(&env, "char-alphabetic?", builtin_char_alphabetic_predicate);
@@ -958,6 +1021,7 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "vector?", builtin_vector_predicate);
     define_builtin(&env, "vector->list", builtin_vector_to_list);
     define_builtin(&env, "list->vector", builtin_list_to_vector);
+    define_builtin(&env, "error", builtin_error);
     define_builtin(&env, "raise", builtin_raise);
     define_builtin(&env, "values", builtin_values);
     define_dynamic_wind_builtin(&env, "dynamic-wind");
@@ -1106,6 +1170,7 @@ enum MachineState {
 enum CondMatchAction {
     ReturnTestValue,
     EvaluateBody(Vec<Expr>),
+    ApplyProcedure(Expr),
 }
 
 #[derive(Clone)]
@@ -1175,6 +1240,9 @@ enum MachineFrame {
     },
     CallWithValuesConsumer {
         consumer: Value,
+    },
+    ApplyOneArgument {
+        argument: Value,
     },
     GuardHandler {
         variable: String,
@@ -1295,6 +1363,10 @@ fn eval_machine_list(
         });
     }
 
+    if let Some(vector_items) = vector_literal_items(&items) {
+        return Ok(MachineState::Value(quote_vector_items(vector_items)));
+    }
+
     if let Expr::Symbol(operator) = &items[0] {
         let args = &items[1..];
 
@@ -1306,6 +1378,7 @@ fn eval_machine_list(
             "cond" => return schedule_machine_cond(args, env, frames),
             "guard" => return schedule_machine_guard(args, env, ctx, frames),
             "quote" => return Ok(MachineState::Value(eval_quote(args)?)),
+            "quasiquote" => return Ok(MachineState::Value(eval_quasiquote(args, env, ctx)?)),
             "define" => return schedule_machine_define(args, env, ctx, frames),
             "define-record-type" => {
                 return Ok(MachineState::Value(eval_define_record_type(args, env)?));
@@ -1423,11 +1496,7 @@ fn schedule_machine_cond(
         }
     }
 
-    let match_action = if items.len() == 1 {
-        CondMatchAction::ReturnTestValue
-    } else {
-        CondMatchAction::EvaluateBody(items[1..].to_vec())
-    };
+    let match_action = parse_cond_match_action(items, "cond")?;
 
     frames.push(MachineFrame::Cond {
         remaining_clauses: remaining.to_vec(),
@@ -1551,11 +1620,7 @@ fn schedule_machine_guard_clauses(
         }
     }
 
-    let match_action = if items.len() == 1 {
-        CondMatchAction::ReturnTestValue
-    } else {
-        CondMatchAction::EvaluateBody(items[1..].to_vec())
-    };
+    let match_action = parse_cond_match_action(items, "guard")?;
 
     frames.push(MachineFrame::GuardClause {
         remaining_clauses: remaining.to_vec(),
@@ -1718,6 +1783,10 @@ fn resume_machine_frame(
                     CondMatchAction::EvaluateBody(body) => {
                         Ok(schedule_machine_sequence(&body, env, frames))
                     }
+                    CondMatchAction::ApplyProcedure(procedure) => {
+                        frames.push(MachineFrame::ApplyOneArgument { argument: value });
+                        Ok(MachineState::Eval(procedure, env))
+                    }
                 }
             } else {
                 schedule_machine_cond(&remaining_clauses, env, frames)
@@ -1789,6 +1858,9 @@ fn resume_machine_frame(
         MachineFrame::CallWithValuesConsumer { consumer } => {
             apply_machine_value(consumer, unpack_values(value), ctx, frames)
         }
+        MachineFrame::ApplyOneArgument { argument } => {
+            apply_machine_value(value, vec![argument], ctx, frames)
+        }
         MachineFrame::GuardHandler { .. } => Ok(MachineState::Value(value)),
         MachineFrame::GuardClause {
             remaining_clauses,
@@ -1801,6 +1873,10 @@ fn resume_machine_frame(
                     CondMatchAction::ReturnTestValue => Ok(MachineState::Value(value)),
                     CondMatchAction::EvaluateBody(body) => {
                         Ok(schedule_machine_sequence(&body, env, frames))
+                    }
+                    CondMatchAction::ApplyProcedure(procedure) => {
+                        frames.push(MachineFrame::ApplyOneArgument { argument: value });
+                        Ok(MachineState::Eval(procedure, env))
                     }
                 }
             } else {
@@ -2241,6 +2317,10 @@ fn eval_list(items: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value
         });
     }
 
+    if let Some(vector_items) = vector_literal_items(items) {
+        return Ok(quote_vector_items(vector_items));
+    }
+
     if let Expr::Symbol(operator) = &items[0] {
         let args = &items[1..];
 
@@ -2252,6 +2332,7 @@ fn eval_list(items: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value
             "cond" => return eval_cond(args, env, ctx),
             "case" => return eval_case(args, env, ctx),
             "quote" => return eval_quote(args),
+            "quasiquote" => return eval_quasiquote(args, env, ctx),
             "define" => return eval_define(args, env, ctx),
             "define-record-type" => return eval_define_record_type(args, env),
             "define-syntax" => return eval_define_syntax(args, env),
@@ -2287,6 +2368,10 @@ fn eval_tail_list(
         });
     }
 
+    if let Some(vector_items) = vector_literal_items(items) {
+        return Ok(TailOutcome::Value(quote_vector_items(vector_items)));
+    }
+
     if let Expr::Symbol(operator) = &items[0] {
         let args = &items[1..];
 
@@ -2298,6 +2383,7 @@ fn eval_tail_list(
             "cond" => return eval_tail_cond(args, env, ctx),
             "case" => return eval_tail_case(args, env, ctx),
             "quote" => return Ok(TailOutcome::Value(eval_quote(args)?)),
+            "quasiquote" => return Ok(TailOutcome::Value(eval_quasiquote(args, env, ctx)?)),
             "define" => return Ok(TailOutcome::Value(eval_define(args, env, ctx)?)),
             "define-record-type" => {
                 return Ok(TailOutcome::Value(eval_define_record_type(args, env)?));
@@ -2506,10 +2592,14 @@ fn eval_cond(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value,
 
         let test_value = eval_expr(&items[0], env.clone(), ctx)?;
         if test_value.is_truthy() {
-            if items.len() == 1 {
-                return Ok(test_value);
-            }
-            return eval_sequence(&items[1..], env, ctx);
+            return match parse_cond_match_action(items, "cond")? {
+                CondMatchAction::ReturnTestValue => Ok(test_value),
+                CondMatchAction::EvaluateBody(body) => eval_sequence(&body, env, ctx),
+                CondMatchAction::ApplyProcedure(procedure) => {
+                    let operator = eval_expr(&procedure, env, ctx)?;
+                    apply_evaluated(operator, vec![test_value], ctx)
+                }
+            };
         }
     }
 
@@ -2550,10 +2640,14 @@ fn eval_tail_cond(
 
         let test_value = eval_expr(&items[0], env.clone(), ctx)?;
         if test_value.is_truthy() {
-            if items.len() == 1 {
-                return Ok(TailOutcome::Value(test_value));
-            }
-            return prepare_tail_sequence(&items[1..], env, ctx);
+            return match parse_cond_match_action(items, "cond")? {
+                CondMatchAction::ReturnTestValue => Ok(TailOutcome::Value(test_value)),
+                CondMatchAction::EvaluateBody(body) => prepare_tail_sequence(&body, env, ctx),
+                CondMatchAction::ApplyProcedure(procedure) => {
+                    let operator = eval_expr(&procedure, env.clone(), ctx)?;
+                    tail_apply_evaluated(operator, vec![test_value], ctx)
+                }
+            };
         }
     }
 
@@ -2687,6 +2781,11 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
     Ok(quote_expr(&args[0]))
 }
 
+fn eval_quasiquote(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_expr_arity("quasiquote", args, 1)?;
+    quasiquote_expr(&args[0], env, ctx, 1)
+}
+
 fn quote_expr(expr: &Expr) -> Value {
     match expr {
         Expr::Number(value) => Value::Number(*value),
@@ -2694,9 +2793,196 @@ fn quote_expr(expr: &Expr) -> Value {
         Expr::String(value) => Value::String(SchemeString::new(value)),
         Expr::Char(value) => Value::Char(*value),
         Expr::Symbol(name) => Value::Symbol(name.clone()),
-        Expr::List(items) => items.iter().rev().fold(Value::EmptyList, |tail, item| {
-            make_pair(quote_expr(item), tail)
-        }),
+        Expr::List(items) => quote_list_expr(items),
+    }
+}
+
+fn quote_list_expr(items: &[Expr]) -> Value {
+    if let Some(vector_items) = vector_literal_items(items) {
+        return quote_vector_items(vector_items);
+    }
+
+    let dot_index = items
+        .iter()
+        .position(|item| matches!(item, Expr::Symbol(symbol) if symbol == "."));
+
+    let (head, tail) = match dot_index {
+        Some(index) if index > 0 && index + 2 == items.len() => {
+            (&items[..index], quote_expr(&items[index + 1]))
+        }
+        _ => (items, Value::EmptyList),
+    };
+
+    head.iter()
+        .rev()
+        .fold(tail, |tail, item| make_pair(quote_expr(item), tail))
+}
+
+fn vector_literal_items(items: &[Expr]) -> Option<&[Expr]> {
+    match items.split_first() {
+        Some((Expr::Symbol(marker), vector_items)) if marker == VECTOR_LITERAL_MARKER => {
+            Some(vector_items)
+        }
+        _ => None,
+    }
+}
+
+fn quote_vector_items(items: &[Expr]) -> Value {
+    Value::Vector(SchemeVector::new(
+        items.iter().map(quote_expr).collect::<Vec<_>>(),
+    ))
+}
+
+fn quasiquote_expr(
+    expr: &Expr,
+    env: EnvRef,
+    ctx: &mut EvalContext,
+    depth: usize,
+) -> Result<Value, EvalError> {
+    match expr {
+        Expr::Number(_)
+        | Expr::Boolean(_)
+        | Expr::String(_)
+        | Expr::Char(_)
+        | Expr::Symbol(_) => Ok(quote_expr(expr)),
+        Expr::List(items) => {
+            if let Some(vector_items) = vector_literal_items(items) {
+                return quasiquote_vector_items(vector_items, env, ctx, depth);
+            }
+
+            if let Some(inner) = unquote_form_arg(items, "quasiquote") {
+                return if depth == 1 {
+                    eval_expr(inner, env, ctx)
+                } else {
+                    Ok(list_from_values(vec![
+                        Value::Symbol("unquote".to_string()),
+                        quasiquote_expr(inner, env, ctx, depth - 1)?,
+                    ]))
+                };
+            }
+
+            if let Some(inner) = unquote_splicing_form_arg(items, "quasiquote") {
+                return if depth == 1 {
+                    Err(EvalError::SyntaxError {
+                        message: "unquote-splicing is only valid within list or vector quasiquote context"
+                            .to_string(),
+                    })
+                } else {
+                    Ok(list_from_values(vec![
+                        Value::Symbol("unquote-splicing".to_string()),
+                        quasiquote_expr(inner, env, ctx, depth - 1)?,
+                    ]))
+                };
+            }
+
+            if let Some(inner) = quasiquote_form_arg(items) {
+                return Ok(list_from_values(vec![
+                    Value::Symbol("quasiquote".to_string()),
+                    quasiquote_expr(inner, env, ctx, depth + 1)?,
+                ]));
+            }
+
+            quasiquote_list_items(items, env, ctx, depth)
+        }
+    }
+}
+
+fn quasiquote_list_items(
+    items: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+    depth: usize,
+) -> Result<Value, EvalError> {
+    let dot_index = items
+        .iter()
+        .position(|item| matches!(item, Expr::Symbol(symbol) if symbol == "."));
+
+    let (head, tail) = match dot_index {
+        Some(index) if index > 0 && index + 2 == items.len() => (
+            &items[..index],
+            quasiquote_expr(&items[index + 1], env.clone(), ctx, depth)?,
+        ),
+        _ => (items, Value::EmptyList),
+    };
+
+    let mut result = tail;
+
+    for item in head.iter().rev() {
+        if let Some(inner) = unquote_splicing_form_arg_from_depth(item, depth) {
+            let splice_values = eval_expr(inner, env.clone(), ctx)?;
+            let splice_items = expect_list_values(&splice_values, "quasiquote")?;
+            for value in splice_items.into_iter().rev() {
+                result = make_pair(value, result);
+            }
+        } else {
+            result = make_pair(quasiquote_expr(item, env.clone(), ctx, depth)?, result);
+        }
+    }
+
+    Ok(result)
+}
+
+fn quasiquote_vector_items(
+    items: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+    depth: usize,
+) -> Result<Value, EvalError> {
+    let mut values = Vec::new();
+
+    for item in items {
+        if let Some(inner) = unquote_splicing_form_arg_from_depth(item, depth) {
+            let splice_values = eval_expr(inner, env.clone(), ctx)?;
+            values.extend(expect_list_values(&splice_values, "quasiquote")?);
+        } else {
+            values.push(quasiquote_expr(item, env.clone(), ctx, depth)?);
+        }
+    }
+
+    Ok(Value::Vector(SchemeVector::new(values)))
+}
+
+fn quasiquote_form_arg(items: &[Expr]) -> Option<&Expr> {
+    match items {
+        [Expr::Symbol(symbol), inner] if symbol == "quasiquote" => Some(inner),
+        _ => None,
+    }
+}
+
+fn unquote_form_arg<'a>(items: &'a [Expr], context: &str) -> Option<&'a Expr> {
+    match items {
+        [Expr::Symbol(symbol), inner] if symbol == "unquote" => Some(inner),
+        [Expr::Symbol(symbol), ..] if symbol == "unquote" => {
+            let _ = context;
+            None
+        }
+        _ => None,
+    }
+}
+
+fn unquote_splicing_form_arg<'a>(items: &'a [Expr], context: &str) -> Option<&'a Expr> {
+    match items {
+        [Expr::Symbol(symbol), inner] if symbol == "unquote-splicing" => Some(inner),
+        [Expr::Symbol(symbol), ..] if symbol == "unquote-splicing" => {
+            let _ = context;
+            None
+        }
+        _ => None,
+    }
+}
+
+fn unquote_splicing_form_arg_from_depth(expr: &Expr, depth: usize) -> Option<&Expr> {
+    if depth != 1 {
+        return None;
+    }
+
+    let Expr::List(items) = expr else {
+        return None;
+    };
+
+    match items.as_slice() {
+        [Expr::Symbol(symbol), inner] if symbol == "unquote-splicing" => Some(inner),
+        _ => None,
     }
 }
 
@@ -4158,10 +4444,21 @@ fn builtin_string_to_number(args: &[Value], _ctx: &mut EvalContext) -> Result<Va
 }
 
 fn builtin_number_to_string(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
-    expect_value_arity("number->string", args, 1)?;
-    Ok(Value::String(SchemeString::new(
-        expect_number(&args[0])?.render(),
-    )))
+    if !(1..=2).contains(&args.len()) {
+        return Err(EvalError::WrongArgumentCount {
+            name: "number->string".to_string(),
+            expected: "1 or 2".to_string(),
+            got: args.len(),
+        });
+    }
+
+    let number = expect_number(&args[0])?;
+    let rendered = match args.get(1) {
+        None => number.render(),
+        Some(radix) => render_number_in_radix(number, parse_radix(radix, "number->string")?)?,
+    };
+
+    Ok(Value::String(SchemeString::new(rendered)))
 }
 
 fn builtin_symbol_to_string(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -4381,6 +4678,11 @@ fn builtin_assoc(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalEr
     builtin_assoc_by("assoc", args, equal_values)
 }
 
+fn builtin_assq(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("assq", args, 2)?;
+    builtin_assoc_by("assq", args, eqv_values)
+}
+
 fn builtin_assv(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     expect_value_arity("assv", args, 2)?;
     builtin_assoc_by("assv", args, eqv_values)
@@ -4431,6 +4733,24 @@ fn builtin_assoc_by(
 
 fn builtin_member(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     expect_value_arity("member", args, 2)?;
+    builtin_member_by("member", args, equal_values)
+}
+
+fn builtin_memq(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("memq", args, 2)?;
+    builtin_member_by("memq", args, eqv_values)
+}
+
+fn builtin_memv(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("memv", args, 2)?;
+    builtin_member_by("memv", args, eqv_values)
+}
+
+fn builtin_member_by(
+    name: &str,
+    args: &[Value],
+    predicate: fn(&Value, &Value) -> bool,
+) -> Result<Value, EvalError> {
     let key = &args[0];
     let mut cursor = args[1].clone();
     let mut seen = HashSet::new();
@@ -4441,12 +4761,12 @@ fn builtin_member(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalE
             Value::Pair(pair) => {
                 if !seen.insert(pair_id(&pair)) {
                     return Err(EvalError::CircularList {
-                        name: "member".to_string(),
+                        name: name.to_string(),
                     });
                 }
 
                 let car = pair_car(&pair);
-                if equal_values(key, &car) {
+                if predicate(key, &car) {
                     return Ok(Value::Pair(pair));
                 }
 
@@ -4460,6 +4780,20 @@ fn builtin_member(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalE
             }
         }
     }
+}
+
+fn builtin_error(args: &[Value], ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    let message = if args.is_empty() {
+        "error".to_string()
+    } else {
+        args.iter()
+            .map(Value::render_for_display)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    ctx.pending_exception = Some(Value::String(SchemeString::new(message)));
+    Err(EvalError::ExceptionRaisedSignal)
 }
 
 fn builtin_map(args: &[Value], ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -5321,6 +5655,67 @@ fn expect_expr_arity(name: &str, args: &[Expr], expected: usize) -> Result<(), E
     Ok(())
 }
 
+fn parse_cond_match_action(items: &[Expr], form_name: &str) -> Result<CondMatchAction, EvalError> {
+    match items {
+        [_] => Ok(CondMatchAction::ReturnTestValue),
+        [_, Expr::Symbol(symbol), procedure] if symbol == "=>" => {
+            Ok(CondMatchAction::ApplyProcedure(procedure.clone()))
+        }
+        [_, Expr::Symbol(symbol), ..] if symbol == "=>" => Err(EvalError::SyntaxError {
+            message: format!("{form_name} => clauses require exactly one recipient expression"),
+        }),
+        _ => Ok(CondMatchAction::EvaluateBody(items[1..].to_vec())),
+    }
+}
+
+fn parse_radix(value: &Value, name: &'static str) -> Result<u32, EvalError> {
+    match expect_exact_integer(value, name)? {
+        2 => Ok(2),
+        8 => Ok(8),
+        10 => Ok(10),
+        16 => Ok(16),
+        radix => Err(EvalError::UnsupportedRadix { name, radix }),
+    }
+}
+
+fn render_number_in_radix(number: Number, radix: u32) -> Result<String, EvalError> {
+    if radix == 10 {
+        return Ok(number.render());
+    }
+
+    let value = number.expect_exact_integer()?;
+    Ok(render_exact_integer_in_radix(value, radix))
+}
+
+fn render_exact_integer_in_radix(value: i64, radix: u32) -> String {
+    let negative = value < 0;
+    let mut magnitude = i128::from(value).abs();
+    let radix = i128::from(radix);
+    let mut digits = Vec::new();
+
+    if magnitude == 0 {
+        digits.push('0');
+    } else {
+        while magnitude > 0 {
+            let digit = (magnitude % radix) as u8;
+            digits.push(match digit {
+                0..=9 => char::from(b'0' + digit),
+                10..=15 => char::from(b'a' + (digit - 10)),
+                _ => unreachable!("supported radices only emit digits up to 15"),
+            });
+            magnitude /= radix;
+        }
+        digits.reverse();
+    }
+
+    let mut rendered = String::with_capacity(digits.len() + usize::from(negative));
+    if negative {
+        rendered.push('-');
+    }
+    rendered.extend(digits);
+    rendered
+}
+
 fn parse_guard_spec(expr: &Expr) -> Result<(String, Vec<Expr>), EvalError> {
     let Expr::List(items) = expr else {
         return Err(EvalError::SyntaxError {
@@ -5378,6 +5773,7 @@ fn is_special_form_name(name: &str) -> bool {
             | "cond"
             | "case"
             | "quote"
+            | "quasiquote"
             | "define"
             | "define-record-type"
             | "define-syntax"

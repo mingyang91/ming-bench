@@ -113,6 +113,9 @@ pub enum EvalError {
 
     #[error("invalid character code point: {value}")]
     InvalidCharacterCodePoint { value: i64 },
+
+    #[error("unsupported radix for {name}: {radix}")]
+    UnsupportedRadix { name: &'static str, radix: i64 },
 }
 
 impl EvalError {
