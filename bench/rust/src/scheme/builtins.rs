@@ -1,8 +1,11 @@
 use std::cmp::Ordering;
+use std::collections::HashSet;
+use std::rc::Rc;
 
 use super::core::{
-    make_pair, make_string, make_vector, value_equal, BuiltinProcedure, EnvRef, Environment,
-    Runtime, StringRef, Value, VectorRef,
+    is_proper_list, list_from_vec, list_to_vec, make_pair, make_string, make_vector,
+    make_immutable_string, value_equal, BuiltinProcedure, EnvRef, Environment, PairRef, Runtime,
+    StringRef, Value, VectorRef,
 };
 use super::error::EvalError;
 use super::eval::apply_procedure;
@@ -12,6 +15,22 @@ const BUILTINS: &[BuiltinProcedure] = &[
     BuiltinProcedure {
         name: "abs",
         func: builtin_abs,
+    },
+    BuiltinProcedure {
+        name: "gcd",
+        func: builtin_gcd,
+    },
+    BuiltinProcedure {
+        name: "lcm",
+        func: builtin_lcm,
+    },
+    BuiltinProcedure {
+        name: "truncate",
+        func: builtin_truncate,
+    },
+    BuiltinProcedure {
+        name: "round",
+        func: builtin_round,
     },
     BuiltinProcedure {
         name: "+",
@@ -78,6 +97,30 @@ const BUILTINS: &[BuiltinProcedure] = &[
         func: builtin_cdr,
     },
     BuiltinProcedure {
+        name: "caar",
+        func: builtin_caar,
+    },
+    BuiltinProcedure {
+        name: "cadr",
+        func: builtin_cadr,
+    },
+    BuiltinProcedure {
+        name: "cdar",
+        func: builtin_cdar,
+    },
+    BuiltinProcedure {
+        name: "cddr",
+        func: builtin_cddr,
+    },
+    BuiltinProcedure {
+        name: "set-car!",
+        func: builtin_set_car,
+    },
+    BuiltinProcedure {
+        name: "set-cdr!",
+        func: builtin_set_cdr,
+    },
+    BuiltinProcedure {
         name: "null?",
         func: builtin_null,
     },
@@ -134,12 +177,32 @@ const BUILTINS: &[BuiltinProcedure] = &[
         func: builtin_map,
     },
     BuiltinProcedure {
+        name: "for-each",
+        func: builtin_for_each,
+    },
+    BuiltinProcedure {
         name: "append",
         func: builtin_append,
     },
     BuiltinProcedure {
+        name: "reverse",
+        func: builtin_reverse,
+    },
+    BuiltinProcedure {
         name: "assoc",
         func: builtin_assoc,
+    },
+    BuiltinProcedure {
+        name: "assq",
+        func: builtin_assq,
+    },
+    BuiltinProcedure {
+        name: "assv",
+        func: builtin_assv,
+    },
+    BuiltinProcedure {
+        name: "member",
+        func: builtin_member,
     },
     BuiltinProcedure {
         name: "string?",
@@ -220,6 +283,14 @@ const BUILTINS: &[BuiltinProcedure] = &[
     BuiltinProcedure {
         name: "string-length",
         func: builtin_string_length,
+    },
+    BuiltinProcedure {
+        name: "make-string",
+        func: builtin_make_string,
+    },
+    BuiltinProcedure {
+        name: "string",
+        func: builtin_string,
     },
     BuiltinProcedure {
         name: "substring",
@@ -306,6 +377,18 @@ const BUILTINS: &[BuiltinProcedure] = &[
         func: builtin_string_lt,
     },
     BuiltinProcedure {
+        name: "string>?",
+        func: builtin_string_gt,
+    },
+    BuiltinProcedure {
+        name: "string<=?",
+        func: builtin_string_le,
+    },
+    BuiltinProcedure {
+        name: "string>=?",
+        func: builtin_string_ge,
+    },
+    BuiltinProcedure {
         name: "string-ci=?",
         func: builtin_string_ci_eq,
     },
@@ -390,6 +473,51 @@ pub(crate) fn default_env() -> EnvRef {
 fn builtin_abs(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let value = expect_number(expect_single_arg("abs", args)?)?;
     Ok(Value::Number(value.abs()))
+}
+
+fn builtin_gcd(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let mut result = 0_i128;
+
+    for arg in args {
+        let value = i128::from(expect_exact_integer(arg)?).abs();
+        result = gcd_i128(result, value);
+    }
+
+    Ok(Value::Number(Number::exact_integer_i128(result)))
+}
+
+fn builtin_lcm(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Ok(Value::Number(Number::exact_integer(1)));
+    }
+
+    let mut result = 1_i128;
+
+    for arg in args {
+        let value = i128::from(expect_exact_integer(arg)?).abs();
+        if result == 0 || value == 0 {
+            result = 0;
+            continue;
+        }
+
+        let divisor = gcd_i128(result, value);
+        result = result
+            .checked_div(divisor)
+            .and_then(|partial| partial.checked_mul(value))
+            .ok_or(EvalError::NumericOverflow)?;
+    }
+
+    Ok(Value::Number(Number::exact_integer_i128(result)))
+}
+
+fn builtin_truncate(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_number(expect_single_arg("truncate", args)?)?;
+    Ok(Value::Number(truncate_number(value)))
+}
+
+fn builtin_round(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_number(expect_single_arg("round", args)?)?;
+    Ok(Value::Number(round_number(value)))
 }
 
 fn builtin_add(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -501,15 +629,7 @@ fn builtin_cons(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalErr
         return Err(wrong_arg_count("cons", "exactly 2", args.len()));
     };
 
-    match tail {
-        Value::List(values) => {
-            let mut list = Vec::with_capacity(values.len() + 1);
-            list.push(head.clone());
-            list.extend(values.iter().cloned());
-            Ok(Value::List(list))
-        }
-        _ => Ok(make_pair(head.clone(), tail.clone())),
-    }
+    Ok(make_pair(head.clone(), tail.clone()))
 }
 
 fn builtin_car(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -520,6 +640,46 @@ fn builtin_cdr(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalErro
     pair_cdr(expect_single_arg("cdr", args)?)
 }
 
+fn builtin_caar(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_single_arg("caar", args)?;
+    pair_car(&pair_car(value)?)
+}
+
+fn builtin_cadr(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_single_arg("cadr", args)?;
+    pair_car(&pair_cdr(value)?)
+}
+
+fn builtin_cdar(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_single_arg("cdar", args)?;
+    pair_cdr(&pair_car(value)?)
+}
+
+fn builtin_cddr(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_single_arg("cddr", args)?;
+    pair_cdr(&pair_cdr(value)?)
+}
+
+fn builtin_set_car(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let [pair, value] = args else {
+        return Err(wrong_arg_count("set-car!", "exactly 2", args.len()));
+    };
+
+    let pair = expect_pair_ref(pair)?;
+    pair.borrow_mut().car = value.clone();
+    Ok(Value::Void)
+}
+
+fn builtin_set_cdr(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let [pair, value] = args else {
+        return Err(wrong_arg_count("set-cdr!", "exactly 2", args.len()));
+    };
+
+    let pair = expect_pair_ref(pair)?;
+    pair.borrow_mut().cdr = value.clone();
+    Ok(Value::Void)
+}
+
 fn builtin_null(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     Ok(Value::Bool(matches!(
         expect_single_arg("null?", args)?,
@@ -528,7 +688,7 @@ fn builtin_null(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalErr
 }
 
 fn builtin_list(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    Ok(Value::List(args.to_vec()))
+    Ok(list_from_vec(args.to_vec()))
 }
 
 fn builtin_vector(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -587,7 +747,7 @@ fn builtin_list_tail(args: &[Value], _runtime: &mut Runtime) -> Result<Value, Ev
 
     let values = expect_list(list, "list")?;
     let index = expect_index(index, values.len(), IndexBound::AllowEnd)?;
-    Ok(Value::List(values[index..].to_vec()))
+    Ok(list_from_vec(values[index..].to_vec()))
 }
 
 fn builtin_vector_set(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -603,17 +763,17 @@ fn builtin_vector_set(args: &[Value], _runtime: &mut Runtime) -> Result<Value, E
 }
 
 fn builtin_is_list(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    unary_predicate("list?", args, |value| matches!(value, Value::List(_)))
+    unary_predicate("list?", args, is_proper_list)
 }
 
 fn builtin_vector_to_list(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let vector = expect_vector_ref(expect_single_arg("vector->list", args)?)?;
-    Ok(Value::List(vector.borrow().clone()))
+    Ok(list_from_vec(vector.borrow().clone()))
 }
 
 fn builtin_list_to_vector(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let values = expect_list(expect_single_arg("list->vector", args)?, "list")?;
-    Ok(make_vector(values.to_vec()))
+    Ok(make_vector(values))
 }
 
 fn builtin_map(args: &[Value], runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -640,17 +800,49 @@ fn builtin_map(args: &[Value], runtime: &mut Runtime) -> Result<Value, EvalError
         results.push(apply_procedure(operator.clone(), &call_args, runtime)?);
     }
 
-    Ok(Value::List(results))
+    Ok(list_from_vec(results))
+}
+
+fn builtin_for_each(args: &[Value], runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let Some((operator, list_args)) = args.split_first() else {
+        return Err(wrong_arg_count("for-each", "at least 2", 0));
+    };
+
+    if list_args.is_empty() {
+        return Err(wrong_arg_count("for-each", "at least 2", 1));
+    }
+
+    let lists = list_args
+        .iter()
+        .map(|list| expect_list(list, "list"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let len = lists.iter().map(|list| list.len()).min().unwrap_or(0);
+
+    for index in 0..len {
+        let call_args = lists
+            .iter()
+            .map(|list| list[index].clone())
+            .collect::<Vec<_>>();
+        apply_procedure(operator.clone(), &call_args, runtime)?;
+    }
+
+    Ok(Value::Void)
 }
 
 fn builtin_append(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let mut combined = Vec::new();
 
     for arg in args {
-        combined.extend(expect_list(arg, "list")?.iter().cloned());
+        combined.extend(expect_list(arg, "list")?);
     }
 
-    Ok(Value::List(combined))
+    Ok(list_from_vec(combined))
+}
+
+fn builtin_reverse(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let mut values = expect_list(expect_single_arg("reverse", args)?, "list")?;
+    values.reverse();
+    Ok(list_from_vec(values))
 }
 
 fn builtin_assoc(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -659,12 +851,81 @@ fn builtin_assoc(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalEr
     };
 
     for entry in expect_list(alist, "list")? {
-        if value_equal(key, &pair_car(entry)?) {
-            return Ok(entry.clone());
+        if value_equal(key, &pair_car(&entry)?) {
+            return Ok(entry);
         }
     }
 
     Ok(Value::Bool(false))
+}
+
+fn builtin_assq(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let [key, alist] = args else {
+        return Err(wrong_arg_count("assq", "exactly 2", args.len()));
+    };
+
+    for entry in expect_list(alist, "list")? {
+        if eq_value(key, &pair_car(&entry)?) {
+            return Ok(entry);
+        }
+    }
+
+    Ok(Value::Bool(false))
+}
+
+fn builtin_assv(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let [key, alist] = args else {
+        return Err(wrong_arg_count("assv", "exactly 2", args.len()));
+    };
+
+    for entry in expect_list(alist, "list")? {
+        if eqv_value(key, &pair_car(&entry)?) {
+            return Ok(entry);
+        }
+    }
+
+    Ok(Value::Bool(false))
+}
+
+fn builtin_member(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let [needle, list] = args else {
+        return Err(wrong_arg_count("member", "exactly 2", args.len()));
+    };
+
+    let mut current = list.clone();
+    let mut seen_pairs = HashSet::new();
+
+    loop {
+        match current {
+            Value::List(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    if value_equal(needle, value) {
+                        return Ok(list_from_vec(values[index..].to_vec()));
+                    }
+                }
+
+                return Ok(Value::Bool(false));
+            }
+            Value::Pair(pair) => {
+                let ptr = Rc::as_ptr(&pair) as usize;
+                if !seen_pairs.insert(ptr) {
+                    return Ok(Value::Bool(false));
+                }
+
+                let (car, cdr) = {
+                    let borrowed = pair.borrow();
+                    (borrowed.car.clone(), borrowed.cdr.clone())
+                };
+
+                if value_equal(needle, &car) {
+                    return Ok(Value::Pair(pair.clone()));
+                }
+
+                current = cdr;
+            }
+            _ => return Err(type_mismatch("list", list)),
+        }
+    }
 }
 
 fn builtin_is_string(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -776,6 +1037,26 @@ fn builtin_string_length(args: &[Value], _runtime: &mut Runtime) -> Result<Value
     )?)))
 }
 
+fn builtin_make_string(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let (len, fill) = match args {
+        [len] => (expect_length(len)?, ' '),
+        [len, fill] => (expect_length(len)?, expect_char(fill)?),
+        _ => return Err(wrong_arg_count("make-string", "exactly 1 or 2", args.len())),
+    };
+
+    Ok(make_immutable_string(std::iter::repeat_n(fill, len).collect::<String>()))
+}
+
+fn builtin_string(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let mut text = String::with_capacity(args.len());
+
+    for value in args {
+        text.push(expect_char(value)?);
+    }
+
+    Ok(make_immutable_string(text))
+}
+
 fn builtin_substring(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let [string, start, end] = args else {
         return Err(wrong_arg_count("substring", "exactly 3", args.len()));
@@ -830,7 +1111,7 @@ fn builtin_string_copy(args: &[Value], _runtime: &mut Runtime) -> Result<Value, 
 
 fn builtin_string_to_list(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let value = expect_string(expect_single_arg("string->list", args)?)?;
-    Ok(Value::List(value.chars().map(Value::Char).collect()))
+    Ok(list_from_vec(value.chars().map(Value::Char).collect()))
 }
 
 fn builtin_list_to_string(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -838,7 +1119,7 @@ fn builtin_list_to_string(args: &[Value], _runtime: &mut Runtime) -> Result<Valu
     let mut text = String::with_capacity(values.len());
 
     for value in values {
-        text.push(expect_char(value)?);
+        text.push(expect_char(&value)?);
     }
 
     Ok(make_string(text))
@@ -931,6 +1212,18 @@ fn builtin_string_eq(args: &[Value], _runtime: &mut Runtime) -> Result<Value, Ev
 
 fn builtin_string_lt(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     compare_string_args("string<?", args, |lhs, rhs| lhs < rhs)
+}
+
+fn builtin_string_gt(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    compare_string_args("string>?", args, |lhs, rhs| lhs > rhs)
+}
+
+fn builtin_string_le(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    compare_string_args("string<=?", args, |lhs, rhs| lhs <= rhs)
+}
+
+fn builtin_string_ge(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    compare_string_args("string>=?", args, |lhs, rhs| lhs >= rhs)
 }
 
 fn builtin_string_ci_eq(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -1058,7 +1351,7 @@ fn builtin_apply(args: &[Value], runtime: &mut Runtime) -> Result<Value, EvalErr
     };
 
     let mut applied_args = prefix_args.to_vec();
-    applied_args.extend(expect_list(list_arg, "list")?.iter().cloned());
+    applied_args.extend(expect_list(list_arg, "list")?);
     apply_procedure(operator.clone(), &applied_args, runtime)
 }
 
@@ -1083,7 +1376,7 @@ fn pair_cdr(value: &Value) -> Result<Value, EvalError> {
             if values.is_empty() {
                 Err(empty_pair_error())
             } else {
-                Ok(Value::List(values[1..].to_vec()))
+                Ok(list_from_vec(values[1..].to_vec()))
             }
         }
         Value::Pair(pair) => Ok(pair.borrow().cdr.clone()),
@@ -1091,10 +1384,14 @@ fn pair_cdr(value: &Value) -> Result<Value, EvalError> {
     }
 }
 
-fn expect_list<'a>(value: &'a Value, expected: &str) -> Result<&'a [Value], EvalError> {
+fn expect_list(value: &Value, expected: &str) -> Result<Vec<Value>, EvalError> {
+    list_to_vec(value).ok_or_else(|| type_mismatch(expected, value))
+}
+
+fn expect_pair_ref(value: &Value) -> Result<&PairRef, EvalError> {
     match value {
-        Value::List(values) => Ok(values),
-        other => Err(type_mismatch(expected, other)),
+        Value::Pair(pair) => Ok(pair),
+        other => Err(type_mismatch("pair", other)),
     }
 }
 
@@ -1306,4 +1603,47 @@ fn type_mismatch(expected: &str, value: &Value) -> EvalError {
 
 fn usize_to_i64(value: usize) -> Result<i64, EvalError> {
     i64::try_from(value).map_err(|_| EvalError::NumericOverflow)
+}
+
+fn gcd_i128(mut lhs: i128, mut rhs: i128) -> i128 {
+    lhs = lhs.abs();
+    rhs = rhs.abs();
+
+    while rhs != 0 {
+        let remainder = lhs % rhs;
+        lhs = rhs;
+        rhs = remainder;
+    }
+
+    lhs
+}
+
+fn truncate_number(value: Number) -> Number {
+    match value {
+        Number::Exact(_) if value.is_integer() => value,
+        Number::Exact(_) => {
+            let (numer, denom) = value.exact_parts().expect("exact numbers have parts");
+            Number::exact_integer_i128(numer / denom)
+        }
+        Number::Inexact(inner) => Number::Inexact(inner.trunc()),
+    }
+}
+
+fn round_number(value: Number) -> Number {
+    match value {
+        Number::Exact(_) if value.is_integer() => value,
+        Number::Exact(_) => {
+            let (numer, denom) = value.exact_parts().expect("exact numbers have parts");
+            let quotient = numer / denom;
+            let remainder = numer % denom;
+            let doubled = remainder.abs().saturating_mul(2);
+            let rounded = if doubled >= denom {
+                quotient + numer.signum()
+            } else {
+                quotient
+            };
+            Number::exact_integer_i128(rounded)
+        }
+        Number::Inexact(inner) => Number::Inexact(inner.round()),
+    }
 }

@@ -1,5 +1,5 @@
 use std::cell::{Ref, RefCell, RefMut};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use super::error::EvalError;
@@ -334,6 +334,54 @@ pub(crate) fn make_pair(car: Value, cdr: Value) -> Value {
     Value::Pair(Rc::new(RefCell::new(PairCell { car, cdr })))
 }
 
+pub(crate) fn empty_list() -> Value {
+    Value::List(Vec::new())
+}
+
+pub(crate) fn list_from_vec(mut values: Vec<Value>) -> Value {
+    let mut list = empty_list();
+
+    while let Some(value) = values.pop() {
+        list = make_pair(value, list);
+    }
+
+    list
+}
+
+pub(crate) fn list_to_vec(value: &Value) -> Option<Vec<Value>> {
+    let mut values = Vec::new();
+    let mut current = value.clone();
+    let mut seen_pairs = HashSet::new();
+
+    loop {
+        match current {
+            Value::List(items) => {
+                if items.is_empty() {
+                    return Some(values);
+                }
+
+                values.extend(items);
+                return Some(values);
+            }
+            Value::Pair(pair) => {
+                let ptr = Rc::as_ptr(&pair) as usize;
+                if !seen_pairs.insert(ptr) {
+                    return None;
+                }
+
+                let borrowed = pair.borrow();
+                values.push(borrowed.car.clone());
+                current = borrowed.cdr.clone();
+            }
+            _ => return None,
+        }
+    }
+}
+
+pub(crate) fn is_proper_list(value: &Value) -> bool {
+    list_to_vec(value).is_some()
+}
+
 pub(crate) fn make_vector(values: Vec<Value>) -> Value {
     Value::Vector(Rc::new(RefCell::new(values)))
 }
@@ -417,11 +465,22 @@ pub(crate) fn quote_expr(expr: &Expr) -> Value {
         Expr::String(value, _) => make_immutable_string(value.clone()),
         Expr::Char(value, _) => Value::Char(*value),
         Expr::Symbol(value, _) => Value::Symbol(value.clone()),
-        Expr::List(items, _) => Value::List(items.iter().map(quote_expr).collect()),
+        Expr::List(items, _) => list_from_vec(items.iter().map(quote_expr).collect()),
     }
 }
 
 fn render_value(value: &Value, mode: RenderMode) -> String {
+    let mut seen_pairs = HashSet::new();
+    let mut seen_vectors = HashSet::new();
+    render_value_inner(value, mode, &mut seen_pairs, &mut seen_vectors)
+}
+
+fn render_value_inner(
+    value: &Value,
+    mode: RenderMode,
+    seen_pairs: &mut HashSet<usize>,
+    seen_vectors: &mut HashSet<usize>,
+) -> String {
     match value {
         Value::Bool(true) => "#t".into(),
         Value::Bool(false) => "#f".into(),
@@ -438,9 +497,9 @@ fn render_value(value: &Value, mode: RenderMode) -> String {
             RenderMode::Write => render_char(*value),
             RenderMode::Display => value.to_string(),
         },
-        Value::List(values) => render_list(values, mode),
-        Value::Pair(pair) => render_pair(pair, mode),
-        Value::Vector(vector) => render_vector(vector, mode),
+        Value::List(values) => render_list(values, mode, seen_pairs, seen_vectors),
+        Value::Pair(pair) => render_pair(pair, mode, seen_pairs, seen_vectors),
+        Value::Vector(vector) => render_vector(vector, mode, seen_pairs, seen_vectors),
         Value::Record(record) => render_record(record),
         Value::Procedure(_) => "#<procedure>".into(),
         Value::Uninitialized => "#<uninitialized>".into(),
@@ -475,42 +534,126 @@ fn render_char(value: char) -> String {
     }
 }
 
-fn render_list(values: &[Value], mode: RenderMode) -> String {
+fn render_list(
+    values: &[Value],
+    mode: RenderMode,
+    seen_pairs: &mut HashSet<usize>,
+    seen_vectors: &mut HashSet<usize>,
+) -> String {
     let mut rendered = String::from("(");
 
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
             rendered.push(' ');
         }
-        rendered.push_str(&render_value(value, mode));
+        rendered.push_str(&render_value_inner(value, mode, seen_pairs, seen_vectors));
     }
 
     rendered.push(')');
     rendered
 }
 
-fn render_pair(pair: &PairRef, mode: RenderMode) -> String {
-    let pair = pair.borrow();
+fn render_pair(
+    pair: &PairRef,
+    mode: RenderMode,
+    seen_pairs: &mut HashSet<usize>,
+    seen_vectors: &mut HashSet<usize>,
+) -> String {
+    let ptr = Rc::as_ptr(pair) as usize;
+    if !seen_pairs.insert(ptr) {
+        return "#<circular>".into();
+    }
+
+    let (car, mut tail) = {
+        let borrowed = pair.borrow();
+        (borrowed.car.clone(), borrowed.cdr.clone())
+    };
+    let mut entered_pairs = vec![ptr];
     let mut rendered = String::from("(");
-    rendered.push_str(&render_value(&pair.car, mode));
-    rendered.push_str(" . ");
-    rendered.push_str(&render_value(&pair.cdr, mode));
-    rendered.push(')');
+
+    rendered.push_str(&render_value_inner(&car, mode, seen_pairs, seen_vectors));
+
+    loop {
+        match tail {
+            Value::List(values) => {
+                for value in values {
+                    rendered.push(' ');
+                    rendered.push_str(&render_value_inner(
+                        &value,
+                        mode,
+                        seen_pairs,
+                        seen_vectors,
+                    ));
+                }
+
+                rendered.push(')');
+                break;
+            }
+            Value::Pair(next_pair) => {
+                let next_ptr = Rc::as_ptr(&next_pair) as usize;
+                if !seen_pairs.insert(next_ptr) {
+                    rendered.push_str(" . #<circular>)");
+                    break;
+                }
+
+                entered_pairs.push(next_ptr);
+                let (next_car, next_cdr) = {
+                    let borrowed = next_pair.borrow();
+                    (borrowed.car.clone(), borrowed.cdr.clone())
+                };
+                rendered.push(' ');
+                rendered.push_str(&render_value_inner(
+                    &next_car,
+                    mode,
+                    seen_pairs,
+                    seen_vectors,
+                ));
+                tail = next_cdr;
+            }
+            other => {
+                rendered.push_str(" . ");
+                rendered.push_str(&render_value_inner(
+                    &other,
+                    mode,
+                    seen_pairs,
+                    seen_vectors,
+                ));
+                rendered.push(')');
+                break;
+            }
+        }
+    }
+
+    for ptr in entered_pairs {
+        seen_pairs.remove(&ptr);
+    }
+
     rendered
 }
 
-fn render_vector(vector: &VectorRef, mode: RenderMode) -> String {
-    let values = vector.borrow();
+fn render_vector(
+    vector: &VectorRef,
+    mode: RenderMode,
+    seen_pairs: &mut HashSet<usize>,
+    seen_vectors: &mut HashSet<usize>,
+) -> String {
+    let ptr = Rc::as_ptr(vector) as usize;
+    if !seen_vectors.insert(ptr) {
+        return "#<circular-vector>".into();
+    }
+
+    let values = vector.borrow().clone();
     let mut rendered = String::from("#(");
 
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
             rendered.push(' ');
         }
-        rendered.push_str(&render_value(value, mode));
+        rendered.push_str(&render_value_inner(value, mode, seen_pairs, seen_vectors));
     }
 
     rendered.push(')');
+    seen_vectors.remove(&ptr);
     rendered
 }
 
@@ -519,6 +662,17 @@ fn render_record(record: &RecordRef) -> String {
 }
 
 pub(crate) fn value_equal(lhs: &Value, rhs: &Value) -> bool {
+    let mut seen_pairs = HashSet::new();
+    let mut seen_vectors = HashSet::new();
+    value_equal_inner(lhs, rhs, &mut seen_pairs, &mut seen_vectors)
+}
+
+fn value_equal_inner(
+    lhs: &Value,
+    rhs: &Value,
+    seen_pairs: &mut HashSet<(usize, usize)>,
+    seen_vectors: &mut HashSet<(usize, usize)>,
+) -> bool {
     match (lhs, rhs) {
         (Value::Bool(lhs), Value::Bool(rhs)) => lhs == rhs,
         (Value::Number(lhs), Value::Number(rhs)) => lhs == rhs,
@@ -530,21 +684,43 @@ pub(crate) fn value_equal(lhs: &Value, rhs: &Value) -> bool {
                 && lhs
                     .iter()
                     .zip(rhs.iter())
-                    .all(|(lhs, rhs)| value_equal(lhs, rhs))
+                    .all(|(lhs, rhs)| value_equal_inner(lhs, rhs, seen_pairs, seen_vectors))
         }
         (Value::Pair(lhs), Value::Pair(rhs)) => {
-            let lhs = lhs.borrow();
-            let rhs = rhs.borrow();
-            value_equal(&lhs.car, &rhs.car) && value_equal(&lhs.cdr, &rhs.cdr)
+            let key = (Rc::as_ptr(lhs) as usize, Rc::as_ptr(rhs) as usize);
+            if !seen_pairs.insert(key) {
+                return true;
+            }
+
+            let (lhs_car, lhs_cdr) = {
+                let borrowed = lhs.borrow();
+                (borrowed.car.clone(), borrowed.cdr.clone())
+            };
+            let (rhs_car, rhs_cdr) = {
+                let borrowed = rhs.borrow();
+                (borrowed.car.clone(), borrowed.cdr.clone())
+            };
+
+            let equal = value_equal_inner(&lhs_car, &rhs_car, seen_pairs, seen_vectors)
+                && value_equal_inner(&lhs_cdr, &rhs_cdr, seen_pairs, seen_vectors);
+            seen_pairs.remove(&key);
+            equal
         }
         (Value::Vector(lhs), Value::Vector(rhs)) => {
-            let lhs = lhs.borrow();
-            let rhs = rhs.borrow();
-            lhs.len() == rhs.len()
+            let key = (Rc::as_ptr(lhs) as usize, Rc::as_ptr(rhs) as usize);
+            if !seen_vectors.insert(key) {
+                return true;
+            }
+
+            let lhs = lhs.borrow().clone();
+            let rhs = rhs.borrow().clone();
+            let equal = lhs.len() == rhs.len()
                 && lhs
                     .iter()
                     .zip(rhs.iter())
-                    .all(|(lhs, rhs)| value_equal(lhs, rhs))
+                    .all(|(lhs, rhs)| value_equal_inner(lhs, rhs, seen_pairs, seen_vectors));
+            seen_vectors.remove(&key);
+            equal
         }
         (Value::Record(lhs), Value::Record(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::Procedure(lhs), Value::Procedure(rhs)) => Rc::ptr_eq(lhs, rhs),

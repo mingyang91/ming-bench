@@ -3,10 +3,10 @@ use std::rc::Rc;
 
 use super::builtins::{default_env, eqv_value};
 use super::core::{
-    make_case_lambda, make_lambda, make_record, make_record_accessor, make_record_constructor,
-    make_record_predicate, make_record_type, quote_expr, BindingRef, CaseLambdaProcedure, EnvRef,
-    Environment, Expr, ExprsRef, LambdaProcedure, Procedure, RecordAccessorProcedure,
-    RecordConstructorProcedure, RecordPredicateProcedure, Runtime, Value,
+    list_from_vec, make_case_lambda, make_lambda, make_record, make_record_accessor,
+    make_record_constructor, make_record_predicate, make_record_type, quote_expr, BindingRef,
+    CaseLambdaProcedure, EnvRef, Environment, Expr, ExprsRef, LambdaProcedure, Procedure,
+    RecordAccessorProcedure, RecordConstructorProcedure, RecordPredicateProcedure, Runtime, Value,
 };
 use super::error::EvalError;
 use super::macros::{expand_macro_call, parse_macro_definition};
@@ -69,6 +69,7 @@ enum SpecialForm {
     And,
     Or,
     Let,
+    LetStar,
     Letrec,
     LetrecStar,
     Begin,
@@ -91,6 +92,7 @@ impl SpecialForm {
             "and" => Some(Self::And),
             "or" => Some(Self::Or),
             "let" => Some(Self::Let),
+            "let*" => Some(Self::LetStar),
             "letrec" => Some(Self::Letrec),
             "letrec*" => Some(Self::LetrecStar),
             "begin" => Some(Self::Begin),
@@ -119,6 +121,7 @@ impl SpecialForm {
             Self::And => eval_and(args, env, runtime),
             Self::Or => eval_or(args, env, runtime),
             Self::Let => eval_let(args, env, runtime),
+            Self::LetStar => eval_let_star(args, env, runtime),
             Self::Letrec => eval_letrec(args, env, runtime),
             Self::LetrecStar => eval_letrec_star(args, env, runtime),
             Self::Begin => eval_begin(args, env, runtime),
@@ -630,6 +633,30 @@ fn eval_named_let<'a>(
 
     Environment::define(&recursive_env, name.to_string(), procedure.clone());
     apply_procedure_tail(procedure, &values, runtime)
+}
+
+fn eval_let_star<'a>(
+    args: &'a [Expr],
+    env: &EnvRef,
+    runtime: &mut Runtime,
+) -> Result<TailAction<'a>, EvalError> {
+    let Some((bindings_expr, body)) = args.split_first() else {
+        return Err(wrong_arg_count("let*", "at least 2", 0));
+    };
+
+    if body.is_empty() {
+        return Err(wrong_arg_count("let*", "at least 2", 1));
+    }
+
+    let bindings = parse_let_bindings(bindings_expr)?;
+    let local_env = Environment::new(Some(env.clone()));
+
+    for (name, expr) in bindings {
+        let value = eval_expr(&expr, &local_env, runtime)?;
+        Environment::define(&local_env, name, value);
+    }
+
+    Ok(TailAction::Sequence(body, local_env))
 }
 
 fn parse_let_bindings(bindings_expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
@@ -1335,7 +1362,7 @@ fn prepare_lambda_call(lambda: &LambdaProcedure, args: &[Value]) -> Result<EnvRe
         Environment::define(
             &call_env,
             rest_param.clone(),
-            Value::List(args[required_len..].to_vec()),
+            list_from_vec(args[required_len..].to_vec()),
         );
     }
 
