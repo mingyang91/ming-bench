@@ -21,9 +21,7 @@ use self::records::{
     apply_record_accessor, apply_record_constructor, apply_record_predicate,
     eval_define_record_type,
 };
-use self::value_ops::{
-    eqv_value, render_char, render_list, render_pair, render_string, render_vector,
-};
+use self::value_ops::{eqv_value, render_value};
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
@@ -74,7 +72,7 @@ enum Value {
     String(StringRef),
     Symbol(String),
     List(Vec<Value>),
-    Pair(Box<PairValue>),
+    Pair(PairRef),
     Vector(VectorRef),
     Record(Rc<RecordValue>),
     Procedure(Procedure),
@@ -142,6 +140,7 @@ struct StringValue {
 
 type EnvRef = Rc<RefCell<Env>>;
 type EnvWeak = Weak<RefCell<Env>>;
+type PairRef = Rc<RefCell<PairValue>>;
 type VectorRef = Rc<RefCell<Vec<Value>>>;
 type BindingRef = Rc<RefCell<Value>>;
 type MacroRef = Rc<MacroTransformer>;
@@ -283,27 +282,7 @@ impl Value {
     }
 
     fn render_with_mode(&self, mode: RenderMode) -> String {
-        match self {
-            Self::Number(value) => value.render(),
-            Self::Boolean(true) => "#t".into(),
-            Self::Boolean(false) => "#f".into(),
-            Self::Character(value) => render_char(*value, mode),
-            Self::String(value) => {
-                let value = value.borrow();
-                match mode {
-                    RenderMode::Display => value.clone(),
-                    RenderMode::Write => render_string(&value),
-                }
-            }
-            Self::Symbol(value) => value.clone(),
-            Self::List(items) => render_list(items, mode),
-            Self::Pair(pair) => render_pair(&pair.car, &pair.cdr, mode),
-            Self::Vector(values) => render_vector(&values.borrow(), mode),
-            Self::Record(record) => format!("#<record {}>", record.record_type.type_name),
-            Self::Procedure(_) => "#<procedure>".into(),
-            Self::Void => "#<void>".into(),
-            Self::Uninitialized => "#<undefined>".into(),
-        }
+        render_value(self, mode)
     }
 }
 
@@ -325,6 +304,56 @@ impl Env {
             syntax_bindings: HashMap::new(),
         }))
     }
+}
+
+fn empty_list_value() -> Value {
+    Value::List(Vec::new())
+}
+
+fn make_pair_value(car: Value, cdr: Value) -> Value {
+    Value::Pair(Rc::new(RefCell::new(PairValue { car, cdr })))
+}
+
+fn make_list_value(items: Vec<Value>) -> Value {
+    let mut result = empty_list_value();
+    for item in items.into_iter().rev() {
+        result = make_pair_value(item, result);
+    }
+    result
+}
+
+fn collect_list(value: &Value) -> Option<Vec<Value>> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cursor = value.clone();
+
+    loop {
+        match cursor {
+            Value::List(list_items) => {
+                items.extend(list_items);
+                return Some(items);
+            }
+            Value::Pair(pair) => {
+                let pair_id = Rc::as_ptr(&pair) as usize;
+                if !seen.insert(pair_id) {
+                    return None;
+                }
+
+                let pair = pair.borrow();
+                let car = pair.car.clone();
+                let cdr = pair.cdr.clone();
+                drop(pair);
+
+                items.push(car);
+                cursor = cdr;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn is_proper_list(value: &Value) -> bool {
+    collect_list(value).is_some()
 }
 
 /// Evaluate one or more Scheme expressions and return the string
@@ -543,6 +572,7 @@ fn eval_list(
             "do" => return eval_do(&items[1..], env, form_pos, context, tail),
             "if" => return eval_if(&items[1..], env, form_pos, context, tail),
             "let" => return eval_let(&items[1..], env, form_pos, context, tail),
+            "let*" => return eval_let_star(&items[1..], env, form_pos, context, tail),
             "letrec" => return eval_letrec(&items[1..], env, form_pos, context, false, tail),
             "letrec*" => return eval_letrec(&items[1..], env, form_pos, context, true, tail),
             "quote" => return eval_quote(&items[1..], form_pos).map(EvalOutcome::Value),
@@ -936,6 +966,35 @@ fn eval_plain_let(
     eval_sequence_outcome(body, &let_env, pos, context, tail)
 }
 
+fn eval_let_star(
+    args: &[Expr],
+    env: &EnvRef,
+    pos: SourcePos,
+    context: &mut EvalContext,
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
+    let (bindings_expr, body) = args
+        .split_first()
+        .ok_or_else(|| syntax_error(pos, "let* requires bindings and a body"))?;
+
+    if body.is_empty() {
+        return Err(syntax_error(pos, "let* requires a body"));
+    }
+
+    let bindings = bindings_expr
+        .list_items()
+        .ok_or_else(|| syntax_error(bindings_expr.pos, "let* bindings must be a list"))?;
+    let let_env = Env::new_child(env);
+
+    for binding in bindings {
+        let (name, value_expr) = parse_value_binding(binding, "let*")?;
+        let value = eval_expr(&value_expr, &let_env, context)?;
+        env_define(&let_env, name, value);
+    }
+
+    eval_sequence_outcome(body, &let_env, pos, context, tail)
+}
+
 fn eval_named_let(
     name: &str,
     args: &[Expr],
@@ -1123,7 +1182,7 @@ fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
             .iter()
             .map(quote_expr)
             .collect::<Result<Vec<_>, _>>()
-            .map(Value::List),
+            .map(make_list_value),
     }
 }
 
@@ -1360,11 +1419,7 @@ fn bind_lambda_call(lambda: &Lambda, args: &[Value], pos: SourcePos) -> Result<E
     }
 
     if let Some(rest) = &lambda.params.rest {
-        env_define(
-            &call_env,
-            rest.clone(),
-            Value::List(args[required_len..].to_vec()),
-        );
+        env_define(&call_env, rest.clone(), make_list_value(args[required_len..].to_vec()));
     }
 
     Ok(call_env)

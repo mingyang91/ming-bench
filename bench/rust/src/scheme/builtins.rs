@@ -5,9 +5,12 @@ use super::builtin_helpers::{
 };
 use super::value_ops::{byte_index_for_char, eq_value, equal_value, eqv_value};
 use super::{
-    apply, invalid_argument, make_string_value, make_vector_value, number_error, type_mismatch,
-    wrong_arg_count, EvalContext, EvalError, Number, PairValue, SourcePos, Value,
+    apply, invalid_argument, is_proper_list, make_list_value, make_pair_value,
+    make_string_value, make_vector_value, number_error, type_mismatch, wrong_arg_count,
+    EvalContext, EvalError, Number, SourcePos, Value,
 };
+use std::collections::HashSet;
+use std::rc::Rc;
 
 pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
     match name {
@@ -24,6 +27,7 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "apply" => Some("apply"),
         "append" => Some("append"),
         "assoc" => Some("assoc"),
+        "assv" => Some("assv"),
         "boolean?" => Some("boolean?"),
         "char-alphabetic?" => Some("char-alphabetic?"),
         "char->integer" => Some("char->integer"),
@@ -33,8 +37,12 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "char=?" => Some("char=?"),
         "char<?" => Some("char<?"),
         "char?" => Some("char?"),
+        "caar" => Some("caar"),
+        "cadr" => Some("cadr"),
         "car" => Some("car"),
         "cdr" => Some("cdr"),
+        "cdar" => Some("cdar"),
+        "cddr" => Some("cddr"),
         "cons" => Some("cons"),
         "display" => Some("display"),
         "eq?" => Some("eq?"),
@@ -44,10 +52,13 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "equal?" => Some("equal?"),
         "even?" => Some("even?"),
         "expt" => Some("expt"),
+        "for-each" => Some("for-each"),
+        "gcd" => Some("gcd"),
         "inexact?" => Some("inexact?"),
         "inexact->exact" => Some("inexact->exact"),
         "integer?" => Some("integer?"),
         "integer->char" => Some("integer->char"),
+        "lcm" => Some("lcm"),
         "length" => Some("length"),
         "list" => Some("list"),
         "list->string" => Some("list->string"),
@@ -56,7 +67,9 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "list?" => Some("list?"),
         "map" => Some("map"),
         "max" => Some("max"),
+        "make-string" => Some("make-string"),
         "make-vector" => Some("make-vector"),
+        "member" => Some("member"),
         "min" => Some("min"),
         "modulo" => Some("modulo"),
         "negative?" => Some("negative?"),
@@ -72,21 +85,30 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "quotient" => Some("quotient"),
         "rational?" => Some("rational?"),
         "remainder" => Some("remainder"),
+        "reverse" => Some("reverse"),
+        "round" => Some("round"),
+        "set-car!" => Some("set-car!"),
+        "set-cdr!" => Some("set-cdr!"),
         "string-ci=?" => Some("string-ci=?"),
         "string-downcase" => Some("string-downcase"),
         "string->number" => Some("string->number"),
         "string->symbol" => Some("string->symbol"),
         "string-append" => Some("string-append"),
         "string-copy" => Some("string-copy"),
+        "string" => Some("string"),
         "string-upcase" => Some("string-upcase"),
         "string=?" => Some("string=?"),
+        "string>=?" => Some("string>=?"),
+        "string>?" => Some("string>?"),
         "string<?" => Some("string<?"),
+        "string<=?" => Some("string<=?"),
         "string-length" => Some("string-length"),
         "string->list" => Some("string->list"),
         "string-ref" => Some("string-ref"),
         "string-set!" => Some("string-set!"),
         "string?" => Some("string?"),
         "substring" => Some("substring"),
+        "truncate" => Some("truncate"),
         "symbol->string" => Some("symbol->string"),
         "symbol?" => Some("symbol?"),
         "numerator" => Some("numerator"),
@@ -124,6 +146,7 @@ pub(super) fn apply_builtin(
         "apply" => builtin_apply(args, pos, context),
         "append" => append(args, pos),
         "assoc" => assoc(args, pos),
+        "assv" => assv(args, pos),
         "boolean?" => predicate(args, "boolean?", pos, |value| {
             matches!(value, Value::Boolean(_))
         }),
@@ -147,8 +170,12 @@ pub(super) fn apply_builtin(
         "char?" => predicate(args, "char?", pos, |value| {
             matches!(value, Value::Character(_))
         }),
+        "caar" => compound_pair_access(args, pos, "caar", "aa"),
+        "cadr" => compound_pair_access(args, pos, "cadr", "ad"),
         "car" => car(args, pos),
         "cdr" => cdr(args, pos),
+        "cdar" => compound_pair_access(args, pos, "cdar", "da"),
+        "cddr" => compound_pair_access(args, pos, "cddr", "dd"),
         "cons" => cons(args, pos),
         "denominator" => denominator(args, pos),
         "display" => display(args, pos, context),
@@ -166,6 +193,8 @@ pub(super) fn apply_builtin(
             Ok(expect_exact_integer_value("even?", *value, pos)? % 2 == 0)
         }),
         "expt" => expt(args, pos),
+        "for-each" => builtin_for_each(args, pos, context),
+        "gcd" => gcd(args, pos),
         "inexact?" => predicate(
             args,
             "inexact?",
@@ -180,16 +209,19 @@ pub(super) fn apply_builtin(
             pos,
             |value| matches!(value, Value::Number(number) if number.is_integer()),
         ),
+        "lcm" => lcm(args, pos),
         "length" => length(args, pos),
-        "list" => Ok(Value::List(args.to_vec())),
+        "list" => Ok(make_list_value(args.to_vec())),
         "list->string" => list_to_string(args, pos),
         "list-ref" => list_ref(args, pos),
         "list-tail" => list_tail(args, pos),
-        "list?" => predicate(args, "list?", pos, |value| matches!(value, Value::List(_))),
+        "list?" => predicate(args, "list?", pos, is_proper_list),
         "list->vector" => list_to_vector(args, pos),
         "map" => builtin_map(args, pos, context),
         "max" => max_value(args, pos),
+        "make-string" => make_string_builtin(args, pos),
         "make-vector" => make_vector(args, pos),
+        "member" => member(args, pos),
         "min" => min_value(args, pos),
         "modulo" => modulo(args, pos),
         "negative?" => number_predicate(args, "negative?", pos, |value| {
@@ -229,15 +261,23 @@ pub(super) fn apply_builtin(
             |value| matches!(value, Value::Number(number) if number.is_rational()),
         ),
         "remainder" => remainder(args, pos),
+        "reverse" => reverse(args, pos),
+        "round" => round_value(args, pos),
+        "set-car!" => set_car(args, pos),
+        "set-cdr!" => set_cdr(args, pos),
         "string-ci=?" => string_ci_equal(args, pos),
         "string-downcase" => string_downcase(args, pos),
         "string->number" => string_to_number(args, pos),
         "string->symbol" => string_to_symbol(args, pos),
         "string-append" => string_append(args, pos),
         "string-copy" => string_copy(args, pos),
+        "string" => string_builtin(args, pos),
         "string-upcase" => string_upcase(args, pos),
         "string=?" => compare_strings(name, args, pos, |left, right| left == right),
+        "string>=?" => compare_strings(name, args, pos, |left, right| left >= right),
+        "string>?" => compare_strings(name, args, pos, |left, right| left > right),
         "string<?" => compare_strings(name, args, pos, |left, right| left < right),
+        "string<=?" => compare_strings(name, args, pos, |left, right| left <= right),
         "string-length" => string_length(args, pos),
         "string->list" => string_to_list(args, pos),
         "string-ref" => string_ref(args, pos),
@@ -246,6 +286,7 @@ pub(super) fn apply_builtin(
             matches!(value, Value::String(_))
         }),
         "substring" => substring(args, pos),
+        "truncate" => truncate_value(args, pos),
         "symbol->string" => symbol_to_string(args, pos),
         "symbol?" => predicate(args, "symbol?", pos, |value| {
             matches!(value, Value::Symbol(_))
@@ -347,6 +388,29 @@ fn abs_value(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     }
 }
 
+fn gcd(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let mut result = 0_i64;
+
+    for value in args {
+        let next = expect_exact_integer_arg("gcd", value, pos)?;
+        result = gcd_i64(result, next);
+    }
+
+    Ok(Value::Number(Number::exact_integer(result)))
+}
+
+fn lcm(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let mut result = 1_i64;
+
+    for value in args {
+        let next = expect_exact_integer_arg("lcm", value, pos)?;
+        result = lcm_i64(result, next)
+            .ok_or_else(|| invalid_argument(pos, "lcm", "result overflowed the integer range"))?;
+    }
+
+    Ok(Value::Number(Number::exact_integer(result)))
+}
+
 fn min_value(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     let values = expect_numbers("min", args, pos)?;
     match values
@@ -439,16 +503,7 @@ fn builtin_not(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
 
 fn cons(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     match args {
-        [head, Value::List(tail)] => {
-            let mut items = Vec::with_capacity(tail.len() + 1);
-            items.push(head.clone());
-            items.extend(tail.iter().cloned());
-            Ok(Value::List(items))
-        }
-        [head, tail] => Ok(Value::Pair(Box::new(PairValue {
-            car: head.clone(),
-            cdr: tail.clone(),
-        }))),
+        [head, tail] => Ok(make_pair_value(head.clone(), tail.clone())),
         _ => Err(wrong_arg_count(
             pos,
             "cons",
@@ -461,7 +516,7 @@ fn cons(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
 fn car(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     match args {
         [Value::List(items)] if !items.is_empty() => Ok(items[0].clone()),
-        [Value::Pair(pair)] => Ok(pair.car.clone()),
+        [Value::Pair(pair)] => Ok(pair.borrow().car.clone()),
         [other] => Err(type_mismatch(pos, "car", "pair", other.type_name())),
         _ => Err(wrong_arg_count(
             pos,
@@ -474,8 +529,8 @@ fn car(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
 
 fn cdr(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     match args {
-        [Value::List(items)] if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
-        [Value::Pair(pair)] => Ok(pair.cdr.clone()),
+        [Value::List(items)] if !items.is_empty() => Ok(make_list_value(items[1..].to_vec())),
+        [Value::Pair(pair)] => Ok(pair.borrow().cdr.clone()),
         [other] => Err(type_mismatch(pos, "cdr", "pair", other.type_name())),
         _ => Err(wrong_arg_count(
             pos,
@@ -486,15 +541,38 @@ fn cdr(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     }
 }
 
+fn compound_pair_access(
+    args: &[Value],
+    pos: SourcePos,
+    name: &str,
+    pattern: &str,
+) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(wrong_arg_count(pos, name, "exactly 1 argument", args.len()));
+    };
+
+    let mut current = value.clone();
+    for op in pattern.chars().rev() {
+        current = match (op, current) {
+            ('a', Value::List(items)) if !items.is_empty() => items[0].clone(),
+            ('a', Value::Pair(pair)) => pair.borrow().car.clone(),
+            ('d', Value::List(items)) if !items.is_empty() => make_list_value(items[1..].to_vec()),
+            ('d', Value::Pair(pair)) => pair.borrow().cdr.clone(),
+            (_, other) => return Err(type_mismatch(pos, name, "pair", other.type_name())),
+        };
+    }
+
+    Ok(current)
+}
+
 fn append(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     let mut items = Vec::new();
 
     for value in args {
-        let list = expect_list("append", value, pos)?;
-        items.extend(list.iter().cloned());
+        items.extend(expect_list("append", value, pos)?);
     }
 
-    Ok(Value::List(items))
+    Ok(make_list_value(items))
 }
 
 fn builtin_apply(
@@ -512,7 +590,7 @@ fn builtin_apply(
     let list_args = expect_list("apply", list_arg, pos)?;
     let mut expanded_args = Vec::with_capacity(prefix_args.len() + list_args.len());
     expanded_args.extend(prefix_args.iter().cloned());
-    expanded_args.extend(list_args.iter().cloned());
+    expanded_args.extend(list_args);
 
     apply(operator.clone(), &expanded_args, pos, context)
 }
@@ -559,20 +637,41 @@ fn list_ref(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
 fn list_tail(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     match args {
         [list, index] => {
-            let list = expect_list("list-tail", list, pos)?;
             let index = expect_non_negative_integer("list-tail", index, pos, "index")?;
-            if index > list.len() {
+
+            if !is_proper_list(list) {
+                return Err(type_mismatch(pos, "list-tail", "list", list.type_name()));
+            }
+
+            let mut tail = list.clone();
+            for _ in 0..index {
+                tail = match tail {
+                    Value::List(items) if items.is_empty() => {
+                        return Err(invalid_argument(
+                            pos,
+                            "list-tail",
+                            format!("index {index} out of range for list"),
+                        ));
+                    }
+                    Value::List(items) => {
+                        return Ok(make_list_value(items[1..].to_vec()));
+                    }
+                    Value::Pair(pair) => pair.borrow().cdr.clone(),
+                    _ => {
+                        return Err(type_mismatch(pos, "list-tail", "list", list.type_name()));
+                    }
+                };
+            }
+
+            if !is_proper_list(&tail) {
                 return Err(invalid_argument(
                     pos,
                     "list-tail",
-                    format!(
-                        "index {index} out of range for list of length {}",
-                        list.len()
-                    ),
+                    format!("index {index} out of range for list"),
                 ));
             }
 
-            Ok(Value::List(list[index..].to_vec()))
+            Ok(tail)
         }
         _ => Err(wrong_arg_count(
             pos,
@@ -585,9 +684,7 @@ fn list_tail(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
 
 fn list_to_vector(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     match args {
-        [list] => Ok(make_vector_value(
-            expect_list("list->vector", list, pos)?.to_vec(),
-        )),
+        [list] => Ok(make_vector_value(expect_list("list->vector", list, pos)?)),
         _ => Err(wrong_arg_count(
             pos,
             "list->vector",
@@ -602,7 +699,7 @@ fn list_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         [list] => {
             let list = expect_list("list->string", list, pos)?;
             let mut string = String::with_capacity(list.len());
-            for value in list {
+            for value in &list {
                 string.push(expect_char("list->string", value, pos)?);
             }
             Ok(make_string_value(string))
@@ -616,19 +713,79 @@ fn list_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     }
 }
 
+fn reverse(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [list] => {
+            let mut items = expect_list("reverse", list, pos)?;
+            items.reverse();
+            Ok(make_list_value(items))
+        }
+        _ => Err(wrong_arg_count(
+            pos,
+            "reverse",
+            "exactly 1 argument",
+            args.len(),
+        )),
+    }
+}
+
+fn member(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [target, list] => {
+            let mut cursor = list.clone();
+            let mut seen = HashSet::new();
+
+            loop {
+                match cursor.clone() {
+                    Value::List(items) => {
+                        for (index, item) in items.iter().enumerate() {
+                            if equal_value(target, item) {
+                                return Ok(make_list_value(items[index..].to_vec()));
+                            }
+                        }
+                        return Ok(Value::Boolean(false));
+                    }
+                    Value::Pair(pair) => {
+                        let pair_id = Rc::as_ptr(&pair) as usize;
+                        if !seen.insert(pair_id) {
+                            return Err(type_mismatch(pos, "member", "list", list.type_name()));
+                        }
+
+                        let pair_ref = pair.borrow();
+                        if equal_value(target, &pair_ref.car) {
+                            return Ok(cursor);
+                        }
+                        cursor = pair_ref.cdr.clone();
+                    }
+                    _ => return Err(type_mismatch(pos, "member", "list", list.type_name())),
+                }
+            }
+        }
+        _ => Err(wrong_arg_count(
+            pos,
+            "member",
+            "exactly 2 arguments",
+            args.len(),
+        )),
+    }
+}
+
 fn assoc(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     match args {
         [key, alist] => {
             let alist = expect_list("assoc", alist, pos)?;
 
-            for entry in alist {
-                let entry_key = match entry {
-                    Value::List(items) if !items.is_empty() => &items[0],
-                    Value::Pair(pair) => &pair.car,
+            for entry in &alist {
+                let matches = match entry {
+                    Value::List(items) if !items.is_empty() => equal_value(key, &items[0]),
+                    Value::Pair(pair) => {
+                        let pair = pair.borrow();
+                        equal_value(key, &pair.car)
+                    }
                     other => return Err(type_mismatch(pos, "assoc", "pair", other.type_name())),
                 };
 
-                if equal_value(key, entry_key) {
+                if matches {
                     return Ok(entry.clone());
                 }
             }
@@ -638,6 +795,37 @@ fn assoc(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         _ => Err(wrong_arg_count(
             pos,
             "assoc",
+            "exactly 2 arguments",
+            args.len(),
+        )),
+    }
+}
+
+fn assv(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [key, alist] => {
+            let alist = expect_list("assv", alist, pos)?;
+
+            for entry in &alist {
+                let matches = match entry {
+                    Value::List(items) if !items.is_empty() => eqv_value(key, &items[0]),
+                    Value::Pair(pair) => {
+                        let pair = pair.borrow();
+                        eqv_value(key, &pair.car)
+                    }
+                    other => return Err(type_mismatch(pos, "assv", "pair", other.type_name())),
+                };
+
+                if matches {
+                    return Ok(entry.clone());
+                }
+            }
+
+            Ok(Value::Boolean(false))
+        }
+        _ => Err(wrong_arg_count(
+            pos,
+            "assv",
             "exactly 2 arguments",
             args.len(),
         )),
@@ -680,7 +868,77 @@ fn builtin_map(
         results.push(apply(operator.clone(), &call_args, pos, context)?);
     }
 
-    Ok(Value::List(results))
+    Ok(make_list_value(results))
+}
+
+fn builtin_for_each(
+    args: &[Value],
+    pos: SourcePos,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let (operator, list_args) = args
+        .split_first()
+        .ok_or_else(|| wrong_arg_count(pos, "for-each", "at least 2 arguments", 0))?;
+
+    if list_args.is_empty() {
+        return Err(wrong_arg_count(pos, "for-each", "at least 2 arguments", 1));
+    }
+
+    let lists = list_args
+        .iter()
+        .map(|value| expect_list("for-each", value, pos))
+        .collect::<Result<Vec<_>, _>>()?;
+    let len = lists[0].len();
+
+    if lists.iter().any(|list| list.len() != len) {
+        return Err(invalid_argument(
+            pos,
+            "for-each",
+            "all input lists must have the same length",
+        ));
+    }
+
+    for index in 0..len {
+        let call_args = lists
+            .iter()
+            .map(|list| list[index].clone())
+            .collect::<Vec<_>>();
+        apply(operator.clone(), &call_args, pos, context)?;
+    }
+
+    Ok(Value::Void)
+}
+
+fn set_car(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [Value::Pair(pair), value] => {
+            pair.borrow_mut().car = value.clone();
+            Ok(Value::Void)
+        }
+        [other, _] => Err(type_mismatch(pos, "set-car!", "pair", other.type_name())),
+        _ => Err(wrong_arg_count(
+            pos,
+            "set-car!",
+            "exactly 2 arguments",
+            args.len(),
+        )),
+    }
+}
+
+fn set_cdr(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [Value::Pair(pair), value] => {
+            pair.borrow_mut().cdr = value.clone();
+            Ok(Value::Void)
+        }
+        [other, _] => Err(type_mismatch(pos, "set-cdr!", "pair", other.type_name())),
+        _ => Err(wrong_arg_count(
+            pos,
+            "set-cdr!",
+            "exactly 2 arguments",
+            args.len(),
+        )),
+    }
 }
 
 fn display(args: &[Value], pos: SourcePos, context: &mut EvalContext) -> Result<Value, EvalError> {
@@ -725,6 +983,34 @@ fn newline(args: &[Value], pos: SourcePos, context: &mut EvalContext) -> Result<
 
     context.output.push('\n');
     Ok(Value::Void)
+}
+
+fn make_string_builtin(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [length] => {
+            let length = expect_non_negative_integer("make-string", length, pos, "length")?;
+            Ok(make_string_value("\0".repeat(length)))
+        }
+        [length, fill] => {
+            let length = expect_non_negative_integer("make-string", length, pos, "length")?;
+            let fill = expect_char("make-string", fill, pos)?;
+            Ok(make_string_value(fill.to_string().repeat(length)))
+        }
+        _ => Err(wrong_arg_count(
+            pos,
+            "make-string",
+            "1 or 2 arguments",
+            args.len(),
+        )),
+    }
+}
+
+fn string_builtin(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let mut result = String::with_capacity(args.len());
+    for value in args {
+        result.push(expect_char("string", value, pos)?);
+    }
+    Ok(make_string_value(result))
 }
 
 fn string_append(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
@@ -832,7 +1118,7 @@ fn string_to_list(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         [value] => {
             let value = expect_string("string->list", value, pos)?;
             let chars = value.borrow().chars().map(Value::Character).collect();
-            Ok(Value::List(chars))
+            Ok(make_list_value(chars))
         }
         _ => Err(wrong_arg_count(
             pos,
@@ -1220,7 +1506,7 @@ fn vector_set(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
 
 fn vector_to_list(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     match args {
-        [vector] => Ok(Value::List(
+        [vector] => Ok(make_list_value(
             expect_vector("vector->list", vector, pos)?.borrow().clone(),
         )),
         _ => Err(wrong_arg_count(
@@ -1263,6 +1549,14 @@ fn inexact_to_exact(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> 
     }
 }
 
+fn truncate_value(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    round_inexact_to_exact_integer("truncate", args, pos, f64::trunc)
+}
+
+fn round_value(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    round_inexact_to_exact_integer("round", args, pos, f64::round)
+}
+
 fn numerator(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     match args {
         [value] => {
@@ -1275,6 +1569,40 @@ fn numerator(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         _ => Err(wrong_arg_count(
             pos,
             "numerator",
+            "exactly 1 argument",
+            args.len(),
+        )),
+    }
+}
+
+fn round_inexact_to_exact_integer<F>(
+    name: &str,
+    args: &[Value],
+    pos: SourcePos,
+    transform: F,
+) -> Result<Value, EvalError>
+where
+    F: Fn(f64) -> f64,
+{
+    match args {
+        [value] => {
+            let number = expect_number(name, value, pos)?;
+            if let Some(integer) = number.exact_integer_value() {
+                return Ok(Value::Number(Number::exact_integer(integer)));
+            }
+
+            let inexact = match number.to_inexact() {
+                Number::Inexact(value) => value,
+                Number::Exact(_) => unreachable!(),
+            };
+            let rounded = Number::Inexact(transform(inexact))
+                .to_exact()
+                .map_err(|error| number_error(pos, name, error))?;
+            Ok(Value::Number(rounded))
+        }
+        _ => Err(wrong_arg_count(
+            pos,
+            name,
             "exactly 1 argument",
             args.len(),
         )),
@@ -1297,6 +1625,30 @@ fn denominator(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
             args.len(),
         )),
     }
+}
+
+fn gcd_i64(left: i64, right: i64) -> i64 {
+    let mut left = left.abs();
+    let mut right = right.abs();
+
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+
+    left
+}
+
+fn lcm_i64(left: i64, right: i64) -> Option<i64> {
+    if left == 0 || right == 0 {
+        return Some(0);
+    }
+
+    let gcd = gcd_i64(left, right);
+    left.checked_div(gcd)?
+        .checked_mul(right)?
+        .checked_abs()
 }
 
 fn expect_exact_integer_arg(name: &str, value: &Value, pos: SourcePos) -> Result<i64, EvalError> {

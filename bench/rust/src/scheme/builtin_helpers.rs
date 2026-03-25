@@ -1,6 +1,6 @@
 use super::{
-    invalid_argument, type_mismatch, wrong_arg_count, EvalError, Number, SourcePos, StringRef,
-    Value, VectorRef,
+    collect_list, invalid_argument, type_mismatch, wrong_arg_count, EvalError, Number, SourcePos,
+    StringRef, Value, VectorRef,
 };
 use std::rc::Rc;
 
@@ -214,15 +214,12 @@ pub(super) fn expect_non_negative_integer(
     }
 }
 
-pub(super) fn expect_list<'a>(
+pub(super) fn expect_list(
     name: &str,
-    value: &'a Value,
+    value: &Value,
     pos: SourcePos,
-) -> Result<&'a [Value], EvalError> {
-    match value {
-        Value::List(items) => Ok(items),
-        other => Err(type_mismatch(pos, name, "list", other.type_name())),
-    }
+) -> Result<Vec<Value>, EvalError> {
+    collect_list(value).ok_or_else(|| type_mismatch(pos, name, "list", value.type_name()))
 }
 
 pub(super) fn expect_vector(
