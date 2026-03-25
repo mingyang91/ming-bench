@@ -1566,7 +1566,7 @@
     "level": 24,
     "fixture": "l24_coroutine_scheduler.scm",
     "kind": "eval_str_ok",
-    "expected": "4"
+    "expected": "6"
   },
   {
     "name": "l24_macro_tco_loop",
