@@ -1,5 +1,13 @@
 use std::fmt;
 use std::collections::HashMap;
+use std::rc::Rc;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LambdaData {
+    pub params: Vec<String>,
+    pub body: Vec<crate::scheme::parser::Expr>,
+    pub env: Env,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -8,11 +16,7 @@ pub enum Value {
     Str(String),
     Symbol(String),
     List(Vec<Value>),
-    Lambda {
-        params: Vec<String>,
-        body: Vec<crate::scheme::parser::Expr>,
-        env: Env,
-    },
+    Lambda(Rc<LambdaData>),
     Void,
 }
 
@@ -96,7 +100,7 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_display_string()).collect();
                 format!("({})", inner.join(" "))
             }
-            Value::Lambda { .. } => "#<procedure>".into(),
+            Value::Lambda(_) => "#<procedure>".into(),
             Value::Void => "".into(),
         }
     }

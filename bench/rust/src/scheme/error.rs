@@ -9,6 +9,6 @@ pub enum EvalError {
     UnboundVariable(String),
     #[error("wrong number of arguments: {0}")]
     Arity(String),
-    #[error("division by zero")]
-    DivisionByZero,
+    #[error("division by zero {0}")]
+    DivisionByZero(String),
 }
