@@ -7,6 +7,14 @@ pub enum EvalError {
     #[error("empty input")]
     EmptyInput,
 
+    #[error("{source} at {line}:{col}")]
+    WithPosition {
+        line: usize,
+        col: usize,
+        #[source]
+        source: Box<EvalError>,
+    },
+
     #[error("syntax error: {message}")]
     SyntaxError { message: String },
 
@@ -31,4 +39,17 @@ pub enum EvalError {
 
     #[error("integer division produced a non-integer result")]
     NonIntegerDivision,
+}
+
+impl EvalError {
+    pub(crate) fn with_position(self, line: usize, col: usize) -> Self {
+        match self {
+            Self::WithPosition { .. } => self,
+            other => Self::WithPosition {
+                line,
+                col,
+                source: Box::new(other),
+            },
+        }
+    }
 }

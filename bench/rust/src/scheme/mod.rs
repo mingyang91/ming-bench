@@ -6,13 +6,31 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Position {
+    line: usize,
+    col: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Expr {
-    Bool(bool),
-    Int(i64),
-    String(String),
-    Symbol(String),
-    List(Vec<Expr>),
+    Bool(bool, Position),
+    Int(i64, Position),
+    String(String, Position),
+    Symbol(String, Position),
+    List(Vec<Expr>, Position),
+}
+
+impl Expr {
+    fn pos(&self) -> Position {
+        match self {
+            Self::Bool(_, pos)
+            | Self::Int(_, pos)
+            | Self::String(_, pos)
+            | Self::Symbol(_, pos)
+            | Self::List(_, pos) => *pos,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -129,11 +147,18 @@ impl Environment {
 struct Parser<'a> {
     input: &'a str,
     cursor: usize,
+    line: usize,
+    col: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(input: &'a str) -> Self {
-        Self { input, cursor: 0 }
+        Self {
+            input,
+            cursor: 0,
+            line: 1,
+            col: 1,
+        }
     }
 
     fn parse_program(&mut self) -> Result<Vec<Expr>, EvalError> {
@@ -154,22 +179,29 @@ impl<'a> Parser<'a> {
 
     fn parse_expr(&mut self) -> Result<Expr, EvalError> {
         self.skip_ignored();
+        let pos = self.current_position();
 
         match self.peek_char() {
-            Some('(') => self.parse_list(),
-            Some('\'') => self.parse_quote_shorthand(),
-            Some('"') => self.parse_string(),
-            Some(')') => Err(EvalError::SyntaxError {
-                message: "unexpected ')'".into(),
-            }),
-            Some(_) => self.parse_atom(),
-            None => Err(EvalError::SyntaxError {
-                message: "unexpected end of input".into(),
-            }),
+            Some('(') => self.parse_list(pos),
+            Some('\'') => self.parse_quote_shorthand(pos),
+            Some('"') => self.parse_string(pos),
+            Some(')') => Err(with_pos(
+                EvalError::SyntaxError {
+                    message: "unexpected ')'".into(),
+                },
+                pos,
+            )),
+            Some(_) => self.parse_atom(pos),
+            None => Err(with_pos(
+                EvalError::SyntaxError {
+                    message: "unexpected end of input".into(),
+                },
+                pos,
+            )),
         }
     }
 
-    fn parse_list(&mut self) -> Result<Expr, EvalError> {
+    fn parse_list(&mut self, pos: Position) -> Result<Expr, EvalError> {
         self.expect_char('(')?;
         let mut items = Vec::new();
 
@@ -179,31 +211,37 @@ impl<'a> Parser<'a> {
             match self.peek_char() {
                 Some(')') => {
                     self.bump_char();
-                    return Ok(Expr::List(items));
+                    return Ok(Expr::List(items, pos));
                 }
                 Some(_) => items.push(self.parse_expr()?),
                 None => {
-                    return Err(EvalError::SyntaxError {
-                        message: "unterminated list".into(),
-                    });
+                    return Err(with_pos(
+                        EvalError::SyntaxError {
+                            message: "unterminated list".into(),
+                        },
+                        self.current_position(),
+                    ));
                 }
             }
         }
     }
 
-    fn parse_quote_shorthand(&mut self) -> Result<Expr, EvalError> {
+    fn parse_quote_shorthand(&mut self, pos: Position) -> Result<Expr, EvalError> {
         self.expect_char('\'')?;
         let quoted = self.parse_expr()?;
-        Ok(Expr::List(vec![Expr::Symbol("quote".into()), quoted]))
+        Ok(Expr::List(
+            vec![Expr::Symbol("quote".into(), pos), quoted],
+            pos,
+        ))
     }
 
-    fn parse_string(&mut self) -> Result<Expr, EvalError> {
+    fn parse_string(&mut self, pos: Position) -> Result<Expr, EvalError> {
         self.expect_char('"')?;
         let mut value = String::new();
 
         loop {
             match self.bump_char() {
-                Some('"') => return Ok(Expr::String(value)),
+                Some('"') => return Ok(Expr::String(value, pos)),
                 Some('\\') => match self.bump_char() {
                     Some('"') => value.push('"'),
                     Some('\\') => value.push('\\'),
@@ -211,27 +249,36 @@ impl<'a> Parser<'a> {
                     Some('r') => value.push('\r'),
                     Some('t') => value.push('\t'),
                     Some(other) => {
-                        return Err(EvalError::SyntaxError {
-                            message: format!("unsupported string escape: \\{other}"),
-                        });
+                        return Err(with_pos(
+                            EvalError::SyntaxError {
+                                message: format!("unsupported string escape: \\{other}"),
+                            },
+                            self.current_position(),
+                        ));
                     }
                     None => {
-                        return Err(EvalError::SyntaxError {
-                            message: "unterminated string escape".into(),
-                        });
+                        return Err(with_pos(
+                            EvalError::SyntaxError {
+                                message: "unterminated string escape".into(),
+                            },
+                            self.current_position(),
+                        ));
                     }
                 },
                 Some(ch) => value.push(ch),
                 None => {
-                    return Err(EvalError::SyntaxError {
-                        message: "unterminated string".into(),
-                    });
+                    return Err(with_pos(
+                        EvalError::SyntaxError {
+                            message: "unterminated string".into(),
+                        },
+                        self.current_position(),
+                    ));
                 }
             }
         }
     }
 
-    fn parse_atom(&mut self) -> Result<Expr, EvalError> {
+    fn parse_atom(&mut self, pos: Position) -> Result<Expr, EvalError> {
         let mut token = String::new();
 
         while let Some(ch) = self.peek_char() {
@@ -244,17 +291,20 @@ impl<'a> Parser<'a> {
         }
 
         if token.is_empty() {
-            return Err(EvalError::SyntaxError {
-                message: "expected expression".into(),
-            });
+            return Err(with_pos(
+                EvalError::SyntaxError {
+                    message: "expected expression".into(),
+                },
+                pos,
+            ));
         }
 
         match token.as_str() {
-            "#t" => Ok(Expr::Bool(true)),
-            "#f" => Ok(Expr::Bool(false)),
+            "#t" => Ok(Expr::Bool(true, pos)),
+            "#f" => Ok(Expr::Bool(false, pos)),
             _ => match token.parse::<i64>() {
-                Ok(value) => Ok(Expr::Int(value)),
-                Err(_) => Ok(Expr::Symbol(token)),
+                Ok(value) => Ok(Expr::Int(value, pos)),
+                Err(_) => Ok(Expr::Symbol(token, pos)),
             },
         }
     }
@@ -279,14 +329,28 @@ impl<'a> Parser<'a> {
     }
 
     fn expect_char(&mut self, expected: char) -> Result<(), EvalError> {
+        let pos = self.current_position();
         match self.bump_char() {
             Some(actual) if actual == expected => Ok(()),
-            Some(actual) => Err(EvalError::SyntaxError {
-                message: format!("expected '{expected}', found '{actual}'"),
-            }),
-            None => Err(EvalError::SyntaxError {
-                message: format!("expected '{expected}', found end of input"),
-            }),
+            Some(actual) => Err(with_pos(
+                EvalError::SyntaxError {
+                    message: format!("expected '{expected}', found '{actual}'"),
+                },
+                pos,
+            )),
+            None => Err(with_pos(
+                EvalError::SyntaxError {
+                    message: format!("expected '{expected}', found end of input"),
+                },
+                pos,
+            )),
+        }
+    }
+
+    fn current_position(&self) -> Position {
+        Position {
+            line: self.line,
+            col: self.col,
         }
     }
 
@@ -297,6 +361,12 @@ impl<'a> Parser<'a> {
     fn bump_char(&mut self) -> Option<char> {
         let ch = self.peek_char()?;
         self.cursor += ch.len_utf8();
+        if ch == '\n' {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
         Some(ch)
     }
 
@@ -307,6 +377,10 @@ impl<'a> Parser<'a> {
 
 fn is_delimiter(ch: char) -> bool {
     ch.is_whitespace() || matches!(ch, '(' | ')' | ';')
+}
+
+fn with_pos(error: EvalError, pos: Position) -> EvalError {
+    error.with_position(pos.line, pos.col)
 }
 
 fn render_string(value: &str) -> String {
@@ -462,12 +536,12 @@ fn eval_sequence(expressions: &[Expr], env: &EnvRef) -> Result<Value, EvalError>
 
 fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
     match expr {
-        Expr::Bool(value) => Ok(Value::Bool(*value)),
-        Expr::Int(value) => Ok(Value::Int(*value)),
-        Expr::String(value) => Ok(Value::String(value.clone())),
-        Expr::Symbol(name) => Environment::lookup(env, name)
-            .ok_or_else(|| EvalError::UnboundSymbol { name: name.clone() }),
-        Expr::List(items) => eval_list(items, env),
+        Expr::Bool(value, _) => Ok(Value::Bool(*value)),
+        Expr::Int(value, _) => Ok(Value::Int(*value)),
+        Expr::String(value, _) => Ok(Value::String(value.clone())),
+        Expr::Symbol(name, pos) => Environment::lookup(env, name)
+            .ok_or_else(|| with_pos(EvalError::UnboundSymbol { name: name.clone() }, *pos)),
+        Expr::List(items, pos) => eval_list(items, env).map_err(|error| with_pos(error, *pos)),
     }
 }
 
@@ -476,7 +550,7 @@ fn eval_list(items: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
         message: "cannot evaluate an empty list".into(),
     })?;
 
-    if let Expr::Symbol(name) = head {
+    if let Expr::Symbol(name, _) = head {
         match name.as_str() {
             "define" => return eval_define(args, env),
             "if" => return eval_if(args, env),
@@ -507,7 +581,7 @@ fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     })?;
 
     match target {
-        Expr::Symbol(name) => {
+        Expr::Symbol(name, _) => {
             if rest.len() != 1 {
                 return Err(EvalError::WrongArgCount {
                     name: "define".into(),
@@ -520,7 +594,7 @@ fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
             Environment::define(env, name.clone(), value);
             Ok(Value::Void)
         }
-        Expr::List(signature) => {
+        Expr::List(signature, _) => {
             let (name_expr, params_exprs) =
                 signature
                     .split_first()
@@ -542,9 +616,12 @@ fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
             Environment::define(env, name, lambda);
             Ok(Value::Void)
         }
-        _ => Err(EvalError::SyntaxError {
-            message: "define requires a symbol or function signature".into(),
-        }),
+        _ => Err(with_pos(
+            EvalError::SyntaxError {
+                message: "define requires a symbol or function signature".into(),
+            },
+            target.pos(),
+        )),
     }
 }
 
@@ -587,11 +664,14 @@ fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     }
 
     let params = match &args[0] {
-        Expr::List(params) => parse_params(params)?,
+        Expr::List(params, _) => parse_params(params)?,
         _ => {
-            return Err(EvalError::SyntaxError {
-                message: "lambda parameters must be a list".into(),
-            });
+            return Err(with_pos(
+                EvalError::SyntaxError {
+                    message: "lambda parameters must be a list".into(),
+                },
+                args[0].pos(),
+            ));
         }
     };
 
@@ -640,7 +720,7 @@ fn eval_let(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     };
 
     match head {
-        Expr::Symbol(name) => {
+        Expr::Symbol(name, _) => {
             let Some((bindings_expr, body)) = tail.split_first() else {
                 return Err(EvalError::WrongArgCount {
                     name: "let".into(),
@@ -707,7 +787,12 @@ fn eval_named_let(
         .map(|(binding_name, _)| binding_name.clone())
         .collect();
     let recursive_env = Environment::new(Some(env.clone()));
-    let procedure = make_lambda(Some(name.to_string()), params, body.to_vec(), &recursive_env);
+    let procedure = make_lambda(
+        Some(name.to_string()),
+        params,
+        body.to_vec(),
+        &recursive_env,
+    );
 
     Environment::define(&recursive_env, name.to_string(), procedure.clone());
     apply_procedure(procedure, &values)
@@ -715,27 +800,36 @@ fn eval_named_let(
 
 fn parse_let_bindings(bindings_expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
     let bindings = match bindings_expr {
-        Expr::List(bindings) => bindings,
+        Expr::List(bindings, _) => bindings,
         _ => {
-            return Err(EvalError::SyntaxError {
-                message: "let bindings must be a list".into(),
-            });
+            return Err(with_pos(
+                EvalError::SyntaxError {
+                    message: "let bindings must be a list".into(),
+                },
+                bindings_expr.pos(),
+            ));
         }
     };
 
     bindings
         .iter()
         .map(|binding| match binding {
-            Expr::List(parts) if parts.len() == 2 => Ok((
+            Expr::List(parts, _) if parts.len() == 2 => Ok((
                 expect_symbol_expr(&parts[0], "let binding name")?,
                 parts[1].clone(),
             )),
-            Expr::List(_) => Err(EvalError::SyntaxError {
-                message: "let bindings must contain exactly a name and value".into(),
-            }),
-            _ => Err(EvalError::SyntaxError {
-                message: "let binding must be a list".into(),
-            }),
+            Expr::List(_, _) => Err(with_pos(
+                EvalError::SyntaxError {
+                    message: "let bindings must contain exactly a name and value".into(),
+                },
+                binding.pos(),
+            )),
+            _ => Err(with_pos(
+                EvalError::SyntaxError {
+                    message: "let binding must be a list".into(),
+                },
+                binding.pos(),
+            )),
         })
         .collect()
 }
@@ -743,20 +837,26 @@ fn parse_let_bindings(bindings_expr: &Expr) -> Result<Vec<(String, Expr)>, EvalE
 fn eval_cond(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     for clause in args {
         let parts = match clause {
-            Expr::List(parts) if !parts.is_empty() => parts,
-            Expr::List(_) => {
-                return Err(EvalError::SyntaxError {
-                    message: "cond clause cannot be empty".into(),
-                });
+            Expr::List(parts, _) if !parts.is_empty() => parts,
+            Expr::List(_, _) => {
+                return Err(with_pos(
+                    EvalError::SyntaxError {
+                        message: "cond clause cannot be empty".into(),
+                    },
+                    clause.pos(),
+                ));
             }
             _ => {
-                return Err(EvalError::SyntaxError {
-                    message: "cond clause must be a list".into(),
-                });
+                return Err(with_pos(
+                    EvalError::SyntaxError {
+                        message: "cond clause must be a list".into(),
+                    },
+                    clause.pos(),
+                ));
             }
         };
 
-        if matches!(&parts[0], Expr::Symbol(symbol) if symbol == "else") {
+        if matches!(&parts[0], Expr::Symbol(symbol, _) if symbol == "else") {
             return eval_cond_clause_body(&parts[1..], env, Value::Bool(true));
         }
 
@@ -795,20 +895,23 @@ fn parse_params(params: &[Expr]) -> Result<Vec<String>, EvalError> {
 
 fn expect_symbol_expr(expr: &Expr, context: &str) -> Result<String, EvalError> {
     match expr {
-        Expr::Symbol(name) => Ok(name.clone()),
-        _ => Err(EvalError::SyntaxError {
-            message: format!("{context} must be a symbol"),
-        }),
+        Expr::Symbol(name, _) => Ok(name.clone()),
+        _ => Err(with_pos(
+            EvalError::SyntaxError {
+                message: format!("{context} must be a symbol"),
+            },
+            expr.pos(),
+        )),
     }
 }
 
 fn quote_expr(expr: &Expr) -> Value {
     match expr {
-        Expr::Bool(value) => Value::Bool(*value),
-        Expr::Int(value) => Value::Int(*value),
-        Expr::String(value) => Value::String(value.clone()),
-        Expr::Symbol(value) => Value::Symbol(value.clone()),
-        Expr::List(items) => Value::List(items.iter().map(quote_expr).collect()),
+        Expr::Bool(value, _) => Value::Bool(*value),
+        Expr::Int(value, _) => Value::Int(*value),
+        Expr::String(value, _) => Value::String(value.clone()),
+        Expr::Symbol(value, _) => Value::Symbol(value.clone()),
+        Expr::List(items, _) => Value::List(items.iter().map(quote_expr).collect()),
     }
 }
 
@@ -966,10 +1069,13 @@ fn builtin_cons(args: &[Value]) -> Result<Value, EvalError> {
 
 fn builtin_car(args: &[Value]) -> Result<Value, EvalError> {
     let values = expect_list(expect_single_arg("car", args)?, "pair")?;
-    values.first().cloned().ok_or_else(|| EvalError::TypeMismatch {
-        expected: "pair".into(),
-        found: "list".into(),
-    })
+    values
+        .first()
+        .cloned()
+        .ok_or_else(|| EvalError::TypeMismatch {
+            expected: "pair".into(),
+            found: "list".into(),
+        })
 }
 
 fn builtin_cdr(args: &[Value]) -> Result<Value, EvalError> {
