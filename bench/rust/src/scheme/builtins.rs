@@ -636,6 +636,14 @@ fn builtin_is_rational(args: &[Value], _output: &mut String) -> Result<Value, Ev
     Ok(Value::Boolean(args[0].is_exact()))
 }
 
+fn builtin_is_procedure(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("procedure? requires 1 argument".into())); }
+    Ok(Value::Boolean(matches!(args[0],
+        Value::Lambda { .. } | Value::Builtin(_) | Value::CaseLambda { .. }
+        | Value::RecordConstructor { .. } | Value::RecordPredicate { .. } | Value::RecordAccessor { .. }
+    )))
+}
+
 pub(crate) fn make_global_env() -> Env {
     let env = Environment::new();
     {
@@ -719,6 +727,8 @@ pub(crate) fn make_global_env() -> Env {
         e.set("denominator".into(), Value::Builtin(builtin_denominator));
         e.set("integer?".into(), Value::Builtin(builtin_is_integer));
         e.set("rational?".into(), Value::Builtin(builtin_is_rational));
+        // L13: procedure?
+        e.set("procedure?".into(), Value::Builtin(builtin_is_procedure));
     }
     env
 }

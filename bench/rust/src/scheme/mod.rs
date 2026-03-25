@@ -73,6 +73,10 @@ pub(crate) enum Value {
         field_name: String,
         field_index: usize,
     },
+    CaseLambda {
+        clauses: Vec<(Vec<String>, Option<String>, Vec<Ast>)>,
+        env: Env,
+    },
     Void,
 }
 
@@ -205,7 +209,8 @@ impl Value {
             Value::Pair(a, b) => format!("({} . {})", a.display_value(), b.display_value()),
             Value::Lambda { .. } | Value::Builtin(_)
             | Value::RecordConstructor { .. } | Value::RecordPredicate { .. }
-            | Value::RecordAccessor { .. } => "#<procedure>".into(),
+            | Value::RecordAccessor { .. }
+            | Value::CaseLambda { .. } => "#<procedure>".into(),
             Value::Macro { .. } => "#<macro>".into(),
             Value::Record { type_name, fields, .. } => {
                 let inner: Vec<String> = fields.iter().map(|(k, v)| format!("{}: {}", k, v.display_value())).collect();
@@ -237,6 +242,7 @@ impl Value {
             | Value::RecordConstructor { .. }
             | Value::RecordPredicate { .. }
             | Value::RecordAccessor { .. }
+            | Value::CaseLambda { .. }
             | Value::Void => self.display_value(),
         }
     }
@@ -591,6 +597,7 @@ fn eval_inner(ast: &Ast, env: &Env, output: &mut String) -> Result<Value, EvalEr
                     }
                     "define-syntax" => return eval_define_syntax(&items[1..], env),
                     "define-record-type" => return eval_define_record_type(&items[1..], env),
+                    "case-lambda" => return eval_case_lambda(&items[1..], env),
                     _ => {
                         // Check for macro invocation
                         let maybe_macro = env.borrow().get(op);
@@ -676,6 +683,28 @@ fn eval_lambda(args: &[Ast], env: &Env) -> Result<Value, EvalError> {
         params,
         rest_param,
         body,
+        env: Rc::clone(env),
+    })
+}
+
+fn eval_case_lambda(args: &[Ast], env: &Env) -> Result<Value, EvalError> {
+    let mut clauses = Vec::new();
+    for clause in args {
+        match &clause.kind {
+            AstKind::List(items) if items.len() >= 2 => {
+                let (params, rest_param) = match &items[0].kind {
+                    AstKind::List(ps) => parse_params(ps)?,
+                    AstKind::Symbol(s) => (vec![], Some(s.clone())),
+                    _ => return Err(EvalError::Type("case-lambda: expected parameter list".into())),
+                };
+                let body = items[1..].to_vec();
+                clauses.push((params, rest_param, body));
+            }
+            _ => return Err(EvalError::Type("case-lambda: expected clause (params body ...)".into())),
+        }
+    }
+    Ok(Value::CaseLambda {
+        clauses,
         env: Rc::clone(env),
     })
 }
@@ -819,7 +848,7 @@ fn is_special_form(name: &str) -> bool {
         name,
         "define" | "if" | "quote" | "lambda" | "let" | "begin"
             | "cond" | "and" | "or" | "set!" | "string-set!"
-            | "define-syntax" | "syntax-rules" | "define-record-type"
+            | "define-syntax" | "syntax-rules" | "define-record-type" | "case-lambda"
     )
 }
 
@@ -1230,6 +1259,33 @@ fn apply(func: &Value, args: &[Value], output: &mut String) -> Result<Value, Eva
                 result = eval(expr, &local_env, output)?;
             }
             Ok(result)
+        }
+        Value::CaseLambda { clauses, env } => {
+            for (params, rest_param, body) in clauses {
+                let matches = if rest_param.is_some() {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    let local_env = Environment::with_parent(env);
+                    for (p, a) in params.iter().zip(args.iter()) {
+                        local_env.borrow_mut().set(p.clone(), a.clone());
+                    }
+                    if let Some(rest) = rest_param {
+                        let rest_args = args[params.len()..].to_vec();
+                        local_env.borrow_mut().set(rest.clone(), Value::List(rest_args));
+                    }
+                    let mut result = Value::Void;
+                    for expr in body {
+                        result = eval(expr, &local_env, output)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            Err(EvalError::Arity(format!(
+                "case-lambda: no matching clause for {} arguments", args.len()
+            )))
         }
         Value::RecordConstructor { type_id, type_name, field_names } => {
             if args.len() != field_names.len() {
