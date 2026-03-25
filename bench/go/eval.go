@@ -67,6 +67,8 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 			return evalCond(e, env)
 		case "let":
 			return evalLet(e, env)
+		case "set!":
+			return evalSetBang(e, env)
 		}
 	}
 
@@ -554,6 +556,24 @@ func evalLet(e *ListExpr, env *Env) (Value, error) {
 		}
 	}
 	return result, nil
+}
+
+func evalSetBang(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Items) != 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: requires exactly 2 arguments", e.Ln, e.Cl)}
+	}
+	sym, ok := e.Items[1].(*SymbolExpr)
+	if !ok {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: expected symbol", e.Ln, e.Cl)}
+	}
+	val, err := eval(e.Items[2], env)
+	if err != nil {
+		return nil, err
+	}
+	if !env.setMut(sym.Name, val) {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: unbound variable: %s", sym.Ln, sym.Cl, sym.Name)}
+	}
+	return &VoidVal{}, nil
 }
 
 func builtinCons(args []Value) (Value, error) {
