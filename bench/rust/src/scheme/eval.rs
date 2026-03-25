@@ -4,6 +4,13 @@ use crate::scheme::EvalError;
 use crate::scheme::parser::{Expr, ExprKind};
 use crate::scheme::value::{Env, LambdaData, MacroData, Value};
 
+/// Result type for tail-call optimization. In tail position, a lambda call
+/// returns `TailCall` instead of recursing, allowing the trampoline to loop.
+enum TailResult {
+    Value(Value),
+    TailCall { lambda: Rc<LambdaData>, args: Vec<Value>, pos: String },
+}
+
 /// Convert a float to an exact rational (numerator, denominator).
 fn float_to_rational(f: f64) -> (i64, i64) {
     if f == f.floor() {
@@ -175,7 +182,7 @@ impl Evaluator {
 
         match &op {
             Value::Lambda(data) => {
-                self.call_lambda(&data, args, call_pos)
+                self.call_lambda(data, args, call_pos)
             }
             Value::CaseLambda(clauses) => {
                 self.call_case_lambda(&clauses, args, call_pos)
@@ -787,7 +794,7 @@ impl Evaluator {
         Ok(Value::Void)
     }
 
-    fn call_lambda(&mut self, data: &LambdaData, args: Vec<Value>, pos: &str) -> Result<Value, EvalError> {
+    fn bind_lambda_args(data: &LambdaData, args: Vec<Value>, pos: &str) -> Result<Env, EvalError> {
         if let Some(ref rest) = data.rest_param {
             if args.len() < data.params.len() {
                 return Err(EvalError::Arity(format!(
@@ -801,11 +808,7 @@ impl Evaluator {
                 call_env.define(p.clone(), a.clone());
             }
             call_env.define(rest.clone(), Value::List(args[data.params.len()..].to_vec()));
-            let mut result = Value::Void;
-            for expr in &*data.body {
-                result = self.eval_in_env(expr, &mut call_env)?;
-            }
-            Ok(result)
+            Ok(call_env)
         } else {
             if data.params.len() != args.len() {
                 return Err(EvalError::Arity(format!(
@@ -818,12 +821,349 @@ impl Evaluator {
             for (p, a) in data.params.iter().zip(args.into_iter()) {
                 call_env.define(p.clone(), a);
             }
-            let mut result = Value::Void;
-            for expr in &*data.body {
-                result = self.eval_in_env(expr, &mut call_env)?;
-            }
-            Ok(result)
+            Ok(call_env)
         }
+    }
+
+    fn call_lambda(&mut self, data: &Rc<LambdaData>, args: Vec<Value>, pos: &str) -> Result<Value, EvalError> {
+        let mut cur_lambda: Rc<LambdaData> = Rc::clone(data);
+        let mut cur_args = args;
+        let mut cur_pos = pos.to_string();
+
+        loop {
+            let mut call_env = Self::bind_lambda_args(&cur_lambda, cur_args, &cur_pos)?;
+            let body = &cur_lambda.body;
+            // Evaluate all but last body expression
+            for expr in &body[..body.len() - 1] {
+                self.eval_in_env(expr, &mut call_env)?;
+            }
+            // Evaluate last expression in tail position
+            match self.eval_tail(&body[body.len() - 1], &mut call_env)? {
+                TailResult::Value(v) => return Ok(v),
+                TailResult::TailCall { lambda, args, pos } => {
+                    cur_lambda = lambda;
+                    cur_args = args;
+                    cur_pos = pos;
+                }
+            }
+        }
+    }
+
+    // --- Tail-position evaluation for TCO ---
+
+    /// Evaluate an expression in tail position. Returns TailCall for lambda calls
+    /// instead of recursing, enabling the trampoline in call_lambda.
+    fn eval_tail(&mut self, expr: &Expr, env: &mut Env) -> Result<TailResult, EvalError> {
+        let pos = expr.pos_str();
+        match &expr.kind {
+            ExprKind::Integer(_) | ExprKind::Float(_) | ExprKind::Rational(_, _)
+            | ExprKind::Boolean(_) | ExprKind::Char(_) | ExprKind::Str(_) => {
+                Ok(TailResult::Value(self.eval_in_env(expr, env)?))
+            }
+            ExprKind::Symbol(_) => {
+                Ok(TailResult::Value(self.eval_in_env(expr, env)?))
+            }
+            ExprKind::List(elems) => {
+                if elems.is_empty() {
+                    return Ok(TailResult::Value(Value::List(vec![])));
+                }
+                self.eval_tail_list(elems, env, &pos)
+            }
+        }
+    }
+
+    fn eval_tail_list(&mut self, elems: &[Expr], env: &mut Env, call_pos: &str) -> Result<TailResult, EvalError> {
+        if let ExprKind::Symbol(name) = &elems[0].kind {
+            match name.as_str() {
+                "if" => return self.eval_tail_if(&elems[1..], env, call_pos),
+                "begin" => return self.eval_tail_begin(&elems[1..], env),
+                "cond" => return self.eval_tail_cond(&elems[1..], env, call_pos),
+                "and" => return self.eval_tail_and(&elems[1..], env),
+                "or" => return self.eval_tail_or(&elems[1..], env),
+                "let" => return self.eval_tail_let(&elems[1..], env, call_pos),
+                "let*" => return self.eval_tail_let_star(&elems[1..], env, call_pos),
+                "letrec" => return self.eval_tail_letrec(&elems[1..], env, call_pos),
+                "letrec*" => return self.eval_tail_letrec_star(&elems[1..], env, call_pos),
+                "case" => return self.eval_tail_case(&elems[1..], env, call_pos),
+                "do" => return self.eval_tail_do(&elems[1..], env, call_pos),
+                // For define, set!, quote, lambda, etc. - not tail-call relevant, eval normally
+                "define" | "set!" | "quote" | "lambda" | "define-syntax"
+                | "define-record-type" | "string-set!" | "case-lambda"
+                | "procedure?" | "not" => {
+                    return Ok(TailResult::Value(self.eval_list(elems, env, call_pos)?));
+                }
+                _ => {
+                    if let Some(Value::Macro(macro_data)) = env.get(name) {
+                        let expanded = self.expand_and_eval_macro(&macro_data, elems, env, call_pos)?;
+                        return Ok(TailResult::Value(expanded));
+                    }
+                }
+            }
+        }
+
+        // Function call in tail position - evaluate operator and args
+        let op = self.eval_in_env(&elems[0], env)?;
+        let args: Vec<Value> = elems[1..]
+            .iter()
+            .map(|e| self.eval_in_env(e, env))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        match &op {
+            Value::Lambda(data) => {
+                Ok(TailResult::TailCall {
+                    lambda: Rc::clone(data),
+                    args,
+                    pos: call_pos.to_string(),
+                })
+            }
+            Value::CaseLambda(clauses) => {
+                // Find matching clause and return as TailCall
+                for clause in clauses {
+                    if let Some(ref _rest) = clause.rest_param {
+                        if args.len() >= clause.params.len() {
+                            return Ok(TailResult::TailCall {
+                                lambda: Rc::clone(clause),
+                                args,
+                                pos: call_pos.to_string(),
+                            });
+                        }
+                    } else if args.len() == clause.params.len() {
+                        return Ok(TailResult::TailCall {
+                            lambda: Rc::clone(clause),
+                            args,
+                            pos: call_pos.to_string(),
+                        });
+                    }
+                }
+                Err(EvalError::Arity(format!(
+                    "case-lambda: no matching clause for {} arguments at {call_pos}",
+                    args.len()
+                )))
+            }
+            Value::Symbol(name) => {
+                Ok(TailResult::Value(self.apply_builtin(name, &args, call_pos)?))
+            }
+            _ => {
+                // Records, etc - evaluate normally
+                Ok(TailResult::Value(self.eval_list(elems, env, call_pos)?))
+            }
+        }
+    }
+
+    fn eval_tail_if(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<TailResult, EvalError> {
+        if args.len() < 2 || args.len() > 3 {
+            return Err(EvalError::Arity(format!("if: expected 2 or 3 arguments at {pos}")));
+        }
+        let cond = self.eval_in_env(&args[0], env)?;
+        if cond.is_truthy() {
+            self.eval_tail(&args[1], env)
+        } else if args.len() == 3 {
+            self.eval_tail(&args[2], env)
+        } else {
+            Ok(TailResult::Value(Value::Void))
+        }
+    }
+
+    fn eval_tail_begin(&mut self, args: &[Expr], env: &mut Env) -> Result<TailResult, EvalError> {
+        if args.is_empty() {
+            return Ok(TailResult::Value(Value::Void));
+        }
+        for expr in &args[..args.len() - 1] {
+            self.eval_in_env(expr, env)?;
+        }
+        self.eval_tail(&args[args.len() - 1], env)
+    }
+
+    fn eval_tail_cond(&mut self, clauses: &[Expr], env: &mut Env, pos: &str) -> Result<TailResult, EvalError> {
+        for clause in clauses {
+            match &clause.kind {
+                ExprKind::List(parts) if !parts.is_empty() => {
+                    if let ExprKind::Symbol(s) = &parts[0].kind {
+                        if s == "else" {
+                            if parts.len() <= 1 {
+                                return Ok(TailResult::Value(Value::Void));
+                            }
+                            for expr in &parts[1..parts.len() - 1] {
+                                self.eval_in_env(expr, env)?;
+                            }
+                            return self.eval_tail(&parts[parts.len() - 1], env);
+                        }
+                    }
+                    let test = self.eval_in_env(&parts[0], env)?;
+                    if test.is_truthy() {
+                        if parts.len() <= 1 {
+                            return Ok(TailResult::Value(test));
+                        }
+                        for expr in &parts[1..parts.len() - 1] {
+                            self.eval_in_env(expr, env)?;
+                        }
+                        return self.eval_tail(&parts[parts.len() - 1], env);
+                    }
+                }
+                _ => return Err(EvalError::Parse(format!("cond: expected clause at {pos}"))),
+            }
+        }
+        Ok(TailResult::Value(Value::Void))
+    }
+
+    fn eval_tail_and(&mut self, exprs: &[Expr], env: &mut Env) -> Result<TailResult, EvalError> {
+        if exprs.is_empty() {
+            return Ok(TailResult::Value(Value::Boolean(true)));
+        }
+        for expr in &exprs[..exprs.len() - 1] {
+            let result = self.eval_in_env(expr, env)?;
+            if !result.is_truthy() {
+                return Ok(TailResult::Value(result));
+            }
+        }
+        self.eval_tail(&exprs[exprs.len() - 1], env)
+    }
+
+    fn eval_tail_or(&mut self, exprs: &[Expr], env: &mut Env) -> Result<TailResult, EvalError> {
+        if exprs.is_empty() {
+            return Ok(TailResult::Value(Value::Boolean(false)));
+        }
+        for expr in &exprs[..exprs.len() - 1] {
+            let result = self.eval_in_env(expr, env)?;
+            if result.is_truthy() {
+                return Ok(TailResult::Value(result));
+            }
+        }
+        self.eval_tail(&exprs[exprs.len() - 1], env)
+    }
+
+    fn eval_tail_let(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<TailResult, EvalError> {
+        if args.is_empty() {
+            return Err(EvalError::Parse(format!("let: missing arguments at {pos}")));
+        }
+        // Named let
+        if let ExprKind::Symbol(name) = &args[0].kind {
+            if args.len() < 3 {
+                return Err(EvalError::Parse(format!("named let: missing bindings or body at {pos}")));
+            }
+            let bindings = match &args[1].kind {
+                ExprKind::List(b) => b,
+                _ => return Err(EvalError::Parse(format!("named let: expected bindings list at {pos}"))),
+            };
+            let mut params = Vec::new();
+            let mut init_vals = Vec::new();
+            for binding in bindings {
+                match &binding.kind {
+                    ExprKind::List(pair) if pair.len() == 2 => {
+                        if let ExprKind::Symbol(var) = &pair[0].kind {
+                            params.push(var.clone());
+                            init_vals.push(self.eval_in_env(&pair[1], env)?);
+                        } else {
+                            return Err(EvalError::Parse(format!("let: expected symbol in binding at {pos}")));
+                        }
+                    }
+                    _ => return Err(EvalError::Parse(format!("let: expected (var expr) binding at {pos}"))),
+                }
+            }
+            let body = args[2..].to_vec();
+            let loop_env = env.child();
+            let lambda = Value::Lambda(Rc::new(LambdaData {
+                params: params.clone(),
+                rest_param: None,
+                body: body.clone(),
+                env: loop_env.clone(),
+            }));
+            loop_env.define(name.clone(), lambda);
+            let recursive_lambda = Rc::new(LambdaData {
+                params,
+                rest_param: None,
+                body,
+                env: loop_env.clone(),
+            });
+            loop_env.define(name.clone(), Value::Lambda(Rc::clone(&recursive_lambda)));
+            // Return as tail call so the trampoline handles it
+            return Ok(TailResult::TailCall {
+                lambda: recursive_lambda,
+                args: init_vals,
+                pos: pos.to_string(),
+            });
+        }
+        // Regular let - evaluate bindings, then body in tail position
+        let bindings = match &args[0].kind {
+            ExprKind::List(b) => b,
+            _ => return Err(EvalError::Parse(format!("let: expected bindings list at {pos}"))),
+        };
+        let mut new_env = env.child();
+        for binding in bindings {
+            match &binding.kind {
+                ExprKind::List(pair) if pair.len() == 2 => {
+                    if let ExprKind::Symbol(var) = &pair[0].kind {
+                        let val = self.eval_in_env(&pair[1], env)?;
+                        new_env.define(var.clone(), val);
+                    } else {
+                        return Err(EvalError::Parse(format!("let: expected symbol in binding at {pos}")));
+                    }
+                }
+                _ => return Err(EvalError::Parse(format!("let: expected (var expr) binding at {pos}"))),
+            }
+        }
+        let body = &args[1..];
+        if body.is_empty() {
+            return Ok(TailResult::Value(Value::Void));
+        }
+        for expr in &body[..body.len() - 1] {
+            self.eval_in_env(expr, &mut new_env)?;
+        }
+        self.eval_tail(&body[body.len() - 1], &mut new_env)
+    }
+
+    fn eval_tail_let_star(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<TailResult, EvalError> {
+        // Evaluate normally then tail-eval last body expr
+        if args.is_empty() {
+            return Err(EvalError::Parse(format!("let*: missing arguments at {pos}")));
+        }
+        let bindings = match &args[0].kind {
+            ExprKind::List(b) => b,
+            _ => return Err(EvalError::Parse(format!("let*: expected bindings list at {pos}"))),
+        };
+        let mut new_env = env.child();
+        for binding in bindings {
+            match &binding.kind {
+                ExprKind::List(pair) if pair.len() == 2 => {
+                    if let ExprKind::Symbol(var) = &pair[0].kind {
+                        let val = self.eval_in_env(&pair[1], &mut new_env)?;
+                        new_env.define(var.clone(), val);
+                    } else {
+                        return Err(EvalError::Parse(format!("let*: expected symbol in binding at {pos}")));
+                    }
+                }
+                _ => return Err(EvalError::Parse(format!("let*: expected (var expr) binding at {pos}"))),
+            }
+        }
+        let body = &args[1..];
+        if body.is_empty() {
+            return Ok(TailResult::Value(Value::Void));
+        }
+        for expr in &body[..body.len() - 1] {
+            self.eval_in_env(expr, &mut new_env)?;
+        }
+        self.eval_tail(&body[body.len() - 1], &mut new_env)
+    }
+
+    fn eval_tail_letrec(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<TailResult, EvalError> {
+        // Set up letrec env, then tail-eval last body expr
+        let val = self.eval_letrec(args, env, pos)?;
+        Ok(TailResult::Value(val))
+    }
+
+    fn eval_tail_letrec_star(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<TailResult, EvalError> {
+        let val = self.eval_letrec_star(args, env, pos)?;
+        Ok(TailResult::Value(val))
+    }
+
+    fn eval_tail_case(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<TailResult, EvalError> {
+        let val = self.eval_case(args, env, pos)?;
+        Ok(TailResult::Value(val))
+    }
+
+    fn eval_tail_do(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<TailResult, EvalError> {
+        let val = self.eval_do(args, env, pos)?;
+        Ok(TailResult::Value(val))
     }
 
     fn call_proc(&mut self, proc: &Value, args: Vec<Value>, pos: &str) -> Result<Value, EvalError> {
