@@ -269,6 +269,20 @@ func valuesEqual(a, b Value) bool {
 		if bv, ok := b.(*IntVal); ok {
 			return av.Val == bv.Val
 		}
+		if bv, ok := b.(*RationalVal); ok {
+			return bv.Den == 1 && av.Val == bv.Num
+		}
+	case *RationalVal:
+		if bv, ok := b.(*RationalVal); ok {
+			return av.Num == bv.Num && av.Den == bv.Den
+		}
+		if bv, ok := b.(*IntVal); ok {
+			return av.Den == 1 && av.Num == bv.Val
+		}
+	case *FloatVal:
+		if bv, ok := b.(*FloatVal); ok {
+			return av.Val == bv.Val
+		}
 	case *BoolVal:
 		if bv, ok := b.(*BoolVal); ok {
 			return av.Val == bv.Val

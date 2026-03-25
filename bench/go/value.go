@@ -11,6 +11,8 @@ type Value interface {
 }
 
 type IntVal struct{ Val int64 }
+type FloatVal struct{ Val float64 }
+type RationalVal struct{ Num, Den int64 } // always simplified, Den > 0
 type BoolVal struct{ Val bool }
 type StringVal struct{ Val string }
 type PairVal struct{ Car, Cdr Value }
@@ -31,6 +33,26 @@ func (v *LambdaVal) String() string {
 
 func (v *IntVal) String() string {
 	return fmt.Sprintf("%d", v.Val)
+}
+
+func (v *FloatVal) String() string {
+	s := fmt.Sprintf("%.16g", v.Val)
+	// Ensure there's a decimal point for non-special values
+	hasDot := false
+	for _, c := range s {
+		if c == '.' || c == 'e' || c == 'E' || c == 'i' || c == 'n' {
+			hasDot = true
+			break
+		}
+	}
+	if !hasDot {
+		s += ".0"
+	}
+	return s
+}
+
+func (v *RationalVal) String() string {
+	return fmt.Sprintf("%d/%d", v.Num, v.Den)
 }
 
 func (v *BoolVal) String() string {

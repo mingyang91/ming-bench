@@ -15,6 +15,8 @@ const (
 	tokRParen
 	tokQuote
 	tokNumber
+	tokFloat
+	tokRational
 	tokString
 	tokBool
 	tokChar
@@ -192,8 +194,32 @@ func (t *tokenizer) nextToken() token {
 		if _, err := strconv.ParseInt(text, 10, 64); err == nil {
 			return token{kind: tokNumber, text: text, line: line, col: col}
 		}
+		// Check if it's a float (e.g., 1.5, .5, 0.5)
+		if _, err := strconv.ParseFloat(text, 64); err == nil && strings.ContainsAny(text, ".eE") {
+			return token{kind: tokFloat, text: text, line: line, col: col}
+		}
+		// Check if it's a rational literal (e.g., 1/3, -6/4)
+		if isRationalLiteral(text) {
+			return token{kind: tokRational, text: text, line: line, col: col}
+		}
 		return token{kind: tokSymbol, text: text, line: line, col: col}
 	}
+}
+
+func isRationalLiteral(text string) bool {
+	slashIdx := strings.Index(text, "/")
+	if slashIdx <= 0 || slashIdx == len(text)-1 {
+		return false
+	}
+	numStr := text[:slashIdx]
+	denStr := text[slashIdx+1:]
+	if _, err := strconv.ParseInt(numStr, 10, 64); err != nil {
+		return false
+	}
+	if _, err := strconv.ParseInt(denStr, 10, 64); err != nil {
+		return false
+	}
+	return true
 }
 
 // AST nodes
@@ -208,6 +234,20 @@ type NumberExpr struct {
 }
 func (e *NumberExpr) Line() int { return e.Ln }
 func (e *NumberExpr) Col() int  { return e.Cl }
+
+type FloatExpr struct {
+	Val    float64
+	Ln, Cl int
+}
+func (e *FloatExpr) Line() int { return e.Ln }
+func (e *FloatExpr) Col() int  { return e.Cl }
+
+type RationalExpr struct {
+	Num, Den int64
+	Ln, Cl   int
+}
+func (e *RationalExpr) Line() int { return e.Ln }
+func (e *RationalExpr) Col() int  { return e.Cl }
 
 type BoolExpr struct {
 	Val    bool
@@ -272,6 +312,16 @@ func (p *parser) parseExpr() (Expr, error) {
 		p.next()
 		val, _ := strconv.ParseInt(tok.text, 10, 64)
 		return &NumberExpr{Val: val, Ln: tok.line, Cl: tok.col}, nil
+	case tokFloat:
+		p.next()
+		val, _ := strconv.ParseFloat(tok.text, 64)
+		return &FloatExpr{Val: val, Ln: tok.line, Cl: tok.col}, nil
+	case tokRational:
+		p.next()
+		slashIdx := strings.Index(tok.text, "/")
+		num, _ := strconv.ParseInt(tok.text[:slashIdx], 10, 64)
+		den, _ := strconv.ParseInt(tok.text[slashIdx+1:], 10, 64)
+		return &RationalExpr{Num: num, Den: den, Ln: tok.line, Cl: tok.col}, nil
 	case tokBool:
 		p.next()
 		return &BoolExpr{Val: tok.text == "#t", Ln: tok.line, Cl: tok.col}, nil

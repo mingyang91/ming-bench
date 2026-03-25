@@ -20,6 +20,10 @@ func eval(expr Expr, env *Env) (Value, error) {
 	switch e := expr.(type) {
 	case *NumberExpr:
 		return &IntVal{Val: e.Val}, nil
+	case *FloatExpr:
+		return &FloatVal{Val: e.Val}, nil
+	case *RationalExpr:
+		return makeRational(e.Num, e.Den), nil
 	case *BoolExpr:
 		return &BoolVal{Val: e.Val}, nil
 	case *StringExpr:
@@ -286,6 +290,10 @@ func quoteExpr(expr Expr) Value {
 	switch e := expr.(type) {
 	case *NumberExpr:
 		return &IntVal{Val: e.Val}
+	case *FloatExpr:
+		return &FloatVal{Val: e.Val}
+	case *RationalExpr:
+		return makeRational(e.Num, e.Den)
 	case *BoolExpr:
 		return &BoolVal{Val: e.Val}
 	case *StringExpr:
@@ -388,112 +396,42 @@ func makeGlobalEnv(out *strings.Builder) *Env {
 	// L09 builtins
 	registerL09Builtins(env)
 
+	// L11 builtins
+	registerL11Builtins(env)
+
 	return env
 }
 
 func builtinAdd(args []Value) (Value, error) {
-	var sum int64
-	for _, a := range args {
-		n, ok := a.(*IntVal)
-		if !ok {
-			return nil, &EvalError{Message: fmt.Sprintf("+: not a number: %s", a.String())}
-		}
-		sum += n.Val
-	}
-	return &IntVal{Val: sum}, nil
+	return numericAdd(args)
 }
 
 func builtinSub(args []Value) (Value, error) {
-	if len(args) == 0 {
-		return nil, &EvalError{Message: "-: requires at least 1 argument"}
-	}
-	first, ok := args[0].(*IntVal)
-	if !ok {
-		return nil, &EvalError{Message: fmt.Sprintf("-: not a number: %s", args[0].String())}
-	}
-	if len(args) == 1 {
-		return &IntVal{Val: -first.Val}, nil
-	}
-	result := first.Val
-	for _, a := range args[1:] {
-		n, ok := a.(*IntVal)
-		if !ok {
-			return nil, &EvalError{Message: fmt.Sprintf("-: not a number: %s", a.String())}
-		}
-		result -= n.Val
-	}
-	return &IntVal{Val: result}, nil
+	return numericSub(args)
 }
 
 func builtinMul(args []Value) (Value, error) {
-	result := int64(1)
-	for _, a := range args {
-		n, ok := a.(*IntVal)
-		if !ok {
-			return nil, &EvalError{Message: fmt.Sprintf("*: not a number: %s", a.String())}
-		}
-		result *= n.Val
-	}
-	return &IntVal{Val: result}, nil
+	return numericMul(args)
 }
 
 func builtinDiv(args []Value) (Value, error) {
-	if len(args) < 2 {
-		return nil, &EvalError{Message: "/: requires at least 2 arguments"}
-	}
-	first, ok := args[0].(*IntVal)
-	if !ok {
-		return nil, &EvalError{Message: fmt.Sprintf("/: not a number: %s", args[0].String())}
-	}
-	result := first.Val
-	for _, a := range args[1:] {
-		n, ok := a.(*IntVal)
-		if !ok {
-			return nil, &EvalError{Message: fmt.Sprintf("/: not a number: %s", a.String())}
-		}
-		if n.Val == 0 {
-			return nil, &EvalError{Message: "/: division by zero"}
-		}
-		result /= n.Val
-	}
-	return &IntVal{Val: result}, nil
-}
-
-func numericCompare(name string, args []Value, cmp func(a, b int64) bool) (Value, error) {
-	if len(args) < 2 {
-		return nil, &EvalError{Message: fmt.Sprintf("%s: requires at least 2 arguments", name)}
-	}
-	prev, ok := args[0].(*IntVal)
-	if !ok {
-		return nil, &EvalError{Message: fmt.Sprintf("%s: not a number: %s", name, args[0].String())}
-	}
-	for _, a := range args[1:] {
-		n, ok := a.(*IntVal)
-		if !ok {
-			return nil, &EvalError{Message: fmt.Sprintf("%s: not a number: %s", name, a.String())}
-		}
-		if !cmp(prev.Val, n.Val) {
-			return &BoolVal{Val: false}, nil
-		}
-		prev = n
-	}
-	return &BoolVal{Val: true}, nil
+	return numericDiv(args)
 }
 
 func builtinLT(args []Value) (Value, error) {
-	return numericCompare("<", args, func(a, b int64) bool { return a < b })
+	return numericCompareGeneric("<", args, func(a, b float64) bool { return a < b })
 }
 
 func builtinGT(args []Value) (Value, error) {
-	return numericCompare(">", args, func(a, b int64) bool { return a > b })
+	return numericCompareGeneric(">", args, func(a, b float64) bool { return a > b })
 }
 
 func builtinEq(args []Value) (Value, error) {
-	return numericCompare("=", args, func(a, b int64) bool { return a == b })
+	return numericCompareGeneric("=", args, func(a, b float64) bool { return a == b })
 }
 
 func builtinLE(args []Value) (Value, error) {
-	return numericCompare("<=", args, func(a, b int64) bool { return a <= b })
+	return numericCompareGeneric("<=", args, func(a, b float64) bool { return a <= b })
 }
 
 func evalBegin(e *ListExpr, env *Env) (Value, error) {
@@ -683,8 +621,7 @@ func builtinNumberQ(args []Value) (Value, error) {
 	if len(args) != 1 {
 		return nil, &EvalError{Message: "number?: requires exactly 1 argument"}
 	}
-	_, ok := args[0].(*IntVal)
-	return &BoolVal{Val: ok}, nil
+	return &BoolVal{Val: isNumber(args[0])}, nil
 }
 
 func builtinBooleanQ(args []Value) (Value, error) {
