@@ -236,6 +236,13 @@ struct EvalContext {
     next_fresh: usize,
     active_winds: Vec<WindRef>,
     macro_expansions: Vec<MacroExpansion>,
+    step_budget: Option<StepBudget>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StepBudget {
+    remaining: usize,
+    max_steps: usize,
 }
 
 #[derive(Debug)]
@@ -279,6 +286,44 @@ impl LambdaParams {
             Some(_) => format!("at least {required_len} arguments"),
             None => format!("exactly {required_len} arguments"),
         }
+    }
+}
+
+impl EvalContext {
+    fn with_step_limit(max_steps: usize) -> Self {
+        Self {
+            step_budget: Some(StepBudget::new(max_steps)),
+            ..Self::default()
+        }
+    }
+
+    fn record_eval_step(&mut self, pos: SourcePos) -> Result<(), EvalError> {
+        if let Some(step_budget) = &mut self.step_budget {
+            step_budget.consume(pos)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl StepBudget {
+    fn new(max_steps: usize) -> Self {
+        Self {
+            remaining: max_steps,
+            max_steps,
+        }
+    }
+
+    fn consume(&mut self, pos: SourcePos) -> Result<(), EvalError> {
+        if self.remaining == 0 {
+            return Err(EvalError::StepLimitExceeded {
+                pos,
+                max_steps: self.max_steps,
+            });
+        }
+
+        self.remaining -= 1;
+        Ok(())
     }
 }
 
@@ -450,11 +495,23 @@ fn is_proper_list(value: &Value) -> bool {
 /// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
 /// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
+    let mut context = EvalContext::default();
+    let result = eval_program(input, &mut context)?;
+    Ok(result.render())
+}
+
+/// Evaluate one or more Scheme expressions with a maximum number of
+/// expression-dispatch steps.
+pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
+    let mut context = EvalContext::with_step_limit(max_steps);
+    let result = eval_program(input, &mut context)?;
+    Ok(result.render())
+}
+
+fn eval_program(input: &str, context: &mut EvalContext) -> Result<Value, EvalError> {
     let exprs = parser::parse_program(input)?;
     let env = Env::new_root();
-    let mut context = EvalContext::default();
-    let result = eval_sequence(&exprs, &env, START_POS, &mut context)?;
-    Ok(result.render())
+    eval_sequence(&exprs, &env, START_POS, context)
 }
 
 fn eval_sequence(
@@ -469,10 +526,8 @@ fn eval_sequence(
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    let exprs = parser::parse_program(input)?;
-    let env = Env::new_root();
     let mut context = EvalContext::default();
-    let result = eval_sequence(&exprs, &env, START_POS, &mut context)?;
+    let result = eval_program(input, &mut context)?;
     Ok((result.render(), context.output))
 }
 
@@ -516,6 +571,8 @@ fn eval_expr_outcome(
     context: &mut EvalContext,
     tail: bool,
 ) -> Result<EvalOutcome, EvalError> {
+    context.record_eval_step(expr.pos)?;
+
     match &expr.kind {
         ExprKind::Number(value) => Ok(EvalOutcome::Value(Value::Number(*value))),
         ExprKind::Boolean(value) => Ok(EvalOutcome::Value(Value::Boolean(*value))),

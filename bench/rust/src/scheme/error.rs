@@ -70,4 +70,7 @@ pub enum EvalError {
         name: String,
         message: String,
     },
+
+    #[error("{pos}: evaluation step limit exceeded ({max_steps} steps)")]
+    StepLimitExceeded { pos: SourcePos, max_steps: usize },
 }

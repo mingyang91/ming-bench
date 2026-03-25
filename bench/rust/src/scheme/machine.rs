@@ -251,6 +251,7 @@ fn run_machine(
     loop {
         match state {
             MachineState::Eval { expr, env } => {
+                context.record_eval_step(expr.pos)?;
                 state = eval_machine_expr(expr, env, &mut stack, context)?;
             }
             MachineState::Value(value) => {
