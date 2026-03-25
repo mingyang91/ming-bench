@@ -152,6 +152,11 @@ type ContinuationValue = {
   resume: EvalContinuation;
 };
 
+type MultipleValues = {
+  type: 'multiple-values';
+  values: SchemeValue[];
+};
+
 type SchemeValue =
   | { type: 'number'; value: SchemeNumber }
   | { type: 'boolean'; value: boolean }
@@ -165,6 +170,7 @@ type SchemeValue =
   | Closure
   | CaseClosure
   | ContinuationValue
+  | MultipleValues
   | { type: 'void' };
 
 type EvalOutcome =
@@ -3157,6 +3163,31 @@ function createGlobalEnv(context: EvaluationContext): Environment {
       });
     },
   );
+  const valuesBuiltin: BuiltinProcedure = builtin(
+    'values',
+    (args) => multiValueResult(args.map((arg) => arg.value)),
+    (args, _callPosition, continuation) =>
+      continueWith(continuation, multiValueResult(args.map((arg) => arg.value))),
+  );
+  const callWithValuesBuiltin: BuiltinProcedure = builtin(
+    'call-with-values',
+    (args, callPosition) => {
+      requireArgCount('call-with-values', args.length, 2, callPosition);
+      const produced = applyProcedure(args[0].value, [], callPosition);
+      return applyProcedure(args[1].value, multiValueArgs(produced, callPosition), callPosition);
+    },
+    (args, callPosition, continuation) => {
+      requireArgCount('call-with-values', args.length, 2, callPosition);
+      return applyProcedureCps(args[0].value, [], callPosition, (produced) =>
+        applyProcedureCps(
+          args[1].value,
+          multiValueArgs(produced, callPosition),
+          callPosition,
+          continuation,
+        ),
+      );
+    },
+  );
 
   env.define(
     '+',
@@ -3661,6 +3692,8 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'call-with-current-continuation',
     callWithCurrentContinuationBuiltin('call-with-current-continuation'),
   );
+  env.define('values', valuesBuiltin);
+  env.define('call-with-values', callWithValuesBuiltin);
   env.define('raise', raiseBuiltin);
   env.define('with-exception-handler', withExceptionHandlerBuiltin);
   env.define('dynamic-wind', dynamicWindBuiltin);
@@ -4692,6 +4725,7 @@ function eqvValues(left: SchemeValue, right: SchemeValue): boolean {
     case 'closure':
     case 'case-closure':
     case 'continuation':
+    case 'multiple-values':
       return false;
     case 'void':
       return true;
@@ -4766,6 +4800,20 @@ function equalValuesInternal(
     case 'case-closure':
     case 'continuation':
       return left === right;
+    case 'multiple-values': {
+      const rightValues = (right as MultipleValues).values;
+      if (left.values.length !== rightValues.length) {
+        return false;
+      }
+
+      for (let index = 0; index < left.values.length; index += 1) {
+        if (!equalValuesInternal(left.values[index], rightValues[index], memo)) {
+          return false;
+        }
+      }
+
+      return true;
+    }
     case 'void':
       return true;
   }
@@ -4922,6 +4970,18 @@ function charValue(value: string, position?: SourcePosition): SchemeValue {
   return { type: 'char', value };
 }
 
+function multiValueResult(values: SchemeValue[]): SchemeValue {
+  return values.length === 1 ? values[0] : { type: 'multiple-values', values };
+}
+
+function multiValueArgs(value: SchemeValue, position: SourcePosition): EvaluatedArg[] {
+  if (value.type === 'multiple-values') {
+    return value.values.map((entry) => ({ value: entry, position }));
+  }
+
+  return [{ value, position }];
+}
+
 function attachPosition(error: unknown, position: SourcePosition): EvalError {
   if (error instanceof EvalError) {
     return error.position ? error : new EvalError(error.rawMessage, position);
@@ -4969,6 +5029,8 @@ function formatValueInternal(
     case 'case-closure':
     case 'continuation':
       return '#<procedure>';
+    case 'multiple-values':
+      return '#<values>';
     case 'void':
       return '#<void>';
   }

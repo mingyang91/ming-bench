@@ -2009,6 +2009,15 @@ function createGlobalEnv(context) {
             return continueWith(continuation, value);
         });
     });
+    const valuesBuiltin = builtin('values', (args) => multiValueResult(args.map((arg) => arg.value)), (args, _callPosition, continuation) => continueWith(continuation, multiValueResult(args.map((arg) => arg.value))));
+    const callWithValuesBuiltin = builtin('call-with-values', (args, callPosition) => {
+        requireArgCount('call-with-values', args.length, 2, callPosition);
+        const produced = applyProcedure(args[0].value, [], callPosition);
+        return applyProcedure(args[1].value, multiValueArgs(produced, callPosition), callPosition);
+    }, (args, callPosition, continuation) => {
+        requireArgCount('call-with-values', args.length, 2, callPosition);
+        return applyProcedureCps(args[0].value, [], callPosition, (produced) => applyProcedureCps(args[1].value, multiValueArgs(produced, callPosition), callPosition, continuation));
+    });
     env.define('+', builtin('+', (args, callPosition) => numberValue(addNumbers(evaluateNumberArgs('+', args), callPosition), callPosition)));
     env.define('*', builtin('*', (args, callPosition) => numberValue(multiplyNumbers(evaluateNumberArgs('*', args), callPosition), callPosition)));
     env.define('-', builtin('-', (args, callPosition) => {
@@ -2277,6 +2286,8 @@ function createGlobalEnv(context) {
     }));
     env.define('call/cc', callWithCurrentContinuationBuiltin('call/cc'));
     env.define('call-with-current-continuation', callWithCurrentContinuationBuiltin('call-with-current-continuation'));
+    env.define('values', valuesBuiltin);
+    env.define('call-with-values', callWithValuesBuiltin);
     env.define('raise', raiseBuiltin);
     env.define('with-exception-handler', withExceptionHandlerBuiltin);
     env.define('dynamic-wind', dynamicWindBuiltin);
@@ -2883,6 +2894,7 @@ function eqvValues(left, right) {
         case 'closure':
         case 'case-closure':
         case 'continuation':
+        case 'multiple-values':
             return false;
         case 'void':
             return true;
@@ -2942,6 +2954,18 @@ function equalValuesInternal(left, right, memo) {
         case 'case-closure':
         case 'continuation':
             return left === right;
+        case 'multiple-values': {
+            const rightValues = right.values;
+            if (left.values.length !== rightValues.length) {
+                return false;
+            }
+            for (let index = 0; index < left.values.length; index += 1) {
+                if (!equalValuesInternal(left.values[index], rightValues[index], memo)) {
+                    return false;
+                }
+            }
+            return true;
+        }
         case 'void':
             return true;
     }
@@ -3065,6 +3089,15 @@ function charValue(value, position) {
     }
     return { type: 'char', value };
 }
+function multiValueResult(values) {
+    return values.length === 1 ? values[0] : { type: 'multiple-values', values };
+}
+function multiValueArgs(value, position) {
+    if (value.type === 'multiple-values') {
+        return value.values.map((entry) => ({ value: entry, position }));
+    }
+    return [{ value, position }];
+}
 function attachPosition(error, position) {
     if (error instanceof EvalError) {
         return error.position ? error : new EvalError(error.rawMessage, position);
@@ -3103,6 +3136,8 @@ function formatValueInternal(value, mode, active) {
         case 'case-closure':
         case 'continuation':
             return '#<procedure>';
+        case 'multiple-values':
+            return '#<values>';
         case 'void':
             return '#<void>';
     }
