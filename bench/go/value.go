@@ -60,6 +60,16 @@ func (v *CaseLambdaVal) String() string {
 	return "#<procedure>"
 }
 
+// ValuesVal represents multiple return values from (values ...).
+type ValuesVal struct{ Vals []Value }
+
+func (v *ValuesVal) String() string {
+	if len(v.Vals) == 0 {
+		return ""
+	}
+	return v.Vals[0].String()
+}
+
 // CallCCVal is the call/cc primitive, stored as a first-class value.
 type CallCCVal struct{}
 

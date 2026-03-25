@@ -1795,6 +1795,34 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 	env.set("call/cc", &CallCCVal{})
 	env.set("call-with-current-continuation", &CallCCVal{})
 
+	// values — return zero or more values; single value is transparent
+	env.set("values", &BuiltinFunc{Name: "values", Fn: func(args []Value) (Value, error) {
+		if len(args) == 1 {
+			return args[0], nil
+		}
+		return &ValuesVal{Vals: args}, nil
+	}})
+
+	// call-with-values — (call-with-values producer consumer)
+	env.set("call-with-values", &BuiltinFunc{Name: "call-with-values", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "call-with-values: need 2 arguments"}
+		}
+		producer := args[0]
+		consumer := args[1]
+		result, err := applyCallable(producer, nil)
+		if err != nil {
+			return nil, err
+		}
+		var consumerArgs []Value
+		if mv, ok := result.(*ValuesVal); ok {
+			consumerArgs = mv.Vals
+		} else {
+			consumerArgs = []Value{result}
+		}
+		return applyCallable(consumer, consumerArgs)
+	}})
+
 	// raise — signal an exception
 	env.set("raise", &BuiltinFunc{Name: "raise", Fn: func(args []Value) (Value, error) {
 		if len(args) != 1 {
