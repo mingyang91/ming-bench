@@ -452,6 +452,7 @@ struct Env {
     parent: Option<EnvRef>,
     bindings: HashMap<String, BindingCell>,
     macros: HashMap<String, Rc<MacroTransformer>>,
+    define_in_parent: bool,
 }
 
 impl Env {
@@ -460,6 +461,7 @@ impl Env {
             parent: None,
             bindings: HashMap::new(),
             macros: HashMap::new(),
+            define_in_parent: false,
         }))
     }
 
@@ -468,6 +470,16 @@ impl Env {
             parent: Some(parent),
             bindings: HashMap::new(),
             macros: HashMap::new(),
+            define_in_parent: false,
+        }))
+    }
+
+    fn macro_expansion(parent: EnvRef) -> EnvRef {
+        Rc::new(RefCell::new(Self {
+            parent: Some(parent),
+            bindings: HashMap::new(),
+            macros: HashMap::new(),
+            define_in_parent: true,
         }))
     }
 }
@@ -641,6 +653,9 @@ impl<'a> Parser<'a> {
         match self.peek_char() {
             Some('(') => self.parse_list(),
             Some('\'') => self.parse_quote_shorthand(),
+            Some('#') if self.input[self.index..].starts_with("#'") => {
+                self.parse_syntax_quote_shorthand()
+            }
             Some('"') => self.parse_string(),
             Some(_) => self.parse_atom(),
             None => Err(EvalError::UnexpectedEof),
@@ -651,6 +666,13 @@ impl<'a> Parser<'a> {
         self.bump_char();
         let quoted = self.parse_expr()?;
         Ok(Expr::List(vec![Expr::Symbol("quote".to_string()), quoted]))
+    }
+
+    fn parse_syntax_quote_shorthand(&mut self) -> Result<Expr, EvalError> {
+        self.bump_char();
+        self.bump_char();
+        let quoted = self.parse_expr()?;
+        Ok(Expr::List(vec![Expr::Symbol("syntax".to_string()), quoted]))
     }
 
     fn parse_list(&mut self) -> Result<Expr, EvalError> {
@@ -1005,6 +1027,26 @@ fn bind_value(env: &EnvRef, name: String, value: Value) {
 
 fn bind_macro(env: &EnvRef, name: String, transformer: Rc<MacroTransformer>) {
     env.borrow_mut().macros.insert(name, transformer);
+}
+
+fn definition_target_env(env: &EnvRef) -> EnvRef {
+    let mut current = env.clone();
+
+    loop {
+        let parent = {
+            let scope = current.borrow();
+            if scope.define_in_parent {
+                scope.parent.clone()
+            } else {
+                None
+            }
+        };
+
+        match parent {
+            Some(parent) => current = parent,
+            None => return current,
+        }
+    }
 }
 
 fn lookup_binding_cell(env: &EnvRef, name: &str) -> Result<BindingCell, EvalError> {
@@ -1412,7 +1454,7 @@ fn schedule_machine_define(
             expect_expr_arity("define", args, 2)?;
             frames.push(MachineFrame::DefineVar {
                 name: name.clone(),
-                env: env.clone(),
+                env: definition_target_env(&env),
             });
             Ok(MachineState::Eval(args[1].clone(), env))
         }
@@ -1437,7 +1479,8 @@ fn schedule_machine_define(
 
             let params = parse_param_slice(&signature[1..])?;
             let lambda = make_lambda(name.clone(), params, args[1..].to_vec(), env.clone());
-            bind_value(&env, name.clone(), lambda);
+            let target_env = definition_target_env(&env);
+            bind_value(&target_env, name.clone(), lambda);
             let _ = ctx;
             Ok(MachineState::Value(Value::Void))
         }
@@ -2628,7 +2671,8 @@ fn eval_define(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Valu
         Expr::Symbol(name) => {
             expect_expr_arity("define", args, 2)?;
             let value = eval_expr(&args[1], env.clone(), ctx)?;
-            bind_value(&env, name.clone(), value);
+            let target_env = definition_target_env(&env);
+            bind_value(&target_env, name.clone(), value);
             Ok(Value::Void)
         }
         Expr::List(signature) => {
@@ -2652,7 +2696,8 @@ fn eval_define(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Valu
 
             let params = parse_param_slice(&signature[1..])?;
             let lambda = make_lambda(name.clone(), params, args[1..].to_vec(), env.clone());
-            bind_value(&env, name.clone(), lambda);
+            let target_env = definition_target_env(&env);
+            bind_value(&target_env, name.clone(), lambda);
             Ok(Value::Void)
         }
         _ => Err(EvalError::SyntaxError {
@@ -2690,21 +2735,22 @@ fn eval_define_record_type(args: &[Expr], env: EnvRef) -> Result<Value, EvalErro
     }
 
     let record_type = Rc::new(RecordType { name: type_name });
+    let target_env = definition_target_env(&env);
 
     bind_value(
-        &env,
+        &target_env,
         constructor_name.clone(),
         make_record_constructor(constructor_name, record_type.clone(), field_count),
     );
     bind_value(
-        &env,
+        &target_env,
         predicate_name.clone(),
         make_record_predicate(predicate_name, record_type.clone()),
     );
 
     for (field_index, accessor_name) in accessors.into_iter().enumerate() {
         bind_value(
-            &env,
+            &target_env,
             accessor_name.clone(),
             make_record_accessor(accessor_name, record_type.clone(), field_index),
         );
@@ -2723,7 +2769,8 @@ fn eval_define_syntax(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     };
 
     let transformer = parse_macro_transformer(name, &args[1], env.clone())?;
-    bind_macro(&env, name.clone(), transformer);
+    let target_env = definition_target_env(&env);
+    bind_macro(&target_env, name.clone(), transformer);
     Ok(Value::Void)
 }
 
