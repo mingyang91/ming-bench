@@ -1,7 +1,5 @@
 package ming
 
-import "fmt"
-
 type macroTransformer interface {
 	expand(call listNode) (node, error)
 }
@@ -58,8 +56,6 @@ var macroKeywordNames = map[string]struct{}{
 	"unquote-splicing":   {},
 	"with-syntax":        {},
 }
-
-var macroGensymCounter int
 
 func evalDefineSyntax(args []node, env *environment) (value, error) {
 	if len(args) != 2 {
@@ -544,7 +540,7 @@ func (ctx *templateContext) introducedSymbol(sym symbolNode) symbolNode {
 	if _, ok := ctx.locals[sym.name]; ok {
 		renamed, ok := ctx.introduced[sym.name]
 		if !ok {
-			renamed = nextMacroName(sym.name)
+			renamed = nextMacroName(ctx.macro.env, sym.name)
 			ctx.introduced[sym.name] = renamed
 		}
 		return symbolNode{name: renamed, pos: sym.pos}
@@ -801,7 +797,11 @@ func isCoreKeyword(name string) bool {
 	return ok
 }
 
-func nextMacroName(name string) string {
-	macroGensymCounter++
-	return fmt.Sprintf("__macro_%d_%s", macroGensymCounter, name)
+func nextMacroName(env *environment, name string) string {
+	if env != nil {
+		if ctx := env.evalContext(); ctx != nil {
+			return ctx.nextMacroName(name)
+		}
+	}
+	return "__macro_" + name
 }

@@ -497,7 +497,7 @@ func (ctx *syntaxTemplateContext) introducedSymbol(sym symbolNode) symbolNode {
 	if _, ok := ctx.locals[sym.name]; ok {
 		renamed, ok := ctx.introduced[sym.name]
 		if !ok {
-			renamed = nextMacroName(sym.name)
+			renamed = nextMacroName(ctx.bindings, sym.name)
 			ctx.introduced[sym.name] = renamed
 		}
 		return symbolNode{name: renamed, pos: sym.pos}

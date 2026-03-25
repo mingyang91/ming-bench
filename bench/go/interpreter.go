@@ -52,6 +52,7 @@ type voidValue struct{}
 type evalContext struct {
 	output     strings.Builder
 	stepBudget *stepBudget
+	macroGensym int
 }
 
 type evalStep struct {
@@ -95,20 +96,20 @@ type environment struct {
 }
 
 func evalString(input string) (string, error) {
-	result, _, err := evalStringWithOutput(input)
+	result, _, err := evalStringWithFormatter(input, nil, formatValue)
 	return result, err
 }
 
 func evalStringWithLimit(input string, maxSteps int) (string, error) {
-	result, _, err := evalStringWithOutputLimit(input, &maxSteps)
+	result, _, err := evalStringWithFormatter(input, &maxSteps, formatValue)
 	return result, err
 }
 
 func evalStringWithOutput(input string) (string, string, error) {
-	return evalStringWithOutputLimit(input, nil)
+	return evalStringWithFormatter(input, nil, formatOutputResult)
 }
 
-func evalStringWithOutputLimit(input string, maxSteps *int) (string, string, error) {
+func evalStringWithFormatter(input string, maxSteps *int, formatter func(value) (string, error)) (string, string, error) {
 	nodes, err := parseProgram(input)
 	if err != nil {
 		return "", "", err
@@ -136,11 +137,16 @@ func evalStringWithOutputLimit(input string, maxSteps *int) (string, string, err
 	if err != nil {
 		return "", "", err
 	}
-	result, err := formatValue(last)
+	result, err := formatter(last)
 	if err != nil {
 		return "", "", err
 	}
 	return result, ctx.output.String(), nil
+}
+
+func (ctx *evalContext) nextMacroName(name string) string {
+	ctx.macroGensym++
+	return fmt.Sprintf("__macro_%d_%s", ctx.macroGensym, name)
 }
 
 func baseEnv(ctx *evalContext) *environment {
@@ -3033,6 +3039,17 @@ func formatDisplayValue(v value) (string, error) {
 		return "(" + strings.Join(parts, " ") + ")", nil
 	case multiValueValue:
 		return "", multiValueContextError(len(v.values))
+	default:
+		return formatValue(v)
+	}
+}
+
+func formatOutputResult(v value) (string, error) {
+	switch v := v.(type) {
+	case stringValue:
+		return string(v), nil
+	case *mutableStringValue:
+		return string(v.runes), nil
 	default:
 		return formatValue(v)
 	}
