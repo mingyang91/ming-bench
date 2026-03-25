@@ -31,6 +31,7 @@ const BUILTIN_NAMES: &[&str] = &[
     ">=",
     "char?",
     "display",
+    "datum->syntax",
     "eq?",
     "eqv?",
     "equal?",
@@ -140,6 +141,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "string-set!",
     "string-upcase",
     "substring",
+    "syntax->datum",
     "symbol?",
     "symbol->string",
     "set-car!",
@@ -278,7 +280,7 @@ impl Expr {
 
 type EnvRef = Rc<RefCell<Environment>>;
 type BindingRef = Rc<RefCell<Value>>;
-type MacroRef = Rc<SyntaxRulesMacro>;
+type MacroRef = Rc<MacroTransformer>;
 type PairRef = Rc<Pair>;
 type ContinuationRef = Rc<ContinuationChain>;
 type WindRef = Rc<DynamicWind>;
@@ -310,6 +312,31 @@ struct SyntaxRulesMacro {
     literals: HashSet<String>,
     rules: Vec<MacroRule>,
     env: EnvRef,
+}
+
+#[derive(Clone)]
+struct ProcedureMacro {
+    name: String,
+    procedure: Rc<UserProcedure>,
+    env: EnvRef,
+}
+
+#[derive(Clone)]
+enum MacroTransformer {
+    SyntaxRules(SyntaxRulesMacro),
+    Procedure(ProcedureMacro),
+}
+
+#[derive(Clone)]
+struct SyntaxObject {
+    expr: Expr,
+    env: EnvRef,
+}
+
+#[derive(Clone)]
+enum SyntaxValue {
+    One(SyntaxObject),
+    Many(Vec<SyntaxValue>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -373,7 +400,7 @@ impl ExpansionState {
             return parent;
         }
 
-        let env = Environment::child(parent);
+        let env = Environment::alias_child(parent);
 
         for (name, binding) in self.binding_aliases {
             Environment::define_existing(&env, name, binding);
@@ -511,6 +538,9 @@ struct Environment {
     bindings: HashMap<String, BindingRef>,
     macros: HashMap<String, MacroRef>,
     output: Rc<RefCell<String>>,
+    syntax_context: Option<EnvRef>,
+    syntax_use_site: Option<EnvRef>,
+    definition_target: Option<EnvRef>,
 }
 
 impl Environment {
@@ -520,6 +550,9 @@ impl Environment {
             bindings: HashMap::new(),
             macros: HashMap::new(),
             output: Rc::new(RefCell::new(String::new())),
+            syntax_context: None,
+            syntax_use_site: None,
+            definition_target: None,
         }));
 
         for &name in BUILTIN_NAMES {
@@ -530,17 +563,70 @@ impl Environment {
     }
 
     fn child(parent: EnvRef) -> EnvRef {
+        let (output, syntax_context, syntax_use_site) = {
+            let parent = parent.borrow();
+            (
+                parent.output.clone(),
+                parent.syntax_context.clone(),
+                parent.syntax_use_site.clone(),
+            )
+        };
+        Rc::new(RefCell::new(Self {
+            parent: Some(parent),
+            bindings: HashMap::new(),
+            macros: HashMap::new(),
+            output,
+            syntax_context,
+            syntax_use_site,
+            definition_target: None,
+        }))
+    }
+
+    fn child_for_macro_expansion(
+        parent: EnvRef,
+        syntax_context: EnvRef,
+        syntax_use_site: EnvRef,
+    ) -> EnvRef {
         let output = parent.borrow().output.clone();
         Rc::new(RefCell::new(Self {
             parent: Some(parent),
             bindings: HashMap::new(),
             macros: HashMap::new(),
             output,
+            syntax_context: Some(syntax_context),
+            syntax_use_site: Some(syntax_use_site),
+            definition_target: None,
+        }))
+    }
+
+    fn alias_child(parent: EnvRef) -> EnvRef {
+        let (output, syntax_context, syntax_use_site) = {
+            let parent_ref = parent.borrow();
+            (
+                parent_ref.output.clone(),
+                parent_ref.syntax_context.clone(),
+                parent_ref.syntax_use_site.clone(),
+            )
+        };
+
+        Rc::new(RefCell::new(Self {
+            parent: Some(parent.clone()),
+            bindings: HashMap::new(),
+            macros: HashMap::new(),
+            output,
+            syntax_context,
+            syntax_use_site,
+            definition_target: Some(parent),
         }))
     }
 
     fn define(env: &EnvRef, name: String, value: Value) {
-        Self::define_existing(env, name, Rc::new(RefCell::new(value)));
+        let target = env
+            .borrow()
+            .definition_target
+            .clone()
+            .unwrap_or_else(|| env.clone());
+        Self::define_existing(&target, name, Rc::new(RefCell::new(value)));
     }
 
     fn define_existing(env: &EnvRef, name: String, binding: BindingRef) {
@@ -592,6 +678,14 @@ impl Environment {
         let output = env.borrow().output.clone();
         let captured = output.borrow().clone();
         captured
+    }
+
+    fn syntax_context(env: &EnvRef) -> Option<EnvRef> {
+        env.borrow().syntax_context.clone()
+    }
+
+    fn syntax_use_site(env: &EnvRef) -> Option<EnvRef> {
+        env.borrow().syntax_use_site.clone()
     }
 }
 
@@ -853,6 +947,7 @@ enum Value {
     Pair(PairRef),
     Vector(Rc<RefCell<Vec<Value>>>),
     Record(Rc<RecordInstance>),
+    Syntax(SyntaxValue),
     Builtin(&'static str),
     Procedure(Rc<UserProcedure>),
     NativeProcedure(Rc<NativeProcedure>),
@@ -874,6 +969,7 @@ impl Value {
             Value::Pair(_) => "pair",
             Value::Vector(_) => "vector",
             Value::Record(_) => "record",
+            Value::Syntax(_) => "syntax",
             Value::Builtin(_)
             | Value::Procedure(_)
             | Value::NativeProcedure(_)
@@ -1053,6 +1149,7 @@ fn format_value_inner(
         Value::Pair(pair) => format_pair(pair, active_pairs, active_vectors),
         Value::Vector(values) => format_vector(values, active_pairs, active_vectors),
         Value::Record(record) => format!("#<record {}>", record.record_type.name),
+        Value::Syntax(_) => "#<syntax>".into(),
         Value::Builtin(_)
         | Value::Procedure(_)
         | Value::NativeProcedure(_)
@@ -1323,6 +1420,22 @@ fn inexact_to_exact(number: Number, position: SourcePos) -> Result<Number, EvalE
     }
 }
 
+fn syntax_value_eq(left: &SyntaxValue, right: &SyntaxValue) -> bool {
+    match (left, right) {
+        (SyntaxValue::One(left), SyntaxValue::One(right)) => {
+            left.expr == right.expr && Rc::ptr_eq(&left.env, &right.env)
+        }
+        (SyntaxValue::Many(left), SyntaxValue::Many(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| syntax_value_eq(left, right))
+        }
+        _ => false,
+    }
+}
+
 fn scheme_eq(left: &Value, right: &Value) -> bool {
     if let (Some(left), Some(right)) = (left.number(), right.number()) {
         return left.equal(right);
@@ -1337,6 +1450,7 @@ fn scheme_eq(left: &Value, right: &Value) -> bool {
         (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
         (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
+        (Value::Syntax(left), Value::Syntax(right)) => syntax_value_eq(left, right),
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::NativeProcedure(left), Value::NativeProcedure(right)) => Rc::ptr_eq(left, right),
@@ -1405,6 +1519,7 @@ fn scheme_equal_inner(
                 })
         }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
+        (Value::Syntax(left), Value::Syntax(right)) => syntax_value_eq(left, right),
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::NativeProcedure(left), Value::NativeProcedure(right)) => Rc::ptr_eq(left, right),
@@ -2467,6 +2582,10 @@ fn build_quote_expr(datum: Expr, position: SourcePos) -> Expr {
     Expr::list(vec![Expr::symbol("quote", position), datum], position)
 }
 
+fn build_syntax_expr(template: Expr, position: SourcePos) -> Expr {
+    Expr::list(vec![Expr::symbol("syntax", position), template], position)
+}
+
 fn guard_has_else_clause(clauses: &[Expr]) -> bool {
     clauses.iter().any(|clause| {
         matches!(
@@ -2940,6 +3059,9 @@ fn eval_list(items: Vec<Expr>, env: EnvRef, position: SourcePos) -> Result<EvalS
             "quote" => Ok(EvalStep::Value(eval_quote(tail, head.pos)?)),
             "lambda" => Ok(EvalStep::Value(eval_lambda(tail, env, head.pos)?)),
             "case-lambda" => Ok(EvalStep::Value(eval_case_lambda(tail, env, head.pos)?)),
+            "syntax" => Ok(EvalStep::Value(eval_syntax(tail, env, head.pos)?)),
+            "syntax-case" => Ok(EvalStep::Value(eval_syntax_case(tail, env, head.pos)?)),
+            "with-syntax" => Ok(EvalStep::Value(eval_with_syntax(tail, env, head.pos)?)),
             "and" => eval_and_step(tail, env),
             "or" => eval_or_step(tail, env),
             "begin" => eval_sequence_step(tail, env),
@@ -2982,8 +3104,34 @@ fn eval_define_syntax(
         ));
     };
 
-    let transformer =
-        parse_syntax_rules(name, transformer_expr, env.clone(), transformer_expr.pos)?;
+    let transformer = if matches!(
+        &transformer_expr.kind,
+        ExprKind::List(items)
+            if matches!(
+                items.first(),
+                Some(Expr {
+                    kind: ExprKind::Symbol(head),
+                    ..
+                }) if head == "syntax-rules"
+            )
+    ) {
+        parse_syntax_rules(name, transformer_expr, env.clone(), transformer_expr.pos)?
+    } else {
+        let transformer_value = eval(transformer_expr, env.clone())?;
+        let Value::Procedure(procedure) = transformer_value else {
+            return Err(EvalError::not_callable(
+                transformer_value.to_scheme_string(),
+                transformer_expr.pos,
+            ));
+        };
+
+        Rc::new(MacroTransformer::Procedure(ProcedureMacro {
+            name: name.clone(),
+            procedure,
+            env: env.clone(),
+        }))
+    };
+
     Environment::define_macro(&env, name.clone(), transformer);
     Ok(Value::Void)
 }
@@ -3307,6 +3455,156 @@ fn eval_case_lambda(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<
     ))))
 }
 
+fn eval_syntax(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+    let [template] = exprs else {
+        return Err(EvalError::syntax(
+            "syntax requires exactly 1 template",
+            position,
+        ));
+    };
+
+    let bindings = collect_syntax_bindings(&env);
+    let syntax_context = Environment::syntax_context(&env).unwrap_or_else(|| env.clone());
+    let syntax_use_site = Environment::syntax_use_site(&env).unwrap_or_else(|| env.clone());
+    let transformer = SyntaxRulesMacro {
+        name: String::new(),
+        literals: HashSet::new(),
+        rules: Vec::new(),
+        env: syntax_context,
+    };
+    let mut state = ExpansionState::default();
+    let expr = expand_template(
+        template,
+        &bindings,
+        &transformer,
+        &mut state,
+        &[],
+        false,
+    )?;
+
+    Ok(Value::Syntax(SyntaxValue::One(SyntaxObject {
+        expr,
+        env: state.build_env(syntax_use_site),
+    })))
+}
+
+fn eval_syntax_case(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+    let [input_expr, literals_expr, clauses @ ..] = exprs else {
+        return Err(EvalError::syntax(
+            "syntax-case requires an input, literals list, and at least 1 clause",
+            position,
+        ));
+    };
+
+    if clauses.is_empty() {
+        return Err(EvalError::syntax(
+            "syntax-case requires at least 1 clause",
+            position,
+        ));
+    }
+
+    let input = expect_single_syntax(&eval(input_expr, env.clone())?, input_expr.pos)?;
+    let literals = parse_syntax_rule_literals(literals_expr)?;
+
+    for clause in clauses {
+        let ExprKind::List(items) = &clause.kind else {
+            return Err(EvalError::syntax(
+                "syntax-case clauses must be lists",
+                clause.pos,
+            ));
+        };
+
+        let (pattern, fender, template) = match items.as_slice() {
+            [pattern, template] => (pattern, None, template),
+            [pattern, fender, template] => (pattern, Some(fender), template),
+            _ => {
+                return Err(EvalError::syntax(
+                    "syntax-case clauses must contain a pattern, optional fender, and template",
+                    clause.pos,
+                ))
+            }
+        };
+
+        let Some(bindings) = match_pattern(pattern, &input.expr, &literals, None) else {
+            continue;
+        };
+
+        let clause_env = Environment::child(env.clone());
+        bind_syntax_bindings(&clause_env, bindings, input.env.clone());
+
+        if let Some(fender) = fender {
+            if !eval(fender, clause_env.clone())?.is_truthy() {
+                continue;
+            }
+        }
+
+        return eval(template, clause_env);
+    }
+
+    Err(EvalError::syntax(
+        "no matching syntax-case clause",
+        position,
+    ))
+}
+
+fn eval_with_syntax(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+    let [bindings_expr, body @ ..] = exprs else {
+        return Err(EvalError::syntax(
+            "with-syntax requires bindings and a body",
+            position,
+        ));
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::syntax(
+            "with-syntax requires at least 1 body expression",
+            position,
+        ));
+    }
+
+    let ExprKind::List(binding_specs) = &bindings_expr.kind else {
+        return Err(EvalError::syntax(
+            "with-syntax bindings must be a list",
+            bindings_expr.pos,
+        ));
+    };
+
+    let mut pending = Vec::with_capacity(binding_specs.len());
+
+    for binding_spec in binding_specs {
+        let ExprKind::List(parts) = &binding_spec.kind else {
+            return Err(EvalError::syntax(
+                "with-syntax bindings must be lists",
+                binding_spec.pos,
+            ));
+        };
+
+        let [pattern, value_expr] = parts.as_slice() else {
+            return Err(EvalError::syntax(
+                "with-syntax bindings must contain a pattern and expression",
+                binding_spec.pos,
+            ));
+        };
+
+        let syntax = expect_single_syntax(&eval(value_expr, env.clone())?, value_expr.pos)?;
+        let Some(bindings) = match_pattern(pattern, &syntax.expr, &HashSet::new(), None) else {
+            return Err(EvalError::syntax(
+                "with-syntax binding does not match its pattern",
+                pattern.pos,
+            ));
+        };
+
+        pending.push((bindings, syntax.env));
+    }
+
+    let with_env = Environment::child(env);
+    for (bindings, syntax_env) in pending {
+        bind_syntax_bindings(&with_env, bindings, syntax_env);
+    }
+
+    eval_sequence(body, with_env)
+}
+
 fn parse_function_signature(
     signature: &[Expr],
     position: SourcePos,
@@ -3422,6 +3720,219 @@ fn quote_expr(expr: &Expr) -> Value {
         ExprKind::Symbol(value) => Value::Symbol(value.clone()),
         ExprKind::List(items) => list_from_values(items.iter().map(quote_expr)),
     }
+}
+
+fn syntax_value_from_pattern_binding(binding: &PatternBinding, env: EnvRef) -> SyntaxValue {
+    match binding {
+        PatternBinding::One(expr) => SyntaxValue::One(SyntaxObject {
+            expr: expr.clone(),
+            env,
+        }),
+        PatternBinding::Many(values) => SyntaxValue::Many(
+            values
+                .iter()
+                .map(|value| syntax_value_from_pattern_binding(value, env.clone()))
+                .collect(),
+        ),
+    }
+}
+
+fn pattern_binding_from_syntax_value(value: &SyntaxValue) -> Option<PatternBinding> {
+    match value {
+        SyntaxValue::One(object) => Some(PatternBinding::One(object.expr.clone())),
+        SyntaxValue::Many(values) => values
+            .iter()
+            .map(pattern_binding_from_syntax_value)
+            .collect::<Option<Vec<_>>>()
+            .map(PatternBinding::Many),
+    }
+}
+
+fn collect_syntax_bindings(env: &EnvRef) -> PatternBindings {
+    let mut bindings = HashMap::new();
+    collect_syntax_bindings_into(env, &mut bindings);
+    bindings
+}
+
+fn collect_syntax_bindings_into(env: &EnvRef, bindings: &mut PatternBindings) {
+    let (parent, local_bindings) = {
+        let env_ref = env.borrow();
+        let local_bindings = env_ref
+            .bindings
+            .iter()
+            .filter_map(|(name, binding)| match binding.borrow().clone() {
+                Value::Syntax(value) => {
+                    pattern_binding_from_syntax_value(&value).map(|binding| (name.clone(), binding))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        (env_ref.parent.clone(), local_bindings)
+    };
+
+    if let Some(parent) = parent {
+        collect_syntax_bindings_into(&parent, bindings);
+    }
+
+    for (name, binding) in local_bindings {
+        bindings.insert(name, binding);
+    }
+}
+
+fn bind_syntax_bindings(env: &EnvRef, bindings: PatternBindings, syntax_env: EnvRef) {
+    for (name, binding) in bindings {
+        Environment::define(
+            env,
+            name,
+            Value::Syntax(syntax_value_from_pattern_binding(&binding, syntax_env.clone())),
+        );
+    }
+}
+
+fn expect_single_syntax(value: &Value, position: SourcePos) -> Result<SyntaxObject, EvalError> {
+    match value {
+        Value::Syntax(SyntaxValue::One(object)) => Ok(object.clone()),
+        Value::Syntax(SyntaxValue::Many(_)) => {
+            Err(EvalError::syntax("expected a single syntax object", position))
+        }
+        other => Err(EvalError::type_mismatch(
+            "syntax",
+            other.type_name(),
+            position,
+        )),
+    }
+}
+
+fn syntax_value_to_datum(value: &SyntaxValue) -> Value {
+    match value {
+        SyntaxValue::One(object) => quote_expr(&object.expr),
+        SyntaxValue::Many(values) => list_from_values(values.iter().map(syntax_value_to_datum)),
+    }
+}
+
+fn list_value_to_datum_exprs(value: &Value, position: SourcePos) -> Result<Vec<Expr>, EvalError> {
+    let mut items = Vec::new();
+    let mut current = value.clone();
+    let mut visited = HashSet::new();
+
+    loop {
+        match current {
+            Value::EmptyList => return Ok(items),
+            Value::Pair(pair) => {
+                let ptr = Rc::as_ptr(&pair) as usize;
+                if !visited.insert(ptr) {
+                    return Err(EvalError::syntax(
+                        "datum->syntax requires a finite proper list",
+                        position,
+                    ));
+                }
+
+                items.push(value_to_datum_expr(&pair.car(), position)?);
+                current = pair.cdr();
+            }
+            _ => {
+                return Err(EvalError::syntax(
+                    "datum->syntax only supports proper lists",
+                    position,
+                ))
+            }
+        }
+    }
+}
+
+fn value_to_datum_expr(value: &Value, position: SourcePos) -> Result<Expr, EvalError> {
+    match value {
+        Value::Integer(number) => Ok(Expr::new(ExprKind::Integer(*number), position)),
+        Value::Rational(number) => Ok(Expr::new(ExprKind::Rational(*number), position)),
+        Value::Inexact(number) => Ok(Expr::new(ExprKind::Inexact(*number), position)),
+        Value::Bool(value) => Ok(Expr::new(ExprKind::Bool(*value), position)),
+        Value::Char(value) => Ok(Expr::new(ExprKind::Char(*value), position)),
+        Value::String(value) => Ok(Expr::new(
+            ExprKind::String(value.to_plain_string()),
+            position,
+        )),
+        Value::Symbol(value) => Ok(Expr::symbol(value.clone(), position)),
+        Value::EmptyList => Ok(Expr::list(Vec::new(), position)),
+        Value::Pair(_) => Ok(Expr::list(list_value_to_datum_exprs(value, position)?, position)),
+        other => Err(EvalError::type_mismatch(
+            "datum",
+            other.type_name(),
+            position,
+        )),
+    }
+}
+
+fn apply_syntax_to_datum(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "syntax->datum",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    match &args[0].value {
+        Value::Syntax(value) => Ok(syntax_value_to_datum(value)),
+        other => Err(EvalError::type_mismatch(
+            "syntax",
+            other.type_name(),
+            args[0].position,
+        )),
+    }
+}
+
+fn apply_datum_to_syntax(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::wrong_arg_count(
+            "datum->syntax",
+            "exactly 2",
+            args.len(),
+            position,
+        ));
+    }
+
+    let context = expect_single_syntax(&args[0].value, args[0].position)?;
+    let expr = value_to_datum_expr(&args[1].value, args[1].position)?;
+
+    Ok(Value::Syntax(SyntaxValue::One(SyntaxObject {
+        expr,
+        env: context.env,
+    })))
+}
+
+fn apply_macro_transformer(
+    transformer: &ProcedureMacro,
+    input: SyntaxObject,
+    position: SourcePos,
+) -> Result<Value, EvalError> {
+    let Some(clause) = transformer.procedure.matching_clause(1) else {
+        return Err(EvalError::wrong_arg_count(
+            transformer.name.clone(),
+            transformer.procedure.expected_arity(),
+            1,
+            position,
+        ));
+    };
+
+    let call_env = Environment::child_for_macro_expansion(
+        transformer.procedure.env.clone(),
+        transformer.env.clone(),
+        input.env.clone(),
+    );
+
+    let args = [Value::Syntax(SyntaxValue::One(input))];
+    for (param, arg) in clause.params.iter().zip(args.iter()) {
+        Environment::define(&call_env, param.clone(), arg.clone());
+    }
+
+    if let Some(rest_param) = &clause.rest_param {
+        let rest_values = args[clause.params.len()..].iter().cloned();
+        Environment::define(&call_env, rest_param.clone(), list_from_values(rest_values));
+    }
+
+    eval_sequence(&clause.body, call_env)
 }
 
 fn eval_and_step(exprs: &[Expr], env: EnvRef) -> Result<EvalStep, EvalError> {
@@ -4129,6 +4640,7 @@ fn apply_builtin(
         "cdr" => apply_cdr(args, position),
         "cons" => apply_cons(args, position),
         "display" => apply_display(args, position, env),
+        "datum->syntax" => apply_datum_to_syntax(args, position),
         "eq?" => apply_equality_predicate("eq?", args, position, scheme_eq),
         "eqv?" => apply_equality_predicate("eqv?", args, position, scheme_eq),
         "equal?" => apply_equality_predicate("equal?", args, position, scheme_equal),
@@ -4225,6 +4737,7 @@ fn apply_builtin(
             value.to_uppercase()
         }),
         "substring" => apply_substring(args, position),
+        "syntax->datum" => apply_syntax_to_datum(args, position),
         "symbol?" => apply_type_predicate("symbol?", args, position, |value| {
             matches!(value, Value::Symbol(_))
         }),
@@ -5952,7 +6465,10 @@ fn is_core_syntax_keyword(name: &str) -> bool {
             | "or"
             | "quote"
             | "set!"
+            | "syntax"
+            | "syntax-case"
             | "syntax-rules"
+            | "with-syntax"
     )
 }
 
@@ -5960,8 +6476,15 @@ fn is_ellipsis_expr(expr: &Expr) -> bool {
     matches!(&expr.kind, ExprKind::Symbol(name) if name == "...")
 }
 
-fn is_pattern_variable(name: &str, literals: &HashSet<String>, macro_name: &str) -> bool {
-    name != "..." && name != "_" && name != macro_name && !literals.contains(name)
+fn is_pattern_variable(
+    name: &str,
+    literals: &HashSet<String>,
+    macro_name: Option<&str>,
+) -> bool {
+    name != "..."
+        && name != "_"
+        && macro_name.is_none_or(|macro_name| name != macro_name)
+        && !literals.contains(name)
 }
 
 fn parse_syntax_rules(
@@ -6032,12 +6555,12 @@ fn parse_syntax_rules(
         });
     }
 
-    Ok(Rc::new(SyntaxRulesMacro {
+    Ok(Rc::new(MacroTransformer::SyntaxRules(SyntaxRulesMacro {
         name: macro_name.to_string(),
         literals,
         rules,
         env,
-    }))
+    })))
 }
 
 fn parse_syntax_rule_literals(expr: &Expr) -> Result<HashSet<String>, EvalError> {
@@ -6076,6 +6599,22 @@ fn expand_macro_call(
     env: EnvRef,
     position: SourcePos,
 ) -> Result<ExpandedExpr, EvalError> {
+    match transformer.as_ref() {
+        MacroTransformer::SyntaxRules(transformer) => {
+            expand_syntax_rules_macro_call(transformer, invocation_items, env, position)
+        }
+        MacroTransformer::Procedure(transformer) => {
+            expand_procedure_macro_call(transformer, invocation_items, env, position)
+        }
+    }
+}
+
+fn expand_syntax_rules_macro_call(
+    transformer: &SyntaxRulesMacro,
+    invocation_items: &[Expr],
+    env: EnvRef,
+    position: SourcePos,
+) -> Result<ExpandedExpr, EvalError> {
     let invocation = Expr::list(invocation_items.to_vec(), position);
 
     for rule in &transformer.rules {
@@ -6104,6 +6643,29 @@ fn expand_macro_call(
     ))
 }
 
+fn expand_procedure_macro_call(
+    transformer: &ProcedureMacro,
+    invocation_items: &[Expr],
+    env: EnvRef,
+    position: SourcePos,
+) -> Result<ExpandedExpr, EvalError> {
+    let invocation = Expr::list(invocation_items.to_vec(), position);
+    let value = apply_macro_transformer(
+        transformer,
+        SyntaxObject {
+            expr: invocation,
+            env: env.clone(),
+        },
+        position,
+    )?;
+    let syntax = expect_single_syntax(&value, position)?;
+
+    Ok(ExpandedExpr {
+        expr: syntax.expr,
+        env: syntax.env,
+    })
+}
+
 fn match_macro_rule(
     rule: &MacroRule,
     invocation: &Expr,
@@ -6113,7 +6675,7 @@ fn match_macro_rule(
     let (ExprKind::List(pattern_items), ExprKind::List(invocation_items)) =
         (&rule.pattern.kind, &invocation.kind)
     else {
-        return match_pattern(&rule.pattern, invocation, literals, macro_name);
+        return match_pattern(&rule.pattern, invocation, literals, Some(macro_name));
     };
 
     let Some((pattern_head, pattern_tail)) = pattern_items.split_first() else {
@@ -6125,14 +6687,16 @@ fn match_macro_rule(
 
     matches!(&pattern_head.kind, ExprKind::Symbol(name) if name == macro_name)
         .then_some(())
-        .and_then(|_| match_pattern_list(pattern_tail, invocation_tail, literals, macro_name))
+        .and_then(|_| {
+            match_pattern_list(pattern_tail, invocation_tail, literals, Some(macro_name))
+        })
 }
 
 fn match_pattern(
     pattern: &Expr,
     input: &Expr,
     literals: &HashSet<String>,
-    macro_name: &str,
+    macro_name: Option<&str>,
 ) -> Option<PatternBindings> {
     match (&pattern.kind, &input.kind) {
         (ExprKind::Integer(left), ExprKind::Integer(right)) if left == right => {
@@ -6167,7 +6731,7 @@ fn match_pattern_list(
     patterns: &[Expr],
     inputs: &[Expr],
     literals: &HashSet<String>,
-    macro_name: &str,
+    macro_name: Option<&str>,
 ) -> Option<PatternBindings> {
     if patterns.is_empty() {
         return inputs.is_empty().then(HashMap::new);
@@ -6250,7 +6814,7 @@ fn minimum_pattern_items(patterns: &[Expr]) -> usize {
 fn collect_pattern_variables(
     pattern: &Expr,
     literals: &HashSet<String>,
-    macro_name: &str,
+    macro_name: Option<&str>,
     vars: &mut HashSet<String>,
 ) {
     match &pattern.kind {
@@ -6944,6 +7508,7 @@ impl Parser {
             Some('(') => self.parse_list(position),
             Some(')') => Err(EvalError::syntax("unexpected ')'", position)),
             Some('\'') => self.parse_quote_shorthand(position),
+            Some('#') if self.peek_next() == Some('\'') => self.parse_syntax_shorthand(position),
             Some('"') => self.parse_string(position),
             Some(_) => self.parse_token_expr(position),
             None => Err(EvalError::syntax("unexpected end of input", position)),
@@ -6970,10 +7535,13 @@ impl Parser {
 
     fn parse_quote_shorthand(&mut self, position: SourcePos) -> Result<Expr, EvalError> {
         self.expect('\'')?;
-        Ok(Expr::list(
-            vec![Expr::symbol("quote", position), self.parse_expr()?],
-            position,
-        ))
+        Ok(build_quote_expr(self.parse_expr()?, position))
+    }
+
+    fn parse_syntax_shorthand(&mut self, position: SourcePos) -> Result<Expr, EvalError> {
+        self.expect('#')?;
+        self.expect('\'')?;
+        Ok(build_syntax_expr(self.parse_expr()?, position))
     }
 
     fn parse_string(&mut self, position: SourcePos) -> Result<Expr, EvalError> {
@@ -7077,6 +7645,10 @@ impl Parser {
 
     fn peek(&self) -> Option<char> {
         self.chars.get(self.index).copied()
+    }
+
+    fn peek_next(&self) -> Option<char> {
+        self.chars.get(self.index + 1).copied()
     }
 
     fn current_pos(&self) -> SourcePos {
