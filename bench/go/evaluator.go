@@ -144,23 +144,7 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 			}
 			return result, nil
 		case *LambdaVal:
-			if len(args) != len(f.Params) {
-				line, col := e.Elems[0].pos()
-				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected %d, got %d", line, col, len(f.Params), len(args))}
-			}
-			callEnv := newEnv(f.Env)
-			for i, p := range f.Params {
-				callEnv.set(p, args[i])
-			}
-			var result Value
-			for _, bodyExpr := range f.Body {
-				var err2 error
-				result, err2 = evalExpr(bodyExpr, callEnv)
-				if err2 != nil {
-					return nil, err2
-				}
-			}
-			return result, nil
+			return applyLambda(f, args)
 		default:
 			line, col := e.Elems[0].pos()
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", line, col)}
@@ -191,15 +175,11 @@ func evalDefine(e *ListExpr, env *Env) (Value, error) {
 		if !ok {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol", e.Line, e.Col)}
 		}
-		params := make([]string, len(target.Elems)-1)
-		for i, p := range target.Elems[1:] {
-			ps, ok := p.(*SymbolExpr)
-			if !ok {
-				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol in parameter list", e.Line, e.Col)}
-			}
-			params[i] = ps.Name
+		params, rest, perr := parseParams(target.Elems[1:], e.Line, e.Col)
+		if perr != nil {
+			return nil, perr
 		}
-		lambda := &LambdaVal{Params: params, Body: e.Elems[2:], Env: env}
+		lambda := &LambdaVal{Params: params, RestParam: rest, Body: e.Elems[2:], Env: env}
 		env.set(nameSym.Name, lambda)
 		return &VoidVal{}, nil
 	default:
@@ -224,23 +204,83 @@ func evalIf(e *ListExpr, env *Env) (Value, error) {
 	return &VoidVal{}, nil
 }
 
+// parseParams extracts parameter names and optional rest param from a list of exprs.
+// Handles dot notation: (x y . rest) -> params=["x","y"], rest="rest"
+func parseParams(elems []Expr, line, col int) ([]string, string, error) {
+	var params []string
+	var restParam string
+	for i, p := range elems {
+		ps, ok := p.(*SymbolExpr)
+		if !ok {
+			return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: expected symbol in parameter list", line, col)}
+		}
+		if ps.Name == "." {
+			if i+1 != len(elems)-1 {
+				return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: malformed dot in parameter list", line, col)}
+			}
+			rs, ok := elems[i+1].(*SymbolExpr)
+			if !ok {
+				return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: expected symbol after dot", line, col)}
+			}
+			restParam = rs.Name
+			break
+		}
+		params = append(params, ps.Name)
+	}
+	return params, restParam, nil
+}
+
 func evalLambda(e *ListExpr, env *Env) (Value, error) {
 	if len(e.Elems) < 3 {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda requires params and body", e.Line, e.Col)}
 	}
-	paramList, ok := e.Elems[1].(*ListExpr)
-	if !ok {
+	switch pl := e.Elems[1].(type) {
+	case *ListExpr:
+		params, rest, err := parseParams(pl.Elems, e.Line, e.Col)
+		if err != nil {
+			return nil, err
+		}
+		return &LambdaVal{Params: params, RestParam: rest, Body: e.Elems[2:], Env: env}, nil
+	case *SymbolExpr:
+		// (lambda args body...) — all args collected into single rest param
+		return &LambdaVal{RestParam: pl.Name, Body: e.Elems[2:], Env: env}, nil
+	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected parameter list", e.Line, e.Col)}
 	}
-	params := make([]string, len(paramList.Elems))
-	for i, p := range paramList.Elems {
-		ps, ok := p.(*SymbolExpr)
-		if !ok {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected symbol in parameter list", e.Line, e.Col)}
+}
+
+// applyLambda calls a lambda with the given arguments, handling rest params.
+func applyLambda(f *LambdaVal, args []Value) (Value, error) {
+	if f.RestParam != "" {
+		if len(args) < len(f.Params) {
+			return nil, &EvalError{Message: fmt.Sprintf("wrong number of arguments: expected at least %d, got %d", len(f.Params), len(args))}
 		}
-		params[i] = ps.Name
+	} else {
+		if len(args) != len(f.Params) {
+			return nil, &EvalError{Message: fmt.Sprintf("wrong number of arguments: expected %d, got %d", len(f.Params), len(args))}
+		}
 	}
-	return &LambdaVal{Params: params, Body: e.Elems[2:], Env: env}, nil
+	callEnv := newEnv(f.Env)
+	for i, p := range f.Params {
+		callEnv.set(p, args[i])
+	}
+	if f.RestParam != "" {
+		// collect remaining args into a list
+		var rest Value = &NilVal{}
+		for i := len(args) - 1; i >= len(f.Params); i-- {
+			rest = &PairVal{Car: args[i], Cdr: rest}
+		}
+		callEnv.set(f.RestParam, rest)
+	}
+	var result Value
+	for _, bodyExpr := range f.Body {
+		var err error
+		result, err = evalExpr(bodyExpr, callEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
 }
 
 func quoteExpr(expr Expr) (Value, error) {
@@ -545,6 +585,41 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 			result = &PairVal{Car: args[i], Cdr: result}
 		}
 		return result, nil
+	}})
+
+	env.set("apply", &BuiltinFunc{Name: "apply", Fn: func(args []Value) (Value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: "apply: need at least 2 arguments"}
+		}
+		fn := args[0]
+		// Last arg must be a list; prefix args are prepended
+		lastArg := args[len(args)-1]
+		var callArgs []Value
+		// Collect prefix args (between fn and last arg)
+		for _, a := range args[1 : len(args)-1] {
+			callArgs = append(callArgs, a)
+		}
+		// Flatten the last argument (must be a list)
+		cur := lastArg
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				break
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "apply: last argument must be a list"}
+			}
+			callArgs = append(callArgs, p.Car)
+			cur = p.Cdr
+		}
+		switch f := fn.(type) {
+		case *BuiltinFunc:
+			return f.Fn(callArgs)
+		case *LambdaVal:
+			return applyLambda(f, callArgs)
+		default:
+			return nil, &EvalError{Message: "apply: first argument must be a procedure"}
+		}
 	}})
 
 	env.set("length", &BuiltinFunc{Name: "length", Fn: func(args []Value) (Value, error) {

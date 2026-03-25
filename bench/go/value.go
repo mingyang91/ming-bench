@@ -21,9 +21,10 @@ type CharVal struct{ Val rune }
 
 // LambdaVal is a user-defined closure.
 type LambdaVal struct {
-	Params []string
-	Body   []Expr
-	Env    *Env
+	Params    []string
+	RestParam string // if non-empty, collects remaining args into a list
+	Body      []Expr
+	Env       *Env
 }
 
 func (v *LambdaVal) String() string {
