@@ -130,7 +130,8 @@ private[ming] object BuiltinRegistry:
     "values",
     "call-with-values",
     "syntax->datum",
-    "datum->syntax"
+    "datum->syntax",
+    "error"
   )
 
   def makeTopLevelEnv(): Env =

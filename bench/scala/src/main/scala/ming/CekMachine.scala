@@ -33,6 +33,10 @@ object CekMachine:
         s.value = args.head
         s.evaluating = false
 
+      case Expr.Lst(List(Expr.Sym("quasiquote"), tmpl)) =>
+        s.expr = Quasiquote.expand(tmpl)
+        // re-evaluate the expanded expression
+
       case Expr.Lst(Expr.Sym("if") :: args) =>
         if args.length < 2 || args.length > 3 then throw EvalError("if: need 2 or 3 arguments")
         s.k = IfK(args(1), if args.length == 3 then Some(args(2)) else None, curEnv, s.k)
@@ -161,37 +165,57 @@ object CekMachine:
           else setupBody(s, body, e, kk)
         else evalCondClauses(s, remaining, e, kk)
 
-      case CaseKeyK(clauses, e, kk)                   => evalCaseClauses(s, s.value, clauses, e, kk)
-      case k: DynWindAfterInK                         => CekHelpers.stepDynWind(s, k)
-      case k: DynWindAfterBodyK                       => CekHelpers.stepDynWind(s, k)
-      case k: DynWindAfterOutK                        => CekHelpers.stepDynWind(s, k)
-      case k: DynWindTransferK                        => CekHelpers.stepDynWind(s, k)
-      case PopExnHandlerK(kk)                         => s.exnHandlers = s.exnHandlers.tail; s.k = kk
-      case RaiseReturnK                               => throw EvalError("raise: handler returned")
-      case CallExnHandlerK(handler, exnValue, afterK) => applyFunc(s, handler, List(exnValue), afterK)
-      case GuardStartK(varName, clauses, env, exitK)  => evalGuardClauses(s, varName, clauses, env, exitK)
-
-      case GuardCondK(varName, body, remaining, env, exitK) =>
-        if !isFalsy(s.value) then
-          if body.isEmpty then s.k = exitK
-          else setupBody(s, body, env, exitK)
-        else evalGuardClauses(s, varName, remaining, env, exitK)
-
-      case CallWithValuesConsumerK(consumer, kk) =>
-        val args = s.value match
-          case Expr.Values(elems) => elems
-          case single             => List(single)
-        applyFunc(s, consumer, args, kk)
-
-      case SyntaxCaseMatchK(literals, clauses, env, kk) =>
-        CekSyntaxSteps.stepKontSyntaxCaseMatch(s, literals, clauses, env, kk)
-
+      case k: CondArrowK                 => stepCondArrowK(s, k)
+      case CondArrowApplyK(testVal, kk)  => applyFunc(s, s.value, List(testVal), kk)
+      case CaseKeyK(clauses, e, kk)      => evalCaseClauses(s, s.value, clauses, e, kk)
+      case k: DynWindAfterInK            => CekHelpers.stepDynWind(s, k)
+      case k: DynWindAfterBodyK          => CekHelpers.stepDynWind(s, k)
+      case k: DynWindAfterOutK           => CekHelpers.stepDynWind(s, k)
+      case k: DynWindTransferK           => CekHelpers.stepDynWind(s, k)
+      case PopExnHandlerK(kk)            => s.exnHandlers = s.exnHandlers.tail; s.k = kk
+      case RaiseReturnK                  => throw EvalError("raise: handler returned")
+      case CallExnHandlerK(h, v, afterK) => applyFunc(s, h, List(v), afterK)
+      case GuardStartK(vn, cls, env, ek) => evalGuardClauses(s, vn, cls, env, ek)
+      case k: GuardCondK                 => stepGuardCondK(s, k)
+      case k: GuardCondArrowK            => stepGuardCondArrowK(s, k)
+      case k: CallWithValuesConsumerK    => stepCallWithValuesK(s, k)
+      case SyntaxCaseMatchK(lits, cls, env, kk) =>
+        CekSyntaxSteps.stepKontSyntaxCaseMatch(s, lits, cls, env, kk)
       case SyntaxCaseCleanupK(kk) => s.k = kk
-
       case TransformerMacroReturnK(useEnv, kk) =>
         CekSyntaxSteps.stepKontTransformerMacroReturn(s, useEnv, kk)
 
     null // signal: keep looping
+
+  private def stepCondArrowK(s: CekState, k: CondArrowK): Unit =
+    if !isFalsy(s.value) then
+      val testVal = s.value
+      s.k = CondArrowApplyK(testVal, k.k)
+      s.expr = k.procExpr
+      s.env = k.env
+      s.evaluating = true
+    else evalCondClauses(s, k.remaining, k.env, k.k)
+
+  private def stepGuardCondK(s: CekState, k: GuardCondK): Unit =
+    if !isFalsy(s.value) then
+      if k.body.isEmpty then s.k = k.exitK
+      else setupBody(s, k.body, k.env, k.exitK)
+    else evalGuardClauses(s, k.varName, k.remaining, k.env, k.exitK)
+
+  private def stepGuardCondArrowK(s: CekState, k: GuardCondArrowK): Unit =
+    if !isFalsy(s.value) then
+      val testVal = s.value
+      s.k = CondArrowApplyK(testVal, k.exitK)
+      s.expr = k.procExpr
+      s.env = k.env
+      s.evaluating = true
+    else evalGuardClauses(s, k.varName, k.remaining, k.env, k.exitK)
+
+  private def stepCallWithValuesK(s: CekState, k: CallWithValuesConsumerK): Unit =
+    val args = s.value match
+      case Expr.Values(elems) => elems
+      case single             => List(single)
+    applyFunc(s, k.consumer, args, k.k)
 
   private def stepEvFunK(s: CekState, k: EvFunK): Unit =
     if k.argExprs.isEmpty then applyFunc(s, s.value, Nil, k.k)

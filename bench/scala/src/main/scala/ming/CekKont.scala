@@ -35,10 +35,12 @@ private[ming] case class NamedLetBindK(
   k: Kont
 ) extends Kont
 
-private[ming] case class AndK(remaining: List[Expr], env: Env, k: Kont)                    extends Kont
-private[ming] case class OrK(remaining: List[Expr], env: Env, k: Kont)                     extends Kont
-private[ming] case class CondK(body: List[Expr], remaining: List[Expr], env: Env, k: Kont) extends Kont
-private[ming] case class CaseKeyK(clauses: List[Expr], env: Env, k: Kont)                  extends Kont
+private[ming] case class AndK(remaining: List[Expr], env: Env, k: Kont)                       extends Kont
+private[ming] case class OrK(remaining: List[Expr], env: Env, k: Kont)                        extends Kont
+private[ming] case class CondK(body: List[Expr], remaining: List[Expr], env: Env, k: Kont)    extends Kont
+private[ming] case class CondArrowK(procExpr: Expr, remaining: List[Expr], env: Env, k: Kont) extends Kont
+private[ming] case class CondArrowApplyK(testVal: Expr, k: Kont)                              extends Kont
+private[ming] case class CaseKeyK(clauses: List[Expr], env: Env, k: Kont)                     extends Kont
 
 // dynamic-wind support
 private[ming] class WindEntry(val inThunk: Expr, val outThunk: Expr)
@@ -76,6 +78,9 @@ private[ming] case class CallExnHandlerK(handler: Expr, exnValue: Expr, afterK: 
 private[ming] case class GuardStartK(varName: String, clauses: List[Expr], env: Env, exitK: Kont) extends Kont
 
 private[ming] case class GuardCondK(varName: String, body: List[Expr], remaining: List[Expr], env: Env, exitK: Kont)
+    extends Kont
+
+private[ming] case class GuardCondArrowK(varName: String, procExpr: Expr, remaining: List[Expr], env: Env, exitK: Kont)
     extends Kont
 
 // call-with-values support

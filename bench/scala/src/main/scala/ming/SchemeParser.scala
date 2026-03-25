@@ -48,7 +48,20 @@ private[ming] class SchemeParser(input: String):
         val inner = parseExpr()
         Expr.Lst(List(Expr.Sym("quote"), inner))
       case '#' => parseHash()
-      case _   => parseAtom()
+      case '`' =>
+        advance()
+        val inner = parseExpr()
+        Expr.Lst(List(Expr.Sym("quasiquote"), inner))
+      case ',' =>
+        advance()
+        if pos < input.length && peek == '@' then
+          advance()
+          val inner = parseExpr()
+          Expr.Lst(List(Expr.Sym("unquote-splicing"), inner))
+        else
+          val inner = parseExpr()
+          Expr.Lst(List(Expr.Sym("unquote"), inner))
+      case _ => parseAtom()
     val (l, c) = lineColAt(startPos)
     result.withPos(l, c)
 
@@ -57,6 +70,25 @@ private[ming] class SchemeParser(input: String):
     val elems = List.newBuilder[Expr]
     skipWhitespaceAndComments()
     while pos < input.length && peek != ')' do
+      // Check for dotted pair: ". expr)"
+      if peek == '.' then
+        val savedPos = pos
+        pos += 1
+        if pos < input.length && isDelimiter(input(pos)) then
+          // This is a dot separator for a dotted pair
+          skipWhitespaceAndComments()
+          val tail = parseExpr()
+          skipWhitespaceAndComments()
+          if pos >= input.length || peek != ')' then throw EvalError("expected ) after dotted pair")
+          advance() // skip ')'
+          // Build improper list: (a b . c) => Pair(a, Pair(b, c))
+          val items = elems.result()
+          return items.foldRight(tail) { (item, acc) =>
+            Expr.Pair(new MutablePair(item, acc))
+          }
+        else
+          // Not a dot separator, restore and parse as atom
+          pos = savedPos
       elems += parseExpr()
       skipWhitespaceAndComments()
     if pos >= input.length then throw EvalError("unmatched (")

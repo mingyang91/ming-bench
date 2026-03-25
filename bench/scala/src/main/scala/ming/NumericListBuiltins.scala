@@ -45,9 +45,12 @@ private[ming] object NumericListBuiltins:
 
   def applyAppend(args: List[Expr]): Expr =
     if args.isEmpty then Expr.Lst(Nil)
+    else if args.length == 1 then args.head
     else
-      val allElems = args.flatMap(a => PairOps.toScalaList(a))
-      PairOps.makeList(allElems)
+      // R7RS: all but last must be proper lists; last can be anything
+      val init = args.init.flatMap(a => PairOps.toScalaList(a))
+      val last = args.last
+      init.foldRight(last)(PairOps.cons)
 
   def applyListRef(args: List[Expr]): Expr =
     if args.length != 2 then throw EvalError("list-ref: need exactly 2 arguments")

@@ -69,6 +69,10 @@ object CekApply:
         val thunk   = args(1)
         s.exnHandlers = new SimpleExnHandler(handler, s.windStack) :: s.exnHandlers
         applyFunc(s, thunk, Nil, PopExnHandlerK(kk))
+      case Expr.Sym("error") =>
+        if args.isEmpty then throw EvalError("error: need at least 1 argument")
+        val msg = args.map(Display.display).mkString("")
+        performRaise(s, Expr.Str(msg.toCharArray, isMutable = false), kk)
       case Expr.Sym("raise") =>
         if args.length != 1 then throw EvalError("raise: need exactly 1 argument")
         performRaise(s, args.head, kk)
@@ -114,6 +118,11 @@ object CekApply:
         s.evaluating = false
       case Expr.Lst(Expr.Sym("else") :: body) :: _ =>
         setupBody(s, body, e, kk)
+      case Expr.Lst(test :: Expr.Sym("=>") :: proc :: Nil) :: rest =>
+        s.k = CondArrowK(proc, rest, e, kk)
+        s.expr = test
+        s.env = e
+        s.evaluating = true
       case Expr.Lst(test :: body) :: rest =>
         s.k = CondK(body, rest, e, kk)
         s.expr = test
@@ -139,8 +148,8 @@ object CekApply:
       case Expr.Sym(name) :: valExpr :: Nil =>
         s.k = DefineK(name, curEnv, s.k)
         s.expr = valExpr
-      case Expr.Lst(Expr.Sym(name) :: params) :: body if body.nonEmpty =>
-        val (pn, rp) = ParamUtils.extractParamsWithRest("define", params)
+      case (head @ (Expr.Lst(_ :: _) | Expr.Pair(_))) :: body if body.nonEmpty =>
+        val (name, pn, rp) = ParamUtils.extractDefineHead("define", head)
         curEnv.define(name, Expr.Lambda(pn, rp, body, curEnv))
         s.value = Expr.Bool(false)
         s.evaluating = false
@@ -236,6 +245,11 @@ object CekApply:
         performRaise(s, exnValue, exitK)
       case Expr.Lst(Expr.Sym("else") :: body) :: _ =>
         setupBody(s, body, env, exitK)
+      case Expr.Lst(test :: Expr.Sym("=>") :: proc :: Nil) :: rest =>
+        s.k = GuardCondArrowK(varName, proc, rest, env, exitK)
+        s.expr = test
+        s.env = env
+        s.evaluating = true
       case Expr.Lst(test :: body) :: rest =>
         s.k = GuardCondK(varName, body, rest, env, exitK)
         s.expr = test

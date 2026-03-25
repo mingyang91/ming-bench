@@ -15,8 +15,8 @@ object SpecialForms:
     case Expr.Sym(name) :: value :: Nil =>
       env.define(name, Evaluator.eval(value, env))
       Expr.Bool(false)
-    case Expr.Lst(Expr.Sym(name) :: params) :: body if body.nonEmpty =>
-      val (paramNames, restParam) = ParamUtils.extractParamsWithRest("define", params)
+    case (head @ (Expr.Lst(_ :: _) | Expr.Pair(_))) :: body if body.nonEmpty =>
+      val (name, paramNames, restParam) = ParamUtils.extractDefineHead("define", head)
       env.define(name, Expr.Lambda(paramNames, restParam, body, env))
       Expr.Bool(false)
     case _ => throw EvalError("define: invalid syntax")
@@ -28,8 +28,8 @@ object SpecialForms:
     case _ => throw EvalError("set!: invalid syntax")
 
   private[ming] def evalLambda(args: List[Expr], env: Env): Expr = args match
-    case Expr.Lst(params) :: body if body.nonEmpty =>
-      val (paramNames, restParam) = ParamUtils.extractParamsWithRest("lambda", params)
+    case (spec @ (Expr.Lst(_) | Expr.Pair(_))) :: body if body.nonEmpty =>
+      val (paramNames, restParam) = ParamUtils.extractParamSpec("lambda", spec)
       Expr.Lambda(paramNames, restParam, body, env)
     case Expr.Sym(restName) :: body if body.nonEmpty =>
       Expr.Lambda(Nil, Some(restName), body, env)
@@ -58,10 +58,11 @@ object SpecialForms:
 
   private[ming] def evalCaseLambda(clauses: List[Expr], env: Env): Expr =
     val parsed = clauses.map {
-      case Expr.Lst(Expr.Lst(params) :: body) if body.nonEmpty =>
-        val (paramNames, restParam) =
-          ParamUtils.extractParamsWithRest("case-lambda", params)
+      case Expr.Lst((spec @ (Expr.Lst(_) | Expr.Pair(_))) :: body) if body.nonEmpty =>
+        val (paramNames, restParam) = ParamUtils.extractParamSpec("case-lambda", spec)
         (paramNames, restParam, body)
+      case Expr.Lst(Expr.Sym(rest) :: body) if body.nonEmpty =>
+        (Nil, Some(rest), body)
       case _ => throw EvalError("case-lambda: invalid clause")
     }
     Expr.CaseLambda(parsed, env)

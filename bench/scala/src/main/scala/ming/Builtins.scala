@@ -160,8 +160,9 @@ private[ming] object Builtins:
     args: List[Expr],
     op: (Double, Double) => Boolean
   ): Expr =
-    if args.length != 2 then throw EvalError(s"$name: need exactly 2 arguments")
-    Expr.Bool(op(NumericUtils.toDouble(args(0)), NumericUtils.toDouble(args(1))))
+    if args.length < 2 then throw EvalError(s"$name: need at least 2 arguments")
+    val doubles = args.map(NumericUtils.toDouble)
+    Expr.Bool(doubles.zip(doubles.tail).forall((a, b) => op(a, b)))
 
   def asNum(e: Expr): Long = e match
     case Expr.Num(n) => n
