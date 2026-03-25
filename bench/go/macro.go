@@ -373,6 +373,8 @@ func (it *interpreter) expandTemplateList(list *listExpr, macro *syntaxRuleMacro
 			return it.expandTemplateLet(list, macro, rule, match, locals, repeatIndex)
 		case "lambda":
 			return it.expandTemplateLambda(list, macro, rule, match, locals, repeatIndex)
+		case "case-lambda":
+			return it.expandTemplateCaseLambda(list, macro, rule, match, locals, repeatIndex)
 		}
 	}
 
@@ -500,6 +502,39 @@ func (it *interpreter) expandTemplateLambda(list *listExpr, macro *syntaxRuleMac
 			return nil, err
 		}
 		elements = append(elements, expandedBody)
+	}
+
+	return &listExpr{elements: elements, at: list.at}, nil
+}
+
+func (it *interpreter) expandTemplateCaseLambda(list *listExpr, macro *syntaxRuleMacro, rule *syntaxRule, match *syntaxMatch, locals map[string]string, repeatIndex *int) (expr, error) {
+	if len(list.elements) < 2 {
+		return it.expandTemplateListGeneric(list, macro, rule, match, locals, repeatIndex)
+	}
+
+	elements := []expr{&symbolExpr{name: "case-lambda", at: list.elements[0].pos()}}
+	for _, clauseExpr := range list.elements[1:] {
+		clause, ok := clauseExpr.(*listExpr)
+		if !ok || len(clause.elements) < 2 {
+			return it.expandTemplateListGeneric(list, macro, rule, match, locals, repeatIndex)
+		}
+
+		bodyLocals := copyLocalBindings(locals)
+		formals, err := it.expandTemplateFormals(clause.elements[0], macro, rule, match, locals, &bodyLocals, repeatIndex)
+		if err != nil {
+			return nil, err
+		}
+
+		clauseElements := []expr{formals}
+		for _, bodyExpr := range clause.elements[1:] {
+			expandedBody, err := it.expandTemplate(bodyExpr, macro, rule, match, bodyLocals, repeatIndex)
+			if err != nil {
+				return nil, err
+			}
+			clauseElements = append(clauseElements, expandedBody)
+		}
+
+		elements = append(elements, &listExpr{elements: clauseElements, at: clause.at})
 	}
 
 	return &listExpr{elements: elements, at: list.at}, nil
@@ -654,6 +689,8 @@ func (it *interpreter) resolveSyntaxList(list *listExpr, scope *env) (expr, erro
 		return cloneExpr(list), nil
 	case "lambda":
 		return it.resolveSyntaxLambda(list, scope)
+	case "case-lambda":
+		return it.resolveSyntaxCaseLambda(list, scope)
 	case "let":
 		return it.resolveSyntaxLet(list, scope)
 	case "and", "or", "define", "define-syntax", "if", "set!", "begin", "cond":
@@ -705,6 +742,39 @@ func (it *interpreter) resolveSyntaxLambda(list *listExpr, scope *env) (expr, er
 			return nil, err
 		}
 		elements = append(elements, resolved)
+	}
+
+	return &listExpr{elements: elements, at: list.at}, nil
+}
+
+func (it *interpreter) resolveSyntaxCaseLambda(list *listExpr, scope *env) (expr, error) {
+	if len(list.elements) < 2 {
+		return it.resolveSyntaxListGeneric(list, scope)
+	}
+
+	elements := []expr{&symbolExpr{name: "case-lambda", at: list.elements[0].pos()}}
+	for _, clauseExpr := range list.elements[1:] {
+		clause, ok := clauseExpr.(*listExpr)
+		if !ok || len(clause.elements) < 2 {
+			return it.resolveSyntaxListGeneric(list, scope)
+		}
+
+		bodyScope := newEnv(scope)
+		formals, err := it.resolveLambdaFormals(clause.elements[0], bodyScope)
+		if err != nil {
+			return nil, err
+		}
+
+		clauseElements := []expr{formals}
+		for _, bodyExpr := range clause.elements[1:] {
+			resolved, err := it.resolveSyntax(bodyExpr, bodyScope)
+			if err != nil {
+				return nil, err
+			}
+			clauseElements = append(clauseElements, resolved)
+		}
+
+		elements = append(elements, &listExpr{elements: clauseElements, at: clause.at})
 	}
 
 	return &listExpr{elements: elements, at: list.at}, nil

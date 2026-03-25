@@ -635,6 +635,7 @@ func (it *interpreter) installBuiltins() {
 	it.defineName(it.global, "boolean?", &builtinProc{name: "boolean?", fn: builtinBooleanPred})
 	it.defineName(it.global, "pair?", &builtinProc{name: "pair?", fn: builtinPairPred})
 	it.defineName(it.global, "symbol?", &builtinProc{name: "symbol?", fn: builtinSymbolPred})
+	it.defineName(it.global, "procedure?", &builtinProc{name: "procedure?", fn: builtinProcedurePred})
 	it.defineName(it.global, "display", &builtinProc{name: "display", fn: builtinDisplay})
 	it.defineName(it.global, "write", &builtinProc{name: "write", fn: builtinWrite})
 	it.defineName(it.global, "newline", &builtinProc{name: "newline", fn: builtinNewline})
@@ -755,6 +756,8 @@ func (it *interpreter) evalList(list *listExpr, scope *env) (value, error) {
 			return it.evalQuote(list)
 		case "lambda":
 			return it.evalLambda(scope, list)
+		case "case-lambda":
+			return it.evalCaseLambda(scope, list)
 		case "set!":
 			return it.evalSet(scope, list)
 		case "begin":
@@ -1015,6 +1018,8 @@ func (it *interpreter) applyProcedure(proc value, args []value, callPos position
 		return proc.fn(it, args, callPos)
 	case *closureProc:
 		return it.applyClosure(proc, args, callPos)
+	case *caseLambdaProc:
+		return it.applyCaseLambda(proc, args, callPos)
 	default:
 		return nil, newEvalError(ErrNotProcedure, "attempted to call a non-procedure", callPos)
 	}
@@ -1033,15 +1038,7 @@ func (it *interpreter) applyClosure(proc *closureProc, args []value, callPos pos
 	} else if len(args) != len(proc.params) {
 		return nil, wrongArgCount(callPos, name, fmt.Sprintf("expected %d arguments, got %d", len(proc.params), len(args)))
 	}
-
-	callEnv := newEnv(proc.env)
-	for i, param := range proc.params {
-		it.defineBindingName(callEnv, param, args[i])
-	}
-	if proc.hasRest {
-		it.defineBindingName(callEnv, proc.rest, buildList(args[len(proc.params):]))
-	}
-	return it.evalSequence(callEnv, proc.body)
+	return it.applyProcedureBody(proc.env, proc.params, proc.rest, proc.hasRest, proc.body, args)
 }
 
 func (it *interpreter) evalAnd(scope *env, args []expr) (value, error) {
@@ -1792,7 +1789,7 @@ func formatValue(v value) (string, error) {
 		return "()", nil
 	case *pairValue:
 		return formatPair(value)
-	case *builtinProc, *closureProc:
+	case *builtinProc, *closureProc, *caseLambdaProc:
 		return "#<procedure>", nil
 	case *recordValue:
 		return fmt.Sprintf("#<record %s>", value.typ.name), nil
