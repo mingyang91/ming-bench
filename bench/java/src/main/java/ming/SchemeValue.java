@@ -20,6 +20,7 @@ public sealed interface SchemeValue {
     record PairVal(SchemeValue car, SchemeValue cdr) implements SchemeValue {}
     record CharVal(char value) implements SchemeValue {}
     record BuiltinVal(String name, Builtin proc) implements SchemeValue {}
+    record MacroVal(List<String> literals, List<SchemeValue> patterns, List<SchemeValue> templates, Environment defEnv) implements SchemeValue {}
 
     @FunctionalInterface
     interface Builtin {
@@ -63,6 +64,7 @@ public sealed interface SchemeValue {
             case VoidVal v -> "#<void>";
             case LambdaVal v -> "#<procedure>";
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";
+            case MacroVal v -> "#<macro>";
         };
     }
 

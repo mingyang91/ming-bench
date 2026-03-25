@@ -1,14 +1,23 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 public class Interpreter {
     private final Environment globals = new Environment();
     private static final SchemeValue NIL = new SchemeValue.ListVal(List.of());
     private IdentityHashMap<SchemeValue, SourcePos> positions;
     private final StringBuilder outputBuffer = new StringBuilder();
+    private int gensymCounter = 0;
+    private static final Set<String> SPECIAL_FORMS = Set.of(
+        "define", "if", "quote", "lambda", "and", "or", "let", "begin",
+        "cond", "set!", "define-syntax", "syntax-rules"
+    );
 
     public Interpreter() {
         registerBuiltins();
@@ -471,6 +480,7 @@ public class Interpreter {
                 case SchemeValue.BuiltinVal v -> v;
                 case SchemeValue.CharVal v -> v;
                 case SchemeValue.PairVal v -> v;
+                case SchemeValue.MacroVal v -> v;
                 case SchemeValue.SymbolVal v -> env.get(v.name());
                 case SchemeValue.ListVal v -> evalList(v, env);
             };
@@ -492,6 +502,7 @@ public class Interpreter {
         if (first instanceof SchemeValue.SymbolVal sym) {
             return switch (sym.name()) {
                 case "define" -> evalDefine(list.elements(), env);
+                case "define-syntax" -> evalDefineSyntax(list.elements(), env);
                 case "if" -> evalIf(list.elements(), env);
                 case "quote" -> evalQuote(list.elements());
                 case "lambda" -> evalLambda(list.elements(), env);
@@ -501,7 +512,14 @@ public class Interpreter {
                 case "begin" -> evalBegin(list.elements(), env);
                 case "cond" -> evalCond(list.elements(), env);
                 case "set!" -> evalSet(list.elements(), env);
-                default -> evalApplication(list.elements(), env);
+                default -> {
+                    SchemeValue resolved = null;
+                    try { resolved = env.get(sym.name()); } catch (EvalError e) { /* not bound */ }
+                    if (resolved instanceof SchemeValue.MacroVal macro) {
+                        yield evalMacroExpansion(macro, list, env);
+                    }
+                    yield evalApplication(list.elements(), env);
+                }
             };
         }
         return evalApplication(list.elements(), env);
@@ -783,6 +801,253 @@ public class Interpreter {
 
         throw new EvalError("not a procedure: " + proc.display());
     }
+
+    // ---- Macro support (Level 10) ----
+
+    private SchemeValue evalDefineSyntax(List<SchemeValue> elements, Environment env) throws EvalError {
+        if (elements.size() != 3) throw new EvalError("define-syntax: bad syntax");
+        if (!(elements.get(1) instanceof SchemeValue.SymbolVal name))
+            throw new EvalError("define-syntax: expected name");
+        var transformer = elements.get(2);
+        if (!(transformer instanceof SchemeValue.ListVal tl) || tl.elements().isEmpty())
+            throw new EvalError("define-syntax: expected syntax-rules");
+        if (!(tl.elements().get(0) instanceof SchemeValue.SymbolVal sr) || !sr.name().equals("syntax-rules"))
+            throw new EvalError("define-syntax: expected syntax-rules");
+        if (tl.elements().size() < 2)
+            throw new EvalError("syntax-rules: bad syntax");
+        var literals = new ArrayList<String>();
+        if (tl.elements().get(1) instanceof SchemeValue.ListVal ll) {
+            for (var lit : ll.elements()) {
+                if (lit instanceof SchemeValue.SymbolVal s) literals.add(s.name());
+            }
+        }
+        var patterns = new ArrayList<SchemeValue>();
+        var templates = new ArrayList<SchemeValue>();
+        for (int i = 2; i < tl.elements().size(); i++) {
+            if (!(tl.elements().get(i) instanceof SchemeValue.ListVal rule) || rule.elements().size() != 2)
+                throw new EvalError("syntax-rules: bad rule");
+            patterns.add(rule.elements().get(0));
+            templates.add(rule.elements().get(1));
+        }
+        env.define(name.name(), new SchemeValue.MacroVal(literals, patterns, templates, env));
+        return new SchemeValue.VoidVal();
+    }
+
+    private SchemeValue evalMacroExpansion(SchemeValue.MacroVal macro, SchemeValue.ListVal form, Environment env) throws EvalError {
+        var literalSet = new HashSet<>(macro.literals());
+        for (int r = 0; r < macro.patterns().size(); r++) {
+            var pattern = macro.patterns().get(r);
+            var template = macro.templates().get(r);
+            var patternVars = collectPatternVars(pattern, literalSet);
+            var bindings = new HashMap<String, Object>();
+            if (matchPattern(pattern, form, literalSet, patternVars, bindings)) {
+                var renameMap = new HashMap<String, String>();
+                var preBindings = new HashMap<String, SchemeValue>();
+                collectTemplateRenames(template, patternVars, renameMap, preBindings, macro.defEnv());
+                var expanded = instantiateTemplate(template, bindings, renameMap);
+                if (!preBindings.isEmpty()) {
+                    var macroEnv = new Environment(env);
+                    for (var entry : preBindings.entrySet()) {
+                        macroEnv.define(entry.getKey(), entry.getValue());
+                    }
+                    return eval(expanded, macroEnv);
+                }
+                return eval(expanded, env);
+            }
+        }
+        throw new EvalError("no matching pattern for macro");
+    }
+
+    private Set<String> collectPatternVars(SchemeValue pattern, Set<String> literals) {
+        var vars = new HashSet<String>();
+        if (pattern instanceof SchemeValue.ListVal l) {
+            for (int i = 1; i < l.elements().size(); i++) {
+                collectPatternVarsHelper(l.elements().get(i), literals, vars);
+            }
+        }
+        return vars;
+    }
+
+    private void collectPatternVarsHelper(SchemeValue v, Set<String> literals, Set<String> vars) {
+        if (v instanceof SchemeValue.SymbolVal s) {
+            if (!s.name().equals("...") && !literals.contains(s.name())) {
+                vars.add(s.name());
+            }
+        } else if (v instanceof SchemeValue.ListVal l) {
+            for (var elem : l.elements()) {
+                collectPatternVarsHelper(elem, literals, vars);
+            }
+        }
+    }
+
+    private boolean matchPattern(SchemeValue pattern, SchemeValue input, Set<String> literals,
+                                  Set<String> patVars, Map<String, Object> bindings) {
+        if (pattern instanceof SchemeValue.SymbolVal s) {
+            if (s.name().equals("_")) return true;
+            if (literals.contains(s.name())) {
+                return input instanceof SchemeValue.SymbolVal is && is.name().equals(s.name());
+            }
+            if (patVars.contains(s.name())) {
+                bindings.put(s.name(), input);
+                return true;
+            }
+            return true;
+        }
+        if (pattern instanceof SchemeValue.ListVal pl && input instanceof SchemeValue.ListVal il) {
+            return matchListPattern(pl.elements(), il.elements(), literals, patVars, bindings);
+        }
+        if (pattern instanceof SchemeValue.IntVal a && input instanceof SchemeValue.IntVal b)
+            return a.value() == b.value();
+        if (pattern instanceof SchemeValue.BoolVal a && input instanceof SchemeValue.BoolVal b)
+            return a.value() == b.value();
+        return false;
+    }
+
+    private boolean matchListPattern(List<SchemeValue> pat, List<SchemeValue> inp,
+                                      Set<String> literals, Set<String> patVars,
+                                      Map<String, Object> bindings) {
+        int ellipsisIdx = -1;
+        for (int i = 0; i < pat.size(); i++) {
+            if (pat.get(i) instanceof SchemeValue.SymbolVal s && s.name().equals("...")) {
+                ellipsisIdx = i;
+                break;
+            }
+        }
+
+        if (ellipsisIdx == -1) {
+            if (pat.size() != inp.size()) return false;
+            for (int i = 0; i < pat.size(); i++) {
+                if (i == 0) continue; // skip keyword position
+                if (!matchPattern(pat.get(i), inp.get(i), literals, patVars, bindings)) return false;
+            }
+            return true;
+        }
+
+        // Has ellipsis at ellipsisIdx; variadic pattern is at ellipsisIdx-1
+        int varStart = ellipsisIdx - 1; // input index where variadic matching starts
+        int afterCount = pat.size() - ellipsisIdx - 1;
+        if (inp.size() < varStart + afterCount) return false;
+
+        // Match fixed elements before variadic (indices 1..ellipsisIdx-2)
+        for (int i = 1; i < ellipsisIdx - 1; i++) {
+            if (!matchPattern(pat.get(i), inp.get(i), literals, patVars, bindings)) return false;
+        }
+
+        int varCount = inp.size() - varStart - afterCount;
+
+        SchemeValue varPat = pat.get(ellipsisIdx - 1);
+        if (varPat instanceof SchemeValue.SymbolVal s && patVars.contains(s.name())) {
+            var varBindings = new ArrayList<SchemeValue>();
+            for (int i = varStart; i < varStart + varCount; i++) {
+                varBindings.add(inp.get(i));
+            }
+            bindings.put(s.name(), varBindings);
+        }
+
+        // Match fixed elements after ellipsis
+        for (int i = 0; i < afterCount; i++) {
+            int patIdx = ellipsisIdx + 1 + i;
+            int inpIdx = varStart + varCount + i;
+            if (!matchPattern(pat.get(patIdx), inp.get(inpIdx), literals, patVars, bindings)) return false;
+        }
+
+        return true;
+    }
+
+    private void collectTemplateRenames(SchemeValue template, Set<String> patternVars,
+                                         Map<String, String> renameMap,
+                                         Map<String, SchemeValue> preBindings,
+                                         Environment defEnv) {
+        if (template instanceof SchemeValue.SymbolVal s) {
+            String name = s.name();
+            if (patternVars.contains(name) || name.equals("...") || SPECIAL_FORMS.contains(name)
+                    || renameMap.containsKey(name)) {
+                return;
+            }
+            // Don't rename macros (needed for recursive macro calls)
+            try {
+                SchemeValue val = defEnv.get(name);
+                if (val instanceof SchemeValue.MacroVal) return;
+                String gensym = name + "__m" + (gensymCounter++);
+                renameMap.put(name, gensym);
+                preBindings.put(gensym, val);
+            } catch (EvalError e) {
+                // Not bound in defEnv - rename for hygiene (e.g. tmp in swap!)
+                String gensym = name + "__m" + (gensymCounter++);
+                renameMap.put(name, gensym);
+            }
+        } else if (template instanceof SchemeValue.ListVal l) {
+            for (var elem : l.elements()) {
+                collectTemplateRenames(elem, patternVars, renameMap, preBindings, defEnv);
+            }
+        }
+    }
+
+    private SchemeValue instantiateTemplate(SchemeValue template, Map<String, Object> bindings,
+                                             Map<String, String> renameMap) {
+        if (template instanceof SchemeValue.SymbolVal s) {
+            if (bindings.containsKey(s.name())) {
+                Object val = bindings.get(s.name());
+                if (val instanceof SchemeValue sv) return sv;
+                return template; // ellipsis var used without ..., shouldn't happen
+            }
+            if (renameMap.containsKey(s.name())) {
+                return new SchemeValue.SymbolVal(renameMap.get(s.name()));
+            }
+            return template;
+        }
+        if (template instanceof SchemeValue.ListVal tl) {
+            var result = new ArrayList<SchemeValue>();
+            var elems = tl.elements();
+            for (int i = 0; i < elems.size(); i++) {
+                if (i + 1 < elems.size() && elems.get(i + 1) instanceof SchemeValue.SymbolVal dots
+                        && dots.name().equals("...")) {
+                    var subTemplate = elems.get(i);
+                    var ellipsisVars = findEllipsisVars(subTemplate, bindings);
+                    if (!ellipsisVars.isEmpty()) {
+                        String firstVar = ellipsisVars.iterator().next();
+                        @SuppressWarnings("unchecked")
+                        var list = (List<SchemeValue>) bindings.get(firstVar);
+                        int count = list.size();
+                        for (int j = 0; j < count; j++) {
+                            var singleBindings = new HashMap<>(bindings);
+                            for (String var : ellipsisVars) {
+                                @SuppressWarnings("unchecked")
+                                var varList = (List<SchemeValue>) bindings.get(var);
+                                singleBindings.put(var, varList.get(j));
+                            }
+                            result.add(instantiateTemplate(subTemplate, singleBindings, renameMap));
+                        }
+                    }
+                    i++; // skip the ...
+                } else {
+                    result.add(instantiateTemplate(elems.get(i), bindings, renameMap));
+                }
+            }
+            return new SchemeValue.ListVal(result);
+        }
+        return template;
+    }
+
+    private Set<String> findEllipsisVars(SchemeValue template, Map<String, Object> bindings) {
+        var vars = new HashSet<String>();
+        findEllipsisVarsHelper(template, bindings, vars);
+        return vars;
+    }
+
+    private void findEllipsisVarsHelper(SchemeValue template, Map<String, Object> bindings, Set<String> vars) {
+        if (template instanceof SchemeValue.SymbolVal s) {
+            if (bindings.containsKey(s.name()) && bindings.get(s.name()) instanceof List) {
+                vars.add(s.name());
+            }
+        } else if (template instanceof SchemeValue.ListVal l) {
+            for (var elem : l.elements()) {
+                findEllipsisVarsHelper(elem, bindings, vars);
+            }
+        }
+    }
+
+    // ---- End macro support ----
 
     private SchemeValue applyProc(SchemeValue[] args) throws EvalError {
         if (args.length < 2) throw new EvalError("apply: expected at least 2 arguments");
