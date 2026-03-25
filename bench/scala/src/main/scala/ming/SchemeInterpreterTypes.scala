@@ -33,6 +33,21 @@ private[ming] trait SchemeInterpreterTypes:
     def apply(before: Value, after: Value, pos: SourcePos): DynamicWindFrame =
       new DynamicWindFrame(before, after, pos)
 
+  final class ExceptionHandlerFrame private[ming] (
+    val handler: Value,
+    val windStack: scala.collection.immutable.Vector[DynamicWindFrame],
+    val resume: Resume
+  )
+
+  object ExceptionHandlerFrame:
+
+    def apply(
+      handler: Value,
+      windStack: scala.collection.immutable.Vector[DynamicWindFrame],
+      resume: Resume
+    ): ExceptionHandlerFrame =
+      new ExceptionHandlerFrame(handler, windStack, resume)
+
   object EvalState:
 
     final case class EvaluateExpr(
@@ -46,6 +61,12 @@ private[ming] trait SchemeInterpreterTypes:
       expressions: List[Expr],
       env: Env,
       macros: MacroScope,
+      cont: Resume
+    ) extends EvalState
+
+    final case class PopExceptionHandler(
+      frame: ExceptionHandlerFrame,
+      value: Value,
       cont: Resume
     ) extends EvalState
 
@@ -149,19 +170,23 @@ private[ming] trait SchemeInterpreterTypes:
     case object ForEachProcedureBuiltin                                             extends Procedure
     case object CallWithCurrentContinuation                                         extends Procedure
     case object DynamicWindBuiltin                                                  extends Procedure
+    case object RaiseBuiltin                                                        extends Procedure
+    case object WithExceptionHandlerBuiltin                                         extends Procedure
 
     final class Continuation private[ming] (
       val resume: Resume,
-      val windStack: scala.collection.immutable.Vector[DynamicWindFrame]
+      val windStack: scala.collection.immutable.Vector[DynamicWindFrame],
+      val handlerStack: scala.collection.immutable.Vector[ExceptionHandlerFrame]
     ) extends Procedure
 
     object Continuation:
 
       def apply(
         resume: Resume,
-        windStack: scala.collection.immutable.Vector[DynamicWindFrame]
+        windStack: scala.collection.immutable.Vector[DynamicWindFrame],
+        handlerStack: scala.collection.immutable.Vector[ExceptionHandlerFrame]
       ): Continuation =
-        new Continuation(resume, windStack)
+        new Continuation(resume, windStack, handlerStack)
 
     final case class Closure(
       params: LambdaParams,

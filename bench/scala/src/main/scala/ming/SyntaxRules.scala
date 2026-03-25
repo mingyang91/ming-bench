@@ -13,6 +13,7 @@ private[ming] object SyntaxRules:
     "if",
     "let",
     "cond",
+    "guard",
     "quote",
     "lambda",
     "and",

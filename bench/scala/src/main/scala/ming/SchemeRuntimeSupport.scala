@@ -14,4 +14,6 @@ private[ming] object SchemeRuntimeSupport:
     env.define("call/cc", Value.CallWithCurrentContinuation)
     env.define("call-with-current-continuation", Value.CallWithCurrentContinuation)
     env.define("dynamic-wind", Value.DynamicWindBuiltin)
+    env.define("raise", Value.RaiseBuiltin)
+    env.define("with-exception-handler", Value.WithExceptionHandlerBuiltin)
     env

@@ -67,6 +67,9 @@ private[ming] object SchemeInterpreter extends SchemeInterpreterTypes:
           state = nextSequenceState(expressions, env, macros, cont)
         case EvalState.EvaluateExpr(expr, env, macros, cont) =>
           state = evalExprState(expr, env, macros, cont)
+        case EvalState.PopExceptionHandler(frame, value, cont) =>
+          currentRuntime.popExceptionHandler(frame)
+          state = cont(value)
 
     throw new IllegalStateException("unreachable")
 
@@ -113,95 +116,48 @@ private[ming] object SchemeInterpreter extends SchemeInterpreterTypes:
     items match
       case Nil =>
         throw EvalError.at(pos, "cannot evaluate empty list")
-      case Expr.Symbol("define-record-type", _) :: args =>
-        cont(SchemeRecords.evalDefineRecordType(args, env, pos))
-      case Expr.Symbol("define-syntax", _) :: args =>
-        SchemeInterpreterSpecialForms.evalDefineSyntaxState(args, env, macros, pos, cont)
-      case Expr.Symbol("define", _) :: args =>
-        SchemeInterpreterSpecialForms.evalDefineState(args, env, macros, pos, cont, evalExprState)
-      case Expr.Symbol("set!", _) :: args =>
-        SchemeInterpreterSpecialForms.evalSetState(args, env, macros, pos, cont, evalExprState)
-      case Expr.Symbol("begin", _) :: args =>
-        evalSequenceState(args, env, macros, cont)
-      case Expr.Symbol("if", _) :: args =>
-        SchemeInterpreterSpecialForms.evalIfState(args, env, macros, pos, cont, evalExprState)
-      case Expr.Symbol("let", _) :: args =>
-        SchemeInterpreterBindingForms.evalLetState(
-          args,
-          env,
-          macros,
-          pos,
-          cont,
-          evalExprState,
-          evalSequenceState,
-          applyProcedureState
-        )
-      case Expr.Symbol("let*", _) :: args =>
-        SchemeInterpreterBindingForms.evalLetStarState(
-          args,
-          env,
-          macros,
-          pos,
-          cont,
-          evalExprState,
-          evalSequenceState
-        )
-      case Expr.Symbol("letrec", _) :: args =>
-        SchemeInterpreterBindingForms.evalLetrecState(
-          args,
-          env,
-          macros,
-          pos,
-          cont,
-          evalExprState,
-          evalSequenceState
-        )
-      case Expr.Symbol("letrec*", _) :: args =>
-        SchemeInterpreterBindingForms.evalLetrecStarState(
-          args,
-          env,
-          macros,
-          pos,
-          cont,
-          evalExprState,
-          evalSequenceState
-        )
-      case Expr.Symbol("cond", _) :: args =>
-        SchemeInterpreterSpecialForms.evalCondState(
-          args,
-          env,
-          macros,
-          pos,
-          cont,
-          evalExprState,
-          evalSequenceState
-        )
-      case Expr.Symbol("case", _) :: args =>
-        SchemeInterpreterSpecialForms.evalCaseState(
-          args,
-          env,
-          macros,
-          pos,
-          cont,
-          evalExprState,
-          evalSequenceState
-        )
-      case Expr.Symbol("quote", _) :: args =>
-        SchemeInterpreterSpecialForms.evalQuoteState(args, pos, cont)
-      case Expr.Symbol("lambda", _) :: args =>
-        SchemeInterpreterSpecialForms.evalLambdaState(args, env, macros, pos, cont)
-      case Expr.Symbol("case-lambda", _) :: args =>
-        cont(SchemeProcedures.evalCaseLambda(args, env, macros, pos))
-      case Expr.Symbol("do", _) :: args =>
-        evalExprState(SchemeInterpreterDoSupport.expand(args, pos), env, macros, cont)
-      case Expr.Symbol("and", _) :: args =>
-        SchemeInterpreterSpecialForms.evalAndState(args, env, macros, cont, evalExprState)
-      case Expr.Symbol("or", _) :: args =>
-        SchemeInterpreterSpecialForms.evalOrState(args, env, macros, cont, evalExprState)
-      case (symbol @ Expr.Symbol(name, _)) :: args =>
-        evalMacroOrProcedureState(symbol, name, args, items, env, macros, pos, cont)
       case head :: args =>
+        evalNonEmptyListExpr(head, args, items, env, macros, pos, cont)
+
+  private def evalNonEmptyListExpr(
+    head: Expr,
+    args: List[Expr],
+    items: List[Expr],
+    env: Env,
+    macros: MacroScope,
+    pos: SourcePos,
+    cont: Resume
+  ): EvalState =
+    head match
+      case symbol: Expr.Symbol =>
+        evalSymbolListExpr(symbol, args, items, env, macros, pos, cont)
+      case _ =>
         evalProcedureCallState(head, args, env, macros, pos, cont)
+
+  private def evalSymbolListExpr(
+    symbol: Expr.Symbol,
+    args: List[Expr],
+    items: List[Expr],
+    env: Env,
+    macros: MacroScope,
+    pos: SourcePos,
+    cont: Resume
+  ): EvalState =
+    SchemeInterpreterListDispatch.evalNamedFormState(
+      symbol.name,
+      args,
+      env,
+      macros,
+      pos,
+      cont,
+      evalExprState,
+      evalSequenceState,
+      applyProcedureState
+    ) match
+      case Some(state) =>
+        state
+      case None =>
+        evalMacroOrProcedureState(symbol, symbol.name, args, items, env, macros, pos, cont)
 
   private def evalMacroOrProcedureState(
     symbol: Expr.Symbol,

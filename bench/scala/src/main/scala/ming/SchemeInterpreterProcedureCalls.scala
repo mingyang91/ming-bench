@@ -69,6 +69,23 @@ private[ming] object SchemeInterpreterProcedureCalls:
           (procedure, callArgs, callPos, callCont) =>
             applyProcedureState(procedure, callArgs, callPos, callCont, evalSequenceState)
         )
+      case Value.RaiseBuiltin =>
+        SchemeExceptions.raiseState(
+          args,
+          pos,
+          runtime,
+          (procedure, callArgs, callPos, callCont) =>
+            applyProcedureState(procedure, callArgs, callPos, callCont, evalSequenceState)
+        )
+      case Value.WithExceptionHandlerBuiltin =>
+        SchemeExceptions.withExceptionHandlerState(
+          args,
+          pos,
+          cont,
+          runtime,
+          (procedure, callArgs, callPos, callCont) =>
+            applyProcedureState(procedure, callArgs, callPos, callCont, evalSequenceState)
+        )
       case Value.CallWithCurrentContinuation =>
         requireExactly("call/cc", args, expected = 1, pos)
         args match

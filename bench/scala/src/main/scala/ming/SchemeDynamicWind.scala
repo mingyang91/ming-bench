@@ -38,7 +38,7 @@ private[ming] object SchemeDynamicWind:
         throw new IllegalStateException("unreachable")
 
   def captureContinuation(cont: Resume, runtime: Runtime): Value.Continuation =
-    Value.Continuation(cont, runtime.windStack)
+    Value.Continuation(cont, runtime.windStack, runtime.handlerStack)
 
   def resumeContinuationState(
     continuation: Value.Continuation,
@@ -46,8 +46,22 @@ private[ming] object SchemeDynamicWind:
     runtime: Runtime,
     applyProcedureState: ApplyProcedureState
   ): EvalState =
+    transitionToState(
+      continuation.windStack,
+      runtime,
+      applyProcedureState, {
+        runtime.setHandlerStack(continuation.handlerStack)
+        continuation.resume(argument)
+      }
+    )
+
+  def transitionToState(
+    target: IVector[DynamicWindFrame],
+    runtime: Runtime,
+    applyProcedureState: ApplyProcedureState,
+    next: => EvalState
+  ): EvalState =
     val current = runtime.windStack
-    val target  = continuation.windStack
     val common  = commonPrefixLength(current, target)
     val exits   = current.drop(common).reverse.toList
     val enters  = target.drop(common).toList
@@ -61,7 +75,7 @@ private[ming] object SchemeDynamicWind:
         runtime,
         applyProcedureState, {
           runtime.setWindStack(target)
-          continuation.resume(argument)
+          next
         }
       )
     )

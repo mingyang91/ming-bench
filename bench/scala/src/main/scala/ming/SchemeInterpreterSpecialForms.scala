@@ -130,6 +130,16 @@ private[ming] object SchemeInterpreterSpecialForms:
       case _ =>
         throw EvalError.at(pos, "invalid cond clause")
 
+  def evalGuardState(
+    args: List[Expr],
+    env: Env,
+    macros: MacroScope,
+    pos: SourcePos,
+    cont: Resume,
+    evalExprState: EvalExprState
+  ): EvalState =
+    evalExprState(expandGuard(args, pos), env, macros, cont)
+
   def evalCaseState(
     args: List[Expr],
     env: Env,
@@ -211,6 +221,50 @@ private[ming] object SchemeInterpreterSpecialForms:
         else evalCaseClausesState(key, rest, env, macros, pos, cont, evalSequenceState)
       case _ =>
         throw EvalError.at(pos, "invalid case clause")
+
+  private def expandGuard(args: List[Expr], pos: SourcePos): Expr =
+    args match
+      case Expr.ListExpr(Expr.Symbol(name, namePos) :: clauses, _) :: body if body.nonEmpty =>
+        val reRaiseClause =
+          Expr.ListExpr(
+            List(
+              Expr.Symbol("else", pos),
+              Expr.ListExpr(
+                List(Expr.Symbol("raise", pos), Expr.Symbol(name, namePos)),
+                pos
+              )
+            ),
+            pos
+          )
+        val condClauses =
+          if containsElseClause(clauses) then clauses
+          else clauses :+ reRaiseClause
+        val handler =
+          Expr.ListExpr(
+            List(
+              Expr.Symbol("lambda", pos),
+              Expr.ListExpr(List(Expr.Symbol(name, namePos)), pos),
+              Expr.ListExpr(Expr.Symbol("cond", pos) :: condClauses, pos)
+            ),
+            pos
+          )
+        val thunk =
+          Expr.ListExpr(
+            Expr.Symbol("lambda", pos) :: Expr.ListExpr(Nil, pos) :: body,
+            pos
+          )
+        Expr.ListExpr(
+          List(Expr.Symbol("with-exception-handler", pos), handler, thunk),
+          pos
+        )
+      case _ =>
+        throw EvalError.at(pos, "invalid guard")
+
+  private def containsElseClause(clauses: List[Expr]): Boolean =
+    clauses.exists {
+      case Expr.ListExpr(Expr.Symbol("else", _) :: _, _) => true
+      case _                                             => false
+    }
 
   private def shortCircuitState(
     expressions: List[Expr],
