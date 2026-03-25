@@ -138,9 +138,12 @@ func baseEnv(ctx *evalContext) *environment {
 		return isStringValue(v)
 	}))
 	env.define("number?", builtinPredicate(func(v value) bool {
-		_, ok := v.(integerValue)
-		return ok
+		return isNumberValue(v)
 	}))
+	env.define("integer?", builtinPredicate(isIntegerNumber))
+	env.define("rational?", builtinPredicate(isRationalNumber))
+	env.define("exact?", builtinPredicate(isExactNumber))
+	env.define("inexact?", builtinPredicate(isInexactNumber))
 	env.define("boolean?", builtinPredicate(func(v value) bool {
 		_, ok := v.(booleanValue)
 		return ok
@@ -164,6 +167,10 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("substring", builtinSubstring())
 	env.define("string->number", builtinStringToNumber())
 	env.define("number->string", builtinNumberToString())
+	env.define("exact->inexact", builtinExactToInexact())
+	env.define("inexact->exact", builtinInexactToExact())
+	env.define("numerator", builtinNumerator())
+	env.define("denominator", builtinDenominator())
 	env.define("symbol->string", builtinSymbolToString())
 	env.define("string->symbol", builtinStringToSymbol())
 	env.define("string-ref", builtinStringRef())
@@ -230,7 +237,7 @@ func eval(expr node, env *environment) (value, error) {
 
 	expr = expanded
 	switch expr := expr.(type) {
-	case integerValue, booleanValue, stringValue, charValue:
+	case integerValue, rationalValue, inexactValue, booleanValue, stringValue, charValue:
 		return expr, nil
 	case symbolNode:
 		if expr.captured != nil {
@@ -652,23 +659,23 @@ func builtinNumericFold(name string) builtinProc {
 			}
 		}
 
-		total := 0
+		total := exactNumericValue(0, 1)
 		if name == "*" {
-			total = 1
+			total = exactNumericValue(1, 1)
 		}
 
 		for _, arg := range args {
-			current, err := expectIntegerValue(arg)
+			current, err := expectNumberValue(arg)
 			if err != nil {
 				return nil, err
 			}
 			if name == "+" {
-				total += current
+				total = addNumeric(total, current)
 			} else {
-				total *= current
+				total = mulNumeric(total, current)
 			}
 		}
-		return integerValue(total), nil
+		return total.toValue(), nil
 	}
 }
 
@@ -678,23 +685,23 @@ func builtinSub() builtinProc {
 			return nil, &EvalError{Message: "- expects at least 1 argument"}
 		}
 
-		first, err := expectIntegerValue(args[0])
+		first, err := expectNumberValue(args[0])
 		if err != nil {
 			return nil, err
 		}
 		if len(args) == 1 {
-			return integerValue(-first), nil
+			return subNumeric(exactNumericValue(0, 1), first).toValue(), nil
 		}
 
 		total := first
 		for _, arg := range args[1:] {
-			current, err := expectIntegerValue(arg)
+			current, err := expectNumberValue(arg)
 			if err != nil {
 				return nil, err
 			}
-			total -= current
+			total = subNumeric(total, current)
 		}
-		return integerValue(total), nil
+		return total.toValue(), nil
 	}
 }
 
@@ -704,22 +711,22 @@ func builtinDiv() builtinProc {
 			return nil, &EvalError{Message: "/ expects at least 2 arguments"}
 		}
 
-		total, err := expectIntegerValue(args[0])
+		total, err := expectNumberValue(args[0])
 		if err != nil {
 			return nil, err
 		}
 
 		for _, arg := range args[1:] {
-			current, err := expectIntegerValue(arg)
+			current, err := expectNumberValue(arg)
 			if err != nil {
 				return nil, err
 			}
-			if current == 0 {
-				return nil, &EvalError{Message: "division by zero"}
+			total, err = divNumeric(total, current)
+			if err != nil {
+				return nil, err
 			}
-			total /= current
 		}
-		return integerValue(total), nil
+		return total.toValue(), nil
 	}
 }
 
@@ -729,28 +736,19 @@ func builtinCompare(name string) builtinProc {
 			return nil, &EvalError{Message: fmt.Sprintf("%s expects at least 2 arguments", name)}
 		}
 
-		prev, err := expectIntegerValue(args[0])
+		prev, err := expectNumberValue(args[0])
 		if err != nil {
 			return nil, err
 		}
 
 		for _, arg := range args[1:] {
-			current, err := expectIntegerValue(arg)
+			current, err := expectNumberValue(arg)
 			if err != nil {
 				return nil, err
 			}
 
-			var ok bool
-			switch name {
-			case "<":
-				ok = prev < current
-			case ">":
-				ok = prev > current
-			case "=":
-				ok = prev == current
-			case "<=":
-				ok = prev <= current
-			default:
+			ok := compareNumeric(prev, current, name)
+			if name != "<" && name != ">" && name != "=" && name != "<=" {
 				return nil, &EvalError{Message: "unknown comparison"}
 			}
 			if !ok {
@@ -1102,6 +1100,52 @@ func builtinIntegerPredicate(check func(int) bool) builtinProc {
 	}
 }
 
+func builtinExactToInexact() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "exact->inexact expects exactly 1 argument"}
+		}
+		return exactToInexact(args[0])
+	}
+}
+
+func builtinInexactToExact() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "inexact->exact expects exactly 1 argument"}
+		}
+		return inexactToExact(args[0])
+	}
+}
+
+func builtinNumerator() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "numerator expects exactly 1 argument"}
+		}
+
+		numerator, _, err := rationalParts(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return integerValue(numerator), nil
+	}
+}
+
+func builtinDenominator() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "denominator expects exactly 1 argument"}
+		}
+
+		_, denominator, err := rationalParts(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return integerValue(denominator), nil
+	}
+}
+
 func builtinListRef() builtinProc {
 	return func(args []value) (value, error) {
 		if len(args) != 2 {
@@ -1264,11 +1308,11 @@ func builtinStringToNumber() builtinProc {
 			return nil, err
 		}
 
-		n, parseErr := strconv.Atoi(str)
-		if parseErr != nil {
+		number, ok, parseErr := parseNumericToken(str)
+		if parseErr != nil || !ok {
 			return booleanValue(false), nil
 		}
-		return integerValue(n), nil
+		return number, nil
 	}
 }
 
@@ -1278,11 +1322,11 @@ func builtinNumberToString() builtinProc {
 			return nil, &EvalError{Message: "number->string expects exactly 1 argument"}
 		}
 
-		n, err := expectIntegerValue(args[0])
-		if err != nil {
-			return nil, err
+		formatted, ok := formatNumberValue(args[0])
+		if !ok {
+			return nil, &EvalError{Message: "expected number"}
 		}
-		return stringValue(strconv.Itoa(n)), nil
+		return stringValue(formatted), nil
 	}
 }
 
@@ -1530,11 +1574,15 @@ func builtinCharCompare(name string) builtinProc {
 }
 
 func expectIntegerValue(v value) (int, error) {
-	n, ok := v.(integerValue)
-	if !ok {
-		return 0, &EvalError{Message: "expected integer"}
+	switch v := v.(type) {
+	case integerValue:
+		return int(v), nil
+	case rationalValue:
+		if v.denominator == 1 {
+			return v.numerator, nil
+		}
 	}
-	return int(n), nil
+	return 0, &EvalError{Message: "expected integer"}
 }
 
 func expectStringValue(v value) (string, error) {
@@ -1622,7 +1670,7 @@ func copyRunes(runes []rune) []rune {
 
 func datumFromNode(expr node) (value, error) {
 	switch expr := expr.(type) {
-	case integerValue, booleanValue, stringValue, charValue:
+	case integerValue, rationalValue, inexactValue, booleanValue, stringValue, charValue:
 		return expr, nil
 	case symbolNode:
 		return symbolValue(expr.name), nil
@@ -1642,9 +1690,11 @@ func datumFromNode(expr node) (value, error) {
 }
 
 func formatValue(v value) (string, error) {
+	if formatted, ok := formatNumberValue(v); ok {
+		return formatted, nil
+	}
+
 	switch v := v.(type) {
-	case integerValue:
-		return strconv.Itoa(int(v)), nil
 	case booleanValue:
 		if v {
 			return "#t", nil
@@ -1811,8 +1861,38 @@ func assocKey(v value) (value, bool) {
 func eqValues(left, right value) bool {
 	switch left := left.(type) {
 	case integerValue:
-		right, ok := right.(integerValue)
-		return ok && left == right
+		switch right := right.(type) {
+		case integerValue:
+			return left == right
+		case rationalValue:
+			return right.denominator == 1 && int(left) == right.numerator
+		case inexactValue:
+			return float64(left) == float64(right)
+		default:
+			return false
+		}
+	case rationalValue:
+		switch right := right.(type) {
+		case integerValue:
+			return left.denominator == 1 && left.numerator == int(right)
+		case rationalValue:
+			return left.numerator == right.numerator && left.denominator == right.denominator
+		case inexactValue:
+			return float64(left.numerator)/float64(left.denominator) == float64(right)
+		default:
+			return false
+		}
+	case inexactValue:
+		switch right := right.(type) {
+		case integerValue:
+			return float64(left) == float64(right)
+		case rationalValue:
+			return float64(left) == float64(right.numerator)/float64(right.denominator)
+		case inexactValue:
+			return left == right
+		default:
+			return false
+		}
 	case booleanValue:
 		right, ok := right.(booleanValue)
 		return ok && left == right
@@ -1848,8 +1928,38 @@ func eqValues(left, right value) bool {
 func equalValues(left, right value) bool {
 	switch left := left.(type) {
 	case integerValue:
-		right, ok := right.(integerValue)
-		return ok && left == right
+		switch right := right.(type) {
+		case integerValue:
+			return left == right
+		case rationalValue:
+			return right.denominator == 1 && int(left) == right.numerator
+		case inexactValue:
+			return float64(left) == float64(right)
+		default:
+			return false
+		}
+	case rationalValue:
+		switch right := right.(type) {
+		case integerValue:
+			return left.denominator == 1 && left.numerator == int(right)
+		case rationalValue:
+			return left.numerator == right.numerator && left.denominator == right.denominator
+		case inexactValue:
+			return float64(left.numerator)/float64(left.denominator) == float64(right)
+		default:
+			return false
+		}
+	case inexactValue:
+		switch right := right.(type) {
+		case integerValue:
+			return float64(left) == float64(right)
+		case rationalValue:
+			return float64(left) == float64(right.numerator)/float64(right.denominator)
+		case inexactValue:
+			return left == right
+		default:
+			return false
+		}
 	case booleanValue:
 		right, ok := right.(booleanValue)
 		return ok && left == right
@@ -2040,12 +2150,10 @@ func (p *parser) parseAtom() (node, error) {
 		return parseCharLiteral(token, pos)
 	}
 
-	if isIntegerLiteral(token) {
-		n, err := strconv.Atoi(token)
-		if err != nil {
-			return nil, errorAt(pos, "invalid integer: %s", token)
-		}
-		return integerValue(n), nil
+	if number, ok, err := parseNumericToken(token); err != nil {
+		return nil, errorAt(pos, err.Error())
+	} else if ok {
+		return number, nil
 	}
 
 	return symbolNode{name: token, pos: pos}, nil
