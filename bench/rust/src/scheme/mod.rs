@@ -2,7 +2,13 @@ pub mod error;
 
 pub use error::{EvalError, SourcePos};
 
-use std::{cell::RefCell, collections::HashMap, fmt, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    fmt,
+    rc::Rc,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 const BUILTIN_NAMES: &[&str] = &[
     "abs",
@@ -73,6 +79,8 @@ const BUILTIN_NAMES: &[&str] = &[
     "write",
     "zero?",
 ];
+
+static GENERATED_SYMBOL_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
@@ -149,6 +157,96 @@ impl Expr {
 
 type EnvRef = Rc<RefCell<Environment>>;
 type BindingRef = Rc<RefCell<Value>>;
+type MacroRef = Rc<SyntaxRulesMacro>;
+
+#[derive(Clone)]
+struct MacroRule {
+    pattern: Expr,
+    template: Expr,
+}
+
+#[derive(Clone)]
+struct SyntaxRulesMacro {
+    name: String,
+    literals: HashSet<String>,
+    rules: Vec<MacroRule>,
+    env: EnvRef,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum PatternBinding {
+    One(Expr),
+    Many(Vec<PatternBinding>),
+}
+
+type PatternBindings = HashMap<String, PatternBinding>;
+
+struct ExpandedExpr {
+    expr: Expr,
+    env: EnvRef,
+}
+
+#[derive(Default)]
+struct ExpansionState {
+    bound_scopes: Vec<HashMap<String, String>>,
+    free_aliases: HashMap<String, String>,
+    binding_aliases: Vec<(String, BindingRef)>,
+    macro_aliases: Vec<(String, MacroRef)>,
+}
+
+impl ExpansionState {
+    fn lookup_bound_name(&self, name: &str) -> Option<&str> {
+        self.bound_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).map(String::as_str))
+    }
+
+    fn push_scope(&mut self, scope: HashMap<String, String>) {
+        self.bound_scopes.push(scope);
+    }
+
+    fn pop_scope(&mut self) {
+        self.bound_scopes.pop();
+    }
+
+    fn alias_for(&mut self, name: &str, definition_env: &EnvRef) -> String {
+        if let Some(existing) = self.free_aliases.get(name) {
+            return existing.clone();
+        }
+
+        let alias = fresh_generated_symbol("ref");
+
+        if let Some(binding) = Environment::lookup_binding(definition_env, name) {
+            self.binding_aliases.push((alias.clone(), binding));
+        }
+
+        if let Some(transformer) = Environment::lookup_macro(definition_env, name) {
+            self.macro_aliases.push((alias.clone(), transformer));
+        }
+
+        self.free_aliases.insert(name.to_string(), alias.clone());
+        alias
+    }
+
+    fn build_env(self, parent: EnvRef) -> EnvRef {
+        if self.binding_aliases.is_empty() && self.macro_aliases.is_empty() {
+            return parent;
+        }
+
+        let env = Environment::child(parent);
+
+        for (name, binding) in self.binding_aliases {
+            Environment::define_existing(&env, name, binding);
+        }
+
+        for (name, transformer) in self.macro_aliases {
+            Environment::define_macro(&env, name, transformer);
+        }
+
+        env
+    }
+}
 
 #[derive(Clone)]
 struct UserProcedure {
@@ -169,6 +267,7 @@ impl UserProcedure {
 struct Environment {
     parent: Option<EnvRef>,
     bindings: HashMap<String, BindingRef>,
+    macros: HashMap<String, MacroRef>,
     output: Rc<RefCell<String>>,
 }
 
@@ -177,6 +276,7 @@ impl Environment {
         let env = Rc::new(RefCell::new(Self {
             parent: None,
             bindings: HashMap::new(),
+            macros: HashMap::new(),
             output: Rc::new(RefCell::new(String::new())),
         }));
 
@@ -192,14 +292,21 @@ impl Environment {
         Rc::new(RefCell::new(Self {
             parent: Some(parent),
             bindings: HashMap::new(),
+            macros: HashMap::new(),
             output,
         }))
     }
 
     fn define(env: &EnvRef, name: String, value: Value) {
-        env.borrow_mut()
-            .bindings
-            .insert(name, Rc::new(RefCell::new(value)));
+        Self::define_existing(env, name, Rc::new(RefCell::new(value)));
+    }
+
+    fn define_existing(env: &EnvRef, name: String, binding: BindingRef) {
+        env.borrow_mut().bindings.insert(name, binding);
+    }
+
+    fn define_macro(env: &EnvRef, name: String, transformer: MacroRef) {
+        env.borrow_mut().macros.insert(name, transformer);
     }
 
     fn lookup_binding(env: &EnvRef, name: &str) -> Option<BindingRef> {
@@ -213,6 +320,15 @@ impl Environment {
 
     fn lookup(env: &EnvRef, name: &str) -> Option<Value> {
         Self::lookup_binding(env, name).map(|binding| binding.borrow().clone())
+    }
+
+    fn lookup_macro(env: &EnvRef, name: &str) -> Option<MacroRef> {
+        let (transformer, parent) = {
+            let env = env.borrow();
+            (env.macros.get(name).cloned(), env.parent.clone())
+        };
+
+        transformer.or_else(|| parent.and_then(|parent| Self::lookup_macro(&parent, name)))
     }
 
     fn append_output(env: &EnvRef, text: &str) {
@@ -526,23 +642,63 @@ fn eval_list(items: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, 
         return Err(EvalError::syntax("cannot evaluate empty list", position));
     };
 
-    match &head.kind {
-        ExprKind::Symbol(name) if name == "define" => eval_define(tail, env, head.pos),
-        ExprKind::Symbol(name) if name == "set!" => eval_set(tail, env, head.pos),
-        ExprKind::Symbol(name) if name == "if" => eval_if(tail, env, head.pos),
-        ExprKind::Symbol(name) if name == "quote" => eval_quote(tail, head.pos),
-        ExprKind::Symbol(name) if name == "lambda" => eval_lambda(tail, env, head.pos),
-        ExprKind::Symbol(name) if name == "and" => eval_and(tail, env),
-        ExprKind::Symbol(name) if name == "or" => eval_or(tail, env),
-        ExprKind::Symbol(name) if name == "begin" => eval_begin(tail, env),
-        ExprKind::Symbol(name) if name == "cond" => eval_cond(tail, env, head.pos),
-        ExprKind::Symbol(name) if name == "let" => eval_let(tail, env, head.pos),
-        _ => {
-            let callable = eval(head, env.clone())?;
-            let args = eval_all(tail, env.clone())?;
-            apply(callable, head.pos, args, env)
+    if let ExprKind::Symbol(name) = &head.kind {
+        if name == "define-syntax" {
+            return eval_define_syntax(tail, env, head.pos);
         }
+
+        if let Some(transformer) = Environment::lookup_macro(&env, name) {
+            let expanded = expand_macro_call(transformer, items, env.clone(), position)?;
+            return eval(&expanded.expr, expanded.env);
+        }
+
+        return match name.as_str() {
+            "define" => eval_define(tail, env, head.pos),
+            "set!" => eval_set(tail, env, head.pos),
+            "if" => eval_if(tail, env, head.pos),
+            "quote" => eval_quote(tail, head.pos),
+            "lambda" => eval_lambda(tail, env, head.pos),
+            "and" => eval_and(tail, env),
+            "or" => eval_or(tail, env),
+            "begin" => eval_begin(tail, env),
+            "cond" => eval_cond(tail, env, head.pos),
+            "let" => eval_let(tail, env, head.pos),
+            _ => {
+                let callable = eval(head, env.clone())?;
+                let args = eval_all(tail, env.clone())?;
+                apply(callable, head.pos, args, env)
+            }
+        };
     }
+
+    let callable = eval(head, env.clone())?;
+    let args = eval_all(tail, env.clone())?;
+    apply(callable, head.pos, args, env)
+}
+
+fn eval_define_syntax(
+    exprs: &[Expr],
+    env: EnvRef,
+    position: SourcePos,
+) -> Result<Value, EvalError> {
+    let [name_expr, transformer_expr] = exprs else {
+        return Err(EvalError::syntax(
+            "define-syntax requires exactly 2 expressions",
+            position,
+        ));
+    };
+
+    let ExprKind::Symbol(name) = &name_expr.kind else {
+        return Err(EvalError::syntax(
+            "define-syntax name must be a symbol",
+            name_expr.pos,
+        ));
+    };
+
+    let transformer =
+        parse_syntax_rules(name, transformer_expr, env.clone(), transformer_expr.pos)?;
+    Environment::define_macro(&env, name.clone(), transformer);
+    Ok(Value::Void)
 }
 
 fn eval_all(exprs: &[Expr], env: EnvRef) -> Result<Vec<LocatedValue>, EvalError> {
@@ -2036,6 +2192,881 @@ fn expect_proper_list<'a>(arg: &'a LocatedValue) -> Result<&'a [Value], EvalErro
     };
 
     Ok(values)
+}
+
+fn fresh_generated_symbol(kind: &str) -> String {
+    let next = GENERATED_SYMBOL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("__macro_{kind}_{next}")
+}
+
+fn is_core_syntax_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "and"
+            | "begin"
+            | "cond"
+            | "define"
+            | "define-syntax"
+            | "if"
+            | "lambda"
+            | "let"
+            | "or"
+            | "quote"
+            | "set!"
+            | "syntax-rules"
+    )
+}
+
+fn is_ellipsis_expr(expr: &Expr) -> bool {
+    matches!(&expr.kind, ExprKind::Symbol(name) if name == "...")
+}
+
+fn is_pattern_variable(name: &str, literals: &HashSet<String>, macro_name: &str) -> bool {
+    name != "..." && name != "_" && name != macro_name && !literals.contains(name)
+}
+
+fn parse_syntax_rules(
+    macro_name: &str,
+    expr: &Expr,
+    env: EnvRef,
+    position: SourcePos,
+) -> Result<MacroRef, EvalError> {
+    let ExprKind::List(items) = &expr.kind else {
+        return Err(EvalError::syntax(
+            "define-syntax requires a syntax-rules transformer",
+            position,
+        ));
+    };
+
+    let Some((head, tail)) = items.split_first() else {
+        return Err(EvalError::syntax(
+            "syntax-rules requires a literals list and at least 1 rule",
+            position,
+        ));
+    };
+
+    match &head.kind {
+        ExprKind::Symbol(name) if name == "syntax-rules" => {}
+        _ => {
+            return Err(EvalError::syntax(
+                "define-syntax only supports syntax-rules",
+                head.pos,
+            ));
+        }
+    }
+
+    let Some((literals_expr, rules_exprs)) = tail.split_first() else {
+        return Err(EvalError::syntax(
+            "syntax-rules requires a literals list and at least 1 rule",
+            position,
+        ));
+    };
+
+    if rules_exprs.is_empty() {
+        return Err(EvalError::syntax(
+            "syntax-rules requires at least 1 rule",
+            position,
+        ));
+    }
+
+    let literals = parse_syntax_rule_literals(literals_expr)?;
+    let mut rules = Vec::with_capacity(rules_exprs.len());
+
+    for rule_expr in rules_exprs {
+        let ExprKind::List(rule_items) = &rule_expr.kind else {
+            return Err(EvalError::syntax(
+                "syntax-rules clauses must be lists",
+                rule_expr.pos,
+            ));
+        };
+
+        let [pattern, template] = rule_items.as_slice() else {
+            return Err(EvalError::syntax(
+                "syntax-rules clauses must contain a pattern and template",
+                rule_expr.pos,
+            ));
+        };
+
+        rules.push(MacroRule {
+            pattern: pattern.clone(),
+            template: template.clone(),
+        });
+    }
+
+    Ok(Rc::new(SyntaxRulesMacro {
+        name: macro_name.to_string(),
+        literals,
+        rules,
+        env,
+    }))
+}
+
+fn parse_syntax_rule_literals(expr: &Expr) -> Result<HashSet<String>, EvalError> {
+    let ExprKind::List(items) = &expr.kind else {
+        return Err(EvalError::syntax(
+            "syntax-rules literals must be a list",
+            expr.pos,
+        ));
+    };
+
+    let mut literals = HashSet::with_capacity(items.len());
+    for item in items {
+        let ExprKind::Symbol(name) = &item.kind else {
+            return Err(EvalError::syntax(
+                "syntax-rules literals must be identifiers",
+                item.pos,
+            ));
+        };
+
+        if name == "..." {
+            return Err(EvalError::syntax(
+                "syntax-rules literal cannot be '...'",
+                item.pos,
+            ));
+        }
+
+        literals.insert(name.clone());
+    }
+
+    Ok(literals)
+}
+
+fn expand_macro_call(
+    transformer: MacroRef,
+    invocation_items: &[Expr],
+    env: EnvRef,
+    position: SourcePos,
+) -> Result<ExpandedExpr, EvalError> {
+    let invocation = Expr::list(invocation_items.to_vec(), position);
+
+    for rule in &transformer.rules {
+        let Some(bindings) =
+            match_macro_rule(rule, &invocation, &transformer.literals, &transformer.name)
+        else {
+            continue;
+        };
+
+        let mut state = ExpansionState::default();
+        let expr = expand_template(
+            &rule.template,
+            &bindings,
+            &transformer,
+            &mut state,
+            &[],
+            false,
+        )?;
+        let env = state.build_env(env);
+        return Ok(ExpandedExpr { expr, env });
+    }
+
+    Err(EvalError::syntax(
+        format!("no matching syntax-rules clause for {}", transformer.name),
+        position,
+    ))
+}
+
+fn match_macro_rule(
+    rule: &MacroRule,
+    invocation: &Expr,
+    literals: &HashSet<String>,
+    macro_name: &str,
+) -> Option<PatternBindings> {
+    let (ExprKind::List(pattern_items), ExprKind::List(invocation_items)) =
+        (&rule.pattern.kind, &invocation.kind)
+    else {
+        return match_pattern(&rule.pattern, invocation, literals, macro_name);
+    };
+
+    let Some((pattern_head, pattern_tail)) = pattern_items.split_first() else {
+        return None;
+    };
+    let Some((_invocation_head, invocation_tail)) = invocation_items.split_first() else {
+        return None;
+    };
+
+    matches!(&pattern_head.kind, ExprKind::Symbol(name) if name == macro_name)
+        .then_some(())
+        .and_then(|_| match_pattern_list(pattern_tail, invocation_tail, literals, macro_name))
+}
+
+fn match_pattern(
+    pattern: &Expr,
+    input: &Expr,
+    literals: &HashSet<String>,
+    macro_name: &str,
+) -> Option<PatternBindings> {
+    match (&pattern.kind, &input.kind) {
+        (ExprKind::Integer(left), ExprKind::Integer(right)) if left == right => {
+            Some(HashMap::new())
+        }
+        (ExprKind::Bool(left), ExprKind::Bool(right)) if left == right => Some(HashMap::new()),
+        (ExprKind::Char(left), ExprKind::Char(right)) if left == right => Some(HashMap::new()),
+        (ExprKind::String(left), ExprKind::String(right)) if left == right => Some(HashMap::new()),
+        (ExprKind::List(pattern_items), ExprKind::List(input_items)) => {
+            match_pattern_list(pattern_items, input_items, literals, macro_name)
+        }
+        (ExprKind::Symbol(name), _) if name == "_" => Some(HashMap::new()),
+        (ExprKind::Symbol(name), ExprKind::Symbol(input_name))
+            if !is_pattern_variable(name, literals, macro_name) =>
+        {
+            (name == input_name).then(HashMap::new)
+        }
+        (ExprKind::Symbol(name), _) if is_pattern_variable(name, literals, macro_name) => Some(
+            HashMap::from([(name.clone(), PatternBinding::One(input.clone()))]),
+        ),
+        _ => None,
+    }
+}
+
+fn match_pattern_list(
+    patterns: &[Expr],
+    inputs: &[Expr],
+    literals: &HashSet<String>,
+    macro_name: &str,
+) -> Option<PatternBindings> {
+    if patterns.is_empty() {
+        return inputs.is_empty().then(HashMap::new);
+    }
+
+    if patterns.len() >= 2 && is_ellipsis_expr(&patterns[1]) {
+        let repeated_pattern = &patterns[0];
+        let suffix = &patterns[2..];
+        let min_suffix = minimum_pattern_items(suffix);
+
+        if inputs.len() < min_suffix {
+            return None;
+        }
+
+        let mut repeated_vars = HashSet::new();
+        collect_pattern_variables(repeated_pattern, literals, macro_name, &mut repeated_vars);
+
+        let max_repetitions = inputs.len() - min_suffix;
+        for repeat_count in 0..=max_repetitions {
+            let mut repetition_bindings = Vec::with_capacity(repeat_count);
+            let mut matched = true;
+
+            for input in &inputs[..repeat_count] {
+                let Some(bindings) = match_pattern(repeated_pattern, input, literals, macro_name)
+                else {
+                    matched = false;
+                    break;
+                };
+                repetition_bindings.push(bindings);
+            }
+
+            if !matched {
+                continue;
+            }
+
+            let Some(repeated_bindings) =
+                collect_repeated_bindings(&repeated_vars, &repetition_bindings)
+            else {
+                continue;
+            };
+            let Some(suffix_bindings) =
+                match_pattern_list(suffix, &inputs[repeat_count..], literals, macro_name)
+            else {
+                continue;
+            };
+
+            if let Some(merged) = merge_pattern_bindings(repeated_bindings, suffix_bindings) {
+                return Some(merged);
+            }
+        }
+
+        return None;
+    }
+
+    let Some((first_input, rest_inputs)) = inputs.split_first() else {
+        return None;
+    };
+
+    let first_bindings = match_pattern(&patterns[0], first_input, literals, macro_name)?;
+    let rest_bindings = match_pattern_list(&patterns[1..], rest_inputs, literals, macro_name)?;
+    merge_pattern_bindings(first_bindings, rest_bindings)
+}
+
+fn minimum_pattern_items(patterns: &[Expr]) -> usize {
+    let mut required = 0;
+    let mut index = 0;
+
+    while index < patterns.len() {
+        if index + 1 < patterns.len() && is_ellipsis_expr(&patterns[index + 1]) {
+            index += 2;
+        } else {
+            required += 1;
+            index += 1;
+        }
+    }
+
+    required
+}
+
+fn collect_pattern_variables(
+    pattern: &Expr,
+    literals: &HashSet<String>,
+    macro_name: &str,
+    vars: &mut HashSet<String>,
+) {
+    match &pattern.kind {
+        ExprKind::Symbol(name) if is_pattern_variable(name, literals, macro_name) => {
+            vars.insert(name.clone());
+        }
+        ExprKind::List(items) => {
+            let mut index = 0;
+            while index < items.len() {
+                if index + 1 < items.len() && is_ellipsis_expr(&items[index + 1]) {
+                    collect_pattern_variables(&items[index], literals, macro_name, vars);
+                    index += 2;
+                } else {
+                    collect_pattern_variables(&items[index], literals, macro_name, vars);
+                    index += 1;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_repeated_bindings(
+    repeated_vars: &HashSet<String>,
+    repetitions: &[PatternBindings],
+) -> Option<PatternBindings> {
+    let mut bindings = HashMap::with_capacity(repeated_vars.len());
+
+    for var in repeated_vars {
+        let mut values = Vec::with_capacity(repetitions.len());
+
+        for repetition in repetitions {
+            values.push(repetition.get(var)?.clone());
+        }
+
+        bindings.insert(var.clone(), PatternBinding::Many(values));
+    }
+
+    Some(bindings)
+}
+
+fn merge_pattern_bindings(
+    mut left: PatternBindings,
+    right: PatternBindings,
+) -> Option<PatternBindings> {
+    for (name, binding) in right {
+        match left.get(&name) {
+            Some(existing) if existing != &binding => return None,
+            Some(_) => {}
+            None => {
+                left.insert(name, binding);
+            }
+        }
+    }
+
+    Some(left)
+}
+
+fn expand_template(
+    template: &Expr,
+    bindings: &PatternBindings,
+    transformer: &SyntaxRulesMacro,
+    state: &mut ExpansionState,
+    indices: &[usize],
+    quoted: bool,
+) -> Result<Expr, EvalError> {
+    match &template.kind {
+        ExprKind::Symbol(name) => expand_template_symbol(
+            template,
+            name,
+            bindings,
+            transformer,
+            state,
+            indices,
+            quoted,
+        ),
+        ExprKind::List(items) => expand_template_list(
+            template,
+            items,
+            bindings,
+            transformer,
+            state,
+            indices,
+            quoted,
+        ),
+        _ => Ok(template.clone()),
+    }
+}
+
+fn expand_template_symbol(
+    template: &Expr,
+    name: &str,
+    bindings: &PatternBindings,
+    transformer: &SyntaxRulesMacro,
+    state: &mut ExpansionState,
+    indices: &[usize],
+    quoted: bool,
+) -> Result<Expr, EvalError> {
+    if let Some(binding) = bindings.get(name) {
+        return resolve_pattern_binding(binding, indices).ok_or_else(|| {
+            EvalError::syntax(
+                format!("pattern variable {name} used outside the required ellipsis context"),
+                template.pos,
+            )
+        });
+    }
+
+    if quoted {
+        return Ok(template.clone());
+    }
+
+    if let Some(renamed) = state.lookup_bound_name(name) {
+        return Ok(Expr::symbol(renamed.to_string(), template.pos));
+    }
+
+    if name == "..." || is_core_syntax_keyword(name) {
+        return Ok(template.clone());
+    }
+
+    Ok(Expr::symbol(
+        state.alias_for(name, &transformer.env),
+        template.pos,
+    ))
+}
+
+fn expand_template_list(
+    template: &Expr,
+    items: &[Expr],
+    bindings: &PatternBindings,
+    transformer: &SyntaxRulesMacro,
+    state: &mut ExpansionState,
+    indices: &[usize],
+    quoted: bool,
+) -> Result<Expr, EvalError> {
+    if !quoted {
+        if let Some(Expr {
+            kind: ExprKind::Symbol(head_name),
+            ..
+        }) = items.first()
+        {
+            if !bindings.contains_key(head_name) && state.lookup_bound_name(head_name).is_none() {
+                match head_name.as_str() {
+                    "quote" => {
+                        return expand_quote_template(
+                            template.pos,
+                            items,
+                            bindings,
+                            transformer,
+                            state,
+                            indices,
+                        )
+                    }
+                    "let" => {
+                        return expand_let_template(
+                            template.pos,
+                            items,
+                            bindings,
+                            transformer,
+                            state,
+                            indices,
+                        )
+                    }
+                    "lambda" => {
+                        return expand_lambda_template(
+                            template.pos,
+                            items,
+                            bindings,
+                            transformer,
+                            state,
+                            indices,
+                        )
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok(Expr::list(
+        expand_template_sequence(items, bindings, transformer, state, indices, quoted)?,
+        template.pos,
+    ))
+}
+
+fn expand_quote_template(
+    position: SourcePos,
+    items: &[Expr],
+    bindings: &PatternBindings,
+    transformer: &SyntaxRulesMacro,
+    state: &mut ExpansionState,
+    indices: &[usize],
+) -> Result<Expr, EvalError> {
+    let [head, datum] = items else {
+        return Err(EvalError::syntax(
+            "quote template must contain exactly 1 datum",
+            position,
+        ));
+    };
+
+    Ok(Expr::list(
+        vec![
+            head.clone(),
+            expand_template(datum, bindings, transformer, state, indices, true)?,
+        ],
+        position,
+    ))
+}
+
+fn expand_let_template(
+    position: SourcePos,
+    items: &[Expr],
+    bindings: &PatternBindings,
+    transformer: &SyntaxRulesMacro,
+    state: &mut ExpansionState,
+    indices: &[usize],
+) -> Result<Expr, EvalError> {
+    let Some((_, tail)) = items.split_first() else {
+        return Err(EvalError::syntax("invalid let template", position));
+    };
+
+    let Some((bindings_expr, body)) = tail.split_first() else {
+        return Err(EvalError::syntax(
+            "let template requires bindings and a body",
+            position,
+        ));
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::syntax(
+            "let template requires at least 1 body expression",
+            position,
+        ));
+    }
+
+    let ExprKind::List(binding_items) = &bindings_expr.kind else {
+        return Err(EvalError::syntax(
+            "let template bindings must be a list",
+            bindings_expr.pos,
+        ));
+    };
+
+    let mut expanded_bindings = Vec::with_capacity(binding_items.len());
+    let mut scope = HashMap::new();
+
+    for binding_expr in binding_items {
+        let ExprKind::List(binding_parts) = &binding_expr.kind else {
+            return Err(EvalError::syntax(
+                "let template bindings must be lists",
+                binding_expr.pos,
+            ));
+        };
+
+        let [name_expr, value_expr] = binding_parts.as_slice() else {
+            return Err(EvalError::syntax(
+                "let template bindings must contain a name and value",
+                binding_expr.pos,
+            ));
+        };
+
+        let (expanded_name, rename) =
+            expand_binding_identifier(name_expr, bindings, transformer, state, indices)?;
+        let expanded_value =
+            expand_template(value_expr, bindings, transformer, state, indices, false)?;
+
+        if let Some((original, renamed)) = rename {
+            scope.insert(original, renamed);
+        }
+
+        expanded_bindings.push(Expr::list(
+            vec![expanded_name, expanded_value],
+            binding_expr.pos,
+        ));
+    }
+
+    state.push_scope(scope);
+
+    let mut expanded_items = Vec::with_capacity(items.len());
+    expanded_items.push(items[0].clone());
+    expanded_items.push(Expr::list(expanded_bindings, bindings_expr.pos));
+    for body_expr in body {
+        expanded_items.push(expand_template(
+            body_expr,
+            bindings,
+            transformer,
+            state,
+            indices,
+            false,
+        )?);
+    }
+
+    state.pop_scope();
+    Ok(Expr::list(expanded_items, position))
+}
+
+fn expand_lambda_template(
+    position: SourcePos,
+    items: &[Expr],
+    bindings: &PatternBindings,
+    transformer: &SyntaxRulesMacro,
+    state: &mut ExpansionState,
+    indices: &[usize],
+) -> Result<Expr, EvalError> {
+    let [head, params_expr, body @ ..] = items else {
+        return Err(EvalError::syntax(
+            "lambda template requires parameters and a body",
+            position,
+        ));
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::syntax(
+            "lambda template requires at least 1 body expression",
+            position,
+        ));
+    }
+
+    let (expanded_params, scope) =
+        expand_lambda_parameters(params_expr, bindings, transformer, state, indices)?;
+
+    state.push_scope(scope);
+
+    let mut expanded_items = Vec::with_capacity(items.len());
+    expanded_items.push(head.clone());
+    expanded_items.push(expanded_params);
+    for body_expr in body {
+        expanded_items.push(expand_template(
+            body_expr,
+            bindings,
+            transformer,
+            state,
+            indices,
+            false,
+        )?);
+    }
+
+    state.pop_scope();
+    Ok(Expr::list(expanded_items, position))
+}
+
+fn expand_lambda_parameters(
+    params_expr: &Expr,
+    bindings: &PatternBindings,
+    transformer: &SyntaxRulesMacro,
+    state: &mut ExpansionState,
+    indices: &[usize],
+) -> Result<(Expr, HashMap<String, String>), EvalError> {
+    match &params_expr.kind {
+        ExprKind::Symbol(name) => {
+            if name == "." {
+                return Ok((params_expr.clone(), HashMap::new()));
+            }
+
+            let (expanded, rename) =
+                expand_binding_identifier(params_expr, bindings, transformer, state, indices)?;
+            let mut scope = HashMap::new();
+            if let Some((original, renamed)) = rename {
+                scope.insert(original, renamed);
+            }
+            Ok((expanded, scope))
+        }
+        ExprKind::List(params) => {
+            let mut expanded = Vec::with_capacity(params.len());
+            let mut scope = HashMap::new();
+
+            for param in params {
+                if matches!(&param.kind, ExprKind::Symbol(name) if name == ".") {
+                    expanded.push(param.clone());
+                    continue;
+                }
+
+                let (expanded_param, rename) =
+                    expand_binding_identifier(param, bindings, transformer, state, indices)?;
+                if let Some((original, renamed)) = rename {
+                    scope.insert(original, renamed);
+                }
+                expanded.push(expanded_param);
+            }
+
+            Ok((Expr::list(expanded, params_expr.pos), scope))
+        }
+        _ => Ok((
+            expand_template(params_expr, bindings, transformer, state, indices, false)?,
+            HashMap::new(),
+        )),
+    }
+}
+
+fn expand_binding_identifier(
+    expr: &Expr,
+    bindings: &PatternBindings,
+    transformer: &SyntaxRulesMacro,
+    state: &mut ExpansionState,
+    indices: &[usize],
+) -> Result<(Expr, Option<(String, String)>), EvalError> {
+    let ExprKind::Symbol(name) = &expr.kind else {
+        return Ok((
+            expand_template(expr, bindings, transformer, state, indices, false)?,
+            None,
+        ));
+    };
+
+    if name == "." {
+        return Ok((expr.clone(), None));
+    }
+
+    if let Some(binding) = bindings.get(name) {
+        let expanded = resolve_pattern_binding(binding, indices).ok_or_else(|| {
+            EvalError::syntax(
+                format!("pattern variable {name} used outside the required ellipsis context"),
+                expr.pos,
+            )
+        })?;
+        return Ok((expanded, None));
+    }
+
+    let renamed = fresh_generated_symbol("bind");
+    Ok((
+        Expr::symbol(renamed.clone(), expr.pos),
+        Some((name.clone(), renamed)),
+    ))
+}
+
+fn expand_template_sequence(
+    items: &[Expr],
+    bindings: &PatternBindings,
+    transformer: &SyntaxRulesMacro,
+    state: &mut ExpansionState,
+    indices: &[usize],
+    quoted: bool,
+) -> Result<Vec<Expr>, EvalError> {
+    let mut expanded = Vec::new();
+    let mut index = 0;
+
+    while index < items.len() {
+        if index + 1 < items.len() && is_ellipsis_expr(&items[index + 1]) {
+            let repeat_count = determine_template_repeat_count(&items[index], bindings, indices)?;
+            for repetition in 0..repeat_count {
+                let next_indices = extend_indices(indices, repetition);
+                expanded.push(expand_template(
+                    &items[index],
+                    bindings,
+                    transformer,
+                    state,
+                    &next_indices,
+                    quoted,
+                )?);
+            }
+            index += 2;
+        } else {
+            expanded.push(expand_template(
+                &items[index],
+                bindings,
+                transformer,
+                state,
+                indices,
+                quoted,
+            )?);
+            index += 1;
+        }
+    }
+
+    Ok(expanded)
+}
+
+fn determine_template_repeat_count(
+    template: &Expr,
+    bindings: &PatternBindings,
+    indices: &[usize],
+) -> Result<usize, EvalError> {
+    let mut repeat_count = None;
+    collect_template_repeat_count(template, bindings, indices, &mut repeat_count)?;
+    repeat_count.ok_or_else(|| {
+        EvalError::syntax(
+            "ellipsis template must reference a repeated pattern variable",
+            template.pos,
+        )
+    })
+}
+
+fn collect_template_repeat_count(
+    template: &Expr,
+    bindings: &PatternBindings,
+    indices: &[usize],
+    repeat_count: &mut Option<usize>,
+) -> Result<(), EvalError> {
+    match &template.kind {
+        ExprKind::Symbol(name) => {
+            let Some(binding) = bindings.get(name) else {
+                return Ok(());
+            };
+
+            let Some(current_len) = binding_repeat_len(binding, indices) else {
+                return Ok(());
+            };
+
+            match repeat_count {
+                Some(existing) if *existing != current_len => Err(EvalError::syntax(
+                    "mismatched ellipsis lengths in template",
+                    template.pos,
+                )),
+                Some(_) => Ok(()),
+                None => {
+                    *repeat_count = Some(current_len);
+                    Ok(())
+                }
+            }
+        }
+        ExprKind::List(items) => {
+            let mut index = 0;
+            while index < items.len() {
+                if index + 1 < items.len() && is_ellipsis_expr(&items[index + 1]) {
+                    collect_template_repeat_count(&items[index], bindings, indices, repeat_count)?;
+                    index += 2;
+                } else {
+                    collect_template_repeat_count(&items[index], bindings, indices, repeat_count)?;
+                    index += 1;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn binding_repeat_len(binding: &PatternBinding, indices: &[usize]) -> Option<usize> {
+    let mut current = binding;
+
+    for &index in indices {
+        let PatternBinding::Many(values) = current else {
+            return None;
+        };
+        current = values.get(index)?;
+    }
+
+    match current {
+        PatternBinding::Many(values) => Some(values.len()),
+        PatternBinding::One(_) => None,
+    }
+}
+
+fn resolve_pattern_binding(binding: &PatternBinding, indices: &[usize]) -> Option<Expr> {
+    let mut current = binding;
+
+    for &index in indices {
+        let PatternBinding::Many(values) = current else {
+            return None;
+        };
+        current = values.get(index)?;
+    }
+
+    match current {
+        PatternBinding::One(expr) => Some(expr.clone()),
+        PatternBinding::Many(_) => None,
+    }
+}
+
+fn extend_indices(indices: &[usize], next: usize) -> Vec<usize> {
+    let mut extended = Vec::with_capacity(indices.len() + 1);
+    extended.extend_from_slice(indices);
+    extended.push(next);
+    extended
 }
 
 struct Parser {
