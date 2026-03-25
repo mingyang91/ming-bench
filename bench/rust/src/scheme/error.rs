@@ -86,6 +86,9 @@ pub enum EvalError {
 
     #[error("{position}: cannot mutate immutable string")]
     ImmutableString { position: SourcePos },
+
+    #[error("{position}: uncaught exception: {value}")]
+    UncaughtException { value: String, position: SourcePos },
 }
 
 impl EvalError {
@@ -178,5 +181,12 @@ impl EvalError {
 
     pub fn immutable_string(position: SourcePos) -> Self {
         Self::ImmutableString { position }
+    }
+
+    pub fn uncaught_exception(value: impl Into<String>, position: SourcePos) -> Self {
+        Self::UncaughtException {
+            value: value.into(),
+            position,
+        }
     }
 }

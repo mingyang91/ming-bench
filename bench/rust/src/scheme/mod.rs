@@ -20,6 +20,8 @@ const BUILTIN_NAMES: &[&str] = &[
     "call-with-current-continuation",
     "call/cc",
     "dynamic-wind",
+    "raise",
+    "with-exception-handler",
     "<",
     "<=",
     "denominator",
@@ -188,8 +190,40 @@ fn uses_immutable_strings() -> bool {
 fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
     let exprs = Parser::new(input).parse_program()?;
     let env = Environment::global();
-    let value = machine_eval_program(&exprs, env.clone())?;
+    let value = if program_requires_machine(&exprs) {
+        machine_eval_program(&exprs, env.clone())?
+    } else {
+        eval_program_without_machine(&exprs, env.clone())?
+    };
     Ok((value, Environment::captured_output(&env)))
+}
+
+fn program_requires_machine(exprs: &[Expr]) -> bool {
+    exprs.iter().any(expr_requires_machine)
+}
+
+fn expr_requires_machine(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Symbol(name) => matches!(
+            name.as_str(),
+            "call/cc"
+                | "call-with-current-continuation"
+                | "dynamic-wind"
+                | "guard"
+                | "raise"
+                | "with-exception-handler"
+        ),
+        ExprKind::List(items) => items.iter().any(expr_requires_machine),
+        _ => false,
+    }
+}
+
+fn eval_program_without_machine(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    if exprs.is_empty() {
+        return Err(EvalError::EmptyInput);
+    }
+
+    eval_sequence(exprs, env)
 }
 
 fn render_result(value: &Value) -> String {
@@ -246,6 +280,7 @@ type MacroRef = Rc<SyntaxRulesMacro>;
 type PairRef = Rc<Pair>;
 type ContinuationRef = Rc<ContinuationChain>;
 type WindRef = Rc<DynamicWind>;
+type HandlerRef = Rc<ExceptionHandler>;
 
 #[derive(Clone)]
 struct DynamicWind {
@@ -253,6 +288,12 @@ struct DynamicWind {
     in_position: SourcePos,
     out_thunk: Value,
     out_position: SourcePos,
+}
+
+#[derive(Clone)]
+struct ExceptionHandler {
+    procedure: Value,
+    position: SourcePos,
 }
 
 #[derive(Clone)]
@@ -1434,6 +1475,11 @@ enum MachineFrame {
         target_cont: ContinuationRef,
         env: EnvRef,
     },
+    HandleException {
+        handler: HandlerRef,
+        exception_position: SourcePos,
+        env: EnvRef,
+    },
 }
 
 #[derive(Clone)]
@@ -1441,6 +1487,7 @@ enum ContinuationChain {
     Empty,
     Frame(MachineFrame, ContinuationRef),
     Wind(WindRef, ContinuationRef),
+    Handler(HandlerRef, ContinuationRef),
 }
 
 #[derive(Clone)]
@@ -1473,6 +1520,10 @@ fn push_wind(wind: WindRef, next: ContinuationRef) -> ContinuationRef {
     Rc::new(ContinuationChain::Wind(wind, next))
 }
 
+fn push_handler(handler: HandlerRef, next: ContinuationRef) -> ContinuationRef {
+    Rc::new(ContinuationChain::Handler(handler, next))
+}
+
 fn build_continuation_with_winds(frame: MachineFrame, active_winds: &[WindRef]) -> ContinuationRef {
     let mut cont = empty_continuation();
 
@@ -1490,7 +1541,9 @@ fn collect_winds(cont: &ContinuationRef) -> Vec<WindRef> {
     loop {
         match current.as_ref() {
             ContinuationChain::Empty => break,
-            ContinuationChain::Frame(_, next) | ContinuationChain::Wind(_, next) => {
+            ContinuationChain::Frame(_, next)
+            | ContinuationChain::Wind(_, next)
+            | ContinuationChain::Handler(_, next) => {
                 if let ContinuationChain::Wind(wind, _) = current.as_ref() {
                     winds.push(wind.clone());
                 }
@@ -1611,6 +1664,47 @@ fn machine_continue_wind_transition(
     }
 }
 
+fn find_exception_handler(cont: &ContinuationRef) -> Option<(HandlerRef, ContinuationRef)> {
+    let mut current = cont.clone();
+
+    loop {
+        match current.as_ref() {
+            ContinuationChain::Empty => return None,
+            ContinuationChain::Frame(_, next) | ContinuationChain::Wind(_, next) => {
+                current = next.clone();
+            }
+            ContinuationChain::Handler(handler, next) => {
+                return Some((handler.clone(), next.clone()));
+            }
+        }
+    }
+}
+
+fn machine_raise(
+    exception: Value,
+    exception_position: SourcePos,
+    env: EnvRef,
+    cont: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    let Some((handler, next)) = find_exception_handler(&cont) else {
+        return Err(EvalError::uncaught_exception(
+            exception.to_scheme_string(),
+            exception_position,
+        ));
+    };
+
+    let handler_cont = push_continuation(
+        MachineFrame::HandleException {
+            handler,
+            exception_position,
+            env: env.clone(),
+        },
+        next,
+    );
+
+    machine_resume_continuation(exception, cont, handler_cont, env)
+}
+
 fn machine_eval_program(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     if exprs.is_empty() {
         return Err(EvalError::EmptyInput);
@@ -1627,6 +1721,7 @@ fn machine_eval_program(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError>
                     machine_apply_frame(frame.clone(), value, next.clone())?
                 }
                 ContinuationChain::Wind(_, next) => machine_value(value, next.clone()),
+                ContinuationChain::Handler(_, next) => machine_value(value, next.clone()),
             },
         };
 
@@ -1729,6 +1824,7 @@ fn machine_eval_list(
             "do" => Ok(machine_expr(desugar_do(tail, head.pos)?, env, cont)),
             "let" => Ok(machine_expr(desugar_let(tail, head.pos)?, env, cont)),
             "let*" => Ok(machine_expr(desugar_let_star(tail, head.pos)?, env, cont)),
+            "guard" => Ok(machine_expr(desugar_guard(tail, head.pos)?, env, cont)),
             "letrec" => Ok(machine_value(
                 eval_letrec(tail, env, head.pos, false)?,
                 cont,
@@ -1998,6 +2094,17 @@ fn machine_apply_frame(
             target_cont,
             env,
         ),
+        MachineFrame::HandleException {
+            handler,
+            exception_position,
+            env,
+        } => machine_apply_value(
+            handler.procedure.clone(),
+            handler.position,
+            vec![LocatedValue::new(value, exception_position)],
+            env,
+            cont,
+        ),
     }
 }
 
@@ -2125,6 +2232,44 @@ fn machine_apply_builtin(
                 next_cont,
             )
         }
+        "raise" => {
+            if args.len() != 1 {
+                return Err(EvalError::wrong_arg_count(
+                    "raise",
+                    "exactly 1",
+                    args.len(),
+                    position,
+                ));
+            }
+
+            machine_raise(args[0].value.clone(), args[0].position, env, cont)
+        }
+        "with-exception-handler" => {
+            if args.len() != 2 {
+                return Err(EvalError::wrong_arg_count(
+                    "with-exception-handler",
+                    "exactly 2",
+                    args.len(),
+                    position,
+                ));
+            }
+
+            let handler_cont = push_handler(
+                Rc::new(ExceptionHandler {
+                    procedure: args[0].value.clone(),
+                    position: args[0].position,
+                }),
+                cont,
+            );
+
+            machine_apply_value(
+                args[1].value.clone(),
+                args[1].position,
+                Vec::new(),
+                env,
+                handler_cont,
+            )
+        }
         "apply" => {
             if args.len() < 2 {
                 return Err(EvalError::wrong_arg_count(
@@ -2175,6 +2320,21 @@ fn build_begin_expr(exprs: Vec<Expr>, position: SourcePos) -> Expr {
     Expr::list(items, position)
 }
 
+fn build_lambda_expr(params: Vec<Expr>, body: Vec<Expr>, position: SourcePos) -> Expr {
+    let mut items = Vec::with_capacity(body.len() + 2);
+    items.push(Expr::symbol("lambda", position));
+    items.push(Expr::list(params, position));
+    items.extend(body);
+    Expr::list(items, position)
+}
+
+fn build_call_expr(operator: Expr, args: Vec<Expr>, position: SourcePos) -> Expr {
+    let mut items = Vec::with_capacity(args.len() + 1);
+    items.push(operator);
+    items.extend(args);
+    Expr::list(items, position)
+}
+
 fn build_if_expr(test: Expr, then_branch: Expr, else_branch: Expr, position: SourcePos) -> Expr {
     Expr::list(
         vec![Expr::symbol("if", position), test, then_branch, else_branch],
@@ -2220,6 +2380,99 @@ fn build_named_let_expr(
 
 fn build_quote_expr(datum: Expr, position: SourcePos) -> Expr {
     Expr::list(vec![Expr::symbol("quote", position), datum], position)
+}
+
+fn guard_has_else_clause(clauses: &[Expr]) -> bool {
+    clauses.iter().any(|clause| {
+        matches!(
+            &clause.kind,
+            ExprKind::List(items)
+                if matches!(items.first(), Some(test) if matches!(&test.kind, ExprKind::Symbol(name) if name == "else"))
+        )
+    })
+}
+
+fn desugar_guard(exprs: &[Expr], position: SourcePos) -> Result<Expr, EvalError> {
+    let Some((guard_spec_expr, body)) = exprs.split_first() else {
+        return Err(EvalError::syntax(
+            "guard requires a binding list and a body",
+            position,
+        ));
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::syntax("guard requires a body", position));
+    }
+
+    let ExprKind::List(guard_spec) = &guard_spec_expr.kind else {
+        return Err(EvalError::syntax(
+            "guard requires a binding list",
+            guard_spec_expr.pos,
+        ));
+    };
+
+    let Some((exception_name_expr, clauses)) = guard_spec.split_first() else {
+        return Err(EvalError::syntax(
+            "guard requires an exception variable",
+            guard_spec_expr.pos,
+        ));
+    };
+
+    let ExprKind::Symbol(exception_name) = &exception_name_expr.kind else {
+        return Err(EvalError::syntax(
+            "guard exception variable must be a symbol",
+            exception_name_expr.pos,
+        ));
+    };
+
+    let exit_name = fresh_generated_symbol("guard");
+    let exception_expr = Expr::symbol(exception_name.clone(), exception_name_expr.pos);
+
+    let mut cond_items = Vec::with_capacity(clauses.len() + 2);
+    cond_items.push(Expr::symbol("cond", position));
+    cond_items.extend(clauses.iter().cloned());
+    if !guard_has_else_clause(clauses) {
+        cond_items.push(Expr::list(
+            vec![
+                Expr::symbol("else", position),
+                build_call_expr(
+                    Expr::symbol("raise", position),
+                    vec![exception_expr.clone()],
+                    position,
+                ),
+            ],
+            position,
+        ));
+    }
+
+    let cond_expr = Expr::list(cond_items, position);
+    let handler_body = vec![build_call_expr(
+        Expr::symbol(exit_name.clone(), position),
+        vec![cond_expr],
+        position,
+    )];
+    let handler_lambda = build_lambda_expr(
+        vec![exception_expr],
+        handler_body,
+        guard_spec_expr.pos,
+    );
+    let body_thunk = build_lambda_expr(Vec::new(), body.to_vec(), position);
+    let with_handler_expr = build_call_expr(
+        Expr::symbol("with-exception-handler", position),
+        vec![handler_lambda, body_thunk],
+        position,
+    );
+    let guard_lambda = build_lambda_expr(
+        vec![Expr::symbol(exit_name, position)],
+        vec![with_handler_expr],
+        position,
+    );
+
+    Ok(build_call_expr(
+        Expr::symbol("call/cc", position),
+        vec![guard_lambda],
+        position,
+    ))
 }
 
 fn desugar_and(exprs: &[Expr], position: SourcePos) -> Result<Expr, EvalError> {
