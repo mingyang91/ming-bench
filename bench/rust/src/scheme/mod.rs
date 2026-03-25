@@ -5,6 +5,7 @@ mod helpers;
 mod macros;
 mod number;
 mod parser;
+mod records;
 mod value_ops;
 
 pub use error::{EvalError, SourcePos};
@@ -16,8 +17,12 @@ use self::helpers::{
 };
 use self::macros::{expand_macro_call, parse_syntax_rules};
 use self::number::{parse_number_literal, Number, NumberError};
+use self::records::{
+    apply_record_accessor, apply_record_constructor, apply_record_predicate,
+    eval_define_record_type,
+};
 use self::value_ops::{
-    eqv_value, render_char, render_list, render_pair, render_string, render_vector, value_type_name,
+    eqv_value, render_char, render_list, render_pair, render_string, render_vector,
 };
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
@@ -177,6 +182,26 @@ struct EvalContext {
     next_fresh: usize,
 }
 
+#[derive(Debug)]
+enum EvalOutcome {
+    Value(Value),
+    TailCall(PendingCall),
+}
+
+#[derive(Debug)]
+enum PendingCall {
+    Lambda {
+        lambda: Rc<Lambda>,
+        args: Vec<Value>,
+        pos: SourcePos,
+    },
+    CaseLambda {
+        case_lambda: Rc<CaseLambda>,
+        args: Vec<Value>,
+        pos: SourcePos,
+    },
+}
+
 impl LambdaParams {
     fn fixed(required: Vec<String>) -> Self {
         Self {
@@ -324,13 +349,10 @@ fn eval_sequence(
     empty_pos: SourcePos,
     context: &mut EvalContext,
 ) -> Result<Value, EvalError> {
-    let mut last = None;
-
-    for expr in exprs {
-        last = Some(eval_expr(expr, env, context)?);
-    }
-
-    last.ok_or_else(|| syntax_error(empty_pos, "empty input"))
+    resolve_outcome(
+        eval_sequence_outcome(exprs, env, empty_pos, context, true)?,
+        context,
+    )
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
@@ -344,13 +366,54 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
 }
 
 fn eval_expr(expr: &Expr, env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
+    resolve_outcome(eval_expr_outcome(expr, env, context, true)?, context)
+}
+
+fn resolve_outcome(
+    mut outcome: EvalOutcome,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    loop {
+        match outcome {
+            EvalOutcome::Value(value) => return Ok(value),
+            EvalOutcome::TailCall(call) => outcome = execute_pending_call(call, context)?,
+        }
+    }
+}
+
+fn eval_sequence_outcome(
+    exprs: &[Expr],
+    env: &EnvRef,
+    empty_pos: SourcePos,
+    context: &mut EvalContext,
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
+    let Some((last, prefix)) = exprs.split_last() else {
+        return Err(syntax_error(empty_pos, "empty input"));
+    };
+
+    for expr in prefix {
+        let _ = eval_expr(expr, env, context)?;
+    }
+
+    eval_expr_outcome(last, env, context, tail)
+}
+
+fn eval_expr_outcome(
+    expr: &Expr,
+    env: &EnvRef,
+    context: &mut EvalContext,
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
     match &expr.kind {
-        ExprKind::Number(value) => Ok(Value::Number(*value)),
-        ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
-        ExprKind::Character(value) => Ok(Value::Character(*value)),
-        ExprKind::String(value) => Ok(make_immutable_string_value(value.clone())),
-        ExprKind::Symbol(name) => lookup_symbol(env, name, expr.pos),
-        ExprKind::List(items) => eval_list(items, env, expr.pos, context),
+        ExprKind::Number(value) => Ok(EvalOutcome::Value(Value::Number(*value))),
+        ExprKind::Boolean(value) => Ok(EvalOutcome::Value(Value::Boolean(*value))),
+        ExprKind::Character(value) => Ok(EvalOutcome::Value(Value::Character(*value))),
+        ExprKind::String(value) => Ok(EvalOutcome::Value(make_immutable_string_value(
+            value.clone(),
+        ))),
+        ExprKind::Symbol(name) => lookup_symbol(env, name, expr.pos).map(EvalOutcome::Value),
+        ExprKind::List(items) => eval_list(items, env, expr.pos, context, tail),
     }
 }
 
@@ -453,7 +516,8 @@ fn eval_list(
     env: &EnvRef,
     pos: SourcePos,
     context: &mut EvalContext,
-) -> Result<Value, EvalError> {
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
     if items.is_empty() {
         return Err(syntax_error(pos, "cannot evaluate empty list"));
     }
@@ -461,29 +525,39 @@ fn eval_list(
     if let Some(name) = items[0].symbol_name() {
         let form_pos = items[0].pos;
         match name {
-            "begin" => return eval_begin(&items[1..], env, form_pos, context),
-            "case" => return eval_case(&items[1..], env, form_pos, context),
-            "case-lambda" => return eval_case_lambda(&items[1..], env, form_pos),
-            "cond" => return eval_cond(&items[1..], env, context),
-            "define" => return eval_define(&items[1..], env, form_pos, context),
-            "define-record-type" => return eval_define_record_type(&items[1..], env, form_pos),
-            "define-syntax" => return eval_define_syntax(&items[1..], env, form_pos),
-            "do" => return eval_do(&items[1..], env, form_pos, context),
-            "if" => return eval_if(&items[1..], env, form_pos, context),
-            "let" => return eval_let(&items[1..], env, form_pos, context),
-            "letrec" => return eval_letrec(&items[1..], env, form_pos, context, false),
-            "letrec*" => return eval_letrec(&items[1..], env, form_pos, context, true),
-            "quote" => return eval_quote(&items[1..], form_pos),
-            "set!" => return eval_set(&items[1..], env, form_pos, context),
-            "lambda" => return eval_lambda(None, &items[1..], env, form_pos),
-            "and" => return eval_and(&items[1..], env, context),
-            "or" => return eval_or(&items[1..], env, context),
+            "begin" => return eval_begin(&items[1..], env, form_pos, context, tail),
+            "case" => return eval_case(&items[1..], env, form_pos, context, tail),
+            "case-lambda" => {
+                return eval_case_lambda(&items[1..], env, form_pos).map(EvalOutcome::Value)
+            }
+            "cond" => return eval_cond(&items[1..], env, context, tail),
+            "define" => {
+                return eval_define(&items[1..], env, form_pos, context).map(EvalOutcome::Value)
+            }
+            "define-record-type" => {
+                return eval_define_record_type(&items[1..], env, form_pos).map(EvalOutcome::Value)
+            }
+            "define-syntax" => {
+                return eval_define_syntax(&items[1..], env, form_pos).map(EvalOutcome::Value)
+            }
+            "do" => return eval_do(&items[1..], env, form_pos, context, tail),
+            "if" => return eval_if(&items[1..], env, form_pos, context, tail),
+            "let" => return eval_let(&items[1..], env, form_pos, context, tail),
+            "letrec" => return eval_letrec(&items[1..], env, form_pos, context, false, tail),
+            "letrec*" => return eval_letrec(&items[1..], env, form_pos, context, true, tail),
+            "quote" => return eval_quote(&items[1..], form_pos).map(EvalOutcome::Value),
+            "set!" => return eval_set(&items[1..], env, form_pos, context).map(EvalOutcome::Value),
+            "lambda" => {
+                return eval_lambda(None, &items[1..], env, form_pos).map(EvalOutcome::Value)
+            }
+            "and" => return eval_and(&items[1..], env, context, tail),
+            "or" => return eval_or(&items[1..], env, context, tail),
             _ => {}
         }
 
         if let Some(transformer) = env_lookup_macro(env, name) {
             let expanded = expand_macro_call(&transformer, items, pos, env, context)?;
-            return eval_expr(&expanded, env, context);
+            return eval_expr_outcome(&expanded, env, context, tail);
         }
     }
 
@@ -493,7 +567,7 @@ fn eval_list(
         .map(|expr| eval_expr(expr, env, context))
         .collect::<Result<Vec<_>, _>>()?;
 
-    apply(operator, &args, items[0].pos, context)
+    apply_outcome(operator, args, items[0].pos, context, tail)
 }
 
 fn eval_define(
@@ -542,81 +616,14 @@ fn eval_define_syntax(args: &[Expr], env: &EnvRef, pos: SourcePos) -> Result<Val
     }
 }
 
-fn eval_define_record_type(
-    args: &[Expr],
-    env: &EnvRef,
-    pos: SourcePos,
-) -> Result<Value, EvalError> {
-    let (type_name_expr, constructor_expr, predicate_expr, field_exprs) = match args {
-        [type_name_expr, constructor_expr, predicate_expr, field_exprs @ ..] => (
-            type_name_expr,
-            constructor_expr,
-            predicate_expr,
-            field_exprs,
-        ),
-        _ => return Err(syntax_error(pos, "invalid define-record-type form")),
-    };
-
-    let type_name = type_name_expr
-        .symbol_name()
-        .ok_or_else(|| syntax_error(type_name_expr.pos, "record type name must be a symbol"))?
-        .to_string();
-    let (constructor_name, constructor_field_count) = parse_record_constructor(constructor_expr)?;
-    let predicate_name = predicate_expr
-        .symbol_name()
-        .ok_or_else(|| syntax_error(predicate_expr.pos, "record predicate name must be a symbol"))?
-        .to_string();
-    let accessor_names = field_exprs
-        .iter()
-        .map(parse_record_field)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if constructor_field_count != accessor_names.len() {
-        return Err(syntax_error(
-            constructor_expr.pos,
-            "record constructor arity must match field count",
-        ));
-    }
-
-    let record_type = Rc::new(RecordType {
-        type_name,
-        constructor_name: constructor_name.clone(),
-        field_count: accessor_names.len(),
-    });
-
-    env_define(
-        env,
-        constructor_name,
-        Value::Procedure(Procedure::RecordConstructor(Rc::clone(&record_type))),
-    );
-    env_define(
-        env,
-        predicate_name,
-        Value::Procedure(Procedure::RecordPredicate(Rc::clone(&record_type))),
-    );
-
-    for (field_index, accessor_name) in accessor_names.into_iter().enumerate() {
-        env_define(
-            env,
-            accessor_name.clone(),
-            Value::Procedure(Procedure::RecordAccessor {
-                record_type: Rc::clone(&record_type),
-                field_index,
-                name: accessor_name,
-            }),
-        );
-    }
-
-    Ok(Value::Void)
-}
-
 fn eval_begin(
     args: &[Expr],
     env: &EnvRef,
     pos: SourcePos,
     context: &mut EvalContext,
-) -> Result<Value, EvalError> {
-    eval_sequence(args, env, pos, context)
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
+    eval_sequence_outcome(args, env, pos, context, tail)
 }
 
 fn eval_set(
@@ -701,63 +708,12 @@ fn parse_params(params: &[Expr]) -> Result<LambdaParams, EvalError> {
     Ok(LambdaParams { required, rest })
 }
 
-fn parse_record_constructor(constructor: &Expr) -> Result<(String, usize), EvalError> {
-    let items = constructor
-        .list_items()
-        .ok_or_else(|| syntax_error(constructor.pos, "record constructor must be a list"))?;
-    let (name_expr, params) = items
-        .split_first()
-        .ok_or_else(|| syntax_error(constructor.pos, "record constructor cannot be empty"))?;
-    let name = name_expr
-        .symbol_name()
-        .ok_or_else(|| syntax_error(name_expr.pos, "record constructor name must be a symbol"))?
-        .to_string();
-
-    for param in params {
-        if param.symbol_name().is_none() {
-            return Err(syntax_error(
-                param.pos,
-                "record constructor parameter must be a symbol",
-            ));
-        }
-    }
-
-    Ok((name, params.len()))
-}
-
-fn parse_record_field(field: &Expr) -> Result<String, EvalError> {
-    let items = field
-        .list_items()
-        .ok_or_else(|| syntax_error(field.pos, "record field must be a list"))?;
-
-    match items {
-        [name_expr, accessor_expr] => {
-            if name_expr.symbol_name().is_none() {
-                return Err(syntax_error(
-                    name_expr.pos,
-                    "record field name must be a symbol",
-                ));
-            }
-
-            accessor_expr
-                .symbol_name()
-                .ok_or_else(|| {
-                    syntax_error(accessor_expr.pos, "record accessor name must be a symbol")
-                })
-                .map(str::to_string)
-        }
-        _ => Err(syntax_error(
-            field.pos,
-            "record field must contain a name and accessor",
-        )),
-    }
-}
-
 fn eval_cond(
     clauses: &[Expr],
     env: &EnvRef,
     context: &mut EvalContext,
-) -> Result<Value, EvalError> {
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
     for (index, clause) in clauses.iter().enumerate() {
         let items = clause
             .list_items()
@@ -771,20 +727,20 @@ fn eval_cond(
             if index + 1 != clauses.len() {
                 return Err(syntax_error(test.pos, "else clause must be last"));
             }
-            return eval_sequence(body, env, clause.pos, context);
+            return eval_sequence_outcome(body, env, clause.pos, context, tail);
         }
 
         let test_value = eval_expr(test, env, context)?;
         if test_value.is_truthy() {
             return if body.is_empty() {
-                Ok(test_value)
+                Ok(EvalOutcome::Value(test_value))
             } else {
-                eval_sequence(body, env, clause.pos, context)
+                eval_sequence_outcome(body, env, clause.pos, context, tail)
             };
         }
     }
 
-    Ok(Value::Void)
+    Ok(EvalOutcome::Value(Value::Void))
 }
 
 fn eval_case(
@@ -792,7 +748,8 @@ fn eval_case(
     env: &EnvRef,
     pos: SourcePos,
     context: &mut EvalContext,
-) -> Result<Value, EvalError> {
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
     let (key_expr, clauses) = args
         .split_first()
         .ok_or_else(|| syntax_error(pos, "case requires a key and at least one clause"))?;
@@ -817,9 +774,9 @@ fn eval_case(
             }
 
             return if body.is_empty() {
-                Ok(Value::Void)
+                Ok(EvalOutcome::Value(Value::Void))
             } else {
-                eval_sequence(body, env, clause.pos, context)
+                eval_sequence_outcome(body, env, clause.pos, context, tail)
             };
         }
 
@@ -830,15 +787,15 @@ fn eval_case(
         for datum in datums {
             if eqv_value(&key, &quote_expr(datum)?) {
                 return if body.is_empty() {
-                    Ok(Value::Void)
+                    Ok(EvalOutcome::Value(Value::Void))
                 } else {
-                    eval_sequence(body, env, clause.pos, context)
+                    eval_sequence_outcome(body, env, clause.pos, context, tail)
                 };
             }
         }
     }
 
-    Ok(Value::Void)
+    Ok(EvalOutcome::Value(Value::Void))
 }
 
 fn eval_if(
@@ -846,20 +803,21 @@ fn eval_if(
     env: &EnvRef,
     pos: SourcePos,
     context: &mut EvalContext,
-) -> Result<Value, EvalError> {
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
     match args {
         [condition, when_true] => {
             if eval_expr(condition, env, context)?.is_truthy() {
-                eval_expr(when_true, env, context)
+                eval_expr_outcome(when_true, env, context, tail)
             } else {
-                Ok(Value::Void)
+                Ok(EvalOutcome::Value(Value::Void))
             }
         }
         [condition, when_true, when_false] => {
             if eval_expr(condition, env, context)?.is_truthy() {
-                eval_expr(when_true, env, context)
+                eval_expr_outcome(when_true, env, context, tail)
             } else {
-                eval_expr(when_false, env, context)
+                eval_expr_outcome(when_false, env, context, tail)
             }
         }
         _ => Err(wrong_arg_count(pos, "if", "2 or 3 arguments", args.len())),
@@ -871,7 +829,8 @@ fn eval_do(
     env: &EnvRef,
     pos: SourcePos,
     context: &mut EvalContext,
-) -> Result<Value, EvalError> {
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
     let (bindings_expr, rest) = args
         .split_first()
         .ok_or_else(|| syntax_error(pos, "do requires bindings and a test clause"))?;
@@ -910,9 +869,9 @@ fn eval_do(
     loop {
         if eval_expr(test_expr, &do_env, context)?.is_truthy() {
             return if exit_exprs.is_empty() {
-                Ok(Value::Void)
+                Ok(EvalOutcome::Value(Value::Void))
             } else {
-                eval_sequence(exit_exprs, &do_env, test_clause_expr.pos, context)
+                eval_sequence_outcome(exit_exprs, &do_env, test_clause_expr.pos, context, tail)
             };
         }
 
@@ -940,15 +899,16 @@ fn eval_let(
     env: &EnvRef,
     pos: SourcePos,
     context: &mut EvalContext,
-) -> Result<Value, EvalError> {
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
     let (head, rest) = args
         .split_first()
         .ok_or_else(|| syntax_error(pos, "let requires bindings and a body"))?;
 
     if let Some(bindings) = head.list_items() {
-        eval_plain_let(bindings, rest, env, pos, context)
+        eval_plain_let(bindings, rest, env, pos, context, tail)
     } else if let Some(name) = head.symbol_name() {
-        eval_named_let(name, rest, env, head.pos, context)
+        eval_named_let(name, rest, env, head.pos, context, tail)
     } else {
         Err(syntax_error(head.pos, "invalid let form"))
     }
@@ -960,7 +920,8 @@ fn eval_plain_let(
     env: &EnvRef,
     pos: SourcePos,
     context: &mut EvalContext,
-) -> Result<Value, EvalError> {
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
     if body.is_empty() {
         return Err(syntax_error(pos, "let requires a body"));
     }
@@ -972,7 +933,7 @@ fn eval_plain_let(
         env_define(&let_env, name, value);
     }
 
-    eval_sequence(body, &let_env, pos, context)
+    eval_sequence_outcome(body, &let_env, pos, context, tail)
 }
 
 fn eval_named_let(
@@ -981,7 +942,8 @@ fn eval_named_let(
     env: &EnvRef,
     pos: SourcePos,
     context: &mut EvalContext,
-) -> Result<Value, EvalError> {
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
     let (bindings_expr, body) = args
         .split_first()
         .ok_or_else(|| syntax_error(pos, "named let requires bindings and a body"))?;
@@ -1005,7 +967,7 @@ fn eval_named_let(
         pos,
     )?;
     env_define(&let_env, name.to_string(), lambda.clone());
-    apply(lambda, &values, pos, context)
+    apply_outcome(lambda, values, pos, context, tail)
 }
 
 fn eval_letrec(
@@ -1014,7 +976,8 @@ fn eval_letrec(
     pos: SourcePos,
     context: &mut EvalContext,
     sequential: bool,
-) -> Result<Value, EvalError> {
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
     let (bindings_expr, body) = args
         .split_first()
         .ok_or_else(|| syntax_error(pos, "letrec requires bindings and a body"))?;
@@ -1052,7 +1015,7 @@ fn eval_letrec(
         }
     }
 
-    eval_sequence(body, &letrec_env, pos, context)
+    eval_sequence_outcome(body, &letrec_env, pos, context, tail)
 }
 
 fn eval_bindings(
@@ -1254,29 +1217,44 @@ fn make_lambda(
     }))))
 }
 
-fn eval_and(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
-    let mut last = Value::Boolean(true);
+fn eval_and(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
+    let Some((last, prefix)) = args.split_last() else {
+        return Ok(EvalOutcome::Value(Value::Boolean(true)));
+    };
 
-    for expr in args {
+    for expr in prefix {
         let value = eval_expr(expr, env, context)?;
         if !value.is_truthy() {
-            return Ok(value);
+            return Ok(EvalOutcome::Value(value));
         }
-        last = value;
     }
 
-    Ok(last)
+    eval_expr_outcome(last, env, context, tail)
 }
 
-fn eval_or(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
-    for expr in args {
+fn eval_or(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
+    let Some((last, prefix)) = args.split_last() else {
+        return Ok(EvalOutcome::Value(Value::Boolean(false)));
+    };
+
+    for expr in prefix {
         let value = eval_expr(expr, env, context)?;
         if value.is_truthy() {
-            return Ok(value);
+            return Ok(EvalOutcome::Value(value));
         }
     }
 
-    Ok(Value::Boolean(false))
+    eval_expr_outcome(last, env, context, tail)
 }
 
 fn apply(
@@ -1285,25 +1263,55 @@ fn apply(
     pos: SourcePos,
     context: &mut EvalContext,
 ) -> Result<Value, EvalError> {
+    resolve_outcome(
+        apply_outcome(operator, args.to_vec(), pos, context, true)?,
+        context,
+    )
+}
+
+fn apply_outcome(
+    operator: Value,
+    args: Vec<Value>,
+    pos: SourcePos,
+    context: &mut EvalContext,
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
     match operator {
         Value::Procedure(Procedure::Builtin(name)) => {
-            builtins::apply_builtin(name, args, pos, context)
+            builtins::apply_builtin(name, &args, pos, context).map(EvalOutcome::Value)
         }
-        Value::Procedure(Procedure::Lambda(lambda)) => apply_lambda(lambda, args, pos, context),
+        Value::Procedure(Procedure::Lambda(lambda)) => {
+            let outcome = EvalOutcome::TailCall(PendingCall::Lambda { lambda, args, pos });
+            if tail {
+                Ok(outcome)
+            } else {
+                resolve_outcome(outcome, context).map(EvalOutcome::Value)
+            }
+        }
         Value::Procedure(Procedure::CaseLambda(case_lambda)) => {
-            apply_case_lambda(case_lambda, args, pos, context)
+            let outcome = EvalOutcome::TailCall(PendingCall::CaseLambda {
+                case_lambda,
+                args,
+                pos,
+            });
+            if tail {
+                Ok(outcome)
+            } else {
+                resolve_outcome(outcome, context).map(EvalOutcome::Value)
+            }
         }
         Value::Procedure(Procedure::RecordConstructor(record_type)) => {
-            apply_record_constructor(record_type, args, pos)
+            apply_record_constructor(record_type, &args, pos).map(EvalOutcome::Value)
         }
         Value::Procedure(Procedure::RecordPredicate(record_type)) => {
-            apply_record_predicate(record_type, args, pos)
+            apply_record_predicate(record_type, &args, pos).map(EvalOutcome::Value)
         }
         Value::Procedure(Procedure::RecordAccessor {
             record_type,
             field_index,
             name,
-        }) => apply_record_accessor(record_type, field_index, &name, args, pos),
+        }) => apply_record_accessor(record_type, field_index, &name, &args, pos)
+            .map(EvalOutcome::Value),
         other => Err(EvalError::NotAProcedure {
             pos,
             found: other.render(),
@@ -1311,12 +1319,31 @@ fn apply(
     }
 }
 
-fn apply_lambda(
-    lambda: Rc<Lambda>,
-    args: &[Value],
-    pos: SourcePos,
+fn execute_pending_call(
+    call: PendingCall,
     context: &mut EvalContext,
-) -> Result<Value, EvalError> {
+) -> Result<EvalOutcome, EvalError> {
+    match call {
+        PendingCall::Lambda { lambda, args, pos } => {
+            let call_env = bind_lambda_call(&lambda, &args, pos)?;
+            eval_sequence_outcome(&lambda.body, &call_env, pos, context, true)
+        }
+        PendingCall::CaseLambda {
+            case_lambda,
+            args,
+            pos,
+        } => {
+            let lambda = select_case_lambda_clause(&case_lambda, args.len(), pos)?;
+            Ok(EvalOutcome::TailCall(PendingCall::Lambda {
+                lambda,
+                args,
+                pos,
+            }))
+        }
+    }
+}
+
+fn bind_lambda_call(lambda: &Lambda, args: &[Value], pos: SourcePos) -> Result<EnvRef, EvalError> {
     if !lambda.params.matches_arg_count(args.len()) {
         return Err(wrong_arg_count(
             pos,
@@ -1340,21 +1367,20 @@ fn apply_lambda(
         );
     }
 
-    eval_sequence(&lambda.body, &call_env, pos, context)
+    Ok(call_env)
 }
 
-fn apply_case_lambda(
-    case_lambda: Rc<CaseLambda>,
-    args: &[Value],
+fn select_case_lambda_clause(
+    case_lambda: &CaseLambda,
+    arg_count: usize,
     pos: SourcePos,
-    context: &mut EvalContext,
-) -> Result<Value, EvalError> {
+) -> Result<Rc<Lambda>, EvalError> {
     if let Some(clause) = case_lambda
         .clauses
         .iter()
-        .find(|clause| clause.params.matches_arg_count(args.len()))
+        .find(|clause| clause.params.matches_arg_count(arg_count))
     {
-        return apply_lambda(Rc::clone(clause), args, pos, context);
+        return Ok(Rc::clone(clause));
     }
 
     let expected = case_lambda
@@ -1368,69 +1394,8 @@ fn apply_case_lambda(
         pos,
         "case-lambda",
         format!("one of {expected}"),
-        args.len(),
+        arg_count,
     ))
-}
-
-fn apply_record_constructor(
-    record_type: Rc<RecordType>,
-    args: &[Value],
-    pos: SourcePos,
-) -> Result<Value, EvalError> {
-    if args.len() != record_type.field_count {
-        return Err(wrong_arg_count(
-            pos,
-            record_type.constructor_name.clone(),
-            format!("exactly {} arguments", record_type.field_count),
-            args.len(),
-        ));
-    }
-
-    Ok(Value::Record(Rc::new(RecordValue {
-        record_type,
-        fields: args.to_vec(),
-    })))
-}
-
-fn apply_record_predicate(
-    record_type: Rc<RecordType>,
-    args: &[Value],
-    pos: SourcePos,
-) -> Result<Value, EvalError> {
-    match args {
-        [Value::Record(record)] => Ok(Value::Boolean(Rc::ptr_eq(
-            &record.record_type,
-            &record_type,
-        ))),
-        [_] => Ok(Value::Boolean(false)),
-        _ => Err(wrong_arg_count(
-            pos,
-            "record predicate",
-            "exactly 1 argument",
-            args.len(),
-        )),
-    }
-}
-
-fn apply_record_accessor(
-    record_type: Rc<RecordType>,
-    field_index: usize,
-    name: &str,
-    args: &[Value],
-    pos: SourcePos,
-) -> Result<Value, EvalError> {
-    match args {
-        [Value::Record(record)] if Rc::ptr_eq(&record.record_type, &record_type) => {
-            Ok(record.fields[field_index].clone())
-        }
-        [other] => Err(type_mismatch(
-            pos,
-            name,
-            record_type.type_name.clone(),
-            value_type_name(other),
-        )),
-        _ => Err(wrong_arg_count(pos, name, "exactly 1 argument", args.len())),
-    }
 }
 
 #[cfg(test)]
