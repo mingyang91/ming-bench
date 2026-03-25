@@ -15,4 +15,7 @@ pub enum EvalError {
 
     #[error("division by zero")]
     DivisionByZero,
+
+    #[error("{0} at {1}:{2}")]
+    WithPosition(Box<EvalError>, usize, usize),
 }
