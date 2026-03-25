@@ -11,6 +11,16 @@ private[ming] class SchemeParser(input: String):
     pos += 1
     c
 
+  private def lineColAt(offset: Int): (Int, Int) =
+    var line = 1
+    var col  = 1
+    for i <- 0 until offset do
+      if input(i) == '\n' then
+        line += 1
+        col = 1
+      else col += 1
+    (line, col)
+
   private def skipWhitespaceAndComments(): Unit =
     while pos < input.length do
       val c = input(pos)
@@ -29,7 +39,8 @@ private[ming] class SchemeParser(input: String):
   private def parseExpr(): Expr =
     skipWhitespaceAndComments()
     if pos >= input.length then throw EvalError("unexpected end of input")
-    peek match
+    val startPos = pos
+    val result = peek match
       case '(' => parseList()
       case '"' => parseString()
       case '\'' =>
@@ -38,6 +49,8 @@ private[ming] class SchemeParser(input: String):
         Expr.Lst(List(Expr.Sym("quote"), inner))
       case '#' => parseHash()
       case _   => parseAtom()
+    val (l, c) = lineColAt(startPos)
+    result.withPos(l, c)
 
   private def parseList(): Expr =
     advance() // skip '('

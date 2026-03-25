@@ -4,26 +4,31 @@ import scala.collection.mutable
 
 object Evaluator:
 
-  private def eval(expr: Expr, env: Env): Expr = expr match
-    case Expr.Num(_) | Expr.Bool(_) | Expr.Str(_) | Expr.Lambda(_, _, _) =>
-      expr
-    case Expr.Sym(name) => env.lookup(name)
-    case Expr.Lst(Nil)  => throw EvalError("empty application")
-    case Expr.Lst(Expr.Sym("quote") :: args) =>
-      if args.length != 1 then throw EvalError("quote: need exactly 1 argument")
-      args.head
-    case Expr.Lst(Expr.Sym("if") :: args)      => evalIf(args, env)
-    case Expr.Lst(Expr.Sym("define") :: args)  => evalDefine(args, env)
-    case Expr.Lst(Expr.Sym("lambda") :: args)  => evalLambda(args, env)
-    case Expr.Lst(Expr.Sym("let") :: args)     => evalLet(args, env)
-    case Expr.Lst(Expr.Sym("begin") :: args)   => evalBegin(args, env)
-    case Expr.Lst(Expr.Sym("cond") :: clauses) => evalCond(clauses, env)
-    case Expr.Lst(Expr.Sym("and") :: args)     => evalAnd(args, env)
-    case Expr.Lst(Expr.Sym("or") :: args)      => evalOr(args, env)
-    case Expr.Lst(op :: args) =>
-      val func          = eval(op, env)
-      val evaluatedArgs = args.map(a => eval(a, env))
-      applyProc(func, evaluatedArgs)
+  private def eval(expr: Expr, env: Env): Expr =
+    try
+      expr match
+        case Expr.Num(_) | Expr.Bool(_) | Expr.Str(_) | Expr.Lambda(_, _, _) =>
+          expr
+        case Expr.Sym(name) => env.lookup(name)
+        case Expr.Lst(Nil)  => throw EvalError("empty application")
+        case Expr.Lst(Expr.Sym("quote") :: args) =>
+          if args.length != 1 then throw EvalError("quote: need exactly 1 argument")
+          args.head
+        case Expr.Lst(Expr.Sym("if") :: args)      => evalIf(args, env)
+        case Expr.Lst(Expr.Sym("define") :: args)  => evalDefine(args, env)
+        case Expr.Lst(Expr.Sym("lambda") :: args)  => evalLambda(args, env)
+        case Expr.Lst(Expr.Sym("let") :: args)     => evalLet(args, env)
+        case Expr.Lst(Expr.Sym("begin") :: args)   => evalBegin(args, env)
+        case Expr.Lst(Expr.Sym("cond") :: clauses) => evalCond(clauses, env)
+        case Expr.Lst(Expr.Sym("and") :: args)     => evalAnd(args, env)
+        case Expr.Lst(Expr.Sym("or") :: args)      => evalOr(args, env)
+        case Expr.Lst(op :: args) =>
+          val func          = eval(op, env)
+          val evaluatedArgs = args.map(a => eval(a, env))
+          applyProc(func, evaluatedArgs)
+    catch
+      case e: EvalError if expr.line > 0 && !e.getMessage.matches(".*\\d+:\\d+.*") =>
+        throw EvalError(s"${expr.line}:${expr.col}: ${e.getMessage}")
 
   private def evalIf(args: List[Expr], env: Env): Expr =
     if args.length < 2 || args.length > 3 then throw EvalError("if: need 2 or 3 arguments")

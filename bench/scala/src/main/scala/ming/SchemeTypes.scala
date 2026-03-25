@@ -10,6 +10,14 @@ private[ming] enum Expr:
   case Lst(elems: List[Expr])
   case Lambda(params: List[String], body: List[Expr], closure: Env)
 
+  var line: Int = 0
+  var col: Int  = 0
+
+  def withPos(l: Int, c: Int): Expr =
+    line = l
+    col = c
+    this
+
 private[ming] class Env(
   val bindings: mutable.Map[String, Expr],
   val parent: Option[Env]
