@@ -497,6 +497,9 @@ func eqValue(left value, right value) bool {
 	case *closureProc:
 		right, ok := right.(*closureProc)
 		return ok && left == right
+	case *recordValue:
+		right, ok := right.(*recordValue)
+		return ok && left == right
 	case voidValue:
 		_, ok := right.(voidValue)
 		return ok

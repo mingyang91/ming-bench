@@ -745,6 +745,8 @@ func (it *interpreter) evalList(list *listExpr, scope *env) (value, error) {
 			return it.evalOr(scope, list.elements[1:])
 		case "define":
 			return it.evalDefine(scope, list)
+		case "define-record-type":
+			return it.evalDefineRecordType(scope, list)
 		case "define-syntax":
 			return it.evalDefineSyntax(scope, list)
 		case "if":
@@ -1792,6 +1794,8 @@ func formatValue(v value) (string, error) {
 		return formatPair(value)
 	case *builtinProc, *closureProc:
 		return "#<procedure>", nil
+	case *recordValue:
+		return fmt.Sprintf("#<record %s>", value.typ.name), nil
 	case voidValue:
 		return "#<void>", nil
 	default:
