@@ -91,6 +91,8 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 				return evalIf(e, env)
 			case "lambda":
 				return evalLambda(e, env)
+			case "case-lambda":
+				return evalCaseLambda(e, env)
 			case "quote":
 				if len(e.Elems) != 2 {
 					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quote requires 1 argument", sym.Line, sym.Col)}
@@ -182,6 +184,8 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 			return result, nil
 		case *LambdaVal:
 			return applyLambda(f, args)
+		case *CaseLambdaVal:
+			return applyCaseLambda(f, args)
 		default:
 			line, col := e.Elems[0].pos()
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", line, col)}
@@ -284,6 +288,47 @@ func evalLambda(e *ListExpr, env *Env) (Value, error) {
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected parameter list", e.Line, e.Col)}
 	}
+}
+
+func evalCaseLambda(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Elems) < 2 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda requires at least one clause", e.Line, e.Col)}
+	}
+	var clauses []*LambdaVal
+	for _, clauseExpr := range e.Elems[1:] {
+		cl, ok := clauseExpr.(*ListExpr)
+		if !ok || len(cl.Elems) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: bad clause", e.Line, e.Col)}
+		}
+		switch pl := cl.Elems[0].(type) {
+		case *ListExpr:
+			params, rest, err := parseParams(pl.Elems, cl.Line, cl.Col)
+			if err != nil {
+				return nil, err
+			}
+			clauses = append(clauses, &LambdaVal{Params: params, RestParam: rest, Body: cl.Elems[1:], Env: env})
+		case *SymbolExpr:
+			clauses = append(clauses, &LambdaVal{RestParam: pl.Name, Body: cl.Elems[1:], Env: env})
+		default:
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: expected parameter list", e.Line, e.Col)}
+		}
+	}
+	return &CaseLambdaVal{Clauses: clauses}, nil
+}
+
+func applyCaseLambda(f *CaseLambdaVal, args []Value) (Value, error) {
+	for _, clause := range f.Clauses {
+		if clause.RestParam != "" {
+			if len(args) >= len(clause.Params) {
+				return applyLambda(clause, args)
+			}
+		} else {
+			if len(args) == len(clause.Params) {
+				return applyLambda(clause, args)
+			}
+		}
+	}
+	return nil, &EvalError{Message: fmt.Sprintf("case-lambda: no matching clause for %d arguments", len(args))}
 }
 
 // applyLambda calls a lambda with the given arguments, handling rest params.
@@ -595,6 +640,8 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 			return f.Fn(callArgs)
 		case *LambdaVal:
 			return applyLambda(f, callArgs)
+		case *CaseLambdaVal:
+			return applyCaseLambda(f, callArgs)
 		default:
 			return nil, &EvalError{Message: "apply: first argument must be a procedure"}
 		}
@@ -869,6 +916,18 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 		}
 		_, ok := args[0].(*SymbolVal)
 		return &BoolVal{Val: ok}, nil
+	}})
+
+	env.set("procedure?", &BuiltinFunc{Name: "procedure?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "procedure?: need 1 argument"}
+		}
+		switch args[0].(type) {
+		case *LambdaVal, *BuiltinFunc, *CaseLambdaVal:
+			return &BoolVal{Val: true}, nil
+		default:
+			return &BoolVal{Val: false}, nil
+		}
 	}})
 
 	// eq? — identity/simple equality
@@ -1297,6 +1356,8 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 				val, err = f.Fn(callArgs)
 			case *LambdaVal:
 				val, err = applyLambda(f, callArgs)
+			case *CaseLambdaVal:
+				val, err = applyCaseLambda(f, callArgs)
 			default:
 				return nil, &EvalError{Message: "map: first argument must be a procedure"}
 			}

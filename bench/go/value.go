@@ -47,6 +47,15 @@ func (v *LambdaVal) String() string {
 	return "#<procedure>"
 }
 
+// CaseLambdaVal is a procedure with multiple arity clauses.
+type CaseLambdaVal struct {
+	Clauses []*LambdaVal
+}
+
+func (v *CaseLambdaVal) String() string {
+	return "#<procedure>"
+}
+
 func (v *IntVal) String() string {
 	return fmt.Sprintf("%d", v.Val)
 }
