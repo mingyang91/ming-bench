@@ -503,6 +503,61 @@ pub fn builtin_string_copy(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     }
 }
 
+pub fn builtin_string_to_list(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("string->list: expected 1 argument".into()));
+    }
+    match &args[0] {
+        Val::Str(s) => {
+            let chars: Vec<Val> = s.chars().map(Val::Char).collect();
+            Ok(Val::List(chars))
+        }
+        _ => Err(EvalError::Type("string->list: expected string".into())),
+    }
+}
+
+pub fn builtin_list_to_string(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("list->string: expected 1 argument".into()));
+    }
+    let items = match &args[0] {
+        Val::List(v) => v,
+        _ => return Err(EvalError::Type("list->string: expected list".into())),
+    };
+    let mut s = String::new();
+    for item in items {
+        match item {
+            Val::Char(c) => s.push(*c),
+            _ => return Err(EvalError::Type("list->string: expected list of characters".into())),
+        }
+    }
+    Ok(Val::Str(s))
+}
+
+pub fn builtin_char_to_integer(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("char->integer: expected 1 argument".into()));
+    }
+    match &args[0] {
+        Val::Char(c) => Ok(Val::Int(*c as i64)),
+        _ => Err(EvalError::Type("char->integer: expected char".into())),
+    }
+}
+
+pub fn builtin_integer_to_char(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("integer->char: expected 1 argument".into()));
+    }
+    match &args[0] {
+        Val::Int(n) => {
+            let c = char::from_u32(*n as u32)
+                .ok_or_else(|| EvalError::Runtime(format!("integer->char: invalid code point {n}")))?;
+            Ok(Val::Char(c))
+        }
+        _ => Err(EvalError::Type("integer->char: expected integer".into())),
+    }
+}
+
 pub fn vals_equal(a: &Val, b: &Val) -> bool {
     match (a, b) {
         (Val::Int(x), Val::Int(y)) => x == y,

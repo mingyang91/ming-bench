@@ -192,6 +192,10 @@ impl Env {
             ("string->symbol", builtin_string_to_symbol),
             ("string-ref", builtin_string_ref),
             ("string-copy", builtin_string_copy),
+            ("string->list", builtin_string_to_list),
+            ("list->string", builtin_list_to_string),
+            ("char->integer", builtin_char_to_integer),
+            ("integer->char", builtin_integer_to_char),
             ("apply", builtin_apply),
             ("equal?", builtin_equal),
             ("eq?", builtin_eq_pred),
@@ -1114,30 +1118,38 @@ fn eval_string_set(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalErro
     if args.len() != 3 {
         return Err(EvalError::Arity(format!("string-set!: expected 3 arguments at {span}")));
     }
-    let target = eval(&args[0], env)?;
-    let idx = match eval(&args[1], env)? {
+    // String literals are immutable (L15)
+    if matches!(&args[0].kind, ExprKind::Str(_)) {
+        return Err(EvalError::Runtime("string-set!: strings are immutable".into()));
+    }
+    let name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type(format!("string-set!: expected variable at {span}"))),
+    };
+    let idx_val = eval(&args[1], env)?;
+    let idx = match idx_val {
         Val::Int(n) => n as usize,
         _ => return Err(EvalError::Type("string-set!: expected integer index".into())),
     };
-    let ch = match eval(&args[2], env)? {
+    let char_val = eval(&args[2], env)?;
+    let ch = match char_val {
         Val::Char(c) => c,
-        _ => return Err(EvalError::Type("string-set!: expected char".into())),
+        _ => return Err(EvalError::Type("string-set!: expected character".into())),
     };
-    let mut s = match target {
-        Val::Str(s) => s,
-        _ => return Err(EvalError::Type("string-set!: expected string".into())),
-    };
-    let mut chars: Vec<char> = s.chars().collect();
-    if idx >= chars.len() {
-        return Err(EvalError::Runtime("string-set!: index out of range".into()));
+    let current = env.get(&name).ok_or_else(|| EvalError::UnboundVariable(format!("{name} at {span}")))?;
+    match current {
+        Val::Str(s) => {
+            let mut chars: Vec<char> = s.chars().collect();
+            if idx >= chars.len() {
+                return Err(EvalError::Runtime("string-set!: index out of range".into()));
+            }
+            chars[idx] = ch;
+            let new_str: String = chars.into_iter().collect();
+            env.set(&name, Val::Str(new_str))?;
+            Ok(Val::Void)
+        }
+        _ => Err(EvalError::Type("string-set!: expected string".into())),
     }
-    chars[idx] = ch;
-    s = chars.into_iter().collect();
-    // If the first argument is a variable, update it in the environment
-    if let ExprKind::Symbol(name) = &args[0].kind {
-        env.set(name, Val::Str(s))?;
-    }
-    Ok(Val::Void)
 }
 
 fn eval_letrec(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
