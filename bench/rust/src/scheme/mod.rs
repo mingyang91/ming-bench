@@ -19,6 +19,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "/",
     "call-with-current-continuation",
     "call/cc",
+    "dynamic-wind",
     "<",
     "<=",
     "denominator",
@@ -244,6 +245,15 @@ type BindingRef = Rc<RefCell<Value>>;
 type MacroRef = Rc<SyntaxRulesMacro>;
 type PairRef = Rc<Pair>;
 type ContinuationRef = Rc<ContinuationChain>;
+type WindRef = Rc<DynamicWind>;
+
+#[derive(Clone)]
+struct DynamicWind {
+    in_thunk: Value,
+    in_position: SourcePos,
+    out_thunk: Value,
+    out_position: SourcePos,
+}
 
 #[derive(Clone)]
 struct MacroRule {
@@ -1001,9 +1011,7 @@ fn format_value_inner(
         Value::Builtin(_)
         | Value::Procedure(_)
         | Value::NativeProcedure(_)
-        | Value::Continuation(_) => {
-            "#<procedure>".into()
-        }
+        | Value::Continuation(_) => "#<procedure>".into(),
         Value::Uninitialized => "#<uninitialized>".into(),
         Value::Void => "#<void>".into(),
     }
@@ -1402,19 +1410,54 @@ enum MachineFrame {
         position: SourcePos,
         current_arg_position: SourcePos,
     },
+    DynamicWindEnter {
+        in_thunk: Value,
+        in_position: SourcePos,
+        body_thunk: Value,
+        body_position: SourcePos,
+        out_thunk: Value,
+        out_position: SourcePos,
+        env: EnvRef,
+    },
+    DynamicWindExit {
+        wind: WindRef,
+        env: EnvRef,
+    },
+    DynamicWindReturn {
+        result: Value,
+    },
+    WindTransition {
+        actions: Vec<WindAction>,
+        next_index: usize,
+        active_winds: Vec<WindRef>,
+        jump_value: Value,
+        target_cont: ContinuationRef,
+        env: EnvRef,
+    },
 }
 
 #[derive(Clone)]
 enum ContinuationChain {
     Empty,
     Frame(MachineFrame, ContinuationRef),
+    Wind(WindRef, ContinuationRef),
+}
+
+#[derive(Clone)]
+enum WindAction {
+    Exit(WindRef),
+    Enter(WindRef),
 }
 
 fn machine_value(value: Value, cont: ContinuationRef) -> (MachineControl, ContinuationRef) {
     (MachineControl::Value(value), cont)
 }
 
-fn machine_expr(expr: Expr, env: EnvRef, cont: ContinuationRef) -> (MachineControl, ContinuationRef) {
+fn machine_expr(
+    expr: Expr,
+    env: EnvRef,
+    cont: ContinuationRef,
+) -> (MachineControl, ContinuationRef) {
     (MachineControl::Expr(expr, env), cont)
 }
 
@@ -1424,6 +1467,148 @@ fn empty_continuation() -> ContinuationRef {
 
 fn push_continuation(frame: MachineFrame, next: ContinuationRef) -> ContinuationRef {
     Rc::new(ContinuationChain::Frame(frame, next))
+}
+
+fn push_wind(wind: WindRef, next: ContinuationRef) -> ContinuationRef {
+    Rc::new(ContinuationChain::Wind(wind, next))
+}
+
+fn build_continuation_with_winds(frame: MachineFrame, active_winds: &[WindRef]) -> ContinuationRef {
+    let mut cont = empty_continuation();
+
+    for wind in active_winds {
+        cont = push_wind(wind.clone(), cont);
+    }
+
+    push_continuation(frame, cont)
+}
+
+fn collect_winds(cont: &ContinuationRef) -> Vec<WindRef> {
+    let mut current = cont.clone();
+    let mut winds = Vec::new();
+
+    loop {
+        match current.as_ref() {
+            ContinuationChain::Empty => break,
+            ContinuationChain::Frame(_, next) | ContinuationChain::Wind(_, next) => {
+                if let ContinuationChain::Wind(wind, _) = current.as_ref() {
+                    winds.push(wind.clone());
+                }
+                current = next.clone();
+            }
+        }
+    }
+
+    winds.reverse();
+    winds
+}
+
+fn shared_wind_prefix_len(left: &[WindRef], right: &[WindRef]) -> usize {
+    left.iter()
+        .zip(right.iter())
+        .take_while(|(left, right)| Rc::ptr_eq(left, right))
+        .count()
+}
+
+fn strip_wind(cont: ContinuationRef, expected: &WindRef) -> ContinuationRef {
+    match cont.as_ref() {
+        ContinuationChain::Wind(wind, next) if Rc::ptr_eq(wind, expected) => next.clone(),
+        _ => {
+            debug_assert!(false, "dynamic-wind marker missing from continuation");
+            cont
+        }
+    }
+}
+
+fn machine_resume_continuation(
+    jump_value: Value,
+    current_cont: ContinuationRef,
+    target_cont: ContinuationRef,
+    env: EnvRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    let current_winds = collect_winds(&current_cont);
+    let target_winds = collect_winds(&target_cont);
+    let shared = shared_wind_prefix_len(&current_winds, &target_winds);
+    let mut actions = Vec::new();
+
+    for wind in current_winds[shared..].iter().rev() {
+        actions.push(WindAction::Exit(wind.clone()));
+    }
+
+    for wind in target_winds[shared..].iter() {
+        actions.push(WindAction::Enter(wind.clone()));
+    }
+
+    machine_continue_wind_transition(actions, 0, current_winds, jump_value, target_cont, env)
+}
+
+fn machine_continue_wind_transition(
+    actions: Vec<WindAction>,
+    next_index: usize,
+    active_winds: Vec<WindRef>,
+    jump_value: Value,
+    target_cont: ContinuationRef,
+    env: EnvRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    let Some(action) = actions.get(next_index).cloned() else {
+        return Ok(machine_value(jump_value, target_cont));
+    };
+
+    match action {
+        WindAction::Exit(wind) => {
+            let next_active_winds = if let Some(last) = active_winds.last() {
+                debug_assert!(Rc::ptr_eq(last, &wind));
+                active_winds[..active_winds.len() - 1].to_vec()
+            } else {
+                debug_assert!(false, "cannot exit a missing dynamic-wind frame");
+                Vec::new()
+            };
+
+            let next_cont = build_continuation_with_winds(
+                MachineFrame::WindTransition {
+                    actions,
+                    next_index: next_index + 1,
+                    active_winds: next_active_winds.clone(),
+                    jump_value,
+                    target_cont,
+                    env: env.clone(),
+                },
+                &next_active_winds,
+            );
+
+            machine_apply_value(
+                wind.out_thunk.clone(),
+                wind.out_position,
+                Vec::new(),
+                env,
+                next_cont,
+            )
+        }
+        WindAction::Enter(wind) => {
+            let mut next_active_winds = active_winds.clone();
+            next_active_winds.push(wind.clone());
+
+            let next_cont = build_continuation_with_winds(
+                MachineFrame::WindTransition {
+                    actions,
+                    next_index: next_index + 1,
+                    active_winds: next_active_winds,
+                    jump_value,
+                    target_cont,
+                    env: env.clone(),
+                },
+                &active_winds,
+            );
+
+            machine_apply_value(
+                wind.in_thunk.clone(),
+                wind.in_position,
+                Vec::new(),
+                env,
+                next_cont,
+            )
+        }
+    }
 }
 
 fn machine_eval_program(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
@@ -1441,6 +1626,7 @@ fn machine_eval_program(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError>
                 ContinuationChain::Frame(frame, next) => {
                     machine_apply_frame(frame.clone(), value, next.clone())?
                 }
+                ContinuationChain::Wind(_, next) => machine_value(value, next.clone()),
             },
         };
 
@@ -1513,7 +1699,10 @@ fn machine_eval_list(
 
     if let ExprKind::Symbol(name) = &head.kind {
         if name == "define-syntax" {
-            return Ok(machine_value(eval_define_syntax(tail, env, head.pos)?, cont));
+            return Ok(machine_value(
+                eval_define_syntax(tail, env, head.pos)?,
+                cont,
+            ));
         }
 
         if let Some(transformer) = Environment::lookup_macro(&env, name) {
@@ -1540,7 +1729,10 @@ fn machine_eval_list(
             "do" => Ok(machine_expr(desugar_do(tail, head.pos)?, env, cont)),
             "let" => Ok(machine_expr(desugar_let(tail, head.pos)?, env, cont)),
             "let*" => Ok(machine_expr(desugar_let_star(tail, head.pos)?, env, cont)),
-            "letrec" => Ok(machine_value(eval_letrec(tail, env, head.pos, false)?, cont)),
+            "letrec" => Ok(machine_value(
+                eval_letrec(tail, env, head.pos, false)?,
+                cont,
+            )),
             "letrec*" => Ok(machine_value(eval_letrec(tail, env, head.pos, true)?, cont)),
             _ => Ok(machine_start_call(head.clone(), tail.to_vec(), env, cont)),
         };
@@ -1679,7 +1871,9 @@ fn machine_apply_frame(
     cont: ContinuationRef,
 ) -> Result<(MachineControl, ContinuationRef), EvalError> {
     match frame {
-        MachineFrame::Sequence { remaining, env } => Ok(machine_start_sequence(&remaining, env, cont)),
+        MachineFrame::Sequence { remaining, env } => {
+            Ok(machine_start_sequence(&remaining, env, cont))
+        }
         MachineFrame::DefineValue { name, env } => {
             Environment::define(&env, name, value);
             Ok(machine_value(Value::Void, cont))
@@ -1702,7 +1896,11 @@ fn machine_apply_frame(
                 }
             }
         }
-        MachineFrame::ApplyOperator { args, env, position } => {
+        MachineFrame::ApplyOperator {
+            args,
+            env,
+            position,
+        } => {
             if let Some((current_arg, rest)) = args.split_last() {
                 let next_cont = push_continuation(
                     MachineFrame::ApplyArgs {
@@ -1746,6 +1944,60 @@ fn machine_apply_frame(
                 machine_apply_value(callable, position, evaluated, env, cont)
             }
         }
+        MachineFrame::DynamicWindEnter {
+            in_thunk,
+            in_position,
+            body_thunk,
+            body_position,
+            out_thunk,
+            out_position,
+            env,
+        } => {
+            let wind = Rc::new(DynamicWind {
+                in_thunk,
+                in_position,
+                out_thunk,
+                out_position,
+            });
+            let wind_cont = push_wind(wind.clone(), cont);
+            let next_cont = push_continuation(
+                MachineFrame::DynamicWindExit {
+                    wind,
+                    env: env.clone(),
+                },
+                wind_cont,
+            );
+            machine_apply_value(body_thunk, body_position, Vec::new(), env, next_cont)
+        }
+        MachineFrame::DynamicWindExit { wind, env } => {
+            let next_cont = push_continuation(
+                MachineFrame::DynamicWindReturn { result: value },
+                strip_wind(cont, &wind),
+            );
+            machine_apply_value(
+                wind.out_thunk.clone(),
+                wind.out_position,
+                Vec::new(),
+                env,
+                next_cont,
+            )
+        }
+        MachineFrame::DynamicWindReturn { result } => Ok(machine_value(result, cont)),
+        MachineFrame::WindTransition {
+            actions,
+            next_index,
+            active_winds,
+            jump_value,
+            target_cont,
+            env,
+        } => machine_continue_wind_transition(
+            actions,
+            next_index,
+            active_winds,
+            jump_value,
+            target_cont,
+            env,
+        ),
     }
 }
 
@@ -1758,10 +2010,13 @@ fn machine_apply_value(
 ) -> Result<(MachineControl, ContinuationRef), EvalError> {
     match callable {
         Value::Builtin(name) => machine_apply_builtin(name, args, position, env, cont),
-        Value::Procedure(procedure) => machine_apply_user_procedure(procedure, args, position, cont),
-        Value::NativeProcedure(procedure) => {
-            Ok(machine_value(apply_native_procedure(procedure, args, position)?, cont))
+        Value::Procedure(procedure) => {
+            machine_apply_user_procedure(procedure, args, position, cont)
         }
+        Value::NativeProcedure(procedure) => Ok(machine_value(
+            apply_native_procedure(procedure, args, position)?,
+            cont,
+        )),
         Value::Continuation(saved) => {
             if args.len() != 1 {
                 return Err(EvalError::wrong_arg_count(
@@ -1772,7 +2027,7 @@ fn machine_apply_value(
                 ));
             }
 
-            Ok(machine_value(args[0].value.clone(), saved))
+            machine_resume_continuation(args[0].value.clone(), cont, saved, env)
         }
         other => Err(EvalError::not_callable(other.type_name(), position)),
     }
@@ -1831,7 +2086,44 @@ fn machine_apply_builtin(
                 Value::Continuation(cont.clone()),
                 position,
             )];
-            machine_apply_value(args[0].value.clone(), args[0].position, continuation_arg, env, cont)
+            machine_apply_value(
+                args[0].value.clone(),
+                args[0].position,
+                continuation_arg,
+                env,
+                cont,
+            )
+        }
+        "dynamic-wind" => {
+            if args.len() != 3 {
+                return Err(EvalError::wrong_arg_count(
+                    "dynamic-wind",
+                    "exactly 3",
+                    args.len(),
+                    position,
+                ));
+            }
+
+            let next_cont = push_continuation(
+                MachineFrame::DynamicWindEnter {
+                    in_thunk: args[0].value.clone(),
+                    in_position: args[0].position,
+                    body_thunk: args[1].value.clone(),
+                    body_position: args[1].position,
+                    out_thunk: args[2].value.clone(),
+                    out_position: args[2].position,
+                    env: env.clone(),
+                },
+                cont,
+            );
+
+            machine_apply_value(
+                args[0].value.clone(),
+                args[0].position,
+                Vec::new(),
+                env,
+                next_cont,
+            )
         }
         "apply" => {
             if args.len() < 2 {
@@ -1865,7 +2157,10 @@ fn machine_apply_builtin(
                 cont,
             )
         }
-        _ => Ok(machine_value(apply_builtin(name, &args, position, env)?, cont)),
+        _ => Ok(machine_value(
+            apply_builtin(name, &args, position, env)?,
+            cont,
+        )),
     }
 }
 
@@ -1887,7 +2182,11 @@ fn build_if_expr(test: Expr, then_branch: Expr, else_branch: Expr, position: Sou
     )
 }
 
-fn build_plain_let_expr(bindings: Vec<(String, Expr)>, body: Vec<Expr>, position: SourcePos) -> Expr {
+fn build_plain_let_expr(
+    bindings: Vec<(String, Expr)>,
+    body: Vec<Expr>,
+    position: SourcePos,
+) -> Expr {
     let binding_exprs = bindings
         .into_iter()
         .map(|(name, value)| Expr::list(vec![Expr::symbol(name, position), value], position))
@@ -2228,13 +2527,23 @@ fn desugar_do(exprs: &[Expr], position: SourcePos) -> Result<Expr, EvalError> {
         position,
     );
     let true_branch = build_begin_expr(result_exprs, position);
-    let loop_body = vec![build_if_expr(test_expr, true_branch, false_branch, position)];
+    let loop_body = vec![build_if_expr(
+        test_expr,
+        true_branch,
+        false_branch,
+        position,
+    )];
     let loop_bindings = bindings
         .into_iter()
         .map(|binding| (binding.name, binding.init))
         .collect::<Vec<_>>();
 
-    Ok(build_named_let_expr(loop_name, loop_bindings, loop_body, position))
+    Ok(build_named_let_expr(
+        loop_name,
+        loop_bindings,
+        loop_body,
+        position,
+    ))
 }
 
 fn eval(expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
