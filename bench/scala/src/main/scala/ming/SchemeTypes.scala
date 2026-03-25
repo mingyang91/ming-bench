@@ -14,6 +14,7 @@ private[ming] enum Expr:
   case Lambda(params: List[String], restParam: Option[String], body: List[Expr], closure: Env)
   case Pair(car: Expr, cdr: Expr)
   case Macro(literals: List[String], rules: List[(List[Expr], Expr)], defEnv: Env)
+  case Record(typeName: String, typeId: Int, fields: Array[Expr], fieldNames: Array[String])
 
   var line: Int = 0
   var col: Int  = 0

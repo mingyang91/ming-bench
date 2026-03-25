@@ -8,23 +8,24 @@ object Evaluator:
     try
       expr match
         case Expr.Num(_) | Expr.Rational(_, _) | Expr.Real(_) | Expr.Bool(_) | Expr.Str(_) | Expr.Chr(_) |
-            Expr.Lambda(_, _, _, _) | Expr.Pair(_, _) | Expr.Macro(_, _, _) =>
+            Expr.Lambda(_, _, _, _) | Expr.Pair(_, _) | Expr.Macro(_, _, _) | Expr.Record(_, _, _, _) =>
           expr
         case Expr.Sym(name) => env.lookup(name)
         case Expr.Lst(Nil)  => throw EvalError("empty application")
         case Expr.Lst(Expr.Sym("quote") :: args) =>
           if args.length != 1 then throw EvalError("quote: need exactly 1 argument")
           args.head
-        case Expr.Lst(Expr.Sym("if") :: args)            => evalIf(args, env)
-        case Expr.Lst(Expr.Sym("define") :: args)        => evalDefine(args, env)
-        case Expr.Lst(Expr.Sym("set!") :: args)          => evalSet(args, env)
-        case Expr.Lst(Expr.Sym("lambda") :: args)        => evalLambda(args, env)
-        case Expr.Lst(Expr.Sym("let") :: args)           => evalLet(args, env)
-        case Expr.Lst(Expr.Sym("begin") :: args)         => evalBegin(args, env)
-        case Expr.Lst(Expr.Sym("cond") :: clauses)       => evalCond(clauses, env)
-        case Expr.Lst(Expr.Sym("and") :: args)           => evalAnd(args, env)
-        case Expr.Lst(Expr.Sym("or") :: args)            => evalOr(args, env)
-        case Expr.Lst(Expr.Sym("define-syntax") :: args) => evalDefineSyntax(args, env)
+        case Expr.Lst(Expr.Sym("if") :: args)                 => evalIf(args, env)
+        case Expr.Lst(Expr.Sym("define") :: args)             => evalDefine(args, env)
+        case Expr.Lst(Expr.Sym("set!") :: args)               => evalSet(args, env)
+        case Expr.Lst(Expr.Sym("lambda") :: args)             => evalLambda(args, env)
+        case Expr.Lst(Expr.Sym("let") :: args)                => evalLet(args, env)
+        case Expr.Lst(Expr.Sym("begin") :: args)              => evalBegin(args, env)
+        case Expr.Lst(Expr.Sym("cond") :: clauses)            => evalCond(clauses, env)
+        case Expr.Lst(Expr.Sym("and") :: args)                => evalAnd(args, env)
+        case Expr.Lst(Expr.Sym("or") :: args)                 => evalOr(args, env)
+        case Expr.Lst(Expr.Sym("define-syntax") :: args)      => evalDefineSyntax(args, env)
+        case Expr.Lst(Expr.Sym("define-record-type") :: args) => RecordOps.evalDefineRecordType(args, env)
         case Expr.Lst((head @ Expr.Sym(name)) :: _) if isMacro(name, env) =>
           val mac = env.lookup(name).asInstanceOf[Expr.Macro]
           val (expanded, hygieneEnv) =
@@ -163,9 +164,10 @@ object Evaluator:
       )
 
   private def applyProc(func: Expr, args: List[Expr]): Expr = func match
-    case Expr.Sym(name) if name == "apply" => applyApply(args)
-    case Expr.Sym(name) if name == "map"   => applyMap(Expr.Sym("map"), args)
-    case Expr.Sym(name)                    => applyBuiltin(name, args)
+    case Expr.Sym(name) if name == "apply"              => applyApply(args)
+    case Expr.Sym(name) if name == "map"                => applyMap(Expr.Sym("map"), args)
+    case Expr.Sym(name) if name.startsWith("%%record-") => RecordOps.applyRecordOp(name, args)
+    case Expr.Sym(name)                                 => applyBuiltin(name, args)
     case Expr.Lambda(params, restParam, body, closure) =>
       restParam match
         case None =>
