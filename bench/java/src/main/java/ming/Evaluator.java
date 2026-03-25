@@ -2,6 +2,7 @@ package ming;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -18,6 +19,31 @@ public class Evaluator {
         record Void() implements Val {}
         record Builtin(String name, java.util.function.Function<List<Val>, Val> fn) implements Val {}
         record Lambda(List<String> params, List<Val> body, Env closure) implements Val {}
+    }
+
+    // ── Token with position ─────────────────────────────────────
+    private record Token(String text, int line, int col) {}
+
+    // ── Position tracking ───────────────────────────────────────
+    private final IdentityHashMap<Val, int[]> positions = new IdentityHashMap<>();
+
+    private void setPos(Val v, int line, int col) {
+        positions.put(v, new int[]{line, col});
+    }
+
+    private void copyPos(Val from, Val to) {
+        int[] pos = positions.get(from);
+        if (pos != null) positions.put(to, pos);
+    }
+
+    private String posPrefix(Val v) {
+        int[] pos = positions.get(v);
+        if (pos != null) return pos[0] + ":" + pos[1] + ": ";
+        return "";
+    }
+
+    private EvalError posError(Val v, String msg) {
+        return new EvalError(posPrefix(v) + msg);
     }
 
     // ── Environment ─────────────────────────────────────────────
@@ -75,64 +101,88 @@ public class Evaluator {
     }
 
     // ── Tokenizer ────────────────────────────────────────────────
-    private static List<String> tokenize(String input) {
-        List<String> tokens = new ArrayList<>();
+    private static List<Token> tokenize(String input) {
+        List<Token> tokens = new ArrayList<>();
         int i = 0;
         int len = input.length();
+        int line = 1;
+        int col = 1;
         while (i < len) {
             char c = input.charAt(i);
-            if (Character.isWhitespace(c)) { i++; continue; }
-            if (c == ';') { while (i < len && input.charAt(i) != '\n') i++; continue; }
-            if (c == '(') { tokens.add("("); i++; continue; }
-            if (c == ')') { tokens.add(")"); i++; continue; }
-            if (c == '\'') { tokens.add("'"); i++; continue; }
+            if (c == '\n') { i++; line++; col = 1; continue; }
+            if (Character.isWhitespace(c)) { i++; col++; continue; }
+            if (c == ';') {
+                while (i < len && input.charAt(i) != '\n') { i++; col++; }
+                continue;
+            }
+            if (c == '(') { tokens.add(new Token("(", line, col)); i++; col++; continue; }
+            if (c == ')') { tokens.add(new Token(")", line, col)); i++; col++; continue; }
+            if (c == '\'') { tokens.add(new Token("'", line, col)); i++; col++; continue; }
             if (c == '"') {
+                int startCol = col;
                 StringBuilder sb = new StringBuilder("\"");
-                i++;
+                i++; col++;
                 while (i < len && input.charAt(i) != '"') {
-                    if (input.charAt(i) == '\\') { sb.append(input.charAt(i++)); }
-                    sb.append(input.charAt(i++));
+                    if (input.charAt(i) == '\\') { sb.append(input.charAt(i)); i++; col++; }
+                    sb.append(input.charAt(i)); i++; col++;
                 }
                 sb.append('"');
-                if (i < len) i++; // skip closing "
-                tokens.add(sb.toString());
+                if (i < len) { i++; col++; } // skip closing "
+                tokens.add(new Token(sb.toString(), line, startCol));
                 continue;
             }
             // atom
+            int startCol = col;
             StringBuilder sb = new StringBuilder();
             while (i < len && !Character.isWhitespace(input.charAt(i))
                     && input.charAt(i) != '(' && input.charAt(i) != ')'
                     && input.charAt(i) != '"' && input.charAt(i) != ';') {
-                sb.append(input.charAt(i++));
+                sb.append(input.charAt(i)); i++; col++;
             }
-            tokens.add(sb.toString());
+            tokens.add(new Token(sb.toString(), line, startCol));
         }
         return tokens;
     }
 
     // ── Parser ───────────────────────────────────────────────────
-    private Val parse(List<String> tokens, int[] idx) throws EvalError {
+    private Val parse(List<Token> tokens, int[] idx) throws EvalError {
         if (idx[0] >= tokens.size()) throw new EvalError("unexpected EOF");
-        String tok = tokens.get(idx[0]++);
-        if (tok.equals("(")) {
+        Token tok = tokens.get(idx[0]++);
+        if (tok.text().equals("(")) {
             List<Val> elems = new ArrayList<>();
-            while (idx[0] < tokens.size() && !tokens.get(idx[0]).equals(")")) {
+            while (idx[0] < tokens.size() && !tokens.get(idx[0]).text().equals(")")) {
                 elems.add(parse(tokens, idx));
             }
-            if (idx[0] >= tokens.size()) throw new EvalError("missing )");
+            if (idx[0] >= tokens.size()) throw new EvalError(tok.line() + ":" + tok.col() + ": missing )");
             idx[0]++; // skip )
             Val list = new Val.Nil();
             for (int i = elems.size() - 1; i >= 0; i--) {
-                list = new Val.PairV(elems.get(i), list);
+                Val pair = new Val.PairV(elems.get(i), list);
+                copyPos(elems.get(i), pair);
+                list = pair;
+            }
+            // Set position of the whole list to the opening paren
+            if (list instanceof Val.PairV) {
+                setPos(list, tok.line(), tok.col());
+            } else {
+                // empty list ()
+                setPos(list, tok.line(), tok.col());
             }
             return list;
         }
-        if (tok.equals(")")) throw new EvalError("unexpected )");
-        if (tok.equals("'")) {
+        if (tok.text().equals(")")) throw new EvalError(tok.line() + ":" + tok.col() + ": unexpected )");
+        if (tok.text().equals("'")) {
             Val quoted = parse(tokens, idx);
-            return new Val.PairV(new Val.Sym("quote"), new Val.PairV(quoted, new Val.Nil()));
+            Val inner = new Val.PairV(quoted, new Val.Nil());
+            Val quoteSym = new Val.Sym("quote");
+            setPos(quoteSym, tok.line(), tok.col());
+            Val result = new Val.PairV(quoteSym, inner);
+            setPos(result, tok.line(), tok.col());
+            return result;
         }
-        return parseAtom(tok);
+        Val atom = parseAtom(tok.text());
+        setPos(atom, tok.line(), tok.col());
+        return atom;
     }
 
     private Val parseAtom(String tok) {
@@ -156,7 +206,13 @@ public class Evaluator {
             case Val.Void v -> v;
             case Val.Builtin b -> b;
             case Val.Lambda l -> l;
-            case Val.Sym sym -> env.lookup(sym.name());
+            case Val.Sym sym -> {
+                try {
+                    yield env.lookup(sym.name());
+                } catch (EvalError e) {
+                    throw posError(expr, e.getMessage());
+                }
+            }
             case Val.PairV pair -> evalList(pair, env);
         };
     }
@@ -169,20 +225,20 @@ public class Evaluator {
             switch (sym.name()) {
                 case "quote" -> {
                     if (!(pair.cdr() instanceof Val.PairV q))
-                        throw new EvalError("quote requires 1 argument");
+                        throw posError(pair, "quote requires 1 argument");
                     return q.car();
                 }
                 case "if" -> {
-                    return evalIf(pair.cdr(), env);
+                    return evalIf(pair.cdr(), env, pair);
                 }
                 case "define" -> {
-                    return evalDefine(pair.cdr(), env);
+                    return evalDefine(pair.cdr(), env, pair);
                 }
                 case "lambda" -> {
-                    return evalLambda(pair.cdr(), env);
+                    return evalLambda(pair.cdr(), env, pair);
                 }
                 case "begin" -> { return evalBegin(pair.cdr(), env); }
-                case "let" -> { return evalLet(pair.cdr(), env); }
+                case "let" -> { return evalLet(pair.cdr(), env, pair); }
                 case "cond" -> { return evalCond(pair.cdr(), env); }
                 case "and" -> { return evalAnd(pair.cdr(), env); }
                 case "or" -> { return evalOr(pair.cdr(), env); }
@@ -192,34 +248,34 @@ public class Evaluator {
         // Function call
         Val fn = eval(head, env);
         List<Val> args = evalArgs(pair.cdr(), env);
-        return applyFn(fn, args);
+        return applyFn(fn, args, pair);
     }
 
-    private Val applyFn(Val fn, List<Val> args) throws EvalError {
+    private Val applyFn(Val fn, List<Val> args, Val callSite) throws EvalError {
         if (fn instanceof Val.Builtin builtin) {
             try {
                 return builtin.fn().apply(args);
             } catch (RuntimeException e) {
-                throw new EvalError(e.getMessage());
+                throw posError(callSite, e.getMessage());
             }
         }
         if (fn instanceof Val.Lambda lambda) {
             if (args.size() != lambda.params().size())
-                throw new EvalError("expected " + lambda.params().size() + " arguments, got " + args.size());
+                throw posError(callSite, "expected " + lambda.params().size() + " arguments, got " + args.size());
             Env callEnv = new Env(lambda.closure());
             for (int i = 0; i < lambda.params().size(); i++) {
                 callEnv.define(lambda.params().get(i), args.get(i));
             }
             return evalBody(lambda.body(), callEnv);
         }
-        throw new EvalError("not a procedure: " + display(fn));
+        throw posError(callSite, "not a procedure: " + display(fn));
     }
 
-    private Val evalIf(Val args, Env env) throws EvalError {
-        if (!(args instanceof Val.PairV p1)) throw new EvalError("if requires a condition");
+    private Val evalIf(Val args, Env env, Val form) throws EvalError {
+        if (!(args instanceof Val.PairV p1)) throw posError(form, "if requires a condition");
         Val cond = eval(p1.car(), env);
         Val rest = p1.cdr();
-        if (!(rest instanceof Val.PairV p2)) throw new EvalError("if requires a consequent");
+        if (!(rest instanceof Val.PairV p2)) throw posError(form, "if requires a consequent");
         if (isTruthy(cond)) {
             return eval(p2.car(), env);
         }
@@ -230,12 +286,12 @@ public class Evaluator {
         return new Val.Void();
     }
 
-    private Val evalDefine(Val args, Env env) throws EvalError {
-        if (!(args instanceof Val.PairV p)) throw new EvalError("define requires arguments");
+    private Val evalDefine(Val args, Env env, Val form) throws EvalError {
+        if (!(args instanceof Val.PairV p)) throw posError(form, "define requires arguments");
         Val target = p.car();
         if (target instanceof Val.Sym sym) {
             // (define x expr)
-            if (!(p.cdr() instanceof Val.PairV valPair)) throw new EvalError("define requires a value");
+            if (!(p.cdr() instanceof Val.PairV valPair)) throw posError(form, "define requires a value");
             Val val = eval(valPair.car(), env);
             env.define(sym.name(), val);
             return new Val.Void();
@@ -243,36 +299,36 @@ public class Evaluator {
         if (target instanceof Val.PairV namePair) {
             // (define (f params...) body)
             if (!(namePair.car() instanceof Val.Sym fnName))
-                throw new EvalError("define: expected function name");
+                throw posError(form, "define: expected function name");
             List<String> params = new ArrayList<>();
             Val paramList = namePair.cdr();
             while (paramList instanceof Val.PairV pp) {
                 if (!(pp.car() instanceof Val.Sym paramSym))
-                    throw new EvalError("define: expected parameter name");
+                    throw posError(form, "define: expected parameter name");
                 params.add(paramSym.name());
                 paramList = pp.cdr();
             }
             List<Val> body = collectList(p.cdr());
-            if (body.isEmpty()) throw new EvalError("define: missing body");
+            if (body.isEmpty()) throw posError(form, "define: missing body");
             Val.Lambda lambda = new Val.Lambda(params, body, env);
             env.define(fnName.name(), lambda);
             return new Val.Void();
         }
-        throw new EvalError("define: invalid syntax");
+        throw posError(form, "define: invalid syntax");
     }
 
-    private Val evalLambda(Val args, Env env) throws EvalError {
-        if (!(args instanceof Val.PairV p)) throw new EvalError("lambda requires arguments");
+    private Val evalLambda(Val args, Env env, Val form) throws EvalError {
+        if (!(args instanceof Val.PairV p)) throw posError(form, "lambda requires arguments");
         List<String> params = new ArrayList<>();
         Val paramList = p.car();
         while (paramList instanceof Val.PairV pp) {
             if (!(pp.car() instanceof Val.Sym paramSym))
-                throw new EvalError("lambda: expected parameter name");
+                throw posError(form, "lambda: expected parameter name");
             params.add(paramSym.name());
             paramList = pp.cdr();
         }
         List<Val> body = collectList(p.cdr());
-        if (body.isEmpty()) throw new EvalError("lambda: missing body");
+        if (body.isEmpty()) throw posError(form, "lambda: missing body");
         return new Val.Lambda(params, body, env);
     }
 
@@ -326,43 +382,42 @@ public class Evaluator {
         return result;
     }
 
-    private Val evalLet(Val args, Env env) throws EvalError {
-        if (!(args instanceof Val.PairV p)) throw new EvalError("let: invalid syntax");
+    private Val evalLet(Val args, Env env, Val form) throws EvalError {
+        if (!(args instanceof Val.PairV p)) throw posError(form, "let: invalid syntax");
         // Named let: (let name ((var init) ...) body ...)
         if (p.car() instanceof Val.Sym nameSym) {
-            if (!(p.cdr() instanceof Val.PairV rest)) throw new EvalError("let: invalid syntax");
+            if (!(p.cdr() instanceof Val.PairV rest)) throw posError(form, "let: invalid syntax");
             List<String> params = new ArrayList<>();
             List<Val> inits = new ArrayList<>();
             Val bindings = rest.car();
             while (bindings instanceof Val.PairV bp) {
-                if (!(bp.car() instanceof Val.PairV binding)) throw new EvalError("let: invalid binding");
-                if (!(binding.car() instanceof Val.Sym varSym)) throw new EvalError("let: expected variable name");
+                if (!(bp.car() instanceof Val.PairV binding)) throw posError(form, "let: invalid binding");
+                if (!(binding.car() instanceof Val.Sym varSym)) throw posError(form, "let: expected variable name");
                 params.add(varSym.name());
-                if (!(binding.cdr() instanceof Val.PairV valPair)) throw new EvalError("let: missing init");
+                if (!(binding.cdr() instanceof Val.PairV valPair)) throw posError(form, "let: missing init");
                 inits.add(eval(valPair.car(), env));
                 bindings = bp.cdr();
             }
             List<Val> body = collectList(rest.cdr());
-            if (body.isEmpty()) throw new EvalError("let: missing body");
-            // Create lambda and bind it in its own closure
+            if (body.isEmpty()) throw posError(form, "let: missing body");
             Env letEnv = new Env(env);
             Val.Lambda lambda = new Val.Lambda(params, body, letEnv);
             letEnv.define(nameSym.name(), lambda);
-            return applyFn(lambda, inits);
+            return applyFn(lambda, inits, form);
         }
         // Regular let: (let ((var init) ...) body ...)
         Env letEnv = new Env(env);
         Val bindings = p.car();
         while (bindings instanceof Val.PairV bp) {
-            if (!(bp.car() instanceof Val.PairV binding)) throw new EvalError("let: invalid binding");
-            if (!(binding.car() instanceof Val.Sym varSym)) throw new EvalError("let: expected variable name");
-            if (!(binding.cdr() instanceof Val.PairV valPair)) throw new EvalError("let: missing init");
+            if (!(bp.car() instanceof Val.PairV binding)) throw posError(form, "let: invalid binding");
+            if (!(binding.car() instanceof Val.Sym varSym)) throw posError(form, "let: expected variable name");
+            if (!(binding.cdr() instanceof Val.PairV valPair)) throw posError(form, "let: missing init");
             Val val = eval(valPair.car(), env);
             letEnv.define(varSym.name(), val);
             bindings = bp.cdr();
         }
         List<Val> body = collectList(p.cdr());
-        if (body.isEmpty()) throw new EvalError("let: missing body");
+        if (body.isEmpty()) throw posError(form, "let: missing body");
         return evalBody(body, letEnv);
     }
 
@@ -531,7 +586,8 @@ public class Evaluator {
 
     // ── Public API ───────────────────────────────────────────────
     public String evalStr(String input) throws EvalError {
-        List<String> tokens = tokenize(input);
+        positions.clear();
+        List<Token> tokens = tokenize(input);
         if (tokens.isEmpty()) throw new EvalError("empty input");
         int[] idx = {0};
         Env env = createGlobalEnv();
