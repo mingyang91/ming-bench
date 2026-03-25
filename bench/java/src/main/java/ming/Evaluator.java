@@ -52,6 +52,13 @@ public class Evaluator {
 
     private record Lambda(List<String> params, String restParam, List<Object> body, Env closureEnv) {}
 
+    // --- case-lambda (multiple-arity dispatch) ---
+
+    private static class CaseLambda {
+        final List<Lambda> clauses;
+        CaseLambda(List<Lambda> clauses) { this.clauses = clauses; }
+    }
+
     // Sentinel for void (define returns this)
     private static final Object VOID = new Object() {
         @Override public String toString() { return "#<void>"; }
@@ -202,6 +209,7 @@ public class Evaluator {
         globalEnv.define("string?", (BuiltinProc) args -> args.get(0) instanceof SchemeString);
         globalEnv.define("symbol?", (BuiltinProc) args -> args.get(0) instanceof String);
         globalEnv.define("char?", (BuiltinProc) args -> args.get(0) instanceof SchemeChar);
+        globalEnv.define("procedure?", (BuiltinProc) args -> args.get(0) instanceof Lambda || args.get(0) instanceof BuiltinProc || args.get(0) instanceof CaseLambda);
 
         // I/O
         globalEnv.define("display", (BuiltinProc) args -> {
@@ -412,6 +420,8 @@ public class Evaluator {
                     results.add(builtin.apply(callArgs));
                 } else if (proc instanceof Lambda lambda) {
                     results.add(applyLambda(lambda, callArgs));
+                } else if (proc instanceof CaseLambda cl) {
+                    results.add(applyCaseLambda(cl, callArgs));
                 } else {
                     throw new EvalError("map: not a procedure");
                 }
@@ -481,6 +491,9 @@ public class Evaluator {
             }
             if (proc instanceof Lambda lambda) {
                 return applyLambda(lambda, callArgs);
+            }
+            if (proc instanceof CaseLambda cl) {
+                return applyCaseLambda(cl, callArgs);
             }
             throw new EvalError("apply: not a procedure");
         });
@@ -814,6 +827,33 @@ public class Evaluator {
                         }
                         return new Lambda(params, restParam, body, env);
                     }
+                    case "case-lambda" -> {
+                        List<Lambda> clauses = new ArrayList<>();
+                        for (int i = 1; i < list.size(); i++) {
+                            Object clauseObj = list.get(i);
+                            if (clauseObj instanceof SourceExpr se) clauseObj = se.expr;
+                            List<?> clause = (List<?>) clauseObj;
+                            Object cpObj = clause.get(0);
+                            if (cpObj instanceof SourceExpr se) cpObj = se.expr;
+                            List<?> cpList = (List<?>) cpObj;
+                            List<String> cParams = new ArrayList<>();
+                            String cRest = null;
+                            for (int j = 0; j < cpList.size(); j++) {
+                                Object p = cpList.get(j);
+                                if (p instanceof SourceExpr se) p = se.expr;
+                                if (".".equals(p)) {
+                                    Object rp = cpList.get(j + 1);
+                                    if (rp instanceof SourceExpr se) rp = se.expr;
+                                    cRest = (String) rp;
+                                    break;
+                                }
+                                cParams.add((String) p);
+                            }
+                            List<Object> cBody = new ArrayList<>(clause.subList(1, clause.size()));
+                            clauses.add(new Lambda(cParams, cRest, cBody, env));
+                        }
+                        return new CaseLambda(clauses);
+                    }
                     case "let" -> {
                         int offset;
                         String loopName = null;
@@ -1044,6 +1084,9 @@ public class Evaluator {
             if (proc instanceof Lambda lambda) {
                 return applyLambda(lambda, args);
             }
+            if (proc instanceof CaseLambda cl) {
+                return applyCaseLambda(cl, args);
+            }
             throw new EvalError("cannot apply: " + schemeToString(proc));
         }
         throw new EvalError("unknown expression type");
@@ -1072,6 +1115,18 @@ public class Evaluator {
             result = eval(bodyExpr, callEnv);
         }
         return result;
+    }
+
+    private Object applyCaseLambda(CaseLambda cl, List<Object> args) throws EvalError {
+        for (Lambda clause : cl.clauses) {
+            int required = clause.params.size();
+            if (clause.restParam != null) {
+                if (args.size() >= required) return applyLambda(clause, args);
+            } else {
+                if (args.size() == required) return applyLambda(clause, args);
+            }
+        }
+        throw new EvalError("case-lambda: no matching clause for " + args.size() + " arguments");
     }
 
     private Object javaListToScheme(List<Object> items) {
@@ -1464,6 +1519,7 @@ public class Evaluator {
             return sb.toString();
         }
         if (val instanceof Lambda) return "#<procedure>";
+        if (val instanceof CaseLambda) return "#<procedure>";
         if (val instanceof SyntaxRulesMacro) return "#<macro>";
         if (val instanceof ResolvedValue rv) return schemeToString(rv.value);
         return val.toString();
