@@ -61,7 +61,7 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 	case *RationalExpr:
 		return makeRat(e.Num, e.Den), nil
 	case *StringExpr:
-		return &StringVal{Val: e.Val}, nil
+		return &StringVal{Val: e.Val, Immutable: true}, nil
 	case *BoolExpr:
 		return &BoolVal{Val: e.Val}, nil
 	case *CharExpr:
@@ -392,7 +392,7 @@ func quoteExpr(expr Expr) (Value, error) {
 	case *RationalExpr:
 		return makeRat(e.Num, e.Den), nil
 	case *StringExpr:
-		return &StringVal{Val: e.Val}, nil
+		return &StringVal{Val: e.Val, Immutable: true}, nil
 	case *BoolExpr:
 		return &BoolVal{Val: e.Val}, nil
 	case *CharExpr:
@@ -1088,23 +1088,88 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 		}
 		s, ok := args[0].(*StringVal)
 		if !ok {
-			return nil, &EvalError{Message: "string-set!: not a string"}
+			return nil, &EvalError{Message: "string-set!: first argument must be a string"}
+		}
+		if s.Immutable {
+			return nil, &EvalError{Message: "string-set!: strings are immutable"}
 		}
 		idx, ok := args[1].(*IntVal)
 		if !ok {
-			return nil, &EvalError{Message: "string-set!: index not a number"}
+			return nil, &EvalError{Message: "string-set!: second argument must be an integer"}
 		}
-		ch, ok := args[2].(*CharVal)
+		c, ok := args[2].(*CharVal)
 		if !ok {
-			return nil, &EvalError{Message: "string-set!: not a character"}
+			return nil, &EvalError{Message: "string-set!: third argument must be a character"}
 		}
-		if idx.Val < 0 || idx.Val >= int64(len(s.Val)) {
+		runes := []rune(s.Val)
+		if idx.Val < 0 || int(idx.Val) >= len(runes) {
 			return nil, &EvalError{Message: "string-set!: index out of range"}
 		}
-		b := []byte(s.Val)
-		b[idx.Val] = byte(ch.Val)
-		s.Val = string(b)
+		runes[idx.Val] = c.Val
+		s.Val = string(runes)
 		return &VoidVal{}, nil
+	}})
+
+	env.set("string->list", &BuiltinFunc{Name: "string->list", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string->list: need 1 argument"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string->list: not a string"}
+		}
+		var result Value = &NilVal{}
+		runes := []rune(s.Val)
+		for i := len(runes) - 1; i >= 0; i-- {
+			result = &PairVal{Car: &CharVal{Val: runes[i]}, Cdr: result}
+		}
+		return result, nil
+	}})
+
+	env.set("list->string", &BuiltinFunc{Name: "list->string", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "list->string: need 1 argument"}
+		}
+		var runes []rune
+		cur := args[0]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				break
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "list->string: not a proper list"}
+			}
+			ch, ok := p.Car.(*CharVal)
+			if !ok {
+				return nil, &EvalError{Message: "list->string: element is not a character"}
+			}
+			runes = append(runes, ch.Val)
+			cur = p.Cdr
+		}
+		return &StringVal{Val: string(runes)}, nil
+	}})
+
+	env.set("char->integer", &BuiltinFunc{Name: "char->integer", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "char->integer: need 1 argument"}
+		}
+		ch, ok := args[0].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char->integer: not a character"}
+		}
+		return &IntVal{Val: int64(ch.Val)}, nil
+	}})
+
+	env.set("integer->char", &BuiltinFunc{Name: "integer->char", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "integer->char: need 1 argument"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "integer->char: not a number"}
+		}
+		return &CharVal{Val: rune(n.Val)}, nil
 	}})
 
 	env.set("char?", &BuiltinFunc{Name: "char?", Fn: func(args []Value) (Value, error) {
