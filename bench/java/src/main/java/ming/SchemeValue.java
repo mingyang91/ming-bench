@@ -25,6 +25,14 @@ public sealed interface SchemeValue {
     record MacroVal(List<String> literals, List<SchemeValue> patterns, List<SchemeValue> templates, Environment defEnv) implements SchemeValue {}
     record CaseLambdaVal(List<LambdaVal> clauses) implements SchemeValue {}
     record RecordVal(Object tag, String typeName, String[] fieldNames, SchemeValue[] fields) implements SchemeValue {}
+    final class VectorVal implements SchemeValue {
+        private final SchemeValue[] elements;
+        public VectorVal(SchemeValue[] elements) { this.elements = elements; }
+        public SchemeValue[] elements() { return elements; }
+        public SchemeValue ref(int i) { return elements[i]; }
+        public void set(int i, SchemeValue v) { elements[i] = v; }
+        public int length() { return elements.length; }
+    }
 
     @FunctionalInterface
     interface Builtin {
@@ -73,6 +81,15 @@ public sealed interface SchemeValue {
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";
             case MacroVal v -> "#<macro>";
             case RecordVal v -> "#<record:" + v.typeName() + ">";
+            case VectorVal v -> {
+                var sb = new StringBuilder("#(");
+                for (int i = 0; i < v.length(); i++) {
+                    if (i > 0) sb.append(" ");
+                    sb.append(v.ref(i).display());
+                }
+                sb.append(")");
+                yield sb.toString();
+            }
         };
     }
 
