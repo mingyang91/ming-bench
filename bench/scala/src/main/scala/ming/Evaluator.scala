@@ -15,15 +15,21 @@ object Evaluator:
   /** Thrown when a continuation is invoked from a non-CPS context (e.g., inside a builtin). */
   class ContinuationThrown(val bounce: Bounce) extends Exception with scala.util.control.NoStackTrace
 
-  // --- dynamic-wind support ---
-  var winders: List[Winder] = Nil
+  // --- dynamic-wind support (thread-local for concurrency) ---
+  private val _winders: ThreadLocal[List[Winder]] = ThreadLocal.withInitial(() => Nil)
+  def winders: List[Winder] = _winders.get()
+  def winders_=(v: List[Winder]): Unit = _winders.set(v)
 
-  // --- exception handling support ---
+  // --- exception handling support (thread-local for concurrency) ---
   type ExceptionHandler = SchemeVal => Bounce
-  var exceptionHandlers: List[ExceptionHandler] = Nil
+  private val _exceptionHandlers: ThreadLocal[List[ExceptionHandler]] = ThreadLocal.withInitial(() => Nil)
+  def exceptionHandlers: List[ExceptionHandler] = _exceptionHandlers.get()
+  def exceptionHandlers_=(v: List[ExceptionHandler]): Unit = _exceptionHandlers.set(v)
 
-  // --- Step-limit support ---
-  private var stepBudget: Int = -1 // negative = unlimited
+  // --- Step-limit support (thread-local for concurrency) ---
+  private val _stepBudget: ThreadLocal[Int] = ThreadLocal.withInitial(() => -1)
+  private def stepBudget: Int = _stepBudget.get()
+  private def stepBudget_=(v: Int): Unit = _stepBudget.set(v)
 
   // --- Entry points ---
   def evalStr(input: String): String =

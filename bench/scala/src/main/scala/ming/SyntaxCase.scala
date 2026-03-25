@@ -3,8 +3,10 @@ package ming
 import Evaluator.{Bounce, Cont, Done, More}
 
 object SyntaxCase:
-  // Current pattern bindings from enclosing syntax-case / with-syntax forms
-  var patternBindings: Macro.Bindings = Map.empty
+  // Current pattern bindings from enclosing syntax-case / with-syntax forms (thread-local)
+  private val _patternBindings: ThreadLocal[Macro.Bindings] = ThreadLocal.withInitial(() => Map.empty)
+  def patternBindings: Macro.Bindings = _patternBindings.get()
+  def patternBindings_=(v: Macro.Bindings): Unit = _patternBindings.set(v)
 
   /** Evaluate (syntax-case expr (literals) clause ...) */
   def evalSyntaxCaseK(args: List[SchemeVal], env: Env, k: Cont): Bounce =
