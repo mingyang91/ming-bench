@@ -13,6 +13,7 @@ pub struct LambdaData {
 pub enum Value {
     Integer(i64),
     Boolean(bool),
+    Char(char),
     Str(String),
     Symbol(String),
     List(Vec<Value>),
@@ -94,6 +95,12 @@ impl Value {
             Value::Integer(n) => n.to_string(),
             Value::Boolean(true) => "#t".into(),
             Value::Boolean(false) => "#f".into(),
+            Value::Char(c) => format!("#\\{}", match *c {
+                ' ' => "space".to_string(),
+                '\n' => "newline".to_string(),
+                '\t' => "tab".to_string(),
+                c => c.to_string(),
+            }),
             Value::Str(s) => format!("\"{}\"", s),
             Value::Symbol(s) => s.clone(),
             Value::List(elems) => {
@@ -102,6 +109,24 @@ impl Value {
             }
             Value::Lambda(_) => "#<procedure>".into(),
             Value::Void => "".into(),
+        }
+    }
+
+    /// Format for `display` — no quotes on strings, raw chars
+    pub fn to_write_string(&self) -> String {
+        self.to_display_string()
+    }
+
+    /// Format for `display` — no quotes on strings, raw chars
+    pub fn to_scheme_display(&self) -> String {
+        match self {
+            Value::Str(s) => s.clone(),
+            Value::Char(c) => c.to_string(),
+            Value::List(elems) => {
+                let inner: Vec<String> = elems.iter().map(|v| v.to_scheme_display()).collect();
+                format!("({})", inner.join(" "))
+            }
+            _ => self.to_display_string(),
         }
     }
 

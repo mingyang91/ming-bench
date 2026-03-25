@@ -5,11 +5,12 @@ use crate::scheme::value::{Env, LambdaData, Value};
 
 pub struct Evaluator {
     env: Env,
+    output: String,
 }
 
 impl Evaluator {
     pub fn new() -> Self {
-        Evaluator { env: Env::new() }
+        Evaluator { env: Env::new(), output: String::new() }
     }
 
     pub fn eval(&mut self, expr: &Expr) -> Result<Value, EvalError> {
@@ -19,11 +20,19 @@ impl Evaluator {
         result
     }
 
+    pub fn take_output(&mut self) -> String {
+        std::mem::take(&mut self.output)
+    }
+
     fn is_builtin(name: &str) -> bool {
         matches!(name, "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">="
             | "not" | "cons" | "car" | "cdr" | "null?" | "list" | "length"
             | "append" | "number?" | "boolean?" | "string?" | "pair?" | "symbol?"
-            | "zero?" | "modulo" | "remainder" | "abs")
+            | "zero?" | "modulo" | "remainder" | "abs"
+            | "display" | "write" | "newline" | "char?"
+            | "string-append" | "string-length" | "substring"
+            | "string->number" | "number->string"
+            | "symbol->string" | "string->symbol" | "string-ref")
     }
 
     fn eval_in_env(&mut self, expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
@@ -479,6 +488,92 @@ impl Evaluator {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("abs: expected 1 argument at {pos}"))); }
                 let n = self.expect_integer(&args[0], "abs", pos)?;
                 Ok(Value::Integer(n.abs()))
+            }
+            "display" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("display: expected 1 argument at {pos}"))); }
+                self.output.push_str(&args[0].to_scheme_display());
+                Ok(Value::Void)
+            }
+            "write" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("write: expected 1 argument at {pos}"))); }
+                self.output.push_str(&args[0].to_write_string());
+                Ok(Value::Void)
+            }
+            "newline" => {
+                if !args.is_empty() { return Err(EvalError::Arity(format!("newline: expected 0 arguments at {pos}"))); }
+                self.output.push('\n');
+                Ok(Value::Void)
+            }
+            "char?" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("char?: expected 1 argument at {pos}"))); }
+                Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
+            }
+            "string-append" => {
+                let mut result = String::new();
+                for arg in args {
+                    match arg {
+                        Value::Str(s) => result.push_str(s),
+                        _ => return Err(EvalError::Type(format!("string-append: expected string at {pos}"))),
+                    }
+                }
+                Ok(Value::Str(result))
+            }
+            "string-length" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("string-length: expected 1 argument at {pos}"))); }
+                match &args[0] {
+                    Value::Str(s) => Ok(Value::Integer(s.len() as i64)),
+                    _ => Err(EvalError::Type(format!("string-length: expected string at {pos}"))),
+                }
+            }
+            "substring" => {
+                if args.len() != 3 { return Err(EvalError::Arity(format!("substring: expected 3 arguments at {pos}"))); }
+                let s = match &args[0] {
+                    Value::Str(s) => s,
+                    _ => return Err(EvalError::Type(format!("substring: expected string at {pos}"))),
+                };
+                let start = self.expect_integer(&args[1], "substring", pos)? as usize;
+                let end = self.expect_integer(&args[2], "substring", pos)? as usize;
+                Ok(Value::Str(s[start..end].to_string()))
+            }
+            "string->number" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("string->number: expected 1 argument at {pos}"))); }
+                match &args[0] {
+                    Value::Str(s) => match s.parse::<i64>() {
+                        Ok(n) => Ok(Value::Integer(n)),
+                        Err(_) => Ok(Value::Boolean(false)),
+                    },
+                    _ => Err(EvalError::Type(format!("string->number: expected string at {pos}"))),
+                }
+            }
+            "number->string" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("number->string: expected 1 argument at {pos}"))); }
+                let n = self.expect_integer(&args[0], "number->string", pos)?;
+                Ok(Value::Str(n.to_string()))
+            }
+            "symbol->string" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("symbol->string: expected 1 argument at {pos}"))); }
+                match &args[0] {
+                    Value::Symbol(s) => Ok(Value::Str(s.clone())),
+                    _ => Err(EvalError::Type(format!("symbol->string: expected symbol at {pos}"))),
+                }
+            }
+            "string->symbol" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("string->symbol: expected 1 argument at {pos}"))); }
+                match &args[0] {
+                    Value::Str(s) => Ok(Value::Symbol(s.clone())),
+                    _ => Err(EvalError::Type(format!("string->symbol: expected string at {pos}"))),
+                }
+            }
+            "string-ref" => {
+                if args.len() != 2 { return Err(EvalError::Arity(format!("string-ref: expected 2 arguments at {pos}"))); }
+                let s = match &args[0] {
+                    Value::Str(s) => s,
+                    _ => return Err(EvalError::Type(format!("string-ref: expected string at {pos}"))),
+                };
+                let idx = self.expect_integer(&args[1], "string-ref", pos)? as usize;
+                Ok(Value::Char(s.chars().nth(idx).ok_or_else(|| {
+                    EvalError::Type(format!("string-ref: index out of bounds at {pos}"))
+                })?))
             }
             _ => Err(EvalError::UnboundVariable(format!("{name} at {pos}"))),
         }
