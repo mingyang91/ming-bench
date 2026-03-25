@@ -1,19 +1,21 @@
-import { EvalError } from './evalError.js';
+import { EvalError, type SourceLocation } from './evalError.js';
+
+type Located<T> = T & { location: SourceLocation };
 
 type Expr =
-  | { kind: 'number'; value: number }
-  | { kind: 'boolean'; value: boolean }
-  | { kind: 'string'; value: string }
-  | { kind: 'symbol'; value: string }
-  | { kind: 'list'; items: Expr[] };
+  | Located<{ kind: 'number'; value: number }>
+  | Located<{ kind: 'boolean'; value: boolean }>
+  | Located<{ kind: 'string'; value: string }>
+  | Located<{ kind: 'symbol'; value: string }>
+  | Located<{ kind: 'list'; items: Expr[] }>;
 
 type Token =
-  | { kind: 'number'; value: number }
-  | { kind: 'boolean'; value: boolean }
-  | { kind: 'string'; value: string }
-  | { kind: 'symbol'; value: string }
-  | { kind: 'paren'; value: '(' | ')' }
-  | { kind: 'quote' };
+  | Located<{ kind: 'number'; value: number }>
+  | Located<{ kind: 'boolean'; value: boolean }>
+  | Located<{ kind: 'string'; value: string }>
+  | Located<{ kind: 'symbol'; value: string }>
+  | Located<{ kind: 'paren'; value: '(' | ')' }>
+  | Located<{ kind: 'quote' }>;
 
 interface NumberValue {
   kind: 'number';
@@ -84,11 +86,17 @@ interface Binding {
 interface ParserState {
   tokens: Token[];
   index: number;
+  eofLocation: SourceLocation;
 }
 
 interface LetBindingSpec {
   name: string;
   valueExpression: Expr;
+}
+
+interface TokenizationResult {
+  tokens: Token[];
+  eofLocation: SourceLocation;
 }
 
 class Environment {
@@ -131,7 +139,7 @@ const VOID_VALUE: VoidValue = { kind: 'void' };
 export function evalStr(input: string): string {
   const expressions = parseProgram(input);
   if (expressions.length === 0) {
-    throw new EvalError('empty input');
+    throw new EvalError('empty input', { line: 1, column: 1 });
   }
 
   const env = createGlobalEnvironment();
@@ -198,7 +206,8 @@ function createGlobalEnvironment(): Environment {
 }
 
 function parseProgram(input: string): Expr[] {
-  const state: ParserState = { tokens: tokenize(input), index: 0 };
+  const { tokens, eofLocation } = tokenize(input);
+  const state: ParserState = { tokens, index: 0, eofLocation };
   const expressions: Expr[] = [];
 
   while (state.index < state.tokens.length) {
@@ -208,9 +217,11 @@ function parseProgram(input: string): Expr[] {
   return expressions;
 }
 
-function tokenize(input: string): Token[] {
+function tokenize(input: string): TokenizationResult {
   const tokens: Token[] = [];
   let index = 0;
+  let line = 1;
+  let column = 1;
 
   while (index < input.length) {
     const char = input[index];
@@ -219,85 +230,101 @@ function tokenize(input: string): Token[] {
     }
 
     if (isWhitespace(char)) {
+      ({ line, column } = advanceLocation(char, line, column));
       index += 1;
       continue;
     }
 
     if (char === ';') {
-      index = skipComment(input, index);
+      const next = skipComment(input, index, line, column);
+      index = next.nextIndex;
+      line = next.nextLine;
+      column = next.nextColumn;
       continue;
     }
 
+    const location: SourceLocation = { line, column };
+
     if (char === '(' || char === ')') {
-      tokens.push({ kind: 'paren', value: char });
+      tokens.push({ kind: 'paren', value: char, location });
+      ({ line, column } = advanceLocation(char, line, column));
       index += 1;
       continue;
     }
 
     if (char === "'") {
-      tokens.push({ kind: 'quote' });
+      tokens.push({ kind: 'quote', location });
+      ({ line, column } = advanceLocation(char, line, column));
       index += 1;
       continue;
     }
 
     if (char === '"') {
-      const parsed = readStringToken(input, index);
-      tokens.push({ kind: 'string', value: parsed.value });
+      const parsed = readStringToken(input, index, line, column);
+      tokens.push({ kind: 'string', value: parsed.value, location });
       index = parsed.nextIndex;
+      line = parsed.nextLine;
+      column = parsed.nextColumn;
       continue;
     }
 
-    const parsed = readAtomToken(input, index);
+    const parsed = readAtomToken(input, index, line, column);
     tokens.push(parsed.token);
     index = parsed.nextIndex;
+    line = parsed.nextLine;
+    column = parsed.nextColumn;
   }
 
-  return tokens;
+  return { tokens, eofLocation: { line, column } };
 }
 
 function parseExpression(state: ParserState): Expr {
   const token = state.tokens[state.index];
   if (token === undefined) {
-    throw new EvalError('unexpected end of input');
+    throw new EvalError('unexpected end of input', state.eofLocation);
   }
 
   state.index += 1;
 
   switch (token.kind) {
     case 'number':
-      return { kind: 'number', value: token.value };
+      return { kind: 'number', value: token.value, location: token.location };
     case 'boolean':
-      return { kind: 'boolean', value: token.value };
+      return { kind: 'boolean', value: token.value, location: token.location };
     case 'string':
-      return { kind: 'string', value: token.value };
+      return { kind: 'string', value: token.value, location: token.location };
     case 'symbol':
-      return { kind: 'symbol', value: token.value };
+      return { kind: 'symbol', value: token.value, location: token.location };
     case 'quote':
       return {
         kind: 'list',
-        items: [{ kind: 'symbol', value: 'quote' }, parseExpression(state)],
+        items: [
+          { kind: 'symbol', value: 'quote', location: token.location },
+          parseExpression(state),
+        ],
+        location: token.location,
       };
     case 'paren':
       if (token.value === ')') {
-        throw new EvalError('unexpected )');
+        throw new EvalError('unexpected )', token.location);
       }
 
-      return parseList(state);
+      return parseList(state, token.location);
   }
 }
 
-function parseList(state: ParserState): Expr {
+function parseList(state: ParserState, location: SourceLocation): Expr {
   const items: Expr[] = [];
 
   while (true) {
     const token = state.tokens[state.index];
     if (token === undefined) {
-      throw new EvalError('unterminated list');
+      throw new EvalError('unterminated list', location);
     }
 
     if (token.kind === 'paren' && token.value === ')') {
       state.index += 1;
-      return { kind: 'list', items };
+      return { kind: 'list', items, location };
     }
 
     items.push(parseExpression(state));
@@ -305,22 +332,26 @@ function parseList(state: ParserState): Expr {
 }
 
 function evaluate(expression: Expr, env: Environment): SchemeValue {
-  switch (expression.kind) {
-    case 'number':
-      return numberValue(expression.value);
-    case 'boolean':
-      return booleanValue(expression.value);
-    case 'string':
-      return stringValue(expression.value);
-    case 'symbol': {
-      const value = env.lookup(expression.value);
-      if (value === undefined) {
-        throw new EvalError(`unbound variable: ${expression.value}`);
+  try {
+    switch (expression.kind) {
+      case 'number':
+        return numberValue(expression.value);
+      case 'boolean':
+        return booleanValue(expression.value);
+      case 'string':
+        return stringValue(expression.value);
+      case 'symbol': {
+        const value = env.lookup(expression.value);
+        if (value === undefined) {
+          throw new EvalError(`unbound variable: ${expression.value}`);
+        }
+        return value;
       }
-      return value;
+      case 'list':
+        return evaluateList(expression.items, env);
     }
-    case 'list':
-      return evaluateList(expression.items, env);
+  } catch (error) {
+    rethrowWithLocation(error, expression.location);
   }
 }
 
@@ -465,7 +496,7 @@ function defineVariable(name: string, valueExpression: Expr, env: Environment): 
   return VOID_VALUE;
 }
 
-function isLambdaExpression(expression: Expr): expression is { kind: 'list'; items: Expr[] } {
+function isLambdaExpression(expression: Expr): expression is Extract<Expr, { kind: 'list' }> {
   return (
     expression.kind === 'list' &&
     expression.items.length > 0 &&
@@ -475,7 +506,7 @@ function isLambdaExpression(expression: Expr): expression is { kind: 'list'; ite
 }
 
 function evaluateNamedLambda(
-  expression: { kind: 'list'; items: Expr[] },
+  expression: Extract<Expr, { kind: 'list' }>,
   env: Environment,
   name: string,
 ): ClosureProcedureValue {
@@ -912,17 +943,41 @@ function isWhitespace(char: string): boolean {
   return /\s/u.test(char);
 }
 
-function skipComment(input: string, index: number): number {
+function skipComment(
+  input: string,
+  index: number,
+  line: number,
+  column: number,
+): { nextIndex: number; nextLine: number; nextColumn: number } {
   let nextIndex = index;
+  let nextLine = line;
+  let nextColumn = column;
+
   while (nextIndex < input.length && input[nextIndex] !== '\n') {
+    ({ line: nextLine, column: nextColumn } = advanceLocation(
+      input[nextIndex],
+      nextLine,
+      nextColumn,
+    ));
     nextIndex += 1;
   }
-  return nextIndex;
+
+  return { nextIndex, nextLine, nextColumn };
 }
 
-function readStringToken(input: string, startIndex: number): { value: string; nextIndex: number } {
+function readStringToken(
+  input: string,
+  startIndex: number,
+  startLine: number,
+  startColumn: number,
+): { value: string; nextIndex: number; nextLine: number; nextColumn: number } {
+  const startLocation: SourceLocation = { line: startLine, column: startColumn };
   let value = '';
   let index = startIndex + 1;
+  let line = startLine;
+  let column = startColumn;
+
+  ({ line, column } = advanceLocation('"', line, column));
 
   while (index < input.length) {
     const char = input[index];
@@ -931,26 +986,35 @@ function readStringToken(input: string, startIndex: number): { value: string; ne
     }
 
     if (char === '"') {
-      return { value, nextIndex: index + 1 };
+      const next = advanceLocation(char, line, column);
+      return {
+        value,
+        nextIndex: index + 1,
+        nextLine: next.line,
+        nextColumn: next.column,
+      };
     }
 
     if (char === '\\') {
+      ({ line, column } = advanceLocation(char, line, column));
       index += 1;
       const escaped = input[index];
       if (escaped === undefined) {
-        throw new EvalError('unterminated string literal');
+        throw new EvalError('unterminated string literal', startLocation);
       }
 
       value += decodeEscape(escaped);
+      ({ line, column } = advanceLocation(escaped, line, column));
       index += 1;
       continue;
     }
 
     value += char;
+    ({ line, column } = advanceLocation(char, line, column));
     index += 1;
   }
 
-  throw new EvalError('unterminated string literal');
+  throw new EvalError('unterminated string literal', startLocation);
 }
 
 function decodeEscape(char: string): string {
@@ -970,14 +1034,28 @@ function decodeEscape(char: string): string {
   }
 }
 
-function readAtomToken(input: string, startIndex: number): { token: Token; nextIndex: number } {
+function readAtomToken(
+  input: string,
+  startIndex: number,
+  startLine: number,
+  startColumn: number,
+): { token: Token; nextIndex: number; nextLine: number; nextColumn: number } {
   let index = startIndex;
+  let line = startLine;
+  let column = startColumn;
+
   while (index < input.length && !isTokenBoundary(input[index])) {
+    ({ line, column } = advanceLocation(input[index], line, column));
     index += 1;
   }
 
   const raw = input.slice(startIndex, index);
-  return { token: tokenFromAtom(raw), nextIndex: index };
+  return {
+    token: tokenFromAtom(raw, { line: startLine, column: startColumn }),
+    nextIndex: index,
+    nextLine: line,
+    nextColumn: column,
+  };
 }
 
 function isTokenBoundary(char: string | undefined): boolean {
@@ -991,18 +1069,34 @@ function isTokenBoundary(char: string | undefined): boolean {
   );
 }
 
-function tokenFromAtom(raw: string): Token {
+function tokenFromAtom(raw: string, location: SourceLocation): Token {
   if (raw === '#t') {
-    return { kind: 'boolean', value: true };
+    return { kind: 'boolean', value: true, location };
   }
 
   if (raw === '#f') {
-    return { kind: 'boolean', value: false };
+    return { kind: 'boolean', value: false, location };
   }
 
   if (/^[+-]?\d+$/u.test(raw) && raw !== '+' && raw !== '-') {
-    return { kind: 'number', value: Number(raw) };
+    return { kind: 'number', value: Number(raw), location };
   }
 
-  return { kind: 'symbol', value: raw };
+  return { kind: 'symbol', value: raw, location };
+}
+
+function advanceLocation(char: string, line: number, column: number): SourceLocation {
+  if (char === '\n') {
+    return { line: line + 1, column: 1 };
+  }
+
+  return { line, column: column + 1 };
+}
+
+function rethrowWithLocation(error: unknown, location: SourceLocation): never {
+  if (error instanceof EvalError) {
+    throw error.withLocation(location);
+  }
+
+  throw error;
 }
