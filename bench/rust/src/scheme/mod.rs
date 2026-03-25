@@ -372,6 +372,7 @@ fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
                     "begin" => return eval_begin(&elems[1..], env),
                     "let" => return eval_let(&elems[1..], env, span),
                     "cond" => return eval_cond(&elems[1..], env),
+                    "set!" => return eval_set_bang(&elems[1..], env, span),
                     "string-set!" => return eval_string_set(&elems[1..], env, span),
                     _ => {}
                 }
@@ -444,6 +445,19 @@ fn eval_define(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
         }
         _ => Err(EvalError::Parse(format!("define: expected symbol or list at {span}"))),
     }
+}
+
+fn eval_set_bang(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity(format!("set!: expected 2 arguments at {span}")));
+    }
+    let name = match &args[0].kind {
+        ExprKind::Symbol(s) => s,
+        _ => return Err(EvalError::Parse(format!("set!: expected symbol at {span}"))),
+    };
+    let val = eval(&args[1], env)?;
+    env.set(name, val).map_err(|e| span_err(span, e))?;
+    Ok(Val::Void)
 }
 
 fn eval_if(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
