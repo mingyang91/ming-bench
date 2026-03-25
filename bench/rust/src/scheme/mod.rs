@@ -280,6 +280,46 @@ impl UserProcedure {
     }
 }
 
+#[derive(Clone)]
+struct RecordType {
+    name: String,
+    field_count: usize,
+}
+
+#[derive(Clone)]
+struct RecordInstance {
+    record_type: Rc<RecordType>,
+    fields: Vec<Value>,
+}
+
+#[derive(Clone)]
+enum NativeProcedure {
+    RecordConstructor {
+        name: String,
+        record_type: Rc<RecordType>,
+        field_indices: Vec<usize>,
+    },
+    RecordPredicate {
+        name: String,
+        record_type: Rc<RecordType>,
+    },
+    RecordAccessor {
+        name: String,
+        record_type: Rc<RecordType>,
+        field_index: usize,
+    },
+}
+
+impl NativeProcedure {
+    fn display_name(&self) -> &str {
+        match self {
+            NativeProcedure::RecordConstructor { name, .. }
+            | NativeProcedure::RecordPredicate { name, .. }
+            | NativeProcedure::RecordAccessor { name, .. } => name,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Environment {
     parent: Option<EnvRef>,
@@ -592,8 +632,10 @@ enum Value {
     Symbol(String),
     List(Vec<Value>),
     Pair(Rc<Pair>),
+    Record(Rc<RecordInstance>),
     Builtin(&'static str),
     Procedure(Rc<UserProcedure>),
+    NativeProcedure(Rc<NativeProcedure>),
     Void,
 }
 
@@ -607,7 +649,8 @@ impl Value {
             Value::Symbol(_) => "symbol",
             Value::List(_) => "list",
             Value::Pair(_) => "pair",
-            Value::Builtin(_) | Value::Procedure(_) => "procedure",
+            Value::Record(_) => "record",
+            Value::Builtin(_) | Value::Procedure(_) | Value::NativeProcedure(_) => "procedure",
             Value::Void => "void",
         }
     }
@@ -672,7 +715,10 @@ impl Value {
                 format!("({items})")
             }
             Value::Pair(pair) => format_pair(pair),
-            Value::Builtin(_) | Value::Procedure(_) => "#<procedure>".into(),
+            Value::Record(record) => format!("#<record {}>", record.record_type.name),
+            Value::Builtin(_) | Value::Procedure(_) | Value::NativeProcedure(_) => {
+                "#<procedure>".into()
+            }
             Value::Void => "#<void>".into(),
         }
     }
@@ -993,8 +1039,10 @@ fn scheme_eq(left: &Value, right: &Value) -> bool {
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::String(left), Value::String(right)) => Rc::ptr_eq(&left.chars, &right.chars),
         (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
+        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::NativeProcedure(left), Value::NativeProcedure(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,
     }
@@ -1022,8 +1070,10 @@ fn scheme_equal(left: &Value, right: &Value) -> bool {
         (Value::Pair(left), Value::Pair(right)) => {
             scheme_equal(&left.car, &right.car) && scheme_equal(&left.cdr, &right.cdr)
         }
+        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::NativeProcedure(left), Value::NativeProcedure(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,
     }
@@ -1060,6 +1110,7 @@ fn eval_list(items: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, 
 
         return match name.as_str() {
             "define" => eval_define(tail, env, head.pos),
+            "define-record-type" => eval_define_record_type(tail, env, head.pos),
             "set!" => eval_set(tail, env, head.pos),
             "if" => eval_if(tail, env, head.pos),
             "quote" => eval_quote(tail, head.pos),
@@ -1105,6 +1156,180 @@ fn eval_define_syntax(
         parse_syntax_rules(name, transformer_expr, env.clone(), transformer_expr.pos)?;
     Environment::define_macro(&env, name.clone(), transformer);
     Ok(Value::Void)
+}
+
+#[derive(Clone)]
+struct RecordFieldSpec {
+    name: String,
+    accessor_name: String,
+    position: SourcePos,
+}
+
+fn eval_define_record_type(
+    exprs: &[Expr],
+    env: EnvRef,
+    position: SourcePos,
+) -> Result<Value, EvalError> {
+    let [type_name_expr, constructor_expr, predicate_expr, field_exprs @ ..] = exprs else {
+        return Err(EvalError::syntax(
+            "define-record-type requires a type name, constructor, and predicate",
+            position,
+        ));
+    };
+
+    let type_name = parse_symbol_name(type_name_expr, "define-record-type name must be a symbol")?;
+    let (constructor_name, constructor_fields) = parse_record_constructor_spec(constructor_expr)?;
+    let predicate_name = parse_symbol_name(
+        predicate_expr,
+        "define-record-type predicate must be a symbol",
+    )?;
+    let fields = field_exprs
+        .iter()
+        .map(parse_record_field_spec)
+        .collect::<Result<Vec<_>, _>>()?;
+    let constructor_indices =
+        resolve_record_constructor_fields(&constructor_fields, &fields, constructor_expr.pos)?;
+
+    let record_type = Rc::new(RecordType {
+        name: type_name,
+        field_count: fields.len(),
+    });
+
+    Environment::define(
+        &env,
+        constructor_name.clone(),
+        Value::NativeProcedure(Rc::new(NativeProcedure::RecordConstructor {
+            name: constructor_name,
+            record_type: record_type.clone(),
+            field_indices: constructor_indices,
+        })),
+    );
+    Environment::define(
+        &env,
+        predicate_name.clone(),
+        Value::NativeProcedure(Rc::new(NativeProcedure::RecordPredicate {
+            name: predicate_name,
+            record_type: record_type.clone(),
+        })),
+    );
+
+    for (field_index, field) in fields.into_iter().enumerate() {
+        Environment::define(
+            &env,
+            field.accessor_name.clone(),
+            Value::NativeProcedure(Rc::new(NativeProcedure::RecordAccessor {
+                name: field.accessor_name,
+                record_type: record_type.clone(),
+                field_index,
+            })),
+        );
+    }
+
+    Ok(Value::Void)
+}
+
+fn parse_symbol_name(expr: &Expr, message: &str) -> Result<String, EvalError> {
+    let ExprKind::Symbol(name) = &expr.kind else {
+        return Err(EvalError::syntax(message, expr.pos));
+    };
+
+    Ok(name.clone())
+}
+
+fn parse_record_constructor_spec(expr: &Expr) -> Result<(String, Vec<String>), EvalError> {
+    let ExprKind::List(items) = &expr.kind else {
+        return Err(EvalError::syntax(
+            "define-record-type constructor must be a list",
+            expr.pos,
+        ));
+    };
+
+    let Some((name_expr, field_exprs)) = items.split_first() else {
+        return Err(EvalError::syntax(
+            "define-record-type constructor must include a name",
+            expr.pos,
+        ));
+    };
+
+    let name = parse_symbol_name(
+        name_expr,
+        "define-record-type constructor name must be a symbol",
+    )?;
+    let mut fields = Vec::with_capacity(field_exprs.len());
+    for field_expr in field_exprs {
+        fields.push(parse_symbol_name(
+            field_expr,
+            "define-record-type constructor fields must be symbols",
+        )?);
+    }
+
+    Ok((name, fields))
+}
+
+fn parse_record_field_spec(expr: &Expr) -> Result<RecordFieldSpec, EvalError> {
+    let ExprKind::List(items) = &expr.kind else {
+        return Err(EvalError::syntax(
+            "define-record-type field spec must be a list",
+            expr.pos,
+        ));
+    };
+
+    let [field_name_expr, accessor_name_expr] = items.as_slice() else {
+        return Err(EvalError::syntax(
+            "define-record-type field spec must contain a field name and accessor",
+            expr.pos,
+        ));
+    };
+
+    Ok(RecordFieldSpec {
+        name: parse_symbol_name(
+            field_name_expr,
+            "define-record-type field name must be a symbol",
+        )?,
+        accessor_name: parse_symbol_name(
+            accessor_name_expr,
+            "define-record-type accessor name must be a symbol",
+        )?,
+        position: expr.pos,
+    })
+}
+
+fn resolve_record_constructor_fields(
+    constructor_fields: &[String],
+    fields: &[RecordFieldSpec],
+    position: SourcePos,
+) -> Result<Vec<usize>, EvalError> {
+    let mut field_indices = HashMap::with_capacity(fields.len());
+    for (index, field) in fields.iter().enumerate() {
+        if field_indices.insert(field.name.clone(), index).is_some() {
+            return Err(EvalError::syntax(
+                format!("duplicate record field: {}", field.name),
+                field.position,
+            ));
+        }
+    }
+
+    let mut constructor_indices = Vec::with_capacity(constructor_fields.len());
+    let mut seen = HashSet::with_capacity(constructor_fields.len());
+    for field_name in constructor_fields {
+        let Some(&field_index) = field_indices.get(field_name) else {
+            return Err(EvalError::syntax(
+                format!("unknown constructor field: {field_name}"),
+                position,
+            ));
+        };
+
+        if !seen.insert(field_index) {
+            return Err(EvalError::syntax(
+                format!("duplicate constructor field: {field_name}"),
+                position,
+            ));
+        }
+
+        constructor_indices.push(field_index);
+    }
+
+    Ok(constructor_indices)
 }
 
 fn eval_all(exprs: &[Expr], env: EnvRef) -> Result<Vec<LocatedValue>, EvalError> {
@@ -1493,7 +1718,86 @@ fn apply(
     match callable {
         Value::Builtin(name) => apply_builtin(name, &args, position, env),
         Value::Procedure(procedure) => apply_user_procedure(procedure, args, position),
+        Value::NativeProcedure(procedure) => apply_native_procedure(procedure, args, position),
         other => Err(EvalError::not_callable(other.type_name(), position)),
+    }
+}
+
+fn apply_native_procedure(
+    procedure: Rc<NativeProcedure>,
+    args: Vec<LocatedValue>,
+    position: SourcePos,
+) -> Result<Value, EvalError> {
+    match procedure.as_ref() {
+        NativeProcedure::RecordConstructor {
+            name,
+            record_type,
+            field_indices,
+        } => {
+            if args.len() != field_indices.len() {
+                return Err(EvalError::wrong_arg_count(
+                    name,
+                    format!("exactly {}", field_indices.len()),
+                    args.len(),
+                    position,
+                ));
+            }
+
+            let mut fields = vec![Value::Void; record_type.field_count];
+            for (arg, &field_index) in args.iter().zip(field_indices.iter()) {
+                fields[field_index] = arg.value.clone();
+            }
+
+            Ok(Value::Record(Rc::new(RecordInstance {
+                record_type: record_type.clone(),
+                fields,
+            })))
+        }
+        NativeProcedure::RecordPredicate { name, record_type } => {
+            if args.len() != 1 {
+                return Err(EvalError::wrong_arg_count(
+                    name,
+                    "exactly 1",
+                    args.len(),
+                    position,
+                ));
+            }
+
+            Ok(Value::Bool(matches!(
+                &args[0].value,
+                Value::Record(record) if Rc::ptr_eq(&record.record_type, record_type)
+            )))
+        }
+        NativeProcedure::RecordAccessor {
+            name,
+            record_type,
+            field_index,
+        } => {
+            if args.len() != 1 {
+                return Err(EvalError::wrong_arg_count(
+                    name,
+                    "exactly 1",
+                    args.len(),
+                    position,
+                ));
+            }
+
+            match &args[0].value {
+                Value::Record(record) if Rc::ptr_eq(&record.record_type, record_type) => {
+                    Ok(record.fields[*field_index].clone())
+                }
+                Value::Record(record) => Err(EvalError::type_mismatch(
+                    record_type.name.as_str(),
+                    record.record_type.name.as_str(),
+                    args[0].position,
+                )),
+                other => Err(EvalError::type_mismatch(
+                    record_type.name.as_str(),
+                    other.type_name(),
+                    args[0].position,
+                )),
+            }
+        }
     }
 }
 
@@ -2755,6 +3059,7 @@ fn is_core_syntax_keyword(name: &str) -> bool {
             | "begin"
             | "cond"
             | "define"
+            | "define-record-type"
             | "define-syntax"
             | "if"
             | "lambda"
