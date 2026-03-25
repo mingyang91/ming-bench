@@ -1315,14 +1315,12 @@ fn expand_template_let(
         Expr::Symbol("let".into(), items[0].pos()),
         Expr::List(expanded_bindings, *bindings_pos),
     ];
-    for body in &items[2..] {
-        expanded.push(expand_template(
-            body,
-            state,
-            repetition_index,
-            &body_renames,
-        )?);
-    }
+    expanded.extend(expand_template_body_forms(
+        &items[2..],
+        state,
+        repetition_index,
+        &mut body_renames,
+    )?);
 
     Ok(Expr::List(expanded, pos))
 }
@@ -1348,14 +1346,12 @@ fn expand_template_lambda(
     )?;
 
     let mut expanded = vec![Expr::Symbol("lambda".into(), items[0].pos()), params];
-    for body in &items[2..] {
-        expanded.push(expand_template(
-            body,
-            state,
-            repetition_index,
-            &body_renames,
-        )?);
-    }
+    expanded.extend(expand_template_body_forms(
+        &items[2..],
+        state,
+        repetition_index,
+        &mut body_renames,
+    )?);
 
     Ok(Expr::List(expanded, pos))
 }
@@ -1366,6 +1362,25 @@ fn expand_template_define(
     state: &mut ExpansionState<'_>,
     repetition_index: Option<usize>,
     local_renames: &HashMap<String, String>,
+) -> Result<Expr, EvalError> {
+    let mut body_renames = local_renames.clone();
+    expand_template_define_with_scope(
+        items,
+        pos,
+        state,
+        repetition_index,
+        local_renames,
+        &mut body_renames,
+    )
+}
+
+fn expand_template_define_with_scope(
+    items: &[Expr],
+    pos: Position,
+    state: &mut ExpansionState<'_>,
+    repetition_index: Option<usize>,
+    local_renames: &HashMap<String, String>,
+    body_renames: &mut HashMap<String, String>,
 ) -> Result<Expr, EvalError> {
     if items.len() < 3 {
         return expand_plain_list(items, pos, state, repetition_index, local_renames);
@@ -1378,17 +1393,17 @@ fn expand_template_define(
             state,
             repetition_index,
             local_renames,
-            &mut local_renames.clone(),
+            body_renames,
         )?),
         Expr::List(signature, signature_pos) if !signature.is_empty() => {
-            let mut body_renames = local_renames.clone();
             let name = expand_binding_identifier(
                 &signature[0],
                 state,
                 repetition_index,
                 local_renames,
-                &mut body_renames,
+                body_renames,
             )?;
+            let mut define_body_renames = body_renames.clone();
             let mut expanded_signature = vec![name];
             for param in &signature[1..] {
                 expanded_signature.push(expand_binding_identifier(
@@ -1396,18 +1411,16 @@ fn expand_template_define(
                     state,
                     repetition_index,
                     local_renames,
-                    &mut body_renames,
+                    &mut define_body_renames,
                 )?);
             }
             expanded.push(Expr::List(expanded_signature, *signature_pos));
-            for body in &items[2..] {
-                expanded.push(expand_template(
-                    body,
-                    state,
-                    repetition_index,
-                    &body_renames,
-                )?);
-            }
+            expanded.extend(expand_template_body_forms(
+                &items[2..],
+                state,
+                repetition_index,
+                &mut define_body_renames,
+            )?);
             return Ok(Expr::List(expanded, pos));
         }
         _ => return expand_plain_list(items, pos, state, repetition_index, local_renames),
@@ -1418,11 +1431,39 @@ fn expand_template_define(
             value,
             state,
             repetition_index,
-            local_renames,
+            body_renames,
         )?);
     }
 
     Ok(Expr::List(expanded, pos))
+}
+
+fn expand_template_body_forms(
+    body: &[Expr],
+    state: &mut ExpansionState<'_>,
+    repetition_index: Option<usize>,
+    body_renames: &mut HashMap<String, String>,
+) -> Result<Vec<Expr>, EvalError> {
+    let mut expanded = Vec::with_capacity(body.len());
+
+    for expr in body {
+        match expr {
+            Expr::List(items, pos) if is_template_head(items, state.pattern_vars, "define") => {
+                let local_renames = body_renames.clone();
+                expanded.push(expand_template_define_with_scope(
+                    items,
+                    *pos,
+                    state,
+                    repetition_index,
+                    &local_renames,
+                    body_renames,
+                )?);
+            }
+            _ => expanded.push(expand_template(expr, state, repetition_index, body_renames)?),
+        }
+    }
+
+    Ok(expanded)
 }
 
 fn expand_formals(
