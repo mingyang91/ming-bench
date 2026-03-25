@@ -14,6 +14,7 @@ const (
 	ErrNotProcedure    EvalErrorKind = "not_a_procedure"
 	ErrOutOfRange      EvalErrorKind = "out_of_range"
 	ErrImmutable       EvalErrorKind = "immutable"
+	ErrRaised          EvalErrorKind = "raised"
 )
 
 // EvalError represents a Scheme evaluation error.

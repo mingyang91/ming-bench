@@ -426,13 +426,34 @@ func compareStrings(args []value, callPos position, name string, cmp func(string
 }
 
 func isProperList(v value) bool {
+	tortoise := v
+	hare := v
+
 	for {
-		switch current := v.(type) {
+		switch current := hare.(type) {
 		case emptyListValue:
 			return true
 		case *pairValue:
-			v = current.cdr
+			hare = current.cdr
 		default:
+			return false
+		}
+
+		switch current := hare.(type) {
+		case emptyListValue:
+			return true
+		case *pairValue:
+			hare = current.cdr
+		default:
+			return false
+		}
+
+		next, ok := tortoise.(*pairValue)
+		if !ok {
+			return false
+		}
+		tortoise = next.cdr
+		if tortoise == hare {
 			return false
 		}
 	}
@@ -514,7 +535,53 @@ func eqValue(left value, right value) bool {
 	}
 }
 
+type deepEqualPairKey struct {
+	left  *pairValue
+	right *pairValue
+}
+
+type deepEqualVectorKey struct {
+	left  *vectorValue
+	right *vectorValue
+}
+
+type deepEqualState struct {
+	pairs   map[deepEqualPairKey]struct{}
+	vectors map[deepEqualVectorKey]struct{}
+}
+
+func newDeepEqualState() *deepEqualState {
+	return &deepEqualState{
+		pairs:   map[deepEqualPairKey]struct{}{},
+		vectors: map[deepEqualVectorKey]struct{}{},
+	}
+}
+
+func (s *deepEqualState) rememberPair(left *pairValue, right *pairValue) bool {
+	key := deepEqualPairKey{left: left, right: right}
+	if _, ok := s.pairs[key]; ok {
+		return false
+	}
+	s.pairs[key] = struct{}{}
+	s.pairs[deepEqualPairKey{left: right, right: left}] = struct{}{}
+	return true
+}
+
+func (s *deepEqualState) rememberVector(left *vectorValue, right *vectorValue) bool {
+	key := deepEqualVectorKey{left: left, right: right}
+	if _, ok := s.vectors[key]; ok {
+		return false
+	}
+	s.vectors[key] = struct{}{}
+	s.vectors[deepEqualVectorKey{left: right, right: left}] = struct{}{}
+	return true
+}
+
 func deepEqual(left value, right value) bool {
+	return deepEqualWithState(left, right, newDeepEqualState())
+}
+
+func deepEqualWithState(left value, right value, state *deepEqualState) bool {
 	if isNumberValue(left) && isNumberValue(right) {
 		return numberEqual(left, right)
 	}
@@ -540,14 +607,23 @@ func deepEqual(left value, right value) bool {
 		return ok
 	case *pairValue:
 		right, ok := right.(*pairValue)
-		return ok && deepEqual(left.car, right.car) && deepEqual(left.cdr, right.cdr)
+		if !ok {
+			return false
+		}
+		if !state.rememberPair(left, right) {
+			return true
+		}
+		return deepEqualWithState(left.car, right.car, state) && deepEqualWithState(left.cdr, right.cdr, state)
 	case *vectorValue:
 		right, ok := right.(*vectorValue)
 		if !ok || len(left.elements) != len(right.elements) {
 			return false
 		}
+		if !state.rememberVector(left, right) {
+			return true
+		}
 		for i, element := range left.elements {
-			if !deepEqual(element, right.elements[i]) {
+			if !deepEqualWithState(element, right.elements[i], state) {
 				return false
 			}
 		}

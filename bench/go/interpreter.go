@@ -647,14 +647,24 @@ func (it *interpreter) installBuiltins() {
 	it.defineName(it.global, "<=", &builtinProc{name: "<=", fn: builtinLessEqual})
 	it.defineName(it.global, ">=", &builtinProc{name: ">=", fn: builtinGreaterEqual})
 	it.defineName(it.global, "not", &builtinProc{name: "not", fn: builtinNot})
+	it.defineName(it.global, "eqv?", &builtinProc{name: "eqv?", fn: builtinEqvPred})
 	it.defineName(it.global, "cons", &builtinProc{name: "cons", fn: builtinCons})
 	it.defineName(it.global, "car", &builtinProc{name: "car", fn: builtinCar})
 	it.defineName(it.global, "cdr", &builtinProc{name: "cdr", fn: builtinCdr})
+	it.defineName(it.global, "caar", &builtinProc{name: "caar", fn: builtinCaar})
+	it.defineName(it.global, "cadr", &builtinProc{name: "cadr", fn: builtinCadr})
+	it.defineName(it.global, "cdar", &builtinProc{name: "cdar", fn: builtinCdar})
+	it.defineName(it.global, "cddr", &builtinProc{name: "cddr", fn: builtinCddr})
+	it.defineName(it.global, "set-car!", &builtinProc{name: "set-car!", fn: builtinSetCar})
+	it.defineName(it.global, "set-cdr!", &builtinProc{name: "set-cdr!", fn: builtinSetCdr})
 	it.defineName(it.global, "null?", &builtinProc{name: "null?", fn: builtinNull})
 	it.defineName(it.global, "list", &builtinProc{name: "list", fn: builtinList})
 	it.defineName(it.global, "length", &builtinProc{name: "length", fn: builtinLength})
 	it.defineName(it.global, "append", &builtinProc{name: "append", fn: builtinAppend})
+	it.defineName(it.global, "reverse", &builtinProc{name: "reverse", fn: builtinReverse})
 	it.defineName(it.global, "string?", &builtinProc{name: "string?", fn: builtinStringPred})
+	it.defineName(it.global, "make-string", &builtinProc{name: "make-string", fn: builtinMakeString})
+	it.defineName(it.global, "string", &builtinProc{name: "string", fn: builtinString})
 	it.defineName(it.global, "number?", &builtinProc{name: "number?", fn: builtinNumberPred})
 	it.defineName(it.global, "exact?", &builtinProc{name: "exact?", fn: builtinExactPred})
 	it.defineName(it.global, "inexact?", &builtinProc{name: "inexact?", fn: builtinInexactPred})
@@ -671,8 +681,13 @@ func (it *interpreter) installBuiltins() {
 	it.defineName(it.global, "display", &builtinProc{name: "display", fn: builtinDisplay})
 	it.defineName(it.global, "write", &builtinProc{name: "write", fn: builtinWrite})
 	it.defineName(it.global, "newline", &builtinProc{name: "newline", fn: builtinNewline})
+	it.defineName(it.global, "error", &builtinProc{name: "error", fn: builtinError})
 	it.defineName(it.global, "apply", &builtinProc{name: "apply", fn: builtinApply})
 	it.defineName(it.global, "abs", &builtinProc{name: "abs", fn: builtinAbs})
+	it.defineName(it.global, "gcd", &builtinProc{name: "gcd", fn: builtinGCD})
+	it.defineName(it.global, "lcm", &builtinProc{name: "lcm", fn: builtinLCM})
+	it.defineName(it.global, "truncate", &builtinProc{name: "truncate", fn: builtinTruncate})
+	it.defineName(it.global, "round", &builtinProc{name: "round", fn: builtinRound})
 	it.defineName(it.global, "modulo", &builtinProc{name: "modulo", fn: builtinModulo})
 	it.defineName(it.global, "remainder", &builtinProc{name: "remainder", fn: builtinRemainder})
 	it.defineName(it.global, "quotient", &builtinProc{name: "quotient", fn: builtinQuotient})
@@ -698,6 +713,9 @@ func (it *interpreter) installBuiltins() {
 	it.defineName(it.global, "list->string", &builtinProc{name: "list->string", fn: builtinListToString})
 	it.defineName(it.global, "string=?", &builtinProc{name: "string=?", fn: builtinStringEqualPred})
 	it.defineName(it.global, "string<?", &builtinProc{name: "string<?", fn: builtinStringLessPred})
+	it.defineName(it.global, "string>?", &builtinProc{name: "string>?", fn: builtinStringGreaterPred})
+	it.defineName(it.global, "string<=?", &builtinProc{name: "string<=?", fn: builtinStringLessEqualPred})
+	it.defineName(it.global, "string>=?", &builtinProc{name: "string>=?", fn: builtinStringGreaterEqualPred})
 	it.defineName(it.global, "string-ci=?", &builtinProc{name: "string-ci=?", fn: builtinStringCIEqualPred})
 	it.defineName(it.global, "string-upcase", &builtinProc{name: "string-upcase", fn: builtinStringUpcase})
 	it.defineName(it.global, "string-downcase", &builtinProc{name: "string-downcase", fn: builtinStringDowncase})
@@ -716,7 +734,10 @@ func (it *interpreter) installBuiltins() {
 	it.defineName(it.global, "list-ref", &builtinProc{name: "list-ref", fn: builtinListRef})
 	it.defineName(it.global, "list-tail", &builtinProc{name: "list-tail", fn: builtinListTail})
 	it.defineName(it.global, "assoc", &builtinProc{name: "assoc", fn: builtinAssoc})
+	it.defineName(it.global, "assv", &builtinProc{name: "assv", fn: builtinAssv})
+	it.defineName(it.global, "member", &builtinProc{name: "member", fn: builtinMember})
 	it.defineName(it.global, "map", &builtinProc{name: "map", fn: builtinMap})
+	it.defineName(it.global, "for-each", &builtinProc{name: "for-each", fn: builtinForEach})
 	it.defineName(it.global, "vector", &builtinProc{name: "vector", fn: builtinVector})
 	it.defineName(it.global, "make-vector", &builtinProc{name: "make-vector", fn: builtinMakeVector})
 	it.defineName(it.global, "vector?", &builtinProc{name: "vector?", fn: builtinVectorPred})
@@ -724,6 +745,7 @@ func (it *interpreter) installBuiltins() {
 	it.defineName(it.global, "vector-ref", &builtinProc{name: "vector-ref", fn: builtinVectorRef})
 	it.defineName(it.global, "vector-set!", &builtinProc{name: "vector-set!", fn: builtinVectorSet})
 	it.defineName(it.global, "vector->list", &builtinProc{name: "vector->list", fn: builtinVectorToList})
+	it.defineName(it.global, "list->vector", &builtinProc{name: "list->vector", fn: builtinListToVector})
 }
 
 func (it *interpreter) evalProgram(exprs []expr) (value, error) {
@@ -852,6 +874,8 @@ func (it *interpreter) eval(node expr, scope *env) (value, error) {
 					step, err = it.prepareTailCond(scope, expr)
 				case "let":
 					step, err = it.prepareTailLet(scope, expr)
+				case "let*":
+					step, err = it.prepareTailLetStar(scope, expr)
 				case "letrec":
 					return it.evalLetRec(scope, expr, false)
 				case "letrec*":
@@ -1116,6 +1140,8 @@ func (it *interpreter) evalList(list *listExpr, scope *env) (value, error) {
 			return it.evalCond(scope, list)
 		case "let":
 			return it.evalLet(scope, list)
+		case "let*":
+			return it.evalLetStar(scope, list)
 		case "letrec":
 			return it.evalLetRec(scope, list, false)
 		case "letrec*":
