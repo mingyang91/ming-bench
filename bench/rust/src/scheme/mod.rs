@@ -1,5 +1,6 @@
 pub mod error;
 mod builtins;
+mod eval_forms;
 mod macros;
 
 pub use error::EvalError;
@@ -510,54 +511,115 @@ fn span_err(span: Span, err: EvalError) -> EvalError {
 }
 
 pub(crate) fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
-    let span = expr.span;
-    match &expr.kind {
-        ExprKind::Int(n) => Ok(Val::Int(*n)),
-        ExprKind::Float(x) => Ok(Val::Float(*x)),
-        ExprKind::Rational(n, d) => Ok(Val::Rational(*n, *d)),
-        ExprKind::Bool(b) => Ok(Val::Bool(*b)),
-        ExprKind::Str(s) => Ok(Val::Str(s.clone())),
-        ExprKind::Char(c) => Ok(Val::Char(*c)),
-        ExprKind::Symbol(name) => {
-            env.get(name).ok_or_else(|| EvalError::UnboundVariable(format!("{name} at {span}")))
-        }
-        ExprKind::List(elems) => {
-            if elems.is_empty() {
-                return Ok(Val::List(vec![]));
+    let mut cur = expr.clone();
+    let mut cur_env = env.clone();
+
+    'tco: loop {
+        let Expr { kind, span } = cur;
+        match kind {
+            ExprKind::Int(n) => return Ok(Val::Int(n)),
+            ExprKind::Float(x) => return Ok(Val::Float(x)),
+            ExprKind::Rational(n, d) => return Ok(Val::Rational(n, d)),
+            ExprKind::Bool(b) => return Ok(Val::Bool(b)),
+            ExprKind::Str(s) => return Ok(Val::Str(s)),
+            ExprKind::Char(c) => return Ok(Val::Char(c)),
+            ExprKind::Symbol(name) => {
+                return cur_env.get(&name)
+                    .ok_or_else(|| EvalError::UnboundVariable(format!("{name} at {span}")));
             }
-            // Check for special forms
-            if let ExprKind::Symbol(op) = &elems[0].kind {
-                match op.as_str() {
-                    "define" => return eval_define(&elems[1..], env, span),
-                    "if" => return eval_if(&elems[1..], env, span),
-                    "quote" => return eval_quote(&elems[1..], span),
-                    "lambda" => return eval_lambda(&elems[1..], env, span),
-                    "and" => return eval_and(&elems[1..], env),
-                    "or" => return eval_or(&elems[1..], env),
-                    "begin" => return eval_begin(&elems[1..], env),
-                    "let" => return eval_let(&elems[1..], env, span),
-                    "cond" => return eval_cond(&elems[1..], env),
-                    "set!" => return eval_set_bang(&elems[1..], env, span),
-                    "string-set!" => return eval_string_set(&elems[1..], env, span),
-                    "define-syntax" => return eval_define_syntax(&elems[1..], env, span),
-                    "define-record-type" => return eval_define_record_type(&elems[1..], env, span),
-                    "case-lambda" => return eval_case_lambda(&elems[1..], env, span),
-                    "letrec" => return eval_letrec(&elems[1..], env, span),
-                    "letrec*" => return eval_letrec_star(&elems[1..], env, span),
-                    "case" => return eval_case(&elems[1..], env, span),
-                    "do" => return eval_do(&elems[1..], env, span),
-                    "let*" => return eval_let_star(&elems[1..], env, span),
-                    _ => {
-                        if let Some(Val::Macro { literals, rules, def_env }) = env.get(op) {
-                            return eval_macro_call(elems, &literals, &rules, &def_env, env, span);
+            ExprKind::List(mut elems) => {
+                if elems.is_empty() {
+                    return Ok(Val::List(vec![]));
+                }
+
+                // Extract op name to avoid borrowing elems through the match
+                let maybe_op: Option<String> = match &elems[0].kind {
+                    ExprKind::Symbol(s) => Some(s.clone()),
+                    _ => None,
+                };
+
+                if let Some(ref op) = maybe_op {
+                    match op.as_str() {
+                        // --- Non-tail special forms (delegate to helpers) ---
+                        "define" => return eval_define(&elems[1..], &cur_env, span),
+                        "quote" => return eval_quote(&elems[1..], span),
+                        "lambda" => return eval_lambda(&elems[1..], &cur_env, span),
+                        "set!" => return eval_set_bang(&elems[1..], &cur_env, span),
+                        "string-set!" => return eval_string_set(&elems[1..], &cur_env, span),
+                        "define-syntax" => return eval_define_syntax(&elems[1..], &cur_env, span),
+                        "define-record-type" => return eval_define_record_type(&elems[1..], &cur_env, span),
+                        "case-lambda" => return eval_case_lambda(&elems[1..], &cur_env, span),
+                        "case" => return eval_case(&elems[1..], &cur_env, span),
+                        "do" => return eval_do(&elems[1..], &cur_env, span),
+                        "letrec" => return eval_letrec(&elems[1..], &cur_env, span),
+                        "letrec*" => return eval_letrec_star(&elems[1..], &cur_env, span),
+                        "let*" => return eval_let_star(&elems[1..], &cur_env, span),
+
+                        // --- Tail-position forms (inlined for TCO) ---
+                        "if" => {
+                            let nargs = elems.len() - 1;
+                            if !(2..=3).contains(&nargs) {
+                                return Err(EvalError::Arity(format!("if: expected 2 or 3 arguments at {span}")));
+                            }
+                            let cond_val = eval(&elems[1], &cur_env)?;
+                            if cond_val.is_truthy() {
+                                cur = elems.swap_remove(2);
+                                continue 'tco;
+                            } else if nargs == 3 {
+                                cur = elems.swap_remove(3);
+                                continue 'tco;
+                            } else {
+                                return Ok(Val::Void);
+                            }
+                        }
+
+                        "begin" | "and" | "or" | "cond" | "let" => {
+                            let result = eval_forms::dispatch_tco_form(
+                                op, &mut elems, &cur_env, span,
+                            )?;
+                            match result {
+                                eval_forms::Tco::Done(v) => return Ok(v),
+                                eval_forms::Tco::Tail(expr, env) => { cur = expr; cur_env = env; continue 'tco; }
+                            }
+                        }
+
+                        _ => {
+                            if let Some(Val::Macro { literals, rules, def_env }) = cur_env.get(op) {
+                                return eval_macro_call(&elems, &literals, &rules, &def_env, &cur_env, span);
+                            }
+                            // Fall through to function application
                         }
                     }
                 }
+
+                // --- Function application with TCO ---
+                let func = eval(&elems[0], &cur_env)?;
+                let args: Vec<Val> = elems[1..].iter()
+                    .map(|e| eval(e, &cur_env))
+                    .collect::<Result<_, _>>()?;
+
+                let tco_result = match func {
+                    Val::Lambda { params, rest_param, body, env: lambda_env } => {
+                        let new_env = eval_forms::bind_lambda_args(
+                            &params, &rest_param, &args, &lambda_env, span,
+                        )?;
+                        eval_forms::eval_body_tco(body, &new_env)?
+                    }
+                    Val::CaseLambda { clauses, env: lambda_env } => {
+                        eval_forms::apply_case_lambda(clauses, &args, &lambda_env, span)?
+                    }
+                    Val::Builtin(f) => return f(&args, &cur_env).map_err(|e| span_err(span, e)),
+                    _ => return Err(EvalError::Type(format!("not a procedure at {span}"))),
+                };
+                match tco_result {
+                    eval_forms::Tco::Done(v) => return Ok(v),
+                    eval_forms::Tco::Tail(expr, env) => {
+                        cur = expr;
+                        cur_env = env;
+                        continue 'tco;
+                    }
+                }
             }
-            // Evaluate function position
-            let func = eval(&elems[0], env)?;
-            let args: Vec<Val> = elems[1..].iter().map(|e| eval(e, env)).collect::<Result<_, _>>()?;
-            apply_val(&func, &args, env).map_err(|e| span_err(span, e))
         }
     }
 }
@@ -904,20 +966,6 @@ fn eval_set_bang(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError>
     Ok(Val::Void)
 }
 
-fn eval_if(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
-    if args.len() < 2 || args.len() > 3 {
-        return Err(EvalError::Arity(format!("if: expected 2 or 3 arguments at {span}")));
-    }
-    let cond = eval(&args[0], env)?;
-    if cond.is_truthy() {
-        eval(&args[1], env)
-    } else if args.len() == 3 {
-        eval(&args[2], env)
-    } else {
-        Ok(Val::Void)
-    }
-}
-
 fn eval_quote(args: &[Expr], span: Span) -> Result<Val, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::Arity(format!("quote: expected 1 argument at {span}")));
@@ -982,136 +1030,6 @@ fn eval_case_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalErr
         }
     }
     Ok(Val::CaseLambda { clauses, env: env.clone() })
-}
-
-fn eval_and(exprs: &[Expr], env: &Env) -> Result<Val, EvalError> {
-    if exprs.is_empty() {
-        return Ok(Val::Bool(true));
-    }
-    let mut result = Val::Bool(true);
-    for expr in exprs {
-        result = eval(expr, env)?;
-        if !result.is_truthy() {
-            return Ok(result);
-        }
-    }
-    Ok(result)
-}
-
-fn eval_or(exprs: &[Expr], env: &Env) -> Result<Val, EvalError> {
-    if exprs.is_empty() {
-        return Ok(Val::Bool(false));
-    }
-    for expr in exprs {
-        let result = eval(expr, env)?;
-        if result.is_truthy() {
-            return Ok(result);
-        }
-    }
-    Ok(Val::Bool(false))
-}
-
-fn eval_begin(args: &[Expr], env: &Env) -> Result<Val, EvalError> {
-    let mut result = Val::Void;
-    for expr in args {
-        result = eval(expr, env)?;
-    }
-    Ok(result)
-}
-
-fn eval_let(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
-    if args.is_empty() {
-        return Err(EvalError::Parse(format!("let: missing arguments at {span}")));
-    }
-    // Named let: (let name ((var init) ...) body ...)
-    if let ExprKind::Symbol(name) = &args[0].kind {
-        if args.len() < 2 {
-            return Err(EvalError::Parse(format!("let: missing bindings at {span}")));
-        }
-        let bindings = match &args[1].kind {
-            ExprKind::List(b) => b,
-            _ => return Err(EvalError::Parse(format!("let: expected bindings list at {span}"))),
-        };
-        let mut params = Vec::new();
-        let mut inits = Vec::new();
-        for b in bindings {
-            match &b.kind {
-                ExprKind::List(pair) if pair.len() == 2 => {
-                    if let ExprKind::Symbol(s) = &pair[0].kind {
-                        params.push(s.clone());
-                        inits.push(eval(&pair[1], env)?);
-                    } else {
-                        return Err(EvalError::Parse(format!("let: expected variable name at {span}")));
-                    }
-                }
-                _ => return Err(EvalError::Parse(format!("let: invalid binding at {span}"))),
-            }
-        }
-        let body = args[2..].to_vec();
-        let new_env = env.push();
-        let lambda = Val::Lambda {
-            params: params.clone(),
-            rest_param: None,
-            body,
-            env: new_env.clone(),
-        };
-        new_env.define(name.clone(), lambda.clone());
-        apply_val(&lambda, &inits, &new_env)
-    } else {
-        // Regular let: (let ((var init) ...) body ...)
-        let bindings = match &args[0].kind {
-            ExprKind::List(b) => b,
-            _ => return Err(EvalError::Parse(format!("let: expected bindings list at {span}"))),
-        };
-        let new_env = env.push();
-        for b in bindings {
-            match &b.kind {
-                ExprKind::List(pair) if pair.len() == 2 => {
-                    if let ExprKind::Symbol(s) = &pair[0].kind {
-                        let val = eval(&pair[1], env)?;
-                        new_env.define(s.clone(), val);
-                    } else {
-                        return Err(EvalError::Parse(format!("let: expected variable name at {span}")));
-                    }
-                }
-                _ => return Err(EvalError::Parse(format!("let: invalid binding at {span}"))),
-            }
-        }
-        let mut result = Val::Void;
-        for expr in &args[1..] {
-            result = eval(expr, &new_env)?;
-        }
-        Ok(result)
-    }
-}
-
-fn eval_cond(clauses: &[Expr], env: &Env) -> Result<Val, EvalError> {
-    for clause in clauses {
-        match &clause.kind {
-            ExprKind::List(parts) if !parts.is_empty() => {
-                // Check for else clause
-                if let ExprKind::Symbol(s) = &parts[0].kind {
-                    if s == "else" {
-                        let mut result = Val::Void;
-                        for expr in &parts[1..] {
-                            result = eval(expr, env)?;
-                        }
-                        return Ok(result);
-                    }
-                }
-                let test = eval(&parts[0], env)?;
-                if test.is_truthy() {
-                    let mut result = test;
-                    for expr in &parts[1..] {
-                        result = eval(expr, env)?;
-                    }
-                    return Ok(result);
-                }
-            }
-            _ => return Err(EvalError::Parse(format!("cond: invalid clause at {}", clause.span))),
-        }
-    }
-    Ok(Val::Void)
 }
 
 fn eval_string_set(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
