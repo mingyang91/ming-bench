@@ -55,6 +55,12 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 			return quoteExpr(e.Items[1]), nil
 		case "lambda":
 			return evalLambda(e, env)
+		case "begin":
+			return evalBegin(e, env)
+		case "cond":
+			return evalCond(e, env)
+		case "let":
+			return evalLet(e, env)
 		}
 	}
 
@@ -249,6 +255,22 @@ func makeGlobalEnv() *Env {
 	// Logic
 	env.set("not", &BuiltinFunc{Name: "not", Fn: builtinNot})
 
+	// List operations
+	env.set("cons", &BuiltinFunc{Name: "cons", Fn: builtinCons})
+	env.set("car", &BuiltinFunc{Name: "car", Fn: builtinCar})
+	env.set("cdr", &BuiltinFunc{Name: "cdr", Fn: builtinCdr})
+	env.set("null?", &BuiltinFunc{Name: "null?", Fn: builtinNullQ})
+	env.set("pair?", &BuiltinFunc{Name: "pair?", Fn: builtinPairQ})
+	env.set("list", &BuiltinFunc{Name: "list", Fn: builtinList})
+	env.set("length", &BuiltinFunc{Name: "length", Fn: builtinLength})
+	env.set("append", &BuiltinFunc{Name: "append", Fn: builtinAppend})
+
+	// Type predicates
+	env.set("number?", &BuiltinFunc{Name: "number?", Fn: builtinNumberQ})
+	env.set("boolean?", &BuiltinFunc{Name: "boolean?", Fn: builtinBooleanQ})
+	env.set("string?", &BuiltinFunc{Name: "string?", Fn: builtinStringQ})
+	env.set("symbol?", &BuiltinFunc{Name: "symbol?", Fn: builtinSymbolQ})
+
 	return env
 }
 
@@ -355,6 +377,261 @@ func builtinEq(args []Value) (Value, error) {
 
 func builtinLE(args []Value) (Value, error) {
 	return numericCompare("<=", args, func(a, b int64) bool { return a <= b })
+}
+
+func evalBegin(e *ListExpr, env *Env) (Value, error) {
+	var result Value = &VoidVal{}
+	var err error
+	for _, item := range e.Items[1:] {
+		result, err = eval(item, env)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalCond(e *ListExpr, env *Env) (Value, error) {
+	for _, clause := range e.Items[1:] {
+		cl, ok := clause.(*ListExpr)
+		if !ok || len(cl.Items) < 2 {
+			return nil, &EvalError{Message: "cond: bad clause"}
+		}
+		// Check for else
+		if sym, ok := cl.Items[0].(*SymbolExpr); ok && sym.Name == "else" {
+			var result Value
+			var err error
+			for _, expr := range cl.Items[1:] {
+				result, err = eval(expr, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		test, err := eval(cl.Items[0], env)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(test) {
+			var result Value
+			for _, expr := range cl.Items[1:] {
+				result, err = eval(expr, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+	}
+	return &VoidVal{}, nil
+}
+
+func evalLet(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Items) < 3 {
+		return nil, &EvalError{Message: "let: requires bindings and body"}
+	}
+
+	// Named let: (let name ((var init) ...) body ...)
+	if sym, ok := e.Items[1].(*SymbolExpr); ok {
+		if len(e.Items) < 4 {
+			return nil, &EvalError{Message: "let: named let requires bindings and body"}
+		}
+		bindingsList, ok := e.Items[2].(*ListExpr)
+		if !ok {
+			return nil, &EvalError{Message: "let: expected bindings list"}
+		}
+		params := make([]string, 0, len(bindingsList.Items))
+		initVals := make([]Value, 0, len(bindingsList.Items))
+		for _, b := range bindingsList.Items {
+			bl, ok := b.(*ListExpr)
+			if !ok || len(bl.Items) != 2 {
+				return nil, &EvalError{Message: "let: bad binding"}
+			}
+			ps, ok := bl.Items[0].(*SymbolExpr)
+			if !ok {
+				return nil, &EvalError{Message: "let: expected symbol in binding"}
+			}
+			val, err := eval(bl.Items[1], env)
+			if err != nil {
+				return nil, err
+			}
+			params = append(params, ps.Name)
+			initVals = append(initVals, val)
+		}
+		// Create lambda for the named let
+		lambda := &LambdaVal{Params: params, Body: e.Items[3:], Env: env}
+		// Create env where the name is bound to the lambda
+		letEnv := newEnv(env)
+		letEnv.set(sym.Name, lambda)
+		lambda.Env = letEnv
+		return applyLambda(lambda, initVals, e.Ln, e.Cl)
+	}
+
+	bindings, ok := e.Items[1].(*ListExpr)
+	if !ok {
+		return nil, &EvalError{Message: "let: expected bindings list"}
+	}
+	childEnv := newEnv(env)
+	for _, b := range bindings.Items {
+		bl, ok := b.(*ListExpr)
+		if !ok || len(bl.Items) != 2 {
+			return nil, &EvalError{Message: "let: bad binding"}
+		}
+		sym, ok := bl.Items[0].(*SymbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: "let: expected symbol in binding"}
+		}
+		val, err := eval(bl.Items[1], env)
+		if err != nil {
+			return nil, err
+		}
+		childEnv.set(sym.Name, val)
+	}
+	var result Value
+	var err error
+	for _, bodyExpr := range e.Items[2:] {
+		result, err = eval(bodyExpr, childEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func builtinCons(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, &EvalError{Message: "cons: requires exactly 2 arguments"}
+	}
+	return &PairVal{Car: args[0], Cdr: args[1]}, nil
+}
+
+func builtinCar(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "car: requires exactly 1 argument"}
+	}
+	p, ok := args[0].(*PairVal)
+	if !ok {
+		return nil, &EvalError{Message: fmt.Sprintf("car: not a pair: %s", args[0].String())}
+	}
+	return p.Car, nil
+}
+
+func builtinCdr(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "cdr: requires exactly 1 argument"}
+	}
+	p, ok := args[0].(*PairVal)
+	if !ok {
+		return nil, &EvalError{Message: fmt.Sprintf("cdr: not a pair: %s", args[0].String())}
+	}
+	return p.Cdr, nil
+}
+
+func builtinNullQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "null?: requires exactly 1 argument"}
+	}
+	_, ok := args[0].(*NilVal)
+	return &BoolVal{Val: ok}, nil
+}
+
+func builtinPairQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "pair?: requires exactly 1 argument"}
+	}
+	_, ok := args[0].(*PairVal)
+	return &BoolVal{Val: ok}, nil
+}
+
+func builtinNumberQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "number?: requires exactly 1 argument"}
+	}
+	_, ok := args[0].(*IntVal)
+	return &BoolVal{Val: ok}, nil
+}
+
+func builtinBooleanQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "boolean?: requires exactly 1 argument"}
+	}
+	_, ok := args[0].(*BoolVal)
+	return &BoolVal{Val: ok}, nil
+}
+
+func builtinStringQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "string?: requires exactly 1 argument"}
+	}
+	_, ok := args[0].(*StringVal)
+	return &BoolVal{Val: ok}, nil
+}
+
+func builtinSymbolQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "symbol?: requires exactly 1 argument"}
+	}
+	_, ok := args[0].(*SymbolVal)
+	return &BoolVal{Val: ok}, nil
+}
+
+func builtinList(args []Value) (Value, error) {
+	result := Value(&NilVal{})
+	for i := len(args) - 1; i >= 0; i-- {
+		result = &PairVal{Car: args[i], Cdr: result}
+	}
+	return result, nil
+}
+
+func builtinLength(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "length: requires exactly 1 argument"}
+	}
+	count := int64(0)
+	cur := args[0]
+	for {
+		if _, ok := cur.(*NilVal); ok {
+			break
+		}
+		p, ok := cur.(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("length: not a proper list: %s", args[0].String())}
+		}
+		count++
+		cur = p.Cdr
+	}
+	return &IntVal{Val: count}, nil
+}
+
+func builtinAppend(args []Value) (Value, error) {
+	if len(args) == 0 {
+		return &NilVal{}, nil
+	}
+	if len(args) == 1 {
+		return args[0], nil
+	}
+	// Collect all elements from all lists except last, then append last
+	var elems []Value
+	for _, a := range args[:len(args)-1] {
+		cur := a
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				break
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "append: not a proper list"}
+			}
+			elems = append(elems, p.Car)
+			cur = p.Cdr
+		}
+	}
+	result := args[len(args)-1]
+	for i := len(elems) - 1; i >= 0; i-- {
+		result = &PairVal{Car: elems[i], Cdr: result}
+	}
+	return result, nil
 }
 
 func builtinNot(args []Value) (Value, error) {
