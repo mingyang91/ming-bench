@@ -14,6 +14,19 @@ private[ming] object SyntaxPatternMatcher:
     if pattern.items.isEmpty || call.items.isEmpty then None
     else matchItems(pattern.items.tail, call.items.tail, literals)
 
+  def matchPattern(
+    pattern: Expr,
+    input: Expr,
+    literals: Set[String]
+  ): Option[Map[String, Capture]] =
+    matchExpr(pattern, input, literals)
+
+  def mergeCaptures(
+    left: Map[String, Capture],
+    right: Map[String, Capture]
+  ): Option[Map[String, Capture]] =
+    mergeBindings(left, right)
+
   def collectTemplateVariables(
     template: Expr,
     patternVariables: Set[String]

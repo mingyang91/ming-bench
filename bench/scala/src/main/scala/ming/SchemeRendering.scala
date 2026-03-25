@@ -53,6 +53,7 @@ private[ming] object SchemeRendering:
       case vector: Value.Vector    => renderVector(vector, displayMode, state)
       case record: Value.Record    => s"#<record ${record.typeName}>"
       case Value.MultipleValues(_) => "#<values>"
+      case Value.SyntaxObject(_)   => "#<syntax>"
       case _: Procedure            => "#<procedure>"
       case Value.Void              => "#<void>"
 

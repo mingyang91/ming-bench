@@ -56,6 +56,11 @@ private[ming] object SchemeInterpreter extends SchemeInterpreterTypes:
       runState(evalSequenceState(expressions, env, macros, halt))
     }
 
+  private[ming] def evalExpr(expr: Expr, env: Env, macros: MacroScope): Value =
+    withCurrentRuntime { _ =>
+      runState(evalExprState(expr, env, macros, halt))
+    }
+
   private def runState(initialState: EvalState): Value =
     var state = initialState
 

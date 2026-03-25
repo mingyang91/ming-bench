@@ -12,6 +12,7 @@ private[ming] object SchemeBuiltins:
       VectorBuiltins.all,
       CharBuiltins.all,
       StringBuiltins.all,
+      SyntaxBuiltins.all,
       IoBuiltins.all(writeOutput),
       PredicateBuiltins.all
     )

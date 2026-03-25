@@ -25,8 +25,8 @@ private[ming] object SchemeInterpreterListDispatch:
     applyProcedureState: ApplyProcedureState
   ): Option[EvalState] =
     name match
-      case "define-record-type" | "define-syntax" | "define" | "set!" | "begin" | "if" | "quote" | "lambda" |
-          "case-lambda" | "do" | "and" | "or" =>
+      case "define-record-type" | "define-syntax" | "define" | "set!" | "begin" | "if" | "quote" | "syntax" |
+          "syntax-case" | "lambda" | "with-syntax" | "case-lambda" | "do" | "and" | "or" =>
         Some(evalCoreFormState(name, args, env, macros, pos, cont, evalExprState, evalSequenceState))
       case "let" | "let*" | "letrec" | "letrec*" =>
         Some(
@@ -69,19 +69,25 @@ private[ming] object SchemeInterpreterListDispatch:
       case "begin" =>
         evalSequenceState(args, env, macros, cont)
       case "if" =>
-        SchemeInterpreterSpecialForms.evalIfState(args, env, macros, pos, cont, evalExprState)
+        SchemeInterpreterConditionalForms.evalIfState(args, env, macros, pos, cont, evalExprState)
       case "quote" =>
         SchemeInterpreterSpecialForms.evalQuoteState(args, pos, cont)
+      case "syntax" =>
+        SchemeInterpreterSpecialForms.evalSyntaxState(args, env, macros, pos, cont)
+      case "syntax-case" =>
+        SchemeInterpreterSpecialForms.evalSyntaxCaseState(args, env, macros, pos, cont)
       case "lambda" =>
         SchemeInterpreterSpecialForms.evalLambdaState(args, env, macros, pos, cont)
+      case "with-syntax" =>
+        SchemeInterpreterSpecialForms.evalWithSyntaxState(args, env, macros, pos, cont)
       case "case-lambda" =>
         cont(SchemeProcedures.evalCaseLambda(args, env, macros, pos))
       case "do" =>
         evalExprState(SchemeInterpreterDoSupport.expand(args, pos), env, macros, cont)
       case "and" =>
-        SchemeInterpreterSpecialForms.evalAndState(args, env, macros, cont, evalExprState)
+        SchemeInterpreterConditionalForms.evalAndState(args, env, macros, cont, evalExprState)
       case "or" =>
-        SchemeInterpreterSpecialForms.evalOrState(args, env, macros, cont, evalExprState)
+        SchemeInterpreterConditionalForms.evalOrState(args, env, macros, cont, evalExprState)
       case _ =>
         throw new IllegalStateException("unreachable")
 
@@ -153,7 +159,7 @@ private[ming] object SchemeInterpreterListDispatch:
   ): EvalState =
     name match
       case "cond" =>
-        SchemeInterpreterSpecialForms.evalCondState(
+        SchemeInterpreterConditionalForms.evalCondState(
           args,
           env,
           macros,
@@ -163,7 +169,7 @@ private[ming] object SchemeInterpreterListDispatch:
           evalSequenceState
         )
       case "guard" =>
-        SchemeInterpreterSpecialForms.evalGuardState(
+        SchemeInterpreterConditionalForms.evalGuardState(
           args,
           env,
           macros,
@@ -172,7 +178,7 @@ private[ming] object SchemeInterpreterListDispatch:
           evalExprState
         )
       case "case" =>
-        SchemeInterpreterSpecialForms.evalCaseState(
+        SchemeInterpreterConditionalForms.evalCaseState(
           args,
           env,
           macros,

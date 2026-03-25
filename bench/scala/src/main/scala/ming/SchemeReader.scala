@@ -84,7 +84,11 @@ private[ming] object SchemeReader:
       Expr.StringLit(builder.result(), startPos)
 
     private def readHashLiteral(startPos: SourcePos): Expr =
-      if startsWithToken("#t") then
+      if input.startsWith("#'", index) then
+        advance()
+        advance()
+        Expr.ListExpr(List(Expr.Symbol("syntax", startPos), readExpr()), startPos)
+      else if startsWithToken("#t") then
         advance()
         advance()
         Expr.Bool(true, startPos)

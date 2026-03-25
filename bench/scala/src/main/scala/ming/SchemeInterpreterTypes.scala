@@ -210,6 +210,8 @@ private[ming] trait SchemeInterpreterTypes:
 
     final case class MultipleValues(values: List[Value]) extends Value
 
+    final case class SyntaxObject(expr: Expr) extends Value
+
     case object Void extends Value
 
     def list(items: List[Value]): Value =

@@ -49,6 +49,20 @@ private[ming] object SchemeInterpreterSyntax:
       case Expr.Symbol(name, _)     => Value.Symbol(name)
       case Expr.ListExpr(items, _)  => Value.list(items.map(quote))
 
+  def datumToExpr(value: Value, pos: SourcePos, context: String): Expr =
+    value match
+      case Value.Number(number)      => Expr.Number(number, pos)
+      case Value.Bool(boolean)       => Expr.Bool(boolean, pos)
+      case Value.StringLit(text)     => Expr.StringLit(text, pos)
+      case Value.MutableString(text) => Expr.StringLit(text, pos)
+      case Value.Character(char)     => Expr.Character(char, pos)
+      case Value.Symbol(name)        => Expr.Symbol(name, pos)
+      case Value.EmptyList           => Expr.ListExpr(Nil, pos)
+      case pair: Value.Pair =>
+        Expr.ListExpr(BuiltinSupport.asList(pair, context, pos).map(datumToExpr(_, pos, context)), pos)
+      case other =>
+        throw EvalError.at(pos, s"$context expected datum, got ${SchemeInterpreter.render(other)}")
+
   def isTruthy(value: Value): Boolean =
     value match
       case Value.Bool(false) => false
