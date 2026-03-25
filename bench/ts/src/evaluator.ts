@@ -11,6 +11,7 @@ type SchemeVal =
   | { tag: 'boolean'; value: boolean; pos?: Pos }
   | { tag: 'string'; value: string; pos?: Pos }
   | { tag: 'symbol'; value: string; pos?: Pos }
+  | { tag: 'char'; value: string; pos?: Pos }
   | { tag: 'list'; elements: SchemeVal[]; pos?: Pos }  // syntax only (parsed S-expr)
   | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal; pos?: Pos }
   | { tag: 'nil'; pos?: Pos }
@@ -27,6 +28,19 @@ function errAt(msg: string, pos?: Pos): EvalError {
 }
 
 const NIL: SchemeVal = { tag: 'nil' };
+
+// ── Output Buffer ────────────────────────────────────────────────
+let outputBuffer = '';
+
+function displayValUnquoted(val: SchemeVal): string {
+  if (val.tag === 'string') return val.value;
+  if (val.tag === 'char') return val.value;
+  return displayVal(val);
+}
+
+function writeVal(val: SchemeVal): string {
+  return displayVal(val);
+}
 
 function makeList(items: SchemeVal[]): SchemeVal {
   let result: SchemeVal = NIL;
@@ -196,6 +210,87 @@ function makeGlobalEnv(): Env {
   defBuiltin('pair?', (args) => {
     if (args.length !== 1) throw new EvalError('pair?: expected 1 argument');
     return { tag: 'boolean', value: args[0].tag === 'pair' };
+  });
+
+  defBuiltin('char?', (args) => {
+    if (args.length !== 1) throw new EvalError('char?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'char' };
+  });
+
+  // I/O
+  defBuiltin('display', (args) => {
+    if (args.length !== 1) throw new EvalError('display: expected 1 argument');
+    outputBuffer += displayValUnquoted(args[0]);
+    return { tag: 'void' };
+  });
+
+  defBuiltin('write', (args) => {
+    if (args.length !== 1) throw new EvalError('write: expected 1 argument');
+    outputBuffer += writeVal(args[0]);
+    return { tag: 'void' };
+  });
+
+  defBuiltin('newline', (args) => {
+    if (args.length !== 0) throw new EvalError('newline: expected 0 arguments');
+    outputBuffer += '\n';
+    return { tag: 'void' };
+  });
+
+  // String operations
+  defBuiltin('string-append', (args) => {
+    let result = '';
+    for (const a of args) {
+      if (a.tag !== 'string') throw new EvalError('string-append: expected string');
+      result += a.value;
+    }
+    return { tag: 'string', value: result };
+  });
+
+  defBuiltin('string-length', (args) => {
+    if (args.length !== 1 || args[0].tag !== 'string')
+      throw new EvalError('string-length: expected 1 string argument');
+    return { tag: 'number', value: args[0].value.length };
+  });
+
+  defBuiltin('substring', (args) => {
+    if (args.length !== 3) throw new EvalError('substring: expected 3 arguments');
+    if (args[0].tag !== 'string') throw new EvalError('substring: expected string');
+    const start = expectNum(args[1], 'substring');
+    const end = expectNum(args[2], 'substring');
+    return { tag: 'string', value: args[0].value.substring(start, end) };
+  });
+
+  defBuiltin('string->number', (args) => {
+    if (args.length !== 1 || args[0].tag !== 'string')
+      throw new EvalError('string->number: expected 1 string argument');
+    const n = Number(args[0].value);
+    if (isNaN(n)) return { tag: 'boolean', value: false };
+    return { tag: 'number', value: n };
+  });
+
+  defBuiltin('number->string', (args) => {
+    if (args.length !== 1 || args[0].tag !== 'number')
+      throw new EvalError('number->string: expected 1 number argument');
+    return { tag: 'string', value: String(args[0].value) };
+  });
+
+  defBuiltin('string-ref', (args) => {
+    if (args.length !== 2) throw new EvalError('string-ref: expected 2 arguments');
+    if (args[0].tag !== 'string') throw new EvalError('string-ref: expected string');
+    const idx = expectNum(args[1], 'string-ref');
+    return { tag: 'char', value: args[0].value[idx] };
+  });
+
+  defBuiltin('symbol->string', (args) => {
+    if (args.length !== 1 || args[0].tag !== 'symbol')
+      throw new EvalError('symbol->string: expected 1 symbol argument');
+    return { tag: 'string', value: args[0].value };
+  });
+
+  defBuiltin('string->symbol', (args) => {
+    if (args.length !== 1 || args[0].tag !== 'string')
+      throw new EvalError('string->symbol: expected 1 string argument');
+    return { tag: 'symbol', value: args[0].value };
   });
 
   return env;
@@ -529,6 +624,7 @@ function displayVal(val: SchemeVal): string {
     case 'number': return String(val.value);
     case 'boolean': return val.value ? '#t' : '#f';
     case 'string': return `"${val.value}"`;
+    case 'char': return `#\\${val.value}`;
     case 'symbol': return val.value;
     case 'list': return `(${val.elements.map(displayVal).join(' ')})`;
     case 'nil': return '()';
@@ -556,6 +652,7 @@ export function evalStr(input: string): string {
   const tokens = tokenize(input);
   const exprs = parse(tokens);
   if (exprs.length === 0) throw new EvalError('no expressions');
+  outputBuffer = '';
   const env = makeGlobalEnv();
   let result: SchemeVal | undefined;
   for (const expr of exprs) {
@@ -565,5 +662,14 @@ export function evalStr(input: string): string {
 }
 
 export function evalStrWithOutput(input: string): { result: string; output: string } {
-  throw new EvalError('not implemented');
+  const tokens = tokenize(input);
+  const exprs = parse(tokens);
+  if (exprs.length === 0) throw new EvalError('no expressions');
+  outputBuffer = '';
+  const env = makeGlobalEnv();
+  let result: SchemeVal | undefined;
+  for (const expr of exprs) {
+    result = evalExpr(expr, env);
+  }
+  return { result: displayVal(result!), output: outputBuffer };
 }
