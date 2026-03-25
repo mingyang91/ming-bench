@@ -1,4 +1,5 @@
 pub mod error;
+mod builtins;
 
 pub use error::EvalError;
 
@@ -6,6 +7,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
+
+use builtins::OUTPUT_BUFFER;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Span {
@@ -33,6 +36,7 @@ enum Value {
     Str(String),
     Symbol(String),
     List(Vec<Value>),
+    Pair(Box<Value>, Box<Value>), // dotted pair (a . b) where b is not a list
     Nil,
     Builtin(String, fn(&[Value], Span) -> Result<Value, EvalError>),
     Lambda {
@@ -50,10 +54,16 @@ impl fmt::Display for Value {
             Value::Integer(n) => write!(f, "{n}"),
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
-            Value::Char(c) => write!(f, "#\\{c}"),
+            Value::Char(c) => match c {
+                ' ' => write!(f, "#\\space"),
+                '\n' => write!(f, "#\\newline"),
+                '\t' => write!(f, "#\\tab"),
+                _ => write!(f, "#\\{c}"),
+            },
             Value::Str(s) => write!(f, "\"{}\"", s),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::Nil => write!(f, "()"),
+            Value::Pair(a, b) => write!(f, "({a} . {b})"),
             Value::List(elems) => {
                 write!(f, "(")?;
                 for (i, e) in elems.iter().enumerate() {
@@ -77,6 +87,7 @@ impl Value {
         match self {
             Value::Str(s) => s.clone(),
             Value::Char(c) => c.to_string(),
+            Value::Pair(a, b) => format!("({} . {})", a.display_fmt(), b.display_fmt()),
             Value::List(elems) => {
                 let mut out = String::from("(");
                 for (i, e) in elems.iter().enumerate() {
@@ -102,6 +113,7 @@ impl PartialEq for Value {
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Nil, Value::Nil) => true,
+            (Value::Pair(a1, b1), Value::Pair(a2, b2)) => a1 == a2 && b1 == b2,
             (Value::List(a), Value::List(b)) => a == b,
             _ => false,
         }
@@ -414,432 +426,6 @@ impl Env {
     }
 }
 
-thread_local! {
-    static OUTPUT_BUFFER: RefCell<String> = const { RefCell::new(String::new()) };
-}
-
-fn builtin_add(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    let mut sum = 0i64;
-    for a in args {
-        match a {
-            Value::Integer(n) => sum += n,
-            _ => return Err(EvalError::Type(format!("at {span}: + expects numbers"))),
-        }
-    }
-    Ok(Value::Integer(sum))
-}
-
-fn builtin_sub(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.is_empty() {
-        return Err(EvalError::Arity(format!("at {span}: - requires at least 1 argument")));
-    }
-    match &args[0] {
-        Value::Integer(first) => {
-            if args.len() == 1 {
-                return Ok(Value::Integer(-first));
-            }
-            let mut result = *first;
-            for a in &args[1..] {
-                match a {
-                    Value::Integer(n) => result -= n,
-                    _ => return Err(EvalError::Type(format!("at {span}: - expects numbers"))),
-                }
-            }
-            Ok(Value::Integer(result))
-        }
-        _ => Err(EvalError::Type(format!("at {span}: - expects numbers"))),
-    }
-}
-
-fn builtin_mul(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    let mut product = 1i64;
-    for a in args {
-        match a {
-            Value::Integer(n) => product *= n,
-            _ => return Err(EvalError::Type(format!("at {span}: * expects numbers"))),
-        }
-    }
-    Ok(Value::Integer(product))
-}
-
-fn builtin_div(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::Arity(format!("at {span}: / requires at least 2 arguments")));
-    }
-    match &args[0] {
-        Value::Integer(first) => {
-            let mut result = *first;
-            for a in &args[1..] {
-                match a {
-                    Value::Integer(0) => return Err(EvalError::DivisionByZero(span)),
-                    Value::Integer(n) => result /= n,
-                    _ => return Err(EvalError::Type(format!("at {span}: / expects numbers"))),
-                }
-            }
-            Ok(Value::Integer(result))
-        }
-        _ => Err(EvalError::Type(format!("at {span}: / expects numbers"))),
-    }
-}
-
-fn builtin_lt(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 2 {
-        return Err(EvalError::Arity(format!("at {span}: < requires 2 arguments")));
-    }
-    match (&args[0], &args[1]) {
-        (Value::Integer(a), Value::Integer(b)) => Ok(Value::Boolean(a < b)),
-        _ => Err(EvalError::Type(format!("at {span}: < expects numbers"))),
-    }
-}
-
-fn builtin_gt(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 2 {
-        return Err(EvalError::Arity(format!("at {span}: > requires 2 arguments")));
-    }
-    match (&args[0], &args[1]) {
-        (Value::Integer(a), Value::Integer(b)) => Ok(Value::Boolean(a > b)),
-        _ => Err(EvalError::Type(format!("at {span}: > expects numbers"))),
-    }
-}
-
-fn builtin_eq(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 2 {
-        return Err(EvalError::Arity(format!("at {span}: = requires 2 arguments")));
-    }
-    match (&args[0], &args[1]) {
-        (Value::Integer(a), Value::Integer(b)) => Ok(Value::Boolean(a == b)),
-        _ => Err(EvalError::Type(format!("at {span}: = expects numbers"))),
-    }
-}
-
-fn builtin_le(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 2 {
-        return Err(EvalError::Arity(format!("at {span}: <= requires 2 arguments")));
-    }
-    match (&args[0], &args[1]) {
-        (Value::Integer(a), Value::Integer(b)) => Ok(Value::Boolean(a <= b)),
-        _ => Err(EvalError::Type(format!("at {span}: <= expects numbers"))),
-    }
-}
-
-fn builtin_not(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: not requires 1 argument")));
-    }
-    Ok(Value::Boolean(!args[0].is_truthy()))
-}
-
-fn builtin_cons(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 2 {
-        return Err(EvalError::Arity(format!("at {span}: cons requires 2 arguments")));
-    }
-    match &args[1] {
-        Value::List(elems) => {
-            let mut new = vec![args[0].clone()];
-            new.extend(elems.iter().cloned());
-            Ok(Value::List(new))
-        }
-        Value::Nil => Ok(Value::List(vec![args[0].clone()])),
-        _ => {
-            Ok(Value::List(vec![args[0].clone(), args[1].clone()]))
-        }
-    }
-}
-
-fn builtin_car(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: car requires 1 argument")));
-    }
-    match &args[0] {
-        Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
-        _ => Err(EvalError::Type(format!("at {span}: car: not a pair"))),
-    }
-}
-
-fn builtin_cdr(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: cdr requires 1 argument")));
-    }
-    match &args[0] {
-        Value::List(elems) if !elems.is_empty() => {
-            if elems.len() == 1 {
-                Ok(Value::Nil)
-            } else {
-                Ok(Value::List(elems[1..].to_vec()))
-            }
-        }
-        _ => Err(EvalError::Type(format!("at {span}: cdr: not a pair"))),
-    }
-}
-
-fn builtin_null(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: null? requires 1 argument")));
-    }
-    let is_null = matches!(&args[0], Value::Nil) || matches!(&args[0], Value::List(v) if v.is_empty());
-    Ok(Value::Boolean(is_null))
-}
-
-fn builtin_list(args: &[Value], _span: Span) -> Result<Value, EvalError> {
-    if args.is_empty() {
-        Ok(Value::Nil)
-    } else {
-        Ok(Value::List(args.to_vec()))
-    }
-}
-
-fn builtin_length(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: length requires 1 argument")));
-    }
-    match &args[0] {
-        Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
-        Value::Nil => Ok(Value::Integer(0)),
-        _ => Err(EvalError::Type(format!("at {span}: length: not a list"))),
-    }
-}
-
-fn builtin_number_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: number? requires 1 argument")));
-    }
-    Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
-}
-
-fn builtin_boolean_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: boolean? requires 1 argument")));
-    }
-    Ok(Value::Boolean(matches!(&args[0], Value::Boolean(_))))
-}
-
-fn builtin_string_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: string? requires 1 argument")));
-    }
-    Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
-}
-
-fn builtin_pair_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: pair? requires 1 argument")));
-    }
-    Ok(Value::Boolean(matches!(&args[0], Value::List(v) if !v.is_empty())))
-}
-
-fn builtin_symbol_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: symbol? requires 1 argument")));
-    }
-    Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
-}
-
-fn builtin_append(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    let mut result = Vec::new();
-    for (i, arg) in args.iter().enumerate() {
-        match arg {
-            Value::List(elems) => result.extend(elems.iter().cloned()),
-            Value::Nil => {}
-            _ if i == args.len() - 1 => {
-                result.push(arg.clone());
-            }
-            _ => return Err(EvalError::Type(format!("at {span}: append: not a list"))),
-        }
-    }
-    if result.is_empty() {
-        Ok(Value::Nil)
-    } else {
-        Ok(Value::List(result))
-    }
-}
-
-fn builtin_display(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: display requires 1 argument")));
-    }
-    let s = args[0].display_fmt();
-    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().push_str(&s));
-    Ok(Value::Void)
-}
-
-fn builtin_write(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: write requires 1 argument")));
-    }
-    let s = args[0].to_string();
-    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().push_str(&s));
-    Ok(Value::Void)
-}
-
-fn builtin_newline(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if !args.is_empty() {
-        return Err(EvalError::Arity(format!("at {span}: newline takes 0 arguments")));
-    }
-    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().push('\n'));
-    Ok(Value::Void)
-}
-
-fn builtin_string_append(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    let mut result = String::new();
-    for a in args {
-        match a {
-            Value::Str(s) => result.push_str(s),
-            _ => return Err(EvalError::Type(format!("at {span}: string-append expects strings"))),
-        }
-    }
-    Ok(Value::Str(result))
-}
-
-fn builtin_string_length(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: string-length requires 1 argument")));
-    }
-    match &args[0] {
-        Value::Str(s) => Ok(Value::Integer(s.chars().count() as i64)),
-        _ => Err(EvalError::Type(format!("at {span}: string-length expects a string"))),
-    }
-}
-
-fn builtin_substring(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 3 {
-        return Err(EvalError::Arity(format!("at {span}: substring requires 3 arguments")));
-    }
-    match (&args[0], &args[1], &args[2]) {
-        (Value::Str(s), Value::Integer(start), Value::Integer(end)) => {
-            let start = *start as usize;
-            let end = *end as usize;
-            let chars: Vec<char> = s.chars().collect();
-            if start > end || end > chars.len() {
-                return Err(EvalError::Type(format!("at {span}: substring: index out of range")));
-            }
-            Ok(Value::Str(chars[start..end].iter().collect()))
-        }
-        _ => Err(EvalError::Type(format!("at {span}: substring expects (string int int)"))),
-    }
-}
-
-fn builtin_string_to_number(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: string->number requires 1 argument")));
-    }
-    match &args[0] {
-        Value::Str(s) => match s.parse::<i64>() {
-            Ok(n) => Ok(Value::Integer(n)),
-            Err(_) => Ok(Value::Boolean(false)),
-        },
-        _ => Err(EvalError::Type(format!("at {span}: string->number expects a string"))),
-    }
-}
-
-fn builtin_number_to_string(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: number->string requires 1 argument")));
-    }
-    match &args[0] {
-        Value::Integer(n) => Ok(Value::Str(n.to_string())),
-        _ => Err(EvalError::Type(format!("at {span}: number->string expects a number"))),
-    }
-}
-
-fn builtin_symbol_to_string(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: symbol->string requires 1 argument")));
-    }
-    match &args[0] {
-        Value::Symbol(s) => Ok(Value::Str(s.clone())),
-        _ => Err(EvalError::Type(format!("at {span}: symbol->string expects a symbol"))),
-    }
-}
-
-fn builtin_string_to_symbol(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: string->symbol requires 1 argument")));
-    }
-    match &args[0] {
-        Value::Str(s) => Ok(Value::Symbol(s.clone())),
-        _ => Err(EvalError::Type(format!("at {span}: string->symbol expects a string"))),
-    }
-}
-
-fn builtin_string_ref(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 2 {
-        return Err(EvalError::Arity(format!("at {span}: string-ref requires 2 arguments")));
-    }
-    match (&args[0], &args[1]) {
-        (Value::Str(s), Value::Integer(idx)) => {
-            let idx = *idx as usize;
-            let chars: Vec<char> = s.chars().collect();
-            if idx >= chars.len() {
-                return Err(EvalError::Type(format!("at {span}: string-ref: index out of range")));
-            }
-            Ok(Value::Char(chars[idx]))
-        }
-        _ => Err(EvalError::Type(format!("at {span}: string-ref expects (string int)"))),
-    }
-}
-
-fn builtin_char_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: char? requires 1 argument")));
-    }
-    Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
-}
-
-fn builtin_string_copy(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("at {span}: string-copy requires 1 argument")));
-    }
-    match &args[0] {
-        Value::Str(s) => Ok(Value::Str(s.clone())),
-        _ => Err(EvalError::Type(format!("at {span}: string-copy expects a string"))),
-    }
-}
-
-fn default_env() -> EnvRef {
-    let env = Env::new(None);
-    {
-        let mut e = env.borrow_mut();
-        e.set("+".into(), Value::Builtin("+".into(), builtin_add));
-        e.set("-".into(), Value::Builtin("-".into(), builtin_sub));
-        e.set("*".into(), Value::Builtin("*".into(), builtin_mul));
-        e.set("/".into(), Value::Builtin("/".into(), builtin_div));
-        e.set("<".into(), Value::Builtin("<".into(), builtin_lt));
-        e.set(">".into(), Value::Builtin(">".into(), builtin_gt));
-        e.set("=".into(), Value::Builtin("=".into(), builtin_eq));
-        e.set("<=".into(), Value::Builtin("<=".into(), builtin_le));
-        e.set("not".into(), Value::Builtin("not".into(), builtin_not));
-        e.set("cons".into(), Value::Builtin("cons".into(), builtin_cons));
-        e.set("car".into(), Value::Builtin("car".into(), builtin_car));
-        e.set("cdr".into(), Value::Builtin("cdr".into(), builtin_cdr));
-        e.set("null?".into(), Value::Builtin("null?".into(), builtin_null));
-        e.set("list".into(), Value::Builtin("list".into(), builtin_list));
-        e.set("length".into(), Value::Builtin("length".into(), builtin_length));
-        e.set("number?".into(), Value::Builtin("number?".into(), builtin_number_pred));
-        e.set("boolean?".into(), Value::Builtin("boolean?".into(), builtin_boolean_pred));
-        e.set("string?".into(), Value::Builtin("string?".into(), builtin_string_pred));
-        e.set("pair?".into(), Value::Builtin("pair?".into(), builtin_pair_pred));
-        e.set("symbol?".into(), Value::Builtin("symbol?".into(), builtin_symbol_pred));
-        e.set("append".into(), Value::Builtin("append".into(), builtin_append));
-        e.set("display".into(), Value::Builtin("display".into(), builtin_display));
-        e.set("write".into(), Value::Builtin("write".into(), builtin_write));
-        e.set("newline".into(), Value::Builtin("newline".into(), builtin_newline));
-        e.set("string-append".into(), Value::Builtin("string-append".into(), builtin_string_append));
-        e.set("string-length".into(), Value::Builtin("string-length".into(), builtin_string_length));
-        e.set("substring".into(), Value::Builtin("substring".into(), builtin_substring));
-        e.set("string->number".into(), Value::Builtin("string->number".into(), builtin_string_to_number));
-        e.set("number->string".into(), Value::Builtin("number->string".into(), builtin_number_to_string));
-        e.set("symbol->string".into(), Value::Builtin("symbol->string".into(), builtin_symbol_to_string));
-        e.set("string->symbol".into(), Value::Builtin("string->symbol".into(), builtin_string_to_symbol));
-        e.set("string-ref".into(), Value::Builtin("string-ref".into(), builtin_string_ref));
-        e.set("char?".into(), Value::Builtin("char?".into(), builtin_char_pred));
-        e.set("string-copy".into(), Value::Builtin("string-copy".into(), builtin_string_copy));
-        // apply is handled specially in eval, but needs to be a value for (define f apply)
-        e.set("apply".into(), Value::Builtin("apply".into(), |_args, _span| unreachable!()));
-    }
-
-    env
-}
-
 // --- Evaluator ---
 
 fn expr_to_value(expr: &Expr) -> Value {
@@ -1150,27 +736,12 @@ fn eval(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
 
             // Handle apply specially
             if matches!(&func, Value::Builtin(name, _) if name == "apply") {
-                return builtin_apply(&args, span);
+                return builtins::builtin_apply(&args, span);
             }
 
             apply_function(&func, &args, span)
         }
     }
-}
-
-fn builtin_apply(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::Arity(format!("at {span}: apply requires at least 2 arguments")));
-    }
-    let func = &args[0];
-    let last = &args[args.len() - 1];
-    let mut call_args: Vec<Value> = args[1..args.len() - 1].to_vec();
-    match last {
-        Value::List(elems) => call_args.extend(elems.iter().cloned()),
-        Value::Nil => {}
-        _ => return Err(EvalError::Type(format!("at {span}: apply: last argument must be a list"))),
-    }
-    apply_function(func, &call_args, span)
 }
 
 fn apply_function(func: &Value, args: &[Value], span: Span) -> Result<Value, EvalError> {
@@ -1225,7 +796,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     if exprs.is_empty() {
         return Err(EvalError::Parse("empty input".into()));
     }
-    let env = default_env();
+    let env = builtins::default_env();
     let mut result = Value::Nil;
     for expr in &exprs {
         result = eval(expr, &env)?;
@@ -1241,7 +812,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     if exprs.is_empty() {
         return Err(EvalError::Parse("empty input".into()));
     }
-    let env = default_env();
+    let env = builtins::default_env();
     let mut result = Value::Nil;
     for expr in &exprs {
         result = eval(expr, &env)?;
