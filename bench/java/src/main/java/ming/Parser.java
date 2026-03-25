@@ -17,8 +17,8 @@ final class Parser {
         this.column = 1;
     }
 
-    List<Evaluator.Expr> parseProgram() throws EvalError {
-        List<Evaluator.Expr> expressions = new ArrayList<>();
+    List<Expr> parseProgram() throws EvalError {
+        List<Expr> expressions = new ArrayList<>();
         skipIgnored();
         while (!isAtEnd()) {
             expressions.add(parseExpr());
@@ -27,7 +27,7 @@ final class Parser {
         return expressions;
     }
 
-    private Evaluator.Expr parseExpr() throws EvalError {
+    private Expr parseExpr() throws EvalError {
         skipIgnored();
         if (isAtEnd()) {
             throw error("unexpected end of input", currentPos());
@@ -55,11 +55,11 @@ final class Parser {
         return parseSymbol();
     }
 
-    private Evaluator.Expr parseList() throws EvalError {
-        Evaluator.SourcePos pos = currentPos();
+    private Expr parseList() throws EvalError {
+        SourcePos pos = currentPos();
         advance();
 
-        List<Evaluator.Expr> elements = new ArrayList<>();
+        List<Expr> elements = new ArrayList<>();
         skipIgnored();
         while (!isAtEnd() && peek() != ')') {
             elements.add(parseExpr());
@@ -71,28 +71,28 @@ final class Parser {
         }
 
         advance();
-        return new Evaluator.ListExpr(elements, pos);
+        return new ListExpr(elements, pos);
     }
 
-    private Evaluator.Expr parseQuote() throws EvalError {
-        Evaluator.SourcePos pos = currentPos();
+    private Expr parseQuote() throws EvalError {
+        SourcePos pos = currentPos();
         advance();
 
-        List<Evaluator.Expr> elements = new ArrayList<>(2);
-        elements.add(new Evaluator.SymbolExpr("quote", pos));
+        List<Expr> elements = new ArrayList<>(2);
+        elements.add(new SymbolExpr("quote", pos));
         elements.add(parseExpr());
-        return new Evaluator.ListExpr(elements, pos);
+        return new ListExpr(elements, pos);
     }
 
-    private Evaluator.Expr parseString() throws EvalError {
-        Evaluator.SourcePos pos = currentPos();
+    private Expr parseString() throws EvalError {
+        SourcePos pos = currentPos();
         advance();
 
         StringBuilder builder = new StringBuilder();
         while (!isAtEnd()) {
             char current = advance();
             if (current == '"') {
-                return new Evaluator.StringExpr(builder.toString(), pos);
+                return new StringExpr(builder.toString(), pos);
             }
             if (current == '\\') {
                 if (isAtEnd()) {
@@ -107,7 +107,7 @@ final class Parser {
         throw error("unterminated string", pos);
     }
 
-    private char readEscape(Evaluator.SourcePos pos) throws EvalError {
+    private char readEscape(SourcePos pos) throws EvalError {
         char escaped = advance();
         return switch (escaped) {
             case 'n' -> '\n';
@@ -119,8 +119,8 @@ final class Parser {
         };
     }
 
-    private Evaluator.Expr parseHashLiteral() throws EvalError {
-        Evaluator.SourcePos pos = currentPos();
+    private Expr parseHashLiteral() throws EvalError {
+        SourcePos pos = currentPos();
         advance();
         if (isAtEnd()) {
             throw error("incomplete hash literal", pos);
@@ -128,14 +128,14 @@ final class Parser {
 
         char value = advance();
         return switch (value) {
-            case 't' -> new Evaluator.BoolExpr(true, pos);
-            case 'f' -> new Evaluator.BoolExpr(false, pos);
+            case 't' -> new BoolExpr(true, pos);
+            case 'f' -> new BoolExpr(false, pos);
             case '\\' -> parseCharacterLiteral(pos);
             default -> throw error("unknown hash literal '#" + value + "'", pos);
         };
     }
 
-    private Evaluator.Expr parseCharacterLiteral(Evaluator.SourcePos pos) throws EvalError {
+    private Expr parseCharacterLiteral(SourcePos pos) throws EvalError {
         if (isAtEnd()) {
             throw error("incomplete character literal", pos);
         }
@@ -150,19 +150,19 @@ final class Parser {
             throw error("incomplete character literal", pos);
         }
         return switch (token) {
-            case "space" -> new Evaluator.CharExpr(' ', pos);
-            case "newline" -> new Evaluator.CharExpr('\n', pos);
+            case "space" -> new CharExpr(' ', pos);
+            case "newline" -> new CharExpr('\n', pos);
             default -> {
                 if (token.length() != 1) {
                     throw error("unknown character literal '#\\" + token + "'", pos);
                 }
-                yield new Evaluator.CharExpr(token.charAt(0), pos);
+                yield new CharExpr(token.charAt(0), pos);
             }
         };
     }
 
-    private Evaluator.Expr parseNumber() {
-        Evaluator.SourcePos pos = currentPos();
+    private Expr parseNumber() {
+        SourcePos pos = currentPos();
         int start = index;
         if (peek() == '+' || peek() == '-') {
             advance();
@@ -170,16 +170,16 @@ final class Parser {
         while (!isAtEnd() && Character.isDigit(peek())) {
             advance();
         }
-        return new Evaluator.IntExpr(new BigInteger(input.substring(start, index)), pos);
+        return new IntExpr(new BigInteger(input.substring(start, index)), pos);
     }
 
-    private Evaluator.Expr parseSymbol() {
-        Evaluator.SourcePos pos = currentPos();
+    private Expr parseSymbol() {
+        SourcePos pos = currentPos();
         int start = index;
         while (!isAtEnd() && !isDelimiter(peek())) {
             advance();
         }
-        return new Evaluator.SymbolExpr(input.substring(start, index), pos);
+        return new SymbolExpr(input.substring(start, index), pos);
     }
 
     private boolean isNumberStart() {
@@ -243,11 +243,11 @@ final class Parser {
         return value;
     }
 
-    private Evaluator.SourcePos currentPos() {
-        return new Evaluator.SourcePos(line, column);
+    private SourcePos currentPos() {
+        return new SourcePos(line, column);
     }
 
-    private EvalError error(String message, Evaluator.SourcePos pos) {
+    private EvalError error(String message, SourcePos pos) {
         return new EvalError(message, pos.line(), pos.column());
     }
 }

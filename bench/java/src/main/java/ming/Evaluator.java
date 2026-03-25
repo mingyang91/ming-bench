@@ -166,7 +166,10 @@ public class Evaluator {
             return new CharValue(charExpr.value());
         }
         if (expression instanceof SymbolExpr symbolExpr) {
-            return environment.lookup(symbolExpr.name(), symbolExpr.pos());
+            Environment bindingEnvironment = symbolExpr.lexicalEnvironment() != null
+                    ? symbolExpr.lexicalEnvironment()
+                    : environment;
+            return bindingEnvironment.lookup(symbolExpr.name(), symbolExpr.pos());
         }
         if (expression instanceof ListExpr listExpr) {
             return evalList(listExpr, environment);
@@ -186,6 +189,7 @@ public class Evaluator {
             List<Expr> arguments = elements.subList(1, elements.size());
             return switch (symbolExpr.name()) {
                 case "define" -> evalDefine(arguments, environment, symbolExpr.pos());
+                case "define-syntax" -> evalDefineSyntax(arguments, environment, symbolExpr.pos());
                 case "set!" -> evalSet(arguments, environment, symbolExpr.pos());
                 case "if" -> evalIf(arguments, environment, symbolExpr.pos());
                 case "quote" -> evalQuote(arguments, symbolExpr.pos());
@@ -195,8 +199,14 @@ public class Evaluator {
                 case "let" -> evalLet(arguments, environment, symbolExpr.pos());
                 case "and" -> evalAnd(arguments, environment);
                 case "or" -> evalOr(arguments, environment);
-                default -> apply(eval(head, environment),
-                        evalArguments(arguments, environment), expression.pos());
+                default -> {
+                    SyntaxMacro macro = lookupMacro(symbolExpr, environment);
+                    if (macro != null) {
+                        yield eval(macro.expand(expression), environment);
+                    }
+                    yield apply(eval(head, environment),
+                            evalArguments(arguments, environment), expression.pos());
+                }
             };
         }
 
@@ -245,6 +255,20 @@ public class Evaluator {
         throw error("'define' target must be a symbol or parameter list", target.pos());
     }
 
+    private Value evalDefineSyntax(List<Expr> arguments, Environment environment, SourcePos pos)
+            throws EvalError {
+        if (arguments.size() != 2) {
+            throw error("'define-syntax' expects exactly 2 arguments", pos);
+        }
+        if (!(arguments.getFirst() instanceof SymbolExpr symbolExpr)) {
+            throw error("'define-syntax' target must be an identifier", arguments.getFirst().pos());
+        }
+
+        environment.defineMacro(symbolExpr.name(),
+                SyntaxRulesMacro.fromDefinition(symbolExpr.name(), arguments.get(1), environment));
+        return VoidValue.INSTANCE;
+    }
+
     private Value evalSet(List<Expr> arguments, Environment environment, SourcePos pos)
             throws EvalError {
         if (arguments.size() != 2) {
@@ -255,7 +279,10 @@ public class Evaluator {
         }
 
         Value value = eval(arguments.get(1), environment);
-        environment.assign(symbolExpr.name(), value, symbolExpr.pos());
+        Environment bindingEnvironment = symbolExpr.lexicalEnvironment() != null
+                ? symbolExpr.lexicalEnvironment()
+                : environment;
+        bindingEnvironment.assign(symbolExpr.name(), value, symbolExpr.pos());
         return VoidValue.INSTANCE;
     }
 
@@ -520,6 +547,13 @@ public class Evaluator {
             return evalSequence(closureProcedure.body(), callEnvironment);
         }
         throw error("not a procedure", pos);
+    }
+
+    private SyntaxMacro lookupMacro(SymbolExpr symbolExpr, Environment environment) {
+        Environment macroEnvironment = symbolExpr.lexicalEnvironment() != null
+                ? symbolExpr.lexicalEnvironment()
+                : environment;
+        return macroEnvironment.lookupMacro(symbolExpr.name());
     }
 
     private Value applyAdd(List<Value> arguments, SourcePos pos) throws EvalError {
@@ -1340,42 +1374,6 @@ public class Evaluator {
         return new EvalError(message, pos.line(), pos.column());
     }
 
-    sealed interface Expr permits IntExpr, BoolExpr, StringExpr, CharExpr, SymbolExpr,
-            ListExpr {
-        SourcePos pos();
-    }
-
-    sealed interface Value permits IntValue, BoolValue, StringValue, CharValue,
-            SymbolValue, EmptyListValue, PairValue, ProcedureValue, VoidValue {
-    }
-
-    private sealed interface ProcedureValue extends Value permits BuiltinProcedure,
-            ClosureProcedure {
-    }
-
-    @FunctionalInterface
-    private interface BuiltinImplementation {
-        Value apply(List<Value> arguments, SourcePos pos) throws EvalError;
-    }
-
-    record IntExpr(BigInteger value, SourcePos pos) implements Expr {
-    }
-
-    record BoolExpr(boolean value, SourcePos pos) implements Expr {
-    }
-
-    record StringExpr(String value, SourcePos pos) implements Expr {
-    }
-
-    record CharExpr(char value, SourcePos pos) implements Expr {
-    }
-
-    record SymbolExpr(String name, SourcePos pos) implements Expr {
-    }
-
-    record ListExpr(List<Expr> elements, SourcePos pos) implements Expr {
-    }
-
     private record LetBinding(String name, Expr initializer) {
     }
 
@@ -1383,88 +1381,5 @@ public class Evaluator {
     }
 
     private record ProgramResult(Value value, String output) {
-    }
-
-    private record IntValue(BigInteger value) implements Value {
-    }
-
-    private record BoolValue(boolean value) implements Value {
-        private static final BoolValue TRUE = new BoolValue(true);
-        private static final BoolValue FALSE = new BoolValue(false);
-
-        private static BoolValue of(boolean value) {
-            return value ? TRUE : FALSE;
-        }
-    }
-
-    private static final class StringValue implements Value {
-        private final StringBuilder value;
-        private final boolean mutable;
-
-        private StringValue(String value) {
-            this(value, true);
-        }
-
-        private StringValue(String value, boolean mutable) {
-            this.value = new StringBuilder(value);
-            this.mutable = mutable;
-        }
-
-        private String value() {
-            return value.toString();
-        }
-
-        private int length() {
-            return value.length();
-        }
-
-        private char charAt(int index) {
-            return value.charAt(index);
-        }
-
-        private boolean mutable() {
-            return mutable;
-        }
-
-        private void setCharAt(int index, char updatedValue) {
-            value.setCharAt(index, updatedValue);
-        }
-
-        private StringValue copy(boolean mutable) {
-            return new StringValue(value(), mutable);
-        }
-    }
-
-    private record CharValue(char value) implements Value {
-    }
-
-    private record SymbolValue(String name) implements Value {
-    }
-
-    private record EmptyListValue() implements Value {
-        private static final EmptyListValue INSTANCE = new EmptyListValue();
-    }
-
-    private record PairValue(Value car, Value cdr) implements Value {
-    }
-
-    private record BuiltinProcedure(String name, BuiltinImplementation implementation)
-            implements ProcedureValue {
-    }
-
-    private record ClosureProcedure(String name, List<String> parameters, String restParameter,
-                                    List<Expr> body, Environment environment)
-            implements ProcedureValue {
-    }
-
-    private record VoidValue() implements Value {
-        private static final VoidValue INSTANCE = new VoidValue();
-    }
-
-    record SourcePos(int line, int column) {
-        @Override
-        public String toString() {
-            return line + ":" + column;
-        }
     }
 }
