@@ -10,6 +10,7 @@ type Expr =
   | { type: 'number'; value: number; position: SourcePosition }
   | { type: 'boolean'; value: boolean; position: SourcePosition }
   | { type: 'string'; value: string; position: SourcePosition }
+  | { type: 'char'; value: string; position: SourcePosition }
   | { type: 'symbol'; name: string; position: SourcePosition }
   | { type: 'list'; elements: Expr[]; position: SourcePosition };
 
@@ -168,6 +169,11 @@ function parseProgram(input: string): Expr[] {
       return { type: 'boolean', value: false, position: token.position };
     }
 
+    const character = parseCharLiteral(token.value, token.position);
+    if (character !== null) {
+      return { type: 'char', value: character, position: token.position };
+    }
+
     if (/^-?\d+$/.test(token.value)) {
       return { type: 'number', value: Number(token.value), position: token.position };
     }
@@ -304,8 +310,11 @@ function evaluate(expr: Expr, env: Environment): SchemeValue {
     switch (expr.type) {
       case 'number':
       case 'boolean':
-      case 'string':
         return expr;
+      case 'string':
+        return stringValue(expr.value);
+      case 'char':
+        return charValue(expr.value, expr.position);
       case 'symbol':
         return env.lookup(expr.name, expr.position);
       case 'list':
@@ -495,9 +504,13 @@ function evaluateCond(args: Expr[], env: Environment): SchemeValue {
 function quoteExpr(expr: Expr): SchemeValue {
   switch (expr.type) {
     case 'number':
-    case 'boolean':
-    case 'string':
       return expr;
+    case 'boolean':
+      return booleanValue(expr.value);
+    case 'string':
+      return stringValue(expr.value);
+    case 'char':
+      return charValue(expr.value, expr.position);
     case 'symbol':
       return { type: 'symbol', name: expr.name };
     case 'list':
@@ -743,10 +756,9 @@ function createGlobalEnv(context: EvaluationContext): Environment {
 
   env.define(
     'string-append',
-    builtin('string-append', (args) => ({
-      type: 'string',
-      value: args.map((arg) => expectString('string-append', arg)).join(''),
-    })),
+    builtin('string-append', (args) =>
+      stringValue(args.map((arg) => expectString('string-append', arg)).join('')),
+    ),
   );
 
   env.define(
@@ -795,7 +807,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'number->string',
     builtin('number->string', (args, callPosition) => {
       requireArgCount('number->string', args.length, 1, callPosition);
-      return { type: 'string', value: String(expectNumber('number->string', args[0])) };
+      return stringValue(String(expectNumber('number->string', args[0])));
     }),
   );
 
@@ -803,7 +815,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'symbol->string',
     builtin('symbol->string', (args, callPosition) => {
       requireArgCount('symbol->string', args.length, 1, callPosition);
-      return { type: 'string', value: expectSymbol('symbol->string', args[0]).name };
+      return stringValue(expectSymbol('symbol->string', args[0]).name);
     }),
   );
 
@@ -828,6 +840,33 @@ function createGlobalEnv(context: EvaluationContext): Environment {
       }
 
       return charValue(characters[index], args[1].position);
+    }),
+  );
+
+  env.define(
+    'string-copy',
+    builtin('string-copy', (args, callPosition) => {
+      requireArgCount('string-copy', args.length, 1, callPosition);
+      return stringValue(expectString('string-copy', args[0]));
+    }),
+  );
+
+  env.define(
+    'string-set!',
+    builtin('string-set!', (args, callPosition) => {
+      requireArgCount('string-set!', args.length, 3, callPosition);
+      const target = expectStringValue('string-set!', args[0]);
+      const index = expectNonNegativeInteger('string-set!', args[1]);
+      const character = expectChar('string-set!', args[2]).value;
+      const characters = codePoints(target.value);
+
+      if (index >= characters.length) {
+        throw new EvalError('string-set!: index out of range', args[1].position);
+      }
+
+      characters[index] = character;
+      target.value = characters.join('');
+      return VOID_VALUE;
     }),
   );
 
@@ -950,11 +989,15 @@ function expectNumber(name: string, arg: EvaluatedArg): number {
 }
 
 function expectString(name: string, arg: EvaluatedArg): string {
+  return expectStringValue(name, arg).value;
+}
+
+function expectStringValue(name: string, arg: EvaluatedArg): Extract<SchemeValue, { type: 'string' }> {
   if (arg.value.type !== 'string') {
     throw new EvalError(`${name}: expected string`, arg.position);
   }
 
-  return arg.value.value;
+  return arg.value;
 }
 
 function expectSymbol(name: string, arg: EvaluatedArg): Extract<SchemeValue, { type: 'symbol' }> {
@@ -991,8 +1034,37 @@ function expectPair(name: string, arg: EvaluatedArg): Extract<SchemeValue, { typ
   return list;
 }
 
+function expectChar(name: string, arg: EvaluatedArg): Extract<SchemeValue, { type: 'char' }> {
+  if (arg.value.type !== 'char') {
+    throw new EvalError(`${name}: expected character`, arg.position);
+  }
+
+  return arg.value;
+}
+
 function isTruthy(value: SchemeValue): boolean {
   return value.type !== 'boolean' || value.value;
+}
+
+function parseCharLiteral(value: string, position: SourcePosition): string | null {
+  if (!value.startsWith('#\\')) {
+    return null;
+  }
+
+  const literal = value.slice(2);
+  switch (literal) {
+    case 'space':
+      return ' ';
+    case 'newline':
+      return '\n';
+  }
+
+  const characters = codePoints(literal);
+  if (characters.length === 1) {
+    return characters[0];
+  }
+
+  throw new EvalError('invalid character literal', position);
 }
 
 function codePoints(value: string): string[] {
@@ -1009,6 +1081,10 @@ function numberValue(value: number, position?: SourcePosition): SchemeValue {
 
 function booleanValue(value: boolean): SchemeValue {
   return { type: 'boolean', value };
+}
+
+function stringValue(value: string): SchemeValue {
+  return { type: 'string', value };
 }
 
 function charValue(value: string, position?: SourcePosition): SchemeValue {

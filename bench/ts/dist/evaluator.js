@@ -97,6 +97,10 @@ function parseProgram(input) {
         if (token.value === '#f') {
             return { type: 'boolean', value: false, position: token.position };
         }
+        const character = parseCharLiteral(token.value, token.position);
+        if (character !== null) {
+            return { type: 'char', value: character, position: token.position };
+        }
         if (/^-?\d+$/.test(token.value)) {
             return { type: 'number', value: Number(token.value), position: token.position };
         }
@@ -208,8 +212,11 @@ function evaluate(expr, env) {
         switch (expr.type) {
             case 'number':
             case 'boolean':
-            case 'string':
                 return expr;
+            case 'string':
+                return stringValue(expr.value);
+            case 'char':
+                return charValue(expr.value, expr.position);
             case 'symbol':
                 return env.lookup(expr.name, expr.position);
             case 'list':
@@ -366,9 +373,13 @@ function evaluateCond(args, env) {
 function quoteExpr(expr) {
     switch (expr.type) {
         case 'number':
-        case 'boolean':
-        case 'string':
             return expr;
+        case 'boolean':
+            return booleanValue(expr.value);
+        case 'string':
+            return stringValue(expr.value);
+        case 'char':
+            return charValue(expr.value, expr.position);
         case 'symbol':
             return { type: 'symbol', name: expr.name };
         case 'list':
@@ -500,10 +511,7 @@ function createGlobalEnv(context) {
         context.output.push('\n');
         return VOID_VALUE;
     }));
-    env.define('string-append', builtin('string-append', (args) => ({
-        type: 'string',
-        value: args.map((arg) => expectString('string-append', arg)).join(''),
-    })));
+    env.define('string-append', builtin('string-append', (args) => stringValue(args.map((arg) => expectString('string-append', arg)).join(''))));
     env.define('string-length', builtin('string-length', (args, callPosition) => {
         requireArgCount('string-length', args.length, 1, callPosition);
         return numberValue(codePoints(expectString('string-length', args[0])).length, callPosition);
@@ -532,11 +540,11 @@ function createGlobalEnv(context) {
     }));
     env.define('number->string', builtin('number->string', (args, callPosition) => {
         requireArgCount('number->string', args.length, 1, callPosition);
-        return { type: 'string', value: String(expectNumber('number->string', args[0])) };
+        return stringValue(String(expectNumber('number->string', args[0])));
     }));
     env.define('symbol->string', builtin('symbol->string', (args, callPosition) => {
         requireArgCount('symbol->string', args.length, 1, callPosition);
-        return { type: 'string', value: expectSymbol('symbol->string', args[0]).name };
+        return stringValue(expectSymbol('symbol->string', args[0]).name);
     }));
     env.define('string->symbol', builtin('string->symbol', (args, callPosition) => {
         requireArgCount('string->symbol', args.length, 1, callPosition);
@@ -551,6 +559,23 @@ function createGlobalEnv(context) {
             throw new EvalError('string-ref: index out of range', args[1].position);
         }
         return charValue(characters[index], args[1].position);
+    }));
+    env.define('string-copy', builtin('string-copy', (args, callPosition) => {
+        requireArgCount('string-copy', args.length, 1, callPosition);
+        return stringValue(expectString('string-copy', args[0]));
+    }));
+    env.define('string-set!', builtin('string-set!', (args, callPosition) => {
+        requireArgCount('string-set!', args.length, 3, callPosition);
+        const target = expectStringValue('string-set!', args[0]);
+        const index = expectNonNegativeInteger('string-set!', args[1]);
+        const character = expectChar('string-set!', args[2]).value;
+        const characters = codePoints(target.value);
+        if (index >= characters.length) {
+            throw new EvalError('string-set!: index out of range', args[1].position);
+        }
+        characters[index] = character;
+        target.value = characters.join('');
+        return VOID_VALUE;
     }));
     env.define('null?', builtin('null?', (args, callPosition) => {
         requireArgCount('null?', args.length, 1, callPosition);
@@ -615,10 +640,13 @@ function expectNumber(name, arg) {
     return arg.value.value;
 }
 function expectString(name, arg) {
+    return expectStringValue(name, arg).value;
+}
+function expectStringValue(name, arg) {
     if (arg.value.type !== 'string') {
         throw new EvalError(`${name}: expected string`, arg.position);
     }
-    return arg.value.value;
+    return arg.value;
 }
 function expectSymbol(name, arg) {
     if (arg.value.type !== 'symbol') {
@@ -646,8 +674,31 @@ function expectPair(name, arg) {
     }
     return list;
 }
+function expectChar(name, arg) {
+    if (arg.value.type !== 'char') {
+        throw new EvalError(`${name}: expected character`, arg.position);
+    }
+    return arg.value;
+}
 function isTruthy(value) {
     return value.type !== 'boolean' || value.value;
+}
+function parseCharLiteral(value, position) {
+    if (!value.startsWith('#\\')) {
+        return null;
+    }
+    const literal = value.slice(2);
+    switch (literal) {
+        case 'space':
+            return ' ';
+        case 'newline':
+            return '\n';
+    }
+    const characters = codePoints(literal);
+    if (characters.length === 1) {
+        return characters[0];
+    }
+    throw new EvalError('invalid character literal', position);
 }
 function codePoints(value) {
     return Array.from(value);
@@ -660,6 +711,9 @@ function numberValue(value, position) {
 }
 function booleanValue(value) {
     return { type: 'boolean', value };
+}
+function stringValue(value) {
+    return { type: 'string', value };
 }
 function charValue(value, position) {
     if (codePoints(value).length !== 1) {
