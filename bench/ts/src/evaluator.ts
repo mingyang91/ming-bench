@@ -10,6 +10,7 @@ interface MacroClause { pattern: SchemeVal[]; template: SchemeVal }
 
 type SchemeVal =
   | { tag: 'number'; value: number; pos?: Pos }
+  | { tag: 'rational'; num: number; den: number; pos?: Pos }
   | { tag: 'boolean'; value: boolean; pos?: Pos }
   | { tag: 'string'; value: string; pos?: Pos }
   | { tag: 'symbol'; value: string; pos?: Pos }
@@ -31,6 +32,69 @@ function errAt(msg: string, pos?: Pos): EvalError {
 }
 
 const NIL: SchemeVal = { tag: 'nil' };
+
+// ── Rational helpers ────────────────────────────────────────────
+function gcd(a: number, b: number): number {
+  a = Math.abs(a); b = Math.abs(b);
+  while (b) { [a, b] = [b, a % b]; }
+  return a;
+}
+
+function makeRat(num: number, den: number): SchemeVal {
+  if (den === 0) throw new EvalError('division by zero');
+  if (den < 0) { num = -num; den = -den; }
+  const g = gcd(Math.abs(num), den);
+  return { tag: 'rational', num: num / g, den: den / g };
+}
+
+function toFloat(v: SchemeVal): number {
+  if (v.tag === 'number') return v.value;
+  if (v.tag === 'rational') return v.num / v.den;
+  throw new EvalError('expected number');
+}
+
+function isNumeric(v: SchemeVal): boolean {
+  return v.tag === 'number' || v.tag === 'rational';
+}
+
+function assertNumeric(v: SchemeVal, op: string): void {
+  if (!isNumeric(v)) throw new EvalError(`${op}: expected number`);
+}
+
+function anyInexact(args: SchemeVal[]): boolean {
+  return args.some(a => a.tag === 'number');
+}
+
+function ratAdd(a: SchemeVal, b: SchemeVal): SchemeVal {
+  if (a.tag === 'rational' && b.tag === 'rational') {
+    return makeRat(a.num * b.den + b.num * a.den, a.den * b.den);
+  }
+  return { tag: 'number', value: toFloat(a) + toFloat(b) };
+}
+
+function ratSub(a: SchemeVal, b: SchemeVal): SchemeVal {
+  if (a.tag === 'rational' && b.tag === 'rational') {
+    return makeRat(a.num * b.den - b.num * a.den, a.den * b.den);
+  }
+  return { tag: 'number', value: toFloat(a) - toFloat(b) };
+}
+
+function ratMul(a: SchemeVal, b: SchemeVal): SchemeVal {
+  if (a.tag === 'rational' && b.tag === 'rational') {
+    return makeRat(a.num * b.num, a.den * b.den);
+  }
+  return { tag: 'number', value: toFloat(a) * toFloat(b) };
+}
+
+function ratDiv(a: SchemeVal, b: SchemeVal): SchemeVal {
+  if (a.tag === 'rational' && b.tag === 'rational') {
+    if (b.num === 0) throw new EvalError('division by zero');
+    return makeRat(a.num * b.den, a.den * b.num);
+  }
+  const bv = toFloat(b);
+  if (bv === 0) throw new EvalError('division by zero');
+  return { tag: 'number', value: toFloat(a) / bv };
+}
 
 // ── Output Buffer ────────────────────────────────────────────────
 let outputBuffer = '';
@@ -91,8 +155,9 @@ class Env {
 // ── Builtins ──────────────────────────────────────────────────────
 
 function expectNum(v: SchemeVal, op: string): number {
-  if (v.tag !== 'number') throw new EvalError(`${op}: expected number`);
-  return v.value;
+  if (v.tag === 'number') return v.value;
+  if (v.tag === 'rational') return v.num / v.den;
+  throw new EvalError(`${op}: expected number`);
 }
 
 function makeGlobalEnv(): Env {
@@ -103,36 +168,50 @@ function makeGlobalEnv(): Env {
   }
 
   defBuiltin('+', (args) => {
-    let sum = 0;
-    for (const a of args) sum += expectNum(a, '+');
-    return { tag: 'number', value: sum };
+    for (const a of args) assertNumeric(a, '+');
+    if (args.length === 0) return makeRat(0, 1);
+    let result: SchemeVal = args[0];
+    for (let i = 1; i < args.length; i++) result = ratAdd(result, args[i]);
+    return result;
   });
 
   defBuiltin('-', (args) => {
     if (args.length === 0) throw new EvalError('-: expected at least 1 argument');
-    if (args.length === 1) return { tag: 'number', value: -expectNum(args[0], '-') };
-    let result = expectNum(args[0], '-');
-    for (let i = 1; i < args.length; i++) result -= expectNum(args[i], '-');
-    return { tag: 'number', value: result };
+    for (const a of args) assertNumeric(a, '-');
+    if (args.length === 1) {
+      if (args[0].tag === 'rational') return makeRat(-args[0].num, args[0].den);
+      return { tag: 'number', value: -args[0].value };
+    }
+    let result: SchemeVal = args[0];
+    for (let i = 1; i < args.length; i++) result = ratSub(result, args[i]);
+    return result;
   });
 
   defBuiltin('*', (args) => {
-    let prod = 1;
-    for (const a of args) prod *= expectNum(a, '*');
-    return { tag: 'number', value: prod };
+    for (const a of args) assertNumeric(a, '*');
+    if (args.length === 0) return makeRat(1, 1);
+    let result: SchemeVal = args[0];
+    for (let i = 1; i < args.length; i++) result = ratMul(result, args[i]);
+    return result;
   });
 
   defBuiltin('/', (args) => {
-    if (args.length !== 2) throw new EvalError('/: expected 2 arguments');
-    const a = expectNum(args[0], '/'), b = expectNum(args[1], '/');
-    if (b === 0) throw new EvalError('division by zero');
-    return { tag: 'number', value: Math.trunc(a / b) };
+    if (args.length < 1) throw new EvalError('/: expected at least 1 argument');
+    for (const a of args) assertNumeric(a, '/');
+    if (args.length === 1) {
+      // (/ x) => 1/x
+      return ratDiv(makeRat(1, 1), args[0]);
+    }
+    let result: SchemeVal = args[0];
+    for (let i = 1; i < args.length; i++) result = ratDiv(result, args[i]);
+    return result;
   });
 
   for (const op of ['<', '>', '=', '>=', '<='] as const) {
     defBuiltin(op, (args) => {
       if (args.length !== 2) throw new EvalError(`${op}: expected 2 arguments`);
-      const a = expectNum(args[0], op), b = expectNum(args[1], op);
+      assertNumeric(args[0], op); assertNumeric(args[1], op);
+      const a = toFloat(args[0]), b = toFloat(args[1]);
       let r: boolean;
       switch (op) {
         case '<': r = a < b; break;
@@ -178,7 +257,7 @@ function makeGlobalEnv(): Env {
     let cur = args[0];
     while (cur.tag === 'pair') { count++; cur = cur.cdr; }
     if (cur.tag !== 'nil') throw new EvalError('length: expected proper list');
-    return { tag: 'number', value: count };
+    return makeRat(count, 1);
   });
 
   defBuiltin('append', (args) => {
@@ -198,7 +277,62 @@ function makeGlobalEnv(): Env {
   // Type predicates
   defBuiltin('number?', (args) => {
     if (args.length !== 1) throw new EvalError('number?: expected 1 argument');
+    return { tag: 'boolean', value: isNumeric(args[0]) };
+  });
+
+  defBuiltin('exact?', (args) => {
+    if (args.length !== 1) throw new EvalError('exact?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'rational' };
+  });
+
+  defBuiltin('inexact?', (args) => {
+    if (args.length !== 1) throw new EvalError('inexact?: expected 1 argument');
     return { tag: 'boolean', value: args[0].tag === 'number' };
+  });
+
+  defBuiltin('integer?', (args) => {
+    if (args.length !== 1) throw new EvalError('integer?: expected 1 argument');
+    if (args[0].tag === 'rational') return { tag: 'boolean', value: args[0].den === 1 };
+    if (args[0].tag === 'number') return { tag: 'boolean', value: Number.isInteger(args[0].value) };
+    return { tag: 'boolean', value: false };
+  });
+
+  defBuiltin('rational?', (args) => {
+    if (args.length !== 1) throw new EvalError('rational?: expected 1 argument');
+    return { tag: 'boolean', value: isNumeric(args[0]) };
+  });
+
+  defBuiltin('exact->inexact', (args) => {
+    if (args.length !== 1) throw new EvalError('exact->inexact: expected 1 argument');
+    assertNumeric(args[0], 'exact->inexact');
+    return { tag: 'number', value: toFloat(args[0]) };
+  });
+
+  defBuiltin('inexact->exact', (args) => {
+    if (args.length !== 1) throw new EvalError('inexact->exact: expected 1 argument');
+    assertNumeric(args[0], 'inexact->exact');
+    if (args[0].tag === 'rational') return args[0];
+    // Convert float to rational using continued fraction approach
+    const v = args[0].value;
+    if (Number.isInteger(v)) return makeRat(v, 1);
+    // Use a simple approach: multiply by power of 2 to get exact fraction
+    let num = v, den = 1;
+    while (num !== Math.floor(num) && den < 1e15) { num *= 2; den *= 2; }
+    return makeRat(Math.round(num), den);
+  });
+
+  defBuiltin('numerator', (args) => {
+    if (args.length !== 1) throw new EvalError('numerator: expected 1 argument');
+    assertNumeric(args[0], 'numerator');
+    if (args[0].tag === 'rational') return makeRat(args[0].num, 1);
+    return { tag: 'number', value: args[0].value };
+  });
+
+  defBuiltin('denominator', (args) => {
+    if (args.length !== 1) throw new EvalError('denominator: expected 1 argument');
+    assertNumeric(args[0], 'denominator');
+    if (args[0].tag === 'rational') return makeRat(args[0].den, 1);
+    return { tag: 'number', value: 1 };
   });
 
   defBuiltin('boolean?', (args) => {
@@ -258,7 +392,7 @@ function makeGlobalEnv(): Env {
   defBuiltin('string-length', (args) => {
     if (args.length !== 1 || args[0].tag !== 'string')
       throw new EvalError('string-length: expected 1 string argument');
-    return { tag: 'number', value: args[0].value.length };
+    return makeRat(args[0].value.length, 1);
   });
 
   defBuiltin('substring', (args) => {
@@ -272,15 +406,20 @@ function makeGlobalEnv(): Env {
   defBuiltin('string->number', (args) => {
     if (args.length !== 1 || args[0].tag !== 'string')
       throw new EvalError('string->number: expected 1 string argument');
-    const n = Number(args[0].value);
+    const s = args[0].value;
+    // Check for rational notation
+    const ratMatch = s.match(/^(-?\d+)\/(\d+)$/);
+    if (ratMatch) return makeRat(parseInt(ratMatch[1], 10), parseInt(ratMatch[2], 10));
+    const n = Number(s);
     if (isNaN(n)) return { tag: 'boolean', value: false };
+    if (Number.isInteger(n) && !s.includes('.')) return makeRat(n, 1);
     return { tag: 'number', value: n };
   });
 
   defBuiltin('number->string', (args) => {
-    if (args.length !== 1 || args[0].tag !== 'number')
+    if (args.length !== 1 || !isNumeric(args[0]))
       throw new EvalError('number->string: expected 1 number argument');
-    return { tag: 'string', value: String(args[0].value) };
+    return { tag: 'string', value: displayVal(args[0]) };
   });
 
   defBuiltin('string-ref', (args) => {
@@ -325,6 +464,7 @@ function makeGlobalEnv(): Env {
     if (a.tag !== b.tag) return { tag: 'boolean', value: false };
     if (a.tag === 'symbol' && b.tag === 'symbol') return { tag: 'boolean', value: a.value === b.value };
     if (a.tag === 'number' && b.tag === 'number') return { tag: 'boolean', value: a.value === b.value };
+    if (a.tag === 'rational' && b.tag === 'rational') return { tag: 'boolean', value: a.num === b.num && a.den === b.den };
     if (a.tag === 'boolean' && b.tag === 'boolean') return { tag: 'boolean', value: a.value === b.value };
     if (a.tag === 'char' && b.tag === 'char') return { tag: 'boolean', value: a.value === b.value };
     if (a.tag === 'string' && b.tag === 'string') return { tag: 'boolean', value: a === b };
@@ -333,8 +473,9 @@ function makeGlobalEnv(): Env {
   });
 
   function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
+    // Numeric cross-type comparison
+    if (isNumeric(a) && isNumeric(b)) return toFloat(a) === toFloat(b);
     if (a.tag !== b.tag) return false;
-    if (a.tag === 'number' && b.tag === 'number') return a.value === b.value;
     if (a.tag === 'boolean' && b.tag === 'boolean') return a.value === b.value;
     if (a.tag === 'string' && b.tag === 'string') return a.value === b.value;
     if (a.tag === 'symbol' && b.tag === 'symbol') return a.value === b.value;
@@ -352,79 +493,99 @@ function makeGlobalEnv(): Env {
   // Numeric utilities
   defBuiltin('abs', (args) => {
     if (args.length !== 1) throw new EvalError('abs: expected 1 argument');
-    return { tag: 'number', value: Math.abs(expectNum(args[0], 'abs')) };
+    assertNumeric(args[0], 'abs');
+    if (args[0].tag === 'rational') return makeRat(Math.abs(args[0].num), args[0].den);
+    return { tag: 'number', value: Math.abs(args[0].value) };
   });
 
   defBuiltin('modulo', (args) => {
     if (args.length !== 2) throw new EvalError('modulo: expected 2 arguments');
     const a = expectNum(args[0], 'modulo'), b = expectNum(args[1], 'modulo');
     if (b === 0) throw new EvalError('modulo: division by zero');
-    return { tag: 'number', value: ((a % b) + b) % b };
+    const r = ((a % b) + b) % b;
+    if (args[0].tag === 'rational' && args[1].tag === 'rational') return makeRat(r, 1);
+    return { tag: 'number', value: r };
   });
 
   defBuiltin('remainder', (args) => {
     if (args.length !== 2) throw new EvalError('remainder: expected 2 arguments');
     const a = expectNum(args[0], 'remainder'), b = expectNum(args[1], 'remainder');
     if (b === 0) throw new EvalError('remainder: division by zero');
-    return { tag: 'number', value: a % b };
+    const r = a % b;
+    if (args[0].tag === 'rational' && args[1].tag === 'rational') return makeRat(r, 1);
+    return { tag: 'number', value: r };
   });
 
   defBuiltin('quotient', (args) => {
     if (args.length !== 2) throw new EvalError('quotient: expected 2 arguments');
     const a = expectNum(args[0], 'quotient'), b = expectNum(args[1], 'quotient');
     if (b === 0) throw new EvalError('quotient: division by zero');
-    return { tag: 'number', value: Math.trunc(a / b) };
+    const r = Math.trunc(a / b);
+    if (args[0].tag === 'rational' && args[1].tag === 'rational') return makeRat(r, 1);
+    return { tag: 'number', value: r };
   });
 
   defBuiltin('min', (args) => {
     if (args.length < 1) throw new EvalError('min: expected at least 1 argument');
-    let result = expectNum(args[0], 'min');
+    for (const a of args) assertNumeric(a, 'min');
+    let best = args[0];
     for (let i = 1; i < args.length; i++) {
-      const n = expectNum(args[i], 'min');
-      if (n < result) result = n;
+      if (toFloat(args[i]) < toFloat(best)) best = args[i];
     }
-    return { tag: 'number', value: result };
+    return best;
   });
 
   defBuiltin('max', (args) => {
     if (args.length < 1) throw new EvalError('max: expected at least 1 argument');
-    let result = expectNum(args[0], 'max');
+    for (const a of args) assertNumeric(a, 'max');
+    let best = args[0];
     for (let i = 1; i < args.length; i++) {
-      const n = expectNum(args[i], 'max');
-      if (n > result) result = n;
+      if (toFloat(args[i]) > toFloat(best)) best = args[i];
     }
-    return { tag: 'number', value: result };
+    return best;
   });
 
   defBuiltin('expt', (args) => {
     if (args.length !== 2) throw new EvalError('expt: expected 2 arguments');
-    const base = expectNum(args[0], 'expt'), exp = expectNum(args[1], 'expt');
-    return { tag: 'number', value: Math.pow(base, exp) };
+    assertNumeric(args[0], 'expt'); assertNumeric(args[1], 'expt');
+    if (args[0].tag === 'rational' && args[1].tag === 'rational' && args[1].den === 1) {
+      const exp = args[1].num;
+      if (exp >= 0) {
+        return makeRat(Math.pow(args[0].num, exp), Math.pow(args[0].den, exp));
+      }
+      return makeRat(Math.pow(args[0].den, -exp), Math.pow(args[0].num, -exp));
+    }
+    return { tag: 'number', value: Math.pow(toFloat(args[0]), toFloat(args[1])) };
   });
 
   defBuiltin('zero?', (args) => {
     if (args.length !== 1) throw new EvalError('zero?: expected 1 argument');
-    return { tag: 'boolean', value: expectNum(args[0], 'zero?') === 0 };
+    assertNumeric(args[0], 'zero?');
+    return { tag: 'boolean', value: toFloat(args[0]) === 0 };
   });
 
   defBuiltin('positive?', (args) => {
     if (args.length !== 1) throw new EvalError('positive?: expected 1 argument');
-    return { tag: 'boolean', value: expectNum(args[0], 'positive?') > 0 };
+    assertNumeric(args[0], 'positive?');
+    return { tag: 'boolean', value: toFloat(args[0]) > 0 };
   });
 
   defBuiltin('negative?', (args) => {
     if (args.length !== 1) throw new EvalError('negative?: expected 1 argument');
-    return { tag: 'boolean', value: expectNum(args[0], 'negative?') < 0 };
+    assertNumeric(args[0], 'negative?');
+    return { tag: 'boolean', value: toFloat(args[0]) < 0 };
   });
 
   defBuiltin('odd?', (args) => {
     if (args.length !== 1) throw new EvalError('odd?: expected 1 argument');
-    return { tag: 'boolean', value: Math.abs(expectNum(args[0], 'odd?')) % 2 === 1 };
+    const n = expectNum(args[0], 'odd?');
+    return { tag: 'boolean', value: Math.abs(n) % 2 === 1 };
   });
 
   defBuiltin('even?', (args) => {
     if (args.length !== 1) throw new EvalError('even?: expected 1 argument');
-    return { tag: 'boolean', value: expectNum(args[0], 'even?') % 2 === 0 };
+    const n = expectNum(args[0], 'even?');
+    return { tag: 'boolean', value: n % 2 === 0 };
   });
 
   // List utilities
@@ -689,7 +850,17 @@ function parse(tokens: Token[]): SchemeVal[] {
       if (charPart.length === 1) return { tag: 'char', value: charPart, pos: tok.pos };
       throw new EvalError(`unknown character literal: ${tok.text}`);
     }
-    if (/^-?\d+$/.test(tok.text)) return { tag: 'number', value: parseInt(tok.text, 10), pos: tok.pos };
+    // Rational literal: e.g. 1/3, -5/2
+    if (/^-?\d+\/\d+$/.test(tok.text)) {
+      const parts = tok.text.split('/');
+      const r = makeRat(parseInt(parts[0], 10), parseInt(parts[1], 10));
+      (r as any).pos = tok.pos;
+      return r;
+    }
+    // Float literal
+    if (/^-?\d+\.\d+$/.test(tok.text)) return { tag: 'number', value: parseFloat(tok.text), pos: tok.pos };
+    // Integer literal → exact rational
+    if (/^-?\d+$/.test(tok.text)) { const r = makeRat(parseInt(tok.text, 10), 1); (r as any).pos = tok.pos; return r; }
     return { tag: 'symbol', value: tok.text, pos: tok.pos };
   }
 
@@ -877,7 +1048,7 @@ function isTruthy(val: SchemeVal): boolean {
 }
 
 function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
-  if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') {
+  if (expr.tag === 'number' || expr.tag === 'rational' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') {
     return expr;
   }
 
@@ -1143,7 +1314,13 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
 
 function displayVal(val: SchemeVal): string {
   switch (val.tag) {
-    case 'number': return String(val.value);
+    case 'number': {
+      const s = String(val.value);
+      // Ensure inexact floats display with decimal point
+      if (Number.isInteger(val.value) && !s.includes('.')) return s + '.0';
+      return s;
+    }
+    case 'rational': return val.den === 1 ? String(val.num) : `${val.num}/${val.den}`;
     case 'boolean': return val.value ? '#t' : '#f';
     case 'string': return `"${val.value}"`;
     case 'char': return `#\\${val.value}`;
