@@ -130,7 +130,7 @@ fn eval_expr(expr: &Expr, env: &EnvRef, runtime: &mut Runtime) -> Result<Value, 
     match expr {
         Expr::Bool(value, _) => Ok(Value::Bool(*value)),
         Expr::Number(value, _) => Ok(Value::Number(*value)),
-        Expr::String(value, _) => Ok(super::core::make_string(value.clone())),
+        Expr::String(value, _) => Ok(super::core::make_immutable_string(value.clone())),
         Expr::Char(value, _) => Ok(Value::Char(*value)),
         Expr::Symbol(name, pos) => match Environment::lookup(env, name) {
             Some(Value::Uninitialized) => {

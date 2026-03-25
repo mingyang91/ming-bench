@@ -55,6 +55,12 @@ pub enum EvalError {
     #[error("invalid number literal: {literal}")]
     InvalidNumberLiteral { literal: String },
 
+    #[error("strings are immutable")]
+    ImmutableString,
+
+    #[error("invalid character code: {code}")]
+    InvalidCharacterCode { code: i64 },
+
     #[error("numeric overflow")]
     NumericOverflow,
 

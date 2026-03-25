@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -41,13 +41,39 @@ impl Expr {
     }
 }
 
-pub(crate) type StringRef = Rc<RefCell<String>>;
+pub(crate) type StringRef = Rc<SchemeString>;
 pub(crate) type PairRef = Rc<RefCell<PairCell>>;
 pub(crate) type VectorRef = Rc<RefCell<Vec<Value>>>;
 pub(crate) type RecordTypeRef = Rc<RecordType>;
 pub(crate) type RecordRef = Rc<RecordValue>;
 pub(crate) type EnvRef = Rc<RefCell<Environment>>;
 pub(crate) type BindingRef = Rc<RefCell<Value>>;
+
+pub(crate) struct SchemeString {
+    text: RefCell<String>,
+    mutable: bool,
+}
+
+impl SchemeString {
+    pub(crate) fn new(text: impl Into<String>, mutable: bool) -> Self {
+        Self {
+            text: RefCell::new(text.into()),
+            mutable,
+        }
+    }
+
+    pub(crate) fn borrow(&self) -> Ref<'_, String> {
+        self.text.borrow()
+    }
+
+    pub(crate) fn borrow_mut(&self) -> RefMut<'_, String> {
+        self.text.borrow_mut()
+    }
+
+    pub(crate) fn is_mutable(&self) -> bool {
+        self.mutable
+    }
+}
 
 pub(crate) struct PairCell {
     pub(crate) car: Value,
@@ -296,7 +322,11 @@ enum RenderMode {
 }
 
 pub(crate) fn make_string(text: impl Into<String>) -> Value {
-    Value::String(Rc::new(RefCell::new(text.into())))
+    Value::String(Rc::new(SchemeString::new(text, true)))
+}
+
+pub(crate) fn make_immutable_string(text: impl Into<String>) -> Value {
+    Value::String(Rc::new(SchemeString::new(text, false)))
 }
 
 pub(crate) fn make_pair(car: Value, cdr: Value) -> Value {
@@ -383,7 +413,7 @@ pub(crate) fn quote_expr(expr: &Expr) -> Value {
     match expr {
         Expr::Bool(value, _) => Value::Bool(*value),
         Expr::Number(value, _) => Value::Number(*value),
-        Expr::String(value, _) => make_string(value.clone()),
+        Expr::String(value, _) => make_immutable_string(value.clone()),
         Expr::Char(value, _) => Value::Char(*value),
         Expr::Symbol(value, _) => Value::Symbol(value.clone()),
         Expr::List(items, _) => Value::List(items.iter().map(quote_expr).collect()),

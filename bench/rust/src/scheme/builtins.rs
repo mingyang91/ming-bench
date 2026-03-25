@@ -58,6 +58,10 @@ const BUILTINS: &[BuiltinProcedure] = &[
         func: builtin_le,
     },
     BuiltinProcedure {
+        name: ">=",
+        func: builtin_ge,
+    },
+    BuiltinProcedure {
         name: "not",
         func: builtin_not,
     },
@@ -242,6 +246,14 @@ const BUILTINS: &[BuiltinProcedure] = &[
         func: builtin_string_copy,
     },
     BuiltinProcedure {
+        name: "string->list",
+        func: builtin_string_to_list,
+    },
+    BuiltinProcedure {
+        name: "list->string",
+        func: builtin_list_to_string,
+    },
+    BuiltinProcedure {
         name: "string-set!",
         func: builtin_string_set,
     },
@@ -252,6 +264,14 @@ const BUILTINS: &[BuiltinProcedure] = &[
     BuiltinProcedure {
         name: "char?",
         func: builtin_is_char,
+    },
+    BuiltinProcedure {
+        name: "char->integer",
+        func: builtin_char_to_integer,
+    },
+    BuiltinProcedure {
+        name: "integer->char",
+        func: builtin_integer_to_char,
     },
     BuiltinProcedure {
         name: "char-alphabetic?",
@@ -451,6 +471,10 @@ fn builtin_is_equal(args: &[Value], _runtime: &mut Runtime) -> Result<Value, Eva
 
 fn builtin_le(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     builtin_compare("<=", args, |ordering| ordering != Ordering::Greater)
+}
+
+fn builtin_ge(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    builtin_compare(">=", args, |ordering| ordering != Ordering::Less)
 }
 
 fn builtin_compare<F>(name: &str, args: &[Value], compare: F) -> Result<Value, EvalError>
@@ -804,6 +828,22 @@ fn builtin_string_copy(args: &[Value], _runtime: &mut Runtime) -> Result<Value, 
     )?)?))
 }
 
+fn builtin_string_to_list(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_string(expect_single_arg("string->list", args)?)?;
+    Ok(Value::List(value.chars().map(Value::Char).collect()))
+}
+
+fn builtin_list_to_string(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let values = expect_list(expect_single_arg("list->string", args)?, "list")?;
+    let mut text = String::with_capacity(values.len());
+
+    for value in values {
+        text.push(expect_char(value)?);
+    }
+
+    Ok(make_string(text))
+}
+
 fn builtin_string_set(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let [string, index, character] = args else {
         return Err(wrong_arg_count("string-set!", "exactly 3", args.len()));
@@ -815,7 +855,13 @@ fn builtin_string_set(args: &[Value], _runtime: &mut Runtime) -> Result<Value, E
         text.chars().collect::<Vec<_>>()
     };
     let index = expect_index(index, chars.len(), IndexBound::Exact)?;
-    chars[index] = expect_char(character)?;
+    let replacement = expect_char(character)?;
+
+    if !string_ref.is_mutable() {
+        return Err(EvalError::ImmutableString);
+    }
+
+    chars[index] = replacement;
     *string_ref.borrow_mut() = chars.into_iter().collect();
 
     Ok(Value::Void)
@@ -833,6 +879,22 @@ fn builtin_string_ref(args: &[Value], _runtime: &mut Runtime) -> Result<Value, E
 
 fn builtin_is_char(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     unary_predicate("char?", args, |value| matches!(value, Value::Char(_)))
+}
+
+fn builtin_char_to_integer(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_char(expect_single_arg("char->integer", args)?)?;
+    Ok(Value::Number(Number::exact_integer(i64::from(
+        value as u32,
+    ))))
+}
+
+fn builtin_integer_to_char(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let code = expect_exact_integer(expect_single_arg("integer->char", args)?)?;
+    let scalar = u32::try_from(code)
+        .ok()
+        .and_then(char::from_u32)
+        .ok_or(EvalError::InvalidCharacterCode { code })?;
+    Ok(Value::Char(scalar))
 }
 
 fn builtin_is_char_alphabetic(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
