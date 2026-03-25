@@ -1080,6 +1080,7 @@ fn eq_value(lhs: &Value, rhs: &Value) -> bool {
         (Value::String(lhs), Value::String(rhs)) => std::rc::Rc::ptr_eq(lhs, rhs),
         (Value::List(lhs), Value::List(rhs)) => lhs.is_empty() && rhs.is_empty(),
         (Value::Pair(lhs), Value::Pair(rhs)) => std::rc::Rc::ptr_eq(lhs, rhs),
+        (Value::Record(lhs), Value::Record(rhs)) => std::rc::Rc::ptr_eq(lhs, rhs),
         (Value::Procedure(lhs), Value::Procedure(rhs)) => std::rc::Rc::ptr_eq(lhs, rhs),
         (Value::Void, Value::Void) => true,
         _ => false,

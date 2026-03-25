@@ -43,12 +43,26 @@ impl Expr {
 
 pub(crate) type StringRef = Rc<RefCell<String>>;
 pub(crate) type PairRef = Rc<RefCell<PairCell>>;
+pub(crate) type RecordTypeRef = Rc<RecordType>;
+pub(crate) type RecordRef = Rc<RecordValue>;
 pub(crate) type EnvRef = Rc<RefCell<Environment>>;
 pub(crate) type BindingRef = Rc<RefCell<Value>>;
 
 pub(crate) struct PairCell {
     pub(crate) car: Value,
     pub(crate) cdr: Value,
+}
+
+#[derive(Clone)]
+pub(crate) struct RecordType {
+    pub(crate) name: String,
+    pub(crate) field_names: Vec<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RecordValue {
+    pub(crate) record_type: RecordTypeRef,
+    pub(crate) fields: Vec<Value>,
 }
 
 #[derive(Clone)]
@@ -60,6 +74,7 @@ pub(crate) enum Value {
     Char(char),
     List(Vec<Value>),
     Pair(PairRef),
+    Record(RecordRef),
     Procedure(Rc<Procedure>),
     Void,
 }
@@ -84,6 +99,7 @@ impl Value {
             Self::Char(_) => "character",
             Self::List(_) => "list",
             Self::Pair(_) => "pair",
+            Self::Record(_) => "record",
             Self::Procedure(_) => "procedure",
             Self::Void => "void",
         }
@@ -109,6 +125,9 @@ impl Value {
 pub(crate) enum Procedure {
     Builtin(BuiltinProcedure),
     Lambda(LambdaProcedure),
+    RecordConstructor(RecordConstructorProcedure),
+    RecordPredicate(RecordPredicateProcedure),
+    RecordAccessor(RecordAccessorProcedure),
 }
 
 #[derive(Clone, Copy)]
@@ -124,6 +143,25 @@ pub(crate) struct LambdaProcedure {
     pub(crate) rest_param: Option<String>,
     pub(crate) body: Vec<Expr>,
     pub(crate) env: EnvRef,
+}
+
+#[derive(Clone)]
+pub(crate) struct RecordConstructorProcedure {
+    pub(crate) name: String,
+    pub(crate) record_type: RecordTypeRef,
+}
+
+#[derive(Clone)]
+pub(crate) struct RecordPredicateProcedure {
+    pub(crate) name: String,
+    pub(crate) record_type: RecordTypeRef,
+}
+
+#[derive(Clone)]
+pub(crate) struct RecordAccessorProcedure {
+    pub(crate) name: String,
+    pub(crate) record_type: RecordTypeRef,
+    pub(crate) field_index: usize,
 }
 
 pub(crate) struct Environment {
@@ -268,6 +306,61 @@ pub(crate) fn make_lambda(
     })))
 }
 
+pub(crate) fn make_record_type(
+    name: impl Into<String>,
+    field_names: Vec<String>,
+) -> RecordTypeRef {
+    Rc::new(RecordType {
+        name: name.into(),
+        field_names,
+    })
+}
+
+pub(crate) fn make_record(record_type: &RecordTypeRef, fields: Vec<Value>) -> Value {
+    Value::Record(Rc::new(RecordValue {
+        record_type: record_type.clone(),
+        fields,
+    }))
+}
+
+pub(crate) fn make_record_constructor(
+    name: impl Into<String>,
+    record_type: &RecordTypeRef,
+) -> Value {
+    Value::Procedure(Rc::new(Procedure::RecordConstructor(
+        RecordConstructorProcedure {
+            name: name.into(),
+            record_type: record_type.clone(),
+        },
+    )))
+}
+
+pub(crate) fn make_record_predicate(
+    name: impl Into<String>,
+    record_type: &RecordTypeRef,
+) -> Value {
+    Value::Procedure(Rc::new(Procedure::RecordPredicate(
+        RecordPredicateProcedure {
+            name: name.into(),
+            record_type: record_type.clone(),
+        },
+    )))
+}
+
+pub(crate) fn make_record_accessor(
+    name: impl Into<String>,
+    record_type: &RecordTypeRef,
+    field_index: usize,
+) -> Value {
+    Value::Procedure(Rc::new(Procedure::RecordAccessor(
+        RecordAccessorProcedure {
+            name: name.into(),
+            record_type: record_type.clone(),
+            field_index,
+        },
+    )))
+}
+
 pub(crate) fn quote_expr(expr: &Expr) -> Value {
     match expr {
         Expr::Bool(value, _) => Value::Bool(*value),
@@ -298,6 +391,7 @@ fn render_value(value: &Value, mode: RenderMode) -> String {
         },
         Value::List(values) => render_list(values, mode),
         Value::Pair(pair) => render_pair(pair, mode),
+        Value::Record(record) => render_record(record),
         Value::Procedure(_) => "#<procedure>".into(),
         Value::Void => String::new(),
     }
@@ -354,6 +448,10 @@ fn render_pair(pair: &PairRef, mode: RenderMode) -> String {
     rendered
 }
 
+fn render_record(record: &RecordRef) -> String {
+    format!("#<record {}>", record.as_ref().record_type.name)
+}
+
 pub(crate) fn value_equal(lhs: &Value, rhs: &Value) -> bool {
     match (lhs, rhs) {
         (Value::Bool(lhs), Value::Bool(rhs)) => lhs == rhs,
@@ -373,6 +471,7 @@ pub(crate) fn value_equal(lhs: &Value, rhs: &Value) -> bool {
             let rhs = rhs.borrow();
             value_equal(&lhs.car, &rhs.car) && value_equal(&lhs.cdr, &rhs.cdr)
         }
+        (Value::Record(lhs), Value::Record(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::Procedure(lhs), Value::Procedure(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::Void, Value::Void) => true,
         _ => false,
