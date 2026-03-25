@@ -22,6 +22,9 @@ const (
 	tokChar
 	tokSymbol
 	tokSyntaxQuote
+	tokBackquote
+	tokComma
+	tokCommaAt
 	tokEOF
 )
 
@@ -83,7 +86,7 @@ func isSymbolChar(ch rune) bool {
 		return false
 	}
 	switch ch {
-	case '(', ')', '"', ';', '\'':
+	case '(', ')', '"', ';', '\'', '`', ',':
 		return false
 	}
 	return ch > 0
@@ -108,6 +111,16 @@ func (t *tokenizer) nextToken() token {
 	case ch == '\'':
 		t.advance()
 		return token{kind: tokQuote, text: "'", line: line, col: col}
+	case ch == '`':
+		t.advance()
+		return token{kind: tokBackquote, text: "`", line: line, col: col}
+	case ch == ',':
+		t.advance()
+		if t.pos < len(t.input) && t.peek() == '@' {
+			t.advance()
+			return token{kind: tokCommaAt, text: ",@", line: line, col: col}
+		}
+		return token{kind: tokComma, text: ",", line: line, col: col}
 	case ch == '#':
 		t.advance()
 		next := t.peek()
@@ -362,6 +375,45 @@ func (p *parser) parseExpr() (Expr, error) {
 		return &ListExpr{
 			Items: []Expr{
 				&SymbolExpr{Name: "syntax", Ln: tok.line, Cl: tok.col},
+				inner,
+			},
+			Ln: tok.line, Cl: tok.col,
+		}, nil
+	case tokBackquote:
+		p.next()
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ListExpr{
+			Items: []Expr{
+				&SymbolExpr{Name: "quasiquote", Ln: tok.line, Cl: tok.col},
+				inner,
+			},
+			Ln: tok.line, Cl: tok.col,
+		}, nil
+	case tokComma:
+		p.next()
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ListExpr{
+			Items: []Expr{
+				&SymbolExpr{Name: "unquote", Ln: tok.line, Cl: tok.col},
+				inner,
+			},
+			Ln: tok.line, Cl: tok.col,
+		}, nil
+	case tokCommaAt:
+		p.next()
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ListExpr{
+			Items: []Expr{
+				&SymbolExpr{Name: "unquote-splicing", Ln: tok.line, Cl: tok.col},
 				inner,
 			},
 			Ln: tok.line, Cl: tok.col,

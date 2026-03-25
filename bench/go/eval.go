@@ -133,6 +133,11 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quote: requires exactly 1 argument", e.Ln, e.Cl)}
 			}
 			return quoteExpr(e.Items[1]), nil
+		case "quasiquote":
+			if len(e.Items) != 2 {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quasiquote: requires exactly 1 argument", e.Ln, e.Cl)}
+			}
+			return evalQuasiquote(e.Items[1], env)
 		case "lambda":
 			return evalLambda(e, env)
 		case "begin":
@@ -532,6 +537,23 @@ func quoteExpr(expr Expr) Value {
 		if len(e.Items) == 0 {
 			return &NilVal{}
 		}
+		// Check for dotted pair notation: (a b . c)
+		// The dot is a SymbolExpr with Name "."
+		dotIdx := -1
+		for i, item := range e.Items {
+			if sym, ok := item.(*SymbolExpr); ok && sym.Name == "." {
+				dotIdx = i
+				break
+			}
+		}
+		if dotIdx >= 0 && dotIdx == len(e.Items)-2 {
+			// Build improper list: items before dot become cars, last item is final cdr
+			result := quoteExpr(e.Items[len(e.Items)-1])
+			for i := dotIdx - 1; i >= 0; i-- {
+				result = &PairVal{Car: quoteExpr(e.Items[i]), Cdr: result}
+			}
+			return result
+		}
 		// Build a proper list from the items
 		result := Value(&NilVal{})
 		for i := len(e.Items) - 1; i >= 0; i-- {
@@ -541,6 +563,114 @@ func quoteExpr(expr Expr) Value {
 	default:
 		return &NilVal{}
 	}
+}
+
+// evalQuasiquote processes a quasiquote template, evaluating unquote and unquote-splicing.
+func evalQuasiquote(expr Expr, env *Env) (Value, error) {
+	list, ok := expr.(*ListExpr)
+	if !ok {
+		// Non-list: just quote it
+		return quoteExpr(expr), nil
+	}
+	if len(list.Items) == 0 {
+		return &NilVal{}, nil
+	}
+	// Check for (unquote x)
+	if sym, ok := list.Items[0].(*SymbolExpr); ok && sym.Name == "unquote" {
+		if len(list.Items) != 2 {
+			return nil, &EvalError{Message: "unquote: requires exactly 1 argument"}
+		}
+		return eval(list.Items[1], env)
+	}
+	// Check for dotted pair notation
+	dotIdx := -1
+	for i, item := range list.Items {
+		if sym, ok := item.(*SymbolExpr); ok && sym.Name == "." {
+			dotIdx = i
+			break
+		}
+	}
+	if dotIdx >= 0 && dotIdx == len(list.Items)-2 {
+		// Improper list quasiquote: `(a b . ,c)
+		tail, err := evalQuasiquote(list.Items[len(list.Items)-1], env)
+		if err != nil {
+			return nil, err
+		}
+		for i := dotIdx - 1; i >= 0; i-- {
+			item := list.Items[i]
+			// Check for unquote-splicing in car position
+			if il, ok := item.(*ListExpr); ok && len(il.Items) == 2 {
+				if sym, ok := il.Items[0].(*SymbolExpr); ok && sym.Name == "unquote-splicing" {
+					spliced, err := eval(il.Items[1], env)
+					if err != nil {
+						return nil, err
+					}
+					// Append tail to spliced list
+					tail, err = appendValues(spliced, tail)
+					if err != nil {
+						return nil, err
+					}
+					continue
+				}
+			}
+			val, err := evalQuasiquote(item, env)
+			if err != nil {
+				return nil, err
+			}
+			tail = &PairVal{Car: val, Cdr: tail}
+		}
+		return tail, nil
+	}
+	// Regular list: process each element
+	var results []Value
+	for _, item := range list.Items {
+		// Check for (unquote-splicing x)
+		if il, ok := item.(*ListExpr); ok && len(il.Items) == 2 {
+			if sym, ok := il.Items[0].(*SymbolExpr); ok && sym.Name == "unquote-splicing" {
+				val, err := eval(il.Items[1], env)
+				if err != nil {
+					return nil, err
+				}
+				// Splice the list into results
+				for val != nil {
+					pair, ok := val.(*PairVal)
+					if !ok {
+						break
+					}
+					results = append(results, pair.Car)
+					val = pair.Cdr
+				}
+				continue
+			}
+		}
+		val, err := evalQuasiquote(item, env)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, val)
+	}
+	// Build proper list
+	result := Value(&NilVal{})
+	for i := len(results) - 1; i >= 0; i-- {
+		result = &PairVal{Car: results[i], Cdr: result}
+	}
+	return result, nil
+}
+
+// appendValues appends b to the end of list a.
+func appendValues(a, b Value) (Value, error) {
+	if _, ok := a.(*NilVal); ok {
+		return b, nil
+	}
+	pair, ok := a.(*PairVal)
+	if !ok {
+		return nil, &EvalError{Message: "unquote-splicing: not a proper list"}
+	}
+	rest, err := appendValues(pair.Cdr, b)
+	if err != nil {
+		return nil, err
+	}
+	return &PairVal{Car: pair.Car, Cdr: rest}, nil
 }
 
 func makeGlobalEnv(out *strings.Builder) *Env {
@@ -781,6 +911,16 @@ func evalCond(e *ListExpr, env *Env) (Value, error) {
 		if isTruthy(test) {
 			if len(cl.Items) == 1 {
 				return test, nil
+			}
+			// Handle => clause: (cond (test => proc))
+			if len(cl.Items) == 3 {
+				if arrow, ok := cl.Items[1].(*SymbolExpr); ok && arrow.Name == "=>" {
+					proc, err := eval(cl.Items[2], env)
+					if err != nil {
+						return nil, err
+					}
+					return applyCallable(proc, []Value{test}, e.Line(), e.Col())
+				}
 			}
 			body := cl.Items[1:]
 			for _, expr := range body[:len(body)-1] {
