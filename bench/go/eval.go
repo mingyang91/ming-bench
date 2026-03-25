@@ -79,6 +79,8 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 			return evalDefineSyntax(e, env)
 		case "define-record-type":
 			return evalDefineRecordType(e, env)
+		case "case-lambda":
+			return evalCaseLambda(e, env)
 		}
 
 		// Check for macro application
@@ -123,6 +125,8 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 		return result, nil
 	case *LambdaVal:
 		return applyLambda(f, args, e.Ln, e.Cl)
+	case *CaseLambdaVal:
+		return applyCaseLambda(f, args, e.Ln, e.Cl)
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure: %s", e.Ln, e.Cl, fn.String())}
 	}
@@ -226,6 +230,42 @@ func evalLambda(e *ListExpr, env *Env) (Value, error) {
 		return nil, err
 	}
 	return &LambdaVal{Params: params, Rest: rest, Body: e.Items[2:], Env: env}, nil
+}
+
+func evalCaseLambda(e *ListExpr, env *Env) (Value, error) {
+	// (case-lambda (params body...) ...)
+	var clauses []*LambdaVal
+	for _, clause := range e.Items[1:] {
+		cl, ok := clause.(*ListExpr)
+		if !ok || len(cl.Items) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: bad clause", e.Ln, e.Cl)}
+		}
+		paramList, ok := cl.Items[0].(*ListExpr)
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: expected parameter list", e.Ln, e.Cl)}
+		}
+		params, rest, err := parseDotParams(paramList.Items, e.Ln, e.Cl, "case-lambda")
+		if err != nil {
+			return nil, err
+		}
+		clauses = append(clauses, &LambdaVal{Params: params, Rest: rest, Body: cl.Items[1:], Env: env})
+	}
+	return &CaseLambdaVal{Clauses: clauses}, nil
+}
+
+func applyCaseLambda(cl *CaseLambdaVal, args []Value, ln, col int) (Value, error) {
+	for _, clause := range cl.Clauses {
+		if clause.Rest != "" {
+			if len(args) >= len(clause.Params) {
+				return applyLambda(clause, args, ln, col)
+			}
+		} else {
+			if len(args) == len(clause.Params) {
+				return applyLambda(clause, args, ln, col)
+			}
+		}
+	}
+	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: no matching clause for %d arguments", ln, col, len(args))}
 }
 
 // parseDotParams extracts fixed params and optional rest param from a parameter list.
@@ -353,6 +393,17 @@ func makeGlobalEnv(out *strings.Builder) *Env {
 	env.set("string?", &BuiltinFunc{Name: "string?", Fn: builtinStringQ})
 	env.set("symbol?", &BuiltinFunc{Name: "symbol?", Fn: builtinSymbolQ})
 	env.set("char?", &BuiltinFunc{Name: "char?", Fn: builtinCharQ})
+	env.set("procedure?", &BuiltinFunc{Name: "procedure?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "procedure?: requires exactly 1 argument"}
+		}
+		switch args[0].(type) {
+		case *LambdaVal, *BuiltinFunc, *CaseLambdaVal:
+			return &BoolVal{Val: true}, nil
+		default:
+			return &BoolVal{Val: false}, nil
+		}
+	}})
 
 	// I/O — capture to output buffer
 	env.set("display", &BuiltinFunc{Name: "display", Fn: func(args []Value) (Value, error) {
@@ -880,6 +931,8 @@ func builtinApply(args []Value) (Value, error) {
 		return f.Fn(callArgs)
 	case *LambdaVal:
 		return applyLambda(f, callArgs, 0, 0)
+	case *CaseLambdaVal:
+		return applyCaseLambda(f, callArgs, 0, 0)
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("apply: not a procedure: %s", fn.String())}
 	}

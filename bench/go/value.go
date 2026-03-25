@@ -26,8 +26,15 @@ type LambdaVal struct {
 	Body     []Expr
 	Env      *Env
 }
+type CaseLambdaVal struct {
+	Clauses []*LambdaVal
+}
 
 func (v *LambdaVal) String() string {
+	return "#<procedure>"
+}
+
+func (v *CaseLambdaVal) String() string {
 	return "#<procedure>"
 }
 
