@@ -21,6 +21,7 @@ pub enum Value {
     Str(String),
     Symbol(String),
     List(Vec<Value>),
+    Pair(Box<Value>, Box<Value>),
     Lambda(Rc<LambdaData>),
     Void,
 }
@@ -34,6 +35,7 @@ impl PartialEq for Value {
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Void, Value::Void) => true,
             _ => false,
         }
@@ -112,6 +114,7 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_display_string()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Pair(a, b) => format!("({} . {})", a.to_display_string(), b.to_display_string()),
             Value::Lambda(_) => "#<procedure>".into(),
             Value::Void => "".into(),
         }
@@ -131,6 +134,7 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_scheme_display()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Pair(a, b) => format!("({} . {})", a.to_scheme_display(), b.to_scheme_display()),
             _ => self.to_display_string(),
         }
     }
