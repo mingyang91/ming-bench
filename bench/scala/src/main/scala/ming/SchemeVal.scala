@@ -10,7 +10,7 @@ enum SchemeVal:
   case SList(elems: List[SchemeVal])
   case Void
   case BuiltinProc(name: String, f: List[SchemeVal] => SchemeVal)
-  case LambdaProc(params: List[String], body: List[SchemeVal], closure: Env)
+  case LambdaProc(params: List[String], body: List[SchemeVal], closure: Env, rest: Option[String] = None)
 
 object SchemeVal:
 
@@ -18,16 +18,16 @@ object SchemeVal:
 
   /** write-style display (strings quoted) */
   def display(v: SchemeVal): String = v match
-    case IntVal(n)            => n.toString
-    case BoolVal(true)        => "#t"
-    case BoolVal(false)       => "#f"
-    case StringVal(chars)     => s"\"${new String(chars)}\""
-    case CharVal(c)           => s"#\\$c"
-    case Symbol(name)         => name
-    case SList(elems)         => "(" + elems.map(display).mkString(" ") + ")"
-    case Void                 => ""
-    case BuiltinProc(name, _) => s"#<procedure $name>"
-    case LambdaProc(_, _, _)  => "#<procedure>"
+    case IntVal(n)              => n.toString
+    case BoolVal(true)          => "#t"
+    case BoolVal(false)         => "#f"
+    case StringVal(chars)       => s"\"${new String(chars)}\""
+    case CharVal(c)             => s"#\\$c"
+    case Symbol(name)           => name
+    case SList(elems)           => "(" + elems.map(display).mkString(" ") + ")"
+    case Void                   => ""
+    case BuiltinProc(name, _)   => s"#<procedure $name>"
+    case LambdaProc(_, _, _, _) => "#<procedure>"
 
   /** display-style output (strings unquoted) */
   def displayOutput(v: SchemeVal): String = v match

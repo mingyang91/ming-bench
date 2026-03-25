@@ -13,7 +13,24 @@ object Builtins:
     registerComparison(env)
     registerListOps(env)
     registerPredicates(env)
+    registerApply(env)
     StringBuiltins.register(env, output)
+
+  private def registerApply(env: Env): Unit =
+    env.define(
+      "apply",
+      SchemeVal.BuiltinProc(
+        "apply",
+        args =>
+          if args.size < 2 then throw new EvalError("apply: expected at least 2 arguments")
+          val proc = args.head
+          val lastArg = args.last match
+            case SchemeVal.SList(elems) => elems
+            case other => throw new EvalError(s"apply: last argument must be a list, got ${SchemeVal.display(other)}")
+          val prefixArgs = args.slice(1, args.size - 1)
+          Evaluator.apply(proc, prefixArgs ++ lastArg)
+      )
+    )
 
   private def registerArithmetic(env: Env): Unit =
     env.define(

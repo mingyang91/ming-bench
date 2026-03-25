@@ -41,9 +41,18 @@ object Parser:
     val elems     = scala.collection.mutable.ListBuffer[SchemeVal]()
     var remaining = tokens
     while remaining.nonEmpty && !remaining.head.isInstanceOf[Token.RParen] do
-      val (expr, rest) = parseExpr(remaining)
-      elems += expr
-      remaining = rest
+      remaining match
+        case Token.Atom(".", _) :: rest =>
+          // Dotted pair: place a dot marker, then the rest element
+          remaining = rest
+          val (expr, rest2) = parseExpr(remaining)
+          elems += SchemeVal.Symbol(".")
+          elems += expr
+          remaining = rest2
+        case _ =>
+          val (expr, rest) = parseExpr(remaining)
+          elems += expr
+          remaining = rest
     remaining match
       case Token.RParen(_) :: rest => (elems.toList, rest)
       case _                       => throw new EvalError("missing )")

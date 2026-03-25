@@ -66,11 +66,8 @@ object Evaluator:
       case SchemeVal.SList(elems) :: body if elems.nonEmpty && body.nonEmpty =>
         elems.head match
           case SchemeVal.Symbol(name) =>
-            val params = elems.tail.map {
-              case SchemeVal.Symbol(p) => p
-              case other               => throw new EvalError(s"define: expected parameter name, got $other")
-            }
-            env.define(name, SchemeVal.LambdaProc(params, body, env))
+            val (params, rest) = parseParams(elems.tail)
+            env.define(name, SchemeVal.LambdaProc(params, body, env, rest))
             SchemeVal.Void
           case other => throw new EvalError(s"define: expected name, got $other")
       case _ => throw new EvalError("define: bad syntax")
@@ -85,14 +82,31 @@ object Evaluator:
         else SchemeVal.Void
       case _ => throw new EvalError("if: bad syntax")
 
+  private def parseParams(paramList: List[SchemeVal]): (List[String], Option[String]) =
+    val dotIdx = paramList.indexWhere {
+      case SchemeVal.Symbol(".") => true
+      case _                     => false
+    }
+    if dotIdx >= 0 then
+      val fixed = paramList.take(dotIdx).map {
+        case SchemeVal.Symbol(p) => p
+        case other               => throw new EvalError(s"expected parameter name, got $other")
+      }
+      paramList.drop(dotIdx + 1) match
+        case SchemeVal.Symbol(rest) :: Nil => (fixed, Some(rest))
+        case _                             => throw new EvalError("bad dot syntax in parameter list")
+    else
+      val params = paramList.map {
+        case SchemeVal.Symbol(p) => p
+        case other               => throw new EvalError(s"expected parameter name, got $other")
+      }
+      (params, None)
+
   private def evalLambda(args: List[SchemeVal], env: Env): SchemeVal =
     args match
       case SchemeVal.SList(paramList) :: body if body.nonEmpty =>
-        val params = paramList.map {
-          case SchemeVal.Symbol(p) => p
-          case other               => throw new EvalError(s"lambda: expected parameter name, got $other")
-        }
-        SchemeVal.LambdaProc(params, body, env)
+        val (params, rest) = parseParams(paramList)
+        SchemeVal.LambdaProc(params, body, env, rest)
       case _ => throw new EvalError("lambda: bad syntax")
 
   @tailrec
@@ -177,9 +191,18 @@ object Evaluator:
 
   def apply(proc: SchemeVal, args: List[SchemeVal]): SchemeVal = proc match
     case SchemeVal.BuiltinProc(_, f) => f(args)
-    case SchemeVal.LambdaProc(params, body, closure) =>
-      if args.size != params.size then throw new EvalError(s"expected ${params.size} arguments, got ${args.size}")
-      val localEnv = new Env(scala.collection.mutable.Map.empty, Some(closure))
-      params.zip(args).foreach((p, a) => localEnv.define(p, a))
-      body.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, localEnv))
+    case SchemeVal.LambdaProc(params, body, closure, rest) =>
+      rest match
+        case Some(restName) =>
+          if args.size < params.size then
+            throw new EvalError(s"expected at least ${params.size} arguments, got ${args.size}")
+          val localEnv = new Env(scala.collection.mutable.Map.empty, Some(closure))
+          params.zip(args).foreach((p, a) => localEnv.define(p, a))
+          localEnv.define(restName, SchemeVal.SList(args.drop(params.size)))
+          body.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, localEnv))
+        case None =>
+          if args.size != params.size then throw new EvalError(s"expected ${params.size} arguments, got ${args.size}")
+          val localEnv = new Env(scala.collection.mutable.Map.empty, Some(closure))
+          params.zip(args).foreach((p, a) => localEnv.define(p, a))
+          body.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, localEnv))
     case _ => throw new EvalError(s"not a procedure: $proc")
