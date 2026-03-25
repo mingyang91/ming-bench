@@ -7,6 +7,7 @@ use serde::Deserialize;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::process::Command;
 
 #[derive(Deserialize)]
 struct TestEntry {
@@ -26,7 +27,8 @@ fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let tests_json_path = Path::new(&manifest_dir).join("../tests.json");
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    let out_path = Path::new(&out_dir).join("tests_generated.rs");
+    let out_dir = Path::new(&out_dir);
+    let out_path = out_dir.join("tests_generated.rs");
 
     // Tell cargo to rerun if tests.json changes
     println!("cargo:rerun-if-changed=../tests.json");
@@ -135,4 +137,169 @@ fn main() {
         writeln!(out, "}}").unwrap();
         writeln!(out).unwrap();
     }
+
+    build_go_bridge(&manifest_dir, out_dir);
 }
+
+fn build_go_bridge(manifest_dir: &str, out_dir: &Path) {
+    let go_dir = Path::new(manifest_dir)
+        .join("../go")
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("Cannot resolve Go source dir: {e}"));
+
+    emit_go_rerun_directives(&go_dir);
+
+    let bridge_dir = out_dir.join("go_bridge");
+    fs::create_dir_all(&bridge_dir)
+        .unwrap_or_else(|e| panic!("Cannot create {}: {e}", bridge_dir.display()));
+
+    let go_mod_path = bridge_dir.join("go.mod");
+    let main_go_path = bridge_dir.join("main.go");
+    let bridge_bin_path = bridge_dir.join("ming_go_bridge");
+
+    fs::write(&go_mod_path, GO_BRIDGE_GO_MOD)
+        .unwrap_or_else(|e| panic!("Cannot write {}: {e}", go_mod_path.display()));
+    fs::write(&main_go_path, GO_BRIDGE_MAIN)
+        .unwrap_or_else(|e| panic!("Cannot write {}: {e}", main_go_path.display()));
+
+    let bridge_mount = format!("{}:/bridge:Z", bridge_dir.display());
+    let go_mount = format!("{}:/ming:ro,Z", go_dir.display());
+    let build_cmd =
+        "CGO_ENABLED=0 /usr/local/go/bin/go build -trimpath -ldflags='-s -w' -o /bridge/ming_go_bridge .";
+
+    let status = Command::new("sudo")
+        .args([
+            "podman",
+            "run",
+            "--rm",
+            "-v",
+            &bridge_mount,
+            "-v",
+            &go_mount,
+            "-w",
+            "/bridge",
+            "docker.io/library/golang:1.23",
+            "bash",
+            "-lc",
+            build_cmd,
+        ])
+        .status()
+        .unwrap_or_else(|e| panic!("Failed to start Go bridge build: {e}"));
+
+    if !status.success() {
+        panic!("Go bridge build failed with status {status}");
+    }
+
+    println!(
+        "cargo:rustc-env=MING_GO_BRIDGE_BIN={}",
+        bridge_bin_path.display()
+    );
+}
+
+fn emit_go_rerun_directives(go_dir: &Path) {
+    let entries = fs::read_dir(go_dir)
+        .unwrap_or_else(|e| panic!("Cannot list {}: {e}", go_dir.display()));
+
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|e| panic!("Cannot read {} entry: {e}", go_dir.display()))
+            .path();
+
+        if path.extension().and_then(|ext| ext.to_str()) == Some("go")
+            || path.file_name().and_then(|name| name.to_str()) == Some("go.mod")
+        {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
+const GO_BRIDGE_GO_MOD: &str = r#"module rustbridge
+
+go 1.23
+
+require ming v0.0.0
+
+replace ming => /ming
+"#;
+
+const GO_BRIDGE_MAIN: &str = r#"package main
+
+import (
+    "encoding/binary"
+    "fmt"
+    "io"
+    "os"
+
+    "ming"
+)
+
+func writeField(value string) error {
+    var size [8]byte
+    binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+    if _, err := os.Stdout.Write(size[:]); err != nil {
+        return err
+    }
+    _, err := io.WriteString(os.Stdout, value)
+    return err
+}
+
+func writeSuccess(fields ...string) error {
+    if _, err := os.Stdout.Write([]byte{'S'}); err != nil {
+        return err
+    }
+    for _, field := range fields {
+        if err := writeField(field); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
+func writeError(err error) error {
+    if _, writeErr := os.Stdout.Write([]byte{'E'}); writeErr != nil {
+        return writeErr
+    }
+    return writeField(err.Error())
+}
+
+func main() {
+    mode := "eval"
+    if len(os.Args) > 1 {
+        mode = os.Args[1]
+    }
+
+    input, err := io.ReadAll(os.Stdin)
+    if err != nil {
+        panic(err)
+    }
+
+    switch mode {
+    case "eval":
+        result, err := ming.EvalStr(string(input))
+        if err != nil {
+            if writeErr := writeError(err); writeErr != nil {
+                panic(writeErr)
+            }
+            return
+        }
+        if err := writeSuccess(result); err != nil {
+            panic(err)
+        }
+    case "eval-output":
+        result, output, err := ming.EvalStrWithOutput(string(input))
+        if err != nil {
+            if writeErr := writeError(err); writeErr != nil {
+                panic(writeErr)
+            }
+            return
+        }
+        if err := writeSuccess(result, output); err != nil {
+            panic(err)
+        }
+    default:
+        if err := writeError(fmt.Errorf("unknown mode: %s", mode)); err != nil {
+            panic(err)
+        }
+    }
+}
+"#;

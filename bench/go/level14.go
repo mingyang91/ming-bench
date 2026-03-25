@@ -332,7 +332,6 @@ func evalDo(args []node, env *environment) (value, error) {
 
 func parseNamedBindings(bindingExprs []node, formName string) ([]namedBindingSpec, error) {
 	specs := make([]namedBindingSpec, len(bindingExprs))
-	seen := map[string]struct{}{}
 	for i, bindingExpr := range bindingExprs {
 		binding, ok := bindingExpr.(listNode)
 		if !ok || len(binding.elements) != 2 {
@@ -343,22 +342,23 @@ func parseNamedBindings(bindingExprs []node, formName string) ([]namedBindingSpe
 		if !ok {
 			return nil, &EvalError{Message: fmt.Sprintf("%s binding names must be symbols", formName)}
 		}
-		if _, exists := seen[name]; exists {
-			return nil, &EvalError{Message: fmt.Sprintf("duplicate binding: %s", name)}
+
+		for j := 0; j < i; j++ {
+			if specs[j].name == name {
+				return nil, &EvalError{Message: fmt.Sprintf("duplicate binding: %s", name)}
+			}
 		}
 
 		specs[i] = namedBindingSpec{
 			name: name,
 			expr: binding.elements[1],
 		}
-		seen[name] = struct{}{}
 	}
 	return specs, nil
 }
 
 func parseDoBindings(bindingExprs []node) ([]doBindingSpec, error) {
 	specs := make([]doBindingSpec, len(bindingExprs))
-	seen := map[string]struct{}{}
 	for i, bindingExpr := range bindingExprs {
 		binding, ok := bindingExpr.(listNode)
 		if !ok || len(binding.elements) < 2 || len(binding.elements) > 3 {
@@ -369,8 +369,11 @@ func parseDoBindings(bindingExprs []node) ([]doBindingSpec, error) {
 		if !ok {
 			return nil, &EvalError{Message: "do binding names must be symbols"}
 		}
-		if _, exists := seen[name]; exists {
-			return nil, &EvalError{Message: fmt.Sprintf("duplicate binding: %s", name)}
+
+		for j := 0; j < i; j++ {
+			if specs[j].name == name {
+				return nil, &EvalError{Message: fmt.Sprintf("duplicate binding: %s", name)}
+			}
 		}
 
 		specs[i] = doBindingSpec{
@@ -382,7 +385,6 @@ func parseDoBindings(bindingExprs []node) ([]doBindingSpec, error) {
 			specs[i].step = binding.elements[2]
 		}
 
-		seen[name] = struct{}{}
 	}
 	return specs, nil
 }

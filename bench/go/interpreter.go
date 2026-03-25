@@ -76,13 +76,19 @@ type binding struct {
 	value value
 }
 
+type macroState struct {
+	hasMacros bool
+}
+
 type environment struct {
-	parent      *environment
-	values      map[string]*binding
-	smallNames  [4]string
-	smallValues [4]*binding
-	smallCount  int
-	macros      map[string]macroTransformer
+	parent       *environment
+	values       map[string]*binding
+	smallNames   [4]string
+	smallValues  [4]*binding
+	smallCount   int
+	macros       map[string]macroTransformer
+	macroState   *macroState
+	fastEval     bool
 	syntaxDefEnv *environment
 }
 
@@ -102,7 +108,14 @@ func evalStringWithOutput(input string) (string, string, error) {
 
 	ctx := &evalContext{}
 	env := baseEnv(ctx)
-	last, err := runEvalSequence(nodes, env)
+	env.fastEval = canUseFastEval(nodes)
+
+	var last value
+	if env.fastEval {
+		last, err = evalSequenceFast(nodes, env)
+	} else {
+		last, err = runEvalSequence(nodes, env)
+	}
 	if err != nil {
 		return "", "", err
 	}
@@ -256,6 +269,10 @@ func newEnvironment(parent *environment) *environment {
 	}
 	if parent != nil {
 		env.syntaxDefEnv = parent.syntaxDefEnv
+		env.macroState = parent.macroState
+		env.fastEval = parent.fastEval
+	} else {
+		env.macroState = &macroState{}
 	}
 	return env
 }
@@ -330,7 +347,96 @@ func (e *environment) set(name string, val value) bool {
 }
 
 func eval(expr node, env *environment) (value, error) {
+	if env != nil && env.fastEval {
+		return evalFast(expr, env)
+	}
 	return runEval(expr, env)
+}
+
+func evalFast(expr node, env *environment) (value, error) {
+	for {
+		switch current := expr.(type) {
+		case integerValue, rationalValue, inexactValue, booleanValue, stringValue, charValue:
+			return current, nil
+		case vectorNode:
+			return datumFromNode(current)
+		case symbolNode:
+			if current.captured != nil {
+				return current.captured.value, nil
+			}
+
+			val, ok := env.lookup(current.name)
+			if !ok {
+				return nil, errorAt(current.pos, "unbound variable: %s", current.name)
+			}
+			return val, nil
+		case listNode:
+			result, step, err := evalList(current, env)
+			if err != nil {
+				return nil, err
+			}
+			if step == nil {
+				return result, nil
+			}
+			expr = step.expr
+			env = step.env
+		default:
+			return nil, errorAt(nodePos(expr), "unknown expression")
+		}
+	}
+}
+
+var slowEvalSymbols = map[string]struct{}{
+	"call/cc":                        {},
+	"call-with-current-continuation": {},
+	"dynamic-wind":                   {},
+	"guard":                          {},
+	"raise":                          {},
+	"with-exception-handler":         {},
+	"define-syntax":                  {},
+	"syntax":                         {},
+	"syntax-case":                    {},
+	"with-syntax":                    {},
+}
+
+func canUseFastEval(nodes []node) bool {
+	for _, expr := range nodes {
+		if containsSlowEvalFeature(expr) {
+			return false
+		}
+	}
+	return true
+}
+
+func containsSlowEvalFeature(expr node) bool {
+	switch expr := expr.(type) {
+	case symbolNode:
+		_, blocked := slowEvalSymbols[expr.name]
+		return blocked
+	case listNode:
+		for _, element := range expr.elements {
+			if containsSlowEvalFeature(element) {
+				return true
+			}
+		}
+		return false
+	case dottedListNode:
+		for _, element := range expr.elements {
+			if containsSlowEvalFeature(element) {
+				return true
+			}
+		}
+		return containsSlowEvalFeature(expr.tail)
+	case vectorNode:
+		for _, element := range expr.elements {
+			if containsSlowEvalFeature(element) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
 }
 
 func evalList(list listNode, env *environment) (value, *evalStep, error) {
@@ -795,7 +901,38 @@ func parseParamNames(paramExprs []node) ([]string, string, bool, error) {
 }
 
 func applyProcedure(proc value, args []value, pos sourcePos) (value, error) {
+	if procedureUsesFastEval(proc) {
+		result, step, err := startProcedureCall(proc, args, pos)
+		if err != nil {
+			return nil, err
+		}
+		if step == nil {
+			return result, nil
+		}
+		return eval(step.expr, step.env)
+	}
 	return runProcedureCall(proc, args, pos)
+}
+
+func procedureUsesFastEval(proc value) bool {
+	switch proc := proc.(type) {
+	case builtinProc:
+		return true
+	case *closureValue:
+		return proc.env != nil && proc.env.fastEval
+	case *caseClosureValue:
+		if len(proc.clauses) == 0 {
+			return false
+		}
+		for _, clause := range proc.clauses {
+			if clause.env == nil || !clause.env.fastEval {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 func startProcedureCall(proc value, args []value, pos sourcePos) (value, *evalStep, error) {
@@ -854,7 +991,21 @@ func startClosureCall(proc *closureValue, args []value, pos sourcePos) (value, *
 }
 
 func evalSequence(exprs []node, env *environment) (value, error) {
+	if env != nil && env.fastEval {
+		return evalSequenceFast(exprs, env)
+	}
 	return runEvalSequence(exprs, env)
+}
+
+func evalSequenceFast(exprs []node, env *environment) (value, error) {
+	result, step, err := prepareSequence(exprs, env)
+	if err != nil {
+		return nil, err
+	}
+	if step == nil {
+		return result, nil
+	}
+	return eval(step.expr, step.env)
 }
 
 func prepareSequence(exprs []node, env *environment) (value, *evalStep, error) {
@@ -1127,11 +1278,18 @@ func builtinLength() builtinProc {
 			return nil, &EvalError{Message: "length expects exactly 1 argument"}
 		}
 
-		list, err := expectListValue(args[0])
-		if err != nil {
-			return nil, err
+		cursor := newListCursor(args[0])
+		count := 0
+		for {
+			_, ok, err := cursor.next()
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return integerValue(count), nil
+			}
+			count++
 		}
-		return integerValue(len(list.elements)), nil
 	}
 }
 
@@ -1141,16 +1299,18 @@ func builtinReverse() builtinProc {
 			return nil, &EvalError{Message: "reverse expects exactly 1 argument"}
 		}
 
-		list, err := expectListValue(args[0])
-		if err != nil {
-			return nil, err
+		cursor := newListCursor(args[0])
+		var reversed value = listValue{}
+		for {
+			element, ok, err := cursor.next()
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return reversed, nil
+			}
+			reversed = &pairValue{car: element, cdr: reversed}
 		}
-
-		reversed := make([]value, len(list.elements))
-		for i, element := range list.elements {
-			reversed[len(list.elements)-1-i] = element
-		}
-		return makeList(reversed), nil
 	}
 }
 
@@ -1160,15 +1320,33 @@ func builtinAppend() builtinProc {
 			return listValue{}, nil
 		}
 
-		var combined []value
+		var head *pairValue
+		var tail *pairValue
 		for _, arg := range args {
-			list, err := expectListValue(arg)
-			if err != nil {
-				return nil, err
+			cursor := newListCursor(arg)
+			for {
+				element, ok, err := cursor.next()
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					break
+				}
+
+				cell := &pairValue{car: element, cdr: listValue{}}
+				if head == nil {
+					head = cell
+					tail = cell
+				} else {
+					tail.cdr = cell
+					tail = cell
+				}
 			}
-			combined = append(combined, list.elements...)
 		}
-		return makeList(combined), nil
+		if head == nil {
+			return listValue{}, nil
+		}
+		return head, nil
 	}
 }
 
@@ -1196,33 +1374,43 @@ func builtinMap() builtinProc {
 			return nil, &EvalError{Message: "map expects a procedure and at least 1 list"}
 		}
 
-		lists := make([]listValue, len(args)-1)
-		limit := -1
+		cursors := make([]listCursor, len(args)-1)
 		for i, arg := range args[1:] {
-			list, err := expectListValue(arg)
-			if err != nil {
-				return nil, err
-			}
-			lists[i] = list
-			if limit == -1 || len(list.elements) < limit {
-				limit = len(list.elements)
-			}
+			cursors[i] = newListCursor(arg)
 		}
 
-		results := make([]value, 0, limit)
-		callArgs := make([]value, len(lists))
-		for i := 0; i < limit; i++ {
-			for j, list := range lists {
-				callArgs[j] = list.elements[i]
+		callArgs := make([]value, len(cursors))
+		var head *pairValue
+		var tail *pairValue
+		for {
+			for i := range cursors {
+				element, ok, err := cursors[i].next()
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					if head == nil {
+						return listValue{}, nil
+					}
+					return head, nil
+				}
+				callArgs[i] = element
 			}
+
 			result, err := applyProcedure(args[0], callArgs, sourcePos{})
 			if err != nil {
 				return nil, err
 			}
-			results = append(results, result)
-		}
 
-		return makeList(results), nil
+			cell := &pairValue{car: result, cdr: listValue{}}
+			if head == nil {
+				head = cell
+				tail = cell
+			} else {
+				tail.cdr = cell
+				tail = cell
+			}
+		}
 	}
 }
 
@@ -1232,30 +1420,27 @@ func builtinForEach() builtinProc {
 			return nil, &EvalError{Message: "for-each expects a procedure and at least 1 list"}
 		}
 
-		lists := make([]listValue, len(args)-1)
-		limit := -1
+		cursors := make([]listCursor, len(args)-1)
 		for i, arg := range args[1:] {
-			list, err := expectListValue(arg)
-			if err != nil {
-				return nil, err
-			}
-			lists[i] = list
-			if limit == -1 || len(list.elements) < limit {
-				limit = len(list.elements)
-			}
+			cursors[i] = newListCursor(arg)
 		}
 
-		callArgs := make([]value, len(lists))
-		for i := 0; i < limit; i++ {
-			for j, list := range lists {
-				callArgs[j] = list.elements[i]
+		callArgs := make([]value, len(cursors))
+		for {
+			for i := range cursors {
+				element, ok, err := cursors[i].next()
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					return voidValue{}, nil
+				}
+				callArgs[i] = element
 			}
 			if _, err := applyProcedure(args[0], callArgs, sourcePos{}); err != nil {
 				return nil, err
 			}
 		}
-
-		return voidValue{}, nil
 	}
 }
 
@@ -2287,6 +2472,53 @@ func makeList(elements []value) value {
 func isEmptyListValue(v value) bool {
 	list, ok := v.(listValue)
 	return ok && len(list.elements) == 0
+}
+
+type listCursor struct {
+	rest    []value
+	current value
+	seen    map[*pairValue]struct{}
+}
+
+func newListCursor(v value) listCursor {
+	if list, ok := v.(listValue); ok {
+		return listCursor{rest: list.elements}
+	}
+	return listCursor{
+		current: v,
+		seen:    map[*pairValue]struct{}{},
+	}
+}
+
+func (c *listCursor) next() (value, bool, error) {
+	for {
+		if len(c.rest) > 0 {
+			element := c.rest[0]
+			c.rest = c.rest[1:]
+			return element, true, nil
+		}
+
+		switch current := c.current.(type) {
+		case nil:
+			return nil, false, nil
+		case listValue:
+			if len(current.elements) == 0 {
+				c.current = nil
+				return nil, false, nil
+			}
+			c.rest = current.elements
+			c.current = nil
+		case *pairValue:
+			if _, ok := c.seen[current]; ok {
+				return nil, false, &EvalError{Message: "expected list"}
+			}
+			c.seen[current] = struct{}{}
+			c.current = current.cdr
+			return current.car, true, nil
+		default:
+			return nil, false, &EvalError{Message: "expected list"}
+		}
+	}
 }
 
 func listElements(v value) ([]value, error) {

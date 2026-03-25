@@ -3,8 +3,8 @@ package ming
 type continuation interface{}
 
 type continuationValue struct {
-	cont continuation
-	wind *windFrame
+	cont    continuation
+	wind    *windFrame
 	handler *exceptionHandlerFrame
 }
 
@@ -23,9 +23,10 @@ type windFrame struct {
 }
 
 type sequenceCont struct {
-	rest []node
-	env  *environment
-	next continuation
+	exprs []node
+	index int
+	env   *environment
+	next  continuation
 }
 
 type ifCont struct {
@@ -49,15 +50,17 @@ type setValueCont struct {
 }
 
 type andCont struct {
-	rest []node
-	env  *environment
-	next continuation
+	args  []node
+	index int
+	env   *environment
+	next  continuation
 }
 
 type orCont struct {
-	rest []node
-	env  *environment
-	next continuation
+	args  []node
+	index int
+	env   *environment
+	next  continuation
 }
 
 type applicationOperatorCont struct {
@@ -68,20 +71,21 @@ type applicationOperatorCont struct {
 }
 
 type applicationArgCont struct {
-	proc      value
-	remaining []node
-	valuesRev []value
-	env       *environment
-	pos       sourcePos
-	next      continuation
+	proc     value
+	operands []node
+	index    int
+	values   []value
+	env      *environment
+	pos      sourcePos
+	next     continuation
 }
 
 type condTestCont struct {
-	clause    listNode
-	remaining []node
-	env       *environment
-	pos       sourcePos
-	next      continuation
+	clauses []node
+	index   int
+	env     *environment
+	pos     sourcePos
+	next    continuation
 }
 
 type caseKeyCont struct {
@@ -148,24 +152,24 @@ type dynamicWindAfterOutCont struct {
 }
 
 type windTransitionCont struct {
-	leave      []*windFrame
-	enter      []*windFrame
-	setWind    *windFrame
-	value      value
-	targetCont continuation
-	targetWind *windFrame
+	leave         []*windFrame
+	enter         []*windFrame
+	setWind       *windFrame
+	value         value
+	targetCont    continuation
+	targetWind    *windFrame
 	targetHandler *exceptionHandlerFrame
-	pos        sourcePos
+	pos           sourcePos
 }
 
 type evalMachine struct {
-	expr node
-	env  *environment
-	val  value
-	cont continuation
-	wind *windFrame
+	expr    node
+	env     *environment
+	val     value
+	cont    continuation
+	wind    *windFrame
 	handler *exceptionHandlerFrame
-	eval bool
+	eval    bool
 }
 
 func runEval(expr node, env *environment) (value, error) {
@@ -225,6 +229,9 @@ func (m *evalMachine) setValue(val value, cont continuation) {
 func (m *evalMachine) stepEval() error {
 	switch expr := m.expr.(type) {
 	case listNode:
+		if m.env == nil || m.env.macroState == nil || !m.env.macroState.hasMacros {
+			return m.stepEvalExpanded(expr)
+		}
 		expanded, err := expandMacros(expr, m.env)
 		if err != nil {
 			return err
@@ -371,7 +378,17 @@ func (m *evalMachine) stepEvalList(list listNode) error {
 func (m *evalMachine) stepContinue() error {
 	switch cont := m.cont.(type) {
 	case *sequenceCont:
-		return m.startSequence(cont.rest, cont.env, cont.next)
+		cont.index++
+		if cont.index >= len(cont.exprs) {
+			m.setValue(voidValue{}, cont.next)
+			return nil
+		}
+		if cont.index == len(cont.exprs)-1 {
+			m.setEval(cont.exprs[cont.index], cont.env, cont.next)
+			return nil
+		}
+		m.setEval(cont.exprs[cont.index], cont.env, cont)
+		return nil
 	case *ifCont:
 		if isTruthy(m.val) {
 			m.setEval(cont.consequent, cont.env, cont.next)
@@ -404,13 +421,33 @@ func (m *evalMachine) stepContinue() error {
 			m.setValue(m.val, cont.next)
 			return nil
 		}
-		return m.startAnd(cont.rest, cont.env, cont.next)
+		cont.index++
+		if cont.index >= len(cont.args) {
+			m.setValue(booleanValue(true), cont.next)
+			return nil
+		}
+		if cont.index == len(cont.args)-1 {
+			m.setEval(cont.args[cont.index], cont.env, cont.next)
+			return nil
+		}
+		m.setEval(cont.args[cont.index], cont.env, cont)
+		return nil
 	case *orCont:
 		if isTruthy(m.val) {
 			m.setValue(m.val, cont.next)
 			return nil
 		}
-		return m.startOr(cont.rest, cont.env, cont.next)
+		cont.index++
+		if cont.index >= len(cont.args) {
+			m.setValue(booleanValue(false), cont.next)
+			return nil
+		}
+		if cont.index == len(cont.args)-1 {
+			m.setEval(cont.args[cont.index], cont.env, cont.next)
+			return nil
+		}
+		m.setEval(cont.args[cont.index], cont.env, cont)
+		return nil
 	case *applicationOperatorCont:
 		if len(cont.operands) == 0 {
 			return m.enterProcedure(m.val, nil, cont.pos, cont.next)
@@ -418,71 +455,57 @@ func (m *evalMachine) stepContinue() error {
 
 		last := len(cont.operands) - 1
 		m.setEval(cont.operands[last], cont.env, &applicationArgCont{
-			proc:      m.val,
-			remaining: cont.operands[:last],
-			env:       cont.env,
-			pos:       cont.pos,
-			next:      cont.next,
+			proc:     m.val,
+			operands: cont.operands,
+			index:    last,
+			values:   make([]value, len(cont.operands)),
+			env:      cont.env,
+			pos:      cont.pos,
+			next:     cont.next,
 		})
 		return nil
 	case *applicationArgCont:
-		valuesRev := appendCopiedValue(cont.valuesRev, m.val)
-		if len(cont.remaining) == 0 {
-			return m.enterProcedure(cont.proc, reverseValues(valuesRev), cont.pos, cont.next)
+		cont.values[cont.index] = m.val
+		if cont.index == 0 {
+			return m.enterProcedure(cont.proc, cont.values, cont.pos, cont.next)
 		}
 
-		last := len(cont.remaining) - 1
-		m.setEval(cont.remaining[last], cont.env, &applicationArgCont{
-			proc:      cont.proc,
-			remaining: cont.remaining[:last],
-			valuesRev: valuesRev,
-			env:       cont.env,
-			pos:       cont.pos,
-			next:      cont.next,
-		})
+		cont.index--
+		m.setEval(cont.operands[cont.index], cont.env, cont)
 		return nil
 	case *condTestCont:
-		if !isTruthy(m.val) {
-			return m.startCond(cont.remaining, cont.env, cont.pos, cont.next)
+		clause, ok := cont.clauses[cont.index].(listNode)
+		if !ok || len(clause.elements) == 0 {
+			return errorAt(cont.pos, "cond clauses must be non-empty lists")
 		}
-		if len(cont.clause.elements) == 1 {
+		if !isTruthy(m.val) {
+			return m.advanceCond(cont)
+		}
+		if len(clause.elements) == 1 {
 			m.setValue(m.val, cont.next)
 			return nil
 		}
-		return m.startSequence(cont.clause.elements[1:], cont.env, cont.next)
+		return m.startSequence(clause.elements[1:], cont.env, cont.next)
 	case *caseKeyCont:
 		return m.resumeCase(cont, m.val)
 	case *letValueCont:
-		values := appendCopiedValue(cont.values, m.val)
+		cont.values[cont.index] = m.val
 		if cont.index+1 < len(cont.specs) {
-			m.setEval(cont.specs[cont.index+1].expr, cont.env, &letValueCont{
-				specs:  cont.specs,
-				index:  cont.index + 1,
-				values: values,
-				env:    cont.env,
-				body:   cont.body,
-				next:   cont.next,
-			})
+			cont.index++
+			m.setEval(cont.specs[cont.index].expr, cont.env, cont)
 			return nil
 		}
 
 		letEnv := newEnvironment(cont.env)
 		for i, spec := range cont.specs {
-			letEnv.define(spec.name, values[i])
+			letEnv.define(spec.name, cont.values[i])
 		}
 		return m.startSequence(cont.body, letEnv, cont.next)
 	case *namedLetValueCont:
-		values := appendCopiedValue(cont.values, m.val)
+		cont.values[cont.index] = m.val
 		if cont.index+1 < len(cont.specs) {
-			m.setEval(cont.specs[cont.index+1].expr, cont.env, &namedLetValueCont{
-				name:   cont.name,
-				specs:  cont.specs,
-				index:  cont.index + 1,
-				values: values,
-				env:    cont.env,
-				body:   cont.body,
-				next:   cont.next,
-			})
+			cont.index++
+			m.setEval(cont.specs[cont.index].expr, cont.env, cont)
 			return nil
 		}
 
@@ -498,19 +521,14 @@ func (m *evalMachine) stepContinue() error {
 		}
 		letEnv.define(cont.name, proc)
 		for i, name := range params {
-			letEnv.define(name, values[i])
+			letEnv.define(name, cont.values[i])
 		}
 		return m.startSequence(cont.body, letEnv, cont.next)
 	case *letStarValueCont:
 		cont.letEnv.define(cont.specs[cont.index].name, m.val)
 		if cont.index+1 < len(cont.specs) {
-			m.setEval(cont.specs[cont.index+1].expr, cont.letEnv, &letStarValueCont{
-				specs:  cont.specs,
-				index:  cont.index + 1,
-				letEnv: cont.letEnv,
-				body:   cont.body,
-				next:   cont.next,
-			})
+			cont.index++
+			m.setEval(cont.specs[cont.index].expr, cont.letEnv, cont)
 			return nil
 		}
 		return m.startSequence(cont.body, cont.letEnv, cont.next)
@@ -518,36 +536,22 @@ func (m *evalMachine) stepContinue() error {
 		if cont.sequential {
 			cont.cells[cont.index].value = m.val
 			if cont.index+1 < len(cont.specs) {
-				m.setEval(cont.specs[cont.index+1].expr, cont.letEnv, &letrecValueCont{
-					specs:      cont.specs,
-					index:      cont.index + 1,
-					sequential: true,
-					letEnv:     cont.letEnv,
-					cells:      cont.cells,
-					body:       cont.body,
-					next:       cont.next,
-				})
+				cont.index++
+				m.setEval(cont.specs[cont.index].expr, cont.letEnv, cont)
 				return nil
 			}
 			return m.startSequence(cont.body, cont.letEnv, cont.next)
 		}
 
-		values := appendCopiedValue(cont.values, m.val)
+		cont.values[cont.index] = m.val
 		if cont.index+1 < len(cont.specs) {
-			m.setEval(cont.specs[cont.index+1].expr, cont.letEnv, &letrecValueCont{
-				specs:  cont.specs,
-				index:  cont.index + 1,
-				letEnv: cont.letEnv,
-				cells:  cont.cells,
-				values: values,
-				body:   cont.body,
-				next:   cont.next,
-			})
+			cont.index++
+			m.setEval(cont.specs[cont.index].expr, cont.letEnv, cont)
 			return nil
 		}
 
 		for i, cell := range cont.cells {
-			cell.value = values[i]
+			cell.value = cont.values[i]
 		}
 		return m.startSequence(cont.body, cont.letEnv, cont.next)
 	case *dynamicWindAfterInCont:
@@ -615,9 +619,9 @@ func (m *evalMachine) startSequence(exprs []node, env *environment, next continu
 	}
 
 	m.setEval(exprs[0], env, &sequenceCont{
-		rest: exprs[1:],
-		env:  env,
-		next: next,
+		exprs: exprs,
+		env:   env,
+		next:  next,
 	})
 	return nil
 }
@@ -633,7 +637,7 @@ func (m *evalMachine) startAnd(args []node, env *environment, next continuation)
 	}
 
 	m.setEval(args[0], env, &andCont{
-		rest: args[1:],
+		args: args,
 		env:  env,
 		next: next,
 	})
@@ -651,7 +655,7 @@ func (m *evalMachine) startOr(args []node, env *environment, next continuation) 
 	}
 
 	m.setEval(args[0], env, &orCont{
-		rest: args[1:],
+		args: args,
 		env:  env,
 		next: next,
 	})
@@ -734,35 +738,51 @@ func (m *evalMachine) startIf(args []node, env *environment, next continuation) 
 }
 
 func (m *evalMachine) startCond(clauses []node, env *environment, pos sourcePos, next continuation) error {
+	return m.startCondAt(clauses, 0, env, pos, next)
+}
+
+func (m *evalMachine) startCondAt(clauses []node, index int, env *environment, pos sourcePos, next continuation) error {
 	if len(clauses) == 0 {
 		m.setValue(voidValue{}, next)
 		return nil
 	}
 
-	clause, ok := clauses[0].(listNode)
-	if !ok || len(clause.elements) == 0 {
-		return errorAt(pos, "cond clauses must be non-empty lists")
+	frame := &condTestCont{
+		clauses: clauses,
+		index:   index,
+		env:     env,
+		pos:     pos,
+		next:    next,
 	}
+	return m.advanceCond(frame)
+}
 
-	if name, ok := symbolName(clause.elements[0]); ok && name == "else" {
-		if len(clauses) != 1 {
-			return errorAt(pos, "else clause must be last")
-		}
-		if len(clause.elements) == 1 {
-			m.setValue(voidValue{}, next)
+func (m *evalMachine) advanceCond(frame *condTestCont) error {
+	for {
+		if frame.index >= len(frame.clauses) {
+			m.setValue(voidValue{}, frame.next)
 			return nil
 		}
-		return m.startSequence(clause.elements[1:], env, next)
-	}
 
-	m.setEval(clause.elements[0], env, &condTestCont{
-		clause:    clause,
-		remaining: clauses[1:],
-		env:       env,
-		pos:       pos,
-		next:      next,
-	})
-	return nil
+		clause, ok := frame.clauses[frame.index].(listNode)
+		if !ok || len(clause.elements) == 0 {
+			return errorAt(frame.pos, "cond clauses must be non-empty lists")
+		}
+
+		if name, ok := symbolName(clause.elements[0]); ok && name == "else" {
+			if frame.index != len(frame.clauses)-1 {
+				return errorAt(frame.pos, "else clause must be last")
+			}
+			if len(clause.elements) == 1 {
+				m.setValue(voidValue{}, frame.next)
+				return nil
+			}
+			return m.startSequence(clause.elements[1:], frame.env, frame.next)
+		}
+
+		m.setEval(clause.elements[0], frame.env, frame)
+		return nil
+	}
 }
 
 func (m *evalMachine) startCase(args []node, env *environment, pos sourcePos, next continuation) error {
@@ -846,10 +866,11 @@ func (m *evalMachine) startLet(args []node, env *environment, pos sourcePos, nex
 	}
 
 	m.setEval(specs[0].expr, env, &letValueCont{
-		specs: specs,
-		env:   env,
-		body:  args[1:],
-		next:  next,
+		specs:  specs,
+		values: make([]value, len(specs)),
+		env:    env,
+		body:   args[1:],
+		next:   next,
 	})
 	return nil
 }
@@ -880,11 +901,12 @@ func (m *evalMachine) startNamedLet(name string, args []node, env *environment, 
 	}
 
 	m.setEval(specs[0].expr, env, &namedLetValueCont{
-		name:  name,
-		specs: specs,
-		env:   env,
-		body:  args[1:],
-		next:  next,
+		name:   name,
+		specs:  specs,
+		values: make([]value, len(specs)),
+		env:    env,
+		body:   args[1:],
+		next:   next,
 	})
 	return nil
 }
@@ -955,6 +977,7 @@ func (m *evalMachine) startLetrec(args []node, env *environment, pos sourcePos, 
 		sequential: sequential,
 		letEnv:     letEnv,
 		cells:      cells,
+		values:     make([]value, len(specs)),
 		body:       args[1:],
 		next:       next,
 	})
@@ -985,27 +1008,27 @@ func (m *evalMachine) startWindTransition(leave []*windFrame, enter []*windFrame
 		frame := leave[0]
 		m.wind = frame.parent
 		return m.enterProcedure(frame.outProc, nil, pos, &windTransitionCont{
-			leave:      leave[1:],
-			enter:      enter,
-			value:      val,
-			targetCont: targetCont,
-			targetWind: targetWind,
+			leave:         leave[1:],
+			enter:         enter,
+			value:         val,
+			targetCont:    targetCont,
+			targetWind:    targetWind,
 			targetHandler: targetHandler,
-			pos:        pos,
+			pos:           pos,
 		})
 	}
 
 	if len(enter) > 0 {
 		frame := enter[0]
 		return m.enterProcedure(frame.inProc, nil, pos, &windTransitionCont{
-			leave:      leave,
-			enter:      enter[1:],
-			setWind:    frame,
-			value:      val,
-			targetCont: targetCont,
-			targetWind: targetWind,
+			leave:         leave,
+			enter:         enter[1:],
+			setWind:       frame,
+			value:         val,
+			targetCont:    targetCont,
+			targetWind:    targetWind,
 			targetHandler: targetHandler,
-			pos:        pos,
+			pos:           pos,
 		})
 	}
 
@@ -1037,12 +1060,16 @@ func (m *evalMachine) enterProcedure(proc value, args []value, pos sourcePos, ne
 		if len(args) != 1 {
 			return errorAt(pos, "continuation expects exactly 1 argument")
 		}
-		return m.resumeContinuation(args[0], proc.cont, proc.wind, proc.handler, pos)
+		return m.resumeContinuation(args[0], cloneContinuation(proc.cont), proc.wind, proc.handler, pos)
 	case *callCCProcValue:
 		if len(args) != 1 {
 			return errorAt(pos, "call/cc expects exactly 1 argument")
 		}
-		return m.enterProcedure(args[0], []value{&continuationValue{cont: next, wind: m.wind, handler: m.handler}}, pos, next)
+		return m.enterProcedure(args[0], []value{&continuationValue{
+			cont:    cloneContinuation(next),
+			wind:    m.wind,
+			handler: m.handler,
+		}}, pos, next)
 	case *dynamicWindProcValue:
 		if len(args) != 3 {
 			return errorAt(pos, "dynamic-wind expects exactly 3 arguments")
@@ -1088,21 +1115,6 @@ func (m *evalMachine) startClosureCall(proc *closureValue, args []value, pos sou
 	return m.startSequence(proc.body, callEnv, next)
 }
 
-func appendCopiedValue(values []value, v value) []value {
-	result := make([]value, len(values)+1)
-	copy(result, values)
-	result[len(values)] = v
-	return result
-}
-
-func reverseValues(values []value) []value {
-	result := make([]value, len(values))
-	for i, value := range values {
-		result[len(values)-1-i] = value
-	}
-	return result
-}
-
 func diffWindFrames(current *windFrame, target *windFrame) ([]*windFrame, []*windFrame) {
 	currentFrames := collectWindFrames(current)
 	targetFrames := collectWindFrames(target)
@@ -1133,4 +1145,172 @@ func reverseWindFrames(frames []*windFrame) []*windFrame {
 		result[len(frames)-1-i] = frame
 	}
 	return result
+}
+
+func cloneContinuation(cont continuation) continuation {
+	switch cont := cont.(type) {
+	case nil:
+		return nil
+	case *sequenceCont:
+		return &sequenceCont{
+			exprs: cont.exprs,
+			index: cont.index,
+			env:   cont.env,
+			next:  cloneContinuation(cont.next),
+		}
+	case *ifCont:
+		return &ifCont{
+			consequent: cont.consequent,
+			alternate:  cont.alternate,
+			hasElse:    cont.hasElse,
+			env:        cont.env,
+			next:       cloneContinuation(cont.next),
+		}
+	case *defineValueCont:
+		return &defineValueCont{
+			target: cont.target,
+			env:    cont.env,
+			next:   cloneContinuation(cont.next),
+		}
+	case *setValueCont:
+		return &setValueCont{
+			target: cont.target,
+			env:    cont.env,
+			next:   cloneContinuation(cont.next),
+		}
+	case *andCont:
+		return &andCont{
+			args:  cont.args,
+			index: cont.index,
+			env:   cont.env,
+			next:  cloneContinuation(cont.next),
+		}
+	case *orCont:
+		return &orCont{
+			args:  cont.args,
+			index: cont.index,
+			env:   cont.env,
+			next:  cloneContinuation(cont.next),
+		}
+	case *applicationOperatorCont:
+		return &applicationOperatorCont{
+			operands: cont.operands,
+			env:      cont.env,
+			pos:      cont.pos,
+			next:     cloneContinuation(cont.next),
+		}
+	case *applicationArgCont:
+		return &applicationArgCont{
+			proc:     cont.proc,
+			operands: cont.operands,
+			index:    cont.index,
+			values:   append([]value(nil), cont.values...),
+			env:      cont.env,
+			pos:      cont.pos,
+			next:     cloneContinuation(cont.next),
+		}
+	case *condTestCont:
+		return &condTestCont{
+			clauses: cont.clauses,
+			index:   cont.index,
+			env:     cont.env,
+			pos:     cont.pos,
+			next:    cloneContinuation(cont.next),
+		}
+	case *caseKeyCont:
+		return &caseKeyCont{
+			clauses: cont.clauses,
+			env:     cont.env,
+			pos:     cont.pos,
+			next:    cloneContinuation(cont.next),
+		}
+	case *letValueCont:
+		return &letValueCont{
+			specs:  cont.specs,
+			index:  cont.index,
+			values: append([]value(nil), cont.values...),
+			env:    cont.env,
+			body:   cont.body,
+			next:   cloneContinuation(cont.next),
+		}
+	case *namedLetValueCont:
+		return &namedLetValueCont{
+			name:   cont.name,
+			specs:  cont.specs,
+			index:  cont.index,
+			values: append([]value(nil), cont.values...),
+			env:    cont.env,
+			body:   cont.body,
+			next:   cloneContinuation(cont.next),
+		}
+	case *letStarValueCont:
+		return &letStarValueCont{
+			specs:  cont.specs,
+			index:  cont.index,
+			letEnv: cont.letEnv,
+			body:   cont.body,
+			next:   cloneContinuation(cont.next),
+		}
+	case *letrecValueCont:
+		return &letrecValueCont{
+			specs:      cont.specs,
+			index:      cont.index,
+			sequential: cont.sequential,
+			letEnv:     cont.letEnv,
+			cells:      cont.cells,
+			values:     append([]value(nil), cont.values...),
+			body:       cont.body,
+			next:       cloneContinuation(cont.next),
+		}
+	case *dynamicWindAfterInCont:
+		return &dynamicWindAfterInCont{
+			frame:    cont.frame,
+			bodyProc: cont.bodyProc,
+			pos:      cont.pos,
+			next:     cloneContinuation(cont.next),
+		}
+	case *dynamicWindAfterBodyCont:
+		return &dynamicWindAfterBodyCont{
+			frame: cont.frame,
+			pos:   cont.pos,
+			next:  cloneContinuation(cont.next),
+		}
+	case *dynamicWindAfterOutCont:
+		return &dynamicWindAfterOutCont{
+			result: cont.result,
+			next:   cloneContinuation(cont.next),
+		}
+	case *windTransitionCont:
+		return &windTransitionCont{
+			leave:         cont.leave,
+			enter:         cont.enter,
+			setWind:       cont.setWind,
+			value:         cont.value,
+			targetCont:    cloneContinuation(cont.targetCont),
+			targetWind:    cont.targetWind,
+			targetHandler: cont.targetHandler,
+			pos:           cont.pos,
+		}
+	case *handlerRestoreCont:
+		return &handlerRestoreCont{
+			frame: cont.frame,
+			next:  cloneContinuation(cont.next),
+		}
+	case *exceptionDispatchCont:
+		return &exceptionDispatchCont{
+			frame: cont.frame,
+			pos:   cont.pos,
+		}
+	case *guardTestCont:
+		return &guardTestCont{
+			clause:    cont.clause,
+			remaining: cont.remaining,
+			env:       cont.env,
+			exn:       cont.exn,
+			pos:       cont.pos,
+			next:      cloneContinuation(cont.next),
+		}
+	default:
+		return cont
+	}
 }

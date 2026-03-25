@@ -201,6 +201,9 @@ func (e *environment) defineMacro(name string, macro macroTransformer) {
 		e.macros = map[string]macroTransformer{}
 	}
 	e.macros[name] = macro
+	if e.macroState != nil {
+		e.macroState.hasMacros = true
+	}
 }
 
 func (e *environment) lookupMacro(name string) (macroTransformer, bool) {

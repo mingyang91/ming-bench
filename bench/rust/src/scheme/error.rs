@@ -2,7 +2,7 @@
 ///
 /// Agents must add domain-specific variants here. Using `String` as the
 /// error type is not possible — the `eval_str` signature requires this type.
-#[derive(Debug, PartialEq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum EvalError {
     #[error("{message}")]
     Message { message: String },
