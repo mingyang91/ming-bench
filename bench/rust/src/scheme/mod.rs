@@ -826,6 +826,10 @@ thread_local! {
     static WIND_STACK: RefCell<Vec<WindEntry>> = RefCell::new(Vec::new());
     /// Target wind stack for continuation re-entry.
     static REENTRY_WINDS: RefCell<Option<Vec<WindEntry>>> = RefCell::new(None);
+    /// Exception handler stack (for with-exception-handler / raise).
+    static EXCEPTION_HANDLERS: RefCell<Vec<Val>> = RefCell::new(Vec::new());
+    /// Raised value during raise signal propagation.
+    static RAISED_VALUE: RefCell<Option<Val>> = RefCell::new(None);
 }
 
 #[derive(Clone)]
@@ -916,6 +920,14 @@ fn handle_callcc(f: &Val, env: &Env, out: &mut String, span: Span) -> Result<Val
 fn is_callcc_signal(e: &EvalError) -> bool {
     match e {
         EvalError::Type(s) => s.contains("__callcc_escape__") || s.contains("__callcc_reexec__"),
+        _ => false,
+    }
+}
+
+/// Check if an error is a raise signal.
+fn is_raise_signal(e: &EvalError) -> bool {
+    match e {
+        EvalError::Type(s) => s.contains("__raise_signal__"),
         _ => false,
     }
 }
@@ -1742,6 +1754,122 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                         return Ok(Val::Void);
                     }
                     _ => {}
+                }
+            }
+
+            // raise handling (only if not locally rebound)
+            if let ExprKind::Symbol(op) = &list[0].kind {
+                if op == "raise" && env_get(env, "raise").is_none() {
+                    if list.len() != 2 {
+                        return Err(err_at(span, EvalError::Arity("raise: need 1 argument".into())));
+                    }
+                    let val = eval(&list[1], env, out)?;
+                    // Check for with-exception-handler handlers
+                    let handler = EXCEPTION_HANDLERS.with(|h| h.borrow_mut().pop());
+                    if let Some(handler_fn) = handler {
+                        let result = call_function(&handler_fn, vec![val], span, out);
+                        match result {
+                            Ok(_) => {
+                                return Err(err_at(span, EvalError::Type(
+                                    "raise: exception handler returned".into()
+                                )));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    // No handler — use signal mechanism (for guard to catch)
+                    RAISED_VALUE.with(|r| *r.borrow_mut() = Some(val));
+                    return Err(err_at(span, EvalError::Type("__raise_signal__".into())));
+                }
+            }
+
+            // guard handling
+            if let ExprKind::Symbol(op) = &list[0].kind {
+                if op == "guard" {
+                    if list.len() < 3 {
+                        return Err(err_at(span, EvalError::Arity("guard: need clauses and body".into())));
+                    }
+                    let clauses_list = match &list[1].kind {
+                        ExprKind::List(l) => l.clone(),
+                        _ => return Err(err_at(span, EvalError::Parse("guard: bad clause form".into()))),
+                    };
+                    if clauses_list.is_empty() {
+                        return Err(err_at(span, EvalError::Parse("guard: need variable name".into())));
+                    }
+                    let var_name = match &clauses_list[0].kind {
+                        ExprKind::Symbol(s) => s.clone(),
+                        _ => return Err(err_at(span, EvalError::Parse("guard: variable must be symbol".into()))),
+                    };
+                    let clauses = clauses_list[1..].to_vec();
+                    let body = &list[2..];
+
+                    // Evaluate body, catching raise signals
+                    let body_result = eval_body_seq(body, env, out);
+                    match body_result {
+                        Ok(val) => return Ok(val),
+                        Err(ref e) if is_raise_signal(e) => {
+                            let raised = RAISED_VALUE.with(|r| r.borrow_mut().take())
+                                .unwrap_or(Val::Void);
+                            let guard_env = new_env(Some(env.clone()));
+                            env_set(&guard_env, var_name.clone(), raised.clone());
+
+                            for clause in &clauses {
+                                match &clause.kind {
+                                    ExprKind::List(cl) if !cl.is_empty() => {
+                                        if let ExprKind::Symbol(s) = &cl[0].kind {
+                                            if s == "else" {
+                                                let mut result = Val::Void;
+                                                for expr in &cl[1..] {
+                                                    result = eval(expr, &guard_env, out)?;
+                                                }
+                                                return Ok(result);
+                                            }
+                                        }
+                                        let test = eval(&cl[0], &guard_env, out)?;
+                                        if is_truthy(&test) {
+                                            if cl.len() == 1 {
+                                                return Ok(test);
+                                            }
+                                            let mut result = Val::Void;
+                                            for expr in &cl[1..] {
+                                                result = eval(expr, &guard_env, out)?;
+                                            }
+                                            return Ok(result);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            // No clause matched — re-raise
+                            RAISED_VALUE.with(|r| *r.borrow_mut() = Some(raised));
+                            return Err(err_at(span, EvalError::Type("__raise_signal__".into())));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+
+            // with-exception-handler handling (only if not locally rebound)
+            if let ExprKind::Symbol(op) = &list[0].kind {
+                if op == "with-exception-handler" && env_get(env, "with-exception-handler").is_none() {
+                    if list.len() != 3 {
+                        return Err(err_at(span, EvalError::Arity(
+                            "with-exception-handler: need 2 arguments".into()
+                        )));
+                    }
+                    let handler = eval(&list[1], env, out)?;
+                    let thunk = eval(&list[2], env, out)?;
+                    let depth_before = EXCEPTION_HANDLERS.with(|h| h.borrow().len());
+                    EXCEPTION_HANDLERS.with(|h| h.borrow_mut().push(handler));
+                    let result = call_function(&thunk, vec![], span, out);
+                    // Pop our handler if raise didn't already consume it
+                    EXCEPTION_HANDLERS.with(|h| {
+                        let mut handlers = h.borrow_mut();
+                        if handlers.len() > depth_before {
+                            handlers.pop();
+                        }
+                    });
+                    return result;
                 }
             }
 
