@@ -5,6 +5,7 @@ import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -77,8 +78,39 @@ public class Evaluator {
         installBuiltin(env, "cons", this::builtinCons);
         installBuiltin(env, "car", this::builtinCar);
         installBuiltin(env, "cdr", this::builtinCdr);
+        installBuiltin(env, "caar", this::builtinCaar);
+        installBuiltin(env, "cadr", this::builtinCadr);
+        installBuiltin(env, "cdar", this::builtinCdar);
+        installBuiltin(env, "cddr", this::builtinCddr);
+        installCxrBuiltin(env, "caaar");
+        installCxrBuiltin(env, "caadr");
+        installCxrBuiltin(env, "cadar");
+        installCxrBuiltin(env, "caddr");
+        installCxrBuiltin(env, "cdaar");
+        installCxrBuiltin(env, "cdadr");
+        installCxrBuiltin(env, "cddar");
+        installCxrBuiltin(env, "cdddr");
+        installCxrBuiltin(env, "caaaar");
+        installCxrBuiltin(env, "caaadr");
+        installCxrBuiltin(env, "caadar");
+        installCxrBuiltin(env, "caaddr");
+        installCxrBuiltin(env, "cadaar");
+        installCxrBuiltin(env, "cadadr");
+        installCxrBuiltin(env, "caddar");
+        installCxrBuiltin(env, "cadddr");
+        installCxrBuiltin(env, "cdaaar");
+        installCxrBuiltin(env, "cdaadr");
+        installCxrBuiltin(env, "cdadar");
+        installCxrBuiltin(env, "cdaddr");
+        installCxrBuiltin(env, "cddaar");
+        installCxrBuiltin(env, "cddadr");
+        installCxrBuiltin(env, "cdddar");
+        installCxrBuiltin(env, "cddddr");
+        installBuiltin(env, "set-car!", this::builtinSetCar);
+        installBuiltin(env, "set-cdr!", this::builtinSetCdr);
         installBuiltin(env, "null?", this::builtinNull);
         installBuiltin(env, "list", this::builtinList);
+        installBuiltin(env, "reverse", this::builtinReverse);
         installBuiltin(env, "length", this::builtinLength);
         installBuiltin(env, "append", this::builtinAppend);
         installBuiltin(env, "display", this::builtinDisplay);
@@ -119,6 +151,7 @@ public class Evaluator {
         installBuiltin(env, "not", this::builtinNot);
         installBuiltin(env, "apply", this::builtinApply);
         installBuiltin(env, "map", this::builtinMap);
+        installBuiltin(env, "for-each", this::builtinForEach);
         installBuiltin(env, "vector", this::builtinVector);
         installBuiltin(env, "make-vector", this::builtinMakeVector);
         installBuiltin(env, "vector-ref", this::builtinVectorRef);
@@ -131,6 +164,10 @@ public class Evaluator {
         installBuiltin(env, "modulo", this::builtinModulo);
         installBuiltin(env, "remainder", this::builtinRemainder);
         installBuiltin(env, "quotient", this::builtinQuotient);
+        installBuiltin(env, "gcd", this::builtinGcd);
+        installBuiltin(env, "lcm", this::builtinLcm);
+        installBuiltin(env, "truncate", this::builtinTruncate);
+        installBuiltin(env, "round", this::builtinRound);
         installBuiltin(env, "min", this::builtinMin);
         installBuiltin(env, "max", this::builtinMax);
         installBuiltin(env, "expt", this::builtinExpt);
@@ -142,6 +179,8 @@ public class Evaluator {
         installBuiltin(env, "list?", this::builtinListPredicate);
         installBuiltin(env, "list-ref", this::builtinListRef);
         installBuiltin(env, "list-tail", this::builtinListTail);
+        installBuiltin(env, "member", this::builtinMember);
+        installBuiltin(env, "assv", this::builtinAssv);
         installBuiltin(env, "assoc", this::builtinAssoc);
         installBuiltin(env, "char-alphabetic?", this::builtinCharAlphabeticPredicate);
         installBuiltin(env, "char-numeric?", this::builtinCharNumericPredicate);
@@ -149,8 +188,13 @@ public class Evaluator {
         installBuiltin(env, "char-downcase", this::builtinCharDowncase);
         installBuiltin(env, "char=?", this::builtinCharEquals);
         installBuiltin(env, "char<?", this::builtinCharLessThan);
+        installBuiltin(env, "make-string", this::builtinMakeString);
+        installBuiltin(env, "string", this::builtinString);
         installBuiltin(env, "string=?", this::builtinStringEquals);
         installBuiltin(env, "string<?", this::builtinStringLessThan);
+        installBuiltin(env, "string>?", this::builtinStringGreaterThan);
+        installBuiltin(env, "string<=?", this::builtinStringLessEqual);
+        installBuiltin(env, "string>=?", this::builtinStringGreaterEqual);
         installBuiltin(env, "string-ci=?", this::builtinStringCaseInsensitiveEquals);
         installBuiltin(env, "string-upcase", this::builtinStringUpcase);
         installBuiltin(env, "string-downcase", this::builtinStringDowncase);
@@ -159,6 +203,10 @@ public class Evaluator {
 
     private void installBuiltin(Environment env, String name, BuiltinImplementation implementation) {
         env.define(name, new BuiltinProcedure(name, implementation));
+    }
+
+    private void installCxrBuiltin(Environment env, String name) {
+        installBuiltin(env, name, (callPos, arguments) -> builtinCxr(callPos, arguments, name));
     }
 
     private Value eval(Expr expression, Environment env) throws EvalError {
@@ -217,6 +265,7 @@ public class Evaluator {
                 case "define-syntax" -> evalDefineSyntax(arguments, env);
                 case "if" -> evalIf(arguments, env, tailPosition);
                 case "let" -> evalLet(arguments, env, tailPosition);
+                case "let*" -> evalLetStar(arguments, env, tailPosition);
                 case "letrec" -> evalLetrec(arguments, env, false, tailPosition);
                 case "letrec*" -> evalLetrec(arguments, env, true, tailPosition);
                 case "lambda" -> evalLambda(arguments, env);
@@ -799,6 +848,19 @@ public class Evaluator {
         return evalSequence(arguments.subList(1, arguments.size()), letEnv, tailPosition);
     }
 
+    private Value evalLetStar(List<Expr> arguments, Environment env, boolean tailPosition) throws EvalError {
+        if (arguments.size() < 2) {
+            throw new EvalError("invalid let*");
+        }
+
+        List<Binding> bindings = parseBindings(arguments.get(0), "let*");
+        Environment letStarEnv = new Environment(env);
+        for (Binding binding : bindings) {
+            letStarEnv.define(binding.name(), eval(binding.valueExpr(), letStarEnv));
+        }
+        return evalSequence(arguments.subList(1, arguments.size()), letStarEnv, tailPosition);
+    }
+
     private Value evalLetrec(List<Expr> arguments, Environment env, boolean sequential, boolean tailPosition)
             throws EvalError {
         String formName = sequential ? "letrec*" : "letrec";
@@ -1137,6 +1199,45 @@ public class Evaluator {
         return requirePair(arguments.get(0), "cdr").cdr();
     }
 
+    private Value builtinCaar(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        return builtinCxr(callPos, arguments, "caar");
+    }
+
+    private Value builtinCadr(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        return builtinCxr(callPos, arguments, "cadr");
+    }
+
+    private Value builtinCdar(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        return builtinCxr(callPos, arguments, "cdar");
+    }
+
+    private Value builtinCddr(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        return builtinCxr(callPos, arguments, "cddr");
+    }
+
+    private Value builtinCxr(SourcePos callPos, List<LocatedValue> arguments, String name)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, name, callPos);
+        Value current = arguments.get(0).value();
+        for (int i = name.length() - 2; i >= 1; i--) {
+            PairValue pair = requirePair(new LocatedValue(current, arguments.get(0).pos()), name);
+            current = name.charAt(i) == 'a' ? pair.car() : pair.cdr();
+        }
+        return current;
+    }
+
+    private Value builtinSetCar(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 2, "set-car!", callPos);
+        requirePair(arguments.get(0), "set-car!").setCar(arguments.get(1).value());
+        return VOID_VALUE;
+    }
+
+    private Value builtinSetCdr(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 2, "set-cdr!", callPos);
+        requirePair(arguments.get(0), "set-cdr!").setCdr(arguments.get(1).value());
+        return VOID_VALUE;
+    }
+
     private Value builtinNull(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
         expectArgumentCount(arguments, 1, "null?", callPos);
         return boolValue(arguments.get(0).value() instanceof EmptyListValue);
@@ -1146,6 +1247,16 @@ public class Evaluator {
         Value result = EMPTY_LIST;
         for (int i = arguments.size() - 1; i >= 0; i--) {
             result = new PairValue(arguments.get(i).value(), result);
+        }
+        return result;
+    }
+
+    private Value builtinReverse(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 1, "reverse", callPos);
+        List<Value> elements = collectProperListElements(arguments.get(0), "reverse");
+        Value result = EMPTY_LIST;
+        for (Value element : elements) {
+            result = new PairValue(element, result);
         }
         return result;
     }
@@ -1246,6 +1357,28 @@ public class Evaluator {
             throws EvalError {
         expectArgumentCount(arguments, 1, "string?", callPos);
         return boolValue(arguments.get(0).value() instanceof StringValue);
+    }
+
+    private Value builtinMakeString(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        if (arguments.size() < 1 || arguments.size() > 2) {
+            throw errorAt(callPos, "wrong argument count for make-string");
+        }
+
+        int length = requireNonNegativeIndex(arguments.get(0), "make-string");
+        char fill = arguments.size() == 2 ? requireChar(arguments.get(1), "make-string") : '\0';
+        StringBuilder builder = new StringBuilder(length);
+        for (int i = 0; i < length; i++) {
+            builder.append(fill);
+        }
+        return new StringValue(builder.toString());
+    }
+
+    private Value builtinString(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        StringBuilder builder = new StringBuilder(arguments.size());
+        for (LocatedValue argument : arguments) {
+            builder.append(requireChar(argument, "string"));
+        }
+        return new StringValue(builder.toString());
     }
 
     private Value builtinStringAppend(SourcePos callPos, List<LocatedValue> arguments)
@@ -1552,6 +1685,48 @@ public class Evaluator {
         }
     }
 
+    private Value builtinForEach(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        if (arguments.size() < 2) {
+            throw errorAt(callPos, "wrong argument count for for-each");
+        }
+
+        LocatedValue operator = arguments.get(0);
+        List<LocatedValue> listArguments = arguments.subList(1, arguments.size());
+        List<Value> cursors = new ArrayList<>(listArguments.size());
+        for (LocatedValue listArgument : listArguments) {
+            cursors.add(listArgument.value());
+        }
+
+        while (true) {
+            int emptyCount = 0;
+            for (int i = 0; i < cursors.size(); i++) {
+                Value current = cursors.get(i);
+                if (current instanceof EmptyListValue) {
+                    emptyCount++;
+                    continue;
+                }
+                if (!(current instanceof PairValue)) {
+                    throw errorAt(listArguments.get(i).pos(), "expected list for for-each");
+                }
+            }
+
+            if (emptyCount > 0) {
+                if (emptyCount != cursors.size()) {
+                    throw errorAt(callPos, "expected lists of equal length for for-each");
+                }
+                return VOID_VALUE;
+            }
+
+            List<LocatedValue> mappedArguments = new ArrayList<>(cursors.size());
+            for (int i = 0; i < cursors.size(); i++) {
+                PairValue pair = (PairValue) cursors.get(i);
+                mappedArguments.add(new LocatedValue(pair.car(), listArguments.get(i).pos()));
+                cursors.set(i, pair.cdr());
+            }
+            apply(operator.value(), operator.pos(), mappedArguments, callPos);
+        }
+    }
+
     private Value builtinAdd(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
         NumberValue total = new IntValue(0L);
         for (LocatedValue argument : arguments) {
@@ -1595,6 +1770,52 @@ public class Evaluator {
             remainder += divisor;
         }
         return new IntValue(remainder);
+    }
+
+    private Value builtinGcd(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        long result = 0L;
+        for (LocatedValue argument : arguments) {
+            result = greatestCommonDivisor(result, requireInt(argument, "gcd"));
+        }
+        return new IntValue(Math.abs(result));
+    }
+
+    private Value builtinLcm(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        long result = 1L;
+        for (LocatedValue argument : arguments) {
+            long next = requireInt(argument, "lcm");
+            if (result == 0L || next == 0L) {
+                result = 0L;
+                continue;
+            }
+            result = Math.abs((result / greatestCommonDivisor(result, next)) * next);
+        }
+        return new IntValue(Math.abs(result));
+    }
+
+    private Value builtinTruncate(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 1, "truncate", callPos);
+        NumberValue number = requireNumber(arguments.get(0), "truncate");
+        if (number instanceof IntValue) {
+            return number;
+        }
+        if (number instanceof RationalValue(long numerator, long denominator)) {
+            return new IntValue(numerator / denominator);
+        }
+        double value = ((InexactValue) number).value();
+        return new InexactValue(value < 0 ? Math.ceil(value) : Math.floor(value));
+    }
+
+    private Value builtinRound(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 1, "round", callPos);
+        NumberValue number = requireNumber(arguments.get(0), "round");
+        if (number instanceof IntValue) {
+            return number;
+        }
+        if (number instanceof RationalValue(long numerator, long denominator)) {
+            return new IntValue(Math.round((double) numerator / (double) denominator));
+        }
+        return new InexactValue(Math.rint(((InexactValue) number).value()));
     }
 
     private Value builtinRemainder(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
@@ -1744,11 +1965,11 @@ public class Evaluator {
         int index = requireNonNegativeIndex(arguments.get(1), "list-ref");
         Value current = arguments.get(0).value();
         for (int i = 0; ; i++) {
-            if (current instanceof PairValue(Value car, Value cdr)) {
+            if (current instanceof PairValue pair) {
                 if (i == index) {
-                    return car;
+                    return pair.car();
                 }
-                current = cdr;
+                current = pair.cdr();
                 continue;
             }
             if (current instanceof EmptyListValue) {
@@ -1763,8 +1984,8 @@ public class Evaluator {
         int index = requireNonNegativeIndex(arguments.get(1), "list-tail");
         Value current = arguments.get(0).value();
         for (int i = 0; i < index; i++) {
-            if (current instanceof PairValue(Value ignoredCar, Value cdr)) {
-                current = cdr;
+            if (current instanceof PairValue pair) {
+                current = pair.cdr();
                 continue;
             }
             if (current instanceof EmptyListValue) {
@@ -1782,19 +2003,64 @@ public class Evaluator {
         expectArgumentCount(arguments, 2, "assoc", callPos);
         Value key = arguments.get(0).value();
         Value current = arguments.get(1).value();
-        while (current instanceof PairValue(Value entry, Value rest)) {
-            if (!(entry instanceof PairValue pair)) {
+        while (current instanceof PairValue listPair) {
+            Value entry = listPair.car();
+            if (!(entry instanceof PairValue entryPair)) {
                 throw errorAt(arguments.get(1).pos(), "expected association list for assoc");
             }
-            if (equalValues(key, pair.car())) {
+            if (equalValues(key, entryPair.car())) {
                 return entry;
             }
-            current = rest;
+            current = listPair.cdr();
         }
         if (current instanceof EmptyListValue) {
             return FALSE_VALUE;
         }
         throw errorAt(arguments.get(1).pos(), "expected association list for assoc");
+    }
+
+    private Value builtinAssv(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 2, "assv", callPos);
+        Value key = arguments.get(0).value();
+        Value current = arguments.get(1).value();
+        Set<PairValue> visited = new HashSet<>();
+        while (current instanceof PairValue listPair) {
+            if (!visited.add(listPair)) {
+                throw errorAt(arguments.get(1).pos(), "expected association list for assv");
+            }
+            Value entry = listPair.car();
+            if (!(entry instanceof PairValue entryPair)) {
+                throw errorAt(arguments.get(1).pos(), "expected association list for assv");
+            }
+            if (eqvValues(key, entryPair.car())) {
+                return entry;
+            }
+            current = listPair.cdr();
+        }
+        if (current instanceof EmptyListValue) {
+            return FALSE_VALUE;
+        }
+        throw errorAt(arguments.get(1).pos(), "expected association list for assv");
+    }
+
+    private Value builtinMember(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 2, "member", callPos);
+        Value key = arguments.get(0).value();
+        Value current = arguments.get(1).value();
+        Set<PairValue> visited = new HashSet<>();
+        while (current instanceof PairValue pair) {
+            if (!visited.add(pair)) {
+                throw errorAt(arguments.get(1).pos(), "expected list for member");
+            }
+            if (equalValues(key, pair.car())) {
+                return current;
+            }
+            current = pair.cdr();
+        }
+        if (current instanceof EmptyListValue) {
+            return FALSE_VALUE;
+        }
+        throw errorAt(arguments.get(1).pos(), "expected list for member");
     }
 
     private Value builtinCharAlphabeticPredicate(SourcePos callPos, List<LocatedValue> arguments)
@@ -1889,6 +2155,21 @@ public class Evaluator {
         return TRUE_VALUE;
     }
 
+    private Value builtinStringGreaterThan(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        return builtinStringComparison(callPos, arguments, "string>?", ordering -> ordering > 0);
+    }
+
+    private Value builtinStringLessEqual(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        return builtinStringComparison(callPos, arguments, "string<=?", ordering -> ordering <= 0);
+    }
+
+    private Value builtinStringGreaterEqual(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        return builtinStringComparison(callPos, arguments, "string>=?", ordering -> ordering >= 0);
+    }
+
     private Value builtinStringCaseInsensitiveEquals(SourcePos callPos, List<LocatedValue> arguments)
             throws EvalError {
         if (arguments.size() < 2) {
@@ -1899,6 +2180,23 @@ public class Evaluator {
         for (int i = 1; i < arguments.size(); i++) {
             String right = requireString(arguments.get(i), "string-ci=?");
             if (!left.equalsIgnoreCase(right)) {
+                return FALSE_VALUE;
+            }
+            left = right;
+        }
+        return TRUE_VALUE;
+    }
+
+    private Value builtinStringComparison(SourcePos callPos, List<LocatedValue> arguments, String name,
+                                          Comparator comparator) throws EvalError {
+        if (arguments.size() < 2) {
+            throw errorAt(callPos, "wrong argument count for " + name);
+        }
+
+        String left = requireString(arguments.get(0), name);
+        for (int i = 1; i < arguments.size(); i++) {
+            String right = requireString(arguments.get(i), name);
+            if (!comparator.test(left.compareTo(right))) {
                 return FALSE_VALUE;
             }
             left = right;
@@ -2059,6 +2357,17 @@ public class Evaluator {
             return numerator == 0L;
         }
         return ((InexactValue) number).value() == 0.0d;
+    }
+
+    private static long greatestCommonDivisor(long left, long right) {
+        long a = Math.abs(left);
+        long b = Math.abs(right);
+        while (b != 0L) {
+            long next = a % b;
+            a = b;
+            b = next;
+        }
+        return a;
     }
 
     private static NumberValue addNumbers(NumberValue left, NumberValue right) {
@@ -2264,11 +2573,23 @@ public class Evaluator {
     }
 
     private List<Value> requireProperListElements(LocatedValue value, String name) throws EvalError {
+        return collectProperListElements(value, name);
+    }
+
+    private long requireProperListLength(LocatedValue value, String name) throws EvalError {
+        return collectProperListElements(value, name).size();
+    }
+
+    private List<Value> collectProperListElements(LocatedValue value, String name) throws EvalError {
         List<Value> elements = new ArrayList<>();
+        Set<PairValue> visited = new HashSet<>();
         Value current = value.value();
-        while (current instanceof PairValue(Value car, Value cdr)) {
-            elements.add(car);
-            current = cdr;
+        while (current instanceof PairValue pair) {
+            if (!visited.add(pair)) {
+                throw errorAt(value.pos(), "expected list for " + name);
+            }
+            elements.add(pair.car());
+            current = pair.cdr();
         }
         if (current instanceof EmptyListValue) {
             return elements;
@@ -2276,30 +2597,8 @@ public class Evaluator {
         throw errorAt(value.pos(), "expected list for " + name);
     }
 
-    private long requireProperListLength(LocatedValue value, String name) throws EvalError {
-        long length = 0L;
-        Value current = value.value();
-        while (current instanceof PairValue(Value ignoredCar, Value cdr)) {
-            length++;
-            current = cdr;
-        }
-        if (current instanceof EmptyListValue) {
-            return length;
-        }
-        throw errorAt(value.pos(), "expected list for " + name);
-    }
-
     private Value appendListOnto(LocatedValue list, Value tail) throws EvalError {
-        List<Value> elements = new ArrayList<>();
-        Value current = list.value();
-        while (current instanceof PairValue(Value car, Value cdr)) {
-            elements.add(car);
-            current = cdr;
-        }
-        if (!(current instanceof EmptyListValue)) {
-            throw errorAt(list.pos(), "expected list for append");
-        }
-
+        List<Value> elements = collectProperListElements(list, "append");
         Value result = tail;
         for (int i = elements.size() - 1; i >= 0; i--) {
             result = new PairValue(elements.get(i), result);
@@ -2332,14 +2631,10 @@ public class Evaluator {
     }
 
     private List<LocatedValue> expandApplyArguments(LocatedValue list) throws EvalError {
-        List<LocatedValue> values = new ArrayList<>();
-        Value current = list.value();
-        while (current instanceof PairValue(Value car, Value cdr)) {
-            values.add(new LocatedValue(car, list.pos()));
-            current = cdr;
-        }
-        if (!(current instanceof EmptyListValue)) {
-            throw errorAt(list.pos(), "expected list for apply");
+        List<Value> elements = collectProperListElements(list, "apply");
+        List<LocatedValue> values = new ArrayList<>(elements.size());
+        for (Value element : elements) {
+            values.add(new LocatedValue(element, list.pos()));
         }
         return values;
     }
@@ -2349,9 +2644,13 @@ public class Evaluator {
     }
 
     private boolean isProperList(Value value) {
+        Set<PairValue> visited = new HashSet<>();
         Value current = value;
-        while (current instanceof PairValue(Value ignoredCar, Value cdr)) {
-            current = cdr;
+        while (current instanceof PairValue pair) {
+            if (!visited.add(pair)) {
+                return false;
+            }
+            current = pair.cdr();
         }
         return current instanceof EmptyListValue;
     }
@@ -2380,22 +2679,34 @@ public class Evaluator {
     }
 
     private boolean equalValues(Value left, Value right) {
+        return equalValues(left, right, new HashSet<>());
+    }
+
+    private boolean equalValues(Value left, Value right, Set<ValueComparison> visited) {
         if (eqvValues(left, right)) {
             return true;
         }
         if (left instanceof StringValue leftString && right instanceof StringValue rightString) {
             return leftString.text().equals(rightString.text());
         }
-        if (left instanceof PairValue(Value leftCar, Value leftCdr)
-                && right instanceof PairValue(Value rightCar, Value rightCdr)) {
-            return equalValues(leftCar, rightCar) && equalValues(leftCdr, rightCdr);
+        if (left instanceof PairValue leftPair && right instanceof PairValue rightPair) {
+            ValueComparison comparison = new ValueComparison(leftPair, rightPair);
+            if (!visited.add(comparison)) {
+                return true;
+            }
+            return equalValues(leftPair.car(), rightPair.car(), visited)
+                    && equalValues(leftPair.cdr(), rightPair.cdr(), visited);
         }
         if (left instanceof VectorValue leftVector && right instanceof VectorValue rightVector) {
             if (leftVector.length() != rightVector.length()) {
                 return false;
             }
+            ValueComparison comparison = new ValueComparison(leftVector, rightVector);
+            if (!visited.add(comparison)) {
+                return true;
+            }
             for (int i = 0; i < leftVector.length(); i++) {
-                if (!equalValues(leftVector.element(i), rightVector.element(i))) {
+                if (!equalValues(leftVector.element(i), rightVector.element(i), visited)) {
                     return false;
                 }
             }
@@ -2569,10 +2880,34 @@ public class Evaluator {
         }
     }
 
-    private record PairValue(Value car, Value cdr) implements Value {
+    private static final class PairValue implements Value {
+        private Value car;
+        private Value cdr;
+
+        private PairValue(Value car, Value cdr) {
+            this.car = car;
+            this.cdr = cdr;
+        }
+
+        private Value car() {
+            return car;
+        }
+
+        private Value cdr() {
+            return cdr;
+        }
+
+        private void setCar(Value value) {
+            car = value;
+        }
+
+        private void setCdr(Value value) {
+            cdr = value;
+        }
+
         @Override
         public String render() {
-            return renderPair(this, false);
+            return renderPair(this, false, new RenderContext());
         }
     }
 
@@ -2601,7 +2936,7 @@ public class Evaluator {
 
         @Override
         public String render() {
-            return renderVector(this, false);
+            return renderVector(this, false, new RenderContext());
         }
     }
 
@@ -2865,7 +3200,7 @@ public class Evaluator {
     private static boolean isSpecialForm(String name) {
         return switch (name) {
             case "and", "begin", "case", "case-lambda", "cond", "define", "define-record-type", "define-syntax",
-                    "do", "else", "if", "lambda", "let", "letrec", "letrec*", "or", "quote", "set!",
+                    "do", "else", "if", "lambda", "let", "let*", "letrec", "letrec*", "or", "quote", "set!",
                     "syntax-rules" -> true;
             default -> false;
         };
@@ -3094,6 +3429,20 @@ public class Evaluator {
         private Integer value;
     }
 
+    private record ValueComparison(Value left, Value right) {}
+
+    private static final class RenderContext {
+        private final IdentityHashMap<Object, Boolean> active = new IdentityHashMap<>();
+
+        private boolean enter(Object value) {
+            return active.put(value, Boolean.TRUE) == null;
+        }
+
+        private void exit(Object value) {
+            active.remove(value);
+        }
+    }
+
     private static final BoolValue TRUE_VALUE = new BoolValue(true);
     private static final BoolValue FALSE_VALUE = new BoolValue(false);
     private static final EmptyListValue EMPTY_LIST = new EmptyListValue();
@@ -3101,11 +3450,15 @@ public class Evaluator {
     private static final VoidValue VOID_VALUE = new VoidValue();
 
     private static String renderValue(Value value, boolean displayMode) {
+        return renderValue(value, displayMode, new RenderContext());
+    }
+
+    private static String renderValue(Value value, boolean displayMode, RenderContext context) {
         if (value instanceof PairValue pair) {
-            return renderPair(pair, displayMode);
+            return renderPair(pair, displayMode, context);
         }
         if (value instanceof VectorValue vector) {
-            return renderVector(vector, displayMode);
+            return renderVector(vector, displayMode, context);
         }
         if (displayMode) {
             if (value instanceof StringValue stringValue) {
@@ -3118,39 +3471,62 @@ public class Evaluator {
         return value.render();
     }
 
-    private static String renderPair(PairValue pair, boolean displayMode) {
+    private static String renderPair(PairValue pair, boolean displayMode, RenderContext context) {
         StringBuilder builder = new StringBuilder("(");
-        Value current = pair;
+        List<PairValue> enteredPairs = new ArrayList<>();
+        PairValue current = pair;
         boolean first = true;
-
-        while (current instanceof PairValue(Value car, Value cdr)) {
-            if (!first) {
-                builder.append(' ');
+        try {
+            while (true) {
+                if (!context.enter(current)) {
+                    if (first) {
+                        return "#<circular>";
+                    }
+                    builder.append(" . #<circular>)");
+                    return builder.toString();
+                }
+                enteredPairs.add(current);
+                if (!first) {
+                    builder.append(' ');
+                }
+                builder.append(renderValue(current.car(), displayMode, context));
+                Value tail = current.cdr();
+                if (tail instanceof PairValue nextPair) {
+                    current = nextPair;
+                    first = false;
+                    continue;
+                }
+                if (tail instanceof EmptyListValue) {
+                    builder.append(')');
+                    return builder.toString();
+                }
+                builder.append(" . ").append(renderValue(tail, displayMode, context)).append(')');
+                return builder.toString();
             }
-            builder.append(renderValue(car, displayMode));
-            current = cdr;
-            first = false;
+        } finally {
+            for (int i = enteredPairs.size() - 1; i >= 0; i--) {
+                context.exit(enteredPairs.get(i));
+            }
         }
-
-        if (current instanceof EmptyListValue) {
-            builder.append(')');
-            return builder.toString();
-        }
-
-        builder.append(" . ").append(renderValue(current, displayMode)).append(')');
-        return builder.toString();
     }
 
-    private static String renderVector(VectorValue vector, boolean displayMode) {
-        StringBuilder builder = new StringBuilder("#(");
-        for (int i = 0; i < vector.length(); i++) {
-            if (i > 0) {
-                builder.append(' ');
-            }
-            builder.append(renderValue(vector.element(i), displayMode));
+    private static String renderVector(VectorValue vector, boolean displayMode, RenderContext context) {
+        if (!context.enter(vector)) {
+            return "#<circular>";
         }
-        builder.append(')');
-        return builder.toString();
+        StringBuilder builder = new StringBuilder("#(");
+        try {
+            for (int i = 0; i < vector.length(); i++) {
+                if (i > 0) {
+                    builder.append(' ');
+                }
+                builder.append(renderValue(vector.element(i), displayMode, context));
+            }
+            builder.append(')');
+            return builder.toString();
+        } finally {
+            context.exit(vector);
+        }
     }
 
     private static String renderStringLiteral(String value) {
