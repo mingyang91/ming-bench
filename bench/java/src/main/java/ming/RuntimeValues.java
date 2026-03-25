@@ -4,7 +4,7 @@ import java.math.BigInteger;
 import java.util.List;
 
 sealed interface Value permits NumericValue, BoolValue, StringValue, CharValue,
-        SymbolValue, EmptyListValue, PairValue, ProcedureValue, VoidValue {
+        SymbolValue, EmptyListValue, PairValue, RecordValue, ProcedureValue, VoidValue {
 }
 
 sealed interface NumericValue extends Value permits IntValue, RationalValue, InexactValue {
@@ -102,6 +102,15 @@ record EmptyListValue() implements Value {
 }
 
 record PairValue(Value car, Value cdr) implements Value {
+}
+
+record RecordType(String name, List<String> fieldNames) {
+}
+
+record RecordValue(RecordType type, List<Value> fields) implements Value {
+    Value field(int index) {
+        return fields.get(index);
+    }
 }
 
 record BuiltinProcedure(String name, BuiltinImplementation implementation)

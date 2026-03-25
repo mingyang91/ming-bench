@@ -2,8 +2,11 @@ package ming;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 /**
  * Scheme interpreter entry point.
@@ -14,7 +17,7 @@ public class Evaluator {
      * representation of the last result.
      */
     public String evalStr(String input) throws EvalError {
-        return format(evalProgram(input).value());
+        return ValueFormatter.format(evalProgram(input).value());
     }
 
     /**
@@ -23,7 +26,7 @@ public class Evaluator {
      */
     public EvalResult evalStrWithOutput(String input) throws EvalError {
         ProgramResult result = evalProgram(input);
-        return new EvalResult(format(result.value()), result.output());
+        return new EvalResult(ValueFormatter.format(result.value()), result.output());
     }
 
     private ProgramResult evalProgram(String input) throws EvalError {
@@ -205,6 +208,8 @@ public class Evaluator {
             return switch (symbolExpr.name()) {
                 case "define" -> evalDefine(arguments, environment, symbolExpr.pos());
                 case "define-syntax" -> evalDefineSyntax(arguments, environment, symbolExpr.pos());
+                case "define-record-type" ->
+                        evalDefineRecordType(arguments, environment, symbolExpr.pos());
                 case "set!" -> evalSet(arguments, environment, symbolExpr.pos());
                 case "if" -> evalIf(arguments, environment, symbolExpr.pos());
                 case "quote" -> evalQuote(arguments, symbolExpr.pos());
@@ -284,6 +289,76 @@ public class Evaluator {
         return VoidValue.INSTANCE;
     }
 
+    private Value evalDefineRecordType(List<Expr> arguments, Environment environment, SourcePos pos)
+            throws EvalError {
+        if (arguments.size() < 3) {
+            throw error("'define-record-type' expects a name, constructor, and predicate", pos);
+        }
+
+        String typeName = requireSymbolName(arguments.get(0), "record type name");
+        if (!(arguments.get(1) instanceof ListExpr constructorExpr)) {
+            throw error("'define-record-type' constructor spec must be a list",
+                    arguments.get(1).pos());
+        }
+
+        List<Expr> constructorElements = constructorExpr.elements();
+        if (constructorElements.isEmpty()) {
+            throw error("'define-record-type' constructor spec must not be empty",
+                    constructorExpr.pos());
+        }
+
+        String constructorName = requireSymbolName(constructorElements.getFirst(),
+                "record constructor name");
+        String predicateName = requireSymbolName(arguments.get(2), "record predicate name");
+
+        List<RecordFieldSpec> fieldSpecs = new ArrayList<>(arguments.size() - 3);
+        Map<String, Integer> fieldIndexes = new HashMap<>();
+        for (int i = 3; i < arguments.size(); i++) {
+            RecordFieldSpec fieldSpec = parseRecordFieldSpec(arguments.get(i));
+            if (fieldIndexes.putIfAbsent(fieldSpec.name(), fieldSpecs.size()) != null) {
+                throw error("duplicate record field: " + fieldSpec.name(), fieldSpec.pos());
+            }
+            fieldSpecs.add(fieldSpec);
+        }
+
+        List<Integer> constructorFieldIndexes = new ArrayList<>(constructorElements.size() - 1);
+        HashSet<String> constructorFields = new HashSet<>();
+        for (int i = 1; i < constructorElements.size(); i++) {
+            Expr fieldExpr = constructorElements.get(i);
+            String fieldName = requireSymbolName(fieldExpr, "record constructor field");
+            Integer fieldIndex = fieldIndexes.get(fieldName);
+            if (fieldIndex == null) {
+                throw error("unknown record field: " + fieldName, fieldExpr.pos());
+            }
+            if (!constructorFields.add(fieldName)) {
+                throw error("duplicate constructor field: " + fieldName, fieldExpr.pos());
+            }
+            constructorFieldIndexes.add(fieldIndex);
+        }
+
+        List<String> fieldNames = new ArrayList<>(fieldSpecs.size());
+        for (RecordFieldSpec fieldSpec : fieldSpecs) {
+            fieldNames.add(fieldSpec.name());
+        }
+        RecordType recordType = new RecordType(typeName, List.copyOf(fieldNames));
+
+        environment.define(constructorName, new BuiltinProcedure(constructorName,
+                (callArguments, callPos) -> applyRecordConstructor(recordType,
+                        constructorFieldIndexes, constructorName, callArguments, callPos)));
+        environment.define(predicateName, new BuiltinProcedure(predicateName,
+                (callArguments, callPos) -> applyRecordPredicate(recordType,
+                        predicateName, callArguments, callPos)));
+        for (int i = 0; i < fieldSpecs.size(); i++) {
+            RecordFieldSpec fieldSpec = fieldSpecs.get(i);
+            int fieldIndex = i;
+            environment.define(fieldSpec.accessorName(),
+                    new BuiltinProcedure(fieldSpec.accessorName(),
+                            (callArguments, callPos) -> applyRecordAccessor(recordType, fieldIndex,
+                                    fieldSpec.accessorName(), callArguments, callPos)));
+        }
+        return VoidValue.INSTANCE;
+    }
+
     private Value evalSet(List<Expr> arguments, Environment environment, SourcePos pos)
             throws EvalError {
         if (arguments.size() != 2) {
@@ -318,7 +393,7 @@ public class Evaluator {
         if (arguments.size() != 1) {
             throw error("'quote' expects exactly 1 argument", pos);
         }
-        return quote(arguments.getFirst());
+        return QuotedValueBuilder.quote(arguments.getFirst());
     }
 
     private Value evalLambda(List<Expr> arguments, Environment environment, SourcePos pos)
@@ -772,14 +847,14 @@ public class Evaluator {
     private Value applyDisplay(List<Value> arguments, SourcePos pos, StringBuilder output)
             throws EvalError {
         requireArgCount(arguments, 1, "display", pos);
-        output.append(formatDisplay(arguments.getFirst()));
+        output.append(ValueFormatter.formatDisplay(arguments.getFirst()));
         return VoidValue.INSTANCE;
     }
 
     private Value applyWrite(List<Value> arguments, SourcePos pos, StringBuilder output)
             throws EvalError {
         requireArgCount(arguments, 1, "write", pos);
-        output.append(format(arguments.getFirst()));
+        output.append(ValueFormatter.format(arguments.getFirst()));
         return VoidValue.INSTANCE;
     }
 
@@ -1145,6 +1220,56 @@ public class Evaluator {
         return true;
     }
 
+    private RecordFieldSpec parseRecordFieldSpec(Expr expression) throws EvalError {
+        if (!(expression instanceof ListExpr fieldExpr)) {
+            throw error("'define-record-type' field specs must be lists", expression.pos());
+        }
+
+        List<Expr> fieldElements = fieldExpr.elements();
+        if (fieldElements.size() != 2) {
+            throw error("record field spec must contain a field name and an accessor",
+                    fieldExpr.pos());
+        }
+        return new RecordFieldSpec(
+                requireSymbolName(fieldElements.get(0), "record field name"),
+                requireSymbolName(fieldElements.get(1), "record accessor name"),
+                fieldExpr.pos());
+    }
+
+    private String requireSymbolName(Expr expression, String description) throws EvalError {
+        if (expression instanceof SymbolExpr symbolExpr) {
+            return symbolExpr.name();
+        }
+        throw error(description + " must be a symbol", expression.pos());
+    }
+
+    private Value applyRecordConstructor(RecordType recordType, List<Integer> constructorFieldIndexes,
+                                         String name, List<Value> arguments, SourcePos pos)
+            throws EvalError {
+        requireArgCount(arguments, constructorFieldIndexes.size(), name, pos);
+        List<Value> fields = new ArrayList<>(recordType.fieldNames().size());
+        for (int i = 0; i < recordType.fieldNames().size(); i++) {
+            fields.add(VoidValue.INSTANCE);
+        }
+        for (int i = 0; i < constructorFieldIndexes.size(); i++) {
+            fields.set(constructorFieldIndexes.get(i), arguments.get(i));
+        }
+        return new RecordValue(recordType, List.copyOf(fields));
+    }
+
+    private Value applyRecordPredicate(RecordType recordType, String name, List<Value> arguments,
+                                       SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 1, name, pos);
+        return BoolValue.of(arguments.getFirst() instanceof RecordValue recordValue
+                && recordValue.type() == recordType);
+    }
+
+    private Value applyRecordAccessor(RecordType recordType, int fieldIndex, String name,
+                                      List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 1, name, pos);
+        return asRecord(arguments.getFirst(), recordType, name, pos).field(fieldIndex);
+    }
+
     private boolean eqValues(Value left, Value right) {
         if (left == right) {
             return true;
@@ -1252,6 +1377,14 @@ public class Evaluator {
         throw error("'" + operator + "' expects a pair", pos);
     }
 
+    private RecordValue asRecord(Value value, RecordType expectedType, String operator,
+                                 SourcePos pos) throws EvalError {
+        if (value instanceof RecordValue recordValue && recordValue.type() == expectedType) {
+            return recordValue;
+        }
+        throw error("'" + operator + "' expects a " + expectedType.name() + " record", pos);
+    }
+
     private String asString(Value value, String operator, SourcePos pos) throws EvalError {
         if (value instanceof StringValue stringValue) {
             return stringValue.value();
@@ -1340,129 +1473,8 @@ public class Evaluator {
         }
     }
 
-    private Value quote(Expr expression) throws EvalError {
-        if (expression instanceof NumberExpr numberExpr) {
-            return numberExpr.value().toValue();
-        }
-        if (expression instanceof BoolExpr boolExpr) {
-            return BoolValue.of(boolExpr.value());
-        }
-        if (expression instanceof StringExpr stringExpr) {
-            return new StringValue(stringExpr.value());
-        }
-        if (expression instanceof CharExpr charExpr) {
-            return new CharValue(charExpr.value());
-        }
-        if (expression instanceof SymbolExpr symbolExpr) {
-            return new SymbolValue(symbolExpr.name());
-        }
-        if (expression instanceof ListExpr listExpr) {
-            return quoteList(listExpr.elements());
-        }
-        throw new EvalError("unsupported quoted expression", expression.pos().line(),
-                expression.pos().column());
-    }
-
-    private Value quoteList(List<Expr> expressions) throws EvalError {
-        Value result = EmptyListValue.INSTANCE;
-        for (int i = expressions.size() - 1; i >= 0; i--) {
-            result = new PairValue(quote(expressions.get(i)), result);
-        }
-        return result;
-    }
-
     private boolean isTruthy(Value value) {
         return !(value instanceof BoolValue boolValue) || boolValue.value();
-    }
-
-    private String format(Value value) {
-        return format(value, false);
-    }
-
-    private String formatDisplay(Value value) {
-        return format(value, true);
-    }
-
-    private String format(Value value, boolean displayMode) {
-        if (value instanceof NumericValue numericValue) {
-            return SchemeNumber.fromValue(numericValue).format();
-        }
-        if (value instanceof BoolValue boolValue) {
-            return boolValue.value() ? "#t" : "#f";
-        }
-        if (value instanceof StringValue stringValue) {
-            if (displayMode) {
-                return stringValue.value();
-            }
-            return "\"" + escapeString(stringValue.value()) + "\"";
-        }
-        if (value instanceof CharValue charValue) {
-            if (displayMode) {
-                return Character.toString(charValue.value());
-            }
-            return formatCharacter(charValue.value());
-        }
-        if (value instanceof SymbolValue symbolValue) {
-            return symbolValue.name();
-        }
-        if (value instanceof EmptyListValue) {
-            return "()";
-        }
-        if (value instanceof PairValue pairValue) {
-            return formatPair(pairValue, displayMode);
-        }
-        if (value instanceof VoidValue) {
-            return "#<void>";
-        }
-        if (value instanceof ProcedureValue) {
-            return "#<procedure>";
-        }
-        throw new IllegalStateException("unsupported runtime value");
-    }
-
-    private String formatPair(PairValue pairValue, boolean displayMode) {
-        StringBuilder builder = new StringBuilder("(");
-        Value current = pairValue;
-        boolean first = true;
-        while (current instanceof PairValue pair) {
-            if (!first) {
-                builder.append(' ');
-            }
-            builder.append(format(pair.car(), displayMode));
-            current = pair.cdr();
-            first = false;
-        }
-
-        if (current instanceof EmptyListValue) {
-            builder.append(')');
-        } else {
-            builder.append(" . ").append(format(current, displayMode)).append(')');
-        }
-        return builder.toString();
-    }
-
-    private String formatCharacter(char value) {
-        return switch (value) {
-            case ' ' -> "#\\space";
-            case '\n' -> "#\\newline";
-            default -> "#\\" + value;
-        };
-    }
-
-    private String escapeString(String value) {
-        StringBuilder builder = new StringBuilder(value.length());
-        for (int i = 0; i < value.length(); i++) {
-            char ch = value.charAt(i);
-            switch (ch) {
-                case '\\' -> builder.append("\\\\");
-                case '"' -> builder.append("\\\"");
-                case '\n' -> builder.append("\\n");
-                case '\r' -> builder.append("\\r");
-                case '\t' -> builder.append("\\t");
-                default -> builder.append(ch);
-            }
-        }
-        return builder.toString();
     }
 
     private EvalError error(String message, SourcePos pos) {
@@ -1473,6 +1485,9 @@ public class Evaluator {
     }
 
     private record ParameterSpec(List<String> required, String rest) {
+    }
+
+    private record RecordFieldSpec(String name, String accessorName, SourcePos pos) {
     }
 
     private record ProgramResult(Value value, String output) {
