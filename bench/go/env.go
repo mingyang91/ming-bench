@@ -112,6 +112,44 @@ func makeGlobalEnv() *Env {
 	// Apply (L08)
 	env.Set("apply", &Value{Type: TypeSymbol, StrVal: "builtin:apply"})
 
+	// Numeric utilities (L09)
+	env.Set("abs", &Value{Type: TypeSymbol, StrVal: "builtin:abs"})
+	env.Set("zero?", &Value{Type: TypeSymbol, StrVal: "builtin:zero?"})
+	env.Set("positive?", &Value{Type: TypeSymbol, StrVal: "builtin:positive?"})
+	env.Set("negative?", &Value{Type: TypeSymbol, StrVal: "builtin:negative?"})
+	env.Set("odd?", &Value{Type: TypeSymbol, StrVal: "builtin:odd?"})
+	env.Set("even?", &Value{Type: TypeSymbol, StrVal: "builtin:even?"})
+	env.Set("modulo", &Value{Type: TypeSymbol, StrVal: "builtin:modulo"})
+	env.Set("remainder", &Value{Type: TypeSymbol, StrVal: "builtin:remainder"})
+	env.Set("quotient", &Value{Type: TypeSymbol, StrVal: "builtin:quotient"})
+	env.Set("min", &Value{Type: TypeSymbol, StrVal: "builtin:min"})
+	env.Set("max", &Value{Type: TypeSymbol, StrVal: "builtin:max"})
+	env.Set("expt", &Value{Type: TypeSymbol, StrVal: "builtin:expt"})
+
+	// Char operations (L09)
+	env.Set("char=?", &Value{Type: TypeSymbol, StrVal: "builtin:char=?"})
+	env.Set("char<?", &Value{Type: TypeSymbol, StrVal: "builtin:char<?"})
+	env.Set("char-alphabetic?", &Value{Type: TypeSymbol, StrVal: "builtin:char-alphabetic?"})
+	env.Set("char-numeric?", &Value{Type: TypeSymbol, StrVal: "builtin:char-numeric?"})
+	env.Set("char-upcase", &Value{Type: TypeSymbol, StrVal: "builtin:char-upcase"})
+	env.Set("char-downcase", &Value{Type: TypeSymbol, StrVal: "builtin:char-downcase"})
+
+	// String comparisons (L09)
+	env.Set("string=?", &Value{Type: TypeSymbol, StrVal: "builtin:string=?"})
+	env.Set("string<?", &Value{Type: TypeSymbol, StrVal: "builtin:string<?"})
+	env.Set("string-ci=?", &Value{Type: TypeSymbol, StrVal: "builtin:string-ci=?"})
+	env.Set("string-upcase", &Value{Type: TypeSymbol, StrVal: "builtin:string-upcase"})
+	env.Set("string-downcase", &Value{Type: TypeSymbol, StrVal: "builtin:string-downcase"})
+
+	// List operations (L09)
+	env.Set("list?", &Value{Type: TypeSymbol, StrVal: "builtin:list?"})
+	env.Set("list-ref", &Value{Type: TypeSymbol, StrVal: "builtin:list-ref"})
+	env.Set("list-tail", &Value{Type: TypeSymbol, StrVal: "builtin:list-tail"})
+	env.Set("map", &Value{Type: TypeSymbol, StrVal: "builtin:map"})
+	env.Set("assoc", &Value{Type: TypeSymbol, StrVal: "builtin:assoc"})
+	env.Set("equal?", &Value{Type: TypeSymbol, StrVal: "builtin:equal?"})
+	env.Set("eq?", &Value{Type: TypeSymbol, StrVal: "builtin:eq?"})
+
 	return env
 }
 
@@ -469,7 +507,373 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 			return callLambda(fn, allArgs, line, col)
 		}
 		return nil, fmt.Errorf("%d:%d: 'apply' first argument must be a procedure", line, col)
+
+	// Numeric utilities (L09)
+	case "builtin:abs":
+		if len(args) != 1 || args[0].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'abs' expects a number", line, col)
+		}
+		v := args[0].IntVal
+		if v < 0 {
+			v = -v
+		}
+		return IntValue(v), nil
+
+	case "builtin:zero?":
+		if len(args) != 1 || args[0].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'zero?' expects a number", line, col)
+		}
+		return BoolValue(args[0].IntVal == 0), nil
+
+	case "builtin:positive?":
+		if len(args) != 1 || args[0].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'positive?' expects a number", line, col)
+		}
+		return BoolValue(args[0].IntVal > 0), nil
+
+	case "builtin:negative?":
+		if len(args) != 1 || args[0].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'negative?' expects a number", line, col)
+		}
+		return BoolValue(args[0].IntVal < 0), nil
+
+	case "builtin:odd?":
+		if len(args) != 1 || args[0].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'odd?' expects a number", line, col)
+		}
+		return BoolValue(args[0].IntVal%2 != 0), nil
+
+	case "builtin:even?":
+		if len(args) != 1 || args[0].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'even?' expects a number", line, col)
+		}
+		return BoolValue(args[0].IntVal%2 == 0), nil
+
+	case "builtin:modulo":
+		if len(args) != 2 || args[0].Type != TypeInteger || args[1].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'modulo' expects two numbers", line, col)
+		}
+		if args[1].IntVal == 0 {
+			return nil, fmt.Errorf("%d:%d: division by zero", line, col)
+		}
+		// Scheme modulo: result has the sign of the divisor
+		a, b := args[0].IntVal, args[1].IntVal
+		r := a % b
+		if r != 0 && (r > 0) != (b > 0) {
+			r += b
+		}
+		return IntValue(r), nil
+
+	case "builtin:remainder":
+		if len(args) != 2 || args[0].Type != TypeInteger || args[1].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'remainder' expects two numbers", line, col)
+		}
+		if args[1].IntVal == 0 {
+			return nil, fmt.Errorf("%d:%d: division by zero", line, col)
+		}
+		return IntValue(args[0].IntVal % args[1].IntVal), nil
+
+	case "builtin:quotient":
+		if len(args) != 2 || args[0].Type != TypeInteger || args[1].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'quotient' expects two numbers", line, col)
+		}
+		if args[1].IntVal == 0 {
+			return nil, fmt.Errorf("%d:%d: division by zero", line, col)
+		}
+		// Truncate toward zero (Go's default integer division behavior)
+		return IntValue(args[0].IntVal / args[1].IntVal), nil
+
+	case "builtin:min":
+		if len(args) == 0 {
+			return nil, fmt.Errorf("%d:%d: 'min' requires at least one argument", line, col)
+		}
+		if args[0].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'min' expects numbers", line, col)
+		}
+		result := args[0].IntVal
+		for _, a := range args[1:] {
+			if a.Type != TypeInteger {
+				return nil, fmt.Errorf("%d:%d: 'min' expects numbers", line, col)
+			}
+			if a.IntVal < result {
+				result = a.IntVal
+			}
+		}
+		return IntValue(result), nil
+
+	case "builtin:max":
+		if len(args) == 0 {
+			return nil, fmt.Errorf("%d:%d: 'max' requires at least one argument", line, col)
+		}
+		if args[0].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'max' expects numbers", line, col)
+		}
+		result := args[0].IntVal
+		for _, a := range args[1:] {
+			if a.Type != TypeInteger {
+				return nil, fmt.Errorf("%d:%d: 'max' expects numbers", line, col)
+			}
+			if a.IntVal > result {
+				result = a.IntVal
+			}
+		}
+		return IntValue(result), nil
+
+	case "builtin:expt":
+		if len(args) != 2 || args[0].Type != TypeInteger || args[1].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'expt' expects two numbers", line, col)
+		}
+		base, exp := args[0].IntVal, args[1].IntVal
+		var result int64 = 1
+		for i := int64(0); i < exp; i++ {
+			result *= base
+		}
+		return IntValue(result), nil
+
+	// Char operations (L09)
+	case "builtin:char=?":
+		if len(args) != 2 || args[0].Type != TypeChar || args[1].Type != TypeChar {
+			return nil, fmt.Errorf("%d:%d: 'char=?' expects two chars", line, col)
+		}
+		return BoolValue(args[0].CharVal == args[1].CharVal), nil
+
+	case "builtin:char<?":
+		if len(args) != 2 || args[0].Type != TypeChar || args[1].Type != TypeChar {
+			return nil, fmt.Errorf("%d:%d: 'char<?' expects two chars", line, col)
+		}
+		return BoolValue(args[0].CharVal < args[1].CharVal), nil
+
+	case "builtin:char-alphabetic?":
+		if len(args) != 1 || args[0].Type != TypeChar {
+			return nil, fmt.Errorf("%d:%d: 'char-alphabetic?' expects a char", line, col)
+		}
+		c := args[0].CharVal
+		return BoolValue((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')), nil
+
+	case "builtin:char-numeric?":
+		if len(args) != 1 || args[0].Type != TypeChar {
+			return nil, fmt.Errorf("%d:%d: 'char-numeric?' expects a char", line, col)
+		}
+		c := args[0].CharVal
+		return BoolValue(c >= '0' && c <= '9'), nil
+
+	case "builtin:char-upcase":
+		if len(args) != 1 || args[0].Type != TypeChar {
+			return nil, fmt.Errorf("%d:%d: 'char-upcase' expects a char", line, col)
+		}
+		c := args[0].CharVal
+		if c >= 'a' && c <= 'z' {
+			c = c - 'a' + 'A'
+		}
+		return CharValue(c), nil
+
+	case "builtin:char-downcase":
+		if len(args) != 1 || args[0].Type != TypeChar {
+			return nil, fmt.Errorf("%d:%d: 'char-downcase' expects a char", line, col)
+		}
+		c := args[0].CharVal
+		if c >= 'A' && c <= 'Z' {
+			c = c - 'A' + 'a'
+		}
+		return CharValue(c), nil
+
+	// String comparisons (L09)
+	case "builtin:string=?":
+		if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeString {
+			return nil, fmt.Errorf("%d:%d: 'string=?' expects two strings", line, col)
+		}
+		return BoolValue(args[0].StrVal == args[1].StrVal), nil
+
+	case "builtin:string<?":
+		if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeString {
+			return nil, fmt.Errorf("%d:%d: 'string<?' expects two strings", line, col)
+		}
+		return BoolValue(args[0].StrVal < args[1].StrVal), nil
+
+	case "builtin:string-ci=?":
+		if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeString {
+			return nil, fmt.Errorf("%d:%d: 'string-ci=?' expects two strings", line, col)
+		}
+		return BoolValue(strings.EqualFold(args[0].StrVal, args[1].StrVal)), nil
+
+	case "builtin:string-upcase":
+		if len(args) != 1 || args[0].Type != TypeString {
+			return nil, fmt.Errorf("%d:%d: 'string-upcase' expects a string", line, col)
+		}
+		return StringValue(strings.ToUpper(args[0].StrVal)), nil
+
+	case "builtin:string-downcase":
+		if len(args) != 1 || args[0].Type != TypeString {
+			return nil, fmt.Errorf("%d:%d: 'string-downcase' expects a string", line, col)
+		}
+		return StringValue(strings.ToLower(args[0].StrVal)), nil
+
+	// List operations (L09)
+	case "builtin:list?":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("%d:%d: 'list?' expects 1 argument", line, col)
+		}
+		cur := args[0]
+		for cur.Type == TypePair {
+			cur = cur.Cdr
+		}
+		return BoolValue(cur.Type == TypeNull), nil
+
+	case "builtin:list-ref":
+		if len(args) != 2 || args[1].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'list-ref' expects a list and index", line, col)
+		}
+		idx := int(args[1].IntVal)
+		cur := args[0]
+		for i := 0; i < idx; i++ {
+			if cur.Type != TypePair {
+				return nil, fmt.Errorf("%d:%d: 'list-ref' index out of range", line, col)
+			}
+			cur = cur.Cdr
+		}
+		if cur.Type != TypePair {
+			return nil, fmt.Errorf("%d:%d: 'list-ref' index out of range", line, col)
+		}
+		return cur.Car, nil
+
+	case "builtin:list-tail":
+		if len(args) != 2 || args[1].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'list-tail' expects a list and index", line, col)
+		}
+		idx := int(args[1].IntVal)
+		cur := args[0]
+		for i := 0; i < idx; i++ {
+			if cur.Type != TypePair {
+				return nil, fmt.Errorf("%d:%d: 'list-tail' index out of range", line, col)
+			}
+			cur = cur.Cdr
+		}
+		return cur, nil
+
+	case "builtin:map":
+		if len(args) < 2 {
+			return nil, fmt.Errorf("%d:%d: 'map' requires a procedure and at least one list", line, col)
+		}
+		fn := args[0]
+		lists := args[1:]
+		var resultItems []*Value
+		for {
+			// Check if any list is exhausted
+			allPairs := true
+			for _, l := range lists {
+				if l.Type != TypePair {
+					allPairs = false
+					break
+				}
+			}
+			if !allPairs {
+				break
+			}
+			// Collect cars
+			callArgs := make([]*Value, len(lists))
+			for i, l := range lists {
+				callArgs[i] = l.Car
+			}
+			// Call function
+			var val *Value
+			var err error
+			if fn.Type == TypeSymbol && len(fn.StrVal) > 8 && fn.StrVal[:8] == "builtin:" {
+				val, err = callBuiltin(fn.StrVal, callArgs, env, line, col)
+			} else if fn.Type == TypeLambda {
+				val, err = callLambda(fn, callArgs, line, col)
+			} else {
+				return nil, fmt.Errorf("%d:%d: 'map' first argument must be a procedure", line, col)
+			}
+			if err != nil {
+				return nil, err
+			}
+			resultItems = append(resultItems, val)
+			// Advance all lists
+			for i, l := range lists {
+				lists[i] = l.Cdr
+			}
+		}
+		// Build result list
+		result := Null
+		for i := len(resultItems) - 1; i >= 0; i-- {
+			result = PairValue(resultItems[i], result)
+		}
+		return result, nil
+
+	case "builtin:assoc":
+		if len(args) != 2 {
+			return nil, fmt.Errorf("%d:%d: 'assoc' expects 2 arguments", line, col)
+		}
+		key := args[0]
+		cur := args[1]
+		for cur.Type == TypePair {
+			pair := cur.Car
+			if pair.Type == TypePair {
+				if valuesEqual(key, pair.Car) {
+					return pair, nil
+				}
+			}
+			cur = cur.Cdr
+		}
+		return False, nil
+
+	case "builtin:equal?":
+		if len(args) != 2 {
+			return nil, fmt.Errorf("%d:%d: 'equal?' expects 2 arguments", line, col)
+		}
+		return BoolValue(valuesEqual(args[0], args[1])), nil
+
+	case "builtin:eq?":
+		if len(args) != 2 {
+			return nil, fmt.Errorf("%d:%d: 'eq?' expects 2 arguments", line, col)
+		}
+		return BoolValue(valuesEq(args[0], args[1])), nil
 	}
 
 	return nil, fmt.Errorf("%d:%d: unknown builtin %s", line, col, name)
+}
+
+func valuesEqual(a, b *Value) bool {
+	if a.Type != b.Type {
+		return false
+	}
+	switch a.Type {
+	case TypeInteger:
+		return a.IntVal == b.IntVal
+	case TypeBoolean:
+		return a.BoolVal == b.BoolVal
+	case TypeString:
+		return a.StrVal == b.StrVal
+	case TypeSymbol:
+		return a.StrVal == b.StrVal
+	case TypeChar:
+		return a.CharVal == b.CharVal
+	case TypeNull:
+		return true
+	case TypePair:
+		return valuesEqual(a.Car, b.Car) && valuesEqual(a.Cdr, b.Cdr)
+	}
+	return a == b
+}
+
+func valuesEq(a, b *Value) bool {
+	if a == b {
+		return true
+	}
+	if a.Type != b.Type {
+		return false
+	}
+	switch a.Type {
+	case TypeInteger:
+		return a.IntVal == b.IntVal
+	case TypeBoolean:
+		return a.BoolVal == b.BoolVal
+	case TypeSymbol:
+		return a.StrVal == b.StrVal
+	case TypeChar:
+		return a.CharVal == b.CharVal
+	case TypeNull:
+		return true
+	}
+	return false
 }

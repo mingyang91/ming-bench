@@ -88,7 +88,16 @@ func (v *Value) Display() string {
 	case TypeLambda:
 		return "#<procedure>"
 	case TypeChar:
-		return fmt.Sprintf("#\\%c", v.CharVal)
+		switch v.CharVal {
+		case ' ':
+			return "#\\space"
+		case '\n':
+			return "#\\newline"
+		case '\t':
+			return "#\\tab"
+		default:
+			return fmt.Sprintf("#\\%c", v.CharVal)
+		}
 	}
 	return ""
 }
