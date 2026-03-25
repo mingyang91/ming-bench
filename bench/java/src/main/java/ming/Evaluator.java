@@ -90,6 +90,7 @@ public class Evaluator {
         installBuiltin(env, "pair?", this::builtinPairPredicate);
         installBuiltin(env, "symbol?", this::builtinSymbolPredicate);
         installBuiltin(env, "not", this::builtinNot);
+        installBuiltin(env, "apply", this::builtinApply);
         return env;
     }
 
@@ -245,7 +246,7 @@ public class Evaluator {
             if (arguments.size() < 2) {
                 throw new EvalError("invalid define");
             }
-            List<String> parameters = parseParameters(signature.subList(1, signature.size()));
+            ParameterSpec parameters = parseParameters(signature.subList(1, signature.size()));
             String name = nameExpr.name();
             env.define(name, new LambdaProcedure(name, parameters, copyExprs(arguments.subList(1, arguments.size())), env));
             return VOID_VALUE;
@@ -272,7 +273,7 @@ public class Evaluator {
         if (arguments.size() < 2) {
             throw new EvalError("invalid lambda");
         }
-        List<String> parameters = parseParameters(arguments.get(0));
+        ParameterSpec parameters = parseParameters(arguments.get(0));
         return new LambdaProcedure(null, parameters, copyExprs(arguments.subList(1, arguments.size())), env);
     }
 
@@ -293,7 +294,7 @@ public class Evaluator {
             Environment loopEnv = new Environment(env);
             LambdaProcedure procedure = new LambdaProcedure(
                     name,
-                    parameters,
+                    ParameterSpec.fixed(parameters),
                     copyExprs(arguments.subList(2, arguments.size())),
                     loopEnv);
             loopEnv.define(name, procedure);
@@ -377,23 +378,39 @@ public class Evaluator {
         return names;
     }
 
-    private List<String> parseParameters(Expr parametersExpr) throws EvalError {
+    private ParameterSpec parseParameters(Expr parametersExpr) throws EvalError {
+        if (parametersExpr instanceof SymbolExpr symbolExpr) {
+            if (".".equals(symbolExpr.name())) {
+                throw new EvalError("invalid parameter list");
+            }
+            return ParameterSpec.restOnly(symbolExpr.name());
+        }
         if (!(parametersExpr instanceof ListExpr parametersList)) {
             throw new EvalError("invalid parameter list");
         }
-        List<Expr> parameters = parametersList.elements();
-        return parseParameters(parameters);
+        return parseParameters(parametersList.elements());
     }
 
-    private List<String> parseParameters(List<Expr> parameters) throws EvalError {
+    private ParameterSpec parseParameters(List<Expr> parameters) throws EvalError {
         List<String> names = new ArrayList<>(parameters.size());
-        for (Expr parameter : parameters) {
+        for (int i = 0; i < parameters.size(); i++) {
+            Expr parameter = parameters.get(i);
             if (!(parameter instanceof SymbolExpr symbolExpr)) {
                 throw new EvalError("invalid parameter list");
             }
+            if (".".equals(symbolExpr.name())) {
+                if (i + 2 != parameters.size()) {
+                    throw new EvalError("invalid parameter list");
+                }
+                Expr restExpr = parameters.get(i + 1);
+                if (!(restExpr instanceof SymbolExpr restSymbol) || ".".equals(restSymbol.name())) {
+                    throw new EvalError("invalid parameter list");
+                }
+                return new ParameterSpec(List.copyOf(names), restSymbol.name());
+            }
             names.add(symbolExpr.name());
         }
-        return names;
+        return ParameterSpec.fixed(names);
     }
 
     private Value quote(Expr expression) {
@@ -439,13 +456,17 @@ public class Evaluator {
 
     private Value applyLambda(LambdaProcedure lambda, List<LocatedValue> arguments, SourcePos callPos)
             throws EvalError {
-        if (arguments.size() != lambda.parameters().size()) {
+        ParameterSpec parameters = lambda.parameters();
+        if (!parameters.accepts(arguments.size())) {
             throw errorAt(callPos, "wrong argument count for " + lambda.displayName());
         }
 
         Environment callEnv = new Environment(lambda.closure());
-        for (int i = 0; i < lambda.parameters().size(); i++) {
-            callEnv.define(lambda.parameters().get(i), arguments.get(i).value());
+        for (int i = 0; i < parameters.required().size(); i++) {
+            callEnv.define(parameters.required().get(i), arguments.get(i).value());
+        }
+        if (parameters.rest() != null) {
+            callEnv.define(parameters.rest(), buildList(arguments, parameters.required().size()));
         }
 
         Value result = VOID_VALUE;
@@ -635,6 +656,20 @@ public class Evaluator {
         return boolValue(arguments.get(0).value() instanceof SymbolValue);
     }
 
+    private Value builtinApply(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        if (arguments.size() < 2) {
+            throw errorAt(callPos, "wrong argument count for apply");
+        }
+
+        LocatedValue operator = arguments.get(0);
+        List<LocatedValue> expandedArguments = new ArrayList<>();
+        for (int i = 1; i < arguments.size() - 1; i++) {
+            expandedArguments.add(arguments.get(i));
+        }
+        expandedArguments.addAll(expandApplyArguments(arguments.get(arguments.size() - 1)));
+        return apply(operator.value(), operator.pos(), expandedArguments, callPos);
+    }
+
     private Value builtinAdd(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
         long total = 0L;
         for (LocatedValue argument : arguments) {
@@ -785,6 +820,27 @@ public class Evaluator {
         return result;
     }
 
+    private Value buildList(List<LocatedValue> values, int startIndex) {
+        Value result = EMPTY_LIST;
+        for (int i = values.size() - 1; i >= startIndex; i--) {
+            result = new PairValue(values.get(i).value(), result);
+        }
+        return result;
+    }
+
+    private List<LocatedValue> expandApplyArguments(LocatedValue list) throws EvalError {
+        List<LocatedValue> values = new ArrayList<>();
+        Value current = list.value();
+        while (current instanceof PairValue(Value car, Value cdr)) {
+            values.add(new LocatedValue(car, list.pos()));
+            current = cdr;
+        }
+        if (!(current instanceof EmptyListValue)) {
+            throw errorAt(list.pos(), "expected list for apply");
+        }
+        return values;
+    }
+
     private boolean isTruthy(Value value) {
         return !(value instanceof BoolValue(boolean bool) && !bool);
     }
@@ -927,7 +983,7 @@ public class Evaluator {
         }
     }
 
-    private record LambdaProcedure(String name, List<String> parameters, List<Expr> body,
+    private record LambdaProcedure(String name, ParameterSpec parameters, List<Expr> body,
                                    Environment closure) implements Value {
         private String displayName() {
             return name == null ? "lambda" : name;
@@ -936,6 +992,23 @@ public class Evaluator {
         @Override
         public String render() {
             return "#<procedure " + displayName() + ">";
+        }
+    }
+
+    private record ParameterSpec(List<String> required, String rest) {
+        private static ParameterSpec fixed(List<String> required) {
+            return new ParameterSpec(List.copyOf(required), null);
+        }
+
+        private static ParameterSpec restOnly(String rest) {
+            return new ParameterSpec(List.of(), rest);
+        }
+
+        private boolean accepts(int argumentCount) {
+            if (rest != null) {
+                return argumentCount >= required.size();
+            }
+            return argumentCount == required.size();
         }
     }
 
