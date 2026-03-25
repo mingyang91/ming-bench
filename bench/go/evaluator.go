@@ -29,7 +29,7 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 		return "", output, err
 	}
 
-	formatted, err := formatValue(value)
+	formatted, err := formatDisplayValue(value)
 	if err != nil {
 		return "", "", err
 	}
