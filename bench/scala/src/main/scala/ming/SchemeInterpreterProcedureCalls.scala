@@ -2,7 +2,8 @@ package ming
 
 private[ming] object SchemeInterpreterProcedureCalls:
 
-  import BuiltinSupport.{asList, requireAtLeast, requireExactly}
+  import BuiltinSupport.{asList, requireAtLeast, singleArg, twoArgs}
+  import SchemeValues.{pack, unpack}
   import SchemeInterpreter.{EvalState, Expr, Resume, Value}
 
   private type EvalExprState =
@@ -39,7 +40,8 @@ private[ming] object SchemeInterpreterProcedureCalls:
     cont: Resume,
     evalSequenceState: EvalSequenceState
   ): EvalState =
-    val runtime = SchemeInterpreter.currentRuntime
+    val runtime        = SchemeInterpreter.currentRuntime
+    val recursiveApply = recursiveApplyState(evalSequenceState)
 
     value match
       case Value.Builtin(_, impl) =>
@@ -49,7 +51,7 @@ private[ming] object SchemeInterpreterProcedureCalls:
         val procedure = args.head
         val prefix    = args.tail.dropRight(1)
         val rest      = asList(args.last, "apply", pos)
-        applyProcedureState(procedure, prefix ++ rest, pos, cont, evalSequenceState)
+        recursiveApply(procedure, prefix ++ rest, pos, cont)
       case Value.MapProcedureBuiltin =>
         requireAtLeast("map", args, expected = 2, pos)
         val procedure = args.head
@@ -60,22 +62,24 @@ private[ming] object SchemeInterpreterProcedureCalls:
         val procedure = args.head
         val lists     = args.tail.map(asList(_, "for-each", pos))
         evalForEachState(procedure, lists, pos, cont, evalSequenceState)
+      case Value.ValuesBuiltin =>
+        cont(pack(args))
+      case Value.CallWithValuesBuiltin =>
+        applyCallWithValuesState(args, pos, cont, recursiveApply)
       case Value.DynamicWindBuiltin =>
         SchemeDynamicWind.applyState(
           args,
           pos,
           cont,
           runtime,
-          (procedure, callArgs, callPos, callCont) =>
-            applyProcedureState(procedure, callArgs, callPos, callCont, evalSequenceState)
+          recursiveApply
         )
       case Value.RaiseBuiltin =>
         SchemeExceptions.raiseState(
           args,
           pos,
           runtime,
-          (procedure, callArgs, callPos, callCont) =>
-            applyProcedureState(procedure, callArgs, callPos, callCont, evalSequenceState)
+          recursiveApply
         )
       case Value.WithExceptionHandlerBuiltin =>
         SchemeExceptions.withExceptionHandlerState(
@@ -83,60 +87,129 @@ private[ming] object SchemeInterpreterProcedureCalls:
           pos,
           cont,
           runtime,
-          (procedure, callArgs, callPos, callCont) =>
-            applyProcedureState(procedure, callArgs, callPos, callCont, evalSequenceState)
+          recursiveApply
         )
       case Value.CallWithCurrentContinuation =>
-        requireExactly("call/cc", args, expected = 1, pos)
-        args match
-          case procedure :: Nil =>
-            applyProcedureState(
-              procedure,
-              List(SchemeDynamicWind.captureContinuation(cont, runtime)),
-              pos,
-              cont,
-              evalSequenceState
-            )
-          case _ =>
-            throw new IllegalStateException("unreachable")
+        applyCallWithCurrentContinuationState(args, pos, cont, runtime, recursiveApply)
       case continuation: Value.Continuation =>
-        requireExactly("continuation", args, expected = 1, pos)
-        args match
-          case argument :: Nil =>
-            SchemeDynamicWind.resumeContinuationState(
-              continuation,
-              argument,
-              runtime,
-              (procedure, callArgs, callPos, callCont) =>
-                applyProcedureState(procedure, callArgs, callPos, callCont, evalSequenceState)
-            )
-          case _ => throw new IllegalStateException("unreachable")
+        resumeContinuationState(continuation, args, pos, runtime, recursiveApply)
       case Value.Closure(params, body, closureEnv, closureMacros) =>
-        val prepared = SchemeProcedures.prepareUserProcedure(
+        applyUserProcedureState(
           params,
           body,
           closureEnv,
           closureMacros,
           args,
           pos,
-          "lambda"
+          "lambda",
+          cont,
+          evalSequenceState
         )
-        evalSequenceState(prepared.body, prepared.env, prepared.macros, cont)
       case Value.CaseLambda(clauses, closureEnv, closureMacros) =>
-        val Value.CaseLambdaClause(params, body) =
-          SchemeProcedures.selectCaseLambdaClause(clauses, args.length, pos)
-        val prepared = SchemeProcedures.prepareUserProcedure(
-          params,
-          body,
+        applyCaseLambdaState(
+          clauses,
           closureEnv,
           closureMacros,
           args,
           pos,
-          "case-lambda"
+          cont,
+          evalSequenceState
         )
-        evalSequenceState(prepared.body, prepared.env, prepared.macros, cont)
       case other =>
         throw EvalError.at(pos, s"not a procedure: ${SchemeRendering.render(other)}")
+
+  private def recursiveApplyState(evalSequenceState: EvalSequenceState): ApplyProcedureState =
+    (procedure, callArgs, callPos, callCont) =>
+      applyProcedureState(procedure, callArgs, callPos, callCont, evalSequenceState)
+
+  private def applyCallWithValuesState(
+    args: List[Value],
+    pos: SourcePos,
+    cont: Resume,
+    recursiveApply: ApplyProcedureState
+  ): EvalState =
+    val (producer, consumer) = twoArgs("call-with-values", args, pos)
+    recursiveApply(
+      producer,
+      Nil,
+      pos,
+      produced => recursiveApply(consumer, unpack(produced), pos, cont)
+    )
+
+  private def applyCallWithCurrentContinuationState(
+    args: List[Value],
+    pos: SourcePos,
+    cont: Resume,
+    runtime: Runtime,
+    recursiveApply: ApplyProcedureState
+  ): EvalState =
+    val procedure = singleArg("call/cc", args, pos)
+    recursiveApply(
+      procedure,
+      List(SchemeDynamicWind.captureContinuation(cont, runtime)),
+      pos,
+      cont
+    )
+
+  private def resumeContinuationState(
+    continuation: Value.Continuation,
+    args: List[Value],
+    pos: SourcePos,
+    runtime: Runtime,
+    recursiveApply: ApplyProcedureState
+  ): EvalState =
+    val argument = singleArg("continuation", args, pos)
+    SchemeDynamicWind.resumeContinuationState(
+      continuation,
+      argument,
+      runtime,
+      recursiveApply
+    )
+
+  private def applyUserProcedureState(
+    params: LambdaParams,
+    body: List[Expr],
+    closureEnv: Env,
+    closureMacros: MacroScope,
+    args: List[Value],
+    pos: SourcePos,
+    name: String,
+    cont: Resume,
+    evalSequenceState: EvalSequenceState
+  ): EvalState =
+    val prepared = SchemeProcedures.prepareUserProcedure(
+      params,
+      body,
+      closureEnv,
+      closureMacros,
+      args,
+      pos,
+      name
+    )
+    evalSequenceState(prepared.body, prepared.env, prepared.macros, cont)
+
+  private def applyCaseLambdaState(
+    clauses: List[Value.CaseLambdaClause],
+    closureEnv: Env,
+    closureMacros: MacroScope,
+    args: List[Value],
+    pos: SourcePos,
+    cont: Resume,
+    evalSequenceState: EvalSequenceState
+  ): EvalState =
+    val Value.CaseLambdaClause(params, body) =
+      SchemeProcedures.selectCaseLambdaClause(clauses, args.length, pos)
+    applyUserProcedureState(
+      params,
+      body,
+      closureEnv,
+      closureMacros,
+      args,
+      pos,
+      "case-lambda",
+      cont,
+      evalSequenceState
+    )
 
   private def evalArgumentsState(
     procedure: Value,

@@ -168,6 +168,8 @@ private[ming] trait SchemeInterpreterTypes:
     case object ApplyProcedureBuiltin                                               extends Procedure
     case object MapProcedureBuiltin                                                 extends Procedure
     case object ForEachProcedureBuiltin                                             extends Procedure
+    case object ValuesBuiltin                                                       extends Procedure
+    case object CallWithValuesBuiltin                                               extends Procedure
     case object CallWithCurrentContinuation                                         extends Procedure
     case object DynamicWindBuiltin                                                  extends Procedure
     case object RaiseBuiltin                                                        extends Procedure
@@ -205,6 +207,8 @@ private[ming] trait SchemeInterpreterTypes:
       env: Env,
       macros: MacroScope
     ) extends Procedure
+
+    final case class MultipleValues(values: List[Value]) extends Value
 
     case object Void extends Value
 

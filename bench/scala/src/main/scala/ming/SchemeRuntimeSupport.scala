@@ -11,6 +11,8 @@ private[ming] object SchemeRuntimeSupport:
     env.define("apply", Value.ApplyProcedureBuiltin)
     env.define("map", Value.MapProcedureBuiltin)
     env.define("for-each", Value.ForEachProcedureBuiltin)
+    env.define("values", Value.ValuesBuiltin)
+    env.define("call-with-values", Value.CallWithValuesBuiltin)
     env.define("call/cc", Value.CallWithCurrentContinuation)
     env.define("call-with-current-continuation", Value.CallWithCurrentContinuation)
     env.define("dynamic-wind", Value.DynamicWindBuiltin)

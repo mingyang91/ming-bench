@@ -47,13 +47,14 @@ private[ming] object SchemeRendering:
       case Value.MutableString(text) => if displayMode then text else "\"" + escapeString(text) + "\""
       case Value.Character(character) =>
         if displayMode then character.toString else renderCharacter(character)
-      case Value.Symbol(name)   => name
-      case Value.EmptyList      => "()"
-      case pair: Value.Pair     => renderPair(pair, displayMode, state)
-      case vector: Value.Vector => renderVector(vector, displayMode, state)
-      case record: Value.Record => s"#<record ${record.typeName}>"
-      case _: Procedure         => "#<procedure>"
-      case Value.Void           => "#<void>"
+      case Value.Symbol(name)      => name
+      case Value.EmptyList         => "()"
+      case pair: Value.Pair        => renderPair(pair, displayMode, state)
+      case vector: Value.Vector    => renderVector(vector, displayMode, state)
+      case record: Value.Record    => s"#<record ${record.typeName}>"
+      case Value.MultipleValues(_) => "#<values>"
+      case _: Procedure            => "#<procedure>"
+      case Value.Void              => "#<void>"
 
   private def renderPair(
     value: Value.Pair,
