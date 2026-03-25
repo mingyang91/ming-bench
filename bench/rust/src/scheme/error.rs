@@ -40,6 +40,9 @@ pub enum EvalError {
     #[error("integer division produced a non-integer result")]
     NonIntegerDivision,
 
+    #[error("negative exponent: {exponent}")]
+    NegativeExponent { exponent: i64 },
+
     #[error("index out of bounds: index {index}, length {len}")]
     IndexOutOfBounds { index: i64, len: usize },
 

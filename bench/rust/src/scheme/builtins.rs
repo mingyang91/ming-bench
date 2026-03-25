@@ -1,8 +1,15 @@
-use super::core::{make_string, BuiltinProcedure, EnvRef, Environment, Runtime, StringRef, Value};
+use super::core::{
+    make_pair, make_string, value_equal, BuiltinProcedure, EnvRef, Environment, Runtime, StringRef,
+    Value,
+};
 use super::error::EvalError;
 use super::eval::apply_procedure;
 
 const BUILTINS: &[BuiltinProcedure] = &[
+    BuiltinProcedure {
+        name: "abs",
+        func: builtin_abs,
+    },
     BuiltinProcedure {
         name: "+",
         func: builtin_add,
@@ -30,6 +37,14 @@ const BUILTINS: &[BuiltinProcedure] = &[
     BuiltinProcedure {
         name: "=",
         func: builtin_eq,
+    },
+    BuiltinProcedure {
+        name: "eq?",
+        func: builtin_is_eq,
+    },
+    BuiltinProcedure {
+        name: "equal?",
+        func: builtin_is_equal,
     },
     BuiltinProcedure {
         name: "<=",
@@ -64,8 +79,28 @@ const BUILTINS: &[BuiltinProcedure] = &[
         func: builtin_length,
     },
     BuiltinProcedure {
+        name: "list-ref",
+        func: builtin_list_ref,
+    },
+    BuiltinProcedure {
+        name: "list-tail",
+        func: builtin_list_tail,
+    },
+    BuiltinProcedure {
+        name: "list?",
+        func: builtin_is_list,
+    },
+    BuiltinProcedure {
+        name: "map",
+        func: builtin_map,
+    },
+    BuiltinProcedure {
         name: "append",
         func: builtin_append,
+    },
+    BuiltinProcedure {
+        name: "assoc",
+        func: builtin_assoc,
     },
     BuiltinProcedure {
         name: "string?",
@@ -144,6 +179,94 @@ const BUILTINS: &[BuiltinProcedure] = &[
         func: builtin_is_char,
     },
     BuiltinProcedure {
+        name: "char-alphabetic?",
+        func: builtin_is_char_alphabetic,
+    },
+    BuiltinProcedure {
+        name: "char-numeric?",
+        func: builtin_is_char_numeric,
+    },
+    BuiltinProcedure {
+        name: "char-upcase",
+        func: builtin_char_upcase,
+    },
+    BuiltinProcedure {
+        name: "char-downcase",
+        func: builtin_char_downcase,
+    },
+    BuiltinProcedure {
+        name: "char=?",
+        func: builtin_char_eq,
+    },
+    BuiltinProcedure {
+        name: "char<?",
+        func: builtin_char_lt,
+    },
+    BuiltinProcedure {
+        name: "string=?",
+        func: builtin_string_eq,
+    },
+    BuiltinProcedure {
+        name: "string<?",
+        func: builtin_string_lt,
+    },
+    BuiltinProcedure {
+        name: "string-ci=?",
+        func: builtin_string_ci_eq,
+    },
+    BuiltinProcedure {
+        name: "string-upcase",
+        func: builtin_string_upcase,
+    },
+    BuiltinProcedure {
+        name: "string-downcase",
+        func: builtin_string_downcase,
+    },
+    BuiltinProcedure {
+        name: "modulo",
+        func: builtin_modulo,
+    },
+    BuiltinProcedure {
+        name: "remainder",
+        func: builtin_remainder,
+    },
+    BuiltinProcedure {
+        name: "quotient",
+        func: builtin_quotient,
+    },
+    BuiltinProcedure {
+        name: "min",
+        func: builtin_min,
+    },
+    BuiltinProcedure {
+        name: "max",
+        func: builtin_max,
+    },
+    BuiltinProcedure {
+        name: "expt",
+        func: builtin_expt,
+    },
+    BuiltinProcedure {
+        name: "zero?",
+        func: builtin_is_zero,
+    },
+    BuiltinProcedure {
+        name: "positive?",
+        func: builtin_is_positive,
+    },
+    BuiltinProcedure {
+        name: "negative?",
+        func: builtin_is_negative,
+    },
+    BuiltinProcedure {
+        name: "odd?",
+        func: builtin_is_odd,
+    },
+    BuiltinProcedure {
+        name: "even?",
+        func: builtin_is_even,
+    },
+    BuiltinProcedure {
         name: "apply",
         func: builtin_apply,
     },
@@ -167,6 +290,11 @@ pub(crate) fn default_env() -> EnvRef {
     }
 
     env
+}
+
+fn builtin_abs(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_number(expect_single_arg("abs", args)?)?;
+    Ok(Value::Int(value.abs()))
 }
 
 fn builtin_add(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -232,6 +360,22 @@ fn builtin_eq(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError
     builtin_compare("=", args, |lhs, rhs| lhs == rhs)
 }
 
+fn builtin_is_eq(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let [lhs, rhs] = args else {
+        return Err(wrong_arg_count("eq?", "exactly 2", args.len()));
+    };
+
+    Ok(Value::Bool(eq_value(lhs, rhs)))
+}
+
+fn builtin_is_equal(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let [lhs, rhs] = args else {
+        return Err(wrong_arg_count("equal?", "exactly 2", args.len()));
+    };
+
+    Ok(Value::Bool(value_equal(lhs, rhs)))
+}
+
 fn builtin_le(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     builtin_compare("<=", args, |lhs, rhs| lhs <= rhs)
 }
@@ -260,23 +404,23 @@ fn builtin_cons(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalErr
         return Err(wrong_arg_count("cons", "exactly 2", args.len()));
     };
 
-    let mut values = vec![head.clone()];
-    values.extend(expect_list(tail, "list")?.iter().cloned());
-    Ok(Value::List(values))
+    match tail {
+        Value::List(values) => {
+            let mut list = Vec::with_capacity(values.len() + 1);
+            list.push(head.clone());
+            list.extend(values.iter().cloned());
+            Ok(Value::List(list))
+        }
+        _ => Ok(make_pair(head.clone(), tail.clone())),
+    }
 }
 
 fn builtin_car(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    let values = expect_list(expect_single_arg("car", args)?, "pair")?;
-    values.first().cloned().ok_or_else(empty_pair_error)
+    pair_car(expect_single_arg("car", args)?)
 }
 
 fn builtin_cdr(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    let values = expect_list(expect_single_arg("cdr", args)?, "pair")?;
-    if values.is_empty() {
-        return Err(empty_pair_error());
-    }
-
-    Ok(Value::List(values[1..].to_vec()))
+    pair_cdr(expect_single_arg("cdr", args)?)
 }
 
 fn builtin_null(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -295,6 +439,57 @@ fn builtin_length(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalE
     Ok(Value::Int(values.len() as i64))
 }
 
+fn builtin_list_ref(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let [list, index] = args else {
+        return Err(wrong_arg_count("list-ref", "exactly 2", args.len()));
+    };
+
+    let values = expect_list(list, "list")?;
+    let index = expect_index(index, values.len(), IndexBound::Exact)?;
+    Ok(values[index].clone())
+}
+
+fn builtin_list_tail(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let [list, index] = args else {
+        return Err(wrong_arg_count("list-tail", "exactly 2", args.len()));
+    };
+
+    let values = expect_list(list, "list")?;
+    let index = expect_index(index, values.len(), IndexBound::AllowEnd)?;
+    Ok(Value::List(values[index..].to_vec()))
+}
+
+fn builtin_is_list(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    unary_predicate("list?", args, |value| matches!(value, Value::List(_)))
+}
+
+fn builtin_map(args: &[Value], runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let Some((operator, list_args)) = args.split_first() else {
+        return Err(wrong_arg_count("map", "at least 2", 0));
+    };
+
+    if list_args.is_empty() {
+        return Err(wrong_arg_count("map", "at least 2", 1));
+    }
+
+    let lists = list_args
+        .iter()
+        .map(|list| expect_list(list, "list"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let len = lists.iter().map(|list| list.len()).min().unwrap_or(0);
+    let mut results = Vec::with_capacity(len);
+
+    for index in 0..len {
+        let call_args = lists
+            .iter()
+            .map(|list| list[index].clone())
+            .collect::<Vec<_>>();
+        results.push(apply_procedure(operator.clone(), &call_args, runtime)?);
+    }
+
+    Ok(Value::List(results))
+}
+
 fn builtin_append(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let mut combined = Vec::new();
 
@@ -303,6 +498,20 @@ fn builtin_append(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalE
     }
 
     Ok(Value::List(combined))
+}
+
+fn builtin_assoc(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let [key, alist] = args else {
+        return Err(wrong_arg_count("assoc", "exactly 2", args.len()));
+    };
+
+    for entry in expect_list(alist, "list")? {
+        if value_equal(key, &pair_car(entry)?) {
+            return Ok(entry.clone());
+        }
+    }
+
+    Ok(Value::Bool(false))
 }
 
 fn builtin_is_string(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -318,11 +527,10 @@ fn builtin_is_boolean(args: &[Value], _runtime: &mut Runtime) -> Result<Value, E
 }
 
 fn builtin_is_pair(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    unary_predicate(
-        "pair?",
-        args,
-        |value| matches!(value, Value::List(values) if !values.is_empty()),
-    )
+    unary_predicate("pair?", args, |value| {
+        matches!(value, Value::List(values) if !values.is_empty())
+            || matches!(value, Value::Pair(_))
+    })
 }
 
 fn builtin_is_symbol(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -444,6 +652,140 @@ fn builtin_is_char(args: &[Value], _runtime: &mut Runtime) -> Result<Value, Eval
     unary_predicate("char?", args, |value| matches!(value, Value::Char(_)))
 }
 
+fn builtin_is_char_alphabetic(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_char(expect_single_arg("char-alphabetic?", args)?)?;
+    Ok(Value::Bool(value.is_alphabetic()))
+}
+
+fn builtin_is_char_numeric(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_char(expect_single_arg("char-numeric?", args)?)?;
+    Ok(Value::Bool(value.is_numeric()))
+}
+
+fn builtin_char_upcase(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_char(expect_single_arg("char-upcase", args)?)?;
+    Ok(Value::Char(value.to_ascii_uppercase()))
+}
+
+fn builtin_char_downcase(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_char(expect_single_arg("char-downcase", args)?)?;
+    Ok(Value::Char(value.to_ascii_lowercase()))
+}
+
+fn builtin_char_eq(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    compare_char_args("char=?", args, |lhs, rhs| lhs == rhs)
+}
+
+fn builtin_char_lt(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    compare_char_args("char<?", args, |lhs, rhs| lhs < rhs)
+}
+
+fn builtin_string_eq(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    compare_string_args("string=?", args, |lhs, rhs| lhs == rhs)
+}
+
+fn builtin_string_lt(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    compare_string_args("string<?", args, |lhs, rhs| lhs < rhs)
+}
+
+fn builtin_string_ci_eq(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    compare_string_args("string-ci=?", args, |lhs, rhs| {
+        lhs.to_lowercase() == rhs.to_lowercase()
+    })
+}
+
+fn builtin_string_upcase(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_string(expect_single_arg("string-upcase", args)?)?;
+    Ok(make_string(value.to_uppercase()))
+}
+
+fn builtin_string_downcase(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_string(expect_single_arg("string-downcase", args)?)?;
+    Ok(make_string(value.to_lowercase()))
+}
+
+fn builtin_modulo(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let (dividend, divisor) = expect_two_numbers("modulo", args)?;
+    if divisor == 0 {
+        return Err(EvalError::DivisionByZero);
+    }
+
+    let remainder = dividend % divisor;
+    let result = if remainder != 0 && remainder.signum() != divisor.signum() {
+        remainder + divisor
+    } else {
+        remainder
+    };
+
+    Ok(Value::Int(result))
+}
+
+fn builtin_remainder(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let (dividend, divisor) = expect_two_numbers("remainder", args)?;
+    if divisor == 0 {
+        return Err(EvalError::DivisionByZero);
+    }
+
+    Ok(Value::Int(dividend % divisor))
+}
+
+fn builtin_quotient(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let (dividend, divisor) = expect_two_numbers("quotient", args)?;
+    if divisor == 0 {
+        return Err(EvalError::DivisionByZero);
+    }
+
+    Ok(Value::Int(dividend / divisor))
+}
+
+fn builtin_min(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let values = eval_number_args("min", args, 1)?;
+    Ok(Value::Int(
+        *values.iter().min().expect("min has at least one arg"),
+    ))
+}
+
+fn builtin_max(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let values = eval_number_args("max", args, 1)?;
+    Ok(Value::Int(
+        *values.iter().max().expect("max has at least one arg"),
+    ))
+}
+
+fn builtin_expt(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let (base, exponent) = expect_two_numbers("expt", args)?;
+    if exponent < 0 {
+        return Err(EvalError::NegativeExponent { exponent });
+    }
+
+    Ok(Value::Int(base.pow(exponent as u32)))
+}
+
+fn builtin_is_zero(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_number(expect_single_arg("zero?", args)?)?;
+    Ok(Value::Bool(value == 0))
+}
+
+fn builtin_is_positive(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_number(expect_single_arg("positive?", args)?)?;
+    Ok(Value::Bool(value > 0))
+}
+
+fn builtin_is_negative(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_number(expect_single_arg("negative?", args)?)?;
+    Ok(Value::Bool(value < 0))
+}
+
+fn builtin_is_odd(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_number(expect_single_arg("odd?", args)?)?;
+    Ok(Value::Bool(value % 2 != 0))
+}
+
+fn builtin_is_even(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_number(expect_single_arg("even?", args)?)?;
+    Ok(Value::Bool(value % 2 == 0))
+}
+
 fn builtin_apply(args: &[Value], runtime: &mut Runtime) -> Result<Value, EvalError> {
     let Some((operator, arg_parts)) = args.split_first() else {
         return Err(wrong_arg_count("apply", "at least 2", 0));
@@ -463,6 +805,28 @@ where
     F: FnOnce(&Value) -> bool,
 {
     Ok(Value::Bool(predicate(expect_single_arg(name, args)?)))
+}
+
+fn pair_car(value: &Value) -> Result<Value, EvalError> {
+    match value {
+        Value::List(values) => values.first().cloned().ok_or_else(empty_pair_error),
+        Value::Pair(pair) => Ok(pair.borrow().car.clone()),
+        other => Err(type_mismatch("pair", other)),
+    }
+}
+
+fn pair_cdr(value: &Value) -> Result<Value, EvalError> {
+    match value {
+        Value::List(values) => {
+            if values.is_empty() {
+                Err(empty_pair_error())
+            } else {
+                Ok(Value::List(values[1..].to_vec()))
+            }
+        }
+        Value::Pair(pair) => Ok(pair.borrow().cdr.clone()),
+        other => Err(type_mismatch("pair", other)),
+    }
 }
 
 fn expect_list<'a>(value: &'a Value, expected: &str) -> Result<&'a [Value], EvalError> {
@@ -513,6 +877,14 @@ fn expect_char(value: &Value) -> Result<char, EvalError> {
     }
 }
 
+fn expect_two_numbers(name: &str, args: &[Value]) -> Result<(i64, i64), EvalError> {
+    let [lhs, rhs] = args else {
+        return Err(wrong_arg_count(name, "exactly 2", args.len()));
+    };
+
+    Ok((expect_number(lhs)?, expect_number(rhs)?))
+}
+
 fn expect_index(value: &Value, len: usize, bound: IndexBound) -> Result<usize, EvalError> {
     let index = expect_number(value)?;
 
@@ -548,6 +920,65 @@ fn expect_number(value: &Value) -> Result<i64, EvalError> {
     match value {
         Value::Int(number) => Ok(*number),
         other => Err(type_mismatch("number", other)),
+    }
+}
+
+fn compare_char_args<F>(name: &str, args: &[Value], compare: F) -> Result<Value, EvalError>
+where
+    F: Fn(char, char) -> bool,
+{
+    if args.len() < 2 {
+        return Err(wrong_arg_count(name, "at least 2", args.len()));
+    }
+
+    let values = args
+        .iter()
+        .map(expect_char)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for pair in values.windows(2) {
+        if !compare(pair[0], pair[1]) {
+            return Ok(Value::Bool(false));
+        }
+    }
+
+    Ok(Value::Bool(true))
+}
+
+fn compare_string_args<F>(name: &str, args: &[Value], compare: F) -> Result<Value, EvalError>
+where
+    F: Fn(&str, &str) -> bool,
+{
+    if args.len() < 2 {
+        return Err(wrong_arg_count(name, "at least 2", args.len()));
+    }
+
+    let values = args
+        .iter()
+        .map(expect_string)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for pair in values.windows(2) {
+        if !compare(pair[0].as_str(), pair[1].as_str()) {
+            return Ok(Value::Bool(false));
+        }
+    }
+
+    Ok(Value::Bool(true))
+}
+
+fn eq_value(lhs: &Value, rhs: &Value) -> bool {
+    match (lhs, rhs) {
+        (Value::Bool(lhs), Value::Bool(rhs)) => lhs == rhs,
+        (Value::Int(lhs), Value::Int(rhs)) => lhs == rhs,
+        (Value::Symbol(lhs), Value::Symbol(rhs)) => lhs == rhs,
+        (Value::Char(lhs), Value::Char(rhs)) => lhs == rhs,
+        (Value::String(lhs), Value::String(rhs)) => std::rc::Rc::ptr_eq(lhs, rhs),
+        (Value::List(lhs), Value::List(rhs)) => lhs.is_empty() && rhs.is_empty(),
+        (Value::Pair(lhs), Value::Pair(rhs)) => std::rc::Rc::ptr_eq(lhs, rhs),
+        (Value::Procedure(lhs), Value::Procedure(rhs)) => std::rc::Rc::ptr_eq(lhs, rhs),
+        (Value::Void, Value::Void) => true,
+        _ => false,
     }
 }
 

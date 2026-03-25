@@ -547,6 +547,7 @@ pub(crate) fn apply_procedure(
         | Value::Symbol(_)
         | Value::Char(_)
         | Value::List(_)
+        | Value::Pair(_)
         | Value::Void => Err(EvalError::NotAProcedure {
             found: operator.render_for_error(),
         }),

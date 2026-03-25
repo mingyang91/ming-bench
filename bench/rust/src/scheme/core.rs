@@ -40,7 +40,13 @@ impl Expr {
 }
 
 pub(crate) type StringRef = Rc<RefCell<String>>;
+pub(crate) type PairRef = Rc<RefCell<PairCell>>;
 pub(crate) type EnvRef = Rc<RefCell<Environment>>;
+
+pub(crate) struct PairCell {
+    pub(crate) car: Value,
+    pub(crate) cdr: Value,
+}
 
 #[derive(Clone)]
 pub(crate) enum Value {
@@ -50,8 +56,15 @@ pub(crate) enum Value {
     Symbol(String),
     Char(char),
     List(Vec<Value>),
+    Pair(PairRef),
     Procedure(Rc<Procedure>),
     Void,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        value_equal(self, other)
+    }
 }
 
 impl Value {
@@ -67,6 +80,7 @@ impl Value {
             Self::Symbol(_) => "symbol",
             Self::Char(_) => "character",
             Self::List(_) => "list",
+            Self::Pair(_) => "pair",
             Self::Procedure(_) => "procedure",
             Self::Void => "void",
         }
@@ -185,6 +199,10 @@ pub(crate) fn make_string(text: impl Into<String>) -> Value {
     Value::String(Rc::new(RefCell::new(text.into())))
 }
 
+pub(crate) fn make_pair(car: Value, cdr: Value) -> Value {
+    Value::Pair(Rc::new(RefCell::new(PairCell { car, cdr })))
+}
+
 pub(crate) fn make_lambda(
     name: Option<String>,
     params: Vec<String>,
@@ -230,6 +248,7 @@ fn render_value(value: &Value, mode: RenderMode) -> String {
             RenderMode::Display => value.to_string(),
         },
         Value::List(values) => render_list(values, mode),
+        Value::Pair(pair) => render_pair(pair, mode),
         Value::Procedure(_) => "#<procedure>".into(),
         Value::Void => String::new(),
     }
@@ -274,4 +293,39 @@ fn render_list(values: &[Value], mode: RenderMode) -> String {
 
     rendered.push(')');
     rendered
+}
+
+fn render_pair(pair: &PairRef, mode: RenderMode) -> String {
+    let pair = pair.borrow();
+    let mut rendered = String::from("(");
+    rendered.push_str(&render_value(&pair.car, mode));
+    rendered.push_str(" . ");
+    rendered.push_str(&render_value(&pair.cdr, mode));
+    rendered.push(')');
+    rendered
+}
+
+pub(crate) fn value_equal(lhs: &Value, rhs: &Value) -> bool {
+    match (lhs, rhs) {
+        (Value::Bool(lhs), Value::Bool(rhs)) => lhs == rhs,
+        (Value::Int(lhs), Value::Int(rhs)) => lhs == rhs,
+        (Value::String(lhs), Value::String(rhs)) => lhs.borrow().as_str() == rhs.borrow().as_str(),
+        (Value::Symbol(lhs), Value::Symbol(rhs)) => lhs == rhs,
+        (Value::Char(lhs), Value::Char(rhs)) => lhs == rhs,
+        (Value::List(lhs), Value::List(rhs)) => {
+            lhs.len() == rhs.len()
+                && lhs
+                    .iter()
+                    .zip(rhs.iter())
+                    .all(|(lhs, rhs)| value_equal(lhs, rhs))
+        }
+        (Value::Pair(lhs), Value::Pair(rhs)) => {
+            let lhs = lhs.borrow();
+            let rhs = rhs.borrow();
+            value_equal(&lhs.car, &rhs.car) && value_equal(&lhs.cdr, &rhs.cdr)
+        }
+        (Value::Procedure(lhs), Value::Procedure(rhs)) => Rc::ptr_eq(lhs, rhs),
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    }
 }
