@@ -29,27 +29,31 @@ object LetForms:
   def evalLetStep(args: List[SchemeVal], env: Env, k: Cont): State =
     args match
       case SchemeVal.SSymbol(name) :: SchemeVal.SList(bindings) :: body if body.nonEmpty =>
-        val paramNames = bindings.map {
-          case SchemeVal.SList(SchemeVal.SSymbol(n) :: _ :: Nil) => n
-          case _                                                 => throw new EvalError("let: bad binding")
+        // Named let — CPS evaluation of init expressions
+        val parsed = bindings.map {
+          case SchemeVal.SList(SchemeVal.SSymbol(n) :: initExpr :: Nil) => (n, initExpr)
+          case _                                                        => throw new EvalError("let: bad binding")
         }
-        val initVals = bindings.map {
-          case SchemeVal.SList(_ :: initExpr :: Nil) => Evaluator.eval(initExpr, env)
-          case _                                     => throw new EvalError("let: bad binding")
-        }
-        val letEnv = Env(Some(env))
-        letEnv.define(name, SchemeVal.SLambda(paramNames, None, body, letEnv))
-        paramNames.zip(initVals).foreach((p, v) => letEnv.define(p, v))
-        Evaluator.evalBodyCek(body, letEnv, k)
+        val paramNames = parsed.map(_._1)
+        parsed match
+          case Nil =>
+            val letEnv = Env(Some(env))
+            letEnv.define(name, SchemeVal.SLambda(paramNames, None, body, letEnv))
+            Evaluator.evalBodyCek(body, letEnv, k)
+          case (n, expr) :: rest =>
+            State.Ev(expr, env, Cont.NamedLetEvalK(name, paramNames, n, Nil, rest, body, env, k))
       case SchemeVal.SList(bindings) :: body if body.nonEmpty =>
-        val pairs = bindings.map {
-          case SchemeVal.SList(SchemeVal.SSymbol(n) :: initExpr :: Nil) =>
-            (n, Evaluator.eval(initExpr, env))
-          case _ => throw new EvalError("let: bad binding")
+        // Regular let — CPS evaluation of init expressions
+        val parsed = bindings.map {
+          case SchemeVal.SList(SchemeVal.SSymbol(n) :: initExpr :: Nil) => (n, initExpr)
+          case _                                                        => throw new EvalError("let: bad binding")
         }
-        val letEnv = Env(Some(env))
-        pairs.foreach((n, v) => letEnv.define(n, v))
-        Evaluator.evalBodyCek(body, letEnv, k)
+        parsed match
+          case Nil =>
+            val letEnv = Env(Some(env))
+            Evaluator.evalBodyCek(body, letEnv, k)
+          case (n, expr) :: rest =>
+            State.Ev(expr, env, Cont.LetEvalK(n, Nil, rest, body, env, k))
       case _ => throw new EvalError("let: bad syntax")
 
   def evalLetrecStep(args: List[SchemeVal], env: Env, k: Cont): State =

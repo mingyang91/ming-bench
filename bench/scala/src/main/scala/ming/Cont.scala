@@ -58,3 +58,25 @@ object Cont:
 
   // L21 — call-with-values
   case class CallWithValuesK(consumer: SchemeVal, k: Cont) extends Cont
+
+  // CPS let binding evaluation — ensures call/cc inside let bindings captures full continuation
+  case class LetEvalK(
+    currentName: String,                  // name for the value being evaluated
+    bound: List[(String, SchemeVal)],     // already evaluated (name, value) pairs (reversed)
+    remaining: List[(String, SchemeVal)], // remaining (name, initExpr) pairs
+    body: List[SchemeVal],
+    outerEnv: Env,
+    k: Cont
+  ) extends Cont
+
+  // CPS named let binding evaluation
+  case class NamedLetEvalK(
+    loopName: String,
+    paramNames: List[String],
+    currentName: String,
+    bound: List[(String, SchemeVal)],
+    remaining: List[(String, SchemeVal)],
+    body: List[SchemeVal],
+    outerEnv: Env,
+    k: Cont
+  ) extends Cont

@@ -213,46 +213,7 @@ object Evaluator:
         if body.isEmpty then State.Ko(v, k2)
         else evalBodyCek(body, env, k2)
       else LetForms.evalCondStep(remaining, env, k2)
-    // dynamic-wind normal flow
-    case Cont.DynWindAfterInK(bodyThunk, entry, k2) =>
-      // in-thunk done; push entry onto wind stack, call body
-      windStack.set(entry :: windStack.get())
-      Apply.performApply(bodyThunk, Nil, Cont.DynWindAfterBodyK(entry, k2))
-    case Cont.DynWindAfterBodyK(entry, k2) =>
-      // body done; pop entry from wind stack, call out-thunk
-      val ws = windStack.get()
-      if ws.nonEmpty && (ws.head eq entry) then windStack.set(ws.tail)
-      Apply.performApply(entry.outThunk, Nil, Cont.DynWindAfterOutK(v, k2))
-    case Cont.DynWindAfterOutK(bodyValue, k2) =>
-      // out-thunk done; return body value
-      State.Ko(bodyValue, k2)
-    // continuation wind/unwind steps
-    case Cont.WindContinueK(remaining, finalValue, targetK, targetWinds) =>
-      DynWind.startWindActions(remaining, finalValue, targetK, targetWinds)(Apply.performApply)
-    case Cont.WindPushK(entry, remaining, finalValue, targetK, targetWinds) =>
-      // in-thunk done during rewind; push entry onto wind stack
-      windStack.set(entry :: windStack.get())
-      DynWind.startWindActions(remaining, finalValue, targetK, targetWinds)(Apply.performApply)
-    // exception handling (L20)
-    case Cont.WithHandlerK(k2) =>
-      // Body/thunk completed normally — pop handler, return value
-      val hs = handlerStack.get()
-      if hs.nonEmpty then handlerStack.set(hs.tail)
-      State.Ko(v, k2)
-    case Cont.RaiseReturnErrorK =>
-      throw new EvalError("handler returned from non-continuable exception")
-    case Cont.GuardAfterWindK(clauses, exnValue, env, guardK) =>
-      ExceptionOps.evalGuardClauses(clauses, exnValue, env, guardK, Apply.performApply)
-    case Cont.GuardTestK(body, remaining, exnValue, env, guardK) =>
-      if isTruthy(v) then
-        if body.isEmpty then State.Ko(v, guardK)
-        else evalBodyCek(body, env, guardK)
-      else ExceptionOps.evalGuardClauses(remaining, exnValue, env, guardK, Apply.performApply)
-    // L21 — call-with-values
-    case Cont.CallWithValuesK(consumer, k2) =>
-      v match
-        case SchemeVal.SValues(vals) => Apply.performApply(consumer, vals, k2)
-        case single                  => Apply.performApply(consumer, List(single), k2)
+    case other => KontOps.step(v, other)
 
   private def isMacro(v: SchemeVal): Boolean = v match
     case _: SchemeVal.SMacro            => true
