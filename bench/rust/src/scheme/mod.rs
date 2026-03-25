@@ -510,6 +510,7 @@ fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
                     "set!" => return eval_set_bang(&elems[1..], env, span),
                     "string-set!" => return eval_string_set(&elems[1..], env, span),
                     "define-syntax" => return eval_define_syntax(&elems[1..], env, span),
+                    "define-record-type" => return eval_define_record_type(&elems[1..], env, span),
                     _ => {
                         if let Some(Val::Macro { literals, rules, def_env }) = env.get(op) {
                             return eval_macro_call(elems, &literals, &rules, &def_env, env, span);
@@ -709,6 +710,7 @@ fn collect_template_free_vars(
 const SPECIAL_FORMS: &[&str] = &[
     "define", "if", "quote", "lambda", "and", "or", "begin",
     "let", "cond", "set!", "string-set!", "define-syntax", "syntax-rules",
+    "define-record-type",
 ];
 
 fn is_ellipsis(expr: &Expr) -> bool {
@@ -815,6 +817,145 @@ fn eval_macro_call(
         }
     }
     Err(EvalError::Runtime(format!("no matching syntax rule at {span}")))
+}
+
+fn eval_define_record_type(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
+    // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+    if args.len() < 3 {
+        return Err(EvalError::Parse(format!("define-record-type: expected at least 3 arguments at {span}")));
+    }
+    // args[0] = type name (ignored, but parsed)
+    // args[1] = (constructor-name field-name ...)
+    // args[2] = predicate-name
+    // args[3..] = (field-name accessor-name) ...
+
+    let (constructor_name, constructor_fields) = match &args[1].kind {
+        ExprKind::List(elems) if !elems.is_empty() => {
+            let cname = match &elems[0].kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Parse(format!("define-record-type: expected constructor name at {span}"))),
+            };
+            let fields: Vec<String> = elems[1..].iter().map(|e| match &e.kind {
+                ExprKind::Symbol(s) => Ok(s.clone()),
+                _ => Err(EvalError::Parse(format!("define-record-type: expected field name at {span}"))),
+            }).collect::<Result<_, _>>()?;
+            (cname, fields)
+        }
+        _ => return Err(EvalError::Parse(format!("define-record-type: expected constructor at {span}"))),
+    };
+
+    let pred_name = match &args[2].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Parse(format!("define-record-type: expected predicate name at {span}"))),
+    };
+
+    // Parse field accessors
+    let mut accessors: Vec<(String, String)> = Vec::new(); // (field_name, accessor_name)
+    for arg in &args[3..] {
+        match &arg.kind {
+            ExprKind::List(elems) if elems.len() >= 2 => {
+                let field = match &elems[0].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Parse(format!("define-record-type: expected field name at {span}"))),
+                };
+                let accessor = match &elems[1].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Parse(format!("define-record-type: expected accessor name at {span}"))),
+                };
+                accessors.push((field, accessor));
+            }
+            _ => return Err(EvalError::Parse(format!("define-record-type: expected field spec at {span}"))),
+        }
+    }
+
+    // Use gensym tags and regular lists/lambdas to represent records
+    let tag = gensym("record");
+
+    // Constructor: (lambda (f1 f2 ...) (list '<tag> f1 f2 ...))
+    // We define it directly as a Lambda with a body that creates a tagged list
+    {
+        let params = constructor_fields.clone();
+        let tag_sym = tag.clone();
+        // Build body: (list (quote <tag>) f1 f2 ...)
+        let span0 = Span::new(0, 0);
+        let mut list_args = vec![
+            Expr::new(ExprKind::Symbol("list".into()), span0),
+            Expr::new(ExprKind::List(vec![
+                Expr::new(ExprKind::Symbol("quote".into()), span0),
+                Expr::new(ExprKind::Symbol(tag_sym), span0),
+            ]), span0),
+        ];
+        for p in &params {
+            list_args.push(Expr::new(ExprKind::Symbol(p.clone()), span0));
+        }
+        let body = vec![Expr::new(ExprKind::List(list_args), span0)];
+
+        env.define(constructor_name, Val::Lambda {
+            params,
+            rest_param: None,
+            body,
+            env: env.clone(),
+        });
+    }
+
+    // Predicate: checks if value is a list whose car is the tag
+    {
+        let tag_sym = tag.clone();
+        let param = "__rec_v".to_string();
+        let span0 = Span::new(0, 0);
+        // Body: (and (pair? __rec_v) (equal? (car __rec_v) (quote <tag>)))
+        let body = vec![Expr::new(ExprKind::List(vec![
+            Expr::new(ExprKind::Symbol("and".into()), span0),
+            Expr::new(ExprKind::List(vec![
+                Expr::new(ExprKind::Symbol("pair?".into()), span0),
+                Expr::new(ExprKind::Symbol(param.clone()), span0),
+            ]), span0),
+            Expr::new(ExprKind::List(vec![
+                Expr::new(ExprKind::Symbol("equal?".into()), span0),
+                Expr::new(ExprKind::List(vec![
+                    Expr::new(ExprKind::Symbol("car".into()), span0),
+                    Expr::new(ExprKind::Symbol(param.clone()), span0),
+                ]), span0),
+                Expr::new(ExprKind::List(vec![
+                    Expr::new(ExprKind::Symbol("quote".into()), span0),
+                    Expr::new(ExprKind::Symbol(tag_sym), span0),
+                ]), span0),
+            ]), span0),
+        ]), span0)];
+
+        env.define(pred_name, Val::Lambda {
+            params: vec![param],
+            rest_param: None,
+            body,
+            env: env.clone(),
+        });
+    }
+
+    // Accessors: (lambda (v) (list-ref v <index>))
+    for (field_name, accessor_name) in &accessors {
+        // Find field index in constructor_fields
+        let idx = constructor_fields.iter().position(|f| f == field_name)
+            .ok_or_else(|| EvalError::Parse(format!(
+                "define-record-type: field '{}' not in constructor at {span}", field_name
+            )))?;
+        let span0 = Span::new(0, 0);
+        let param = "__rec_v".to_string();
+        // Body: (list-ref __rec_v <idx+1>)  (+1 because index 0 is the tag)
+        let body = vec![Expr::new(ExprKind::List(vec![
+            Expr::new(ExprKind::Symbol("list-ref".into()), span0),
+            Expr::new(ExprKind::Symbol(param.clone()), span0),
+            Expr::new(ExprKind::Int((idx + 1) as i64), span0),
+        ]), span0)];
+
+        env.define(accessor_name.clone(), Val::Lambda {
+            params: vec![param],
+            rest_param: None,
+            body,
+            env: env.clone(),
+        });
+    }
+
+    Ok(Val::Void)
 }
 
 fn eval_define_syntax(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
