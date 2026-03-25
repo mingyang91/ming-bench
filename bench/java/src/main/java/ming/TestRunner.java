@@ -28,6 +28,12 @@ public class TestRunner {
             }
         }
 
+        // L27 is a standalone test (step-limited eval) — delegate to its own runner
+        if (benchLevel == 27) {
+            L27Tests.main(new String[0]);
+            return;
+        }
+
         String testsJsonPath = System.getenv("TESTS_JSON");
         if (testsJsonPath == null || testsJsonPath.isEmpty()) {
             testsJsonPath = "../tests.json";

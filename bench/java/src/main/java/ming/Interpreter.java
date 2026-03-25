@@ -983,8 +983,17 @@ public class Interpreter {
     // Track the last list expression being evaluated for error position reporting
     private SchemeValue lastExpr;
 
+    // Step limit support (0 = unlimited)
+    private int stepLimit = 0;
+    private int stepCount = 0;
+
+    public void setStepLimit(int limit) { this.stepLimit = limit; this.stepCount = 0; }
+
     private SchemeValue runCekLoop() throws EvalError {
         while (true) {
+            if (stepLimit > 0 && ++stepCount > stepLimit) {
+                throw new EvalError("step limit exceeded");
+            }
             if (cIsValue) {
                 if (cK instanceof Cont.Halt) return cControl;
                 try {
