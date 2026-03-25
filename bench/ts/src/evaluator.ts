@@ -43,10 +43,12 @@ type SchemeValue =
   | { type: 'string'; value: string }
   | { type: 'char'; value: string }
   | { type: 'symbol'; name: string }
-  | { type: 'list'; elements: SchemeValue[] }
+  | { type: 'list'; elements: SchemeValue[]; tail?: SchemeValue }
   | BuiltinProcedure
   | Closure
   | { type: 'void' };
+
+type ListValue = Extract<SchemeValue, { type: 'list' }>;
 
 const START_POSITION: SourcePosition = { line: 1, column: 1 };
 const VOID_VALUE: SchemeValue = { type: 'void' };
@@ -746,6 +748,129 @@ function createGlobalEnv(context: EvaluationContext): Environment {
   );
 
   env.define(
+    'abs',
+    builtin('abs', (args, callPosition) => {
+      requireArgCount('abs', args.length, 1, callPosition);
+      return numberValue(Math.abs(expectNumber('abs', args[0])), callPosition);
+    }),
+  );
+
+  env.define(
+    'quotient',
+    builtin('quotient', (args, callPosition) => {
+      requireArgCount('quotient', args.length, 2, callPosition);
+      const dividend = expectInteger('quotient', args[0]);
+      const divisor = expectInteger('quotient', args[1]);
+      if (divisor === 0) {
+        throw new EvalError('division by zero', args[1].position);
+      }
+
+      return numberValue(Math.trunc(dividend / divisor), callPosition);
+    }),
+  );
+
+  env.define(
+    'remainder',
+    builtin('remainder', (args, callPosition) => {
+      requireArgCount('remainder', args.length, 2, callPosition);
+      const dividend = expectInteger('remainder', args[0]);
+      const divisor = expectInteger('remainder', args[1]);
+      if (divisor === 0) {
+        throw new EvalError('division by zero', args[1].position);
+      }
+
+      return numberValue(dividend % divisor, callPosition);
+    }),
+  );
+
+  env.define(
+    'modulo',
+    builtin('modulo', (args, callPosition) => {
+      requireArgCount('modulo', args.length, 2, callPosition);
+      const dividend = expectInteger('modulo', args[0]);
+      const divisor = expectInteger('modulo', args[1]);
+      if (divisor === 0) {
+        throw new EvalError('division by zero', args[1].position);
+      }
+
+      let result = dividend % divisor;
+      if (result !== 0 && Math.sign(result) !== Math.sign(divisor)) {
+        result += divisor;
+      }
+
+      return numberValue(result, callPosition);
+    }),
+  );
+
+  env.define(
+    'min',
+    builtin('min', (args, callPosition) => {
+      const values = evaluateNumberArgs('min', args);
+      requireArgCountAtLeast('min', values.length, 1, callPosition);
+      return numberValue(Math.min(...values), callPosition);
+    }),
+  );
+
+  env.define(
+    'max',
+    builtin('max', (args, callPosition) => {
+      const values = evaluateNumberArgs('max', args);
+      requireArgCountAtLeast('max', values.length, 1, callPosition);
+      return numberValue(Math.max(...values), callPosition);
+    }),
+  );
+
+  env.define(
+    'expt',
+    builtin('expt', (args, callPosition) => {
+      requireArgCount('expt', args.length, 2, callPosition);
+      const base = expectNumber('expt', args[0]);
+      const exponent = expectInteger('expt', args[1]);
+      return numberValue(base ** exponent, callPosition);
+    }),
+  );
+
+  env.define(
+    'zero?',
+    builtin('zero?', (args, callPosition) => {
+      requireArgCount('zero?', args.length, 1, callPosition);
+      return booleanValue(expectNumber('zero?', args[0]) === 0);
+    }),
+  );
+
+  env.define(
+    'positive?',
+    builtin('positive?', (args, callPosition) => {
+      requireArgCount('positive?', args.length, 1, callPosition);
+      return booleanValue(expectNumber('positive?', args[0]) > 0);
+    }),
+  );
+
+  env.define(
+    'negative?',
+    builtin('negative?', (args, callPosition) => {
+      requireArgCount('negative?', args.length, 1, callPosition);
+      return booleanValue(expectNumber('negative?', args[0]) < 0);
+    }),
+  );
+
+  env.define(
+    'odd?',
+    builtin('odd?', (args, callPosition) => {
+      requireArgCount('odd?', args.length, 1, callPosition);
+      return booleanValue(Math.abs(expectInteger('odd?', args[0]) % 2) === 1);
+    }),
+  );
+
+  env.define(
+    'even?',
+    builtin('even?', (args, callPosition) => {
+      requireArgCount('even?', args.length, 1, callPosition);
+      return booleanValue(expectInteger('even?', args[0]) % 2 === 0);
+    }),
+  );
+
+  env.define(
     'not',
     builtin('not', (args, callPosition) => {
       requireArgCount('not', args.length, 1, callPosition);
@@ -754,11 +879,26 @@ function createGlobalEnv(context: EvaluationContext): Environment {
   );
 
   env.define(
+    'eq?',
+    builtin('eq?', (args, callPosition) => {
+      requireArgCount('eq?', args.length, 2, callPosition);
+      return booleanValue(equalValues(args[0].value, args[1].value));
+    }),
+  );
+
+  env.define(
+    'equal?',
+    builtin('equal?', (args, callPosition) => {
+      requireArgCount('equal?', args.length, 2, callPosition);
+      return booleanValue(equalValues(args[0].value, args[1].value));
+    }),
+  );
+
+  env.define(
     'cons',
     builtin('cons', (args, callPosition) => {
       requireArgCount('cons', args.length, 2, callPosition);
-      const tail = expectList('cons', args[1]);
-      return { type: 'list', elements: [args[0].value, ...tail.elements] };
+      return consValue(args[0].value, args[1].value);
     }),
   );
 
@@ -774,11 +914,11 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'cdr',
     builtin('cdr', (args, callPosition) => {
       requireArgCount('cdr', args.length, 1, callPosition);
-      return { type: 'list', elements: expectPair('cdr', args[0]).elements.slice(1) };
+      return cdrValue(expectPair('cdr', args[0]));
     }),
   );
 
-  env.define('list', builtin('list', (args) => ({ type: 'list', elements: args.map((arg) => arg.value) })));
+  env.define('list', builtin('list', (args) => listValue(args.map((arg) => arg.value))));
 
   env.define(
     'length',
@@ -797,7 +937,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
         elements.push(...expectList('append', arg).elements);
       }
 
-      return { type: 'list', elements };
+      return listValue(elements);
     }),
   );
 
@@ -818,6 +958,28 @@ function createGlobalEnv(context: EvaluationContext): Environment {
         [...args.slice(1, -1), ...trailingArgs],
         callPosition,
       );
+    }),
+  );
+
+  env.define(
+    'map',
+    builtin('map', (args, callPosition) => {
+      requireArgCountAtLeast('map', args.length, 2, callPosition);
+
+      const procedure = args[0].value;
+      const lists = args.slice(1).map((arg) => expectList('map', arg));
+      const resultLength = Math.min(...lists.map((list) => list.elements.length));
+      const results: SchemeValue[] = [];
+
+      for (let index = 0; index < resultLength; index += 1) {
+        const mappedArgs = lists.map((list, listIndex) => ({
+          value: list.elements[index],
+          position: args[listIndex + 1].position,
+        }));
+        results.push(applyProcedure(procedure, mappedArgs, callPosition));
+      }
+
+      return listValue(results);
     }),
   );
 
@@ -965,10 +1127,58 @@ function createGlobalEnv(context: EvaluationContext): Environment {
   );
 
   env.define(
+    'string=?',
+    builtin('string=?', (args, callPosition) =>
+      booleanValue(compareStringArgs('string=?', args, (a, b) => a === b, callPosition)),
+    ),
+  );
+
+  env.define(
+    'string<?',
+    builtin('string<?', (args, callPosition) =>
+      booleanValue(compareStringArgs('string<?', args, (a, b) => a < b, callPosition)),
+    ),
+  );
+
+  env.define(
+    'string-ci=?',
+    builtin('string-ci=?', (args, callPosition) =>
+      booleanValue(
+        compareStringArgs(
+          'string-ci=?',
+          args,
+          (a, b) => a.toLowerCase() === b.toLowerCase(),
+          callPosition,
+        ),
+      ),
+    ),
+  );
+
+  env.define(
+    'string-upcase',
+    builtin('string-upcase', (args, callPosition) => {
+      requireArgCount('string-upcase', args.length, 1, callPosition);
+      return stringValue(expectString('string-upcase', args[0]).toUpperCase());
+    }),
+  );
+
+  env.define(
+    'string-downcase',
+    builtin('string-downcase', (args, callPosition) => {
+      requireArgCount('string-downcase', args.length, 1, callPosition);
+      return stringValue(expectString('string-downcase', args[0]).toLowerCase());
+    }),
+  );
+
+  env.define(
     'null?',
     builtin('null?', (args, callPosition) => {
       requireArgCount('null?', args.length, 1, callPosition);
-      return booleanValue(args[0].value.type === 'list' && args[0].value.elements.length === 0);
+      return booleanValue(
+        args[0].value.type === 'list' &&
+          args[0].value.elements.length === 0 &&
+          args[0].value.tail === undefined,
+      );
     }),
   );
 
@@ -1020,6 +1230,112 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     }),
   );
 
+  env.define(
+    'list?',
+    builtin('list?', (args, callPosition) => {
+      requireArgCount('list?', args.length, 1, callPosition);
+      return booleanValue(args[0].value.type === 'list' && isProperList(args[0].value));
+    }),
+  );
+
+  env.define(
+    'list-ref',
+    builtin('list-ref', (args, callPosition) => {
+      requireArgCount('list-ref', args.length, 2, callPosition);
+      const list = expectList('list-ref', args[0]);
+      const index = expectNonNegativeInteger('list-ref', args[1]);
+      if (index >= list.elements.length) {
+        throw new EvalError('list-ref: index out of range', args[1].position);
+      }
+
+      return list.elements[index];
+    }),
+  );
+
+  env.define(
+    'list-tail',
+    builtin('list-tail', (args, callPosition) => {
+      requireArgCount('list-tail', args.length, 2, callPosition);
+      const list = expectList('list-tail', args[0]);
+      const index = expectNonNegativeInteger('list-tail', args[1]);
+      if (index > list.elements.length) {
+        throw new EvalError('list-tail: index out of range', args[1].position);
+      }
+
+      return listValue(list.elements.slice(index));
+    }),
+  );
+
+  env.define(
+    'assoc',
+    builtin('assoc', (args, callPosition) => {
+      requireArgCount('assoc', args.length, 2, callPosition);
+      const key = args[0].value;
+      const alist = expectList('assoc', args[1]);
+
+      for (const entry of alist.elements) {
+        if (entry.type === 'list' && entry.elements.length > 0 && equalValues(entry.elements[0], key)) {
+          return entry;
+        }
+      }
+
+      return booleanValue(false);
+    }),
+  );
+
+  env.define(
+    'char-alphabetic?',
+    builtin('char-alphabetic?', (args, callPosition) => {
+      requireArgCount('char-alphabetic?', args.length, 1, callPosition);
+      return booleanValue(/^[A-Za-z]$/u.test(expectChar('char-alphabetic?', args[0]).value));
+    }),
+  );
+
+  env.define(
+    'char-numeric?',
+    builtin('char-numeric?', (args, callPosition) => {
+      requireArgCount('char-numeric?', args.length, 1, callPosition);
+      return booleanValue(/^[0-9]$/u.test(expectChar('char-numeric?', args[0]).value));
+    }),
+  );
+
+  env.define(
+    'char-upcase',
+    builtin('char-upcase', (args, callPosition) => {
+      requireArgCount('char-upcase', args.length, 1, callPosition);
+      return charValue(expectChar('char-upcase', args[0]).value.toUpperCase(), args[0].position);
+    }),
+  );
+
+  env.define(
+    'char-downcase',
+    builtin('char-downcase', (args, callPosition) => {
+      requireArgCount('char-downcase', args.length, 1, callPosition);
+      return charValue(expectChar('char-downcase', args[0]).value.toLowerCase(), args[0].position);
+    }),
+  );
+
+  env.define(
+    'char=?',
+    builtin('char=?', (args, callPosition) =>
+      booleanValue(compareCharArgs('char=?', args, (a, b) => a === b, callPosition)),
+    ),
+  );
+
+  env.define(
+    'char<?',
+    builtin('char<?', (args, callPosition) =>
+      booleanValue(
+        compareCharArgs(
+          'char<?',
+          args,
+          (a, b) => a.codePointAt(0)! < b.codePointAt(0)!,
+          callPosition,
+        ),
+      ),
+    ),
+  );
+
   return env;
 }
 
@@ -1041,6 +1357,42 @@ function compareNumberArgs(
   position: SourcePosition,
 ): boolean {
   const values = evaluateNumberArgs(name, args);
+  requireArgCountAtLeast(name, values.length, 1, position);
+
+  for (let index = 0; index < values.length - 1; index += 1) {
+    if (!predicate(values[index], values[index + 1])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function compareStringArgs(
+  name: string,
+  args: EvaluatedArg[],
+  predicate: (left: string, right: string) => boolean,
+  position: SourcePosition,
+): boolean {
+  const values = args.map((arg) => expectString(name, arg));
+  requireArgCountAtLeast(name, values.length, 1, position);
+
+  for (let index = 0; index < values.length - 1; index += 1) {
+    if (!predicate(values[index], values[index + 1])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function compareCharArgs(
+  name: string,
+  args: EvaluatedArg[],
+  predicate: (left: string, right: string) => boolean,
+  position: SourcePosition,
+): boolean {
+  const values = args.map((arg) => expectChar(name, arg).value);
   requireArgCountAtLeast(name, values.length, 1, position);
 
   for (let index = 0; index < values.length - 1; index += 1) {
@@ -1082,6 +1434,15 @@ function expectNumber(name: string, arg: EvaluatedArg): number {
   return arg.value.value;
 }
 
+function expectInteger(name: string, arg: EvaluatedArg): number {
+  const value = expectNumber(name, arg);
+  if (!Number.isInteger(value)) {
+    throw new EvalError(`${name}: expected integer`, arg.position);
+  }
+
+  return value;
+}
+
 function expectString(name: string, arg: EvaluatedArg): string {
   return expectStringValue(name, arg).value;
 }
@@ -1103,15 +1464,24 @@ function expectSymbol(name: string, arg: EvaluatedArg): Extract<SchemeValue, { t
 }
 
 function expectNonNegativeInteger(name: string, arg: EvaluatedArg): number {
-  const value = expectNumber(name, arg);
-  if (!Number.isInteger(value) || value < 0) {
+  const value = expectInteger(name, arg);
+  if (value < 0) {
     throw new EvalError(`${name}: expected non-negative integer`, arg.position);
   }
 
   return value;
 }
 
-function expectList(name: string, arg: EvaluatedArg): Extract<SchemeValue, { type: 'list' }> {
+function expectList(name: string, arg: EvaluatedArg): ListValue {
+  const list = expectListValue(name, arg);
+  if (!isProperList(list)) {
+    throw new EvalError(`${name}: expected list`, arg.position);
+  }
+
+  return list;
+}
+
+function expectListValue(name: string, arg: EvaluatedArg): ListValue {
   if (arg.value.type !== 'list') {
     throw new EvalError(`${name}: expected list`, arg.position);
   }
@@ -1119,8 +1489,8 @@ function expectList(name: string, arg: EvaluatedArg): Extract<SchemeValue, { typ
   return arg.value;
 }
 
-function expectPair(name: string, arg: EvaluatedArg): Extract<SchemeValue, { type: 'list' }> {
-  const list = expectList(name, arg);
+function expectPair(name: string, arg: EvaluatedArg): ListValue {
+  const list = expectListValue(name, arg);
   if (list.elements.length === 0) {
     throw new EvalError(`${name}: expected non-empty list`, arg.position);
   }
@@ -1134,6 +1504,73 @@ function expectChar(name: string, arg: EvaluatedArg): Extract<SchemeValue, { typ
   }
 
   return arg.value;
+}
+
+function listValue(elements: SchemeValue[], tail?: SchemeValue): ListValue {
+  return tail === undefined ? { type: 'list', elements } : { type: 'list', elements, tail };
+}
+
+function isProperList(value: ListValue): boolean {
+  return value.tail === undefined;
+}
+
+function consValue(head: SchemeValue, tail: SchemeValue): ListValue {
+  if (tail.type === 'list') {
+    return listValue([head, ...tail.elements], tail.tail);
+  }
+
+  return listValue([head], tail);
+}
+
+function cdrValue(list: ListValue): SchemeValue {
+  if (list.elements.length > 1) {
+    return listValue(list.elements.slice(1), list.tail);
+  }
+
+  return list.tail ?? listValue([]);
+}
+
+function equalValues(left: SchemeValue, right: SchemeValue): boolean {
+  if (left === right) {
+    return true;
+  }
+
+  if (left.type !== right.type) {
+    return false;
+  }
+
+  switch (left.type) {
+    case 'number':
+    case 'boolean':
+    case 'string':
+    case 'char':
+      return left.value === (right as typeof left).value;
+    case 'symbol':
+      return left.name === (right as typeof left).name;
+    case 'list': {
+      const rightList = right as ListValue;
+      if (left.elements.length !== rightList.elements.length) {
+        return false;
+      }
+
+      for (let index = 0; index < left.elements.length; index += 1) {
+        if (!equalValues(left.elements[index], rightList.elements[index])) {
+          return false;
+        }
+      }
+
+      if (left.tail === undefined || rightList.tail === undefined) {
+        return left.tail === undefined && rightList.tail === undefined;
+      }
+
+      return equalValues(left.tail, rightList.tail);
+    }
+    case 'builtin':
+    case 'closure':
+      return left === right;
+    case 'void':
+      return true;
+  }
 }
 
 function isTruthy(value: SchemeValue): boolean {
@@ -1207,7 +1644,7 @@ function formatDisplayValue(value: SchemeValue): string {
     case 'char':
       return value.value;
     case 'list':
-      return `(${value.elements.map(formatDisplayValue).join(' ')})`;
+      return formatListValue(value, formatDisplayValue);
     default:
       return formatValue(value);
   }
@@ -1226,13 +1663,25 @@ function formatValue(value: SchemeValue): string {
     case 'symbol':
       return value.name;
     case 'list':
-      return `(${value.elements.map(formatValue).join(' ')})`;
+      return formatListValue(value, formatValue);
     case 'builtin':
     case 'closure':
       return '#<procedure>';
     case 'void':
       return '#<void>';
   }
+}
+
+function formatListValue(
+  value: ListValue,
+  formatter: (value: SchemeValue) => string,
+): string {
+  const elements = value.elements.map(formatter);
+  if (value.tail === undefined) {
+    return `(${elements.join(' ')})`;
+  }
+
+  return `(${elements.join(' ')} . ${formatter(value.tail)})`;
 }
 
 function formatChar(value: string): string {
