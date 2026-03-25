@@ -18,6 +18,7 @@ const (
 	tokString
 	tokBool
 	tokSymbol
+	tokChar
 	tokEOF
 )
 
@@ -135,6 +136,38 @@ func tokenize(input string) ([]token, error) {
 					col += 2
 					continue
 				}
+				if next == '\\' {
+					// character literal: #\x, #\space, #\newline, #\tab
+					i += 2
+					col += 2
+					if i >= len(input) {
+						return nil, fmt.Errorf("%d:%d: incomplete character literal", line, startCol)
+					}
+					// read the character name
+					nameStart := i
+					for i < len(input) && !isDelimiter(input[i]) {
+						i++
+						col++
+					}
+					name := input[nameStart:i]
+					var ch rune
+					switch strings.ToLower(name) {
+					case "space":
+						ch = ' '
+					case "newline":
+						ch = '\n'
+					case "tab":
+						ch = '\t'
+					default:
+						if len(name) == 1 {
+							ch = rune(name[0])
+						} else {
+							return nil, fmt.Errorf("%d:%d: unknown character name: %s", line, startCol, name)
+						}
+					}
+					tokens = append(tokens, token{tokChar, string(ch), line, startCol})
+					continue
+				}
 			}
 			// fall through to symbol
 		}
@@ -216,11 +249,18 @@ type ListExpr struct {
 	Col   int
 }
 
+type CharExpr struct {
+	Val  rune
+	Line int
+	Col  int
+}
+
 func (e *NumberExpr) pos() (int, int) { return e.Line, e.Col }
 func (e *StringExpr) pos() (int, int) { return e.Line, e.Col }
 func (e *BoolExpr) pos() (int, int)   { return e.Line, e.Col }
 func (e *SymbolExpr) pos() (int, int) { return e.Line, e.Col }
 func (e *ListExpr) pos() (int, int)   { return e.Line, e.Col }
+func (e *CharExpr) pos() (int, int)   { return e.Line, e.Col }
 
 type parser struct {
 	tokens []token
@@ -270,6 +310,9 @@ func (p *parser) parseExpr() (Expr, error) {
 	case tokBool:
 		p.next()
 		return &BoolExpr{Val: t.text == "#t", Line: t.line, Col: t.col}, nil
+	case tokChar:
+		p.next()
+		return &CharExpr{Val: rune(t.text[0]), Line: t.line, Col: t.col}, nil
 	case tokQuote:
 		p.next()
 		inner, err := p.parseExpr()

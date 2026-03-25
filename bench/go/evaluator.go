@@ -48,6 +48,8 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 		return &StringVal{Val: e.Val}, nil
 	case *BoolExpr:
 		return &BoolVal{Val: e.Val}, nil
+	case *CharExpr:
+		return &CharVal{Val: e.Val}, nil
 	case *SymbolExpr:
 		v, ok := env.get(e.Name)
 		if !ok {
@@ -222,6 +224,8 @@ func quoteExpr(expr Expr) (Value, error) {
 		return &StringVal{Val: e.Val}, nil
 	case *BoolExpr:
 		return &BoolVal{Val: e.Val}, nil
+	case *CharExpr:
+		return &CharVal{Val: e.Val}, nil
 	case *SymbolExpr:
 		return &SymbolVal{Val: e.Name}, nil
 	case *ListExpr:
@@ -702,6 +706,42 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 			return nil, &EvalError{Message: "string-ref: index out of range"}
 		}
 		return &CharVal{Val: rune(s.Val[idx.Val])}, nil
+	}})
+
+	env.set("string-copy", &BuiltinFunc{Name: "string-copy", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string-copy: need 1 argument"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-copy: not a string"}
+		}
+		return &StringVal{Val: s.Val}, nil
+	}})
+
+	env.set("string-set!", &BuiltinFunc{Name: "string-set!", Fn: func(args []Value) (Value, error) {
+		if len(args) != 3 {
+			return nil, &EvalError{Message: "string-set!: need 3 arguments"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-set!: not a string"}
+		}
+		idx, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-set!: index not a number"}
+		}
+		ch, ok := args[2].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-set!: not a character"}
+		}
+		if idx.Val < 0 || idx.Val >= int64(len(s.Val)) {
+			return nil, &EvalError{Message: "string-set!: index out of range"}
+		}
+		b := []byte(s.Val)
+		b[idx.Val] = byte(ch.Val)
+		s.Val = string(b)
+		return &VoidVal{}, nil
 	}})
 
 	env.set("char?", &BuiltinFunc{Name: "char?", Fn: func(args []Value) (Value, error) {
