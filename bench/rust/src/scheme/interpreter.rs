@@ -1,14 +1,17 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::EvalError;
 
 type Env = Rc<Environment>;
 type BuiltinFunc = fn(&[Value]) -> Result<Value, EvalError>;
 type ExprRef = Rc<Expr>;
+type MacroEnv = HashMap<String, SyntaxRules>;
+type RuntimeResult<T> = Result<T, RuntimeSignal>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Expr {
     Integer(i64),
     Boolean(bool),
@@ -41,6 +44,9 @@ enum Procedure {
         name: &'static str,
         func: BuiltinFunc,
     },
+    Continuation {
+        id: usize,
+    },
     Lambda {
         params: Vec<String>,
         body: Vec<ExprRef>,
@@ -61,6 +67,37 @@ struct Environment {
 struct StepBudget {
     max_steps: usize,
     remaining: Option<usize>,
+}
+
+#[derive(Clone)]
+struct SyntaxRules {
+    literals: HashSet<String>,
+    rules: Vec<SyntaxRule>,
+}
+
+#[derive(Clone)]
+struct SyntaxRule {
+    pattern: ExprRef,
+    template: ExprRef,
+}
+
+#[derive(Clone, Default)]
+struct MacroBindings {
+    singles: HashMap<String, ExprRef>,
+    repeats: HashMap<String, Vec<ExprRef>>,
+}
+
+enum RuntimeSignal {
+    Error(EvalError),
+    ContinuationJump { id: usize, value: Value },
+}
+
+static NEXT_CONTINUATION_ID: AtomicUsize = AtomicUsize::new(1);
+
+impl From<EvalError> for RuntimeSignal {
+    fn from(error: EvalError) -> Self {
+        Self::Error(error)
+    }
 }
 
 impl Environment {
@@ -101,10 +138,24 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
 fn eval_program(input: &str, mut budget: StepBudget) -> Result<String, EvalError> {
     let expressions = Parser::new(input).parse_program()?;
     let env = default_env();
+    let mut macros = MacroEnv::new();
     let mut last = Value::Void;
 
-    for expression in &expressions {
-        last = eval(expression.clone(), env.clone(), &mut budget)?;
+    for expression in expressions {
+        let Some(expanded) = expand_top_level(expression, &mut macros)? else {
+            last = Value::Void;
+            continue;
+        };
+
+        last = match eval(expanded, env.clone(), &mut budget) {
+            Ok(value) => value,
+            Err(RuntimeSignal::Error(error)) => return Err(error),
+            Err(RuntimeSignal::ContinuationJump { .. }) => {
+                return Err(EvalError::Runtime(
+                    "continuation invoked outside of an active call/cc".into(),
+                ))
+            }
+        };
     }
 
     Ok(render_result(last))
@@ -131,7 +182,10 @@ fn default_env() -> Env {
         ("length", builtin_length),
         ("append", builtin_append),
         ("reverse", builtin_reverse),
+        ("eqv?", builtin_eqv),
         ("string?", builtin_is_string),
+        ("string-append", builtin_string_append),
+        ("string-length", builtin_string_length),
         ("number?", builtin_is_number),
         ("boolean?", builtin_is_boolean),
         ("pair?", builtin_is_pair),
@@ -147,7 +201,514 @@ fn default_env() -> Env {
     env
 }
 
-fn eval(expression: ExprRef, env: Env, budget: &mut StepBudget) -> Result<Value, EvalError> {
+fn expand_top_level(expression: ExprRef, macros: &mut MacroEnv) -> Result<Option<ExprRef>, EvalError> {
+    if let Expr::List(items) = expression.as_ref() {
+        if list_head_symbol(items) == Some("define-syntax") {
+            let (name, rules) = parse_define_syntax(items)?;
+            macros.insert(name, rules);
+            return Ok(None);
+        }
+    }
+
+    expand_expr(expression, macros).map(Some)
+}
+
+fn parse_define_syntax(items: &[ExprRef]) -> Result<(String, SyntaxRules), EvalError> {
+    ensure_exact_args("define-syntax", items.len() - 1, 2)?;
+
+    let Expr::Symbol(name) = items[1].as_ref() else {
+        return Err(EvalError::Syntax(
+            "define-syntax: macro name must be a symbol".into(),
+        ));
+    };
+
+    Ok((name.clone(), parse_syntax_rules(items[2].as_ref())?))
+}
+
+fn parse_syntax_rules(expression: &Expr) -> Result<SyntaxRules, EvalError> {
+    let Expr::List(items) = expression else {
+        return Err(EvalError::Syntax(
+            "define-syntax: expected a syntax-rules form".into(),
+        ));
+    };
+
+    if list_head_symbol(items) != Some("syntax-rules") {
+        return Err(EvalError::Syntax(
+            "define-syntax: expected a syntax-rules form".into(),
+        ));
+    }
+
+    if items.len() < 3 {
+        return Err(EvalError::Syntax(
+            "syntax-rules: expected a literals list and at least one rule".into(),
+        ));
+    }
+
+    let Expr::List(literal_items) = items[1].as_ref() else {
+        return Err(EvalError::Syntax(
+            "syntax-rules: literals must be a list".into(),
+        ));
+    };
+
+    let mut literals = HashSet::with_capacity(literal_items.len());
+    for literal in literal_items {
+        let Expr::Symbol(symbol) = literal.as_ref() else {
+            return Err(EvalError::Syntax(
+                "syntax-rules: literals must be symbols".into(),
+            ));
+        };
+        literals.insert(symbol.clone());
+    }
+
+    let mut rules = Vec::with_capacity(items.len() - 2);
+    for rule in &items[2..] {
+        let Expr::List(parts) = rule.as_ref() else {
+            return Err(EvalError::Syntax(
+                "syntax-rules: each rule must be a list".into(),
+            ));
+        };
+
+        if parts.len() != 2 {
+            return Err(EvalError::Syntax(
+                "syntax-rules: each rule must contain a pattern and template".into(),
+            ));
+        }
+
+        rules.push(SyntaxRule {
+            pattern: parts[0].clone(),
+            template: parts[1].clone(),
+        });
+    }
+
+    Ok(SyntaxRules { literals, rules })
+}
+
+fn expand_expr(expression: ExprRef, macros: &MacroEnv) -> Result<ExprRef, EvalError> {
+    match expression.as_ref() {
+        Expr::Integer(_) | Expr::Boolean(_) | Expr::String(_) | Expr::Symbol(_) => Ok(expression),
+        Expr::List(items) if items.is_empty() => Ok(expression),
+        Expr::List(items) => {
+            if let Some(name) = list_head_symbol(items) {
+                if let Some(rules) = macros.get(name) {
+                    return expand_macro_call(&expression, rules, macros);
+                }
+
+                return match name {
+                    "quote" => Ok(expression),
+                    "define" => expand_define_expr(items, macros),
+                    "lambda" => expand_lambda_expr(items, macros),
+                    "let" => expand_let_expr(items, macros),
+                    "cond" => expand_cond_expr(items, macros),
+                    "case" => expand_case_expr(items, macros),
+                    _ => expand_list(items, macros),
+                };
+            }
+
+            expand_list(items, macros)
+        }
+    }
+}
+
+fn expand_macro_call(
+    expression: &ExprRef,
+    rules: &SyntaxRules,
+    macros: &MacroEnv,
+) -> Result<ExprRef, EvalError> {
+    for rule in &rules.rules {
+        let mut bindings = MacroBindings::default();
+        if match_pattern(
+            &rule.pattern,
+            expression,
+            &rules.literals,
+            &mut bindings,
+            false,
+        ) {
+            return expand_expr(expand_template(&rule.template, &bindings, None)?, macros);
+        }
+    }
+
+    Err(EvalError::Runtime(
+        "syntax-rules: no pattern matched macro invocation".into(),
+    ))
+}
+
+fn expand_define_expr(items: &[ExprRef], macros: &MacroEnv) -> Result<ExprRef, EvalError> {
+    if items.len() < 3 {
+        return Ok(make_list(items.to_vec()));
+    }
+
+    let mut expanded = vec![items[0].clone(), items[1].clone()];
+    expanded.extend(expand_all(&items[2..], macros)?);
+    Ok(make_list(expanded))
+}
+
+fn expand_lambda_expr(items: &[ExprRef], macros: &MacroEnv) -> Result<ExprRef, EvalError> {
+    if items.len() < 3 {
+        return Ok(make_list(items.to_vec()));
+    }
+
+    let mut expanded = vec![items[0].clone(), items[1].clone()];
+    expanded.extend(expand_all(&items[2..], macros)?);
+    Ok(make_list(expanded))
+}
+
+fn expand_let_expr(items: &[ExprRef], macros: &MacroEnv) -> Result<ExprRef, EvalError> {
+    if items.len() < 3 {
+        return Ok(make_list(items.to_vec()));
+    }
+
+    let mut expanded = vec![items[0].clone()];
+    match items[1].as_ref() {
+        Expr::Symbol(_) if items.len() >= 4 => {
+            expanded.push(items[1].clone());
+            expanded.push(expand_bindings(items[2].clone(), macros)?);
+            expanded.extend(expand_all(&items[3..], macros)?);
+        }
+        _ => {
+            expanded.push(expand_bindings(items[1].clone(), macros)?);
+            expanded.extend(expand_all(&items[2..], macros)?);
+        }
+    }
+
+    Ok(make_list(expanded))
+}
+
+fn expand_cond_expr(items: &[ExprRef], macros: &MacroEnv) -> Result<ExprRef, EvalError> {
+    let mut expanded = Vec::with_capacity(items.len());
+    expanded.push(items[0].clone());
+
+    for clause in &items[1..] {
+        let Expr::List(clause_items) = clause.as_ref() else {
+            expanded.push(clause.clone());
+            continue;
+        };
+
+        if clause_items.is_empty() {
+            expanded.push(clause.clone());
+            continue;
+        }
+
+        let mut expanded_clause = Vec::with_capacity(clause_items.len());
+        if list_head_symbol(clause_items) == Some("else") {
+            expanded_clause.push(clause_items[0].clone());
+            expanded_clause.extend(expand_all(&clause_items[1..], macros)?);
+        } else {
+            expanded_clause.extend(expand_all(clause_items, macros)?);
+        }
+        expanded.push(make_list(expanded_clause));
+    }
+
+    Ok(make_list(expanded))
+}
+
+fn expand_case_expr(items: &[ExprRef], macros: &MacroEnv) -> Result<ExprRef, EvalError> {
+    if items.len() < 2 {
+        return Ok(make_list(items.to_vec()));
+    }
+
+    let mut expanded = vec![items[0].clone(), expand_expr(items[1].clone(), macros)?];
+    for clause in &items[2..] {
+        let Expr::List(clause_items) = clause.as_ref() else {
+            expanded.push(clause.clone());
+            continue;
+        };
+
+        if clause_items.is_empty() {
+            expanded.push(clause.clone());
+            continue;
+        }
+
+        let mut expanded_clause = Vec::with_capacity(clause_items.len());
+        expanded_clause.push(clause_items[0].clone());
+        expanded_clause.extend(expand_all(&clause_items[1..], macros)?);
+        expanded.push(make_list(expanded_clause));
+    }
+
+    Ok(make_list(expanded))
+}
+
+fn expand_list(items: &[ExprRef], macros: &MacroEnv) -> Result<ExprRef, EvalError> {
+    Ok(make_list(expand_all(items, macros)?))
+}
+
+fn expand_all(items: &[ExprRef], macros: &MacroEnv) -> Result<Vec<ExprRef>, EvalError> {
+    items
+        .iter()
+        .cloned()
+        .map(|item| expand_expr(item, macros))
+        .collect()
+}
+
+fn expand_bindings(bindings_expr: ExprRef, macros: &MacroEnv) -> Result<ExprRef, EvalError> {
+    let Expr::List(bindings) = bindings_expr.as_ref() else {
+        return Ok(bindings_expr);
+    };
+
+    let mut expanded = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let Expr::List(parts) = binding.as_ref() else {
+            return Ok(bindings_expr);
+        };
+        if parts.len() != 2 {
+            return Ok(bindings_expr);
+        }
+
+        expanded.push(make_list(vec![
+            parts[0].clone(),
+            expand_expr(parts[1].clone(), macros)?,
+        ]));
+    }
+
+    Ok(make_list(expanded))
+}
+
+fn match_pattern(
+    pattern: &ExprRef,
+    input: &ExprRef,
+    literals: &HashSet<String>,
+    bindings: &mut MacroBindings,
+    repeated: bool,
+) -> bool {
+    match (pattern.as_ref(), input.as_ref()) {
+        (Expr::Integer(expected), Expr::Integer(actual)) => expected == actual,
+        (Expr::Boolean(expected), Expr::Boolean(actual)) => expected == actual,
+        (Expr::String(expected), Expr::String(actual)) => expected == actual,
+        (Expr::Symbol(symbol), _) => match symbol.as_str() {
+            "_" => true,
+            "..." => false,
+            _ if literals.contains(symbol) => matches!(input.as_ref(), Expr::Symbol(name) if name == symbol),
+            _ if repeated => bind_repeated(symbol, input, bindings),
+            _ => bind_single(symbol, input, bindings),
+        },
+        (Expr::List(pattern_items), Expr::List(input_items)) => {
+            match_pattern_items(pattern_items, input_items, literals, bindings, repeated)
+        }
+        _ => false,
+    }
+}
+
+fn match_pattern_items(
+    patterns: &[ExprRef],
+    inputs: &[ExprRef],
+    literals: &HashSet<String>,
+    bindings: &mut MacroBindings,
+    repeated: bool,
+) -> bool {
+    if patterns.is_empty() {
+        return inputs.is_empty();
+    }
+
+    if patterns.len() >= 2 && is_ellipsis(&patterns[1]) {
+        for count in 0..=inputs.len() {
+            let mut candidate = bindings.clone();
+            seed_repeated_bindings(&patterns[0], literals, &mut candidate);
+            let mut matched = true;
+
+            for input in &inputs[..count] {
+                if !match_pattern(&patterns[0], input, literals, &mut candidate, true) {
+                    matched = false;
+                    break;
+                }
+            }
+
+            if matched
+                && match_pattern_items(
+                    &patterns[2..],
+                    &inputs[count..],
+                    literals,
+                    &mut candidate,
+                    repeated,
+                )
+            {
+                *bindings = candidate;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    let Some((input, rest_inputs)) = inputs.split_first() else {
+        return false;
+    };
+
+    let mut candidate = bindings.clone();
+    match_pattern(&patterns[0], input, literals, &mut candidate, repeated)
+        && match_pattern_items(&patterns[1..], rest_inputs, literals, &mut candidate, repeated)
+        && {
+            *bindings = candidate;
+            true
+        }
+}
+
+fn bind_single(name: &str, input: &ExprRef, bindings: &mut MacroBindings) -> bool {
+    if bindings.repeats.contains_key(name) {
+        return false;
+    }
+
+    match bindings.singles.get(name) {
+        Some(existing) => existing == input,
+        None => {
+            bindings.singles.insert(name.to_string(), input.clone());
+            true
+        }
+    }
+}
+
+fn bind_repeated(name: &str, input: &ExprRef, bindings: &mut MacroBindings) -> bool {
+    if bindings.singles.contains_key(name) {
+        return false;
+    }
+
+    bindings
+        .repeats
+        .entry(name.to_string())
+        .or_default()
+        .push(input.clone());
+    true
+}
+
+fn seed_repeated_bindings(
+    pattern: &ExprRef,
+    literals: &HashSet<String>,
+    bindings: &mut MacroBindings,
+) {
+    match pattern.as_ref() {
+        Expr::Symbol(symbol) => match symbol.as_str() {
+            "_" | "..." => {}
+            _ if literals.contains(symbol) => {}
+            _ => {
+                bindings.repeats.entry(symbol.clone()).or_default();
+            }
+        },
+        Expr::List(items) => {
+            for item in items {
+                seed_repeated_bindings(item, literals, bindings);
+            }
+        }
+        Expr::Integer(_) | Expr::Boolean(_) | Expr::String(_) => {}
+    }
+}
+
+fn expand_template(
+    template: &ExprRef,
+    bindings: &MacroBindings,
+    repeat_index: Option<usize>,
+) -> Result<ExprRef, EvalError> {
+    match template.as_ref() {
+        Expr::Integer(_) | Expr::Boolean(_) | Expr::String(_) => Ok(template.clone()),
+        Expr::Symbol(symbol) => expand_template_symbol(symbol, bindings, repeat_index),
+        Expr::List(items) => {
+            let mut expanded = Vec::with_capacity(items.len());
+            let mut index = 0;
+
+            while index < items.len() {
+                if index + 1 < items.len() && is_ellipsis(&items[index + 1]) {
+                    let repeat_len = template_repeat_len(&items[index], bindings)?;
+                    for item_index in 0..repeat_len {
+                        expanded.push(expand_template(&items[index], bindings, Some(item_index))?);
+                    }
+                    index += 2;
+                    continue;
+                }
+
+                expanded.push(expand_template(&items[index], bindings, repeat_index)?);
+                index += 1;
+            }
+
+            Ok(make_list(expanded))
+        }
+    }
+}
+
+fn expand_template_symbol(
+    symbol: &str,
+    bindings: &MacroBindings,
+    repeat_index: Option<usize>,
+) -> Result<ExprRef, EvalError> {
+    if symbol == "..." {
+        return Err(EvalError::Syntax(
+            "syntax-rules: unexpected ellipsis in template".into(),
+        ));
+    }
+
+    if let Some(index) = repeat_index {
+        if let Some(values) = bindings.repeats.get(symbol) {
+            return values.get(index).cloned().ok_or_else(|| {
+                EvalError::Syntax(format!(
+                    "syntax-rules: repeated variable '{symbol}' out of bounds"
+                ))
+            });
+        }
+    }
+
+    if let Some(value) = bindings.singles.get(symbol) {
+        return Ok(value.clone());
+    }
+
+    if let Some(values) = bindings.repeats.get(symbol) {
+        return match values.as_slice() {
+            [value] => Ok(value.clone()),
+            _ => Err(EvalError::Syntax(format!(
+                "syntax-rules: repeated variable '{symbol}' used without ellipsis"
+            ))),
+        };
+    }
+
+    Ok(Rc::new(Expr::Symbol(symbol.to_string())))
+}
+
+fn template_repeat_len(template: &ExprRef, bindings: &MacroBindings) -> Result<usize, EvalError> {
+    let mut lengths = Vec::new();
+    collect_repeat_lengths(template, bindings, &mut lengths);
+
+    let Some(first) = lengths.first().copied() else {
+        return Err(EvalError::Syntax(
+            "syntax-rules: ellipsis requires a repeated pattern variable".into(),
+        ));
+    };
+
+    if lengths.iter().any(|length| *length != first) {
+        return Err(EvalError::Syntax(
+            "syntax-rules: repeated template variables must have matching lengths".into(),
+        ));
+    }
+
+    Ok(first)
+}
+
+fn collect_repeat_lengths(template: &ExprRef, bindings: &MacroBindings, lengths: &mut Vec<usize>) {
+    match template.as_ref() {
+        Expr::Symbol(symbol) => {
+            if let Some(values) = bindings.repeats.get(symbol) {
+                lengths.push(values.len());
+            }
+        }
+        Expr::List(items) => {
+            for item in items {
+                collect_repeat_lengths(item, bindings, lengths);
+            }
+        }
+        Expr::Integer(_) | Expr::Boolean(_) | Expr::String(_) => {}
+    }
+}
+
+fn list_head_symbol(items: &[ExprRef]) -> Option<&str> {
+    let Expr::Symbol(symbol) = items.first()?.as_ref() else {
+        return None;
+    };
+    Some(symbol)
+}
+
+fn is_ellipsis(expression: &ExprRef) -> bool {
+    matches!(expression.as_ref(), Expr::Symbol(symbol) if symbol == "...")
+}
+
+fn make_list(items: Vec<ExprRef>) -> ExprRef {
+    Rc::new(Expr::List(items))
+}
+
+fn eval(expression: ExprRef, env: Env, budget: &mut StepBudget) -> RuntimeResult<Value> {
     let mut current_expression = expression;
     let mut current_env = env;
 
@@ -159,10 +720,10 @@ fn eval(expression: ExprRef, env: Env, budget: &mut StepBudget) -> Result<Value,
             Expr::String(value) => return Ok(Value::String(value.clone())),
             Expr::Symbol(name) => {
                 return Environment::get(&current_env, name)
-                    .ok_or_else(|| EvalError::UnboundVariable(name.clone()))
+                    .ok_or_else(|| RuntimeSignal::Error(EvalError::UnboundVariable(name.clone())))
             }
             Expr::List(items) if items.is_empty() => {
-                return Err(EvalError::Runtime("cannot evaluate an empty list".into()))
+                return Err(EvalError::Runtime("cannot evaluate an empty list".into()).into())
             }
             Expr::List(items) => match items.first().map(|item| item.as_ref()) {
                 Some(Expr::Symbol(symbol)) if symbol == "quote" => {
@@ -176,6 +737,9 @@ fn eval(expression: ExprRef, env: Env, budget: &mut StepBudget) -> Result<Value,
                 }
                 Some(Expr::Symbol(symbol)) if symbol == "lambda" => {
                     TailOutcome::Value(eval_lambda(items, current_env.clone())?)
+                }
+                Some(Expr::Symbol(symbol)) if symbol == "call/cc" => {
+                    eval_call_cc(items, current_env.clone(), budget)?
                 }
                 Some(Expr::Symbol(symbol)) if symbol == "and" => {
                     eval_and(&items[1..], current_env.clone(), budget)?
@@ -191,6 +755,9 @@ fn eval(expression: ExprRef, env: Env, budget: &mut StepBudget) -> Result<Value,
                 }
                 Some(Expr::Symbol(symbol)) if symbol == "cond" => {
                     eval_cond(&items[1..], current_env.clone(), budget)?
+                }
+                Some(Expr::Symbol(symbol)) if symbol == "case" => {
+                    eval_case(items, current_env.clone(), budget)?
                 }
                 _ => eval_application(items, current_env.clone(), budget)?,
             },
@@ -211,7 +778,7 @@ fn eval_quote(items: &[ExprRef]) -> Result<Value, EvalError> {
     datum_to_value(items[1].as_ref())
 }
 
-fn eval_if(items: &[ExprRef], env: Env, budget: &mut StepBudget) -> Result<TailOutcome, EvalError> {
+fn eval_if(items: &[ExprRef], env: Env, budget: &mut StepBudget) -> RuntimeResult<TailOutcome> {
     ensure_exact_args("if", items.len() - 1, 3)?;
     let condition = eval(items[1].clone(), env.clone(), budget)?;
     if condition.is_truthy() {
@@ -221,13 +788,14 @@ fn eval_if(items: &[ExprRef], env: Env, budget: &mut StepBudget) -> Result<TailO
     }
 }
 
-fn eval_define(items: &[ExprRef], env: Env, budget: &mut StepBudget) -> Result<Value, EvalError> {
+fn eval_define(items: &[ExprRef], env: Env, budget: &mut StepBudget) -> RuntimeResult<Value> {
     if items.len() < 3 {
         return Err(EvalError::WrongArgCount {
             name: "define".into(),
             expected: "at least 2".into(),
             got: items.len().saturating_sub(1),
-        });
+        }
+        .into());
     }
 
     match items[1].as_ref() {
@@ -241,7 +809,8 @@ fn eval_define(items: &[ExprRef], env: Env, budget: &mut StepBudget) -> Result<V
             let Expr::Symbol(name) = signature[0].as_ref() else {
                 return Err(EvalError::Syntax(
                     "define: function name must be a symbol".into(),
-                ));
+                )
+                .into());
             };
 
             let params = parse_params(&signature[1..], "define")?;
@@ -255,9 +824,9 @@ fn eval_define(items: &[ExprRef], env: Env, budget: &mut StepBudget) -> Result<V
             Environment::define(&env, name.clone(), procedure);
             Ok(Value::Void)
         }
-        _ => Err(EvalError::Syntax(
-            "define: expected a symbol or function signature".into(),
-        )),
+        _ => Err(
+            EvalError::Syntax("define: expected a symbol or function signature".into()).into(),
+        ),
     }
 }
 
@@ -284,11 +853,29 @@ fn eval_lambda(items: &[ExprRef], env: Env) -> Result<Value, EvalError> {
     })))
 }
 
+fn eval_call_cc(items: &[ExprRef], env: Env, budget: &mut StepBudget) -> RuntimeResult<TailOutcome> {
+    ensure_exact_args("call/cc", items.len() - 1, 1)?;
+
+    let procedure = eval(items[1].clone(), env, budget)?;
+    let continuation_id = next_continuation_id();
+    let continuation = Value::Procedure(Rc::new(Procedure::Continuation {
+        id: continuation_id,
+    }));
+
+    match apply_and_resolve(procedure, vec![continuation], budget) {
+        Ok(value) => Ok(TailOutcome::Value(value)),
+        Err(RuntimeSignal::ContinuationJump { id, value }) if id == continuation_id => {
+            Ok(TailOutcome::Value(value))
+        }
+        Err(other) => Err(other),
+    }
+}
+
 fn eval_and(
     items: &[ExprRef],
     env: Env,
     budget: &mut StepBudget,
-) -> Result<TailOutcome, EvalError> {
+) -> RuntimeResult<TailOutcome> {
     if items.is_empty() {
         return Ok(TailOutcome::Value(Value::Boolean(true)));
     }
@@ -303,7 +890,7 @@ fn eval_and(
     Ok(TailOutcome::Expr(items.last().cloned().unwrap(), env))
 }
 
-fn eval_or(items: &[ExprRef], env: Env, budget: &mut StepBudget) -> Result<TailOutcome, EvalError> {
+fn eval_or(items: &[ExprRef], env: Env, budget: &mut StepBudget) -> RuntimeResult<TailOutcome> {
     if items.is_empty() {
         return Ok(TailOutcome::Value(Value::Boolean(false)));
     }
@@ -322,13 +909,14 @@ fn eval_let(
     items: &[ExprRef],
     env: Env,
     budget: &mut StepBudget,
-) -> Result<TailOutcome, EvalError> {
+) -> RuntimeResult<TailOutcome> {
     if items.len() < 3 {
         return Err(EvalError::WrongArgCount {
             name: "let".into(),
             expected: "at least 2".into(),
             got: items.len().saturating_sub(1),
-        });
+        }
+        .into());
     }
 
     match items[1].as_ref() {
@@ -343,7 +931,7 @@ fn eval_named_let(
     body: &[ExprRef],
     env: Env,
     budget: &mut StepBudget,
-) -> Result<TailOutcome, EvalError> {
+) -> RuntimeResult<TailOutcome> {
     let bindings = parse_bindings(bindings_expr, "let")?;
     let mut params = Vec::with_capacity(bindings.len());
     let mut args = Vec::with_capacity(bindings.len());
@@ -368,7 +956,7 @@ fn eval_plain_let(
     body: &[ExprRef],
     env: Env,
     budget: &mut StepBudget,
-) -> Result<TailOutcome, EvalError> {
+) -> RuntimeResult<TailOutcome> {
     let bindings = parse_bindings(bindings_expr, "let")?;
     let mut values = Vec::with_capacity(bindings.len());
 
@@ -388,14 +976,14 @@ fn eval_cond(
     clauses: &[ExprRef],
     env: Env,
     budget: &mut StepBudget,
-) -> Result<TailOutcome, EvalError> {
+) -> RuntimeResult<TailOutcome> {
     for clause in clauses {
         let Expr::List(items) = clause.as_ref() else {
-            return Err(EvalError::Syntax("cond: each clause must be a list".into()));
+            return Err(EvalError::Syntax("cond: each clause must be a list".into()).into());
         };
 
         if items.is_empty() {
-            return Err(EvalError::Syntax("cond: empty clause".into()));
+            return Err(EvalError::Syntax("cond: empty clause".into()).into());
         }
 
         if matches!(items.first().map(|item| item.as_ref()), Some(Expr::Symbol(symbol)) if symbol == "else")
@@ -420,11 +1008,62 @@ fn eval_cond(
     Ok(TailOutcome::Value(Value::Void))
 }
 
+fn eval_case(items: &[ExprRef], env: Env, budget: &mut StepBudget) -> RuntimeResult<TailOutcome> {
+    if items.len() < 3 {
+        return Err(EvalError::WrongArgCount {
+            name: "case".into(),
+            expected: "at least 2".into(),
+            got: items.len().saturating_sub(1),
+        }
+        .into());
+    }
+
+    let key = eval(items[1].clone(), env.clone(), budget)?;
+    for clause in &items[2..] {
+        let Expr::List(clause_items) = clause.as_ref() else {
+            return Err(EvalError::Syntax("case: each clause must be a list".into()).into());
+        };
+
+        if clause_items.is_empty() {
+            return Err(EvalError::Syntax("case: empty clause".into()).into());
+        }
+
+        if list_head_symbol(clause_items) == Some("else") {
+            return eval_sequence_tail(&clause_items[1..], env.clone(), budget);
+        }
+
+        let Expr::List(data) = clause_items[0].as_ref() else {
+            return Err(EvalError::Syntax(
+                "case: clause datums must be a list or else".into(),
+            )
+            .into());
+        };
+
+        let mut matched = false;
+        for datum in data {
+            if datum_matches_key(datum, &key)? {
+                matched = true;
+                break;
+            }
+        }
+
+        if matched {
+            return if clause_items.len() == 1 {
+                Ok(TailOutcome::Value(Value::Void))
+            } else {
+                eval_sequence_tail(&clause_items[1..], env.clone(), budget)
+            };
+        }
+    }
+
+    Ok(TailOutcome::Value(Value::Void))
+}
+
 fn eval_sequence_tail(
     expressions: &[ExprRef],
     env: Env,
     budget: &mut StepBudget,
-) -> Result<TailOutcome, EvalError> {
+) -> RuntimeResult<TailOutcome> {
     if expressions.is_empty() {
         return Ok(TailOutcome::Value(Value::Void));
     }
@@ -440,7 +1079,7 @@ fn eval_application(
     items: &[ExprRef],
     env: Env,
     budget: &mut StepBudget,
-) -> Result<TailOutcome, EvalError> {
+) -> RuntimeResult<TailOutcome> {
     let operator = eval(items[0].clone(), env.clone(), budget)?;
     let mut args = Vec::with_capacity(items.len().saturating_sub(1));
 
@@ -455,13 +1094,20 @@ fn tail_apply(
     procedure: Value,
     args: Vec<Value>,
     budget: &mut StepBudget,
-) -> Result<TailOutcome, EvalError> {
+) -> RuntimeResult<TailOutcome> {
     let Value::Procedure(procedure) = procedure else {
-        return Err(EvalError::NotAProcedure(procedure.render()));
+        return Err(EvalError::NotAProcedure(procedure.render()).into());
     };
 
     match procedure.as_ref() {
         Procedure::Builtin { func, .. } => Ok(TailOutcome::Value(func(&args)?)),
+        Procedure::Continuation { id } => {
+            ensure_exact_args("continuation", args.len(), 1)?;
+            Err(RuntimeSignal::ContinuationJump {
+                id: *id,
+                value: args.into_iter().next().unwrap(),
+            })
+        }
         Procedure::Lambda { params, body, env } => {
             ensure_exact_args("lambda", args.len(), params.len())?;
             let call_env = Environment::new(Some(env.clone()));
@@ -472,6 +1118,17 @@ fn tail_apply(
 
             eval_sequence_tail(body, call_env, budget)
         }
+    }
+}
+
+fn apply_and_resolve(
+    procedure: Value,
+    args: Vec<Value>,
+    budget: &mut StepBudget,
+) -> RuntimeResult<Value> {
+    match tail_apply(procedure, args, budget)? {
+        TailOutcome::Value(value) => Ok(value),
+        TailOutcome::Expr(expression, env) => eval(expression, env, budget),
     }
 }
 
@@ -670,9 +1327,34 @@ fn builtin_reverse(args: &[Value]) -> Result<Value, EvalError> {
     Ok(list_from_vec(values))
 }
 
+fn builtin_eqv(args: &[Value]) -> Result<Value, EvalError> {
+    ensure_exact_args("eqv?", args.len(), 2)?;
+    Ok(Value::Boolean(values_eqv(&args[0], &args[1])))
+}
+
 fn builtin_is_string(args: &[Value]) -> Result<Value, EvalError> {
     ensure_exact_args("string?", args.len(), 1)?;
     Ok(Value::Boolean(matches!(args[0], Value::String(_))))
+}
+
+fn builtin_string_append(args: &[Value]) -> Result<Value, EvalError> {
+    let capacity = args.iter().try_fold(0usize, |total, arg| {
+        Ok::<usize, EvalError>(total + expect_string("string-append", arg)?.len())
+    })?;
+    let mut result = String::with_capacity(capacity);
+
+    for arg in args {
+        result.push_str(expect_string("string-append", arg)?);
+    }
+
+    Ok(Value::String(result))
+}
+
+fn builtin_string_length(args: &[Value]) -> Result<Value, EvalError> {
+    ensure_exact_args("string-length", args.len(), 1)?;
+    Ok(Value::Integer(
+        expect_string("string-length", &args[0])?.chars().count() as i64,
+    ))
 }
 
 fn builtin_is_number(args: &[Value]) -> Result<Value, EvalError> {
@@ -725,6 +1407,35 @@ fn expect_integer(name: &str, value: &Value) -> Result<i64, EvalError> {
         Value::Integer(integer) => Ok(*integer),
         _ => Err(type_mismatch(name, "number", value)),
     }
+}
+
+fn expect_string<'a>(name: &str, value: &'a Value) -> Result<&'a str, EvalError> {
+    match value {
+        Value::String(string) => Ok(string),
+        _ => Err(type_mismatch(name, "string", value)),
+    }
+}
+
+fn datum_matches_key(datum: &ExprRef, key: &Value) -> Result<bool, EvalError> {
+    Ok(values_eqv(&datum_to_value(datum.as_ref())?, key))
+}
+
+fn values_eqv(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+        (Value::String(a), Value::String(b)) => a == b,
+        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+        (Value::Nil, Value::Nil) => true,
+        (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(a, b),
+        (Value::Procedure(a), Value::Procedure(b)) => Rc::ptr_eq(a, b),
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    }
+}
+
+fn next_continuation_id() -> usize {
+    NEXT_CONTINUATION_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 fn list_to_vec(name: &str, value: &Value) -> Result<Vec<Value>, EvalError> {
@@ -808,6 +1519,7 @@ impl Value {
             Value::Pair(_) => render_pair(self),
             Value::Procedure(procedure) => match procedure.as_ref() {
                 Procedure::Builtin { name, .. } => format!("#<procedure:{name}>"),
+                Procedure::Continuation { .. } => "#<procedure:continuation>".into(),
                 Procedure::Lambda { .. } => "#<procedure>".into(),
             },
             Value::Void => String::new(),
