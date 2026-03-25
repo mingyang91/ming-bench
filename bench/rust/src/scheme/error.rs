@@ -24,6 +24,8 @@ pub enum EvalError {
     NotAProcedure(String),
     #[error("division by zero")]
     DivisionByZero,
+    #[error("step limit exceeded after {max_steps} step(s)")]
+    StepLimitExceeded { max_steps: usize },
     #[error("{0}")]
     Runtime(String),
 }

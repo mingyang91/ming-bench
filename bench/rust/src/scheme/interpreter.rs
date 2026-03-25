@@ -58,6 +58,11 @@ struct Environment {
     bindings: RefCell<HashMap<String, Value>>,
 }
 
+struct StepBudget {
+    max_steps: usize,
+    remaining: Option<usize>,
+}
+
 impl Environment {
     fn new(parent: Option<Env>) -> Env {
         Rc::new(Self {
@@ -82,22 +87,27 @@ impl Environment {
 }
 
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
+    eval_program(input, StepBudget::unlimited())
+}
+
+pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
+    eval_program(input, StepBudget::limited(max_steps))
+}
+
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    Ok((eval_program(input, StepBudget::unlimited())?, String::new()))
+}
+
+fn eval_program(input: &str, mut budget: StepBudget) -> Result<String, EvalError> {
     let expressions = Parser::new(input).parse_program()?;
     let env = default_env();
     let mut last = Value::Void;
 
     for expression in &expressions {
-        last = eval(expression.clone(), env.clone())?;
+        last = eval(expression.clone(), env.clone(), &mut budget)?;
     }
 
-    Ok(match last {
-        Value::Void => String::new(),
-        value => value.render(),
-    })
-}
-
-pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    Ok((eval_str(input)?, String::new()))
+    Ok(render_result(last))
 }
 
 fn default_env() -> Env {
@@ -137,11 +147,12 @@ fn default_env() -> Env {
     env
 }
 
-fn eval(expression: ExprRef, env: Env) -> Result<Value, EvalError> {
+fn eval(expression: ExprRef, env: Env, budget: &mut StepBudget) -> Result<Value, EvalError> {
     let mut current_expression = expression;
     let mut current_env = env;
 
     loop {
+        budget.consume()?;
         let next = match current_expression.as_ref() {
             Expr::Integer(value) => return Ok(Value::Integer(*value)),
             Expr::Boolean(value) => return Ok(Value::Boolean(*value)),
@@ -158,30 +169,30 @@ fn eval(expression: ExprRef, env: Env) -> Result<Value, EvalError> {
                     TailOutcome::Value(eval_quote(items)?)
                 }
                 Some(Expr::Symbol(symbol)) if symbol == "if" => {
-                    eval_if(items, current_env.clone())?
+                    eval_if(items, current_env.clone(), budget)?
                 }
                 Some(Expr::Symbol(symbol)) if symbol == "define" => {
-                    TailOutcome::Value(eval_define(items, current_env.clone())?)
+                    TailOutcome::Value(eval_define(items, current_env.clone(), budget)?)
                 }
                 Some(Expr::Symbol(symbol)) if symbol == "lambda" => {
                     TailOutcome::Value(eval_lambda(items, current_env.clone())?)
                 }
                 Some(Expr::Symbol(symbol)) if symbol == "and" => {
-                    eval_and(&items[1..], current_env.clone())?
+                    eval_and(&items[1..], current_env.clone(), budget)?
                 }
                 Some(Expr::Symbol(symbol)) if symbol == "or" => {
-                    eval_or(&items[1..], current_env.clone())?
+                    eval_or(&items[1..], current_env.clone(), budget)?
                 }
                 Some(Expr::Symbol(symbol)) if symbol == "let" => {
-                    eval_let(items, current_env.clone())?
+                    eval_let(items, current_env.clone(), budget)?
                 }
                 Some(Expr::Symbol(symbol)) if symbol == "begin" => {
-                    eval_sequence_tail(&items[1..], current_env.clone())?
+                    eval_sequence_tail(&items[1..], current_env.clone(), budget)?
                 }
                 Some(Expr::Symbol(symbol)) if symbol == "cond" => {
-                    eval_cond(&items[1..], current_env.clone())?
+                    eval_cond(&items[1..], current_env.clone(), budget)?
                 }
-                _ => eval_application(items, current_env.clone())?,
+                _ => eval_application(items, current_env.clone(), budget)?,
             },
         };
 
@@ -200,9 +211,9 @@ fn eval_quote(items: &[ExprRef]) -> Result<Value, EvalError> {
     datum_to_value(items[1].as_ref())
 }
 
-fn eval_if(items: &[ExprRef], env: Env) -> Result<TailOutcome, EvalError> {
+fn eval_if(items: &[ExprRef], env: Env, budget: &mut StepBudget) -> Result<TailOutcome, EvalError> {
     ensure_exact_args("if", items.len() - 1, 3)?;
-    let condition = eval(items[1].clone(), env.clone())?;
+    let condition = eval(items[1].clone(), env.clone(), budget)?;
     if condition.is_truthy() {
         Ok(TailOutcome::Expr(items[2].clone(), env))
     } else {
@@ -210,7 +221,7 @@ fn eval_if(items: &[ExprRef], env: Env) -> Result<TailOutcome, EvalError> {
     }
 }
 
-fn eval_define(items: &[ExprRef], env: Env) -> Result<Value, EvalError> {
+fn eval_define(items: &[ExprRef], env: Env, budget: &mut StepBudget) -> Result<Value, EvalError> {
     if items.len() < 3 {
         return Err(EvalError::WrongArgCount {
             name: "define".into(),
@@ -222,7 +233,7 @@ fn eval_define(items: &[ExprRef], env: Env) -> Result<Value, EvalError> {
     match items[1].as_ref() {
         Expr::Symbol(name) => {
             ensure_exact_args("define", items.len() - 1, 2)?;
-            let value = eval(items[2].clone(), env.clone())?;
+            let value = eval(items[2].clone(), env.clone(), budget)?;
             Environment::define(&env, name.clone(), value);
             Ok(Value::Void)
         }
@@ -273,13 +284,17 @@ fn eval_lambda(items: &[ExprRef], env: Env) -> Result<Value, EvalError> {
     })))
 }
 
-fn eval_and(items: &[ExprRef], env: Env) -> Result<TailOutcome, EvalError> {
+fn eval_and(
+    items: &[ExprRef],
+    env: Env,
+    budget: &mut StepBudget,
+) -> Result<TailOutcome, EvalError> {
     if items.is_empty() {
         return Ok(TailOutcome::Value(Value::Boolean(true)));
     }
 
     for item in &items[..items.len() - 1] {
-        let value = eval(item.clone(), env.clone())?;
+        let value = eval(item.clone(), env.clone(), budget)?;
         if !value.is_truthy() {
             return Ok(TailOutcome::Value(value));
         }
@@ -288,13 +303,13 @@ fn eval_and(items: &[ExprRef], env: Env) -> Result<TailOutcome, EvalError> {
     Ok(TailOutcome::Expr(items.last().cloned().unwrap(), env))
 }
 
-fn eval_or(items: &[ExprRef], env: Env) -> Result<TailOutcome, EvalError> {
+fn eval_or(items: &[ExprRef], env: Env, budget: &mut StepBudget) -> Result<TailOutcome, EvalError> {
     if items.is_empty() {
         return Ok(TailOutcome::Value(Value::Boolean(false)));
     }
 
     for item in &items[..items.len() - 1] {
-        let value = eval(item.clone(), env.clone())?;
+        let value = eval(item.clone(), env.clone(), budget)?;
         if value.is_truthy() {
             return Ok(TailOutcome::Value(value));
         }
@@ -303,7 +318,11 @@ fn eval_or(items: &[ExprRef], env: Env) -> Result<TailOutcome, EvalError> {
     Ok(TailOutcome::Expr(items.last().cloned().unwrap(), env))
 }
 
-fn eval_let(items: &[ExprRef], env: Env) -> Result<TailOutcome, EvalError> {
+fn eval_let(
+    items: &[ExprRef],
+    env: Env,
+    budget: &mut StepBudget,
+) -> Result<TailOutcome, EvalError> {
     if items.len() < 3 {
         return Err(EvalError::WrongArgCount {
             name: "let".into(),
@@ -313,8 +332,8 @@ fn eval_let(items: &[ExprRef], env: Env) -> Result<TailOutcome, EvalError> {
     }
 
     match items[1].as_ref() {
-        Expr::Symbol(name) => eval_named_let(name, &items[2], &items[3..], env),
-        bindings => eval_plain_let(bindings, &items[2..], env),
+        Expr::Symbol(name) => eval_named_let(name, &items[2], &items[3..], env, budget),
+        bindings => eval_plain_let(bindings, &items[2..], env, budget),
     }
 }
 
@@ -323,6 +342,7 @@ fn eval_named_let(
     bindings_expr: &ExprRef,
     body: &[ExprRef],
     env: Env,
+    budget: &mut StepBudget,
 ) -> Result<TailOutcome, EvalError> {
     let bindings = parse_bindings(bindings_expr, "let")?;
     let mut params = Vec::with_capacity(bindings.len());
@@ -330,7 +350,7 @@ fn eval_named_let(
 
     for (param, expression) in bindings {
         params.push(param);
-        args.push(eval(expression, env.clone())?);
+        args.push(eval(expression, env.clone(), budget)?);
     }
 
     let loop_env = Environment::new(Some(env));
@@ -340,19 +360,20 @@ fn eval_named_let(
         env: loop_env.clone(),
     }));
     Environment::define(&loop_env, name.to_string(), procedure.clone());
-    tail_apply(procedure, args)
+    tail_apply(procedure, args, budget)
 }
 
 fn eval_plain_let(
     bindings_expr: &Expr,
     body: &[ExprRef],
     env: Env,
+    budget: &mut StepBudget,
 ) -> Result<TailOutcome, EvalError> {
     let bindings = parse_bindings(bindings_expr, "let")?;
     let mut values = Vec::with_capacity(bindings.len());
 
     for (name, expression) in &bindings {
-        values.push((name.clone(), eval(expression.clone(), env.clone())?));
+        values.push((name.clone(), eval(expression.clone(), env.clone(), budget)?));
     }
 
     let let_env = Environment::new(Some(env));
@@ -360,10 +381,14 @@ fn eval_plain_let(
         Environment::define(&let_env, name, value);
     }
 
-    eval_sequence_tail(body, let_env)
+    eval_sequence_tail(body, let_env, budget)
 }
 
-fn eval_cond(clauses: &[ExprRef], env: Env) -> Result<TailOutcome, EvalError> {
+fn eval_cond(
+    clauses: &[ExprRef],
+    env: Env,
+    budget: &mut StepBudget,
+) -> Result<TailOutcome, EvalError> {
     for clause in clauses {
         let Expr::List(items) = clause.as_ref() else {
             return Err(EvalError::Syntax("cond: each clause must be a list".into()));
@@ -378,16 +403,16 @@ fn eval_cond(clauses: &[ExprRef], env: Env) -> Result<TailOutcome, EvalError> {
             return if items.len() == 1 {
                 Ok(TailOutcome::Value(Value::Boolean(true)))
             } else {
-                eval_sequence_tail(&items[1..], env.clone())
+                eval_sequence_tail(&items[1..], env.clone(), budget)
             };
         }
 
-        let test_value = eval(items[0].clone(), env.clone())?;
+        let test_value = eval(items[0].clone(), env.clone(), budget)?;
         if test_value.is_truthy() {
             return if items.len() == 1 {
                 Ok(TailOutcome::Value(test_value))
             } else {
-                eval_sequence_tail(&items[1..], env.clone())
+                eval_sequence_tail(&items[1..], env.clone(), budget)
             };
         }
     }
@@ -395,30 +420,42 @@ fn eval_cond(clauses: &[ExprRef], env: Env) -> Result<TailOutcome, EvalError> {
     Ok(TailOutcome::Value(Value::Void))
 }
 
-fn eval_sequence_tail(expressions: &[ExprRef], env: Env) -> Result<TailOutcome, EvalError> {
+fn eval_sequence_tail(
+    expressions: &[ExprRef],
+    env: Env,
+    budget: &mut StepBudget,
+) -> Result<TailOutcome, EvalError> {
     if expressions.is_empty() {
         return Ok(TailOutcome::Value(Value::Void));
     }
 
     for expression in &expressions[..expressions.len() - 1] {
-        eval(expression.clone(), env.clone())?;
+        eval(expression.clone(), env.clone(), budget)?;
     }
 
     Ok(TailOutcome::Expr(expressions.last().cloned().unwrap(), env))
 }
 
-fn eval_application(items: &[ExprRef], env: Env) -> Result<TailOutcome, EvalError> {
-    let operator = eval(items[0].clone(), env.clone())?;
+fn eval_application(
+    items: &[ExprRef],
+    env: Env,
+    budget: &mut StepBudget,
+) -> Result<TailOutcome, EvalError> {
+    let operator = eval(items[0].clone(), env.clone(), budget)?;
     let mut args = Vec::with_capacity(items.len().saturating_sub(1));
 
     for expression in &items[1..] {
-        args.push(eval(expression.clone(), env.clone())?);
+        args.push(eval(expression.clone(), env.clone(), budget)?);
     }
 
-    tail_apply(operator, args)
+    tail_apply(operator, args, budget)
 }
 
-fn tail_apply(procedure: Value, args: Vec<Value>) -> Result<TailOutcome, EvalError> {
+fn tail_apply(
+    procedure: Value,
+    args: Vec<Value>,
+    budget: &mut StepBudget,
+) -> Result<TailOutcome, EvalError> {
     let Value::Procedure(procedure) = procedure else {
         return Err(EvalError::NotAProcedure(procedure.render()));
     };
@@ -433,7 +470,7 @@ fn tail_apply(procedure: Value, args: Vec<Value>) -> Result<TailOutcome, EvalErr
                 Environment::define(&call_env, param.clone(), value);
             }
 
-            eval_sequence_tail(body, call_env)
+            eval_sequence_tail(body, call_env, budget)
         }
     }
 }
@@ -735,6 +772,13 @@ fn type_mismatch(name: &str, expected: &str, value: &Value) -> EvalError {
     }
 }
 
+fn render_result(value: Value) -> String {
+    match value {
+        Value::Void => String::new(),
+        value => value.render(),
+    }
+}
+
 impl Value {
     fn is_truthy(&self) -> bool {
         !matches!(self, Value::Boolean(false))
@@ -987,5 +1031,87 @@ fn is_integer_token(token: &str) -> bool {
         token.len() > 1 && token[1..].chars().all(|ch| ch.is_ascii_digit())
     } else {
         token.chars().all(|ch| ch.is_ascii_digit())
+    }
+}
+
+impl StepBudget {
+    fn unlimited() -> Self {
+        Self {
+            max_steps: 0,
+            remaining: None,
+        }
+    }
+
+    fn limited(max_steps: usize) -> Self {
+        Self {
+            max_steps,
+            remaining: Some(max_steps),
+        }
+    }
+
+    fn consume(&mut self) -> Result<(), EvalError> {
+        let max_steps = self.max_steps;
+
+        if let Some(remaining) = self.remaining.as_mut() {
+            if *remaining == 0 {
+                return Err(EvalError::StepLimitExceeded { max_steps });
+            }
+            *remaining -= 1;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod level27_tests {
+    use super::{eval_str, eval_str_with_limit};
+
+    #[test]
+    fn test_l27_step_limit_normal() {
+        let result = eval_str_with_limit("(+ 1 2)", 1000);
+        assert_eq!(result, Ok("3".into()));
+    }
+
+    #[test]
+    fn test_l27_step_limit_loop_within_budget() {
+        let result = eval_str_with_limit(
+            "(let loop ((n 50)) (if (= n 0) 'done (loop (- n 1))))",
+            10000,
+        );
+        assert_eq!(result, Ok("done".into()));
+    }
+
+    #[test]
+    fn test_l27_step_limit_infinite_loop() {
+        let result = eval_str_with_limit("(let loop () (loop))", 1000);
+        assert!(result.is_err(), "infinite loop should hit step limit");
+    }
+
+    #[test]
+    fn test_l27_step_limit_exceeded() {
+        let result = eval_str_with_limit(
+            "(let loop ((n 1000)) (if (= n 0) 'done (loop (- n 1))))",
+            50,
+        );
+        assert!(
+            result.is_err(),
+            "loop of 1000 iters should exceed 50-step budget"
+        );
+    }
+
+    #[test]
+    fn test_l27_step_limit_factorial() {
+        let result = eval_str_with_limit(
+            "(define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) (fact 10)",
+            10000,
+        );
+        assert_eq!(result, Ok("3628800".into()));
+    }
+
+    #[test]
+    fn test_l27_normal_eval_unaffected() {
+        let result = eval_str("(let loop ((n 100000)) (if (= n 0) 'done (loop (- n 1))))");
+        assert_eq!(result, Ok("done".into()));
     }
 }
