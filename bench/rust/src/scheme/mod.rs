@@ -3,6 +3,7 @@ mod builtins;
 mod cek;
 mod macros;
 mod parser;
+mod quasiquote;
 
 pub use error::EvalError;
 
@@ -122,6 +123,7 @@ pub(crate) enum Frame {
     LetrecBind { name: String, remaining: Vec<(String, Ast)>, body: Vec<Ast>, local_env: Env },
     LetrecStarBind { name: String, remaining: Vec<(String, Ast)>, body: Vec<Ast>, local_env: Env },
     CondClause { body: Vec<Ast>, remaining: Vec<Ast>, env: Env },
+    CondArrow { test_val: Value },
     CaseKey { clauses: Vec<Ast>, env: Env },
     StringSetIdx { var_name: String, char_expr: Ast, env: Env },
     StringSetChar { var_name: String, idx: usize, env: Env },
@@ -426,7 +428,22 @@ pub(crate) fn ast_to_value(ast: &Ast) -> Value {
         AstKind::Str(s) => Value::Str(s.clone()),
         AstKind::Char(c) => Value::Char(*c),
         AstKind::Symbol(s) => Value::Symbol(s.clone()),
-        AstKind::List(items) => Value::List(items.iter().map(ast_to_value).collect()),
+        AstKind::List(items) => {
+            // Check for dotted pair notation: (a b . c) has "." as second-to-last element
+            if let Some(dot_pos) = items.iter().position(|it| matches!(&it.kind, AstKind::Symbol(s) if s == ".")) {
+                // Dot must be second-to-last, with exactly one element after it
+                if dot_pos + 2 == items.len() && dot_pos > 0 {
+                    let tail = ast_to_value(&items[dot_pos + 1]);
+                    // Build pairs from right to left: (a b . c) = (cons a (cons b c))
+                    let mut result = tail;
+                    for item in items[..dot_pos].iter().rev() {
+                        result = make_pair(ast_to_value(item), result);
+                    }
+                    return result;
+                }
+            }
+            Value::List(items.iter().map(ast_to_value).collect())
+        }
     }
 }
 
@@ -547,6 +564,12 @@ fn cek_eval_list(items: &[Ast], env: &Env, kont: &mut Kont, _output: &mut String
                     return Err(EvalError::Arity("quote requires exactly 1 argument".into()));
                 }
                 Ok(CekState::Apply(ast_to_value(&items[1])))
+            }
+            "quasiquote" => {
+                if items.len() != 2 {
+                    return Err(EvalError::Arity("quasiquote requires exactly 1 argument".into()));
+                }
+                cek_eval_quasiquote(&items[1], env, kont)
             }
             "lambda" => {
                 let val = eval_lambda(&items[1..], env)?;
@@ -1000,6 +1023,12 @@ fn cek_eval_letrec_star(args: &[Ast], env: &Env, kont: &mut Kont) -> Result<CekS
         local_env: local_env.clone(),
     });
     Ok(CekState::Eval(first.1, local_env))
+}
+
+/// Transform quasiquote into an evaluable AST expression, then evaluate it.
+fn cek_eval_quasiquote(tmpl: &Ast, env: &Env, _kont: &mut Kont) -> Result<CekState, EvalError> {
+    let expanded = quasiquote::qq_expand(tmpl);
+    Ok(CekState::Eval(expanded, Rc::clone(env)))
 }
 
 pub(crate) fn cek_eval_cond(clauses: &[Ast], env: &Env, kont: &mut Kont) -> Result<CekState, EvalError> {
@@ -1469,6 +1498,5 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let result = cek_run(state, &mut kont, &mut winders, &mut output)?;
     Ok((result.display_value(), output))
 }
-
 #[cfg(test)]
 mod tests;

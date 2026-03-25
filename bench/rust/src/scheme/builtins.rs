@@ -149,13 +149,24 @@ fn builtin_length(args: &[Value], _output: &mut String) -> Result<Value, EvalErr
 
 fn builtin_append(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
     if args.is_empty() { return Ok(Value::List(vec![])); }
+    if args.len() == 1 { return Ok(args[0].clone()); }
+    // All args except the last must be proper lists; last can be anything
     let mut result = Vec::new();
-    for a in args {
+    for a in &args[..args.len() - 1] {
         let items = value_to_vec(a)
             .ok_or_else(|| EvalError::Type("append: expected list".into()))?;
         result.extend(items);
     }
-    Ok(vec_to_list(result))
+    let tail = args.last().expect("append requires at least one argument").clone();
+    if result.is_empty() {
+        return Ok(tail);
+    }
+    // Build list from collected items with tail as the final cdr
+    let mut out = tail;
+    for item in result.into_iter().rev() {
+        out = make_pair(item, out);
+    }
+    Ok(out)
 }
 
 fn builtin_display(args: &[Value], output: &mut String) -> Result<Value, EvalError> {

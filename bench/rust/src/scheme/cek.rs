@@ -252,12 +252,20 @@ pub(crate) fn cek_apply_frame(frame: Frame, val: Value, kont: &mut Kont, winders
             if val.is_truthy() {
                 if body.is_empty() {
                     Ok(CekState::Apply(val))
+                } else if body.len() == 2 && matches!(&body[0].kind, AstKind::Symbol(s) if s == "=>") {
+                    // (cond (test => proc)) — evaluate proc, then apply it to test result
+                    kont.push(Frame::CondArrow { test_val: val });
+                    Ok(CekState::Eval(body[1].clone(), env))
                 } else {
                     cek_eval_body(body, env, kont)
                 }
             } else {
                 cek_eval_cond(&remaining, &env, kont)
             }
+        }
+        Frame::CondArrow { test_val } => {
+            // (cond (test => proc)) — proc was just evaluated, apply it to test_val
+            cek_apply_func(val, vec![test_val], kont, winders, output)
         }
         Frame::CaseKey { clauses, env } => {
             apply_case_key(&val, clauses, env, kont)

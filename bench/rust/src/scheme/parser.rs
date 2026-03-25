@@ -67,6 +67,43 @@ impl Parser {
                     col,
                 })
             }
+            Some('`') => {
+                self.next_char();
+                let expr = self.parse_expr()?;
+                Ok(Ast {
+                    kind: AstKind::List(vec![
+                        Ast { kind: AstKind::Symbol("quasiquote".into()), line, col },
+                        expr,
+                    ]),
+                    line,
+                    col,
+                })
+            }
+            Some(',') => {
+                self.next_char();
+                if self.peek() == Some('@') {
+                    self.next_char();
+                    let expr = self.parse_expr()?;
+                    Ok(Ast {
+                        kind: AstKind::List(vec![
+                            Ast { kind: AstKind::Symbol("unquote-splicing".into()), line, col },
+                            expr,
+                        ]),
+                        line,
+                        col,
+                    })
+                } else {
+                    let expr = self.parse_expr()?;
+                    Ok(Ast {
+                        kind: AstKind::List(vec![
+                            Ast { kind: AstKind::Symbol("unquote".into()), line, col },
+                            expr,
+                        ]),
+                        line,
+                        col,
+                    })
+                }
+            }
             Some('(') => self.parse_list(line, col),
             Some('"') => self.parse_string(line, col),
             Some('#') => self.parse_hash(line, col),
