@@ -53,6 +53,7 @@ func (b *BuiltinFunc) String() string {
 }
 
 func evalExpr(expr Expr, env *Env) (Value, error) {
+	for {
 	switch e := expr.(type) {
 	case *NumberExpr:
 		return &IntVal{Val: e.Val}, nil
@@ -98,7 +99,22 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 			case "define":
 				return evalDefine(e, env)
 			case "if":
-				return evalIf(e, env)
+				if len(e.Elems) < 3 || len(e.Elems) > 4 {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: if requires 2 or 3 arguments", sym.Line, sym.Col)}
+				}
+				cond, err := evalExpr(e.Elems[1], env)
+				if err != nil {
+					return nil, err
+				}
+				if isTruthy(cond) {
+					expr = e.Elems[2]
+					continue
+				}
+				if len(e.Elems) == 4 {
+					expr = e.Elems[3]
+					continue
+				}
+				return &VoidVal{}, nil
 			case "lambda":
 				return evalLambda(e, env)
 			case "case-lambda":
@@ -109,15 +125,169 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 				}
 				return quoteExpr(e.Elems[1])
 			case "begin":
-				return evalBegin(e.Elems[1:], env)
+				if len(e.Elems) < 2 {
+					return &VoidVal{}, nil
+				}
+				for _, bodyExpr := range e.Elems[1 : len(e.Elems)-1] {
+					if _, err := evalExpr(bodyExpr, env); err != nil {
+						return nil, err
+					}
+				}
+				expr = e.Elems[len(e.Elems)-1]
+				continue
 			case "let":
-				return evalLet(e, env)
+				if len(e.Elems) < 3 {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let requires bindings and body", e.Line, e.Col)}
+				}
+				// Named let: (let name ((var init) ...) body ...)
+				if nameSym, ok := e.Elems[1].(*SymbolExpr); ok {
+					if len(e.Elems) < 4 {
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: named let requires bindings and body", e.Line, e.Col)}
+					}
+					nlBindList, ok := e.Elems[2].(*ListExpr)
+					if !ok {
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: expected binding list", e.Line, e.Col)}
+					}
+					nlParams := make([]string, len(nlBindList.Elems))
+					nlInitVals := make([]Value, len(nlBindList.Elems))
+					for i, b := range nlBindList.Elems {
+						pair, ok := b.(*ListExpr)
+						if !ok || len(pair.Elems) != 2 {
+							return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad binding", e.Line, e.Col)}
+						}
+						ps, ok := pair.Elems[0].(*SymbolExpr)
+						if !ok {
+							return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: expected symbol", e.Line, e.Col)}
+						}
+						nlParams[i] = ps.Name
+						v, verr := evalExpr(pair.Elems[1], env)
+						if verr != nil {
+							return nil, verr
+						}
+						nlInitVals[i] = v
+					}
+					nlEnv := newEnv(env)
+					lambda := &LambdaVal{Params: nlParams, Body: e.Elems[3:], Env: nlEnv}
+					nlEnv.set(nameSym.Name, lambda)
+					callEnv := newEnv(nlEnv)
+					for i, p := range nlParams {
+						callEnv.set(p, nlInitVals[i])
+					}
+					nlBody := e.Elems[3:]
+					for _, bodyExpr := range nlBody[:len(nlBody)-1] {
+						if _, berr := evalExpr(bodyExpr, callEnv); berr != nil {
+							return nil, berr
+						}
+					}
+					expr = nlBody[len(nlBody)-1]
+					env = callEnv
+					continue
+				}
+				// Regular let: (let ((var init) ...) body ...)
+				rlBindList, ok := e.Elems[1].(*ListExpr)
+				if !ok {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: expected binding list", e.Line, e.Col)}
+				}
+				rlEnv := newEnv(env)
+				for _, b := range rlBindList.Elems {
+					pair, ok := b.(*ListExpr)
+					if !ok || len(pair.Elems) != 2 {
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad binding", e.Line, e.Col)}
+					}
+					ps, ok := pair.Elems[0].(*SymbolExpr)
+					if !ok {
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: expected symbol", e.Line, e.Col)}
+					}
+					v, verr := evalExpr(pair.Elems[1], env)
+					if verr != nil {
+						return nil, verr
+					}
+					rlEnv.set(ps.Name, v)
+				}
+				rlBody := e.Elems[2:]
+				for _, bodyExpr := range rlBody[:len(rlBody)-1] {
+					if _, berr := evalExpr(bodyExpr, rlEnv); berr != nil {
+						return nil, berr
+					}
+				}
+				expr = rlBody[len(rlBody)-1]
+				env = rlEnv
+				continue
 			case "cond":
-				return evalCond(e, env)
+				condHandled := false
+				for _, clause := range e.Elems[1:] {
+					cl, ok := clause.(*ListExpr)
+					if !ok || len(cl.Elems) == 0 {
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cond: bad clause", e.Line, e.Col)}
+					}
+					if csym, ok := cl.Elems[0].(*SymbolExpr); ok && csym.Name == "else" {
+						if len(cl.Elems) < 2 {
+							condHandled = true
+							break
+						}
+						for _, bodyExpr := range cl.Elems[1 : len(cl.Elems)-1] {
+							if _, cerr := evalExpr(bodyExpr, env); cerr != nil {
+								return nil, cerr
+							}
+						}
+						expr = cl.Elems[len(cl.Elems)-1]
+						condHandled = true
+						break
+					}
+					test, terr := evalExpr(cl.Elems[0], env)
+					if terr != nil {
+						return nil, terr
+					}
+					if isTruthy(test) {
+						if len(cl.Elems) == 1 {
+							return test, nil
+						}
+						for _, bodyExpr := range cl.Elems[1 : len(cl.Elems)-1] {
+							if _, cerr := evalExpr(bodyExpr, env); cerr != nil {
+								return nil, cerr
+							}
+						}
+						expr = cl.Elems[len(cl.Elems)-1]
+						condHandled = true
+						break
+					}
+				}
+				if condHandled {
+					continue
+				}
+				return &VoidVal{}, nil
 			case "and":
-				return evalAnd(e.Elems[1:], env)
+				andArgs := e.Elems[1:]
+				if len(andArgs) == 0 {
+					return &BoolVal{Val: true}, nil
+				}
+				for _, a := range andArgs[:len(andArgs)-1] {
+					v, err := evalExpr(a, env)
+					if err != nil {
+						return nil, err
+					}
+					if !isTruthy(v) {
+						return v, nil
+					}
+				}
+				expr = andArgs[len(andArgs)-1]
+				continue
 			case "or":
-				return evalOr(e.Elems[1:], env)
+				orArgs := e.Elems[1:]
+				if len(orArgs) == 0 {
+					return &BoolVal{Val: false}, nil
+				}
+				for _, a := range orArgs[:len(orArgs)-1] {
+					v, err := evalExpr(a, env)
+					if err != nil {
+						return nil, err
+					}
+					if isTruthy(v) {
+						return v, nil
+					}
+				}
+				expr = orArgs[len(orArgs)-1]
+				continue
 			case "set!":
 				if len(e.Elems) != 3 {
 					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set! requires 2 arguments", sym.Line, sym.Col)}
@@ -148,22 +318,87 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 			case "define-record-type":
 				return evalDefineRecordType(e, env)
 			case "letrec":
-				return evalLetrec(e, env, false)
+				tailExpr, tailEnv, lerr := evalLetrecTail(e, env, false)
+				if lerr != nil {
+					return nil, lerr
+				}
+				expr = tailExpr
+				env = tailEnv
+				continue
 			case "letrec*":
-				return evalLetrec(e, env, true)
+				tailExpr, tailEnv, lerr := evalLetrecTail(e, env, true)
+				if lerr != nil {
+					return nil, lerr
+				}
+				expr = tailExpr
+				env = tailEnv
+				continue
 			case "case":
-				return evalCase(e, env)
+				if len(e.Elems) < 3 {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case requires key and clauses", e.Line, e.Col)}
+				}
+				caseKey, kerr := evalExpr(e.Elems[1], env)
+				if kerr != nil {
+					return nil, kerr
+				}
+				caseHandled := false
+				for _, clause := range e.Elems[2:] {
+					cl, ok := clause.(*ListExpr)
+					if !ok || len(cl.Elems) < 2 {
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case: bad clause", e.Line, e.Col)}
+					}
+					if csym, ok := cl.Elems[0].(*SymbolExpr); ok && csym.Name == "else" {
+						for _, bodyExpr := range cl.Elems[1 : len(cl.Elems)-1] {
+							if _, berr := evalExpr(bodyExpr, env); berr != nil {
+								return nil, berr
+							}
+						}
+						expr = cl.Elems[len(cl.Elems)-1]
+						caseHandled = true
+						break
+					}
+					datums, ok := cl.Elems[0].(*ListExpr)
+					if !ok {
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case: expected datum list", e.Line, e.Col)}
+					}
+					caseMatched := false
+					for _, d := range datums.Elems {
+						dv, derr := quoteExpr(d)
+						if derr != nil {
+							return nil, derr
+						}
+						if schemeEqv(caseKey, dv) {
+							caseMatched = true
+							break
+						}
+					}
+					if caseMatched {
+						for _, bodyExpr := range cl.Elems[1 : len(cl.Elems)-1] {
+							if _, berr := evalExpr(bodyExpr, env); berr != nil {
+								return nil, berr
+							}
+						}
+						expr = cl.Elems[len(cl.Elems)-1]
+						caseHandled = true
+						break
+					}
+				}
+				if caseHandled {
+					continue
+				}
+				return &VoidVal{}, nil
 			case "do":
 				return evalDo(e, env)
 			}
 			// Check if symbol is bound to a macro
 			if v, ok := env.get(sym.Name); ok {
 				if macro, ok := v.(*SyntaxRulesVal); ok {
-					expanded, err := expandMacro(macro, e)
-					if err != nil {
-						return nil, err
+					expanded, merr := expandMacro(macro, e)
+					if merr != nil {
+						return nil, merr
 					}
-					return evalExpr(expanded, env)
+					expr = expanded
+					continue
 				}
 			}
 		}
@@ -171,11 +406,12 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 		if ref, ok := e.Elems[0].(*EnvRefExpr); ok {
 			if v, ok := ref.Env.get(ref.Name); ok {
 				if macro, ok := v.(*SyntaxRulesVal); ok {
-					expanded, err := expandMacro(macro, e)
-					if err != nil {
-						return nil, err
+					expanded, merr := expandMacro(macro, e)
+					if merr != nil {
+						return nil, merr
 					}
-					return evalExpr(expanded, env)
+					expr = expanded
+					continue
 				}
 			}
 		}
@@ -201,15 +437,43 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 			}
 			return result, nil
 		case *LambdaVal:
-			return applyLambda(f, args)
+			callEnv, cerr := setupLambdaCall(f, args)
+			if cerr != nil {
+				return nil, cerr
+			}
+			for _, bodyExpr := range f.Body[:len(f.Body)-1] {
+				if _, berr := evalExpr(bodyExpr, callEnv); berr != nil {
+					return nil, berr
+				}
+			}
+			expr = f.Body[len(f.Body)-1]
+			env = callEnv
+			continue
 		case *CaseLambdaVal:
-			return applyCaseLambda(f, args)
+			clause, cerr := findCaseLambdaClause(f, args)
+			if cerr != nil {
+				return nil, cerr
+			}
+			clEnv, cerr2 := setupLambdaCall(clause, args)
+			if cerr2 != nil {
+				return nil, cerr2
+			}
+			for _, bodyExpr := range clause.Body[:len(clause.Body)-1] {
+				if _, berr := evalExpr(bodyExpr, clEnv); berr != nil {
+					return nil, berr
+				}
+			}
+			expr = clause.Body[len(clause.Body)-1]
+			env = clEnv
+			continue
 		default:
 			line, col := e.Elems[0].pos()
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", line, col)}
 		}
+	default:
+		return nil, &EvalError{Message: "unknown expression type"}
 	}
-	return nil, &EvalError{Message: "unknown expression type"}
+	}
 }
 
 func evalDefine(e *ListExpr, env *Env) (Value, error) {
@@ -381,6 +645,103 @@ func applyLambda(f *LambdaVal, args []Value) (Value, error) {
 		}
 	}
 	return result, nil
+}
+
+// setupLambdaCall creates the call environment for a lambda application without evaluating the body.
+func setupLambdaCall(f *LambdaVal, args []Value) (*Env, error) {
+	if f.RestParam != "" {
+		if len(args) < len(f.Params) {
+			return nil, &EvalError{Message: fmt.Sprintf("wrong number of arguments: expected at least %d, got %d", len(f.Params), len(args))}
+		}
+	} else {
+		if len(args) != len(f.Params) {
+			return nil, &EvalError{Message: fmt.Sprintf("wrong number of arguments: expected %d, got %d", len(f.Params), len(args))}
+		}
+	}
+	callEnv := newEnv(f.Env)
+	for i, p := range f.Params {
+		callEnv.set(p, args[i])
+	}
+	if f.RestParam != "" {
+		var rest Value = &NilVal{}
+		for i := len(args) - 1; i >= len(f.Params); i-- {
+			rest = &PairVal{Car: args[i], Cdr: rest}
+		}
+		callEnv.set(f.RestParam, rest)
+	}
+	return callEnv, nil
+}
+
+// findCaseLambdaClause finds the matching clause for a case-lambda application.
+func findCaseLambdaClause(f *CaseLambdaVal, args []Value) (*LambdaVal, error) {
+	for _, clause := range f.Clauses {
+		if clause.RestParam != "" {
+			if len(args) >= len(clause.Params) {
+				return clause, nil
+			}
+		} else {
+			if len(args) == len(clause.Params) {
+				return clause, nil
+			}
+		}
+	}
+	return nil, &EvalError{Message: fmt.Sprintf("case-lambda: no matching clause for %d arguments", len(args))}
+}
+
+// evalLetrecTail evaluates letrec/letrec* bindings and all but the last body expression,
+// returning the last body expression and its environment for TCO.
+func evalLetrecTail(e *ListExpr, env *Env, star bool) (Expr, *Env, error) {
+	if len(e.Elems) < 3 {
+		return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: letrec requires bindings and body", e.Line, e.Col)}
+	}
+	bindList, ok := e.Elems[1].(*ListExpr)
+	if !ok {
+		return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: expected binding list", e.Line, e.Col)}
+	}
+	letEnv := newEnv(env)
+	names := make([]string, len(bindList.Elems))
+	for i, b := range bindList.Elems {
+		pair, ok := b.(*ListExpr)
+		if !ok || len(pair.Elems) != 2 {
+			return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: bad binding", e.Line, e.Col)}
+		}
+		ps, ok := pair.Elems[0].(*SymbolExpr)
+		if !ok {
+			return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: expected symbol", e.Line, e.Col)}
+		}
+		names[i] = ps.Name
+		letEnv.set(ps.Name, &VoidVal{})
+	}
+	if star {
+		for i, b := range bindList.Elems {
+			pair := b.(*ListExpr)
+			v, err := evalExpr(pair.Elems[1], letEnv)
+			if err != nil {
+				return nil, nil, err
+			}
+			letEnv.set(names[i], v)
+		}
+	} else {
+		vals := make([]Value, len(bindList.Elems))
+		for i, b := range bindList.Elems {
+			pair := b.(*ListExpr)
+			v, err := evalExpr(pair.Elems[1], letEnv)
+			if err != nil {
+				return nil, nil, err
+			}
+			vals[i] = v
+		}
+		for i, name := range names {
+			letEnv.set(name, vals[i])
+		}
+	}
+	body := e.Elems[2:]
+	for _, bodyExpr := range body[:len(body)-1] {
+		if _, err := evalExpr(bodyExpr, letEnv); err != nil {
+			return nil, nil, err
+		}
+	}
+	return body[len(body)-1], letEnv, nil
 }
 
 func quoteExpr(expr Expr) (Value, error) {
