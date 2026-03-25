@@ -1,8 +1,10 @@
 pub mod error;
 mod builtins;
+mod macros;
 
 pub use error::EvalError;
 use builtins::*;
+use macros::eval_macro_call;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -12,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-fn gensym(prefix: &str) -> String {
+pub(crate) fn gensym(prefix: &str) -> String {
     let n = GENSYM_COUNTER.fetch_add(1, Ordering::SeqCst);
     format!("#{}#{}", prefix, n)
 }
@@ -40,6 +42,7 @@ pub(crate) enum Val {
         clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>)>,
         env: Env,
     },
+    Vector(Rc<RefCell<Vec<Val>>>),
     Builtin(BuiltinFn),
     Macro {
         literals: Vec<String>,
@@ -122,6 +125,15 @@ impl fmt::Display for Val {
                         Val::List(v) if v.is_empty() => break,
                         other => { write!(f, " . {other}")?; break; }
                     }
+                }
+                write!(f, ")")
+            }
+            Val::Vector(v) => {
+                let elems = v.borrow();
+                write!(f, "#(")?;
+                for (i, e) in elems.iter().enumerate() {
+                    if i > 0 { write!(f, " ")?; }
+                    write!(f, "{e}")?;
                 }
                 write!(f, ")")
             }
@@ -220,6 +232,15 @@ impl Env {
             ("numerator", builtin_numerator),
             ("denominator", builtin_denominator),
             ("procedure?", builtin_is_procedure),
+            ("eqv?", builtin_eqv),
+            ("vector", builtin_vector),
+            ("make-vector", builtin_make_vector),
+            ("vector-ref", builtin_vector_ref),
+            ("vector-set!", builtin_vector_set),
+            ("vector-length", builtin_vector_length),
+            ("vector?", builtin_is_vector),
+            ("vector->list", builtin_vector_to_list),
+            ("list->vector", builtin_list_to_vector),
         ];
         for &(name, f) in builtins {
             frame.borrow_mut().insert(name.to_string(), Val::Builtin(f));
@@ -227,7 +248,7 @@ impl Env {
         Env { frames: vec![frame], output: Rc::new(RefCell::new(String::new())) }
     }
 
-    fn get(&self, name: &str) -> Option<Val> {
+    pub(crate) fn get(&self, name: &str) -> Option<Val> {
         for frame in self.frames.iter().rev() {
             if let Some(v) = frame.borrow().get(name) {
                 return Some(v.clone());
@@ -236,7 +257,7 @@ impl Env {
         None
     }
 
-    fn define(&self, name: String, val: Val) {
+    pub(crate) fn define(&self, name: String, val: Val) {
         self.frames.last().expect("env has no frames").borrow_mut().insert(name, val);
     }
 
@@ -251,7 +272,7 @@ impl Env {
         Err(EvalError::UnboundVariable(name.to_string()))
     }
 
-    fn push(&self) -> Env {
+    pub(crate) fn push(&self) -> Env {
         let mut frames = self.frames.clone();
         frames.push(Rc::new(RefCell::new(HashMap::new())));
         Env { frames, output: Rc::clone(&self.output) }
@@ -282,8 +303,8 @@ impl fmt::Display for Span {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Expr {
-    kind: ExprKind,
-    span: Span,
+    pub(crate) kind: ExprKind,
+    pub(crate) span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -299,7 +320,7 @@ pub(crate) enum ExprKind {
 }
 
 impl Expr {
-    fn new(kind: ExprKind, span: Span) -> Self {
+    pub(crate) fn new(kind: ExprKind, span: Span) -> Self {
         Expr { kind, span }
     }
 }
@@ -484,7 +505,7 @@ fn span_err(span: Span, err: EvalError) -> EvalError {
     }
 }
 
-fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
+pub(crate) fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
     let span = expr.span;
     match &expr.kind {
         ExprKind::Int(n) => Ok(Val::Int(*n)),
@@ -517,6 +538,11 @@ fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
                     "define-syntax" => return eval_define_syntax(&elems[1..], env, span),
                     "define-record-type" => return eval_define_record_type(&elems[1..], env, span),
                     "case-lambda" => return eval_case_lambda(&elems[1..], env, span),
+                    "letrec" => return eval_letrec(&elems[1..], env, span),
+                    "letrec*" => return eval_letrec_star(&elems[1..], env, span),
+                    "case" => return eval_case(&elems[1..], env, span),
+                    "do" => return eval_do(&elems[1..], env, span),
+                    "let*" => return eval_let_star(&elems[1..], env, span),
                     _ => {
                         if let Some(Val::Macro { literals, rules, def_env }) = env.get(op) {
                             return eval_macro_call(elems, &literals, &rules, &def_env, env, span);
@@ -623,233 +649,7 @@ fn parse_params(exprs: &[Expr], span: Span) -> Result<(Vec<String>, Option<Strin
     Ok((params, rest_param))
 }
 
-// --- Macros (syntax-rules) ---
-
-#[derive(Clone, Debug)]
-enum MacroBinding {
-    Single(Expr),
-    Many(Vec<Expr>),
-}
-
-fn match_pattern_list(
-    pattern: &[Expr],
-    input: &[Expr],
-    literals: &[String],
-    bindings: &mut HashMap<String, MacroBinding>,
-) -> bool {
-    let ellipsis_pos = pattern.iter().position(
-        |e| matches!(&e.kind, ExprKind::Symbol(s) if s == "..."),
-    );
-    if let Some(epos) = ellipsis_pos {
-        let fixed_before = &pattern[..epos - 1];
-        let ellipsis_pat = &pattern[epos - 1];
-        let fixed_after = &pattern[epos + 1..];
-        let min_len = fixed_before.len() + fixed_after.len();
-        if input.len() < min_len {
-            return false;
-        }
-        for (p, e) in fixed_before.iter().zip(input.iter()) {
-            if !match_pattern_single(p, e, literals, bindings) {
-                return false;
-            }
-        }
-        let after_start = input.len() - fixed_after.len();
-        for (p, e) in fixed_after.iter().zip(input[after_start..].iter()) {
-            if !match_pattern_single(p, e, literals, bindings) {
-                return false;
-            }
-        }
-        let ellipsis_input = &input[fixed_before.len()..after_start];
-        match &ellipsis_pat.kind {
-            ExprKind::Symbol(s) if !literals.contains(s) && s != "_" => {
-                bindings.insert(s.clone(), MacroBinding::Many(ellipsis_input.to_vec()));
-                true
-            }
-            _ => ellipsis_input.is_empty(),
-        }
-    } else {
-        if pattern.len() != input.len() {
-            return false;
-        }
-        for (p, e) in pattern.iter().zip(input.iter()) {
-            if !match_pattern_single(p, e, literals, bindings) {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-fn match_pattern_single(
-    pattern: &Expr,
-    input: &Expr,
-    literals: &[String],
-    bindings: &mut HashMap<String, MacroBinding>,
-) -> bool {
-    match &pattern.kind {
-        ExprKind::Symbol(s) if s == "_" => true,
-        ExprKind::Symbol(s) if literals.contains(s) => {
-            matches!(&input.kind, ExprKind::Symbol(s2) if s2 == s)
-        }
-        ExprKind::Symbol(s) => {
-            bindings.insert(s.clone(), MacroBinding::Single(input.clone()));
-            true
-        }
-        _ => false,
-    }
-}
-
-fn find_ellipsis_var(expr: &Expr, bindings: &HashMap<String, MacroBinding>) -> Option<String> {
-    match &expr.kind {
-        ExprKind::Symbol(s) => {
-            if matches!(bindings.get(s), Some(MacroBinding::Many(_))) {
-                return Some(s.clone());
-            }
-            None
-        }
-        ExprKind::List(elems) => {
-            for e in elems {
-                if let Some(v) = find_ellipsis_var(e, bindings) {
-                    return Some(v);
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-fn collect_template_free_vars(
-    expr: &Expr,
-    pattern_vars: &[String],
-    out: &mut Vec<String>,
-) {
-    match &expr.kind {
-        ExprKind::Symbol(s) if s != "..." => {
-            if !pattern_vars.contains(s) && !out.contains(s) {
-                out.push(s.clone());
-            }
-        }
-        ExprKind::List(elems) => {
-            for e in elems {
-                collect_template_free_vars(e, pattern_vars, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-const SPECIAL_FORMS: &[&str] = &[
-    "define", "if", "quote", "lambda", "and", "or", "begin",
-    "let", "cond", "set!", "string-set!", "define-syntax", "syntax-rules",
-    "define-record-type",
-];
-
-fn is_ellipsis(expr: &Expr) -> bool {
-    matches!(&expr.kind, ExprKind::Symbol(s) if s == "...")
-}
-
-fn expand_ellipsis_element(
-    sub: &Expr,
-    bindings: &HashMap<String, MacroBinding>,
-    renames: &HashMap<String, String>,
-    result: &mut Vec<Expr>,
-) {
-    let Some(var_name) = find_ellipsis_var(sub, bindings) else { return };
-    let Some(MacroBinding::Many(exprs)) = bindings.get(&var_name) else { return };
-    if matches!(&sub.kind, ExprKind::Symbol(sn) if sn == &var_name) {
-        result.extend(exprs.iter().cloned());
-    } else {
-        for expr in exprs {
-            let mut sub_bindings = bindings.clone();
-            sub_bindings.insert(var_name.clone(), MacroBinding::Single(expr.clone()));
-            result.push(expand_template(sub, &sub_bindings, renames));
-        }
-    }
-}
-
-fn expand_template(
-    template: &Expr,
-    bindings: &HashMap<String, MacroBinding>,
-    renames: &HashMap<String, String>,
-) -> Expr {
-    match &template.kind {
-        ExprKind::Symbol(s) => {
-            if let Some(binding) = bindings.get(s) {
-                match binding {
-                    MacroBinding::Single(e) => e.clone(),
-                    MacroBinding::Many(_) => template.clone(),
-                }
-            } else if let Some(new_name) = renames.get(s) {
-                Expr::new(ExprKind::Symbol(new_name.clone()), template.span)
-            } else {
-                template.clone()
-            }
-        }
-        ExprKind::List(elems) => {
-            let mut result = Vec::new();
-            let mut i = 0;
-            while i < elems.len() {
-                if i + 1 < elems.len() && is_ellipsis(&elems[i + 1]) {
-                    expand_ellipsis_element(&elems[i], bindings, renames, &mut result);
-                    i += 2;
-                    continue;
-                }
-                result.push(expand_template(&elems[i], bindings, renames));
-                i += 1;
-            }
-            Expr::new(ExprKind::List(result), template.span)
-        }
-        _ => template.clone(),
-    }
-}
-
-fn eval_macro_call(
-    elems: &[Expr],
-    literals: &[String],
-    rules: &[(Expr, Expr)],
-    def_env: &Env,
-    use_env: &Env,
-    span: Span,
-) -> Result<Val, EvalError> {
-    for (pattern, template) in rules {
-        let pat_elems = match &pattern.kind {
-            ExprKind::List(e) => e,
-            _ => continue,
-        };
-        let mut bindings = HashMap::new();
-        if match_pattern_list(&pat_elems[1..], &elems[1..], literals, &mut bindings) {
-            let pattern_vars: Vec<String> = bindings.keys().cloned().collect();
-            let mut free_vars = Vec::new();
-            collect_template_free_vars(template, &pattern_vars, &mut free_vars);
-
-            let mut renames = HashMap::new();
-            for sym in &free_vars {
-                if SPECIAL_FORMS.contains(&sym.as_str()) {
-                    continue;
-                }
-                if def_env.get(sym).is_some() {
-                    renames.insert(sym.clone(), gensym(sym));
-                }
-            }
-
-            let expanded = expand_template(template, &bindings, &renames);
-
-            if renames.is_empty() {
-                return eval(&expanded, use_env);
-            } else {
-                let new_env = use_env.push();
-                for (orig, gs) in &renames {
-                    if let Some(val) = def_env.get(orig) {
-                        new_env.define(gs.clone(), val);
-                    }
-                }
-                return eval(&expanded, &new_env);
-            }
-        }
-    }
-    Err(EvalError::Runtime(format!("no matching syntax rule at {span}")))
-}
+// --- Macros (syntax-rules) --- see macros.rs
 
 fn eval_define_record_type(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
     // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
@@ -1338,6 +1138,233 @@ fn eval_string_set(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalErro
         env.set(name, Val::Str(s))?;
     }
     Ok(Val::Void)
+}
+
+fn eval_letrec(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Parse(format!("letrec: missing arguments at {span}")));
+    }
+    let bindings = match &args[0].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(EvalError::Parse(format!("letrec: expected bindings list at {span}"))),
+    };
+    let new_env = env.push();
+    // First pass: define all variables as Void
+    let mut names = Vec::new();
+    let mut init_exprs = Vec::new();
+    for b in bindings {
+        match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                if let ExprKind::Symbol(s) = &pair[0].kind {
+                    names.push(s.clone());
+                    init_exprs.push(&pair[1]);
+                    new_env.define(s.clone(), Val::Void);
+                } else {
+                    return Err(EvalError::Parse(format!("letrec: expected variable name at {span}")));
+                }
+            }
+            _ => return Err(EvalError::Parse(format!("letrec: invalid binding at {span}"))),
+        }
+    }
+    // Second pass: evaluate inits in the new env and set them
+    for (name, init_expr) in names.iter().zip(init_exprs.iter()) {
+        let val = eval(init_expr, &new_env)?;
+        new_env.set(name, val)?;
+    }
+    let mut result = Val::Void;
+    for expr in &args[1..] {
+        result = eval(expr, &new_env)?;
+    }
+    Ok(result)
+}
+
+fn eval_letrec_star(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Parse(format!("letrec*: missing arguments at {span}")));
+    }
+    let bindings = match &args[0].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(EvalError::Parse(format!("letrec*: expected bindings list at {span}"))),
+    };
+    let new_env = env.push();
+    for b in bindings {
+        match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                if let ExprKind::Symbol(s) = &pair[0].kind {
+                    let val = eval(&pair[1], &new_env)?;
+                    new_env.define(s.clone(), val);
+                } else {
+                    return Err(EvalError::Parse(format!("letrec*: expected variable name at {span}")));
+                }
+            }
+            _ => return Err(EvalError::Parse(format!("letrec*: invalid binding at {span}"))),
+        }
+    }
+    let mut result = Val::Void;
+    for expr in &args[1..] {
+        result = eval(expr, &new_env)?;
+    }
+    Ok(result)
+}
+
+fn eval_let_star(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Parse(format!("let*: missing arguments at {span}")));
+    }
+    let bindings = match &args[0].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(EvalError::Parse(format!("let*: expected bindings list at {span}"))),
+    };
+    let new_env = env.push();
+    for b in bindings {
+        match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                if let ExprKind::Symbol(s) = &pair[0].kind {
+                    let val = eval(&pair[1], &new_env)?;
+                    new_env.define(s.clone(), val);
+                } else {
+                    return Err(EvalError::Parse(format!("let*: expected variable name at {span}")));
+                }
+            }
+            _ => return Err(EvalError::Parse(format!("let*: invalid binding at {span}"))),
+        }
+    }
+    let mut result = Val::Void;
+    for expr in &args[1..] {
+        result = eval(expr, &new_env)?;
+    }
+    Ok(result)
+}
+
+fn vals_eqv(a: &Val, b: &Val) -> bool {
+    match (a, b) {
+        (Val::Int(x), Val::Int(y)) => x == y,
+        (Val::Float(x), Val::Float(y)) => x == y,
+        (Val::Rational(n1, d1), Val::Rational(n2, d2)) => n1 == n2 && d1 == d2,
+        (Val::Bool(x), Val::Bool(y)) => x == y,
+        (Val::Char(x), Val::Char(y)) => x == y,
+        (Val::Symbol(x), Val::Symbol(y)) => x == y,
+        (Val::List(a), Val::List(b)) if a.is_empty() && b.is_empty() => true,
+        (Val::Void, Val::Void) => true,
+        _ => std::ptr::eq(a as *const Val, b as *const Val),
+    }
+}
+
+fn eval_case(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Parse(format!("case: missing arguments at {span}")));
+    }
+    let key = eval(&args[0], env)?;
+    for clause in &args[1..] {
+        match &clause.kind {
+            ExprKind::List(parts) if !parts.is_empty() => {
+                // Check for else
+                if let ExprKind::Symbol(s) = &parts[0].kind {
+                    if s == "else" {
+                        let mut result = Val::Void;
+                        for expr in &parts[1..] {
+                            result = eval(expr, env)?;
+                        }
+                        return Ok(result);
+                    }
+                }
+                // Normal clause: ((datum ...) body ...)
+                let datums = match &parts[0].kind {
+                    ExprKind::List(d) => d,
+                    _ => return Err(EvalError::Parse(format!("case: expected datum list at {span}"))),
+                };
+                for datum in datums {
+                    let datum_val = expr_to_val(datum)?;
+                    if vals_eqv(&key, &datum_val) {
+                        let mut result = Val::Void;
+                        for expr in &parts[1..] {
+                            result = eval(expr, env)?;
+                        }
+                        return Ok(result);
+                    }
+                }
+            }
+            _ => return Err(EvalError::Parse(format!("case: invalid clause at {span}"))),
+        }
+    }
+    Ok(Val::Void)
+}
+
+fn eval_do(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
+    // (do ((var init step) ...) (test expr ...) body ...)
+    if args.len() < 2 {
+        return Err(EvalError::Parse(format!("do: expected at least 2 arguments at {span}")));
+    }
+    let var_specs = match &args[0].kind {
+        ExprKind::List(v) => v,
+        _ => return Err(EvalError::Parse(format!("do: expected variable list at {span}"))),
+    };
+    let test_clause = match &args[1].kind {
+        ExprKind::List(t) => t,
+        _ => return Err(EvalError::Parse(format!("do: expected test clause at {span}"))),
+    };
+    if test_clause.is_empty() {
+        return Err(EvalError::Parse(format!("do: empty test clause at {span}")));
+    }
+
+    // Parse variable specs
+    struct DoVar<'a> {
+        name: String,
+        step: Option<&'a Expr>,
+    }
+    let mut vars = Vec::new();
+    let do_env = env.push();
+    for spec in var_specs {
+        match &spec.kind {
+            ExprKind::List(parts) if parts.len() >= 2 => {
+                let name = match &parts[0].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Parse(format!("do: expected variable name at {span}"))),
+                };
+                let init = eval(&parts[1], env)?;
+                let step = if parts.len() >= 3 { Some(&parts[2]) } else { None };
+                do_env.define(name.clone(), init);
+                vars.push(DoVar { name, step });
+            }
+            _ => return Err(EvalError::Parse(format!("do: invalid variable spec at {span}"))),
+        }
+    }
+
+    // Iterate
+    loop {
+        // Test
+        let test_result = eval(&test_clause[0], &do_env)?;
+        if test_result.is_truthy() {
+            // Evaluate result expressions
+            if test_clause.len() > 1 {
+                let mut result = Val::Void;
+                for expr in &test_clause[1..] {
+                    result = eval(expr, &do_env)?;
+                }
+                return Ok(result);
+            }
+            return Ok(Val::Void);
+        }
+
+        // Evaluate body
+        for expr in &args[2..] {
+            eval(expr, &do_env)?;
+        }
+
+        // Step: evaluate ALL step expressions using current values, then update
+        let new_vals: Vec<Option<Val>> = vars.iter().map(|v| {
+            match v.step {
+                Some(step_expr) => Ok(Some(eval(step_expr, &do_env)?)),
+                None => Ok(None),
+            }
+        }).collect::<Result<_, EvalError>>()?;
+
+        for (v, new_val) in vars.iter().zip(new_vals.into_iter()) {
+            if let Some(val) = new_val {
+                do_env.set(&v.name, val)?;
+            }
+        }
+    }
 }
 
 /// Evaluate one or more Scheme expressions and return the string

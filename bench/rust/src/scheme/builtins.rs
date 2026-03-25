@@ -1,4 +1,6 @@
 use super::{Val, Env, apply_val, make_rational};
+use std::cell::RefCell;
+use std::rc::Rc;
 use crate::scheme::error::EvalError;
 
 // --- Numeric tower helpers ---
@@ -375,6 +377,16 @@ fn display_format(val: &Val) -> String {
             out.push(')');
             out
         }
+        Val::Vector(v) => {
+            let elems = v.borrow();
+            let mut out = String::from("#(");
+            for (i, e) in elems.iter().enumerate() {
+                if i > 0 { out.push(' '); }
+                out.push_str(&display_format(e));
+            }
+            out.push(')');
+            out
+        }
         other => other.to_string(),
     }
 }
@@ -502,6 +514,12 @@ pub fn vals_equal(a: &Val, b: &Val) -> bool {
         (Val::Symbol(x), Val::Symbol(y)) => x == y,
         (Val::List(x), Val::List(y)) => x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| vals_equal(a, b)),
         (Val::Pair(a1, b1), Val::Pair(a2, b2)) => vals_equal(a1, a2) && vals_equal(b1, b2),
+        (Val::Vector(v1), Val::Vector(v2)) => {
+            let a = v1.borrow();
+            let b = v2.borrow();
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| vals_equal(x, y))
+        }
+        (Val::Void, Val::Void) => true,
         _ => false,
     }
 }
@@ -519,6 +537,8 @@ pub fn builtin_eq_pred(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
         (Val::Char(a), Val::Char(b)) => a == b,
         (Val::Symbol(a), Val::Symbol(b)) => a == b,
         (Val::List(a), Val::List(b)) => a.is_empty() && b.is_empty(),
+        (Val::Void, Val::Void) => true,
+        (Val::Vector(a), Val::Vector(b)) => Rc::ptr_eq(a, b),
         _ => false,
     };
     Ok(Val::Bool(result))
@@ -779,4 +799,96 @@ pub fn builtin_apply(args: &[Val], env: &Env) -> Result<Val, EvalError> {
     let mut all_args: Vec<Val> = args[1..args.len() - 1].to_vec();
     all_args.extend(tail);
     apply_val(func, &all_args, env)
+}
+
+pub fn builtin_eqv(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("eqv?: expected 2 arguments".into())); }
+    let result = match (&args[0], &args[1]) {
+        (Val::Bool(a), Val::Bool(b)) => a == b,
+        (Val::Int(a), Val::Int(b)) => a == b,
+        (Val::Float(a), Val::Float(b)) => a == b,
+        (Val::Rational(n1, d1), Val::Rational(n2, d2)) => n1 == n2 && d1 == d2,
+        (Val::Char(a), Val::Char(b)) => a == b,
+        (Val::Symbol(a), Val::Symbol(b)) => a == b,
+        (Val::List(a), Val::List(b)) => a.is_empty() && b.is_empty(),
+        (Val::Void, Val::Void) => true,
+        _ => false,
+    };
+    Ok(Val::Bool(result))
+}
+
+pub fn builtin_vector(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    Ok(Val::Vector(Rc::new(RefCell::new(args.to_vec()))))
+}
+
+pub fn builtin_make_vector(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(EvalError::Arity("make-vector: expected 1 or 2 arguments".into()));
+    }
+    let len = match &args[0] {
+        Val::Int(n) => *n as usize,
+        _ => return Err(EvalError::Type("make-vector: expected integer".into())),
+    };
+    let fill = if args.len() == 2 { args[1].clone() } else { Val::Int(0) };
+    Ok(Val::Vector(Rc::new(RefCell::new(vec![fill; len]))))
+}
+
+pub fn builtin_vector_ref(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("vector-ref: expected 2 arguments".into())); }
+    let v = match &args[0] {
+        Val::Vector(v) => v.borrow(),
+        _ => return Err(EvalError::Type("vector-ref: expected vector".into())),
+    };
+    let idx = match &args[1] {
+        Val::Int(n) => *n as usize,
+        _ => return Err(EvalError::Type("vector-ref: expected integer index".into())),
+    };
+    v.get(idx).cloned().ok_or_else(|| EvalError::Runtime("vector-ref: index out of range".into()))
+}
+
+pub fn builtin_vector_set(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 3 { return Err(EvalError::Arity("vector-set!: expected 3 arguments".into())); }
+    let v = match &args[0] {
+        Val::Vector(v) => v.clone(),
+        _ => return Err(EvalError::Type("vector-set!: expected vector".into())),
+    };
+    let idx = match &args[1] {
+        Val::Int(n) => *n as usize,
+        _ => return Err(EvalError::Type("vector-set!: expected integer index".into())),
+    };
+    let mut vec = v.borrow_mut();
+    if idx >= vec.len() {
+        return Err(EvalError::Runtime("vector-set!: index out of range".into()));
+    }
+    vec[idx] = args[2].clone();
+    Ok(Val::Void)
+}
+
+pub fn builtin_vector_length(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("vector-length: expected 1 argument".into())); }
+    match &args[0] {
+        Val::Vector(v) => Ok(Val::Int(v.borrow().len() as i64)),
+        _ => Err(EvalError::Type("vector-length: expected vector".into())),
+    }
+}
+
+pub fn builtin_is_vector(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("vector?: expected 1 argument".into())); }
+    Ok(Val::Bool(matches!(&args[0], Val::Vector(_))))
+}
+
+pub fn builtin_vector_to_list(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("vector->list: expected 1 argument".into())); }
+    match &args[0] {
+        Val::Vector(v) => Ok(Val::List(v.borrow().clone())),
+        _ => Err(EvalError::Type("vector->list: expected vector".into())),
+    }
+}
+
+pub fn builtin_list_to_vector(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("list->vector: expected 1 argument".into())); }
+    match &args[0] {
+        Val::List(v) => Ok(Val::Vector(Rc::new(RefCell::new(v.clone())))),
+        _ => Err(EvalError::Type("list->vector: expected list".into())),
+    }
 }
