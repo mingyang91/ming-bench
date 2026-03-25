@@ -110,6 +110,7 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define(">", builtinCompare(">"))
 	env.define("=", builtinCompare("="))
 	env.define("<=", builtinCompare("<="))
+	env.define(">=", builtinCompare(">="))
 	env.define("eq?", builtinEq())
 	env.define("eqv?", builtinEqv())
 	env.define("equal?", builtinEqual())
@@ -187,6 +188,8 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("denominator", builtinDenominator())
 	env.define("symbol->string", builtinSymbolToString())
 	env.define("string->symbol", builtinStringToSymbol())
+	env.define("string->list", builtinStringToList())
+	env.define("list->string", builtinListToString())
 	env.define("string-ref", builtinStringRef())
 	env.define("string-copy", builtinStringCopy())
 	env.define("string-set!", builtinStringSet())
@@ -195,6 +198,8 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("string-ci=?", builtinStringCIEqual())
 	env.define("string-upcase", builtinStringCase("upcase"))
 	env.define("string-downcase", builtinStringCase("downcase"))
+	env.define("char->integer", builtinCharToInteger())
+	env.define("integer->char", builtinIntegerToChar())
 	env.define("char-alphabetic?", builtinCharPredicate(unicode.IsLetter))
 	env.define("char-numeric?", builtinCharPredicate(unicode.IsDigit))
 	env.define("char-upcase", builtinCharCase("upcase"))
@@ -851,7 +856,7 @@ func builtinCompare(name string) builtinProc {
 			}
 
 			ok := compareNumeric(prev, current, name)
-			if name != "<" && name != ">" && name != "=" && name != "<=" {
+			if name != "<" && name != ">" && name != "=" && name != "<=" && name != ">=" {
 				return nil, &EvalError{Message: "unknown comparison"}
 			}
 			if !ok {
@@ -1470,6 +1475,49 @@ func builtinStringToSymbol() builtinProc {
 	}
 }
 
+func builtinStringToList() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string->list expects exactly 1 argument"}
+		}
+
+		runes, err := expectStringRunes(args[0])
+		if err != nil {
+			return nil, err
+		}
+
+		elements := make([]value, len(runes))
+		for i, r := range runes {
+			elements[i] = charValue(r)
+		}
+		return listValue{elements: elements}, nil
+	}
+}
+
+func builtinListToString() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "list->string expects exactly 1 argument"}
+		}
+
+		list, err := expectListValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+
+		runes := make([]rune, len(list.elements))
+		for i, element := range list.elements {
+			char, err := expectCharValue(element)
+			if err != nil {
+				return nil, err
+			}
+			runes[i] = rune(char)
+		}
+
+		return stringValue(string(runes)), nil
+	}
+}
+
 func builtinStringRef() builtinProc {
 	return func(args []value) (value, error) {
 		if len(args) != 2 {
@@ -1514,21 +1562,24 @@ func builtinStringSet() builtinProc {
 			return nil, &EvalError{Message: "string-set! expects exactly 3 arguments"}
 		}
 
-		str, err := expectMutableStringValue(args[0])
-		if err != nil {
-			return nil, err
+		var str *mutableStringValue
+		switch candidate := args[0].(type) {
+		case *mutableStringValue:
+			str = candidate
+		case stringValue:
+			return nil, &EvalError{Message: "string-set! cannot modify immutable strings"}
+		default:
+			return nil, &EvalError{Message: "expected string"}
 		}
 
 		index, err := expectIntegerValue(args[1])
 		if err != nil {
 			return nil, err
 		}
-
 		char, err := expectCharValue(args[2])
 		if err != nil {
 			return nil, err
 		}
-
 		if index < 0 || index >= len(str.runes) {
 			return nil, &EvalError{Message: "string-set! index out of range"}
 		}
@@ -1647,6 +1698,40 @@ func builtinCharCase(name string) builtinProc {
 			return charValue(unicode.ToUpper(rune(char))), nil
 		}
 		return charValue(unicode.ToLower(rune(char))), nil
+	}
+}
+
+func builtinCharToInteger() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "char->integer expects exactly 1 argument"}
+		}
+
+		char, err := expectCharValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return integerValue(char), nil
+	}
+}
+
+func builtinIntegerToChar() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "integer->char expects exactly 1 argument"}
+		}
+
+		codePoint, err := expectIntegerValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+
+		r := rune(codePoint)
+		if !utf8.ValidRune(r) {
+			return nil, &EvalError{Message: "integer->char expects a valid Unicode code point"}
+		}
+
+		return charValue(r), nil
 	}
 }
 

@@ -260,6 +260,8 @@ func compareNumeric(left, right numericValue, name string) bool {
 			return leftValue == rightValue
 		case "<=":
 			return leftValue <= rightValue
+		case ">=":
+			return leftValue >= rightValue
 		default:
 			return false
 		}
@@ -276,6 +278,8 @@ func compareNumeric(left, right numericValue, name string) bool {
 		return leftFloat == rightFloat
 	case "<=":
 		return leftFloat <= rightFloat
+	case ">=":
+		return leftFloat >= rightFloat
 	default:
 		return false
 	}
