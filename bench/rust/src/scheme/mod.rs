@@ -21,6 +21,7 @@ impl fmt::Display for Span {
 enum Value {
     Integer(i64),
     Boolean(bool),
+    Char(char),
     Str(String),
     Symbol(String),
     List(Vec<Value>),
@@ -40,6 +41,11 @@ impl fmt::Display for Value {
             Value::Integer(n) => write!(f, "{n}"),
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
+            Value::Char(c) => match c {
+                '\n' => write!(f, "#\\newline"),
+                ' ' => write!(f, "#\\space"),
+                _ => write!(f, "#\\{c}"),
+            },
             Value::Str(s) => write!(f, "\"{}\"", s),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(elems) => {
@@ -313,7 +319,12 @@ fn default_env() -> Env {
     for name in [
         "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "and", "or",
         "cons", "car", "cdr", "null?", "list", "length", "append",
-        "string?", "number?", "boolean?", "pair?", "symbol?",
+        "string?", "number?", "boolean?", "pair?", "symbol?", "char?",
+        "display", "write", "newline",
+        "string-append", "string-length", "substring",
+        "string->number", "number->string",
+        "symbol->string", "string->symbol",
+        "string-ref",
     ] {
         env.set(name.into(), Value::Builtin(name.into()));
     }
@@ -322,7 +333,22 @@ fn default_env() -> Env {
 
 // --- Evaluator ---
 
-fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
+fn display_value(v: &Value, out: &mut String) {
+    match v {
+        Value::Str(s) => out.push_str(s),
+        Value::List(elems) => {
+            out.push('(');
+            for (i, e) in elems.iter().enumerate() {
+                if i > 0 { out.push(' '); }
+                display_value(e, out);
+            }
+            out.push(')');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     let span = expr.span;
     match &expr.kind {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
@@ -349,11 +375,11 @@ fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
                         if elems.len() < 3 || elems.len() > 4 {
                             return Err(EvalError::Syntax(format!("if requires 2 or 3 arguments at {span}")));
                         }
-                        let cond = eval(&elems[1], env)?;
+                        let cond = eval(&elems[1], env, output)?;
                         if is_truthy(&cond) {
-                            return eval(&elems[2], env);
+                            return eval(&elems[2], env, output);
                         } else if elems.len() == 4 {
-                            return eval(&elems[3], env);
+                            return eval(&elems[3], env, output);
                         } else {
                             return Ok(Value::Void);
                         }
@@ -364,7 +390,7 @@ fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
                         }
                         match &elems[1].kind {
                             ExprKind::Symbol(name) => {
-                                let val = eval(&elems[2], env)?;
+                                let val = eval(&elems[2], env, output)?;
                                 env.set(name.clone(), val);
                                 return Ok(Value::Void);
                             }
@@ -422,7 +448,7 @@ fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
                         let args = &elems[1..];
                         let mut result = Value::Boolean(true);
                         for a in args {
-                            result = eval(a, env)?;
+                            result = eval(a, env, output)?;
                             if !is_truthy(&result) {
                                 return Ok(result);
                             }
@@ -436,7 +462,7 @@ fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
                         let args = &elems[1..];
                         let mut result = Value::Boolean(false);
                         for a in args {
-                            result = eval(a, env)?;
+                            result = eval(a, env, output)?;
                             if is_truthy(&result) {
                                 return Ok(result);
                             }
@@ -469,7 +495,7 @@ fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
                                     match &pair[0].kind {
                                         ExprKind::Symbol(s) => {
                                             params.push(s.clone());
-                                            init_vals.push(eval(&pair[1], env)?);
+                                            init_vals.push(eval(&pair[1], env, output)?);
                                         }
                                         _ => return Err(EvalError::Syntax(format!("let: expected variable name at {span}"))),
                                     }
@@ -485,7 +511,7 @@ fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
                                 body,
                                 env: env.clone(),
                             };
-                            return apply_func(&lambda, &init_vals, span);
+                            return apply_func(&lambda, &init_vals, span, output);
                         }
                         let mut local_env = Env::with_parent(env.clone());
                         for (p, v) in params.iter().zip(init_vals.iter()) {
@@ -493,14 +519,14 @@ fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
                         }
                         let mut result = Value::Void;
                         for expr in &elems[body_start..] {
-                            result = eval(expr, &mut local_env)?;
+                            result = eval(expr, &mut local_env, output)?;
                         }
                         return Ok(result);
                     }
                     "begin" => {
                         let mut result = Value::Void;
                         for expr in &elems[1..] {
-                            result = eval(expr, env)?;
+                            result = eval(expr, env, output)?;
                         }
                         return Ok(result);
                     }
@@ -512,16 +538,16 @@ fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
                                         if s == "else" {
                                             let mut result = Value::Void;
                                             for expr in &parts[1..] {
-                                                result = eval(expr, env)?;
+                                                result = eval(expr, env, output)?;
                                             }
                                             return Ok(result);
                                         }
                                     }
-                                    let test = eval(&parts[0], env)?;
+                                    let test = eval(&parts[0], env, output)?;
                                     if is_truthy(&test) {
                                         let mut result = test;
                                         for expr in &parts[1..] {
-                                            result = eval(expr, env)?;
+                                            result = eval(expr, env, output)?;
                                         }
                                         return Ok(result);
                                     }
@@ -536,19 +562,19 @@ fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
             }
 
             // Function application
-            let func = eval(&elems[0], env)?;
+            let func = eval(&elems[0], env, output)?;
             let args: Vec<Value> = elems[1..].iter()
-                .map(|a| eval(a, env))
+                .map(|a| eval(a, env, output))
                 .collect::<Result<_, _>>()?;
 
-            apply_func(&func, &args, span)
+            apply_func(&func, &args, span, output)
         }
     }
 }
 
-fn apply_func(func: &Value, args: &[Value], call_span: Span) -> Result<Value, EvalError> {
+fn apply_func(func: &Value, args: &[Value], call_span: Span, output: &mut String) -> Result<Value, EvalError> {
     match func {
-        Value::Builtin(name) => apply_builtin(name, args, call_span),
+        Value::Builtin(name) => apply_builtin(name, args, call_span, output),
         Value::Lambda { name, params, body, env } => {
             if args.len() != params.len() {
                 return Err(EvalError::Arity(format!(
@@ -582,7 +608,7 @@ fn apply_func(func: &Value, args: &[Value], call_span: Span) -> Result<Value, Ev
                 rest_exprs.push(expr);
             }
             for expr in &define_exprs {
-                eval(expr, &mut local_env)?;
+                eval(expr, &mut local_env, output)?;
             }
             if define_exprs.len() > 1 {
                 let define_names: Vec<String> = define_exprs.iter().filter_map(|expr| {
@@ -609,7 +635,7 @@ fn apply_func(func: &Value, args: &[Value], call_span: Span) -> Result<Value, Ev
             }
             let mut result = Value::Void;
             for expr in &rest_exprs {
-                result = eval(expr, &mut local_env)?;
+                result = eval(expr, &mut local_env, output)?;
             }
             Ok(result)
         }
@@ -617,7 +643,7 @@ fn apply_func(func: &Value, args: &[Value], call_span: Span) -> Result<Value, Ev
     }
 }
 
-fn apply_builtin(name: &str, args: &[Value], call_span: Span) -> Result<Value, EvalError> {
+fn apply_builtin(name: &str, args: &[Value], call_span: Span, output: &mut String) -> Result<Value, EvalError> {
     match name {
         "+" => {
             let mut sum: i64 = 0;
@@ -777,6 +803,98 @@ fn apply_builtin(name: &str, args: &[Value], call_span: Span) -> Result<Value, E
             if args.len() != 1 { return Err(EvalError::Arity(format!("symbol? requires 1 argument at {call_span}"))); }
             Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
         }
+        "char?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("char? requires 1 argument at {call_span}"))); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
+        }
+        "display" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("display requires 1 argument at {call_span}"))); }
+            display_value(&args[0], output);
+            Ok(Value::Void)
+        }
+        "write" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("write requires 1 argument at {call_span}"))); }
+            output.push_str(&args[0].to_string());
+            Ok(Value::Void)
+        }
+        "newline" => {
+            if !args.is_empty() { return Err(EvalError::Arity(format!("newline requires 0 arguments at {call_span}"))); }
+            output.push('\n');
+            Ok(Value::Void)
+        }
+        "string-append" => {
+            let mut result = String::new();
+            for a in args {
+                match a {
+                    Value::Str(s) => result.push_str(s),
+                    _ => return Err(EvalError::Type(format!("string-append: not a string at {call_span}"))),
+                }
+            }
+            Ok(Value::Str(result))
+        }
+        "string-length" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("string-length requires 1 argument at {call_span}"))); }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Integer(s.chars().count() as i64)),
+                _ => Err(EvalError::Type(format!("string-length: not a string at {call_span}"))),
+            }
+        }
+        "substring" => {
+            if args.len() != 3 { return Err(EvalError::Arity(format!("substring requires 3 arguments at {call_span}"))); }
+            let s = match &args[0] {
+                Value::Str(s) => s,
+                _ => return Err(EvalError::Type(format!("substring: not a string at {call_span}"))),
+            };
+            let start = as_int(&args[1], call_span)? as usize;
+            let end = as_int(&args[2], call_span)? as usize;
+            let chars: Vec<char> = s.chars().collect();
+            if end > chars.len() || start > end {
+                return Err(EvalError::Type(format!("substring: index out of range at {call_span}")));
+            }
+            Ok(Value::Str(chars[start..end].iter().collect()))
+        }
+        "string->number" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("string->number requires 1 argument at {call_span}"))); }
+            match &args[0] {
+                Value::Str(s) => match s.parse::<i64>() {
+                    Ok(n) => Ok(Value::Integer(n)),
+                    Err(_) => Ok(Value::Boolean(false)),
+                },
+                _ => Err(EvalError::Type(format!("string->number: not a string at {call_span}"))),
+            }
+        }
+        "number->string" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("number->string requires 1 argument at {call_span}"))); }
+            let n = as_int(&args[0], call_span)?;
+            Ok(Value::Str(n.to_string()))
+        }
+        "symbol->string" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("symbol->string requires 1 argument at {call_span}"))); }
+            match &args[0] {
+                Value::Symbol(s) => Ok(Value::Str(s.clone())),
+                _ => Err(EvalError::Type(format!("symbol->string: not a symbol at {call_span}"))),
+            }
+        }
+        "string->symbol" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("string->symbol requires 1 argument at {call_span}"))); }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Symbol(s.clone())),
+                _ => Err(EvalError::Type(format!("string->symbol: not a string at {call_span}"))),
+            }
+        }
+        "string-ref" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("string-ref requires 2 arguments at {call_span}"))); }
+            let s = match &args[0] {
+                Value::Str(s) => s,
+                _ => return Err(EvalError::Type(format!("string-ref: not a string at {call_span}"))),
+            };
+            let idx = as_int(&args[1], call_span)? as usize;
+            let chars: Vec<char> = s.chars().collect();
+            if idx >= chars.len() {
+                return Err(EvalError::Type(format!("string-ref: index out of range at {call_span}")));
+            }
+            Ok(Value::Char(chars[idx]))
+        }
         _ => Err(EvalError::Unbound(format!("{name} at {call_span}"))),
     }
 }
@@ -814,17 +932,28 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         return Err(EvalError::Parse("empty input".into()));
     }
     let mut env = default_env();
+    let mut output = String::new();
     let mut result = Value::Void;
     for expr in &exprs {
-        result = eval(expr, &mut env)?;
+        result = eval(expr, &mut env, &mut output)?;
     }
     Ok(result.to_string())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let exprs = parse_all(input)?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse("empty input".into()));
+    }
+    let mut env = default_env();
+    let mut output = String::new();
+    let mut result = Value::Void;
+    for expr in &exprs {
+        result = eval(expr, &mut env, &mut output)?;
+    }
+    Ok((result.to_string(), output))
 }
 
 #[cfg(test)]
