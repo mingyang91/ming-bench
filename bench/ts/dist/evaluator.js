@@ -26,23 +26,28 @@ class Environment {
  * representation of the last result.
  */
 export function evalStr(input) {
-    const expressions = parseProgram(input);
-    if (expressions.length === 0) {
-        throw new EvalError('empty input', START_POSITION);
-    }
-    const env = createGlobalEnv();
-    let result = VOID_VALUE;
-    for (const expr of expressions) {
-        result = evaluate(expr, env);
-    }
-    return formatValue(result);
+    return formatValue(evaluateProgram(input).result);
 }
 /**
  * Evaluate Scheme expressions and return both the result string
  * and any captured output from display/write/newline.
  */
 export function evalStrWithOutput(input) {
-    return { result: evalStr(input), output: '' };
+    const { result, output } = evaluateProgram(input);
+    return { result: formatValue(result), output };
+}
+function evaluateProgram(input) {
+    const expressions = parseProgram(input);
+    if (expressions.length === 0) {
+        throw new EvalError('empty input', START_POSITION);
+    }
+    const context = { output: [] };
+    const env = createGlobalEnv(context);
+    let result = VOID_VALUE;
+    for (const expr of expressions) {
+        result = evaluate(expr, env);
+    }
+    return { result, output: context.output.join('') };
 }
 function parseProgram(input) {
     const { tokens, eofPosition } = tokenize(input);
@@ -416,7 +421,7 @@ function evaluateSequence(expressions, env) {
     }
     return result;
 }
-function createGlobalEnv() {
+function createGlobalEnv(context) {
     const env = new Environment();
     env.define('+', builtin('+', (args, callPosition) => numberValue(evaluateNumberArgs('+', args).reduce((sum, value) => sum + value, 0), callPosition)));
     env.define('*', builtin('*', (args, callPosition) => numberValue(evaluateNumberArgs('*', args).reduce((product, value) => product * value, 1), callPosition)));
@@ -480,6 +485,73 @@ function createGlobalEnv() {
         }
         return { type: 'list', elements };
     }));
+    env.define('display', builtin('display', (args, callPosition) => {
+        requireArgCount('display', args.length, 1, callPosition);
+        context.output.push(formatDisplayValue(args[0].value));
+        return VOID_VALUE;
+    }));
+    env.define('write', builtin('write', (args, callPosition) => {
+        requireArgCount('write', args.length, 1, callPosition);
+        context.output.push(formatValue(args[0].value));
+        return VOID_VALUE;
+    }));
+    env.define('newline', builtin('newline', (args, callPosition) => {
+        requireArgCount('newline', args.length, 0, callPosition);
+        context.output.push('\n');
+        return VOID_VALUE;
+    }));
+    env.define('string-append', builtin('string-append', (args) => ({
+        type: 'string',
+        value: args.map((arg) => expectString('string-append', arg)).join(''),
+    })));
+    env.define('string-length', builtin('string-length', (args, callPosition) => {
+        requireArgCount('string-length', args.length, 1, callPosition);
+        return numberValue(codePoints(expectString('string-length', args[0])).length, callPosition);
+    }));
+    env.define('substring', builtin('substring', (args, callPosition) => {
+        requireArgCount('substring', args.length, 3, callPosition);
+        const value = expectString('substring', args[0]);
+        const start = expectNonNegativeInteger('substring', args[1]);
+        const end = expectNonNegativeInteger('substring', args[2]);
+        const characters = codePoints(value);
+        if (start > end) {
+            throw new EvalError('substring: start index exceeds end index', args[1].position);
+        }
+        if (end > characters.length) {
+            throw new EvalError('substring: index out of range', args[2].position);
+        }
+        return { type: 'string', value: characters.slice(start, end).join('') };
+    }));
+    env.define('string->number', builtin('string->number', (args, callPosition) => {
+        requireArgCount('string->number', args.length, 1, callPosition);
+        const value = expectString('string->number', args[0]);
+        if (!/^[+-]?(?:\d+|\d+\.\d+|\.\d+)$/.test(value)) {
+            return booleanValue(false);
+        }
+        return numberValue(Number(value), args[0].position);
+    }));
+    env.define('number->string', builtin('number->string', (args, callPosition) => {
+        requireArgCount('number->string', args.length, 1, callPosition);
+        return { type: 'string', value: String(expectNumber('number->string', args[0])) };
+    }));
+    env.define('symbol->string', builtin('symbol->string', (args, callPosition) => {
+        requireArgCount('symbol->string', args.length, 1, callPosition);
+        return { type: 'string', value: expectSymbol('symbol->string', args[0]).name };
+    }));
+    env.define('string->symbol', builtin('string->symbol', (args, callPosition) => {
+        requireArgCount('string->symbol', args.length, 1, callPosition);
+        return { type: 'symbol', name: expectString('string->symbol', args[0]) };
+    }));
+    env.define('string-ref', builtin('string-ref', (args, callPosition) => {
+        requireArgCount('string-ref', args.length, 2, callPosition);
+        const value = expectString('string-ref', args[0]);
+        const index = expectNonNegativeInteger('string-ref', args[1]);
+        const characters = codePoints(value);
+        if (index >= characters.length) {
+            throw new EvalError('string-ref: index out of range', args[1].position);
+        }
+        return charValue(characters[index], args[1].position);
+    }));
     env.define('null?', builtin('null?', (args, callPosition) => {
         requireArgCount('null?', args.length, 1, callPosition);
         return booleanValue(args[0].value.type === 'list' && args[0].value.elements.length === 0);
@@ -503,6 +575,10 @@ function createGlobalEnv() {
     env.define('symbol?', builtin('symbol?', (args, callPosition) => {
         requireArgCount('symbol?', args.length, 1, callPosition);
         return booleanValue(args[0].value.type === 'symbol');
+    }));
+    env.define('char?', builtin('char?', (args, callPosition) => {
+        requireArgCount('char?', args.length, 1, callPosition);
+        return booleanValue(args[0].value.type === 'char');
     }));
     return env;
 }
@@ -538,6 +614,25 @@ function expectNumber(name, arg) {
     }
     return arg.value.value;
 }
+function expectString(name, arg) {
+    if (arg.value.type !== 'string') {
+        throw new EvalError(`${name}: expected string`, arg.position);
+    }
+    return arg.value.value;
+}
+function expectSymbol(name, arg) {
+    if (arg.value.type !== 'symbol') {
+        throw new EvalError(`${name}: expected symbol`, arg.position);
+    }
+    return arg.value;
+}
+function expectNonNegativeInteger(name, arg) {
+    const value = expectNumber(name, arg);
+    if (!Number.isInteger(value) || value < 0) {
+        throw new EvalError(`${name}: expected non-negative integer`, arg.position);
+    }
+    return value;
+}
 function expectList(name, arg) {
     if (arg.value.type !== 'list') {
         throw new EvalError(`${name}: expected list`, arg.position);
@@ -554,6 +649,9 @@ function expectPair(name, arg) {
 function isTruthy(value) {
     return value.type !== 'boolean' || value.value;
 }
+function codePoints(value) {
+    return Array.from(value);
+}
 function numberValue(value, position) {
     if (!Number.isFinite(value)) {
         throw new EvalError('invalid number', position);
@@ -562,6 +660,12 @@ function numberValue(value, position) {
 }
 function booleanValue(value) {
     return { type: 'boolean', value };
+}
+function charValue(value, position) {
+    if (codePoints(value).length !== 1) {
+        throw new EvalError('invalid character', position);
+    }
+    return { type: 'char', value };
 }
 function attachPosition(error, position) {
     if (error instanceof EvalError) {
@@ -572,6 +676,17 @@ function attachPosition(error, position) {
     }
     return new EvalError(String(error), position);
 }
+function formatDisplayValue(value) {
+    switch (value.type) {
+        case 'string':
+        case 'char':
+            return value.value;
+        case 'list':
+            return `(${value.elements.map(formatDisplayValue).join(' ')})`;
+        default:
+            return formatValue(value);
+    }
+}
 function formatValue(value) {
     switch (value.type) {
         case 'number':
@@ -580,6 +695,8 @@ function formatValue(value) {
             return value.value ? '#t' : '#f';
         case 'string':
             return JSON.stringify(value.value);
+        case 'char':
+            return formatChar(value.value);
         case 'symbol':
             return value.name;
         case 'list':
@@ -590,4 +707,13 @@ function formatValue(value) {
         case 'void':
             return '#<void>';
     }
+}
+function formatChar(value) {
+    if (value === ' ') {
+        return '#\\space';
+    }
+    if (value === '\n') {
+        return '#\\newline';
+    }
+    return `#\\${value}`;
 }
