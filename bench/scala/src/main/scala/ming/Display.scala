@@ -8,7 +8,7 @@ private[ming] object Display:
     case Expr.Real(v)               => formatReal(v)
     case Expr.Bool(true)            => "#t"
     case Expr.Bool(false)           => "#f"
-    case Expr.Str(s)                => "\"" + new String(s) + "\""
+    case Expr.Str(s, _)             => "\"" + new String(s) + "\""
     case Expr.Chr(c)                => s"#\\$c"
     case Expr.Sym(name)             => name
     case Expr.Lst(elems)            => "(" + elems.map(display).mkString(" ") + ")"
@@ -20,7 +20,7 @@ private[ming] object Display:
     case Expr.Record(name, _, _, _) => s"#<record:$name>"
 
   def displayOutput(e: Expr): String = e match
-    case Expr.Str(s) => new String(s)
+    case Expr.Str(s, _) => new String(s)
     case other       => display(other)
 
   private def formatReal(v: Double): String =

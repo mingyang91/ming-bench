@@ -9,7 +9,7 @@ object Evaluator:
   private[ming] def eval(expr: Expr, env: Env): Expr =
     try
       expr match
-        case Expr.Num(_) | Expr.Rational(_, _) | Expr.Real(_) | Expr.Bool(_) | Expr.Str(_) | Expr.Chr(_) |
+        case Expr.Num(_) | Expr.Rational(_, _) | Expr.Real(_) | Expr.Bool(_) | Expr.Str(_, _) | Expr.Chr(_) |
             Expr.Lambda(_, _, _, _) | Expr.Pair(_, _) | Expr.Macro(_, _, _) | Expr.Record(_, _, _, _) |
             Expr.CaseLambda(_, _) | Expr.Vec(_) =>
           expr

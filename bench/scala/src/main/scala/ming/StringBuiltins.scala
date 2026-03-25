@@ -5,36 +5,37 @@ private[ming] object StringBuiltins:
   def applyStringBuiltin(name: String, args: List[Expr]): Expr = name match
     case "string-append" =>
       val strs = args.map {
-        case Expr.Str(s) => new String(s)
-        case other       => throw EvalError(s"string-append: not a string: ${Builtins.display(other)}")
+        case Expr.Str(s, _) => new String(s)
+        case other          => throw EvalError(s"string-append: not a string: ${Builtins.display(other)}")
       }
       Expr.Str(strs.mkString.toCharArray)
     case "string-length" =>
       Builtins.unary(name, args) {
-        case Expr.Str(s) => Expr.Num(s.length.toLong)
-        case other       => throw EvalError(s"string-length: not a string: ${Builtins.display(other)}")
+        case Expr.Str(s, _) => Expr.Num(s.length.toLong)
+        case other          => throw EvalError(s"string-length: not a string: ${Builtins.display(other)}")
       }
     case "string-set!" =>
       if args.length != 3 then throw EvalError("string-set!: need exactly 3 arguments")
       args match
-        case List(Expr.Str(s), Expr.Num(idx), Expr.Chr(c)) =>
+        case List(Expr.Str(s, mutable), Expr.Num(idx), Expr.Chr(c)) =>
+          if !mutable then throw EvalError("string-set!: strings are immutable")
           s(idx.toInt) = c
           Expr.Bool(false)
         case _ => throw EvalError("string-set!: invalid arguments")
     case "string-copy" =>
       Builtins.unary(name, args) {
-        case Expr.Str(s) => Expr.Str(s.clone())
-        case other       => throw EvalError(s"string-copy: not a string: ${Builtins.display(other)}")
+        case Expr.Str(s, _) => Expr.Str(s.clone())
+        case other          => throw EvalError(s"string-copy: not a string: ${Builtins.display(other)}")
       }
     case "substring" =>
       if args.length != 3 then throw EvalError("substring: need exactly 3 arguments")
       args match
-        case List(Expr.Str(s), Expr.Num(start), Expr.Num(end)) =>
+        case List(Expr.Str(s, _), Expr.Num(start), Expr.Num(end)) =>
           Expr.Str(new String(s).substring(start.toInt, end.toInt).toCharArray)
         case _ => throw EvalError("substring: invalid arguments")
     case "string->number" =>
       Builtins.unary(name, args) {
-        case Expr.Str(s) =>
+        case Expr.Str(s, _) =>
           val str = new String(s)
           str.toLongOption match
             case Some(n) => Expr.Num(n)
@@ -56,14 +57,14 @@ private[ming] object StringBuiltins:
       }
     case "string->symbol" =>
       Builtins.unary(name, args) {
-        case Expr.Str(s) => Expr.Sym(new String(s))
-        case other       => throw EvalError(s"string->symbol: not a string: ${Builtins.display(other)}")
+        case Expr.Str(s, _) => Expr.Sym(new String(s))
+        case other          => throw EvalError(s"string->symbol: not a string: ${Builtins.display(other)}")
       }
     case "string-ref" =>
       if args.length != 2 then throw EvalError("string-ref: need exactly 2 arguments")
       args match
-        case List(Expr.Str(s), Expr.Num(idx)) => Expr.Chr(s(idx.toInt))
-        case _                                => throw EvalError("string-ref: invalid arguments")
+        case List(Expr.Str(s, _), Expr.Num(idx)) => Expr.Chr(s(idx.toInt))
+        case _                                   => throw EvalError("string-ref: invalid arguments")
     case "char?" =>
       Builtins.unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Chr]))
     case "string=?"    => strCmp(name, args, _ == _)
@@ -71,13 +72,38 @@ private[ming] object StringBuiltins:
     case "string-ci=?" => strCiCmp(name, args, _ == _)
     case "string-upcase" =>
       Builtins.unary(name, args) {
-        case Expr.Str(s) => Expr.Str(new String(s).toUpperCase.toCharArray)
-        case _           => throw EvalError("string-upcase: not a string")
+        case Expr.Str(s, _) => Expr.Str(new String(s).toUpperCase.toCharArray)
+        case _              => throw EvalError("string-upcase: not a string")
       }
     case "string-downcase" =>
       Builtins.unary(name, args) {
-        case Expr.Str(s) => Expr.Str(new String(s).toLowerCase.toCharArray)
-        case _           => throw EvalError("string-downcase: not a string")
+        case Expr.Str(s, _) => Expr.Str(new String(s).toLowerCase.toCharArray)
+        case _              => throw EvalError("string-downcase: not a string")
+      }
+    case "string->list" =>
+      Builtins.unary(name, args) {
+        case Expr.Str(s, _) => Expr.Lst(s.map(c => Expr.Chr(c)).toList)
+        case other          => throw EvalError(s"string->list: not a string: ${Builtins.display(other)}")
+      }
+    case "list->string" =>
+      Builtins.unary(name, args) {
+        case Expr.Lst(elems) =>
+          val chars = elems.map {
+            case Expr.Chr(c) => c
+            case other       => throw EvalError(s"list->string: not a character: ${Builtins.display(other)}")
+          }
+          Expr.Str(chars.toArray)
+        case other => throw EvalError(s"list->string: not a list: ${Builtins.display(other)}")
+      }
+    case "char->integer" =>
+      Builtins.unary(name, args) {
+        case Expr.Chr(c) => Expr.Num(c.toLong)
+        case other       => throw EvalError(s"char->integer: not a character: ${Builtins.display(other)}")
+      }
+    case "integer->char" =>
+      Builtins.unary(name, args) {
+        case Expr.Num(n) => Expr.Chr(n.toChar)
+        case other       => throw EvalError(s"integer->char: not an integer: ${Builtins.display(other)}")
       }
     case _ => throw EvalError(s"unknown procedure: $name")
 
@@ -111,12 +137,12 @@ private[ming] object StringBuiltins:
   def strCmp(name: String, args: List[Expr], op: (String, String) => Boolean): Expr =
     if args.length != 2 then throw EvalError(s"$name: need exactly 2 arguments")
     (args(0), args(1)) match
-      case (Expr.Str(a), Expr.Str(b)) => Expr.Bool(op(new String(a), new String(b)))
-      case _                          => throw EvalError(s"$name: not strings")
+      case (Expr.Str(a, _), Expr.Str(b, _)) => Expr.Bool(op(new String(a), new String(b)))
+      case _                                => throw EvalError(s"$name: not strings")
 
   def strCiCmp(name: String, args: List[Expr], op: (String, String) => Boolean): Expr =
     if args.length != 2 then throw EvalError(s"$name: need exactly 2 arguments")
     (args(0), args(1)) match
-      case (Expr.Str(a), Expr.Str(b)) =>
+      case (Expr.Str(a, _), Expr.Str(b, _)) =>
         Expr.Bool(op(new String(a).toLowerCase, new String(b).toLowerCase))
       case _ => throw EvalError(s"$name: not strings")

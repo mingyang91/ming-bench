@@ -51,7 +51,8 @@ private[ming] object Builtins:
       if buf != null then buf.append("\n")
       Expr.Bool(false)
     case "string-append" | "string-length" | "string-set!" | "string-copy" | "substring" | "string->number" |
-        "number->string" | "symbol->string" | "string->symbol" | "string-ref" | "char?" =>
+        "number->string" | "symbol->string" | "string->symbol" | "string-ref" | "char?" | "string->list" |
+        "list->string" | "char->integer" | "integer->char" =>
       StringBuiltins.applyStringBuiltin(name, args)
     case "abs" =>
       unary(name, args) {
@@ -265,7 +266,11 @@ private[ming] object Builtins:
     "vector-length",
     "vector?",
     "vector->list",
-    "list->vector"
+    "list->vector",
+    "string->list",
+    "list->string",
+    "char->integer",
+    "integer->char"
   )
 
   def makeTopLevelEnv(): Env =

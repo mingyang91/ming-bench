@@ -7,7 +7,7 @@ private[ming] enum Expr:
   case Rational(num: Long, den: Long)
   case Real(value: Double)
   case Bool(value: Boolean)
-  case Str(chars: Array[Char])
+  case Str(chars: Array[Char], isMutable: Boolean = true)
   case Chr(value: Char)
   case Sym(name: String)
   case Lst(elems: List[Expr])

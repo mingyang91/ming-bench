@@ -19,7 +19,7 @@ private[ming] object EqualityOps:
     case (Expr.Bool(x), Expr.Bool(y))                   => x == y
     case (Expr.Sym(x), Expr.Sym(y))                     => x == y
     case (Expr.Chr(x), Expr.Chr(y))                     => x == y
-    case (Expr.Str(x), Expr.Str(y))                     => java.util.Arrays.equals(x, y)
+    case (Expr.Str(x, _), Expr.Str(y, _))               => java.util.Arrays.equals(x, y)
     case (Expr.Lst(xs), Expr.Lst(ys)) =>
       xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b))
     case (Expr.Pair(a1, d1), Expr.Pair(a2, d2)) =>

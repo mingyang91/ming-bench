@@ -79,7 +79,7 @@ private[ming] class SchemeParser(input: String):
       else sb.append(c)
     if pos >= input.length then throw EvalError("unterminated string")
     advance() // skip closing "
-    Expr.Str(sb.result().toCharArray)
+    Expr.Str(sb.result().toCharArray, isMutable = false)
 
   private def parseHash(): Expr =
     advance() // skip '#'
