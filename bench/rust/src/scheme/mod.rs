@@ -297,6 +297,7 @@ impl Env {
 enum Procedure {
     Builtin(BuiltinProcedure),
     Lambda(LambdaProcedure),
+    CaseLambda(CaseLambdaProcedure),
     RecordConstructor(RecordConstructorProcedure),
     RecordPredicate(RecordPredicateProcedure),
     RecordAccessor(RecordAccessorProcedure),
@@ -313,6 +314,31 @@ struct LambdaProcedure {
     params: ParameterList,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+#[derive(Clone)]
+struct CaseLambdaProcedure {
+    name: String,
+    clauses: Vec<LambdaProcedure>,
+}
+
+impl CaseLambdaProcedure {
+    fn expected_arity(&self) -> String {
+        let mut arities = Vec::with_capacity(self.clauses.len());
+
+        for clause in &self.clauses {
+            let arity = clause.params.expected_arity();
+            if !arities.iter().any(|existing| existing == &arity) {
+                arities.push(arity);
+            }
+        }
+
+        match arities.as_slice() {
+            [] => "no clauses".to_string(),
+            [arity] => arity.clone(),
+            _ => arities.join(" or "),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -586,6 +612,7 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "boolean?", builtin_boolean_predicate);
     define_builtin(&env, "pair?", builtin_pair_predicate);
     define_builtin(&env, "symbol?", builtin_symbol_predicate);
+    define_builtin(&env, "procedure?", builtin_procedure_predicate);
     define_builtin(&env, "display", builtin_display);
     define_builtin(&env, "write", builtin_write);
     define_builtin(&env, "newline", builtin_newline);
@@ -744,6 +771,7 @@ fn eval_list(items: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value
             "define-syntax" => return eval_define_syntax(args, env),
             "set!" => return eval_set(args, env, ctx),
             "lambda" => return eval_lambda(args, env),
+            "case-lambda" => return eval_case_lambda(args, env),
             "let" => return eval_let(args, env, ctx),
             _ => {}
         }
@@ -996,6 +1024,39 @@ fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     ))
 }
 
+fn eval_case_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "case-lambda requires at least one clause".to_string(),
+        });
+    }
+
+    let mut clauses = Vec::with_capacity(args.len());
+
+    for clause in args {
+        let Expr::List(items) = clause else {
+            return Err(EvalError::SyntaxError {
+                message: "case-lambda clauses must be lists".to_string(),
+            });
+        };
+
+        if items.len() < 2 {
+            return Err(EvalError::SyntaxError {
+                message: "case-lambda clauses require parameters and a body".to_string(),
+            });
+        }
+
+        clauses.push(LambdaProcedure {
+            name: "case-lambda".to_string(),
+            params: parse_param_list(&items[0])?,
+            body: items[1..].to_vec(),
+            env: env.clone(),
+        });
+    }
+
+    Ok(make_case_lambda("case-lambda".to_string(), clauses))
+}
+
 fn eval_let(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::SyntaxError {
@@ -1224,6 +1285,13 @@ fn make_lambda(name: String, params: ParameterList, body: Vec<Expr>, env: EnvRef
     })))
 }
 
+fn make_case_lambda(name: String, clauses: Vec<LambdaProcedure>) -> Value {
+    Value::Procedure(Rc::new(Procedure::CaseLambda(CaseLambdaProcedure {
+        name,
+        clauses,
+    })))
+}
+
 fn make_record_constructor(name: String, record_type: RecordTypeRef, field_count: usize) -> Value {
     Value::Procedure(Rc::new(Procedure::RecordConstructor(
         RecordConstructorProcedure {
@@ -1283,6 +1351,7 @@ fn apply_procedure(
     match procedure.as_ref() {
         Procedure::Builtin(builtin) => (builtin.implementation)(&args, ctx),
         Procedure::Lambda(lambda) => apply_lambda(lambda, args, ctx),
+        Procedure::CaseLambda(case_lambda) => apply_case_lambda(case_lambda, args, ctx),
         Procedure::RecordConstructor(constructor) => apply_record_constructor(constructor, args),
         Procedure::RecordPredicate(predicate) => apply_record_predicate(predicate, args),
         Procedure::RecordAccessor(accessor) => apply_record_accessor(accessor, args),
@@ -1337,6 +1406,26 @@ fn apply_lambda(
     }
 
     eval_sequence(&lambda.body, call_env, ctx)
+}
+
+fn apply_case_lambda(
+    case_lambda: &CaseLambdaProcedure,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let Some(index) = case_lambda
+        .clauses
+        .iter()
+        .position(|clause| clause.params.accepts(args.len()))
+    else {
+        return Err(EvalError::WrongArgumentCount {
+            name: case_lambda.name.clone(),
+            expected: case_lambda.expected_arity(),
+            got: args.len(),
+        });
+    };
+
+    apply_lambda(&case_lambda.clauses[index], args, ctx)
 }
 
 fn apply_record_constructor(
@@ -1542,6 +1631,13 @@ fn builtin_pair_predicate(args: &[Value], _ctx: &mut EvalContext) -> Result<Valu
 
 fn builtin_symbol_predicate(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     builtin_type_predicate("symbol?", args, |value| matches!(value, Value::Symbol(_)))
+}
+
+fn builtin_procedure_predicate(
+    args: &[Value],
+    _ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    builtin_type_predicate("procedure?", args, |value| matches!(value, Value::Procedure(_)))
 }
 
 fn builtin_char_predicate(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -2383,6 +2479,7 @@ fn is_special_form_name(name: &str) -> bool {
             | "define-syntax"
             | "set!"
             | "lambda"
+            | "case-lambda"
             | "let"
     )
 }
