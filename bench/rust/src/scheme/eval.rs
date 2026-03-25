@@ -41,6 +41,7 @@ enum Frame {
     DynWindTransition { outs: Vec<Value>, rewind_entries: WindStack, target_k: CapturedKont, target_val: Value, target_winds: WindStack },
     PopExceptionHandler,
     GuardClauses { var: String, clauses: Vec<Expr>, env: Env },
+    CallWithValuesConsumer { consumer: Value, pos: String },
 }
 
 enum CekState {
@@ -530,6 +531,14 @@ impl Evaluator {
                 self.pending_exception = Some(val);
                 return Err(EvalError::ExceptionRaised);
             }
+            Frame::CallWithValuesConsumer { consumer, pos } => {
+                // val is the producer's result; unpack Values into args
+                let args = match val {
+                    Value::Values(vals) => vals,
+                    single => vec![single],
+                };
+                self.cek_apply(consumer, args, k, s, &pos)?;
+            }
         }
         Ok(())
     }
@@ -599,6 +608,23 @@ impl Evaluator {
                 self.exception_handlers.push(ExceptionHandlerEntry::Procedure(handler));
                 k.push(Frame::PopExceptionHandler);
                 self.cek_apply(thunk, vec![], k, s, pos)?;
+            }
+            Value::Symbol(name) if name == "values" => {
+                // (values) => Values([])
+                // (values x) => x  (single value is transparent)
+                // (values x y ...) => Values([x, y, ...])
+                if args.len() == 1 {
+                    *s = CekState::Ret(args.into_iter().next().unwrap());
+                } else {
+                    *s = CekState::Ret(Value::Values(args));
+                }
+            }
+            Value::Symbol(name) if name == "call-with-values" => {
+                if args.len() != 2 { return Err(EvalError::Arity(format!("call-with-values: expected 2 args at {pos}"))); }
+                let producer = args[0].clone();
+                let consumer = args[1].clone();
+                k.push(Frame::CallWithValuesConsumer { consumer, pos: pos.to_string() });
+                self.cek_apply(producer, vec![], k, s, pos)?;
             }
             Value::Symbol(name) if name == "apply" => {
                 if args.len() < 2 { return Err(EvalError::Arity(format!("apply: expected at least 2 args at {pos}"))); }
@@ -794,7 +820,8 @@ impl Evaluator {
             | "cadar"
             | "call/cc" | "call-with-current-continuation"
             | "dynamic-wind"
-            | "raise" | "with-exception-handler")
+            | "raise" | "with-exception-handler"
+            | "values" | "call-with-values")
     }
 
     fn eval_in_env(&mut self, expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {

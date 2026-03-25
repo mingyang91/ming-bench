@@ -43,6 +43,7 @@ pub enum Value {
     RecordPredicate(u64),              // type_id
     RecordAccessor(u64, usize),        // type_id, field_index
     Continuation(u64),                 // continuation id for call/cc
+    Values(Vec<Value>),                // multiple return values
     Void,
 }
 
@@ -213,6 +214,7 @@ fn equal_with_cycle_check(a: &Value, b: &Value, seen: &mut HashSet<(usize, usize
         (Value::CaseLambda(_), Value::CaseLambda(_)) => false,
         (Value::Macro(_), Value::Macro(_)) => false,
         (Value::Record(t1, f1), Value::Record(t2, f2)) => t1 == t2 && f1 == f2,
+        (Value::Values(a), Value::Values(b)) => a == b,
         (Value::Void, Value::Void) => true,
         _ => false,
     }
@@ -336,6 +338,10 @@ impl Value {
             }
             Value::Record(..) => "#<record>".into(),
             Value::RecordConstructor(..) | Value::RecordPredicate(_) | Value::RecordAccessor(..) => "#<procedure>".into(),
+            Value::Values(vals) => {
+                if vals.is_empty() { "".into() }
+                else { vals.iter().map(|v| v.to_display_string()).collect::<Vec<_>>().join("\n") }
+            }
             Value::Void => "".into(),
         }
     }
