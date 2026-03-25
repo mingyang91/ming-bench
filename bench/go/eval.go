@@ -2,135 +2,496 @@ package ming
 
 import "fmt"
 
-func Eval(expr *Expr, env *Env) (*Value, error) {
-	switch expr.Type {
-	case ExprInteger:
-		return IntValue(expr.IntVal), nil
-	case ExprBoolean:
-		return BoolValue(expr.BoolVal), nil
-	case ExprString:
-		return StringValue(expr.StrVal), nil
-	case ExprChar:
-		runes := []rune(expr.StrVal)
-		return CharValue(runes[0]), nil
-	case ExprFloat:
-		return FloatValue(expr.FloatVal), nil
-	case ExprRational:
-		return RationalValue(expr.Num, expr.Den), nil
-	case ExprSymbol:
-		val, ok := env.Get(expr.StrVal)
-		if !ok {
-			return nil, fmt.Errorf("%d:%d: unbound variable '%s'", expr.Line, expr.Col, expr.StrVal)
+// bindLambdaEnv creates a new environment binding lambda parameters to arguments.
+func bindLambdaEnv(fn *Value, args []*Value, line, col int) (*Env, error) {
+	if fn.RestParam != "" {
+		if len(args) < len(fn.Params) {
+			return nil, fmt.Errorf("%d:%d: wrong number of arguments: expected at least %d, got %d", line, col, len(fn.Params), len(args))
 		}
-		return val, nil
-	case ExprLiteral:
-		return expr.LitVal, nil
-	case ExprList:
-		return evalList(expr, env)
+		callEnv := NewEnv(fn.ClosureEnv)
+		for i, param := range fn.Params {
+			callEnv.Set(param, args[i])
+		}
+		rest := Null
+		for i := len(args) - 1; i >= len(fn.Params); i-- {
+			rest = PairValue(args[i], rest)
+		}
+		callEnv.Set(fn.RestParam, rest)
+		return callEnv, nil
 	}
-	return nil, fmt.Errorf("%d:%d: unknown expression type", expr.Line, expr.Col)
+	if len(args) != len(fn.Params) {
+		return nil, fmt.Errorf("%d:%d: wrong number of arguments: expected %d, got %d", line, col, len(fn.Params), len(args))
+	}
+	callEnv := NewEnv(fn.ClosureEnv)
+	for i, param := range fn.Params {
+		callEnv.Set(param, args[i])
+	}
+	return callEnv, nil
 }
 
-func evalList(expr *Expr, env *Env) (*Value, error) {
-	if len(expr.Elements) == 0 {
-		return nil, fmt.Errorf("%d:%d: empty application", expr.Line, expr.Col)
-	}
-
-	// Check for special forms
-	head := expr.Elements[0]
-	if head.Type == ExprSymbol {
-		switch head.StrVal {
-		case "and":
-			return evalAnd(expr, env)
-		case "or":
-			return evalOr(expr, env)
-		case "define":
-			return evalDefine(expr, env)
-		case "if":
-			return evalIf(expr, env)
-		case "quote":
-			return evalQuote(expr)
-		case "lambda":
-			return evalLambda(expr, env)
-		case "let":
-			return evalLet(expr, env)
-		case "begin":
-			return evalBegin(expr, env)
-		case "cond":
-			return evalCond(expr, env)
-		case "set!":
-			return evalSetBang(expr, env)
-		case "define-syntax":
-			return evalDefineSyntax(expr, env)
-		case "define-record-type":
-			return evalDefineRecordType(expr, env)
-		case "case-lambda":
-			return evalCaseLambda(expr, env)
-		case "letrec":
-			return evalLetrec(expr, env)
-		case "letrec*":
-			return evalLetrecStar(expr, env)
-		case "case":
-			return evalCase(expr, env)
-		case "do":
-			return evalDo(expr, env)
+// bindCaseLambdaEnv finds the matching clause and creates the call environment.
+func bindCaseLambdaEnv(fn *Value, args []*Value, line, col int) (*Env, []*Expr, error) {
+	for _, clause := range fn.CaseClauses {
+		if clause.RestParam != "" {
+			if len(args) >= len(clause.Params) {
+				callEnv := NewEnv(fn.ClosureEnv)
+				for i, param := range clause.Params {
+					callEnv.Set(param, args[i])
+				}
+				rest := Null
+				for i := len(args) - 1; i >= len(clause.Params); i-- {
+					rest = PairValue(args[i], rest)
+				}
+				callEnv.Set(clause.RestParam, rest)
+				return callEnv, clause.Body, nil
+			}
+		} else if len(args) == len(clause.Params) {
+			callEnv := NewEnv(fn.ClosureEnv)
+			for i, param := range clause.Params {
+				callEnv.Set(param, args[i])
+			}
+			return callEnv, clause.Body, nil
 		}
-		// Check for macro application
-		if val, ok := env.Get(head.StrVal); ok && val.Type == TypeMacro {
-			expanded, err := expandMacro(val.Macro, expr)
+	}
+	return nil, nil, fmt.Errorf("%d:%d: no matching clause in case-lambda for %d arguments", line, col, len(args))
+}
+
+// Eval evaluates an expression in the given environment.
+// Uses a trampoline loop for tail-call optimization.
+func Eval(expr *Expr, env *Env) (*Value, error) {
+	for {
+		switch expr.Type {
+		case ExprInteger:
+			return IntValue(expr.IntVal), nil
+		case ExprBoolean:
+			return BoolValue(expr.BoolVal), nil
+		case ExprString:
+			return StringValue(expr.StrVal), nil
+		case ExprChar:
+			runes := []rune(expr.StrVal)
+			return CharValue(runes[0]), nil
+		case ExprFloat:
+			return FloatValue(expr.FloatVal), nil
+		case ExprRational:
+			return RationalValue(expr.Num, expr.Den), nil
+		case ExprSymbol:
+			val, ok := env.Get(expr.StrVal)
+			if !ok {
+				return nil, fmt.Errorf("%d:%d: unbound variable '%s'", expr.Line, expr.Col, expr.StrVal)
+			}
+			return val, nil
+		case ExprLiteral:
+			return expr.LitVal, nil
+		case ExprList:
+			if len(expr.Elements) == 0 {
+				return nil, fmt.Errorf("%d:%d: empty application", expr.Line, expr.Col)
+			}
+
+			head := expr.Elements[0]
+			if head.Type == ExprSymbol {
+				switch head.StrVal {
+				// Non-tail forms — return directly
+				case "define":
+					return evalDefine(expr, env)
+				case "set!":
+					return evalSetBang(expr, env)
+				case "quote":
+					return evalQuote(expr)
+				case "lambda":
+					return evalLambda(expr, env)
+				case "case-lambda":
+					return evalCaseLambda(expr, env)
+				case "define-syntax":
+					return evalDefineSyntax(expr, env)
+				case "define-record-type":
+					return evalDefineRecordType(expr, env)
+				case "do":
+					return evalDo(expr, env)
+
+				// Tail forms — update expr/env and continue trampoline
+				case "if":
+					if len(expr.Elements) < 3 || len(expr.Elements) > 4 {
+						return nil, fmt.Errorf("%d:%d: 'if' requires 2 or 3 arguments", expr.Line, expr.Col)
+					}
+					cond, err := Eval(expr.Elements[1], env)
+					if err != nil {
+						return nil, err
+					}
+					if isTruthy(cond) {
+						expr = expr.Elements[2]
+						continue
+					}
+					if len(expr.Elements) == 4 {
+						expr = expr.Elements[3]
+						continue
+					}
+					return Void, nil
+
+				case "begin":
+					if len(expr.Elements) < 2 {
+						return Void, nil
+					}
+					for _, e := range expr.Elements[1 : len(expr.Elements)-1] {
+						_, err := Eval(e, env)
+						if err != nil {
+							return nil, err
+						}
+					}
+					expr = expr.Elements[len(expr.Elements)-1]
+					continue
+
+				case "and":
+					if len(expr.Elements) == 1 {
+						return True, nil
+					}
+					for _, e := range expr.Elements[1 : len(expr.Elements)-1] {
+						val, err := Eval(e, env)
+						if err != nil {
+							return nil, err
+						}
+						if !isTruthy(val) {
+							return val, nil
+						}
+					}
+					expr = expr.Elements[len(expr.Elements)-1]
+					continue
+
+				case "or":
+					if len(expr.Elements) == 1 {
+						return False, nil
+					}
+					for _, e := range expr.Elements[1 : len(expr.Elements)-1] {
+						val, err := Eval(e, env)
+						if err != nil {
+							return nil, err
+						}
+						if isTruthy(val) {
+							return val, nil
+						}
+					}
+					expr = expr.Elements[len(expr.Elements)-1]
+					continue
+
+				case "cond":
+					found := false
+					for _, clause := range expr.Elements[1:] {
+						if clause.Type != ExprList || len(clause.Elements) < 2 {
+							return nil, fmt.Errorf("%d:%d: invalid cond clause", expr.Line, expr.Col)
+						}
+						isElse := clause.Elements[0].Type == ExprSymbol && clause.Elements[0].StrVal == "else"
+						if !isElse {
+							test, err := Eval(clause.Elements[0], env)
+							if err != nil {
+								return nil, err
+							}
+							if !isTruthy(test) {
+								continue
+							}
+						}
+						// Matched — evaluate body with TCO on last
+						body := clause.Elements[1:]
+						for _, e := range body[:len(body)-1] {
+							_, err := Eval(e, env)
+							if err != nil {
+								return nil, err
+							}
+						}
+						expr = body[len(body)-1]
+						found = true
+						break
+					}
+					if found {
+						continue
+					}
+					return Void, nil
+
+				case "let":
+					if len(expr.Elements) < 3 {
+						return nil, fmt.Errorf("%d:%d: 'let' requires bindings and body", expr.Line, expr.Col)
+					}
+					bindingsIdx := 1
+					var loopName string
+					if expr.Elements[1].Type == ExprSymbol {
+						loopName = expr.Elements[1].StrVal
+						bindingsIdx = 2
+						if len(expr.Elements) < 4 {
+							return nil, fmt.Errorf("%d:%d: named 'let' requires bindings and body", expr.Line, expr.Col)
+						}
+					}
+					bindingsExpr := expr.Elements[bindingsIdx]
+					if bindingsExpr.Type != ExprList {
+						return nil, fmt.Errorf("%d:%d: 'let' bindings must be a list", expr.Line, expr.Col)
+					}
+					names := make([]string, len(bindingsExpr.Elements))
+					vals := make([]*Value, len(bindingsExpr.Elements))
+					for i, binding := range bindingsExpr.Elements {
+						if binding.Type != ExprList || len(binding.Elements) != 2 {
+							return nil, fmt.Errorf("%d:%d: invalid let binding", expr.Line, expr.Col)
+						}
+						if binding.Elements[0].Type != ExprSymbol {
+							return nil, fmt.Errorf("%d:%d: let binding name must be a symbol", expr.Line, expr.Col)
+						}
+						names[i] = binding.Elements[0].StrVal
+						val, err := Eval(binding.Elements[1], env)
+						if err != nil {
+							return nil, err
+						}
+						vals[i] = val
+					}
+					letEnv := NewEnv(env)
+					for i, name := range names {
+						letEnv.Set(name, vals[i])
+					}
+					body := expr.Elements[bindingsIdx+1:]
+					if loopName != "" {
+						lambda := &Value{
+							Type:       TypeLambda,
+							Params:     names,
+							Body:       body,
+							ClosureEnv: letEnv,
+						}
+						letEnv.Set(loopName, lambda)
+					}
+					for _, bodyExpr := range body[:len(body)-1] {
+						_, err := Eval(bodyExpr, letEnv)
+						if err != nil {
+							return nil, err
+						}
+					}
+					expr = body[len(body)-1]
+					env = letEnv
+					continue
+
+				case "letrec":
+					if len(expr.Elements) < 3 {
+						return nil, fmt.Errorf("%d:%d: 'letrec' requires bindings and body", expr.Line, expr.Col)
+					}
+					bindingsExpr := expr.Elements[1]
+					if bindingsExpr.Type != ExprList {
+						return nil, fmt.Errorf("%d:%d: 'letrec' bindings must be a list", expr.Line, expr.Col)
+					}
+					letEnv := NewEnv(env)
+					names := make([]string, len(bindingsExpr.Elements))
+					for i, binding := range bindingsExpr.Elements {
+						if binding.Type != ExprList || len(binding.Elements) != 2 || binding.Elements[0].Type != ExprSymbol {
+							return nil, fmt.Errorf("%d:%d: invalid letrec binding", expr.Line, expr.Col)
+						}
+						names[i] = binding.Elements[0].StrVal
+						letEnv.Set(names[i], Void)
+					}
+					for i, binding := range bindingsExpr.Elements {
+						val, err := Eval(binding.Elements[1], letEnv)
+						if err != nil {
+							return nil, err
+						}
+						letEnv.Set(names[i], val)
+					}
+					body := expr.Elements[2:]
+					for _, bodyExpr := range body[:len(body)-1] {
+						_, err := Eval(bodyExpr, letEnv)
+						if err != nil {
+							return nil, err
+						}
+					}
+					expr = body[len(body)-1]
+					env = letEnv
+					continue
+
+				case "letrec*":
+					if len(expr.Elements) < 3 {
+						return nil, fmt.Errorf("%d:%d: 'letrec*' requires bindings and body", expr.Line, expr.Col)
+					}
+					bindingsExpr := expr.Elements[1]
+					if bindingsExpr.Type != ExprList {
+						return nil, fmt.Errorf("%d:%d: 'letrec*' bindings must be a list", expr.Line, expr.Col)
+					}
+					letEnv := NewEnv(env)
+					for _, binding := range bindingsExpr.Elements {
+						if binding.Type != ExprList || len(binding.Elements) != 2 || binding.Elements[0].Type != ExprSymbol {
+							return nil, fmt.Errorf("%d:%d: invalid letrec* binding", expr.Line, expr.Col)
+						}
+						val, err := Eval(binding.Elements[1], letEnv)
+						if err != nil {
+							return nil, err
+						}
+						letEnv.Set(binding.Elements[0].StrVal, val)
+					}
+					body := expr.Elements[2:]
+					for _, bodyExpr := range body[:len(body)-1] {
+						_, err := Eval(bodyExpr, letEnv)
+						if err != nil {
+							return nil, err
+						}
+					}
+					expr = body[len(body)-1]
+					env = letEnv
+					continue
+
+				case "case":
+					if len(expr.Elements) < 3 {
+						return nil, fmt.Errorf("%d:%d: 'case' requires key and clauses", expr.Line, expr.Col)
+					}
+					key, err := Eval(expr.Elements[1], env)
+					if err != nil {
+						return nil, err
+					}
+					found := false
+					for _, clause := range expr.Elements[2:] {
+						if clause.Type != ExprList || len(clause.Elements) < 2 {
+							return nil, fmt.Errorf("%d:%d: invalid case clause", expr.Line, expr.Col)
+						}
+						isElse := clause.Elements[0].Type == ExprSymbol && clause.Elements[0].StrVal == "else"
+						matched := isElse
+						if !isElse {
+							datums := clause.Elements[0]
+							if datums.Type != ExprList {
+								return nil, fmt.Errorf("%d:%d: case clause datums must be a list", expr.Line, expr.Col)
+							}
+							for _, d := range datums.Elements {
+								dv := exprToValue(d)
+								if valuesEqv(key, dv) {
+									matched = true
+									break
+								}
+							}
+						}
+						if matched {
+							body := clause.Elements[1:]
+							for _, e := range body[:len(body)-1] {
+								_, err = Eval(e, env)
+								if err != nil {
+									return nil, err
+								}
+							}
+							expr = body[len(body)-1]
+							found = true
+							break
+						}
+					}
+					if found {
+						continue
+					}
+					return Void, nil
+				}
+
+				// Check for macro application
+				if val, ok := env.Get(head.StrVal); ok && val.Type == TypeMacro {
+					expanded, err := expandMacro(val.Macro, expr)
+					if err != nil {
+						return nil, err
+					}
+					expr = expanded
+					continue
+				}
+			}
+
+			// Function application
+			fn, err := Eval(head, env)
 			if err != nil {
 				return nil, err
 			}
-			return Eval(expanded, env)
+
+			// Evaluate arguments
+			args := make([]*Value, len(expr.Elements)-1)
+			for i, argExpr := range expr.Elements[1:] {
+				val, err := Eval(argExpr, env)
+				if err != nil {
+					return nil, err
+				}
+				args[i] = val
+			}
+
+			// Call builtin
+			if fn.Type == TypeSymbol && len(fn.StrVal) > 8 && fn.StrVal[:8] == "builtin:" {
+				return callBuiltin(fn.StrVal, args, env, expr.Line, expr.Col)
+			}
+
+			// Call Go native function
+			if fn.Type == TypeGoFunc {
+				return fn.GoFunc(args)
+			}
+
+			// Call lambda (TCO)
+			if fn.Type == TypeLambda {
+				callEnv, err := bindLambdaEnv(fn, args, expr.Line, expr.Col)
+				if err != nil {
+					return nil, err
+				}
+				for _, bodyExpr := range fn.Body[:len(fn.Body)-1] {
+					_, err = Eval(bodyExpr, callEnv)
+					if err != nil {
+						return nil, err
+					}
+				}
+				expr = fn.Body[len(fn.Body)-1]
+				env = callEnv
+				continue
+			}
+
+			// Call case-lambda (TCO)
+			if fn.Type == TypeCaseLambda {
+				callEnv, body, err := bindCaseLambdaEnv(fn, args, expr.Line, expr.Col)
+				if err != nil {
+					return nil, err
+				}
+				for _, bodyExpr := range body[:len(body)-1] {
+					_, err = Eval(bodyExpr, callEnv)
+					if err != nil {
+						return nil, err
+					}
+				}
+				expr = body[len(body)-1]
+				env = callEnv
+				continue
+			}
+
+			// Macro from ExprLiteral
+			if fn.Type == TypeMacro {
+				expanded, err := expandMacro(fn.Macro, expr)
+				if err != nil {
+					return nil, err
+				}
+				expr = expanded
+				continue
+			}
+
+			return nil, fmt.Errorf("%d:%d: not a procedure", expr.Line, expr.Col)
+		default:
+			return nil, fmt.Errorf("%d:%d: unknown expression type", expr.Line, expr.Col)
 		}
 	}
+}
 
-	// Function application
-	fn, err := Eval(head, env)
+// callLambda is used by builtins (apply, map, etc.) that call lambdas outside the trampoline.
+func callLambda(fn *Value, args []*Value, line, col int) (*Value, error) {
+	callEnv, err := bindLambdaEnv(fn, args, line, col)
 	if err != nil {
 		return nil, err
 	}
-
-	// Evaluate arguments
-	args := make([]*Value, len(expr.Elements)-1)
-	for i, argExpr := range expr.Elements[1:] {
-		val, err := Eval(argExpr, env)
+	var result *Value
+	for _, bodyExpr := range fn.Body {
+		result, err = Eval(bodyExpr, callEnv)
 		if err != nil {
 			return nil, err
 		}
-		args[i] = val
 	}
+	return result, nil
+}
 
-	// Call builtin
-	if fn.Type == TypeSymbol && len(fn.StrVal) > 8 && fn.StrVal[:8] == "builtin:" {
-		return callBuiltin(fn.StrVal, args, env, expr.Line, expr.Col)
+// callCaseLambda is used by builtins that call case-lambdas outside the trampoline.
+func callCaseLambda(fn *Value, args []*Value, line, col int) (*Value, error) {
+	callEnv, body, err := bindCaseLambdaEnv(fn, args, line, col)
+	if err != nil {
+		return nil, err
 	}
-
-	// Call Go native function
-	if fn.Type == TypeGoFunc {
-		return fn.GoFunc(args)
-	}
-
-	// Call lambda
-	if fn.Type == TypeLambda {
-		return callLambda(fn, args, expr.Line, expr.Col)
-	}
-
-	// Call case-lambda
-	if fn.Type == TypeCaseLambda {
-		return callCaseLambda(fn, args, expr.Line, expr.Col)
-	}
-
-	// Macro from ExprLiteral
-	if fn.Type == TypeMacro {
-		expanded, err := expandMacro(fn.Macro, expr)
+	var result *Value
+	for _, bodyExpr := range body {
+		result, err = Eval(bodyExpr, callEnv)
 		if err != nil {
 			return nil, err
 		}
-		return Eval(expanded, env)
 	}
-
-	return nil, fmt.Errorf("%d:%d: not a procedure", expr.Line, expr.Col)
+	return result, nil
 }
 
 func evalDefine(expr *Expr, env *Env) (*Value, error) {
@@ -167,23 +528,6 @@ func evalDefine(expr *Expr, env *Env) (*Value, error) {
 		return nil, err
 	}
 	env.Set(target.StrVal, val)
-	return Void, nil
-}
-
-func evalIf(expr *Expr, env *Env) (*Value, error) {
-	if len(expr.Elements) < 3 || len(expr.Elements) > 4 {
-		return nil, fmt.Errorf("%d:%d: 'if' requires 2 or 3 arguments", expr.Line, expr.Col)
-	}
-	cond, err := Eval(expr.Elements[1], env)
-	if err != nil {
-		return nil, err
-	}
-	if isTruthy(cond) {
-		return Eval(expr.Elements[2], env)
-	}
-	if len(expr.Elements) == 4 {
-		return Eval(expr.Elements[3], env)
-	}
 	return Void, nil
 }
 
@@ -271,107 +615,6 @@ func evalLambda(expr *Expr, env *Env) (*Value, error) {
 	}, nil
 }
 
-func evalAnd(expr *Expr, env *Env) (*Value, error) {
-	if len(expr.Elements) == 1 {
-		return True, nil
-	}
-	var result *Value = True
-	for _, e := range expr.Elements[1:] {
-		val, err := Eval(e, env)
-		if err != nil {
-			return nil, err
-		}
-		result = val
-		if !isTruthy(val) {
-			return val, nil
-		}
-	}
-	return result, nil
-}
-
-func evalOr(expr *Expr, env *Env) (*Value, error) {
-	if len(expr.Elements) == 1 {
-		return False, nil
-	}
-	for _, e := range expr.Elements[1:] {
-		val, err := Eval(e, env)
-		if err != nil {
-			return nil, err
-		}
-		if isTruthy(val) {
-			return val, nil
-		}
-	}
-	return False, nil
-}
-
-func evalLet(expr *Expr, env *Env) (*Value, error) {
-	if len(expr.Elements) < 3 {
-		return nil, fmt.Errorf("%d:%d: 'let' requires bindings and body", expr.Line, expr.Col)
-	}
-
-	bindingsIdx := 1
-	// Named let: (let name ((var init) ...) body ...)
-	var loopName string
-	if expr.Elements[1].Type == ExprSymbol {
-		loopName = expr.Elements[1].StrVal
-		bindingsIdx = 2
-		if len(expr.Elements) < 4 {
-			return nil, fmt.Errorf("%d:%d: named 'let' requires bindings and body", expr.Line, expr.Col)
-		}
-	}
-
-	bindingsExpr := expr.Elements[bindingsIdx]
-	if bindingsExpr.Type != ExprList {
-		return nil, fmt.Errorf("%d:%d: 'let' bindings must be a list", expr.Line, expr.Col)
-	}
-
-	names := make([]string, len(bindingsExpr.Elements))
-	vals := make([]*Value, len(bindingsExpr.Elements))
-	for i, binding := range bindingsExpr.Elements {
-		if binding.Type != ExprList || len(binding.Elements) != 2 {
-			return nil, fmt.Errorf("%d:%d: invalid let binding", expr.Line, expr.Col)
-		}
-		if binding.Elements[0].Type != ExprSymbol {
-			return nil, fmt.Errorf("%d:%d: let binding name must be a symbol", expr.Line, expr.Col)
-		}
-		names[i] = binding.Elements[0].StrVal
-		val, err := Eval(binding.Elements[1], env)
-		if err != nil {
-			return nil, err
-		}
-		vals[i] = val
-	}
-
-	letEnv := NewEnv(env)
-	for i, name := range names {
-		letEnv.Set(name, vals[i])
-	}
-
-	body := expr.Elements[bindingsIdx+1:]
-
-	if loopName != "" {
-		// Named let: bind the loop name to a lambda that re-enters
-		lambda := &Value{
-			Type:       TypeLambda,
-			Params:     names,
-			Body:       body,
-			ClosureEnv: letEnv,
-		}
-		letEnv.Set(loopName, lambda)
-	}
-
-	var result *Value
-	for _, bodyExpr := range body {
-		var err error
-		result, err = Eval(bodyExpr, letEnv)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
-}
-
 func evalSetBang(expr *Expr, env *Env) (*Value, error) {
 	if len(expr.Elements) != 3 {
 		return nil, fmt.Errorf("%d:%d: 'set!' requires exactly 2 arguments", expr.Line, expr.Col)
@@ -388,64 +631,6 @@ func evalSetBang(expr *Expr, env *Env) (*Value, error) {
 		return nil, fmt.Errorf("%d:%d: unbound variable '%s'", expr.Line, expr.Col, target.StrVal)
 	}
 	return Void, nil
-}
-
-func evalBegin(expr *Expr, env *Env) (*Value, error) {
-	if len(expr.Elements) < 2 {
-		return Void, nil
-	}
-	var result *Value
-	for _, e := range expr.Elements[1:] {
-		var err error
-		result, err = Eval(e, env)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
-}
-
-func callLambda(fn *Value, args []*Value, line, col int) (*Value, error) {
-	if fn.RestParam != "" {
-		if len(args) < len(fn.Params) {
-			return nil, fmt.Errorf("%d:%d: wrong number of arguments: expected at least %d, got %d", line, col, len(fn.Params), len(args))
-		}
-		callEnv := NewEnv(fn.ClosureEnv)
-		for i, param := range fn.Params {
-			callEnv.Set(param, args[i])
-		}
-		// Collect rest args into a list
-		rest := Null
-		for i := len(args) - 1; i >= len(fn.Params); i-- {
-			rest = PairValue(args[i], rest)
-		}
-		callEnv.Set(fn.RestParam, rest)
-		var result *Value
-		for _, bodyExpr := range fn.Body {
-			var err error
-			result, err = Eval(bodyExpr, callEnv)
-			if err != nil {
-				return nil, err
-			}
-		}
-		return result, nil
-	}
-	if len(args) != len(fn.Params) {
-		return nil, fmt.Errorf("%d:%d: wrong number of arguments: expected %d, got %d", line, col, len(fn.Params), len(args))
-	}
-	callEnv := NewEnv(fn.ClosureEnv)
-	for i, param := range fn.Params {
-		callEnv.Set(param, args[i])
-	}
-	var result *Value
-	for _, bodyExpr := range fn.Body {
-		var err error
-		result, err = Eval(bodyExpr, callEnv)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
 }
 
 func evalDefineRecordType(expr *Expr, env *Env) (*Value, error) {
@@ -519,14 +704,6 @@ func evalDefineRecordType(expr *Expr, env *Env) (*Value, error) {
 
 	// Define constructor
 	numFields := len(fieldNames)
-	constructor := &Value{
-		Type: TypeLambda,
-		Params: ctorFields,
-		Body: nil, // handled specially via BuiltinFunc
-		ClosureEnv: env,
-	}
-	// We'll use a Go-native approach: bind the constructor as a lambda that creates records
-	// Instead, let's define it as a builtin-like closure
 	rtCopy := rt
 	ctorIdxCopy := ctorFieldIdx
 	nf := numFields
@@ -540,7 +717,6 @@ func evalDefineRecordType(expr *Expr, env *Env) (*Value, error) {
 		}
 		return &Value{Type: TypeRecord, RecordType: rtCopy, RecordFields: fields}, nil
 	}))
-	_ = constructor
 
 	// Define predicate
 	env.Set(predExpr.StrVal, makeGoFunc(func(args []*Value) (*Value, error) {
@@ -571,41 +747,6 @@ func evalDefineRecordType(expr *Expr, env *Env) (*Value, error) {
 	return Void, nil
 }
 
-func evalCond(expr *Expr, env *Env) (*Value, error) {
-	for _, clause := range expr.Elements[1:] {
-		if clause.Type != ExprList || len(clause.Elements) < 2 {
-			return nil, fmt.Errorf("%d:%d: invalid cond clause", expr.Line, expr.Col)
-		}
-		// Check for else clause
-		if clause.Elements[0].Type == ExprSymbol && clause.Elements[0].StrVal == "else" {
-			var result *Value
-			for _, e := range clause.Elements[1:] {
-				var err error
-				result, err = Eval(e, env)
-				if err != nil {
-					return nil, err
-				}
-			}
-			return result, nil
-		}
-		test, err := Eval(clause.Elements[0], env)
-		if err != nil {
-			return nil, err
-		}
-		if isTruthy(test) {
-			var result *Value
-			for _, e := range clause.Elements[1:] {
-				result, err = Eval(e, env)
-				if err != nil {
-					return nil, err
-				}
-			}
-			return result, nil
-		}
-	}
-	return Void, nil
-}
-
 func evalCaseLambda(expr *Expr, env *Env) (*Value, error) {
 	// (case-lambda (formals body ...) ...)
 	clauses := make([]CaseLambdaClause, 0, len(expr.Elements)-1)
@@ -632,166 +773,6 @@ func evalCaseLambda(expr *Expr, env *Env) (*Value, error) {
 		CaseClauses: clauses,
 		ClosureEnv:  env,
 	}, nil
-}
-
-func callCaseLambda(fn *Value, args []*Value, line, col int) (*Value, error) {
-	for _, clause := range fn.CaseClauses {
-		if clause.RestParam != "" {
-			if len(args) >= len(clause.Params) {
-				callEnv := NewEnv(fn.ClosureEnv)
-				for i, param := range clause.Params {
-					callEnv.Set(param, args[i])
-				}
-				rest := Null
-				for i := len(args) - 1; i >= len(clause.Params); i-- {
-					rest = PairValue(args[i], rest)
-				}
-				callEnv.Set(clause.RestParam, rest)
-				var result *Value
-				for _, bodyExpr := range clause.Body {
-					var err error
-					result, err = Eval(bodyExpr, callEnv)
-					if err != nil {
-						return nil, err
-					}
-				}
-				return result, nil
-			}
-		} else if len(args) == len(clause.Params) {
-			callEnv := NewEnv(fn.ClosureEnv)
-			for i, param := range clause.Params {
-				callEnv.Set(param, args[i])
-			}
-			var result *Value
-			for _, bodyExpr := range clause.Body {
-				var err error
-				result, err = Eval(bodyExpr, callEnv)
-				if err != nil {
-					return nil, err
-				}
-			}
-			return result, nil
-		}
-	}
-	return nil, fmt.Errorf("%d:%d: no matching clause in case-lambda for %d arguments", line, col, len(args))
-}
-
-func evalLetrec(expr *Expr, env *Env) (*Value, error) {
-	if len(expr.Elements) < 3 {
-		return nil, fmt.Errorf("%d:%d: 'letrec' requires bindings and body", expr.Line, expr.Col)
-	}
-	bindingsExpr := expr.Elements[1]
-	if bindingsExpr.Type != ExprList {
-		return nil, fmt.Errorf("%d:%d: 'letrec' bindings must be a list", expr.Line, expr.Col)
-	}
-	letEnv := NewEnv(env)
-	// First bind all names to undefined
-	names := make([]string, len(bindingsExpr.Elements))
-	for i, binding := range bindingsExpr.Elements {
-		if binding.Type != ExprList || len(binding.Elements) != 2 || binding.Elements[0].Type != ExprSymbol {
-			return nil, fmt.Errorf("%d:%d: invalid letrec binding", expr.Line, expr.Col)
-		}
-		names[i] = binding.Elements[0].StrVal
-		letEnv.Set(names[i], Void)
-	}
-	// Evaluate init expressions in the new env
-	for i, binding := range bindingsExpr.Elements {
-		val, err := Eval(binding.Elements[1], letEnv)
-		if err != nil {
-			return nil, err
-		}
-		letEnv.Set(names[i], val)
-	}
-	// Evaluate body
-	var result *Value
-	for _, bodyExpr := range expr.Elements[2:] {
-		var err error
-		result, err = Eval(bodyExpr, letEnv)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
-}
-
-func evalLetrecStar(expr *Expr, env *Env) (*Value, error) {
-	if len(expr.Elements) < 3 {
-		return nil, fmt.Errorf("%d:%d: 'letrec*' requires bindings and body", expr.Line, expr.Col)
-	}
-	bindingsExpr := expr.Elements[1]
-	if bindingsExpr.Type != ExprList {
-		return nil, fmt.Errorf("%d:%d: 'letrec*' bindings must be a list", expr.Line, expr.Col)
-	}
-	letEnv := NewEnv(env)
-	for _, binding := range bindingsExpr.Elements {
-		if binding.Type != ExprList || len(binding.Elements) != 2 || binding.Elements[0].Type != ExprSymbol {
-			return nil, fmt.Errorf("%d:%d: invalid letrec* binding", expr.Line, expr.Col)
-		}
-		val, err := Eval(binding.Elements[1], letEnv)
-		if err != nil {
-			return nil, err
-		}
-		letEnv.Set(binding.Elements[0].StrVal, val)
-	}
-	var result *Value
-	for _, bodyExpr := range expr.Elements[2:] {
-		var err error
-		result, err = Eval(bodyExpr, letEnv)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
-}
-
-func evalCase(expr *Expr, env *Env) (*Value, error) {
-	if len(expr.Elements) < 3 {
-		return nil, fmt.Errorf("%d:%d: 'case' requires key and clauses", expr.Line, expr.Col)
-	}
-	key, err := Eval(expr.Elements[1], env)
-	if err != nil {
-		return nil, err
-	}
-	for _, clause := range expr.Elements[2:] {
-		if clause.Type != ExprList || len(clause.Elements) < 2 {
-			return nil, fmt.Errorf("%d:%d: invalid case clause", expr.Line, expr.Col)
-		}
-		// else clause
-		if clause.Elements[0].Type == ExprSymbol && clause.Elements[0].StrVal == "else" {
-			var result *Value
-			for _, e := range clause.Elements[1:] {
-				result, err = Eval(e, env)
-				if err != nil {
-					return nil, err
-				}
-			}
-			return result, nil
-		}
-		// datum list: ((datum ...) expr ...)
-		datums := clause.Elements[0]
-		if datums.Type != ExprList {
-			return nil, fmt.Errorf("%d:%d: case clause datums must be a list", expr.Line, expr.Col)
-		}
-		matched := false
-		for _, d := range datums.Elements {
-			dv := exprToValue(d)
-			if valuesEqv(key, dv) {
-				matched = true
-				break
-			}
-		}
-		if matched {
-			var result *Value
-			for _, e := range clause.Elements[1:] {
-				result, err = Eval(e, env)
-				if err != nil {
-					return nil, err
-				}
-			}
-			return result, nil
-		}
-	}
-	return Void, nil
 }
 
 func evalDo(expr *Expr, env *Env) (*Value, error) {
@@ -888,3 +869,4 @@ func evalDo(expr *Expr, env *Env) (*Value, error) {
 		}
 	}
 }
+
