@@ -69,6 +69,12 @@ public class Evaluator {
         void define(String name, Val val) {
             bindings.put(name, val);
         }
+
+        void set(String name, Val val) throws EvalError {
+            if (bindings.containsKey(name)) { bindings.put(name, val); return; }
+            if (parent != null) { parent.set(name, val); return; }
+            throw new EvalError("unbound variable: " + name);
+        }
     }
 
     // ── Output capture ──────────────────────────────────────────
@@ -301,6 +307,15 @@ public class Evaluator {
                 }
                 case "lambda" -> {
                     return evalLambda(pair.cdr(), env, pair);
+                }
+                case "set!" -> {
+                    Val setCdr = pair.cdr();
+                    if (!(setCdr instanceof Val.PairV sp)) throw posError(pair, "set! requires 2 arguments");
+                    if (!(sp.car() instanceof Val.Sym setSym)) throw posError(pair, "set!: expected variable name");
+                    if (!(sp.cdr() instanceof Val.PairV svp)) throw posError(pair, "set! requires a value");
+                    Val setVal = eval(svp.car(), env);
+                    env.set(setSym.name(), setVal);
+                    return new Val.Void();
                 }
                 case "begin" -> { return evalBegin(pair.cdr(), env); }
                 case "let" -> { return evalLet(pair.cdr(), env, pair); }
