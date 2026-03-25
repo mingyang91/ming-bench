@@ -1,6 +1,10 @@
 package ming
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
 
 // BuiltinFunc is a built-in procedure.
 type BuiltinFunc struct {
@@ -247,7 +251,7 @@ func quoteExpr(expr Expr) Value {
 	}
 }
 
-func makeGlobalEnv() *Env {
+func makeGlobalEnv(out *strings.Builder) *Env {
 	env := newEnv(nil)
 
 	// Arithmetic
@@ -280,6 +284,43 @@ func makeGlobalEnv() *Env {
 	env.set("boolean?", &BuiltinFunc{Name: "boolean?", Fn: builtinBooleanQ})
 	env.set("string?", &BuiltinFunc{Name: "string?", Fn: builtinStringQ})
 	env.set("symbol?", &BuiltinFunc{Name: "symbol?", Fn: builtinSymbolQ})
+	env.set("char?", &BuiltinFunc{Name: "char?", Fn: builtinCharQ})
+
+	// I/O — capture to output buffer
+	env.set("display", &BuiltinFunc{Name: "display", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "display: requires exactly 1 argument"}
+		}
+		if out != nil {
+			out.WriteString(displayValue(args[0]))
+		}
+		return &VoidVal{}, nil
+	}})
+	env.set("write", &BuiltinFunc{Name: "write", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "write: requires exactly 1 argument"}
+		}
+		if out != nil {
+			out.WriteString(args[0].String())
+		}
+		return &VoidVal{}, nil
+	}})
+	env.set("newline", &BuiltinFunc{Name: "newline", Fn: func(args []Value) (Value, error) {
+		if out != nil {
+			out.WriteByte('\n')
+		}
+		return &VoidVal{}, nil
+	}})
+
+	// String operations
+	env.set("string-append", &BuiltinFunc{Name: "string-append", Fn: builtinStringAppend})
+	env.set("string-length", &BuiltinFunc{Name: "string-length", Fn: builtinStringLength})
+	env.set("substring", &BuiltinFunc{Name: "substring", Fn: builtinSubstring})
+	env.set("string->number", &BuiltinFunc{Name: "string->number", Fn: builtinStringToNumber})
+	env.set("number->string", &BuiltinFunc{Name: "number->string", Fn: builtinNumberToString})
+	env.set("symbol->string", &BuiltinFunc{Name: "symbol->string", Fn: builtinSymbolToString})
+	env.set("string->symbol", &BuiltinFunc{Name: "string->symbol", Fn: builtinStringToSymbol})
+	env.set("string-ref", &BuiltinFunc{Name: "string-ref", Fn: builtinStringRef})
 
 	return env
 }
@@ -649,4 +690,122 @@ func builtinNot(args []Value) (Value, error) {
 		return nil, &EvalError{Message: "not: requires exactly 1 argument"}
 	}
 	return &BoolVal{Val: !isTruthy(args[0])}, nil
+}
+
+func builtinCharQ(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "char?: requires exactly 1 argument"}
+	}
+	_, ok := args[0].(*CharVal)
+	return &BoolVal{Val: ok}, nil
+}
+
+func builtinStringAppend(args []Value) (Value, error) {
+	var buf strings.Builder
+	for _, a := range args {
+		s, ok := a.(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("string-append: not a string: %s", a.String())}
+		}
+		buf.WriteString(s.Val)
+	}
+	return &StringVal{Val: buf.String()}, nil
+}
+
+func builtinStringLength(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "string-length: requires exactly 1 argument"}
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, &EvalError{Message: fmt.Sprintf("string-length: not a string: %s", args[0].String())}
+	}
+	return &IntVal{Val: int64(len([]rune(s.Val)))}, nil
+}
+
+func builtinSubstring(args []Value) (Value, error) {
+	if len(args) != 3 {
+		return nil, &EvalError{Message: "substring: requires exactly 3 arguments"}
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, &EvalError{Message: "substring: not a string"}
+	}
+	start, ok := args[1].(*IntVal)
+	if !ok {
+		return nil, &EvalError{Message: "substring: start not a number"}
+	}
+	end, ok := args[2].(*IntVal)
+	if !ok {
+		return nil, &EvalError{Message: "substring: end not a number"}
+	}
+	runes := []rune(s.Val)
+	return &StringVal{Val: string(runes[start.Val:end.Val])}, nil
+}
+
+func builtinStringToNumber(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "string->number: requires exactly 1 argument"}
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, &EvalError{Message: "string->number: not a string"}
+	}
+	n, err := strconv.ParseInt(s.Val, 10, 64)
+	if err != nil {
+		return &BoolVal{Val: false}, nil
+	}
+	return &IntVal{Val: n}, nil
+}
+
+func builtinNumberToString(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "number->string: requires exactly 1 argument"}
+	}
+	n, ok := args[0].(*IntVal)
+	if !ok {
+		return nil, &EvalError{Message: "number->string: not a number"}
+	}
+	return &StringVal{Val: strconv.FormatInt(n.Val, 10)}, nil
+}
+
+func builtinSymbolToString(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "symbol->string: requires exactly 1 argument"}
+	}
+	s, ok := args[0].(*SymbolVal)
+	if !ok {
+		return nil, &EvalError{Message: "symbol->string: not a symbol"}
+	}
+	return &StringVal{Val: s.Name}, nil
+}
+
+func builtinStringToSymbol(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "string->symbol: requires exactly 1 argument"}
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, &EvalError{Message: "string->symbol: not a string"}
+	}
+	return &SymbolVal{Name: s.Val}, nil
+}
+
+func builtinStringRef(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, &EvalError{Message: "string-ref: requires exactly 2 arguments"}
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, &EvalError{Message: "string-ref: not a string"}
+	}
+	idx, ok := args[1].(*IntVal)
+	if !ok {
+		return nil, &EvalError{Message: "string-ref: index not a number"}
+	}
+	runes := []rune(s.Val)
+	if idx.Val < 0 || idx.Val >= int64(len(runes)) {
+		return nil, &EvalError{Message: "string-ref: index out of range"}
+	}
+	return &CharVal{Val: runes[idx.Val]}, nil
 }
