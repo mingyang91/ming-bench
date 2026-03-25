@@ -208,6 +208,14 @@ object Builtins:
       case "eqv?" =>
         val (a, b) = requireTwo("eqv?", args)
         SchemeVal.SBool(schemeEqv(a, b))
+      case "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length" | "vector?" | "vector->list" |
+          "list->vector" =>
+        applyVector(name, args)
+      case other =>
+        throw new EvalError(s"unknown procedure: $other")
+
+  private def applyVector(name: String, args: List[SchemeVal]): SchemeVal =
+    name match
       case "vector" =>
         SchemeVal.SVector(args.toArray)
       case "make-vector" =>
@@ -257,5 +265,4 @@ object Builtins:
         args.head match
           case SchemeVal.SList(elems) => SchemeVal.SVector(elems.toArray)
           case _                      => throw new EvalError("list->vector: expected list")
-      case other =>
-        throw new EvalError(s"unknown procedure: $other")
+      case _ => throw new EvalError(s"unknown vector op: $name")

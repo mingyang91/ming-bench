@@ -132,7 +132,7 @@ object NumericOps:
   def applyTypePredicate(name: String, args: List[SchemeVal]): SchemeVal =
     val arg = requireOne(name, args)
     SchemeVal.SBool((name, arg) match
-      case ("string?", SchemeVal.SString(_, _))     => true
+      case ("string?", SchemeVal.SString(_, _))    => true
       case ("number?", _) if isNumeric(arg)        => true
       case ("boolean?", SchemeVal.SBool(_))        => true
       case ("symbol?", SchemeVal.SSymbol(_))       => true

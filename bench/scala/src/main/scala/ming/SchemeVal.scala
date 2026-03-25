@@ -54,9 +54,9 @@ enum SchemeVal:
       else v.toString
     case SRational(n, d) =>
       if d == 1 then n.toString else s"$n/$d"
-    case SBool(v)   => if v then "#t" else "#f"
+    case SBool(v)      => if v then "#t" else "#f"
     case SString(v, _) => s""""${v.toString}""""
-    case SSymbol(n) => n
+    case SSymbol(n)    => n
     case SChar(c) =>
       c match
         case ' '  => "#\\space"
@@ -81,8 +81,8 @@ enum SchemeVal:
   /** Display representation (no quotes for strings). */
   def displayRepr: String = this match
     case SString(v, _) => v.toString
-    case SChar(c)   => c.toString
-    case other      => other.display
+    case SChar(c)      => c.toString
+    case other         => other.display
 
 object SchemeVal:
 
