@@ -128,9 +128,15 @@ type DynamicWindFrame = {
   outThunk: SchemeValue;
 };
 
+type ExceptionHandlerFrame = {
+  windStack: DynamicWindFrame[];
+  handle: (exception: SchemeValue, raisePosition: SourcePosition) => EvalStep;
+};
+
 type EvaluationContext = {
   output: string[];
   dynamicWindStack: DynamicWindFrame[];
+  exceptionHandlers: ExceptionHandlerFrame[];
 };
 
 type PairCell = {
@@ -142,6 +148,7 @@ type ContinuationValue = {
   type: 'continuation';
   context: EvaluationContext;
   windStack: DynamicWindFrame[];
+  handlerStack: ExceptionHandlerFrame[];
   resume: EvalContinuation;
 };
 
@@ -296,7 +303,7 @@ function evaluateProgram(input: string): { result: SchemeValue; output: string }
     throw new EvalError('empty input', START_POSITION);
   }
 
-  const context: EvaluationContext = { output: [], dynamicWindStack: [] };
+  const context: EvaluationContext = { output: [], dynamicWindStack: [], exceptionHandlers: [] };
   const env = createGlobalEnv(context);
   const result = runEvalStep(evaluateSequenceCps(expressions, env, completeEval));
 
@@ -529,9 +536,10 @@ function runEvalStep(step: EvalStep): SchemeValue {
 function continuationValue(
   context: EvaluationContext,
   windStack: DynamicWindFrame[],
+  handlerStack: ExceptionHandlerFrame[],
   resume: EvalContinuation,
 ): ContinuationValue {
-  return { type: 'continuation', context, windStack, resume };
+  return { type: 'continuation', context, windStack, handlerStack, resume };
 }
 
 function sharedDynamicWindDepth(
@@ -551,6 +559,7 @@ function transitionDynamicWind(
   targetStack: DynamicWindFrame[],
   callPosition: SourcePosition,
   continuation: () => EvalStep,
+  beforeRewind?: () => void,
 ): EvalStep {
   return suspendStep(() => {
     const currentStack = context.dynamicWindStack;
@@ -562,6 +571,7 @@ function transitionDynamicWind(
       sharedDepth,
       callPosition,
       continuation,
+      beforeRewind,
     );
   });
 }
@@ -573,9 +583,11 @@ function unwindDynamicWindFrames(
   sharedDepth: number,
   callPosition: SourcePosition,
   continuation: () => EvalStep,
+  beforeRewind?: () => void,
 ): EvalStep {
   return suspendStep(() => {
     if (currentStack.length <= sharedDepth) {
+      beforeRewind?.();
       return rewindDynamicWindFrames(
         context,
         targetStack,
@@ -598,6 +610,7 @@ function unwindDynamicWindFrames(
         sharedDepth,
         callPosition,
         continuation,
+        beforeRewind,
       ),
     );
   });
@@ -643,7 +656,56 @@ function invokeContinuationValue(
     value.windStack,
     callPosition,
     () => value.resume(argument),
+    () => {
+      value.context.exceptionHandlers = [...value.handlerStack];
+    },
   );
+}
+
+function pushExceptionHandlerFrame(
+  context: EvaluationContext,
+  frame: ExceptionHandlerFrame,
+): void {
+  context.exceptionHandlers = [...context.exceptionHandlers, frame];
+}
+
+function removeExceptionHandlerFrame(
+  context: EvaluationContext,
+  frame: ExceptionHandlerFrame,
+): void {
+  const index = context.exceptionHandlers.lastIndexOf(frame);
+  if (index < 0) {
+    return;
+  }
+
+  context.exceptionHandlers = [
+    ...context.exceptionHandlers.slice(0, index),
+    ...context.exceptionHandlers.slice(index + 1),
+  ];
+}
+
+function raiseException(
+  context: EvaluationContext,
+  exception: SchemeValue,
+  raisePosition: SourcePosition,
+): EvalStep {
+  return suspendStep(() => {
+    const handlerFrame = context.exceptionHandlers[context.exceptionHandlers.length - 1];
+    if (handlerFrame === undefined) {
+      throw new EvalError(`uncaught exception: ${formatValue(exception)}`, raisePosition);
+    }
+
+    const previousHandlers = context.exceptionHandlers.slice(0, -1);
+    return transitionDynamicWind(
+      context,
+      handlerFrame.windStack,
+      raisePosition,
+      () => {
+        context.exceptionHandlers = previousHandlers;
+        return handlerFrame.handle(exception, raisePosition);
+      },
+    );
+  });
 }
 
 function evaluateCps(
@@ -2985,6 +3047,23 @@ function tailOutcome(expr: Expr, env: Environment): EvalOutcome {
   return { kind: 'tail', expr, env };
 }
 
+function defineCoreSyntax(env: Environment): void {
+  const [guardTransformer] = parseProgram(`
+    (syntax-rules (else)
+      ((guard (var clause ...) body ...)
+       (call/cc
+         (lambda (guard-k)
+           (with-exception-handler
+             (lambda (var)
+               (guard-k
+                 (cond clause ...
+                       (else (raise var)))))
+             (lambda () body ...))))))
+  `);
+
+  env.defineSyntax('guard', parseSyntaxRules('guard', guardTransformer, env));
+}
+
 function createGlobalEnv(context: EvaluationContext): Environment {
   const env = new Environment();
   const callWithCurrentContinuationBuiltin = (name: string): BuiltinProcedure =>
@@ -3002,6 +3081,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
               value: continuationValue(
                 context,
                 [...context.dynamicWindStack],
+                [...context.exceptionHandlers],
                 (value) => continueWith(continuation, value),
               ),
               position: callPosition,
@@ -3037,6 +3117,44 @@ function createGlobalEnv(context: EvaluationContext): Environment {
             ),
           ),
       );
+    },
+  );
+  const raiseBuiltin: BuiltinProcedure = builtin(
+    'raise',
+    (_args, callPosition) => {
+      throw new EvalError('raise: internal error', callPosition);
+    },
+    (args, callPosition) => {
+      requireArgCount('raise', args.length, 1, callPosition);
+      return raiseException(context, args[0].value, callPosition);
+    },
+  );
+  const withExceptionHandlerBuiltin: BuiltinProcedure = builtin(
+    'with-exception-handler',
+    (_args, callPosition) => {
+      throw new EvalError('with-exception-handler: internal error', callPosition);
+    },
+    (args, callPosition, continuation) => {
+      requireArgCount('with-exception-handler', args.length, 2, callPosition);
+
+      const frame: ExceptionHandlerFrame = {
+        windStack: [...context.dynamicWindStack],
+        handle: (exception, raisePosition) =>
+          applyProcedureCps(
+            args[0].value,
+            [{ value: exception, position: raisePosition }],
+            raisePosition,
+            () => {
+              throw new EvalError('raise: handler returned', raisePosition);
+            },
+          ),
+      };
+
+      pushExceptionHandlerFrame(context, frame);
+      return applyProcedureCps(args[1].value, [], callPosition, (value) => {
+        removeExceptionHandlerFrame(context, frame);
+        return continueWith(continuation, value);
+      });
     },
   );
 
@@ -3543,7 +3661,10 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'call-with-current-continuation',
     callWithCurrentContinuationBuiltin('call-with-current-continuation'),
   );
+  env.define('raise', raiseBuiltin);
+  env.define('with-exception-handler', withExceptionHandlerBuiltin);
   env.define('dynamic-wind', dynamicWindBuiltin);
+  defineCoreSyntax(env);
 
   env.define(
     'map',

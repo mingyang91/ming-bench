@@ -100,7 +100,7 @@ function evaluateProgram(input) {
     if (expressions.length === 0) {
         throw new EvalError('empty input', START_POSITION);
     }
-    const context = { output: [], dynamicWindStack: [] };
+    const context = { output: [], dynamicWindStack: [], exceptionHandlers: [] };
     const env = createGlobalEnv(context);
     const result = runEvalStep(evaluateSequenceCps(expressions, env, completeEval));
     return { result, output: context.output.join('') };
@@ -283,8 +283,8 @@ function runEvalStep(step) {
     }
     return current.value;
 }
-function continuationValue(context, windStack, resume) {
-    return { type: 'continuation', context, windStack, resume };
+function continuationValue(context, windStack, handlerStack, resume) {
+    return { type: 'continuation', context, windStack, handlerStack, resume };
 }
 function sharedDynamicWindDepth(left, right) {
     let index = 0;
@@ -293,23 +293,24 @@ function sharedDynamicWindDepth(left, right) {
     }
     return index;
 }
-function transitionDynamicWind(context, targetStack, callPosition, continuation) {
+function transitionDynamicWind(context, targetStack, callPosition, continuation, beforeRewind) {
     return suspendStep(() => {
         const currentStack = context.dynamicWindStack;
         const sharedDepth = sharedDynamicWindDepth(currentStack, targetStack);
-        return unwindDynamicWindFrames(context, currentStack, targetStack, sharedDepth, callPosition, continuation);
+        return unwindDynamicWindFrames(context, currentStack, targetStack, sharedDepth, callPosition, continuation, beforeRewind);
     });
 }
-function unwindDynamicWindFrames(context, currentStack, targetStack, sharedDepth, callPosition, continuation) {
+function unwindDynamicWindFrames(context, currentStack, targetStack, sharedDepth, callPosition, continuation, beforeRewind) {
     return suspendStep(() => {
         if (currentStack.length <= sharedDepth) {
+            beforeRewind?.();
             return rewindDynamicWindFrames(context, targetStack, sharedDepth, callPosition, continuation);
         }
         const frameIndex = currentStack.length - 1;
         const frame = currentStack[frameIndex];
         const nextStack = currentStack.slice(0, frameIndex);
         context.dynamicWindStack = nextStack;
-        return applyProcedureCps(frame.outThunk, [], callPosition, () => unwindDynamicWindFrames(context, nextStack, targetStack, sharedDepth, callPosition, continuation));
+        return applyProcedureCps(frame.outThunk, [], callPosition, () => unwindDynamicWindFrames(context, nextStack, targetStack, sharedDepth, callPosition, continuation, beforeRewind));
     });
 }
 function rewindDynamicWindFrames(context, targetStack, index, callPosition, continuation) {
@@ -328,7 +329,35 @@ function rewindDynamicWindFrames(context, targetStack, index, callPosition, cont
     });
 }
 function invokeContinuationValue(value, argument, callPosition) {
-    return transitionDynamicWind(value.context, value.windStack, callPosition, () => value.resume(argument));
+    return transitionDynamicWind(value.context, value.windStack, callPosition, () => value.resume(argument), () => {
+        value.context.exceptionHandlers = [...value.handlerStack];
+    });
+}
+function pushExceptionHandlerFrame(context, frame) {
+    context.exceptionHandlers = [...context.exceptionHandlers, frame];
+}
+function removeExceptionHandlerFrame(context, frame) {
+    const index = context.exceptionHandlers.lastIndexOf(frame);
+    if (index < 0) {
+        return;
+    }
+    context.exceptionHandlers = [
+        ...context.exceptionHandlers.slice(0, index),
+        ...context.exceptionHandlers.slice(index + 1),
+    ];
+}
+function raiseException(context, exception, raisePosition) {
+    return suspendStep(() => {
+        const handlerFrame = context.exceptionHandlers[context.exceptionHandlers.length - 1];
+        if (handlerFrame === undefined) {
+            throw new EvalError(`uncaught exception: ${formatValue(exception)}`, raisePosition);
+        }
+        const previousHandlers = context.exceptionHandlers.slice(0, -1);
+        return transitionDynamicWind(context, handlerFrame.windStack, raisePosition, () => {
+            context.exceptionHandlers = previousHandlers;
+            return handlerFrame.handle(exception, raisePosition);
+        });
+    });
 }
 function evaluateCps(expr, env, continuation) {
     return suspendStep(() => {
@@ -1919,6 +1948,21 @@ function valueOutcome(value) {
 function tailOutcome(expr, env) {
     return { kind: 'tail', expr, env };
 }
+function defineCoreSyntax(env) {
+    const [guardTransformer] = parseProgram(`
+    (syntax-rules (else)
+      ((guard (var clause ...) body ...)
+       (call/cc
+         (lambda (guard-k)
+           (with-exception-handler
+             (lambda (var)
+               (guard-k
+                 (cond clause ...
+                       (else (raise var)))))
+             (lambda () body ...))))))
+  `);
+    env.defineSyntax('guard', parseSyntaxRules('guard', guardTransformer, env));
+}
 function createGlobalEnv(context) {
     const env = new Environment();
     const callWithCurrentContinuationBuiltin = (name) => builtin(name, (_args, callPosition) => {
@@ -1927,7 +1971,7 @@ function createGlobalEnv(context) {
         requireArgCount(name, args.length, 1, callPosition);
         return applyProcedureCps(args[0].value, [
             {
-                value: continuationValue(context, [...context.dynamicWindStack], (value) => continueWith(continuation, value)),
+                value: continuationValue(context, [...context.dynamicWindStack], [...context.exceptionHandlers], (value) => continueWith(continuation, value)),
                 position: callPosition,
             },
         ], callPosition, continuation);
@@ -1942,6 +1986,28 @@ function createGlobalEnv(context) {
             outThunk: args[2].value,
         };
         return transitionDynamicWind(context, [...baseStack, frame], callPosition, () => applyProcedureCps(args[1].value, [], callPosition, (bodyValue) => transitionDynamicWind(context, baseStack, callPosition, () => continueWith(continuation, bodyValue))));
+    });
+    const raiseBuiltin = builtin('raise', (_args, callPosition) => {
+        throw new EvalError('raise: internal error', callPosition);
+    }, (args, callPosition) => {
+        requireArgCount('raise', args.length, 1, callPosition);
+        return raiseException(context, args[0].value, callPosition);
+    });
+    const withExceptionHandlerBuiltin = builtin('with-exception-handler', (_args, callPosition) => {
+        throw new EvalError('with-exception-handler: internal error', callPosition);
+    }, (args, callPosition, continuation) => {
+        requireArgCount('with-exception-handler', args.length, 2, callPosition);
+        const frame = {
+            windStack: [...context.dynamicWindStack],
+            handle: (exception, raisePosition) => applyProcedureCps(args[0].value, [{ value: exception, position: raisePosition }], raisePosition, () => {
+                throw new EvalError('raise: handler returned', raisePosition);
+            }),
+        };
+        pushExceptionHandlerFrame(context, frame);
+        return applyProcedureCps(args[1].value, [], callPosition, (value) => {
+            removeExceptionHandlerFrame(context, frame);
+            return continueWith(continuation, value);
+        });
     });
     env.define('+', builtin('+', (args, callPosition) => numberValue(addNumbers(evaluateNumberArgs('+', args), callPosition), callPosition)));
     env.define('*', builtin('*', (args, callPosition) => numberValue(multiplyNumbers(evaluateNumberArgs('*', args), callPosition), callPosition)));
@@ -2211,7 +2277,10 @@ function createGlobalEnv(context) {
     }));
     env.define('call/cc', callWithCurrentContinuationBuiltin('call/cc'));
     env.define('call-with-current-continuation', callWithCurrentContinuationBuiltin('call-with-current-continuation'));
+    env.define('raise', raiseBuiltin);
+    env.define('with-exception-handler', withExceptionHandlerBuiltin);
     env.define('dynamic-wind', dynamicWindBuiltin);
+    defineCoreSyntax(env);
     env.define('map', builtin('map', (args, callPosition) => {
         requireArgCountAtLeast('map', args.length, 2, callPosition);
         const procedure = args[0].value;
