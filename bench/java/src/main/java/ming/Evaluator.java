@@ -560,6 +560,27 @@ public class Evaluator {
                         case "letrec*" -> { return evalLetrecStar(list, env, pos); }
                         case "case" -> { return evalCase(list, env, pos); }
                         case "do" -> { return evalDo(list, env, pos); }
+                        case "let*" -> {
+                            if (list.size() < 3) throw new EvalError("let* requires bindings and body" + posStr(pos));
+                            Object bindingsRaw = unwrap(list.get(1));
+                            if (!(bindingsRaw instanceof List<?> bindings))
+                                throw new EvalError("let* bindings must be a list" + posStr(pos));
+                            Env letStarEnv = new Env(env);
+                            for (Object b : bindings) {
+                                Object bRaw = unwrap(b);
+                                if (!(bRaw instanceof List<?> binding) || binding.size() != 2)
+                                    throw new EvalError("invalid let* binding" + posStr(pos));
+                                if (!(unwrap(binding.get(0)) instanceof String name))
+                                    throw new EvalError("let* binding name must be a symbol" + posStr(pos));
+                                letStarEnv.define(name, eval(binding.get(1), letStarEnv));
+                            }
+                            for (int i = 2; i < list.size() - 1; i++) {
+                                eval(list.get(i), letStarEnv);
+                            }
+                            expr = list.get(list.size() - 1);
+                            env = letStarEnv;
+                            continue evalLoop;
+                        }
                     }
                 }
 
@@ -988,17 +1009,26 @@ public class Evaluator {
     }
 
     boolean schemeEqual(Object a, Object b) {
+        return schemeEqualRec(a, b, new java.util.IdentityHashMap<>());
+    }
+
+    private boolean schemeEqualRec(Object a, Object b, java.util.IdentityHashMap<Object, Object> seen) {
         if (a == b) return true;
         if (schemeEqv(a, b)) return true;
         if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
         if (a == NIL && b == NIL) return true;
         if (a instanceof Cons ca && b instanceof Cons cb) {
-            return schemeEqual(ca.car, cb.car) && schemeEqual(ca.cdr, cb.cdr);
+            // Use identity of the pair 'a' as key, mapping to 'b'
+            // If we've seen this exact (a,b) pair before, assume equal to break cycles
+            Object prev = seen.get(a);
+            if (prev == b) return true;
+            seen.put(a, b);
+            return schemeEqualRec(ca.car, cb.car, seen) && schemeEqualRec(ca.cdr, cb.cdr, seen);
         }
         if (a instanceof SchemeVector va && b instanceof SchemeVector vb) {
             if (va.length() != vb.length()) return false;
             for (int i = 0; i < va.length(); i++) {
-                if (!schemeEqual(va.data[i], vb.data[i])) return false;
+                if (!schemeEqualRec(va.data[i], vb.data[i], seen)) return false;
             }
             return true;
         }
@@ -1255,6 +1285,10 @@ public class Evaluator {
     }
 
     String schemeToString(Object val) {
+        return schemeToStringRec(val, new java.util.IdentityHashMap<>());
+    }
+
+    private String schemeToStringRec(Object val, java.util.IdentityHashMap<Object, Boolean> seen) {
         if (val == NIL) return "()";
         if (val instanceof Long l) return l.toString();
         if (val instanceof SchemeRational r) return r.isInteger() ? String.valueOf(r.toLong()) : r.num + "/" + r.den;
@@ -1273,12 +1307,15 @@ public class Evaluator {
             };
         }
         if (val instanceof SchemeVector v) {
+            if (seen.containsKey(v)) return "#<cycle>";
+            seen.put(v, Boolean.TRUE);
             StringBuilder sb = new StringBuilder("#(");
             for (int i = 0; i < v.length(); i++) {
                 if (i > 0) sb.append(" ");
-                sb.append(schemeToString(v.data[i]));
+                sb.append(schemeToStringRec(v.data[i], seen));
             }
             sb.append(")");
+            seen.remove(v);
             return sb.toString();
         }
         if (val instanceof SchemeRecord r) return "#<record " + r.type.name + ">";
@@ -1286,18 +1323,24 @@ public class Evaluator {
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof CaseLambda) return "#<procedure>";
         if (val instanceof Cons) {
+            if (seen.containsKey(val)) return "#<cycle>";
+            seen.put(val, Boolean.TRUE);
             StringBuilder sb = new StringBuilder("(");
             Object cur = val;
             boolean first = true;
             while (cur instanceof Cons c) {
+                if (!first) {
+                    if (seen.containsKey(cur)) { sb.append(" . #<cycle>"); break; }
+                    seen.put(cur, Boolean.TRUE);
+                }
                 if (!first) sb.append(" ");
                 first = false;
-                sb.append(schemeToString(c.car));
+                sb.append(schemeToStringRec(c.car, seen));
                 cur = c.cdr;
             }
-            if (cur != NIL) {
+            if (cur != NIL && !(cur instanceof Cons)) {
                 sb.append(" . ");
-                sb.append(schemeToString(cur));
+                sb.append(schemeToStringRec(cur, seen));
             }
             sb.append(")");
             return sb.toString();
@@ -1306,7 +1349,7 @@ public class Evaluator {
             StringBuilder sb = new StringBuilder("(");
             for (int i = 0; i < list.size(); i++) {
                 if (i > 0) sb.append(" ");
-                sb.append(schemeToString(list.get(i)));
+                sb.append(schemeToStringRec(list.get(i), seen));
             }
             sb.append(")");
             return sb.toString();

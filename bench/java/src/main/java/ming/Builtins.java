@@ -109,6 +109,11 @@ final class Builtins {
         if (!isNumber(v)) throw new EvalError("expected number, got: " + schemeToString(v));
     }
 
+    private static long gcdLong(long a, long b) {
+        while (b != 0) { long t = b; b = a % b; a = t; }
+        return a;
+    }
+
     private void define(String name, Evaluator.BuiltinFn fn) {
         env.define(name, new Builtin(name, fn));
     }
@@ -202,6 +207,15 @@ final class Builtins {
             requireArgCount(args, 1, "not");
             return evaluator.isFalse(args.get(0));
         });
+        define("error", args -> {
+            if (args.isEmpty()) throw new EvalError("error");
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < args.size(); i++) {
+                if (i > 0) sb.append(" ");
+                sb.append(displayString(args.get(i)));
+            }
+            throw new EvalError(sb.toString());
+        });
     }
 
     // --- Pairs ---
@@ -220,6 +234,226 @@ final class Builtins {
             requireArgCount(args, 1, "cdr");
             if (!(args.get(0) instanceof Cons c)) throw new EvalError("cdr: not a pair");
             return c.cdr;
+        });
+        define("set-car!", args -> {
+            requireArgCount(args, 2, "set-car!");
+            if (!(args.get(0) instanceof Cons c)) throw new EvalError("set-car!: not a pair");
+            c.car = args.get(1);
+            return VOID;
+        });
+        define("set-cdr!", args -> {
+            requireArgCount(args, 2, "set-cdr!");
+            if (!(args.get(0) instanceof Cons c)) throw new EvalError("set-cdr!: not a pair");
+            c.cdr = args.get(1);
+            return VOID;
+        });
+        define("caar", args -> {
+            requireArgCount(args, 1, "caar");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("caar: not a pair");
+            if (!(c1.car instanceof Cons c2)) throw new EvalError("caar: not a pair");
+            return c2.car;
+        });
+        define("cadr", args -> {
+            requireArgCount(args, 1, "cadr");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cadr: not a pair");
+            if (!(c1.cdr instanceof Cons c2)) throw new EvalError("cadr: not a pair");
+            return c2.car;
+        });
+        define("cdar", args -> {
+            requireArgCount(args, 1, "cdar");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cdar: not a pair");
+            if (!(c1.car instanceof Cons c2)) throw new EvalError("cdar: not a pair");
+            return c2.cdr;
+        });
+        define("cddr", args -> {
+            requireArgCount(args, 1, "cddr");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cddr: not a pair");
+            if (!(c1.cdr instanceof Cons c2)) throw new EvalError("cddr: not a pair");
+            return c2.cdr;
+        });
+        define("caddr", args -> {
+            requireArgCount(args, 1, "caddr");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("caddr: not a pair");
+            if (!(c1.cdr instanceof Cons c2)) throw new EvalError("caddr: not a pair");
+            if (!(c2.cdr instanceof Cons c3)) throw new EvalError("caddr: not a pair");
+            return c3.car;
+        });
+        define("cdddr", args -> {
+            requireArgCount(args, 1, "cdddr");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cdddr: not a pair");
+            if (!(c1.cdr instanceof Cons c2)) throw new EvalError("cdddr: not a pair");
+            if (!(c2.cdr instanceof Cons c3)) throw new EvalError("cdddr: not a pair");
+            return c3.cdr;
+        });
+        define("cadddr", args -> {
+            requireArgCount(args, 1, "cadddr");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cadddr: not a pair");
+            if (!(c1.cdr instanceof Cons c2)) throw new EvalError("cadddr: not a pair");
+            if (!(c2.cdr instanceof Cons c3)) throw new EvalError("cadddr: not a pair");
+            if (!(c3.cdr instanceof Cons c4)) throw new EvalError("cadddr: not a pair");
+            return c4.car;
+        });
+        define("cddddr", args -> {
+            requireArgCount(args, 1, "cddddr");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cddddr: not a pair");
+            if (!(c1.cdr instanceof Cons c2)) throw new EvalError("cddddr: not a pair");
+            if (!(c2.cdr instanceof Cons c3)) throw new EvalError("cddddr: not a pair");
+            if (!(c3.cdr instanceof Cons c4)) throw new EvalError("cddddr: not a pair");
+            return c4.cdr;
+        });
+        define("caaar", args -> {
+            requireArgCount(args, 1, "caaar");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("caaar: not a pair");
+            if (!(c1.car instanceof Cons c2)) throw new EvalError("caaar: not a pair");
+            if (!(c2.car instanceof Cons c3)) throw new EvalError("caaar: not a pair");
+            return c3.car;
+        });
+        define("caadr", args -> {
+            requireArgCount(args, 1, "caadr");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("caadr: not a pair");
+            if (!(c1.cdr instanceof Cons c2)) throw new EvalError("caadr: not a pair");
+            if (!(c2.car instanceof Cons c3)) throw new EvalError("caadr: not a pair");
+            return c3.car;
+        });
+        define("cadar", args -> {
+            requireArgCount(args, 1, "cadar");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cadar: not a pair");
+            if (!(c1.car instanceof Cons c2)) throw new EvalError("cadar: not a pair");
+            if (!(c2.cdr instanceof Cons c3)) throw new EvalError("cadar: not a pair");
+            return c3.car;
+        });
+        define("cadaar", args -> {
+            requireArgCount(args, 1, "cadaar");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cadaar: not a pair");
+            if (!(c1.car instanceof Cons c2)) throw new EvalError("cadaar: not a pair");
+            if (!(c2.car instanceof Cons c3)) throw new EvalError("cadaar: not a pair");
+            if (!(c3.cdr instanceof Cons c4)) throw new EvalError("cadaar: not a pair");
+            return c4.car;
+        });
+        define("cadadr", args -> {
+            requireArgCount(args, 1, "cadadr");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cadadr: not a pair");
+            if (!(c1.cdr instanceof Cons c2)) throw new EvalError("cadadr: not a pair");
+            if (!(c2.car instanceof Cons c3)) throw new EvalError("cadadr: not a pair");
+            if (!(c3.cdr instanceof Cons c4)) throw new EvalError("cadadr: not a pair");
+            return c4.car;
+        });
+        define("caddar", args -> {
+            requireArgCount(args, 1, "caddar");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("caddar: not a pair");
+            if (!(c1.car instanceof Cons c2)) throw new EvalError("caddar: not a pair");
+            if (!(c2.cdr instanceof Cons c3)) throw new EvalError("caddar: not a pair");
+            if (!(c3.cdr instanceof Cons c4)) throw new EvalError("caddar: not a pair");
+            return c4.car;
+        });
+        define("cdaar", args -> {
+            requireArgCount(args, 1, "cdaar");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cdaar: not a pair");
+            if (!(c1.car instanceof Cons c2)) throw new EvalError("cdaar: not a pair");
+            if (!(c2.car instanceof Cons c3)) throw new EvalError("cdaar: not a pair");
+            return c3.cdr;
+        });
+        define("cdadr", args -> {
+            requireArgCount(args, 1, "cdadr");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cdadr: not a pair");
+            if (!(c1.cdr instanceof Cons c2)) throw new EvalError("cdadr: not a pair");
+            if (!(c2.car instanceof Cons c3)) throw new EvalError("cdadr: not a pair");
+            return c3.cdr;
+        });
+        define("cddar", args -> {
+            requireArgCount(args, 1, "cddar");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cddar: not a pair");
+            if (!(c1.car instanceof Cons c2)) throw new EvalError("cddar: not a pair");
+            if (!(c2.cdr instanceof Cons c3)) throw new EvalError("cddar: not a pair");
+            return c3.cdr;
+        });
+        define("caaaar", args -> {
+            requireArgCount(args, 1, "caaaar");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("caaaar: not a pair");
+            if (!(c1.car instanceof Cons c2)) throw new EvalError("caaaar: not a pair");
+            if (!(c2.car instanceof Cons c3)) throw new EvalError("caaaar: not a pair");
+            if (!(c3.car instanceof Cons c4)) throw new EvalError("caaaar: not a pair");
+            return c4.car;
+        });
+        define("caaadr", args -> {
+            requireArgCount(args, 1, "caaadr");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("caaadr: not a pair");
+            if (!(c1.cdr instanceof Cons c2)) throw new EvalError("caaadr: not a pair");
+            if (!(c2.car instanceof Cons c3)) throw new EvalError("caaadr: not a pair");
+            if (!(c3.car instanceof Cons c4)) throw new EvalError("caaadr: not a pair");
+            return c4.car;
+        });
+        define("caadar", args -> {
+            requireArgCount(args, 1, "caadar");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("caadar: not a pair");
+            if (!(c1.car instanceof Cons c2)) throw new EvalError("caadar: not a pair");
+            if (!(c2.cdr instanceof Cons c3)) throw new EvalError("caadar: not a pair");
+            if (!(c3.car instanceof Cons c4)) throw new EvalError("caadar: not a pair");
+            return c4.car;
+        });
+        define("caaddr", args -> {
+            requireArgCount(args, 1, "caaddr");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("caaddr: not a pair");
+            if (!(c1.cdr instanceof Cons c2)) throw new EvalError("caaddr: not a pair");
+            if (!(c2.cdr instanceof Cons c3)) throw new EvalError("caaddr: not a pair");
+            if (!(c3.car instanceof Cons c4)) throw new EvalError("caaddr: not a pair");
+            return c4.car;
+        });
+        define("cdaaar", args -> {
+            requireArgCount(args, 1, "cdaaar");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cdaaar: not a pair");
+            if (!(c1.car instanceof Cons c2)) throw new EvalError("cdaaar: not a pair");
+            if (!(c2.car instanceof Cons c3)) throw new EvalError("cdaaar: not a pair");
+            if (!(c3.car instanceof Cons c4)) throw new EvalError("cdaaar: not a pair");
+            return c4.cdr;
+        });
+        define("cdaadr", args -> {
+            requireArgCount(args, 1, "cdaadr");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cdaadr: not a pair");
+            if (!(c1.cdr instanceof Cons c2)) throw new EvalError("cdaadr: not a pair");
+            if (!(c2.car instanceof Cons c3)) throw new EvalError("cdaadr: not a pair");
+            if (!(c3.car instanceof Cons c4)) throw new EvalError("cdaadr: not a pair");
+            return c4.cdr;
+        });
+        define("cdadar", args -> {
+            requireArgCount(args, 1, "cdadar");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cdadar: not a pair");
+            if (!(c1.car instanceof Cons c2)) throw new EvalError("cdadar: not a pair");
+            if (!(c2.cdr instanceof Cons c3)) throw new EvalError("cdadar: not a pair");
+            if (!(c3.car instanceof Cons c4)) throw new EvalError("cdadar: not a pair");
+            return c4.cdr;
+        });
+        define("cdaddr", args -> {
+            requireArgCount(args, 1, "cdaddr");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cdaddr: not a pair");
+            if (!(c1.cdr instanceof Cons c2)) throw new EvalError("cdaddr: not a pair");
+            if (!(c2.cdr instanceof Cons c3)) throw new EvalError("cdaddr: not a pair");
+            if (!(c3.car instanceof Cons c4)) throw new EvalError("cdaddr: not a pair");
+            return c4.cdr;
+        });
+        define("cddaar", args -> {
+            requireArgCount(args, 1, "cddaar");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cddaar: not a pair");
+            if (!(c1.car instanceof Cons c2)) throw new EvalError("cddaar: not a pair");
+            if (!(c2.car instanceof Cons c3)) throw new EvalError("cddaar: not a pair");
+            if (!(c3.cdr instanceof Cons c4)) throw new EvalError("cddaar: not a pair");
+            return c4.cdr;
+        });
+        define("cddadr", args -> {
+            requireArgCount(args, 1, "cddadr");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cddadr: not a pair");
+            if (!(c1.cdr instanceof Cons c2)) throw new EvalError("cddadr: not a pair");
+            if (!(c2.car instanceof Cons c3)) throw new EvalError("cddadr: not a pair");
+            if (!(c3.cdr instanceof Cons c4)) throw new EvalError("cddadr: not a pair");
+            return c4.cdr;
+        });
+        define("cdddar", args -> {
+            requireArgCount(args, 1, "cdddar");
+            if (!(args.get(0) instanceof Cons c1)) throw new EvalError("cdddar: not a pair");
+            if (!(c1.car instanceof Cons c2)) throw new EvalError("cdddar: not a pair");
+            if (!(c2.cdr instanceof Cons c3)) throw new EvalError("cdddar: not a pair");
+            if (!(c3.cdr instanceof Cons c4)) throw new EvalError("cdddar: not a pair");
+            return c4.cdr;
         });
     }
 
@@ -240,9 +474,17 @@ final class Builtins {
         define("length", args -> {
             requireArgCount(args, 1, "length");
             long count = 0;
-            Object cur = args.get(0);
-            while (cur instanceof Cons c) { count++; cur = c.cdr; }
-            if (cur != NIL) throw new EvalError("length: not a proper list");
+            Object slow = args.get(0), fast = args.get(0);
+            while (fast instanceof Cons cf) {
+                fast = cf.cdr;
+                count++;
+                if (!(fast instanceof Cons cf2)) break;
+                fast = cf2.cdr;
+                count++;
+                slow = ((Cons) slow).cdr;
+                if (slow == fast) throw new EvalError("length: not a proper list");
+            }
+            if (fast != NIL) throw new EvalError("length: not a proper list");
             return count;
         });
         define("append", args -> {
@@ -282,9 +524,15 @@ final class Builtins {
         });
         define("list?", args -> {
             requireArgCount(args, 1, "list?");
-            Object cur = args.get(0);
-            while (cur instanceof Cons c) { cur = c.cdr; }
-            return cur == NIL;
+            Object slow = args.get(0), fast = args.get(0);
+            while (fast instanceof Cons cf) {
+                fast = cf.cdr;
+                if (!(fast instanceof Cons cf2)) return fast == NIL;
+                fast = cf2.cdr;
+                slow = ((Cons) slow).cdr;
+                if (slow == fast) return false; // cycle detected
+            }
+            return fast == NIL;
         });
         define("eq?", args -> {
             requireArgCount(args, 2, "eq?");
@@ -301,6 +549,64 @@ final class Builtins {
         define("equal?", args -> {
             requireArgCount(args, 2, "equal?");
             return schemeEqual(args.get(0), args.get(1));
+        });
+        define("memq", args -> {
+            requireArgCount(args, 2, "memq");
+            Object obj = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof Cons c) {
+                if (obj == c.car || (obj instanceof Long la && c.car instanceof Long lb && la.equals(lb))
+                    || (obj instanceof Boolean ba && c.car instanceof Boolean bb && ba.equals(bb))
+                    || (obj instanceof String sa && c.car instanceof String sb && sa.equals(sb)))
+                    return lst;
+                lst = c.cdr;
+            }
+            return Boolean.FALSE;
+        });
+        define("memv", args -> {
+            requireArgCount(args, 2, "memv");
+            Object obj = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof Cons c) {
+                if (evaluator.schemeEqv(obj, c.car)) return lst;
+                lst = c.cdr;
+            }
+            return Boolean.FALSE;
+        });
+        define("member", args -> {
+            requireArgCount(args, 2, "member");
+            Object obj = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof Cons c) {
+                if (schemeEqual(obj, c.car)) return lst;
+                lst = c.cdr;
+            }
+            return Boolean.FALSE;
+        });
+        define("assq", args -> {
+            requireArgCount(args, 2, "assq");
+            Object key = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof Cons c) {
+                if (c.car instanceof Cons pair) {
+                    if (key == pair.car || (key instanceof Long la && pair.car instanceof Long lb && la.equals(lb))
+                        || (key instanceof Boolean ba && pair.car instanceof Boolean bb && ba.equals(bb))
+                        || (key instanceof String sa && pair.car instanceof String sb && sa.equals(sb)))
+                        return c.car;
+                }
+                lst = c.cdr;
+            }
+            return Boolean.FALSE;
+        });
+        define("assv", args -> {
+            requireArgCount(args, 2, "assv");
+            Object key = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof Cons c) {
+                if (c.car instanceof Cons pair && evaluator.schemeEqv(key, pair.car)) return c.car;
+                lst = c.cdr;
+            }
+            return Boolean.FALSE;
         });
         define("assoc", args -> {
             requireArgCount(args, 2, "assoc");
@@ -335,6 +641,34 @@ final class Builtins {
             Object result = NIL;
             for (int i = results.size() - 1; i >= 0; i--) result = new Cons(results.get(i), result);
             return result;
+        });
+        define("reverse", args -> {
+            requireArgCount(args, 1, "reverse");
+            Object result = NIL;
+            Object cur = args.get(0);
+            while (cur instanceof Cons c) { result = new Cons(c.car, result); cur = c.cdr; }
+            return result;
+        });
+        define("for-each", args -> {
+            if (args.size() < 2) throw new EvalError("for-each requires at least 2 arguments");
+            Object proc = args.get(0);
+            int numLists = args.size() - 1;
+            Object[] cursors = new Object[numLists];
+            for (int i = 0; i < numLists; i++) cursors[i] = args.get(i + 1);
+            while (true) {
+                boolean done = false;
+                for (int i = 0; i < numLists; i++) {
+                    if (!(cursors[i] instanceof Cons)) { done = true; break; }
+                }
+                if (done) break;
+                List<Object> callArgs = new ArrayList<>();
+                for (int i = 0; i < numLists; i++) {
+                    callArgs.add(((Cons) cursors[i]).car);
+                    cursors[i] = ((Cons) cursors[i]).cdr;
+                }
+                applyProc(proc, callArgs);
+            }
+            return VOID;
         });
     }
 
@@ -374,6 +708,22 @@ final class Builtins {
     // --- Strings ---
 
     private void registerStrings() {
+        define("make-string", args -> {
+            if (args.isEmpty() || args.size() > 2) throw new EvalError("make-string requires 1 or 2 arguments");
+            int len = (int) requireLong(args.get(0));
+            char fill = args.size() >= 2 && args.get(1) instanceof SchemeChar sc ? sc.value() : ' ';
+            char[] chars = new char[len];
+            java.util.Arrays.fill(chars, fill);
+            return new SchemeString(chars);
+        });
+        define("string", args -> {
+            char[] chars = new char[args.size()];
+            for (int i = 0; i < args.size(); i++) {
+                if (!(args.get(i) instanceof SchemeChar sc)) throw new EvalError("string: not a character");
+                chars[i] = sc.value();
+            }
+            return new SchemeString(chars);
+        });
         define("string-append", args -> {
             StringBuilder sb = new StringBuilder();
             for (Object a : args) {
@@ -536,6 +886,49 @@ final class Builtins {
             for (long i = 0; i < exp; i++) result *= base;
             return result;
         });
+        define("gcd", args -> {
+            if (args.isEmpty()) return 0L;
+            long result = Math.abs(requireLong(args.get(0)));
+            for (int i = 1; i < args.size(); i++) {
+                long b = Math.abs(requireLong(args.get(i)));
+                while (b != 0) { long t = b; b = result % b; result = t; }
+            }
+            return result;
+        });
+        define("lcm", args -> {
+            if (args.isEmpty()) return 1L;
+            long result = Math.abs(requireLong(args.get(0)));
+            for (int i = 1; i < args.size(); i++) {
+                long b = Math.abs(requireLong(args.get(i)));
+                if (result == 0 && b == 0) { result = 0; continue; }
+                result = result / gcdLong(result, b) * b;
+            }
+            return result;
+        });
+        define("truncate", args -> {
+            requireArgCount(args, 1, "truncate");
+            Object v = args.get(0);
+            if (v instanceof Long) return v;
+            if (v instanceof Double d) return (long)(double) d;
+            if (v instanceof SchemeRational r) return r.num / r.den;
+            throw new EvalError("truncate: expected number");
+        });
+        define("round", args -> {
+            requireArgCount(args, 1, "round");
+            Object v = args.get(0);
+            if (v instanceof Long) return v;
+            if (v instanceof Double d) return Math.round(d);
+            if (v instanceof SchemeRational r) {
+                long q = r.num / r.den;
+                long rem = Math.abs(r.num % r.den);
+                long halfDen = r.den / 2;
+                if (rem > halfDen || (rem == halfDen && r.den % 2 == 0 && q % 2 != 0)) {
+                    return r.num > 0 ? q + 1 : q - 1;
+                }
+                return q;
+            }
+            throw new EvalError("round: expected number");
+        });
         define("zero?", args -> { requireArgCount(args, 1, "zero?"); requireNumber(args.get(0)); return numEquals(args.get(0), 0L); });
         define("positive?", args -> { requireArgCount(args, 1, "positive?"); requireNumber(args.get(0)); return numCompare(args.get(0), 0L) > 0; });
         define("negative?", args -> { requireArgCount(args, 1, "negative?"); requireNumber(args.get(0)); return numCompare(args.get(0), 0L) < 0; });
@@ -594,6 +987,24 @@ final class Builtins {
             if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b))
                 throw new EvalError("string<?: not a string");
             return a.value().compareTo(b.value()) < 0;
+        });
+        define("string>?", args -> {
+            requireArgCount(args, 2, "string>?");
+            if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b))
+                throw new EvalError("string>?: not a string");
+            return a.value().compareTo(b.value()) > 0;
+        });
+        define("string<=?", args -> {
+            requireArgCount(args, 2, "string<=?");
+            if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b))
+                throw new EvalError("string<=?: not a string");
+            return a.value().compareTo(b.value()) <= 0;
+        });
+        define("string>=?", args -> {
+            requireArgCount(args, 2, "string>=?");
+            if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b))
+                throw new EvalError("string>=?: not a string");
+            return a.value().compareTo(b.value()) >= 0;
         });
         define("string-ci=?", args -> {
             requireArgCount(args, 2, "string-ci=?");
