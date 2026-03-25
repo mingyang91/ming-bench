@@ -3,6 +3,7 @@ package ming;
 import java.util.ArrayList;
 import java.util.List;
 
+import ming.Continuations.SchemeContinuation;
 import ming.Evaluator.Builtin;
 import ming.Evaluator.Env;
 
@@ -636,7 +637,7 @@ final class Builtins {
         define("symbol?", args -> { requireArgCount(args, 1, "symbol?"); return args.get(0) instanceof String; });
         define("char?", args -> { requireArgCount(args, 1, "char?"); return args.get(0) instanceof SchemeChar; });
         define("vector?", args -> { requireArgCount(args, 1, "vector?"); return args.get(0) instanceof SchemeVector; });
-        define("procedure?", args -> { requireArgCount(args, 1, "procedure?"); Object a = args.get(0); return a instanceof Evaluator.Lambda || a instanceof Evaluator.CaseLambda || a instanceof Evaluator.Builtin || a instanceof Evaluator.SchemeContinuation; });
+        define("procedure?", args -> { requireArgCount(args, 1, "procedure?"); Object a = args.get(0); return a instanceof Evaluator.Lambda || a instanceof Evaluator.CaseLambda || a instanceof Evaluator.Builtin || a instanceof SchemeContinuation; });
     }
 
     // --- I/O ---
@@ -786,6 +787,8 @@ final class Builtins {
         define("call/cc", args -> { throw new EvalError("call/cc: should be handled by CEK machine"); });
         define("call-with-current-continuation", args -> { throw new EvalError("call-with-current-continuation: should be handled by CEK machine"); });
         define("dynamic-wind", args -> { throw new EvalError("dynamic-wind: should be handled by CEK machine"); });
+        define("raise", args -> { throw new EvalError("raise: should be handled by CEK machine"); });
+        define("with-exception-handler", args -> { throw new EvalError("with-exception-handler: should be handled by CEK machine"); });
     }
 
     // --- Numeric utilities (L09) ---

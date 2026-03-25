@@ -5,6 +5,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import ming.Continuations.*;
+import ming.Continuations.WindEntry;
+
 public class Evaluator {
 
     @FunctionalInterface
@@ -47,205 +50,12 @@ public class Evaluator {
         }
     }
 
-    // ===== Continuation types for CEK machine =====
-
-    static abstract class Kont {}
-
-    static final class HaltK extends Kont {
-        static final HaltK INST = new HaltK();
-    }
-
-    static final class IfK extends Kont {
-        final Object thenE, elseE;
-        final Env env; final Kont k;
-        IfK(Object t, Object e, Env env, Kont k) { thenE=t; elseE=e; this.env=env; this.k=k; }
-    }
-
-    // Sequence: evaluate exprs[idx], then exprs[idx+1], ..., with last in tail position
-    static final class SeqK extends Kont {
-        final List<?> exprs; final int idx;
-        final Env env; final Kont k;
-        SeqK(List<?> es, int i, Env env, Kont k) { exprs=es; idx=i; this.env=env; this.k=k; }
-    }
-
-    static final class SetK extends Kont {
-        final String name; final Env env; final Pos pos; final Kont k;
-        SetK(String n, Env env, Pos p, Kont k) { name=n; this.env=env; pos=p; this.k=k; }
-    }
-
-    static final class DefK extends Kont {
-        final String name; final Env env; final Kont k;
-        DefK(String n, Env env, Kont k) { name=n; this.env=env; this.k=k; }
-    }
-
-    // Evaluated operator, now start evaluating args
-    static final class EvArgsK extends Kont {
-        final List<Object> argExprs;
-        final Env env; final Pos pos; final Kont k;
-        EvArgsK(List<Object> ae, Env env, Pos pos, Kont k) { argExprs=ae; this.env=env; this.pos=pos; this.k=k; }
-    }
-
-    // Accumulating evaluated args
-    static final class AccArgsK extends Kont {
-        final Object fun;
-        final List<Object> evaled;
-        final List<Object> argExprs;
-        final int nextIdx;
-        final Env env; final Pos pos; final Kont k;
-        AccArgsK(Object f, List<Object> ev, List<Object> ae, int ni, Env env, Pos pos, Kont k) {
-            fun=f; evaled=ev; argExprs=ae; nextIdx=ni; this.env=env; this.pos=pos; this.k=k;
-        }
-    }
-
-    static final class AndK extends Kont {
-        final List<?> form; final int nextIdx;
-        final Env env; final Kont k;
-        AndK(List<?> f, int i, Env env, Kont k) { form=f; nextIdx=i; this.env=env; this.k=k; }
-    }
-
-    static final class OrK extends Kont {
-        final List<?> form; final int nextIdx;
-        final Env env; final Kont k;
-        OrK(List<?> f, int i, Env env, Kont k) { form=f; nextIdx=i; this.env=env; this.k=k; }
-    }
-
-    // Let/let*/letrec bindings
-    static final class LetBindK extends Kont {
-        final String name;
-        final List<?> bindings; final int nextIdx;
-        final Env evalEnv; final Env letEnv;
-        final List<?> form; final int bodyStart;
-        final Kont k;
-        LetBindK(String n, List<?> b, int ni, Env ee, Env le, List<?> f, int bs, Kont k) {
-            name=n; bindings=b; nextIdx=ni; evalEnv=ee; letEnv=le; form=f; bodyStart=bs; this.k=k;
-        }
-    }
-
-    // Cond: evaluated a test
-    static final class CondK extends Kont {
-        final List<?> clause;
-        final List<?> form; final int nextClauseIdx;
-        final Env env; final Kont k;
-        CondK(List<?> c, List<?> f, int ni, Env env, Kont k) { clause=c; form=f; nextClauseIdx=ni; this.env=env; this.k=k; }
-    }
-
-    // Case: evaluated the key
-    static final class CaseKeyK extends Kont {
-        final List<?> form; final Env env; final Kont k;
-        CaseKeyK(List<?> f, Env env, Kont k) { form=f; this.env=env; this.k=k; }
-    }
-
-    // Do: init evaluation
-    static final class DoInitK extends Kont {
-        final int idx;
-        final String[] varNames; final Object[] initExprs;
-        final Object[] stepExprs; final boolean[] hasStep;
-        final Env doEnv; final List<?> testClause; final List<?> form;
-        final Env outerEnv; final Kont k;
-        DoInitK(int i, String[] vn, Object[] ie, Object[] se, boolean[] hs, Env de, List<?> tc, List<?> f, Env oe, Kont k) {
-            idx=i; varNames=vn; initExprs=ie; stepExprs=se; hasStep=hs; doEnv=de; testClause=tc; form=f; outerEnv=oe; this.k=k;
-        }
-    }
-
-    // Do: test evaluated
-    static final class DoTestK extends Kont {
-        final String[] varNames; final Object[] stepExprs; final boolean[] hasStep;
-        final List<?> testClause; final List<?> form;
-        final Env doEnv; final Kont k;
-        DoTestK(String[] vn, Object[] se, boolean[] hs, List<?> tc, List<?> f, Env de, Kont k) {
-            varNames=vn; stepExprs=se; hasStep=hs; testClause=tc; form=f; doEnv=de; this.k=k;
-        }
-    }
-
-    // Do: after commands, start step evaluation
-    static final class DoStepStartK extends Kont {
-        final String[] varNames; final Object[] stepExprs; final boolean[] hasStep;
-        final List<?> testClause; final List<?> form;
-        final Env doEnv; final Kont k;
-        DoStepStartK(String[] vn, Object[] se, boolean[] hs, List<?> tc, List<?> f, Env de, Kont k) {
-            varNames=vn; stepExprs=se; hasStep=hs; testClause=tc; form=f; doEnv=de; this.k=k;
-        }
-    }
-
-    // Do: evaluating step expressions
-    static final class DoStepK extends Kont {
-        final int idx; final Object[] newVals;
-        final String[] varNames; final Object[] stepExprs; final boolean[] hasStep;
-        final List<?> testClause; final List<?> form;
-        final Env doEnv; final Kont k;
-        DoStepK(int i, Object[] nv, String[] vn, Object[] se, boolean[] hs, List<?> tc, List<?> f, Env de, Kont k) {
-            idx=i; newVals=nv; varNames=vn; stepExprs=se; hasStep=hs; testClause=tc; form=f; doEnv=de; this.k=k;
-        }
-    }
-
-    // Map builtin continuation
-    static final class MapK extends Kont {
-        final Object fun; final List<Object> remainingLists;
-        final List<Object> results; final Pos pos; final Kont k;
-        MapK(Object f, List<Object> rl, List<Object> r, Pos p, Kont k) {
-            fun=f; remainingLists=rl; results=r; pos=p; this.k=k;
-        }
-    }
-
-    // For-each builtin continuation
-    static final class ForEachK extends Kont {
-        final Object fun; final List<Object> remainingLists;
-        final Pos pos; final Kont k;
-        ForEachK(Object f, List<Object> rl, Pos p, Kont k) {
-            fun=f; remainingLists=rl; pos=p; this.k=k;
-        }
-    }
-
-    // Wind entry for dynamic-wind
-    record WindEntry(Object inThunk, Object outThunk) {}
-
-    // First-class continuation value
-    static final class SchemeContinuation {
-        final Kont k;
-        final List<WindEntry> windStack;
-        SchemeContinuation(Kont k, List<WindEntry> windStack) { this.k = k; this.windStack = windStack; }
-    }
-
-    // dynamic-wind: after in-thunk, evaluate body
-    static final class DynWindBodyK extends Kont {
-        final Object bodyThunk; final Object outThunk; final WindEntry entry;
-        final Pos pos; final Kont k;
-        DynWindBodyK(Object bt, Object ot, WindEntry e, Pos p, Kont k) {
-            bodyThunk=bt; outThunk=ot; entry=e; pos=p; this.k=k;
-        }
-    }
-
-    // dynamic-wind: after body, run out-thunk
-    static final class DynWindOutK extends Kont {
-        final Object outThunk; final WindEntry entry;
-        final Object bodyVal; final Pos pos; final Kont k;
-        DynWindOutK(Object ot, WindEntry e, Object bv, Pos p, Kont k) {
-            outThunk=ot; entry=e; bodyVal=bv; pos=p; this.k=k;
-        }
-    }
-
-    // dynamic-wind: after out-thunk, return body value
-    static final class DynWindFinishK extends Kont {
-        final Object bodyVal; final WindEntry entry; final Kont k;
-        DynWindFinishK(Object bv, WindEntry e, Kont k) { bodyVal=bv; entry=e; this.k=k; }
-    }
-
-    // Wind transfer: run a sequence of thunks then continue
-    static final class WindTransferK extends Kont {
-        final List<Object> thunks; final int idx;
-        final List<WindEntry> targetStack;
-        final Object val; final Kont targetK;
-        WindTransferK(List<Object> t, int i, List<WindEntry> ts, Object v, Kont tk) {
-            thunks=t; idx=i; targetStack=ts; val=v; targetK=tk;
-        }
-    }
-
     // ===== Constants =====
 
     static final java.util.Set<String> SPECIAL_FORMS = java.util.Set.of(
         "quote", "if", "define", "lambda", "and", "or", "let", "set!", "begin", "cond",
         "define-syntax", "syntax-rules", "else", "let*", "letrec", "letrec*", "case",
-        "do", "define-record-type", "case-lambda"
+        "do", "define-record-type", "case-lambda", "guard"
     );
 
     private int gensymCounter = 0;
@@ -267,6 +77,9 @@ public class Evaluator {
 
     // dynamic-wind stack
     private List<WindEntry> windStack = new ArrayList<>();
+
+    // exception handler stack
+    private List<ExHandlerFrame> exHandlerStack = new ArrayList<>();
 
     public Evaluator() {
         new Builtins(globalEnv, this).registerAll();
@@ -436,6 +249,16 @@ public class Evaluator {
                     case "do" -> { evalDoStep(list, pos); return; }
                     case "define-syntax" -> { evalDefineSyntax(list, mEnv, pos); mVal = VOID; mApply = true; return; }
                     case "define-record-type" -> { evalDefineRecordType(list, mEnv, pos); mVal = VOID; mApply = true; return; }
+                    case "guard" -> {
+                        if (list.size() < 3) throw new EvalError("guard requires clauses and body" + posStr(pos));
+                        Object clauseSpecRaw = unwrap(list.get(1));
+                        if (!(clauseSpecRaw instanceof List<?> clauseSpec) || clauseSpec.isEmpty())
+                            throw new EvalError("guard requires variable and clauses" + posStr(pos));
+                        String gvar = (String) unwrap(clauseSpec.get(0));
+                        exHandlerStack.add(new ExHandlerFrame(gvar, clauseSpec, mEnv, mK, windStack));
+                        startBody(list, 2, mEnv, new GuardBodyK(mK));
+                        return;
+                    }
                 }
             }
 
@@ -687,6 +510,30 @@ public class Evaluator {
             return;
         }
 
+        if (mK instanceof GuardBodyK gk) {
+            // Body completed normally, pop guard handler
+            if (!exHandlerStack.isEmpty()) exHandlerStack.remove(exHandlerStack.size() - 1);
+            mK = gk.k;
+            return;
+        }
+
+        if (mK instanceof WithExHandlerK wk) {
+            // Thunk completed normally, pop handler
+            if (!exHandlerStack.isEmpty()) exHandlerStack.remove(exHandlerStack.size() - 1);
+            mK = wk.k;
+            return;
+        }
+
+        if (mK instanceof GuardEvalK gk) {
+            // Wind transfer done, evaluate guard cond clauses
+            Env clauseEnv = new Env(gk.guardEnv);
+            clauseEnv.define(gk.var, gk.exnVal);
+            mEnv = clauseEnv;
+            mK = gk.k;
+            evalCondStep(gk.clauseSpec, 1);
+            return;
+        }
+
         if (mK instanceof WindTransferK wt) {
             int nextIdx = wt.idx + 1;
             // Update wind stack as we go: if the thunk we just ran was an out-thunk, pop; if in-thunk, push
@@ -851,6 +698,57 @@ public class Evaluator {
                 // Run in-thunk first, then body, then out-thunk
                 mK = new DynWindBodyK(bodyThunk, outThunk, entry, pos, mK);
                 cekApplyFun(inThunk, List.of(), pos);
+                return;
+            }
+
+            // raise
+            if ("raise".equals(name)) {
+                if (args.size() != 1) throw new EvalError("raise requires 1 argument" + posStr(pos));
+                Object exnVal = args.get(0);
+                if (exHandlerStack.isEmpty()) throw new EvalError("unhandled exception: " + schemeToString(exnVal));
+                ExHandlerFrame frame = exHandlerStack.remove(exHandlerStack.size() - 1);
+                if (frame.isGuard) {
+                    // Wind-transfer back to guard point, then evaluate clauses
+                    List<WindEntry> current = windStack;
+                    List<WindEntry> target = frame.guardWindStack;
+                    int commonLen = 0;
+                    int minLen = Math.min(current.size(), target.size());
+                    for (int i = 0; i < minLen; i++) {
+                        if (current.get(i) == target.get(i)) commonLen++;
+                        else break;
+                    }
+                    List<Object> thunks = new ArrayList<>();
+                    for (int i = current.size() - 1; i >= commonLen; i--) {
+                        thunks.add(current.get(i).outThunk());
+                    }
+                    for (int i = commonLen; i < target.size(); i++) {
+                        thunks.add(target.get(i).inThunk());
+                    }
+                    Kont targetK = new GuardEvalK(frame.guardVar, exnVal, frame.clauseSpec, frame.guardEnv, frame.guardK);
+                    if (thunks.isEmpty()) {
+                        windStack = new ArrayList<>(target);
+                        mK = targetK;
+                        mVal = VOID;
+                        mApply = true;
+                    } else {
+                        mK = new WindTransferK(thunks, 0, target, VOID, targetK);
+                        cekApplyFun(thunks.get(0), List.of(), pos);
+                    }
+                } else {
+                    // with-exception-handler: call handler in current dynamic environment
+                    cekApplyFun(frame.handler, List.of(exnVal), pos);
+                }
+                return;
+            }
+
+            // with-exception-handler
+            if ("with-exception-handler".equals(name)) {
+                if (args.size() != 2) throw new EvalError("with-exception-handler requires 2 arguments" + posStr(pos));
+                Object handler = args.get(0);
+                Object thunk = args.get(1);
+                exHandlerStack.add(new ExHandlerFrame(handler));
+                mK = new WithExHandlerK(mK);
+                cekApplyFun(thunk, List.of(), pos);
                 return;
             }
 
