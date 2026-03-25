@@ -432,10 +432,44 @@ final class Builtins {
         define("string-set!", args -> {
             requireArgCount(args, 3, "string-set!");
             if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-set!: not a string");
-            int idx = (int) requireLong(args.get(1));
+            if (!(args.get(1) instanceof Long idx)) throw new EvalError("string-set!: not an integer");
             if (!(args.get(2) instanceof SchemeChar c)) throw new EvalError("string-set!: not a character");
-            s.setChar(idx, c.value());
-            return VOID;
+            int i = idx.intValue();
+            if (i < 0 || i >= s.length()) throw new EvalError("string-set!: index out of range");
+            s.setChar(i, c.value());
+            return null;
+        });
+        define("string->list", args -> {
+            requireArgCount(args, 1, "string->list");
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string->list: not a string");
+            Object result = NIL;
+            for (int i = s.length() - 1; i >= 0; i--) {
+                result = new Cons(new SchemeChar(s.charAt(i)), result);
+            }
+            return result;
+        });
+        define("list->string", args -> {
+            requireArgCount(args, 1, "list->string");
+            List<Character> chars = new ArrayList<>();
+            Object cur = args.get(0);
+            while (cur instanceof Cons c) {
+                if (!(c.car instanceof SchemeChar sc)) throw new EvalError("list->string: not a character");
+                chars.add(sc.value());
+                cur = c.cdr;
+            }
+            char[] arr = new char[chars.size()];
+            for (int i = 0; i < chars.size(); i++) arr[i] = chars.get(i);
+            return new SchemeString(arr);
+        });
+        define("char->integer", args -> {
+            requireArgCount(args, 1, "char->integer");
+            if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char->integer: not a character");
+            return (long) c.value();
+        });
+        define("integer->char", args -> {
+            requireArgCount(args, 1, "integer->char");
+            long n = requireLong(args.get(0));
+            return new SchemeChar((char) n);
         });
     }
 

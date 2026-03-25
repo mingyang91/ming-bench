@@ -20,12 +20,18 @@ public class Evaluator {
 
     static class SchemeString {
         private final char[] chars;
-        SchemeString(String value) { this.chars = value.toCharArray(); }
-        SchemeString(char[] chars) { this.chars = chars; }
+        private final boolean immutable;
+        SchemeString(String value) { this.chars = value.toCharArray(); this.immutable = false; }
+        SchemeString(String value, boolean immutable) { this.chars = value.toCharArray(); this.immutable = immutable; }
+        SchemeString(char[] chars) { this.chars = chars; this.immutable = false; }
         String value() { return new String(chars); }
         int length() { return chars.length; }
         char charAt(int i) { return chars[i]; }
-        void setChar(int i, char c) { chars[i] = c; }
+        boolean isImmutable() { return immutable; }
+        void setChar(int i, char c) throws EvalError {
+            if (immutable) throw new EvalError("string-set!: strings are immutable");
+            chars[i] = c;
+        }
     }
 
     record SchemeChar(char value) {}
@@ -251,7 +257,7 @@ public class Evaluator {
                     i++;
                 }
                 if (i < input.length()) { i++; colNum++; }
-                tokens.add(new Token(new SchemeString(sb.toString()), strPos));
+                tokens.add(new Token(new SchemeString(sb.toString(), true), strPos));
             } else if (c == '#') {
                 Pos hPos = posAt(lineNum, colNum);
                 if (i + 1 < input.length()) {
