@@ -8,6 +8,7 @@ public class Interpreter {
     private final Environment globals = new Environment();
     private static final SchemeValue NIL = new SchemeValue.ListVal(List.of());
     private IdentityHashMap<SchemeValue, SourcePos> positions;
+    private final StringBuilder outputBuffer = new StringBuilder();
 
     public Interpreter() {
         registerBuiltins();
@@ -15,6 +16,10 @@ public class Interpreter {
 
     public void setPositions(IdentityHashMap<SchemeValue, SourcePos> positions) {
         this.positions = positions;
+    }
+
+    public String getOutput() {
+        return outputBuffer.toString();
     }
 
     private void registerBuiltins() {
@@ -127,6 +132,83 @@ public class Interpreter {
             if (args.length != 1) throw new EvalError("symbol?: expected 1 argument");
             return new SchemeValue.BoolVal(args[0] instanceof SchemeValue.SymbolVal);
         }));
+
+        // L05 builtins
+        globals.define("display", new SchemeValue.BuiltinVal("display", args -> {
+            if (args.length != 1) throw new EvalError("display: expected 1 argument");
+            outputBuffer.append(args[0].displayOutput());
+            return new SchemeValue.VoidVal();
+        }));
+        globals.define("write", new SchemeValue.BuiltinVal("write", args -> {
+            if (args.length != 1) throw new EvalError("write: expected 1 argument");
+            outputBuffer.append(args[0].display());
+            return new SchemeValue.VoidVal();
+        }));
+        globals.define("newline", new SchemeValue.BuiltinVal("newline", args -> {
+            if (args.length != 0) throw new EvalError("newline: expected 0 arguments");
+            outputBuffer.append("\n");
+            return new SchemeValue.VoidVal();
+        }));
+        globals.define("string-append", new SchemeValue.BuiltinVal("string-append", args -> {
+            var sb = new StringBuilder();
+            for (var arg : args) {
+                if (!(arg instanceof SchemeValue.StringVal s))
+                    throw new EvalError("string-append: expected string");
+                sb.append(s.value());
+            }
+            return new SchemeValue.StringVal(sb.toString());
+        }));
+        globals.define("string-length", new SchemeValue.BuiltinVal("string-length", args -> {
+            if (args.length != 1) throw new EvalError("string-length: expected 1 argument");
+            if (!(args[0] instanceof SchemeValue.StringVal s))
+                throw new EvalError("string-length: expected string");
+            return new SchemeValue.IntVal(s.value().length());
+        }));
+        globals.define("substring", new SchemeValue.BuiltinVal("substring", args -> {
+            if (args.length != 3) throw new EvalError("substring: expected 3 arguments");
+            if (!(args[0] instanceof SchemeValue.StringVal s))
+                throw new EvalError("substring: expected string");
+            int start = (int) asLong(args[1]);
+            int end = (int) asLong(args[2]);
+            return new SchemeValue.StringVal(s.value().substring(start, end));
+        }));
+        globals.define("string->number", new SchemeValue.BuiltinVal("string->number", args -> {
+            if (args.length != 1) throw new EvalError("string->number: expected 1 argument");
+            if (!(args[0] instanceof SchemeValue.StringVal s))
+                throw new EvalError("string->number: expected string");
+            try {
+                return new SchemeValue.IntVal(Long.parseLong(s.value()));
+            } catch (NumberFormatException e) {
+                return new SchemeValue.BoolVal(false);
+            }
+        }));
+        globals.define("number->string", new SchemeValue.BuiltinVal("number->string", args -> {
+            if (args.length != 1) throw new EvalError("number->string: expected 1 argument");
+            return new SchemeValue.StringVal(Long.toString(asLong(args[0])));
+        }));
+        globals.define("symbol->string", new SchemeValue.BuiltinVal("symbol->string", args -> {
+            if (args.length != 1) throw new EvalError("symbol->string: expected 1 argument");
+            if (!(args[0] instanceof SchemeValue.SymbolVal s))
+                throw new EvalError("symbol->string: expected symbol");
+            return new SchemeValue.StringVal(s.name());
+        }));
+        globals.define("string->symbol", new SchemeValue.BuiltinVal("string->symbol", args -> {
+            if (args.length != 1) throw new EvalError("string->symbol: expected 1 argument");
+            if (!(args[0] instanceof SchemeValue.StringVal s))
+                throw new EvalError("string->symbol: expected string");
+            return new SchemeValue.SymbolVal(s.value());
+        }));
+        globals.define("string-ref", new SchemeValue.BuiltinVal("string-ref", args -> {
+            if (args.length != 2) throw new EvalError("string-ref: expected 2 arguments");
+            if (!(args[0] instanceof SchemeValue.StringVal s))
+                throw new EvalError("string-ref: expected string");
+            int idx = (int) asLong(args[1]);
+            return new SchemeValue.CharVal(s.value().charAt(idx));
+        }));
+        globals.define("char?", new SchemeValue.BuiltinVal("char?", args -> {
+            if (args.length != 1) throw new EvalError("char?: expected 1 argument");
+            return new SchemeValue.BoolVal(args[0] instanceof SchemeValue.CharVal);
+        }));
     }
 
     public SchemeValue eval(SchemeValue expr) throws EvalError {
@@ -142,6 +224,7 @@ public class Interpreter {
                 case SchemeValue.VoidVal v -> v;
                 case SchemeValue.LambdaVal v -> v;
                 case SchemeValue.BuiltinVal v -> v;
+                case SchemeValue.CharVal v -> v;
                 case SchemeValue.PairVal v -> v;
                 case SchemeValue.SymbolVal v -> env.get(v.name());
                 case SchemeValue.ListVal v -> evalList(v, env);

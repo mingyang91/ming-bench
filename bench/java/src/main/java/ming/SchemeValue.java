@@ -11,6 +11,7 @@ public sealed interface SchemeValue {
     record VoidVal() implements SchemeValue {}
     record LambdaVal(List<String> params, List<SchemeValue> body, Environment env) implements SchemeValue {}
     record PairVal(SchemeValue car, SchemeValue cdr) implements SchemeValue {}
+    record CharVal(char value) implements SchemeValue {}
     record BuiltinVal(String name, Builtin proc) implements SchemeValue {}
 
     @FunctionalInterface
@@ -51,10 +52,18 @@ public sealed interface SchemeValue {
                 sb.append(")");
                 yield sb.toString();
             }
+            case CharVal v -> "#\\" + v.value();
             case VoidVal v -> "#<void>";
             case LambdaVal v -> "#<procedure>";
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";
         };
+    }
+
+    /** Like display but strings without quotes, chars as raw char. Used by Scheme `display`. */
+    default String displayOutput() {
+        if (this instanceof StringVal s) return s.value();
+        if (this instanceof CharVal c) return String.valueOf(c.value());
+        return display();
     }
 
     default boolean isTruthy() {
