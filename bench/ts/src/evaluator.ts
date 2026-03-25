@@ -1,22 +1,27 @@
-import { EvalError } from './evalError.js';
+import { EvalError, type SourcePosition } from './evalError.js';
 
 type Token =
-  | { kind: 'paren'; value: '(' | ')' }
-  | { kind: 'atom'; value: string }
-  | { kind: 'string'; value: string }
-  | { kind: 'quote' };
+  | { kind: 'paren'; value: '(' | ')'; position: SourcePosition }
+  | { kind: 'atom'; value: string; position: SourcePosition }
+  | { kind: 'string'; value: string; position: SourcePosition }
+  | { kind: 'quote'; position: SourcePosition };
 
 type Expr =
-  | { type: 'number'; value: number }
-  | { type: 'boolean'; value: boolean }
-  | { type: 'string'; value: string }
-  | { type: 'symbol'; name: string }
-  | { type: 'list'; elements: Expr[] };
+  | { type: 'number'; value: number; position: SourcePosition }
+  | { type: 'boolean'; value: boolean; position: SourcePosition }
+  | { type: 'string'; value: string; position: SourcePosition }
+  | { type: 'symbol'; name: string; position: SourcePosition }
+  | { type: 'list'; elements: Expr[]; position: SourcePosition };
+
+type EvaluatedArg = {
+  value: SchemeValue;
+  position: SourcePosition;
+};
 
 type BuiltinProcedure = {
   type: 'builtin';
   name: string;
-  invoke: (args: SchemeValue[]) => SchemeValue;
+  invoke: (args: EvaluatedArg[], callPosition: SourcePosition) => SchemeValue;
 };
 
 type Closure = {
@@ -36,6 +41,7 @@ type SchemeValue =
   | Closure
   | { type: 'void' };
 
+const START_POSITION: SourcePosition = { line: 1, column: 1 };
 const VOID_VALUE: SchemeValue = { type: 'void' };
 
 class Environment {
@@ -47,17 +53,17 @@ class Environment {
     this.bindings.set(name, value);
   }
 
-  lookup(name: string): SchemeValue {
+  lookup(name: string, position: SourcePosition): SchemeValue {
     const value = this.bindings.get(name);
     if (value !== undefined) {
       return value;
     }
 
     if (this.parent) {
-      return this.parent.lookup(name);
+      return this.parent.lookup(name, position);
     }
 
-    throw new EvalError(`unbound variable: ${name}`);
+    throw new EvalError(`unbound variable: ${name}`, position);
   }
 }
 
@@ -69,7 +75,7 @@ export function evalStr(input: string): string {
   const expressions = parseProgram(input);
 
   if (expressions.length === 0) {
-    throw new EvalError('empty input');
+    throw new EvalError('empty input', START_POSITION);
   }
 
   const env = createGlobalEnv();
@@ -91,7 +97,7 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
 }
 
 function parseProgram(input: string): Expr[] {
-  const tokens = tokenize(input);
+  const { tokens, eofPosition } = tokenize(input);
   let index = 0;
   const expressions: Expr[] = [];
 
@@ -104,14 +110,14 @@ function parseProgram(input: string): Expr[] {
   function parseExpr(): Expr {
     const token = tokens[index];
     if (!token) {
-      throw new EvalError('unexpected end of input');
+      throw new EvalError('unexpected end of input', eofPosition);
     }
 
     index += 1;
 
     if (token.kind === 'paren') {
       if (token.value === ')') {
-        throw new EvalError('unexpected )');
+        throw new EvalError('unexpected )', token.position);
       }
 
       const elements: Expr[] = [];
@@ -119,75 +125,96 @@ function parseProgram(input: string): Expr[] {
         const next = tokens[index];
         if (next.kind === 'paren' && next.value === ')') {
           index += 1;
-          return { type: 'list', elements };
+          return { type: 'list', elements, position: token.position };
         }
 
         elements.push(parseExpr());
       }
 
-      throw new EvalError('missing )');
+      throw new EvalError('missing )', eofPosition);
     }
 
     if (token.kind === 'quote') {
       return {
         type: 'list',
-        elements: [{ type: 'symbol', name: 'quote' }, parseExpr()],
+        elements: [
+          { type: 'symbol', name: 'quote', position: token.position },
+          parseExpr(),
+        ],
+        position: token.position,
       };
     }
 
     if (token.kind === 'string') {
-      return { type: 'string', value: token.value };
+      return { type: 'string', value: token.value, position: token.position };
     }
 
     if (token.value === '#t') {
-      return { type: 'boolean', value: true };
+      return { type: 'boolean', value: true, position: token.position };
     }
 
     if (token.value === '#f') {
-      return { type: 'boolean', value: false };
+      return { type: 'boolean', value: false, position: token.position };
     }
 
     if (/^-?\d+$/.test(token.value)) {
-      return { type: 'number', value: Number(token.value) };
+      return { type: 'number', value: Number(token.value), position: token.position };
     }
 
-    return { type: 'symbol', name: token.value };
+    return { type: 'symbol', name: token.value, position: token.position };
   }
 }
 
-function tokenize(input: string): Token[] {
+function tokenize(input: string): { tokens: Token[]; eofPosition: SourcePosition } {
   const tokens: Token[] = [];
   let index = 0;
+  let line = 1;
+  let column = 1;
+
+  const currentPosition = (): SourcePosition => ({ line, column });
+
+  const advanceChar = (ch: string): void => {
+    index += 1;
+    if (ch === '\n') {
+      line += 1;
+      column = 1;
+      return;
+    }
+
+    column += 1;
+  };
 
   while (index < input.length) {
     const ch = input[index];
 
     if (/\s/.test(ch)) {
-      index += 1;
+      advanceChar(ch);
       continue;
     }
 
     if (ch === ';') {
       while (index < input.length && input[index] !== '\n') {
-        index += 1;
+        advanceChar(input[index]);
       }
       continue;
     }
 
+    const position = currentPosition();
+
     if (ch === '(' || ch === ')') {
-      tokens.push({ kind: 'paren', value: ch });
-      index += 1;
+      tokens.push({ kind: 'paren', value: ch, position });
+      advanceChar(ch);
       continue;
     }
 
     if (ch === "'") {
-      tokens.push({ kind: 'quote' });
-      index += 1;
+      tokens.push({ kind: 'quote', position });
+      advanceChar(ch);
       continue;
     }
 
     if (ch === '"') {
-      index += 1;
+      advanceChar(ch);
       let value = '';
       let terminated = false;
 
@@ -195,16 +222,16 @@ function tokenize(input: string): Token[] {
         const current = input[index];
 
         if (current === '"') {
-          index += 1;
-          tokens.push({ kind: 'string', value });
+          advanceChar(current);
+          tokens.push({ kind: 'string', value, position });
           terminated = true;
           break;
         }
 
         if (current === '\\') {
-          index += 1;
+          advanceChar(current);
           if (index >= input.length) {
-            throw new EvalError('unterminated string literal');
+            throw new EvalError('unterminated string literal', position);
           }
 
           const escaped = input[index];
@@ -229,68 +256,73 @@ function tokenize(input: string): Token[] {
               break;
           }
 
-          index += 1;
+          advanceChar(escaped);
           continue;
         }
 
         value += current;
-        index += 1;
+        advanceChar(current);
       }
 
       if (!terminated) {
-        throw new EvalError('unterminated string literal');
+        throw new EvalError('unterminated string literal', position);
       }
 
       continue;
     }
 
-    let end = index;
-    while (end < input.length) {
-      const current = input[end];
+    let value = '';
+    while (index < input.length) {
+      const current = input[index];
       if (/\s/.test(current) || current === '(' || current === ')' || current === ';') {
         break;
       }
-      end += 1;
+
+      value += current;
+      advanceChar(current);
     }
 
-    tokens.push({ kind: 'atom', value: input.slice(index, end) });
-    index = end;
+    tokens.push({ kind: 'atom', value, position });
   }
 
-  return tokens;
+  return { tokens, eofPosition: currentPosition() };
 }
 
 function evaluate(expr: Expr, env: Environment): SchemeValue {
-  switch (expr.type) {
-    case 'number':
-    case 'boolean':
-    case 'string':
-      return expr;
-    case 'symbol':
-      return env.lookup(expr.name);
-    case 'list':
-      return evaluateList(expr.elements, env);
+  try {
+    switch (expr.type) {
+      case 'number':
+      case 'boolean':
+      case 'string':
+        return expr;
+      case 'symbol':
+        return env.lookup(expr.name, expr.position);
+      case 'list':
+        return evaluateList(expr, env);
+    }
+  } catch (error) {
+    throw attachPosition(error, expr.position);
   }
 }
 
-function evaluateList(elements: Expr[], env: Environment): SchemeValue {
-  if (elements.length === 0) {
-    throw new EvalError('cannot evaluate empty list');
+function evaluateList(expr: Extract<Expr, { type: 'list' }>, env: Environment): SchemeValue {
+  if (expr.elements.length === 0) {
+    throw new EvalError('cannot evaluate empty list', expr.position);
   }
 
-  const operator = elements[0];
-  const args = elements.slice(1);
+  const operator = expr.elements[0];
+  const args = expr.elements.slice(1);
 
   if (operator.type === 'symbol') {
     switch (operator.name) {
       case 'define':
-        return evaluateDefine(args, env);
+        return evaluateDefine(args, env, operator.position);
       case 'if':
-        return evaluateIf(args, env);
+        return evaluateIf(args, env, operator.position);
       case 'quote':
-        return evaluateQuote(args);
+        return evaluateQuote(args, operator.position);
       case 'lambda':
-        return evaluateLambda(args, env);
+        return evaluateLambda(args, env, operator.position);
       case 'and':
         return evaluateAnd(args, env);
       case 'or':
@@ -298,38 +330,38 @@ function evaluateList(elements: Expr[], env: Environment): SchemeValue {
       case 'begin':
         return evaluateBegin(args, env);
       case 'let':
-        return evaluateLet(args, env);
+        return evaluateLet(args, env, operator.position);
       case 'cond':
         return evaluateCond(args, env);
     }
   }
 
   const procedure = evaluate(operator, env);
-  const evaluatedArgs = args.map((arg) => evaluate(arg, env));
-  return applyProcedure(procedure, evaluatedArgs);
+  const evaluatedArgs = args.map((arg) => ({ value: evaluate(arg, env), position: arg.position }));
+  return applyProcedure(procedure, evaluatedArgs, operator.position);
 }
 
-function evaluateDefine(args: Expr[], env: Environment): SchemeValue {
+function evaluateDefine(args: Expr[], env: Environment, position: SourcePosition): SchemeValue {
   if (args.length < 2) {
-    throw new EvalError(`define: expected at least 2 argument(s), got ${args.length}`);
+    throw new EvalError(`define: expected at least 2 argument(s), got ${args.length}`, position);
   }
 
   const target = args[0];
 
   if (target.type === 'symbol') {
-    requireArgCount('define', args.length, 2);
+    requireArgCount('define', args.length, 2, position);
     const value = evaluate(args[1], env);
     env.define(target.name, value);
     return VOID_VALUE;
   }
 
   if (target.type !== 'list' || target.elements.length === 0) {
-    throw new EvalError('define: invalid binding target');
+    throw new EvalError('define: invalid binding target', target.position);
   }
 
   const nameExpr = target.elements[0];
   if (nameExpr.type !== 'symbol') {
-    throw new EvalError('define: invalid function name');
+    throw new EvalError('define: invalid function name', nameExpr.position);
   }
 
   const params = parseParameterNames(target.elements.slice(1));
@@ -339,21 +371,21 @@ function evaluateDefine(args: Expr[], env: Environment): SchemeValue {
   return VOID_VALUE;
 }
 
-function evaluateIf(args: Expr[], env: Environment): SchemeValue {
-  requireArgCount('if', args.length, 3);
+function evaluateIf(args: Expr[], env: Environment, position: SourcePosition): SchemeValue {
+  requireArgCount('if', args.length, 3, position);
   return isTruthy(evaluate(args[0], env)) ? evaluate(args[1], env) : evaluate(args[2], env);
 }
 
-function evaluateQuote(args: Expr[]): SchemeValue {
-  requireArgCount('quote', args.length, 1);
+function evaluateQuote(args: Expr[], position: SourcePosition): SchemeValue {
+  requireArgCount('quote', args.length, 1, position);
   return quoteExpr(args[0]);
 }
 
-function evaluateLambda(args: Expr[], env: Environment): SchemeValue {
-  requireArgCountAtLeast('lambda', args.length, 2);
+function evaluateLambda(args: Expr[], env: Environment, position: SourcePosition): SchemeValue {
+  requireArgCountAtLeast('lambda', args.length, 2, position);
   const paramsExpr = args[0];
   if (paramsExpr.type !== 'list') {
-    throw new EvalError('lambda: parameter list must be a list');
+    throw new EvalError('lambda: parameter list must be a list', paramsExpr.position);
   }
 
   return {
@@ -394,15 +426,18 @@ function evaluateBegin(args: Expr[], env: Environment): SchemeValue {
   return evaluateSequence(args, env);
 }
 
-function evaluateLet(args: Expr[], env: Environment): SchemeValue {
-  requireArgCountAtLeast('let', args.length, 2);
+function evaluateLet(args: Expr[], env: Environment, position: SourcePosition): SchemeValue {
+  requireArgCountAtLeast('let', args.length, 2, position);
 
   const firstArg = args[0];
   if (firstArg.type === 'symbol') {
-    requireArgCountAtLeast('let', args.length, 3);
+    requireArgCountAtLeast('let', args.length, 3, position);
 
     const bindings = parseLetBindings(args[1]);
-    const values = bindings.map((binding) => evaluate(binding.value, env));
+    const values = bindings.map((binding) => ({
+      value: evaluate(binding.value, env),
+      position: binding.value.position,
+    }));
     const letEnv = new Environment(env);
     const closure: Closure = {
       type: 'closure',
@@ -412,7 +447,7 @@ function evaluateLet(args: Expr[], env: Environment): SchemeValue {
     };
 
     letEnv.define(firstArg.name, closure);
-    return applyProcedure(closure, values);
+    return applyProcedure(closure, values, firstArg.position);
   }
 
   const bindings = parseLetBindings(firstArg);
@@ -428,7 +463,7 @@ function evaluateLet(args: Expr[], env: Environment): SchemeValue {
 function evaluateCond(args: Expr[], env: Environment): SchemeValue {
   for (const clause of args) {
     if (clause.type !== 'list' || clause.elements.length === 0) {
-      throw new EvalError('cond: expected non-empty clause');
+      throw new EvalError('cond: expected non-empty clause', clause.position);
     }
 
     const [testExpr, ...body] = clause.elements;
@@ -462,7 +497,7 @@ function quoteExpr(expr: Expr): SchemeValue {
 function parseParameterNames(params: Expr[]): string[] {
   return params.map((param) => {
     if (param.type !== 'symbol') {
-      throw new EvalError('lambda: parameter names must be symbols');
+      throw new EvalError('lambda: parameter names must be symbols', param.position);
     }
 
     return param.name;
@@ -471,38 +506,42 @@ function parseParameterNames(params: Expr[]): string[] {
 
 function parseLetBindings(bindingsExpr: Expr): Array<{ name: string; value: Expr }> {
   if (bindingsExpr.type !== 'list') {
-    throw new EvalError('let: expected binding list');
+    throw new EvalError('let: expected binding list', bindingsExpr.position);
   }
 
   return bindingsExpr.elements.map((bindingExpr) => {
     if (bindingExpr.type !== 'list' || bindingExpr.elements.length !== 2) {
-      throw new EvalError('let: expected binding pair');
+      throw new EvalError('let: expected binding pair', bindingExpr.position);
     }
 
     const [nameExpr, valueExpr] = bindingExpr.elements;
     if (nameExpr.type !== 'symbol') {
-      throw new EvalError('let: binding name must be a symbol');
+      throw new EvalError('let: binding name must be a symbol', nameExpr.position);
     }
 
     return { name: nameExpr.name, value: valueExpr };
   });
 }
 
-function applyProcedure(value: SchemeValue, args: SchemeValue[]): SchemeValue {
+function applyProcedure(
+  value: SchemeValue,
+  args: EvaluatedArg[],
+  callPosition: SourcePosition,
+): SchemeValue {
   switch (value.type) {
     case 'builtin':
-      return value.invoke(args);
+      return value.invoke(args, callPosition);
     case 'closure': {
-      requireArgCount('lambda', args.length, value.params.length);
+      requireArgCount('lambda', args.length, value.params.length, callPosition);
       const callEnv = new Environment(value.env);
       for (let index = 0; index < value.params.length; index += 1) {
-        callEnv.define(value.params[index], args[index]);
+        callEnv.define(value.params[index], args[index].value);
       }
 
       return evaluateSequence(value.body, callEnv);
     }
     default:
-      throw new EvalError('attempted to call a non-procedure');
+      throw new EvalError('attempted to call a non-procedure', callPosition);
   }
 }
 
@@ -521,104 +560,133 @@ function createGlobalEnv(): Environment {
 
   env.define(
     '+',
-    builtin('+', (args) => numberValue(evaluateNumberArgs(args).reduce((sum, value) => sum + value, 0))),
+    builtin('+', (args, callPosition) =>
+      numberValue(
+        evaluateNumberArgs('+', args).reduce((sum, value) => sum + value, 0),
+        callPosition,
+      ),
+    ),
   );
 
   env.define(
     '*',
-    builtin(
-      '*',
-      (args) => numberValue(evaluateNumberArgs(args).reduce((product, value) => product * value, 1)),
+    builtin('*', (args, callPosition) =>
+      numberValue(
+        evaluateNumberArgs('*', args).reduce((product, value) => product * value, 1),
+        callPosition,
+      ),
     ),
   );
 
   env.define(
     '-',
-    builtin('-', (args) => {
-      const values = evaluateNumberArgs(args);
-      requireArgCountAtLeast('-', values.length, 1);
+    builtin('-', (args, callPosition) => {
+      const values = evaluateNumberArgs('-', args);
+      requireArgCountAtLeast('-', values.length, 1, callPosition);
       if (values.length === 1) {
-        return numberValue(-values[0]);
+        return numberValue(-values[0], callPosition);
       }
 
-      return numberValue(values.slice(1).reduce((result, value) => result - value, values[0]));
+      return numberValue(
+        values.slice(1).reduce((result, value) => result - value, values[0]),
+        callPosition,
+      );
     }),
   );
 
   env.define(
     '/',
-    builtin('/', (args) => {
-      const values = evaluateNumberArgs(args);
-      requireArgCountAtLeast('/', values.length, 1);
+    builtin('/', (args, callPosition) => {
+      const values = evaluateNumberArgs('/', args);
+      requireArgCountAtLeast('/', values.length, 1, callPosition);
 
       let result = values[0];
       if (values.length === 1) {
         if (result === 0) {
-          throw new EvalError('division by zero');
+          throw new EvalError('division by zero', args[0].position);
         }
 
-        return numberValue(1 / result);
+        return numberValue(1 / result, callPosition);
       }
 
-      for (const value of values.slice(1)) {
+      for (let index = 1; index < values.length; index += 1) {
+        const value = values[index];
         if (value === 0) {
-          throw new EvalError('division by zero');
+          throw new EvalError('division by zero', args[index].position);
         }
+
         result /= value;
       }
 
-      return numberValue(result);
+      return numberValue(result, callPosition);
     }),
   );
 
-  env.define('<', builtin('<', (args) => booleanValue(compareNumberArgs('<', args, (a, b) => a < b))));
-  env.define('>', builtin('>', (args) => booleanValue(compareNumberArgs('>', args, (a, b) => a > b))));
-  env.define('=', builtin('=', (args) => booleanValue(compareNumberArgs('=', args, (a, b) => a === b))));
+  env.define(
+    '<',
+    builtin('<', (args, callPosition) =>
+      booleanValue(compareNumberArgs('<', args, (a, b) => a < b, callPosition)),
+    ),
+  );
+  env.define(
+    '>',
+    builtin('>', (args, callPosition) =>
+      booleanValue(compareNumberArgs('>', args, (a, b) => a > b, callPosition)),
+    ),
+  );
+  env.define(
+    '=',
+    builtin('=', (args, callPosition) =>
+      booleanValue(compareNumberArgs('=', args, (a, b) => a === b, callPosition)),
+    ),
+  );
   env.define(
     '<=',
-    builtin('<=', (args) => booleanValue(compareNumberArgs('<=', args, (a, b) => a <= b))),
+    builtin('<=', (args, callPosition) =>
+      booleanValue(compareNumberArgs('<=', args, (a, b) => a <= b, callPosition)),
+    ),
   );
 
   env.define(
     'not',
-    builtin('not', (args) => {
-      requireArgCount('not', args.length, 1);
-      return booleanValue(!isTruthy(args[0]));
+    builtin('not', (args, callPosition) => {
+      requireArgCount('not', args.length, 1, callPosition);
+      return booleanValue(!isTruthy(args[0].value));
     }),
   );
 
   env.define(
     'cons',
-    builtin('cons', (args) => {
-      requireArgCount('cons', args.length, 2);
+    builtin('cons', (args, callPosition) => {
+      requireArgCount('cons', args.length, 2, callPosition);
       const tail = expectList('cons', args[1]);
-      return { type: 'list', elements: [args[0], ...tail.elements] };
+      return { type: 'list', elements: [args[0].value, ...tail.elements] };
     }),
   );
 
   env.define(
     'car',
-    builtin('car', (args) => {
-      requireArgCount('car', args.length, 1);
+    builtin('car', (args, callPosition) => {
+      requireArgCount('car', args.length, 1, callPosition);
       return expectPair('car', args[0]).elements[0];
     }),
   );
 
   env.define(
     'cdr',
-    builtin('cdr', (args) => {
-      requireArgCount('cdr', args.length, 1);
+    builtin('cdr', (args, callPosition) => {
+      requireArgCount('cdr', args.length, 1, callPosition);
       return { type: 'list', elements: expectPair('cdr', args[0]).elements.slice(1) };
     }),
   );
 
-  env.define('list', builtin('list', (args) => ({ type: 'list', elements: [...args] })));
+  env.define('list', builtin('list', (args) => ({ type: 'list', elements: args.map((arg) => arg.value) })));
 
   env.define(
     'length',
-    builtin('length', (args) => {
-      requireArgCount('length', args.length, 1);
-      return numberValue(expectList('length', args[0]).elements.length);
+    builtin('length', (args, callPosition) => {
+      requireArgCount('length', args.length, 1, callPosition);
+      return numberValue(expectList('length', args[0]).elements.length, callPosition);
     }),
   );
 
@@ -637,70 +705,74 @@ function createGlobalEnv(): Environment {
 
   env.define(
     'null?',
-    builtin('null?', (args) => {
-      requireArgCount('null?', args.length, 1);
-      return booleanValue(args[0].type === 'list' && args[0].elements.length === 0);
+    builtin('null?', (args, callPosition) => {
+      requireArgCount('null?', args.length, 1, callPosition);
+      return booleanValue(args[0].value.type === 'list' && args[0].value.elements.length === 0);
     }),
   );
 
   env.define(
     'pair?',
-    builtin('pair?', (args) => {
-      requireArgCount('pair?', args.length, 1);
-      return booleanValue(args[0].type === 'list' && args[0].elements.length > 0);
+    builtin('pair?', (args, callPosition) => {
+      requireArgCount('pair?', args.length, 1, callPosition);
+      return booleanValue(args[0].value.type === 'list' && args[0].value.elements.length > 0);
     }),
   );
 
   env.define(
     'string?',
-    builtin('string?', (args) => {
-      requireArgCount('string?', args.length, 1);
-      return booleanValue(args[0].type === 'string');
+    builtin('string?', (args, callPosition) => {
+      requireArgCount('string?', args.length, 1, callPosition);
+      return booleanValue(args[0].value.type === 'string');
     }),
   );
 
   env.define(
     'number?',
-    builtin('number?', (args) => {
-      requireArgCount('number?', args.length, 1);
-      return booleanValue(args[0].type === 'number');
+    builtin('number?', (args, callPosition) => {
+      requireArgCount('number?', args.length, 1, callPosition);
+      return booleanValue(args[0].value.type === 'number');
     }),
   );
 
   env.define(
     'boolean?',
-    builtin('boolean?', (args) => {
-      requireArgCount('boolean?', args.length, 1);
-      return booleanValue(args[0].type === 'boolean');
+    builtin('boolean?', (args, callPosition) => {
+      requireArgCount('boolean?', args.length, 1, callPosition);
+      return booleanValue(args[0].value.type === 'boolean');
     }),
   );
 
   env.define(
     'symbol?',
-    builtin('symbol?', (args) => {
-      requireArgCount('symbol?', args.length, 1);
-      return booleanValue(args[0].type === 'symbol');
+    builtin('symbol?', (args, callPosition) => {
+      requireArgCount('symbol?', args.length, 1, callPosition);
+      return booleanValue(args[0].value.type === 'symbol');
     }),
   );
 
   return env;
 }
 
-function builtin(name: string, invoke: (args: SchemeValue[]) => SchemeValue): BuiltinProcedure {
+function builtin(
+  name: string,
+  invoke: (args: EvaluatedArg[], callPosition: SourcePosition) => SchemeValue,
+): BuiltinProcedure {
   return { type: 'builtin', name, invoke };
 }
 
-function evaluateNumberArgs(args: SchemeValue[]): number[] {
-  return args.map(expectNumber);
+function evaluateNumberArgs(name: string, args: EvaluatedArg[]): number[] {
+  return args.map((arg) => expectNumber(name, arg));
 }
 
 function compareNumberArgs(
   name: string,
-  args: SchemeValue[],
+  args: EvaluatedArg[],
   predicate: (left: number, right: number) => boolean,
+  position: SourcePosition,
 ): boolean {
-  const values = evaluateNumberArgs(args);
-  requireArgCountAtLeast(name, values.length, 1);
+  const values = evaluateNumberArgs(name, args);
+  requireArgCountAtLeast(name, values.length, 1, position);
 
   for (let index = 0; index < values.length - 1; index += 1) {
     if (!predicate(values[index], values[index + 1])) {
@@ -711,44 +783,48 @@ function compareNumberArgs(
   return true;
 }
 
-function requireArgCount(name: string, actual: number, expected: number): void {
+function requireArgCount(
+  name: string,
+  actual: number,
+  expected: number,
+  position: SourcePosition,
+): void {
   if (actual !== expected) {
-    throw new EvalError(`${name}: expected ${expected} argument(s), got ${actual}`);
+    throw new EvalError(`${name}: expected ${expected} argument(s), got ${actual}`, position);
   }
 }
 
-function requireArgCountAtLeast(name: string, actual: number, minimum: number): void {
+function requireArgCountAtLeast(
+  name: string,
+  actual: number,
+  minimum: number,
+  position: SourcePosition,
+): void {
   if (actual < minimum) {
-    throw new EvalError(`${name}: expected at least ${minimum} argument(s), got ${actual}`);
+    throw new EvalError(`${name}: expected at least ${minimum} argument(s), got ${actual}`, position);
   }
 }
 
-function expectNumber(value: SchemeValue): number {
-  if (value.type !== 'number') {
-    throw new EvalError('expected number');
+function expectNumber(name: string, arg: EvaluatedArg): number {
+  if (arg.value.type !== 'number') {
+    throw new EvalError(`${name}: expected number`, arg.position);
   }
 
-  return value.value;
+  return arg.value.value;
 }
 
-function expectList(
-  name: string,
-  value: SchemeValue,
-): Extract<SchemeValue, { type: 'list' }> {
-  if (value.type !== 'list') {
-    throw new EvalError(`${name}: expected list`);
+function expectList(name: string, arg: EvaluatedArg): Extract<SchemeValue, { type: 'list' }> {
+  if (arg.value.type !== 'list') {
+    throw new EvalError(`${name}: expected list`, arg.position);
   }
 
-  return value;
+  return arg.value;
 }
 
-function expectPair(
-  name: string,
-  value: SchemeValue,
-): Extract<SchemeValue, { type: 'list' }> {
-  const list = expectList(name, value);
+function expectPair(name: string, arg: EvaluatedArg): Extract<SchemeValue, { type: 'list' }> {
+  const list = expectList(name, arg);
   if (list.elements.length === 0) {
-    throw new EvalError(`${name}: expected non-empty list`);
+    throw new EvalError(`${name}: expected non-empty list`, arg.position);
   }
 
   return list;
@@ -758,9 +834,9 @@ function isTruthy(value: SchemeValue): boolean {
   return value.type !== 'boolean' || value.value;
 }
 
-function numberValue(value: number): SchemeValue {
+function numberValue(value: number, position?: SourcePosition): SchemeValue {
   if (!Number.isFinite(value)) {
-    throw new EvalError('invalid number');
+    throw new EvalError('invalid number', position);
   }
 
   return { type: 'number', value };
@@ -768,6 +844,18 @@ function numberValue(value: number): SchemeValue {
 
 function booleanValue(value: boolean): SchemeValue {
   return { type: 'boolean', value };
+}
+
+function attachPosition(error: unknown, position: SourcePosition): EvalError {
+  if (error instanceof EvalError) {
+    return error.position ? error : new EvalError(error.rawMessage, position);
+  }
+
+  if (error instanceof Error) {
+    return new EvalError(error.message, position);
+  }
+
+  return new EvalError(String(error), position);
 }
 
 function formatValue(value: SchemeValue): string {

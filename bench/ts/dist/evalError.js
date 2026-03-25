@@ -1,6 +1,10 @@
 export class EvalError extends Error {
-    constructor(message) {
-        super(message);
+    rawMessage;
+    position;
+    constructor(message, position) {
+        super(position ? `${position.line}:${position.column}: ${message}` : message);
         this.name = 'EvalError';
+        this.rawMessage = message;
+        this.position = position;
     }
 }
