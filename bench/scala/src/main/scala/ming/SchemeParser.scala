@@ -101,7 +101,29 @@ private[ming] object SchemeParser:
   private def parseHashLiteral(start: SourcePos, state: ParserState): (Expr, ParserState) =
     if state.startsWith("#t") && isTokenBoundary(state, 2) then (Expr.BoolAtom(true, start), advanceBy(state, 2))
     else if state.startsWith("#f") && isTokenBoundary(state, 2) then (Expr.BoolAtom(false, start), advanceBy(state, 2))
+    else if state.startsWith("#\\") then parseChar(start, advanceBy(state, 2))
     else fail(start, "unknown # literal")
+
+  private def parseChar(start: SourcePos, state: ParserState): (Expr, ParserState) =
+    val (token, nextState) = readToken(state)
+    val value =
+      token match
+        case "" =>
+          fail(start, "unterminated character literal")
+
+        case "space" =>
+          ' '
+
+        case "newline" =>
+          '\n'
+
+        case single if single.length == 1 =>
+          single.head
+
+        case _ =>
+          fail(start, s"unsupported character literal: #\\$token")
+
+    (Expr.CharAtom(value, start), nextState)
 
   private def parseNumber(start: SourcePos, state: ParserState): (Expr, ParserState) =
     val (token, nextState) = readToken(state)

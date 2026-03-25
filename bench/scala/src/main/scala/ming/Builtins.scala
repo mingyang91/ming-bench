@@ -25,6 +25,7 @@ private[ming] object Builtins:
     "write"          -> Value.Builtin("write", write(runtime)),
     "newline"        -> Value.Builtin("newline", newline(runtime)),
     "string-append"  -> Value.Builtin("string-append", stringAppend),
+    "string-copy"    -> Value.Builtin("string-copy", stringCopy),
     "string-length"  -> Value.Builtin("string-length", stringLength),
     "substring"      -> Value.Builtin("substring", substring),
     "string->number" -> Value.Builtin("string->number", stringToNumber),
@@ -32,6 +33,7 @@ private[ming] object Builtins:
     "symbol->string" -> Value.Builtin("symbol->string", symbolToString),
     "string->symbol" -> Value.Builtin("string->symbol", stringToSymbol),
     "string-ref"     -> Value.Builtin("string-ref", stringRef),
+    "string-set!"    -> Value.Builtin("string-set!", stringSet),
     "string?"        -> predicate("string?", _.isInstanceOf[Value.StringVal]),
     "number?"        -> predicate("number?", _.isInstanceOf[Value.IntVal]),
     "boolean?"       -> predicate("boolean?", _.isInstanceOf[Value.BoolVal]),
@@ -142,7 +144,10 @@ private[ming] object Builtins:
     Value.VoidVal
 
   private def stringAppend(args: List[Value], pos: SourcePos): Value =
-    Value.StringVal(args.map(arg => expectString(arg, pos, "string-append")).mkString)
+    Value.StringVal(args.map(arg => expectString(arg, pos, "string-append")).mkString.toCharArray)
+
+  private def stringCopy(args: List[Value], pos: SourcePos): Value =
+    Value.StringVal(expectStringValue(expectSingleArg(args, pos, "string-copy"), pos, "string-copy").clone())
 
   private def stringLength(args: List[Value], pos: SourcePos): Value =
     Value.IntVal(expectString(expectSingleArg(args, pos, "string-length"), pos, "string-length").length)
@@ -155,7 +160,7 @@ private[ming] object Builtins:
         val end   = expectIndex(endValue, pos, "substring")
         if start > end || end > text.length then throw EvalError.at(pos, "substring indices are out of bounds")
 
-        Value.StringVal(text.substring(start, end))
+        Value.StringVal(text.substring(start, end).toCharArray)
 
       case _ =>
         throw EvalError.at(pos, "substring expects exactly 3 arguments")
@@ -170,10 +175,12 @@ private[ming] object Builtins:
           Value.BoolVal(false)
 
   private def numberToString(args: List[Value], pos: SourcePos): Value =
-    Value.StringVal(expectNumber(expectSingleArg(args, pos, "number->string"), pos, "number->string").toString)
+    Value.StringVal(
+      expectNumber(expectSingleArg(args, pos, "number->string"), pos, "number->string").toString.toCharArray
+    )
 
   private def symbolToString(args: List[Value], pos: SourcePos): Value =
-    Value.StringVal(expectSymbol(expectSingleArg(args, pos, "symbol->string"), pos, "symbol->string"))
+    Value.StringVal(expectSymbol(expectSingleArg(args, pos, "symbol->string"), pos, "symbol->string").toCharArray)
 
   private def stringToSymbol(args: List[Value], pos: SourcePos): Value =
     Value.SymbolVal(expectString(expectSingleArg(args, pos, "string->symbol"), pos, "string->symbol"))
@@ -189,6 +196,19 @@ private[ming] object Builtins:
 
       case _ =>
         throw EvalError.at(pos, "string-ref expects exactly 2 arguments")
+
+  private def stringSet(args: List[Value], pos: SourcePos): Value =
+    args match
+      case stringValue :: indexValue :: charValue :: Nil =>
+        val text  = expectStringValue(stringValue, pos, "string-set!")
+        val index = expectIndex(indexValue, pos, "string-set!")
+        if index >= text.length then throw EvalError.at(pos, "string-set! index is out of bounds")
+
+        text(index) = expectChar(charValue, pos, "string-set!")
+        Value.VoidVal
+
+      case _ =>
+        throw EvalError.at(pos, "string-set! expects exactly 3 arguments")
 
   private def comparison(name: String, relation: (BigInt, BigInt) => Boolean): Value =
     Value.Builtin(
@@ -226,6 +246,9 @@ private[ming] object Builtins:
         throw EvalError.at(pos, s"$name expected number arguments, got ${other.typeName}")
 
   private def expectString(arg: Value, pos: SourcePos, name: String): String =
+    new String(expectStringValue(arg, pos, name))
+
+  private def expectStringValue(arg: Value, pos: SourcePos, name: String): Array[Char] =
     arg match
       case Value.StringVal(value) =>
         value
@@ -240,6 +263,14 @@ private[ming] object Builtins:
 
       case other =>
         throw EvalError.at(pos, s"$name expected a symbol, got ${other.typeName}")
+
+  private def expectChar(arg: Value, pos: SourcePos, name: String): Char =
+    arg match
+      case Value.CharVal(value) =>
+        value
+
+      case other =>
+        throw EvalError.at(pos, s"$name expected a char, got ${other.typeName}")
 
   private def expectIndex(arg: Value, pos: SourcePos, name: String): Int =
     val value = expectNumber(arg, pos, name)

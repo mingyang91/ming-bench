@@ -22,7 +22,10 @@ private[ming] object Interpreter:
         Value.BoolVal(value)
 
       case Expr.StringAtom(value, _) =>
-        Value.StringVal(value)
+        Value.StringVal(value.toCharArray)
+
+      case Expr.CharAtom(value, _) =>
+        Value.CharVal(value)
 
       case Expr.Symbol(name, pos) =>
         env.lookup(name, pos)

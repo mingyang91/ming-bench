@@ -7,6 +7,7 @@ private[ming] enum Expr:
   case IntAtom(value: BigInt, pos: SourcePos)
   case BoolAtom(value: Boolean, pos: SourcePos)
   case StringAtom(value: String, pos: SourcePos)
+  case CharAtom(value: Char, pos: SourcePos)
   case Symbol(name: String, pos: SourcePos)
   case ListExpr(items: List[Expr], pos: SourcePos)
 
@@ -14,7 +15,7 @@ private[ming] enum Value:
 
   case IntVal(value: BigInt)
   case BoolVal(value: Boolean)
-  case StringVal(value: String)
+  case StringVal(value: Array[Char])
   case CharVal(value: Char)
   case SymbolVal(name: String)
   case EmptyList
@@ -102,7 +103,8 @@ private[ming] object Value:
       case Value.BoolVal(boolean) =>
         if boolean then "#t" else "#f"
 
-      case Value.StringVal(text) =>
+      case Value.StringVal(chars) =>
+        val text = new String(chars)
         if displayMode then text else "\"" + escapeString(text) + "\""
 
       case Value.CharVal(ch) =>
@@ -135,7 +137,10 @@ private[ming] object Value:
         Value.BoolVal(value)
 
       case Expr.StringAtom(value, _) =>
-        Value.StringVal(value)
+        Value.StringVal(value.toCharArray)
+
+      case Expr.CharAtom(value, _) =>
+        Value.CharVal(value)
 
       case Expr.Symbol(name, _) =>
         Value.SymbolVal(name)
