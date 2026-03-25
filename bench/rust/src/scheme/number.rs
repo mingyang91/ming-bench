@@ -233,13 +233,7 @@ impl Number {
     pub(crate) fn to_exact(self) -> Result<Self, EvalError> {
         match self {
             Self::Exact(_) => Ok(self),
-            Self::Inexact(value) => {
-                if !value.is_finite() {
-                    return Err(EvalError::NonFiniteNumber);
-                }
-
-                Ok(Self::Exact(parse_decimal_rational(&format!("{value:?}"))?))
-            }
+            Self::Inexact(value) => Ok(Self::Exact(exact_from_inexact(value)?)),
         }
     }
 
@@ -257,6 +251,14 @@ impl Number {
             Self::Inexact(value) => value,
         }
     }
+}
+
+fn exact_from_inexact(value: f64) -> Result<Rational, EvalError> {
+    if !value.is_finite() {
+        return Err(EvalError::NonFiniteNumber);
+    }
+
+    parse_decimal_rational(&format!("{value:?}"))
 }
 
 pub(crate) fn parse_number_literal(token: &str) -> Result<Option<Number>, EvalError> {

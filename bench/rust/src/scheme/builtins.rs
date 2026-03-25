@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
 
 use super::core::{
-    make_pair, make_string, value_equal, BuiltinProcedure, EnvRef, Environment, Runtime, StringRef,
-    Value,
+    make_pair, make_string, make_vector, value_equal, BuiltinProcedure, EnvRef, Environment,
+    Runtime, StringRef, Value, VectorRef,
 };
 use super::error::EvalError;
 use super::eval::apply_procedure;
@@ -46,6 +46,10 @@ const BUILTINS: &[BuiltinProcedure] = &[
         func: builtin_is_eq,
     },
     BuiltinProcedure {
+        name: "eqv?",
+        func: builtin_is_eqv,
+    },
+    BuiltinProcedure {
         name: "equal?",
         func: builtin_is_equal,
     },
@@ -78,20 +82,48 @@ const BUILTINS: &[BuiltinProcedure] = &[
         func: builtin_list,
     },
     BuiltinProcedure {
+        name: "vector",
+        func: builtin_vector,
+    },
+    BuiltinProcedure {
+        name: "make-vector",
+        func: builtin_make_vector,
+    },
+    BuiltinProcedure {
         name: "length",
         func: builtin_length,
+    },
+    BuiltinProcedure {
+        name: "vector-length",
+        func: builtin_vector_length,
     },
     BuiltinProcedure {
         name: "list-ref",
         func: builtin_list_ref,
     },
     BuiltinProcedure {
+        name: "vector-ref",
+        func: builtin_vector_ref,
+    },
+    BuiltinProcedure {
         name: "list-tail",
         func: builtin_list_tail,
     },
     BuiltinProcedure {
+        name: "vector-set!",
+        func: builtin_vector_set,
+    },
+    BuiltinProcedure {
         name: "list?",
         func: builtin_is_list,
+    },
+    BuiltinProcedure {
+        name: "vector->list",
+        func: builtin_vector_to_list,
+    },
+    BuiltinProcedure {
+        name: "list->vector",
+        func: builtin_list_to_vector,
     },
     BuiltinProcedure {
         name: "map",
@@ -152,6 +184,10 @@ const BUILTINS: &[BuiltinProcedure] = &[
     BuiltinProcedure {
         name: "pair?",
         func: builtin_is_pair,
+    },
+    BuiltinProcedure {
+        name: "vector?",
+        func: builtin_is_vector,
     },
     BuiltinProcedure {
         name: "symbol?",
@@ -397,6 +433,14 @@ fn builtin_is_eq(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalEr
     Ok(Value::Bool(eq_value(lhs, rhs)))
 }
 
+fn builtin_is_eqv(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let [lhs, rhs] = args else {
+        return Err(wrong_arg_count("eqv?", "exactly 2", args.len()));
+    };
+
+    Ok(Value::Bool(eqv_value(lhs, rhs)))
+}
+
 fn builtin_is_equal(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let [lhs, rhs] = args else {
         return Err(wrong_arg_count("equal?", "exactly 2", args.len()));
@@ -463,10 +507,31 @@ fn builtin_list(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalErr
     Ok(Value::List(args.to_vec()))
 }
 
+fn builtin_vector(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    Ok(make_vector(args.to_vec()))
+}
+
+fn builtin_make_vector(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let (len, fill) = match args {
+        [len] => (expect_length(len)?, Value::Bool(false)),
+        [len, fill] => (expect_length(len)?, fill.clone()),
+        _ => return Err(wrong_arg_count("make-vector", "exactly 1 or 2", args.len())),
+    };
+
+    Ok(make_vector(vec![fill; len]))
+}
+
 fn builtin_length(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let values = expect_list(expect_single_arg("length", args)?, "list")?;
     Ok(Value::Number(Number::exact_integer(usize_to_i64(
         values.len(),
+    )?)))
+}
+
+fn builtin_vector_length(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let vector = expect_vector_ref(expect_single_arg("vector-length", args)?)?;
+    Ok(Value::Number(Number::exact_integer(usize_to_i64(
+        vector.borrow().len(),
     )?)))
 }
 
@@ -476,6 +541,17 @@ fn builtin_list_ref(args: &[Value], _runtime: &mut Runtime) -> Result<Value, Eva
     };
 
     let values = expect_list(list, "list")?;
+    let index = expect_index(index, values.len(), IndexBound::Exact)?;
+    Ok(values[index].clone())
+}
+
+fn builtin_vector_ref(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let [vector, index] = args else {
+        return Err(wrong_arg_count("vector-ref", "exactly 2", args.len()));
+    };
+
+    let vector = expect_vector_ref(vector)?;
+    let values = vector.borrow();
     let index = expect_index(index, values.len(), IndexBound::Exact)?;
     Ok(values[index].clone())
 }
@@ -490,8 +566,30 @@ fn builtin_list_tail(args: &[Value], _runtime: &mut Runtime) -> Result<Value, Ev
     Ok(Value::List(values[index..].to_vec()))
 }
 
+fn builtin_vector_set(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let [vector, index, value] = args else {
+        return Err(wrong_arg_count("vector-set!", "exactly 3", args.len()));
+    };
+
+    let vector = expect_vector_ref(vector)?;
+    let mut values = vector.borrow_mut();
+    let index = expect_index(index, values.len(), IndexBound::Exact)?;
+    values[index] = value.clone();
+    Ok(Value::Void)
+}
+
 fn builtin_is_list(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     unary_predicate("list?", args, |value| matches!(value, Value::List(_)))
+}
+
+fn builtin_vector_to_list(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let vector = expect_vector_ref(expect_single_arg("vector->list", args)?)?;
+    Ok(Value::List(vector.borrow().clone()))
+}
+
+fn builtin_list_to_vector(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let values = expect_list(expect_single_arg("list->vector", args)?, "list")?;
+    Ok(make_vector(values.to_vec()))
 }
 
 fn builtin_map(args: &[Value], runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -604,6 +702,10 @@ fn builtin_is_pair(args: &[Value], _runtime: &mut Runtime) -> Result<Value, Eval
         matches!(value, Value::List(values) if !values.is_empty())
             || matches!(value, Value::Pair(_))
     })
+}
+
+fn builtin_is_vector(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    unary_predicate("vector?", args, |value| matches!(value, Value::Vector(_)))
 }
 
 fn builtin_is_symbol(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -934,6 +1036,13 @@ fn expect_list<'a>(value: &'a Value, expected: &str) -> Result<&'a [Value], Eval
     }
 }
 
+fn expect_vector_ref(value: &Value) -> Result<&VectorRef, EvalError> {
+    match value {
+        Value::Vector(vector) => Ok(vector),
+        other => Err(type_mismatch("vector", other)),
+    }
+}
+
 fn expect_single_arg<'a>(name: &str, args: &'a [Value]) -> Result<&'a Value, EvalError> {
     match args {
         [value] => Ok(value),
@@ -1004,6 +1113,14 @@ fn expect_index(value: &Value, len: usize, bound: IndexBound) -> Result<usize, E
             len,
         })
     }
+}
+
+fn expect_length(value: &Value) -> Result<usize, EvalError> {
+    let length = expect_exact_integer(value)?;
+    usize::try_from(length).map_err(|_| EvalError::TypeMismatch {
+        expected: "non-negative integer".into(),
+        found: value.type_name().into(),
+    })
 }
 
 fn eval_number_args(name: &str, args: &[Value], min: usize) -> Result<Vec<Number>, EvalError> {
@@ -1081,6 +1198,10 @@ where
     Ok(Value::Bool(true))
 }
 
+pub(crate) fn eqv_value(lhs: &Value, rhs: &Value) -> bool {
+    eq_value(lhs, rhs)
+}
+
 fn eq_value(lhs: &Value, rhs: &Value) -> bool {
     match (lhs, rhs) {
         (Value::Bool(lhs), Value::Bool(rhs)) => lhs == rhs,
@@ -1090,8 +1211,10 @@ fn eq_value(lhs: &Value, rhs: &Value) -> bool {
         (Value::String(lhs), Value::String(rhs)) => std::rc::Rc::ptr_eq(lhs, rhs),
         (Value::List(lhs), Value::List(rhs)) => lhs.is_empty() && rhs.is_empty(),
         (Value::Pair(lhs), Value::Pair(rhs)) => std::rc::Rc::ptr_eq(lhs, rhs),
+        (Value::Vector(lhs), Value::Vector(rhs)) => std::rc::Rc::ptr_eq(lhs, rhs),
         (Value::Record(lhs), Value::Record(rhs)) => std::rc::Rc::ptr_eq(lhs, rhs),
         (Value::Procedure(lhs), Value::Procedure(rhs)) => std::rc::Rc::ptr_eq(lhs, rhs),
+        (Value::Uninitialized, Value::Uninitialized) => true,
         (Value::Void, Value::Void) => true,
         _ => false,
     }

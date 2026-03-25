@@ -44,6 +44,16 @@ enum BindingMatch {
 
 type Bindings = HashMap<String, BindingMatch>;
 
+struct ListMatchContext<'a> {
+    patterns: &'a [Expr],
+    pattern_index: usize,
+    inputs: &'a [Expr],
+    input_index: usize,
+    literals: &'a HashSet<String>,
+    ellipsis_depth: usize,
+    bindings: &'a Bindings,
+}
+
 struct ExpansionState<'a> {
     bindings: &'a Bindings,
     pattern_vars: &'a HashSet<String>,
@@ -326,6 +336,10 @@ fn match_list(
     match_list_from(patterns, 0, inputs, 0, literals, ellipsis_depth, bindings)
 }
 
+fn followed_by_ellipsis(items: &[Expr], index: usize) -> bool {
+    items.get(index + 1).is_some_and(is_ellipsis)
+}
+
 fn match_list_from(
     patterns: &[Expr],
     pattern_index: usize,
@@ -339,78 +353,160 @@ fn match_list_from(
         return Ok((input_index == inputs.len()).then(|| bindings.clone()));
     }
 
-    if pattern_index + 1 < patterns.len() && is_ellipsis(&patterns[pattern_index + 1]) {
-        let repeated = &patterns[pattern_index];
-        let min_remaining = minimum_inputs_required(&patterns[pattern_index + 2..]);
-        if inputs.len() < input_index + min_remaining {
-            return Ok(None);
-        }
-
-        let max_repeat = inputs.len() - input_index - min_remaining;
-        for repeat in (0..=max_repeat).rev() {
-            let mut branch = bindings.clone();
-            if repeat == 0 {
-                ensure_empty_repeated_bindings(
-                    repeated,
-                    literals,
-                    ellipsis_depth + 1,
-                    &mut branch,
-                )?;
-            }
-
-            let mut matched = true;
-            for input in &inputs[input_index..input_index + repeat] {
-                let Some(next) =
-                    match_pattern(repeated, input, literals, ellipsis_depth + 1, &branch)?
-                else {
-                    matched = false;
-                    break;
-                };
-                branch = next;
-            }
-
-            if !matched {
-                continue;
-            }
-
-            if let Some(done) = match_list_from(
-                patterns,
-                pattern_index + 2,
-                inputs,
-                input_index + repeat,
-                literals,
-                ellipsis_depth,
-                &branch,
-            )? {
-                return Ok(Some(done));
-            }
-        }
-
-        Ok(None)
-    } else {
-        let Some(input) = inputs.get(input_index) else {
-            return Ok(None);
-        };
-        let Some(next) = match_pattern(
-            &patterns[pattern_index],
-            input,
+    if followed_by_ellipsis(patterns, pattern_index) {
+        return match_repeated_list_pattern(
+            patterns,
+            pattern_index,
+            inputs,
+            input_index,
             literals,
             ellipsis_depth,
             bindings,
-        )?
-        else {
-            return Ok(None);
-        };
-        match_list_from(
-            patterns,
-            pattern_index + 1,
-            inputs,
-            input_index + 1,
-            literals,
-            ellipsis_depth,
-            &next,
-        )
+        );
     }
+
+    match_single_list_pattern(
+        patterns,
+        pattern_index,
+        inputs,
+        input_index,
+        literals,
+        ellipsis_depth,
+        bindings,
+    )
+}
+
+fn match_repeated_list_pattern(
+    patterns: &[Expr],
+    pattern_index: usize,
+    inputs: &[Expr],
+    input_index: usize,
+    literals: &HashSet<String>,
+    ellipsis_depth: usize,
+    bindings: &Bindings,
+) -> Result<Option<Bindings>, EvalError> {
+    let context = ListMatchContext {
+        patterns,
+        pattern_index,
+        inputs,
+        input_index,
+        literals,
+        ellipsis_depth,
+        bindings,
+    };
+    let min_remaining = minimum_inputs_required(&patterns[pattern_index + 2..]);
+    if inputs.len() < input_index + min_remaining {
+        return Ok(None);
+    }
+
+    let max_repeat = inputs.len() - input_index - min_remaining;
+    for repeat in (0..=max_repeat).rev() {
+        if let Some(done) = match_repeated_list_branch(&context, repeat)? {
+            return Ok(Some(done));
+        }
+    }
+
+    Ok(None)
+}
+
+fn match_repeated_list_branch(
+    context: &ListMatchContext<'_>,
+    repeat: usize,
+) -> Result<Option<Bindings>, EvalError> {
+    let repeated = &context.patterns[context.pattern_index];
+    let mut branch = context.bindings.clone();
+    initialize_repeated_list_branch(
+        repeated,
+        repeat,
+        context.literals,
+        context.ellipsis_depth,
+        &mut branch,
+    )?;
+    if !match_repeated_inputs(
+        repeated,
+        &context.inputs[context.input_index..context.input_index + repeat],
+        context.literals,
+        context.ellipsis_depth,
+        &mut branch,
+    )? {
+        return Ok(None);
+    }
+
+    match_list_from(
+        context.patterns,
+        context.pattern_index + 2,
+        context.inputs,
+        context.input_index + repeat,
+        context.literals,
+        context.ellipsis_depth,
+        &branch,
+    )
+}
+
+fn initialize_repeated_list_branch(
+    repeated: &Expr,
+    repeat: usize,
+    literals: &HashSet<String>,
+    ellipsis_depth: usize,
+    branch: &mut Bindings,
+) -> Result<(), EvalError> {
+    if repeat != 0 {
+        return Ok(());
+    }
+
+    ensure_empty_repeated_bindings(repeated, literals, ellipsis_depth + 1, branch)
+}
+
+fn match_repeated_inputs(
+    repeated: &Expr,
+    inputs: &[Expr],
+    literals: &HashSet<String>,
+    ellipsis_depth: usize,
+    branch: &mut Bindings,
+) -> Result<bool, EvalError> {
+    for input in inputs {
+        let Some(next) = match_pattern(repeated, input, literals, ellipsis_depth + 1, branch)?
+        else {
+            return Ok(false);
+        };
+        *branch = next;
+    }
+
+    Ok(true)
+}
+
+fn match_single_list_pattern(
+    patterns: &[Expr],
+    pattern_index: usize,
+    inputs: &[Expr],
+    input_index: usize,
+    literals: &HashSet<String>,
+    ellipsis_depth: usize,
+    bindings: &Bindings,
+) -> Result<Option<Bindings>, EvalError> {
+    let Some(input) = inputs.get(input_index) else {
+        return Ok(None);
+    };
+    let Some(next) = match_pattern(
+        &patterns[pattern_index],
+        input,
+        literals,
+        ellipsis_depth,
+        bindings,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    match_list_from(
+        patterns,
+        pattern_index + 1,
+        inputs,
+        input_index + 1,
+        literals,
+        ellipsis_depth,
+        &next,
+    )
 }
 
 fn bind_pattern_variable(
@@ -471,27 +567,26 @@ fn ensure_empty_repeated_bindings(
         Expr::List(items, _) => {
             let mut index = 0;
             while index < items.len() {
-                if index + 1 < items.len() && is_ellipsis(&items[index + 1]) {
-                    ensure_empty_repeated_bindings(
-                        &items[index],
-                        literals,
-                        ellipsis_depth + 1,
-                        bindings,
-                    )?;
-                    index += 2;
-                } else {
-                    ensure_empty_repeated_bindings(
-                        &items[index],
-                        literals,
-                        ellipsis_depth,
-                        bindings,
-                    )?;
-                    index += 1;
-                }
+                let (item, next_index, next_depth) =
+                    repeated_binding_step(items, index, ellipsis_depth);
+                ensure_empty_repeated_bindings(item, literals, next_depth, bindings)?;
+                index = next_index;
             }
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+fn repeated_binding_step(
+    items: &[Expr],
+    index: usize,
+    ellipsis_depth: usize,
+) -> (&Expr, usize, usize) {
+    if followed_by_ellipsis(items, index) {
+        (&items[index], index + 2, ellipsis_depth + 1)
+    } else {
+        (&items[index], index + 1, ellipsis_depth)
     }
 }
 
@@ -608,35 +703,65 @@ fn expand_plain_list(
     let mut index = 0;
 
     while index < items.len() {
-        if index + 1 < items.len() && is_ellipsis(&items[index + 1]) {
-            if repetition_index.is_some() {
-                return Err(items[index + 1]
-                    .pos()
-                    .attach(syntax_error("nested ellipsis is not supported")));
-            }
-
-            let repeat_count = template_repeat_count(&items[index], state)?;
-            for repeat in 0..repeat_count {
-                expanded.push(expand_template(
-                    &items[index],
-                    state,
-                    Some(repeat),
-                    local_renames,
-                )?);
-            }
-            index += 2;
-        } else {
-            expanded.push(expand_template(
-                &items[index],
+        if followed_by_ellipsis(items, index) {
+            expand_repeated_template_items(
+                &mut expanded,
+                items,
+                index,
                 state,
                 repetition_index,
                 local_renames,
-            )?);
-            index += 1;
+            )?;
+            index += 2;
+            continue;
         }
+
+        expanded.push(expand_template(
+            &items[index],
+            state,
+            repetition_index,
+            local_renames,
+        )?);
+        index += 1;
     }
 
     Ok(Expr::List(expanded, pos))
+}
+
+fn expand_repeated_template_items(
+    expanded: &mut Vec<Expr>,
+    items: &[Expr],
+    index: usize,
+    state: &mut ExpansionState<'_>,
+    repetition_index: Option<usize>,
+    local_renames: &HashMap<String, String>,
+) -> Result<(), EvalError> {
+    reject_nested_ellipsis(&items[index + 1], repetition_index)?;
+
+    let repeat_count = template_repeat_count(&items[index], state)?;
+    for repeat in 0..repeat_count {
+        expanded.push(expand_template(
+            &items[index],
+            state,
+            Some(repeat),
+            local_renames,
+        )?);
+    }
+
+    Ok(())
+}
+
+fn reject_nested_ellipsis(
+    ellipsis: &Expr,
+    repetition_index: Option<usize>,
+) -> Result<(), EvalError> {
+    if repetition_index.is_none() {
+        return Ok(());
+    }
+
+    Err(ellipsis
+        .pos()
+        .attach(syntax_error("nested ellipsis is not supported")))
 }
 
 fn expand_template_let(
@@ -807,24 +932,14 @@ fn expand_formals(
     body_renames: &mut HashMap<String, String>,
 ) -> Result<Expr, EvalError> {
     match formals {
-        Expr::List(params, pos) => {
-            let mut expanded = Vec::with_capacity(params.len());
-            for param in params {
-                match param {
-                    Expr::Symbol(name, param_pos) if name == "." => {
-                        expanded.push(Expr::Symbol(name.clone(), *param_pos));
-                    }
-                    _ => expanded.push(expand_binding_identifier(
-                        param,
-                        state,
-                        repetition_index,
-                        local_renames,
-                        body_renames,
-                    )?),
-                }
-            }
-            Ok(Expr::List(expanded, *pos))
-        }
+        Expr::List(params, pos) => expand_formal_list(
+            params,
+            *pos,
+            state,
+            repetition_index,
+            local_renames,
+            body_renames,
+        ),
         Expr::Symbol(name, pos) if name != "." => expand_binding_identifier(
             formals,
             state,
@@ -833,6 +948,36 @@ fn expand_formals(
             body_renames,
         ),
         _ => expand_template(formals, state, repetition_index, local_renames),
+    }
+}
+
+fn expand_formal_list(
+    params: &[Expr],
+    pos: Position,
+    state: &mut ExpansionState<'_>,
+    repetition_index: Option<usize>,
+    local_renames: &HashMap<String, String>,
+    body_renames: &mut HashMap<String, String>,
+) -> Result<Expr, EvalError> {
+    let expanded = params
+        .iter()
+        .map(|param| {
+            expand_formal_param(param, state, repetition_index, local_renames, body_renames)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Expr::List(expanded, pos))
+}
+
+fn expand_formal_param(
+    param: &Expr,
+    state: &mut ExpansionState<'_>,
+    repetition_index: Option<usize>,
+    local_renames: &HashMap<String, String>,
+    body_renames: &mut HashMap<String, String>,
+) -> Result<Expr, EvalError> {
+    match param {
+        Expr::Symbol(name, pos) if name == "." => Ok(Expr::Symbol(name.clone(), *pos)),
+        _ => expand_binding_identifier(param, state, repetition_index, local_renames, body_renames),
     }
 }
 
@@ -883,29 +1028,38 @@ fn expand_quoted_list(
     let mut index = 0;
 
     while index < items.len() {
-        if index + 1 < items.len() && is_ellipsis(&items[index + 1]) {
-            if repetition_index.is_some() {
-                return Err(items[index + 1]
-                    .pos()
-                    .attach(syntax_error("nested ellipsis is not supported")));
-            }
-
-            let repeat_count = template_repeat_count(&items[index], state)?;
-            for repeat in 0..repeat_count {
-                expanded.push(expand_quoted_template(&items[index], state, Some(repeat))?);
-            }
+        if followed_by_ellipsis(items, index) {
+            expand_repeated_quoted_items(&mut expanded, items, index, state, repetition_index)?;
             index += 2;
-        } else {
-            expanded.push(expand_quoted_template(
-                &items[index],
-                state,
-                repetition_index,
-            )?);
-            index += 1;
+            continue;
         }
+
+        expanded.push(expand_quoted_template(
+            &items[index],
+            state,
+            repetition_index,
+        )?);
+        index += 1;
     }
 
     Ok(Expr::List(expanded, pos))
+}
+
+fn expand_repeated_quoted_items(
+    expanded: &mut Vec<Expr>,
+    items: &[Expr],
+    index: usize,
+    state: &ExpansionState<'_>,
+    repetition_index: Option<usize>,
+) -> Result<(), EvalError> {
+    reject_nested_ellipsis(&items[index + 1], repetition_index)?;
+
+    let repeat_count = template_repeat_count(&items[index], state)?;
+    for repeat in 0..repeat_count {
+        expanded.push(expand_quoted_template(&items[index], state, Some(repeat))?);
+    }
+
+    Ok(())
 }
 
 fn template_repeat_count(template: &Expr, state: &ExpansionState<'_>) -> Result<usize, EvalError> {
@@ -941,10 +1095,8 @@ fn collect_repeat_counts(
             }
         }
         Expr::List(items, _) => {
-            for item in items {
-                if !is_ellipsis(item) {
-                    collect_repeat_counts(item, pattern_vars, bindings, counts);
-                }
+            for item in items.iter().filter(|item| !is_ellipsis(item)) {
+                collect_repeat_counts(item, pattern_vars, bindings, counts);
             }
         }
         _ => {}

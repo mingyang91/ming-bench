@@ -43,6 +43,7 @@ impl Expr {
 
 pub(crate) type StringRef = Rc<RefCell<String>>;
 pub(crate) type PairRef = Rc<RefCell<PairCell>>;
+pub(crate) type VectorRef = Rc<RefCell<Vec<Value>>>;
 pub(crate) type RecordTypeRef = Rc<RecordType>;
 pub(crate) type RecordRef = Rc<RecordValue>;
 pub(crate) type EnvRef = Rc<RefCell<Environment>>;
@@ -74,8 +75,10 @@ pub(crate) enum Value {
     Char(char),
     List(Vec<Value>),
     Pair(PairRef),
+    Vector(VectorRef),
     Record(RecordRef),
     Procedure(Rc<Procedure>),
+    Uninitialized,
     Void,
 }
 
@@ -99,8 +102,10 @@ impl Value {
             Self::Char(_) => "character",
             Self::List(_) => "list",
             Self::Pair(_) => "pair",
+            Self::Vector(_) => "vector",
             Self::Record(_) => "record",
             Self::Procedure(_) => "procedure",
+            Self::Uninitialized => "uninitialized",
             Self::Void => "void",
         }
     }
@@ -116,6 +121,7 @@ impl Value {
     pub(crate) fn render_for_error(&self) -> String {
         match self {
             Self::Void => "#<void>".into(),
+            Self::Uninitialized => "#<uninitialized>".into(),
             _ => self.render(),
         }
     }
@@ -297,6 +303,10 @@ pub(crate) fn make_pair(car: Value, cdr: Value) -> Value {
     Value::Pair(Rc::new(RefCell::new(PairCell { car, cdr })))
 }
 
+pub(crate) fn make_vector(values: Vec<Value>) -> Value {
+    Value::Vector(Rc::new(RefCell::new(values)))
+}
+
 pub(crate) fn make_lambda(
     name: Option<String>,
     params: Vec<String>,
@@ -399,8 +409,10 @@ fn render_value(value: &Value, mode: RenderMode) -> String {
         },
         Value::List(values) => render_list(values, mode),
         Value::Pair(pair) => render_pair(pair, mode),
+        Value::Vector(vector) => render_vector(vector, mode),
         Value::Record(record) => render_record(record),
         Value::Procedure(_) => "#<procedure>".into(),
+        Value::Uninitialized => "#<uninitialized>".into(),
         Value::Void => String::new(),
     }
 }
@@ -456,6 +468,21 @@ fn render_pair(pair: &PairRef, mode: RenderMode) -> String {
     rendered
 }
 
+fn render_vector(vector: &VectorRef, mode: RenderMode) -> String {
+    let values = vector.borrow();
+    let mut rendered = String::from("#(");
+
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            rendered.push(' ');
+        }
+        rendered.push_str(&render_value(value, mode));
+    }
+
+    rendered.push(')');
+    rendered
+}
+
 fn render_record(record: &RecordRef) -> String {
     format!("#<record {}>", record.as_ref().record_type.name)
 }
@@ -479,8 +506,18 @@ pub(crate) fn value_equal(lhs: &Value, rhs: &Value) -> bool {
             let rhs = rhs.borrow();
             value_equal(&lhs.car, &rhs.car) && value_equal(&lhs.cdr, &rhs.cdr)
         }
+        (Value::Vector(lhs), Value::Vector(rhs)) => {
+            let lhs = lhs.borrow();
+            let rhs = rhs.borrow();
+            lhs.len() == rhs.len()
+                && lhs
+                    .iter()
+                    .zip(rhs.iter())
+                    .all(|(lhs, rhs)| value_equal(lhs, rhs))
+        }
         (Value::Record(lhs), Value::Record(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::Procedure(lhs), Value::Procedure(rhs)) => Rc::ptr_eq(lhs, rhs),
+        (Value::Uninitialized, Value::Uninitialized) => true,
         (Value::Void, Value::Void) => true,
         _ => false,
     }

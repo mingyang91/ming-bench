@@ -1,11 +1,12 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::builtins::default_env;
+use super::builtins::{default_env, eqv_value};
 use super::core::{
     make_case_lambda, make_lambda, make_record, make_record_accessor, make_record_constructor,
-    make_record_predicate, make_record_type, quote_expr, CaseLambdaProcedure, EnvRef, Environment,
-    Expr, LambdaProcedure, Procedure, RecordAccessorProcedure, RecordConstructorProcedure,
-    RecordPredicateProcedure, Runtime, Value,
+    make_record_predicate, make_record_type, quote_expr, BindingRef, CaseLambdaProcedure, EnvRef,
+    Environment, Expr, LambdaProcedure, Procedure, RecordAccessorProcedure,
+    RecordConstructorProcedure, RecordPredicateProcedure, Runtime, Value,
 };
 use super::error::EvalError;
 use super::macros::{expand_macro_call, parse_macro_definition};
@@ -25,6 +26,12 @@ struct RecordFieldSpec {
     accessor_name: String,
 }
 
+struct DoBindingSpec {
+    name: String,
+    init: Expr,
+    step: Option<Expr>,
+}
+
 #[derive(Clone, Copy)]
 enum SpecialForm {
     Define,
@@ -38,8 +45,12 @@ enum SpecialForm {
     And,
     Or,
     Let,
+    Letrec,
+    LetrecStar,
     Begin,
     Cond,
+    Case,
+    Do,
 }
 
 impl SpecialForm {
@@ -56,8 +67,12 @@ impl SpecialForm {
             "and" => Some(Self::And),
             "or" => Some(Self::Or),
             "let" => Some(Self::Let),
+            "letrec" => Some(Self::Letrec),
+            "letrec*" => Some(Self::LetrecStar),
             "begin" => Some(Self::Begin),
             "cond" => Some(Self::Cond),
+            "case" => Some(Self::Case),
+            "do" => Some(Self::Do),
             _ => None,
         }
     }
@@ -75,8 +90,12 @@ impl SpecialForm {
             Self::And => eval_and(args, env, runtime),
             Self::Or => eval_or(args, env, runtime),
             Self::Let => eval_let(args, env, runtime),
+            Self::Letrec => eval_letrec(args, env, runtime),
+            Self::LetrecStar => eval_letrec_star(args, env, runtime),
             Self::Begin => eval_begin(args, env, runtime),
             Self::Cond => eval_cond(args, env, runtime),
+            Self::Case => eval_case(args, env, runtime),
+            Self::Do => eval_do(args, env, runtime),
         }
     }
 }
@@ -113,8 +132,13 @@ fn eval_expr(expr: &Expr, env: &EnvRef, runtime: &mut Runtime) -> Result<Value, 
         Expr::Number(value, _) => Ok(Value::Number(*value)),
         Expr::String(value, _) => Ok(super::core::make_string(value.clone())),
         Expr::Char(value, _) => Ok(Value::Char(*value)),
-        Expr::Symbol(name, pos) => Environment::lookup(env, name)
-            .ok_or_else(|| pos.attach(EvalError::UnboundSymbol { name: name.clone() })),
+        Expr::Symbol(name, pos) => match Environment::lookup(env, name) {
+            Some(Value::Uninitialized) => {
+                Err(pos.attach(EvalError::UninitializedBinding { name: name.clone() }))
+            }
+            Some(value) => Ok(value),
+            None => Err(pos.attach(EvalError::UnboundSymbol { name: name.clone() })),
+        },
         Expr::List(items, pos) => eval_list(items, env, runtime).map_err(|error| pos.attach(error)),
     }
 }
@@ -273,14 +297,18 @@ fn eval_function_define(
 }
 
 fn eval_if(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value, EvalError> {
-    let [condition, consequent, alternate] = args else {
-        return Err(wrong_arg_count("if", "exactly 3", args.len()));
+    let (condition, consequent, alternate) = match args {
+        [condition, consequent] => (condition, consequent, None),
+        [condition, consequent, alternate] => (condition, consequent, Some(alternate)),
+        _ => return Err(wrong_arg_count("if", "exactly 2 or 3", args.len())),
     };
 
     if eval_expr(condition, env, runtime)?.is_truthy() {
         eval_expr(consequent, env, runtime)
-    } else {
+    } else if let Some(alternate) = alternate {
         eval_expr(alternate, env, runtime)
+    } else {
+        Ok(Value::Void)
     }
 }
 
@@ -516,6 +544,110 @@ fn parse_let_binding(binding: &Expr) -> Result<(String, Expr), EvalError> {
     }
 }
 
+fn eval_letrec(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value, EvalError> {
+    eval_recursive_let("letrec", args, env, runtime, false)
+}
+
+fn eval_letrec_star(
+    args: &[Expr],
+    env: &EnvRef,
+    runtime: &mut Runtime,
+) -> Result<Value, EvalError> {
+    eval_recursive_let("letrec*", args, env, runtime, true)
+}
+
+fn eval_recursive_let(
+    name: &str,
+    args: &[Expr],
+    env: &EnvRef,
+    runtime: &mut Runtime,
+    sequential: bool,
+) -> Result<Value, EvalError> {
+    let Some((bindings_expr, body)) = args.split_first() else {
+        return Err(wrong_arg_count(name, "at least 2", 0));
+    };
+
+    if body.is_empty() {
+        return Err(wrong_arg_count(name, "at least 2", 1));
+    }
+
+    let bindings = parse_let_bindings(bindings_expr)?;
+    let local_env = Environment::new(Some(env.clone()));
+    let cells = create_recursive_bindings(&local_env, &bindings);
+
+    if sequential {
+        for ((_, expr), cell) in bindings.iter().zip(cells.iter()) {
+            let value = eval_expr(expr, &local_env, runtime)?;
+            *cell.borrow_mut() = value;
+        }
+    } else {
+        let values = bindings
+            .iter()
+            .map(|(_, expr)| eval_expr(expr, &local_env, runtime))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (cell, value) in cells.iter().zip(values) {
+            *cell.borrow_mut() = value;
+        }
+    }
+
+    eval_sequence(body, &local_env, runtime)
+}
+
+fn create_recursive_bindings(env: &EnvRef, bindings: &[(String, Expr)]) -> Vec<BindingRef> {
+    bindings
+        .iter()
+        .map(|(binding_name, _)| {
+            let cell = Rc::new(RefCell::new(Value::Uninitialized));
+            Environment::define_cell(env, binding_name.clone(), cell.clone());
+            cell
+        })
+        .collect()
+}
+
+fn parse_do_bindings(bindings_expr: &Expr) -> Result<Vec<DoBindingSpec>, EvalError> {
+    let bindings = match bindings_expr {
+        Expr::List(bindings, _) => bindings,
+        Expr::Bool(_, _)
+        | Expr::Number(_, _)
+        | Expr::String(_, _)
+        | Expr::Char(_, _)
+        | Expr::Symbol(_, _) => {
+            return Err(positioned_syntax_error(
+                bindings_expr,
+                "do bindings must be a list",
+            ));
+        }
+    };
+
+    bindings
+        .iter()
+        .map(parse_do_binding)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn parse_do_binding(binding: &Expr) -> Result<DoBindingSpec, EvalError> {
+    match binding {
+        Expr::List(parts, _) if (2..=3).contains(&parts.len()) => Ok(DoBindingSpec {
+            name: expect_symbol_expr(&parts[0], "do binding name")?,
+            init: parts[1].clone(),
+            step: parts.get(2).cloned(),
+        }),
+        Expr::List(_, _) => Err(positioned_syntax_error(
+            binding,
+            "do bindings must contain a name, init, and optional step",
+        )),
+        Expr::Bool(_, _)
+        | Expr::Number(_, _)
+        | Expr::String(_, _)
+        | Expr::Char(_, _)
+        | Expr::Symbol(_, _) => Err(positioned_syntax_error(
+            binding,
+            "do binding must be a list",
+        )),
+    }
+}
+
 fn parse_record_constructor_spec(expr: &Expr) -> Result<RecordConstructorSpec, EvalError> {
     let parts = match expr {
         Expr::List(parts, _) if !parts.is_empty() => parts,
@@ -581,6 +713,185 @@ fn eval_cond(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value
     Ok(Value::Void)
 }
 
+fn eval_case(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let Some((key_expr, clauses)) = args.split_first() else {
+        return Err(wrong_arg_count("case", "at least 2", 0));
+    };
+
+    if clauses.is_empty() {
+        return Err(wrong_arg_count("case", "at least 2", 1));
+    }
+
+    let key = eval_expr(key_expr, env, runtime)?;
+
+    for (index, clause) in clauses.iter().enumerate() {
+        if let Some(result) = eval_case_clause(clause, index, clauses.len(), &key, env, runtime)? {
+            return Ok(result);
+        }
+    }
+
+    Ok(Value::Void)
+}
+
+fn eval_case_clause(
+    clause: &Expr,
+    index: usize,
+    clause_count: usize,
+    key: &Value,
+    env: &EnvRef,
+    runtime: &mut Runtime,
+) -> Result<Option<Value>, EvalError> {
+    let parts = case_clause_parts(clause)?;
+    if is_else_clause(parts) {
+        validate_case_else_clause(clause, parts, index, clause_count)?;
+        return Ok(Some(eval_sequence(&parts[1..], env, runtime)?));
+    }
+
+    ensure_case_clause_has_body(clause, parts, "case clause must have a body")?;
+    if !case_clause_matches_key(key, &parts[0])? {
+        return Ok(None);
+    }
+
+    Ok(Some(eval_sequence(&parts[1..], env, runtime)?))
+}
+
+fn validate_case_else_clause(
+    clause: &Expr,
+    parts: &[Expr],
+    index: usize,
+    clause_count: usize,
+) -> Result<(), EvalError> {
+    if index + 1 != clause_count {
+        return Err(positioned_syntax_error(
+            clause,
+            "case else clause must be last",
+        ));
+    }
+
+    ensure_case_clause_has_body(clause, parts, "case else clause must have a body")
+}
+
+fn ensure_case_clause_has_body(
+    clause: &Expr,
+    parts: &[Expr],
+    message: &str,
+) -> Result<(), EvalError> {
+    if parts.len() > 1 {
+        return Ok(());
+    }
+
+    Err(positioned_syntax_error(clause, message))
+}
+
+fn case_clause_matches_key(key: &Value, datums_expr: &Expr) -> Result<bool, EvalError> {
+    let datums = case_clause_datums(datums_expr)?;
+    Ok(datums
+        .iter()
+        .any(|datum| eqv_value(key, &quote_expr(datum))))
+}
+
+fn eval_do(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let Some((bindings_expr, tail)) = args.split_first() else {
+        return Err(wrong_arg_count("do", "at least 2", 0));
+    };
+
+    let Some((test_clause, body)) = tail.split_first() else {
+        return Err(wrong_arg_count("do", "at least 2", 1));
+    };
+
+    let bindings = parse_do_bindings(bindings_expr)?;
+    let test_parts = do_termination_clause_parts(test_clause)?;
+    let (test_expr, result_exprs) = test_parts
+        .split_first()
+        .expect("do termination clause must contain a test expression");
+    let init_values = bindings
+        .iter()
+        .map(|binding| eval_expr(&binding.init, env, runtime))
+        .collect::<Result<Vec<_>, _>>()?;
+    let local_env = Environment::new(Some(env.clone()));
+
+    for (binding, value) in bindings.iter().zip(init_values) {
+        Environment::define(&local_env, binding.name.clone(), value);
+    }
+
+    loop {
+        if let Some(result) = eval_do_termination(test_expr, result_exprs, &local_env, runtime)? {
+            return Ok(result);
+        }
+
+        eval_do_body(body, &local_env, runtime)?;
+        let next_values = collect_do_next_values(&bindings, &local_env, runtime)?;
+        update_do_bindings(&bindings, &local_env, next_values);
+    }
+}
+
+fn eval_do_termination(
+    test_expr: &Expr,
+    result_exprs: &[Expr],
+    env: &EnvRef,
+    runtime: &mut Runtime,
+) -> Result<Option<Value>, EvalError> {
+    if !eval_expr(test_expr, env, runtime)?.is_truthy() {
+        return Ok(None);
+    }
+
+    Ok(Some(eval_do_result(result_exprs, env, runtime)?))
+}
+
+fn eval_do_result(
+    result_exprs: &[Expr],
+    env: &EnvRef,
+    runtime: &mut Runtime,
+) -> Result<Value, EvalError> {
+    if result_exprs.is_empty() {
+        return Ok(Value::Void);
+    }
+
+    eval_sequence(result_exprs, env, runtime)
+}
+
+fn eval_do_body(body: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<(), EvalError> {
+    if body.is_empty() {
+        return Ok(());
+    }
+
+    eval_sequence(body, env, runtime).map(|_| ())
+}
+
+fn collect_do_next_values(
+    bindings: &[DoBindingSpec],
+    env: &EnvRef,
+    runtime: &mut Runtime,
+) -> Result<Vec<Value>, EvalError> {
+    bindings
+        .iter()
+        .map(|binding| eval_do_step(binding, env, runtime))
+        .collect()
+}
+
+fn eval_do_step(
+    binding: &DoBindingSpec,
+    env: &EnvRef,
+    runtime: &mut Runtime,
+) -> Result<Value, EvalError> {
+    match &binding.step {
+        Some(step) => eval_expr(step, env, runtime),
+        None => Ok(
+            Environment::lookup(env, &binding.name).expect("do binding should remain available")
+        ),
+    }
+}
+
+fn update_do_bindings(bindings: &[DoBindingSpec], env: &EnvRef, next_values: Vec<Value>) {
+    for (binding, value) in bindings.iter().zip(next_values) {
+        let updated = Environment::set(env, &binding.name, value);
+        debug_assert!(
+            updated,
+            "do binding should be mutable in its local environment"
+        );
+    }
+}
+
 fn cond_clause_parts(clause: &Expr) -> Result<&[Expr], EvalError> {
     match clause {
         Expr::List(parts, _) if !parts.is_empty() => Ok(parts),
@@ -595,6 +906,60 @@ fn cond_clause_parts(clause: &Expr) -> Result<&[Expr], EvalError> {
         | Expr::Symbol(_, _) => Err(positioned_syntax_error(
             clause,
             "cond clause must be a list",
+        )),
+    }
+}
+
+fn case_clause_parts(clause: &Expr) -> Result<&[Expr], EvalError> {
+    match clause {
+        Expr::List(parts, _) if !parts.is_empty() => Ok(parts),
+        Expr::List(_, _) => Err(positioned_syntax_error(
+            clause,
+            "case clause cannot be empty",
+        )),
+        Expr::Bool(_, _)
+        | Expr::Number(_, _)
+        | Expr::String(_, _)
+        | Expr::Char(_, _)
+        | Expr::Symbol(_, _) => Err(positioned_syntax_error(
+            clause,
+            "case clause must be a list",
+        )),
+    }
+}
+
+fn case_clause_datums(expr: &Expr) -> Result<&[Expr], EvalError> {
+    match expr {
+        Expr::List(datums, _) if !datums.is_empty() => Ok(datums),
+        Expr::List(_, _) => Err(positioned_syntax_error(
+            expr,
+            "case clause must include at least one datum",
+        )),
+        Expr::Bool(_, _)
+        | Expr::Number(_, _)
+        | Expr::String(_, _)
+        | Expr::Char(_, _)
+        | Expr::Symbol(_, _) => Err(positioned_syntax_error(
+            expr,
+            "case clause datums must be a list",
+        )),
+    }
+}
+
+fn do_termination_clause_parts(clause: &Expr) -> Result<&[Expr], EvalError> {
+    match clause {
+        Expr::List(parts, _) if !parts.is_empty() => Ok(parts),
+        Expr::List(_, _) => Err(positioned_syntax_error(
+            clause,
+            "do termination clause cannot be empty",
+        )),
+        Expr::Bool(_, _)
+        | Expr::Number(_, _)
+        | Expr::String(_, _)
+        | Expr::Char(_, _)
+        | Expr::Symbol(_, _) => Err(positioned_syntax_error(
+            clause,
+            "do termination clause must be a list",
         )),
     }
 }
@@ -697,21 +1062,7 @@ fn parse_params(params: &[Expr]) -> Result<ParsedParams, EvalError> {
     while index < params.len() {
         match &params[index] {
             Expr::Symbol(symbol, _) if symbol == "." => {
-                let Some(rest_expr) = params.get(index + 1) else {
-                    return Err(positioned_syntax_error(
-                        &params[index],
-                        "parameter list is missing a rest parameter name",
-                    ));
-                };
-
-                if index + 2 != params.len() {
-                    return Err(positioned_syntax_error(
-                        &params[index],
-                        "parameter list allows only one rest parameter",
-                    ));
-                }
-
-                parsed.rest_param = Some(expect_param_name(rest_expr)?);
+                parsed.rest_param = Some(parse_rest_param(params, index)?);
                 return Ok(parsed);
             }
             param => parsed.params.push(expect_param_name(param)?),
@@ -721,6 +1072,25 @@ fn parse_params(params: &[Expr]) -> Result<ParsedParams, EvalError> {
     }
 
     Ok(parsed)
+}
+
+fn parse_rest_param(params: &[Expr], index: usize) -> Result<String, EvalError> {
+    let dot = &params[index];
+    let Some(rest_expr) = params.get(index + 1) else {
+        return Err(positioned_syntax_error(
+            dot,
+            "parameter list is missing a rest parameter name",
+        ));
+    };
+
+    if index + 2 != params.len() {
+        return Err(positioned_syntax_error(
+            dot,
+            "parameter list allows only one rest parameter",
+        ));
+    }
+
+    expect_param_name(rest_expr)
 }
 
 fn expect_param_name(expr: &Expr) -> Result<String, EvalError> {
@@ -758,7 +1128,9 @@ pub(crate) fn apply_procedure(
         | Value::Char(_)
         | Value::List(_)
         | Value::Pair(_)
+        | Value::Vector(_)
         | Value::Record(_)
+        | Value::Uninitialized
         | Value::Void => Err(EvalError::NotAProcedure {
             found: operator.render_for_error(),
         }),
