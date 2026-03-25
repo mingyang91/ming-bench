@@ -1,4 +1,5 @@
 pub mod error;
+mod macros;
 
 pub use error::EvalError;
 
@@ -15,6 +16,7 @@ enum Token {
     LParen,
     RParen,
     Quote,
+    SyntaxQuote,
     Atom(String),
     String(String),
 }
@@ -485,6 +487,11 @@ fn evaluate_program(input: &str) -> Result<Value, EvalError> {
         return Err(EvalError::message("empty input"));
     }
 
+    let expressions = macros::expand_program(expressions)?;
+    if expressions.is_empty() {
+        return Ok(Value::Void);
+    }
+
     let env = create_global_env();
     run_machine(schedule_sequence(
         expressions,
@@ -543,6 +550,10 @@ impl Parser {
                 Expr::Symbol("quote".into()),
                 self.parse_expr()?,
             ])),
+            Token::SyntaxQuote => Ok(Expr::List(vec![
+                Expr::Symbol("syntax".into()),
+                self.parse_expr()?,
+            ])),
             Token::String(value) => Ok(Expr::String(value)),
             Token::Atom(atom) => Ok(parse_atom(atom)),
         }
@@ -589,6 +600,12 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
             while index < chars.len() && chars[index] != '\n' {
                 index += 1;
             }
+            continue;
+        }
+
+        if ch == '#' && chars.get(index + 1) == Some(&'\'') {
+            tokens.push(Token::SyntaxQuote);
+            index += 2;
             continue;
         }
 
@@ -824,13 +841,22 @@ fn schedule_if(
     env: EnvRef,
     context: Rc<ExecutionContext>,
 ) -> Result<MachineState, EvalError> {
-    require_exact("if", args.len(), 3)?;
+    if args.len() != 2 && args.len() != 3 {
+        return Err(EvalError::message(format!(
+            "if: expected 2 or 3 argument(s), got {}",
+            args.len()
+        )));
+    }
+
     Ok(MachineState::Evaluate {
         expr: args[0].clone(),
         env: env.clone(),
         context: Rc::new(ExecutionContext::If {
             consequent: args[1].clone(),
-            alternate: args[2].clone(),
+            alternate: args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| Expr::List(vec![Expr::Symbol("begin".into())])),
             env,
             next: context,
         }),
@@ -1450,11 +1476,18 @@ fn evaluate_set(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
 }
 
 fn evaluate_if(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
-    require_exact("if", args.len(), 3)?;
+    if args.len() != 2 && args.len() != 3 {
+        return Err(EvalError::message(format!(
+            "if: expected 2 or 3 argument(s), got {}",
+            args.len()
+        )));
+    }
     if is_truthy(&evaluate(&args[0], env.clone())?) {
         evaluate(&args[1], env)
-    } else {
+    } else if args.len() == 3 {
         evaluate(&args[2], env)
+    } else {
+        Ok(Value::Void)
     }
 }
 
@@ -1776,6 +1809,7 @@ fn create_global_env() -> EnvRef {
     define_builtin(&env, "=", builtin_number_equal);
     define_builtin(&env, "<=", builtin_less_equal);
     define_builtin(&env, "not", builtin_not);
+    define_builtin(&env, "zero?", builtin_zero);
     define_builtin(&env, "cons", builtin_cons);
     define_builtin(&env, "car", builtin_car);
     define_builtin(&env, "cdr", builtin_cdr);
@@ -1790,6 +1824,9 @@ fn create_global_env() -> EnvRef {
         "call-with-current-continuation",
         builtin_call_cc,
     );
+    define_builtin(&env, "string-append", builtin_string_append);
+    define_builtin(&env, "number->string", builtin_number_to_string);
+    define_builtin(&env, "string->symbol", builtin_string_to_symbol);
     define_builtin(&env, "string?", builtin_is_string);
     define_builtin(&env, "number?", builtin_is_number);
     define_builtin(&env, "integer?", builtin_is_integer);
@@ -1899,6 +1936,11 @@ fn builtin_not(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Boolean(!is_truthy(&args[0])))
 }
 
+fn builtin_zero(args: &[Value]) -> Result<Value, EvalError> {
+    require_exact("zero?", args.len(), 1)?;
+    Ok(Value::Boolean(expect_number(&args[0])?.is_zero()))
+}
+
 fn builtin_cons(args: &[Value]) -> Result<Value, EvalError> {
     require_exact("cons", args.len(), 2)?;
     Ok(Value::pair(args[0].clone(), args[1].clone()))
@@ -1961,6 +2003,24 @@ fn builtin_call_cc(_args: &[Value]) -> Result<Value, EvalError> {
     Err(EvalError::message(
         "call/cc requires continuation-aware application",
     ))
+}
+
+fn builtin_string_append(args: &[Value]) -> Result<Value, EvalError> {
+    let mut combined = String::new();
+    for arg in args {
+        combined.push_str(&expect_string(arg)?);
+    }
+    Ok(Value::String(combined))
+}
+
+fn builtin_number_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    require_exact("number->string", args.len(), 1)?;
+    Ok(Value::String(format_number(&expect_number(&args[0])?)))
+}
+
+fn builtin_string_to_symbol(args: &[Value]) -> Result<Value, EvalError> {
+    require_exact("string->symbol", args.len(), 1)?;
+    Ok(Value::Symbol(expect_string(&args[0])?))
 }
 
 fn builtin_is_string(args: &[Value]) -> Result<Value, EvalError> {
@@ -2088,6 +2148,16 @@ fn expect_pair(value: &Value) -> Result<Rc<Pair>, EvalError> {
         Value::Pair(pair) => Ok(pair.clone()),
         _ => Err(EvalError::message(format!(
             "expected pair, got {}",
+            type_name(value)
+        ))),
+    }
+}
+
+fn expect_string(value: &Value) -> Result<String, EvalError> {
+    match value {
+        Value::String(value) => Ok(value.clone()),
+        _ => Err(EvalError::message(format!(
+            "expected string, got {}",
             type_name(value)
         ))),
     }
