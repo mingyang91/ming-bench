@@ -8,7 +8,6 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     rc::Rc,
-    sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
 };
 
 const BUILTIN_NAMES: &[&str] = &[
@@ -159,8 +158,6 @@ const BUILTIN_NAMES: &[&str] = &[
     "zero?",
 ];
 
-static GENERATED_SYMBOL_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StepBudget {
     remaining: usize,
@@ -178,6 +175,7 @@ impl StepBudget {
 
 std::thread_local! {
     static STEP_BUDGET: Cell<Option<StepBudget>> = Cell::new(None);
+    static GENERATED_SYMBOL_COUNTER: Cell<usize> = Cell::new(0);
 }
 
 struct StepBudgetReset(Option<StepBudget>);
@@ -185,6 +183,14 @@ struct StepBudgetReset(Option<StepBudget>);
 impl Drop for StepBudgetReset {
     fn drop(&mut self) {
         STEP_BUDGET.with(|budget| budget.set(self.0));
+    }
+}
+
+struct GeneratedSymbolCounterReset(usize);
+
+impl Drop for GeneratedSymbolCounterReset {
+    fn drop(&mut self) {
+        GENERATED_SYMBOL_COUNTER.with(|counter| counter.set(self.0));
     }
 }
 
@@ -198,6 +204,16 @@ fn with_step_budget<T>(
         previous
     });
     let _reset = StepBudgetReset(previous);
+    f()
+}
+
+fn with_fresh_generated_symbols<T>(f: impl FnOnce() -> Result<T, EvalError>) -> Result<T, EvalError> {
+    let previous = GENERATED_SYMBOL_COUNTER.with(|counter| {
+        let previous = counter.get();
+        counter.set(0);
+        previous
+    });
+    let _reset = GeneratedSymbolCounterReset(previous);
     f()
 }
 
@@ -240,7 +256,7 @@ pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, Eval
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let (value, output) = eval_program(input)?;
-    Ok((render_result(&value), output))
+    Ok((render_output_result(&value), output))
 }
 
 fn current_bench_level() -> u32 {
@@ -255,14 +271,16 @@ fn uses_immutable_strings() -> bool {
 }
 
 fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
-    let exprs = Parser::new(input).parse_program()?;
-    let env = Environment::global();
-    let value = if program_requires_machine(&exprs) {
-        machine_eval_program(&exprs, env.clone())?
-    } else {
-        eval_program_without_machine(&exprs, env.clone())?
-    };
-    Ok((value, Environment::captured_output(&env)))
+    with_fresh_generated_symbols(|| {
+        let exprs = Parser::new(input).parse_program()?;
+        let env = Environment::global();
+        let value = if program_requires_machine(&exprs) {
+            machine_eval_program(&exprs, env.clone())?
+        } else {
+            eval_program_without_machine(&exprs, env.clone())?
+        };
+        Ok((value, Environment::captured_output(&env)))
+    })
 }
 
 fn program_requires_machine(exprs: &[Expr]) -> bool {
@@ -297,6 +315,13 @@ fn render_result(value: &Value) -> String {
     match value {
         Value::Void => String::new(),
         other => other.to_scheme_string(),
+    }
+}
+
+fn render_output_result(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.to_plain_string(),
+        other => render_result(other),
     }
 }
 
@@ -6782,7 +6807,11 @@ fn expect_proper_list_length(arg: &LocatedValue) -> Result<usize, EvalError> {
 }
 
 fn fresh_generated_symbol(kind: &str) -> String {
-    let next = GENERATED_SYMBOL_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    let next = GENERATED_SYMBOL_COUNTER.with(|counter| {
+        let next = counter.get();
+        counter.set(next + 1);
+        next
+    });
     format!("__macro_{kind}_{next}")
 }
 
