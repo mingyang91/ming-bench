@@ -2,6 +2,19 @@ import { EvalError, type SourceLocation } from './evalError.js';
 
 type Located<T> = T & { location: SourceLocation };
 
+interface ExactSchemeNumber {
+  exactness: 'exact';
+  numerator: number;
+  denominator: number;
+}
+
+interface InexactSchemeNumber {
+  exactness: 'inexact';
+  value: number;
+}
+
+type SchemeNumber = ExactSchemeNumber | InexactSchemeNumber;
+
 type SymbolExpr = Located<{
   kind: 'symbol';
   value: string;
@@ -14,7 +27,7 @@ type SymbolExpr = Located<{
 type ListExpr = Located<{ kind: 'list'; items: Expr[] }>;
 
 type Expr =
-  | Located<{ kind: 'number'; value: number }>
+  | Located<{ kind: 'number'; value: SchemeNumber }>
   | Located<{ kind: 'boolean'; value: boolean }>
   | Located<{ kind: 'string'; value: string }>
   | Located<{ kind: 'char'; value: string }>
@@ -22,7 +35,7 @@ type Expr =
   | ListExpr;
 
 type Token =
-  | Located<{ kind: 'number'; value: number }>
+  | Located<{ kind: 'number'; value: SchemeNumber }>
   | Located<{ kind: 'boolean'; value: boolean }>
   | Located<{ kind: 'string'; value: string }>
   | Located<{ kind: 'char'; value: string }>
@@ -32,7 +45,7 @@ type Token =
 
 interface NumberValue {
   kind: 'number';
-  value: number;
+  value: SchemeNumber;
 }
 
 interface BooleanValue {
@@ -244,25 +257,25 @@ function createGlobalEnvironment(output: string[]): Environment {
   env.define(
     '<',
     makeBuiltinProcedure('<', (args) =>
-      booleanValue(compareChain(asNumbers(args, '<'), (left, right) => left < right, '<')),
+      booleanValue(compareChain(asNumbers(args, '<'), (comparison) => comparison < 0, '<')),
     ),
   );
   env.define(
     '>',
     makeBuiltinProcedure('>', (args) =>
-      booleanValue(compareChain(asNumbers(args, '>'), (left, right) => left > right, '>')),
+      booleanValue(compareChain(asNumbers(args, '>'), (comparison) => comparison > 0, '>')),
     ),
   );
   env.define(
     '=',
     makeBuiltinProcedure('=', (args) =>
-      booleanValue(compareChain(asNumbers(args, '='), (left, right) => left === right, '=')),
+      booleanValue(compareChain(asNumbers(args, '='), (comparison) => comparison === 0, '=')),
     ),
   );
   env.define(
     '<=',
     makeBuiltinProcedure('<=', (args) =>
-      booleanValue(compareChain(asNumbers(args, '<='), (left, right) => left <= right, '<=')),
+      booleanValue(compareChain(asNumbers(args, '<='), (comparison) => comparison <= 0, '<=')),
     ),
   );
   env.define('not', makeBuiltinProcedure('not', (args) => applyNot(args)));
@@ -278,14 +291,14 @@ function createGlobalEnvironment(output: string[]): Environment {
   env.define('max', makeBuiltinProcedure('max', (args) => applyMax(args)));
   env.define('expt', makeBuiltinProcedure('expt', (args) => applyExpt(args)));
 
-  env.define('zero?', makePredicateProcedure('zero?', (value) => expectNumber(value, 'zero?') === 0));
+  env.define('zero?', makePredicateProcedure('zero?', (value) => compareNumbers(expectNumber(value, 'zero?'), exactNumber(0)) === 0));
   env.define(
     'positive?',
-    makePredicateProcedure('positive?', (value) => expectNumber(value, 'positive?') > 0),
+    makePredicateProcedure('positive?', (value) => compareNumbers(expectNumber(value, 'positive?'), exactNumber(0)) > 0),
   );
   env.define(
     'negative?',
-    makePredicateProcedure('negative?', (value) => expectNumber(value, 'negative?') < 0),
+    makePredicateProcedure('negative?', (value) => compareNumbers(expectNumber(value, 'negative?'), exactNumber(0)) < 0),
   );
   env.define('odd?', makeBuiltinProcedure('odd?', (args) => applyOddPredicate(args)));
   env.define('even?', makeBuiltinProcedure('even?', (args) => applyEvenPredicate(args)));
@@ -335,11 +348,37 @@ function createGlobalEnvironment(output: string[]): Environment {
 
   env.define('string?', makePredicateProcedure('string?', (value) => value.kind === 'string'));
   env.define('number?', makePredicateProcedure('number?', (value) => value.kind === 'number'));
+  env.define(
+    'integer?',
+    makePredicateProcedure('integer?', (value) => value.kind === 'number' && isIntegerNumber(value.value)),
+  );
+  env.define(
+    'rational?',
+    makePredicateProcedure('rational?', (value) => value.kind === 'number' && isRationalNumber(value.value)),
+  );
+  env.define(
+    'exact?',
+    makePredicateProcedure('exact?', (value) => value.kind === 'number' && value.value.exactness === 'exact'),
+  );
+  env.define(
+    'inexact?',
+    makePredicateProcedure('inexact?', (value) => value.kind === 'number' && value.value.exactness === 'inexact'),
+  );
   env.define('boolean?', makePredicateProcedure('boolean?', (value) => value.kind === 'boolean'));
   env.define('pair?', makePredicateProcedure('pair?', (value) => value.kind === 'pair'));
   env.define('symbol?', makePredicateProcedure('symbol?', (value) => value.kind === 'symbol'));
   env.define('list?', makePredicateProcedure('list?', (value) => isProperList(value)));
   env.define('char?', makePredicateProcedure('char?', (value) => value.kind === 'char'));
+  env.define(
+    'exact->inexact',
+    makeBuiltinProcedure('exact->inexact', (args) => applyExactToInexact(args)),
+  );
+  env.define(
+    'inexact->exact',
+    makeBuiltinProcedure('inexact->exact', (args) => applyInexactToExact(args)),
+  );
+  env.define('numerator', makeBuiltinProcedure('numerator', (args) => applyNumerator(args)));
+  env.define('denominator', makeBuiltinProcedure('denominator', (args) => applyDenominator(args)));
 
   return env;
 }
@@ -626,6 +665,7 @@ function matchPattern(
 
   switch (pattern.kind) {
     case 'number':
+      return input.kind === 'number' && sameNumberRepresentation(input.value, pattern.value);
     case 'boolean':
     case 'string':
     case 'char':
@@ -1057,6 +1097,7 @@ function syntaxEqual(left: Expr, right: Expr): boolean {
 
   switch (left.kind) {
     case 'number':
+      return sameNumberRepresentation(left.value, (right as typeof left).value);
     case 'boolean':
     case 'string':
     case 'char':
@@ -1669,21 +1710,21 @@ function applyEqual(args: SchemeValue[]): SchemeValue {
 
 function applyAbs(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('abs', args, 1);
-  return numberValue(Math.abs(expectNumber(args[0], 'abs')));
+  return numberValue(absNumber(expectNumber(args[0], 'abs')));
 }
 
 function applyQuotient(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('quotient', args, 2);
   const [dividend, divisor] = args.map((arg) => expectInteger(arg, 'quotient'));
   ensureNonZeroDivisor(divisor);
-  return numberValue(Math.trunc(dividend / divisor));
+  return exactIntegerValue(Math.trunc(dividend / divisor));
 }
 
 function applyRemainder(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('remainder', args, 2);
   const [dividend, divisor] = args.map((arg) => expectInteger(arg, 'remainder'));
   ensureNonZeroDivisor(divisor);
-  return numberValue(dividend % divisor);
+  return exactIntegerValue(dividend % divisor);
 }
 
 function applyModulo(args: SchemeValue[]): SchemeValue {
@@ -1693,29 +1734,29 @@ function applyModulo(args: SchemeValue[]): SchemeValue {
 
   const remainder = dividend % divisor;
   if (remainder === 0) {
-    return numberValue(0);
+    return exactIntegerValue(0);
   }
 
-  return numberValue(
+  return exactIntegerValue(
     Math.sign(remainder) === Math.sign(divisor) ? remainder : remainder + divisor,
   );
 }
 
 function applyMin(args: SchemeValue[]): SchemeValue {
   expectAtLeastArgCount('min', args, 1);
-  return numberValue(Math.min(...asNumbers(args, 'min')));
+  return numberValue(minNumber(asNumbers(args, 'min')));
 }
 
 function applyMax(args: SchemeValue[]): SchemeValue {
   expectAtLeastArgCount('max', args, 1);
-  return numberValue(Math.max(...asNumbers(args, 'max')));
+  return numberValue(maxNumber(asNumbers(args, 'max')));
 }
 
 function applyExpt(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('expt', args, 2);
   const base = expectNumber(args[0], 'expt');
   const exponent = expectInteger(args[1], 'expt');
-  return numberValue(base ** exponent);
+  return numberValue(exptNumber(base, exponent));
 }
 
 function applyOddPredicate(args: SchemeValue[]): SchemeValue {
@@ -1750,7 +1791,7 @@ function applyNullPredicate(args: SchemeValue[]): SchemeValue {
 
 function applyLength(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('length', args, 1);
-  return numberValue(expectList(args[0], 'length').length);
+  return exactIntegerValue(expectList(args[0], 'length').length);
 }
 
 function applyListRef(args: SchemeValue[]): SchemeValue {
@@ -1879,7 +1920,7 @@ function applyStringAppend(args: SchemeValue[]): SchemeValue {
 
 function applyStringLength(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('string-length', args, 1);
-  return numberValue(readStringChars(expectString(args[0], 'string-length')).length);
+  return exactIntegerValue(readStringChars(expectString(args[0], 'string-length')).length);
 }
 
 function applyStringCopy(args: SchemeValue[]): SchemeValue {
@@ -1930,6 +1971,28 @@ function applyStringToNumber(args: SchemeValue[]): SchemeValue {
 function applyNumberToString(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('number->string', args, 1);
   return stringValue(formatNumber(expectNumber(args[0], 'number->string')));
+}
+
+function applyExactToInexact(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('exact->inexact', args, 1);
+  return numberValue(exactToInexact(expectNumber(args[0], 'exact->inexact')));
+}
+
+function applyInexactToExact(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('inexact->exact', args, 1);
+  return numberValue(inexactToExact(expectNumber(args[0], 'inexact->exact')));
+}
+
+function applyNumerator(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('numerator', args, 1);
+  const exact = toExactNumber(expectNumber(args[0], 'numerator'));
+  return exactIntegerValue(exact.numerator);
+}
+
+function applyDenominator(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('denominator', args, 1);
+  const exact = toExactNumber(expectNumber(args[0], 'denominator'));
+  return exactIntegerValue(exact.denominator);
 }
 
 function applySymbolToString(args: SchemeValue[]): SchemeValue {
@@ -2015,11 +2078,11 @@ function applyCharLess(args: SchemeValue[]): SchemeValue {
   return booleanValue(compareCharChain(args, (left, right) => left < right, 'char<?'));
 }
 
-function asNumbers(args: SchemeValue[], name: string): number[] {
+function asNumbers(args: SchemeValue[], name: string): SchemeNumber[] {
   return args.map((arg) => expectNumber(arg, name));
 }
 
-function expectNumber(value: SchemeValue, name: string): number {
+function expectNumber(value: SchemeValue, name: string): SchemeNumber {
   if (value.kind !== 'number') {
     throw new EvalError(`${name} expected numbers`);
   }
@@ -2029,11 +2092,11 @@ function expectNumber(value: SchemeValue, name: string): number {
 
 function expectInteger(value: SchemeValue, name: string): number {
   const number = expectNumber(value, name);
-  if (!Number.isInteger(number)) {
+  if (!isIntegerNumber(number)) {
     throw new EvalError(`${name} expected an integer`);
   }
 
-  return number;
+  return numberToJs(number);
 }
 
 function expectString(value: SchemeValue, name: string): string {
@@ -2082,11 +2145,11 @@ function expectPair(value: SchemeValue, name: string): PairValue {
 
 function expectIndex(value: SchemeValue, name: string): number {
   const number = expectNumber(value, name);
-  if (!Number.isInteger(number) || number < 0) {
+  if (!isIntegerNumber(number) || compareNumbers(number, exactNumber(0)) < 0) {
     throw new EvalError(`${name} expected a non-negative integer`);
   }
 
-  return number;
+  return numberToJs(number);
 }
 
 function expectList(value: SchemeValue, name: string): SchemeValue[] {
@@ -2137,8 +2200,8 @@ function expectAtLeastArgCount(name: string, values: ArrayLike<unknown>, minimum
   }
 }
 
-function sum(values: number[]): number {
-  return values.reduce((total, value) => total + value, 0);
+function sum(values: SchemeNumber[]): SchemeNumber {
+  return values.reduce((total, value) => addNumbers(total, value), exactNumber(0));
 }
 
 function ensureNonZeroDivisor(value: number): void {
@@ -2147,51 +2210,43 @@ function ensureNonZeroDivisor(value: number): void {
   }
 }
 
-function subtract(values: number[]): number {
+function subtract(values: SchemeNumber[]): SchemeNumber {
   expectAtLeastArgCount('-', values, 1);
   if (values.length === 1) {
-    return -values[0];
+    return negateNumber(values[0]);
   }
 
-  return values.slice(1).reduce((total, value) => total - value, values[0]);
+  return values.slice(1).reduce((total, value) => subtractNumbers(total, value), values[0]);
 }
 
-function product(values: number[]): number {
-  return values.reduce((total, value) => total * value, 1);
+function product(values: SchemeNumber[]): SchemeNumber {
+  return values.reduce((total, value) => multiplyNumbers(total, value), exactNumber(1));
 }
 
-function divide(values: number[]): number {
+function divide(values: SchemeNumber[]): SchemeNumber {
   expectAtLeastArgCount('/', values, 1);
 
   if (values.length === 1) {
-    return checkedDivision(1, values[0]);
+    return divideNumbers(exactNumber(1), values[0]);
   }
 
   let result = values[0];
   for (const value of values.slice(1)) {
-    result = checkedDivision(result, value);
+    result = divideNumbers(result, value);
   }
 
   return result;
 }
 
-function checkedDivision(left: number, right: number): number {
-  if (right === 0) {
-    throw new EvalError('division by zero');
-  }
-
-  return left / right;
-}
-
 function compareChain(
-  values: number[],
-  predicate: (left: number, right: number) => boolean,
+  values: SchemeNumber[],
+  predicate: (comparison: number) => boolean,
   name: string,
 ): boolean {
   expectAtLeastArgCount(name, values, 2);
 
   for (let index = 0; index < values.length - 1; index += 1) {
-    if (!predicate(values[index], values[index + 1])) {
+    if (!predicate(compareNumbers(values[index], values[index + 1]))) {
       return false;
     }
   }
@@ -2311,12 +2366,20 @@ function formatDisplayPair(pair: PairValue): string {
   return `(${parts.join(' ')} . ${formatDisplayValue(current)})`;
 }
 
-function formatNumber(value: number): string {
-  if (Object.is(value, -0)) {
-    return '0';
+function formatNumber(value: SchemeNumber): string {
+  if (value.exactness === 'exact') {
+    if (value.denominator === 1) {
+      return String(value.numerator);
+    }
+
+    return `${value.numerator}/${value.denominator}`;
   }
 
-  return Number.isInteger(value) ? String(Math.trunc(value)) : String(value);
+  if (Object.is(value.value, -0)) {
+    return '0.0';
+  }
+
+  return Number.isInteger(value.value) ? `${Math.trunc(value.value)}.0` : String(value.value);
 }
 
 function formatChar(value: string): string {
@@ -2360,6 +2423,7 @@ function schemeEq(left: SchemeValue, right: SchemeValue): boolean {
 
   switch (left.kind) {
     case 'number':
+      return compareNumbers(left.value, (right as typeof left).value) === 0;
     case 'boolean':
     case 'char':
     case 'symbol':
@@ -2381,6 +2445,7 @@ function schemeEqual(left: SchemeValue, right: SchemeValue): boolean {
 
   switch (left.kind) {
     case 'number':
+      return compareNumbers(left.value, (right as typeof left).value) === 0;
     case 'boolean':
     case 'char':
     case 'symbol':
@@ -2400,8 +2465,12 @@ function schemeEqual(left: SchemeValue, right: SchemeValue): boolean {
   }
 }
 
-function numberValue(value: number): NumberValue {
+function numberValue(value: SchemeNumber): NumberValue {
   return { kind: 'number', value };
+}
+
+function exactIntegerValue(value: number): NumberValue {
+  return numberValue(exactNumber(value));
 }
 
 function booleanValue(value: boolean): BooleanValue {
@@ -2523,16 +2592,8 @@ function readStringChars(value: string): string[] {
   return Array.from(value);
 }
 
-function parseStringToNumber(value: string): number | undefined {
-  if (/^[+-]?\d+$/u.test(value)) {
-    return Number(value);
-  }
-
-  if (/^[+-]?(?:\d+\.\d*|\d*\.\d+)$/u.test(value)) {
-    return Number(value);
-  }
-
-  return undefined;
+function parseStringToNumber(value: string): SchemeNumber | undefined {
+  return parseNumericLiteral(value);
 }
 
 function readAtomToken(
@@ -2583,8 +2644,9 @@ function tokenFromAtom(raw: string, location: SourceLocation): Token {
     return { kind: 'char', value: parseCharLiteral(raw, location), location };
   }
 
-  if (/^[+-]?\d+$/u.test(raw) && raw !== '+' && raw !== '-') {
-    return { kind: 'number', value: Number(raw), location };
+  const number = parseNumericLiteral(raw);
+  if (number !== undefined) {
+    return { kind: 'number', value: number, location };
   }
 
   return { kind: 'symbol', value: raw, location };
@@ -2606,6 +2668,252 @@ function parseCharLiteral(raw: string, location: SourceLocation): string {
   }
 
   throw new EvalError('invalid character literal', location);
+}
+
+function parseNumericLiteral(raw: string): SchemeNumber | undefined {
+  if (raw === '+' || raw === '-' || raw === '.') {
+    return undefined;
+  }
+
+  if (/^[+-]?\d+$/u.test(raw)) {
+    return exactNumber(Number(raw));
+  }
+
+  const rationalMatch = raw.match(/^([+-]?\d+)\/(\d+)$/u);
+  if (rationalMatch !== null) {
+    return exactNumber(Number(rationalMatch[1]), Number(rationalMatch[2]));
+  }
+
+  if (/^[+-]?(?:\d+\.\d*|\d*\.\d+)$/u.test(raw)) {
+    return inexactNumber(Number(raw));
+  }
+
+  return undefined;
+}
+
+function exactNumber(numerator: number, denominator = 1): ExactSchemeNumber {
+  if (!Number.isInteger(numerator) || !Number.isInteger(denominator)) {
+    throw new EvalError('exact numbers require integer components');
+  }
+
+  if (denominator === 0) {
+    throw new EvalError('division by zero');
+  }
+
+  if (numerator === 0) {
+    return { exactness: 'exact', numerator: 0, denominator: 1 };
+  }
+
+  let normalizedNumerator = numerator;
+  let normalizedDenominator = denominator;
+  if (normalizedDenominator < 0) {
+    normalizedNumerator = -normalizedNumerator;
+    normalizedDenominator = -normalizedDenominator;
+  }
+
+  const divisor = greatestCommonDivisor(Math.abs(normalizedNumerator), normalizedDenominator);
+  return {
+    exactness: 'exact',
+    numerator: normalizedNumerator / divisor,
+    denominator: normalizedDenominator / divisor,
+  };
+}
+
+function inexactNumber(value: number): InexactSchemeNumber {
+  return { exactness: 'inexact', value };
+}
+
+function greatestCommonDivisor(left: number, right: number): number {
+  let a = Math.abs(left);
+  let b = Math.abs(right);
+
+  while (b !== 0) {
+    const remainder = a % b;
+    a = b;
+    b = remainder;
+  }
+
+  return a === 0 ? 1 : a;
+}
+
+function numberToJs(value: SchemeNumber): number {
+  return value.exactness === 'exact' ? value.numerator / value.denominator : value.value;
+}
+
+function isIntegerNumber(value: SchemeNumber): boolean {
+  return value.exactness === 'exact' ? value.denominator === 1 : Number.isInteger(value.value);
+}
+
+function isRationalNumber(value: SchemeNumber): boolean {
+  return value.exactness === 'exact' || Number.isFinite(value.value);
+}
+
+function toExactNumber(value: SchemeNumber): ExactSchemeNumber {
+  if (value.exactness === 'exact') {
+    return value;
+  }
+
+  if (!Number.isFinite(value.value)) {
+    throw new EvalError('expected a finite number');
+  }
+
+  const raw = value.value.toString();
+  const match = raw.match(/^([+-]?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/u);
+  if (match === null) {
+    throw new EvalError('unable to convert inexact number to exact');
+  }
+
+  const sign = match[1] === '-' ? -1 : 1;
+  const integerPart = match[2] ?? '0';
+  const fractionalPart = match[3] ?? '';
+  const exponent = Number(match[4] ?? '0');
+  const digits = `${integerPart}${fractionalPart}`.replace(/^0+(?=\d)/u, '');
+  let numerator = sign * Number(digits === '' ? '0' : digits);
+  let denominator = 10 ** fractionalPart.length;
+
+  if (exponent > 0) {
+    numerator *= 10 ** exponent;
+  } else if (exponent < 0) {
+    denominator *= 10 ** -exponent;
+  }
+
+  return exactNumber(numerator, denominator);
+}
+
+function exactToInexact(value: SchemeNumber): SchemeNumber {
+  if (value.exactness === 'inexact') {
+    return value;
+  }
+
+  return inexactNumber(value.numerator / value.denominator);
+}
+
+function inexactToExact(value: SchemeNumber): SchemeNumber {
+  return toExactNumber(value);
+}
+
+function addNumbers(left: SchemeNumber, right: SchemeNumber): SchemeNumber {
+  if (left.exactness === 'exact' && right.exactness === 'exact') {
+    return exactNumber(
+      left.numerator * right.denominator + right.numerator * left.denominator,
+      left.denominator * right.denominator,
+    );
+  }
+
+  return inexactNumber(numberToJs(left) + numberToJs(right));
+}
+
+function subtractNumbers(left: SchemeNumber, right: SchemeNumber): SchemeNumber {
+  return addNumbers(left, negateNumber(right));
+}
+
+function negateNumber(value: SchemeNumber): SchemeNumber {
+  return value.exactness === 'exact'
+    ? exactNumber(-value.numerator, value.denominator)
+    : inexactNumber(-value.value);
+}
+
+function absNumber(value: SchemeNumber): SchemeNumber {
+  return value.exactness === 'exact'
+    ? exactNumber(Math.abs(value.numerator), value.denominator)
+    : inexactNumber(Math.abs(value.value));
+}
+
+function multiplyNumbers(left: SchemeNumber, right: SchemeNumber): SchemeNumber {
+  if (left.exactness === 'exact' && right.exactness === 'exact') {
+    return exactNumber(left.numerator * right.numerator, left.denominator * right.denominator);
+  }
+
+  return inexactNumber(numberToJs(left) * numberToJs(right));
+}
+
+function divideNumbers(left: SchemeNumber, right: SchemeNumber): SchemeNumber {
+  if (compareNumbers(right, exactNumber(0)) === 0) {
+    throw new EvalError('division by zero');
+  }
+
+  if (left.exactness === 'exact' && right.exactness === 'exact') {
+    return exactNumber(left.numerator * right.denominator, left.denominator * right.numerator);
+  }
+
+  return inexactNumber(numberToJs(left) / numberToJs(right));
+}
+
+function compareNumbers(left: SchemeNumber, right: SchemeNumber): number {
+  if (left.exactness === 'exact' && right.exactness === 'exact') {
+    const leftScaled = left.numerator * right.denominator;
+    const rightScaled = right.numerator * left.denominator;
+    if (leftScaled < rightScaled) {
+      return -1;
+    }
+
+    if (leftScaled > rightScaled) {
+      return 1;
+    }
+
+    return 0;
+  }
+
+  const leftValue = numberToJs(left);
+  const rightValue = numberToJs(right);
+  if (leftValue < rightValue) {
+    return -1;
+  }
+
+  if (leftValue > rightValue) {
+    return 1;
+  }
+
+  return 0;
+}
+
+function sameNumberRepresentation(left: SchemeNumber, right: SchemeNumber): boolean {
+  if (left.exactness !== right.exactness) {
+    return false;
+  }
+
+  if (left.exactness === 'exact') {
+    const exactRight = right as ExactSchemeNumber;
+    return left.numerator === exactRight.numerator && left.denominator === exactRight.denominator;
+  }
+
+  const inexactRight = right as InexactSchemeNumber;
+  return Object.is(left.value, inexactRight.value);
+}
+
+function minNumber(values: SchemeNumber[]): SchemeNumber {
+  let result = values[0];
+  for (const value of values.slice(1)) {
+    if (compareNumbers(value, result) < 0) {
+      result = value;
+    }
+  }
+  return result;
+}
+
+function maxNumber(values: SchemeNumber[]): SchemeNumber {
+  let result = values[0];
+  for (const value of values.slice(1)) {
+    if (compareNumbers(value, result) > 0) {
+      result = value;
+    }
+  }
+  return result;
+}
+
+function exptNumber(base: SchemeNumber, exponent: number): SchemeNumber {
+  if (base.exactness === 'exact') {
+    if (exponent === 0) {
+      return exactNumber(1);
+    }
+
+    const magnitude = Math.abs(exponent);
+    const numerator = base.numerator ** magnitude;
+    const denominator = base.denominator ** magnitude;
+    return exponent > 0 ? exactNumber(numerator, denominator) : exactNumber(denominator, numerator);
+  }
+
+  return inexactNumber(numberToJs(base) ** exponent);
 }
 
 function advanceLocation(char: string, line: number, column: number): SourceLocation {
