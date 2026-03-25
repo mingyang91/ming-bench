@@ -82,7 +82,8 @@ type environment struct {
 	smallNames  [4]string
 	smallValues [4]*binding
 	smallCount  int
-	macros      map[string]*syntaxRulesMacro
+	macros      map[string]macroTransformer
+	syntaxDefEnv *environment
 }
 
 func evalString(input string) (string, error) {
@@ -242,13 +243,21 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("call/cc", callCCBuiltin)
 	env.define("call-with-current-continuation", callCCBuiltin)
 	env.define("dynamic-wind", dynamicWindBuiltin)
+	env.define("syntax->datum", builtinSyntaxToDatum())
+	env.define("datum->syntax", builtinDatumToSyntax())
+	env.define("identifier?", builtinIdentifierPredicate())
+	env.define("free-identifier=?", builtinFreeIdentifierEqual())
 	return env
 }
 
 func newEnvironment(parent *environment) *environment {
-	return &environment{
+	env := &environment{
 		parent: parent,
 	}
+	if parent != nil {
+		env.syntaxDefEnv = parent.syntaxDefEnv
+	}
+	return env
 }
 
 func (e *environment) define(name string, val value) {
@@ -2531,6 +2540,10 @@ func formatValue(v value) (string, error) {
 		return "#<record " + v.recordType.name + ">", nil
 	case builtinProc, *closureValue, *caseClosureValue, *continuationValue, *callCCProcValue, *dynamicWindProcValue, *raiseProcValue, *withExceptionHandlerProcValue:
 		return "#<procedure>", nil
+	case *syntaxValue:
+		return "#<syntax>", nil
+	case *repeatedSyntaxValue:
+		return "#<syntax-list>", nil
 	case *pairValue:
 		return formatPair(v, formatValue)
 	case listValue:
@@ -2891,6 +2904,8 @@ func nodePos(expr node) sourcePos {
 	switch expr := expr.(type) {
 	case listNode:
 		return expr.pos
+	case dottedListNode:
+		return expr.pos
 	case vectorNode:
 		return expr.pos
 	case symbolNode:
@@ -2937,6 +2952,9 @@ func (p *parser) parseExpr() (node, error) {
 	case ')':
 		return nil, errorAt(p.currentPos(), "unexpected )")
 	case '#':
+		if p.hasPrefix("#'") {
+			return p.parseSyntaxQuote()
+		}
 		if p.hasPrefix("#(") {
 			return p.parseVector()
 		}
@@ -2983,6 +3001,9 @@ func (p *parser) parseDatum() (node, error) {
 	case ')':
 		return nil, errorAt(p.currentPos(), "unexpected )")
 	case '#':
+		if p.hasPrefix("#'") {
+			return p.parseSyntaxQuote()
+		}
 		if p.hasPrefix("#(") {
 			return p.parseVector()
 		}
@@ -3057,6 +3078,22 @@ func (p *parser) parseQuote() (node, error) {
 	return listNode{
 		elements: []node{
 			symbolNode{name: "quote", pos: pos},
+			expr,
+		},
+		pos: pos,
+	}, nil
+}
+
+func (p *parser) parseSyntaxQuote() (node, error) {
+	pos := p.currentPos()
+	p.offset += 2
+	expr, err := p.parseDatum()
+	if err != nil {
+		return nil, err
+	}
+	return listNode{
+		elements: []node{
+			symbolNode{name: "syntax", pos: pos},
 			expr,
 		},
 		pos: pos,

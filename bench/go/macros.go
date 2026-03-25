@@ -2,6 +2,10 @@ package ming
 
 import "fmt"
 
+type macroTransformer interface {
+	expand(call listNode) (node, error)
+}
+
 type syntaxRulesMacro struct {
 	keyword  string
 	literals map[string]struct{}
@@ -23,6 +27,7 @@ type templateContext struct {
 	macro      *syntaxRulesMacro
 	match      *macroMatch
 	introduced map[string]string
+	locals     map[string]struct{}
 }
 
 var macroKeywordNames = map[string]struct{}{
@@ -45,7 +50,10 @@ var macroKeywordNames = map[string]struct{}{
 	"or":                 {},
 	"quote":              {},
 	"set!":               {},
+	"syntax":             {},
+	"syntax-case":        {},
 	"syntax-rules":       {},
+	"with-syntax":        {},
 }
 
 var macroGensymCounter int
@@ -60,13 +68,45 @@ func evalDefineSyntax(args []node, env *environment) (value, error) {
 		return nil, &EvalError{Message: "define-syntax requires a symbol"}
 	}
 
-	transformer, err := parseSyntaxRules(nameNode.name, args[1], env)
+	if transformer, ok, err := parseSyntaxRulesMacro(nameNode.name, args[1], env); err != nil {
+		return nil, err
+	} else if ok {
+		env.defineMacro(nameNode.name, transformer)
+		return voidValue{}, nil
+	}
+
+	transformerValue, err := eval(args[1], env)
 	if err != nil {
 		return nil, err
 	}
+	if !isProcedureValue(transformerValue) {
+		return nil, &EvalError{Message: "define-syntax transformer must be a procedure"}
+	}
 
-	env.defineMacro(nameNode.name, transformer)
+	env.defineMacro(nameNode.name, &procedureMacro{
+		keyword:       nameNode.name,
+		proc:          transformerValue,
+		definitionEnv: snapshotEnvironment(env),
+	})
 	return voidValue{}, nil
+}
+
+func parseSyntaxRulesMacro(keyword string, expr node, env *environment) (*syntaxRulesMacro, bool, error) {
+	form, ok := expr.(listNode)
+	if !ok || len(form.elements) == 0 {
+		return nil, false, nil
+	}
+
+	head, ok := symbolName(form.elements[0])
+	if !ok || head != "syntax-rules" {
+		return nil, false, nil
+	}
+
+	transformer, err := parseSyntaxRules(keyword, expr, env)
+	if err != nil {
+		return nil, false, err
+	}
+	return transformer, true, nil
 }
 
 func expandMacros(expr node, env *environment) (node, error) {
@@ -152,18 +192,18 @@ func parseSyntaxRules(keyword string, expr node, env *environment) (*syntaxRules
 		keyword:  keyword,
 		literals: literals,
 		rules:    rules,
-		env:      env,
+		env:      snapshotEnvironment(env),
 	}, nil
 }
 
-func (e *environment) defineMacro(name string, macro *syntaxRulesMacro) {
+func (e *environment) defineMacro(name string, macro macroTransformer) {
 	if e.macros == nil {
-		e.macros = map[string]*syntaxRulesMacro{}
+		e.macros = map[string]macroTransformer{}
 	}
 	e.macros[name] = macro
 }
 
-func (e *environment) lookupMacro(name string) (*syntaxRulesMacro, bool) {
+func (e *environment) lookupMacro(name string) (macroTransformer, bool) {
 	for current := e; current != nil; current = current.parent {
 		if current.macros != nil {
 			transformer, ok := current.macros[name]
@@ -173,6 +213,45 @@ func (e *environment) lookupMacro(name string) (*syntaxRulesMacro, bool) {
 		}
 	}
 	return nil, false
+}
+
+func snapshotEnvironment(env *environment) *environment {
+	snapshot := newEnvironment(nil)
+	seenBindings := map[string]struct{}{}
+	seenMacros := map[string]struct{}{}
+
+	for current := env; current != nil; current = current.parent {
+		for i := 0; i < current.smallCount; i++ {
+			name := current.smallNames[i]
+			if _, ok := seenBindings[name]; ok {
+				continue
+			}
+			snapshot.defineBinding(name, current.smallValues[i])
+			seenBindings[name] = struct{}{}
+		}
+
+		if current.values != nil {
+			for name, cell := range current.values {
+				if _, ok := seenBindings[name]; ok {
+					continue
+				}
+				snapshot.defineBinding(name, cell)
+				seenBindings[name] = struct{}{}
+			}
+		}
+
+		if current.macros != nil {
+			for name, transformer := range current.macros {
+				if _, ok := seenMacros[name]; ok {
+					continue
+				}
+				snapshot.defineMacro(name, transformer)
+				seenMacros[name] = struct{}{}
+			}
+		}
+	}
+
+	return snapshot
 }
 
 func (m *syntaxRulesMacro) expand(call listNode) (node, error) {
@@ -186,6 +265,7 @@ func (m *syntaxRulesMacro) expand(call listNode) (node, error) {
 			macro:      m,
 			match:      match,
 			introduced: map[string]string{},
+			locals:     collectTemplateLocals(rule.template),
 		}
 		return ctx.instantiate(rule.template, -1)
 	}
@@ -214,7 +294,7 @@ func (m *syntaxRulesMacro) matchPattern(pattern node, expr node, captures *macro
 
 		if m.isLiteral(pattern.name) {
 			other, ok := expr.(symbolNode)
-			return ok && other.name == pattern.name
+			return ok && freeIdentifierEqualNodes(pattern, other)
 		}
 
 		if repeated {
@@ -325,7 +405,7 @@ func (m *macroMatch) clone() *macroMatch {
 
 func (ctx *templateContext) instantiate(template node, repeatIndex int) (node, error) {
 	switch template := template.(type) {
-	case integerValue, booleanValue, stringValue, charValue:
+	case integerValue, rationalValue, inexactValue, booleanValue, stringValue, charValue:
 		return template, nil
 	case symbolNode:
 		if template.name == "..." {
@@ -345,6 +425,10 @@ func (ctx *templateContext) instantiate(template node, repeatIndex int) (node, e
 
 		return ctx.introducedSymbol(template), nil
 	case listNode:
+		if isQuotedSyntaxForm(template) {
+			return cloneNode(template), nil
+		}
+
 		elements := make([]node, 0, len(template.elements))
 		for i := 0; i < len(template.elements); i++ {
 			if i+1 < len(template.elements) && isEllipsisNode(template.elements[i+1]) {
@@ -365,6 +449,51 @@ func (ctx *templateContext) instantiate(template node, repeatIndex int) (node, e
 		}
 
 		return listNode{elements: elements, pos: template.pos}, nil
+	case dottedListNode:
+		elements := make([]node, 0, len(template.elements))
+		for i := 0; i < len(template.elements); i++ {
+			if i+1 < len(template.elements) && isEllipsisNode(template.elements[i+1]) {
+				repeated, err := ctx.instantiateRepeated(template.elements[i])
+				if err != nil {
+					return nil, err
+				}
+				elements = append(elements, repeated...)
+				i++
+				continue
+			}
+
+			element, err := ctx.instantiate(template.elements[i], repeatIndex)
+			if err != nil {
+				return nil, err
+			}
+			elements = append(elements, element)
+		}
+
+		tail, err := ctx.instantiate(template.tail, repeatIndex)
+		if err != nil {
+			return nil, err
+		}
+		return dottedListNode{elements: elements, tail: tail, pos: template.pos}, nil
+	case vectorNode:
+		elements := make([]node, 0, len(template.elements))
+		for i := 0; i < len(template.elements); i++ {
+			if i+1 < len(template.elements) && isEllipsisNode(template.elements[i+1]) {
+				repeated, err := ctx.instantiateRepeated(template.elements[i])
+				if err != nil {
+					return nil, err
+				}
+				elements = append(elements, repeated...)
+				i++
+				continue
+			}
+
+			element, err := ctx.instantiate(template.elements[i], repeatIndex)
+			if err != nil {
+				return nil, err
+			}
+			elements = append(elements, element)
+		}
+		return vectorNode{elements: elements, pos: template.pos}, nil
 	default:
 		return nil, &EvalError{Message: "invalid syntax template"}
 	}
@@ -405,6 +534,15 @@ func (ctx *templateContext) introducedSymbol(sym symbolNode) symbolNode {
 		return symbolNode{name: sym.name, pos: sym.pos}
 	}
 
+	if _, ok := ctx.locals[sym.name]; ok {
+		renamed, ok := ctx.introduced[sym.name]
+		if !ok {
+			renamed = nextMacroName(sym.name)
+			ctx.introduced[sym.name] = renamed
+		}
+		return symbolNode{name: renamed, pos: sym.pos}
+	}
+
 	if _, ok := ctx.macro.env.lookupMacro(sym.name); ok {
 		return symbolNode{name: sym.name, pos: sym.pos}
 	}
@@ -413,17 +551,12 @@ func (ctx *templateContext) introducedSymbol(sym symbolNode) symbolNode {
 		return symbolNode{name: sym.name, pos: sym.pos, captured: binding}
 	}
 
-	renamed, ok := ctx.introduced[sym.name]
-	if !ok {
-		renamed = nextMacroName(sym.name)
-		ctx.introduced[sym.name] = renamed
-	}
-	return symbolNode{name: renamed, pos: sym.pos}
+	return symbolNode{name: sym.name, pos: sym.pos}
 }
 
 func cloneNode(expr node) node {
 	switch expr := expr.(type) {
-	case integerValue, booleanValue, stringValue, charValue:
+	case integerValue, rationalValue, inexactValue, booleanValue, stringValue, charValue:
 		return expr
 	case symbolNode:
 		return symbolNode{
@@ -447,6 +580,12 @@ func cloneNode(expr node) node {
 			tail:     cloneNode(expr.tail),
 			pos:      expr.pos,
 		}
+	case vectorNode:
+		elements := make([]node, len(expr.elements))
+		for i, element := range expr.elements {
+			elements[i] = cloneNode(element)
+		}
+		return vectorNode{elements: elements, pos: expr.pos}
 	default:
 		return nil
 	}
@@ -456,6 +595,12 @@ func syntaxEqual(left node, right node) bool {
 	switch left := left.(type) {
 	case integerValue:
 		right, ok := right.(integerValue)
+		return ok && left == right
+	case rationalValue:
+		right, ok := right.(rationalValue)
+		return ok && left == right
+	case inexactValue:
+		right, ok := right.(inexactValue)
 		return ok && left == right
 	case booleanValue:
 		right, ok := right.(booleanValue)
@@ -468,7 +613,7 @@ func syntaxEqual(left node, right node) bool {
 		return ok && left == right
 	case symbolNode:
 		right, ok := right.(symbolNode)
-		return ok && left.name == right.name
+		return ok && freeIdentifierEqualNodes(left, right)
 	case listNode:
 		right, ok := right.(listNode)
 		if !ok || len(left.elements) != len(right.elements) {
@@ -491,6 +636,17 @@ func syntaxEqual(left node, right node) bool {
 			}
 		}
 		return syntaxEqual(left.tail, right.tail)
+	case vectorNode:
+		right, ok := right.(vectorNode)
+		if !ok || len(left.elements) != len(right.elements) {
+			return false
+		}
+		for i, element := range left.elements {
+			if !syntaxEqual(element, right.elements[i]) {
+				return false
+			}
+		}
+		return true
 	default:
 		return false
 	}
@@ -506,12 +662,119 @@ func collectRepeatedTemplateVars(expr node, match *macroMatch, names map[string]
 		for _, element := range expr.elements {
 			collectRepeatedTemplateVars(element, match, names)
 		}
+	case dottedListNode:
+		for _, element := range expr.elements {
+			collectRepeatedTemplateVars(element, match, names)
+		}
+		collectRepeatedTemplateVars(expr.tail, match, names)
+	case vectorNode:
+		for _, element := range expr.elements {
+			collectRepeatedTemplateVars(element, match, names)
+		}
 	}
 }
 
 func isEllipsisNode(expr node) bool {
 	name, ok := symbolName(expr)
 	return ok && name == "..."
+}
+
+func isQuotedSyntaxForm(expr listNode) bool {
+	if len(expr.elements) != 2 {
+		return false
+	}
+
+	name, ok := symbolName(expr.elements[0])
+	return ok && name == "quote"
+}
+
+func collectTemplateLocals(expr node) map[string]struct{} {
+	locals := map[string]struct{}{}
+	collectTemplateLocalsInto(expr, locals)
+	return locals
+}
+
+func collectTemplateLocalsInto(expr node, locals map[string]struct{}) {
+	switch expr := expr.(type) {
+	case listNode:
+		if isQuotedSyntaxForm(expr) {
+			return
+		}
+		if len(expr.elements) > 0 {
+			if name, ok := symbolName(expr.elements[0]); ok {
+				switch name {
+				case "lambda":
+					if len(expr.elements) >= 2 {
+						collectFormalLocals(expr.elements[1], locals)
+					}
+				case "let", "let*", "letrec", "letrec*":
+					bindingIndex := 1
+					if name == "let" && len(expr.elements) >= 3 {
+						if loopName, ok := expr.elements[1].(symbolNode); ok && loopName.name != "." {
+							locals[loopName.name] = struct{}{}
+							bindingIndex = 2
+						}
+					}
+					if len(expr.elements) > bindingIndex {
+						if bindingList, ok := expr.elements[bindingIndex].(listNode); ok {
+							for _, bindingExpr := range bindingList.elements {
+								binding, ok := bindingExpr.(listNode)
+								if !ok || len(binding.elements) == 0 {
+									continue
+								}
+								collectBindingLocal(binding.elements[0], locals)
+							}
+						}
+					}
+				case "define":
+					if len(expr.elements) >= 2 {
+						if target, ok := expr.elements[1].(listNode); ok && len(target.elements) >= 2 {
+							for _, param := range target.elements[1:] {
+								collectBindingLocal(param, locals)
+							}
+						}
+					}
+				}
+			}
+		}
+
+		for _, element := range expr.elements {
+			collectTemplateLocalsInto(element, locals)
+		}
+	case dottedListNode:
+		for _, element := range expr.elements {
+			collectTemplateLocalsInto(element, locals)
+		}
+		collectTemplateLocalsInto(expr.tail, locals)
+	case vectorNode:
+		for _, element := range expr.elements {
+			collectTemplateLocalsInto(element, locals)
+		}
+	}
+}
+
+func collectFormalLocals(formals node, locals map[string]struct{}) {
+	switch formals := formals.(type) {
+	case listNode:
+		for _, param := range formals.elements {
+			collectBindingLocal(param, locals)
+		}
+	case symbolNode:
+		collectBindingLocal(formals, locals)
+	case dottedListNode:
+		for _, param := range formals.elements {
+			collectBindingLocal(param, locals)
+		}
+		collectBindingLocal(formals.tail, locals)
+	}
+}
+
+func collectBindingLocal(expr node, locals map[string]struct{}) {
+	name, ok := symbolName(expr)
+	if !ok || name == "." {
+		return
+	}
+	locals[name] = struct{}{}
 }
 
 func minPatternLength(patternElems []node) int {
