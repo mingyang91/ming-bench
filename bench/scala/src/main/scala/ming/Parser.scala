@@ -43,6 +43,9 @@ object Parser:
       case Token.Atom("quote-sugar", p) :: rest =>
         val (expr, remaining) = parseExpr(rest)
         (withPos(SchemeVal.SList(List(withPos(SchemeVal.Symbol("quote"), p), expr)), p), remaining)
+      case Token.Atom("syntax-sugar", p) :: rest =>
+        val (expr, remaining) = parseExpr(rest)
+        (withPos(SchemeVal.SList(List(withPos(SchemeVal.Symbol("syntax"), p), expr)), p), remaining)
       case Token.Atom(s, p) :: rest =>
         (withPos(parseAtom(s), p), rest)
 

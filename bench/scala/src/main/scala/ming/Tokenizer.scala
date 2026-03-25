@@ -51,6 +51,9 @@ object Tokenizer:
       case '#' if pos + 1 < input.length && input(pos + 1) == '(' =>
         tokens += Token.VecLParen(positions(pos))
         pos + 2
+      case '#' if pos + 1 < input.length && input(pos + 1) == '\'' =>
+        tokens += Token.Atom("syntax-sugar", positions(pos))
+        pos + 2
       case _ =>
         val sb       = new StringBuilder
         val startPos = positions(pos)

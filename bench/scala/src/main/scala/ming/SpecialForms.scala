@@ -127,9 +127,9 @@ object SpecialForms:
 
   def evalDefineSyntax(args: List[SchemeVal], env: Env): Unit =
     args match
-      case SchemeVal.Symbol(name) :: SchemeVal.SList(srElems) :: Nil =>
-        srElems.head match
-          case SchemeVal.Symbol("syntax-rules") =>
+      case SchemeVal.Symbol(name) :: body :: Nil =>
+        body match
+          case SchemeVal.SList(srElems) if srElems.nonEmpty && srElems.head == SchemeVal.Symbol("syntax-rules") =>
             val literals = srElems(1) match
               case SchemeVal.SList(lits) =>
                 lits.map {
@@ -142,7 +142,9 @@ object SpecialForms:
               case _ => throw new EvalError("syntax-rules: expected (pattern template) clause")
             }
             env.define(name, SchemeVal.MacroVal(name, literals, rules, env))
-          case _ => throw new EvalError("define-syntax: expected syntax-rules")
+          case _ =>
+            val proc = Evaluator.eval(body, env)
+            env.define(name, SchemeVal.TransformerVal(proc))
       case _ => throw new EvalError("define-syntax: bad syntax")
 
   def evalCaseLambda(clauses: List[SchemeVal], env: Env): SchemeVal =

@@ -39,6 +39,18 @@ object Macro:
     "unquote-splicing"
   )
 
+  /** Match a full pattern against an input value (used by syntax-case). */
+  def matchPattern(pattern: SchemeVal, input: SchemeVal, literals: List[String]): Option[Bindings] =
+    (pattern, input) match
+      case (SchemeVal.SList(patElems), SchemeVal.SList(inputElems)) =>
+        matchElements(patElems, inputElems, literals)
+      case _ =>
+        matchSingle(pattern, input, literals)
+
+  /** Expand a template with pattern bindings (no hygiene renaming). */
+  def instantiateTemplate(template: SchemeVal, bindings: Bindings): SchemeVal =
+    expandTemplate(template, bindings, Map.empty)
+
   def expand(
     macroName: String,
     literals: List[String],

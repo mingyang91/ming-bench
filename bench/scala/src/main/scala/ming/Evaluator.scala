@@ -41,6 +41,7 @@ object Evaluator:
   private def evalProgram(exprs: List[SchemeVal], env: Env): SchemeVal =
     winders = Nil
     exceptionHandlers = Nil
+    SyntaxCase.patternBindings = Map.empty
     run(evalBodyK(exprs, env, v => Done(v)))
 
   // --- Trampoline (top-level, catches ContinuationThrown) ---
@@ -139,54 +140,14 @@ object Evaluator:
           case SchemeVal.Symbol("begin")        => evalBodyK(elems.tail, env, k)
           case SchemeVal.Symbol("dynamic-wind") => DynamicWind.evalDynamicWindK(elems.tail, env, k)
           case SchemeVal.Symbol("raise") if !env.lookup("raise").exists(isUserDefined) =>
-            if elems.tail.size != 1 then throw new EvalError("raise: expected 1 argument")
-            evalK(
-              elems.tail.head,
-              env,
-              value =>
-                if exceptionHandlers.isEmpty then
-                  throw new EvalError(s"unhandled exception: ${SchemeVal.display(value)}")
-                val handler = exceptionHandlers.head
-                exceptionHandlers = exceptionHandlers.tail
-                handler(value)
-            )
+            ExceptionForms.evalRaiseK(elems.tail, env, k)
           case SchemeVal.Symbol("with-exception-handler")
               if !env.lookup("with-exception-handler").exists(isUserDefined) =>
-            if elems.tail.size != 2 then throw new EvalError("with-exception-handler: expected 2 arguments")
-            evalK(
-              elems.tail(0),
-              env,
-              handlerProc =>
-                evalK(
-                  elems.tail(1),
-                  env,
-                  thunkProc =>
-                    val savedHandlers = exceptionHandlers
-                    val cpsHandler: ExceptionHandler =
-                      value => applyK(handlerProc, List(value), _ => throw new EvalError("raise: handler returned"))
-                    exceptionHandlers = cpsHandler :: exceptionHandlers
-                    applyK(
-                      thunkProc,
-                      Nil,
-                      result =>
-                        exceptionHandlers = savedHandlers
-                        k(result)
-                    )
-                )
-            )
+            ExceptionForms.evalWithExceptionHandlerK(elems.tail, env, k)
           case SchemeVal.Symbol("guard") =>
             Guard.evalGuardK(elems.tail, env, k)
           case SchemeVal.Symbol("call-with-values") if !env.lookup("call-with-values").exists(isUserDefined) =>
-            if elems.tail.size != 2 then throw new EvalError("call-with-values: expected 2 arguments")
-            evalK(elems.tail(0), env, producer =>
-              evalK(elems.tail(1), env, consumer =>
-                applyK(producer, Nil, result =>
-                  result match
-                    case SchemeVal.MultipleValues(vals) => applyK(consumer, vals, k)
-                    case other                         => applyK(consumer, List(other), k)
-                )
-              )
-            )
+            ExceptionForms.evalCallWithValuesK(elems.tail, env, k)
           case SchemeVal.Symbol("let")  => BindingForms.evalLetK(elems.tail, env, k)
           case SchemeVal.Symbol("cond") => BindingForms.evalCondK(elems.tail, env, k)
           case SchemeVal.Symbol("set!") => SpecialForms.evalSetK(elems.tail, env, k)
@@ -202,11 +163,24 @@ object Evaluator:
           case SchemeVal.Symbol("define-record-type") =>
             RecordType.evalDefineRecordType(elems.tail, env)
             k(SchemeVal.Void)
+          case SchemeVal.Symbol("syntax-case") => SyntaxCase.evalSyntaxCaseK(elems.tail, env, k)
+          case SchemeVal.Symbol("syntax") =>
+            if elems.tail.size != 1 then throw new EvalError("syntax: expected 1 argument")
+            k(SyntaxCase.evalSyntax(elems.tail.head))
+          case SchemeVal.Symbol("with-syntax") => SyntaxCase.evalWithSyntaxK(elems.tail, env, k)
           case SchemeVal.Symbol(name) =>
             env.lookup(name) match
               case Some(m: SchemeVal.MacroVal) =>
                 val expanded = Macro.expand(m.name, m.literals, m.rules, m.defEnv, SchemeVal.SList(elems))
                 More(() => evalK(expanded, env, k))
+              case Some(t: SchemeVal.TransformerVal) =>
+                More(() =>
+                  applyK(
+                    t.proc,
+                    List(SchemeVal.SList(elems)),
+                    expanded => More(() => evalK(expanded, env, k))
+                  )
+                )
               case _ => evalApplicationK(elems, expr.pos, env, k)
           case _ => evalApplicationK(elems, expr.pos, env, k)
 

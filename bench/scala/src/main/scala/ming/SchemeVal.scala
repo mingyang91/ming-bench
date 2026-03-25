@@ -26,6 +26,7 @@ enum SchemeVal:
   case CallCCVal()
   case TailCall(expr: SchemeVal, env: Env)
   case MultipleValues(vals: List[SchemeVal])
+  case TransformerVal(proc: SchemeVal)
 
 object SchemeVal:
 
@@ -180,6 +181,7 @@ object SchemeVal:
       case VectorVal(elems)        => "#(" + elems.map(e => displayImpl(e, seen, quoted)).mkString(" ") + ")"
       case TailCall(_, _)          => "#<tailcall>"
       case MultipleValues(vals)    => vals.map(e => displayImpl(e, seen, quoted)).mkString(" ")
+      case TransformerVal(_)       => "#<transformer>"
 
   private class IdentityHashSet:
     private val map                    = new java.util.IdentityHashMap[AnyRef, java.lang.Boolean]()
