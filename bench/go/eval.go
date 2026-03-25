@@ -81,7 +81,17 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 
 	switch f := fn.(type) {
 	case *BuiltinFunc:
-		return f.Fn(args)
+		result, err := f.Fn(args)
+		if err != nil {
+			if ee, ok := err.(*EvalError); ok {
+				// Prepend position if not already present
+				if len(ee.Message) == 0 || ee.Message[0] < '0' || ee.Message[0] > '9' {
+					ee.Message = fmt.Sprintf("%d:%d: %s", e.Ln, e.Cl, ee.Message)
+				}
+			}
+			return nil, err
+		}
+		return result, nil
 	case *LambdaVal:
 		return applyLambda(f, args, e.Ln, e.Cl)
 	default:
