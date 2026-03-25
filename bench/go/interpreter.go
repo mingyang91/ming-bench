@@ -45,6 +45,7 @@ func (e *charExpr) pos() position { return e.at }
 
 type symbolExpr struct {
 	name string
+	key  string
 	at   position
 }
 
@@ -429,37 +430,43 @@ type builtinProc struct {
 	fn   func(it *interpreter, args []value, callPos position) (value, error)
 }
 
+type bindingName struct {
+	name string
+	key  string
+}
+
 type closureProc struct {
 	name    string
-	params  []string
-	rest    string
+	params  []bindingName
+	rest    bindingName
 	hasRest bool
 	body    []expr
 	env     *env
 }
 
 type binding struct {
+	name  string
+	key   string
 	value value
 }
 
 type env struct {
 	parent *env
 	values map[string]*binding
+	keys   map[string]*binding
 }
 
 func newEnv(parent *env) *env {
 	return &env{
 		parent: parent,
 		values: map[string]*binding{},
+		keys:   map[string]*binding{},
 	}
 }
 
-func (e *env) define(name string, v value) {
-	if existing, ok := e.values[name]; ok {
-		existing.value = v
-		return
-	}
-	e.values[name] = &binding{value: v}
+func (e *env) bind(b *binding) {
+	e.values[b.name] = b
+	e.keys[b.key] = b
 }
 
 func (e *env) lookup(name string) (value, bool) {
@@ -479,9 +486,19 @@ func (e *env) lookupBinding(name string) (*binding, bool) {
 	return nil, false
 }
 
+func (e *env) lookupBindingKey(key string) (*binding, bool) {
+	for current := e; current != nil; current = current.parent {
+		if binding, ok := current.keys[key]; ok {
+			return binding, true
+		}
+	}
+	return nil, false
+}
+
 type interpreter struct {
 	global *env
 	output strings.Builder
+	nextID int
 }
 
 func newInterpreter() *interpreter {
@@ -492,73 +509,131 @@ func newInterpreter() *interpreter {
 	return it
 }
 
+func (it *interpreter) freshBindingKey(name string) string {
+	it.nextID++
+	return fmt.Sprintf("%s#%d", name, it.nextID)
+}
+
+func (it *interpreter) defineName(scope *env, name string, v value) *binding {
+	if existing, ok := scope.values[name]; ok {
+		existing.value = v
+		return existing
+	}
+
+	b := &binding{
+		name:  name,
+		key:   it.freshBindingKey(name),
+		value: v,
+	}
+	scope.bind(b)
+	return b
+}
+
+func (it *interpreter) defineSymbol(scope *env, sym *symbolExpr, v value) *binding {
+	if sym.key != "" {
+		if existing, ok := scope.keys[sym.key]; ok {
+			existing.value = v
+			return existing
+		}
+
+		b := &binding{
+			name:  sym.name,
+			key:   sym.key,
+			value: v,
+		}
+		scope.bind(b)
+		return b
+	}
+
+	return it.defineName(scope, sym.name, v)
+}
+
+func (it *interpreter) defineBindingName(scope *env, name bindingName, v value) *binding {
+	return it.defineSymbol(scope, &symbolExpr{name: name.name, key: name.key}, v)
+}
+
+func (it *interpreter) lookupSymbolBinding(scope *env, sym *symbolExpr) (*binding, bool) {
+	if sym.key != "" {
+		return scope.lookupBindingKey(sym.key)
+	}
+	return scope.lookupBinding(sym.name)
+}
+
+func (it *interpreter) lookupSymbol(scope *env, sym *symbolExpr) (value, bool) {
+	binding, ok := it.lookupSymbolBinding(scope, sym)
+	if !ok {
+		return nil, false
+	}
+	return binding.value, true
+}
+
 func (it *interpreter) installBuiltins() {
-	it.global.define("+", &builtinProc{name: "+", fn: builtinAdd})
-	it.global.define("-", &builtinProc{name: "-", fn: builtinSub})
-	it.global.define("*", &builtinProc{name: "*", fn: builtinMul})
-	it.global.define("/", &builtinProc{name: "/", fn: builtinDiv})
-	it.global.define("<", &builtinProc{name: "<", fn: builtinLessThan})
-	it.global.define(">", &builtinProc{name: ">", fn: builtinGreaterThan})
-	it.global.define("=", &builtinProc{name: "=", fn: builtinEqual})
-	it.global.define("<=", &builtinProc{name: "<=", fn: builtinLessEqual})
-	it.global.define("not", &builtinProc{name: "not", fn: builtinNot})
-	it.global.define("cons", &builtinProc{name: "cons", fn: builtinCons})
-	it.global.define("car", &builtinProc{name: "car", fn: builtinCar})
-	it.global.define("cdr", &builtinProc{name: "cdr", fn: builtinCdr})
-	it.global.define("null?", &builtinProc{name: "null?", fn: builtinNull})
-	it.global.define("list", &builtinProc{name: "list", fn: builtinList})
-	it.global.define("length", &builtinProc{name: "length", fn: builtinLength})
-	it.global.define("append", &builtinProc{name: "append", fn: builtinAppend})
-	it.global.define("string?", &builtinProc{name: "string?", fn: builtinStringPred})
-	it.global.define("number?", &builtinProc{name: "number?", fn: builtinNumberPred})
-	it.global.define("boolean?", &builtinProc{name: "boolean?", fn: builtinBooleanPred})
-	it.global.define("pair?", &builtinProc{name: "pair?", fn: builtinPairPred})
-	it.global.define("symbol?", &builtinProc{name: "symbol?", fn: builtinSymbolPred})
-	it.global.define("display", &builtinProc{name: "display", fn: builtinDisplay})
-	it.global.define("write", &builtinProc{name: "write", fn: builtinWrite})
-	it.global.define("newline", &builtinProc{name: "newline", fn: builtinNewline})
-	it.global.define("apply", &builtinProc{name: "apply", fn: builtinApply})
-	it.global.define("abs", &builtinProc{name: "abs", fn: builtinAbs})
-	it.global.define("modulo", &builtinProc{name: "modulo", fn: builtinModulo})
-	it.global.define("remainder", &builtinProc{name: "remainder", fn: builtinRemainder})
-	it.global.define("quotient", &builtinProc{name: "quotient", fn: builtinQuotient})
-	it.global.define("min", &builtinProc{name: "min", fn: builtinMin})
-	it.global.define("max", &builtinProc{name: "max", fn: builtinMax})
-	it.global.define("expt", &builtinProc{name: "expt", fn: builtinExpt})
-	it.global.define("zero?", &builtinProc{name: "zero?", fn: builtinZeroPred})
-	it.global.define("positive?", &builtinProc{name: "positive?", fn: builtinPositivePred})
-	it.global.define("negative?", &builtinProc{name: "negative?", fn: builtinNegativePred})
-	it.global.define("odd?", &builtinProc{name: "odd?", fn: builtinOddPred})
-	it.global.define("even?", &builtinProc{name: "even?", fn: builtinEvenPred})
-	it.global.define("string-copy", &builtinProc{name: "string-copy", fn: builtinStringCopy})
-	it.global.define("string-set!", &builtinProc{name: "string-set!", fn: builtinStringSet})
-	it.global.define("string-append", &builtinProc{name: "string-append", fn: builtinStringAppend})
-	it.global.define("string-length", &builtinProc{name: "string-length", fn: builtinStringLength})
-	it.global.define("substring", &builtinProc{name: "substring", fn: builtinSubstring})
-	it.global.define("string->number", &builtinProc{name: "string->number", fn: builtinStringToNumber})
-	it.global.define("number->string", &builtinProc{name: "number->string", fn: builtinNumberToString})
-	it.global.define("symbol->string", &builtinProc{name: "symbol->string", fn: builtinSymbolToString})
-	it.global.define("string->symbol", &builtinProc{name: "string->symbol", fn: builtinStringToSymbol})
-	it.global.define("string-ref", &builtinProc{name: "string-ref", fn: builtinStringRef})
-	it.global.define("string=?", &builtinProc{name: "string=?", fn: builtinStringEqualPred})
-	it.global.define("string<?", &builtinProc{name: "string<?", fn: builtinStringLessPred})
-	it.global.define("string-ci=?", &builtinProc{name: "string-ci=?", fn: builtinStringCIEqualPred})
-	it.global.define("string-upcase", &builtinProc{name: "string-upcase", fn: builtinStringUpcase})
-	it.global.define("string-downcase", &builtinProc{name: "string-downcase", fn: builtinStringDowncase})
-	it.global.define("char?", &builtinProc{name: "char?", fn: builtinCharPred})
-	it.global.define("char-alphabetic?", &builtinProc{name: "char-alphabetic?", fn: builtinCharAlphabeticPred})
-	it.global.define("char-numeric?", &builtinProc{name: "char-numeric?", fn: builtinCharNumericPred})
-	it.global.define("char-upcase", &builtinProc{name: "char-upcase", fn: builtinCharUpcase})
-	it.global.define("char-downcase", &builtinProc{name: "char-downcase", fn: builtinCharDowncase})
-	it.global.define("char=?", &builtinProc{name: "char=?", fn: builtinCharEqualPred})
-	it.global.define("char<?", &builtinProc{name: "char<?", fn: builtinCharLessPred})
-	it.global.define("eq?", &builtinProc{name: "eq?", fn: builtinEqPred})
-	it.global.define("equal?", &builtinProc{name: "equal?", fn: builtinDeepEqualPred})
-	it.global.define("list?", &builtinProc{name: "list?", fn: builtinListPred})
-	it.global.define("list-ref", &builtinProc{name: "list-ref", fn: builtinListRef})
-	it.global.define("list-tail", &builtinProc{name: "list-tail", fn: builtinListTail})
-	it.global.define("assoc", &builtinProc{name: "assoc", fn: builtinAssoc})
-	it.global.define("map", &builtinProc{name: "map", fn: builtinMap})
+	it.defineName(it.global, "+", &builtinProc{name: "+", fn: builtinAdd})
+	it.defineName(it.global, "-", &builtinProc{name: "-", fn: builtinSub})
+	it.defineName(it.global, "*", &builtinProc{name: "*", fn: builtinMul})
+	it.defineName(it.global, "/", &builtinProc{name: "/", fn: builtinDiv})
+	it.defineName(it.global, "<", &builtinProc{name: "<", fn: builtinLessThan})
+	it.defineName(it.global, ">", &builtinProc{name: ">", fn: builtinGreaterThan})
+	it.defineName(it.global, "=", &builtinProc{name: "=", fn: builtinEqual})
+	it.defineName(it.global, "<=", &builtinProc{name: "<=", fn: builtinLessEqual})
+	it.defineName(it.global, "not", &builtinProc{name: "not", fn: builtinNot})
+	it.defineName(it.global, "cons", &builtinProc{name: "cons", fn: builtinCons})
+	it.defineName(it.global, "car", &builtinProc{name: "car", fn: builtinCar})
+	it.defineName(it.global, "cdr", &builtinProc{name: "cdr", fn: builtinCdr})
+	it.defineName(it.global, "null?", &builtinProc{name: "null?", fn: builtinNull})
+	it.defineName(it.global, "list", &builtinProc{name: "list", fn: builtinList})
+	it.defineName(it.global, "length", &builtinProc{name: "length", fn: builtinLength})
+	it.defineName(it.global, "append", &builtinProc{name: "append", fn: builtinAppend})
+	it.defineName(it.global, "string?", &builtinProc{name: "string?", fn: builtinStringPred})
+	it.defineName(it.global, "number?", &builtinProc{name: "number?", fn: builtinNumberPred})
+	it.defineName(it.global, "boolean?", &builtinProc{name: "boolean?", fn: builtinBooleanPred})
+	it.defineName(it.global, "pair?", &builtinProc{name: "pair?", fn: builtinPairPred})
+	it.defineName(it.global, "symbol?", &builtinProc{name: "symbol?", fn: builtinSymbolPred})
+	it.defineName(it.global, "display", &builtinProc{name: "display", fn: builtinDisplay})
+	it.defineName(it.global, "write", &builtinProc{name: "write", fn: builtinWrite})
+	it.defineName(it.global, "newline", &builtinProc{name: "newline", fn: builtinNewline})
+	it.defineName(it.global, "apply", &builtinProc{name: "apply", fn: builtinApply})
+	it.defineName(it.global, "abs", &builtinProc{name: "abs", fn: builtinAbs})
+	it.defineName(it.global, "modulo", &builtinProc{name: "modulo", fn: builtinModulo})
+	it.defineName(it.global, "remainder", &builtinProc{name: "remainder", fn: builtinRemainder})
+	it.defineName(it.global, "quotient", &builtinProc{name: "quotient", fn: builtinQuotient})
+	it.defineName(it.global, "min", &builtinProc{name: "min", fn: builtinMin})
+	it.defineName(it.global, "max", &builtinProc{name: "max", fn: builtinMax})
+	it.defineName(it.global, "expt", &builtinProc{name: "expt", fn: builtinExpt})
+	it.defineName(it.global, "zero?", &builtinProc{name: "zero?", fn: builtinZeroPred})
+	it.defineName(it.global, "positive?", &builtinProc{name: "positive?", fn: builtinPositivePred})
+	it.defineName(it.global, "negative?", &builtinProc{name: "negative?", fn: builtinNegativePred})
+	it.defineName(it.global, "odd?", &builtinProc{name: "odd?", fn: builtinOddPred})
+	it.defineName(it.global, "even?", &builtinProc{name: "even?", fn: builtinEvenPred})
+	it.defineName(it.global, "string-copy", &builtinProc{name: "string-copy", fn: builtinStringCopy})
+	it.defineName(it.global, "string-set!", &builtinProc{name: "string-set!", fn: builtinStringSet})
+	it.defineName(it.global, "string-append", &builtinProc{name: "string-append", fn: builtinStringAppend})
+	it.defineName(it.global, "string-length", &builtinProc{name: "string-length", fn: builtinStringLength})
+	it.defineName(it.global, "substring", &builtinProc{name: "substring", fn: builtinSubstring})
+	it.defineName(it.global, "string->number", &builtinProc{name: "string->number", fn: builtinStringToNumber})
+	it.defineName(it.global, "number->string", &builtinProc{name: "number->string", fn: builtinNumberToString})
+	it.defineName(it.global, "symbol->string", &builtinProc{name: "symbol->string", fn: builtinSymbolToString})
+	it.defineName(it.global, "string->symbol", &builtinProc{name: "string->symbol", fn: builtinStringToSymbol})
+	it.defineName(it.global, "string-ref", &builtinProc{name: "string-ref", fn: builtinStringRef})
+	it.defineName(it.global, "string=?", &builtinProc{name: "string=?", fn: builtinStringEqualPred})
+	it.defineName(it.global, "string<?", &builtinProc{name: "string<?", fn: builtinStringLessPred})
+	it.defineName(it.global, "string-ci=?", &builtinProc{name: "string-ci=?", fn: builtinStringCIEqualPred})
+	it.defineName(it.global, "string-upcase", &builtinProc{name: "string-upcase", fn: builtinStringUpcase})
+	it.defineName(it.global, "string-downcase", &builtinProc{name: "string-downcase", fn: builtinStringDowncase})
+	it.defineName(it.global, "char?", &builtinProc{name: "char?", fn: builtinCharPred})
+	it.defineName(it.global, "char-alphabetic?", &builtinProc{name: "char-alphabetic?", fn: builtinCharAlphabeticPred})
+	it.defineName(it.global, "char-numeric?", &builtinProc{name: "char-numeric?", fn: builtinCharNumericPred})
+	it.defineName(it.global, "char-upcase", &builtinProc{name: "char-upcase", fn: builtinCharUpcase})
+	it.defineName(it.global, "char-downcase", &builtinProc{name: "char-downcase", fn: builtinCharDowncase})
+	it.defineName(it.global, "char=?", &builtinProc{name: "char=?", fn: builtinCharEqualPred})
+	it.defineName(it.global, "char<?", &builtinProc{name: "char<?", fn: builtinCharLessPred})
+	it.defineName(it.global, "eq?", &builtinProc{name: "eq?", fn: builtinEqPred})
+	it.defineName(it.global, "equal?", &builtinProc{name: "equal?", fn: builtinDeepEqualPred})
+	it.defineName(it.global, "list?", &builtinProc{name: "list?", fn: builtinListPred})
+	it.defineName(it.global, "list-ref", &builtinProc{name: "list-ref", fn: builtinListRef})
+	it.defineName(it.global, "list-tail", &builtinProc{name: "list-tail", fn: builtinListTail})
+	it.defineName(it.global, "assoc", &builtinProc{name: "assoc", fn: builtinAssoc})
+	it.defineName(it.global, "map", &builtinProc{name: "map", fn: builtinMap})
 }
 
 func (it *interpreter) evalProgram(exprs []expr) (value, error) {
@@ -592,9 +667,12 @@ func (it *interpreter) eval(node expr, scope *env) (value, error) {
 	case *charExpr:
 		return charValue(expr.value), nil
 	case *symbolExpr:
-		value, ok := scope.lookup(expr.name)
+		value, ok := it.lookupSymbol(scope, expr)
 		if !ok {
 			return nil, newEvalError(ErrUnboundVariable, fmt.Sprintf("unbound variable: %s", expr.name), expr.at)
+		}
+		if _, isMacro := value.(*syntaxRuleMacro); isMacro {
+			return nil, newEvalError(ErrSyntax, fmt.Sprintf("cannot use syntax as value: %s", expr.name), expr.at)
 		}
 		return value, nil
 	case *listExpr:
@@ -617,6 +695,8 @@ func (it *interpreter) evalList(list *listExpr, scope *env) (value, error) {
 			return it.evalOr(scope, list.elements[1:])
 		case "define":
 			return it.evalDefine(scope, list)
+		case "define-syntax":
+			return it.evalDefineSyntax(scope, list)
 		case "if":
 			return it.evalIf(scope, list)
 		case "quote":
@@ -631,6 +711,13 @@ func (it *interpreter) evalList(list *listExpr, scope *env) (value, error) {
 			return it.evalCond(scope, list)
 		case "let":
 			return it.evalLet(scope, list)
+		}
+
+		if expanded, ok, err := it.expandMacroCall(list, scope); ok || err != nil {
+			if err != nil {
+				return nil, err
+			}
+			return it.eval(expanded, scope)
 		}
 	}
 
@@ -665,7 +752,7 @@ func (it *interpreter) evalDefine(scope *env, list *listExpr) (value, error) {
 		if err != nil {
 			return nil, err
 		}
-		scope.define(target.name, result)
+		it.defineSymbol(scope, target, result)
 		return voidValue{}, nil
 	case *listExpr:
 		if len(target.elements) == 0 {
@@ -687,7 +774,7 @@ func (it *interpreter) evalDefine(scope *env, list *listExpr) (value, error) {
 			body:    list.elements[2:],
 			env:     scope,
 		}
-		scope.define(name.name, proc)
+		it.defineSymbol(scope, name, proc)
 		return voidValue{}, nil
 	default:
 		return nil, newEvalError(ErrSyntax, "define: expected a symbol or function signature", list.elements[1].pos())
@@ -704,7 +791,7 @@ func (it *interpreter) evalSet(scope *env, list *listExpr) (value, error) {
 		return nil, newEvalError(ErrSyntax, "set!: expected variable name", list.elements[1].pos())
 	}
 
-	binding, ok := scope.lookupBinding(target.name)
+	binding, ok := it.lookupSymbolBinding(scope, target)
 	if !ok {
 		return nil, newEvalError(ErrUnboundVariable, fmt.Sprintf("set!: unbound variable: %s", target.name), target.at)
 	}
@@ -806,7 +893,7 @@ func (it *interpreter) evalCond(scope *env, list *listExpr) (value, error) {
 }
 
 type letBinding struct {
-	name string
+	name bindingName
 	init expr
 }
 
@@ -841,7 +928,7 @@ func (it *interpreter) evalLet(scope *env, list *listExpr) (value, error) {
 	}
 
 	args := make([]value, 0, len(bindings))
-	params := make([]string, 0, len(bindings))
+	params := make([]bindingName, 0, len(bindings))
 	for _, binding := range bindings {
 		current, err := it.eval(binding.init, scope)
 		if err != nil {
@@ -854,7 +941,7 @@ func (it *interpreter) evalLet(scope *env, list *listExpr) (value, error) {
 	if name == nil {
 		letEnv := newEnv(scope)
 		for i, param := range params {
-			letEnv.define(param, args[i])
+			it.defineBindingName(letEnv, param, args[i])
 		}
 		return it.evalSequence(letEnv, body)
 	}
@@ -866,7 +953,7 @@ func (it *interpreter) evalLet(scope *env, list *listExpr) (value, error) {
 		body:   body,
 		env:    letEnv,
 	}
-	letEnv.define(name.name, proc)
+	it.defineSymbol(letEnv, name, proc)
 	return it.applyClosure(proc, args, list.at)
 }
 
@@ -897,10 +984,10 @@ func (it *interpreter) applyClosure(proc *closureProc, args []value, callPos pos
 
 	callEnv := newEnv(proc.env)
 	for i, param := range proc.params {
-		callEnv.define(param, args[i])
+		it.defineBindingName(callEnv, param, args[i])
 	}
 	if proc.hasRest {
-		callEnv.define(proc.rest, buildList(args[len(proc.params):]))
+		it.defineBindingName(callEnv, proc.rest, buildList(args[len(proc.params):]))
 	}
 	return it.evalSequence(callEnv, proc.body)
 }
@@ -938,47 +1025,47 @@ func isTruthy(v value) bool {
 	return !ok || boolean
 }
 
-func parseLambdaParams(node expr) ([]string, string, bool, error) {
+func parseLambdaParams(node expr) ([]bindingName, bindingName, bool, error) {
 	switch formals := node.(type) {
 	case *listExpr:
 		return parseParamNames(formals.elements)
 	case *symbolExpr:
 		if formals.name == "." {
-			return nil, "", false, newEvalError(ErrSyntax, "expected parameter name", formals.at)
+			return nil, bindingName{}, false, newEvalError(ErrSyntax, "expected parameter name", formals.at)
 		}
-		return nil, formals.name, true, nil
+		return nil, bindingName{name: formals.name, key: formals.key}, true, nil
 	default:
-		return nil, "", false, newEvalError(ErrSyntax, "lambda: expected parameter list", node.pos())
+		return nil, bindingName{}, false, newEvalError(ErrSyntax, "lambda: expected parameter list", node.pos())
 	}
 }
 
-func parseParamNames(nodes []expr) ([]string, string, bool, error) {
-	params := make([]string, 0, len(nodes))
+func parseParamNames(nodes []expr) ([]bindingName, bindingName, bool, error) {
+	params := make([]bindingName, 0, len(nodes))
 	for i, node := range nodes {
 		sym, ok := node.(*symbolExpr)
 		if !ok {
-			return nil, "", false, newEvalError(ErrSyntax, "expected parameter name", node.pos())
+			return nil, bindingName{}, false, newEvalError(ErrSyntax, "expected parameter name", node.pos())
 		}
 		if sym.name != "." {
-			params = append(params, sym.name)
+			params = append(params, bindingName{name: sym.name, key: sym.key})
 			continue
 		}
 
 		if i == len(nodes)-1 {
-			return nil, "", false, newEvalError(ErrSyntax, "expected rest parameter name", sym.at)
+			return nil, bindingName{}, false, newEvalError(ErrSyntax, "expected rest parameter name", sym.at)
 		}
 
 		restNode := nodes[i+1]
 		rest, ok := restNode.(*symbolExpr)
 		if !ok || rest.name == "." {
-			return nil, "", false, newEvalError(ErrSyntax, "expected rest parameter name", restNode.pos())
+			return nil, bindingName{}, false, newEvalError(ErrSyntax, "expected rest parameter name", restNode.pos())
 		}
 		if i+2 != len(nodes) {
-			return nil, "", false, newEvalError(ErrSyntax, "expected '.' before final parameter", nodes[i+2].pos())
+			return nil, bindingName{}, false, newEvalError(ErrSyntax, "expected '.' before final parameter", nodes[i+2].pos())
 		}
-		return params, rest.name, true, nil
+		return params, bindingName{name: rest.name, key: rest.key}, true, nil
 	}
-	return params, "", false, nil
+	return params, bindingName{}, false, nil
 }
 
 func parseLetBindings(list *listExpr) ([]letBinding, error) {
@@ -995,7 +1082,7 @@ func parseLetBindings(list *listExpr) ([]letBinding, error) {
 		}
 
 		bindings = append(bindings, letBinding{
-			name: name.name,
+			name: bindingName{name: name.name, key: name.key},
 			init: binding.elements[1],
 		})
 	}
