@@ -25,6 +25,13 @@ public class Interpreter {
         new SchemeValue.BuiltinVal("call/cc", null);
     private static final SchemeValue.BuiltinVal APPLY_MARKER =
         new SchemeValue.BuiltinVal("apply", null);
+    private static final SchemeValue.BuiltinVal DYNAMIC_WIND_MARKER =
+        new SchemeValue.BuiltinVal("dynamic-wind", null);
+
+    // dynamic-wind support
+    private record WindEntry(SchemeValue inThunk, SchemeValue outThunk) {}
+    private record CapturedContinuation(Cont k, List<WindEntry> winds) {}
+    private final List<WindEntry> windStack = new ArrayList<>();
 
     // ---- CEK machine types ----
 
@@ -932,6 +939,9 @@ public class Interpreter {
         // L18: call/cc
         globals.define("call/cc", CALL_CC_MARKER);
         globals.define("call-with-current-continuation", CALL_CC_MARKER);
+
+        // L19: dynamic-wind
+        globals.define("dynamic-wind", DYNAMIC_WIND_MARKER);
     }
 
     // ---- CEK evaluation engine ----
@@ -1511,8 +1521,28 @@ public class Interpreter {
         if (proc == CALL_CC_MARKER) {
             if (args.length != 1) throw new EvalError("call/cc: expected 1 argument");
             SchemeValue f = args[0];
-            SchemeValue capturedK = new SchemeValue.ContinuationVal(k);
+            SchemeValue capturedK = new SchemeValue.ContinuationVal(
+                new CapturedContinuation(k, new ArrayList<>(windStack)));
             applyProcCek(f, new SchemeValue[]{capturedK}, k);
+            return;
+        }
+
+        // dynamic-wind
+        if (proc == DYNAMIC_WIND_MARKER) {
+            if (args.length != 3) throw new EvalError("dynamic-wind: expected 3 arguments");
+            var inThunk = args[0];
+            var bodyThunk = args[1];
+            var outThunk = args[2];
+            var entry = new WindEntry(inThunk, outThunk);
+            applyProcCek(inThunk, new SchemeValue[0], new Cont.Frame(inResult -> {
+                windStack.add(entry);
+                applyProcCek(bodyThunk, new SchemeValue[0], new Cont.Frame(bodyResult -> {
+                    windStack.remove(windStack.size() - 1);
+                    applyProcCek(outThunk, new SchemeValue[0], new Cont.Frame(outResult -> {
+                        cekReturn(bodyResult, k);
+                    }));
+                }));
+            }));
             return;
         }
 
@@ -1539,7 +1569,15 @@ public class Interpreter {
         // Continuation invocation
         if (proc instanceof SchemeValue.ContinuationVal cv) {
             SchemeValue value = args.length > 0 ? args[0] : new SchemeValue.VoidVal();
-            cekReturn(value, (Cont) cv.cont());
+            var captured = (CapturedContinuation) cv.cont();
+            var targetWinds = captured.winds();
+            int common = commonWindPrefix(windStack, targetWinds);
+            if (common == windStack.size() && common == targetWinds.size()) {
+                // No wind transition needed
+                cekReturn(value, captured.k());
+            } else {
+                doWindTransition(windStack.size(), common, targetWinds, common, value, captured.k());
+            }
             return;
         }
 
@@ -1568,6 +1606,40 @@ public class Interpreter {
         }
 
         throw new EvalError("not a procedure: " + proc.display());
+    }
+
+    // ---- dynamic-wind helpers ----
+
+    private int commonWindPrefix(List<WindEntry> current, List<WindEntry> target) {
+        int min = Math.min(current.size(), target.size());
+        for (int i = 0; i < min; i++) {
+            if (current.get(i) != target.get(i)) return i;
+        }
+        return min;
+    }
+
+    private void doWindTransition(int unwindFrom, int common, List<WindEntry> target,
+                                  int rewindFrom, SchemeValue value, Cont k) throws EvalError {
+        // Phase 1: Unwind — call out-thunks from innermost to common
+        if (unwindFrom > common) {
+            int idx = unwindFrom - 1;
+            var entry = windStack.remove(idx);
+            applyProcCek(entry.outThunk(), new SchemeValue[0], new Cont.Frame(ignored -> {
+                doWindTransition(idx, common, target, rewindFrom, value, k);
+            }));
+            return;
+        }
+        // Phase 2: Rewind — call in-thunks from common to innermost
+        if (rewindFrom < target.size()) {
+            var entry = target.get(rewindFrom);
+            windStack.add(entry);
+            applyProcCek(entry.inThunk(), new SchemeValue[0], new Cont.Frame(ignored -> {
+                doWindTransition(unwindFrom, common, target, rewindFrom + 1, value, k);
+            }));
+            return;
+        }
+        // Phase 3: Resume
+        cekReturn(value, k);
     }
 
     private void applyLambdaCek(SchemeValue.LambdaVal lambda, SchemeValue[] args, Cont k) throws EvalError {
