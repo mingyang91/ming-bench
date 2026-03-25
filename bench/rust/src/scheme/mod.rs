@@ -1212,63 +1212,94 @@ fn scheme_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
-fn eval(expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
-    match &expr.kind {
-        ExprKind::Integer(value) => Ok(Value::Integer(*value)),
-        ExprKind::Rational(value) => Ok(Value::from_number(Number::Rational(*value))),
-        ExprKind::Inexact(value) => Ok(Value::Inexact(*value)),
-        ExprKind::Bool(value) => Ok(Value::Bool(*value)),
-        ExprKind::Char(value) => Ok(Value::Char(*value)),
-        ExprKind::String(value) => Ok(Value::String(SchemeString::immutable(value))),
-        ExprKind::Symbol(name) => Environment::lookup(&env, name, expr.pos)?
-            .ok_or_else(|| EvalError::unbound_variable(name.clone(), expr.pos)),
-        ExprKind::List(items) => eval_list(items, env, expr.pos),
+enum EvalStep {
+    Value(Value),
+    Expr(Expr, EnvRef),
+}
+
+fn resolve_eval_step(step: EvalStep) -> Result<Value, EvalError> {
+    match step {
+        EvalStep::Value(value) => Ok(value),
+        EvalStep::Expr(expr, env) => eval(&expr, env),
     }
 }
 
-fn eval_list(items: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
-    let Some((head, tail)) = items.split_first() else {
+fn eval(expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
+    let mut current_expr = expr.clone();
+    let mut current_env = env;
+
+    loop {
+        let position = current_expr.pos;
+        match current_expr.kind {
+            ExprKind::Integer(value) => return Ok(Value::Integer(value)),
+            ExprKind::Rational(value) => {
+                return Ok(Value::from_number(Number::Rational(value)));
+            }
+            ExprKind::Inexact(value) => return Ok(Value::Inexact(value)),
+            ExprKind::Bool(value) => return Ok(Value::Bool(value)),
+            ExprKind::Char(value) => return Ok(Value::Char(value)),
+            ExprKind::String(value) => {
+                return Ok(Value::String(SchemeString::immutable(&value)));
+            }
+            ExprKind::Symbol(name) => {
+                return Environment::lookup(&current_env, &name, position)?
+                    .ok_or_else(|| EvalError::unbound_variable(name, position));
+            }
+            ExprKind::List(items) => match eval_list(items, current_env.clone(), position)? {
+                EvalStep::Value(value) => return Ok(value),
+                EvalStep::Expr(expr, env) => {
+                    current_expr = expr;
+                    current_env = env;
+                }
+            },
+        }
+    }
+}
+
+fn eval_list(items: Vec<Expr>, env: EnvRef, position: SourcePos) -> Result<EvalStep, EvalError> {
+    let Some(head) = items.first() else {
         return Err(EvalError::syntax("cannot evaluate empty list", position));
     };
+    let tail = &items[1..];
 
     if let ExprKind::Symbol(name) = &head.kind {
         if name == "define-syntax" {
-            return eval_define_syntax(tail, env, head.pos);
+            return Ok(EvalStep::Value(eval_define_syntax(tail, env, head.pos)?));
         }
 
         if let Some(transformer) = Environment::lookup_macro(&env, name) {
-            let expanded = expand_macro_call(transformer, items, env.clone(), position)?;
-            return eval(&expanded.expr, expanded.env);
+            let expanded = expand_macro_call(transformer, &items, env.clone(), position)?;
+            return Ok(EvalStep::Expr(expanded.expr, expanded.env));
         }
 
         return match name.as_str() {
-            "define" => eval_define(tail, env, head.pos),
+            "define" => Ok(EvalStep::Value(eval_define(tail, env, head.pos)?)),
             "define-record-type" => eval_define_record_type(tail, env, head.pos),
-            "set!" => eval_set(tail, env, head.pos),
-            "if" => eval_if(tail, env, head.pos),
-            "quote" => eval_quote(tail, head.pos),
-            "lambda" => eval_lambda(tail, env, head.pos),
-            "case-lambda" => eval_case_lambda(tail, env, head.pos),
-            "and" => eval_and(tail, env),
-            "or" => eval_or(tail, env),
-            "begin" => eval_begin(tail, env),
-            "cond" => eval_cond(tail, env, head.pos),
-            "case" => eval_case(tail, env, head.pos),
-            "do" => eval_do(tail, env, head.pos),
-            "let" => eval_let(tail, env, head.pos),
-            "letrec" => eval_letrec(tail, env, head.pos, false),
-            "letrec*" => eval_letrec(tail, env, head.pos, true),
+            "set!" => Ok(EvalStep::Value(eval_set(tail, env, head.pos)?)),
+            "if" => eval_if_step(tail, env, head.pos),
+            "quote" => Ok(EvalStep::Value(eval_quote(tail, head.pos)?)),
+            "lambda" => Ok(EvalStep::Value(eval_lambda(tail, env, head.pos)?)),
+            "case-lambda" => Ok(EvalStep::Value(eval_case_lambda(tail, env, head.pos)?)),
+            "and" => eval_and_step(tail, env),
+            "or" => eval_or_step(tail, env),
+            "begin" => eval_sequence_step(tail, env),
+            "cond" => eval_cond_step(tail, env, head.pos),
+            "case" => eval_case_step(tail, env, head.pos),
+            "do" => eval_do_step(tail, env, head.pos),
+            "let" => eval_let_step(tail, env, head.pos),
+            "letrec" => eval_letrec_step(tail, env, head.pos, false),
+            "letrec*" => eval_letrec_step(tail, env, head.pos, true),
             _ => {
                 let callable = eval(head, env.clone())?;
                 let args = eval_all(tail, env.clone())?;
-                apply(callable, head.pos, args, env)
+                apply_step(callable, head.pos, args, env)
             }
         };
     }
 
     let callable = eval(head, env.clone())?;
     let args = eval_all(tail, env.clone())?;
-    apply(callable, head.pos, args, env)
+    apply_step(callable, head.pos, args, env)
 }
 
 fn eval_define_syntax(
@@ -1307,7 +1338,7 @@ fn eval_define_record_type(
     exprs: &[Expr],
     env: EnvRef,
     position: SourcePos,
-) -> Result<Value, EvalError> {
+) -> Result<EvalStep, EvalError> {
     let [type_name_expr, constructor_expr, predicate_expr, field_exprs @ ..] = exprs else {
         return Err(EvalError::syntax(
             "define-record-type requires a type name, constructor, and predicate",
@@ -1363,7 +1394,7 @@ fn eval_define_record_type(
         );
     }
 
-    Ok(Value::Void)
+    Ok(EvalStep::Value(Value::Void))
 }
 
 fn parse_symbol_name(expr: &Expr, message: &str) -> Result<String, EvalError> {
@@ -1533,20 +1564,20 @@ fn eval_set(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, E
     Ok(Value::Void)
 }
 
-fn eval_if(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+fn eval_if_step(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<EvalStep, EvalError> {
     match exprs {
         [condition, then_branch] => {
             if eval(condition, env.clone())?.is_truthy() {
-                eval(then_branch, env)
+                Ok(EvalStep::Expr(then_branch.clone(), env))
             } else {
-                Ok(Value::Void)
+                Ok(EvalStep::Value(Value::Void))
             }
         }
         [condition, then_branch, else_branch] => {
             if eval(condition, env.clone())?.is_truthy() {
-                eval(then_branch, env)
+                Ok(EvalStep::Expr(then_branch.clone(), env))
             } else {
-                eval(else_branch, env)
+                Ok(EvalStep::Expr(else_branch.clone(), env))
             }
         }
         _ => Err(EvalError::syntax(
@@ -1554,6 +1585,10 @@ fn eval_if(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, Ev
             position,
         )),
     }
+}
+
+fn eval_if(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+    resolve_eval_step(eval_if_step(exprs, env, position)?)
 }
 
 fn eval_quote(exprs: &[Expr], position: SourcePos) -> Result<Value, EvalError> {
@@ -1728,36 +1763,53 @@ fn quote_expr(expr: &Expr) -> Value {
     }
 }
 
-fn eval_and(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
-    let mut last = Value::Bool(true);
+fn eval_and_step(exprs: &[Expr], env: EnvRef) -> Result<EvalStep, EvalError> {
+    let Some((last, rest)) = exprs.split_last() else {
+        return Ok(EvalStep::Value(Value::Bool(true)));
+    };
 
-    for expr in exprs {
+    for expr in rest {
         let value = eval(expr, env.clone())?;
         if !value.is_truthy() {
-            return Ok(value);
+            return Ok(EvalStep::Value(value));
         }
-        last = value;
     }
 
-    Ok(last)
+    Ok(EvalStep::Expr(last.clone(), env))
+}
+
+fn eval_and(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    resolve_eval_step(eval_and_step(exprs, env)?)
+}
+
+fn eval_or_step(exprs: &[Expr], env: EnvRef) -> Result<EvalStep, EvalError> {
+    let Some((last, rest)) = exprs.split_last() else {
+        return Ok(EvalStep::Value(Value::Bool(false)));
+    };
+
+    for expr in rest {
+        let value = eval(expr, env.clone())?;
+        if value.is_truthy() {
+            return Ok(EvalStep::Value(value));
+        }
+    }
+
+    Ok(EvalStep::Expr(last.clone(), env))
 }
 
 fn eval_or(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
-    for expr in exprs {
-        let value = eval(expr, env.clone())?;
-        if value.is_truthy() {
-            return Ok(value);
-        }
-    }
-
-    Ok(Value::Bool(false))
+    resolve_eval_step(eval_or_step(exprs, env)?)
 }
 
 fn eval_begin(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
-    eval_sequence(exprs, env)
+    resolve_eval_step(eval_sequence_step(exprs, env)?)
 }
 
-fn eval_cond(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+fn eval_cond_step(
+    exprs: &[Expr],
+    env: EnvRef,
+    position: SourcePos,
+) -> Result<EvalStep, EvalError> {
     for (index, clause) in exprs.iter().enumerate() {
         let ExprKind::List(items) = &clause.kind else {
             return Err(EvalError::syntax("cond clauses must be lists", clause.pos));
@@ -1774,24 +1826,32 @@ fn eval_cond(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, 
             if index + 1 != exprs.len() {
                 return Err(EvalError::syntax("cond else clause must be last", test.pos));
             }
-            return eval_sequence(body, env);
+            return eval_sequence_step(body, env);
         }
 
         let test_value = eval(test, env.clone())?;
         if test_value.is_truthy() {
             return if body.is_empty() {
-                Ok(test_value)
+                Ok(EvalStep::Value(test_value))
             } else {
-                eval_sequence(body, env)
+                eval_sequence_step(body, env)
             };
         }
     }
 
     let _ = position;
-    Ok(Value::Void)
+    Ok(EvalStep::Value(Value::Void))
 }
 
-fn eval_case(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+fn eval_cond(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+    resolve_eval_step(eval_cond_step(exprs, env, position)?)
+}
+
+fn eval_case_step(
+    exprs: &[Expr],
+    env: EnvRef,
+    position: SourcePos,
+) -> Result<EvalStep, EvalError> {
     let Some((key_expr, clauses)) = exprs.split_first() else {
         return Err(EvalError::syntax(
             "case requires a key and at least 1 clause",
@@ -1828,7 +1888,7 @@ fn eval_case(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, 
                 ));
             }
 
-            return eval_sequence(body, env);
+            return eval_sequence_step(body, env);
         }
 
         let ExprKind::List(datums) = &datums_expr.kind else {
@@ -1842,14 +1902,18 @@ fn eval_case(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, 
             .iter()
             .any(|datum| scheme_eq(&key, &quote_expr(datum)))
         {
-            return eval_sequence(body, env);
+            return eval_sequence_step(body, env);
         }
     }
 
-    Ok(Value::Void)
+    Ok(EvalStep::Value(Value::Void))
 }
 
-fn eval_let(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+fn eval_case(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+    resolve_eval_step(eval_case_step(exprs, env, position)?)
+}
+
+fn eval_let_step(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<EvalStep, EvalError> {
     match exprs {
         [first, bindings_expr, body @ ..]
             if !body.is_empty() && matches!(&first.kind, ExprKind::Symbol(_)) =>
@@ -1857,9 +1921,11 @@ fn eval_let(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, E
             let ExprKind::Symbol(name) = &first.kind else {
                 unreachable!("guard ensures symbol");
             };
-            eval_named_let(name, bindings_expr, body, env, position)
+            eval_named_let_step(name, bindings_expr, body, env, position)
         }
-        [bindings_expr, body @ ..] if !body.is_empty() => eval_plain_let(bindings_expr, body, env),
+        [bindings_expr, body @ ..] if !body.is_empty() => {
+            eval_plain_let_step(bindings_expr, body, env)
+        }
         _ => Err(EvalError::syntax(
             "let requires bindings and a body",
             position,
@@ -1867,12 +1933,20 @@ fn eval_let(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, E
     }
 }
 
-fn eval_letrec(
+fn eval_let(
+    exprs: &[Expr],
+    env: EnvRef,
+    position: SourcePos,
+) -> Result<Value, EvalError> {
+    resolve_eval_step(eval_let_step(exprs, env, position)?)
+}
+
+fn eval_letrec_step(
     exprs: &[Expr],
     env: EnvRef,
     position: SourcePos,
     sequential: bool,
-) -> Result<Value, EvalError> {
+) -> Result<EvalStep, EvalError> {
     let Some((bindings_expr, body)) = exprs.split_first() else {
         let name = if sequential { "letrec*" } else { "letrec" };
         return Err(EvalError::syntax(
@@ -1916,10 +1990,23 @@ fn eval_letrec(
         }
     }
 
-    eval_sequence(body, let_env)
+    eval_sequence_step(body, let_env)
 }
 
-fn eval_plain_let(bindings_expr: &Expr, body: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_letrec(
+    exprs: &[Expr],
+    env: EnvRef,
+    position: SourcePos,
+    sequential: bool,
+) -> Result<Value, EvalError> {
+    resolve_eval_step(eval_letrec_step(exprs, env, position, sequential)?)
+}
+
+fn eval_plain_let_step(
+    bindings_expr: &Expr,
+    body: &[Expr],
+    env: EnvRef,
+) -> Result<EvalStep, EvalError> {
     let bindings = parse_bindings(bindings_expr)?;
     let values = eval_binding_values(&bindings, env.clone())?;
     let let_env = Environment::child(env);
@@ -1928,16 +2015,20 @@ fn eval_plain_let(bindings_expr: &Expr, body: &[Expr], env: EnvRef) -> Result<Va
         Environment::define(&let_env, name, value.value);
     }
 
-    eval_sequence(body, let_env)
+    eval_sequence_step(body, let_env)
 }
 
-fn eval_named_let(
+fn eval_plain_let(bindings_expr: &Expr, body: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    resolve_eval_step(eval_plain_let_step(bindings_expr, body, env)?)
+}
+
+fn eval_named_let_step(
     name: &str,
     bindings_expr: &Expr,
     body: &[Expr],
     env: EnvRef,
     position: SourcePos,
-) -> Result<Value, EvalError> {
+) -> Result<EvalStep, EvalError> {
     let bindings = parse_bindings(bindings_expr)?;
     let args = eval_binding_values(&bindings, env.clone())?;
     let params = bindings.into_iter().map(|(param, _)| param).collect();
@@ -1952,7 +2043,17 @@ fn eval_named_let(
     )));
 
     Environment::define(&let_env, name.into(), procedure.clone());
-    apply(procedure, position, args, let_env)
+    apply_step(procedure, position, args, let_env)
+}
+
+fn eval_named_let(
+    name: &str,
+    bindings_expr: &Expr,
+    body: &[Expr],
+    env: EnvRef,
+    position: SourcePos,
+) -> Result<Value, EvalError> {
+    resolve_eval_step(eval_named_let_step(name, bindings_expr, body, env, position)?)
 }
 
 fn parse_bindings(bindings_expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
@@ -2059,14 +2160,20 @@ fn eval_binding_values(
         .collect()
 }
 
-fn eval_sequence(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
-    let mut last = Value::Void;
+fn eval_sequence_step(exprs: &[Expr], env: EnvRef) -> Result<EvalStep, EvalError> {
+    let Some((last, init)) = exprs.split_last() else {
+        return Ok(EvalStep::Value(Value::Void));
+    };
 
-    for expr in exprs {
-        last = eval(expr, env.clone())?;
+    for expr in init {
+        let _ = eval(expr, env.clone())?;
     }
 
-    Ok(last)
+    Ok(EvalStep::Expr(last.clone(), env))
+}
+
+fn eval_sequence(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    resolve_eval_step(eval_sequence_step(exprs, env)?)
 }
 
 #[derive(Clone)]
@@ -2076,7 +2183,7 @@ struct DoBinding {
     step: Option<Expr>,
 }
 
-fn eval_do(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+fn eval_do_step(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<EvalStep, EvalError> {
     let Some((bindings_expr, rest)) = exprs.split_first() else {
         return Err(EvalError::syntax(
             "do requires bindings and a termination clause",
@@ -2104,7 +2211,7 @@ fn eval_do(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, Ev
 
     loop {
         if eval(&test_expr, do_env.clone())?.is_truthy() {
-            return eval_sequence(&result_exprs, do_env);
+            return eval_sequence_step(&result_exprs, do_env);
         }
 
         if !body.is_empty() {
@@ -2126,16 +2233,31 @@ fn eval_do(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, Ev
     }
 }
 
+fn eval_do(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+    resolve_eval_step(eval_do_step(exprs, env, position)?)
+}
+
 fn apply(
     callable: Value,
     position: SourcePos,
     args: Vec<LocatedValue>,
     env: EnvRef,
 ) -> Result<Value, EvalError> {
+    resolve_eval_step(apply_step(callable, position, args, env)?)
+}
+
+fn apply_step(
+    callable: Value,
+    position: SourcePos,
+    args: Vec<LocatedValue>,
+    env: EnvRef,
+) -> Result<EvalStep, EvalError> {
     match callable {
-        Value::Builtin(name) => apply_builtin(name, &args, position, env),
-        Value::Procedure(procedure) => apply_user_procedure(procedure, args, position),
-        Value::NativeProcedure(procedure) => apply_native_procedure(procedure, args, position),
+        Value::Builtin(name) => apply_builtin_step(name, &args, position, env),
+        Value::Procedure(procedure) => apply_user_procedure_step(procedure, args, position),
+        Value::NativeProcedure(procedure) => {
+            Ok(EvalStep::Value(apply_native_procedure(procedure, args, position)?))
+        }
         other => Err(EvalError::not_callable(other.type_name(), position)),
     }
 }
@@ -2218,11 +2340,11 @@ fn apply_native_procedure(
     }
 }
 
-fn apply_user_procedure(
+fn apply_user_procedure_step(
     procedure: Rc<UserProcedure>,
     args: Vec<LocatedValue>,
     position: SourcePos,
-) -> Result<Value, EvalError> {
+) -> Result<EvalStep, EvalError> {
     let Some(clause) = procedure.matching_clause(args.len()) else {
         return Err(EvalError::wrong_arg_count(
             procedure.display_name(),
@@ -2245,7 +2367,27 @@ fn apply_user_procedure(
         Environment::define(&call_env, rest_param.clone(), Value::List(rest_values));
     }
 
-    eval_sequence(&clause.body, call_env)
+    eval_sequence_step(&clause.body, call_env)
+}
+
+fn apply_user_procedure(
+    procedure: Rc<UserProcedure>,
+    args: Vec<LocatedValue>,
+    position: SourcePos,
+) -> Result<Value, EvalError> {
+    resolve_eval_step(apply_user_procedure_step(procedure, args, position)?)
+}
+
+fn apply_builtin_step(
+    name: &str,
+    args: &[LocatedValue],
+    position: SourcePos,
+    env: EnvRef,
+) -> Result<EvalStep, EvalError> {
+    match name {
+        "apply" => apply_apply_step(args, position, env),
+        _ => Ok(EvalStep::Value(apply_builtin(name, args, position, env)?)),
+    }
 }
 
 fn apply_builtin(
@@ -2808,11 +2950,11 @@ fn apply_append(args: &[LocatedValue], _position: SourcePos) -> Result<Value, Ev
     Ok(Value::List(items))
 }
 
-fn apply_apply(
+fn apply_apply_step(
     args: &[LocatedValue],
     position: SourcePos,
     env: EnvRef,
-) -> Result<Value, EvalError> {
+) -> Result<EvalStep, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::wrong_arg_count(
             "apply",
@@ -2838,12 +2980,20 @@ fn apply_apply(
             .map(|value| LocatedValue::new(value, list_arg.position)),
     );
 
-    apply(
+    apply_step(
         callable.value.clone(),
         callable.position,
         expanded_args,
         env,
     )
+}
+
+fn apply_apply(
+    args: &[LocatedValue],
+    position: SourcePos,
+    env: EnvRef,
+) -> Result<Value, EvalError> {
+    resolve_eval_step(apply_apply_step(args, position, env)?)
 }
 
 fn apply_number_to_string(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
