@@ -176,6 +176,17 @@ object Evaluator:
             )
           case SchemeVal.Symbol("guard") =>
             Guard.evalGuardK(elems.tail, env, k)
+          case SchemeVal.Symbol("call-with-values") if !env.lookup("call-with-values").exists(isUserDefined) =>
+            if elems.tail.size != 2 then throw new EvalError("call-with-values: expected 2 arguments")
+            evalK(elems.tail(0), env, producer =>
+              evalK(elems.tail(1), env, consumer =>
+                applyK(producer, Nil, result =>
+                  result match
+                    case SchemeVal.MultipleValues(vals) => applyK(consumer, vals, k)
+                    case other                         => applyK(consumer, List(other), k)
+                )
+              )
+            )
           case SchemeVal.Symbol("let")  => BindingForms.evalLetK(elems.tail, env, k)
           case SchemeVal.Symbol("cond") => BindingForms.evalCondK(elems.tail, env, k)
           case SchemeVal.Symbol("set!") => SpecialForms.evalSetK(elems.tail, env, k)

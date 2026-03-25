@@ -14,6 +14,15 @@ object Builtins:
     StringBuiltins.register(env, output)
     env.define("call/cc", SchemeVal.CallCCVal())
     env.define("call-with-current-continuation", SchemeVal.CallCCVal())
+    env.define(
+      "values",
+      SchemeVal.BuiltinProc(
+        "values",
+        args =>
+          if args.size == 1 then args.head
+          else SchemeVal.MultipleValues(args)
+      )
+    )
 
   private def registerApply(env: Env): Unit =
     env.define(
