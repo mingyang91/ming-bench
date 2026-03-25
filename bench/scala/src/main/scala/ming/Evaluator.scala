@@ -85,6 +85,7 @@ object Evaluator:
             case SchemeVal.SSymbol("and") :: args    => evalAnd(args, env)
             case SchemeVal.SSymbol("or") :: args     => evalOr(args, env)
             case SchemeVal.SSymbol("let") :: args    => evalLet(args, env)
+            case SchemeVal.SSymbol("set!") :: args   => evalSet(args, env)
             case SchemeVal.SSymbol("begin") :: args  => evalBegin(args, env)
             case SchemeVal.SSymbol("cond") :: args   => evalCond(args, env)
             case head :: args =>
@@ -171,6 +172,13 @@ object Evaluator:
         pairs.foreach((n, v) => letEnv.define(n, v))
         evalBody(body, letEnv)
       case _ => throw new EvalError("let: bad syntax")
+
+  private def evalSet(args: List[SchemeVal], env: Env): SchemeVal =
+    args match
+      case SchemeVal.SSymbol(name) :: valueExpr :: Nil =>
+        env.set(name, eval(valueExpr, env))
+        SchemeVal.SVoid
+      case _ => throw new EvalError("set!: bad syntax")
 
   private def evalBegin(args: List[SchemeVal], env: Env): SchemeVal =
     evalBody(args, env)
