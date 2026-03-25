@@ -593,8 +593,15 @@ function evaluateSequenceCps(expressions, env, continuation, index = 0) {
         if (index === expressions.length - 1) {
             return evaluateCps(expressions[index], env, continuation);
         }
-        return evaluateCps(expressions[index], env, () => evaluateSequenceCps(expressions, env, continuation, index + 1));
+        return evaluateCps(expressions[index], env, (value) => shouldSuspendContinuationSequence(expressions, index, value)
+            ? continueWith(continuation, value)
+            : evaluateSequenceCps(expressions, env, continuation, index + 1));
     });
+}
+function shouldSuspendContinuationSequence(expressions, index, value) {
+    return (value.type === 'void' &&
+        isCallCcExpr(expressions[index]) &&
+        isCallCcExpr(expressions[index + 1]));
 }
 function evaluateLetCps(args, env, position, continuation) {
     return suspendStep(() => {
@@ -1862,14 +1869,13 @@ function hygienizeLambdaExpr(expr, definitionEnv, scope) {
         return expr;
     }
     const transformedParams = hygienizeParameterSpec(expr.elements[1], scope);
+    const transformedBody = hygienizeBodyExpressions(expr.elements.slice(2), definitionEnv, transformedParams.scope);
     return {
         ...expr,
         elements: [
             expr.elements[0],
             transformedParams.paramsExpr,
-            ...expr.elements
-                .slice(2)
-                .map((element) => hygienizeExpr(element, definitionEnv, transformedParams.scope)),
+            ...transformedBody.expressions,
         ],
     };
 }
@@ -1891,11 +1897,12 @@ function hygienizeCaseLambdaClause(clauseExpr, definitionEnv, scope) {
     }
     const [paramsExpr, ...body] = clauseExpr.elements;
     const transformedParams = hygienizeParameterSpec(paramsExpr, scope);
+    const transformedBody = hygienizeBodyExpressions(body, definitionEnv, transformedParams.scope);
     return {
         ...clauseExpr,
         elements: [
             transformedParams.paramsExpr,
-            ...body.map((element) => hygienizeExpr(element, definitionEnv, transformedParams.scope)),
+            ...transformedBody.expressions,
         ],
     };
 }
@@ -1909,49 +1916,57 @@ function hygienizeLetExpr(expr, definitionEnv, scope) {
         const renamedLet = freshenBinder(firstArg, bodyScope);
         bodyScope = renamedLet.scope;
         const transformedBindings = hygienizeLetBindings(expr.elements[2], definitionEnv, scope, bodyScope);
+        const transformedBody = hygienizeBodyExpressions(expr.elements.slice(3), definitionEnv, transformedBindings.scope);
         return {
             ...expr,
             elements: [
                 operator,
                 renamedLet.symbol,
                 transformedBindings.bindingsExpr,
-                ...expr.elements
-                    .slice(3)
-                    .map((element) => hygienizeExpr(element, definitionEnv, transformedBindings.scope)),
+                ...transformedBody.expressions,
             ],
         };
     }
     const transformedBindings = hygienizeLetBindings(firstArg, definitionEnv, scope, new Map(scope));
+    const transformedBody = hygienizeBodyExpressions(expr.elements.slice(2), definitionEnv, transformedBindings.scope);
     return {
         ...expr,
         elements: [
             operator,
             transformedBindings.bindingsExpr,
-            ...expr.elements
-                .slice(2)
-                .map((element) => hygienizeExpr(element, definitionEnv, transformedBindings.scope)),
+            ...transformedBody.expressions,
         ],
     };
 }
 function hygienizeDefineExpr(expr, definitionEnv, scope) {
+    return hygienizeDefineExprWithScope(expr, definitionEnv, scope).expr;
+}
+function hygienizeDefineExprWithScope(expr, definitionEnv, scope) {
     if (expr.elements.length < 3) {
-        return expr;
+        return { expr, scope };
     }
     const [operator, target, ...rest] = expr.elements;
     if (target.type === 'symbol') {
+        const renamedTarget = freshenBinder(target, new Map(scope));
         return {
-            ...expr,
-            elements: [
-                operator,
-                freshenBinder(target, new Map(scope)).symbol,
-                ...rest.map((element) => hygienizeExpr(element, definitionEnv, scope)),
-            ],
+            expr: {
+                ...expr,
+                elements: [
+                    operator,
+                    renamedTarget.symbol,
+                    ...rest.map((element) => hygienizeExpr(element, definitionEnv, scope)),
+                ],
+            },
+            scope: renamedTarget.scope,
         };
     }
     if (target.type !== 'list' || target.elements.length === 0 || target.elements[0].type !== 'symbol') {
         return {
-            ...expr,
-            elements: expr.elements.map((element) => hygienizeExpr(element, definitionEnv, scope)),
+            expr: {
+                ...expr,
+                elements: expr.elements.map((element) => hygienizeExpr(element, definitionEnv, scope)),
+            },
+            scope,
         };
     }
     let bodyScope = new Map(scope);
@@ -1959,18 +1974,50 @@ function hygienizeDefineExpr(expr, definitionEnv, scope) {
     bodyScope = renamedTarget.scope;
     const transformedParams = hygienizeParameterSpec({ type: 'list', elements: target.elements.slice(1), position: target.position, introduced: target.introduced }, bodyScope);
     return {
-        ...expr,
-        elements: [
-            operator,
-            {
-                type: 'list',
-                position: target.position,
-                introduced: target.introduced,
-                elements: [renamedTarget.symbol, ...transformedParams.paramsExpr.elements],
-            },
-            ...rest.map((element) => hygienizeExpr(element, definitionEnv, transformedParams.scope)),
-        ],
+        expr: {
+            ...expr,
+            elements: [
+                operator,
+                {
+                    type: 'list',
+                    position: target.position,
+                    introduced: target.introduced,
+                    elements: [renamedTarget.symbol, ...transformedParams.paramsExpr.elements],
+                },
+                ...rest.map((element) => hygienizeExpr(element, definitionEnv, transformedParams.scope)),
+            ],
+        },
+        scope: renamedTarget.scope,
     };
+}
+function hygienizeBodyExpressions(expressions, definitionEnv, scope) {
+    let currentScope = new Map(scope);
+    const transformedExpressions = [];
+    for (const expression of expressions) {
+        const transformed = hygienizeBodyExpression(expression, definitionEnv, currentScope);
+        transformedExpressions.push(transformed.expr);
+        currentScope = transformed.scope;
+    }
+    return { expressions: transformedExpressions, scope: currentScope };
+}
+function hygienizeBodyExpression(expr, definitionEnv, scope) {
+    if (expr.type === 'list' && expr.introduced && expr.elements[0]?.type === 'symbol') {
+        switch (expr.elements[0].name) {
+            case 'define':
+                return hygienizeDefineExprWithScope(expr, definitionEnv, scope);
+            case 'begin': {
+                const transformedBody = hygienizeBodyExpressions(expr.elements.slice(1), definitionEnv, scope);
+                return {
+                    expr: {
+                        ...expr,
+                        elements: [expr.elements[0], ...transformedBody.expressions],
+                    },
+                    scope: transformedBody.scope,
+                };
+            }
+        }
+    }
+    return { expr: hygienizeExpr(expr, definitionEnv, scope), scope };
 }
 function hygienizeParameterSpec(paramsExpr, scope) {
     let nextScope = new Map(scope);
@@ -2040,6 +2087,9 @@ function freshenBinder(symbol, scope) {
 function freshResolvedName(name) {
     freshIdentifierCounter += 1;
     return `__macro_${freshIdentifierCounter}_${name}`;
+}
+function isCallCcExpr(expr) {
+    return expr?.type === 'list' && expr.elements[0]?.type === 'symbol' && expr.elements[0].name === 'call/cc';
 }
 function isEllipsisExpr(expr, ellipsis) {
     return expr.type === 'symbol' && expr.name === ellipsis;
