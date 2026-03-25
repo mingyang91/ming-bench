@@ -1,6 +1,7 @@
 pub mod error;
 mod builtins;
 mod macros;
+mod parser;
 
 pub use error::EvalError;
 
@@ -48,7 +49,7 @@ pub(crate) enum Value {
         body: Vec<Ast>,
         env: Env,
     },
-    Pair(Box<Value>, Box<Value>),
+    Pair(Rc<RefCell<(Value, Value)>>),
     Builtin(fn(&[Value], &mut String) -> Result<Value, EvalError>),
     Macro {
         literals: Vec<String>,
@@ -102,6 +103,49 @@ pub(crate) fn make_rational(n: i64, d: i64) -> Value {
     let n = sign * (n / g);
     let d = d / g;
     if d == 1 { Value::Integer(n) } else { Value::Rational(n, d) }
+}
+
+pub(crate) fn make_pair(car: Value, cdr: Value) -> Value {
+    Value::Pair(Rc::new(RefCell::new((car, cdr))))
+}
+
+pub(crate) fn vec_to_list(items: Vec<Value>) -> Value {
+    let mut result = Value::List(vec![]);
+    for item in items.into_iter().rev() {
+        result = make_pair(item, result);
+    }
+    result
+}
+
+pub(crate) fn value_to_vec(val: &Value) -> Option<Vec<Value>> {
+    match val {
+        Value::List(items) => Some(items.clone()),
+        Value::Pair(_) => {
+            let mut result = Vec::new();
+            let mut current = val.clone();
+            let mut limit = 10_000_000usize;
+            loop {
+                match current {
+                    Value::List(ref items) if items.is_empty() => return Some(result),
+                    Value::List(ref items) => {
+                        result.extend(items.iter().cloned());
+                        return Some(result);
+                    }
+                    Value::Pair(ref p) => {
+                        limit = limit.checked_sub(1)?;
+                        let (car, cdr) = {
+                            let b = p.borrow();
+                            (b.0.clone(), b.1.clone())
+                        };
+                        result.push(car);
+                        current = cdr;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        _ => None,
+    }
 }
 
 pub(crate) type Env = Rc<RefCell<Environment>>;
@@ -212,7 +256,7 @@ impl Value {
                 let inner: Vec<String> = items.iter().map(|v| v.display_value()).collect();
                 format!("({})", inner.join(" "))
             }
-            Value::Pair(a, b) => format!("({} . {})", a.display_value(), b.display_value()),
+            Value::Pair(_) => display_pair(self, false),
             Value::Lambda { .. } | Value::Builtin(_)
             | Value::RecordConstructor { .. } | Value::RecordPredicate { .. }
             | Value::RecordAccessor { .. }
@@ -240,7 +284,7 @@ impl Value {
                 let inner: Vec<String> = items.iter().map(|v| v.display_repr()).collect();
                 format!("({})", inner.join(" "))
             }
-            Value::Pair(a, b) => format!("({} . {})", a.display_repr(), b.display_repr()),
+            Value::Pair(_) => display_pair(self, true),
             Value::Vector(v) => {
                 let items = v.borrow();
                 let inner: Vec<String> = items.iter().map(|v| v.display_repr()).collect();
@@ -248,6 +292,46 @@ impl Value {
             }
             _ => self.display_value(),
         }
+    }
+}
+
+fn display_pair(val: &Value, use_repr: bool) -> String {
+    let mut parts = Vec::new();
+    let mut current = val.clone();
+    let mut seen = std::collections::HashSet::new();
+    let mut improper_tail = None;
+    loop {
+        match current {
+            Value::List(ref items) if items.is_empty() => break,
+            Value::List(ref items) => {
+                // Non-empty List in cdr position: extend with its elements
+                for item in items {
+                    parts.push(if use_repr { item.display_repr() } else { item.display_value() });
+                }
+                break;
+            }
+            Value::Pair(ref p) => {
+                let addr = Rc::as_ptr(p) as usize;
+                if !seen.insert(addr) {
+                    break; // cycle detected
+                }
+                let (car, cdr) = {
+                    let b = p.borrow();
+                    (b.0.clone(), b.1.clone())
+                };
+                parts.push(if use_repr { car.display_repr() } else { car.display_value() });
+                current = cdr;
+            }
+            other => {
+                improper_tail = Some(if use_repr { other.display_repr() } else { other.display_value() });
+                break;
+            }
+        }
+    }
+    if let Some(tail) = improper_tail {
+        format!("({} . {})", parts.join(" "), tail)
+    } else {
+        format!("({})", parts.join(" "))
     }
 }
 
@@ -265,242 +349,7 @@ fn ast_to_value(ast: &Ast) -> Value {
     }
 }
 
-// ---- Parser ----
-
-struct Parser {
-    chars: Vec<char>,
-    pos: usize,
-    line: usize,
-    col: usize,
-}
-
-impl Parser {
-    fn new(input: &str) -> Self {
-        Self {
-            chars: input.chars().collect(),
-            pos: 0,
-            line: 1,
-            col: 1,
-        }
-    }
-
-    fn skip_whitespace(&mut self) {
-        while self.pos < self.chars.len() {
-            if self.chars[self.pos].is_whitespace() {
-                self.next_char();
-            } else if self.chars[self.pos] == ';' {
-                while self.pos < self.chars.len() && self.chars[self.pos] != '\n' {
-                    self.next_char();
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
-    }
-
-    fn next_char(&mut self) -> Option<char> {
-        let ch = self.chars.get(self.pos).copied();
-        if let Some(c) = ch {
-            self.pos += 1;
-            if c == '\n' {
-                self.line += 1;
-                self.col = 1;
-            } else {
-                self.col += 1;
-            }
-        }
-        ch
-    }
-
-    fn parse_expr(&mut self) -> Result<Ast, EvalError> {
-        self.skip_whitespace();
-        let line = self.line;
-        let col = self.col;
-        match self.peek() {
-            None => Err(EvalError::Parse("unexpected end of input".into())),
-            Some('\'') => {
-                self.next_char(); // consume quote
-                let expr = self.parse_expr()?;
-                Ok(Ast {
-                    kind: AstKind::List(vec![
-                        Ast { kind: AstKind::Symbol("quote".into()), line, col },
-                        expr,
-                    ]),
-                    line,
-                    col,
-                })
-            }
-            Some('(') => self.parse_list(line, col),
-            Some('"') => self.parse_string(line, col),
-            Some('#') => self.parse_hash(line, col),
-            _ => self.parse_atom(line, col),
-        }
-    }
-
-    fn parse_list(&mut self, line: usize, col: usize) -> Result<Ast, EvalError> {
-        self.next_char(); // consume '('
-        let mut items = Vec::new();
-        loop {
-            self.skip_whitespace();
-            match self.peek() {
-                None => return Err(EvalError::Parse("unclosed parenthesis".into())),
-                Some(')') => {
-                    self.next_char();
-                    return Ok(Ast { kind: AstKind::List(items), line, col });
-                }
-                _ => items.push(self.parse_expr()?),
-            }
-        }
-    }
-
-    fn parse_string(&mut self, line: usize, col: usize) -> Result<Ast, EvalError> {
-        self.next_char(); // consume opening '"'
-        let mut s = String::new();
-        loop {
-            match self.next_char() {
-                None => return Err(EvalError::Parse("unclosed string".into())),
-                Some('"') => return Ok(Ast { kind: AstKind::Str(s), line, col }),
-                Some('\\') => match self.next_char() {
-                    Some('n') => s.push('\n'),
-                    Some('t') => s.push('\t'),
-                    Some('\\') => s.push('\\'),
-                    Some('"') => s.push('"'),
-                    Some(c) => s.push(c),
-                    None => return Err(EvalError::Parse("unclosed string escape".into())),
-                },
-                Some(c) => s.push(c),
-            }
-        }
-    }
-
-    fn parse_hash(&mut self, line: usize, col: usize) -> Result<Ast, EvalError> {
-        self.next_char(); // consume '#'
-        if let Some('(') = self.peek() {
-            // Vector literal #(...)
-            self.next_char(); // consume '('
-            let mut items = Vec::new();
-            loop {
-                self.skip_whitespace();
-                match self.peek() {
-                    None => return Err(EvalError::Parse("unclosed vector literal".into())),
-                    Some(')') => {
-                        self.next_char();
-                        // Represent as (vector item ...) for eval
-                        let mut elems = vec![Ast { kind: AstKind::Symbol("vector".into()), line, col }];
-                        elems.extend(items);
-                        return Ok(Ast { kind: AstKind::List(elems), line, col });
-                    }
-                    _ => items.push(self.parse_expr()?),
-                }
-            }
-        }
-        match self.next_char() {
-            Some('t') => {
-                if self.peek().is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '-' && c != '!' && c != '?') {
-                    Ok(Ast { kind: AstKind::Boolean(true), line, col })
-                } else {
-                    Err(EvalError::Parse("invalid boolean literal".into()))
-                }
-            }
-            Some('f') => {
-                if self.peek().is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '-' && c != '!' && c != '?') {
-                    Ok(Ast { kind: AstKind::Boolean(false), line, col })
-                } else {
-                    Err(EvalError::Parse("invalid boolean literal".into()))
-                }
-            }
-            Some('\\') => {
-                // Character literal: #\x, #\space, #\newline, etc.
-                match self.next_char() {
-                    None => Err(EvalError::Parse("unexpected end of character literal".into())),
-                    Some(c) => {
-                        // Check for named characters
-                        let mut name = String::new();
-                        name.push(c);
-                        while let Some(nc) = self.peek() {
-                            if nc.is_alphabetic() {
-                                name.push(nc);
-                                self.next_char();
-                            } else {
-                                break;
-                            }
-                        }
-                        let ch = if name.len() == 1 {
-                            name.chars().next().expect("single-char name is non-empty")
-                        } else {
-                            match name.as_str() {
-                                "space" => ' ',
-                                "newline" => '\n',
-                                "tab" => '\t',
-                                _ => return Err(EvalError::Parse(format!("unknown character name: {}", name))),
-                            }
-                        };
-                        Ok(Ast { kind: AstKind::Char(ch), line, col })
-                    }
-                }
-            }
-            _ => Err(EvalError::Parse("invalid hash literal".into())),
-        }
-    }
-
-    fn parse_atom(&mut self, line: usize, col: usize) -> Result<Ast, EvalError> {
-        let mut token = String::new();
-        while let Some(c) = self.peek() {
-            if c.is_whitespace() || c == '(' || c == ')' || c == '"' || c == ';' {
-                break;
-            }
-            token.push(c);
-            self.next_char();
-        }
-        if token.is_empty() {
-            return Err(EvalError::Parse("unexpected character".into()));
-        }
-        if let Ok(n) = token.parse::<i64>() {
-            return Ok(Ast { kind: AstKind::Integer(n), line, col });
-        }
-        // Rational literal: digits/digits (e.g. 1/3, -5/2)
-        if let Some(slash) = token.find('/') {
-            if let (Ok(n), Ok(d)) = (token[..slash].parse::<i64>(), token[slash+1..].parse::<i64>()) {
-                if d != 0 {
-                    let sign = if (n < 0) ^ (d < 0) { -1 } else { 1 };
-                    let na = n.abs();
-                    let da = d.abs();
-                    let g = gcd(na, da);
-                    let n2 = sign * (na / g);
-                    let d2 = da / g;
-                    if d2 == 1 {
-                        return Ok(Ast { kind: AstKind::Integer(n2), line, col });
-                    }
-                    return Ok(Ast { kind: AstKind::Rational(n2, d2), line, col });
-                }
-            }
-        }
-        // Float literal
-        if let Ok(f) = token.parse::<f64>() {
-            return Ok(Ast { kind: AstKind::Float(f), line, col });
-        }
-        Ok(Ast { kind: AstKind::Symbol(token), line, col })
-    }
-
-    fn parse_all(&mut self) -> Result<Vec<Ast>, EvalError> {
-        let mut exprs = Vec::new();
-        loop {
-            self.skip_whitespace();
-            if self.pos >= self.chars.len() {
-                break;
-            }
-            exprs.push(self.parse_expr()?);
-        }
-        if exprs.is_empty() {
-            return Err(EvalError::Parse("empty input".into()));
-        }
-        Ok(exprs)
-    }
-}
+use parser::Parser;
 
 // ---- Evaluator ----
 
@@ -582,11 +431,14 @@ fn eval_inner(ast: &Ast, env: &Env, output: &mut String) -> Result<Value, EvalEr
                             continue;
                         }
                         "cond" => {
-                            if let Some(tail) = eval_cond_tail(&items[1..], &cur_env, output)? {
-                                cur_ast = tail;
-                                continue;
+                            match eval_cond_tail(&items[1..], &cur_env, output)? {
+                                CondResult::TailExpr(tail) => {
+                                    cur_ast = tail;
+                                    continue;
+                                }
+                                CondResult::DirectValue(val) => return Ok(val),
+                                CondResult::NoMatch => return Ok(Value::Void),
                             }
-                            return Ok(Value::Void);
                         }
                         "and" => {
                             if items.len() == 1 {
@@ -664,7 +516,7 @@ fn eval_inner(ast: &Ast, env: &Env, output: &mut String) -> Result<Value, EvalEr
                         }
                         if let Some(rest) = &rest_param {
                             let rest_args = args[params.len()..].to_vec();
-                            local_env.borrow_mut().set(rest.clone(), Value::List(rest_args));
+                            local_env.borrow_mut().set(rest.clone(), vec_to_list(rest_args));
                         }
                         if body.is_empty() {
                             return Ok(Value::Void);
@@ -691,7 +543,7 @@ fn eval_inner(ast: &Ast, env: &Env, output: &mut String) -> Result<Value, EvalEr
                             }
                             if let Some(rest) = &rest_param {
                                 let rest_args = args[params.len()..].to_vec();
-                                local_env.borrow_mut().set(rest.clone(), Value::List(rest_args));
+                                local_env.borrow_mut().set(rest.clone(), vec_to_list(rest_args));
                             }
                             if body.is_empty() {
                                 return Ok(Value::Void);
@@ -796,30 +648,44 @@ fn eval_regular_let(
 }
 
 /// Evaluate cond clauses, returning the tail expression for TCO if a clause matches.
+enum CondResult {
+    NoMatch,
+    TailExpr(Ast),
+    DirectValue(Value),
+}
+
 fn eval_cond_tail(
     clauses: &[Ast],
     env: &Env,
     output: &mut String,
-) -> Result<Option<Ast>, EvalError> {
+) -> Result<CondResult, EvalError> {
     for clause in clauses {
         let citems = match &clause.kind {
-            AstKind::List(citems) if citems.len() >= 2 => citems,
+            AstKind::List(citems) if !citems.is_empty() => citems,
             _ => return Err(EvalError::Type("cond: invalid clause".into())),
         };
         let is_else = matches!(&citems[0].kind, AstKind::Symbol(s) if s == "else");
-        let test_true = if is_else {
-            true
-        } else {
-            eval(&citems[0], env, output)?.is_truthy()
-        };
-        if test_true {
+        if is_else {
+            if citems.len() < 2 {
+                return Err(EvalError::Type("cond: else clause needs a body".into()));
+            }
             for expr in &citems[1..citems.len() - 1] {
                 eval(expr, env, output)?;
             }
-            return Ok(Some(citems.last().expect("cond clause is non-empty").clone()));
+            return Ok(CondResult::TailExpr(citems.last().expect("else clause non-empty").clone()));
+        }
+        let test_val = eval(&citems[0], env, output)?;
+        if test_val.is_truthy() {
+            if citems.len() == 1 {
+                return Ok(CondResult::DirectValue(test_val));
+            }
+            for expr in &citems[1..citems.len() - 1] {
+                eval(expr, env, output)?;
+            }
+            return Ok(CondResult::TailExpr(citems.last().expect("cond clause non-empty").clone()));
         }
     }
-    Ok(None)
+    Ok(CondResult::NoMatch)
 }
 
 /// Evaluate short-circuit `and` arguments (all but the last).
@@ -1078,6 +944,7 @@ pub(crate) fn eqv(a: &Value, b: &Value) -> bool {
         (Value::Char(x), Value::Char(y)) => x == y,
         (Value::Symbol(x), Value::Symbol(y)) => x == y,
         (Value::List(x), Value::List(y)) => x.is_empty() && y.is_empty(),
+        (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(a, b),
         _ => false,
     }
 }
@@ -1361,7 +1228,7 @@ fn apply(func: &Value, args: &[Value], output: &mut String) -> Result<Value, Eva
             }
             if let Some(rest) = rest_param {
                 let rest_args = args[params.len()..].to_vec();
-                local_env.borrow_mut().set(rest.clone(), Value::List(rest_args));
+                local_env.borrow_mut().set(rest.clone(), vec_to_list(rest_args));
             }
             let mut result = Value::Void;
             for expr in body {
@@ -1383,7 +1250,7 @@ fn apply(func: &Value, args: &[Value], output: &mut String) -> Result<Value, Eva
                     }
                     if let Some(rest) = rest_param {
                         let rest_args = args[params.len()..].to_vec();
-                        local_env.borrow_mut().set(rest.clone(), Value::List(rest_args));
+                        local_env.borrow_mut().set(rest.clone(), vec_to_list(rest_args));
                     }
                     let mut result = Value::Void;
                     for expr in body {
@@ -1437,7 +1304,7 @@ fn apply(func: &Value, args: &[Value], output: &mut String) -> Result<Value, Eva
         | Value::Str(_)
         | Value::Char(_)
         | Value::List(_)
-        | Value::Pair(_, _)
+        | Value::Pair(_)
         | Value::Symbol(_)
         | Value::Macro { .. }
         | Value::Record { .. }
