@@ -54,6 +54,8 @@ public class Evaluator {
 
     record Lambda(List<String> params, String restParam, List<Object> body, Env env) {}
 
+    record CaseLambda(List<Lambda> clauses) {}
+
     // Source position tracking
     record Pos(int line, int col) {
         @Override public String toString() { return line + ":" + col; }
@@ -132,7 +134,7 @@ public class Evaluator {
 
     private static final java.util.Set<String> SPECIAL_FORMS = java.util.Set.of(
         "quote", "if", "define", "lambda", "and", "or", "let", "set!", "begin", "cond",
-        "define-syntax", "syntax-rules", "else", "let*", "letrec", "define-record-type"
+        "define-syntax", "syntax-rules", "else", "let*", "letrec", "define-record-type", "case-lambda"
     );
 
     private int gensymCounter = 0;
@@ -603,6 +605,33 @@ public class Evaluator {
                     case "define-record-type" -> {
                         return evalDefineRecordType(list, env, pos);
                     }
+                    case "case-lambda" -> {
+                        List<Lambda> clauses = new ArrayList<>();
+                        for (int i = 1; i < list.size(); i++) {
+                            Object clauseRaw = unwrap(list.get(i));
+                            if (!(clauseRaw instanceof List<?> clause) || clause.size() < 2)
+                                throw new EvalError("case-lambda: invalid clause" + posStr(pos));
+                            Object paramSpec = unwrap(clause.get(0));
+                            if (!(paramSpec instanceof List<?> paramList))
+                                throw new EvalError("case-lambda: params must be a list" + posStr(pos));
+                            List<String> params = new ArrayList<>();
+                            String restParam = null;
+                            for (int pi = 0; pi < paramList.size(); pi++) {
+                                String s = unwrap(paramList.get(pi)) instanceof String str ? str : null;
+                                if (s == null) throw new EvalError("parameter must be a symbol" + posStr(pos));
+                                if (".".equals(s)) {
+                                    if (pi + 1 >= paramList.size()) throw new EvalError("missing rest parameter after ." + posStr(pos));
+                                    restParam = unwrap(paramList.get(pi + 1)) instanceof String rp ? rp : null;
+                                    if (restParam == null) throw new EvalError("rest parameter must be a symbol" + posStr(pos));
+                                    break;
+                                }
+                                params.add(s);
+                            }
+                            List<Object> body = new ArrayList<>(clause.subList(1, clause.size()));
+                            clauses.add(new Lambda(params, restParam, body, env));
+                        }
+                        return new CaseLambda(clauses);
+                    }
                 }
             }
 
@@ -748,6 +777,20 @@ public class Evaluator {
                 result = eval(bodyExpr, callEnv);
             }
             return result;
+        }
+        if (proc instanceof CaseLambda cl) {
+            for (Lambda lam : cl.clauses()) {
+                if (lam.restParam() != null) {
+                    if (args.size() >= lam.params().size()) {
+                        return applyProc(lam, args, pos);
+                    }
+                } else {
+                    if (args.size() == lam.params().size()) {
+                        return applyProc(lam, args, pos);
+                    }
+                }
+            }
+            throw new EvalError("no matching clause in case-lambda for " + args.size() + " arguments" + posStr(pos));
         }
         throw new EvalError("not a procedure: " + schemeToString(proc) + posStr(pos));
     }
@@ -934,6 +977,7 @@ public class Evaluator {
         if (val instanceof SchemeRecord r) return "#<record " + r.type.name + ">";
         if (val instanceof Builtin b) return "#<procedure " + b.name() + ">";
         if (val instanceof Lambda) return "#<procedure>";
+        if (val instanceof CaseLambda) return "#<procedure>";
         if (val instanceof Cons) {
             StringBuilder sb = new StringBuilder("(");
             Object cur = val;

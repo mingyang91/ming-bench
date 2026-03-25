@@ -341,6 +341,7 @@ final class Builtins {
         define("pair?", args -> { requireArgCount(args, 1, "pair?"); return args.get(0) instanceof Cons; });
         define("symbol?", args -> { requireArgCount(args, 1, "symbol?"); return args.get(0) instanceof String; });
         define("char?", args -> { requireArgCount(args, 1, "char?"); return args.get(0) instanceof SchemeChar; });
+        define("procedure?", args -> { requireArgCount(args, 1, "procedure?"); Object a = args.get(0); return a instanceof Evaluator.Lambda || a instanceof Evaluator.CaseLambda || a instanceof Evaluator.Builtin; });
     }
 
     // --- I/O ---
