@@ -118,7 +118,7 @@ export function evalStrWithLimit(input, maxSteps) {
  */
 export function evalStrWithOutput(input) {
     const { result, output } = evaluateProgram(input);
-    return { result: formatValue(result), output };
+    return { result: formatEvalStrWithOutputResult(result), output };
 }
 function evaluateProgram(input, maxSteps) {
     const expressions = parseProgram(input);
@@ -3735,6 +3735,9 @@ function buildErrorMessage(args) {
 }
 function formatDisplayValue(value) {
     return formatValueInternal(value, 'display', new Set());
+}
+function formatEvalStrWithOutputResult(value) {
+    return value.type === 'string' ? value.value : formatValue(value);
 }
 function formatValue(value) {
     return formatValueInternal(value, 'write', new Set());

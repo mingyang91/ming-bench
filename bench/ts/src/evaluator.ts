@@ -375,7 +375,7 @@ export function evalStrWithLimit(input: string, maxSteps: number): string {
  */
 export function evalStrWithOutput(input: string): { result: string; output: string } {
   const { result, output } = evaluateProgram(input);
-  return { result: formatValue(result), output };
+  return { result: formatEvalStrWithOutputResult(result), output };
 }
 
 function evaluateProgram(input: string, maxSteps?: number): { result: SchemeValue; output: string } {
@@ -6051,6 +6051,10 @@ function buildErrorMessage(args: EvaluatedArg[]): string {
 
 function formatDisplayValue(value: SchemeValue): string {
   return formatValueInternal(value, 'display', new Set());
+}
+
+function formatEvalStrWithOutputResult(value: SchemeValue): string {
+  return value.type === 'string' ? value.value : formatValue(value);
 }
 
 function formatValue(value: SchemeValue): string {
