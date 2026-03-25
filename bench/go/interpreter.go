@@ -26,12 +26,17 @@ type booleanValue bool
 type integerValue int
 type stringValue string
 type symbolValue string
+type charValue rune
 
 type listValue struct {
 	elements []value
 }
 
 type voidValue struct{}
+
+type evalContext struct {
+	output strings.Builder
+}
 
 type builtinProc func(args []value) (value, error)
 
@@ -47,26 +52,36 @@ type environment struct {
 }
 
 func evalString(input string) (string, error) {
+	result, _, err := evalStringWithOutput(input)
+	return result, err
+}
+
+func evalStringWithOutput(input string) (string, string, error) {
 	nodes, err := parseProgram(input)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if len(nodes) == 0 {
-		return "", errorAt(startPos(), "empty input")
+		return "", "", errorAt(startPos(), "empty input")
 	}
 
-	env := baseEnv()
+	ctx := &evalContext{}
+	env := baseEnv(ctx)
 	last := value(voidValue{})
 	for _, expr := range nodes {
 		last, err = eval(expr, env)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 	}
-	return formatValue(last)
+	result, err := formatValue(last)
+	if err != nil {
+		return "", "", err
+	}
+	return result, ctx.output.String(), nil
 }
 
-func baseEnv() *environment {
+func baseEnv(ctx *evalContext) *environment {
 	env := newEnvironment(nil)
 	env.define("+", builtinNumericFold("+"))
 	env.define("-", builtinSub())
@@ -104,6 +119,21 @@ func baseEnv() *environment {
 		_, ok := v.(symbolValue)
 		return ok
 	}))
+	env.define("char?", builtinPredicate(func(v value) bool {
+		_, ok := v.(charValue)
+		return ok
+	}))
+	env.define("display", builtinDisplay(ctx))
+	env.define("write", builtinWrite(ctx))
+	env.define("newline", builtinNewline(ctx))
+	env.define("string-append", builtinStringAppend())
+	env.define("string-length", builtinStringLength())
+	env.define("substring", builtinSubstring())
+	env.define("string->number", builtinStringToNumber())
+	env.define("number->string", builtinNumberToString())
+	env.define("symbol->string", builtinSymbolToString())
+	env.define("string->symbol", builtinStringToSymbol())
+	env.define("string-ref", builtinStringRef())
 	return env
 }
 
@@ -725,12 +755,210 @@ func builtinPredicate(check func(value) bool) builtinProc {
 	}
 }
 
+func builtinDisplay(ctx *evalContext) builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "display expects exactly 1 argument"}
+		}
+
+		text, err := formatDisplayValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		ctx.output.WriteString(text)
+		return voidValue{}, nil
+	}
+}
+
+func builtinWrite(ctx *evalContext) builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "write expects exactly 1 argument"}
+		}
+
+		text, err := formatValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		ctx.output.WriteString(text)
+		return voidValue{}, nil
+	}
+}
+
+func builtinNewline(ctx *evalContext) builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 0 {
+			return nil, &EvalError{Message: "newline expects exactly 0 arguments"}
+		}
+
+		ctx.output.WriteByte('\n')
+		return voidValue{}, nil
+	}
+}
+
+func builtinStringAppend() builtinProc {
+	return func(args []value) (value, error) {
+		var builder strings.Builder
+		for _, arg := range args {
+			str, err := expectStringValue(arg)
+			if err != nil {
+				return nil, err
+			}
+			builder.WriteString(str)
+		}
+		return stringValue(builder.String()), nil
+	}
+}
+
+func builtinStringLength() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string-length expects exactly 1 argument"}
+		}
+
+		str, err := expectStringValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return integerValue(utf8.RuneCountInString(str)), nil
+	}
+}
+
+func builtinSubstring() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 3 {
+			return nil, &EvalError{Message: "substring expects exactly 3 arguments"}
+		}
+
+		str, err := expectStringValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+
+		start, err := expectIntegerValue(args[1])
+		if err != nil {
+			return nil, err
+		}
+		end, err := expectIntegerValue(args[2])
+		if err != nil {
+			return nil, err
+		}
+
+		runes := []rune(str)
+		if start < 0 || end < start || end > len(runes) {
+			return nil, &EvalError{Message: "substring indices out of range"}
+		}
+
+		return stringValue(string(runes[start:end])), nil
+	}
+}
+
+func builtinStringToNumber() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string->number expects exactly 1 argument"}
+		}
+
+		str, err := expectStringValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+
+		n, parseErr := strconv.Atoi(str)
+		if parseErr != nil {
+			return booleanValue(false), nil
+		}
+		return integerValue(n), nil
+	}
+}
+
+func builtinNumberToString() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "number->string expects exactly 1 argument"}
+		}
+
+		n, err := expectIntegerValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return stringValue(strconv.Itoa(n)), nil
+	}
+}
+
+func builtinSymbolToString() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "symbol->string expects exactly 1 argument"}
+		}
+
+		sym, err := expectSymbolValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return stringValue(sym), nil
+	}
+}
+
+func builtinStringToSymbol() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string->symbol expects exactly 1 argument"}
+		}
+
+		str, err := expectStringValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return symbolValue(str), nil
+	}
+}
+
+func builtinStringRef() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "string-ref expects exactly 2 arguments"}
+		}
+
+		str, err := expectStringValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		index, err := expectIntegerValue(args[1])
+		if err != nil {
+			return nil, err
+		}
+
+		runes := []rune(str)
+		if index < 0 || index >= len(runes) {
+			return nil, &EvalError{Message: "string-ref index out of range"}
+		}
+		return charValue(runes[index]), nil
+	}
+}
+
 func expectIntegerValue(v value) (int, error) {
 	n, ok := v.(integerValue)
 	if !ok {
 		return 0, &EvalError{Message: "expected integer"}
 	}
 	return int(n), nil
+}
+
+func expectStringValue(v value) (string, error) {
+	str, ok := v.(stringValue)
+	if !ok {
+		return "", &EvalError{Message: "expected string"}
+	}
+	return string(str), nil
+}
+
+func expectSymbolValue(v value) (string, error) {
+	sym, ok := v.(symbolValue)
+	if !ok {
+		return "", &EvalError{Message: "expected symbol"}
+	}
+	return string(sym), nil
 }
 
 func expectListValue(v value) (listValue, error) {
@@ -785,6 +1013,8 @@ func formatValue(v value) (string, error) {
 		return strconv.Quote(string(v)), nil
 	case symbolValue:
 		return string(v), nil
+	case charValue:
+		return formatChar(v), nil
 	case listValue:
 		if len(v.elements) == 0 {
 			return "()", nil
@@ -803,6 +1033,42 @@ func formatValue(v value) (string, error) {
 		return "", nil
 	default:
 		return "", &EvalError{Message: "cannot format value"}
+	}
+}
+
+func formatDisplayValue(v value) (string, error) {
+	switch v := v.(type) {
+	case stringValue:
+		return string(v), nil
+	case charValue:
+		return string(rune(v)), nil
+	case listValue:
+		if len(v.elements) == 0 {
+			return "()", nil
+		}
+
+		parts := make([]string, len(v.elements))
+		for i, element := range v.elements {
+			formatted, err := formatDisplayValue(element)
+			if err != nil {
+				return "", err
+			}
+			parts[i] = formatted
+		}
+		return "(" + strings.Join(parts, " ") + ")", nil
+	default:
+		return formatValue(v)
+	}
+}
+
+func formatChar(v charValue) string {
+	switch rune(v) {
+	case ' ':
+		return "#\\space"
+	case '\n':
+		return "#\\newline"
+	default:
+		return "#\\" + string(rune(v))
 	}
 }
 
