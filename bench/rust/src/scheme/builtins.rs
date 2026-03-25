@@ -712,7 +712,7 @@ fn builtin_is_procedure(args: &[Value], _output: &mut String) -> Result<Value, E
         Value::Lambda { .. } | Value::Builtin(_) | Value::CaseLambda { .. }
         | Value::RecordConstructor { .. } | Value::RecordPredicate { .. } | Value::RecordAccessor { .. }
         | Value::CallCC | Value::DynamicWind | Value::Continuation(_, _)
-        | Value::Raise | Value::WithExceptionHandler
+        | Value::Raise | Value::WithExceptionHandler | Value::CallWithValues
     )))
 }
 
@@ -931,6 +931,14 @@ fn builtin_error(args: &[Value], _output: &mut String) -> Result<Value, EvalErro
         args.iter().map(|a| a.display_value()).collect::<Vec<_>>().join(" ")
     };
     Err(EvalError::Type(msg))
+}
+
+fn builtin_values(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() == 1 {
+        Ok(args[0].clone())
+    } else {
+        Ok(Value::Values(args.to_vec()))
+    }
 }
 
 fn builtin_vector_fill(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
@@ -1311,6 +1319,9 @@ pub(crate) fn make_global_env() -> Env {
         // L20: raise, guard, with-exception-handler
         e.set("raise".into(), Value::Raise);
         e.set("with-exception-handler".into(), Value::WithExceptionHandler);
+        // L21: values, call-with-values
+        e.set("values".into(), Value::Builtin(builtin_values));
+        e.set("call-with-values".into(), Value::CallWithValues);
         // c..r compositions (3-letter)
         e.set("caar".into(), Value::Builtin(builtin_caar));
         e.set("cadr".into(), Value::Builtin(builtin_cadr));

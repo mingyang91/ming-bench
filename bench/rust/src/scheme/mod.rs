@@ -90,6 +90,8 @@ pub(crate) enum Value {
     Continuation(Kont, Winders),
     Raise,
     WithExceptionHandler,
+    Values(Vec<Value>),
+    CallWithValues,
 }
 
 // ---- CEK Machine continuation frames ----
@@ -121,6 +123,7 @@ pub(crate) enum Frame {
     ExceptionHandler { handler: Value },
     GuardHandler { var: String, clauses: Vec<Ast>, env: Env },
     RaiseUnwind { raised_val: Value },
+    CallWithValues { consumer: Value },
 }
 
 pub(crate) enum CekState {
@@ -309,7 +312,9 @@ impl Value {
             | Value::RecordAccessor { .. }
             | Value::CaseLambda { .. }
             | Value::CallCC | Value::DynamicWind | Value::Continuation(_, _)
-            | Value::Raise | Value::WithExceptionHandler => "#<procedure>".into(),
+            | Value::Raise | Value::WithExceptionHandler
+            | Value::CallWithValues => "#<procedure>".into(),
+            Value::Values(_) => "#<values>".into(),
             Value::Vector(v) => {
                 let items = v.borrow();
                 let inner: Vec<String> = items.iter().map(|v| v.display_value()).collect();
@@ -1258,6 +1263,17 @@ fn apply(func: &Value, args: &[Value], output: &mut String) -> Result<Value, Eva
             } else {
                 cek_run(CekState::Apply(args[0].clone()), &mut saved_kont.clone(), &mut saved_winders.clone(), output)
             }
+        }
+        Value::CallWithValues => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("call-with-values requires exactly 2 arguments".into()));
+            }
+            let producer_result = apply(&args[0], &[], output)?;
+            let consumer_args = match producer_result {
+                Value::Values(vs) => vs,
+                single => vec![single],
+            };
+            apply(&args[1], &consumer_args, output)
         }
         _ => Err(EvalError::Type(format!("not a procedure: {}", func.display_value()))),
     }

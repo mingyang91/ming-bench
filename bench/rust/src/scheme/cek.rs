@@ -258,22 +258,7 @@ pub(crate) fn cek_apply_frame(frame: Frame, val: Value, kont: &mut Kont, winders
             }
         }
         Frame::CaseKey { clauses, env } => {
-            for clause in &clauses {
-                let items = match &clause.kind {
-                    AstKind::List(items) if items.len() >= 2 => items,
-                    _ => return Err(EvalError::Type("case: invalid clause".into())),
-                };
-                if matches!(&items[0].kind, AstKind::Symbol(s) if s == "else") {
-                    return cek_eval_body(items[1..].to_vec(), env, kont);
-                }
-                if let AstKind::List(datums) = &items[0].kind {
-                    let matched = datums.iter().any(|d| eqv(&val, &ast_to_value(d)));
-                    if matched {
-                        return cek_eval_body(items[1..].to_vec(), env, kont);
-                    }
-                }
-            }
-            Ok(CekState::Apply(Value::Void))
+            apply_case_key(&val, clauses, env, kont)
         }
         Frame::StringSetIdx { var_name, char_expr, env } => {
             let idx = val.as_integer()? as usize;
@@ -323,6 +308,13 @@ pub(crate) fn cek_apply_frame(frame: Frame, val: Value, kont: &mut Kont, winders
         Frame::RaiseUnwind { raised_val } => {
             handle_raise(raised_val, kont, winders, output)
         }
+        Frame::CallWithValues { consumer } => {
+            let args = match val {
+                Value::Values(vs) => vs,
+                single => vec![single],
+            };
+            cek_apply_func(consumer, args, kont, winders, output)
+        }
         Frame::ContinuationWind { mut out_thunks, in_entries, saved_kont, saved_winders, val } => {
             if !out_thunks.is_empty() {
                 let thunk = out_thunks.remove(0);
@@ -355,6 +347,25 @@ pub(crate) fn cek_apply_frame(frame: Frame, val: Value, kont: &mut Kont, winders
             }
         }
     }
+}
+
+fn apply_case_key(val: &Value, clauses: Vec<Ast>, env: Env, kont: &mut Kont) -> Result<CekState, EvalError> {
+    for clause in &clauses {
+        let items = match &clause.kind {
+            AstKind::List(items) if items.len() >= 2 => items,
+            _ => return Err(EvalError::Type("case: invalid clause".into())),
+        };
+        if matches!(&items[0].kind, AstKind::Symbol(s) if s == "else") {
+            return cek_eval_body(items[1..].to_vec(), env, kont);
+        }
+        if let AstKind::List(datums) = &items[0].kind {
+            let matched = datums.iter().any(|d| eqv(val, &ast_to_value(d)));
+            if matched {
+                return cek_eval_body(items[1..].to_vec(), env, kont);
+            }
+        }
+    }
+    Ok(CekState::Apply(Value::Void))
 }
 
 pub(crate) fn cek_apply_func(func: Value, args: Vec<Value>, kont: &mut Kont, winders: &mut Winders, output: &mut String) -> Result<CekState, EvalError> {
@@ -476,6 +487,18 @@ pub(crate) fn cek_apply_func(func: Value, args: Vec<Value>, kont: &mut Kont, win
                 }
                 _ => Err(EvalError::Type(format!("{}: expected {}", field_name, type_name))),
             }
+        }
+        Value::CallWithValues => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("call-with-values requires exactly 2 arguments".into()));
+            }
+            let producer = args[0].clone();
+            let consumer = args[1].clone();
+            kont.push(Frame::CallWithValues { consumer });
+            cek_apply_func(producer, vec![], kont, winders, output)
+        }
+        Value::Values(_) => {
+            Err(EvalError::Type("values: cannot be used as a procedure".into()))
         }
         _ => Err(EvalError::Type(format!("not a procedure: {}", func.display_value()))),
     }
