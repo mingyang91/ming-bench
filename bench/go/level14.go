@@ -331,6 +331,14 @@ func evalDo(args []node, env *environment) (value, error) {
 }
 
 func parseNamedBindings(bindingExprs []node, formName string) ([]namedBindingSpec, error) {
+	return parseNamedBindingsWithOptions(bindingExprs, formName, false)
+}
+
+func parseNamedBindingsAllowDuplicates(bindingExprs []node, formName string) ([]namedBindingSpec, error) {
+	return parseNamedBindingsWithOptions(bindingExprs, formName, true)
+}
+
+func parseNamedBindingsWithOptions(bindingExprs []node, formName string, allowDuplicates bool) ([]namedBindingSpec, error) {
 	specs := make([]namedBindingSpec, len(bindingExprs))
 	for i, bindingExpr := range bindingExprs {
 		binding, ok := bindingExpr.(listNode)
@@ -343,9 +351,11 @@ func parseNamedBindings(bindingExprs []node, formName string) ([]namedBindingSpe
 			return nil, &EvalError{Message: fmt.Sprintf("%s binding names must be symbols", formName)}
 		}
 
-		for j := 0; j < i; j++ {
-			if specs[j].name == name {
-				return nil, &EvalError{Message: fmt.Sprintf("duplicate binding: %s", name)}
+		if !allowDuplicates {
+			for j := 0; j < i; j++ {
+				if specs[j].name == name {
+					return nil, &EvalError{Message: fmt.Sprintf("duplicate binding: %s", name)}
+				}
 			}
 		}
 

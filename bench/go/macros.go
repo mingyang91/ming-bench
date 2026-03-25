@@ -49,10 +49,13 @@ var macroKeywordNames = map[string]struct{}{
 	"letrec*":            {},
 	"or":                 {},
 	"quote":              {},
+	"quasiquote":         {},
 	"set!":               {},
 	"syntax":             {},
 	"syntax-case":        {},
 	"syntax-rules":       {},
+	"unquote":            {},
+	"unquote-splicing":   {},
 	"with-syntax":        {},
 }
 

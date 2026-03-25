@@ -184,7 +184,10 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("call-with-values", builtinCallWithValues())
 	env.define("map", builtinMap())
 	env.define("for-each", builtinForEach())
+	env.define("memq", builtinMemq())
+	env.define("memv", builtinMemv())
 	env.define("member", builtinMember())
+	env.define("assq", builtinAssq())
 	env.define("assv", builtinAssv())
 	env.define("assoc", builtinAssoc())
 	env.define("procedure?", builtinProcedurePredicate())
@@ -470,6 +473,9 @@ func evalList(list listNode, env *environment) (value, *evalStep, error) {
 		case "quote":
 			result, err := evalQuote(list.elements[1:])
 			return result, nil, withErrorPos(err, list.pos)
+		case "quasiquote":
+			result, err := evalQuasiquote(list.elements[1:], env)
+			return result, nil, withErrorPos(err, list.pos)
 		case "lambda":
 			result, err := evalLambda(list.elements[1:], env)
 			return result, nil, withErrorPos(err, list.pos)
@@ -652,16 +658,18 @@ func evalQuote(args []node) (value, error) {
 	return datumFromNode(args[0])
 }
 
+func evalQuasiquote(args []node, env *environment) (value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "quasiquote expects exactly 1 argument"}
+	}
+	return evalQuasiquoteNode(args[0], env, 1)
+}
+
 func evalLambda(args []node, env *environment) (value, error) {
 	if len(args) < 2 {
 		return nil, &EvalError{Message: "lambda expects parameters and a body"}
 	}
-
-	params, ok := args[0].(listNode)
-	if !ok {
-		return nil, &EvalError{Message: "lambda parameters must be a list"}
-	}
-	return makeClosure(params.elements, args[1:], env)
+	return makeClosureFromFormals(args[0], args[1:], env)
 }
 
 func evalCaseLambda(args []node, env *environment) (value, error) {
@@ -716,6 +724,13 @@ func evalCond(args []node, env *environment) (value, *evalStep, error) {
 		}
 		if len(clause.elements) == 1 {
 			return testValue, nil, nil
+		}
+		if isCondArrowClause(clause) {
+			receiver, err := eval(clause.elements[2], env)
+			if err != nil {
+				return nil, nil, err
+			}
+			return startProcedureCall(receiver, []value{testValue}, clause.pos)
 		}
 		return prepareSequence(clause.elements[1:], env)
 	}
@@ -838,6 +853,12 @@ func makeClosureFromFormals(formals node, body []node, env *environment) (*closu
 	switch formals := formals.(type) {
 	case listNode:
 		return makeClosureWithParams(formals.elements, body, env)
+	case dottedListNode:
+		paramExprs := make([]node, 0, len(formals.elements)+2)
+		paramExprs = append(paramExprs, formals.elements...)
+		paramExprs = append(paramExprs, symbolNode{name: ".", pos: formals.pos})
+		paramExprs = append(paramExprs, formals.tail)
+		return makeClosureWithParams(paramExprs, body, env)
 	case symbolNode:
 		if formals.name == "." {
 			return nil, &EvalError{Message: "parameter list must contain only symbols"}
@@ -1024,6 +1045,15 @@ func prepareSequence(exprs []node, env *environment) (value, *evalStep, error) {
 	}
 
 	return nil, &evalStep{expr: exprs[len(exprs)-1], env: env}, nil
+}
+
+func isCondArrowClause(clause listNode) bool {
+	if len(clause.elements) != 3 {
+		return false
+	}
+
+	name, ok := symbolName(clause.elements[1])
+	return ok && name == "=>"
 }
 
 func builtinNumericFold(name string) builtinProc {
@@ -1323,10 +1353,13 @@ func builtinAppend() builtinProc {
 		if len(args) == 0 {
 			return listValue{}, nil
 		}
+		if len(args) == 1 {
+			return args[0], nil
+		}
 
 		var head *pairValue
 		var tail *pairValue
-		for _, arg := range args {
+		for _, arg := range args[:len(args)-1] {
 			cursor := newListCursor(arg)
 			for {
 				element, ok, err := cursor.next()
@@ -1347,9 +1380,12 @@ func builtinAppend() builtinProc {
 				}
 			}
 		}
+
+		last := args[len(args)-1]
 		if head == nil {
-			return listValue{}, nil
+			return last, nil
 		}
+		tail.cdr = last
 		return head, nil
 	}
 }
@@ -1449,9 +1485,21 @@ func builtinForEach() builtinProc {
 }
 
 func builtinMember() builtinProc {
+	return builtinMemSearch("member", equalValues)
+}
+
+func builtinMemq() builtinProc {
+	return builtinMemSearch("memq", eqValues)
+}
+
+func builtinMemv() builtinProc {
+	return builtinMemSearch("memv", eqValues)
+}
+
+func builtinMemSearch(name string, matches func(left value, right value) bool) builtinProc {
 	return func(args []value) (value, error) {
 		if len(args) != 2 {
-			return nil, &EvalError{Message: "member expects exactly 2 arguments"}
+			return nil, &EvalError{Message: fmt.Sprintf("%s expects exactly 2 arguments", name)}
 		}
 
 		current := args[1]
@@ -1460,7 +1508,7 @@ func builtinMember() builtinProc {
 			switch list := current.(type) {
 			case listValue:
 				for i, element := range list.elements {
-					if equalValues(args[0], element) {
+					if matches(args[0], element) {
 						return makeList(copyValues(list.elements[i:])), nil
 					}
 				}
@@ -1470,7 +1518,7 @@ func builtinMember() builtinProc {
 					return nil, &EvalError{Message: "expected list"}
 				}
 				seen[list] = struct{}{}
-				if equalValues(args[0], list.car) {
+				if matches(args[0], list.car) {
 					return current, nil
 				}
 				current = list.cdr
@@ -1509,34 +1557,21 @@ func builtinError() builtinProc {
 }
 
 func builtinAssoc() builtinProc {
-	return func(args []value) (value, error) {
-		if len(args) != 2 {
-			return nil, &EvalError{Message: "assoc expects exactly 2 arguments"}
-		}
+	return builtinAssocSearch("assoc", equalValues)
+}
 
-		alist, err := expectListValue(args[1])
-		if err != nil {
-			return nil, err
-		}
-
-		for _, entry := range alist.elements {
-			key, ok := assocKey(entry)
-			if !ok {
-				return nil, &EvalError{Message: "assoc expects a list of pairs"}
-			}
-			if equalValues(args[0], key) {
-				return entry, nil
-			}
-		}
-
-		return booleanValue(false), nil
-	}
+func builtinAssq() builtinProc {
+	return builtinAssocSearch("assq", eqValues)
 }
 
 func builtinAssv() builtinProc {
+	return builtinAssocSearch("assv", eqValues)
+}
+
+func builtinAssocSearch(name string, matches func(left value, right value) bool) builtinProc {
 	return func(args []value) (value, error) {
 		if len(args) != 2 {
-			return nil, &EvalError{Message: "assv expects exactly 2 arguments"}
+			return nil, &EvalError{Message: fmt.Sprintf("%s expects exactly 2 arguments", name)}
 		}
 
 		alist, err := expectListValue(args[1])
@@ -1547,9 +1582,9 @@ func builtinAssv() builtinProc {
 		for _, entry := range alist.elements {
 			key, ok := assocKey(entry)
 			if !ok {
-				return nil, &EvalError{Message: "assv expects a list of pairs"}
+				return nil, &EvalError{Message: fmt.Sprintf("%s expects a list of pairs", name)}
 			}
-			if eqValues(args[0], key) {
+			if matches(args[0], key) {
 				return entry, nil
 			}
 		}
@@ -2462,11 +2497,15 @@ func copyRunes(runes []rune) []rune {
 }
 
 func makeList(elements []value) value {
+	return makeListWithTail(elements, listValue{})
+}
+
+func makeListWithTail(elements []value, tail value) value {
 	if len(elements) == 0 {
-		return listValue{}
+		return tail
 	}
 
-	var result value = listValue{}
+	var result value = tail
 	for i := len(elements) - 1; i >= 0; i-- {
 		result = &pairValue{car: elements[i], cdr: result}
 	}
@@ -2739,6 +2778,141 @@ func datumFromNode(expr node) (value, error) {
 	default:
 		return nil, &EvalError{Message: "invalid quoted datum"}
 	}
+}
+
+func evalQuasiquoteNode(expr node, env *environment, depth int) (value, error) {
+	if inner, ok := quasiquoteInner(expr); ok {
+		evaluated, err := evalQuasiquoteNode(inner, env, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		return makeList([]value{symbolValue("quasiquote"), evaluated}), nil
+	}
+
+	if inner, ok := unquoteInner(expr); ok {
+		if depth == 1 {
+			return eval(inner, env)
+		}
+		evaluated, err := evalQuasiquoteNode(inner, env, depth-1)
+		if err != nil {
+			return nil, err
+		}
+		return makeList([]value{symbolValue("unquote"), evaluated}), nil
+	}
+
+	if inner, ok := unquoteSplicingInner(expr); ok {
+		if depth == 1 {
+			return nil, &EvalError{Message: "unquote-splicing is only valid within a list or vector"}
+		}
+		evaluated, err := evalQuasiquoteNode(inner, env, depth-1)
+		if err != nil {
+			return nil, err
+		}
+		return makeList([]value{symbolValue("unquote-splicing"), evaluated}), nil
+	}
+
+	switch expr := expr.(type) {
+	case integerValue, rationalValue, inexactValue, booleanValue, stringValue, charValue:
+		return expr, nil
+	case symbolNode:
+		return symbolValue(expr.name), nil
+	case listNode:
+		return evalQuasiquoteList(expr.elements, nil, false, env, depth)
+	case dottedListNode:
+		return evalQuasiquoteList(expr.elements, expr.tail, true, env, depth)
+	case vectorNode:
+		return evalQuasiquoteVector(expr.elements, env, depth)
+	default:
+		return nil, &EvalError{Message: "invalid quasiquote datum"}
+	}
+}
+
+func evalQuasiquoteList(elements []node, tailExpr node, hasTail bool, env *environment, depth int) (value, error) {
+	values := make([]value, 0, len(elements))
+	for _, element := range elements {
+		if inner, ok := unquoteSplicingInner(element); ok && depth == 1 {
+			spliced, err := eval(inner, env)
+			if err != nil {
+				return nil, err
+			}
+			items, err := listElements(spliced)
+			if err != nil {
+				return nil, err
+			}
+			values = append(values, items...)
+			continue
+		}
+
+		evaluated, err := evalQuasiquoteNode(element, env, depth)
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, evaluated)
+	}
+
+	if !hasTail {
+		return makeList(values), nil
+	}
+
+	if _, ok := unquoteSplicingInner(tailExpr); ok && depth == 1 {
+		return nil, &EvalError{Message: "unquote-splicing is only valid in sequence position"}
+	}
+
+	tail, err := evalQuasiquoteNode(tailExpr, env, depth)
+	if err != nil {
+		return nil, err
+	}
+	return makeListWithTail(values, tail), nil
+}
+
+func evalQuasiquoteVector(elements []node, env *environment, depth int) (value, error) {
+	values := make([]value, 0, len(elements))
+	for _, element := range elements {
+		if inner, ok := unquoteSplicingInner(element); ok && depth == 1 {
+			spliced, err := eval(inner, env)
+			if err != nil {
+				return nil, err
+			}
+			items, err := listElements(spliced)
+			if err != nil {
+				return nil, err
+			}
+			values = append(values, items...)
+			continue
+		}
+
+		evaluated, err := evalQuasiquoteNode(element, env, depth)
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, evaluated)
+	}
+	return &vectorValue{elements: values}, nil
+}
+
+func quasiquoteInner(expr node) (node, bool) {
+	return readerFormInner(expr, "quasiquote")
+}
+
+func unquoteInner(expr node) (node, bool) {
+	return readerFormInner(expr, "unquote")
+}
+
+func unquoteSplicingInner(expr node) (node, bool) {
+	return readerFormInner(expr, "unquote-splicing")
+}
+
+func readerFormInner(expr node, name string) (node, bool) {
+	list, ok := expr.(listNode)
+	if !ok || len(list.elements) != 2 {
+		return nil, false
+	}
+
+	head, ok := symbolName(list.elements[0])
+	if !ok || head != name {
+		return nil, false
+	}
+	return list.elements[1], true
 }
 
 func formatValue(v value) (string, error) {
@@ -3186,6 +3360,13 @@ func (p *parser) parseExpr() (node, error) {
 		return p.parseList()
 	case '\'':
 		return p.parseQuote()
+	case '`':
+		return p.parseQuasiquote()
+	case ',':
+		if p.hasPrefix(",@") {
+			return p.parseUnquoteSplicing()
+		}
+		return p.parseUnquote()
 	case '"':
 		return p.parseString()
 	case ')':
@@ -3235,6 +3416,13 @@ func (p *parser) parseDatum() (node, error) {
 		return p.parseDatumList()
 	case '\'':
 		return p.parseQuote()
+	case '`':
+		return p.parseQuasiquote()
+	case ',':
+		if p.hasPrefix(",@") {
+			return p.parseUnquoteSplicing()
+		}
+		return p.parseUnquote()
 	case '"':
 		return p.parseString()
 	case ')':
@@ -3317,6 +3505,54 @@ func (p *parser) parseQuote() (node, error) {
 	return listNode{
 		elements: []node{
 			symbolNode{name: "quote", pos: pos},
+			expr,
+		},
+		pos: pos,
+	}, nil
+}
+
+func (p *parser) parseQuasiquote() (node, error) {
+	pos := p.currentPos()
+	p.offset++
+	expr, err := p.parseDatum()
+	if err != nil {
+		return nil, err
+	}
+	return listNode{
+		elements: []node{
+			symbolNode{name: "quasiquote", pos: pos},
+			expr,
+		},
+		pos: pos,
+	}, nil
+}
+
+func (p *parser) parseUnquote() (node, error) {
+	pos := p.currentPos()
+	p.offset++
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	return listNode{
+		elements: []node{
+			symbolNode{name: "unquote", pos: pos},
+			expr,
+		},
+		pos: pos,
+	}, nil
+}
+
+func (p *parser) parseUnquoteSplicing() (node, error) {
+	pos := p.currentPos()
+	p.offset += 2
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	return listNode{
+		elements: []node{
+			symbolNode{name: "unquote-splicing", pos: pos},
 			expr,
 		},
 		pos: pos,

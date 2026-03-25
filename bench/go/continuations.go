@@ -94,6 +94,12 @@ type condTestCont struct {
 	next    continuation
 }
 
+type condArrowCont struct {
+	arg  value
+	pos  sourcePos
+	next continuation
+}
+
 type caseKeyCont struct {
 	clauses []node
 	env     *environment
@@ -317,6 +323,13 @@ func (m *evalMachine) stepEvalList(list listNode) error {
 			}
 			m.setValue(result, m.cont)
 			return nil
+		case "quasiquote":
+			result, err := evalQuasiquote(args, m.env)
+			if err != nil {
+				return withErrorPos(err, list.pos)
+			}
+			m.setValue(result, m.cont)
+			return nil
 		case "syntax":
 			result, err := evalSyntaxForm(args, m.env)
 			if err != nil {
@@ -494,7 +507,17 @@ func (m *evalMachine) stepContinue() error {
 			m.setValue(m.val, cont.next)
 			return nil
 		}
+		if isCondArrowClause(clause) {
+			m.setEval(clause.elements[2], cont.env, &condArrowCont{
+				arg:  m.val,
+				pos:  clause.pos,
+				next: cont.next,
+			})
+			return nil
+		}
 		return m.startSequence(clause.elements[1:], cont.env, cont.next)
+	case *condArrowCont:
+		return m.enterProcedure(m.val, []value{cont.arg}, cont.pos, cont.next)
 	case *caseKeyCont:
 		return m.resumeCase(cont, m.val)
 	case *letValueCont:
@@ -930,7 +953,7 @@ func (m *evalMachine) startLetStar(args []node, env *environment, pos sourcePos,
 		return &EvalError{Message: "let* bindings must be a list"}
 	}
 
-	specs, err := parseNamedBindings(bindingList.elements, "let*")
+	specs, err := parseNamedBindingsAllowDuplicates(bindingList.elements, "let*")
 	if err != nil {
 		return err
 	}
@@ -1240,6 +1263,12 @@ func cloneContinuation(cont continuation) continuation {
 			env:     cont.env,
 			pos:     cont.pos,
 			next:    cloneContinuation(cont.next),
+		}
+	case *condArrowCont:
+		return &condArrowCont{
+			arg:  cont.arg,
+			pos:  cont.pos,
+			next: cloneContinuation(cont.next),
 		}
 	case *caseKeyCont:
 		return &caseKeyCont{
