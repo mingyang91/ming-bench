@@ -190,11 +190,24 @@ final class Builtins {
     }
 
     private void registerComparison() {
-        define("<", args -> { requireArgCount(args, 2, "<"); return numCompare(args.get(0), args.get(1)) < 0; });
-        define(">", args -> { requireArgCount(args, 2, ">"); return numCompare(args.get(0), args.get(1)) > 0; });
-        define("=", args -> { requireArgCount(args, 2, "="); return numEquals(args.get(0), args.get(1)); });
-        define("<=", args -> { requireArgCount(args, 2, "<="); return numCompare(args.get(0), args.get(1)) <= 0; });
-        define(">=", args -> { requireArgCount(args, 2, ">="); return numCompare(args.get(0), args.get(1)) >= 0; });
+        define("<", args -> { return chainCompare(args, "<", (a, b) -> numCompare(a, b) < 0); });
+        define(">", args -> { return chainCompare(args, ">", (a, b) -> numCompare(a, b) > 0); });
+        define("=", args -> { return chainCompare(args, "=", (a, b) -> numEquals(a, b)); });
+        define("<=", args -> { return chainCompare(args, "<=", (a, b) -> numCompare(a, b) <= 0); });
+        define(">=", args -> { return chainCompare(args, ">=", (a, b) -> numCompare(a, b) >= 0); });
+    }
+
+    @FunctionalInterface
+    private interface NumPred {
+        boolean test(Object a, Object b) throws EvalError;
+    }
+
+    private boolean chainCompare(List<Object> args, String name, NumPred pred) throws EvalError {
+        if (args.size() < 2) throw new EvalError(name + " requires at least 2 arguments");
+        for (int i = 0; i < args.size() - 1; i++) {
+            if (!pred.test(args.get(i), args.get(i + 1))) return false;
+        }
+        return true;
     }
 
     // --- Logic ---

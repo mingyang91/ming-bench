@@ -54,6 +54,7 @@ record Pos(int line, int col) {
 
 class SExpr extends ArrayList<Object> {
     final Pos pos;
+    Object dotTail; // non-null for improper lists like (a b . c)
     SExpr(Pos pos) { super(); this.pos = pos; }
 }
 

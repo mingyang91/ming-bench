@@ -56,7 +56,8 @@ public class Evaluator {
         "quote", "if", "define", "lambda", "and", "or", "let", "set!", "begin", "cond",
         "define-syntax", "syntax-rules", "else", "let*", "letrec", "letrec*", "case",
         "do", "define-record-type", "case-lambda", "guard",
-        "syntax", "syntax-case", "with-syntax"
+        "syntax", "syntax-case", "with-syntax",
+        "quasiquote", "unquote", "unquote-splicing"
     );
 
     private int gensymCounter = 0;
@@ -201,6 +202,10 @@ public class Evaluator {
                     case "quote" -> {
                         if (list.size() != 2) throw new EvalError("quote requires 1 argument" + posStr(pos));
                         mVal = javaToScheme(list.get(1)); mApply = true; return;
+                    }
+                    case "quasiquote" -> {
+                        if (list.size() != 2) throw new EvalError("quasiquote requires 1 argument" + posStr(pos));
+                        mExpr = Quasiquote.expand(list.get(1)); return;
                     }
                     case "if" -> {
                         if (list.size() < 3 || list.size() > 4)
@@ -416,7 +421,14 @@ public class Evaluator {
 
         if (mK instanceof CondK ck) {
             if (!isFalse(mVal)) {
-                if (ck.clause.size() == 1) {
+                if (ck.clause.size() == 3 && "=>".equals(unwrap(ck.clause.get(1)))) {
+                    // (test => proc) — evaluate proc, then apply to test result
+                    Object testVal = mVal;
+                    mK = new CondArrowK(testVal, ck.k);
+                    mExpr = ck.clause.get(2);
+                    mEnv = ck.env;
+                    mApply = false;
+                } else if (ck.clause.size() == 1) {
                     mK = ck.k; // return test value
                 } else {
                     mK = ck.k;
@@ -427,6 +439,13 @@ public class Evaluator {
                 mEnv = ck.env;
                 evalCondStep(ck.form, ck.nextClauseIdx);
             }
+            return;
+        }
+
+        if (mK instanceof CondArrowK ca) {
+            // proc evaluated, apply it to test value
+            mK = ca.k;
+            cekApplyFun(mVal, List.of(ca.testVal), null);
             return;
         }
 
@@ -1088,6 +1107,11 @@ public class Evaluator {
     private Lambda makeLambda(List<?> list, Env env, Pos pos) throws EvalError {
         if (list.size() < 3) throw new EvalError("lambda requires params and body" + posStr(pos));
         Object paramSpec = unwrap(list.get(1));
+        if (paramSpec instanceof String restName) {
+            // (lambda args body) — all args captured as rest
+            List<Object> body = new ArrayList<>(list.subList(2, list.size()));
+            return new Lambda(List.of(), restName, body, env);
+        }
         if (!(paramSpec instanceof List<?> paramList))
             throw new EvalError("lambda params must be a list" + posStr(pos));
         List<String> params = new ArrayList<>();
@@ -1128,6 +1152,12 @@ public class Evaluator {
     // ===== Helper methods =====
 
     private String parseParamList(List<?> paramList, int start, Pos pos) throws EvalError {
+        // Check for dotted pair form: (a b . rest)
+        if (paramList instanceof SExpr sexpr && sexpr.dotTail != null) {
+            String rp = unwrap(sexpr.dotTail) instanceof String r ? r : null;
+            if (rp == null) throw new EvalError("rest parameter must be a symbol" + posStr(pos));
+            return rp;
+        }
         for (int i = start; i < paramList.size(); i++) {
             String s = unwrap(paramList.get(i)) instanceof String str ? str : null;
             if (s == null) throw new EvalError("parameter must be a symbol" + posStr(pos));

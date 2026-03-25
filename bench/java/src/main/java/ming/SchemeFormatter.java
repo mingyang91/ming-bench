@@ -22,6 +22,20 @@ final class SchemeFormatter {
 
     static Object javaToScheme(Object val) {
         if (val instanceof Token t) return javaToScheme(t.value());
+        if (val instanceof SchemeVector v) {
+            Object[] converted = new Object[v.data.length];
+            for (int i = 0; i < v.data.length; i++) {
+                converted[i] = javaToScheme(v.data[i]);
+            }
+            return new SchemeVector(converted);
+        }
+        if (val instanceof SExpr sexpr) {
+            Object tail = sexpr.dotTail != null ? javaToScheme(sexpr.dotTail) : Evaluator.NIL;
+            for (int i = sexpr.size() - 1; i >= 0; i--) {
+                tail = new Cons(javaToScheme(sexpr.get(i)), tail);
+            }
+            return tail;
+        }
         if (val instanceof List<?> list) {
             Object result = Evaluator.NIL;
             for (int i = list.size() - 1; i >= 0; i--) {

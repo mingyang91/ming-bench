@@ -15,7 +15,7 @@ final class SchemeReader {
     private Pos posAt(int line, int col) { return new Pos(line, col); }
 
     private boolean isDelimiter(char c) {
-        return Character.isWhitespace(c) || c == '(' || c == ')' || c == '"' || c == ';' || c == '\'';
+        return Character.isWhitespace(c) || c == '(' || c == ')' || c == '"' || c == ';' || c == '\'' || c == '`' || c == ',';
     }
 
     List<Token> tokenize(String input) throws EvalError {
@@ -37,6 +37,17 @@ final class SchemeReader {
             } else if (c == '\'') {
                 tokens.add(new Token("'", posAt(lineNum, colNum)));
                 i++; colNum++;
+            } else if (c == '`') {
+                tokens.add(new Token("`", posAt(lineNum, colNum)));
+                i++; colNum++;
+            } else if (c == ',') {
+                if (i + 1 < input.length() && input.charAt(i + 1) == '@') {
+                    tokens.add(new Token(",@", posAt(lineNum, colNum)));
+                    i += 2; colNum += 2;
+                } else {
+                    tokens.add(new Token(",", posAt(lineNum, colNum)));
+                    i++; colNum++;
+                }
             } else if (c == '(') {
                 tokens.add(new Token("(", posAt(lineNum, colNum)));
                 i++; colNum++;
@@ -132,6 +143,9 @@ final class SchemeReader {
                     tokens.add(new Token(new SchemeChar(input.charAt(i)), hPos));
                     i++; colNum++;
                 }
+            } else if (next == '(') {
+                tokens.add(new Token("#(", hPos));
+                i += 2; colNum += 2;
             } else if (next == '\'') {
                 tokens.add(new Token("#'", hPos));
                 i += 2; colNum += 2;
@@ -183,11 +197,54 @@ final class SchemeReader {
             quoteExpr.add(quoted);
             return quoteExpr;
         }
+        if ("`".equals(token.value())) {
+            pos[0]++;
+            Object quoted = parse(tokens, pos);
+            SExpr qqExpr = new SExpr(token.pos());
+            qqExpr.add("quasiquote");
+            qqExpr.add(quoted);
+            return qqExpr;
+        }
+        if (",@".equals(token.value())) {
+            pos[0]++;
+            Object unq = parse(tokens, pos);
+            SExpr usExpr = new SExpr(token.pos());
+            usExpr.add("unquote-splicing");
+            usExpr.add(unq);
+            return usExpr;
+        }
+        if (",".equals(token.value())) {
+            pos[0]++;
+            Object unq = parse(tokens, pos);
+            SExpr uqExpr = new SExpr(token.pos());
+            uqExpr.add("unquote");
+            uqExpr.add(unq);
+            return uqExpr;
+        }
+        if ("#(".equals(token.value())) {
+            pos[0]++;
+            List<Object> elems = new ArrayList<>();
+            while (pos[0] < tokens.size() && !")".equals(tokens.get(pos[0]).value())) {
+                elems.add(parse(tokens, pos));
+            }
+            if (pos[0] >= tokens.size()) {
+                throw new EvalError("missing closing paren for vector at " + token.pos());
+            }
+            pos[0]++;
+            return new SchemeVector(elems.toArray());
+        }
         if ("(".equals(token.value())) {
             pos[0]++;
             SExpr list = new SExpr(token.pos());
             while (pos[0] < tokens.size() && !")".equals(tokens.get(pos[0]).value())) {
-                list.add(parse(tokens, pos));
+                Object elem = parse(tokens, pos);
+                Object raw = elem instanceof Token t ? t.value() : elem;
+                if (".".equals(raw) && !list.isEmpty()) {
+                    // dotted pair: (a b . c)
+                    list.dotTail = parse(tokens, pos);
+                    break;
+                }
+                list.add(elem);
             }
             if (pos[0] >= tokens.size()) {
                 throw new EvalError("missing closing paren at " + token.pos());

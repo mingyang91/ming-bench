@@ -91,6 +91,11 @@ final class Continuations {
         final Evaluator.Env env; final Kont k;
         CondK(List<?> c, List<?> f, int ni, Evaluator.Env env, Kont k) { clause=c; form=f; nextClauseIdx=ni; this.env=env; this.k=k; }
     }
+    // Cond =>: evaluated the procedure, now apply to saved test value
+    static final class CondArrowK extends Kont {
+        final Object testVal; final Kont k;
+        CondArrowK(Object testVal, Kont k) { this.testVal=testVal; this.k=k; }
+    }
 
     // Case: evaluated the key
     static final class CaseKeyK extends Kont {
