@@ -3,7 +3,8 @@ import { EvalError } from './evalError.js';
 type Token =
   | { kind: 'paren'; value: '(' | ')' }
   | { kind: 'atom'; value: string }
-  | { kind: 'string'; value: string };
+  | { kind: 'string'; value: string }
+  | { kind: 'quote' };
 
 type Expr =
   | { type: 'number'; value: number }
@@ -127,6 +128,13 @@ function parseProgram(input: string): Expr[] {
       throw new EvalError('missing )');
     }
 
+    if (token.kind === 'quote') {
+      return {
+        type: 'list',
+        elements: [{ type: 'symbol', name: 'quote' }, parseExpr()],
+      };
+    }
+
     if (token.kind === 'string') {
       return { type: 'string', value: token.value };
     }
@@ -168,6 +176,12 @@ function tokenize(input: string): Token[] {
 
     if (ch === '(' || ch === ')') {
       tokens.push({ kind: 'paren', value: ch });
+      index += 1;
+      continue;
+    }
+
+    if (ch === "'") {
+      tokens.push({ kind: 'quote' });
       index += 1;
       continue;
     }
@@ -281,6 +295,12 @@ function evaluateList(elements: Expr[], env: Environment): SchemeValue {
         return evaluateAnd(args, env);
       case 'or':
         return evaluateOr(args, env);
+      case 'begin':
+        return evaluateBegin(args, env);
+      case 'let':
+        return evaluateLet(args, env);
+      case 'cond':
+        return evaluateCond(args, env);
     }
   }
 
@@ -370,6 +390,62 @@ function evaluateOr(args: Expr[], env: Environment): SchemeValue {
   return result;
 }
 
+function evaluateBegin(args: Expr[], env: Environment): SchemeValue {
+  return evaluateSequence(args, env);
+}
+
+function evaluateLet(args: Expr[], env: Environment): SchemeValue {
+  requireArgCountAtLeast('let', args.length, 2);
+
+  const firstArg = args[0];
+  if (firstArg.type === 'symbol') {
+    requireArgCountAtLeast('let', args.length, 3);
+
+    const bindings = parseLetBindings(args[1]);
+    const values = bindings.map((binding) => evaluate(binding.value, env));
+    const letEnv = new Environment(env);
+    const closure: Closure = {
+      type: 'closure',
+      params: bindings.map((binding) => binding.name),
+      body: args.slice(2),
+      env: letEnv,
+    };
+
+    letEnv.define(firstArg.name, closure);
+    return applyProcedure(closure, values);
+  }
+
+  const bindings = parseLetBindings(firstArg);
+  const letEnv = new Environment(env);
+
+  for (const binding of bindings) {
+    letEnv.define(binding.name, evaluate(binding.value, env));
+  }
+
+  return evaluateSequence(args.slice(1), letEnv);
+}
+
+function evaluateCond(args: Expr[], env: Environment): SchemeValue {
+  for (const clause of args) {
+    if (clause.type !== 'list' || clause.elements.length === 0) {
+      throw new EvalError('cond: expected non-empty clause');
+    }
+
+    const [testExpr, ...body] = clause.elements;
+
+    if (testExpr.type === 'symbol' && testExpr.name === 'else') {
+      return body.length === 0 ? VOID_VALUE : evaluateSequence(body, env);
+    }
+
+    const testValue = evaluate(testExpr, env);
+    if (isTruthy(testValue)) {
+      return body.length === 0 ? testValue : evaluateSequence(body, env);
+    }
+  }
+
+  return VOID_VALUE;
+}
+
 function quoteExpr(expr: Expr): SchemeValue {
   switch (expr.type) {
     case 'number':
@@ -390,6 +466,25 @@ function parseParameterNames(params: Expr[]): string[] {
     }
 
     return param.name;
+  });
+}
+
+function parseLetBindings(bindingsExpr: Expr): Array<{ name: string; value: Expr }> {
+  if (bindingsExpr.type !== 'list') {
+    throw new EvalError('let: expected binding list');
+  }
+
+  return bindingsExpr.elements.map((bindingExpr) => {
+    if (bindingExpr.type !== 'list' || bindingExpr.elements.length !== 2) {
+      throw new EvalError('let: expected binding pair');
+    }
+
+    const [nameExpr, valueExpr] = bindingExpr.elements;
+    if (nameExpr.type !== 'symbol') {
+      throw new EvalError('let: binding name must be a symbol');
+    }
+
+    return { name: nameExpr.name, value: valueExpr };
   });
 }
 
@@ -492,6 +587,102 @@ function createGlobalEnv(): Environment {
     }),
   );
 
+  env.define(
+    'cons',
+    builtin('cons', (args) => {
+      requireArgCount('cons', args.length, 2);
+      const tail = expectList('cons', args[1]);
+      return { type: 'list', elements: [args[0], ...tail.elements] };
+    }),
+  );
+
+  env.define(
+    'car',
+    builtin('car', (args) => {
+      requireArgCount('car', args.length, 1);
+      return expectPair('car', args[0]).elements[0];
+    }),
+  );
+
+  env.define(
+    'cdr',
+    builtin('cdr', (args) => {
+      requireArgCount('cdr', args.length, 1);
+      return { type: 'list', elements: expectPair('cdr', args[0]).elements.slice(1) };
+    }),
+  );
+
+  env.define('list', builtin('list', (args) => ({ type: 'list', elements: [...args] })));
+
+  env.define(
+    'length',
+    builtin('length', (args) => {
+      requireArgCount('length', args.length, 1);
+      return numberValue(expectList('length', args[0]).elements.length);
+    }),
+  );
+
+  env.define(
+    'append',
+    builtin('append', (args) => {
+      const elements: SchemeValue[] = [];
+
+      for (const arg of args) {
+        elements.push(...expectList('append', arg).elements);
+      }
+
+      return { type: 'list', elements };
+    }),
+  );
+
+  env.define(
+    'null?',
+    builtin('null?', (args) => {
+      requireArgCount('null?', args.length, 1);
+      return booleanValue(args[0].type === 'list' && args[0].elements.length === 0);
+    }),
+  );
+
+  env.define(
+    'pair?',
+    builtin('pair?', (args) => {
+      requireArgCount('pair?', args.length, 1);
+      return booleanValue(args[0].type === 'list' && args[0].elements.length > 0);
+    }),
+  );
+
+  env.define(
+    'string?',
+    builtin('string?', (args) => {
+      requireArgCount('string?', args.length, 1);
+      return booleanValue(args[0].type === 'string');
+    }),
+  );
+
+  env.define(
+    'number?',
+    builtin('number?', (args) => {
+      requireArgCount('number?', args.length, 1);
+      return booleanValue(args[0].type === 'number');
+    }),
+  );
+
+  env.define(
+    'boolean?',
+    builtin('boolean?', (args) => {
+      requireArgCount('boolean?', args.length, 1);
+      return booleanValue(args[0].type === 'boolean');
+    }),
+  );
+
+  env.define(
+    'symbol?',
+    builtin('symbol?', (args) => {
+      requireArgCount('symbol?', args.length, 1);
+      return booleanValue(args[0].type === 'symbol');
+    }),
+  );
+
   return env;
 }
 
@@ -538,6 +729,29 @@ function expectNumber(value: SchemeValue): number {
   }
 
   return value.value;
+}
+
+function expectList(
+  name: string,
+  value: SchemeValue,
+): Extract<SchemeValue, { type: 'list' }> {
+  if (value.type !== 'list') {
+    throw new EvalError(`${name}: expected list`);
+  }
+
+  return value;
+}
+
+function expectPair(
+  name: string,
+  value: SchemeValue,
+): Extract<SchemeValue, { type: 'list' }> {
+  const list = expectList(name, value);
+  if (list.elements.length === 0) {
+    throw new EvalError(`${name}: expected non-empty list`);
+  }
+
+  return list;
 }
 
 function isTruthy(value: SchemeValue): boolean {
