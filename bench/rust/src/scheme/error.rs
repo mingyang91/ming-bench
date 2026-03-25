@@ -24,6 +24,9 @@ pub enum EvalError {
     #[error("unbound variable: {name}")]
     UnboundVariable { name: String },
 
+    #[error("uninitialized binding: {name}")]
+    UninitializedBinding { name: String },
+
     #[error("unsupported form: {name}")]
     UnsupportedForm { name: String },
 
