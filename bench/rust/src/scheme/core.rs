@@ -48,6 +48,7 @@ pub(crate) type RecordTypeRef = Rc<RecordType>;
 pub(crate) type RecordRef = Rc<RecordValue>;
 pub(crate) type EnvRef = Rc<RefCell<Environment>>;
 pub(crate) type BindingRef = Rc<RefCell<Value>>;
+pub(crate) type ExprsRef = Rc<[Expr]>;
 
 pub(crate) struct SchemeString {
     text: RefCell<String>,
@@ -174,7 +175,7 @@ pub(crate) struct LambdaProcedure {
     pub(crate) name: Option<String>,
     pub(crate) params: Vec<String>,
     pub(crate) rest_param: Option<String>,
-    pub(crate) body: Vec<Expr>,
+    pub(crate) body: ExprsRef,
     pub(crate) env: EnvRef,
 }
 
@@ -348,7 +349,7 @@ pub(crate) fn make_lambda(
         name,
         params,
         rest_param,
-        body,
+        body: body.into(),
         env: env.clone(),
     })))
 }
