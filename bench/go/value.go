@@ -17,6 +17,15 @@ type PairVal struct{ Car, Cdr Value }
 type NilVal struct{}
 type SymbolVal struct{ Name string }
 type VoidVal struct{}
+type LambdaVal struct {
+	Params []string
+	Body   []Expr
+	Env    *Env
+}
+
+func (v *LambdaVal) String() string {
+	return "#<procedure>"
+}
 
 func (v *IntVal) String() string {
 	return fmt.Sprintf("%d", v.Val)

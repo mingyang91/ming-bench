@@ -44,6 +44,17 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 			return evalAnd(e, env)
 		case "or":
 			return evalOr(e, env)
+		case "define":
+			return evalDefine(e, env)
+		case "if":
+			return evalIf(e, env)
+		case "quote":
+			if len(e.Items) != 2 {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quote: requires exactly 1 argument", e.Ln, e.Cl)}
+			}
+			return quoteExpr(e.Items[1]), nil
+		case "lambda":
+			return evalLambda(e, env)
 		}
 	}
 
@@ -65,6 +76,8 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 	switch f := fn.(type) {
 	case *BuiltinFunc:
 		return f.Fn(args)
+	case *LambdaVal:
+		return applyLambda(f, args, e.Ln, e.Cl)
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure: %s", e.Ln, e.Cl, fn.String())}
 	}
@@ -98,6 +111,124 @@ func evalOr(e *ListExpr, env *Env) (Value, error) {
 		result = v
 	}
 	return result, nil
+}
+
+func evalDefine(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Items) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: requires at least 2 arguments", e.Ln, e.Cl)}
+	}
+	switch target := e.Items[1].(type) {
+	case *SymbolExpr:
+		// (define x expr)
+		val, err := eval(e.Items[2], env)
+		if err != nil {
+			return nil, err
+		}
+		env.set(target.Name, val)
+		return &VoidVal{}, nil
+	case *ListExpr:
+		// (define (f params...) body...)
+		if len(target.Items) == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: empty name list", e.Ln, e.Cl)}
+		}
+		nameSym, ok := target.Items[0].(*SymbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol", e.Ln, e.Cl)}
+		}
+		params := make([]string, 0, len(target.Items)-1)
+		for _, p := range target.Items[1:] {
+			ps, ok := p.(*SymbolExpr)
+			if !ok {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol in params", e.Ln, e.Cl)}
+			}
+			params = append(params, ps.Name)
+		}
+		lambda := &LambdaVal{Params: params, Body: e.Items[2:], Env: env}
+		env.set(nameSym.Name, lambda)
+		return &VoidVal{}, nil
+	default:
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol or list", e.Ln, e.Cl)}
+	}
+}
+
+func evalIf(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Items) < 3 || len(e.Items) > 4 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: if: requires 2 or 3 arguments", e.Ln, e.Cl)}
+	}
+	cond, err := eval(e.Items[1], env)
+	if err != nil {
+		return nil, err
+	}
+	if isTruthy(cond) {
+		return eval(e.Items[2], env)
+	}
+	if len(e.Items) == 4 {
+		return eval(e.Items[3], env)
+	}
+	return &VoidVal{}, nil
+}
+
+func evalLambda(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Items) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: requires params and body", e.Ln, e.Cl)}
+	}
+	paramList, ok := e.Items[1].(*ListExpr)
+	if !ok {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected parameter list", e.Ln, e.Cl)}
+	}
+	params := make([]string, 0, len(paramList.Items))
+	for _, p := range paramList.Items {
+		ps, ok := p.(*SymbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected symbol in params", e.Ln, e.Cl)}
+		}
+		params = append(params, ps.Name)
+	}
+	return &LambdaVal{Params: params, Body: e.Items[2:], Env: env}, nil
+}
+
+func applyLambda(fn *LambdaVal, args []Value, ln, cl int) (Value, error) {
+	if len(args) != len(fn.Params) {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected %d, got %d", ln, cl, len(fn.Params), len(args))}
+	}
+	childEnv := newEnv(fn.Env)
+	for i, p := range fn.Params {
+		childEnv.set(p, args[i])
+	}
+	var result Value
+	var err error
+	for _, bodyExpr := range fn.Body {
+		result, err = eval(bodyExpr, childEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func quoteExpr(expr Expr) Value {
+	switch e := expr.(type) {
+	case *NumberExpr:
+		return &IntVal{Val: e.Val}
+	case *BoolExpr:
+		return &BoolVal{Val: e.Val}
+	case *StringExpr:
+		return &StringVal{Val: e.Val}
+	case *SymbolExpr:
+		return &SymbolVal{Name: e.Name}
+	case *ListExpr:
+		if len(e.Items) == 0 {
+			return &NilVal{}
+		}
+		// Build a proper list from the items
+		result := Value(&NilVal{})
+		for i := len(e.Items) - 1; i >= 0; i-- {
+			result = &PairVal{Car: quoteExpr(e.Items[i]), Cdr: result}
+		}
+		return result
+	default:
+		return &NilVal{}
+	}
 }
 
 func makeGlobalEnv() *Env {
