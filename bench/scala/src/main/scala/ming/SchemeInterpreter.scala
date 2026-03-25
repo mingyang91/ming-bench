@@ -61,7 +61,10 @@ private[ming] object SchemeInterpreter:
         items match
           case Nil                           => throw new EvalError("cannot evaluate empty list")
           case Expr.Symbol("define") :: args => evalDefine(args, env)
+          case Expr.Symbol("begin") :: args  => evalBegin(args, env)
           case Expr.Symbol("if") :: args     => evalIf(args, env)
+          case Expr.Symbol("let") :: args    => evalLet(args, env)
+          case Expr.Symbol("cond") :: args   => evalCond(args, env)
           case Expr.Symbol("quote") :: args  => evalQuote(args)
           case Expr.Symbol("lambda") :: args => evalLambda(args, env)
           case Expr.Symbol("and") :: args    => evalAnd(args, env)
@@ -82,6 +85,9 @@ private[ming] object SchemeInterpreter:
       case _ =>
         throw new EvalError("invalid define")
 
+  private def evalBegin(args: List[Expr], env: Env): Value =
+    evalSequence(args, env)
+
   private def evalIf(args: List[Expr], env: Env): Value =
     args match
       case condition :: ifTrue :: ifFalse :: Nil =>
@@ -89,6 +95,37 @@ private[ming] object SchemeInterpreter:
         else eval(ifFalse, env)
       case _ =>
         throw new EvalError(s"if expected 3 arguments, got ${args.length}")
+
+  private def evalLet(args: List[Expr], env: Env): Value =
+    args match
+      case Expr.ListExpr(bindingsExpr) :: body if body.nonEmpty =>
+        val bindings = readBindings(bindingsExpr)
+        val values   = bindings.map { case (_, valueExpr) => eval(valueExpr, env) }
+        val letEnv   = Env.child(env, bindings.map(_._1).zip(values))
+        evalSequence(body, letEnv)
+      case Expr.Symbol(name) :: Expr.ListExpr(bindingsExpr) :: body if body.nonEmpty =>
+        val bindings = readBindings(bindingsExpr)
+        val values   = bindings.map { case (_, valueExpr) => eval(valueExpr, env) }
+        val letEnv   = Env.child(env, Nil)
+        val closure  = Value.Closure(bindings.map(_._1), body, letEnv)
+        letEnv.define(name, closure)
+        applyProcedure(closure, values)
+      case _ =>
+        throw new EvalError("invalid let")
+
+  private def evalCond(args: List[Expr], env: Env): Value =
+    args match
+      case Nil => Value.Void
+      case Expr.ListExpr(Expr.Symbol("else") :: body) :: rest =>
+        if rest.nonEmpty then throw new EvalError("cond else clause must be last")
+        if body.isEmpty then throw new EvalError("cond else clause requires a body")
+        evalSequence(body, env)
+      case Expr.ListExpr(test :: body) :: rest =>
+        val testValue = eval(test, env)
+        if isTruthy(testValue) then if body.isEmpty then testValue else evalSequence(body, env)
+        else evalCond(rest, env)
+      case _ =>
+        throw new EvalError("invalid cond clause")
 
   private def evalQuote(args: List[Expr]): Value =
     args match
@@ -132,54 +169,21 @@ private[ming] object SchemeInterpreter:
 
   private def initialEnv(): Env =
     val env = Env.root()
-    for builtin <- builtins do env.define(builtin.name, builtin)
+    SchemeBuiltins.all.foreach { builtin =>
+      env.define(builtin.name, builtin)
+    }
     env
-
-  private def builtins: List[Value.Builtin] =
-    List(
-      Value.Builtin(
-        "+",
-        args => Value.Number(args.foldLeft(BigInt(0))((acc, value) => acc + asNumber(value, "+")))
-      ),
-      Value.Builtin(
-        "-",
-        args =>
-          requireAtLeast("-", args, 1)
-          val numbers = args.map(asNumber(_, "-"))
-          numbers match
-            case value :: Nil  => Value.Number(-value)
-            case value :: rest => Value.Number(rest.foldLeft(value)(_ - _))
-            case Nil           => unreachable()
-      ),
-      Value.Builtin(
-        "*",
-        args => Value.Number(args.foldLeft(BigInt(1))((acc, value) => acc * asNumber(value, "*")))
-      ),
-      Value.Builtin(
-        "/",
-        args =>
-          requireAtLeast("/", args, 2)
-          val numbers = args.map(asNumber(_, "/"))
-          numbers match
-            case value :: rest => Value.Number(rest.foldLeft(value)(divide(_, _, "/")))
-            case Nil           => unreachable()
-      ),
-      Value.Builtin("<", args => Value.Bool(compareAdjacent("<", args)(_ < _))),
-      Value.Builtin(">", args => Value.Bool(compareAdjacent(">", args)(_ > _))),
-      Value.Builtin("=", args => Value.Bool(compareAdjacent("=", args)(_ == _))),
-      Value.Builtin("<=", args => Value.Bool(compareAdjacent("<=", args)(_ <= _))),
-      Value.Builtin(
-        "not",
-        args =>
-          requireExactly("not", args, 1)
-          Value.Bool(!isTruthy(args.head))
-      )
-    )
 
   private def readParams(params: List[Expr]): List[String] =
     params.map {
       case Expr.Symbol(name) => name
       case other             => throw new EvalError(s"invalid parameter: ${renderExpr(other)}")
+    }
+
+  private def readBindings(bindings: List[Expr]): List[(String, Expr)] =
+    bindings.map {
+      case Expr.ListExpr(List(Expr.Symbol(name), valueExpr)) => (name, valueExpr)
+      case other => throw new EvalError(s"invalid binding: ${renderExpr(other)}")
     }
 
   private def quote(expr: Expr): Value =
@@ -189,30 +193,6 @@ private[ming] object SchemeInterpreter:
       case Expr.StringLit(value) => Value.StringLit(value)
       case Expr.Symbol(name)     => Value.Symbol(name)
       case Expr.ListExpr(items)  => Value.ListValue(items.map(quote))
-
-  private def compareAdjacent(
-    name: String,
-    args: List[Value]
-  )(predicate: (BigInt, BigInt) => Boolean): Boolean =
-    requireAtLeast(name, args, 2)
-    val numbers = args.map(asNumber(_, name))
-    numbers.zip(numbers.tail).forall { case (left, right) => predicate(left, right) }
-
-  private def asNumber(value: Value, context: String): BigInt =
-    value match
-      case Value.Number(number) => number
-      case other                => throw new EvalError(s"$context expected number, got ${render(other)}")
-
-  private def divide(left: BigInt, right: BigInt, context: String): BigInt =
-    if right == 0 then throw new EvalError(s"$context division by zero")
-    left / right
-
-  private def requireExactly(name: String, args: List[Value], expected: Int): Unit =
-    if args.length != expected then throw new EvalError(s"$name expected $expected arguments, got ${args.length}")
-
-  private def requireAtLeast(name: String, args: List[Value], expected: Int): Unit =
-    if args.length < expected then
-      throw new EvalError(s"$name expected at least $expected arguments, got ${args.length}")
 
   private def isTruthy(value: Value): Boolean =
     value match
@@ -226,9 +206,12 @@ private[ming] object SchemeInterpreter:
       bindings.update(name, value)
 
     def lookup(name: String): Value =
-      bindings.get(name).orElse(parent.map(_.lookup(name))).getOrElse {
-        throw new EvalError(s"unbound variable: $name")
-      }
+      bindings.get(name) match
+        case Some(value) => value
+        case None =>
+          parent match
+            case Some(parentEnv) => parentEnv.lookup(name)
+            case None            => throw new EvalError(s"unbound variable: $name")
 
   private object Env:
     def root(): Env = new Env(None)
@@ -258,6 +241,3 @@ private[ming] object SchemeInterpreter:
       case ch   => builder.append(ch)
     }
     builder.result()
-
-  private def unreachable(): Nothing =
-    throw IllegalStateException("unreachable")

@@ -22,6 +22,9 @@ private[ming] object SchemeReader:
       if index >= input.length then throw new EvalError("unexpected end of input")
 
       input.charAt(index) match
+        case '\'' =>
+          index += 1
+          Expr.ListExpr(List(Expr.Symbol("quote"), readExpr()))
         case '(' =>
           index += 1
           readList()
@@ -109,7 +112,7 @@ private[ming] object SchemeReader:
       }
 
     private def isDelimiter(ch: Char): Boolean =
-      ch.isWhitespace || ch == '(' || ch == ')' || ch == '"' || ch == ';'
+      ch.isWhitespace || ch == '\'' || ch == '(' || ch == ')' || ch == '"' || ch == ';'
 
     private def isIntegerToken(token: String): Boolean =
       token.nonEmpty &&
