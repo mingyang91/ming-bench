@@ -38,6 +38,7 @@ final class Builtins {
         registerStringComparison();
         registerRationals();
         registerVectors();
+        registerSyntax();
     }
 
     // --- Numeric tower helpers ---
@@ -1083,6 +1084,21 @@ final class Builtins {
             Object cur = args.get(0);
             while (cur instanceof Cons c) { elems.add(c.car); cur = c.cdr; }
             return new SchemeVector(elems.toArray());
+        });
+    }
+
+    // --- Syntax (L22) ---
+
+    private void registerSyntax() {
+        define("syntax->datum", args -> {
+            requireArgCount(args, 1, "syntax->datum");
+            Object val = args.get(0);
+            if (val instanceof Token t) return t.value();
+            return val;
+        });
+        define("datum->syntax", args -> {
+            requireArgCount(args, 2, "datum->syntax");
+            return args.get(1);
         });
     }
 }

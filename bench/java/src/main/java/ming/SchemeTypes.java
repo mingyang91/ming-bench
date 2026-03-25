@@ -103,3 +103,7 @@ class SchemeVector {
     Object ref(int i) { return data[i]; }
     void set(int i, Object v) { data[i] = v; }
 }
+
+record MacroTransformer(Object proc) {}
+
+record SyntaxOutput(Object form, java.util.Map<String, String> renames, Evaluator.Env defEnv) {}

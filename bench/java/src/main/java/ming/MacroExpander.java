@@ -146,8 +146,8 @@ final class MacroExpander {
     }
 
     @SuppressWarnings("unchecked")
-    private void collectPatternVars(List<Object> pattern, int start, List<String> literals,
-                                     Set<String> patVars, Set<String> ellipsisVars) {
+    void collectPatternVars(List<Object> pattern, int start, List<String> literals,
+                             Set<String> patVars, Set<String> ellipsisVars) {
         for (int i = start; i < pattern.size(); i++) {
             Object raw = unwrap(pattern.get(i));
             if (raw instanceof String sym && !literals.contains(sym) && !"...".equals(sym)) {
@@ -161,9 +161,9 @@ final class MacroExpander {
         }
     }
 
-    private boolean matchElements(List<Object> pattern, int pi, List<?> input, int ii,
-                                   List<String> literals, Set<String> patVars,
-                                   Map<String, Object> bindings) {
+    boolean matchElements(List<Object> pattern, int pi, List<?> input, int ii,
+                           List<String> literals, Set<String> patVars,
+                           Map<String, Object> bindings) {
         while (pi < pattern.size()) {
             Object patRaw = unwrap(pattern.get(pi));
             if (pi + 1 < pattern.size() && "...".equals(unwrap(pattern.get(pi + 1)))) {
@@ -197,9 +197,9 @@ final class MacroExpander {
     }
 
     @SuppressWarnings("unchecked")
-    private Object expandTemplate(Object template, Map<String, Object> bindings,
-                                   Set<String> ellipsisVars, Set<String> patVars,
-                                   Map<String, String> renames) {
+    Object expandTemplate(Object template, Map<String, Object> bindings,
+                           Set<String> ellipsisVars, Set<String> patVars,
+                           Map<String, String> renames) {
         Object raw = unwrap(template);
         if (raw instanceof String sym) {
             if (patVars.contains(sym)) {
@@ -212,6 +212,10 @@ final class MacroExpander {
             return sym;
         }
         if (raw instanceof List<?> list) {
+            // Don't expand inside quotes (preserve literal symbols)
+            if (!list.isEmpty() && "quote".equals(unwrap(list.get(0)))) {
+                return raw;
+            }
             List<Object> result = new ArrayList<>();
             for (int i = 0; i < list.size(); i++) {
                 if (i + 1 < list.size() && "...".equals(unwrap(list.get(i + 1)))) {

@@ -132,6 +132,9 @@ final class SchemeReader {
                     tokens.add(new Token(new SchemeChar(input.charAt(i)), hPos));
                     i++; colNum++;
                 }
+            } else if (next == '\'') {
+                tokens.add(new Token("#'", hPos));
+                i += 2; colNum += 2;
             } else {
                 throw new EvalError("unexpected #" + next + " at " + hPos);
             }
@@ -164,6 +167,14 @@ final class SchemeReader {
             throw new EvalError("unexpected end of input");
         }
         Token token = tokens.get(pos[0]);
+        if ("#'".equals(token.value())) {
+            pos[0]++;
+            Object inner = parse(tokens, pos);
+            SExpr syntaxExpr = new SExpr(token.pos());
+            syntaxExpr.add("syntax");
+            syntaxExpr.add(inner);
+            return syntaxExpr;
+        }
         if ("'".equals(token.value())) {
             pos[0]++;
             Object quoted = parse(tokens, pos);

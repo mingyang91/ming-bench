@@ -55,7 +55,8 @@ public class Evaluator {
     static final java.util.Set<String> SPECIAL_FORMS = java.util.Set.of(
         "quote", "if", "define", "lambda", "and", "or", "let", "set!", "begin", "cond",
         "define-syntax", "syntax-rules", "else", "let*", "letrec", "letrec*", "case",
-        "do", "define-record-type", "case-lambda", "guard"
+        "do", "define-record-type", "case-lambda", "guard",
+        "syntax", "syntax-case", "with-syntax"
     );
 
     private int gensymCounter = 0;
@@ -259,6 +260,9 @@ public class Evaluator {
                         startBody(list, 2, mEnv, new GuardBodyK(mK));
                         return;
                     }
+                    case "syntax-case" -> { evalSyntaxCaseStep(list, pos); return; }
+                    case "syntax" -> { evalSyntaxStep(list, pos); return; }
+                    case "with-syntax" -> { evalWithSyntaxStep(list, pos); return; }
                 }
             }
 
@@ -270,6 +274,20 @@ public class Evaluator {
                         Object[] result = expandMacroForm(macro, list, mEnv, pos);
                         mExpr = result[0];
                         mEnv = (Env) result[1];
+                        return; // stay in eval mode
+                    }
+                    if (val instanceof MacroTransformer mt) {
+                        Object result = applyProc(mt.proc(), List.of(list), pos);
+                        if (result instanceof SyntaxOutput so) {
+                            for (var entry : so.renames().entrySet()) {
+                                try {
+                                    mEnv.define(entry.getValue(), so.defEnv().lookup(entry.getKey()));
+                                } catch (EvalError ignore2) {}
+                            }
+                            mExpr = so.form();
+                        } else {
+                            mExpr = result;
+                        }
                         return; // stay in eval mode
                     }
                 } catch (EvalError ignore) {}
@@ -1247,106 +1265,163 @@ public class Evaluator {
     }
 
     private void evalDefineSyntax(List<?> list, Env env, Pos pos) throws EvalError {
-        macroExpander.evalDefineSyntax(list, env, pos);
+        if (list.size() != 3) throw new EvalError("define-syntax requires 2 arguments" + posStr(pos));
+        Object nameRaw = unwrap(list.get(1));
+        if (!(nameRaw instanceof String macroName))
+            throw new EvalError("define-syntax: name must be a symbol" + posStr(pos));
+        Object rulesExpr = unwrap(list.get(2));
+        if (rulesExpr instanceof List<?> rulesList && rulesList.size() >= 2
+                && "syntax-rules".equals(unwrap(rulesList.get(0)))) {
+            macroExpander.evalDefineSyntax(list, env, pos);
+        } else {
+            Object transformer = evalSync(list.get(2), env);
+            env.define(macroName, new MacroTransformer(transformer));
+        }
     }
 
     private void evalDefineRecordType(List<?> list, Env env, Pos pos) throws EvalError {
         macroExpander.evalDefineRecordType(list, env, pos);
     }
 
+    // ===== syntax-case support =====
+
+    private Object evalSync(Object expr, Env env) throws EvalError {
+        Object savedExpr = mExpr; Env savedEnv = mEnv; Kont savedK = mK;
+        Object savedVal = mVal; boolean savedApply = mApply;
+        try {
+            mExpr = expr; mEnv = env; mK = HaltK.INST; mApply = false;
+            while (true) {
+                if (mApply) {
+                    if (mK instanceof HaltK) return mVal;
+                    applyStep();
+                } else {
+                    evalStep();
+                }
+            }
+        } finally {
+            mExpr = savedExpr; mEnv = savedEnv; mK = savedK;
+            mVal = savedVal; mApply = savedApply;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void evalSyntaxCaseStep(List<?> list, Pos pos) throws EvalError {
+        if (list.size() < 4) throw new EvalError("syntax-case requires at least 3 arguments" + posStr(pos));
+        Object input = evalSync(list.get(1), mEnv);
+        if (!(input instanceof List<?>))
+            throw new EvalError("syntax-case: input must be a list" + posStr(pos));
+        List<?> inputList = (List<?>) input;
+        Object litsRaw = unwrap(list.get(2));
+        List<String> literals = new ArrayList<>();
+        if (litsRaw instanceof List<?> litList) {
+            for (Object l : litList) {
+                Object lv = unwrap(l);
+                if (lv instanceof String s) literals.add(s);
+            }
+        }
+        for (int ci = 3; ci < list.size(); ci++) {
+            Object clauseRaw = unwrap(list.get(ci));
+            if (!(clauseRaw instanceof List<?> clause) || clause.size() < 2)
+                throw new EvalError("syntax-case: invalid clause" + posStr(pos));
+            Object patRaw = unwrap(clause.get(0));
+            if (!(patRaw instanceof List<?> patList))
+                throw new EvalError("syntax-case: pattern must be a list" + posStr(pos));
+            Map<String, Object> bindings = new HashMap<>();
+            java.util.Set<String> patVars = new java.util.HashSet<>();
+            java.util.Set<String> ellipsisVars = new java.util.HashSet<>();
+            macroExpander.collectPatternVars((List<Object>) patList, 0, literals, patVars, ellipsisVars);
+            if (macroExpander.matchElements((List<Object>) patList, 0, inputList, 0, literals, patVars, bindings)) {
+                Env bodyEnv = new Env(mEnv);
+                for (var entry : bindings.entrySet()) {
+                    bodyEnv.define(entry.getKey(), entry.getValue());
+                }
+                bodyEnv.define("##syntax-info", new Object[]{patVars, ellipsisVars});
+                Object body;
+                if (clause.size() == 3) {
+                    Object fenderResult = evalSync(clause.get(1), bodyEnv);
+                    if (isFalse(fenderResult)) continue;
+                    body = clause.get(2);
+                } else {
+                    body = clause.get(1);
+                }
+                mExpr = body; mEnv = bodyEnv; mApply = false; return;
+            }
+        }
+        throw new EvalError("no matching syntax-case pattern" + posStr(pos));
+    }
+
+    @SuppressWarnings("unchecked")
+    private void evalSyntaxStep(List<?> list, Pos pos) throws EvalError {
+        if (list.size() != 2) throw new EvalError("syntax requires 1 argument" + posStr(pos));
+        Object template = list.get(1);
+        Object rawTemplate = unwrap(template);
+
+        Object[] info;
+        try {
+            info = (Object[]) mEnv.lookup("##syntax-info");
+        } catch (EvalError e) {
+            throw new EvalError("syntax used outside of syntax-case" + posStr(pos));
+        }
+        java.util.Set<String> patVars = (java.util.Set<String>) info[0];
+        java.util.Set<String> ellipsisVars = (java.util.Set<String>) info[1];
+
+        // Simple pattern variable reference
+        if (rawTemplate instanceof String sym && patVars.contains(sym)) {
+            mVal = mEnv.lookup(sym);
+            mApply = true; return;
+        }
+
+        // Template expansion
+        Map<String, Object> bindings = new HashMap<>();
+        for (String pv : patVars) {
+            try { bindings.put(pv, mEnv.lookup(pv)); } catch (EvalError ignore) {}
+        }
+        Map<String, String> renames = new HashMap<>();
+        Object expanded = macroExpander.expandTemplate(template, bindings, ellipsisVars, patVars, renames);
+        mVal = new SyntaxOutput(expanded, renames, mEnv);
+        mApply = true;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void evalWithSyntaxStep(List<?> list, Pos pos) throws EvalError {
+        if (list.size() < 3) throw new EvalError("with-syntax requires bindings and body" + posStr(pos));
+        List<?> bindingsList = (List<?>) unwrap(list.get(1));
+
+        java.util.Set<String> allPatVars = new java.util.HashSet<>();
+        java.util.Set<String> allEllipsisVars = new java.util.HashSet<>();
+        try {
+            Object[] existingInfo = (Object[]) mEnv.lookup("##syntax-info");
+            allPatVars.addAll((java.util.Set<String>) existingInfo[0]);
+            allEllipsisVars.addAll((java.util.Set<String>) existingInfo[1]);
+        } catch (EvalError ignore) {}
+
+        Env wsEnv = new Env(mEnv);
+        for (Object binding : bindingsList) {
+            List<?> b = (List<?>) unwrap(binding);
+            Object pat = unwrap(b.get(0));
+            Object val = evalSync(b.get(1), mEnv);
+            if (pat instanceof String sym) {
+                wsEnv.define(sym, val);
+                allPatVars.add(sym);
+            }
+        }
+        wsEnv.define("##syntax-info", new Object[]{allPatVars, allEllipsisVars});
+        startBody(list, 2, wsEnv, mK);
+    }
+
     // ===== Conversion =====
 
     private Object javaToScheme(Object val) {
-        if (val instanceof Token t) return javaToScheme(t.value());
-        if (val instanceof List<?> list) {
-            Object result = NIL;
-            for (int i = list.size() - 1; i >= 0; i--) {
-                result = new Cons(javaToScheme(list.get(i)), result);
-            }
-            return result;
-        }
-        return val;
+        return SchemeFormatter.javaToScheme(val);
     }
 
-    // ===== Output formatting =====
+    // ===== Output formatting (delegated to SchemeFormatter) =====
 
     String displayString(Object val) {
-        if (val instanceof SchemeString s) return s.value();
-        return schemeToString(val);
+        return SchemeFormatter.display(val);
     }
 
     String schemeToString(Object val) {
-        return schemeToStringRec(val, new java.util.IdentityHashMap<>());
-    }
-
-    private String schemeToStringRec(Object val, java.util.IdentityHashMap<Object, Boolean> seen) {
-        if (val == NIL) return "()";
-        if (val instanceof Long l) return l.toString();
-        if (val instanceof SchemeRational r) return r.isInteger() ? String.valueOf(r.toLong()) : r.num + "/" + r.den;
-        if (val instanceof Double d) {
-            if (d == Math.floor(d) && !Double.isInfinite(d)) return String.valueOf(d);
-            return String.valueOf(d);
-        }
-        if (val instanceof Boolean b) return b ? "#t" : "#f";
-        if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
-        if (val instanceof SchemeChar c) {
-            return switch (c.value()) {
-                case ' ' -> "#\\space";
-                case '\n' -> "#\\newline";
-                case '\t' -> "#\\tab";
-                default -> "#\\" + c.value();
-            };
-        }
-        if (val instanceof SchemeVector v) {
-            if (seen.containsKey(v)) return "#<cycle>";
-            seen.put(v, Boolean.TRUE);
-            StringBuilder sb = new StringBuilder("#(");
-            for (int i = 0; i < v.length(); i++) {
-                if (i > 0) sb.append(" ");
-                sb.append(schemeToStringRec(v.data[i], seen));
-            }
-            sb.append(")");
-            seen.remove(v);
-            return sb.toString();
-        }
-        if (val instanceof SchemeRecord r) return "#<record " + r.type.name + ">";
-        if (val instanceof Builtin b) return "#<procedure " + b.name() + ">";
-        if (val instanceof Lambda) return "#<procedure>";
-        if (val instanceof CaseLambda) return "#<procedure>";
-        if (val instanceof SchemeContinuation) return "#<procedure>";
-        if (val instanceof Cons) {
-            if (seen.containsKey(val)) return "#<cycle>";
-            seen.put(val, Boolean.TRUE);
-            StringBuilder sb = new StringBuilder("(");
-            Object cur = val;
-            boolean first = true;
-            while (cur instanceof Cons c) {
-                if (!first) {
-                    if (seen.containsKey(cur)) { sb.append(" . #<cycle>"); break; }
-                    seen.put(cur, Boolean.TRUE);
-                }
-                if (!first) sb.append(" ");
-                first = false;
-                sb.append(schemeToStringRec(c.car, seen));
-                cur = c.cdr;
-            }
-            if (cur != NIL && !(cur instanceof Cons)) {
-                sb.append(" . ");
-                sb.append(schemeToStringRec(cur, seen));
-            }
-            sb.append(")");
-            return sb.toString();
-        }
-        if (val instanceof List<?> list) {
-            StringBuilder sb = new StringBuilder("(");
-            for (int i = 0; i < list.size(); i++) {
-                if (i > 0) sb.append(" ");
-                sb.append(schemeToStringRec(list.get(i), seen));
-            }
-            sb.append(")");
-            return sb.toString();
-        }
-        if (val instanceof String s) return s;
-        return String.valueOf(val);
+        return SchemeFormatter.toString(val);
     }
 }
