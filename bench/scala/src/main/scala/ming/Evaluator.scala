@@ -50,6 +50,9 @@ object Evaluator:
     case SchemeVal.SBool(false) => false
     case _                      => true
 
+  private def evalBody(body: List[SchemeVal], env: Env): SchemeVal =
+    body.foldLeft(SchemeVal.SVoid: SchemeVal)((_, expr) => eval(expr, env))
+
   def eval(expr: SchemeVal, env: Env): SchemeVal = expr match
     case SchemeVal.SInt(_) | SchemeVal.SBool(_) | SchemeVal.SString(_) | SchemeVal.SVoid => expr
     case SchemeVal.SSymbol(name)                                                         => env.get(name)
@@ -64,6 +67,9 @@ object Evaluator:
         case SchemeVal.SSymbol("lambda") :: args => evalLambda(args, env)
         case SchemeVal.SSymbol("and") :: args    => evalAnd(args, env)
         case SchemeVal.SSymbol("or") :: args     => evalOr(args, env)
+        case SchemeVal.SSymbol("let") :: args    => evalLet(args, env)
+        case SchemeVal.SSymbol("begin") :: args  => evalBegin(args, env)
+        case SchemeVal.SSymbol("cond") :: args   => evalCond(args, env)
         case head :: args =>
           val op         = eval(head, env)
           val evaledArgs = args.map(eval(_, env))
@@ -102,26 +108,65 @@ object Evaluator:
       case _ => throw new EvalError("lambda: bad syntax")
 
   private def evalAnd(args: List[SchemeVal], env: Env): SchemeVal =
-    if args.isEmpty then SchemeVal.SBool(true)
-    else
-      var result: SchemeVal = SchemeVal.SBool(true)
-      val iter              = args.iterator
-      var done              = false
-      while iter.hasNext && !done do
-        result = eval(iter.next(), env)
-        if !isTruthy(result) then done = true
-      result
+    args match
+      case Nil         => SchemeVal.SBool(true)
+      case last :: Nil => eval(last, env)
+      case head :: tail =>
+        val result = eval(head, env)
+        if isTruthy(result) then evalAnd(tail, env) else result
 
   private def evalOr(args: List[SchemeVal], env: Env): SchemeVal =
-    if args.isEmpty then SchemeVal.SBool(false)
-    else
-      var result: SchemeVal = SchemeVal.SBool(false)
-      val iter              = args.iterator
-      var found             = false
-      while iter.hasNext && !found do
-        result = eval(iter.next(), env)
-        if isTruthy(result) then found = true
-      result
+    args match
+      case Nil         => SchemeVal.SBool(false)
+      case last :: Nil => eval(last, env)
+      case head :: tail =>
+        val result = eval(head, env)
+        if isTruthy(result) then result else evalOr(tail, env)
+
+  private def evalLet(args: List[SchemeVal], env: Env): SchemeVal =
+    args match
+      // Named let: (let name ((var init) ...) body ...)
+      case SchemeVal.SSymbol(name) :: SchemeVal.SList(bindings) :: body if body.nonEmpty =>
+        val paramNames = bindings.map {
+          case SchemeVal.SList(SchemeVal.SSymbol(n) :: _ :: Nil) => n
+          case _                                                 => throw new EvalError("let: bad binding")
+        }
+        val initVals = bindings.map {
+          case SchemeVal.SList(_ :: initExpr :: Nil) => eval(initExpr, env)
+          case _                                     => throw new EvalError("let: bad binding")
+        }
+        val letEnv = Env(Some(env))
+        letEnv.define(name, SchemeVal.SLambda(paramNames, body, letEnv))
+        paramNames.zip(initVals).foreach((p, v) => letEnv.define(p, v))
+        evalBody(body, letEnv)
+      // Regular let: (let ((var init) ...) body ...)
+      case SchemeVal.SList(bindings) :: body if body.nonEmpty =>
+        val pairs = bindings.map {
+          case SchemeVal.SList(SchemeVal.SSymbol(n) :: initExpr :: Nil) => (n, eval(initExpr, env))
+          case _                                                        => throw new EvalError("let: bad binding")
+        }
+        val letEnv = Env(Some(env))
+        pairs.foreach((n, v) => letEnv.define(n, v))
+        evalBody(body, letEnv)
+      case _ => throw new EvalError("let: bad syntax")
+
+  private def evalBegin(args: List[SchemeVal], env: Env): SchemeVal =
+    evalBody(args, env)
+
+  private def evalCond(clauses: List[SchemeVal], env: Env): SchemeVal =
+    clauses match
+      case Nil => SchemeVal.SVoid
+      case clause :: rest =>
+        clause match
+          case SchemeVal.SList(SchemeVal.SSymbol("else") :: body) =>
+            evalBody(body, env)
+          case SchemeVal.SList(test :: body) =>
+            val testVal = eval(test, env)
+            if isTruthy(testVal) then
+              if body.isEmpty then testVal
+              else evalBody(body, env)
+            else evalCond(rest, env)
+          case _ => throw new EvalError("cond: bad clause")
 
   private def applyProc(op: SchemeVal, args: List[SchemeVal]): SchemeVal =
     op match
@@ -130,9 +175,7 @@ object Evaluator:
           throw new EvalError(s"expected ${params.length} arguments, got ${args.length}")
         val callEnv = Env(Some(closure))
         params.zip(args).foreach((p, a) => callEnv.define(p, a))
-        var result: SchemeVal = SchemeVal.SVoid
-        for expr <- body do result = eval(expr, callEnv)
-        result
+        evalBody(body, callEnv)
       case SchemeVal.SSymbol(name) => Builtins.applyBuiltin(name, args)
       case _                       => throw new EvalError(s"not a procedure: ${op.display}")
 
@@ -145,10 +188,8 @@ object Evaluator:
   def evalStr(input: String): String =
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw new EvalError("empty input")
-    val env               = makeGlobalEnv()
-    var result: SchemeVal = SchemeVal.SVoid
-    for expr <- exprs do result = eval(expr, env)
-    result.display
+    val env = makeGlobalEnv()
+    evalBody(exprs, env).display
 
   /** Evaluate Scheme expressions and return both the result string and any captured output. */
   def evalStrWithOutput(input: String): (String, String) =
