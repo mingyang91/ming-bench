@@ -146,26 +146,48 @@ public class Evaluator {
     private record DoAfterBodyK(List<String> varNames, Env doEnv, List<Object> steps, List<Object> testClause, List<Object> fullList, Kont k) implements Kont {}
     private record DoStepK(List<String> varNames, Env doEnv, List<Object> steps, int nextIdx, List<Object> newVals, List<Object> testClause, List<Object> fullList, Kont k) implements Kont {}
 
+    // --- dynamic-wind continuation types ---
+    private record DynWindAfterInK(Object inThunk, Object bodyThunk, Object outThunk, Kont k) implements Kont {}
+    private record DynWindAfterBodyK(Object inThunk, Object outThunk, Kont k) implements Kont {}
+    private record DynWindAfterOutK(Object bodyValue, Kont k) implements Kont {}
+    // For unwinding/rewinding during continuation invocation
+    private record DynWindDoThunksK(List<Object> thunks, int idx, List<WindEntry> targetWind, Kont targetK, Object targetValue, Kont k) implements Kont {}
+
+    // --- dynamic-wind entry ---
+    private static class WindEntry {
+        final Object inThunk;
+        final Object outThunk;
+        WindEntry(Object inThunk, Object outThunk) { this.inThunk = inThunk; this.outThunk = outThunk; }
+    }
+
     // --- Scheme continuation (first-class value) ---
     private static class SchemeContinuation {
         final Kont k;
-        SchemeContinuation(Kont k) { this.k = k; }
+        final List<WindEntry> savedWind;
+        SchemeContinuation(Kont k, List<WindEntry> savedWind) { this.k = k; this.savedWind = savedWind; }
     }
 
     // Thrown when a continuation is invoked to unwind back to the CEK loop
     private static class ContinuationReturn extends RuntimeException {
         final Kont k;
         final Object value;
-        ContinuationReturn(Kont k, Object value) {
+        final List<WindEntry> targetWind;
+        ContinuationReturn(Kont k, Object value, List<WindEntry> targetWind) {
             super(null, null, true, false); // no stack trace for performance
             this.k = k;
             this.value = value;
+            this.targetWind = targetWind;
         }
     }
 
     // Sentinel for call/cc procedure
     private static final Object CALLCC_PROC = new Object() {
         @Override public String toString() { return "#<procedure:call/cc>"; }
+    };
+
+    // Sentinel for dynamic-wind procedure
+    private static final Object DYNAMIC_WIND_PROC = new Object() {
+        @Override public String toString() { return "#<procedure:dynamic-wind>"; }
     };
 
     // Sentinel for empty list '()
@@ -183,6 +205,7 @@ public class Evaluator {
     private final Env globalEnv = new Env(null);
     private StringBuilder outputBuffer = new StringBuilder();
     private int gensymCounter = 0;
+    private List<WindEntry> windStack = new ArrayList<>();
 
     // CEK machine state (instance fields for helper method access)
     private Object cekExpr;
@@ -286,7 +309,7 @@ public class Evaluator {
         globalEnv.define("string?", (BuiltinProc) args -> args.get(0) instanceof SchemeString);
         globalEnv.define("symbol?", (BuiltinProc) args -> args.get(0) instanceof String);
         globalEnv.define("char?", (BuiltinProc) args -> args.get(0) instanceof SchemeChar);
-        globalEnv.define("procedure?", (BuiltinProc) args -> args.get(0) instanceof Lambda || args.get(0) instanceof BuiltinProc || args.get(0) instanceof CaseLambda || args.get(0) instanceof SchemeContinuation || args.get(0) == CALLCC_PROC);
+        globalEnv.define("procedure?", (BuiltinProc) args -> args.get(0) instanceof Lambda || args.get(0) instanceof BuiltinProc || args.get(0) instanceof CaseLambda || args.get(0) instanceof SchemeContinuation || args.get(0) == CALLCC_PROC || args.get(0) == DYNAMIC_WIND_PROC);
 
         // I/O
         globalEnv.define("display", (BuiltinProc) args -> {
@@ -568,7 +591,7 @@ public class Evaluator {
                 } else if (proc instanceof CaseLambda cl) {
                     results.add(applyCaseLambda(cl, callArgs));
                 } else if (proc instanceof SchemeContinuation sc) {
-                    throw new ContinuationReturn(sc.k, callArgs.get(0));
+                    throw new ContinuationReturn(sc.k, callArgs.get(0), sc.savedWind);
                 } else {
                     throw new EvalError("map: not a procedure");
                 }
@@ -602,7 +625,7 @@ public class Evaluator {
                 } else if (proc instanceof CaseLambda cl) {
                     applyCaseLambda(cl, callArgs);
                 } else if (proc instanceof SchemeContinuation sc) {
-                    throw new ContinuationReturn(sc.k, callArgs.get(0));
+                    throw new ContinuationReturn(sc.k, callArgs.get(0), sc.savedWind);
                 } else {
                     throw new EvalError("for-each: not a procedure");
                 }
@@ -827,7 +850,7 @@ public class Evaluator {
                 return applyCaseLambda(cl, callArgs);
             }
             if (proc instanceof SchemeContinuation sc) {
-                throw new ContinuationReturn(sc.k, callArgs.get(0));
+                throw new ContinuationReturn(sc.k, callArgs.get(0), sc.savedWind);
             }
             throw new EvalError("apply: not a procedure");
         });
@@ -835,6 +858,9 @@ public class Evaluator {
         // First-class continuations
         globalEnv.define("call/cc", CALLCC_PROC);
         globalEnv.define("call-with-current-continuation", CALLCC_PROC);
+
+        // dynamic-wind
+        globalEnv.define("dynamic-wind", DYNAMIC_WIND_PROC);
     }
 
     private Object appendTwo(Object a, Object b) {
@@ -1086,9 +1112,38 @@ public class Evaluator {
                     cekApplyKont();
                 }
             } catch (ContinuationReturn cr) {
-                cekK = cr.k;
-                cekValue = cr.value;
-                cekEval = false;
+                List<WindEntry> targetWind = cr.targetWind != null ? cr.targetWind : List.of();
+                // Compute common prefix
+                int commonLen = 0;
+                int minLen = Math.min(windStack.size(), targetWind.size());
+                for (int i = 0; i < minLen; i++) {
+                    if (windStack.get(i) == targetWind.get(i)) commonLen++;
+                    else break;
+                }
+                // Build thunk list: out-thunks (innermost first), then in-thunks (outermost first)
+                List<Object> thunks = new ArrayList<>();
+                for (int i = windStack.size() - 1; i >= commonLen; i--) {
+                    thunks.add(windStack.get(i).outThunk);
+                }
+                for (int i = commonLen; i < targetWind.size(); i++) {
+                    thunks.add(targetWind.get(i).inThunk);
+                }
+                if (!thunks.isEmpty()) {
+                    // Execute thunks, then restore continuation
+                    cekK = new DynWindDoThunksK(thunks, 0, targetWind, cr.k, cr.value, cekK);
+                    // Need to properly unwind current stack before running thunks
+                    // Trim wind stack to common prefix before running out-thunks
+                    while (windStack.size() > commonLen) windStack.remove(windStack.size() - 1);
+                    try {
+                        cekApplyProc(thunks.get(0), List.of(), cekK);
+                    } catch (EvalError e) {
+                        throw e;
+                    }
+                } else {
+                    cekK = cr.k;
+                    cekValue = cr.value;
+                    cekEval = false;
+                }
             } catch (EvalError e) {
                 if (cekSrcLine >= 0 && !e.getMessage().matches(".*\\d+:\\d+.*")) {
                     throw new EvalError(e.getMessage() + " at " + cekSrcLine + ":" + cekSrcCol);
@@ -1592,6 +1647,41 @@ public class Evaluator {
             cekExpr = dsk.testClause.get(0); cekEnv = dsk.doEnv; cekEval = true; return;
         }
 
+        if (k instanceof DynWindAfterInK dwi) {
+            // in-thunk done; push wind entry, call body-thunk
+            WindEntry entry = new WindEntry(dwi.inThunk, dwi.outThunk);
+            windStack.add(entry);
+            cekK = new DynWindAfterBodyK(dwi.inThunk, dwi.outThunk, dwi.k);
+            cekApplyProc(dwi.bodyThunk, List.of(), cekK); return;
+        }
+
+        if (k instanceof DynWindAfterBodyK dwb) {
+            // body done; save result, pop wind entry, call out-thunk
+            Object bodyValue = value;
+            if (!windStack.isEmpty()) windStack.remove(windStack.size() - 1);
+            cekK = new DynWindAfterOutK(bodyValue, dwb.k);
+            cekApplyProc(dwb.outThunk, List.of(), cekK); return;
+        }
+
+        if (k instanceof DynWindAfterOutK dwo) {
+            // out-thunk done; return body value
+            cekValue = dwo.bodyValue; cekK = dwo.k; return;
+        }
+
+        if (k instanceof DynWindDoThunksK dwt) {
+            // Just finished a thunk; advance to next
+            if (dwt.idx + 1 < dwt.thunks.size()) {
+                cekK = new DynWindDoThunksK(dwt.thunks, dwt.idx + 1, dwt.targetWind, dwt.targetK, dwt.targetValue, dwt.k);
+                cekApplyProc(dwt.thunks.get(dwt.idx + 1), List.of(), cekK); return;
+            }
+            // All thunks done; restore target wind stack and continuation
+            windStack = new ArrayList<>(dwt.targetWind);
+            cekK = dwt.targetK;
+            cekValue = dwt.targetValue;
+            cekEval = false;
+            return;
+        }
+
         throw new EvalError("unknown continuation type: " + k.getClass().getSimpleName());
     }
 
@@ -1613,12 +1703,21 @@ public class Evaluator {
         }
         if (proc instanceof SchemeContinuation sc) {
             if (args.isEmpty()) throw new EvalError("continuation requires 1 argument");
-            throw new ContinuationReturn(sc.k, args.get(0));
+            throw new ContinuationReturn(sc.k, args.get(0), sc.savedWind);
         }
         if (proc == CALLCC_PROC) {
             if (args.size() != 1) throw new EvalError("call/cc requires 1 argument");
-            SchemeContinuation sc = new SchemeContinuation(k);
+            SchemeContinuation sc = new SchemeContinuation(k, new ArrayList<>(windStack));
             cekApplyProc(args.get(0), List.of(sc), k); return;
+        }
+        if (proc == DYNAMIC_WIND_PROC) {
+            if (args.size() != 3) throw new EvalError("dynamic-wind requires 3 arguments");
+            Object inThunk = args.get(0);
+            Object bodyThunk = args.get(1);
+            Object outThunk = args.get(2);
+            // Call in-thunk first, then DynWindAfterInK handles the rest
+            cekK = new DynWindAfterInK(inThunk, bodyThunk, outThunk, k);
+            cekApplyProc(inThunk, List.of(), cekK); return;
         }
         throw new EvalError("cannot apply: " + schemeToString(proc));
     }
@@ -2356,6 +2455,7 @@ public class Evaluator {
         if (val instanceof CaseLambda) return "#<procedure>";
         if (val instanceof SchemeContinuation) return "#<continuation>";
         if (val == CALLCC_PROC) return "#<procedure:call/cc>";
+        if (val == DYNAMIC_WIND_PROC) return "#<procedure:dynamic-wind>";
         if (val instanceof SyntaxRulesMacro) return "#<macro>";
         if (val instanceof ResolvedValue rv) return schemeToString(rv.value);
         return val.toString();
