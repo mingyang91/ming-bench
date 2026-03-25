@@ -229,17 +229,68 @@ public class Interpreter {
             if (args.length != 1) throw new EvalError("string-copy: expected 1 argument");
             if (!(args[0] instanceof SchemeValue.StringVal s))
                 throw new EvalError("string-copy: expected string");
-            return new SchemeValue.StringVal(s.value());
+            return new SchemeValue.StringVal(s.value(), true);
         }));
         globals.define("string-set!", new SchemeValue.BuiltinVal("string-set!", args -> {
             if (args.length != 3) throw new EvalError("string-set!: expected 3 arguments");
             if (!(args[0] instanceof SchemeValue.StringVal s))
                 throw new EvalError("string-set!: expected string");
-            int idx = (int) asLong(args[1]);
+            if (!s.isMutable())
+                throw new EvalError("string-set!: strings are immutable");
+            if (!(args[1] instanceof SchemeValue.IntVal idx))
+                throw new EvalError("string-set!: expected integer index");
             if (!(args[2] instanceof SchemeValue.CharVal c))
-                throw new EvalError("string-set!: expected char");
-            s.setCharAt(idx, c.value());
+                throw new EvalError("string-set!: expected character");
+            int i = (int) idx.value();
+            if (i < 0 || i >= s.length())
+                throw new EvalError("string-set!: index out of bounds");
+            s.setCharAt(i, c.value());
             return new SchemeValue.VoidVal();
+        }));
+
+        // L15 builtins
+        globals.define("string->list", new SchemeValue.BuiltinVal("string->list", args -> {
+            if (args.length != 1) throw new EvalError("string->list: expected 1 argument");
+            if (!(args[0] instanceof SchemeValue.StringVal s))
+                throw new EvalError("string->list: expected string");
+            String str = s.value();
+            SchemeValue result = new SchemeValue.ListVal(java.util.List.of());
+            for (int i = str.length() - 1; i >= 0; i--) {
+                result = new SchemeValue.PairVal(new SchemeValue.CharVal(str.charAt(i)), result);
+            }
+            return result;
+        }));
+        globals.define("list->string", new SchemeValue.BuiltinVal("list->string", args -> {
+            if (args.length != 1) throw new EvalError("list->string: expected 1 argument");
+            var sb = new StringBuilder();
+            SchemeValue cur = args[0];
+            while (cur instanceof SchemeValue.PairVal p) {
+                if (!(p.car() instanceof SchemeValue.CharVal c))
+                    throw new EvalError("list->string: expected list of characters");
+                sb.append(c.value());
+                cur = p.cdr();
+            }
+            if (cur instanceof SchemeValue.ListVal l && !l.elements().isEmpty()) {
+                for (var elem : l.elements()) {
+                    if (!(elem instanceof SchemeValue.CharVal c))
+                        throw new EvalError("list->string: expected list of characters");
+                    sb.append(c.value());
+                }
+            } else if (!(cur instanceof SchemeValue.ListVal)) {
+                throw new EvalError("list->string: expected proper list");
+            }
+            return new SchemeValue.StringVal(sb.toString());
+        }));
+        globals.define("char->integer", new SchemeValue.BuiltinVal("char->integer", args -> {
+            if (args.length != 1) throw new EvalError("char->integer: expected 1 argument");
+            if (!(args[0] instanceof SchemeValue.CharVal c))
+                throw new EvalError("char->integer: expected char");
+            return new SchemeValue.IntVal(c.value());
+        }));
+        globals.define("integer->char", new SchemeValue.BuiltinVal("integer->char", args -> {
+            if (args.length != 1) throw new EvalError("integer->char: expected 1 argument");
+            long n = asLong(args[0]);
+            return new SchemeValue.CharVal((char) n);
         }));
 
         // L08 builtins
