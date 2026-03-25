@@ -38,6 +38,9 @@ function errAt(msg: string, pos?: Pos): EvalError {
 }
 
 const NIL: SchemeVal = { tag: 'nil' };
+const VOID: SchemeVal = { tag: 'void' };
+const TRUE_VAL: SchemeVal = { tag: 'boolean', value: true };
+const FALSE_VAL: SchemeVal = { tag: 'boolean', value: false };
 let eqIdCounter = 0;
 
 // ── Rational helpers ────────────────────────────────────────────
@@ -141,23 +144,26 @@ function pairToArray(val: SchemeVal): SchemeVal[] {
 // ── Environment ───────────────────────────────────────────────────
 
 class Env {
-  private bindings: Map<string, SchemeVal> = new Map();
+  private bindings: Map<string, SchemeVal> | null = null;
   constructor(private parent: Env | null = null) {}
 
   get(name: string, pos?: Pos): SchemeVal {
-    const val = this.bindings.get(name);
-    if (val !== undefined) return val;
+    if (this.bindings) {
+      const val = this.bindings.get(name);
+      if (val !== undefined) return val;
+    }
     if (this.parent) return this.parent.get(name, pos);
     throw errAt(`unbound variable: ${name}`, pos);
   }
 
   set(name: string, val: SchemeVal, pos?: Pos): void {
-    if (this.bindings.has(name)) { this.bindings.set(name, val); return; }
+    if (this.bindings?.has(name)) { this.bindings.set(name, val); return; }
     if (this.parent) { this.parent.set(name, val, pos); return; }
     throw errAt(`set!: unbound variable: ${name}`, pos);
   }
 
   define(name: string, val: SchemeVal): void {
+    if (!this.bindings) this.bindings = new Map();
     this.bindings.set(name, val);
   }
 }
@@ -305,7 +311,7 @@ function makeGlobalEnv(): Env {
         case '>=': r = a >= b; break;
         case '<=': r = a <= b; break;
       }
-      return { tag: 'boolean', value: r };
+      return r ? TRUE_VAL : FALSE_VAL;
     });
   }
 
@@ -454,19 +460,19 @@ function makeGlobalEnv(): Env {
   defBuiltin('display', (args) => {
     if (args.length !== 1) throw new EvalError('display: expected 1 argument');
     outputBuffer += displayValUnquoted(args[0]);
-    return { tag: 'void' };
+    return VOID;
   });
 
   defBuiltin('write', (args) => {
     if (args.length !== 1) throw new EvalError('write: expected 1 argument');
     outputBuffer += writeVal(args[0]);
-    return { tag: 'void' };
+    return VOID;
   });
 
   defBuiltin('newline', (args) => {
     if (args.length !== 0) throw new EvalError('newline: expected 0 arguments');
     outputBuffer += '\n';
-    return { tag: 'void' };
+    return VOID;
   });
 
   // String operations
@@ -532,7 +538,7 @@ function makeGlobalEnv(): Env {
     const idx = expectNum(args[1], 'string-set!');
     if (idx < 0 || idx >= s.value.length) throw new EvalError('string-set!: index out of range');
     s.value = s.value.substring(0, idx) + args[2].value + s.value.substring(idx + 1);
-    return { tag: 'void' };
+    return VOID;
   });
 
   defBuiltin('string->list', (args) => {
@@ -782,7 +788,7 @@ function makeGlobalEnv(): Env {
       const callArgs = lists.map(l => l[i]);
       applySync(func, callArgs);
     }
-    return { tag: 'void' };
+    return VOID;
   });
 
   // cxr helpers
@@ -962,14 +968,14 @@ function makeGlobalEnv(): Env {
     if (args.length !== 2) throw new EvalError('set-car!: expected 2 arguments');
     if (args[0].tag !== 'pair') throw new EvalError('set-car!: expected pair');
     (args[0] as { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }).car = args[1];
-    return { tag: 'void' };
+    return VOID;
   });
 
   defBuiltin('set-cdr!', (args) => {
     if (args.length !== 2) throw new EvalError('set-cdr!: expected 2 arguments');
     if (args[0].tag !== 'pair') throw new EvalError('set-cdr!: expected pair');
     (args[0] as { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }).cdr = args[1];
-    return { tag: 'void' };
+    return VOID;
   });
 
   // Map (uses applySync for CPS compatibility)
@@ -1075,7 +1081,7 @@ function makeGlobalEnv(): Env {
     const idx = expectNum(args[1], 'vector-set!');
     if (idx < 0 || idx >= args[0].elements.length) throw new EvalError('vector-set!: index out of range');
     args[0].elements[idx] = args[2];
-    return { tag: 'void' };
+    return VOID;
   });
 
   defBuiltin('vector-length', (args) => {
@@ -1288,7 +1294,7 @@ function gensym(prefix: string): string {
 const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'lambda', 'case-lambda', 'set!', 'begin', 'let', 'let*', 'letrec', 'letrec*',
   'cond', 'and', 'or', 'not', 'define-syntax', 'syntax-rules', 'syntax-case', 'syntax', 'with-syntax', 'case', 'do',
-  'call/cc', 'call-with-current-continuation', 'guard',
+  'call/cc', 'call-with-current-continuation', 'guard', 'define-record-type',
 ]);
 
 // ── Syntax-case support ──────────────────────────────────────────
@@ -1405,11 +1411,15 @@ function expandTemplate(
   return template;
 }
 
+interface MacroExpansionResult {
+  expanded: SchemeVal;
+  renames: [string, string][];
+}
+
 function expandMacro(
   macro: { literals: string[]; clauses: MacroClause[]; defEnv: Env },
   form: SchemeVal[],
-  useEnv: Env
-): SchemeVal {
+): MacroExpansionResult {
   const literalSet = new Set(macro.literals);
   for (const clause of macro.clauses) {
     const bindings = new Map<string, MatchBinding>();
@@ -1420,11 +1430,7 @@ function expandMacro(
       const renames = new Map<string, string>();
       for (const sym of introduced) renames.set(sym, gensym(sym));
       const expanded = expandTemplate(clause.template, bindings, renames);
-      for (const [original, renamed] of renames) {
-        try { useEnv.define(renamed, macro.defEnv.get(original)); }
-        catch { /* fresh introduced variable */ }
-      }
-      return expanded;
+      return { expanded, renames: Array.from(renames.entries()) };
     }
   }
   throw new EvalError('syntax-rules: no matching pattern');
@@ -1436,25 +1442,78 @@ function isTruthy(val: SchemeVal): boolean {
   return !(val.tag === 'boolean' && val.value === false);
 }
 
+const identityCont: Cont = (v: SchemeVal): Bounce => v;
+
+const CC_SYMBOLS = new Set(['call/cc', 'call-with-current-continuation', 'dynamic-wind', 'raise', 'with-exception-handler', 'guard', 'values', 'call-with-values']);
+
 function exprMayCallCC(expr: SchemeVal): boolean {
-  if (expr.tag === 'symbol') return expr.value === 'call/cc' || expr.value === 'call-with-current-continuation' || expr.value === 'dynamic-wind' || expr.value === 'raise' || expr.value === 'with-exception-handler' || expr.value === 'guard' || expr.value === 'values' || expr.value === 'call-with-values';
-  if (expr.tag === 'list') return expr.elements.some(exprMayCallCC);
-  return false;
+  const cached = (expr as any)._mcc;
+  if (cached !== undefined) return cached;
+  let result: boolean;
+  if (expr.tag === 'symbol') result = CC_SYMBOLS.has(expr.value);
+  else if (expr.tag === 'list') result = expr.elements.some(exprMayCallCC);
+  else result = false;
+  (expr as any)._mcc = result;
+  return result;
+}
+
+// Fast evaluation for simple expressions (symbols and literals) — avoids full evalCPS overhead
+function evalFast(expr: SchemeVal, env: Env): SchemeVal | null {
+  if (expr.tag === 'symbol') {
+    try { return env.get(expr.value, expr.pos); }
+    catch { return null; }  // unbound (might be a special form)
+  }
+  if (expr.tag === 'number' || expr.tag === 'rational' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') return expr;
+  return null;
+}
+
+// Fast evaluation for a simple function call: (builtin arg1 arg2 ...) where all args are symbols/literals
+function evalCallDirect(expr: SchemeVal, env: Env): SchemeVal | null {
+  if (expr.tag !== 'list') return evalFast(expr, env);
+  const elems = expr.elements;
+  if (elems.length === 0) return null;
+  const func = evalFast(elems[0], env);
+  if (func === null || func.tag !== 'builtin') return null;
+  // Check for CPS builtins that need special handling
+  if (CC_SYMBOLS.has(func.name) || func.name === 'apply') return null;
+  const args: SchemeVal[] = [];
+  for (let i = 1; i < elems.length; i++) {
+    const arg = evalFast(elems[i], env);
+    if (arg === null) return null;
+    args.push(arg);
+  }
+  try { return func.fn(args); }
+  catch (e) {
+    if (e instanceof EvalError) throw errAt(e.message, expr.pos);
+    throw e;
+  }
 }
 
 let callccActive = false;
+// When the fast path evaluates an expression, this holds the proper CPS continuation
+// for remaining expressions. call/cc uses this to capture the correct chain.
+let fastPathCont: Cont | null = null;
 
 function evalSeqCPS(exprs: SchemeVal[], idx: number, env: Env, k: Cont): Bounce {
   // Fast path: evaluate non-tail expressions synchronously when no call/cc is active
   while (idx < exprs.length - 1 && !callccActive && !exprMayCallCC(exprs[idx])) {
-    runTrampoline(evalCPS(exprs[idx], env, (v) => v));
+    // Smart continuation: behaves like identityCont normally, but if call/cc
+    // is used during evaluation, redirects to the proper CPS continuation
+    // that includes remaining expressions.
+    const nextIdx = idx + 1;
+    const cpsK: Cont = (_) => evalSeqCPS(exprs, nextIdx, env, k);
+    fastPathCont = cpsK;
+    const smartK: Cont = (val) => callccActive ? cpsK(val) : val;
+    runTrampoline(evalCPS(exprs[idx], env, smartK));
+    fastPathCont = null;
     if (callccActive) {
-      // call/cc was invoked during sync eval — re-evaluate with CPS to capture correct continuation
-      return evalCPS(exprs[idx], env, (_) => evalSeqCPS(exprs, idx + 1, env, k));
+      // call/cc was invoked — the captured continuation includes smartK
+      // which will redirect to cpsK when invoked. No re-evaluation needed.
+      return evalSeqCPS(exprs, nextIdx, env, k);
     }
     idx++;
   }
-  if (idx >= exprs.length) return k({ tag: 'void' });
+  if (idx >= exprs.length) return k(VOID);
   if (idx === exprs.length - 1) return evalCPS(exprs[idx], env, k);
   return evalCPS(exprs[idx], env, (_) => evalSeqCPS(exprs, idx + 1, env, k));
 }
@@ -1637,6 +1696,7 @@ function applyCPS(func: SchemeVal, args: SchemeVal[], pos: Pos | undefined, k: C
 }
 
 function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
+ tailLoop: while (true) {
   if (expr.tag === 'number' || expr.tag === 'rational' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') {
     return k(expr);
   }
@@ -1655,6 +1715,40 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
   if (elems[0].tag === 'symbol') {
     const op = elems[0].value;
 
+    // Fast path: non-special-form symbols skip directly to macro/function handling
+    if (!SPECIAL_FORMS.has(op)) {
+      // Check for macro application
+      try {
+        const macroVal = env.get(op);
+        if (macroVal.tag === 'macro') {
+          let cache = (expr as any)._mc as MacroExpansionResult | undefined;
+          if (!cache) {
+            cache = expandMacro(macroVal, elems);
+            (expr as any)._mc = cache;
+          }
+          const { expanded, renames } = cache;
+          for (const [original, renamed] of renames) {
+            try { env.define(renamed, macroVal.defEnv.get(original)); }
+            catch { /* fresh introduced variable */ }
+          }
+          expr = expanded; continue tailLoop;
+        }
+        if (macroVal.tag === 'syntax-case-macro') {
+          const formVal: SchemeVal = { tag: 'list', elements: elems };
+          pendingSyntaxRenames = [];
+          return applyCPS(macroVal.transformer, [formVal], epos, (expanded) => {
+            for (const { original, renamed, defEnv: dEnv } of pendingSyntaxRenames) {
+              try { env.define(renamed, dEnv.get(original)); }
+              catch { /* fresh introduced variable */ }
+            }
+            pendingSyntaxRenames = [];
+            return mkBounce(() => evalCPS(expanded, env, k));
+          });
+        }
+      } catch { /* not bound — fall through to function application */ }
+      // Fall through to function application below
+    } else {
+
     if (op === 'quote') {
       if (elems.length !== 2) throw errAt('quote: expected 1 argument', epos);
       return k(quoteSyntaxToValue(elems[1]));
@@ -1663,17 +1757,21 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
     if (op === 'if') {
       if (elems.length < 3 || elems.length > 4) throw errAt('if: expected 2 or 3 arguments', epos);
       if (!callccActive && !exprMayCallCC(elems[1])) {
-        const cond = runTrampoline(evalCPS(elems[1], env, (v) => v));
-        if (isTruthy(cond)) return evalCPS(elems[2], env, k);
-        else if (elems.length === 4) return evalCPS(elems[3], env, k);
-        else return k({ tag: 'void' });
+        // Try direct evaluation for simple conditions like (< i n)
+        let cond: SchemeVal | null = evalCallDirect(elems[1], env);
+        if (cond === null) cond = runTrampoline(evalCPS(elems[1], env, identityCont));
+        if (!callccActive) {
+          if (isTruthy(cond)) { expr = elems[2]; continue tailLoop; }
+          else if (elems.length === 4) { expr = elems[3]; continue tailLoop; }
+          else return k(VOID);
+        }
       }
       return evalCPS(elems[1], env, (cond) => {
         if (isTruthy(cond)) {
           return evalCPS(elems[2], env, k);
         } else {
           if (elems.length === 4) return evalCPS(elems[3], env, k);
-          return k({ tag: 'void' });
+          return k(VOID);
         }
       });
     }
@@ -1684,7 +1782,7 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
       if (target.tag === 'symbol') {
         return evalCPS(elems[2], env, (val) => {
           env.define(target.value, val);
-          return k({ tag: 'void' });
+          return k(VOID);
         });
       }
       if (target.tag === 'list' && target.elements.length > 0 && target.elements[0].tag === 'symbol') {
@@ -1693,7 +1791,7 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
         const body = elems.slice(2);
         const lambda: SchemeVal = { tag: 'lambda', params, rest, body, env };
         env.define(name, lambda);
-        return k({ tag: 'void' });
+        return k(VOID);
       }
       throw errAt('define: bad syntax', epos);
     }
@@ -1729,14 +1827,48 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
     if (op === 'set!') {
       if (elems.length !== 3) throw errAt('set!: bad syntax', epos);
       if (elems[1].tag !== 'symbol') throw errAt('set!: expected symbol', epos);
+      // Fast path: evaluate value directly when possible
+      if (!callccActive && !exprMayCallCC(elems[2])) {
+        let val: SchemeVal | null = evalCallDirect(elems[2], env);
+        if (val === null) val = runTrampoline(evalCPS(elems[2], env, identityCont));
+        if (!callccActive) {
+          env.set(elems[1].value, val, epos);
+          return k(VOID);
+        }
+      }
       return evalCPS(elems[2], env, (val) => {
         env.set(elems[1].value, val, epos);
-        return k({ tag: 'void' });
+        return k(VOID);
       });
     }
 
     if (op === 'begin') {
-      if (elems.length === 1) return k({ tag: 'void' });
+      if (elems.length === 1) return k(VOID);
+      if (!callccActive) {
+        let idx = 1;
+        let safe = true;
+        while (idx < elems.length - 1) {
+          if (exprMayCallCC(elems[idx])) { safe = false; break; }
+          // Try direct evaluation for common patterns (set!, simple calls)
+          const sub = elems[idx];
+          let handled = false;
+          if (sub.tag === 'list' && sub.elements.length === 3 &&
+              sub.elements[0].tag === 'symbol' && sub.elements[0].value === 'set!' &&
+              sub.elements[1].tag === 'symbol') {
+            const val = evalCallDirect(sub.elements[2], env);
+            if (val !== null) {
+              env.set(sub.elements[1].value, val, sub.pos);
+              handled = true;
+            }
+          }
+          if (!handled) {
+            runTrampoline(evalCPS(elems[idx], env, identityCont));
+          }
+          if (callccActive) { safe = false; break; }
+          idx++;
+        }
+        if (safe) { expr = elems[elems.length - 1]; continue tailLoop; }
+      }
       return evalSeqCPS(elems, 1, env, k);
     }
 
@@ -1767,8 +1899,7 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
             return mkBounce(() => evalSeqCPS(body, 0, callEnv, k));
           }
           return evalCPS(bindingsList.elements[idx].elements[1], env, (val) => {
-            vals.push(val);
-            return evalNamedLetInits(idx + 1, vals);
+            return evalNamedLetInits(idx + 1, [...vals, val]);
           });
         }
         return evalNamedLetInits(0, []);
@@ -1789,8 +1920,7 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
         if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
           throw new EvalError('let: bad binding');
         return evalCPS(b.elements[1], env, (val) => {
-          vals.push(val);
-          return evalLetBindings(idx + 1, vals);
+          return mkBounce(() => evalLetBindings(idx + 1, [...vals, val]));
         });
       }
       return evalLetBindings(0, []);
@@ -1826,7 +1956,7 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
         if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
           throw errAt('letrec: bad binding', epos);
         names.push(b.elements[0].value);
-        letrecEnv.define(b.elements[0].value, { tag: 'void' });
+        letrecEnv.define(b.elements[0].value, VOID);
       }
       function evalLetrecBindings(idx: number): Bounce {
         if (idx >= bindings.elements.length) {
@@ -1864,7 +1994,7 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
       if (elems.length < 2) throw errAt('case: bad syntax', epos);
       return evalCPS(elems[1], env, (key) => {
         function evalCaseClauses(idx: number): Bounce {
-          if (idx >= elems.length) return k({ tag: 'void' });
+          if (idx >= elems.length) return k(VOID);
           const clause = elems[idx];
           if (clause.tag !== 'list' || clause.elements.length < 2) throw errAt('case: bad clause', epos);
           if (clause.elements[0].tag === 'symbol' && clause.elements[0].value === 'else') {
@@ -1916,7 +2046,7 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
       function doLoop(doEnv: Env): Bounce {
         return evalCPS(testClause.elements[0], doEnv, (testResult) => {
           if (isTruthy(testResult)) {
-            if (testClause.elements.length === 1) return k({ tag: 'void' });
+            if (testClause.elements.length === 1) return k(VOID);
             return evalSeqCPS(testClause.elements, 1, doEnv, k);
           }
           function afterBody(): Bounce {
@@ -1947,8 +2077,38 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
     }
 
     if (op === 'cond') {
+      // Fast path: evaluate cond clauses synchronously
+      if (!callccActive) {
+        for (let ci = 1; ci < elems.length; ci++) {
+          const clause = elems[ci];
+          if (clause.tag !== 'list' || clause.elements.length < 1) throw errAt('cond: bad clause', epos);
+          if (clause.elements[0].tag === 'symbol' && clause.elements[0].value === 'else') {
+            if (clause.elements.length === 2) { expr = clause.elements[1]; continue tailLoop; }
+            // Multi-expr else: inline begin
+            for (let bi = 1; bi < clause.elements.length - 1; bi++) {
+              runTrampoline(evalCPS(clause.elements[bi], env, identityCont));
+              if (callccActive) break;
+            }
+            if (!callccActive) { expr = clause.elements[clause.elements.length - 1]; continue tailLoop; }
+            break;
+          }
+          if (exprMayCallCC(clause.elements[0])) break;
+          const test = evalCallDirect(clause.elements[0], env) ?? runTrampoline(evalCPS(clause.elements[0], env, identityCont));
+          if (callccActive) break;
+          if (isTruthy(test)) {
+            if (clause.elements.length === 1) return k(test);
+            if (clause.elements.length === 2) { expr = clause.elements[1]; continue tailLoop; }
+            for (let bi = 1; bi < clause.elements.length - 1; bi++) {
+              runTrampoline(evalCPS(clause.elements[bi], env, identityCont));
+              if (callccActive) break;
+            }
+            if (!callccActive) { expr = clause.elements[clause.elements.length - 1]; continue tailLoop; }
+            break;
+          }
+        }
+      }
       function evalCondClauses(idx: number): Bounce {
-        if (idx >= elems.length) return k({ tag: 'void' });
+        if (idx >= elems.length) return k(VOID);
         const clause = elems[idx];
         if (clause.tag !== 'list' || clause.elements.length < 1) throw errAt('cond: bad clause', epos);
         if (clause.elements[0].tag === 'symbol' && clause.elements[0].value === 'else') {
@@ -1966,7 +2126,18 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
     }
 
     if (op === 'and') {
-      if (elems.length === 1) return k({ tag: 'boolean', value: true });
+      if (elems.length === 1) return k(TRUE_VAL);
+      // Fast path: evaluate non-tail clauses synchronously
+      if (!callccActive) {
+        let allTrue = true;
+        for (let i = 1; i < elems.length - 1; i++) {
+          if (exprMayCallCC(elems[i])) { allTrue = false; break; }
+          const r = evalCallDirect(elems[i], env) ?? runTrampoline(evalCPS(elems[i], env, identityCont));
+          if (callccActive) { allTrue = false; break; }
+          if (!isTruthy(r)) return k(r);
+        }
+        if (allTrue) { expr = elems[elems.length - 1]; continue tailLoop; }
+      }
       function evalAndExprs(idx: number): Bounce {
         if (idx === elems.length - 1) return evalCPS(elems[idx], env, k);
         return evalCPS(elems[idx], env, (result) => {
@@ -1978,7 +2149,18 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
     }
 
     if (op === 'or') {
-      if (elems.length === 1) return k({ tag: 'boolean', value: false });
+      if (elems.length === 1) return k(FALSE_VAL);
+      // Fast path: evaluate non-tail clauses synchronously
+      if (!callccActive) {
+        let allFalse = true;
+        for (let i = 1; i < elems.length - 1; i++) {
+          if (exprMayCallCC(elems[i])) { allFalse = false; break; }
+          const r = evalCallDirect(elems[i], env) ?? runTrampoline(evalCPS(elems[i], env, identityCont));
+          if (callccActive) { allFalse = false; break; }
+          if (isTruthy(r)) return k(r);
+        }
+        if (allFalse) { expr = elems[elems.length - 1]; continue tailLoop; }
+      }
       function evalOrExprs(idx: number): Bounce {
         if (idx === elems.length - 1) return evalCPS(elems[idx], env, k);
         return evalCPS(elems[idx], env, (result) => {
@@ -2006,7 +2188,7 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
           transformer.elements[0].tag === 'symbol' && transformer.elements[0].value === 'lambda') {
         return evalCPS(transformer, env, (lambdaVal) => {
           env.define(name, { tag: 'syntax-case-macro', transformer: lambdaVal, defEnv: env });
-          return k({ tag: 'void' });
+          return k(VOID);
         });
       }
       if (transformer.tag !== 'list' || transformer.elements.length < 2 ||
@@ -2029,7 +2211,7 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
         clauses.push({ pattern: c.elements[0].elements, template: c.elements[1] });
       }
       env.define(name, { tag: 'macro', literals, clauses, defEnv: env });
-      return k({ tag: 'void' });
+      return k(VOID);
     }
 
     if (op === 'define-record-type') {
@@ -2073,7 +2255,7 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
           return args[0].fields.get(field)!;
         }});
       }
-      return k({ tag: 'void' });
+      return k(VOID);
     }
 
     if (op === 'guard') {
@@ -2249,12 +2431,21 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
       return evalWithSyntaxBindings(0);
     }
 
-    // Check for macro application
+    // Check for macro application (for special-form symbols that weren't handled above)
     try {
       const macroVal = env.get(op);
       if (macroVal.tag === 'macro') {
-        const expanded = expandMacro(macroVal, elems, env);
-        return mkBounce(() => evalCPS(expanded, env, k));
+        let cache = (expr as any)._mc as MacroExpansionResult | undefined;
+        if (!cache) {
+          cache = expandMacro(macroVal, elems);
+          (expr as any)._mc = cache;
+        }
+        const { expanded, renames } = cache;
+        for (const [original, renamed] of renames) {
+          try { env.define(renamed, macroVal.defEnv.get(original)); }
+          catch { /* fresh introduced variable */ }
+        }
+        expr = expanded; continue tailLoop;
       }
       if (macroVal.tag === 'syntax-case-macro') {
         const formVal: SchemeVal = { tag: 'list', elements: elems };
@@ -2270,29 +2461,96 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
         });
       }
     } catch { /* not bound — fall through */ }
+  } // end else (SPECIAL_FORMS)
   }
 
   // Function application
   if (!callccActive && !exprMayCallCC(expr)) {
-    // Fast path: evaluate func and args synchronously
-    const func = runTrampoline(evalCPS(elems[0], env, (v) => v));
-    const args: SchemeVal[] = [];
-    for (let i = 1; i < elems.length; i++) {
-      args.push(runTrampoline(evalCPS(elems[i], env, (v) => v)));
-      if (callccActive) {
-        // call/cc was encountered during arg eval; re-do remaining with CPS
-        return evalArgsCPS(elems, i + 1, env, args, (allArgs) => {
-          return applyCPS(func, allArgs, epos, k);
-        });
+    // Fast path: evaluate func and args, preferring direct lookup over full evalCPS
+    const func = evalFast(elems[0], env) ?? runTrampoline(evalCPS(elems[0], env, identityCont));
+    if (!callccActive) {
+      const args: SchemeVal[] = [];
+      let argsOk = true;
+      for (let i = 1; i < elems.length; i++) {
+        const fast = evalFast(elems[i], env);
+        if (fast !== null) {
+          args.push(fast);
+        } else {
+          args.push(runTrampoline(evalCPS(elems[i], env, identityCont)));
+          if (callccActive) { argsOk = false; break; }
+        }
       }
+      if (argsOk) {
+        // Lambda TCO: inline lambda application to avoid bounce allocation
+        if (func.tag === 'lambda') {
+          contReentry = false;
+          if (func.rest) {
+            if (args.length < func.params.length)
+              throw errAt(`lambda: expected at least ${func.params.length} arguments, got ${args.length}`, epos);
+          } else {
+            if (args.length !== func.params.length)
+              throw errAt(`lambda: expected ${func.params.length} arguments, got ${args.length}`, epos);
+          }
+          // Skip Env creation for zero-param lambdas (no bindings needed)
+          const bodyEnv = (func.params.length === 0 && !func.rest)
+            ? func.env
+            : (() => {
+                const e = new Env(func.env);
+                for (let i = 0; i < func.params.length; i++) e.define(func.params[i], args[i]);
+                if (func.rest) e.define(func.rest, makeList(args.slice(func.params.length)));
+                return e;
+              })();
+          // Evaluate non-tail body expressions synchronously
+          let bodyOk = true;
+          for (let i = 0; i < func.body.length - 1; i++) {
+            if (callccActive || exprMayCallCC(func.body[i])) { bodyOk = false; break; }
+            runTrampoline(evalCPS(func.body[i], bodyEnv, identityCont));
+            if (callccActive) { bodyOk = false; break; }
+          }
+          if (bodyOk && !callccActive) {
+            expr = func.body[func.body.length - 1];
+            env = bodyEnv;
+            continue tailLoop;  // TCO!
+          }
+          // Fallback to CPS for remaining body
+          return mkBounce(() => evalSeqCPS(func.body, 0, bodyEnv, k));
+        }
+        // Case-lambda TCO
+        if (func.tag === 'case-lambda') {
+          for (const clause of func.clauses) {
+            if (clause.rest ? args.length >= clause.params.length : args.length === clause.params.length) {
+              const callEnv = new Env(func.env);
+              for (let i = 0; i < clause.params.length; i++) callEnv.define(clause.params[i], args[i]);
+              if (clause.rest) callEnv.define(clause.rest, makeList(args.slice(clause.params.length)));
+              let bodyOk = true;
+              for (let i = 0; i < clause.body.length - 1; i++) {
+                if (callccActive || exprMayCallCC(clause.body[i])) { bodyOk = false; break; }
+                runTrampoline(evalCPS(clause.body[i], callEnv, identityCont));
+                if (callccActive) { bodyOk = false; break; }
+              }
+              if (bodyOk && !callccActive) {
+                expr = clause.body[clause.body.length - 1];
+                env = callEnv;
+                continue tailLoop;
+              }
+              return mkBounce(() => evalSeqCPS(clause.body, 0, callEnv, k));
+            }
+          }
+        }
+        return applyCPS(func, args, epos, k);
+      }
+      // callcc activated during arg eval — fall through to CPS
+      return evalArgsCPS(elems, 1, env, [], (allArgs) => {
+        return applyCPS(func, allArgs, epos, k);
+      });
     }
-    return applyCPS(func, args, epos, k);
   }
   return evalCPS(elems[0], env, (func) => {
     return evalArgsCPS(elems, 1, env, [], (args) => {
       return applyCPS(func, args, epos, k);
     });
   });
+ } // end tailLoop
 }
 
 // ── Display ────────────────────────────────────────────────────────
@@ -2350,6 +2608,7 @@ export function evalStr(input: string): string {
   outputBuffer = '';
   contReentry = false;
   callccActive = false;
+  fastPathCont = null;
   windStack = [];
   exceptionHandlers = [];
   syntaxBindingsStack = [];
@@ -2366,6 +2625,7 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   outputBuffer = '';
   contReentry = false;
   callccActive = false;
+  fastPathCont = null;
   windStack = [];
   exceptionHandlers = [];
   syntaxBindingsStack = [];
