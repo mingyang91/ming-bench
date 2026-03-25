@@ -2,6 +2,7 @@ package ming
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"unicode"
@@ -12,6 +13,12 @@ type node interface{}
 
 type listNode struct {
 	elements []node
+	pos      sourcePos
+}
+
+type dottedListNode struct {
+	elements []node
+	tail     node
 	pos      sourcePos
 }
 
@@ -121,6 +128,10 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("equal?", builtinEqual())
 	env.define("not", builtinNot())
 	env.define("abs", builtinAbs())
+	env.define("gcd", builtinGCD())
+	env.define("lcm", builtinLCM())
+	env.define("truncate", builtinTruncate())
+	env.define("round", builtinRound())
 	env.define("modulo", builtinModulo())
 	env.define("remainder", builtinRemainder())
 	env.define("quotient", builtinQuotient())
@@ -135,6 +146,9 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("cons", builtinCons())
 	env.define("car", builtinCar())
 	env.define("cdr", builtinCdr())
+	env.define("cddr", builtinCxr("cddr"))
+	env.define("set-car!", builtinSetCar())
+	env.define("set-cdr!", builtinSetCdr())
 	env.define("null?", builtinNull())
 	env.define("list", builtinList())
 	env.define("vector", builtinVector())
@@ -147,13 +161,18 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("list?", builtinPredicate(isListValue))
 	env.define("vector?", builtinPredicate(isVectorValue))
 	env.define("length", builtinLength())
+	env.define("reverse", builtinReverse())
 	env.define("list-ref", builtinListRef())
 	env.define("list-tail", builtinListTail())
 	env.define("append", builtinAppend())
 	env.define("apply", builtinApply())
 	env.define("map", builtinMap())
+	env.define("for-each", builtinForEach())
+	env.define("member", builtinMember())
+	env.define("assv", builtinAssv())
 	env.define("assoc", builtinAssoc())
 	env.define("procedure?", builtinProcedurePredicate())
+	env.define("error", builtinError())
 	env.define("string?", builtinPredicate(func(v value) bool {
 		return isStringValue(v)
 	}))
@@ -182,6 +201,8 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("display", builtinDisplay(ctx))
 	env.define("write", builtinWrite(ctx))
 	env.define("newline", builtinNewline(ctx))
+	env.define("make-string", builtinMakeString())
+	env.define("string", builtinString())
 	env.define("string-append", builtinStringAppend())
 	env.define("string-length", builtinStringLength())
 	env.define("substring", builtinSubstring())
@@ -200,6 +221,9 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("string-set!", builtinStringSet())
 	env.define("string=?", builtinStringCompare("string=?"))
 	env.define("string<?", builtinStringCompare("string<?"))
+	env.define("string>?", builtinStringCompare("string>?"))
+	env.define("string<=?", builtinStringCompare("string<=?"))
+	env.define("string>=?", builtinStringCompare("string>=?"))
 	env.define("string-ci=?", builtinStringCIEqual())
 	env.define("string-upcase", builtinStringCase("upcase"))
 	env.define("string-downcase", builtinStringCase("downcase"))
@@ -342,6 +366,9 @@ func evalList(list listNode, env *environment) (value, *evalStep, error) {
 			return result, step, withErrorPos(err, list.pos)
 		case "let":
 			result, step, err := evalLet(list.elements[1:], env)
+			return result, step, withErrorPos(err, list.pos)
+		case "let*":
+			result, step, err := evalLetStar(list.elements[1:], env)
 			return result, step, withErrorPos(err, list.pos)
 		case "letrec":
 			result, step, err := evalLetrec(list.elements[1:], env, false)
@@ -600,6 +627,38 @@ func evalLet(args []node, env *environment) (value, *evalStep, error) {
 	return prepareSequence(args[1:], letEnv)
 }
 
+func evalLetStar(args []node, env *environment) (value, *evalStep, error) {
+	if len(args) < 2 {
+		return nil, nil, &EvalError{Message: "let* expects bindings and a body"}
+	}
+
+	bindingList, ok := args[0].(listNode)
+	if !ok {
+		return nil, nil, &EvalError{Message: "let* bindings must be a list"}
+	}
+
+	letEnv := newEnvironment(env)
+	for _, bindingExpr := range bindingList.elements {
+		binding, ok := bindingExpr.(listNode)
+		if !ok || len(binding.elements) != 2 {
+			return nil, nil, &EvalError{Message: "let* bindings must contain name/value pairs"}
+		}
+
+		name, ok := symbolName(binding.elements[0])
+		if !ok {
+			return nil, nil, &EvalError{Message: "let* binding names must be symbols"}
+		}
+
+		boundValue, err := eval(binding.elements[1], letEnv)
+		if err != nil {
+			return nil, nil, err
+		}
+		letEnv.define(name, boundValue)
+	}
+
+	return prepareSequence(args[1:], letEnv)
+}
+
 func evalNamedLet(name string, args []node, env *environment) (value, *evalStep, error) {
 	if len(args) < 2 {
 		return nil, nil, &EvalError{Message: "named let expects bindings and a body"}
@@ -781,7 +840,7 @@ func startClosureCall(proc *closureValue, args []value, pos sourcePos) (value, *
 		callEnv.define(name, args[i])
 	}
 	if proc.hasRest {
-		callEnv.define(proc.restParam, listValue{elements: copyValues(args[len(proc.params):])})
+		callEnv.define(proc.restParam, makeList(copyValues(args[len(proc.params):])))
 	}
 	return prepareSequence(proc.body, callEnv)
 }
@@ -939,16 +998,7 @@ func builtinCons() builtinProc {
 		if len(args) != 2 {
 			return nil, &EvalError{Message: "cons expects exactly 2 arguments"}
 		}
-
-		list, ok := args[1].(listValue)
-		if !ok {
-			return &pairValue{car: args[0], cdr: args[1]}, nil
-		}
-
-		elements := make([]value, 0, len(list.elements)+1)
-		elements = append(elements, args[0])
-		elements = append(elements, list.elements...)
-		return listValue{elements: elements}, nil
+		return &pairValue{car: args[0], cdr: args[1]}, nil
 	}
 }
 
@@ -983,12 +1033,74 @@ func builtinCdr() builtinProc {
 			if len(v.elements) == 0 {
 				return nil, &EvalError{Message: "cdr expects a non-empty list"}
 			}
-			return listValue{elements: copyValues(v.elements[1:])}, nil
+			return makeList(copyValues(v.elements[1:])), nil
 		case *pairValue:
 			return v.cdr, nil
 		default:
 			return nil, &EvalError{Message: "cdr expects a pair"}
 		}
+	}
+}
+
+func builtinCxr(name string) builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%s expects exactly 1 argument", name)}
+		}
+
+		current := args[0]
+		for i := len(name) - 2; i >= 1; i-- {
+			switch name[i] {
+			case 'a':
+				next, err := builtinCar()([]value{current})
+				if err != nil {
+					return nil, err
+				}
+				current = next
+			case 'd':
+				next, err := builtinCdr()([]value{current})
+				if err != nil {
+					return nil, err
+				}
+				current = next
+			default:
+				return nil, &EvalError{Message: fmt.Sprintf("unsupported accessor: %s", name)}
+			}
+		}
+
+		return current, nil
+	}
+}
+
+func builtinSetCar() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "set-car! expects exactly 2 arguments"}
+		}
+
+		pair, ok := args[0].(*pairValue)
+		if !ok {
+			return nil, &EvalError{Message: "set-car! expects a pair"}
+		}
+
+		pair.car = args[1]
+		return voidValue{}, nil
+	}
+}
+
+func builtinSetCdr() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "set-cdr! expects exactly 2 arguments"}
+		}
+
+		pair, ok := args[0].(*pairValue)
+		if !ok {
+			return nil, &EvalError{Message: "set-cdr! expects a pair"}
+		}
+
+		pair.cdr = args[1]
+		return voidValue{}, nil
 	}
 }
 
@@ -998,14 +1110,13 @@ func builtinNull() builtinProc {
 			return nil, &EvalError{Message: "null? expects exactly 1 argument"}
 		}
 
-		list, ok := args[0].(listValue)
-		return booleanValue(ok && len(list.elements) == 0), nil
+		return booleanValue(isEmptyListValue(args[0])), nil
 	}
 }
 
 func builtinList() builtinProc {
 	return func(args []value) (value, error) {
-		return listValue{elements: copyValues(args)}, nil
+		return makeList(copyValues(args)), nil
 	}
 }
 
@@ -1023,10 +1134,29 @@ func builtinLength() builtinProc {
 	}
 }
 
+func builtinReverse() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "reverse expects exactly 1 argument"}
+		}
+
+		list, err := expectListValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+
+		reversed := make([]value, len(list.elements))
+		for i, element := range list.elements {
+			reversed[len(list.elements)-1-i] = element
+		}
+		return makeList(reversed), nil
+	}
+}
+
 func builtinAppend() builtinProc {
 	return func(args []value) (value, error) {
 		if len(args) == 0 {
-			return listValue{elements: nil}, nil
+			return listValue{}, nil
 		}
 
 		var combined []value
@@ -1037,7 +1167,7 @@ func builtinAppend() builtinProc {
 			}
 			combined = append(combined, list.elements...)
 		}
-		return listValue{elements: copyValues(combined)}, nil
+		return makeList(combined), nil
 	}
 }
 
@@ -1091,7 +1221,100 @@ func builtinMap() builtinProc {
 			results = append(results, result)
 		}
 
-		return listValue{elements: results}, nil
+		return makeList(results), nil
+	}
+}
+
+func builtinForEach() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: "for-each expects a procedure and at least 1 list"}
+		}
+
+		lists := make([]listValue, len(args)-1)
+		limit := -1
+		for i, arg := range args[1:] {
+			list, err := expectListValue(arg)
+			if err != nil {
+				return nil, err
+			}
+			lists[i] = list
+			if limit == -1 || len(list.elements) < limit {
+				limit = len(list.elements)
+			}
+		}
+
+		callArgs := make([]value, len(lists))
+		for i := 0; i < limit; i++ {
+			for j, list := range lists {
+				callArgs[j] = list.elements[i]
+			}
+			if _, err := applyProcedure(args[0], callArgs, sourcePos{}); err != nil {
+				return nil, err
+			}
+		}
+
+		return voidValue{}, nil
+	}
+}
+
+func builtinMember() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "member expects exactly 2 arguments"}
+		}
+
+		current := args[1]
+		seen := map[*pairValue]struct{}{}
+		for {
+			switch list := current.(type) {
+			case listValue:
+				for i, element := range list.elements {
+					if equalValues(args[0], element) {
+						return makeList(copyValues(list.elements[i:])), nil
+					}
+				}
+				return booleanValue(false), nil
+			case *pairValue:
+				if _, ok := seen[list]; ok {
+					return nil, &EvalError{Message: "expected list"}
+				}
+				seen[list] = struct{}{}
+				if equalValues(args[0], list.car) {
+					return current, nil
+				}
+				current = list.cdr
+			default:
+				return nil, &EvalError{Message: "expected list"}
+			}
+		}
+	}
+}
+
+func builtinError() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) == 0 {
+			return nil, &EvalError{Message: "error expects at least 1 argument"}
+		}
+
+		parts := make([]string, 0, len(args))
+		for i, arg := range args {
+			var (
+				text string
+				err  error
+			)
+			if i == 0 {
+				text, err = formatDisplayValue(arg)
+			} else {
+				text, err = formatValue(arg)
+			}
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, text)
+		}
+
+		return nil, &EvalError{Message: strings.Join(parts, " ")}
 	}
 }
 
@@ -1112,6 +1335,31 @@ func builtinAssoc() builtinProc {
 				return nil, &EvalError{Message: "assoc expects a list of pairs"}
 			}
 			if equalValues(args[0], key) {
+				return entry, nil
+			}
+		}
+
+		return booleanValue(false), nil
+	}
+}
+
+func builtinAssv() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "assv expects exactly 2 arguments"}
+		}
+
+		alist, err := expectListValue(args[1])
+		if err != nil {
+			return nil, err
+		}
+
+		for _, entry := range alist.elements {
+			key, ok := assocKey(entry)
+			if !ok {
+				return nil, &EvalError{Message: "assv expects a list of pairs"}
+			}
+			if eqValues(args[0], key) {
 				return entry, nil
 			}
 		}
@@ -1161,6 +1409,70 @@ func builtinAbs() builtinProc {
 			n = -n
 		}
 		return integerValue(n), nil
+	}
+}
+
+func builtinGCD() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) == 0 {
+			return integerValue(0), nil
+		}
+
+		result := 0
+		for _, arg := range args {
+			n, err := expectIntegerValue(arg)
+			if err != nil {
+				return nil, err
+			}
+			if n < 0 {
+				n = -n
+			}
+			result = gcdIntegers(result, n)
+		}
+		return integerValue(result), nil
+	}
+}
+
+func builtinLCM() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) == 0 {
+			return integerValue(1), nil
+		}
+
+		result := 1
+		for _, arg := range args {
+			n, err := expectIntegerValue(arg)
+			if err != nil {
+				return nil, err
+			}
+			if n < 0 {
+				n = -n
+			}
+			if result == 0 || n == 0 {
+				result = 0
+				continue
+			}
+			result = result / gcdIntegers(result, n) * n
+		}
+		return integerValue(result), nil
+	}
+}
+
+func builtinTruncate() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "truncate expects exactly 1 argument"}
+		}
+		return truncateValue(args[0])
+	}
+}
+
+func builtinRound() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "round expects exactly 1 argument"}
+		}
+		return roundValue(args[0])
 	}
 }
 
@@ -1326,19 +1638,12 @@ func builtinListRef() builtinProc {
 			return nil, &EvalError{Message: "list-ref expects exactly 2 arguments"}
 		}
 
-		list, err := expectListValue(args[0])
-		if err != nil {
-			return nil, err
-		}
 		index, err := expectIntegerValue(args[1])
 		if err != nil {
 			return nil, err
 		}
-		if index < 0 || index >= len(list.elements) {
-			return nil, &EvalError{Message: "list-ref index out of range"}
-		}
 
-		return list.elements[index], nil
+		return listRefValue(args[0], index)
 	}
 }
 
@@ -1348,19 +1653,12 @@ func builtinListTail() builtinProc {
 			return nil, &EvalError{Message: "list-tail expects exactly 2 arguments"}
 		}
 
-		list, err := expectListValue(args[0])
-		if err != nil {
-			return nil, err
-		}
 		index, err := expectIntegerValue(args[1])
 		if err != nil {
 			return nil, err
 		}
-		if index < 0 || index > len(list.elements) {
-			return nil, &EvalError{Message: "list-tail index out of range"}
-		}
 
-		return listValue{elements: copyValues(list.elements[index:])}, nil
+		return listTailValue(args[0], index)
 	}
 }
 
@@ -1425,6 +1723,51 @@ func builtinStringAppend() builtinProc {
 			builder.WriteString(str)
 		}
 		return stringValue(builder.String()), nil
+	}
+}
+
+func builtinMakeString() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) < 1 || len(args) > 2 {
+			return nil, &EvalError{Message: "make-string expects 1 or 2 arguments"}
+		}
+
+		length, err := expectIntegerValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		if length < 0 {
+			return nil, &EvalError{Message: "make-string length must be non-negative"}
+		}
+
+		fill := rune(0)
+		if len(args) == 2 {
+			char, err := expectCharValue(args[1])
+			if err != nil {
+				return nil, err
+			}
+			fill = rune(char)
+		}
+
+		runes := make([]rune, length)
+		for i := range runes {
+			runes[i] = fill
+		}
+		return stringValue(string(runes)), nil
+	}
+}
+
+func builtinString() builtinProc {
+	return func(args []value) (value, error) {
+		runes := make([]rune, len(args))
+		for i, arg := range args {
+			char, err := expectCharValue(arg)
+			if err != nil {
+				return nil, err
+			}
+			runes[i] = rune(char)
+		}
+		return stringValue(string(runes)), nil
 	}
 }
 
@@ -1547,7 +1890,7 @@ func builtinStringToList() builtinProc {
 		for i, r := range runes {
 			elements[i] = charValue(r)
 		}
-		return listValue{elements: elements}, nil
+		return makeList(elements), nil
 	}
 }
 
@@ -1668,6 +2011,12 @@ func builtinStringCompare(name string) builtinProc {
 				ok = prev == current
 			case "string<?":
 				ok = prev < current
+			case "string>?":
+				ok = prev > current
+			case "string<=?":
+				ok = prev <= current
+			case "string>=?":
+				ok = prev >= current
 			default:
 				return nil, &EvalError{Message: "unknown string comparison"}
 			}
@@ -1859,11 +2208,11 @@ func expectSymbolValue(v value) (string, error) {
 }
 
 func expectListValue(v value) (listValue, error) {
-	list, ok := v.(listValue)
-	if !ok {
-		return listValue{}, &EvalError{Message: "expected list"}
+	elements, err := listElements(v)
+	if err != nil {
+		return listValue{}, err
 	}
-	return list, nil
+	return listValue{elements: elements}, nil
 }
 
 func expectStringRunes(v value) ([]rune, error) {
@@ -1922,6 +2271,194 @@ func copyRunes(runes []rune) []rune {
 	return copied
 }
 
+func makeList(elements []value) value {
+	if len(elements) == 0 {
+		return listValue{}
+	}
+
+	var result value = listValue{}
+	for i := len(elements) - 1; i >= 0; i-- {
+		result = &pairValue{car: elements[i], cdr: result}
+	}
+	return result
+}
+
+func isEmptyListValue(v value) bool {
+	list, ok := v.(listValue)
+	return ok && len(list.elements) == 0
+}
+
+func listElements(v value) ([]value, error) {
+	elements := []value{}
+	current := v
+	seen := map[*pairValue]struct{}{}
+
+	for {
+		switch currentPair := current.(type) {
+		case listValue:
+			elements = append(elements, currentPair.elements...)
+			return elements, nil
+		case *pairValue:
+			if _, ok := seen[currentPair]; ok {
+				return nil, &EvalError{Message: "expected list"}
+			}
+			seen[currentPair] = struct{}{}
+			elements = append(elements, currentPair.car)
+			current = currentPair.cdr
+		default:
+			return nil, &EvalError{Message: "expected list"}
+		}
+	}
+}
+
+func properListElements(v value) ([]value, bool) {
+	elements, err := listElements(v)
+	if err != nil {
+		return nil, false
+	}
+	return elements, true
+}
+
+func equalValueSlices(left []value, right []value) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i, element := range left {
+		if !equalValues(element, right[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func gcdIntegers(a int, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	if a < 0 {
+		return -a
+	}
+	return a
+}
+
+func truncateValue(v value) (value, error) {
+	switch v := v.(type) {
+	case integerValue:
+		return v, nil
+	case rationalValue:
+		return integerValue(v.numerator / v.denominator), nil
+	case inexactValue:
+		return inexactValue(math.Trunc(float64(v))), nil
+	default:
+		return nil, &EvalError{Message: "expected number"}
+	}
+}
+
+func roundValue(v value) (value, error) {
+	switch v := v.(type) {
+	case integerValue:
+		return v, nil
+	case rationalValue:
+		sign := 1
+		numerator := v.numerator
+		if numerator < 0 {
+			sign = -1
+			numerator = -numerator
+		}
+		quotient := numerator / v.denominator
+		remainder := numerator % v.denominator
+		if remainder*2 >= v.denominator {
+			quotient++
+		}
+		return integerValue(sign * quotient), nil
+	case inexactValue:
+		return inexactValue(math.Round(float64(v))), nil
+	default:
+		return nil, &EvalError{Message: "expected number"}
+	}
+}
+
+func listRefValue(v value, index int) (value, error) {
+	if index < 0 {
+		return nil, &EvalError{Message: "list-ref index out of range"}
+	}
+
+	tail, err := listTailValue(v, index)
+	if err != nil {
+		return nil, err
+	}
+
+	switch tail := tail.(type) {
+	case listValue:
+		if len(tail.elements) == 0 {
+			return nil, &EvalError{Message: "list-ref index out of range"}
+		}
+		return tail.elements[0], nil
+	case *pairValue:
+		return tail.car, nil
+	default:
+		return nil, &EvalError{Message: "list-ref index out of range"}
+	}
+}
+
+func listTailValue(v value, index int) (value, error) {
+	if index < 0 {
+		return nil, &EvalError{Message: "list-tail index out of range"}
+	}
+
+	current := v
+	remaining := index
+	seen := map[*pairValue]struct{}{}
+
+	for {
+		if remaining == 0 {
+			switch current.(type) {
+			case listValue, *pairValue:
+				return current, nil
+			default:
+				return nil, &EvalError{Message: "expected list"}
+			}
+		}
+
+		switch currentValue := current.(type) {
+		case listValue:
+			if remaining > len(currentValue.elements) {
+				return nil, &EvalError{Message: "list-tail index out of range"}
+			}
+			return makeList(copyValues(currentValue.elements[remaining:])), nil
+		case *pairValue:
+			if _, ok := seen[currentValue]; ok {
+				return nil, &EvalError{Message: "expected list"}
+			}
+			seen[currentValue] = struct{}{}
+			current = currentValue.cdr
+			remaining--
+		default:
+			return nil, &EvalError{Message: "expected list"}
+		}
+	}
+}
+
+func isProperList(v value) bool {
+	current := v
+	seen := map[*pairValue]struct{}{}
+
+	for {
+		switch currentPair := current.(type) {
+		case listValue:
+			return true
+		case *pairValue:
+			if _, ok := seen[currentPair]; ok {
+				return false
+			}
+			seen[currentPair] = struct{}{}
+			current = currentPair.cdr
+		default:
+			return false
+		}
+	}
+}
+
 func datumFromNode(expr node) (value, error) {
 	switch expr := expr.(type) {
 	case integerValue, rationalValue, inexactValue, booleanValue, stringValue, charValue:
@@ -1938,6 +2475,20 @@ func datumFromNode(expr node) (value, error) {
 			elements[i] = datum
 		}
 		return &vectorValue{elements: elements}, nil
+	case dottedListNode:
+		tail, err := datumFromNode(expr.tail)
+		if err != nil {
+			return nil, err
+		}
+
+		for i := len(expr.elements) - 1; i >= 0; i-- {
+			car, err := datumFromNode(expr.elements[i])
+			if err != nil {
+				return nil, err
+			}
+			tail = &pairValue{car: car, cdr: tail}
+		}
+		return tail, nil
 	case listNode:
 		elements := make([]value, len(expr.elements))
 		for i, element := range expr.elements {
@@ -1947,7 +2498,7 @@ func datumFromNode(expr node) (value, error) {
 			}
 			elements[i] = datum
 		}
-		return listValue{elements: elements}, nil
+		return makeList(elements), nil
 	default:
 		return nil, &EvalError{Message: "invalid quoted datum"}
 	}
@@ -2087,8 +2638,7 @@ func isTruthy(v value) bool {
 }
 
 func isListValue(v value) bool {
-	_, ok := v.(listValue)
-	return ok
+	return isProperList(v)
 }
 
 func isPairValue(v value) bool {
@@ -2284,16 +2834,11 @@ func equalValues(left, right value) bool {
 			return false
 		}
 	case listValue:
-		right, ok := right.(listValue)
-		if !ok || len(left.elements) != len(right.elements) {
+		rightElements, ok := properListElements(right)
+		if !ok {
 			return false
 		}
-		for i, element := range left.elements {
-			if !equalValues(element, right.elements[i]) {
-				return false
-			}
-		}
-		return true
+		return equalValueSlices(left.elements, rightElements)
 	case *vectorValue:
 		right, ok := right.(*vectorValue)
 		if !ok || len(left.elements) != len(right.elements) {
@@ -2306,6 +2851,10 @@ func equalValues(left, right value) bool {
 		}
 		return true
 	case *pairValue:
+		if rightList, ok := right.(listValue); ok {
+			leftElements, ok := properListElements(left)
+			return ok && equalValueSlices(leftElements, rightList.elements)
+		}
 		right, ok := right.(*pairValue)
 		return ok && equalValues(left.car, right.car) && equalValues(left.cdr, right.cdr)
 	case *recordValue:
@@ -2407,10 +2956,90 @@ func (p *parser) parseList() (node, error) {
 	}
 }
 
+func (p *parser) parseDatum() (node, error) {
+	p.skipWhitespaceAndComments()
+	if p.eof() {
+		return nil, errorAt(p.currentPos(), "unexpected end of input")
+	}
+
+	switch p.peek() {
+	case '(':
+		return p.parseDatumList()
+	case '\'':
+		return p.parseQuote()
+	case '"':
+		return p.parseString()
+	case ')':
+		return nil, errorAt(p.currentPos(), "unexpected )")
+	case '#':
+		if p.hasPrefix("#(") {
+			return p.parseVector()
+		}
+		return p.parseAtom()
+	default:
+		return p.parseAtom()
+	}
+}
+
+func (p *parser) parseDatumList() (node, error) {
+	pos := p.currentPos()
+	p.offset++
+
+	var elements []node
+	var tail node
+	hasTail := false
+
+	for {
+		p.skipWhitespaceAndComments()
+		if p.eof() {
+			return nil, errorAt(pos, "unterminated list")
+		}
+		if p.peek() == ')' {
+			p.offset++
+			if hasTail {
+				return dottedListNode{elements: elements, tail: tail, pos: pos}, nil
+			}
+			return listNode{elements: elements, pos: pos}, nil
+		}
+
+		if !hasTail && p.isDatumDot() {
+			dotPos := p.currentPos()
+			if len(elements) == 0 {
+				return nil, errorAt(dotPos, "invalid dotted list")
+			}
+
+			p.offset++
+			p.skipWhitespaceAndComments()
+
+			var err error
+			tail, err = p.parseDatum()
+			if err != nil {
+				return nil, err
+			}
+			hasTail = true
+
+			p.skipWhitespaceAndComments()
+			if p.eof() {
+				return nil, errorAt(pos, "unterminated list")
+			}
+			if p.peek() != ')' {
+				return nil, errorAt(dotPos, "invalid dotted list")
+			}
+			continue
+		}
+
+		element, err := p.parseDatum()
+		if err != nil {
+			return nil, err
+		}
+		elements = append(elements, element)
+	}
+}
+
 func (p *parser) parseQuote() (node, error) {
 	pos := p.currentPos()
 	p.offset++
-	expr, err := p.parseExpr()
+	expr, err := p.parseDatum()
 	if err != nil {
 		return nil, err
 	}
@@ -2486,6 +3115,20 @@ func (p *parser) parseAtom() (node, error) {
 	}
 
 	return symbolNode{name: token, pos: pos}, nil
+}
+
+func (p *parser) isDatumDot() bool {
+	if p.peek() != '.' {
+		return false
+	}
+
+	nextOffset := p.offset + 1
+	if nextOffset >= len(p.source) {
+		return true
+	}
+
+	r, _ := utf8.DecodeRuneInString(p.source[nextOffset:])
+	return unicode.IsSpace(r) || r == ')' || r == ';'
 }
 
 func parseCharLiteral(token string, pos sourcePos) (node, error) {

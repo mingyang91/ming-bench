@@ -135,7 +135,7 @@ func builtinVectorToList() builtinProc {
 		if err != nil {
 			return nil, err
 		}
-		return listValue{elements: copyValues(vector.elements)}, nil
+		return makeList(copyValues(vector.elements)), nil
 	}
 }
 

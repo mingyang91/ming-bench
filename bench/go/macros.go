@@ -38,6 +38,7 @@ var macroKeywordNames = map[string]struct{}{
 	"if":                 {},
 	"lambda":             {},
 	"let":                {},
+	"let*":               {},
 	"letrec":             {},
 	"letrec*":            {},
 	"or":                 {},
@@ -430,6 +431,16 @@ func cloneNode(expr node) node {
 			elements[i] = cloneNode(element)
 		}
 		return listNode{elements: elements, pos: expr.pos}
+	case dottedListNode:
+		elements := make([]node, len(expr.elements))
+		for i, element := range expr.elements {
+			elements[i] = cloneNode(element)
+		}
+		return dottedListNode{
+			elements: elements,
+			tail:     cloneNode(expr.tail),
+			pos:      expr.pos,
+		}
 	default:
 		return nil
 	}
@@ -463,6 +474,17 @@ func syntaxEqual(left node, right node) bool {
 			}
 		}
 		return true
+	case dottedListNode:
+		right, ok := right.(dottedListNode)
+		if !ok || len(left.elements) != len(right.elements) {
+			return false
+		}
+		for i, element := range left.elements {
+			if !syntaxEqual(element, right.elements[i]) {
+				return false
+			}
+		}
+		return syntaxEqual(left.tail, right.tail)
 	default:
 		return false
 	}
