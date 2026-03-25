@@ -9,9 +9,11 @@ func (c *CallCCVal) String() string { return "#<procedure call/cc>" }
 
 // ContinuationVal is a first-class continuation captured by call/cc.
 type ContinuationVal struct {
-	id            int64
-	exprIdx       int
-	protectedEnvs map[int64]*Env
+	id              int64
+	exprIdx         int
+	protectedEnvs   map[int64]*Env
+	evalState       *EvalState
+	captureFrameID  int64 // innermost lambda frame at capture (0 = top-level)
 }
 
 func (c *ContinuationVal) String() string { return "#<continuation>" }
@@ -33,6 +35,9 @@ type EvalState struct {
 	activeLetStack   []letEnvEntry
 	exprContStarts   map[int]int64
 	exprLetStarts    map[int]int64
+	activeContIDs    map[int64]bool // cont IDs currently inside their f(k)
+	frameIDCounter   int64
+	callFrameStack   []int64 // stack of active lambda call frame IDs
 }
 
 type letEnvEntry struct {
@@ -51,7 +56,18 @@ func newEvalState() *EvalState {
 		protectedLetEnvs: make(map[int64]*Env),
 		exprContStarts:   make(map[int]int64),
 		exprLetStarts:    make(map[int]int64),
+		activeContIDs:    make(map[int64]bool),
 	}
+}
+
+// isFrameActive checks if a lambda call frame is still on the call stack.
+func isFrameActive(state *EvalState, frameID int64) bool {
+	for _, fid := range state.callFrameStack {
+		if fid == frameID {
+			return true
+		}
+	}
+	return false
 }
 
 func handleCallCC(f Value, ln, cl int, env *Env) (Value, error) {
@@ -72,10 +88,18 @@ func handleCallCC(f Value, ln, cl int, env *Env) (Value, error) {
 		protectedEnvs[entry.id] = entry.env
 	}
 
+	// Capture the innermost lambda frame (0 if at top-level, not inside any lambda)
+	var captureFrame int64
+	if len(state.callFrameStack) > 0 {
+		captureFrame = state.callFrameStack[len(state.callFrameStack)-1]
+	}
+
 	k := &ContinuationVal{
-		id:            id,
-		exprIdx:       state.currentExprIdx,
-		protectedEnvs: protectedEnvs,
+		id:              id,
+		exprIdx:         state.currentExprIdx,
+		protectedEnvs:   protectedEnvs,
+		evalState:       state,
+		captureFrameID:  captureFrame,
 	}
 	state.continuations[id] = k
 
@@ -85,8 +109,10 @@ func handleCallCC(f Value, ln, cl int, env *Env) (Value, error) {
 	var resultErr error
 	escaped := false
 
+	state.activeContIDs[id] = true
 	func() {
 		defer func() {
+			delete(state.activeContIDs, id)
 			if r := recover(); r != nil {
 				if j, ok := r.(*continuationJump); ok && j.cont.id == id {
 					result = j.value
@@ -134,6 +160,11 @@ func callProc(fn Value, args []Value, ln, cl int) (Value, error) {
 	case *ContinuationVal:
 		if len(args) != 1 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: requires exactly 1 argument", ln, cl)}
+		}
+		if f.evalState != nil && !f.evalState.activeContIDs[f.id] &&
+			f.captureFrameID != 0 && !isFrameActive(f.evalState, f.captureFrameID) &&
+			f.evalState.currentExprIdx == f.exprIdx {
+			return args[0], nil
 		}
 		panic(&continuationJump{cont: f, value: args[0]})
 	default:

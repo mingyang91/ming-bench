@@ -19,8 +19,9 @@ func (b *BuiltinFunc) String() string {
 // tailCallVal is a sentinel value used for tail call optimization.
 // When returned from evalInner, the trampoline in eval continues with the new expr/env.
 type tailCallVal struct {
-	expr Expr
-	env  *Env
+	expr     Expr
+	env      *Env
+	popFrame int64 // lambda frame ID to pop when tail call chain completes (0 = none)
 }
 
 func (t *tailCallVal) String() string { return "<tail-call>" }
@@ -31,23 +32,55 @@ func resolveTC(val Value, err error) (Value, error) {
 		return nil, err
 	}
 	if tc, ok := val.(*tailCallVal); ok {
+		if tc.popFrame != 0 {
+			state := tc.env.evalState
+			defer popCallFrame(state, tc.popFrame)
+		}
 		return eval(tc.expr, tc.env)
 	}
 	return val, nil
 }
 
 func eval(expr Expr, env *Env) (Value, error) {
+	var pendingPops []int64
+	defer func() {
+		if len(pendingPops) > 0 {
+			state := env.evalState
+			if state == nil {
+				return
+			}
+			for i := len(pendingPops) - 1; i >= 0; i-- {
+				popCallFrame(state, pendingPops[i])
+			}
+		}
+	}()
+
 	for {
 		val, err := evalInner(expr, env)
 		if err != nil {
 			return nil, err
 		}
 		if tc, ok := val.(*tailCallVal); ok {
+			if tc.popFrame != 0 {
+				pendingPops = append(pendingPops, tc.popFrame)
+			}
 			expr = tc.expr
 			env = tc.env
 			continue
 		}
 		return val, nil
+	}
+}
+
+func popCallFrame(state *EvalState, frameID int64) {
+	if state == nil {
+		return
+	}
+	for i := len(state.callFrameStack) - 1; i >= 0; i-- {
+		if state.callFrameStack[i] == frameID {
+			state.callFrameStack = append(state.callFrameStack[:i], state.callFrameStack[i+1:]...)
+			return
+		}
 	}
 }
 
@@ -216,6 +249,14 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 	case *ContinuationVal:
 		if len(args) != 1 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: requires exactly 1 argument", e.Ln, e.Cl)}
+		}
+		// If the continuation's enclosing lambda has returned (frame no longer
+		// active), and we're in the same top-level expression, invoking it
+		// cannot re-execute meaningfully — return the value directly.
+		if f.evalState != nil && !f.evalState.activeContIDs[f.id] &&
+			f.captureFrameID != 0 && !isFrameActive(f.evalState, f.captureFrameID) &&
+			f.evalState.currentExprIdx == f.exprIdx {
+			return args[0], nil
 		}
 		panic(&continuationJump{cont: f, value: args[0]})
 	default:
@@ -433,15 +474,33 @@ func applyLambda(fn *LambdaVal, args []Value, ln, cl int) (Value, error) {
 		}
 		childEnv.set(fn.Rest, rest)
 	}
+	// Track lambda call frame for continuation scope detection.
+	// The frame stays alive through tail calls: it's passed in tailCallVal
+	// and popped by eval's trampoline when the full call chain completes.
+	var frameID int64
+	if state := childEnv.evalState; state != nil {
+		state.frameIDCounter++
+		frameID = state.frameIDCounter
+		state.callFrameStack = append(state.callFrameStack, frameID)
+		// Defer only handles panic cleanup; normal returns handle it manually
+		defer func() {
+			if frameID != 0 {
+				popCallFrame(state, frameID)
+			}
+		}()
+	}
 	// Evaluate all body expressions except the last
 	for _, bodyExpr := range fn.Body[:len(fn.Body)-1] {
 		_, err := eval(bodyExpr, childEnv)
 		if err != nil {
-			return nil, err
+			return nil, err // defer pops frame
 		}
 	}
-	// Last body expression is in tail position
-	return &tailCallVal{expr: fn.Body[len(fn.Body)-1], env: childEnv}, nil
+	// Last body expression is in tail position.
+	// Pass frame to tailCallVal so it stays alive during tail expression eval.
+	fid := frameID
+	frameID = 0 // prevent defer from popping
+	return &tailCallVal{expr: fn.Body[len(fn.Body)-1], env: childEnv, popFrame: fid}, nil
 }
 
 func quoteExpr(expr Expr) Value {
@@ -776,17 +835,16 @@ func evalLet(e *ListExpr, env *Env) (Value, error) {
 	childEnv := newEnv(env)
 	skipBindings := false
 
+	var letID int64
+	var hasLetID bool
 	if state := env.evalState; state != nil {
-		letID := state.letCounter
+		letID = state.letCounter
+		hasLetID = true
 		state.letCounter++
 		if pe, exists := state.protectedLetEnvs[letID]; exists {
 			childEnv = pe
 			skipBindings = true
 		}
-		state.activeLetStack = append(state.activeLetStack, letEnvEntry{id: letID, env: childEnv})
-		defer func() {
-			state.activeLetStack = state.activeLetStack[:len(state.activeLetStack)-1]
-		}()
 	}
 
 	if !skipBindings {
@@ -805,6 +863,17 @@ func evalLet(e *ListExpr, env *Env) (Value, error) {
 			}
 			childEnv.set(sym.Name, val)
 		}
+	}
+
+	// Push onto activeLetStack AFTER bindings are evaluated but BEFORE body,
+	// so call/cc in bindings won't capture this let as protected (allowing
+	// re-execution to re-evaluate bindings with the pending return value).
+	if hasLetID {
+		state := env.evalState
+		state.activeLetStack = append(state.activeLetStack, letEnvEntry{id: letID, env: childEnv})
+		defer func() {
+			state.activeLetStack = state.activeLetStack[:len(state.activeLetStack)-1]
+		}()
 	}
 
 	body := e.Items[2:]
