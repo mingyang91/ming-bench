@@ -323,33 +323,71 @@ func (p *parser) peek() token {
 
 type value interface{}
 
+type symbolValue string
+
+type listValue []value
+
+type voidValue struct{}
+
 type builtinProc struct {
 	name string
 	fn   func(args []value, callPos position) (value, error)
 }
 
+type closureProc struct {
+	name   string
+	params []string
+	body   []expr
+	env    *env
+}
+
+type env struct {
+	parent *env
+	values map[string]value
+}
+
+func newEnv(parent *env) *env {
+	return &env{
+		parent: parent,
+		values: map[string]value{},
+	}
+}
+
+func (e *env) define(name string, v value) {
+	e.values[name] = v
+}
+
+func (e *env) lookup(name string) (value, bool) {
+	for current := e; current != nil; current = current.parent {
+		if v, ok := current.values[name]; ok {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
 type interpreter struct {
-	env map[string]value
+	global *env
 }
 
 func newInterpreter() *interpreter {
 	it := &interpreter{
-		env: map[string]value{},
+		global: newEnv(nil),
 	}
 	it.installBuiltins()
 	return it
 }
 
 func (it *interpreter) installBuiltins() {
-	it.env["+"] = &builtinProc{name: "+", fn: builtinAdd}
-	it.env["-"] = &builtinProc{name: "-", fn: builtinSub}
-	it.env["*"] = &builtinProc{name: "*", fn: builtinMul}
-	it.env["/"] = &builtinProc{name: "/", fn: builtinDiv}
-	it.env["<"] = &builtinProc{name: "<", fn: builtinLessThan}
-	it.env[">"] = &builtinProc{name: ">", fn: builtinGreaterThan}
-	it.env["="] = &builtinProc{name: "=", fn: builtinEqual}
-	it.env["<="] = &builtinProc{name: "<=", fn: builtinLessEqual}
-	it.env["not"] = &builtinProc{name: "not", fn: builtinNot}
+	it.global.define("+", &builtinProc{name: "+", fn: builtinAdd})
+	it.global.define("-", &builtinProc{name: "-", fn: builtinSub})
+	it.global.define("*", &builtinProc{name: "*", fn: builtinMul})
+	it.global.define("/", &builtinProc{name: "/", fn: builtinDiv})
+	it.global.define("<", &builtinProc{name: "<", fn: builtinLessThan})
+	it.global.define(">", &builtinProc{name: ">", fn: builtinGreaterThan})
+	it.global.define("=", &builtinProc{name: "=", fn: builtinEqual})
+	it.global.define("<=", &builtinProc{name: "<=", fn: builtinLessEqual})
+	it.global.define("not", &builtinProc{name: "not", fn: builtinNot})
 }
 
 func (it *interpreter) evalProgram(exprs []expr) (value, error) {
@@ -357,18 +395,22 @@ func (it *interpreter) evalProgram(exprs []expr) (value, error) {
 		return nil, newEvalError(ErrSyntax, "expected expression", position{line: 1, column: 1})
 	}
 
-	var result value
+	return it.evalSequence(it.global, exprs)
+}
+
+func (it *interpreter) evalSequence(scope *env, exprs []expr) (value, error) {
+	result := value(voidValue{})
 	for _, node := range exprs {
-		value, err := it.eval(node)
+		current, err := it.eval(node, scope)
 		if err != nil {
 			return nil, err
 		}
-		result = value
+		result = current
 	}
 	return result, nil
 }
 
-func (it *interpreter) eval(node expr) (value, error) {
+func (it *interpreter) eval(node expr, scope *env) (value, error) {
 	switch expr := node.(type) {
 	case *intExpr:
 		return expr.value, nil
@@ -377,19 +419,19 @@ func (it *interpreter) eval(node expr) (value, error) {
 	case *stringExpr:
 		return expr.value, nil
 	case *symbolExpr:
-		value, ok := it.env[expr.name]
+		value, ok := scope.lookup(expr.name)
 		if !ok {
 			return nil, newEvalError(ErrUnboundVariable, fmt.Sprintf("unbound variable: %s", expr.name), expr.at)
 		}
 		return value, nil
 	case *listExpr:
-		return it.evalList(expr)
+		return it.evalList(expr, scope)
 	default:
 		return nil, newEvalError(ErrSyntax, "unknown expression", node.pos())
 	}
 }
 
-func (it *interpreter) evalList(list *listExpr) (value, error) {
+func (it *interpreter) evalList(list *listExpr, scope *env) (value, error) {
 	if len(list.elements) == 0 {
 		return nil, newEvalError(ErrSyntax, "cannot evaluate empty list", list.at)
 	}
@@ -397,38 +439,152 @@ func (it *interpreter) evalList(list *listExpr) (value, error) {
 	if sym, ok := list.elements[0].(*symbolExpr); ok {
 		switch sym.name {
 		case "and":
-			return it.evalAnd(list.elements[1:])
+			return it.evalAnd(scope, list.elements[1:])
 		case "or":
-			return it.evalOr(list.elements[1:])
+			return it.evalOr(scope, list.elements[1:])
+		case "define":
+			return it.evalDefine(scope, list)
+		case "if":
+			return it.evalIf(scope, list)
+		case "quote":
+			return it.evalQuote(list)
+		case "lambda":
+			return it.evalLambda(scope, list)
 		}
 	}
 
-	operator, err := it.eval(list.elements[0])
+	operator, err := it.eval(list.elements[0], scope)
 	if err != nil {
 		return nil, err
 	}
 
 	args := make([]value, 0, len(list.elements)-1)
 	for _, argExpr := range list.elements[1:] {
-		arg, err := it.eval(argExpr)
+		arg, err := it.eval(argExpr, scope)
 		if err != nil {
 			return nil, err
 		}
 		args = append(args, arg)
 	}
 
-	proc, ok := operator.(*builtinProc)
-	if !ok {
+	switch proc := operator.(type) {
+	case *builtinProc:
+		return proc.fn(args, list.at)
+	case *closureProc:
+		return it.applyClosure(proc, args, list.at)
+	default:
 		return nil, newEvalError(ErrNotProcedure, "attempted to call a non-procedure", list.at)
 	}
-
-	return proc.fn(args, list.at)
 }
 
-func (it *interpreter) evalAnd(args []expr) (value, error) {
+func (it *interpreter) evalDefine(scope *env, list *listExpr) (value, error) {
+	if len(list.elements) < 3 {
+		return nil, newEvalError(ErrSyntax, "define: expected a name and value", list.at)
+	}
+
+	switch target := list.elements[1].(type) {
+	case *symbolExpr:
+		if len(list.elements) != 3 {
+			return nil, newEvalError(ErrSyntax, "define: expected exactly one value expression", list.at)
+		}
+		result, err := it.eval(list.elements[2], scope)
+		if err != nil {
+			return nil, err
+		}
+		scope.define(target.name, result)
+		return voidValue{}, nil
+	case *listExpr:
+		if len(target.elements) == 0 {
+			return nil, newEvalError(ErrSyntax, "define: expected function name", target.at)
+		}
+		name, ok := target.elements[0].(*symbolExpr)
+		if !ok {
+			return nil, newEvalError(ErrSyntax, "define: expected function name", target.elements[0].pos())
+		}
+		params, err := parseParamNames(target.elements[1:])
+		if err != nil {
+			return nil, err
+		}
+		proc := &closureProc{
+			name:   name.name,
+			params: params,
+			body:   list.elements[2:],
+			env:    scope,
+		}
+		scope.define(name.name, proc)
+		return voidValue{}, nil
+	default:
+		return nil, newEvalError(ErrSyntax, "define: expected a symbol or function signature", list.elements[1].pos())
+	}
+}
+
+func (it *interpreter) evalIf(scope *env, list *listExpr) (value, error) {
+	if len(list.elements) != 3 && len(list.elements) != 4 {
+		return nil, newEvalError(ErrSyntax, "if: expected a test, consequent, and optional alternate", list.at)
+	}
+
+	test, err := it.eval(list.elements[1], scope)
+	if err != nil {
+		return nil, err
+	}
+	if isTruthy(test) {
+		return it.eval(list.elements[2], scope)
+	}
+	if len(list.elements) == 4 {
+		return it.eval(list.elements[3], scope)
+	}
+	return voidValue{}, nil
+}
+
+func (it *interpreter) evalQuote(list *listExpr) (value, error) {
+	if len(list.elements) != 2 {
+		return nil, newEvalError(ErrSyntax, "quote: expected exactly one argument", list.at)
+	}
+	return datumToValue(list.elements[1])
+}
+
+func (it *interpreter) evalLambda(scope *env, list *listExpr) (value, error) {
+	if len(list.elements) < 3 {
+		return nil, newEvalError(ErrSyntax, "lambda: expected parameters and body", list.at)
+	}
+
+	paramsExpr, ok := list.elements[1].(*listExpr)
+	if !ok {
+		return nil, newEvalError(ErrSyntax, "lambda: expected parameter list", list.elements[1].pos())
+	}
+
+	params, err := parseParamNames(paramsExpr.elements)
+	if err != nil {
+		return nil, err
+	}
+
+	return &closureProc{
+		params: params,
+		body:   list.elements[2:],
+		env:    scope,
+	}, nil
+}
+
+func (it *interpreter) applyClosure(proc *closureProc, args []value, callPos position) (value, error) {
+	if len(args) != len(proc.params) {
+		name := "lambda"
+		if proc.name != "" {
+			name = proc.name
+		}
+		return nil, wrongArgCount(callPos, name, fmt.Sprintf("expected %d arguments, got %d", len(proc.params), len(args)))
+	}
+
+	callEnv := newEnv(proc.env)
+	for i, param := range proc.params {
+		callEnv.define(param, args[i])
+	}
+	return it.evalSequence(callEnv, proc.body)
+}
+
+func (it *interpreter) evalAnd(scope *env, args []expr) (value, error) {
 	result := value(true)
 	for _, arg := range args {
-		current, err := it.eval(arg)
+		current, err := it.eval(arg, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -440,9 +596,9 @@ func (it *interpreter) evalAnd(args []expr) (value, error) {
 	return result, nil
 }
 
-func (it *interpreter) evalOr(args []expr) (value, error) {
+func (it *interpreter) evalOr(scope *env, args []expr) (value, error) {
 	for _, arg := range args {
-		current, err := it.eval(arg)
+		current, err := it.eval(arg, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -456,6 +612,43 @@ func (it *interpreter) evalOr(args []expr) (value, error) {
 func isTruthy(v value) bool {
 	boolean, ok := v.(bool)
 	return !ok || boolean
+}
+
+func parseParamNames(nodes []expr) ([]string, error) {
+	params := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		sym, ok := node.(*symbolExpr)
+		if !ok {
+			return nil, newEvalError(ErrSyntax, "expected parameter name", node.pos())
+		}
+		params = append(params, sym.name)
+	}
+	return params, nil
+}
+
+func datumToValue(node expr) (value, error) {
+	switch expr := node.(type) {
+	case *intExpr:
+		return expr.value, nil
+	case *boolExpr:
+		return expr.value, nil
+	case *stringExpr:
+		return expr.value, nil
+	case *symbolExpr:
+		return symbolValue(expr.name), nil
+	case *listExpr:
+		values := make(listValue, 0, len(expr.elements))
+		for _, element := range expr.elements {
+			item, err := datumToValue(element)
+			if err != nil {
+				return nil, err
+			}
+			values = append(values, item)
+		}
+		return values, nil
+	default:
+		return nil, newEvalError(ErrSyntax, "invalid quoted datum", node.pos())
+	}
 }
 
 func builtinAdd(args []value, callPos position) (value, error) {
@@ -630,6 +823,22 @@ func formatValue(v value) (string, error) {
 		return "#f", nil
 	case string:
 		return strconv.Quote(value), nil
+	case symbolValue:
+		return string(value), nil
+	case listValue:
+		parts := make([]string, 0, len(value))
+		for _, element := range value {
+			formatted, err := formatValue(element)
+			if err != nil {
+				return "", err
+			}
+			parts = append(parts, formatted)
+		}
+		return "(" + strings.Join(parts, " ") + ")", nil
+	case *builtinProc, *closureProc:
+		return "#<procedure>", nil
+	case voidValue:
+		return "#<void>", nil
 	default:
 		return "", &EvalError{Message: "cannot format value"}
 	}
