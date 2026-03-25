@@ -22,6 +22,9 @@ object Evaluator:
   type ExceptionHandler = SchemeVal => Bounce
   var exceptionHandlers: List[ExceptionHandler] = Nil
 
+  // --- Step-limit support ---
+  private var stepBudget: Int = -1 // negative = unlimited
+
   // --- Entry points ---
   def evalStr(input: String): String =
     val tokens = Tokenizer.tokenize(input)
@@ -29,6 +32,16 @@ object Evaluator:
     val env    = Env.default()
     val result = evalProgram(exprs, env)
     SchemeVal.display(result)
+
+  def evalStrWithLimit(input: String, maxSteps: Int): String =
+    val tokens = Tokenizer.tokenize(input)
+    val exprs  = Parser.parseAll(tokens)
+    val env    = Env.default()
+    stepBudget = maxSteps
+    try
+      val result = evalProgram(exprs, env)
+      SchemeVal.display(result)
+    finally stepBudget = -1
 
   def evalStrWithOutput(input: String): (String, String) =
     val tokens = Tokenizer.tokenize(input)
@@ -51,6 +64,9 @@ object Evaluator:
       b match
         case Done(v) => return v
         case More(thunk) =>
+          if stepBudget >= 0 then
+            stepBudget -= 1
+            if stepBudget < 0 then throw new EvalError("step limit exceeded")
           try b = thunk()
           catch case ct: ContinuationThrown => b = ct.bounce
     throw new AssertionError("unreachable")
