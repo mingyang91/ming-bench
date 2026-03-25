@@ -10,7 +10,8 @@ sealed interface Value permits NumericValue, BoolValue, StringValue, CharValue,
 sealed interface NumericValue extends Value permits IntValue, RationalValue, InexactValue {
 }
 
-sealed interface ProcedureValue extends Value permits BuiltinProcedure, ClosureProcedure {
+sealed interface ProcedureValue extends Value permits BuiltinProcedure, ClosureProcedure,
+        CaseLambdaProcedure {
 }
 
 @FunctionalInterface
@@ -117,8 +118,15 @@ record BuiltinProcedure(String name, BuiltinImplementation implementation)
         implements ProcedureValue {
 }
 
+record CaseLambdaClause(List<String> parameters, String restParameter, List<Expr> body) {
+}
+
 record ClosureProcedure(String name, List<String> parameters, String restParameter,
                         List<Expr> body, Environment environment)
+        implements ProcedureValue {
+}
+
+record CaseLambdaProcedure(String name, List<CaseLambdaClause> clauses, Environment environment)
         implements ProcedureValue {
 }
 
