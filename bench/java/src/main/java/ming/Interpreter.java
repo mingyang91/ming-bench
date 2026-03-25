@@ -1728,7 +1728,10 @@ public class Interpreter {
 
         // Continuation invocation
         if (proc instanceof SchemeValue.ContinuationVal cv) {
-            SchemeValue value = args.length > 0 ? args[0] : new SchemeValue.VoidVal();
+            SchemeValue value;
+            if (args.length == 0) value = new SchemeValue.VoidVal();
+            else if (args.length == 1) value = args[0];
+            else value = new SchemeValue.ValuesVal(args);
             var captured = (CapturedContinuation) cv.cont();
             var targetWinds = captured.winds();
             int common = commonWindPrefix(windStack, targetWinds);
@@ -1941,11 +1944,10 @@ public class Interpreter {
                 collectTemplateRenames(template, patternVars, renameMap, preBindings, macro.defEnv());
                 var expanded = instantiateTemplate(template, bindings, renameMap);
                 if (!preBindings.isEmpty()) {
-                    var macroEnv = new Environment(env);
                     for (var entry : preBindings.entrySet()) {
-                        macroEnv.define(entry.getKey(), entry.getValue());
+                        env.define(entry.getKey(), entry.getValue());
                     }
-                    cekEval(expanded, macroEnv, k);
+                    cekEval(expanded, env, k);
                 } else {
                     cekEval(expanded, env, k);
                 }
