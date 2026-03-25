@@ -6,6 +6,7 @@ enum SchemeVal:
   case BoolVal(b: Boolean)
   case StringVal(s: String)
   case Symbol(name: String)
+  case CharVal(c: Char)
   case SList(elems: List[SchemeVal])
   case Void
   case BuiltinProc(name: String, f: List[SchemeVal] => SchemeVal)
@@ -13,16 +14,24 @@ enum SchemeVal:
 
 object SchemeVal:
 
+  /** write-style display (strings quoted) */
   def display(v: SchemeVal): String = v match
     case IntVal(n)            => n.toString
     case BoolVal(true)        => "#t"
     case BoolVal(false)       => "#f"
     case StringVal(s)         => s"\"$s\""
+    case CharVal(c)           => s"#\\$c"
     case Symbol(name)         => name
     case SList(elems)         => "(" + elems.map(display).mkString(" ") + ")"
     case Void                 => ""
     case BuiltinProc(name, _) => s"#<procedure $name>"
     case LambdaProc(_, _, _)  => "#<procedure>"
+
+  /** display-style output (strings unquoted) */
+  def displayOutput(v: SchemeVal): String = v match
+    case StringVal(s) => s
+    case CharVal(c)   => c.toString
+    case other        => display(other)
 
 class Env(
   private val bindings: scala.collection.mutable.Map[String, SchemeVal],
@@ -40,4 +49,9 @@ object Env:
   def default(): Env =
     val env = new Env(scala.collection.mutable.Map.empty, None)
     Builtins.register(env)
+    env
+
+  def defaultWithOutput(output: StringBuilder): Env =
+    val env = new Env(scala.collection.mutable.Map.empty, None)
+    Builtins.register(env, output)
     env

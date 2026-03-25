@@ -8,11 +8,12 @@ object Builtins:
       case other               => throw new EvalError(s"$name: expected number, got ${SchemeVal.display(other)}")
     }
 
-  def register(env: Env): Unit =
+  def register(env: Env, output: StringBuilder = new StringBuilder): Unit =
     registerArithmetic(env)
     registerComparison(env)
     registerListOps(env)
     registerPredicates(env)
+    StringBuiltins.register(env, output)
 
   private def registerArithmetic(env: Env): Unit =
     env.define(
@@ -241,5 +242,16 @@ object Builtins:
           args.head match
             case SchemeVal.BoolVal(false) => SchemeVal.BoolVal(true)
             case _                        => SchemeVal.BoolVal(false)
+      )
+    )
+    env.define(
+      "char?",
+      SchemeVal.BuiltinProc(
+        "char?",
+        args =>
+          if args.size != 1 then throw new EvalError("char?: expected 1 argument")
+          args.head match
+            case SchemeVal.CharVal(_) => SchemeVal.BoolVal(true)
+            case _                    => SchemeVal.BoolVal(false)
       )
     )

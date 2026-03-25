@@ -13,7 +13,12 @@ object Evaluator:
     SchemeVal.display(result)
 
   def evalStrWithOutput(input: String): (String, String) =
-    throw new EvalError("not implemented")
+    val tokens = Tokenizer.tokenize(input)
+    val exprs  = Parser.parseAll(tokens)
+    val output = new StringBuilder
+    val env    = Env.defaultWithOutput(output)
+    val result = exprs.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, env))
+    (SchemeVal.display(result), output.toString)
 
   def eval(expr: SchemeVal, env: Env): SchemeVal =
     try
