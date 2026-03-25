@@ -7,13 +7,14 @@ use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
-type BuiltinFn = fn(&[Val]) -> Result<Val, EvalError>;
+type BuiltinFn = fn(&[Val], &Env) -> Result<Val, EvalError>;
 
 #[derive(Clone)]
 enum Val {
     Int(i64),
     Bool(bool),
     Str(String),
+    Char(char),
     Symbol(String),
     List(Vec<Val>),
     Lambda {
@@ -44,6 +45,7 @@ impl fmt::Display for Val {
             Val::Bool(true) => write!(f, "#t"),
             Val::Bool(false) => write!(f, "#f"),
             Val::Str(s) => write!(f, "\"{}\"", s),
+            Val::Char(c) => write!(f, "#\\{c}"),
             Val::Symbol(s) => write!(f, "{s}"),
             Val::List(elems) => {
                 write!(f, "(")?;
@@ -66,6 +68,7 @@ type Frame = Rc<RefCell<HashMap<String, Val>>>;
 #[derive(Clone)]
 struct Env {
     frames: Vec<Frame>,
+    output: Rc<RefCell<String>>,
 }
 
 impl Env {
@@ -94,11 +97,23 @@ impl Env {
             ("string?", builtin_is_string),
             ("symbol?", builtin_is_symbol),
             ("pair?", builtin_is_pair),
+            ("char?", builtin_is_char),
+            ("display", builtin_display),
+            ("write", builtin_write),
+            ("newline", builtin_newline),
+            ("string-append", builtin_string_append),
+            ("string-length", builtin_string_length),
+            ("substring", builtin_substring),
+            ("string->number", builtin_string_to_number),
+            ("number->string", builtin_number_to_string),
+            ("symbol->string", builtin_symbol_to_string),
+            ("string->symbol", builtin_string_to_symbol),
+            ("string-ref", builtin_string_ref),
         ];
         for &(name, f) in builtins {
             frame.borrow_mut().insert(name.to_string(), Val::Builtin(f));
         }
-        Env { frames: vec![frame] }
+        Env { frames: vec![frame], output: Rc::new(RefCell::new(String::new())) }
     }
 
     fn get(&self, name: &str) -> Option<Val> {
@@ -117,7 +132,7 @@ impl Env {
     fn push(&self) -> Env {
         let mut frames = self.frames.clone();
         frames.push(Rc::new(RefCell::new(HashMap::new())));
-        Env { frames }
+        Env { frames, output: Rc::clone(&self.output) }
     }
 }
 
@@ -339,12 +354,12 @@ fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
             // Evaluate function position
             let func = eval(&elems[0], env)?;
             let args: Vec<Val> = elems[1..].iter().map(|e| eval(e, env)).collect::<Result<_, _>>()?;
-            apply_val(&func, &args).map_err(|e| span_err(span, e))
+            apply_val(&func, &args, env).map_err(|e| span_err(span, e))
         }
     }
 }
 
-fn apply_val(func: &Val, args: &[Val]) -> Result<Val, EvalError> {
+fn apply_val(func: &Val, args: &[Val], caller_env: &Env) -> Result<Val, EvalError> {
     match func {
         Val::Lambda { params, body, env } => {
             if args.len() != params.len() {
@@ -362,7 +377,7 @@ fn apply_val(func: &Val, args: &[Val]) -> Result<Val, EvalError> {
             }
             Ok(result)
         }
-        Val::Builtin(f) => f(args),
+        Val::Builtin(f) => f(args, caller_env),
         _ => Err(EvalError::Type("not a procedure".into())),
     }
 }
@@ -532,7 +547,7 @@ fn eval_let(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
             env: new_env.clone(),
         };
         new_env.define(name.clone(), lambda.clone());
-        apply_val(&lambda, &inits)
+        apply_val(&lambda, &inits, &new_env)
     } else {
         // Regular let: (let ((var init) ...) body ...)
         let bindings = match &args[0].kind {
@@ -597,12 +612,12 @@ fn require_ints(args: &[Val], op: &str) -> Result<Vec<i64>, EvalError> {
     }).collect()
 }
 
-fn builtin_add(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_add(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     let nums = require_ints(args, "+")?;
     Ok(Val::Int(nums.iter().sum()))
 }
 
-fn builtin_sub(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_sub(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity("-: need at least 1 argument".into()));
     }
@@ -614,12 +629,12 @@ fn builtin_sub(args: &[Val]) -> Result<Val, EvalError> {
     }
 }
 
-fn builtin_mul(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_mul(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     let nums = require_ints(args, "*")?;
     Ok(Val::Int(nums.iter().product()))
 }
 
-fn builtin_div(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_div(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity("/: need at least 2 arguments".into()));
     }
@@ -634,39 +649,39 @@ fn builtin_div(args: &[Val]) -> Result<Val, EvalError> {
     Ok(Val::Int(result))
 }
 
-fn builtin_lt(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_lt(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     let nums = require_ints(args, "<")?;
     Ok(Val::Bool(nums.windows(2).all(|w| w[0] < w[1])))
 }
 
-fn builtin_gt(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_gt(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     let nums = require_ints(args, ">")?;
     Ok(Val::Bool(nums.windows(2).all(|w| w[0] > w[1])))
 }
 
-fn builtin_eq(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_eq(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     let nums = require_ints(args, "=")?;
     Ok(Val::Bool(nums.windows(2).all(|w| w[0] == w[1])))
 }
 
-fn builtin_le(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_le(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     let nums = require_ints(args, "<=")?;
     Ok(Val::Bool(nums.windows(2).all(|w| w[0] <= w[1])))
 }
 
-fn builtin_ge(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_ge(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     let nums = require_ints(args, ">=")?;
     Ok(Val::Bool(nums.windows(2).all(|w| w[0] >= w[1])))
 }
 
-fn builtin_not(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_not(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::Arity("not: expected 1 argument".into()));
     }
     Ok(Val::Bool(!args[0].is_truthy()))
 }
 
-fn builtin_cons(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_cons(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::Arity("cons: expected 2 arguments".into()));
     }
@@ -683,7 +698,7 @@ fn builtin_cons(args: &[Val]) -> Result<Val, EvalError> {
     }
 }
 
-fn builtin_car(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_car(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::Arity("car: expected 1 argument".into()));
     }
@@ -693,7 +708,7 @@ fn builtin_car(args: &[Val]) -> Result<Val, EvalError> {
     }
 }
 
-fn builtin_cdr(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_cdr(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::Arity("cdr: expected 1 argument".into()));
     }
@@ -703,18 +718,18 @@ fn builtin_cdr(args: &[Val]) -> Result<Val, EvalError> {
     }
 }
 
-fn builtin_list(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_list(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     Ok(Val::List(args.to_vec()))
 }
 
-fn builtin_null(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_null(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::Arity("null?: expected 1 argument".into()));
     }
     Ok(Val::Bool(matches!(&args[0], Val::List(v) if v.is_empty())))
 }
 
-fn builtin_length(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_length(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::Arity("length: expected 1 argument".into()));
     }
@@ -724,7 +739,7 @@ fn builtin_length(args: &[Val]) -> Result<Val, EvalError> {
     }
 }
 
-fn builtin_append(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_append(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     let mut result = Vec::new();
     for arg in args {
         match arg {
@@ -735,29 +750,140 @@ fn builtin_append(args: &[Val]) -> Result<Val, EvalError> {
     Ok(Val::List(result))
 }
 
-fn builtin_is_boolean(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_is_boolean(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("boolean?: expected 1 argument".into())); }
     Ok(Val::Bool(matches!(args[0], Val::Bool(_))))
 }
 
-fn builtin_is_number(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_is_number(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("number?: expected 1 argument".into())); }
     Ok(Val::Bool(matches!(args[0], Val::Int(_))))
 }
 
-fn builtin_is_string(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_is_string(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("string?: expected 1 argument".into())); }
     Ok(Val::Bool(matches!(args[0], Val::Str(_))))
 }
 
-fn builtin_is_symbol(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_is_symbol(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("symbol?: expected 1 argument".into())); }
     Ok(Val::Bool(matches!(args[0], Val::Symbol(_))))
 }
 
-fn builtin_is_pair(args: &[Val]) -> Result<Val, EvalError> {
+fn builtin_is_pair(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("pair?: expected 1 argument".into())); }
     Ok(Val::Bool(matches!(&args[0], Val::List(v) if !v.is_empty())))
+}
+
+fn builtin_is_char(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("char?: expected 1 argument".into())); }
+    Ok(Val::Bool(matches!(args[0], Val::Char(_))))
+}
+
+/// Format a value for `display` (no quotes on strings).
+fn display_format(val: &Val) -> String {
+    match val {
+        Val::Str(s) => s.clone(),
+        Val::Char(c) => c.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn builtin_display(args: &[Val], env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("display: expected 1 argument".into())); }
+    let text = display_format(&args[0]);
+    env.output.borrow_mut().push_str(&text);
+    Ok(Val::Void)
+}
+
+fn builtin_write(args: &[Val], env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("write: expected 1 argument".into())); }
+    let text = args[0].to_string();
+    env.output.borrow_mut().push_str(&text);
+    Ok(Val::Void)
+}
+
+fn builtin_newline(args: &[Val], env: &Env) -> Result<Val, EvalError> {
+    if !args.is_empty() { return Err(EvalError::Arity("newline: expected 0 arguments".into())); }
+    env.output.borrow_mut().push('\n');
+    Ok(Val::Void)
+}
+
+fn builtin_string_append(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    let mut result = String::new();
+    for arg in args {
+        match arg {
+            Val::Str(s) => result.push_str(s),
+            _ => return Err(EvalError::Type("string-append: expected string".into())),
+        }
+    }
+    Ok(Val::Str(result))
+}
+
+fn builtin_string_length(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("string-length: expected 1 argument".into())); }
+    match &args[0] {
+        Val::Str(s) => Ok(Val::Int(s.chars().count() as i64)),
+        _ => Err(EvalError::Type("string-length: expected string".into())),
+    }
+}
+
+fn builtin_substring(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 3 { return Err(EvalError::Arity("substring: expected 3 arguments".into())); }
+    let s = match &args[0] { Val::Str(s) => s, _ => return Err(EvalError::Type("substring: expected string".into())) };
+    let start = match &args[1] { Val::Int(n) => *n as usize, _ => return Err(EvalError::Type("substring: expected integer".into())) };
+    let end = match &args[2] { Val::Int(n) => *n as usize, _ => return Err(EvalError::Type("substring: expected integer".into())) };
+    let chars: Vec<char> = s.chars().collect();
+    if start > end || end > chars.len() {
+        return Err(EvalError::Runtime("substring: index out of range".into()));
+    }
+    Ok(Val::Str(chars[start..end].iter().collect()))
+}
+
+fn builtin_string_to_number(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("string->number: expected 1 argument".into())); }
+    match &args[0] {
+        Val::Str(s) => match s.parse::<i64>() {
+            Ok(n) => Ok(Val::Int(n)),
+            Err(_) => Ok(Val::Bool(false)),
+        },
+        _ => Err(EvalError::Type("string->number: expected string".into())),
+    }
+}
+
+fn builtin_number_to_string(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("number->string: expected 1 argument".into())); }
+    match &args[0] {
+        Val::Int(n) => Ok(Val::Str(n.to_string())),
+        _ => Err(EvalError::Type("number->string: expected number".into())),
+    }
+}
+
+fn builtin_symbol_to_string(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("symbol->string: expected 1 argument".into())); }
+    match &args[0] {
+        Val::Symbol(s) => Ok(Val::Str(s.clone())),
+        _ => Err(EvalError::Type("symbol->string: expected symbol".into())),
+    }
+}
+
+fn builtin_string_to_symbol(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("string->symbol: expected 1 argument".into())); }
+    match &args[0] {
+        Val::Str(s) => Ok(Val::Symbol(s.clone())),
+        _ => Err(EvalError::Type("string->symbol: expected string".into())),
+    }
+}
+
+fn builtin_string_ref(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("string-ref: expected 2 arguments".into())); }
+    let s = match &args[0] { Val::Str(s) => s, _ => return Err(EvalError::Type("string-ref: expected string".into())) };
+    let idx = match &args[1] { Val::Int(n) => *n as usize, _ => return Err(EvalError::Type("string-ref: expected integer".into())) };
+    let chars: Vec<char> = s.chars().collect();
+    if idx >= chars.len() {
+        return Err(EvalError::Runtime("string-ref: index out of range".into()));
+    }
+    Ok(Val::Char(chars[idx]))
 }
 
 /// Evaluate one or more Scheme expressions and return the string
@@ -777,8 +903,18 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let exprs = parse_all(input)?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse("empty input".into()));
+    }
+    let env = Env::new();
+    let mut last = Val::Void;
+    for expr in &exprs {
+        last = eval(expr, &env)?;
+    }
+    let output = env.output.borrow().clone();
+    Ok((last.to_string(), output))
 }
 
 #[cfg(test)]
