@@ -1,8 +1,6 @@
 package ming
 
-import scala.annotation.tailrec
-
-private[ming] object Builtins:
+private[ming] object Builtins extends BuiltinSupport:
 
   def globalEnv(runtime: RuntimeContext): Map[String, Value] = Map(
     "+"              -> Value.Builtin("+", add),
@@ -39,7 +37,8 @@ private[ming] object Builtins:
     "boolean?"       -> predicate("boolean?", _.isInstanceOf[Value.BoolVal]),
     "pair?"          -> predicate("pair?", _.isInstanceOf[Value.PairVal]),
     "symbol?"        -> predicate("symbol?", _.isInstanceOf[Value.SymbolVal]),
-    "char?"          -> predicate("char?", _.isInstanceOf[Value.CharVal])
+    "char?"          -> predicate("char?", _.isInstanceOf[Value.CharVal]),
+    "apply"          -> Value.Builtin("apply", applyBuiltin)
   )
 
   private def add(args: List[Value], pos: SourcePos): Value =
@@ -226,73 +225,12 @@ private[ming] object Builtins:
       (args, pos) => Value.BoolVal(test(expectSingleArg(args, pos, name)))
     )
 
-  private def asNumbers(args: List[Value], pos: SourcePos, name: String): List[BigInt] =
-    args.map(arg => expectNumber(arg, pos, name))
-
-  private def expectSingleArg(args: List[Value], pos: SourcePos, name: String): Value =
+  private def applyBuiltin(args: List[Value], pos: SourcePos): Value =
     args match
-      case value :: Nil =>
-        value
+      case proc :: appliedArgs if appliedArgs.nonEmpty =>
+        val prefixArgs = appliedArgs.dropRight(1)
+        val listArgs   = asProperList(appliedArgs.last, pos, "apply")
+        Interpreter.applyProcedure(proc, prefixArgs ++ listArgs, pos)
 
       case _ =>
-        throw EvalError.at(pos, s"$name expects exactly 1 argument")
-
-  private def expectNumber(arg: Value, pos: SourcePos, name: String): BigInt =
-    arg match
-      case Value.IntVal(value) =>
-        value
-
-      case other =>
-        throw EvalError.at(pos, s"$name expected number arguments, got ${other.typeName}")
-
-  private def expectString(arg: Value, pos: SourcePos, name: String): String =
-    new String(expectStringValue(arg, pos, name))
-
-  private def expectStringValue(arg: Value, pos: SourcePos, name: String): Array[Char] =
-    arg match
-      case Value.StringVal(value) =>
-        value
-
-      case other =>
-        throw EvalError.at(pos, s"$name expected string arguments, got ${other.typeName}")
-
-  private def expectSymbol(arg: Value, pos: SourcePos, name: String): String =
-    arg match
-      case Value.SymbolVal(value) =>
-        value
-
-      case other =>
-        throw EvalError.at(pos, s"$name expected a symbol, got ${other.typeName}")
-
-  private def expectChar(arg: Value, pos: SourcePos, name: String): Char =
-    arg match
-      case Value.CharVal(value) =>
-        value
-
-      case other =>
-        throw EvalError.at(pos, s"$name expected a char, got ${other.typeName}")
-
-  private def expectIndex(arg: Value, pos: SourcePos, name: String): Int =
-    val value = expectNumber(arg, pos, name)
-    if value < 0 || !value.isValidInt then throw EvalError.at(pos, s"$name expected a non-negative integer index")
-
-    value.toInt
-
-  private def expectList(arg: Value, pos: SourcePos, name: String): Value =
-    asProperList(arg, pos, name)
-    arg
-
-  private def asProperList(arg: Value, pos: SourcePos, name: String): List[Value] =
-    @tailrec
-    def loop(current: Value, acc: List[Value]): List[Value] =
-      current match
-        case Value.EmptyList =>
-          acc.reverse
-
-        case Value.PairVal(carValue, cdrValue) =>
-          loop(cdrValue, carValue :: acc)
-
-        case other =>
-          throw EvalError.at(pos, s"$name expected a proper list, got ${other.typeName}")
-
-    loop(arg, Nil)
+        throw EvalError.at(pos, "apply expects at least 2 arguments")

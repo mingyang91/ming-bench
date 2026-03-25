@@ -78,7 +78,8 @@ private[ming] object Interpreter:
         Value.VoidVal
 
       case Expr.ListExpr(Expr.Symbol(name, _) :: params, signaturePos) :: body if body.nonEmpty =>
-        env.define(name, Value.Closure(parseParameters(params, signaturePos), body, env))
+        val (fixedParams, restParam) = parseParameters(params, signaturePos)
+        env.define(name, Value.Closure(fixedParams, restParam, body, env))
         Value.VoidVal
 
       case _ =>
@@ -113,7 +114,8 @@ private[ming] object Interpreter:
   private def evalLambda(args: List[Expr], env: Env, pos: SourcePos): Value =
     args match
       case Expr.ListExpr(params, paramsPos) :: body if body.nonEmpty =>
-        Value.Closure(parseParameters(params, paramsPos), body, env)
+        val (fixedParams, restParam) = parseParameters(params, paramsPos)
+        Value.Closure(fixedParams, restParam, body, env)
 
       case _ =>
         throw EvalError.at(pos, "lambda expects a parameter list and body")
@@ -147,7 +149,7 @@ private[ming] object Interpreter:
     val names          = parsedBindings.map(_._1)
     val values         = parsedBindings.map { case (_, valueExpr) => eval(valueExpr, env) }
     val loopEnv        = Env.child(env)
-    val closure        = Value.Closure(names, body, loopEnv)
+    val closure        = Value.Closure(names, None, body, loopEnv)
 
     loopEnv.define(name, closure)
     applyProcedure(closure, values, pos)
@@ -185,14 +187,31 @@ private[ming] object Interpreter:
         throw EvalError.at(pos, "bindings must be lists")
     }
 
-  private def parseParameters(params: List[Expr], pos: SourcePos): List[String] =
-    params.map {
-      case Expr.Symbol(name, _) =>
-        name
+  private def parseParameters(params: List[Expr], pos: SourcePos): (List[String], Option[String]) =
+    @tailrec
+    def loop(
+      remaining: List[Expr],
+      acc: List[String]
+    ): (List[String], Option[String]) =
+      remaining match
+        case Nil =>
+          (acc.reverse, None)
 
-      case _ =>
-        throw EvalError.at(pos, "parameter list must contain only symbols")
-    }
+        case Expr.Symbol(".", dotPos) :: Expr.Symbol(restName, restPos) :: Nil =>
+          if restName == "." then throw EvalError.at(restPos, "parameter list contains an invalid rest parameter")
+          (acc.reverse, Some(restName))
+
+        case Expr.Symbol(".", dotPos) :: _ =>
+          throw EvalError.at(dotPos, "dot must be followed by exactly one rest parameter")
+
+        case Expr.Symbol(name, _) :: tail =>
+          if name == "." then throw EvalError.at(pos, "parameter list contains an invalid dot")
+          loop(tail, name :: acc)
+
+        case _ =>
+          throw EvalError.at(pos, "parameter list must contain only symbols")
+
+    loop(params, Nil)
 
   @tailrec
   private def evalAnd(
@@ -226,16 +245,26 @@ private[ming] object Interpreter:
       case expr :: rest =>
         evalOr(rest, env, eval(expr, env))
 
-  private def applyProcedure(proc: Value, args: List[Value], pos: SourcePos): Value =
+  private[ming] def applyProcedure(proc: Value, args: List[Value], pos: SourcePos): Value =
     proc match
       case Value.Builtin(_, fn) =>
         fn(args, pos)
 
-      case Value.Closure(params, body, closureEnv) =>
-        if params.length != args.length then
-          throw EvalError.at(pos, s"expected ${params.length} arguments, got ${args.length}")
+      case Value.Closure(params, restParam, body, closureEnv) =>
+        restParam match
+          case None =>
+            if params.length != args.length then
+              throw EvalError.at(pos, s"expected ${params.length} arguments, got ${args.length}")
 
-        evalSequence(body, closureEnv.extend(params, args))
+            evalSequence(body, closureEnv.extend(params, args))
+
+          case Some(restName) =>
+            if args.length < params.length then
+              throw EvalError.at(pos, s"expected at least ${params.length} arguments, got ${args.length}")
+
+            val fixedArgs = args.take(params.length)
+            val restArgs  = Value.list(args.drop(params.length))
+            evalSequence(body, closureEnv.extend(params :+ restName, fixedArgs :+ restArgs))
 
       case other =>
         throw EvalError.at(pos, s"attempted to call a ${other.typeName} value")

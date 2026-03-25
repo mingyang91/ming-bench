@@ -20,7 +20,7 @@ private[ming] enum Value:
   case SymbolVal(name: String)
   case EmptyList
   case PairVal(car: Value, cdr: Value)
-  case Closure(params: List[String], body: List[Expr], env: Env)
+  case Closure(params: List[String], restParam: Option[String], body: List[Expr], env: Env)
   case Builtin(name: String, fn: (List[Value], SourcePos) => Value)
   case VoidVal
 
@@ -53,7 +53,7 @@ private[ming] enum Value:
       case Value.PairVal(_, _) =>
         "pair"
 
-      case Value.Closure(_, _, _) =>
+      case Value.Closure(_, _, _, _) =>
         "procedure"
 
       case Value.Builtin(_, _) =>
@@ -119,7 +119,7 @@ private[ming] object Value:
       case Value.PairVal(_, _) =>
         renderPair(value, displayMode)
 
-      case Value.Closure(_, _, _) =>
+      case Value.Closure(_, _, _, _) =>
         "#<procedure>"
 
       case Value.Builtin(name, _) =>
