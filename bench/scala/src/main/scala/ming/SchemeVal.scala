@@ -39,6 +39,13 @@ enum SchemeVal:
     closure: Env
   )
 
+  case SVector(elems: Array[SchemeVal])
+
+  /** Safely cast to SMacro via pattern match. */
+  def asMatchedMacro: SchemeVal.SMacro = this match
+    case m: SchemeVal.SMacro => m
+    case other               => throw new EvalError(s"expected macro, got ${other.display}")
+
   /** Write representation (with quotes for strings). */
   def display: String = this match
     case SInt(v) => v.toString
@@ -69,6 +76,7 @@ enum SchemeVal:
     case SCaseLambda(_, _)   => "#<procedure>"
     case SMacro(_, _, _)     => "#<macro>"
     case SRecord(tn, _)      => s"#<record:$tn>"
+    case SVector(es)         => "#(" + es.map(_.display).mkString(" ") + ")"
 
   /** Display representation (no quotes for strings). */
   def displayRepr: String = this match
