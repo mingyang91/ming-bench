@@ -213,6 +213,11 @@ object Evaluator:
         if body.isEmpty then State.Ko(v, guardK)
         else evalBodyCek(body, env, guardK)
       else ExceptionOps.evalGuardClauses(remaining, exnValue, env, guardK, performApply)
+    // L21 — call-with-values
+    case Cont.CallWithValuesK(consumer, k2) =>
+      v match
+        case SchemeVal.SValues(vals) => performApply(consumer, vals, k2)
+        case single                  => performApply(consumer, List(single), k2)
 
   private def performApply(op: SchemeVal, args: List[SchemeVal], k: Cont): State =
     op match
@@ -238,6 +243,13 @@ object Evaluator:
         val (inThunk, bodyThunk, outThunk) = (args(0), args(1), args(2))
         val entry                          = new WindEntry(inThunk, outThunk)
         performApply(inThunk, Nil, Cont.DynWindAfterInK(bodyThunk, entry, k))
+      case SchemeVal.SSymbol("values") =>
+        if args.length == 1 then State.Ko(args.head, k)
+        else State.Ko(SchemeVal.SValues(args), k)
+      case SchemeVal.SSymbol("call-with-values") =>
+        if args.length != 2 then throw new EvalError("call-with-values: expected 2 arguments")
+        val (producer, consumer) = (args(0), args(1))
+        performApply(producer, Nil, Cont.CallWithValuesK(consumer, k))
       case SchemeVal.SSymbol("raise") =>
         if args.length != 1 then throw new EvalError("raise: expected 1 argument")
         ExceptionOps.handleRaise(args.head, k, performApply)

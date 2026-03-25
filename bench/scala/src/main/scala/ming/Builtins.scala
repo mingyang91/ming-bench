@@ -127,7 +127,10 @@ object Builtins:
     "dynamic-wind",
     // L20
     "raise",
-    "with-exception-handler"
+    "with-exception-handler",
+    // L21
+    "values",
+    "call-with-values"
   )
 
   private def isTruthy(v: SchemeVal): Boolean = v match

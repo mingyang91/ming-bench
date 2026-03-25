@@ -55,3 +55,6 @@ object Cont:
 
   case class GuardTestK(body: List[SchemeVal], remaining: List[SchemeVal], exnValue: SchemeVal, env: Env, guardK: Cont)
       extends Cont
+
+  // L21 — call-with-values
+  case class CallWithValuesK(consumer: SchemeVal, k: Cont) extends Cont
