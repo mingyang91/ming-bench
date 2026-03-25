@@ -1043,7 +1043,7 @@ public class Evaluator {
         }
         if (forms.isEmpty()) return new EvalResult("", outputBuffer.toString());
         Object lastResult = evalForms(forms, globalEnv);
-        String result = (lastResult == null || lastResult == VOID) ? "" : schemeToString(lastResult);
+        String result = (lastResult == null || lastResult == VOID) ? "" : displayString(lastResult);
         return new EvalResult(result, outputBuffer.toString());
     }
 

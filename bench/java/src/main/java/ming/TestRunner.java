@@ -33,6 +33,10 @@ public class TestRunner {
             L27Tests.main(args);
             return;
         }
+        if (benchLevel == 28) {
+            L28Tests.main(args);
+            return;
+        }
 
         String testsJsonPath = System.getenv("TESTS_JSON");
         if (testsJsonPath == null || testsJsonPath.isEmpty()) {
