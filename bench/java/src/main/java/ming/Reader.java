@@ -72,6 +72,23 @@ public class Reader {
                 pos++;
                 return new SchemeValue.ListVal(elements);
             }
+            // Check for dot notation: (a b . c)
+            if (input.charAt(pos) == '.' && pos + 1 < input.length()
+                    && (Character.isWhitespace(input.charAt(pos + 1)) || input.charAt(pos + 1) == '(')) {
+                pos++; // skip '.'
+                skipWhitespace();
+                var cdr = readExpr();
+                skipWhitespace();
+                if (pos >= input.length() || input.charAt(pos) != ')')
+                    throw new EvalError("expected ) after dotted pair");
+                pos++; // skip ')'
+                // Build pair chain from elements + cdr
+                SchemeValue result = cdr;
+                for (int i = elements.size() - 1; i >= 0; i--) {
+                    result = new SchemeValue.PairVal(elements.get(i), result);
+                }
+                return result;
+            }
             elements.add(readExpr());
         }
     }

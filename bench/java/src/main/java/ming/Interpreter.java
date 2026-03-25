@@ -227,6 +227,9 @@ public class Interpreter {
             s.setCharAt(idx, c.value());
             return new SchemeValue.VoidVal();
         }));
+
+        // L08 builtins
+        globals.define("apply", new SchemeValue.BuiltinVal("apply", this::applyProc));
     }
 
     public SchemeValue eval(SchemeValue expr) throws EvalError {
@@ -299,7 +302,29 @@ public class Interpreter {
                 params.add(p.name());
             }
             var body = elements.subList(2, elements.size());
-            var lambda = new SchemeValue.LambdaVal(params, body, env);
+            var lambda = new SchemeValue.LambdaVal(params, null, body, env);
+            env.define(fnName.name(), lambda);
+            return new SchemeValue.VoidVal();
+        } else if (target instanceof SchemeValue.PairVal pair) {
+            // Dotted pair: (define (name p1 p2 . rest) body)
+            if (!(pair.car() instanceof SchemeValue.SymbolVal fnName))
+                throw new EvalError("define: expected function name");
+            var params = new ArrayList<String>();
+            String restParam = null;
+            SchemeValue cur = pair.cdr();
+            while (cur instanceof SchemeValue.PairVal p) {
+                if (!(p.car() instanceof SchemeValue.SymbolVal s))
+                    throw new EvalError("define: expected parameter name");
+                params.add(s.name());
+                cur = p.cdr();
+            }
+            if (cur instanceof SchemeValue.SymbolVal rest) {
+                restParam = rest.name();
+            } else if (!(cur instanceof SchemeValue.ListVal l && l.elements().isEmpty())) {
+                throw new EvalError("define: bad syntax");
+            }
+            var body = elements.subList(2, elements.size());
+            var lambda = new SchemeValue.LambdaVal(params, restParam, body, env);
             env.define(fnName.name(), lambda);
             return new SchemeValue.VoidVal();
         }
@@ -332,12 +357,37 @@ public class Interpreter {
             }
             return result;
         }
+        if (datum instanceof SchemeValue.PairVal p) {
+            return new SchemeValue.PairVal(quoteDatum(p.car()), quoteDatum(p.cdr()));
+        }
         return datum;
     }
 
     private SchemeValue evalLambda(List<SchemeValue> elements, Environment env) throws EvalError {
         if (elements.size() < 3) throw new EvalError("lambda: bad syntax");
         var paramList = elements.get(1);
+        if (paramList instanceof SchemeValue.SymbolVal sym) {
+            // (lambda args body) — all args collected into single rest param
+            var body = elements.subList(2, elements.size());
+            return new SchemeValue.LambdaVal(List.of(), sym.name(), body, env);
+        }
+        if (paramList instanceof SchemeValue.PairVal pair) {
+            // Dotted pair: (lambda (p1 p2 . rest) body)
+            var params = new ArrayList<String>();
+            String restParam = null;
+            SchemeValue cur = pair;
+            while (cur instanceof SchemeValue.PairVal p) {
+                if (!(p.car() instanceof SchemeValue.SymbolVal s))
+                    throw new EvalError("lambda: expected parameter name");
+                params.add(s.name());
+                cur = p.cdr();
+            }
+            if (cur instanceof SchemeValue.SymbolVal rest) {
+                restParam = rest.name();
+            }
+            var body = elements.subList(2, elements.size());
+            return new SchemeValue.LambdaVal(params, restParam, body, env);
+        }
         if (!(paramList instanceof SchemeValue.ListVal pl))
             throw new EvalError("lambda: expected parameter list");
         var params = new ArrayList<String>();
@@ -347,7 +397,7 @@ public class Interpreter {
             params.add(sym.name());
         }
         var body = elements.subList(2, elements.size());
-        return new SchemeValue.LambdaVal(params, body, env);
+        return new SchemeValue.LambdaVal(params, null, body, env);
     }
 
     private SchemeValue evalAnd(List<SchemeValue> elements, Environment env) throws EvalError {
@@ -389,7 +439,7 @@ public class Interpreter {
             }
             var body = elements.subList(3, elements.size());
             var letEnv = new Environment(env);
-            var lambda = new SchemeValue.LambdaVal(params, body, letEnv);
+            var lambda = new SchemeValue.LambdaVal(params, null, body, letEnv);
             letEnv.define(loopName.name(), lambda);
             // Call with initial values
             var callEnv = new Environment(letEnv);
@@ -471,13 +521,30 @@ public class Interpreter {
         for (int i = 1; i < elements.size(); i++) {
             args[i - 1] = eval(elements.get(i), env);
         }
+        return callProc(proc, args);
+    }
 
+    private SchemeValue callProc(SchemeValue proc, SchemeValue[] args) throws EvalError {
         if (proc instanceof SchemeValue.LambdaVal lambda) {
-            if (args.length != lambda.params().size())
-                throw new EvalError("wrong number of arguments: expected " + lambda.params().size() + ", got " + args.length);
             var callEnv = new Environment(lambda.env());
-            for (int i = 0; i < lambda.params().size(); i++) {
-                callEnv.define(lambda.params().get(i), args[i]);
+            if (lambda.restParam() != null) {
+                if (args.length < lambda.params().size())
+                    throw new EvalError("wrong number of arguments: expected at least " + lambda.params().size() + ", got " + args.length);
+                for (int i = 0; i < lambda.params().size(); i++) {
+                    callEnv.define(lambda.params().get(i), args[i]);
+                }
+                // Collect remaining args into rest list
+                SchemeValue rest = NIL;
+                for (int i = args.length - 1; i >= lambda.params().size(); i--) {
+                    rest = new SchemeValue.PairVal(args[i], rest);
+                }
+                callEnv.define(lambda.restParam(), rest);
+            } else {
+                if (args.length != lambda.params().size())
+                    throw new EvalError("wrong number of arguments: expected " + lambda.params().size() + ", got " + args.length);
+                for (int i = 0; i < lambda.params().size(); i++) {
+                    callEnv.define(lambda.params().get(i), args[i]);
+                }
             }
             SchemeValue result = new SchemeValue.VoidVal();
             for (var bodyExpr : lambda.body()) {
@@ -491,6 +558,30 @@ public class Interpreter {
         }
 
         throw new EvalError("not a procedure: " + proc.display());
+    }
+
+    private SchemeValue applyProc(SchemeValue[] args) throws EvalError {
+        if (args.length < 2) throw new EvalError("apply: expected at least 2 arguments");
+        var proc = args[0];
+        // Last arg must be a list; prefix args are prepended
+        var lastArg = args[args.length - 1];
+        var allArgs = new ArrayList<SchemeValue>();
+        // Add prefix args
+        for (int i = 1; i < args.length - 1; i++) {
+            allArgs.add(args[i]);
+        }
+        // Flatten last arg (must be a list)
+        SchemeValue cur = lastArg;
+        while (cur instanceof SchemeValue.PairVal p) {
+            allArgs.add(p.car());
+            cur = p.cdr();
+        }
+        if (!(cur instanceof SchemeValue.ListVal l && l.elements().isEmpty())) {
+            if (!(cur instanceof SchemeValue.ListVal)) {
+                throw new EvalError("apply: last argument must be a list");
+            }
+        }
+        return callProc(proc, allArgs.toArray(new SchemeValue[0]));
     }
 
     @FunctionalInterface
