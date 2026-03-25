@@ -126,7 +126,9 @@ private[ming] object BuiltinRegistry:
     "dynamic-wind",
     "with-exception-handler",
     "raise",
-    "raise-continuable"
+    "raise-continuable",
+    "values",
+    "call-with-values"
   )
 
   def makeTopLevelEnv(): Env =

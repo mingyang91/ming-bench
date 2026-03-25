@@ -20,6 +20,7 @@ private[ming] enum Expr:
   case CaseLambda(clauses: List[(List[String], Option[String], List[Expr])], closure: Env)
   case Vec(elems: Array[Expr])
   case Cont(kont: AnyRef)
+  case Values(elems: List[Expr])
 
   var line: Int = 0
   var col: Int  = 0

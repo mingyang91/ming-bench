@@ -78,6 +78,9 @@ private[ming] case class GuardStartK(varName: String, clauses: List[Expr], env: 
 private[ming] case class GuardCondK(varName: String, body: List[Expr], remaining: List[Expr], env: Env, exitK: Kont)
     extends Kont
 
+// call-with-values support
+private[ming] case class CallWithValuesConsumerK(consumer: Expr, k: Kont) extends Kont
+
 private[ming] class CekState:
   var expr: Expr                         = null
   var env: Env                           = null

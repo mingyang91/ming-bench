@@ -75,6 +75,20 @@ object CekApply:
       case Expr.Sym("raise-continuable") =>
         if args.length != 1 then throw EvalError("raise-continuable: need exactly 1 argument")
         performRaise(s, args.head, kk)
+      case Expr.Sym("values") =>
+        if args.length == 1 then
+          s.value = args.head
+          s.k = kk
+          s.evaluating = false
+        else
+          s.value = Expr.Values(args)
+          s.k = kk
+          s.evaluating = false
+      case Expr.Sym("call-with-values") =>
+        if args.length != 2 then throw EvalError("call-with-values: need exactly 2 arguments")
+        val producer = args(0)
+        val consumer = args(1)
+        applyFunc(s, producer, Nil, CallWithValuesConsumerK(consumer, kk))
       case Expr.Sym("dynamic-wind") =>
         if args.length != 3 then throw EvalError("dynamic-wind: need exactly 3 arguments")
         val (inThunk, bodyThunk, outThunk) = (args(0), args(1), args(2))

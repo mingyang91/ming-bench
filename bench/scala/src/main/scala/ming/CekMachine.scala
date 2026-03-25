@@ -17,7 +17,8 @@ object CekMachine:
     val curEnv  = s.env
     curExpr match
       case _: Expr.Num | _: Expr.Rational | _: Expr.Real | _: Expr.Bool | _: Expr.Str | _: Expr.Chr | _: Expr.Lambda |
-          _: Expr.Pair | _: Expr.Macro | _: Expr.Record | _: Expr.CaseLambda | _: Expr.Vec | _: Expr.Cont =>
+          _: Expr.Pair | _: Expr.Macro | _: Expr.Record | _: Expr.CaseLambda | _: Expr.Vec | _: Expr.Cont |
+          _: Expr.Values =>
         s.value = curExpr
         s.evaluating = false
 
@@ -148,23 +149,8 @@ object CekMachine:
         s.value = Expr.Bool(false)
         s.k = kk
 
-      case EvFunK(argExprs, e, kk) =>
-        if argExprs.isEmpty then applyFunc(s, s.value, Nil, kk)
-        else
-          val revArgs = argExprs.reverse
-          s.k = EvArgsK(s.value, Nil, revArgs.tail, e, kk)
-          s.expr = revArgs.head
-          s.env = e
-          s.evaluating = true
-
-      case EvArgsK(func, evaledInOrder, remaining, e, kk) =>
-        val newEvaled = s.value :: evaledInOrder
-        if remaining.isEmpty then applyFunc(s, func, newEvaled, kk)
-        else
-          s.k = EvArgsK(func, newEvaled, remaining.tail, e, kk)
-          s.expr = remaining.head
-          s.env = e
-          s.evaluating = true
+      case k: EvFunK  => stepEvFunK(s, k)
+      case k: EvArgsK => stepEvArgsK(s, k)
 
       case _: BindK | _: NamedLetBindK =>
         CekHelpers.stepBindKont(s, s.k)
@@ -210,7 +196,31 @@ object CekMachine:
           else setupBody(s, body, env, exitK)
         else evalGuardClauses(s, varName, remaining, env, exitK)
 
+      case CallWithValuesConsumerK(consumer, kk) =>
+        val args = s.value match
+          case Expr.Values(elems) => elems
+          case single             => List(single)
+        applyFunc(s, consumer, args, kk)
+
     null // signal: keep looping
+
+  private def stepEvFunK(s: CekState, k: EvFunK): Unit =
+    if k.argExprs.isEmpty then applyFunc(s, s.value, Nil, k.k)
+    else
+      val revArgs = k.argExprs.reverse
+      s.k = EvArgsK(s.value, Nil, revArgs.tail, k.env, k.k)
+      s.expr = revArgs.head
+      s.env = k.env
+      s.evaluating = true
+
+  private def stepEvArgsK(s: CekState, k: EvArgsK): Unit =
+    val newEvaled = s.value :: k.evaledInOrder
+    if k.remaining.isEmpty then applyFunc(s, k.func, newEvaled, k.k)
+    else
+      s.k = EvArgsK(k.func, newEvaled, k.remaining.tail, k.env, k.k)
+      s.expr = k.remaining.head
+      s.env = k.env
+      s.evaluating = true
 
   private def run(expr0: Expr, env0: Env, k0: Kont): Expr =
     val s = new CekState
