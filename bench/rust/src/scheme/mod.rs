@@ -1,4 +1,5 @@
 pub mod error;
+mod parser;
 
 pub use error::{EvalError, SourcePos};
 
@@ -18,6 +19,7 @@ struct Expr {
 enum ExprKind {
     Integer(i64),
     Boolean(bool),
+    Character(char),
     String(String),
     Symbol(String),
     List(Vec<Expr>),
@@ -48,7 +50,7 @@ enum Value {
     Integer(i64),
     Boolean(bool),
     Character(char),
-    String(String),
+    String(StringRef),
     Symbol(String),
     List(Vec<Value>),
     Procedure(Procedure),
@@ -70,6 +72,7 @@ struct Lambda {
 }
 
 type EnvRef = Rc<RefCell<Env>>;
+type StringRef = Rc<RefCell<String>>;
 
 #[derive(Debug, Default)]
 struct Env {
@@ -115,10 +118,13 @@ impl Value {
             Self::Boolean(true) => "#t".into(),
             Self::Boolean(false) => "#f".into(),
             Self::Character(value) => render_char(*value, mode),
-            Self::String(value) => match mode {
-                RenderMode::Display => value.clone(),
-                RenderMode::Write => render_string(value),
-            },
+            Self::String(value) => {
+                let value = value.borrow();
+                match mode {
+                    RenderMode::Display => value.clone(),
+                    RenderMode::Write => render_string(&value),
+                }
+            }
             Self::Symbol(value) => value.clone(),
             Self::List(items) => render_list(items, mode),
             Self::Procedure(_) => "#<procedure>".into(),
@@ -146,252 +152,11 @@ impl Env {
     }
 }
 
-struct Parser<'a> {
-    input: &'a str,
-    offset: usize,
-    line: usize,
-    column: usize,
-}
-
-impl<'a> Parser<'a> {
-    fn new(input: &'a str) -> Self {
-        Self {
-            input,
-            offset: 0,
-            line: 1,
-            column: 1,
-        }
-    }
-
-    fn parse_program(&mut self) -> Result<Vec<Expr>, EvalError> {
-        let mut exprs = Vec::new();
-        self.skip_ignored();
-
-        while !self.is_eof() {
-            exprs.push(self.parse_expr()?);
-            self.skip_ignored();
-        }
-
-        if exprs.is_empty() {
-            Err(syntax_error(self.current_pos(), "empty input"))
-        } else {
-            Ok(exprs)
-        }
-    }
-
-    fn parse_expr(&mut self) -> Result<Expr, EvalError> {
-        self.skip_ignored();
-        let pos = self.current_pos();
-
-        match self.peek_char() {
-            Some('(') => self.parse_list(pos),
-            Some('\'') => self.parse_quote_shorthand(pos),
-            Some('"') => self.parse_string(pos),
-            Some('#') => self.parse_boolean(pos),
-            Some('+') | Some('-')
-                if self
-                    .peek_second_char()
-                    .is_some_and(|ch| ch.is_ascii_digit()) =>
-            {
-                self.parse_number(pos)
-            }
-            Some(ch) if ch.is_ascii_digit() => self.parse_number(pos),
-            Some(_) => self.parse_symbol(pos),
-            None => Err(unexpected_eof(pos)),
-        }
-    }
-
-    fn parse_quote_shorthand(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
-        self.bump();
-        let expr = self.parse_expr()?;
-        Ok(Expr::new(
-            pos,
-            ExprKind::List(vec![Expr::new(pos, ExprKind::Symbol("quote".into())), expr]),
-        ))
-    }
-
-    fn parse_list(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
-        self.bump();
-        let mut items = Vec::new();
-
-        loop {
-            self.skip_ignored();
-            match self.peek_char() {
-                Some(')') => {
-                    self.bump();
-                    return Ok(Expr::new(pos, ExprKind::List(items)));
-                }
-                Some(_) => items.push(self.parse_expr()?),
-                None => return Err(unexpected_eof(self.current_pos())),
-            }
-        }
-    }
-
-    fn parse_string(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
-        self.bump();
-        let mut value = String::new();
-
-        loop {
-            match self.bump() {
-                Some('"') => return Ok(Expr::new(pos, ExprKind::String(value))),
-                Some('\\') => {
-                    let escaped = match self.bump() {
-                        Some('"') => '"',
-                        Some('\\') => '\\',
-                        Some('n') => '\n',
-                        Some('r') => '\r',
-                        Some('t') => '\t',
-                        Some(ch) => ch,
-                        None => return Err(unexpected_eof(self.current_pos())),
-                    };
-                    value.push(escaped);
-                }
-                Some(ch) => value.push(ch),
-                None => return Err(unexpected_eof(self.current_pos())),
-            }
-        }
-    }
-
-    fn parse_boolean(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
-        if self.consume_literal("#t") {
-            return Ok(Expr::new(pos, ExprKind::Boolean(true)));
-        }
-
-        if self.consume_literal("#f") {
-            return Ok(Expr::new(pos, ExprKind::Boolean(false)));
-        }
-
-        Err(syntax_error(pos, "invalid boolean literal"))
-    }
-
-    fn parse_number(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
-        let start = self.offset;
-
-        if matches!(self.peek_char(), Some('+') | Some('-')) {
-            self.bump();
-        }
-
-        let mut saw_digit = false;
-        while matches!(self.peek_char(), Some(ch) if ch.is_ascii_digit()) {
-            saw_digit = true;
-            self.bump();
-        }
-
-        if !saw_digit {
-            return Err(syntax_error(pos, "invalid number literal"));
-        }
-
-        let token = &self.input[start..self.offset];
-        let value = token
-            .parse::<i64>()
-            .map_err(|_| syntax_error(pos, format!("invalid number literal: {token}")))?;
-
-        Ok(Expr::new(pos, ExprKind::Integer(value)))
-    }
-
-    fn parse_symbol(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
-        let start = self.offset;
-
-        while matches!(self.peek_char(), Some(ch) if !is_delimiter(ch)) {
-            self.bump();
-        }
-
-        if start == self.offset {
-            return Err(syntax_error(pos, "expected expression"));
-        }
-
-        Ok(Expr::new(
-            pos,
-            ExprKind::Symbol(self.input[start..self.offset].to_string()),
-        ))
-    }
-
-    fn skip_ignored(&mut self) {
-        loop {
-            match self.peek_char() {
-                Some(ch) if ch.is_whitespace() => {
-                    self.bump();
-                }
-                Some(';') => {
-                    while let Some(ch) = self.bump() {
-                        if ch == '\n' {
-                            break;
-                        }
-                    }
-                }
-                _ => return,
-            }
-        }
-    }
-
-    fn consume_literal(&mut self, literal: &str) -> bool {
-        if !self.remaining().starts_with(literal) {
-            return false;
-        }
-
-        let end = self.offset + literal.len();
-        if self
-            .input
-            .get(end..)
-            .and_then(|rest| rest.chars().next())
-            .is_some_and(|ch| !is_delimiter(ch))
-        {
-            return false;
-        }
-
-        for _ in literal.chars() {
-            self.bump();
-        }
-
-        true
-    }
-
-    fn current_pos(&self) -> SourcePos {
-        SourcePos::new(self.line, self.column)
-    }
-
-    fn remaining(&self) -> &'a str {
-        &self.input[self.offset..]
-    }
-
-    fn peek_char(&self) -> Option<char> {
-        self.remaining().chars().next()
-    }
-
-    fn peek_second_char(&self) -> Option<char> {
-        let mut chars = self.remaining().chars();
-        chars.next()?;
-        chars.next()
-    }
-
-    fn bump(&mut self) -> Option<char> {
-        let ch = self.peek_char()?;
-        self.offset += ch.len_utf8();
-
-        if ch == '\n' {
-            self.line += 1;
-            self.column = 1;
-        } else {
-            self.column += 1;
-        }
-
-        Some(ch)
-    }
-
-    fn is_eof(&self) -> bool {
-        self.offset >= self.input.len()
-    }
-}
-
 fn syntax_error(pos: SourcePos, message: impl Into<String>) -> EvalError {
     EvalError::Syntax {
         pos,
         message: message.into(),
     }
-}
-
-fn unexpected_eof(pos: SourcePos) -> EvalError {
-    EvalError::UnexpectedEof { pos }
 }
 
 fn wrong_arg_count(
@@ -434,6 +199,10 @@ fn invalid_argument(
     }
 }
 
+fn make_string_value(value: impl Into<String>) -> Value {
+    Value::String(Rc::new(RefCell::new(value.into())))
+}
+
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 ///
@@ -443,8 +212,7 @@ fn invalid_argument(
 /// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
 /// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
-    let mut parser = Parser::new(input);
-    let exprs = parser.parse_program()?;
+    let exprs = parser::parse_program(input)?;
     let env = Env::new_root();
     let mut context = EvalContext::default();
     let result = eval_sequence(&exprs, &env, START_POS, &mut context)?;
@@ -469,8 +237,7 @@ fn eval_sequence(
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    let mut parser = Parser::new(input);
-    let exprs = parser.parse_program()?;
+    let exprs = parser::parse_program(input)?;
     let env = Env::new_root();
     let mut context = EvalContext::default();
     let result = eval_sequence(&exprs, &env, START_POS, &mut context)?;
@@ -481,7 +248,8 @@ fn eval_expr(expr: &Expr, env: &EnvRef, context: &mut EvalContext) -> Result<Val
     match &expr.kind {
         ExprKind::Integer(value) => Ok(Value::Integer(*value)),
         ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
-        ExprKind::String(value) => Ok(Value::String(value.clone())),
+        ExprKind::Character(value) => Ok(Value::Character(*value)),
+        ExprKind::String(value) => Ok(make_string_value(value.clone())),
         ExprKind::Symbol(name) => lookup_symbol(env, name, expr.pos),
         ExprKind::List(items) => eval_list(items, env, expr.pos, context),
     }
@@ -556,8 +324,10 @@ fn builtin_name(name: &str) -> Option<&'static str> {
         "string->number" => Some("string->number"),
         "string->symbol" => Some("string->symbol"),
         "string-append" => Some("string-append"),
+        "string-copy" => Some("string-copy"),
         "string-length" => Some("string-length"),
         "string-ref" => Some("string-ref"),
+        "string-set!" => Some("string-set!"),
         "string?" => Some("string?"),
         "substring" => Some("substring"),
         "symbol->string" => Some("symbol->string"),
@@ -841,7 +611,8 @@ fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Integer(value) => Ok(Value::Integer(*value)),
         ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
-        ExprKind::String(value) => Ok(Value::String(value.clone())),
+        ExprKind::Character(value) => Ok(Value::Character(*value)),
+        ExprKind::String(value) => Ok(make_string_value(value.clone())),
         ExprKind::Symbol(value) => Ok(Value::Symbol(value.clone())),
         ExprKind::List(items) => items
             .iter()
@@ -1005,8 +776,10 @@ fn apply_builtin(
         "string->number" => string_to_number(args, pos),
         "string->symbol" => string_to_symbol(args, pos),
         "string-append" => string_append(args, pos),
+        "string-copy" => string_copy(args, pos),
         "string-length" => string_length(args, pos),
         "string-ref" => string_ref(args, pos),
+        "string-set!" => string_set(args, pos),
         "string?" => predicate(args, "string?", pos, |value| {
             matches!(value, Value::String(_))
         }),
@@ -1193,17 +966,36 @@ fn string_append(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     let mut result = String::new();
 
     for value in args {
-        result.push_str(expect_string("string-append", value, pos)?);
+        let value = expect_string("string-append", value, pos)?;
+        result.push_str(&value.borrow());
     }
 
-    Ok(Value::String(result))
+    Ok(make_string_value(result))
+}
+
+fn string_copy(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [value] => {
+            let value = expect_string("string-copy", value, pos)?;
+            let copy = value.borrow().clone();
+            Ok(make_string_value(copy))
+        }
+        _ => Err(wrong_arg_count(
+            pos,
+            "string-copy",
+            "exactly 1 argument",
+            args.len(),
+        )),
+    }
 }
 
 fn string_length(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     match args {
-        [value] => Ok(Value::Integer(
-            expect_string("string-length", value, pos)?.chars().count() as i64,
-        )),
+        [value] => {
+            let value = expect_string("string-length", value, pos)?;
+            let len = value.borrow().chars().count() as i64;
+            Ok(Value::Integer(len))
+        }
         _ => Err(wrong_arg_count(
             pos,
             "string-length",
@@ -1219,6 +1011,7 @@ fn substring(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
             let string = expect_string("substring", string, pos)?;
             let start = expect_non_negative_integer("substring", start, pos, "start index")?;
             let end = expect_non_negative_integer("substring", end, pos, "end index")?;
+            let string = string.borrow();
             let len = string.chars().count();
 
             if start > end {
@@ -1237,9 +1030,9 @@ fn substring(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
                 ));
             }
 
-            let start_byte = byte_index_for_char(string, start).unwrap_or(string.len());
-            let end_byte = byte_index_for_char(string, end).unwrap_or(string.len());
-            Ok(Value::String(string[start_byte..end_byte].to_string()))
+            let start_byte = byte_index_for_char(&string, start).unwrap_or(string.len());
+            let end_byte = byte_index_for_char(&string, end).unwrap_or(string.len());
+            Ok(make_string_value(string[start_byte..end_byte].to_string()))
         }
         _ => Err(wrong_arg_count(
             pos,
@@ -1254,7 +1047,8 @@ fn string_to_number(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> 
     match args {
         [value] => {
             let string = expect_string("string->number", value, pos)?;
-            Ok(match string.parse::<i64>() {
+            let parsed = string.borrow().parse::<i64>();
+            Ok(match parsed {
                 Ok(number) => Value::Integer(number),
                 Err(_) => Value::Boolean(false),
             })
@@ -1270,7 +1064,7 @@ fn string_to_number(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> 
 
 fn number_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     match args {
-        [Value::Integer(number)] => Ok(Value::String(number.to_string())),
+        [Value::Integer(number)] => Ok(make_string_value(number.to_string())),
         [other] => Err(type_mismatch(
             pos,
             "number->string",
@@ -1288,7 +1082,7 @@ fn number_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> 
 
 fn symbol_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     match args {
-        [value] => Ok(Value::String(
+        [value] => Ok(make_string_value(
             expect_symbol("symbol->string", value, pos)?.to_string(),
         )),
         _ => Err(wrong_arg_count(
@@ -1302,9 +1096,11 @@ fn symbol_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> 
 
 fn string_to_symbol(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     match args {
-        [value] => Ok(Value::Symbol(
-            expect_string("string->symbol", value, pos)?.to_string(),
-        )),
+        [value] => {
+            let value = expect_string("string->symbol", value, pos)?;
+            let symbol = value.borrow().clone();
+            Ok(Value::Symbol(symbol))
+        }
         _ => Err(wrong_arg_count(
             pos,
             "string->symbol",
@@ -1319,6 +1115,7 @@ fn string_ref(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         [string, index] => {
             let string = expect_string("string-ref", string, pos)?;
             let index = expect_non_negative_integer("string-ref", index, pos, "index")?;
+            let string = string.borrow();
             let len = string.chars().count();
 
             match string.chars().nth(index) {
@@ -1334,6 +1131,40 @@ fn string_ref(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
             pos,
             "string-ref",
             "exactly 2 arguments",
+            args.len(),
+        )),
+    }
+}
+
+fn string_set(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [string, index, Value::Character(ch)] => {
+            let string = expect_string("string-set!", string, pos)?;
+            let index = expect_non_negative_integer("string-set!", index, pos, "index")?;
+            let mut string = string.borrow_mut();
+            let len = string.chars().count();
+
+            if index >= len {
+                return Err(invalid_argument(
+                    pos,
+                    "string-set!",
+                    format!("index {index} out of range for string of length {len}"),
+                ));
+            }
+
+            let start = byte_index_for_char(&string, index)
+                .expect("valid character index must have a byte offset");
+            let end = byte_index_for_char(&string, index + 1)
+                .expect("valid character index must have an end byte offset");
+            let replacement = ch.to_string();
+            string.replace_range(start..end, &replacement);
+            Ok(Value::Void)
+        }
+        [_, _, other] => Err(type_mismatch(pos, "string-set!", "char", other.type_name())),
+        _ => Err(wrong_arg_count(
+            pos,
+            "string-set!",
+            "exactly 3 arguments",
             args.len(),
         )),
     }
@@ -1358,9 +1189,9 @@ fn expect_numbers(name: &str, args: &[Value], pos: SourcePos) -> Result<Vec<i64>
         .collect()
 }
 
-fn expect_string<'a>(name: &str, value: &'a Value, pos: SourcePos) -> Result<&'a str, EvalError> {
+fn expect_string(name: &str, value: &Value, pos: SourcePos) -> Result<StringRef, EvalError> {
     match value {
-        Value::String(value) => Ok(value),
+        Value::String(value) => Ok(Rc::clone(value)),
         other => Err(type_mismatch(pos, name, "string", other.type_name())),
     }
 }
@@ -1463,10 +1294,6 @@ fn byte_index_for_char(input: &str, char_index: usize) -> Option<usize> {
             .nth(char_index)
             .map(|(byte_index, _)| byte_index)
     }
-}
-
-fn is_delimiter(ch: char) -> bool {
-    ch.is_whitespace() || matches!(ch, '(' | ')' | ';')
 }
 
 #[cfg(test)]
