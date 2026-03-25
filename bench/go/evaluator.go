@@ -86,6 +86,10 @@ var contFrameStack []contFrame
 // Body eval loops counteract by decrementing before and incrementing after evalExpr calls.
 var nonBodyEvalDepth int
 
+// Step-limited evaluation support
+var stepCounter int
+var stepLimit int // 0 means unlimited
+
 func pushContFrame(f contFrame) {
 	contFrameStack = append(contFrameStack, f)
 }
@@ -100,6 +104,12 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 	nonBodyEvalDepth++
 	defer func() { nonBodyEvalDepth-- }()
 	for {
+	if stepLimit > 0 {
+		stepCounter++
+		if stepCounter > stepLimit {
+			return nil, &EvalError{Message: "step limit exceeded"}
+		}
+	}
 	switch e := expr.(type) {
 	case *NumberExpr:
 		return &IntVal{Val: e.Val}, nil
@@ -3943,6 +3953,13 @@ func evalWithSyntax(e *ListExpr, env *Env) (Value, error) {
 func EvalStr(input string) (string, error) {
 	r, _, err := EvalStrWithOutput(input)
 	return r, err
+}
+
+func EvalStrWithLimit(input string, limit int) (string, error) {
+	stepCounter = 0
+	stepLimit = limit
+	defer func() { stepLimit = 0 }()
+	return EvalStr(input)
 }
 
 // EvalStrWithOutput evaluates Scheme expressions and returns both the result
