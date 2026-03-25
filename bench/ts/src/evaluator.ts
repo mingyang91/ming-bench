@@ -1528,8 +1528,14 @@ function evalArgsCPS(exprs: SchemeVal[], idx: number, env: Env, acc: SchemeVal[]
 
 function applyCPS(func: SchemeVal, args: SchemeVal[], pos: Pos | undefined, k: Cont): Bounce {
   if (func.tag === 'continuation') {
-    if (args.length !== 1) throw errAt('continuation: expected 1 argument', pos);
     contReentry = true;
+    let val: SchemeVal;
+    if (args.length === 1) {
+      val = args[0];
+    } else {
+      val = { tag: 'values', vals: args };
+    }
+    const theVal = val;
     const targetWinds = func.winds;
     const currentWinds = [...windStack];
     // Find common prefix length
@@ -1547,7 +1553,7 @@ function applyCPS(func: SchemeVal, args: SchemeVal[], pos: Pos | undefined, k: C
     }
     // Rewind target extents (in-thunks, common prefix to target)
     function rewind(idx: number): Bounce {
-      if (idx >= targetWinds.length) return mkBounce(() => func.k(args[0]));
+      if (idx >= targetWinds.length) return mkBounce(() => func.k(theVal));
       const entry = targetWinds[idx];
       return applyCPS(entry.inThunk, [], pos, (_) => {
         windStack.push(entry);
@@ -2330,7 +2336,7 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
 
       return evalSeqCPS(body, 0, env, (result) => {
         exceptionHandlers.pop();
-        return k(result);
+        return mkBounce(() => k(result));
       });
     }
 
