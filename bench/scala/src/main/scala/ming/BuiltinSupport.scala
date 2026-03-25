@@ -4,6 +4,9 @@ import scala.annotation.tailrec
 
 private[ming] trait BuiltinSupport:
 
+  final protected def asNumericNumbers(args: List[Value], pos: SourcePos, name: String): List[SchemeNumber] =
+    args.map(arg => expectNumeric(arg, pos, name))
+
   final protected def asNumbers(args: List[Value], pos: SourcePos, name: String): List[BigInt] =
     args.map(arg => expectNumber(arg, pos, name))
 
@@ -27,13 +30,16 @@ private[ming] trait BuiltinSupport:
     val (first, second) = expectTwoArgs(args, pos, name)
     (expectNumber(first, pos, name), expectNumber(second, pos, name))
 
+  final protected def expectNumeric(arg: Value, pos: SourcePos, name: String): SchemeNumber =
+    SchemeNumber.fromValue(arg, pos, name)
+
   final protected def expectNumber(arg: Value, pos: SourcePos, name: String): BigInt =
-    arg match
-      case Value.IntVal(value) =>
+    expectNumeric(arg, pos, name) match
+      case SchemeNumber.Exact(value, denominator) if denominator == 1 =>
         value
 
-      case other =>
-        throw EvalError.at(pos, s"$name expected number arguments, got ${other.typeName}")
+      case _ =>
+        throw EvalError.at(pos, s"$name expected integer arguments, got number")
 
   final protected def expectString(arg: Value, pos: SourcePos, name: String): String =
     new String(expectStringValue(arg, pos, name))

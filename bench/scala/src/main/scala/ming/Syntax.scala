@@ -5,6 +5,8 @@ import scala.annotation.tailrec
 private[ming] enum Expr:
 
   case IntAtom(value: BigInt, pos: SourcePos)
+  case RationalAtom(numerator: BigInt, denominator: BigInt, pos: SourcePos)
+  case InexactAtom(value: Double, pos: SourcePos)
   case BoolAtom(value: Boolean, pos: SourcePos)
   case StringAtom(value: String, pos: SourcePos)
   case CharAtom(value: Char, pos: SourcePos)
@@ -14,6 +16,8 @@ private[ming] enum Expr:
 private[ming] enum Value:
 
   case IntVal(value: BigInt)
+  case RationalVal(numerator: BigInt, denominator: BigInt)
+  case InexactVal(value: Double)
   case BoolVal(value: Boolean)
   case StringVal(value: Array[Char])
   case CharVal(value: Char)
@@ -33,6 +37,12 @@ private[ming] enum Value:
   def typeName: String =
     this match
       case Value.IntVal(_) =>
+        "number"
+
+      case Value.RationalVal(_, _) =>
+        "number"
+
+      case Value.InexactVal(_) =>
         "number"
 
       case Value.BoolVal(_) =>
@@ -89,6 +99,9 @@ private[ming] object Value:
 
   def eqv(left: Value, right: Value): Boolean =
     (left, right) match
+      case _ if isNumberValue(left) && isNumberValue(right) =>
+        equalNumbers(left, right)
+
       case (Value.IntVal(leftValue), Value.IntVal(rightValue)) =>
         leftValue == rightValue
 
@@ -149,6 +162,12 @@ private[ming] object Value:
       case Value.IntVal(number) =>
         number.toString
 
+      case Value.RationalVal(numerator, denominator) =>
+        s"$numerator/$denominator"
+
+      case Value.InexactVal(number) =>
+        java.lang.Double.toString(number)
+
       case Value.BoolVal(boolean) =>
         if boolean then "#t" else "#f"
 
@@ -182,6 +201,12 @@ private[ming] object Value:
       case Expr.IntAtom(value, _) =>
         Value.IntVal(value)
 
+      case Expr.RationalAtom(numerator, denominator, _) =>
+        Value.RationalVal(numerator, denominator)
+
+      case Expr.InexactAtom(value, _) =>
+        Value.InexactVal(value)
+
       case Expr.BoolAtom(value, _) =>
         Value.BoolVal(value)
 
@@ -199,6 +224,17 @@ private[ming] object Value:
 
   def list(items: List[Value]): Value =
     items.foldRight[Value](Value.EmptyList)(Value.PairVal(_, _))
+
+  private def isNumberValue(value: Value): Boolean =
+    SchemeNumber.isNumberValue(value)
+
+  private def equalNumbers(left: Value, right: Value): Boolean =
+    (SchemeNumber.fromValueOption(left), SchemeNumber.fromValueOption(right)) match
+      case (Some(leftNumber), Some(rightNumber)) =>
+        SchemeNumber.equal(leftNumber, rightNumber)
+
+      case _ =>
+        false
 
   private def renderChar(value: Char): String =
     value match

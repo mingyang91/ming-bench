@@ -93,6 +93,12 @@ private[ming] object MacroSupport:
       case (Expr.IntAtom(leftValue, _), Expr.IntAtom(rightValue, _)) =>
         leftValue == rightValue
 
+      case (Expr.RationalAtom(leftNumerator, leftDenominator, _), Expr.RationalAtom(rightNumerator, rightDenominator, _)) =>
+        leftNumerator == rightNumerator && leftDenominator == rightDenominator
+
+      case (Expr.InexactAtom(leftValue, _), Expr.InexactAtom(rightValue, _)) =>
+        leftValue == rightValue
+
       case (Expr.BoolAtom(leftValue, _), Expr.BoolAtom(rightValue, _)) =>
         leftValue == rightValue
 
@@ -114,6 +120,8 @@ private[ming] object MacroSupport:
   def exprPos(expr: Expr): SourcePos =
     expr match
       case Expr.IntAtom(_, pos)    => pos
+      case Expr.RationalAtom(_, _, pos) => pos
+      case Expr.InexactAtom(_, pos) => pos
       case Expr.BoolAtom(_, pos)   => pos
       case Expr.StringAtom(_, pos) => pos
       case Expr.CharAtom(_, pos)   => pos

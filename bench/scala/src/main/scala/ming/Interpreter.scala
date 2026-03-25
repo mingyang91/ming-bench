@@ -27,6 +27,12 @@ private[ming] object Interpreter:
       case Expr.IntAtom(value, _) =>
         Value.IntVal(value)
 
+      case Expr.RationalAtom(numerator, denominator, _) =>
+        Value.RationalVal(numerator, denominator)
+
+      case Expr.InexactAtom(value, _) =>
+        Value.InexactVal(value)
+
       case Expr.BoolAtom(value, _) =>
         Value.BoolVal(value)
 

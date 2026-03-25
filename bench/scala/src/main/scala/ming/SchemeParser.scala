@@ -39,13 +39,7 @@ private[ming] object SchemeParser:
       case '#' =>
         parseHashLiteral(start, trimmed)
 
-      case '+' if nextIsDigit(trimmed) =>
-        parseNumber(start, trimmed)
-
-      case '-' if nextIsDigit(trimmed) =>
-        parseNumber(start, trimmed)
-
-      case ch if ch.isDigit =>
+      case _ if startsNumber(trimmed) =>
         parseNumber(start, trimmed)
 
       case _ =>
@@ -127,13 +121,21 @@ private[ming] object SchemeParser:
 
   private def parseNumber(start: SourcePos, state: ParserState): (Expr, ParserState) =
     val (token, nextState) = readToken(state)
-    val value =
-      try BigInt(token)
-      catch
-        case _: NumberFormatException =>
-          fail(start, s"invalid integer literal: $token")
+    val expr =
+      SchemeNumber.parseLiteral(token) match
+        case Right(SchemeNumber.Exact(numerator, denominator)) if denominator == 1 =>
+          Expr.IntAtom(numerator, start)
 
-    (Expr.IntAtom(value, start), nextState)
+        case Right(SchemeNumber.Exact(numerator, denominator)) =>
+          Expr.RationalAtom(numerator, denominator, start)
+
+        case Right(SchemeNumber.Inexact(value)) =>
+          Expr.InexactAtom(value, start)
+
+        case Left(message) =>
+          fail(start, message)
+
+    (expr, nextState)
 
   private def parseSymbol(start: SourcePos, state: ParserState): (Expr, ParserState) =
     val (token, nextState) = readToken(state)
@@ -173,8 +175,17 @@ private[ming] object SchemeParser:
     if count <= 0 then state
     else advanceBy(state.advance, count - 1)
 
-  private def nextIsDigit(state: ParserState): Boolean =
-    state.peek(1).exists(_.isDigit)
+  private def startsNumber(state: ParserState): Boolean =
+    state.currentChar match
+      case '+' | '-' =>
+        state.peek(1).exists(_.isDigit) ||
+          (state.peek(1).contains('.') && state.peek(2).exists(_.isDigit))
+
+      case '.' =>
+        state.peek(1).exists(_.isDigit)
+
+      case ch =>
+        ch.isDigit
 
   private def isTokenBoundary(state: ParserState, offset: Int): Boolean =
     state.peek(offset).forall(isDelimiter)

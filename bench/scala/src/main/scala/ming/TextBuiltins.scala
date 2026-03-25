@@ -68,14 +68,16 @@ private[ming] object TextBuiltins extends BuiltinSupport:
     val text = expectString(expectSingleArg(args, pos, "string->number"), pos, "string->number").trim
     if text.isEmpty then Value.BoolVal(false)
     else
-      try Value.IntVal(BigInt(text))
-      catch
-        case _: NumberFormatException =>
+      SchemeNumber.parseLiteral(text) match
+        case Right(number) =>
+          SchemeNumber.toValue(number)
+
+        case Left(_) =>
           Value.BoolVal(false)
 
   private def numberToString(args: List[Value], pos: SourcePos): Value =
     Value.StringVal(
-      expectNumber(expectSingleArg(args, pos, "number->string"), pos, "number->string").toString.toCharArray
+      expectNumeric(expectSingleArg(args, pos, "number->string"), pos, "number->string").render.toCharArray
     )
 
   private def symbolToString(args: List[Value], pos: SourcePos): Value =
