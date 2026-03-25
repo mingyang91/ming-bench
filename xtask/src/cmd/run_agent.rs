@@ -256,8 +256,6 @@ fn create_worktree(
 
     symlink_strategy(&args.lang, &args.strategy, agent_workdir)?;
     copy_strategy_clippy(args, agent_workdir)?;
-    // quality-gate lints are now enforced at runtime via `cargo xtask test`
-    // (clippy flags in test_level.rs), not via Cargo feature patching.
     Ok(())
 }
 
