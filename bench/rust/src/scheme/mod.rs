@@ -1,16 +1,26 @@
 pub mod error;
+mod builtins;
 
 pub use error::EvalError;
+use builtins::*;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-type BuiltinFn = fn(&[Val], &Env) -> Result<Val, EvalError>;
+static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn gensym(prefix: &str) -> String {
+    let n = GENSYM_COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!("#{}#{}", prefix, n)
+}
+
+pub(crate) type BuiltinFn = fn(&[Val], &Env) -> Result<Val, EvalError>;
 
 #[derive(Clone)]
-enum Val {
+pub(crate) enum Val {
     Int(i64),
     Bool(bool),
     Str(String),
@@ -25,6 +35,11 @@ enum Val {
         env: Env,
     },
     Builtin(BuiltinFn),
+    Macro {
+        literals: Vec<String>,
+        rules: Vec<(Expr, Expr)>,
+        def_env: Env,
+    },
     Void,
 }
 
@@ -72,7 +87,7 @@ impl fmt::Display for Val {
                 }
                 write!(f, ")")
             }
-            Val::Lambda { .. } | Val::Builtin(..) => write!(f, "#<procedure>"),
+            Val::Lambda { .. } | Val::Builtin(..) | Val::Macro { .. } => write!(f, "#<procedure>"),
             Val::Void => write!(f, "#<void>"),
         }
     }
@@ -83,9 +98,9 @@ impl fmt::Display for Val {
 type Frame = Rc<RefCell<HashMap<String, Val>>>;
 
 #[derive(Clone)]
-struct Env {
+pub(crate) struct Env {
     frames: Vec<Frame>,
-    output: Rc<RefCell<String>>,
+    pub(crate) output: Rc<RefCell<String>>,
 }
 
 impl Env {
@@ -199,7 +214,7 @@ impl Env {
 // --- Source Positions ---
 
 #[derive(Debug, Clone, Copy)]
-struct Span {
+pub(crate) struct Span {
     line: usize,
     col: usize,
 }
@@ -219,13 +234,13 @@ impl fmt::Display for Span {
 // --- Parser ---
 
 #[derive(Debug, Clone)]
-struct Expr {
+pub(crate) struct Expr {
     kind: ExprKind,
     span: Span,
 }
 
 #[derive(Debug, Clone)]
-enum ExprKind {
+pub(crate) enum ExprKind {
     Int(i64),
     Bool(bool),
     Str(String),
@@ -422,7 +437,12 @@ fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
                     "cond" => return eval_cond(&elems[1..], env),
                     "set!" => return eval_set_bang(&elems[1..], env, span),
                     "string-set!" => return eval_string_set(&elems[1..], env, span),
-                    _ => {}
+                    "define-syntax" => return eval_define_syntax(&elems[1..], env, span),
+                    _ => {
+                        if let Some(Val::Macro { literals, rules, def_env }) = env.get(op) {
+                            return eval_macro_call(elems, &literals, &rules, &def_env, env, span);
+                        }
+                    }
                 }
             }
             // Evaluate function position
@@ -433,7 +453,7 @@ fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
     }
 }
 
-fn apply_val(func: &Val, args: &[Val], caller_env: &Env) -> Result<Val, EvalError> {
+pub(crate) fn apply_val(func: &Val, args: &[Val], caller_env: &Env) -> Result<Val, EvalError> {
     match func {
         Val::Lambda { params, rest_param, body, env } => {
             if let Some(rest) = rest_param {
@@ -496,6 +516,293 @@ fn parse_params(exprs: &[Expr], span: Span) -> Result<(Vec<String>, Option<Strin
         i += 1;
     }
     Ok((params, rest_param))
+}
+
+// --- Macros (syntax-rules) ---
+
+#[derive(Clone, Debug)]
+enum MacroBinding {
+    Single(Expr),
+    Many(Vec<Expr>),
+}
+
+fn match_pattern_list(
+    pattern: &[Expr],
+    input: &[Expr],
+    literals: &[String],
+    bindings: &mut HashMap<String, MacroBinding>,
+) -> bool {
+    let ellipsis_pos = pattern.iter().position(
+        |e| matches!(&e.kind, ExprKind::Symbol(s) if s == "..."),
+    );
+    if let Some(epos) = ellipsis_pos {
+        let fixed_before = &pattern[..epos - 1];
+        let ellipsis_pat = &pattern[epos - 1];
+        let fixed_after = &pattern[epos + 1..];
+        let min_len = fixed_before.len() + fixed_after.len();
+        if input.len() < min_len {
+            return false;
+        }
+        for (p, e) in fixed_before.iter().zip(input.iter()) {
+            if !match_pattern_single(p, e, literals, bindings) {
+                return false;
+            }
+        }
+        let after_start = input.len() - fixed_after.len();
+        for (p, e) in fixed_after.iter().zip(input[after_start..].iter()) {
+            if !match_pattern_single(p, e, literals, bindings) {
+                return false;
+            }
+        }
+        let ellipsis_input = &input[fixed_before.len()..after_start];
+        match &ellipsis_pat.kind {
+            ExprKind::Symbol(s) if !literals.contains(s) && s != "_" => {
+                bindings.insert(s.clone(), MacroBinding::Many(ellipsis_input.to_vec()));
+                true
+            }
+            _ => ellipsis_input.is_empty(),
+        }
+    } else {
+        if pattern.len() != input.len() {
+            return false;
+        }
+        for (p, e) in pattern.iter().zip(input.iter()) {
+            if !match_pattern_single(p, e, literals, bindings) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn match_pattern_single(
+    pattern: &Expr,
+    input: &Expr,
+    literals: &[String],
+    bindings: &mut HashMap<String, MacroBinding>,
+) -> bool {
+    match &pattern.kind {
+        ExprKind::Symbol(s) if s == "_" => true,
+        ExprKind::Symbol(s) if literals.contains(s) => {
+            matches!(&input.kind, ExprKind::Symbol(s2) if s2 == s)
+        }
+        ExprKind::Symbol(s) => {
+            bindings.insert(s.clone(), MacroBinding::Single(input.clone()));
+            true
+        }
+        _ => false,
+    }
+}
+
+fn find_ellipsis_var(expr: &Expr, bindings: &HashMap<String, MacroBinding>) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Symbol(s) => {
+            if matches!(bindings.get(s), Some(MacroBinding::Many(_))) {
+                return Some(s.clone());
+            }
+            None
+        }
+        ExprKind::List(elems) => {
+            for e in elems {
+                if let Some(v) = find_ellipsis_var(e, bindings) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn collect_template_free_vars(
+    expr: &Expr,
+    pattern_vars: &[String],
+    out: &mut Vec<String>,
+) {
+    match &expr.kind {
+        ExprKind::Symbol(s) if s != "..." => {
+            if !pattern_vars.contains(s) && !out.contains(s) {
+                out.push(s.clone());
+            }
+        }
+        ExprKind::List(elems) => {
+            for e in elems {
+                collect_template_free_vars(e, pattern_vars, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+const SPECIAL_FORMS: &[&str] = &[
+    "define", "if", "quote", "lambda", "and", "or", "begin",
+    "let", "cond", "set!", "string-set!", "define-syntax", "syntax-rules",
+];
+
+fn is_ellipsis(expr: &Expr) -> bool {
+    matches!(&expr.kind, ExprKind::Symbol(s) if s == "...")
+}
+
+fn expand_ellipsis_element(
+    sub: &Expr,
+    bindings: &HashMap<String, MacroBinding>,
+    renames: &HashMap<String, String>,
+    result: &mut Vec<Expr>,
+) {
+    let Some(var_name) = find_ellipsis_var(sub, bindings) else { return };
+    let Some(MacroBinding::Many(exprs)) = bindings.get(&var_name) else { return };
+    if matches!(&sub.kind, ExprKind::Symbol(sn) if sn == &var_name) {
+        result.extend(exprs.iter().cloned());
+    } else {
+        for expr in exprs {
+            let mut sub_bindings = bindings.clone();
+            sub_bindings.insert(var_name.clone(), MacroBinding::Single(expr.clone()));
+            result.push(expand_template(sub, &sub_bindings, renames));
+        }
+    }
+}
+
+fn expand_template(
+    template: &Expr,
+    bindings: &HashMap<String, MacroBinding>,
+    renames: &HashMap<String, String>,
+) -> Expr {
+    match &template.kind {
+        ExprKind::Symbol(s) => {
+            if let Some(binding) = bindings.get(s) {
+                match binding {
+                    MacroBinding::Single(e) => e.clone(),
+                    MacroBinding::Many(_) => template.clone(),
+                }
+            } else if let Some(new_name) = renames.get(s) {
+                Expr::new(ExprKind::Symbol(new_name.clone()), template.span)
+            } else {
+                template.clone()
+            }
+        }
+        ExprKind::List(elems) => {
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                if i + 1 < elems.len() && is_ellipsis(&elems[i + 1]) {
+                    expand_ellipsis_element(&elems[i], bindings, renames, &mut result);
+                    i += 2;
+                    continue;
+                }
+                result.push(expand_template(&elems[i], bindings, renames));
+                i += 1;
+            }
+            Expr::new(ExprKind::List(result), template.span)
+        }
+        _ => template.clone(),
+    }
+}
+
+fn eval_macro_call(
+    elems: &[Expr],
+    literals: &[String],
+    rules: &[(Expr, Expr)],
+    def_env: &Env,
+    use_env: &Env,
+    span: Span,
+) -> Result<Val, EvalError> {
+    for (pattern, template) in rules {
+        let pat_elems = match &pattern.kind {
+            ExprKind::List(e) => e,
+            _ => continue,
+        };
+        let mut bindings = HashMap::new();
+        if match_pattern_list(&pat_elems[1..], &elems[1..], literals, &mut bindings) {
+            let pattern_vars: Vec<String> = bindings.keys().cloned().collect();
+            let mut free_vars = Vec::new();
+            collect_template_free_vars(template, &pattern_vars, &mut free_vars);
+
+            let mut renames = HashMap::new();
+            for sym in &free_vars {
+                if SPECIAL_FORMS.contains(&sym.as_str()) {
+                    continue;
+                }
+                if def_env.get(sym).is_some() {
+                    renames.insert(sym.clone(), gensym(sym));
+                }
+            }
+
+            let expanded = expand_template(template, &bindings, &renames);
+
+            if renames.is_empty() {
+                return eval(&expanded, use_env);
+            } else {
+                let new_env = use_env.push();
+                for (orig, gs) in &renames {
+                    if let Some(val) = def_env.get(orig) {
+                        new_env.define(gs.clone(), val);
+                    }
+                }
+                return eval(&expanded, &new_env);
+            }
+        }
+    }
+    Err(EvalError::Runtime(format!("no matching syntax rule at {span}")))
+}
+
+fn eval_define_syntax(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity(format!("define-syntax: expected 2 arguments at {span}")));
+    }
+    let name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Parse(format!("define-syntax: expected symbol at {span}"))),
+    };
+    let transformer = match &args[1].kind {
+        ExprKind::List(elems) => elems,
+        _ => return Err(EvalError::Parse(format!("define-syntax: expected syntax-rules at {span}"))),
+    };
+    if transformer.is_empty()
+        || !matches!(&transformer[0].kind, ExprKind::Symbol(s) if s == "syntax-rules")
+    {
+        return Err(EvalError::Parse(format!("define-syntax: expected syntax-rules at {span}")));
+    }
+    if transformer.len() < 2 {
+        return Err(EvalError::Parse(format!("syntax-rules: missing literals at {span}")));
+    }
+    let literals = match &transformer[1].kind {
+        ExprKind::List(lits) => lits
+            .iter()
+            .map(|e| match &e.kind {
+                ExprKind::Symbol(s) => Ok(s.clone()),
+                _ => Err(EvalError::Parse(format!(
+                    "syntax-rules: expected literal symbol at {span}"
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => {
+            return Err(EvalError::Parse(format!(
+                "syntax-rules: expected literals list at {span}"
+            )))
+        }
+    };
+    let mut rules = Vec::new();
+    for rule_expr in &transformer[2..] {
+        match &rule_expr.kind {
+            ExprKind::List(parts) if parts.len() == 2 => {
+                rules.push((parts[0].clone(), parts[1].clone()));
+            }
+            _ => {
+                return Err(EvalError::Parse(format!(
+                    "syntax-rules: invalid rule at {span}"
+                )))
+            }
+        }
+    }
+    env.define(
+        name,
+        Val::Macro {
+            literals,
+            rules,
+            def_env: env.clone(),
+        },
+    );
+    Ok(Val::Void)
 }
 
 fn eval_define(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
@@ -734,313 +1041,6 @@ fn eval_cond(clauses: &[Expr], env: &Env) -> Result<Val, EvalError> {
     Ok(Val::Void)
 }
 
-fn require_ints(args: &[Val], op: &str) -> Result<Vec<i64>, EvalError> {
-    args.iter().map(|a| match a {
-        Val::Int(n) => Ok(*n),
-        _ => Err(EvalError::Type(format!("{op}: expected number"))),
-    }).collect()
-}
-
-fn builtin_add(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    let nums = require_ints(args, "+")?;
-    Ok(Val::Int(nums.iter().sum()))
-}
-
-fn builtin_sub(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.is_empty() {
-        return Err(EvalError::Arity("-: need at least 1 argument".into()));
-    }
-    let nums = require_ints(args, "-")?;
-    if nums.len() == 1 {
-        Ok(Val::Int(-nums[0]))
-    } else {
-        Ok(Val::Int(nums[0] - nums[1..].iter().sum::<i64>()))
-    }
-}
-
-fn builtin_mul(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    let nums = require_ints(args, "*")?;
-    Ok(Val::Int(nums.iter().product()))
-}
-
-fn builtin_div(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::Arity("/: need at least 2 arguments".into()));
-    }
-    let nums = require_ints(args, "/")?;
-    if nums[1..].contains(&0) {
-        return Err(EvalError::Runtime("division by zero".into()));
-    }
-    let mut result = nums[0];
-    for &n in &nums[1..] {
-        result /= n;
-    }
-    Ok(Val::Int(result))
-}
-
-fn builtin_lt(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    let nums = require_ints(args, "<")?;
-    Ok(Val::Bool(nums.windows(2).all(|w| w[0] < w[1])))
-}
-
-fn builtin_gt(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    let nums = require_ints(args, ">")?;
-    Ok(Val::Bool(nums.windows(2).all(|w| w[0] > w[1])))
-}
-
-fn builtin_eq(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    let nums = require_ints(args, "=")?;
-    Ok(Val::Bool(nums.windows(2).all(|w| w[0] == w[1])))
-}
-
-fn builtin_le(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    let nums = require_ints(args, "<=")?;
-    Ok(Val::Bool(nums.windows(2).all(|w| w[0] <= w[1])))
-}
-
-fn builtin_ge(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    let nums = require_ints(args, ">=")?;
-    Ok(Val::Bool(nums.windows(2).all(|w| w[0] >= w[1])))
-}
-
-fn builtin_not(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity("not: expected 1 argument".into()));
-    }
-    Ok(Val::Bool(!args[0].is_truthy()))
-}
-
-fn builtin_cons(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 2 {
-        return Err(EvalError::Arity("cons: expected 2 arguments".into()));
-    }
-    match &args[1] {
-        Val::List(elems) => {
-            let mut new = vec![args[0].clone()];
-            new.extend(elems.iter().cloned());
-            Ok(Val::List(new))
-        }
-        _ => {
-            Ok(Val::Pair(Box::new(args[0].clone()), Box::new(args[1].clone())))
-        }
-    }
-}
-
-fn builtin_car(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity("car: expected 1 argument".into()));
-    }
-    match &args[0] {
-        Val::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
-        Val::Pair(a, _) => Ok(a.as_ref().clone()),
-        _ => Err(EvalError::Type("car: expected non-empty list".into())),
-    }
-}
-
-fn builtin_cdr(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity("cdr: expected 1 argument".into()));
-    }
-    match &args[0] {
-        Val::List(elems) if !elems.is_empty() => Ok(Val::List(elems[1..].to_vec())),
-        Val::Pair(_, b) => Ok(b.as_ref().clone()),
-        _ => Err(EvalError::Type("cdr: expected non-empty list".into())),
-    }
-}
-
-fn builtin_list(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    Ok(Val::List(args.to_vec()))
-}
-
-fn builtin_null(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity("null?: expected 1 argument".into()));
-    }
-    Ok(Val::Bool(matches!(&args[0], Val::List(v) if v.is_empty())))
-}
-
-fn builtin_length(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity("length: expected 1 argument".into()));
-    }
-    match &args[0] {
-        Val::List(elems) => Ok(Val::Int(elems.len() as i64)),
-        _ => Err(EvalError::Type("length: expected list".into())),
-    }
-}
-
-fn builtin_append(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    let mut result = Vec::new();
-    for arg in args {
-        match arg {
-            Val::List(elems) => result.extend(elems.iter().cloned()),
-            _ => return Err(EvalError::Type("append: expected list".into())),
-        }
-    }
-    Ok(Val::List(result))
-}
-
-fn builtin_is_boolean(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("boolean?: expected 1 argument".into())); }
-    Ok(Val::Bool(matches!(args[0], Val::Bool(_))))
-}
-
-fn builtin_is_number(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("number?: expected 1 argument".into())); }
-    Ok(Val::Bool(matches!(args[0], Val::Int(_))))
-}
-
-fn builtin_is_string(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("string?: expected 1 argument".into())); }
-    Ok(Val::Bool(matches!(args[0], Val::Str(_))))
-}
-
-fn builtin_is_symbol(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("symbol?: expected 1 argument".into())); }
-    Ok(Val::Bool(matches!(args[0], Val::Symbol(_))))
-}
-
-fn builtin_is_pair(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("pair?: expected 1 argument".into())); }
-    Ok(Val::Bool(matches!(&args[0], Val::List(v) if !v.is_empty()) || matches!(&args[0], Val::Pair(_, _))))
-}
-
-fn builtin_is_char(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("char?: expected 1 argument".into())); }
-    Ok(Val::Bool(matches!(args[0], Val::Char(_))))
-}
-
-/// Format a value for `display` (no quotes on strings).
-fn display_format(val: &Val) -> String {
-    match val {
-        Val::Str(s) => s.clone(),
-        Val::Char(c) => c.to_string(),
-        Val::List(elems) => {
-            let mut out = String::from("(");
-            for (i, e) in elems.iter().enumerate() {
-                if i > 0 { out.push(' '); }
-                out.push_str(&display_format(e));
-            }
-            out.push(')');
-            out
-        }
-        Val::Pair(a, b) => {
-            let mut out = format!("({}", display_format(a));
-            let mut cur = b.as_ref();
-            loop {
-                match cur {
-                    Val::Pair(ca, cb) => {
-                        out.push_str(&format!(" {}", display_format(ca)));
-                        cur = cb.as_ref();
-                    }
-                    Val::List(v) if v.is_empty() => break,
-                    other => { out.push_str(&format!(" . {}", display_format(other))); break; }
-                }
-            }
-            out.push(')');
-            out
-        }
-        other => other.to_string(),
-    }
-}
-
-fn builtin_display(args: &[Val], env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("display: expected 1 argument".into())); }
-    let text = display_format(&args[0]);
-    env.output.borrow_mut().push_str(&text);
-    Ok(Val::Void)
-}
-
-fn builtin_write(args: &[Val], env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("write: expected 1 argument".into())); }
-    let text = args[0].to_string();
-    env.output.borrow_mut().push_str(&text);
-    Ok(Val::Void)
-}
-
-fn builtin_newline(args: &[Val], env: &Env) -> Result<Val, EvalError> {
-    if !args.is_empty() { return Err(EvalError::Arity("newline: expected 0 arguments".into())); }
-    env.output.borrow_mut().push('\n');
-    Ok(Val::Void)
-}
-
-fn builtin_string_append(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    let mut result = String::new();
-    for arg in args {
-        match arg {
-            Val::Str(s) => result.push_str(s),
-            _ => return Err(EvalError::Type("string-append: expected string".into())),
-        }
-    }
-    Ok(Val::Str(result))
-}
-
-fn builtin_string_length(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("string-length: expected 1 argument".into())); }
-    match &args[0] {
-        Val::Str(s) => Ok(Val::Int(s.chars().count() as i64)),
-        _ => Err(EvalError::Type("string-length: expected string".into())),
-    }
-}
-
-fn builtin_substring(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 3 { return Err(EvalError::Arity("substring: expected 3 arguments".into())); }
-    let s = match &args[0] { Val::Str(s) => s, _ => return Err(EvalError::Type("substring: expected string".into())) };
-    let start = match &args[1] { Val::Int(n) => *n as usize, _ => return Err(EvalError::Type("substring: expected integer".into())) };
-    let end = match &args[2] { Val::Int(n) => *n as usize, _ => return Err(EvalError::Type("substring: expected integer".into())) };
-    let chars: Vec<char> = s.chars().collect();
-    if start > end || end > chars.len() {
-        return Err(EvalError::Runtime("substring: index out of range".into()));
-    }
-    Ok(Val::Str(chars[start..end].iter().collect()))
-}
-
-fn builtin_string_to_number(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("string->number: expected 1 argument".into())); }
-    match &args[0] {
-        Val::Str(s) => match s.parse::<i64>() {
-            Ok(n) => Ok(Val::Int(n)),
-            Err(_) => Ok(Val::Bool(false)),
-        },
-        _ => Err(EvalError::Type("string->number: expected string".into())),
-    }
-}
-
-fn builtin_number_to_string(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("number->string: expected 1 argument".into())); }
-    match &args[0] {
-        Val::Int(n) => Ok(Val::Str(n.to_string())),
-        _ => Err(EvalError::Type("number->string: expected number".into())),
-    }
-}
-
-fn builtin_symbol_to_string(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("symbol->string: expected 1 argument".into())); }
-    match &args[0] {
-        Val::Symbol(s) => Ok(Val::Str(s.clone())),
-        _ => Err(EvalError::Type("symbol->string: expected symbol".into())),
-    }
-}
-
-fn builtin_string_to_symbol(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("string->symbol: expected 1 argument".into())); }
-    match &args[0] {
-        Val::Str(s) => Ok(Val::Symbol(s.clone())),
-        _ => Err(EvalError::Type("string->symbol: expected string".into())),
-    }
-}
-
-fn builtin_string_ref(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 2 { return Err(EvalError::Arity("string-ref: expected 2 arguments".into())); }
-    let s = match &args[0] { Val::Str(s) => s, _ => return Err(EvalError::Type("string-ref: expected string".into())) };
-    let idx = match &args[1] { Val::Int(n) => *n as usize, _ => return Err(EvalError::Type("string-ref: expected integer".into())) };
-    let chars: Vec<char> = s.chars().collect();
-    if idx >= chars.len() {
-        return Err(EvalError::Runtime("string-ref: index out of range".into()));
-    }
-    Ok(Val::Char(chars[idx]))
-}
-
 fn eval_string_set(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
     if args.len() != 3 {
         return Err(EvalError::Arity(format!("string-set!: expected 3 arguments at {span}")));
@@ -1069,264 +1069,6 @@ fn eval_string_set(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalErro
         env.set(name, Val::Str(s))?;
     }
     Ok(Val::Void)
-}
-
-fn builtin_string_copy(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity("string-copy: expected 1 argument".into()));
-    }
-    match &args[0] {
-        Val::Str(s) => Ok(Val::Str(s.clone())),
-        _ => Err(EvalError::Type("string-copy: expected string".into())),
-    }
-}
-
-fn vals_equal(a: &Val, b: &Val) -> bool {
-    match (a, b) {
-        (Val::Int(x), Val::Int(y)) => x == y,
-        (Val::Bool(x), Val::Bool(y)) => x == y,
-        (Val::Str(x), Val::Str(y)) => x == y,
-        (Val::Char(x), Val::Char(y)) => x == y,
-        (Val::Symbol(x), Val::Symbol(y)) => x == y,
-        (Val::List(x), Val::List(y)) => x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| vals_equal(a, b)),
-        (Val::Pair(a1, b1), Val::Pair(a2, b2)) => vals_equal(a1, a2) && vals_equal(b1, b2),
-        _ => false,
-    }
-}
-
-fn builtin_equal(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 2 { return Err(EvalError::Arity("equal?: expected 2 arguments".into())); }
-    Ok(Val::Bool(vals_equal(&args[0], &args[1])))
-}
-
-fn builtin_eq_pred(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 2 { return Err(EvalError::Arity("eq?: expected 2 arguments".into())); }
-    let result = match (&args[0], &args[1]) {
-        (Val::Bool(a), Val::Bool(b)) => a == b,
-        (Val::Int(a), Val::Int(b)) => a == b,
-        (Val::Char(a), Val::Char(b)) => a == b,
-        (Val::Symbol(a), Val::Symbol(b)) => a == b,
-        (Val::List(a), Val::List(b)) => a.is_empty() && b.is_empty(),
-        _ => false,
-    };
-    Ok(Val::Bool(result))
-}
-
-fn builtin_abs(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("abs: expected 1 argument".into())); }
-    match &args[0] { Val::Int(n) => Ok(Val::Int(n.abs())), _ => Err(EvalError::Type("abs: expected number".into())) }
-}
-
-fn builtin_modulo(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 2 { return Err(EvalError::Arity("modulo: expected 2 arguments".into())); }
-    let nums = require_ints(args, "modulo")?;
-    if nums[1] == 0 { return Err(EvalError::Runtime("modulo: division by zero".into())); }
-    Ok(Val::Int(((nums[0] % nums[1]) + nums[1]) % nums[1]))
-}
-
-fn builtin_remainder(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 2 { return Err(EvalError::Arity("remainder: expected 2 arguments".into())); }
-    let nums = require_ints(args, "remainder")?;
-    if nums[1] == 0 { return Err(EvalError::Runtime("remainder: division by zero".into())); }
-    Ok(Val::Int(nums[0] % nums[1]))
-}
-
-fn builtin_quotient(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 2 { return Err(EvalError::Arity("quotient: expected 2 arguments".into())); }
-    let nums = require_ints(args, "quotient")?;
-    if nums[1] == 0 { return Err(EvalError::Runtime("quotient: division by zero".into())); }
-    Ok(Val::Int(nums[0] / nums[1]))
-}
-
-fn builtin_min(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.is_empty() { return Err(EvalError::Arity("min: need at least 1 argument".into())); }
-    let nums = require_ints(args, "min")?;
-    Ok(Val::Int(*nums.iter().min().expect("non-empty after arity check")))
-}
-
-fn builtin_max(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.is_empty() { return Err(EvalError::Arity("max: need at least 1 argument".into())); }
-    let nums = require_ints(args, "max")?;
-    Ok(Val::Int(*nums.iter().max().expect("non-empty after arity check")))
-}
-
-fn builtin_expt(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 2 { return Err(EvalError::Arity("expt: expected 2 arguments".into())); }
-    let nums = require_ints(args, "expt")?;
-    Ok(Val::Int((nums[0] as i64).pow(nums[1] as u32)))
-}
-
-fn builtin_zero(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("zero?: expected 1 argument".into())); }
-    match &args[0] { Val::Int(n) => Ok(Val::Bool(*n == 0)), _ => Err(EvalError::Type("zero?: expected number".into())) }
-}
-
-fn builtin_positive(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("positive?: expected 1 argument".into())); }
-    match &args[0] { Val::Int(n) => Ok(Val::Bool(*n > 0)), _ => Err(EvalError::Type("positive?: expected number".into())) }
-}
-
-fn builtin_negative(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("negative?: expected 1 argument".into())); }
-    match &args[0] { Val::Int(n) => Ok(Val::Bool(*n < 0)), _ => Err(EvalError::Type("negative?: expected number".into())) }
-}
-
-fn builtin_odd(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("odd?: expected 1 argument".into())); }
-    match &args[0] { Val::Int(n) => Ok(Val::Bool(n % 2 != 0)), _ => Err(EvalError::Type("odd?: expected number".into())) }
-}
-
-fn builtin_even(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("even?: expected 1 argument".into())); }
-    match &args[0] { Val::Int(n) => Ok(Val::Bool(n % 2 == 0)), _ => Err(EvalError::Type("even?: expected number".into())) }
-}
-
-fn builtin_list_ref(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 2 { return Err(EvalError::Arity("list-ref: expected 2 arguments".into())); }
-    let idx = match &args[1] { Val::Int(n) => *n as usize, _ => return Err(EvalError::Type("list-ref: expected integer".into())) };
-    match &args[0] {
-        Val::List(elems) => elems.get(idx).cloned().ok_or_else(|| EvalError::Runtime("list-ref: index out of range".into())),
-        _ => Err(EvalError::Type("list-ref: expected list".into())),
-    }
-}
-
-fn builtin_list_tail(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 2 { return Err(EvalError::Arity("list-tail: expected 2 arguments".into())); }
-    let idx = match &args[1] { Val::Int(n) => *n as usize, _ => return Err(EvalError::Type("list-tail: expected integer".into())) };
-    match &args[0] {
-        Val::List(elems) => {
-            if idx > elems.len() { return Err(EvalError::Runtime("list-tail: index out of range".into())); }
-            Ok(Val::List(elems[idx..].to_vec()))
-        }
-        _ => Err(EvalError::Type("list-tail: expected list".into())),
-    }
-}
-
-fn builtin_is_list(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("list?: expected 1 argument".into())); }
-    Ok(Val::Bool(matches!(&args[0], Val::List(_))))
-}
-
-fn builtin_assoc(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 2 { return Err(EvalError::Arity("assoc: expected 2 arguments".into())); }
-    let key = &args[0];
-    match &args[1] {
-        Val::List(alist) => {
-            for entry in alist {
-                match entry {
-                    Val::List(pair) if !pair.is_empty() => {
-                        if vals_equal(key, &pair[0]) {
-                            return Ok(entry.clone());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Val::Bool(false))
-        }
-        _ => Err(EvalError::Type("assoc: expected list".into())),
-    }
-}
-
-fn builtin_map(args: &[Val], env: &Env) -> Result<Val, EvalError> {
-    if args.len() < 2 { return Err(EvalError::Arity("map: expected at least 2 arguments".into())); }
-    let func = &args[0];
-    let lists: Vec<&Vec<Val>> = args[1..].iter().map(|a| match a {
-        Val::List(v) => Ok(v),
-        _ => Err(EvalError::Type("map: expected list".into())),
-    }).collect::<Result<_, _>>()?;
-    let len = lists[0].len();
-    let mut result = Vec::with_capacity(len);
-    for i in 0..len {
-        let call_args: Vec<Val> = lists.iter().map(|l| l[i].clone()).collect();
-        result.push(apply_val(func, &call_args, env)?);
-    }
-    Ok(Val::List(result))
-}
-
-fn builtin_char_alphabetic(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("char-alphabetic?: expected 1 argument".into())); }
-    match &args[0] { Val::Char(c) => Ok(Val::Bool(c.is_alphabetic())), _ => Err(EvalError::Type("char-alphabetic?: expected char".into())) }
-}
-
-fn builtin_char_numeric(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("char-numeric?: expected 1 argument".into())); }
-    match &args[0] { Val::Char(c) => Ok(Val::Bool(c.is_ascii_digit())), _ => Err(EvalError::Type("char-numeric?: expected char".into())) }
-}
-
-fn builtin_char_upcase(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("char-upcase: expected 1 argument".into())); }
-    match &args[0] { Val::Char(c) => Ok(Val::Char(c.to_ascii_uppercase())), _ => Err(EvalError::Type("char-upcase: expected char".into())) }
-}
-
-fn builtin_char_downcase(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("char-downcase: expected 1 argument".into())); }
-    match &args[0] { Val::Char(c) => Ok(Val::Char(c.to_ascii_lowercase())), _ => Err(EvalError::Type("char-downcase: expected char".into())) }
-}
-
-fn builtin_char_eq(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 2 { return Err(EvalError::Arity("char=?: expected 2 arguments".into())); }
-    match (&args[0], &args[1]) {
-        (Val::Char(a), Val::Char(b)) => Ok(Val::Bool(a == b)),
-        _ => Err(EvalError::Type("char=?: expected chars".into())),
-    }
-}
-
-fn builtin_char_lt(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 2 { return Err(EvalError::Arity("char<?: expected 2 arguments".into())); }
-    match (&args[0], &args[1]) {
-        (Val::Char(a), Val::Char(b)) => Ok(Val::Bool(a < b)),
-        _ => Err(EvalError::Type("char<?: expected chars".into())),
-    }
-}
-
-fn builtin_string_eq(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 2 { return Err(EvalError::Arity("string=?: expected 2 arguments".into())); }
-    match (&args[0], &args[1]) {
-        (Val::Str(a), Val::Str(b)) => Ok(Val::Bool(a == b)),
-        _ => Err(EvalError::Type("string=?: expected strings".into())),
-    }
-}
-
-fn builtin_string_lt(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 2 { return Err(EvalError::Arity("string<?: expected 2 arguments".into())); }
-    match (&args[0], &args[1]) {
-        (Val::Str(a), Val::Str(b)) => Ok(Val::Bool(a < b)),
-        _ => Err(EvalError::Type("string<?: expected strings".into())),
-    }
-}
-
-fn builtin_string_ci_eq(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 2 { return Err(EvalError::Arity("string-ci=?: expected 2 arguments".into())); }
-    match (&args[0], &args[1]) {
-        (Val::Str(a), Val::Str(b)) => Ok(Val::Bool(a.to_lowercase() == b.to_lowercase())),
-        _ => Err(EvalError::Type("string-ci=?: expected strings".into())),
-    }
-}
-
-fn builtin_string_upcase(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("string-upcase: expected 1 argument".into())); }
-    match &args[0] { Val::Str(s) => Ok(Val::Str(s.to_uppercase())), _ => Err(EvalError::Type("string-upcase: expected string".into())) }
-}
-
-fn builtin_string_downcase(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
-    if args.len() != 1 { return Err(EvalError::Arity("string-downcase: expected 1 argument".into())); }
-    match &args[0] { Val::Str(s) => Ok(Val::Str(s.to_lowercase())), _ => Err(EvalError::Type("string-downcase: expected string".into())) }
-}
-
-fn builtin_apply(args: &[Val], env: &Env) -> Result<Val, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::Arity("apply: expected at least 2 arguments".into()));
-    }
-    let func = &args[0];
-    let last = &args[args.len() - 1];
-    let tail = match last {
-        Val::List(v) => v.clone(),
-        _ => return Err(EvalError::Type("apply: last argument must be a list".into())),
-    };
-    let mut all_args: Vec<Val> = args[1..args.len() - 1].to_vec();
-    all_args.extend(tail);
-    apply_val(func, &all_args, env)
 }
 
 /// Evaluate one or more Scheme expressions and return the string
