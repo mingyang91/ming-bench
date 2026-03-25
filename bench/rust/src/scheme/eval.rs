@@ -40,11 +40,12 @@ pub struct Evaluator {
     env: Env,
     output: String,
     gensym_counter: u64,
+    record_type_counter: u64,
 }
 
 impl Evaluator {
     pub fn new() -> Self {
-        Evaluator { env: Env::new(), output: String::new(), gensym_counter: 0 }
+        Evaluator { env: Env::new(), output: String::new(), gensym_counter: 0, record_type_counter: 0 }
     }
 
     pub fn eval(&mut self, expr: &Expr) -> Result<Value, EvalError> {
@@ -120,6 +121,7 @@ impl Evaluator {
                 "or" => return self.eval_or(&elems[1..], env),
                 "set!" => return self.eval_set(&elems[1..], env, call_pos),
                 "define-syntax" => return self.eval_define_syntax(&elems[1..], env, call_pos),
+                "define-record-type" => return self.eval_define_record_type(&elems[1..], env, call_pos),
                 "string-set!" => return self.eval_string_set(&elems[1..], env, call_pos),
                 "not" => {
                     if elems.len() != 2 {
@@ -153,6 +155,38 @@ impl Evaluator {
                 self.call_lambda(&data, args, call_pos)
             }
             Value::Symbol(name) => self.apply_builtin(name, &args, call_pos),
+            Value::RecordConstructor(type_id, num_fields) => {
+                if args.len() != *num_fields {
+                    return Err(EvalError::Arity(format!(
+                        "record constructor: expected {} arguments, got {} at {call_pos}",
+                        num_fields, args.len()
+                    )));
+                }
+                Ok(Value::Record(*type_id, args))
+            }
+            Value::RecordPredicate(type_id) => {
+                if args.len() != 1 {
+                    return Err(EvalError::Arity(format!(
+                        "record predicate: expected 1 argument, got {} at {call_pos}",
+                        args.len()
+                    )));
+                }
+                Ok(Value::Boolean(matches!(&args[0], Value::Record(tid, _) if tid == type_id)))
+            }
+            Value::RecordAccessor(type_id, field_idx) => {
+                if args.len() != 1 {
+                    return Err(EvalError::Arity(format!(
+                        "record accessor: expected 1 argument, got {} at {call_pos}",
+                        args.len()
+                    )));
+                }
+                match &args[0] {
+                    Value::Record(tid, fields) if tid == type_id => {
+                        Ok(fields[*field_idx].clone())
+                    }
+                    _ => Err(EvalError::Type(format!("record accessor: wrong record type at {call_pos}"))),
+                }
+            }
             _ => {
                 if let ExprKind::Symbol(name) = &elems[0].kind {
                     return self.apply_builtin(name, &args, call_pos);
@@ -1210,6 +1244,75 @@ impl Evaluator {
         };
         let macro_data = self.parse_syntax_rules(&args[1], env, pos)?;
         env.define(name, Value::Macro(Rc::new(macro_data)));
+        Ok(Value::Void)
+    }
+
+    fn eval_define_record_type(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<Value, EvalError> {
+        // (define-record-type <name> (constructor field-names...) predicate (field accessor)...)
+        if args.len() < 3 {
+            return Err(EvalError::Parse(format!("define-record-type: too few arguments at {pos}")));
+        }
+        // args[0] = type name (ignored, just a tag like <point>)
+        // args[1] = (constructor-name field-name ...)
+        // args[2] = predicate-name
+        // args[3..] = (field-name accessor-name) ...
+
+        let type_id = self.record_type_counter;
+        self.record_type_counter += 1;
+
+        // Parse constructor: (make-point x y)
+        let ctor_elems = match &args[1].kind {
+            ExprKind::List(e) => e,
+            _ => return Err(EvalError::Parse(format!("define-record-type: expected constructor list at {pos}"))),
+        };
+        if ctor_elems.is_empty() {
+            return Err(EvalError::Parse(format!("define-record-type: empty constructor at {pos}")));
+        }
+        let ctor_name = match &ctor_elems[0].kind {
+            ExprKind::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Parse(format!("define-record-type: expected constructor name at {pos}"))),
+        };
+        let ctor_fields: Vec<String> = ctor_elems[1..].iter().map(|e| match &e.kind {
+            ExprKind::Symbol(s) => Ok(s.clone()),
+            _ => Err(EvalError::Parse(format!("define-record-type: expected field name at {pos}"))),
+        }).collect::<Result<Vec<_>, _>>()?;
+        let num_fields = ctor_fields.len();
+
+        // Parse predicate
+        let pred_name = match &args[2].kind {
+            ExprKind::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Parse(format!("define-record-type: expected predicate name at {pos}"))),
+        };
+
+        // Parse field accessors
+        for field_spec in &args[3..] {
+            let spec = match &field_spec.kind {
+                ExprKind::List(e) => e,
+                _ => return Err(EvalError::Parse(format!("define-record-type: expected field spec at {pos}"))),
+            };
+            if spec.len() < 2 {
+                return Err(EvalError::Parse(format!("define-record-type: field spec too short at {pos}")));
+            }
+            let field_name = match &spec[0].kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Parse(format!("define-record-type: expected field name at {pos}"))),
+            };
+            let accessor_name = match &spec[1].kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Parse(format!("define-record-type: expected accessor name at {pos}"))),
+            };
+            // Find the field index in the constructor field list
+            let field_idx = ctor_fields.iter().position(|f| f == &field_name)
+                .ok_or_else(|| EvalError::Parse(format!(
+                    "define-record-type: field {field_name} not in constructor at {pos}"
+                )))?;
+            env.define(accessor_name, Value::RecordAccessor(type_id, field_idx));
+        }
+
+        // Define constructor and predicate
+        env.define(ctor_name, Value::RecordConstructor(type_id, num_fields));
+        env.define(pred_name, Value::RecordPredicate(type_id));
+
         Ok(Value::Void)
     }
 
