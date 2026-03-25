@@ -20,7 +20,22 @@ object Evaluator:
     val result = exprs.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, env))
     (SchemeVal.display(result), output.toString)
 
+  /** Trampoline: repeatedly evaluate until result is not a TailCall. */
   def eval(expr: SchemeVal, env: Env): SchemeVal =
+    var result = evalStep(expr, env)
+    while result.isInstanceOf[SchemeVal.TailCall] do
+      val tc = result.asInstanceOf[SchemeVal.TailCall]
+      result = evalStep(tc.expr, tc.env)
+    result
+
+  /** Evaluate body expressions, returning TailCall for the last one. */
+  def evalBodyTail(body: List[SchemeVal], env: Env): SchemeVal =
+    if body.isEmpty then SchemeVal.Void
+    else
+      body.init.foreach(e => eval(e, env))
+      SchemeVal.TailCall(body.last, env)
+
+  private def evalStep(expr: SchemeVal, env: Env): SchemeVal =
     try
       expr match
         case SchemeVal.IntVal(_)              => expr
@@ -67,15 +82,15 @@ object Evaluator:
               env.lookup(name) match
                 case Some(m: SchemeVal.MacroVal) =>
                   val expanded = Macro.expand(m.name, m.literals, m.rules, m.defEnv, SchemeVal.SList(elems))
-                  eval(expanded, env)
+                  SchemeVal.TailCall(expanded, env)
                 case _ =>
                   val proc = eval(elems.head, env)
                   val args = elems.tail.map(a => eval(a, env))
-                  apply(proc, args)
+                  applyProc(proc, args)
             case head =>
               val proc = eval(head, env)
               val args = elems.tail.map(a => eval(a, env))
-              apply(proc, args)
+              applyProc(proc, args)
         case SchemeVal.DottedList(_, _) => throw new EvalError(s"cannot evaluate dotted list: $expr")
         case _                          => throw new EvalError(s"cannot evaluate: $expr")
     catch
@@ -111,10 +126,10 @@ object Evaluator:
   private def evalIf(args: List[SchemeVal], env: Env): SchemeVal =
     args match
       case cond :: thenBranch :: elseBranch :: Nil =>
-        if isTruthy(eval(cond, env)) then eval(thenBranch, env)
-        else eval(elseBranch, env)
+        if isTruthy(eval(cond, env)) then SchemeVal.TailCall(thenBranch, env)
+        else SchemeVal.TailCall(elseBranch, env)
       case cond :: thenBranch :: Nil =>
-        if isTruthy(eval(cond, env)) then eval(thenBranch, env)
+        if isTruthy(eval(cond, env)) then SchemeVal.TailCall(thenBranch, env)
         else SchemeVal.Void
       case _ => throw new EvalError("if: bad syntax")
 
@@ -157,7 +172,7 @@ object Evaluator:
   private def evalAnd(exprs: List[SchemeVal], env: Env): SchemeVal =
     exprs match
       case Nil         => SchemeVal.BoolVal(true)
-      case last :: Nil => eval(last, env)
+      case last :: Nil => SchemeVal.TailCall(last, env)
       case head :: tail =>
         val result = eval(head, env)
         if !isTruthy(result) then result else evalAnd(tail, env)
@@ -166,14 +181,16 @@ object Evaluator:
   private def evalOr(exprs: List[SchemeVal], env: Env): SchemeVal =
     exprs match
       case Nil         => SchemeVal.BoolVal(false)
-      case last :: Nil => eval(last, env)
+      case last :: Nil => SchemeVal.TailCall(last, env)
       case head :: tail =>
         val result = eval(head, env)
         if isTruthy(result) then result else evalOr(tail, env)
 
   private def evalBegin(exprs: List[SchemeVal], env: Env): SchemeVal =
     if exprs.isEmpty then SchemeVal.Void
-    else exprs.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, env))
+    else
+      exprs.init.foreach(e => eval(e, env))
+      SchemeVal.TailCall(exprs.last, env)
 
   private def evalDefineSyntax(args: List[SchemeVal], env: Env): SchemeVal =
     args match
@@ -227,5 +244,13 @@ object Evaluator:
     case SchemeVal.BoolVal(false) => false
     case _                        => true
 
-  def apply(proc: SchemeVal, args: List[SchemeVal]): SchemeVal =
+  /** Apply a procedure, returning TailCall for lambda bodies (TCO). */
+  def applyProc(proc: SchemeVal, args: List[SchemeVal]): SchemeVal =
     Apply(proc, args)
+
+  def apply(proc: SchemeVal, args: List[SchemeVal]): SchemeVal =
+    val result = applyProc(proc, args)
+    if result.isInstanceOf[SchemeVal.TailCall] then
+      val tc = result.asInstanceOf[SchemeVal.TailCall]
+      eval(tc.expr, tc.env)
+    else result

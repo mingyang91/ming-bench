@@ -19,6 +19,7 @@ enum SchemeVal:
   case CaseLambdaProc(clauses: List[(List[String], Option[String], List[SchemeVal])], closure: Env)
   case RecordVal(typeName: String, fields: scala.collection.mutable.Map[String, SchemeVal])
   case VectorVal(elems: Array[SchemeVal])
+  case TailCall(expr: SchemeVal, env: Env)
 
 object SchemeVal:
 

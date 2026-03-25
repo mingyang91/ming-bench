@@ -13,7 +13,7 @@ object BindingForms:
         val proc            = SchemeVal.LambdaProc(params, body, localEnv)
         localEnv.define(name, proc)
         params.zip(inits).foreach((p, v) => localEnv.define(p, v))
-        body.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => Evaluator.eval(e, localEnv))
+        Evaluator.evalBodyTail(body, localEnv)
       case SchemeVal.SList(bindings) :: body if body.nonEmpty =>
         val localEnv = new Env(scala.collection.mutable.Map.empty, Some(env))
         for b <- bindings do
@@ -21,7 +21,7 @@ object BindingForms:
             case SchemeVal.SList(List(SchemeVal.Symbol(name), valueExpr)) =>
               localEnv.define(name, Evaluator.eval(valueExpr, env))
             case _ => throw new EvalError("let: bad binding syntax")
-        body.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => Evaluator.eval(e, localEnv))
+        Evaluator.evalBodyTail(body, localEnv)
       case _ => throw new EvalError("let: bad syntax")
 
   private def parseBindings(
@@ -48,7 +48,7 @@ object BindingForms:
           case _                                   => throw new EvalError("letrec: bad binding syntax")
         }
         names.zip(values).foreach((n, v) => localEnv.define(n, v))
-        body.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => Evaluator.eval(e, localEnv))
+        Evaluator.evalBodyTail(body, localEnv)
       case _ => throw new EvalError("letrec: bad syntax")
 
   def evalLetrecStar(args: List[SchemeVal], env: Env): SchemeVal =
@@ -60,7 +60,7 @@ object BindingForms:
             case SchemeVal.SList(List(SchemeVal.Symbol(name), valueExpr)) =>
               localEnv.define(name, Evaluator.eval(valueExpr, localEnv))
             case _ => throw new EvalError("letrec*: bad binding syntax")
-        body.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => Evaluator.eval(e, localEnv))
+        Evaluator.evalBodyTail(body, localEnv)
       case _ => throw new EvalError("letrec*: bad syntax")
 
   def evalLetStar(args: List[SchemeVal], env: Env): SchemeVal =
@@ -72,7 +72,7 @@ object BindingForms:
             case SchemeVal.SList(List(SchemeVal.Symbol(name), valueExpr)) =>
               localEnv.define(name, Evaluator.eval(valueExpr, localEnv))
             case _ => throw new EvalError("let*: bad binding syntax")
-        body.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => Evaluator.eval(e, localEnv))
+        Evaluator.evalBodyTail(body, localEnv)
       case _ => throw new EvalError("let*: bad syntax")
 
   @tailrec
@@ -84,12 +84,12 @@ object BindingForms:
           case SchemeVal.SList(elems) if elems.nonEmpty =>
             elems.head match
               case SchemeVal.Symbol("else") =>
-                elems.tail.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => Evaluator.eval(e, env))
+                Evaluator.evalBodyTail(elems.tail, env)
               case test =>
                 val testVal = Evaluator.eval(test, env)
                 if Evaluator.isTruthy(testVal) then
                   if elems.tail.isEmpty then testVal
-                  else elems.tail.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => Evaluator.eval(e, env))
+                  else Evaluator.evalBodyTail(elems.tail, env)
                 else evalCond(rest, env)
           case _ => throw new EvalError("cond: bad clause")
 
@@ -107,10 +107,9 @@ object BindingForms:
           case SchemeVal.SList(elems) if elems.nonEmpty =>
             elems.head match
               case SchemeVal.Symbol("else") =>
-                elems.tail.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => Evaluator.eval(e, env))
+                Evaluator.evalBodyTail(elems.tail, env)
               case SchemeVal.SList(datums) =>
-                if datums.exists(d => schemeEqv(key, d)) then
-                  elems.tail.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => Evaluator.eval(e, env))
+                if datums.exists(d => schemeEqv(key, d)) then Evaluator.evalBodyTail(elems.tail, env)
                 else evalCaseClauses(key, rest, env)
               case _ => throw new EvalError("case: bad clause")
           case _ => throw new EvalError("case: bad clause")

@@ -24,7 +24,7 @@ object CollectionBuiltins:
           val len = lists.head.size
           val result = (0 until len).map { i =>
             val mapArgs = lists.map(_(i))
-            Apply(proc, mapArgs)
+            Evaluator.apply(proc, mapArgs)
           }.toList
           SchemeVal.SList(result)
       )
