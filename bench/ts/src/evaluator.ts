@@ -25,7 +25,8 @@ type SchemeVal =
   | { tag: 'record'; typeName: string; fields: Map<string, SchemeVal>; pos?: Pos }
   | { tag: 'case-lambda'; clauses: { params: string[]; rest?: string; body: SchemeVal[] }[]; env: Env; pos?: Pos }
   | { tag: 'vector'; elements: SchemeVal[]; pos?: Pos }
-  | { tag: 'continuation'; k: Cont; winds: WindEntry[]; pos?: Pos };
+  | { tag: 'continuation'; k: Cont; winds: WindEntry[]; pos?: Pos }
+  | { tag: 'values'; vals: SchemeVal[]; pos?: Pos };
 
 function posStr(pos?: Pos): string {
   return pos ? `${pos.line}:${pos.col}` : '?:?';
@@ -1107,6 +1108,12 @@ function makeGlobalEnv(): Env {
   defBuiltin('raise', (_args) => {
     throw new EvalError('raise: internal error - should be handled by CPS evaluator');
   });
+  defBuiltin('values', (_args) => {
+    throw new EvalError('values: internal error - should be handled by CPS evaluator');
+  });
+  defBuiltin('call-with-values', (_args) => {
+    throw new EvalError('call-with-values: internal error - should be handled by CPS evaluator');
+  });
   defBuiltin('with-exception-handler', (_args) => {
     throw new EvalError('with-exception-handler: internal error - should be handled by CPS evaluator');
   });
@@ -1400,7 +1407,7 @@ function isTruthy(val: SchemeVal): boolean {
 }
 
 function exprMayCallCC(expr: SchemeVal): boolean {
-  if (expr.tag === 'symbol') return expr.value === 'call/cc' || expr.value === 'call-with-current-continuation' || expr.value === 'dynamic-wind' || expr.value === 'raise' || expr.value === 'with-exception-handler' || expr.value === 'guard';
+  if (expr.tag === 'symbol') return expr.value === 'call/cc' || expr.value === 'call-with-current-continuation' || expr.value === 'dynamic-wind' || expr.value === 'raise' || expr.value === 'with-exception-handler' || expr.value === 'guard' || expr.value === 'values' || expr.value === 'call-with-values';
   if (expr.tag === 'list') return expr.elements.some(exprMayCallCC);
   return false;
 }
@@ -1547,6 +1554,18 @@ function applyCPS(func: SchemeVal, args: SchemeVal[], pos: Pos | undefined, k: C
       return applyCPS(thunk, [], pos, (result) => {
         exceptionHandlers.pop();
         return k(result);
+      });
+    }
+    if (func.name === 'values') {
+      if (args.length === 1) return k(args[0]);
+      return k({ tag: 'values', vals: args });
+    }
+    if (func.name === 'call-with-values') {
+      if (args.length !== 2) throw errAt('call-with-values: expected 2 arguments', pos);
+      const [producer, consumer] = args;
+      return applyCPS(producer, [], pos, (result) => {
+        const vals = result.tag === 'values' ? result.vals : [result];
+        return applyCPS(consumer, vals, pos, k);
       });
     }
     if (func.name === 'apply') {
@@ -2178,6 +2197,7 @@ function displayVal(val: SchemeVal, seen?: Set<SchemeVal>): string {
     case 'record': return `#<record:${val.typeName}>`;
     case 'vector': return `#(${val.elements.map(e => displayVal(e, seen)).join(' ')})`;
     case 'continuation': return '#<continuation>';
+    case 'values': return val.vals.map(v => displayVal(v, seen)).join('\n');
   }
 }
 
