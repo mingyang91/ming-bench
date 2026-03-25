@@ -116,13 +116,18 @@ type EvaluationContext = {
   output: string[];
 };
 
+type PairCell = {
+  car: SchemeValue;
+  cdr: SchemeValue;
+};
+
 type SchemeValue =
   | { type: 'number'; value: SchemeNumber }
   | { type: 'boolean'; value: boolean }
   | { type: 'string'; value: string; mutable: boolean }
   | { type: 'char'; value: string }
   | { type: 'symbol'; name: string }
-  | { type: 'list'; elements: SchemeValue[]; tail?: SchemeValue }
+  | { type: 'list'; pair?: PairCell }
   | { type: 'vector'; elements: SchemeValue[] }
   | { type: 'record'; recordType: RecordTypeDescriptor; fields: SchemeValue[] }
   | BuiltinProcedure
@@ -144,6 +149,7 @@ type MatchBindings = Map<string, MatchBinding>;
 
 const START_POSITION: SourcePosition = { line: 1, column: 1 };
 const VOID_VALUE: SchemeValue = { type: 'void' };
+const EMPTY_LIST: ListValue = { type: 'list' };
 const SPECIAL_FORM_NAMES = new Set([
   'define',
   'define-syntax',
@@ -157,6 +163,7 @@ const SPECIAL_FORM_NAMES = new Set([
   'or',
   'begin',
   'let',
+  'let*',
   'letrec',
   'letrec*',
   'cond',
@@ -551,6 +558,8 @@ function evaluateList(expr: Extract<Expr, { type: 'list' }>, env: Environment): 
         return evaluateBegin(args, env);
       case 'let':
         return evaluateLet(args, env, operator.position);
+      case 'let*':
+        return evaluateLetStar(args, env, operator.position);
       case 'letrec':
         return evaluateLetrec(args, env, operator.position, false);
       case 'letrec*':
@@ -841,6 +850,19 @@ function evaluateLet(args: Expr[], env: Environment, position: SourcePosition): 
   return evaluateSequenceOutcome(args.slice(1), letEnv);
 }
 
+function evaluateLetStar(args: Expr[], env: Environment, position: SourcePosition): EvalOutcome {
+  requireArgCountAtLeast('let*', args.length, 2, position);
+
+  const bindings = parseLetBindings('let*', args[0]);
+  const letStarEnv = new Environment(env);
+
+  for (const binding of bindings) {
+    letStarEnv.define(symbolKey(binding.name), evaluate(binding.value, letStarEnv));
+  }
+
+  return evaluateSequenceOutcome(args.slice(1), letStarEnv);
+}
+
 function evaluateCond(args: Expr[], env: Environment): EvalOutcome {
   for (const clause of args) {
     if (clause.type !== 'list' || clause.elements.length === 0) {
@@ -984,7 +1006,7 @@ function quoteExpr(expr: Expr): SchemeValue {
     case 'symbol':
       return { type: 'symbol', name: expr.name };
     case 'list':
-      return { type: 'list', elements: expr.elements.map(quoteExpr) };
+      return listValue(expr.elements.map(quoteExpr));
   }
 }
 
@@ -1979,10 +2001,7 @@ function applyClosureOutcome(
   }
 
   if (value.restParam !== undefined) {
-    callEnv.define(value.restParam, {
-      type: 'list',
-      elements: args.slice(value.params.length).map((arg) => arg.value),
-    });
+    callEnv.define(value.restParam, listValue(args.slice(value.params.length).map((arg) => arg.value)));
   }
 
   return evaluateSequenceOutcome(value.body, callEnv);
@@ -2111,6 +2130,39 @@ function createGlobalEnv(context: EvaluationContext): Environment {
   );
 
   env.define(
+    'gcd',
+    builtin('gcd', (args, callPosition) => {
+      if (args.length === 0) {
+        return numberValue(exactInteger(0n), callPosition);
+      }
+
+      let result = 0n;
+      for (const arg of args) {
+        result = greatestCommonDivisorBigInt(result, absBigInt(expectIntegerBigInt('gcd', arg)));
+      }
+
+      return integerResultValue(result, hasAnyInexactArgs(args), callPosition);
+    }),
+  );
+
+  env.define(
+    'lcm',
+    builtin('lcm', (args, callPosition) => {
+      if (args.length === 0) {
+        return numberValue(exactInteger(1n), callPosition);
+      }
+
+      let result = 1n;
+      for (const arg of args) {
+        const value = absBigInt(expectIntegerBigInt('lcm', arg));
+        result = leastCommonMultipleBigInt(result, value);
+      }
+
+      return integerResultValue(result, hasAnyInexactArgs(args), callPosition);
+    }),
+  );
+
+  env.define(
     'quotient',
     builtin('quotient', (args, callPosition) => {
       requireArgCount('quotient', args.length, 2, callPosition);
@@ -2182,6 +2234,22 @@ function createGlobalEnv(context: EvaluationContext): Environment {
       const base = expectNumber('expt', args[0]);
       const exponent = expectInteger('expt', args[1]);
       return numberValue(exptNumber(base, exponent, args[1].position), callPosition);
+    }),
+  );
+
+  env.define(
+    'truncate',
+    builtin('truncate', (args, callPosition) => {
+      requireArgCount('truncate', args.length, 1, callPosition);
+      return numberValue(truncateSchemeNumber(expectNumber('truncate', args[0]), args[0].position), callPosition);
+    }),
+  );
+
+  env.define(
+    'round',
+    builtin('round', (args, callPosition) => {
+      requireArgCount('round', args.length, 1, callPosition);
+      return numberValue(roundSchemeNumber(expectNumber('round', args[0]), args[0].position), callPosition);
     }),
   );
 
@@ -2277,7 +2345,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'car',
     builtin('car', (args, callPosition) => {
       requireArgCount('car', args.length, 1, callPosition);
-      return expectPair('car', args[0]).elements[0];
+      return expectPair('car', args[0]).pair.car;
     }),
   );
 
@@ -2286,6 +2354,33 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     builtin('cdr', (args, callPosition) => {
       requireArgCount('cdr', args.length, 1, callPosition);
       return cdrValue(expectPair('cdr', args[0]));
+    }),
+  );
+
+  env.define(
+    'cddr',
+    builtin('cddr', (args, callPosition) => {
+      requireArgCount('cddr', args.length, 1, callPosition);
+      const first = cdrValue(expectPair('cddr', args[0]));
+      return cdrValue(expectPair('cddr', { value: first, position: args[0].position }));
+    }),
+  );
+
+  env.define(
+    'set-car!',
+    builtin('set-car!', (args, callPosition) => {
+      requireArgCount('set-car!', args.length, 2, callPosition);
+      expectPair('set-car!', args[0]).pair.car = args[1].value;
+      return VOID_VALUE;
+    }),
+  );
+
+  env.define(
+    'set-cdr!',
+    builtin('set-cdr!', (args, callPosition) => {
+      requireArgCount('set-cdr!', args.length, 2, callPosition);
+      expectPair('set-cdr!', args[0]).pair.cdr = args[1].value;
+      return VOID_VALUE;
     }),
   );
 
@@ -2363,7 +2458,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'list->vector',
     builtin('list->vector', (args, callPosition) => {
       requireArgCount('list->vector', args.length, 1, callPosition);
-      return vectorValue([...expectList('list->vector', args[0]).elements]);
+      return vectorValue(listElements(expectList('list->vector', args[0])));
     }),
   );
 
@@ -2371,20 +2466,44 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'length',
     builtin('length', (args, callPosition) => {
       requireArgCount('length', args.length, 1, callPosition);
-      return numberValue(expectList('length', args[0]).elements.length, callPosition);
+      return numberValue(listLength(expectList('length', args[0])), callPosition);
+    }),
+  );
+
+  env.define(
+    'reverse',
+    builtin('reverse', (args, callPosition) => {
+      requireArgCount('reverse', args.length, 1, callPosition);
+
+      let result: ListValue = EMPTY_LIST;
+      let cursor: ListValue = expectList('reverse', args[0]);
+      while (isPairListValue(cursor)) {
+        result = consValue(cursor.pair.car, result);
+        cursor = cdrValue(cursor) as ListValue;
+      }
+
+      return result;
     }),
   );
 
   env.define(
     'append',
     builtin('append', (args) => {
-      const elements: SchemeValue[] = [];
-
-      for (const arg of args) {
-        elements.push(...expectList('append', arg).elements);
+      if (args.length === 0) {
+        return EMPTY_LIST;
       }
 
-      return listValue(elements);
+      const prefixElements: SchemeValue[] = [];
+      for (const arg of args.slice(0, -1)) {
+        prefixElements.push(...listElements(expectList('append', arg)));
+      }
+
+      const tail = args[args.length - 1].value;
+      if (prefixElements.length === 0) {
+        return tail;
+      }
+
+      return listValue(prefixElements, tail);
     }),
   );
 
@@ -2395,7 +2514,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
 
       const procedure = args[0].value;
       const finalListArg = args[args.length - 1];
-      const trailingArgs = expectList('apply', finalListArg).elements.map((value) => ({
+      const trailingArgs = listElements(expectList('apply', finalListArg)).map((value) => ({
         value,
         position: finalListArg.position,
       }));
@@ -2414,19 +2533,56 @@ function createGlobalEnv(context: EvaluationContext): Environment {
       requireArgCountAtLeast('map', args.length, 2, callPosition);
 
       const procedure = args[0].value;
-      const lists = args.slice(1).map((arg) => expectList('map', arg));
-      const resultLength = Math.min(...lists.map((list) => list.elements.length));
       const results: SchemeValue[] = [];
+      const cursors = args.slice(1).map((arg) => expectList('map', arg));
 
-      for (let index = 0; index < resultLength; index += 1) {
-        const mappedArgs = lists.map((list, listIndex) => ({
-          value: list.elements[index],
+      while (true) {
+        const pairs = cursors.map((cursor) => (isPairListValue(cursor) ? cursor : undefined));
+        if (pairs.some((pair) => pair === undefined)) {
+          break;
+        }
+
+        const mappedArgs = pairs.map((pair, listIndex) => ({
+          value: pair!.pair.car,
           position: args[listIndex + 1].position,
         }));
         results.push(applyProcedure(procedure, mappedArgs, callPosition));
+
+        for (let index = 0; index < cursors.length; index += 1) {
+          cursors[index] = cdrValue(pairs[index]!) as ListValue;
+        }
       }
 
       return listValue(results);
+    }),
+  );
+
+  env.define(
+    'for-each',
+    builtin('for-each', (args, callPosition) => {
+      requireArgCountAtLeast('for-each', args.length, 2, callPosition);
+
+      const procedure = args[0].value;
+      const cursors = args.slice(1).map((arg) => expectList('for-each', arg));
+
+      while (true) {
+        const pairs = cursors.map((cursor) => (isPairListValue(cursor) ? cursor : undefined));
+        if (pairs.some((pair) => pair === undefined)) {
+          break;
+        }
+
+        const appliedArgs = pairs.map((pair, listIndex) => ({
+          value: pair!.pair.car,
+          position: args[listIndex + 1].position,
+        }));
+        applyProcedure(procedure, appliedArgs, callPosition);
+
+        for (let index = 0; index < cursors.length; index += 1) {
+          cursors[index] = cdrValue(pairs[index]!) as ListValue;
+        }
+      }
+
+      return VOID_VALUE;
     }),
   );
 
@@ -2461,6 +2617,26 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'string-append',
     builtin('string-append', (args) =>
       stringValue(args.map((arg) => expectString('string-append', arg)).join('')),
+    ),
+  );
+
+  env.define(
+    'make-string',
+    builtin('make-string', (args, callPosition) => {
+      if (args.length !== 1 && args.length !== 2) {
+        throw new EvalError(`make-string: expected 1 or 2 argument(s), got ${args.length}`, callPosition);
+      }
+
+      const length = expectNonNegativeInteger('make-string', args[0]);
+      const fill = args[1] === undefined ? '\0' : expectChar('make-string', args[1]).value;
+      return stringValue(fill.repeat(length));
+    }),
+  );
+
+  env.define(
+    'string',
+    builtin('string', (args) =>
+      stringValue(args.map((arg) => expectChar('string', arg).value).join('')),
     ),
   );
 
@@ -2569,8 +2745,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'list->string',
     builtin('list->string', (args, callPosition) => {
       requireArgCount('list->string', args.length, 1, callPosition);
-      const list = expectList('list->string', args[0]);
-      const characters = list.elements.map((element) => {
+      const characters = listElements(expectList('list->string', args[0])).map((element) => {
         if (element.type !== 'char') {
           throw new EvalError('list->string: expected list of characters', args[0].position);
         }
@@ -2620,6 +2795,27 @@ function createGlobalEnv(context: EvaluationContext): Environment {
   );
 
   env.define(
+    'string>?',
+    builtin('string>?', (args, callPosition) =>
+      booleanValue(compareStringArgs('string>?', args, (a, b) => a > b, callPosition)),
+    ),
+  );
+
+  env.define(
+    'string<=?',
+    builtin('string<=?', (args, callPosition) =>
+      booleanValue(compareStringArgs('string<=?', args, (a, b) => a <= b, callPosition)),
+    ),
+  );
+
+  env.define(
+    'string>=?',
+    builtin('string>=?', (args, callPosition) =>
+      booleanValue(compareStringArgs('string>=?', args, (a, b) => a >= b, callPosition)),
+    ),
+  );
+
+  env.define(
     'string-ci=?',
     builtin('string-ci=?', (args, callPosition) =>
       booleanValue(
@@ -2653,11 +2849,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'null?',
     builtin('null?', (args, callPosition) => {
       requireArgCount('null?', args.length, 1, callPosition);
-      return booleanValue(
-        args[0].value.type === 'list' &&
-          args[0].value.elements.length === 0 &&
-          args[0].value.tail === undefined,
-      );
+      return booleanValue(isNullListValue(args[0].value));
     }),
   );
 
@@ -2665,7 +2857,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'pair?',
     builtin('pair?', (args, callPosition) => {
       requireArgCount('pair?', args.length, 1, callPosition);
-      return booleanValue(args[0].value.type === 'list' && args[0].value.elements.length > 0);
+      return booleanValue(isPairListValue(args[0].value));
     }),
   );
 
@@ -2787,11 +2979,11 @@ function createGlobalEnv(context: EvaluationContext): Environment {
       requireArgCount('list-ref', args.length, 2, callPosition);
       const list = expectList('list-ref', args[0]);
       const index = expectNonNegativeInteger('list-ref', args[1]);
-      if (index >= list.elements.length) {
+      if (index >= listLength(list)) {
         throw new EvalError('list-ref: index out of range', args[1].position);
       }
 
-      return list.elements[index];
+      return listRefValue(list, index);
     }),
   );
 
@@ -2801,11 +2993,11 @@ function createGlobalEnv(context: EvaluationContext): Environment {
       requireArgCount('list-tail', args.length, 2, callPosition);
       const list = expectList('list-tail', args[0]);
       const index = expectNonNegativeInteger('list-tail', args[1]);
-      if (index > list.elements.length) {
+      if (index > listLength(list)) {
         throw new EvalError('list-tail: index out of range', args[1].position);
       }
 
-      return listValue(list.elements.slice(index));
+      return listTailValue(list, index);
     }),
   );
 
@@ -2816,10 +3008,53 @@ function createGlobalEnv(context: EvaluationContext): Environment {
       const key = args[0].value;
       const alist = expectList('assoc', args[1]);
 
-      for (const entry of alist.elements) {
-        if (entry.type === 'list' && entry.elements.length > 0 && equalValues(entry.elements[0], key)) {
+      let cursor: ListValue = alist;
+      while (isPairListValue(cursor)) {
+        const entry = cursor.pair.car;
+        if (isPairListValue(entry) && equalValues(entry.pair.car, key)) {
           return entry;
         }
+
+        cursor = cdrValue(cursor) as ListValue;
+      }
+
+      return booleanValue(false);
+    }),
+  );
+
+  env.define(
+    'assv',
+    builtin('assv', (args, callPosition) => {
+      requireArgCount('assv', args.length, 2, callPosition);
+      const key = args[0].value;
+      let cursor: ListValue = expectList('assv', args[1]);
+
+      while (isPairListValue(cursor)) {
+        const entry = cursor.pair.car;
+        if (isPairListValue(entry) && eqvValues(entry.pair.car, key)) {
+          return entry;
+        }
+
+        cursor = cdrValue(cursor) as ListValue;
+      }
+
+      return booleanValue(false);
+    }),
+  );
+
+  env.define(
+    'member',
+    builtin('member', (args, callPosition) => {
+      requireArgCount('member', args.length, 2, callPosition);
+      const target = args[0].value;
+      let cursor: ListValue = expectList('member', args[1]);
+
+      while (isPairListValue(cursor)) {
+        if (equalValues(cursor.pair.car, target)) {
+          return cursor;
+        }
+
+        cursor = cdrValue(cursor) as ListValue;
       }
 
       return booleanValue(false);
@@ -3024,6 +3259,15 @@ function expectInteger(name: string, arg: EvaluatedArg): number {
   return integerToJs(value, arg.position);
 }
 
+function expectIntegerBigInt(name: string, arg: EvaluatedArg): bigint {
+  const value = expectNumber(name, arg);
+  if (!isIntegerNumber(value)) {
+    throw new EvalError(`${name}: expected integer`, arg.position);
+  }
+
+  return value.kind === 'exact' ? value.numerator : BigInt(integerToJs(value, arg.position));
+}
+
 function expectString(name: string, arg: EvaluatedArg): string {
   return expectStringValue(name, arg).value;
 }
@@ -3053,6 +3297,18 @@ function expectNonNegativeInteger(name: string, arg: EvaluatedArg): number {
   return value;
 }
 
+function hasAnyInexactArgs(args: EvaluatedArg[]): boolean {
+  return args.some((arg) => arg.value.type === 'number' && arg.value.value.kind === 'inexact');
+}
+
+function integerResultValue(
+  value: bigint,
+  inexact: boolean,
+  position?: SourcePosition,
+): SchemeValue {
+  return inexact ? numberValue(inexactNumber(Number(value), position), position) : numberValue(exactInteger(value), position);
+}
+
 function expectList(name: string, arg: EvaluatedArg): ListValue {
   const list = expectListValue(name, arg);
   if (!isProperList(list)) {
@@ -3078,10 +3334,10 @@ function expectVector(name: string, arg: EvaluatedArg): VectorValue {
   return arg.value;
 }
 
-function expectPair(name: string, arg: EvaluatedArg): ListValue {
+function expectPair(name: string, arg: EvaluatedArg): ListValue & { pair: PairCell } {
   const list = expectListValue(name, arg);
-  if (list.elements.length === 0) {
-    throw new EvalError(`${name}: expected non-empty list`, arg.position);
+  if (!isPairListValue(list)) {
+    throw new EvalError(`${name}: expected pair`, arg.position);
   }
 
   return list;
@@ -3107,32 +3363,149 @@ function expectRecord(
   return arg.value;
 }
 
-function listValue(elements: SchemeValue[], tail?: SchemeValue): ListValue {
-  return tail === undefined ? { type: 'list', elements } : { type: 'list', elements, tail };
+function pairValue(car: SchemeValue, cdr: SchemeValue): ListValue {
+  return { type: 'list', pair: { car, cdr } };
+}
+
+function listValue(elements: SchemeValue[], tail: SchemeValue = EMPTY_LIST): ListValue {
+  let result: SchemeValue = tail;
+
+  for (let index = elements.length - 1; index >= 0; index -= 1) {
+    result = pairValue(elements[index], result);
+  }
+
+  if (result.type !== 'list') {
+    throw new Error('internal error: list tail is not a list');
+  }
+
+  return result;
 }
 
 function vectorValue(elements: SchemeValue[]): VectorValue {
   return { type: 'vector', elements };
 }
 
+function isNullListValue(value: SchemeValue): value is ListValue & { pair?: undefined } {
+  return value.type === 'list' && value.pair === undefined;
+}
+
+function isPairListValue(value: SchemeValue): value is ListValue & { pair: PairCell } {
+  return value.type === 'list' && value.pair !== undefined;
+}
+
+function stepList(
+  value: SchemeValue,
+): { kind: 'pair'; next: SchemeValue } | { kind: 'null' } | { kind: 'improper' } {
+  if (value.type !== 'list') {
+    return { kind: 'improper' };
+  }
+
+  if (value.pair === undefined) {
+    return { kind: 'null' };
+  }
+
+  return { kind: 'pair', next: value.pair.cdr };
+}
+
 function isProperList(value: ListValue): boolean {
-  return value.tail === undefined;
+  let slow: SchemeValue = value;
+  let fast: SchemeValue = value;
+
+  while (true) {
+    const fastStep1 = stepList(fast);
+    if (fastStep1.kind === 'null') {
+      return true;
+    }
+    if (fastStep1.kind === 'improper') {
+      return false;
+    }
+    fast = fastStep1.next;
+
+    const fastStep2 = stepList(fast);
+    if (fastStep2.kind === 'null') {
+      return true;
+    }
+    if (fastStep2.kind === 'improper') {
+      return false;
+    }
+    fast = fastStep2.next;
+
+    const slowStep = stepList(slow);
+    if (slowStep.kind !== 'pair') {
+      return slowStep.kind === 'null';
+    }
+    slow = slowStep.next;
+
+    if (fast === slow) {
+      return false;
+    }
+  }
 }
 
 function consValue(head: SchemeValue, tail: SchemeValue): ListValue {
-  if (tail.type === 'list') {
-    return listValue([head, ...tail.elements], tail.tail);
-  }
-
-  return listValue([head], tail);
+  return pairValue(head, tail);
 }
 
-function cdrValue(list: ListValue): SchemeValue {
-  if (list.elements.length > 1) {
-    return listValue(list.elements.slice(1), list.tail);
+function cdrValue(list: ListValue & { pair: PairCell }): SchemeValue {
+  return list.pair.cdr;
+}
+
+function listLength(list: ListValue): number {
+  let length = 0;
+  let cursor: SchemeValue = list;
+
+  while (isPairListValue(cursor)) {
+    length += 1;
+    cursor = cursor.pair.cdr;
   }
 
-  return list.tail ?? listValue([]);
+  return length;
+}
+
+function listElements(list: ListValue): SchemeValue[] {
+  const elements: SchemeValue[] = [];
+  let cursor: SchemeValue = list;
+
+  while (isPairListValue(cursor)) {
+    elements.push(cursor.pair.car);
+    cursor = cursor.pair.cdr;
+  }
+
+  return elements;
+}
+
+function listRefValue(list: ListValue, index: number): SchemeValue {
+  let cursor: SchemeValue = list;
+  let remaining = index;
+
+  while (isPairListValue(cursor)) {
+    if (remaining === 0) {
+      return cursor.pair.car;
+    }
+
+    remaining -= 1;
+    cursor = cursor.pair.cdr;
+  }
+
+  throw new Error('internal error: list-ref on exhausted list');
+}
+
+function listTailValue(list: ListValue, index: number): ListValue {
+  let cursor: SchemeValue = list;
+
+  for (let remaining = index; remaining > 0; remaining -= 1) {
+    if (!isPairListValue(cursor)) {
+      throw new Error('internal error: list-tail on exhausted list');
+    }
+
+    cursor = cursor.pair.cdr;
+  }
+
+  if (cursor.type !== 'list') {
+    throw new Error('internal error: list-tail returned a non-list');
+  }
+
+  return cursor;
 }
 
 function eqvValues(left: SchemeValue, right: SchemeValue): boolean {
@@ -3153,15 +3526,8 @@ function eqvValues(left: SchemeValue, right: SchemeValue): boolean {
       return left.value === (right as typeof left).value;
     case 'symbol':
       return left.name === (right as typeof left).name;
-    case 'list': {
-      const rightList = right as ListValue;
-      return (
-        left.elements.length === 0 &&
-        rightList.elements.length === 0 &&
-        left.tail === undefined &&
-        rightList.tail === undefined
-      );
-    }
+    case 'list':
+      return isNullListValue(left) && isNullListValue(right as ListValue);
     case 'vector':
     case 'record':
     case 'builtin':
@@ -3174,6 +3540,14 @@ function eqvValues(left: SchemeValue, right: SchemeValue): boolean {
 }
 
 function equalValues(left: SchemeValue, right: SchemeValue): boolean {
+  return equalValuesInternal(left, right, new Map());
+}
+
+function equalValuesInternal(
+  left: SchemeValue,
+  right: SchemeValue,
+  memo: Map<object, Set<object>>,
+): boolean {
   if (left === right) {
     return true;
   }
@@ -3193,21 +3567,20 @@ function equalValues(left: SchemeValue, right: SchemeValue): boolean {
       return left.name === (right as typeof left).name;
     case 'list': {
       const rightList = right as ListValue;
-      if (left.elements.length !== rightList.elements.length) {
-        return false;
+      if (isNullListValue(left) || isNullListValue(rightList)) {
+        return isNullListValue(left) && isNullListValue(rightList);
       }
 
-      for (let index = 0; index < left.elements.length; index += 1) {
-        if (!equalValues(left.elements[index], rightList.elements[index])) {
-          return false;
-        }
+      if (rememberComparison(memo, left, rightList)) {
+        return true;
       }
 
-      if (left.tail === undefined || rightList.tail === undefined) {
-        return left.tail === undefined && rightList.tail === undefined;
-      }
-
-      return equalValues(left.tail, rightList.tail);
+      const leftPair = left as ListValue & { pair: PairCell };
+      const rightPair = rightList as ListValue & { pair: PairCell };
+      return (
+        equalValuesInternal(leftPair.pair.car, rightPair.pair.car, memo) &&
+        equalValuesInternal(leftPair.pair.cdr, rightPair.pair.cdr, memo)
+      );
     }
     case 'vector': {
       const rightVector = right as VectorValue;
@@ -3215,8 +3588,12 @@ function equalValues(left: SchemeValue, right: SchemeValue): boolean {
         return false;
       }
 
+      if (rememberComparison(memo, left, rightVector)) {
+        return true;
+      }
+
       for (let index = 0; index < left.elements.length; index += 1) {
-        if (!equalValues(left.elements[index], rightVector.elements[index])) {
+        if (!equalValuesInternal(left.elements[index], rightVector.elements[index], memo)) {
           return false;
         }
       }
@@ -3232,6 +3609,28 @@ function equalValues(left: SchemeValue, right: SchemeValue): boolean {
     case 'void':
       return true;
   }
+}
+
+function rememberComparison(memo: Map<object, Set<object>>, left: object, right: object): boolean {
+  const seenLeft = memo.get(left);
+  if (seenLeft?.has(right) ?? false) {
+    return true;
+  }
+
+  if (seenLeft === undefined) {
+    memo.set(left, new Set([right]));
+  } else {
+    seenLeft.add(right);
+  }
+
+  const seenRight = memo.get(right);
+  if (seenRight === undefined) {
+    memo.set(right, new Set([left]));
+  } else {
+    seenRight.add(left);
+  }
+
+  return false;
 }
 
 function isTruthy(value: SchemeValue): boolean {
@@ -3270,6 +3669,70 @@ function isValidUnicodeScalar(value: number): boolean {
     value <= 0x10ffff &&
     (value < 0xd800 || value > 0xdfff)
   );
+}
+
+function absBigInt(value: bigint): bigint {
+  return value < 0n ? -value : value;
+}
+
+function greatestCommonDivisorBigInt(left: bigint, right: bigint): bigint {
+  let a = absBigInt(left);
+  let b = absBigInt(right);
+
+  while (b !== 0n) {
+    const remainder = a % b;
+    a = b;
+    b = remainder;
+  }
+
+  return a;
+}
+
+function leastCommonMultipleBigInt(left: bigint, right: bigint): bigint {
+  if (left === 0n || right === 0n) {
+    return 0n;
+  }
+
+  return absBigInt((left / greatestCommonDivisorBigInt(left, right)) * right);
+}
+
+function truncateSchemeNumber(value: SchemeNumber, position?: SourcePosition): SchemeNumber {
+  if (value.kind === 'exact') {
+    return exactInteger(value.numerator / value.denominator);
+  }
+
+  return inexactNumber(Math.trunc(value.value), position);
+}
+
+function roundSchemeNumber(value: SchemeNumber, position?: SourcePosition): SchemeNumber {
+  if (value.kind === 'exact') {
+    const quotient = value.numerator / value.denominator;
+    const remainder = absBigInt(value.numerator % value.denominator);
+    const doubledRemainder = remainder * 2n;
+
+    if (doubledRemainder < value.denominator) {
+      return exactInteger(quotient);
+    }
+
+    if (doubledRemainder > value.denominator) {
+      return exactInteger(quotient + (value.numerator < 0n ? -1n : 1n));
+    }
+
+    return exactInteger(quotient % 2n === 0n ? quotient : quotient + (value.numerator < 0n ? -1n : 1n));
+  }
+
+  const truncated = Math.trunc(value.value);
+  const difference = Math.abs(value.value - truncated);
+  if (difference < 0.5) {
+    return inexactNumber(truncated, position);
+  }
+
+  if (difference > 0.5) {
+    return inexactNumber(truncated + Math.sign(value.value), position);
+  }
+
+  const rounded = truncated % 2 === 0 ? truncated : truncated + Math.sign(value.value);
+  return inexactNumber(rounded, position);
 }
 
 function numberValue(value: number | SchemeNumber, position?: SourcePosition): SchemeValue {
@@ -3312,35 +3775,33 @@ function attachPosition(error: unknown, position: SourcePosition): EvalError {
 }
 
 function formatDisplayValue(value: SchemeValue): string {
-  switch (value.type) {
-    case 'string':
-    case 'char':
-      return value.value;
-    case 'list':
-      return formatListValue(value, formatDisplayValue);
-    case 'vector':
-      return formatVectorValue(value, formatDisplayValue);
-    default:
-      return formatValue(value);
-  }
+  return formatValueInternal(value, 'display', new Set());
 }
 
 function formatValue(value: SchemeValue): string {
+  return formatValueInternal(value, 'write', new Set());
+}
+
+function formatValueInternal(
+  value: SchemeValue,
+  mode: 'display' | 'write',
+  active: Set<object>,
+): string {
   switch (value.type) {
     case 'number':
       return formatNumber(value.value);
     case 'boolean':
       return value.value ? '#t' : '#f';
     case 'string':
-      return JSON.stringify(value.value);
+      return mode === 'display' ? value.value : JSON.stringify(value.value);
     case 'char':
-      return formatChar(value.value);
+      return mode === 'display' ? value.value : formatChar(value.value);
     case 'symbol':
       return value.name;
     case 'list':
-      return formatListValue(value, formatValue);
+      return formatListValue(value, mode, active);
     case 'vector':
-      return formatVectorValue(value, formatValue);
+      return formatVectorValue(value, mode, active);
     case 'record':
       return `#<${value.recordType.displayName}>`;
     case 'builtin':
@@ -3358,21 +3819,65 @@ function isProcedureValue(value: SchemeValue): boolean {
 
 function formatListValue(
   value: ListValue,
-  formatter: (value: SchemeValue) => string,
+  mode: 'display' | 'write',
+  active: Set<object>,
 ): string {
-  const elements = value.elements.map(formatter);
-  if (value.tail === undefined) {
-    return `(${elements.join(' ')})`;
+  if (isNullListValue(value)) {
+    return '()';
   }
 
-  return `(${elements.join(' ')} . ${formatter(value.tail)})`;
+  if (active.has(value)) {
+    return '#<circular>';
+  }
+
+  const entered: ListValue[] = [value];
+  const parts: string[] = [];
+  let cursor = value as ListValue & { pair: PairCell };
+  active.add(value);
+
+  try {
+    while (true) {
+      parts.push(formatValueInternal(cursor.pair.car, mode, active));
+
+      const next = cursor.pair.cdr;
+      if (isNullListValue(next)) {
+        return `(${parts.join(' ')})`;
+      }
+
+      if (next.type !== 'list') {
+        return `(${parts.join(' ')} . ${formatValueInternal(next, mode, active)})`;
+      }
+
+      if (active.has(next)) {
+        return `(${parts.join(' ')} . #<circular>)`;
+      }
+
+      active.add(next);
+      entered.push(next);
+      cursor = next as ListValue & { pair: PairCell };
+    }
+  } finally {
+    for (const list of entered) {
+      active.delete(list);
+    }
+  }
 }
 
 function formatVectorValue(
   value: VectorValue,
-  formatter: (value: SchemeValue) => string,
+  mode: 'display' | 'write',
+  active: Set<object>,
 ): string {
-  return `#(${value.elements.map(formatter).join(' ')})`;
+  if (active.has(value)) {
+    return '#<circular>';
+  }
+
+  active.add(value);
+  try {
+    return `#(${value.elements.map((element) => formatValueInternal(element, mode, active)).join(' ')})`;
+  } finally {
+    active.delete(value);
+  }
 }
 
 function formatChar(value: string): string {
