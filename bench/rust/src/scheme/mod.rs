@@ -296,6 +296,28 @@ fn env_define(env: &EnvRef, name: String, value: Value) {
     env.borrow_mut().bindings.insert(name, value);
 }
 
+fn env_set(env: &EnvRef, name: &str, value: Value) -> bool {
+    let mut current = Some(Rc::clone(env));
+    let mut value = Some(value);
+
+    while let Some(scope) = current {
+        let parent = {
+            let mut scope = scope.borrow_mut();
+            if let Some(slot) = scope.bindings.get_mut(name) {
+                *slot = value
+                    .take()
+                    .expect("environment update value should only be consumed once");
+                return true;
+            }
+            scope.parent.as_ref().map(Rc::clone)
+        };
+
+        current = parent;
+    }
+
+    false
+}
+
 fn builtin_name(name: &str) -> Option<&'static str> {
     match name {
         "+" => Some("+"),
@@ -356,6 +378,7 @@ fn eval_list(
             "if" => return eval_if(&items[1..], env, form_pos, context),
             "let" => return eval_let(&items[1..], env, form_pos, context),
             "quote" => return eval_quote(&items[1..], form_pos),
+            "set!" => return eval_set(&items[1..], env, form_pos, context),
             "lambda" => return eval_lambda(None, &items[1..], env, form_pos),
             "and" => return eval_and(&items[1..], env, context),
             "or" => return eval_or(&items[1..], env, context),
@@ -405,6 +428,37 @@ fn eval_begin(
     context: &mut EvalContext,
 ) -> Result<Value, EvalError> {
     eval_sequence(args, env, pos, context)
+}
+
+fn eval_set(
+    args: &[Expr],
+    env: &EnvRef,
+    pos: SourcePos,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    match args {
+        [name_expr, value_expr] => {
+            let name = name_expr
+                .symbol_name()
+                .ok_or_else(|| syntax_error(name_expr.pos, "set! target must be a symbol"))?;
+            let value = eval_expr(value_expr, env, context)?;
+
+            if env_set(env, name, value) {
+                Ok(Value::Void)
+            } else {
+                Err(EvalError::UnboundVariable {
+                    pos: name_expr.pos,
+                    name: name.to_string(),
+                })
+            }
+        }
+        _ => Err(wrong_arg_count(
+            pos,
+            "set!",
+            "exactly 2 arguments",
+            args.len(),
+        )),
+    }
 }
 
 fn parse_define_signature(signature: &Expr) -> Result<(String, Vec<String>), EvalError> {
