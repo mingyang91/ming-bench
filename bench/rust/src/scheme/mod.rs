@@ -54,6 +54,25 @@ pub(crate) enum Value {
         rules: Vec<(Ast, Ast)>,
         def_env: Env,
     },
+    Record {
+        type_id: u64,
+        type_name: String,
+        fields: Vec<(String, Value)>,
+    },
+    RecordConstructor {
+        type_id: u64,
+        type_name: String,
+        field_names: Vec<String>,
+    },
+    RecordPredicate {
+        type_id: u64,
+    },
+    RecordAccessor {
+        type_id: u64,
+        type_name: String,
+        field_name: String,
+        field_index: usize,
+    },
     Void,
 }
 
@@ -184,8 +203,14 @@ impl Value {
                 format!("({})", inner.join(" "))
             }
             Value::Pair(a, b) => format!("({} . {})", a.display_value(), b.display_value()),
-            Value::Lambda { .. } | Value::Builtin(_) => "#<procedure>".into(),
+            Value::Lambda { .. } | Value::Builtin(_)
+            | Value::RecordConstructor { .. } | Value::RecordPredicate { .. }
+            | Value::RecordAccessor { .. } => "#<procedure>".into(),
             Value::Macro { .. } => "#<macro>".into(),
+            Value::Record { type_name, fields, .. } => {
+                let inner: Vec<String> = fields.iter().map(|(k, v)| format!("{}: {}", k, v.display_value())).collect();
+                format!("#<{} {}>", type_name, inner.join(", "))
+            }
             Value::Void => "".into(),
         }
     }
@@ -208,6 +233,10 @@ impl Value {
             | Value::Lambda { .. }
             | Value::Builtin(_)
             | Value::Macro { .. }
+            | Value::Record { .. }
+            | Value::RecordConstructor { .. }
+            | Value::RecordPredicate { .. }
+            | Value::RecordAccessor { .. }
             | Value::Void => self.display_value(),
         }
     }
@@ -561,6 +590,7 @@ fn eval_inner(ast: &Ast, env: &Env, output: &mut String) -> Result<Value, EvalEr
                         return Ok(result);
                     }
                     "define-syntax" => return eval_define_syntax(&items[1..], env),
+                    "define-record-type" => return eval_define_record_type(&items[1..], env),
                     _ => {
                         // Check for macro invocation
                         let maybe_macro = env.borrow().get(op);
@@ -789,7 +819,7 @@ fn is_special_form(name: &str) -> bool {
         name,
         "define" | "if" | "quote" | "lambda" | "let" | "begin"
             | "cond" | "and" | "or" | "set!" | "string-set!"
-            | "define-syntax" | "syntax-rules"
+            | "define-syntax" | "syntax-rules" | "define-record-type"
     )
 }
 
@@ -1091,6 +1121,87 @@ fn eval_define_syntax(args: &[Ast], env: &Env) -> Result<Value, EvalError> {
     Ok(Value::Void)
 }
 
+static RECORD_TYPE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn eval_define_record_type(args: &[Ast], env: &Env) -> Result<Value, EvalError> {
+    // (define-record-type <name> (constructor field...) predicate (field accessor) ...)
+    if args.len() < 3 {
+        return Err(EvalError::Arity("define-record-type requires at least 3 arguments".into()));
+    }
+    let _type_name = match &args[0].kind {
+        AstKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type("define-record-type: expected type name symbol".into())),
+    };
+    let type_id = RECORD_TYPE_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    // Parse constructor: (constructor-name field-name ...)
+    let (constructor_name, constructor_fields) = match &args[1].kind {
+        AstKind::List(items) if !items.is_empty() => {
+            let cname = match &items[0].kind {
+                AstKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Type("define-record-type: expected constructor name".into())),
+            };
+            let fields: Vec<String> = items[1..].iter().map(|a| match &a.kind {
+                AstKind::Symbol(s) => Ok(s.clone()),
+                _ => Err(EvalError::Type("define-record-type: expected field name in constructor".into())),
+            }).collect::<Result<_, _>>()?;
+            (cname, fields)
+        }
+        _ => return Err(EvalError::Type("define-record-type: expected constructor spec".into())),
+    };
+
+    // Parse predicate name
+    let predicate_name = match &args[2].kind {
+        AstKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type("define-record-type: expected predicate name".into())),
+    };
+
+    // Parse field accessors: (field-name accessor-name) ...
+    let mut field_accessors: Vec<(String, String)> = Vec::new();
+    for arg in &args[3..] {
+        match &arg.kind {
+            AstKind::List(items) if items.len() == 2 => {
+                let field = match &items[0].kind {
+                    AstKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Type("define-record-type: expected field name".into())),
+                };
+                let accessor = match &items[1].kind {
+                    AstKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Type("define-record-type: expected accessor name".into())),
+                };
+                field_accessors.push((field, accessor));
+            }
+            _ => return Err(EvalError::Type("define-record-type: invalid field spec".into())),
+        }
+    }
+
+    // Register constructor
+    env.borrow_mut().set(constructor_name, Value::RecordConstructor {
+        type_id,
+        type_name: _type_name.clone(),
+        field_names: constructor_fields.clone(),
+    });
+
+    // Register predicate
+    env.borrow_mut().set(predicate_name, Value::RecordPredicate { type_id });
+
+    // Register accessors
+    for (field_name, accessor_name) in &field_accessors {
+        let field_index = constructor_fields.iter().position(|f| f == field_name)
+            .ok_or_else(|| EvalError::Type(format!(
+                "define-record-type: field {} not in constructor", field_name
+            )))?;
+        env.borrow_mut().set(accessor_name.clone(), Value::RecordAccessor {
+            type_id,
+            type_name: _type_name.clone(),
+            field_name: accessor_name.clone(),
+            field_index,
+        });
+    }
+
+    Ok(Value::Void)
+}
+
 fn apply(func: &Value, args: &[Value], output: &mut String) -> Result<Value, EvalError> {
     match func {
         Value::Builtin(f) => f(args, output),
@@ -1120,6 +1231,40 @@ fn apply(func: &Value, args: &[Value], output: &mut String) -> Result<Value, Eva
             }
             Ok(result)
         }
+        Value::RecordConstructor { type_id, type_name, field_names } => {
+            if args.len() != field_names.len() {
+                return Err(EvalError::Arity(format!(
+                    "{} constructor expects {} arguments, got {}", type_name, field_names.len(), args.len()
+                )));
+            }
+            let fields: Vec<(String, Value)> = field_names.iter().zip(args.iter())
+                .map(|(n, v)| (n.clone(), v.clone()))
+                .collect();
+            Ok(Value::Record {
+                type_id: *type_id,
+                type_name: type_name.clone(),
+                fields,
+            })
+        }
+        Value::RecordPredicate { type_id } => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("record predicate expects 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Record { type_id: tid, .. } if tid == type_id)))
+        }
+        Value::RecordAccessor { type_id, type_name, field_name, field_index } => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("record accessor expects 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Record { type_id: tid, fields, .. } if tid == type_id => {
+                    Ok(fields[*field_index].1.clone())
+                }
+                _ => Err(EvalError::Type(format!(
+                    "{}: expected {}", field_name, type_name
+                ))),
+            }
+        }
         Value::Integer(_)
         | Value::Rational(_, _)
         | Value::Float(_)
@@ -1130,6 +1275,7 @@ fn apply(func: &Value, args: &[Value], output: &mut String) -> Result<Value, Eva
         | Value::Pair(_, _)
         | Value::Symbol(_)
         | Value::Macro { .. }
+        | Value::Record { .. }
         | Value::Void => Err(EvalError::Type(format!("not a procedure: {}", func.display_value()))),
     }
 }
