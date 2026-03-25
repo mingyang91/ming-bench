@@ -32,6 +32,8 @@ func eval(expr Expr, env *Env) (Value, error) {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", e.Ln, e.Cl, e.Name)}
 		}
 		return v, nil
+	case *ValueExpr:
+		return e.Val, nil
 	case *ListExpr:
 		if len(e.Items) == 0 {
 			return &NilVal{}, nil
@@ -69,6 +71,19 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 			return evalLet(e, env)
 		case "set!":
 			return evalSetBang(e, env)
+		case "define-syntax":
+			return evalDefineSyntax(e, env)
+		}
+
+		// Check for macro application
+		if val, ok := env.get(sym.Name); ok {
+			if macro, ok := val.(*MacroVal); ok {
+				expanded, err := expandMacro(macro, e)
+				if err != nil {
+					return nil, err
+				}
+				return eval(expanded, env)
+			}
 		}
 	}
 
