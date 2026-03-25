@@ -1069,6 +1069,20 @@ fn eval(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                         }
                         return Ok(result);
                     }
+                    "set!" => {
+                        if elems.len() != 3 {
+                            return Err(EvalError::Parse(format!("at {span}: set! requires 2 arguments")));
+                        }
+                        let var_name = match &elems[1].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Parse(format!("at {span}: set! expects a variable name"))),
+                        };
+                        let val = eval(&elems[2], env)?;
+                        if !env.borrow_mut().set_existing(&var_name, val) {
+                            return Err(EvalError::UnboundVariable(format!("at {span}: set!: variable {var_name} is not bound")));
+                        }
+                        return Ok(Value::Void);
+                    }
                     "string-set!" => {
                         if elems.len() != 4 {
                             return Err(EvalError::Arity(format!("at {span}: string-set! requires 3 arguments")));
