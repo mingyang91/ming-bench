@@ -24,6 +24,8 @@ func eval(expr Expr, env *Env) (Value, error) {
 		return &BoolVal{Val: e.Val}, nil
 	case *StringExpr:
 		return &StringVal{Val: e.Val}, nil
+	case *CharExpr:
+		return &CharVal{Val: e.Val}, nil
 	case *SymbolExpr:
 		v, ok := env.get(e.Name)
 		if !ok {
@@ -234,6 +236,8 @@ func quoteExpr(expr Expr) Value {
 		return &BoolVal{Val: e.Val}
 	case *StringExpr:
 		return &StringVal{Val: e.Val}
+	case *CharExpr:
+		return &CharVal{Val: e.Val}
 	case *SymbolExpr:
 		return &SymbolVal{Name: e.Name}
 	case *ListExpr:
@@ -321,6 +325,8 @@ func makeGlobalEnv(out *strings.Builder) *Env {
 	env.set("symbol->string", &BuiltinFunc{Name: "symbol->string", Fn: builtinSymbolToString})
 	env.set("string->symbol", &BuiltinFunc{Name: "string->symbol", Fn: builtinStringToSymbol})
 	env.set("string-ref", &BuiltinFunc{Name: "string-ref", Fn: builtinStringRef})
+	env.set("string-copy", &BuiltinFunc{Name: "string-copy", Fn: builtinStringCopy})
+	env.set("string-set!", &BuiltinFunc{Name: "string-set!", Fn: builtinStringSet})
 
 	return env
 }
@@ -789,6 +795,42 @@ func builtinStringToSymbol(args []Value) (Value, error) {
 		return nil, &EvalError{Message: "string->symbol: not a string"}
 	}
 	return &SymbolVal{Name: s.Val}, nil
+}
+
+func builtinStringCopy(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "string-copy: requires exactly 1 argument"}
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, &EvalError{Message: "string-copy: not a string"}
+	}
+	return &StringVal{Val: s.Val}, nil
+}
+
+func builtinStringSet(args []Value) (Value, error) {
+	if len(args) != 3 {
+		return nil, &EvalError{Message: "string-set!: requires exactly 3 arguments"}
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, &EvalError{Message: "string-set!: not a string"}
+	}
+	idx, ok := args[1].(*IntVal)
+	if !ok {
+		return nil, &EvalError{Message: "string-set!: index not a number"}
+	}
+	ch, ok := args[2].(*CharVal)
+	if !ok {
+		return nil, &EvalError{Message: "string-set!: not a character"}
+	}
+	runes := []rune(s.Val)
+	if idx.Val < 0 || idx.Val >= int64(len(runes)) {
+		return nil, &EvalError{Message: "string-set!: index out of range"}
+	}
+	runes[idx.Val] = ch.Val
+	s.Val = string(runes)
+	return &VoidVal{}, nil
 }
 
 func builtinStringRef(args []Value) (Value, error) {

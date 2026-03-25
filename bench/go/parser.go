@@ -17,6 +17,7 @@ const (
 	tokNumber
 	tokString
 	tokBool
+	tokChar
 	tokSymbol
 	tokEOF
 )
@@ -107,6 +108,35 @@ func (t *tokenizer) nextToken() token {
 	case ch == '#':
 		t.advance()
 		next := t.peek()
+		if next == '\\' {
+			// Character literal: #\x, #\space, #\newline
+			t.advance() // consume backslash
+			if t.pos >= len(t.input) {
+				return token{kind: tokChar, text: " ", line: line, col: col}
+			}
+			// Read the character name
+			first := t.advance()
+			var name strings.Builder
+			name.WriteRune(first)
+			for t.pos < len(t.input) && isSymbolChar(t.peek()) {
+				name.WriteRune(t.advance())
+			}
+			charName := name.String()
+			switch strings.ToLower(charName) {
+			case "space":
+				return token{kind: tokChar, text: " ", line: line, col: col}
+			case "newline":
+				return token{kind: tokChar, text: "\n", line: line, col: col}
+			case "tab":
+				return token{kind: tokChar, text: "\t", line: line, col: col}
+			default:
+				// Single character
+				if len([]rune(charName)) == 1 {
+					return token{kind: tokChar, text: charName, line: line, col: col}
+				}
+				return token{kind: tokSymbol, text: "#\\" + charName, line: line, col: col}
+			}
+		}
 		if next == 't' || next == 'f' {
 			t.advance()
 			// Make sure it's not part of a longer symbol
@@ -193,6 +223,13 @@ type StringExpr struct {
 func (e *StringExpr) Line() int { return e.Ln }
 func (e *StringExpr) Col() int  { return e.Cl }
 
+type CharExpr struct {
+	Val    rune
+	Ln, Cl int
+}
+func (e *CharExpr) Line() int { return e.Ln }
+func (e *CharExpr) Col() int  { return e.Cl }
+
 type SymbolExpr struct {
 	Name   string
 	Ln, Cl int
@@ -241,6 +278,10 @@ func (p *parser) parseExpr() (Expr, error) {
 	case tokString:
 		p.next()
 		return &StringExpr{Val: tok.text, Ln: tok.line, Cl: tok.col}, nil
+	case tokChar:
+		p.next()
+		runes := []rune(tok.text)
+		return &CharExpr{Val: runes[0], Ln: tok.line, Cl: tok.col}, nil
 	case tokSymbol:
 		p.next()
 		return &SymbolExpr{Name: tok.text, Ln: tok.line, Cl: tok.col}, nil
