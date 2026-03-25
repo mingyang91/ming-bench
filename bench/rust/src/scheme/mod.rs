@@ -1535,13 +1535,15 @@ fn eval_reexec(exprs: &[Expr], env: &Env, out: &mut String) -> Result<Val, EvalE
 
 thread_local! {
     static EVAL_STEPS: Cell<u64> = Cell::new(0);
+    static EVAL_STEP_LIMIT: Cell<u64> = Cell::new(200_000_000);
 }
 
 fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
     EVAL_STEPS.with(|s| {
         let v = s.get() + 1;
         s.set(v);
-        if v > 200_000_000 {
+        let limit = EVAL_STEP_LIMIT.with(|l| l.get());
+        if v > limit {
             return Err(EvalError::Type(format!("step limit exceeded at {v}")));
         }
         Ok(())
@@ -1555,6 +1557,16 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
         match result {
             Ok(val) => {
                 if let Some((next_expr, next_env)) = bounce {
+                    // Count each trampoline bounce as a step
+                    EVAL_STEPS.with(|s| {
+                        let v = s.get() + 1;
+                        s.set(v);
+                        let limit = EVAL_STEP_LIMIT.with(|l| l.get());
+                        if v > limit {
+                            return Err(EvalError::Type(format!("step limit exceeded at {v}")));
+                        }
+                        Ok(())
+                    })?;
                     cur = next_expr;
                     cur_env = next_env;
                 } else {
@@ -4574,6 +4586,22 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let mut out = String::new();
     let result = cek_eval(&exprs, &env, &mut out)?;
     Ok(result.to_string())
+}
+
+/// Evaluate Scheme expressions with a step budget.
+/// Each eval dispatch counts as one step. Exceeding the budget returns an error.
+pub fn eval_str_with_limit(input: &str, max_steps: u64) -> Result<String, EvalError> {
+    EVAL_STEPS.with(|s| s.set(0));
+    EVAL_STEP_LIMIT.with(|l| l.set(max_steps));
+    let result = (|| {
+        let exprs = parse_all(input)?;
+        let env = new_env(None);
+        let mut out = String::new();
+        let result = cek_eval(&exprs, &env, &mut out)?;
+        Ok(result.to_string())
+    })();
+    EVAL_STEP_LIMIT.with(|l| l.set(200_000_000));
+    result
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
