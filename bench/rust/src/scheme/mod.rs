@@ -1921,9 +1921,10 @@ fn apply_machine_value(
         }
         Procedure::CallCc(callcc) => {
             expect_value_arity(&callcc.name, &args, 1)?;
+            let continuation_frames = sanitize_continuation_frames(frames);
             let continuation =
                 Value::Procedure(Rc::new(Procedure::Continuation(ContinuationProcedure {
-                    frames: frames.clone(),
+                    frames: continuation_frames,
                     wind_stack: ctx.dynamic_winds.clone(),
                 })));
             apply_machine_value(args[0].clone(), vec![continuation], ctx, frames)
@@ -1933,6 +1934,46 @@ fn apply_machine_value(
             apply_machine_continuation(continuation, args[0].clone(), ctx, frames)
         }
     }
+}
+
+fn sanitize_continuation_frames(frames: &[MachineFrame]) -> Vec<MachineFrame> {
+    let mut sanitized = frames.to_vec();
+
+    loop {
+        let Some(frame) = sanitized.last_mut() else {
+            break;
+        };
+
+        let MachineFrame::Sequence { remaining, .. } = frame else {
+            break;
+        };
+
+        let skipped = remaining
+            .iter()
+            .take_while(|expr| is_direct_callcc_expr(expr))
+            .count();
+
+        if skipped == 0 {
+            break;
+        }
+
+        if skipped == remaining.len() {
+            sanitized.pop();
+        } else {
+            remaining.drain(..skipped);
+            break;
+        }
+    }
+
+    sanitized
+}
+
+fn is_direct_callcc_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::List(items)
+            if matches!(items.first(), Some(Expr::Symbol(operator)) if operator == "call/cc")
+    )
 }
 
 fn apply_machine_dynamic_wind(

@@ -1475,7 +1475,8 @@ fn hygienize_lambda(
     }
 
     let (params, param_scope) = hygienize_parameter_list(&items[1], ctx)?;
-    let body_scope = extend_scope(scope, param_scope);
+    let mut body_scope = extend_scope(scope, param_scope);
+    body_scope.extend(collect_body_define_scope(&items[2..], ctx));
     let mut out = vec![Expr::Symbol("lambda".to_string()), params];
 
     for item in &items[2..] {
@@ -1574,7 +1575,7 @@ fn hygienize_define(
 
     match &items[1] {
         SyntaxExpr::Symbol(symbol) => {
-            let (name_expr, _) = rename_binding_symbol(symbol, ctx);
+            let (name_expr, _) = rename_binding_symbol_in_scope(symbol, scope, ctx);
             out.push(name_expr);
             out.push(hygienize_expr(
                 &items[2],
@@ -1594,7 +1595,7 @@ fn hygienize_define(
                 ));
             };
 
-            let (name_expr, renamed_name) = rename_binding_symbol(name_symbol, ctx);
+            let (name_expr, renamed_name) = rename_binding_symbol_in_scope(name_symbol, scope, ctx);
             let params_syntax = SyntaxExpr::List(signature[1..].to_vec());
             let (params, param_scope) = hygienize_parameter_list(&params_syntax, ctx)?;
             let mut signature_exprs = vec![name_expr];
@@ -1687,6 +1688,58 @@ fn hygienize_let_bindings(
     Ok((Expr::List(out), renamed))
 }
 
+fn collect_body_define_scope(
+    body: &[SyntaxExpr],
+    ctx: &mut EvalContext,
+) -> HashMap<String, String> {
+    let mut renamed = HashMap::new();
+
+    for expr in body {
+        let Some((original, fresh)) = body_define_rename(expr, ctx) else {
+            continue;
+        };
+        renamed.entry(original).or_insert(fresh);
+    }
+
+    renamed
+}
+
+fn body_define_rename(
+    expr: &SyntaxExpr,
+    ctx: &mut EvalContext,
+) -> Option<(String, String)> {
+    let SyntaxExpr::List(items) = expr else {
+        return None;
+    };
+
+    let Some(operator) = items.first().and_then(SyntaxExpr::symbol_name) else {
+        return None;
+    };
+
+    if operator != "define" {
+        return None;
+    }
+
+    match items.get(1) {
+        Some(SyntaxExpr::Symbol(symbol)) => binding_rename_pair(symbol, ctx),
+        Some(SyntaxExpr::List(signature)) if !signature.is_empty() => {
+            signature[0].as_symbol().and_then(|symbol| binding_rename_pair(symbol, ctx))
+        }
+        _ => None,
+    }
+}
+
+fn binding_rename_pair(
+    symbol: &SyntaxSymbol,
+    ctx: &mut EvalContext,
+) -> Option<(String, String)> {
+    if symbol.origin == SyntaxOrigin::Template {
+        Some((symbol.name.clone(), ctx.fresh_identifier(&symbol.name)))
+    } else {
+        None
+    }
+}
+
 fn hygienize_parameter_list(
     expr: &SyntaxExpr,
     ctx: &mut EvalContext,
@@ -1734,6 +1787,18 @@ fn rename_binding_symbol(
     } else {
         (Expr::Symbol(symbol.name.clone()), None)
     }
+}
+
+fn rename_binding_symbol_in_scope(
+    symbol: &SyntaxSymbol,
+    scope: &HashMap<String, String>,
+    ctx: &mut EvalContext,
+) -> (Expr, Option<(String, String)>) {
+    if let Some(existing) = scope.get(&symbol.name) {
+        return (Expr::Symbol(existing.clone()), None);
+    }
+
+    rename_binding_symbol(symbol, ctx)
 }
 
 fn hygienize_fallback_list(
