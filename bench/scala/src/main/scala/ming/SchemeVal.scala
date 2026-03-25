@@ -15,6 +15,7 @@ enum SchemeVal:
   case BuiltinProc(name: String, f: List[SchemeVal] => SchemeVal)
   case LambdaProc(params: List[String], body: List[SchemeVal], closure: Env, rest: Option[String] = None)
   case MacroVal(name: String, literals: List[String], rules: List[(SchemeVal, SchemeVal)], defEnv: Env)
+  case CaseLambdaProc(clauses: List[(List[String], Option[String], List[SchemeVal])], closure: Env)
   case RecordVal(typeName: String, fields: scala.collection.mutable.Map[String, SchemeVal])
 
 object SchemeVal:
@@ -65,6 +66,7 @@ object SchemeVal:
     case Void                    => ""
     case BuiltinProc(name, _)    => s"#<procedure $name>"
     case LambdaProc(_, _, _, _)  => "#<procedure>"
+    case CaseLambdaProc(_, _)    => "#<procedure>"
     case MacroVal(name, _, _, _) => s"#<macro $name>"
     case RecordVal(typeName, _)  => s"#<$typeName>"
 
@@ -74,6 +76,7 @@ object SchemeVal:
     case CharVal(c)              => c.toString
     case SList(elems)            => "(" + elems.map(displayOutput).mkString(" ") + ")"
     case DottedList(elems, tail) => "(" + elems.map(displayOutput).mkString(" ") + " . " + displayOutput(tail) + ")"
+    case CaseLambdaProc(_, _)    => "#<procedure>"
     case other                   => display(other)
 
   def schemeEqual(a: SchemeVal, b: SchemeVal): Boolean = (a, b) match

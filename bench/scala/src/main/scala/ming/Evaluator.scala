@@ -31,6 +31,7 @@ object Evaluator:
         case SchemeVal.CharVal(_)             => expr
         case SchemeVal.BuiltinProc(_, _)      => expr
         case SchemeVal.LambdaProc(_, _, _, _) => expr
+        case SchemeVal.CaseLambdaProc(_, _)   => expr
         case SchemeVal.MacroVal(_, _, _, _)   => expr
         case SchemeVal.Symbol(name) =>
           env.lookup(name) match
@@ -53,6 +54,7 @@ object Evaluator:
             case SchemeVal.Symbol("cond")          => evalCond(elems.tail, env)
             case SchemeVal.Symbol("set!")          => evalSet(elems.tail, env)
             case SchemeVal.Symbol("define-syntax") => evalDefineSyntax(elems.tail, env)
+            case SchemeVal.Symbol("case-lambda")   => evalCaseLambda(elems.tail, env)
             case SchemeVal.Symbol("define-record-type") =>
               RecordType.evalDefineRecordType(elems.tail, env)
             case SchemeVal.Symbol(name) =>
@@ -235,6 +237,26 @@ object Evaluator:
           case _ => throw new EvalError("define-syntax: expected syntax-rules")
       case _ => throw new EvalError("define-syntax: bad syntax")
 
+  private def evalCaseLambda(clauses: List[SchemeVal], env: Env): SchemeVal =
+    val parsed = clauses.map {
+      case SchemeVal.SList(elems) if elems.nonEmpty =>
+        elems.head match
+          case SchemeVal.SList(paramList) =>
+            val (params, rest) = parseParams(paramList)
+            (params, rest, elems.tail)
+          case SchemeVal.DottedList(paramList, SchemeVal.Symbol(restParam)) =>
+            val params = paramList.map {
+              case SchemeVal.Symbol(p) => p
+              case other               => throw new EvalError(s"expected parameter name, got $other")
+            }
+            (params, Some(restParam), elems.tail)
+          case SchemeVal.Symbol(restParam) =>
+            (Nil, Some(restParam), elems.tail)
+          case other => throw new EvalError(s"case-lambda: bad clause")
+      case _ => throw new EvalError("case-lambda: bad clause")
+    }
+    SchemeVal.CaseLambdaProc(parsed, env)
+
   private def evalSet(args: List[SchemeVal], env: Env): SchemeVal =
     args match
       case SchemeVal.Symbol(name) :: value :: Nil =>
@@ -246,20 +268,5 @@ object Evaluator:
     case SchemeVal.BoolVal(false) => false
     case _                        => true
 
-  def apply(proc: SchemeVal, args: List[SchemeVal]): SchemeVal = proc match
-    case SchemeVal.BuiltinProc(_, f) => f(args)
-    case SchemeVal.LambdaProc(params, body, closure, rest) =>
-      rest match
-        case Some(restName) =>
-          if args.size < params.size then
-            throw new EvalError(s"expected at least ${params.size} arguments, got ${args.size}")
-          val localEnv = new Env(scala.collection.mutable.Map.empty, Some(closure))
-          params.zip(args).foreach((p, a) => localEnv.define(p, a))
-          localEnv.define(restName, SchemeVal.SList(args.drop(params.size)))
-          body.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, localEnv))
-        case None =>
-          if args.size != params.size then throw new EvalError(s"expected ${params.size} arguments, got ${args.size}")
-          val localEnv = new Env(scala.collection.mutable.Map.empty, Some(closure))
-          params.zip(args).foreach((p, a) => localEnv.define(p, a))
-          body.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, localEnv))
-    case _ => throw new EvalError(s"not a procedure: $proc")
+  def apply(proc: SchemeVal, args: List[SchemeVal]): SchemeVal =
+    Apply(proc, args)
