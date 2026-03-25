@@ -37,7 +37,7 @@ enum Val {
     Rational(i64, i64), // numerator, denominator (always simplified, denom > 0)
     Bool(bool),
     Char(char),
-    Str(String),
+    Str(String, bool), // (content, mutable)
     Symbol(String),
     Pair(Box<Val>, Box<Val>),
     Nil,
@@ -95,7 +95,7 @@ impl fmt::Display for Val {
             Val::Bool(true) => write!(f, "#t"),
             Val::Bool(false) => write!(f, "#f"),
             Val::Char(c) => write!(f, "#\\{c}"),
-            Val::Str(s) => write!(f, "\"{}\"", s),
+            Val::Str(s, _) => write!(f, "\"{}\"", s),
             Val::Symbol(s) => write!(f, "{s}"),
             Val::Nil => write!(f, "()"),
             Val::Pair(_, _) => {
@@ -402,7 +402,7 @@ fn env_set_existing(env: &Env, name: &str, val: Val) -> bool {
 /// Format a value using `display` semantics (no quotes on strings).
 fn display_val(v: &Val, f: &mut String) {
     match v {
-        Val::Str(s) => f.push_str(s),
+        Val::Str(s, _) => f.push_str(s),
         Val::Char(c) => f.push(*c),
         Val::Float(_) | Val::Rational(_, _) | Val::Int(_) => f.push_str(&v.to_string()),
         Val::Pair(_, _) => {
@@ -512,7 +512,7 @@ fn quote_expr(expr: &Expr) -> Val {
         ExprKind::Int(n) => Val::Int(*n),
         ExprKind::Bool(b) => Val::Bool(*b),
         ExprKind::Char(c) => Val::Char(*c),
-        ExprKind::Str(s) => Val::Str(s.clone()),
+        ExprKind::Str(s) => Val::Str(s.clone(), false),
         ExprKind::Symbol(s) => Val::Symbol(s.clone()),
         ExprKind::Literal(v) => v.clone(),
         ExprKind::List(items) => {
@@ -759,7 +759,7 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
         ExprKind::Int(n) => Ok(Val::Int(*n)),
         ExprKind::Bool(b) => Ok(Val::Bool(*b)),
         ExprKind::Char(c) => Ok(Val::Char(*c)),
-        ExprKind::Str(s) => Ok(Val::Str(s.clone())),
+        ExprKind::Str(s) => Ok(Val::Str(s.clone(), false)),
         ExprKind::Literal(v) => Ok(v.clone()),
         ExprKind::Symbol(name) => {
             env_get(env, name)
@@ -1370,18 +1370,21 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                             Val::Char(c) => *c,
                             _ => return Err(err_at(span, EvalError::Type("string-set!: expected char".into()))),
                         };
-                        let mut s = match env_get(env, &var_name) {
-                            Some(Val::Str(s)) => s,
+                        let (mut s, mutable) = match env_get(env, &var_name) {
+                            Some(Val::Str(s, m)) => (s, m),
                             Some(_) => return Err(err_at(span, EvalError::Type("string-set!: expected string".into()))),
                             None => return Err(err_at(span, EvalError::UnboundVariable(var_name.clone()))),
                         };
+                        if !mutable {
+                            return Err(err_at(span, EvalError::Type("string-set!: strings are immutable".into())));
+                        }
                         let mut chars: Vec<char> = s.chars().collect();
                         if idx >= chars.len() {
                             return Err(err_at(span, EvalError::Type("string-set!: index out of range".into())));
                         }
                         chars[idx] = ch;
                         s = chars.into_iter().collect();
-                        env_set(env, var_name, Val::Str(s));
+                        env_set(env, var_name, Val::Str(s, true));
                         return Ok(Val::Void);
                     }
                     _ => {}
@@ -1452,7 +1455,7 @@ fn is_builtin(op: &str) -> bool {
         | "exact->inexact" | "inexact->exact" | "numerator" | "denominator"
         | "string-append" | "string-length" | "substring" | "string->number"
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
-        | "string-copy" | "apply"
+        | "string-copy" | "string->list" | "list->string" | "char->integer" | "integer->char" | "apply"
         | "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt"
         | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
         | "list-ref" | "list-tail" | "list?" | "assoc" | "equal?" | "eq?" | "eqv?"
@@ -1659,7 +1662,7 @@ fn val_equal(a: &Val, b: &Val) -> bool {
         (Val::Rational(n1, d1), Val::Rational(n2, d2)) => n1 == n2 && d1 == d2,
         (Val::Bool(x), Val::Bool(y)) => x == y,
         (Val::Char(x), Val::Char(y)) => x == y,
-        (Val::Str(x), Val::Str(y)) => x == y,
+        (Val::Str(x, _), Val::Str(y, _)) => x == y,
         (Val::Symbol(x), Val::Symbol(y)) => x == y,
         (Val::Nil, Val::Nil) => true,
         (Val::Pair(a1, a2), Val::Pair(b1, b2)) => val_equal(a1, b1) && val_equal(a2, b2),
@@ -1924,7 +1927,7 @@ fn apply_builtin(op: &str, args: &[Val]) -> Result<Val, EvalError> {
         }
         "string?" => {
             if args.len() != 1 { return Err(EvalError::Arity("string?: need 1 argument".into())); }
-            Ok(Val::Bool(matches!(args[0], Val::Str(_))))
+            Ok(Val::Bool(matches!(args[0], Val::Str(_, _))))
         }
         "number?" => {
             if args.len() != 1 { return Err(EvalError::Arity("number?: need 1 argument".into())); }
@@ -1954,23 +1957,23 @@ fn apply_builtin(op: &str, args: &[Val]) -> Result<Val, EvalError> {
             let mut result = String::new();
             for a in args {
                 match a {
-                    Val::Str(s) => result.push_str(s),
+                    Val::Str(s, _) => result.push_str(s),
                     _ => return Err(EvalError::Type("string-append: expected string".into())),
                 }
             }
-            Ok(Val::Str(result))
+            Ok(Val::Str(result, true))
         }
         "string-length" => {
             if args.len() != 1 { return Err(EvalError::Arity("string-length: need 1 argument".into())); }
             match &args[0] {
-                Val::Str(s) => Ok(Val::Int(s.chars().count() as i64)),
+                Val::Str(s, _) => Ok(Val::Int(s.chars().count() as i64)),
                 _ => Err(EvalError::Type("string-length: expected string".into())),
             }
         }
         "substring" => {
             if args.len() != 3 { return Err(EvalError::Arity("substring: need 3 arguments".into())); }
             let s = match &args[0] {
-                Val::Str(s) => s,
+                Val::Str(s, _) => s,
                 _ => return Err(EvalError::Type("substring: expected string".into())),
             };
             let start = as_int(&args[1], "substring")? as usize;
@@ -1979,12 +1982,12 @@ fn apply_builtin(op: &str, args: &[Val]) -> Result<Val, EvalError> {
             if end > chars.len() || start > end {
                 return Err(EvalError::Type("substring: index out of range".into()));
             }
-            Ok(Val::Str(chars[start..end].iter().collect()))
+            Ok(Val::Str(chars[start..end].iter().collect(), true))
         }
         "string->number" => {
             if args.len() != 1 { return Err(EvalError::Arity("string->number: need 1 argument".into())); }
             match &args[0] {
-                Val::Str(s) => match s.parse::<i64>() {
+                Val::Str(s, _) => match s.parse::<i64>() {
                     Ok(n) => Ok(Val::Int(n)),
                     Err(_) => Ok(Val::Bool(false)),
                 },
@@ -1994,29 +1997,29 @@ fn apply_builtin(op: &str, args: &[Val]) -> Result<Val, EvalError> {
         "number->string" => {
             if args.len() != 1 { return Err(EvalError::Arity("number->string: need 1 argument".into())); }
             match &args[0] {
-                Val::Int(n) => Ok(Val::Str(n.to_string())),
-                Val::Float(_) | Val::Rational(_, _) => Ok(Val::Str(args[0].to_string())),
+                Val::Int(n) => Ok(Val::Str(n.to_string(), true)),
+                Val::Float(_) | Val::Rational(_, _) => Ok(Val::Str(args[0].to_string(), true)),
                 _ => Err(EvalError::Type("number->string: expected number".into())),
             }
         }
         "symbol->string" => {
             if args.len() != 1 { return Err(EvalError::Arity("symbol->string: need 1 argument".into())); }
             match &args[0] {
-                Val::Symbol(s) => Ok(Val::Str(s.clone())),
+                Val::Symbol(s) => Ok(Val::Str(s.clone(), false)),
                 _ => Err(EvalError::Type("symbol->string: expected symbol".into())),
             }
         }
         "string->symbol" => {
             if args.len() != 1 { return Err(EvalError::Arity("string->symbol: need 1 argument".into())); }
             match &args[0] {
-                Val::Str(s) => Ok(Val::Symbol(s.clone())),
+                Val::Str(s, _) => Ok(Val::Symbol(s.clone())),
                 _ => Err(EvalError::Type("string->symbol: expected string".into())),
             }
         }
         "string-ref" => {
             if args.len() != 2 { return Err(EvalError::Arity("string-ref: need 2 arguments".into())); }
             let s = match &args[0] {
-                Val::Str(s) => s,
+                Val::Str(s, _) => s,
                 _ => return Err(EvalError::Type("string-ref: expected string".into())),
             };
             let idx = as_int(&args[1], "string-ref")? as usize;
@@ -2029,8 +2032,59 @@ fn apply_builtin(op: &str, args: &[Val]) -> Result<Val, EvalError> {
         "string-copy" => {
             if args.len() != 1 { return Err(EvalError::Arity("string-copy: need 1 argument".into())); }
             match &args[0] {
-                Val::Str(s) => Ok(Val::Str(s.clone())),
+                Val::Str(s, _) => Ok(Val::Str(s.clone(), true)),
                 _ => Err(EvalError::Type("string-copy: expected string".into())),
+            }
+        }
+        "string->list" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string->list: need 1 argument".into())); }
+            match &args[0] {
+                Val::Str(s, _) => {
+                    let mut result = Val::Nil;
+                    for c in s.chars().rev() {
+                        result = Val::Pair(Box::new(Val::Char(c)), Box::new(result));
+                    }
+                    Ok(result)
+                }
+                _ => Err(EvalError::Type("string->list: expected string".into())),
+            }
+        }
+        "list->string" => {
+            if args.len() != 1 { return Err(EvalError::Arity("list->string: need 1 argument".into())); }
+            let mut chars = Vec::new();
+            let mut cur = &args[0];
+            loop {
+                match cur {
+                    Val::Pair(a, b) => {
+                        match a.as_ref() {
+                            Val::Char(c) => chars.push(*c),
+                            _ => return Err(EvalError::Type("list->string: list must contain only characters".into())),
+                        }
+                        cur = b.as_ref();
+                    }
+                    Val::Nil => break,
+                    _ => return Err(EvalError::Type("list->string: expected proper list".into())),
+                }
+            }
+            Ok(Val::Str(chars.into_iter().collect(), true))
+        }
+        "char->integer" => {
+            if args.len() != 1 { return Err(EvalError::Arity("char->integer: need 1 argument".into())); }
+            match &args[0] {
+                Val::Char(c) => Ok(Val::Int(*c as i64)),
+                _ => Err(EvalError::Type("char->integer: expected char".into())),
+            }
+        }
+        "integer->char" => {
+            if args.len() != 1 { return Err(EvalError::Arity("integer->char: need 1 argument".into())); }
+            match &args[0] {
+                Val::Int(n) => {
+                    match char::from_u32(*n as u32) {
+                        Some(c) => Ok(Val::Char(c)),
+                        None => Err(EvalError::Type("integer->char: invalid code point".into())),
+                    }
+                }
+                _ => Err(EvalError::Type("integer->char: expected integer".into())),
             }
         }
         "abs" => {
@@ -2281,35 +2335,35 @@ fn apply_builtin(op: &str, args: &[Val]) -> Result<Val, EvalError> {
         "string=?" => {
             if args.len() != 2 { return Err(EvalError::Arity("string=?: need 2 arguments".into())); }
             match (&args[0], &args[1]) {
-                (Val::Str(a), Val::Str(b)) => Ok(Val::Bool(a == b)),
+                (Val::Str(a, _), Val::Str(b, _)) => Ok(Val::Bool(a == b)),
                 _ => Err(EvalError::Type("string=?: expected strings".into())),
             }
         }
         "string<?" => {
             if args.len() != 2 { return Err(EvalError::Arity("string<?: need 2 arguments".into())); }
             match (&args[0], &args[1]) {
-                (Val::Str(a), Val::Str(b)) => Ok(Val::Bool(a < b)),
+                (Val::Str(a, _), Val::Str(b, _)) => Ok(Val::Bool(a < b)),
                 _ => Err(EvalError::Type("string<?: expected strings".into())),
             }
         }
         "string-ci=?" => {
             if args.len() != 2 { return Err(EvalError::Arity("string-ci=?: need 2 arguments".into())); }
             match (&args[0], &args[1]) {
-                (Val::Str(a), Val::Str(b)) => Ok(Val::Bool(a.to_lowercase() == b.to_lowercase())),
+                (Val::Str(a, _), Val::Str(b, _)) => Ok(Val::Bool(a.to_lowercase() == b.to_lowercase())),
                 _ => Err(EvalError::Type("string-ci=?: expected strings".into())),
             }
         }
         "string-upcase" => {
             if args.len() != 1 { return Err(EvalError::Arity("string-upcase: need 1 argument".into())); }
             match &args[0] {
-                Val::Str(s) => Ok(Val::Str(s.to_uppercase())),
+                Val::Str(s, _) => Ok(Val::Str(s.to_uppercase(), true)),
                 _ => Err(EvalError::Type("string-upcase: expected string".into())),
             }
         }
         "string-downcase" => {
             if args.len() != 1 { return Err(EvalError::Arity("string-downcase: need 1 argument".into())); }
             match &args[0] {
-                Val::Str(s) => Ok(Val::Str(s.to_lowercase())),
+                Val::Str(s, _) => Ok(Val::Str(s.to_lowercase(), true)),
                 _ => Err(EvalError::Type("string-downcase: expected string".into())),
             }
         }
