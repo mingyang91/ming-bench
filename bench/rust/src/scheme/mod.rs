@@ -2,6 +2,7 @@ mod builtin_helpers;
 mod builtins;
 pub mod error;
 mod helpers;
+mod machine;
 mod macros;
 mod number;
 mod parser;
@@ -15,6 +16,7 @@ use self::helpers::{
     invalid_argument, make_immutable_string_value, make_string_value, make_vector_value,
     number_error, syntax_error, type_mismatch, wrong_arg_count,
 };
+use self::machine::Continuation;
 use self::macros::{expand_macro_call, parse_syntax_rules};
 use self::number::{parse_number_literal, Number, NumberError};
 use self::records::{
@@ -91,6 +93,7 @@ enum Procedure {
     Builtin(&'static str),
     Lambda(Rc<Lambda>),
     CaseLambda(Rc<CaseLambda>),
+    Continuation(Rc<Continuation>),
     RecordConstructor(Rc<RecordType>),
     RecordPredicate(Rc<RecordType>),
     RecordAccessor {
@@ -378,10 +381,7 @@ fn eval_sequence(
     empty_pos: SourcePos,
     context: &mut EvalContext,
 ) -> Result<Value, EvalError> {
-    resolve_outcome(
-        eval_sequence_outcome(exprs, env, empty_pos, context, true)?,
-        context,
-    )
+    machine::eval_sequence(exprs, env, empty_pos, context)
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
@@ -395,7 +395,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
 }
 
 fn eval_expr(expr: &Expr, env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
-    resolve_outcome(eval_expr_outcome(expr, env, context, true)?, context)
+    machine::eval_expr(expr, env, context)
 }
 
 fn resolve_outcome(
@@ -1419,7 +1419,11 @@ fn bind_lambda_call(lambda: &Lambda, args: &[Value], pos: SourcePos) -> Result<E
     }
 
     if let Some(rest) = &lambda.params.rest {
-        env_define(&call_env, rest.clone(), make_list_value(args[required_len..].to_vec()));
+        env_define(
+            &call_env,
+            rest.clone(),
+            make_list_value(args[required_len..].to_vec()),
+        );
     }
 
     Ok(call_env)

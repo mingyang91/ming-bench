@@ -5,9 +5,9 @@ use super::builtin_helpers::{
 };
 use super::value_ops::{byte_index_for_char, eq_value, equal_value, eqv_value};
 use super::{
-    apply, invalid_argument, is_proper_list, make_list_value, make_pair_value,
-    make_string_value, make_vector_value, number_error, type_mismatch, wrong_arg_count,
-    EvalContext, EvalError, Number, SourcePos, Value,
+    apply, invalid_argument, is_proper_list, make_list_value, make_pair_value, make_string_value,
+    make_vector_value, number_error, type_mismatch, wrong_arg_count, EvalContext, EvalError,
+    Number, SourcePos, Value,
 };
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -29,6 +29,8 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "assoc" => Some("assoc"),
         "assv" => Some("assv"),
         "boolean?" => Some("boolean?"),
+        "call-with-current-continuation" => Some("call/cc"),
+        "call/cc" => Some("call/cc"),
         "char-alphabetic?" => Some("char-alphabetic?"),
         "char->integer" => Some("char->integer"),
         "char-downcase" => Some("char-downcase"),
@@ -1600,12 +1602,7 @@ where
                 .map_err(|error| number_error(pos, name, error))?;
             Ok(Value::Number(rounded))
         }
-        _ => Err(wrong_arg_count(
-            pos,
-            name,
-            "exactly 1 argument",
-            args.len(),
-        )),
+        _ => Err(wrong_arg_count(pos, name, "exactly 1 argument", args.len())),
     }
 }
 
@@ -1646,9 +1643,7 @@ fn lcm_i64(left: i64, right: i64) -> Option<i64> {
     }
 
     let gcd = gcd_i64(left, right);
-    left.checked_div(gcd)?
-        .checked_mul(right)?
-        .checked_abs()
+    left.checked_div(gcd)?.checked_mul(right)?.checked_abs()
 }
 
 fn expect_exact_integer_arg(name: &str, value: &Value, pos: SourcePos) -> Result<i64, EvalError> {

@@ -164,9 +164,10 @@ fn equal_value_inner(
             let left_items = left.borrow().clone();
             let right_items = right.borrow().clone();
             left_items.len() == right_items.len()
-                && left_items.iter().zip(right_items.iter()).all(|(left, right)| {
-                    equal_value_inner(left, right, seen_pairs, seen_vectors)
-                })
+                && left_items
+                    .iter()
+                    .zip(right_items.iter())
+                    .all(|(left, right)| equal_value_inner(left, right, seen_pairs, seen_vectors))
         }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
@@ -287,7 +288,12 @@ fn render_list(
         if index > 0 {
             out.push(' ');
         }
-        out.push_str(&render_value_inner(value, mode, active_pairs, active_vectors));
+        out.push_str(&render_value_inner(
+            value,
+            mode,
+            active_pairs,
+            active_vectors,
+        ));
     }
 
     out.push(')');
@@ -312,7 +318,12 @@ fn render_pair(
     drop(pair_ref);
 
     let mut out = String::from("(");
-    out.push_str(&render_value_inner(&car, mode, active_pairs, active_vectors));
+    out.push_str(&render_value_inner(
+        &car,
+        mode,
+        active_pairs,
+        active_vectors,
+    ));
 
     loop {
         match tail {
@@ -330,20 +341,35 @@ fn render_pair(
                 drop(pair_ref);
 
                 out.push(' ');
-                out.push_str(&render_value_inner(&car, mode, active_pairs, active_vectors));
+                out.push_str(&render_value_inner(
+                    &car,
+                    mode,
+                    active_pairs,
+                    active_vectors,
+                ));
                 tail = cdr;
             }
             Value::List(items) => {
                 for value in &items {
                     out.push(' ');
-                    out.push_str(&render_value_inner(value, mode, active_pairs, active_vectors));
+                    out.push_str(&render_value_inner(
+                        value,
+                        mode,
+                        active_pairs,
+                        active_vectors,
+                    ));
                 }
                 out.push(')');
                 break;
             }
             other => {
                 out.push_str(" . ");
-                out.push_str(&render_value_inner(&other, mode, active_pairs, active_vectors));
+                out.push_str(&render_value_inner(
+                    &other,
+                    mode,
+                    active_pairs,
+                    active_vectors,
+                ));
                 out.push(')');
                 break;
             }
@@ -375,7 +401,12 @@ fn render_vector(
         if index > 0 {
             out.push(' ');
         }
-        out.push_str(&render_value_inner(value, mode, active_pairs, active_vectors));
+        out.push_str(&render_value_inner(
+            value,
+            mode,
+            active_pairs,
+            active_vectors,
+        ));
     }
 
     out.push(')');
