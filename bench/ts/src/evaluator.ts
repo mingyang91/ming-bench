@@ -235,6 +235,9 @@ interface WindEntry {
 }
 let windStack: WindEntry[] = [];
 
+// ── Exception Handlers ──────────────────────────────────────────
+let exceptionHandlers: Array<{ handler: (val: SchemeVal) => Bounce; winds: WindEntry[] }> = [];
+
 function applySync(func: SchemeVal, args: SchemeVal[], pos?: Pos): SchemeVal {
   return runTrampoline(applyCPS(func, args, pos, (v) => v));
 }
@@ -1101,6 +1104,13 @@ function makeGlobalEnv(): Env {
     throw new EvalError('dynamic-wind: internal error - should be handled by CPS evaluator');
   });
 
+  defBuiltin('raise', (_args) => {
+    throw new EvalError('raise: internal error - should be handled by CPS evaluator');
+  });
+  defBuiltin('with-exception-handler', (_args) => {
+    throw new EvalError('with-exception-handler: internal error - should be handled by CPS evaluator');
+  });
+
   return env;
 }
 
@@ -1251,7 +1261,7 @@ function gensym(prefix: string): string {
 const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'lambda', 'case-lambda', 'set!', 'begin', 'let', 'let*', 'letrec', 'letrec*',
   'cond', 'and', 'or', 'not', 'define-syntax', 'syntax-rules', 'case', 'do',
-  'call/cc', 'call-with-current-continuation',
+  'call/cc', 'call-with-current-continuation', 'guard',
 ]);
 
 type MatchBinding =
@@ -1390,7 +1400,7 @@ function isTruthy(val: SchemeVal): boolean {
 }
 
 function exprMayCallCC(expr: SchemeVal): boolean {
-  if (expr.tag === 'symbol') return expr.value === 'call/cc' || expr.value === 'call-with-current-continuation' || expr.value === 'dynamic-wind';
+  if (expr.tag === 'symbol') return expr.value === 'call/cc' || expr.value === 'call-with-current-continuation' || expr.value === 'dynamic-wind' || expr.value === 'raise' || expr.value === 'with-exception-handler' || expr.value === 'guard';
   if (expr.tag === 'list') return expr.elements.some(exprMayCallCC);
   return false;
 }
@@ -1497,6 +1507,46 @@ function applyCPS(func: SchemeVal, args: SchemeVal[], pos: Pos | undefined, k: C
             return k(bodyVal);
           });
         });
+      });
+    }
+    if (func.name === 'raise') {
+      if (args.length !== 1) throw errAt('raise: expected 1 argument', pos);
+      const val = args[0];
+      if (exceptionHandlers.length === 0) {
+        throw new EvalError(`unhandled exception: ${displayVal(val)}`);
+      }
+      const entry = exceptionHandlers.pop()!;
+      // Unwind dynamic-wind from current to handler's wind state
+      const currentWinds = [...windStack];
+      const targetWinds = entry.winds;
+      let commonLen = 0;
+      while (commonLen < currentWinds.length && commonLen < targetWinds.length &&
+             currentWinds[commonLen] === targetWinds[commonLen]) {
+        commonLen++;
+      }
+      function unwindForRaise(idx: number): Bounce {
+        if (idx <= commonLen) return entry.handler(val);
+        const w = currentWinds[idx - 1];
+        windStack.pop();
+        return applyCPS(w.outThunk, [], pos, (_) => unwindForRaise(idx - 1));
+      }
+      return unwindForRaise(currentWinds.length);
+    }
+    if (func.name === 'with-exception-handler') {
+      if (args.length !== 2) throw errAt('with-exception-handler: expected 2 arguments', pos);
+      const [handlerProc, thunk] = args;
+      const savedWinds = [...windStack];
+      exceptionHandlers.push({
+        handler: (val: SchemeVal) => {
+          return applyCPS(handlerProc, [val], pos, (_result) => {
+            throw new EvalError('raise: handler returned');
+          });
+        },
+        winds: savedWinds,
+      });
+      return applyCPS(thunk, [], pos, (result) => {
+        exceptionHandlers.pop();
+        return k(result);
       });
     }
     if (func.name === 'apply') {
@@ -1969,6 +2019,82 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
       return k({ tag: 'void' });
     }
 
+    if (op === 'guard') {
+      // (guard (var clause1 clause2 ...) body ...)
+      if (elems.length < 3) throw errAt('guard: bad syntax', epos);
+      const guardSpec = elems[1];
+      if (guardSpec.tag !== 'list' || guardSpec.elements.length < 1)
+        throw errAt('guard: bad syntax', epos);
+      if (guardSpec.elements[0].tag !== 'symbol')
+        throw errAt('guard: expected variable name', epos);
+
+      const varName = guardSpec.elements[0].value;
+      const clauses = guardSpec.elements.slice(1);
+      const body = elems.slice(2);
+
+      callccActive = true;
+      const guardWinds = [...windStack];
+      const guardK = k;
+
+      exceptionHandlers.push({
+        handler: (val: SchemeVal) => {
+          // Test clauses in an env with the exception bound
+          const guardEnv = new Env(env);
+          guardEnv.define(varName, val);
+
+          function testClauses(cidx: number): Bounce {
+            if (cidx >= clauses.length) {
+              // No clause matched — re-raise
+              if (exceptionHandlers.length === 0) {
+                throw new EvalError(`unhandled exception: ${displayVal(val)}`);
+              }
+              const next = exceptionHandlers.pop()!;
+              // Unwind to next handler's wind state
+              const curWinds = [...windStack];
+              const tgtWinds = next.winds;
+              let cLen = 0;
+              while (cLen < curWinds.length && cLen < tgtWinds.length &&
+                     curWinds[cLen] === tgtWinds[cLen]) cLen++;
+              function unwindReRaise(idx: number): Bounce {
+                if (idx <= cLen) return next.handler(val);
+                const w = curWinds[idx - 1];
+                windStack.pop();
+                return applyCPS(w.outThunk, [], epos, (_) => unwindReRaise(idx - 1));
+              }
+              return unwindReRaise(curWinds.length);
+            }
+
+            const clause = clauses[cidx];
+            if (clause.tag !== 'list' || clause.elements.length < 1)
+              throw errAt('guard: bad clause', epos);
+
+            if (clause.elements[0].tag === 'symbol' && clause.elements[0].value === 'else') {
+              if (clause.elements.length < 2) throw errAt('guard: bad else clause', epos);
+              return evalSeqCPS(clause.elements, 1, guardEnv, guardK);
+            }
+
+            return evalCPS(clause.elements[0], guardEnv, (testResult) => {
+              if (isTruthy(testResult)) {
+                if (clause.elements.length > 1) {
+                  return evalSeqCPS(clause.elements, 1, guardEnv, guardK);
+                }
+                return guardK(testResult);
+              }
+              return testClauses(cidx + 1);
+            });
+          }
+
+          return testClauses(0);
+        },
+        winds: guardWinds,
+      });
+
+      return evalSeqCPS(body, 0, env, (result) => {
+        exceptionHandlers.pop();
+        return k(result);
+      });
+    }
+
     if (op === 'call/cc' || op === 'call-with-current-continuation') {
       if (elems.length !== 2) throw errAt('call/cc: expected 1 argument', epos);
       callccActive = true;
@@ -2065,6 +2191,7 @@ export function evalStr(input: string): string {
   contReentry = false;
   callccActive = false;
   windStack = [];
+  exceptionHandlers = [];
   const env = makeGlobalEnv();
   const result = runTrampoline(evalSeqCPS(exprs, 0, env, (v) => v));
   return displayVal(result);
@@ -2078,6 +2205,7 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   contReentry = false;
   callccActive = false;
   windStack = [];
+  exceptionHandlers = [];
   const env = makeGlobalEnv();
   const result = runTrampoline(evalSeqCPS(exprs, 0, env, (v) => v));
   return { result: displayVal(result), output: outputBuffer };
