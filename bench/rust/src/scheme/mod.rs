@@ -1,12 +1,14 @@
 mod builtins;
 pub mod error;
+mod macros;
 mod parser;
 
 pub use error::{EvalError, SourcePos};
 
+use self::macros::{expand_macro_call, parse_syntax_rules};
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
+use std::collections::{HashMap, HashSet};
+use std::rc::{Rc, Weak};
 
 const START_POS: SourcePos = SourcePos::new(1, 1);
 
@@ -86,17 +88,42 @@ struct Lambda {
 }
 
 type EnvRef = Rc<RefCell<Env>>;
+type EnvWeak = Weak<RefCell<Env>>;
 type StringRef = Rc<RefCell<String>>;
+type BindingRef = Rc<RefCell<Value>>;
+type MacroRef = Rc<MacroTransformer>;
+
+#[derive(Debug, Clone)]
+struct MacroRule {
+    pattern: Expr,
+    template: Expr,
+}
+
+#[derive(Debug, Clone)]
+struct MacroTransformer {
+    name: String,
+    literals: HashSet<String>,
+    rules: Vec<MacroRule>,
+    env: EnvWeak,
+}
+
+#[derive(Debug, Clone)]
+enum PatternBinding {
+    Single(Expr),
+    Repeated(Vec<Expr>),
+}
 
 #[derive(Debug, Default)]
 struct Env {
     parent: Option<EnvRef>,
-    bindings: HashMap<String, Value>,
+    bindings: HashMap<String, BindingRef>,
+    syntax_bindings: HashMap<String, MacroRef>,
 }
 
 #[derive(Debug, Default)]
 struct EvalContext {
     output: String,
+    next_fresh: usize,
 }
 
 impl LambdaParams {
@@ -173,6 +200,7 @@ impl Env {
         Rc::new(RefCell::new(Self {
             parent: Some(Rc::clone(parent)),
             bindings: HashMap::new(),
+            syntax_bindings: HashMap::new(),
         }))
     }
 }
@@ -295,7 +323,7 @@ fn lookup_symbol(env: &EnvRef, name: &str, pos: SourcePos) -> Result<Value, Eval
     })
 }
 
-fn env_lookup(env: &EnvRef, name: &str) -> Option<Value> {
+fn env_lookup_cell(env: &EnvRef, name: &str) -> Option<BindingRef> {
     let mut current = Some(Rc::clone(env));
 
     while let Some(scope) = current {
@@ -307,8 +335,8 @@ fn env_lookup(env: &EnvRef, name: &str) -> Option<Value> {
             )
         };
 
-        if value.is_some() {
-            return value;
+        if let Some(value) = value {
+            return Some(value);
         }
 
         current = parent;
@@ -317,30 +345,57 @@ fn env_lookup(env: &EnvRef, name: &str) -> Option<Value> {
     None
 }
 
-fn env_define(env: &EnvRef, name: String, value: Value) {
-    env.borrow_mut().bindings.insert(name, value);
+fn env_lookup(env: &EnvRef, name: &str) -> Option<Value> {
+    env_lookup_cell(env, name).map(|cell| cell.borrow().clone())
 }
 
-fn env_set(env: &EnvRef, name: &str, value: Value) -> bool {
+fn env_define(env: &EnvRef, name: String, value: Value) {
+    let mut scope = env.borrow_mut();
+
+    if let Some(cell) = scope.bindings.get(&name) {
+        *cell.borrow_mut() = value;
+    } else {
+        scope.bindings.insert(name, Rc::new(RefCell::new(value)));
+    }
+}
+
+fn env_define_alias(env: &EnvRef, name: String, cell: BindingRef) {
+    env.borrow_mut().bindings.insert(name, cell);
+}
+
+fn env_lookup_macro(env: &EnvRef, name: &str) -> Option<MacroRef> {
     let mut current = Some(Rc::clone(env));
-    let mut value = Some(value);
 
     while let Some(scope) = current {
-        let parent = {
-            let mut scope = scope.borrow_mut();
-            if let Some(slot) = scope.bindings.get_mut(name) {
-                *slot = value
-                    .take()
-                    .expect("environment update value should only be consumed once");
-                return true;
-            }
-            scope.parent.as_ref().map(Rc::clone)
+        let (value, parent) = {
+            let scope = scope.borrow();
+            (
+                scope.syntax_bindings.get(name).cloned(),
+                scope.parent.as_ref().map(Rc::clone),
+            )
         };
+
+        if let Some(value) = value {
+            return Some(value);
+        }
 
         current = parent;
     }
 
-    false
+    None
+}
+
+fn env_define_macro(env: &EnvRef, name: String, transformer: MacroRef) {
+    env.borrow_mut().syntax_bindings.insert(name, transformer);
+}
+
+fn env_set(env: &EnvRef, name: &str, value: Value) -> bool {
+    if let Some(cell) = env_lookup_cell(env, name) {
+        *cell.borrow_mut() = value;
+        true
+    } else {
+        false
+    }
 }
 
 fn builtin_name(name: &str) -> Option<&'static str> {
@@ -431,6 +486,7 @@ fn eval_list(
             "begin" => return eval_begin(&items[1..], env, form_pos, context),
             "cond" => return eval_cond(&items[1..], env, context),
             "define" => return eval_define(&items[1..], env, form_pos, context),
+            "define-syntax" => return eval_define_syntax(&items[1..], env, form_pos),
             "if" => return eval_if(&items[1..], env, form_pos, context),
             "let" => return eval_let(&items[1..], env, form_pos, context),
             "quote" => return eval_quote(&items[1..], form_pos),
@@ -439,6 +495,11 @@ fn eval_list(
             "and" => return eval_and(&items[1..], env, context),
             "or" => return eval_or(&items[1..], env, context),
             _ => {}
+        }
+
+        if let Some(transformer) = env_lookup_macro(env, name) {
+            let expanded = expand_macro_call(&transformer, items, pos, env, context)?;
+            return eval_expr(&expanded, env, context);
         }
     }
 
@@ -474,6 +535,26 @@ fn eval_define(
             }
         }
         _ => Err(syntax_error(pos, "invalid define form")),
+    }
+}
+
+fn eval_define_syntax(args: &[Expr], env: &EnvRef, pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [name_expr, transformer_expr] => {
+            let name = name_expr
+                .symbol_name()
+                .ok_or_else(|| syntax_error(name_expr.pos, "macro name must be a symbol"))?
+                .to_string();
+            let transformer = parse_syntax_rules(&name, transformer_expr, env)?;
+            env_define_macro(env, name, transformer);
+            Ok(Value::Void)
+        }
+        _ => Err(wrong_arg_count(
+            pos,
+            "define-syntax",
+            "exactly 2 arguments",
+            args.len(),
+        )),
     }
 }
 
