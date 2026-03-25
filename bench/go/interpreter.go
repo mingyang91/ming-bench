@@ -432,6 +432,8 @@ type builtinProc struct {
 type closureProc struct {
 	name   string
 	params []string
+	rest   string
+	hasRest bool
 	body   []expr
 	env    *env
 }
@@ -515,6 +517,7 @@ func (it *interpreter) installBuiltins() {
 	it.global.define("display", &builtinProc{name: "display", fn: builtinDisplay})
 	it.global.define("write", &builtinProc{name: "write", fn: builtinWrite})
 	it.global.define("newline", &builtinProc{name: "newline", fn: builtinNewline})
+	it.global.define("apply", &builtinProc{name: "apply", fn: builtinApply})
 	it.global.define("string-copy", &builtinProc{name: "string-copy", fn: builtinStringCopy})
 	it.global.define("string-set!", &builtinProc{name: "string-set!", fn: builtinStringSet})
 	it.global.define("string-append", &builtinProc{name: "string-append", fn: builtinStringAppend})
@@ -615,14 +618,7 @@ func (it *interpreter) evalList(list *listExpr, scope *env) (value, error) {
 		args = append(args, arg)
 	}
 
-	switch proc := operator.(type) {
-	case *builtinProc:
-		return proc.fn(it, args, list.at)
-	case *closureProc:
-		return it.applyClosure(proc, args, list.at)
-	default:
-		return nil, newEvalError(ErrNotProcedure, "attempted to call a non-procedure", list.at)
-	}
+	return it.applyProcedure(operator, args, list.at)
 }
 
 func (it *interpreter) evalDefine(scope *env, list *listExpr) (value, error) {
@@ -649,15 +645,17 @@ func (it *interpreter) evalDefine(scope *env, list *listExpr) (value, error) {
 		if !ok {
 			return nil, newEvalError(ErrSyntax, "define: expected function name", target.elements[0].pos())
 		}
-		params, err := parseParamNames(target.elements[1:])
+		params, rest, hasRest, err := parseParamNames(target.elements[1:])
 		if err != nil {
 			return nil, err
 		}
 		proc := &closureProc{
-			name:   name.name,
-			params: params,
-			body:   list.elements[2:],
-			env:    scope,
+			name:    name.name,
+			params:  params,
+			rest:    rest,
+			hasRest: hasRest,
+			body:    list.elements[2:],
+			env:     scope,
 		}
 		scope.define(name.name, proc)
 		return voidValue{}, nil
@@ -720,20 +718,17 @@ func (it *interpreter) evalLambda(scope *env, list *listExpr) (value, error) {
 		return nil, newEvalError(ErrSyntax, "lambda: expected parameters and body", list.at)
 	}
 
-	paramsExpr, ok := list.elements[1].(*listExpr)
-	if !ok {
-		return nil, newEvalError(ErrSyntax, "lambda: expected parameter list", list.elements[1].pos())
-	}
-
-	params, err := parseParamNames(paramsExpr.elements)
+	params, rest, hasRest, err := parseLambdaParams(list.elements[1])
 	if err != nil {
 		return nil, err
 	}
 
 	return &closureProc{
-		params: params,
-		body:   list.elements[2:],
-		env:    scope,
+		params:  params,
+		rest:    rest,
+		hasRest: hasRest,
+		body:    list.elements[2:],
+		env:     scope,
 	}, nil
 }
 
@@ -845,18 +840,37 @@ func (it *interpreter) evalLet(scope *env, list *listExpr) (value, error) {
 	return it.applyClosure(proc, args, list.at)
 }
 
+func (it *interpreter) applyProcedure(proc value, args []value, callPos position) (value, error) {
+	switch proc := proc.(type) {
+	case *builtinProc:
+		return proc.fn(it, args, callPos)
+	case *closureProc:
+		return it.applyClosure(proc, args, callPos)
+	default:
+		return nil, newEvalError(ErrNotProcedure, "attempted to call a non-procedure", callPos)
+	}
+}
+
 func (it *interpreter) applyClosure(proc *closureProc, args []value, callPos position) (value, error) {
-	if len(args) != len(proc.params) {
-		name := "lambda"
-		if proc.name != "" {
-			name = proc.name
+	name := "lambda"
+	if proc.name != "" {
+		name = proc.name
+	}
+
+	if proc.hasRest {
+		if len(args) < len(proc.params) {
+			return nil, wrongArgCount(callPos, name, fmt.Sprintf("expected at least %d arguments, got %d", len(proc.params), len(args)))
 		}
+	} else if len(args) != len(proc.params) {
 		return nil, wrongArgCount(callPos, name, fmt.Sprintf("expected %d arguments, got %d", len(proc.params), len(args)))
 	}
 
 	callEnv := newEnv(proc.env)
 	for i, param := range proc.params {
 		callEnv.define(param, args[i])
+	}
+	if proc.hasRest {
+		callEnv.define(proc.rest, buildList(args[len(proc.params):]))
 	}
 	return it.evalSequence(callEnv, proc.body)
 }
@@ -894,16 +908,47 @@ func isTruthy(v value) bool {
 	return !ok || boolean
 }
 
-func parseParamNames(nodes []expr) ([]string, error) {
+func parseLambdaParams(node expr) ([]string, string, bool, error) {
+	switch formals := node.(type) {
+	case *listExpr:
+		return parseParamNames(formals.elements)
+	case *symbolExpr:
+		if formals.name == "." {
+			return nil, "", false, newEvalError(ErrSyntax, "expected parameter name", formals.at)
+		}
+		return nil, formals.name, true, nil
+	default:
+		return nil, "", false, newEvalError(ErrSyntax, "lambda: expected parameter list", node.pos())
+	}
+}
+
+func parseParamNames(nodes []expr) ([]string, string, bool, error) {
 	params := make([]string, 0, len(nodes))
-	for _, node := range nodes {
+	for i, node := range nodes {
 		sym, ok := node.(*symbolExpr)
 		if !ok {
-			return nil, newEvalError(ErrSyntax, "expected parameter name", node.pos())
+			return nil, "", false, newEvalError(ErrSyntax, "expected parameter name", node.pos())
 		}
-		params = append(params, sym.name)
+		if sym.name != "." {
+			params = append(params, sym.name)
+			continue
+		}
+
+		if i == len(nodes)-1 {
+			return nil, "", false, newEvalError(ErrSyntax, "expected rest parameter name", sym.at)
+		}
+
+		restNode := nodes[i+1]
+		rest, ok := restNode.(*symbolExpr)
+		if !ok || rest.name == "." {
+			return nil, "", false, newEvalError(ErrSyntax, "expected rest parameter name", restNode.pos())
+		}
+		if i+2 != len(nodes) {
+			return nil, "", false, newEvalError(ErrSyntax, "expected '.' before final parameter", nodes[i+2].pos())
+		}
+		return params, rest.name, true, nil
 	}
-	return params, nil
+	return params, "", false, nil
 }
 
 func parseLetBindings(list *listExpr) ([]letBinding, error) {
@@ -1163,6 +1208,22 @@ func builtinAppend(_ *interpreter, args []value, callPos position) (value, error
 		}
 	}
 	return result, nil
+}
+
+func builtinApply(it *interpreter, args []value, callPos position) (value, error) {
+	if len(args) < 2 {
+		return nil, wrongArgCount(callPos, "apply", "expected at least 2 arguments")
+	}
+
+	tailArgs, err := listToSlice(args[len(args)-1], callPos)
+	if err != nil {
+		return nil, err
+	}
+
+	appliedArgs := make([]value, 0, len(args)-2+len(tailArgs))
+	appliedArgs = append(appliedArgs, args[1:len(args)-1]...)
+	appliedArgs = append(appliedArgs, tailArgs...)
+	return it.applyProcedure(args[0], appliedArgs, callPos)
 }
 
 func builtinStringPred(_ *interpreter, args []value, callPos position) (value, error) {
