@@ -37,7 +37,9 @@ object Parser:
       case Token.RParen(_) :: _ =>
         throw new EvalError("unexpected )")
       case Token.Str(s, p) :: rest =>
-        (withPos(SchemeVal.str(s), p), rest)
+        val sv = SchemeVal.str(s)
+        sv.immutable = true
+        (withPos(sv, p), rest)
       case Token.Atom("quote-sugar", p) :: rest =>
         val (expr, remaining) = parseExpr(rest)
         (withPos(SchemeVal.SList(List(withPos(SchemeVal.Symbol("quote"), p), expr)), p), remaining)

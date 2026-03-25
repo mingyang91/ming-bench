@@ -131,10 +131,61 @@ object StringBuiltins:
         args =>
           if args.size != 3 then throw new EvalError("string-set!: expected 3 arguments")
           (args(0), args(1), args(2)) match
-            case (SchemeVal.StringVal(chars), SchemeVal.IntVal(i), SchemeVal.CharVal(c)) =>
+            case (sv @ SchemeVal.StringVal(chars), SchemeVal.IntVal(i), SchemeVal.CharVal(c)) =>
+              if sv.immutable then throw new EvalError("string-set!: string is immutable")
               chars(i.toInt) = c
               SchemeVal.Void
             case _ => throw new EvalError("string-set!: invalid arguments")
+      )
+    )
+    env.define(
+      "string->list",
+      SchemeVal.BuiltinProc(
+        "string->list",
+        args =>
+          if args.size != 1 then throw new EvalError("string->list: expected 1 argument")
+          args.head match
+            case SchemeVal.StringVal(chars) =>
+              SchemeVal.SList(chars.toList.map(SchemeVal.CharVal(_)))
+            case other => throw new EvalError(s"string->list: expected string, got ${SchemeVal.display(other)}")
+      )
+    )
+    env.define(
+      "list->string",
+      SchemeVal.BuiltinProc(
+        "list->string",
+        args =>
+          if args.size != 1 then throw new EvalError("list->string: expected 1 argument")
+          args.head match
+            case SchemeVal.SList(elems) =>
+              val chars = elems.map {
+                case SchemeVal.CharVal(c) => c
+                case other => throw new EvalError(s"list->string: expected character, got ${SchemeVal.display(other)}")
+              }
+              SchemeVal.StringVal(chars.toArray)
+            case other => throw new EvalError(s"list->string: expected list, got ${SchemeVal.display(other)}")
+      )
+    )
+    env.define(
+      "char->integer",
+      SchemeVal.BuiltinProc(
+        "char->integer",
+        args =>
+          if args.size != 1 then throw new EvalError("char->integer: expected 1 argument")
+          args.head match
+            case SchemeVal.CharVal(c) => SchemeVal.IntVal(c.toLong)
+            case other => throw new EvalError(s"char->integer: expected character, got ${SchemeVal.display(other)}")
+      )
+    )
+    env.define(
+      "integer->char",
+      SchemeVal.BuiltinProc(
+        "integer->char",
+        args =>
+          if args.size != 1 then throw new EvalError("integer->char: expected 1 argument")
+          args.head match
+            case SchemeVal.IntVal(n) => SchemeVal.CharVal(n.toChar)
+            case other => throw new EvalError(s"integer->char: expected integer, got ${SchemeVal.display(other)}")
       )
     )
 

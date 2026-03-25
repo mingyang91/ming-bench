@@ -2,6 +2,7 @@ package ming
 
 enum SchemeVal:
   var pos: (Int, Int) = (0, 0)
+  var immutable: Boolean = false
   case IntVal(n: Long)
   case RationalVal(num: Long, den: Long)
   case FloatVal(d: Double)
