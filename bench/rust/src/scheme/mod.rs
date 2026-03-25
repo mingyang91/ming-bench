@@ -1529,7 +1529,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     }
     let state = CekState::Eval(exprs[0].clone(), Rc::clone(&env));
     let result = cek_run(state, &mut kont, &mut winders, &mut output)?;
-    Ok((result.display_value(), output))
+    Ok((result.display_repr(), output))
 }
 #[cfg(test)]
 mod tests;
