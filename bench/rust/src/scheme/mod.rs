@@ -754,6 +754,21 @@ fn expand_macro(
 }
 
 fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
+    let mut cur = expr.clone();
+    let mut cur_env = env.clone();
+    loop {
+        let mut bounce: Option<(Expr, Env)> = None;
+        let result = eval_body(&cur, &cur_env, out, &mut bounce)?;
+        if let Some((next_expr, next_env)) = bounce {
+            cur = next_expr;
+            cur_env = next_env;
+        } else {
+            return Ok(result);
+        }
+    }
+}
+
+fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, Env)>) -> Result<Val, EvalError> {
     let span = expr.span;
     match &expr.kind {
         ExprKind::Int(n) => Ok(Val::Int(*n)),
@@ -882,7 +897,8 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                 // Check for macro expansion
                 if let Some(mac @ Val::Macro { .. }) = env_get(env, op) {
                     let expanded = expand_macro(&mac, list, span, env)?;
-                    return eval(&expanded, env, out);
+                    *tco = Some((expanded, env.clone()));
+                    return Ok(Val::Void);
                 }
             }
             // Check for special forms
@@ -928,9 +944,11 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                         }
                         let cond = eval(&list[1], env, out)?;
                         if is_truthy(&cond) {
-                            return eval(&list[2], env, out);
+                            *tco = Some((list[2].clone(), env.clone()));
+                            return Ok(Val::Void);
                         } else if list.len() == 4 {
-                            return eval(&list[3], env, out);
+                            *tco = Some((list[3].clone(), env.clone()));
+                            return Ok(Val::Void);
                         } else {
                             return Ok(Val::Void);
                         }
@@ -1027,11 +1045,13 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                             for (p, v) in params.iter().zip(init_vals) {
                                 env_set(&call_env, p.clone(), v);
                             }
-                            let mut result = Val::Void;
-                            for expr in &list[3..] {
-                                result = eval(expr, &call_env, out)?;
+                            let body_exprs = &list[3..];
+                            if body_exprs.is_empty() { return Ok(Val::Void); }
+                            for i in 0..body_exprs.len() - 1 {
+                                eval(&body_exprs[i], &call_env, out)?;
                             }
-                            return Ok(result);
+                            *tco = Some((body_exprs.last().unwrap().clone(), call_env));
+                            return Ok(Val::Void);
                         }
                         let bindings = match &list[1].kind {
                             ExprKind::List(b) => b,
@@ -1051,11 +1071,13 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                                 _ => return Err(err_at(span, EvalError::Parse("let: bad binding".into()))),
                             }
                         }
-                        let mut result = Val::Void;
-                        for expr in &list[2..] {
-                            result = eval(expr, &let_env, out)?;
+                        let body_exprs = &list[2..];
+                        if body_exprs.is_empty() { return Ok(Val::Void); }
+                        for i in 0..body_exprs.len() - 1 {
+                            eval(&body_exprs[i], &let_env, out)?;
                         }
-                        return Ok(result);
+                        *tco = Some((body_exprs.last().unwrap().clone(), let_env));
+                        return Ok(Val::Void);
                     }
                     "set!" => {
                         if list.len() != 3 {
@@ -1072,11 +1094,12 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                         return Ok(Val::Void);
                     }
                     "begin" => {
-                        let mut result = Val::Void;
-                        for expr in &list[1..] {
-                            result = eval(expr, env, out)?;
+                        if list.len() <= 1 { return Ok(Val::Void); }
+                        for i in 1..list.len() - 1 {
+                            eval(&list[i], env, out)?;
                         }
-                        return Ok(result);
+                        *tco = Some((list.last().unwrap().clone(), env.clone()));
+                        return Ok(Val::Void);
                     }
                     "cond" => {
                         for clause in &list[1..] {
@@ -1084,20 +1107,22 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                                 ExprKind::List(parts) if !parts.is_empty() => {
                                     if let ExprKind::Symbol(s) = &parts[0].kind {
                                         if s == "else" {
-                                            let mut result = Val::Void;
-                                            for expr in &parts[1..] {
-                                                result = eval(expr, env, out)?;
+                                            if parts.len() <= 1 { return Ok(Val::Void); }
+                                            for i in 1..parts.len() - 1 {
+                                                eval(&parts[i], env, out)?;
                                             }
-                                            return Ok(result);
+                                            *tco = Some((parts.last().unwrap().clone(), env.clone()));
+                                            return Ok(Val::Void);
                                         }
                                     }
                                     let cond_val = eval(&parts[0], env, out)?;
                                     if is_truthy(&cond_val) {
-                                        let mut result = cond_val;
-                                        for expr in &parts[1..] {
-                                            result = eval(expr, env, out)?;
+                                        if parts.len() <= 1 { return Ok(cond_val); }
+                                        for i in 1..parts.len() - 1 {
+                                            eval(&parts[i], env, out)?;
                                         }
-                                        return Ok(result);
+                                        *tco = Some((parts.last().unwrap().clone(), env.clone()));
+                                        return Ok(Val::Void);
                                     }
                                 }
                                 _ => return Err(err_at(span, EvalError::Parse("cond: bad clause".into()))),
@@ -1106,24 +1131,26 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                         return Ok(Val::Void);
                     }
                     "and" => {
-                        let mut result = Val::Bool(true);
-                        for arg in &list[1..] {
-                            result = eval(arg, env, out)?;
+                        if list.len() <= 1 { return Ok(Val::Bool(true)); }
+                        for i in 1..list.len() - 1 {
+                            let result = eval(&list[i], env, out)?;
                             if !is_truthy(&result) {
                                 return Ok(result);
                             }
                         }
-                        return Ok(result);
+                        *tco = Some((list.last().unwrap().clone(), env.clone()));
+                        return Ok(Val::Void);
                     }
                     "or" => {
-                        let mut result = Val::Bool(false);
-                        for arg in &list[1..] {
-                            result = eval(arg, env, out)?;
+                        if list.len() <= 1 { return Ok(Val::Bool(false)); }
+                        for i in 1..list.len() - 1 {
+                            let result = eval(&list[i], env, out)?;
                             if is_truthy(&result) {
                                 return Ok(result);
                             }
                         }
-                        return Ok(result);
+                        *tco = Some((list.last().unwrap().clone(), env.clone()));
+                        return Ok(Val::Void);
                     }
                     "let*" => {
                         if list.len() < 3 {
@@ -1147,11 +1174,13 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                                 _ => return Err(err_at(span, EvalError::Parse("let*: bad binding".into()))),
                             }
                         }
-                        let mut result = Val::Void;
-                        for expr in &list[2..] {
-                            result = eval(expr, &let_env, out)?;
+                        let body_exprs = &list[2..];
+                        if body_exprs.is_empty() { return Ok(Val::Void); }
+                        for i in 0..body_exprs.len() - 1 {
+                            eval(&body_exprs[i], &let_env, out)?;
                         }
-                        return Ok(result);
+                        *tco = Some((body_exprs.last().unwrap().clone(), let_env));
+                        return Ok(Val::Void);
                     }
                     "letrec" => {
                         if list.len() < 3 {
@@ -1186,11 +1215,13 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                         for (name, val) in names.into_iter().zip(vals) {
                             env_set(&letrec_env, name, val);
                         }
-                        let mut result = Val::Void;
-                        for expr in &list[2..] {
-                            result = eval(expr, &letrec_env, out)?;
+                        let body_exprs = &list[2..];
+                        if body_exprs.is_empty() { return Ok(Val::Void); }
+                        for i in 0..body_exprs.len() - 1 {
+                            eval(&body_exprs[i], &letrec_env, out)?;
                         }
-                        return Ok(result);
+                        *tco = Some((body_exprs.last().unwrap().clone(), letrec_env));
+                        return Ok(Val::Void);
                     }
                     "letrec*" => {
                         if list.len() < 3 {
@@ -1214,11 +1245,13 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                                 _ => return Err(err_at(span, EvalError::Parse("letrec*: bad binding".into()))),
                             }
                         }
-                        let mut result = Val::Void;
-                        for expr in &list[2..] {
-                            result = eval(expr, &letrec_env, out)?;
+                        let body_exprs = &list[2..];
+                        if body_exprs.is_empty() { return Ok(Val::Void); }
+                        for i in 0..body_exprs.len() - 1 {
+                            eval(&body_exprs[i], &letrec_env, out)?;
                         }
-                        return Ok(result);
+                        *tco = Some((body_exprs.last().unwrap().clone(), letrec_env));
+                        return Ok(Val::Void);
                     }
                     "case" => {
                         if list.len() < 2 {
@@ -1231,11 +1264,12 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                                     // else clause
                                     if let ExprKind::Symbol(s) = &parts[0].kind {
                                         if s == "else" {
-                                            let mut result = Val::Void;
-                                            for expr in &parts[1..] {
-                                                result = eval(expr, env, out)?;
+                                            if parts.len() <= 1 { return Ok(Val::Void); }
+                                            for i in 1..parts.len() - 1 {
+                                                eval(&parts[i], env, out)?;
                                             }
-                                            return Ok(result);
+                                            *tco = Some((parts.last().unwrap().clone(), env.clone()));
+                                            return Ok(Val::Void);
                                         }
                                     }
                                     // datum clause: ((datum ...) expr ...)
@@ -1248,11 +1282,12 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                                         val_eqv(&key, &datum_val)
                                     });
                                     if matched {
-                                        let mut result = Val::Void;
-                                        for expr in &parts[1..] {
-                                            result = eval(expr, env, out)?;
+                                        if parts.len() <= 1 { return Ok(Val::Void); }
+                                        for i in 1..parts.len() - 1 {
+                                            eval(&parts[i], env, out)?;
                                         }
-                                        return Ok(result);
+                                        *tco = Some((parts.last().unwrap().clone(), env.clone()));
+                                        return Ok(Val::Void);
                                     }
                                 }
                                 _ => return Err(err_at(span, EvalError::Parse("case: bad clause".into()))),
@@ -1297,12 +1332,13 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                             // Evaluate test
                             let test_val = eval(&test_clause[0], &do_env, out)?;
                             if is_truthy(&test_val) {
-                                // Evaluate result expressions
-                                let mut result = Val::Void;
-                                for expr in &test_clause[1..] {
-                                    result = eval(expr, &do_env, out)?;
+                                // Evaluate result expressions with TCO on last
+                                if test_clause.len() <= 1 { return Ok(Val::Void); }
+                                for i in 1..test_clause.len() - 1 {
+                                    eval(&test_clause[i], &do_env, out)?;
                                 }
-                                return Ok(result);
+                                *tco = Some((test_clause.last().unwrap().clone(), do_env.clone()));
+                                return Ok(Val::Void);
                             }
                             // Evaluate body
                             for expr in body {
@@ -1442,7 +1478,75 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                 args.push(eval(a, env, out)?);
             }
 
-            call_function(&func, args, span, out)
+            // TCO for Lambda/CaseLambda, delegate others to call_function
+            match func {
+                Val::Lambda { params, rest_param, mut body, env: closure_env } => {
+                    if let Some(ref _rp) = rest_param {
+                        if args.len() < params.len() {
+                            return Err(err_at(span, EvalError::Arity(format!(
+                                "expected at least {} arguments, got {}", params.len(), args.len()
+                            ))));
+                        }
+                    } else if args.len() != params.len() {
+                        return Err(err_at(span, EvalError::Arity(format!(
+                            "expected {} arguments, got {}", params.len(), args.len()
+                        ))));
+                    }
+                    let call_env = new_env(Some(closure_env));
+                    for (p, a) in params.iter().zip(args.iter()) {
+                        env_set(&call_env, p.clone(), a.clone());
+                    }
+                    if let Some(ref rp) = rest_param {
+                        let rest_args = &args[params.len()..];
+                        let mut rest_list = Val::Nil;
+                        for a in rest_args.iter().rev() {
+                            rest_list = Val::Pair(Box::new(a.clone()), Box::new(rest_list));
+                        }
+                        env_set(&call_env, rp.clone(), rest_list);
+                    }
+                    if body.is_empty() { return Ok(Val::Void); }
+                    let last = body.pop().unwrap();
+                    for e in &body {
+                        eval(e, &call_env, out)?;
+                    }
+                    *tco = Some((last, call_env));
+                    Ok(Val::Void)
+                }
+                Val::CaseLambda { clauses, env: closure_env } => {
+                    for (params, rest_param, mut body_cl) in clauses {
+                        let matches = if rest_param.is_some() {
+                            args.len() >= params.len()
+                        } else {
+                            args.len() == params.len()
+                        };
+                        if matches {
+                            let call_env = new_env(Some(closure_env.clone()));
+                            for (p, a) in params.iter().zip(args.iter()) {
+                                env_set(&call_env, p.clone(), a.clone());
+                            }
+                            if let Some(ref rp) = rest_param {
+                                let rest_args = &args[params.len()..];
+                                let mut rest_list = Val::Nil;
+                                for a in rest_args.iter().rev() {
+                                    rest_list = Val::Pair(Box::new(a.clone()), Box::new(rest_list));
+                                }
+                                env_set(&call_env, rp.clone(), rest_list);
+                            }
+                            if body_cl.is_empty() { return Ok(Val::Void); }
+                            let last = body_cl.pop().unwrap();
+                            for e in &body_cl {
+                                eval(e, &call_env, out)?;
+                            }
+                            *tco = Some((last, call_env));
+                            return Ok(Val::Void);
+                        }
+                    }
+                    Err(err_at(span, EvalError::Arity(format!(
+                        "case-lambda: no matching clause for {} arguments", args.len()
+                    ))))
+                }
+                other => call_function(&other, args, span, out),
+            }
         }
     }
 }
