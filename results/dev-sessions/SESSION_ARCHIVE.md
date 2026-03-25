@@ -426,8 +426,21 @@ Sessions: 40 | Source: `~/.claude/projects/-home-my--zeroclaw-workspace-cs61a-be
 
 ## 2026-03-25
 
-### [Session Backup & Archive (this session)](c4050e99-2147-40c2-9d6e-bb4ba1cfaf68.jsonl)
+### [Session Backup & Archive](c4050e99-2147-40c2-9d6e-bb4ba1cfaf68.jsonl)
 - **First prompt:** "can you backup all history sessions file to result?"
 - **Summary:** Backed up all session JSONL files to results/dev-sessions/ and generated this archive document.
 - **Topics:** session backup, history preservation, cross-session analysis
 - **Size:** 135K
+
+### [R22-R26 Analysis, QG Tuning, sboyer Fix, PreToolUse Hooks](current session)
+- **First prompt:** "compare r14"
+- **Summary:** Extended multi-round benchmark analysis session. Compared R14-R26 across all 6 Claude runs (5 languages, default + quality-gate strategies). Key deliverables: (1) Level reordering — moved TCO/pair-mutation/call-cc to L16-L18 difficulty wall, (2) Two-pass QG strategy swap — coding pass uses default.md, cleanup uses quality-gate.md (cut QG coding turns 44%), (3) Raised file size limit 500→1500 based on empirical struggle-rate analysis, (4) Diagnosed sboyer stack overflow root cause (debug vs release stack frames), (5) Added [profile.test] opt-level=2 and PreToolUse hooks blocking direct test commands, (6) Agent pre-planning analysis (zero forward design confirmed), (7) Scala-QG compliance audit (accidental 300-line file targeting).
+- **Topics:** run comparison, token analysis, level reordering, QG strategy swap, file size limits, sboyer stack overflow, PreToolUse hooks, agent compliance, pre-planning analysis, difficulty wall calibration
+- **Commits:** `deb3aadc` (level reorder), `a8722d35` (QG swap + 1500 limit), `60170053` (hooks + profile.test)
+- **Key findings:**
+  - Difficulty wall dropped 26/26 completion from 83% (r21) to 17% (r22)
+  - QG strategy swap made QG coding pass competitive with default (20.4 vs 21.7 turns/level)
+  - File size 1500 is data-driven: agents struggle at 67% rate above 2000 lines
+  - Scala-QG set cost record: $157 for 26/26 ($6.02/level)
+  - Agents never pre-plan despite seeing full SPEC — reactive coding only
+  - Rust agents ignore "never run cargo test" rule after 50 turns of pressure

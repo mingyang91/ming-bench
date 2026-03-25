@@ -4,6 +4,39 @@ A record of key design decisions, what changed, and why. Latest first.
 
 ---
 
+## Phase 6: Benchmark Tuning & Agent Behavioral Analysis (Mar 25)
+
+### PreToolUse Hooks to Block Direct Test Commands
+**What:** Added static `.claude/hooks/block-test.sh` + `.claude/settings.json` to all 5 language dirs. Hook fires before every Bash tool call, blocks direct test commands (`cargo test`, `go test`, `gradlew test`, `vitest`, `mill test`), returns deny with a message redirecting to `cargo xtask test`.
+**Why:** R24/R26 compliance analysis showed Rust agents ignoring the "NEVER run cargo test" rule after ~50 turns of pressure — running `cargo test` 48 times vs `cargo xtask test` 3 times. Prose rules drift under debugging pressure; hooks enforce mechanically. Works even with `--dangerously-skip-permissions`.
+**Also:** Added `[profile.test] opt-level = 2` to bench/rust/Cargo.toml so even if an agent bypasses the hook, `cargo test` compiles with optimization (shrinking stack frames from ~30KB to ~5KB), preventing the sboyer stack overflow that killed agents at L14.
+
+### File Size Threshold Analysis: 1500 Lines Is the Struggle Zone
+**What:** Correlated max source file size vs struggle rate (5+ test reruns or 60+ turns) across all r24 runs (134 level-runs, 5 languages). Found: 0-999 lines → 0-6% struggle, 1000-1499 → 12%, 1500-1999 → 9% (but catastrophic when it fails), 2000-2499 → **67%** struggle rate. Confirmed 1500-line QG limit is data-driven — sits just below the danger zone.
+**Why:** Needed empirical basis for the file size limit rather than intuition. "Human 3x" (300→1000) was close but the data says 1500 is the actual threshold where agents start making systematic mistakes.
+
+### Scala-QG Compliance: Accidental Over-Compliance on File Size
+**What:** `/compliance` analysis of cl-scala-qg-r25 revealed the agent confused `FileTooLong` (1500 lines) with `MethodTooLong` (300 lines), targeting 300-line files instead of 1500. This created 19 files instead of 3-4 — accidentally reducing input token costs (73:1 input:output ratio vs 150+ for others).
+**Why:** The accidental over-compliance actually helped: smaller files = less context re-read per turn = cheaper. Scala-QG r25 was the cheapest completer at $157 (26/26). The bug is beneficial — no fix needed.
+
+### sboyer Stack Overflow Root Cause
+**What:** Traced the L14 sboyer failure that killed Rust agents in r24 and r26. Root cause: agents run `cargo test` (debug mode) for fast feedback, but debug stack frames are ~30KB vs ~5KB in release. sboyer needs ~1000 recursion levels → 30MB stack needed in debug vs 5MB in release. Default 8MB stack overflows in debug only. Agents spiral: try larger stacks (8→16→64→256MB), add depth guards, attempt mid-level TCO refactors — all fail because the real fix is simply "compile in release mode."
+**Why:** This explained why `cargo xtask test` (release mode) passes but agents die during development. The `[profile.test] opt-level = 2` fix + hook blocking direct `cargo test` addresses both the symptom and the root cause.
+
+### R22-R26 Cross-Round Analysis
+**What:** Ran 6 concurrent agents per round across 5 languages (Rust, Go, Java, TS, Scala) with default and quality-gate strategies. Key findings:
+- **R22** (first run with difficulty wall): Only 1/6 completed 26/26 (TS). Wall works as differentiator.
+- **R23** (strategy swap): QG coding pass matched default speed (20.4 vs 21.7 turns/level). 44% turn reduction vs R22.
+- **R24** (swap + 1500 limit): First QG 26/26 completion. Rust-QG ($215) beat Rust-default (dead at L14). Scala-QG $206.
+- **R25**: Scala-QG set benchmark record at $157/26 levels ($6.02/level). Java $225. Rust-QG $236.
+- **R26**: Java won at $153/28 levels. Rust-QG died at L14 (sboyer). Led to hook/profile fix.
+
+### Agent Pre-Planning Analysis: Zero Forward Design
+**What:** Searched all r22 agent thinking blocks for mentions of call/cc, TCO, trampoline, pair mutation BEFORE those features' levels. Found zero genuine pre-planning across all 6 runs. Agents read SPEC.md (100-150 lines) at L01 but never reference future levels in their architectural thinking.
+**Why:** Validates that the difficulty wall tests reactive coding quality, not planning ability. Also confirms the current soft instruction ("don't skip ahead") is sufficient — but progressive spec revelation should be implemented before a model that spontaneously plans ahead arrives.
+
+---
+
 ## Phase 5: Validation & Reflection (Mar 23-25)
 
 ### Session Archival (This Document)
