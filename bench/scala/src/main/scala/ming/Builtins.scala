@@ -54,7 +54,8 @@ private[ming] object Builtins:
     case "string-append" | "string-length" | "string-set!" | "string-copy" | "substring" | "string->number" |
         "number->string" | "symbol->string" | "string->symbol" | "string-ref" | "char?" =>
       applyStringBuiltin(name, args)
-    case _ => throw EvalError(s"unknown procedure: $name")
+    case "apply" => throw EvalError("apply: should be handled by applyProc")
+    case _       => throw EvalError(s"unknown procedure: $name")
 
   private def applyStringBuiltin(name: String, args: List[Expr]): Expr = name match
     case "string-append" =>
@@ -177,14 +178,14 @@ private[ming] object Builtins:
     case _                => false
 
   def display(e: Expr): String = e match
-    case Expr.Num(n)          => n.toString
-    case Expr.Bool(true)      => "#t"
-    case Expr.Bool(false)     => "#f"
-    case Expr.Str(s)          => "\"" + new String(s) + "\""
-    case Expr.Chr(c)          => s"#\\$c"
-    case Expr.Sym(name)       => name
-    case Expr.Lst(elems)      => "(" + elems.map(display).mkString(" ") + ")"
-    case Expr.Lambda(_, _, _) => "#<procedure>"
+    case Expr.Num(n)             => n.toString
+    case Expr.Bool(true)         => "#t"
+    case Expr.Bool(false)        => "#f"
+    case Expr.Str(s)             => "\"" + new String(s) + "\""
+    case Expr.Chr(c)             => s"#\\$c"
+    case Expr.Sym(name)          => name
+    case Expr.Lst(elems)         => "(" + elems.map(display).mkString(" ") + ")"
+    case Expr.Lambda(_, _, _, _) => "#<procedure>"
 
   private def displayOutput(e: Expr): String = e match
     case Expr.Str(s) => new String(s)
@@ -226,7 +227,8 @@ private[ming] object Builtins:
     "string-ref",
     "string-set!",
     "string-copy",
-    "char?"
+    "char?",
+    "apply"
   )
 
   def makeTopLevelEnv(): Env =

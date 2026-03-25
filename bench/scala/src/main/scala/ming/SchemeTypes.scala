@@ -9,7 +9,7 @@ private[ming] enum Expr:
   case Chr(value: Char)
   case Sym(name: String)
   case Lst(elems: List[Expr])
-  case Lambda(params: List[String], body: List[Expr], closure: Env)
+  case Lambda(params: List[String], restParam: Option[String], body: List[Expr], closure: Env)
 
   var line: Int = 0
   var col: Int  = 0
