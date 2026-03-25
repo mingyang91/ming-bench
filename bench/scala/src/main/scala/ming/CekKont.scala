@@ -55,11 +55,35 @@ private[ming] case class DynWindTransferK(
   savedK: Kont
 ) extends Kont
 
+// Exception handler entries
+sealed private[ming] trait ExnHandlerEntry:
+  def windStack: List[WindEntry]
+
+private[ming] class SimpleExnHandler(val handler: Expr, val windStack: List[WindEntry]) extends ExnHandlerEntry
+
+private[ming] class GuardExnHandler(
+  val varName: String,
+  val clauses: List[Expr],
+  val env: Env,
+  val exitK: Kont,
+  val windStack: List[WindEntry]
+) extends ExnHandlerEntry
+
+// Exception-related continuations
+private[ming] case class PopExnHandlerK(k: Kont)                                                  extends Kont
+private[ming] case object RaiseReturnK                                                            extends Kont
+private[ming] case class CallExnHandlerK(handler: Expr, exnValue: Expr, afterK: Kont)             extends Kont
+private[ming] case class GuardStartK(varName: String, clauses: List[Expr], env: Env, exitK: Kont) extends Kont
+
+private[ming] case class GuardCondK(varName: String, body: List[Expr], remaining: List[Expr], env: Env, exitK: Kont)
+    extends Kont
+
 private[ming] class CekState:
-  var expr: Expr                 = null
-  var env: Env                   = null
-  var k: Kont                    = null
-  var value: Expr                = null
-  var evaluating: Boolean        = true
-  var appPosExpr: Expr           = null
-  var windStack: List[WindEntry] = Nil
+  var expr: Expr                         = null
+  var env: Env                           = null
+  var k: Kont                            = null
+  var value: Expr                        = null
+  var evaluating: Boolean                = true
+  var appPosExpr: Expr                   = null
+  var windStack: List[WindEntry]         = Nil
+  var exnHandlers: List[ExnHandlerEntry] = Nil

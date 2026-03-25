@@ -71,10 +71,10 @@ object CekMachine:
         evalCondClauses(s, clauses, curEnv, s.k)
 
       case Expr.Lst(Expr.Sym("and") :: args) =>
-        stepLogical(s, args, curEnv, isAnd = true)
+        CekHelpers.stepLogical(s, args, curEnv, isAnd = true)
 
       case Expr.Lst(Expr.Sym("or") :: args) =>
-        stepLogical(s, args, curEnv, isAnd = false)
+        CekHelpers.stepLogical(s, args, curEnv, isAnd = false)
 
       case Expr.Lst(Expr.Sym("case") :: rest) =>
         if rest.isEmpty then throw EvalError("case: need key expression")
@@ -97,6 +97,9 @@ object CekMachine:
         s.value = SpecialForms.evalDo(rest, curEnv)
         s.evaluating = false
 
+      case Expr.Lst(Expr.Sym("guard") :: rest) =>
+        CekHelpers.stepGuard(s, rest, curEnv)
+
       case lst @ Expr.Lst(Expr.Sym(name) :: _) if SpecialForms.isMacro(name, curEnv) =>
         val mac = SpecialForms.lookupMacro(name, curEnv)
         val (expanded, hygieneEnv) =
@@ -108,15 +111,6 @@ object CekMachine:
         s.appPosExpr = curExpr
         s.k = EvFunK(args, curEnv, s.k)
         s.expr = op
-
-  private def stepLogical(s: CekState, args: List[Expr], curEnv: Env, isAnd: Boolean): Unit =
-    if args.isEmpty then
-      s.value = Expr.Bool(isAnd)
-      s.evaluating = false
-    else if args.length == 1 then s.expr = args.head
-    else
-      s.k = if isAnd then AndK(args.tail, curEnv, s.k) else OrK(args.tail, curEnv, s.k)
-      s.expr = args.head
 
   private def stepKont(s: CekState): Expr =
     s.k match
@@ -172,36 +166,16 @@ object CekMachine:
           s.env = e
           s.evaluating = true
 
-      case BindK(name, remaining, body, bindEnv, evalEnv, kk) =>
-        bindEnv.define(name, s.value)
-        if remaining.isEmpty then setupBody(s, body, bindEnv, kk)
-        else
-          s.k = BindK(remaining.head._1, remaining.tail, body, bindEnv, evalEnv, kk)
-          s.expr = remaining.head._2
-          s.env = evalEnv
-          s.evaluating = true
-
-      case NamedLetBindK(name, paramNames, evaledRev, remaining, body, evalEnv, kk) =>
-        val newEvaled = s.value :: evaledRev
-        if remaining.isEmpty then
-          val initVals = newEvaled.reverse
-          val letEnv   = evalEnv.child()
-          letEnv.define(name, Expr.Lambda(paramNames, None, body, letEnv))
-          val localEnv = Evaluator.bindLambdaParams(paramNames, None, initVals, letEnv)
-          setupBody(s, body, localEnv, kk)
-        else
-          s.k = NamedLetBindK(name, paramNames, newEvaled, remaining.tail, body, evalEnv, kk)
-          s.expr = remaining.head
-          s.env = evalEnv
-          s.evaluating = true
+      case _: BindK | _: NamedLetBindK =>
+        CekHelpers.stepBindKont(s, s.k)
 
       case AndK(remaining, e, kk) =>
         if isFalsy(s.value) then s.k = kk
-        else stepLogicalKont(s, remaining, e, kk, isAnd = true)
+        else CekHelpers.stepLogicalKont(s, remaining, e, kk, isAnd = true)
 
       case OrK(remaining, e, kk) =>
         if !isFalsy(s.value) then s.k = kk
-        else stepLogicalKont(s, remaining, e, kk, isAnd = false)
+        else CekHelpers.stepLogicalKont(s, remaining, e, kk, isAnd = false)
 
       case CondK(body, remaining, e, kk) =>
         if !isFalsy(s.value) then
@@ -212,60 +186,31 @@ object CekMachine:
       case CaseKeyK(clauses, e, kk) =>
         evalCaseClauses(s, s.value, clauses, e, kk)
 
-      case k: DynWindAfterInK   => stepDynWind(s, k)
-      case k: DynWindAfterBodyK => stepDynWind(s, k)
-      case k: DynWindAfterOutK  => stepDynWind(s, k)
-      case k: DynWindTransferK  => stepDynWind(s, k)
+      case k: DynWindAfterInK   => CekHelpers.stepDynWind(s, k)
+      case k: DynWindAfterBodyK => CekHelpers.stepDynWind(s, k)
+      case k: DynWindAfterOutK  => CekHelpers.stepDynWind(s, k)
+      case k: DynWindTransferK  => CekHelpers.stepDynWind(s, k)
+
+      case PopExnHandlerK(kk) =>
+        s.exnHandlers = s.exnHandlers.tail
+        s.k = kk
+
+      case RaiseReturnK =>
+        throw EvalError("raise: handler returned")
+
+      case CallExnHandlerK(handler, exnValue, afterK) =>
+        applyFunc(s, handler, List(exnValue), afterK)
+
+      case GuardStartK(varName, clauses, env, exitK) =>
+        evalGuardClauses(s, varName, clauses, env, exitK)
+
+      case GuardCondK(varName, body, remaining, env, exitK) =>
+        if !isFalsy(s.value) then
+          if body.isEmpty then s.k = exitK
+          else setupBody(s, body, env, exitK)
+        else evalGuardClauses(s, varName, remaining, env, exitK)
 
     null // signal: keep looping
-
-  private def stepDynWind(s: CekState, k: Kont): Unit = k match
-    case DynWindAfterInK(entry, bodyThunk, outThunk, kk) =>
-      s.windStack = entry :: s.windStack
-      applyFunc(s, bodyThunk, Nil, DynWindAfterBodyK(entry, outThunk, kk))
-
-    case DynWindAfterBodyK(entry, outThunk, kk) =>
-      val bodyValue = s.value
-      s.windStack = s.windStack.tail
-      applyFunc(s, outThunk, Nil, DynWindAfterOutK(bodyValue, kk))
-
-    case DynWindAfterOutK(bodyValue, kk) =>
-      s.value = bodyValue
-      s.k = kk
-
-    case DynWindTransferK(unwindOuts, rewindEntries, targetWinds, value, savedK) =>
-      if unwindOuts.nonEmpty then
-        s.windStack = s.windStack.tail
-        val nextK = DynWindTransferK(unwindOuts.tail, rewindEntries, targetWinds, value, savedK)
-        applyFunc(s, unwindOuts.head, Nil, nextK)
-      else if rewindEntries.nonEmpty then
-        s.windStack = rewindEntries.head :: s.windStack
-        val nextK = DynWindTransferK(Nil, rewindEntries.tail, targetWinds, value, savedK)
-        applyFunc(s, rewindEntries.head.inThunk, Nil, nextK)
-      else
-        s.value = value
-        s.k = savedK
-        s.evaluating = false
-
-    case _ => ()
-
-  private def stepLogicalKont(
-    s: CekState,
-    remaining: List[Expr],
-    e: Env,
-    kk: Kont,
-    isAnd: Boolean
-  ): Unit =
-    if remaining.length == 1 then
-      s.expr = remaining.head
-      s.env = e
-      s.k = kk
-      s.evaluating = true
-    else
-      s.k = if isAnd then AndK(remaining.tail, e, kk) else OrK(remaining.tail, e, kk)
-      s.expr = remaining.head
-      s.env = e
-      s.evaluating = true
 
   private def run(expr0: Expr, env0: Env, k0: Kont): Expr =
     val s = new CekState

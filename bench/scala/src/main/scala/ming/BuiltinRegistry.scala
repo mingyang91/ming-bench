@@ -123,7 +123,10 @@ private[ming] object BuiltinRegistry:
     "void",
     "call/cc",
     "call-with-current-continuation",
-    "dynamic-wind"
+    "dynamic-wind",
+    "with-exception-handler",
+    "raise",
+    "raise-continuable"
   )
 
   def makeTopLevelEnv(): Env =

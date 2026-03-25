@@ -63,6 +63,18 @@ object CekApply:
         s.value = applyForEachCek(args)
         s.k = kk
         s.evaluating = false
+      case Expr.Sym("with-exception-handler") =>
+        if args.length != 2 then throw EvalError("with-exception-handler: need exactly 2 arguments")
+        val handler = args(0)
+        val thunk   = args(1)
+        s.exnHandlers = new SimpleExnHandler(handler, s.windStack) :: s.exnHandlers
+        applyFunc(s, thunk, Nil, PopExnHandlerK(kk))
+      case Expr.Sym("raise") =>
+        if args.length != 1 then throw EvalError("raise: need exactly 1 argument")
+        performRaise(s, args.head, kk)
+      case Expr.Sym("raise-continuable") =>
+        if args.length != 1 then throw EvalError("raise-continuable: need exactly 1 argument")
+        performRaise(s, args.head, kk)
       case Expr.Sym("dynamic-wind") =>
         if args.length != 3 then throw EvalError("dynamic-wind: need exactly 3 arguments")
         val (inThunk, bodyThunk, outThunk) = (args(0), args(1), args(2))
@@ -168,6 +180,54 @@ object CekApply:
           s.expr = parsed.head._2
           s.env = letEnv
       case _ => throw EvalError("letrec: invalid syntax")
+
+  def performRaise(s: CekState, exnValue: Expr, currentK: Kont): Unit =
+    if s.exnHandlers.isEmpty then throw EvalError(s"unhandled exception: ${Display.display(exnValue)}")
+    val entry = s.exnHandlers.head
+    s.exnHandlers = s.exnHandlers.tail
+    entry match
+      case h: SimpleExnHandler =>
+        val (toUnwind, toRewind) = computeWindTransfer(s.windStack, h.windStack)
+        if toUnwind.isEmpty && toRewind.isEmpty then applyFunc(s, h.handler, List(exnValue), RaiseReturnK)
+        else
+          val unwindOuts = toUnwind.map(_.outThunk)
+          s.k = DynWindTransferK(
+            unwindOuts,
+            toRewind,
+            h.windStack,
+            exnValue,
+            CallExnHandlerK(h.handler, exnValue, RaiseReturnK)
+          )
+          s.evaluating = false
+      case g: GuardExnHandler =>
+        val clauseEnv = g.env.child()
+        clauseEnv.define(g.varName, exnValue)
+        val (toUnwind, toRewind) = computeWindTransfer(s.windStack, g.windStack)
+        if toUnwind.isEmpty && toRewind.isEmpty then evalGuardClauses(s, g.varName, g.clauses, clauseEnv, g.exitK)
+        else
+          val unwindOuts = toUnwind.map(_.outThunk)
+          s.k = DynWindTransferK(
+            unwindOuts,
+            toRewind,
+            g.windStack,
+            exnValue,
+            GuardStartK(g.varName, g.clauses, clauseEnv, g.exitK)
+          )
+          s.evaluating = false
+
+  def evalGuardClauses(s: CekState, varName: String, clauses: List[Expr], env: Env, exitK: Kont): Unit =
+    clauses match
+      case Nil =>
+        val exnValue = env.lookup(varName)
+        performRaise(s, exnValue, exitK)
+      case Expr.Lst(Expr.Sym("else") :: body) :: _ =>
+        setupBody(s, body, env, exitK)
+      case Expr.Lst(test :: body) :: rest =>
+        s.k = GuardCondK(varName, body, rest, env, exitK)
+        s.expr = test
+        s.env = env
+        s.evaluating = true
+      case _ => throw EvalError("guard: invalid clause")
 
   private def applyMapCek(args: List[Expr]): Expr =
     if args.length < 2 then throw EvalError("map: need at least 2 arguments")
