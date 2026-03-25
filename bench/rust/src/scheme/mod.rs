@@ -38,6 +38,7 @@ enum Value {
     Pair(Rc<Pair>),
     Builtin(Builtin),
     Closure(Rc<Closure>),
+    CaseClosure(Rc<CaseClosure>),
     Void,
 }
 
@@ -96,7 +97,10 @@ impl Number {
         }
 
         if atom.contains('.') {
-            return atom.parse::<f64>().ok().and_then(|value| Self::inexact(value).ok());
+            return atom
+                .parse::<f64>()
+                .ok()
+                .and_then(|value| Self::inexact(value).ok());
         }
 
         None
@@ -299,7 +303,11 @@ fn gcd_i128(mut left: i128, mut right: i128) -> i128 {
         right = remainder;
     }
 
-    if left == 0 { 1 } else { left.abs() }
+    if left == 0 {
+        1
+    } else {
+        left.abs()
+    }
 }
 
 #[derive(Clone)]
@@ -317,8 +325,19 @@ struct Builtin {
 #[derive(Clone)]
 struct Closure {
     params: Vec<String>,
+    rest_param: Option<String>,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+#[derive(Clone)]
+struct CaseClosure {
+    clauses: Vec<Closure>,
+}
+
+struct ParameterSpec {
+    params: Vec<String>,
+    rest_param: Option<String>,
 }
 
 struct Environment {
@@ -600,6 +619,7 @@ fn evaluate_list(elements: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
             "if" => return evaluate_if(&elements[1..], env),
             "quote" => return evaluate_quote(&elements[1..]),
             "lambda" => return evaluate_lambda(&elements[1..], env),
+            "case-lambda" => return evaluate_case_lambda(&elements[1..], env),
             "and" => return evaluate_and(&elements[1..], env),
             "or" => return evaluate_or(&elements[1..], env),
             "begin" => return evaluate_begin(&elements[1..], env),
@@ -633,9 +653,11 @@ fn evaluate_define(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
                 _ => return Err(EvalError::message("define: invalid function name")),
             };
 
-            let params = parse_parameter_list(&signature[1..])?;
+            let ParameterSpec { params, rest_param } =
+                parse_parameter_list(&signature[1..], "lambda")?;
             let closure = Value::Closure(Rc::new(Closure {
                 params,
+                rest_param,
                 body: args[1..].to_vec(),
                 env: env.clone(),
             }));
@@ -676,16 +698,36 @@ fn evaluate_quote(args: &[Expr]) -> Result<Value, EvalError> {
 fn evaluate_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     require_at_least("lambda", args.len(), 2)?;
 
-    let params = match &args[0] {
-        Expr::List(params) => parse_parameter_list(params)?,
-        _ => return Err(EvalError::message("lambda: expected a parameter list")),
-    };
+    let ParameterSpec { params, rest_param } = parse_formals(&args[0], "lambda")?;
 
     Ok(Value::Closure(Rc::new(Closure {
         params,
+        rest_param,
         body: args[1..].to_vec(),
         env,
     })))
+}
+
+fn evaluate_case_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    require_at_least("case-lambda", args.len(), 1)?;
+
+    let mut clauses = Vec::with_capacity(args.len());
+    for clause in args {
+        let items = match clause {
+            Expr::List(items) if items.len() >= 2 => items,
+            _ => return Err(EvalError::message("case-lambda: invalid clause")),
+        };
+
+        let ParameterSpec { params, rest_param } = parse_formals(&items[0], "case-lambda")?;
+        clauses.push(Closure {
+            params,
+            rest_param,
+            body: items[1..].to_vec(),
+            env: env.clone(),
+        });
+    }
+
+    Ok(Value::CaseClosure(Rc::new(CaseClosure { clauses })))
 }
 
 fn evaluate_and(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
@@ -767,6 +809,7 @@ fn evaluate_named_let(
     let let_env = Environment::new(Some(env));
     let closure = Value::Closure(Rc::new(Closure {
         params,
+        rest_param: None,
         body: body.to_vec(),
         env: let_env.clone(),
     }));
@@ -824,16 +867,57 @@ fn parse_bindings(bindings: &[Expr], env: EnvRef) -> Result<Vec<(String, Value)>
     Ok(parsed)
 }
 
-fn parse_parameter_list(params: &[Expr]) -> Result<Vec<String>, EvalError> {
-    params
-        .iter()
-        .map(|expr| match expr {
-            Expr::Symbol(name) => Ok(name.clone()),
-            _ => Err(EvalError::message(
-                "lambda: parameter names must be symbols",
-            )),
-        })
-        .collect()
+fn parse_formals(expr: &Expr, context: &str) -> Result<ParameterSpec, EvalError> {
+    match expr {
+        Expr::Symbol(name) => Ok(ParameterSpec {
+            params: Vec::new(),
+            rest_param: Some(name.clone()),
+        }),
+        Expr::List(params) => parse_parameter_list(params, context),
+        _ => Err(EvalError::message(format!(
+            "{context}: expected a parameter list"
+        ))),
+    }
+}
+
+fn parse_parameter_list(params: &[Expr], context: &str) -> Result<ParameterSpec, EvalError> {
+    let mut names = Vec::with_capacity(params.len());
+    let mut index = 0;
+
+    while index < params.len() {
+        match &params[index] {
+            Expr::Symbol(name) if name == "." => {
+                let rest_param = match params.get(index + 1) {
+                    Some(Expr::Symbol(name)) if name != "." && index + 2 == params.len() => {
+                        name.clone()
+                    }
+                    _ => {
+                        return Err(EvalError::message(format!(
+                            "{context}: invalid rest parameter list"
+                        )))
+                    }
+                };
+
+                return Ok(ParameterSpec {
+                    params: names,
+                    rest_param: Some(rest_param),
+                });
+            }
+            Expr::Symbol(name) => names.push(name.clone()),
+            _ => {
+                return Err(EvalError::message(format!(
+                    "{context}: parameter names must be symbols"
+                )))
+            }
+        }
+
+        index += 1;
+    }
+
+    Ok(ParameterSpec {
+        params: names,
+        rest_param: None,
+    })
 }
 
 fn datum_to_value(expr: &Expr) -> Value {
@@ -849,15 +933,51 @@ fn datum_to_value(expr: &Expr) -> Value {
 fn apply_procedure(procedure: Value, args: &[Value]) -> Result<Value, EvalError> {
     match procedure {
         Value::Builtin(builtin) => (builtin.func)(args),
-        Value::Closure(closure) => {
-            require_exact("lambda", args.len(), closure.params.len())?;
-            let call_env = Environment::new(Some(closure.env.clone()));
-            for (name, value) in closure.params.iter().zip(args.iter()) {
-                call_env.define(name.clone(), value.clone());
-            }
-            evaluate_sequence(&closure.body, call_env)
-        }
+        Value::Closure(closure) => apply_closure(closure.as_ref(), args, "lambda"),
+        Value::CaseClosure(case_closure) => apply_case_closure(case_closure.as_ref(), args),
         _ => Err(EvalError::message("attempted to call a non-procedure")),
+    }
+}
+
+fn apply_case_closure(case_closure: &CaseClosure, args: &[Value]) -> Result<Value, EvalError> {
+    for clause in &case_closure.clauses {
+        if closure_accepts_arity(clause, args.len()) {
+            return apply_closure(clause, args, "case-lambda");
+        }
+    }
+
+    Err(EvalError::message(format!(
+        "case-lambda: no matching clause for {} argument(s)",
+        args.len()
+    )))
+}
+
+fn apply_closure(closure: &Closure, args: &[Value], name: &str) -> Result<Value, EvalError> {
+    if closure.rest_param.is_some() {
+        require_at_least(name, args.len(), closure.params.len())?;
+    } else {
+        require_exact(name, args.len(), closure.params.len())?;
+    }
+
+    let call_env = Environment::new(Some(closure.env.clone()));
+    for (name, value) in closure.params.iter().zip(args.iter()) {
+        call_env.define(name.clone(), value.clone());
+    }
+
+    if let Some(rest_param) = &closure.rest_param {
+        call_env.define(
+            rest_param.clone(),
+            list_value(args[closure.params.len()..].iter().cloned()),
+        );
+    }
+
+    evaluate_sequence(&closure.body, call_env)
+}
+
+fn closure_accepts_arity(closure: &Closure, arity: usize) -> bool {
+    match closure.rest_param {
+        Some(_) => arity >= closure.params.len(),
+        None => arity == closure.params.len(),
     }
 }
 
@@ -888,6 +1008,7 @@ fn create_global_env() -> EnvRef {
     define_builtin(&env, "list", builtin_list);
     define_builtin(&env, "length", builtin_length);
     define_builtin(&env, "append", builtin_append);
+    define_builtin(&env, "apply", builtin_apply);
     define_builtin(&env, "string?", builtin_is_string);
     define_builtin(&env, "number?", builtin_is_number);
     define_builtin(&env, "integer?", builtin_is_integer);
@@ -901,6 +1022,8 @@ fn create_global_env() -> EnvRef {
     define_builtin(&env, "boolean?", builtin_is_boolean);
     define_builtin(&env, "pair?", builtin_is_pair);
     define_builtin(&env, "symbol?", builtin_is_symbol);
+    define_builtin(&env, "procedure?", builtin_is_procedure);
+    define_builtin(&env, "equal?", builtin_equal);
 
     env
 }
@@ -1044,6 +1167,15 @@ fn builtin_append(args: &[Value]) -> Result<Value, EvalError> {
     Ok(result)
 }
 
+fn builtin_apply(args: &[Value]) -> Result<Value, EvalError> {
+    require_at_least("apply", args.len(), 2)?;
+
+    let procedure = args[0].clone();
+    let mut applied_args = args[1..args.len() - 1].to_vec();
+    applied_args.extend(list_to_vec(&args[args.len() - 1])?);
+    apply_procedure(procedure, &applied_args)
+}
+
 fn builtin_is_string(args: &[Value]) -> Result<Value, EvalError> {
     require_exact("string?", args.len(), 1)?;
     Ok(Value::Boolean(matches!(args[0], Value::String(_))))
@@ -1116,6 +1248,41 @@ fn builtin_is_pair(args: &[Value]) -> Result<Value, EvalError> {
 fn builtin_is_symbol(args: &[Value]) -> Result<Value, EvalError> {
     require_exact("symbol?", args.len(), 1)?;
     Ok(Value::Boolean(matches!(args[0], Value::Symbol(_))))
+}
+
+fn builtin_is_procedure(args: &[Value]) -> Result<Value, EvalError> {
+    require_exact("procedure?", args.len(), 1)?;
+    Ok(Value::Boolean(is_procedure(&args[0])))
+}
+
+fn builtin_equal(args: &[Value]) -> Result<Value, EvalError> {
+    require_exact("equal?", args.len(), 2)?;
+    Ok(Value::Boolean(equal_values(&args[0], &args[1])))
+}
+
+fn is_procedure(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Builtin(_) | Value::Closure(_) | Value::CaseClosure(_)
+    )
+}
+
+fn equal_values(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => left.compare(right) == Ordering::Equal,
+        (Value::Boolean(left), Value::Boolean(right)) => left == right,
+        (Value::String(left), Value::String(right)) => left == right,
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::Nil, Value::Nil) => true,
+        (Value::Pair(left), Value::Pair(right)) => {
+            equal_values(&left.car, &right.car) && equal_values(&left.cdr, &right.cdr)
+        }
+        (Value::Builtin(left), Value::Builtin(right)) => left.name == right.name,
+        (Value::Closure(left), Value::Closure(right)) => Rc::ptr_eq(left, right),
+        (Value::CaseClosure(left), Value::CaseClosure(right)) => Rc::ptr_eq(left, right),
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    }
 }
 
 fn expect_number(value: &Value) -> Result<Number, EvalError> {
@@ -1207,7 +1374,7 @@ fn type_name(value: &Value) -> &'static str {
         Value::Symbol(_) => "symbol",
         Value::Nil => "null",
         Value::Pair(_) => "pair",
-        Value::Builtin(_) | Value::Closure(_) => "procedure",
+        Value::Builtin(_) | Value::Closure(_) | Value::CaseClosure(_) => "procedure",
         Value::Void => "void",
     }
 }
@@ -1222,7 +1389,7 @@ fn format_value(value: &Value) -> String {
         Value::Nil => "()".into(),
         Value::Pair(_) => format_pair(value),
         Value::Builtin(builtin) => format!("#<procedure:{}>", builtin.name),
-        Value::Closure(_) => "#<procedure>".into(),
+        Value::Closure(_) | Value::CaseClosure(_) => "#<procedure>".into(),
         Value::Void => "#<void>".into(),
     }
 }
