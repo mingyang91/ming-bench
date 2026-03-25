@@ -122,7 +122,7 @@ public class Evaluator {
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "quote", "if", "define", "lambda", "let", "let*", "set!", "begin", "cond",
         "and", "or", "define-syntax", "syntax-rules", "else", "define-record-type",
-        "letrec", "letrec*", "case", "do"
+        "letrec", "letrec*", "case", "do", "guard"
     );
 
     // --- Continuation types for CEK machine ---
@@ -153,6 +153,11 @@ public class Evaluator {
     // For unwinding/rewinding during continuation invocation
     private record DynWindDoThunksK(List<Object> thunks, int idx, List<WindEntry> targetWind, Kont targetK, Object targetValue, Kont k) implements Kont {}
 
+    // --- guard / raise / with-exception-handler ---
+    private record GuardBodyK(Kont k) implements Kont {} // pops handler on normal body completion
+    private record GuardClauseK(String var, List<Object> clauses, Env guardEnv, Object exnValue, Kont k) implements Kont {}
+    private record WehK(Kont k) implements Kont {} // pops handler on normal thunk completion
+
     // --- dynamic-wind entry ---
     private static class WindEntry {
         final Object inThunk;
@@ -165,6 +170,50 @@ public class Evaluator {
         final Kont k;
         final List<WindEntry> savedWind;
         SchemeContinuation(Kont k, List<WindEntry> savedWind) { this.k = k; this.savedWind = savedWind; }
+    }
+
+    // Thrown when raise is called in Scheme
+    private static class SchemeRaise extends RuntimeException {
+        final Object value;
+        SchemeRaise(Object value) {
+            super(null, null, true, false);
+            this.value = value;
+        }
+    }
+
+    // Exception handler stack entry
+    private static class ExceptionHandlerEntry {
+        // For guard:
+        final String var;
+        final List<Object> clauses;
+        final Env guardEnv;
+        final Kont guardK;
+        final List<WindEntry> savedWind;
+        // For with-exception-handler:
+        final Object handlerProc;
+        final boolean isGuard;
+
+        // Guard constructor
+        ExceptionHandlerEntry(String var, List<Object> clauses, Env guardEnv, Kont guardK, List<WindEntry> savedWind) {
+            this.isGuard = true;
+            this.var = var;
+            this.clauses = clauses;
+            this.guardEnv = guardEnv;
+            this.guardK = guardK;
+            this.savedWind = savedWind;
+            this.handlerProc = null;
+        }
+
+        // with-exception-handler constructor
+        ExceptionHandlerEntry(Object handlerProc) {
+            this.isGuard = false;
+            this.handlerProc = handlerProc;
+            this.var = null;
+            this.clauses = null;
+            this.guardEnv = null;
+            this.guardK = null;
+            this.savedWind = null;
+        }
     }
 
     // Thrown when a continuation is invoked to unwind back to the CEK loop
@@ -190,6 +239,16 @@ public class Evaluator {
         @Override public String toString() { return "#<procedure:dynamic-wind>"; }
     };
 
+    // Sentinel for with-exception-handler procedure
+    private static final Object WITH_EXCEPTION_HANDLER_PROC = new Object() {
+        @Override public String toString() { return "#<procedure:with-exception-handler>"; }
+    };
+
+    // Sentinel for raise procedure
+    private static final Object RAISE_PROC = new Object() {
+        @Override public String toString() { return "#<procedure:raise>"; }
+    };
+
     // Sentinel for empty list '()
     private static final Object NIL = new Object() {
         @Override public String toString() { return "()"; }
@@ -206,6 +265,7 @@ public class Evaluator {
     private StringBuilder outputBuffer = new StringBuilder();
     private int gensymCounter = 0;
     private List<WindEntry> windStack = new ArrayList<>();
+    private List<ExceptionHandlerEntry> handlerStack = new ArrayList<>();
 
     // CEK machine state (instance fields for helper method access)
     private Object cekExpr;
@@ -861,6 +921,10 @@ public class Evaluator {
 
         // dynamic-wind
         globalEnv.define("dynamic-wind", DYNAMIC_WIND_PROC);
+
+        // exception handling
+        globalEnv.define("with-exception-handler", WITH_EXCEPTION_HANDLER_PROC);
+        globalEnv.define("raise", RAISE_PROC);
     }
 
     private Object appendTwo(Object a, Object b) {
@@ -1144,6 +1208,41 @@ public class Evaluator {
                     cekValue = cr.value;
                     cekEval = false;
                 }
+            } catch (SchemeRaise sr) {
+                if (handlerStack.isEmpty()) {
+                    throw new EvalError("unhandled exception: " + schemeToString(sr.value));
+                }
+                ExceptionHandlerEntry handler = handlerStack.remove(handlerStack.size() - 1);
+                if (handler.isGuard) {
+                    // Unwind dynamic-wind back to guard (same logic as ContinuationReturn handler)
+                    Kont targetK = new GuardClauseK(handler.var, handler.clauses, handler.guardEnv, sr.value, handler.guardK);
+                    List<WindEntry> targetWind = handler.savedWind != null ? handler.savedWind : List.of();
+                    int commonLen = 0;
+                    int minLen = Math.min(windStack.size(), targetWind.size());
+                    for (int i = 0; i < minLen; i++) {
+                        if (windStack.get(i) == targetWind.get(i)) commonLen++;
+                        else break;
+                    }
+                    List<Object> thunks = new ArrayList<>();
+                    for (int i = windStack.size() - 1; i >= commonLen; i--) {
+                        thunks.add(windStack.get(i).outThunk);
+                    }
+                    for (int i = commonLen; i < targetWind.size(); i++) {
+                        thunks.add(targetWind.get(i).inThunk);
+                    }
+                    if (!thunks.isEmpty()) {
+                        cekK = new DynWindDoThunksK(thunks, 0, targetWind, targetK, sr.value, cekK);
+                        while (windStack.size() > commonLen) windStack.remove(windStack.size() - 1);
+                        cekApplyProc(thunks.get(0), List.of(), cekK);
+                    } else {
+                        cekK = targetK;
+                        cekValue = sr.value;
+                        cekEval = false;
+                    }
+                } else {
+                    // with-exception-handler: call handler in raiser's dynamic extent
+                    cekApplyProc(handler.handlerProc, List.of(sr.value), cekK);
+                }
             } catch (EvalError e) {
                 if (cekSrcLine >= 0 && !e.getMessage().matches(".*\\d+:\\d+.*")) {
                     throw new EvalError(e.getMessage() + " at " + cekSrcLine + ":" + cekSrcCol);
@@ -1351,6 +1450,9 @@ public class Evaluator {
                         case "define-record-type" -> {
                             cekHandleDefineRecordType(list, env);
                             cekValue = VOID; cekEval = false; return;
+                        }
+                        case "guard" -> {
+                            cekHandleGuard(list, env); return;
                         }
                     }
                 }
@@ -1647,6 +1749,28 @@ public class Evaluator {
             cekExpr = dsk.testClause.get(0); cekEnv = dsk.doEnv; cekEval = true; return;
         }
 
+        if (k instanceof GuardBodyK gbk) {
+            // Body completed normally; pop handler, pass value through
+            if (!handlerStack.isEmpty()) handlerStack.remove(handlerStack.size() - 1);
+            cekK = gbk.k;
+            return;
+        }
+
+        if (k instanceof GuardClauseK gck) {
+            // Exception caught; bind var and evaluate cond-like clauses
+            Env clauseEnv = new Env(gck.guardEnv);
+            clauseEnv.define(gck.var, gck.exnValue);
+            cekHandleGuardClauses(gck.clauses, clauseEnv, gck.k, gck.exnValue);
+            return;
+        }
+
+        if (k instanceof WehK wehk) {
+            // Thunk completed normally; pop handler, pass value through
+            if (!handlerStack.isEmpty()) handlerStack.remove(handlerStack.size() - 1);
+            cekK = wehk.k;
+            return;
+        }
+
         if (k instanceof DynWindAfterInK dwi) {
             // in-thunk done; push wind entry, call body-thunk
             WindEntry entry = new WindEntry(dwi.inThunk, dwi.outThunk);
@@ -1710,6 +1834,18 @@ public class Evaluator {
             SchemeContinuation sc = new SchemeContinuation(k, new ArrayList<>(windStack));
             cekApplyProc(args.get(0), List.of(sc), k); return;
         }
+        if (proc == RAISE_PROC) {
+            if (args.size() != 1) throw new EvalError("raise requires 1 argument");
+            throw new SchemeRaise(args.get(0));
+        }
+        if (proc == WITH_EXCEPTION_HANDLER_PROC) {
+            if (args.size() != 2) throw new EvalError("with-exception-handler requires 2 arguments");
+            Object handler = args.get(0);
+            Object thunk = args.get(1);
+            handlerStack.add(new ExceptionHandlerEntry(handler));
+            cekK = new WehK(k);
+            cekApplyProc(thunk, List.of(), cekK); return;
+        }
         if (proc == DYNAMIC_WIND_PROC) {
             if (args.size() != 3) throw new EvalError("dynamic-wind requires 3 arguments");
             Object inThunk = args.get(0);
@@ -1756,6 +1892,53 @@ public class Evaluator {
     @SuppressWarnings("unchecked")
     private void cekHandleCond(List<Object> list, Env env) throws EvalError {
         cekHandleCondFrom(list, 1, env, cekK);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void cekHandleGuard(List<Object> list, Env env) throws EvalError {
+        // (guard (var clause ...) body ...)
+        if (list.size() < 3) throw new EvalError("bad syntax: guard");
+        Object clauseSpec = list.get(1);
+        if (clauseSpec instanceof SourceExpr se) clauseSpec = se.expr;
+        List<Object> spec = (List<Object>) clauseSpec;
+        if (spec.isEmpty()) throw new EvalError("bad syntax: guard");
+        Object varObj = spec.get(0);
+        if (varObj instanceof SourceExpr se) varObj = se.expr;
+        String var = (String) varObj;
+        List<Object> clauses = new ArrayList<>(spec.subList(1, spec.size()));
+        List<Object> body = new ArrayList<>(list.subList(2, list.size()));
+
+        // Push exception handler with current continuation and wind state
+        handlerStack.add(new ExceptionHandlerEntry(var, clauses, env, cekK, new ArrayList<>(windStack)));
+        // Set up body evaluation; GuardBodyK will pop handler on normal completion
+        cekK = new GuardBodyK(cekK);
+        evalBodyExprs(body, 0, env);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void cekHandleGuardClauses(List<Object> clauses, Env env, Kont k, Object exnValue) throws EvalError {
+        // Evaluate cond-like clauses (like cekHandleCondFrom but with pre-built clause list)
+        for (int i = 0; i < clauses.size(); i++) {
+            Object clauseObj = clauses.get(i);
+            if (clauseObj instanceof SourceExpr se) clauseObj = se.expr;
+            List<Object> clause = (List<Object>) clauseObj;
+            Object test = clause.get(0);
+            Object rawTest = test;
+            if (rawTest instanceof SourceExpr se) rawTest = se.expr;
+            if ("else".equals(rawTest)) {
+                cekEnv = env; cekK = k;
+                evalBodyExprs(clause, 1, env); return;
+            }
+            // Need to evaluate the test — use CondTestK with remaining clauses
+            // Build a fake "cond" list for CondTestK compatibility
+            List<Object> fullList = new ArrayList<>();
+            fullList.add("cond"); // placeholder at index 0
+            fullList.addAll(clauses);
+            cekK = new CondTestK(clause, fullList, i + 2, env, k);
+            cekExpr = test; cekEnv = env; cekEval = true; return;
+        }
+        // No clause matched — re-raise the exception
+        throw new SchemeRaise(exnValue);
     }
 
     @SuppressWarnings("unchecked")
