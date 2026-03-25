@@ -11,7 +11,7 @@ import java.util.Set;
 public class Evaluator {
 
     // ── Value types ──────────────────────────────────────────────
-    private sealed interface Val permits Val.Int, Val.Rat, Val.Flo, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda, Val.CaseLambda, Val.Macro, Val.RecordInstance, Val.Vec, Val.ContVal, Val.CallccVal {
+    private sealed interface Val permits Val.Int, Val.Rat, Val.Flo, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda, Val.CaseLambda, Val.Macro, Val.RecordInstance, Val.Vec, Val.ContVal, Val.CallccVal, Val.DynamicWindVal {
         record Int(long value) implements Val {}
         record Rat(long num, long den) implements Val {}
         record Flo(double value) implements Val {}
@@ -70,10 +70,13 @@ public class Evaluator {
         // Continuation value (captured by call/cc)
         final class ContVal implements Val {
             final Kont savedK;
-            ContVal(Kont savedK) { this.savedK = savedK; }
+            final List<WindEntry> savedWinds;
+            ContVal(Kont savedK, List<WindEntry> savedWinds) { this.savedK = savedK; this.savedWinds = savedWinds; }
         }
         // call/cc as a first-class value
         final class CallccVal implements Val {}
+        // dynamic-wind as a first-class value
+        final class DynamicWindVal implements Val {}
     }
 
     // ── Token with position ─────────────────────────────────────
@@ -115,6 +118,10 @@ public class Evaluator {
     // ── Output capture ──────────────────────────────────────────
     private StringBuilder output = new StringBuilder();
     private int gensymCounter = 0;
+
+    // ── Dynamic wind ─────────────────────────────────────────────
+    private record WindEntry(Val inThunk, Val outThunk) {}
+    private final List<WindEntry> windStack = new ArrayList<>();
     private String gensym(String base) { return base + "_g" + (gensymCounter++); }
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "quote", "if", "define", "lambda", "set!", "begin", "let", "let*", "cond", "and", "or",
@@ -153,6 +160,7 @@ public class Evaluator {
             }
             case Val.ContVal ignored -> "#<continuation>";
             case Val.CallccVal ignored -> "#<procedure:call/cc>";
+            case Val.DynamicWindVal ignored -> "#<procedure:dynamic-wind>";
         };
     }
 
@@ -390,6 +398,13 @@ public class Evaluator {
         record LetrecK(List<String> names, int idx, List<Val> initExprs, Env letEnv, List<Val> body, Kont k) implements Kont {}
         record NamedLetK(Val.Lambda lambda, int idx, List<Val> initExprs, List<Val> initVals, Env evalEnv, Kont k, Val form) implements Kont {}
         record CallccK(Kont k) implements Kont {}
+        // dynamic-wind continuation frames
+        record DynWindCallInK(Val inThunk, Val bodyThunk, Val outThunk, Kont k) implements Kont {}
+        record DynWindCallBodyK(Val inThunk, Val outThunk, Kont k) implements Kont {}
+        record DynWindCallOutK(Val bodyVal, Kont k) implements Kont {}
+        // wind transfer frames for continuation invocation
+        record DynWindUnwindK(List<Val> remainingOuts, List<WindEntry> toRewind, Val value, Kont targetK, List<WindEntry> targetWinds) implements Kont {}
+        record DynWindRewindK(List<WindEntry> remaining, Val value, Kont targetK, List<WindEntry> targetWinds) implements Kont {}
     }
 
     // CEK step: either evaluate an expression or apply a continuation
@@ -418,7 +433,7 @@ public class Evaluator {
             try {
                 step = advance(step);
             } catch (ContinuationInvoke ci) {
-                step = new Step.Apply(ci.value, ci.cont.savedK);
+                step = windTransfer(ci.value, ci.cont.savedK, ci.cont.savedWinds);
             }
         }
     }
@@ -537,6 +552,14 @@ public class Evaluator {
                     if (!(argsList instanceof Val.PairV ap)) throw posError(form, "call/cc requires 1 argument");
                     if (ap.cdr() instanceof Val.PairV) throw posError(form, "call/cc requires 1 argument");
                     yield new Step.Eval(ap.car(), env, new Kont.CallccK(k));
+                }
+                if (fn instanceof Val.DynamicWindVal) {
+                    List<Val> dwArgs = collectList(argsList);
+                    if (dwArgs.size() != 3) throw posError(form, "dynamic-wind requires 3 arguments");
+                    // Evaluate all 3 thunk expressions; use ArgK to collect them
+                    int last = dwArgs.size() - 1;
+                    yield new Step.Eval(dwArgs.get(last), env,
+                        new Kont.ArgK(fn, new ArrayList<>(), dwArgs, last - 1, env, k, form));
                 }
                 List<Val> argExprs = collectList(argsList);
                 if (argExprs.isEmpty()) {
@@ -657,8 +680,70 @@ public class Evaluator {
             case Kont.CallccK(var k) -> {
                 // value is the proc, k is the continuation to capture
                 Val proc = value;
-                Val.ContVal contVal = new Val.ContVal(k);
+                Val.ContVal contVal = new Val.ContVal(k, new ArrayList<>(windStack));
                 yield applyFunctionStep(proc, List.of(contVal), k, null);
+            }
+
+            // dynamic-wind continuation frames
+            case Kont.DynWindCallInK(var inThunk, var bodyThunk, var outThunk, var k) -> {
+                // in-thunk done; push wind entry, call body-thunk
+                windStack.add(new WindEntry(inThunk, outThunk));
+                yield applyFunctionStep(bodyThunk, new ArrayList<>(),
+                    new Kont.DynWindCallBodyK(inThunk, outThunk, k), null);
+            }
+
+            case Kont.DynWindCallBodyK(var inThunk, var outThunk, var k) -> {
+                // body done; pop wind entry, call out-thunk, save body value
+                windStack.remove(windStack.size() - 1);
+                yield applyFunctionStep(outThunk, new ArrayList<>(),
+                    new Kont.DynWindCallOutK(value, k), null);
+            }
+
+            case Kont.DynWindCallOutK(var bodyVal, var k) -> {
+                // out-thunk done; return body value
+                yield new Step.Apply(bodyVal, k);
+            }
+
+            // wind transfer frames for continuation invocation
+            case Kont.DynWindUnwindK(var remainingOuts, var toRewind, var val, var targetK, var targetWinds) -> {
+                // An out-thunk just finished; pop wind stack
+                windStack.remove(windStack.size() - 1);
+                if (!remainingOuts.isEmpty()) {
+                    List<Val> rest = new ArrayList<>(remainingOuts);
+                    Val nextOut = rest.remove(0);
+                    yield applyFunctionStep(nextOut, new ArrayList<>(),
+                        new Kont.DynWindUnwindK(rest, toRewind, val, targetK, targetWinds), null);
+                }
+                // Done unwinding; start rewinding
+                if (!toRewind.isEmpty()) {
+                    List<WindEntry> rest = new ArrayList<>(toRewind);
+                    WindEntry next = rest.remove(0);
+                    yield applyFunctionStep(next.inThunk(), new ArrayList<>(),
+                        new Kont.DynWindRewindK(rest, val, targetK, targetWinds), null);
+                }
+                // Nothing to rewind
+                yield new Step.Apply(val, targetK);
+            }
+
+            case Kont.DynWindRewindK(var remaining, var val, var targetK, var targetWinds) -> {
+                // An in-thunk just finished; push the wind entry
+                // Figure out which entry was just rewound based on targetWinds and remaining count
+                int idx = targetWinds.size() - remaining.size() - 1;
+                // Actually we need to track which entry. Let me compute from targetWinds.
+                // The entries being rewound start at (targetWinds.size() - remaining.size() - 1)
+                // Wait: toRewind was built from targetWinds starting at commonLen.
+                // remaining has the rest, the one we just ran is targetWinds[targetWinds.size() - remaining.size() - 1]
+                // Simpler: just push the correct entry from targetWinds
+                // At this point, windStack should be at commonLen + (number already rewound)
+                windStack.add(targetWinds.get(windStack.size()));
+                if (!remaining.isEmpty()) {
+                    List<WindEntry> rest = new ArrayList<>(remaining);
+                    WindEntry next = rest.remove(0);
+                    yield applyFunctionStep(next.inThunk(), new ArrayList<>(),
+                        new Kont.DynWindRewindK(rest, val, targetK, targetWinds), null);
+                }
+                // Done rewinding
+                yield new Step.Apply(val, targetK);
             }
         };
     }
@@ -667,13 +752,20 @@ public class Evaluator {
     private Step applyFunctionStep(Val fn, List<Val> args, Kont k, Val form) throws EvalError {
         if (fn instanceof Val.ContVal cont) {
             if (args.size() != 1) throw posError(form, "continuation expects 1 argument, got " + args.size());
-            return new Step.Apply(args.get(0), cont.savedK);
+            return windTransfer(args.get(0), cont.savedK, cont.savedWinds);
         }
         if (fn instanceof Val.CallccVal) {
             if (args.size() != 1) throw posError(form, "call/cc requires 1 argument");
             Val proc = args.get(0);
-            Val.ContVal contVal = new Val.ContVal(k);
+            Val.ContVal contVal = new Val.ContVal(k, new ArrayList<>(windStack));
             return applyFunctionStep(proc, List.of(contVal), k, form);
+        }
+        if (fn instanceof Val.DynamicWindVal) {
+            if (args.size() != 3) throw posError(form, "dynamic-wind requires 3 arguments");
+            Val inThunk = args.get(0), bodyThunk = args.get(1), outThunk = args.get(2);
+            // Call in-thunk first
+            return applyFunctionStep(inThunk, new ArrayList<>(),
+                new Kont.DynWindCallInK(inThunk, bodyThunk, outThunk, k), form);
         }
 
         Val.Lambda lambda = null;
@@ -713,6 +805,40 @@ public class Evaluator {
             catch (RuntimeException e) { throw posError(form, e.getMessage()); }
         }
         throw posError(form, "not a procedure: " + writeVal(fn));
+    }
+
+    // ── Wind transfer for continuation invocation ────────────────
+    private Step windTransfer(Val value, Kont targetK, List<WindEntry> targetWinds) throws EvalError {
+        // Find common prefix length
+        int commonLen = 0;
+        int minLen = Math.min(windStack.size(), targetWinds.size());
+        while (commonLen < minLen && windStack.get(commonLen) == targetWinds.get(commonLen)) {
+            commonLen++;
+        }
+        // Collect out-thunks to unwind (current[commonLen..end], innermost first)
+        List<Val> outsToRun = new ArrayList<>();
+        for (int i = windStack.size() - 1; i >= commonLen; i--) {
+            outsToRun.add(windStack.get(i).outThunk());
+        }
+        // Collect wind entries to rewind (target[commonLen..end], outermost first)
+        List<WindEntry> toRewind = new ArrayList<>();
+        for (int i = commonLen; i < targetWinds.size(); i++) {
+            toRewind.add(targetWinds.get(i));
+        }
+        // If nothing to unwind/rewind, jump directly
+        if (outsToRun.isEmpty() && toRewind.isEmpty()) {
+            return new Step.Apply(value, targetK);
+        }
+        // Start unwinding
+        if (!outsToRun.isEmpty()) {
+            Val firstOut = outsToRun.remove(0);
+            return applyFunctionStep(firstOut, new ArrayList<>(),
+                new Kont.DynWindUnwindK(outsToRun, toRewind, value, targetK, targetWinds), null);
+        }
+        // Nothing to unwind, start rewinding
+        WindEntry first = toRewind.remove(0);
+        return applyFunctionStep(first.inThunk(), new ArrayList<>(),
+            new Kont.DynWindRewindK(toRewind, value, targetK, targetWinds), null);
     }
 
     // ── applyFn for builtins (runs mini-trampoline) ─────────────
@@ -1312,6 +1438,7 @@ public class Evaluator {
         // call/cc as first-class values
         env.define("call/cc", new Val.CallccVal());
         env.define("call-with-current-continuation", new Val.CallccVal());
+        env.define("dynamic-wind", new Val.DynamicWindVal());
         // Arithmetic
         env.define("+", new Val.Builtin("+", args -> {
             Val result = new Val.Int(0);
@@ -1374,7 +1501,7 @@ public class Evaluator {
         env.define("procedure?", new Val.Builtin("procedure?", args -> {
             checkArgCount(args, 1, "procedure?");
             Val v = args.get(0);
-            return new Val.Bool(v instanceof Val.Lambda || v instanceof Val.CaseLambda || v instanceof Val.Builtin || v instanceof Val.ContVal || v instanceof Val.CallccVal);
+            return new Val.Bool(v instanceof Val.Lambda || v instanceof Val.CaseLambda || v instanceof Val.Builtin || v instanceof Val.ContVal || v instanceof Val.CallccVal || v instanceof Val.DynamicWindVal);
         }));
         env.define("list", new Val.Builtin("list", args -> {
             Val result = new Val.Nil();
