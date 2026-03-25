@@ -93,6 +93,7 @@ public class Evaluator {
                 this::applyStringToNumber));
         environment.define("number->string", new BuiltinProcedure("number->string",
                 this::applyNumberToString));
+        environment.define("apply", new BuiltinProcedure("apply", this::applyApply));
         environment.define("symbol->string", new BuiltinProcedure("symbol->string",
                 this::applySymbolToString));
         environment.define("string->symbol", new BuiltinProcedure("string->symbol",
@@ -186,11 +187,11 @@ public class Evaluator {
                 throw error("function definition requires a body", pos);
             }
 
-            List<String> parameters = parseParameterNames(
+            ParameterSpec parameters = parseParameterSpec(
                     signature.subList(1, signature.size()), signatureExpr.pos());
             List<Expr> body = new ArrayList<>(arguments.subList(1, arguments.size()));
             ClosureProcedure procedure = new ClosureProcedure(
-                    nameExpr.name(), parameters, body, environment);
+                    nameExpr.name(), parameters.required(), parameters.rest(), body, environment);
             environment.define(nameExpr.name(), procedure);
             return VoidValue.INSTANCE;
         }
@@ -237,13 +238,11 @@ public class Evaluator {
         if (arguments.size() < 2) {
             throw error("'lambda' expects a parameter list and a body", pos);
         }
-        if (!(arguments.getFirst() instanceof ListExpr parameterExpr)) {
-            throw error("'lambda' parameters must be a list", arguments.getFirst().pos());
-        }
 
-        List<String> parameters = parseParameterNames(parameterExpr.elements(), parameterExpr.pos());
+        ParameterSpec parameters = parseLambdaParameters(arguments.getFirst());
         List<Expr> body = new ArrayList<>(arguments.subList(1, arguments.size()));
-        return new ClosureProcedure(null, parameters, body, environment);
+        return new ClosureProcedure(null, parameters.required(), parameters.rest(), body,
+                environment);
     }
 
     private Value evalBegin(List<Expr> arguments, Environment environment) throws EvalError {
@@ -330,7 +329,7 @@ public class Evaluator {
         }
 
         Environment closureEnvironment = new Environment(environment);
-        ClosureProcedure procedure = new ClosureProcedure(nameExpr.name(), parameters,
+        ClosureProcedure procedure = new ClosureProcedure(nameExpr.name(), parameters, null,
                 new ArrayList<>(body), closureEnvironment);
         closureEnvironment.define(nameExpr.name(), procedure);
         return apply(procedure, values, pos);
@@ -371,16 +370,52 @@ public class Evaluator {
         return result;
     }
 
-    private List<String> parseParameterNames(List<Expr> parameterExprs, SourcePos pos)
+    private ParameterSpec parseLambdaParameters(Expr parameterExpr) throws EvalError {
+        if (parameterExpr instanceof ListExpr listExpr) {
+            return parseParameterSpec(listExpr.elements(), listExpr.pos());
+        }
+        if (parameterExpr instanceof SymbolExpr symbolExpr) {
+            return new ParameterSpec(List.of(), symbolExpr.name());
+        }
+        throw error("'lambda' parameters must be a list or a symbol", parameterExpr.pos());
+    }
+
+    private ParameterSpec parseParameterSpec(List<Expr> parameterExprs, SourcePos pos)
             throws EvalError {
         List<String> parameters = new ArrayList<>(parameterExprs.size());
-        for (Expr parameterExpr : parameterExprs) {
+        String restParameter = null;
+        boolean sawDot = false;
+
+        for (int i = 0; i < parameterExprs.size(); i++) {
+            Expr parameterExpr = parameterExprs.get(i);
             if (!(parameterExpr instanceof SymbolExpr symbolExpr)) {
-                throw error("parameters must be symbols", pos);
+                throw error("parameters must be symbols", parameterExpr.pos());
             }
+
+            if (".".equals(symbolExpr.name())) {
+                if (sawDot || i == parameterExprs.size() - 1) {
+                    throw error("invalid dotted parameter list", symbolExpr.pos());
+                }
+                sawDot = true;
+                continue;
+            }
+
+            if (sawDot) {
+                if (i != parameterExprs.size() - 1) {
+                    throw error("rest parameter must be last", parameterExpr.pos());
+                }
+                restParameter = symbolExpr.name();
+                return new ParameterSpec(parameters, restParameter);
+            }
+
             parameters.add(symbolExpr.name());
         }
-        return parameters;
+
+        if (sawDot) {
+            throw error("invalid dotted parameter list", pos);
+        }
+
+        return new ParameterSpec(parameters, null);
     }
 
     private List<Value> evalArguments(List<Expr> arguments, Environment environment)
@@ -419,13 +454,21 @@ public class Evaluator {
             return builtinProcedure.implementation().apply(arguments, pos);
         }
         if (procedure instanceof ClosureProcedure closureProcedure) {
-            if (arguments.size() != closureProcedure.parameters().size()) {
+            int requiredCount = closureProcedure.parameters().size();
+            if (closureProcedure.restParameter() == null && arguments.size() != requiredCount) {
+                throw error("wrong number of arguments", pos);
+            }
+            if (closureProcedure.restParameter() != null && arguments.size() < requiredCount) {
                 throw error("wrong number of arguments", pos);
             }
 
             Environment callEnvironment = new Environment(closureProcedure.environment());
-            for (int i = 0; i < closureProcedure.parameters().size(); i++) {
+            for (int i = 0; i < requiredCount; i++) {
                 callEnvironment.define(closureProcedure.parameters().get(i), arguments.get(i));
+            }
+            if (closureProcedure.restParameter() != null) {
+                callEnvironment.define(closureProcedure.restParameter(),
+                        buildList(arguments.subList(requiredCount, arguments.size())));
             }
 
             return evalSequence(closureProcedure.body(), callEnvironment);
@@ -535,6 +578,20 @@ public class Evaluator {
     private Value applyNumberToString(List<Value> arguments, SourcePos pos) throws EvalError {
         requireArgCount(arguments, 1, "number->string", pos);
         return new StringValue(asNumber(arguments.getFirst(), "number->string", pos).toString());
+    }
+
+    private Value applyApply(List<Value> arguments, SourcePos pos) throws EvalError {
+        if (arguments.size() < 2) {
+            throw error("'apply' expects at least 2 arguments", pos);
+        }
+
+        Value procedure = arguments.getFirst();
+        List<Value> expandedArguments = new ArrayList<>(arguments.size() - 1);
+        for (int i = 1; i < arguments.size() - 1; i++) {
+            expandedArguments.add(arguments.get(i));
+        }
+        appendListElements(arguments.get(arguments.size() - 1), expandedArguments, pos);
+        return apply(procedure, expandedArguments, pos);
     }
 
     private Value applySymbolToString(List<Value> arguments, SourcePos pos) throws EvalError {
@@ -760,6 +817,18 @@ public class Evaluator {
         return result;
     }
 
+    private void appendListElements(Value list, List<Value> destination, SourcePos pos)
+            throws EvalError {
+        Value current = list;
+        while (current instanceof PairValue pairValue) {
+            destination.add(pairValue.car());
+            current = pairValue.cdr();
+        }
+        if (!(current instanceof EmptyListValue)) {
+            throw error("'apply' expects a proper list as its last argument", pos);
+        }
+    }
+
     private Value quote(Expr expression) throws EvalError {
         if (expression instanceof IntExpr intExpr) {
             return new IntValue(intExpr.value());
@@ -963,6 +1032,9 @@ public class Evaluator {
     private record LetBinding(String name, Expr initializer) {
     }
 
+    private record ParameterSpec(List<String> required, String rest) {
+    }
+
     private record ProgramResult(Value value, String output) {
     }
 
@@ -1033,8 +1105,9 @@ public class Evaluator {
             implements ProcedureValue {
     }
 
-    private record ClosureProcedure(String name, List<String> parameters, List<Expr> body,
-                                    Environment environment) implements ProcedureValue {
+    private record ClosureProcedure(String name, List<String> parameters, String restParameter,
+                                    List<Expr> body, Environment environment)
+            implements ProcedureValue {
     }
 
     private record VoidValue() implements Value {
