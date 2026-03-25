@@ -10,7 +10,11 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### builtin_min_max (src/scheme/mod.rs:1699) — Shared reducer for variadic `min` and `max`
+### builtin_string_compare (src/scheme/mod.rs:1753) — Normalizes and compares variadic string arguments
+### list_tail_at (src/scheme/mod.rs:1791) — Walks a list/pair chain to the requested tail with index errors
+### equal_values (src/scheme/mod.rs:1816) — Structural equality helper used by `assoc`
+### expect_two_numbers (src/scheme/mod.rs:1921) — Validates binary numeric operations and handles division by zero
 
 ## Python Helpers (scripts/)
 

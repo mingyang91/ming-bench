@@ -46,6 +46,19 @@ pub enum EvalError {
     #[error("division by zero")]
     DivisionByZero,
 
+    #[error("numeric overflow in {operation}")]
+    NumericOverflow { operation: &'static str },
+
+    #[error("negative exponent for expt: {value}")]
+    NegativeExponent { value: i64 },
+
+    #[error("mismatched list lengths for {name}: expected {expected}, got {got}")]
+    MismatchedListLengths {
+        name: String,
+        expected: usize,
+        got: usize,
+    },
+
     #[error("expected non-negative integer for {kind}, got {value}")]
     NegativeIndex { kind: &'static str, value: i64 },
 

@@ -522,6 +522,8 @@ fn default_env() -> EnvRef {
     define_builtin(&env, ">", builtin_greater_than);
     define_builtin(&env, "=", builtin_equal_numbers);
     define_builtin(&env, "<=", builtin_less_equal);
+    define_builtin(&env, "eq?", builtin_eq);
+    define_builtin(&env, "equal?", builtin_equal);
     define_builtin(&env, "not", builtin_not);
     define_builtin(&env, "cons", builtin_cons);
     define_builtin(&env, "car", builtin_car);
@@ -550,6 +552,34 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "string-copy", builtin_string_copy);
     define_builtin(&env, "string-set!", builtin_string_set);
     define_builtin(&env, "char?", builtin_char_predicate);
+    define_builtin(&env, "abs", builtin_abs);
+    define_builtin(&env, "modulo", builtin_modulo);
+    define_builtin(&env, "remainder", builtin_remainder);
+    define_builtin(&env, "quotient", builtin_quotient);
+    define_builtin(&env, "min", builtin_min);
+    define_builtin(&env, "max", builtin_max);
+    define_builtin(&env, "expt", builtin_expt);
+    define_builtin(&env, "zero?", builtin_zero_predicate);
+    define_builtin(&env, "positive?", builtin_positive_predicate);
+    define_builtin(&env, "negative?", builtin_negative_predicate);
+    define_builtin(&env, "odd?", builtin_odd_predicate);
+    define_builtin(&env, "even?", builtin_even_predicate);
+    define_builtin(&env, "list-ref", builtin_list_ref);
+    define_builtin(&env, "list-tail", builtin_list_tail);
+    define_builtin(&env, "list?", builtin_list_predicate);
+    define_builtin(&env, "assoc", builtin_assoc);
+    define_builtin(&env, "map", builtin_map);
+    define_builtin(&env, "char-alphabetic?", builtin_char_alphabetic_predicate);
+    define_builtin(&env, "char-numeric?", builtin_char_numeric_predicate);
+    define_builtin(&env, "char-upcase", builtin_char_upcase);
+    define_builtin(&env, "char-downcase", builtin_char_downcase);
+    define_builtin(&env, "char=?", builtin_char_equal);
+    define_builtin(&env, "char<?", builtin_char_less_than);
+    define_builtin(&env, "string=?", builtin_string_equal);
+    define_builtin(&env, "string<?", builtin_string_less_than);
+    define_builtin(&env, "string-ci=?", builtin_string_ci_equal);
+    define_builtin(&env, "string-upcase", builtin_string_upcase);
+    define_builtin(&env, "string-downcase", builtin_string_downcase);
 
     env
 }
@@ -1099,6 +1129,16 @@ fn builtin_not(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalErro
     Ok(Value::Boolean(!args[0].is_truthy()))
 }
 
+fn builtin_eq(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("eq?", args, 2)?;
+    Ok(Value::Boolean(equal_values(&args[0], &args[1])))
+}
+
+fn builtin_equal(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("equal?", args, 2)?;
+    Ok(Value::Boolean(equal_values(&args[0], &args[1])))
+}
+
 fn builtin_cons(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     expect_value_arity("cons", args, 2)?;
     Ok(Value::Pair(
@@ -1297,6 +1337,273 @@ fn builtin_string_set(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, E
     Ok(Value::Void)
 }
 
+fn builtin_abs(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("abs", args, 1)?;
+    Ok(Value::Integer(
+        expect_number(&args[0])?
+            .checked_abs()
+            .ok_or(EvalError::NumericOverflow { operation: "abs" })?,
+    ))
+}
+
+fn builtin_modulo(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    let (dividend, divisor) = expect_two_numbers("modulo", args)?;
+
+    let remainder = dividend % divisor;
+    let result = if remainder != 0 && (remainder < 0) != (divisor < 0) {
+        remainder + divisor
+    } else {
+        remainder
+    };
+
+    Ok(Value::Integer(result))
+}
+
+fn builtin_remainder(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    let (dividend, divisor) = expect_two_numbers("remainder", args)?;
+    Ok(Value::Integer(dividend % divisor))
+}
+
+fn builtin_quotient(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    let (dividend, divisor) = expect_two_numbers("quotient", args)?;
+    Ok(Value::Integer(dividend.checked_div(divisor).ok_or(
+        EvalError::NumericOverflow {
+            operation: "quotient",
+        },
+    )?))
+}
+
+fn builtin_min(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_min_max("min", args, |left, right| left.min(right))
+}
+
+fn builtin_max(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_min_max("max", args, |left, right| left.max(right))
+}
+
+fn builtin_expt(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("expt", args, 2)?;
+    let base = expect_number(&args[0])?;
+    let exponent = expect_number(&args[1])?;
+
+    if exponent < 0 {
+        return Err(EvalError::NegativeExponent { value: exponent });
+    }
+
+    let mut result = 1_i64;
+    for _ in 0..exponent {
+        result = result
+            .checked_mul(base)
+            .ok_or(EvalError::NumericOverflow { operation: "expt" })?;
+    }
+
+    Ok(Value::Integer(result))
+}
+
+fn builtin_zero_predicate(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_number_predicate_by("zero?", args, |value| value == 0)
+}
+
+fn builtin_positive_predicate(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_number_predicate_by("positive?", args, |value| value > 0)
+}
+
+fn builtin_negative_predicate(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_number_predicate_by("negative?", args, |value| value < 0)
+}
+
+fn builtin_odd_predicate(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_number_predicate_by("odd?", args, |value| value % 2 != 0)
+}
+
+fn builtin_even_predicate(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_number_predicate_by("even?", args, |value| value % 2 == 0)
+}
+
+fn builtin_list_ref(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("list-ref", args, 2)?;
+    let index = expect_index(&args[1], "list-ref")?;
+
+    match list_tail_at(&args[0], index, "list-ref")? {
+        Value::Pair(car, _) => Ok(*car),
+        Value::EmptyList => Err(EvalError::IndexOutOfBounds {
+            kind: "list-ref",
+            index,
+            length: index,
+        }),
+        other => Err(EvalError::TypeMismatch {
+            expected: "pair",
+            actual: other.type_name(),
+        }),
+    }
+}
+
+fn builtin_list_tail(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("list-tail", args, 2)?;
+    let index = expect_index(&args[1], "list-tail")?;
+    list_tail_at(&args[0], index, "list-tail")
+}
+
+fn builtin_list_predicate(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("list?", args, 1)?;
+    Ok(Value::Boolean(is_proper_list(&args[0])))
+}
+
+fn builtin_assoc(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("assoc", args, 2)?;
+    let key = &args[0];
+    let mut cursor = &args[1];
+
+    loop {
+        match cursor {
+            Value::EmptyList => return Ok(Value::Boolean(false)),
+            Value::Pair(entry, rest) => {
+                let Value::Pair(found_key, _) = entry.as_ref() else {
+                    return Err(EvalError::TypeMismatch {
+                        expected: "pair",
+                        actual: entry.as_ref().type_name(),
+                    });
+                };
+
+                if equal_values(key, found_key.as_ref()) {
+                    return Ok((**entry).clone());
+                }
+
+                cursor = rest.as_ref();
+            }
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    expected: "pair",
+                    actual: other.type_name(),
+                });
+            }
+        }
+    }
+}
+
+fn builtin_map(args: &[Value], ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgumentCount {
+            name: "map".to_string(),
+            expected: "at least 2".to_string(),
+            got: args.len(),
+        });
+    }
+
+    let procedure = expect_procedure(&args[0])?;
+    let list_values = args[1..]
+        .iter()
+        .map(expect_list_values)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let expected_len = list_values.first().map_or(0, Vec::len);
+    for values in &list_values[1..] {
+        if values.len() != expected_len {
+            return Err(EvalError::MismatchedListLengths {
+                name: "map".to_string(),
+                expected: expected_len,
+                got: values.len(),
+            });
+        }
+    }
+
+    let mut results = Vec::with_capacity(expected_len);
+    for index in 0..expected_len {
+        let call_args = list_values
+            .iter()
+            .map(|values| values[index].clone())
+            .collect();
+        results.push(apply_procedure(procedure.clone(), call_args, ctx)?);
+    }
+
+    Ok(list_from_values(results))
+}
+
+fn builtin_char_alphabetic_predicate(
+    args: &[Value],
+    _ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    expect_value_arity("char-alphabetic?", args, 1)?;
+    Ok(Value::Boolean(expect_char(&args[0])?.is_alphabetic()))
+}
+
+fn builtin_char_numeric_predicate(
+    args: &[Value],
+    _ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    expect_value_arity("char-numeric?", args, 1)?;
+    Ok(Value::Boolean(expect_char(&args[0])?.is_numeric()))
+}
+
+fn builtin_char_upcase(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("char-upcase", args, 1)?;
+    let ch = expect_char(&args[0])?;
+    Ok(Value::Char(ch.to_uppercase().next().unwrap_or(ch)))
+}
+
+fn builtin_char_downcase(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("char-downcase", args, 1)?;
+    let ch = expect_char(&args[0])?;
+    Ok(Value::Char(ch.to_lowercase().next().unwrap_or(ch)))
+}
+
+fn builtin_char_equal(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_char_compare("char=?", args, |left, right| left == right)
+}
+
+fn builtin_char_less_than(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_char_compare("char<?", args, |left, right| left < right)
+}
+
+fn builtin_string_equal(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_string_compare(
+        "string=?",
+        args,
+        |value| value.to_string(),
+        |left, right| left == right,
+    )
+}
+
+fn builtin_string_less_than(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_string_compare(
+        "string<?",
+        args,
+        |value| value.to_string(),
+        |left, right| left < right,
+    )
+}
+
+fn builtin_string_ci_equal(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_string_compare(
+        "string-ci=?",
+        args,
+        |value| value.chars().flat_map(char::to_lowercase).collect(),
+        |left, right| left == right,
+    )
+}
+
+fn builtin_string_upcase(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("string-upcase", args, 1)?;
+    let string = expect_string(&args[0])?.to_plain_string();
+    Ok(Value::String(SchemeString::new(
+        string
+            .chars()
+            .flat_map(char::to_uppercase)
+            .collect::<String>(),
+    )))
+}
+
+fn builtin_string_downcase(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("string-downcase", args, 1)?;
+    let string = expect_string(&args[0])?.to_plain_string();
+    Ok(Value::String(SchemeString::new(
+        string
+            .chars()
+            .flat_map(char::to_lowercase)
+            .collect::<String>(),
+    )))
+}
+
 fn builtin_add(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     let numbers = expect_numbers(args)?;
     Ok(Value::Integer(numbers.into_iter().sum()))
@@ -1389,6 +1696,143 @@ fn builtin_type_predicate(
     Ok(Value::Boolean(predicate(&args[0])))
 }
 
+fn builtin_min_max(
+    name: &str,
+    args: &[Value],
+    pick: impl Fn(i64, i64) -> i64,
+) -> Result<Value, EvalError> {
+    let numbers = expect_numbers(args)?;
+
+    let Some(first) = numbers.first().copied() else {
+        return Err(EvalError::WrongArgumentCount {
+            name: name.to_string(),
+            expected: "at least 1".to_string(),
+            got: 0,
+        });
+    };
+
+    let value = numbers
+        .into_iter()
+        .skip(1)
+        .fold(first, |current, next| pick(current, next));
+    Ok(Value::Integer(value))
+}
+
+fn builtin_number_predicate_by(
+    name: &str,
+    args: &[Value],
+    predicate: impl Fn(i64) -> bool,
+) -> Result<Value, EvalError> {
+    expect_value_arity(name, args, 1)?;
+    Ok(Value::Boolean(predicate(expect_number(&args[0])?)))
+}
+
+fn builtin_char_compare(
+    name: &str,
+    args: &[Value],
+    predicate: impl Fn(char, char) -> bool,
+) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgumentCount {
+            name: name.to_string(),
+            expected: "at least 2".to_string(),
+            got: args.len(),
+        });
+    }
+
+    let mut chars = Vec::with_capacity(args.len());
+    for value in args {
+        chars.push(expect_char(value)?);
+    }
+
+    Ok(Value::Boolean(
+        chars.windows(2).all(|pair| predicate(pair[0], pair[1])),
+    ))
+}
+
+fn builtin_string_compare(
+    name: &str,
+    args: &[Value],
+    normalize: impl Fn(&str) -> String,
+    predicate: impl Fn(&str, &str) -> bool,
+) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgumentCount {
+            name: name.to_string(),
+            expected: "at least 2".to_string(),
+            got: args.len(),
+        });
+    }
+
+    let mut strings = Vec::with_capacity(args.len());
+    for value in args {
+        strings.push(normalize(&expect_string(value)?.to_plain_string()));
+    }
+
+    Ok(Value::Boolean(
+        strings
+            .windows(2)
+            .all(|pair| predicate(pair[0].as_str(), pair[1].as_str())),
+    ))
+}
+
+fn is_proper_list(value: &Value) -> bool {
+    let mut cursor = value;
+
+    loop {
+        match cursor {
+            Value::EmptyList => return true,
+            Value::Pair(_, cdr) => cursor = cdr.as_ref(),
+            _ => return false,
+        }
+    }
+}
+
+fn list_tail_at(value: &Value, index: usize, kind: &'static str) -> Result<Value, EvalError> {
+    let mut cursor = value;
+
+    for depth in 0..index {
+        cursor = match cursor {
+            Value::Pair(_, cdr) => cdr.as_ref(),
+            Value::EmptyList => {
+                return Err(EvalError::IndexOutOfBounds {
+                    kind,
+                    index,
+                    length: depth,
+                });
+            }
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    expected: "pair",
+                    actual: other.type_name(),
+                });
+            }
+        };
+    }
+
+    Ok(cursor.clone())
+}
+
+fn equal_values(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Boolean(left), Value::Boolean(right)) => left == right,
+        (Value::String(left), Value::String(right)) => {
+            left.to_plain_string() == right.to_plain_string()
+        }
+        (Value::Char(left), Value::Char(right)) => left == right,
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::EmptyList, Value::EmptyList) => true,
+        (Value::Pair(left_car, left_cdr), Value::Pair(right_car, right_cdr)) => {
+            equal_values(left_car.as_ref(), right_car.as_ref())
+                && equal_values(left_cdr.as_ref(), right_cdr.as_ref())
+        }
+        (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    }
+}
+
 fn list_length(value: &Value) -> Result<usize, EvalError> {
     let mut count = 0;
     let mut cursor = value;
@@ -1458,18 +1902,32 @@ fn expect_numbers(args: &[Value]) -> Result<Vec<i64>, EvalError> {
     let mut values = Vec::with_capacity(args.len());
 
     for value in args {
-        match value {
-            Value::Integer(number) => values.push(*number),
-            other => {
-                return Err(EvalError::TypeMismatch {
-                    expected: "number",
-                    actual: other.type_name(),
-                });
-            }
-        }
+        values.push(expect_number(value)?);
     }
 
     Ok(values)
+}
+
+fn expect_number(value: &Value) -> Result<i64, EvalError> {
+    match value {
+        Value::Integer(number) => Ok(*number),
+        other => Err(EvalError::TypeMismatch {
+            expected: "number",
+            actual: other.type_name(),
+        }),
+    }
+}
+
+fn expect_two_numbers(name: &str, args: &[Value]) -> Result<(i64, i64), EvalError> {
+    expect_value_arity(name, args, 2)?;
+    let left = expect_number(&args[0])?;
+    let right = expect_number(&args[1])?;
+
+    if right == 0 {
+        return Err(EvalError::DivisionByZero);
+    }
+
+    Ok((left, right))
 }
 
 fn expect_string(value: &Value) -> Result<&SchemeString, EvalError> {
@@ -1489,6 +1947,13 @@ fn expect_char(value: &Value) -> Result<char, EvalError> {
             expected: "char",
             actual: other.type_name(),
         }),
+    }
+}
+
+fn expect_procedure(value: &Value) -> Result<Rc<Procedure>, EvalError> {
+    match value {
+        Value::Procedure(procedure) => Ok(procedure.clone()),
+        _ => Err(EvalError::NotAProcedure),
     }
 }
 
