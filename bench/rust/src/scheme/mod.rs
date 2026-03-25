@@ -35,7 +35,7 @@ enum Value {
     Rational(i64, i64), // numerator, denominator (always simplified, d > 0)
     Boolean(bool),
     Char(char),
-    Str(String),
+    Str(String, bool), // (content, mutable)
     Symbol(String),
     List(Vec<Value>),
     Pair(Box<Value>, Box<Value>),
@@ -84,7 +84,7 @@ impl fmt::Display for Value {
                 ' ' => write!(f, "#\\space"),
                 _ => write!(f, "#\\{c}"),
             },
-            Value::Str(s) => write!(f, "\"{}\"", s),
+            Value::Str(s, _) => write!(f, "\"{}\"", s),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(elems) => {
                 write!(f, "(")?;
@@ -465,6 +465,8 @@ fn default_env() -> Env {
         "string->number", "number->string",
         "symbol->string", "string->symbol",
         "string-ref", "string-copy",
+        "string->list", "list->string",
+        "char->integer", "integer->char",
         "apply",
         "eq?", "equal?", "map",
         "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
@@ -491,7 +493,7 @@ fn default_env() -> Env {
 
 fn display_value(v: &Value, out: &mut String) {
     match v {
-        Value::Str(s) => out.push_str(s),
+        Value::Str(s, _) => out.push_str(s),
         Value::List(elems) => {
             out.push('(');
             for (i, e) in elems.iter().enumerate() {
@@ -528,7 +530,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
         ExprKind::Rational(n, d) => Ok(make_rational(*n, *d)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::Char(c) => Ok(Value::Char(*c)),
-        ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Str(s) => Ok(Value::Str(s.clone(), false)),
         ExprKind::Symbol(s) => {
             env.get(s).ok_or_else(|| EvalError::Unbound(format!("{s} at {span}")))
         }
@@ -777,30 +779,33 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                         }
                         let var_name = match &elems[1].kind {
                             ExprKind::Symbol(s) => s.clone(),
-                            _ => return Err(EvalError::Type(format!("string-set!: first argument must be a variable at {span}"))),
+                            _ => return Err(EvalError::Type(format!("string-set!: strings are immutable at {span}"))),
                         };
-                        let idx_val = eval(&elems[2], env, output)?;
-                        let idx = match &idx_val {
-                            Value::Integer(n) => *n as usize,
-                            _ => return Err(EvalError::Type(format!("string-set!: index must be integer at {span}"))),
+                        let idx = match eval(&elems[2], env, output)? {
+                            Value::Integer(n) => n as usize,
+                            _ => return Err(EvalError::Type(format!("string-set!: expected integer index at {span}"))),
                         };
-                        let char_val = eval(&elems[3], env, output)?;
-                        let ch = match &char_val {
-                            Value::Char(c) => *c,
-                            _ => return Err(EvalError::Type(format!("string-set!: third argument must be char at {span}"))),
+                        let ch = match eval(&elems[3], env, output)? {
+                            Value::Char(c) => c,
+                            _ => return Err(EvalError::Type(format!("string-set!: expected char at {span}"))),
                         };
-                        let s = env.get(&var_name).ok_or_else(|| EvalError::Unbound(format!("{var_name} at {span}")))?;
-                        let mut chars: Vec<char> = match &s {
-                            Value::Str(st) => st.chars().collect(),
+                        let current = env.get(&var_name).ok_or_else(|| EvalError::Unbound(format!("{var_name} at {span}")))?;
+                        match current {
+                            Value::Str(s, true) => {
+                                let mut chars: Vec<char> = s.chars().collect();
+                                if idx >= chars.len() {
+                                    return Err(EvalError::Type(format!("string-set!: index out of range at {span}")));
+                                }
+                                chars[idx] = ch;
+                                let new_s: String = chars.into_iter().collect();
+                                env.set_existing(&var_name, Value::Str(new_s, true));
+                                return Ok(Value::Void);
+                            }
+                            Value::Str(_, false) => {
+                                return Err(EvalError::Type(format!("string-set!: strings are immutable at {span}")));
+                            }
                             _ => return Err(EvalError::Type(format!("string-set!: not a string at {span}"))),
-                        };
-                        if idx >= chars.len() {
-                            return Err(EvalError::Type(format!("string-set!: index out of range at {span}")));
                         }
-                        chars[idx] = ch;
-                        let new_str: String = chars.into_iter().collect();
-                        env.set(var_name, Value::Str(new_str));
-                        return Ok(Value::Void);
                     }
                     "define-record-type" => {
                         // (define-record-type <name> (constructor field-names...) predicate (field accessor)...)
@@ -1254,7 +1259,7 @@ fn scheme_equal(a: &Value, b: &Value) -> bool {
         (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::Char(x), Value::Char(y)) => x == y,
-        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Str(x, _), Value::Str(y, _)) => x == y,
         (Value::Symbol(x), Value::Symbol(y)) => x == y,
         (Value::List(x), Value::List(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| scheme_equal(a, b))
@@ -1447,7 +1452,7 @@ fn apply_builtin(name: &str, args: &[Value], call_span: Span, output: &mut Strin
         }
         "string?" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("string? requires 1 argument at {call_span}"))); }
-            Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
+            Ok(Value::Boolean(matches!(&args[0], Value::Str(_, _))))
         }
         "number?" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("number? requires 1 argument at {call_span}"))); }
@@ -1555,23 +1560,23 @@ fn apply_builtin(name: &str, args: &[Value], call_span: Span, output: &mut Strin
             let mut result = String::new();
             for a in args {
                 match a {
-                    Value::Str(s) => result.push_str(s),
+                    Value::Str(s, _) => result.push_str(s),
                     _ => return Err(EvalError::Type(format!("string-append: not a string at {call_span}"))),
                 }
             }
-            Ok(Value::Str(result))
+            Ok(Value::Str(result, true))
         }
         "string-length" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("string-length requires 1 argument at {call_span}"))); }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Integer(s.chars().count() as i64)),
+                Value::Str(s, _) => Ok(Value::Integer(s.chars().count() as i64)),
                 _ => Err(EvalError::Type(format!("string-length: not a string at {call_span}"))),
             }
         }
         "substring" => {
             if args.len() != 3 { return Err(EvalError::Arity(format!("substring requires 3 arguments at {call_span}"))); }
             let s = match &args[0] {
-                Value::Str(s) => s,
+                Value::Str(s, _) => s,
                 _ => return Err(EvalError::Type(format!("substring: not a string at {call_span}"))),
             };
             let start = as_int(&args[1], call_span)? as usize;
@@ -1580,12 +1585,12 @@ fn apply_builtin(name: &str, args: &[Value], call_span: Span, output: &mut Strin
             if end > chars.len() || start > end {
                 return Err(EvalError::Type(format!("substring: index out of range at {call_span}")));
             }
-            Ok(Value::Str(chars[start..end].iter().collect()))
+            Ok(Value::Str(chars[start..end].iter().collect(), true))
         }
         "string->number" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("string->number requires 1 argument at {call_span}"))); }
             match &args[0] {
-                Value::Str(s) => {
+                Value::Str(s, _) => {
                     if let Ok(n) = s.parse::<i64>() {
                         Ok(Value::Integer(n))
                     } else if let Ok(f) = s.parse::<f64>() {
@@ -1599,26 +1604,26 @@ fn apply_builtin(name: &str, args: &[Value], call_span: Span, output: &mut Strin
         }
         "number->string" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("number->string requires 1 argument at {call_span}"))); }
-            Ok(Value::Str(args[0].to_string()))
+            Ok(Value::Str(args[0].to_string(), true))
         }
         "symbol->string" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("symbol->string requires 1 argument at {call_span}"))); }
             match &args[0] {
-                Value::Symbol(s) => Ok(Value::Str(s.clone())),
+                Value::Symbol(s) => Ok(Value::Str(s.clone(), true)),
                 _ => Err(EvalError::Type(format!("symbol->string: not a symbol at {call_span}"))),
             }
         }
         "string->symbol" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("string->symbol requires 1 argument at {call_span}"))); }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Symbol(s.clone())),
+                Value::Str(s, _) => Ok(Value::Symbol(s.clone())),
                 _ => Err(EvalError::Type(format!("string->symbol: not a string at {call_span}"))),
             }
         }
         "string-ref" => {
             if args.len() != 2 { return Err(EvalError::Arity(format!("string-ref requires 2 arguments at {call_span}"))); }
             let s = match &args[0] {
-                Value::Str(s) => s,
+                Value::Str(s, _) => s,
                 _ => return Err(EvalError::Type(format!("string-ref: not a string at {call_span}"))),
             };
             let idx = as_int(&args[1], call_span)? as usize;
@@ -1631,8 +1636,49 @@ fn apply_builtin(name: &str, args: &[Value], call_span: Span, output: &mut Strin
         "string-copy" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("string-copy requires 1 argument at {call_span}"))); }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Str(s.clone())),
+                Value::Str(s, _) => Ok(Value::Str(s.clone(), true)),
                 _ => Err(EvalError::Type(format!("string-copy: not a string at {call_span}"))),
+            }
+        }
+        "string->list" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("string->list requires 1 argument at {call_span}"))); }
+            match &args[0] {
+                Value::Str(s, _) => Ok(Value::List(s.chars().map(Value::Char).collect())),
+                _ => Err(EvalError::Type(format!("string->list: not a string at {call_span}"))),
+            }
+        }
+        "list->string" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("list->string requires 1 argument at {call_span}"))); }
+            let chars = match &args[0] {
+                Value::List(elems) => {
+                    let mut s = String::new();
+                    for e in elems {
+                        match e {
+                            Value::Char(c) => s.push(*c),
+                            _ => return Err(EvalError::Type(format!("list->string: list must contain only characters at {call_span}"))),
+                        }
+                    }
+                    s
+                }
+                _ => return Err(EvalError::Type(format!("list->string: not a list at {call_span}"))),
+            };
+            Ok(Value::Str(chars, true))
+        }
+        "char->integer" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("char->integer requires 1 argument at {call_span}"))); }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Integer(*c as i64)),
+                _ => Err(EvalError::Type(format!("char->integer: not a char at {call_span}"))),
+            }
+        }
+        "integer->char" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("integer->char requires 1 argument at {call_span}"))); }
+            match &args[0] {
+                Value::Integer(n) => {
+                    let c = char::from_u32(*n as u32).ok_or_else(|| EvalError::Type(format!("integer->char: invalid code point at {call_span}")))?;
+                    Ok(Value::Char(c))
+                }
+                _ => Err(EvalError::Type(format!("integer->char: not an integer at {call_span}"))),
             }
         }
         "apply" => {
@@ -1826,35 +1872,35 @@ fn apply_builtin(name: &str, args: &[Value], call_span: Span, output: &mut Strin
         "string=?" => {
             if args.len() != 2 { return Err(EvalError::Arity(format!("string=? requires 2 arguments at {call_span}"))); }
             match (&args[0], &args[1]) {
-                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a == b)),
+                (Value::Str(a, _), Value::Str(b, _)) => Ok(Value::Boolean(a == b)),
                 _ => Err(EvalError::Type(format!("string=?: not strings at {call_span}"))),
             }
         }
         "string<?" => {
             if args.len() != 2 { return Err(EvalError::Arity(format!("string<? requires 2 arguments at {call_span}"))); }
             match (&args[0], &args[1]) {
-                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a < b)),
+                (Value::Str(a, _), Value::Str(b, _)) => Ok(Value::Boolean(a < b)),
                 _ => Err(EvalError::Type(format!("string<?: not strings at {call_span}"))),
             }
         }
         "string-ci=?" => {
             if args.len() != 2 { return Err(EvalError::Arity(format!("string-ci=? requires 2 arguments at {call_span}"))); }
             match (&args[0], &args[1]) {
-                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a.to_lowercase() == b.to_lowercase())),
+                (Value::Str(a, _), Value::Str(b, _)) => Ok(Value::Boolean(a.to_lowercase() == b.to_lowercase())),
                 _ => Err(EvalError::Type(format!("string-ci=?: not strings at {call_span}"))),
             }
         }
         "string-upcase" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("string-upcase requires 1 argument at {call_span}"))); }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Str(s.to_uppercase())),
+                Value::Str(s, _) => Ok(Value::Str(s.to_uppercase(), true)),
                 _ => Err(EvalError::Type(format!("string-upcase: not a string at {call_span}"))),
             }
         }
         "string-downcase" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("string-downcase requires 1 argument at {call_span}"))); }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
+                Value::Str(s, _) => Ok(Value::Str(s.to_lowercase(), true)),
                 _ => Err(EvalError::Type(format!("string-downcase: not a string at {call_span}"))),
             }
         }
@@ -1923,7 +1969,7 @@ fn apply_builtin(name: &str, args: &[Value], call_span: Span, output: &mut Strin
         }
         "error" => {
             let msg: String = args.iter().map(|a| match a {
-                Value::Str(s) => s.clone(),
+                Value::Str(s, _) => s.clone(),
                 Value::Boolean(false) => "#f".to_string(),
                 other => other.to_string(),
             }).collect::<Vec<_>>().join("");
@@ -1990,7 +2036,7 @@ fn expr_to_value(expr: &Expr) -> Value {
         ExprKind::Rational(n, d) => make_rational(*n, *d),
         ExprKind::Boolean(b) => Value::Boolean(*b),
         ExprKind::Char(c) => Value::Char(*c),
-        ExprKind::Str(s) => Value::Str(s.clone()),
+        ExprKind::Str(s) => Value::Str(s.clone(), false),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
         ExprKind::List(elems) => Value::List(elems.iter().map(expr_to_value).collect()),
     }
