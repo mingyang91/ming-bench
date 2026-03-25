@@ -107,7 +107,10 @@ type SchemeValue =
   | VoidValue
   | ProcedureValue;
 
-type ProcedureValue = BuiltinProcedureValue | ClosureProcedureValue;
+type ProcedureValue =
+  | BuiltinProcedureValue
+  | ClosureProcedureValue
+  | CaseLambdaProcedureValue;
 
 interface BuiltinProcedureValue {
   kind: 'procedure';
@@ -123,6 +126,20 @@ interface ClosureProcedureValue {
   params: SymbolExpr[];
   restParam?: SymbolExpr;
   body: Expr[];
+  env: Environment;
+}
+
+interface CaseLambdaClause {
+  params: SymbolExpr[];
+  restParam?: SymbolExpr;
+  body: Expr[];
+}
+
+interface CaseLambdaProcedureValue {
+  kind: 'procedure';
+  procedureKind: 'case-lambda';
+  name: string;
+  clauses: CaseLambdaClause[];
   env: Environment;
 }
 
@@ -230,6 +247,7 @@ const SPECIAL_FORM_NAMES = new Set([
   'and',
   'or',
   'begin',
+  'case-lambda',
   'cond',
   'define',
   'define-record-type',
@@ -308,6 +326,10 @@ function createGlobalEnvironment(output: string[]): Environment {
   env.define('apply', makeBuiltinProcedure('apply', (args) => applyApply(args)));
   env.define('eq?', makeBuiltinProcedure('eq?', (args) => applyEq(args)));
   env.define('equal?', makeBuiltinProcedure('equal?', (args) => applyEqual(args)));
+  env.define(
+    'procedure?',
+    makePredicateProcedure('procedure?', (value) => value.kind === 'procedure'),
+  );
 
   env.define('abs', makeBuiltinProcedure('abs', (args) => applyAbs(args)));
   env.define('quotient', makeBuiltinProcedure('quotient', (args) => applyQuotient(args)));
@@ -1099,6 +1121,11 @@ function resolveTemplateIdentifiers(
     return;
   }
 
+  if (head?.kind === 'symbol' && head.value === 'case-lambda') {
+    resolveCaseLambdaTemplateIdentifiers(expression, env, templateId, scope);
+    return;
+  }
+
   if (head?.kind === 'symbol' && head.value === 'let') {
     resolveLetTemplateIdentifiers(expression, env, templateId, scope);
     return;
@@ -1163,6 +1190,27 @@ function resolveLambdaTemplateIdentifiers(
 
   for (const bodyExpression of expression.items.slice(2)) {
     resolveTemplateIdentifiers(bodyExpression, env, templateId, childScope);
+  }
+}
+
+function resolveCaseLambdaTemplateIdentifiers(
+  expression: ListExpr,
+  env: Environment,
+  templateId: number,
+  scope?: TemplateScope,
+): void {
+  for (const clause of expression.items.slice(1)) {
+    if (clause.kind !== 'list' || clause.items.length === 0) {
+      resolveTemplateIdentifiers(clause, env, templateId, scope);
+      continue;
+    }
+
+    const childScope = createTemplateScope(scope);
+    renameLambdaParameters(clause.items[0], templateId, childScope);
+
+    for (const bodyExpression of clause.items.slice(1)) {
+      resolveTemplateIdentifiers(bodyExpression, env, templateId, childScope);
+    }
   }
 }
 
@@ -1502,6 +1550,8 @@ function evaluateList(items: Expr[], env: Environment): SchemeValue {
         return evaluateDefineSyntax(items.slice(1), env);
       case 'if':
         return evaluateIf(items.slice(1), env);
+      case 'case-lambda':
+        return evaluateCaseLambda(items.slice(1), env);
       case 'lambda':
         return evaluateLambda(items.slice(1), env);
       case 'let':
@@ -1621,6 +1671,13 @@ function defineVariable(name: SymbolExpr, valueExpression: Expr, env: Environmen
     return VOID_VALUE;
   }
 
+  if (isCaseLambdaExpression(valueExpression)) {
+    const binding: Binding = { value: VOID_VALUE };
+    defineIdentifierBinding(name, env, binding);
+    binding.value = evaluateNamedCaseLambda(valueExpression, env, displayIdentifierName(name));
+    return VOID_VALUE;
+  }
+
   defineIdentifier(name, env, evaluate(valueExpression, env));
   return VOID_VALUE;
 }
@@ -1634,6 +1691,15 @@ function isLambdaExpression(expression: Expr): expression is ListExpr {
   );
 }
 
+function isCaseLambdaExpression(expression: Expr): expression is ListExpr {
+  return (
+    expression.kind === 'list' &&
+    expression.items.length > 0 &&
+    expression.items[0].kind === 'symbol' &&
+    expression.items[0].value === 'case-lambda'
+  );
+}
+
 function evaluateNamedLambda(
   expression: ListExpr,
   env: Environment,
@@ -1641,6 +1707,14 @@ function evaluateNamedLambda(
 ): ClosureProcedureValue {
   const { params, restParam, body } = parseLambdaParts(expression.items.slice(1));
   return makeClosure(name, params, body, env, restParam);
+}
+
+function evaluateNamedCaseLambda(
+  expression: ListExpr,
+  env: Environment,
+  name: string,
+): CaseLambdaProcedureValue {
+  return makeCaseLambda(name, parseCaseLambdaClauses(expression.items.slice(1)), env);
 }
 
 function evaluateIf(items: Expr[], env: Environment): SchemeValue {
@@ -1663,6 +1737,10 @@ function evaluateIf(items: Expr[], env: Environment): SchemeValue {
 function evaluateLambda(items: Expr[], env: Environment): SchemeValue {
   const { params, restParam, body } = parseLambdaParts(items);
   return makeClosure('lambda', params, body, env, restParam);
+}
+
+function evaluateCaseLambda(items: Expr[], env: Environment): SchemeValue {
+  return makeCaseLambda('case-lambda', parseCaseLambdaClauses(items), env);
 }
 
 function evaluateSet(items: Expr[], env: Environment): SchemeValue {
@@ -1762,6 +1840,23 @@ function parseLambdaParts(items: Expr[]): { params: SymbolExpr[]; restParam?: Sy
   return { params, restParam, body };
 }
 
+function parseCaseLambdaClauses(items: Expr[]): CaseLambdaClause[] {
+  if (items.length === 0) {
+    throw new EvalError('case-lambda requires at least one clause');
+  }
+
+  return items.map((item) => parseCaseLambdaClause(item));
+}
+
+function parseCaseLambdaClause(expression: Expr): CaseLambdaClause {
+  if (expression.kind !== 'list' || expression.items.length < 2) {
+    throw new EvalError('case-lambda clauses require parameters and a body', expression.location);
+  }
+
+  const { params, restParam } = readParameterList(expression.items[0]);
+  return { params, restParam, body: expression.items.slice(1) };
+}
+
 function readParameterList(expression: Expr): { params: SymbolExpr[]; restParam?: SymbolExpr } {
   if (expression.kind === 'symbol') {
     return { params: [], restParam: readParameterName(expression) };
@@ -1808,6 +1903,14 @@ function makeClosure(
   return { kind: 'procedure', procedureKind: 'closure', name, params, restParam, body, env };
 }
 
+function makeCaseLambda(
+  name: string,
+  clauses: CaseLambdaClause[],
+  env: Environment,
+): CaseLambdaProcedureValue {
+  return { kind: 'procedure', procedureKind: 'case-lambda', name, clauses, env };
+}
+
 function evaluateQuote(items: Expr[]): SchemeValue {
   expectExactExprCount('quote', items, 1);
   return quoteExpression(items[0]);
@@ -1852,22 +1955,73 @@ function applyProcedure(value: SchemeValue, args: SchemeValue[]): SchemeValue {
     return value.apply(args);
   }
 
-  if (value.restParam === undefined) {
-    expectExactArgCount(value.name, args, value.params.length);
+  if (value.procedureKind === 'case-lambda') {
+    const clause = selectCaseLambdaClause(value, args.length);
+    return applyUserProcedure(
+      value.name,
+      clause.params,
+      clause.body,
+      value.env,
+      args,
+      clause.restParam,
+    );
+  }
+
+  return applyUserProcedure(value.name, value.params, value.body, value.env, args, value.restParam);
+}
+
+function applyUserProcedure(
+  name: string,
+  params: SymbolExpr[],
+  body: Expr[],
+  env: Environment,
+  args: SchemeValue[],
+  restParam?: SymbolExpr,
+): SchemeValue {
+  if (restParam === undefined) {
+    expectExactArgCount(name, args, params.length);
   } else {
-    expectAtLeastArgCount(value.name, args, value.params.length);
+    expectAtLeastArgCount(name, args, params.length);
   }
 
-  const callEnv = value.env.child();
-  for (let index = 0; index < value.params.length; index += 1) {
-    defineIdentifier(value.params[index], callEnv, args[index]);
+  const callEnv = env.child();
+  for (let index = 0; index < params.length; index += 1) {
+    defineIdentifier(params[index], callEnv, args[index]);
   }
 
-  if (value.restParam !== undefined) {
-    defineIdentifier(value.restParam, callEnv, arrayToList(args.slice(value.params.length)));
+  if (restParam !== undefined) {
+    defineIdentifier(restParam, callEnv, arrayToList(args.slice(params.length)));
   }
 
-  return evaluateSequence(value.body, callEnv);
+  return evaluateSequence(body, callEnv);
+}
+
+function selectCaseLambdaClause(
+  procedure: CaseLambdaProcedureValue,
+  argCount: number,
+): CaseLambdaClause {
+  for (const clause of procedure.clauses) {
+    if (
+      clause.restParam === undefined
+        ? argCount === clause.params.length
+        : argCount >= clause.params.length
+    ) {
+      return clause;
+    }
+  }
+
+  throw new EvalError(formatCaseLambdaArityError(procedure.name, procedure.clauses, argCount));
+}
+
+function formatCaseLambdaArityError(
+  name: string,
+  clauses: CaseLambdaClause[],
+  actual: number,
+): string {
+  const expectations = clauses.map((clause) =>
+    clause.restParam === undefined ? `${clause.params.length}` : `at least ${clause.params.length}`,
+  );
+  return `${name} expected ${expectations.join(' or ')} argument(s), got ${actual}`;
 }
 
 function makeBuiltinProcedure(
