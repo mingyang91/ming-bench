@@ -3,6 +3,8 @@ package ming
 enum SchemeVal:
   var pos: (Int, Int) = (0, 0)
   case IntVal(n: Long)
+  case RationalVal(num: Long, den: Long)
+  case FloatVal(d: Double)
   case BoolVal(b: Boolean)
   case StringVal(chars: Array[Char])
   case Symbol(name: String)
@@ -18,9 +20,37 @@ object SchemeVal:
 
   def str(s: String): StringVal = StringVal(s.toCharArray)
 
+  private def gcd(a: Long, b: Long): Long =
+    val aa = math.abs(a); val bb = math.abs(b)
+    if bb == 0 then aa else gcd(bb, aa % bb)
+
+  def makeRational(num: Long, den: Long): SchemeVal =
+    if den == 0 then throw new EvalError("division by zero")
+    val sign = if den < 0 then -1L else 1L
+    val n    = num * sign; val d = den * sign
+    val g    = gcd(math.abs(n), d)
+    val sn   = n / g; val sd     = d / g
+    if sd == 1 then IntVal(sn) else RationalVal(sn, sd)
+
+  def toDouble(v: SchemeVal): Double = v match
+    case IntVal(n)         => n.toDouble
+    case RationalVal(n, d) => n.toDouble / d.toDouble
+    case FloatVal(d)       => d
+    case other             => throw new EvalError(s"expected number, got ${display(other)}")
+
+  def isNumeric(v: SchemeVal): Boolean = v match
+    case IntVal(_) | RationalVal(_, _) | FloatVal(_) => true
+    case _                                           => false
+
+  def isExact(v: SchemeVal): Boolean = v match
+    case IntVal(_) | RationalVal(_, _) => true
+    case _                             => false
+
   /** write-style display (strings quoted) */
   def display(v: SchemeVal): String = v match
     case IntVal(n)               => n.toString
+    case RationalVal(n, d)       => s"$n/$d"
+    case FloatVal(d)             => if d == d.toLong.toDouble && !d.isInfinite then s"${d.toLong}.0" else d.toString
     case BoolVal(true)           => "#t"
     case BoolVal(false)          => "#f"
     case StringVal(chars)        => s"\"${new String(chars)}\""
@@ -45,12 +75,14 @@ object SchemeVal:
     case other                   => display(other)
 
   def schemeEqual(a: SchemeVal, b: SchemeVal): Boolean = (a, b) match
-    case (IntVal(x), IntVal(y))       => x == y
-    case (BoolVal(x), BoolVal(y))     => x == y
-    case (StringVal(x), StringVal(y)) => java.util.Arrays.equals(x, y)
-    case (CharVal(x), CharVal(y))     => x == y
-    case (Symbol(x), Symbol(y))       => x == y
-    case (SList(xs), SList(ys))       => xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b))
+    case (IntVal(x), IntVal(y))                     => x == y
+    case (RationalVal(n1, d1), RationalVal(n2, d2)) => n1 == n2 && d1 == d2
+    case (FloatVal(x), FloatVal(y))                 => x == y
+    case (BoolVal(x), BoolVal(y))                   => x == y
+    case (StringVal(x), StringVal(y))               => java.util.Arrays.equals(x, y)
+    case (CharVal(x), CharVal(y))                   => x == y
+    case (Symbol(x), Symbol(y))                     => x == y
+    case (SList(xs), SList(ys)) => xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b))
     case (DottedList(xs, xt), DottedList(ys, yt)) =>
       xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b)) && schemeEqual(xt, yt)
     case (Void, Void) => true

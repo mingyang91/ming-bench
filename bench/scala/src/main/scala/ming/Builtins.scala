@@ -117,9 +117,7 @@ object Builtins:
         "number?",
         args =>
           if args.size != 1 then throw new EvalError("number?: expected 1 argument")
-          args.head match
-            case SchemeVal.IntVal(_) => SchemeVal.BoolVal(true)
-            case _                   => SchemeVal.BoolVal(false)
+          SchemeVal.BoolVal(SchemeVal.isNumeric(args.head))
       )
     )
     env.define(

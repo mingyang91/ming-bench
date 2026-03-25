@@ -24,6 +24,8 @@ object Evaluator:
     try
       expr match
         case SchemeVal.IntVal(_)              => expr
+        case SchemeVal.RationalVal(_, _)      => expr
+        case SchemeVal.FloatVal(_)            => expr
         case SchemeVal.BoolVal(_)             => expr
         case SchemeVal.StringVal(_)           => expr
         case SchemeVal.CharVal(_)             => expr

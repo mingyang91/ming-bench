@@ -59,18 +59,43 @@ object Parser:
       case Token.RParen(_) :: rest => (elems.toList, dotTail, rest)
       case _                       => throw new EvalError("missing )")
 
+  private def parseNumeric(s: String): SchemeVal =
+    s.toLongOption match
+      case Some(n) => SchemeVal.IntVal(n)
+      case None    => parseRationalOrFloat(s)
+
+  private def parseRationalOrFloat(s: String): SchemeVal =
+    val slashIdx = s.indexOf('/')
+    if slashIdx > 0 && slashIdx < s.length - 1 then
+      val numStr = s.substring(0, slashIdx)
+      val denStr = s.substring(slashIdx + 1)
+      (numStr.toLongOption, denStr.toLongOption) match
+        case (Some(n), Some(d)) => SchemeVal.makeRational(n, d)
+        case _                  => parseFloatOrSymbol(s)
+    else parseFloatWithIndicator(s)
+
+  private def parseFloatOrSymbol(s: String): SchemeVal =
+    s.toDoubleOption match
+      case Some(d) => SchemeVal.FloatVal(d)
+      case None    => SchemeVal.Symbol(s)
+
+  private def parseFloatWithIndicator(s: String): SchemeVal =
+    s.toDoubleOption match
+      case Some(d) if s.contains('.') || s.contains('e') || s.contains('E') =>
+        SchemeVal.FloatVal(d)
+      case _ => SchemeVal.Symbol(s)
+
+  private def parseCharLiteral(s: String): SchemeVal =
+    val rest = s.substring(2)
+    rest match
+      case "space"            => SchemeVal.CharVal(' ')
+      case "newline"          => SchemeVal.CharVal('\n')
+      case "tab"              => SchemeVal.CharVal('\t')
+      case c if c.length == 1 => SchemeVal.CharVal(c.charAt(0))
+      case _                  => throw new EvalError(s"invalid character literal: $s")
+
   private def parseAtom(s: String): SchemeVal =
     if s == "#t" then SchemeVal.BoolVal(true)
     else if s == "#f" then SchemeVal.BoolVal(false)
-    else if s.startsWith("#\\") then
-      val rest = s.substring(2)
-      rest match
-        case "space"            => SchemeVal.CharVal(' ')
-        case "newline"          => SchemeVal.CharVal('\n')
-        case "tab"              => SchemeVal.CharVal('\t')
-        case c if c.length == 1 => SchemeVal.CharVal(c.charAt(0))
-        case _                  => throw new EvalError(s"invalid character literal: $s")
-    else
-      s.toLongOption match
-        case Some(n) => SchemeVal.IntVal(n)
-        case None    => SchemeVal.Symbol(s)
+    else if s.startsWith("#\\") then parseCharLiteral(s)
+    else parseNumeric(s)
