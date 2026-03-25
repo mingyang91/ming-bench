@@ -14,7 +14,11 @@ const BUILTIN_NAMES: &[&str] = &[
     "=",
     ">",
     ">=",
+    "char?",
+    "display",
     "not",
+    "newline",
+    "number->string",
     "append",
     "boolean?",
     "car",
@@ -25,8 +29,16 @@ const BUILTIN_NAMES: &[&str] = &[
     "null?",
     "number?",
     "pair?",
+    "string-append",
     "string?",
+    "string-length",
+    "string->number",
+    "string->symbol",
+    "string-ref",
+    "substring",
     "symbol?",
+    "symbol->string",
+    "write",
 ];
 
 /// Evaluate one or more Scheme expressions and return the string
@@ -38,6 +50,18 @@ const BUILTIN_NAMES: &[&str] = &[
 /// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
 /// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
+    let (value, _) = eval_program(input)?;
+    Ok(render_result(&value))
+}
+
+/// Evaluate Scheme expressions, returning both the result value and
+/// any output produced by `display`, `write`, or `newline`.
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let (value, output) = eval_program(input)?;
+    Ok((render_result(&value), output))
+}
+
+fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
     let exprs = Parser::new(input).parse_program()?;
     let env = Environment::global();
     let mut last = None;
@@ -47,16 +71,14 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     }
 
     let value = last.ok_or(EvalError::EmptyInput)?;
-    Ok(match value {
-        Value::Void => String::new(),
-        other => other.to_scheme_string(),
-    })
+    Ok((value, Environment::captured_output(&env)))
 }
 
-/// Evaluate Scheme expressions, returning both the result value and
-/// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    Ok((eval_str(input)?, String::new()))
+fn render_result(value: &Value) -> String {
+    match value {
+        Value::Void => String::new(),
+        other => other.to_scheme_string(),
+    }
 }
 
 #[cfg(test)]
@@ -111,11 +133,16 @@ impl UserProcedure {
 struct Environment {
     parent: Option<EnvRef>,
     bindings: HashMap<String, Value>,
+    output: Rc<RefCell<String>>,
 }
 
 impl Environment {
     fn global() -> EnvRef {
-        let env = Rc::new(RefCell::new(Self::default()));
+        let env = Rc::new(RefCell::new(Self {
+            parent: None,
+            bindings: HashMap::new(),
+            output: Rc::new(RefCell::new(String::new())),
+        }));
 
         for &name in BUILTIN_NAMES {
             Self::define(&env, name.to_string(), Value::Builtin(name));
@@ -125,9 +152,11 @@ impl Environment {
     }
 
     fn child(parent: EnvRef) -> EnvRef {
+        let output = parent.borrow().output.clone();
         Rc::new(RefCell::new(Self {
             parent: Some(parent),
             bindings: HashMap::new(),
+            output,
         }))
     }
 
@@ -148,12 +177,24 @@ impl Environment {
 
         parent.and_then(|parent| Self::lookup(&parent, name))
     }
+
+    fn append_output(env: &EnvRef, text: &str) {
+        let output = env.borrow().output.clone();
+        output.borrow_mut().push_str(text);
+    }
+
+    fn captured_output(env: &EnvRef) -> String {
+        let output = env.borrow().output.clone();
+        let captured = output.borrow().clone();
+        captured
+    }
 }
 
 #[derive(Clone)]
 enum Value {
     Integer(i64),
     Bool(bool),
+    Char(char),
     String(String),
     Symbol(String),
     List(Vec<Value>),
@@ -167,6 +208,7 @@ impl Value {
         match self {
             Value::Integer(_) => "number",
             Value::Bool(_) => "boolean",
+            Value::Char(_) => "char",
             Value::String(_) => "string",
             Value::Symbol(_) => "symbol",
             Value::List(_) => "list",
@@ -191,6 +233,7 @@ impl Value {
             Value::Integer(value) => value.to_string(),
             Value::Bool(true) => "#t".into(),
             Value::Bool(false) => "#f".into(),
+            Value::Char(value) => format_char(*value),
             Value::String(value) => format!("\"{}\"", escape_string(value)),
             Value::Symbol(value) => value.clone(),
             Value::List(values) => {
@@ -203,6 +246,14 @@ impl Value {
             }
             Value::Builtin(_) | Value::Procedure(_) => "#<procedure>".into(),
             Value::Void => "#<void>".into(),
+        }
+    }
+
+    fn to_display_string(&self) -> String {
+        match self {
+            Value::String(value) => value.clone(),
+            Value::Char(value) => value.to_string(),
+            other => other.to_scheme_string(),
         }
     }
 }
@@ -220,6 +271,28 @@ impl LocatedValue {
 
     fn as_number(&self) -> Result<i64, EvalError> {
         self.value.as_number(self.position)
+    }
+
+    fn as_string(&self) -> Result<&str, EvalError> {
+        match &self.value {
+            Value::String(value) => Ok(value.as_str()),
+            other => Err(EvalError::type_mismatch(
+                "string",
+                other.type_name(),
+                self.position,
+            )),
+        }
+    }
+
+    fn as_symbol(&self) -> Result<&str, EvalError> {
+        match &self.value {
+            Value::Symbol(value) => Ok(value.as_str()),
+            other => Err(EvalError::type_mismatch(
+                "symbol",
+                other.type_name(),
+                self.position,
+            )),
+        }
     }
 }
 
@@ -244,6 +317,14 @@ fn escape_string(input: &str) -> String {
     }
 
     escaped
+}
+
+fn format_char(ch: char) -> String {
+    match ch {
+        ' ' => "#\\space".into(),
+        '\n' => "#\\newline".into(),
+        other => format!("#\\{}", other),
+    }
 }
 
 fn eval(expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
@@ -274,8 +355,8 @@ fn eval_list(items: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, 
         ExprKind::Symbol(name) if name == "let" => eval_let(tail, env, head.pos),
         _ => {
             let callable = eval(head, env.clone())?;
-            let args = eval_all(tail, env)?;
-            apply(callable, head.pos, args)
+            let args = eval_all(tail, env.clone())?;
+            apply(callable, head.pos, args, env)
         }
     }
 }
@@ -548,7 +629,7 @@ fn eval_named_let(
     }));
 
     Environment::define(&let_env, name.into(), procedure.clone());
-    apply(procedure, position, args)
+    apply(procedure, position, args, let_env)
 }
 
 fn parse_bindings(bindings_expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
@@ -605,9 +686,14 @@ fn eval_sequence(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     Ok(last)
 }
 
-fn apply(callable: Value, position: SourcePos, args: Vec<LocatedValue>) -> Result<Value, EvalError> {
+fn apply(
+    callable: Value,
+    position: SourcePos,
+    args: Vec<LocatedValue>,
+    env: EnvRef,
+) -> Result<Value, EvalError> {
     match callable {
-        Value::Builtin(name) => apply_builtin(name, &args, position),
+        Value::Builtin(name) => apply_builtin(name, &args, position, env),
         Value::Procedure(procedure) => apply_user_procedure(procedure, args, position),
         other => Err(EvalError::not_callable(other.type_name(), position)),
     }
@@ -635,7 +721,12 @@ fn apply_user_procedure(
     eval_sequence(&procedure.body, call_env)
 }
 
-fn apply_builtin(name: &str, args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+fn apply_builtin(
+    name: &str,
+    args: &[LocatedValue],
+    position: SourcePos,
+    env: EnvRef,
+) -> Result<Value, EvalError> {
     match name {
         "+" => apply_add(args, position),
         "-" => apply_sub(args, position),
@@ -648,19 +739,31 @@ fn apply_builtin(name: &str, args: &[LocatedValue], position: SourcePos) -> Resu
         ">=" => apply_compare(name, args, position, |left, right| left >= right),
         "append" => apply_append(args, position),
         "boolean?" => apply_type_predicate("boolean?", args, position, |value| matches!(value, Value::Bool(_))),
+        "char?" => apply_type_predicate("char?", args, position, |value| matches!(value, Value::Char(_))),
         "car" => apply_car(args, position),
         "cdr" => apply_cdr(args, position),
         "cons" => apply_cons(args, position),
+        "display" => apply_display(args, position, env),
         "length" => apply_length(args, position),
         "list" => Ok(Value::List(args.iter().map(|arg| arg.value.clone()).collect())),
+        "newline" => apply_newline(args, position, env),
         "null?" => apply_null(args, position),
         "not" => apply_not(args, position),
+        "number->string" => apply_number_to_string(args, position),
         "number?" => apply_type_predicate("number?", args, position, |value| matches!(value, Value::Integer(_))),
         "pair?" => apply_type_predicate("pair?", args, position, |value| {
             matches!(value, Value::List(values) if !values.is_empty())
         }),
+        "string-append" => apply_string_append(args),
         "string?" => apply_type_predicate("string?", args, position, |value| matches!(value, Value::String(_))),
+        "string-length" => apply_string_length(args, position),
+        "string->number" => apply_string_to_number(args, position),
+        "string->symbol" => apply_string_to_symbol(args, position),
+        "string-ref" => apply_string_ref(args, position),
+        "substring" => apply_substring(args, position),
         "symbol?" => apply_type_predicate("symbol?", args, position, |value| matches!(value, Value::Symbol(_))),
+        "symbol->string" => apply_symbol_to_string(args, position),
+        "write" => apply_write(args, position, env),
         _ => Err(EvalError::unbound_variable(name, position)),
     }
 }
@@ -782,6 +885,48 @@ fn apply_not(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalEr
     Ok(Value::Bool(!args[0].value.is_truthy()))
 }
 
+fn apply_display(args: &[LocatedValue], position: SourcePos, env: EnvRef) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "display",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    Environment::append_output(&env, &args[0].value.to_display_string());
+    Ok(Value::Void)
+}
+
+fn apply_newline(args: &[LocatedValue], position: SourcePos, env: EnvRef) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::wrong_arg_count(
+            "newline",
+            "exactly 0",
+            args.len(),
+            position,
+        ));
+    }
+
+    Environment::append_output(&env, "\n");
+    Ok(Value::Void)
+}
+
+fn apply_write(args: &[LocatedValue], position: SourcePos, env: EnvRef) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "write",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    Environment::append_output(&env, &args[0].value.to_scheme_string());
+    Ok(Value::Void)
+}
+
 fn apply_append(args: &[LocatedValue], _position: SourcePos) -> Result<Value, EvalError> {
     let mut items = Vec::new();
 
@@ -798,6 +943,138 @@ fn apply_append(args: &[LocatedValue], _position: SourcePos) -> Result<Value, Ev
     }
 
     Ok(Value::List(items))
+}
+
+fn apply_number_to_string(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "number->string",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    Ok(Value::String(args[0].as_number()?.to_string()))
+}
+
+fn apply_string_append(args: &[LocatedValue]) -> Result<Value, EvalError> {
+    let mut result = String::new();
+
+    for arg in args {
+        result.push_str(arg.as_string()?);
+    }
+
+    Ok(Value::String(result))
+}
+
+fn apply_string_length(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "string-length",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    Ok(Value::Integer(args[0].as_string()?.chars().count() as i64))
+}
+
+fn apply_string_to_number(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "string->number",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    Ok(match args[0].as_string()?.parse::<i64>() {
+        Ok(value) => Value::Integer(value),
+        Err(_) => Value::Bool(false),
+    })
+}
+
+fn apply_substring(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::wrong_arg_count(
+            "substring",
+            "exactly 3",
+            args.len(),
+            position,
+        ));
+    }
+
+    let string = args[0].as_string()?;
+    let length = string.chars().count();
+    let start = args[1].as_number()?;
+    let end = args[2].as_number()?;
+
+    if start < 0 || end < 0 || start > end || end as usize > length {
+        return Err(EvalError::invalid_range(start, end, length, position));
+    }
+
+    Ok(Value::String(
+        string
+            .chars()
+            .skip(start as usize)
+            .take((end - start) as usize)
+            .collect(),
+    ))
+}
+
+fn apply_symbol_to_string(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "symbol->string",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    Ok(Value::String(args[0].as_symbol()?.to_string()))
+}
+
+fn apply_string_to_symbol(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "string->symbol",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    Ok(Value::Symbol(args[0].as_string()?.to_string()))
+}
+
+fn apply_string_ref(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::wrong_arg_count(
+            "string-ref",
+            "exactly 2",
+            args.len(),
+            position,
+        ));
+    }
+
+    let string = args[0].as_string()?;
+    let length = string.chars().count();
+    let index = args[1].as_number()?;
+
+    if index < 0 || index as usize >= length {
+        return Err(EvalError::index_out_of_bounds(index, length, args[1].position));
+    }
+
+    Ok(Value::Char(
+        string
+            .chars()
+            .nth(index as usize)
+            .expect("validated character index"),
+    ))
 }
 
 fn apply_car(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {

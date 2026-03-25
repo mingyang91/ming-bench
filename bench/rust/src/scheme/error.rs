@@ -56,6 +56,21 @@ pub enum EvalError {
 
     #[error("{position}: integer overflow")]
     IntegerOverflow { position: SourcePos },
+
+    #[error("{position}: index out of bounds: index {index}, length {length}")]
+    IndexOutOfBounds {
+        index: i64,
+        length: usize,
+        position: SourcePos,
+    },
+
+    #[error("{position}: invalid range: start {start}, end {end}, length {length}")]
+    InvalidRange {
+        start: i64,
+        end: i64,
+        length: usize,
+        position: SourcePos,
+    },
 }
 
 impl EvalError {
@@ -112,5 +127,22 @@ impl EvalError {
 
     pub fn integer_overflow(position: SourcePos) -> Self {
         Self::IntegerOverflow { position }
+    }
+
+    pub fn index_out_of_bounds(index: i64, length: usize, position: SourcePos) -> Self {
+        Self::IndexOutOfBounds {
+            index,
+            length,
+            position,
+        }
+    }
+
+    pub fn invalid_range(start: i64, end: i64, length: usize, position: SourcePos) -> Self {
+        Self::InvalidRange {
+            start,
+            end,
+            length,
+            position,
+        }
     }
 }
