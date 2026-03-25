@@ -13,6 +13,7 @@ const (
 	ErrDivisionByZero  EvalErrorKind = "division_by_zero"
 	ErrNotProcedure    EvalErrorKind = "not_a_procedure"
 	ErrOutOfRange      EvalErrorKind = "out_of_range"
+	ErrImmutable       EvalErrorKind = "immutable"
 )
 
 // EvalError represents a Scheme evaluation error.

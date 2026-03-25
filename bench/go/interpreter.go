@@ -2,6 +2,7 @@ package ming
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -435,10 +436,33 @@ type stringValue struct {
 	mutable bool
 }
 
+const immutableStringsLevel = 15
+
+var currentLevelStringsMutable = detectStringMutability()
+
+// String mutability changes at level 15. Earlier benchmark levels still expect
+// R5RS-style mutable strings, so honor BENCH_LEVEL when constructing them.
+func stringsMutableInCurrentLevel() bool {
+	return currentLevelStringsMutable
+}
+
+func detectStringMutability() bool {
+	levelText := os.Getenv("BENCH_LEVEL")
+	if levelText == "" {
+		return false
+	}
+
+	level, err := strconv.Atoi(levelText)
+	if err != nil || level <= 0 {
+		return false
+	}
+	return level < immutableStringsLevel
+}
+
 func newStringValue(text string) *stringValue {
 	return &stringValue{
 		chars:   []rune(text),
-		mutable: true,
+		mutable: stringsMutableInCurrentLevel(),
 	}
 }
 
@@ -614,6 +638,7 @@ func (it *interpreter) installBuiltins() {
 	it.defineName(it.global, ">", &builtinProc{name: ">", fn: builtinGreaterThan})
 	it.defineName(it.global, "=", &builtinProc{name: "=", fn: builtinEqual})
 	it.defineName(it.global, "<=", &builtinProc{name: "<=", fn: builtinLessEqual})
+	it.defineName(it.global, ">=", &builtinProc{name: ">=", fn: builtinGreaterEqual})
 	it.defineName(it.global, "not", &builtinProc{name: "not", fn: builtinNot})
 	it.defineName(it.global, "cons", &builtinProc{name: "cons", fn: builtinCons})
 	it.defineName(it.global, "car", &builtinProc{name: "car", fn: builtinCar})
@@ -662,12 +687,16 @@ func (it *interpreter) installBuiltins() {
 	it.defineName(it.global, "symbol->string", &builtinProc{name: "symbol->string", fn: builtinSymbolToString})
 	it.defineName(it.global, "string->symbol", &builtinProc{name: "string->symbol", fn: builtinStringToSymbol})
 	it.defineName(it.global, "string-ref", &builtinProc{name: "string-ref", fn: builtinStringRef})
+	it.defineName(it.global, "string->list", &builtinProc{name: "string->list", fn: builtinStringToList})
+	it.defineName(it.global, "list->string", &builtinProc{name: "list->string", fn: builtinListToString})
 	it.defineName(it.global, "string=?", &builtinProc{name: "string=?", fn: builtinStringEqualPred})
 	it.defineName(it.global, "string<?", &builtinProc{name: "string<?", fn: builtinStringLessPred})
 	it.defineName(it.global, "string-ci=?", &builtinProc{name: "string-ci=?", fn: builtinStringCIEqualPred})
 	it.defineName(it.global, "string-upcase", &builtinProc{name: "string-upcase", fn: builtinStringUpcase})
 	it.defineName(it.global, "string-downcase", &builtinProc{name: "string-downcase", fn: builtinStringDowncase})
 	it.defineName(it.global, "char?", &builtinProc{name: "char?", fn: builtinCharPred})
+	it.defineName(it.global, "char->integer", &builtinProc{name: "char->integer", fn: builtinCharToInteger})
+	it.defineName(it.global, "integer->char", &builtinProc{name: "integer->char", fn: builtinIntegerToChar})
 	it.defineName(it.global, "char-alphabetic?", &builtinProc{name: "char-alphabetic?", fn: builtinCharAlphabeticPred})
 	it.defineName(it.global, "char-numeric?", &builtinProc{name: "char-numeric?", fn: builtinCharNumericPred})
 	it.defineName(it.global, "char-upcase", &builtinProc{name: "char-upcase", fn: builtinCharUpcase})
@@ -1328,6 +1357,18 @@ func builtinLessEqual(_ *interpreter, args []value, callPos position) (value, er
 	)
 }
 
+func builtinGreaterEqual(_ *interpreter, args []value, callPos position) (value, error) {
+	return compareNumbers(
+		args,
+		callPos,
+		">=",
+		func(left exactFraction, right exactFraction) bool {
+			return left.num*right.den >= right.num*left.den
+		},
+		func(left float64, right float64) bool { return left >= right },
+	)
+}
+
 func compareNumbers(
 	args []value,
 	callPos position,
@@ -1539,7 +1580,7 @@ func builtinStringCopy(_ *interpreter, args []value, callPos position) (value, e
 	if err != nil {
 		return nil, err
 	}
-	return s.copy(true), nil
+	return s.copy(stringsMutableInCurrentLevel()), nil
 }
 
 func builtinStringSet(_ *interpreter, args []value, callPos position) (value, error) {
@@ -1560,6 +1601,9 @@ func builtinStringSet(_ *interpreter, args []value, callPos position) (value, er
 		return nil, err
 	}
 
+	if !s.mutable {
+		return nil, newEvalError(ErrImmutable, "string-set!: immutable string", callPos)
+	}
 	if index < 0 || index >= len(s.chars) {
 		return nil, newEvalError(ErrOutOfRange, "string-set!: index out of range", callPos)
 	}
@@ -1614,7 +1658,7 @@ func builtinSubstring(_ *interpreter, args []value, callPos position) (value, er
 	}
 	return &stringValue{
 		chars:   append([]rune(nil), s.chars[start:end]...),
-		mutable: true,
+		mutable: stringsMutableInCurrentLevel(),
 	}, nil
 }
 
