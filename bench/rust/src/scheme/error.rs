@@ -75,6 +75,9 @@ pub enum EvalError {
         got: usize,
     },
 
+    #[error("circular list in {name}")]
+    CircularList { name: String },
+
     #[error("cannot mutate immutable string in {name}")]
     ImmutableString { name: String },
 
