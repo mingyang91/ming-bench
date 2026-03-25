@@ -3,10 +3,11 @@ mod builtins;
 mod eval_forms;
 mod macros;
 mod parser;
+mod special_forms;
 
 pub use error::EvalError;
 use builtins::*;
-use macros::eval_macro_call;
+use macros::expand_macro;
 use parser::parse_all;
 
 use std::cell::RefCell;
@@ -53,6 +54,71 @@ pub(crate) enum Val {
         def_env: Env,
     },
     Void,
+    /// The call/cc primitive as a first-class value.
+    CallCC,
+    /// A captured continuation (clone of the CEK continuation stack).
+    Continuation(Rc<Vec<KFrame>>),
+}
+
+// --- CEK Machine Types ---
+
+/// Continuation frame — one pending operation in the CEK machine.
+#[derive(Clone)]
+pub(crate) enum KFrame {
+    /// Evaluated the operator of a call; now evaluate args right-to-left.
+    CallOp {
+        args: Vec<Expr>,
+        env: Env,
+        span: Span,
+    },
+    /// Evaluating arguments right-to-left; `done` accumulates in reverse order.
+    CallArgs {
+        func: Val,
+        done: Vec<Val>,
+        rest: Vec<Expr>,
+        env: Env,
+        span: Span,
+    },
+    /// Sequence of expressions — evaluate remaining, return last value.
+    Seq {
+        rest: Vec<Expr>,
+        env: Env,
+    },
+    /// Bind value to a variable via `define`.
+    Define {
+        name: String,
+        env: Env,
+    },
+    /// Assign value to a variable via `set!`.
+    SetBang {
+        name: String,
+        env: Env,
+        span: Span,
+    },
+    /// Branch on condition result.
+    IfBranch {
+        then_e: Expr,
+        else_e: Option<Expr>,
+        env: Env,
+    },
+    /// `and` — short-circuit evaluation.
+    And {
+        rest: Vec<Expr>,
+        env: Env,
+    },
+    /// `or` — short-circuit evaluation.
+    Or {
+        rest: Vec<Expr>,
+        env: Env,
+    },
+}
+
+/// CEK machine state.
+enum CekState {
+    /// Evaluate an expression in an environment.
+    Eval(Expr, Env),
+    /// Apply a value to the current continuation (top frame).
+    ApplyK(Val),
 }
 
 pub(crate) fn gcd(mut a: i64, mut b: i64) -> i64 {
@@ -253,7 +319,8 @@ impl fmt::Display for Val {
                 }
                 write!(f, ")")
             }
-            Val::Lambda { .. } | Val::CaseLambda { .. } | Val::Builtin(..) | Val::Macro { .. } => write!(f, "#<procedure>"),
+            Val::Lambda { .. } | Val::CaseLambda { .. } | Val::Builtin(..) | Val::Macro { .. }
+            | Val::CallCC | Val::Continuation(_) => write!(f, "#<procedure>"),
             Val::Void => write!(f, "#<void>"),
         }
     }
@@ -388,6 +455,9 @@ impl Env {
             ("set-car!", builtin_set_car),
             ("set-cdr!", builtin_set_cdr),
         ];
+        // call/cc as a first-class value
+        frame.borrow_mut().insert("call/cc".to_string(), Val::CallCC);
+        frame.borrow_mut().insert("call-with-current-continuation".to_string(), Val::CallCC);
         for &(name, f) in builtins {
             frame.borrow_mut().insert(name.to_string(), Val::Builtin(f));
         }
@@ -531,120 +601,623 @@ fn span_err(span: Span, err: EvalError) -> EvalError {
     }
 }
 
+/// Evaluate a single expression using the CEK machine.
 pub(crate) fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
-    let mut cur = expr.clone();
-    let mut cur_env = env.clone();
+    eval_seq(std::slice::from_ref(expr), env)
+}
 
-    'tco: loop {
-        let Expr { kind, span } = cur;
-        match kind {
-            ExprKind::Int(n) => return Ok(Val::Int(n)),
-            ExprKind::Float(x) => return Ok(Val::Float(x)),
-            ExprKind::Rational(n, d) => return Ok(Val::Rational(n, d)),
-            ExprKind::Bool(b) => return Ok(Val::Bool(b)),
-            ExprKind::Str(s) => return Ok(Val::Str(s)),
-            ExprKind::Char(c) => return Ok(Val::Char(c)),
-            ExprKind::Symbol(name) => {
-                return cur_env.get(&name)
-                    .ok_or_else(|| EvalError::UnboundVariable(format!("{name} at {span}")));
+/// Evaluate a sequence of expressions in a single CEK machine, returning the
+/// last value.  All expressions share one continuation stack, which is
+/// essential for `call/cc` to capture continuations across top-level forms.
+pub(crate) fn eval_seq(exprs: &[Expr], env: &Env) -> Result<Val, EvalError> {
+    if exprs.is_empty() {
+        return Ok(Val::Void);
+    }
+    let mut kont: Vec<KFrame> = Vec::new();
+    if exprs.len() > 1 {
+        kont.push(KFrame::Seq { rest: exprs[1..].to_vec(), env: env.clone() });
+    }
+    let mut state = CekState::Eval(exprs[0].clone(), env.clone());
+
+    loop {
+        match state {
+            CekState::Eval(expr, env) => {
+                state = cek_step(expr, env, &mut kont)?;
             }
-            ExprKind::List(mut elems) => {
-                if elems.is_empty() {
-                    return Ok(Val::List(vec![]));
-                }
-
-                // Extract op name to avoid borrowing elems through the match
-                let maybe_op: Option<String> = match &elems[0].kind {
-                    ExprKind::Symbol(s) => Some(s.clone()),
-                    _ => None,
-                };
-
-                if let Some(ref op) = maybe_op {
-                    match op.as_str() {
-                        // --- Non-tail special forms (delegate to helpers) ---
-                        "define" => return eval_define(&elems[1..], &cur_env, span),
-                        "quote" => return eval_quote(&elems[1..], span),
-                        "lambda" => return eval_lambda(&elems[1..], &cur_env, span),
-                        "set!" => return eval_set_bang(&elems[1..], &cur_env, span),
-                        "string-set!" => return eval_string_set(&elems[1..], &cur_env, span),
-                        "set-car!" => return eval_set_car(&elems[1..], &cur_env, span),
-                        "set-cdr!" => return eval_set_cdr(&elems[1..], &cur_env, span),
-                        "define-syntax" => return eval_define_syntax(&elems[1..], &cur_env, span),
-                        "define-record-type" => return eval_define_record_type(&elems[1..], &cur_env, span),
-                        "case-lambda" => return eval_case_lambda(&elems[1..], &cur_env, span),
-                        "case" => return eval_case(&elems[1..], &cur_env, span),
-                        "do" => return eval_do(&elems[1..], &cur_env, span),
-                        "letrec" => return eval_letrec(&elems[1..], &cur_env, span),
-                        "letrec*" => return eval_letrec_star(&elems[1..], &cur_env, span),
-                        "let*" => return eval_let_star(&elems[1..], &cur_env, span),
-
-                        // --- Tail-position forms (inlined for TCO) ---
-                        "if" => {
-                            let nargs = elems.len() - 1;
-                            if !(2..=3).contains(&nargs) {
-                                return Err(EvalError::Arity(format!("if: expected 2 or 3 arguments at {span}")));
-                            }
-                            let cond_val = eval(&elems[1], &cur_env)?;
-                            if cond_val.is_truthy() {
-                                cur = elems.swap_remove(2);
-                                continue 'tco;
-                            } else if nargs == 3 {
-                                cur = elems.swap_remove(3);
-                                continue 'tco;
-                            } else {
-                                return Ok(Val::Void);
-                            }
-                        }
-
-                        "begin" | "and" | "or" | "cond" | "let" => {
-                            let result = eval_forms::dispatch_tco_form(
-                                op, &mut elems, &cur_env, span,
-                            )?;
-                            match result {
-                                eval_forms::Tco::Done(v) => return Ok(v),
-                                eval_forms::Tco::Tail(expr, env) => { cur = expr; cur_env = env; continue 'tco; }
-                            }
-                        }
-
-                        _ => {
-                            if let Some(Val::Macro { literals, rules, def_env }) = cur_env.get(op) {
-                                return eval_macro_call(&elems, &literals, &rules, &def_env, &cur_env, span);
-                            }
-                            // Fall through to function application
-                        }
-                    }
-                }
-
-                // --- Function application with TCO ---
-                let func = eval(&elems[0], &cur_env)?;
-                let args: Vec<Val> = elems[1..].iter()
-                    .map(|e| eval(e, &cur_env))
-                    .collect::<Result<_, _>>()?;
-
-                let tco_result = match func {
-                    Val::Lambda { params, rest_param, body, env: lambda_env } => {
-                        let new_env = eval_forms::bind_lambda_args(
-                            &params, &rest_param, &args, &lambda_env, span,
-                        )?;
-                        eval_forms::eval_body_tco(body, &new_env)?
-                    }
-                    Val::CaseLambda { clauses, env: lambda_env } => {
-                        eval_forms::apply_case_lambda(clauses, &args, &lambda_env, span)?
-                    }
-                    Val::Builtin(f) => return f(&args, &cur_env).map_err(|e| span_err(span, e)),
-                    _ => return Err(EvalError::Type(format!("not a procedure at {span}"))),
-                };
-                match tco_result {
-                    eval_forms::Tco::Done(v) => return Ok(v),
-                    eval_forms::Tco::Tail(expr, env) => {
-                        cur = expr;
-                        cur_env = env;
-                        continue 'tco;
+            CekState::ApplyK(val) => {
+                match kont.pop() {
+                    None => return Ok(val),
+                    Some(frame) => {
+                        state = apply_frame(frame, val, &mut kont)?;
                     }
                 }
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+//  CEK step: evaluate one expression, producing either a value (ApplyK) or
+//  another expression to evaluate.
+// ---------------------------------------------------------------------------
+
+fn cek_step(expr: Expr, env: Env, kont: &mut Vec<KFrame>) -> Result<CekState, EvalError> {
+    let Expr { kind, span } = expr;
+    match kind {
+        ExprKind::Int(n) => Ok(CekState::ApplyK(Val::Int(n))),
+        ExprKind::Float(x) => Ok(CekState::ApplyK(Val::Float(x))),
+        ExprKind::Rational(n, d) => Ok(CekState::ApplyK(Val::Rational(n, d))),
+        ExprKind::Bool(b) => Ok(CekState::ApplyK(Val::Bool(b))),
+        ExprKind::Str(s) => Ok(CekState::ApplyK(Val::Str(s))),
+        ExprKind::Char(c) => Ok(CekState::ApplyK(Val::Char(c))),
+        ExprKind::Symbol(name) => {
+            let val = env.get(&name)
+                .ok_or_else(|| EvalError::UnboundVariable(format!("{name} at {span}")))?;
+            Ok(CekState::ApplyK(val))
+        }
+        ExprKind::List(elems) => {
+            if elems.is_empty() {
+                return Ok(CekState::ApplyK(Val::List(vec![])));
+            }
+            let maybe_op: Option<String> = match &elems[0].kind {
+                ExprKind::Symbol(s) => Some(s.clone()),
+                _ => None,
+            };
+
+            if let Some(ref op) = maybe_op {
+                match op.as_str() {
+                    // --- Immediate forms (no sub-expression eval in CEK spine) ---
+                    "quote" => {
+                        return Ok(CekState::ApplyK(eval_quote(&elems[1..], span)?));
+                    }
+                    "lambda" => {
+                        return Ok(CekState::ApplyK(eval_lambda(&elems[1..], &env, span)?));
+                    }
+                    "case-lambda" => {
+                        return Ok(CekState::ApplyK(eval_case_lambda(&elems[1..], &env, span)?));
+                    }
+                    "define-syntax" => {
+                        return Ok(CekState::ApplyK(eval_define_syntax(&elems[1..], &env, span)?));
+                    }
+                    "define-record-type" => {
+                        return Ok(CekState::ApplyK(eval_define_record_type(&elems[1..], &env, span)?));
+                    }
+
+                    // --- CEK-aware special forms ---
+                    "define" => {
+                        return cek_define(&elems[1..], env, span, kont);
+                    }
+                    "set!" => {
+                        if elems.len() != 3 {
+                            return Err(EvalError::Arity(format!("set!: expected 2 arguments at {span}")));
+                        }
+                        let name = match &elems[1].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Parse(format!("set!: expected symbol at {span}"))),
+                        };
+                        kont.push(KFrame::SetBang { name, env: env.clone(), span });
+                        return Ok(CekState::Eval(elems[2].clone(), env));
+                    }
+                    "if" => {
+                        let nargs = elems.len() - 1;
+                        if !(2..=3).contains(&nargs) {
+                            return Err(EvalError::Arity(format!("if: expected 2 or 3 arguments at {span}")));
+                        }
+                        let else_e = if nargs == 3 { Some(elems[3].clone()) } else { None };
+                        kont.push(KFrame::IfBranch { then_e: elems[2].clone(), else_e, env: env.clone() });
+                        return Ok(CekState::Eval(elems[1].clone(), env));
+                    }
+                    "begin" => {
+                        if elems.len() <= 1 {
+                            return Ok(CekState::ApplyK(Val::Void));
+                        }
+                        return enter_body_cek(&elems[1..], &env, kont);
+                    }
+                    "and" => {
+                        if elems.len() <= 1 {
+                            return Ok(CekState::ApplyK(Val::Bool(true)));
+                        }
+                        if elems.len() > 2 {
+                            kont.push(KFrame::And { rest: elems[2..].to_vec(), env: env.clone() });
+                        }
+                        return Ok(CekState::Eval(elems[1].clone(), env));
+                    }
+                    "or" => {
+                        if elems.len() <= 1 {
+                            return Ok(CekState::ApplyK(Val::Bool(false)));
+                        }
+                        if elems.len() > 2 {
+                            kont.push(KFrame::Or { rest: elems[2..].to_vec(), env: env.clone() });
+                        }
+                        return Ok(CekState::Eval(elems[1].clone(), env));
+                    }
+
+                    // --- Forms that use nested eval for sub-expressions ---
+                    "cond" => return cek_cond(&elems[1..], &env, kont),
+                    "let" => return cek_let(&elems, &env, span, kont),
+                    "let*" => return cek_let_star(&elems[1..], &env, span, kont),
+                    "letrec" => return cek_letrec(&elems[1..], &env, span, kont),
+                    "letrec*" => return cek_letrec_star(&elems[1..], &env, span, kont),
+                    "do" => return cek_do(&elems[1..], &env, span, kont),
+                    "case" => return cek_case(&elems[1..], &env, span, kont),
+                    "string-set!" => {
+                        return Ok(CekState::ApplyK(eval_string_set(&elems[1..], &env, span)?));
+                    }
+                    "set-car!" => {
+                        return Ok(CekState::ApplyK(eval_set_car(&elems[1..], &env, span)?));
+                    }
+                    "set-cdr!" => {
+                        return Ok(CekState::ApplyK(eval_set_cdr(&elems[1..], &env, span)?));
+                    }
+
+                    _ => {
+                        // Check for macro
+                        if let Some(Val::Macro { literals, rules, def_env }) = env.get(op) {
+                            let (expanded, eval_env) = expand_macro(
+                                &elems, &literals, &rules, &def_env, &env, span,
+                            )?;
+                            return Ok(CekState::Eval(expanded, eval_env));
+                        }
+                        // Fall through to function application
+                    }
+                }
+            }
+
+            // --- Function application ---
+            // Push CallOp frame; evaluate the operator first
+            kont.push(KFrame::CallOp { args: elems[1..].to_vec(), env: env.clone(), span });
+            Ok(CekState::Eval(elems[0].clone(), env))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Apply a value to the top continuation frame.
+// ---------------------------------------------------------------------------
+
+fn apply_frame(frame: KFrame, val: Val, kont: &mut Vec<KFrame>) -> Result<CekState, EvalError> {
+    match frame {
+        KFrame::CallOp { mut args, env, span } => {
+            // val = evaluated operator.  Evaluate args right-to-left.
+            if args.is_empty() {
+                apply_function_cek(val, vec![], kont, span, &env)
+            } else {
+                let next = args.pop().expect("args verified non-empty");
+                kont.push(KFrame::CallArgs { func: val, done: vec![], rest: args, env: env.clone(), span });
+                Ok(CekState::Eval(next, env))
+            }
+        }
+        KFrame::CallArgs { func, mut done, mut rest, env, span } => {
+            // val = just-evaluated argument (right-to-left order)
+            done.push(val);
+            if rest.is_empty() {
+                done.reverse(); // convert R-to-L accumulation → L-to-R argument order
+                apply_function_cek(func, done, kont, span, &env)
+            } else {
+                let next = rest.pop().expect("rest verified non-empty");
+                kont.push(KFrame::CallArgs { func, done, rest, env: env.clone(), span });
+                Ok(CekState::Eval(next, env))
+            }
+        }
+        KFrame::Seq { rest, env } => {
+            // Discard val (not the last expr); evaluate remaining body.
+            enter_body_cek(&rest, &env, kont)
+        }
+        KFrame::Define { name, env } => {
+            env.define(name, val);
+            Ok(CekState::ApplyK(Val::Void))
+        }
+        KFrame::SetBang { name, env, span } => {
+            env.set(&name, val).map_err(|e| span_err(span, e))?;
+            Ok(CekState::ApplyK(Val::Void))
+        }
+        KFrame::IfBranch { then_e, else_e, env } => {
+            if val.is_truthy() {
+                Ok(CekState::Eval(then_e, env))
+            } else if let Some(e) = else_e {
+                Ok(CekState::Eval(e, env))
+            } else {
+                Ok(CekState::ApplyK(Val::Void))
+            }
+        }
+        KFrame::And { rest, env } => {
+            if !val.is_truthy() {
+                Ok(CekState::ApplyK(val))
+            } else if rest.len() == 1 {
+                // Tail position
+                Ok(CekState::Eval(rest.into_iter().next().expect("rest len verified == 1"), env))
+            } else {
+                kont.push(KFrame::And { rest: rest[1..].to_vec(), env: env.clone() });
+                Ok(CekState::Eval(rest[0].clone(), env))
+            }
+        }
+        KFrame::Or { rest, env } => {
+            if val.is_truthy() {
+                Ok(CekState::ApplyK(val))
+            } else if rest.len() == 1 {
+                Ok(CekState::Eval(rest.into_iter().next().expect("rest len verified == 1"), env))
+            } else {
+                kont.push(KFrame::Or { rest: rest[1..].to_vec(), env: env.clone() });
+                Ok(CekState::Eval(rest[0].clone(), env))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Function application in the CEK machine.
+// ---------------------------------------------------------------------------
+
+fn apply_function_cek(
+    func: Val,
+    args: Vec<Val>,
+    kont: &mut Vec<KFrame>,
+    span: Span,
+    caller_env: &Env,
+) -> Result<CekState, EvalError> {
+    match func {
+        Val::Lambda { params, rest_param, body, env } => {
+            let new_env = eval_forms::bind_lambda_args(&params, &rest_param, &args, &env, span)?;
+            enter_body_cek(&body, &new_env, kont)
+        }
+        Val::CaseLambda { clauses, env } => {
+            for (params, rest_param, body) in clauses {
+                let matches = if rest_param.is_some() {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    let new_env = eval_forms::bind_lambda_args(&params, &rest_param, &args, &env, span)?;
+                    return enter_body_cek(&body, &new_env, kont);
+                }
+            }
+            Err(EvalError::Arity(format!("no matching clause for {} arguments", args.len())))
+        }
+        Val::Builtin(f) => {
+            let result = f(&args, caller_env).map_err(|e| span_err(span, e))?;
+            Ok(CekState::ApplyK(result))
+        }
+        Val::CallCC => {
+            // (call/cc proc): capture current continuation, call proc with it
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("call/cc: expected 1 argument, got {} at {span}", args.len())));
+            }
+            let saved_kont = kont.clone();
+            let cont_val = Val::Continuation(Rc::new(saved_kont));
+            // Apply the procedure argument to [continuation]
+            apply_function_cek(args.into_iter().next().expect("args len verified == 1"), vec![cont_val], kont, span, caller_env)
+        }
+        Val::Continuation(saved_kont) => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "continuation: expected 1 argument, got {} at {span}", args.len()
+                )));
+            }
+            // Replace current continuation with the saved one
+            *kont = (*saved_kont).clone();
+            Ok(CekState::ApplyK(args.into_iter().next().expect("args len verified == 1")))
+        }
+        _ => Err(EvalError::Type(format!("not a procedure at {span}"))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Helpers
+// ---------------------------------------------------------------------------
+
+/// Enter a body (sequence of expressions) in the CEK machine, with TCO
+/// for the last expression.
+fn enter_body_cek(body: &[Expr], env: &Env, kont: &mut Vec<KFrame>) -> Result<CekState, EvalError> {
+    if body.is_empty() {
+        return Ok(CekState::ApplyK(Val::Void));
+    }
+    if body.len() > 1 {
+        kont.push(KFrame::Seq { rest: body[1..].to_vec(), env: env.clone() });
+    }
+    Ok(CekState::Eval(body[0].clone(), env.clone()))
+}
+
+/// `(define ...)` in the CEK machine.
+fn cek_define(args: &[Expr], env: Env, span: Span, kont: &mut Vec<KFrame>) -> Result<CekState, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Parse(format!("define: missing arguments at {span}")));
+    }
+    match &args[0].kind {
+        ExprKind::Symbol(name) => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("define: expected 2 arguments at {span}")));
+            }
+            kont.push(KFrame::Define { name: name.clone(), env: env.clone() });
+            Ok(CekState::Eval(args[1].clone(), env))
+        }
+        ExprKind::List(sig) => {
+            if sig.is_empty() {
+                return Err(EvalError::Parse(format!("define: empty signature at {span}")));
+            }
+            let name = match &sig[0].kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Parse(format!("define: expected symbol at {span}"))),
+            };
+            let (params, rest_param) = parse_params(&sig[1..], span)?;
+            let body = args[1..].to_vec();
+            let lambda = Val::Lambda { params, rest_param, body, env: env.clone() };
+            env.define(name, lambda);
+            Ok(CekState::ApplyK(Val::Void))
+        }
+        _ => Err(EvalError::Parse(format!("define: expected symbol or list at {span}"))),
+    }
+}
+
+/// `(cond ...)` — evaluate tests via nested eval, enter matching body via CEK.
+fn cek_cond(clauses: &[Expr], env: &Env, kont: &mut Vec<KFrame>) -> Result<CekState, EvalError> {
+    for clause_expr in clauses {
+        let parts = match &clause_expr.kind {
+            ExprKind::List(parts) if !parts.is_empty() => parts,
+            _ => return Err(EvalError::Parse(format!("cond: invalid clause at {}", clause_expr.span))),
+        };
+        if matches!(&parts[0].kind, ExprKind::Symbol(s) if s == "else") {
+            return enter_body_cek(&parts[1..], env, kont);
+        }
+        let test = eval(&parts[0], env)?;
+        if test.is_truthy() {
+            if parts.len() <= 1 {
+                return Ok(CekState::ApplyK(test));
+            }
+            return enter_body_cek(&parts[1..], env, kont);
+        }
+    }
+    Ok(CekState::ApplyK(Val::Void))
+}
+
+/// `(let ...)` — handles both regular and named let.
+fn cek_let(elems: &[Expr], env: &Env, span: Span, kont: &mut Vec<KFrame>) -> Result<CekState, EvalError> {
+    if elems.len() < 2 {
+        return Err(EvalError::Parse(format!("let: missing arguments at {span}")));
+    }
+    // Named let
+    if matches!(&elems[1].kind, ExprKind::Symbol(_)) {
+        return cek_named_let(elems, env, span, kont);
+    }
+    // Regular let
+    let new_env = env.push();
+    let bindings = match &elems[1].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(EvalError::Parse(format!("let: expected bindings list at {span}"))),
+    };
+    for b in bindings {
+        let pair = match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => pair,
+            _ => return Err(EvalError::Parse(format!("let: invalid binding at {span}"))),
+        };
+        let name = match &pair[0].kind {
+            ExprKind::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Parse(format!("let: expected variable name at {span}"))),
+        };
+        let val = eval(&pair[1], env)?;
+        new_env.define(name, val);
+    }
+    enter_body_cek(&elems[2..], &new_env, kont)
+}
+
+fn cek_named_let(elems: &[Expr], env: &Env, span: Span, kont: &mut Vec<KFrame>) -> Result<CekState, EvalError> {
+    let name = match &elems[1].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => unreachable!(),
+    };
+    if elems.len() < 3 {
+        return Err(EvalError::Parse(format!("let: missing bindings at {span}")));
+    }
+    let bindings = match &elems[2].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(EvalError::Parse(format!("let: expected bindings list at {span}"))),
+    };
+    let mut params = Vec::new();
+    let mut inits = Vec::new();
+    for b in bindings {
+        let pair = match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => pair,
+            _ => return Err(EvalError::Parse(format!("let: invalid binding at {span}"))),
+        };
+        let p = match &pair[0].kind {
+            ExprKind::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Parse(format!("let: expected variable name at {span}"))),
+        };
+        params.push(p);
+        inits.push(eval(&pair[1], env)?);
+    }
+    let body: Vec<Expr> = elems[3..].to_vec();
+    let new_env = env.push();
+    let lambda = Val::Lambda {
+        params: params.clone(),
+        rest_param: None,
+        body: body.clone(),
+        env: new_env.clone(),
+    };
+    new_env.define(name, lambda);
+    for (p, v) in params.iter().zip(inits.iter()) {
+        new_env.define(p.clone(), v.clone());
+    }
+    enter_body_cek(&body, &new_env, kont)
+}
+
+/// `(let* ...)` — sequential bindings via nested eval, body via CEK.
+fn cek_let_star(args: &[Expr], env: &Env, span: Span, kont: &mut Vec<KFrame>) -> Result<CekState, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Parse(format!("let*: missing arguments at {span}")));
+    }
+    let bindings = match &args[0].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(EvalError::Parse(format!("let*: expected bindings list at {span}"))),
+    };
+    let new_env = env.push();
+    for b in bindings {
+        match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                if let ExprKind::Symbol(s) = &pair[0].kind {
+                    let val = eval(&pair[1], &new_env)?;
+                    new_env.define(s.clone(), val);
+                } else {
+                    return Err(EvalError::Parse(format!("let*: expected variable name at {span}")));
+                }
+            }
+            _ => return Err(EvalError::Parse(format!("let*: invalid binding at {span}"))),
+        }
+    }
+    enter_body_cek(&args[1..], &new_env, kont)
+}
+
+/// `(letrec ...)` — nested eval for inits, body via CEK.
+fn cek_letrec(args: &[Expr], env: &Env, span: Span, kont: &mut Vec<KFrame>) -> Result<CekState, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Parse(format!("letrec: missing arguments at {span}")));
+    }
+    let bindings = match &args[0].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(EvalError::Parse(format!("letrec: expected bindings list at {span}"))),
+    };
+    let new_env = env.push();
+    let mut names = Vec::new();
+    let mut init_exprs = Vec::new();
+    for b in bindings {
+        match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                if let ExprKind::Symbol(s) = &pair[0].kind {
+                    names.push(s.clone());
+                    init_exprs.push(&pair[1]);
+                    new_env.define(s.clone(), Val::Void);
+                } else {
+                    return Err(EvalError::Parse(format!("letrec: expected variable name at {span}")));
+                }
+            }
+            _ => return Err(EvalError::Parse(format!("letrec: invalid binding at {span}"))),
+        }
+    }
+    for (name, init_expr) in names.iter().zip(init_exprs.iter()) {
+        let val = eval(init_expr, &new_env)?;
+        new_env.set(name, val)?;
+    }
+    enter_body_cek(&args[1..], &new_env, kont)
+}
+
+/// `(letrec* ...)` — sequential letrec, body via CEK.
+fn cek_letrec_star(args: &[Expr], env: &Env, span: Span, kont: &mut Vec<KFrame>) -> Result<CekState, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Parse(format!("letrec*: missing arguments at {span}")));
+    }
+    let bindings = match &args[0].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(EvalError::Parse(format!("letrec*: expected bindings list at {span}"))),
+    };
+    let new_env = env.push();
+    for b in bindings {
+        match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                if let ExprKind::Symbol(s) = &pair[0].kind {
+                    let val = eval(&pair[1], &new_env)?;
+                    new_env.define(s.clone(), val);
+                } else {
+                    return Err(EvalError::Parse(format!("letrec*: expected variable name at {span}")));
+                }
+            }
+            _ => return Err(EvalError::Parse(format!("letrec*: invalid binding at {span}"))),
+        }
+    }
+    enter_body_cek(&args[1..], &new_env, kont)
+}
+
+/// `(do ...)` — iterative loop.
+fn cek_do(args: &[Expr], env: &Env, span: Span, _kont: &mut Vec<KFrame>) -> Result<CekState, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Parse(format!("do: expected at least 2 arguments at {span}")));
+    }
+    let var_specs = match &args[0].kind {
+        ExprKind::List(v) => v,
+        _ => return Err(EvalError::Parse(format!("do: expected variable list at {span}"))),
+    };
+    let test_clause = match &args[1].kind {
+        ExprKind::List(t) => t,
+        _ => return Err(EvalError::Parse(format!("do: expected test clause at {span}"))),
+    };
+    if test_clause.is_empty() {
+        return Err(EvalError::Parse(format!("do: empty test clause at {span}")));
+    }
+    struct DoVar<'a> { name: String, step: Option<&'a Expr> }
+    let mut vars = Vec::new();
+    let do_env = env.push();
+    for spec in var_specs {
+        match &spec.kind {
+            ExprKind::List(parts) if parts.len() >= 2 => {
+                let name = match &parts[0].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Parse(format!("do: expected variable name at {span}"))),
+                };
+                let init = eval(&parts[1], env)?;
+                let step = if parts.len() >= 3 { Some(&parts[2]) } else { None };
+                do_env.define(name.clone(), init);
+                vars.push(DoVar { name, step });
+            }
+            _ => return Err(EvalError::Parse(format!("do: invalid variable spec at {span}"))),
+        }
+    }
+    loop {
+        let test_result = eval(&test_clause[0], &do_env)?;
+        if test_result.is_truthy() {
+            if test_clause.len() > 1 {
+                let mut result = Val::Void;
+                for expr in &test_clause[1..] {
+                    result = eval(expr, &do_env)?;
+                }
+                return Ok(CekState::ApplyK(result));
+            }
+            return Ok(CekState::ApplyK(Val::Void));
+        }
+        for expr in &args[2..] {
+            eval(expr, &do_env)?;
+        }
+        let new_vals: Vec<Option<Val>> = vars.iter().map(|v| {
+            match v.step {
+                Some(step_expr) => Ok(Some(eval(step_expr, &do_env)?)),
+                None => Ok(None),
+            }
+        }).collect::<Result<_, EvalError>>()?;
+        for (v, new_val) in vars.iter().zip(new_vals.into_iter()) {
+            if let Some(val) = new_val {
+                do_env.set(&v.name, val)?;
+            }
+        }
+    }
+}
+
+/// `(case ...)` — nested eval for key/body.
+fn cek_case(args: &[Expr], env: &Env, span: Span, kont: &mut Vec<KFrame>) -> Result<CekState, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Parse(format!("case: missing arguments at {span}")));
+    }
+    let key = eval(&args[0], env)?;
+    for clause in &args[1..] {
+        match &clause.kind {
+            ExprKind::List(parts) if !parts.is_empty() => {
+                if let ExprKind::Symbol(s) = &parts[0].kind {
+                    if s == "else" {
+                        return enter_body_cek(&parts[1..], env, kont);
+                    }
+                }
+                let datums = match &parts[0].kind {
+                    ExprKind::List(d) => d,
+                    _ => return Err(EvalError::Parse(format!("case: expected datum list at {span}"))),
+                };
+                for datum in datums {
+                    let datum_val = expr_to_val(datum)?;
+                    if vals_eqv(&key, &datum_val) {
+                        return enter_body_cek(&parts[1..], env, kont);
+                    }
+                }
+            }
+            _ => return Err(EvalError::Parse(format!("case: invalid clause at {span}"))),
+        }
+    }
+    Ok(CekState::ApplyK(Val::Void))
 }
 
 pub(crate) fn apply_val(func: &Val, args: &[Val], caller_env: &Env) -> Result<Val, EvalError> {
@@ -710,645 +1283,31 @@ pub(crate) fn apply_val(func: &Val, args: &[Val], caller_env: &Env) -> Result<Va
             )))
         }
         Val::Builtin(f) => f(args, caller_env),
+        Val::CallCC => {
+            // call/cc invoked via apply_val (e.g. from builtin `apply`)
+            if args.len() != 1 {
+                return Err(EvalError::Arity("call/cc: expected 1 argument".into()));
+            }
+            // No CEK kont to capture here; just call the proc with a dummy continuation
+            // that raises an error if invoked.
+            let cont = Val::Continuation(Rc::new(vec![]));
+            apply_val(&args[0], &[cont], caller_env)
+        }
+        Val::Continuation(_) => {
+            // Continuation invoked from outside the CEK machine (e.g. inside map).
+            // This is a limitation — full support would require all evaluation
+            // paths to go through the CEK machine.
+            Err(EvalError::Runtime("continuation invoked outside CEK machine".into()))
+        }
         _ => Err(EvalError::Type("not a procedure".into())),
     }
 }
 
-fn parse_params(exprs: &[Expr], span: Span) -> Result<(Vec<String>, Option<String>), EvalError> {
-    let mut params = Vec::new();
-    let mut rest_param = None;
-    let mut i = 0;
-    while i < exprs.len() {
-        match &exprs[i].kind {
-            ExprKind::Symbol(s) if s == "." => {
-                if i + 1 >= exprs.len() {
-                    return Err(EvalError::Parse(format!("missing rest parameter after . at {span}")));
-                }
-                rest_param = Some(match &exprs[i + 1].kind {
-                    ExprKind::Symbol(s) => s.clone(),
-                    _ => return Err(EvalError::Parse(format!("expected rest parameter name at {span}"))),
-                });
-                break;
-            }
-            ExprKind::Symbol(s) => params.push(s.clone()),
-            _ => return Err(EvalError::Parse(format!("expected parameter name at {span}"))),
-        }
-        i += 1;
-    }
-    Ok((params, rest_param))
-}
-
-// --- Macros (syntax-rules) --- see macros.rs
-
-fn eval_define_record_type(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
-    // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
-    if args.len() < 3 {
-        return Err(EvalError::Parse(format!("define-record-type: expected at least 3 arguments at {span}")));
-    }
-    // args[0] = type name (ignored, but parsed)
-    // args[1] = (constructor-name field-name ...)
-    // args[2] = predicate-name
-    // args[3..] = (field-name accessor-name) ...
-
-    let (constructor_name, constructor_fields) = match &args[1].kind {
-        ExprKind::List(elems) if !elems.is_empty() => {
-            let cname = match &elems[0].kind {
-                ExprKind::Symbol(s) => s.clone(),
-                _ => return Err(EvalError::Parse(format!("define-record-type: expected constructor name at {span}"))),
-            };
-            let fields: Vec<String> = elems[1..].iter().map(|e| match &e.kind {
-                ExprKind::Symbol(s) => Ok(s.clone()),
-                _ => Err(EvalError::Parse(format!("define-record-type: expected field name at {span}"))),
-            }).collect::<Result<_, _>>()?;
-            (cname, fields)
-        }
-        _ => return Err(EvalError::Parse(format!("define-record-type: expected constructor at {span}"))),
-    };
-
-    let pred_name = match &args[2].kind {
-        ExprKind::Symbol(s) => s.clone(),
-        _ => return Err(EvalError::Parse(format!("define-record-type: expected predicate name at {span}"))),
-    };
-
-    // Parse field accessors
-    let mut accessors: Vec<(String, String)> = Vec::new(); // (field_name, accessor_name)
-    for arg in &args[3..] {
-        match &arg.kind {
-            ExprKind::List(elems) if elems.len() >= 2 => {
-                let field = match &elems[0].kind {
-                    ExprKind::Symbol(s) => s.clone(),
-                    _ => return Err(EvalError::Parse(format!("define-record-type: expected field name at {span}"))),
-                };
-                let accessor = match &elems[1].kind {
-                    ExprKind::Symbol(s) => s.clone(),
-                    _ => return Err(EvalError::Parse(format!("define-record-type: expected accessor name at {span}"))),
-                };
-                accessors.push((field, accessor));
-            }
-            _ => return Err(EvalError::Parse(format!("define-record-type: expected field spec at {span}"))),
-        }
-    }
-
-    // Use gensym tags and regular lists/lambdas to represent records
-    let tag = gensym("record");
-
-    // Constructor: (lambda (f1 f2 ...) (list '<tag> f1 f2 ...))
-    // We define it directly as a Lambda with a body that creates a tagged list
-    {
-        let params = constructor_fields.clone();
-        let tag_sym = tag.clone();
-        // Build body: (list (quote <tag>) f1 f2 ...)
-        let span0 = Span::new(0, 0);
-        let mut list_args = vec![
-            Expr::new(ExprKind::Symbol("list".into()), span0),
-            Expr::new(ExprKind::List(vec![
-                Expr::new(ExprKind::Symbol("quote".into()), span0),
-                Expr::new(ExprKind::Symbol(tag_sym), span0),
-            ]), span0),
-        ];
-        for p in &params {
-            list_args.push(Expr::new(ExprKind::Symbol(p.clone()), span0));
-        }
-        let body = vec![Expr::new(ExprKind::List(list_args), span0)];
-
-        env.define(constructor_name, Val::Lambda {
-            params,
-            rest_param: None,
-            body,
-            env: env.clone(),
-        });
-    }
-
-    // Predicate: checks if value is a list whose car is the tag
-    {
-        let tag_sym = tag.clone();
-        let param = "__rec_v".to_string();
-        let span0 = Span::new(0, 0);
-        // Body: (and (pair? __rec_v) (equal? (car __rec_v) (quote <tag>)))
-        let body = vec![Expr::new(ExprKind::List(vec![
-            Expr::new(ExprKind::Symbol("and".into()), span0),
-            Expr::new(ExprKind::List(vec![
-                Expr::new(ExprKind::Symbol("pair?".into()), span0),
-                Expr::new(ExprKind::Symbol(param.clone()), span0),
-            ]), span0),
-            Expr::new(ExprKind::List(vec![
-                Expr::new(ExprKind::Symbol("equal?".into()), span0),
-                Expr::new(ExprKind::List(vec![
-                    Expr::new(ExprKind::Symbol("car".into()), span0),
-                    Expr::new(ExprKind::Symbol(param.clone()), span0),
-                ]), span0),
-                Expr::new(ExprKind::List(vec![
-                    Expr::new(ExprKind::Symbol("quote".into()), span0),
-                    Expr::new(ExprKind::Symbol(tag_sym), span0),
-                ]), span0),
-            ]), span0),
-        ]), span0)];
-
-        env.define(pred_name, Val::Lambda {
-            params: vec![param],
-            rest_param: None,
-            body,
-            env: env.clone(),
-        });
-    }
-
-    // Accessors: (lambda (v) (list-ref v <index>))
-    for (field_name, accessor_name) in &accessors {
-        // Find field index in constructor_fields
-        let idx = constructor_fields.iter().position(|f| f == field_name)
-            .ok_or_else(|| EvalError::Parse(format!(
-                "define-record-type: field '{}' not in constructor at {span}", field_name
-            )))?;
-        let span0 = Span::new(0, 0);
-        let param = "__rec_v".to_string();
-        // Body: (list-ref __rec_v <idx+1>)  (+1 because index 0 is the tag)
-        let body = vec![Expr::new(ExprKind::List(vec![
-            Expr::new(ExprKind::Symbol("list-ref".into()), span0),
-            Expr::new(ExprKind::Symbol(param.clone()), span0),
-            Expr::new(ExprKind::Int((idx + 1) as i64), span0),
-        ]), span0)];
-
-        env.define(accessor_name.clone(), Val::Lambda {
-            params: vec![param],
-            rest_param: None,
-            body,
-            env: env.clone(),
-        });
-    }
-
-    Ok(Val::Void)
-}
-
-fn eval_define_syntax(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
-    if args.len() != 2 {
-        return Err(EvalError::Arity(format!("define-syntax: expected 2 arguments at {span}")));
-    }
-    let name = match &args[0].kind {
-        ExprKind::Symbol(s) => s.clone(),
-        _ => return Err(EvalError::Parse(format!("define-syntax: expected symbol at {span}"))),
-    };
-    let transformer = match &args[1].kind {
-        ExprKind::List(elems) => elems,
-        _ => return Err(EvalError::Parse(format!("define-syntax: expected syntax-rules at {span}"))),
-    };
-    if transformer.is_empty()
-        || !matches!(&transformer[0].kind, ExprKind::Symbol(s) if s == "syntax-rules")
-    {
-        return Err(EvalError::Parse(format!("define-syntax: expected syntax-rules at {span}")));
-    }
-    if transformer.len() < 2 {
-        return Err(EvalError::Parse(format!("syntax-rules: missing literals at {span}")));
-    }
-    let literals = match &transformer[1].kind {
-        ExprKind::List(lits) => lits
-            .iter()
-            .map(|e| match &e.kind {
-                ExprKind::Symbol(s) => Ok(s.clone()),
-                _ => Err(EvalError::Parse(format!(
-                    "syntax-rules: expected literal symbol at {span}"
-                ))),
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        _ => {
-            return Err(EvalError::Parse(format!(
-                "syntax-rules: expected literals list at {span}"
-            )))
-        }
-    };
-    let mut rules = Vec::new();
-    for rule_expr in &transformer[2..] {
-        match &rule_expr.kind {
-            ExprKind::List(parts) if parts.len() == 2 => {
-                rules.push((parts[0].clone(), parts[1].clone()));
-            }
-            _ => {
-                return Err(EvalError::Parse(format!(
-                    "syntax-rules: invalid rule at {span}"
-                )))
-            }
-        }
-    }
-    env.define(
-        name,
-        Val::Macro {
-            literals,
-            rules,
-            def_env: env.clone(),
-        },
-    );
-    Ok(Val::Void)
-}
-
-fn eval_define(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
-    if args.is_empty() {
-        return Err(EvalError::Parse(format!("define: missing arguments at {span}")));
-    }
-    match &args[0].kind {
-        ExprKind::Symbol(name) => {
-            if args.len() != 2 {
-                return Err(EvalError::Arity(format!("define: expected 2 arguments at {span}")));
-            }
-            let val = eval(&args[1], env)?;
-            env.define(name.clone(), val);
-            Ok(Val::Void)
-        }
-        ExprKind::List(sig) => {
-            // (define (f params...) body...)
-            if sig.is_empty() {
-                return Err(EvalError::Parse(format!("define: empty signature at {span}")));
-            }
-            let name = match &sig[0].kind {
-                ExprKind::Symbol(s) => s.clone(),
-                _ => return Err(EvalError::Parse(format!("define: expected symbol at {span}"))),
-            };
-            let (params, rest_param) = parse_params(&sig[1..], span)?;
-            let body = args[1..].to_vec();
-            let lambda = Val::Lambda {
-                params,
-                rest_param,
-                body,
-                env: env.clone(),
-            };
-            env.define(name, lambda);
-            Ok(Val::Void)
-        }
-        _ => Err(EvalError::Parse(format!("define: expected symbol or list at {span}"))),
-    }
-}
-
-fn eval_set_bang(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
-    if args.len() != 2 {
-        return Err(EvalError::Arity(format!("set!: expected 2 arguments at {span}")));
-    }
-    let name = match &args[0].kind {
-        ExprKind::Symbol(s) => s,
-        _ => return Err(EvalError::Parse(format!("set!: expected symbol at {span}"))),
-    };
-    let val = eval(&args[1], env)?;
-    env.set(name, val).map_err(|e| span_err(span, e))?;
-    Ok(Val::Void)
-}
-
-fn eval_quote(args: &[Expr], span: Span) -> Result<Val, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity(format!("quote: expected 1 argument at {span}")));
-    }
-    expr_to_val(&args[0])
-}
-
-fn expr_to_val(expr: &Expr) -> Result<Val, EvalError> {
-    match &expr.kind {
-        ExprKind::Int(n) => Ok(Val::Int(*n)),
-        ExprKind::Float(x) => Ok(Val::Float(*x)),
-        ExprKind::Rational(n, d) => Ok(Val::Rational(*n, *d)),
-        ExprKind::Bool(b) => Ok(Val::Bool(*b)),
-        ExprKind::Str(s) => Ok(Val::Str(s.clone())),
-        ExprKind::Char(c) => Ok(Val::Char(*c)),
-        ExprKind::Symbol(s) => Ok(Val::Symbol(s.clone())),
-        ExprKind::List(elems) => {
-            let vals: Vec<Val> = elems.iter().map(expr_to_val).collect::<Result<_, _>>()?;
-            Ok(Val::List(vals))
-        }
-    }
-}
-
-fn eval_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
-    if args.is_empty() {
-        return Err(EvalError::Parse(format!("lambda: missing parameters at {span}")));
-    }
-    let (params, rest_param) = match &args[0].kind {
-        ExprKind::List(param_exprs) => parse_params(param_exprs, span)?,
-        ExprKind::Symbol(s) => {
-            // (lambda rest body...) — single rest param
-            (vec![], Some(s.clone()))
-        }
-        _ => return Err(EvalError::Parse(format!("lambda: expected parameter list at {span}"))),
-    };
-    let body = args[1..].to_vec();
-    Ok(Val::Lambda {
-        params,
-        rest_param,
-        body,
-        env: env.clone(),
-    })
-}
-
-fn eval_case_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
-    let mut clauses = Vec::new();
-    for clause in args {
-        match &clause.kind {
-            ExprKind::List(elems) => {
-                if elems.is_empty() {
-                    return Err(EvalError::Parse(format!("case-lambda: empty clause at {span}")));
-                }
-                let (params, rest_param) = match &elems[0].kind {
-                    ExprKind::List(param_exprs) => parse_params(param_exprs, span)?,
-                    ExprKind::Symbol(s) => (vec![], Some(s.clone())),
-                    _ => return Err(EvalError::Parse(format!("case-lambda: expected parameter list at {span}"))),
-                };
-                let body = elems[1..].to_vec();
-                clauses.push((params, rest_param, body));
-            }
-            _ => return Err(EvalError::Parse(format!("case-lambda: expected clause at {span}"))),
-        }
-    }
-    Ok(Val::CaseLambda { clauses, env: env.clone() })
-}
-
-fn eval_string_set(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
-    if args.len() != 3 {
-        return Err(EvalError::Arity(format!("string-set!: expected 3 arguments at {span}")));
-    }
-    // String literals are immutable (L15)
-    if matches!(&args[0].kind, ExprKind::Str(_)) {
-        return Err(EvalError::Runtime("string-set!: strings are immutable".into()));
-    }
-    let name = match &args[0].kind {
-        ExprKind::Symbol(s) => s.clone(),
-        _ => return Err(EvalError::Type(format!("string-set!: expected variable at {span}"))),
-    };
-    let idx_val = eval(&args[1], env)?;
-    let idx = match idx_val {
-        Val::Int(n) => n as usize,
-        _ => return Err(EvalError::Type("string-set!: expected integer index".into())),
-    };
-    let char_val = eval(&args[2], env)?;
-    let ch = match char_val {
-        Val::Char(c) => c,
-        _ => return Err(EvalError::Type("string-set!: expected character".into())),
-    };
-    let current = env.get(&name).ok_or_else(|| EvalError::UnboundVariable(format!("{name} at {span}")))?;
-    match current {
-        Val::Str(s) => {
-            let mut chars: Vec<char> = s.chars().collect();
-            if idx >= chars.len() {
-                return Err(EvalError::Runtime("string-set!: index out of range".into()));
-            }
-            chars[idx] = ch;
-            let new_str: String = chars.into_iter().collect();
-            env.set(&name, Val::Str(new_str))?;
-            Ok(Val::Void)
-        }
-        _ => Err(EvalError::Type("string-set!: expected string".into())),
-    }
-}
-
-fn eval_set_car(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
-    if args.len() != 2 {
-        return Err(EvalError::Arity(format!("set-car!: expected 2 arguments at {span}")));
-    }
-    let pair_val = eval(&args[0], env)?;
-    let new_car = eval(&args[1], env)?;
-    match pair_val {
-        Val::Pair(rc) => {
-            rc.borrow_mut().0 = new_car;
-            Ok(Val::Void)
-        }
-        _ => Err(EvalError::Type("set-car!: expected pair".into())),
-    }
-}
-
-fn eval_set_cdr(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
-    if args.len() != 2 {
-        return Err(EvalError::Arity(format!("set-cdr!: expected 2 arguments at {span}")));
-    }
-    let pair_val = eval(&args[0], env)?;
-    let new_cdr = eval(&args[1], env)?;
-    match pair_val {
-        Val::Pair(rc) => {
-            rc.borrow_mut().1 = new_cdr;
-            Ok(Val::Void)
-        }
-        _ => Err(EvalError::Type("set-cdr!: expected pair".into())),
-    }
-}
-
-fn eval_letrec(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
-    if args.is_empty() {
-        return Err(EvalError::Parse(format!("letrec: missing arguments at {span}")));
-    }
-    let bindings = match &args[0].kind {
-        ExprKind::List(b) => b,
-        _ => return Err(EvalError::Parse(format!("letrec: expected bindings list at {span}"))),
-    };
-    let new_env = env.push();
-    // First pass: define all variables as Void
-    let mut names = Vec::new();
-    let mut init_exprs = Vec::new();
-    for b in bindings {
-        match &b.kind {
-            ExprKind::List(pair) if pair.len() == 2 => {
-                if let ExprKind::Symbol(s) = &pair[0].kind {
-                    names.push(s.clone());
-                    init_exprs.push(&pair[1]);
-                    new_env.define(s.clone(), Val::Void);
-                } else {
-                    return Err(EvalError::Parse(format!("letrec: expected variable name at {span}")));
-                }
-            }
-            _ => return Err(EvalError::Parse(format!("letrec: invalid binding at {span}"))),
-        }
-    }
-    // Second pass: evaluate inits in the new env and set them
-    for (name, init_expr) in names.iter().zip(init_exprs.iter()) {
-        let val = eval(init_expr, &new_env)?;
-        new_env.set(name, val)?;
-    }
-    let mut result = Val::Void;
-    for expr in &args[1..] {
-        result = eval(expr, &new_env)?;
-    }
-    Ok(result)
-}
-
-fn eval_letrec_star(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
-    if args.is_empty() {
-        return Err(EvalError::Parse(format!("letrec*: missing arguments at {span}")));
-    }
-    let bindings = match &args[0].kind {
-        ExprKind::List(b) => b,
-        _ => return Err(EvalError::Parse(format!("letrec*: expected bindings list at {span}"))),
-    };
-    let new_env = env.push();
-    for b in bindings {
-        match &b.kind {
-            ExprKind::List(pair) if pair.len() == 2 => {
-                if let ExprKind::Symbol(s) = &pair[0].kind {
-                    let val = eval(&pair[1], &new_env)?;
-                    new_env.define(s.clone(), val);
-                } else {
-                    return Err(EvalError::Parse(format!("letrec*: expected variable name at {span}")));
-                }
-            }
-            _ => return Err(EvalError::Parse(format!("letrec*: invalid binding at {span}"))),
-        }
-    }
-    let mut result = Val::Void;
-    for expr in &args[1..] {
-        result = eval(expr, &new_env)?;
-    }
-    Ok(result)
-}
-
-fn eval_let_star(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
-    if args.is_empty() {
-        return Err(EvalError::Parse(format!("let*: missing arguments at {span}")));
-    }
-    let bindings = match &args[0].kind {
-        ExprKind::List(b) => b,
-        _ => return Err(EvalError::Parse(format!("let*: expected bindings list at {span}"))),
-    };
-    let new_env = env.push();
-    for b in bindings {
-        match &b.kind {
-            ExprKind::List(pair) if pair.len() == 2 => {
-                if let ExprKind::Symbol(s) = &pair[0].kind {
-                    let val = eval(&pair[1], &new_env)?;
-                    new_env.define(s.clone(), val);
-                } else {
-                    return Err(EvalError::Parse(format!("let*: expected variable name at {span}")));
-                }
-            }
-            _ => return Err(EvalError::Parse(format!("let*: invalid binding at {span}"))),
-        }
-    }
-    let mut result = Val::Void;
-    for expr in &args[1..] {
-        result = eval(expr, &new_env)?;
-    }
-    Ok(result)
-}
-
-fn vals_eqv(a: &Val, b: &Val) -> bool {
-    match (a, b) {
-        (Val::Int(x), Val::Int(y)) => x == y,
-        (Val::Float(x), Val::Float(y)) => x == y,
-        (Val::Rational(n1, d1), Val::Rational(n2, d2)) => n1 == n2 && d1 == d2,
-        (Val::Bool(x), Val::Bool(y)) => x == y,
-        (Val::Char(x), Val::Char(y)) => x == y,
-        (Val::Symbol(x), Val::Symbol(y)) => x == y,
-        (Val::List(a), Val::List(b)) if a.is_empty() && b.is_empty() => true,
-        (Val::Void, Val::Void) => true,
-        _ => std::ptr::eq(a as *const Val, b as *const Val),
-    }
-}
-
-fn eval_case(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
-    if args.is_empty() {
-        return Err(EvalError::Parse(format!("case: missing arguments at {span}")));
-    }
-    let key = eval(&args[0], env)?;
-    for clause in &args[1..] {
-        match &clause.kind {
-            ExprKind::List(parts) if !parts.is_empty() => {
-                // Check for else
-                if let ExprKind::Symbol(s) = &parts[0].kind {
-                    if s == "else" {
-                        let mut result = Val::Void;
-                        for expr in &parts[1..] {
-                            result = eval(expr, env)?;
-                        }
-                        return Ok(result);
-                    }
-                }
-                // Normal clause: ((datum ...) body ...)
-                let datums = match &parts[0].kind {
-                    ExprKind::List(d) => d,
-                    _ => return Err(EvalError::Parse(format!("case: expected datum list at {span}"))),
-                };
-                for datum in datums {
-                    let datum_val = expr_to_val(datum)?;
-                    if vals_eqv(&key, &datum_val) {
-                        let mut result = Val::Void;
-                        for expr in &parts[1..] {
-                            result = eval(expr, env)?;
-                        }
-                        return Ok(result);
-                    }
-                }
-            }
-            _ => return Err(EvalError::Parse(format!("case: invalid clause at {span}"))),
-        }
-    }
-    Ok(Val::Void)
-}
-
-fn eval_do(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
-    // (do ((var init step) ...) (test expr ...) body ...)
-    if args.len() < 2 {
-        return Err(EvalError::Parse(format!("do: expected at least 2 arguments at {span}")));
-    }
-    let var_specs = match &args[0].kind {
-        ExprKind::List(v) => v,
-        _ => return Err(EvalError::Parse(format!("do: expected variable list at {span}"))),
-    };
-    let test_clause = match &args[1].kind {
-        ExprKind::List(t) => t,
-        _ => return Err(EvalError::Parse(format!("do: expected test clause at {span}"))),
-    };
-    if test_clause.is_empty() {
-        return Err(EvalError::Parse(format!("do: empty test clause at {span}")));
-    }
-
-    // Parse variable specs
-    struct DoVar<'a> {
-        name: String,
-        step: Option<&'a Expr>,
-    }
-    let mut vars = Vec::new();
-    let do_env = env.push();
-    for spec in var_specs {
-        match &spec.kind {
-            ExprKind::List(parts) if parts.len() >= 2 => {
-                let name = match &parts[0].kind {
-                    ExprKind::Symbol(s) => s.clone(),
-                    _ => return Err(EvalError::Parse(format!("do: expected variable name at {span}"))),
-                };
-                let init = eval(&parts[1], env)?;
-                let step = if parts.len() >= 3 { Some(&parts[2]) } else { None };
-                do_env.define(name.clone(), init);
-                vars.push(DoVar { name, step });
-            }
-            _ => return Err(EvalError::Parse(format!("do: invalid variable spec at {span}"))),
-        }
-    }
-
-    // Iterate
-    loop {
-        // Test
-        let test_result = eval(&test_clause[0], &do_env)?;
-        if test_result.is_truthy() {
-            // Evaluate result expressions
-            if test_clause.len() > 1 {
-                let mut result = Val::Void;
-                for expr in &test_clause[1..] {
-                    result = eval(expr, &do_env)?;
-                }
-                return Ok(result);
-            }
-            return Ok(Val::Void);
-        }
-
-        // Evaluate body
-        for expr in &args[2..] {
-            eval(expr, &do_env)?;
-        }
-
-        // Step: evaluate ALL step expressions using current values, then update
-        let new_vals: Vec<Option<Val>> = vars.iter().map(|v| {
-            match v.step {
-                Some(step_expr) => Ok(Some(eval(step_expr, &do_env)?)),
-                None => Ok(None),
-            }
-        }).collect::<Result<_, EvalError>>()?;
-
-        for (v, new_val) in vars.iter().zip(new_vals.into_iter()) {
-            if let Some(val) = new_val {
-                do_env.set(&v.name, val)?;
-            }
-        }
-    }
-}
+use special_forms::{
+    parse_params, eval_define_record_type, eval_define_syntax,
+    eval_quote, expr_to_val, eval_lambda, eval_case_lambda,
+    eval_string_set, eval_set_car, eval_set_cdr, vals_eqv,
+};
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
@@ -1358,10 +1317,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         return Err(EvalError::Parse("empty input".into()));
     }
     let env = Env::new();
-    let mut last = Val::Void;
-    for expr in &exprs {
-        last = eval(expr, &env)?;
-    }
+    let last = eval_seq(&exprs, &env)?;
     Ok(last.to_string())
 }
 
@@ -1373,10 +1329,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
         return Err(EvalError::Parse("empty input".into()));
     }
     let env = Env::new();
-    let mut last = Val::Void;
-    for expr in &exprs {
-        last = eval(expr, &env)?;
-    }
+    let last = eval_seq(&exprs, &env)?;
     let output = env.output.borrow().clone();
     Ok((last.to_string(), output))
 }

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::{
-    eval, gensym, Env, Expr, ExprKind, Span, Val, EvalError,
+    gensym, Env, Expr, ExprKind, Span, EvalError,
 };
 
 #[derive(Clone, Debug)]
@@ -15,6 +15,7 @@ pub(super) const SPECIAL_FORMS: &[&str] = &[
     "let", "let*", "cond", "set!", "string-set!", "set-car!", "set-cdr!",
     "define-syntax", "syntax-rules",
     "define-record-type", "case-lambda", "letrec", "letrec*", "case", "do",
+    "call/cc", "call-with-current-continuation",
 ];
 
 pub(super) fn is_ellipsis(expr: &Expr) -> bool {
@@ -184,14 +185,15 @@ fn expand_template(
     }
 }
 
-pub(super) fn eval_macro_call(
+/// Expand a macro call and return the expanded expression + environment.
+pub(super) fn expand_macro(
     elems: &[Expr],
     literals: &[String],
     rules: &[(Expr, Expr)],
     def_env: &Env,
     use_env: &Env,
     span: Span,
-) -> Result<Val, EvalError> {
+) -> Result<(Expr, Env), EvalError> {
     for (pattern, template) in rules {
         let pat_elems = match &pattern.kind {
             ExprKind::List(e) => e,
@@ -216,7 +218,7 @@ pub(super) fn eval_macro_call(
             let expanded = expand_template(template, &bindings, &renames);
 
             if renames.is_empty() {
-                return eval(&expanded, use_env);
+                return Ok((expanded, use_env.clone()));
             } else {
                 let new_env = use_env.push();
                 for (orig, gs) in &renames {
@@ -224,9 +226,10 @@ pub(super) fn eval_macro_call(
                         new_env.define(gs.clone(), val);
                     }
                 }
-                return eval(&expanded, &new_env);
+                return Ok((expanded, new_env));
             }
         }
     }
     Err(EvalError::Runtime(format!("no matching syntax rule at {span}")))
 }
+
