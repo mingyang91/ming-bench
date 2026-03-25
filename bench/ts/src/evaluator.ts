@@ -296,6 +296,7 @@ const SPECIAL_FORM_NAMES = new Set([
   'if',
   'lambda',
   'let',
+  'let*',
   'letrec',
   'letrec*',
   'quote',
@@ -376,18 +377,23 @@ function createGlobalEnvironment(output: string[]): Environment {
   env.define('eq?', makeBuiltinProcedure('eq?', (args) => applyEq(args)));
   env.define('eqv?', makeBuiltinProcedure('eqv?', (args) => applyEqv(args)));
   env.define('equal?', makeBuiltinProcedure('equal?', (args) => applyEqual(args)));
+  env.define('error', makeBuiltinProcedure('error', (args) => applyError(args)));
   env.define(
     'procedure?',
     makePredicateProcedure('procedure?', (value) => value.kind === 'procedure'),
   );
 
   env.define('abs', makeBuiltinProcedure('abs', (args) => applyAbs(args)));
+  env.define('gcd', makeBuiltinProcedure('gcd', (args) => applyGcd(args)));
+  env.define('lcm', makeBuiltinProcedure('lcm', (args) => applyLcm(args)));
   env.define('quotient', makeBuiltinProcedure('quotient', (args) => applyQuotient(args)));
   env.define('remainder', makeBuiltinProcedure('remainder', (args) => applyRemainder(args)));
   env.define('modulo', makeBuiltinProcedure('modulo', (args) => applyModulo(args)));
   env.define('min', makeBuiltinProcedure('min', (args) => applyMin(args)));
   env.define('max', makeBuiltinProcedure('max', (args) => applyMax(args)));
   env.define('expt', makeBuiltinProcedure('expt', (args) => applyExpt(args)));
+  env.define('truncate', makeBuiltinProcedure('truncate', (args) => applyTruncate(args)));
+  env.define('round', makeBuiltinProcedure('round', (args) => applyRound(args)));
 
   env.define('zero?', makePredicateProcedure('zero?', (value) => compareNumbers(expectNumber(value, 'zero?'), exactNumber(0)) === 0));
   env.define(
@@ -404,14 +410,21 @@ function createGlobalEnvironment(output: string[]): Environment {
   env.define('cons', makeBuiltinProcedure('cons', (args) => applyCons(args)));
   env.define('car', makeBuiltinProcedure('car', (args) => applyCar(args)));
   env.define('cdr', makeBuiltinProcedure('cdr', (args) => applyCdr(args)));
+  registerCompositePairAccessors(env);
+  env.define('set-car!', makeBuiltinProcedure('set-car!', (args) => applySetCar(args)));
+  env.define('set-cdr!', makeBuiltinProcedure('set-cdr!', (args) => applySetCdr(args)));
   env.define('null?', makeBuiltinProcedure('null?', (args) => applyNullPredicate(args)));
   env.define('list', makeBuiltinProcedure('list', (args) => arrayToList(args)));
   env.define('length', makeBuiltinProcedure('length', (args) => applyLength(args)));
   env.define('list-ref', makeBuiltinProcedure('list-ref', (args) => applyListRef(args)));
   env.define('list-tail', makeBuiltinProcedure('list-tail', (args) => applyListTail(args)));
   env.define('append', makeBuiltinProcedure('append', (args) => applyAppend(args)));
+  env.define('reverse', makeBuiltinProcedure('reverse', (args) => applyReverse(args)));
   env.define('assoc', makeBuiltinProcedure('assoc', (args) => applyAssoc(args)));
+  env.define('assv', makeBuiltinProcedure('assv', (args) => applyAssv(args)));
+  env.define('member', makeBuiltinProcedure('member', (args) => applyMember(args)));
   env.define('map', makeBuiltinProcedure('map', (args) => applyMap(args)));
+  env.define('for-each', makeBuiltinProcedure('for-each', (args) => applyForEach(args)));
   env.define('vector', makeBuiltinProcedure('vector', (args) => applyVector(args)));
   env.define('make-vector', makeBuiltinProcedure('make-vector', (args) => applyMakeVector(args)));
   env.define('vector-ref', makeBuiltinProcedure('vector-ref', (args) => applyVectorRef(args)));
@@ -422,6 +435,8 @@ function createGlobalEnvironment(output: string[]): Environment {
   env.define('display', makeBuiltinProcedure('display', (args) => applyDisplay(args, output)));
   env.define('write', makeBuiltinProcedure('write', (args) => applyWrite(args, output)));
   env.define('newline', makeBuiltinProcedure('newline', (args) => applyNewline(args, output)));
+  env.define('make-string', makeBuiltinProcedure('make-string', (args) => applyMakeString(args)));
+  env.define('string', makeBuiltinProcedure('string', (args) => applyString(args)));
   env.define('string-append', makeBuiltinProcedure('string-append', (args) => applyStringAppend(args)));
   env.define('string-length', makeBuiltinProcedure('string-length', (args) => applyStringLength(args)));
   env.define('string-copy', makeBuiltinProcedure('string-copy', (args) => applyStringCopy(args)));
@@ -436,6 +451,9 @@ function createGlobalEnvironment(output: string[]): Environment {
   env.define('list->string', makeBuiltinProcedure('list->string', (args) => applyListToString(args)));
   env.define('string=?', makeBuiltinProcedure('string=?', (args) => applyStringEqual(args)));
   env.define('string<?', makeBuiltinProcedure('string<?', (args) => applyStringLess(args)));
+  env.define('string>?', makeBuiltinProcedure('string>?', (args) => applyStringGreater(args)));
+  env.define('string<=?', makeBuiltinProcedure('string<=?', (args) => applyStringLessEqual(args)));
+  env.define('string>=?', makeBuiltinProcedure('string>=?', (args) => applyStringGreaterEqual(args)));
   env.define('string-ci=?', makeBuiltinProcedure('string-ci=?', (args) => applyStringCiEqual(args)));
   env.define('string-upcase', makeBuiltinProcedure('string-upcase', (args) => applyStringUpcase(args)));
   env.define('string-downcase', makeBuiltinProcedure('string-downcase', (args) => applyStringDowncase(args)));
@@ -491,6 +509,30 @@ function createGlobalEnvironment(output: string[]): Environment {
   env.define('denominator', makeBuiltinProcedure('denominator', (args) => applyDenominator(args)));
 
   return env;
+}
+
+function registerCompositePairAccessors(env: Environment): void {
+  const names = buildCompositePairAccessorNames();
+  for (const name of names) {
+    env.define(name, makeCompositePairAccessorProcedure(name));
+  }
+}
+
+function buildCompositePairAccessorNames(): string[] {
+  const names: string[] = [];
+
+  for (let depth = 2; depth <= 4; depth += 1) {
+    const count = 2 ** depth;
+    for (let mask = 0; mask < count; mask += 1) {
+      let operations = '';
+      for (let bit = depth - 1; bit >= 0; bit -= 1) {
+        operations += (mask & (1 << bit)) === 0 ? 'a' : 'd';
+      }
+      names.push(`c${operations}r`);
+    }
+  }
+
+  return names;
 }
 
 function displayIdentifierName(identifier: SymbolExpr): string {
@@ -1188,7 +1230,7 @@ function resolveTemplateIdentifiers(
     return;
   }
 
-  if (head?.kind === 'symbol' && head.value === 'let') {
+  if (head?.kind === 'symbol' && (head.value === 'let' || head.value === 'let*')) {
     resolveLetTemplateIdentifiers(expression, env, templateId, scope);
     return;
   }
@@ -1667,6 +1709,8 @@ function evaluateList(expression: ListExpr, env: Environment, tailPosition: bool
         return evaluateLambda(items.slice(1), env);
       case 'let':
         return evaluateLet(items.slice(1), env, tailPosition, location);
+      case 'let*':
+        return evaluateLetStar(items.slice(1), env, tailPosition);
       case 'letrec':
         return evaluateLetrec(items.slice(1), env, tailPosition);
       case 'letrec*':
@@ -2016,6 +2060,21 @@ function evaluateLet(
   }
 
   return evaluateSequenceInternal(items.slice(1), letEnv, tailPosition);
+}
+
+function evaluateLetStar(items: Expr[], env: Environment, tailPosition: boolean): EvalOutcome {
+  if (items.length < 2) {
+    throw new EvalError('let* requires bindings and a body');
+  }
+
+  const bindings = parseLetBindings(items[0]);
+  const letStarEnv = env.child();
+
+  for (const binding of bindings) {
+    defineIdentifier(binding.name, letStarEnv, evaluate(binding.valueExpression, letStarEnv));
+  }
+
+  return evaluateSequenceInternal(items.slice(1), letStarEnv, tailPosition);
 }
 
 function evaluateNamedLet(
@@ -2410,6 +2469,20 @@ function makePredicateProcedure(
   });
 }
 
+function makeCompositePairAccessorProcedure(name: string): BuiltinProcedureValue {
+  return makeBuiltinProcedure(name, (args) => {
+    expectExactArgCount(name, args, 1);
+
+    let current = args[0];
+    for (let index = name.length - 2; index >= 1; index -= 1) {
+      const pair = expectPair(current, name);
+      current = name[index] === 'a' ? pair.car : pair.cdr;
+    }
+
+    return current;
+  });
+}
+
 function applyNot(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('not', args, 1);
   return booleanValue(!isTruthy(args[0]));
@@ -2439,9 +2512,42 @@ function applyEqual(args: SchemeValue[]): SchemeValue {
   return booleanValue(schemeEqual(args[0], args[1]));
 }
 
+function applyError(args: SchemeValue[]): SchemeValue {
+  expectAtLeastArgCount('error', args, 1);
+  throw new EvalError(args.map((arg) => formatDisplayValue(arg)).join(' '));
+}
+
 function applyAbs(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('abs', args, 1);
   return numberValue(absNumber(expectNumber(args[0], 'abs')));
+}
+
+function applyGcd(args: SchemeValue[]): SchemeValue {
+  const values = args.map((arg) => expectInteger(arg, 'gcd'));
+  if (values.length === 0) {
+    return exactIntegerValue(0);
+  }
+
+  let result = Math.abs(values[0]);
+  for (let index = 1; index < values.length; index += 1) {
+    result = integerGreatestCommonDivisor(result, values[index]);
+  }
+
+  return exactIntegerValue(result);
+}
+
+function applyLcm(args: SchemeValue[]): SchemeValue {
+  const values = args.map((arg) => expectInteger(arg, 'lcm'));
+  if (values.length === 0) {
+    return exactIntegerValue(1);
+  }
+
+  let result = 1;
+  for (const value of values) {
+    result = integerLeastCommonMultiple(result, value);
+  }
+
+  return exactIntegerValue(result);
 }
 
 function applyQuotient(args: SchemeValue[]): SchemeValue {
@@ -2490,6 +2596,22 @@ function applyExpt(args: SchemeValue[]): SchemeValue {
   return numberValue(exptNumber(base, exponent));
 }
 
+function applyTruncate(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('truncate', args, 1);
+
+  const input = expectNumber(args[0], 'truncate');
+  return integerResultFromNumber(input, Math.trunc(numberToJs(input)));
+}
+
+function applyRound(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('round', args, 1);
+
+  const input = expectNumber(args[0], 'round');
+  const value = numberToJs(input);
+  const rounded = value >= 0 ? Math.floor(value + 0.5) : Math.ceil(value - 0.5);
+  return integerResultFromNumber(input, rounded);
+}
+
 function applyOddPredicate(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('odd?', args, 1);
   return booleanValue(Math.abs(expectInteger(args[0], 'odd?') % 2) === 1);
@@ -2513,6 +2635,18 @@ function applyCar(args: SchemeValue[]): SchemeValue {
 function applyCdr(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('cdr', args, 1);
   return expectPair(args[0], 'cdr').cdr;
+}
+
+function applySetCar(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('set-car!', args, 2);
+  expectPair(args[0], 'set-car!').car = args[1];
+  return VOID_VALUE;
+}
+
+function applySetCdr(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('set-cdr!', args, 2);
+  expectPair(args[0], 'set-cdr!').cdr = args[1];
+  return VOID_VALUE;
 }
 
 function applyNullPredicate(args: SchemeValue[]): SchemeValue {
@@ -2578,35 +2712,24 @@ function applyAppend(args: SchemeValue[]): SchemeValue {
   return result;
 }
 
+function applyReverse(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('reverse', args, 1);
+  return arrayToList(expectList(args[0], 'reverse').slice().reverse());
+}
+
 function applyAssoc(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('assoc', args, 2);
+  return findAssocEntry(args[0], args[1], schemeEqual, 'assoc');
+}
 
-  const target = args[0];
-  let current = args[1];
-  const visited = new Set<PairValue>();
-  while (current.kind === 'pair') {
-    if (visited.has(current)) {
-      throw new EvalError('assoc expected a proper list');
-    }
-    visited.add(current);
+function applyAssv(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('assv', args, 2);
+  return findAssocEntry(args[0], args[1], schemeEqv, 'assv');
+}
 
-    const entry = current.car;
-    if (entry.kind !== 'pair') {
-      throw new EvalError('assoc expected an association list');
-    }
-
-    if (schemeEqual(target, entry.car)) {
-      return entry;
-    }
-
-    current = current.cdr;
-  }
-
-  if (current.kind !== 'empty-list') {
-    throw new EvalError('assoc expected a proper list');
-  }
-
-  return FALSE_VALUE;
+function applyMember(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('member', args, 2);
+  return findListMember(args[0], args[1], schemeEqual, 'member');
 }
 
 function applyMap(args: SchemeValue[]): SchemeValue {
@@ -2625,6 +2748,23 @@ function applyMap(args: SchemeValue[]): SchemeValue {
   }
 
   return arrayToList(results);
+}
+
+function applyForEach(args: SchemeValue[]): SchemeValue {
+  expectAtLeastArgCount('for-each', args, 2);
+
+  const procedure = args[0];
+  const lists = args.slice(1).map((arg) => expectList(arg, 'for-each'));
+  const resultLength = lists.reduce(
+    (shortest, list) => Math.min(shortest, list.length),
+    Number.POSITIVE_INFINITY,
+  );
+
+  for (let index = 0; index < resultLength; index += 1) {
+    applyProcedure(procedure, lists.map((list) => list[index]));
+  }
+
+  return VOID_VALUE;
 }
 
 function applyVector(args: SchemeValue[]): SchemeValue {
@@ -2697,6 +2837,23 @@ function applyNewline(args: SchemeValue[], output: string[]): SchemeValue {
   expectExactArgCount('newline', args, 0);
   output.push('\n');
   return VOID_VALUE;
+}
+
+function applyMakeString(args: SchemeValue[]): SchemeValue {
+  if (args.length !== 1 && args.length !== 2) {
+    throw new EvalError(`make-string expected 1 or 2 argument(s), got ${args.length}`);
+  }
+
+  const length = expectIndex(args[0], 'make-string');
+  const fill = args[1] === undefined ? '\0' : expectChar(args[1], 'make-string');
+  return stringValue(fill.repeat(length), !stringsAreImmutable());
+}
+
+function applyString(args: SchemeValue[]): SchemeValue {
+  return stringValue(
+    args.map((arg) => expectChar(arg, 'string')).join(''),
+    !stringsAreImmutable(),
+  );
 }
 
 function applyStringAppend(args: SchemeValue[]): SchemeValue {
@@ -2827,6 +2984,21 @@ function applyStringEqual(args: SchemeValue[]): SchemeValue {
 function applyStringLess(args: SchemeValue[]): SchemeValue {
   expectAtLeastArgCount('string<?', args, 2);
   return booleanValue(compareStringChain(args, (left, right) => compareStrings(left, right) < 0, 'string<?'));
+}
+
+function applyStringGreater(args: SchemeValue[]): SchemeValue {
+  expectAtLeastArgCount('string>?', args, 2);
+  return booleanValue(compareStringChain(args, (left, right) => compareStrings(left, right) > 0, 'string>?'));
+}
+
+function applyStringLessEqual(args: SchemeValue[]): SchemeValue {
+  expectAtLeastArgCount('string<=?', args, 2);
+  return booleanValue(compareStringChain(args, (left, right) => compareStrings(left, right) <= 0, 'string<=?'));
+}
+
+function applyStringGreaterEqual(args: SchemeValue[]): SchemeValue {
+  expectAtLeastArgCount('string>=?', args, 2);
+  return booleanValue(compareStringChain(args, (left, right) => compareStrings(left, right) >= 0, 'string>=?'));
 }
 
 function applyStringCiEqual(args: SchemeValue[]): SchemeValue {
@@ -3012,6 +3184,69 @@ function expectList(value: SchemeValue, name: string): SchemeValue[] {
   return elements;
 }
 
+function findListMember(
+  target: SchemeValue,
+  list: SchemeValue,
+  predicate: (left: SchemeValue, right: SchemeValue) => boolean,
+  name: string,
+): SchemeValue {
+  let current = list;
+  const visited = new Set<PairValue>();
+
+  while (current.kind === 'pair') {
+    if (visited.has(current)) {
+      throw new EvalError(`${name} expected a proper list`);
+    }
+    visited.add(current);
+
+    if (predicate(target, current.car)) {
+      return current;
+    }
+
+    current = current.cdr;
+  }
+
+  if (current.kind !== 'empty-list') {
+    throw new EvalError(`${name} expected a proper list`);
+  }
+
+  return FALSE_VALUE;
+}
+
+function findAssocEntry(
+  target: SchemeValue,
+  list: SchemeValue,
+  predicate: (left: SchemeValue, right: SchemeValue) => boolean,
+  name: string,
+): SchemeValue {
+  let current = list;
+  const visited = new Set<PairValue>();
+
+  while (current.kind === 'pair') {
+    if (visited.has(current)) {
+      throw new EvalError(`${name} expected a proper list`);
+    }
+    visited.add(current);
+
+    const entry = current.car;
+    if (entry.kind !== 'pair') {
+      throw new EvalError(`${name} expected an association list`);
+    }
+
+    if (predicate(target, entry.car)) {
+      return entry;
+    }
+
+    current = current.cdr;
+  }
+
+  if (current.kind !== 'empty-list') {
+    throw new EvalError(`${name} expected a proper list`);
+  }
+
+  return FALSE_VALUE;
+}
+
 function arrayToList(values: SchemeValue[]): SchemeValue {
   let result: SchemeValue = EMPTY_LIST_VALUE;
   for (let index = values.length - 1; index >= 0; index -= 1) {
@@ -3040,6 +3275,11 @@ function expectAtLeastArgCount(name: string, values: ArrayLike<unknown>, minimum
 
 function sum(values: SchemeNumber[]): SchemeNumber {
   return values.reduce((total, value) => addNumbers(total, value), exactNumber(0));
+}
+
+function integerResultFromNumber(input: SchemeNumber, value: number): SchemeValue {
+  const normalized = Object.is(value, -0) ? 0 : value;
+  return numberValue(input.exactness === 'exact' ? exactNumber(normalized) : inexactNumber(normalized));
 }
 
 function ensureNonZeroDivisor(value: number): void {
@@ -3137,6 +3377,10 @@ function compareStrings(left: string, right: string): number {
 }
 
 function formatValue(value: SchemeValue): string {
+  return formatWrittenValue(value, new Set<object>());
+}
+
+function formatWrittenValue(value: SchemeValue, active: Set<object>): string {
   switch (value.kind) {
     case 'number':
       return formatNumber(value.value);
@@ -3151,9 +3395,9 @@ function formatValue(value: SchemeValue): string {
     case 'empty-list':
       return '()';
     case 'pair':
-      return formatPair(value);
+      return active.has(value) ? '#<cycle>' : formatPair(value, active, formatWrittenValue);
     case 'vector':
-      return formatVector(value);
+      return active.has(value) ? '#<cycle>' : formatVector(value, active);
     case 'record':
       return `#<record:${value.recordType.name}>`;
     case 'void':
@@ -3164,54 +3408,76 @@ function formatValue(value: SchemeValue): string {
 }
 
 function formatDisplayValue(value: SchemeValue): string {
+  return formatDisplayedValue(value, new Set<object>());
+}
+
+function formatDisplayedValue(value: SchemeValue, active: Set<object>): string {
   switch (value.kind) {
     case 'string':
       return value.value;
     case 'char':
       return value.value;
     case 'pair':
-      return formatDisplayPair(value);
+      return active.has(value) ? '#<cycle>' : formatPair(value, active, formatDisplayedValue);
     case 'vector':
-      return formatVector(value);
+      return active.has(value) ? '#<cycle>' : formatVector(value, active);
     default:
-      return formatValue(value);
+      return formatWrittenValue(value, active);
   }
 }
 
-function formatPair(pair: PairValue): string {
+function formatPair(
+  pair: PairValue,
+  active: Set<object>,
+  formatElement: (value: SchemeValue, active: Set<object>) => string,
+): string {
   const parts: string[] = [];
   let current: SchemeValue = pair;
+  const chain: PairValue[] = [];
 
   while (current.kind === 'pair') {
-    parts.push(formatValue(current.car));
+    if (active.has(current)) {
+      for (const item of chain) {
+        active.delete(item);
+      }
+      return formatPairResult(parts, '#<cycle>');
+    }
+
+    active.add(current);
+    chain.push(current);
+    parts.push(formatElement(current.car, active));
     current = current.cdr;
   }
 
-  if (current.kind === 'empty-list') {
+  const result =
+    current.kind === 'empty-list'
+      ? formatPairResult(parts)
+      : formatPairResult(parts, formatElement(current, active));
+
+  for (const item of chain) {
+    active.delete(item);
+  }
+
+  return result;
+}
+
+function formatPairResult(parts: string[], tail?: string): string {
+  if (tail === undefined) {
     return `(${parts.join(' ')})`;
   }
 
-  return `(${parts.join(' ')} . ${formatValue(current)})`;
-}
-
-function formatDisplayPair(pair: PairValue): string {
-  const parts: string[] = [];
-  let current: SchemeValue = pair;
-
-  while (current.kind === 'pair') {
-    parts.push(formatDisplayValue(current.car));
-    current = current.cdr;
+  if (parts.length === 0) {
+    return `(${tail})`;
   }
 
-  if (current.kind === 'empty-list') {
-    return `(${parts.join(' ')})`;
-  }
-
-  return `(${parts.join(' ')} . ${formatDisplayValue(current)})`;
+  return `(${parts.join(' ')} . ${tail})`;
 }
 
-function formatVector(vector: VectorValue): string {
-  return `#(${vector.elements.map((element) => formatValue(element)).join(' ')})`;
+function formatVector(vector: VectorValue, active: Set<object>): string {
+  active.add(vector);
+  const result = `#(${vector.elements.map((element) => formatWrittenValue(element, active)).join(' ')})`;
+  active.delete(vector);
+  return result;
 }
 
 function formatNumber(value: SchemeNumber): string {
@@ -3316,6 +3582,26 @@ function schemeEqv(left: SchemeValue, right: SchemeValue): boolean {
 }
 
 function schemeEqual(left: SchemeValue, right: SchemeValue): boolean {
+  return schemeEqualInternal(left, right, {
+    active: new Map(),
+    equal: new Map(),
+  });
+}
+
+interface EqualityState {
+  active: Map<PairValue | VectorValue, Set<PairValue | VectorValue>>;
+  equal: Map<PairValue | VectorValue, Set<PairValue | VectorValue>>;
+}
+
+function schemeEqualInternal(
+  left: SchemeValue,
+  right: SchemeValue,
+  state: EqualityState,
+): boolean {
+  if (left === right) {
+    return true;
+  }
+
   if (left.kind !== right.kind) {
     return false;
   }
@@ -3333,21 +3619,86 @@ function schemeEqual(left: SchemeValue, right: SchemeValue): boolean {
     case 'void':
       return true;
     case 'pair':
-      return (
-        schemeEqual(left.car, (right as PairValue).car) &&
-        schemeEqual(left.cdr, (right as PairValue).cdr)
+      return compareCyclicValues(left, right as PairValue, state, () =>
+        schemeEqualInternal(left.car, (right as PairValue).car, state) &&
+        schemeEqualInternal(left.cdr, (right as PairValue).cdr, state),
       );
     case 'vector': {
       const rightVector = right as VectorValue;
-      return (
+      return compareCyclicValues(left, rightVector, state, () =>
         left.elements.length === rightVector.elements.length &&
-        left.elements.every((element, index) => schemeEqual(element, rightVector.elements[index]))
+        left.elements.every((element, index) => schemeEqualInternal(element, rightVector.elements[index], state)),
       );
     }
     case 'record':
     case 'procedure':
       return left === right;
   }
+}
+
+function compareCyclicValues(
+  left: PairValue | VectorValue,
+  right: PairValue | VectorValue,
+  state: EqualityState,
+  compare: () => boolean,
+): boolean {
+  if (hasTrackedValuePair(state.equal, left, right)) {
+    return true;
+  }
+
+  if (hasTrackedValuePair(state.active, left, right)) {
+    return true;
+  }
+
+  trackValuePair(state.active, left, right);
+  const result = compare();
+  untrackValuePair(state.active, left, right);
+
+  if (result) {
+    trackValuePair(state.equal, left, right);
+  }
+
+  return result;
+}
+
+function hasTrackedValuePair(
+  map: Map<PairValue | VectorValue, Set<PairValue | VectorValue>>,
+  left: PairValue | VectorValue,
+  right: PairValue | VectorValue,
+): boolean {
+  return map.get(left)?.has(right) ?? false;
+}
+
+function trackValuePair(
+  map: Map<PairValue | VectorValue, Set<PairValue | VectorValue>>,
+  left: PairValue | VectorValue,
+  right: PairValue | VectorValue,
+): void {
+  getTrackedValueSet(map, left).add(right);
+  getTrackedValueSet(map, right).add(left);
+}
+
+function untrackValuePair(
+  map: Map<PairValue | VectorValue, Set<PairValue | VectorValue>>,
+  left: PairValue | VectorValue,
+  right: PairValue | VectorValue,
+): void {
+  map.get(left)?.delete(right);
+  map.get(right)?.delete(left);
+}
+
+function getTrackedValueSet(
+  map: Map<PairValue | VectorValue, Set<PairValue | VectorValue>>,
+  value: PairValue | VectorValue,
+): Set<PairValue | VectorValue> {
+  const existing = map.get(value);
+  if (existing !== undefined) {
+    return existing;
+  }
+
+  const created = new Set<PairValue | VectorValue>();
+  map.set(value, created);
+  return created;
 }
 
 function numberValue(value: SchemeNumber): NumberValue {
@@ -3627,6 +3978,35 @@ function greatestCommonDivisor(left: number, right: number): number {
   }
 
   return a === 0 ? 1 : a;
+}
+
+function integerGreatestCommonDivisor(left: number, right: number): number {
+  let a = Math.abs(left);
+  let b = Math.abs(right);
+
+  if (a === 0) {
+    return b;
+  }
+
+  if (b === 0) {
+    return a;
+  }
+
+  while (b !== 0) {
+    const remainder = a % b;
+    a = b;
+    b = remainder;
+  }
+
+  return a;
+}
+
+function integerLeastCommonMultiple(left: number, right: number): number {
+  if (left === 0 || right === 0) {
+    return 0;
+  }
+
+  return Math.abs((left / integerGreatestCommonDivisor(left, right)) * right);
 }
 
 function numberToJs(value: SchemeNumber): number {
