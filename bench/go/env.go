@@ -109,6 +109,9 @@ func makeGlobalEnv() *Env {
 	env.Set("string-set!", &Value{Type: TypeSymbol, StrVal: "builtin:string-set!"})
 	env.Set("string-copy", &Value{Type: TypeSymbol, StrVal: "builtin:string-copy"})
 
+	// Apply (L08)
+	env.Set("apply", &Value{Type: TypeSymbol, StrVal: "builtin:apply"})
+
 	return env
 }
 
@@ -439,6 +442,33 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 			return nil, fmt.Errorf("%d:%d: 'string-copy' expects a string", line, col)
 		}
 		return StringValue(args[0].StrVal), nil
+
+	case "builtin:apply":
+		if len(args) < 2 {
+			return nil, fmt.Errorf("%d:%d: 'apply' requires at least 2 arguments", line, col)
+		}
+		fn := args[0]
+		// Last arg must be a list; prefix args are prepended
+		lastArg := args[len(args)-1]
+		// Collect prefix args
+		var allArgs []*Value
+		for _, a := range args[1 : len(args)-1] {
+			allArgs = append(allArgs, a)
+		}
+		// Unpack the final list
+		cur := lastArg
+		for cur.Type == TypePair {
+			allArgs = append(allArgs, cur.Car)
+			cur = cur.Cdr
+		}
+		// Call the function
+		if fn.Type == TypeSymbol && len(fn.StrVal) > 8 && fn.StrVal[:8] == "builtin:" {
+			return callBuiltin(fn.StrVal, allArgs, env, line, col)
+		}
+		if fn.Type == TypeLambda {
+			return callLambda(fn, allArgs, line, col)
+		}
+		return nil, fmt.Errorf("%d:%d: 'apply' first argument must be a procedure", line, col)
 	}
 
 	return nil, fmt.Errorf("%d:%d: unknown builtin %s", line, col, name)

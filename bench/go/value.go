@@ -28,8 +28,9 @@ type Value struct {
 	Cdr     *Value
 	CharVal rune
 	// Lambda fields
-	Params []string
-	Body   []*Expr
+	Params    []string
+	RestParam string // variadic rest parameter (empty if none)
+	Body      []*Expr
 	ClosureEnv *Env
 }
 

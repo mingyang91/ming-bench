@@ -80,22 +80,7 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 
 	// Call lambda
 	if fn.Type == TypeLambda {
-		if len(args) != len(fn.Params) {
-			return nil, fmt.Errorf("%d:%d: wrong number of arguments: expected %d, got %d", expr.Line, expr.Col, len(fn.Params), len(args))
-		}
-		callEnv := NewEnv(fn.ClosureEnv)
-		for i, param := range fn.Params {
-			callEnv.Set(param, args[i])
-		}
-		var result *Value
-		for _, bodyExpr := range fn.Body {
-			var err error
-			result, err = Eval(bodyExpr, callEnv)
-			if err != nil {
-				return nil, err
-			}
-		}
-		return result, nil
+		return callLambda(fn, args, expr.Line, expr.Col)
 	}
 
 	return nil, fmt.Errorf("%d:%d: not a procedure", expr.Line, expr.Col)
@@ -112,16 +97,14 @@ func evalDefine(expr *Expr, env *Env) (*Value, error) {
 		if name.Type != ExprSymbol {
 			return nil, fmt.Errorf("%d:%d: expected symbol in define", expr.Line, expr.Col)
 		}
-		params := make([]string, len(target.Elements)-1)
-		for i, p := range target.Elements[1:] {
-			if p.Type != ExprSymbol {
-				return nil, fmt.Errorf("%d:%d: expected symbol as parameter", p.Line, p.Col)
-			}
-			params[i] = p.StrVal
+		params, restParam, err := parseParams(target.Elements[1:])
+		if err != nil {
+			return nil, err
 		}
 		lambda := &Value{
 			Type:       TypeLambda,
 			Params:     params,
+			RestParam:  restParam,
 			Body:       expr.Elements[2:],
 			ClosureEnv: env,
 		}
@@ -187,24 +170,51 @@ func exprToValue(expr *Expr) *Value {
 	return Void
 }
 
+func parseParams(elements []*Expr) (params []string, restParam string, err error) {
+	for i, p := range elements {
+		if p.Type != ExprSymbol {
+			return nil, "", fmt.Errorf("%d:%d: expected symbol as parameter", p.Line, p.Col)
+		}
+		if p.StrVal == "." {
+			if i+1 != len(elements)-1 {
+				return nil, "", fmt.Errorf("%d:%d: expected exactly one parameter after '.'", p.Line, p.Col)
+			}
+			rest := elements[i+1]
+			if rest.Type != ExprSymbol {
+				return nil, "", fmt.Errorf("%d:%d: expected symbol after '.'", rest.Line, rest.Col)
+			}
+			return params, rest.StrVal, nil
+		}
+		params = append(params, p.StrVal)
+	}
+	return params, "", nil
+}
+
 func evalLambda(expr *Expr, env *Env) (*Value, error) {
 	if len(expr.Elements) < 3 {
 		return nil, fmt.Errorf("%d:%d: 'lambda' requires parameters and body", expr.Line, expr.Col)
 	}
 	paramExpr := expr.Elements[1]
+	// (lambda args body) — single symbol means all args go to rest
+	if paramExpr.Type == ExprSymbol {
+		return &Value{
+			Type:       TypeLambda,
+			RestParam:  paramExpr.StrVal,
+			Body:       expr.Elements[2:],
+			ClosureEnv: env,
+		}, nil
+	}
 	if paramExpr.Type != ExprList {
 		return nil, fmt.Errorf("%d:%d: 'lambda' parameters must be a list", expr.Line, expr.Col)
 	}
-	params := make([]string, len(paramExpr.Elements))
-	for i, p := range paramExpr.Elements {
-		if p.Type != ExprSymbol {
-			return nil, fmt.Errorf("%d:%d: expected symbol as parameter", p.Line, p.Col)
-		}
-		params[i] = p.StrVal
+	params, restParam, err := parseParams(paramExpr.Elements)
+	if err != nil {
+		return nil, err
 	}
 	return &Value{
 		Type:       TypeLambda,
 		Params:     params,
+		RestParam:  restParam,
 		Body:       expr.Elements[2:],
 		ClosureEnv: env,
 	}, nil
@@ -337,6 +347,49 @@ func evalBegin(expr *Expr, env *Env) (*Value, error) {
 	for _, e := range expr.Elements[1:] {
 		var err error
 		result, err = Eval(e, env)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func callLambda(fn *Value, args []*Value, line, col int) (*Value, error) {
+	if fn.RestParam != "" {
+		if len(args) < len(fn.Params) {
+			return nil, fmt.Errorf("%d:%d: wrong number of arguments: expected at least %d, got %d", line, col, len(fn.Params), len(args))
+		}
+		callEnv := NewEnv(fn.ClosureEnv)
+		for i, param := range fn.Params {
+			callEnv.Set(param, args[i])
+		}
+		// Collect rest args into a list
+		rest := Null
+		for i := len(args) - 1; i >= len(fn.Params); i-- {
+			rest = PairValue(args[i], rest)
+		}
+		callEnv.Set(fn.RestParam, rest)
+		var result *Value
+		for _, bodyExpr := range fn.Body {
+			var err error
+			result, err = Eval(bodyExpr, callEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	}
+	if len(args) != len(fn.Params) {
+		return nil, fmt.Errorf("%d:%d: wrong number of arguments: expected %d, got %d", line, col, len(fn.Params), len(args))
+	}
+	callEnv := NewEnv(fn.ClosureEnv)
+	for i, param := range fn.Params {
+		callEnv.Set(param, args[i])
+	}
+	var result *Value
+	for _, bodyExpr := range fn.Body {
+		var err error
+		result, err = Eval(bodyExpr, callEnv)
 		if err != nil {
 			return nil, err
 		}
