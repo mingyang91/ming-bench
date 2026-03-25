@@ -46,6 +46,7 @@ object Evaluator:
             case SchemeVal.Symbol("begin")  => evalBegin(elems.tail, env)
             case SchemeVal.Symbol("let")    => evalLet(elems.tail, env)
             case SchemeVal.Symbol("cond")   => evalCond(elems.tail, env)
+            case SchemeVal.Symbol("set!")   => evalSet(elems.tail, env)
             case head =>
               val proc = eval(head, env)
               val args = elems.tail.map(a => eval(a, env))
@@ -162,6 +163,13 @@ object Evaluator:
                   else elems.tail.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, env))
                 else evalCond(rest, env)
           case _ => throw new EvalError("cond: bad clause")
+
+  private def evalSet(args: List[SchemeVal], env: Env): SchemeVal =
+    args match
+      case SchemeVal.Symbol(name) :: value :: Nil =>
+        env.set(name, eval(value, env))
+        SchemeVal.Void
+      case _ => throw new EvalError("set!: bad syntax")
 
   private def isTruthy(v: SchemeVal): Boolean = v match
     case SchemeVal.BoolVal(false) => false
