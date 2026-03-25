@@ -77,7 +77,28 @@ type evalState struct {
 var currentEvalState *evalState
 var currentWindStack []windEntry
 
+// contFrameStack tracks remaining body-sequence expressions for continuation capture.
+var contFrameStack []contFrame
+
+// nonBodyEvalDepth tracks whether call/cc is at body level.
+// 0 = body level, >0 = inside a subexpression.
+// evalExpr increments on entry and decrements on exit.
+// Body eval loops counteract by decrementing before and incrementing after evalExpr calls.
+var nonBodyEvalDepth int
+
+func pushContFrame(f contFrame) {
+	contFrameStack = append(contFrameStack, f)
+}
+
+func popContFrame() {
+	if len(contFrameStack) > 0 {
+		contFrameStack = contFrameStack[:len(contFrameStack)-1]
+	}
+}
+
 func evalExpr(expr Expr, env *Env) (Value, error) {
+	nonBodyEvalDepth++
+	defer func() { nonBodyEvalDepth-- }()
 	for {
 	switch e := expr.(type) {
 	case *NumberExpr:
@@ -159,12 +180,18 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 				if len(e.Elems) < 2 {
 					return &VoidVal{}, nil
 				}
-				for _, bodyExpr := range e.Elems[1 : len(e.Elems)-1] {
-					if _, err := evalExpr(bodyExpr, env); err != nil {
+				beginBody := e.Elems[1:]
+				for i, bodyExpr := range beginBody[:len(beginBody)-1] {
+					pushContFrame(contFrame{remainExprs: beginBody[i+1:], env: env})
+					nonBodyEvalDepth--
+					_, err := evalExpr(bodyExpr, env)
+					nonBodyEvalDepth++
+					popContFrame()
+					if err != nil {
 						return nil, err
 					}
 				}
-				expr = e.Elems[len(e.Elems)-1]
+				expr = beginBody[len(beginBody)-1]
 				continue
 			case "let":
 				if len(e.Elems) < 3 {
@@ -205,8 +232,13 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 						callEnv.set(p, nlInitVals[i])
 					}
 					nlBody := e.Elems[3:]
-					for _, bodyExpr := range nlBody[:len(nlBody)-1] {
-						if _, berr := evalExpr(bodyExpr, callEnv); berr != nil {
+					for i, bodyExpr := range nlBody[:len(nlBody)-1] {
+						pushContFrame(contFrame{remainExprs: nlBody[i+1:], env: callEnv})
+						nonBodyEvalDepth--
+						_, berr := evalExpr(bodyExpr, callEnv)
+						nonBodyEvalDepth++
+						popContFrame()
+						if berr != nil {
 							return nil, berr
 						}
 					}
@@ -240,8 +272,13 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 					state.bodyExprs = rlBody
 					state.bodyEnv = rlEnv
 				}
-				for _, bodyExpr := range rlBody[:len(rlBody)-1] {
-					if _, berr := evalExpr(bodyExpr, rlEnv); berr != nil {
+				for i, bodyExpr := range rlBody[:len(rlBody)-1] {
+					pushContFrame(contFrame{remainExprs: rlBody[i+1:], env: rlEnv})
+					nonBodyEvalDepth--
+					_, berr := evalExpr(bodyExpr, rlEnv)
+					nonBodyEvalDepth++
+					popContFrame()
+					if berr != nil {
 						return nil, berr
 					}
 				}
@@ -273,8 +310,13 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 					lsEnv.set(ps.Name, v)
 				}
 				lsBody := e.Elems[2:]
-				for _, bodyExpr := range lsBody[:len(lsBody)-1] {
-					if _, berr := evalExpr(bodyExpr, lsEnv); berr != nil {
+				for i, bodyExpr := range lsBody[:len(lsBody)-1] {
+					pushContFrame(contFrame{remainExprs: lsBody[i+1:], env: lsEnv})
+					nonBodyEvalDepth--
+					_, berr := evalExpr(bodyExpr, lsEnv)
+					nonBodyEvalDepth++
+					popContFrame()
+					if berr != nil {
 						return nil, berr
 					}
 				}
@@ -293,12 +335,18 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 							condHandled = true
 							break
 						}
-						for _, bodyExpr := range cl.Elems[1 : len(cl.Elems)-1] {
-							if _, cerr := evalExpr(bodyExpr, env); cerr != nil {
+						condBody := cl.Elems[1:]
+						for ci, bodyExpr := range condBody[:len(condBody)-1] {
+							pushContFrame(contFrame{remainExprs: condBody[ci+1:], env: env})
+							nonBodyEvalDepth--
+							_, cerr := evalExpr(bodyExpr, env)
+							nonBodyEvalDepth++
+							popContFrame()
+							if cerr != nil {
 								return nil, cerr
 							}
 						}
-						expr = cl.Elems[len(cl.Elems)-1]
+						expr = condBody[len(condBody)-1]
 						condHandled = true
 						break
 					}
@@ -310,8 +358,14 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 						if len(cl.Elems) == 1 {
 							return test, nil
 						}
-						for _, bodyExpr := range cl.Elems[1 : len(cl.Elems)-1] {
-							if _, cerr := evalExpr(bodyExpr, env); cerr != nil {
+						condBody2 := cl.Elems[1:]
+						for ci, bodyExpr := range condBody2[:len(condBody2)-1] {
+							pushContFrame(contFrame{remainExprs: condBody2[ci+1:], env: env})
+							nonBodyEvalDepth--
+							_, cerr := evalExpr(bodyExpr, env)
+							nonBodyEvalDepth++
+							popContFrame()
+							if cerr != nil {
 								return nil, cerr
 							}
 						}
@@ -416,12 +470,18 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case: bad clause", e.Line, e.Col)}
 					}
 					if csym, ok := cl.Elems[0].(*SymbolExpr); ok && csym.Name == "else" {
-						for _, bodyExpr := range cl.Elems[1 : len(cl.Elems)-1] {
-							if _, berr := evalExpr(bodyExpr, env); berr != nil {
+						caseElseBody := cl.Elems[1:]
+						for ci, bodyExpr := range caseElseBody[:len(caseElseBody)-1] {
+							pushContFrame(contFrame{remainExprs: caseElseBody[ci+1:], env: env})
+							nonBodyEvalDepth--
+							_, berr := evalExpr(bodyExpr, env)
+							nonBodyEvalDepth++
+							popContFrame()
+							if berr != nil {
 								return nil, berr
 							}
 						}
-						expr = cl.Elems[len(cl.Elems)-1]
+						expr = caseElseBody[len(caseElseBody)-1]
 						caseHandled = true
 						break
 					}
@@ -441,8 +501,14 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 						}
 					}
 					if caseMatched {
-						for _, bodyExpr := range cl.Elems[1 : len(cl.Elems)-1] {
-							if _, berr := evalExpr(bodyExpr, env); berr != nil {
+						caseMatchBody := cl.Elems[1:]
+						for ci, bodyExpr := range caseMatchBody[:len(caseMatchBody)-1] {
+							pushContFrame(contFrame{remainExprs: caseMatchBody[ci+1:], env: env})
+							nonBodyEvalDepth--
+							_, berr := evalExpr(bodyExpr, env)
+							nonBodyEvalDepth++
+							popContFrame()
+							if berr != nil {
 								return nil, berr
 							}
 						}
@@ -546,8 +612,13 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 			if cerr != nil {
 				return nil, cerr
 			}
-			for _, bodyExpr := range f.Body[:len(f.Body)-1] {
-				if _, berr := evalExpr(bodyExpr, callEnv); berr != nil {
+			for i, bodyExpr := range f.Body[:len(f.Body)-1] {
+				pushContFrame(contFrame{remainExprs: f.Body[i+1:], env: callEnv})
+				nonBodyEvalDepth--
+				_, berr := evalExpr(bodyExpr, callEnv)
+				nonBodyEvalDepth++
+				popContFrame()
+				if berr != nil {
 					return nil, berr
 				}
 			}
@@ -563,8 +634,13 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 			if cerr2 != nil {
 				return nil, cerr2
 			}
-			for _, bodyExpr := range clause.Body[:len(clause.Body)-1] {
-				if _, berr := evalExpr(bodyExpr, clEnv); berr != nil {
+			for i, bodyExpr := range clause.Body[:len(clause.Body)-1] {
+				pushContFrame(contFrame{remainExprs: clause.Body[i+1:], env: clEnv})
+				nonBodyEvalDepth--
+				_, berr := evalExpr(bodyExpr, clEnv)
+				nonBodyEvalDepth++
+				popContFrame()
+				if berr != nil {
 					return nil, berr
 				}
 			}
@@ -752,9 +828,17 @@ func applyLambda(f *LambdaVal, args []Value) (Value, error) {
 		callEnv.set(f.RestParam, rest)
 	}
 	var result Value
-	for _, bodyExpr := range f.Body {
+	for i, bodyExpr := range f.Body {
+		if i < len(f.Body)-1 {
+			pushContFrame(contFrame{remainExprs: f.Body[i+1:], env: callEnv})
+		}
+		nonBodyEvalDepth--
 		var err error
 		result, err = evalExpr(bodyExpr, callEnv)
+		nonBodyEvalDepth++
+		if i < len(f.Body)-1 {
+			popContFrame()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -851,8 +935,13 @@ func evalLetrecTail(e *ListExpr, env *Env, star bool) (Expr, *Env, error) {
 		}
 	}
 	body := e.Elems[2:]
-	for _, bodyExpr := range body[:len(body)-1] {
-		if _, err := evalExpr(bodyExpr, letEnv); err != nil {
+	for i, bodyExpr := range body[:len(body)-1] {
+		pushContFrame(contFrame{remainExprs: body[i+1:], env: letEnv})
+		nonBodyEvalDepth--
+		_, err := evalExpr(bodyExpr, letEnv)
+		nonBodyEvalDepth++
+		popContFrame()
+		if err != nil {
 			return nil, nil, err
 		}
 	}
@@ -3244,17 +3333,25 @@ func evalDynamicWind(e *ListExpr, env *Env) (Value, error) {
 	escaped := false
 	var escapePanic interface{}
 
+	// Save depth/stack state — panic unwinding corrupts them
+	savedDepthDW := nonBodyEvalDepth
+	savedStackLenDW := len(contFrameStack)
+
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
 				if _, ok := r.(contInvokePanic); ok {
 					escaped = true
 					escapePanic = r
+					nonBodyEvalDepth = savedDepthDW
+					contFrameStack = contFrameStack[:savedStackLenDW]
 					return
 				}
 				if _, ok := r.(raisePanic); ok {
 					escaped = true
 					escapePanic = r
+					nonBodyEvalDepth = savedDepthDW
+					contFrameStack = contFrameStack[:savedStackLenDW]
 					return
 				}
 				panic(r)
@@ -3299,23 +3396,35 @@ func evalGuard(e *ListExpr, env *Env) (Value, error) {
 	var bodyErr error
 	var raised *raisePanic
 
+	savedDepthG := nonBodyEvalDepth
+	savedStackLenG := len(contFrameStack)
+
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
 				if rp, ok := r.(raisePanic); ok {
 					raised = &rp
+					nonBodyEvalDepth = savedDepthG
+					contFrameStack = contFrameStack[:savedStackLenG]
 					return
 				}
 				panic(r)
 			}
 		}()
-		for _, bodyExpr := range body[:len(body)-1] {
-			if _, err := evalExpr(bodyExpr, env); err != nil {
+		for i, bodyExpr := range body[:len(body)-1] {
+			pushContFrame(contFrame{remainExprs: body[i+1:], env: env})
+			nonBodyEvalDepth--
+			_, err := evalExpr(bodyExpr, env)
+			nonBodyEvalDepth++
+			popContFrame()
+			if err != nil {
 				bodyErr = err
 				return
 			}
 		}
+		nonBodyEvalDepth--
 		result, bodyErr = evalExpr(body[len(body)-1], env)
+		nonBodyEvalDepth++
 	}()
 
 	if bodyErr != nil {
@@ -3385,11 +3494,16 @@ func evalWithExceptionHandler(e *ListExpr, env *Env) (Value, error) {
 	var thunkErr error
 	var raised *raisePanic
 
+	savedDepthWEH := nonBodyEvalDepth
+	savedStackLenWEH := len(contFrameStack)
+
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
 				if rp, ok := r.(raisePanic); ok {
 					raised = &rp
+					nonBodyEvalDepth = savedDepthWEH
+					contFrameStack = contFrameStack[:savedStackLenWEH]
 					return
 				}
 				panic(r)
@@ -3422,30 +3536,43 @@ func handleCallCC(f Value) (Value, error) {
 	}
 
 	// Capture continuation: save the top-level expressions from the current
-	// expression onward and the environment, plus any body context
+	// expression onward and the environment, plus any body context and frames
 	var cont *ContinuationVal
+	windsCopy := make([]windEntry, len(currentWindStack))
+	copy(windsCopy, currentWindStack)
+	// Capture continuation frames (body-sequence chain)
+	framesCopy := make([]contFrame, len(contFrameStack))
+	copy(framesCopy, contFrameStack)
+	// nonBodyEvalDepth == 0 means call/cc is at body level
+	isBodyLevel := nonBodyEvalDepth == 0
 	if state != nil {
 		topCopy := make([]Expr, len(state.topExprs)-state.curIdx)
 		copy(topCopy, state.topExprs[state.curIdx:])
-		windsCopy := make([]windEntry, len(currentWindStack))
-		copy(windsCopy, currentWindStack)
 		cont = &ContinuationVal{
 			topExprs:  topCopy,
 			topEnv:    state.topEnv,
 			bodyExprs: state.bodyExprs,
 			bodyEnv:   state.bodyEnv,
 			winds:     windsCopy,
+			frames:    framesCopy,
+			bodyLevel: isBodyLevel,
 		}
 	} else {
-		windsCopy := make([]windEntry, len(currentWindStack))
-		copy(windsCopy, currentWindStack)
-		cont = &ContinuationVal{winds: windsCopy}
+		cont = &ContinuationVal{
+			winds:     windsCopy,
+			frames:    framesCopy,
+			bodyLevel: isBodyLevel,
+		}
 	}
 
 	// Call f(cont) with panic/recover for escape continuations
 	var result Value
 	var err error
 	escaped := false
+
+	// Save depth/stack state before calling f — escape panics corrupt them
+	savedDepth := nonBodyEvalDepth
+	savedStackLen := len(contFrameStack)
 
 	func() {
 		defer func() {
@@ -3454,6 +3581,9 @@ func handleCallCC(f Value) (Value, error) {
 					// Escape: continuation invoked during f's execution
 					result = ci.value
 					escaped = true
+					// Restore depth/stack corrupted by panic unwinding
+					nonBodyEvalDepth = savedDepth
+					contFrameStack = contFrameStack[:savedStackLen]
 					return
 				}
 				panic(r) // re-panic for other continuations or real panics
@@ -3661,8 +3791,10 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	if len(exprs) == 0 {
 		return "", "", nil
 	}
-	// Reset wind stack for each top-level evaluation
+	// Reset global state for each top-level evaluation
 	currentWindStack = nil
+	contFrameStack = contFrameStack[:0]
+	nonBodyEvalDepth = 0
 	var buf strings.Builder
 	env := makeGlobalEnv(&buf)
 	last, evalErr := evalTopLevel(exprs, env)
@@ -3675,6 +3807,46 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	return last.String(), buf.String(), nil
 }
 
+// replayContinuationFrames evaluates the remaining computation captured in
+// continuation frames. Frames are stored outermost-first; we evaluate
+// innermost-first (reverse order).
+func replayContinuationFrames(value Value, frames []contFrame) (Value, error) {
+	savedDepth := nonBodyEvalDepth
+	nonBodyEvalDepth = 0
+	savedStack := contFrameStack
+
+	for fi := len(frames) - 1; fi >= 0; fi-- {
+		frame := frames[fi]
+		for ei, expr := range frame.remainExprs {
+			// Set up contFrameStack: remaining in this frame + outer frames
+			contFrameStack = contFrameStack[:0]
+			if ei+1 < len(frame.remainExprs) {
+				contFrameStack = append(contFrameStack, contFrame{
+					remainExprs: frame.remainExprs[ei+1:],
+					env:         frame.env,
+				})
+			}
+			if fi > 0 {
+				contFrameStack = append(contFrameStack, frames[:fi]...)
+			}
+
+			nonBodyEvalDepth--
+			var err error
+			value, err = evalExpr(expr, frame.env)
+			nonBodyEvalDepth++
+			if err != nil {
+				contFrameStack = savedStack
+				nonBodyEvalDepth = savedDepth
+				return nil, err
+			}
+		}
+	}
+
+	contFrameStack = savedStack
+	nonBodyEvalDepth = savedDepth
+	return value, nil
+}
+
 // evalTopLevel evaluates a sequence of top-level expressions, handling
 // continuation restarts when a saved continuation is invoked.
 func evalTopLevel(exprs []Expr, env *Env) (Value, error) {
@@ -3685,6 +3857,11 @@ func evalTopLevel(exprs []Expr, env *Env) (Value, error) {
 	prevState := currentEvalState
 	currentEvalState = state
 	defer func() { currentEvalState = prevState }()
+
+	// Track whether to use frame-based replay
+	var replayFrames []contFrame
+	var replayValue Value
+	useFrameReplay := false
 
 	for {
 		var last Value
@@ -3702,11 +3879,27 @@ func evalTopLevel(exprs []Expr, env *Env) (Value, error) {
 				}
 			}()
 
-			for i := 0; i < len(state.topExprs); i++ {
-				state.curIdx = i
-				last, evalErr = evalExpr(state.topExprs[i], state.topEnv)
-				if evalErr != nil {
-					return
+			if useFrameReplay {
+				last, evalErr = replayContinuationFrames(replayValue, replayFrames)
+				useFrameReplay = false
+			} else {
+				for i := 0; i < len(state.topExprs); i++ {
+					state.curIdx = i
+					if i < len(state.topExprs)-1 {
+						pushContFrame(contFrame{
+							remainExprs: state.topExprs[i+1:],
+							env:         state.topEnv,
+						})
+					}
+					nonBodyEvalDepth--
+					last, evalErr = evalExpr(state.topExprs[i], state.topEnv)
+					nonBodyEvalDepth++
+					if i < len(state.topExprs)-1 {
+						popContFrame()
+					}
+					if evalErr != nil {
+						return
+					}
 				}
 			}
 		}()
@@ -3715,20 +3908,27 @@ func evalTopLevel(exprs []Expr, env *Env) (Value, error) {
 			return nil, evalErr
 		}
 		if restart != nil {
-			// Reset wind stack — the re-evaluation of dynamic-wind forms
-			// will naturally rebuild it via in-thunk calls.
+			// Reset wind stack, cont frame stack, and depth counter
 			currentWindStack = nil
-			// A saved continuation was invoked. Set override and re-evaluate.
+			contFrameStack = contFrameStack[:0]
+			nonBodyEvalDepth = 0
+
+			// Check if the continuation has body-level frames for precise replay.
+			// Don't use frame replay if dynamic-wind is active (wind thunks need re-evaluation).
+			if restart.cont.bodyLevel && len(restart.cont.frames) > 0 && len(restart.cont.winds) == 0 {
+				replayFrames = restart.cont.frames
+				replayValue = restart.value
+				useFrameReplay = true
+				continue
+			}
+
+			// Fall back to existing topExprs/bodyExprs replay mechanism
 			val := restart.value
 			state.callccOverride = &val
 			if restart.cont.bodyExprs != nil {
-				// Continuation was captured inside a body sequence (e.g., let body).
-				// Restart from the body expressions in the captured environment
-				// to preserve mutated bindings.
 				state.topExprs = restart.cont.bodyExprs
 				state.topEnv = restart.cont.bodyEnv
 			} else {
-				// Restart from the top-level expressions.
 				state.topExprs = restart.cont.topExprs
 				state.topEnv = restart.cont.topEnv
 			}

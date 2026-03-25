@@ -83,6 +83,12 @@ type windEntry struct {
 	Out Value // out-thunk
 }
 
+// contFrame represents a saved body-sequence frame for continuation replay.
+type contFrame struct {
+	remainExprs []Expr // remaining body expressions after the current one
+	env         *Env   // environment for these expressions
+}
+
 // ContinuationVal is a captured continuation from call/cc.
 type ContinuationVal struct {
 	topExprs  []Expr // top-level expressions from the capturing expression onward
@@ -90,6 +96,8 @@ type ContinuationVal struct {
 	bodyExprs []Expr // if non-nil, restart from these body expressions instead
 	bodyEnv   *Env   // environment for bodyExprs
 	winds     []windEntry // dynamic-wind stack at capture time
+	frames    []contFrame // captured continuation frames (body-sequence chain)
+	bodyLevel bool        // true if call/cc was at body level (frames capture full continuation)
 }
 
 func (v *ContinuationVal) String() string {
