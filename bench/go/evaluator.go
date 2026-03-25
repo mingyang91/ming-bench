@@ -68,6 +68,12 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", e.Line, e.Col, e.Name)}
 		}
 		return v, nil
+	case *EnvRefExpr:
+		v, ok := e.Env.get(e.Name)
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", e.Line, e.Col, e.Name)}
+		}
+		return v, nil
 	case *ListExpr:
 		if len(e.Elems) == 0 {
 			return &NilVal{}, nil
@@ -121,6 +127,30 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 					return nil, err
 				}
 				return &BoolVal{Val: !isTruthy(v)}, nil
+			case "define-syntax":
+				return evalDefineSyntax(e, env)
+			}
+			// Check if symbol is bound to a macro
+			if v, ok := env.get(sym.Name); ok {
+				if macro, ok := v.(*SyntaxRulesVal); ok {
+					expanded, err := expandMacro(macro, e)
+					if err != nil {
+						return nil, err
+					}
+					return evalExpr(expanded, env)
+				}
+			}
+		}
+		// Check if first element is an EnvRefExpr pointing to a macro
+		if ref, ok := e.Elems[0].(*EnvRefExpr); ok {
+			if v, ok := ref.Env.get(ref.Name); ok {
+				if macro, ok := v.(*SyntaxRulesVal); ok {
+					expanded, err := expandMacro(macro, e)
+					if err != nil {
+						return nil, err
+					}
+					return evalExpr(expanded, env)
+				}
 			}
 		}
 
