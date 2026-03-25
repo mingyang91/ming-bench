@@ -303,6 +303,22 @@ fn env_set(env: &Env, name: String, val: Val) {
     env.borrow_mut().bindings.insert(name, val);
 }
 
+/// Mutate an existing binding in the environment chain. Returns false if not found.
+fn env_set_existing(env: &Env, name: &str, val: Val) -> bool {
+    let has_key = env.borrow().bindings.contains_key(name);
+    if has_key {
+        env.borrow_mut().bindings.insert(name.to_string(), val);
+        true
+    } else {
+        let parent = env.borrow().parent.clone();
+        if let Some(ref p) = parent {
+            env_set_existing(p, name, val)
+        } else {
+            false
+        }
+    }
+}
+
 /// Format a value using `display` semantics (no quotes on strings).
 fn display_val(v: &Val, f: &mut String) {
     match v {
@@ -544,6 +560,20 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                             result = eval(expr, &let_env, out)?;
                         }
                         return Ok(result);
+                    }
+                    "set!" => {
+                        if list.len() != 3 {
+                            return Err(err_at(span, EvalError::Parse("set!: bad syntax".into())));
+                        }
+                        let name = match &list[1].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(err_at(span, EvalError::Parse("set!: expected symbol".into()))),
+                        };
+                        let val = eval(&list[2], env, out)?;
+                        if !env_set_existing(env, &name, val) {
+                            return Err(err_at(span, EvalError::UnboundVariable(name)));
+                        }
+                        return Ok(Val::Void);
                     }
                     "begin" => {
                         let mut result = Val::Void;
