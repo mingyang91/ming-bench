@@ -146,6 +146,9 @@ public class Evaluator {
     private record DoAfterBodyK(List<String> varNames, Env doEnv, List<Object> steps, List<Object> testClause, List<Object> fullList, Kont k) implements Kont {}
     private record DoStepK(List<String> varNames, Env doEnv, List<Object> steps, int nextIdx, List<Object> newVals, List<Object> testClause, List<Object> fullList, Kont k) implements Kont {}
 
+    // --- call-with-values continuation ---
+    private record CallWithValuesK(Object consumer, Kont k) implements Kont {}
+
     // --- dynamic-wind continuation types ---
     private record DynWindAfterInK(Object inThunk, Object bodyThunk, Object outThunk, Kont k) implements Kont {}
     private record DynWindAfterBodyK(Object inThunk, Object outThunk, Kont k) implements Kont {}
@@ -248,6 +251,22 @@ public class Evaluator {
     private static final Object RAISE_PROC = new Object() {
         @Override public String toString() { return "#<procedure:raise>"; }
     };
+
+    // Sentinel for values procedure
+    private static final Object VALUES_PROC = new Object() {
+        @Override public String toString() { return "#<procedure:values>"; }
+    };
+
+    // Sentinel for call-with-values procedure
+    private static final Object CALL_WITH_VALUES_PROC = new Object() {
+        @Override public String toString() { return "#<procedure:call-with-values>"; }
+    };
+
+    // Multiple values wrapper
+    private static class MultipleValues {
+        final List<Object> values;
+        MultipleValues(List<Object> values) { this.values = values; }
+    }
 
     // Sentinel for empty list '()
     private static final Object NIL = new Object() {
@@ -369,7 +388,7 @@ public class Evaluator {
         globalEnv.define("string?", (BuiltinProc) args -> args.get(0) instanceof SchemeString);
         globalEnv.define("symbol?", (BuiltinProc) args -> args.get(0) instanceof String);
         globalEnv.define("char?", (BuiltinProc) args -> args.get(0) instanceof SchemeChar);
-        globalEnv.define("procedure?", (BuiltinProc) args -> args.get(0) instanceof Lambda || args.get(0) instanceof BuiltinProc || args.get(0) instanceof CaseLambda || args.get(0) instanceof SchemeContinuation || args.get(0) == CALLCC_PROC || args.get(0) == DYNAMIC_WIND_PROC);
+        globalEnv.define("procedure?", (BuiltinProc) args -> args.get(0) instanceof Lambda || args.get(0) instanceof BuiltinProc || args.get(0) instanceof CaseLambda || args.get(0) instanceof SchemeContinuation || args.get(0) == CALLCC_PROC || args.get(0) == DYNAMIC_WIND_PROC || args.get(0) == VALUES_PROC || args.get(0) == CALL_WITH_VALUES_PROC);
 
         // I/O
         globalEnv.define("display", (BuiltinProc) args -> {
@@ -925,6 +944,10 @@ public class Evaluator {
         // exception handling
         globalEnv.define("with-exception-handler", WITH_EXCEPTION_HANDLER_PROC);
         globalEnv.define("raise", RAISE_PROC);
+
+        // Multiple values
+        globalEnv.define("values", VALUES_PROC);
+        globalEnv.define("call-with-values", CALL_WITH_VALUES_PROC);
     }
 
     private Object appendTwo(Object a, Object b) {
@@ -1771,6 +1794,17 @@ public class Evaluator {
             return;
         }
 
+        if (k instanceof CallWithValuesK cwv) {
+            // Producer completed; pass its values to consumer
+            List<Object> vals;
+            if (value instanceof MultipleValues mv) {
+                vals = mv.values;
+            } else {
+                vals = List.of(value);
+            }
+            cekApplyProc(cwv.consumer, vals, cwv.k); return;
+        }
+
         if (k instanceof DynWindAfterInK dwi) {
             // in-thunk done; push wind entry, call body-thunk
             WindEntry entry = new WindEntry(dwi.inThunk, dwi.outThunk);
@@ -1854,6 +1888,22 @@ public class Evaluator {
             // Call in-thunk first, then DynWindAfterInK handles the rest
             cekK = new DynWindAfterInK(inThunk, bodyThunk, outThunk, k);
             cekApplyProc(inThunk, List.of(), cekK); return;
+        }
+        if (proc == VALUES_PROC) {
+            if (args.size() == 1) {
+                cekValue = args.get(0);
+            } else {
+                cekValue = new MultipleValues(args);
+            }
+            cekK = k;
+            return;
+        }
+        if (proc == CALL_WITH_VALUES_PROC) {
+            if (args.size() != 2) throw new EvalError("call-with-values requires 2 arguments");
+            Object producer = args.get(0);
+            Object consumer = args.get(1);
+            cekK = new CallWithValuesK(consumer, k);
+            cekApplyProc(producer, List.of(), cekK); return;
         }
         throw new EvalError("cannot apply: " + schemeToString(proc));
     }
