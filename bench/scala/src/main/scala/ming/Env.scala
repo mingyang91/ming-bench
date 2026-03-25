@@ -14,6 +14,9 @@ class Env(val parent: Option[Env] = None):
           case Some(p) => p.get(name)
           case None    => throw new EvalError(s"unbound variable: $name")
 
+  def lookup(name: String): Option[SchemeVal] =
+    bindings.get(name).orElse(parent.flatMap(_.lookup(name)))
+
   def define(name: String, value: SchemeVal): Unit =
     bindings(name) = value
 

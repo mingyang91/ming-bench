@@ -3,10 +3,6 @@ package ming
 /** Scheme interpreter entry point. */
 object Evaluator:
 
-  /** Thread-local output buffer for display/write/newline. */
-  private val outputBuffer: ThreadLocal[StringBuilder] =
-    ThreadLocal.withInitial(() => new StringBuilder())
-
   private def isTruthy(v: SchemeVal): Boolean = v match
     case SchemeVal.SBool(false) => false
     case _                      => true
@@ -27,15 +23,20 @@ object Evaluator:
             case SchemeVal.SSymbol("quote") :: args =>
               if args.length != 1 then throw new EvalError("quote: expected 1 argument")
               args.head
-            case SchemeVal.SSymbol("if") :: args     => evalIf(args, env)
-            case SchemeVal.SSymbol("define") :: args => evalDefine(args, env)
-            case SchemeVal.SSymbol("lambda") :: args => evalLambda(args, env)
-            case SchemeVal.SSymbol("and") :: args    => evalAnd(args, env)
-            case SchemeVal.SSymbol("or") :: args     => evalOr(args, env)
-            case SchemeVal.SSymbol("let") :: args    => evalLet(args, env)
-            case SchemeVal.SSymbol("set!") :: args   => evalSet(args, env)
-            case SchemeVal.SSymbol("begin") :: args  => evalBegin(args, env)
-            case SchemeVal.SSymbol("cond") :: args   => evalCond(args, env)
+            case SchemeVal.SSymbol("if") :: args            => evalIf(args, env)
+            case SchemeVal.SSymbol("define") :: args        => evalDefine(args, env)
+            case SchemeVal.SSymbol("lambda") :: args        => evalLambda(args, env)
+            case SchemeVal.SSymbol("and") :: args           => evalAnd(args, env)
+            case SchemeVal.SSymbol("or") :: args            => evalOr(args, env)
+            case SchemeVal.SSymbol("let") :: args           => evalLet(args, env)
+            case SchemeVal.SSymbol("set!") :: args          => evalSet(args, env)
+            case SchemeVal.SSymbol("begin") :: args         => evalBegin(args, env)
+            case SchemeVal.SSymbol("cond") :: args          => evalCond(args, env)
+            case SchemeVal.SSymbol("define-syntax") :: args => evalDefineSyntax(args, env)
+            case SchemeVal.SSymbol(name) :: args if env.lookup(name).exists(_.isInstanceOf[SchemeVal.SMacro]) =>
+              val macro_   = env.get(name).asInstanceOf[SchemeVal.SMacro]
+              val expanded = Macro.expand(macro_, SchemeVal.SList(elems))
+              eval(expanded, env)
             case head :: args =>
               val op         = eval(head, env)
               val evaledArgs = args.map(eval(_, env))
@@ -162,6 +163,20 @@ object Evaluator:
         SchemeVal.SVoid
       case _ => throw new EvalError("set!: bad syntax")
 
+  private def evalDefineSyntax(args: List[SchemeVal], env: Env): SchemeVal =
+    args match
+      case SchemeVal.SSymbol(name) :: SchemeVal.SList(
+            SchemeVal.SSymbol("syntax-rules") :: SchemeVal.SList(literals) :: clauses
+          ) :: Nil =>
+        val litNames = literals.collect { case SchemeVal.SSymbol(n) => n }.toSet
+        val parsedClauses = clauses.map {
+          case SchemeVal.SList(pattern :: template :: Nil) => (pattern, template)
+          case other => throw new EvalError(s"syntax-rules: bad clause ${other.display}")
+        }
+        env.define(name, SchemeVal.SMacro(litNames, parsedClauses, env))
+        SchemeVal.SVoid
+      case _ => throw new EvalError("define-syntax: bad syntax")
+
   private def evalBegin(args: List[SchemeVal], env: Env): SchemeVal =
     evalBody(args, env)
 
@@ -210,61 +225,8 @@ object Evaluator:
     args: List[SchemeVal]
   ): SchemeVal =
     name match
-      case "display" =>
-        if args.length != 1 then throw new EvalError("display: expected 1 argument")
-        outputBuffer.get().append(args.head.displayRepr)
-        SchemeVal.SVoid
-      case "write" =>
-        if args.length != 1 then throw new EvalError("write: expected 1 argument")
-        outputBuffer.get().append(args.head.display)
-        SchemeVal.SVoid
-      case "newline" =>
-        if args.nonEmpty then throw new EvalError("newline: expected 0 arguments")
-        outputBuffer.get().append("\n")
-        SchemeVal.SVoid
-      case "apply" =>
-        if args.length < 2 then throw new EvalError("apply: expected at least 2 arguments")
-        val proc = args.head
-        val lastArg = args.last match
-          case SchemeVal.SList(elems) => elems
-          case other =>
-            throw new EvalError(
-              s"apply: last argument must be a list, got ${other.display}"
-            )
-        val prefixArgs = args.slice(1, args.length - 1)
-        applyProc(proc, prefixArgs ++ lastArg)
-      case "map" =>
-        if args.length < 2 then throw new EvalError("map: expected at least 2 arguments")
-        val proc = args.head
-        val lists = args.tail.map {
-          case SchemeVal.SList(elems) => elems
-          case other =>
-            throw new EvalError(
-              s"map: expected list, got ${other.display}"
-            )
-        }
-        val len = lists.head.length
-        val result = (0 until len).map { i =>
-          val mapArgs = lists.map(_(i))
-          applyProc(proc, mapArgs)
-        }.toList
-        SchemeVal.SList(result)
-      case "for-each" =>
-        if args.length < 2 then throw new EvalError("for-each: expected at least 2 arguments")
-        val proc = args.head
-        val lists = args.tail.map {
-          case SchemeVal.SList(elems) => elems
-          case other =>
-            throw new EvalError(
-              s"for-each: expected list, got ${other.display}"
-            )
-        }
-        val len = lists.head.length
-        (0 until len).foreach { i =>
-          val feArgs = lists.map(_(i))
-          applyProc(proc, feArgs)
-        }
-        SchemeVal.SVoid
+      case "display" | "write" | "newline" | "apply" | "map" | "for-each" =>
+        HigherOrder(name, args, applyProc)
       case _ => Builtins.applyBuiltin(name, args)
 
   private def makeGlobalEnv(): Env =
@@ -283,7 +245,7 @@ object Evaluator:
   /** Evaluate Scheme expressions and return both the result string and any captured output.
     */
   def evalStrWithOutput(input: String): (String, String) =
-    val buf = outputBuffer.get()
+    val buf = HigherOrder.outputBuffer.get()
     buf.clear()
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw new EvalError("empty input")

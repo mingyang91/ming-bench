@@ -21,6 +21,12 @@ enum SchemeVal:
     closure: Env
   )
 
+  case SMacro(
+    literals: Set[String],
+    clauses: List[(SchemeVal, SchemeVal)],
+    defEnv: Env
+  )
+
   /** Write representation (with quotes for strings). */
   def display: String = this match
     case SInt(v)    => v.toString
@@ -43,6 +49,7 @@ enum SchemeVal:
       "(" + a.display + pairTail(d) + ")"
     case SVoid               => ""
     case SLambda(_, _, _, _) => "#<procedure>"
+    case SMacro(_, _, _)     => "#<macro>"
 
   /** Display representation (no quotes for strings). */
   def displayRepr: String = this match
