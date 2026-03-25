@@ -1,21 +1,19 @@
 package ming
 
-import scala.collection.mutable
-
 private[ming] object Builtins:
 
   val outputBuffer: ThreadLocal[StringBuilder] = new ThreadLocal[StringBuilder]
 
   def applyBuiltin(name: String, args: List[Expr]): Expr = name match
-    case "+"    => Expr.Num(args.map(asNum).sum)
+    case "+"    => applyAdd(args)
     case "-"    => applyMinus(args)
-    case "*"    => Expr.Num(args.map(asNum).product)
+    case "*"    => applyMul(args)
     case "/"    => applyDiv(args)
-    case "<"    => binaryCmp(name, args, _ < _)
-    case ">"    => binaryCmp(name, args, _ > _)
-    case "="    => binaryCmp(name, args, _ == _)
-    case "<="   => binaryCmp(name, args, _ <= _)
-    case ">="   => binaryCmp(name, args, _ >= _)
+    case "<"    => numCmp(name, args, _ < _)
+    case ">"    => numCmp(name, args, _ > _)
+    case "="    => numCmp(name, args, _ == _)
+    case "<="   => numCmp(name, args, _ <= _)
+    case ">="   => numCmp(name, args, _ >= _)
     case "not"  => unary(name, args)(e => Expr.Bool(isFalsy(e)))
     case "cons" => applyCons(args)
     case "car"  => unary(name, args)(carOf)
@@ -24,7 +22,7 @@ private[ming] object Builtins:
       unary(name, args)(e => Expr.Bool(e == Expr.Lst(Nil)))
     case "list"     => Expr.Lst(args)
     case "length"   => unary(name, args)(lengthOf)
-    case "number?"  => unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Num]))
+    case "number?"  => unary(name, args)(e => Expr.Bool(NumericUtils.isNumber(e)))
     case "string?"  => unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Str]))
     case "boolean?" => unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Bool]))
     case "pair?" =>
@@ -56,7 +54,12 @@ private[ming] object Builtins:
         "number->string" | "symbol->string" | "string->symbol" | "string-ref" | "char?" =>
       StringBuiltins.applyStringBuiltin(name, args)
     case "abs" =>
-      unary(name, args) { case Expr.Num(n) => Expr.Num(math.abs(n)); case _ => throw EvalError("abs: not a number") }
+      unary(name, args) {
+        case Expr.Num(n)         => Expr.Num(math.abs(n))
+        case Expr.Rational(n, d) => Expr.Rational(math.abs(n), d)
+        case Expr.Real(v)        => Expr.Real(math.abs(v))
+        case _                   => throw EvalError("abs: not a number")
+      }
     case "modulo"    => NumericListBuiltins.applyModulo(args)
     case "remainder" => NumericListBuiltins.applyRemainder(args)
     case "quotient"  => NumericListBuiltins.applyQuotient(args)
@@ -71,10 +74,11 @@ private[ming] object Builtins:
     case "assoc"     => NumericListBuiltins.applyAssoc(args)
     case "map"       => throw EvalError("map: should be handled by applyProc")
     case "eq?" =>
-      if args.length != 2 then throw EvalError("eq?: need exactly 2 arguments"); Expr.Bool(eqv(args(0), args(1)))
+      if args.length != 2 then throw EvalError("eq?: need exactly 2 arguments")
+      Expr.Bool(EqualityOps.eqv(args(0), args(1)))
     case "equal?" =>
-      if args.length != 2 then throw EvalError("equal?: need exactly 2 arguments");
-      Expr.Bool(schemeEqual(args(0), args(1)))
+      if args.length != 2 then throw EvalError("equal?: need exactly 2 arguments")
+      Expr.Bool(EqualityOps.schemeEqual(args(0), args(1)))
     case "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?" | "char<?" =>
       StringBuiltins.applyCharBuiltin(name, args)
     case "string=?"    => StringBuiltins.strCmp(name, args, _ == _)
@@ -90,20 +94,46 @@ private[ming] object Builtins:
         case Expr.Str(s) => Expr.Str(new String(s).toLowerCase.toCharArray);
         case _           => throw EvalError("string-downcase: not a string")
       }
+    case "exact?" | "inexact?" | "integer?" | "rational?" | "exact->inexact" | "inexact->exact" | "numerator" |
+        "denominator" =>
+      RationalBuiltins.applyRationalBuiltin(name, args)
     case "apply" => throw EvalError("apply: should be handled by applyProc")
     case _       => throw EvalError(s"unknown procedure: $name")
 
+  private def applyAdd(args: List[Expr]): Expr =
+    if args.isEmpty then return Expr.Num(0)
+    if args.exists(_.isInstanceOf[Expr.Real]) then Expr.Real(args.map(NumericUtils.toDouble).sum)
+    else args.map(toExact).reduceLeft(NumericUtils.addExact)
+
   private def applyMinus(args: List[Expr]): Expr =
     if args.isEmpty then throw EvalError("-: need at least 1 argument")
-    val nums = args.map(asNum)
-    if nums.length == 1 then Expr.Num(-nums.head)
-    else Expr.Num(nums.reduceLeft(_ - _))
+    if args.exists(_.isInstanceOf[Expr.Real]) then
+      val nums = args.map(NumericUtils.toDouble)
+      if nums.length == 1 then Expr.Real(-nums.head)
+      else Expr.Real(nums.reduceLeft(_ - _))
+    else
+      val exacts = args.map(toExact)
+      if exacts.length == 1 then NumericUtils.negateExact(exacts.head)
+      else exacts.reduceLeft(NumericUtils.subExact)
+
+  private def applyMul(args: List[Expr]): Expr =
+    if args.isEmpty then return Expr.Num(1)
+    if args.exists(_.isInstanceOf[Expr.Real]) then Expr.Real(args.map(NumericUtils.toDouble).product)
+    else args.map(toExact).reduceLeft(NumericUtils.mulExact)
 
   private def applyDiv(args: List[Expr]): Expr =
     if args.length < 2 then throw EvalError("/: need at least 2 arguments")
-    val nums = args.map(asNum)
-    if nums.tail.contains(0L) then throw EvalError("division by zero")
-    Expr.Num(nums.reduceLeft(_ / _))
+    if args.exists(_.isInstanceOf[Expr.Real]) then
+      val nums = args.map(NumericUtils.toDouble)
+      if nums.tail.contains(0.0) then throw EvalError("division by zero")
+      Expr.Real(nums.reduceLeft(_ / _))
+    else
+      val exacts = args.map(toExact)
+      exacts.reduceLeft(NumericUtils.divExact)
+
+  private def toExact(e: Expr): Expr = e match
+    case Expr.Num(_) | Expr.Rational(_, _) => e
+    case _                                 => throw EvalError(s"expected number, got ${display(e)}")
 
   private def applyCons(args: List[Expr]): Expr =
     if args.length != 2 then throw EvalError("cons: need exactly 2 arguments")
@@ -129,24 +159,31 @@ private[ming] object Builtins:
     if args.length != 1 then throw EvalError(s"$name: need exactly 1 argument")
     f(args.head)
 
-  private def binaryCmp(
+  private def numCmp(
     name: String,
     args: List[Expr],
-    op: (Long, Long) => Boolean
+    op: (Double, Double) => Boolean
   ): Expr =
     if args.length != 2 then throw EvalError(s"$name: need exactly 2 arguments")
-    Expr.Bool(op(asNum(args(0)), asNum(args(1))))
+    Expr.Bool(op(NumericUtils.toDouble(args(0)), NumericUtils.toDouble(args(1))))
 
   def asNum(e: Expr): Long = e match
     case Expr.Num(n) => n
-    case _           => throw EvalError(s"expected number, got ${display(e)}")
+    case _           => throw EvalError(s"expected integer, got ${display(e)}")
 
   def isFalsy(e: Expr): Boolean = e match
     case Expr.Bool(false) => true
     case _                => false
 
   def display(e: Expr): String = e match
-    case Expr.Num(n)             => n.toString
+    case Expr.Num(n)         => n.toString
+    case Expr.Rational(n, d) => s"$n/$d"
+    case Expr.Real(v) =>
+      if v == v.floor && !v.isInfinite && !v.isNaN then
+        val l = v.toLong
+        if l.toDouble == v then s"$l.0"
+        else v.toString
+      else v.toString
     case Expr.Bool(true)         => "#t"
     case Expr.Bool(false)        => "#f"
     case Expr.Str(s)             => "\"" + new String(s) + "\""
@@ -161,25 +198,9 @@ private[ming] object Builtins:
     case Expr.Str(s) => new String(s)
     case other       => display(other)
 
-  def eqv(a: Expr, b: Expr): Boolean = (a, b) match
-    case (Expr.Num(x), Expr.Num(y))     => x == y
-    case (Expr.Bool(x), Expr.Bool(y))   => x == y
-    case (Expr.Sym(x), Expr.Sym(y))     => x == y
-    case (Expr.Chr(x), Expr.Chr(y))     => x == y
-    case (Expr.Lst(Nil), Expr.Lst(Nil)) => true
-    case _                              => a eq b
+  def eqv(a: Expr, b: Expr): Boolean = EqualityOps.eqv(a, b)
 
-  def schemeEqual(a: Expr, b: Expr): Boolean = (a, b) match
-    case (Expr.Num(x), Expr.Num(y))   => x == y
-    case (Expr.Bool(x), Expr.Bool(y)) => x == y
-    case (Expr.Sym(x), Expr.Sym(y))   => x == y
-    case (Expr.Chr(x), Expr.Chr(y))   => x == y
-    case (Expr.Str(x), Expr.Str(y))   => java.util.Arrays.equals(x, y)
-    case (Expr.Lst(xs), Expr.Lst(ys)) =>
-      xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b))
-    case (Expr.Pair(a1, d1), Expr.Pair(a2, d2)) =>
-      schemeEqual(a1, a2) && schemeEqual(d1, d2)
-    case _ => false
+  def schemeEqual(a: Expr, b: Expr): Boolean = EqualityOps.schemeEqual(a, b)
 
   val builtinNames: List[String] = List(
     "+",
@@ -248,7 +269,15 @@ private[ming] object Builtins:
     "string<?",
     "string-ci=?",
     "string-upcase",
-    "string-downcase"
+    "string-downcase",
+    "exact?",
+    "inexact?",
+    "integer?",
+    "rational?",
+    "exact->inexact",
+    "inexact->exact",
+    "numerator",
+    "denominator"
   )
 
   def makeTopLevelEnv(): Env =

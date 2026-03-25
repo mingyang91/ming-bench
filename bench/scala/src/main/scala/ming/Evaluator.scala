@@ -7,8 +7,8 @@ object Evaluator:
   private def eval(expr: Expr, env: Env): Expr =
     try
       expr match
-        case Expr.Num(_) | Expr.Bool(_) | Expr.Str(_) | Expr.Chr(_) | Expr.Lambda(_, _, _, _) | Expr.Pair(_, _) |
-            Expr.Macro(_, _, _) =>
+        case Expr.Num(_) | Expr.Rational(_, _) | Expr.Real(_) | Expr.Bool(_) | Expr.Str(_) | Expr.Chr(_) |
+            Expr.Lambda(_, _, _, _) | Expr.Pair(_, _) | Expr.Macro(_, _, _) =>
           expr
         case Expr.Sym(name) => env.lookup(name)
         case Expr.Lst(Nil)  => throw EvalError("empty application")

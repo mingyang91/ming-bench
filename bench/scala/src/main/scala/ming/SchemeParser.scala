@@ -117,4 +117,20 @@ private[ming] class SchemeParser(input: String):
     if token.isEmpty then throw EvalError(s"unexpected character: ${peek}")
     token.toLongOption match
       case Some(n) => Expr.Num(n)
+      case None    =>
+        // Try rational n/d
+        val slashIdx = token.indexOf('/')
+        if slashIdx > 0 && slashIdx < token.length - 1 then
+          val numPart = token.substring(0, slashIdx)
+          val denPart = token.substring(slashIdx + 1)
+          (numPart.toLongOption, denPart.toLongOption) match
+            case (Some(n), Some(d)) =>
+              if d == 0 then throw EvalError("division by zero")
+              NumericUtils.makeRational(n, d)
+            case _ => tryReal(token)
+        else tryReal(token)
+
+  private def tryReal(token: String): Expr =
+    token.toDoubleOption match
+      case Some(d) => Expr.Real(d)
       case None    => Expr.Sym(token)

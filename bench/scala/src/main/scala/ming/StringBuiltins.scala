@@ -35,14 +35,19 @@ private[ming] object StringBuiltins:
     case "string->number" =>
       Builtins.unary(name, args) {
         case Expr.Str(s) =>
-          try Expr.Num(new String(s).toLong)
-          catch case _: NumberFormatException => Expr.Bool(false)
+          val str = new String(s)
+          str.toLongOption match
+            case Some(n) => Expr.Num(n)
+            case None =>
+              str.toDoubleOption match
+                case Some(d) => Expr.Real(d)
+                case None    => Expr.Bool(false)
         case other => throw EvalError(s"string->number: not a string: ${Builtins.display(other)}")
       }
     case "number->string" =>
-      Builtins.unary(name, args) {
-        case Expr.Num(n) => Expr.Str(n.toString.toCharArray)
-        case other       => throw EvalError(s"number->string: not a number: ${Builtins.display(other)}")
+      Builtins.unary(name, args) { e =>
+        if NumericUtils.isNumber(e) then Expr.Str(Builtins.display(e).toCharArray)
+        else throw EvalError(s"number->string: not a number: ${Builtins.display(e)}")
       }
     case "symbol->string" =>
       Builtins.unary(name, args) {

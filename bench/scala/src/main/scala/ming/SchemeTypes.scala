@@ -4,6 +4,8 @@ import scala.collection.mutable
 
 private[ming] enum Expr:
   case Num(value: Long)
+  case Rational(num: Long, den: Long)
+  case Real(value: Double)
   case Bool(value: Boolean)
   case Str(chars: Array[Char])
   case Chr(value: Char)
