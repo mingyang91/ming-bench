@@ -54,6 +54,10 @@ enum Val {
         rules: Vec<(Expr, Expr)>,
         def_env: Env,
     },
+    SyntaxTransformer {
+        transformer: Box<Val>, // Lambda
+        def_env: Env,
+    },
     Record {
         type_id: usize,
         type_name: String,
@@ -139,6 +143,7 @@ impl fmt::Display for Val {
             Val::Builtin(_) => write!(f, "#<procedure>"),
             Val::Void => write!(f, "#<void>"),
             Val::Macro { .. } => write!(f, "#<macro>"),
+            Val::SyntaxTransformer { .. } => write!(f, "#<macro>"),
             Val::Record { type_name, .. } => write!(f, "#<record:{type_name}>"),
             Val::Vector(v) => {
                 write!(f, "#(")?;
@@ -208,7 +213,11 @@ fn tokenize(input: &str) -> Vec<Token> {
             '\'' => { tokens.push(Token { text: "'".into(), span: Span::new(line, col) }); i += 1; col += 1; }
             '#' => {
                 let start_col = col;
-                if i + 1 < chars.len() && (chars[i + 1] == 't' || chars[i + 1] == 'f') {
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    tokens.push(Token { text: "#'".into(), span: Span::new(line, start_col) });
+                    i += 2;
+                    col += 2;
+                } else if i + 1 < chars.len() && (chars[i + 1] == 't' || chars[i + 1] == 'f') {
                     let tok: String = chars[i..i+2].iter().collect();
                     tokens.push(Token { text: tok, span: Span::new(line, start_col) });
                     i += 2;
@@ -276,6 +285,14 @@ fn parse(tokens: &[Token], pos: &mut usize) -> Result<Expr, EvalError> {
         let inner = parse(tokens, pos)?;
         return Ok(Expr { kind: ExprKind::List(vec![
             Expr { kind: ExprKind::Symbol("quote".into()), span },
+            inner,
+        ]), span });
+    }
+    if tok.text == "#'" {
+        *pos += 1;
+        let inner = parse(tokens, pos)?;
+        return Ok(Expr { kind: ExprKind::List(vec![
+            Expr { kind: ExprKind::Symbol("syntax".into()), span },
             inner,
         ]), span });
     }
@@ -579,7 +596,7 @@ fn gensym(base: &str) -> String {
 fn is_syntax_keyword(s: &str) -> bool {
     matches!(s, "if" | "let" | "let*" | "letrec" | "letrec*" | "begin" | "set!" | "define"
         | "define-syntax" | "define-record-type" | "lambda" | "quote" | "cond" | "and" | "or" | "else"
-        | "syntax-rules" | "case" | "do")
+        | "syntax-rules" | "syntax-case" | "syntax" | "with-syntax" | "case" | "do")
 }
 
 #[derive(Debug, Clone)]
@@ -783,6 +800,177 @@ fn expand_macro(
     }
 
     Err(err_at(span, EvalError::Parse("no matching syntax-rules pattern".into())))
+}
+
+// ── syntax-case support ──
+
+#[derive(Clone)]
+enum ScBinding {
+    One(Val),
+    Many(Vec<Val>),
+}
+
+struct SyntaxCtx {
+    pattern_vars: HashSet<String>,
+    ellipsis_vars: HashSet<String>,
+    def_env: Env,
+    bindings: HashMap<String, ScBinding>,
+}
+
+thread_local! {
+    static SYNTAX_CTX_STACK: RefCell<Vec<SyntaxCtx>> = RefCell::new(Vec::new());
+}
+
+/// Convert a Val to an Expr (inverse of quote_expr).
+fn val_to_expr(val: &Val, span: Span) -> Expr {
+    match val {
+        Val::Int(n) => Expr { kind: ExprKind::Int(*n), span },
+        Val::Bool(b) => Expr { kind: ExprKind::Bool(*b), span },
+        Val::Char(c) => Expr { kind: ExprKind::Char(*c), span },
+        Val::Str(s, _) => Expr { kind: ExprKind::Str(s.clone()), span },
+        Val::Symbol(s) => Expr { kind: ExprKind::Symbol(s.clone()), span },
+        Val::Nil => Expr { kind: ExprKind::List(vec![]), span },
+        Val::Pair(_) => {
+            let mut items = Vec::new();
+            let mut cur = val.clone();
+            loop {
+                match cur {
+                    Val::Pair(p) => {
+                        let pair = p.borrow();
+                        items.push(val_to_expr(&pair.0, span));
+                        cur = pair.1.clone();
+                    }
+                    Val::Nil => break,
+                    other => {
+                        // Improper list — just append remaining element
+                        items.push(val_to_expr(&other, span));
+                        break;
+                    }
+                }
+            }
+            Expr { kind: ExprKind::List(items), span }
+        }
+        _ => Expr { kind: ExprKind::Literal(val.clone()), span },
+    }
+}
+
+/// Pattern-match a Val against a syntax-case pattern.
+/// Returns true on success, populating bindings and ellipsis_vars.
+fn match_sc_pattern(
+    val: &Val,
+    pattern: &Expr,
+    literals: &[String],
+    bindings: &mut HashMap<String, ScBinding>,
+    ellipsis_vars: &mut HashSet<String>,
+) -> bool {
+    match &pattern.kind {
+        ExprKind::Symbol(s) if s == "_" => true,
+        ExprKind::Symbol(s) if literals.contains(s) => {
+            matches!(val, Val::Symbol(t) if t == s)
+        }
+        ExprKind::Symbol(s) => {
+            bindings.insert(s.clone(), ScBinding::One(val.clone()));
+            true
+        }
+        ExprKind::List(pat_elems) => {
+            // Convert val to a Vec<Val>
+            let val_elems = val_to_vec(val);
+
+            let has_ellipsis = pat_elems.len() >= 2
+                && matches!(&pat_elems[pat_elems.len()-1].kind, ExprKind::Symbol(s) if s == "...");
+
+            if has_ellipsis {
+                let fixed_count = pat_elems.len() - 2;
+                if val_elems.len() < fixed_count {
+                    return false;
+                }
+                for i in 0..fixed_count {
+                    if !match_sc_pattern(&val_elems[i], &pat_elems[i], literals, bindings, ellipsis_vars) {
+                        return false;
+                    }
+                }
+                // The element before ... is the ellipsis variable
+                match &pat_elems[pat_elems.len() - 2].kind {
+                    ExprKind::Symbol(s) if !literals.contains(s) => {
+                        let rest: Vec<Val> = val_elems[fixed_count..].to_vec();
+                        ellipsis_vars.insert(s.clone());
+                        bindings.insert(s.clone(), ScBinding::Many(rest));
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                if val_elems.len() != pat_elems.len() {
+                    return false;
+                }
+                for (p, v) in pat_elems.iter().zip(val_elems.iter()) {
+                    if !match_sc_pattern(v, p, literals, bindings, ellipsis_vars) {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+        ExprKind::Int(n) => matches!(val, Val::Int(m) if m == n),
+        ExprKind::Bool(b) => matches!(val, Val::Bool(v) if v == b),
+        _ => false,
+    }
+}
+
+/// Convert a Val proper list to Vec<Val>.
+fn val_to_vec(val: &Val) -> Vec<Val> {
+    let mut result = Vec::new();
+    let mut cur = val.clone();
+    loop {
+        match cur {
+            Val::Pair(p) => {
+                let pair = p.borrow();
+                result.push(pair.0.clone());
+                cur = pair.1.clone();
+            }
+            Val::Nil => break,
+            other => {
+                result.push(other);
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// Expand a syntax template in the current syntax-case context.
+/// Converts the syntax context bindings to MacroBindings and uses substitute_template.
+fn expand_syntax_template(
+    template: &Expr,
+    span: Span,
+) -> Result<Val, EvalError> {
+    SYNTAX_CTX_STACK.with(|stack| {
+        let stack = stack.borrow();
+        let ctx = stack.last()
+            .ok_or_else(|| EvalError::Parse("syntax: not inside syntax-case".into()))?;
+
+        // Convert ScBinding to MacroBinding
+        let mut macro_bindings = HashMap::new();
+        for (name, binding) in &ctx.bindings {
+            match binding {
+                ScBinding::One(v) => {
+                    macro_bindings.insert(name.clone(), MacroBinding::Single(val_to_expr(v, span)));
+                }
+                ScBinding::Many(vs) => {
+                    macro_bindings.insert(name.clone(), MacroBinding::Many(
+                        vs.iter().map(|v| val_to_expr(v, span)).collect()
+                    ));
+                }
+            }
+        }
+
+        // No free_to_literal/gensym — syntax-case relies on lexical scoping for hygiene.
+        let empty_lit = HashMap::new();
+        let empty_gen = HashMap::new();
+
+        let result_expr = substitute_template(template, &macro_bindings, &empty_lit, &empty_gen);
+        Ok(quote_expr(&result_expr))
+    })
 }
 
 // ── call/cc support ──
@@ -1116,36 +1304,45 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                         ExprKind::Symbol(s) => s.clone(),
                         _ => return Err(err_at(span, EvalError::Parse("define-syntax: expected name".into()))),
                     };
-                    let sr = match &list[2].kind {
-                        ExprKind::List(sr_list) => sr_list,
-                        _ => return Err(err_at(span, EvalError::Parse("define-syntax: expected syntax-rules".into()))),
-                    };
-                    if sr.is_empty() || !matches!(&sr[0].kind, ExprKind::Symbol(s) if s == "syntax-rules") {
-                        return Err(err_at(span, EvalError::Parse("define-syntax: expected syntax-rules".into())));
-                    }
-                    let literals = match &sr[1].kind {
-                        ExprKind::List(lits) => {
-                            let mut ls = Vec::new();
-                            for l in lits {
-                                match &l.kind {
-                                    ExprKind::Symbol(s) => ls.push(s.clone()),
-                                    _ => return Err(err_at(span, EvalError::Parse("define-syntax: bad literal".into()))),
+                    // Check if body is (syntax-rules ...) or an expression (lambda)
+                    let is_syntax_rules = matches!(&list[2].kind, ExprKind::List(sr) if !sr.is_empty() && matches!(&sr[0].kind, ExprKind::Symbol(s) if s == "syntax-rules"));
+                    if is_syntax_rules {
+                        let sr = match &list[2].kind {
+                            ExprKind::List(sr_list) => sr_list,
+                            _ => unreachable!(),
+                        };
+                        let literals = match &sr[1].kind {
+                            ExprKind::List(lits) => {
+                                let mut ls = Vec::new();
+                                for l in lits {
+                                    match &l.kind {
+                                        ExprKind::Symbol(s) => ls.push(s.clone()),
+                                        _ => return Err(err_at(span, EvalError::Parse("define-syntax: bad literal".into()))),
+                                    }
                                 }
+                                ls
                             }
-                            ls
-                        }
-                        _ => return Err(err_at(span, EvalError::Parse("define-syntax: expected literals list".into()))),
-                    };
-                    let mut rules = Vec::new();
-                    for rule in &sr[2..] {
-                        match &rule.kind {
-                            ExprKind::List(r) if r.len() == 2 => {
-                                rules.push((r[0].clone(), r[1].clone()));
+                            _ => return Err(err_at(span, EvalError::Parse("define-syntax: expected literals list".into()))),
+                        };
+                        let mut rules = Vec::new();
+                        for rule in &sr[2..] {
+                            match &rule.kind {
+                                ExprKind::List(r) if r.len() == 2 => {
+                                    rules.push((r[0].clone(), r[1].clone()));
+                                }
+                                _ => return Err(err_at(span, EvalError::Parse("define-syntax: bad rule".into()))),
                             }
-                            _ => return Err(err_at(span, EvalError::Parse("define-syntax: bad rule".into()))),
                         }
+                        env_set(env, name, Val::Macro { literals, rules, def_env: env.clone() });
+                    } else {
+                        // Evaluate as expression (should produce a lambda)
+                        let def_env = env.clone();
+                        let transformer = eval(&list[2], env, out)?;
+                        env_set(env, name, Val::SyntaxTransformer {
+                            transformer: Box::new(transformer),
+                            def_env,
+                        });
                     }
-                    env_set(env, name, Val::Macro { literals, rules, def_env: env.clone() });
                     return Ok(Val::Void);
                 }
                 if op == "define-record-type" {
@@ -1221,6 +1418,29 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                     *tco = Some((expanded, env.clone()));
                     return Ok(Val::Void);
                 }
+                // Check for syntax-case transformer expansion
+                if let Some(Val::SyntaxTransformer { transformer, def_env }) = env_get(env, op) {
+                    // Convert input form to a Val proper list
+                    let mut input_val = Val::Nil;
+                    for item in list.iter().rev() {
+                        input_val = make_pair(quote_expr(item), input_val);
+                    }
+                    // Push initial syntax context with def_env
+                    SYNTAX_CTX_STACK.with(|stack| {
+                        stack.borrow_mut().push(SyntaxCtx {
+                            pattern_vars: HashSet::new(),
+                            ellipsis_vars: HashSet::new(),
+                            def_env: def_env.clone(),
+                            bindings: HashMap::new(),
+                        });
+                    });
+                    let result = call_function(&transformer, vec![input_val], span, out);
+                    SYNTAX_CTX_STACK.with(|stack| stack.borrow_mut().pop());
+                    let result = result?;
+                    let result_expr = val_to_expr(&result, span);
+                    *tco = Some((result_expr, env.clone()));
+                    return Ok(Val::Void);
+                }
             }
             // Check for special forms
             if let ExprKind::Symbol(op) = &list[0].kind {
@@ -1273,6 +1493,191 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                         } else {
                             return Ok(Val::Void);
                         }
+                    }
+                    "syntax-case" => {
+                        // (syntax-case expr (literal ...) clause ...)
+                        if list.len() < 4 {
+                            return Err(err_at(span, EvalError::Parse("syntax-case: bad syntax".into())));
+                        }
+                        let input_val = eval(&list[1], env, out)?;
+                        let literals: Vec<String> = match &list[2].kind {
+                            ExprKind::List(lits) => {
+                                let mut ls = Vec::new();
+                                for l in lits {
+                                    match &l.kind {
+                                        ExprKind::Symbol(s) => ls.push(s.clone()),
+                                        _ => return Err(err_at(span, EvalError::Parse("syntax-case: bad literal".into()))),
+                                    }
+                                }
+                                ls
+                            }
+                            _ => return Err(err_at(span, EvalError::Parse("syntax-case: expected literals list".into()))),
+                        };
+
+                        for clause in &list[3..] {
+                            let clause_items = match &clause.kind {
+                                ExprKind::List(items) => items,
+                                _ => return Err(err_at(span, EvalError::Parse("syntax-case: bad clause".into()))),
+                            };
+                            if clause_items.len() < 2 || clause_items.len() > 3 {
+                                return Err(err_at(span, EvalError::Parse("syntax-case: clause needs 2 or 3 elements".into())));
+                            }
+
+                            let pattern = &clause_items[0];
+                            let (fender, body) = if clause_items.len() == 3 {
+                                (Some(&clause_items[1]), &clause_items[2])
+                            } else {
+                                (None, &clause_items[1])
+                            };
+
+                            let mut bindings = HashMap::new();
+                            let mut ellipsis_vars = HashSet::new();
+
+                            if match_sc_pattern(&input_val, pattern, &literals, &mut bindings, &mut ellipsis_vars) {
+                                // Get def_env from the enclosing syntax context
+                                let parent_def_env = SYNTAX_CTX_STACK.with(|stack| {
+                                    stack.borrow().last().map(|ctx| ctx.def_env.clone())
+                                }).unwrap_or_else(|| env.clone());
+
+                                let pattern_vars: HashSet<String> = bindings.keys().cloned().collect();
+
+                                // Merge with parent context's bindings and pattern_vars
+                                let (merged_bindings, merged_pvars, merged_evars) = SYNTAX_CTX_STACK.with(|stack| {
+                                    let stack = stack.borrow();
+                                    if let Some(parent) = stack.last() {
+                                        let mut mb = parent.bindings.clone();
+                                        mb.extend(bindings.clone());
+                                        let mut mp = parent.pattern_vars.clone();
+                                        mp.extend(pattern_vars.clone());
+                                        let mut me = parent.ellipsis_vars.clone();
+                                        me.extend(ellipsis_vars.clone());
+                                        (mb, mp, me)
+                                    } else {
+                                        (bindings.clone(), pattern_vars.clone(), ellipsis_vars.clone())
+                                    }
+                                });
+
+                                // Create child env with pattern vars bound
+                                let body_env = new_env(Some(env.clone()));
+                                for (name, binding) in &bindings {
+                                    match binding {
+                                        ScBinding::One(v) => env_set(&body_env, name.clone(), v.clone()),
+                                        ScBinding::Many(vs) => {
+                                            let mut list_val = Val::Nil;
+                                            for v in vs.iter().rev() {
+                                                list_val = make_pair(v.clone(), list_val);
+                                            }
+                                            env_set(&body_env, name.clone(), list_val);
+                                        }
+                                    }
+                                }
+
+                                // Check fender if present
+                                if let Some(fender_expr) = fender {
+                                    let fender_result = eval(fender_expr, &body_env, out)?;
+                                    if !is_truthy(&fender_result) {
+                                        continue;
+                                    }
+                                }
+
+                                // Push merged syntax context
+                                SYNTAX_CTX_STACK.with(|stack| {
+                                    stack.borrow_mut().push(SyntaxCtx {
+                                        pattern_vars: merged_pvars,
+                                        ellipsis_vars: merged_evars,
+                                        def_env: parent_def_env,
+                                        bindings: merged_bindings,
+                                    });
+                                });
+
+                                let result = eval(body, &body_env, out);
+                                SYNTAX_CTX_STACK.with(|stack| stack.borrow_mut().pop());
+                                return result;
+                            }
+                        }
+                        return Err(err_at(span, EvalError::Parse("syntax-case: no matching pattern".into())));
+                    }
+                    "syntax" => {
+                        // (syntax template) — expand template with current syntax-case bindings
+                        if list.len() != 2 {
+                            return Err(err_at(span, EvalError::Parse("syntax: need exactly 1 argument".into())));
+                        }
+                        return expand_syntax_template(&list[1], span);
+                    }
+                    "with-syntax" => {
+                        // (with-syntax ((pattern expr) ...) body ...)
+                        if list.len() < 3 {
+                            return Err(err_at(span, EvalError::Parse("with-syntax: bad syntax".into())));
+                        }
+                        let binding_list = match &list[1].kind {
+                            ExprKind::List(items) => items,
+                            _ => return Err(err_at(span, EvalError::Parse("with-syntax: expected binding list".into()))),
+                        };
+
+                        let mut new_bindings: HashMap<String, ScBinding> = HashMap::new();
+                        let mut new_pvars: HashSet<String> = HashSet::new();
+                        let mut new_evars: HashSet<String> = HashSet::new();
+
+                        for binding in binding_list {
+                            let items = match &binding.kind {
+                                ExprKind::List(items) if items.len() == 2 => items,
+                                _ => return Err(err_at(span, EvalError::Parse("with-syntax: bad binding".into()))),
+                            };
+                            let val = eval(&items[1], env, out)?;
+                            // Match pattern against val
+                            match &items[0].kind {
+                                ExprKind::Symbol(name) => {
+                                    new_pvars.insert(name.clone());
+                                    new_bindings.insert(name.clone(), ScBinding::One(val));
+                                }
+                                _ => return Err(err_at(span, EvalError::Parse("with-syntax: expected symbol pattern".into()))),
+                            }
+                        }
+
+                        // Get parent context info
+                        let parent_def_env = SYNTAX_CTX_STACK.with(|stack| {
+                            stack.borrow().last().map(|ctx| ctx.def_env.clone())
+                        }).unwrap_or_else(|| env.clone());
+
+                        let (merged_bindings, merged_pvars, merged_evars) = SYNTAX_CTX_STACK.with(|stack| {
+                            let stack = stack.borrow();
+                            if let Some(parent) = stack.last() {
+                                let mut mb = parent.bindings.clone();
+                                mb.extend(new_bindings);
+                                let mut mp = parent.pattern_vars.clone();
+                                mp.extend(new_pvars);
+                                let mut me = parent.ellipsis_vars.clone();
+                                me.extend(new_evars);
+                                (mb, mp, me)
+                            } else {
+                                (new_bindings, new_pvars, new_evars)
+                            }
+                        });
+
+                        // Push new context
+                        SYNTAX_CTX_STACK.with(|stack| {
+                            stack.borrow_mut().push(SyntaxCtx {
+                                pattern_vars: merged_pvars,
+                                ellipsis_vars: merged_evars,
+                                def_env: parent_def_env,
+                                bindings: merged_bindings,
+                            });
+                        });
+
+                        // Evaluate body
+                        let body_env = new_env(Some(env.clone()));
+                        let body = &list[2..];
+                        let result = if body.is_empty() {
+                            Ok(Val::Void)
+                        } else {
+                            for expr in &body[..body.len()-1] {
+                                eval(expr, &body_env, out)?;
+                            }
+                            eval(&body[body.len()-1], &body_env, out)
+                        };
+
+                        SYNTAX_CTX_STACK.with(|stack| stack.borrow_mut().pop());
+                        return result;
                     }
                     "quote" => {
                         if list.len() != 2 {
@@ -2194,7 +2599,8 @@ fn is_builtin(op: &str) -> bool {
         | "display" | "write" | "newline"
         | "call/cc" | "call-with-current-continuation"
         | "dynamic-wind"
-        | "values" | "call-with-values")
+        | "values" | "call-with-values"
+        | "syntax->datum" | "datum->syntax")
 }
 
 /// Parse a parameter list that may contain dot notation for rest params.
@@ -3521,6 +3927,15 @@ fn apply_builtin(op: &str, args: &[Val]) -> Result<Val, EvalError> {
                     _ => return Err(EvalError::Type("assq: expected list".into())),
                 }
             }
+        }
+        "syntax->datum" => {
+            if args.len() != 1 { return Err(EvalError::Arity("syntax->datum: need 1 argument".into())); }
+            Ok(args[0].clone())
+        }
+        "datum->syntax" => {
+            if args.len() != 2 { return Err(EvalError::Arity("datum->syntax: need 2 arguments".into())); }
+            // Return the datum as-is (simplified: ignore context)
+            Ok(args[1].clone())
         }
         _ => Err(EvalError::UnboundVariable(op.into())),
     }
