@@ -34,6 +34,11 @@ enum SchemeVal:
     fields: Map[String, SchemeVal]
   )
 
+  case SCaseLambda(
+    clauses: List[(List[String], Option[String], List[SchemeVal])],
+    closure: Env
+  )
+
   /** Write representation (with quotes for strings). */
   def display: String = this match
     case SInt(v) => v.toString
@@ -61,6 +66,7 @@ enum SchemeVal:
       "(" + a.display + pairTail(d) + ")"
     case SVoid               => ""
     case SLambda(_, _, _, _) => "#<procedure>"
+    case SCaseLambda(_, _)   => "#<procedure>"
     case SMacro(_, _, _)     => "#<macro>"
     case SRecord(tn, _)      => s"#<record:$tn>"
 

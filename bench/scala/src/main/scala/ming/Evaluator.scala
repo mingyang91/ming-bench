@@ -33,6 +33,7 @@ object Evaluator:
             case SchemeVal.SSymbol("begin") :: args              => evalBegin(args, env)
             case SchemeVal.SSymbol("cond") :: args               => evalCond(args, env)
             case SchemeVal.SSymbol("define-syntax") :: args      => evalDefineSyntax(args, env)
+            case SchemeVal.SSymbol("case-lambda") :: args        => evalCaseLambda(args, env)
             case SchemeVal.SSymbol("define-record-type") :: args => RecordOps.evalDefineRecordType(args, env)
             case SchemeVal.SSymbol(name) :: args if env.lookup(name).exists(_.isInstanceOf[SchemeVal.SMacro]) =>
               val macro_   = env.get(name).asInstanceOf[SchemeVal.SMacro]
@@ -196,6 +197,19 @@ object Evaluator:
             else evalCond(rest, env)
           case _ => throw new EvalError("cond: bad clause")
 
+  private def evalCaseLambda(args: List[SchemeVal], env: Env): SchemeVal =
+    val clauses = args.map {
+      case SchemeVal.SList(SchemeVal.SList(params) :: body) if body.nonEmpty =>
+        val (paramNames, restParam) = parseParams(params)
+        (paramNames, restParam, body)
+      case SchemeVal.SList(SchemeVal.SSymbol(rest) :: body) if body.nonEmpty =>
+        (Nil, Some(rest), body)
+      case SchemeVal.SList(SchemeVal.SList(Nil) :: body) if body.nonEmpty =>
+        (Nil, None, body)
+      case _ => throw new EvalError("case-lambda: bad clause")
+    }
+    SchemeVal.SCaseLambda(clauses, env)
+
   private def applyProc(op: SchemeVal, args: List[SchemeVal]): SchemeVal =
     op match
       case SchemeVal.SLambda(params, restParam, body, closure) =>
@@ -217,6 +231,20 @@ object Evaluator:
             params.zip(args).foreach((p, a) => callEnv.define(p, a))
             callEnv.define(rest, SchemeVal.SList(args.drop(params.length)))
             evalBody(body, callEnv)
+      case SchemeVal.SCaseLambda(clauses, closure) =>
+        val matching = clauses.find { case (params, restParam, _) =>
+          restParam match
+            case None    => args.length == params.length
+            case Some(_) => args.length >= params.length
+        }
+        matching match
+          case Some((params, restParam, body)) =>
+            val callEnv = Env(Some(closure))
+            params.zip(args).foreach((p, a) => callEnv.define(p, a))
+            restParam.foreach(rest => callEnv.define(rest, SchemeVal.SList(args.drop(params.length))))
+            evalBody(body, callEnv)
+          case None =>
+            throw new EvalError(s"no matching clause for ${args.length} arguments")
       case SchemeVal.SSymbol(name)
           if name.startsWith("__record-ctor__:") ||
             name.startsWith("__record-pred__:") ||

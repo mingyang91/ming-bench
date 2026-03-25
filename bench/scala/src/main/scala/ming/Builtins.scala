@@ -81,7 +81,9 @@ object Builtins:
     "numerator",
     "denominator",
     "integer?",
-    "rational?"
+    "rational?",
+    // L13
+    "procedure?"
   )
 
   private def isTruthy(v: SchemeVal): Boolean = v match
@@ -141,6 +143,14 @@ object Builtins:
         ListOps(name, args)
       case "string?" | "number?" | "boolean?" | "symbol?" | "char?" | "integer?" | "rational?" =>
         NumericOps.applyTypePredicate(name, args)
+      case "procedure?" =>
+        if args.length != 1 then throw new EvalError("procedure?: expected 1 argument")
+        val isProcedure = args.head match
+          case _: SchemeVal.SLambda     => true
+          case _: SchemeVal.SCaseLambda => true
+          case SchemeVal.SSymbol(n)     => names.contains(n) || n.startsWith("__record-")
+          case _                        => false
+        SchemeVal.SBool(isProcedure)
       case "zero?" | "positive?" | "negative?" | "odd?" | "even?" =>
         NumericOps.applyNumericPredicate(name, args)
       case "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?" | "char<?" =>
