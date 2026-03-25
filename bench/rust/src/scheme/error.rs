@@ -45,6 +45,24 @@ pub enum EvalError {
 
     #[error("division by zero")]
     DivisionByZero,
+
+    #[error("expected non-negative integer for {kind}, got {value}")]
+    NegativeIndex { kind: &'static str, value: i64 },
+
+    #[error("index out of bounds for {kind}: index {index}, length {length}")]
+    IndexOutOfBounds {
+        kind: &'static str,
+        index: usize,
+        length: usize,
+    },
+
+    #[error("invalid range for {kind}: start {start}, end {end}, length {length}")]
+    InvalidRange {
+        kind: &'static str,
+        start: usize,
+        end: usize,
+        length: usize,
+    },
 }
 
 impl EvalError {

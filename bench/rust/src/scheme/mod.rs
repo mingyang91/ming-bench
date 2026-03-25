@@ -20,11 +20,18 @@ enum Value {
     Integer(i64),
     Boolean(bool),
     String(String),
+    Char(char),
     Symbol(String),
     EmptyList,
     Pair(Box<Value>, Box<Value>),
     Procedure(Rc<Procedure>),
     Void,
+}
+
+#[derive(Clone, Copy)]
+enum RenderMode {
+    Write,
+    Display,
 }
 
 impl Value {
@@ -37,6 +44,7 @@ impl Value {
             Self::Integer(_) => "number",
             Self::Boolean(_) => "boolean",
             Self::String(_) => "string",
+            Self::Char(_) => "char",
             Self::Symbol(_) => "symbol",
             Self::EmptyList | Self::Pair(_, _) => "pair",
             Self::Procedure(_) => "procedure",
@@ -45,21 +53,36 @@ impl Value {
     }
 
     fn render(&self) -> String {
+        self.render_with_mode(RenderMode::Write)
+    }
+
+    fn render_for_display(&self) -> String {
+        self.render_with_mode(RenderMode::Display)
+    }
+
+    fn render_with_mode(&self, mode: RenderMode) -> String {
         match self {
             Self::Integer(value) => value.to_string(),
             Self::Boolean(true) => "#t".to_string(),
             Self::Boolean(false) => "#f".to_string(),
-            Self::String(value) => render_string(value),
+            Self::String(value) => match mode {
+                RenderMode::Write => render_string(value),
+                RenderMode::Display => value.clone(),
+            },
+            Self::Char(value) => match mode {
+                RenderMode::Write => render_char(*value),
+                RenderMode::Display => value.to_string(),
+            },
             Self::Symbol(value) => value.clone(),
             Self::EmptyList => "()".to_string(),
-            Self::Pair(_, _) => render_pair(self),
+            Self::Pair(_, _) => render_pair(self, mode),
             Self::Procedure(_) => "#<procedure>".to_string(),
             Self::Void => "#<void>".to_string(),
         }
     }
 }
 
-fn render_pair(value: &Value) -> String {
+fn render_pair(value: &Value, mode: RenderMode) -> String {
     let mut out = String::from("(");
     let mut cursor = value;
 
@@ -68,7 +91,7 @@ fn render_pair(value: &Value) -> String {
             break;
         };
 
-        out.push_str(&car.render());
+        out.push_str(&car.render_with_mode(mode));
 
         match cdr.as_ref() {
             Value::EmptyList => break,
@@ -78,7 +101,7 @@ fn render_pair(value: &Value) -> String {
             }
             other => {
                 out.push_str(" . ");
-                out.push_str(&other.render());
+                out.push_str(&other.render_with_mode(mode));
                 break;
             }
         }
@@ -107,8 +130,41 @@ fn render_string(value: &str) -> String {
     out
 }
 
+fn render_char(value: char) -> String {
+    match value {
+        ' ' => "#\\space".to_string(),
+        '\n' => "#\\newline".to_string(),
+        other => format!("#\\{other}"),
+    }
+}
+
+#[derive(Default)]
+struct EvalContext {
+    output: String,
+    capture_output: bool,
+}
+
+impl EvalContext {
+    fn new(capture_output: bool) -> Self {
+        Self {
+            output: String::new(),
+            capture_output,
+        }
+    }
+
+    fn emit(&mut self, text: &str) {
+        if self.capture_output {
+            self.output.push_str(text);
+        }
+    }
+
+    fn finish(self) -> String {
+        self.output
+    }
+}
+
 type EnvRef = Rc<RefCell<Env>>;
-type BuiltinFn = fn(&[Value]) -> Result<Value, EvalError>;
+type BuiltinFn = fn(&[Value], &mut EvalContext) -> Result<Value, EvalError>;
 
 struct Env {
     parent: Option<EnvRef>,
@@ -355,6 +411,18 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "boolean?", builtin_boolean_predicate);
     define_builtin(&env, "pair?", builtin_pair_predicate);
     define_builtin(&env, "symbol?", builtin_symbol_predicate);
+    define_builtin(&env, "display", builtin_display);
+    define_builtin(&env, "write", builtin_write);
+    define_builtin(&env, "newline", builtin_newline);
+    define_builtin(&env, "string-append", builtin_string_append);
+    define_builtin(&env, "string-length", builtin_string_length);
+    define_builtin(&env, "substring", builtin_substring);
+    define_builtin(&env, "string->number", builtin_string_to_number);
+    define_builtin(&env, "number->string", builtin_number_to_string);
+    define_builtin(&env, "symbol->string", builtin_symbol_to_string);
+    define_builtin(&env, "string->symbol", builtin_string_to_symbol);
+    define_builtin(&env, "string-ref", builtin_string_ref);
+    define_builtin(&env, "char?", builtin_char_predicate);
 
     env
 }
@@ -385,32 +453,32 @@ fn lookup(env: &EnvRef, name: &str) -> Result<Value, EvalError> {
     })
 }
 
-fn eval_program(exprs: &[Expr]) -> Result<Value, EvalError> {
+fn eval_program(exprs: &[Expr], ctx: &mut EvalContext) -> Result<Value, EvalError> {
     let env = default_env();
-    eval_sequence(exprs, env)
+    eval_sequence(exprs, env, ctx)
 }
 
-fn eval_sequence(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_sequence(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     let mut last = Value::Void;
 
     for expr in exprs {
-        last = eval_expr(expr, env.clone())?;
+        last = eval_expr(expr, env.clone(), ctx)?;
     }
 
     Ok(last)
 }
 
-fn eval_expr(expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
+fn eval_expr(expr: &Expr, env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     match expr {
         Expr::Integer(value) => Ok(Value::Integer(*value)),
         Expr::Boolean(value) => Ok(Value::Boolean(*value)),
         Expr::String(value) => Ok(Value::String(value.clone())),
         Expr::Symbol(name) => lookup(&env, name),
-        Expr::List(items) => eval_list(items, env),
+        Expr::List(items) => eval_list(items, env, ctx),
     }
 }
 
-fn eval_list(items: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_list(items: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     if items.is_empty() {
         return Err(EvalError::SyntaxError {
             message: "cannot evaluate an empty list".to_string(),
@@ -421,28 +489,28 @@ fn eval_list(items: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
         let args = &items[1..];
 
         match operator.as_str() {
-            "and" => return eval_and(args, env),
-            "or" => return eval_or(args, env),
-            "if" => return eval_if(args, env),
-            "begin" => return eval_begin(args, env),
-            "cond" => return eval_cond(args, env),
+            "and" => return eval_and(args, env, ctx),
+            "or" => return eval_or(args, env, ctx),
+            "if" => return eval_if(args, env, ctx),
+            "begin" => return eval_begin(args, env, ctx),
+            "cond" => return eval_cond(args, env, ctx),
             "quote" => return eval_quote(args),
-            "define" => return eval_define(args, env),
+            "define" => return eval_define(args, env, ctx),
             "lambda" => return eval_lambda(args, env),
-            "let" => return eval_let(args, env),
+            "let" => return eval_let(args, env, ctx),
             _ => {}
         }
     }
 
-    let operator = eval_expr(&items[0], env.clone())?;
-    apply(operator, &items[1..], env)
+    let operator = eval_expr(&items[0], env.clone(), ctx)?;
+    apply(operator, &items[1..], env, ctx)
 }
 
-fn eval_and(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_and(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     let mut last = Value::Boolean(true);
 
     for expr in args {
-        let value = eval_expr(expr, env.clone())?;
+        let value = eval_expr(expr, env.clone(), ctx)?;
         if !value.is_truthy() {
             return Ok(value);
         }
@@ -452,9 +520,9 @@ fn eval_and(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     Ok(last)
 }
 
-fn eval_or(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_or(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     for expr in args {
-        let value = eval_expr(expr, env.clone())?;
+        let value = eval_expr(expr, env.clone(), ctx)?;
         if value.is_truthy() {
             return Ok(value);
         }
@@ -463,22 +531,22 @@ fn eval_or(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     Ok(Value::Boolean(false))
 }
 
-fn eval_if(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_if(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     expect_expr_arity("if", args, 3)?;
 
-    let condition = eval_expr(&args[0], env.clone())?;
+    let condition = eval_expr(&args[0], env.clone(), ctx)?;
     if condition.is_truthy() {
-        eval_expr(&args[1], env)
+        eval_expr(&args[1], env, ctx)
     } else {
-        eval_expr(&args[2], env)
+        eval_expr(&args[2], env, ctx)
     }
 }
 
-fn eval_begin(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
-    eval_sequence(args, env)
+fn eval_begin(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    eval_sequence(args, env, ctx)
 }
 
-fn eval_cond(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_cond(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     for (index, clause) in args.iter().enumerate() {
         let Expr::List(items) = clause else {
             return Err(EvalError::SyntaxError {
@@ -502,16 +570,16 @@ fn eval_cond(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
                 if items.len() == 1 {
                     return Ok(Value::Void);
                 }
-                return eval_sequence(&items[1..], env);
+                return eval_sequence(&items[1..], env, ctx);
             }
         }
 
-        let test_value = eval_expr(&items[0], env.clone())?;
+        let test_value = eval_expr(&items[0], env.clone(), ctx)?;
         if test_value.is_truthy() {
             if items.len() == 1 {
                 return Ok(test_value);
             }
-            return eval_sequence(&items[1..], env);
+            return eval_sequence(&items[1..], env, ctx);
         }
     }
 
@@ -535,7 +603,7 @@ fn quote_expr(expr: &Expr) -> Value {
     }
 }
 
-fn eval_define(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_define(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::SyntaxError {
             message: "define requires a binding target".to_string(),
@@ -545,7 +613,7 @@ fn eval_define(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     match &args[0] {
         Expr::Symbol(name) => {
             expect_expr_arity("define", args, 2)?;
-            let value = eval_expr(&args[1], env.clone())?;
+            let value = eval_expr(&args[1], env.clone(), ctx)?;
             env.borrow_mut().bindings.insert(name.clone(), value);
             Ok(Value::Void)
         }
@@ -595,7 +663,7 @@ fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     ))
 }
 
-fn eval_let(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_let(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::SyntaxError {
             message: "let requires bindings".to_string(),
@@ -603,12 +671,17 @@ fn eval_let(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     }
 
     match &args[0] {
-        Expr::Symbol(name) => eval_named_let(name, &args[1..], env),
-        bindings => eval_let_bindings(bindings, &args[1..], env),
+        Expr::Symbol(name) => eval_named_let(name, &args[1..], env, ctx),
+        bindings => eval_let_bindings(bindings, &args[1..], env, ctx),
     }
 }
 
-fn eval_named_let(name: &str, args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_named_let(
+    name: &str,
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::SyntaxError {
             message: "named let requires bindings and a body".to_string(),
@@ -616,7 +689,7 @@ fn eval_named_let(name: &str, args: &[Expr], env: EnvRef) -> Result<Value, EvalE
     }
 
     let bindings = parse_let_bindings(&args[0])?;
-    let values = eval_let_values(&bindings, env.clone())?;
+    let values = eval_let_values(&bindings, env.clone(), ctx)?;
     let params = bindings.iter().map(|(param, _)| param.clone()).collect();
     let named_env = Env::child(env);
     let lambda = make_lambda(
@@ -629,10 +702,15 @@ fn eval_named_let(name: &str, args: &[Expr], env: EnvRef) -> Result<Value, EvalE
         .borrow_mut()
         .bindings
         .insert(name.to_string(), lambda.clone());
-    apply_evaluated(lambda, values)
+    apply_evaluated(lambda, values, ctx)
 }
 
-fn eval_let_bindings(bindings_expr: &Expr, body: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_let_bindings(
+    bindings_expr: &Expr,
+    body: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
     if body.is_empty() {
         return Err(EvalError::SyntaxError {
             message: "let requires a body".to_string(),
@@ -640,7 +718,7 @@ fn eval_let_bindings(bindings_expr: &Expr, body: &[Expr], env: EnvRef) -> Result
     }
 
     let bindings = parse_let_bindings(bindings_expr)?;
-    let values = eval_let_values(&bindings, env.clone())?;
+    let values = eval_let_values(&bindings, env.clone(), ctx)?;
     let let_env = Env::child(env);
     {
         let mut scope = let_env.borrow_mut();
@@ -648,7 +726,7 @@ fn eval_let_bindings(bindings_expr: &Expr, body: &[Expr], env: EnvRef) -> Result
             scope.bindings.insert(name, value);
         }
     }
-    eval_sequence(body, let_env)
+    eval_sequence(body, let_env, ctx)
 }
 
 fn parse_let_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
@@ -684,10 +762,14 @@ fn parse_let_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
     Ok(parsed)
 }
 
-fn eval_let_values(bindings: &[(String, Expr)], env: EnvRef) -> Result<Vec<Value>, EvalError> {
+fn eval_let_values(
+    bindings: &[(String, Expr)],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<Vec<Value>, EvalError> {
     let mut values = Vec::with_capacity(bindings.len());
     for (_, expr) in bindings {
-        values.push(eval_expr(expr, env.clone())?);
+        values.push(eval_expr(expr, env.clone(), ctx)?);
     }
     Ok(values)
 }
@@ -726,42 +808,63 @@ fn make_lambda(name: String, params: Vec<String>, body: Vec<Expr>, env: EnvRef) 
     })))
 }
 
-fn apply(operator: Value, arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn apply(
+    operator: Value,
+    arg_exprs: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
     let Value::Procedure(procedure) = operator else {
         return Err(EvalError::NotAProcedure);
     };
 
-    let args = eval_args(arg_exprs, env)?;
+    let args = eval_args(arg_exprs, env, ctx)?;
 
-    apply_procedure(procedure, args)
+    apply_procedure(procedure, args, ctx)
 }
 
-fn apply_evaluated(operator: Value, args: Vec<Value>) -> Result<Value, EvalError> {
+fn apply_evaluated(
+    operator: Value,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
     let Value::Procedure(procedure) = operator else {
         return Err(EvalError::NotAProcedure);
     };
 
-    apply_procedure(procedure, args)
+    apply_procedure(procedure, args, ctx)
 }
 
-fn apply_procedure(procedure: Rc<Procedure>, args: Vec<Value>) -> Result<Value, EvalError> {
+fn apply_procedure(
+    procedure: Rc<Procedure>,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
     match procedure.as_ref() {
-        Procedure::Builtin(builtin) => (builtin.implementation)(&args),
-        Procedure::Lambda(lambda) => apply_lambda(lambda, args),
+        Procedure::Builtin(builtin) => (builtin.implementation)(&args, ctx),
+        Procedure::Lambda(lambda) => apply_lambda(lambda, args, ctx),
     }
 }
 
-fn eval_args(arg_exprs: &[Expr], env: EnvRef) -> Result<Vec<Value>, EvalError> {
+fn eval_args(
+    arg_exprs: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<Vec<Value>, EvalError> {
     let mut args = Vec::with_capacity(arg_exprs.len());
 
     for expr in arg_exprs {
-        args.push(eval_expr(expr, env.clone())?);
+        args.push(eval_expr(expr, env.clone(), ctx)?);
     }
 
     Ok(args)
 }
 
-fn apply_lambda(lambda: &LambdaProcedure, args: Vec<Value>) -> Result<Value, EvalError> {
+fn apply_lambda(
+    lambda: &LambdaProcedure,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
     if args.len() != lambda.params.len() {
         return Err(EvalError::WrongArgumentCount {
             name: lambda.name.clone(),
@@ -778,15 +881,15 @@ fn apply_lambda(lambda: &LambdaProcedure, args: Vec<Value>) -> Result<Value, Eva
         }
     }
 
-    eval_sequence(&lambda.body, call_env)
+    eval_sequence(&lambda.body, call_env, ctx)
 }
 
-fn builtin_not(args: &[Value]) -> Result<Value, EvalError> {
+fn builtin_not(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     expect_value_arity("not", args, 1)?;
     Ok(Value::Boolean(!args[0].is_truthy()))
 }
 
-fn builtin_cons(args: &[Value]) -> Result<Value, EvalError> {
+fn builtin_cons(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     expect_value_arity("cons", args, 2)?;
     Ok(Value::Pair(
         Box::new(args[0].clone()),
@@ -794,7 +897,7 @@ fn builtin_cons(args: &[Value]) -> Result<Value, EvalError> {
     ))
 }
 
-fn builtin_car(args: &[Value]) -> Result<Value, EvalError> {
+fn builtin_car(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     expect_value_arity("car", args, 1)?;
     let Value::Pair(car, _) = &args[0] else {
         return Err(EvalError::TypeMismatch {
@@ -805,7 +908,7 @@ fn builtin_car(args: &[Value]) -> Result<Value, EvalError> {
     Ok((**car).clone())
 }
 
-fn builtin_cdr(args: &[Value]) -> Result<Value, EvalError> {
+fn builtin_cdr(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     expect_value_arity("cdr", args, 1)?;
     let Value::Pair(_, cdr) = &args[0] else {
         return Err(EvalError::TypeMismatch {
@@ -816,23 +919,23 @@ fn builtin_cdr(args: &[Value]) -> Result<Value, EvalError> {
     Ok((**cdr).clone())
 }
 
-fn builtin_null_predicate(args: &[Value]) -> Result<Value, EvalError> {
+fn builtin_null_predicate(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     expect_value_arity("null?", args, 1)?;
     Ok(Value::Boolean(matches!(args[0], Value::EmptyList)))
 }
 
-fn builtin_list(args: &[Value]) -> Result<Value, EvalError> {
+fn builtin_list(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     Ok(args.iter().rev().fold(Value::EmptyList, |tail, value| {
         Value::Pair(Box::new(value.clone()), Box::new(tail))
     }))
 }
 
-fn builtin_length(args: &[Value]) -> Result<Value, EvalError> {
+fn builtin_length(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     expect_value_arity("length", args, 1)?;
     Ok(Value::Integer(list_length(&args[0])? as i64))
 }
 
-fn builtin_append(args: &[Value]) -> Result<Value, EvalError> {
+fn builtin_append(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     let mut result = args.last().cloned().unwrap_or(Value::EmptyList);
 
     for value in args[..args.len().saturating_sub(1)].iter().rev() {
@@ -842,37 +945,148 @@ fn builtin_append(args: &[Value]) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-fn builtin_string_predicate(args: &[Value]) -> Result<Value, EvalError> {
-    builtin_type_predicate(args, |value| matches!(value, Value::String(_)))
+fn builtin_string_predicate(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_type_predicate("string?", args, |value| matches!(value, Value::String(_)))
 }
 
-fn builtin_number_predicate(args: &[Value]) -> Result<Value, EvalError> {
-    builtin_type_predicate(args, |value| matches!(value, Value::Integer(_)))
+fn builtin_number_predicate(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_type_predicate("number?", args, |value| matches!(value, Value::Integer(_)))
 }
 
-fn builtin_boolean_predicate(args: &[Value]) -> Result<Value, EvalError> {
-    builtin_type_predicate(args, |value| matches!(value, Value::Boolean(_)))
+fn builtin_boolean_predicate(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_type_predicate("boolean?", args, |value| matches!(value, Value::Boolean(_)))
 }
 
-fn builtin_pair_predicate(args: &[Value]) -> Result<Value, EvalError> {
-    builtin_type_predicate(args, |value| matches!(value, Value::Pair(_, _)))
+fn builtin_pair_predicate(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_type_predicate("pair?", args, |value| matches!(value, Value::Pair(_, _)))
 }
 
-fn builtin_symbol_predicate(args: &[Value]) -> Result<Value, EvalError> {
-    builtin_type_predicate(args, |value| matches!(value, Value::Symbol(_)))
+fn builtin_symbol_predicate(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_type_predicate("symbol?", args, |value| matches!(value, Value::Symbol(_)))
 }
 
-fn builtin_add(args: &[Value]) -> Result<Value, EvalError> {
+fn builtin_char_predicate(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_type_predicate("char?", args, |value| matches!(value, Value::Char(_)))
+}
+
+fn builtin_display(args: &[Value], ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("display", args, 1)?;
+    ctx.emit(&args[0].render_for_display());
+    Ok(Value::Void)
+}
+
+fn builtin_write(args: &[Value], ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("write", args, 1)?;
+    ctx.emit(&args[0].render());
+    Ok(Value::Void)
+}
+
+fn builtin_newline(args: &[Value], ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("newline", args, 0)?;
+    ctx.emit("\n");
+    Ok(Value::Void)
+}
+
+fn builtin_string_append(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    let mut result = String::new();
+
+    for value in args {
+        result.push_str(expect_string(value)?);
+    }
+
+    Ok(Value::String(result))
+}
+
+fn builtin_string_length(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("string-length", args, 1)?;
+    Ok(Value::Integer(
+        expect_string(&args[0])?.chars().count() as i64
+    ))
+}
+
+fn builtin_substring(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("substring", args, 3)?;
+    let source = expect_string(&args[0])?;
+    let start = expect_index(&args[1], "substring")?;
+    let end = expect_index(&args[2], "substring")?;
+    let chars: Vec<char> = source.chars().collect();
+
+    if start > end || end > chars.len() {
+        return Err(EvalError::InvalidRange {
+            kind: "substring",
+            start,
+            end,
+            length: chars.len(),
+        });
+    }
+
+    Ok(Value::String(chars[start..end].iter().collect()))
+}
+
+fn builtin_string_to_number(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("string->number", args, 1)?;
+    let source = expect_string(&args[0])?;
+    Ok(parse_integer_token(source)
+        .map(Value::Integer)
+        .unwrap_or(Value::Boolean(false)))
+}
+
+fn builtin_number_to_string(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("number->string", args, 1)?;
+    let Value::Integer(value) = args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "number",
+            actual: args[0].type_name(),
+        });
+    };
+    Ok(Value::String(value.to_string()))
+}
+
+fn builtin_symbol_to_string(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("symbol->string", args, 1)?;
+    let Value::Symbol(ref value) = args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "symbol",
+            actual: args[0].type_name(),
+        });
+    };
+    Ok(Value::String(value.clone()))
+}
+
+fn builtin_string_to_symbol(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("string->symbol", args, 1)?;
+    Ok(Value::Symbol(expect_string(&args[0])?.to_string()))
+}
+
+fn builtin_string_ref(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("string-ref", args, 2)?;
+    let source = expect_string(&args[0])?;
+    let index = expect_index(&args[1], "string-ref")?;
+    let chars: Vec<char> = source.chars().collect();
+
+    let value = chars
+        .get(index)
+        .copied()
+        .ok_or(EvalError::IndexOutOfBounds {
+            kind: "string-ref",
+            index,
+            length: chars.len(),
+        })?;
+
+    Ok(Value::Char(value))
+}
+
+fn builtin_add(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     let numbers = expect_numbers(args)?;
     Ok(Value::Integer(numbers.into_iter().sum()))
 }
 
-fn builtin_mul(args: &[Value]) -> Result<Value, EvalError> {
+fn builtin_mul(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     let numbers = expect_numbers(args)?;
     Ok(Value::Integer(numbers.into_iter().product()))
 }
 
-fn builtin_sub(args: &[Value]) -> Result<Value, EvalError> {
+fn builtin_sub(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     let numbers = expect_numbers(args)?;
 
     match numbers.as_slice() {
@@ -888,7 +1102,7 @@ fn builtin_sub(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
-fn builtin_div(args: &[Value]) -> Result<Value, EvalError> {
+fn builtin_div(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     let numbers = expect_numbers(args)?;
 
     match numbers.as_slice() {
@@ -910,19 +1124,19 @@ fn builtin_div(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
-fn builtin_less_than(args: &[Value]) -> Result<Value, EvalError> {
+fn builtin_less_than(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     builtin_compare("<", args, |left, right| left < right)
 }
 
-fn builtin_greater_than(args: &[Value]) -> Result<Value, EvalError> {
+fn builtin_greater_than(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     builtin_compare(">", args, |left, right| left > right)
 }
 
-fn builtin_equal_numbers(args: &[Value]) -> Result<Value, EvalError> {
+fn builtin_equal_numbers(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     builtin_compare("=", args, |left, right| left == right)
 }
 
-fn builtin_less_equal(args: &[Value]) -> Result<Value, EvalError> {
+fn builtin_less_equal(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     builtin_compare("<=", args, |left, right| left <= right)
 }
 
@@ -946,10 +1160,11 @@ fn builtin_compare(
 }
 
 fn builtin_type_predicate(
+    name: &str,
     args: &[Value],
     predicate: impl Fn(&Value) -> bool,
 ) -> Result<Value, EvalError> {
-    expect_value_arity("predicate", args, 1)?;
+    expect_value_arity(name, args, 1)?;
     Ok(Value::Boolean(predicate(&args[0])))
 }
 
@@ -1006,6 +1221,30 @@ fn expect_numbers(args: &[Value]) -> Result<Vec<i64>, EvalError> {
     Ok(values)
 }
 
+fn expect_string(value: &Value) -> Result<&str, EvalError> {
+    match value {
+        Value::String(text) => Ok(text),
+        other => Err(EvalError::TypeMismatch {
+            expected: "string",
+            actual: other.type_name(),
+        }),
+    }
+}
+
+fn expect_index(value: &Value, kind: &'static str) -> Result<usize, EvalError> {
+    match value {
+        Value::Integer(index) if *index >= 0 => Ok(*index as usize),
+        Value::Integer(index) => Err(EvalError::NegativeIndex {
+            kind,
+            value: *index,
+        }),
+        other => Err(EvalError::TypeMismatch {
+            expected: "number",
+            actual: other.type_name(),
+        }),
+    }
+}
+
 fn expect_expr_arity(name: &str, args: &[Expr], expected: usize) -> Result<(), EvalError> {
     if args.len() != expected {
         return Err(EvalError::WrongArgumentCount {
@@ -1039,19 +1278,26 @@ fn expect_value_arity(name: &str, args: &[Value], expected: usize) -> Result<(),
 /// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
 /// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
+    let (value, _) = eval_input(input, false)?;
+    Ok(value.render())
+}
+
+fn eval_input(input: &str, capture_output: bool) -> Result<(Value, String), EvalError> {
     let mut parser = Parser::new(input);
     let exprs = parser.parse_program().map_err(|error| {
         let (line, column) = line_col_at(input, parser.index);
         error.with_position(line, column)
     })?;
-    let value = eval_program(&exprs).map_err(|error| error.with_position(1, 1))?;
-    Ok(value.render())
+    let mut ctx = EvalContext::new(capture_output);
+    let value = eval_program(&exprs, &mut ctx).map_err(|error| error.with_position(1, 1))?;
+    Ok((value, ctx.finish()))
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    Ok((eval_str(input)?, String::new()))
+    let (value, output) = eval_input(input, true)?;
+    Ok((value.render(), output))
 }
 
 #[cfg(test)]
