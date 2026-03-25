@@ -31,23 +31,9 @@ private[ming] object Builtins:
     case "pair?"    => unary(name, args)(e => Expr.Bool(PairOps.isPair(e)))
     case "symbol?"  => unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Sym]))
     case "append"   => NumericListBuiltins.applyAppend(args)
-    case "display" =>
-      unary(name, args) { e =>
-        val buf = outputBuffer.get()
-        if buf != null then buf.append(displayOutput(e))
-        Expr.Bool(false)
-      }
-    case "write" =>
-      unary(name, args) { e =>
-        val buf = outputBuffer.get()
-        if buf != null then buf.append(display(e))
-        Expr.Bool(false)
-      }
-    case "newline" =>
-      if args.nonEmpty then throw EvalError("newline: need exactly 0 arguments")
-      val buf = outputBuffer.get()
-      if buf != null then buf.append("\n")
-      Expr.Bool(false)
+    case "display"  => applyIO(name, args, displayOutput)
+    case "write"    => applyIO(name, args, display)
+    case "newline"  => applyOutput(args, "\n")
     case "string-append" | "string-length" | "string-set!" | "string-copy" | "substring" | "string->number" |
         "number->string" | "symbol->string" | "string->symbol" | "string-ref" | "char?" | "string->list" |
         "list->string" | "char->integer" | "integer->char" | "make-string" | "string" =>
@@ -98,9 +84,13 @@ private[ming] object Builtins:
       ListSearchBuiltins.applyListSearch(name, args)
     case "gcd" | "lcm" | "floor" | "ceiling" | "truncate" | "round" | "sqrt" =>
       MathBuiltins.applyMathBuiltin(name, args)
-    case "void"  => Expr.Bool(false)
-    case "apply" => throw EvalError("apply: should be handled by applyProc")
-    case _       => throw EvalError(s"unknown procedure: $name")
+    case "void"          => Expr.Bool(false)
+    case "apply"         => throw EvalError("apply: should be handled by applyProc")
+    case "syntax->datum" => unary(name, args)(v => v)
+    case "datum->syntax" =>
+      if args.length != 2 then throw EvalError("datum->syntax: need exactly 2 arguments")
+      args(1) // return the datum as-is (lexical context ignored in this impl)
+    case _ => throw EvalError(s"unknown procedure: $name")
 
   private def applyAdd(args: List[Expr]): Expr =
     if args.isEmpty then return Expr.Num(0)
@@ -184,3 +174,16 @@ private[ming] object Builtins:
   def display(e: Expr): String = Display.display(e)
 
   private def displayOutput(e: Expr): String = Display.displayOutput(e)
+
+  private def applyIO(name: String, args: List[Expr], fmt: Expr => String): Expr =
+    unary(name, args) { e =>
+      val buf = outputBuffer.get()
+      if buf != null then buf.append(fmt(e))
+      Expr.Bool(false)
+    }
+
+  private def applyOutput(args: List[Expr], text: String): Expr =
+    if args.nonEmpty then throw EvalError("newline: need exactly 0 arguments")
+    val buf = outputBuffer.get()
+    if buf != null then buf.append(text)
+    Expr.Bool(false)

@@ -115,6 +115,10 @@ private[ming] class SchemeParser(input: String):
         if pos >= input.length then throw EvalError("unmatched #(")
         advance() // skip ')'
         Expr.Vec(elems.result().toArray)
+      case '\'' =>
+        // #'expr => (syntax expr)
+        val inner = parseExpr()
+        Expr.Lst(List(Expr.Sym("syntax"), inner))
       case _ => throw EvalError(s"unexpected #$c")
 
   private def isDelimiter(c: Char): Boolean =

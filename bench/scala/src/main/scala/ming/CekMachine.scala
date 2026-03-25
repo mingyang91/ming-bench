@@ -18,7 +18,7 @@ object CekMachine:
     curExpr match
       case _: Expr.Num | _: Expr.Rational | _: Expr.Real | _: Expr.Bool | _: Expr.Str | _: Expr.Chr | _: Expr.Lambda |
           _: Expr.Pair | _: Expr.Macro | _: Expr.Record | _: Expr.CaseLambda | _: Expr.Vec | _: Expr.Cont |
-          _: Expr.Values =>
+          _: Expr.Values | _: Expr.TransformerMacro | _: Expr.SyntaxExpanded =>
         s.value = curExpr
         s.evaluating = false
 
@@ -56,26 +56,13 @@ object CekMachine:
         if rest.isEmpty then throw EvalError("begin: need at least 1 expression")
         setupBody(s, rest, curEnv, s.k)
 
-      case Expr.Lst(Expr.Sym("let") :: rest) =>
-        stepLet(s, rest, curEnv)
-
-      case Expr.Lst(Expr.Sym("let*") :: rest) =>
-        stepLetStar(s, rest, curEnv, "let*")
-
-      case Expr.Lst(Expr.Sym("letrec") :: rest) =>
-        stepLetrec(s, rest, curEnv)
-
-      case Expr.Lst(Expr.Sym("letrec*") :: rest) =>
-        stepLetStar(s, rest, curEnv, "letrec*")
-
-      case Expr.Lst(Expr.Sym("cond") :: clauses) =>
-        evalCondClauses(s, clauses, curEnv, s.k)
-
-      case Expr.Lst(Expr.Sym("and") :: args) =>
-        CekHelpers.stepLogical(s, args, curEnv, isAnd = true)
-
-      case Expr.Lst(Expr.Sym("or") :: args) =>
-        CekHelpers.stepLogical(s, args, curEnv, isAnd = false)
+      case Expr.Lst(Expr.Sym("let") :: rest)     => stepLet(s, rest, curEnv)
+      case Expr.Lst(Expr.Sym("let*") :: rest)    => stepLetStar(s, rest, curEnv, "let*")
+      case Expr.Lst(Expr.Sym("letrec") :: rest)  => stepLetrec(s, rest, curEnv)
+      case Expr.Lst(Expr.Sym("letrec*") :: rest) => stepLetStar(s, rest, curEnv, "letrec*")
+      case Expr.Lst(Expr.Sym("cond") :: clauses) => evalCondClauses(s, clauses, curEnv, s.k)
+      case Expr.Lst(Expr.Sym("and") :: args)     => CekHelpers.stepLogical(s, args, curEnv, isAnd = true)
+      case Expr.Lst(Expr.Sym("or") :: args)      => CekHelpers.stepLogical(s, args, curEnv, isAnd = false)
 
       case Expr.Lst(Expr.Sym("case") :: rest) =>
         if rest.isEmpty then throw EvalError("case: need key expression")
@@ -85,6 +72,15 @@ object CekMachine:
       case Expr.Lst(Expr.Sym("define-syntax") :: rest) =>
         s.value = SpecialForms.evalDefineSyntax(rest, curEnv)
         s.evaluating = false
+
+      case Expr.Lst(Expr.Sym("syntax-case") :: stxExpr :: Expr.Lst(literals) :: clauses) =>
+        CekSyntaxSteps.stepEvalSyntaxCase(s, stxExpr, literals, clauses)
+
+      case Expr.Lst(Expr.Sym("syntax") :: template :: Nil) =>
+        CekSyntaxSteps.stepEvalSyntax(s, template, curEnv)
+
+      case Expr.Lst(Expr.Sym("with-syntax") :: Expr.Lst(bindings) :: body) if body.nonEmpty =>
+        CekSyntaxSteps.stepEvalWithSyntax(s, bindings, body, curEnv)
 
       case Expr.Lst(Expr.Sym("define-record-type") :: rest) =>
         s.value = RecordOps.evalDefineRecordType(rest, curEnv)
@@ -102,11 +98,7 @@ object CekMachine:
         CekHelpers.stepGuard(s, rest, curEnv)
 
       case lst @ Expr.Lst(Expr.Sym(name) :: _) if SpecialForms.isMacro(name, curEnv) =>
-        val mac = SpecialForms.lookupMacro(name, curEnv)
-        val (expanded, hygieneEnv) =
-          Macros.expandMacro(mac.literals, mac.rules, lst.elems, mac.defEnv, curEnv)
-        s.expr = expanded
-        s.env = hygieneEnv
+        CekSyntaxSteps.stepEvalMacro(s, name, lst, curEnv)
 
       case Expr.Lst(op :: args) =>
         s.appPosExpr = curExpr
@@ -169,26 +161,15 @@ object CekMachine:
           else setupBody(s, body, e, kk)
         else evalCondClauses(s, remaining, e, kk)
 
-      case CaseKeyK(clauses, e, kk) =>
-        evalCaseClauses(s, s.value, clauses, e, kk)
-
-      case k: DynWindAfterInK   => CekHelpers.stepDynWind(s, k)
-      case k: DynWindAfterBodyK => CekHelpers.stepDynWind(s, k)
-      case k: DynWindAfterOutK  => CekHelpers.stepDynWind(s, k)
-      case k: DynWindTransferK  => CekHelpers.stepDynWind(s, k)
-
-      case PopExnHandlerK(kk) =>
-        s.exnHandlers = s.exnHandlers.tail
-        s.k = kk
-
-      case RaiseReturnK =>
-        throw EvalError("raise: handler returned")
-
-      case CallExnHandlerK(handler, exnValue, afterK) =>
-        applyFunc(s, handler, List(exnValue), afterK)
-
-      case GuardStartK(varName, clauses, env, exitK) =>
-        evalGuardClauses(s, varName, clauses, env, exitK)
+      case CaseKeyK(clauses, e, kk)                   => evalCaseClauses(s, s.value, clauses, e, kk)
+      case k: DynWindAfterInK                         => CekHelpers.stepDynWind(s, k)
+      case k: DynWindAfterBodyK                       => CekHelpers.stepDynWind(s, k)
+      case k: DynWindAfterOutK                        => CekHelpers.stepDynWind(s, k)
+      case k: DynWindTransferK                        => CekHelpers.stepDynWind(s, k)
+      case PopExnHandlerK(kk)                         => s.exnHandlers = s.exnHandlers.tail; s.k = kk
+      case RaiseReturnK                               => throw EvalError("raise: handler returned")
+      case CallExnHandlerK(handler, exnValue, afterK) => applyFunc(s, handler, List(exnValue), afterK)
+      case GuardStartK(varName, clauses, env, exitK)  => evalGuardClauses(s, varName, clauses, env, exitK)
 
       case GuardCondK(varName, body, remaining, env, exitK) =>
         if !isFalsy(s.value) then
@@ -201,6 +182,14 @@ object CekMachine:
           case Expr.Values(elems) => elems
           case single             => List(single)
         applyFunc(s, consumer, args, kk)
+
+      case SyntaxCaseMatchK(literals, clauses, env, kk) =>
+        CekSyntaxSteps.stepKontSyntaxCaseMatch(s, literals, clauses, env, kk)
+
+      case SyntaxCaseCleanupK(kk) => s.k = kk
+
+      case TransformerMacroReturnK(useEnv, kk) =>
+        CekSyntaxSteps.stepKontTransformerMacroReturn(s, useEnv, kk)
 
     null // signal: keep looping
 

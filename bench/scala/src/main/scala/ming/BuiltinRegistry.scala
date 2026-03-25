@@ -128,7 +128,9 @@ private[ming] object BuiltinRegistry:
     "raise",
     "raise-continuable",
     "values",
-    "call-with-values"
+    "call-with-values",
+    "syntax->datum",
+    "datum->syntax"
   )
 
   def makeTopLevelEnv(): Env =

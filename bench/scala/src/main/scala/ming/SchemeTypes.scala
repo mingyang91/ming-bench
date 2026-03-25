@@ -21,6 +21,8 @@ private[ming] enum Expr:
   case Vec(elems: Array[Expr])
   case Cont(kont: AnyRef)
   case Values(elems: List[Expr])
+  case TransformerMacro(transformer: Expr, defEnv: Env)
+  case SyntaxExpanded(expr: Expr, hygieneEnv: Env)
 
   var line: Int = 0
   var col: Int  = 0

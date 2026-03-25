@@ -3,23 +3,25 @@ package ming
 private[ming] object Display:
 
   def display(e: Expr): String = e match
-    case Expr.Num(n)                => n.toString
-    case Expr.Rational(n, d)        => s"$n/$d"
-    case Expr.Real(v)               => formatReal(v)
-    case Expr.Bool(true)            => "#t"
-    case Expr.Bool(false)           => "#f"
-    case Expr.Str(s, _)             => "\"" + new String(s) + "\""
-    case Expr.Chr(c)                => s"#\\$c"
-    case Expr.Sym(name)             => name
-    case Expr.Lst(elems)            => "(" + elems.map(display).mkString(" ") + ")"
-    case Expr.Pair(cell)            => displayPair(cell)
-    case Expr.Lambda(_, _, _, _)    => "#<procedure>"
-    case Expr.CaseLambda(_, _)      => "#<procedure>"
-    case Expr.Macro(_, _, _)        => "#<macro>"
-    case Expr.Vec(elems)            => "#(" + elems.map(display).mkString(" ") + ")"
-    case Expr.Record(name, _, _, _) => s"#<record:$name>"
-    case Expr.Cont(_)               => "#<continuation>"
-    case Expr.Values(elems)         => elems.map(display).mkString(" ")
+    case Expr.Num(n)                 => n.toString
+    case Expr.Rational(n, d)         => s"$n/$d"
+    case Expr.Real(v)                => formatReal(v)
+    case Expr.Bool(true)             => "#t"
+    case Expr.Bool(false)            => "#f"
+    case Expr.Str(s, _)              => "\"" + new String(s) + "\""
+    case Expr.Chr(c)                 => s"#\\$c"
+    case Expr.Sym(name)              => name
+    case Expr.Lst(elems)             => "(" + elems.map(display).mkString(" ") + ")"
+    case Expr.Pair(cell)             => displayPair(cell)
+    case Expr.Lambda(_, _, _, _)     => "#<procedure>"
+    case Expr.CaseLambda(_, _)       => "#<procedure>"
+    case Expr.Macro(_, _, _)         => "#<macro>"
+    case Expr.TransformerMacro(_, _) => "#<macro>"
+    case Expr.SyntaxExpanded(e, _)   => display(e)
+    case Expr.Vec(elems)             => "#(" + elems.map(display).mkString(" ") + ")"
+    case Expr.Record(name, _, _, _)  => s"#<record:$name>"
+    case Expr.Cont(_)                => "#<continuation>"
+    case Expr.Values(elems)          => elems.map(display).mkString(" ")
 
   private def displayPair(cell: MutablePair): String =
     val visited = java.util.Collections.newSetFromMap(

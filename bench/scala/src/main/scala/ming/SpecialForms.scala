@@ -4,7 +4,7 @@ object SpecialForms:
   import Builtins.isFalsy
 
   private[ming] def isMacro(name: String, env: Env): Boolean =
-    env.lookupOpt(name).exists(_.isInstanceOf[Expr.Macro])
+    env.lookupOpt(name).exists(v => v.isInstanceOf[Expr.Macro] || v.isInstanceOf[Expr.TransformerMacro])
 
   private[ming] def lookupMacro(name: String, env: Env): Expr.Macro =
     env.lookup(name) match
@@ -49,6 +49,10 @@ object SpecialForms:
         case _ => throw EvalError("define-syntax: invalid rule")
       }
       env.define(name, Expr.Macro(litNames, rulesList, env))
+      Expr.Bool(false)
+    case Expr.Sym(name) :: transformerExpr :: Nil =>
+      val transformer = Evaluator.eval(transformerExpr, env)
+      env.define(name, Expr.TransformerMacro(transformer, env))
       Expr.Bool(false)
     case _ => throw EvalError("define-syntax: invalid syntax")
 

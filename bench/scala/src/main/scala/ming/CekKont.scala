@@ -81,6 +81,11 @@ private[ming] case class GuardCondK(varName: String, body: List[Expr], remaining
 // call-with-values support
 private[ming] case class CallWithValuesConsumerK(consumer: Expr, k: Kont) extends Kont
 
+// syntax-case support
+private[ming] case class SyntaxCaseMatchK(literals: List[String], clauses: List[Expr], env: Env, k: Kont) extends Kont
+private[ming] case class SyntaxCaseCleanupK(k: Kont)                                                      extends Kont
+private[ming] case class TransformerMacroReturnK(useEnv: Env, k: Kont)                                    extends Kont
+
 private[ming] class CekState:
   var expr: Expr                         = null
   var env: Env                           = null

@@ -6,11 +6,11 @@ private[ming] object Macros:
 
   private var gensymCounter = 0L
 
-  private def gensym(base: String): String =
+  def gensym(base: String): String =
     gensymCounter += 1
     s"${base}__hyg_${gensymCounter}"
 
-  private val specialForms = Set(
+  val specialForms: Set[String] = Set(
     "if",
     "begin",
     "let",
@@ -26,8 +26,51 @@ private[ming] object Macros:
     "let*",
     "letrec",
     "when",
-    "unless"
+    "unless",
+    "syntax-case",
+    "syntax",
+    "with-syntax"
   )
+
+  // --- Thread-local syntax-case context ---
+
+  private case class SyntaxCtx(
+    bindings: Map[String, Either[Expr, List[Expr]]],
+    defEnv: Env,
+    useEnv: Env
+  )
+
+  private val ctxStack = new ThreadLocal[List[SyntaxCtx]]:
+    override def initialValue(): List[SyntaxCtx] = Nil
+
+  def pushSyntaxContext(defEnv: Env, useEnv: Env): Unit =
+    ctxStack.set(SyntaxCtx(Map.empty, defEnv, useEnv) :: ctxStack.get())
+
+  def popSyntaxContext(): Unit =
+    ctxStack.get() match
+      case _ :: rest => ctxStack.set(rest)
+      case Nil       => ()
+
+  def addSyntaxBindings(bindings: Map[String, Either[Expr, List[Expr]]]): Unit =
+    ctxStack.get() match
+      case head :: rest =>
+        ctxStack.set(head.copy(bindings = head.bindings ++ bindings) :: rest)
+      case Nil => ()
+
+  def currentSyntaxBindings: Map[String, Either[Expr, List[Expr]]] =
+    ctxStack.get() match
+      case head :: _ => head.bindings
+      case Nil       => Map.empty
+
+  def currentDefEnv: Option[Env] =
+    ctxStack.get() match
+      case head :: _ => Some(head.defEnv)
+      case Nil       => None
+
+  def currentUseEnv: Option[Env] =
+    ctxStack.get() match
+      case head :: _ => Some(head.useEnv)
+      case Nil       => None
 
   /** Expand a macro call. Returns (expanded expr, env to evaluate it in). */
   def expandMacro(
@@ -45,8 +88,8 @@ private[ming] object Macros:
           val freeSyms = collectFreeSymbols(template, patVars)
           val renames  = mutable.Map[String, String]()
           for sym <- freeSyms if !specialForms.contains(sym) do
-            // Don't rename macro names — they need normal resolution for recursive expansion
-            val isMacroRef = defEnv.lookupOpt(sym).exists(_.isInstanceOf[Expr.Macro])
+            val isMacroRef =
+              defEnv.lookupOpt(sym).exists(v => v.isInstanceOf[Expr.Macro] || v.isInstanceOf[Expr.TransformerMacro])
             if !isMacroRef then renames(sym) = gensym(sym)
 
           val expanded = doExpand(template, bindings, renames.toMap)
@@ -54,12 +97,47 @@ private[ming] object Macros:
           val hygieneEnv = useEnv.child()
           for (original, renamed) <- renames do
             defEnv.lookupOpt(original) match
-              case Some(_: Expr.Macro) => () // let macros resolve via normal lookup
-              case Some(value)         => hygieneEnv.define(renamed, value)
-              case None                => () // template-introduced name, no injection
+              case Some(_: Expr.Macro) | Some(_: Expr.TransformerMacro) => ()
+              case Some(value)                                          => hygieneEnv.define(renamed, value)
+              case None                                                 => ()
           return (expanded, hygieneEnv)
         case None => ()
     throw EvalError("syntax-rules: no matching pattern")
+
+  /** Expand a syntax template using current syntax-case bindings. */
+  def expandSyntaxTemplate(template: Expr, curEnv: Env): (Expr, Env) =
+    val bindings = currentSyntaxBindings
+    val defEnv   = currentDefEnv.getOrElse(curEnv)
+    val useEnv   = currentUseEnv.getOrElse(curEnv)
+    val patVars  = bindings.keySet
+    val freeSyms = collectFreeSymbols(template, patVars)
+    val renames  = mutable.Map[String, String]()
+    for sym <- freeSyms if !specialForms.contains(sym) do
+      val isMacroRef =
+        defEnv.lookupOpt(sym).exists(v => v.isInstanceOf[Expr.Macro] || v.isInstanceOf[Expr.TransformerMacro])
+      if !isMacroRef then renames(sym) = gensym(sym)
+
+    val expanded = doExpand(template, bindings, renames.toMap)
+
+    // Inject hygiene renames directly into useEnv (not a child)
+    // so that defines in expanded code go into the use-site env
+    for (original, renamed) <- renames do
+      defEnv.lookupOpt(original) match
+        case Some(_: Expr.Macro) | Some(_: Expr.TransformerMacro) => ()
+        case Some(value)                                          => useEnv.define(renamed, value)
+        case None                                                 => ()
+
+    (expanded, useEnv)
+
+  /** Match a syntax-case pattern against a single input expr. */
+  def matchSyntaxCasePattern(
+    pattern: Expr,
+    input: Expr,
+    literals: List[String]
+  ): Option[Map[String, Either[Expr, List[Expr]]]] =
+    val bindings = mutable.Map[String, Either[Expr, List[Expr]]]()
+    if matchSingle(pattern, input, literals, bindings) then Some(bindings.toMap)
+    else None
 
   private def collectPatternVars(pattern: List[Expr], literals: List[String]): Set[String] =
     val vars = Set.newBuilder[String]
@@ -71,7 +149,7 @@ private[ming] object Macros:
     pattern.foreach(collect)
     vars.result()
 
-  private def collectFreeSymbols(template: Expr, patVars: Set[String]): Set[String] = template match
+  def collectFreeSymbols(template: Expr, patVars: Set[String]): Set[String] = template match
     case Expr.Sym(name) if !patVars.contains(name) && name != "..." => Set(name)
     case Expr.Lst(Expr.Sym("quote") :: _)                           => Set.empty
     case Expr.Lst(elems) => elems.flatMap(e => collectFreeSymbols(e, patVars)).toSet
@@ -88,7 +166,7 @@ private[ming] object Macros:
     if matchElems(pattern, input, literals, bindings) then Some(bindings.toMap)
     else None
 
-  private def matchElems(
+  private[ming] def matchElems(
     pattern: List[Expr],
     input: List[Expr],
     literals: List[String],
@@ -134,7 +212,7 @@ private[ming] object Macros:
     case Expr.Lst(elems) => elems.flatMap(e => collectSinglePatternVars(e, literals)).toSet
     case _               => Set.empty
 
-  private def matchSingle(
+  private[ming] def matchSingle(
     pattern: Expr,
     input: Expr,
     literals: List[String],
@@ -156,7 +234,7 @@ private[ming] object Macros:
 
   // --- Template expansion ---
 
-  private def doExpand(
+  def doExpand(
     template: Expr,
     bindings: Map[String, Either[Expr, List[Expr]]],
     renames: Map[String, String]
