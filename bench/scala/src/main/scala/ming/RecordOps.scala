@@ -10,16 +10,16 @@ private[ming] object RecordOps:
     ctorFieldIndices: List[Int]
   )
 
-  private var recordTypeCounter: Int = 0
-  private val recordTypes            = scala.collection.mutable.Map[Int, RecordTypeInfo]()
+  private val recordTypeCounter                                          = new java.util.concurrent.atomic.AtomicInteger(0)
+  private val recordTypes: java.util.concurrent.ConcurrentHashMap[Int, RecordTypeInfo] =
+    new java.util.concurrent.ConcurrentHashMap[Int, RecordTypeInfo]()
 
   def evalDefineRecordType(args: List[Expr], env: Env): Expr =
     args match
       case Expr.Sym(typeName) :: Expr.Lst(Expr.Sym(ctorName) :: ctorFields) :: Expr.Sym(
             predName
           ) :: fieldSpecs =>
-        recordTypeCounter += 1
-        val typeId = recordTypeCounter
+        val typeId = recordTypeCounter.incrementAndGet()
         val ctorFieldNames = ctorFields.map {
           case Expr.Sym(f) => f
           case _           => throw EvalError("define-record-type: invalid constructor field")
@@ -41,14 +41,14 @@ private[ming] object RecordOps:
         accessorNames.zipWithIndex.foreach { (accName, idx) =>
           env.define(accName, Expr.Sym(s"%%record-acc-$typeId-$idx"))
         }
-        recordTypes(typeId) = RecordTypeInfo(typeName, typeId, allFieldNames.toArray, ctorFieldNames, ctorIndices)
+        recordTypes.put(typeId, RecordTypeInfo(typeName, typeId, allFieldNames.toArray, ctorFieldNames, ctorIndices))
         Expr.Bool(false)
       case _ => throw EvalError("define-record-type: invalid syntax")
 
   def applyRecordOp(name: String, args: List[Expr]): Expr =
     if name.startsWith("%%record-ctor-") then
       val typeId = name.stripPrefix("%%record-ctor-").toInt
-      val info   = recordTypes(typeId)
+      val info   = recordTypes.get(typeId)
       if args.length != info.ctorFieldNames.length then
         throw EvalError(
           s"${info.name} constructor: expected ${info.ctorFieldNames.length} arguments, got ${args.length}"
@@ -69,5 +69,5 @@ private[ming] object RecordOps:
       if args.length != 1 then throw EvalError("record accessor: expected 1 argument")
       args.head match
         case Expr.Record(_, tid, fields, _) if tid == typeId => fields(fieldIdx)
-        case _ => throw EvalError(s"record accessor: not a ${recordTypes(typeId).name}")
+        case _ => throw EvalError(s"record accessor: not a ${recordTypes.get(typeId).name}")
     else throw EvalError(s"unknown record operation: $name")
