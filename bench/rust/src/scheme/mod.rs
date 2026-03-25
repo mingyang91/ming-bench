@@ -17,6 +17,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "-",
     "*",
     "/",
+    "call-with-values",
     "call-with-current-continuation",
     "call/cc",
     "dynamic-wind",
@@ -150,6 +151,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "vector-ref",
     "vector-set!",
     "vector?",
+    "values",
     "write",
     "zero?",
 ];
@@ -855,6 +857,7 @@ enum Value {
     Procedure(Rc<UserProcedure>),
     NativeProcedure(Rc<NativeProcedure>),
     Continuation(ContinuationRef),
+    Multiple(Vec<LocatedValue>),
     Uninitialized,
     Void,
 }
@@ -875,6 +878,7 @@ impl Value {
             | Value::Procedure(_)
             | Value::NativeProcedure(_)
             | Value::Continuation(_) => "procedure",
+            Value::Multiple(_) => "values",
             Value::Uninitialized => "undefined",
             Value::Void => "void",
         }
@@ -1053,6 +1057,7 @@ fn format_value_inner(
         | Value::Procedure(_)
         | Value::NativeProcedure(_)
         | Value::Continuation(_) => "#<procedure>".into(),
+        Value::Multiple(_) => "#<values>".into(),
         Value::Uninitialized => "#<uninitialized>".into(),
         Value::Void => "#<void>".into(),
     }
@@ -1336,6 +1341,13 @@ fn scheme_eq(left: &Value, right: &Value) -> bool {
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::NativeProcedure(left), Value::NativeProcedure(right)) => Rc::ptr_eq(left, right),
         (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
+        (Value::Multiple(left), Value::Multiple(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| scheme_eq(&left.value, &right.value))
+        }
         (Value::Void, Value::Void) => true,
         _ => false,
     }
@@ -1397,6 +1409,17 @@ fn scheme_equal_inner(
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::NativeProcedure(left), Value::NativeProcedure(right)) => Rc::ptr_eq(left, right),
         (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
+        (Value::Multiple(left), Value::Multiple(right)) => {
+            left.len() == right.len()
+                && left.iter().zip(right.iter()).all(|(left, right)| {
+                    scheme_equal_inner(
+                        &left.value,
+                        &right.value,
+                        visited_pairs,
+                        visited_vectors,
+                    )
+                })
+        }
         (Value::Void, Value::Void) => true,
         _ => false,
     }
@@ -1411,6 +1434,21 @@ fn resolve_eval_step(step: EvalStep) -> Result<Value, EvalError> {
     match step {
         EvalStep::Value(value) => Ok(value),
         EvalStep::Expr(expr, env) => eval(&expr, env),
+    }
+}
+
+fn pack_values(values: Vec<LocatedValue>) -> Value {
+    if values.len() == 1 {
+        values[0].value.clone()
+    } else {
+        Value::Multiple(values)
+    }
+}
+
+fn unpack_values(value: Value, position: SourcePos) -> Vec<LocatedValue> {
+    match value {
+        Value::Multiple(values) => values,
+        other => vec![LocatedValue::new(other, position)],
     }
 }
 
@@ -1450,6 +1488,12 @@ enum MachineFrame {
         env: EnvRef,
         position: SourcePos,
         current_arg_position: SourcePos,
+    },
+    CallWithValuesConsume {
+        consumer: Value,
+        consumer_position: SourcePos,
+        producer_position: SourcePos,
+        env: EnvRef,
     },
     DynamicWindEnter {
         in_thunk: Value,
@@ -2040,6 +2084,18 @@ fn machine_apply_frame(
                 machine_apply_value(callable, position, evaluated, env, cont)
             }
         }
+        MachineFrame::CallWithValuesConsume {
+            consumer,
+            consumer_position,
+            producer_position,
+            env,
+        } => machine_apply_value(
+            consumer,
+            consumer_position,
+            unpack_values(value, producer_position),
+            env,
+            cont,
+        ),
         MachineFrame::DynamicWindEnter {
             in_thunk,
             in_position,
@@ -2179,6 +2235,34 @@ fn machine_apply_builtin(
     cont: ContinuationRef,
 ) -> Result<(MachineControl, ContinuationRef), EvalError> {
     match name {
+        "call-with-values" => {
+            if args.len() != 2 {
+                return Err(EvalError::wrong_arg_count(
+                    "call-with-values",
+                    "exactly 2",
+                    args.len(),
+                    position,
+                ));
+            }
+
+            let next_cont = push_continuation(
+                MachineFrame::CallWithValuesConsume {
+                    consumer: args[1].value.clone(),
+                    consumer_position: args[1].position,
+                    producer_position: args[0].position,
+                    env: env.clone(),
+                },
+                cont,
+            );
+
+            machine_apply_value(
+                args[0].value.clone(),
+                args[0].position,
+                Vec::new(),
+                env,
+                next_cont,
+            )
+        }
         "call/cc" | "call-with-current-continuation" => {
             if args.len() != 1 {
                 return Err(EvalError::wrong_arg_count(
@@ -2302,6 +2386,7 @@ fn machine_apply_builtin(
                 cont,
             )
         }
+        "values" => Ok(machine_value(pack_values(args), cont)),
         _ => Ok(machine_value(
             apply_builtin(name, &args, position, env)?,
             cont,
@@ -3986,6 +4071,7 @@ fn apply_builtin_step(
 ) -> Result<EvalStep, EvalError> {
     match name {
         "apply" => apply_apply_step(args, position, env),
+        "call-with-values" => apply_call_with_values_step(args, position, env),
         _ => Ok(EvalStep::Value(apply_builtin(name, args, position, env)?)),
     }
 }
@@ -4156,6 +4242,7 @@ fn apply_builtin(
         "vector?" => apply_type_predicate("vector?", args, position, |value| {
             matches!(value, Value::Vector(_))
         }),
+        "values" => apply_values(args),
         "write" => apply_write(args, position, env),
         "zero?" => apply_number_predicate("zero?", args, position, Number::is_zero),
         _ => Err(EvalError::unbound_variable(name, position)),
@@ -4664,6 +4751,39 @@ fn apply_apply(
     env: EnvRef,
 ) -> Result<Value, EvalError> {
     resolve_eval_step(apply_apply_step(args, position, env)?)
+}
+
+fn apply_values(args: &[LocatedValue]) -> Result<Value, EvalError> {
+    Ok(pack_values(args.to_vec()))
+}
+
+fn apply_call_with_values_step(
+    args: &[LocatedValue],
+    position: SourcePos,
+    env: EnvRef,
+) -> Result<EvalStep, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::wrong_arg_count(
+            "call-with-values",
+            "exactly 2",
+            args.len(),
+            position,
+        ));
+    }
+
+    let produced = resolve_eval_step(apply_step(
+        args[0].value.clone(),
+        args[0].position,
+        Vec::new(),
+        env.clone(),
+    )?)?;
+
+    apply_step(
+        args[1].value.clone(),
+        args[1].position,
+        unpack_values(produced, args[0].position),
+        env,
+    )
 }
 
 fn apply_number_to_string(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
