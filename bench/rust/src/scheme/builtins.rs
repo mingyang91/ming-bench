@@ -1,4 +1,6 @@
-use super::{apply, make_rational, Environment, Env, Value, EvalError};
+use std::cell::RefCell;
+use std::rc::Rc;
+use super::{apply, eqv, make_rational, Environment, Env, Value, EvalError};
 
 /// Extract numerator/denominator pair from a numeric value (exact representation).
 fn to_rational(v: &Value) -> Result<(i64, i64), EvalError> {
@@ -430,6 +432,11 @@ fn values_equal(a: &Value, b: &Value) -> bool {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| values_equal(a, b))
         }
         (Value::Pair(a1, b1), Value::Pair(a2, b2)) => values_equal(a1, a2) && values_equal(b1, b2),
+        (Value::Vector(x), Value::Vector(y)) => {
+            let xb = x.borrow();
+            let yb = y.borrow();
+            xb.len() == yb.len() && xb.iter().zip(yb.iter()).all(|(a, b)| values_equal(a, b))
+        }
         _ => false,
     }
 }
@@ -449,6 +456,8 @@ fn builtin_eq_pred(args: &[Value], _output: &mut String) -> Result<Value, EvalEr
         (Value::Char(a), Value::Char(b)) => a == b,
         (Value::Symbol(a), Value::Symbol(b)) => a == b,
         (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
+        (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+        (Value::Void, Value::Void) => true,
         _ => false,
     };
     Ok(Value::Boolean(result))
@@ -644,6 +653,246 @@ fn builtin_is_procedure(args: &[Value], _output: &mut String) -> Result<Value, E
     )))
 }
 
+// ---- L14: Vectors, eqv?, for-each, assq, memq ----
+
+fn builtin_vector(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec()))))
+}
+
+fn builtin_make_vector(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(EvalError::Arity("make-vector requires 1 or 2 arguments".into()));
+    }
+    let len = args[0].as_integer()? as usize;
+    let fill = if args.len() == 2 { args[1].clone() } else { Value::Integer(0) };
+    Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; len]))))
+}
+
+fn builtin_vector_ref(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("vector-ref requires 2 arguments".into())); }
+    match &args[0] {
+        Value::Vector(v) => {
+            let idx = args[1].as_integer()? as usize;
+            let items = v.borrow();
+            items.get(idx).cloned().ok_or_else(|| EvalError::Type("vector-ref: index out of bounds".into()))
+        }
+        _ => Err(EvalError::Type("vector-ref: expected vector".into())),
+    }
+}
+
+fn builtin_vector_set(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 3 { return Err(EvalError::Arity("vector-set! requires 3 arguments".into())); }
+    match &args[0] {
+        Value::Vector(v) => {
+            let idx = args[1].as_integer()? as usize;
+            let mut items = v.borrow_mut();
+            if idx >= items.len() {
+                return Err(EvalError::Type("vector-set!: index out of bounds".into()));
+            }
+            items[idx] = args[2].clone();
+            Ok(Value::Void)
+        }
+        _ => Err(EvalError::Type("vector-set!: expected vector".into())),
+    }
+}
+
+fn builtin_vector_length(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("vector-length requires 1 argument".into())); }
+    match &args[0] {
+        Value::Vector(v) => Ok(Value::Integer(v.borrow().len() as i64)),
+        _ => Err(EvalError::Type("vector-length: expected vector".into())),
+    }
+}
+
+fn builtin_is_vector(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("vector? requires 1 argument".into())); }
+    Ok(Value::Boolean(args[0].is_vector()))
+}
+
+fn builtin_vector_to_list(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("vector->list requires 1 argument".into())); }
+    match &args[0] {
+        Value::Vector(v) => Ok(Value::List(v.borrow().clone())),
+        _ => Err(EvalError::Type("vector->list: expected vector".into())),
+    }
+}
+
+fn builtin_list_to_vector(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("list->vector requires 1 argument".into())); }
+    match &args[0] {
+        Value::List(items) => Ok(Value::Vector(Rc::new(RefCell::new(items.clone())))),
+        _ => Err(EvalError::Type("list->vector: expected list".into())),
+    }
+}
+
+fn builtin_eqv(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("eqv? requires 2 arguments".into())); }
+    Ok(Value::Boolean(eqv(&args[0], &args[1])))
+}
+
+fn builtin_for_each(args: &[Value], output: &mut String) -> Result<Value, EvalError> {
+    if args.len() < 2 { return Err(EvalError::Arity("for-each requires at least 2 arguments".into())); }
+    let func = &args[0];
+    let lists: Vec<&Vec<Value>> = args[1..].iter().map(|a| match a {
+        Value::List(v) => Ok(v),
+        _ => Err(EvalError::Type("for-each: expected list".into())),
+    }).collect::<Result<_, _>>()?;
+    let len = lists[0].len();
+    for i in 0..len {
+        let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+        apply(func, &call_args, output)?;
+    }
+    Ok(Value::Void)
+}
+
+fn builtin_assq(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("assq requires 2 arguments".into())); }
+    let key = &args[0];
+    let alist = match &args[1] {
+        Value::List(v) => v,
+        _ => return Err(EvalError::Type("assq: expected list".into())),
+    };
+    for entry in alist {
+        if let Value::List(pair) = entry {
+            if !pair.is_empty() && eqv(&pair[0], key) {
+                return Ok(entry.clone());
+            }
+        }
+    }
+    Ok(Value::Boolean(false))
+}
+
+fn builtin_memq(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("memq requires 2 arguments".into())); }
+    let key = &args[0];
+    let list = match &args[1] {
+        Value::List(v) => v,
+        _ => return Err(EvalError::Type("memq: expected list".into())),
+    };
+    for (i, item) in list.iter().enumerate() {
+        if eqv(item, key) {
+            return Ok(Value::List(list[i..].to_vec()));
+        }
+    }
+    Ok(Value::Boolean(false))
+}
+
+fn builtin_char_to_integer(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("char->integer requires 1 argument".into())); }
+    match &args[0] {
+        Value::Char(c) => Ok(Value::Integer(*c as i64)),
+        _ => Err(EvalError::Type("char->integer: expected char".into())),
+    }
+}
+
+fn builtin_integer_to_char(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("integer->char requires 1 argument".into())); }
+    let n = args[0].as_integer()?;
+    Ok(Value::Char(char::from_u32(n as u32).ok_or_else(|| EvalError::Type("integer->char: invalid code point".into()))?))
+}
+
+fn builtin_string_to_list(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("string->list requires 1 argument".into())); }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::List(s.chars().map(Value::Char).collect())),
+        _ => Err(EvalError::Type("string->list: expected string".into())),
+    }
+}
+
+fn builtin_list_to_string(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("list->string requires 1 argument".into())); }
+    match &args[0] {
+        Value::List(items) => {
+            let mut s = String::new();
+            for item in items {
+                match item {
+                    Value::Char(c) => s.push(*c),
+                    _ => return Err(EvalError::Type("list->string: expected char in list".into())),
+                }
+            }
+            Ok(Value::Str(s))
+        }
+        _ => Err(EvalError::Type("list->string: expected list".into())),
+    }
+}
+
+fn builtin_make_string(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(EvalError::Arity("make-string requires 1 or 2 arguments".into()));
+    }
+    let len = args[0].as_integer()? as usize;
+    let ch = if args.len() == 2 {
+        match &args[1] {
+            Value::Char(c) => *c,
+            _ => return Err(EvalError::Type("make-string: expected char".into())),
+        }
+    } else {
+        '\0'
+    };
+    Ok(Value::Str(std::iter::repeat_n(ch, len).collect()))
+}
+
+fn builtin_reverse(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("reverse requires 1 argument".into())); }
+    match &args[0] {
+        Value::List(items) => {
+            let mut reversed = items.clone();
+            reversed.reverse();
+            Ok(Value::List(reversed))
+        }
+        _ => Err(EvalError::Type("reverse: expected list".into())),
+    }
+}
+
+fn builtin_gcd(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.is_empty() { return Ok(Value::Integer(0)); }
+    let mut result = args[0].as_integer()?.abs();
+    for a in &args[1..] {
+        let mut b = a.as_integer()?.abs();
+        while b != 0 {
+            let t = b;
+            b = result % b;
+            result = t;
+        }
+    }
+    Ok(Value::Integer(result))
+}
+
+fn builtin_lcm(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.is_empty() { return Ok(Value::Integer(1)); }
+    let mut result = args[0].as_integer()?.abs();
+    for a in &args[1..] {
+        let b = a.as_integer()?.abs();
+        if b == 0 { return Ok(Value::Integer(0)); }
+        result = result / super::gcd(result, b) * b;
+    }
+    Ok(Value::Integer(result))
+}
+
+fn builtin_error(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    let msg = if args.is_empty() {
+        "error".to_string()
+    } else {
+        args.iter().map(|a| a.display_value()).collect::<Vec<_>>().join(" ")
+    };
+    Err(EvalError::Type(msg))
+}
+
+fn builtin_vector_fill(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("vector-fill! requires 2 arguments".into())); }
+    match &args[0] {
+        Value::Vector(v) => {
+            let fill = args[1].clone();
+            let mut items = v.borrow_mut();
+            for item in items.iter_mut() {
+                *item = fill.clone();
+            }
+            Ok(Value::Void)
+        }
+        _ => Err(EvalError::Type("vector-fill!: expected vector".into())),
+    }
+}
+
 pub(crate) fn make_global_env() -> Env {
     let env = Environment::new();
     {
@@ -729,6 +978,31 @@ pub(crate) fn make_global_env() -> Env {
         e.set("rational?".into(), Value::Builtin(builtin_is_rational));
         // L13: procedure?
         e.set("procedure?".into(), Value::Builtin(builtin_is_procedure));
+        // L14: Vectors
+        e.set("vector".into(), Value::Builtin(builtin_vector));
+        e.set("make-vector".into(), Value::Builtin(builtin_make_vector));
+        e.set("vector-ref".into(), Value::Builtin(builtin_vector_ref));
+        e.set("vector-set!".into(), Value::Builtin(builtin_vector_set));
+        e.set("vector-length".into(), Value::Builtin(builtin_vector_length));
+        e.set("vector?".into(), Value::Builtin(builtin_is_vector));
+        e.set("vector->list".into(), Value::Builtin(builtin_vector_to_list));
+        e.set("list->vector".into(), Value::Builtin(builtin_list_to_vector));
+        e.set("vector-fill!".into(), Value::Builtin(builtin_vector_fill));
+        // L14: eqv?, for-each, assq, memq
+        e.set("eqv?".into(), Value::Builtin(builtin_eqv));
+        e.set("for-each".into(), Value::Builtin(builtin_for_each));
+        e.set("assq".into(), Value::Builtin(builtin_assq));
+        e.set("memq".into(), Value::Builtin(builtin_memq));
+        // L14: Additional utilities
+        e.set("char->integer".into(), Value::Builtin(builtin_char_to_integer));
+        e.set("integer->char".into(), Value::Builtin(builtin_integer_to_char));
+        e.set("string->list".into(), Value::Builtin(builtin_string_to_list));
+        e.set("list->string".into(), Value::Builtin(builtin_list_to_string));
+        e.set("make-string".into(), Value::Builtin(builtin_make_string));
+        e.set("reverse".into(), Value::Builtin(builtin_reverse));
+        e.set("gcd".into(), Value::Builtin(builtin_gcd));
+        e.set("lcm".into(), Value::Builtin(builtin_lcm));
+        e.set("error".into(), Value::Builtin(builtin_error));
     }
     env
 }

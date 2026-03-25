@@ -1,5 +1,6 @@
 pub mod error;
 mod builtins;
+mod macros;
 
 pub use error::EvalError;
 
@@ -12,13 +13,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Ast {
-    kind: AstKind,
-    line: usize,
-    col: usize,
+    pub(crate) kind: AstKind,
+    pub(crate) line: usize,
+    pub(crate) col: usize,
 }
 
 #[derive(Debug, Clone)]
-enum AstKind {
+pub(crate) enum AstKind {
     Integer(i64),
     Rational(i64, i64),
     Float(f64),
@@ -77,10 +78,11 @@ pub(crate) enum Value {
         clauses: Vec<(Vec<String>, Option<String>, Vec<Ast>)>,
         env: Env,
     },
+    Vector(Rc<RefCell<Vec<Value>>>),
     Void,
 }
 
-fn gcd(a: i64, b: i64) -> i64 {
+pub(crate) fn gcd(a: i64, b: i64) -> i64 {
     let (mut a, mut b) = (a.abs(), b.abs());
     while b != 0 {
         let t = b;
@@ -118,14 +120,14 @@ impl Environment {
         }))
     }
 
-    fn with_parent(parent: &Env) -> Env {
+    pub(crate) fn with_parent(parent: &Env) -> Env {
         Rc::new(RefCell::new(Environment {
             bindings: HashMap::new(),
             parent: Some(Rc::clone(parent)),
         }))
     }
 
-    fn get(&self, name: &str) -> Option<Value> {
+    pub(crate) fn get(&self, name: &str) -> Option<Value> {
         if let Some(val) = self.bindings.get(name) {
             Some(val.clone())
         } else if let Some(ref parent) = self.parent {
@@ -173,6 +175,10 @@ impl Value {
         }
     }
 
+    pub(crate) fn is_vector(&self) -> bool {
+        matches!(self, Value::Vector(_))
+    }
+
     pub(crate) fn is_number(&self) -> bool {
         matches!(self, Value::Integer(_) | Value::Rational(_, _) | Value::Float(_))
     }
@@ -211,6 +217,11 @@ impl Value {
             | Value::RecordConstructor { .. } | Value::RecordPredicate { .. }
             | Value::RecordAccessor { .. }
             | Value::CaseLambda { .. } => "#<procedure>".into(),
+            Value::Vector(v) => {
+                let items = v.borrow();
+                let inner: Vec<String> = items.iter().map(|v| v.display_value()).collect();
+                format!("#({})", inner.join(" "))
+            }
             Value::Macro { .. } => "#<macro>".into(),
             Value::Record { type_name, fields, .. } => {
                 let inner: Vec<String> = fields.iter().map(|(k, v)| format!("{}: {}", k, v.display_value())).collect();
@@ -230,20 +241,12 @@ impl Value {
                 format!("({})", inner.join(" "))
             }
             Value::Pair(a, b) => format!("({} . {})", a.display_repr(), b.display_repr()),
-            Value::Integer(_)
-            | Value::Rational(_, _)
-            | Value::Float(_)
-            | Value::Boolean(_)
-            | Value::Symbol(_)
-            | Value::Lambda { .. }
-            | Value::Builtin(_)
-            | Value::Macro { .. }
-            | Value::Record { .. }
-            | Value::RecordConstructor { .. }
-            | Value::RecordPredicate { .. }
-            | Value::RecordAccessor { .. }
-            | Value::CaseLambda { .. }
-            | Value::Void => self.display_value(),
+            Value::Vector(v) => {
+                let items = v.borrow();
+                let inner: Vec<String> = items.iter().map(|v| v.display_repr()).collect();
+                format!("#({})", inner.join(" "))
+            }
+            _ => self.display_value(),
         }
     }
 }
@@ -376,6 +379,25 @@ impl Parser {
 
     fn parse_hash(&mut self, line: usize, col: usize) -> Result<Ast, EvalError> {
         self.next_char(); // consume '#'
+        if let Some('(') = self.peek() {
+            // Vector literal #(...)
+            self.next_char(); // consume '('
+            let mut items = Vec::new();
+            loop {
+                self.skip_whitespace();
+                match self.peek() {
+                    None => return Err(EvalError::Parse("unclosed vector literal".into())),
+                    Some(')') => {
+                        self.next_char();
+                        // Represent as (vector item ...) for eval
+                        let mut elems = vec![Ast { kind: AstKind::Symbol("vector".into()), line, col }];
+                        elems.extend(items);
+                        return Ok(Ast { kind: AstKind::List(elems), line, col });
+                    }
+                    _ => items.push(self.parse_expr()?),
+                }
+            }
+        }
         match self.next_char() {
             Some('t') => {
                 if self.peek().is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '-' && c != '!' && c != '?') {
@@ -483,7 +505,7 @@ impl Parser {
 // ---- Evaluator ----
 
 /// Evaluate an AST node, wrapping any error with source position.
-fn eval(ast: &Ast, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+pub(crate) fn eval(ast: &Ast, env: &Env, output: &mut String) -> Result<Value, EvalError> {
     eval_inner(ast, env, output).map_err(|e| match e {
         EvalError::WithPosition(_, _, _) => e,
         _ => EvalError::WithPosition(Box::new(e), ast.line, ast.col),
@@ -598,6 +620,13 @@ fn eval_inner(ast: &Ast, env: &Env, output: &mut String) -> Result<Value, EvalEr
                     "define-syntax" => return eval_define_syntax(&items[1..], env),
                     "define-record-type" => return eval_define_record_type(&items[1..], env),
                     "case-lambda" => return eval_case_lambda(&items[1..], env),
+                    "letrec" => return eval_letrec(&items[1..], env, output),
+                    "letrec*" => return eval_letrec_star(&items[1..], env, output),
+                    "case" => return eval_case(&items[1..], env, output),
+                    "do" => return eval_do(&items[1..], env, output),
+                    "let*" => return eval_let_star(&items[1..], env, output),
+                    "when" => return eval_when(&items[1..], env, output),
+                    "unless" => return eval_unless(&items[1..], env, output),
                     _ => {
                         // Check for macro invocation
                         let maybe_macro = env.borrow().get(op);
@@ -834,321 +863,273 @@ fn eval_cond(clauses: &[Ast], env: &Env, output: &mut String) -> Result<Value, E
     Ok(Value::Void)
 }
 
-// ---- Macro Support (L10) ----
+// ---- L14: letrec, letrec*, case, do, let*, when, unless ----
 
-static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn gensym(base: &str) -> String {
-    let n = GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}__macro_{}", base, n)
-}
-
-fn is_special_form(name: &str) -> bool {
-    matches!(
-        name,
-        "define" | "if" | "quote" | "lambda" | "let" | "begin"
-            | "cond" | "and" | "or" | "set!" | "string-set!"
-            | "define-syntax" | "syntax-rules" | "define-record-type" | "case-lambda"
-    )
-}
-
-#[derive(Debug, Clone)]
-enum PatternBinding {
-    Single(Ast),
-    Ellipsis(Vec<Ast>),
-}
-
-fn match_pattern(
-    pattern: &[Ast],
-    form: &[Ast],
-    literals: &[String],
-    bindings: &mut HashMap<String, PatternBinding>,
-) -> bool {
-    let mut pi = 0;
-    let mut fi = 0;
-
-    while pi < pattern.len() {
-        if matches!(&pattern[pi].kind, AstKind::Symbol(s) if s == "...") {
-            pi += 1;
-            continue;
-        }
-
-        let is_ellipsis = pi + 1 < pattern.len()
-            && matches!(&pattern[pi + 1].kind, AstKind::Symbol(s) if s == "...");
-
-        if is_ellipsis {
-            match &pattern[pi].kind {
-                AstKind::Symbol(name) if !literals.contains(name) && name != "_" => {
-                    let remaining = count_non_ellipsis_remaining(&pattern[pi + 2..]);
-                    let available = if form.len() >= fi + remaining {
-                        form.len() - fi - remaining
-                    } else {
-                        return false;
-                    };
-                    bindings.insert(
-                        name.clone(),
-                        PatternBinding::Ellipsis(form[fi..fi + available].to_vec()),
-                    );
-                    fi += available;
-                    pi += 2;
-                }
-                _ => return false,
-            }
-        } else {
-            if fi >= form.len() {
-                return false;
-            }
-            match &pattern[pi].kind {
-                AstKind::Symbol(name) if literals.contains(name) => {
-                    if !matches!(&form[fi].kind, AstKind::Symbol(s) if s == name) {
-                        return false;
-                    }
-                }
-                AstKind::Symbol(name) if name == "_" => {}
-                AstKind::Symbol(name) => {
-                    bindings.insert(name.clone(), PatternBinding::Single(form[fi].clone()));
-                }
-                AstKind::List(sub_pat) => {
-                    if let AstKind::List(sub_form) = &form[fi].kind {
-                        if !match_pattern(sub_pat, sub_form, literals, bindings) {
-                            return false;
-                        }
-                    } else {
-                        return false;
-                    }
-                }
-                _ => return false,
-            }
-            pi += 1;
-            fi += 1;
-        }
+fn eval_letrec(args: &[Ast], env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity("letrec requires bindings and body".into()));
     }
-
-    fi == form.len()
-}
-
-fn count_non_ellipsis_remaining(pattern: &[Ast]) -> usize {
-    let mut count = 0;
-    let mut i = 0;
-    while i < pattern.len() {
-        if matches!(&pattern[i].kind, AstKind::Symbol(s) if s == "...") {
-            i += 1;
-            continue;
-        }
-        let is_ellipsis = i + 1 < pattern.len()
-            && matches!(&pattern[i + 1].kind, AstKind::Symbol(s) if s == "...");
-        if is_ellipsis {
-            i += 2;
-        } else {
-            count += 1;
-            i += 1;
-        }
-    }
-    count
-}
-
-fn expand_ellipsis_element(
-    element: &Ast,
-    bindings: &HashMap<String, PatternBinding>,
-    renames: &mut HashMap<String, String>,
-    expanded: &mut Vec<Ast>,
-) {
-    let var_name = match find_ellipsis_var(element, bindings) {
-        Some(name) => name,
-        None => return,
+    let bindings_list = match &args[0].kind {
+        AstKind::List(b) => b,
+        _ => return Err(EvalError::Type("letrec: expected bindings list".into())),
     };
-    let values = match bindings.get(&var_name) {
-        Some(PatternBinding::Ellipsis(vals)) => vals,
-        _ => return,
+    let local_env = Environment::with_parent(env);
+    // First pass: bind all names to Void (so they're visible to each other)
+    let mut names = Vec::new();
+    let mut init_exprs = Vec::new();
+    for binding in bindings_list {
+        match &binding.kind {
+            AstKind::List(pair) if pair.len() == 2 => {
+                let name = match &pair[0].kind {
+                    AstKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Type("letrec: expected symbol in binding".into())),
+                };
+                local_env.borrow_mut().set(name.clone(), Value::Void);
+                names.push(name);
+                init_exprs.push(&pair[1]);
+            }
+            _ => return Err(EvalError::Type("letrec: invalid binding".into())),
+        }
+    }
+    // Second pass: evaluate inits in the local_env and update bindings
+    for (name, init_expr) in names.iter().zip(init_exprs.iter()) {
+        let val = eval(init_expr, &local_env, output)?;
+        local_env.borrow_mut().set(name.clone(), val);
+    }
+    let mut result = Value::Void;
+    for expr in &args[1..] {
+        result = eval(expr, &local_env, output)?;
+    }
+    Ok(result)
+}
+
+fn eval_letrec_star(args: &[Ast], env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity("letrec* requires bindings and body".into()));
+    }
+    let bindings_list = match &args[0].kind {
+        AstKind::List(b) => b,
+        _ => return Err(EvalError::Type("letrec*: expected bindings list".into())),
     };
-    for val in values {
-        let mut local_bindings = bindings.clone();
-        local_bindings.insert(var_name.clone(), PatternBinding::Single(val.clone()));
-        expanded.push(expand_template(element, &local_bindings, renames));
+    let local_env = Environment::with_parent(env);
+    // Bind all names to Void first
+    for binding in bindings_list {
+        if let AstKind::List(pair) = &binding.kind {
+            if let AstKind::Symbol(s) = &pair[0].kind {
+                local_env.borrow_mut().set(s.clone(), Value::Void);
+            }
+        }
+    }
+    // Evaluate sequentially — each init can see previous bindings
+    for binding in bindings_list {
+        match &binding.kind {
+            AstKind::List(pair) if pair.len() == 2 => {
+                let name = match &pair[0].kind {
+                    AstKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Type("letrec*: expected symbol in binding".into())),
+                };
+                let val = eval(&pair[1], &local_env, output)?;
+                local_env.borrow_mut().set(name, val);
+            }
+            _ => return Err(EvalError::Type("letrec*: invalid binding".into())),
+        }
+    }
+    let mut result = Value::Void;
+    for expr in &args[1..] {
+        result = eval(expr, &local_env, output)?;
+    }
+    Ok(result)
+}
+
+pub(crate) fn eqv(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Rational(xn, xd), Value::Rational(yn, yd)) => xn == yn && xd == yd,
+        (Value::Float(x), Value::Float(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::List(x), Value::List(y)) => x.is_empty() && y.is_empty(),
+        _ => false,
     }
 }
 
-fn expand_template(
-    template: &Ast,
-    bindings: &HashMap<String, PatternBinding>,
-    renames: &mut HashMap<String, String>,
-) -> Ast {
-    match &template.kind {
-        AstKind::Symbol(name) => {
-            if let Some(binding) = bindings.get(name) {
-                match binding {
-                    PatternBinding::Single(ast) => return ast.clone(),
-                    PatternBinding::Ellipsis(_) => return template.clone(),
-                }
-            }
-            if is_special_form(name) || name == "..." {
-                template.clone()
-            } else {
-                let gensym_name = renames
-                    .entry(name.clone())
-                    .or_insert_with(|| gensym(name))
-                    .clone();
-                Ast {
-                    kind: AstKind::Symbol(gensym_name),
-                    line: template.line,
-                    col: template.col,
-                }
-            }
-        }
-        AstKind::List(elements) => {
-            let mut expanded = Vec::new();
-            let mut i = 0;
-            while i < elements.len() {
-                if matches!(&elements[i].kind, AstKind::Symbol(s) if s == "...") {
-                    i += 1;
-                    continue;
-                }
-                let is_ellipsis = i + 1 < elements.len()
-                    && matches!(&elements[i + 1].kind, AstKind::Symbol(s) if s == "...");
-
-                if is_ellipsis {
-                    expand_ellipsis_element(&elements[i], bindings, renames, &mut expanded);
-                    i += 2;
-                } else {
-                    expanded.push(expand_template(&elements[i], bindings, renames));
-                    i += 1;
-                }
-            }
-            Ast {
-                kind: AstKind::List(expanded),
-                line: template.line,
-                col: template.col,
-            }
-        }
-        _ => template.clone(),
+fn eval_body(exprs: &[Ast], env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    let mut result = Value::Void;
+    for expr in exprs {
+        result = eval(expr, env, output)?;
     }
+    Ok(result)
 }
 
-fn find_ellipsis_var(
-    template: &Ast,
-    bindings: &HashMap<String, PatternBinding>,
-) -> Option<String> {
-    match &template.kind {
-        AstKind::Symbol(name) => {
-            if matches!(bindings.get(name), Some(PatternBinding::Ellipsis(_))) {
-                Some(name.clone())
+fn eval_case(args: &[Ast], env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Arity("case requires at least a key expression".into()));
+    }
+    let key = eval(&args[0], env, output)?;
+    for clause in &args[1..] {
+        let items = match &clause.kind {
+            AstKind::List(items) if items.len() >= 2 => items,
+            _ => return Err(EvalError::Type("case: invalid clause".into())),
+        };
+        // Check for else clause
+        if matches!(&items[0].kind, AstKind::Symbol(s) if s == "else") {
+            return eval_body(&items[1..], env, output);
+        }
+        // Check datums list
+        if let AstKind::List(datums) = &items[0].kind {
+            let matched = datums.iter().any(|d| eqv(&key, &ast_to_value(d)));
+            if matched {
+                return eval_body(&items[1..], env, output);
+            }
+        }
+    }
+    Ok(Value::Void)
+}
+
+fn eval_do(args: &[Ast], env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    // (do ((var init step) ...) (test expr ...) body ...)
+    if args.len() < 2 {
+        return Err(EvalError::Arity("do requires variable bindings and test clause".into()));
+    }
+    let var_specs = match &args[0].kind {
+        AstKind::List(v) => v,
+        _ => return Err(EvalError::Type("do: expected variable list".into())),
+    };
+    let test_clause = match &args[1].kind {
+        AstKind::List(t) if !t.is_empty() => t,
+        _ => return Err(EvalError::Type("do: expected test clause".into())),
+    };
+    let body = &args[2..];
+
+    // Parse variable specs
+    struct DoVar {
+        name: String,
+        step: Option<usize>, // index into var_specs for the step expression
+    }
+    let mut vars: Vec<DoVar> = Vec::new();
+    let mut step_exprs: Vec<Option<Ast>> = Vec::new();
+
+    let local_env = Environment::with_parent(env);
+
+    for spec in var_specs {
+        match &spec.kind {
+            AstKind::List(parts) if parts.len() >= 2 => {
+                let name = match &parts[0].kind {
+                    AstKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Type("do: expected symbol for variable".into())),
+                };
+                let init = eval(&parts[1], env, output)?;
+                local_env.borrow_mut().set(name.clone(), init);
+                let step = if parts.len() >= 3 { Some(parts[2].clone()) } else { None };
+                vars.push(DoVar { name, step: if step.is_some() { Some(step_exprs.len()) } else { None } });
+                step_exprs.push(step);
+            }
+            _ => return Err(EvalError::Type("do: invalid variable spec".into())),
+        }
+    }
+
+    loop {
+        // Test
+        let test_val = eval(&test_clause[0], &local_env, output)?;
+        if test_val.is_truthy() {
+            // Evaluate result expressions
+            if test_clause.len() > 1 {
+                let mut result = Value::Void;
+                for expr in &test_clause[1..] {
+                    result = eval(expr, &local_env, output)?;
+                }
+                return Ok(result);
+            }
+            return Ok(Value::Void);
+        }
+
+        // Execute body
+        for expr in body {
+            eval(expr, &local_env, output)?;
+        }
+
+        // Parallel step: evaluate all steps with current values, then update
+        let new_vals: Vec<Option<Result<Value, EvalError>>> = vars.iter().map(|v| {
+            if let Some(idx) = v.step {
+                step_exprs[idx].as_ref().map(|step_expr| eval(step_expr, &local_env, output))
             } else {
                 None
             }
-        }
-        AstKind::List(elements) => {
-            for elem in elements {
-                if let Some(name) = find_ellipsis_var(elem, bindings) {
-                    return Some(name);
-                }
+        }).collect();
+
+        for (var, new_val) in vars.iter().zip(new_vals.into_iter()) {
+            if let Some(result) = new_val {
+                local_env.borrow_mut().set(var.name.clone(), result?);
             }
-            None
         }
-        _ => None,
     }
 }
 
-fn expand_and_eval_macro(
-    literals: &[String],
-    rules: &[(Ast, Ast)],
-    def_env: &Env,
-    form: &[Ast],
-    use_env: &Env,
-    output: &mut String,
-) -> Result<Value, EvalError> {
-    let form_args = &form[1..];
-
-    for (pattern, template) in rules {
-        let pattern_args = match &pattern.kind {
-            AstKind::List(items) if !items.is_empty() => &items[1..],
-            _ => continue,
-        };
-
-        let mut bindings = HashMap::new();
-        if match_pattern(pattern_args, form_args, literals, &mut bindings) {
-            let mut renames = HashMap::new();
-            let expanded = expand_template(template, &bindings, &mut renames);
-
-            if !renames.is_empty() {
-                let child_env = Environment::with_parent(use_env);
-                for (original, gensym_name) in &renames {
-                    if let Some(val) = def_env.borrow().get(original) {
-                        child_env.borrow_mut().set(gensym_name.clone(), val);
-                    }
-                }
-                return eval(&expanded, &child_env, output);
-            }
-
-            return eval(&expanded, use_env, output);
-        }
+fn eval_let_star(args: &[Ast], env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity("let* requires bindings and body".into()));
     }
-
-    Err(EvalError::Type("no matching macro pattern".into()))
-}
-
-fn eval_define_syntax(args: &[Ast], env: &Env) -> Result<Value, EvalError> {
-    if args.len() != 2 {
-        return Err(EvalError::Arity(
-            "define-syntax requires 2 arguments".into(),
-        ));
-    }
-    let name = match &args[0].kind {
-        AstKind::Symbol(s) => s.clone(),
-        _ => return Err(EvalError::Type("define-syntax: expected symbol".into())),
+    let bindings_list = match &args[0].kind {
+        AstKind::List(b) => b,
+        _ => return Err(EvalError::Type("let*: expected bindings list".into())),
     };
-    let sr = match &args[1].kind {
-        AstKind::List(items) => items,
-        _ => {
-            return Err(EvalError::Type(
-                "define-syntax: expected syntax-rules".into(),
-            ))
-        }
-    };
-    if sr.is_empty() || !matches!(&sr[0].kind, AstKind::Symbol(s) if s == "syntax-rules") {
-        return Err(EvalError::Type(
-            "define-syntax: expected syntax-rules".into(),
-        ));
-    }
-    if sr.len() < 2 {
-        return Err(EvalError::Type(
-            "syntax-rules: missing literals list".into(),
-        ));
-    }
-    let literals = match &sr[1].kind {
-        AstKind::List(lits) => lits
-            .iter()
-            .map(|l| match &l.kind {
-                AstKind::Symbol(s) => Ok(s.clone()),
-                _ => Err(EvalError::Type(
-                    "syntax-rules: expected symbol in literals".into(),
-                )),
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        _ => {
-            return Err(EvalError::Type(
-                "syntax-rules: expected literals list".into(),
-            ))
-        }
-    };
-    let mut rules = Vec::new();
-    for rule in &sr[2..] {
-        match &rule.kind {
+    let local_env = Environment::with_parent(env);
+    for binding in bindings_list {
+        match &binding.kind {
             AstKind::List(pair) if pair.len() == 2 => {
-                rules.push((pair[0].clone(), pair[1].clone()));
+                let name = match &pair[0].kind {
+                    AstKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Type("let*: expected symbol in binding".into())),
+                };
+                let val = eval(&pair[1], &local_env, output)?;
+                local_env.borrow_mut().set(name, val);
             }
-            _ => return Err(EvalError::Type("syntax-rules: invalid rule".into())),
+            _ => return Err(EvalError::Type("let*: invalid binding".into())),
         }
     }
-    env.borrow_mut().set(
-        name,
-        Value::Macro {
-            literals,
-            rules,
-            def_env: Rc::clone(env),
-        },
-    );
-    Ok(Value::Void)
+    let mut result = Value::Void;
+    for expr in &args[1..] {
+        result = eval(expr, &local_env, output)?;
+    }
+    Ok(result)
 }
+
+fn eval_when(args: &[Ast], env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity("when requires a test and body".into()));
+    }
+    let test = eval(&args[0], env, output)?;
+    if test.is_truthy() {
+        let mut result = Value::Void;
+        for expr in &args[1..] {
+            result = eval(expr, env, output)?;
+        }
+        Ok(result)
+    } else {
+        Ok(Value::Void)
+    }
+}
+
+fn eval_unless(args: &[Ast], env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity("unless requires a test and body".into()));
+    }
+    let test = eval(&args[0], env, output)?;
+    if !test.is_truthy() {
+        let mut result = Value::Void;
+        for expr in &args[1..] {
+            result = eval(expr, env, output)?;
+        }
+        Ok(result)
+    } else {
+        Ok(Value::Void)
+    }
+}
+
+// ---- Macro Support (L10) — see macros.rs ----
+
+use macros::{expand_and_eval_macro, eval_define_syntax};
 
 static RECORD_TYPE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1332,6 +1313,7 @@ fn apply(func: &Value, args: &[Value], output: &mut String) -> Result<Value, Eva
         | Value::Symbol(_)
         | Value::Macro { .. }
         | Value::Record { .. }
+        | Value::Vector(_)
         | Value::Void => Err(EvalError::Type(format!("not a procedure: {}", func.display_value()))),
     }
 }
