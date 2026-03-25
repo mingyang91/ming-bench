@@ -139,6 +139,13 @@ public class Interpreter {
             return new SchemeValue.BoolVal(args[0] instanceof SchemeValue.SymbolVal);
         }));
 
+        globals.define("procedure?", new SchemeValue.BuiltinVal("procedure?", args -> {
+            if (args.length != 1) throw new EvalError("procedure?: expected 1 argument");
+            return new SchemeValue.BoolVal(args[0] instanceof SchemeValue.LambdaVal
+                || args[0] instanceof SchemeValue.BuiltinVal
+                || args[0] instanceof SchemeValue.CaseLambdaVal);
+        }));
+
         // L05 builtins
         globals.define("display", new SchemeValue.BuiltinVal("display", args -> {
             if (args.length != 1) throw new EvalError("display: expected 1 argument");
@@ -537,6 +544,7 @@ public class Interpreter {
                 case SchemeValue.PairVal v -> v;
                 case SchemeValue.MacroVal v -> v;
                 case SchemeValue.RecordVal v -> v;
+                case SchemeValue.CaseLambdaVal v -> v;
                 case SchemeValue.SymbolVal v -> env.get(v.name());
                 case SchemeValue.ListVal v -> evalList(v, env);
             };
@@ -563,6 +571,7 @@ public class Interpreter {
                 case "if" -> evalIf(list.elements(), env);
                 case "quote" -> evalQuote(list.elements());
                 case "lambda" -> evalLambda(list.elements(), env);
+                case "case-lambda" -> evalCaseLambda(list.elements(), env);
                 case "and" -> evalAnd(list.elements(), env);
                 case "or" -> evalOr(list.elements(), env);
                 case "let" -> evalLet(list.elements(), env);
@@ -697,6 +706,21 @@ public class Interpreter {
         }
         var body = elements.subList(2, elements.size());
         return new SchemeValue.LambdaVal(params, null, body, env);
+    }
+
+    private SchemeValue evalCaseLambda(List<SchemeValue> elements, Environment env) throws EvalError {
+        var clauses = new ArrayList<SchemeValue.LambdaVal>();
+        for (int i = 1; i < elements.size(); i++) {
+            if (!(elements.get(i) instanceof SchemeValue.ListVal clause) || clause.elements().size() < 2)
+                throw new EvalError("case-lambda: bad clause");
+            // Build a lambda for each clause by wrapping as (lambda params body...)
+            var lambdaElements = new ArrayList<SchemeValue>();
+            lambdaElements.add(new SchemeValue.SymbolVal("lambda"));
+            lambdaElements.addAll(clause.elements());
+            var lambda = evalLambda(lambdaElements, env);
+            clauses.add((SchemeValue.LambdaVal) lambda);
+        }
+        return new SchemeValue.CaseLambdaVal(clauses);
     }
 
     private SchemeValue evalAnd(List<SchemeValue> elements, Environment env) throws EvalError {
@@ -850,6 +874,17 @@ public class Interpreter {
                 result = eval(bodyExpr, callEnv);
             }
             return result;
+        }
+
+        if (proc instanceof SchemeValue.CaseLambdaVal cl) {
+            for (var clause : cl.clauses()) {
+                if (clause.restParam() != null) {
+                    if (args.length >= clause.params().size()) return callProc(clause, args);
+                } else {
+                    if (args.length == clause.params().size()) return callProc(clause, args);
+                }
+            }
+            throw new EvalError("case-lambda: no matching clause for " + args.length + " arguments");
         }
 
         if (proc instanceof SchemeValue.BuiltinVal builtin) {
