@@ -203,6 +203,15 @@ final class Continuations {
         }
     }
 
+    // Multiple return values wrapper
+    record SchemeValues(List<Object> values) {}
+
+    // call-with-values: producer returned, now call consumer
+    static final class CallWithValuesK extends Kont {
+        final Object consumer; final Pos pos; final Kont k;
+        CallWithValuesK(Object c, Pos p, Kont k) { consumer=c; pos=p; this.k=k; }
+    }
+
     // Exception handler stack entry
     static class ExHandlerFrame {
         final Object handler;      // for with-exception-handler (null for guard)

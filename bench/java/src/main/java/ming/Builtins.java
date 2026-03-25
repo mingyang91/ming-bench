@@ -789,6 +789,8 @@ final class Builtins {
         define("dynamic-wind", args -> { throw new EvalError("dynamic-wind: should be handled by CEK machine"); });
         define("raise", args -> { throw new EvalError("raise: should be handled by CEK machine"); });
         define("with-exception-handler", args -> { throw new EvalError("with-exception-handler: should be handled by CEK machine"); });
+        define("values", args -> { throw new EvalError("values: should be handled by CEK machine"); });
+        define("call-with-values", args -> { throw new EvalError("call-with-values: should be handled by CEK machine"); });
     }
 
     // --- Numeric utilities (L09) ---

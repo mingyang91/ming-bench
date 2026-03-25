@@ -483,6 +483,19 @@ public class Evaluator {
             return;
         }
 
+        if (mK instanceof Continuations.CallWithValuesK cwv) {
+            // Producer returned, call consumer with the values
+            List<Object> consumerArgs;
+            if (mVal instanceof Continuations.SchemeValues sv) {
+                consumerArgs = sv.values();
+            } else {
+                consumerArgs = List.of(mVal);
+            }
+            mK = cwv.k;
+            cekApplyFun(cwv.consumer, consumerArgs, cwv.pos);
+            return;
+        }
+
         if (mK instanceof DynWindBodyK dwb) {
             // in-thunk done, push wind entry and run body
             windStack.add(dwb.entry);
@@ -749,6 +762,25 @@ public class Evaluator {
                 exHandlerStack.add(new ExHandlerFrame(handler));
                 mK = new WithExHandlerK(mK);
                 cekApplyFun(thunk, List.of(), pos);
+                return;
+            }
+
+            // values
+            if ("values".equals(name)) {
+                if (args.size() == 1) {
+                    mVal = args.get(0); mApply = true;
+                } else {
+                    mVal = new Continuations.SchemeValues(args); mApply = true;
+                }
+                return;
+            }
+
+            // call-with-values
+            if ("call-with-values".equals(name)) {
+                if (args.size() != 2) throw new EvalError("call-with-values requires 2 arguments" + posStr(pos));
+                Object producer = args.get(0), consumer = args.get(1);
+                mK = new Continuations.CallWithValuesK(consumer, pos, mK);
+                cekApplyFun(producer, List.of(), pos);
                 return;
             }
 
