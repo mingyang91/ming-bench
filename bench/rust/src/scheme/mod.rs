@@ -2,8 +2,10 @@ pub mod error;
 
 pub use error::EvalError;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Span {
@@ -318,21 +320,21 @@ fn parse_all(input: &str) -> Result<Vec<Expr>, EvalError> {
 
 #[derive(Debug, Clone)]
 struct Env {
-    bindings: HashMap<String, Value>,
+    bindings: Rc<RefCell<HashMap<String, Value>>>,
     parent: Option<Box<Env>>,
 }
 
 impl Env {
     fn new() -> Self {
-        Env { bindings: HashMap::new(), parent: None }
+        Env { bindings: Rc::new(RefCell::new(HashMap::new())), parent: None }
     }
 
     fn with_parent(parent: Env) -> Self {
-        Env { bindings: HashMap::new(), parent: Some(Box::new(parent)) }
+        Env { bindings: Rc::new(RefCell::new(HashMap::new())), parent: Some(Box::new(parent)) }
     }
 
     fn get(&self, name: &str) -> Option<Value> {
-        if let Some(v) = self.bindings.get(name) {
+        if let Some(v) = self.bindings.borrow().get(name) {
             Some(v.clone())
         } else if let Some(ref parent) = self.parent {
             parent.get(name)
@@ -341,13 +343,24 @@ impl Env {
         }
     }
 
-    fn set(&mut self, name: String, val: Value) {
-        self.bindings.insert(name, val);
+    fn set(&self, name: String, val: Value) {
+        self.bindings.borrow_mut().insert(name, val);
+    }
+
+    fn set_existing(&self, name: &str, val: Value) -> bool {
+        if self.bindings.borrow().contains_key(name) {
+            self.bindings.borrow_mut().insert(name.to_string(), val);
+            true
+        } else if let Some(ref parent) = self.parent {
+            parent.set_existing(name, val)
+        } else {
+            false
+        }
     }
 }
 
 fn default_env() -> Env {
-    let mut env = Env::new();
+    let env = Env::new();
     for name in [
         "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "and", "or",
         "cons", "car", "cdr", "null?", "list", "length", "append",
@@ -590,6 +603,20 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                         }
                         return Ok(Value::Void);
                     }
+                    "set!" => {
+                        if elems.len() != 3 {
+                            return Err(EvalError::Syntax(format!("set! requires 2 arguments at {span}")));
+                        }
+                        let var_name = match &elems[1].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Syntax(format!("set!: expected variable name at {span}"))),
+                        };
+                        let val = eval(&elems[2], env, output)?;
+                        if !env.set_existing(&var_name, val) {
+                            return Err(EvalError::Unbound(format!("{var_name} at {span}")));
+                        }
+                        return Ok(Value::Void);
+                    }
                     "string-set!" => {
                         if elems.len() != 4 {
                             return Err(EvalError::Syntax(format!("string-set! requires 3 arguments at {span}")));
@@ -687,13 +714,18 @@ fn apply_func(func: &Value, args: &[Value], call_span: Span, output: &mut String
                     } else { None }
                 }).collect();
                 let final_bindings: Vec<(String, Value)> = define_names.iter()
-                    .filter_map(|n| local_env.bindings.get(n).map(|v| (n.clone(), v.clone())))
+                    .filter_map(|n| local_env.bindings.borrow().get(n).map(|v| (n.clone(), v.clone())))
                     .collect();
+                // Extract lambdas, modify them outside the borrow, then put them back
                 for dn in &define_names {
-                    if let Some(Value::Lambda { env: ref mut closure_env, .. }) = local_env.bindings.get_mut(dn) {
+                    let mut val = local_env.bindings.borrow_mut().remove(dn);
+                    if let Some(Value::Lambda { env: ref mut closure_env, .. }) = val {
                         for (sib_name, sib_val) in &final_bindings {
                             closure_env.set(sib_name.clone(), sib_val.clone());
                         }
+                    }
+                    if let Some(v) = val {
+                        local_env.bindings.borrow_mut().insert(dn.clone(), v);
                     }
                 }
             }
