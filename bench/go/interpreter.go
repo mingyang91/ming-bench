@@ -349,6 +349,8 @@ type value interface{}
 
 type symbolValue string
 
+type charValue rune
+
 type emptyListValue struct{}
 
 type pairValue struct {
@@ -360,7 +362,7 @@ type voidValue struct{}
 
 type builtinProc struct {
 	name string
-	fn   func(args []value, callPos position) (value, error)
+	fn   func(it *interpreter, args []value, callPos position) (value, error)
 }
 
 type closureProc struct {
@@ -397,6 +399,7 @@ func (e *env) lookup(name string) (value, bool) {
 
 type interpreter struct {
 	global *env
+	output strings.Builder
 }
 
 func newInterpreter() *interpreter {
@@ -429,6 +432,18 @@ func (it *interpreter) installBuiltins() {
 	it.global.define("boolean?", &builtinProc{name: "boolean?", fn: builtinBooleanPred})
 	it.global.define("pair?", &builtinProc{name: "pair?", fn: builtinPairPred})
 	it.global.define("symbol?", &builtinProc{name: "symbol?", fn: builtinSymbolPred})
+	it.global.define("display", &builtinProc{name: "display", fn: builtinDisplay})
+	it.global.define("write", &builtinProc{name: "write", fn: builtinWrite})
+	it.global.define("newline", &builtinProc{name: "newline", fn: builtinNewline})
+	it.global.define("string-append", &builtinProc{name: "string-append", fn: builtinStringAppend})
+	it.global.define("string-length", &builtinProc{name: "string-length", fn: builtinStringLength})
+	it.global.define("substring", &builtinProc{name: "substring", fn: builtinSubstring})
+	it.global.define("string->number", &builtinProc{name: "string->number", fn: builtinStringToNumber})
+	it.global.define("number->string", &builtinProc{name: "number->string", fn: builtinNumberToString})
+	it.global.define("symbol->string", &builtinProc{name: "symbol->string", fn: builtinSymbolToString})
+	it.global.define("string->symbol", &builtinProc{name: "string->symbol", fn: builtinStringToSymbol})
+	it.global.define("string-ref", &builtinProc{name: "string-ref", fn: builtinStringRef})
+	it.global.define("char?", &builtinProc{name: "char?", fn: builtinCharPred})
 }
 
 func (it *interpreter) evalProgram(exprs []expr) (value, error) {
@@ -516,7 +531,7 @@ func (it *interpreter) evalList(list *listExpr, scope *env) (value, error) {
 
 	switch proc := operator.(type) {
 	case *builtinProc:
-		return proc.fn(args, list.at)
+		return proc.fn(it, args, list.at)
 	case *closureProc:
 		return it.applyClosure(proc, args, list.at)
 	default:
@@ -850,7 +865,7 @@ func listToSlice(v value, pos position) ([]value, error) {
 	}
 }
 
-func builtinAdd(args []value, callPos position) (value, error) {
+func builtinAdd(_ *interpreter, args []value, callPos position) (value, error) {
 	var total int64
 	for _, arg := range args {
 		n, err := expectInt(arg, callPos)
@@ -862,7 +877,7 @@ func builtinAdd(args []value, callPos position) (value, error) {
 	return total, nil
 }
 
-func builtinSub(args []value, callPos position) (value, error) {
+func builtinSub(_ *interpreter, args []value, callPos position) (value, error) {
 	if len(args) == 0 {
 		return nil, wrongArgCount(callPos, "-", "expected at least 1 argument")
 	}
@@ -886,7 +901,7 @@ func builtinSub(args []value, callPos position) (value, error) {
 	return total, nil
 }
 
-func builtinMul(args []value, callPos position) (value, error) {
+func builtinMul(_ *interpreter, args []value, callPos position) (value, error) {
 	product := int64(1)
 	for _, arg := range args {
 		n, err := expectInt(arg, callPos)
@@ -898,7 +913,7 @@ func builtinMul(args []value, callPos position) (value, error) {
 	return product, nil
 }
 
-func builtinDiv(args []value, callPos position) (value, error) {
+func builtinDiv(_ *interpreter, args []value, callPos position) (value, error) {
 	if len(args) < 2 {
 		return nil, wrongArgCount(callPos, "/", "expected at least 2 arguments")
 	}
@@ -920,19 +935,19 @@ func builtinDiv(args []value, callPos position) (value, error) {
 	return quotient, nil
 }
 
-func builtinLessThan(args []value, callPos position) (value, error) {
+func builtinLessThan(_ *interpreter, args []value, callPos position) (value, error) {
 	return compareNumbers(args, callPos, "<", func(left, right int64) bool { return left < right })
 }
 
-func builtinGreaterThan(args []value, callPos position) (value, error) {
+func builtinGreaterThan(_ *interpreter, args []value, callPos position) (value, error) {
 	return compareNumbers(args, callPos, ">", func(left, right int64) bool { return left > right })
 }
 
-func builtinEqual(args []value, callPos position) (value, error) {
+func builtinEqual(_ *interpreter, args []value, callPos position) (value, error) {
 	return compareNumbers(args, callPos, "=", func(left, right int64) bool { return left == right })
 }
 
-func builtinLessEqual(args []value, callPos position) (value, error) {
+func builtinLessEqual(_ *interpreter, args []value, callPos position) (value, error) {
 	return compareNumbers(args, callPos, "<=", func(left, right int64) bool { return left <= right })
 }
 
@@ -958,21 +973,21 @@ func compareNumbers(args []value, callPos position, name string, cmp func(int64,
 	return true, nil
 }
 
-func builtinNot(args []value, callPos position) (value, error) {
+func builtinNot(_ *interpreter, args []value, callPos position) (value, error) {
 	if len(args) != 1 {
 		return nil, wrongArgCount(callPos, "not", "expected exactly 1 argument")
 	}
 	return !isTruthy(args[0]), nil
 }
 
-func builtinCons(args []value, callPos position) (value, error) {
+func builtinCons(_ *interpreter, args []value, callPos position) (value, error) {
 	if len(args) != 2 {
 		return nil, wrongArgCount(callPos, "cons", "expected exactly 2 arguments")
 	}
 	return &pairValue{car: args[0], cdr: args[1]}, nil
 }
 
-func builtinCar(args []value, callPos position) (value, error) {
+func builtinCar(_ *interpreter, args []value, callPos position) (value, error) {
 	if len(args) != 1 {
 		return nil, wrongArgCount(callPos, "car", "expected exactly 1 argument")
 	}
@@ -984,7 +999,7 @@ func builtinCar(args []value, callPos position) (value, error) {
 	return pair.car, nil
 }
 
-func builtinCdr(args []value, callPos position) (value, error) {
+func builtinCdr(_ *interpreter, args []value, callPos position) (value, error) {
 	if len(args) != 1 {
 		return nil, wrongArgCount(callPos, "cdr", "expected exactly 1 argument")
 	}
@@ -996,7 +1011,7 @@ func builtinCdr(args []value, callPos position) (value, error) {
 	return pair.cdr, nil
 }
 
-func builtinNull(args []value, callPos position) (value, error) {
+func builtinNull(_ *interpreter, args []value, callPos position) (value, error) {
 	if len(args) != 1 {
 		return nil, wrongArgCount(callPos, "null?", "expected exactly 1 argument")
 	}
@@ -1004,11 +1019,11 @@ func builtinNull(args []value, callPos position) (value, error) {
 	return ok, nil
 }
 
-func builtinList(args []value, callPos position) (value, error) {
+func builtinList(_ *interpreter, args []value, callPos position) (value, error) {
 	return buildList(args), nil
 }
 
-func builtinLength(args []value, callPos position) (value, error) {
+func builtinLength(_ *interpreter, args []value, callPos position) (value, error) {
 	if len(args) != 1 {
 		return nil, wrongArgCount(callPos, "length", "expected exactly 1 argument")
 	}
@@ -1020,7 +1035,7 @@ func builtinLength(args []value, callPos position) (value, error) {
 	return int64(len(items)), nil
 }
 
-func builtinAppend(args []value, callPos position) (value, error) {
+func builtinAppend(_ *interpreter, args []value, callPos position) (value, error) {
 	if len(args) == 0 {
 		return emptyListValue{}, nil
 	}
@@ -1038,7 +1053,7 @@ func builtinAppend(args []value, callPos position) (value, error) {
 	return result, nil
 }
 
-func builtinStringPred(args []value, callPos position) (value, error) {
+func builtinStringPred(_ *interpreter, args []value, callPos position) (value, error) {
 	if len(args) != 1 {
 		return nil, wrongArgCount(callPos, "string?", "expected exactly 1 argument")
 	}
@@ -1046,7 +1061,7 @@ func builtinStringPred(args []value, callPos position) (value, error) {
 	return ok, nil
 }
 
-func builtinNumberPred(args []value, callPos position) (value, error) {
+func builtinNumberPred(_ *interpreter, args []value, callPos position) (value, error) {
 	if len(args) != 1 {
 		return nil, wrongArgCount(callPos, "number?", "expected exactly 1 argument")
 	}
@@ -1054,7 +1069,7 @@ func builtinNumberPred(args []value, callPos position) (value, error) {
 	return ok, nil
 }
 
-func builtinBooleanPred(args []value, callPos position) (value, error) {
+func builtinBooleanPred(_ *interpreter, args []value, callPos position) (value, error) {
 	if len(args) != 1 {
 		return nil, wrongArgCount(callPos, "boolean?", "expected exactly 1 argument")
 	}
@@ -1062,7 +1077,7 @@ func builtinBooleanPred(args []value, callPos position) (value, error) {
 	return ok, nil
 }
 
-func builtinPairPred(args []value, callPos position) (value, error) {
+func builtinPairPred(_ *interpreter, args []value, callPos position) (value, error) {
 	if len(args) != 1 {
 		return nil, wrongArgCount(callPos, "pair?", "expected exactly 1 argument")
 	}
@@ -1070,11 +1085,176 @@ func builtinPairPred(args []value, callPos position) (value, error) {
 	return ok, nil
 }
 
-func builtinSymbolPred(args []value, callPos position) (value, error) {
+func builtinSymbolPred(_ *interpreter, args []value, callPos position) (value, error) {
 	if len(args) != 1 {
 		return nil, wrongArgCount(callPos, "symbol?", "expected exactly 1 argument")
 	}
 	_, ok := args[0].(symbolValue)
+	return ok, nil
+}
+
+func builtinDisplay(it *interpreter, args []value, callPos position) (value, error) {
+	if len(args) != 1 {
+		return nil, wrongArgCount(callPos, "display", "expected exactly 1 argument")
+	}
+
+	formatted, err := formatDisplayValue(args[0])
+	if err != nil {
+		return nil, err
+	}
+	it.output.WriteString(formatted)
+	return voidValue{}, nil
+}
+
+func builtinWrite(it *interpreter, args []value, callPos position) (value, error) {
+	if len(args) != 1 {
+		return nil, wrongArgCount(callPos, "write", "expected exactly 1 argument")
+	}
+
+	formatted, err := formatValue(args[0])
+	if err != nil {
+		return nil, err
+	}
+	it.output.WriteString(formatted)
+	return voidValue{}, nil
+}
+
+func builtinNewline(it *interpreter, args []value, callPos position) (value, error) {
+	if len(args) != 0 {
+		return nil, wrongArgCount(callPos, "newline", "expected exactly 0 arguments")
+	}
+	it.output.WriteByte('\n')
+	return voidValue{}, nil
+}
+
+func builtinStringAppend(_ *interpreter, args []value, callPos position) (value, error) {
+	var builder strings.Builder
+	for _, arg := range args {
+		s, err := expectString(arg, callPos)
+		if err != nil {
+			return nil, err
+		}
+		builder.WriteString(s)
+	}
+	return builder.String(), nil
+}
+
+func builtinStringLength(_ *interpreter, args []value, callPos position) (value, error) {
+	if len(args) != 1 {
+		return nil, wrongArgCount(callPos, "string-length", "expected exactly 1 argument")
+	}
+
+	s, err := expectString(args[0], callPos)
+	if err != nil {
+		return nil, err
+	}
+	return int64(len([]rune(s))), nil
+}
+
+func builtinSubstring(_ *interpreter, args []value, callPos position) (value, error) {
+	if len(args) != 3 {
+		return nil, wrongArgCount(callPos, "substring", "expected exactly 3 arguments")
+	}
+
+	s, err := expectString(args[0], callPos)
+	if err != nil {
+		return nil, err
+	}
+	start, err := expectIndex(args[1], callPos)
+	if err != nil {
+		return nil, err
+	}
+	end, err := expectIndex(args[2], callPos)
+	if err != nil {
+		return nil, err
+	}
+
+	runes := []rune(s)
+	if start < 0 || end < start || end > len(runes) {
+		return nil, newEvalError(ErrOutOfRange, "substring: index out of range", callPos)
+	}
+	return string(runes[start:end]), nil
+}
+
+func builtinStringToNumber(_ *interpreter, args []value, callPos position) (value, error) {
+	if len(args) != 1 {
+		return nil, wrongArgCount(callPos, "string->number", "expected exactly 1 argument")
+	}
+
+	s, err := expectString(args[0], callPos)
+	if err != nil {
+		return nil, err
+	}
+
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return false, nil
+	}
+	return n, nil
+}
+
+func builtinNumberToString(_ *interpreter, args []value, callPos position) (value, error) {
+	if len(args) != 1 {
+		return nil, wrongArgCount(callPos, "number->string", "expected exactly 1 argument")
+	}
+
+	n, err := expectInt(args[0], callPos)
+	if err != nil {
+		return nil, err
+	}
+	return strconv.FormatInt(n, 10), nil
+}
+
+func builtinSymbolToString(_ *interpreter, args []value, callPos position) (value, error) {
+	if len(args) != 1 {
+		return nil, wrongArgCount(callPos, "symbol->string", "expected exactly 1 argument")
+	}
+
+	sym, err := expectSymbol(args[0], callPos)
+	if err != nil {
+		return nil, err
+	}
+	return string(sym), nil
+}
+
+func builtinStringToSymbol(_ *interpreter, args []value, callPos position) (value, error) {
+	if len(args) != 1 {
+		return nil, wrongArgCount(callPos, "string->symbol", "expected exactly 1 argument")
+	}
+
+	s, err := expectString(args[0], callPos)
+	if err != nil {
+		return nil, err
+	}
+	return symbolValue(s), nil
+}
+
+func builtinStringRef(_ *interpreter, args []value, callPos position) (value, error) {
+	if len(args) != 2 {
+		return nil, wrongArgCount(callPos, "string-ref", "expected exactly 2 arguments")
+	}
+
+	s, err := expectString(args[0], callPos)
+	if err != nil {
+		return nil, err
+	}
+	index, err := expectIndex(args[1], callPos)
+	if err != nil {
+		return nil, err
+	}
+
+	runes := []rune(s)
+	if index < 0 || index >= len(runes) {
+		return nil, newEvalError(ErrOutOfRange, "string-ref: index out of range", callPos)
+	}
+	return charValue(runes[index]), nil
+}
+
+func builtinCharPred(_ *interpreter, args []value, callPos position) (value, error) {
+	if len(args) != 1 {
+		return nil, wrongArgCount(callPos, "char?", "expected exactly 1 argument")
+	}
+	_, ok := args[0].(charValue)
 	return ok, nil
 }
 
@@ -1084,6 +1264,33 @@ func expectInt(v value, pos position) (int64, error) {
 		return 0, newEvalError(ErrTypeMismatch, "expected number", pos)
 	}
 	return n, nil
+}
+
+func expectString(v value, pos position) (string, error) {
+	s, ok := v.(string)
+	if !ok {
+		return "", newEvalError(ErrTypeMismatch, "expected string", pos)
+	}
+	return s, nil
+}
+
+func expectSymbol(v value, pos position) (symbolValue, error) {
+	sym, ok := v.(symbolValue)
+	if !ok {
+		return "", newEvalError(ErrTypeMismatch, "expected symbol", pos)
+	}
+	return sym, nil
+}
+
+func expectIndex(v value, pos position) (int, error) {
+	n, err := expectInt(v, pos)
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 {
+		return 0, newEvalError(ErrOutOfRange, "expected non-negative index", pos)
+	}
+	return int(n), nil
 }
 
 func wrongArgCount(pos position, name string, message string) error {
@@ -1119,9 +1326,9 @@ func evalInput(input string) (value, string, error) {
 	interpreter := newInterpreter()
 	result, err := interpreter.evalProgram(exprs)
 	if err != nil {
-		return nil, "", err
+		return nil, interpreter.output.String(), err
 	}
-	return result, "", nil
+	return result, interpreter.output.String(), nil
 }
 
 func formatValue(v value) (string, error) {
@@ -1137,6 +1344,8 @@ func formatValue(v value) (string, error) {
 		return strconv.Quote(value), nil
 	case symbolValue:
 		return string(value), nil
+	case charValue:
+		return formatChar(rune(value)), nil
 	case emptyListValue:
 		return "()", nil
 	case *pairValue:
@@ -1150,14 +1359,42 @@ func formatValue(v value) (string, error) {
 	}
 }
 
+func formatDisplayValue(v value) (string, error) {
+	switch value := v.(type) {
+	case string:
+		return value, nil
+	case charValue:
+		return string(rune(value)), nil
+	case *pairValue:
+		return formatPairWith(value, formatDisplayValue)
+	default:
+		return formatValue(v)
+	}
+}
+
+func formatChar(ch rune) string {
+	switch ch {
+	case ' ':
+		return "#\\space"
+	case '\n':
+		return "#\\newline"
+	default:
+		return "#\\" + string(ch)
+	}
+}
+
 func formatPair(pair *pairValue) (string, error) {
+	return formatPairWith(pair, formatValue)
+}
+
+func formatPairWith(pair *pairValue, formatter func(value) (string, error)) (string, error) {
 	parts := []string{}
 	current := value(pair)
 
 	for {
 		switch cell := current.(type) {
 		case *pairValue:
-			formatted, err := formatValue(cell.car)
+			formatted, err := formatter(cell.car)
 			if err != nil {
 				return "", err
 			}
@@ -1166,7 +1403,7 @@ func formatPair(pair *pairValue) (string, error) {
 		case emptyListValue:
 			return "(" + strings.Join(parts, " ") + ")", nil
 		default:
-			tail, err := formatValue(cell)
+			tail, err := formatter(cell)
 			if err != nil {
 				return "", err
 			}

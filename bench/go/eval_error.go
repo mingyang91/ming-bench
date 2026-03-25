@@ -12,6 +12,7 @@ const (
 	ErrWrongArgCount   EvalErrorKind = "wrong_arg_count"
 	ErrDivisionByZero  EvalErrorKind = "division_by_zero"
 	ErrNotProcedure    EvalErrorKind = "not_a_procedure"
+	ErrOutOfRange      EvalErrorKind = "out_of_range"
 )
 
 // EvalError represents a Scheme evaluation error.

@@ -15,7 +15,7 @@ func EvalStr(input string) (string, error) {
 func EvalStrWithOutput(input string) (result string, output string, err error) {
 	value, output, err := evalInput(input)
 	if err != nil {
-		return "", "", err
+		return "", output, err
 	}
 
 	formatted, err := formatValue(value)
