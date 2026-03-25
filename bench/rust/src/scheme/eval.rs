@@ -277,7 +277,10 @@ fn run_machine(
 ) -> Result<ProducedValues, EvalError> {
     loop {
         control = match control {
-            MachineControl::Expr(expr, env) => eval_machine_expr(expr, env, runtime, &mut frames)?,
+            MachineControl::Expr(expr, env) => {
+                runtime.consume_eval_step()?;
+                eval_machine_expr(expr, env, runtime, &mut frames)?
+            }
             MachineControl::Values(values) => match frames.pop() {
                 Some(frame) => resume_machine_frame(frame, values, runtime, &mut frames)?,
                 None => return Ok(values),

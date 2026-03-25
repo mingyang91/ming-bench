@@ -25,6 +25,12 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     Ok(result)
 }
 
+/// Evaluate Scheme expressions with a maximum number of eval dispatches.
+pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
+    let (result, _) = evaluate_with_runtime(input, Runtime::with_step_limit(max_steps))?;
+    Ok(result)
+}
+
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
@@ -33,8 +39,11 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
 }
 
 fn evaluate(input: &str) -> Result<(String, Runtime), EvalError> {
+    evaluate_with_runtime(input, Runtime::default())
+}
+
+fn evaluate_with_runtime(input: &str, mut runtime: Runtime) -> Result<(String, Runtime), EvalError> {
     let expressions = parse_program(input)?;
-    let mut runtime = Runtime::default();
     let result = eval_program(&expressions, &mut runtime)?;
     Ok((result.render(), runtime))
 }

@@ -293,6 +293,21 @@ impl Environment {
     }
 }
 
+#[derive(Clone, Copy)]
+struct StepBudget {
+    remaining: usize,
+    max_steps: usize,
+}
+
+impl StepBudget {
+    fn new(max_steps: usize) -> Self {
+        Self {
+            remaining: max_steps,
+            max_steps,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Runtime {
     output: String,
@@ -300,9 +315,17 @@ pub(crate) struct Runtime {
     gensym_counter: usize,
     winders: Vec<WinderRef>,
     exception_handlers: Vec<Rc<dyn Any>>,
+    step_budget: Option<StepBudget>,
 }
 
 impl Runtime {
+    pub(crate) fn with_step_limit(max_steps: usize) -> Self {
+        Self {
+            step_budget: Some(StepBudget::new(max_steps)),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn display(&mut self, value: &Value) {
         self.output.push_str(&value.render_display());
     }
@@ -374,6 +397,21 @@ impl Runtime {
 
     pub(crate) fn replace_exception_handlers(&mut self, handlers: Vec<Rc<dyn Any>>) {
         self.exception_handlers = handlers;
+    }
+
+    pub(crate) fn consume_eval_step(&mut self) -> Result<(), EvalError> {
+        let Some(budget) = self.step_budget.as_mut() else {
+            return Ok(());
+        };
+
+        if budget.remaining == 0 {
+            return Err(EvalError::StepLimitExceeded {
+                max_steps: budget.max_steps,
+            });
+        }
+
+        budget.remaining -= 1;
+        Ok(())
     }
 
     pub(crate) fn into_output(self) -> String {

@@ -7,6 +7,9 @@ pub enum EvalError {
     #[error("empty input")]
     EmptyInput,
 
+    #[error("step limit exceeded: max {max_steps}")]
+    StepLimitExceeded { max_steps: usize },
+
     #[error("{source} at {line}:{col}")]
     WithPosition {
         line: usize,
