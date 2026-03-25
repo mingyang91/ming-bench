@@ -3,6 +3,7 @@ mod core;
 pub mod error;
 mod eval;
 mod macros;
+mod number;
 mod parser;
 
 pub use error::EvalError;

@@ -1,5 +1,6 @@
 use super::core::{Expr, Position};
 use super::error::EvalError;
+use super::number::parse_number_literal;
 
 pub(crate) fn parse_program(input: &str) -> Result<Vec<Expr>, EvalError> {
     Parser::new(input).parse_program()
@@ -105,9 +106,10 @@ impl<'a> Parser<'a> {
             "#t" => Ok(Expr::Bool(true, pos)),
             "#f" => Ok(Expr::Bool(false, pos)),
             _ if token.starts_with("#\\") => parse_char_literal(&token, pos),
-            _ => match token.parse::<i64>() {
-                Ok(value) => Ok(Expr::Int(value, pos)),
-                Err(_) => Ok(Expr::Symbol(token, pos)),
+            _ => match parse_number_literal(&token) {
+                Ok(Some(value)) => Ok(Expr::Number(value, pos)),
+                Ok(None) => Ok(Expr::Symbol(token, pos)),
+                Err(error) => Err(pos.attach(error)),
             },
         }
     }

@@ -89,7 +89,7 @@ pub(crate) fn eval_sequence(
 fn eval_expr(expr: &Expr, env: &EnvRef, runtime: &mut Runtime) -> Result<Value, EvalError> {
     match expr {
         Expr::Bool(value, _) => Ok(Value::Bool(*value)),
-        Expr::Int(value, _) => Ok(Value::Int(*value)),
+        Expr::Number(value, _) => Ok(Value::Number(*value)),
         Expr::String(value, _) => Ok(super::core::make_string(value.clone())),
         Expr::Char(value, _) => Ok(Value::Char(*value)),
         Expr::Symbol(name, pos) => Environment::lookup(env, name)
@@ -128,7 +128,7 @@ fn eval_define(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Val
     match target {
         Expr::Symbol(name, _) => eval_variable_define(name, rest, env, runtime, args.len()),
         Expr::List(signature, _) => eval_function_define(signature, rest, env, args.len()),
-        Expr::Bool(_, _) | Expr::Int(_, _) | Expr::String(_, _) | Expr::Char(_, _) => Err(
+        Expr::Bool(_, _) | Expr::Number(_, _) | Expr::String(_, _) | Expr::Char(_, _) => Err(
             positioned_syntax_error(target, "define requires a symbol or function signature"),
         ),
     }
@@ -212,7 +212,7 @@ fn eval_set(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value,
     let name = match target {
         Expr::Symbol(name, _) => name,
         Expr::Bool(_, _)
-        | Expr::Int(_, _)
+        | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
         | Expr::List(_, _) => {
@@ -301,7 +301,7 @@ fn eval_let(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value,
     match head {
         Expr::Symbol(name, _) => eval_named_let_form(name, tail, env, runtime, args.len()),
         Expr::Bool(_, _)
-        | Expr::Int(_, _)
+        | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
         | Expr::List(_, _) => {
@@ -385,7 +385,7 @@ fn parse_let_bindings(bindings_expr: &Expr) -> Result<Vec<(String, Expr)>, EvalE
     let bindings = match bindings_expr {
         Expr::List(bindings, _) => bindings,
         Expr::Bool(_, _)
-        | Expr::Int(_, _)
+        | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
         | Expr::Symbol(_, _) => {
@@ -413,7 +413,7 @@ fn parse_let_binding(binding: &Expr) -> Result<(String, Expr), EvalError> {
             "let bindings must contain exactly a name and value",
         )),
         Expr::Bool(_, _)
-        | Expr::Int(_, _)
+        | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
         | Expr::Symbol(_, _) => Err(positioned_syntax_error(
@@ -448,7 +448,7 @@ fn cond_clause_parts(clause: &Expr) -> Result<&[Expr], EvalError> {
             "cond clause cannot be empty",
         )),
         Expr::Bool(_, _)
-        | Expr::Int(_, _)
+        | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
         | Expr::Symbol(_, _) => Err(positioned_syntax_error(
@@ -479,7 +479,7 @@ fn expect_symbol_expr(expr: &Expr, context: &str) -> Result<String, EvalError> {
     match expr {
         Expr::Symbol(name, _) => Ok(name.clone()),
         Expr::Bool(_, _)
-        | Expr::Int(_, _)
+        | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
         | Expr::List(_, _) => Err(positioned_syntax_error(
@@ -498,7 +498,7 @@ fn parse_formals(params_expr: &Expr) -> Result<ParsedParams, EvalError> {
         }),
         Expr::Symbol(_, _)
         | Expr::Bool(_, _)
-        | Expr::Int(_, _)
+        | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _) => Err(positioned_syntax_error(
             params_expr,
@@ -566,7 +566,7 @@ pub(crate) fn apply_procedure(
             Procedure::Lambda(lambda) => apply_lambda(lambda, args, runtime),
         },
         Value::Bool(_)
-        | Value::Int(_)
+        | Value::Number(_)
         | Value::String(_)
         | Value::Symbol(_)
         | Value::Char(_)

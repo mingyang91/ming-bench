@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use super::error::EvalError;
 use super::macros::MacroTransformer;
+use super::number::Number;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Position {
@@ -20,7 +21,7 @@ impl Position {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Expr {
     Bool(bool, Position),
-    Int(i64, Position),
+    Number(Number, Position),
     String(String, Position),
     Char(char, Position),
     Symbol(String, Position),
@@ -31,7 +32,7 @@ impl Expr {
     pub(crate) fn pos(&self) -> Position {
         match self {
             Self::Bool(_, pos)
-            | Self::Int(_, pos)
+            | Self::Number(_, pos)
             | Self::String(_, pos)
             | Self::Char(_, pos)
             | Self::Symbol(_, pos)
@@ -53,7 +54,7 @@ pub(crate) struct PairCell {
 #[derive(Clone)]
 pub(crate) enum Value {
     Bool(bool),
-    Int(i64),
+    Number(Number),
     String(StringRef),
     Symbol(String),
     Char(char),
@@ -77,7 +78,7 @@ impl Value {
     pub(crate) fn type_name(&self) -> &'static str {
         match self {
             Self::Bool(_) => "boolean",
-            Self::Int(_) => "number",
+            Self::Number(_) => "number",
             Self::String(_) => "string",
             Self::Symbol(_) => "symbol",
             Self::Char(_) => "character",
@@ -270,7 +271,7 @@ pub(crate) fn make_lambda(
 pub(crate) fn quote_expr(expr: &Expr) -> Value {
     match expr {
         Expr::Bool(value, _) => Value::Bool(*value),
-        Expr::Int(value, _) => Value::Int(*value),
+        Expr::Number(value, _) => Value::Number(*value),
         Expr::String(value, _) => make_string(value.clone()),
         Expr::Char(value, _) => Value::Char(*value),
         Expr::Symbol(value, _) => Value::Symbol(value.clone()),
@@ -282,7 +283,7 @@ fn render_value(value: &Value, mode: RenderMode) -> String {
     match value {
         Value::Bool(true) => "#t".into(),
         Value::Bool(false) => "#f".into(),
-        Value::Int(value) => value.to_string(),
+        Value::Number(value) => value.render(),
         Value::String(value) => {
             let text = value.borrow();
             match mode {
@@ -356,7 +357,7 @@ fn render_pair(pair: &PairRef, mode: RenderMode) -> String {
 pub(crate) fn value_equal(lhs: &Value, rhs: &Value) -> bool {
     match (lhs, rhs) {
         (Value::Bool(lhs), Value::Bool(rhs)) => lhs == rhs,
-        (Value::Int(lhs), Value::Int(rhs)) => lhs == rhs,
+        (Value::Number(lhs), Value::Number(rhs)) => lhs == rhs,
         (Value::String(lhs), Value::String(rhs)) => lhs.borrow().as_str() == rhs.borrow().as_str(),
         (Value::Symbol(lhs), Value::Symbol(rhs)) => lhs == rhs,
         (Value::Char(lhs), Value::Char(rhs)) => lhs == rhs,

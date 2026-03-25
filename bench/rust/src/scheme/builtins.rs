@@ -1,9 +1,12 @@
+use std::cmp::Ordering;
+
 use super::core::{
     make_pair, make_string, value_equal, BuiltinProcedure, EnvRef, Environment, Runtime, StringRef,
     Value,
 };
 use super::error::EvalError;
 use super::eval::apply_procedure;
+use super::number::{parse_number_literal, Number};
 
 const BUILTINS: &[BuiltinProcedure] = &[
     BuiltinProcedure {
@@ -109,6 +112,38 @@ const BUILTINS: &[BuiltinProcedure] = &[
     BuiltinProcedure {
         name: "number?",
         func: builtin_is_number,
+    },
+    BuiltinProcedure {
+        name: "exact?",
+        func: builtin_is_exact,
+    },
+    BuiltinProcedure {
+        name: "inexact?",
+        func: builtin_is_inexact,
+    },
+    BuiltinProcedure {
+        name: "integer?",
+        func: builtin_is_integer,
+    },
+    BuiltinProcedure {
+        name: "rational?",
+        func: builtin_is_rational,
+    },
+    BuiltinProcedure {
+        name: "exact->inexact",
+        func: builtin_exact_to_inexact,
+    },
+    BuiltinProcedure {
+        name: "inexact->exact",
+        func: builtin_inexact_to_exact,
+    },
+    BuiltinProcedure {
+        name: "numerator",
+        func: builtin_numerator,
+    },
+    BuiltinProcedure {
+        name: "denominator",
+        func: builtin_denominator,
     },
     BuiltinProcedure {
         name: "boolean?",
@@ -294,38 +329,38 @@ pub(crate) fn default_env() -> EnvRef {
 
 fn builtin_abs(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let value = expect_number(expect_single_arg("abs", args)?)?;
-    Ok(Value::Int(value.abs()))
+    Ok(Value::Number(value.abs()))
 }
 
 fn builtin_add(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    let mut total = 0_i64;
+    let mut total = Number::exact_integer(0);
 
     for arg in args {
-        total += expect_number(arg)?;
+        total = total.add(expect_number(arg)?)?;
     }
 
-    Ok(Value::Int(total))
+    Ok(Value::Number(total))
 }
 
 fn builtin_sub(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let values = eval_number_args("-", args, 1)?;
     let result = match values.split_first() {
-        Some((first, [])) => -*first,
-        Some((first, rest)) => rest.iter().fold(*first, |acc, value| acc - value),
+        Some((first, [])) => first.neg()?,
+        Some((first, rest)) => rest.iter().try_fold(*first, |acc, value| acc.sub(*value))?,
         None => return Err(wrong_arg_count("-", "at least 1", 0)),
     };
 
-    Ok(Value::Int(result))
+    Ok(Value::Number(result))
 }
 
 fn builtin_mul(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    let mut product = 1_i64;
+    let mut product = Number::exact_integer(1);
 
     for arg in args {
-        product *= expect_number(arg)?;
+        product = product.mul(expect_number(arg)?)?;
     }
 
-    Ok(Value::Int(product))
+    Ok(Value::Number(product))
 }
 
 fn builtin_div(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -333,31 +368,21 @@ fn builtin_div(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalErro
     let Some((first, rest)) = values.split_first() else {
         return Err(wrong_arg_count("/", "at least 2", 0));
     };
-    let mut result = *first;
 
-    for value in rest {
-        if *value == 0 {
-            return Err(EvalError::DivisionByZero);
-        }
-        if result % value != 0 {
-            return Err(EvalError::NonIntegerDivision);
-        }
-        result /= value;
-    }
-
-    Ok(Value::Int(result))
+    let result = rest.iter().try_fold(*first, |acc, value| acc.div(*value))?;
+    Ok(Value::Number(result))
 }
 
 fn builtin_lt(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    builtin_compare("<", args, |lhs, rhs| lhs < rhs)
+    builtin_compare("<", args, |ordering| ordering == Ordering::Less)
 }
 
 fn builtin_gt(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    builtin_compare(">", args, |lhs, rhs| lhs > rhs)
+    builtin_compare(">", args, |ordering| ordering == Ordering::Greater)
 }
 
 fn builtin_eq(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    builtin_compare("=", args, |lhs, rhs| lhs == rhs)
+    builtin_compare("=", args, |ordering| ordering == Ordering::Equal)
 }
 
 fn builtin_is_eq(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -377,17 +402,17 @@ fn builtin_is_equal(args: &[Value], _runtime: &mut Runtime) -> Result<Value, Eva
 }
 
 fn builtin_le(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    builtin_compare("<=", args, |lhs, rhs| lhs <= rhs)
+    builtin_compare("<=", args, |ordering| ordering != Ordering::Greater)
 }
 
 fn builtin_compare<F>(name: &str, args: &[Value], compare: F) -> Result<Value, EvalError>
 where
-    F: Fn(i64, i64) -> bool,
+    F: Fn(Ordering) -> bool,
 {
     let values = eval_number_args(name, args, 2)?;
 
     for pair in values.windows(2) {
-        if !compare(pair[0], pair[1]) {
+        if !compare(pair[0].compare(pair[1])) {
             return Ok(Value::Bool(false));
         }
     }
@@ -436,7 +461,9 @@ fn builtin_list(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalErr
 
 fn builtin_length(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let values = expect_list(expect_single_arg("length", args)?, "list")?;
-    Ok(Value::Int(values.len() as i64))
+    Ok(Value::Number(Number::exact_integer(usize_to_i64(
+        values.len(),
+    )?)))
 }
 
 fn builtin_list_ref(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -519,7 +546,49 @@ fn builtin_is_string(args: &[Value], _runtime: &mut Runtime) -> Result<Value, Ev
 }
 
 fn builtin_is_number(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    unary_predicate("number?", args, |value| matches!(value, Value::Int(_)))
+    unary_predicate("number?", args, |value| matches!(value, Value::Number(_)))
+}
+
+fn builtin_is_exact(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_number(expect_single_arg("exact?", args)?)?;
+    Ok(Value::Bool(value.is_exact()))
+}
+
+fn builtin_is_inexact(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_number(expect_single_arg("inexact?", args)?)?;
+    Ok(Value::Bool(value.is_inexact()))
+}
+
+fn builtin_is_integer(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_number(expect_single_arg("integer?", args)?)?;
+    Ok(Value::Bool(value.is_integer()))
+}
+
+fn builtin_is_rational(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_number(expect_single_arg("rational?", args)?)?;
+    Ok(Value::Bool(value.is_rational()))
+}
+
+fn builtin_exact_to_inexact(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_number(expect_single_arg("exact->inexact", args)?)?;
+    Ok(Value::Number(value.to_inexact()))
+}
+
+fn builtin_inexact_to_exact(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_number(expect_single_arg("inexact->exact", args)?)?;
+    Ok(Value::Number(value.to_exact()?))
+}
+
+fn builtin_numerator(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_single_arg("numerator", args)?;
+    let (numer, _) = expect_exact_parts(value, "exact number")?;
+    Ok(Value::Number(Number::exact_integer_i128(numer)))
+}
+
+fn builtin_denominator(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let value = expect_single_arg("denominator", args)?;
+    let (_, denom) = expect_exact_parts(value, "exact number")?;
+    Ok(Value::Number(Number::exact_integer_i128(denom)))
 }
 
 fn builtin_is_boolean(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -566,7 +635,9 @@ fn builtin_string_append(args: &[Value], _runtime: &mut Runtime) -> Result<Value
 
 fn builtin_string_length(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let value = expect_string(expect_single_arg("string-length", args)?)?;
-    Ok(Value::Int(value.chars().count() as i64))
+    Ok(Value::Number(Number::exact_integer(usize_to_i64(
+        value.chars().count(),
+    )?)))
 }
 
 fn builtin_substring(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -593,15 +664,15 @@ fn builtin_substring(args: &[Value], _runtime: &mut Runtime) -> Result<Value, Ev
 
 fn builtin_string_to_number(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let value = expect_string(expect_single_arg("string->number", args)?)?;
-    match value.parse::<i64>() {
-        Ok(number) => Ok(Value::Int(number)),
-        Err(_) => Ok(Value::Bool(false)),
+    match parse_number_literal(&value) {
+        Ok(Some(number)) => Ok(Value::Number(number)),
+        Ok(None) | Err(_) => Ok(Value::Bool(false)),
     }
 }
 
 fn builtin_number_to_string(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let value = expect_number(expect_single_arg("number->string", args)?)?;
-    Ok(make_string(value.to_string()))
+    Ok(make_string(value.render()))
 }
 
 fn builtin_symbol_to_string(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -705,7 +776,7 @@ fn builtin_string_downcase(args: &[Value], _runtime: &mut Runtime) -> Result<Val
 }
 
 fn builtin_modulo(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    let (dividend, divisor) = expect_two_numbers("modulo", args)?;
+    let (dividend, divisor) = expect_two_exact_integers("modulo", args)?;
     if divisor == 0 {
         return Err(EvalError::DivisionByZero);
     }
@@ -717,72 +788,89 @@ fn builtin_modulo(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalE
         remainder
     };
 
-    Ok(Value::Int(result))
+    Ok(Value::Number(Number::exact_integer(result)))
 }
 
 fn builtin_remainder(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    let (dividend, divisor) = expect_two_numbers("remainder", args)?;
+    let (dividend, divisor) = expect_two_exact_integers("remainder", args)?;
     if divisor == 0 {
         return Err(EvalError::DivisionByZero);
     }
 
-    Ok(Value::Int(dividend % divisor))
+    Ok(Value::Number(Number::exact_integer(dividend % divisor)))
 }
 
 fn builtin_quotient(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    let (dividend, divisor) = expect_two_numbers("quotient", args)?;
+    let (dividend, divisor) = expect_two_exact_integers("quotient", args)?;
     if divisor == 0 {
         return Err(EvalError::DivisionByZero);
     }
 
-    Ok(Value::Int(dividend / divisor))
+    Ok(Value::Number(Number::exact_integer(dividend / divisor)))
 }
 
 fn builtin_min(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let values = eval_number_args("min", args, 1)?;
-    Ok(Value::Int(
-        *values.iter().min().expect("min has at least one arg"),
-    ))
+    let mut iter = values.into_iter();
+    let mut result = iter.next().expect("min has at least one arg");
+
+    for value in iter {
+        if value.compare(result) == Ordering::Less {
+            result = value;
+        }
+    }
+
+    Ok(Value::Number(result))
 }
 
 fn builtin_max(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let values = eval_number_args("max", args, 1)?;
-    Ok(Value::Int(
-        *values.iter().max().expect("max has at least one arg"),
-    ))
+    let mut iter = values.into_iter();
+    let mut result = iter.next().expect("max has at least one arg");
+
+    for value in iter {
+        if value.compare(result) == Ordering::Greater {
+            result = value;
+        }
+    }
+
+    Ok(Value::Number(result))
 }
 
 fn builtin_expt(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    let (base, exponent) = expect_two_numbers("expt", args)?;
+    let (base, exponent) = expect_two_exact_integers("expt", args)?;
     if exponent < 0 {
         return Err(EvalError::NegativeExponent { exponent });
     }
 
-    Ok(Value::Int(base.pow(exponent as u32)))
+    let value = base
+        .checked_pow(exponent as u32)
+        .ok_or(EvalError::NumericOverflow)?;
+    Ok(Value::Number(Number::exact_integer(value)))
 }
 
 fn builtin_is_zero(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let value = expect_number(expect_single_arg("zero?", args)?)?;
-    Ok(Value::Bool(value == 0))
+    Ok(Value::Bool(value.is_zero()))
 }
 
 fn builtin_is_positive(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let value = expect_number(expect_single_arg("positive?", args)?)?;
-    Ok(Value::Bool(value > 0))
+    Ok(Value::Bool(value.is_positive()))
 }
 
 fn builtin_is_negative(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let value = expect_number(expect_single_arg("negative?", args)?)?;
-    Ok(Value::Bool(value < 0))
+    Ok(Value::Bool(value.is_negative()))
 }
 
 fn builtin_is_odd(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    let value = expect_number(expect_single_arg("odd?", args)?)?;
+    let value = expect_exact_integer(expect_single_arg("odd?", args)?)?;
     Ok(Value::Bool(value % 2 != 0))
 }
 
 fn builtin_is_even(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    let value = expect_number(expect_single_arg("even?", args)?)?;
+    let value = expect_exact_integer(expect_single_arg("even?", args)?)?;
     Ok(Value::Bool(value % 2 == 0))
 }
 
@@ -877,16 +965,16 @@ fn expect_char(value: &Value) -> Result<char, EvalError> {
     }
 }
 
-fn expect_two_numbers(name: &str, args: &[Value]) -> Result<(i64, i64), EvalError> {
+fn expect_two_exact_integers(name: &str, args: &[Value]) -> Result<(i64, i64), EvalError> {
     let [lhs, rhs] = args else {
         return Err(wrong_arg_count(name, "exactly 2", args.len()));
     };
 
-    Ok((expect_number(lhs)?, expect_number(rhs)?))
+    Ok((expect_exact_integer(lhs)?, expect_exact_integer(rhs)?))
 }
 
 fn expect_index(value: &Value, len: usize, bound: IndexBound) -> Result<usize, EvalError> {
-    let index = expect_number(value)?;
+    let index = expect_exact_integer(value)?;
 
     if index < 0 {
         return Err(EvalError::IndexOutOfBounds { index, len });
@@ -908,7 +996,7 @@ fn expect_index(value: &Value, len: usize, bound: IndexBound) -> Result<usize, E
     }
 }
 
-fn eval_number_args(name: &str, args: &[Value], min: usize) -> Result<Vec<i64>, EvalError> {
+fn eval_number_args(name: &str, args: &[Value], min: usize) -> Result<Vec<Number>, EvalError> {
     if args.len() < min {
         return Err(wrong_arg_count(name, format!("at least {min}"), args.len()));
     }
@@ -916,11 +1004,27 @@ fn eval_number_args(name: &str, args: &[Value], min: usize) -> Result<Vec<i64>, 
     args.iter().map(expect_number).collect()
 }
 
-fn expect_number(value: &Value) -> Result<i64, EvalError> {
+fn expect_number(value: &Value) -> Result<Number, EvalError> {
     match value {
-        Value::Int(number) => Ok(*number),
+        Value::Number(number) => Ok(*number),
         other => Err(type_mismatch("number", other)),
     }
+}
+
+fn expect_exact_parts(value: &Value, expected: &str) -> Result<(i128, i128), EvalError> {
+    let number = expect_number(value)?;
+    number
+        .exact_parts()
+        .ok_or_else(|| type_mismatch(expected, value))
+}
+
+fn expect_exact_integer(value: &Value) -> Result<i64, EvalError> {
+    let (numer, denom) = expect_exact_parts(value, "integer")?;
+    if denom != 1 {
+        return Err(type_mismatch("integer", value));
+    }
+
+    i64::try_from(numer).map_err(|_| EvalError::NumericOverflow)
 }
 
 fn compare_char_args<F>(name: &str, args: &[Value], compare: F) -> Result<Value, EvalError>
@@ -970,7 +1074,7 @@ where
 fn eq_value(lhs: &Value, rhs: &Value) -> bool {
     match (lhs, rhs) {
         (Value::Bool(lhs), Value::Bool(rhs)) => lhs == rhs,
-        (Value::Int(lhs), Value::Int(rhs)) => lhs == rhs,
+        (Value::Number(lhs), Value::Number(rhs)) => lhs == rhs,
         (Value::Symbol(lhs), Value::Symbol(rhs)) => lhs == rhs,
         (Value::Char(lhs), Value::Char(rhs)) => lhs == rhs,
         (Value::String(lhs), Value::String(rhs)) => std::rc::Rc::ptr_eq(lhs, rhs),
@@ -1002,4 +1106,8 @@ fn type_mismatch(expected: &str, value: &Value) -> EvalError {
         expected: expected.into(),
         found: value.type_name().into(),
     }
+}
+
+fn usize_to_i64(value: usize) -> Result<i64, EvalError> {
+    i64::try_from(value).map_err(|_| EvalError::NumericOverflow)
 }

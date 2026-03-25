@@ -48,6 +48,15 @@ pub enum EvalError {
 
     #[error("invalid substring range: start {start}, end {end}, length {len}")]
     InvalidSubstringRange { start: i64, end: i64, len: usize },
+
+    #[error("invalid number literal: {literal}")]
+    InvalidNumberLiteral { literal: String },
+
+    #[error("numeric overflow")]
+    NumericOverflow,
+
+    #[error("cannot convert non-finite number to exact")]
+    NonFiniteNumber,
 }
 
 impl EvalError {

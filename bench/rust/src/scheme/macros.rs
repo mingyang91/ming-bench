@@ -287,8 +287,8 @@ fn match_pattern(
             Expr::Bool(other, _) if value == other => Some(bindings.clone()),
             _ => None,
         }),
-        Expr::Int(value, _) => Ok(match input {
-            Expr::Int(other, _) if value == other => Some(bindings.clone()),
+        Expr::Number(value, _) => Ok(match input {
+            Expr::Number(other, _) if value == other => Some(bindings.clone()),
             _ => None,
         }),
         Expr::String(value, _) => Ok(match input {
@@ -516,7 +516,7 @@ fn expand_template(
     local_renames: &HashMap<String, String>,
 ) -> Result<Expr, EvalError> {
     match template {
-        Expr::Bool(_, _) | Expr::Int(_, _) | Expr::String(_, _) | Expr::Char(_, _) => {
+        Expr::Bool(_, _) | Expr::Number(_, _) | Expr::String(_, _) | Expr::Char(_, _) => {
             Ok(template.clone())
         }
         Expr::Symbol(name, pos) => {
@@ -859,7 +859,7 @@ fn expand_quoted_template(
     repetition_index: Option<usize>,
 ) -> Result<Expr, EvalError> {
     match template {
-        Expr::Bool(_, _) | Expr::Int(_, _) | Expr::String(_, _) | Expr::Char(_, _) => {
+        Expr::Bool(_, _) | Expr::Number(_, _) | Expr::String(_, _) | Expr::Char(_, _) => {
             Ok(template.clone())
         }
         Expr::Symbol(name, pos) if name == ELLIPSIS => {
