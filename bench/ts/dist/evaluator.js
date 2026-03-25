@@ -290,9 +290,9 @@ function evaluateDefine(args, env, position) {
     if (nameExpr.type !== 'symbol') {
         throw new EvalError('define: invalid function name', nameExpr.position);
     }
-    const params = parseParameterNames(target.elements.slice(1));
+    const { params, restParam } = parseParameterList(target.elements.slice(1));
     const body = args.slice(1);
-    const closure = { type: 'closure', params, body, env };
+    const closure = { type: 'closure', params, restParam, body, env };
     env.define(nameExpr.name, closure);
     return VOID_VALUE;
 }
@@ -316,12 +316,23 @@ function evaluateQuote(args, position) {
 function evaluateLambda(args, env, position) {
     requireArgCountAtLeast('lambda', args.length, 2, position);
     const paramsExpr = args[0];
+    if (paramsExpr.type === 'symbol') {
+        return {
+            type: 'closure',
+            params: [],
+            restParam: paramsExpr.name,
+            body: args.slice(1),
+            env,
+        };
+    }
     if (paramsExpr.type !== 'list') {
         throw new EvalError('lambda: parameter list must be a list', paramsExpr.position);
     }
+    const { params, restParam } = parseParameterList(paramsExpr.elements);
     return {
         type: 'closure',
-        params: parseParameterNames(paramsExpr.elements),
+        params,
+        restParam,
         body: args.slice(1),
         env,
     };
@@ -408,13 +419,27 @@ function quoteExpr(expr) {
             return { type: 'list', elements: expr.elements.map(quoteExpr) };
     }
 }
-function parseParameterNames(params) {
-    return params.map((param) => {
+function parseParameterList(params) {
+    const names = [];
+    for (let index = 0; index < params.length; index += 1) {
+        const param = params[index];
         if (param.type !== 'symbol') {
             throw new EvalError('lambda: parameter names must be symbols', param.position);
         }
-        return param.name;
-    });
+        if (param.name !== '.') {
+            names.push(param.name);
+            continue;
+        }
+        const restParam = params[index + 1];
+        if (restParam === undefined ||
+            restParam.type !== 'symbol' ||
+            restParam.name === '.' ||
+            index + 2 !== params.length) {
+            throw new EvalError('lambda: invalid rest parameter list', param.position);
+        }
+        return { params: names, restParam: restParam.name };
+    }
+    return { params: names };
 }
 function parseLetBindings(bindingsExpr) {
     if (bindingsExpr.type !== 'list') {
@@ -436,10 +461,21 @@ function applyProcedure(value, args, callPosition) {
         case 'builtin':
             return value.invoke(args, callPosition);
         case 'closure': {
-            requireArgCount('lambda', args.length, value.params.length, callPosition);
+            if (value.restParam === undefined) {
+                requireArgCount('lambda', args.length, value.params.length, callPosition);
+            }
+            else {
+                requireArgCountAtLeast('lambda', args.length, value.params.length, callPosition);
+            }
             const callEnv = new Environment(value.env);
             for (let index = 0; index < value.params.length; index += 1) {
                 callEnv.define(value.params[index], args[index].value);
+            }
+            if (value.restParam !== undefined) {
+                callEnv.define(value.restParam, {
+                    type: 'list',
+                    elements: args.slice(value.params.length).map((arg) => arg.value),
+                });
             }
             return evaluateSequence(value.body, callEnv);
         }
@@ -517,6 +553,16 @@ function createGlobalEnv(context) {
             elements.push(...expectList('append', arg).elements);
         }
         return { type: 'list', elements };
+    }));
+    env.define('apply', builtin('apply', (args, callPosition) => {
+        requireArgCountAtLeast('apply', args.length, 2, callPosition);
+        const procedure = args[0].value;
+        const finalListArg = args[args.length - 1];
+        const trailingArgs = expectList('apply', finalListArg).elements.map((value) => ({
+            value,
+            position: finalListArg.position,
+        }));
+        return applyProcedure(procedure, [...args.slice(1, -1), ...trailingArgs], callPosition);
     }));
     env.define('display', builtin('display', (args, callPosition) => {
         requireArgCount('display', args.length, 1, callPosition);
