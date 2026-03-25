@@ -92,6 +92,31 @@ public class Evaluator {
         ResolvedValue(Object value) { this.value = value; }
     }
 
+    // --- Syntax-case transformer ---
+
+    private static class SyntaxCaseTransformer {
+        final Object transformer; // Lambda
+        final Env defEnv;
+        SyntaxCaseTransformer(Object transformer, Env defEnv) {
+            this.transformer = transformer;
+            this.defEnv = defEnv;
+        }
+    }
+
+    // --- Syntax object (wrapper for syntax-case) ---
+
+    private static class SyntaxObject {
+        final Object datum;
+        SyntaxObject(Object datum) { this.datum = datum; }
+    }
+
+    // --- Ellipsis binding for syntax-case ---
+
+    private static class SyntaxEllipsis {
+        final List<Object> elements;
+        SyntaxEllipsis(List<Object> elements) { this.elements = elements; }
+    }
+
     // --- Vector type ---
 
     private static class SchemeVector {
@@ -122,7 +147,8 @@ public class Evaluator {
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "quote", "if", "define", "lambda", "let", "let*", "set!", "begin", "cond",
         "and", "or", "define-syntax", "syntax-rules", "else", "define-record-type",
-        "letrec", "letrec*", "case", "do", "guard"
+        "letrec", "letrec*", "case", "do", "guard", "case-lambda",
+        "syntax-case", "syntax", "with-syntax"
     );
 
     // --- Continuation types for CEK machine ---
@@ -145,6 +171,10 @@ public class Evaluator {
     private record DoTestK(List<String> varNames, Env doEnv, List<Object> testClause, List<Object> steps, List<Object> fullList, Kont k) implements Kont {}
     private record DoAfterBodyK(List<String> varNames, Env doEnv, List<Object> steps, List<Object> testClause, List<Object> fullList, Kont k) implements Kont {}
     private record DoStepK(List<String> varNames, Env doEnv, List<Object> steps, int nextIdx, List<Object> newVals, List<Object> testClause, List<Object> fullList, Kont k) implements Kont {}
+
+    // --- syntax-case / with-syntax continuations ---
+    private record SyntaxCaseK(List<Object> fullList, Env env, Kont k) implements Kont {}
+    private record WithSyntaxK(List<Object[]> bindings, int nextIdx, Env wsEnv, List<Object> body, Kont k) implements Kont {}
 
     // --- call-with-values continuation ---
     private record CallWithValuesK(Object consumer, Kont k) implements Kont {}
@@ -482,6 +512,19 @@ public class Evaluator {
             throw new EvalError("symbol->string: not a symbol");
         });
         globalEnv.define("string->symbol", (BuiltinProc) args -> asSchemeString(args.get(0)).value());
+
+        // --- syntax-case support builtins ---
+        globalEnv.define("syntax->datum", (BuiltinProc) args -> {
+            Object v = args.get(0);
+            if (v instanceof SyntaxObject so) return so.datum;
+            return v;
+        });
+        globalEnv.define("datum->syntax", (BuiltinProc) args -> {
+            // (datum->syntax context-stx datum)
+            Object datum = args.get(1);
+            return new SyntaxObject(datum);
+        });
+
         globalEnv.define("string-ref", (BuiltinProc) args -> {
             SchemeString s = asSchemeString(args.get(0));
             int idx = (int) asLong(args.get(1));
@@ -1063,7 +1106,12 @@ public class Evaluator {
                 int startCol = col;
                 if (i + 1 < len) {
                     char next = input.charAt(i + 1);
-                    if (next == 't') {
+                    if (next == '\'') {
+                        // #' = syntax quote
+                        tokens.add(new Token("#'", line, startCol));
+                        i += 2;
+                        col += 2;
+                    } else if (next == 't') {
                         tokens.add(new Token(Boolean.TRUE, line, startCol));
                         i += 2;
                         col += 2;
@@ -1134,6 +1182,14 @@ public class Evaluator {
             quoteExpr.add("quote");
             quoteExpr.add(quoted);
             return new SourceExpr(quoteExpr, token.line, token.col);
+        }
+        if ("#'".equals(token.value)) {
+            pos[0]++;
+            Object syntaxed = parse(tokens, pos);
+            List<Object> syntaxExpr = new ArrayList<>();
+            syntaxExpr.add("syntax");
+            syntaxExpr.add(syntaxed);
+            return new SourceExpr(syntaxExpr, token.line, token.col);
         }
         if ("(".equals(token.value)) {
             pos[0]++;
@@ -1450,24 +1506,38 @@ public class Evaluator {
                             if (nameObj instanceof SourceExpr se) nameObj = se.expr;
                             String macroName = (String) nameObj;
                             Object srObj = list.get(2);
-                            if (srObj instanceof SourceExpr se) srObj = se.expr;
-                            List<Object> sr = (List<Object>) srObj;
-                            Object litsObj = sr.get(1);
-                            if (litsObj instanceof SourceExpr se) litsObj = se.expr;
-                            List<?> litsRaw = (List<?>) litsObj;
-                            List<String> lits = new ArrayList<>();
-                            for (Object l : litsRaw) {
-                                if (l instanceof SourceExpr se) l = se.expr;
-                                lits.add((String) l);
+                            Object rawSr = srObj;
+                            if (rawSr instanceof SourceExpr se) rawSr = se.expr;
+                            // Check if body is (syntax-rules ...) or a transformer expression
+                            boolean isSyntaxRules = false;
+                            if (rawSr instanceof List<?> srList && !srList.isEmpty()) {
+                                Object first = srList.get(0);
+                                if (first instanceof SourceExpr se) first = se.expr;
+                                if ("syntax-rules".equals(first)) isSyntaxRules = true;
                             }
-                            List<Object[]> rules = new ArrayList<>();
-                            for (int i = 2; i < sr.size(); i++) {
-                                Object ruleObj = sr.get(i);
-                                if (ruleObj instanceof SourceExpr se) ruleObj = se.expr;
-                                List<Object> rule = (List<Object>) ruleObj;
-                                rules.add(new Object[]{rule.get(0), rule.get(1)});
+                            if (isSyntaxRules) {
+                                List<Object> sr = (List<Object>) rawSr;
+                                Object litsObj = sr.get(1);
+                                if (litsObj instanceof SourceExpr se) litsObj = se.expr;
+                                List<?> litsRaw = (List<?>) litsObj;
+                                List<String> lits = new ArrayList<>();
+                                for (Object l : litsRaw) {
+                                    if (l instanceof SourceExpr se) l = se.expr;
+                                    lits.add((String) l);
+                                }
+                                List<Object[]> rules = new ArrayList<>();
+                                for (int i = 2; i < sr.size(); i++) {
+                                    Object ruleObj = sr.get(i);
+                                    if (ruleObj instanceof SourceExpr se) ruleObj = se.expr;
+                                    List<Object> rule = (List<Object>) ruleObj;
+                                    rules.add(new Object[]{rule.get(0), rule.get(1)});
+                                }
+                                env.define(macroName, new SyntaxRulesMacro(lits, rules, env));
+                            } else {
+                                // Transformer expression (e.g., lambda)
+                                Object transformer = eval(srObj, env);
+                                env.define(macroName, new SyntaxCaseTransformer(transformer, env));
                             }
-                            env.define(macroName, new SyntaxRulesMacro(lits, rules, env));
                             cekValue = VOID; cekEval = false; return;
                         }
                         case "define-record-type" -> {
@@ -1476,6 +1546,39 @@ public class Evaluator {
                         }
                         case "guard" -> {
                             cekHandleGuard(list, env); return;
+                        }
+                        case "syntax-case" -> {
+                            // (syntax-case expr (lits ...) clause ...)
+                            cekK = new SyntaxCaseK(list, env, cekK);
+                            cekExpr = list.get(1); return;
+                        }
+                        case "syntax" -> {
+                            // #'template - expand template with pattern variable substitution
+                            Object template = list.get(1);
+                            Map<String, String> renames = new HashMap<>();
+                            Object result = expandSyntaxTemplate(template, env, renames);
+                            cekValue = new SyntaxObject(result);
+                            cekEval = false; return;
+                        }
+                        case "with-syntax" -> {
+                            // (with-syntax ((pat expr) ...) body ...)
+                            Object bindingsObj = unwrapSE(list.get(1));
+                            List<?> bindingsList = (List<?>) bindingsObj;
+                            List<Object[]> bindings = new ArrayList<>();
+                            for (Object b : bindingsList) {
+                                Object bu = unwrapSE(b);
+                                List<?> bl = (List<?>) bu;
+                                bindings.add(new Object[]{bl.get(0), bl.get(1)});
+                            }
+                            List<Object> body = new ArrayList<>(list.subList(2, list.size()));
+                            Env wsEnv = new Env(env);
+                            if (bindings.isEmpty()) {
+                                cekEnv = wsEnv;
+                                evalBodyExprs(body, 0, wsEnv); return;
+                            }
+                            cekK = new WithSyntaxK(bindings, 0, wsEnv, body, cekK);
+                            cekExpr = bindings.get(0)[1];
+                            cekEval = true; return;
                         }
                     }
                 }
@@ -1538,6 +1641,18 @@ public class Evaluator {
             // Handle macros
             if (proc instanceof SyntaxRulesMacro macro) {
                 cekExpr = expandMacro(macro, list);
+                cekEnv = env; cekK = epk.k; cekEval = true; return;
+            }
+            if (proc instanceof SyntaxCaseTransformer sct) {
+                SyntaxObject stxObj = new SyntaxObject(list);
+                Env tempEnv = new Env(env);
+                String tfVar = gensym("__tf");
+                String stxVar = gensym("__sx");
+                tempEnv.define(tfVar, sct.transformer);
+                tempEnv.define(stxVar, stxObj);
+                Object result = eval(List.of(tfVar, stxVar), tempEnv);
+                if (result instanceof SyntaxObject so) result = so.datum;
+                cekExpr = result;
                 cekEnv = env; cekK = epk.k; cekEval = true; return;
             }
             int argCount = list.size() - 1;
@@ -1791,6 +1906,84 @@ public class Evaluator {
             // Thunk completed normally; pop handler, pass value through
             if (!handlerStack.isEmpty()) handlerStack.remove(handlerStack.size() - 1);
             cekK = wehk.k;
+            return;
+        }
+
+        if (k instanceof SyntaxCaseK sck) {
+            Object scrutinee = value;
+            if (scrutinee instanceof SyntaxObject so) scrutinee = so.datum;
+            List<Object> fullList = sck.fullList;
+            Env scEnv = sck.env;
+
+            // Parse literals
+            Object litsObj = unwrapSE(fullList.get(2));
+            List<String> literals = new ArrayList<>();
+            for (Object l : (List<?>) litsObj) {
+                literals.add((String) unwrapSE(l));
+            }
+
+            // Try each clause
+            for (int ci = 3; ci < fullList.size(); ci++) {
+                Object clauseObj = unwrapSE(fullList.get(ci));
+                List<Object> clause = (List<Object>) clauseObj;
+
+                Object pattern = unwrapSE(clause.get(0));
+                boolean hasFender = clause.size() == 3;
+                Object body = hasFender ? clause.get(2) : clause.get(1);
+
+                Map<String, Object> bindings = new HashMap<>();
+                Set<String> patternVars = new HashSet<>();
+                Set<String> ellipsisVars = new HashSet<>();
+
+                boolean matched;
+                if (pattern instanceof List<?> patList) {
+                    if (!(scrutinee instanceof List<?>)) {
+                        matched = false;
+                    } else {
+                        matched = matchPatternList(patList, (List<?>) scrutinee, 0, literals, bindings, patternVars, ellipsisVars);
+                    }
+                } else {
+                    matched = matchPattern(pattern, scrutinee, literals, bindings, patternVars, ellipsisVars);
+                }
+
+                if (matched) {
+                    // Bind pattern variables as SyntaxObjects / SyntaxEllipsis
+                    Env bodyEnv = new Env(scEnv);
+                    for (var entry : bindings.entrySet()) {
+                        if (ellipsisVars.contains(entry.getKey())) {
+                            bodyEnv.define(entry.getKey(), new SyntaxEllipsis((List<Object>) entry.getValue()));
+                        } else {
+                            bodyEnv.define(entry.getKey(), new SyntaxObject(entry.getValue()));
+                        }
+                    }
+
+                    if (hasFender) {
+                        Object fender = clause.get(1);
+                        Object fResult = eval(fender, bodyEnv);
+                        if (isFalse(fResult)) continue;
+                    }
+
+                    cekExpr = body; cekEnv = bodyEnv; cekK = sck.k; cekEval = true; return;
+                }
+            }
+            throw new EvalError("no matching syntax-case pattern");
+        }
+
+        if (k instanceof WithSyntaxK wsk) {
+            Object pattern = unwrapSE(wsk.bindings.get(wsk.nextIdx)[0]);
+            // Simple pattern: just a symbol
+            if (pattern instanceof String sym) {
+                wsk.wsEnv.define(sym, value instanceof SyntaxObject ? value : new SyntaxObject(value));
+            }
+            int nextIdx = wsk.nextIdx + 1;
+            if (nextIdx < wsk.bindings.size()) {
+                cekK = new WithSyntaxK(wsk.bindings, nextIdx, wsk.wsEnv, wsk.body, wsk.k);
+                cekExpr = wsk.bindings.get(nextIdx)[1];
+                cekEnv = wsk.wsEnv;
+                cekEval = true; return;
+            }
+            cekEnv = wsk.wsEnv; cekK = wsk.k;
+            evalBodyExprs(wsk.body, 0, wsk.wsEnv);
             return;
         }
 
@@ -2453,6 +2646,73 @@ public class Evaluator {
         return found;
     }
 
+    // --- Syntax-case template expansion ---
+
+    @SuppressWarnings("unchecked")
+    private Object expandSyntaxTemplate(Object template, Env env, Map<String, String> renames) throws EvalError {
+        template = unwrapSE(template);
+
+        if (template instanceof String sym) {
+            // Check if it's a pattern variable (bound as SyntaxObject/SyntaxEllipsis)
+            try {
+                Object val = env.lookup(sym);
+                if (val instanceof SyntaxObject so) return so.datum;
+                if (val instanceof SyntaxEllipsis) {
+                    throw new EvalError("syntax: misuse of ellipsis variable: " + sym);
+                }
+            } catch (EvalError e) {
+                // Not bound - leave as-is
+            }
+            // Non-pattern-variable: return as-is (symbol)
+            return sym;
+        }
+
+        if (template instanceof List<?> tmplList) {
+            List<Object> result = new ArrayList<>();
+            for (int i = 0; i < tmplList.size(); i++) {
+                if ("...".equals(unwrapSE(tmplList.get(i)))) continue;
+
+                if (i + 1 < tmplList.size() && "...".equals(unwrapSE(tmplList.get(i + 1)))) {
+                    // Ellipsis expansion
+                    Object subTmpl = tmplList.get(i);
+                    String evar = findSyntaxEllipsisVar(subTmpl, env);
+                    if (evar != null) {
+                        SyntaxEllipsis se = (SyntaxEllipsis) env.lookup(evar);
+                        for (Object elt : se.elements) {
+                            Env iterEnv = new Env(env);
+                            iterEnv.define(evar, new SyntaxObject(elt));
+                            result.add(expandSyntaxTemplate(subTmpl, iterEnv, renames));
+                        }
+                    }
+                    i++; // skip ...
+                } else {
+                    result.add(expandSyntaxTemplate(tmplList.get(i), env, renames));
+                }
+            }
+            return result;
+        }
+
+        return template;
+    }
+
+    private String findSyntaxEllipsisVar(Object template, Env env) {
+        template = unwrapSE(template);
+        if (template instanceof String sym) {
+            try {
+                Object val = env.lookup(sym);
+                if (val instanceof SyntaxEllipsis) return sym;
+            } catch (EvalError e) { /* not bound */ }
+            return null;
+        }
+        if (template instanceof List<?> list) {
+            for (Object elt : list) {
+                String found = findSyntaxEllipsisVar(elt, env);
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
     // --- Numeric helpers for exact arithmetic ---
 
     private static long gcd(long a, long b) {
@@ -2690,6 +2950,8 @@ public class Evaluator {
         if (val == CALLCC_PROC) return "#<procedure:call/cc>";
         if (val == DYNAMIC_WIND_PROC) return "#<procedure:dynamic-wind>";
         if (val instanceof SyntaxRulesMacro) return "#<macro>";
+        if (val instanceof SyntaxCaseTransformer) return "#<macro>";
+        if (val instanceof SyntaxObject so) return schemeToString(so.datum);
         if (val instanceof ResolvedValue rv) return schemeToString(rv.value);
         return val.toString();
     }
