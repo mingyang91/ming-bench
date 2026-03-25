@@ -465,6 +465,14 @@ const BUILTINS: &[BuiltinProcedure] = &[
         func: builtin_call_cc,
     },
     BuiltinProcedure {
+        name: "values",
+        func: builtin_values,
+    },
+    BuiltinProcedure {
+        name: "call-with-values",
+        func: builtin_call_with_values,
+    },
+    BuiltinProcedure {
         name: "apply",
         func: builtin_apply,
     },
@@ -1366,6 +1374,18 @@ fn builtin_is_even(args: &[Value], _runtime: &mut Runtime) -> Result<Value, Eval
 fn builtin_call_cc(_args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     Err(EvalError::SyntaxError {
         message: "internal error: call/cc should be handled by the evaluator".into(),
+    })
+}
+
+fn builtin_values(_args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    Err(EvalError::SyntaxError {
+        message: "internal error: values should be handled by the evaluator".into(),
+    })
+}
+
+fn builtin_call_with_values(_args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    Err(EvalError::SyntaxError {
+        message: "internal error: call-with-values should be handled by the evaluator".into(),
     })
 }
 

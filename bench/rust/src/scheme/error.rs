@@ -34,6 +34,9 @@ pub enum EvalError {
         actual: usize,
     },
 
+    #[error("wrong number of values: expected {expected}, got {actual}")]
+    WrongValueCount { expected: String, actual: usize },
+
     #[error("type mismatch: expected {expected}, got {found}")]
     TypeMismatch { expected: String, found: String },
 

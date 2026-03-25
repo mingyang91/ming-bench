@@ -101,6 +101,34 @@ struct CapturedExceptionHandler {
 }
 
 #[derive(Clone)]
+struct ProducedValues {
+    values: Vec<Value>,
+}
+
+impl ProducedValues {
+    fn single(value: Value) -> Self {
+        Self {
+            values: vec![value],
+        }
+    }
+
+    fn into_single(self) -> Result<Value, EvalError> {
+        match self.values.len() {
+            1 => Ok(self
+                .values
+                .into_iter()
+                .next()
+                .expect("single produced value")),
+            actual => Err(wrong_value_count("exactly 1", actual)),
+        }
+    }
+
+    fn into_vec(self) -> Vec<Value> {
+        self.values
+    }
+}
+
+#[derive(Clone)]
 struct MapIteration {
     operator: Value,
     lists: Rc<Vec<Vec<Value>>>,
@@ -123,7 +151,7 @@ struct WindTransition {
 
 #[derive(Clone)]
 enum WindResume {
-    Value(Value),
+    Values(ProducedValues),
     Apply {
         operator: Value,
         args: Vec<Value>,
@@ -188,11 +216,15 @@ enum MachineFrame {
     },
     DynamicWindExit {
         winder: WinderRef,
-        result: Option<Value>,
+        result: Option<ProducedValues>,
         pos: Option<Position>,
     },
     ExceptionHandlerExit {
         handler: ExceptionHandlerRef,
+    },
+    CallWithValues {
+        consumer: Value,
+        pos: Option<Position>,
     },
     WindTransition {
         transition: WindTransition,
@@ -202,10 +234,13 @@ enum MachineFrame {
 
 enum MachineControl {
     Expr(Rc<Expr>, EnvRef),
-    Value(Value),
+    Values(ProducedValues),
 }
 
-fn machine_eval_program(expressions: &[Expr], runtime: &mut Runtime) -> Result<Value, EvalError> {
+fn machine_eval_program(
+    expressions: &[Expr],
+    runtime: &mut Runtime,
+) -> Result<ProducedValues, EvalError> {
     if expressions.is_empty() {
         return Err(EvalError::EmptyInput);
     }
@@ -218,7 +253,7 @@ fn machine_eval_sequence(
     expressions: &[Expr],
     env: &EnvRef,
     runtime: &mut Runtime,
-) -> Result<Value, EvalError> {
+) -> Result<ProducedValues, EvalError> {
     let mut frames = Vec::new();
     let control = start_sequence_control(expressions.to_vec().into(), env.clone(), &mut frames);
     run_machine(control, frames, runtime)
@@ -228,7 +263,7 @@ fn machine_apply_procedure(
     operator: Value,
     args: &[Value],
     runtime: &mut Runtime,
-) -> Result<Value, EvalError> {
+) -> Result<ProducedValues, EvalError> {
     let mut frames = Vec::new();
     let control = apply_machine_value(operator, args.to_vec(), runtime, &mut frames, None)?;
     run_machine(control, frames, runtime)
@@ -238,13 +273,13 @@ fn run_machine(
     mut control: MachineControl,
     mut frames: Vec<MachineFrame>,
     runtime: &mut Runtime,
-) -> Result<Value, EvalError> {
+) -> Result<ProducedValues, EvalError> {
     loop {
         control = match control {
             MachineControl::Expr(expr, env) => eval_machine_expr(expr, env, runtime, &mut frames)?,
-            MachineControl::Value(value) => match frames.pop() {
-                Some(frame) => resume_machine_frame(frame, value, runtime, &mut frames)?,
-                None => return Ok(value),
+            MachineControl::Values(values) => match frames.pop() {
+                Some(frame) => resume_machine_frame(frame, values, runtime, &mut frames)?,
+                None => return Ok(values),
             },
         };
     }
@@ -265,7 +300,7 @@ fn continue_sequence_control(
     frames: &mut Vec<MachineFrame>,
 ) -> MachineControl {
     if index >= expressions.len() {
-        return MachineControl::Value(Value::Void);
+        return MachineControl::Values(ProducedValues::single(Value::Void));
     }
 
     if index + 1 < expressions.len() {
@@ -286,17 +321,23 @@ fn eval_machine_expr(
     frames: &mut Vec<MachineFrame>,
 ) -> Result<MachineControl, EvalError> {
     match expr.as_ref() {
-        Expr::Bool(value, _) => Ok(MachineControl::Value(Value::Bool(*value))),
-        Expr::Number(value, _) => Ok(MachineControl::Value(Value::Number(*value))),
-        Expr::String(value, _) => Ok(MachineControl::Value(super::core::make_immutable_string(
-            value.clone(),
+        Expr::Bool(value, _) => Ok(MachineControl::Values(ProducedValues::single(Value::Bool(
+            *value,
+        )))),
+        Expr::Number(value, _) => Ok(MachineControl::Values(ProducedValues::single(
+            Value::Number(*value),
         ))),
-        Expr::Char(value, _) => Ok(MachineControl::Value(Value::Char(*value))),
+        Expr::String(value, _) => Ok(MachineControl::Values(ProducedValues::single(
+            super::core::make_immutable_string(value.clone()),
+        ))),
+        Expr::Char(value, _) => Ok(MachineControl::Values(ProducedValues::single(Value::Char(
+            *value,
+        )))),
         Expr::Symbol(name, pos) => match Environment::lookup(&env, name) {
             Some(Value::Uninitialized) => {
                 Err(pos.attach(EvalError::UninitializedBinding { name: name.clone() }))
             }
-            Some(value) => Ok(MachineControl::Value(value)),
+            Some(value) => Ok(MachineControl::Values(ProducedValues::single(value))),
             None => Err(pos.attach(EvalError::UnboundSymbol { name: name.clone() })),
         },
         Expr::List(items, pos) => {
@@ -344,17 +385,19 @@ fn eval_machine_special_form(
 ) -> Result<MachineControl, EvalError> {
     match special_form {
         SpecialForm::Define => eval_machine_define(args, env, runtime, frames),
-        SpecialForm::DefineRecordType => {
-            eval_define_record_type(args, env).map(MachineControl::Value)
-        }
-        SpecialForm::DefineSyntax => {
-            eval_define_syntax(args, env, runtime).map(MachineControl::Value)
-        }
+        SpecialForm::DefineRecordType => eval_define_record_type(args, env)
+            .map(|value| MachineControl::Values(ProducedValues::single(value))),
+        SpecialForm::DefineSyntax => eval_define_syntax(args, env, runtime)
+            .map(|value| MachineControl::Values(ProducedValues::single(value))),
         SpecialForm::Set => eval_machine_set(args, env, runtime, frames),
         SpecialForm::If => eval_machine_if(args, env, frames),
-        SpecialForm::Quote => eval_quote(args).map(MachineControl::Value),
-        SpecialForm::Lambda => eval_lambda(args, env).map(MachineControl::Value),
-        SpecialForm::CaseLambda => eval_case_lambda(args, env).map(MachineControl::Value),
+        SpecialForm::Quote => {
+            eval_quote(args).map(|value| MachineControl::Values(ProducedValues::single(value)))
+        }
+        SpecialForm::Lambda => eval_lambda(args, env)
+            .map(|value| MachineControl::Values(ProducedValues::single(value))),
+        SpecialForm::CaseLambda => eval_case_lambda(args, env)
+            .map(|value| MachineControl::Values(ProducedValues::single(value))),
         SpecialForm::And => Ok(MachineControl::Expr(
             Rc::new(expand_and_form(args, pos, runtime)?),
             env.clone(),
@@ -424,7 +467,7 @@ fn eval_machine_define(
         }
         Expr::List(signature, _) => {
             let value = eval_function_define(signature, rest, env, args.len())?;
-            Ok(MachineControl::Value(value))
+            Ok(MachineControl::Values(ProducedValues::single(value)))
         }
         Expr::Bool(_, _) | Expr::Number(_, _) | Expr::String(_, _) | Expr::Char(_, _) => Err(
             positioned_syntax_error(target, "define requires a symbol or function signature"),
@@ -540,7 +583,7 @@ fn eval_machine_letrec(
 
 fn resume_machine_frame(
     frame: MachineFrame,
-    value: Value,
+    produced: ProducedValues,
     runtime: &mut Runtime,
     frames: &mut Vec<MachineFrame>,
 ) -> Result<MachineControl, EvalError> {
@@ -549,14 +592,19 @@ fn resume_machine_frame(
             expressions,
             index,
             env,
-        } => Ok(continue_sequence_control(expressions, index, env, frames)),
+        } => {
+            produced.into_single()?;
+            Ok(continue_sequence_control(expressions, index, env, frames))
+        }
         MachineFrame::Define { name, env } => {
+            let value = produced.into_single()?;
             Environment::define(&env, name, value);
-            Ok(MachineControl::Value(Value::Void))
+            Ok(MachineControl::Values(ProducedValues::single(Value::Void)))
         }
         MachineFrame::Set { name, env, pos } => {
+            let value = produced.into_single()?;
             if Environment::set(&env, &name, value) {
-                Ok(MachineControl::Value(Value::Void))
+                Ok(MachineControl::Values(ProducedValues::single(Value::Void)))
             } else {
                 Err(pos.attach(EvalError::UnboundSymbol { name }))
             }
@@ -566,15 +614,17 @@ fn resume_machine_frame(
             alternate,
             env,
         } => {
+            let value = produced.into_single()?;
             if value.is_truthy() {
                 Ok(MachineControl::Expr(consequent, env))
             } else if let Some(alternate) = alternate {
                 Ok(MachineControl::Expr(alternate, env))
             } else {
-                Ok(MachineControl::Value(Value::Void))
+                Ok(MachineControl::Values(ProducedValues::single(Value::Void)))
             }
         }
         MachineFrame::ApplyOperator { args, env, pos } => {
+            let value = produced.into_single()?;
             if args.is_empty() {
                 apply_machine_value(value, Vec::new(), runtime, frames, Some(pos))
             } else {
@@ -598,7 +648,7 @@ fn resume_machine_frame(
             env,
             pos,
         } => {
-            values.push(value);
+            values.push(produced.into_single()?);
             if index > 0 {
                 let next_index = index - 1;
                 frames.push(MachineFrame::ApplyArgument {
@@ -623,7 +673,7 @@ fn resume_machine_frame(
             index,
             mut values,
         } => {
-            values.push(value);
+            values.push(produced.into_single()?);
             if index + 1 < bindings.len() {
                 let next_index = index + 1;
                 frames.push(MachineFrame::LetrecParallel {
@@ -652,7 +702,7 @@ fn resume_machine_frame(
             cells,
             index,
         } => {
-            *cells[index].borrow_mut() = value;
+            *cells[index].borrow_mut() = produced.into_single()?;
             if index + 1 < bindings.len() {
                 let next_index = index + 1;
                 frames.push(MachineFrame::LetrecSequential {
@@ -672,7 +722,7 @@ fn resume_machine_frame(
         }
         MachineFrame::MapContinue(mut iteration) => {
             if !iteration.for_each {
-                iteration.results.push(value);
+                iteration.results.push(produced.into_single()?);
             }
 
             iteration.index += 1;
@@ -686,9 +736,11 @@ fn resume_machine_frame(
             {
                 apply_map_iteration(iteration, runtime, frames)
             } else if iteration.for_each {
-                Ok(MachineControl::Value(Value::Void))
+                Ok(MachineControl::Values(ProducedValues::single(Value::Void)))
             } else {
-                Ok(MachineControl::Value(list_from_vec(iteration.results)))
+                Ok(MachineControl::Values(ProducedValues::single(
+                    list_from_vec(iteration.results),
+                )))
             }
         }
         MachineFrame::DynamicWindEnter { winder, body, pos } => {
@@ -706,12 +758,12 @@ fn resume_machine_frame(
             pos,
         } => {
             if let Some(result) = result {
-                Ok(MachineControl::Value(result))
+                Ok(MachineControl::Values(result))
             } else {
                 pop_expected_winder(runtime, &winder);
                 frames.push(MachineFrame::DynamicWindExit {
                     winder: winder.clone(),
-                    result: Some(value),
+                    result: Some(produced),
                     pos,
                 });
                 apply_machine_value(winder.after.clone(), Vec::new(), runtime, frames, pos)
@@ -719,7 +771,10 @@ fn resume_machine_frame(
         }
         MachineFrame::ExceptionHandlerExit { handler } => {
             pop_expected_exception_handler(runtime, &handler);
-            Ok(MachineControl::Value(value))
+            Ok(MachineControl::Values(produced))
+        }
+        MachineFrame::CallWithValues { consumer, pos } => {
+            apply_machine_value(consumer, produced.into_vec(), runtime, frames, pos)
         }
         MachineFrame::WindTransition {
             transition,
@@ -774,14 +829,13 @@ fn apply_machine_value(
                 ))
             }
             Procedure::RecordConstructor(constructor) => {
-                apply_record_constructor(constructor, &args).map(MachineControl::Value)
+                apply_record_constructor(constructor, &args)
+                    .map(|value| MachineControl::Values(ProducedValues::single(value)))
             }
-            Procedure::RecordPredicate(predicate) => {
-                apply_record_predicate(predicate, &args).map(MachineControl::Value)
-            }
-            Procedure::RecordAccessor(accessor) => {
-                apply_record_accessor(accessor, &args).map(MachineControl::Value)
-            }
+            Procedure::RecordPredicate(predicate) => apply_record_predicate(predicate, &args)
+                .map(|value| MachineControl::Values(ProducedValues::single(value))),
+            Procedure::RecordAccessor(accessor) => apply_record_accessor(accessor, &args)
+                .map(|value| MachineControl::Values(ProducedValues::single(value))),
             Procedure::Continuation(captured) => {
                 apply_captured_continuation(captured.clone(), &args, runtime, frames, pos)
             }
@@ -823,10 +877,13 @@ fn apply_machine_builtin(
         "call/cc" | "call-with-current-continuation" => {
             apply_call_cc_builtin(&args, runtime, frames, pos)
         }
+        "values" => Ok(MachineControl::Values(ProducedValues { values: args })),
+        "call-with-values" => apply_call_with_values_builtin(&args, runtime, frames, pos),
         "apply" => apply_apply_builtin(&args, runtime, frames, pos),
         "map" => apply_map_builtin(&args, runtime, frames, pos, false),
         "for-each" => apply_map_builtin(&args, runtime, frames, pos, true),
-        _ => (builtin.func)(&args, runtime).map(MachineControl::Value),
+        _ => (builtin.func)(&args, runtime)
+            .map(|value| MachineControl::Values(ProducedValues::single(value))),
     }
 }
 
@@ -941,6 +998,23 @@ fn apply_call_cc_builtin(
     apply_machine_value(procedure.clone(), vec![continuation], runtime, frames, pos)
 }
 
+fn apply_call_with_values_builtin(
+    args: &[Value],
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+    pos: Option<Position>,
+) -> Result<MachineControl, EvalError> {
+    let [producer, consumer] = args else {
+        return Err(wrong_arg_count("call-with-values", "exactly 2", args.len()));
+    };
+
+    frames.push(MachineFrame::CallWithValues {
+        consumer: consumer.clone(),
+        pos,
+    });
+    apply_machine_value(producer.clone(), Vec::new(), runtime, frames, pos)
+}
+
 fn apply_apply_builtin(
     args: &[Value],
     runtime: &mut Runtime,
@@ -986,11 +1060,13 @@ fn apply_map_builtin(
     let len = lists.iter().map(|list| list.len()).min().unwrap_or(0);
 
     if len == 0 {
-        return Ok(MachineControl::Value(if for_each {
-            Value::Void
-        } else {
-            list_from_vec(Vec::new())
-        }));
+        return Ok(MachineControl::Values(ProducedValues::single(
+            if for_each {
+                Value::Void
+            } else {
+                list_from_vec(Vec::new())
+            },
+        )));
     }
 
     let call_pos = pos.unwrap_or(Position { line: 1, col: 1 });
@@ -1066,7 +1142,7 @@ fn apply_captured_continuation(
             target_frames: captured.frames.clone(),
             target_winders,
             target_handlers: captured.handlers.clone(),
-            resume: WindResume::Value(value.clone()),
+            resume: WindResume::Values(ProducedValues::single(value.clone())),
             pos,
         },
         runtime,
@@ -1132,7 +1208,7 @@ fn step_wind_transition(
     runtime.replace_exception_handlers(transition.target_handlers);
     *frames = transition.target_frames;
     match transition.resume {
-        WindResume::Value(value) => Ok(MachineControl::Value(value)),
+        WindResume::Values(values) => Ok(MachineControl::Values(values)),
         WindResume::Apply {
             operator,
             args,
@@ -1581,7 +1657,7 @@ pub(crate) fn eval_program(
     expressions: &[Expr],
     runtime: &mut Runtime,
 ) -> Result<Value, EvalError> {
-    machine_eval_program(expressions, runtime)
+    machine_eval_program(expressions, runtime).and_then(ProducedValues::into_single)
 }
 
 fn eval_define_record_type(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
@@ -2128,7 +2204,7 @@ pub(crate) fn apply_procedure(
     args: &[Value],
     runtime: &mut Runtime,
 ) -> Result<Value, EvalError> {
-    machine_apply_procedure(operator, args, runtime)
+    machine_apply_procedure(operator, args, runtime).and_then(ProducedValues::into_single)
 }
 
 fn prepare_lambda_call(lambda: &LambdaProcedure, args: &[Value]) -> Result<EnvRef, EvalError> {
@@ -2273,6 +2349,13 @@ fn positioned_syntax_error(expr: &Expr, message: impl Into<String>) -> EvalError
 fn wrong_arg_count(name: &str, expected: impl Into<String>, actual: usize) -> EvalError {
     EvalError::WrongArgCount {
         name: name.into(),
+        expected: expected.into(),
+        actual,
+    }
+}
+
+fn wrong_value_count(expected: impl Into<String>, actual: usize) -> EvalError {
+    EvalError::WrongValueCount {
         expected: expected.into(),
         actual,
     }
