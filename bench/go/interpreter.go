@@ -12,10 +12,12 @@ type node interface{}
 
 type listNode struct {
 	elements []node
+	pos      sourcePos
 }
 
 type symbolNode struct {
 	name string
+	pos  sourcePos
 }
 
 type value interface{}
@@ -50,7 +52,7 @@ func evalString(input string) (string, error) {
 		return "", err
 	}
 	if len(nodes) == 0 {
-		return "", &EvalError{Message: "empty input"}
+		return "", errorAt(startPos(), "empty input")
 	}
 
 	env := baseEnv()
@@ -133,41 +135,50 @@ func eval(expr node, env *environment) (value, error) {
 	case symbolNode:
 		val, ok := env.lookup(expr.name)
 		if !ok {
-			return nil, &EvalError{Message: fmt.Sprintf("unbound variable: %s", expr.name)}
+			return nil, errorAt(expr.pos, "unbound variable: %s", expr.name)
 		}
 		return val, nil
 	case listNode:
 		return evalList(expr, env)
 	default:
-		return nil, &EvalError{Message: "unknown expression"}
+		return nil, errorAt(nodePos(expr), "unknown expression")
 	}
 }
 
 func evalList(list listNode, env *environment) (value, error) {
 	if len(list.elements) == 0 {
-		return nil, &EvalError{Message: "cannot evaluate empty list"}
+		return nil, errorAt(list.pos, "cannot evaluate empty list")
 	}
 
 	if name, ok := symbolName(list.elements[0]); ok {
 		switch name {
 		case "and":
-			return evalAnd(list.elements[1:], env)
+			result, err := evalAnd(list.elements[1:], env)
+			return result, withErrorPos(err, list.pos)
 		case "or":
-			return evalOr(list.elements[1:], env)
+			result, err := evalOr(list.elements[1:], env)
+			return result, withErrorPos(err, list.pos)
 		case "define":
-			return evalDefine(list.elements[1:], env)
+			result, err := evalDefine(list.elements[1:], env)
+			return result, withErrorPos(err, list.pos)
 		case "if":
-			return evalIf(list.elements[1:], env)
+			result, err := evalIf(list.elements[1:], env)
+			return result, withErrorPos(err, list.pos)
 		case "quote":
-			return evalQuote(list.elements[1:])
+			result, err := evalQuote(list.elements[1:])
+			return result, withErrorPos(err, list.pos)
 		case "lambda":
-			return evalLambda(list.elements[1:], env)
+			result, err := evalLambda(list.elements[1:], env)
+			return result, withErrorPos(err, list.pos)
 		case "begin":
-			return evalBegin(list.elements[1:], env)
+			result, err := evalBegin(list.elements[1:], env)
+			return result, withErrorPos(err, list.pos)
 		case "cond":
-			return evalCond(list.elements[1:], env)
+			result, err := evalCond(list.elements[1:], env)
+			return result, withErrorPos(err, list.pos)
 		case "let":
-			return evalLet(list.elements[1:], env)
+			result, err := evalLet(list.elements[1:], env)
+			return result, withErrorPos(err, list.pos)
 		}
 	}
 
@@ -180,7 +191,7 @@ func evalList(list listNode, env *environment) (value, error) {
 	if err != nil {
 		return nil, err
 	}
-	return apply(operator, args)
+	return apply(operator, args, list.pos)
 }
 
 func evalArgs(args []node, env *environment) ([]value, error) {
@@ -383,7 +394,7 @@ func evalNamedLet(name string, args []node, env *environment) (value, error) {
 		env:    letEnv,
 	}
 	letEnv.define(name, proc)
-	return apply(proc, values)
+	return apply(proc, values, sourcePos{})
 }
 
 func evalBindings(bindingExprs []node, env *environment) ([]string, []value, error) {
@@ -440,13 +451,14 @@ func parseParamNames(paramExprs []node) ([]string, error) {
 	return params, nil
 }
 
-func apply(proc value, args []value) (value, error) {
+func apply(proc value, args []value, pos sourcePos) (value, error) {
 	switch proc := proc.(type) {
 	case builtinProc:
-		return proc(args)
+		result, err := proc(args)
+		return result, withErrorPos(err, pos)
 	case *closureValue:
 		if len(args) != len(proc.params) {
-			return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(proc.params), len(args))}
+			return nil, errorAt(pos, "expected %d arguments, got %d", len(proc.params), len(args))
 		}
 
 		callEnv := newEnvironment(proc.env)
@@ -455,7 +467,7 @@ func apply(proc value, args []value) (value, error) {
 		}
 		return evalSequence(proc.body, callEnv)
 	default:
-		return nil, &EvalError{Message: "not a procedure"}
+		return nil, errorAt(pos, "not a procedure")
 	}
 }
 
@@ -807,6 +819,17 @@ func symbolName(expr node) (string, bool) {
 	return sym.name, true
 }
 
+func nodePos(expr node) sourcePos {
+	switch expr := expr.(type) {
+	case listNode:
+		return expr.pos
+	case symbolNode:
+		return expr.pos
+	default:
+		return sourcePos{}
+	}
+}
+
 func parseProgram(input string) ([]node, error) {
 	p := parser{source: input}
 	var nodes []node
@@ -831,7 +854,7 @@ type parser struct {
 func (p *parser) parseExpr() (node, error) {
 	p.skipWhitespaceAndComments()
 	if p.eof() {
-		return nil, &EvalError{Message: "unexpected end of input"}
+		return nil, errorAt(p.currentPos(), "unexpected end of input")
 	}
 
 	switch p.peek() {
@@ -842,23 +865,24 @@ func (p *parser) parseExpr() (node, error) {
 	case '"':
 		return p.parseString()
 	case ')':
-		return nil, &EvalError{Message: "unexpected )"}
+		return nil, errorAt(p.currentPos(), "unexpected )")
 	default:
 		return p.parseAtom()
 	}
 }
 
 func (p *parser) parseList() (node, error) {
+	pos := p.currentPos()
 	p.offset++
 	var elements []node
 	for {
 		p.skipWhitespaceAndComments()
 		if p.eof() {
-			return nil, &EvalError{Message: "unterminated list"}
+			return nil, errorAt(pos, "unterminated list")
 		}
 		if p.peek() == ')' {
 			p.offset++
-			return listNode{elements: elements}, nil
+			return listNode{elements: elements, pos: pos}, nil
 		}
 		elem, err := p.parseExpr()
 		if err != nil {
@@ -869,6 +893,7 @@ func (p *parser) parseList() (node, error) {
 }
 
 func (p *parser) parseQuote() (node, error) {
+	pos := p.currentPos()
 	p.offset++
 	expr, err := p.parseExpr()
 	if err != nil {
@@ -876,13 +901,15 @@ func (p *parser) parseQuote() (node, error) {
 	}
 	return listNode{
 		elements: []node{
-			symbolNode{name: "quote"},
+			symbolNode{name: "quote", pos: pos},
 			expr,
 		},
+		pos: pos,
 	}, nil
 }
 
 func (p *parser) parseString() (node, error) {
+	pos := p.currentPos()
 	p.offset++
 	var builder strings.Builder
 	for !p.eof() {
@@ -893,7 +920,7 @@ func (p *parser) parseString() (node, error) {
 		}
 		if r == '\\' {
 			if p.eof() {
-				return nil, &EvalError{Message: "unterminated string escape"}
+				return nil, errorAt(pos, "unterminated string escape")
 			}
 			escaped := p.peek()
 			p.offset++
@@ -905,16 +932,17 @@ func (p *parser) parseString() (node, error) {
 			case 't':
 				builder.WriteByte('\t')
 			default:
-				return nil, &EvalError{Message: fmt.Sprintf("unsupported escape: \\%c", escaped)}
+				return nil, errorAt(pos, "unsupported escape: \\%c", escaped)
 			}
 			continue
 		}
 		builder.WriteRune(r)
 	}
-	return nil, &EvalError{Message: "unterminated string"}
+	return nil, errorAt(pos, "unterminated string")
 }
 
 func (p *parser) parseAtom() (node, error) {
+	pos := p.currentPos()
 	start := p.offset
 	for !p.eof() {
 		r := p.peek()
@@ -935,12 +963,12 @@ func (p *parser) parseAtom() (node, error) {
 	if isIntegerLiteral(token) {
 		n, err := strconv.Atoi(token)
 		if err != nil {
-			return nil, &EvalError{Message: fmt.Sprintf("invalid integer: %s", token)}
+			return nil, errorAt(pos, "invalid integer: %s", token)
 		}
 		return integerValue(n), nil
 	}
 
-	return symbolNode{name: token}, nil
+	return symbolNode{name: token, pos: pos}, nil
 }
 
 func (p *parser) skipWhitespaceAndComments() {
@@ -971,6 +999,25 @@ func (p *parser) eof() bool {
 func (p *parser) peek() rune {
 	r, _ := utf8.DecodeRuneInString(p.source[p.offset:])
 	return r
+}
+
+func (p *parser) currentPos() sourcePos {
+	return p.posAt(p.offset)
+}
+
+func (p *parser) posAt(offset int) sourcePos {
+	pos := startPos()
+	for i := 0; i < offset && i < len(p.source); {
+		r, size := utf8.DecodeRuneInString(p.source[i:])
+		if r == '\n' {
+			pos.Line++
+			pos.Col = 1
+		} else {
+			pos.Col++
+		}
+		i += size
+	}
+	return pos
 }
 
 func isIntegerLiteral(token string) bool {
