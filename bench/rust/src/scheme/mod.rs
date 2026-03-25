@@ -39,6 +39,7 @@ enum Value {
     Builtin(Builtin),
     Closure(Rc<Closure>),
     CaseClosure(Rc<CaseClosure>),
+    Continuation(Rc<CapturedContinuation>),
     Void,
 }
 
@@ -335,6 +336,77 @@ struct CaseClosure {
     clauses: Vec<Closure>,
 }
 
+#[derive(Clone)]
+struct CapturedContinuation {
+    context: Rc<ExecutionContext>,
+}
+
+#[derive(Clone)]
+enum ExecutionContext {
+    Done,
+    Sequence {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+        next: Rc<ExecutionContext>,
+    },
+    Define {
+        name: String,
+        env: EnvRef,
+        next: Rc<ExecutionContext>,
+    },
+    Set {
+        name: String,
+        env: EnvRef,
+        next: Rc<ExecutionContext>,
+    },
+    If {
+        consequent: Expr,
+        alternate: Expr,
+        env: EnvRef,
+        next: Rc<ExecutionContext>,
+    },
+    And {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+        next: Rc<ExecutionContext>,
+    },
+    Or {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+        next: Rc<ExecutionContext>,
+    },
+    ApplyOperator {
+        arguments: Vec<Expr>,
+        env: EnvRef,
+        next: Rc<ExecutionContext>,
+    },
+    ApplyArgument {
+        procedure: Value,
+        evaluated: Vec<Value>,
+        remaining: Vec<Expr>,
+        env: EnvRef,
+        next: Rc<ExecutionContext>,
+    },
+    Cond {
+        body: Vec<Expr>,
+        remaining: Vec<Expr>,
+        env: EnvRef,
+        next: Rc<ExecutionContext>,
+    },
+}
+
+enum MachineState {
+    Evaluate {
+        expr: Expr,
+        env: EnvRef,
+        context: Rc<ExecutionContext>,
+    },
+    Return {
+        value: Value,
+        context: Rc<ExecutionContext>,
+    },
+}
+
 struct ParameterSpec {
     params: Vec<String>,
     rest_param: Option<String>,
@@ -414,13 +486,11 @@ fn evaluate_program(input: &str) -> Result<Value, EvalError> {
     }
 
     let env = create_global_env();
-    let mut result = Value::Void;
-
-    for expression in &expressions {
-        result = evaluate(expression, env.clone())?;
-    }
-
-    Ok(result)
+    run_machine(schedule_sequence(
+        expressions,
+        env,
+        Rc::new(ExecutionContext::Done),
+    ))
 }
 
 fn parse_program(input: &str) -> Result<Vec<Expr>, EvalError> {
@@ -595,6 +665,704 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
     }
 
     Ok(tokens)
+}
+
+fn run_machine(mut state: MachineState) -> Result<Value, EvalError> {
+    loop {
+        state = match state {
+            MachineState::Evaluate { expr, env, context } => {
+                evaluate_with_machine(expr, env, context)?
+            }
+            MachineState::Return { value, context } => match context.as_ref() {
+                ExecutionContext::Done => return Ok(value),
+                _ => resume_machine(value, context)?,
+            },
+        };
+    }
+}
+
+fn evaluate_with_machine(
+    expr: Expr,
+    env: EnvRef,
+    context: Rc<ExecutionContext>,
+) -> Result<MachineState, EvalError> {
+    match expr {
+        Expr::Number(value) => Ok(MachineState::Return {
+            value: Value::Number(value),
+            context,
+        }),
+        Expr::Boolean(value) => Ok(MachineState::Return {
+            value: Value::Boolean(value),
+            context,
+        }),
+        Expr::String(value) => Ok(MachineState::Return {
+            value: Value::String(value),
+            context,
+        }),
+        Expr::Symbol(name) => Ok(MachineState::Return {
+            value: env.lookup(&name)?,
+            context,
+        }),
+        Expr::List(elements) => evaluate_list_with_machine(elements, env, context),
+    }
+}
+
+fn evaluate_list_with_machine(
+    elements: Vec<Expr>,
+    env: EnvRef,
+    context: Rc<ExecutionContext>,
+) -> Result<MachineState, EvalError> {
+    if elements.is_empty() {
+        return Err(EvalError::message("cannot evaluate an empty list"));
+    }
+
+    if let Expr::Symbol(name) = &elements[0] {
+        match name.as_str() {
+            "define" => return schedule_define(&elements[1..], env, context),
+            "set!" => return schedule_set(&elements[1..], env, context),
+            "if" => return schedule_if(&elements[1..], env, context),
+            "quote" => return schedule_quote(&elements[1..], context),
+            "lambda" => return schedule_lambda(&elements[1..], env, context),
+            "case-lambda" => return schedule_case_lambda(&elements[1..], env, context),
+            "and" => return schedule_and(&elements[1..], env, context),
+            "or" => return schedule_or(&elements[1..], env, context),
+            "begin" => return Ok(schedule_sequence(elements[1..].to_vec(), env, context)),
+            "let" => {
+                return Ok(MachineState::Evaluate {
+                    expr: expand_let_expression(&elements[1..])?,
+                    env,
+                    context,
+                })
+            }
+            "cond" => return schedule_cond(elements[1..].to_vec(), env, context),
+            _ => {}
+        }
+    }
+
+    Ok(MachineState::Evaluate {
+        expr: elements[0].clone(),
+        env: env.clone(),
+        context: Rc::new(ExecutionContext::ApplyOperator {
+            arguments: elements[1..].to_vec(),
+            env,
+            next: context,
+        }),
+    })
+}
+
+fn schedule_define(
+    args: &[Expr],
+    env: EnvRef,
+    context: Rc<ExecutionContext>,
+) -> Result<MachineState, EvalError> {
+    require_at_least("define", args.len(), 2)?;
+
+    match &args[0] {
+        Expr::Symbol(name) => {
+            require_exact("define", args.len(), 2)?;
+            Ok(MachineState::Evaluate {
+                expr: args[1].clone(),
+                env: env.clone(),
+                context: Rc::new(ExecutionContext::Define {
+                    name: name.clone(),
+                    env,
+                    next: context,
+                }),
+            })
+        }
+        Expr::List(signature) if !signature.is_empty() => {
+            let name = match &signature[0] {
+                Expr::Symbol(name) => name.clone(),
+                _ => return Err(EvalError::message("define: invalid function name")),
+            };
+
+            let ParameterSpec { params, rest_param } =
+                parse_parameter_list(&signature[1..], "lambda")?;
+            env.define(
+                name,
+                Value::Closure(Rc::new(Closure {
+                    params,
+                    rest_param,
+                    body: args[1..].to_vec(),
+                    env: env.clone(),
+                })),
+            );
+            Ok(MachineState::Return {
+                value: Value::Void,
+                context,
+            })
+        }
+        _ => Err(EvalError::message("define: invalid binding target")),
+    }
+}
+
+fn schedule_set(
+    args: &[Expr],
+    env: EnvRef,
+    context: Rc<ExecutionContext>,
+) -> Result<MachineState, EvalError> {
+    require_exact("set!", args.len(), 2)?;
+
+    let name = match &args[0] {
+        Expr::Symbol(name) => name.clone(),
+        _ => return Err(EvalError::message("set!: expected a symbol")),
+    };
+
+    Ok(MachineState::Evaluate {
+        expr: args[1].clone(),
+        env: env.clone(),
+        context: Rc::new(ExecutionContext::Set {
+            name,
+            env,
+            next: context,
+        }),
+    })
+}
+
+fn schedule_if(
+    args: &[Expr],
+    env: EnvRef,
+    context: Rc<ExecutionContext>,
+) -> Result<MachineState, EvalError> {
+    require_exact("if", args.len(), 3)?;
+    Ok(MachineState::Evaluate {
+        expr: args[0].clone(),
+        env: env.clone(),
+        context: Rc::new(ExecutionContext::If {
+            consequent: args[1].clone(),
+            alternate: args[2].clone(),
+            env,
+            next: context,
+        }),
+    })
+}
+
+fn schedule_quote(args: &[Expr], context: Rc<ExecutionContext>) -> Result<MachineState, EvalError> {
+    require_exact("quote", args.len(), 1)?;
+    Ok(MachineState::Return {
+        value: datum_to_value(&args[0]),
+        context,
+    })
+}
+
+fn schedule_lambda(
+    args: &[Expr],
+    env: EnvRef,
+    context: Rc<ExecutionContext>,
+) -> Result<MachineState, EvalError> {
+    require_at_least("lambda", args.len(), 2)?;
+    let ParameterSpec { params, rest_param } = parse_formals(&args[0], "lambda")?;
+
+    Ok(MachineState::Return {
+        value: Value::Closure(Rc::new(Closure {
+            params,
+            rest_param,
+            body: args[1..].to_vec(),
+            env,
+        })),
+        context,
+    })
+}
+
+fn schedule_case_lambda(
+    args: &[Expr],
+    env: EnvRef,
+    context: Rc<ExecutionContext>,
+) -> Result<MachineState, EvalError> {
+    require_at_least("case-lambda", args.len(), 1)?;
+
+    let mut clauses = Vec::with_capacity(args.len());
+    for clause in args {
+        let items = match clause {
+            Expr::List(items) if items.len() >= 2 => items,
+            _ => return Err(EvalError::message("case-lambda: invalid clause")),
+        };
+
+        let ParameterSpec { params, rest_param } = parse_formals(&items[0], "case-lambda")?;
+        clauses.push(Closure {
+            params,
+            rest_param,
+            body: items[1..].to_vec(),
+            env: env.clone(),
+        });
+    }
+
+    Ok(MachineState::Return {
+        value: Value::CaseClosure(Rc::new(CaseClosure { clauses })),
+        context,
+    })
+}
+
+fn schedule_and(
+    args: &[Expr],
+    env: EnvRef,
+    context: Rc<ExecutionContext>,
+) -> Result<MachineState, EvalError> {
+    if args.is_empty() {
+        return Ok(MachineState::Return {
+            value: Value::Boolean(true),
+            context,
+        });
+    }
+
+    Ok(MachineState::Evaluate {
+        expr: args[0].clone(),
+        env: env.clone(),
+        context: Rc::new(ExecutionContext::And {
+            remaining: args[1..].to_vec(),
+            env,
+            next: context,
+        }),
+    })
+}
+
+fn schedule_or(
+    args: &[Expr],
+    env: EnvRef,
+    context: Rc<ExecutionContext>,
+) -> Result<MachineState, EvalError> {
+    if args.is_empty() {
+        return Ok(MachineState::Return {
+            value: Value::Boolean(false),
+            context,
+        });
+    }
+
+    Ok(MachineState::Evaluate {
+        expr: args[0].clone(),
+        env: env.clone(),
+        context: Rc::new(ExecutionContext::Or {
+            remaining: args[1..].to_vec(),
+            env,
+            next: context,
+        }),
+    })
+}
+
+fn schedule_cond(
+    clauses: Vec<Expr>,
+    env: EnvRef,
+    context: Rc<ExecutionContext>,
+) -> Result<MachineState, EvalError> {
+    if clauses.is_empty() {
+        return Ok(MachineState::Return {
+            value: Value::Void,
+            context,
+        });
+    }
+
+    let mut clauses = clauses.into_iter();
+    let clause = clauses.next().unwrap();
+    let remaining = clauses.collect::<Vec<_>>();
+    let items = match clause {
+        Expr::List(items) if !items.is_empty() => items,
+        _ => return Err(EvalError::message("cond: invalid clause")),
+    };
+
+    if matches!(&items[0], Expr::Symbol(symbol) if symbol == "else") {
+        if !remaining.is_empty() {
+            return Err(EvalError::message("cond: else must be last"));
+        }
+        if items.len() == 1 {
+            return Err(EvalError::message("cond: else clause requires a body"));
+        }
+        return Ok(schedule_sequence(items[1..].to_vec(), env, context));
+    }
+
+    Ok(MachineState::Evaluate {
+        expr: items[0].clone(),
+        env: env.clone(),
+        context: Rc::new(ExecutionContext::Cond {
+            body: items[1..].to_vec(),
+            remaining,
+            env,
+            next: context,
+        }),
+    })
+}
+
+fn resume_machine(
+    value: Value,
+    context: Rc<ExecutionContext>,
+) -> Result<MachineState, EvalError> {
+    match context.as_ref() {
+        ExecutionContext::Done => Ok(MachineState::Return { value, context }),
+        ExecutionContext::Sequence {
+            remaining,
+            env,
+            next,
+        } => {
+            if remaining.is_empty() {
+                Ok(MachineState::Return {
+                    value,
+                    context: next.clone(),
+                })
+            } else {
+                Ok(schedule_sequence(remaining.clone(), env.clone(), next.clone()))
+            }
+        }
+        ExecutionContext::Define { name, env, next } => {
+            env.define(name.clone(), value);
+            Ok(MachineState::Return {
+                value: Value::Void,
+                context: next.clone(),
+            })
+        }
+        ExecutionContext::Set { name, env, next } => {
+            env.set(name, value)?;
+            Ok(MachineState::Return {
+                value: Value::Void,
+                context: next.clone(),
+            })
+        }
+        ExecutionContext::If {
+            consequent,
+            alternate,
+            env,
+            next,
+        } => Ok(MachineState::Evaluate {
+            expr: if is_truthy(&value) {
+                consequent.clone()
+            } else {
+                alternate.clone()
+            },
+            env: env.clone(),
+            context: next.clone(),
+        }),
+        ExecutionContext::And {
+            remaining,
+            env,
+            next,
+        } => {
+            if !is_truthy(&value) || remaining.is_empty() {
+                Ok(MachineState::Return {
+                    value,
+                    context: next.clone(),
+                })
+            } else {
+                Ok(MachineState::Evaluate {
+                    expr: remaining[0].clone(),
+                    env: env.clone(),
+                    context: Rc::new(ExecutionContext::And {
+                        remaining: remaining[1..].to_vec(),
+                        env: env.clone(),
+                        next: next.clone(),
+                    }),
+                })
+            }
+        }
+        ExecutionContext::Or {
+            remaining,
+            env,
+            next,
+        } => {
+            if is_truthy(&value) || remaining.is_empty() {
+                Ok(MachineState::Return {
+                    value,
+                    context: next.clone(),
+                })
+            } else {
+                Ok(MachineState::Evaluate {
+                    expr: remaining[0].clone(),
+                    env: env.clone(),
+                    context: Rc::new(ExecutionContext::Or {
+                        remaining: remaining[1..].to_vec(),
+                        env: env.clone(),
+                        next: next.clone(),
+                    }),
+                })
+            }
+        }
+        ExecutionContext::ApplyOperator {
+            arguments,
+            env,
+            next,
+        } => {
+            if arguments.is_empty() {
+                apply_invokable(value, Vec::new(), next.clone())
+            } else {
+                let next_index = arguments.len() - 1;
+                Ok(MachineState::Evaluate {
+                    expr: arguments[next_index].clone(),
+                    env: env.clone(),
+                    context: Rc::new(ExecutionContext::ApplyArgument {
+                        procedure: value,
+                        evaluated: Vec::new(),
+                        remaining: arguments[..next_index].to_vec(),
+                        env: env.clone(),
+                        next: next.clone(),
+                    }),
+                })
+            }
+        }
+        ExecutionContext::ApplyArgument {
+            procedure,
+            evaluated,
+            remaining,
+            env,
+            next,
+        } => {
+            let mut evaluated = evaluated.clone();
+            evaluated.insert(0, value);
+
+            if remaining.is_empty() {
+                apply_invokable(procedure.clone(), evaluated, next.clone())
+            } else {
+                let next_index = remaining.len() - 1;
+                Ok(MachineState::Evaluate {
+                    expr: remaining[next_index].clone(),
+                    env: env.clone(),
+                    context: Rc::new(ExecutionContext::ApplyArgument {
+                        procedure: procedure.clone(),
+                        evaluated,
+                        remaining: remaining[..next_index].to_vec(),
+                        env: env.clone(),
+                        next: next.clone(),
+                    }),
+                })
+            }
+        }
+        ExecutionContext::Cond {
+            body,
+            remaining,
+            env,
+            next,
+        } => {
+            if is_truthy(&value) {
+                if body.is_empty() {
+                    Ok(MachineState::Return {
+                        value,
+                        context: next.clone(),
+                    })
+                } else {
+                    Ok(schedule_sequence(body.clone(), env.clone(), next.clone()))
+                }
+            } else {
+                schedule_cond(remaining.clone(), env.clone(), next.clone())
+            }
+        }
+    }
+}
+
+fn schedule_sequence(
+    expressions: Vec<Expr>,
+    env: EnvRef,
+    context: Rc<ExecutionContext>,
+) -> MachineState {
+    if expressions.is_empty() {
+        return MachineState::Return {
+            value: Value::Void,
+            context,
+        };
+    }
+
+    if expressions.len() == 1 {
+        return MachineState::Evaluate {
+            expr: expressions.into_iter().next().unwrap(),
+            env,
+            context,
+        };
+    }
+
+    MachineState::Evaluate {
+        expr: expressions[0].clone(),
+        env: env.clone(),
+        context: Rc::new(ExecutionContext::Sequence {
+            remaining: expressions[1..].to_vec(),
+            env,
+            next: context,
+        }),
+    }
+}
+
+fn apply_invokable(
+    procedure: Value,
+    args: Vec<Value>,
+    context: Rc<ExecutionContext>,
+) -> Result<MachineState, EvalError> {
+    match procedure {
+        Value::Builtin(builtin) => match builtin.name {
+            "call/cc" | "call-with-current-continuation" => {
+                require_exact(builtin.name, args.len(), 1)?;
+                apply_invokable(
+                    args[0].clone(),
+                    vec![Value::Continuation(Rc::new(CapturedContinuation {
+                        context: context.clone(),
+                    }))],
+                    context,
+                )
+            }
+            "apply" => {
+                require_at_least("apply", args.len(), 2)?;
+                let procedure = args[0].clone();
+                let mut applied_args = args[1..args.len() - 1].to_vec();
+                applied_args.extend(list_to_vec(&args[args.len() - 1])?);
+                apply_invokable(procedure, applied_args, context)
+            }
+            _ => Ok(MachineState::Return {
+                value: (builtin.func)(&args)?,
+                context,
+            }),
+        },
+        Value::Closure(closure) => apply_closure_with_machine(closure.as_ref(), args, "lambda", context),
+        Value::CaseClosure(case_closure) => {
+            for clause in &case_closure.clauses {
+                if closure_accepts_arity(clause, args.len()) {
+                    return apply_closure_with_machine(clause, args, "case-lambda", context);
+                }
+            }
+
+            Err(EvalError::message(format!(
+                "case-lambda: no matching clause for {} argument(s)",
+                args.len()
+            )))
+        }
+        Value::Continuation(continuation) => {
+            require_exact("continuation", args.len(), 1)?;
+            Ok(MachineState::Return {
+                value: args[0].clone(),
+                context: continuation.context.clone(),
+            })
+        }
+        _ => Err(EvalError::message("attempted to call a non-procedure")),
+    }
+}
+
+fn apply_closure_with_machine(
+    closure: &Closure,
+    args: Vec<Value>,
+    name: &str,
+    context: Rc<ExecutionContext>,
+) -> Result<MachineState, EvalError> {
+    if closure.rest_param.is_some() {
+        require_at_least(name, args.len(), closure.params.len())?;
+    } else {
+        require_exact(name, args.len(), closure.params.len())?;
+    }
+
+    let call_env = Environment::new(Some(closure.env.clone()));
+    for (name, value) in closure.params.iter().zip(args.iter()) {
+        call_env.define(name.clone(), value.clone());
+    }
+
+    if let Some(rest_param) = &closure.rest_param {
+        call_env.define(
+            rest_param.clone(),
+            list_value(args[closure.params.len()..].iter().cloned()),
+        );
+    }
+
+    Ok(schedule_sequence(closure.body.clone(), call_env, context))
+}
+
+fn expand_let_expression(args: &[Expr]) -> Result<Expr, EvalError> {
+    require_at_least("let", args.len(), 2)?;
+
+    match &args[0] {
+        Expr::List(bindings) => expand_ordinary_let(bindings, &args[1..]),
+        Expr::Symbol(name) => {
+            require_at_least("let", args.len(), 3)?;
+            let bindings = match &args[1] {
+                Expr::List(bindings) => bindings,
+                _ => return Err(EvalError::message("let: expected a binding list")),
+            };
+            expand_named_let(name, bindings, &args[2..])
+        }
+        _ => Err(EvalError::message("let: invalid form")),
+    }
+}
+
+fn expand_ordinary_let(bindings: &[Expr], body: &[Expr]) -> Result<Expr, EvalError> {
+    require_at_least("let", body.len(), 1)?;
+    let bindings = parse_binding_expressions(bindings, "let")?;
+    let params = bindings
+        .iter()
+        .map(|(name, _)| Expr::Symbol(name.clone()))
+        .collect::<Vec<_>>();
+
+    let mut lambda = vec![Expr::Symbol("lambda".into()), Expr::List(params)];
+    lambda.extend(body.iter().cloned());
+
+    let mut application = vec![Expr::List(lambda)];
+    application.extend(bindings.into_iter().map(|(_, value)| value));
+    Ok(Expr::List(application))
+}
+
+fn expand_named_let(name: &str, bindings: &[Expr], body: &[Expr]) -> Result<Expr, EvalError> {
+    require_at_least("let", body.len(), 1)?;
+    let bindings = parse_binding_expressions(bindings, "let")?;
+    let params = bindings
+        .iter()
+        .map(|(param, _)| Expr::Symbol(param.clone()))
+        .collect::<Vec<_>>();
+    let temp_names = (0..bindings.len())
+        .map(|index| format!("__named_let_arg_{index}"))
+        .collect::<Vec<_>>();
+
+    let mut define_signature = vec![Expr::Symbol(name.to_string())];
+    define_signature.extend(params);
+
+    let mut define_form = vec![Expr::Symbol("define".into()), Expr::List(define_signature)];
+    define_form.extend(body.iter().cloned());
+
+    let mut recursive_call = vec![Expr::Symbol(name.to_string())];
+    recursive_call.extend(
+        temp_names
+            .iter()
+            .cloned()
+            .map(Expr::Symbol)
+            .collect::<Vec<_>>(),
+    );
+
+    let inner_lambda = Expr::List(vec![
+        Expr::Symbol("lambda".into()),
+        Expr::List(Vec::new()),
+        Expr::List(define_form),
+        Expr::List(recursive_call),
+    ]);
+    let inner_application = Expr::List(vec![inner_lambda]);
+
+    let outer_params = temp_names
+        .iter()
+        .cloned()
+        .map(Expr::Symbol)
+        .collect::<Vec<_>>();
+    let outer_lambda = Expr::List(vec![
+        Expr::Symbol("lambda".into()),
+        Expr::List(outer_params),
+        inner_application,
+    ]);
+
+    let mut outer_application = vec![outer_lambda];
+    outer_application.extend(bindings.into_iter().map(|(_, value)| value));
+    Ok(Expr::List(outer_application))
+}
+
+fn parse_binding_expressions(
+    bindings: &[Expr],
+    context: &str,
+) -> Result<Vec<(String, Expr)>, EvalError> {
+    let mut parsed = Vec::with_capacity(bindings.len());
+
+    for binding in bindings {
+        let items = match binding {
+            Expr::List(items) if items.len() == 2 => items,
+            _ => return Err(EvalError::message(format!("{context}: invalid binding"))),
+        };
+
+        let name = match &items[0] {
+            Expr::Symbol(name) => name.clone(),
+            _ => {
+                return Err(EvalError::message(format!(
+                    "{context}: binding name must be a symbol"
+                )))
+            }
+        };
+
+        parsed.push((name, items[1].clone()));
+    }
+
+    Ok(parsed)
 }
 
 fn evaluate(expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
@@ -935,6 +1703,13 @@ fn apply_procedure(procedure: Value, args: &[Value]) -> Result<Value, EvalError>
         Value::Builtin(builtin) => (builtin.func)(args),
         Value::Closure(closure) => apply_closure(closure.as_ref(), args, "lambda"),
         Value::CaseClosure(case_closure) => apply_case_closure(case_closure.as_ref(), args),
+        Value::Continuation(continuation) => {
+            require_exact("continuation", args.len(), 1)?;
+            run_machine(MachineState::Return {
+                value: args[0].clone(),
+                context: continuation.context.clone(),
+            })
+        }
         _ => Err(EvalError::message("attempted to call a non-procedure")),
     }
 }
@@ -1009,6 +1784,12 @@ fn create_global_env() -> EnvRef {
     define_builtin(&env, "length", builtin_length);
     define_builtin(&env, "append", builtin_append);
     define_builtin(&env, "apply", builtin_apply);
+    define_builtin(&env, "call/cc", builtin_call_cc);
+    define_builtin(
+        &env,
+        "call-with-current-continuation",
+        builtin_call_cc,
+    );
     define_builtin(&env, "string?", builtin_is_string);
     define_builtin(&env, "number?", builtin_is_number);
     define_builtin(&env, "integer?", builtin_is_integer);
@@ -1176,6 +1957,12 @@ fn builtin_apply(args: &[Value]) -> Result<Value, EvalError> {
     apply_procedure(procedure, &applied_args)
 }
 
+fn builtin_call_cc(_args: &[Value]) -> Result<Value, EvalError> {
+    Err(EvalError::message(
+        "call/cc requires continuation-aware application",
+    ))
+}
+
 fn builtin_is_string(args: &[Value]) -> Result<Value, EvalError> {
     require_exact("string?", args.len(), 1)?;
     Ok(Value::Boolean(matches!(args[0], Value::String(_))))
@@ -1263,7 +2050,7 @@ fn builtin_equal(args: &[Value]) -> Result<Value, EvalError> {
 fn is_procedure(value: &Value) -> bool {
     matches!(
         value,
-        Value::Builtin(_) | Value::Closure(_) | Value::CaseClosure(_)
+        Value::Builtin(_) | Value::Closure(_) | Value::CaseClosure(_) | Value::Continuation(_)
     )
 }
 
@@ -1280,6 +2067,7 @@ fn equal_values(left: &Value, right: &Value) -> bool {
         (Value::Builtin(left), Value::Builtin(right)) => left.name == right.name,
         (Value::Closure(left), Value::Closure(right)) => Rc::ptr_eq(left, right),
         (Value::CaseClosure(left), Value::CaseClosure(right)) => Rc::ptr_eq(left, right),
+        (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,
     }
@@ -1374,7 +2162,10 @@ fn type_name(value: &Value) -> &'static str {
         Value::Symbol(_) => "symbol",
         Value::Nil => "null",
         Value::Pair(_) => "pair",
-        Value::Builtin(_) | Value::Closure(_) | Value::CaseClosure(_) => "procedure",
+        Value::Builtin(_)
+        | Value::Closure(_)
+        | Value::CaseClosure(_)
+        | Value::Continuation(_) => "procedure",
         Value::Void => "void",
     }
 }
@@ -1389,7 +2180,9 @@ fn format_value(value: &Value) -> String {
         Value::Nil => "()".into(),
         Value::Pair(_) => format_pair(value),
         Value::Builtin(builtin) => format!("#<procedure:{}>", builtin.name),
-        Value::Closure(_) | Value::CaseClosure(_) => "#<procedure>".into(),
+        Value::Closure(_) | Value::CaseClosure(_) | Value::Continuation(_) => {
+            "#<procedure>".into()
+        }
         Value::Void => "#<void>".into(),
     }
 }

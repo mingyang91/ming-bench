@@ -55,10 +55,21 @@ type EvaluatedArg = {
   position: SourcePosition;
 };
 
+type EvalStep =
+  | { kind: 'suspend'; thunk: () => EvalStep }
+  | { kind: 'done'; value: SchemeValue };
+
+type EvalContinuation = (value: SchemeValue) => EvalStep;
+
 type BuiltinProcedure = {
   type: 'builtin';
   name: string;
   invoke: (args: EvaluatedArg[], callPosition: SourcePosition) => SchemeValue;
+  invokeCps?: (
+    args: EvaluatedArg[],
+    callPosition: SourcePosition,
+    continuation: EvalContinuation,
+  ) => EvalStep;
 };
 
 type Closure = {
@@ -121,6 +132,11 @@ type PairCell = {
   cdr: SchemeValue;
 };
 
+type ContinuationValue = {
+  type: 'continuation';
+  resume: EvalContinuation;
+};
+
 type SchemeValue =
   | { type: 'number'; value: SchemeNumber }
   | { type: 'boolean'; value: boolean }
@@ -133,6 +149,7 @@ type SchemeValue =
   | BuiltinProcedure
   | Closure
   | CaseClosure
+  | ContinuationValue
   | { type: 'void' };
 
 type EvalOutcome =
@@ -273,11 +290,7 @@ function evaluateProgram(input: string): { result: SchemeValue; output: string }
 
   const context: EvaluationContext = { output: [] };
   const env = createGlobalEnv(context);
-  let result: SchemeValue = VOID_VALUE;
-
-  for (const expr of expressions) {
-    result = evaluate(expr, env);
-  }
+  const result = runEvalStep(evaluateSequenceCps(expressions, env, completeEval));
 
   return { result, output: context.output.join('') };
 }
@@ -478,6 +491,812 @@ function tokenize(input: string): { tokens: Token[]; eofPosition: SourcePosition
   }
 
   return { tokens, eofPosition: currentPosition() };
+}
+
+function doneStep(value: SchemeValue): EvalStep {
+  return { kind: 'done', value };
+}
+
+function suspendStep(thunk: () => EvalStep): EvalStep {
+  return { kind: 'suspend', thunk };
+}
+
+function continueWith(continuation: EvalContinuation, value: SchemeValue): EvalStep {
+  return suspendStep(() => continuation(value));
+}
+
+function completeEval(value: SchemeValue): EvalStep {
+  return doneStep(value);
+}
+
+function runEvalStep(step: EvalStep): SchemeValue {
+  let current = step;
+  while (current.kind === 'suspend') {
+    current = current.thunk();
+  }
+
+  return current.value;
+}
+
+function continuationValue(resume: EvalContinuation): ContinuationValue {
+  return { type: 'continuation', resume };
+}
+
+function evaluateCps(
+  expr: Expr,
+  env: Environment,
+  continuation: EvalContinuation,
+): EvalStep {
+  return suspendStep(() => {
+    try {
+      switch (expr.type) {
+        case 'number':
+        case 'boolean':
+          return continueWith(continuation, expr);
+        case 'string':
+          return continueWith(continuation, stringValue(expr.value));
+        case 'char':
+          return continueWith(continuation, charValue(expr.value, expr.position));
+        case 'symbol':
+          if (expr.capturedCell) {
+            return continueWith(
+              continuation,
+              readBindingCell(expr.capturedCell, symbolKey(expr), expr.position),
+            );
+          }
+
+          if (expr.capturedSyntax) {
+            throw new EvalError(`syntax identifier used as value: ${expr.name}`, expr.position);
+          }
+
+          return continueWith(continuation, env.lookup(symbolKey(expr), expr.position));
+        case 'list':
+          return evaluateListCps(expr, env, continuation);
+      }
+    } catch (error) {
+      throw attachPosition(error, expr.position);
+    }
+  });
+}
+
+function evaluateListCps(
+  expr: Extract<Expr, { type: 'list' }>,
+  env: Environment,
+  continuation: EvalContinuation,
+): EvalStep {
+  return suspendStep(() => {
+    try {
+      if (expr.elements.length === 0) {
+        throw new EvalError('cannot evaluate empty list', expr.position);
+      }
+
+      const operator = expr.elements[0];
+      const args = expr.elements.slice(1);
+
+      if (operator.type === 'symbol') {
+        switch (operator.name) {
+          case 'define':
+            return evaluateDefineCps(args, env, operator.position, continuation);
+          case 'define-syntax':
+            return continueWith(
+              continuation,
+              evaluateDefineSyntax(args, env, operator.position),
+            );
+          case 'define-record-type':
+            return continueWith(
+              continuation,
+              evaluateDefineRecordType(args, env, operator.position),
+            );
+          case 'set!':
+            return evaluateSetCps(args, env, operator.position, continuation);
+          case 'if':
+            return evaluateIfCps(args, env, operator.position, continuation);
+          case 'quote':
+            return continueWith(continuation, evaluateQuote(args, operator.position));
+          case 'lambda':
+            return continueWith(continuation, evaluateLambda(args, env, operator.position));
+          case 'case-lambda':
+            return continueWith(continuation, evaluateCaseLambda(args, env, operator.position));
+          case 'and':
+            return evaluateAndCps(args, env, continuation);
+          case 'or':
+            return evaluateOrCps(args, env, continuation);
+          case 'begin':
+            return evaluateSequenceCps(args, env, continuation);
+          case 'let':
+            return evaluateLetCps(args, env, operator.position, continuation);
+          case 'let*':
+            return evaluateLetStarCps(args, env, operator.position, continuation);
+          case 'letrec':
+            return evaluateLetrecCps(args, env, operator.position, false, continuation);
+          case 'letrec*':
+            return evaluateLetrecCps(args, env, operator.position, true, continuation);
+          case 'cond':
+            return evaluateCondCps(args, env, continuation);
+          case 'case':
+            return evaluateCaseCps(args, env, operator.position, continuation);
+          case 'do':
+            return evaluateDoCps(args, env, operator.position, continuation);
+        }
+
+        const macro = operator.capturedSyntax ?? env.tryLookupSyntax(symbolKey(operator));
+        if (macro) {
+          return evaluateCps(expandMacroCall(macro, expr), env, continuation);
+        }
+      }
+
+      return evaluateCps(operator, env, (procedure) =>
+        evaluateCallArgExpressionsCps(args, env, (evaluatedArgs) =>
+          applyProcedureCps(procedure, evaluatedArgs, operator.position, continuation),
+        ),
+      );
+    } catch (error) {
+      throw attachPosition(error, expr.position);
+    }
+  });
+}
+
+function evaluateCallArgExpressionsCps(
+  expressions: Expr[],
+  env: Environment,
+  continuation: (args: EvaluatedArg[]) => EvalStep,
+  index = expressions.length - 1,
+  collected: EvaluatedArg[] = [],
+): EvalStep {
+  return suspendStep(() => {
+    if (index < 0) {
+      return continuation(collected);
+    }
+
+    const expr = expressions[index];
+    return evaluateCps(expr, env, (value) =>
+      evaluateCallArgExpressionsCps(
+        expressions,
+        env,
+        continuation,
+        index - 1,
+        [{ value, position: expr.position }, ...collected],
+      ),
+    );
+  });
+}
+
+function evaluateArgExpressionsCps(
+  expressions: Expr[],
+  env: Environment,
+  continuation: (args: EvaluatedArg[]) => EvalStep,
+  index = 0,
+  collected: EvaluatedArg[] = [],
+): EvalStep {
+  return suspendStep(() => {
+    if (index >= expressions.length) {
+      return continuation(collected);
+    }
+
+    const expr = expressions[index];
+    return evaluateCps(expr, env, (value) =>
+      evaluateArgExpressionsCps(
+        expressions,
+        env,
+        continuation,
+        index + 1,
+        [...collected, { value, position: expr.position }],
+      ),
+    );
+  });
+}
+
+function evaluateDefineCps(
+  args: Expr[],
+  env: Environment,
+  position: SourcePosition,
+  continuation: EvalContinuation,
+): EvalStep {
+  return suspendStep(() => {
+    if (args.length < 2) {
+      throw new EvalError(`define: expected at least 2 argument(s), got ${args.length}`, position);
+    }
+
+    const target = args[0];
+    if (target.type === 'symbol') {
+      requireArgCount('define', args.length, 2, position);
+      return evaluateCps(args[1], env, (value) => {
+        env.define(symbolKey(target), value);
+        return continueWith(continuation, VOID_VALUE);
+      });
+    }
+
+    if (target.type !== 'list' || target.elements.length === 0) {
+      throw new EvalError('define: invalid binding target', target.position);
+    }
+
+    const nameExpr = target.elements[0];
+    if (nameExpr.type !== 'symbol') {
+      throw new EvalError('define: invalid function name', nameExpr.position);
+    }
+
+    const { params, restParam } = parseParameterList('define', target.elements.slice(1));
+    const body = args.slice(1);
+    const closure: Closure = { type: 'closure', params, restParam, body, env };
+    env.define(symbolKey(nameExpr), closure);
+    return continueWith(continuation, VOID_VALUE);
+  });
+}
+
+function evaluateSetCps(
+  args: Expr[],
+  env: Environment,
+  position: SourcePosition,
+  continuation: EvalContinuation,
+): EvalStep {
+  return suspendStep(() => {
+    requireArgCount('set!', args.length, 2, position);
+
+    const target = args[0];
+    if (target.type !== 'symbol') {
+      throw new EvalError('set!: invalid binding target', target.position);
+    }
+
+    return evaluateCps(args[1], env, (value) => {
+      if (target.capturedCell) {
+        writeBindingCell(target.capturedCell, value);
+        return continueWith(continuation, VOID_VALUE);
+      }
+
+      env.set(symbolKey(target), value, target.position);
+      return continueWith(continuation, VOID_VALUE);
+    });
+  });
+}
+
+function evaluateIfCps(
+  args: Expr[],
+  env: Environment,
+  position: SourcePosition,
+  continuation: EvalContinuation,
+): EvalStep {
+  return suspendStep(() => {
+    if (args.length !== 2 && args.length !== 3) {
+      throw new EvalError(`if: expected 2 or 3 argument(s), got ${args.length}`, position);
+    }
+
+    return evaluateCps(args[0], env, (condition) => {
+      if (isTruthy(condition)) {
+        return evaluateCps(args[1], env, continuation);
+      }
+
+      return args[2] === undefined
+        ? continueWith(continuation, VOID_VALUE)
+        : evaluateCps(args[2], env, continuation);
+    });
+  });
+}
+
+function evaluateAndCps(
+  args: Expr[],
+  env: Environment,
+  continuation: EvalContinuation,
+  index = 0,
+): EvalStep {
+  return suspendStep(() => {
+    if (args.length === 0) {
+      return continueWith(continuation, booleanValue(true));
+    }
+
+    if (index === args.length - 1) {
+      return evaluateCps(args[index], env, continuation);
+    }
+
+    return evaluateCps(args[index], env, (result) =>
+      isTruthy(result) ? evaluateAndCps(args, env, continuation, index + 1) : continueWith(continuation, result),
+    );
+  });
+}
+
+function evaluateOrCps(
+  args: Expr[],
+  env: Environment,
+  continuation: EvalContinuation,
+  index = 0,
+): EvalStep {
+  return suspendStep(() => {
+    if (args.length === 0) {
+      return continueWith(continuation, booleanValue(false));
+    }
+
+    if (index === args.length - 1) {
+      return evaluateCps(args[index], env, continuation);
+    }
+
+    return evaluateCps(args[index], env, (result) =>
+      isTruthy(result) ? continueWith(continuation, result) : evaluateOrCps(args, env, continuation, index + 1),
+    );
+  });
+}
+
+function evaluateSequenceCps(
+  expressions: Expr[],
+  env: Environment,
+  continuation: EvalContinuation,
+  index = 0,
+): EvalStep {
+  return suspendStep(() => {
+    if (expressions.length === 0) {
+      return continueWith(continuation, VOID_VALUE);
+    }
+
+    if (index === expressions.length - 1) {
+      return evaluateCps(expressions[index], env, continuation);
+    }
+
+    return evaluateCps(expressions[index], env, () =>
+      evaluateSequenceCps(expressions, env, continuation, index + 1),
+    );
+  });
+}
+
+function evaluateLetCps(
+  args: Expr[],
+  env: Environment,
+  position: SourcePosition,
+  continuation: EvalContinuation,
+): EvalStep {
+  return suspendStep(() => {
+    requireArgCountAtLeast('let', args.length, 2, position);
+
+    const firstArg = args[0];
+    if (firstArg.type === 'symbol') {
+      requireArgCountAtLeast('let', args.length, 3, position);
+      const bindings = parseLetBindings('let', args[1]);
+
+      return evaluateArgExpressionsCps(
+        bindings.map((binding) => binding.value),
+        env,
+        (values) => {
+          const letEnv = new Environment(env);
+          const closure: Closure = {
+            type: 'closure',
+            params: bindings.map((binding) => symbolKey(binding.name)),
+            body: args.slice(2),
+            env: letEnv,
+          };
+
+          letEnv.define(symbolKey(firstArg), closure);
+          return applyProcedureCps(closure, values, firstArg.position, continuation);
+        },
+      );
+    }
+
+    const bindings = parseLetBindings('let', firstArg);
+    return evaluateArgExpressionsCps(
+      bindings.map((binding) => binding.value),
+      env,
+      (values) => {
+        const letEnv = new Environment(env);
+        for (let index = 0; index < bindings.length; index += 1) {
+          letEnv.define(symbolKey(bindings[index].name), values[index].value);
+        }
+
+        return evaluateSequenceCps(args.slice(1), letEnv, continuation);
+      },
+    );
+  });
+}
+
+function evaluateLetStarCps(
+  args: Expr[],
+  env: Environment,
+  position: SourcePosition,
+  continuation: EvalContinuation,
+  index = 0,
+  letStarEnv?: Environment,
+  bindings?: Array<{ name: SymbolExpr; value: Expr }>,
+): EvalStep {
+  return suspendStep(() => {
+    requireArgCountAtLeast('let*', args.length, 2, position);
+    const currentEnv = letStarEnv ?? new Environment(env);
+    const currentBindings = bindings ?? parseLetBindings('let*', args[0]);
+
+    if (index >= currentBindings.length) {
+      return evaluateSequenceCps(args.slice(1), currentEnv, continuation);
+    }
+
+    const binding = currentBindings[index];
+    return evaluateCps(binding.value, currentEnv, (value) => {
+      currentEnv.define(symbolKey(binding.name), value);
+      return evaluateLetStarCps(
+        args,
+        env,
+        position,
+        continuation,
+        index + 1,
+        currentEnv,
+        currentBindings,
+      );
+    });
+  });
+}
+
+function evaluateCondCps(
+  args: Expr[],
+  env: Environment,
+  continuation: EvalContinuation,
+  index = 0,
+): EvalStep {
+  return suspendStep(() => {
+    if (index >= args.length) {
+      return continueWith(continuation, VOID_VALUE);
+    }
+
+    const clause = args[index];
+    if (clause.type !== 'list' || clause.elements.length === 0) {
+      throw new EvalError('cond: expected non-empty clause', clause.position);
+    }
+
+    const [testExpr, ...body] = clause.elements;
+    if (testExpr.type === 'symbol' && testExpr.name === 'else') {
+      return body.length === 0
+        ? continueWith(continuation, VOID_VALUE)
+        : evaluateSequenceCps(body, env, continuation);
+    }
+
+    return evaluateCps(testExpr, env, (testValue) => {
+      if (isTruthy(testValue)) {
+        return body.length === 0
+          ? continueWith(continuation, testValue)
+          : evaluateSequenceCps(body, env, continuation);
+      }
+
+      return evaluateCondCps(args, env, continuation, index + 1);
+    });
+  });
+}
+
+function evaluateLetrecCps(
+  args: Expr[],
+  env: Environment,
+  position: SourcePosition,
+  sequential: boolean,
+  continuation: EvalContinuation,
+): EvalStep {
+  return suspendStep(() => {
+    const name = sequential ? 'letrec*' : 'letrec';
+    requireArgCountAtLeast(name, args.length, 2, position);
+
+    const bindings = parseLetBindings(name, args[0]);
+    const letrecEnv = new Environment(env);
+    for (const binding of bindings) {
+      letrecEnv.defineUninitialized(symbolKey(binding.name));
+    }
+
+    if (sequential) {
+      return evaluateLetrecSequentialCps(bindings, letrecEnv, continuation, args.slice(1), 0);
+    }
+
+    return evaluateArgExpressionsCps(
+      bindings.map((binding) => binding.value),
+      letrecEnv,
+      (values) => {
+        for (let index = 0; index < bindings.length; index += 1) {
+          letrecEnv.set(symbolKey(bindings[index].name), values[index].value, bindings[index].value.position);
+        }
+
+        return evaluateSequenceCps(args.slice(1), letrecEnv, continuation);
+      },
+    );
+  });
+}
+
+function evaluateLetrecSequentialCps(
+  bindings: Array<{ name: SymbolExpr; value: Expr }>,
+  letrecEnv: Environment,
+  continuation: EvalContinuation,
+  body: Expr[],
+  index: number,
+): EvalStep {
+  return suspendStep(() => {
+    if (index >= bindings.length) {
+      return evaluateSequenceCps(body, letrecEnv, continuation);
+    }
+
+    const binding = bindings[index];
+    return evaluateCps(binding.value, letrecEnv, (value) => {
+      letrecEnv.set(symbolKey(binding.name), value, binding.value.position);
+      return evaluateLetrecSequentialCps(bindings, letrecEnv, continuation, body, index + 1);
+    });
+  });
+}
+
+function evaluateCaseCps(
+  args: Expr[],
+  env: Environment,
+  position: SourcePosition,
+  continuation: EvalContinuation,
+): EvalStep {
+  return suspendStep(() => {
+    requireArgCountAtLeast('case', args.length, 2, position);
+    const clauses = args.slice(1);
+
+    return evaluateCps(args[0], env, (key) =>
+      evaluateCaseClauseCps(clauses, key, env, continuation, 0),
+    );
+  });
+}
+
+function evaluateCaseClauseCps(
+  clauses: Expr[],
+  key: SchemeValue,
+  env: Environment,
+  continuation: EvalContinuation,
+  index: number,
+): EvalStep {
+  return suspendStep(() => {
+    if (index >= clauses.length) {
+      return continueWith(continuation, VOID_VALUE);
+    }
+
+    const clause = clauses[index];
+    if (clause.type !== 'list' || clause.elements.length === 0) {
+      throw new EvalError('case: expected non-empty clause', clause.position);
+    }
+
+    const [head, ...body] = clause.elements;
+    if (head.type === 'symbol' && head.name === 'else') {
+      if (index !== clauses.length - 1) {
+        throw new EvalError('case: else clause must be last', head.position);
+      }
+
+      return body.length === 0
+        ? continueWith(continuation, VOID_VALUE)
+        : evaluateSequenceCps(body, env, continuation);
+    }
+
+    if (head.type !== 'list') {
+      throw new EvalError('case: expected datum list', head.position);
+    }
+
+    if (head.elements.some((datum) => eqvValues(key, quoteExpr(datum)))) {
+      return body.length === 0
+        ? continueWith(continuation, VOID_VALUE)
+        : evaluateSequenceCps(body, env, continuation);
+    }
+
+    return evaluateCaseClauseCps(clauses, key, env, continuation, index + 1);
+  });
+}
+
+function evaluateDoCps(
+  args: Expr[],
+  env: Environment,
+  position: SourcePosition,
+  continuation: EvalContinuation,
+): EvalStep {
+  return suspendStep(() => {
+    requireArgCountAtLeast('do', args.length, 2, position);
+
+    const bindings = parseDoBindings(args[0]);
+    const testClause = args[1];
+    if (testClause.type !== 'list' || testClause.elements.length === 0) {
+      throw new EvalError('do: expected termination clause', testClause.position);
+    }
+
+    const [testExpr, ...resultExprs] = testClause.elements;
+    const body = args.slice(2);
+    const doEnv = new Environment(env);
+
+    return evaluateArgExpressionsCps(
+      bindings.map((binding) => binding.init),
+      env,
+      (initialValues) => {
+        for (let index = 0; index < bindings.length; index += 1) {
+          doEnv.define(symbolKey(bindings[index].name), initialValues[index].value);
+        }
+
+        return evaluateDoLoopCps(
+          bindings,
+          testExpr,
+          resultExprs,
+          body,
+          doEnv,
+          continuation,
+        );
+      },
+    );
+  });
+}
+
+function evaluateDoLoopCps(
+  bindings: DoBinding[],
+  testExpr: Expr,
+  resultExprs: Expr[],
+  body: Expr[],
+  doEnv: Environment,
+  continuation: EvalContinuation,
+): EvalStep {
+  return suspendStep(() =>
+    evaluateCps(testExpr, doEnv, (testValue) => {
+      if (isTruthy(testValue)) {
+        return resultExprs.length === 0
+          ? continueWith(continuation, VOID_VALUE)
+          : evaluateSequenceCps(resultExprs, doEnv, continuation);
+      }
+
+      return evaluateSequenceCps(body, doEnv, () =>
+        evaluateDoStepsCps(bindings, doEnv, 0, [], () =>
+          evaluateDoLoopCps(bindings, testExpr, resultExprs, body, doEnv, continuation),
+        ),
+      );
+    }),
+  );
+}
+
+function evaluateDoStepsCps(
+  bindings: DoBinding[],
+  doEnv: Environment,
+  index: number,
+  nextValues: Array<{ name: string; value: SchemeValue; position: SourcePosition }>,
+  continuation: () => EvalStep,
+): EvalStep {
+  return suspendStep(() => {
+    if (index >= bindings.length) {
+      for (const nextValue of nextValues) {
+        doEnv.set(nextValue.name, nextValue.value, nextValue.position);
+      }
+
+      return continuation();
+    }
+
+    const binding = bindings[index];
+    if (binding.step === undefined) {
+      return evaluateDoStepsCps(bindings, doEnv, index + 1, nextValues, continuation);
+    }
+
+    return evaluateCps(binding.step, doEnv, (value) =>
+      evaluateDoStepsCps(
+        bindings,
+        doEnv,
+        index + 1,
+        [
+          ...nextValues,
+          { name: symbolKey(binding.name), value, position: binding.step!.position },
+        ],
+        continuation,
+      ),
+    );
+  });
+}
+
+function applyProcedureCps(
+  value: SchemeValue,
+  args: EvaluatedArg[],
+  callPosition: SourcePosition,
+  continuation: EvalContinuation,
+): EvalStep {
+  return suspendStep(() => {
+    try {
+      switch (value.type) {
+        case 'builtin':
+          return value.invokeCps
+            ? value.invokeCps(args, callPosition, continuation)
+            : continueWith(continuation, value.invoke(args, callPosition));
+        case 'closure':
+          return applyClosureCps(value, args, callPosition, 'lambda', continuation);
+        case 'case-closure': {
+          const clause = value.clauses.find((candidate) => matchesArity(candidate, args.length));
+          if (clause === undefined) {
+            throw new EvalError('case-lambda: wrong number of arguments', callPosition);
+          }
+
+          return applyClosureCps(
+            { type: 'closure', env: value.env, ...clause },
+            args,
+            callPosition,
+            'case-lambda',
+            continuation,
+          );
+        }
+        case 'continuation':
+          requireArgCount('continuation', args.length, 1, callPosition);
+          return value.resume(args[0].value);
+        default:
+          throw new EvalError('attempted to call a non-procedure', callPosition);
+      }
+    } catch (error) {
+      throw attachPosition(error, callPosition);
+    }
+  });
+}
+
+function applyClosureCps(
+  value: Closure,
+  args: EvaluatedArg[],
+  callPosition: SourcePosition,
+  name: string,
+  continuation: EvalContinuation,
+): EvalStep {
+  return suspendStep(() => {
+    if (value.restParam === undefined) {
+      requireArgCount(name, args.length, value.params.length, callPosition);
+    } else {
+      requireArgCountAtLeast(name, args.length, value.params.length, callPosition);
+    }
+
+    const callEnv = new Environment(value.env);
+    for (let index = 0; index < value.params.length; index += 1) {
+      callEnv.define(value.params[index], args[index].value);
+    }
+
+    if (value.restParam !== undefined) {
+      callEnv.define(
+        value.restParam,
+        listValue(args.slice(value.params.length).map((arg) => arg.value)),
+      );
+    }
+
+    return evaluateSequenceCps(value.body, callEnv, continuation);
+  });
+}
+
+function mapBuiltinCps(
+  procedure: SchemeValue,
+  cursors: ListValue[],
+  listArgs: EvaluatedArg[],
+  callPosition: SourcePosition,
+  continuation: EvalContinuation,
+  results: SchemeValue[],
+): EvalStep {
+  return suspendStep(() => {
+    const pairs = cursors.map((cursor) => (isPairListValue(cursor) ? cursor : undefined));
+    if (pairs.some((pair) => pair === undefined)) {
+      return continueWith(continuation, listValue(results));
+    }
+
+    const mappedArgs = pairs.map((pair, listIndex) => ({
+      value: pair!.pair.car,
+      position: listArgs[listIndex].position,
+    }));
+
+    return applyProcedureCps(procedure, mappedArgs, callPosition, (mappedValue) =>
+      mapBuiltinCps(
+        procedure,
+        cursors.map((_, index) => cdrValue(pairs[index]!) as ListValue),
+        listArgs,
+        callPosition,
+        continuation,
+        [...results, mappedValue],
+      ),
+    );
+  });
+}
+
+function forEachBuiltinCps(
+  procedure: SchemeValue,
+  cursors: ListValue[],
+  listArgs: EvaluatedArg[],
+  callPosition: SourcePosition,
+  continuation: EvalContinuation,
+): EvalStep {
+  return suspendStep(() => {
+    const pairs = cursors.map((cursor) => (isPairListValue(cursor) ? cursor : undefined));
+    if (pairs.some((pair) => pair === undefined)) {
+      return continueWith(continuation, VOID_VALUE);
+    }
+
+    const appliedArgs = pairs.map((pair, listIndex) => ({
+      value: pair!.pair.car,
+      position: listArgs[listIndex].position,
+    }));
+
+    return applyProcedureCps(procedure, appliedArgs, callPosition, () =>
+      forEachBuiltinCps(
+        procedure,
+        cursors.map((_, index) => cdrValue(pairs[index]!) as ListValue),
+        listArgs,
+        callPosition,
+        continuation,
+      ),
+    );
+  });
 }
 
 function evaluate(expr: Expr, env: Environment): SchemeValue {
@@ -2044,6 +2863,27 @@ function tailOutcome(expr: Expr, env: Environment): EvalOutcome {
 
 function createGlobalEnv(context: EvaluationContext): Environment {
   const env = new Environment();
+  const callWithCurrentContinuationBuiltin = (name: string): BuiltinProcedure =>
+    builtin(
+      name,
+      (_args, callPosition) => {
+        throw new EvalError(`${name}: internal error`, callPosition);
+      },
+      (args, callPosition, continuation) => {
+        requireArgCount(name, args.length, 1, callPosition);
+        return applyProcedureCps(
+          args[0].value,
+          [
+            {
+              value: continuationValue((value) => continueWith(continuation, value)),
+              position: callPosition,
+            },
+          ],
+          callPosition,
+          continuation,
+        );
+      },
+    );
 
   env.define(
     '+',
@@ -2524,7 +3364,29 @@ function createGlobalEnv(context: EvaluationContext): Environment {
         [...args.slice(1, -1), ...trailingArgs],
         callPosition,
       );
+    }, (args, callPosition, continuation) => {
+      requireArgCountAtLeast('apply', args.length, 2, callPosition);
+
+      const procedure = args[0].value;
+      const finalListArg = args[args.length - 1];
+      const trailingArgs = listElements(expectList('apply', finalListArg)).map((value) => ({
+        value,
+        position: finalListArg.position,
+      }));
+
+      return applyProcedureCps(
+        procedure,
+        [...args.slice(1, -1), ...trailingArgs],
+        callPosition,
+        continuation,
+      );
     }),
+  );
+
+  env.define('call/cc', callWithCurrentContinuationBuiltin('call/cc'));
+  env.define(
+    'call-with-current-continuation',
+    callWithCurrentContinuationBuiltin('call-with-current-continuation'),
   );
 
   env.define(
@@ -2554,6 +3416,13 @@ function createGlobalEnv(context: EvaluationContext): Environment {
       }
 
       return listValue(results);
+    }, (args, callPosition, continuation) => {
+      requireArgCountAtLeast('map', args.length, 2, callPosition);
+
+      const procedure = args[0].value;
+      const cursors = args.slice(1).map((arg) => expectList('map', arg));
+
+      return mapBuiltinCps(procedure, cursors, args.slice(1), callPosition, continuation, []);
     }),
   );
 
@@ -2583,6 +3452,13 @@ function createGlobalEnv(context: EvaluationContext): Environment {
       }
 
       return VOID_VALUE;
+    }, (args, callPosition, continuation) => {
+      requireArgCountAtLeast('for-each', args.length, 2, callPosition);
+
+      const procedure = args[0].value;
+      const cursors = args.slice(1).map((arg) => expectList('for-each', arg));
+
+      return forEachBuiltinCps(procedure, cursors, args.slice(1), callPosition, continuation);
     }),
   );
 
@@ -3141,8 +4017,13 @@ function createGlobalEnv(context: EvaluationContext): Environment {
 function builtin(
   name: string,
   invoke: (args: EvaluatedArg[], callPosition: SourcePosition) => SchemeValue,
+  invokeCps?: (
+    args: EvaluatedArg[],
+    callPosition: SourcePosition,
+    continuation: EvalContinuation,
+  ) => EvalStep,
 ): BuiltinProcedure {
-  return { type: 'builtin', name, invoke };
+  return { type: 'builtin', name, invoke, invokeCps };
 }
 
 function evaluateNumberArgs(name: string, args: EvaluatedArg[]): SchemeNumber[] {
@@ -3533,6 +4414,7 @@ function eqvValues(left: SchemeValue, right: SchemeValue): boolean {
     case 'builtin':
     case 'closure':
     case 'case-closure':
+    case 'continuation':
       return false;
     case 'void':
       return true;
@@ -3605,6 +4487,7 @@ function equalValuesInternal(
     case 'builtin':
     case 'closure':
     case 'case-closure':
+    case 'continuation':
       return left === right;
     case 'void':
       return true;
@@ -3807,6 +4690,7 @@ function formatValueInternal(
     case 'builtin':
     case 'closure':
     case 'case-closure':
+    case 'continuation':
       return '#<procedure>';
     case 'void':
       return '#<void>';
@@ -3814,7 +4698,12 @@ function formatValueInternal(
 }
 
 function isProcedureValue(value: SchemeValue): boolean {
-  return value.type === 'builtin' || value.type === 'closure' || value.type === 'case-closure';
+  return (
+    value.type === 'builtin' ||
+    value.type === 'closure' ||
+    value.type === 'case-closure' ||
+    value.type === 'continuation'
+  );
 }
 
 function formatListValue(
