@@ -14,7 +14,10 @@ type IntVal struct{ Val int64 }
 type FloatVal struct{ Val float64 }
 type RationalVal struct{ Num, Den int64 } // always simplified, Den > 0
 type BoolVal struct{ Val bool }
-type StringVal struct{ Val string }
+type StringVal struct {
+	Val     string
+	Mutable bool
+}
 type PairVal struct{ Car, Cdr Value }
 type NilVal struct{}
 type SymbolVal struct{ Name string }

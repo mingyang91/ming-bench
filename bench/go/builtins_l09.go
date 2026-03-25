@@ -626,7 +626,7 @@ func builtinStringUpcase(args []Value) (Value, error) {
 	if !ok {
 		return nil, &EvalError{Message: "string-upcase: not a string"}
 	}
-	return &StringVal{Val: strings.ToUpper(s.Val)}, nil
+	return &StringVal{Val: strings.ToUpper(s.Val), Mutable: true}, nil
 }
 
 func builtinStringDowncase(args []Value) (Value, error) {
@@ -637,7 +637,7 @@ func builtinStringDowncase(args []Value) (Value, error) {
 	if !ok {
 		return nil, &EvalError{Message: "string-downcase: not a string"}
 	}
-	return &StringVal{Val: strings.ToLower(s.Val)}, nil
+	return &StringVal{Val: strings.ToLower(s.Val), Mutable: true}, nil
 }
 
 func registerL09Builtins(env *Env) {

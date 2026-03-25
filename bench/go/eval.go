@@ -381,6 +381,7 @@ func makeGlobalEnv(out *strings.Builder) *Env {
 	env.set(">", &BuiltinFunc{Name: ">", Fn: builtinGT})
 	env.set("=", &BuiltinFunc{Name: "=", Fn: builtinEq})
 	env.set("<=", &BuiltinFunc{Name: "<=", Fn: builtinLE})
+	env.set(">=", &BuiltinFunc{Name: ">=", Fn: builtinGE})
 
 	// Logic
 	env.set("not", &BuiltinFunc{Name: "not", Fn: builtinNot})
@@ -453,6 +454,10 @@ func makeGlobalEnv(out *strings.Builder) *Env {
 	env.set("string-ref", &BuiltinFunc{Name: "string-ref", Fn: builtinStringRef})
 	env.set("string-copy", &BuiltinFunc{Name: "string-copy", Fn: builtinStringCopy})
 	env.set("string-set!", &BuiltinFunc{Name: "string-set!", Fn: builtinStringSet})
+	env.set("string->list", &BuiltinFunc{Name: "string->list", Fn: builtinStringToList})
+	env.set("list->string", &BuiltinFunc{Name: "list->string", Fn: builtinListToString})
+	env.set("char->integer", &BuiltinFunc{Name: "char->integer", Fn: builtinCharToInteger})
+	env.set("integer->char", &BuiltinFunc{Name: "integer->char", Fn: builtinIntegerToChar})
 
 	// L09 builtins
 	registerL09Builtins(env)
@@ -496,6 +501,10 @@ func builtinEq(args []Value) (Value, error) {
 
 func builtinLE(args []Value) (Value, error) {
 	return numericCompareGeneric("<=", args, func(a, b float64) bool { return a <= b })
+}
+
+func builtinGE(args []Value) (Value, error) {
+	return numericCompareGeneric(">=", args, func(a, b float64) bool { return a >= b })
 }
 
 func evalBegin(e *ListExpr, env *Env) (Value, error) {
@@ -794,7 +803,7 @@ func builtinStringAppend(args []Value) (Value, error) {
 		}
 		buf.WriteString(s.Val)
 	}
-	return &StringVal{Val: buf.String()}, nil
+	return &StringVal{Val: buf.String(), Mutable: true}, nil
 }
 
 func builtinStringLength(args []Value) (Value, error) {
@@ -825,7 +834,7 @@ func builtinSubstring(args []Value) (Value, error) {
 		return nil, &EvalError{Message: "substring: end not a number"}
 	}
 	runes := []rune(s.Val)
-	return &StringVal{Val: string(runes[start.Val:end.Val])}, nil
+	return &StringVal{Val: string(runes[start.Val:end.Val]), Mutable: true}, nil
 }
 
 func builtinStringToNumber(args []Value) (Value, error) {
@@ -851,7 +860,7 @@ func builtinNumberToString(args []Value) (Value, error) {
 	if !ok {
 		return nil, &EvalError{Message: "number->string: not a number"}
 	}
-	return &StringVal{Val: strconv.FormatInt(n.Val, 10)}, nil
+	return &StringVal{Val: strconv.FormatInt(n.Val, 10), Mutable: true}, nil
 }
 
 func builtinSymbolToString(args []Value) (Value, error) {
@@ -862,7 +871,7 @@ func builtinSymbolToString(args []Value) (Value, error) {
 	if !ok {
 		return nil, &EvalError{Message: "symbol->string: not a symbol"}
 	}
-	return &StringVal{Val: s.Name}, nil
+	return &StringVal{Val: s.Name, Mutable: true}, nil
 }
 
 func builtinStringToSymbol(args []Value) (Value, error) {
@@ -884,7 +893,7 @@ func builtinStringCopy(args []Value) (Value, error) {
 	if !ok {
 		return nil, &EvalError{Message: "string-copy: not a string"}
 	}
-	return &StringVal{Val: s.Val}, nil
+	return &StringVal{Val: s.Val, Mutable: true}, nil
 }
 
 func builtinStringSet(args []Value) (Value, error) {
@@ -893,15 +902,18 @@ func builtinStringSet(args []Value) (Value, error) {
 	}
 	s, ok := args[0].(*StringVal)
 	if !ok {
-		return nil, &EvalError{Message: "string-set!: not a string"}
+		return nil, &EvalError{Message: "string-set!: first argument must be a string"}
+	}
+	if !s.Mutable {
+		return nil, &EvalError{Message: "string-set!: strings are immutable"}
 	}
 	idx, ok := args[1].(*IntVal)
 	if !ok {
-		return nil, &EvalError{Message: "string-set!: index not a number"}
+		return nil, &EvalError{Message: "string-set!: second argument must be an integer"}
 	}
 	ch, ok := args[2].(*CharVal)
 	if !ok {
-		return nil, &EvalError{Message: "string-set!: not a character"}
+		return nil, &EvalError{Message: "string-set!: third argument must be a character"}
 	}
 	runes := []rune(s.Val)
 	if idx.Val < 0 || idx.Val >= int64(len(runes)) {
@@ -910,6 +922,68 @@ func builtinStringSet(args []Value) (Value, error) {
 	runes[idx.Val] = ch.Val
 	s.Val = string(runes)
 	return &VoidVal{}, nil
+}
+
+func builtinStringToList(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "string->list: requires exactly 1 argument"}
+	}
+	s, ok := args[0].(*StringVal)
+	if !ok {
+		return nil, &EvalError{Message: "string->list: not a string"}
+	}
+	var result Value = &NilVal{}
+	runes := []rune(s.Val)
+	for i := len(runes) - 1; i >= 0; i-- {
+		result = &PairVal{Car: &CharVal{Val: runes[i]}, Cdr: result}
+	}
+	return result, nil
+}
+
+func builtinListToString(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "list->string: requires exactly 1 argument"}
+	}
+	var runes []rune
+	cur := args[0]
+	for {
+		if _, ok := cur.(*NilVal); ok {
+			break
+		}
+		p, ok := cur.(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "list->string: not a proper list"}
+		}
+		ch, ok := p.Car.(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "list->string: element is not a character"}
+		}
+		runes = append(runes, ch.Val)
+		cur = p.Cdr
+	}
+	return &StringVal{Val: string(runes), Mutable: true}, nil
+}
+
+func builtinCharToInteger(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "char->integer: requires exactly 1 argument"}
+	}
+	ch, ok := args[0].(*CharVal)
+	if !ok {
+		return nil, &EvalError{Message: "char->integer: not a character"}
+	}
+	return &IntVal{Val: int64(ch.Val)}, nil
+}
+
+func builtinIntegerToChar(args []Value) (Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "integer->char: requires exactly 1 argument"}
+	}
+	n, ok := args[0].(*IntVal)
+	if !ok {
+		return nil, &EvalError{Message: "integer->char: not an integer"}
+	}
+	return &CharVal{Val: rune(n.Val)}, nil
 }
 
 func builtinApply(args []Value) (Value, error) {
