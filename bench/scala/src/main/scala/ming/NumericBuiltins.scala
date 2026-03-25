@@ -30,7 +30,8 @@ private[ming] object NumericBuiltins:
       comparisonBuiltin("<")(SchemeNumber.compare(_, _) < 0),
       comparisonBuiltin(">")(SchemeNumber.compare(_, _) > 0),
       comparisonBuiltin("=")(SchemeNumber.areEqual),
-      comparisonBuiltin("<=")(SchemeNumber.compare(_, _) <= 0)
+      comparisonBuiltin("<=")(SchemeNumber.compare(_, _) <= 0),
+      comparisonBuiltin(">=")(SchemeNumber.compare(_, _) >= 0)
     )
 
   private val additionBuiltin: Value.Builtin =

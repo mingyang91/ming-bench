@@ -17,6 +17,8 @@ private[ming] object StringBuiltins:
       symbolToStringBuiltin,
       stringToSymbolBuiltin,
       stringRefBuiltin,
+      stringToListBuiltin,
+      listToStringBuiltin,
       stringCopyBuiltin,
       stringSetBuiltin,
       stringEqualsBuiltin,
@@ -95,6 +97,22 @@ private[ming] object StringBuiltins:
         Value.Character(text.charAt(index))
     )
 
+  private val stringToListBuiltin: Value.Builtin =
+    Value.Builtin(
+      "string->list",
+      (args, pos) =>
+        val text = asString(singleArg("string->list", args, pos), "string->list", pos)
+        Value.list(text.toList.map(Value.Character(_)))
+    )
+
+  private val listToStringBuiltin: Value.Builtin =
+    Value.Builtin(
+      "list->string",
+      (args, pos) =>
+        val items = asList(singleArg("list->string", args, pos), "list->string", pos)
+        Value.StringLit(items.map(asCharacter(_, "list->string", pos)).mkString)
+    )
+
   private val stringCopyBuiltin: Value.Builtin =
     Value.Builtin(
       "string-copy",
@@ -108,11 +126,19 @@ private[ming] object StringBuiltins:
       "string-set!",
       (args, pos) =>
         val (stringValue, indexValue, charValue) = threeArgs("string-set!", args, pos)
-        val text                                 = asMutableString(stringValue, "string-set!", pos)
         val index                                = asIndex(indexValue, "string-set!", pos)
-        if index >= text.length then fail(pos, "string-set! index out of bounds")
-        text.set(index, asCharacter(charValue, "string-set!", pos))
-        Value.Void
+        val char                                 = asCharacter(charValue, "string-set!", pos)
+
+        stringValue match
+          case text: Value.MutableString =>
+            requireIndexInRange(index, text.length, "string-set!", pos)
+            text.set(index, char)
+            Value.Void
+          case Value.StringLit(_) =>
+            fail(pos, "string-set! cannot mutate immutable strings")
+          case other =>
+            asString(other, "string-set!", pos)
+            unreachable()
     )
 
   private def parseNumber(value: String): Value =

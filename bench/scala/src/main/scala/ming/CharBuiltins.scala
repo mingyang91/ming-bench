@@ -9,6 +9,8 @@ private[ming] object CharBuiltins:
     List(
       charAlphabeticBuiltin,
       charNumericBuiltin,
+      charToIntegerBuiltin,
+      integerToCharBuiltin,
       charUpcaseBuiltin,
       charDowncaseBuiltin,
       charEqualsBuiltin,
@@ -20,6 +22,24 @@ private[ming] object CharBuiltins:
 
   private val charNumericBuiltin: Value.Builtin =
     charPredicateBuiltin("char-numeric?")(_.isDigit)
+
+  private val charToIntegerBuiltin: Value.Builtin =
+    Value.Builtin(
+      "char->integer",
+      (args, pos) =>
+        val value = asCharacter(singleArg("char->integer", args, pos), "char->integer", pos)
+        Value.Number(SchemeNumber.exact(BigInt(value.toInt)))
+    )
+
+  private val integerToCharBuiltin: Value.Builtin =
+    Value.Builtin(
+      "integer->char",
+      (args, pos) =>
+        val value = asExactInteger(singleArg("integer->char", args, pos), "integer->char", pos)
+        if value < Char.MinValue.toInt || value > Char.MaxValue.toInt then
+          fail(pos, s"integer->char expected valid character code point, got $value")
+        Value.Character(value.toInt.toChar)
+    )
 
   private val charUpcaseBuiltin: Value.Builtin =
     Value.Builtin(
