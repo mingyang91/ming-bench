@@ -10,6 +10,8 @@ pub struct Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64),
     Boolean(bool),
     Char(char),
     Str(String),
@@ -231,6 +233,19 @@ fn parse_atom(s: &str) -> ExprKind {
         ExprKind::Str(s[1..s.len() - 1].to_string())
     } else if let Ok(n) = s.parse::<i64>() {
         ExprKind::Integer(n)
+    } else if s.contains('/') {
+        // Try rational literal like 1/3, -5/2
+        let parts: Vec<&str> = s.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            if let (Ok(n), Ok(d)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
+                if d != 0 {
+                    return ExprKind::Rational(n, d);
+                }
+            }
+        }
+        ExprKind::Symbol(s.to_string())
+    } else if let Ok(f) = s.parse::<f64>() {
+        ExprKind::Float(f)
     } else {
         ExprKind::Symbol(s.to_string())
     }

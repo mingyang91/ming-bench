@@ -23,6 +23,8 @@ pub struct MacroData {
 #[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64), // numerator, denominator (always simplified, denom > 0)
     Boolean(bool),
     Char(char),
     Str(String),
@@ -34,10 +36,64 @@ pub enum Value {
     Void,
 }
 
+fn gcd(a: i64, b: i64) -> i64 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+impl Value {
+    /// Create a simplified rational, collapsing to Integer if denominator is 1.
+    pub fn make_rational(n: i64, d: i64) -> Value {
+        if d == 0 {
+            panic!("rational with zero denominator");
+        }
+        let sign = if d < 0 { -1 } else { 1 };
+        let n = n * sign;
+        let d = d * sign;
+        let g = gcd(n, d);
+        let n = n / g;
+        let d = d / g;
+        if d == 1 {
+            Value::Integer(n)
+        } else {
+            Value::Rational(n, d)
+        }
+    }
+
+    /// Convert to f64 for cross-type arithmetic
+    pub fn to_f64(&self) -> Option<f64> {
+        match self {
+            Value::Integer(n) => Some(*n as f64),
+            Value::Float(f) => Some(*f),
+            Value::Rational(n, d) => Some(*n as f64 / *d as f64),
+            _ => None,
+        }
+    }
+
+    pub fn is_exact(&self) -> bool {
+        matches!(self, Value::Integer(_) | Value::Rational(_, _))
+    }
+
+    pub fn is_inexact(&self) -> bool {
+        matches!(self, Value::Float(_))
+    }
+
+    pub fn is_number(&self) -> bool {
+        matches!(self, Value::Integer(_) | Value::Float(_) | Value::Rational(_, _))
+    }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
@@ -109,6 +165,14 @@ impl Value {
     pub fn to_display_string(&self) -> String {
         match self {
             Value::Integer(n) => n.to_string(),
+            Value::Float(f) => {
+                if f.fract() == 0.0 && f.is_finite() {
+                    format!("{:.1}", f)
+                } else {
+                    format!("{}", f)
+                }
+            }
+            Value::Rational(n, d) => format!("{}/{}", n, d),
             Value::Boolean(true) => "#t".into(),
             Value::Boolean(false) => "#f".into(),
             Value::Char(c) => format!("#\\{}", match *c {
@@ -140,6 +204,13 @@ impl Value {
         match self {
             Value::Str(s) => s.clone(),
             Value::Char(c) => c.to_string(),
+            Value::Float(f) => {
+                if f.fract() == 0.0 && f.is_finite() {
+                    format!("{:.1}", f)
+                } else {
+                    format!("{}", f)
+                }
+            }
             Value::List(elems) => {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_scheme_display()).collect();
                 format!("({})", inner.join(" "))

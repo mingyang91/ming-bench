@@ -4,6 +4,38 @@ use crate::scheme::EvalError;
 use crate::scheme::parser::{Expr, ExprKind};
 use crate::scheme::value::{Env, LambdaData, MacroData, Value};
 
+/// Convert a float to an exact rational (numerator, denominator).
+fn float_to_rational(f: f64) -> (i64, i64) {
+    if f == f.floor() {
+        return (f as i64, 1);
+    }
+    // Use continued fraction approximation
+    let sign = if f < 0.0 { -1 } else { 1 };
+    let f = f.abs();
+    let mut p0: i64 = 0;
+    let mut q0: i64 = 1;
+    let mut p1: i64 = 1;
+    let mut q1: i64 = 0;
+    let mut x = f;
+    for _ in 0..64 {
+        let a = x.floor() as i64;
+        let p2 = a * p1 + p0;
+        let q2 = a * q1 + q0;
+        p0 = p1; q0 = q1;
+        p1 = p2; q1 = q2;
+        let approx = p1 as f64 / q1 as f64;
+        if (approx - f).abs() < 1e-12 {
+            break;
+        }
+        let rem = x - a as f64;
+        if rem.abs() < 1e-15 {
+            break;
+        }
+        x = 1.0 / rem;
+    }
+    (sign * p1, q1)
+}
+
 pub struct Evaluator {
     env: Env,
     output: String,
@@ -42,13 +74,17 @@ impl Evaluator {
             | "string-copy" | "apply"
             | "string=?" | "string<?" | "string-ci=?"
             | "string-upcase" | "string-downcase"
-            | "eq?" | "equal?" | "eqv?")
+            | "eq?" | "equal?" | "eqv?"
+            | "exact?" | "inexact?" | "exact->inexact" | "inexact->exact"
+            | "numerator" | "denominator" | "integer?" | "rational?")
     }
 
     fn eval_in_env(&mut self, expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
         let pos = expr.pos_str();
         match &expr.kind {
             ExprKind::Integer(n) => Ok(Value::Integer(*n)),
+            ExprKind::Float(f) => Ok(Value::Float(*f)),
+            ExprKind::Rational(n, d) => Ok(Value::make_rational(*n, *d)),
             ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
             ExprKind::Char(c) => Ok(Value::Char(*c)),
             ExprKind::Str(s) => Ok(Value::Str(s.clone())),
@@ -208,6 +244,8 @@ impl Evaluator {
     fn expr_to_value(expr: &Expr) -> Value {
         match &expr.kind {
             ExprKind::Integer(n) => Value::Integer(*n),
+            ExprKind::Float(f) => Value::Float(*f),
+            ExprKind::Rational(n, d) => Value::make_rational(*n, *d),
             ExprKind::Boolean(b) => Value::Boolean(*b),
             ExprKind::Char(c) => Value::Char(*c),
             ExprKind::Str(s) => Value::Str(s.clone()),
@@ -456,52 +494,56 @@ impl Evaluator {
     fn apply_builtin(&mut self, name: &str, args: &[Value], pos: &str) -> Result<Value, EvalError> {
         match name {
             "+" => {
-                let mut sum: i64 = 0;
+                let mut sum = Value::Integer(0);
                 for arg in args {
-                    sum += self.expect_integer(arg, "+", pos)?;
+                    self.expect_number(arg, "+", pos)?;
+                    sum = Self::num_add(&sum, arg);
                 }
-                Ok(Value::Integer(sum))
+                Ok(sum)
             }
             "-" => {
                 if args.is_empty() {
                     return Err(EvalError::Arity(format!("-: expected at least 1 argument at {pos}")));
                 }
+                self.expect_number(&args[0], "-", pos)?;
                 if args.len() == 1 {
-                    let n = self.expect_integer(&args[0], "-", pos)?;
-                    return Ok(Value::Integer(-n));
+                    return Ok(Self::num_negate(&args[0]));
                 }
-                let mut result = self.expect_integer(&args[0], "-", pos)?;
+                let mut result = args[0].clone();
                 for arg in &args[1..] {
-                    result -= self.expect_integer(arg, "-", pos)?;
+                    self.expect_number(arg, "-", pos)?;
+                    result = Self::num_sub(&result, arg);
                 }
-                Ok(Value::Integer(result))
+                Ok(result)
             }
             "*" => {
-                let mut product: i64 = 1;
+                let mut product = Value::Integer(1);
                 for arg in args {
-                    product *= self.expect_integer(arg, "*", pos)?;
+                    self.expect_number(arg, "*", pos)?;
+                    product = Self::num_mul(&product, arg);
                 }
-                Ok(Value::Integer(product))
+                Ok(product)
             }
             "/" => {
                 if args.is_empty() {
                     return Err(EvalError::Arity(format!("/: expected at least 1 argument at {pos}")));
                 }
-                let mut result = self.expect_integer(&args[0], "/", pos)?;
-                for arg in &args[1..] {
-                    let divisor = self.expect_integer(arg, "/", pos)?;
-                    if divisor == 0 {
-                        return Err(EvalError::DivisionByZero(format!("at {pos}")));
-                    }
-                    result /= divisor;
+                self.expect_number(&args[0], "/", pos)?;
+                if args.len() == 1 {
+                    return Self::num_div(&Value::Integer(1), &args[0], pos);
                 }
-                Ok(Value::Integer(result))
+                let mut result = args[0].clone();
+                for arg in &args[1..] {
+                    self.expect_number(arg, "/", pos)?;
+                    result = Self::num_div(&result, arg, pos)?;
+                }
+                Ok(result)
             }
-            "<" => self.compare_numbers(args, "<", pos, |a, b| a < b),
-            ">" => self.compare_numbers(args, ">", pos, |a, b| a > b),
-            "=" => self.compare_numbers(args, "=", pos, |a, b| a == b),
-            "<=" => self.compare_numbers(args, "<=", pos, |a, b| a <= b),
-            ">=" => self.compare_numbers(args, ">=", pos, |a, b| a >= b),
+            "<" => self.compare_numbers_generic(args, "<", pos, |o| o == std::cmp::Ordering::Less),
+            ">" => self.compare_numbers_generic(args, ">", pos, |o| o == std::cmp::Ordering::Greater),
+            "=" => self.compare_numbers_generic(args, "=", pos, |o| o == std::cmp::Ordering::Equal),
+            "<=" => self.compare_numbers_generic(args, "<=", pos, |o| o != std::cmp::Ordering::Greater),
+            ">=" => self.compare_numbers_generic(args, ">=", pos, |o| o != std::cmp::Ordering::Less),
             "cons" => {
                 if args.len() != 2 {
                     return Err(EvalError::Arity(format!("cons: expected 2 arguments at {pos}")));
@@ -565,7 +607,7 @@ impl Evaluator {
             }
             "number?" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("number?: expected 1 argument at {pos}"))); }
-                Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+                Ok(Value::Boolean(args[0].is_number()))
             }
             "boolean?" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("boolean?: expected 1 argument at {pos}"))); }
@@ -585,7 +627,12 @@ impl Evaluator {
             }
             "zero?" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("zero?: expected 1 argument at {pos}"))); }
-                Ok(Value::Boolean(matches!(&args[0], Value::Integer(0))))
+                Ok(Value::Boolean(match &args[0] {
+                    Value::Integer(0) => true,
+                    Value::Float(f) => *f == 0.0,
+                    Value::Rational(n, _) => *n == 0,
+                    _ => false,
+                }))
             }
             "modulo" => {
                 if args.len() != 2 { return Err(EvalError::Arity(format!("modulo: expected 2 arguments at {pos}"))); }
@@ -841,17 +888,22 @@ impl Evaluator {
             "string->number" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("string->number: expected 1 argument at {pos}"))); }
                 match &args[0] {
-                    Value::Str(s) => match s.parse::<i64>() {
-                        Ok(n) => Ok(Value::Integer(n)),
-                        Err(_) => Ok(Value::Boolean(false)),
+                    Value::Str(s) => {
+                        if let Ok(n) = s.parse::<i64>() {
+                            Ok(Value::Integer(n))
+                        } else if let Ok(f) = s.parse::<f64>() {
+                            Ok(Value::Float(f))
+                        } else {
+                            Ok(Value::Boolean(false))
+                        }
                     },
                     _ => Err(EvalError::Type(format!("string->number: expected string at {pos}"))),
                 }
             }
             "number->string" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("number->string: expected 1 argument at {pos}"))); }
-                let n = self.expect_integer(&args[0], "number->string", pos)?;
-                Ok(Value::Str(n.to_string()))
+                self.expect_number(&args[0], "number->string", pos)?;
+                Ok(Value::Str(args[0].to_display_string()))
             }
             "symbol->string" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("symbol->string: expected 1 argument at {pos}"))); }
@@ -907,29 +959,81 @@ impl Evaluator {
                 if args.len() != 2 { return Err(EvalError::Arity(format!("equal?: expected 2 arguments at {pos}"))); }
                 Ok(Value::Boolean(args[0] == args[1]))
             }
+            "exact?" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("exact?: expected 1 argument at {pos}"))); }
+                Ok(Value::Boolean(args[0].is_exact()))
+            }
+            "inexact?" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("inexact?: expected 1 argument at {pos}"))); }
+                Ok(Value::Boolean(args[0].is_inexact()))
+            }
+            "exact->inexact" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("exact->inexact: expected 1 argument at {pos}"))); }
+                self.expect_number(&args[0], "exact->inexact", pos)?;
+                Ok(Value::Float(Self::num_to_f64(&args[0])))
+            }
+            "inexact->exact" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("inexact->exact: expected 1 argument at {pos}"))); }
+                self.expect_number(&args[0], "inexact->exact", pos)?;
+                match &args[0] {
+                    Value::Integer(_) => Ok(args[0].clone()),
+                    Value::Rational(_, _) => Ok(args[0].clone()),
+                    Value::Float(f) => {
+                        // Convert float to exact rational
+                        // For simple cases like 0.5, find the fraction
+                        let (n, d) = float_to_rational(*f);
+                        Ok(Value::make_rational(n, d))
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            "numerator" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("numerator: expected 1 argument at {pos}"))); }
+                match &args[0] {
+                    Value::Integer(n) => Ok(Value::Integer(*n)),
+                    Value::Rational(n, _) => Ok(Value::Integer(*n)),
+                    _ => Err(EvalError::Type(format!("numerator: expected rational at {pos}"))),
+                }
+            }
+            "denominator" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("denominator: expected 1 argument at {pos}"))); }
+                match &args[0] {
+                    Value::Integer(_) => Ok(Value::Integer(1)),
+                    Value::Rational(_, d) => Ok(Value::Integer(*d)),
+                    _ => Err(EvalError::Type(format!("denominator: expected rational at {pos}"))),
+                }
+            }
+            "integer?" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("integer?: expected 1 argument at {pos}"))); }
+                Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+            }
+            "rational?" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("rational?: expected 1 argument at {pos}"))); }
+                Ok(Value::Boolean(args[0].is_exact()))
+            }
             _ => Err(EvalError::UnboundVariable(format!("{name} at {pos}"))),
         }
     }
 
-    fn compare_numbers(
+    fn compare_numbers_generic(
         &self,
         args: &[Value],
         name: &str,
         pos: &str,
-        cmp: fn(i64, i64) -> bool,
+        cmp: fn(std::cmp::Ordering) -> bool,
     ) -> Result<Value, EvalError> {
         if args.len() < 2 {
             return Err(EvalError::Arity(format!(
                 "{name}: expected at least 2 arguments at {pos}"
             )));
         }
-        let mut prev = self.expect_integer(&args[0], name, pos)?;
-        for arg in &args[1..] {
-            let curr = self.expect_integer(arg, name, pos)?;
-            if !cmp(prev, curr) {
+        self.expect_number(&args[0], name, pos)?;
+        for i in 1..args.len() {
+            self.expect_number(&args[i], name, pos)?;
+            let ord = Self::num_cmp(&args[i - 1], &args[i]);
+            if !cmp(ord) {
                 return Ok(Value::Boolean(false));
             }
-            prev = curr;
         }
         Ok(Value::Boolean(true))
     }
@@ -967,6 +1071,119 @@ impl Evaluator {
             _ => Err(EvalError::Type(format!(
                 "{context}: expected number, got {val} at {pos}"
             ))),
+        }
+    }
+
+    fn expect_number(&self, val: &Value, context: &str, pos: &str) -> Result<(), EvalError> {
+        if val.is_number() {
+            Ok(())
+        } else {
+            Err(EvalError::Type(format!(
+                "{context}: expected number, got {val} at {pos}"
+            )))
+        }
+    }
+
+    /// Add two numeric values, preserving exactness.
+    fn num_add(a: &Value, b: &Value) -> Value {
+        match (a, b) {
+            (Value::Integer(x), Value::Integer(y)) => Value::Integer(x + y),
+            (Value::Rational(n1, d1), Value::Rational(n2, d2)) => {
+                Value::make_rational(n1 * d2 + n2 * d1, d1 * d2)
+            }
+            (Value::Integer(x), Value::Rational(n, d)) | (Value::Rational(n, d), Value::Integer(x)) => {
+                Value::make_rational(x * d + n, *d)
+            }
+            _ => Value::Float(a.to_f64().unwrap() + b.to_f64().unwrap()),
+        }
+    }
+
+    fn num_sub(a: &Value, b: &Value) -> Value {
+        match (a, b) {
+            (Value::Integer(x), Value::Integer(y)) => Value::Integer(x - y),
+            (Value::Rational(n1, d1), Value::Rational(n2, d2)) => {
+                Value::make_rational(n1 * d2 - n2 * d1, d1 * d2)
+            }
+            (Value::Integer(x), Value::Rational(n, d)) => {
+                Value::make_rational(x * d - n, *d)
+            }
+            (Value::Rational(n, d), Value::Integer(x)) => {
+                Value::make_rational(n - x * d, *d)
+            }
+            _ => Value::Float(a.to_f64().unwrap() - b.to_f64().unwrap()),
+        }
+    }
+
+    fn num_mul(a: &Value, b: &Value) -> Value {
+        match (a, b) {
+            (Value::Integer(x), Value::Integer(y)) => Value::Integer(x * y),
+            (Value::Rational(n1, d1), Value::Rational(n2, d2)) => {
+                Value::make_rational(n1 * n2, d1 * d2)
+            }
+            (Value::Integer(x), Value::Rational(n, d)) | (Value::Rational(n, d), Value::Integer(x)) => {
+                Value::make_rational(x * n, *d)
+            }
+            _ => Value::Float(a.to_f64().unwrap() * b.to_f64().unwrap()),
+        }
+    }
+
+    fn num_div(a: &Value, b: &Value, pos: &str) -> Result<Value, EvalError> {
+        match (a, b) {
+            (Value::Integer(x), Value::Integer(y)) => {
+                if *y == 0 { return Err(EvalError::DivisionByZero(format!("at {pos}"))); }
+                Ok(Value::make_rational(*x, *y))
+            }
+            (Value::Rational(n1, d1), Value::Rational(n2, d2)) => {
+                if *n2 == 0 { return Err(EvalError::DivisionByZero(format!("at {pos}"))); }
+                Ok(Value::make_rational(n1 * d2, d1 * n2))
+            }
+            (Value::Integer(x), Value::Rational(n, d)) => {
+                if *n == 0 { return Err(EvalError::DivisionByZero(format!("at {pos}"))); }
+                Ok(Value::make_rational(x * d, *n))
+            }
+            (Value::Rational(n, d), Value::Integer(y)) => {
+                if *y == 0 { return Err(EvalError::DivisionByZero(format!("at {pos}"))); }
+                Ok(Value::make_rational(*n, d * y))
+            }
+            _ => {
+                let bv = b.to_f64().unwrap();
+                if bv == 0.0 { return Err(EvalError::DivisionByZero(format!("at {pos}"))); }
+                Ok(Value::Float(a.to_f64().unwrap() / bv))
+            }
+        }
+    }
+
+    fn num_negate(a: &Value) -> Value {
+        match a {
+            Value::Integer(n) => Value::Integer(-n),
+            Value::Float(f) => Value::Float(-f),
+            Value::Rational(n, d) => Value::Rational(-n, *d),
+            _ => unreachable!(),
+        }
+    }
+
+    fn num_to_f64(a: &Value) -> f64 {
+        a.to_f64().unwrap()
+    }
+
+    fn num_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+        // Compare exactly when possible
+        match (a, b) {
+            (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
+            (Value::Rational(n1, d1), Value::Rational(n2, d2)) => {
+                (n1 * d2).cmp(&(n2 * d1))
+            }
+            (Value::Integer(x), Value::Rational(n, d)) => {
+                (x * d).cmp(n)
+            }
+            (Value::Rational(n, d), Value::Integer(y)) => {
+                n.cmp(&(y * d))
+            }
+            _ => {
+                let af = Self::num_to_f64(a);
+                let bf = Self::num_to_f64(b);
+                af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
+            }
         }
     }
 
