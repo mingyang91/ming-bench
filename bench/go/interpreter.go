@@ -201,6 +201,8 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("display", builtinDisplay(ctx))
 	env.define("write", builtinWrite(ctx))
 	env.define("newline", builtinNewline(ctx))
+	env.define("raise", raiseBuiltin)
+	env.define("with-exception-handler", withExceptionHandlerBuiltin)
 	env.define("make-string", builtinMakeString())
 	env.define("string", builtinString())
 	env.define("string-append", builtinStringAppend())
@@ -2523,7 +2525,7 @@ func formatValue(v value) (string, error) {
 		return "#(" + strings.Join(parts, " ") + ")", nil
 	case *recordValue:
 		return "#<record " + v.recordType.name + ">", nil
-	case builtinProc, *closureValue, *caseClosureValue, *continuationValue, *callCCProcValue, *dynamicWindProcValue:
+	case builtinProc, *closureValue, *caseClosureValue, *continuationValue, *callCCProcValue, *dynamicWindProcValue, *raiseProcValue, *withExceptionHandlerProcValue:
 		return "#<procedure>", nil
 	case *pairValue:
 		return formatPair(v, formatValue)
@@ -2642,7 +2644,7 @@ func isPairValue(v value) bool {
 
 func isProcedureValue(v value) bool {
 	switch v.(type) {
-	case builtinProc, *closureValue, *caseClosureValue, *continuationValue, *callCCProcValue, *dynamicWindProcValue:
+	case builtinProc, *closureValue, *caseClosureValue, *continuationValue, *callCCProcValue, *dynamicWindProcValue, *raiseProcValue, *withExceptionHandlerProcValue:
 		return true
 	default:
 		return false
@@ -2756,6 +2758,12 @@ func eqValues(left, right value) bool {
 		return ok && left == right
 	case *dynamicWindProcValue:
 		right, ok := right.(*dynamicWindProcValue)
+		return ok && left == right
+	case *raiseProcValue:
+		right, ok := right.(*raiseProcValue)
+		return ok && left == right
+	case *withExceptionHandlerProcValue:
+		right, ok := right.(*withExceptionHandlerProcValue)
 		return ok && left == right
 	case *recordValue:
 		right, ok := right.(*recordValue)

@@ -5,6 +5,7 @@ type continuation interface{}
 type continuationValue struct {
 	cont continuation
 	wind *windFrame
+	handler *exceptionHandlerFrame
 }
 
 type callCCProcValue struct{}
@@ -153,6 +154,7 @@ type windTransitionCont struct {
 	value      value
 	targetCont continuation
 	targetWind *windFrame
+	targetHandler *exceptionHandlerFrame
 	pos        sourcePos
 }
 
@@ -162,6 +164,7 @@ type evalMachine struct {
 	val  value
 	cont continuation
 	wind *windFrame
+	handler *exceptionHandlerFrame
 	eval bool
 }
 
@@ -329,6 +332,8 @@ func (m *evalMachine) stepEvalList(list listNode) error {
 			return withErrorPos(m.startLetrec(args, m.env, list.pos, false, m.cont), list.pos)
 		case "letrec*":
 			return withErrorPos(m.startLetrec(args, m.env, list.pos, true, m.cont), list.pos)
+		case "guard":
+			return withErrorPos(m.startGuard(args, m.env, list.pos, m.cont), list.pos)
 		case "do":
 			result, err := evalDo(args, m.env)
 			if err != nil {
@@ -541,11 +546,28 @@ func (m *evalMachine) stepContinue() error {
 	case *dynamicWindAfterOutCont:
 		m.setValue(cont.result, cont.next)
 		return nil
+	case *handlerRestoreCont:
+		if m.handler == cont.frame {
+			m.handler = cont.frame.parent
+		}
+		m.setValue(m.val, cont.next)
+		return nil
+	case *exceptionDispatchCont:
+		return m.continueExceptionDispatch(cont)
+	case *guardTestCont:
+		if !isTruthy(m.val) {
+			return m.startGuardClauses(cont.remaining, cont.env, cont.exn, cont.pos, cont.next)
+		}
+		if len(cont.clause.elements) == 1 {
+			m.setValue(m.val, cont.next)
+			return nil
+		}
+		return m.startSequence(cont.clause.elements[1:], cont.env, cont.next)
 	case *windTransitionCont:
 		if cont.setWind != nil {
 			m.wind = cont.setWind
 		}
-		return m.startWindTransition(cont.leave, cont.enter, cont.value, cont.targetCont, cont.targetWind, cont.pos)
+		return m.startWindTransition(cont.leave, cont.enter, cont.value, cont.targetCont, cont.targetWind, cont.targetHandler, cont.pos)
 	default:
 		return &EvalError{Message: "invalid continuation"}
 	}
@@ -932,12 +954,12 @@ func (m *evalMachine) startDynamicWind(inProc value, bodyProc value, outProc val
 	})
 }
 
-func (m *evalMachine) resumeContinuation(val value, targetCont continuation, targetWind *windFrame, pos sourcePos) error {
+func (m *evalMachine) resumeContinuation(val value, targetCont continuation, targetWind *windFrame, targetHandler *exceptionHandlerFrame, pos sourcePos) error {
 	leave, enter := diffWindFrames(m.wind, targetWind)
-	return m.startWindTransition(leave, enter, val, targetCont, targetWind, pos)
+	return m.startWindTransition(leave, enter, val, targetCont, targetWind, targetHandler, pos)
 }
 
-func (m *evalMachine) startWindTransition(leave []*windFrame, enter []*windFrame, val value, targetCont continuation, targetWind *windFrame, pos sourcePos) error {
+func (m *evalMachine) startWindTransition(leave []*windFrame, enter []*windFrame, val value, targetCont continuation, targetWind *windFrame, targetHandler *exceptionHandlerFrame, pos sourcePos) error {
 	if len(leave) > 0 {
 		frame := leave[0]
 		m.wind = frame.parent
@@ -947,6 +969,7 @@ func (m *evalMachine) startWindTransition(leave []*windFrame, enter []*windFrame
 			value:      val,
 			targetCont: targetCont,
 			targetWind: targetWind,
+			targetHandler: targetHandler,
 			pos:        pos,
 		})
 	}
@@ -960,11 +983,13 @@ func (m *evalMachine) startWindTransition(leave []*windFrame, enter []*windFrame
 			value:      val,
 			targetCont: targetCont,
 			targetWind: targetWind,
+			targetHandler: targetHandler,
 			pos:        pos,
 		})
 	}
 
 	m.wind = targetWind
+	m.handler = targetHandler
 	m.setValue(val, targetCont)
 	return nil
 }
@@ -991,12 +1016,12 @@ func (m *evalMachine) enterProcedure(proc value, args []value, pos sourcePos, ne
 		if len(args) != 1 {
 			return errorAt(pos, "continuation expects exactly 1 argument")
 		}
-		return m.resumeContinuation(args[0], proc.cont, proc.wind, pos)
+		return m.resumeContinuation(args[0], proc.cont, proc.wind, proc.handler, pos)
 	case *callCCProcValue:
 		if len(args) != 1 {
 			return errorAt(pos, "call/cc expects exactly 1 argument")
 		}
-		return m.enterProcedure(args[0], []value{&continuationValue{cont: next, wind: m.wind}}, pos, next)
+		return m.enterProcedure(args[0], []value{&continuationValue{cont: next, wind: m.wind, handler: m.handler}}, pos, next)
 	case *dynamicWindProcValue:
 		if len(args) != 3 {
 			return errorAt(pos, "dynamic-wind expects exactly 3 arguments")
@@ -1005,6 +1030,19 @@ func (m *evalMachine) enterProcedure(proc value, args []value, pos sourcePos, ne
 			return errorAt(pos, "dynamic-wind expects 3 procedures")
 		}
 		return m.startDynamicWind(args[0], args[1], args[2], pos, next)
+	case *raiseProcValue:
+		if len(args) != 1 {
+			return errorAt(pos, "raise expects exactly 1 argument")
+		}
+		return m.raiseValue(args[0], pos)
+	case *withExceptionHandlerProcValue:
+		if len(args) != 2 {
+			return errorAt(pos, "with-exception-handler expects exactly 2 arguments")
+		}
+		if !isProcedureValue(args[0]) || !isProcedureValue(args[1]) {
+			return errorAt(pos, "with-exception-handler expects 2 procedures")
+		}
+		return m.startWithExceptionHandler(args[0], args[1], pos, next)
 	default:
 		return errorAt(pos, "not a procedure")
 	}
