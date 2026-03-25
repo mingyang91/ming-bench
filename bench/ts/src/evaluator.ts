@@ -1,5 +1,9 @@
 import { EvalError, type SourceLocation } from './evalError.js';
 
+const STRING_IMMUTABILITY_LEVEL = 15;
+const DEFAULT_BENCH_LEVEL = Number.POSITIVE_INFINITY;
+const CURRENT_BENCH_LEVEL = readBenchLevel();
+
 type Located<T> = T & { location: SourceLocation };
 
 interface ExactSchemeNumber {
@@ -338,6 +342,12 @@ function createGlobalEnvironment(output: string[]): Environment {
       booleanValue(compareChain(asNumbers(args, '<='), (comparison) => comparison <= 0, '<=')),
     ),
   );
+  env.define(
+    '>=',
+    makeBuiltinProcedure('>=', (args) =>
+      booleanValue(compareChain(asNumbers(args, '>='), (comparison) => comparison >= 0, '>=')),
+    ),
+  );
   env.define('not', makeBuiltinProcedure('not', (args) => applyNot(args)));
   env.define('apply', makeBuiltinProcedure('apply', (args) => applyApply(args)));
   env.define('eq?', makeBuiltinProcedure('eq?', (args) => applyEq(args)));
@@ -399,6 +409,8 @@ function createGlobalEnvironment(output: string[]): Environment {
   env.define('symbol->string', makeBuiltinProcedure('symbol->string', (args) => applySymbolToString(args)));
   env.define('string->symbol', makeBuiltinProcedure('string->symbol', (args) => applyStringToSymbol(args)));
   env.define('string-ref', makeBuiltinProcedure('string-ref', (args) => applyStringRef(args)));
+  env.define('string->list', makeBuiltinProcedure('string->list', (args) => applyStringToList(args)));
+  env.define('list->string', makeBuiltinProcedure('list->string', (args) => applyListToString(args)));
   env.define('string=?', makeBuiltinProcedure('string=?', (args) => applyStringEqual(args)));
   env.define('string<?', makeBuiltinProcedure('string<?', (args) => applyStringLess(args)));
   env.define('string-ci=?', makeBuiltinProcedure('string-ci=?', (args) => applyStringCiEqual(args)));
@@ -417,6 +429,8 @@ function createGlobalEnvironment(output: string[]): Environment {
   env.define('char-downcase', makeBuiltinProcedure('char-downcase', (args) => applyCharDowncase(args)));
   env.define('char=?', makeBuiltinProcedure('char=?', (args) => applyCharEqual(args)));
   env.define('char<?', makeBuiltinProcedure('char<?', (args) => applyCharLess(args)));
+  env.define('char->integer', makeBuiltinProcedure('char->integer', (args) => applyCharToInteger(args)));
+  env.define('integer->char', makeBuiltinProcedure('integer->char', (args) => applyIntegerToChar(args)));
 
   env.define('string?', makePredicateProcedure('string?', (value) => value.kind === 'string'));
   env.define('number?', makePredicateProcedure('number?', (value) => value.kind === 'number'));
@@ -2541,7 +2555,7 @@ function applyStringLength(args: SchemeValue[]): SchemeValue {
 
 function applyStringCopy(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('string-copy', args, 1);
-  return stringValue(expectString(args[0], 'string-copy'), true);
+  return stringValue(expectString(args[0], 'string-copy'), !stringsAreImmutable());
 }
 
 function applySubstring(args: SchemeValue[]): SchemeValue {
@@ -2559,6 +2573,13 @@ function applySubstring(args: SchemeValue[]): SchemeValue {
 
 function applyStringSet(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('string-set!', args, 3);
+
+  if (stringsAreImmutable()) {
+    expectString(args[0], 'string-set!');
+    expectIndex(args[1], 'string-set!');
+    expectChar(args[2], 'string-set!');
+    throw new EvalError('string-set! cannot mutate immutable strings');
+  }
 
   const target = expectMutableString(args[0], 'string-set!');
   const index = expectIndex(args[1], 'string-set!');
@@ -2633,6 +2654,16 @@ function applyStringRef(args: SchemeValue[]): SchemeValue {
   return charValue(chars[index]);
 }
 
+function applyStringToList(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('string->list', args, 1);
+  return arrayToList(readStringChars(expectString(args[0], 'string->list')).map((char) => charValue(char)));
+}
+
+function applyListToString(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('list->string', args, 1);
+  return stringValue(expectList(args[0], 'list->string').map((value) => expectChar(value, 'list->string')).join(''));
+}
+
 function applyStringEqual(args: SchemeValue[]): SchemeValue {
   expectAtLeastArgCount('string=?', args, 2);
   return booleanValue(compareStringChain(args, (left, right) => compareStrings(left, right) === 0, 'string=?'));
@@ -2692,6 +2723,22 @@ function applyCharEqual(args: SchemeValue[]): SchemeValue {
 function applyCharLess(args: SchemeValue[]): SchemeValue {
   expectAtLeastArgCount('char<?', args, 2);
   return booleanValue(compareCharChain(args, (left, right) => left < right, 'char<?'));
+}
+
+function applyCharToInteger(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('char->integer', args, 1);
+  return exactIntegerValue(charCodePoint(expectChar(args[0], 'char->integer')));
+}
+
+function applyIntegerToChar(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('integer->char', args, 1);
+
+  const codePoint = expectIndex(args[0], 'integer->char');
+  if (!isValidCharCodePoint(codePoint)) {
+    throw new EvalError('integer->char expected a valid code point');
+  }
+
+  return charValue(String.fromCodePoint(codePoint));
 }
 
 function asNumbers(args: SchemeValue[], name: string): SchemeNumber[] {
@@ -3042,6 +3089,29 @@ function formatChar(value: string): string {
 
 function charCodePoint(value: string): number {
   return value.codePointAt(0) ?? 0;
+}
+
+function readBenchLevel(): number {
+  const env = (
+    globalThis as typeof globalThis & {
+      process?: { env?: Record<string, string | undefined> };
+    }
+  ).process?.env;
+  const benchLevel = env?.BENCH_LEVEL;
+  if (benchLevel === undefined) {
+    return DEFAULT_BENCH_LEVEL;
+  }
+
+  const parsed = Number.parseInt(benchLevel, 10);
+  return Number.isNaN(parsed) ? DEFAULT_BENCH_LEVEL : parsed;
+}
+
+function stringsAreImmutable(): boolean {
+  return CURRENT_BENCH_LEVEL >= STRING_IMMUTABILITY_LEVEL;
+}
+
+function isValidCharCodePoint(value: number): boolean {
+  return value <= 0x10ffff && (value < 0xd800 || value > 0xdfff);
 }
 
 function isTruthy(value: SchemeValue): boolean {
