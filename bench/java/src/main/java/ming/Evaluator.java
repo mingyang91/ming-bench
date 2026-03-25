@@ -387,55 +387,43 @@ public class Evaluator {
         }
     }
 
-    // ── Eval ─────────────────────────────────────────────────────
+    // ── Eval (trampoline for TCO) ────────────────────────────────
     private Val eval(Val expr, Env env) throws EvalError {
-        return switch (expr) {
-            case Val.Int i -> i;
-            case Val.Rat r -> r;
-            case Val.Flo f -> f;
-            case Val.Bool b -> b;
-            case Val.Str s -> s;
-            case Val.Nil n -> n;
-            case Val.Void v -> v;
-            case Val.Chr c -> c;
-            case Val.Builtin b -> b;
-            case Val.Lambda l -> l;
-            case Val.CaseLambda cl -> cl;
-            case Val.Macro m -> m;
-            case Val.RecordInstance r -> r;
-            case Val.Vec v -> v;
-            case Val.Sym sym -> {
-                try {
-                    yield env.lookup(sym.name());
-                } catch (EvalError e) {
-                    throw posError(expr, e.getMessage());
-                }
+        tco: while (true) {
+            // Self-evaluating types
+            if (expr instanceof Val.Sym sym) {
+                try { return env.lookup(sym.name()); }
+                catch (EvalError e) { throw posError(expr, e.getMessage()); }
             }
-            case Val.PairV pair -> evalList(pair, env);
-        };
-    }
+            if (!(expr instanceof Val.PairV pair)) return expr;
 
-    private Val evalList(Val.PairV pair, Env env) throws EvalError {
-        Val head = pair.car();
+            Val head = pair.car();
 
-        // Special forms
-        if (head instanceof Val.Sym sym) {
-            switch (sym.name()) {
-                case "quote" -> {
+            // Special forms
+            if (head instanceof Val.Sym sym) {
+                String formName = sym.name();
+
+                if (formName.equals("quote")) {
                     if (!(pair.cdr() instanceof Val.PairV q))
                         throw posError(pair, "quote requires 1 argument");
                     return q.car();
                 }
-                case "if" -> {
-                    return evalIf(pair.cdr(), env, pair);
+
+                if (formName.equals("if")) {
+                    Val ifArgs = pair.cdr();
+                    if (!(ifArgs instanceof Val.PairV p1)) throw posError(pair, "if requires a condition");
+                    Val cond = eval(p1.car(), env);
+                    Val rest = p1.cdr();
+                    if (!(rest instanceof Val.PairV p2)) throw posError(pair, "if requires a consequent");
+                    if (isTruthy(cond)) { expr = p2.car(); continue tco; }
+                    if (p2.cdr() instanceof Val.PairV p3) { expr = p3.car(); continue tco; }
+                    return new Val.Void();
                 }
-                case "define" -> {
-                    return evalDefine(pair.cdr(), env, pair);
-                }
-                case "lambda" -> {
-                    return evalLambda(pair.cdr(), env, pair);
-                }
-                case "set!" -> {
+
+                if (formName.equals("define")) return evalDefine(pair.cdr(), env, pair);
+                if (formName.equals("lambda")) return evalLambda(pair.cdr(), env, pair);
+
+                if (formName.equals("set!")) {
                     Val setCdr = pair.cdr();
                     if (!(setCdr instanceof Val.PairV sp)) throw posError(pair, "set! requires 2 arguments");
                     if (!(sp.car() instanceof Val.Sym setSym)) throw posError(pair, "set!: expected variable name");
@@ -444,29 +432,276 @@ public class Evaluator {
                     env.set(setSym.name(), setVal);
                     return new Val.Void();
                 }
-                case "begin" -> { return evalBegin(pair.cdr(), env); }
-                case "let" -> { return evalLet(pair.cdr(), env, pair); }
-                case "cond" -> { return evalCond(pair.cdr(), env); }
-                case "and" -> { return evalAnd(pair.cdr(), env); }
-                case "or" -> { return evalOr(pair.cdr(), env); }
-                case "define-syntax" -> { return evalDefineSyntax(pair, env); }
-                case "define-record-type" -> { return evalDefineRecordType(pair.cdr(), env, pair); }
-                case "case-lambda" -> { return evalCaseLambda(pair.cdr(), env, pair); }
-                case "let*" -> { return evalLetStar(pair.cdr(), env, pair); }
-                case "letrec" -> { return evalLetrec(pair.cdr(), env, pair); }
-                case "letrec*" -> { return evalLetrecStar(pair.cdr(), env, pair); }
-                case "case" -> { return evalCase(pair.cdr(), env, pair); }
-                case "do" -> { return evalDo(pair.cdr(), env, pair); }
-            }
-        }
 
-        // Function call
-        Val fn = eval(head, env);
-        if (fn instanceof Val.Macro macro) {
-            return expandAndEvalMacro(macro, pair, env);
+                if (formName.equals("begin")) {
+                    Val cur = pair.cdr();
+                    if (!(cur instanceof Val.PairV)) return new Val.Void();
+                    while (cur instanceof Val.PairV p) {
+                        if (!(p.cdr() instanceof Val.PairV)) { expr = p.car(); continue tco; }
+                        eval(p.car(), env);
+                        cur = p.cdr();
+                    }
+                    return new Val.Void();
+                }
+
+                if (formName.equals("let")) {
+                    Val letArgs = pair.cdr();
+                    if (!(letArgs instanceof Val.PairV lp)) throw posError(pair, "let: invalid syntax");
+                    if (lp.car() instanceof Val.Sym nameSym) {
+                        // Named let
+                        if (!(lp.cdr() instanceof Val.PairV rest)) throw posError(pair, "let: invalid syntax");
+                        List<String> params = new ArrayList<>();
+                        List<Val> inits = new ArrayList<>();
+                        Val bindings = rest.car();
+                        while (bindings instanceof Val.PairV bp) {
+                            if (!(bp.car() instanceof Val.PairV binding)) throw posError(pair, "let: invalid binding");
+                            if (!(binding.car() instanceof Val.Sym varSym)) throw posError(pair, "let: expected variable name");
+                            params.add(varSym.name());
+                            if (!(binding.cdr() instanceof Val.PairV valPair)) throw posError(pair, "let: missing init");
+                            inits.add(eval(valPair.car(), env));
+                            bindings = bp.cdr();
+                        }
+                        List<Val> body = collectList(rest.cdr());
+                        if (body.isEmpty()) throw posError(pair, "let: missing body");
+                        Env letEnv = new Env(env);
+                        Val.Lambda lambda = new Val.Lambda(params, null, body, letEnv);
+                        letEnv.define(nameSym.name(), lambda);
+                        Env callEnv = new Env(letEnv);
+                        for (int i = 0; i < params.size(); i++) callEnv.define(params.get(i), inits.get(i));
+                        for (int i = 0; i < body.size() - 1; i++) eval(body.get(i), callEnv);
+                        expr = body.get(body.size() - 1); env = callEnv; continue tco;
+                    }
+                    // Regular let
+                    Env letEnv = new Env(env);
+                    Val bindings = lp.car();
+                    while (bindings instanceof Val.PairV bp) {
+                        if (!(bp.car() instanceof Val.PairV binding)) throw posError(pair, "let: invalid binding");
+                        if (!(binding.car() instanceof Val.Sym varSym)) throw posError(pair, "let: expected variable name");
+                        if (!(binding.cdr() instanceof Val.PairV valPair)) throw posError(pair, "let: missing init");
+                        Val val = eval(valPair.car(), env);
+                        letEnv.define(varSym.name(), val);
+                        bindings = bp.cdr();
+                    }
+                    List<Val> body = collectList(lp.cdr());
+                    if (body.isEmpty()) throw posError(pair, "let: missing body");
+                    for (int i = 0; i < body.size() - 1; i++) eval(body.get(i), letEnv);
+                    expr = body.get(body.size() - 1); env = letEnv; continue tco;
+                }
+
+                if (formName.equals("let*")) {
+                    Val letArgs = pair.cdr();
+                    if (!(letArgs instanceof Val.PairV lp)) throw posError(pair, "let*: invalid syntax");
+                    Env letEnv = new Env(env);
+                    Val bindings = lp.car();
+                    while (bindings instanceof Val.PairV bp) {
+                        if (!(bp.car() instanceof Val.PairV binding)) throw posError(pair, "let*: invalid binding");
+                        if (!(binding.car() instanceof Val.Sym varSym)) throw posError(pair, "let*: expected variable name");
+                        if (!(binding.cdr() instanceof Val.PairV valPair)) throw posError(pair, "let*: missing init");
+                        Val val = eval(valPair.car(), letEnv);
+                        letEnv.define(varSym.name(), val);
+                        bindings = bp.cdr();
+                    }
+                    List<Val> body = collectList(lp.cdr());
+                    if (body.isEmpty()) throw posError(pair, "let*: missing body");
+                    for (int i = 0; i < body.size() - 1; i++) eval(body.get(i), letEnv);
+                    expr = body.get(body.size() - 1); env = letEnv; continue tco;
+                }
+
+                if (formName.equals("letrec")) {
+                    Val letArgs = pair.cdr();
+                    if (!(letArgs instanceof Val.PairV lp)) throw posError(pair, "letrec: invalid syntax");
+                    Env letEnv = new Env(env);
+                    List<String> names = new ArrayList<>();
+                    List<Val> initExprs = new ArrayList<>();
+                    Val bindings = lp.car();
+                    while (bindings instanceof Val.PairV bp) {
+                        if (!(bp.car() instanceof Val.PairV binding)) throw posError(pair, "letrec: invalid binding");
+                        if (!(binding.car() instanceof Val.Sym varSym)) throw posError(pair, "letrec: expected variable name");
+                        names.add(varSym.name());
+                        letEnv.define(varSym.name(), new Val.Void());
+                        if (!(binding.cdr() instanceof Val.PairV valPair)) throw posError(pair, "letrec: missing init");
+                        initExprs.add(valPair.car());
+                        bindings = bp.cdr();
+                    }
+                    for (int i = 0; i < names.size(); i++) letEnv.define(names.get(i), eval(initExprs.get(i), letEnv));
+                    List<Val> body = collectList(lp.cdr());
+                    if (body.isEmpty()) throw posError(pair, "letrec: missing body");
+                    for (int i = 0; i < body.size() - 1; i++) eval(body.get(i), letEnv);
+                    expr = body.get(body.size() - 1); env = letEnv; continue tco;
+                }
+
+                if (formName.equals("letrec*")) {
+                    Val letArgs = pair.cdr();
+                    if (!(letArgs instanceof Val.PairV lp)) throw posError(pair, "letrec*: invalid syntax");
+                    Env letEnv = new Env(env);
+                    Val bindings = lp.car();
+                    while (bindings instanceof Val.PairV bp) {
+                        if (!(bp.car() instanceof Val.PairV binding)) throw posError(pair, "letrec*: invalid binding");
+                        if (!(binding.car() instanceof Val.Sym varSym)) throw posError(pair, "letrec*: expected variable name");
+                        if (!(binding.cdr() instanceof Val.PairV valPair)) throw posError(pair, "letrec*: missing init");
+                        Val val = eval(valPair.car(), letEnv);
+                        letEnv.define(varSym.name(), val);
+                        bindings = bp.cdr();
+                    }
+                    List<Val> body = collectList(lp.cdr());
+                    if (body.isEmpty()) throw posError(pair, "letrec*: missing body");
+                    for (int i = 0; i < body.size() - 1; i++) eval(body.get(i), letEnv);
+                    expr = body.get(body.size() - 1); env = letEnv; continue tco;
+                }
+
+                if (formName.equals("cond")) {
+                    Val cur = pair.cdr();
+                    while (cur instanceof Val.PairV cp0) {
+                        Val clause = cp0.car();
+                        if (!(clause instanceof Val.PairV cp)) throw new EvalError("cond: invalid clause");
+                        if (cp.car() instanceof Val.Sym s && s.name().equals("else")) {
+                            Val body = cp.cdr();
+                            if (!(body instanceof Val.PairV)) return new Val.Void();
+                            while (body instanceof Val.PairV bp) {
+                                if (!(bp.cdr() instanceof Val.PairV)) { expr = bp.car(); continue tco; }
+                                eval(bp.car(), env);
+                                body = bp.cdr();
+                            }
+                            return new Val.Void();
+                        }
+                        Val test = eval(cp.car(), env);
+                        if (isTruthy(test)) {
+                            if (cp.cdr() instanceof Val.Nil) return test;
+                            Val body = cp.cdr();
+                            while (body instanceof Val.PairV bp) {
+                                if (!(bp.cdr() instanceof Val.PairV)) { expr = bp.car(); continue tco; }
+                                eval(bp.car(), env);
+                                body = bp.cdr();
+                            }
+                            return new Val.Void();
+                        }
+                        cur = cp0.cdr();
+                    }
+                    return new Val.Void();
+                }
+
+                if (formName.equals("and")) {
+                    Val cur = pair.cdr();
+                    if (!(cur instanceof Val.PairV)) return new Val.Bool(true);
+                    while (cur instanceof Val.PairV p) {
+                        if (!(p.cdr() instanceof Val.PairV)) { expr = p.car(); continue tco; }
+                        Val result = eval(p.car(), env);
+                        if (!isTruthy(result)) return result;
+                        cur = p.cdr();
+                    }
+                    return new Val.Bool(true);
+                }
+
+                if (formName.equals("or")) {
+                    Val cur = pair.cdr();
+                    if (!(cur instanceof Val.PairV)) return new Val.Bool(false);
+                    while (cur instanceof Val.PairV p) {
+                        if (!(p.cdr() instanceof Val.PairV)) { expr = p.car(); continue tco; }
+                        Val result = eval(p.car(), env);
+                        if (isTruthy(result)) return result;
+                        cur = p.cdr();
+                    }
+                    return new Val.Bool(false);
+                }
+
+                if (formName.equals("case")) {
+                    Val caseArgs = pair.cdr();
+                    if (!(caseArgs instanceof Val.PairV caseP)) throw posError(pair, "case: invalid syntax");
+                    Val key = eval(caseP.car(), env);
+                    Val clauses = caseP.cdr();
+                    while (clauses instanceof Val.PairV clp) {
+                        Val clause = clp.car();
+                        if (!(clause instanceof Val.PairV clausePair)) throw posError(pair, "case: invalid clause");
+                        if (clausePair.car() instanceof Val.Sym s && s.name().equals("else")) {
+                            Val body = clausePair.cdr();
+                            if (!(body instanceof Val.PairV)) return new Val.Void();
+                            while (body instanceof Val.PairV bp) {
+                                if (!(bp.cdr() instanceof Val.PairV)) { expr = bp.car(); continue tco; }
+                                eval(bp.car(), env);
+                                body = bp.cdr();
+                            }
+                            return new Val.Void();
+                        }
+                        Val datums = clausePair.car();
+                        if (!(datums instanceof Val.PairV)) throw posError(pair, "case: expected datum list");
+                        boolean matched = false;
+                        Val d = datums;
+                        while (d instanceof Val.PairV dp) {
+                            if (isEqv(key, dp.car())) { matched = true; break; }
+                            d = dp.cdr();
+                        }
+                        if (matched) {
+                            if (clausePair.cdr() instanceof Val.Nil) return new Val.Void();
+                            Val body = clausePair.cdr();
+                            while (body instanceof Val.PairV bp) {
+                                if (!(bp.cdr() instanceof Val.PairV)) { expr = bp.car(); continue tco; }
+                                eval(bp.car(), env);
+                                body = bp.cdr();
+                            }
+                            return new Val.Void();
+                        }
+                        clauses = clp.cdr();
+                    }
+                    return new Val.Void();
+                }
+
+                if (formName.equals("define-syntax")) return evalDefineSyntax(pair, env);
+                if (formName.equals("define-record-type")) return evalDefineRecordType(pair.cdr(), env, pair);
+                if (formName.equals("case-lambda")) return evalCaseLambda(pair.cdr(), env, pair);
+                if (formName.equals("do")) return evalDo(pair.cdr(), env, pair);
+            }
+
+            // Function call
+            Val fn = eval(head, env);
+            if (fn instanceof Val.Macro macro) {
+                expr = expandMacro(macro, pair, env);
+                continue tco;
+            }
+            List<Val> args = evalArgs(pair.cdr(), env);
+
+            // Resolve CaseLambda to matching clause
+            Val.Lambda lambda = null;
+            if (fn instanceof Val.CaseLambda cl) {
+                for (Val.Lambda clause : cl.clauses()) {
+                    int required = clause.params().size();
+                    if (clause.restParam() != null) {
+                        if (args.size() >= required) { lambda = clause; break; }
+                    } else {
+                        if (args.size() == required) { lambda = clause; break; }
+                    }
+                }
+                if (lambda == null) throw posError(pair, "no matching clause for " + args.size() + " arguments");
+            } else if (fn instanceof Val.Lambda l) {
+                lambda = l;
+            }
+
+            if (lambda != null) {
+                int required = lambda.params().size();
+                if (lambda.restParam() != null) {
+                    if (args.size() < required)
+                        throw posError(pair, "expected at least " + required + " arguments, got " + args.size());
+                } else {
+                    if (args.size() != required)
+                        throw posError(pair, "expected " + required + " arguments, got " + args.size());
+                }
+                Env callEnv = new Env(lambda.closure());
+                for (int i = 0; i < required; i++) callEnv.define(lambda.params().get(i), args.get(i));
+                if (lambda.restParam() != null) {
+                    Val rest = new Val.Nil();
+                    for (int i = args.size() - 1; i >= required; i--) rest = new Val.PairV(args.get(i), rest);
+                    callEnv.define(lambda.restParam(), rest);
+                }
+                List<Val> body = lambda.body();
+                for (int i = 0; i < body.size() - 1; i++) eval(body.get(i), callEnv);
+                expr = body.get(body.size() - 1); env = callEnv; continue tco;
+            }
+
+            if (fn instanceof Val.Builtin builtin) {
+                try { return builtin.fn().apply(args); }
+                catch (RuntimeException e) { throw posError(pair, e.getMessage()); }
+            }
+            throw posError(pair, "not a procedure: " + writeVal(fn));
         }
-        List<Val> args = evalArgs(pair.cdr(), env);
-        return applyFn(fn, args, pair);
     }
 
     private Val applyFn(Val fn, List<Val> args, Val callSite) throws EvalError {
@@ -1017,7 +1252,7 @@ public class Evaluator {
         return new Val.Void();
     }
 
-    private Val expandAndEvalMacro(Val.Macro macro, Val.PairV form, Env env) throws EvalError {
+    private Val expandMacro(Val.Macro macro, Val.PairV form, Env env) throws EvalError {
         Val inputArgs = form.cdr();
         for (int i = 0; i < macro.patterns.size(); i++) {
             Val pattern = macro.patterns.get(i);
@@ -1046,7 +1281,7 @@ public class Evaluator {
                         // Not in defEnv — truly introduced identifier, no pre-binding needed
                     }
                 }
-                return eval(expanded, env);
+                return expanded;
             }
         }
         throw posError(form, "no matching pattern for macro " + macro.name);
