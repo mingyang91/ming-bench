@@ -22,6 +22,16 @@ public class Evaluator {
 
     record Lambda(List<String> params, List<Object> body, Env env) {}
 
+    static class Cons {
+        Object car;
+        Object cdr;
+        Cons(Object car, Object cdr) { this.car = car; this.cdr = cdr; }
+    }
+
+    static final Object NIL = new Object() {
+        @Override public String toString() { return "()"; }
+    };
+
     static final Object VOID = new Object() {
         @Override public String toString() { return "#<void>"; }
     };
@@ -91,6 +101,82 @@ public class Evaluator {
         globalEnv.define("not", new Builtin("not", args -> {
             requireArgCount(args, 1, "not");
             return isFalse(args.get(0));
+        }));
+        globalEnv.define("cons", new Builtin("cons", args -> {
+            requireArgCount(args, 2, "cons");
+            return new Cons(args.get(0), args.get(1));
+        }));
+        globalEnv.define("car", new Builtin("car", args -> {
+            requireArgCount(args, 1, "car");
+            if (!(args.get(0) instanceof Cons c)) throw new EvalError("car: not a pair");
+            return c.car;
+        }));
+        globalEnv.define("cdr", new Builtin("cdr", args -> {
+            requireArgCount(args, 1, "cdr");
+            if (!(args.get(0) instanceof Cons c)) throw new EvalError("cdr: not a pair");
+            return c.cdr;
+        }));
+        globalEnv.define("null?", new Builtin("null?", args -> {
+            requireArgCount(args, 1, "null?");
+            return args.get(0) == NIL;
+        }));
+        globalEnv.define("list", new Builtin("list", args -> {
+            Object result = NIL;
+            for (int i = args.size() - 1; i >= 0; i--) {
+                result = new Cons(args.get(i), result);
+            }
+            return result;
+        }));
+        globalEnv.define("length", new Builtin("length", args -> {
+            requireArgCount(args, 1, "length");
+            long count = 0;
+            Object cur = args.get(0);
+            while (cur instanceof Cons c) {
+                count++;
+                cur = c.cdr;
+            }
+            if (cur != NIL) throw new EvalError("length: not a proper list");
+            return count;
+        }));
+        globalEnv.define("append", new Builtin("append", args -> {
+            if (args.isEmpty()) return NIL;
+            if (args.size() == 1) return args.get(0);
+            // Build result right-to-left
+            Object result = args.get(args.size() - 1);
+            for (int i = args.size() - 2; i >= 0; i--) {
+                Object lst = args.get(i);
+                // Collect elements of lst, then prepend to result
+                List<Object> elems = new ArrayList<>();
+                Object cur = lst;
+                while (cur instanceof Cons c) {
+                    elems.add(c.car);
+                    cur = c.cdr;
+                }
+                for (int j = elems.size() - 1; j >= 0; j--) {
+                    result = new Cons(elems.get(j), result);
+                }
+            }
+            return result;
+        }));
+        globalEnv.define("number?", new Builtin("number?", args -> {
+            requireArgCount(args, 1, "number?");
+            return args.get(0) instanceof Long;
+        }));
+        globalEnv.define("string?", new Builtin("string?", args -> {
+            requireArgCount(args, 1, "string?");
+            return args.get(0) instanceof SchemeString;
+        }));
+        globalEnv.define("boolean?", new Builtin("boolean?", args -> {
+            requireArgCount(args, 1, "boolean?");
+            return args.get(0) instanceof Boolean;
+        }));
+        globalEnv.define("pair?", new Builtin("pair?", args -> {
+            requireArgCount(args, 1, "pair?");
+            return args.get(0) instanceof Cons;
+        }));
+        globalEnv.define("symbol?", new Builtin("symbol?", args -> {
+            requireArgCount(args, 1, "symbol?");
+            return args.get(0) instanceof String;
         }));
     }
 
@@ -243,7 +329,7 @@ public class Evaluator {
                 switch (sym) {
                     case "quote" -> {
                         if (list.size() != 2) throw new EvalError("quote requires 1 argument");
-                        return list.get(1);
+                        return javaToScheme(list.get(1));
                     }
                     case "if" -> {
                         if (list.size() < 3 || list.size() > 4)
@@ -309,6 +395,74 @@ public class Evaluator {
                         }
                         return result;
                     }
+                    case "let" -> {
+                        if (list.size() < 3) throw new EvalError("let requires bindings and body");
+                        // Named let: (let name ((var init) ...) body...)
+                        if (list.get(1) instanceof String loopName) {
+                            if (list.size() < 4) throw new EvalError("named let requires bindings and body");
+                            if (!(list.get(2) instanceof List<?> bindings))
+                                throw new EvalError("let bindings must be a list");
+                            List<String> params = new ArrayList<>();
+                            List<Object> inits = new ArrayList<>();
+                            for (Object b : bindings) {
+                                if (!(b instanceof List<?> binding) || binding.size() != 2)
+                                    throw new EvalError("invalid let binding");
+                                if (!(binding.get(0) instanceof String pname))
+                                    throw new EvalError("let binding name must be a symbol");
+                                params.add(pname);
+                                inits.add(eval(binding.get(1), env));
+                            }
+                            List<Object> body = new ArrayList<>(list.subList(3, list.size()));
+                            Env letEnv = new Env(env);
+                            Lambda loopFn = new Lambda(params, body, letEnv);
+                            letEnv.define(loopName, loopFn);
+                            return applyProc(loopFn, inits);
+                        }
+                        if (!(list.get(1) instanceof List<?> bindings))
+                            throw new EvalError("let bindings must be a list");
+                        Env letEnv = new Env(env);
+                        for (Object b : bindings) {
+                            if (!(b instanceof List<?> binding) || binding.size() != 2)
+                                throw new EvalError("invalid let binding");
+                            if (!(binding.get(0) instanceof String name))
+                                throw new EvalError("let binding name must be a symbol");
+                            letEnv.define(name, eval(binding.get(1), env));
+                        }
+                        Object result = VOID;
+                        for (int i = 2; i < list.size(); i++) {
+                            result = eval(list.get(i), letEnv);
+                        }
+                        return result;
+                    }
+                    case "begin" -> {
+                        Object result = VOID;
+                        for (int i = 1; i < list.size(); i++) {
+                            result = eval(list.get(i), env);
+                        }
+                        return result;
+                    }
+                    case "cond" -> {
+                        for (int i = 1; i < list.size(); i++) {
+                            if (!(list.get(i) instanceof List<?> clause) || clause.isEmpty())
+                                throw new EvalError("invalid cond clause");
+                            if ("else".equals(clause.get(0))) {
+                                Object result = VOID;
+                                for (int j = 1; j < clause.size(); j++) {
+                                    result = eval(clause.get(j), env);
+                                }
+                                return result;
+                            }
+                            Object test = eval(clause.get(0), env);
+                            if (!isFalse(test)) {
+                                Object result = test;
+                                for (int j = 1; j < clause.size(); j++) {
+                                    result = eval(clause.get(j), env);
+                                }
+                                return result;
+                            }
+                        }
+                        return VOID;
+                    }
                 }
             }
 
@@ -359,15 +513,45 @@ public class Evaluator {
         }
     }
 
+    // --- Conversion ---
+
+    private Object javaToScheme(Object val) {
+        if (val instanceof List<?> list) {
+            Object result = NIL;
+            for (int i = list.size() - 1; i >= 0; i--) {
+                result = new Cons(javaToScheme(list.get(i)), result);
+            }
+            return result;
+        }
+        return val;
+    }
+
     // --- Output formatting ---
 
-    @SuppressWarnings("unchecked")
     private String schemeToString(Object val) {
+        if (val == NIL) return "()";
         if (val instanceof Long l) return l.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
         if (val instanceof Builtin b) return "#<procedure " + b.name() + ">";
         if (val instanceof Lambda) return "#<procedure>";
+        if (val instanceof Cons) {
+            StringBuilder sb = new StringBuilder("(");
+            Object cur = val;
+            boolean first = true;
+            while (cur instanceof Cons c) {
+                if (!first) sb.append(" ");
+                first = false;
+                sb.append(schemeToString(c.car));
+                cur = c.cdr;
+            }
+            if (cur != NIL) {
+                sb.append(" . ");
+                sb.append(schemeToString(cur));
+            }
+            sb.append(")");
+            return sb.toString();
+        }
         if (val instanceof List<?> list) {
             StringBuilder sb = new StringBuilder("(");
             for (int i = 0; i < list.size(); i++) {
