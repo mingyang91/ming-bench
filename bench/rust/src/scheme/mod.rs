@@ -54,6 +54,24 @@ enum Val {
         rules: Vec<(Expr, Expr)>,
         def_env: Env,
     },
+    Record {
+        type_id: usize,
+        type_name: String,
+        fields: Vec<(String, Val)>,
+    },
+}
+
+static RECORD_TYPE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone)]
+struct RecordTypeInfo {
+    type_name: String,
+    ctor_name: String,
+    field_names: Vec<String>,
+}
+
+thread_local! {
+    static RECORD_REGISTRY: RefCell<HashMap<usize, RecordTypeInfo>> = RefCell::new(HashMap::new());
 }
 
 impl fmt::Display for Val {
@@ -100,6 +118,7 @@ impl fmt::Display for Val {
             Val::Builtin(_) => write!(f, "#<procedure>"),
             Val::Void => write!(f, "#<void>"),
             Val::Macro { .. } => write!(f, "#<macro>"),
+            Val::Record { type_name, .. } => write!(f, "#<record:{type_name}>"),
         }
     }
 }
@@ -503,7 +522,7 @@ fn gensym(base: &str) -> String {
 
 fn is_syntax_keyword(s: &str) -> bool {
     matches!(s, "if" | "let" | "let*" | "letrec" | "begin" | "set!" | "define"
-        | "define-syntax" | "lambda" | "quote" | "cond" | "and" | "or" | "else"
+        | "define-syntax" | "define-record-type" | "lambda" | "quote" | "cond" | "and" | "or" | "else"
         | "syntax-rules")
 }
 
@@ -767,6 +786,73 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                         }
                     }
                     env_set(env, name, Val::Macro { literals, rules, def_env: env.clone() });
+                    return Ok(Val::Void);
+                }
+                if op == "define-record-type" {
+                    // (define-record-type <name> (ctor field ...) pred? (field accessor) ...)
+                    if list.len() < 4 {
+                        return Err(err_at(span, EvalError::Parse("define-record-type: bad syntax".into())));
+                    }
+                    let _type_name = match &list[1].kind {
+                        ExprKind::Symbol(s) => s.clone(),
+                        _ => return Err(err_at(span, EvalError::Parse("define-record-type: expected type name".into()))),
+                    };
+                    let (ctor_name, ctor_fields) = match &list[2].kind {
+                        ExprKind::List(ctor_list) if !ctor_list.is_empty() => {
+                            let name = match &ctor_list[0].kind {
+                                ExprKind::Symbol(s) => s.clone(),
+                                _ => return Err(err_at(span, EvalError::Parse("define-record-type: expected constructor name".into()))),
+                            };
+                            let mut fields = Vec::new();
+                            for f in &ctor_list[1..] {
+                                match &f.kind {
+                                    ExprKind::Symbol(s) => fields.push(s.clone()),
+                                    _ => return Err(err_at(span, EvalError::Parse("define-record-type: expected field name".into()))),
+                                }
+                            }
+                            (name, fields)
+                        }
+                        _ => return Err(err_at(span, EvalError::Parse("define-record-type: expected constructor".into()))),
+                    };
+                    let pred_name = match &list[3].kind {
+                        ExprKind::Symbol(s) => s.clone(),
+                        _ => return Err(err_at(span, EvalError::Parse("define-record-type: expected predicate name".into()))),
+                    };
+                    let mut field_accessors = Vec::new();
+                    for spec in &list[4..] {
+                        match &spec.kind {
+                            ExprKind::List(fa) if fa.len() >= 2 => {
+                                let fname = match &fa[0].kind {
+                                    ExprKind::Symbol(s) => s.clone(),
+                                    _ => return Err(err_at(span, EvalError::Parse("define-record-type: expected field name".into()))),
+                                };
+                                let accessor = match &fa[1].kind {
+                                    ExprKind::Symbol(s) => s.clone(),
+                                    _ => return Err(err_at(span, EvalError::Parse("define-record-type: expected accessor name".into()))),
+                                };
+                                field_accessors.push((fname, accessor));
+                            }
+                            _ => return Err(err_at(span, EvalError::Parse("define-record-type: bad field spec".into()))),
+                        }
+                    }
+                    let type_id = RECORD_TYPE_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+                    // Register record type info in global registry
+                    RECORD_REGISTRY.with(|reg| {
+                        reg.borrow_mut().insert(type_id, RecordTypeInfo {
+                            type_name: _type_name.clone(),
+                            ctor_name: ctor_name.clone(),
+                            field_names: ctor_fields.clone(),
+                        });
+                    });
+
+                    // Define constructor, predicate, and accessors as specially-named builtins
+                    env_set(env, ctor_name.clone(), Val::Builtin(format!("__ctor_{}_{}", type_id, ctor_name)));
+                    env_set(env, pred_name.clone(), Val::Builtin(format!("__pred_{}_{}", type_id, pred_name)));
+                    for (fname, accessor_name) in &field_accessors {
+                        env_set(env, accessor_name.clone(), Val::Builtin(format!("__acc_{}_{}_{}", type_id, fname, accessor_name)));
+                    }
+
                     return Ok(Val::Void);
                 }
                 // Check for macro expansion
@@ -1211,6 +1297,60 @@ fn call_function(func: &Val, args: Vec<Val>, span: Span, out: &mut String) -> Re
         Val::Builtin(name) => {
             if name == "apply" {
                 do_apply(&args, span, out)
+            } else if name.starts_with("__ctor_") {
+                let rest = &name[7..]; // skip "__ctor_"
+                let id_end = rest.find('_').unwrap();
+                let type_id: usize = rest[..id_end].parse().unwrap();
+                let info = RECORD_REGISTRY.with(|reg| reg.borrow().get(&type_id).cloned());
+                match info {
+                    Some(rec_info) => {
+                        if args.len() != rec_info.field_names.len() {
+                            return Err(err_at(span, EvalError::Arity(format!(
+                                "{}: expected {} arguments, got {}",
+                                rec_info.ctor_name, rec_info.field_names.len(), args.len()
+                            ))));
+                        }
+                        let fields: Vec<(String, Val)> = rec_info.field_names.iter()
+                            .zip(args.into_iter())
+                            .map(|(n, v)| (n.clone(), v))
+                            .collect();
+                        Ok(Val::Record {
+                            type_id,
+                            type_name: rec_info.type_name.clone(),
+                            fields,
+                        })
+                    }
+                    None => Err(err_at(span, EvalError::Type("unknown record type".into()))),
+                }
+            } else if name.starts_with("__pred_") {
+                let rest = &name[7..];
+                let id_end = rest.find('_').unwrap();
+                let type_id: usize = rest[..id_end].parse().unwrap();
+                if args.len() != 1 {
+                    return Err(err_at(span, EvalError::Arity("predicate: expected 1 argument".into())));
+                }
+                Ok(Val::Bool(matches!(&args[0], Val::Record { type_id: tid, .. } if *tid == type_id)))
+            } else if name.starts_with("__acc_") {
+                let rest = &name[6..];
+                let id_end = rest.find('_').unwrap();
+                let type_id: usize = rest[..id_end].parse().unwrap();
+                let field_and_acc = &rest[id_end+1..];
+                let field_end = field_and_acc.find('_').unwrap();
+                let field_name = &field_and_acc[..field_end];
+                if args.len() != 1 {
+                    return Err(err_at(span, EvalError::Arity("accessor: expected 1 argument".into())));
+                }
+                match &args[0] {
+                    Val::Record { type_id: tid, fields, .. } if *tid == type_id => {
+                        for (fname, val) in fields {
+                            if fname == field_name {
+                                return Ok(val.clone());
+                            }
+                        }
+                        Err(err_at(span, EvalError::Type(format!("record has no field {field_name}"))))
+                    }
+                    _ => Err(err_at(span, EvalError::Type("accessor: expected record of correct type".into()))),
+                }
             } else {
                 apply_builtin(name, &args).map_err(|e| err_at(span, e))
             }
