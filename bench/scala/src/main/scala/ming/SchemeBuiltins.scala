@@ -9,6 +9,7 @@ private[ming] object SchemeBuiltins:
       LogicalBuiltins.all,
       EqualityBuiltins.all,
       ListBuiltins.all,
+      VectorBuiltins.all,
       CharBuiltins.all,
       StringBuiltins.all,
       IoBuiltins.all(writeOutput),

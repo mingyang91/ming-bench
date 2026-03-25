@@ -1,100 +1,7 @@
 package ming
 
-import scala.collection.mutable
-
-private[ming] object SchemeInterpreter:
+private[ming] object SchemeInterpreter extends SchemeInterpreterTypes:
   import SchemeInterpreterSyntax.*
-
-  sealed trait Expr:
-    def pos: SourcePos
-
-  object Expr:
-    final case class Number(value: SchemeNumber, pos: SourcePos) extends Expr
-    final case class Bool(value: Boolean, pos: SourcePos)        extends Expr
-    final case class StringLit(value: String, pos: SourcePos)    extends Expr
-    final case class Character(value: Char, pos: SourcePos)      extends Expr
-    final case class Symbol(name: String, pos: SourcePos)        extends Expr
-    final case class ListExpr(items: List[Expr], pos: SourcePos) extends Expr
-
-  sealed trait Value
-  sealed trait Procedure extends Value
-
-  object Value:
-    final case class Number(value: SchemeNumber) extends Value
-    final case class Bool(value: Boolean)        extends Value
-    final case class StringLit(value: String)    extends Value
-
-    final class MutableString private (private val chars: mutable.ArrayBuffer[Char]) extends Value:
-
-      def value: String =
-        chars.mkString
-
-      def length: Int =
-        chars.length
-
-      def charAt(index: Int): Char =
-        chars(index)
-
-      def set(index: Int, value: Char): Unit =
-        chars(index) = value
-
-      def copyString(): MutableString =
-        MutableString(value)
-
-    object MutableString:
-
-      def apply(value: String): MutableString =
-        new MutableString(mutable.ArrayBuffer.from(value))
-
-      def unapply(value: MutableString): Some[String] =
-        Some(value.value)
-
-    final case class Character(value: Char)       extends Value
-    final case class Symbol(name: String)         extends Value
-    case object EmptyList                         extends Value
-    final case class Pair(car: Value, cdr: Value) extends Value
-
-    final class Record private[ming] (
-      private val descriptor: SchemeRecords.RecordTypeDescriptor,
-      private val fields: mutable.ArrayBuffer[Value]
-    ) extends Value:
-
-      def recordTypeId: Long =
-        descriptor.id
-
-      def typeName: String =
-        descriptor.name
-
-      def field(index: Int): Value =
-        fields(index)
-
-      def setField(index: Int, value: Value): Unit =
-        fields(index) = value
-
-    final case class Builtin(name: String, impl: (List[Value], SourcePos) => Value) extends Procedure
-
-    final case class Closure(
-      params: LambdaParams,
-      body: List[Expr],
-      env: Env,
-      macros: MacroScope
-    ) extends Procedure
-
-    final case class CaseLambdaClause(
-      params: LambdaParams,
-      body: List[Expr]
-    )
-
-    final case class CaseLambda(
-      clauses: List[CaseLambdaClause],
-      env: Env,
-      macros: MacroScope
-    ) extends Procedure
-
-    case object Void extends Value
-
-    def list(items: List[Value]): Value =
-      items.foldRight[Value](EmptyList)(Pair(_, _))
 
   def evalProgram(input: String): Value =
     runProgram(input)._1
@@ -139,12 +46,17 @@ private[ming] object SchemeInterpreter:
           case Expr.Symbol("begin", _) :: args              => evalBegin(args, env, macros)
           case Expr.Symbol("if", _) :: args                 => evalIf(args, env, macros, pos)
           case Expr.Symbol("let", _) :: args                => evalLet(args, env, macros, pos)
+          case Expr.Symbol("letrec", _) :: args             => evalLetrec(args, env, macros, pos)
+          case Expr.Symbol("letrec*", _) :: args            => evalLetrecStar(args, env, macros, pos)
           case Expr.Symbol("cond", _) :: args               => evalCond(args, env, macros, pos)
+          case Expr.Symbol("case", _) :: args               => evalCase(args, env, macros, pos)
           case Expr.Symbol("quote", _) :: args              => evalQuote(args, pos)
           case Expr.Symbol("lambda", _) :: args             => evalLambda(args, env, macros, pos)
           case Expr.Symbol("case-lambda", _) :: args        => SchemeProcedures.evalCaseLambda(args, env, macros, pos)
-          case Expr.Symbol("and", _) :: args                => evalAnd(args, env, macros)
-          case Expr.Symbol("or", _) :: args                 => evalOr(args, env, macros)
+          case Expr.Symbol("do", _) :: args =>
+            SchemeInterpreterDoSupport.eval(args, env, macros, pos, eval, evalSequence)
+          case Expr.Symbol("and", _) :: args => evalAnd(args, env, macros)
+          case Expr.Symbol("or", _) :: args  => evalOr(args, env, macros)
           case (symbol @ Expr.Symbol(name, _)) :: args =>
             macros.lookup(name) match
               case Some(macroDef) =>
@@ -191,11 +103,14 @@ private[ming] object SchemeInterpreter:
 
   private def evalIf(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value =
     args match
+      case condition :: ifTrue :: Nil =>
+        if isTruthy(eval(condition, env, macros)) then eval(ifTrue, env, macros)
+        else Value.Void
       case condition :: ifTrue :: ifFalse :: Nil =>
         if isTruthy(eval(condition, env, macros)) then eval(ifTrue, env, macros)
         else eval(ifFalse, env, macros)
       case _ =>
-        throw EvalError.at(pos, s"if expected 3 arguments, got ${args.length}")
+        throw EvalError.at(pos, s"if expected 2 or 3 arguments, got ${args.length}")
 
   private def evalLet(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value =
     args match
@@ -216,6 +131,45 @@ private[ming] object SchemeInterpreter:
       case _ =>
         throw EvalError.at(pos, "invalid let")
 
+  private def evalLetrec(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value =
+    args match
+      case Expr.ListExpr(bindingsExpr, _) :: body if body.nonEmpty =>
+        val bindings     = readBindings(bindingsExpr)
+        val letrecEnv    = Env.child(env, Nil)
+        val letrecMacros = MacroScope.child(macros)
+
+        bindings.foreach { case (name, _) =>
+          letrecEnv.define(name, Value.Void)
+        }
+
+        val values = bindings.map { case (_, valueExpr) =>
+          eval(valueExpr, letrecEnv, letrecMacros)
+        }
+
+        bindings.zip(values).foreach { case ((name, _), value) =>
+          letrecEnv.assign(name, value, pos)
+        }
+
+        evalSequence(body, letrecEnv, letrecMacros)
+      case _ =>
+        throw EvalError.at(pos, "invalid letrec")
+
+  private def evalLetrecStar(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value =
+    args match
+      case Expr.ListExpr(bindingsExpr, _) :: body if body.nonEmpty =>
+        val bindings     = readBindings(bindingsExpr)
+        val letrecEnv    = Env.child(env, Nil)
+        val letrecMacros = MacroScope.child(macros)
+
+        bindings.foreach { case (name, valueExpr) =>
+          letrecEnv.define(name, Value.Void)
+          letrecEnv.assign(name, eval(valueExpr, letrecEnv, letrecMacros), valueExpr.pos)
+        }
+
+        evalSequence(body, letrecEnv, letrecMacros)
+      case _ =>
+        throw EvalError.at(pos, "invalid letrec*")
+
   private def evalCond(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value =
     args match
       case Nil => Value.Void
@@ -229,6 +183,34 @@ private[ming] object SchemeInterpreter:
         else evalCond(rest, env, macros, pos)
       case _ =>
         throw EvalError.at(pos, "invalid cond clause")
+
+  private def evalCase(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value =
+    args match
+      case keyExpr :: clauses =>
+        val key = eval(keyExpr, env, macros)
+        evalCaseClauses(key, clauses, env, macros, pos)
+      case _ =>
+        throw EvalError.at(pos, "invalid case")
+
+  private def evalCaseClauses(
+    key: Value,
+    clauses: List[Expr],
+    env: Env,
+    macros: MacroScope,
+    pos: SourcePos
+  ): Value =
+    clauses match
+      case Nil => Value.Void
+      case Expr.ListExpr(Expr.Symbol("else", _) :: body, clausePos) :: rest =>
+        if rest.nonEmpty then throw EvalError.at(clausePos, "case else clause must be last")
+        if body.isEmpty then throw EvalError.at(clausePos, "case else clause requires a body")
+        evalSequence(body, env, macros)
+      case Expr.ListExpr(Expr.ListExpr(datums, _) :: body, _) :: rest =>
+        if body.isEmpty then throw EvalError.at(pos, "case clause requires a body")
+        if datums.exists(datum => EqualityBuiltins.eqvValues(key, quote(datum))) then evalSequence(body, env, macros)
+        else evalCaseClauses(key, rest, env, macros, pos)
+      case _ =>
+        throw EvalError.at(pos, "invalid case clause")
 
   private def evalQuote(args: List[Expr], pos: SourcePos): Value =
     args match

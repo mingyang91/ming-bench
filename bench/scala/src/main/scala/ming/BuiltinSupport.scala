@@ -111,6 +111,15 @@ private[ming] object BuiltinSupport:
           s"$context expected character, got ${SchemeInterpreter.render(other)}"
         )
 
+  def asVector(value: Value, context: String, pos: SourcePos): Value.Vector =
+    value match
+      case vector: Value.Vector => vector
+      case other =>
+        fail(
+          pos,
+          s"$context expected vector, got ${SchemeInterpreter.render(other)}"
+        )
+
   def asSymbol(value: Value, context: String, pos: SourcePos): String =
     value match
       case Value.Symbol(name) => name
@@ -135,6 +144,9 @@ private[ming] object BuiltinSupport:
     val number = asExactInteger(value, context, pos)
     if number < 0 || !number.isValidInt then fail(pos, s"$context expected non-negative integer index, got $number")
     number.toInt
+
+  def requireIndexInRange(index: Int, length: Int, context: String, pos: SourcePos): Unit =
+    if index < 0 || index >= length then fail(pos, s"$context index out of bounds")
 
   def divide(
     left: SchemeNumber,

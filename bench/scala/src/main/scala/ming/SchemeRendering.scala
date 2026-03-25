@@ -17,6 +17,7 @@ private[ming] object SchemeRendering:
       case Value.Symbol(name)         => name
       case Value.EmptyList            => "()"
       case pair: Value.Pair           => renderPair(pair, render)
+      case vector: Value.Vector       => renderVector(vector, render)
       case record: Value.Record       => s"#<record ${record.typeName}>"
       case _: Procedure               => "#<procedure>"
       case Value.Void                 => "#<void>"
@@ -28,6 +29,7 @@ private[ming] object SchemeRendering:
       case Value.Character(value)    => value.toString
       case Value.EmptyList           => "()"
       case pair: Value.Pair          => renderPair(pair, renderDisplay)
+      case vector: Value.Vector      => renderVector(vector, renderDisplay)
       case other                     => render(other)
 
   def renderExpr(expr: Expr): String =
@@ -83,3 +85,9 @@ private[ming] object SchemeRendering:
     loop(value, first = true)
     builder.append(")")
     builder.result()
+
+  private def renderVector(
+    value: Value.Vector,
+    renderValue: Value => String
+  ): String =
+    value.toList.map(renderValue).mkString("#(", " ", ")")
