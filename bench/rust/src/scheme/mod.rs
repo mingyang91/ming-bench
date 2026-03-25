@@ -63,10 +63,16 @@ enum Procedure {
     Lambda(Rc<Lambda>),
 }
 
+#[derive(Debug, Clone)]
+struct LambdaParams {
+    required: Vec<String>,
+    rest: Option<String>,
+}
+
 #[derive(Debug)]
 struct Lambda {
     name: Option<String>,
-    params: Vec<String>,
+    params: LambdaParams,
     body: Vec<Expr>,
     env: EnvRef,
 }
@@ -83,6 +89,15 @@ struct Env {
 #[derive(Debug, Default)]
 struct EvalContext {
     output: String,
+}
+
+impl LambdaParams {
+    fn fixed(required: Vec<String>) -> Self {
+        Self {
+            required,
+            rest: None,
+        }
+    }
 }
 
 impl Value {
@@ -328,6 +343,7 @@ fn builtin_name(name: &str) -> Option<&'static str> {
         ">" => Some(">"),
         "=" => Some("="),
         "<=" => Some("<="),
+        "apply" => Some("apply"),
         "append" => Some("append"),
         "boolean?" => Some("boolean?"),
         "char?" => Some("char?"),
@@ -461,7 +477,7 @@ fn eval_set(
     }
 }
 
-fn parse_define_signature(signature: &Expr) -> Result<(String, Vec<String>), EvalError> {
+fn parse_define_signature(signature: &Expr) -> Result<(String, LambdaParams), EvalError> {
     let items = signature
         .list_items()
         .ok_or_else(|| syntax_error(signature.pos, "invalid define form"))?;
@@ -479,15 +495,37 @@ fn parse_define_signature(signature: &Expr) -> Result<(String, Vec<String>), Eva
     Ok((name, params))
 }
 
-fn parse_params(params: &[Expr]) -> Result<Vec<String>, EvalError> {
-    params
-        .iter()
-        .map(|expr| {
-            expr.symbol_name()
-                .map(str::to_string)
-                .ok_or_else(|| syntax_error(expr.pos, "parameter name must be a symbol"))
-        })
-        .collect()
+fn parse_params(params: &[Expr]) -> Result<LambdaParams, EvalError> {
+    let mut required = Vec::new();
+    let mut rest = None;
+    let mut iter = params.iter().peekable();
+
+    while let Some(expr) = iter.next() {
+        match expr.symbol_name() {
+            Some(".") => {
+                let rest_expr = iter
+                    .next()
+                    .ok_or_else(|| syntax_error(expr.pos, "rest parameter requires a name"))?;
+                let rest_name = rest_expr
+                    .symbol_name()
+                    .filter(|name| *name != ".")
+                    .ok_or_else(|| {
+                        syntax_error(rest_expr.pos, "parameter name must be a symbol")
+                    })?;
+
+                if iter.next().is_some() {
+                    return Err(syntax_error(expr.pos, "rest parameter must be last"));
+                }
+
+                rest = Some(rest_name.to_string());
+                break;
+            }
+            Some(name) => required.push(name.to_string()),
+            None => return Err(syntax_error(expr.pos, "parameter name must be a symbol")),
+        }
+    }
+
+    Ok(LambdaParams { required, rest })
 }
 
 fn eval_cond(
@@ -609,7 +647,13 @@ fn eval_named_let(
 
     let (params, values): (Vec<_>, Vec<_>) = bindings.into_iter().unzip();
     let let_env = Env::new_child(env);
-    let lambda = make_lambda(Some(name.to_string()), params, body, &let_env, pos)?;
+    let lambda = make_lambda(
+        Some(name.to_string()),
+        LambdaParams::fixed(params),
+        body,
+        &let_env,
+        pos,
+    )?;
     env_define(&let_env, name.to_string(), lambda.clone());
     apply(lambda, &values, pos, context)
 }
@@ -700,7 +744,7 @@ fn eval_lambda(
 
 fn make_lambda(
     name: Option<String>,
-    params: Vec<String>,
+    params: LambdaParams,
     body: &[Expr],
     env: &EnvRef,
     pos: SourcePos,
@@ -764,18 +808,33 @@ fn apply_lambda(
     pos: SourcePos,
     context: &mut EvalContext,
 ) -> Result<Value, EvalError> {
-    if args.len() != lambda.params.len() {
+    let required_len = lambda.params.required.len();
+    let wrong_arity = match lambda.params.rest {
+        Some(_) => args.len() < required_len,
+        None => args.len() != required_len,
+    };
+
+    if wrong_arity {
+        let expected = match lambda.params.rest {
+            Some(_) => format!("at least {required_len} arguments"),
+            None => format!("exactly {required_len} arguments"),
+        };
+
         return Err(wrong_arg_count(
             pos,
             lambda.name.clone().unwrap_or_else(|| "lambda".into()),
-            format!("exactly {} arguments", lambda.params.len()),
+            expected,
             args.len(),
         ));
     }
 
     let call_env = Env::new_child(&lambda.env);
-    for (param, value) in lambda.params.iter().zip(args.iter()) {
+    for (param, value) in lambda.params.required.iter().zip(args.iter()) {
         env_define(&call_env, param.clone(), value.clone());
+    }
+
+    if let Some(rest) = &lambda.params.rest {
+        env_define(&call_env, rest.clone(), Value::List(args[required_len..].to_vec()));
     }
 
     eval_sequence(&lambda.body, &call_env, pos, context)
@@ -796,6 +855,7 @@ fn apply_builtin(
         ">" => compare(name, args, pos, |left, right| left > right),
         "=" => compare(name, args, pos, |left, right| left == right),
         "<=" => compare(name, args, pos, |left, right| left <= right),
+        "apply" => builtin_apply(args, pos, context),
         "append" => append(args, pos),
         "boolean?" => predicate(args, "boolean?", pos, |value| {
             matches!(value, Value::Boolean(_))
@@ -956,6 +1016,26 @@ fn append(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     }
 
     Ok(Value::List(items))
+}
+
+fn builtin_apply(
+    args: &[Value],
+    pos: SourcePos,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let (operator, rest) = args
+        .split_first()
+        .ok_or_else(|| wrong_arg_count(pos, "apply", "at least 2 arguments", 0))?;
+    let (list_arg, prefix_args) = rest
+        .split_last()
+        .ok_or_else(|| wrong_arg_count(pos, "apply", "at least 2 arguments", 1))?;
+
+    let list_args = expect_list("apply", list_arg, pos)?;
+    let mut expanded_args = Vec::with_capacity(prefix_args.len() + list_args.len());
+    expanded_args.extend(prefix_args.iter().cloned());
+    expanded_args.extend(list_args.iter().cloned());
+
+    apply(operator.clone(), &expanded_args, pos, context)
 }
 
 fn length(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
