@@ -145,7 +145,8 @@ function pairToArray(val: SchemeVal): SchemeVal[] {
 
 class Env {
   private bindings: Map<string, SchemeVal> | null = null;
-  constructor(private parent: Env | null = null) {}
+  private parent: Env | null;
+  constructor(parent: Env | null = null) { this.parent = parent; }
 
   get(name: string, pos?: Pos): SchemeVal {
     if (this.bindings) {
@@ -232,6 +233,17 @@ function mkBounce(fn: () => Bounce): Bounce {
 function runTrampoline(b: Bounce): SchemeVal {
   while (isBounce(b)) b = b.fn();
   return b as SchemeVal;
+}
+
+// Step-limit globals
+let stepLimitActive = false;
+let stepCount = 0;
+let stepMax = 0;
+
+function checkStepLimit(): void {
+  if (stepLimitActive && ++stepCount > stepMax) {
+    throw new EvalError('step limit exceeded');
+  }
 }
 
 let contReentry = false;
@@ -1801,6 +1813,7 @@ function evalQQList(elems: SchemeVal[], env: Env, k: (items: SchemeVal[]) => Bou
 
 function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
  tailLoop: while (true) {
+  checkStepLimit();
   if (expr.tag === 'number' || expr.tag === 'rational' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') {
     return k(expr);
   }
@@ -2754,4 +2767,28 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   const env = makeGlobalEnv();
   const result = runTrampoline(evalSeqCPS(exprs, 0, env, (v) => v));
   return { result: displayVal(result), output: outputBuffer };
+}
+
+export function evalStrWithLimit(input: string, maxSteps: number): string {
+  const tokens = tokenize(input);
+  const exprs = parse(tokens);
+  if (exprs.length === 0) throw new EvalError('no expressions');
+  outputBuffer = '';
+  contReentry = false;
+  callccActive = false;
+  fastPathCont = null;
+  windStack = [];
+  exceptionHandlers = [];
+  syntaxBindingsStack = [];
+  pendingSyntaxRenames = [];
+  stepLimitActive = true;
+  stepCount = 0;
+  stepMax = maxSteps;
+  try {
+    const env = makeGlobalEnv();
+    const result = runTrampoline(evalSeqCPS(exprs, 0, env, (v) => v));
+    return displayVal(result);
+  } finally {
+    stepLimitActive = false;
+  }
 }
