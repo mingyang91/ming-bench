@@ -30,6 +30,10 @@ type charValue rune
 type mutableStringValue struct {
 	runes []rune
 }
+type pairValue struct {
+	car value
+	cdr value
+}
 
 type listValue struct {
 	elements []value
@@ -100,15 +104,34 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define(">", builtinCompare(">"))
 	env.define("=", builtinCompare("="))
 	env.define("<=", builtinCompare("<="))
+	env.define("eq?", builtinEq())
+	env.define("equal?", builtinEqual())
 	env.define("not", builtinNot())
+	env.define("abs", builtinAbs())
+	env.define("modulo", builtinModulo())
+	env.define("remainder", builtinRemainder())
+	env.define("quotient", builtinQuotient())
+	env.define("min", builtinMinMax("min"))
+	env.define("max", builtinMinMax("max"))
+	env.define("expt", builtinExpt())
+	env.define("zero?", builtinIntegerPredicate(func(n int) bool { return n == 0 }))
+	env.define("positive?", builtinIntegerPredicate(func(n int) bool { return n > 0 }))
+	env.define("negative?", builtinIntegerPredicate(func(n int) bool { return n < 0 }))
+	env.define("odd?", builtinIntegerPredicate(func(n int) bool { return n%2 != 0 }))
+	env.define("even?", builtinIntegerPredicate(func(n int) bool { return n%2 == 0 }))
 	env.define("cons", builtinCons())
 	env.define("car", builtinCar())
 	env.define("cdr", builtinCdr())
 	env.define("null?", builtinNull())
 	env.define("list", builtinList())
+	env.define("list?", builtinPredicate(isListValue))
 	env.define("length", builtinLength())
+	env.define("list-ref", builtinListRef())
+	env.define("list-tail", builtinListTail())
 	env.define("append", builtinAppend())
 	env.define("apply", builtinApply())
+	env.define("map", builtinMap())
+	env.define("assoc", builtinAssoc())
 	env.define("string?", builtinPredicate(func(v value) bool {
 		return isStringValue(v)
 	}))
@@ -121,8 +144,7 @@ func baseEnv(ctx *evalContext) *environment {
 		return ok
 	}))
 	env.define("pair?", builtinPredicate(func(v value) bool {
-		list, ok := v.(listValue)
-		return ok && len(list.elements) > 0
+		return isPairValue(v)
 	}))
 	env.define("symbol?", builtinPredicate(func(v value) bool {
 		_, ok := v.(symbolValue)
@@ -145,6 +167,17 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("string-ref", builtinStringRef())
 	env.define("string-copy", builtinStringCopy())
 	env.define("string-set!", builtinStringSet())
+	env.define("string=?", builtinStringCompare("string=?"))
+	env.define("string<?", builtinStringCompare("string<?"))
+	env.define("string-ci=?", builtinStringCIEqual())
+	env.define("string-upcase", builtinStringCase("upcase"))
+	env.define("string-downcase", builtinStringCase("downcase"))
+	env.define("char-alphabetic?", builtinCharPredicate(unicode.IsLetter))
+	env.define("char-numeric?", builtinCharPredicate(unicode.IsDigit))
+	env.define("char-upcase", builtinCharCase("upcase"))
+	env.define("char-downcase", builtinCharCase("downcase"))
+	env.define("char=?", builtinCharCompare("char=?"))
+	env.define("char<?", builtinCharCompare("char<?"))
 	return env
 }
 
@@ -726,7 +759,7 @@ func builtinCons() builtinProc {
 
 		list, ok := args[1].(listValue)
 		if !ok {
-			return nil, &EvalError{Message: "cons expects a list as its second argument"}
+			return &pairValue{car: args[0], cdr: args[1]}, nil
 		}
 
 		elements := make([]value, 0, len(list.elements)+1)
@@ -742,14 +775,17 @@ func builtinCar() builtinProc {
 			return nil, &EvalError{Message: "car expects exactly 1 argument"}
 		}
 
-		list, err := expectListValue(args[0])
-		if err != nil {
-			return nil, err
+		switch v := args[0].(type) {
+		case listValue:
+			if len(v.elements) == 0 {
+				return nil, &EvalError{Message: "car expects a non-empty list"}
+			}
+			return v.elements[0], nil
+		case *pairValue:
+			return v.car, nil
+		default:
+			return nil, &EvalError{Message: "car expects a pair"}
 		}
-		if len(list.elements) == 0 {
-			return nil, &EvalError{Message: "car expects a non-empty list"}
-		}
-		return list.elements[0], nil
 	}
 }
 
@@ -759,14 +795,17 @@ func builtinCdr() builtinProc {
 			return nil, &EvalError{Message: "cdr expects exactly 1 argument"}
 		}
 
-		list, err := expectListValue(args[0])
-		if err != nil {
-			return nil, err
+		switch v := args[0].(type) {
+		case listValue:
+			if len(v.elements) == 0 {
+				return nil, &EvalError{Message: "cdr expects a non-empty list"}
+			}
+			return listValue{elements: copyValues(v.elements[1:])}, nil
+		case *pairValue:
+			return v.cdr, nil
+		default:
+			return nil, &EvalError{Message: "cdr expects a pair"}
 		}
-		if len(list.elements) == 0 {
-			return nil, &EvalError{Message: "cdr expects a non-empty list"}
-		}
-		return listValue{elements: copyValues(list.elements[1:])}, nil
 	}
 }
 
@@ -834,6 +873,256 @@ func builtinApply() builtinProc {
 		combined = append(combined, args[1:len(args)-1]...)
 		combined = append(combined, last.elements...)
 		return applyProcedure(args[0], combined, sourcePos{})
+	}
+}
+
+func builtinMap() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: "map expects a procedure and at least 1 list"}
+		}
+
+		lists := make([]listValue, len(args)-1)
+		limit := -1
+		for i, arg := range args[1:] {
+			list, err := expectListValue(arg)
+			if err != nil {
+				return nil, err
+			}
+			lists[i] = list
+			if limit == -1 || len(list.elements) < limit {
+				limit = len(list.elements)
+			}
+		}
+
+		results := make([]value, 0, limit)
+		callArgs := make([]value, len(lists))
+		for i := 0; i < limit; i++ {
+			for j, list := range lists {
+				callArgs[j] = list.elements[i]
+			}
+			result, err := applyProcedure(args[0], callArgs, sourcePos{})
+			if err != nil {
+				return nil, err
+			}
+			results = append(results, result)
+		}
+
+		return listValue{elements: results}, nil
+	}
+}
+
+func builtinAssoc() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "assoc expects exactly 2 arguments"}
+		}
+
+		alist, err := expectListValue(args[1])
+		if err != nil {
+			return nil, err
+		}
+
+		for _, entry := range alist.elements {
+			key, ok := assocKey(entry)
+			if !ok {
+				return nil, &EvalError{Message: "assoc expects a list of pairs"}
+			}
+			if equalValues(args[0], key) {
+				return entry, nil
+			}
+		}
+
+		return booleanValue(false), nil
+	}
+}
+
+func builtinEq() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "eq? expects exactly 2 arguments"}
+		}
+		return booleanValue(eqValues(args[0], args[1])), nil
+	}
+}
+
+func builtinEqual() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "equal? expects exactly 2 arguments"}
+		}
+		return booleanValue(equalValues(args[0], args[1])), nil
+	}
+}
+
+func builtinAbs() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "abs expects exactly 1 argument"}
+		}
+
+		n, err := expectIntegerValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		if n < 0 {
+			n = -n
+		}
+		return integerValue(n), nil
+	}
+}
+
+func builtinModulo() builtinProc {
+	return func(args []value) (value, error) {
+		dividend, divisor, err := expectIntegerPair("modulo", args)
+		if err != nil {
+			return nil, err
+		}
+
+		remainder := dividend % divisor
+		if remainder != 0 && (remainder > 0) != (divisor > 0) {
+			remainder += divisor
+		}
+		return integerValue(remainder), nil
+	}
+}
+
+func builtinRemainder() builtinProc {
+	return func(args []value) (value, error) {
+		dividend, divisor, err := expectIntegerPair("remainder", args)
+		if err != nil {
+			return nil, err
+		}
+		return integerValue(dividend % divisor), nil
+	}
+}
+
+func builtinQuotient() builtinProc {
+	return func(args []value) (value, error) {
+		dividend, divisor, err := expectIntegerPair("quotient", args)
+		if err != nil {
+			return nil, err
+		}
+		return integerValue(dividend / divisor), nil
+	}
+}
+
+func builtinMinMax(name string) builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%s expects at least 1 argument", name)}
+		}
+
+		best, err := expectIntegerValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		for _, arg := range args[1:] {
+			current, err := expectIntegerValue(arg)
+			if err != nil {
+				return nil, err
+			}
+			if name == "min" {
+				if current < best {
+					best = current
+				}
+			} else if current > best {
+				best = current
+			}
+		}
+
+		return integerValue(best), nil
+	}
+}
+
+func builtinExpt() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "expt expects exactly 2 arguments"}
+		}
+
+		base, err := expectIntegerValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		exponent, err := expectIntegerValue(args[1])
+		if err != nil {
+			return nil, err
+		}
+		if exponent < 0 {
+			return nil, &EvalError{Message: "expt expects a non-negative exponent"}
+		}
+
+		result := 1
+		factor := base
+		for exponent > 0 {
+			if exponent%2 == 1 {
+				result *= factor
+			}
+			exponent /= 2
+			if exponent > 0 {
+				factor *= factor
+			}
+		}
+
+		return integerValue(result), nil
+	}
+}
+
+func builtinIntegerPredicate(check func(int) bool) builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "predicate expects exactly 1 argument"}
+		}
+		n, err := expectIntegerValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return booleanValue(check(n)), nil
+	}
+}
+
+func builtinListRef() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "list-ref expects exactly 2 arguments"}
+		}
+
+		list, err := expectListValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		index, err := expectIntegerValue(args[1])
+		if err != nil {
+			return nil, err
+		}
+		if index < 0 || index >= len(list.elements) {
+			return nil, &EvalError{Message: "list-ref index out of range"}
+		}
+
+		return list.elements[index], nil
+	}
+}
+
+func builtinListTail() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "list-tail expects exactly 2 arguments"}
+		}
+
+		list, err := expectListValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		index, err := expectIntegerValue(args[1])
+		if err != nil {
+			return nil, err
+		}
+		if index < 0 || index > len(list.elements) {
+			return nil, &EvalError{Message: "list-tail index out of range"}
+		}
+
+		return listValue{elements: copyValues(list.elements[index:])}, nil
 	}
 }
 
@@ -1073,6 +1362,153 @@ func builtinStringSet() builtinProc {
 	}
 }
 
+func builtinStringCompare(name string) builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%s expects at least 2 arguments", name)}
+		}
+
+		prev, err := expectStringValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		for _, arg := range args[1:] {
+			current, err := expectStringValue(arg)
+			if err != nil {
+				return nil, err
+			}
+
+			ok := false
+			switch name {
+			case "string=?":
+				ok = prev == current
+			case "string<?":
+				ok = prev < current
+			default:
+				return nil, &EvalError{Message: "unknown string comparison"}
+			}
+			if !ok {
+				return booleanValue(false), nil
+			}
+			prev = current
+		}
+
+		return booleanValue(true), nil
+	}
+}
+
+func builtinStringCIEqual() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: "string-ci=? expects at least 2 arguments"}
+		}
+
+		prev, err := expectStringValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		for _, arg := range args[1:] {
+			current, err := expectStringValue(arg)
+			if err != nil {
+				return nil, err
+			}
+			if !strings.EqualFold(prev, current) {
+				return booleanValue(false), nil
+			}
+			prev = current
+		}
+
+		return booleanValue(true), nil
+	}
+}
+
+func builtinStringCase(name string) builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("string-%s expects exactly 1 argument", name)}
+		}
+
+		runes, err := expectStringRunes(args[0])
+		if err != nil {
+			return nil, err
+		}
+		for i, r := range runes {
+			if name == "upcase" {
+				runes[i] = unicode.ToUpper(r)
+			} else {
+				runes[i] = unicode.ToLower(r)
+			}
+		}
+		return stringValue(string(runes)), nil
+	}
+}
+
+func builtinCharPredicate(check func(rune) bool) builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "predicate expects exactly 1 argument"}
+		}
+
+		char, err := expectCharValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return booleanValue(check(rune(char))), nil
+	}
+}
+
+func builtinCharCase(name string) builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("char-%s expects exactly 1 argument", name)}
+		}
+
+		char, err := expectCharValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		if name == "upcase" {
+			return charValue(unicode.ToUpper(rune(char))), nil
+		}
+		return charValue(unicode.ToLower(rune(char))), nil
+	}
+}
+
+func builtinCharCompare(name string) builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%s expects at least 2 arguments", name)}
+		}
+
+		prev, err := expectCharValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		for _, arg := range args[1:] {
+			current, err := expectCharValue(arg)
+			if err != nil {
+				return nil, err
+			}
+
+			ok := false
+			switch name {
+			case "char=?":
+				ok = prev == current
+			case "char<?":
+				ok = prev < current
+			default:
+				return nil, &EvalError{Message: "unknown character comparison"}
+			}
+			if !ok {
+				return booleanValue(false), nil
+			}
+			prev = current
+		}
+
+		return booleanValue(true), nil
+	}
+}
+
 func expectIntegerValue(v value) (int, error) {
 	n, ok := v.(integerValue)
 	if !ok {
@@ -1202,6 +1638,8 @@ func formatValue(v value) (string, error) {
 		return string(v), nil
 	case charValue:
 		return formatChar(v), nil
+	case *pairValue:
+		return formatPair(v, formatValue)
 	case listValue:
 		if len(v.elements) == 0 {
 			return "()", nil
@@ -1231,6 +1669,8 @@ func formatDisplayValue(v value) (string, error) {
 		return string(v.runes), nil
 	case charValue:
 		return string(rune(v)), nil
+	case *pairValue:
+		return formatPair(v, formatDisplayValue)
 	case listValue:
 		if len(v.elements) == 0 {
 			return "()", nil
@@ -1250,6 +1690,38 @@ func formatDisplayValue(v value) (string, error) {
 	}
 }
 
+func formatPair(v *pairValue, formatter func(value) (string, error)) (string, error) {
+	parts := []string{}
+	current := v
+	for {
+		head, err := formatter(current.car)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, head)
+
+		switch tail := current.cdr.(type) {
+		case *pairValue:
+			current = tail
+		case listValue:
+			for _, element := range tail.elements {
+				formatted, err := formatter(element)
+				if err != nil {
+					return "", err
+				}
+				parts = append(parts, formatted)
+			}
+			return "(" + strings.Join(parts, " ") + ")", nil
+		default:
+			formattedTail, err := formatter(tail)
+			if err != nil {
+				return "", err
+			}
+			return "(" + strings.Join(parts, " ") + " . " + formattedTail + ")", nil
+		}
+	}
+}
+
 func formatChar(v charValue) string {
 	switch rune(v) {
 	case ' ':
@@ -1264,6 +1736,135 @@ func formatChar(v charValue) string {
 func isTruthy(v value) bool {
 	b, ok := v.(booleanValue)
 	return !ok || bool(b)
+}
+
+func isListValue(v value) bool {
+	_, ok := v.(listValue)
+	return ok
+}
+
+func isPairValue(v value) bool {
+	switch v := v.(type) {
+	case listValue:
+		return len(v.elements) > 0
+	case *pairValue:
+		return true
+	default:
+		return false
+	}
+}
+
+func expectIntegerPair(name string, args []value) (int, int, error) {
+	if len(args) != 2 {
+		return 0, 0, &EvalError{Message: fmt.Sprintf("%s expects exactly 2 arguments", name)}
+	}
+
+	first, err := expectIntegerValue(args[0])
+	if err != nil {
+		return 0, 0, err
+	}
+	second, err := expectIntegerValue(args[1])
+	if err != nil {
+		return 0, 0, err
+	}
+	if second == 0 {
+		return 0, 0, &EvalError{Message: "division by zero"}
+	}
+
+	return first, second, nil
+}
+
+func assocKey(v value) (value, bool) {
+	switch pair := v.(type) {
+	case listValue:
+		if len(pair.elements) == 0 {
+			return nil, false
+		}
+		return pair.elements[0], true
+	case *pairValue:
+		return pair.car, true
+	default:
+		return nil, false
+	}
+}
+
+func eqValues(left, right value) bool {
+	switch left := left.(type) {
+	case integerValue:
+		right, ok := right.(integerValue)
+		return ok && left == right
+	case booleanValue:
+		right, ok := right.(booleanValue)
+		return ok && left == right
+	case stringValue:
+		right, ok := right.(stringValue)
+		return ok && left == right
+	case symbolValue:
+		right, ok := right.(symbolValue)
+		return ok && left == right
+	case charValue:
+		right, ok := right.(charValue)
+		return ok && left == right
+	case *mutableStringValue:
+		right, ok := right.(*mutableStringValue)
+		return ok && left == right
+	case listValue:
+		right, ok := right.(listValue)
+		return ok && len(left.elements) == 0 && len(right.elements) == 0
+	case *pairValue:
+		right, ok := right.(*pairValue)
+		return ok && left == right
+	case *closureValue:
+		right, ok := right.(*closureValue)
+		return ok && left == right
+	case voidValue:
+		_, ok := right.(voidValue)
+		return ok
+	default:
+		return false
+	}
+}
+
+func equalValues(left, right value) bool {
+	switch left := left.(type) {
+	case integerValue:
+		right, ok := right.(integerValue)
+		return ok && left == right
+	case booleanValue:
+		right, ok := right.(booleanValue)
+		return ok && left == right
+	case stringValue:
+		right, ok := right.(stringValue)
+		return ok && left == right
+	case symbolValue:
+		right, ok := right.(symbolValue)
+		return ok && left == right
+	case charValue:
+		right, ok := right.(charValue)
+		return ok && left == right
+	case *mutableStringValue:
+		right, ok := right.(*mutableStringValue)
+		return ok && string(left.runes) == string(right.runes)
+	case listValue:
+		right, ok := right.(listValue)
+		if !ok || len(left.elements) != len(right.elements) {
+			return false
+		}
+		for i, element := range left.elements {
+			if !equalValues(element, right.elements[i]) {
+				return false
+			}
+		}
+		return true
+	case *pairValue:
+		right, ok := right.(*pairValue)
+		return ok && equalValues(left.car, right.car) && equalValues(left.cdr, right.cdr)
+	case voidValue:
+		_, ok := right.(voidValue)
+		return ok
+	default:
+		return false
+	}
 }
 
 func symbolName(expr node) (string, bool) {
