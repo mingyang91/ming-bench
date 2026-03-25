@@ -1,11 +1,13 @@
-use super::{
-    apply, compare, compare_chars, compare_strings, expect_char, expect_list,
-    expect_non_negative_integer, expect_number, expect_numbers, expect_string,
-    expect_string_values, expect_symbol, expect_two_numbers, invalid_argument, make_string_value,
-    number_error, number_predicate, predicate, type_mismatch, wrong_arg_count, EvalContext,
-    EvalError, Number, PairValue, SourcePos, Value,
+use super::builtin_helpers::{
+    compare, compare_chars, compare_strings, expect_char, expect_list, expect_non_negative_integer,
+    expect_number, expect_numbers, expect_string, expect_string_values, expect_symbol,
+    expect_two_numbers, expect_vector, number_predicate, predicate,
 };
-use super::value_ops::{byte_index_for_char, equal_value};
+use super::value_ops::{byte_index_for_char, eq_value, equal_value, eqv_value};
+use super::{
+    apply, invalid_argument, make_string_value, make_vector_value, number_error, type_mismatch,
+    wrong_arg_count, EvalContext, EvalError, Number, PairValue, SourcePos, Value,
+};
 
 pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
     match name {
@@ -34,6 +36,7 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "cons" => Some("cons"),
         "display" => Some("display"),
         "eq?" => Some("eq?"),
+        "eqv?" => Some("eqv?"),
         "exact?" => Some("exact?"),
         "exact->inexact" => Some("exact->inexact"),
         "equal?" => Some("equal?"),
@@ -49,6 +52,7 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "list?" => Some("list?"),
         "map" => Some("map"),
         "max" => Some("max"),
+        "make-vector" => Some("make-vector"),
         "min" => Some("min"),
         "modulo" => Some("modulo"),
         "negative?" => Some("negative?"),
@@ -82,6 +86,13 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "symbol?" => Some("symbol?"),
         "numerator" => Some("numerator"),
         "denominator" => Some("denominator"),
+        "list->vector" => Some("list->vector"),
+        "vector" => Some("vector"),
+        "vector->list" => Some("vector->list"),
+        "vector-length" => Some("vector-length"),
+        "vector-ref" => Some("vector-ref"),
+        "vector-set!" => Some("vector-set!"),
+        "vector?" => Some("vector?"),
         "write" => Some("write"),
         "zero?" => Some("zero?"),
         _ => None,
@@ -135,6 +146,7 @@ pub(super) fn apply_builtin(
         "denominator" => denominator(args, pos),
         "display" => display(args, pos, context),
         "eq?" => eq_predicate(args, pos),
+        "eqv?" => eqv_predicate(args, pos),
         "exact?" => predicate(
             args,
             "exact?",
@@ -165,8 +177,10 @@ pub(super) fn apply_builtin(
         "list-ref" => list_ref(args, pos),
         "list-tail" => list_tail(args, pos),
         "list?" => predicate(args, "list?", pos, |value| matches!(value, Value::List(_))),
+        "list->vector" => list_to_vector(args, pos),
         "map" => builtin_map(args, pos, context),
         "max" => max_value(args, pos),
+        "make-vector" => make_vector(args, pos),
         "min" => min_value(args, pos),
         "modulo" => modulo(args, pos),
         "negative?" => number_predicate(args, "negative?", pos, |value| {
@@ -225,6 +239,14 @@ pub(super) fn apply_builtin(
         "symbol->string" => symbol_to_string(args, pos),
         "symbol?" => predicate(args, "symbol?", pos, |value| {
             matches!(value, Value::Symbol(_))
+        }),
+        "vector" => Ok(make_vector_value(args.to_vec())),
+        "vector->list" => vector_to_list(args, pos),
+        "vector-length" => vector_length(args, pos),
+        "vector-ref" => vector_ref(args, pos),
+        "vector-set!" => vector_set(args, pos),
+        "vector?" => predicate(args, "vector?", pos, |value| {
+            matches!(value, Value::Vector(_))
         }),
         "write" => write(args, pos, context),
         "zero?" => number_predicate(args, "zero?", pos, |value| {
@@ -546,6 +568,20 @@ fn list_tail(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
             pos,
             "list-tail",
             "exactly 2 arguments",
+            args.len(),
+        )),
+    }
+}
+
+fn list_to_vector(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [list] => Ok(make_vector_value(
+            expect_list("list->vector", list, pos)?.to_vec(),
+        )),
+        _ => Err(wrong_arg_count(
+            pos,
+            "list->vector",
+            "exactly 1 argument",
             args.len(),
         )),
     }
@@ -959,10 +995,22 @@ fn char_downcase(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
 
 fn eq_predicate(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     match args {
-        [left, right] => Ok(Value::Boolean(equal_value(left, right))),
+        [left, right] => Ok(Value::Boolean(eq_value(left, right))),
         _ => Err(wrong_arg_count(
             pos,
             "eq?",
+            "exactly 2 arguments",
+            args.len(),
+        )),
+    }
+}
+
+fn eqv_predicate(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [left, right] => Ok(Value::Boolean(eqv_value(left, right))),
+        _ => Err(wrong_arg_count(
+            pos,
+            "eqv?",
             "exactly 2 arguments",
             args.len(),
         )),
@@ -976,6 +1024,110 @@ fn equal_predicate(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
             pos,
             "equal?",
             "exactly 2 arguments",
+            args.len(),
+        )),
+    }
+}
+
+fn make_vector(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [length] => {
+            let length = expect_non_negative_integer("make-vector", length, pos, "length")?;
+            Ok(make_vector_value(vec![Value::Void; length]))
+        }
+        [length, fill] => {
+            let length = expect_non_negative_integer("make-vector", length, pos, "length")?;
+            Ok(make_vector_value(vec![fill.clone(); length]))
+        }
+        _ => Err(wrong_arg_count(
+            pos,
+            "make-vector",
+            "1 or 2 arguments",
+            args.len(),
+        )),
+    }
+}
+
+fn vector_length(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [vector] => Ok(Value::Number(Number::exact_integer(
+            expect_vector("vector-length", vector, pos)?.borrow().len() as i64,
+        ))),
+        _ => Err(wrong_arg_count(
+            pos,
+            "vector-length",
+            "exactly 1 argument",
+            args.len(),
+        )),
+    }
+}
+
+fn vector_ref(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [vector, index] => {
+            let vector = expect_vector("vector-ref", vector, pos)?;
+            let index = expect_non_negative_integer("vector-ref", index, pos, "index")?;
+            let vector = vector.borrow();
+
+            vector.get(index).cloned().ok_or_else(|| {
+                invalid_argument(
+                    pos,
+                    "vector-ref",
+                    format!(
+                        "index {index} out of range for vector of length {}",
+                        vector.len()
+                    ),
+                )
+            })
+        }
+        _ => Err(wrong_arg_count(
+            pos,
+            "vector-ref",
+            "exactly 2 arguments",
+            args.len(),
+        )),
+    }
+}
+
+fn vector_set(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [vector, index, value] => {
+            let vector = expect_vector("vector-set!", vector, pos)?;
+            let index = expect_non_negative_integer("vector-set!", index, pos, "index")?;
+            let mut vector = vector.borrow_mut();
+
+            if index >= vector.len() {
+                return Err(invalid_argument(
+                    pos,
+                    "vector-set!",
+                    format!(
+                        "index {index} out of range for vector of length {}",
+                        vector.len()
+                    ),
+                ));
+            }
+
+            vector[index] = value.clone();
+            Ok(Value::Void)
+        }
+        _ => Err(wrong_arg_count(
+            pos,
+            "vector-set!",
+            "exactly 3 arguments",
+            args.len(),
+        )),
+    }
+}
+
+fn vector_to_list(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [vector] => Ok(Value::List(
+            expect_vector("vector->list", vector, pos)?.borrow().clone(),
+        )),
+        _ => Err(wrong_arg_count(
+            pos,
+            "vector->list",
+            "exactly 1 argument",
             args.len(),
         )),
     }

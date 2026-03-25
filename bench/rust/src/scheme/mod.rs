@@ -1,3 +1,4 @@
+mod builtin_helpers;
 mod builtins;
 pub mod error;
 mod macros;
@@ -10,7 +11,9 @@ pub use error::{EvalError, SourcePos};
 use self::builtins::builtin_name;
 use self::macros::{expand_macro_call, parse_syntax_rules};
 use self::number::{parse_number_literal, Number, NumberError};
-use self::value_ops::{render_char, render_list, render_pair, render_string, value_type_name};
+use self::value_ops::{
+    eqv_value, render_char, render_list, render_pair, render_string, render_vector, value_type_name,
+};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
@@ -62,9 +65,11 @@ enum Value {
     Symbol(String),
     List(Vec<Value>),
     Pair(Box<PairValue>),
+    Vector(VectorRef),
     Record(Rc<RecordValue>),
     Procedure(Procedure),
     Void,
+    Uninitialized,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +127,7 @@ struct RecordValue {
 type EnvRef = Rc<RefCell<Env>>;
 type EnvWeak = Weak<RefCell<Env>>;
 type StringRef = Rc<RefCell<String>>;
+type VectorRef = Rc<RefCell<Vec<Value>>>;
 type BindingRef = Rc<RefCell<Value>>;
 type MacroRef = Rc<MacroTransformer>;
 
@@ -197,9 +203,11 @@ impl Value {
             Self::List(items) if items.is_empty() => "null",
             Self::List(_) => "pair",
             Self::Pair(_) => "pair",
+            Self::Vector(_) => "vector",
             Self::Record(_) => "record",
             Self::Procedure(_) => "procedure",
             Self::Void => "void",
+            Self::Uninitialized => "undefined",
         }
     }
 
@@ -227,9 +235,11 @@ impl Value {
             Self::Symbol(value) => value.clone(),
             Self::List(items) => render_list(items, mode),
             Self::Pair(pair) => render_pair(&pair.car, &pair.cdr, mode),
+            Self::Vector(values) => render_vector(&values.borrow(), mode),
             Self::Record(record) => format!("#<record {}>", record.record_type.type_name),
             Self::Procedure(_) => "#<procedure>".into(),
             Self::Void => "#<void>".into(),
+            Self::Uninitialized => "#<undefined>".into(),
         }
     }
 }
@@ -317,6 +327,10 @@ fn make_string_value(value: impl Into<String>) -> Value {
     Value::String(Rc::new(RefCell::new(value.into())))
 }
 
+fn make_vector_value(values: Vec<Value>) -> Value {
+    Value::Vector(Rc::new(RefCell::new(values)))
+}
+
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 ///
@@ -370,8 +384,16 @@ fn eval_expr(expr: &Expr, env: &EnvRef, context: &mut EvalContext) -> Result<Val
 }
 
 fn lookup_symbol(env: &EnvRef, name: &str, pos: SourcePos) -> Result<Value, EvalError> {
-    if let Some(value) = env_lookup(env, name) {
-        return Ok(value);
+    if let Some(cell) = env_lookup_cell(env, name) {
+        let value = cell.borrow().clone();
+        return if matches!(value, Value::Uninitialized) {
+            Err(EvalError::UninitializedBinding {
+                pos,
+                name: name.to_string(),
+            })
+        } else {
+            Ok(value)
+        };
     }
 
     if let Some(name) = builtin_name(name) {
@@ -404,10 +426,6 @@ fn env_lookup_cell(env: &EnvRef, name: &str) -> Option<BindingRef> {
     }
 
     None
-}
-
-fn env_lookup(env: &EnvRef, name: &str) -> Option<Value> {
-    env_lookup_cell(env, name).map(|cell| cell.borrow().clone())
 }
 
 fn env_define(env: &EnvRef, name: String, value: Value) {
@@ -473,13 +491,17 @@ fn eval_list(
         let form_pos = items[0].pos;
         match name {
             "begin" => return eval_begin(&items[1..], env, form_pos, context),
+            "case" => return eval_case(&items[1..], env, form_pos, context),
             "case-lambda" => return eval_case_lambda(&items[1..], env, form_pos),
             "cond" => return eval_cond(&items[1..], env, context),
             "define" => return eval_define(&items[1..], env, form_pos, context),
             "define-record-type" => return eval_define_record_type(&items[1..], env, form_pos),
             "define-syntax" => return eval_define_syntax(&items[1..], env, form_pos),
+            "do" => return eval_do(&items[1..], env, form_pos, context),
             "if" => return eval_if(&items[1..], env, form_pos, context),
             "let" => return eval_let(&items[1..], env, form_pos, context),
+            "letrec" => return eval_letrec(&items[1..], env, form_pos, context, false),
+            "letrec*" => return eval_letrec(&items[1..], env, form_pos, context, true),
             "quote" => return eval_quote(&items[1..], form_pos),
             "set!" => return eval_set(&items[1..], env, form_pos, context),
             "lambda" => return eval_lambda(None, &items[1..], env, form_pos),
@@ -794,6 +816,60 @@ fn eval_cond(
     Ok(Value::Void)
 }
 
+fn eval_case(
+    args: &[Expr],
+    env: &EnvRef,
+    pos: SourcePos,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let (key_expr, clauses) = args
+        .split_first()
+        .ok_or_else(|| syntax_error(pos, "case requires a key and at least one clause"))?;
+
+    if clauses.is_empty() {
+        return Err(syntax_error(pos, "case requires at least one clause"));
+    }
+
+    let key = eval_expr(key_expr, env, context)?;
+
+    for (index, clause) in clauses.iter().enumerate() {
+        let items = clause
+            .list_items()
+            .ok_or_else(|| syntax_error(clause.pos, "case clauses must be lists"))?;
+        let (head, body) = items
+            .split_first()
+            .ok_or_else(|| syntax_error(clause.pos, "case clause cannot be empty"))?;
+
+        if head.symbol_name() == Some("else") {
+            if index + 1 != clauses.len() {
+                return Err(syntax_error(head.pos, "else clause must be last"));
+            }
+
+            return if body.is_empty() {
+                Ok(Value::Void)
+            } else {
+                eval_sequence(body, env, clause.pos, context)
+            };
+        }
+
+        let datums = head
+            .list_items()
+            .ok_or_else(|| syntax_error(head.pos, "case datums must be a list"))?;
+
+        for datum in datums {
+            if eqv_value(&key, &quote_expr(datum)?) {
+                return if body.is_empty() {
+                    Ok(Value::Void)
+                } else {
+                    eval_sequence(body, env, clause.pos, context)
+                };
+            }
+        }
+    }
+
+    Ok(Value::Void)
+}
+
 fn eval_if(
     args: &[Expr],
     env: &EnvRef,
@@ -801,6 +877,13 @@ fn eval_if(
     context: &mut EvalContext,
 ) -> Result<Value, EvalError> {
     match args {
+        [condition, when_true] => {
+            if eval_expr(condition, env, context)?.is_truthy() {
+                eval_expr(when_true, env, context)
+            } else {
+                Ok(Value::Void)
+            }
+        }
         [condition, when_true, when_false] => {
             if eval_expr(condition, env, context)?.is_truthy() {
                 eval_expr(when_true, env, context)
@@ -808,12 +891,76 @@ fn eval_if(
                 eval_expr(when_false, env, context)
             }
         }
-        _ => Err(wrong_arg_count(
-            pos,
-            "if",
-            "exactly 3 arguments",
-            args.len(),
-        )),
+        _ => Err(wrong_arg_count(pos, "if", "2 or 3 arguments", args.len())),
+    }
+}
+
+fn eval_do(
+    args: &[Expr],
+    env: &EnvRef,
+    pos: SourcePos,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let (bindings_expr, rest) = args
+        .split_first()
+        .ok_or_else(|| syntax_error(pos, "do requires bindings and a test clause"))?;
+    let (test_clause_expr, body) = rest
+        .split_first()
+        .ok_or_else(|| syntax_error(pos, "do requires a test clause"))?;
+
+    let bindings = bindings_expr
+        .list_items()
+        .ok_or_else(|| syntax_error(bindings_expr.pos, "do bindings must be a list"))?;
+    let test_clause = test_clause_expr
+        .list_items()
+        .ok_or_else(|| syntax_error(test_clause_expr.pos, "do test clause must be a list"))?;
+    let (test_expr, exit_exprs) = test_clause
+        .split_first()
+        .ok_or_else(|| syntax_error(test_clause_expr.pos, "do test clause cannot be empty"))?;
+
+    let bindings = bindings
+        .iter()
+        .map(parse_do_binding)
+        .collect::<Result<Vec<_>, _>>()?;
+    let init_values = bindings
+        .iter()
+        .map(|(_, init, _)| eval_expr(init, env, context))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let do_env = Env::new_child(env);
+    let mut cells = Vec::with_capacity(bindings.len());
+
+    for ((name, _, _), value) in bindings.iter().zip(init_values.into_iter()) {
+        env_define(&do_env, name.clone(), value);
+        let cell = env_lookup_cell(&do_env, name).expect("binding defined in current scope");
+        cells.push(cell);
+    }
+
+    loop {
+        if eval_expr(test_expr, &do_env, context)?.is_truthy() {
+            return if exit_exprs.is_empty() {
+                Ok(Value::Void)
+            } else {
+                eval_sequence(exit_exprs, &do_env, test_clause_expr.pos, context)
+            };
+        }
+
+        if !body.is_empty() {
+            let _ = eval_sequence(body, &do_env, pos, context)?;
+        }
+
+        let next_values = bindings
+            .iter()
+            .zip(cells.iter())
+            .map(|((_, _, step), cell)| match step {
+                Some(step) => eval_expr(step, &do_env, context),
+                None => Ok(cell.borrow().clone()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (cell, value) in cells.iter().zip(next_values.into_iter()) {
+            *cell.borrow_mut() = value;
+        }
     }
 }
 
@@ -890,6 +1037,53 @@ fn eval_named_let(
     apply(lambda, &values, pos, context)
 }
 
+fn eval_letrec(
+    args: &[Expr],
+    env: &EnvRef,
+    pos: SourcePos,
+    context: &mut EvalContext,
+    sequential: bool,
+) -> Result<Value, EvalError> {
+    let (bindings_expr, body) = args
+        .split_first()
+        .ok_or_else(|| syntax_error(pos, "letrec requires bindings and a body"))?;
+
+    if body.is_empty() {
+        return Err(syntax_error(pos, "letrec requires a body"));
+    }
+
+    let bindings = bindings_expr
+        .list_items()
+        .ok_or_else(|| syntax_error(bindings_expr.pos, "letrec bindings must be a list"))?;
+    let bindings = bindings
+        .iter()
+        .map(|binding| parse_value_binding(binding, "letrec"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let letrec_env = Env::new_child(env);
+    for (name, _) in &bindings {
+        env_define(&letrec_env, name.clone(), Value::Uninitialized);
+    }
+
+    if sequential {
+        for (name, value_expr) in &bindings {
+            let value = eval_expr(value_expr, &letrec_env, context)?;
+            env_set(&letrec_env, name, value);
+        }
+    } else {
+        let values = bindings
+            .iter()
+            .map(|(_, value_expr)| eval_expr(value_expr, &letrec_env, context))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for ((name, _), value) in bindings.iter().zip(values.into_iter()) {
+            env_set(&letrec_env, name, value);
+        }
+    }
+
+    eval_sequence(body, &letrec_env, pos, context)
+}
+
 fn eval_bindings(
     bindings: &[Expr],
     env: &EnvRef,
@@ -923,6 +1117,53 @@ fn eval_bindings(
             }
         })
         .collect()
+}
+
+fn parse_value_binding(binding: &Expr, form_name: &str) -> Result<(String, Expr), EvalError> {
+    let items = binding
+        .list_items()
+        .ok_or_else(|| syntax_error(binding.pos, format!("{form_name} bindings must be lists")))?;
+
+    match items {
+        [name_expr, value_expr] => {
+            let name = name_expr
+                .symbol_name()
+                .ok_or_else(|| syntax_error(name_expr.pos, "binding name must be a symbol"))?
+                .to_string();
+            Ok((name, value_expr.clone()))
+        }
+        _ => Err(syntax_error(
+            binding.pos,
+            format!("each {form_name} binding must contain a name and value"),
+        )),
+    }
+}
+
+fn parse_do_binding(binding: &Expr) -> Result<(String, Expr, Option<Expr>), EvalError> {
+    let items = binding
+        .list_items()
+        .ok_or_else(|| syntax_error(binding.pos, "do bindings must be lists"))?;
+
+    match items {
+        [name_expr, init_expr] => {
+            let name = name_expr
+                .symbol_name()
+                .ok_or_else(|| syntax_error(name_expr.pos, "do binding name must be a symbol"))?
+                .to_string();
+            Ok((name, init_expr.clone(), None))
+        }
+        [name_expr, init_expr, step_expr] => {
+            let name = name_expr
+                .symbol_name()
+                .ok_or_else(|| syntax_error(name_expr.pos, "do binding name must be a symbol"))?
+                .to_string();
+            Ok((name, init_expr.clone(), Some(step_expr.clone())))
+        }
+        _ => Err(syntax_error(
+            binding.pos,
+            "each do binding must contain a name, init, and optional step",
+        )),
+    }
 }
 
 fn eval_quote(args: &[Expr], pos: SourcePos) -> Result<Value, EvalError> {
@@ -1218,193 +1459,6 @@ fn apply_record_accessor(
             value_type_name(other),
         )),
         _ => Err(wrong_arg_count(pos, name, "exactly 1 argument", args.len())),
-    }
-}
-
-fn number_predicate<F>(
-    args: &[Value],
-    name: &str,
-    pos: SourcePos,
-    test: F,
-) -> Result<Value, EvalError>
-where
-    F: Fn(&Number) -> Result<bool, EvalError>,
-{
-    match args {
-        [value] => Ok(Value::Boolean(test(&expect_number(name, value, pos)?)?)),
-        _ => Err(wrong_arg_count(pos, name, "exactly 1 argument", args.len())),
-    }
-}
-
-fn predicate<F>(args: &[Value], name: &str, pos: SourcePos, test: F) -> Result<Value, EvalError>
-where
-    F: Fn(&Value) -> bool,
-{
-    match args {
-        [value] => Ok(Value::Boolean(test(value))),
-        _ => Err(wrong_arg_count(pos, name, "exactly 1 argument", args.len())),
-    }
-}
-
-fn compare<F>(name: &str, args: &[Value], pos: SourcePos, predicate: F) -> Result<Value, EvalError>
-where
-    F: Fn(&Number, &Number) -> bool,
-{
-    let values = expect_numbers(name, args, pos)?;
-    if values.len() < 2 {
-        return Err(wrong_arg_count(
-            pos,
-            name,
-            "at least 2 arguments",
-            values.len(),
-        ));
-    }
-
-    let result = values.windows(2).all(|pair| predicate(&pair[0], &pair[1]));
-    Ok(Value::Boolean(result))
-}
-
-fn compare_chars<F>(
-    name: &str,
-    args: &[Value],
-    pos: SourcePos,
-    predicate: F,
-) -> Result<Value, EvalError>
-where
-    F: Fn(char, char) -> bool,
-{
-    let values = expect_chars(name, args, pos)?;
-    if values.len() < 2 {
-        return Err(wrong_arg_count(
-            pos,
-            name,
-            "at least 2 arguments",
-            values.len(),
-        ));
-    }
-
-    let result = values.windows(2).all(|pair| predicate(pair[0], pair[1]));
-    Ok(Value::Boolean(result))
-}
-
-fn compare_strings<F>(
-    name: &str,
-    args: &[Value],
-    pos: SourcePos,
-    predicate: F,
-) -> Result<Value, EvalError>
-where
-    F: Fn(&str, &str) -> bool,
-{
-    let values = expect_string_values(name, args, pos)?;
-    if values.len() < 2 {
-        return Err(wrong_arg_count(
-            pos,
-            name,
-            "at least 2 arguments",
-            values.len(),
-        ));
-    }
-
-    let result = values
-        .windows(2)
-        .all(|pair| predicate(pair[0].as_str(), pair[1].as_str()));
-    Ok(Value::Boolean(result))
-}
-
-fn expect_number(name: &str, value: &Value, pos: SourcePos) -> Result<Number, EvalError> {
-    match value {
-        Value::Number(number) => Ok(*number),
-        other => Err(type_mismatch(pos, name, "number", other.type_name())),
-    }
-}
-
-fn expect_numbers(name: &str, args: &[Value], pos: SourcePos) -> Result<Vec<Number>, EvalError> {
-    args.iter()
-        .map(|value| expect_number(name, value, pos))
-        .collect()
-}
-
-fn expect_two_numbers(
-    name: &str,
-    args: &[Value],
-    pos: SourcePos,
-) -> Result<(Number, Number), EvalError> {
-    match args {
-        [left, right] => Ok((
-            expect_number(name, left, pos)?,
-            expect_number(name, right, pos)?,
-        )),
-        _ => Err(wrong_arg_count(
-            pos,
-            name,
-            "exactly 2 arguments",
-            args.len(),
-        )),
-    }
-}
-
-fn expect_char(name: &str, value: &Value, pos: SourcePos) -> Result<char, EvalError> {
-    match value {
-        Value::Character(ch) => Ok(*ch),
-        other => Err(type_mismatch(pos, name, "char", other.type_name())),
-    }
-}
-
-fn expect_chars(name: &str, args: &[Value], pos: SourcePos) -> Result<Vec<char>, EvalError> {
-    args.iter()
-        .map(|value| expect_char(name, value, pos))
-        .collect()
-}
-
-fn expect_string(name: &str, value: &Value, pos: SourcePos) -> Result<StringRef, EvalError> {
-    match value {
-        Value::String(value) => Ok(Rc::clone(value)),
-        other => Err(type_mismatch(pos, name, "string", other.type_name())),
-    }
-}
-
-fn expect_string_values(
-    name: &str,
-    args: &[Value],
-    pos: SourcePos,
-) -> Result<Vec<String>, EvalError> {
-    args.iter()
-        .map(|value| Ok(expect_string(name, value, pos)?.borrow().clone()))
-        .collect()
-}
-
-fn expect_symbol<'a>(name: &str, value: &'a Value, pos: SourcePos) -> Result<&'a str, EvalError> {
-    match value {
-        Value::Symbol(value) => Ok(value),
-        other => Err(type_mismatch(pos, name, "symbol", other.type_name())),
-    }
-}
-
-fn expect_non_negative_integer(
-    name: &str,
-    value: &Value,
-    pos: SourcePos,
-    label: &str,
-) -> Result<usize, EvalError> {
-    match value {
-        Value::Number(number) => match number.exact_integer_value() {
-            Some(number) if number >= 0 => Ok(number as usize),
-            Some(number) => Err(invalid_argument(
-                pos,
-                name,
-                format!("{label} must be non-negative, got {number}"),
-            )),
-            None => Err(type_mismatch(pos, name, "exact integer", "number")),
-        },
-        other => Err(type_mismatch(pos, name, "exact integer", other.type_name())),
-    }
-}
-
-fn expect_list<'a>(name: &str, value: &'a Value, pos: SourcePos) -> Result<&'a [Value], EvalError> {
-    match value {
-        Value::List(items) => Ok(items),
-        other => Err(type_mismatch(pos, name, "list", other.type_name())),
     }
 }
 

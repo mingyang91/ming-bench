@@ -8,6 +8,106 @@ pub(super) fn value_type_name(value: &Value) -> String {
     }
 }
 
+pub(super) fn eq_value(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => left == right,
+        (Value::Boolean(left), Value::Boolean(right)) => left == right,
+        (Value::Character(left), Value::Character(right)) => left == right,
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::List(left), Value::List(right)) => left.is_empty() && right.is_empty(),
+        (Value::String(left), Value::String(right)) => Rc::ptr_eq(left, right),
+        (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
+        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
+        (Value::Void, Value::Void) => true,
+        (
+            Value::Procedure(Procedure::Builtin(left)),
+            Value::Procedure(Procedure::Builtin(right)),
+        ) => left == right,
+        (Value::Procedure(Procedure::Lambda(left)), Value::Procedure(Procedure::Lambda(right))) => {
+            Rc::ptr_eq(left, right)
+        }
+        (
+            Value::Procedure(Procedure::CaseLambda(left)),
+            Value::Procedure(Procedure::CaseLambda(right)),
+        ) => Rc::ptr_eq(left, right),
+        (
+            Value::Procedure(Procedure::RecordConstructor(left)),
+            Value::Procedure(Procedure::RecordConstructor(right)),
+        ) => Rc::ptr_eq(left, right),
+        (
+            Value::Procedure(Procedure::RecordPredicate(left)),
+            Value::Procedure(Procedure::RecordPredicate(right)),
+        ) => Rc::ptr_eq(left, right),
+        (
+            Value::Procedure(Procedure::RecordAccessor {
+                record_type: left_record_type,
+                field_index: left_field_index,
+                name: left_name,
+            }),
+            Value::Procedure(Procedure::RecordAccessor {
+                record_type: right_record_type,
+                field_index: right_field_index,
+                name: right_name,
+            }),
+        ) => {
+            Rc::ptr_eq(left_record_type, right_record_type)
+                && left_field_index == right_field_index
+                && left_name == right_name
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn eqv_value(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => left == right,
+        (Value::Boolean(left), Value::Boolean(right)) => left == right,
+        (Value::Character(left), Value::Character(right)) => left == right,
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::String(left), Value::String(right)) => Rc::ptr_eq(left, right),
+        (Value::List(left), Value::List(right)) => left.is_empty() && right.is_empty(),
+        (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
+        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
+        (Value::Void, Value::Void) => true,
+        (
+            Value::Procedure(Procedure::Builtin(left)),
+            Value::Procedure(Procedure::Builtin(right)),
+        ) => left == right,
+        (Value::Procedure(Procedure::Lambda(left)), Value::Procedure(Procedure::Lambda(right))) => {
+            Rc::ptr_eq(left, right)
+        }
+        (
+            Value::Procedure(Procedure::CaseLambda(left)),
+            Value::Procedure(Procedure::CaseLambda(right)),
+        ) => Rc::ptr_eq(left, right),
+        (
+            Value::Procedure(Procedure::RecordConstructor(left)),
+            Value::Procedure(Procedure::RecordConstructor(right)),
+        ) => Rc::ptr_eq(left, right),
+        (
+            Value::Procedure(Procedure::RecordPredicate(left)),
+            Value::Procedure(Procedure::RecordPredicate(right)),
+        ) => Rc::ptr_eq(left, right),
+        (
+            Value::Procedure(Procedure::RecordAccessor {
+                record_type: left_record_type,
+                field_index: left_field_index,
+                name: left_name,
+            }),
+            Value::Procedure(Procedure::RecordAccessor {
+                record_type: right_record_type,
+                field_index: right_field_index,
+                name: right_name,
+            }),
+        ) => {
+            Rc::ptr_eq(left_record_type, right_record_type)
+                && left_field_index == right_field_index
+                && left_name == right_name
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn equal_value(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => left == right,
@@ -25,8 +125,18 @@ pub(super) fn equal_value(left: &Value, right: &Value) -> bool {
         (Value::Pair(left), Value::Pair(right)) => {
             equal_value(&left.car, &right.car) && equal_value(&left.cdr, &right.cdr)
         }
+        (Value::Vector(left), Value::Vector(right)) => {
+            let left = left.borrow();
+            let right = right.borrow();
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| equal_value(left, right))
+        }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
+        (Value::Uninitialized, Value::Uninitialized) => true,
         (
             Value::Procedure(Procedure::Builtin(left)),
             Value::Procedure(Procedure::Builtin(right)),
@@ -138,6 +248,20 @@ pub(super) fn render_pair(car: &Value, cdr: &Value, mode: RenderMode) -> String 
             }
         }
     }
+}
+
+pub(super) fn render_vector(items: &[Value], mode: RenderMode) -> String {
+    let mut out = String::from("#(");
+
+    for (index, value) in items.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        out.push_str(&value.render_with_mode(mode));
+    }
+
+    out.push(')');
+    out
 }
 
 pub(super) fn byte_index_for_char(input: &str, char_index: usize) -> Option<usize> {

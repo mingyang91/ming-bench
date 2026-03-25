@@ -33,6 +33,9 @@ pub enum EvalError {
     #[error("{pos}: unbound variable: {name}")]
     UnboundVariable { pos: SourcePos, name: String },
 
+    #[error("{pos}: uninitialized binding: {name}")]
+    UninitializedBinding { pos: SourcePos, name: String },
+
     #[error("{pos}: {found} is not a procedure")]
     NotAProcedure { pos: SourcePos, found: String },
 
