@@ -596,7 +596,8 @@ fn gensym(base: &str) -> String {
 fn is_syntax_keyword(s: &str) -> bool {
     matches!(s, "if" | "let" | "let*" | "letrec" | "letrec*" | "begin" | "set!" | "define"
         | "define-syntax" | "define-record-type" | "lambda" | "quote" | "cond" | "and" | "or" | "else"
-        | "syntax-rules" | "syntax-case" | "syntax" | "with-syntax" | "case" | "do")
+        | "syntax-rules" | "syntax-case" | "syntax" | "with-syntax" | "case" | "do"
+        | "guard" | "raise" | "dynamic-wind" | "with-exception-handler")
 }
 
 #[derive(Debug, Clone)]
@@ -1006,6 +1007,15 @@ impl fmt::Debug for Kont {
     }
 }
 
+/// A guard context for trampoline-based guard handling (TCO through guard).
+#[derive(Clone)]
+struct GuardContext {
+    var_name: String,
+    clauses: Vec<Expr>,
+    env: Env,
+    span: Span,
+}
+
 /// A dynamic-wind frame on the wind stack.
 #[derive(Clone)]
 struct WindEntry {
@@ -1028,6 +1038,8 @@ thread_local! {
     static EXCEPTION_HANDLERS: RefCell<Vec<Val>> = RefCell::new(Vec::new());
     /// Raised value during raise signal propagation.
     static RAISED_VALUE: RefCell<Option<Val>> = RefCell::new(None);
+    /// Guard context stack for trampoline-based guard handling.
+    static GUARD_STACK: RefCell<Vec<GuardContext>> = RefCell::new(Vec::new());
 }
 
 static BODY_CTX_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -1284,17 +1296,84 @@ fn eval_reexec(exprs: &[Expr], env: &Env, out: &mut String) -> Result<Val, EvalE
 }
 
 fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
-    // PLACEHOLDER_MARKER_FOR_OLD_EVAL
     let mut cur = expr.clone();
     let mut cur_env = env.clone();
+    let guard_depth_before = GUARD_STACK.with(|g| g.borrow().len());
     loop {
         let mut bounce: Option<(Expr, Env)> = None;
-        let result = eval_body(&cur, &cur_env, out, &mut bounce)?;
-        if let Some((next_expr, next_env)) = bounce {
-            cur = next_expr;
-            cur_env = next_env;
-        } else {
-            return Ok(result);
+        let result = eval_body(&cur, &cur_env, out, &mut bounce);
+        match result {
+            Ok(val) => {
+                if let Some((next_expr, next_env)) = bounce {
+                    cur = next_expr;
+                    cur_env = next_env;
+                } else {
+                    // Success — trim any guard contexts we pushed
+                    GUARD_STACK.with(|g| g.borrow_mut().truncate(guard_depth_before));
+                    return Ok(val);
+                }
+            }
+            Err(ref e) if is_raise_signal(e) => {
+                let guard_depth = GUARD_STACK.with(|g| g.borrow().len());
+                if guard_depth > guard_depth_before {
+                    // Pop the innermost guard context and handle it
+                    let guard_ctx = GUARD_STACK.with(|g| g.borrow_mut().pop().unwrap());
+                    let raised = RAISED_VALUE.with(|r| r.borrow_mut().take())
+                        .unwrap_or(Val::Void);
+                    let guard_env = new_env(Some(guard_ctx.env));
+                    env_set(&guard_env, guard_ctx.var_name, raised.clone());
+
+                    let mut handled = false;
+                    for clause in &guard_ctx.clauses {
+                        match &clause.kind {
+                            ExprKind::List(cl) if !cl.is_empty() => {
+                                if let ExprKind::Symbol(s) = &cl[0].kind {
+                                    if s == "else" {
+                                        for expr in &cl[1..cl.len()-1] {
+                                            eval(expr, &guard_env, out)?;
+                                        }
+                                        if cl.len() > 1 {
+                                            cur = cl.last().unwrap().clone();
+                                            cur_env = guard_env;
+                                            handled = true;
+                                        }
+                                        break;
+                                    }
+                                }
+                                let test = eval(&cl[0], &guard_env, out)?;
+                                if is_truthy(&test) {
+                                    if cl.len() == 1 {
+                                        GUARD_STACK.with(|g| g.borrow_mut().truncate(guard_depth_before));
+                                        return Ok(test);
+                                    }
+                                    for expr in &cl[1..cl.len()-1] {
+                                        eval(expr, &guard_env, out)?;
+                                    }
+                                    cur = cl.last().unwrap().clone();
+                                    cur_env = guard_env;
+                                    handled = true;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !handled {
+                        // No clause matched — re-raise
+                        RAISED_VALUE.with(|r| *r.borrow_mut() = Some(raised));
+                        GUARD_STACK.with(|g| g.borrow_mut().truncate(guard_depth_before));
+                        return Err(err_at(guard_ctx.span, EvalError::Type("__raise_signal__".into())));
+                    }
+                    // Continue trampoline with clause result expression
+                } else {
+                    // No guard to handle — propagate
+                    return result;
+                }
+            }
+            Err(e) => {
+                GUARD_STACK.with(|g| g.borrow_mut().truncate(guard_depth_before));
+                return Err(e);
+            }
         }
     }
 }
@@ -2219,7 +2298,7 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                 }
             }
 
-            // guard handling
+            // guard handling — push context to guard stack, TCO-bounce body to trampoline
             if let ExprKind::Symbol(op) = &list[0].kind {
                 if op == "guard" {
                     if list.len() < 3 {
@@ -2239,49 +2318,20 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                     let clauses = clauses_list[1..].to_vec();
                     let body = &list[2..];
 
-                    // Evaluate body, catching raise signals
-                    let body_result = eval_body_seq(body, env, out);
-                    match body_result {
-                        Ok(val) => return Ok(val),
-                        Err(ref e) if is_raise_signal(e) => {
-                            let raised = RAISED_VALUE.with(|r| r.borrow_mut().take())
-                                .unwrap_or(Val::Void);
-                            let guard_env = new_env(Some(env.clone()));
-                            env_set(&guard_env, var_name.clone(), raised.clone());
+                    // Push guard context for the trampoline to handle raises
+                    GUARD_STACK.with(|g| g.borrow_mut().push(GuardContext {
+                        var_name,
+                        clauses,
+                        env: env.clone(),
+                        span,
+                    }));
 
-                            for clause in &clauses {
-                                match &clause.kind {
-                                    ExprKind::List(cl) if !cl.is_empty() => {
-                                        if let ExprKind::Symbol(s) = &cl[0].kind {
-                                            if s == "else" {
-                                                let mut result = Val::Void;
-                                                for expr in &cl[1..] {
-                                                    result = eval(expr, &guard_env, out)?;
-                                                }
-                                                return Ok(result);
-                                            }
-                                        }
-                                        let test = eval(&cl[0], &guard_env, out)?;
-                                        if is_truthy(&test) {
-                                            if cl.len() == 1 {
-                                                return Ok(test);
-                                            }
-                                            let mut result = Val::Void;
-                                            for expr in &cl[1..] {
-                                                result = eval(expr, &guard_env, out)?;
-                                            }
-                                            return Ok(result);
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            // No clause matched — re-raise
-                            RAISED_VALUE.with(|r| *r.borrow_mut() = Some(raised));
-                            return Err(err_at(span, EvalError::Type("__raise_signal__".into())));
-                        }
-                        Err(e) => return Err(e),
+                    // TCO-bounce to body (evaluate non-last exprs, then bounce last)
+                    for expr in &body[..body.len()-1] {
+                        eval(expr, env, out)?;
                     }
+                    *tco = Some((body.last().unwrap().clone(), env.clone()));
+                    return Ok(Val::Void);
                 }
             }
 
@@ -2816,10 +2866,15 @@ fn call_function(func: &Val, args: Vec<Val>, span: Span, out: &mut String) -> Re
             }
         }
         Val::Continuation(ref data) => {
-            if args.len() != 1 {
-                return Err(err_at(span, EvalError::Arity("continuation: expected 1 argument".into())));
+            if args.is_empty() {
+                return Err(err_at(span, EvalError::Arity("continuation: expected at least 1 argument".into())));
             }
-            invoke_continuation(data, args[0].clone())
+            let val = if args.len() == 1 {
+                args.into_iter().next().unwrap()
+            } else {
+                Val::Values(args)
+            };
+            invoke_continuation(data, val)
         }
         _ => Err(err_at(span, EvalError::Type("not a procedure".into()))),
     }
