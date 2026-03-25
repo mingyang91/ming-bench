@@ -12,6 +12,10 @@ private[ming] object NumericBuiltins:
       multiplicationBuiltin,
       divisionBuiltin,
       absBuiltin,
+      gcdBuiltin,
+      lcmBuiltin,
+      truncateBuiltin,
+      roundBuiltin,
       moduloBuiltin,
       remainderBuiltin,
       quotientBuiltin,
@@ -85,6 +89,43 @@ private[ming] object NumericBuiltins:
     Value.Builtin(
       "abs",
       (args, pos) => Value.Number(SchemeNumber.abs(asNumber(singleArg("abs", args, pos), "abs", pos)))
+    )
+
+  private val gcdBuiltin: Value.Builtin =
+    Value.Builtin(
+      "gcd",
+      (args, pos) =>
+        val result = args.map(value => asExactInteger(value, "gcd", pos).abs).foldLeft(BigInt(0))(_.gcd(_))
+        Value.Number(SchemeNumber.exact(result))
+    )
+
+  private val lcmBuiltin: Value.Builtin =
+    Value.Builtin(
+      "lcm",
+      (args, pos) =>
+        val numbers = args.map(value => asExactInteger(value, "lcm", pos).abs)
+        val result =
+          numbers.foldLeft(BigInt(1)) { (acc, value) =>
+            if acc == 0 || value == 0 then BigInt(0)
+            else (acc / acc.gcd(value)) * value
+          }
+        Value.Number(SchemeNumber.exact(result))
+    )
+
+  private val truncateBuiltin: Value.Builtin =
+    Value.Builtin(
+      "truncate",
+      (args, pos) =>
+        val number = asNumber(singleArg("truncate", args, pos), "truncate", pos)
+        Value.Number(truncateNumber(number))
+    )
+
+  private val roundBuiltin: Value.Builtin =
+    Value.Builtin(
+      "round",
+      (args, pos) =>
+        val number = asNumber(singleArg("round", args, pos), "round", pos)
+        Value.Number(roundNumber(number))
     )
 
   private val moduloBuiltin: Value.Builtin =
@@ -221,3 +262,31 @@ private[ming] object NumericBuiltins:
       name,
       (args, pos) => Value.Bool(predicate(asExactInteger(singleArg(name, args, pos), name, pos)))
     )
+
+  private def truncateNumber(number: SchemeNumber): SchemeNumber =
+    number match
+      case SchemeNumber.Exact(numerator, denominator) =>
+        SchemeNumber.exact(numerator / denominator)
+      case SchemeNumber.Inexact(value) =>
+        val truncated =
+          if value >= 0 then math.floor(value)
+          else math.ceil(value)
+        SchemeNumber.inexact(truncated)
+
+  private def roundNumber(number: SchemeNumber): SchemeNumber =
+    number match
+      case SchemeNumber.Exact(numerator, denominator) =>
+        val quotient  = numerator / denominator
+        val remainder = numerator % denominator
+        val twiceAbs  = remainder.abs * 2
+        val step      = BigInt(remainder.signum)
+
+        val rounded =
+          if twiceAbs < denominator then quotient
+          else if twiceAbs > denominator then quotient + step
+          else if (quotient.abs % 2) == 0 then quotient
+          else quotient + step
+
+        SchemeNumber.exact(rounded)
+      case SchemeNumber.Inexact(value) =>
+        SchemeNumber.inexact(math.rint(value))

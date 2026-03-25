@@ -1,6 +1,8 @@
 package ming
 
 private[ming] object SchemeInterpreter extends SchemeInterpreterTypes:
+
+  import SchemeInterpreterBindingForms.*
   import SchemeInterpreterSpecialForms.*
 
   sealed private[ming] trait EvalTarget
@@ -84,6 +86,7 @@ private[ming] object SchemeInterpreter extends SchemeInterpreterTypes:
           case Expr.Symbol("begin", _) :: args   => evalBegin(args, env, macros)
           case Expr.Symbol("if", _) :: args      => evalIf(args, env, macros, pos, eval)
           case Expr.Symbol("let", _) :: args     => evalLet(args, env, macros, pos, eval, applyProcedureStep)
+          case Expr.Symbol("let*", _) :: args    => evalLetStar(args, env, macros, pos, eval)
           case Expr.Symbol("letrec", _) :: args  => evalLetrec(args, env, macros, pos, eval)
           case Expr.Symbol("letrec*", _) :: args => evalLetrecStar(args, env, macros, pos, eval)
           case Expr.Symbol("cond", _) :: args    => evalCond(args, env, macros, pos, eval)

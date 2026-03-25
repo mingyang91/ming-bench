@@ -1,36 +1,15 @@
 package ming
 
-import scala.annotation.tailrec
+import java.util.IdentityHashMap
 
 private[ming] object SchemeRendering:
   import SchemeInterpreter.{Expr, Procedure, Value}
 
   def render(value: Value): String =
-    value match
-      case Value.Number(number)  => number.render
-      case Value.Bool(true)      => "#t"
-      case Value.Bool(false)     => "#f"
-      case Value.StringLit(text) => "\"" + escapeString(text) + "\""
-      case Value.MutableString(text) =>
-        "\"" + escapeString(text) + "\""
-      case Value.Character(character) => renderCharacter(character)
-      case Value.Symbol(name)         => name
-      case Value.EmptyList            => "()"
-      case pair: Value.Pair           => renderPair(pair, render)
-      case vector: Value.Vector       => renderVector(vector, render)
-      case record: Value.Record       => s"#<record ${record.typeName}>"
-      case _: Procedure               => "#<procedure>"
-      case Value.Void                 => "#<void>"
+    renderValue(value, displayMode = false, RenderState())
 
   def renderDisplay(value: Value): String =
-    value match
-      case Value.StringLit(text)     => text
-      case Value.MutableString(text) => text
-      case Value.Character(value)    => value.toString
-      case Value.EmptyList           => "()"
-      case pair: Value.Pair          => renderPair(pair, renderDisplay)
-      case vector: Value.Vector      => renderVector(vector, renderDisplay)
-      case other                     => render(other)
+    renderValue(value, displayMode = true, RenderState())
 
   def renderExpr(expr: Expr): String =
     expr match
@@ -59,35 +38,78 @@ private[ming] object SchemeRendering:
       case '\n' => "#\\newline"
       case ch   => s"#\\$ch"
 
+  private def renderValue(value: Value, displayMode: Boolean, state: RenderState): String =
+    value match
+      case Value.Number(number)      => number.render
+      case Value.Bool(true)          => "#t"
+      case Value.Bool(false)         => "#f"
+      case Value.StringLit(text)     => if displayMode then text else "\"" + escapeString(text) + "\""
+      case Value.MutableString(text) => if displayMode then text else "\"" + escapeString(text) + "\""
+      case Value.Character(character) =>
+        if displayMode then character.toString else renderCharacter(character)
+      case Value.Symbol(name)   => name
+      case Value.EmptyList      => "()"
+      case pair: Value.Pair     => renderPair(pair, displayMode, state)
+      case vector: Value.Vector => renderVector(vector, displayMode, state)
+      case record: Value.Record => s"#<record ${record.typeName}>"
+      case _: Procedure         => "#<procedure>"
+      case Value.Void           => "#<void>"
+
   private def renderPair(
     value: Value.Pair,
-    renderValue: Value => String
+    displayMode: Boolean,
+    state: RenderState
   ): String =
-    val builder = new StringBuilder("(")
+    if state.activePairs.containsKey(value) then "#<cycle>"
+    else
+      val builder = new StringBuilder("(")
 
-    @tailrec
-    def loop(current: Value, first: Boolean): Unit =
-      current match
-        case Value.Pair(car, cdr) =>
-          if !first then builder.append(" ")
-          builder.append(renderValue(car))
-          cdr match
-            case Value.EmptyList =>
-              ()
-            case next: Value.Pair =>
-              loop(next, first = false)
-            case other =>
-              builder.append(" . ")
-              builder.append(renderValue(other))
-        case _ =>
-          ()
+      def appendPair(current: Value.Pair): Unit =
+        if state.activePairs.containsKey(current) then builder.append("#<cycle>")
+        else
+          state.activePairs.put(current, java.lang.Boolean.TRUE)
+          try
+            builder.append(renderValue(current.car, displayMode, state))
+            current.cdr match
+              case Value.EmptyList =>
+                ()
+              case next: Value.Pair if state.activePairs.containsKey(next) =>
+                builder.append(" . ")
+                builder.append("#<cycle>")
+              case next: Value.Pair =>
+                builder.append(" ")
+                appendPair(next)
+              case other =>
+                builder.append(" . ")
+                builder.append(renderValue(other, displayMode, state))
+          finally state.activePairs.remove(current)
 
-    loop(value, first = true)
-    builder.append(")")
-    builder.result()
+      appendPair(value)
+      builder.append(")")
+      builder.result()
 
   private def renderVector(
     value: Value.Vector,
-    renderValue: Value => String
+    displayMode: Boolean,
+    state: RenderState
   ): String =
-    value.toList.map(renderValue).mkString("#(", " ", ")")
+    if state.activeVectors.containsKey(value) then "#<cycle>"
+    else
+      state.activeVectors.put(value, java.lang.Boolean.TRUE)
+      try
+        value.toList.map(renderValue(_, displayMode, state)).mkString("#(", " ", ")")
+      finally
+        state.activeVectors.remove(value)
+
+  final private class RenderState private (
+    val activePairs: IdentityHashMap[Value.Pair, java.lang.Boolean],
+    val activeVectors: IdentityHashMap[Value.Vector, java.lang.Boolean]
+  )
+
+  private object RenderState:
+
+    def apply(): RenderState =
+      new RenderState(
+        new IdentityHashMap[Value.Pair, java.lang.Boolean](),
+        new IdentityHashMap[Value.Vector, java.lang.Boolean]()
+      )

@@ -48,10 +48,31 @@ private[ming] trait SchemeInterpreterTypes:
       def unapply(value: MutableString): Some[String] =
         Some(value.value)
 
-    final case class Character(value: Char)       extends Value
-    final case class Symbol(name: String)         extends Value
-    case object EmptyList                         extends Value
-    final case class Pair(car: Value, cdr: Value) extends Value
+    final case class Character(value: Char) extends Value
+    final case class Symbol(name: String)   extends Value
+    case object EmptyList                   extends Value
+
+    final class Pair private (private var currentCar: Value, private var currentCdr: Value) extends Value:
+
+      def car: Value =
+        currentCar
+
+      def cdr: Value =
+        currentCdr
+
+      def setCar(value: Value): Unit =
+        currentCar = value
+
+      def setCdr(value: Value): Unit =
+        currentCdr = value
+
+    object Pair:
+
+      def apply(car: Value, cdr: Value): Pair =
+        new Pair(car, cdr)
+
+      def unapply(pair: Pair): Some[(Value, Value)] =
+        Some((pair.car, pair.cdr))
 
     final class Vector private (private val elements: mutable.ArrayBuffer[Value]) extends Value:
 

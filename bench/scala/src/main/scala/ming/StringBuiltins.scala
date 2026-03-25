@@ -9,6 +9,8 @@ private[ming] object StringBuiltins:
 
   def all: List[Value.Builtin] =
     List(
+      makeStringBuiltin,
+      stringBuiltin,
       stringAppendBuiltin,
       stringLengthBuiltin,
       substringBuiltin,
@@ -23,9 +25,34 @@ private[ming] object StringBuiltins:
       stringSetBuiltin,
       stringEqualsBuiltin,
       stringLessBuiltin,
+      stringGreaterBuiltin,
+      stringLessEqualBuiltin,
+      stringGreaterEqualBuiltin,
       stringCiEqualsBuiltin,
       stringUpcaseBuiltin,
       stringDowncaseBuiltin
+    )
+
+  private val makeStringBuiltin: Value.Builtin =
+    Value.Builtin(
+      "make-string",
+      (args, pos) =>
+        val (length, fillChar) =
+          args match
+            case lengthValue :: Nil =>
+              (asIndex(lengthValue, "make-string", pos), '\u0000')
+            case lengthValue :: fillValue :: Nil =>
+              (asIndex(lengthValue, "make-string", pos), asCharacter(fillValue, "make-string", pos))
+            case _ =>
+              fail(pos, s"make-string expected 1 or 2 arguments, got ${args.length}")
+
+        Value.MutableString(fillChar.toString * length)
+    )
+
+  private val stringBuiltin: Value.Builtin =
+    Value.Builtin(
+      "string",
+      (args, pos) => Value.MutableString(args.map(asCharacter(_, "string", pos)).mkString)
     )
 
   private val stringAppendBuiltin: Value.Builtin =
@@ -151,6 +178,15 @@ private[ming] object StringBuiltins:
 
   private val stringLessBuiltin: Value.Builtin =
     stringComparisonBuiltin("string<?")(_ < _)
+
+  private val stringGreaterBuiltin: Value.Builtin =
+    stringComparisonBuiltin("string>?")(_ > _)
+
+  private val stringLessEqualBuiltin: Value.Builtin =
+    stringComparisonBuiltin("string<=?")(_ <= _)
+
+  private val stringGreaterEqualBuiltin: Value.Builtin =
+    stringComparisonBuiltin("string>=?")(_ >= _)
 
   private val stringCiEqualsBuiltin: Value.Builtin =
     Value.Builtin(

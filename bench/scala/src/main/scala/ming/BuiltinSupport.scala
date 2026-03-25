@@ -1,6 +1,6 @@
 package ming
 
-import scala.annotation.tailrec
+import java.util.IdentityHashMap
 
 private[ming] object BuiltinSupport:
   import SchemeInterpreter.Value
@@ -52,8 +52,12 @@ private[ming] object BuiltinSupport:
       case Nil          => fail(pos, s"$name expected non-empty list")
 
   def asPair(value: Value, context: String, pos: SourcePos): (Value, Value) =
+    val pair = asPairObject(value, context, pos)
+    (pair.car, pair.cdr)
+
+  def asPairObject(value: Value, context: String, pos: SourcePos): Value.Pair =
     value match
-      case Value.Pair(car, cdr) => (car, cdr)
+      case pair: Value.Pair => pair
       case other =>
         fail(
           pos,
@@ -184,12 +188,21 @@ private[ming] object BuiltinSupport:
   def unreachable(): Nothing =
     throw IllegalStateException("unreachable")
 
-  @tailrec
-  private def toScalaList(
-    value: Value,
-    acc: List[Value] = Nil
-  ): Option[List[Value]] =
-    value match
-      case Value.EmptyList      => Some(acc.reverse)
-      case Value.Pair(car, cdr) => toScalaList(cdr, car :: acc)
-      case _                    => None
+  private def toScalaList(value: Value): Option[List[Value]] =
+    val items   = List.newBuilder[Value]
+    val visited = new IdentityHashMap[Value.Pair, java.lang.Boolean]()
+    var current = value
+
+    while true do
+      current match
+        case Value.EmptyList =>
+          return Some(items.result())
+        case pair: Value.Pair =>
+          if visited.containsKey(pair) then return None
+          visited.put(pair, java.lang.Boolean.TRUE)
+          items += pair.car
+          current = pair.cdr
+        case _ =>
+          return None
+
+    None
