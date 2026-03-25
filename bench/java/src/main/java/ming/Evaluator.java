@@ -1,5 +1,7 @@
 package ming;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -93,6 +95,14 @@ public class Evaluator {
         installBuiltin(env, "string->symbol", this::builtinStringToSymbol);
         installBuiltin(env, "string-ref", this::builtinStringRef);
         installBuiltin(env, "number?", this::builtinNumberPredicate);
+        installBuiltin(env, "integer?", this::builtinIntegerPredicate);
+        installBuiltin(env, "rational?", this::builtinRationalPredicate);
+        installBuiltin(env, "exact?", this::builtinExactPredicate);
+        installBuiltin(env, "inexact?", this::builtinInexactPredicate);
+        installBuiltin(env, "exact->inexact", this::builtinExactToInexact);
+        installBuiltin(env, "inexact->exact", this::builtinInexactToExact);
+        installBuiltin(env, "numerator", this::builtinNumerator);
+        installBuiltin(env, "denominator", this::builtinDenominator);
         installBuiltin(env, "boolean?", this::builtinBooleanPredicate);
         installBuiltin(env, "char?", this::builtinCharPredicate);
         installBuiltin(env, "pair?", this::builtinPairPredicate);
@@ -138,8 +148,8 @@ public class Evaluator {
 
     private Value eval(Expr expression, Environment env) throws EvalError {
         try {
-            if (expression instanceof IntExpr intExpr) {
-                return new IntValue(intExpr.value());
+            if (expression instanceof NumberExpr numberExpr) {
+                return numberExpr.value();
             }
             if (expression instanceof BoolExpr boolExpr) {
                 return boolValue(boolExpr.value());
@@ -398,7 +408,7 @@ public class Evaluator {
                                      MacroBindings bindings, Map<String, String> renameEnv,
                                      MacroExpansionState state, Integer repeatIndex)
             throws EvalError {
-        if (template instanceof IntExpr || template instanceof BoolExpr
+        if (template instanceof NumberExpr || template instanceof BoolExpr
                 || template instanceof StringExpr || template instanceof CharExpr) {
             return template;
         }
@@ -694,8 +704,8 @@ public class Evaluator {
     }
 
     private Value quote(Expr expression) {
-        if (expression instanceof IntExpr intExpr) {
-            return new IntValue(intExpr.value());
+        if (expression instanceof NumberExpr numberExpr) {
+            return numberExpr.value();
         }
         if (expression instanceof BoolExpr boolExpr) {
             return boolValue(boolExpr.value());
@@ -875,8 +885,9 @@ public class Evaluator {
         expectArgumentCount(arguments, 1, "string->number", callPos);
         String value = requireString(arguments.get(0), "string->number");
         try {
-            return new IntValue(Long.parseLong(value));
-        } catch (NumberFormatException e) {
+            NumberValue parsed = parseNumberLiteral(value);
+            return parsed == null ? FALSE_VALUE : parsed;
+        } catch (IllegalArgumentException e) {
             return FALSE_VALUE;
         }
     }
@@ -884,7 +895,7 @@ public class Evaluator {
     private Value builtinNumberToString(SourcePos callPos, List<LocatedValue> arguments)
             throws EvalError {
         expectArgumentCount(arguments, 1, "number->string", callPos);
-        return new StringValue(Long.toString(requireInt(arguments.get(0), "number->string")));
+        return new StringValue(requireNumber(arguments.get(0), "number->string").render());
     }
 
     private Value builtinSymbolToString(SourcePos callPos, List<LocatedValue> arguments)
@@ -909,7 +920,81 @@ public class Evaluator {
     private Value builtinNumberPredicate(SourcePos callPos, List<LocatedValue> arguments)
             throws EvalError {
         expectArgumentCount(arguments, 1, "number?", callPos);
-        return boolValue(arguments.get(0).value() instanceof IntValue);
+        return boolValue(arguments.get(0).value() instanceof NumberValue);
+    }
+
+    private Value builtinIntegerPredicate(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "integer?", callPos);
+        Value value = arguments.get(0).value();
+        if (value instanceof IntValue) {
+            return TRUE_VALUE;
+        }
+        if (value instanceof InexactValue(double number)) {
+            return boolValue(Double.isFinite(number) && Math.rint(number) == number);
+        }
+        return FALSE_VALUE;
+    }
+
+    private Value builtinRationalPredicate(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "rational?", callPos);
+        return boolValue(arguments.get(0).value() instanceof NumberValue);
+    }
+
+    private Value builtinExactPredicate(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "exact?", callPos);
+        Value value = arguments.get(0).value();
+        return boolValue(value instanceof IntValue || value instanceof RationalValue);
+    }
+
+    private Value builtinInexactPredicate(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "inexact?", callPos);
+        return boolValue(arguments.get(0).value() instanceof InexactValue);
+    }
+
+    private Value builtinExactToInexact(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "exact->inexact", callPos);
+        NumberValue number = requireNumber(arguments.get(0), "exact->inexact");
+        if (number instanceof InexactValue) {
+            return number;
+        }
+        return new InexactValue(numberToDouble(number));
+    }
+
+    private Value builtinInexactToExact(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "inexact->exact", callPos);
+        NumberValue number = requireNumber(arguments.get(0), "inexact->exact");
+        if (number instanceof InexactValue inexact) {
+            return inexactToExactValue(inexact.value());
+        }
+        return number;
+    }
+
+    private Value builtinNumerator(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "numerator", callPos);
+        NumberValue number = requireNumber(arguments.get(0), "numerator");
+        if (number instanceof InexactValue) {
+            throw errorAt(arguments.get(0).pos(), "expected exact number for numerator");
+        }
+        ExactNumber exact = toExactNumber(number);
+        return new IntValue(exact.numerator().longValueExact());
+    }
+
+    private Value builtinDenominator(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "denominator", callPos);
+        NumberValue number = requireNumber(arguments.get(0), "denominator");
+        if (number instanceof InexactValue) {
+            throw errorAt(arguments.get(0).pos(), "expected exact number for denominator");
+        }
+        ExactNumber exact = toExactNumber(number);
+        return new IntValue(exact.denominator().longValueExact());
     }
 
     private Value builtinBooleanPredicate(SourcePos callPos, List<LocatedValue> arguments)
@@ -1004,16 +1089,21 @@ public class Evaluator {
     }
 
     private Value builtinAdd(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
-        long total = 0L;
+        NumberValue total = new IntValue(0L);
         for (LocatedValue argument : arguments) {
-            total += requireInt(argument, "+");
+            total = addNumbers(total, requireNumber(argument, "+"));
         }
-        return new IntValue(total);
+        return total;
     }
 
     private Value builtinAbs(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
         expectArgumentCount(arguments, 1, "abs", callPos);
-        return new IntValue(Math.abs(requireInt(arguments.get(0), "abs")));
+        NumberValue number = requireNumber(arguments.get(0), "abs");
+        if (number instanceof InexactValue(double value)) {
+            return new InexactValue(Math.abs(value));
+        }
+        ExactNumber exact = toExactNumber(number);
+        return exactValue(exact.numerator().abs(), exact.denominator());
     }
 
     private Value builtinSubtract(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
@@ -1021,15 +1111,15 @@ public class Evaluator {
             throw errorAt(callPos, "wrong argument count for -");
         }
 
-        long result = requireInt(arguments.get(0), "-");
+        NumberValue result = requireNumber(arguments.get(0), "-");
         if (arguments.size() == 1) {
-            return new IntValue(-result);
+            return subtractNumbers(new IntValue(0L), result);
         }
 
         for (int i = 1; i < arguments.size(); i++) {
-            result -= requireInt(arguments.get(i), "-");
+            result = subtractNumbers(result, requireNumber(arguments.get(i), "-"));
         }
-        return new IntValue(result);
+        return result;
     }
 
     private Value builtinModulo(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
@@ -1062,11 +1152,14 @@ public class Evaluator {
             throw errorAt(callPos, "wrong argument count for min");
         }
 
-        long result = requireInt(arguments.get(0), "min");
+        NumberValue result = requireNumber(arguments.get(0), "min");
         for (int i = 1; i < arguments.size(); i++) {
-            result = Math.min(result, requireInt(arguments.get(i), "min"));
+            NumberValue next = requireNumber(arguments.get(i), "min");
+            if (compareNumbers(next, result) < 0) {
+                result = next;
+            }
         }
-        return new IntValue(result);
+        return result;
     }
 
     private Value builtinMax(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
@@ -1074,11 +1167,14 @@ public class Evaluator {
             throw errorAt(callPos, "wrong argument count for max");
         }
 
-        long result = requireInt(arguments.get(0), "max");
+        NumberValue result = requireNumber(arguments.get(0), "max");
         for (int i = 1; i < arguments.size(); i++) {
-            result = Math.max(result, requireInt(arguments.get(i), "max"));
+            NumberValue next = requireNumber(arguments.get(i), "max");
+            if (compareNumbers(next, result) > 0) {
+                result = next;
+            }
         }
-        return new IntValue(result);
+        return result;
     }
 
     private Value builtinExpt(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
@@ -1105,19 +1201,19 @@ public class Evaluator {
     private Value builtinZeroPredicate(SourcePos callPos, List<LocatedValue> arguments)
             throws EvalError {
         expectArgumentCount(arguments, 1, "zero?", callPos);
-        return boolValue(requireInt(arguments.get(0), "zero?") == 0L);
+        return boolValue(isZero(requireNumber(arguments.get(0), "zero?")));
     }
 
     private Value builtinPositivePredicate(SourcePos callPos, List<LocatedValue> arguments)
             throws EvalError {
         expectArgumentCount(arguments, 1, "positive?", callPos);
-        return boolValue(requireInt(arguments.get(0), "positive?") > 0L);
+        return boolValue(compareNumbers(requireNumber(arguments.get(0), "positive?"), new IntValue(0L)) > 0);
     }
 
     private Value builtinNegativePredicate(SourcePos callPos, List<LocatedValue> arguments)
             throws EvalError {
         expectArgumentCount(arguments, 1, "negative?", callPos);
-        return boolValue(requireInt(arguments.get(0), "negative?") < 0L);
+        return boolValue(compareNumbers(requireNumber(arguments.get(0), "negative?"), new IntValue(0L)) < 0);
     }
 
     private Value builtinOddPredicate(SourcePos callPos, List<LocatedValue> arguments)
@@ -1133,11 +1229,11 @@ public class Evaluator {
     }
 
     private Value builtinMultiply(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
-        long total = 1L;
+        NumberValue total = new IntValue(1L);
         for (LocatedValue argument : arguments) {
-            total *= requireInt(argument, "*");
+            total = multiplyNumbers(total, requireNumber(argument, "*"));
         }
-        return new IntValue(total);
+        return total;
     }
 
     private Value builtinDivide(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
@@ -1145,15 +1241,15 @@ public class Evaluator {
             throw errorAt(callPos, "wrong argument count for /");
         }
 
-        long result = requireInt(arguments.get(0), "/");
+        NumberValue result = requireNumber(arguments.get(0), "/");
         for (int i = 1; i < arguments.size(); i++) {
-            long divisor = requireInt(arguments.get(i), "/");
-            if (divisor == 0L) {
+            NumberValue divisor = requireNumber(arguments.get(i), "/");
+            if (isZero(divisor)) {
                 throw errorAt(arguments.get(i).pos(), "division by zero");
             }
-            result /= divisor;
+            result = divideNumbers(result, divisor);
         }
-        return new IntValue(result);
+        return result;
     }
 
     private Value builtinComparison(SourcePos callPos, List<LocatedValue> arguments,
@@ -1162,10 +1258,10 @@ public class Evaluator {
             throw errorAt(callPos, "wrong argument count for " + comparison.name);
         }
 
-        long left = requireInt(arguments.get(0), comparison.name);
+        NumberValue left = requireNumber(arguments.get(0), comparison.name);
         for (int i = 1; i < arguments.size(); i++) {
-            long right = requireInt(arguments.get(i), comparison.name);
-            if (!comparison.test(left, right)) {
+            NumberValue right = requireNumber(arguments.get(i), comparison.name);
+            if (!comparison.test(compareNumbers(left, right))) {
                 return FALSE_VALUE;
             }
             left = right;
@@ -1360,6 +1456,241 @@ public class Evaluator {
                 .toLowerCase(Locale.ROOT));
     }
 
+    private static NumberValue parseNumberLiteral(String token) {
+        if (isIntegerToken(token)) {
+            try {
+                return exactValue(new BigInteger(token), BigInteger.ONE);
+            } catch (RuntimeException e) {
+                throw new IllegalArgumentException("invalid integer literal: " + token, e);
+            }
+        }
+        if (isRationalToken(token)) {
+            try {
+                int slash = token.indexOf('/');
+                BigInteger numerator = new BigInteger(token.substring(0, slash));
+                BigInteger denominator = new BigInteger(token.substring(slash + 1));
+                if (denominator.signum() == 0) {
+                    throw new IllegalArgumentException("invalid rational literal: " + token);
+                }
+                return exactValue(numerator, denominator);
+            } catch (RuntimeException e) {
+                if (e instanceof IllegalArgumentException illegal && illegal.getMessage() != null
+                        && illegal.getMessage().startsWith("invalid rational literal: ")) {
+                    throw illegal;
+                }
+                throw new IllegalArgumentException("invalid rational literal: " + token, e);
+            }
+        }
+        if (isInexactToken(token)) {
+            try {
+                return new InexactValue(Double.parseDouble(token));
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("invalid inexact literal: " + token, e);
+            }
+        }
+        return null;
+    }
+
+    private static boolean isIntegerToken(String token) {
+        if (token.isEmpty()) {
+            return false;
+        }
+
+        int start = 0;
+        if (token.charAt(0) == '-' || token.charAt(0) == '+') {
+            if (token.length() == 1) {
+                return false;
+            }
+            start = 1;
+        }
+
+        return isUnsignedIntegerToken(token.substring(start));
+    }
+
+    private static boolean isUnsignedIntegerToken(String token) {
+        if (token.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < token.length(); i++) {
+            if (!Character.isDigit(token.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isRationalToken(String token) {
+        int slash = token.indexOf('/');
+        return slash > 0
+                && slash == token.lastIndexOf('/')
+                && isIntegerToken(token.substring(0, slash))
+                && isUnsignedIntegerToken(token.substring(slash + 1));
+    }
+
+    private static boolean isInexactToken(String token) {
+        if (token.isEmpty()) {
+            return false;
+        }
+
+        int start = 0;
+        if (token.charAt(0) == '-' || token.charAt(0) == '+') {
+            if (token.length() == 1) {
+                return false;
+            }
+            start = 1;
+        }
+
+        boolean sawDigit = false;
+        boolean sawDot = false;
+        for (int i = start; i < token.length(); i++) {
+            char ch = token.charAt(i);
+            if (Character.isDigit(ch)) {
+                sawDigit = true;
+                continue;
+            }
+            if (ch == '.' && !sawDot) {
+                sawDot = true;
+                continue;
+            }
+            return false;
+        }
+        return sawDigit && sawDot;
+    }
+
+    private NumberValue requireNumber(LocatedValue value, String name) throws EvalError {
+        if (value.value() instanceof NumberValue number) {
+            return number;
+        }
+        throw errorAt(value.pos(), "expected number for " + name);
+    }
+
+    private static boolean isZero(NumberValue number) {
+        if (number instanceof IntValue(long value)) {
+            return value == 0L;
+        }
+        if (number instanceof RationalValue(long numerator, long ignoredDenominator)) {
+            return numerator == 0L;
+        }
+        return ((InexactValue) number).value() == 0.0d;
+    }
+
+    private static NumberValue addNumbers(NumberValue left, NumberValue right) {
+        if (left instanceof InexactValue || right instanceof InexactValue) {
+            return new InexactValue(numberToDouble(left) + numberToDouble(right));
+        }
+        ExactNumber leftExact = toExactNumber(left);
+        ExactNumber rightExact = toExactNumber(right);
+        return exactValue(
+                leftExact.numerator().multiply(rightExact.denominator())
+                        .add(rightExact.numerator().multiply(leftExact.denominator())),
+                leftExact.denominator().multiply(rightExact.denominator()));
+    }
+
+    private static NumberValue subtractNumbers(NumberValue left, NumberValue right) {
+        if (left instanceof InexactValue || right instanceof InexactValue) {
+            return new InexactValue(numberToDouble(left) - numberToDouble(right));
+        }
+        ExactNumber leftExact = toExactNumber(left);
+        ExactNumber rightExact = toExactNumber(right);
+        return exactValue(
+                leftExact.numerator().multiply(rightExact.denominator())
+                        .subtract(rightExact.numerator().multiply(leftExact.denominator())),
+                leftExact.denominator().multiply(rightExact.denominator()));
+    }
+
+    private static NumberValue multiplyNumbers(NumberValue left, NumberValue right) {
+        if (left instanceof InexactValue || right instanceof InexactValue) {
+            return new InexactValue(numberToDouble(left) * numberToDouble(right));
+        }
+        ExactNumber leftExact = toExactNumber(left);
+        ExactNumber rightExact = toExactNumber(right);
+        return exactValue(
+                leftExact.numerator().multiply(rightExact.numerator()),
+                leftExact.denominator().multiply(rightExact.denominator()));
+    }
+
+    private static NumberValue divideNumbers(NumberValue left, NumberValue right) {
+        if (left instanceof InexactValue || right instanceof InexactValue) {
+            return new InexactValue(numberToDouble(left) / numberToDouble(right));
+        }
+        ExactNumber leftExact = toExactNumber(left);
+        ExactNumber rightExact = toExactNumber(right);
+        return exactValue(
+                leftExact.numerator().multiply(rightExact.denominator()),
+                leftExact.denominator().multiply(rightExact.numerator()));
+    }
+
+    private static int compareNumbers(NumberValue left, NumberValue right) {
+        if (left instanceof InexactValue || right instanceof InexactValue) {
+            return Double.compare(numberToDouble(left), numberToDouble(right));
+        }
+        ExactNumber leftExact = toExactNumber(left);
+        ExactNumber rightExact = toExactNumber(right);
+        return leftExact.numerator().multiply(rightExact.denominator())
+                .compareTo(rightExact.numerator().multiply(leftExact.denominator()));
+    }
+
+    private static boolean numberValuesEqual(NumberValue left, NumberValue right) {
+        return compareNumbers(left, right) == 0;
+    }
+
+    private static boolean sameNumberLiteral(NumberValue left, NumberValue right) {
+        if (left instanceof IntValue(long leftInt) && right instanceof IntValue(long rightInt)) {
+            return leftInt == rightInt;
+        }
+        if (left instanceof RationalValue(long leftNumerator, long leftDenominator)
+                && right instanceof RationalValue(long rightNumerator, long rightDenominator)) {
+            return leftNumerator == rightNumerator && leftDenominator == rightDenominator;
+        }
+        if (left instanceof InexactValue(double leftInexact)
+                && right instanceof InexactValue(double rightInexact)) {
+            return Double.doubleToLongBits(leftInexact) == Double.doubleToLongBits(rightInexact);
+        }
+        return false;
+    }
+
+    private static double numberToDouble(NumberValue number) {
+        if (number instanceof IntValue(long value)) {
+            return (double) value;
+        }
+        if (number instanceof RationalValue(long numerator, long denominator)) {
+            return (double) numerator / (double) denominator;
+        }
+        return ((InexactValue) number).value();
+    }
+
+    private static NumberValue inexactToExactValue(double value) {
+        BigDecimal decimal = BigDecimal.valueOf(value).stripTrailingZeros();
+        BigInteger numerator = decimal.unscaledValue();
+        BigInteger denominator = BigInteger.ONE;
+        if (decimal.scale() > 0) {
+            denominator = BigInteger.TEN.pow(decimal.scale());
+        } else if (decimal.scale() < 0) {
+            numerator = numerator.multiply(BigInteger.TEN.pow(-decimal.scale()));
+        }
+        return exactValue(numerator, denominator);
+    }
+
+    private static ExactNumber toExactNumber(NumberValue number) {
+        if (number instanceof IntValue(long value)) {
+            return new ExactNumber(BigInteger.valueOf(value), BigInteger.ONE);
+        }
+        if (number instanceof RationalValue(long numerator, long denominator)) {
+            return new ExactNumber(BigInteger.valueOf(numerator), BigInteger.valueOf(denominator));
+        }
+        throw new IllegalArgumentException("expected exact number");
+    }
+
+    private static NumberValue exactValue(BigInteger numerator, BigInteger denominator) {
+        ExactNumber exact = new ExactNumber(numerator, denominator);
+        if (exact.denominator().equals(BigInteger.ONE)) {
+            return new IntValue(exact.numerator().longValueExact());
+        }
+        return new RationalValue(
+                exact.numerator().longValueExact(),
+                exact.denominator().longValueExact());
+    }
+
     private void expectArgumentCount(List<?> arguments, int expected, String name, SourcePos pos)
             throws EvalError {
         if (arguments.size() != expected) {
@@ -1506,8 +1837,8 @@ public class Evaluator {
         if (left == right) {
             return true;
         }
-        if (left instanceof IntValue(long leftNumber) && right instanceof IntValue(long rightNumber)) {
-            return leftNumber == rightNumber;
+        if (left instanceof NumberValue leftNumber && right instanceof NumberValue rightNumber) {
+            return numberValuesEqual(leftNumber, rightNumber);
         }
         if (left instanceof BoolValue(boolean leftBool) && right instanceof BoolValue(boolean rightBool)) {
             return leftBool == rightBool;
@@ -1551,13 +1882,13 @@ public class Evaluator {
         return error.hasPosition() ? error : error.withPosition(pos.line(), pos.column());
     }
 
-    private sealed interface Expr permits IntExpr, BoolExpr, StringExpr, CharExpr, SymbolExpr, ListExpr {
+    private sealed interface Expr permits NumberExpr, BoolExpr, StringExpr, CharExpr, SymbolExpr, ListExpr {
         SourcePos pos();
     }
 
     private record SourcePos(int line, int column) {}
 
-    private record IntExpr(long value, SourcePos pos) implements Expr {}
+    private record NumberExpr(NumberValue value, SourcePos pos) implements Expr {}
 
     private record BoolExpr(boolean value, SourcePos pos) implements Expr {}
 
@@ -1571,15 +1902,48 @@ public class Evaluator {
 
     private record LocatedValue(Value value, SourcePos pos) {}
 
-    private sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue,
+    private record ExactNumber(BigInteger numerator, BigInteger denominator) {
+        private ExactNumber {
+            if (denominator.signum() == 0) {
+                throw new IllegalArgumentException("zero denominator");
+            }
+            if (denominator.signum() < 0) {
+                numerator = numerator.negate();
+                denominator = denominator.negate();
+            }
+            BigInteger gcd = numerator.gcd(denominator);
+            if (gcd.signum() != 0) {
+                numerator = numerator.divide(gcd);
+                denominator = denominator.divide(gcd);
+            }
+        }
+    }
+
+    private sealed interface Value permits NumberValue, BoolValue, StringValue, SymbolValue,
             CharValue, PairValue, EmptyListValue, BuiltinProcedure, LambdaProcedure, VoidValue {
         String render();
     }
 
-    private record IntValue(long value) implements Value {
+    private sealed interface NumberValue extends Value permits IntValue, RationalValue, InexactValue {}
+
+    private record IntValue(long value) implements NumberValue {
         @Override
         public String render() {
             return Long.toString(value);
+        }
+    }
+
+    private record RationalValue(long numerator, long denominator) implements NumberValue {
+        @Override
+        public String render() {
+            return numerator + "/" + denominator;
+        }
+    }
+
+    private record InexactValue(double value) implements NumberValue {
+        @Override
+        public String render() {
+            return Double.toString(value);
         }
     }
 
@@ -1703,19 +2067,19 @@ public class Evaluator {
     }
 
     private record Comparison(String name, Comparator comparator) {
-        private static final Comparison LESS_THAN = new Comparison("<", (a, b) -> a < b);
-        private static final Comparison GREATER_THAN = new Comparison(">", (a, b) -> a > b);
-        private static final Comparison EQUAL = new Comparison("=", (a, b) -> a == b);
-        private static final Comparison LESS_EQUAL = new Comparison("<=", (a, b) -> a <= b);
+        private static final Comparison LESS_THAN = new Comparison("<", ordering -> ordering < 0);
+        private static final Comparison GREATER_THAN = new Comparison(">", ordering -> ordering > 0);
+        private static final Comparison EQUAL = new Comparison("=", ordering -> ordering == 0);
+        private static final Comparison LESS_EQUAL = new Comparison("<=", ordering -> ordering <= 0);
 
-        private boolean test(long left, long right) {
-            return comparator.test(left, right);
+        private boolean test(int ordering) {
+            return comparator.test(ordering);
         }
     }
 
     @FunctionalInterface
     private interface Comparator {
-        boolean test(long left, long right);
+        boolean test(int ordering);
     }
 
     @FunctionalInterface
@@ -1851,7 +2215,7 @@ public class Evaluator {
                     && symbolInput.name().equals(symbolPattern.name());
         }
 
-        if (pattern instanceof IntExpr || pattern instanceof BoolExpr
+        if (pattern instanceof NumberExpr || pattern instanceof BoolExpr
                 || pattern instanceof StringExpr || pattern instanceof CharExpr) {
             return exprSyntaxEq(pattern, input);
         }
@@ -1974,8 +2338,8 @@ public class Evaluator {
     }
 
     private static boolean exprSyntaxEq(Expr left, Expr right) {
-        if (left instanceof IntExpr leftInt && right instanceof IntExpr rightInt) {
-            return leftInt.value() == rightInt.value();
+        if (left instanceof NumberExpr leftNumber && right instanceof NumberExpr rightNumber) {
+            return sameNumberLiteral(leftNumber.value(), rightNumber.value());
         }
         if (left instanceof BoolExpr leftBool && right instanceof BoolExpr rightBool) {
             return leftBool.value() == rightBool.value();
@@ -2221,35 +2585,15 @@ public class Evaluator {
                 throw errorAt(pos, "unexpected token");
             }
 
-            if (isIntegerToken(token)) {
-                try {
-                    return new IntExpr(Long.parseLong(token), pos);
-                } catch (NumberFormatException e) {
-                    throw errorAt(pos, "invalid integer literal: " + token);
+            try {
+                NumberValue number = parseNumberLiteral(token);
+                if (number != null) {
+                    return new NumberExpr(number, pos);
                 }
+            } catch (IllegalArgumentException e) {
+                throw errorAt(pos, e.getMessage());
             }
             return new SymbolExpr(token, pos);
-        }
-
-        private boolean isIntegerToken(String token) {
-            if (token.isEmpty()) {
-                return false;
-            }
-
-            int start = 0;
-            if (token.charAt(0) == '-' || token.charAt(0) == '+') {
-                if (token.length() == 1) {
-                    return false;
-                }
-                start = 1;
-            }
-
-            for (int i = start; i < token.length(); i++) {
-                if (!Character.isDigit(token.charAt(i))) {
-                    return false;
-                }
-            }
-            return true;
         }
 
         private void skipWhitespace() {
