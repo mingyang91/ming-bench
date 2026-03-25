@@ -10,12 +10,14 @@ import java.util.Map;
  * Agents implement this class.
  */
 public class Evaluator {
+    private StringBuilder outputBuffer = new StringBuilder();
+
     /**
      * Evaluate one or more Scheme expressions and return the string
      * representation of the last result.
      */
     public String evalStr(String input) throws EvalError {
-        return evaluateProgram(input).render();
+        return evaluateWithOutput(input).result().render();
     }
 
     /**
@@ -23,8 +25,18 @@ public class Evaluator {
      * and any captured output from display/write/newline.
      */
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        Value result = evaluateProgram(input);
-        return new EvalResult(result.render(), "");
+        ProgramEvaluation evaluation = evaluateWithOutput(input);
+        return new EvalResult(evaluation.result().render(), evaluation.output());
+    }
+
+    private ProgramEvaluation evaluateWithOutput(String input) throws EvalError {
+        StringBuilder previousOutput = outputBuffer;
+        outputBuffer = new StringBuilder();
+        try {
+            return new ProgramEvaluation(evaluateProgram(input), outputBuffer.toString());
+        } finally {
+            outputBuffer = previousOutput;
+        }
     }
 
     private Value evaluateProgram(String input) throws EvalError {
@@ -58,9 +70,21 @@ public class Evaluator {
         installBuiltin(env, "list", this::builtinList);
         installBuiltin(env, "length", this::builtinLength);
         installBuiltin(env, "append", this::builtinAppend);
+        installBuiltin(env, "display", this::builtinDisplay);
+        installBuiltin(env, "write", this::builtinWrite);
+        installBuiltin(env, "newline", this::builtinNewline);
         installBuiltin(env, "string?", this::builtinStringPredicate);
+        installBuiltin(env, "string-append", this::builtinStringAppend);
+        installBuiltin(env, "string-length", this::builtinStringLength);
+        installBuiltin(env, "substring", this::builtinSubstring);
+        installBuiltin(env, "string->number", this::builtinStringToNumber);
+        installBuiltin(env, "number->string", this::builtinNumberToString);
+        installBuiltin(env, "symbol->string", this::builtinSymbolToString);
+        installBuiltin(env, "string->symbol", this::builtinStringToSymbol);
+        installBuiltin(env, "string-ref", this::builtinStringRef);
         installBuiltin(env, "number?", this::builtinNumberPredicate);
         installBuiltin(env, "boolean?", this::builtinBooleanPredicate);
+        installBuiltin(env, "char?", this::builtinCharPredicate);
         installBuiltin(env, "pair?", this::builtinPairPredicate);
         installBuiltin(env, "symbol?", this::builtinSymbolPredicate);
         installBuiltin(env, "not", this::builtinNot);
@@ -463,10 +487,90 @@ public class Evaluator {
         return result;
     }
 
+    private Value builtinDisplay(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 1, "display", callPos);
+        appendOutput(renderValue(arguments.get(0).value(), true));
+        return VOID_VALUE;
+    }
+
+    private Value builtinWrite(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 1, "write", callPos);
+        appendOutput(arguments.get(0).value().render());
+        return VOID_VALUE;
+    }
+
+    private Value builtinNewline(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 0, "newline", callPos);
+        appendOutput("\n");
+        return VOID_VALUE;
+    }
+
     private Value builtinStringPredicate(SourcePos callPos, List<LocatedValue> arguments)
             throws EvalError {
         expectArgumentCount(arguments, 1, "string?", callPos);
         return boolValue(arguments.get(0).value() instanceof StringValue);
+    }
+
+    private Value builtinStringAppend(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        StringBuilder builder = new StringBuilder();
+        for (LocatedValue argument : arguments) {
+            builder.append(requireString(argument, "string-append"));
+        }
+        return new StringValue(builder.toString());
+    }
+
+    private Value builtinStringLength(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "string-length", callPos);
+        return new IntValue(requireString(arguments.get(0), "string-length").length());
+    }
+
+    private Value builtinSubstring(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 3, "substring", callPos);
+        String value = requireString(arguments.get(0), "substring");
+        int start = requireStringIndex(arguments.get(1), "substring", value.length());
+        int end = requireStringIndex(arguments.get(2), "substring", value.length());
+        if (start > end) {
+            throw errorAt(arguments.get(1).pos(), "invalid substring range");
+        }
+        return new StringValue(value.substring(start, end));
+    }
+
+    private Value builtinStringToNumber(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "string->number", callPos);
+        String value = requireString(arguments.get(0), "string->number");
+        try {
+            return new IntValue(Long.parseLong(value));
+        } catch (NumberFormatException e) {
+            return FALSE_VALUE;
+        }
+    }
+
+    private Value builtinNumberToString(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "number->string", callPos);
+        return new StringValue(Long.toString(requireInt(arguments.get(0), "number->string")));
+    }
+
+    private Value builtinSymbolToString(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "symbol->string", callPos);
+        return new StringValue(requireSymbol(arguments.get(0), "symbol->string"));
+    }
+
+    private Value builtinStringToSymbol(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "string->symbol", callPos);
+        return new SymbolValue(requireString(arguments.get(0), "string->symbol"));
+    }
+
+    private Value builtinStringRef(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 2, "string-ref", callPos);
+        String value = requireString(arguments.get(0), "string-ref");
+        int index = requireStringIndex(arguments.get(1), "string-ref", value.length() - 1);
+        return new CharValue(value.charAt(index));
     }
 
     private Value builtinNumberPredicate(SourcePos callPos, List<LocatedValue> arguments)
@@ -479,6 +583,12 @@ public class Evaluator {
             throws EvalError {
         expectArgumentCount(arguments, 1, "boolean?", callPos);
         return boolValue(arguments.get(0).value() instanceof BoolValue);
+    }
+
+    private Value builtinCharPredicate(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "char?", callPos);
+        return boolValue(arguments.get(0).value() instanceof CharValue);
     }
 
     private Value builtinPairPredicate(SourcePos callPos, List<LocatedValue> arguments)
@@ -572,6 +682,28 @@ public class Evaluator {
         throw errorAt(value.pos(), "expected number for " + name);
     }
 
+    private String requireString(LocatedValue value, String name) throws EvalError {
+        if (value.value() instanceof StringValue(String string)) {
+            return string;
+        }
+        throw errorAt(value.pos(), "expected string for " + name);
+    }
+
+    private String requireSymbol(LocatedValue value, String name) throws EvalError {
+        if (value.value() instanceof SymbolValue(String symbol)) {
+            return symbol;
+        }
+        throw errorAt(value.pos(), "expected symbol for " + name);
+    }
+
+    private int requireStringIndex(LocatedValue value, String name, int upperBound) throws EvalError {
+        long index = requireInt(value, name);
+        if (index < 0 || index > upperBound) {
+            throw errorAt(value.pos(), "index out of range for " + name);
+        }
+        return (int) index;
+    }
+
     private PairValue requirePair(LocatedValue value, String name) throws EvalError {
         if (value.value() instanceof PairValue pair) {
             return pair;
@@ -618,6 +750,10 @@ public class Evaluator {
         return value ? TRUE_VALUE : FALSE_VALUE;
     }
 
+    private void appendOutput(String value) {
+        outputBuffer.append(value);
+    }
+
     private EvalError errorAt(SourcePos pos, String message) {
         return new EvalError(message, pos.line(), pos.column());
     }
@@ -645,7 +781,7 @@ public class Evaluator {
     private record LocatedValue(Value value, SourcePos pos) {}
 
     private sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue,
-            PairValue, EmptyListValue, BuiltinProcedure, LambdaProcedure, VoidValue {
+            CharValue, PairValue, EmptyListValue, BuiltinProcedure, LambdaProcedure, VoidValue {
         String render();
     }
 
@@ -673,19 +809,21 @@ public class Evaluator {
     private record StringValue(String value) implements Value {
         @Override
         public String render() {
-            String escaped = value
-                    .replace("\\", "\\\\")
-                    .replace("\"", "\\\"")
-                    .replace("\n", "\\n")
-                    .replace("\t", "\\t");
-            return "\"" + escaped + "\"";
+            return renderStringLiteral(value);
+        }
+    }
+
+    private record CharValue(char value) implements Value {
+        @Override
+        public String render() {
+            return renderCharacterLiteral(value);
         }
     }
 
     private record PairValue(Value car, Value cdr) implements Value {
         @Override
         public String render() {
-            return renderPair(this);
+            return renderPair(this, false);
         }
     }
 
@@ -757,6 +895,8 @@ public class Evaluator {
 
     private record Binding(String name, Expr valueExpr) {}
 
+    private record ProgramEvaluation(Value result, String output) {}
+
     private static final class Environment {
         private final Environment parent;
         private final Map<String, Value> bindings = new HashMap<>();
@@ -785,7 +925,22 @@ public class Evaluator {
     private static final EmptyListValue EMPTY_LIST = new EmptyListValue();
     private static final VoidValue VOID_VALUE = new VoidValue();
 
-    private static String renderPair(PairValue pair) {
+    private static String renderValue(Value value, boolean displayMode) {
+        if (value instanceof PairValue pair) {
+            return renderPair(pair, displayMode);
+        }
+        if (displayMode) {
+            if (value instanceof StringValue(String string)) {
+                return string;
+            }
+            if (value instanceof CharValue(char ch)) {
+                return Character.toString(ch);
+            }
+        }
+        return value.render();
+    }
+
+    private static String renderPair(PairValue pair, boolean displayMode) {
         StringBuilder builder = new StringBuilder("(");
         Value current = pair;
         boolean first = true;
@@ -794,7 +949,7 @@ public class Evaluator {
             if (!first) {
                 builder.append(' ');
             }
-            builder.append(car.render());
+            builder.append(renderValue(car, displayMode));
             current = cdr;
             first = false;
         }
@@ -804,8 +959,25 @@ public class Evaluator {
             return builder.toString();
         }
 
-        builder.append(" . ").append(current.render()).append(')');
+        builder.append(" . ").append(renderValue(current, displayMode)).append(')');
         return builder.toString();
+    }
+
+    private static String renderStringLiteral(String value) {
+        String escaped = value
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\t", "\\t");
+        return "\"" + escaped + "\"";
+    }
+
+    private static String renderCharacterLiteral(char value) {
+        return switch (value) {
+            case ' ' -> "#\\space";
+            case '\n' -> "#\\newline";
+            default -> "#\\" + value;
+        };
     }
 
     private static final class Parser {
