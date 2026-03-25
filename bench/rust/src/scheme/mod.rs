@@ -83,11 +83,14 @@ impl SchemeString {
     fn get(&self, index: usize, kind: &'static str) -> Result<char, EvalError> {
         let chars = self.chars.borrow();
 
-        chars.get(index).copied().ok_or(EvalError::IndexOutOfBounds {
-            kind,
-            index,
-            length: chars.len(),
-        })
+        chars
+            .get(index)
+            .copied()
+            .ok_or(EvalError::IndexOutOfBounds {
+                kind,
+                index,
+                length: chars.len(),
+            })
     }
 
     fn set(&self, index: usize, value: char, kind: &'static str) -> Result<(), EvalError> {
@@ -273,9 +276,32 @@ struct BuiltinProcedure {
 #[derive(Clone)]
 struct LambdaProcedure {
     name: String,
-    params: Vec<String>,
+    params: ParameterList,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+#[derive(Clone)]
+struct ParameterList {
+    required: Vec<String>,
+    rest: Option<String>,
+}
+
+impl ParameterList {
+    fn expected_arity(&self) -> String {
+        match self.rest {
+            Some(_) => format!("at least {}", self.required.len()),
+            None => self.required.len().to_string(),
+        }
+    }
+
+    fn accepts(&self, arg_count: usize) -> bool {
+        if self.rest.is_some() {
+            arg_count >= self.required.len()
+        } else {
+            arg_count == self.required.len()
+        }
+    }
 }
 
 struct Parser<'a> {
@@ -512,6 +538,7 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "display", builtin_display);
     define_builtin(&env, "write", builtin_write);
     define_builtin(&env, "newline", builtin_newline);
+    define_builtin(&env, "apply", builtin_apply);
     define_builtin(&env, "string-append", builtin_string_append);
     define_builtin(&env, "string-length", builtin_string_length);
     define_builtin(&env, "substring", builtin_substring);
@@ -828,7 +855,10 @@ fn eval_named_let(
 
     let bindings = parse_let_bindings(&args[0])?;
     let values = eval_let_values(&bindings, env.clone(), ctx)?;
-    let params = bindings.iter().map(|(param, _)| param.clone()).collect();
+    let params = ParameterList {
+        required: bindings.iter().map(|(param, _)| param.clone()).collect(),
+        rest: None,
+    };
     let named_env = Env::child(env);
     let lambda = make_lambda(
         name.to_string(),
@@ -912,7 +942,7 @@ fn eval_let_values(
     Ok(values)
 }
 
-fn parse_param_list(expr: &Expr) -> Result<Vec<String>, EvalError> {
+fn parse_param_list(expr: &Expr) -> Result<ParameterList, EvalError> {
     let Expr::List(params) = expr else {
         return Err(EvalError::SyntaxError {
             message: "lambda parameters must be a list".to_string(),
@@ -922,22 +952,53 @@ fn parse_param_list(expr: &Expr) -> Result<Vec<String>, EvalError> {
     parse_param_slice(params)
 }
 
-fn parse_param_slice(params: &[Expr]) -> Result<Vec<String>, EvalError> {
-    let mut names = Vec::with_capacity(params.len());
+fn parse_param_slice(params: &[Expr]) -> Result<ParameterList, EvalError> {
+    let mut required = Vec::with_capacity(params.len());
+    let mut index = 0;
 
-    for param in params {
-        let Expr::Symbol(name) = param else {
+    while index < params.len() {
+        let Expr::Symbol(name) = &params[index] else {
             return Err(EvalError::SyntaxError {
                 message: "parameter names must be symbols".to_string(),
             });
         };
-        names.push(name.clone());
+
+        if name == "." {
+            if index + 2 != params.len() {
+                return Err(EvalError::SyntaxError {
+                    message: "dot notation requires exactly one rest parameter".to_string(),
+                });
+            }
+
+            let Expr::Symbol(rest) = &params[index + 1] else {
+                return Err(EvalError::SyntaxError {
+                    message: "parameter names must be symbols".to_string(),
+                });
+            };
+
+            if rest == "." {
+                return Err(EvalError::SyntaxError {
+                    message: "parameter names must be symbols".to_string(),
+                });
+            }
+
+            return Ok(ParameterList {
+                required,
+                rest: Some(rest.clone()),
+            });
+        }
+
+        required.push(name.clone());
+        index += 1;
     }
 
-    Ok(names)
+    Ok(ParameterList {
+        required,
+        rest: None,
+    })
 }
 
-fn make_lambda(name: String, params: Vec<String>, body: Vec<Expr>, env: EnvRef) -> Value {
+fn make_lambda(name: String, params: ParameterList, body: Vec<Expr>, env: EnvRef) -> Value {
     Value::Procedure(Rc::new(Procedure::Lambda(LambdaProcedure {
         name,
         params,
@@ -1003,10 +1064,10 @@ fn apply_lambda(
     args: Vec<Value>,
     ctx: &mut EvalContext,
 ) -> Result<Value, EvalError> {
-    if args.len() != lambda.params.len() {
+    if !lambda.params.accepts(args.len()) {
         return Err(EvalError::WrongArgumentCount {
             name: lambda.name.clone(),
-            expected: lambda.params.len().to_string(),
+            expected: lambda.params.expected_arity(),
             got: args.len(),
         });
     }
@@ -1014,8 +1075,19 @@ fn apply_lambda(
     let call_env = Env::child(lambda.env.clone());
     {
         let mut scope = call_env.borrow_mut();
-        for (param, arg) in lambda.params.iter().cloned().zip(args) {
+        let mut args = args.into_iter();
+
+        for param in lambda.params.required.iter().cloned() {
+            let arg = args
+                .next()
+                .expect("arity check should ensure enough arguments");
             scope.bindings.insert(param, arg);
+        }
+
+        if let Some(rest) = &lambda.params.rest {
+            scope
+                .bindings
+                .insert(rest.clone(), list_from_values(args.collect()));
         }
     }
 
@@ -1123,6 +1195,24 @@ fn builtin_newline(args: &[Value], ctx: &mut EvalContext) -> Result<Value, EvalE
     expect_value_arity("newline", args, 0)?;
     ctx.emit("\n");
     Ok(Value::Void)
+}
+
+fn builtin_apply(args: &[Value], ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgumentCount {
+            name: "apply".to_string(),
+            expected: "at least 2".to_string(),
+            got: args.len(),
+        });
+    }
+
+    let (operator, rest) = args
+        .split_first()
+        .expect("arity check should ensure operator");
+    let mut applied_args = rest[..rest.len() - 1].to_vec();
+    applied_args.extend(expect_list_values(&rest[rest.len() - 1])?);
+
+    apply_evaluated(operator.clone(), applied_args, ctx)
 }
 
 fn builtin_string_append(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -1331,6 +1421,36 @@ fn copy_list_with_tail(list: &Value, tail: Value) -> Result<Value, EvalError> {
             expected: "pair",
             actual: other.type_name(),
         }),
+    }
+}
+
+fn list_from_values(values: Vec<Value>) -> Value {
+    values
+        .into_iter()
+        .rev()
+        .fold(Value::EmptyList, |tail, value| {
+            Value::Pair(Box::new(value), Box::new(tail))
+        })
+}
+
+fn expect_list_values(value: &Value) -> Result<Vec<Value>, EvalError> {
+    let mut values = Vec::new();
+    let mut cursor = value;
+
+    loop {
+        match cursor {
+            Value::EmptyList => return Ok(values),
+            Value::Pair(car, cdr) => {
+                values.push((**car).clone());
+                cursor = cdr.as_ref();
+            }
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    expected: "pair",
+                    actual: other.type_name(),
+                });
+            }
+        }
     }
 }
 
