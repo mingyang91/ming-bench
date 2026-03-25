@@ -33,6 +33,9 @@ pub enum EvalError {
     #[error("continuations are not supported in this evaluation context")]
     UnsupportedContinuationContext,
 
+    #[error("interpreter invariant violated: {message}")]
+    InvariantViolation { message: String },
+
     #[error("macro error in {name}: {message}")]
     MacroError { name: String, message: String },
 

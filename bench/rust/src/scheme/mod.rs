@@ -387,6 +387,8 @@ struct EvalContext {
     output: String,
     capture_output: bool,
     gensym_counter: u64,
+    dynamic_winds: Vec<DynamicWindExtent>,
+    dynamic_wind_counter: u64,
 }
 
 impl EvalContext {
@@ -395,6 +397,8 @@ impl EvalContext {
             output: String::new(),
             capture_output,
             gensym_counter: 0,
+            dynamic_winds: Vec::new(),
+            dynamic_wind_counter: 0,
         }
     }
 
@@ -411,6 +415,15 @@ impl EvalContext {
     fn fresh_identifier(&mut self, name: &str) -> String {
         self.gensym_counter += 1;
         format!("__macro_{}_{}", self.gensym_counter, name)
+    }
+
+    fn fresh_dynamic_wind(&mut self, before: Value, after: Value) -> DynamicWindExtent {
+        self.dynamic_wind_counter += 1;
+        DynamicWindExtent {
+            id: self.dynamic_wind_counter,
+            before,
+            after,
+        }
     }
 }
 
@@ -450,6 +463,7 @@ enum Procedure {
     RecordConstructor(RecordConstructorProcedure),
     RecordPredicate(RecordPredicateProcedure),
     RecordAccessor(RecordAccessorProcedure),
+    DynamicWind(DynamicWindProcedure),
     CallCc(CallCcProcedure),
     Continuation(ContinuationProcedure),
 }
@@ -457,6 +471,11 @@ enum Procedure {
 #[derive(Clone)]
 struct BuiltinProcedure {
     implementation: BuiltinFn,
+}
+
+#[derive(Clone)]
+struct DynamicWindProcedure {
+    name: String,
 }
 
 #[derive(Clone)]
@@ -520,6 +539,14 @@ struct RecordAccessorProcedure {
 #[derive(Clone)]
 struct ContinuationProcedure {
     frames: Vec<MachineFrame>,
+    wind_stack: Vec<DynamicWindExtent>,
+}
+
+#[derive(Clone)]
+struct DynamicWindExtent {
+    id: u64,
+    before: Value,
+    after: Value,
 }
 
 #[derive(Clone)]
@@ -880,6 +907,7 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "vector?", builtin_vector_predicate);
     define_builtin(&env, "vector->list", builtin_vector_to_list);
     define_builtin(&env, "list->vector", builtin_list_to_vector);
+    define_dynamic_wind_builtin(&env, "dynamic-wind");
     define_callcc_builtin(&env, "call/cc");
     define_callcc_builtin(&env, "call-with-current-continuation");
 
@@ -889,6 +917,13 @@ fn default_env() -> EnvRef {
 fn define_builtin(env: &EnvRef, name: &'static str, implementation: BuiltinFn) {
     let value = Value::Procedure(Rc::new(Procedure::Builtin(BuiltinProcedure {
         implementation,
+    })));
+    bind_value(env, name.to_string(), value);
+}
+
+fn define_dynamic_wind_builtin(env: &EnvRef, name: &'static str) {
+    let value = Value::Procedure(Rc::new(Procedure::DynamicWind(DynamicWindProcedure {
+        name: name.to_string(),
     })));
     bind_value(env, name.to_string(), value);
 }
@@ -981,6 +1016,12 @@ enum CondMatchAction {
 }
 
 #[derive(Clone)]
+enum WindTransitionStep {
+    Exit(DynamicWindExtent),
+    Enter(DynamicWindExtent),
+}
+
+#[derive(Clone)]
 enum MachineFrame {
     Sequence {
         remaining: Vec<Expr>,
@@ -1028,6 +1069,23 @@ enum MachineFrame {
         evaluated: Vec<Value>,
         remaining: Vec<Expr>,
         env: EnvRef,
+    },
+    DynamicWindEnter {
+        wind: DynamicWindExtent,
+        thunk: Value,
+    },
+    DynamicWindBody {
+        wind: DynamicWindExtent,
+    },
+    DynamicWindComplete {
+        result: Value,
+    },
+    WindTransition {
+        pending_install: Option<DynamicWindExtent>,
+        remaining_steps: Vec<WindTransitionStep>,
+        target_frames: Vec<MachineFrame>,
+        target_winds: Vec<DynamicWindExtent>,
+        result: Value,
     },
 }
 
@@ -1515,6 +1573,43 @@ fn resume_machine_frame(
                 apply_machine_value(operator, evaluated, ctx, frames)
             }
         }
+        MachineFrame::DynamicWindEnter { wind, thunk } => {
+            let _ = value;
+            ctx.dynamic_winds.push(wind.clone());
+            frames.push(MachineFrame::DynamicWindBody { wind });
+            apply_machine_value(thunk, Vec::new(), ctx, frames)
+        }
+        MachineFrame::DynamicWindBody { wind } => {
+            pop_dynamic_wind(ctx, wind.id)?;
+            frames.push(MachineFrame::DynamicWindComplete { result: value });
+            apply_machine_value(wind.after.clone(), Vec::new(), ctx, frames)
+        }
+        MachineFrame::DynamicWindComplete { result } => {
+            let _ = value;
+            Ok(MachineState::Value(result))
+        }
+        MachineFrame::WindTransition {
+            pending_install,
+            remaining_steps,
+            target_frames,
+            target_winds,
+            result,
+        } => {
+            let _ = value;
+
+            if let Some(wind) = pending_install {
+                ctx.dynamic_winds.push(wind);
+            }
+
+            schedule_wind_transition(
+                remaining_steps,
+                target_frames,
+                target_winds,
+                result,
+                ctx,
+                frames,
+            )
+        }
     }
 }
 
@@ -1562,19 +1657,135 @@ fn apply_machine_value(
         Procedure::RecordAccessor(accessor) => {
             Ok(MachineState::Value(apply_record_accessor(accessor, args)?))
         }
+        Procedure::DynamicWind(dynamic_wind) => {
+            apply_machine_dynamic_wind(dynamic_wind, args, ctx, frames)
+        }
         Procedure::CallCc(callcc) => {
             expect_value_arity(&callcc.name, &args, 1)?;
             let continuation =
                 Value::Procedure(Rc::new(Procedure::Continuation(ContinuationProcedure {
                     frames: frames.clone(),
+                    wind_stack: ctx.dynamic_winds.clone(),
                 })));
             apply_machine_value(args[0].clone(), vec![continuation], ctx, frames)
         }
         Procedure::Continuation(continuation) => {
             expect_value_arity("continuation", &args, 1)?;
-            *frames = continuation.frames.clone();
-            Ok(MachineState::Value(args[0].clone()))
+            apply_machine_continuation(continuation, args[0].clone(), ctx, frames)
         }
+    }
+}
+
+fn apply_machine_dynamic_wind(
+    dynamic_wind: &DynamicWindProcedure,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    expect_value_arity(&dynamic_wind.name, &args, 3)?;
+
+    let wind = ctx.fresh_dynamic_wind(args[0].clone(), args[2].clone());
+    frames.push(MachineFrame::DynamicWindEnter {
+        wind,
+        thunk: args[1].clone(),
+    });
+    apply_machine_value(args[0].clone(), Vec::new(), ctx, frames)
+}
+
+fn apply_machine_continuation(
+    continuation: &ContinuationProcedure,
+    value: Value,
+    ctx: &mut EvalContext,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    let steps = build_wind_transition_steps(&ctx.dynamic_winds, &continuation.wind_stack);
+    schedule_wind_transition(
+        steps,
+        continuation.frames.clone(),
+        continuation.wind_stack.clone(),
+        value,
+        ctx,
+        frames,
+    )
+}
+
+fn schedule_wind_transition(
+    steps: Vec<WindTransitionStep>,
+    target_frames: Vec<MachineFrame>,
+    target_winds: Vec<DynamicWindExtent>,
+    result: Value,
+    ctx: &mut EvalContext,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    let Some((step, remaining_steps)) = steps.split_first() else {
+        ctx.dynamic_winds = target_winds;
+        *frames = target_frames;
+        return Ok(MachineState::Value(result));
+    };
+
+    let (thunk, pending_install) = match step.clone() {
+        WindTransitionStep::Exit(wind) => {
+            pop_dynamic_wind(ctx, wind.id)?;
+            (wind.after, None)
+        }
+        WindTransitionStep::Enter(wind) => (wind.before.clone(), Some(wind)),
+    };
+
+    frames.push(MachineFrame::WindTransition {
+        pending_install,
+        remaining_steps: remaining_steps.to_vec(),
+        target_frames,
+        target_winds,
+        result,
+    });
+    apply_machine_value(thunk, Vec::new(), ctx, frames)
+}
+
+fn build_wind_transition_steps(
+    current: &[DynamicWindExtent],
+    target: &[DynamicWindExtent],
+) -> Vec<WindTransitionStep> {
+    let mut shared_prefix = 0;
+
+    while shared_prefix < current.len()
+        && shared_prefix < target.len()
+        && current[shared_prefix].id == target[shared_prefix].id
+    {
+        shared_prefix += 1;
+    }
+
+    let mut steps = current[shared_prefix..]
+        .iter()
+        .rev()
+        .cloned()
+        .map(WindTransitionStep::Exit)
+        .collect::<Vec<_>>();
+
+    steps.extend(
+        target[shared_prefix..]
+            .iter()
+            .cloned()
+            .map(WindTransitionStep::Enter),
+    );
+
+    steps
+}
+
+fn pop_dynamic_wind(ctx: &mut EvalContext, expected_id: u64) -> Result<(), EvalError> {
+    match ctx.dynamic_winds.pop() {
+        Some(wind) if wind.id == expected_id => Ok(()),
+        Some(wind) => Err(EvalError::InvariantViolation {
+            message: format!(
+                "dynamic-wind stack mismatch: expected {}, found {}",
+                expected_id, wind.id
+            ),
+        }),
+        None => Err(EvalError::InvariantViolation {
+            message: format!(
+                "attempted to pop dynamic-wind {} from an empty stack",
+                expected_id
+            ),
+        }),
     }
 }
 
@@ -2903,6 +3114,7 @@ fn apply_procedure(
         Procedure::RecordConstructor(constructor) => apply_record_constructor(constructor, args),
         Procedure::RecordPredicate(predicate) => apply_record_predicate(predicate, args),
         Procedure::RecordAccessor(accessor) => apply_record_accessor(accessor, args),
+        Procedure::DynamicWind(dynamic_wind) => apply_dynamic_wind(dynamic_wind, args, ctx),
         Procedure::CallCc(callcc) => apply_callcc(callcc, args, ctx),
         Procedure::Continuation(continuation) => apply_continuation(continuation, args, ctx),
     }
@@ -2928,6 +3140,11 @@ fn tail_apply_procedure(
         Procedure::RecordAccessor(accessor) => {
             Ok(TailOutcome::Value(apply_record_accessor(accessor, args)?))
         }
+        Procedure::DynamicWind(dynamic_wind) => Ok(TailOutcome::Value(apply_dynamic_wind(
+            dynamic_wind,
+            args,
+            ctx,
+        )?)),
         Procedure::CallCc(callcc) => Ok(TailOutcome::Value(apply_callcc(callcc, args, ctx)?)),
         Procedure::Continuation(continuation) => Ok(TailOutcome::Value(apply_continuation(
             continuation,
@@ -2935,6 +3152,26 @@ fn tail_apply_procedure(
             ctx,
         )?)),
     }
+}
+
+fn apply_dynamic_wind(
+    dynamic_wind: &DynamicWindProcedure,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    expect_value_arity(&dynamic_wind.name, &args, 3)?;
+
+    let wind = ctx.fresh_dynamic_wind(args[0].clone(), args[2].clone());
+    let _ = apply_evaluated(args[0].clone(), Vec::new(), ctx)?;
+
+    ctx.dynamic_winds.push(wind.clone());
+    let body_result = apply_evaluated(args[1].clone(), Vec::new(), ctx);
+    let pop_result = pop_dynamic_wind(ctx, wind.id);
+    let out_result = apply_evaluated(wind.after.clone(), Vec::new(), ctx);
+
+    pop_result?;
+    let _ = out_result?;
+    body_result
 }
 
 fn eval_args(
