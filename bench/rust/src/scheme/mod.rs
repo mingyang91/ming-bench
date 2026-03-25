@@ -82,6 +82,7 @@ enum Value {
         fields: Vec<(String, Value)>,
     },
     Void,
+    Values(Vec<Value>),
 }
 
 fn make_pair(car: Value, cdr: Value) -> Value {
@@ -273,6 +274,14 @@ impl fmt::Display for Value {
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
             Value::Void => write!(f, "#<void>"),
+            Value::Values(vals) => {
+                write!(f, "#<values:")?;
+                for (i, v) in vals.iter().enumerate() {
+                    if i > 0 { write!(f, " ")?; }
+                    write!(f, "{v}")?;
+                }
+                write!(f, ">")
+            }
         }
     }
 }
@@ -646,6 +655,7 @@ fn default_env() -> Env {
         "call/cc", "call-with-current-continuation",
         "dynamic-wind",
         "raise", "with-exception-handler",
+        "values", "call-with-values",
     ] {
         env.set(name.into(), Value::Builtin(name.into()));
     }
@@ -961,6 +971,7 @@ enum Cont {
         val: Value,
         saved_k: K,
     },
+    CallWithValuesK(Value, Span, K), // (consumer, call_span, next)
 }
 
 impl fmt::Debug for Cont {
@@ -1133,6 +1144,23 @@ fn cek_apply_func(
             });
             *k = Rc::new(Cont::WithExHandlerBody(k.clone()));
             cek_apply_func(&body_thunk, &[], span, st, k, winders, handlers, output)
+        }
+        Value::Builtin(ref bname) if bname == "values" => {
+            if args.len() == 1 {
+                *st = CekState::Ret(args[0].clone());
+            } else {
+                *st = CekState::Ret(Value::Values(args.to_vec()));
+            }
+            Ok(())
+        }
+        Value::Builtin(ref bname) if bname == "call-with-values" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("call-with-values requires 2 arguments at {span}")));
+            }
+            let producer = args[0].clone();
+            let consumer = args[1].clone();
+            *k = Rc::new(Cont::CallWithValuesK(consumer, span, k.clone()));
+            cek_apply_func(&producer, &[], span, st, k, winders, handlers, output)
         }
         Value::Builtin(ref bname) if bname == "dynamic-wind" => {
             if args.len() != 3 {
@@ -2218,6 +2246,14 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                             k = saved_k;
                             st = CekState::Ret(cont_val);
                         }
+                    }
+                    Cont::CallWithValuesK(consumer, call_span, next) => {
+                        let args = match val {
+                            Value::Values(vals) => vals,
+                            single => vec![single],
+                        };
+                        k = next;
+                        cek_apply_func(&consumer, &args, call_span, &mut st, &mut k, &mut winders, &mut handlers, output)?;
                     }
                     Cont::WithExHandlerBody(next) => {
                         // Body of with-exception-handler returned normally; pop handler
