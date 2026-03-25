@@ -170,6 +170,11 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quote requires 1 argument", sym.Line, sym.Col)}
 				}
 				return quoteExpr(e.Elems[1])
+			case "quasiquote":
+				if len(e.Elems) != 2 {
+					return nil, &EvalError{Message: "quasiquote requires 1 argument"}
+				}
+				return evalQuasiquote(e.Elems[1], env, 0)
 			case "dynamic-wind":
 				return evalDynamicWind(e, env)
 			case "guard":
@@ -357,6 +362,16 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 					if isTruthy(test) {
 						if len(cl.Elems) == 1 {
 							return test, nil
+						}
+						// Handle => clause: (test => proc)
+						if len(cl.Elems) == 3 {
+							if arrow, ok := cl.Elems[1].(*SymbolExpr); ok && arrow.Name == "=>" {
+								proc, perr := evalExpr(cl.Elems[2], env)
+								if perr != nil {
+									return nil, perr
+								}
+								return applyCallable(proc, []Value{test})
+							}
 						}
 						condBody2 := cl.Elems[1:]
 						for ci, bodyExpr := range condBody2[:len(condBody2)-1] {
@@ -689,7 +704,7 @@ func evalDefine(e *ListExpr, env *Env) (Value, error) {
 		if !ok {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol", e.Line, e.Col)}
 		}
-		params, rest, perr := parseParams(target.Elems[1:], e.Line, e.Col)
+		params, rest, perr := parseParams(target.Elems[1:], target.Dot, e.Line, e.Col)
 		if perr != nil {
 			return nil, perr
 		}
@@ -720,26 +735,22 @@ func evalIf(e *ListExpr, env *Env) (Value, error) {
 
 // parseParams extracts parameter names and optional rest param from a list of exprs.
 // Handles dot notation: (x y . rest) -> params=["x","y"], rest="rest"
-func parseParams(elems []Expr, line, col int) ([]string, string, error) {
+func parseParams(elems []Expr, dot Expr, line, col int) ([]string, string, error) {
 	var params []string
 	var restParam string
-	for i, p := range elems {
+	for _, p := range elems {
 		ps, ok := p.(*SymbolExpr)
 		if !ok {
 			return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: expected symbol in parameter list", line, col)}
 		}
-		if ps.Name == "." {
-			if i+1 != len(elems)-1 {
-				return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: malformed dot in parameter list", line, col)}
-			}
-			rs, ok := elems[i+1].(*SymbolExpr)
-			if !ok {
-				return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: expected symbol after dot", line, col)}
-			}
-			restParam = rs.Name
-			break
-		}
 		params = append(params, ps.Name)
+	}
+	if dot != nil {
+		rs, ok := dot.(*SymbolExpr)
+		if !ok {
+			return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: expected symbol after dot", line, col)}
+		}
+		restParam = rs.Name
 	}
 	return params, restParam, nil
 }
@@ -750,7 +761,7 @@ func evalLambda(e *ListExpr, env *Env) (Value, error) {
 	}
 	switch pl := e.Elems[1].(type) {
 	case *ListExpr:
-		params, rest, err := parseParams(pl.Elems, e.Line, e.Col)
+		params, rest, err := parseParams(pl.Elems, pl.Dot, e.Line, e.Col)
 		if err != nil {
 			return nil, err
 		}
@@ -775,7 +786,7 @@ func evalCaseLambda(e *ListExpr, env *Env) (Value, error) {
 		}
 		switch pl := cl.Elems[0].(type) {
 		case *ListExpr:
-			params, rest, err := parseParams(pl.Elems, cl.Line, cl.Col)
+			params, rest, err := parseParams(pl.Elems, pl.Dot, cl.Line, cl.Col)
 			if err != nil {
 				return nil, err
 			}
@@ -965,11 +976,20 @@ func quoteExpr(expr Expr) (Value, error) {
 	case *SymbolExpr:
 		return &SymbolVal{Val: e.Name}, nil
 	case *ListExpr:
-		if len(e.Elems) == 0 {
+		if len(e.Elems) == 0 && e.Dot == nil {
 			return &NilVal{}, nil
 		}
-		// Build a proper list from the elements
-		var result Value = &NilVal{}
+		// Build list, using Dot as final cdr if present
+		var result Value
+		if e.Dot != nil {
+			var err error
+			result, err = quoteExpr(e.Dot)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			result = &NilVal{}
+		}
 		for i := len(e.Elems) - 1; i >= 0; i-- {
 			car, err := quoteExpr(e.Elems[i])
 			if err != nil {
@@ -990,6 +1010,129 @@ func quoteExpr(expr Expr) (Value, error) {
 		return &VectorVal{Elems: elems}, nil
 	}
 	return nil, &EvalError{Message: "quote: unsupported expression type"}
+}
+
+// evalQuasiquote expands a quasiquote expression. depth tracks nesting level.
+func evalQuasiquote(expr Expr, env *Env, depth int) (Value, error) {
+	switch e := expr.(type) {
+	case *ListExpr:
+		if len(e.Elems) == 0 {
+			return &NilVal{}, nil
+		}
+		// Check for (unquote x) or (unquote-splicing x)
+		if len(e.Elems) == 2 {
+			if sym, ok := e.Elems[0].(*SymbolExpr); ok {
+				if sym.Name == "unquote" {
+					if depth == 0 {
+						return evalExpr(e.Elems[1], env)
+					}
+					// nested quasiquote: decrement depth
+					inner, err := evalQuasiquote(e.Elems[1], env, depth-1)
+					if err != nil {
+						return nil, err
+					}
+					return &PairVal{Car: &SymbolVal{Val: "unquote"}, Cdr: &PairVal{Car: inner, Cdr: &NilVal{}}}, nil
+				}
+				if sym.Name == "quasiquote" {
+					inner, err := evalQuasiquote(e.Elems[1], env, depth+1)
+					if err != nil {
+						return nil, err
+					}
+					return &PairVal{Car: &SymbolVal{Val: "quasiquote"}, Cdr: &PairVal{Car: inner, Cdr: &NilVal{}}}, nil
+				}
+			}
+		}
+		// Process list elements, handling splicing
+		var result []Value
+		for _, elem := range e.Elems {
+			if le, ok := elem.(*ListExpr); ok && len(le.Elems) == 2 {
+				if sym, ok := le.Elems[0].(*SymbolExpr); ok {
+					if sym.Name == "unquote-splicing" {
+						if depth == 0 {
+							v, err := evalExpr(le.Elems[1], env)
+							if err != nil {
+								return nil, err
+							}
+							// Splice the list into result
+							for {
+								switch p := v.(type) {
+								case *PairVal:
+									result = append(result, p.Car)
+									v = p.Cdr
+									continue
+								case *NilVal:
+								default:
+									return nil, &EvalError{Message: "unquote-splicing: expected list"}
+								}
+								break
+							}
+							continue
+						}
+						// nested: decrement depth
+						inner, err := evalQuasiquote(le.Elems[1], env, depth-1)
+						if err != nil {
+							return nil, err
+						}
+						result = append(result, &PairVal{Car: &SymbolVal{Val: "unquote-splicing"}, Cdr: &PairVal{Car: inner, Cdr: &NilVal{}}})
+						continue
+					}
+				}
+			}
+			v, err := evalQuasiquote(elem, env, depth)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, v)
+		}
+		// Build list (with dotted cdr if present)
+		var list Value
+		if e.Dot != nil {
+			var err error
+			list, err = evalQuasiquote(e.Dot, env, depth)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			list = &NilVal{}
+		}
+		for i := len(result) - 1; i >= 0; i-- {
+			list = &PairVal{Car: result[i], Cdr: list}
+		}
+		return list, nil
+	case *VectorExpr:
+		var result []Value
+		for _, elem := range e.Elems {
+			if le, ok := elem.(*ListExpr); ok && len(le.Elems) == 2 {
+				if sym, ok := le.Elems[0].(*SymbolExpr); ok && sym.Name == "unquote-splicing" && depth == 0 {
+					v, err := evalExpr(le.Elems[1], env)
+					if err != nil {
+						return nil, err
+					}
+					for {
+						switch p := v.(type) {
+						case *PairVal:
+							result = append(result, p.Car)
+							v = p.Cdr
+							continue
+						case *NilVal:
+						default:
+							return nil, &EvalError{Message: "unquote-splicing: expected list"}
+						}
+						break
+					}
+					continue
+				}
+			}
+			v, err := evalQuasiquote(elem, env, depth)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, v)
+		}
+		return &VectorVal{Elems: result}, nil
+	default:
+		return quoteExpr(expr)
+	}
 }
 
 func evalAnd(exprs []Expr, env *Env) (Value, error) {
@@ -1344,6 +1487,16 @@ func evalCond(e *ListExpr, env *Env) (Value, error) {
 		if isTruthy(test) {
 			if len(cl.Elems) == 1 {
 				return test, nil
+			}
+			// Handle => clause: (test => proc)
+			if len(cl.Elems) == 3 {
+				if arrow, ok := cl.Elems[1].(*SymbolExpr); ok && arrow.Name == "=>" {
+					proc, err := evalExpr(cl.Elems[2], env)
+					if err != nil {
+						return nil, err
+					}
+					return applyCallable(proc, []Value{test})
+				}
 			}
 			return evalBegin(cl.Elems[1:], env)
 		}
@@ -1955,6 +2108,17 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 			return nil, &EvalError{Message: "raise: need 1 argument"}
 		}
 		panic(raisePanic{value: args[0]})
+	}})
+
+	env.set("error", &BuiltinFunc{Name: "error", Fn: func(args []Value) (Value, error) {
+		if len(args) < 1 {
+			return nil, &EvalError{Message: "error: need at least 1 argument"}
+		}
+		msg := displayValue(args[0])
+		for _, a := range args[1:] {
+			msg += " " + displayValue(a)
+		}
+		panic(raisePanic{value: &StringVal{Val: msg}})
 	}})
 
 	// eq? — identity/simple equality
@@ -3797,6 +3961,18 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	nonBodyEvalDepth = 0
 	var buf strings.Builder
 	env := makeGlobalEnv(&buf)
+
+	// Catch unhandled raise/error panics
+	defer func() {
+		if r := recover(); r != nil {
+			if rp, ok := r.(raisePanic); ok {
+				err = &EvalError{Message: fmt.Sprintf("unhandled exception: %s", displayValue(rp.value))}
+				return
+			}
+			panic(r)
+		}
+	}()
+
 	last, evalErr := evalTopLevel(exprs, env)
 	if evalErr != nil {
 		return "", "", evalErr

@@ -22,7 +22,10 @@ const (
 	tokFloat
 	tokRational
 	tokVecOpen     // #(
-	tokSyntaxQuote // #'
+	tokSyntaxQuote    // #'
+	tokQuasiquote     // `
+	tokUnquote        // ,
+	tokUnquoteSplice  // ,@
 	tokEOF
 )
 
@@ -44,7 +47,7 @@ func tokenize(input string) ([]token, error) {
 		ch := input[i]
 
 		// skip whitespace
-		if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' {
+		if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '\f' {
 			if ch == '\n' {
 				line++
 				col = 1
@@ -81,6 +84,24 @@ func tokenize(input string) ([]token, error) {
 			tokens = append(tokens, token{tokQuote, "'", line, startCol})
 			i++
 			col++
+			continue
+		}
+		if ch == '`' {
+			tokens = append(tokens, token{tokQuasiquote, "`", line, startCol})
+			i++
+			col++
+			continue
+		}
+		if ch == ',' {
+			if i+1 < len(input) && input[i+1] == '@' {
+				tokens = append(tokens, token{tokUnquoteSplice, ",@", line, startCol})
+				i += 2
+				col += 2
+			} else {
+				tokens = append(tokens, token{tokUnquote, ",", line, startCol})
+				i++
+				col++
+			}
 			continue
 		}
 
@@ -239,7 +260,8 @@ func tokenize(input string) ([]token, error) {
 
 func isDelimiter(ch byte) bool {
 	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' ||
-		ch == '(' || ch == ')' || ch == '"' || ch == ';'
+		ch == '(' || ch == ')' || ch == '"' || ch == ';' ||
+		ch == '`' || ch == ','
 }
 
 func isSymbolStart(ch byte) bool {
@@ -281,6 +303,7 @@ type SymbolExpr struct {
 
 type ListExpr struct {
 	Elems []Expr
+	Dot   Expr // non-nil for dotted pair: (a b . c)
 	Line  int
 	Col   int
 }
@@ -402,6 +425,39 @@ func (p *parser) parseExpr() (Expr, error) {
 			Line:  t.line,
 			Col:   t.col,
 		}, nil
+	case tokQuasiquote:
+		p.next()
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ListExpr{
+			Elems: []Expr{&SymbolExpr{Name: "quasiquote", Line: t.line, Col: t.col}, inner},
+			Line:  t.line,
+			Col:   t.col,
+		}, nil
+	case tokUnquote:
+		p.next()
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ListExpr{
+			Elems: []Expr{&SymbolExpr{Name: "unquote", Line: t.line, Col: t.col}, inner},
+			Line:  t.line,
+			Col:   t.col,
+		}, nil
+	case tokUnquoteSplice:
+		p.next()
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ListExpr{
+			Elems: []Expr{&SymbolExpr{Name: "unquote-splicing", Line: t.line, Col: t.col}, inner},
+			Line:  t.line,
+			Col:   t.col,
+		}, nil
 	case tokVecOpen:
 		p.next()
 		var elems []Expr
@@ -420,9 +476,23 @@ func (p *parser) parseExpr() (Expr, error) {
 	case tokLParen:
 		p.next()
 		var elems []Expr
+		var dot Expr
 		for p.peek().kind != tokRParen {
 			if p.peek().kind == tokEOF {
 				return nil, fmt.Errorf("%d:%d: unexpected end of input", t.line, t.col)
+			}
+			// Check for dotted pair: (a b . c)
+			if pk := p.peek(); pk.kind == tokSymbol && pk.text == "." && len(elems) > 0 {
+				p.next() // consume .
+				var err error
+				dot, err = p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				if p.peek().kind != tokRParen {
+					return nil, fmt.Errorf("%d:%d: expected ) after dotted pair", t.line, t.col)
+				}
+				break
 			}
 			e, err := p.parseExpr()
 			if err != nil {
@@ -431,7 +501,7 @@ func (p *parser) parseExpr() (Expr, error) {
 			elems = append(elems, e)
 		}
 		p.next() // consume )
-		return &ListExpr{Elems: elems, Line: t.line, Col: t.col}, nil
+		return &ListExpr{Elems: elems, Dot: dot, Line: t.line, Col: t.col}, nil
 	case tokEOF:
 		return nil, fmt.Errorf("unexpected end of input")
 	default:
