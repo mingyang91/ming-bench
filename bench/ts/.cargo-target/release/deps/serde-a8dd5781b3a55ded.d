@@ -1,0 +1,14 @@
+/home/my/.zeroclaw/workspace/workspace/cx-ts-def-r27/bench/ts/.cargo-target/release/deps/serde-a8dd5781b3a55ded.d: /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/my/.zeroclaw/workspace/workspace/cx-ts-def-r27/bench/ts/.cargo-target/release/build/serde-d3502a6cc52dbd5b/out/private.rs
+
+/home/my/.zeroclaw/workspace/workspace/cx-ts-def-r27/bench/ts/.cargo-target/release/deps/libserde-a8dd5781b3a55ded.rlib: /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/my/.zeroclaw/workspace/workspace/cx-ts-def-r27/bench/ts/.cargo-target/release/build/serde-d3502a6cc52dbd5b/out/private.rs
+
+/home/my/.zeroclaw/workspace/workspace/cx-ts-def-r27/bench/ts/.cargo-target/release/deps/libserde-a8dd5781b3a55ded.rmeta: /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/my/.zeroclaw/workspace/workspace/cx-ts-def-r27/bench/ts/.cargo-target/release/build/serde-d3502a6cc52dbd5b/out/private.rs
+
+/home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/home/my/.zeroclaw/workspace/workspace/cx-ts-def-r27/bench/ts/.cargo-target/release/build/serde-d3502a6cc52dbd5b/out/private.rs:
+
+# env-dep:OUT_DIR=/home/my/.zeroclaw/workspace/workspace/cx-ts-def-r27/bench/ts/.cargo-target/release/build/serde-d3502a6cc52dbd5b/out

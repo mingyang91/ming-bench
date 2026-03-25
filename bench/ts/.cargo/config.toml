@@ -1,0 +1,3 @@
+[build]
+rustc-wrapper = "/home/my/.zeroclaw/workspace/workspace/cx-ts-def-r27/bench/ts/.cargo/rustc-wrapper.sh"
+target-dir = "/home/my/.zeroclaw/workspace/workspace/cx-ts-def-r27/bench/ts/.cargo-target"
