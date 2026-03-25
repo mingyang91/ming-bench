@@ -27,6 +27,7 @@ pub(crate) enum Expr {
     Char(char, Position),
     Symbol(String, Position),
     List(Vec<Expr>, Position),
+    Vector(Vec<Expr>, Position),
 }
 
 impl Expr {
@@ -37,7 +38,8 @@ impl Expr {
             | Self::String(_, pos)
             | Self::Char(_, pos)
             | Self::Symbol(_, pos)
-            | Self::List(_, pos) => *pos,
+            | Self::List(_, pos)
+            | Self::Vector(_, pos) => *pos,
         }
     }
 }
@@ -528,8 +530,40 @@ pub(crate) fn quote_expr(expr: &Expr) -> Value {
         Expr::String(value, _) => make_immutable_string(value.clone()),
         Expr::Char(value, _) => Value::Char(*value),
         Expr::Symbol(value, _) => Value::Symbol(value.clone()),
-        Expr::List(items, _) => list_from_vec(items.iter().map(quote_expr).collect()),
+        Expr::List(items, _) => quote_list_expr(items),
+        Expr::Vector(items, _) => make_vector(items.iter().map(quote_expr).collect()),
     }
+}
+
+fn quote_list_expr(items: &[Expr]) -> Value {
+    match split_quoted_list(items) {
+        QuotedList::Proper(items) => list_from_vec(items.iter().map(quote_expr).collect()),
+        QuotedList::Improper { head, tail } => {
+            head.iter().rev().fold(quote_expr(tail), |cdr, expr| {
+                make_pair(quote_expr(expr), cdr)
+            })
+        }
+    }
+}
+
+enum QuotedList<'a> {
+    Proper(&'a [Expr]),
+    Improper { head: &'a [Expr], tail: &'a Expr },
+}
+
+fn split_quoted_list(items: &[Expr]) -> QuotedList<'_> {
+    let dot_index = items.iter().position(is_dot_expr);
+    match dot_index {
+        Some(index) if index > 0 && index + 2 == items.len() => QuotedList::Improper {
+            head: &items[..index],
+            tail: &items[index + 1],
+        },
+        Some(_) | None => QuotedList::Proper(items),
+    }
+}
+
+fn is_dot_expr(expr: &Expr) -> bool {
+    matches!(expr, Expr::Symbol(name, _) if name == ".")
 }
 
 fn render_value(value: &Value, mode: RenderMode) -> String {

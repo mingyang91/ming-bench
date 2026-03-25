@@ -104,6 +104,7 @@ pub(crate) fn parse_macro_definition(
     name: &str,
     spec: &Expr,
     env: &EnvRef,
+    runtime: &mut Runtime,
 ) -> Result<MacroTransformer, EvalError> {
     let Expr::List(items, _) = spec else {
         return Err(positioned_syntax_error(
@@ -125,6 +126,17 @@ pub(crate) fn parse_macro_definition(
         }
         Expr::Symbol(symbol, _) if symbol == "lambda" => {
             parse_procedure_macro_definition(name, rest, spec, env).map(MacroTransformer::Procedure)
+        }
+        Expr::Symbol(symbol, _) => {
+            let Some(transformer) = runtime.lookup_macro(symbol) else {
+                return Err(positioned_syntax_error(
+                    head,
+                    "define-syntax requires a syntax-rules or lambda transformer",
+                ));
+            };
+
+            let (expanded, _) = expand_macro_call(&transformer, items, env, runtime)?;
+            parse_macro_definition(name, &expanded, env, runtime)
         }
         _ => Err(positioned_syntax_error(
             head,
@@ -383,13 +395,14 @@ fn parse_syntax_rule(
         ));
     };
 
-    match head {
-        Expr::Symbol(name, _) if name == macro_name => {}
-        Expr::Symbol(_, _) => {
-            return Err(positioned_syntax_error(
-                head,
-                "syntax-rules pattern must start with the macro name",
-            ));
+    let normalized_pattern = match head {
+        // The pattern head is a placeholder for the macro keyword. Accept `_`,
+        // the macro name itself, or any other identifier, but normalize it so
+        // matching always checks the actual macro keyword.
+        Expr::Symbol(_, pos) => {
+            let mut normalized_items = pattern_items.clone();
+            normalized_items[0] = Expr::Symbol(macro_name.to_string(), *pos);
+            Expr::List(normalized_items, pattern.pos())
         }
         _ => {
             return Err(positioned_syntax_error(
@@ -397,15 +410,15 @@ fn parse_syntax_rule(
                 "syntax-rules pattern must start with an identifier",
             ));
         }
-    }
+    };
 
     let mut pattern_vars = HashSet::new();
     let mut match_literals = literals.clone();
     match_literals.insert(macro_name.to_string());
-    collect_pattern_variables(pattern, &match_literals, &mut pattern_vars);
+    collect_pattern_variables(&normalized_pattern, &match_literals, &mut pattern_vars);
 
     Ok(SyntaxRule {
-        pattern: pattern.clone(),
+        pattern: normalized_pattern,
         template: template.clone(),
         pattern_vars,
     })
@@ -440,6 +453,7 @@ fn eval_transformer_expr(
         )))),
         Expr::Char(value, _) => Ok(TransformerValue::Scheme(Value::Char(*value))),
         Expr::Symbol(name, pos) => eval_transformer_symbol(name, *pos, env, state),
+        Expr::Vector(_, _) => Ok(TransformerValue::Scheme(quote_expr(expr))),
         Expr::List(items, pos) => eval_transformer_list(items, *pos, env, state),
     }
 }
@@ -773,10 +787,12 @@ fn collect_pattern_variables(
     pattern_vars: &mut HashSet<String>,
 ) {
     match expr {
-        Expr::Symbol(name, _) if name != ELLIPSIS && name != "_" && !literals.contains(name) => {
+        Expr::Symbol(name, _)
+            if name != ELLIPSIS && name != "_" && name != "." && !literals.contains(name) =>
+        {
             pattern_vars.insert(name.clone());
         }
-        Expr::List(items, _) => {
+        Expr::Vector(items, _) | Expr::List(items, _) => {
             for item in items {
                 collect_pattern_variables(item, literals, pattern_vars);
             }
@@ -809,6 +825,10 @@ fn match_pattern(
             Expr::Char(other, _) if value == other => Some(bindings.clone()),
             _ => None,
         }),
+        Expr::Symbol(name, _) if name == "." => Ok(match input {
+            Expr::Symbol(other, _) if name == other => Some(bindings.clone()),
+            _ => None,
+        }),
         Expr::Symbol(name, _) if name == ELLIPSIS => {
             Err(syntax_error("misplaced ellipsis in macro pattern"))
         }
@@ -818,13 +838,215 @@ fn match_pattern(
             _ => None,
         }),
         Expr::Symbol(name, _) => bind_pattern_variable(name, input, ellipsis_depth, bindings),
-        Expr::List(patterns, _) => match input {
-            Expr::List(inputs, _) => {
+        Expr::Vector(patterns, _) => match input {
+            Expr::Vector(inputs, _) => {
                 match_list(patterns, inputs, literals, ellipsis_depth, bindings)
             }
             _ => Ok(None),
         },
+        Expr::List(patterns, _) => match input {
+            Expr::List(inputs, pos) => {
+                match_list_syntax(patterns, inputs, *pos, literals, ellipsis_depth, bindings)
+            }
+            _ => Ok(None),
+        },
     }
+}
+
+struct InputListSyntax<'a> {
+    head: &'a [Expr],
+    tail: Option<&'a Expr>,
+    pos: Position,
+}
+
+enum ParsedListSyntax<'a> {
+    Proper(&'a [Expr]),
+    Improper { head: &'a [Expr], tail: &'a Expr },
+}
+
+struct ImproperListMatchContext<'a> {
+    patterns: &'a [Expr],
+    tail_pattern: &'a Expr,
+    inputs: InputListSyntax<'a>,
+    literals: &'a HashSet<String>,
+    ellipsis_depth: usize,
+}
+
+fn match_list_syntax(
+    patterns: &[Expr],
+    inputs: &[Expr],
+    pos: Position,
+    literals: &HashSet<String>,
+    ellipsis_depth: usize,
+    bindings: &Bindings,
+) -> Result<Option<Bindings>, EvalError> {
+    match split_list_syntax(patterns) {
+        ParsedListSyntax::Proper(patterns) => match split_list_syntax(inputs) {
+            ParsedListSyntax::Proper(inputs) => {
+                match_list(patterns, inputs, literals, ellipsis_depth, bindings)
+            }
+            ParsedListSyntax::Improper { .. } => Ok(None),
+        },
+        ParsedListSyntax::Improper {
+            head: pattern_head,
+            tail: pattern_tail,
+        } => match_improper_list(
+            pattern_head,
+            pattern_tail,
+            parse_input_list_syntax(inputs, pos),
+            literals,
+            ellipsis_depth,
+            bindings,
+        ),
+    }
+}
+
+fn split_list_syntax(items: &[Expr]) -> ParsedListSyntax<'_> {
+    let dot_index = items.iter().position(is_dot_symbol);
+    match dot_index {
+        Some(index) if index > 0 && index + 2 == items.len() => ParsedListSyntax::Improper {
+            head: &items[..index],
+            tail: &items[index + 1],
+        },
+        Some(_) | None => ParsedListSyntax::Proper(items),
+    }
+}
+
+fn parse_input_list_syntax(items: &[Expr], pos: Position) -> InputListSyntax<'_> {
+    match split_list_syntax(items) {
+        ParsedListSyntax::Proper(head) => InputListSyntax {
+            head,
+            tail: None,
+            pos,
+        },
+        ParsedListSyntax::Improper { head, tail } => InputListSyntax {
+            head,
+            tail: Some(tail),
+            pos,
+        },
+    }
+}
+
+fn match_improper_list(
+    patterns: &[Expr],
+    tail_pattern: &Expr,
+    inputs: InputListSyntax<'_>,
+    literals: &HashSet<String>,
+    ellipsis_depth: usize,
+    bindings: &Bindings,
+) -> Result<Option<Bindings>, EvalError> {
+    let context = ImproperListMatchContext {
+        patterns,
+        tail_pattern,
+        inputs,
+        literals,
+        ellipsis_depth,
+    };
+    match_improper_list_from(&context, 0, 0, bindings)
+}
+
+fn match_improper_list_from(
+    context: &ImproperListMatchContext<'_>,
+    pattern_index: usize,
+    input_index: usize,
+    bindings: &Bindings,
+) -> Result<Option<Bindings>, EvalError> {
+    if pattern_index == context.patterns.len() {
+        let remainder = rebuild_list_remainder(&context.inputs, input_index);
+        return match_pattern(
+            context.tail_pattern,
+            &remainder,
+            context.literals,
+            context.ellipsis_depth,
+            bindings,
+        );
+    }
+
+    if followed_by_ellipsis(context.patterns, pattern_index) {
+        return match_repeated_improper_pattern(context, pattern_index, input_index, bindings);
+    }
+
+    let Some(input) = context.inputs.head.get(input_index) else {
+        return Ok(None);
+    };
+    let Some(next) = match_pattern(
+        &context.patterns[pattern_index],
+        input,
+        context.literals,
+        context.ellipsis_depth,
+        bindings,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    match_improper_list_from(context, pattern_index + 1, input_index + 1, &next)
+}
+
+fn match_repeated_improper_pattern(
+    context: &ImproperListMatchContext<'_>,
+    pattern_index: usize,
+    input_index: usize,
+    bindings: &Bindings,
+) -> Result<Option<Bindings>, EvalError> {
+    let min_remaining = minimum_inputs_required(&context.patterns[pattern_index + 2..]);
+    if context.inputs.head.len() < input_index + min_remaining {
+        return Ok(None);
+    }
+
+    let repeated = &context.patterns[pattern_index];
+    let max_repeat = context.inputs.head.len() - input_index - min_remaining;
+    for repeat in (0..=max_repeat).rev() {
+        let mut branch = bindings.clone();
+        initialize_repeated_list_branch(
+            repeated,
+            repeat,
+            context.literals,
+            context.ellipsis_depth,
+            &mut branch,
+        )?;
+        if !match_repeated_inputs(
+            repeated,
+            &context.inputs.head[input_index..input_index + repeat],
+            context.literals,
+            context.ellipsis_depth,
+            &mut branch,
+        )? {
+            continue;
+        }
+
+        if let Some(done) =
+            match_improper_list_from(context, pattern_index + 2, input_index + repeat, &branch)?
+        {
+            return Ok(Some(done));
+        }
+    }
+
+    Ok(None)
+}
+
+fn rebuild_list_remainder(inputs: &InputListSyntax<'_>, index: usize) -> Expr {
+    if index == inputs.head.len() {
+        return match inputs.tail {
+            Some(tail) => tail.clone(),
+            None => Expr::List(Vec::new(), inputs.pos),
+        };
+    }
+
+    build_list_expr(&inputs.head[index..], inputs.tail, inputs.pos)
+}
+
+fn build_list_expr(head: &[Expr], tail: Option<&Expr>, pos: Position) -> Expr {
+    let mut items = head.to_vec();
+    if let Some(tail) = tail {
+        items.push(Expr::Symbol(".".into(), pos));
+        items.push(tail.clone());
+    }
+    Expr::List(items, pos)
+}
+
+fn is_dot_symbol(expr: &Expr) -> bool {
+    matches!(expr, Expr::Symbol(name, _) if name == ".")
 }
 
 fn match_list(
@@ -1057,7 +1279,9 @@ fn ensure_empty_repeated_bindings(
     }
 
     match pattern {
-        Expr::Symbol(name, _) if name != ELLIPSIS && name != "_" && !literals.contains(name) => {
+        Expr::Symbol(name, _)
+            if name != ELLIPSIS && name != "_" && name != "." && !literals.contains(name) =>
+        {
             if ellipsis_depth == 1 {
                 bindings
                     .entry(name.clone())
@@ -1118,6 +1342,9 @@ fn expand_template(
         Expr::Symbol(name, pos) => {
             expand_template_symbol(name, *pos, state, repetition_index, local_renames)
         }
+        Expr::Vector(items, pos) => {
+            expand_plain_vector(items, *pos, state, repetition_index, local_renames)
+        }
         Expr::List(items, pos) if is_quote_form(items, state.pattern_vars) => {
             let datum = expand_quoted_template(&items[1], state, repetition_index)?;
             Ok(Expr::List(
@@ -1138,6 +1365,24 @@ fn expand_template(
             expand_plain_list(items, *pos, state, repetition_index, local_renames)
         }
     }
+}
+
+fn expand_plain_vector(
+    items: &[Expr],
+    pos: Position,
+    state: &mut ExpansionState<'_>,
+    repetition_index: Option<usize>,
+    local_renames: &HashMap<String, String>,
+) -> Result<Expr, EvalError> {
+    let Expr::List(expanded, _) =
+        expand_plain_list(items, pos, state, repetition_index, local_renames)?
+    else {
+        return Err(pos.attach(syntax_error(
+            "internal error: vector expansion did not produce a list",
+        )));
+    };
+
+    Ok(Expr::Vector(expanded, pos))
 }
 
 fn expand_template_symbol(
@@ -1459,7 +1704,12 @@ fn expand_template_body_forms(
                     body_renames,
                 )?);
             }
-            _ => expanded.push(expand_template(expr, state, repetition_index, body_renames)?),
+            _ => expanded.push(expand_template(
+                expr,
+                state,
+                repetition_index,
+                body_renames,
+            )?),
         }
     }
 
@@ -1556,8 +1806,24 @@ fn expand_quoted_template(
             expand_pattern_variable(name, *pos, state, repetition_index)
         }
         Expr::Symbol(_, _) => Ok(template.clone()),
+        Expr::Vector(items, pos) => expand_quoted_vector(items, *pos, state, repetition_index),
         Expr::List(items, pos) => expand_quoted_list(items, *pos, state, repetition_index),
     }
+}
+
+fn expand_quoted_vector(
+    items: &[Expr],
+    pos: Position,
+    state: &ExpansionState<'_>,
+    repetition_index: Option<usize>,
+) -> Result<Expr, EvalError> {
+    let Expr::List(expanded, _) = expand_quoted_list(items, pos, state, repetition_index)? else {
+        return Err(pos.attach(syntax_error(
+            "internal error: quoted vector expansion did not produce a list",
+        )));
+    };
+
+    Ok(Expr::Vector(expanded, pos))
 }
 
 fn expand_quoted_list(
@@ -1636,7 +1902,7 @@ fn collect_repeat_counts(
                 counts.push(values.len());
             }
         }
-        Expr::List(items, _) => {
+        Expr::Vector(items, _) | Expr::List(items, _) => {
             for item in items.iter().filter(|item| !is_ellipsis(item)) {
                 collect_repeat_counts(item, pattern_vars, bindings, counts);
             }

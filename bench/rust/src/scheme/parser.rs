@@ -45,6 +45,7 @@ impl<'a> Parser<'a> {
 
         match self.peek_char() {
             Some('(') => self.parse_list(pos),
+            Some('#') if self.peek_next_char() == Some('(') => self.parse_vector(pos),
             Some('\'') => self.parse_quote_shorthand(pos),
             Some('#') if self.peek_next_char() == Some('\'') => self.parse_syntax_shorthand(pos),
             Some('"') => self.parse_string(pos),
@@ -64,6 +65,21 @@ impl<'a> Parser<'a> {
                 Some(')') => return self.finish_list(items, pos),
                 Some(_) => items.push(self.parse_expr()?),
                 None => return Err(syntax_error(self.current_position(), "unterminated list")),
+            }
+        }
+    }
+
+    fn parse_vector(&mut self, pos: Position) -> Result<Expr, EvalError> {
+        self.expect_char('#')?;
+        self.expect_char('(')?;
+        let mut items = Vec::new();
+
+        loop {
+            self.skip_ignored();
+            match self.peek_char() {
+                Some(')') => return self.finish_vector(items, pos),
+                Some(_) => items.push(self.parse_expr()?),
+                None => return Err(syntax_error(self.current_position(), "unterminated vector")),
             }
         }
     }
@@ -160,6 +176,11 @@ impl<'a> Parser<'a> {
     fn finish_list(&mut self, items: Vec<Expr>, pos: Position) -> Result<Expr, EvalError> {
         self.bump_char();
         Ok(Expr::List(items, pos))
+    }
+
+    fn finish_vector(&mut self, items: Vec<Expr>, pos: Position) -> Result<Expr, EvalError> {
+        self.bump_char();
+        Ok(Expr::Vector(items, pos))
     }
 
     fn parse_string_escape(&mut self) -> Result<char, EvalError> {

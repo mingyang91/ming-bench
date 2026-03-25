@@ -95,9 +95,7 @@ struct CapturedContinuation {
 #[derive(Clone)]
 struct CapturedExceptionHandler {
     procedure: Value,
-    frames: Vec<MachineFrame>,
     winders: Vec<WinderRef>,
-    handlers: Vec<ExceptionHandlerRef>,
 }
 
 #[derive(Clone)]
@@ -340,6 +338,9 @@ fn eval_machine_expr(
             Some(value) => Ok(MachineControl::Values(ProducedValues::single(value))),
             None => Err(pos.attach(EvalError::UnboundSymbol { name: name.clone() })),
         },
+        Expr::Vector(_, _) => Ok(MachineControl::Values(ProducedValues::single(quote_expr(
+            expr.as_ref(),
+        )))),
         Expr::List(items, pos) => {
             eval_machine_list(items, *pos, &env, runtime, frames).map_err(|error| pos.attach(error))
         }
@@ -469,9 +470,14 @@ fn eval_machine_define(
             let value = eval_function_define(signature, rest, env, args.len())?;
             Ok(MachineControl::Values(ProducedValues::single(value)))
         }
-        Expr::Bool(_, _) | Expr::Number(_, _) | Expr::String(_, _) | Expr::Char(_, _) => Err(
-            positioned_syntax_error(target, "define requires a symbol or function signature"),
-        ),
+        Expr::Bool(_, _)
+        | Expr::Number(_, _)
+        | Expr::String(_, _)
+        | Expr::Char(_, _)
+        | Expr::Vector(_, _) => Err(positioned_syntax_error(
+            target,
+            "define requires a symbol or function signature",
+        )),
     }
 }
 
@@ -491,7 +497,8 @@ fn eval_machine_set(
         | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
-        | Expr::List(_, _) => {
+        | Expr::List(_, _)
+        | Expr::Vector(_, _) => {
             return Err(positioned_syntax_error(
                 target,
                 "set! target must be a symbol",
@@ -870,6 +877,7 @@ fn apply_machine_builtin(
 ) -> Result<MachineControl, EvalError> {
     match builtin.name {
         "dynamic-wind" => apply_dynamic_wind_builtin(&args, runtime, frames, pos),
+        "error" => apply_error_builtin(&args, runtime, frames, pos),
         "raise" => apply_raise_builtin(&args, runtime, frames, pos),
         "with-exception-handler" => {
             apply_with_exception_handler_builtin(&args, runtime, frames, pos)
@@ -920,20 +928,54 @@ fn apply_raise_builtin(
         return Err(wrong_arg_count("raise", "exactly 1", args.len()));
     };
 
-    let Some(handler_ref) = runtime.exception_handlers().last().cloned() else {
+    raise_machine_value(value.clone(), runtime, frames, pos)
+}
+
+fn apply_error_builtin(
+    args: &[Value],
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+    pos: Option<Position>,
+) -> Result<MachineControl, EvalError> {
+    raise_machine_value(error_value(args), runtime, frames, pos)
+}
+
+fn error_value(args: &[Value]) -> Value {
+    if args.is_empty() {
+        Value::Symbol("error".into())
+    } else {
+        list_from_vec(args.to_vec())
+    }
+}
+
+fn raise_machine_value(
+    value: Value,
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+    pos: Option<Position>,
+) -> Result<MachineControl, EvalError> {
+    let current_handlers = runtime.exception_handlers();
+    let Some(handler_ref) = current_handlers.last().cloned() else {
         return Err(EvalError::UncaughtException {
             value: value.render_for_error(),
         });
     };
 
-    let handler = Rc::downcast::<CapturedExceptionHandler>(handler_ref).map_err(|_| {
+    let handler = Rc::downcast::<CapturedExceptionHandler>(handler_ref.clone()).map_err(|_| {
         EvalError::SyntaxError {
             message: "internal error: invalid exception handler payload".into(),
+        }
+    })?;
+    let target_frames = frames_before_exception_handler(frames, &handler_ref).ok_or_else(|| {
+        EvalError::SyntaxError {
+            message: "internal error: exception handler frame missing".into(),
         }
     })?;
     let current_winders = runtime.winders();
     let target_winders = handler.winders.clone();
     let shared_prefix = common_winder_prefix_len(&current_winders, &target_winders);
+    let mut target_handlers = current_handlers;
+    let _ = target_handlers.pop();
 
     step_wind_transition(
         WindTransition {
@@ -943,12 +985,12 @@ fn apply_raise_builtin(
                 .rev()
                 .cloned()
                 .collect(),
-            target_frames: handler.frames.clone(),
+            target_frames,
             target_winders,
-            target_handlers: handler.handlers.clone(),
+            target_handlers,
             resume: WindResume::Apply {
                 operator: handler.procedure.clone(),
-                args: vec![value.clone()],
+                args: vec![value],
                 pos,
             },
             pos,
@@ -974,9 +1016,7 @@ fn apply_with_exception_handler_builtin(
 
     let captured: ExceptionHandlerRef = Rc::new(CapturedExceptionHandler {
         procedure: handler.clone(),
-        frames: frames.to_vec(),
         winders: runtime.winders(),
-        handlers: runtime.exception_handlers(),
     });
 
     runtime.push_exception_handler(captured.clone());
@@ -1119,10 +1159,6 @@ fn apply_captured_continuation(
     frames: &mut Vec<MachineFrame>,
     pos: Option<Position>,
 ) -> Result<MachineControl, EvalError> {
-    let [value] = args else {
-        return Err(wrong_arg_count("continuation", "exactly 1", args.len()));
-    };
-
     let captured =
         Rc::downcast::<CapturedContinuation>(captured).map_err(|_| EvalError::SyntaxError {
             message: "internal error: invalid continuation payload".into(),
@@ -1142,7 +1178,9 @@ fn apply_captured_continuation(
             target_frames: captured.frames.clone(),
             target_winders,
             target_handlers: captured.handlers.clone(),
-            resume: WindResume::Values(ProducedValues::single(value.clone())),
+            resume: WindResume::Values(ProducedValues {
+                values: args.to_vec(),
+            }),
             pos,
         },
         runtime,
@@ -1178,6 +1216,21 @@ fn pop_expected_exception_handler(runtime: &mut Runtime, expected: &ExceptionHan
             .unwrap_or(false),
         "exception handler stack out of sync"
     );
+}
+
+fn frames_before_exception_handler(
+    frames: &[MachineFrame],
+    target: &ExceptionHandlerRef,
+) -> Option<Vec<MachineFrame>> {
+    frames
+        .iter()
+        .rposition(|frame| {
+            matches!(
+                frame,
+                MachineFrame::ExceptionHandlerExit { handler } if Rc::ptr_eq(handler, target)
+            )
+        })
+        .map(|index| frames[..index].to_vec())
 }
 
 fn step_wind_transition(
@@ -1311,7 +1364,8 @@ fn expand_let_form(args: &[Expr], pos: Position) -> Result<Expr, EvalError> {
         | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
-        | Expr::List(_, _) => {
+        | Expr::List(_, _)
+        | Expr::Vector(_, _) => {
             let bindings = parse_let_bindings(head)?;
             if tail.is_empty() {
                 return Err(wrong_arg_count("let", "at least 2", 1));
@@ -1351,45 +1405,90 @@ fn expand_cond_clauses(
         return Ok(build_begin_expr(&[], pos));
     };
 
-    let parts = cond_clause_parts(clause)?;
-    if is_else_clause(parts) {
-        if !rest.is_empty() {
-            return Err(positioned_syntax_error(
-                clause,
-                "cond else clause must be last",
-            ));
-        }
-
-        return Ok(if parts.len() == 1 {
-            Expr::Bool(true, clause.pos())
-        } else {
-            build_begin_expr(&parts[1..], clause.pos())
-        });
-    }
-
-    let rest_expr = expand_cond_clauses(rest, pos, runtime)?;
-    if parts.len() == 1 {
-        let temp = runtime.fresh_symbol("cond");
-        let temp_expr = symbol_expr(&temp, clause.pos());
-        Ok(build_single_binding_let(
-            &temp,
-            parts[0].clone(),
-            build_if_expr(
-                temp_expr.clone(),
-                temp_expr.clone(),
+    match parse_cond_clause(clause)? {
+        CondClause::Else { body } => expand_else_cond_clause(clause, body, rest),
+        CondClause::TestOnly { test } => {
+            let rest_expr = expand_cond_clauses(rest, pos, runtime)?;
+            Ok(expand_test_only_cond_clause(
+                test,
                 rest_expr,
                 clause.pos(),
-            ),
-            clause.pos(),
-        ))
-    } else {
-        Ok(build_if_expr(
-            parts[0].clone(),
-            build_begin_expr(&parts[1..], clause.pos()),
-            rest_expr,
-            clause.pos(),
-        ))
+                runtime,
+            ))
+        }
+        CondClause::Arrow { test, receiver } => {
+            let rest_expr = expand_cond_clauses(rest, pos, runtime)?;
+            Ok(expand_arrow_cond_clause(
+                test,
+                receiver,
+                rest_expr,
+                clause.pos(),
+                runtime,
+            ))
+        }
+        CondClause::Body { test, body } => {
+            let rest_expr = expand_cond_clauses(rest, pos, runtime)?;
+            Ok(build_if_expr(
+                test.clone(),
+                build_begin_expr(body, clause.pos()),
+                rest_expr,
+                clause.pos(),
+            ))
+        }
     }
+}
+
+fn expand_else_cond_clause(clause: &Expr, body: &[Expr], rest: &[Expr]) -> Result<Expr, EvalError> {
+    if !rest.is_empty() {
+        return Err(positioned_syntax_error(
+            clause,
+            "cond else clause must be last",
+        ));
+    }
+
+    Ok(if body.is_empty() {
+        Expr::Bool(true, clause.pos())
+    } else {
+        build_begin_expr(body, clause.pos())
+    })
+}
+
+fn expand_test_only_cond_clause(
+    test: &Expr,
+    rest_expr: Expr,
+    pos: Position,
+    runtime: &mut Runtime,
+) -> Expr {
+    let temp = runtime.fresh_symbol("cond");
+    let temp_expr = symbol_expr(&temp, pos);
+    build_single_binding_let(
+        &temp,
+        test.clone(),
+        build_if_expr(temp_expr.clone(), temp_expr, rest_expr, pos),
+        pos,
+    )
+}
+
+fn expand_arrow_cond_clause(
+    test: &Expr,
+    receiver: &Expr,
+    rest_expr: Expr,
+    pos: Position,
+    runtime: &mut Runtime,
+) -> Expr {
+    let temp = runtime.fresh_symbol("cond");
+    let temp_expr = symbol_expr(&temp, pos);
+    build_single_binding_let(
+        &temp,
+        test.clone(),
+        build_if_expr(
+            temp_expr.clone(),
+            build_application_expr(receiver.clone(), vec![temp_expr], pos),
+            rest_expr,
+            pos,
+        ),
+        pos,
+    )
 }
 
 fn expand_case_form(
@@ -1729,7 +1828,7 @@ fn eval_define_syntax(
     };
 
     let name = expect_symbol_expr(target, "define-syntax name")?;
-    let transformer = parse_macro_definition(&name, transformer_expr, env)?;
+    let transformer = parse_macro_definition(&name, transformer_expr, env, runtime)?;
     runtime.define_macro(name, transformer);
     Ok(Value::Void)
 }
@@ -1809,7 +1908,8 @@ fn parse_let_bindings(bindings_expr: &Expr) -> Result<Vec<(String, Expr)>, EvalE
         | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
-        | Expr::Symbol(_, _) => {
+        | Expr::Symbol(_, _)
+        | Expr::Vector(_, _) => {
             return Err(positioned_syntax_error(
                 bindings_expr,
                 "let bindings must be a list",
@@ -1837,7 +1937,8 @@ fn parse_let_binding(binding: &Expr) -> Result<(String, Expr), EvalError> {
         | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
-        | Expr::Symbol(_, _) => Err(positioned_syntax_error(
+        | Expr::Symbol(_, _)
+        | Expr::Vector(_, _) => Err(positioned_syntax_error(
             binding,
             "let binding must be a list",
         )),
@@ -1862,7 +1963,8 @@ fn parse_do_bindings(bindings_expr: &Expr) -> Result<Vec<DoBindingSpec>, EvalErr
         | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
-        | Expr::Symbol(_, _) => {
+        | Expr::Symbol(_, _)
+        | Expr::Vector(_, _) => {
             return Err(positioned_syntax_error(
                 bindings_expr,
                 "do bindings must be a list",
@@ -1891,7 +1993,8 @@ fn parse_do_binding(binding: &Expr) -> Result<DoBindingSpec, EvalError> {
         | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
-        | Expr::Symbol(_, _) => Err(positioned_syntax_error(
+        | Expr::Symbol(_, _)
+        | Expr::Vector(_, _) => Err(positioned_syntax_error(
             binding,
             "do binding must be a list",
         )),
@@ -1911,7 +2014,8 @@ fn parse_record_constructor_spec(expr: &Expr) -> Result<RecordConstructorSpec, E
         | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
-        | Expr::Symbol(_, _) => {
+        | Expr::Symbol(_, _)
+        | Expr::Vector(_, _) => {
             return Err(positioned_syntax_error(
                 expr,
                 "record constructor must be a list",
@@ -1942,7 +2046,8 @@ fn parse_record_field_spec(expr: &Expr) -> Result<RecordFieldSpec, EvalError> {
         | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
-        | Expr::Symbol(_, _) => Err(positioned_syntax_error(expr, "record field must be a list")),
+        | Expr::Symbol(_, _)
+        | Expr::Vector(_, _) => Err(positioned_syntax_error(expr, "record field must be a list")),
     }
 }
 
@@ -1985,9 +2090,42 @@ fn cond_clause_parts(clause: &Expr) -> Result<&[Expr], EvalError> {
         | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
-        | Expr::Symbol(_, _) => Err(positioned_syntax_error(
+        | Expr::Symbol(_, _)
+        | Expr::Vector(_, _) => Err(positioned_syntax_error(
             clause,
             "cond clause must be a list",
+        )),
+    }
+}
+
+enum CondClause<'a> {
+    Else { body: &'a [Expr] },
+    TestOnly { test: &'a Expr },
+    Arrow { test: &'a Expr, receiver: &'a Expr },
+    Body { test: &'a Expr, body: &'a [Expr] },
+}
+
+fn parse_cond_clause(clause: &Expr) -> Result<CondClause<'_>, EvalError> {
+    let parts = cond_clause_parts(clause)?;
+    match parts {
+        [Expr::Symbol(symbol, _)] if symbol == "else" => Ok(CondClause::Else { body: &[] }),
+        [Expr::Symbol(symbol, _), body @ ..] if symbol == "else" => Ok(CondClause::Else { body }),
+        [test] => Ok(CondClause::TestOnly { test }),
+        [_, Expr::Symbol(symbol, _)] if symbol == "=>" => Err(positioned_syntax_error(
+            clause,
+            "cond => clause must have a recipient",
+        )),
+        [test, Expr::Symbol(symbol, _), receiver] if symbol == "=>" => {
+            Ok(CondClause::Arrow { test, receiver })
+        }
+        [_, Expr::Symbol(symbol, _), _, ..] if symbol == "=>" => Err(positioned_syntax_error(
+            clause,
+            "cond => clause must have exactly one recipient",
+        )),
+        [test, body @ ..] => Ok(CondClause::Body { test, body }),
+        [] => Err(positioned_syntax_error(
+            clause,
+            "cond clause cannot be empty",
         )),
     }
 }
@@ -2003,7 +2141,8 @@ fn case_clause_parts(clause: &Expr) -> Result<&[Expr], EvalError> {
         | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
-        | Expr::Symbol(_, _) => Err(positioned_syntax_error(
+        | Expr::Symbol(_, _)
+        | Expr::Vector(_, _) => Err(positioned_syntax_error(
             clause,
             "case clause must be a list",
         )),
@@ -2021,7 +2160,8 @@ fn case_clause_datums(expr: &Expr) -> Result<&[Expr], EvalError> {
         | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
-        | Expr::Symbol(_, _) => Err(positioned_syntax_error(
+        | Expr::Symbol(_, _)
+        | Expr::Vector(_, _) => Err(positioned_syntax_error(
             expr,
             "case clause datums must be a list",
         )),
@@ -2039,7 +2179,8 @@ fn do_termination_clause_parts(clause: &Expr) -> Result<&[Expr], EvalError> {
         | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
-        | Expr::Symbol(_, _) => Err(positioned_syntax_error(
+        | Expr::Symbol(_, _)
+        | Expr::Vector(_, _) => Err(positioned_syntax_error(
             clause,
             "do termination clause must be a list",
         )),
@@ -2060,7 +2201,8 @@ fn parse_guard_spec(spec: &Expr) -> Result<(String, &[Expr]), EvalError> {
         | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
-        | Expr::Symbol(_, _) => Err(positioned_syntax_error(spec, "guard spec must be a list")),
+        | Expr::Symbol(_, _)
+        | Expr::Vector(_, _) => Err(positioned_syntax_error(spec, "guard spec must be a list")),
     }
 }
 
@@ -2082,7 +2224,8 @@ fn expect_symbol_expr(expr: &Expr, context: &str) -> Result<String, EvalError> {
         | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
-        | Expr::List(_, _) => Err(positioned_syntax_error(
+        | Expr::List(_, _)
+        | Expr::Vector(_, _) => Err(positioned_syntax_error(
             expr,
             format!("{context} must be a symbol"),
         )),
@@ -2100,7 +2243,8 @@ fn parse_formals(params_expr: &Expr) -> Result<ParsedParams, EvalError> {
         | Expr::Bool(_, _)
         | Expr::Number(_, _)
         | Expr::String(_, _)
-        | Expr::Char(_, _) => Err(positioned_syntax_error(
+        | Expr::Char(_, _)
+        | Expr::Vector(_, _) => Err(positioned_syntax_error(
             params_expr,
             "lambda parameters must be a list or symbol",
         )),
@@ -2114,7 +2258,8 @@ fn parse_case_lambda_clause(clause: &Expr, env: &EnvRef) -> Result<LambdaProcedu
         | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
-        | Expr::Symbol(_, _) => {
+        | Expr::Symbol(_, _)
+        | Expr::Vector(_, _) => {
             return Err(positioned_syntax_error(
                 clause,
                 "case-lambda clause must be a list",

@@ -372,10 +372,26 @@ fn render_inexact(value: f64) -> String {
 }
 
 fn looks_numeric(token: &str) -> bool {
-    token.chars().any(|ch| ch.is_ascii_digit())
+    starts_like_number(token)
+        && token.chars().any(|ch| ch.is_ascii_digit())
         && token
             .chars()
             .all(|ch| ch.is_ascii_digit() || matches!(ch, '+' | '-' | '.' | '/' | 'e' | 'E'))
+}
+
+fn starts_like_number(token: &str) -> bool {
+    let mut chars = token.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    let second = chars.next();
+    match (first, second) {
+        (ch, _) if ch.is_ascii_digit() => true,
+        ('+' | '-', Some(ch)) if ch.is_ascii_digit() || ch == '.' => true,
+        ('.', Some(ch)) if ch.is_ascii_digit() => true,
+        _ => false,
+    }
 }
 
 fn split_exponent(text: &str) -> (&str, Option<&str>) {

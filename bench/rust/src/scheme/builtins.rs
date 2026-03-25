@@ -205,6 +205,14 @@ const BUILTINS: &[BuiltinProcedure] = &[
         func: builtin_member,
     },
     BuiltinProcedure {
+        name: "memq",
+        func: builtin_memq,
+    },
+    BuiltinProcedure {
+        name: "memv",
+        func: builtin_memv,
+    },
+    BuiltinProcedure {
         name: "string?",
         func: builtin_is_string,
     },
@@ -447,6 +455,10 @@ const BUILTINS: &[BuiltinProcedure] = &[
     BuiltinProcedure {
         name: "dynamic-wind",
         func: builtin_dynamic_wind,
+    },
+    BuiltinProcedure {
+        name: "error",
+        func: builtin_error,
     },
     BuiltinProcedure {
         name: "raise",
@@ -916,8 +928,23 @@ fn builtin_assv(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalErr
 }
 
 fn builtin_member(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    find_member("member", args, value_equal)
+}
+
+fn builtin_memq(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    find_member("memq", args, eq_value)
+}
+
+fn builtin_memv(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    find_member("memv", args, eqv_value)
+}
+
+fn find_member<F>(name: &str, args: &[Value], compare: F) -> Result<Value, EvalError>
+where
+    F: Fn(&Value, &Value) -> bool,
+{
     let [needle, list] = args else {
-        return Err(wrong_arg_count("member", "exactly 2", args.len()));
+        return Err(wrong_arg_count(name, "exactly 2", args.len()));
     };
 
     let mut current = list.clone();
@@ -927,7 +954,7 @@ fn builtin_member(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalE
         match current {
             Value::List(values) => {
                 for (index, value) in values.iter().enumerate() {
-                    if value_equal(needle, value) {
+                    if compare(needle, value) {
                         return Ok(list_from_vec(values[index..].to_vec()));
                     }
                 }
@@ -945,7 +972,7 @@ fn builtin_member(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalE
                     (borrowed.car.clone(), borrowed.cdr.clone())
                 };
 
-                if value_equal(needle, &car) {
+                if compare(needle, &car) {
                     return Ok(Value::Pair(pair.clone()));
                 }
 
@@ -1398,6 +1425,12 @@ fn builtin_dynamic_wind(_args: &[Value], _runtime: &mut Runtime) -> Result<Value
 fn builtin_raise(_args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     Err(EvalError::SyntaxError {
         message: "internal error: raise should be handled by the evaluator".into(),
+    })
+}
+
+fn builtin_error(_args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    Err(EvalError::SyntaxError {
+        message: "internal error: error should be handled by the evaluator".into(),
     })
 }
 
