@@ -1,7 +1,19 @@
 package ming
 
 private[ming] object SchemeInterpreter extends SchemeInterpreterTypes:
-  import SchemeInterpreterSyntax.*
+  import SchemeInterpreterSpecialForms.*
+
+  sealed private[ming] trait EvalTarget
+
+  private[ming] object EvalTarget:
+    final case class ExprTarget(expr: Expr, env: Env, macros: MacroScope)                  extends EvalTarget
+    final case class SequenceTarget(expressions: List[Expr], env: Env, macros: MacroScope) extends EvalTarget
+
+  sealed private[ming] trait EvalStep
+
+  private[ming] object EvalStep:
+    final case class Done(value: Value)           extends EvalStep
+    final case class Continue(target: EvalTarget) extends EvalStep
 
   def evalProgram(input: String): Value =
     runProgram(input)._1
@@ -25,227 +37,105 @@ private[ming] object SchemeInterpreter extends SchemeInterpreterTypes:
     (evalSequence(expressions, env, macroScope), runtime)
 
   private[ming] def evalSequence(expressions: List[Expr], env: Env, macros: MacroScope): Value =
-    expressions.foldLeft[Value](Value.Void) { (_, expr) =>
-      eval(expr, env, macros)
-    }
+    evalLoop(EvalTarget.SequenceTarget(expressions, env, macros))
 
   private def eval(expr: Expr, env: Env, macros: MacroScope): Value =
+    evalLoop(EvalTarget.ExprTarget(expr, env, macros))
+
+  private def evalLoop(initialTarget: EvalTarget): Value =
+    var current = initialTarget
+
+    while true do
+      current match
+        case EvalTarget.ExprTarget(expr, env, macros) =>
+          evalExprStep(expr, env, macros) match
+            case EvalStep.Done(value)      => return value
+            case EvalStep.Continue(target) => current = target
+        case EvalTarget.SequenceTarget(expressions, env, macros) =>
+          expressions match
+            case Nil =>
+              return Value.Void
+            case head :: Nil =>
+              current = EvalTarget.ExprTarget(head, env, macros)
+            case head :: tail =>
+              eval(head, env, macros)
+              current = EvalTarget.SequenceTarget(tail, env, macros)
+
+    throw new IllegalStateException("unreachable")
+
+  private def evalExprStep(expr: Expr, env: Env, macros: MacroScope): EvalStep =
     expr match
-      case Expr.Number(value, _)    => Value.Number(value)
-      case Expr.Bool(value, _)      => Value.Bool(value)
-      case Expr.StringLit(value, _) => Value.StringLit(value)
-      case Expr.Character(value, _) => Value.Character(value)
-      case Expr.Symbol(name, pos)   => env.lookup(name, pos)
+      case Expr.Number(value, _)    => EvalStep.Done(Value.Number(value))
+      case Expr.Bool(value, _)      => EvalStep.Done(Value.Bool(value))
+      case Expr.StringLit(value, _) => EvalStep.Done(Value.StringLit(value))
+      case Expr.Character(value, _) => EvalStep.Done(Value.Character(value))
+      case Expr.Symbol(name, pos)   => EvalStep.Done(env.lookup(name, pos))
       case Expr.ListExpr(items, pos) =>
         items match
-          case Nil                                          => throw EvalError.at(pos, "cannot evaluate empty list")
-          case Expr.Symbol("define-record-type", _) :: args => SchemeRecords.evalDefineRecordType(args, env, pos)
-          case Expr.Symbol("define-syntax", _) :: args      => evalDefineSyntax(args, env, macros, pos)
-          case Expr.Symbol("define", _) :: args             => evalDefine(args, env, macros, pos)
-          case Expr.Symbol("set!", _) :: args               => evalSet(args, env, macros, pos)
-          case Expr.Symbol("begin", _) :: args              => evalBegin(args, env, macros)
-          case Expr.Symbol("if", _) :: args                 => evalIf(args, env, macros, pos)
-          case Expr.Symbol("let", _) :: args                => evalLet(args, env, macros, pos)
-          case Expr.Symbol("letrec", _) :: args             => evalLetrec(args, env, macros, pos)
-          case Expr.Symbol("letrec*", _) :: args            => evalLetrecStar(args, env, macros, pos)
-          case Expr.Symbol("cond", _) :: args               => evalCond(args, env, macros, pos)
-          case Expr.Symbol("case", _) :: args               => evalCase(args, env, macros, pos)
-          case Expr.Symbol("quote", _) :: args              => evalQuote(args, pos)
-          case Expr.Symbol("lambda", _) :: args             => evalLambda(args, env, macros, pos)
-          case Expr.Symbol("case-lambda", _) :: args        => SchemeProcedures.evalCaseLambda(args, env, macros, pos)
+          case Nil => throw EvalError.at(pos, "cannot evaluate empty list")
+          case Expr.Symbol("define-record-type", _) :: args =>
+            EvalStep.Done(SchemeRecords.evalDefineRecordType(args, env, pos))
+          case Expr.Symbol("define-syntax", _) :: args =>
+            EvalStep.Done(evalDefineSyntax(args, env, macros, pos))
+          case Expr.Symbol("define", _) :: args =>
+            EvalStep.Done(evalDefine(args, env, macros, pos, eval))
+          case Expr.Symbol("set!", _) :: args =>
+            EvalStep.Done(evalSet(args, env, macros, pos, eval))
+          case Expr.Symbol("begin", _) :: args   => evalBegin(args, env, macros)
+          case Expr.Symbol("if", _) :: args      => evalIf(args, env, macros, pos, eval)
+          case Expr.Symbol("let", _) :: args     => evalLet(args, env, macros, pos, eval, applyProcedureStep)
+          case Expr.Symbol("letrec", _) :: args  => evalLetrec(args, env, macros, pos, eval)
+          case Expr.Symbol("letrec*", _) :: args => evalLetrecStar(args, env, macros, pos, eval)
+          case Expr.Symbol("cond", _) :: args    => evalCond(args, env, macros, pos, eval)
+          case Expr.Symbol("case", _) :: args    => evalCase(args, env, macros, pos, eval)
+          case Expr.Symbol("quote", _) :: args =>
+            EvalStep.Done(evalQuote(args, pos))
+          case Expr.Symbol("lambda", _) :: args =>
+            EvalStep.Done(evalLambda(args, env, macros, pos))
+          case Expr.Symbol("case-lambda", _) :: args =>
+            EvalStep.Done(SchemeProcedures.evalCaseLambda(args, env, macros, pos))
           case Expr.Symbol("do", _) :: args =>
-            SchemeInterpreterDoSupport.eval(args, env, macros, pos, eval, evalSequence)
-          case Expr.Symbol("and", _) :: args => evalAnd(args, env, macros)
-          case Expr.Symbol("or", _) :: args  => evalOr(args, env, macros)
+            EvalStep.Done(SchemeInterpreterDoSupport.eval(args, env, macros, pos, eval, evalSequence))
+          case Expr.Symbol("and", _) :: args => evalAnd(args, env, macros, eval)
+          case Expr.Symbol("or", _) :: args  => evalOr(args, env, macros, eval)
           case (symbol @ Expr.Symbol(name, _)) :: args =>
             macros.lookup(name) match
               case Some(macroDef) =>
                 val expanded = macroDef.expand(Expr.ListExpr(items, pos), pos)
-                eval(expanded, env, macros)
+                continueExpr(expanded, env, macros)
               case None =>
-                val procedure = eval(symbol, env, macros)
-                val values    = args.map(eval(_, env, macros))
-                applyProcedure(procedure, values, pos)
+                evalProcedureCall(symbol, args, env, macros, pos)
           case head :: args =>
-            val procedure = eval(head, env, macros)
-            val values    = args.map(eval(_, env, macros))
-            applyProcedure(procedure, values, pos)
+            evalProcedureCall(head, args, env, macros, pos)
 
-  private def evalDefineSyntax(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value =
-    args match
-      case Expr.Symbol(name, _) :: transformerExpr :: Nil =>
-        macros.define(name, SyntaxRules.parse(name, transformerExpr, env, macros))
-        Value.Void
-      case _ =>
-        throw EvalError.at(pos, "invalid define-syntax")
+  private[ming] def continueExpr(expr: Expr, env: Env, macros: MacroScope): EvalStep =
+    EvalStep.Continue(EvalTarget.ExprTarget(expr, env, macros))
 
-  private def evalDefine(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value =
-    args match
-      case Expr.Symbol(name, _) :: valueExpr :: Nil =>
-        env.define(name, eval(valueExpr, env, macros))
-        Value.Void
-      case Expr.ListExpr(Expr.Symbol(name, _) :: params, _) :: body if body.nonEmpty =>
-        env.define(name, Value.Closure(readParamList(params), body, env, macros))
-        Value.Void
-      case _ =>
-        throw EvalError.at(pos, "invalid define")
+  private[ming] def continueSequence(expressions: List[Expr], env: Env, macros: MacroScope): EvalStep =
+    EvalStep.Continue(EvalTarget.SequenceTarget(expressions, env, macros))
 
-  private def evalSet(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value =
-    args match
-      case Expr.Symbol(name, _) :: valueExpr :: Nil =>
-        env.assign(name, eval(valueExpr, env, macros), pos)
-        Value.Void
-      case _ =>
-        throw EvalError.at(pos, "invalid set!")
-
-  private def evalBegin(args: List[Expr], env: Env, macros: MacroScope): Value =
-    evalSequence(args, env, macros)
-
-  private def evalIf(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value =
-    args match
-      case condition :: ifTrue :: Nil =>
-        if isTruthy(eval(condition, env, macros)) then eval(ifTrue, env, macros)
-        else Value.Void
-      case condition :: ifTrue :: ifFalse :: Nil =>
-        if isTruthy(eval(condition, env, macros)) then eval(ifTrue, env, macros)
-        else eval(ifFalse, env, macros)
-      case _ =>
-        throw EvalError.at(pos, s"if expected 2 or 3 arguments, got ${args.length}")
-
-  private def evalLet(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value =
-    args match
-      case Expr.ListExpr(bindingsExpr, _) :: body if body.nonEmpty =>
-        val bindings = readBindings(bindingsExpr)
-        val values   = bindings.map { case (_, valueExpr) => eval(valueExpr, env, macros) }
-        val letEnv   = Env.child(env, bindings.map(_._1).zip(values))
-        val letMacro = MacroScope.child(macros)
-        evalSequence(body, letEnv, letMacro)
-      case Expr.Symbol(name, _) :: Expr.ListExpr(bindingsExpr, _) :: body if body.nonEmpty =>
-        val bindings = readBindings(bindingsExpr)
-        val values   = bindings.map { case (_, valueExpr) => eval(valueExpr, env, macros) }
-        val letEnv   = Env.child(env, Nil)
-        val letMacro = MacroScope.child(macros)
-        val closure  = Value.Closure(LambdaParams.fixed(bindings.map(_._1)), body, letEnv, letMacro)
-        letEnv.define(name, closure)
-        applyProcedure(closure, values, pos)
-      case _ =>
-        throw EvalError.at(pos, "invalid let")
-
-  private def evalLetrec(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value =
-    args match
-      case Expr.ListExpr(bindingsExpr, _) :: body if body.nonEmpty =>
-        val bindings     = readBindings(bindingsExpr)
-        val letrecEnv    = Env.child(env, Nil)
-        val letrecMacros = MacroScope.child(macros)
-
-        bindings.foreach { case (name, _) =>
-          letrecEnv.define(name, Value.Void)
-        }
-
-        val values = bindings.map { case (_, valueExpr) =>
-          eval(valueExpr, letrecEnv, letrecMacros)
-        }
-
-        bindings.zip(values).foreach { case ((name, _), value) =>
-          letrecEnv.assign(name, value, pos)
-        }
-
-        evalSequence(body, letrecEnv, letrecMacros)
-      case _ =>
-        throw EvalError.at(pos, "invalid letrec")
-
-  private def evalLetrecStar(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value =
-    args match
-      case Expr.ListExpr(bindingsExpr, _) :: body if body.nonEmpty =>
-        val bindings     = readBindings(bindingsExpr)
-        val letrecEnv    = Env.child(env, Nil)
-        val letrecMacros = MacroScope.child(macros)
-
-        bindings.foreach { case (name, valueExpr) =>
-          letrecEnv.define(name, Value.Void)
-          letrecEnv.assign(name, eval(valueExpr, letrecEnv, letrecMacros), valueExpr.pos)
-        }
-
-        evalSequence(body, letrecEnv, letrecMacros)
-      case _ =>
-        throw EvalError.at(pos, "invalid letrec*")
-
-  private def evalCond(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value =
-    args match
-      case Nil => Value.Void
-      case Expr.ListExpr(Expr.Symbol("else", _) :: body, clausePos) :: rest =>
-        if rest.nonEmpty then throw EvalError.at(clausePos, "cond else clause must be last")
-        if body.isEmpty then throw EvalError.at(clausePos, "cond else clause requires a body")
-        evalSequence(body, env, macros)
-      case Expr.ListExpr(test :: body, _) :: rest =>
-        val testValue = eval(test, env, macros)
-        if isTruthy(testValue) then if body.isEmpty then testValue else evalSequence(body, env, macros)
-        else evalCond(rest, env, macros, pos)
-      case _ =>
-        throw EvalError.at(pos, "invalid cond clause")
-
-  private def evalCase(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value =
-    args match
-      case keyExpr :: clauses =>
-        val key = eval(keyExpr, env, macros)
-        evalCaseClauses(key, clauses, env, macros, pos)
-      case _ =>
-        throw EvalError.at(pos, "invalid case")
-
-  private def evalCaseClauses(
-    key: Value,
-    clauses: List[Expr],
+  private def evalProcedureCall(
+    procedureExpr: Expr,
+    argExprs: List[Expr],
     env: Env,
     macros: MacroScope,
     pos: SourcePos
-  ): Value =
-    clauses match
-      case Nil => Value.Void
-      case Expr.ListExpr(Expr.Symbol("else", _) :: body, clausePos) :: rest =>
-        if rest.nonEmpty then throw EvalError.at(clausePos, "case else clause must be last")
-        if body.isEmpty then throw EvalError.at(clausePos, "case else clause requires a body")
-        evalSequence(body, env, macros)
-      case Expr.ListExpr(Expr.ListExpr(datums, _) :: body, _) :: rest =>
-        if body.isEmpty then throw EvalError.at(pos, "case clause requires a body")
-        if datums.exists(datum => EqualityBuiltins.eqvValues(key, quote(datum))) then evalSequence(body, env, macros)
-        else evalCaseClauses(key, rest, env, macros, pos)
-      case _ =>
-        throw EvalError.at(pos, "invalid case clause")
-
-  private def evalQuote(args: List[Expr], pos: SourcePos): Value =
-    args match
-      case value :: Nil => quote(value)
-      case _            => throw EvalError.at(pos, s"quote expected 1 argument, got ${args.length}")
-
-  private def evalLambda(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value =
-    args match
-      case formals :: body if body.nonEmpty =>
-        Value.Closure(readParams(formals), body, env, macros)
-      case _ =>
-        throw EvalError.at(pos, "invalid lambda")
-
-  private def evalAnd(args: List[Expr], env: Env, macros: MacroScope): Value =
-    args match
-      case Nil => Value.Bool(true)
-      case head :: tail =>
-        val value = eval(head, env, macros)
-        if !isTruthy(value) || tail.isEmpty then value
-        else evalAnd(tail, env, macros)
-
-  private def evalOr(args: List[Expr], env: Env, macros: MacroScope): Value =
-    args match
-      case Nil => Value.Bool(false)
-      case head :: tail =>
-        val value = eval(head, env, macros)
-        if isTruthy(value) || tail.isEmpty then value
-        else evalOr(tail, env, macros)
+  ): EvalStep =
+    val procedure = eval(procedureExpr, env, macros)
+    val values    = argExprs.map(eval(_, env, macros))
+    applyProcedureStep(procedure, values, pos)
 
   private[ming] def applyProcedure(value: Value, args: List[Value], pos: SourcePos): Value =
+    applyProcedureStep(value, args, pos) match
+      case EvalStep.Done(result)     => result
+      case EvalStep.Continue(target) => evalLoop(target)
+
+  private def applyProcedureStep(value: Value, args: List[Value], pos: SourcePos): EvalStep =
     value match
       case Value.Builtin(_, impl) =>
-        impl(args, pos)
+        EvalStep.Done(impl(args, pos))
       case Value.Closure(params, body, closureEnv, closureMacros) =>
-        SchemeProcedures.applyUserProcedure(
+        val prepared = SchemeProcedures.prepareUserProcedure(
           params,
           body,
           closureEnv,
@@ -254,10 +144,11 @@ private[ming] object SchemeInterpreter extends SchemeInterpreterTypes:
           pos,
           "lambda"
         )
+        continueSequence(prepared.body, prepared.env, prepared.macros)
       case Value.CaseLambda(clauses, closureEnv, closureMacros) =>
         val Value.CaseLambdaClause(params, body) =
           SchemeProcedures.selectCaseLambdaClause(clauses, args.length, pos)
-        SchemeProcedures.applyUserProcedure(
+        val prepared = SchemeProcedures.prepareUserProcedure(
           params,
           body,
           closureEnv,
@@ -266,5 +157,6 @@ private[ming] object SchemeInterpreter extends SchemeInterpreterTypes:
           pos,
           "case-lambda"
         )
+        continueSequence(prepared.body, prepared.env, prepared.macros)
       case other =>
         throw EvalError.at(pos, s"not a procedure: ${render(other)}")

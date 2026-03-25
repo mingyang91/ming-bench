@@ -6,6 +6,12 @@ import SchemeInterpreterSyntax.readParams
 
 private[ming] object SchemeProcedures:
 
+  final case class PreparedUserProcedure(
+    body: List[Expr],
+    env: Env,
+    macros: MacroScope
+  )
+
   def evalCaseLambda(args: List[Expr], env: Env, macros: MacroScope, pos: SourcePos): Value.CaseLambda =
     if args.isEmpty then throw EvalError.at(pos, "case-lambda requires at least one clause")
     Value.CaseLambda(args.map(parseCaseLambdaClause), env, macros)
@@ -41,10 +47,22 @@ private[ming] object SchemeProcedures:
     pos: SourcePos,
     context: String
   ): Value =
+    val prepared = prepareUserProcedure(params, body, closureEnv, closureMacros, args, pos, context)
+    SchemeInterpreter.evalSequence(prepared.body, prepared.env, prepared.macros)
+
+  def prepareUserProcedure(
+    params: LambdaParams,
+    body: List[Expr],
+    closureEnv: Env,
+    closureMacros: MacroScope,
+    args: List[Value],
+    pos: SourcePos,
+    context: String
+  ): PreparedUserProcedure =
     requireArity(params, args.length, pos, context)
     val callEnv    = Env.child(closureEnv, buildBindings(params, args))
     val callMacros = MacroScope.child(closureMacros)
-    SchemeInterpreter.evalSequence(body, callEnv, callMacros)
+    PreparedUserProcedure(body, callEnv, callMacros)
 
   private def buildBindings(params: LambdaParams, args: List[Value]): List[(String, Value)] =
     val minimum = params.required.length
