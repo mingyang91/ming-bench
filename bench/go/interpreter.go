@@ -649,6 +649,9 @@ type interpreter struct {
 	nextID            int
 	dynamicWinds      []*dynamicWindFrame
 	exceptionHandlers []*exceptionHandlerFrame
+	stepLimit         int
+	stepsTaken        int
+	stepLimitEnabled  bool
 }
 
 type evalStep struct {
@@ -663,6 +666,13 @@ func newInterpreter() *interpreter {
 		global: newEnv(nil),
 	}
 	it.installBuiltins()
+	return it
+}
+
+func newInterpreterWithStepLimit(maxSteps int) *interpreter {
+	it := newInterpreter()
+	it.stepLimit = maxSteps
+	it.stepLimitEnabled = true
 	return it
 }
 
@@ -873,6 +883,10 @@ func (it *interpreter) evalSequence(scope *env, exprs []expr) (value, error) {
 
 func (it *interpreter) eval(node expr, scope *env) (value, error) {
 	for {
+		if err := it.consumeEvalStep(node.pos()); err != nil {
+			return nil, err
+		}
+
 		switch expr := node.(type) {
 		case *intExpr:
 			return expr.value, nil
@@ -2385,6 +2399,17 @@ func wrongArgCount(pos position, name string, message string) error {
 	return newEvalError(ErrWrongArgCount, fmt.Sprintf("%s: %s", name, message), pos)
 }
 
+func (it *interpreter) consumeEvalStep(pos position) error {
+	if !it.stepLimitEnabled {
+		return nil
+	}
+	if it.stepsTaken >= it.stepLimit {
+		return newEvalError(ErrStepLimit, "step limit exceeded", pos)
+	}
+	it.stepsTaken++
+	return nil
+}
+
 func newEvalError(kind EvalErrorKind, message string, pos position) *EvalError {
 	return &EvalError{
 		Message: message,
@@ -2406,12 +2431,21 @@ func parseProgram(input string) ([]expr, error) {
 }
 
 func evalInput(input string) (value, string, error) {
+	return evalInputWithLimit(input, -1)
+}
+
+func evalInputWithLimit(input string, maxSteps int) (value, string, error) {
 	exprs, err := parseProgram(input)
 	if err != nil {
 		return nil, "", err
 	}
 
-	interpreter := newInterpreter()
+	var interpreter *interpreter
+	if maxSteps >= 0 {
+		interpreter = newInterpreterWithStepLimit(maxSteps)
+	} else {
+		interpreter = newInterpreter()
+	}
 	result, err := interpreter.evalProgram(exprs)
 	if err != nil {
 		return nil, interpreter.output.String(), err

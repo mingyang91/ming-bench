@@ -201,6 +201,10 @@ func (it *interpreter) evalBindingValuesWithContinuations(bindings []letBinding,
 }
 
 func (it *interpreter) evalWithContinuations(node expr, scope *env, k evalContinuation) evalResult {
+	if err := it.consumeEvalStep(node.pos()); err != nil {
+		return doneError(err)
+	}
+
 	switch current := node.(type) {
 	case *intExpr:
 		return continueEval(k, current.value)

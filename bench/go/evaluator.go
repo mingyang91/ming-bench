@@ -10,6 +10,17 @@ func EvalStr(input string) (string, error) {
 	return formatValue(result)
 }
 
+// EvalStrWithLimit evaluates Scheme expressions with a step budget and returns
+// the final result string if evaluation completes before the budget is
+// exhausted.
+func EvalStrWithLimit(input string, maxSteps int) (string, error) {
+	result, _, err := evalInputWithLimit(input, maxSteps)
+	if err != nil {
+		return "", err
+	}
+	return formatValue(result)
+}
+
 // EvalStrWithOutput evaluates Scheme expressions and returns both the result
 // string and any captured output from display/write/newline.
 func EvalStrWithOutput(input string) (result string, output string, err error) {

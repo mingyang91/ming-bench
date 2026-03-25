@@ -16,6 +16,7 @@ const (
 	ErrOutOfRange      EvalErrorKind = "out_of_range"
 	ErrImmutable       EvalErrorKind = "immutable"
 	ErrRaised          EvalErrorKind = "raised"
+	ErrStepLimit       EvalErrorKind = "step_limit"
 )
 
 // EvalError represents a Scheme evaluation error.
