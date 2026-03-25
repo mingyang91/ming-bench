@@ -20,6 +20,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "newline",
     "number->string",
     "append",
+    "apply",
     "boolean?",
     "car",
     "cdr",
@@ -123,6 +124,7 @@ type BindingRef = Rc<RefCell<Value>>;
 struct UserProcedure {
     name: Option<String>,
     params: Vec<String>,
+    rest_param: Option<String>,
     body: Vec<Expr>,
     env: EnvRef,
 }
@@ -442,10 +444,12 @@ fn eval_define(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value
                 return Err(EvalError::syntax("invalid define form", position));
             };
 
-            let (name, params) = parse_function_signature(signature, signature_expr.pos)?;
+            let (name, params, rest_param) =
+                parse_function_signature(signature, signature_expr.pos)?;
             let procedure = Value::Procedure(Rc::new(UserProcedure {
                 name: Some(name.clone()),
                 params,
+                rest_param,
                 body: body.to_vec(),
                 env: env.clone(),
             }));
@@ -525,9 +529,12 @@ fn eval_lambda(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value
         ));
     }
 
+    let (params, rest_param) = parse_parameters(params_expr)?;
+
     Ok(Value::Procedure(Rc::new(UserProcedure {
         name: None,
-        params: parse_parameters(params_expr)?,
+        params,
+        rest_param,
         body: body.to_vec(),
         env,
     })))
@@ -536,7 +543,7 @@ fn eval_lambda(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value
 fn parse_function_signature(
     signature: &[Expr],
     position: SourcePos,
-) -> Result<(String, Vec<String>), EvalError> {
+) -> Result<(String, Vec<String>, Option<String>), EvalError> {
     let Some((name_expr, params)) = signature.split_first() else {
         return Err(EvalError::syntax(
             "function definition requires a name",
@@ -551,21 +558,12 @@ fn parse_function_signature(
         ));
     };
 
-    let mut parsed_params = Vec::with_capacity(params.len());
-    for param in params {
-        let ExprKind::Symbol(name) = &param.kind else {
-            return Err(EvalError::syntax(
-                "parameter name must be a symbol",
-                param.pos,
-            ));
-        };
-        parsed_params.push(name.clone());
-    }
+    let (parsed_params, rest_param) = parse_parameter_list(params)?;
 
-    Ok((name.clone(), parsed_params))
+    Ok((name.clone(), parsed_params, rest_param))
 }
 
-fn parse_parameters(expr: &Expr) -> Result<Vec<String>, EvalError> {
+fn parse_parameters(expr: &Expr) -> Result<(Vec<String>, Option<String>), EvalError> {
     let ExprKind::List(params) = &expr.kind else {
         return Err(EvalError::syntax(
             "lambda parameters must be a list",
@@ -573,18 +571,51 @@ fn parse_parameters(expr: &Expr) -> Result<Vec<String>, EvalError> {
         ));
     };
 
+    parse_parameter_list(params)
+}
+
+fn parse_parameter_list(params: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
     let mut parsed = Vec::with_capacity(params.len());
-    for param in params {
+    let mut index = 0;
+
+    while let Some(param) = params.get(index) {
         let ExprKind::Symbol(name) = &param.kind else {
             return Err(EvalError::syntax(
                 "parameter name must be a symbol",
                 param.pos,
             ));
         };
+
+        if name == "." {
+            let Some(rest_expr) = params.get(index + 1) else {
+                return Err(EvalError::syntax(
+                    "rest parameter name must follow '.'",
+                    param.pos,
+                ));
+            };
+
+            let ExprKind::Symbol(rest_name) = &rest_expr.kind else {
+                return Err(EvalError::syntax(
+                    "parameter name must be a symbol",
+                    rest_expr.pos,
+                ));
+            };
+
+            if index + 2 != params.len() {
+                return Err(EvalError::syntax(
+                    "rest parameter must be last",
+                    rest_expr.pos,
+                ));
+            }
+
+            return Ok((parsed, Some(rest_name.clone())));
+        }
+
         parsed.push(name.clone());
+        index += 1;
     }
 
-    Ok(parsed)
+    Ok((parsed, None))
 }
 
 fn quote_expr(expr: &Expr) -> Value {
@@ -709,6 +740,7 @@ fn eval_named_let(
     let procedure = Value::Procedure(Rc::new(UserProcedure {
         name: Some(name.into()),
         params,
+        rest_param: None,
         body: body.to_vec(),
         env: let_env.clone(),
     }));
@@ -789,18 +821,37 @@ fn apply_user_procedure(
     args: Vec<LocatedValue>,
     position: SourcePos,
 ) -> Result<Value, EvalError> {
-    if args.len() != procedure.params.len() {
+    let required = procedure.params.len();
+    let invalid_arity = if procedure.rest_param.is_some() {
+        args.len() < required
+    } else {
+        args.len() != required
+    };
+
+    if invalid_arity {
         return Err(EvalError::wrong_arg_count(
             procedure.display_name(),
-            format!("exactly {}", procedure.params.len()),
+            if procedure.rest_param.is_some() {
+                format!("at least {required}")
+            } else {
+                format!("exactly {required}")
+            },
             args.len(),
             position,
         ));
     }
 
     let call_env = Environment::child(procedure.env.clone());
-    for (param, value) in procedure.params.iter().cloned().zip(args) {
+    for (param, value) in procedure.params.iter().cloned().zip(args.iter().cloned()) {
         Environment::define(&call_env, param, value.value);
+    }
+
+    if let Some(rest_param) = &procedure.rest_param {
+        let rest_values = args[required..]
+            .iter()
+            .map(|arg| arg.value.clone())
+            .collect();
+        Environment::define(&call_env, rest_param.clone(), Value::List(rest_values));
     }
 
     eval_sequence(&procedure.body, call_env)
@@ -823,6 +874,7 @@ fn apply_builtin(
         ">" => apply_compare(name, args, position, |left, right| left > right),
         ">=" => apply_compare(name, args, position, |left, right| left >= right),
         "append" => apply_append(args, position),
+        "apply" => apply_apply(args, position, env),
         "boolean?" => apply_type_predicate("boolean?", args, position, |value| matches!(value, Value::Bool(_))),
         "char?" => apply_type_predicate("char?", args, position, |value| matches!(value, Value::Char(_))),
         "car" => apply_car(args, position),
@@ -1030,6 +1082,43 @@ fn apply_append(args: &[LocatedValue], _position: SourcePos) -> Result<Value, Ev
     }
 
     Ok(Value::List(items))
+}
+
+fn apply_apply(args: &[LocatedValue], position: SourcePos, env: EnvRef) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::wrong_arg_count(
+            "apply",
+            "at least 2",
+            args.len(),
+            position,
+        ));
+    }
+
+    let (callable, list_and_prefix_args) = args
+        .split_first()
+        .expect("apply arity checked");
+    let (list_arg, prefix_args) = list_and_prefix_args
+        .split_last()
+        .expect("apply arity checked");
+
+    let Value::List(list_values) = &list_arg.value else {
+        return Err(EvalError::type_mismatch(
+            "list",
+            list_arg.value.type_name(),
+            list_arg.position,
+        ));
+    };
+
+    let mut expanded_args = Vec::with_capacity(prefix_args.len() + list_values.len());
+    expanded_args.extend(prefix_args.iter().cloned());
+    expanded_args.extend(
+        list_values
+            .iter()
+            .cloned()
+            .map(|value| LocatedValue::new(value, list_arg.position)),
+    );
+
+    apply(callable.value.clone(), callable.position, expanded_args, env)
 }
 
 fn apply_number_to_string(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
