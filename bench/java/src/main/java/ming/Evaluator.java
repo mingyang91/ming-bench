@@ -73,6 +73,7 @@ public class Evaluator {
         installBuiltin(env, ">", (callPos, args) -> builtinComparison(callPos, args, Comparison.GREATER_THAN));
         installBuiltin(env, "=", (callPos, args) -> builtinComparison(callPos, args, Comparison.EQUAL));
         installBuiltin(env, "<=", (callPos, args) -> builtinComparison(callPos, args, Comparison.LESS_EQUAL));
+        installBuiltin(env, ">=", (callPos, args) -> builtinComparison(callPos, args, Comparison.GREATER_EQUAL));
         installBuiltin(env, "cons", this::builtinCons);
         installBuiltin(env, "car", this::builtinCar);
         installBuiltin(env, "cdr", this::builtinCdr);
@@ -88,12 +89,16 @@ public class Evaluator {
         installBuiltin(env, "string-length", this::builtinStringLength);
         installBuiltin(env, "substring", this::builtinSubstring);
         installBuiltin(env, "string-copy", this::builtinStringCopy);
+        installBuiltin(env, "string->list", this::builtinStringToList);
+        installBuiltin(env, "list->string", this::builtinListToString);
         installBuiltin(env, "string-set!", this::builtinStringSet);
         installBuiltin(env, "string->number", this::builtinStringToNumber);
         installBuiltin(env, "number->string", this::builtinNumberToString);
         installBuiltin(env, "symbol->string", this::builtinSymbolToString);
         installBuiltin(env, "string->symbol", this::builtinStringToSymbol);
         installBuiltin(env, "string-ref", this::builtinStringRef);
+        installBuiltin(env, "char->integer", this::builtinCharToInteger);
+        installBuiltin(env, "integer->char", this::builtinIntegerToChar);
         installBuiltin(env, "number?", this::builtinNumberPredicate);
         installBuiltin(env, "integer?", this::builtinIntegerPredicate);
         installBuiltin(env, "rational?", this::builtinRationalPredicate);
@@ -1225,9 +1230,38 @@ public class Evaluator {
         return requireStringValue(arguments.get(0), "string-copy").copy();
     }
 
+    private Value builtinStringToList(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "string->list", callPos);
+        String value = requireString(arguments.get(0), "string->list");
+        List<Value> chars = new ArrayList<>(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            chars.add(new CharValue(value.charAt(i)));
+        }
+        return buildListFromValues(chars);
+    }
+
+    private Value builtinListToString(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "list->string", callPos);
+        List<Value> elements = requireProperListElements(arguments.get(0), "list->string");
+        StringBuilder builder = new StringBuilder(elements.size());
+        for (Value element : elements) {
+            if (element instanceof CharValue(char ch)) {
+                builder.append(ch);
+            } else {
+                throw errorAt(arguments.get(0).pos(), "expected char for list->string");
+            }
+        }
+        return new StringValue(builder.toString());
+    }
+
     private Value builtinStringSet(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
         expectArgumentCount(arguments, 3, "string-set!", callPos);
         StringValue string = requireStringValue(arguments.get(0), "string-set!");
+        if (!string.isMutable()) {
+            throw errorAt(callPos, "string-set! not supported on immutable strings");
+        }
         int index = requireStringIndex(arguments.get(1), "string-set!", string.length() - 1);
         string.setCharAt(index, requireChar(arguments.get(2), "string-set!"));
         return VOID_VALUE;
@@ -1268,6 +1302,22 @@ public class Evaluator {
         String value = requireString(arguments.get(0), "string-ref");
         int index = requireStringIndex(arguments.get(1), "string-ref", value.length() - 1);
         return new CharValue(value.charAt(index));
+    }
+
+    private Value builtinCharToInteger(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "char->integer", callPos);
+        return new IntValue(requireChar(arguments.get(0), "char->integer"));
+    }
+
+    private Value builtinIntegerToChar(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "integer->char", callPos);
+        long value = requireInt(arguments.get(0), "integer->char");
+        if (value < Character.MIN_VALUE || value > Character.MAX_VALUE) {
+            throw errorAt(arguments.get(0).pos(), "integer out of range for integer->char");
+        }
+        return new CharValue((char) value);
     }
 
     private Value builtinNumberPredicate(SourcePos callPos, List<LocatedValue> arguments)
@@ -2404,9 +2454,15 @@ public class Evaluator {
 
     private static final class StringValue implements Value {
         private final StringBuilder builder;
+        private final boolean mutable;
 
         private StringValue(String value) {
+            this(value, false);
+        }
+
+        private StringValue(String value, boolean mutable) {
             this.builder = new StringBuilder(value);
+            this.mutable = mutable;
         }
 
         private String text() {
@@ -2421,8 +2477,12 @@ public class Evaluator {
             builder.setCharAt(index, value);
         }
 
+        private boolean isMutable() {
+            return mutable;
+        }
+
         private StringValue copy() {
-            return new StringValue(text());
+            return new StringValue(text(), true);
         }
 
         @Override
@@ -2585,6 +2645,7 @@ public class Evaluator {
         private static final Comparison GREATER_THAN = new Comparison(">", ordering -> ordering > 0);
         private static final Comparison EQUAL = new Comparison("=", ordering -> ordering == 0);
         private static final Comparison LESS_EQUAL = new Comparison("<=", ordering -> ordering <= 0);
+        private static final Comparison GREATER_EQUAL = new Comparison(">=", ordering -> ordering >= 0);
 
         private boolean test(int ordering) {
             return comparator.test(ordering);
