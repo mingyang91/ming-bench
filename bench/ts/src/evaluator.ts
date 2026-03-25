@@ -21,7 +21,8 @@ type SchemeVal =
   | { tag: 'void'; pos?: Pos }
   | { tag: 'lambda'; params: string[]; rest?: string; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'builtin'; name: string; fn: BuiltinFn; pos?: Pos }
-  | { tag: 'macro'; literals: string[]; clauses: MacroClause[]; defEnv: Env; pos?: Pos };
+  | { tag: 'macro'; literals: string[]; clauses: MacroClause[]; defEnv: Env; pos?: Pos }
+  | { tag: 'record'; typeName: string; fields: Map<string, SchemeVal>; pos?: Pos };
 
 function posStr(pos?: Pos): string {
   return pos ? `${pos.line}:${pos.col}` : '?:?';
@@ -1257,6 +1258,55 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
         return { tag: 'void' };
       }
 
+      if (op === 'define-record-type') {
+        // (define-record-type <name> (<constructor> <field> ...) <predicate> (<field> <accessor>) ...)
+        if (elems.length < 4) throw errAt('define-record-type: bad syntax', epos);
+        if (elems[1].tag !== 'symbol') throw errAt('define-record-type: expected type name', epos);
+        const typeName = elems[1].value;
+        const ctorSpec = elems[2];
+        if (ctorSpec.tag !== 'list' || ctorSpec.elements.length < 1 || ctorSpec.elements[0].tag !== 'symbol')
+          throw errAt('define-record-type: bad constructor spec', epos);
+        const ctorName = ctorSpec.elements[0].value;
+        const ctorFields: string[] = [];
+        for (let i = 1; i < ctorSpec.elements.length; i++) {
+          if (ctorSpec.elements[i].tag !== 'symbol') throw errAt('define-record-type: field must be symbol', epos);
+          ctorFields.push(ctorSpec.elements[i].value);
+        }
+        if (elems[3].tag !== 'symbol') throw errAt('define-record-type: expected predicate name', epos);
+        const predName = elems[3].value;
+        // Parse field accessors
+        const accessors: { field: string; accessor: string }[] = [];
+        for (let i = 4; i < elems.length; i++) {
+          const spec = elems[i];
+          if (spec.tag !== 'list' || spec.elements.length < 2 || spec.elements[0].tag !== 'symbol' || spec.elements[1].tag !== 'symbol')
+            throw errAt('define-record-type: bad field spec', epos);
+          accessors.push({ field: spec.elements[0].value, accessor: spec.elements[1].value });
+        }
+        // Define constructor
+        env.define(ctorName, { tag: 'builtin', name: ctorName, fn: (args) => {
+          if (args.length !== ctorFields.length)
+            throw new EvalError(`${ctorName}: expected ${ctorFields.length} arguments, got ${args.length}`);
+          const fields = new Map<string, SchemeVal>();
+          for (let i = 0; i < ctorFields.length; i++) fields.set(ctorFields[i], args[i]);
+          return { tag: 'record', typeName, fields };
+        }});
+        // Define predicate
+        env.define(predName, { tag: 'builtin', name: predName, fn: (args) => {
+          if (args.length !== 1) throw new EvalError(`${predName}: expected 1 argument`);
+          return { tag: 'boolean', value: args[0].tag === 'record' && args[0].typeName === typeName };
+        }});
+        // Define accessors
+        for (const { field, accessor } of accessors) {
+          env.define(accessor, { tag: 'builtin', name: accessor, fn: (args) => {
+            if (args.length !== 1) throw new EvalError(`${accessor}: expected 1 argument`);
+            if (args[0].tag !== 'record' || args[0].typeName !== typeName)
+              throw new EvalError(`${accessor}: expected ${typeName}`);
+            return args[0].fields.get(field)!;
+          }});
+        }
+        return { tag: 'void' };
+      }
+
       // Check for macro application
       try {
         const macroVal = env.get(op);
@@ -1343,6 +1393,7 @@ function displayVal(val: SchemeVal): string {
     case 'lambda': return '#<procedure>';
     case 'builtin': return `#<builtin:${val.name}>`;
     case 'macro': return '#<macro>';
+    case 'record': return `#<record:${val.typeName}>`;
   }
 }
 
