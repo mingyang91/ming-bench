@@ -8,8 +8,9 @@ private[ming] object PredicateBuiltins:
   def all: List[Value.Builtin] =
     List(
       predicateBuiltin("string?") {
-        case Value.StringLit(_) => true
-        case _                  => false
+        case Value.StringLit(_)     => true
+        case _: Value.MutableString => true
+        case _                      => false
       },
       predicateBuiltin("number?") {
         case Value.Number(_) => true

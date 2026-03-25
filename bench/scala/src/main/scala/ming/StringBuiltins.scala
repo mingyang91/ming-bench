@@ -16,7 +16,9 @@ private[ming] object StringBuiltins:
       numberToStringBuiltin,
       symbolToStringBuiltin,
       stringToSymbolBuiltin,
-      stringRefBuiltin
+      stringRefBuiltin,
+      stringCopyBuiltin,
+      stringSetBuiltin
     )
 
   private val stringAppendBuiltin: Value.Builtin =
@@ -86,6 +88,26 @@ private[ming] object StringBuiltins:
         val index                     = asIndex(indexValue, "string-ref", pos)
         if index >= text.length then fail(pos, "string-ref index out of bounds")
         Value.Character(text.charAt(index))
+    )
+
+  private val stringCopyBuiltin: Value.Builtin =
+    Value.Builtin(
+      "string-copy",
+      (args, pos) =>
+        val text = asString(singleArg("string-copy", args, pos), "string-copy", pos)
+        Value.MutableString(text)
+    )
+
+  private val stringSetBuiltin: Value.Builtin =
+    Value.Builtin(
+      "string-set!",
+      (args, pos) =>
+        val (stringValue, indexValue, charValue) = threeArgs("string-set!", args, pos)
+        val text                                 = asMutableString(stringValue, "string-set!", pos)
+        val index                                = asIndex(indexValue, "string-set!", pos)
+        if index >= text.length then fail(pos, "string-set! index out of bounds")
+        text.set(index, asCharacter(charValue, "string-set!", pos))
+        Value.Void
     )
 
   private def parseInteger(value: String): Value =

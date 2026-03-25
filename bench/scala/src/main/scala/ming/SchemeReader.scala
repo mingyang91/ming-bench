@@ -39,7 +39,7 @@ private[ming] object SchemeReader:
         case '"' =>
           readString(pos)
         case '#' =>
-          readBoolean(pos)
+          readHashLiteral(pos)
         case _ =>
           readAtom(pos)
 
@@ -83,7 +83,7 @@ private[ming] object SchemeReader:
 
       Expr.StringLit(builder.result(), startPos)
 
-    private def readBoolean(startPos: SourcePos): Expr =
+    private def readHashLiteral(startPos: SourcePos): Expr =
       if startsWithToken("#t") then
         advance()
         advance()
@@ -92,7 +92,24 @@ private[ming] object SchemeReader:
         advance()
         advance()
         Expr.Bool(false, startPos)
+      else if input.startsWith("#\\", index) then readCharacter(startPos)
       else throw EvalError.at(startPos, "invalid boolean literal")
+
+    private def readCharacter(startPos: SourcePos): Expr =
+      advance()
+      advance()
+
+      val start = index
+      while index < input.length && !isDelimiter(input.charAt(index)) do advance()
+
+      val token = input.substring(start, index)
+      val value = token match
+        case "space"            => ' '
+        case "newline"          => '\n'
+        case s if s.length == 1 => s.charAt(0)
+        case _                  => throw EvalError.at(startPos, "invalid character literal")
+
+      Expr.Character(value, startPos)
 
     private def readAtom(startPos: SourcePos): Expr =
       val start = index

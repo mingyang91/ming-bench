@@ -11,6 +11,7 @@ private[ming] object SchemeInterpreter:
     final case class Number(value: BigInt, pos: SourcePos)       extends Expr
     final case class Bool(value: Boolean, pos: SourcePos)        extends Expr
     final case class StringLit(value: String, pos: SourcePos)    extends Expr
+    final case class Character(value: Char, pos: SourcePos)      extends Expr
     final case class Symbol(name: String, pos: SourcePos)        extends Expr
     final case class ListExpr(items: List[Expr], pos: SourcePos) extends Expr
 
@@ -18,9 +19,35 @@ private[ming] object SchemeInterpreter:
   sealed trait Procedure extends Value
 
   object Value:
-    final case class Number(value: BigInt)                                          extends Value
-    final case class Bool(value: Boolean)                                           extends Value
-    final case class StringLit(value: String)                                       extends Value
+    final case class Number(value: BigInt)    extends Value
+    final case class Bool(value: Boolean)     extends Value
+    final case class StringLit(value: String) extends Value
+
+    final class MutableString private (private val chars: mutable.ArrayBuffer[Char]) extends Value:
+
+      def value: String =
+        chars.mkString
+
+      def length: Int =
+        chars.length
+
+      def charAt(index: Int): Char =
+        chars(index)
+
+      def set(index: Int, value: Char): Unit =
+        chars(index) = value
+
+      def copyString(): MutableString =
+        MutableString(value)
+
+    object MutableString:
+
+      def apply(value: String): MutableString =
+        new MutableString(mutable.ArrayBuffer.from(value))
+
+      def unapply(value: MutableString): Some[String] =
+        Some(value.value)
+
     final case class Character(value: Char)                                         extends Value
     final case class Symbol(name: String)                                           extends Value
     final case class ListValue(items: List[Value])                                  extends Value
@@ -41,6 +68,8 @@ private[ming] object SchemeInterpreter:
       case Value.Bool(true)       => "#t"
       case Value.Bool(false)      => "#f"
       case Value.StringLit(value) => "\"" + escapeString(value) + "\""
+      case Value.MutableString(value) =>
+        "\"" + escapeString(value) + "\""
       case Value.Character(value) => renderCharacter(value)
       case Value.Symbol(name)     => name
       case Value.ListValue(items) => items.map(render).mkString("(", " ", ")")
@@ -50,6 +79,8 @@ private[ming] object SchemeInterpreter:
   def renderDisplay(value: Value): String =
     value match
       case Value.StringLit(value) => value
+      case Value.MutableString(value) =>
+        value
       case Value.Character(value) => value.toString
       case Value.ListValue(items) => items.map(renderDisplay).mkString("(", " ", ")")
       case other                  => render(other)
@@ -71,6 +102,7 @@ private[ming] object SchemeInterpreter:
       case Expr.Number(value, _)    => Value.Number(value)
       case Expr.Bool(value, _)      => Value.Bool(value)
       case Expr.StringLit(value, _) => Value.StringLit(value)
+      case Expr.Character(value, _) => Value.Character(value)
       case Expr.Symbol(name, pos)   => env.lookup(name, pos)
       case Expr.ListExpr(items, pos) =>
         items match
@@ -206,6 +238,7 @@ private[ming] object SchemeInterpreter:
       case Expr.Number(value, _)    => Value.Number(value)
       case Expr.Bool(value, _)      => Value.Bool(value)
       case Expr.StringLit(value, _) => Value.StringLit(value)
+      case Expr.Character(value, _) => Value.Character(value)
       case Expr.Symbol(name, _)     => Value.Symbol(name)
       case Expr.ListExpr(items, _)  => Value.ListValue(items.map(quote))
 
@@ -242,6 +275,7 @@ private[ming] object SchemeInterpreter:
       case Expr.Bool(true, _)       => "#t"
       case Expr.Bool(false, _)      => "#f"
       case Expr.StringLit(value, _) => "\"" + escapeString(value) + "\""
+      case Expr.Character(value, _) => renderCharacter(value)
       case Expr.Symbol(name, _)     => name
       case Expr.ListExpr(items, _) =>
         items.map(renderExpr).mkString("(", " ", ")")
@@ -262,15 +296,3 @@ private[ming] object SchemeInterpreter:
       case ' '  => "#\\space"
       case '\n' => "#\\newline"
       case ch   => s"#\\$ch"
-
-  final class Runtime private ():
-    private val output = new StringBuilder
-
-    def emit(text: String): Unit =
-      output.append(text)
-
-    def capturedOutput: String =
-      output.toString
-
-  private object Runtime:
-    def apply(): Runtime = new Runtime()

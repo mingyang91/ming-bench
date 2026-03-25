@@ -60,11 +60,34 @@ private[ming] object BuiltinSupport:
 
   def asString(value: Value, context: String, pos: SourcePos): String =
     value match
-      case Value.StringLit(text) => text
+      case Value.StringLit(text)     => text
+      case Value.MutableString(text) => text
       case other =>
         fail(
           pos,
           s"$context expected string, got ${SchemeInterpreter.render(other)}"
+        )
+
+  def asMutableString(
+    value: Value,
+    context: String,
+    pos: SourcePos
+  ): Value.MutableString =
+    value match
+      case string: Value.MutableString => string
+      case other =>
+        fail(
+          pos,
+          s"$context expected mutable string, got ${SchemeInterpreter.render(other)}"
+        )
+
+  def asCharacter(value: Value, context: String, pos: SourcePos): Char =
+    value match
+      case Value.Character(character) => character
+      case other =>
+        fail(
+          pos,
+          s"$context expected character, got ${SchemeInterpreter.render(other)}"
         )
 
   def asSymbol(value: Value, context: String, pos: SourcePos): String =
