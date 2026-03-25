@@ -172,6 +172,16 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 		return applyLambda(f, args, e.Ln, e.Cl)
 	case *CaseLambdaVal:
 		return applyCaseLambda(f, args, e.Ln, e.Cl)
+	case *CallCCVal:
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: call/cc: requires exactly 1 argument", e.Ln, e.Cl)}
+		}
+		return handleCallCC(args[0], e.Ln, e.Cl, env)
+	case *ContinuationVal:
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: requires exactly 1 argument", e.Ln, e.Cl)}
+		}
+		panic(&continuationJump{cont: f, value: args[0]})
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure: %s", e.Ln, e.Cl, fn.String())}
 	}
@@ -452,7 +462,7 @@ func makeGlobalEnv(out *strings.Builder) *Env {
 			return nil, &EvalError{Message: "procedure?: requires exactly 1 argument"}
 		}
 		switch args[0].(type) {
-		case *LambdaVal, *BuiltinFunc, *CaseLambdaVal:
+		case *LambdaVal, *BuiltinFunc, *CaseLambdaVal, *ContinuationVal, *CallCCVal:
 			return &BoolVal{Val: true}, nil
 		default:
 			return &BoolVal{Val: false}, nil
@@ -515,6 +525,10 @@ func makeGlobalEnv(out *strings.Builder) *Env {
 
 	// L17 builtins
 	registerL17Builtins(env)
+
+	// call/cc
+	env.set("call/cc", &CallCCVal{})
+	env.set("call-with-current-continuation", &CallCCVal{})
 
 	return env
 }
@@ -656,22 +670,41 @@ func evalLet(e *ListExpr, env *Env) (Value, error) {
 	if !ok {
 		return nil, &EvalError{Message: "let: expected bindings list"}
 	}
+
 	childEnv := newEnv(env)
-	for _, b := range bindings.Items {
-		bl, ok := b.(*ListExpr)
-		if !ok || len(bl.Items) != 2 {
-			return nil, &EvalError{Message: "let: bad binding"}
+	skipBindings := false
+
+	if state := env.evalState; state != nil {
+		letID := state.letCounter
+		state.letCounter++
+		if pe, exists := state.protectedLetEnvs[letID]; exists {
+			childEnv = pe
+			skipBindings = true
 		}
-		sym, ok := bl.Items[0].(*SymbolExpr)
-		if !ok {
-			return nil, &EvalError{Message: "let: expected symbol in binding"}
-		}
-		val, err := eval(bl.Items[1], env)
-		if err != nil {
-			return nil, err
-		}
-		childEnv.set(sym.Name, val)
+		state.activeLetStack = append(state.activeLetStack, letEnvEntry{id: letID, env: childEnv})
+		defer func() {
+			state.activeLetStack = state.activeLetStack[:len(state.activeLetStack)-1]
+		}()
 	}
+
+	if !skipBindings {
+		for _, b := range bindings.Items {
+			bl, ok := b.(*ListExpr)
+			if !ok || len(bl.Items) != 2 {
+				return nil, &EvalError{Message: "let: bad binding"}
+			}
+			sym, ok := bl.Items[0].(*SymbolExpr)
+			if !ok {
+				return nil, &EvalError{Message: "let: expected symbol in binding"}
+			}
+			val, err := eval(bl.Items[1], env)
+			if err != nil {
+				return nil, err
+			}
+			childEnv.set(sym.Name, val)
+		}
+	}
+
 	body := e.Items[2:]
 	for _, bodyExpr := range body[:len(body)-1] {
 		_, err := eval(bodyExpr, childEnv)
@@ -1132,6 +1165,11 @@ func builtinApply(args []Value) (Value, error) {
 		return resolveTC(applyLambda(f, callArgs, 0, 0))
 	case *CaseLambdaVal:
 		return resolveTC(applyCaseLambda(f, callArgs, 0, 0))
+	case *ContinuationVal:
+		if len(callArgs) != 1 {
+			return nil, &EvalError{Message: "continuation: requires exactly 1 argument"}
+		}
+		panic(&continuationJump{cont: f, value: callArgs[0]})
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("apply: not a procedure: %s", fn.String())}
 	}

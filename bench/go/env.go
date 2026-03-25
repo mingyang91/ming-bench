@@ -2,12 +2,17 @@ package ming
 
 // Env is a lexical environment.
 type Env struct {
-	bindings map[string]Value
-	parent   *Env
+	bindings  map[string]Value
+	parent    *Env
+	evalState *EvalState
 }
 
 func newEnv(parent *Env) *Env {
-	return &Env{bindings: make(map[string]Value), parent: parent}
+	e := &Env{bindings: make(map[string]Value), parent: parent}
+	if parent != nil {
+		e.evalState = parent.evalState
+	}
+	return e
 }
 
 func (e *Env) get(name string) (Value, bool) {

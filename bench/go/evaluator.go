@@ -14,13 +14,10 @@ func EvalStr(input string) (string, error) {
 	}
 
 	env := makeGlobalEnv(nil)
-	var lastVal Value
-	for _, expr := range exprs {
-		v, err := eval(expr, env)
-		if err != nil {
-			return "", err
-		}
-		lastVal = v
+	env.evalState = newEvalState()
+	lastVal, err := evalTopLevel(exprs, env)
+	if err != nil {
+		return "", err
 	}
 
 	if _, ok := lastVal.(*VoidVal); ok {
@@ -42,13 +39,10 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 
 	var out strings.Builder
 	env := makeGlobalEnv(&out)
-	var lastVal Value
-	for _, expr := range exprs {
-		v, evalErr := eval(expr, env)
-		if evalErr != nil {
-			return "", "", evalErr
-		}
-		lastVal = v
+	env.evalState = newEvalState()
+	lastVal, evalErr := evalTopLevel(exprs, env)
+	if evalErr != nil {
+		return "", "", evalErr
 	}
 
 	res := ""
