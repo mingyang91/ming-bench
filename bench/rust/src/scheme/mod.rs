@@ -14,7 +14,7 @@ use self::number::{parse_number_literal, Number, NumberError};
 use self::value_ops::{
     eqv_value, render_char, render_list, render_pair, render_string, render_vector, value_type_name,
 };
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
@@ -124,12 +124,20 @@ struct RecordValue {
     fields: Vec<Value>,
 }
 
+#[derive(Debug)]
+struct StringValue {
+    value: RefCell<String>,
+    mutable: bool,
+}
+
 type EnvRef = Rc<RefCell<Env>>;
 type EnvWeak = Weak<RefCell<Env>>;
-type StringRef = Rc<RefCell<String>>;
 type VectorRef = Rc<RefCell<Vec<Value>>>;
 type BindingRef = Rc<RefCell<Value>>;
 type MacroRef = Rc<MacroTransformer>;
+
+#[derive(Debug, Clone)]
+struct StringRef(Rc<StringValue>);
 
 #[derive(Debug, Clone)]
 struct MacroRule {
@@ -185,6 +193,31 @@ impl LambdaParams {
             Some(_) => format!("at least {required_len} arguments"),
             None => format!("exactly {required_len} arguments"),
         }
+    }
+}
+
+impl StringRef {
+    fn new(value: impl Into<String>, mutable: bool) -> Self {
+        Self(Rc::new(StringValue {
+            value: RefCell::new(value.into()),
+            mutable,
+        }))
+    }
+
+    fn borrow(&self) -> Ref<'_, String> {
+        self.0.value.borrow()
+    }
+
+    fn borrow_mut(&self) -> RefMut<'_, String> {
+        self.0.value.borrow_mut()
+    }
+
+    fn is_mutable(&self) -> bool {
+        self.0.mutable
+    }
+
+    fn ptr_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -324,7 +357,15 @@ fn number_error(pos: SourcePos, name: &str, error: NumberError) -> EvalError {
 }
 
 fn make_string_value(value: impl Into<String>) -> Value {
-    Value::String(Rc::new(RefCell::new(value.into())))
+    make_mutable_string_value(value)
+}
+
+fn make_mutable_string_value(value: impl Into<String>) -> Value {
+    Value::String(StringRef::new(value, true))
+}
+
+fn make_immutable_string_value(value: impl Into<String>) -> Value {
+    Value::String(StringRef::new(value, false))
 }
 
 fn make_vector_value(values: Vec<Value>) -> Value {
@@ -377,7 +418,7 @@ fn eval_expr(expr: &Expr, env: &EnvRef, context: &mut EvalContext) -> Result<Val
         ExprKind::Number(value) => Ok(Value::Number(*value)),
         ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
         ExprKind::Character(value) => Ok(Value::Character(*value)),
-        ExprKind::String(value) => Ok(make_string_value(value.clone())),
+        ExprKind::String(value) => Ok(make_immutable_string_value(value.clone())),
         ExprKind::Symbol(name) => lookup_symbol(env, name, expr.pos),
         ExprKind::List(items) => eval_list(items, env, expr.pos, context),
     }
@@ -1183,7 +1224,7 @@ fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
         ExprKind::Number(value) => Ok(Value::Number(*value)),
         ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
         ExprKind::Character(value) => Ok(Value::Character(*value)),
-        ExprKind::String(value) => Ok(make_string_value(value.clone())),
+        ExprKind::String(value) => Ok(make_immutable_string_value(value.clone())),
         ExprKind::Symbol(value) => Ok(Value::Symbol(value.clone())),
         ExprKind::List(items) => items
             .iter()

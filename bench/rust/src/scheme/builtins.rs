@@ -18,6 +18,7 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "<" => Some("<"),
         ">" => Some(">"),
         "=" => Some("="),
+        ">=" => Some(">="),
         "<=" => Some("<="),
         "abs" => Some("abs"),
         "apply" => Some("apply"),
@@ -25,6 +26,7 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "assoc" => Some("assoc"),
         "boolean?" => Some("boolean?"),
         "char-alphabetic?" => Some("char-alphabetic?"),
+        "char->integer" => Some("char->integer"),
         "char-downcase" => Some("char-downcase"),
         "char-numeric?" => Some("char-numeric?"),
         "char-upcase" => Some("char-upcase"),
@@ -45,8 +47,10 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "inexact?" => Some("inexact?"),
         "inexact->exact" => Some("inexact->exact"),
         "integer?" => Some("integer?"),
+        "integer->char" => Some("integer->char"),
         "length" => Some("length"),
         "list" => Some("list"),
+        "list->string" => Some("list->string"),
         "list-ref" => Some("list-ref"),
         "list-tail" => Some("list-tail"),
         "list?" => Some("list?"),
@@ -78,6 +82,7 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "string=?" => Some("string=?"),
         "string<?" => Some("string<?"),
         "string-length" => Some("string-length"),
+        "string->list" => Some("string->list"),
         "string-ref" => Some("string-ref"),
         "string-set!" => Some("string-set!"),
         "string?" => Some("string?"),
@@ -113,6 +118,7 @@ pub(super) fn apply_builtin(
         "<" => compare(name, args, pos, |left, right| left < right),
         ">" => compare(name, args, pos, |left, right| left > right),
         "=" => compare(name, args, pos, |left, right| left == right),
+        ">=" => compare(name, args, pos, |left, right| left >= right),
         "<=" => compare(name, args, pos, |left, right| left <= right),
         "abs" => abs_value(args, pos),
         "apply" => builtin_apply(args, pos, context),
@@ -127,6 +133,7 @@ pub(super) fn apply_builtin(
             pos,
             |value| matches!(value, Value::Character(ch) if ch.is_alphabetic()),
         ),
+        "char->integer" => char_to_integer(args, pos),
         "char-downcase" => char_downcase(args, pos),
         "char-numeric?" => predicate(
             args,
@@ -165,6 +172,7 @@ pub(super) fn apply_builtin(
             pos,
             |value| matches!(value, Value::Number(number) if number.is_inexact()),
         ),
+        "integer->char" => integer_to_char(args, pos),
         "inexact->exact" => inexact_to_exact(args, pos),
         "integer?" => predicate(
             args,
@@ -174,6 +182,7 @@ pub(super) fn apply_builtin(
         ),
         "length" => length(args, pos),
         "list" => Ok(Value::List(args.to_vec())),
+        "list->string" => list_to_string(args, pos),
         "list-ref" => list_ref(args, pos),
         "list-tail" => list_tail(args, pos),
         "list?" => predicate(args, "list?", pos, |value| matches!(value, Value::List(_))),
@@ -230,6 +239,7 @@ pub(super) fn apply_builtin(
         "string=?" => compare_strings(name, args, pos, |left, right| left == right),
         "string<?" => compare_strings(name, args, pos, |left, right| left < right),
         "string-length" => string_length(args, pos),
+        "string->list" => string_to_list(args, pos),
         "string-ref" => string_ref(args, pos),
         "string-set!" => string_set(args, pos),
         "string?" => predicate(args, "string?", pos, |value| {
@@ -587,6 +597,25 @@ fn list_to_vector(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     }
 }
 
+fn list_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [list] => {
+            let list = expect_list("list->string", list, pos)?;
+            let mut string = String::with_capacity(list.len());
+            for value in list {
+                string.push(expect_char("list->string", value, pos)?);
+            }
+            Ok(make_string_value(string))
+        }
+        _ => Err(wrong_arg_count(
+            pos,
+            "list->string",
+            "exactly 1 argument",
+            args.len(),
+        )),
+    }
+}
+
 fn assoc(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     match args {
         [key, alist] => {
@@ -798,6 +827,22 @@ fn string_length(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     }
 }
 
+fn string_to_list(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [value] => {
+            let value = expect_string("string->list", value, pos)?;
+            let chars = value.borrow().chars().map(Value::Character).collect();
+            Ok(Value::List(chars))
+        }
+        _ => Err(wrong_arg_count(
+            pos,
+            "string->list",
+            "exactly 1 argument",
+            args.len(),
+        )),
+    }
+}
+
 fn substring(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     match args {
         [string, start, end] => {
@@ -934,6 +979,15 @@ fn string_set(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         [string, index, Value::Character(ch)] => {
             let string = expect_string("string-set!", string, pos)?;
             let index = expect_non_negative_integer("string-set!", index, pos, "index")?;
+
+            if !string.is_mutable() {
+                return Err(invalid_argument(
+                    pos,
+                    "string-set!",
+                    "strings are immutable",
+                ));
+            }
+
             let mut string = string.borrow_mut();
             let len = string.chars().count();
 
@@ -958,6 +1012,51 @@ fn string_set(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
             pos,
             "string-set!",
             "exactly 3 arguments",
+            args.len(),
+        )),
+    }
+}
+
+fn char_to_integer(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [value] => Ok(Value::Number(Number::exact_integer(
+            expect_char("char->integer", value, pos)? as u32 as i64,
+        ))),
+        _ => Err(wrong_arg_count(
+            pos,
+            "char->integer",
+            "exactly 1 argument",
+            args.len(),
+        )),
+    }
+}
+
+fn integer_to_char(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [value] => {
+            let integer = expect_exact_integer_arg("integer->char", value, pos)?;
+            let code_point = u32::try_from(integer).map_err(|_| {
+                invalid_argument(
+                    pos,
+                    "integer->char",
+                    format!("code point out of range: {integer}"),
+                )
+            })?;
+
+            let ch = char::from_u32(code_point).ok_or_else(|| {
+                invalid_argument(
+                    pos,
+                    "integer->char",
+                    format!("invalid Unicode scalar value: {integer}"),
+                )
+            })?;
+
+            Ok(Value::Character(ch))
+        }
+        _ => Err(wrong_arg_count(
+            pos,
+            "integer->char",
+            "exactly 1 argument",
             args.len(),
         )),
     }

@@ -168,7 +168,7 @@ pub(super) fn expect_string(
     pos: SourcePos,
 ) -> Result<StringRef, EvalError> {
     match value {
-        Value::String(value) => Ok(Rc::clone(value)),
+        Value::String(value) => Ok(value.clone()),
         other => Err(type_mismatch(pos, name, "string", other.type_name())),
     }
 }
