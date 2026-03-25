@@ -66,12 +66,14 @@ pub(super) fn cek_let(elems: &[Expr], env: &Env, span: Span, kont: &mut Vec<KFra
     if matches!(&elems[1].kind, ExprKind::Symbol(_)) {
         return cek_named_let(elems, env, span, kont);
     }
-    // Regular let
+    // Regular let — evaluate bindings through the CEK machine so call/cc
+    // inside init expressions captures the outer continuation.
     let new_env = env.push();
     let bindings = match &elems[1].kind {
         ExprKind::List(b) => b,
         _ => return Err(EvalError::Parse(format!("let: expected bindings list at {span}"))),
     };
+    let mut parsed: Vec<(String, Expr)> = Vec::new();
     for b in bindings {
         let pair = match &b.kind {
             ExprKind::List(pair) if pair.len() == 2 => pair,
@@ -81,10 +83,23 @@ pub(super) fn cek_let(elems: &[Expr], env: &Env, span: Span, kont: &mut Vec<KFra
             ExprKind::Symbol(s) => s.clone(),
             _ => return Err(EvalError::Parse(format!("let: expected variable name at {span}"))),
         };
-        let val = eval(&pair[1], env)?;
-        new_env.define(name, val);
+        parsed.push((name, pair[1].clone()));
     }
-    enter_body_cek(&elems[2..], &new_env, kont)
+    let body = elems[2..].to_vec();
+    if parsed.is_empty() {
+        return enter_body_cek(&body, &new_env, kont);
+    }
+    // Reverse so we can pop from the end efficiently.
+    parsed.reverse();
+    let (first_name, first_init) = parsed.pop().expect("parsed confirmed non-empty above");
+    kont.push(KFrame::LetBindInit {
+        name: first_name,
+        remaining: parsed,
+        body,
+        new_env,
+        init_env: env.clone(),
+    });
+    Ok(CekState::Eval(first_init, env.clone()))
 }
 
 fn cek_named_let(elems: &[Expr], env: &Env, span: Span, kont: &mut Vec<KFrame>) -> Result<CekState, EvalError> {
