@@ -1,6 +1,10 @@
 package ming
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
 
 // Env is a variable environment with lexical scoping.
 type Env struct {
@@ -388,7 +392,7 @@ func evalCond(e *ListExpr, env *Env) (Value, error) {
 	return &VoidVal{}, nil
 }
 
-func makeGlobalEnv() *Env {
+func makeGlobalEnv(output *strings.Builder) *Env {
 	env := newEnv(nil)
 
 	env.set("+", &BuiltinFunc{Name: "+", Fn: func(args []Value) (Value, error) {
@@ -563,6 +567,151 @@ func makeGlobalEnv() *Env {
 		return result, nil
 	}})
 
+	// I/O
+	env.set("display", &BuiltinFunc{Name: "display", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "display: need 1 argument"}
+		}
+		output.WriteString(displayValue(args[0]))
+		return &VoidVal{}, nil
+	}})
+
+	env.set("write", &BuiltinFunc{Name: "write", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "write: need 1 argument"}
+		}
+		output.WriteString(writeValue(args[0]))
+		return &VoidVal{}, nil
+	}})
+
+	env.set("newline", &BuiltinFunc{Name: "newline", Fn: func(args []Value) (Value, error) {
+		if len(args) != 0 {
+			return nil, &EvalError{Message: "newline: need 0 arguments"}
+		}
+		output.WriteByte('\n')
+		return &VoidVal{}, nil
+	}})
+
+	// String operations
+	env.set("string-append", &BuiltinFunc{Name: "string-append", Fn: func(args []Value) (Value, error) {
+		var buf strings.Builder
+		for _, a := range args {
+			s, ok := a.(*StringVal)
+			if !ok {
+				return nil, &EvalError{Message: "string-append: not a string"}
+			}
+			buf.WriteString(s.Val)
+		}
+		return &StringVal{Val: buf.String()}, nil
+	}})
+
+	env.set("string-length", &BuiltinFunc{Name: "string-length", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string-length: need 1 argument"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-length: not a string"}
+		}
+		return &IntVal{Val: int64(len(s.Val))}, nil
+	}})
+
+	env.set("substring", &BuiltinFunc{Name: "substring", Fn: func(args []Value) (Value, error) {
+		if len(args) != 3 {
+			return nil, &EvalError{Message: "substring: need 3 arguments"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "substring: not a string"}
+		}
+		start, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "substring: start not a number"}
+		}
+		end, ok := args[2].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "substring: end not a number"}
+		}
+		if start.Val < 0 || end.Val > int64(len(s.Val)) || start.Val > end.Val {
+			return nil, &EvalError{Message: "substring: index out of range"}
+		}
+		return &StringVal{Val: s.Val[start.Val:end.Val]}, nil
+	}})
+
+	env.set("string->number", &BuiltinFunc{Name: "string->number", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string->number: need 1 argument"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string->number: not a string"}
+		}
+		n, err := strconv.ParseInt(s.Val, 10, 64)
+		if err != nil {
+			return &BoolVal{Val: false}, nil
+		}
+		return &IntVal{Val: n}, nil
+	}})
+
+	env.set("number->string", &BuiltinFunc{Name: "number->string", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "number->string: need 1 argument"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "number->string: not a number"}
+		}
+		return &StringVal{Val: strconv.FormatInt(n.Val, 10)}, nil
+	}})
+
+	env.set("symbol->string", &BuiltinFunc{Name: "symbol->string", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "symbol->string: need 1 argument"}
+		}
+		s, ok := args[0].(*SymbolVal)
+		if !ok {
+			return nil, &EvalError{Message: "symbol->string: not a symbol"}
+		}
+		return &StringVal{Val: s.Val}, nil
+	}})
+
+	env.set("string->symbol", &BuiltinFunc{Name: "string->symbol", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string->symbol: need 1 argument"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string->symbol: not a string"}
+		}
+		return &SymbolVal{Val: s.Val}, nil
+	}})
+
+	env.set("string-ref", &BuiltinFunc{Name: "string-ref", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "string-ref: need 2 arguments"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-ref: not a string"}
+		}
+		idx, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-ref: index not a number"}
+		}
+		if idx.Val < 0 || idx.Val >= int64(len(s.Val)) {
+			return nil, &EvalError{Message: "string-ref: index out of range"}
+		}
+		return &CharVal{Val: rune(s.Val[idx.Val])}, nil
+	}})
+
+	env.set("char?", &BuiltinFunc{Name: "char?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "char?: need 1 argument"}
+		}
+		_, ok := args[0].(*CharVal)
+		return &BoolVal{Val: ok}, nil
+	}})
+
 	// Type predicates
 	env.set("number?", &BuiltinFunc{Name: "number?", Fn: func(args []Value) (Value, error) {
 		if len(args) != 1 {
@@ -632,30 +781,31 @@ func makeCompare(name string, op func(int64, int64) bool) func([]Value) (Value, 
 // EvalStr evaluates one or more Scheme expressions and returns the string
 // representation of the last result.
 func EvalStr(input string) (string, error) {
-	exprs, err := parse(input)
-	if err != nil {
-		return "", &EvalError{Message: err.Error()}
-	}
-	if len(exprs) == 0 {
-		return "", nil
-	}
-	env := makeGlobalEnv()
-	var last Value
-	for _, expr := range exprs {
-		last, err = evalExpr(expr, env)
-		if err != nil {
-			return "", err
-		}
-	}
-	if _, ok := last.(*VoidVal); ok {
-		return "", nil
-	}
-	return last.String(), nil
+	r, _, err := EvalStrWithOutput(input)
+	return r, err
 }
 
 // EvalStrWithOutput evaluates Scheme expressions and returns both the result
 // string and any captured output from display/write/newline.
 func EvalStrWithOutput(input string) (result string, output string, err error) {
-	r, err := EvalStr(input)
-	return r, "", err
+	exprs, parseErr := parse(input)
+	if parseErr != nil {
+		return "", "", &EvalError{Message: parseErr.Error()}
+	}
+	if len(exprs) == 0 {
+		return "", "", nil
+	}
+	var buf strings.Builder
+	env := makeGlobalEnv(&buf)
+	var last Value
+	for _, expr := range exprs {
+		last, err = evalExpr(expr, env)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	if _, ok := last.(*VoidVal); ok {
+		return "", buf.String(), nil
+	}
+	return last.String(), buf.String(), nil
 }
