@@ -1355,3 +1355,18 @@ fn val_eqv(a: &Val, b: &Val) -> bool {
         _ => false,
     }
 }
+
+pub fn builtin_syntax_to_datum(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("syntax->datum: expected 1 argument".into())); }
+    match &args[0] {
+        Val::SyntaxObject(expr) => super::special_forms::expr_to_val(expr),
+        _ => Err(EvalError::Type("syntax->datum: expected syntax object".into())),
+    }
+}
+
+pub fn builtin_datum_to_syntax(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("datum->syntax: expected 2 arguments".into())); }
+    // First arg is context (syntax object), second is datum to convert
+    let expr = super::macros::val_to_expr(&args[1])?;
+    Ok(Val::SyntaxObject(Box::new(expr)))
+}

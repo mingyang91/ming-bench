@@ -52,6 +52,27 @@ fn tokenize(input: &str) -> Vec<Token> {
                 }
                 tokens.push(Token { text: format!("\"{s}\""), span: start_span });
             }
+            '#' => {
+                let start_span = Span::new(line, col);
+                chars.next();
+                col += 1;
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    col += 1;
+                    tokens.push(Token { text: "#'".into(), span: start_span });
+                } else {
+                    let mut tok = String::from('#');
+                    while let Some(&c2) = chars.peek() {
+                        if c2 == '(' || c2 == ')' || c2 == ' ' || c2 == '\t' || c2 == '\n' || c2 == '\r' || c2 == ';' || c2 == '\'' {
+                            break;
+                        }
+                        tok.push(c2);
+                        chars.next();
+                        col += 1;
+                    }
+                    tokens.push(Token { text: tok, span: start_span });
+                }
+            }
             _ => {
                 let start_span = Span::new(line, col);
                 let mut tok = String::new();
@@ -80,6 +101,12 @@ fn parse(tokens: &[Token]) -> Result<(Expr, usize), EvalError> {
         let (inner, consumed) = parse(&tokens[1..])?;
         Ok((Expr::new(ExprKind::List(vec![
             Expr::new(ExprKind::Symbol("quote".into()), span),
+            inner,
+        ]), span), 1 + consumed))
+    } else if tok.text == "#'" {
+        let (inner, consumed) = parse(&tokens[1..])?;
+        Ok((Expr::new(ExprKind::List(vec![
+            Expr::new(ExprKind::Symbol("syntax".into()), span),
             inner,
         ]), span), 1 + consumed))
     } else if tok.text == "(" {

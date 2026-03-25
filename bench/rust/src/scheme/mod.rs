@@ -86,6 +86,11 @@ pub(crate) enum Val {
         rules: Vec<(Expr, Expr)>,
         def_env: Env,
     },
+    SyntaxCaseMacro {
+        transformer: Box<Val>,
+        def_env: Env,
+    },
+    SyntaxObject(Box<Expr>),
     Void,
     /// The call/cc primitive as a first-class value.
     CallCC,
@@ -201,6 +206,17 @@ pub(crate) enum KFrame {
         consumer: Val,
         span: Span,
         env: Env,
+    },
+    /// syntax-case: stx-expr evaluated, now match patterns.
+    SyntaxCaseMatch {
+        literals: Vec<String>,
+        clauses: Vec<Expr>,
+        env: Env,
+    },
+    /// syntax-case macro expansion: transformer returned, now eval the result.
+    SyntaxCaseExpand {
+        use_env: Env,
+        def_env: Env,
     },
 }
 
@@ -411,9 +427,11 @@ impl fmt::Display for Val {
                 write!(f, ")")
             }
             Val::Lambda { .. } | Val::CaseLambda { .. } | Val::Builtin(..) | Val::Macro { .. }
+            | Val::SyntaxCaseMacro { .. }
             | Val::CallCC | Val::DynamicWind | Val::Raise | Val::WithExcHandler
             | Val::Values | Val::CallWithValues
             | Val::Continuation(..) => write!(f, "#<procedure>"),
+            Val::SyntaxObject(_) => write!(f, "#<syntax>"),
             Val::MultipleValues(_) => write!(f, "#<values>"),
             Val::Void => write!(f, "#<void>"),
         }
@@ -550,6 +568,8 @@ impl Env {
             ("vector-fill!", builtin_vector_fill),
             ("set-car!", builtin_set_car),
             ("set-cdr!", builtin_set_cdr),
+            ("syntax->datum", builtin_syntax_to_datum),
+            ("datum->syntax", builtin_datum_to_syntax),
         ];
         // call/cc as a first-class value
         frame.borrow_mut().insert("call/cc".to_string(), Val::CallCC);
@@ -780,6 +800,42 @@ fn cek_step(expr: Expr, env: Env, kont: &mut Vec<KFrame>) -> Result<CekState, Ev
                     "define-syntax" => {
                         return Ok(CekState::ApplyK(eval_define_syntax(&elems[1..], &env, span)?));
                     }
+                    "syntax" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Arity(format!("syntax: expected 1 argument at {span}")));
+                        }
+                        return Ok(CekState::ApplyK(macros::eval_syntax_form(&elems[1], &env)));
+                    }
+                    "syntax-case" => {
+                        // (syntax-case stx-expr (literals...) clause ...)
+                        if elems.len() < 3 {
+                            return Err(EvalError::Parse(format!("syntax-case: expected at least 2 arguments at {span}")));
+                        }
+                        let literals = match &elems[2].kind {
+                            ExprKind::List(lits) => lits.iter().map(|e| match &e.kind {
+                                ExprKind::Symbol(s) => Ok(s.clone()),
+                                _ => Err(EvalError::Parse(format!("syntax-case: expected literal symbol at {span}"))),
+                            }).collect::<Result<Vec<_>, _>>()?,
+                            _ => return Err(EvalError::Parse(format!("syntax-case: expected literals list at {span}"))),
+                        };
+                        let clauses = elems[3..].to_vec();
+                        kont.push(KFrame::SyntaxCaseMatch { literals, clauses, env: env.clone() });
+                        return Ok(CekState::Eval(elems[1].clone(), env));
+                    }
+                    "with-syntax" => {
+                        // (with-syntax ((var expr) ...) body ...)
+                        // Desugar to let
+                        if elems.len() < 3 {
+                            return Err(EvalError::Parse(format!("with-syntax: expected bindings and body at {span}")));
+                        }
+                        let let_form = Expr::new(ExprKind::List({
+                            let mut parts = vec![Expr::new(ExprKind::Symbol("let".into()), span)];
+                            parts.push(elems[1].clone());
+                            parts.extend_from_slice(&elems[2..]);
+                            parts
+                        }), span);
+                        return Ok(CekState::Eval(let_form, env));
+                    }
                     "define-record-type" => {
                         return Ok(CekState::ApplyK(eval_define_record_type(&elems[1..], &env, span)?));
                     }
@@ -884,6 +940,13 @@ fn cek_step(expr: Expr, env: Env, kont: &mut Vec<KFrame>) -> Result<CekState, Ev
                                 &elems, &literals, &rules, &def_env, &env, span,
                             )?;
                             return Ok(CekState::Eval(expanded, eval_env));
+                        }
+                        // Check for syntax-case macro
+                        if let Some(Val::SyntaxCaseMacro { transformer, def_env }) = env.get(op) {
+                            let call_expr = Expr::new(ExprKind::List(elems.clone()), span);
+                            let stx_obj = Val::SyntaxObject(Box::new(call_expr));
+                            kont.push(KFrame::SyntaxCaseExpand { use_env: env.clone(), def_env });
+                            return apply_function_cek(*transformer, vec![stx_obj], kont, span, &env);
                         }
                         // Fall through to function application
                     }
@@ -1016,6 +1079,23 @@ fn apply_frame(frame: KFrame, val: Val, kont: &mut Vec<KFrame>) -> Result<CekSta
                 other => vec![other],
             };
             apply_function_cek(consumer, args, kont, span, &env)
+        }
+        KFrame::SyntaxCaseMatch { literals, clauses, env } => {
+            let stx_expr = match &val {
+                Val::SyntaxObject(e) => (**e).clone(),
+                _ => return Err(EvalError::Type("syntax-case: expected syntax object".into())),
+            };
+            macros::eval_syntax_case_match(stx_expr, &literals, &clauses, &env, kont)
+        }
+        KFrame::SyntaxCaseExpand { use_env, def_env } => {
+            match val {
+                Val::SyntaxObject(expr) => {
+                    // Apply hygiene: rename free vars from def_env
+                    let (expanded, eval_env) = macros::apply_syntax_hygiene(*expr, &def_env, &use_env);
+                    Ok(CekState::Eval(expanded, eval_env))
+                }
+                _ => Err(EvalError::Type("syntax-case macro must return a syntax object".into())),
+            }
         }
     }
 }

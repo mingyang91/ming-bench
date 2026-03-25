@@ -165,12 +165,29 @@ pub(super) fn eval_define_syntax(args: &[Expr], env: &Env, span: Span) -> Result
     };
     let transformer = match &args[1].kind {
         ExprKind::List(elems) => elems,
-        _ => return Err(EvalError::Parse(format!("define-syntax: expected syntax-rules at {span}"))),
+        _ => return Err(EvalError::Parse(format!("define-syntax: expected syntax-rules or lambda at {span}"))),
     };
-    if transformer.is_empty()
-        || !matches!(&transformer[0].kind, ExprKind::Symbol(s) if s == "syntax-rules")
+    if transformer.is_empty() {
+        return Err(EvalError::Parse(format!("define-syntax: empty transformer at {span}")));
+    }
+
+    // Check if transformer is a lambda (syntax-case style)
+    if matches!(&transformer[0].kind, ExprKind::Symbol(s) if s == "lambda") {
+        let lambda_val = eval_lambda(&transformer[1..], env, span)?;
+        env.define(
+            name,
+            Val::SyntaxCaseMacro {
+                transformer: Box::new(lambda_val),
+                def_env: env.clone(),
+            },
+        );
+        return Ok(Val::Void);
+    }
+
+    // Otherwise expect syntax-rules
+    if !matches!(&transformer[0].kind, ExprKind::Symbol(s) if s == "syntax-rules")
     {
-        return Err(EvalError::Parse(format!("define-syntax: expected syntax-rules at {span}")));
+        return Err(EvalError::Parse(format!("define-syntax: expected syntax-rules or lambda at {span}")));
     }
     if transformer.len() < 2 {
         return Err(EvalError::Parse(format!("syntax-rules: missing literals at {span}")));
