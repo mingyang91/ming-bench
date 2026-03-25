@@ -326,6 +326,31 @@ public class Evaluator {
             s.setChar(idx, ch.value());
             return VOID;
         });
+        globalEnv.define("string->list", (BuiltinProc) args -> {
+            SchemeString s = asSchemeString(args.get(0));
+            Object result = NIL;
+            for (int i = s.length() - 1; i >= 0; i--) {
+                result = new Pair(new SchemeChar(s.charAt(i)), result);
+            }
+            return result;
+        });
+        globalEnv.define("list->string", (BuiltinProc) args -> {
+            Object list = args.get(0);
+            StringBuilder sb = new StringBuilder();
+            while (list instanceof Pair p) {
+                if (!(p.car instanceof SchemeChar ch)) throw new EvalError("list->string: expected char");
+                sb.append(ch.value());
+                list = p.cdr;
+            }
+            return new SchemeString(sb.toString());
+        });
+        globalEnv.define("char->integer", (BuiltinProc) args -> {
+            if (!(args.get(0) instanceof SchemeChar ch)) throw new EvalError("char->integer: expected char");
+            return (long) ch.value();
+        });
+        globalEnv.define("integer->char", (BuiltinProc) args -> {
+            return new SchemeChar((char) asLong(args.get(0)));
+        });
         // --- Level 9 builtins ---
 
         // Numeric utilities
@@ -647,7 +672,7 @@ public class Evaluator {
                 if (i >= len) throw new EvalError("unterminated string at " + line + ":" + startCol);
                 i++;
                 col++;
-                tokens.add(new Token(new SchemeString(sb.toString()), line, startCol));
+                tokens.add(new Token(new SchemeString(sb.toString(), true), line, startCol));
             } else if (c == '#') {
                 int startCol = col;
                 if (i + 1 < len) {
@@ -1729,11 +1754,18 @@ public class Evaluator {
     // Internal wrapper to distinguish strings from symbols (mutable for string-set!)
     static class SchemeString {
         private char[] chars;
-        SchemeString(String value) { this.chars = value.toCharArray(); }
+        private boolean immutable;
+        SchemeString(String value) { this.chars = value.toCharArray(); this.immutable = false; }
+        SchemeString(String value, boolean immutable) { this.chars = value.toCharArray(); this.immutable = immutable; }
         String value() { return new String(chars); }
         char charAt(int i) { return chars[i]; }
-        void setChar(int i, char c) { chars[i] = c; }
+        void setChar(int i, char c) throws EvalError {
+            if (immutable) throw new EvalError("string-set!: strings are immutable");
+            chars[i] = c;
+        }
         int length() { return chars.length; }
+        boolean isImmutable() { return immutable; }
+        void markImmutable() { this.immutable = true; }
         @Override public boolean equals(Object o) {
             return o instanceof SchemeString s && java.util.Arrays.equals(chars, s.chars);
         }
