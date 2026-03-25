@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::error::EvalError;
+use super::macros::MacroTransformer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Position {
@@ -42,6 +43,7 @@ impl Expr {
 pub(crate) type StringRef = Rc<RefCell<String>>;
 pub(crate) type PairRef = Rc<RefCell<PairCell>>;
 pub(crate) type EnvRef = Rc<RefCell<Environment>>;
+pub(crate) type BindingRef = Rc<RefCell<Value>>;
 
 pub(crate) struct PairCell {
     pub(crate) car: Value,
@@ -124,7 +126,7 @@ pub(crate) struct LambdaProcedure {
 }
 
 pub(crate) struct Environment {
-    bindings: HashMap<String, Value>,
+    bindings: HashMap<String, BindingRef>,
     parent: Option<EnvRef>,
 }
 
@@ -137,24 +139,39 @@ impl Environment {
     }
 
     pub(crate) fn define(env: &EnvRef, name: String, value: Value) {
-        env.borrow_mut().bindings.insert(name, value);
+        let mut borrowed = env.borrow_mut();
+        if let Some(binding) = borrowed.bindings.get(&name).cloned() {
+            drop(borrowed);
+            *binding.borrow_mut() = value;
+        } else {
+            borrowed.bindings.insert(name, Rc::new(RefCell::new(value)));
+        }
+    }
+
+    pub(crate) fn define_cell(env: &EnvRef, name: String, binding: BindingRef) {
+        env.borrow_mut().bindings.insert(name, binding);
     }
 
     pub(crate) fn lookup(env: &EnvRef, name: &str) -> Option<Value> {
+        Self::lookup_cell(env, name).map(|binding| binding.borrow().clone())
+    }
+
+    pub(crate) fn lookup_cell(env: &EnvRef, name: &str) -> Option<BindingRef> {
         let borrowed = env.borrow();
-        if let Some(value) = borrowed.bindings.get(name).cloned() {
-            return Some(value);
+        if let Some(binding) = borrowed.bindings.get(name).cloned() {
+            return Some(binding);
         }
 
         let parent = borrowed.parent.clone();
         drop(borrowed);
-        parent.and_then(|parent| Self::lookup(&parent, name))
+        parent.and_then(|parent| Self::lookup_cell(&parent, name))
     }
 
     pub(crate) fn set(env: &EnvRef, name: &str, value: Value) -> bool {
-        let mut borrowed = env.borrow_mut();
-        if let Some(slot) = borrowed.bindings.get_mut(name) {
-            *slot = value;
+        let borrowed = env.borrow();
+        if let Some(binding) = borrowed.bindings.get(name).cloned() {
+            drop(borrowed);
+            *binding.borrow_mut() = value;
             return true;
         }
 
@@ -169,6 +186,8 @@ impl Environment {
 #[derive(Default)]
 pub(crate) struct Runtime {
     output: String,
+    macros: HashMap<String, MacroTransformer>,
+    gensym_counter: usize,
 }
 
 impl Runtime {
@@ -182,6 +201,35 @@ impl Runtime {
 
     pub(crate) fn newline(&mut self) {
         self.output.push('\n');
+    }
+
+    pub(crate) fn define_macro(&mut self, name: String, transformer: MacroTransformer) {
+        self.macros.insert(name, transformer);
+    }
+
+    pub(crate) fn lookup_macro(&self, name: &str) -> Option<MacroTransformer> {
+        self.macros.get(name).cloned()
+    }
+
+    pub(crate) fn macro_names(&self) -> Vec<String> {
+        self.macros.keys().cloned().collect()
+    }
+
+    pub(crate) fn fresh_symbol(&mut self, hint: &str) -> String {
+        let suffix = self.gensym_counter;
+        self.gensym_counter += 1;
+
+        let sanitized = hint
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+            .collect::<String>();
+        let base = if sanitized.is_empty() {
+            "tmp"
+        } else {
+            &sanitized
+        };
+
+        format!("__macro_{suffix}_{base}")
     }
 
     pub(crate) fn into_output(self) -> String {

@@ -2,6 +2,7 @@ mod builtins;
 mod core;
 pub mod error;
 mod eval;
+mod macros;
 mod parser;
 
 pub use error::EvalError;

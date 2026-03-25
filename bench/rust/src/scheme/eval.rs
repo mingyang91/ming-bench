@@ -3,6 +3,7 @@ use super::core::{
     make_lambda, quote_expr, EnvRef, Environment, Expr, LambdaProcedure, Procedure, Runtime, Value,
 };
 use super::error::EvalError;
+use super::macros::{expand_macro_call, parse_macro_definition};
 
 struct ParsedParams {
     params: Vec<String>,
@@ -12,6 +13,7 @@ struct ParsedParams {
 #[derive(Clone, Copy)]
 enum SpecialForm {
     Define,
+    DefineSyntax,
     Set,
     If,
     Quote,
@@ -27,6 +29,7 @@ impl SpecialForm {
     fn from_symbol(symbol: &str) -> Option<Self> {
         match symbol {
             "define" => Some(Self::Define),
+            "define-syntax" => Some(Self::DefineSyntax),
             "set!" => Some(Self::Set),
             "if" => Some(Self::If),
             "quote" => Some(Self::Quote),
@@ -43,6 +46,7 @@ impl SpecialForm {
     fn eval(self, args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value, EvalError> {
         match self {
             Self::Define => eval_define(args, env, runtime),
+            Self::DefineSyntax => eval_define_syntax(args, env, runtime),
             Self::Set => eval_set(args, env, runtime),
             Self::If => eval_if(args, env, runtime),
             Self::Quote => eval_quote(args),
@@ -101,6 +105,11 @@ fn eval_list(items: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Valu
         if let Some(special_form) = SpecialForm::from_symbol(name) {
             return special_form.eval(args, env, runtime);
         }
+
+        if let Some(transformer) = runtime.lookup_macro(name) {
+            let (expanded, expansion_env) = expand_macro_call(&transformer, items, env, runtime)?;
+            return eval_expr(&expanded, &expansion_env, runtime);
+        }
     }
 
     let operator = eval_expr(head, env, runtime)?;
@@ -123,6 +132,21 @@ fn eval_define(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Val
             positioned_syntax_error(target, "define requires a symbol or function signature"),
         ),
     }
+}
+
+fn eval_define_syntax(
+    args: &[Expr],
+    env: &EnvRef,
+    runtime: &mut Runtime,
+) -> Result<Value, EvalError> {
+    let [target, transformer_expr] = args else {
+        return Err(wrong_arg_count("define-syntax", "exactly 2", args.len()));
+    };
+
+    let name = expect_symbol_expr(target, "define-syntax name")?;
+    let transformer = parse_macro_definition(&name, transformer_expr, env)?;
+    runtime.define_macro(name, transformer);
+    Ok(Value::Void)
 }
 
 fn eval_variable_define(
