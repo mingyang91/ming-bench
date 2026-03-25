@@ -77,6 +77,8 @@ public class Evaluator {
         installBuiltin(env, "string-append", this::builtinStringAppend);
         installBuiltin(env, "string-length", this::builtinStringLength);
         installBuiltin(env, "substring", this::builtinSubstring);
+        installBuiltin(env, "string-copy", this::builtinStringCopy);
+        installBuiltin(env, "string-set!", this::builtinStringSet);
         installBuiltin(env, "string->number", this::builtinStringToNumber);
         installBuiltin(env, "number->string", this::builtinNumberToString);
         installBuiltin(env, "symbol->string", this::builtinSymbolToString);
@@ -105,6 +107,9 @@ public class Evaluator {
             }
             if (expression instanceof StringExpr stringExpr) {
                 return new StringValue(stringExpr.value());
+            }
+            if (expression instanceof CharExpr charExpr) {
+                return new CharValue(charExpr.value());
             }
             if (expression instanceof SymbolExpr symbolExpr) {
                 return env.lookup(symbolExpr.name());
@@ -391,6 +396,9 @@ public class Evaluator {
         if (expression instanceof StringExpr stringExpr) {
             return new StringValue(stringExpr.value());
         }
+        if (expression instanceof CharExpr charExpr) {
+            return new CharValue(charExpr.value());
+        }
         if (expression instanceof SymbolExpr symbolExpr) {
             return new SymbolValue(symbolExpr.name());
         }
@@ -535,6 +543,20 @@ public class Evaluator {
             throw errorAt(arguments.get(1).pos(), "invalid substring range");
         }
         return new StringValue(value.substring(start, end));
+    }
+
+    private Value builtinStringCopy(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "string-copy", callPos);
+        return requireStringValue(arguments.get(0), "string-copy").copy();
+    }
+
+    private Value builtinStringSet(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 3, "string-set!", callPos);
+        StringValue string = requireStringValue(arguments.get(0), "string-set!");
+        int index = requireStringIndex(arguments.get(1), "string-set!", string.length() - 1);
+        string.setCharAt(index, requireChar(arguments.get(2), "string-set!"));
+        return VOID_VALUE;
     }
 
     private Value builtinStringToNumber(SourcePos callPos, List<LocatedValue> arguments)
@@ -683,8 +705,12 @@ public class Evaluator {
     }
 
     private String requireString(LocatedValue value, String name) throws EvalError {
-        if (value.value() instanceof StringValue(String string)) {
-            return string;
+        return requireStringValue(value, name).text();
+    }
+
+    private StringValue requireStringValue(LocatedValue value, String name) throws EvalError {
+        if (value.value() instanceof StringValue stringValue) {
+            return stringValue;
         }
         throw errorAt(value.pos(), "expected string for " + name);
     }
@@ -694,6 +720,13 @@ public class Evaluator {
             return symbol;
         }
         throw errorAt(value.pos(), "expected symbol for " + name);
+    }
+
+    private char requireChar(LocatedValue value, String name) throws EvalError {
+        if (value.value() instanceof CharValue(char ch)) {
+            return ch;
+        }
+        throw errorAt(value.pos(), "expected char for " + name);
     }
 
     private int requireStringIndex(LocatedValue value, String name, int upperBound) throws EvalError {
@@ -762,7 +795,7 @@ public class Evaluator {
         return error.hasPosition() ? error : error.withPosition(pos.line(), pos.column());
     }
 
-    private sealed interface Expr permits IntExpr, BoolExpr, StringExpr, SymbolExpr, ListExpr {
+    private sealed interface Expr permits IntExpr, BoolExpr, StringExpr, CharExpr, SymbolExpr, ListExpr {
         SourcePos pos();
     }
 
@@ -773,6 +806,8 @@ public class Evaluator {
     private record BoolExpr(boolean value, SourcePos pos) implements Expr {}
 
     private record StringExpr(String value, SourcePos pos) implements Expr {}
+
+    private record CharExpr(char value, SourcePos pos) implements Expr {}
 
     private record SymbolExpr(String name, SourcePos pos) implements Expr {}
 
@@ -806,10 +841,32 @@ public class Evaluator {
         }
     }
 
-    private record StringValue(String value) implements Value {
+    private static final class StringValue implements Value {
+        private final StringBuilder builder;
+
+        private StringValue(String value) {
+            this.builder = new StringBuilder(value);
+        }
+
+        private String text() {
+            return builder.toString();
+        }
+
+        private int length() {
+            return builder.length();
+        }
+
+        private void setCharAt(int index, char value) {
+            builder.setCharAt(index, value);
+        }
+
+        private StringValue copy() {
+            return new StringValue(text());
+        }
+
         @Override
         public String render() {
-            return renderStringLiteral(value);
+            return renderStringLiteral(text());
         }
     }
 
@@ -930,8 +987,8 @@ public class Evaluator {
             return renderPair(pair, displayMode);
         }
         if (displayMode) {
-            if (value instanceof StringValue(String string)) {
-                return string;
+            if (value instanceof StringValue stringValue) {
+                return stringValue.text();
             }
             if (value instanceof CharValue(char ch)) {
                 return Character.toString(ch);
@@ -1021,7 +1078,7 @@ public class Evaluator {
                 return parseString(pos);
             }
             if (ch == '#') {
-                return parseBoolean(pos);
+                return parseBooleanOrCharacter(pos);
             }
             return parseAtom(pos);
         }
@@ -1076,7 +1133,7 @@ public class Evaluator {
             throw errorAt(pos, "unterminated string");
         }
 
-        private Expr parseBoolean(SourcePos pos) throws EvalError {
+        private Expr parseBooleanOrCharacter(SourcePos pos) throws EvalError {
             if (matchesToken("#t")) {
                 index += 2;
                 return new BoolExpr(true, pos);
@@ -1085,7 +1142,31 @@ public class Evaluator {
                 index += 2;
                 return new BoolExpr(false, pos);
             }
+            if (input.startsWith("#\\", index)) {
+                return parseCharacter(pos);
+            }
             throw errorAt(pos, "invalid boolean literal");
+        }
+
+        private Expr parseCharacter(SourcePos pos) throws EvalError {
+            index += 2;
+            int start = index;
+            while (!isAtEnd() && !isDelimiter(input.charAt(index))) {
+                index++;
+            }
+
+            String token = input.substring(start, index);
+            if (token.isEmpty()) {
+                throw errorAt(pos, "invalid character literal");
+            }
+            if (token.length() == 1) {
+                return new CharExpr(token.charAt(0), pos);
+            }
+            return switch (token) {
+                case "space" -> new CharExpr(' ', pos);
+                case "newline" -> new CharExpr('\n', pos);
+                default -> throw errorAt(pos, "invalid character literal");
+            };
         }
 
         private boolean matchesToken(String token) {
