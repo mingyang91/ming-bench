@@ -1,5 +1,6 @@
 use super::core::{make_string, BuiltinProcedure, EnvRef, Environment, Runtime, StringRef, Value};
 use super::error::EvalError;
+use super::eval::apply_procedure;
 
 const BUILTINS: &[BuiltinProcedure] = &[
     BuiltinProcedure {
@@ -141,6 +142,10 @@ const BUILTINS: &[BuiltinProcedure] = &[
     BuiltinProcedure {
         name: "char?",
         func: builtin_is_char,
+    },
+    BuiltinProcedure {
+        name: "apply",
+        func: builtin_apply,
     },
 ];
 
@@ -437,6 +442,20 @@ fn builtin_string_ref(args: &[Value], _runtime: &mut Runtime) -> Result<Value, E
 
 fn builtin_is_char(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     unary_predicate("char?", args, |value| matches!(value, Value::Char(_)))
+}
+
+fn builtin_apply(args: &[Value], runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let Some((operator, arg_parts)) = args.split_first() else {
+        return Err(wrong_arg_count("apply", "at least 2", 0));
+    };
+
+    let Some((list_arg, prefix_args)) = arg_parts.split_last() else {
+        return Err(wrong_arg_count("apply", "at least 2", 1));
+    };
+
+    let mut applied_args = prefix_args.to_vec();
+    applied_args.extend(expect_list(list_arg, "list")?.iter().cloned());
+    apply_procedure(operator.clone(), &applied_args, runtime)
 }
 
 fn unary_predicate<F>(name: &str, args: &[Value], predicate: F) -> Result<Value, EvalError>

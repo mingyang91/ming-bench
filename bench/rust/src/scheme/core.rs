@@ -104,6 +104,7 @@ pub(crate) struct BuiltinProcedure {
 pub(crate) struct LambdaProcedure {
     pub(crate) name: Option<String>,
     pub(crate) params: Vec<String>,
+    pub(crate) rest_param: Option<String>,
     pub(crate) body: Vec<Expr>,
     pub(crate) env: EnvRef,
 }
@@ -187,12 +188,14 @@ pub(crate) fn make_string(text: impl Into<String>) -> Value {
 pub(crate) fn make_lambda(
     name: Option<String>,
     params: Vec<String>,
+    rest_param: Option<String>,
     body: Vec<Expr>,
     env: &EnvRef,
 ) -> Value {
     Value::Procedure(Rc::new(Procedure::Lambda(LambdaProcedure {
         name,
         params,
+        rest_param,
         body,
         env: env.clone(),
     })))

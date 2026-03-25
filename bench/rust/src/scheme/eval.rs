@@ -4,6 +4,11 @@ use super::core::{
 };
 use super::error::EvalError;
 
+struct ParsedParams {
+    params: Vec<String>,
+    rest_param: Option<String>,
+}
+
 #[derive(Clone, Copy)]
 enum SpecialForm {
     Define,
@@ -152,7 +157,13 @@ fn eval_function_define(
 
     let name = expect_symbol_expr(name_expr, "define function name")?;
     let params = parse_params(params_exprs)?;
-    let lambda = make_lambda(Some(name.clone()), params, rest.to_vec(), env);
+    let lambda = make_lambda(
+        Some(name.clone()),
+        params.params,
+        params.rest_param,
+        rest.to_vec(),
+        env,
+    );
     Environment::define(env, name, lambda);
     Ok(Value::Void)
 }
@@ -215,21 +226,15 @@ fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
         return Err(wrong_arg_count("lambda", "at least 2", 1));
     }
 
-    let params = match params_expr {
-        Expr::List(params, _) => parse_params(params)?,
-        Expr::Bool(_, _)
-        | Expr::Int(_, _)
-        | Expr::String(_, _)
-        | Expr::Char(_, _)
-        | Expr::Symbol(_, _) => {
-            return Err(positioned_syntax_error(
-                params_expr,
-                "lambda parameters must be a list",
-            ));
-        }
-    };
+    let params = parse_formals(params_expr)?;
 
-    Ok(make_lambda(None, params, body.to_vec(), env))
+    Ok(make_lambda(
+        None,
+        params.params,
+        params.rest_param,
+        body.to_vec(),
+        env,
+    ))
 }
 
 fn eval_and(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -343,6 +348,7 @@ fn eval_named_let(
     let procedure = make_lambda(
         Some(name.to_string()),
         params,
+        None,
         body.to_vec(),
         &recursive_env,
     );
@@ -459,14 +465,73 @@ fn expect_symbol_expr(expr: &Expr, context: &str) -> Result<String, EvalError> {
     }
 }
 
-fn parse_params(params: &[Expr]) -> Result<Vec<String>, EvalError> {
-    params
-        .iter()
-        .map(|param| expect_symbol_expr(param, "parameter"))
-        .collect()
+fn parse_formals(params_expr: &Expr) -> Result<ParsedParams, EvalError> {
+    match params_expr {
+        Expr::List(params, _) => parse_params(params),
+        Expr::Symbol(name, _) if name != "." => Ok(ParsedParams {
+            params: Vec::new(),
+            rest_param: Some(name.clone()),
+        }),
+        Expr::Symbol(_, _)
+        | Expr::Bool(_, _)
+        | Expr::Int(_, _)
+        | Expr::String(_, _)
+        | Expr::Char(_, _) => Err(positioned_syntax_error(
+            params_expr,
+            "lambda parameters must be a list or symbol",
+        )),
+    }
 }
 
-fn apply_procedure(
+fn parse_params(params: &[Expr]) -> Result<ParsedParams, EvalError> {
+    let mut parsed = ParsedParams {
+        params: Vec::new(),
+        rest_param: None,
+    };
+    let mut index = 0;
+
+    while index < params.len() {
+        match &params[index] {
+            Expr::Symbol(symbol, _) if symbol == "." => {
+                let Some(rest_expr) = params.get(index + 1) else {
+                    return Err(positioned_syntax_error(
+                        &params[index],
+                        "parameter list is missing a rest parameter name",
+                    ));
+                };
+
+                if index + 2 != params.len() {
+                    return Err(positioned_syntax_error(
+                        &params[index],
+                        "parameter list allows only one rest parameter",
+                    ));
+                }
+
+                parsed.rest_param = Some(expect_param_name(rest_expr)?);
+                return Ok(parsed);
+            }
+            param => parsed.params.push(expect_param_name(param)?),
+        }
+
+        index += 1;
+    }
+
+    Ok(parsed)
+}
+
+fn expect_param_name(expr: &Expr) -> Result<String, EvalError> {
+    let name = expect_symbol_expr(expr, "parameter")?;
+    if name == "." {
+        Err(positioned_syntax_error(
+            expr,
+            "parameter name cannot be '.'",
+        ))
+    } else {
+        Ok(name)
+    }
+}
+
+pub(crate) fn apply_procedure(
     operator: Value,
     args: &[Value],
     runtime: &mut Runtime,
@@ -493,10 +558,17 @@ fn apply_lambda(
     args: &[Value],
     runtime: &mut Runtime,
 ) -> Result<Value, EvalError> {
-    if args.len() != lambda.params.len() {
+    let required_len = lambda.params.len();
+    let rest_param = lambda.rest_param.as_ref();
+
+    if args.len() < required_len || (rest_param.is_none() && args.len() != required_len) {
         return Err(EvalError::WrongArgCount {
             name: lambda.name.clone().unwrap_or_else(|| "lambda".into()),
-            expected: format!("exactly {}", lambda.params.len()),
+            expected: if rest_param.is_some() {
+                format!("at least {required_len}")
+            } else {
+                format!("exactly {required_len}")
+            },
             actual: args.len(),
         });
     }
@@ -505,6 +577,14 @@ fn apply_lambda(
 
     for (param, value) in lambda.params.iter().zip(args.iter()) {
         Environment::define(&call_env, param.clone(), value.clone());
+    }
+
+    if let Some(rest_param) = rest_param {
+        Environment::define(
+            &call_env,
+            rest_param.clone(),
+            Value::List(args[required_len..].to_vec()),
+        );
     }
 
     eval_sequence(&lambda.body, &call_env, runtime)
