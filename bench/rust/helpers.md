@@ -10,7 +10,11 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### eval_list (src/scheme/mod.rs:533) — Dispatch special forms or procedure applications for parsed list expressions
+### apply_builtin (src/scheme/mod.rs:859) — Implement the level-14 builtin procedure surface, including vectors and output forms
+### parse_bindings (src/scheme/mod.rs:1148) — Validate and extract `(name value)` binding lists for `let` and `letrec`
+### collect_list (src/scheme/mod.rs:1311) — Walk a proper list into a Rust vector while preserving Scheme list validation
+### format_value (src/scheme/mod.rs:1377) — Render runtime values into Scheme output syntax for `eval_str`, `write`, and vectors
 
 ## Python Helpers (scripts/)
 
