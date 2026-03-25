@@ -128,6 +128,10 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 			return evalDo(e, env)
 		case "dynamic-wind":
 			return evalDynamicWind(e, env)
+		case "guard":
+			return evalGuard(e, env)
+		case "with-exception-handler":
+			return evalWithExceptionHandler(e, env)
 		}
 
 		// Check for macro application
@@ -531,6 +535,14 @@ func makeGlobalEnv(out *strings.Builder) *Env {
 	// call/cc
 	env.set("call/cc", &CallCCVal{})
 	env.set("call-with-current-continuation", &CallCCVal{})
+
+	// L20: raise
+	env.set("raise", &BuiltinFunc{Name: "raise", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "raise: requires exactly 1 argument"}
+		}
+		panic(&exceptionRaise{value: args[0]})
+	}})
 
 	return env
 }
@@ -1381,16 +1393,21 @@ func evalDynamicWind(e *ListExpr, env *Env) (Value, error) {
 		return nil, err
 	}
 
-	// Call body-thunk, catching any continuation jumps so we can run out-thunk
+	// Call body-thunk, catching any non-local exit so we can run out-thunk
 	var bodyResult Value
 	var bodyErr error
 	var jump *continuationJump
+	var exRaise *exceptionRaise
 
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
 				if j, ok := r.(*continuationJump); ok {
 					jump = j
+					return
+				}
+				if ex, ok := r.(*exceptionRaise); ok {
+					exRaise = ex
 					return
 				}
 				panic(r)
@@ -1402,9 +1419,12 @@ func evalDynamicWind(e *ListExpr, env *Env) (Value, error) {
 	// Call out-thunk (always, even on non-local exit)
 	_, outErr := callProc(outThunk, nil, e.Ln, e.Cl)
 
-	// If there was a continuation jump, re-panic after out-thunk
+	// Re-panic after out-thunk for non-local exits
 	if jump != nil {
 		panic(jump)
+	}
+	if exRaise != nil {
+		panic(exRaise)
 	}
 
 	if bodyErr != nil {
@@ -1415,6 +1435,136 @@ func evalDynamicWind(e *ListExpr, env *Env) (Value, error) {
 	}
 
 	return bodyResult, nil
+}
+
+// exceptionRaise is the panic value when raise is called.
+type exceptionRaise struct {
+	value Value
+}
+
+func evalGuard(e *ListExpr, env *Env) (Value, error) {
+	// (guard (var clause...) body...)
+	if len(e.Items) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: requires clauses and body", e.Ln, e.Cl)}
+	}
+	clauseList, ok := e.Items[1].(*ListExpr)
+	if !ok || len(clauseList.Items) < 1 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: bad clause list", e.Ln, e.Cl)}
+	}
+	varSym, ok := clauseList.Items[0].(*SymbolExpr)
+	if !ok {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: expected variable name", e.Ln, e.Cl)}
+	}
+	clauses := clauseList.Items[1:]
+	bodyExprs := e.Items[2:]
+
+	// Evaluate body, catching exceptions
+	var bodyResult Value
+	var bodyErr error
+	var caught *exceptionRaise
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if ex, ok := r.(*exceptionRaise); ok {
+					caught = ex
+					return
+				}
+				panic(r)
+			}
+		}()
+		for i, bodyExpr := range bodyExprs {
+			bodyResult, bodyErr = eval(bodyExpr, env)
+			if bodyErr != nil {
+				return
+			}
+			_ = i
+		}
+	}()
+
+	if caught == nil {
+		return bodyResult, bodyErr
+	}
+
+	// Exception was caught — evaluate clauses in env with var bound
+	guardEnv := newEnv(env)
+	guardEnv.set(varSym.Name, caught.value)
+
+	for _, clause := range clauses {
+		cl, ok := clause.(*ListExpr)
+		if !ok || len(cl.Items) < 1 {
+			continue
+		}
+		// Check for else clause
+		if sym, ok := cl.Items[0].(*SymbolExpr); ok && sym.Name == "else" {
+			var result Value
+			for _, expr := range cl.Items[1:] {
+				var err error
+				result, err = eval(expr, guardEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		// Evaluate test
+		testVal, err := eval(cl.Items[0], guardEnv)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(testVal) {
+			if len(cl.Items) == 1 {
+				return testVal, nil
+			}
+			var result Value
+			for _, expr := range cl.Items[1:] {
+				result, err = eval(expr, guardEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+	}
+
+	// No clause matched — re-raise
+	panic(caught)
+}
+
+func evalWithExceptionHandler(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Items) != 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: with-exception-handler: requires exactly 2 arguments", e.Ln, e.Cl)}
+	}
+	handler, err := eval(e.Items[1], env)
+	if err != nil {
+		return nil, err
+	}
+	thunk, err := eval(e.Items[2], env)
+	if err != nil {
+		return nil, err
+	}
+
+	var result Value
+	var resultErr error
+	var caught *exceptionRaise
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if ex, ok := r.(*exceptionRaise); ok {
+					caught = ex
+					return
+				}
+				panic(r)
+			}
+		}()
+		result, resultErr = callProc(thunk, nil, e.Ln, e.Cl)
+	}()
+
+	if caught != nil {
+		return callProc(handler, []Value{caught.value}, e.Ln, e.Cl)
+	}
+	return result, resultErr
 }
 
 func evalDo(e *ListExpr, env *Env) (Value, error) {
