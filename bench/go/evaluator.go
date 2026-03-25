@@ -3,7 +3,28 @@ package ming
 // EvalStr evaluates one or more Scheme expressions and returns the string
 // representation of the last result.
 func EvalStr(input string) (string, error) {
-	return "", &EvalError{Message: "not implemented"}
+	exprs, err := parse(input)
+	if err != nil {
+		return "", &EvalError{Message: err.Error()}
+	}
+	if len(exprs) == 0 {
+		return "", &EvalError{Message: "no expressions"}
+	}
+
+	env := makeGlobalEnv()
+	var lastVal Value
+	for _, expr := range exprs {
+		v, err := eval(expr, env)
+		if err != nil {
+			return "", err
+		}
+		lastVal = v
+	}
+
+	if _, ok := lastVal.(*VoidVal); ok {
+		return "", nil
+	}
+	return lastVal.String(), nil
 }
 
 // EvalStrWithOutput evaluates Scheme expressions and returns both the result
