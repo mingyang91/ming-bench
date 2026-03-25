@@ -3,7 +3,8 @@ package ming
 /** Binding and iteration special forms extracted from Evaluator. */
 object BindingForms:
 
-  def evalLet(args: List[SchemeVal], env: Env): SchemeVal =
+  /** Evaluate let, returning (tailExpr, tailEnv) for trampoline. */
+  def evalLetTail(args: List[SchemeVal], env: Env): (SchemeVal, Env) =
     args match
       // Named let: (let name ((var init) ...) body ...)
       case SchemeVal.SSymbol(name) :: SchemeVal.SList(bindings) :: body if body.nonEmpty =>
@@ -16,12 +17,10 @@ object BindingForms:
           case _                                     => throw new EvalError("let: bad binding")
         }
         val letEnv = Env(Some(env))
-        letEnv.define(
-          name,
-          SchemeVal.SLambda(paramNames, None, body, letEnv)
-        )
+        letEnv.define(name, SchemeVal.SLambda(paramNames, None, body, letEnv))
         paramNames.zip(initVals).foreach((p, v) => letEnv.define(p, v))
-        Evaluator.evalBody(body, letEnv)
+        body.init.foreach(e => Evaluator.eval(e, letEnv))
+        (body.last, letEnv)
       // Regular let: (let ((var init) ...) body ...)
       case SchemeVal.SList(bindings) :: body if body.nonEmpty =>
         val pairs = bindings.map {
@@ -31,10 +30,11 @@ object BindingForms:
         }
         val letEnv = Env(Some(env))
         pairs.foreach((n, v) => letEnv.define(n, v))
-        Evaluator.evalBody(body, letEnv)
+        body.init.foreach(e => Evaluator.eval(e, letEnv))
+        (body.last, letEnv)
       case _ => throw new EvalError("let: bad syntax")
 
-  def evalLetStar(args: List[SchemeVal], env: Env): SchemeVal =
+  def evalLetStarTail(args: List[SchemeVal], env: Env): (SchemeVal, Env) =
     args match
       case SchemeVal.SList(bindings) :: body if body.nonEmpty =>
         val letEnv = Env(Some(env))
@@ -43,10 +43,11 @@ object BindingForms:
             letEnv.define(n, Evaluator.eval(initExpr, letEnv))
           case _ => throw new EvalError("let*: bad binding")
         }
-        Evaluator.evalBody(body, letEnv)
+        body.init.foreach(e => Evaluator.eval(e, letEnv))
+        (body.last, letEnv)
       case _ => throw new EvalError("let*: bad syntax")
 
-  def evalLetrec(args: List[SchemeVal], env: Env): SchemeVal =
+  def evalLetrecTail(args: List[SchemeVal], env: Env): (SchemeVal, Env) =
     args match
       case SchemeVal.SList(bindings) :: body if body.nonEmpty =>
         val letEnv = Env(Some(env))
@@ -60,10 +61,11 @@ object BindingForms:
             letEnv.set(n, Evaluator.eval(initExpr, letEnv))
           case _ => throw new EvalError("letrec: bad binding")
         }
-        Evaluator.evalBody(body, letEnv)
+        body.init.foreach(e => Evaluator.eval(e, letEnv))
+        (body.last, letEnv)
       case _ => throw new EvalError("letrec: bad syntax")
 
-  def evalLetrecStar(args: List[SchemeVal], env: Env): SchemeVal =
+  def evalLetrecStarTail(args: List[SchemeVal], env: Env): (SchemeVal, Env) =
     args match
       case SchemeVal.SList(bindings) :: body if body.nonEmpty =>
         val letEnv = Env(Some(env))
@@ -72,13 +74,14 @@ object BindingForms:
             letEnv.define(n, Evaluator.eval(initExpr, letEnv))
           case _ => throw new EvalError("letrec*: bad binding")
         }
-        Evaluator.evalBody(body, letEnv)
+        body.init.foreach(e => Evaluator.eval(e, letEnv))
+        (body.last, letEnv)
       case _ => throw new EvalError("letrec*: bad syntax")
 
   def evalCaseLambda(args: List[SchemeVal], env: Env): SchemeVal =
     val clauses = args.map {
       case SchemeVal.SList(SchemeVal.SList(params) :: body) if body.nonEmpty =>
-        val (paramNames, restParam) = Evaluator.parseParams(params)
+        val (paramNames, restParam) = DefineForms.parseParams(params)
         (paramNames, restParam, body)
       case SchemeVal.SList(SchemeVal.SSymbol(rest) :: body) if body.nonEmpty =>
         (Nil, Some(rest), body)
