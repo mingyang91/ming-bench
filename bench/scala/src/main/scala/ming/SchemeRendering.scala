@@ -17,6 +17,7 @@ private[ming] object SchemeRendering:
       case Value.Symbol(name)         => name
       case Value.EmptyList            => "()"
       case pair: Value.Pair           => renderPair(pair, render)
+      case record: Value.Record       => s"#<record ${record.typeName}>"
       case _: Procedure               => "#<procedure>"
       case Value.Void                 => "#<void>"
 

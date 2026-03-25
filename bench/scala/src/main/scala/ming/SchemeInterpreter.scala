@@ -49,10 +49,28 @@ private[ming] object SchemeInterpreter:
       def unapply(value: MutableString): Some[String] =
         Some(value.value)
 
-    final case class Character(value: Char)                                         extends Value
-    final case class Symbol(name: String)                                           extends Value
-    case object EmptyList                                                           extends Value
-    final case class Pair(car: Value, cdr: Value)                                   extends Value
+    final case class Character(value: Char)       extends Value
+    final case class Symbol(name: String)         extends Value
+    case object EmptyList                         extends Value
+    final case class Pair(car: Value, cdr: Value) extends Value
+
+    final class Record private[ming] (
+      private val descriptor: SchemeRecords.RecordTypeDescriptor,
+      private val fields: mutable.ArrayBuffer[Value]
+    ) extends Value:
+
+      def recordTypeId: Long =
+        descriptor.id
+
+      def typeName: String =
+        descriptor.name
+
+      def field(index: Int): Value =
+        fields(index)
+
+      def setField(index: Int, value: Value): Unit =
+        fields(index) = value
+
     final case class Builtin(name: String, impl: (List[Value], SourcePos) => Value) extends Procedure
 
     final case class Closure(
@@ -101,21 +119,28 @@ private[ming] object SchemeInterpreter:
       case Expr.Symbol(name, pos)   => env.lookup(name, pos)
       case Expr.ListExpr(items, pos) =>
         items match
-          case Nil                                     => throw EvalError.at(pos, "cannot evaluate empty list")
-          case Expr.Symbol("define-syntax", _) :: args => evalDefineSyntax(args, env, macros, pos)
-          case Expr.Symbol("define", _) :: args        => evalDefine(args, env, macros, pos)
-          case Expr.Symbol("set!", _) :: args          => evalSet(args, env, macros, pos)
-          case Expr.Symbol("begin", _) :: args         => evalBegin(args, env, macros)
-          case Expr.Symbol("if", _) :: args            => evalIf(args, env, macros, pos)
-          case Expr.Symbol("let", _) :: args           => evalLet(args, env, macros, pos)
-          case Expr.Symbol("cond", _) :: args          => evalCond(args, env, macros, pos)
-          case Expr.Symbol("quote", _) :: args         => evalQuote(args, pos)
-          case Expr.Symbol("lambda", _) :: args        => evalLambda(args, env, macros, pos)
-          case Expr.Symbol("and", _) :: args           => evalAnd(args, env, macros)
-          case Expr.Symbol("or", _) :: args            => evalOr(args, env, macros)
-          case Expr.Symbol(name, _) :: _ if macros.lookup(name).nonEmpty =>
-            val expanded = macros.lookup(name).get.expand(Expr.ListExpr(items, pos), pos)
-            eval(expanded, env, macros)
+          case Nil                                          => throw EvalError.at(pos, "cannot evaluate empty list")
+          case Expr.Symbol("define-record-type", _) :: args => SchemeRecords.evalDefineRecordType(args, env, pos)
+          case Expr.Symbol("define-syntax", _) :: args      => evalDefineSyntax(args, env, macros, pos)
+          case Expr.Symbol("define", _) :: args             => evalDefine(args, env, macros, pos)
+          case Expr.Symbol("set!", _) :: args               => evalSet(args, env, macros, pos)
+          case Expr.Symbol("begin", _) :: args              => evalBegin(args, env, macros)
+          case Expr.Symbol("if", _) :: args                 => evalIf(args, env, macros, pos)
+          case Expr.Symbol("let", _) :: args                => evalLet(args, env, macros, pos)
+          case Expr.Symbol("cond", _) :: args               => evalCond(args, env, macros, pos)
+          case Expr.Symbol("quote", _) :: args              => evalQuote(args, pos)
+          case Expr.Symbol("lambda", _) :: args             => evalLambda(args, env, macros, pos)
+          case Expr.Symbol("and", _) :: args                => evalAnd(args, env, macros)
+          case Expr.Symbol("or", _) :: args                 => evalOr(args, env, macros)
+          case (symbol @ Expr.Symbol(name, _)) :: args =>
+            macros.lookup(name) match
+              case Some(macroDef) =>
+                val expanded = macroDef.expand(Expr.ListExpr(items, pos), pos)
+                eval(expanded, env, macros)
+              case None =>
+                val procedure = eval(symbol, env, macros)
+                val values    = args.map(eval(_, env, macros))
+                applyProcedure(procedure, values, pos)
           case head :: args =>
             val procedure = eval(head, env, macros)
             val values    = args.map(eval(_, env, macros))
