@@ -98,6 +98,8 @@ public class Evaluator {
         environment.define("string->symbol", new BuiltinProcedure("string->symbol",
                 this::applyStringToSymbol));
         environment.define("string-ref", new BuiltinProcedure("string-ref", this::applyStringRef));
+        environment.define("string-set!", new BuiltinProcedure("string-set!", this::applyStringSet));
+        environment.define("string-copy", new BuiltinProcedure("string-copy", this::applyStringCopy));
         environment.define("char?", new BuiltinProcedure("char?", (args, pos) ->
                 BoolValue.of(isType(args, pos, CharValue.class))));
         return environment;
@@ -112,6 +114,9 @@ public class Evaluator {
         }
         if (expression instanceof StringExpr stringExpr) {
             return new StringValue(stringExpr.value());
+        }
+        if (expression instanceof CharExpr charExpr) {
+            return new CharValue(charExpr.value());
         }
         if (expression instanceof SymbolExpr symbolExpr) {
             return environment.lookup(symbolExpr.name(), symbolExpr.pos());
@@ -529,12 +534,31 @@ public class Evaluator {
 
     private Value applyStringRef(List<Value> arguments, SourcePos pos) throws EvalError {
         requireArgCount(arguments, 2, "string-ref", pos);
-        String value = asString(arguments.get(0), "string-ref", pos);
+        StringValue value = asStringValue(arguments.get(0), "string-ref", pos);
         int index = asIndex(arguments.get(1), "string-ref", pos);
         if (index >= value.length()) {
             throw error("'string-ref' index out of range", pos);
         }
         return new CharValue(value.charAt(index));
+    }
+
+    private Value applyStringSet(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 3, "string-set!", pos);
+        StringValue value = asStringValue(arguments.get(0), "string-set!", pos);
+        int index = asIndex(arguments.get(1), "string-set!", pos);
+        if (index >= value.length()) {
+            throw error("'string-set!' index out of range", pos);
+        }
+        if (!value.mutable()) {
+            throw error("'string-set!' cannot modify an immutable string", pos);
+        }
+        value.setCharAt(index, asChar(arguments.get(2), "string-set!", pos));
+        return VoidValue.INSTANCE;
+    }
+
+    private Value applyStringCopy(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 1, "string-copy", pos);
+        return asStringValue(arguments.getFirst(), "string-copy", pos).copy(true);
     }
 
     private BigInteger sum(List<Value> arguments, SourcePos pos) throws EvalError {
@@ -652,11 +676,26 @@ public class Evaluator {
         throw error("'" + operator + "' expects string arguments", pos);
     }
 
+    private StringValue asStringValue(Value value, String operator, SourcePos pos)
+            throws EvalError {
+        if (value instanceof StringValue stringValue) {
+            return stringValue;
+        }
+        throw error("'" + operator + "' expects string arguments", pos);
+    }
+
     private String asSymbol(Value value, String operator, SourcePos pos) throws EvalError {
         if (value instanceof SymbolValue symbolValue) {
             return symbolValue.name();
         }
         throw error("'" + operator + "' expects a symbol", pos);
+    }
+
+    private char asChar(Value value, String operator, SourcePos pos) throws EvalError {
+        if (value instanceof CharValue charValue) {
+            return charValue.value();
+        }
+        throw error("'" + operator + "' expects a character", pos);
     }
 
     private int asIndex(Value value, String operator, SourcePos pos) throws EvalError {
@@ -715,6 +754,9 @@ public class Evaluator {
         }
         if (expression instanceof StringExpr stringExpr) {
             return new StringValue(stringExpr.value());
+        }
+        if (expression instanceof CharExpr charExpr) {
+            return new CharValue(charExpr.value());
         }
         if (expression instanceof SymbolExpr symbolExpr) {
             return new SymbolValue(symbolExpr.name());
@@ -867,7 +909,8 @@ public class Evaluator {
         abstract boolean matches(int value);
     }
 
-    private sealed interface Expr permits IntExpr, BoolExpr, StringExpr, SymbolExpr, ListExpr {
+    private sealed interface Expr permits IntExpr, BoolExpr, StringExpr, CharExpr, SymbolExpr,
+            ListExpr {
         SourcePos pos();
     }
 
@@ -891,6 +934,9 @@ public class Evaluator {
     }
 
     private record StringExpr(String value, SourcePos pos) implements Expr {
+    }
+
+    private record CharExpr(char value, SourcePos pos) implements Expr {
     }
 
     private record SymbolExpr(String name, SourcePos pos) implements Expr {
@@ -917,7 +963,42 @@ public class Evaluator {
         }
     }
 
-    private record StringValue(String value) implements Value {
+    private static final class StringValue implements Value {
+        private final StringBuilder value;
+        private final boolean mutable;
+
+        private StringValue(String value) {
+            this(value, true);
+        }
+
+        private StringValue(String value, boolean mutable) {
+            this.value = new StringBuilder(value);
+            this.mutable = mutable;
+        }
+
+        private String value() {
+            return value.toString();
+        }
+
+        private int length() {
+            return value.length();
+        }
+
+        private char charAt(int index) {
+            return value.charAt(index);
+        }
+
+        private boolean mutable() {
+            return mutable;
+        }
+
+        private void setCharAt(int index, char updatedValue) {
+            value.setCharAt(index, updatedValue);
+        }
+
+        private StringValue copy(boolean mutable) {
+            return new StringValue(value(), mutable);
+        }
     }
 
     private record CharValue(char value) implements Value {
@@ -1015,7 +1096,7 @@ public class Evaluator {
                 return parseString();
             }
             if (current == '#') {
-                return parseBoolean();
+                return parseHashLiteral();
             }
             if (current == ')') {
                 throw error("unexpected ')'", currentPos());
@@ -1090,18 +1171,46 @@ public class Evaluator {
             };
         }
 
-        private Expr parseBoolean() throws EvalError {
+        private Expr parseHashLiteral() throws EvalError {
             SourcePos pos = currentPos();
             advance();
             if (isAtEnd()) {
-                throw error("incomplete boolean literal", pos);
+                throw error("incomplete hash literal", pos);
             }
 
             char value = advance();
             return switch (value) {
                 case 't' -> new BoolExpr(true, pos);
                 case 'f' -> new BoolExpr(false, pos);
-                default -> throw error("unknown boolean literal '#" + value + "'", pos);
+                case '\\' -> parseCharacterLiteral(pos);
+                default -> throw error("unknown hash literal '#" + value + "'", pos);
+            };
+        }
+
+        private Expr parseCharacterLiteral(SourcePos pos) throws EvalError {
+            if (isAtEnd()) {
+                throw error("incomplete character literal", pos);
+            }
+
+            int start = index;
+            while (!isAtEnd() && !isDelimiter(peek())) {
+                advance();
+            }
+
+            String token = input.substring(start, index);
+            if (token.isEmpty()) {
+                throw error("incomplete character literal", pos);
+            }
+            return switch (token) {
+                case "space" -> new CharExpr(' ', pos);
+                case "newline" -> new CharExpr('\n', pos);
+                default -> {
+                    if (token.length() != 1) {
+                        throw error("unknown character literal '#\\"
+                                + token + "'", pos);
+                    }
+                    yield new CharExpr(token.charAt(0), pos);
+                }
             };
         }
 
