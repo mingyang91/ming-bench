@@ -188,6 +188,7 @@ public class Evaluator {
                 case "cond" -> evalCond(arguments, env);
                 case "or" -> evalOr(arguments, env);
                 case "define" -> evalDefine(arguments, env);
+                case "define-record-type" -> evalDefineRecordType(arguments, env);
                 case "define-syntax" -> evalDefineSyntax(arguments, env);
                 case "if" -> evalIf(arguments, env);
                 case "let" -> evalLet(arguments, env);
@@ -330,6 +331,47 @@ public class Evaluator {
         }
 
         macros.put(symbolExpr.name(), parseMacroDefinition(symbolExpr.name(), arguments.get(1), env));
+        return VOID_VALUE;
+    }
+
+    private Value evalDefineRecordType(List<Expr> arguments, Environment env) throws EvalError {
+        if (arguments.size() < 3) {
+            throw new EvalError("invalid define-record-type");
+        }
+
+        String typeName = requireSymbolExpr(arguments.get(0), "invalid define-record-type");
+        RecordConstructorSpec constructor = parseRecordConstructorSpec(arguments.get(1));
+        String predicateName = requireSymbolExpr(arguments.get(2), "invalid define-record-type");
+
+        RecordType recordType;
+        try {
+            recordType = new RecordType(typeName, constructor.fields());
+        } catch (IllegalArgumentException e) {
+            throw new EvalError("invalid define-record-type");
+        }
+
+        env.define(constructor.name(), new BuiltinProcedure(
+                constructor.name(),
+                (callPos, callArguments) -> constructRecord(callPos, callArguments, constructor.name(), recordType)));
+        env.define(predicateName, new BuiltinProcedure(
+                predicateName,
+                (callPos, callArguments) -> recordPredicate(callPos, callArguments, predicateName, recordType)));
+
+        for (int i = 3; i < arguments.size(); i++) {
+            RecordAccessorSpec accessor = parseRecordAccessorSpec(arguments.get(i));
+            Integer fieldIndex = recordType.fieldIndex(accessor.fieldName());
+            if (fieldIndex == null) {
+                throw new EvalError("invalid define-record-type");
+            }
+            env.define(accessor.accessorName(), new BuiltinProcedure(
+                    accessor.accessorName(),
+                    (callPos, callArguments) -> recordAccessor(
+                            callPos,
+                            callArguments,
+                            accessor.accessorName(),
+                            recordType,
+                            fieldIndex)));
+        }
         return VOID_VALUE;
     }
 
@@ -701,6 +743,38 @@ public class Evaluator {
             names.add(symbolExpr.name());
         }
         return ParameterSpec.fixed(names);
+    }
+
+    private RecordConstructorSpec parseRecordConstructorSpec(Expr expr) throws EvalError {
+        if (!(expr instanceof ListExpr constructorExpr) || constructorExpr.elements().isEmpty()) {
+            throw errorAt(expr.pos(), "invalid define-record-type");
+        }
+
+        List<Expr> elements = constructorExpr.elements();
+        String constructorName = requireSymbolExpr(elements.get(0), "invalid define-record-type");
+        List<String> fields = new ArrayList<>(Math.max(0, elements.size() - 1));
+        for (int i = 1; i < elements.size(); i++) {
+            fields.add(requireSymbolExpr(elements.get(i), "invalid define-record-type"));
+        }
+        return new RecordConstructorSpec(constructorName, List.copyOf(fields));
+    }
+
+    private RecordAccessorSpec parseRecordAccessorSpec(Expr expr) throws EvalError {
+        if (!(expr instanceof ListExpr accessorExpr) || accessorExpr.elements().size() != 2) {
+            throw errorAt(expr.pos(), "invalid define-record-type");
+        }
+
+        List<Expr> elements = accessorExpr.elements();
+        return new RecordAccessorSpec(
+                requireSymbolExpr(elements.get(0), "invalid define-record-type"),
+                requireSymbolExpr(elements.get(1), "invalid define-record-type"));
+    }
+
+    private String requireSymbolExpr(Expr expr, String message) throws EvalError {
+        if (expr instanceof SymbolExpr symbolExpr) {
+            return symbolExpr.name();
+        }
+        throw errorAt(expr.pos(), message);
     }
 
     private Value quote(Expr expression) {
@@ -1456,6 +1530,29 @@ public class Evaluator {
                 .toLowerCase(Locale.ROOT));
     }
 
+    private Value constructRecord(SourcePos callPos, List<LocatedValue> arguments, String name,
+                                  RecordType recordType) throws EvalError {
+        expectArgumentCount(arguments, recordType.fieldCount(), name, callPos);
+        List<Value> fields = new ArrayList<>(arguments.size());
+        for (LocatedValue argument : arguments) {
+            fields.add(argument.value());
+        }
+        return new RecordValue(recordType, fields);
+    }
+
+    private Value recordPredicate(SourcePos callPos, List<LocatedValue> arguments, String name,
+                                  RecordType recordType) throws EvalError {
+        expectArgumentCount(arguments, 1, name, callPos);
+        return boolValue(arguments.get(0).value() instanceof RecordValue record
+                && record.type() == recordType);
+    }
+
+    private Value recordAccessor(SourcePos callPos, List<LocatedValue> arguments, String name,
+                                 RecordType recordType, int fieldIndex) throws EvalError {
+        expectArgumentCount(arguments, 1, name, callPos);
+        return requireRecord(arguments.get(0), name, recordType).field(fieldIndex);
+    }
+
     private static NumberValue parseNumberLiteral(String token) {
         if (isIntegerToken(token)) {
             try {
@@ -1761,6 +1858,14 @@ public class Evaluator {
         throw errorAt(value.pos(), "expected pair for " + name);
     }
 
+    private RecordValue requireRecord(LocatedValue value, String name, RecordType recordType)
+            throws EvalError {
+        if (value.value() instanceof RecordValue recordValue && recordValue.type() == recordType) {
+            return recordValue;
+        }
+        throw errorAt(value.pos(), "expected " + recordType.name() + " for " + name);
+    }
+
     private long requireProperListLength(LocatedValue value, String name) throws EvalError {
         long length = 0L;
         Value current = value.value();
@@ -1920,7 +2025,8 @@ public class Evaluator {
     }
 
     private sealed interface Value permits NumberValue, BoolValue, StringValue, SymbolValue,
-            CharValue, PairValue, EmptyListValue, BuiltinProcedure, LambdaProcedure, VoidValue {
+            CharValue, PairValue, EmptyListValue, BuiltinProcedure, LambdaProcedure,
+            RecordValue, VoidValue {
         String render();
     }
 
@@ -2011,6 +2117,29 @@ public class Evaluator {
         }
     }
 
+    private static final class RecordValue implements Value {
+        private final RecordType type;
+        private final List<Value> fields;
+
+        private RecordValue(RecordType type, List<Value> fields) {
+            this.type = type;
+            this.fields = List.copyOf(fields);
+        }
+
+        private RecordType type() {
+            return type;
+        }
+
+        private Value field(int index) {
+            return fields.get(index);
+        }
+
+        @Override
+        public String render() {
+            return "#<record " + type.name() + ">";
+        }
+    }
+
     private record VoidValue() implements Value {
         @Override
         public String render() {
@@ -2089,6 +2218,10 @@ public class Evaluator {
 
     private record Binding(String name, Expr valueExpr) {}
 
+    private record RecordConstructorSpec(String name, List<String> fields) {}
+
+    private record RecordAccessorSpec(String fieldName, String accessorName) {}
+
     private record ProgramEvaluation(Value result, String output) {}
 
     private record MacroDefinition(String name, Set<String> literals, List<MacroRule> rules,
@@ -2143,6 +2276,34 @@ public class Evaluator {
         private final List<CaptureBinding> captureBindings = new ArrayList<>();
     }
 
+    private static final class RecordType {
+        private final String name;
+        private final List<String> fields;
+        private final Map<String, Integer> fieldIndexes = new HashMap<>();
+
+        private RecordType(String name, List<String> fields) {
+            this.name = name;
+            this.fields = List.copyOf(fields);
+            for (int i = 0; i < fields.size(); i++) {
+                if (fieldIndexes.putIfAbsent(fields.get(i), i) != null) {
+                    throw new IllegalArgumentException("duplicate record field");
+                }
+            }
+        }
+
+        private String name() {
+            return name;
+        }
+
+        private int fieldCount() {
+            return fields.size();
+        }
+
+        private Integer fieldIndex(String fieldName) {
+            return fieldIndexes.get(fieldName);
+        }
+    }
+
     private static final class Environment {
         private final Environment parent;
         private final Map<String, Value> bindings = new HashMap<>();
@@ -2180,7 +2341,7 @@ public class Evaluator {
 
     private static boolean isSpecialForm(String name) {
         return switch (name) {
-            case "and", "begin", "cond", "define", "define-syntax", "else", "if",
+            case "and", "begin", "cond", "define", "define-record-type", "define-syntax", "else", "if",
                     "lambda", "let", "or", "quote", "set!", "syntax-rules" -> true;
             default -> false;
         };
