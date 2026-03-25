@@ -1,6 +1,6 @@
 package ming
 
-private[ming] final class RecordType private (
+final private[ming] class RecordType private (
   val name: String,
   val fieldNames: Vector[String],
   private val fieldIndexes: Map[String, Int]
