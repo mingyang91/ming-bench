@@ -1,5 +1,7 @@
+use super::Span;
+
 /// Evaluation error type for the Scheme interpreter.
-#[derive(Debug, PartialEq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum EvalError {
     #[error("parse error: {0}")]
     Parse(String),
@@ -13,6 +15,12 @@ pub enum EvalError {
     #[error("arity error: {0}")]
     Arity(String),
 
-    #[error("division by zero")]
-    DivisionByZero,
+    #[error("at {0}: division by zero")]
+    DivisionByZero(Span),
+}
+
+impl PartialEq for EvalError {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_string() == other.to_string()
+    }
 }
