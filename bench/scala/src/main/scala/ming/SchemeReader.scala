@@ -8,6 +8,11 @@ private[ming] object SchemeReader:
 
   final private class Reader(input: String):
     private var index = 0
+    private var line  = 1
+    private var col   = 1
+
+    private def currentPos: SourcePos =
+      SourcePos(line, col)
 
     def readAll(): List[Expr] =
       val expressions = List.newBuilder[Expr]
@@ -19,51 +24,50 @@ private[ming] object SchemeReader:
 
     private def readExpr(): Expr =
       skipTrivia()
-      if index >= input.length then throw new EvalError("unexpected end of input")
+      if index >= input.length then throw EvalError.at(currentPos, "unexpected end of input")
 
+      val pos = currentPos
       input.charAt(index) match
         case '\'' =>
-          index += 1
-          Expr.ListExpr(List(Expr.Symbol("quote"), readExpr()))
+          advance()
+          Expr.ListExpr(List(Expr.Symbol("quote", pos), readExpr()), pos)
         case '(' =>
-          index += 1
-          readList()
+          advance()
+          readList(pos)
         case ')' =>
-          throw new EvalError("unexpected )")
+          throw EvalError.at(pos, "unexpected )")
         case '"' =>
-          readString()
+          readString(pos)
         case '#' =>
-          readBoolean()
+          readBoolean(pos)
         case _ =>
-          readAtom()
+          readAtom(pos)
 
-    private def readList(): Expr =
+    private def readList(startPos: SourcePos): Expr =
       val items = List.newBuilder[Expr]
       skipTrivia()
       while index < input.length && input.charAt(index) != ')' do
         items += readExpr()
         skipTrivia()
 
-      if index >= input.length then throw new EvalError("unterminated list")
+      if index >= input.length then throw EvalError.at(startPos, "unterminated list")
 
-      index += 1
-      Expr.ListExpr(items.result())
+      advance()
+      Expr.ListExpr(items.result(), startPos)
 
-    private def readString(): Expr =
-      index += 1
+    private def readString(startPos: SourcePos): Expr =
+      advance()
       val builder = new StringBuilder
       var closed  = false
 
       while index < input.length && !closed do
-        val ch = input.charAt(index)
-        index += 1
+        val ch = advance()
         ch match
           case '"' =>
             closed = true
           case '\\' =>
-            if index >= input.length then throw new EvalError("unterminated string escape")
-            val escaped = input.charAt(index)
-            index += 1
+            if index >= input.length then throw EvalError.at(startPos, "unterminated string escape")
+            val escaped = advance()
             builder.append(
               escaped match
                 case '"'   => '"'
@@ -75,34 +79,36 @@ private[ming] object SchemeReader:
           case other =>
             builder.append(other)
 
-      if !closed then throw new EvalError("unterminated string")
+      if !closed then throw EvalError.at(startPos, "unterminated string")
 
-      Expr.StringLit(builder.result())
+      Expr.StringLit(builder.result(), startPos)
 
-    private def readBoolean(): Expr =
+    private def readBoolean(startPos: SourcePos): Expr =
       if startsWithToken("#t") then
-        index += 2
-        Expr.Bool(true)
+        advance()
+        advance()
+        Expr.Bool(true, startPos)
       else if startsWithToken("#f") then
-        index += 2
-        Expr.Bool(false)
-      else throw new EvalError("invalid boolean literal")
+        advance()
+        advance()
+        Expr.Bool(false, startPos)
+      else throw EvalError.at(startPos, "invalid boolean literal")
 
-    private def readAtom(): Expr =
+    private def readAtom(startPos: SourcePos): Expr =
       val start = index
-      while index < input.length && !isDelimiter(input.charAt(index)) do index += 1
+      while index < input.length && !isDelimiter(input.charAt(index)) do advance()
 
       val token = input.substring(start, index)
-      if isIntegerToken(token) then Expr.Number(BigInt(token))
-      else Expr.Symbol(token)
+      if isIntegerToken(token) then Expr.Number(BigInt(token), startPos)
+      else Expr.Symbol(token, startPos)
 
     private def skipTrivia(): Unit =
       var keepSkipping = true
       while keepSkipping do
-        while index < input.length && input.charAt(index).isWhitespace do index += 1
+        while index < input.length && input.charAt(index).isWhitespace do advance()
 
         if index < input.length && input.charAt(index) == ';' then
-          while index < input.length && input.charAt(index) != '\n' do index += 1
+          while index < input.length && input.charAt(index) != '\n' do advance()
         else keepSkipping = false
 
     private def startsWithToken(token: String): Boolean =
@@ -118,6 +124,15 @@ private[ming] object SchemeReader:
       token.nonEmpty &&
         (token.forall(_.isDigit) ||
           (token.head == '-' && token.length > 1 && token.tail.forall(_.isDigit)))
+
+    private def advance(): Char =
+      val ch = input.charAt(index)
+      index += 1
+      if ch == '\n' then
+        line += 1
+        col = 1
+      else col += 1
+      ch
 
   private object Reader:
     def apply(input: String): Reader = new Reader(input)
