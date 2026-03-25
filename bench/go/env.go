@@ -31,6 +31,17 @@ func (e *Env) Set(name string, val *Value) {
 	e.bindings[name] = val
 }
 
+func (e *Env) Update(name string, val *Value) bool {
+	if _, ok := e.bindings[name]; ok {
+		e.bindings[name] = val
+		return true
+	}
+	if e.parent != nil {
+		return e.parent.Update(name, val)
+	}
+	return false
+}
+
 func (e *Env) GetOutput() *strings.Builder {
 	if e.output != nil {
 		return e.output

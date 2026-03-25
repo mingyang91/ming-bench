@@ -52,6 +52,8 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalBegin(expr, env)
 		case "cond":
 			return evalCond(expr, env)
+		case "set!":
+			return evalSetBang(expr, env)
 		}
 	}
 
@@ -307,6 +309,24 @@ func evalLet(expr *Expr, env *Env) (*Value, error) {
 		}
 	}
 	return result, nil
+}
+
+func evalSetBang(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.Elements) != 3 {
+		return nil, fmt.Errorf("%d:%d: 'set!' requires exactly 2 arguments", expr.Line, expr.Col)
+	}
+	target := expr.Elements[1]
+	if target.Type != ExprSymbol {
+		return nil, fmt.Errorf("%d:%d: 'set!' expects a symbol", expr.Line, expr.Col)
+	}
+	val, err := Eval(expr.Elements[2], env)
+	if err != nil {
+		return nil, err
+	}
+	if !env.Update(target.StrVal, val) {
+		return nil, fmt.Errorf("%d:%d: unbound variable '%s'", expr.Line, expr.Col, target.StrVal)
+	}
+	return Void, nil
 }
 
 func evalBegin(expr *Expr, env *Env) (*Value, error) {
