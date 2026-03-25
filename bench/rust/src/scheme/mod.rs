@@ -553,6 +553,27 @@ fn lookup(env: &EnvRef, name: &str) -> Result<Value, EvalError> {
     })
 }
 
+fn assign(env: &EnvRef, name: &str, value: Value) -> Result<(), EvalError> {
+    let parent = {
+        let mut scope = env.borrow_mut();
+
+        if let Some(slot) = scope.bindings.get_mut(name) {
+            *slot = value;
+            return Ok(());
+        }
+
+        scope.parent.clone()
+    };
+
+    if let Some(parent) = parent {
+        assign(&parent, name, value)
+    } else {
+        Err(EvalError::UnboundVariable {
+            name: name.to_string(),
+        })
+    }
+}
+
 fn eval_program(exprs: &[Expr], ctx: &mut EvalContext) -> Result<Value, EvalError> {
     let env = default_env();
     eval_sequence(exprs, env, ctx)
@@ -597,6 +618,7 @@ fn eval_list(items: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value
             "cond" => return eval_cond(args, env, ctx),
             "quote" => return eval_quote(args),
             "define" => return eval_define(args, env, ctx),
+            "set!" => return eval_set(args, env, ctx),
             "lambda" => return eval_lambda(args, env),
             "let" => return eval_let(args, env, ctx),
             _ => {}
@@ -747,6 +769,20 @@ fn eval_define(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Valu
             message: "define requires a symbol or function signature".to_string(),
         }),
     }
+}
+
+fn eval_set(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_expr_arity("set!", args, 2)?;
+
+    let Expr::Symbol(name) = &args[0] else {
+        return Err(EvalError::SyntaxError {
+            message: "set! requires a symbol target".to_string(),
+        });
+    };
+
+    let value = eval_expr(&args[1], env.clone(), ctx)?;
+    assign(&env, name, value)?;
+    Ok(Value::Void)
 }
 
 fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
