@@ -1,7 +1,9 @@
 pub mod error;
+mod macros;
 
 pub use error::EvalError;
 
+use macros::{expand_macro_call, parse_macro_transformer, MacroTransformer};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -217,6 +219,7 @@ fn render_char(value: char) -> String {
 struct EvalContext {
     output: String,
     capture_output: bool,
+    gensym_counter: u64,
 }
 
 impl EvalContext {
@@ -224,6 +227,7 @@ impl EvalContext {
         Self {
             output: String::new(),
             capture_output,
+            gensym_counter: 0,
         }
     }
 
@@ -236,14 +240,21 @@ impl EvalContext {
     fn finish(self) -> String {
         self.output
     }
+
+    fn fresh_identifier(&mut self, name: &str) -> String {
+        self.gensym_counter += 1;
+        format!("__macro_{}_{}", self.gensym_counter, name)
+    }
 }
 
 type EnvRef = Rc<RefCell<Env>>;
+type BindingCell = Rc<RefCell<Value>>;
 type BuiltinFn = fn(&[Value], &mut EvalContext) -> Result<Value, EvalError>;
 
 struct Env {
     parent: Option<EnvRef>,
-    bindings: HashMap<String, Value>,
+    bindings: HashMap<String, BindingCell>,
+    macros: HashMap<String, Rc<MacroTransformer>>,
 }
 
 impl Env {
@@ -251,6 +262,7 @@ impl Env {
         Rc::new(RefCell::new(Self {
             parent: None,
             bindings: HashMap::new(),
+            macros: HashMap::new(),
         }))
     }
 
@@ -258,6 +270,7 @@ impl Env {
         Rc::new(RefCell::new(Self {
             parent: Some(parent),
             bindings: HashMap::new(),
+            macros: HashMap::new(),
         }))
     }
 }
@@ -588,47 +601,63 @@ fn define_builtin(env: &EnvRef, name: &'static str, implementation: BuiltinFn) {
     let value = Value::Procedure(Rc::new(Procedure::Builtin(BuiltinProcedure {
         implementation,
     })));
-    env.borrow_mut().bindings.insert(name.to_string(), value);
+    bind_value(env, name.to_string(), value);
 }
 
 fn lookup(env: &EnvRef, name: &str) -> Result<Value, EvalError> {
+    Ok(lookup_binding_cell(env, name)?.borrow().clone())
+}
+
+fn bind_value(env: &EnvRef, name: String, value: Value) {
+    env.borrow_mut()
+        .bindings
+        .insert(name, Rc::new(RefCell::new(value)));
+}
+
+fn bind_macro(env: &EnvRef, name: String, transformer: Rc<MacroTransformer>) {
+    env.borrow_mut().macros.insert(name, transformer);
+}
+
+fn lookup_binding_cell(env: &EnvRef, name: &str) -> Result<BindingCell, EvalError> {
+    lookup_binding_cell_opt(env, name).ok_or(EvalError::UnboundVariable {
+        name: name.to_string(),
+    })
+}
+
+fn lookup_binding_cell_opt(env: &EnvRef, name: &str) -> Option<BindingCell> {
     let (value, parent) = {
         let scope = env.borrow();
         (scope.bindings.get(name).cloned(), scope.parent.clone())
     };
 
     if let Some(value) = value {
-        return Ok(value);
+        return Some(value);
     }
 
     if let Some(parent) = parent {
-        return lookup(&parent, name);
+        return lookup_binding_cell_opt(&parent, name);
     }
 
-    Err(EvalError::UnboundVariable {
-        name: name.to_string(),
-    })
+    None
+}
+
+fn lookup_macro(env: &EnvRef, name: &str) -> Option<Rc<MacroTransformer>> {
+    let (transformer, parent) = {
+        let scope = env.borrow();
+        (scope.macros.get(name).cloned(), scope.parent.clone())
+    };
+
+    if let Some(transformer) = transformer {
+        return Some(transformer);
+    }
+
+    parent.and_then(|parent| lookup_macro(&parent, name))
 }
 
 fn assign(env: &EnvRef, name: &str, value: Value) -> Result<(), EvalError> {
-    let parent = {
-        let mut scope = env.borrow_mut();
-
-        if let Some(slot) = scope.bindings.get_mut(name) {
-            *slot = value;
-            return Ok(());
-        }
-
-        scope.parent.clone()
-    };
-
-    if let Some(parent) = parent {
-        assign(&parent, name, value)
-    } else {
-        Err(EvalError::UnboundVariable {
-            name: name.to_string(),
-        })
-    }
+    let cell = lookup_binding_cell(env, name)?;
+    *cell.borrow_mut() = value;
+    Ok(())
 }
 
 fn eval_program(exprs: &[Expr], ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -675,10 +704,16 @@ fn eval_list(items: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value
             "cond" => return eval_cond(args, env, ctx),
             "quote" => return eval_quote(args),
             "define" => return eval_define(args, env, ctx),
+            "define-syntax" => return eval_define_syntax(args, env),
             "set!" => return eval_set(args, env, ctx),
             "lambda" => return eval_lambda(args, env),
             "let" => return eval_let(args, env, ctx),
             _ => {}
+        }
+
+        if let Some(transformer) = lookup_macro(&env, operator) {
+            let (expanded, expansion_env) = expand_macro_call(transformer, items, env, ctx)?;
+            return eval_expr(&expanded, expansion_env, ctx);
         }
     }
 
@@ -795,7 +830,7 @@ fn eval_define(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Valu
         Expr::Symbol(name) => {
             expect_expr_arity("define", args, 2)?;
             let value = eval_expr(&args[1], env.clone(), ctx)?;
-            env.borrow_mut().bindings.insert(name.clone(), value);
+            bind_value(&env, name.clone(), value);
             Ok(Value::Void)
         }
         Expr::List(signature) => {
@@ -819,13 +854,27 @@ fn eval_define(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Valu
 
             let params = parse_param_slice(&signature[1..])?;
             let lambda = make_lambda(name.clone(), params, args[1..].to_vec(), env.clone());
-            env.borrow_mut().bindings.insert(name.clone(), lambda);
+            bind_value(&env, name.clone(), lambda);
             Ok(Value::Void)
         }
         _ => Err(EvalError::SyntaxError {
             message: "define requires a symbol or function signature".to_string(),
         }),
     }
+}
+
+fn eval_define_syntax(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    expect_expr_arity("define-syntax", args, 2)?;
+
+    let Expr::Symbol(name) = &args[0] else {
+        return Err(EvalError::SyntaxError {
+            message: "define-syntax requires a symbol name".to_string(),
+        });
+    };
+
+    let transformer = parse_macro_transformer(name, &args[1], env.clone())?;
+    bind_macro(&env, name.clone(), transformer);
+    Ok(Value::Void)
 }
 
 fn eval_set(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -899,7 +948,7 @@ fn eval_named_let(
     named_env
         .borrow_mut()
         .bindings
-        .insert(name.to_string(), lambda.clone());
+        .insert(name.to_string(), Rc::new(RefCell::new(lambda.clone())));
     apply_evaluated(lambda, values, ctx)
 }
 
@@ -921,7 +970,7 @@ fn eval_let_bindings(
     {
         let mut scope = let_env.borrow_mut();
         for ((name, _), value) in bindings.into_iter().zip(values) {
-            scope.bindings.insert(name, value);
+            scope.bindings.insert(name, Rc::new(RefCell::new(value)));
         }
     }
     eval_sequence(body, let_env, ctx)
@@ -1111,13 +1160,14 @@ fn apply_lambda(
             let arg = args
                 .next()
                 .expect("arity check should ensure enough arguments");
-            scope.bindings.insert(param, arg);
+            scope.bindings.insert(param, Rc::new(RefCell::new(arg)));
         }
 
         if let Some(rest) = &lambda.params.rest {
-            scope
-                .bindings
-                .insert(rest.clone(), list_from_values(args.collect()));
+            scope.bindings.insert(
+                rest.clone(),
+                Rc::new(RefCell::new(list_from_values(args.collect()))),
+            );
         }
     }
 
@@ -1993,6 +2043,23 @@ fn expect_value_arity(name: &str, args: &[Value], expected: usize) -> Result<(),
     }
 
     Ok(())
+}
+
+fn is_special_form_name(name: &str) -> bool {
+    matches!(
+        name,
+        "and"
+            | "or"
+            | "if"
+            | "begin"
+            | "cond"
+            | "quote"
+            | "define"
+            | "define-syntax"
+            | "set!"
+            | "lambda"
+            | "let"
+    )
 }
 
 /// Evaluate one or more Scheme expressions and return the string

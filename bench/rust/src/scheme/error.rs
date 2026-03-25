@@ -27,6 +27,9 @@ pub enum EvalError {
     #[error("unsupported form: {name}")]
     UnsupportedForm { name: String },
 
+    #[error("macro error in {name}: {message}")]
+    MacroError { name: String, message: String },
+
     #[error("attempted to call a non-procedure")]
     NotAProcedure,
 
