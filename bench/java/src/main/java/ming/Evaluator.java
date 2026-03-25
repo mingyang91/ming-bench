@@ -169,7 +169,7 @@ public class Evaluator {
             for (Object a : args) sb.append(asSchemeString(a).value());
             return new SchemeString(sb.toString());
         });
-        globalEnv.define("string-length", (BuiltinProc) args -> (long) asSchemeString(args.get(0)).value().length());
+        globalEnv.define("string-length", (BuiltinProc) args -> (long) asSchemeString(args.get(0)).length());
         globalEnv.define("substring", (BuiltinProc) args -> {
             String s = asSchemeString(args.get(0)).value();
             int start = (int) asLong(args.get(1));
@@ -191,9 +191,19 @@ public class Evaluator {
         });
         globalEnv.define("string->symbol", (BuiltinProc) args -> asSchemeString(args.get(0)).value());
         globalEnv.define("string-ref", (BuiltinProc) args -> {
-            String s = asSchemeString(args.get(0)).value();
+            SchemeString s = asSchemeString(args.get(0));
             int idx = (int) asLong(args.get(1));
             return new SchemeChar(s.charAt(idx));
+        });
+        globalEnv.define("string-copy", (BuiltinProc) args -> {
+            return new SchemeString(asSchemeString(args.get(0)).value());
+        });
+        globalEnv.define("string-set!", (BuiltinProc) args -> {
+            SchemeString s = asSchemeString(args.get(0));
+            int idx = (int) asLong(args.get(1));
+            if (!(args.get(2) instanceof SchemeChar ch)) throw new EvalError("string-set!: expected char");
+            s.setChar(idx, ch.value());
+            return VOID;
         });
     }
 
@@ -313,6 +323,30 @@ public class Evaluator {
                         tokens.add(new Token(Boolean.FALSE, line, startCol));
                         i += 2;
                         col += 2;
+                    } else if (next == '\\') {
+                        i += 2;
+                        col += 2;
+                        if (i >= len) throw new EvalError("unexpected end after #\\ at " + line + ":" + col);
+                        // Read character name or single char
+                        int nameStart = i;
+                        while (i < len && !Character.isWhitespace(input.charAt(i))
+                                && input.charAt(i) != '(' && input.charAt(i) != ')'
+                                && input.charAt(i) != '"' && input.charAt(i) != ';') {
+                            i++;
+                            col++;
+                        }
+                        String charName = input.substring(nameStart, i);
+                        char ch;
+                        switch (charName) {
+                            case "space" -> ch = ' ';
+                            case "newline" -> ch = '\n';
+                            case "tab" -> ch = '\t';
+                            default -> {
+                                if (charName.length() == 1) ch = charName.charAt(0);
+                                else throw new EvalError("unknown character name: " + charName + " at " + line + ":" + startCol);
+                            }
+                        }
+                        tokens.add(new Token(new SchemeChar(ch), line, startCol));
                     } else {
                         throw new EvalError("unexpected token: #" + next + " at " + line + ":" + col);
                     }
@@ -673,8 +707,19 @@ public class Evaluator {
         return val.toString();
     }
 
-    // Internal wrapper to distinguish strings from symbols
-    record SchemeString(String value) {}
+    // Internal wrapper to distinguish strings from symbols (mutable for string-set!)
+    static class SchemeString {
+        private char[] chars;
+        SchemeString(String value) { this.chars = value.toCharArray(); }
+        String value() { return new String(chars); }
+        char charAt(int i) { return chars[i]; }
+        void setChar(int i, char c) { chars[i] = c; }
+        int length() { return chars.length; }
+        @Override public boolean equals(Object o) {
+            return o instanceof SchemeString s && java.util.Arrays.equals(chars, s.chars);
+        }
+        @Override public int hashCode() { return java.util.Arrays.hashCode(chars); }
+    }
 
     // Internal wrapper for characters
     record SchemeChar(char value) {}
