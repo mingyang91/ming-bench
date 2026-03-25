@@ -23,16 +23,17 @@ object Evaluator:
             case SchemeVal.SSymbol("quote") :: args =>
               if args.length != 1 then throw new EvalError("quote: expected 1 argument")
               args.head
-            case SchemeVal.SSymbol("if") :: args            => evalIf(args, env)
-            case SchemeVal.SSymbol("define") :: args        => evalDefine(args, env)
-            case SchemeVal.SSymbol("lambda") :: args        => evalLambda(args, env)
-            case SchemeVal.SSymbol("and") :: args           => evalAnd(args, env)
-            case SchemeVal.SSymbol("or") :: args            => evalOr(args, env)
-            case SchemeVal.SSymbol("let") :: args           => evalLet(args, env)
-            case SchemeVal.SSymbol("set!") :: args          => evalSet(args, env)
-            case SchemeVal.SSymbol("begin") :: args         => evalBegin(args, env)
-            case SchemeVal.SSymbol("cond") :: args          => evalCond(args, env)
-            case SchemeVal.SSymbol("define-syntax") :: args => evalDefineSyntax(args, env)
+            case SchemeVal.SSymbol("if") :: args                 => evalIf(args, env)
+            case SchemeVal.SSymbol("define") :: args             => evalDefine(args, env)
+            case SchemeVal.SSymbol("lambda") :: args             => evalLambda(args, env)
+            case SchemeVal.SSymbol("and") :: args                => evalAnd(args, env)
+            case SchemeVal.SSymbol("or") :: args                 => evalOr(args, env)
+            case SchemeVal.SSymbol("let") :: args                => evalLet(args, env)
+            case SchemeVal.SSymbol("set!") :: args               => evalSet(args, env)
+            case SchemeVal.SSymbol("begin") :: args              => evalBegin(args, env)
+            case SchemeVal.SSymbol("cond") :: args               => evalCond(args, env)
+            case SchemeVal.SSymbol("define-syntax") :: args      => evalDefineSyntax(args, env)
+            case SchemeVal.SSymbol("define-record-type") :: args => RecordOps.evalDefineRecordType(args, env)
             case SchemeVal.SSymbol(name) :: args if env.lookup(name).exists(_.isInstanceOf[SchemeVal.SMacro]) =>
               val macro_   = env.get(name).asInstanceOf[SchemeVal.SMacro]
               val expanded = Macro.expand(macro_, SchemeVal.SList(elems))
@@ -216,6 +217,11 @@ object Evaluator:
             params.zip(args).foreach((p, a) => callEnv.define(p, a))
             callEnv.define(rest, SchemeVal.SList(args.drop(params.length)))
             evalBody(body, callEnv)
+      case SchemeVal.SSymbol(name)
+          if name.startsWith("__record-ctor__:") ||
+            name.startsWith("__record-pred__:") ||
+            name.startsWith("__record-acc__:") =>
+        RecordOps.applyRecordOp(name, args)
       case SchemeVal.SSymbol(name) =>
         applyBuiltinOrHOF(name, args)
       case _ => throw new EvalError(s"not a procedure: ${op.display}")

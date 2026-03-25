@@ -29,6 +29,11 @@ enum SchemeVal:
     defEnv: Env
   )
 
+  case SRecord(
+    typeName: String,
+    fields: Map[String, SchemeVal]
+  )
+
   /** Write representation (with quotes for strings). */
   def display: String = this match
     case SInt(v) => v.toString
@@ -57,6 +62,7 @@ enum SchemeVal:
     case SVoid               => ""
     case SLambda(_, _, _, _) => "#<procedure>"
     case SMacro(_, _, _)     => "#<macro>"
+    case SRecord(tn, _)      => s"#<record:$tn>"
 
   /** Display representation (no quotes for strings). */
   def displayRepr: String = this match
