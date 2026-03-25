@@ -20,6 +20,13 @@ pub(super) fn eq_value(left: &Value, right: &Value) -> bool {
         (Value::String(left), Value::String(right)) => left.ptr_eq(right),
         (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
+        (Value::Values(left), Value::Values(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| eq_value(left, right))
+        }
         (Value::Void, Value::Void) => true,
         (
             Value::Procedure(Procedure::Builtin(left)),
@@ -71,6 +78,13 @@ pub(super) fn eqv_value(left: &Value, right: &Value) -> bool {
         (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
         (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
+        (Value::Values(left), Value::Values(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| eqv_value(left, right))
+        }
         (Value::Void, Value::Void) => true,
         (
             Value::Procedure(Procedure::Builtin(left)),
@@ -170,6 +184,13 @@ fn equal_value_inner(
                     .all(|(left, right)| equal_value_inner(left, right, seen_pairs, seen_vectors))
         }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
+        (Value::Values(left), Value::Values(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| equal_value_inner(left, right, seen_pairs, seen_vectors))
+        }
         (Value::Void, Value::Void) => true,
         (Value::Uninitialized, Value::Uninitialized) => true,
         (
@@ -241,6 +262,7 @@ fn render_value_inner(
         Value::Vector(values) => render_vector(values, mode, active_pairs, active_vectors),
         Value::Record(record) => format!("#<record {}>", record.record_type.type_name),
         Value::Procedure(_) => "#<procedure>".into(),
+        Value::Values(_) => "#<values>".into(),
         Value::Void => "#<void>".into(),
         Value::Uninitialized => "#<undefined>".into(),
     }

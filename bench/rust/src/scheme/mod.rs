@@ -78,6 +78,7 @@ enum Value {
     Vector(VectorRef),
     Record(Rc<RecordValue>),
     Procedure(Procedure),
+    Values(Vec<Value>),
     Void,
     Uninitialized,
 }
@@ -272,8 +273,16 @@ impl Value {
             Self::Vector(_) => "vector",
             Self::Record(_) => "record",
             Self::Procedure(_) => "procedure",
+            Self::Values(_) => "values",
             Self::Void => "void",
             Self::Uninitialized => "undefined",
+        }
+    }
+
+    fn into_values(self) -> Vec<Value> {
+        match self {
+            Self::Values(values) => values,
+            value => vec![value],
         }
     }
 
@@ -1337,6 +1346,9 @@ fn apply_outcome(
     tail: bool,
 ) -> Result<EvalOutcome, EvalError> {
     match operator {
+        Value::Procedure(Procedure::Builtin("call-with-values")) => {
+            apply_call_with_values_outcome(args, pos, context, tail)
+        }
         Value::Procedure(Procedure::Builtin(name)) => {
             builtins::apply_builtin(name, &args, pos, context).map(EvalOutcome::Value)
         }
@@ -1377,6 +1389,25 @@ fn apply_outcome(
             found: other.render(),
         }),
     }
+}
+
+fn apply_call_with_values_outcome(
+    args: Vec<Value>,
+    pos: SourcePos,
+    context: &mut EvalContext,
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
+    let [producer, consumer] = args.as_slice() else {
+        return Err(wrong_arg_count(
+            pos,
+            "call-with-values",
+            "exactly 2 arguments",
+            args.len(),
+        ));
+    };
+
+    let produced = apply(producer.clone(), &[], pos, context)?;
+    apply_outcome(consumer.clone(), produced.into_values(), pos, context, tail)
 }
 
 fn execute_pending_call(

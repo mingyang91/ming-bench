@@ -112,6 +112,10 @@ enum Frame {
     DynamicWindAfterOut {
         result: Value,
     },
+    CallWithValues {
+        consumer: Value,
+        pos: SourcePos,
+    },
     ExceptionHandler {
         handler: Value,
         winds: Vec<WindRef>,
@@ -462,6 +466,9 @@ fn resume_frame(
             resume_dynamic_wind_after_body(wind, pos, value, stack, context)
         }
         Frame::DynamicWindAfterOut { result } => Ok(MachineState::Value(result)),
+        Frame::CallWithValues { consumer, pos } => {
+            resume_call_with_values(consumer, pos, value, stack, context)
+        }
         Frame::ExceptionHandler { .. } | Frame::Guard { .. } => Ok(MachineState::Value(value)),
         Frame::RaiseHandlerReturned { pos } => Err(EvalError::ExceptionHandlerReturned { pos }),
         Frame::RaiseInvokeHandler { handler, pos } => {
@@ -754,6 +761,16 @@ fn resume_dynamic_wind_after_body(
     pop_active_wind(&mut context.active_winds, &wind);
     stack.push(Frame::DynamicWindAfterOut { result });
     apply_machine(wind.out_thunk.clone(), Vec::new(), pos, stack, context)
+}
+
+fn resume_call_with_values(
+    consumer: Value,
+    pos: SourcePos,
+    produced: Value,
+    stack: &mut Vec<Frame>,
+    context: &mut EvalContext,
+) -> Result<MachineState, EvalError> {
+    apply_machine(consumer, produced.into_values(), pos, stack, context)
 }
 
 fn resume_guard_handle_frame(
@@ -1361,6 +1378,9 @@ fn apply_machine(
 ) -> Result<MachineState, EvalError> {
     match operator {
         Value::Procedure(Procedure::Builtin("call/cc")) => apply_call_cc(args, pos, stack, context),
+        Value::Procedure(Procedure::Builtin("call-with-values")) => {
+            apply_call_with_values(args, pos, stack, context)
+        }
         Value::Procedure(Procedure::Builtin("dynamic-wind")) => {
             apply_dynamic_wind(args, pos, stack, context)
         }
@@ -1450,6 +1470,28 @@ fn apply_dynamic_wind(
         pos,
     });
     apply_machine(in_thunk.clone(), Vec::new(), pos, stack, context)
+}
+
+fn apply_call_with_values(
+    args: Vec<Value>,
+    pos: SourcePos,
+    stack: &mut Vec<Frame>,
+    context: &mut EvalContext,
+) -> Result<MachineState, EvalError> {
+    let [producer, consumer] = args.as_slice() else {
+        return Err(wrong_arg_count(
+            pos,
+            "call-with-values",
+            "exactly 2 arguments",
+            args.len(),
+        ));
+    };
+
+    stack.push(Frame::CallWithValues {
+        consumer: consumer.clone(),
+        pos,
+    });
+    apply_machine(producer.clone(), Vec::new(), pos, stack, context)
 }
 
 fn apply_with_exception_handler(

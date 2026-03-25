@@ -31,6 +31,7 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "boolean?" => Some("boolean?"),
         "call-with-current-continuation" => Some("call/cc"),
         "call/cc" => Some("call/cc"),
+        "call-with-values" => Some("call-with-values"),
         "dynamic-wind" => Some("dynamic-wind"),
         "raise" => Some("raise"),
         "char-alphabetic?" => Some("char-alphabetic?"),
@@ -124,6 +125,7 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "vector-ref" => Some("vector-ref"),
         "vector-set!" => Some("vector-set!"),
         "vector?" => Some("vector?"),
+        "values" => Some("values"),
         "with-exception-handler" => Some("with-exception-handler"),
         "write" => Some("write"),
         "zero?" => Some("zero?"),
@@ -304,6 +306,7 @@ pub(super) fn apply_builtin(
         "vector?" => predicate(args, "vector?", pos, |value| {
             matches!(value, Value::Vector(_))
         }),
+        "values" => values(args),
         "write" => write(args, pos, context),
         "zero?" => number_predicate(args, "zero?", pos, |value| {
             Ok(*value == Number::exact_integer(0))
@@ -598,6 +601,13 @@ fn builtin_apply(
     expanded_args.extend(list_args);
 
     apply(operator.clone(), &expanded_args, pos, context)
+}
+
+fn values(args: &[Value]) -> Result<Value, EvalError> {
+    Ok(match args {
+        [value] => value.clone(),
+        _ => Value::Values(args.to_vec()),
+    })
 }
 
 fn length(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
