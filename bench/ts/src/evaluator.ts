@@ -6,6 +6,7 @@ type Expr =
   | Located<{ kind: 'number'; value: number }>
   | Located<{ kind: 'boolean'; value: boolean }>
   | Located<{ kind: 'string'; value: string }>
+  | Located<{ kind: 'char'; value: string }>
   | Located<{ kind: 'symbol'; value: string }>
   | Located<{ kind: 'list'; items: Expr[] }>;
 
@@ -13,6 +14,7 @@ type Token =
   | Located<{ kind: 'number'; value: number }>
   | Located<{ kind: 'boolean'; value: boolean }>
   | Located<{ kind: 'string'; value: string }>
+  | Located<{ kind: 'char'; value: string }>
   | Located<{ kind: 'symbol'; value: string }>
   | Located<{ kind: 'paren'; value: '(' | ')' }>
   | Located<{ kind: 'quote' }>;
@@ -30,6 +32,7 @@ interface BooleanValue {
 interface StringValue {
   kind: 'string';
   value: string;
+  mutable: boolean;
 }
 
 interface CharacterValue {
@@ -211,7 +214,9 @@ function createGlobalEnvironment(output: string[]): Environment {
   env.define('newline', makeBuiltinProcedure('newline', (args) => applyNewline(args, output)));
   env.define('string-append', makeBuiltinProcedure('string-append', (args) => applyStringAppend(args)));
   env.define('string-length', makeBuiltinProcedure('string-length', (args) => applyStringLength(args)));
+  env.define('string-copy', makeBuiltinProcedure('string-copy', (args) => applyStringCopy(args)));
   env.define('substring', makeBuiltinProcedure('substring', (args) => applySubstring(args)));
+  env.define('string-set!', makeBuiltinProcedure('string-set!', (args) => applyStringSet(args)));
   env.define('string->number', makeBuiltinProcedure('string->number', (args) => applyStringToNumber(args)));
   env.define('number->string', makeBuiltinProcedure('number->string', (args) => applyNumberToString(args)));
   env.define('symbol->string', makeBuiltinProcedure('symbol->string', (args) => applySymbolToString(args)));
@@ -316,6 +321,8 @@ function parseExpression(state: ParserState): Expr {
       return { kind: 'boolean', value: token.value, location: token.location };
     case 'string':
       return { kind: 'string', value: token.value, location: token.location };
+    case 'char':
+      return { kind: 'char', value: token.value, location: token.location };
     case 'symbol':
       return { kind: 'symbol', value: token.value, location: token.location };
     case 'quote':
@@ -363,6 +370,8 @@ function evaluate(expression: Expr, env: Environment): SchemeValue {
         return booleanValue(expression.value);
       case 'string':
         return stringValue(expression.value);
+      case 'char':
+        return charValue(expression.value);
       case 'symbol': {
         const value = env.lookup(expression.value);
         if (value === undefined) {
@@ -673,6 +682,8 @@ function quoteExpression(expression: Expr): SchemeValue {
       return booleanValue(expression.value);
     case 'string':
       return stringValue(expression.value);
+    case 'char':
+      return charValue(expression.value);
     case 'symbol':
       return symbolValue(expression.value);
     case 'list': {
@@ -802,6 +813,11 @@ function applyStringLength(args: SchemeValue[]): SchemeValue {
   return numberValue(readStringChars(expectString(args[0], 'string-length')).length);
 }
 
+function applyStringCopy(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('string-copy', args, 1);
+  return stringValue(expectString(args[0], 'string-copy'), true);
+}
+
 function applySubstring(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('substring', args, 3);
 
@@ -813,6 +829,22 @@ function applySubstring(args: SchemeValue[]): SchemeValue {
   }
 
   return stringValue(chars.slice(start, end).join(''));
+}
+
+function applyStringSet(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('string-set!', args, 3);
+
+  const target = expectMutableString(args[0], 'string-set!');
+  const index = expectIndex(args[1], 'string-set!');
+  const value = expectChar(args[2], 'string-set!');
+  const chars = readStringChars(target.value);
+  if (index >= chars.length) {
+    throw new EvalError('string-set! index out of range');
+  }
+
+  chars[index] = value;
+  target.value = chars.join('');
+  return VOID_VALUE;
 }
 
 function applyStringToNumber(args: SchemeValue[]): SchemeValue {
@@ -868,6 +900,26 @@ function expectNumber(value: SchemeValue, name: string): number {
 function expectString(value: SchemeValue, name: string): string {
   if (value.kind !== 'string') {
     throw new EvalError(`${name} expected a string`);
+  }
+
+  return value.value;
+}
+
+function expectMutableString(value: SchemeValue, name: string): StringValue {
+  if (value.kind !== 'string') {
+    throw new EvalError(`${name} expected a string`);
+  }
+
+  if (!value.mutable) {
+    throw new EvalError(`${name} expected a mutable string`);
+  }
+
+  return value;
+}
+
+function expectChar(value: SchemeValue, name: string): string {
+  if (value.kind !== 'char') {
+    throw new EvalError(`${name} expected a character`);
   }
 
   return value.value;
@@ -1096,8 +1148,8 @@ function booleanValue(value: boolean): BooleanValue {
   return value ? TRUE_VALUE : FALSE_VALUE;
 }
 
-function stringValue(value: string): StringValue {
-  return { kind: 'string', value };
+function stringValue(value: string, mutable = false): StringValue {
+  return { kind: 'string', value, mutable };
 }
 
 function charValue(value: string): CharacterValue {
@@ -1267,11 +1319,33 @@ function tokenFromAtom(raw: string, location: SourceLocation): Token {
     return { kind: 'boolean', value: false, location };
   }
 
+  if (raw.startsWith('#\\')) {
+    return { kind: 'char', value: parseCharLiteral(raw, location), location };
+  }
+
   if (/^[+-]?\d+$/u.test(raw) && raw !== '+' && raw !== '-') {
     return { kind: 'number', value: Number(raw), location };
   }
 
   return { kind: 'symbol', value: raw, location };
+}
+
+function parseCharLiteral(raw: string, location: SourceLocation): string {
+  const literal = raw.slice(2);
+  if (literal === 'space') {
+    return ' ';
+  }
+
+  if (literal === 'newline') {
+    return '\n';
+  }
+
+  const chars = Array.from(literal);
+  if (chars.length === 1) {
+    return chars[0];
+  }
+
+  throw new EvalError('invalid character literal', location);
 }
 
 function advanceLocation(char: string, line: number, column: number): SourceLocation {
