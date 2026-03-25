@@ -11,7 +11,7 @@ import java.util.Set;
 public class Evaluator {
 
     // ── Value types ──────────────────────────────────────────────
-    private sealed interface Val permits Val.Int, Val.Rat, Val.Flo, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda, Val.CaseLambda, Val.Macro, Val.RecordInstance, Val.Vec, Val.ContVal, Val.CallccVal, Val.DynamicWindVal {
+    private sealed interface Val permits Val.Int, Val.Rat, Val.Flo, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda, Val.CaseLambda, Val.Macro, Val.RecordInstance, Val.Vec, Val.ContVal, Val.CallccVal, Val.DynamicWindVal, Val.WithExceptionHandlerVal {
         record Int(long value) implements Val {}
         record Rat(long num, long den) implements Val {}
         record Flo(double value) implements Val {}
@@ -77,6 +77,8 @@ public class Evaluator {
         final class CallccVal implements Val {}
         // dynamic-wind as a first-class value
         final class DynamicWindVal implements Val {}
+        // with-exception-handler as a first-class value
+        final class WithExceptionHandlerVal implements Val {}
     }
 
     // ── Token with position ─────────────────────────────────────
@@ -122,10 +124,22 @@ public class Evaluator {
     // ── Dynamic wind ─────────────────────────────────────────────
     private record WindEntry(Val inThunk, Val outThunk) {}
     private final List<WindEntry> windStack = new ArrayList<>();
+
+    // ── Exception handling ────────────────────────────────────────
+    private static class SchemeRaise extends RuntimeException {
+        final Val value;
+        SchemeRaise(Val value) { super(null, null, true, false); this.value = value; }
+    }
+    private sealed interface HandlerEntry {
+        record SimpleHandler(Val handler) implements HandlerEntry {}
+        record GuardHandler(String varName, Val clauses, Env env, Kont resultK, List<WindEntry> guardWinds) implements HandlerEntry {}
+    }
+    private final List<HandlerEntry> handlerStack = new ArrayList<>();
     private String gensym(String base) { return base + "_g" + (gensymCounter++); }
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "quote", "if", "define", "lambda", "set!", "begin", "let", "let*", "cond", "and", "or",
-        "define-syntax", "define-record-type", "letrec", "letrec*", "case", "do", "case-lambda"
+        "define-syntax", "define-record-type", "letrec", "letrec*", "case", "do", "case-lambda",
+        "guard"
     );
 
     // ── Write representation ────────────────────────────────────
@@ -161,6 +175,7 @@ public class Evaluator {
             case Val.ContVal ignored -> "#<continuation>";
             case Val.CallccVal ignored -> "#<procedure:call/cc>";
             case Val.DynamicWindVal ignored -> "#<procedure:dynamic-wind>";
+            case Val.WithExceptionHandlerVal ignored -> "#<procedure:with-exception-handler>";
         };
     }
 
@@ -405,6 +420,11 @@ public class Evaluator {
         // wind transfer frames for continuation invocation
         record DynWindUnwindK(List<Val> remainingOuts, List<WindEntry> toRewind, Val value, Kont targetK, List<WindEntry> targetWinds) implements Kont {}
         record DynWindRewindK(List<WindEntry> remaining, Val value, Kont targetK, List<WindEntry> targetWinds) implements Kont {}
+        // exception handling frames
+        record WithHandlerK(Kont k) implements Kont {}
+        record GuardBodyK(Kont k) implements Kont {}
+        record GuardClauseK(String varName, Val clauses, Env env, Kont k) implements Kont {}
+        record RaiseErrorK() implements Kont {}
     }
 
     // CEK step: either evaluate an expression or apply a continuation
@@ -434,6 +454,22 @@ public class Evaluator {
                 step = advance(step);
             } catch (ContinuationInvoke ci) {
                 step = windTransfer(ci.value, ci.cont.savedK, ci.cont.savedWinds);
+            } catch (SchemeRaise sr) {
+                if (handlerStack.isEmpty()) {
+                    throw new EvalError("unhandled exception: " + writeVal(sr.value));
+                }
+                HandlerEntry entry = handlerStack.remove(handlerStack.size() - 1);
+                switch (entry) {
+                    case HandlerEntry.SimpleHandler sh -> {
+                        // Call handler in raiser's dynamic context; error if it returns
+                        step = applyFunctionStep(sh.handler(), List.of(sr.value), new Kont.RaiseErrorK(), null);
+                    }
+                    case HandlerEntry.GuardHandler gh -> {
+                        // Wind-transfer to guard's context, then evaluate clauses
+                        Kont clauseK = new Kont.GuardClauseK(gh.varName(), gh.clauses(), gh.env(), gh.resultK());
+                        step = windTransfer(sr.value, clauseK, gh.guardWinds());
+                    }
+                }
             }
         }
     }
@@ -511,6 +547,21 @@ public class Evaluator {
             }
             case "do" -> evalDoStep(pair.cdr(), env, k, pair);
             case "case-lambda" -> new Step.Apply(buildCaseLambda(pair.cdr(), env, pair), k);
+            case "guard" -> {
+                // (guard (var clause1 clause2 ...) body ...)
+                Val args = pair.cdr();
+                if (!(args instanceof Val.PairV p1)) throw posError(pair, "guard: invalid syntax");
+                Val clauseSpec = p1.car(); // (var clause1 clause2 ...)
+                if (!(clauseSpec instanceof Val.PairV cs)) throw posError(pair, "guard: invalid syntax");
+                if (!(cs.car() instanceof Val.Sym varSym)) throw posError(pair, "guard: expected variable name");
+                String varName = varSym.name();
+                Val clauses = cs.cdr(); // the clause list
+                List<Val> body = collectList(p1.cdr());
+                // Push guard handler with current continuation and wind stack
+                handlerStack.add(new HandlerEntry.GuardHandler(varName, clauses, env, k, new ArrayList<>(windStack)));
+                // Evaluate body; GuardBodyK pops handler on normal return
+                yield evalBodyStep(body, env, new Kont.GuardBodyK(k));
+            }
             default -> throw posError(pair, "unknown special form: " + fn);
         };
     }
@@ -560,6 +611,14 @@ public class Evaluator {
                     int last = dwArgs.size() - 1;
                     yield new Step.Eval(dwArgs.get(last), env,
                         new Kont.ArgK(fn, new ArrayList<>(), dwArgs, last - 1, env, k, form));
+                }
+                if (fn instanceof Val.WithExceptionHandlerVal) {
+                    List<Val> wehArgs = collectList(argsList);
+                    if (wehArgs.size() != 2) throw posError(form, "with-exception-handler requires 2 arguments");
+                    // Evaluate both args, then handle via ArgK -> applyFunctionStep
+                    int last = wehArgs.size() - 1;
+                    yield new Step.Eval(wehArgs.get(last), env,
+                        new Kont.ArgK(fn, new ArrayList<>(), wehArgs, last - 1, env, k, form));
                 }
                 List<Val> argExprs = collectList(argsList);
                 if (argExprs.isEmpty()) {
@@ -745,6 +804,30 @@ public class Evaluator {
                 // Done rewinding
                 yield new Step.Apply(val, targetK);
             }
+
+            // exception handling frames
+            case Kont.WithHandlerK(var k) -> {
+                // Thunk returned normally; pop handler
+                handlerStack.remove(handlerStack.size() - 1);
+                yield new Step.Apply(value, k);
+            }
+
+            case Kont.GuardBodyK(var k) -> {
+                // Guard body returned normally; pop handler
+                handlerStack.remove(handlerStack.size() - 1);
+                yield new Step.Apply(value, k);
+            }
+
+            case Kont.GuardClauseK(var varName, var clauses, var env, var k) -> {
+                // value is the exception; evaluate cond-like clauses with var bound
+                Env clauseEnv = new Env(env);
+                clauseEnv.define(varName, value);
+                yield evalGuardClauses(clauses, clauseEnv, k);
+            }
+
+            case Kont.RaiseErrorK() -> {
+                throw new EvalError("raise: exception handler returned");
+            }
         };
     }
 
@@ -759,6 +842,13 @@ public class Evaluator {
             Val proc = args.get(0);
             Val.ContVal contVal = new Val.ContVal(k, new ArrayList<>(windStack));
             return applyFunctionStep(proc, List.of(contVal), k, form);
+        }
+        if (fn instanceof Val.WithExceptionHandlerVal) {
+            if (args.size() != 2) throw posError(form, "with-exception-handler requires 2 arguments");
+            Val handler = args.get(0), thunk = args.get(1);
+            // Push handler, call thunk, WithHandlerK pops on normal return
+            handlerStack.add(new HandlerEntry.SimpleHandler(handler));
+            return applyFunctionStep(thunk, new ArrayList<>(), new Kont.WithHandlerK(k), form);
         }
         if (fn instanceof Val.DynamicWindVal) {
             if (args.size() != 3) throw posError(form, "dynamic-wind requires 3 arguments");
@@ -802,6 +892,7 @@ public class Evaluator {
                 Val result = builtin.fn().apply(args);
                 return new Step.Apply(result, k);
             } catch (ContinuationInvoke ci) { throw ci; }
+            catch (SchemeRaise sr) { throw sr; }
             catch (RuntimeException e) { throw posError(form, e.getMessage()); }
         }
         throw posError(form, "not a procedure: " + writeVal(fn));
@@ -851,7 +942,8 @@ public class Evaluator {
         while (true) {
             if (step instanceof Step.Apply a && a.k() instanceof Kont.HaltK) return a.value();
             try { step = advance(step); }
-            catch (ContinuationInvoke ci) { throw ci; } // propagate to outer trampoline
+            catch (ContinuationInvoke ci) { throw ci; }
+            catch (SchemeRaise sr) { throw sr; } // propagate to outer trampoline
         }
     }
 
@@ -985,6 +1077,20 @@ public class Evaluator {
         if (!(clauses instanceof Val.PairV cp)) return new Step.Apply(new Val.Void(), k);
         Val clause = cp.car();
         if (!(clause instanceof Val.PairV clausePair)) throw new EvalError("cond: invalid clause");
+        if (clausePair.car() instanceof Val.Sym s && s.name().equals("else")) {
+            return evalBeginStep(clausePair.cdr(), env, k);
+        }
+        return new Step.Eval(clausePair.car(), env,
+            new Kont.CondK(clausePair.cdr(), cp.cdr(), env, k));
+    }
+
+    private Step evalGuardClauses(Val clauses, Env env, Kont k) throws EvalError {
+        // Like evalCondStep but for guard clauses; re-raises if no match
+        if (!(clauses instanceof Val.PairV cp)) {
+            throw new EvalError("guard: no matching clause");
+        }
+        Val clause = cp.car();
+        if (!(clause instanceof Val.PairV clausePair)) throw new EvalError("guard: invalid clause");
         if (clausePair.car() instanceof Val.Sym s && s.name().equals("else")) {
             return evalBeginStep(clausePair.cdr(), env, k);
         }
@@ -1439,6 +1545,11 @@ public class Evaluator {
         env.define("call/cc", new Val.CallccVal());
         env.define("call-with-current-continuation", new Val.CallccVal());
         env.define("dynamic-wind", new Val.DynamicWindVal());
+        env.define("with-exception-handler", new Val.WithExceptionHandlerVal());
+        env.define("raise", new Val.Builtin("raise", args -> {
+            checkArgCount(args, 1, "raise");
+            throw new SchemeRaise(args.get(0));
+        }));
         // Arithmetic
         env.define("+", new Val.Builtin("+", args -> {
             Val result = new Val.Int(0);
@@ -1501,7 +1612,7 @@ public class Evaluator {
         env.define("procedure?", new Val.Builtin("procedure?", args -> {
             checkArgCount(args, 1, "procedure?");
             Val v = args.get(0);
-            return new Val.Bool(v instanceof Val.Lambda || v instanceof Val.CaseLambda || v instanceof Val.Builtin || v instanceof Val.ContVal || v instanceof Val.CallccVal || v instanceof Val.DynamicWindVal);
+            return new Val.Bool(v instanceof Val.Lambda || v instanceof Val.CaseLambda || v instanceof Val.Builtin || v instanceof Val.ContVal || v instanceof Val.CallccVal || v instanceof Val.DynamicWindVal || v instanceof Val.WithExceptionHandlerVal);
         }));
         env.define("list", new Val.Builtin("list", args -> {
             Val result = new Val.Nil();
