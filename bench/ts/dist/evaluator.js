@@ -1,4 +1,5 @@
 import { EvalError } from './evalError.js';
+import { absNumber, addNumbers, compareNumbers, denominatorPart, divideNumbers, exactInteger, exactToInexact, exptNumber, formatNumber, inexactNumber, inexactToExact, integerToJs, isExactNumber, isInexactNumber, isIntegerNumber, isNegativeNumber, isPositiveNumber, isRationalNumber, isZeroNumber, maxNumber, minNumber, multiplyNumbers, numeratorPart, parseNumberLiteral, subtractNumbers, } from './numbers.js';
 const START_POSITION = { line: 1, column: 1 };
 const VOID_VALUE = { type: 'void' };
 const SPECIAL_FORM_NAMES = new Set([
@@ -136,8 +137,9 @@ function parseProgram(input) {
         if (character !== null) {
             return { type: 'char', value: character, position: token.position };
         }
-        if (/^-?\d+$/.test(token.value)) {
-            return { type: 'number', value: Number(token.value), position: token.position };
+        const numericValue = parseNumberLiteral(token.value, token.position);
+        if (numericValue !== null) {
+            return { type: 'number', value: numericValue, position: token.position };
         }
         return { type: 'symbol', name: token.value, position: token.position };
     }
@@ -998,11 +1000,12 @@ function exprSyntaxEqual(left, right) {
         return false;
     }
     switch (left.type) {
-        case 'number':
         case 'boolean':
         case 'string':
         case 'char':
             return left.value === right.value;
+        case 'number':
+            return compareNumbers(left.value, right.value) === 0;
         case 'symbol':
             return left.name === right.name;
         case 'list': {
@@ -1072,42 +1075,35 @@ function evaluateSequence(expressions, env) {
 }
 function createGlobalEnv(context) {
     const env = new Environment();
-    env.define('+', builtin('+', (args, callPosition) => numberValue(evaluateNumberArgs('+', args).reduce((sum, value) => sum + value, 0), callPosition)));
-    env.define('*', builtin('*', (args, callPosition) => numberValue(evaluateNumberArgs('*', args).reduce((product, value) => product * value, 1), callPosition)));
+    env.define('+', builtin('+', (args, callPosition) => numberValue(addNumbers(evaluateNumberArgs('+', args), callPosition), callPosition)));
+    env.define('*', builtin('*', (args, callPosition) => numberValue(multiplyNumbers(evaluateNumberArgs('*', args), callPosition), callPosition)));
     env.define('-', builtin('-', (args, callPosition) => {
         const values = evaluateNumberArgs('-', args);
         requireArgCountAtLeast('-', values.length, 1, callPosition);
-        if (values.length === 1) {
-            return numberValue(-values[0], callPosition);
-        }
-        return numberValue(values.slice(1).reduce((result, value) => result - value, values[0]), callPosition);
+        return numberValue(subtractNumbers(values, callPosition), callPosition);
     }));
     env.define('/', builtin('/', (args, callPosition) => {
         const values = evaluateNumberArgs('/', args);
         requireArgCountAtLeast('/', values.length, 1, callPosition);
-        let result = values[0];
         if (values.length === 1) {
-            if (result === 0) {
+            if (isZeroNumber(values[0])) {
                 throw new EvalError('division by zero', args[0].position);
             }
-            return numberValue(1 / result, callPosition);
         }
         for (let index = 1; index < values.length; index += 1) {
-            const value = values[index];
-            if (value === 0) {
+            if (isZeroNumber(values[index])) {
                 throw new EvalError('division by zero', args[index].position);
             }
-            result /= value;
         }
-        return numberValue(result, callPosition);
+        return numberValue(divideNumbers(values, callPosition), callPosition);
     }));
-    env.define('<', builtin('<', (args, callPosition) => booleanValue(compareNumberArgs('<', args, (a, b) => a < b, callPosition))));
-    env.define('>', builtin('>', (args, callPosition) => booleanValue(compareNumberArgs('>', args, (a, b) => a > b, callPosition))));
-    env.define('=', builtin('=', (args, callPosition) => booleanValue(compareNumberArgs('=', args, (a, b) => a === b, callPosition))));
-    env.define('<=', builtin('<=', (args, callPosition) => booleanValue(compareNumberArgs('<=', args, (a, b) => a <= b, callPosition))));
+    env.define('<', builtin('<', (args, callPosition) => booleanValue(compareNumberArgs('<', args, (comparison) => comparison < 0, callPosition))));
+    env.define('>', builtin('>', (args, callPosition) => booleanValue(compareNumberArgs('>', args, (comparison) => comparison > 0, callPosition))));
+    env.define('=', builtin('=', (args, callPosition) => booleanValue(compareNumberArgs('=', args, (comparison) => comparison === 0, callPosition))));
+    env.define('<=', builtin('<=', (args, callPosition) => booleanValue(compareNumberArgs('<=', args, (comparison) => comparison <= 0, callPosition))));
     env.define('abs', builtin('abs', (args, callPosition) => {
         requireArgCount('abs', args.length, 1, callPosition);
-        return numberValue(Math.abs(expectNumber('abs', args[0])), callPosition);
+        return numberValue(absNumber(expectNumber('abs', args[0]), callPosition), callPosition);
     }));
     env.define('quotient', builtin('quotient', (args, callPosition) => {
         requireArgCount('quotient', args.length, 2, callPosition);
@@ -1143,30 +1139,30 @@ function createGlobalEnv(context) {
     env.define('min', builtin('min', (args, callPosition) => {
         const values = evaluateNumberArgs('min', args);
         requireArgCountAtLeast('min', values.length, 1, callPosition);
-        return numberValue(Math.min(...values), callPosition);
+        return numberValue(minNumber(values), callPosition);
     }));
     env.define('max', builtin('max', (args, callPosition) => {
         const values = evaluateNumberArgs('max', args);
         requireArgCountAtLeast('max', values.length, 1, callPosition);
-        return numberValue(Math.max(...values), callPosition);
+        return numberValue(maxNumber(values), callPosition);
     }));
     env.define('expt', builtin('expt', (args, callPosition) => {
         requireArgCount('expt', args.length, 2, callPosition);
         const base = expectNumber('expt', args[0]);
         const exponent = expectInteger('expt', args[1]);
-        return numberValue(base ** exponent, callPosition);
+        return numberValue(exptNumber(base, exponent, args[1].position), callPosition);
     }));
     env.define('zero?', builtin('zero?', (args, callPosition) => {
         requireArgCount('zero?', args.length, 1, callPosition);
-        return booleanValue(expectNumber('zero?', args[0]) === 0);
+        return booleanValue(isZeroNumber(expectNumber('zero?', args[0])));
     }));
     env.define('positive?', builtin('positive?', (args, callPosition) => {
         requireArgCount('positive?', args.length, 1, callPosition);
-        return booleanValue(expectNumber('positive?', args[0]) > 0);
+        return booleanValue(isPositiveNumber(expectNumber('positive?', args[0])));
     }));
     env.define('negative?', builtin('negative?', (args, callPosition) => {
         requireArgCount('negative?', args.length, 1, callPosition);
-        return booleanValue(expectNumber('negative?', args[0]) < 0);
+        return booleanValue(isNegativeNumber(expectNumber('negative?', args[0])));
     }));
     env.define('odd?', builtin('odd?', (args, callPosition) => {
         requireArgCount('odd?', args.length, 1, callPosition);
@@ -1274,14 +1270,15 @@ function createGlobalEnv(context) {
     env.define('string->number', builtin('string->number', (args, callPosition) => {
         requireArgCount('string->number', args.length, 1, callPosition);
         const value = expectString('string->number', args[0]);
-        if (!/^[+-]?(?:\d+|\d+\.\d+|\.\d+)$/.test(value)) {
+        const parsed = parseNumberLiteral(value, args[0].position);
+        if (parsed === null) {
             return booleanValue(false);
         }
-        return numberValue(Number(value), args[0].position);
+        return numberValue(parsed, args[0].position);
     }));
     env.define('number->string', builtin('number->string', (args, callPosition) => {
         requireArgCount('number->string', args.length, 1, callPosition);
-        return stringValue(String(expectNumber('number->string', args[0])));
+        return stringValue(formatNumber(expectNumber('number->string', args[0])));
     }));
     env.define('symbol->string', builtin('symbol->string', (args, callPosition) => {
         requireArgCount('symbol->string', args.length, 1, callPosition);
@@ -1346,6 +1343,38 @@ function createGlobalEnv(context) {
     env.define('number?', builtin('number?', (args, callPosition) => {
         requireArgCount('number?', args.length, 1, callPosition);
         return booleanValue(args[0].value.type === 'number');
+    }));
+    env.define('integer?', builtin('integer?', (args, callPosition) => {
+        requireArgCount('integer?', args.length, 1, callPosition);
+        return booleanValue(args[0].value.type === 'number' && isIntegerNumber(args[0].value.value));
+    }));
+    env.define('rational?', builtin('rational?', (args, callPosition) => {
+        requireArgCount('rational?', args.length, 1, callPosition);
+        return booleanValue(args[0].value.type === 'number' && isRationalNumber(args[0].value.value));
+    }));
+    env.define('exact?', builtin('exact?', (args, callPosition) => {
+        requireArgCount('exact?', args.length, 1, callPosition);
+        return booleanValue(args[0].value.type === 'number' && isExactNumber(args[0].value.value));
+    }));
+    env.define('inexact?', builtin('inexact?', (args, callPosition) => {
+        requireArgCount('inexact?', args.length, 1, callPosition);
+        return booleanValue(args[0].value.type === 'number' && isInexactNumber(args[0].value.value));
+    }));
+    env.define('exact->inexact', builtin('exact->inexact', (args, callPosition) => {
+        requireArgCount('exact->inexact', args.length, 1, callPosition);
+        return numberValue(exactToInexact(expectNumber('exact->inexact', args[0]), args[0].position), callPosition);
+    }));
+    env.define('inexact->exact', builtin('inexact->exact', (args, callPosition) => {
+        requireArgCount('inexact->exact', args.length, 1, callPosition);
+        return numberValue(inexactToExact(expectNumber('inexact->exact', args[0]), args[0].position), callPosition);
+    }));
+    env.define('numerator', builtin('numerator', (args, callPosition) => {
+        requireArgCount('numerator', args.length, 1, callPosition);
+        return numberValue(numeratorPart(expectNumber('numerator', args[0]), args[0].position), callPosition);
+    }));
+    env.define('denominator', builtin('denominator', (args, callPosition) => {
+        requireArgCount('denominator', args.length, 1, callPosition);
+        return numberValue(denominatorPart(expectNumber('denominator', args[0]), args[0].position), callPosition);
     }));
     env.define('boolean?', builtin('boolean?', (args, callPosition) => {
         requireArgCount('boolean?', args.length, 1, callPosition);
@@ -1422,7 +1451,7 @@ function compareNumberArgs(name, args, predicate, position) {
     const values = evaluateNumberArgs(name, args);
     requireArgCountAtLeast(name, values.length, 1, position);
     for (let index = 0; index < values.length - 1; index += 1) {
-        if (!predicate(values[index], values[index + 1])) {
+        if (!predicate(compareNumbers(values[index], values[index + 1]))) {
             return false;
         }
     }
@@ -1466,10 +1495,10 @@ function expectNumber(name, arg) {
 }
 function expectInteger(name, arg) {
     const value = expectNumber(name, arg);
-    if (!Number.isInteger(value)) {
+    if (!isIntegerNumber(value)) {
         throw new EvalError(`${name}: expected integer`, arg.position);
     }
-    return value;
+    return integerToJs(value, arg.position);
 }
 function expectString(name, arg) {
     return expectStringValue(name, arg).value;
@@ -1546,6 +1575,7 @@ function equalValues(left, right) {
     }
     switch (left.type) {
         case 'number':
+            return compareNumbers(left.value, right.value) === 0;
         case 'boolean':
         case 'string':
         case 'char':
@@ -1598,8 +1628,11 @@ function codePoints(value) {
     return Array.from(value);
 }
 function numberValue(value, position) {
-    if (!Number.isFinite(value)) {
-        throw new EvalError('invalid number', position);
+    if (typeof value === 'number') {
+        return {
+            type: 'number',
+            value: Number.isInteger(value) ? exactInteger(value) : inexactNumber(value, position),
+        };
     }
     return { type: 'number', value };
 }
@@ -1638,7 +1671,7 @@ function formatDisplayValue(value) {
 function formatValue(value) {
     switch (value.type) {
         case 'number':
-            return String(value.value);
+            return formatNumber(value.value);
         case 'boolean':
             return value.value ? '#t' : '#f';
         case 'string':

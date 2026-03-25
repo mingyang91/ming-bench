@@ -1,4 +1,32 @@
 import { EvalError, type SourcePosition } from './evalError.js';
+import {
+  absNumber,
+  addNumbers,
+  compareNumbers,
+  denominatorPart,
+  divideNumbers,
+  exactInteger,
+  exactToInexact,
+  exptNumber,
+  formatNumber,
+  inexactNumber,
+  inexactToExact,
+  integerToJs,
+  isExactNumber,
+  isInexactNumber,
+  isIntegerNumber,
+  isNegativeNumber,
+  isPositiveNumber,
+  isRationalNumber,
+  isZeroNumber,
+  maxNumber,
+  minNumber,
+  multiplyNumbers,
+  numeratorPart,
+  parseNumberLiteral,
+  subtractNumbers,
+  type SchemeNumber,
+} from './numbers.js';
 
 type Token =
   | { kind: 'paren'; value: '(' | ')'; position: SourcePosition }
@@ -7,7 +35,7 @@ type Token =
   | { kind: 'quote'; position: SourcePosition };
 
 type Expr =
-  | { type: 'number'; value: number; position: SourcePosition; introduced?: boolean }
+  | { type: 'number'; value: SchemeNumber; position: SourcePosition; introduced?: boolean }
   | { type: 'boolean'; value: boolean; position: SourcePosition; introduced?: boolean }
   | { type: 'string'; value: string; position: SourcePosition; introduced?: boolean }
   | { type: 'char'; value: string; position: SourcePosition; introduced?: boolean }
@@ -64,7 +92,7 @@ type EvaluationContext = {
 };
 
 type SchemeValue =
-  | { type: 'number'; value: number }
+  | { type: 'number'; value: SchemeNumber }
   | { type: 'boolean'; value: boolean }
   | { type: 'string'; value: string }
   | { type: 'char'; value: string }
@@ -248,8 +276,9 @@ function parseProgram(input: string): Expr[] {
       return { type: 'char', value: character, position: token.position };
     }
 
-    if (/^-?\d+$/.test(token.value)) {
-      return { type: 'number', value: Number(token.value), position: token.position };
+    const numericValue = parseNumberLiteral(token.value, token.position);
+    if (numericValue !== null) {
+      return { type: 'number', value: numericValue, position: token.position };
     }
 
     return { type: 'symbol', name: token.value, position: token.position };
@@ -1400,11 +1429,12 @@ function exprSyntaxEqual(left: Expr, right: Expr): boolean {
   }
 
   switch (left.type) {
-    case 'number':
     case 'boolean':
     case 'string':
     case 'char':
       return left.value === (right as typeof left).value;
+    case 'number':
+      return compareNumbers(left.value, (right as typeof left).value) === 0;
     case 'symbol':
       return left.name === (right as typeof left).name;
     case 'list': {
@@ -1492,20 +1522,14 @@ function createGlobalEnv(context: EvaluationContext): Environment {
   env.define(
     '+',
     builtin('+', (args, callPosition) =>
-      numberValue(
-        evaluateNumberArgs('+', args).reduce((sum, value) => sum + value, 0),
-        callPosition,
-      ),
+      numberValue(addNumbers(evaluateNumberArgs('+', args), callPosition), callPosition),
     ),
   );
 
   env.define(
     '*',
     builtin('*', (args, callPosition) =>
-      numberValue(
-        evaluateNumberArgs('*', args).reduce((product, value) => product * value, 1),
-        callPosition,
-      ),
+      numberValue(multiplyNumbers(evaluateNumberArgs('*', args), callPosition), callPosition),
     ),
   );
 
@@ -1514,14 +1538,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     builtin('-', (args, callPosition) => {
       const values = evaluateNumberArgs('-', args);
       requireArgCountAtLeast('-', values.length, 1, callPosition);
-      if (values.length === 1) {
-        return numberValue(-values[0], callPosition);
-      }
-
-      return numberValue(
-        values.slice(1).reduce((result, value) => result - value, values[0]),
-        callPosition,
-      );
+      return numberValue(subtractNumbers(values, callPosition), callPosition);
     }),
   );
 
@@ -1531,50 +1548,44 @@ function createGlobalEnv(context: EvaluationContext): Environment {
       const values = evaluateNumberArgs('/', args);
       requireArgCountAtLeast('/', values.length, 1, callPosition);
 
-      let result = values[0];
       if (values.length === 1) {
-        if (result === 0) {
+        if (isZeroNumber(values[0])) {
           throw new EvalError('division by zero', args[0].position);
         }
-
-        return numberValue(1 / result, callPosition);
       }
 
       for (let index = 1; index < values.length; index += 1) {
-        const value = values[index];
-        if (value === 0) {
+        if (isZeroNumber(values[index])) {
           throw new EvalError('division by zero', args[index].position);
         }
-
-        result /= value;
       }
 
-      return numberValue(result, callPosition);
+      return numberValue(divideNumbers(values, callPosition), callPosition);
     }),
   );
 
   env.define(
     '<',
     builtin('<', (args, callPosition) =>
-      booleanValue(compareNumberArgs('<', args, (a, b) => a < b, callPosition)),
+      booleanValue(compareNumberArgs('<', args, (comparison) => comparison < 0, callPosition)),
     ),
   );
   env.define(
     '>',
     builtin('>', (args, callPosition) =>
-      booleanValue(compareNumberArgs('>', args, (a, b) => a > b, callPosition)),
+      booleanValue(compareNumberArgs('>', args, (comparison) => comparison > 0, callPosition)),
     ),
   );
   env.define(
     '=',
     builtin('=', (args, callPosition) =>
-      booleanValue(compareNumberArgs('=', args, (a, b) => a === b, callPosition)),
+      booleanValue(compareNumberArgs('=', args, (comparison) => comparison === 0, callPosition)),
     ),
   );
   env.define(
     '<=',
     builtin('<=', (args, callPosition) =>
-      booleanValue(compareNumberArgs('<=', args, (a, b) => a <= b, callPosition)),
+      booleanValue(compareNumberArgs('<=', args, (comparison) => comparison <= 0, callPosition)),
     ),
   );
 
@@ -1582,7 +1593,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'abs',
     builtin('abs', (args, callPosition) => {
       requireArgCount('abs', args.length, 1, callPosition);
-      return numberValue(Math.abs(expectNumber('abs', args[0])), callPosition);
+      return numberValue(absNumber(expectNumber('abs', args[0]), callPosition), callPosition);
     }),
   );
 
@@ -1638,7 +1649,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     builtin('min', (args, callPosition) => {
       const values = evaluateNumberArgs('min', args);
       requireArgCountAtLeast('min', values.length, 1, callPosition);
-      return numberValue(Math.min(...values), callPosition);
+      return numberValue(minNumber(values), callPosition);
     }),
   );
 
@@ -1647,7 +1658,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     builtin('max', (args, callPosition) => {
       const values = evaluateNumberArgs('max', args);
       requireArgCountAtLeast('max', values.length, 1, callPosition);
-      return numberValue(Math.max(...values), callPosition);
+      return numberValue(maxNumber(values), callPosition);
     }),
   );
 
@@ -1657,7 +1668,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
       requireArgCount('expt', args.length, 2, callPosition);
       const base = expectNumber('expt', args[0]);
       const exponent = expectInteger('expt', args[1]);
-      return numberValue(base ** exponent, callPosition);
+      return numberValue(exptNumber(base, exponent, args[1].position), callPosition);
     }),
   );
 
@@ -1665,7 +1676,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'zero?',
     builtin('zero?', (args, callPosition) => {
       requireArgCount('zero?', args.length, 1, callPosition);
-      return booleanValue(expectNumber('zero?', args[0]) === 0);
+      return booleanValue(isZeroNumber(expectNumber('zero?', args[0])));
     }),
   );
 
@@ -1673,7 +1684,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'positive?',
     builtin('positive?', (args, callPosition) => {
       requireArgCount('positive?', args.length, 1, callPosition);
-      return booleanValue(expectNumber('positive?', args[0]) > 0);
+      return booleanValue(isPositiveNumber(expectNumber('positive?', args[0])));
     }),
   );
 
@@ -1681,7 +1692,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'negative?',
     builtin('negative?', (args, callPosition) => {
       requireArgCount('negative?', args.length, 1, callPosition);
-      return booleanValue(expectNumber('negative?', args[0]) < 0);
+      return booleanValue(isNegativeNumber(expectNumber('negative?', args[0])));
     }),
   );
 
@@ -1882,11 +1893,12 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     builtin('string->number', (args, callPosition) => {
       requireArgCount('string->number', args.length, 1, callPosition);
       const value = expectString('string->number', args[0]);
-      if (!/^[+-]?(?:\d+|\d+\.\d+|\.\d+)$/.test(value)) {
+      const parsed = parseNumberLiteral(value, args[0].position);
+      if (parsed === null) {
         return booleanValue(false);
       }
 
-      return numberValue(Number(value), args[0].position);
+      return numberValue(parsed, args[0].position);
     }),
   );
 
@@ -1894,7 +1906,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     'number->string',
     builtin('number->string', (args, callPosition) => {
       requireArgCount('number->string', args.length, 1, callPosition);
-      return stringValue(String(expectNumber('number->string', args[0])));
+      return stringValue(formatNumber(expectNumber('number->string', args[0])));
     }),
   );
 
@@ -2038,6 +2050,70 @@ function createGlobalEnv(context: EvaluationContext): Environment {
   );
 
   env.define(
+    'integer?',
+    builtin('integer?', (args, callPosition) => {
+      requireArgCount('integer?', args.length, 1, callPosition);
+      return booleanValue(args[0].value.type === 'number' && isIntegerNumber(args[0].value.value));
+    }),
+  );
+
+  env.define(
+    'rational?',
+    builtin('rational?', (args, callPosition) => {
+      requireArgCount('rational?', args.length, 1, callPosition);
+      return booleanValue(args[0].value.type === 'number' && isRationalNumber(args[0].value.value));
+    }),
+  );
+
+  env.define(
+    'exact?',
+    builtin('exact?', (args, callPosition) => {
+      requireArgCount('exact?', args.length, 1, callPosition);
+      return booleanValue(args[0].value.type === 'number' && isExactNumber(args[0].value.value));
+    }),
+  );
+
+  env.define(
+    'inexact?',
+    builtin('inexact?', (args, callPosition) => {
+      requireArgCount('inexact?', args.length, 1, callPosition);
+      return booleanValue(args[0].value.type === 'number' && isInexactNumber(args[0].value.value));
+    }),
+  );
+
+  env.define(
+    'exact->inexact',
+    builtin('exact->inexact', (args, callPosition) => {
+      requireArgCount('exact->inexact', args.length, 1, callPosition);
+      return numberValue(exactToInexact(expectNumber('exact->inexact', args[0]), args[0].position), callPosition);
+    }),
+  );
+
+  env.define(
+    'inexact->exact',
+    builtin('inexact->exact', (args, callPosition) => {
+      requireArgCount('inexact->exact', args.length, 1, callPosition);
+      return numberValue(inexactToExact(expectNumber('inexact->exact', args[0]), args[0].position), callPosition);
+    }),
+  );
+
+  env.define(
+    'numerator',
+    builtin('numerator', (args, callPosition) => {
+      requireArgCount('numerator', args.length, 1, callPosition);
+      return numberValue(numeratorPart(expectNumber('numerator', args[0]), args[0].position), callPosition);
+    }),
+  );
+
+  env.define(
+    'denominator',
+    builtin('denominator', (args, callPosition) => {
+      requireArgCount('denominator', args.length, 1, callPosition);
+      return numberValue(denominatorPart(expectNumber('denominator', args[0]), args[0].position), callPosition);
+    }),
+  );
+
+  env.define(
     'boolean?',
     builtin('boolean?', (args, callPosition) => {
       requireArgCount('boolean?', args.length, 1, callPosition);
@@ -2177,21 +2253,21 @@ function builtin(
   return { type: 'builtin', name, invoke };
 }
 
-function evaluateNumberArgs(name: string, args: EvaluatedArg[]): number[] {
+function evaluateNumberArgs(name: string, args: EvaluatedArg[]): SchemeNumber[] {
   return args.map((arg) => expectNumber(name, arg));
 }
 
 function compareNumberArgs(
   name: string,
   args: EvaluatedArg[],
-  predicate: (left: number, right: number) => boolean,
+  predicate: (comparison: number) => boolean,
   position: SourcePosition,
 ): boolean {
   const values = evaluateNumberArgs(name, args);
   requireArgCountAtLeast(name, values.length, 1, position);
 
   for (let index = 0; index < values.length - 1; index += 1) {
-    if (!predicate(values[index], values[index + 1])) {
+    if (!predicate(compareNumbers(values[index], values[index + 1]))) {
       return false;
     }
   }
@@ -2257,7 +2333,7 @@ function requireArgCountAtLeast(
   }
 }
 
-function expectNumber(name: string, arg: EvaluatedArg): number {
+function expectNumber(name: string, arg: EvaluatedArg): SchemeNumber {
   if (arg.value.type !== 'number') {
     throw new EvalError(`${name}: expected number`, arg.position);
   }
@@ -2267,11 +2343,11 @@ function expectNumber(name: string, arg: EvaluatedArg): number {
 
 function expectInteger(name: string, arg: EvaluatedArg): number {
   const value = expectNumber(name, arg);
-  if (!Number.isInteger(value)) {
+  if (!isIntegerNumber(value)) {
     throw new EvalError(`${name}: expected integer`, arg.position);
   }
 
-  return value;
+  return integerToJs(value, arg.position);
 }
 
 function expectString(name: string, arg: EvaluatedArg): string {
@@ -2372,6 +2448,7 @@ function equalValues(left: SchemeValue, right: SchemeValue): boolean {
 
   switch (left.type) {
     case 'number':
+      return compareNumbers(left.value, (right as typeof left).value) === 0;
     case 'boolean':
     case 'string':
     case 'char':
@@ -2433,9 +2510,12 @@ function codePoints(value: string): string[] {
   return Array.from(value);
 }
 
-function numberValue(value: number, position?: SourcePosition): SchemeValue {
-  if (!Number.isFinite(value)) {
-    throw new EvalError('invalid number', position);
+function numberValue(value: number | SchemeNumber, position?: SourcePosition): SchemeValue {
+  if (typeof value === 'number') {
+    return {
+      type: 'number',
+      value: Number.isInteger(value) ? exactInteger(value) : inexactNumber(value, position),
+    };
   }
 
   return { type: 'number', value };
@@ -2484,7 +2564,7 @@ function formatDisplayValue(value: SchemeValue): string {
 function formatValue(value: SchemeValue): string {
   switch (value.type) {
     case 'number':
-      return String(value.value);
+      return formatNumber(value.value);
     case 'boolean':
       return value.value ? '#t' : '#f';
     case 'string':

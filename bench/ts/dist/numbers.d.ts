@@ -1,0 +1,38 @@
+import { type SourcePosition } from './evalError.js';
+export type ExactSchemeNumber = {
+    kind: 'exact';
+    numerator: bigint;
+    denominator: bigint;
+};
+export type InexactSchemeNumber = {
+    kind: 'inexact';
+    value: number;
+};
+export type SchemeNumber = ExactSchemeNumber | InexactSchemeNumber;
+export declare function parseNumberLiteral(source: string, position: SourcePosition): SchemeNumber | null;
+export declare function exactInteger(value: bigint | number): ExactSchemeNumber;
+export declare function exactRational(numerator: bigint, denominator: bigint, position?: SourcePosition): ExactSchemeNumber;
+export declare function inexactNumber(value: number, position?: SourcePosition): InexactSchemeNumber;
+export declare function addNumbers(values: SchemeNumber[], position?: SourcePosition): SchemeNumber;
+export declare function subtractNumbers(values: SchemeNumber[], position?: SourcePosition): SchemeNumber;
+export declare function multiplyNumbers(values: SchemeNumber[], position?: SourcePosition): SchemeNumber;
+export declare function divideNumbers(values: SchemeNumber[], position?: SourcePosition): SchemeNumber;
+export declare function compareNumbers(left: SchemeNumber, right: SchemeNumber): number;
+export declare function numberToJs(value: SchemeNumber): number;
+export declare function exactToInexact(value: SchemeNumber, position?: SourcePosition): InexactSchemeNumber;
+export declare function inexactToExact(value: SchemeNumber, position?: SourcePosition): ExactSchemeNumber;
+export declare function numeratorPart(value: SchemeNumber, position?: SourcePosition): ExactSchemeNumber;
+export declare function denominatorPart(value: SchemeNumber, position?: SourcePosition): ExactSchemeNumber;
+export declare function isExactNumber(value: SchemeNumber): value is ExactSchemeNumber;
+export declare function isInexactNumber(value: SchemeNumber): value is InexactSchemeNumber;
+export declare function isIntegerNumber(value: SchemeNumber): boolean;
+export declare function isRationalNumber(_value: SchemeNumber): boolean;
+export declare function isZeroNumber(value: SchemeNumber): boolean;
+export declare function isPositiveNumber(value: SchemeNumber): boolean;
+export declare function isNegativeNumber(value: SchemeNumber): boolean;
+export declare function absNumber(value: SchemeNumber, position?: SourcePosition): SchemeNumber;
+export declare function minNumber(values: SchemeNumber[]): SchemeNumber;
+export declare function maxNumber(values: SchemeNumber[]): SchemeNumber;
+export declare function exptNumber(base: SchemeNumber, exponent: number, position?: SourcePosition): SchemeNumber;
+export declare function formatNumber(value: SchemeNumber): string;
+export declare function integerToJs(value: SchemeNumber, position?: SourcePosition): number;
