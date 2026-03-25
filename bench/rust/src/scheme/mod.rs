@@ -2,7 +2,7 @@ pub mod error;
 
 pub use error::EvalError;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
@@ -64,6 +64,7 @@ enum Val {
         env: Env,
     },
     Vector(Rc<RefCell<Vec<Val>>>),
+    Continuation(Rc<ContData>),
 }
 
 fn make_pair(car: Val, cdr: Val) -> Val {
@@ -147,6 +148,7 @@ impl fmt::Display for Val {
                 }
                 write!(f, ")")
             }
+            Val::Continuation(_) => write!(f, "#<continuation>"),
         }
     }
 }
@@ -775,7 +777,214 @@ fn expand_macro(
     Err(err_at(span, EvalError::Parse("no matching syntax-rules pattern".into())))
 }
 
+// ── call/cc support ──
+
+/// Continuation data stored in Val::Continuation.
+#[derive(Clone)]
+struct ContData {
+    /// Is the call/cc's lambda still executing? (escape-eligible)
+    active: Rc<Cell<bool>>,
+    /// Body expressions to re-evaluate (from the enclosing body sequence).
+    reexec_exprs: Vec<Expr>,
+    /// Environment for re-evaluation.
+    reexec_env: Env,
+}
+
+impl fmt::Debug for ContData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ContData{{active={}}}", self.active.get())
+    }
+}
+
+/// Dummy Kont type (only used for Debug derive on Val).
+#[derive(Clone)]
+struct Kont;
+
+impl fmt::Debug for Kont {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Kont")
+    }
+}
+
+thread_local! {
+    /// Override for call/cc re-execution: when set, the next call/cc returns this value.
+    static CALLCC_OVERRIDE: RefCell<Option<Val>> = RefCell::new(None);
+    /// Signal for re-execution: (exprs, env) to re-evaluate.
+    static REEXEC_SIGNAL: RefCell<Option<(Vec<Expr>, Env)>> = RefCell::new(None);
+    /// Stack of body contexts for call/cc capture.
+    static BODY_CTX: RefCell<Vec<BodyCtx>> = RefCell::new(Vec::new());
+}
+
+#[derive(Clone)]
+struct BodyCtx {
+    exprs: Vec<Expr>,
+    cur_idx: usize,
+    env: Env,
+}
+
+/// Push a body context, evaluate a body sequence, pop on completion.
+fn eval_body_seq(body: &[Expr], env: &Env, out: &mut String) -> Result<Val, EvalError> {
+    BODY_CTX.with(|ctx| ctx.borrow_mut().push(BodyCtx {
+        exprs: body.to_vec(),
+        cur_idx: 0,
+        env: env.clone(),
+    }));
+    let mut result = Val::Void;
+    for (idx, expr) in body.iter().enumerate() {
+        BODY_CTX.with(|ctx| {
+            if let Some(top) = ctx.borrow_mut().last_mut() {
+                top.cur_idx = idx;
+            }
+        });
+        result = eval(expr, env, out)?;
+    }
+    BODY_CTX.with(|ctx| ctx.borrow_mut().pop());
+    Ok(result)
+}
+
+/// Handle call/cc: called when we encounter (call/cc f) or (call-with-current-continuation f).
+fn handle_callcc(f: &Val, env: &Env, out: &mut String, span: Span) -> Result<Val, EvalError> {
+    // Check for re-execution override
+    let override_val = CALLCC_OVERRIDE.with(|o| o.borrow_mut().take());
+    if let Some(val) = override_val {
+        return Ok(val);
+    }
+
+    // Capture body context for re-execution
+    let body_ctx = BODY_CTX.with(|ctx| ctx.borrow().last().cloned());
+    let (reexec_exprs, reexec_env) = if let Some(ref bc) = body_ctx {
+        (bc.exprs[bc.cur_idx..].to_vec(), bc.env.clone())
+    } else {
+        (vec![], env.clone())
+    };
+
+    let active = Rc::new(Cell::new(true));
+    let cont_data = ContData {
+        active: active.clone(),
+        reexec_exprs,
+        reexec_env,
+    };
+    let cont_val = Val::Continuation(Rc::new(cont_data));
+
+    // Call the lambda with the continuation
+    let result = call_function(f, vec![cont_val], span, out);
+
+    active.set(false);
+
+    match result {
+        Ok(val) => Ok(val),
+        Err(e) => {
+            // Check for escape (continuation invoked during lambda execution)
+            let escape = CALLCC_OVERRIDE.with(|o| o.borrow().is_some());
+            if escape {
+                // The continuation was invoked as escape — the override value
+                // is the value to return from this call/cc
+                let val = CALLCC_OVERRIDE.with(|o| o.borrow_mut().take()).unwrap();
+                Ok(val)
+            } else {
+                // Check for re-execution signal
+                let reexec = REEXEC_SIGNAL.with(|s| s.borrow().is_some());
+                if reexec {
+                    // Propagate the re-execution signal upward
+                    Err(e)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+/// Invoke a continuation value with a given argument.
+fn invoke_continuation(data: &ContData, val: Val) -> Result<Val, EvalError> {
+    if data.active.get() {
+        // Escape: set the value as override and return error to unwind to call/cc
+        CALLCC_OVERRIDE.with(|o| *o.borrow_mut() = Some(val));
+        Err(EvalError::Type("__callcc_escape__".into()))
+    } else {
+        // Re-invocation: signal re-execution
+        CALLCC_OVERRIDE.with(|o| *o.borrow_mut() = Some(val));
+        REEXEC_SIGNAL.with(|s| {
+            *s.borrow_mut() = Some((data.reexec_exprs.clone(), data.reexec_env.clone()));
+        });
+        Err(EvalError::Type("__callcc_reexec__".into()))
+    }
+}
+
+/// Top-level evaluator with re-execution loop for call/cc.
+fn cek_eval(exprs: &[Expr], env: &Env, out: &mut String) -> Result<Val, EvalError> {
+    // Push top-level body context
+    BODY_CTX.with(|ctx| ctx.borrow_mut().push(BodyCtx {
+        exprs: exprs.to_vec(),
+        cur_idx: 0,
+        env: env.clone(),
+    }));
+
+    let result = eval_toplevel_seq(exprs, env, out);
+
+    BODY_CTX.with(|ctx| ctx.borrow_mut().pop());
+    result
+}
+
+fn eval_toplevel_seq(exprs: &[Expr], env: &Env, out: &mut String) -> Result<Val, EvalError> {
+    let mut result = Val::Void;
+    for (idx, expr) in exprs.iter().enumerate() {
+        BODY_CTX.with(|ctx| {
+            if let Some(top) = ctx.borrow_mut().last_mut() {
+                top.cur_idx = idx;
+            }
+        });
+        match eval(expr, env, out) {
+            Ok(val) => result = val,
+            Err(e) => {
+                // Check for re-execution signal
+                let reexec = REEXEC_SIGNAL.with(|s| s.borrow_mut().take());
+                if let Some((re_exprs, re_env)) = reexec {
+                    // Re-evaluate the captured expressions
+                    return eval_reexec(&re_exprs, &re_env, out);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn eval_reexec(exprs: &[Expr], env: &Env, out: &mut String) -> Result<Val, EvalError> {
+    // Push body context for re-execution (so nested call/cc works)
+    BODY_CTX.with(|ctx| ctx.borrow_mut().push(BodyCtx {
+        exprs: exprs.to_vec(),
+        cur_idx: 0,
+        env: env.clone(),
+    }));
+
+    let mut result = Val::Void;
+    for (idx, expr) in exprs.iter().enumerate() {
+        BODY_CTX.with(|ctx| {
+            if let Some(top) = ctx.borrow_mut().last_mut() {
+                top.cur_idx = idx;
+            }
+        });
+        match eval(expr, env, out) {
+            Ok(val) => result = val,
+            Err(e) => {
+                // Check for another re-execution signal (continuation invoked again)
+                let reexec = REEXEC_SIGNAL.with(|s| s.borrow_mut().take());
+                if let Some((re_exprs, re_env)) = reexec {
+                    BODY_CTX.with(|ctx| ctx.borrow_mut().pop());
+                    return eval_reexec(&re_exprs, &re_env, out);
+                }
+                BODY_CTX.with(|ctx| ctx.borrow_mut().pop());
+                return Err(e);
+            }
+        }
+    }
+    BODY_CTX.with(|ctx| ctx.borrow_mut().pop());
+    Ok(result)
+}
+
 fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
+    // PLACEHOLDER_MARKER_FOR_OLD_EVAL
     let mut cur = expr.clone();
     let mut cur_env = env.clone();
     loop {
@@ -1095,9 +1304,25 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                         }
                         let body_exprs = &list[2..];
                         if body_exprs.is_empty() { return Ok(Val::Void); }
+                        BODY_CTX.with(|ctx| ctx.borrow_mut().push(BodyCtx {
+                            exprs: body_exprs.to_vec(),
+                            cur_idx: 0,
+                            env: let_env.clone(),
+                        }));
                         for i in 0..body_exprs.len() - 1 {
+                            BODY_CTX.with(|ctx| {
+                                if let Some(top) = ctx.borrow_mut().last_mut() {
+                                    top.cur_idx = i;
+                                }
+                            });
                             eval(&body_exprs[i], &let_env, out)?;
                         }
+                        BODY_CTX.with(|ctx| {
+                            if let Some(top) = ctx.borrow_mut().last_mut() {
+                                top.cur_idx = body_exprs.len() - 1;
+                            }
+                        });
+                        BODY_CTX.with(|ctx| ctx.borrow_mut().pop());
                         *tco = Some((body_exprs.last().unwrap().clone(), let_env));
                         return Ok(Val::Void);
                     }
@@ -1449,6 +1674,17 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                 }
             }
 
+            // call/cc handling
+            if let ExprKind::Symbol(op) = &list[0].kind {
+                if op == "call/cc" || op == "call-with-current-continuation" {
+                    if list.len() != 2 {
+                        return Err(err_at(span, EvalError::Arity("call/cc: need 1 argument".into())));
+                    }
+                    let f = eval(&list[1], env, out)?;
+                    return handle_callcc(&f, env, out, span);
+                }
+            }
+
             // Function application: handle map/apply specially (needs out), then builtins, then lambdas
             if let ExprKind::Symbol(op) = &list[0].kind {
                 if op == "map" {
@@ -1512,6 +1748,18 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
             }
 
             let func = eval(&list[0], env, out)?;
+
+            // Handle call/cc applied as first-class value
+            if let Val::Builtin(ref name) = func {
+                if name == "call/cc" || name == "call-with-current-continuation" {
+                    if list.len() != 2 {
+                        return Err(err_at(span, EvalError::Arity("call/cc: need 1 argument".into())));
+                    }
+                    let f = eval(&list[1], env, out)?;
+                    return handle_callcc(&f, env, out, span);
+                }
+            }
+
             let mut args = Vec::new();
             for a in &list[1..] {
                 args.push(eval(a, env, out)?);
@@ -1544,10 +1792,27 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                         env_set(&call_env, rp.clone(), rest_list);
                     }
                     if body.is_empty() { return Ok(Val::Void); }
+                    let full_body = body.clone();
                     let last = body.pop().unwrap();
-                    for e in &body {
+                    BODY_CTX.with(|ctx| ctx.borrow_mut().push(BodyCtx {
+                        exprs: full_body,
+                        cur_idx: 0,
+                        env: call_env.clone(),
+                    }));
+                    for (idx, e) in body.iter().enumerate() {
+                        BODY_CTX.with(|ctx| {
+                            if let Some(top) = ctx.borrow_mut().last_mut() {
+                                top.cur_idx = idx;
+                            }
+                        });
                         eval(e, &call_env, out)?;
                     }
+                    BODY_CTX.with(|ctx| {
+                        if let Some(top) = ctx.borrow_mut().last_mut() {
+                            top.cur_idx = body.len();
+                        }
+                    });
+                    BODY_CTX.with(|ctx| ctx.borrow_mut().pop());
                     *tco = Some((last, call_env));
                     Ok(Val::Void)
                 }
@@ -1572,10 +1837,22 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                                 env_set(&call_env, rp.clone(), rest_list);
                             }
                             if body_cl.is_empty() { return Ok(Val::Void); }
+                            let full_body_cl = body_cl.clone();
                             let last = body_cl.pop().unwrap();
-                            for e in &body_cl {
+                            BODY_CTX.with(|ctx| ctx.borrow_mut().push(BodyCtx {
+                                exprs: full_body_cl,
+                                cur_idx: 0,
+                                env: call_env.clone(),
+                            }));
+                            for (idx, e) in body_cl.iter().enumerate() {
+                                BODY_CTX.with(|ctx| {
+                                    if let Some(top) = ctx.borrow_mut().last_mut() {
+                                        top.cur_idx = idx;
+                                    }
+                                });
                                 eval(e, &call_env, out)?;
                             }
+                            BODY_CTX.with(|ctx| ctx.borrow_mut().pop());
                             *tco = Some((last, call_env));
                             return Ok(Val::Void);
                         }
@@ -1614,7 +1891,9 @@ fn is_builtin(op: &str) -> bool {
         | "for-each" | "reverse" | "member" | "assv" | "memv"
         | "cadar" | "caddar" | "cadddr" | "cdadr" | "cddar" | "cddddr"
         | "error" | "gcd" | "lcm" | "truncate" | "round"
-        | "make-string" | "string" | "string>?" | "string<=?" | "string>=?")
+        | "make-string" | "string" | "string>?" | "string<=?" | "string>=?"
+        | "display" | "write" | "newline"
+        | "call/cc" | "call-with-current-continuation")
 }
 
 /// Parse a parameter list that may contain dot notation for rest params.
@@ -1690,11 +1969,7 @@ fn call_function(func: &Val, args: Vec<Val>, span: Span, out: &mut String) -> Re
                 }
                 env_set(&call_env, rp.clone(), rest_list);
             }
-            let mut result = Val::Void;
-            for expr in body {
-                result = eval(expr, &call_env, out)?;
-            }
-            Ok(result)
+            eval_body_seq(body, &call_env, out)
         }
         Val::CaseLambda { clauses, env: closure_env } => {
             // Find matching clause by arity
@@ -1717,11 +1992,7 @@ fn call_function(func: &Val, args: Vec<Val>, span: Span, out: &mut String) -> Re
                         }
                         env_set(&call_env, rp.clone(), rest_list);
                     }
-                    let mut result = Val::Void;
-                    for expr in body {
-                        result = eval(expr, &call_env, out)?;
-                    }
-                    return Ok(result);
+                    return eval_body_seq(body, &call_env, out);
                 }
             }
             Err(err_at(span, EvalError::Arity(format!(
@@ -1729,7 +2000,12 @@ fn call_function(func: &Val, args: Vec<Val>, span: Span, out: &mut String) -> Re
             ))))
         }
         Val::Builtin(name) => {
-            if name == "apply" {
+            if name == "call/cc" || name == "call-with-current-continuation" {
+                if args.len() != 1 {
+                    return Err(err_at(span, EvalError::Arity("call/cc: need 1 argument".into())));
+                }
+                return handle_callcc(&args[0], &new_env(None), out, span);
+            } else if name == "apply" {
                 do_apply(&args, span, out)
             } else if name.starts_with("__ctor_") {
                 let rest = &name[7..]; // skip "__ctor_"
@@ -1788,6 +2064,12 @@ fn call_function(func: &Val, args: Vec<Val>, span: Span, out: &mut String) -> Re
             } else {
                 apply_builtin(name, &args).map_err(|e| err_at(span, e))
             }
+        }
+        Val::Continuation(ref data) => {
+            if args.len() != 1 {
+                return Err(err_at(span, EvalError::Arity("continuation: expected 1 argument".into())));
+            }
+            invoke_continuation(data, args[0].clone())
         }
         _ => Err(err_at(span, EvalError::Type("not a procedure".into()))),
     }
@@ -2138,7 +2420,7 @@ fn apply_builtin(op: &str, args: &[Val]) -> Result<Val, EvalError> {
         }
         "procedure?" => {
             if args.len() != 1 { return Err(EvalError::Arity("procedure?: need 1 argument".into())); }
-            Ok(Val::Bool(matches!(args[0], Val::Lambda { .. } | Val::CaseLambda { .. } | Val::Builtin(_))))
+            Ok(Val::Bool(matches!(args[0], Val::Lambda { .. } | Val::CaseLambda { .. } | Val::Builtin(_) | Val::Continuation(_))))
         }
         "string-append" => {
             let mut result = String::new();
@@ -2930,11 +3212,8 @@ fn apply_builtin(op: &str, args: &[Val]) -> Result<Val, EvalError> {
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parse_all(input)?;
     let env = new_env(None);
-    let mut result = Val::Void;
     let mut out = String::new();
-    for expr in &exprs {
-        result = eval(&expr, &env, &mut out)?;
-    }
+    let result = cek_eval(&exprs, &env, &mut out)?;
     Ok(result.to_string())
 }
 
@@ -2943,11 +3222,8 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let exprs = parse_all(input)?;
     let env = new_env(None);
-    let mut result = Val::Void;
     let mut out = String::new();
-    for expr in &exprs {
-        result = eval(&expr, &env, &mut out)?;
-    }
+    let result = cek_eval(&exprs, &env, &mut out)?;
     let result_str = match result {
         Val::Void => String::new(),
         other => other.to_string(),
