@@ -20,6 +20,8 @@ pub(crate) struct Ast {
 #[derive(Debug, Clone)]
 enum AstKind {
     Integer(i64),
+    Rational(i64, i64),
+    Float(f64),
     Boolean(bool),
     Str(String),
     Char(char),
@@ -32,6 +34,8 @@ enum AstKind {
 #[derive(Debug, Clone)]
 pub(crate) enum Value {
     Integer(i64),
+    Rational(i64, i64), // numerator, denominator (always simplified, denom > 0)
+    Float(f64),
     Boolean(bool),
     Str(String),
     Char(char),
@@ -51,6 +55,28 @@ pub(crate) enum Value {
         def_env: Env,
     },
     Void,
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+/// Create a rational or integer value, always simplified.
+pub(crate) fn make_rational(n: i64, d: i64) -> Value {
+    assert!(d != 0, "division by zero in make_rational");
+    let sign = if (n < 0) ^ (d < 0) { -1 } else { 1 };
+    let n = n.abs();
+    let d = d.abs();
+    let g = gcd(n, d);
+    let n = sign * (n / g);
+    let d = d / g;
+    if d == 1 { Value::Integer(n) } else { Value::Rational(n, d) }
 }
 
 pub(crate) type Env = Rc<RefCell<Environment>>;
@@ -114,9 +140,35 @@ impl Value {
         }
     }
 
+    /// Convert any numeric value to f64 for comparison.
+    pub(crate) fn as_f64(&self) -> Result<f64, EvalError> {
+        match self {
+            Value::Integer(n) => Ok(*n as f64),
+            Value::Rational(n, d) => Ok(*n as f64 / *d as f64),
+            Value::Float(f) => Ok(*f),
+            _ => Err(EvalError::Type(format!("expected number, got {}", self.display_value()))),
+        }
+    }
+
+    pub(crate) fn is_number(&self) -> bool {
+        matches!(self, Value::Integer(_) | Value::Rational(_, _) | Value::Float(_))
+    }
+
+    pub(crate) fn is_exact(&self) -> bool {
+        matches!(self, Value::Integer(_) | Value::Rational(_, _))
+    }
+
     pub(crate) fn display_value(&self) -> String {
         match self {
             Value::Integer(n) => n.to_string(),
+            Value::Rational(n, d) => format!("{}/{}", n, d),
+            Value::Float(f) => {
+                if f.fract() == 0.0 && f.is_finite() {
+                    format!("{:.1}", f)
+                } else {
+                    format!("{}", f)
+                }
+            }
             Value::Boolean(true) => "#t".into(),
             Value::Boolean(false) => "#f".into(),
             Value::Str(s) => format!("\"{s}\""),
@@ -149,6 +201,8 @@ impl Value {
             }
             Value::Pair(a, b) => format!("({} . {})", a.display_repr(), b.display_repr()),
             Value::Integer(_)
+            | Value::Rational(_, _)
+            | Value::Float(_)
             | Value::Boolean(_)
             | Value::Symbol(_)
             | Value::Lambda { .. }
@@ -163,6 +217,8 @@ impl Value {
 fn ast_to_value(ast: &Ast) -> Value {
     match &ast.kind {
         AstKind::Integer(n) => Value::Integer(*n),
+        AstKind::Rational(n, d) => Value::Rational(*n, *d),
+        AstKind::Float(f) => Value::Float(*f),
         AstKind::Boolean(b) => Value::Boolean(*b),
         AstKind::Str(s) => Value::Str(s.clone()),
         AstKind::Char(c) => Value::Char(*c),
@@ -349,6 +405,27 @@ impl Parser {
         if let Ok(n) = token.parse::<i64>() {
             return Ok(Ast { kind: AstKind::Integer(n), line, col });
         }
+        // Rational literal: digits/digits (e.g. 1/3, -5/2)
+        if let Some(slash) = token.find('/') {
+            if let (Ok(n), Ok(d)) = (token[..slash].parse::<i64>(), token[slash+1..].parse::<i64>()) {
+                if d != 0 {
+                    let sign = if (n < 0) ^ (d < 0) { -1 } else { 1 };
+                    let na = n.abs();
+                    let da = d.abs();
+                    let g = gcd(na, da);
+                    let n2 = sign * (na / g);
+                    let d2 = da / g;
+                    if d2 == 1 {
+                        return Ok(Ast { kind: AstKind::Integer(n2), line, col });
+                    }
+                    return Ok(Ast { kind: AstKind::Rational(n2, d2), line, col });
+                }
+            }
+        }
+        // Float literal
+        if let Ok(f) = token.parse::<f64>() {
+            return Ok(Ast { kind: AstKind::Float(f), line, col });
+        }
         Ok(Ast { kind: AstKind::Symbol(token), line, col })
     }
 
@@ -381,6 +458,8 @@ fn eval(ast: &Ast, env: &Env, output: &mut String) -> Result<Value, EvalError> {
 fn eval_inner(ast: &Ast, env: &Env, output: &mut String) -> Result<Value, EvalError> {
     match &ast.kind {
         AstKind::Integer(n) => Ok(Value::Integer(*n)),
+        AstKind::Rational(n, d) => Ok(Value::Rational(*n, *d)),
+        AstKind::Float(f) => Ok(Value::Float(*f)),
         AstKind::Boolean(b) => Ok(Value::Boolean(*b)),
         AstKind::Str(s) => Ok(Value::Str(s.clone())),
         AstKind::Char(c) => Ok(Value::Char(*c)),
@@ -533,7 +612,7 @@ fn eval_define(args: &[Ast], env: &Env, output: &mut String) -> Result<Value, Ev
             env.borrow_mut().set(name, lambda);
             Ok(Value::Void)
         }
-        AstKind::Integer(_) | AstKind::Boolean(_) | AstKind::Str(_) | AstKind::Char(_) => {
+        AstKind::Integer(_) | AstKind::Rational(_, _) | AstKind::Float(_) | AstKind::Boolean(_) | AstKind::Str(_) | AstKind::Char(_) => {
             Err(EvalError::Type("define: expected symbol or list".into()))
         }
     }
@@ -1042,6 +1121,8 @@ fn apply(func: &Value, args: &[Value], output: &mut String) -> Result<Value, Eva
             Ok(result)
         }
         Value::Integer(_)
+        | Value::Rational(_, _)
+        | Value::Float(_)
         | Value::Boolean(_)
         | Value::Str(_)
         | Value::Char(_)
