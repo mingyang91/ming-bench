@@ -72,6 +72,55 @@ private[ming] object Value:
       case _ =>
         true
 
+  def isProperList(value: Value): Boolean =
+    @tailrec
+    def loop(current: Value): Boolean =
+      current match
+        case Value.EmptyList =>
+          true
+
+        case Value.PairVal(_, cdr) =>
+          loop(cdr)
+
+        case _ =>
+          false
+
+    loop(value)
+
+  def eqv(left: Value, right: Value): Boolean =
+    (left, right) match
+      case (Value.IntVal(leftValue), Value.IntVal(rightValue)) =>
+        leftValue == rightValue
+
+      case (Value.BoolVal(leftValue), Value.BoolVal(rightValue)) =>
+        leftValue == rightValue
+
+      case (Value.CharVal(leftValue), Value.CharVal(rightValue)) =>
+        leftValue == rightValue
+
+      case (Value.SymbolVal(leftValue), Value.SymbolVal(rightValue)) =>
+        leftValue == rightValue
+
+      case (Value.EmptyList, Value.EmptyList) =>
+        true
+
+      case (Value.StringVal(leftValue), Value.StringVal(rightValue)) =>
+        leftValue eq rightValue
+
+      case _ =>
+        left.asInstanceOf[AnyRef] eq right.asInstanceOf[AnyRef]
+
+  def equal(left: Value, right: Value): Boolean =
+    (left, right) match
+      case (Value.StringVal(leftValue), Value.StringVal(rightValue)) =>
+        leftValue.sameElements(rightValue)
+
+      case (Value.PairVal(leftCar, leftCdr), Value.PairVal(rightCar, rightCdr)) =>
+        equal(leftCar, rightCar) && equal(leftCdr, rightCdr)
+
+      case _ =>
+        eqv(left, right)
+
   def escapeString(value: String): String =
     val builder = new StringBuilder
     value.foreach {

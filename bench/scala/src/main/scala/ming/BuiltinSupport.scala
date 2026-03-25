@@ -15,6 +15,18 @@ private[ming] trait BuiltinSupport:
       case _ =>
         throw EvalError.at(pos, s"$name expects exactly 1 argument")
 
+  final protected def expectTwoArgs(args: List[Value], pos: SourcePos, name: String): (Value, Value) =
+    args match
+      case first :: second :: Nil =>
+        (first, second)
+
+      case _ =>
+        throw EvalError.at(pos, s"$name expects exactly 2 arguments")
+
+  final protected def expectTwoNumbers(args: List[Value], pos: SourcePos, name: String): (BigInt, BigInt) =
+    val (first, second) = expectTwoArgs(args, pos, name)
+    (expectNumber(first, pos, name), expectNumber(second, pos, name))
+
   final protected def expectNumber(arg: Value, pos: SourcePos, name: String): BigInt =
     arg match
       case Value.IntVal(value) =>
