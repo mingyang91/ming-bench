@@ -2,7 +2,7 @@
 name: compare
 description: Compare two benchmark runs side-by-side with narrative analysis of struggles, cost, and gate friction.
 argument-hint: <run1> <run2>
-allowed-tools: Read, Grep, Glob, Bash
+allowed-tools: Read, Edit, Grep, Glob, Bash
 ---
 
 # Run Comparison Analysis
@@ -70,3 +70,24 @@ For each struggle level, one paragraph: what happened, why, and how it resolved.
 - Was the cost/time difference justified by code quality?
 - Which levels would benefit from tighter/looser turn limits?
 - Any turn limit violations (turns = limit)?
+
+## Step 6: Save to Run Log
+
+After producing the narrative, append a comparison summary to `results/dev-sessions/RUN_LOG.md`.
+
+Use the Edit tool to insert the entry at the TOP of the file, right after the header (before the first `---` separator that precedes a `## R` section).
+
+Format the entry as:
+
+```markdown
+### Compare: {run1-short} vs {run2-short} — {YYYY-MM-DD}
+**Winner:** {which run and why, one line}
+**Levels:** {run1-short} {passed1}/{total1} vs {run2-short} {passed2}/{total2}
+**Cost:** {run1-short} ${cost1} vs {run2-short} ${cost2}
+**Key insight:** {one-sentence takeaway from the struggle analysis}
+**Verdict:** {2-3 sentence summary of the narrative verdict}
+```
+
+If the runs belong to an existing round section (e.g., both are R25 runs), insert the comparison entry inside that section instead of at the top. Check the run names to determine the round number.
+
+**Important:** Always save the comparison. The whole point is that analysis shouldn't be lost when the conversation ends.

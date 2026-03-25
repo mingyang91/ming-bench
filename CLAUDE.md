@@ -98,6 +98,8 @@ Session analysis tools parse Claude Code JSONL sessions from `results/`. The sha
 - **`compare`** — Side-by-side table of two runs. Uses `analyze_run()` from `session_turns.rs`.
 - **`/compare` skill** — Guides narrative analysis: runs compare, identifies struggle levels, reads thinking blocks, produces verdict.
 - **`/compliance` skill** — Analyzes whether an agent followed its strategy rules.
+- **`/changelog` skill** — Records a 5W1H entry into `results/dev-sessions/DESIGN_EVOLUTION.md` after framework changes. Run after committing to capture who/what/when/where/why/how. The "Why" is the primary value — git shows what changed, this captures the reasoning that would otherwise be lost when the conversation ends.
+- **`results/dev-sessions/RUN_LOG.md`** — Historical record of all benchmark rounds (latest-first). The `/compare` skill auto-appends comparison verdicts here so analysis isn't lost between sessions.
 
 Output token safety caps (by level tier):
 
@@ -131,6 +133,10 @@ Failed levels auto-retry up to 2 times if the failure was infrastructure (timeou
 **Regression checking:** After each level passes (before quality gate cleanup), the orchestrator re-runs all previously-passed levels against the current code. If any regress (e.g., L14 breaking L06's `string-set!`), a fix-it agent pass is launched with the **same tiered token cap as the coding pass**. If the fix-it pass fails to resolve the regressions, the run halts with `REGRESSION` status. Checkpoints: `REGFIX` (regressions fixed), `REGRESSION` (halted).
 
 **Quality-gate cleanup:** After regression check passes, quality-gate levels get an additional cleanup pass (same tiered token budget as coding) with `cargo xtask test --gate`. The cleanup agent sees the QG strategy (quality-gate.md) which encourages radical refactoring. The coding agent sees the default strategy and codes freely.
+
+## Design History
+
+Design decisions and their rationale are tracked in `results/dev-sessions/DESIGN_EVOLUTION.md` (latest-first stack). After committing framework changes, run `/changelog` to record the 5W1H — especially the **Why**, which is lost when the conversation ends.
 
 ## Key Conventions
 
