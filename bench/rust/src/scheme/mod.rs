@@ -76,6 +76,18 @@ impl Environment {
         self.bindings.borrow_mut().insert(name.into(), value);
     }
 
+    fn set(&self, name: &str, value: Value) -> Result<(), EvalError> {
+        if self.bindings.borrow().contains_key(name) {
+            self.bindings.borrow_mut().insert(name.to_string(), value);
+            return Ok(());
+        }
+
+        match &self.parent {
+            Some(parent) => parent.set(name, value),
+            None => Err(EvalError::message(format!("unbound variable: {name}"))),
+        }
+    }
+
     fn lookup(&self, name: &str) -> Result<Value, EvalError> {
         if let Some(value) = self.bindings.borrow().get(name).cloned() {
             return Ok(value);
@@ -334,6 +346,7 @@ fn evaluate_list(elements: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     if let Expr::Symbol(name) = &elements[0] {
         match name.as_str() {
             "define" => return evaluate_define(&elements[1..], env),
+            "set!" => return evaluate_set(&elements[1..], env),
             "if" => return evaluate_if(&elements[1..], env),
             "quote" => return evaluate_quote(&elements[1..]),
             "lambda" => return evaluate_lambda(&elements[1..], env),
@@ -381,6 +394,19 @@ fn evaluate_define(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
         }
         _ => Err(EvalError::message("define: invalid binding target")),
     }
+}
+
+fn evaluate_set(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    require_exact("set!", args.len(), 2)?;
+
+    let name = match &args[0] {
+        Expr::Symbol(name) => name,
+        _ => return Err(EvalError::message("set!: expected a symbol")),
+    };
+
+    let value = evaluate(&args[1], env.clone())?;
+    env.set(name, value)?;
+    Ok(Value::Void)
 }
 
 fn evaluate_if(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {

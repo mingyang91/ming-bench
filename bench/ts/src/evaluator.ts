@@ -59,6 +59,20 @@ class Environment {
     this.bindings.set(name, value);
   }
 
+  set(name: string, value: SchemeValue, position: SourcePosition): void {
+    if (this.bindings.has(name)) {
+      this.bindings.set(name, value);
+      return;
+    }
+
+    if (this.parent) {
+      this.parent.set(name, value, position);
+      return;
+    }
+
+    throw new EvalError(`unbound variable: ${name}`, position);
+  }
+
   lookup(name: string, position: SourcePosition): SchemeValue {
     const value = this.bindings.get(name);
     if (value !== undefined) {
@@ -337,6 +351,8 @@ function evaluateList(expr: Extract<Expr, { type: 'list' }>, env: Environment): 
     switch (operator.name) {
       case 'define':
         return evaluateDefine(args, env, operator.position);
+      case 'set!':
+        return evaluateSet(args, env, operator.position);
       case 'if':
         return evaluateIf(args, env, operator.position);
       case 'quote':
@@ -388,6 +404,18 @@ function evaluateDefine(args: Expr[], env: Environment, position: SourcePosition
   const body = args.slice(1);
   const closure: Closure = { type: 'closure', params, body, env };
   env.define(nameExpr.name, closure);
+  return VOID_VALUE;
+}
+
+function evaluateSet(args: Expr[], env: Environment, position: SourcePosition): SchemeValue {
+  requireArgCount('set!', args.length, 2, position);
+
+  const target = args[0];
+  if (target.type !== 'symbol') {
+    throw new EvalError('set!: invalid binding target', target.position);
+  }
+
+  env.set(target.name, evaluate(args[1], env), target.position);
   return VOID_VALUE;
 }
 
