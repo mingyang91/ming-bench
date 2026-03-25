@@ -46,6 +46,13 @@ pub enum EvalError {
         actual: &'static str,
     },
 
+    #[error("record type mismatch in {name}: expected {expected}, got {actual}")]
+    RecordTypeMismatch {
+        name: String,
+        expected: String,
+        actual: String,
+    },
+
     #[error("division by zero")]
     DivisionByZero,
 

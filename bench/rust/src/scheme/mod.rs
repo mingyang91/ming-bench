@@ -20,6 +20,19 @@ enum Expr {
     List(Vec<Expr>),
 }
 
+type RecordTypeRef = Rc<RecordType>;
+
+#[derive(Clone)]
+struct RecordType {
+    name: String,
+}
+
+#[derive(Clone)]
+struct RecordInstance {
+    record_type: RecordTypeRef,
+    fields: Vec<Value>,
+}
+
 #[derive(Clone)]
 enum Value {
     Number(Number),
@@ -29,6 +42,7 @@ enum Value {
     Symbol(String),
     EmptyList,
     Pair(Box<Value>, Box<Value>),
+    Record(Rc<RecordInstance>),
     Procedure(Rc<Procedure>),
     Void,
 }
@@ -123,6 +137,7 @@ impl Value {
             Self::Char(_) => "char",
             Self::Symbol(_) => "symbol",
             Self::EmptyList | Self::Pair(_, _) => "pair",
+            Self::Record(_) => "record",
             Self::Procedure(_) => "procedure",
             Self::Void => "void",
         }
@@ -155,6 +170,7 @@ impl Value {
             Self::Symbol(value) => value.clone(),
             Self::EmptyList => "()".to_string(),
             Self::Pair(_, _) => render_pair(self, mode),
+            Self::Record(record) => format!("#<record {}>", record.record_type.name),
             Self::Procedure(_) => "#<procedure>".to_string(),
             Self::Void => "#<void>".to_string(),
         }
@@ -281,6 +297,9 @@ impl Env {
 enum Procedure {
     Builtin(BuiltinProcedure),
     Lambda(LambdaProcedure),
+    RecordConstructor(RecordConstructorProcedure),
+    RecordPredicate(RecordPredicateProcedure),
+    RecordAccessor(RecordAccessorProcedure),
 }
 
 #[derive(Clone)]
@@ -294,6 +313,26 @@ struct LambdaProcedure {
     params: ParameterList,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+#[derive(Clone)]
+struct RecordConstructorProcedure {
+    name: String,
+    record_type: RecordTypeRef,
+    field_count: usize,
+}
+
+#[derive(Clone)]
+struct RecordPredicateProcedure {
+    name: String,
+    record_type: RecordTypeRef,
+}
+
+#[derive(Clone)]
+struct RecordAccessorProcedure {
+    name: String,
+    record_type: RecordTypeRef,
+    field_index: usize,
 }
 
 #[derive(Clone)]
@@ -701,6 +740,7 @@ fn eval_list(items: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value
             "cond" => return eval_cond(args, env, ctx),
             "quote" => return eval_quote(args),
             "define" => return eval_define(args, env, ctx),
+            "define-record-type" => return eval_define_record_type(args, env),
             "define-syntax" => return eval_define_syntax(args, env),
             "set!" => return eval_set(args, env, ctx),
             "lambda" => return eval_lambda(args, env),
@@ -858,6 +898,58 @@ fn eval_define(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Valu
             message: "define requires a symbol or function signature".to_string(),
         }),
     }
+}
+
+fn eval_define_record_type(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    if args.len() < 3 {
+        return Err(EvalError::SyntaxError {
+            message: "define-record-type requires a type name, constructor, and predicate"
+                .to_string(),
+        });
+    }
+
+    let type_name = expect_symbol_expr(&args[0], "define-record-type requires a symbol type name")?;
+    let (constructor_name, field_count) = parse_record_constructor_spec(&args[1])?;
+    let predicate_name = expect_symbol_expr(
+        &args[2],
+        "define-record-type requires a symbol predicate name",
+    )?;
+    let accessors = args[3..]
+        .iter()
+        .map(parse_record_field_spec)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if field_count != accessors.len() {
+        return Err(EvalError::SyntaxError {
+            message: format!(
+                "define-record-type constructor for {type_name} expects {field_count} fields, got {}",
+                accessors.len()
+            ),
+        });
+    }
+
+    let record_type = Rc::new(RecordType { name: type_name });
+
+    bind_value(
+        &env,
+        constructor_name.clone(),
+        make_record_constructor(constructor_name, record_type.clone(), field_count),
+    );
+    bind_value(
+        &env,
+        predicate_name.clone(),
+        make_record_predicate(predicate_name, record_type.clone()),
+    );
+
+    for (field_index, accessor_name) in accessors.into_iter().enumerate() {
+        bind_value(
+            &env,
+            accessor_name.clone(),
+            make_record_accessor(accessor_name, record_type.clone(), field_index),
+        );
+    }
+
+    Ok(Value::Void)
 }
 
 fn eval_define_syntax(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
@@ -1028,6 +1120,55 @@ fn parse_param_list(expr: &Expr) -> Result<ParameterList, EvalError> {
     parse_param_slice(params)
 }
 
+fn expect_symbol_expr(expr: &Expr, message: &str) -> Result<String, EvalError> {
+    let Expr::Symbol(name) = expr else {
+        return Err(EvalError::SyntaxError {
+            message: message.to_string(),
+        });
+    };
+
+    Ok(name.clone())
+}
+
+fn parse_record_constructor_spec(expr: &Expr) -> Result<(String, usize), EvalError> {
+    let Expr::List(items) = expr else {
+        return Err(EvalError::SyntaxError {
+            message: "define-record-type constructor must be a list".to_string(),
+        });
+    };
+
+    let Some((name_expr, fields)) = items.split_first() else {
+        return Err(EvalError::SyntaxError {
+            message: "define-record-type constructor cannot be empty".to_string(),
+        });
+    };
+
+    let name = expect_symbol_expr(name_expr, "define-record-type constructor name must be a symbol")?;
+    for field in fields {
+        let _ = expect_symbol_expr(field, "define-record-type constructor fields must be symbols")?;
+    }
+
+    Ok((name, fields.len()))
+}
+
+fn parse_record_field_spec(expr: &Expr) -> Result<String, EvalError> {
+    let Expr::List(items) = expr else {
+        return Err(EvalError::SyntaxError {
+            message: "define-record-type field clauses must be lists".to_string(),
+        });
+    };
+
+    if items.len() != 2 {
+        return Err(EvalError::SyntaxError {
+            message: "define-record-type field clauses must contain a field name and accessor"
+                .to_string(),
+        });
+    }
+
+    let _ = expect_symbol_expr(&items[0], "define-record-type field names must be symbols")?;
+    expect_symbol_expr(&items[1], "define-record-type accessors must be symbols")
+}
+
 fn parse_param_slice(params: &[Expr]) -> Result<ParameterList, EvalError> {
     let mut required = Vec::with_capacity(params.len());
     let mut index = 0;
@@ -1083,6 +1224,30 @@ fn make_lambda(name: String, params: ParameterList, body: Vec<Expr>, env: EnvRef
     })))
 }
 
+fn make_record_constructor(name: String, record_type: RecordTypeRef, field_count: usize) -> Value {
+    Value::Procedure(Rc::new(Procedure::RecordConstructor(
+        RecordConstructorProcedure {
+            name,
+            record_type,
+            field_count,
+        },
+    )))
+}
+
+fn make_record_predicate(name: String, record_type: RecordTypeRef) -> Value {
+    Value::Procedure(Rc::new(Procedure::RecordPredicate(
+        RecordPredicateProcedure { name, record_type },
+    )))
+}
+
+fn make_record_accessor(name: String, record_type: RecordTypeRef, field_index: usize) -> Value {
+    Value::Procedure(Rc::new(Procedure::RecordAccessor(RecordAccessorProcedure {
+        name,
+        record_type,
+        field_index,
+    })))
+}
+
 fn apply(
     operator: Value,
     arg_exprs: &[Expr],
@@ -1118,6 +1283,9 @@ fn apply_procedure(
     match procedure.as_ref() {
         Procedure::Builtin(builtin) => (builtin.implementation)(&args, ctx),
         Procedure::Lambda(lambda) => apply_lambda(lambda, args, ctx),
+        Procedure::RecordConstructor(constructor) => apply_record_constructor(constructor, args),
+        Procedure::RecordPredicate(predicate) => apply_record_predicate(predicate, args),
+        Procedure::RecordAccessor(accessor) => apply_record_accessor(accessor, args),
     }
 }
 
@@ -1169,6 +1337,62 @@ fn apply_lambda(
     }
 
     eval_sequence(&lambda.body, call_env, ctx)
+}
+
+fn apply_record_constructor(
+    constructor: &RecordConstructorProcedure,
+    args: Vec<Value>,
+) -> Result<Value, EvalError> {
+    if args.len() != constructor.field_count {
+        return Err(EvalError::WrongArgumentCount {
+            name: constructor.name.clone(),
+            expected: constructor.field_count.to_string(),
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::Record(Rc::new(RecordInstance {
+        record_type: constructor.record_type.clone(),
+        fields: args,
+    })))
+}
+
+fn apply_record_predicate(
+    predicate: &RecordPredicateProcedure,
+    args: Vec<Value>,
+) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgumentCount {
+            name: predicate.name.clone(),
+            expected: "1".to_string(),
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::Boolean(matches!(
+        args.first(),
+        Some(Value::Record(record)) if Rc::ptr_eq(&record.record_type, &predicate.record_type)
+    )))
+}
+
+fn apply_record_accessor(
+    accessor: &RecordAccessorProcedure,
+    args: Vec<Value>,
+) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgumentCount {
+            name: accessor.name.clone(),
+            expected: "1".to_string(),
+            got: args.len(),
+        });
+    }
+
+    let record = expect_record_of_type(&args[0], &accessor.record_type, &accessor.name)?;
+    Ok(record
+        .fields
+        .get(accessor.field_index)
+        .cloned()
+        .expect("record accessor index should be validated at definition time"))
 }
 
 fn builtin_not(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -1953,6 +2177,7 @@ fn equal_values(left: &Value, right: &Value) -> bool {
             equal_values(left_car.as_ref(), right_car.as_ref())
                 && equal_values(left_cdr.as_ref(), right_cdr.as_ref())
         }
+        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,
@@ -2087,6 +2312,29 @@ fn expect_procedure(value: &Value) -> Result<Rc<Procedure>, EvalError> {
     }
 }
 
+fn expect_record_of_type<'a>(
+    value: &'a Value,
+    record_type: &RecordTypeRef,
+    name: &str,
+) -> Result<&'a RecordInstance, EvalError> {
+    let Value::Record(record) = value else {
+        return Err(EvalError::TypeMismatch {
+            expected: "record",
+            actual: value.type_name(),
+        });
+    };
+
+    if Rc::ptr_eq(&record.record_type, record_type) {
+        Ok(record.as_ref())
+    } else {
+        Err(EvalError::RecordTypeMismatch {
+            name: name.to_string(),
+            expected: record_type.name.clone(),
+            actual: record.record_type.name.clone(),
+        })
+    }
+}
+
 fn expect_index(value: &Value, kind: &'static str) -> Result<usize, EvalError> {
     let index = expect_exact_integer(value, kind)?;
 
@@ -2131,6 +2379,7 @@ fn is_special_form_name(name: &str) -> bool {
             | "cond"
             | "quote"
             | "define"
+            | "define-record-type"
             | "define-syntax"
             | "set!"
             | "lambda"
