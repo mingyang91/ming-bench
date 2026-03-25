@@ -71,6 +71,9 @@ pub enum EvalError {
         length: usize,
         position: SourcePos,
     },
+
+    #[error("{position}: cannot mutate immutable string")]
+    ImmutableString { position: SourcePos },
 }
 
 impl EvalError {
@@ -144,5 +147,9 @@ impl EvalError {
             length,
             position,
         }
+    }
+
+    pub fn immutable_string(position: SourcePos) -> Self {
+        Self::ImmutableString { position }
     }
 }
