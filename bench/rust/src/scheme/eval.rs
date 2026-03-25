@@ -2,10 +2,10 @@ use std::rc::Rc;
 
 use super::builtins::default_env;
 use super::core::{
-    make_lambda, make_record, make_record_accessor, make_record_constructor,
-    make_record_predicate, make_record_type, EnvRef, Environment, Expr, LambdaProcedure,
-    Procedure, RecordAccessorProcedure, RecordConstructorProcedure, RecordPredicateProcedure,
-    Runtime, Value, quote_expr,
+    make_case_lambda, make_lambda, make_record, make_record_accessor, make_record_constructor,
+    make_record_predicate, make_record_type, quote_expr, CaseLambdaProcedure, EnvRef, Environment,
+    Expr, LambdaProcedure, Procedure, RecordAccessorProcedure, RecordConstructorProcedure,
+    RecordPredicateProcedure, Runtime, Value,
 };
 use super::error::EvalError;
 use super::macros::{expand_macro_call, parse_macro_definition};
@@ -34,6 +34,7 @@ enum SpecialForm {
     If,
     Quote,
     Lambda,
+    CaseLambda,
     And,
     Or,
     Let,
@@ -51,6 +52,7 @@ impl SpecialForm {
             "if" => Some(Self::If),
             "quote" => Some(Self::Quote),
             "lambda" => Some(Self::Lambda),
+            "case-lambda" => Some(Self::CaseLambda),
             "and" => Some(Self::And),
             "or" => Some(Self::Or),
             "let" => Some(Self::Let),
@@ -69,6 +71,7 @@ impl SpecialForm {
             Self::If => eval_if(args, env, runtime),
             Self::Quote => eval_quote(args),
             Self::Lambda => eval_lambda(args, env),
+            Self::CaseLambda => eval_case_lambda(args, env),
             Self::And => eval_and(args, env, runtime),
             Self::Or => eval_or(args, env, runtime),
             Self::Let => eval_let(args, env, runtime),
@@ -154,7 +157,11 @@ fn eval_define(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Val
 
 fn eval_define_record_type(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     let [type_name_expr, constructor_expr, predicate_expr, field_exprs @ ..] = args else {
-        return Err(wrong_arg_count("define-record-type", "at least 3", args.len()));
+        return Err(wrong_arg_count(
+            "define-record-type",
+            "at least 3",
+            args.len(),
+        ));
     };
 
     let type_name = expect_symbol_expr(type_name_expr, "record type name")?;
@@ -332,6 +339,19 @@ fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
         body.to_vec(),
         env,
     ))
+}
+
+fn eval_case_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(wrong_arg_count("case-lambda", "at least 1", 0));
+    }
+
+    let clauses = args
+        .iter()
+        .map(|clause| parse_case_lambda_clause(clause, env))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(make_case_lambda(None, clauses))
 }
 
 fn eval_and(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -540,10 +560,7 @@ fn parse_record_field_spec(expr: &Expr) -> Result<RecordFieldSpec, EvalError> {
         | Expr::Number(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)
-        | Expr::Symbol(_, _) => Err(positioned_syntax_error(
-            expr,
-            "record field must be a list",
-        )),
+        | Expr::Symbol(_, _) => Err(positioned_syntax_error(expr, "record field must be a list")),
     }
 }
 
@@ -631,6 +648,45 @@ fn parse_formals(params_expr: &Expr) -> Result<ParsedParams, EvalError> {
     }
 }
 
+fn parse_case_lambda_clause(clause: &Expr, env: &EnvRef) -> Result<LambdaProcedure, EvalError> {
+    let parts = match clause {
+        Expr::List(parts, _) => parts,
+        Expr::Bool(_, _)
+        | Expr::Number(_, _)
+        | Expr::String(_, _)
+        | Expr::Char(_, _)
+        | Expr::Symbol(_, _) => {
+            return Err(positioned_syntax_error(
+                clause,
+                "case-lambda clause must be a list",
+            ));
+        }
+    };
+
+    let Some((params_expr, body)) = parts.split_first() else {
+        return Err(positioned_syntax_error(
+            clause,
+            "case-lambda clause cannot be empty",
+        ));
+    };
+
+    if body.is_empty() {
+        return Err(positioned_syntax_error(
+            clause,
+            "case-lambda clause must have a body",
+        ));
+    }
+
+    let params = parse_formals(params_expr)?;
+    Ok(LambdaProcedure {
+        name: None,
+        params: params.params,
+        rest_param: params.rest_param,
+        body: body.to_vec(),
+        env: env.clone(),
+    })
+}
+
 fn parse_params(params: &[Expr]) -> Result<ParsedParams, EvalError> {
     let mut parsed = ParsedParams {
         params: Vec::new(),
@@ -688,7 +744,10 @@ pub(crate) fn apply_procedure(
         Value::Procedure(procedure) => match procedure.as_ref() {
             Procedure::Builtin(builtin) => (builtin.func)(args, runtime),
             Procedure::Lambda(lambda) => apply_lambda(lambda, args, runtime),
-            Procedure::RecordConstructor(constructor) => apply_record_constructor(constructor, args),
+            Procedure::CaseLambda(case_lambda) => apply_case_lambda(case_lambda, args, runtime),
+            Procedure::RecordConstructor(constructor) => {
+                apply_record_constructor(constructor, args)
+            }
             Procedure::RecordPredicate(predicate) => apply_record_predicate(predicate, args),
             Procedure::RecordAccessor(accessor) => apply_record_accessor(accessor, args),
         },
@@ -714,14 +773,10 @@ fn apply_lambda(
     let required_len = lambda.params.len();
     let rest_param = lambda.rest_param.as_ref();
 
-    if args.len() < required_len || (rest_param.is_none() && args.len() != required_len) {
+    if !lambda_accepts_arity(lambda, args.len()) {
         return Err(EvalError::WrongArgCount {
             name: lambda.name.clone().unwrap_or_else(|| "lambda".into()),
-            expected: if rest_param.is_some() {
-                format!("at least {required_len}")
-            } else {
-                format!("exactly {required_len}")
-            },
+            expected: lambda_expected_arity(lambda),
             actual: args.len(),
         });
     }
@@ -741,6 +796,58 @@ fn apply_lambda(
     }
 
     eval_sequence(&lambda.body, &call_env, runtime)
+}
+
+fn apply_case_lambda(
+    case_lambda: &CaseLambdaProcedure,
+    args: &[Value],
+    runtime: &mut Runtime,
+) -> Result<Value, EvalError> {
+    if let Some(clause) = case_lambda
+        .clauses
+        .iter()
+        .find(|clause| lambda_accepts_arity(clause, args.len()))
+    {
+        return apply_lambda(clause, args, runtime);
+    }
+
+    Err(EvalError::WrongArgCount {
+        name: case_lambda
+            .name
+            .clone()
+            .unwrap_or_else(|| "case-lambda".into()),
+        expected: case_lambda_expected(case_lambda),
+        actual: args.len(),
+    })
+}
+
+fn lambda_accepts_arity(lambda: &LambdaProcedure, actual: usize) -> bool {
+    actual >= lambda.params.len() && (lambda.rest_param.is_some() || actual == lambda.params.len())
+}
+
+fn lambda_expected_arity(lambda: &LambdaProcedure) -> String {
+    if lambda.rest_param.is_some() {
+        format!("at least {}", lambda.params.len())
+    } else {
+        format!("exactly {}", lambda.params.len())
+    }
+}
+
+fn case_lambda_expected(case_lambda: &CaseLambdaProcedure) -> String {
+    let mut expected = Vec::with_capacity(case_lambda.clauses.len());
+
+    for clause in &case_lambda.clauses {
+        let signature = lambda_expected_arity(clause);
+        if !expected.contains(&signature) {
+            expected.push(signature);
+        }
+    }
+
+    match expected.len() {
+        0 => "no matching clause".into(),
+        1 => expected.pop().expect("single expected clause"),
+        _ => format!("one of {}", expected.join(", ")),
+    }
 }
 
 fn apply_record_constructor(
@@ -791,7 +898,9 @@ fn apply_record_accessor(
     };
 
     match value {
-        Value::Record(record) if Rc::ptr_eq(&record.as_ref().record_type, &accessor.record_type) => {
+        Value::Record(record)
+            if Rc::ptr_eq(&record.as_ref().record_type, &accessor.record_type) =>
+        {
             Ok(record.as_ref().fields[accessor.field_index].clone())
         }
         _ => Err(EvalError::TypeMismatch {

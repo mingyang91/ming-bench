@@ -125,6 +125,7 @@ impl Value {
 pub(crate) enum Procedure {
     Builtin(BuiltinProcedure),
     Lambda(LambdaProcedure),
+    CaseLambda(CaseLambdaProcedure),
     RecordConstructor(RecordConstructorProcedure),
     RecordPredicate(RecordPredicateProcedure),
     RecordAccessor(RecordAccessorProcedure),
@@ -143,6 +144,12 @@ pub(crate) struct LambdaProcedure {
     pub(crate) rest_param: Option<String>,
     pub(crate) body: Vec<Expr>,
     pub(crate) env: EnvRef,
+}
+
+#[derive(Clone)]
+pub(crate) struct CaseLambdaProcedure {
+    pub(crate) name: Option<String>,
+    pub(crate) clauses: Vec<LambdaProcedure>,
 }
 
 #[derive(Clone)]
@@ -306,10 +313,14 @@ pub(crate) fn make_lambda(
     })))
 }
 
-pub(crate) fn make_record_type(
-    name: impl Into<String>,
-    field_names: Vec<String>,
-) -> RecordTypeRef {
+pub(crate) fn make_case_lambda(name: Option<String>, clauses: Vec<LambdaProcedure>) -> Value {
+    Value::Procedure(Rc::new(Procedure::CaseLambda(CaseLambdaProcedure {
+        name,
+        clauses,
+    })))
+}
+
+pub(crate) fn make_record_type(name: impl Into<String>, field_names: Vec<String>) -> RecordTypeRef {
     Rc::new(RecordType {
         name: name.into(),
         field_names,
@@ -335,10 +346,7 @@ pub(crate) fn make_record_constructor(
     )))
 }
 
-pub(crate) fn make_record_predicate(
-    name: impl Into<String>,
-    record_type: &RecordTypeRef,
-) -> Value {
+pub(crate) fn make_record_predicate(name: impl Into<String>, record_type: &RecordTypeRef) -> Value {
     Value::Procedure(Rc::new(Procedure::RecordPredicate(
         RecordPredicateProcedure {
             name: name.into(),

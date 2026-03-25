@@ -158,6 +158,10 @@ const BUILTINS: &[BuiltinProcedure] = &[
         func: builtin_is_symbol,
     },
     BuiltinProcedure {
+        name: "procedure?",
+        func: builtin_is_procedure,
+    },
+    BuiltinProcedure {
         name: "display",
         func: builtin_display,
     },
@@ -604,6 +608,12 @@ fn builtin_is_pair(args: &[Value], _runtime: &mut Runtime) -> Result<Value, Eval
 
 fn builtin_is_symbol(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     unary_predicate("symbol?", args, |value| matches!(value, Value::Symbol(_)))
+}
+
+fn builtin_is_procedure(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    unary_predicate("procedure?", args, |value| {
+        matches!(value, Value::Procedure(_))
+    })
 }
 
 fn builtin_display(args: &[Value], runtime: &mut Runtime) -> Result<Value, EvalError> {
