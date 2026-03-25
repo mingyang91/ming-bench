@@ -4,6 +4,7 @@ mod eval_forms;
 mod macros;
 mod parser;
 mod special_forms;
+mod winders;
 
 pub use error::EvalError;
 use builtins::*;
@@ -969,9 +970,9 @@ fn apply_function_cek(
                 return Err(EvalError::Arity(format!("dynamic-wind: expected 3 arguments, got {} at {span}", args.len())));
             }
             let mut it = args.into_iter();
-            let in_thunk = it.next().unwrap();
-            let body_thunk = it.next().unwrap();
-            let out_thunk = it.next().unwrap();
+            let in_thunk = it.next().expect("arity checked");
+            let body_thunk = it.next().expect("arity checked");
+            let out_thunk = it.next().expect("arity checked");
             let winder_id = WINDER_COUNTER.fetch_add(1, Ordering::SeqCst);
             let winder = Winder { id: winder_id, in_thunk: Box::new(in_thunk.clone()), out_thunk: Box::new(out_thunk.clone()) };
             // Push frame to handle what happens after in-thunk completes
@@ -1005,28 +1006,7 @@ fn apply_function_cek(
 
 /// Compute the sequence of wind/unwind actions needed to switch from
 /// `current` winders to `target` winders.
-fn compute_wind_actions(current: &[Winder], target: &[Winder]) -> Vec<DwAction> {
-    // Find common prefix by winder id.
-    let common = current.iter().zip(target.iter())
-        .take_while(|(a, b)| a.id == b.id)
-        .count();
-
-    let mut actions = Vec::new();
-
-    // Unwind: run out-thunks from innermost to outermost (reverse of current[common..])
-    for w in current[common..].iter().rev() {
-        actions.push(DwAction::PopWinder(w.id));
-        actions.push(DwAction::CallThunk(w.out_thunk.clone()));
-    }
-
-    // Rewind: run in-thunks from outermost to innermost (target[common..] in order)
-    for w in &target[common..] {
-        actions.push(DwAction::CallThunk(w.in_thunk.clone()));
-        actions.push(DwAction::PushWinder(w.clone()));
-    }
-
-    actions
-}
+use winders::compute_wind_actions;
 
 /// Process a list of wind/unwind actions. Non-thunk actions (push/pop winder)
 /// are executed immediately; thunk calls push a DwSwitch frame and return.
