@@ -41,6 +41,9 @@ object KontOps:
       v match
         case SchemeVal.SValues(vals) => Apply.performApply(consumer, vals, k2)
         case single                  => Apply.performApply(consumer, List(single), k2)
+    // case expression — v is the key, match against clauses
+    case Cont.CaseK(clauses, env, k2) =>
+      evalCaseClauses(v, clauses, env, k2)
     // CPS let binding evaluation
     case Cont.LetEvalK(currentName, bound, remaining, body, outerEnv, k2) =>
       val newBound = (currentName, v) :: bound
@@ -66,3 +69,18 @@ object KontOps:
             outerEnv,
             Cont.NamedLetEvalK(loopName, paramNames, nextName, newBound, rest, body, outerEnv, k2)
           )
+
+  @scala.annotation.tailrec
+  private def evalCaseClauses(key: SchemeVal, clauses: List[SchemeVal], env: Env, k: Cont): State =
+    clauses match
+      case Nil => State.Ko(SchemeVal.SVoid, k)
+      case clause :: rest =>
+        clause match
+          case SchemeVal.SList(SchemeVal.SSymbol("else") :: body) =>
+            evalBodyCek(body, env, k)
+          case SchemeVal.SList(SchemeVal.SList(datums) :: body) =>
+            if datums.exists(d => Builtins.schemeEqv(key, d)) then
+              if body.isEmpty then State.Ko(SchemeVal.SVoid, k)
+              else evalBodyCek(body, env, k)
+            else evalCaseClauses(key, rest, env, k)
+          case _ => throw new EvalError("case: bad clause")

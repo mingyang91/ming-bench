@@ -119,7 +119,10 @@ object Evaluator:
       case SchemeVal.SSymbol("letrec*") :: args =>
         LetForms.evalLetrecStarStep(args, env, k)
       case SchemeVal.SSymbol("case") :: args =>
-        State.Ko(BindingForms.evalCase(args, env), k)
+        args match
+          case keyExpr :: clauses if clauses.nonEmpty =>
+            State.Ev(keyExpr, env, Cont.CaseK(clauses, env, k))
+          case _ => throw new EvalError("case: bad syntax")
       case SchemeVal.SSymbol("do") :: args =>
         State.Ko(BindingForms.evalDo(args, env), k)
       case SchemeVal.SSymbol("let*") :: args =>

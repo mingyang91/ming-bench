@@ -1,13 +1,14 @@
 package ming
 
 import scala.collection.mutable
+import java.util.concurrent.atomic.AtomicLong
 
 object Macro:
-  private var counter = 0L
+  private val counter = new AtomicLong(0L)
 
   private def gensym(base: String): String =
-    counter += 1
-    s"${base}__m${counter}"
+    val n = counter.incrementAndGet()
+    s"${base}__m${n}"
 
   private val specialForms = Set(
     "if",
