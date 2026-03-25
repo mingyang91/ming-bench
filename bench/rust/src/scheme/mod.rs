@@ -3,7 +3,7 @@ pub mod error;
 pub use error::{EvalError, SourcePos};
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp::Ordering,
     collections::{HashMap, HashSet},
     fmt,
@@ -161,6 +161,62 @@ const BUILTIN_NAMES: &[&str] = &[
 
 static GENERATED_SYMBOL_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StepBudget {
+    remaining: usize,
+    max_steps: usize,
+}
+
+impl StepBudget {
+    fn new(max_steps: usize) -> Self {
+        Self {
+            remaining: max_steps,
+            max_steps,
+        }
+    }
+}
+
+std::thread_local! {
+    static STEP_BUDGET: Cell<Option<StepBudget>> = Cell::new(None);
+}
+
+struct StepBudgetReset(Option<StepBudget>);
+
+impl Drop for StepBudgetReset {
+    fn drop(&mut self) {
+        STEP_BUDGET.with(|budget| budget.set(self.0));
+    }
+}
+
+fn with_step_budget<T>(
+    max_steps: usize,
+    f: impl FnOnce() -> Result<T, EvalError>,
+) -> Result<T, EvalError> {
+    let previous = STEP_BUDGET.with(|budget| {
+        let previous = budget.get();
+        budget.set(Some(StepBudget::new(max_steps)));
+        previous
+    });
+    let _reset = StepBudgetReset(previous);
+    f()
+}
+
+fn charge_eval_step(position: SourcePos) -> Result<(), EvalError> {
+    STEP_BUDGET.with(|budget| {
+        let Some(mut state) = budget.get() else {
+            return Ok(());
+        };
+
+        if state.remaining == 0 {
+            return Err(EvalError::step_limit_exceeded(state.max_steps, position));
+        }
+
+        state.remaining -= 1;
+        budget.set(Some(state));
+        Ok(())
+    })
+}
+
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 ///
@@ -171,6 +227,12 @@ static GENERATED_SYMBOL_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let (value, _) = eval_program(input)?;
+    Ok(render_result(&value))
+}
+
+/// Evaluate Scheme expressions with a limit on the number of eval dispatches.
+pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
+    let (value, _) = with_step_budget(max_steps, || eval_program(input))?;
     Ok(render_result(&value))
 }
 
@@ -1906,7 +1968,10 @@ fn machine_eval_program(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError>
 
     loop {
         let (next_control, next_cont) = match control {
-            MachineControl::Expr(expr, env) => machine_eval_expr(expr, env, cont)?,
+            MachineControl::Expr(expr, env) => {
+                charge_eval_step(expr.pos)?;
+                machine_eval_expr(expr, env, cont)?
+            }
             MachineControl::Value(value) => match cont.as_ref() {
                 ContinuationChain::Empty => return Ok(value),
                 ContinuationChain::Frame(frame, next) => {
@@ -3149,6 +3214,7 @@ fn eval(expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
 
     loop {
         let position = current_expr.pos;
+        charge_eval_step(position)?;
         match current_expr.kind {
             ExprKind::Integer(value) => return Ok(Value::Integer(value)),
             ExprKind::Rational(value) => {

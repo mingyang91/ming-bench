@@ -87,6 +87,12 @@ pub enum EvalError {
     #[error("{position}: cannot mutate immutable string")]
     ImmutableString { position: SourcePos },
 
+    #[error("{position}: step limit exceeded after {max_steps} steps")]
+    StepLimitExceeded {
+        max_steps: usize,
+        position: SourcePos,
+    },
+
     #[error("{position}: uncaught exception: {value}")]
     UncaughtException { value: String, position: SourcePos },
 }
@@ -181,6 +187,13 @@ impl EvalError {
 
     pub fn immutable_string(position: SourcePos) -> Self {
         Self::ImmutableString { position }
+    }
+
+    pub fn step_limit_exceeded(max_steps: usize, position: SourcePos) -> Self {
+        Self::StepLimitExceeded {
+            max_steps,
+            position,
+        }
     }
 
     pub fn uncaught_exception(value: impl Into<String>, position: SourcePos) -> Self {
