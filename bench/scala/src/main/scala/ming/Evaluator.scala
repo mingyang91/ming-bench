@@ -1,13 +1,13 @@
 package ming
 
-import scala.collection.mutable
-
 object Evaluator:
+
+  import Builtins.{applyBuiltin, display, isFalsy}
 
   private def eval(expr: Expr, env: Env): Expr =
     try
       expr match
-        case Expr.Num(_) | Expr.Bool(_) | Expr.Str(_) | Expr.Lambda(_, _, _) =>
+        case Expr.Num(_) | Expr.Bool(_) | Expr.Str(_) | Expr.Chr(_) | Expr.Lambda(_, _, _) =>
           expr
         case Expr.Sym(name) => env.lookup(name)
         case Expr.Lst(Nil)  => throw EvalError("empty application")
@@ -112,10 +112,6 @@ object Evaluator:
       case other       => throw EvalError(s"$context: invalid parameter: ${display(other)}")
     }
 
-  private def isFalsy(e: Expr): Boolean = e match
-    case Expr.Bool(false) => true
-    case _                => false
-
   private def applyProc(func: Expr, args: List[Expr]): Expr = func match
     case Expr.Sym(name) => applyBuiltin(name, args)
     case Expr.Lambda(params, body, closure) =>
@@ -128,135 +124,21 @@ object Evaluator:
       evalBody(body, localEnv)
     case _ => throw EvalError(s"not a procedure: ${display(func)}")
 
-  private def applyBuiltin(name: String, args: List[Expr]): Expr = name match
-    case "+"    => Expr.Num(args.map(asNum).sum)
-    case "-"    => applyMinus(args)
-    case "*"    => Expr.Num(args.map(asNum).product)
-    case "/"    => applyDiv(args)
-    case "<"    => binaryCmp(name, args, _ < _)
-    case ">"    => binaryCmp(name, args, _ > _)
-    case "="    => binaryCmp(name, args, _ == _)
-    case "<="   => binaryCmp(name, args, _ <= _)
-    case ">="   => binaryCmp(name, args, _ >= _)
-    case "not"  => unary(name, args)(e => Expr.Bool(isFalsy(e)))
-    case "cons" => applyCons(args)
-    case "car"  => unary(name, args)(carOf)
-    case "cdr"  => unary(name, args)(cdrOf)
-    case "null?" =>
-      unary(name, args)(e => Expr.Bool(e == Expr.Lst(Nil)))
-    case "list"     => Expr.Lst(args)
-    case "length"   => unary(name, args)(lengthOf)
-    case "number?"  => unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Num]))
-    case "string?"  => unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Str]))
-    case "boolean?" => unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Bool]))
-    case "pair?" =>
-      unary(name, args) {
-        case Expr.Lst(_ :: _) => Expr.Bool(true)
-        case _                => Expr.Bool(false)
-      }
-    case "symbol?" => unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Sym]))
-    case "append"  => applyAppend(args)
-    case _         => throw EvalError(s"unknown procedure: $name")
-
-  private def applyMinus(args: List[Expr]): Expr =
-    if args.isEmpty then throw EvalError("-: need at least 1 argument")
-    val nums = args.map(asNum)
-    if nums.length == 1 then Expr.Num(-nums.head)
-    else Expr.Num(nums.reduceLeft(_ - _))
-
-  private def applyDiv(args: List[Expr]): Expr =
-    if args.length < 2 then throw EvalError("/: need at least 2 arguments")
-    val nums = args.map(asNum)
-    if nums.tail.contains(0L) then throw EvalError("division by zero")
-    Expr.Num(nums.reduceLeft(_ / _))
-
-  private def applyCons(args: List[Expr]): Expr =
-    if args.length != 2 then throw EvalError("cons: need exactly 2 arguments")
-    args(1) match
-      case Expr.Lst(elems) => Expr.Lst(args(0) :: elems)
-      case _               => throw EvalError("cons: second argument must be a list")
-
-  private def carOf(e: Expr): Expr = e match
-    case Expr.Lst(h :: _) => h
-    case _                => throw EvalError("car: not a pair")
-
-  private def cdrOf(e: Expr): Expr = e match
-    case Expr.Lst(_ :: t) => Expr.Lst(t)
-    case _                => throw EvalError("cdr: not a pair")
-
-  private def lengthOf(e: Expr): Expr = e match
-    case Expr.Lst(elems) => Expr.Num(elems.length.toLong)
-    case _               => throw EvalError("length: not a list")
-
-  private def applyAppend(args: List[Expr]): Expr =
-    if args.isEmpty then Expr.Lst(Nil)
-    else
-      val lists = args.map {
-        case Expr.Lst(elems) => elems
-        case other           => throw EvalError(s"append: not a list: ${display(other)}")
-      }
-      Expr.Lst(lists.flatten)
-
-  private def unary(name: String, args: List[Expr])(f: Expr => Expr): Expr =
-    if args.length != 1 then throw EvalError(s"$name: need exactly 1 argument")
-    f(args.head)
-
-  private def binaryCmp(
-    name: String,
-    args: List[Expr],
-    op: (Long, Long) => Boolean
-  ): Expr =
-    if args.length != 2 then throw EvalError(s"$name: need exactly 2 arguments")
-    Expr.Bool(op(asNum(args(0)), asNum(args(1))))
-
-  private def asNum(e: Expr): Long = e match
-    case Expr.Num(n) => n
-    case _           => throw EvalError(s"expected number, got ${display(e)}")
-
-  private[ming] def display(e: Expr): String = e match
-    case Expr.Num(n)          => n.toString
-    case Expr.Bool(true)      => "#t"
-    case Expr.Bool(false)     => "#f"
-    case Expr.Str(s)          => "\"" + s + "\""
-    case Expr.Sym(name)       => name
-    case Expr.Lst(elems)      => "(" + elems.map(display).mkString(" ") + ")"
-    case Expr.Lambda(_, _, _) => "#<procedure>"
-
-  private def makeTopLevelEnv(): Env =
-    val env = Env(mutable.Map.empty, None)
-    val builtins = List(
-      "+",
-      "-",
-      "*",
-      "/",
-      "<",
-      ">",
-      "=",
-      "<=",
-      ">=",
-      "not",
-      "cons",
-      "car",
-      "cdr",
-      "null?",
-      "list",
-      "length",
-      "number?",
-      "string?",
-      "boolean?",
-      "pair?",
-      "symbol?",
-      "append"
-    )
-    for name <- builtins do env.define(name, Expr.Sym(name))
-    env
-
   def evalStr(input: String): String =
     val parser = SchemeParser(input)
     val exprs  = parser.parseAll()
     if exprs.isEmpty then throw EvalError("no expressions")
-    val env = makeTopLevelEnv()
+    val env = Builtins.makeTopLevelEnv()
     display(exprs.foldLeft(Expr.Bool(false): Expr)((_, e) => eval(e, env)))
 
   def evalStrWithOutput(input: String): (String, String) =
-    (evalStr(input), "")
+    val parser = SchemeParser(input)
+    val exprs  = parser.parseAll()
+    if exprs.isEmpty then throw EvalError("no expressions")
+    val env = Builtins.makeTopLevelEnv()
+    val buf = new StringBuilder
+    Builtins.outputBuffer.set(buf)
+    try
+      val result = display(exprs.foldLeft(Expr.Bool(false): Expr)((_, e) => eval(e, env)))
+      (result, buf.toString)
+    finally Builtins.outputBuffer.remove()

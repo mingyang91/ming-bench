@@ -6,6 +6,7 @@ private[ming] enum Expr:
   case Num(value: Long)
   case Bool(value: Boolean)
   case Str(value: String)
+  case Chr(value: Char)
   case Sym(name: String)
   case Lst(elems: List[Expr])
   case Lambda(params: List[String], body: List[Expr], closure: Env)
