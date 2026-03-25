@@ -678,8 +678,12 @@ public class Evaluator {
         }
 
         if (fun instanceof SchemeContinuation cont) {
-            if (args.size() != 1) throw new EvalError("continuation requires exactly 1 argument" + posStr(pos));
-            Object val = args.get(0);
+            Object val;
+            if (args.size() == 1) {
+                val = args.get(0);
+            } else {
+                val = new Continuations.SchemeValues(args);
+            }
             // Compute wind transfer thunks
             List<WindEntry> current = windStack;
             List<WindEntry> target = cont.windStack;

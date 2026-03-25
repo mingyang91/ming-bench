@@ -41,13 +41,12 @@ final class MacroExpander {
             if (matchElements(pattern, 1, form, 1, macro.literals, patVars, bindings)) {
                 Map<String, String> renames = new HashMap<>();
                 Object expanded = expandTemplate(macro.templates.get(i), bindings, ellipsisVars, patVars, renames);
-                Env macroEnv = new Env(env);
                 for (Map.Entry<String, String> entry : renames.entrySet()) {
                     try {
-                        macroEnv.define(entry.getValue(), macro.defEnv.lookup(entry.getKey()));
+                        env.define(entry.getValue(), macro.defEnv.lookup(entry.getKey()));
                     } catch (EvalError ignore) {}
                 }
-                return new Object[]{expanded, macroEnv};
+                return new Object[]{expanded, env};
             }
         }
         throw new EvalError("no matching syntax-rules pattern" + posStr(pos));
