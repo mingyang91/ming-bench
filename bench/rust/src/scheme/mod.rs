@@ -1,3 +1,4 @@
+mod builtins;
 pub mod error;
 mod parser;
 
@@ -53,8 +54,15 @@ enum Value {
     String(StringRef),
     Symbol(String),
     List(Vec<Value>),
+    Pair(Box<PairValue>),
     Procedure(Procedure),
     Void,
+}
+
+#[derive(Debug, Clone)]
+struct PairValue {
+    car: Value,
+    cdr: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +122,7 @@ impl Value {
             Self::Symbol(_) => "symbol",
             Self::List(items) if items.is_empty() => "null",
             Self::List(_) => "pair",
+            Self::Pair(_) => "pair",
             Self::Procedure(_) => "procedure",
             Self::Void => "void",
         }
@@ -142,6 +151,7 @@ impl Value {
             }
             Self::Symbol(value) => value.clone(),
             Self::List(items) => render_list(items, mode),
+            Self::Pair(pair) => render_pair(&pair.car, &pair.cdr, mode),
             Self::Procedure(_) => "#<procedure>".into(),
             Self::Void => "#<void>".into(),
         }
@@ -343,26 +353,55 @@ fn builtin_name(name: &str) -> Option<&'static str> {
         ">" => Some(">"),
         "=" => Some("="),
         "<=" => Some("<="),
+        "abs" => Some("abs"),
         "apply" => Some("apply"),
         "append" => Some("append"),
+        "assoc" => Some("assoc"),
         "boolean?" => Some("boolean?"),
+        "char-alphabetic?" => Some("char-alphabetic?"),
+        "char-downcase" => Some("char-downcase"),
+        "char-numeric?" => Some("char-numeric?"),
+        "char-upcase" => Some("char-upcase"),
+        "char=?" => Some("char=?"),
+        "char<?" => Some("char<?"),
         "char?" => Some("char?"),
         "car" => Some("car"),
         "cdr" => Some("cdr"),
         "cons" => Some("cons"),
         "display" => Some("display"),
+        "eq?" => Some("eq?"),
+        "equal?" => Some("equal?"),
+        "even?" => Some("even?"),
+        "expt" => Some("expt"),
         "length" => Some("length"),
         "list" => Some("list"),
+        "list-ref" => Some("list-ref"),
+        "list-tail" => Some("list-tail"),
+        "list?" => Some("list?"),
+        "map" => Some("map"),
+        "max" => Some("max"),
+        "min" => Some("min"),
+        "modulo" => Some("modulo"),
+        "negative?" => Some("negative?"),
         "newline" => Some("newline"),
         "number->string" => Some("number->string"),
         "not" => Some("not"),
         "null?" => Some("null?"),
         "number?" => Some("number?"),
+        "odd?" => Some("odd?"),
         "pair?" => Some("pair?"),
+        "positive?" => Some("positive?"),
+        "quotient" => Some("quotient"),
+        "remainder" => Some("remainder"),
+        "string-ci=?" => Some("string-ci=?"),
+        "string-downcase" => Some("string-downcase"),
         "string->number" => Some("string->number"),
         "string->symbol" => Some("string->symbol"),
         "string-append" => Some("string-append"),
         "string-copy" => Some("string-copy"),
+        "string-upcase" => Some("string-upcase"),
+        "string=?" => Some("string=?"),
+        "string<?" => Some("string<?"),
         "string-length" => Some("string-length"),
         "string-ref" => Some("string-ref"),
         "string-set!" => Some("string-set!"),
@@ -371,6 +410,7 @@ fn builtin_name(name: &str) -> Option<&'static str> {
         "symbol->string" => Some("symbol->string"),
         "symbol?" => Some("symbol?"),
         "write" => Some("write"),
+        "zero?" => Some("zero?"),
         _ => None,
     }
 }
@@ -793,7 +833,9 @@ fn apply(
     context: &mut EvalContext,
 ) -> Result<Value, EvalError> {
     match operator {
-        Value::Procedure(Procedure::Builtin(name)) => apply_builtin(name, args, pos, context),
+        Value::Procedure(Procedure::Builtin(name)) => {
+            builtins::apply_builtin(name, args, pos, context)
+        }
         Value::Procedure(Procedure::Lambda(lambda)) => apply_lambda(lambda, args, pos, context),
         other => Err(EvalError::NotAProcedure {
             pos,
@@ -834,119 +876,39 @@ fn apply_lambda(
     }
 
     if let Some(rest) = &lambda.params.rest {
-        env_define(&call_env, rest.clone(), Value::List(args[required_len..].to_vec()));
+        env_define(
+            &call_env,
+            rest.clone(),
+            Value::List(args[required_len..].to_vec()),
+        );
     }
 
     eval_sequence(&lambda.body, &call_env, pos, context)
 }
 
-fn apply_builtin(
-    name: &str,
+fn number_predicate<F>(
     args: &[Value],
+    name: &str,
     pos: SourcePos,
-    context: &mut EvalContext,
-) -> Result<Value, EvalError> {
-    match name {
-        "+" => add(args, pos),
-        "-" => subtract(args, pos),
-        "*" => multiply(args, pos),
-        "/" => divide(args, pos),
-        "<" => compare(name, args, pos, |left, right| left < right),
-        ">" => compare(name, args, pos, |left, right| left > right),
-        "=" => compare(name, args, pos, |left, right| left == right),
-        "<=" => compare(name, args, pos, |left, right| left <= right),
-        "apply" => builtin_apply(args, pos, context),
-        "append" => append(args, pos),
-        "boolean?" => predicate(args, "boolean?", pos, |value| {
-            matches!(value, Value::Boolean(_))
-        }),
-        "char?" => predicate(args, "char?", pos, |value| {
-            matches!(value, Value::Character(_))
-        }),
-        "car" => car(args, pos),
-        "cdr" => cdr(args, pos),
-        "cons" => cons(args, pos),
-        "display" => display(args, pos, context),
-        "length" => length(args, pos),
-        "list" => Ok(Value::List(args.to_vec())),
-        "newline" => newline(args, pos, context),
-        "number->string" => number_to_string(args, pos),
-        "not" => builtin_not(args, pos),
-        "null?" => predicate(
-            args,
-            "null?",
-            pos,
-            |value| matches!(value, Value::List(items) if items.is_empty()),
-        ),
-        "number?" => predicate(args, "number?", pos, |value| {
-            matches!(value, Value::Integer(_))
-        }),
-        "pair?" => predicate(
-            args,
-            "pair?",
-            pos,
-            |value| matches!(value, Value::List(items) if !items.is_empty()),
-        ),
-        "string->number" => string_to_number(args, pos),
-        "string->symbol" => string_to_symbol(args, pos),
-        "string-append" => string_append(args, pos),
-        "string-copy" => string_copy(args, pos),
-        "string-length" => string_length(args, pos),
-        "string-ref" => string_ref(args, pos),
-        "string-set!" => string_set(args, pos),
-        "string?" => predicate(args, "string?", pos, |value| {
-            matches!(value, Value::String(_))
-        }),
-        "substring" => substring(args, pos),
-        "symbol->string" => symbol_to_string(args, pos),
-        "symbol?" => predicate(args, "symbol?", pos, |value| {
-            matches!(value, Value::Symbol(_))
-        }),
-        "write" => write(args, pos, context),
-        _ => unreachable!("unsupported builtin: {name}"),
+    test: F,
+) -> Result<Value, EvalError>
+where
+    F: Fn(i64) -> bool,
+{
+    match args {
+        [value] => Ok(Value::Boolean(test(expect_number(name, value, pos)?))),
+        _ => Err(wrong_arg_count(pos, name, "exactly 1 argument", args.len())),
     }
 }
 
-fn add(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    let values = expect_numbers("+", args, pos)?;
-    Ok(Value::Integer(values.into_iter().sum()))
-}
-
-fn subtract(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    let values = expect_numbers("-", args, pos)?;
-    match values.as_slice() {
-        [] => Err(wrong_arg_count(pos, "-", "at least 1 argument", 0)),
-        [value] => Ok(Value::Integer(-value)),
-        [first, rest @ ..] => Ok(Value::Integer(
-            rest.iter().fold(*first, |acc, value| acc - value),
-        )),
+fn predicate<F>(args: &[Value], name: &str, pos: SourcePos, test: F) -> Result<Value, EvalError>
+where
+    F: Fn(&Value) -> bool,
+{
+    match args {
+        [value] => Ok(Value::Boolean(test(value))),
+        _ => Err(wrong_arg_count(pos, name, "exactly 1 argument", args.len())),
     }
-}
-
-fn multiply(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    let values = expect_numbers("*", args, pos)?;
-    Ok(Value::Integer(values.into_iter().product()))
-}
-
-fn divide(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    let values = expect_numbers("/", args, pos)?;
-    let (first, rest) = values
-        .split_first()
-        .ok_or_else(|| wrong_arg_count(pos, "/", "at least 2 arguments", 0))?;
-
-    if rest.is_empty() {
-        return Err(wrong_arg_count(pos, "/", "at least 2 arguments", 1));
-    }
-
-    let mut total = *first;
-    for value in rest {
-        if *value == 0 {
-            return Err(EvalError::DivisionByZero { pos });
-        }
-        total /= value;
-    }
-
-    Ok(Value::Integer(total))
 }
 
 fn compare<F>(name: &str, args: &[Value], pos: SourcePos, predicate: F) -> Result<Value, EvalError>
@@ -967,359 +929,92 @@ where
     Ok(Value::Boolean(result))
 }
 
-fn builtin_not(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    match args {
-        [value] => Ok(Value::Boolean(!value.is_truthy())),
-        _ => Err(wrong_arg_count(
-            pos,
-            "not",
-            "exactly 1 argument",
-            args.len(),
-        )),
-    }
-}
-
-fn cons(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    match args {
-        [head, Value::List(tail)] => {
-            let mut items = Vec::with_capacity(tail.len() + 1);
-            items.push(head.clone());
-            items.extend(tail.iter().cloned());
-            Ok(Value::List(items))
-        }
-        [_, other] => Err(type_mismatch(pos, "cons", "list", other.type_name())),
-        _ => Err(wrong_arg_count(
-            pos,
-            "cons",
-            "exactly 2 arguments",
-            args.len(),
-        )),
-    }
-}
-
-fn car(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    let items = expect_non_empty_list("car", args, pos)?;
-    Ok(items[0].clone())
-}
-
-fn cdr(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    let items = expect_non_empty_list("cdr", args, pos)?;
-    Ok(Value::List(items[1..].to_vec()))
-}
-
-fn append(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    let mut items = Vec::new();
-
-    for value in args {
-        let list = expect_list("append", value, pos)?;
-        items.extend(list.iter().cloned());
-    }
-
-    Ok(Value::List(items))
-}
-
-fn builtin_apply(
+fn compare_chars<F>(
+    name: &str,
     args: &[Value],
     pos: SourcePos,
-    context: &mut EvalContext,
-) -> Result<Value, EvalError> {
-    let (operator, rest) = args
-        .split_first()
-        .ok_or_else(|| wrong_arg_count(pos, "apply", "at least 2 arguments", 0))?;
-    let (list_arg, prefix_args) = rest
-        .split_last()
-        .ok_or_else(|| wrong_arg_count(pos, "apply", "at least 2 arguments", 1))?;
-
-    let list_args = expect_list("apply", list_arg, pos)?;
-    let mut expanded_args = Vec::with_capacity(prefix_args.len() + list_args.len());
-    expanded_args.extend(prefix_args.iter().cloned());
-    expanded_args.extend(list_args.iter().cloned());
-
-    apply(operator.clone(), &expanded_args, pos, context)
-}
-
-fn length(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    match args {
-        [value] => Ok(Value::Integer(
-            expect_list("length", value, pos)?.len() as i64
-        )),
-        _ => Err(wrong_arg_count(
-            pos,
-            "length",
-            "exactly 1 argument",
-            args.len(),
-        )),
-    }
-}
-
-fn display(args: &[Value], pos: SourcePos, context: &mut EvalContext) -> Result<Value, EvalError> {
-    match args {
-        [value] => {
-            context.output.push_str(&value.render_display());
-            Ok(Value::Void)
-        }
-        _ => Err(wrong_arg_count(
-            pos,
-            "display",
-            "exactly 1 argument",
-            args.len(),
-        )),
-    }
-}
-
-fn write(args: &[Value], pos: SourcePos, context: &mut EvalContext) -> Result<Value, EvalError> {
-    match args {
-        [value] => {
-            context.output.push_str(&value.render());
-            Ok(Value::Void)
-        }
-        _ => Err(wrong_arg_count(
-            pos,
-            "write",
-            "exactly 1 argument",
-            args.len(),
-        )),
-    }
-}
-
-fn newline(args: &[Value], pos: SourcePos, context: &mut EvalContext) -> Result<Value, EvalError> {
-    if !args.is_empty() {
+    predicate: F,
+) -> Result<Value, EvalError>
+where
+    F: Fn(char, char) -> bool,
+{
+    let values = expect_chars(name, args, pos)?;
+    if values.len() < 2 {
         return Err(wrong_arg_count(
             pos,
-            "newline",
-            "exactly 0 arguments",
-            args.len(),
+            name,
+            "at least 2 arguments",
+            values.len(),
         ));
     }
 
-    context.output.push('\n');
-    Ok(Value::Void)
+    let result = values.windows(2).all(|pair| predicate(pair[0], pair[1]));
+    Ok(Value::Boolean(result))
 }
 
-fn string_append(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    let mut result = String::new();
-
-    for value in args {
-        let value = expect_string("string-append", value, pos)?;
-        result.push_str(&value.borrow());
-    }
-
-    Ok(make_string_value(result))
-}
-
-fn string_copy(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    match args {
-        [value] => {
-            let value = expect_string("string-copy", value, pos)?;
-            let copy = value.borrow().clone();
-            Ok(make_string_value(copy))
-        }
-        _ => Err(wrong_arg_count(
-            pos,
-            "string-copy",
-            "exactly 1 argument",
-            args.len(),
-        )),
-    }
-}
-
-fn string_length(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    match args {
-        [value] => {
-            let value = expect_string("string-length", value, pos)?;
-            let len = value.borrow().chars().count() as i64;
-            Ok(Value::Integer(len))
-        }
-        _ => Err(wrong_arg_count(
-            pos,
-            "string-length",
-            "exactly 1 argument",
-            args.len(),
-        )),
-    }
-}
-
-fn substring(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    match args {
-        [string, start, end] => {
-            let string = expect_string("substring", string, pos)?;
-            let start = expect_non_negative_integer("substring", start, pos, "start index")?;
-            let end = expect_non_negative_integer("substring", end, pos, "end index")?;
-            let string = string.borrow();
-            let len = string.chars().count();
-
-            if start > end {
-                return Err(invalid_argument(
-                    pos,
-                    "substring",
-                    format!("start index {start} cannot exceed end index {end}"),
-                ));
-            }
-
-            if end > len {
-                return Err(invalid_argument(
-                    pos,
-                    "substring",
-                    format!("end index {end} out of range for string of length {len}"),
-                ));
-            }
-
-            let start_byte = byte_index_for_char(&string, start).unwrap_or(string.len());
-            let end_byte = byte_index_for_char(&string, end).unwrap_or(string.len());
-            Ok(make_string_value(string[start_byte..end_byte].to_string()))
-        }
-        _ => Err(wrong_arg_count(
-            pos,
-            "substring",
-            "exactly 3 arguments",
-            args.len(),
-        )),
-    }
-}
-
-fn string_to_number(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    match args {
-        [value] => {
-            let string = expect_string("string->number", value, pos)?;
-            let parsed = string.borrow().parse::<i64>();
-            Ok(match parsed {
-                Ok(number) => Value::Integer(number),
-                Err(_) => Value::Boolean(false),
-            })
-        }
-        _ => Err(wrong_arg_count(
-            pos,
-            "string->number",
-            "exactly 1 argument",
-            args.len(),
-        )),
-    }
-}
-
-fn number_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    match args {
-        [Value::Integer(number)] => Ok(make_string_value(number.to_string())),
-        [other] => Err(type_mismatch(
-            pos,
-            "number->string",
-            "number",
-            other.type_name(),
-        )),
-        _ => Err(wrong_arg_count(
-            pos,
-            "number->string",
-            "exactly 1 argument",
-            args.len(),
-        )),
-    }
-}
-
-fn symbol_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    match args {
-        [value] => Ok(make_string_value(
-            expect_symbol("symbol->string", value, pos)?.to_string(),
-        )),
-        _ => Err(wrong_arg_count(
-            pos,
-            "symbol->string",
-            "exactly 1 argument",
-            args.len(),
-        )),
-    }
-}
-
-fn string_to_symbol(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    match args {
-        [value] => {
-            let value = expect_string("string->symbol", value, pos)?;
-            let symbol = value.borrow().clone();
-            Ok(Value::Symbol(symbol))
-        }
-        _ => Err(wrong_arg_count(
-            pos,
-            "string->symbol",
-            "exactly 1 argument",
-            args.len(),
-        )),
-    }
-}
-
-fn string_ref(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    match args {
-        [string, index] => {
-            let string = expect_string("string-ref", string, pos)?;
-            let index = expect_non_negative_integer("string-ref", index, pos, "index")?;
-            let string = string.borrow();
-            let len = string.chars().count();
-
-            match string.chars().nth(index) {
-                Some(ch) => Ok(Value::Character(ch)),
-                None => Err(invalid_argument(
-                    pos,
-                    "string-ref",
-                    format!("index {index} out of range for string of length {len}"),
-                )),
-            }
-        }
-        _ => Err(wrong_arg_count(
-            pos,
-            "string-ref",
-            "exactly 2 arguments",
-            args.len(),
-        )),
-    }
-}
-
-fn string_set(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    match args {
-        [string, index, Value::Character(ch)] => {
-            let string = expect_string("string-set!", string, pos)?;
-            let index = expect_non_negative_integer("string-set!", index, pos, "index")?;
-            let mut string = string.borrow_mut();
-            let len = string.chars().count();
-
-            if index >= len {
-                return Err(invalid_argument(
-                    pos,
-                    "string-set!",
-                    format!("index {index} out of range for string of length {len}"),
-                ));
-            }
-
-            let start = byte_index_for_char(&string, index)
-                .expect("valid character index must have a byte offset");
-            let end = byte_index_for_char(&string, index + 1)
-                .expect("valid character index must have an end byte offset");
-            let replacement = ch.to_string();
-            string.replace_range(start..end, &replacement);
-            Ok(Value::Void)
-        }
-        [_, _, other] => Err(type_mismatch(pos, "string-set!", "char", other.type_name())),
-        _ => Err(wrong_arg_count(
-            pos,
-            "string-set!",
-            "exactly 3 arguments",
-            args.len(),
-        )),
-    }
-}
-
-fn predicate<F>(args: &[Value], name: &str, pos: SourcePos, test: F) -> Result<Value, EvalError>
+fn compare_strings<F>(
+    name: &str,
+    args: &[Value],
+    pos: SourcePos,
+    predicate: F,
+) -> Result<Value, EvalError>
 where
-    F: Fn(&Value) -> bool,
+    F: Fn(&str, &str) -> bool,
 {
-    match args {
-        [value] => Ok(Value::Boolean(test(value))),
-        _ => Err(wrong_arg_count(pos, name, "exactly 1 argument", args.len())),
+    let values = expect_string_values(name, args, pos)?;
+    if values.len() < 2 {
+        return Err(wrong_arg_count(
+            pos,
+            name,
+            "at least 2 arguments",
+            values.len(),
+        ));
+    }
+
+    let result = values
+        .windows(2)
+        .all(|pair| predicate(pair[0].as_str(), pair[1].as_str()));
+    Ok(Value::Boolean(result))
+}
+
+fn expect_number(name: &str, value: &Value, pos: SourcePos) -> Result<i64, EvalError> {
+    match value {
+        Value::Integer(number) => Ok(*number),
+        other => Err(type_mismatch(pos, name, "number", other.type_name())),
     }
 }
 
 fn expect_numbers(name: &str, args: &[Value], pos: SourcePos) -> Result<Vec<i64>, EvalError> {
     args.iter()
-        .map(|value| match value {
-            Value::Integer(number) => Ok(*number),
-            other => Err(type_mismatch(pos, name, "number", other.type_name())),
-        })
+        .map(|value| expect_number(name, value, pos))
+        .collect()
+}
+
+fn expect_two_numbers(name: &str, args: &[Value], pos: SourcePos) -> Result<(i64, i64), EvalError> {
+    match args {
+        [left, right] => Ok((
+            expect_number(name, left, pos)?,
+            expect_number(name, right, pos)?,
+        )),
+        _ => Err(wrong_arg_count(
+            pos,
+            name,
+            "exactly 2 arguments",
+            args.len(),
+        )),
+    }
+}
+
+fn expect_char(name: &str, value: &Value, pos: SourcePos) -> Result<char, EvalError> {
+    match value {
+        Value::Character(ch) => Ok(*ch),
+        other => Err(type_mismatch(pos, name, "char", other.type_name())),
+    }
+}
+
+fn expect_chars(name: &str, args: &[Value], pos: SourcePos) -> Result<Vec<char>, EvalError> {
+    args.iter()
+        .map(|value| expect_char(name, value, pos))
         .collect()
 }
 
@@ -1328,6 +1023,16 @@ fn expect_string(name: &str, value: &Value, pos: SourcePos) -> Result<StringRef,
         Value::String(value) => Ok(Rc::clone(value)),
         other => Err(type_mismatch(pos, name, "string", other.type_name())),
     }
+}
+
+fn expect_string_values(
+    name: &str,
+    args: &[Value],
+    pos: SourcePos,
+) -> Result<Vec<String>, EvalError> {
+    args.iter()
+        .map(|value| Ok(expect_string(name, value, pos)?.borrow().clone()))
+        .collect()
 }
 
 fn expect_symbol<'a>(name: &str, value: &'a Value, pos: SourcePos) -> Result<&'a str, EvalError> {
@@ -1361,17 +1066,32 @@ fn expect_list<'a>(name: &str, value: &'a Value, pos: SourcePos) -> Result<&'a [
     }
 }
 
-fn expect_non_empty_list<'a>(
-    name: &str,
-    args: &'a [Value],
-    pos: SourcePos,
-) -> Result<&'a [Value], EvalError> {
-    match args {
-        [value] => match value {
-            Value::List(items) if !items.is_empty() => Ok(items),
-            other => Err(type_mismatch(pos, name, "pair", other.type_name())),
-        },
-        _ => Err(wrong_arg_count(pos, name, "exactly 1 argument", args.len())),
+fn equal_value(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Boolean(left), Value::Boolean(right)) => left == right,
+        (Value::Character(left), Value::Character(right)) => left == right,
+        (Value::String(left), Value::String(right)) => *left.borrow() == *right.borrow(),
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::List(left), Value::List(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| equal_value(left, right))
+        }
+        (Value::Pair(left), Value::Pair(right)) => {
+            equal_value(&left.car, &right.car) && equal_value(&left.cdr, &right.cdr)
+        }
+        (Value::Void, Value::Void) => true,
+        (
+            Value::Procedure(Procedure::Builtin(left)),
+            Value::Procedure(Procedure::Builtin(right)),
+        ) => left == right,
+        (Value::Procedure(Procedure::Lambda(left)), Value::Procedure(Procedure::Lambda(right))) => {
+            Rc::ptr_eq(left, right)
+        }
+        _ => false,
     }
 }
 
@@ -1417,6 +1137,36 @@ fn render_list(items: &[Value], mode: RenderMode) -> String {
 
     out.push(')');
     out
+}
+
+fn render_pair(car: &Value, cdr: &Value, mode: RenderMode) -> String {
+    let mut out = String::from("(");
+    out.push_str(&car.render_with_mode(mode));
+
+    let mut tail = cdr;
+    loop {
+        match tail {
+            Value::Pair(pair) => {
+                out.push(' ');
+                out.push_str(&pair.car.render_with_mode(mode));
+                tail = &pair.cdr;
+            }
+            Value::List(items) => {
+                for value in items {
+                    out.push(' ');
+                    out.push_str(&value.render_with_mode(mode));
+                }
+                out.push(')');
+                return out;
+            }
+            other => {
+                out.push_str(" . ");
+                out.push_str(&other.render_with_mode(mode));
+                out.push(')');
+                return out;
+            }
+        }
+    }
 }
 
 fn byte_index_for_char(input: &str, char_index: usize) -> Option<usize> {
