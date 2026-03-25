@@ -250,15 +250,27 @@ func builtinListQ(args []Value) (Value, error) {
 	if len(args) != 1 {
 		return nil, &EvalError{Message: "list?: requires exactly 1 argument"}
 	}
-	cur := args[0]
+	// Tortoise and hare cycle detection
+	slow := args[0]
+	fast := args[0]
 	for {
-		switch v := cur.(type) {
-		case *NilVal:
-			return &BoolVal{Val: true}, nil
-		case *PairVal:
-			cur = v.Cdr
-		default:
-			return &BoolVal{Val: false}, nil
+		// Advance fast by 2
+		fp, ok := fast.(*PairVal)
+		if !ok {
+			_, isNil := fast.(*NilVal)
+			return &BoolVal{Val: isNil}, nil
+		}
+		fast = fp.Cdr
+		fp2, ok := fast.(*PairVal)
+		if !ok {
+			_, isNil := fast.(*NilVal)
+			return &BoolVal{Val: isNil}, nil
+		}
+		fast = fp2.Cdr
+		// Advance slow by 1
+		slow = slow.(*PairVal).Cdr
+		if slow == fast {
+			return &BoolVal{Val: false}, nil // cycle detected
 		}
 	}
 }

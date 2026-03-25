@@ -108,6 +108,8 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 			return evalCond(e, env)
 		case "let":
 			return evalLet(e, env)
+		case "let*":
+			return evalLetStar(e, env)
 		case "set!":
 			return evalSetBang(e, env)
 		case "define-syntax":
@@ -431,6 +433,8 @@ func makeGlobalEnv(out *strings.Builder) *Env {
 	env.set("cons", &BuiltinFunc{Name: "cons", Fn: builtinCons})
 	env.set("car", &BuiltinFunc{Name: "car", Fn: builtinCar})
 	env.set("cdr", &BuiltinFunc{Name: "cdr", Fn: builtinCdr})
+	env.set("set-car!", &BuiltinFunc{Name: "set-car!", Fn: builtinSetCar})
+	env.set("set-cdr!", &BuiltinFunc{Name: "set-cdr!", Fn: builtinSetCdr})
 	env.set("null?", &BuiltinFunc{Name: "null?", Fn: builtinNullQ})
 	env.set("pair?", &BuiltinFunc{Name: "pair?", Fn: builtinPairQ})
 	env.set("list", &BuiltinFunc{Name: "list", Fn: builtinList})
@@ -509,6 +513,9 @@ func makeGlobalEnv(out *strings.Builder) *Env {
 	// L14 builtins
 	registerL14Builtins(env)
 
+	// L17 builtins
+	registerL17Builtins(env)
+
 	return env
 }
 
@@ -566,12 +573,15 @@ func evalBegin(e *ListExpr, env *Env) (Value, error) {
 func evalCond(e *ListExpr, env *Env) (Value, error) {
 	for _, clause := range e.Items[1:] {
 		cl, ok := clause.(*ListExpr)
-		if !ok || len(cl.Items) < 2 {
+		if !ok || len(cl.Items) < 1 {
 			return nil, &EvalError{Message: "cond: bad clause"}
 		}
 		// Check for else
 		if sym, ok := cl.Items[0].(*SymbolExpr); ok && sym.Name == "else" {
 			body := cl.Items[1:]
+			if len(body) == 0 {
+				return &VoidVal{}, nil
+			}
 			for _, expr := range body[:len(body)-1] {
 				_, err := eval(expr, env)
 				if err != nil {
@@ -585,6 +595,9 @@ func evalCond(e *ListExpr, env *Env) (Value, error) {
 			return nil, err
 		}
 		if isTruthy(test) {
+			if len(cl.Items) == 1 {
+				return test, nil
+			}
 			body := cl.Items[1:]
 			for _, expr := range body[:len(body)-1] {
 				_, err = eval(expr, env)
@@ -670,6 +683,40 @@ func evalLet(e *ListExpr, env *Env) (Value, error) {
 	return &tailCallVal{expr: body[len(body)-1], env: childEnv}, nil
 }
 
+func evalLetStar(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Items) < 3 {
+		return nil, &EvalError{Message: "let*: requires bindings and body"}
+	}
+	bindings, ok := e.Items[1].(*ListExpr)
+	if !ok {
+		return nil, &EvalError{Message: "let*: expected bindings list"}
+	}
+	childEnv := newEnv(env)
+	for _, b := range bindings.Items {
+		bl, ok := b.(*ListExpr)
+		if !ok || len(bl.Items) != 2 {
+			return nil, &EvalError{Message: "let*: bad binding"}
+		}
+		sym, ok := bl.Items[0].(*SymbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: "let*: expected symbol in binding"}
+		}
+		val, err := eval(bl.Items[1], childEnv)
+		if err != nil {
+			return nil, err
+		}
+		childEnv.set(sym.Name, val)
+	}
+	body := e.Items[2:]
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := eval(bodyExpr, childEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &tailCallVal{expr: body[len(body)-1], env: childEnv}, nil
+}
+
 func evalSetBang(e *ListExpr, env *Env) (Value, error) {
 	if len(e.Items) != 3 {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: requires exactly 2 arguments", e.Ln, e.Cl)}
@@ -715,6 +762,30 @@ func builtinCdr(args []Value) (Value, error) {
 		return nil, &EvalError{Message: fmt.Sprintf("cdr: not a pair: %s", args[0].String())}
 	}
 	return p.Cdr, nil
+}
+
+func builtinSetCar(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, &EvalError{Message: "set-car!: requires exactly 2 arguments"}
+	}
+	p, ok := args[0].(*PairVal)
+	if !ok {
+		return nil, &EvalError{Message: "set-car!: not a pair"}
+	}
+	p.Car = args[1]
+	return &VoidVal{}, nil
+}
+
+func builtinSetCdr(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, &EvalError{Message: "set-cdr!: requires exactly 2 arguments"}
+	}
+	p, ok := args[0].(*PairVal)
+	if !ok {
+		return nil, &EvalError{Message: "set-cdr!: not a pair"}
+	}
+	p.Cdr = args[1]
+	return &VoidVal{}, nil
 }
 
 func builtinNullQ(args []Value) (Value, error) {

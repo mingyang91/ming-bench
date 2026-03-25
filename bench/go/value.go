@@ -123,12 +123,21 @@ func displayValue(v Value) string {
 	case *PairVal:
 		var buf strings.Builder
 		buf.WriteByte('(')
+		visited := map[*PairVal]bool{val: true}
 		cur := Value(val)
 		first := true
 		for {
 			p, ok := cur.(*PairVal)
 			if !ok {
 				break
+			}
+			if !first {
+				if visited[p] {
+					buf.WriteString(" . ...")
+					buf.WriteByte(')')
+					return buf.String()
+				}
+				visited[p] = true
 			}
 			if !first {
 				buf.WriteByte(' ')
@@ -162,12 +171,21 @@ func displayValue(v Value) string {
 func (v *PairVal) String() string {
 	var buf strings.Builder
 	buf.WriteByte('(')
+	visited := map[*PairVal]bool{v: true}
 	cur := Value(v)
 	first := true
 	for {
 		p, ok := cur.(*PairVal)
 		if !ok {
 			break
+		}
+		if !first {
+			if visited[p] {
+				buf.WriteString(" . ...")
+				buf.WriteByte(')')
+				return buf.String()
+			}
+			visited[p] = true
 		}
 		if !first {
 			buf.WriteByte(' ')
