@@ -2,11 +2,12 @@ package ming;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Scheme interpreter entry point.
- * This implementation is intentionally scoped to level 01.
  */
 public class Evaluator {
     /**
@@ -14,20 +15,7 @@ public class Evaluator {
      * representation of the last result.
      */
     public String evalStr(String input) throws EvalError {
-        Parser parser = new Parser(input);
-        List<Expr> expressions = parser.parseProgram();
-        if (expressions.isEmpty()) {
-            throw new EvalError("empty input");
-        }
-
-        Value result = null;
-        for (Expr expression : expressions) {
-            result = eval(expression);
-        }
-        if (result == null) {
-            throw new EvalError("empty input");
-        }
-        return format(result);
+        return format(evalProgram(input));
     }
 
     /**
@@ -35,10 +23,44 @@ public class Evaluator {
      * and any captured output from display/write/newline.
      */
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        return new EvalResult(evalStr(input), "");
+        return new EvalResult(format(evalProgram(input)), "");
     }
 
-    private Value eval(Expr expression) throws EvalError {
+    private Value evalProgram(String input) throws EvalError {
+        Parser parser = new Parser(input);
+        List<Expr> expressions = parser.parseProgram();
+        if (expressions.isEmpty()) {
+            throw new EvalError("empty input");
+        }
+
+        Environment environment = createGlobalEnvironment();
+        Value result = VoidValue.INSTANCE;
+        for (Expr expression : expressions) {
+            result = eval(expression, environment);
+        }
+        return result;
+    }
+
+    private Environment createGlobalEnvironment() {
+        Environment environment = new Environment(null);
+        environment.define("+", new BuiltinProcedure("+", this::applyAdd));
+        environment.define("-", new BuiltinProcedure("-", this::applySubtract));
+        environment.define("*", new BuiltinProcedure("*", this::applyMultiply));
+        environment.define("/", new BuiltinProcedure("/", this::applyDivide));
+        environment.define("<", new BuiltinProcedure("<", (args, pos) ->
+                BoolValue.of(compare(args, pos, Comparison.LESS_THAN))));
+        environment.define(">", new BuiltinProcedure(">", (args, pos) ->
+                BoolValue.of(compare(args, pos, Comparison.GREATER_THAN))));
+        environment.define("=", new BuiltinProcedure("=", (args, pos) ->
+                BoolValue.of(compare(args, pos, Comparison.EQUAL))));
+        environment.define("<=", new BuiltinProcedure("<=", (args, pos) ->
+                BoolValue.of(compare(args, pos, Comparison.LESS_EQUAL))));
+        environment.define("not", new BuiltinProcedure("not", (args, pos) ->
+                BoolValue.of(not(args, pos))));
+        return environment;
+    }
+
+    private Value eval(Expr expression, Environment environment) throws EvalError {
         if (expression instanceof IntExpr intExpr) {
             return new IntValue(intExpr.value());
         }
@@ -49,46 +71,139 @@ public class Evaluator {
             return new StringValue(stringExpr.value());
         }
         if (expression instanceof SymbolExpr symbolExpr) {
-            throw error("unbound variable: " + symbolExpr.name(), symbolExpr.pos());
+            return environment.lookup(symbolExpr.name(), symbolExpr.pos());
         }
         if (expression instanceof ListExpr listExpr) {
-            return evalList(listExpr);
+            return evalList(listExpr, environment);
         }
         throw new EvalError("unsupported expression");
     }
 
-    private Value evalList(ListExpr expression) throws EvalError {
+    private Value evalList(ListExpr expression, Environment environment) throws EvalError {
         List<Expr> elements = expression.elements();
         if (elements.isEmpty()) {
             throw error("cannot evaluate empty list", expression.pos());
         }
 
         Expr head = elements.getFirst();
-        if (!(head instanceof SymbolExpr symbolExpr)) {
-            throw error("first list element must be a procedure name", head.pos());
+        if (head instanceof SymbolExpr symbolExpr) {
+            List<Expr> arguments = elements.subList(1, elements.size());
+            return switch (symbolExpr.name()) {
+                case "define" -> evalDefine(arguments, environment, symbolExpr.pos());
+                case "if" -> evalIf(arguments, environment, symbolExpr.pos());
+                case "quote" -> evalQuote(arguments, symbolExpr.pos());
+                case "lambda" -> evalLambda(arguments, environment, symbolExpr.pos());
+                case "and" -> evalAnd(arguments, environment);
+                case "or" -> evalOr(arguments, environment);
+                default -> apply(eval(head, environment),
+                        evalArguments(arguments, environment), expression.pos());
+            };
         }
 
-        String name = symbolExpr.name();
-        List<Expr> arguments = elements.subList(1, elements.size());
-        return switch (name) {
-            case "and" -> evalAnd(arguments);
-            case "or" -> evalOr(arguments);
-            default -> applyBuiltin(name, evalArguments(arguments), symbolExpr.pos());
-        };
+        return apply(eval(head, environment),
+                evalArguments(elements.subList(1, elements.size()), environment),
+                expression.pos());
     }
 
-    private List<Value> evalArguments(List<Expr> arguments) throws EvalError {
+    private Value evalDefine(List<Expr> arguments, Environment environment, SourcePos pos)
+            throws EvalError {
+        if (arguments.isEmpty()) {
+            throw error("'define' expects a target and a value", pos);
+        }
+
+        Expr target = arguments.getFirst();
+        if (target instanceof SymbolExpr symbolExpr) {
+            if (arguments.size() != 2) {
+                throw error("'define' expects exactly 2 arguments", pos);
+            }
+            Value value = eval(arguments.get(1), environment);
+            environment.define(symbolExpr.name(), value);
+            return VoidValue.INSTANCE;
+        }
+
+        if (target instanceof ListExpr signatureExpr) {
+            List<Expr> signature = signatureExpr.elements();
+            if (signature.isEmpty()) {
+                throw error("function definition requires a name", target.pos());
+            }
+            if (!(signature.getFirst() instanceof SymbolExpr nameExpr)) {
+                throw error("function definition requires a symbol name", signatureExpr.pos());
+            }
+            if (arguments.size() < 2) {
+                throw error("function definition requires a body", pos);
+            }
+
+            List<String> parameters = parseParameterNames(
+                    signature.subList(1, signature.size()), signatureExpr.pos());
+            List<Expr> body = new ArrayList<>(arguments.subList(1, arguments.size()));
+            ClosureProcedure procedure = new ClosureProcedure(
+                    nameExpr.name(), parameters, body, environment);
+            environment.define(nameExpr.name(), procedure);
+            return VoidValue.INSTANCE;
+        }
+
+        throw error("'define' target must be a symbol or parameter list", target.pos());
+    }
+
+    private Value evalIf(List<Expr> arguments, Environment environment, SourcePos pos)
+            throws EvalError {
+        if (arguments.size() != 3) {
+            throw error("'if' expects exactly 3 arguments", pos);
+        }
+
+        Value condition = eval(arguments.get(0), environment);
+        if (isTruthy(condition)) {
+            return eval(arguments.get(1), environment);
+        }
+        return eval(arguments.get(2), environment);
+    }
+
+    private Value evalQuote(List<Expr> arguments, SourcePos pos) throws EvalError {
+        if (arguments.size() != 1) {
+            throw error("'quote' expects exactly 1 argument", pos);
+        }
+        return quote(arguments.getFirst());
+    }
+
+    private Value evalLambda(List<Expr> arguments, Environment environment, SourcePos pos)
+            throws EvalError {
+        if (arguments.size() < 2) {
+            throw error("'lambda' expects a parameter list and a body", pos);
+        }
+        if (!(arguments.getFirst() instanceof ListExpr parameterExpr)) {
+            throw error("'lambda' parameters must be a list", arguments.getFirst().pos());
+        }
+
+        List<String> parameters = parseParameterNames(parameterExpr.elements(), parameterExpr.pos());
+        List<Expr> body = new ArrayList<>(arguments.subList(1, arguments.size()));
+        return new ClosureProcedure(null, parameters, body, environment);
+    }
+
+    private List<String> parseParameterNames(List<Expr> parameterExprs, SourcePos pos)
+            throws EvalError {
+        List<String> parameters = new ArrayList<>(parameterExprs.size());
+        for (Expr parameterExpr : parameterExprs) {
+            if (!(parameterExpr instanceof SymbolExpr symbolExpr)) {
+                throw error("parameters must be symbols", pos);
+            }
+            parameters.add(symbolExpr.name());
+        }
+        return parameters;
+    }
+
+    private List<Value> evalArguments(List<Expr> arguments, Environment environment)
+            throws EvalError {
         List<Value> values = new ArrayList<>(arguments.size());
         for (Expr argument : arguments) {
-            values.add(eval(argument));
+            values.add(eval(argument, environment));
         }
         return values;
     }
 
-    private Value evalAnd(List<Expr> arguments) throws EvalError {
+    private Value evalAnd(List<Expr> arguments, Environment environment) throws EvalError {
         Value result = BoolValue.TRUE;
         for (Expr argument : arguments) {
-            result = eval(argument);
+            result = eval(argument, environment);
             if (!isTruthy(result)) {
                 return result;
             }
@@ -96,9 +211,9 @@ public class Evaluator {
         return result;
     }
 
-    private Value evalOr(List<Expr> arguments) throws EvalError {
+    private Value evalOr(List<Expr> arguments, Environment environment) throws EvalError {
         for (Expr argument : arguments) {
-            Value result = eval(argument);
+            Value result = eval(argument, environment);
             if (isTruthy(result)) {
                 return result;
             }
@@ -106,26 +221,50 @@ public class Evaluator {
         return BoolValue.FALSE;
     }
 
-    private Value applyBuiltin(String name, List<Value> arguments, SourcePos pos)
+    private Value apply(Value procedure, List<Value> arguments, SourcePos pos)
             throws EvalError {
-        return switch (name) {
-            case "+" -> new IntValue(sum(arguments));
-            case "-" -> new IntValue(subtract(arguments, pos));
-            case "*" -> new IntValue(product(arguments));
-            case "/" -> new IntValue(divide(arguments, pos));
-            case "<" -> BoolValue.of(compare(arguments, pos, Comparison.LESS_THAN));
-            case ">" -> BoolValue.of(compare(arguments, pos, Comparison.GREATER_THAN));
-            case "=" -> BoolValue.of(compare(arguments, pos, Comparison.EQUAL));
-            case "<=" -> BoolValue.of(compare(arguments, pos, Comparison.LESS_EQUAL));
-            case "not" -> BoolValue.of(not(arguments, pos));
-            default -> throw error("unknown procedure: " + name, pos);
-        };
+        if (procedure instanceof BuiltinProcedure builtinProcedure) {
+            return builtinProcedure.implementation().apply(arguments, pos);
+        }
+        if (procedure instanceof ClosureProcedure closureProcedure) {
+            if (arguments.size() != closureProcedure.parameters().size()) {
+                throw error("wrong number of arguments", pos);
+            }
+
+            Environment callEnvironment = new Environment(closureProcedure.environment());
+            for (int i = 0; i < closureProcedure.parameters().size(); i++) {
+                callEnvironment.define(closureProcedure.parameters().get(i), arguments.get(i));
+            }
+
+            Value result = VoidValue.INSTANCE;
+            for (Expr bodyExpr : closureProcedure.body()) {
+                result = eval(bodyExpr, callEnvironment);
+            }
+            return result;
+        }
+        throw error("not a procedure", pos);
     }
 
-    private BigInteger sum(List<Value> arguments) throws EvalError {
+    private Value applyAdd(List<Value> arguments, SourcePos pos) throws EvalError {
+        return new IntValue(sum(arguments, pos));
+    }
+
+    private Value applySubtract(List<Value> arguments, SourcePos pos) throws EvalError {
+        return new IntValue(subtract(arguments, pos));
+    }
+
+    private Value applyMultiply(List<Value> arguments, SourcePos pos) throws EvalError {
+        return new IntValue(product(arguments, pos));
+    }
+
+    private Value applyDivide(List<Value> arguments, SourcePos pos) throws EvalError {
+        return new IntValue(divide(arguments, pos));
+    }
+
+    private BigInteger sum(List<Value> arguments, SourcePos pos) throws EvalError {
         BigInteger result = BigInteger.ZERO;
         for (Value argument : arguments) {
-            result = result.add(asNumber(argument, "+"));
+            result = result.add(asNumber(argument, "+", pos));
         }
         return result;
     }
@@ -135,21 +274,21 @@ public class Evaluator {
             throw error("'-' expects at least 1 argument", pos);
         }
 
-        BigInteger result = asNumber(arguments.getFirst(), "-");
+        BigInteger result = asNumber(arguments.getFirst(), "-", pos);
         if (arguments.size() == 1) {
             return result.negate();
         }
 
         for (int i = 1; i < arguments.size(); i++) {
-            result = result.subtract(asNumber(arguments.get(i), "-"));
+            result = result.subtract(asNumber(arguments.get(i), "-", pos));
         }
         return result;
     }
 
-    private BigInteger product(List<Value> arguments) throws EvalError {
+    private BigInteger product(List<Value> arguments, SourcePos pos) throws EvalError {
         BigInteger result = BigInteger.ONE;
         for (Value argument : arguments) {
-            result = result.multiply(asNumber(argument, "*"));
+            result = result.multiply(asNumber(argument, "*", pos));
         }
         return result;
     }
@@ -159,9 +298,9 @@ public class Evaluator {
             throw error("'/' expects at least 2 arguments", pos);
         }
 
-        BigInteger result = asNumber(arguments.getFirst(), "/");
+        BigInteger result = asNumber(arguments.getFirst(), "/", pos);
         for (int i = 1; i < arguments.size(); i++) {
-            BigInteger divisor = asNumber(arguments.get(i), "/");
+            BigInteger divisor = asNumber(arguments.get(i), "/", pos);
             if (BigInteger.ZERO.equals(divisor)) {
                 throw error("division by zero", pos);
             }
@@ -176,9 +315,9 @@ public class Evaluator {
             throw error("comparison expects at least 2 arguments", pos);
         }
 
-        BigInteger left = asNumber(arguments.getFirst(), comparison.name);
+        BigInteger left = asNumber(arguments.getFirst(), comparison.name, pos);
         for (int i = 1; i < arguments.size(); i++) {
-            BigInteger right = asNumber(arguments.get(i), comparison.name);
+            BigInteger right = asNumber(arguments.get(i), comparison.name, pos);
             if (!comparison.matches(left.compareTo(right))) {
                 return false;
             }
@@ -194,11 +333,38 @@ public class Evaluator {
         return !isTruthy(arguments.getFirst());
     }
 
-    private BigInteger asNumber(Value value, String operator) throws EvalError {
+    private BigInteger asNumber(Value value, String operator, SourcePos pos) throws EvalError {
         if (value instanceof IntValue intValue) {
             return intValue.value();
         }
-        throw new EvalError("'" + operator + "' expects numeric arguments");
+        throw error("'" + operator + "' expects numeric arguments", pos);
+    }
+
+    private Value quote(Expr expression) throws EvalError {
+        if (expression instanceof IntExpr intExpr) {
+            return new IntValue(intExpr.value());
+        }
+        if (expression instanceof BoolExpr boolExpr) {
+            return BoolValue.of(boolExpr.value());
+        }
+        if (expression instanceof StringExpr stringExpr) {
+            return new StringValue(stringExpr.value());
+        }
+        if (expression instanceof SymbolExpr symbolExpr) {
+            return new SymbolValue(symbolExpr.name());
+        }
+        if (expression instanceof ListExpr listExpr) {
+            return quoteList(listExpr.elements());
+        }
+        throw new EvalError("unsupported quoted expression");
+    }
+
+    private Value quoteList(List<Expr> expressions) throws EvalError {
+        Value result = EmptyListValue.INSTANCE;
+        for (int i = expressions.size() - 1; i >= 0; i--) {
+            result = new PairValue(quote(expressions.get(i)), result);
+        }
+        return result;
     }
 
     private boolean isTruthy(Value value) {
@@ -215,7 +381,43 @@ public class Evaluator {
         if (value instanceof StringValue stringValue) {
             return "\"" + escapeString(stringValue.value()) + "\"";
         }
+        if (value instanceof SymbolValue symbolValue) {
+            return symbolValue.name();
+        }
+        if (value instanceof EmptyListValue) {
+            return "()";
+        }
+        if (value instanceof PairValue pairValue) {
+            return formatPair(pairValue);
+        }
+        if (value instanceof VoidValue) {
+            return "#<void>";
+        }
+        if (value instanceof ProcedureValue) {
+            return "#<procedure>";
+        }
         throw new IllegalStateException("unsupported runtime value");
+    }
+
+    private String formatPair(PairValue pairValue) {
+        StringBuilder builder = new StringBuilder("(");
+        Value current = pairValue;
+        boolean first = true;
+        while (current instanceof PairValue pair) {
+            if (!first) {
+                builder.append(' ');
+            }
+            builder.append(format(pair.car()));
+            current = pair.cdr();
+            first = false;
+        }
+
+        if (current instanceof EmptyListValue) {
+            builder.append(')');
+        } else {
+            builder.append(" . ").append(format(current)).append(')');
+        }
+        return builder.toString();
     }
 
     private String escapeString(String value) {
@@ -277,7 +479,17 @@ public class Evaluator {
         SourcePos pos();
     }
 
-    private sealed interface Value permits IntValue, BoolValue, StringValue {
+    private sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue,
+            EmptyListValue, PairValue, ProcedureValue, VoidValue {
+    }
+
+    private sealed interface ProcedureValue extends Value permits BuiltinProcedure,
+            ClosureProcedure {
+    }
+
+    @FunctionalInterface
+    private interface BuiltinImplementation {
+        Value apply(List<Value> arguments, SourcePos pos) throws EvalError;
     }
 
     private record IntExpr(BigInteger value, SourcePos pos) implements Expr {
@@ -310,10 +522,55 @@ public class Evaluator {
     private record StringValue(String value) implements Value {
     }
 
+    private record SymbolValue(String name) implements Value {
+    }
+
+    private record EmptyListValue() implements Value {
+        private static final EmptyListValue INSTANCE = new EmptyListValue();
+    }
+
+    private record PairValue(Value car, Value cdr) implements Value {
+    }
+
+    private record BuiltinProcedure(String name, BuiltinImplementation implementation)
+            implements ProcedureValue {
+    }
+
+    private record ClosureProcedure(String name, List<String> parameters, List<Expr> body,
+                                    Environment environment) implements ProcedureValue {
+    }
+
+    private record VoidValue() implements Value {
+        private static final VoidValue INSTANCE = new VoidValue();
+    }
+
     private record SourcePos(int line, int column) {
         @Override
         public String toString() {
             return line + ":" + column;
+        }
+    }
+
+    private static final class Environment {
+        private final Environment parent;
+        private final Map<String, Value> bindings = new HashMap<>();
+
+        private Environment(Environment parent) {
+            this.parent = parent;
+        }
+
+        private void define(String name, Value value) {
+            bindings.put(name, value);
+        }
+
+        private Value lookup(String name, SourcePos pos) throws EvalError {
+            if (bindings.containsKey(name)) {
+                return bindings.get(name);
+            }
+            if (parent != null) {
+                return parent.lookup(name, pos);
+            }
+            throw new EvalError("unbound variable: " + name + " at " + pos);
         }
     }
 
