@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+	"unsafe"
 )
 
 type Env struct {
@@ -177,6 +178,37 @@ func makeGlobalEnv() *Env {
 	env.Set("vector?", &Value{Type: TypeSymbol, StrVal: "builtin:vector?"})
 	env.Set("vector->list", &Value{Type: TypeSymbol, StrVal: "builtin:vector->list"})
 	env.Set("list->vector", &Value{Type: TypeSymbol, StrVal: "builtin:list->vector"})
+
+	// Pair mutation (L17)
+	env.Set("set-car!", &Value{Type: TypeSymbol, StrVal: "builtin:set-car!"})
+	env.Set("set-cdr!", &Value{Type: TypeSymbol, StrVal: "builtin:set-cdr!"})
+
+	// Missing list operations (L17)
+	env.Set("for-each", &Value{Type: TypeSymbol, StrVal: "builtin:for-each"})
+	env.Set("reverse", &Value{Type: TypeSymbol, StrVal: "builtin:reverse"})
+	env.Set("member", &Value{Type: TypeSymbol, StrVal: "builtin:member"})
+	env.Set("assv", &Value{Type: TypeSymbol, StrVal: "builtin:assv"})
+	env.Set("error", &Value{Type: TypeSymbol, StrVal: "builtin:error"})
+
+	// cxr combinations
+	env.Set("caar", &Value{Type: TypeSymbol, StrVal: "builtin:caar"})
+	env.Set("cadr", &Value{Type: TypeSymbol, StrVal: "builtin:cadr"})
+	env.Set("cdar", &Value{Type: TypeSymbol, StrVal: "builtin:cdar"})
+	env.Set("cddr", &Value{Type: TypeSymbol, StrVal: "builtin:cddr"})
+	env.Set("caddr", &Value{Type: TypeSymbol, StrVal: "builtin:caddr"})
+
+	// Missing math (L17)
+	env.Set("gcd", &Value{Type: TypeSymbol, StrVal: "builtin:gcd"})
+	env.Set("lcm", &Value{Type: TypeSymbol, StrVal: "builtin:lcm"})
+	env.Set("truncate", &Value{Type: TypeSymbol, StrVal: "builtin:truncate"})
+	env.Set("round", &Value{Type: TypeSymbol, StrVal: "builtin:round"})
+
+	// Missing string ops (L17)
+	env.Set("make-string", &Value{Type: TypeSymbol, StrVal: "builtin:make-string"})
+	env.Set("string", &Value{Type: TypeSymbol, StrVal: "builtin:string"})
+	env.Set("string>?", &Value{Type: TypeSymbol, StrVal: "builtin:string>?"})
+	env.Set("string<=?", &Value{Type: TypeSymbol, StrVal: "builtin:string<=?"})
+	env.Set("string>=?", &Value{Type: TypeSymbol, StrVal: "builtin:string>=?"})
 
 	return env
 }
@@ -857,11 +889,29 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 		if len(args) != 1 {
 			return nil, fmt.Errorf("%d:%d: 'list?' expects 1 argument", line, col)
 		}
-		cur := args[0]
-		for cur.Type == TypePair {
-			cur = cur.Cdr
+		// Tortoise-and-hare cycle detection
+		slow := args[0]
+		fast := args[0]
+		for {
+			if fast.Type == TypeNull {
+				return True, nil
+			}
+			if fast.Type != TypePair {
+				return False, nil
+			}
+			fast = fast.Cdr
+			if fast.Type == TypeNull {
+				return True, nil
+			}
+			if fast.Type != TypePair {
+				return False, nil
+			}
+			fast = fast.Cdr
+			slow = slow.Cdr
+			if slow == fast {
+				return False, nil // cycle detected
+			}
 		}
-		return BoolValue(cur.Type == TypeNull), nil
 
 	case "builtin:list-ref":
 		if len(args) != 2 || args[1].Type != TypeInteger {
@@ -1134,12 +1184,282 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 			cur = cur.Cdr
 		}
 		return VectorVal(elems), nil
+
+	// Pair mutation (L17)
+	case "builtin:set-car!":
+		if len(args) != 2 || args[0].Type != TypePair {
+			return nil, fmt.Errorf("%d:%d: 'set-car!' expects a pair and a value", line, col)
+		}
+		args[0].Car = args[1]
+		return Void, nil
+
+	case "builtin:set-cdr!":
+		if len(args) != 2 || args[0].Type != TypePair {
+			return nil, fmt.Errorf("%d:%d: 'set-cdr!' expects a pair and a value", line, col)
+		}
+		args[0].Cdr = args[1]
+		return Void, nil
+
+	// for-each (L17)
+	case "builtin:for-each":
+		if len(args) < 2 {
+			return nil, fmt.Errorf("%d:%d: 'for-each' requires a procedure and at least one list", line, col)
+		}
+		fn := args[0]
+		lists := make([]*Value, len(args)-1)
+		copy(lists, args[1:])
+		for {
+			allPairs := true
+			for _, l := range lists {
+				if l.Type != TypePair {
+					allPairs = false
+					break
+				}
+			}
+			if !allPairs {
+				break
+			}
+			callArgs := make([]*Value, len(lists))
+			for i, l := range lists {
+				callArgs[i] = l.Car
+			}
+			var err error
+			if fn.Type == TypeSymbol && len(fn.StrVal) > 8 && fn.StrVal[:8] == "builtin:" {
+				_, err = callBuiltin(fn.StrVal, callArgs, env, line, col)
+			} else if fn.Type == TypeLambda {
+				_, err = callLambda(fn, callArgs, line, col)
+			} else if fn.Type == TypeCaseLambda {
+				_, err = callCaseLambda(fn, callArgs, line, col)
+			} else if fn.Type == TypeGoFunc {
+				_, err = fn.GoFunc(callArgs)
+			} else {
+				return nil, fmt.Errorf("%d:%d: 'for-each' first argument must be a procedure", line, col)
+			}
+			if err != nil {
+				return nil, err
+			}
+			for i, l := range lists {
+				lists[i] = l.Cdr
+			}
+		}
+		return Void, nil
+
+	case "builtin:reverse":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("%d:%d: 'reverse' expects 1 argument", line, col)
+		}
+		result := Null
+		cur := args[0]
+		for cur.Type == TypePair {
+			result = PairValue(cur.Car, result)
+			cur = cur.Cdr
+		}
+		return result, nil
+
+	case "builtin:member":
+		if len(args) != 2 {
+			return nil, fmt.Errorf("%d:%d: 'member' expects 2 arguments", line, col)
+		}
+		cur := args[1]
+		for cur.Type == TypePair {
+			if valuesEqual(args[0], cur.Car) {
+				return cur, nil
+			}
+			cur = cur.Cdr
+		}
+		return False, nil
+
+	case "builtin:assv":
+		if len(args) != 2 {
+			return nil, fmt.Errorf("%d:%d: 'assv' expects 2 arguments", line, col)
+		}
+		cur := args[1]
+		for cur.Type == TypePair {
+			pair := cur.Car
+			if pair.Type == TypePair && valuesEqv(args[0], pair.Car) {
+				return pair, nil
+			}
+			cur = cur.Cdr
+		}
+		return False, nil
+
+	case "builtin:error":
+		if len(args) == 0 {
+			return nil, fmt.Errorf("error")
+		}
+		msg := args[0].DisplayStr()
+		if len(args) > 1 {
+			parts := make([]string, len(args)-1)
+			for i, a := range args[1:] {
+				parts[i] = a.Display()
+			}
+			msg += " " + strings.Join(parts, " ")
+		}
+		return nil, fmt.Errorf("%s", msg)
+
+	// cxr combinations
+	case "builtin:caar":
+		if len(args) != 1 || args[0].Type != TypePair || args[0].Car.Type != TypePair {
+			return nil, fmt.Errorf("%d:%d: 'caar' expects a pair", line, col)
+		}
+		return args[0].Car.Car, nil
+	case "builtin:cadr":
+		if len(args) != 1 || args[0].Type != TypePair || args[0].Cdr.Type != TypePair {
+			return nil, fmt.Errorf("%d:%d: 'cadr' expects a pair", line, col)
+		}
+		return args[0].Cdr.Car, nil
+	case "builtin:cdar":
+		if len(args) != 1 || args[0].Type != TypePair || args[0].Car.Type != TypePair {
+			return nil, fmt.Errorf("%d:%d: 'cdar' expects a pair", line, col)
+		}
+		return args[0].Car.Cdr, nil
+	case "builtin:cddr":
+		if len(args) != 1 || args[0].Type != TypePair || args[0].Cdr.Type != TypePair {
+			return nil, fmt.Errorf("%d:%d: 'cddr' expects a pair", line, col)
+		}
+		return args[0].Cdr.Cdr, nil
+	case "builtin:caddr":
+		if len(args) != 1 || args[0].Type != TypePair || args[0].Cdr.Type != TypePair || args[0].Cdr.Cdr.Type != TypePair {
+			return nil, fmt.Errorf("%d:%d: 'caddr' expects a pair", line, col)
+		}
+		return args[0].Cdr.Cdr.Car, nil
+
+	// Math (L17)
+	case "builtin:gcd":
+		if len(args) == 0 {
+			return IntValue(0), nil
+		}
+		for _, a := range args {
+			if !isNumeric(a) {
+				return nil, fmt.Errorf("%d:%d: 'gcd' expects integers", line, col)
+			}
+		}
+		result := toInt64(args[0])
+		if result < 0 {
+			result = -result
+		}
+		for _, a := range args[1:] {
+			b := toInt64(a)
+			if b < 0 {
+				b = -b
+			}
+			result = gcd(result, b)
+		}
+		return IntValue(result), nil
+
+	case "builtin:lcm":
+		if len(args) == 0 {
+			return IntValue(1), nil
+		}
+		for _, a := range args {
+			if !isNumeric(a) {
+				return nil, fmt.Errorf("%d:%d: 'lcm' expects integers", line, col)
+			}
+		}
+		result := toInt64(args[0])
+		if result < 0 {
+			result = -result
+		}
+		for _, a := range args[1:] {
+			b := toInt64(a)
+			if b < 0 {
+				b = -b
+			}
+			if result == 0 || b == 0 {
+				result = 0
+			} else {
+				result = result / gcd(result, b) * b
+			}
+		}
+		return IntValue(result), nil
+
+	case "builtin:truncate":
+		if len(args) != 1 || !isNumeric(args[0]) {
+			return nil, fmt.Errorf("%d:%d: 'truncate' expects a number", line, col)
+		}
+		switch args[0].Type {
+		case TypeInteger:
+			return args[0], nil
+		case TypeFloat:
+			v := args[0].FloatVal
+			if v >= 0 {
+				return IntValue(int64(v)), nil
+			}
+			return IntValue(int64(v)), nil
+		default:
+			return IntValue(args[0].Num / args[0].Den), nil
+		}
+
+	case "builtin:round":
+		if len(args) != 1 || !isNumeric(args[0]) {
+			return nil, fmt.Errorf("%d:%d: 'round' expects a number", line, col)
+		}
+		switch args[0].Type {
+		case TypeInteger:
+			return args[0], nil
+		case TypeFloat:
+			v := args[0].FloatVal
+			return IntValue(int64(v + 0.5)), nil
+		default:
+			return IntValue((args[0].Num + args[0].Den/2) / args[0].Den), nil
+		}
+
+	// String constructors (L17)
+	case "builtin:make-string":
+		if len(args) < 1 || len(args) > 2 || args[0].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'make-string' expects length and optional char", line, col)
+		}
+		n := int(args[0].IntVal)
+		ch := ' '
+		if len(args) == 2 && args[1].Type == TypeChar {
+			ch = args[1].CharVal
+		}
+		return &Value{Type: TypeString, StrVal: strings.Repeat(string(ch), n), Mutable: true}, nil
+
+	case "builtin:string":
+		var sb strings.Builder
+		for _, a := range args {
+			if a.Type != TypeChar {
+				return nil, fmt.Errorf("%d:%d: 'string' expects characters", line, col)
+			}
+			sb.WriteRune(a.CharVal)
+		}
+		return &Value{Type: TypeString, StrVal: sb.String(), Mutable: true}, nil
+
+	case "builtin:string>?":
+		if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeString {
+			return nil, fmt.Errorf("%d:%d: 'string>?' expects two strings", line, col)
+		}
+		return BoolValue(args[0].StrVal > args[1].StrVal), nil
+
+	case "builtin:string<=?":
+		if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeString {
+			return nil, fmt.Errorf("%d:%d: 'string<=?' expects two strings", line, col)
+		}
+		return BoolValue(args[0].StrVal <= args[1].StrVal), nil
+
+	case "builtin:string>=?":
+		if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeString {
+			return nil, fmt.Errorf("%d:%d: 'string>=?' expects two strings", line, col)
+		}
+		return BoolValue(args[0].StrVal >= args[1].StrVal), nil
 	}
 
 	return nil, fmt.Errorf("%d:%d: unknown builtin %s", line, col, name)
 }
 
+func ptrOf(v *Value) uintptr {
+	return uintptr(unsafe.Pointer(v))
+}
+
 func valuesEqual(a, b *Value) bool {
+	return valuesEqualSeen(a, b, make(map[[2]uintptr]bool))
+}
+
+func valuesEqualSeen(a, b *Value, seen map[[2]uintptr]bool) bool {
+	if a == b {
+		return true
+	}
 	// Numeric cross-type comparison
 	if isNumeric(a) && isNumeric(b) {
 		return numericEqual(a, b)
@@ -1159,13 +1479,18 @@ func valuesEqual(a, b *Value) bool {
 	case TypeNull:
 		return true
 	case TypePair:
-		return valuesEqual(a.Car, b.Car) && valuesEqual(a.Cdr, b.Cdr)
+		key := [2]uintptr{uintptr(ptrOf(a)), uintptr(ptrOf(b))}
+		if seen[key] {
+			return true // assume equal for cycles
+		}
+		seen[key] = true
+		return valuesEqualSeen(a.Car, b.Car, seen) && valuesEqualSeen(a.Cdr, b.Cdr, seen)
 	case TypeVector:
 		if len(a.VecElems) != len(b.VecElems) {
 			return false
 		}
 		for i := range a.VecElems {
-			if !valuesEqual(a.VecElems[i], b.VecElems[i]) {
+			if !valuesEqualSeen(a.VecElems[i], b.VecElems[i], seen) {
 				return false
 			}
 		}

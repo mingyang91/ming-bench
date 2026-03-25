@@ -209,6 +209,8 @@ func displayListUnquoted(v *Value) string {
 	sb.WriteByte('(')
 	cur := v
 	first := true
+	seen := make(map[*Value]bool)
+	seen[v] = true
 	for cur.Type == TypePair {
 		if !first {
 			sb.WriteByte(' ')
@@ -216,8 +218,13 @@ func displayListUnquoted(v *Value) string {
 		first = false
 		sb.WriteString(cur.Car.DisplayStr())
 		cur = cur.Cdr
+		if cur.Type == TypePair && seen[cur] {
+			sb.WriteString(" ...")
+			break
+		}
+		seen[cur] = true
 	}
-	if cur.Type != TypeNull {
+	if cur.Type != TypeNull && cur.Type != TypePair {
 		sb.WriteString(" . ")
 		sb.WriteString(cur.DisplayStr())
 	}
@@ -230,6 +237,8 @@ func writeList(v *Value) string {
 	sb.WriteByte('(')
 	cur := v
 	first := true
+	seen := make(map[*Value]bool)
+	seen[v] = true
 	for cur.Type == TypePair {
 		if !first {
 			sb.WriteByte(' ')
@@ -237,8 +246,13 @@ func writeList(v *Value) string {
 		first = false
 		sb.WriteString(cur.Car.WriteRepr())
 		cur = cur.Cdr
+		if cur.Type == TypePair && seen[cur] {
+			sb.WriteString(" ...")
+			break
+		}
+		seen[cur] = true
 	}
-	if cur.Type != TypeNull {
+	if cur.Type != TypeNull && cur.Type != TypePair {
 		sb.WriteString(" . ")
 		sb.WriteString(cur.WriteRepr())
 	}
@@ -251,6 +265,8 @@ func displayList(v *Value) string {
 	sb.WriteByte('(')
 	cur := v
 	first := true
+	seen := make(map[*Value]bool)
+	seen[v] = true
 	for cur.Type == TypePair {
 		if !first {
 			sb.WriteByte(' ')
@@ -258,8 +274,13 @@ func displayList(v *Value) string {
 		first = false
 		sb.WriteString(cur.Car.Display())
 		cur = cur.Cdr
+		if cur.Type == TypePair && seen[cur] {
+			sb.WriteString(" ...")
+			break
+		}
+		seen[cur] = true
 	}
-	if cur.Type != TypeNull {
+	if cur.Type != TypeNull && cur.Type != TypePair {
 		sb.WriteString(" . ")
 		sb.WriteString(cur.Display())
 	}

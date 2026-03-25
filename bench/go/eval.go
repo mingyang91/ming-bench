@@ -175,7 +175,7 @@ func Eval(expr *Expr, env *Env) (*Value, error) {
 				case "cond":
 					found := false
 					for _, clause := range expr.Elements[1:] {
-						if clause.Type != ExprList || len(clause.Elements) < 2 {
+						if clause.Type != ExprList || len(clause.Elements) < 1 {
 							return nil, fmt.Errorf("%d:%d: invalid cond clause", expr.Line, expr.Col)
 						}
 						isElse := clause.Elements[0].Type == ExprSymbol && clause.Elements[0].StrVal == "else"
@@ -186,6 +186,9 @@ func Eval(expr *Expr, env *Env) (*Value, error) {
 							}
 							if !isTruthy(test) {
 								continue
+							}
+							if len(clause.Elements) == 1 {
+								return test, nil
 							}
 						}
 						// Matched — evaluate body with TCO on last
@@ -261,6 +264,40 @@ func Eval(expr *Expr, env *Env) (*Value, error) {
 					expr = body[len(body)-1]
 					env = letEnv
 					continue
+
+
+			case "let*":
+				if len(expr.Elements) < 3 {
+					return nil, fmt.Errorf("%d:%d: 'let*' requires bindings and body", expr.Line, expr.Col)
+				}
+				bindingsExpr := expr.Elements[1]
+				if bindingsExpr.Type != ExprList {
+					return nil, fmt.Errorf("%d:%d: 'let*' bindings must be a list", expr.Line, expr.Col)
+				}
+				letEnv := NewEnv(env)
+				for _, binding := range bindingsExpr.Elements {
+					if binding.Type != ExprList || len(binding.Elements) != 2 {
+						return nil, fmt.Errorf("%d:%d: invalid let* binding", expr.Line, expr.Col)
+					}
+					if binding.Elements[0].Type != ExprSymbol {
+						return nil, fmt.Errorf("%d:%d: let* binding name must be a symbol", expr.Line, expr.Col)
+					}
+					val, err := Eval(binding.Elements[1], letEnv)
+					if err != nil {
+						return nil, err
+					}
+					letEnv.Set(binding.Elements[0].StrVal, val)
+				}
+				body := expr.Elements[2:]
+				for _, bodyExpr := range body[:len(body)-1] {
+					_, err := Eval(bodyExpr, letEnv)
+					if err != nil {
+						return nil, err
+					}
+				}
+				expr = body[len(body)-1]
+				env = letEnv
+				continue
 
 				case "letrec":
 					if len(expr.Elements) < 3 {

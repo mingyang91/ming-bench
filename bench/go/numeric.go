@@ -75,6 +75,19 @@ func toRational(v *Value) (int64, int64) {
 	panic("toRational on non-exact")
 }
 
+// toInt64 converts any numeric value to int64.
+func toInt64(v *Value) int64 {
+	switch v.Type {
+	case TypeInteger:
+		return v.IntVal
+	case TypeRational:
+		return v.Num / v.Den
+	case TypeFloat:
+		return int64(v.FloatVal)
+	}
+	return 0
+}
+
 // hasFloat returns true if any value is a float.
 func hasFloat(args []*Value) bool {
 	for _, a := range args {
