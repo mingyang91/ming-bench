@@ -3,6 +3,7 @@ package ming;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -89,8 +90,38 @@ public class Evaluator {
         installBuiltin(env, "char?", this::builtinCharPredicate);
         installBuiltin(env, "pair?", this::builtinPairPredicate);
         installBuiltin(env, "symbol?", this::builtinSymbolPredicate);
+        installBuiltin(env, "eq?", this::builtinEq);
+        installBuiltin(env, "equal?", this::builtinEqual);
         installBuiltin(env, "not", this::builtinNot);
         installBuiltin(env, "apply", this::builtinApply);
+        installBuiltin(env, "map", this::builtinMap);
+        installBuiltin(env, "abs", this::builtinAbs);
+        installBuiltin(env, "modulo", this::builtinModulo);
+        installBuiltin(env, "remainder", this::builtinRemainder);
+        installBuiltin(env, "quotient", this::builtinQuotient);
+        installBuiltin(env, "min", this::builtinMin);
+        installBuiltin(env, "max", this::builtinMax);
+        installBuiltin(env, "expt", this::builtinExpt);
+        installBuiltin(env, "zero?", this::builtinZeroPredicate);
+        installBuiltin(env, "positive?", this::builtinPositivePredicate);
+        installBuiltin(env, "negative?", this::builtinNegativePredicate);
+        installBuiltin(env, "odd?", this::builtinOddPredicate);
+        installBuiltin(env, "even?", this::builtinEvenPredicate);
+        installBuiltin(env, "list?", this::builtinListPredicate);
+        installBuiltin(env, "list-ref", this::builtinListRef);
+        installBuiltin(env, "list-tail", this::builtinListTail);
+        installBuiltin(env, "assoc", this::builtinAssoc);
+        installBuiltin(env, "char-alphabetic?", this::builtinCharAlphabeticPredicate);
+        installBuiltin(env, "char-numeric?", this::builtinCharNumericPredicate);
+        installBuiltin(env, "char-upcase", this::builtinCharUpcase);
+        installBuiltin(env, "char-downcase", this::builtinCharDowncase);
+        installBuiltin(env, "char=?", this::builtinCharEquals);
+        installBuiltin(env, "char<?", this::builtinCharLessThan);
+        installBuiltin(env, "string=?", this::builtinStringEquals);
+        installBuiltin(env, "string<?", this::builtinStringLessThan);
+        installBuiltin(env, "string-ci=?", this::builtinStringCaseInsensitiveEquals);
+        installBuiltin(env, "string-upcase", this::builtinStringUpcase);
+        installBuiltin(env, "string-downcase", this::builtinStringDowncase);
         return env;
     }
 
@@ -656,6 +687,16 @@ public class Evaluator {
         return boolValue(arguments.get(0).value() instanceof SymbolValue);
     }
 
+    private Value builtinEq(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 2, "eq?", callPos);
+        return boolValue(eqValues(arguments.get(0).value(), arguments.get(1).value()));
+    }
+
+    private Value builtinEqual(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 2, "equal?", callPos);
+        return boolValue(equalValues(arguments.get(0).value(), arguments.get(1).value()));
+    }
+
     private Value builtinApply(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
         if (arguments.size() < 2) {
             throw errorAt(callPos, "wrong argument count for apply");
@@ -670,12 +711,60 @@ public class Evaluator {
         return apply(operator.value(), operator.pos(), expandedArguments, callPos);
     }
 
+    private Value builtinMap(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        if (arguments.size() < 2) {
+            throw errorAt(callPos, "wrong argument count for map");
+        }
+
+        LocatedValue operator = arguments.get(0);
+        List<LocatedValue> listArguments = arguments.subList(1, arguments.size());
+        List<Value> cursors = new ArrayList<>(listArguments.size());
+        for (LocatedValue listArgument : listArguments) {
+            cursors.add(listArgument.value());
+        }
+
+        List<Value> results = new ArrayList<>();
+        while (true) {
+            int emptyCount = 0;
+            for (int i = 0; i < cursors.size(); i++) {
+                Value current = cursors.get(i);
+                if (current instanceof EmptyListValue) {
+                    emptyCount++;
+                    continue;
+                }
+                if (!(current instanceof PairValue)) {
+                    throw errorAt(listArguments.get(i).pos(), "expected list for map");
+                }
+            }
+
+            if (emptyCount > 0) {
+                if (emptyCount != cursors.size()) {
+                    throw errorAt(callPos, "expected lists of equal length for map");
+                }
+                return buildListFromValues(results);
+            }
+
+            List<LocatedValue> mappedArguments = new ArrayList<>(cursors.size());
+            for (int i = 0; i < cursors.size(); i++) {
+                PairValue pair = (PairValue) cursors.get(i);
+                mappedArguments.add(new LocatedValue(pair.car(), listArguments.get(i).pos()));
+                cursors.set(i, pair.cdr());
+            }
+            results.add(apply(operator.value(), operator.pos(), mappedArguments, callPos));
+        }
+    }
+
     private Value builtinAdd(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
         long total = 0L;
         for (LocatedValue argument : arguments) {
             total += requireInt(argument, "+");
         }
         return new IntValue(total);
+    }
+
+    private Value builtinAbs(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 1, "abs", callPos);
+        return new IntValue(Math.abs(requireInt(arguments.get(0), "abs")));
     }
 
     private Value builtinSubtract(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
@@ -692,6 +781,106 @@ public class Evaluator {
             result -= requireInt(arguments.get(i), "-");
         }
         return new IntValue(result);
+    }
+
+    private Value builtinModulo(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 2, "modulo", callPos);
+        long dividend = requireInt(arguments.get(0), "modulo");
+        long divisor = requireNonZeroDivisor(arguments.get(1), "modulo");
+        long remainder = dividend % divisor;
+        if (remainder != 0 && ((remainder < 0) != (divisor < 0))) {
+            remainder += divisor;
+        }
+        return new IntValue(remainder);
+    }
+
+    private Value builtinRemainder(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 2, "remainder", callPos);
+        long dividend = requireInt(arguments.get(0), "remainder");
+        long divisor = requireNonZeroDivisor(arguments.get(1), "remainder");
+        return new IntValue(dividend % divisor);
+    }
+
+    private Value builtinQuotient(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 2, "quotient", callPos);
+        long dividend = requireInt(arguments.get(0), "quotient");
+        long divisor = requireNonZeroDivisor(arguments.get(1), "quotient");
+        return new IntValue(dividend / divisor);
+    }
+
+    private Value builtinMin(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        if (arguments.isEmpty()) {
+            throw errorAt(callPos, "wrong argument count for min");
+        }
+
+        long result = requireInt(arguments.get(0), "min");
+        for (int i = 1; i < arguments.size(); i++) {
+            result = Math.min(result, requireInt(arguments.get(i), "min"));
+        }
+        return new IntValue(result);
+    }
+
+    private Value builtinMax(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        if (arguments.isEmpty()) {
+            throw errorAt(callPos, "wrong argument count for max");
+        }
+
+        long result = requireInt(arguments.get(0), "max");
+        for (int i = 1; i < arguments.size(); i++) {
+            result = Math.max(result, requireInt(arguments.get(i), "max"));
+        }
+        return new IntValue(result);
+    }
+
+    private Value builtinExpt(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 2, "expt", callPos);
+        long base = requireInt(arguments.get(0), "expt");
+        long exponent = requireInt(arguments.get(1), "expt");
+        if (exponent < 0) {
+            throw errorAt(arguments.get(1).pos(), "expected non-negative integer for expt");
+        }
+
+        long result = 1L;
+        long factor = base;
+        long power = exponent;
+        while (power > 0) {
+            if ((power & 1L) != 0L) {
+                result *= factor;
+            }
+            factor *= factor;
+            power >>= 1;
+        }
+        return new IntValue(result);
+    }
+
+    private Value builtinZeroPredicate(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "zero?", callPos);
+        return boolValue(requireInt(arguments.get(0), "zero?") == 0L);
+    }
+
+    private Value builtinPositivePredicate(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "positive?", callPos);
+        return boolValue(requireInt(arguments.get(0), "positive?") > 0L);
+    }
+
+    private Value builtinNegativePredicate(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "negative?", callPos);
+        return boolValue(requireInt(arguments.get(0), "negative?") < 0L);
+    }
+
+    private Value builtinOddPredicate(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "odd?", callPos);
+        return boolValue((requireInt(arguments.get(0), "odd?") & 1L) != 0L);
+    }
+
+    private Value builtinEvenPredicate(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "even?", callPos);
+        return boolValue((requireInt(arguments.get(0), "even?") & 1L) == 0L);
     }
 
     private Value builtinMultiply(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
@@ -735,6 +924,193 @@ public class Evaluator {
         return TRUE_VALUE;
     }
 
+    private Value builtinListPredicate(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "list?", callPos);
+        return boolValue(isProperList(arguments.get(0).value()));
+    }
+
+    private Value builtinListRef(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 2, "list-ref", callPos);
+        int index = requireNonNegativeIndex(arguments.get(1), "list-ref");
+        Value current = arguments.get(0).value();
+        for (int i = 0; ; i++) {
+            if (current instanceof PairValue(Value car, Value cdr)) {
+                if (i == index) {
+                    return car;
+                }
+                current = cdr;
+                continue;
+            }
+            if (current instanceof EmptyListValue) {
+                throw errorAt(arguments.get(1).pos(), "index out of range for list-ref");
+            }
+            throw errorAt(arguments.get(0).pos(), "expected list for list-ref");
+        }
+    }
+
+    private Value builtinListTail(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 2, "list-tail", callPos);
+        int index = requireNonNegativeIndex(arguments.get(1), "list-tail");
+        Value current = arguments.get(0).value();
+        for (int i = 0; i < index; i++) {
+            if (current instanceof PairValue(Value ignoredCar, Value cdr)) {
+                current = cdr;
+                continue;
+            }
+            if (current instanceof EmptyListValue) {
+                throw errorAt(arguments.get(1).pos(), "index out of range for list-tail");
+            }
+            throw errorAt(arguments.get(0).pos(), "expected list for list-tail");
+        }
+        if (current instanceof PairValue || current instanceof EmptyListValue) {
+            return current;
+        }
+        throw errorAt(arguments.get(0).pos(), "expected list for list-tail");
+    }
+
+    private Value builtinAssoc(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 2, "assoc", callPos);
+        Value key = arguments.get(0).value();
+        Value current = arguments.get(1).value();
+        while (current instanceof PairValue(Value entry, Value rest)) {
+            if (!(entry instanceof PairValue pair)) {
+                throw errorAt(arguments.get(1).pos(), "expected association list for assoc");
+            }
+            if (equalValues(key, pair.car())) {
+                return entry;
+            }
+            current = rest;
+        }
+        if (current instanceof EmptyListValue) {
+            return FALSE_VALUE;
+        }
+        throw errorAt(arguments.get(1).pos(), "expected association list for assoc");
+    }
+
+    private Value builtinCharAlphabeticPredicate(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "char-alphabetic?", callPos);
+        return boolValue(Character.isLetter(requireChar(arguments.get(0), "char-alphabetic?")));
+    }
+
+    private Value builtinCharNumericPredicate(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "char-numeric?", callPos);
+        return boolValue(Character.isDigit(requireChar(arguments.get(0), "char-numeric?")));
+    }
+
+    private Value builtinCharUpcase(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "char-upcase", callPos);
+        return new CharValue(Character.toUpperCase(requireChar(arguments.get(0), "char-upcase")));
+    }
+
+    private Value builtinCharDowncase(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "char-downcase", callPos);
+        return new CharValue(Character.toLowerCase(requireChar(arguments.get(0), "char-downcase")));
+    }
+
+    private Value builtinCharEquals(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        if (arguments.size() < 2) {
+            throw errorAt(callPos, "wrong argument count for char=?");
+        }
+
+        char left = requireChar(arguments.get(0), "char=?");
+        for (int i = 1; i < arguments.size(); i++) {
+            char right = requireChar(arguments.get(i), "char=?");
+            if (left != right) {
+                return FALSE_VALUE;
+            }
+            left = right;
+        }
+        return TRUE_VALUE;
+    }
+
+    private Value builtinCharLessThan(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        if (arguments.size() < 2) {
+            throw errorAt(callPos, "wrong argument count for char<?");
+        }
+
+        char left = requireChar(arguments.get(0), "char<?");
+        for (int i = 1; i < arguments.size(); i++) {
+            char right = requireChar(arguments.get(i), "char<?");
+            if (left >= right) {
+                return FALSE_VALUE;
+            }
+            left = right;
+        }
+        return TRUE_VALUE;
+    }
+
+    private Value builtinStringEquals(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        if (arguments.size() < 2) {
+            throw errorAt(callPos, "wrong argument count for string=?");
+        }
+
+        String left = requireString(arguments.get(0), "string=?");
+        for (int i = 1; i < arguments.size(); i++) {
+            String right = requireString(arguments.get(i), "string=?");
+            if (!left.equals(right)) {
+                return FALSE_VALUE;
+            }
+            left = right;
+        }
+        return TRUE_VALUE;
+    }
+
+    private Value builtinStringLessThan(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        if (arguments.size() < 2) {
+            throw errorAt(callPos, "wrong argument count for string<?");
+        }
+
+        String left = requireString(arguments.get(0), "string<?");
+        for (int i = 1; i < arguments.size(); i++) {
+            String right = requireString(arguments.get(i), "string<?");
+            if (left.compareTo(right) >= 0) {
+                return FALSE_VALUE;
+            }
+            left = right;
+        }
+        return TRUE_VALUE;
+    }
+
+    private Value builtinStringCaseInsensitiveEquals(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        if (arguments.size() < 2) {
+            throw errorAt(callPos, "wrong argument count for string-ci=?");
+        }
+
+        String left = requireString(arguments.get(0), "string-ci=?");
+        for (int i = 1; i < arguments.size(); i++) {
+            String right = requireString(arguments.get(i), "string-ci=?");
+            if (!left.equalsIgnoreCase(right)) {
+                return FALSE_VALUE;
+            }
+            left = right;
+        }
+        return TRUE_VALUE;
+    }
+
+    private Value builtinStringUpcase(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "string-upcase", callPos);
+        return new StringValue(requireString(arguments.get(0), "string-upcase")
+                .toUpperCase(Locale.ROOT));
+    }
+
+    private Value builtinStringDowncase(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "string-downcase", callPos);
+        return new StringValue(requireString(arguments.get(0), "string-downcase")
+                .toLowerCase(Locale.ROOT));
+    }
+
     private void expectArgumentCount(List<?> arguments, int expected, String name, SourcePos pos)
             throws EvalError {
         if (arguments.size() != expected) {
@@ -747,6 +1123,22 @@ public class Evaluator {
             return number;
         }
         throw errorAt(value.pos(), "expected number for " + name);
+    }
+
+    private int requireNonNegativeIndex(LocatedValue value, String name) throws EvalError {
+        long index = requireInt(value, name);
+        if (index < 0 || index > Integer.MAX_VALUE) {
+            throw errorAt(value.pos(), "index out of range for " + name);
+        }
+        return (int) index;
+    }
+
+    private long requireNonZeroDivisor(LocatedValue value, String name) throws EvalError {
+        long divisor = requireInt(value, name);
+        if (divisor == 0L) {
+            throw errorAt(value.pos(), "division by zero");
+        }
+        return divisor;
     }
 
     private String requireString(LocatedValue value, String name) throws EvalError {
@@ -828,6 +1220,14 @@ public class Evaluator {
         return result;
     }
 
+    private Value buildListFromValues(List<Value> values) {
+        Value result = EMPTY_LIST;
+        for (int i = values.size() - 1; i >= 0; i--) {
+            result = new PairValue(values.get(i), result);
+        }
+        return result;
+    }
+
     private List<LocatedValue> expandApplyArguments(LocatedValue list) throws EvalError {
         List<LocatedValue> values = new ArrayList<>();
         Value current = list.value();
@@ -843,6 +1243,47 @@ public class Evaluator {
 
     private boolean isTruthy(Value value) {
         return !(value instanceof BoolValue(boolean bool) && !bool);
+    }
+
+    private boolean isProperList(Value value) {
+        Value current = value;
+        while (current instanceof PairValue(Value ignoredCar, Value cdr)) {
+            current = cdr;
+        }
+        return current instanceof EmptyListValue;
+    }
+
+    private boolean eqValues(Value left, Value right) {
+        if (left == right) {
+            return true;
+        }
+        if (left instanceof IntValue(long leftNumber) && right instanceof IntValue(long rightNumber)) {
+            return leftNumber == rightNumber;
+        }
+        if (left instanceof BoolValue(boolean leftBool) && right instanceof BoolValue(boolean rightBool)) {
+            return leftBool == rightBool;
+        }
+        if (left instanceof CharValue(char leftChar) && right instanceof CharValue(char rightChar)) {
+            return leftChar == rightChar;
+        }
+        if (left instanceof SymbolValue(String leftSymbol) && right instanceof SymbolValue(String rightSymbol)) {
+            return leftSymbol.equals(rightSymbol);
+        }
+        return left instanceof EmptyListValue && right instanceof EmptyListValue;
+    }
+
+    private boolean equalValues(Value left, Value right) {
+        if (eqValues(left, right)) {
+            return true;
+        }
+        if (left instanceof StringValue leftString && right instanceof StringValue rightString) {
+            return leftString.text().equals(rightString.text());
+        }
+        if (left instanceof PairValue(Value leftCar, Value leftCdr)
+                && right instanceof PairValue(Value rightCar, Value rightCdr)) {
+            return equalValues(leftCar, rightCar) && equalValues(leftCdr, rightCdr);
+        }
+        return false;
     }
 
     private BoolValue boolValue(boolean value) {

@@ -10,7 +10,12 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### eval (src/scheme/mod.rs:147) — Evaluate a positioned Scheme AST node and attach source positions to runtime errors.
+### parse_parameters_from_expr (src/scheme/mod.rs:454) — Normalize lambda parameter syntax into fixed/rest argument metadata.
+### apply (src/scheme/mod.rs:518) — Dispatch builtin and lambda procedure calls with call-site position tracking.
+### equal_values (src/scheme/mod.rs:1642) — Implement recursive Scheme equality for strings, pairs, and atomic values.
+### parse_program (src/scheme/mod.rs:2088) — Parse a full Scheme source string into a sequence of positioned expressions.
+### render_value (src/scheme/mod.rs:2347) — Render Scheme values for final results and display/write output modes.
 
 ## Python Helpers (scripts/)
 
