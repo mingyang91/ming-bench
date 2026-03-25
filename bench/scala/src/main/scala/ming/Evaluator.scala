@@ -27,13 +27,57 @@ object Evaluator:
     case SchemeVal.SList(elems) =>
       val head = elems.head
       head match
-        case SchemeVal.Symbol("and") => evalAnd(elems.tail, env)
-        case SchemeVal.Symbol("or")  => evalOr(elems.tail, env)
+        case SchemeVal.Symbol("define") => evalDefine(elems.tail, env)
+        case SchemeVal.Symbol("if")     => evalIf(elems.tail, env)
+        case SchemeVal.Symbol("quote") =>
+          if elems.tail.size != 1 then throw new EvalError("quote: expected 1 argument")
+          elems.tail.head
+        case SchemeVal.Symbol("lambda") => evalLambda(elems.tail, env)
+        case SchemeVal.Symbol("and")    => evalAnd(elems.tail, env)
+        case SchemeVal.Symbol("or")     => evalOr(elems.tail, env)
         case _ =>
           val proc = eval(head, env)
           val args = elems.tail.map(a => eval(a, env))
           apply(proc, args)
     case _ => throw new EvalError(s"cannot evaluate: $expr")
+
+  private def evalDefine(args: List[SchemeVal], env: Env): SchemeVal =
+    args match
+      case SchemeVal.Symbol(name) :: value :: Nil =>
+        env.define(name, eval(value, env))
+        SchemeVal.Void
+      case SchemeVal.SList(elems) :: body if elems.nonEmpty && body.nonEmpty =>
+        // (define (f params...) body...)
+        elems.head match
+          case SchemeVal.Symbol(name) =>
+            val params = elems.tail.map {
+              case SchemeVal.Symbol(p) => p
+              case other               => throw new EvalError(s"define: expected parameter name, got $other")
+            }
+            env.define(name, SchemeVal.LambdaProc(params, body, env))
+            SchemeVal.Void
+          case other => throw new EvalError(s"define: expected name, got $other")
+      case _ => throw new EvalError("define: bad syntax")
+
+  private def evalIf(args: List[SchemeVal], env: Env): SchemeVal =
+    args match
+      case cond :: thenBranch :: elseBranch :: Nil =>
+        if isTruthy(eval(cond, env)) then eval(thenBranch, env)
+        else eval(elseBranch, env)
+      case cond :: thenBranch :: Nil =>
+        if isTruthy(eval(cond, env)) then eval(thenBranch, env)
+        else SchemeVal.Void
+      case _ => throw new EvalError("if: bad syntax")
+
+  private def evalLambda(args: List[SchemeVal], env: Env): SchemeVal =
+    args match
+      case SchemeVal.SList(paramList) :: body if body.nonEmpty =>
+        val params = paramList.map {
+          case SchemeVal.Symbol(p) => p
+          case other               => throw new EvalError(s"lambda: expected parameter name, got $other")
+        }
+        SchemeVal.LambdaProc(params, body, env)
+      case _ => throw new EvalError("lambda: bad syntax")
 
   private def evalAnd(exprs: List[SchemeVal], env: Env): SchemeVal =
     if exprs.isEmpty then SchemeVal.BoolVal(true)
@@ -58,7 +102,14 @@ object Evaluator:
 
   def apply(proc: SchemeVal, args: List[SchemeVal]): SchemeVal = proc match
     case SchemeVal.BuiltinProc(_, f) => f(args)
-    case _                           => throw new EvalError(s"not a procedure: $proc")
+    case SchemeVal.LambdaProc(params, body, closure) =>
+      if args.size != params.size then throw new EvalError(s"expected ${params.size} arguments, got ${args.size}")
+      val localEnv = new Env(scala.collection.mutable.Map.empty, Some(closure))
+      params.zip(args).foreach((p, a) => localEnv.define(p, a))
+      var result: SchemeVal = SchemeVal.Void
+      for expr <- body do result = eval(expr, localEnv)
+      result
+    case _ => throw new EvalError(s"not a procedure: $proc")
 
 enum SchemeVal:
   case IntVal(n: Long)
@@ -68,6 +119,7 @@ enum SchemeVal:
   case SList(elems: List[SchemeVal])
   case Void
   case BuiltinProc(name: String, f: List[SchemeVal] => SchemeVal)
+  case LambdaProc(params: List[String], body: List[SchemeVal], closure: Env)
 
 object SchemeVal:
 
@@ -80,6 +132,7 @@ object SchemeVal:
     case SList(elems)         => "(" + elems.map(display).mkString(" ") + ")"
     case Void                 => ""
     case BuiltinProc(name, _) => s"#<procedure $name>"
+    case LambdaProc(_, _, _)  => "#<procedure>"
 
 class Env(private val bindings: scala.collection.mutable.Map[String, SchemeVal], private val parent: Option[Env]):
 
