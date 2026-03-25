@@ -64,6 +64,7 @@ public class Evaluator {
     }
 
     private final Env globalEnv = new Env(null);
+    private StringBuilder outputBuffer = new StringBuilder();
 
     public Evaluator() {
         // Arithmetic
@@ -146,6 +147,54 @@ public class Evaluator {
         globalEnv.define("pair?", (BuiltinProc) args -> args.get(0) instanceof Pair);
         globalEnv.define("string?", (BuiltinProc) args -> args.get(0) instanceof SchemeString);
         globalEnv.define("symbol?", (BuiltinProc) args -> args.get(0) instanceof String);
+        globalEnv.define("char?", (BuiltinProc) args -> args.get(0) instanceof SchemeChar);
+
+        // I/O
+        globalEnv.define("display", (BuiltinProc) args -> {
+            outputBuffer.append(displayString(args.get(0)));
+            return VOID;
+        });
+        globalEnv.define("write", (BuiltinProc) args -> {
+            outputBuffer.append(schemeToString(args.get(0)));
+            return VOID;
+        });
+        globalEnv.define("newline", (BuiltinProc) args -> {
+            outputBuffer.append('\n');
+            return VOID;
+        });
+
+        // String operations
+        globalEnv.define("string-append", (BuiltinProc) args -> {
+            StringBuilder sb = new StringBuilder();
+            for (Object a : args) sb.append(asSchemeString(a).value());
+            return new SchemeString(sb.toString());
+        });
+        globalEnv.define("string-length", (BuiltinProc) args -> (long) asSchemeString(args.get(0)).value().length());
+        globalEnv.define("substring", (BuiltinProc) args -> {
+            String s = asSchemeString(args.get(0)).value();
+            int start = (int) asLong(args.get(1));
+            int end = (int) asLong(args.get(2));
+            return new SchemeString(s.substring(start, end));
+        });
+        globalEnv.define("string->number", (BuiltinProc) args -> {
+            String s = asSchemeString(args.get(0)).value();
+            try {
+                return Long.parseLong(s);
+            } catch (NumberFormatException e) {
+                return Boolean.FALSE;
+            }
+        });
+        globalEnv.define("number->string", (BuiltinProc) args -> new SchemeString(String.valueOf(asLong(args.get(0)))));
+        globalEnv.define("symbol->string", (BuiltinProc) args -> {
+            if (args.get(0) instanceof String s) return new SchemeString(s);
+            throw new EvalError("symbol->string: not a symbol");
+        });
+        globalEnv.define("string->symbol", (BuiltinProc) args -> asSchemeString(args.get(0)).value());
+        globalEnv.define("string-ref", (BuiltinProc) args -> {
+            String s = asSchemeString(args.get(0)).value();
+            int idx = (int) asLong(args.get(1));
+            return new SchemeChar(s.charAt(idx));
+        });
     }
 
     private Object appendTwo(Object a, Object b) {
@@ -174,7 +223,16 @@ public class Evaluator {
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        throw new EvalError("not implemented");
+        outputBuffer.setLength(0);
+        List<Token> tokens = tokenize(input);
+        int[] pos = {0};
+        Object lastResult = null;
+        while (pos[0] < tokens.size()) {
+            Object expr = parse(tokens, pos);
+            lastResult = eval(expr, globalEnv);
+        }
+        String result = (lastResult == null || lastResult == VOID) ? "" : schemeToString(lastResult);
+        return new EvalResult(result, outputBuffer.toString());
     }
 
     // --- Tokenizer ---
@@ -348,7 +406,7 @@ public class Evaluator {
             }
         }
 
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString) {
+        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
             return expr;
         }
         if (expr instanceof String sym) {
@@ -565,12 +623,24 @@ public class Evaluator {
         throw new EvalError("expected number, got: " + schemeToString(val));
     }
 
+    private SchemeString asSchemeString(Object val) throws EvalError {
+        if (val instanceof SchemeString s) return s;
+        throw new EvalError("expected string, got: " + schemeToString(val));
+    }
+
+    private String displayString(Object val) {
+        if (val instanceof SchemeString s) return s.value();
+        if (val instanceof SchemeChar c) return String.valueOf(c.value());
+        return schemeToString(val);
+    }
+
     // --- Display ---
 
     private String schemeToString(Object val) {
         if (val instanceof Long l) return l.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
+        if (val instanceof SchemeChar c) return "#\\" + c.value();
         if (val instanceof String s) return s;
         if (val == NIL) return "()";
         if (val instanceof Pair) {
@@ -605,4 +675,7 @@ public class Evaluator {
 
     // Internal wrapper to distinguish strings from symbols
     record SchemeString(String value) {}
+
+    // Internal wrapper for characters
+    record SchemeChar(char value) {}
 }
