@@ -12,7 +12,13 @@ public class Evaluator {
     private sealed interface Val permits Val.Int, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda {
         record Int(long value) implements Val {}
         record Bool(boolean value) implements Val {}
-        record Str(String value) implements Val {}
+        final class Str implements Val {
+            private final char[] chars;
+            Str(String value) { this.chars = value.toCharArray(); }
+            String value() { return new String(chars); }
+            void setChar(int idx, char c) { chars[idx] = c; }
+            int length() { return chars.length; }
+        }
         record Sym(String name) implements Val {}
         record Chr(char value) implements Val {}
         record PairV(Val car, Val cdr) implements Val {}
@@ -220,6 +226,14 @@ public class Evaluator {
     private Val parseAtom(String tok) {
         if (tok.equals("#t")) return new Val.Bool(true);
         if (tok.equals("#f")) return new Val.Bool(false);
+        if (tok.startsWith("#\\")) {
+            String rest = tok.substring(2);
+            if (rest.equals("space")) return new Val.Chr(' ');
+            if (rest.equals("newline")) return new Val.Chr('\n');
+            if (rest.equals("tab")) return new Val.Chr('\t');
+            if (rest.length() == 1) return new Val.Chr(rest.charAt(0));
+            throw new RuntimeException("unknown character literal: " + tok);
+        }
         if (tok.startsWith("\"")) {
             String raw = tok.substring(1, tok.length() - 1);
             StringBuilder sb = new StringBuilder();
@@ -701,6 +715,20 @@ public class Evaluator {
         env.define("char?", new Val.Builtin("char?", args -> {
             checkArgCount(args, 1, "char?");
             return new Val.Bool(args.get(0) instanceof Val.Chr);
+        }));
+        // L06 — mutable strings
+        env.define("string-copy", new Val.Builtin("string-copy", args -> {
+            checkArgCount(args, 1, "string-copy");
+            if (!(args.get(0) instanceof Val.Str s)) throw new RuntimeException("string-copy: not a string");
+            return new Val.Str(s.value());
+        }));
+        env.define("string-set!", new Val.Builtin("string-set!", args -> {
+            checkArgCount(args, 3, "string-set!");
+            if (!(args.get(0) instanceof Val.Str s)) throw new RuntimeException("string-set!: not a string");
+            int idx = (int) asInt(args.get(1));
+            if (!(args.get(2) instanceof Val.Chr c)) throw new RuntimeException("string-set!: not a character");
+            s.setChar(idx, c.value());
+            return new Val.Void();
         }));
         return env;
     }
