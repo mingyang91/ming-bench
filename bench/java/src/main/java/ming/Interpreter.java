@@ -16,7 +16,7 @@ public class Interpreter {
     private int gensymCounter = 0;
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "define", "if", "quote", "lambda", "and", "or", "let", "begin",
-        "cond", "set!", "define-syntax", "syntax-rules"
+        "cond", "set!", "define-syntax", "syntax-rules", "define-record-type"
     );
 
     public Interpreter() {
@@ -536,6 +536,7 @@ public class Interpreter {
                 case SchemeValue.RationalVal v -> v;
                 case SchemeValue.PairVal v -> v;
                 case SchemeValue.MacroVal v -> v;
+                case SchemeValue.RecordVal v -> v;
                 case SchemeValue.SymbolVal v -> env.get(v.name());
                 case SchemeValue.ListVal v -> evalList(v, env);
             };
@@ -558,6 +559,7 @@ public class Interpreter {
             return switch (sym.name()) {
                 case "define" -> evalDefine(list.elements(), env);
                 case "define-syntax" -> evalDefineSyntax(list.elements(), env);
+                case "define-record-type" -> evalDefineRecordType(list.elements(), env);
                 case "if" -> evalIf(list.elements(), env);
                 case "quote" -> evalQuote(list.elements());
                 case "lambda" -> evalLambda(list.elements(), env);
@@ -885,6 +887,87 @@ public class Interpreter {
             templates.add(rule.elements().get(1));
         }
         env.define(name.name(), new SchemeValue.MacroVal(literals, patterns, templates, env));
+        return new SchemeValue.VoidVal();
+    }
+
+    private SchemeValue evalDefineRecordType(List<SchemeValue> elements, Environment env) throws EvalError {
+        // (define-record-type <name> (constructor field...) predicate (field accessor)...)
+        if (elements.size() < 4) throw new EvalError("define-record-type: bad syntax");
+
+        // Type name
+        if (!(elements.get(1) instanceof SchemeValue.SymbolVal typeName))
+            throw new EvalError("define-record-type: expected type name");
+
+        // Constructor: (constructor-name field1 field2 ...)
+        if (!(elements.get(2) instanceof SchemeValue.ListVal ctorList) || ctorList.elements().isEmpty())
+            throw new EvalError("define-record-type: expected constructor");
+        if (!(ctorList.elements().get(0) instanceof SchemeValue.SymbolVal ctorName))
+            throw new EvalError("define-record-type: expected constructor name");
+        var ctorFields = new ArrayList<String>();
+        for (int i = 1; i < ctorList.elements().size(); i++) {
+            if (!(ctorList.elements().get(i) instanceof SchemeValue.SymbolVal f))
+                throw new EvalError("define-record-type: expected field name in constructor");
+            ctorFields.add(f.name());
+        }
+
+        // Predicate
+        if (!(elements.get(3) instanceof SchemeValue.SymbolVal predName))
+            throw new EvalError("define-record-type: expected predicate name");
+
+        // Field specs: (field accessor) starting at index 4
+        var fieldNames = new ArrayList<String>();
+        var accessorNames = new ArrayList<String>();
+        for (int i = 4; i < elements.size(); i++) {
+            if (!(elements.get(i) instanceof SchemeValue.ListVal fieldSpec) || fieldSpec.elements().size() < 2)
+                throw new EvalError("define-record-type: bad field spec");
+            if (!(fieldSpec.elements().get(0) instanceof SchemeValue.SymbolVal fieldSym))
+                throw new EvalError("define-record-type: expected field name");
+            if (!(fieldSpec.elements().get(1) instanceof SchemeValue.SymbolVal accSym))
+                throw new EvalError("define-record-type: expected accessor name");
+            fieldNames.add(fieldSym.name());
+            accessorNames.add(accSym.name());
+        }
+
+        // Unique tag for this record type (identity-based)
+        var tag = new Object();
+        var fieldNamesArr = fieldNames.toArray(new String[0]);
+
+        // Build field index map for constructor
+        var fieldIndexMap = new HashMap<String, Integer>();
+        for (int i = 0; i < fieldNames.size(); i++) {
+            fieldIndexMap.put(fieldNames.get(i), i);
+        }
+
+        // Define constructor
+        env.define(ctorName.name(), new SchemeValue.BuiltinVal(ctorName.name(), args -> {
+            if (args.length != ctorFields.size())
+                throw new EvalError(ctorName.name() + ": expected " + ctorFields.size() + " arguments");
+            var fields = new SchemeValue[fieldNames.size()];
+            for (int i = 0; i < ctorFields.size(); i++) {
+                int idx = fieldIndexMap.get(ctorFields.get(i));
+                fields[idx] = args[i];
+            }
+            return new SchemeValue.RecordVal(tag, typeName.name(), fieldNamesArr, fields);
+        }));
+
+        // Define predicate
+        env.define(predName.name(), new SchemeValue.BuiltinVal(predName.name(), args -> {
+            if (args.length != 1) throw new EvalError(predName.name() + ": expected 1 argument");
+            return new SchemeValue.BoolVal(args[0] instanceof SchemeValue.RecordVal r && r.tag() == tag);
+        }));
+
+        // Define accessors
+        for (int i = 0; i < fieldNames.size(); i++) {
+            final int idx = i;
+            var accName = accessorNames.get(i);
+            env.define(accName, new SchemeValue.BuiltinVal(accName, args -> {
+                if (args.length != 1) throw new EvalError(accName + ": expected 1 argument");
+                if (!(args[0] instanceof SchemeValue.RecordVal r) || r.tag() != tag)
+                    throw new EvalError(accName + ": not a " + typeName.name());
+                return r.fields()[idx];
+            }));
+        }
+
         return new SchemeValue.VoidVal();
     }
 

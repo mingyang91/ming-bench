@@ -23,6 +23,7 @@ public sealed interface SchemeValue {
     record RationalVal(long num, long den) implements SchemeValue {} // always simplified, den > 0
     record BuiltinVal(String name, Builtin proc) implements SchemeValue {}
     record MacroVal(List<String> literals, List<SchemeValue> patterns, List<SchemeValue> templates, Environment defEnv) implements SchemeValue {}
+    record RecordVal(Object tag, String typeName, String[] fieldNames, SchemeValue[] fields) implements SchemeValue {}
 
     @FunctionalInterface
     interface Builtin {
@@ -69,6 +70,7 @@ public sealed interface SchemeValue {
             case LambdaVal v -> "#<procedure>";
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";
             case MacroVal v -> "#<macro>";
+            case RecordVal v -> "#<record:" + v.typeName() + ">";
         };
     }
 
