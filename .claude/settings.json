@@ -1,4 +1,18 @@
 {
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.command' | grep -q 'git commit' && git diff-tree --no-commit-id --name-only -r HEAD 2>/dev/null | grep -qE '^(xtask/|bench/|CLAUDE\\.md|Dockerfile)' && echo '{\"systemMessage\":\"Framework changed \\u2014 consider running /changelog to record the 5W1H\"}' || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
   "permissions": {
     "allow": [
       "Bash(cargo build *)",

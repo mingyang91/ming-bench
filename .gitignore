@@ -5,6 +5,8 @@ Cargo.lock
 .DS_Store
 results/
 !results/.gitkeep
+!results/dev-sessions/
+!results/dev-sessions/**
 bench/*/CLAUDE.md
 bench/*/AGENTS.md
 *.sh
