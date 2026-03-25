@@ -2,8 +2,11 @@ package ming
 
 import scala.collection.mutable
 
+case class Pos(line: Int, col: Int)
+
 /** Scheme value types */
 enum SchemeVal:
+  var pos: Option[Pos] = None
   case SInt(value: Long)
   case SBool(value: Boolean)
   case SString(value: String)
@@ -53,28 +56,35 @@ object Evaluator:
   private def evalBody(body: List[SchemeVal], env: Env): SchemeVal =
     body.foldLeft(SchemeVal.SVoid: SchemeVal)((_, expr) => eval(expr, env))
 
-  def eval(expr: SchemeVal, env: Env): SchemeVal = expr match
-    case SchemeVal.SInt(_) | SchemeVal.SBool(_) | SchemeVal.SString(_) | SchemeVal.SVoid => expr
-    case SchemeVal.SSymbol(name)                                                         => env.get(name)
-    case SchemeVal.SList(elems) =>
-      elems match
-        case Nil => throw new EvalError("empty application")
-        case SchemeVal.SSymbol("quote") :: args =>
-          if args.length != 1 then throw new EvalError("quote: expected 1 argument")
-          args.head
-        case SchemeVal.SSymbol("if") :: args     => evalIf(args, env)
-        case SchemeVal.SSymbol("define") :: args => evalDefine(args, env)
-        case SchemeVal.SSymbol("lambda") :: args => evalLambda(args, env)
-        case SchemeVal.SSymbol("and") :: args    => evalAnd(args, env)
-        case SchemeVal.SSymbol("or") :: args     => evalOr(args, env)
-        case SchemeVal.SSymbol("let") :: args    => evalLet(args, env)
-        case SchemeVal.SSymbol("begin") :: args  => evalBegin(args, env)
-        case SchemeVal.SSymbol("cond") :: args   => evalCond(args, env)
-        case head :: args =>
-          val op         = eval(head, env)
-          val evaledArgs = args.map(eval(_, env))
-          applyProc(op, evaledArgs)
-    case other => other
+  def eval(expr: SchemeVal, env: Env): SchemeVal =
+    try
+      expr match
+        case SchemeVal.SInt(_) | SchemeVal.SBool(_) | SchemeVal.SString(_) | SchemeVal.SVoid => expr
+        case SchemeVal.SSymbol(name)                                                         => env.get(name)
+        case SchemeVal.SList(elems) =>
+          elems match
+            case Nil => throw new EvalError("empty application")
+            case SchemeVal.SSymbol("quote") :: args =>
+              if args.length != 1 then throw new EvalError("quote: expected 1 argument")
+              args.head
+            case SchemeVal.SSymbol("if") :: args     => evalIf(args, env)
+            case SchemeVal.SSymbol("define") :: args => evalDefine(args, env)
+            case SchemeVal.SSymbol("lambda") :: args => evalLambda(args, env)
+            case SchemeVal.SSymbol("and") :: args    => evalAnd(args, env)
+            case SchemeVal.SSymbol("or") :: args     => evalOr(args, env)
+            case SchemeVal.SSymbol("let") :: args    => evalLet(args, env)
+            case SchemeVal.SSymbol("begin") :: args  => evalBegin(args, env)
+            case SchemeVal.SSymbol("cond") :: args   => evalCond(args, env)
+            case head :: args =>
+              val op         = eval(head, env)
+              val evaledArgs = args.map(eval(_, env))
+              applyProc(op, evaledArgs)
+        case other => other
+    catch
+      case e: EvalError if !e.hasPosition =>
+        expr.pos match
+          case Some(p) => throw new EvalError(s"${e.getMessage} at ${p.line}:${p.col}", hasPosition = true)
+          case None    => throw e
 
   private def evalIf(args: List[SchemeVal], env: Env): SchemeVal =
     if args.length < 2 || args.length > 3 then throw new EvalError("if: expected 2 or 3 arguments")

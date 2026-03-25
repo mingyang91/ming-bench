@@ -2,88 +2,89 @@ package ming
 
 import scala.collection.mutable.ListBuffer
 
+case class Token(text: String, line: Int, col: Int)
+
 /** Tokenizer */
 object Tokenizer:
 
-  def tokenize(input: String): List[String] =
-    val tokens = ListBuffer[String]()
+  def tokenize(input: String): List[Token] =
+    val tokens = ListBuffer[Token]()
     var i      = 0
-    while i < input.length do i = tokenizeOne(input, i, tokens)
+    var line   = 1
+    var col    = 1
+    while i < input.length do
+      val ch = input(i)
+      ch match
+        case '\n' =>
+          i += 1; line += 1; col = 1
+        case c if c.isWhitespace =>
+          i += 1; col += 1
+        case ';' =>
+          while i < input.length && input(i) != '\n' do
+            i += 1; col += 1
+        case '(' =>
+          tokens += Token("(", line, col); i += 1; col += 1
+        case ')' =>
+          tokens += Token(")", line, col); i += 1; col += 1
+        case '\'' =>
+          tokens += Token("'", line, col); i += 1; col += 1
+        case '"' =>
+          val startCol = col
+          val sb       = new StringBuilder("\"")
+          i += 1; col += 1
+          while i < input.length && input(i) != '"' do
+            if input(i) == '\\' then
+              sb += input(i); i += 1; col += 1
+              if i < input.length then
+                sb += input(i); i += 1; col += 1
+            else
+              sb += input(i); i += 1; col += 1
+          if i < input.length then
+            sb += '"'; i += 1; col += 1
+          tokens += Token(sb.toString, line, startCol)
+        case '#' =>
+          val startCol = col
+          val start    = i
+          i += 1; col += 1
+          while i < input.length && !input(i).isWhitespace && input(i) != '(' && input(i) != ')' do
+            i += 1; col += 1
+          tokens += Token(input.substring(start, i), line, startCol)
+        case _ =>
+          val startCol = col
+          val start    = i
+          while i < input.length && !input(i).isWhitespace && input(i) != '(' && input(i) != ')' && input(
+              i
+            ) != '"' && input(i) != ';'
+          do
+            i += 1; col += 1
+          tokens += Token(input.substring(start, i), line, startCol)
     tokens.toList
-
-  private def tokenizeOne(input: String, pos: Int, tokens: ListBuffer[String]): Int =
-    input(pos) match
-      case c if c.isWhitespace => pos + 1
-      case ';'                 => skipLineComment(input, pos + 1)
-      case '('                 => tokens += "("; pos + 1
-      case ')'                 => tokens += ")"; pos + 1
-      case '\''                => tokens += "'"; pos + 1
-      case '"' =>
-        val (tok, next) = tokenizeString(input, pos)
-        tokens += tok
-        next
-      case '#' => tokenizeHash(input, pos, tokens)
-      case _   => tokenizeWord(input, pos, tokens)
-
-  private def skipLineComment(input: String, start: Int): Int =
-    var i = start
-    while i < input.length && input(i) != '\n' do i += 1
-    i
-
-  private def tokenizeHash(input: String, pos: Int, tokens: ListBuffer[String]): Int =
-    var i = pos + 1
-    while i < input.length && !input(i).isWhitespace && input(i) != '(' && input(i) != ')' do i += 1
-    tokens += input.substring(pos, i)
-    i
-
-  private def tokenizeWord(input: String, pos: Int, tokens: ListBuffer[String]): Int =
-    var i = pos
-    while i < input.length && !input(i).isWhitespace && input(i) != '(' && input(i) != ')' && input(i) != '"' && input(
-        i
-      ) != ';'
-    do i += 1
-    tokens += input.substring(pos, i)
-    i
-
-  private def tokenizeString(input: String, start: Int): (String, Int) =
-    val sb = new StringBuilder("\"")
-    var i  = start + 1
-    while i < input.length && input(i) != '"' do
-      if input(i) == '\\' then
-        sb += input(i)
-        i += 1
-        if i < input.length then
-          sb += input(i)
-          i += 1
-      else
-        sb += input(i)
-        i += 1
-    if i < input.length then
-      sb += '"'
-      i += 1
-    (sb.toString, i)
 
 /** Parser */
 object Parser:
 
-  def parse(tokens: List[String]): (SchemeVal, List[String]) =
+  private def withPos(v: SchemeVal, t: Token): SchemeVal =
+    v.pos = Some(Pos(t.line, t.col))
+    v
+
+  def parse(tokens: List[Token]): (SchemeVal, List[Token]) =
     tokens match
       case Nil => throw new EvalError("unexpected end of input")
-      case "(" :: rest =>
+      case t :: rest if t.text == "(" =>
         val elems     = ListBuffer[SchemeVal]()
         var remaining = rest
-        while remaining.nonEmpty && remaining.head != ")" do
+        while remaining.nonEmpty && remaining.head.text != ")" do
           val (expr, r) = parse(remaining)
           elems += expr
           remaining = r
         if remaining.isEmpty then throw new EvalError("missing closing parenthesis")
-        (SchemeVal.SList(elems.toList), remaining.tail)
-      case ")" :: _ => throw new EvalError("unexpected )")
-      case "'" :: rest =>
+        (withPos(SchemeVal.SList(elems.toList), t), remaining.tail)
+      case t :: _ if t.text == ")" => throw new EvalError("unexpected )")
+      case t :: rest if t.text == "'" =>
         val (expr, r) = parse(rest)
-        (SchemeVal.SList(List(SchemeVal.SSymbol("quote"), expr)), r)
-      case token :: rest =>
-        (parseAtom(token), rest)
+        (withPos(SchemeVal.SList(List(SchemeVal.SSymbol("quote"), expr)), t), r)
+      case t :: rest =>
+        (withPos(parseAtom(t.text), t), rest)
 
   private def parseAtom(token: String): SchemeVal =
     if token == "#t" then SchemeVal.SBool(true)
