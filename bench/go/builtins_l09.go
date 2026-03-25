@@ -477,7 +477,7 @@ func builtinMap(args []Value) (Value, error) {
 		case *BuiltinFunc:
 			result, err = f.Fn(callArgs)
 		case *LambdaVal:
-			result, err = applyLambda(f, callArgs, 0, 0)
+			result, err = resolveTC(applyLambda(f, callArgs, 0, 0))
 		default:
 			return nil, &EvalError{Message: fmt.Sprintf("map: not a procedure: %s", fn.String())}
 		}
