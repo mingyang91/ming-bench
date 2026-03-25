@@ -10,16 +10,18 @@ Data sources: `cargo xtask results`, `cargo xtask tokens`, session narratives.
 **Framework:** Post-difficulty-wall, two-pass QG, 1500-line limit, 26+2 levels
 **Runs:** 6 Claude agents (5 languages, default + QG)
 
-| Run | Lang | Strategy | Levels | Cost | Duration | Notes |
-|-----|------|----------|--------|------|----------|-------|
-| cl-def-r26 | Rust | default | 25/26 | $317 | 6h10m | Died at L14 — sboyer stack overflow |
-| cl-go-def-r26 | Go | default | 28/28 | $272 | 3h49m | Full completion |
-| cl-java-def-r26 | Java | default | **28/28** | **$162** | 2h41m | **Cheapest full completer** |
-| cl-ts-def-r26 | TS | default | 28/28 | $377 | 4h53m | Full but expensive |
-| cl-qg-r26 | Rust | quality-gate | 13/14 | $139 | 1h26m | Died at L14 — sboyer |
-| cl-scala-qg-r26 | Scala | quality-gate | 28/28 | $201 | 4h38m | Full completion |
+| Run | Lang | Strategy | Levels | Turns | Output | Total Tok | Cost | Duration | Notes |
+|-----|------|----------|--------|-------|--------|-----------|------|----------|-------|
+| cl-java-def-r26 | Java | default | **28/28** | **613** | 396K | **45.5M** | **$153** | **2h08m** | **Champion — $5.46/level** |
+| cl-scala-qg-r26 | Scala | quality-gate | **28/28** | 647 | 444K | 51.7M | $187 | 2h51m | Best QG completer |
+| cl-go-def-r26 | Go | default | **28/28** | 886 | 640K | 80.6M | $257 | 3h27m | Full completion |
+| cl-ts-def-r26 | TS | default | **28/28** | 875 | 638K | 152.3M | $352 | 3h57m | L24: 241 turns, $240K output |
+| cl-def-r26 | Rust | default | 25+27+28 | 1141 | 834K | 183.6M | $427 | 5h01m | Failed L26 (213 trn), passed L27-L28 |
+| cl-qg-r26 | Rust | quality-gate | **14/28** | 505 | 192K | 62.5M | $139 | 1h04m | Died at L14 — sboyer stack overflow |
 
-**Highlight:** Java won at $162/28 levels — cheapest full completer across all rounds. Both Rust runs (default + QG) died at L14 sboyer stack overflow in debug mode.
+**Highlight:** Java won at $153/28 levels ($5.46/level) — cheapest full completer across all rounds. Both Rust runs hit sboyer-related issues (QG died L14, default failed L26). TS had worst L24 ever (241 turns, 240K output, 33 test runs).
+**Token insight:** Java's 115:1 input:output ratio matched Scala-QG (116:1). TS had worst ratio at 238:1 — reading 238 tokens per output token.
+**Wall (L16-L18):** Java leanest at 120 turns/161K. Rust most expensive at 214 turns/238K.
 **Led to:** PreToolUse hooks blocking direct `cargo test`, `[profile.test] opt-level = 2` fix.
 
 ---
@@ -255,4 +257,4 @@ Data sources: `cargo xtask results`, `cargo xtask tokens`, session narratives.
 | R23 | Mar 24 | $162 | Scala-QG | 1/6 (28/28) | +QG strategy swap |
 | R24 | Mar 24 | $220 | Scala-QG | 5/6 (28/28) | +1500-line limit |
 | R25 | Mar 24 | **$169** | **Scala-QG** | 5/6 (28/28) | Stable |
-| R26 | Mar 24 | $162 | Java | 4/6 (28/28) | Pre-hooks |
+| R26 | Mar 24 | **$153** | **Java** | 4/6 (28/28) | Pre-hooks, sboyer kills Rust |
