@@ -16,6 +16,7 @@ enum TailResult {
 // Uses Vec<Frame> stack for performance; captured continuations clone the vec.
 
 type CapturedKont = Vec<Frame>;
+type WindStack = Vec<(u64, Value, Value)>; // (id, in_thunk, out_thunk)
 
 #[derive(Clone)]
 enum Frame {
@@ -33,6 +34,11 @@ enum Frame {
     NamedLetBind { name: String, params: Vec<String>, rest: Vec<(String, Expr)>, done: Vec<Value>, body: Vec<Expr>, env: Env, pos: String },
     ProcCheck,
     NotCheck,
+    // dynamic-wind frames
+    DynWindAfterIn { body: Value, out: Value, wind_id: u64, in_thunk: Value },
+    DynWindAfterBody { out: Value, wind_id: u64 },
+    DynWindAfterOut { result: Value },
+    DynWindTransition { outs: Vec<Value>, rewind_entries: WindStack, target_k: CapturedKont, target_val: Value, target_winds: WindStack },
 }
 
 enum CekState {
@@ -72,6 +78,10 @@ fn float_to_rational(f: f64) -> (i64, i64) {
     (sign * p1, q1)
 }
 
+fn common_wind_prefix_len(a: &WindStack, b: &WindStack) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x.0 == y.0).count()
+}
+
 pub struct Evaluator {
     env: Env,
     output: String,
@@ -80,7 +90,11 @@ pub struct Evaluator {
     // call/cc support
     continuations: HashMap<u64, CapturedKont>,
     next_cont_id: u64,
-    pending_continuation: Option<(CapturedKont, Value)>,
+    pending_continuation: Option<(CapturedKont, Value, WindStack)>,
+    // dynamic-wind support
+    wind_stack: WindStack,
+    next_wind_id: u64,
+    cont_winds: HashMap<u64, WindStack>,
 }
 
 impl Evaluator {
@@ -90,6 +104,7 @@ impl Evaluator {
             gensym_counter: 0, record_type_counter: 0,
             continuations: HashMap::new(), next_cont_id: 0,
             pending_continuation: None,
+            wind_stack: Vec::new(), next_wind_id: 0, cont_winds: HashMap::new(),
         }
     }
 
@@ -124,9 +139,20 @@ impl Evaluator {
                 Ok(Some(val)) => return Ok(val),
                 Ok(None) => {}
                 Err(EvalError::ContinuationInvoked) => {
-                    let (captured, val) = self.pending_continuation.take().unwrap();
-                    *kstack = captured;
-                    *state = CekState::Ret(val);
+                    let (captured_k, val, captured_winds) = self.pending_continuation.take().unwrap();
+                    let common = common_wind_prefix_len(&self.wind_stack, &captured_winds);
+                    let outs: Vec<Value> = self.wind_stack[common..].iter().rev().map(|e| e.2.clone()).collect();
+                    let rewind_entries: WindStack = captured_winds[common..].to_vec();
+                    if outs.is_empty() && rewind_entries.is_empty() {
+                        *kstack = captured_k;
+                        self.wind_stack = captured_winds;
+                        *state = CekState::Ret(val);
+                    } else {
+                        self.wind_stack.truncate(common);
+                        kstack.clear();
+                        kstack.push(Frame::DynWindTransition { outs, rewind_entries, target_k: captured_k, target_val: val, target_winds: captured_winds });
+                        *state = CekState::Ret(Value::Void);
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -348,6 +374,39 @@ impl Evaluator {
                 )));
             }
             Frame::NotCheck => { *s = CekState::Ret(Value::Boolean(!val.is_truthy())); }
+            Frame::DynWindAfterIn { body, out, wind_id, in_thunk } => {
+                self.wind_stack.push((wind_id, in_thunk, out.clone()));
+                k.push(Frame::DynWindAfterBody { out, wind_id });
+                self.cek_apply(body, vec![], k, s, "dynamic-wind")?;
+            }
+            Frame::DynWindAfterBody { out, wind_id } => {
+                // val is the body's return value; pop wind entry, call out-thunk
+                self.wind_stack.retain(|e| e.0 != wind_id);
+                k.push(Frame::DynWindAfterOut { result: val });
+                self.cek_apply(out, vec![], k, s, "dynamic-wind")?;
+            }
+            Frame::DynWindAfterOut { result } => {
+                // out-thunk returned; return the body's value
+                *s = CekState::Ret(result);
+            }
+            Frame::DynWindTransition { mut outs, mut rewind_entries, target_k, target_val, target_winds } => {
+                // val is the return of the previous thunk (discarded)
+                if !outs.is_empty() {
+                    let out_thunk = outs.remove(0);
+                    k.push(Frame::DynWindTransition { outs, rewind_entries, target_k, target_val, target_winds });
+                    self.cek_apply(out_thunk, vec![], k, s, "dynamic-wind")?;
+                } else if !rewind_entries.is_empty() {
+                    let entry = rewind_entries.remove(0);
+                    let in_thunk = entry.1.clone();
+                    self.wind_stack.push(entry);
+                    k.push(Frame::DynWindTransition { outs: vec![], rewind_entries, target_k, target_val, target_winds });
+                    self.cek_apply(in_thunk, vec![], k, s, "dynamic-wind")?;
+                } else {
+                    *k = target_k;
+                    self.wind_stack = target_winds;
+                    *s = CekState::Ret(target_val);
+                }
+            }
         }
         Ok(())
     }
@@ -367,19 +426,43 @@ impl Evaluator {
             }
             Value::Continuation(id) => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("continuation: expected 1 arg at {pos}"))); }
-                let captured = self.continuations.get(id).cloned()
+                let captured_k = self.continuations.get(id).cloned()
                     .ok_or_else(|| EvalError::Custom(format!("invalid continuation at {pos}")))?;
-                *k = captured;
-                *s = CekState::Ret(args.into_iter().next().unwrap());
+                let captured_winds = self.cont_winds.get(id).cloned().unwrap_or_default();
+                let target_val = args.into_iter().next().unwrap();
+                let common = common_wind_prefix_len(&self.wind_stack, &captured_winds);
+                let outs: Vec<Value> = self.wind_stack[common..].iter().rev().map(|e| e.2.clone()).collect();
+                let rewind_entries: WindStack = captured_winds[common..].to_vec();
+                if outs.is_empty() && rewind_entries.is_empty() {
+                    *k = captured_k;
+                    self.wind_stack = captured_winds;
+                    *s = CekState::Ret(target_val);
+                } else {
+                    self.wind_stack.truncate(common);
+                    k.clear();
+                    k.push(Frame::DynWindTransition { outs, rewind_entries, target_k: captured_k, target_val, target_winds: captured_winds });
+                    *s = CekState::Ret(Value::Void);
+                }
             }
             Value::Symbol(name) if name == "call/cc" || name == "call-with-current-continuation" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("call/cc: expected 1 arg at {pos}"))); }
                 let id = self.next_cont_id;
                 self.next_cont_id += 1;
                 self.continuations.insert(id, k.clone());
+                self.cont_winds.insert(id, self.wind_stack.clone());
                 let cont_val = Value::Continuation(id);
                 let func = args.into_iter().next().unwrap();
                 self.cek_apply(func, vec![cont_val], k, s, pos)?;
+            }
+            Value::Symbol(name) if name == "dynamic-wind" => {
+                if args.len() != 3 { return Err(EvalError::Arity(format!("dynamic-wind: expected 3 args at {pos}"))); }
+                let in_thunk = args[0].clone();
+                let body = args[1].clone();
+                let out = args[2].clone();
+                let wind_id = self.next_wind_id;
+                self.next_wind_id += 1;
+                k.push(Frame::DynWindAfterIn { body, out, wind_id, in_thunk: in_thunk.clone() });
+                self.cek_apply(in_thunk, vec![], k, s, pos)?;
             }
             Value::Symbol(name) if name == "apply" => {
                 if args.len() < 2 { return Err(EvalError::Arity(format!("apply: expected at least 2 args at {pos}"))); }
@@ -573,7 +656,8 @@ impl Evaluator {
             | "caadar" | "cdaaar" | "cdaadr" | "cdadar" | "cdaddr"
             | "cddaar" | "cddadr" | "cdddar" | "cddddr"
             | "cadar"
-            | "call/cc" | "call-with-current-continuation")
+            | "call/cc" | "call-with-current-continuation"
+            | "dynamic-wind")
     }
 
     fn eval_in_env(&mut self, expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
@@ -678,7 +762,8 @@ impl Evaluator {
                 }
                 let kont = self.continuations.get(id).cloned()
                     .ok_or_else(|| EvalError::Custom(format!("invalid continuation at {call_pos}")))?;
-                self.pending_continuation = Some((kont, args.into_iter().next().unwrap()));
+                let winds = self.cont_winds.get(id).cloned().unwrap_or_default();
+                self.pending_continuation = Some((kont, args.into_iter().next().unwrap(), winds));
                 return Err(EvalError::ContinuationInvoked);
             }
             Value::Symbol(name) => self.apply_builtin(name, &args, call_pos),
@@ -1442,7 +1527,8 @@ impl Evaluator {
                 }
                 let kont = self.continuations.get(id).cloned()
                     .ok_or_else(|| EvalError::Custom(format!("invalid continuation at {call_pos}")))?;
-                self.pending_continuation = Some((kont, args.into_iter().next().unwrap()));
+                let winds = self.cont_winds.get(id).cloned().unwrap_or_default();
+                self.pending_continuation = Some((kont, args.into_iter().next().unwrap(), winds));
                 return Err(EvalError::ContinuationInvoked);
             }
             Value::Symbol(name) => {
@@ -1681,7 +1767,8 @@ impl Evaluator {
                 }
                 let kont = self.continuations.get(id).cloned()
                     .ok_or_else(|| EvalError::Custom(format!("invalid continuation at {pos}")))?;
-                self.pending_continuation = Some((kont, args.into_iter().next().unwrap()));
+                let winds = self.cont_winds.get(id).cloned().unwrap_or_default();
+                self.pending_continuation = Some((kont, args.into_iter().next().unwrap(), winds));
                 Err(EvalError::ContinuationInvoked)
             }
             Value::Symbol(name) => self.apply_builtin(name, &args, pos),
@@ -2498,12 +2585,12 @@ impl Evaluator {
                         Ok(val)
                     }
                     Err(EvalError::ContinuationInvoked) => {
-                        if let Some((kont, val)) = self.pending_continuation.take() {
+                        if let Some((kont, val, winds)) = self.pending_continuation.take() {
                             if kont.is_empty() && self.continuations.get(&id).map_or(false, |k| k.is_empty()) {
                                 self.continuations.remove(&id);
                                 Ok(val)
                             } else {
-                                self.pending_continuation = Some((kont, val));
+                                self.pending_continuation = Some((kont, val, winds));
                                 Err(EvalError::ContinuationInvoked)
                             }
                         } else {
