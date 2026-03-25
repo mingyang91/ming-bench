@@ -15,7 +15,7 @@ public class Evaluator {
      * representation of the last result.
      */
     public String evalStr(String input) throws EvalError {
-        return format(evalProgram(input));
+        return format(evalProgram(input).value());
     }
 
     /**
@@ -23,25 +23,27 @@ public class Evaluator {
      * and any captured output from display/write/newline.
      */
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        return new EvalResult(format(evalProgram(input)), "");
+        ProgramResult result = evalProgram(input);
+        return new EvalResult(format(result.value()), result.output());
     }
 
-    private Value evalProgram(String input) throws EvalError {
+    private ProgramResult evalProgram(String input) throws EvalError {
         Parser parser = new Parser(input);
         List<Expr> expressions = parser.parseProgram();
         if (expressions.isEmpty()) {
             throw new EvalError("empty input", 1, 1);
         }
 
-        Environment environment = createGlobalEnvironment();
+        StringBuilder output = new StringBuilder();
+        Environment environment = createGlobalEnvironment(output);
         Value result = VoidValue.INSTANCE;
         for (Expr expression : expressions) {
             result = eval(expression, environment);
         }
-        return result;
+        return new ProgramResult(result, output.toString());
     }
 
-    private Environment createGlobalEnvironment() {
+    private Environment createGlobalEnvironment(StringBuilder output) {
         Environment environment = new Environment(null);
         environment.define("+", new BuiltinProcedure("+", this::applyAdd));
         environment.define("-", new BuiltinProcedure("-", this::applySubtract));
@@ -76,6 +78,28 @@ public class Evaluator {
                 BoolValue.of(isType(args, pos, PairValue.class))));
         environment.define("symbol?", new BuiltinProcedure("symbol?", (args, pos) ->
                 BoolValue.of(isType(args, pos, SymbolValue.class))));
+        environment.define("display", new BuiltinProcedure("display", (args, pos) ->
+                applyDisplay(args, pos, output)));
+        environment.define("write", new BuiltinProcedure("write", (args, pos) ->
+                applyWrite(args, pos, output)));
+        environment.define("newline", new BuiltinProcedure("newline", (args, pos) ->
+                applyNewline(args, pos, output)));
+        environment.define("string-append", new BuiltinProcedure("string-append",
+                this::applyStringAppend));
+        environment.define("string-length", new BuiltinProcedure("string-length",
+                this::applyStringLength));
+        environment.define("substring", new BuiltinProcedure("substring", this::applySubstring));
+        environment.define("string->number", new BuiltinProcedure("string->number",
+                this::applyStringToNumber));
+        environment.define("number->string", new BuiltinProcedure("number->string",
+                this::applyNumberToString));
+        environment.define("symbol->string", new BuiltinProcedure("symbol->string",
+                this::applySymbolToString));
+        environment.define("string->symbol", new BuiltinProcedure("string->symbol",
+                this::applyStringToSymbol));
+        environment.define("string-ref", new BuiltinProcedure("string-ref", this::applyStringRef));
+        environment.define("char?", new BuiltinProcedure("char?", (args, pos) ->
+                BoolValue.of(isType(args, pos, CharValue.class))));
         return environment;
     }
 
@@ -432,6 +456,87 @@ public class Evaluator {
         return result;
     }
 
+    private Value applyDisplay(List<Value> arguments, SourcePos pos, StringBuilder output)
+            throws EvalError {
+        requireArgCount(arguments, 1, "display", pos);
+        output.append(formatDisplay(arguments.getFirst()));
+        return VoidValue.INSTANCE;
+    }
+
+    private Value applyWrite(List<Value> arguments, SourcePos pos, StringBuilder output)
+            throws EvalError {
+        requireArgCount(arguments, 1, "write", pos);
+        output.append(format(arguments.getFirst()));
+        return VoidValue.INSTANCE;
+    }
+
+    private Value applyNewline(List<Value> arguments, SourcePos pos, StringBuilder output)
+            throws EvalError {
+        requireArgCount(arguments, 0, "newline", pos);
+        output.append('\n');
+        return VoidValue.INSTANCE;
+    }
+
+    private Value applyStringAppend(List<Value> arguments, SourcePos pos) throws EvalError {
+        StringBuilder builder = new StringBuilder();
+        for (Value argument : arguments) {
+            builder.append(asString(argument, "string-append", pos));
+        }
+        return new StringValue(builder.toString());
+    }
+
+    private Value applyStringLength(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 1, "string-length", pos);
+        return new IntValue(BigInteger.valueOf(
+                asString(arguments.getFirst(), "string-length", pos).length()));
+    }
+
+    private Value applySubstring(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 3, "substring", pos);
+        String value = asString(arguments.get(0), "substring", pos);
+        int start = asIndex(arguments.get(1), "substring", pos);
+        int end = asIndex(arguments.get(2), "substring", pos);
+        if (start > end || end > value.length()) {
+            throw error("'substring' index out of range", pos);
+        }
+        return new StringValue(value.substring(start, end));
+    }
+
+    private Value applyStringToNumber(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 1, "string->number", pos);
+        String value = asString(arguments.getFirst(), "string->number", pos);
+        try {
+            return new IntValue(new BigInteger(value));
+        } catch (NumberFormatException ignored) {
+            return BoolValue.FALSE;
+        }
+    }
+
+    private Value applyNumberToString(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 1, "number->string", pos);
+        return new StringValue(asNumber(arguments.getFirst(), "number->string", pos).toString());
+    }
+
+    private Value applySymbolToString(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 1, "symbol->string", pos);
+        return new StringValue(asSymbol(arguments.getFirst(), "symbol->string", pos));
+    }
+
+    private Value applyStringToSymbol(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 1, "string->symbol", pos);
+        return new SymbolValue(asString(arguments.getFirst(), "string->symbol", pos));
+    }
+
+    private Value applyStringRef(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 2, "string-ref", pos);
+        String value = asString(arguments.get(0), "string-ref", pos);
+        int index = asIndex(arguments.get(1), "string-ref", pos);
+        if (index >= value.length()) {
+            throw error("'string-ref' index out of range", pos);
+        }
+        return new CharValue(value.charAt(index));
+    }
+
     private BigInteger sum(List<Value> arguments, SourcePos pos) throws EvalError {
         BigInteger result = BigInteger.ZERO;
         for (Value argument : arguments) {
@@ -540,6 +645,28 @@ public class Evaluator {
         throw error("'" + operator + "' expects a pair", pos);
     }
 
+    private String asString(Value value, String operator, SourcePos pos) throws EvalError {
+        if (value instanceof StringValue stringValue) {
+            return stringValue.value();
+        }
+        throw error("'" + operator + "' expects string arguments", pos);
+    }
+
+    private String asSymbol(Value value, String operator, SourcePos pos) throws EvalError {
+        if (value instanceof SymbolValue symbolValue) {
+            return symbolValue.name();
+        }
+        throw error("'" + operator + "' expects a symbol", pos);
+    }
+
+    private int asIndex(Value value, String operator, SourcePos pos) throws EvalError {
+        BigInteger index = asNumber(value, operator, pos);
+        if (index.signum() < 0 || index.compareTo(BigInteger.valueOf(Integer.MAX_VALUE)) > 0) {
+            throw error("'" + operator + "' expects a non-negative integer index", pos);
+        }
+        return index.intValue();
+    }
+
     private Value buildList(List<Value> values) {
         Value result = EmptyListValue.INSTANCE;
         for (int i = values.size() - 1; i >= 0; i--) {
@@ -612,6 +739,14 @@ public class Evaluator {
     }
 
     private String format(Value value) {
+        return format(value, false);
+    }
+
+    private String formatDisplay(Value value) {
+        return format(value, true);
+    }
+
+    private String format(Value value, boolean displayMode) {
         if (value instanceof IntValue intValue) {
             return intValue.value().toString();
         }
@@ -619,7 +754,16 @@ public class Evaluator {
             return boolValue.value() ? "#t" : "#f";
         }
         if (value instanceof StringValue stringValue) {
+            if (displayMode) {
+                return stringValue.value();
+            }
             return "\"" + escapeString(stringValue.value()) + "\"";
+        }
+        if (value instanceof CharValue charValue) {
+            if (displayMode) {
+                return Character.toString(charValue.value());
+            }
+            return formatCharacter(charValue.value());
         }
         if (value instanceof SymbolValue symbolValue) {
             return symbolValue.name();
@@ -628,7 +772,7 @@ public class Evaluator {
             return "()";
         }
         if (value instanceof PairValue pairValue) {
-            return formatPair(pairValue);
+            return formatPair(pairValue, displayMode);
         }
         if (value instanceof VoidValue) {
             return "#<void>";
@@ -639,7 +783,7 @@ public class Evaluator {
         throw new IllegalStateException("unsupported runtime value");
     }
 
-    private String formatPair(PairValue pairValue) {
+    private String formatPair(PairValue pairValue, boolean displayMode) {
         StringBuilder builder = new StringBuilder("(");
         Value current = pairValue;
         boolean first = true;
@@ -647,7 +791,7 @@ public class Evaluator {
             if (!first) {
                 builder.append(' ');
             }
-            builder.append(format(pair.car()));
+            builder.append(format(pair.car(), displayMode));
             current = pair.cdr();
             first = false;
         }
@@ -655,9 +799,17 @@ public class Evaluator {
         if (current instanceof EmptyListValue) {
             builder.append(')');
         } else {
-            builder.append(" . ").append(format(current)).append(')');
+            builder.append(" . ").append(format(current, displayMode)).append(')');
         }
         return builder.toString();
+    }
+
+    private String formatCharacter(char value) {
+        return switch (value) {
+            case ' ' -> "#\\space";
+            case '\n' -> "#\\newline";
+            default -> "#\\" + value;
+        };
     }
 
     private String escapeString(String value) {
@@ -719,8 +871,8 @@ public class Evaluator {
         SourcePos pos();
     }
 
-    private sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue,
-            EmptyListValue, PairValue, ProcedureValue, VoidValue {
+    private sealed interface Value permits IntValue, BoolValue, StringValue, CharValue,
+            SymbolValue, EmptyListValue, PairValue, ProcedureValue, VoidValue {
     }
 
     private sealed interface ProcedureValue extends Value permits BuiltinProcedure,
@@ -750,6 +902,9 @@ public class Evaluator {
     private record LetBinding(String name, Expr initializer) {
     }
 
+    private record ProgramResult(Value value, String output) {
+    }
+
     private record IntValue(BigInteger value) implements Value {
     }
 
@@ -763,6 +918,9 @@ public class Evaluator {
     }
 
     private record StringValue(String value) implements Value {
+    }
+
+    private record CharValue(char value) implements Value {
     }
 
     private record SymbolValue(String name) implements Value {
