@@ -213,6 +213,28 @@ function createGlobalEnvironment(output: string[]): Environment {
   );
   env.define('not', makeBuiltinProcedure('not', (args) => applyNot(args)));
   env.define('apply', makeBuiltinProcedure('apply', (args) => applyApply(args)));
+  env.define('eq?', makeBuiltinProcedure('eq?', (args) => applyEq(args)));
+  env.define('equal?', makeBuiltinProcedure('equal?', (args) => applyEqual(args)));
+
+  env.define('abs', makeBuiltinProcedure('abs', (args) => applyAbs(args)));
+  env.define('quotient', makeBuiltinProcedure('quotient', (args) => applyQuotient(args)));
+  env.define('remainder', makeBuiltinProcedure('remainder', (args) => applyRemainder(args)));
+  env.define('modulo', makeBuiltinProcedure('modulo', (args) => applyModulo(args)));
+  env.define('min', makeBuiltinProcedure('min', (args) => applyMin(args)));
+  env.define('max', makeBuiltinProcedure('max', (args) => applyMax(args)));
+  env.define('expt', makeBuiltinProcedure('expt', (args) => applyExpt(args)));
+
+  env.define('zero?', makePredicateProcedure('zero?', (value) => expectNumber(value, 'zero?') === 0));
+  env.define(
+    'positive?',
+    makePredicateProcedure('positive?', (value) => expectNumber(value, 'positive?') > 0),
+  );
+  env.define(
+    'negative?',
+    makePredicateProcedure('negative?', (value) => expectNumber(value, 'negative?') < 0),
+  );
+  env.define('odd?', makeBuiltinProcedure('odd?', (args) => applyOddPredicate(args)));
+  env.define('even?', makeBuiltinProcedure('even?', (args) => applyEvenPredicate(args)));
 
   env.define('cons', makeBuiltinProcedure('cons', (args) => applyCons(args)));
   env.define('car', makeBuiltinProcedure('car', (args) => applyCar(args)));
@@ -220,7 +242,11 @@ function createGlobalEnvironment(output: string[]): Environment {
   env.define('null?', makeBuiltinProcedure('null?', (args) => applyNullPredicate(args)));
   env.define('list', makeBuiltinProcedure('list', (args) => arrayToList(args)));
   env.define('length', makeBuiltinProcedure('length', (args) => applyLength(args)));
+  env.define('list-ref', makeBuiltinProcedure('list-ref', (args) => applyListRef(args)));
+  env.define('list-tail', makeBuiltinProcedure('list-tail', (args) => applyListTail(args)));
   env.define('append', makeBuiltinProcedure('append', (args) => applyAppend(args)));
+  env.define('assoc', makeBuiltinProcedure('assoc', (args) => applyAssoc(args)));
+  env.define('map', makeBuiltinProcedure('map', (args) => applyMap(args)));
   env.define('display', makeBuiltinProcedure('display', (args) => applyDisplay(args, output)));
   env.define('write', makeBuiltinProcedure('write', (args) => applyWrite(args, output)));
   env.define('newline', makeBuiltinProcedure('newline', (args) => applyNewline(args, output)));
@@ -234,12 +260,31 @@ function createGlobalEnvironment(output: string[]): Environment {
   env.define('symbol->string', makeBuiltinProcedure('symbol->string', (args) => applySymbolToString(args)));
   env.define('string->symbol', makeBuiltinProcedure('string->symbol', (args) => applyStringToSymbol(args)));
   env.define('string-ref', makeBuiltinProcedure('string-ref', (args) => applyStringRef(args)));
+  env.define('string=?', makeBuiltinProcedure('string=?', (args) => applyStringEqual(args)));
+  env.define('string<?', makeBuiltinProcedure('string<?', (args) => applyStringLess(args)));
+  env.define('string-ci=?', makeBuiltinProcedure('string-ci=?', (args) => applyStringCiEqual(args)));
+  env.define('string-upcase', makeBuiltinProcedure('string-upcase', (args) => applyStringUpcase(args)));
+  env.define('string-downcase', makeBuiltinProcedure('string-downcase', (args) => applyStringDowncase(args)));
+
+  env.define(
+    'char-alphabetic?',
+    makeBuiltinProcedure('char-alphabetic?', (args) => applyCharAlphabeticPredicate(args)),
+  );
+  env.define(
+    'char-numeric?',
+    makeBuiltinProcedure('char-numeric?', (args) => applyCharNumericPredicate(args)),
+  );
+  env.define('char-upcase', makeBuiltinProcedure('char-upcase', (args) => applyCharUpcase(args)));
+  env.define('char-downcase', makeBuiltinProcedure('char-downcase', (args) => applyCharDowncase(args)));
+  env.define('char=?', makeBuiltinProcedure('char=?', (args) => applyCharEqual(args)));
+  env.define('char<?', makeBuiltinProcedure('char<?', (args) => applyCharLess(args)));
 
   env.define('string?', makePredicateProcedure('string?', (value) => value.kind === 'string'));
   env.define('number?', makePredicateProcedure('number?', (value) => value.kind === 'number'));
   env.define('boolean?', makePredicateProcedure('boolean?', (value) => value.kind === 'boolean'));
   env.define('pair?', makePredicateProcedure('pair?', (value) => value.kind === 'pair'));
   env.define('symbol?', makePredicateProcedure('symbol?', (value) => value.kind === 'symbol'));
+  env.define('list?', makePredicateProcedure('list?', (value) => isProperList(value)));
   env.define('char?', makePredicateProcedure('char?', (value) => value.kind === 'char'));
 
   return env;
@@ -818,6 +863,77 @@ function applyApply(args: SchemeValue[]): SchemeValue {
   return applyProcedure(procedure, [...prefixArgs, ...finalArgs]);
 }
 
+function applyEq(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('eq?', args, 2);
+  return booleanValue(schemeEq(args[0], args[1]));
+}
+
+function applyEqual(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('equal?', args, 2);
+  return booleanValue(schemeEqual(args[0], args[1]));
+}
+
+function applyAbs(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('abs', args, 1);
+  return numberValue(Math.abs(expectNumber(args[0], 'abs')));
+}
+
+function applyQuotient(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('quotient', args, 2);
+  const [dividend, divisor] = args.map((arg) => expectInteger(arg, 'quotient'));
+  ensureNonZeroDivisor(divisor);
+  return numberValue(Math.trunc(dividend / divisor));
+}
+
+function applyRemainder(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('remainder', args, 2);
+  const [dividend, divisor] = args.map((arg) => expectInteger(arg, 'remainder'));
+  ensureNonZeroDivisor(divisor);
+  return numberValue(dividend % divisor);
+}
+
+function applyModulo(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('modulo', args, 2);
+  const [dividend, divisor] = args.map((arg) => expectInteger(arg, 'modulo'));
+  ensureNonZeroDivisor(divisor);
+
+  const remainder = dividend % divisor;
+  if (remainder === 0) {
+    return numberValue(0);
+  }
+
+  return numberValue(
+    Math.sign(remainder) === Math.sign(divisor) ? remainder : remainder + divisor,
+  );
+}
+
+function applyMin(args: SchemeValue[]): SchemeValue {
+  expectAtLeastArgCount('min', args, 1);
+  return numberValue(Math.min(...asNumbers(args, 'min')));
+}
+
+function applyMax(args: SchemeValue[]): SchemeValue {
+  expectAtLeastArgCount('max', args, 1);
+  return numberValue(Math.max(...asNumbers(args, 'max')));
+}
+
+function applyExpt(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('expt', args, 2);
+  const base = expectNumber(args[0], 'expt');
+  const exponent = expectInteger(args[1], 'expt');
+  return numberValue(base ** exponent);
+}
+
+function applyOddPredicate(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('odd?', args, 1);
+  return booleanValue(Math.abs(expectInteger(args[0], 'odd?') % 2) === 1);
+}
+
+function applyEvenPredicate(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('even?', args, 1);
+  return booleanValue(expectInteger(args[0], 'even?') % 2 === 0);
+}
+
 function applyCons(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('cons', args, 2);
   return pairValue(args[0], args[1]);
@@ -843,6 +959,43 @@ function applyLength(args: SchemeValue[]): SchemeValue {
   return numberValue(expectList(args[0], 'length').length);
 }
 
+function applyListRef(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('list-ref', args, 2);
+
+  const elements = expectList(args[0], 'list-ref');
+  const index = expectIndex(args[1], 'list-ref');
+  if (index >= elements.length) {
+    throw new EvalError('list-ref index out of range');
+  }
+
+  return elements[index];
+}
+
+function applyListTail(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('list-tail', args, 2);
+
+  const index = expectIndex(args[1], 'list-tail');
+  let current = args[0];
+  for (let remaining = index; remaining > 0; remaining -= 1) {
+    if (current.kind === 'pair') {
+      current = current.cdr;
+      continue;
+    }
+
+    if (current.kind === 'empty-list') {
+      throw new EvalError('list-tail index out of range');
+    }
+
+    throw new EvalError('list-tail expected a proper list');
+  }
+
+  if (current.kind !== 'pair' && current.kind !== 'empty-list') {
+    throw new EvalError('list-tail expected a proper list');
+  }
+
+  return current;
+}
+
 function applyAppend(args: SchemeValue[]): SchemeValue {
   if (args.length === 0) {
     return EMPTY_LIST_VALUE;
@@ -857,6 +1010,55 @@ function applyAppend(args: SchemeValue[]): SchemeValue {
   }
 
   return result;
+}
+
+function applyAssoc(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('assoc', args, 2);
+
+  const target = args[0];
+  let current = args[1];
+  const visited = new Set<PairValue>();
+  while (current.kind === 'pair') {
+    if (visited.has(current)) {
+      throw new EvalError('assoc expected a proper list');
+    }
+    visited.add(current);
+
+    const entry = current.car;
+    if (entry.kind !== 'pair') {
+      throw new EvalError('assoc expected an association list');
+    }
+
+    if (schemeEqual(target, entry.car)) {
+      return entry;
+    }
+
+    current = current.cdr;
+  }
+
+  if (current.kind !== 'empty-list') {
+    throw new EvalError('assoc expected a proper list');
+  }
+
+  return FALSE_VALUE;
+}
+
+function applyMap(args: SchemeValue[]): SchemeValue {
+  expectAtLeastArgCount('map', args, 2);
+
+  const procedure = args[0];
+  const lists = args.slice(1).map((arg) => expectList(arg, 'map'));
+  const resultLength = lists.reduce(
+    (shortest, list) => Math.min(shortest, list.length),
+    Number.POSITIVE_INFINITY,
+  );
+
+  const results: SchemeValue[] = [];
+  for (let index = 0; index < resultLength; index += 1) {
+    results.push(applyProcedure(procedure, lists.map((list) => list[index])));
+  }
+
+  return arrayToList(results);
 }
 
 function applyDisplay(args: SchemeValue[], output: string[]): SchemeValue {
@@ -958,6 +1160,67 @@ function applyStringRef(args: SchemeValue[]): SchemeValue {
   return charValue(chars[index]);
 }
 
+function applyStringEqual(args: SchemeValue[]): SchemeValue {
+  expectAtLeastArgCount('string=?', args, 2);
+  return booleanValue(compareStringChain(args, (left, right) => compareStrings(left, right) === 0, 'string=?'));
+}
+
+function applyStringLess(args: SchemeValue[]): SchemeValue {
+  expectAtLeastArgCount('string<?', args, 2);
+  return booleanValue(compareStringChain(args, (left, right) => compareStrings(left, right) < 0, 'string<?'));
+}
+
+function applyStringCiEqual(args: SchemeValue[]): SchemeValue {
+  expectAtLeastArgCount('string-ci=?', args, 2);
+  return booleanValue(
+    compareStringChain(
+      args,
+      (left, right) => compareStrings(left.toLowerCase(), right.toLowerCase()) === 0,
+      'string-ci=?',
+    ),
+  );
+}
+
+function applyStringUpcase(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('string-upcase', args, 1);
+  return stringValue(expectString(args[0], 'string-upcase').toUpperCase());
+}
+
+function applyStringDowncase(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('string-downcase', args, 1);
+  return stringValue(expectString(args[0], 'string-downcase').toLowerCase());
+}
+
+function applyCharAlphabeticPredicate(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('char-alphabetic?', args, 1);
+  return booleanValue(/^\p{L}$/u.test(expectChar(args[0], 'char-alphabetic?')));
+}
+
+function applyCharNumericPredicate(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('char-numeric?', args, 1);
+  return booleanValue(/^\p{Nd}$/u.test(expectChar(args[0], 'char-numeric?')));
+}
+
+function applyCharUpcase(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('char-upcase', args, 1);
+  return charValue(expectChar(args[0], 'char-upcase').toUpperCase());
+}
+
+function applyCharDowncase(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('char-downcase', args, 1);
+  return charValue(expectChar(args[0], 'char-downcase').toLowerCase());
+}
+
+function applyCharEqual(args: SchemeValue[]): SchemeValue {
+  expectAtLeastArgCount('char=?', args, 2);
+  return booleanValue(compareCharChain(args, (left, right) => left === right, 'char=?'));
+}
+
+function applyCharLess(args: SchemeValue[]): SchemeValue {
+  expectAtLeastArgCount('char<?', args, 2);
+  return booleanValue(compareCharChain(args, (left, right) => left < right, 'char<?'));
+}
+
 function asNumbers(args: SchemeValue[], name: string): number[] {
   return args.map((arg) => expectNumber(arg, name));
 }
@@ -968,6 +1231,15 @@ function expectNumber(value: SchemeValue, name: string): number {
   }
 
   return value.value;
+}
+
+function expectInteger(value: SchemeValue, name: string): number {
+  const number = expectNumber(value, name);
+  if (!Number.isInteger(number)) {
+    throw new EvalError(`${name} expected an integer`);
+  }
+
+  return number;
 }
 
 function expectString(value: SchemeValue, name: string): string {
@@ -1026,8 +1298,14 @@ function expectIndex(value: SchemeValue, name: string): number {
 function expectList(value: SchemeValue, name: string): SchemeValue[] {
   const elements: SchemeValue[] = [];
   let current = value;
+  const visited = new Set<PairValue>();
 
   while (current.kind === 'pair') {
+    if (visited.has(current)) {
+      throw new EvalError(`${name} expected a proper list`);
+    }
+    visited.add(current);
+
     elements.push(current.car);
     current = current.cdr;
   }
@@ -1067,6 +1345,12 @@ function expectAtLeastArgCount(name: string, values: ArrayLike<unknown>, minimum
 
 function sum(values: number[]): number {
   return values.reduce((total, value) => total + value, 0);
+}
+
+function ensureNonZeroDivisor(value: number): void {
+  if (value === 0) {
+    throw new EvalError('division by zero');
+  }
 }
 
 function subtract(values: number[]): number {
@@ -1119,6 +1403,50 @@ function compareChain(
   }
 
   return true;
+}
+
+function compareCharChain(
+  args: SchemeValue[],
+  predicate: (left: number, right: number) => boolean,
+  name: string,
+): boolean {
+  const values = args.map((arg) => charCodePoint(expectChar(arg, name)));
+  for (let index = 0; index < values.length - 1; index += 1) {
+    if (!predicate(values[index], values[index + 1])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function compareStringChain(
+  args: SchemeValue[],
+  predicate: (left: string, right: string) => boolean,
+  name: string,
+): boolean {
+  const values = args.map((arg) => expectString(arg, name));
+  for (let index = 0; index < values.length - 1; index += 1) {
+    if (!predicate(values[index], values[index + 1])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function compareStrings(left: string, right: string): number {
+  const leftChars = readStringChars(left);
+  const rightChars = readStringChars(right);
+  const sharedLength = Math.min(leftChars.length, rightChars.length);
+  for (let index = 0; index < sharedLength; index += 1) {
+    const difference = charCodePoint(leftChars[index]) - charCodePoint(rightChars[index]);
+    if (difference !== 0) {
+      return difference;
+    }
+  }
+
+  return leftChars.length - rightChars.length;
 }
 
 function formatValue(value: SchemeValue): string {
@@ -1209,8 +1537,73 @@ function formatChar(value: string): string {
   return `#\\${value}`;
 }
 
+function charCodePoint(value: string): number {
+  return value.codePointAt(0) ?? 0;
+}
+
 function isTruthy(value: SchemeValue): boolean {
   return value.kind !== 'boolean' || value.value;
+}
+
+function isProperList(value: SchemeValue): boolean {
+  let current = value;
+  const visited = new Set<PairValue>();
+  while (current.kind === 'pair') {
+    if (visited.has(current)) {
+      return false;
+    }
+    visited.add(current);
+    current = current.cdr;
+  }
+
+  return current.kind === 'empty-list';
+}
+
+function schemeEq(left: SchemeValue, right: SchemeValue): boolean {
+  if (left.kind !== right.kind) {
+    return false;
+  }
+
+  switch (left.kind) {
+    case 'number':
+    case 'boolean':
+    case 'char':
+    case 'symbol':
+      return left.value === (right as typeof left).value;
+    case 'empty-list':
+    case 'void':
+      return true;
+    case 'string':
+    case 'pair':
+    case 'procedure':
+      return left === right;
+  }
+}
+
+function schemeEqual(left: SchemeValue, right: SchemeValue): boolean {
+  if (left.kind !== right.kind) {
+    return false;
+  }
+
+  switch (left.kind) {
+    case 'number':
+    case 'boolean':
+    case 'char':
+    case 'symbol':
+      return left.value === (right as typeof left).value;
+    case 'string':
+      return left.value === (right as StringValue).value;
+    case 'empty-list':
+    case 'void':
+      return true;
+    case 'pair':
+      return (
+        schemeEqual(left.car, (right as PairValue).car) &&
+        schemeEqual(left.cdr, (right as PairValue).cdr)
+      );
+    case 'procedure':
+      return left === right;
+  }
 }
 
 function numberValue(value: number): NumberValue {
