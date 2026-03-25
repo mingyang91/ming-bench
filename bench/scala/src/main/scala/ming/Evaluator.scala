@@ -1,64 +1,11 @@
 package ming
 
-import scala.collection.mutable
-
-case class Pos(line: Int, col: Int)
-
-/** Scheme value types */
-enum SchemeVal:
-  var pos: Option[Pos] = None
-  case SInt(value: Long)
-  case SBool(value: Boolean)
-  case SString(value: StringBuilder)
-  case SSymbol(name: String)
-  case SChar(value: Char)
-  case SList(elems: List[SchemeVal])
-  case SVoid
-  case SLambda(params: List[String], restParam: Option[String], body: List[SchemeVal], closure: Env)
-
-  /** Write representation (with quotes for strings). */
-  def display: String = this match
-    case SInt(v)             => v.toString
-    case SBool(v)            => if v then "#t" else "#f"
-    case SString(v)          => s""""${v.toString}""""
-    case SSymbol(n)          => n
-    case SChar(c)            => s"#\\$c"
-    case SList(es)           => "(" + es.map(_.display).mkString(" ") + ")"
-    case SVoid               => ""
-    case SLambda(_, _, _, _) => "#<procedure>"
-
-  /** Display representation (no quotes for strings). */
-  def displayRepr: String = this match
-    case SString(v) => v.toString
-    case other      => other.display
-
-/** Environment with parent chain */
-class Env(val parent: Option[Env] = None):
-  private val bindings = mutable.HashMap[String, SchemeVal]()
-
-  def get(name: String): SchemeVal =
-    bindings.get(name) match
-      case Some(v) => v
-      case None =>
-        parent match
-          case Some(p) => p.get(name)
-          case None    => throw new EvalError(s"unbound variable: $name")
-
-  def define(name: String, value: SchemeVal): Unit =
-    bindings(name) = value
-
-  def set(name: String, value: SchemeVal): Unit =
-    if bindings.contains(name) then bindings(name) = value
-    else
-      parent match
-        case Some(p) => p.set(name, value)
-        case None    => throw new EvalError(s"unbound variable: $name")
-
 /** Scheme interpreter entry point. */
 object Evaluator:
 
   /** Thread-local output buffer for display/write/newline. */
-  private val outputBuffer: ThreadLocal[StringBuilder] = ThreadLocal.withInitial(() => new StringBuilder())
+  private val outputBuffer: ThreadLocal[StringBuilder] =
+    ThreadLocal.withInitial(() => new StringBuilder())
 
   private def isTruthy(v: SchemeVal): Boolean = v match
     case SchemeVal.SBool(false) => false
@@ -70,7 +17,8 @@ object Evaluator:
   def eval(expr: SchemeVal, env: Env): SchemeVal =
     try
       expr match
-        case SchemeVal.SInt(_) | SchemeVal.SBool(_) | SchemeVal.SString(_) | SchemeVal.SChar(_) | SchemeVal.SVoid =>
+        case SchemeVal.SInt(_) | SchemeVal.SBool(_) | SchemeVal.SString(_) | SchemeVal.SChar(_) | SchemeVal.SVoid |
+            SchemeVal.SPair(_, _) =>
           expr
         case SchemeVal.SSymbol(name) => env.get(name)
         case SchemeVal.SList(elems) =>
@@ -96,8 +44,12 @@ object Evaluator:
     catch
       case e: EvalError if !e.hasPosition =>
         expr.pos match
-          case Some(p) => throw new EvalError(s"${e.getMessage} at ${p.line}:${p.col}", hasPosition = true)
-          case None    => throw e
+          case Some(p) =>
+            throw new EvalError(
+              s"${e.getMessage} at ${p.line}:${p.col}",
+              hasPosition = true
+            )
+          case None => throw e
 
   private def evalIf(args: List[SchemeVal], env: Env): SchemeVal =
     if args.length < 2 || args.length > 3 then throw new EvalError("if: expected 2 or 3 arguments")
@@ -118,21 +70,32 @@ object Evaluator:
       case _ => throw new EvalError("define: bad syntax")
 
   /** Parse parameter list, returning (fixed params, optional rest param) */
-  private def parseParams(params: List[SchemeVal]): (List[String], Option[String]) =
+  private def parseParams(
+    params: List[SchemeVal]
+  ): (List[String], Option[String]) =
     val dotIdx = params.indexWhere(_ == SchemeVal.SSymbol("."))
     if dotIdx >= 0 then
       if dotIdx != params.length - 2 then throw new EvalError("bad dot syntax in parameter list")
       val fixed = params.take(dotIdx).map {
         case SchemeVal.SSymbol(n) => n
-        case other                => throw new EvalError(s"expected parameter name, got ${other.display}")
+        case other =>
+          throw new EvalError(
+            s"expected parameter name, got ${other.display}"
+          )
       }
       params(dotIdx + 1) match
         case SchemeVal.SSymbol(rest) => (fixed, Some(rest))
-        case other                   => throw new EvalError(s"expected parameter name, got ${other.display}")
+        case other =>
+          throw new EvalError(
+            s"expected parameter name, got ${other.display}"
+          )
     else
       val names = params.map {
         case SchemeVal.SSymbol(n) => n
-        case other                => throw new EvalError(s"expected parameter name, got ${other.display}")
+        case other =>
+          throw new EvalError(
+            s"expected parameter name, got ${other.display}"
+          )
       }
       (names, None)
 
@@ -174,14 +137,18 @@ object Evaluator:
           case _                                     => throw new EvalError("let: bad binding")
         }
         val letEnv = Env(Some(env))
-        letEnv.define(name, SchemeVal.SLambda(paramNames, None, body, letEnv))
+        letEnv.define(
+          name,
+          SchemeVal.SLambda(paramNames, None, body, letEnv)
+        )
         paramNames.zip(initVals).foreach((p, v) => letEnv.define(p, v))
         evalBody(body, letEnv)
       // Regular let: (let ((var init) ...) body ...)
       case SchemeVal.SList(bindings) :: body if body.nonEmpty =>
         val pairs = bindings.map {
-          case SchemeVal.SList(SchemeVal.SSymbol(n) :: initExpr :: Nil) => (n, eval(initExpr, env))
-          case _                                                        => throw new EvalError("let: bad binding")
+          case SchemeVal.SList(SchemeVal.SSymbol(n) :: initExpr :: Nil) =>
+            (n, eval(initExpr, env))
+          case _ => throw new EvalError("let: bad binding")
         }
         val letEnv = Env(Some(env))
         pairs.foreach((n, v) => letEnv.define(n, v))
@@ -219,55 +186,102 @@ object Evaluator:
         restParam match
           case None =>
             if params.length != args.length then
-              throw new EvalError(s"expected ${params.length} arguments, got ${args.length}")
+              throw new EvalError(
+                s"expected ${params.length} arguments, got ${args.length}"
+              )
             val callEnv = Env(Some(closure))
             params.zip(args).foreach((p, a) => callEnv.define(p, a))
             evalBody(body, callEnv)
           case Some(rest) =>
             if args.length < params.length then
-              throw new EvalError(s"expected at least ${params.length} arguments, got ${args.length}")
+              throw new EvalError(
+                s"expected at least ${params.length} arguments, got ${args.length}"
+              )
             val callEnv = Env(Some(closure))
             params.zip(args).foreach((p, a) => callEnv.define(p, a))
             callEnv.define(rest, SchemeVal.SList(args.drop(params.length)))
             evalBody(body, callEnv)
       case SchemeVal.SSymbol(name) =>
-        name match
-          case "display" =>
-            if args.length != 1 then throw new EvalError("display: expected 1 argument")
-            outputBuffer.get().append(args.head.displayRepr)
-            SchemeVal.SVoid
-          case "write" =>
-            if args.length != 1 then throw new EvalError("write: expected 1 argument")
-            outputBuffer.get().append(args.head.display)
-            SchemeVal.SVoid
-          case "newline" =>
-            if args.nonEmpty then throw new EvalError("newline: expected 0 arguments")
-            outputBuffer.get().append("\n")
-            SchemeVal.SVoid
-          case "apply" =>
-            if args.length < 2 then throw new EvalError("apply: expected at least 2 arguments")
-            val proc = args.head
-            val lastArg = args.last match
-              case SchemeVal.SList(elems) => elems
-              case other => throw new EvalError(s"apply: last argument must be a list, got ${other.display}")
-            val prefixArgs = args.slice(1, args.length - 1)
-            applyProc(proc, prefixArgs ++ lastArg)
-          case _ => Builtins.applyBuiltin(name, args)
+        applyBuiltinOrHOF(name, args)
       case _ => throw new EvalError(s"not a procedure: ${op.display}")
+
+  private def applyBuiltinOrHOF(
+    name: String,
+    args: List[SchemeVal]
+  ): SchemeVal =
+    name match
+      case "display" =>
+        if args.length != 1 then throw new EvalError("display: expected 1 argument")
+        outputBuffer.get().append(args.head.displayRepr)
+        SchemeVal.SVoid
+      case "write" =>
+        if args.length != 1 then throw new EvalError("write: expected 1 argument")
+        outputBuffer.get().append(args.head.display)
+        SchemeVal.SVoid
+      case "newline" =>
+        if args.nonEmpty then throw new EvalError("newline: expected 0 arguments")
+        outputBuffer.get().append("\n")
+        SchemeVal.SVoid
+      case "apply" =>
+        if args.length < 2 then throw new EvalError("apply: expected at least 2 arguments")
+        val proc = args.head
+        val lastArg = args.last match
+          case SchemeVal.SList(elems) => elems
+          case other =>
+            throw new EvalError(
+              s"apply: last argument must be a list, got ${other.display}"
+            )
+        val prefixArgs = args.slice(1, args.length - 1)
+        applyProc(proc, prefixArgs ++ lastArg)
+      case "map" =>
+        if args.length < 2 then throw new EvalError("map: expected at least 2 arguments")
+        val proc = args.head
+        val lists = args.tail.map {
+          case SchemeVal.SList(elems) => elems
+          case other =>
+            throw new EvalError(
+              s"map: expected list, got ${other.display}"
+            )
+        }
+        val len = lists.head.length
+        val result = (0 until len).map { i =>
+          val mapArgs = lists.map(_(i))
+          applyProc(proc, mapArgs)
+        }.toList
+        SchemeVal.SList(result)
+      case "for-each" =>
+        if args.length < 2 then throw new EvalError("for-each: expected at least 2 arguments")
+        val proc = args.head
+        val lists = args.tail.map {
+          case SchemeVal.SList(elems) => elems
+          case other =>
+            throw new EvalError(
+              s"for-each: expected list, got ${other.display}"
+            )
+        }
+        val len = lists.head.length
+        (0 until len).foreach { i =>
+          val feArgs = lists.map(_(i))
+          applyProc(proc, feArgs)
+        }
+        SchemeVal.SVoid
+      case _ => Builtins.applyBuiltin(name, args)
 
   private def makeGlobalEnv(): Env =
     val env = Env()
     for name <- Builtins.names do env.define(name, SchemeVal.SSymbol(name))
     env
 
-  /** Evaluate one or more Scheme expressions and return the string representation of the last result. */
+  /** Evaluate one or more Scheme expressions and return the string representation of the last result.
+    */
   def evalStr(input: String): String =
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw new EvalError("empty input")
     val env = makeGlobalEnv()
     evalBody(exprs, env).display
 
-  /** Evaluate Scheme expressions and return both the result string and any captured output. */
+  /** Evaluate Scheme expressions and return both the result string and any captured output.
+    */
   def evalStrWithOutput(input: String): (String, String) =
     val buf = outputBuffer.get()
     buf.clear()
