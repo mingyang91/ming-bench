@@ -281,6 +281,22 @@ function makeGlobalEnv(): Env {
     return { tag: 'char', value: args[0].value[idx] };
   });
 
+  defBuiltin('string-copy', (args) => {
+    if (args.length !== 1 || args[0].tag !== 'string')
+      throw new EvalError('string-copy: expected 1 string argument');
+    return { tag: 'string', value: args[0].value };
+  });
+
+  defBuiltin('string-set!', (args) => {
+    if (args.length !== 3) throw new EvalError('string-set!: expected 3 arguments');
+    if (args[0].tag !== 'string') throw new EvalError('string-set!: expected string');
+    const idx = expectNum(args[1], 'string-set!');
+    if (args[2].tag !== 'char') throw new EvalError('string-set!: expected char');
+    const s = args[0].value;
+    (args[0] as any).value = s.substring(0, idx) + args[2].value + s.substring(idx + 1);
+    return { tag: 'void' };
+  });
+
   defBuiltin('symbol->string', (args) => {
     if (args.length !== 1 || args[0].tag !== 'symbol')
       throw new EvalError('symbol->string: expected 1 symbol argument');
@@ -379,6 +395,14 @@ function parse(tokens: Token[]): SchemeVal[] {
     if (tok.text === '#t') return { tag: 'boolean', value: true, pos: tok.pos };
     if (tok.text === '#f') return { tag: 'boolean', value: false, pos: tok.pos };
     if (tok.text.startsWith('"')) return { tag: 'string', value: tok.text.slice(1, -1), pos: tok.pos };
+    if (tok.text.startsWith('#\\')) {
+      const charPart = tok.text.slice(2);
+      if (charPart === 'space') return { tag: 'char', value: ' ', pos: tok.pos };
+      if (charPart === 'newline') return { tag: 'char', value: '\n', pos: tok.pos };
+      if (charPart === 'tab') return { tag: 'char', value: '\t', pos: tok.pos };
+      if (charPart.length === 1) return { tag: 'char', value: charPart, pos: tok.pos };
+      throw new EvalError(`unknown character literal: ${tok.text}`);
+    }
     if (/^-?\d+$/.test(tok.text)) return { tag: 'number', value: parseInt(tok.text, 10), pos: tok.pos };
     return { tag: 'symbol', value: tok.text, pos: tok.pos };
   }
@@ -408,7 +432,7 @@ function isTruthy(val: SchemeVal): boolean {
 }
 
 function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
-  if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string') {
+  if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') {
     return expr;
   }
 
