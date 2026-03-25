@@ -70,6 +70,7 @@ type evalState struct {
 }
 
 var currentEvalState *evalState
+var currentWindStack []windEntry
 
 func evalExpr(expr Expr, env *Env) (Value, error) {
 	for {
@@ -143,6 +144,8 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quote requires 1 argument", sym.Line, sym.Col)}
 				}
 				return quoteExpr(e.Elems[1])
+			case "dynamic-wind":
+				return evalDynamicWind(e, env)
 			case "begin":
 				if len(e.Elems) < 2 {
 					return &VoidVal{}, nil
@@ -3071,6 +3074,100 @@ func schemeEqual(a, b Value) bool {
 	return eq(a, b)
 }
 
+// doWindTransition unwinds from the current wind stack and rewinds to the
+// target wind stack, calling out-thunks and in-thunks in the correct order.
+func doWindTransition(target []windEntry) error {
+	// Find the common prefix length
+	current := currentWindStack
+	commonLen := 0
+	for commonLen < len(current) && commonLen < len(target) {
+		if current[commonLen].In == target[commonLen].In && current[commonLen].Out == target[commonLen].Out {
+			commonLen++
+		} else {
+			break
+		}
+	}
+	// Unwind: call out-thunks from innermost to the common prefix
+	for i := len(current) - 1; i >= commonLen; i-- {
+		if _, err := applyCallable(current[i].Out, nil); err != nil {
+			return err
+		}
+	}
+	// Rewind: call in-thunks from the common prefix to innermost
+	for i := commonLen; i < len(target); i++ {
+		if _, err := applyCallable(target[i].In, nil); err != nil {
+			return err
+		}
+	}
+	// Update current wind stack to target
+	currentWindStack = make([]windEntry, len(target))
+	copy(currentWindStack, target)
+	return nil
+}
+
+// evalDynamicWind implements (dynamic-wind in-thunk body-thunk out-thunk).
+func evalDynamicWind(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Elems) != 4 {
+		return nil, &EvalError{Message: "dynamic-wind: need 3 arguments"}
+	}
+	inThunk, err := evalExpr(e.Elems[1], env)
+	if err != nil {
+		return nil, err
+	}
+	bodyThunk, err := evalExpr(e.Elems[2], env)
+	if err != nil {
+		return nil, err
+	}
+	outThunk, err := evalExpr(e.Elems[3], env)
+	if err != nil {
+		return nil, err
+	}
+
+	// Call in-thunk
+	if _, err := applyCallable(inThunk, nil); err != nil {
+		return nil, err
+	}
+
+	// Push wind entry
+	entry := windEntry{In: inThunk, Out: outThunk}
+	currentWindStack = append(currentWindStack, entry)
+
+	// Call body-thunk, catching continuation escapes to run out-thunk
+	var result Value
+	var bodyErr error
+	escaped := false
+	var escapePanic interface{}
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if _, ok := r.(contInvokePanic); ok {
+					escaped = true
+					escapePanic = r
+					return
+				}
+				panic(r)
+			}
+		}()
+		result, bodyErr = applyCallable(bodyThunk, nil)
+	}()
+
+	// Pop wind entry
+	currentWindStack = currentWindStack[:len(currentWindStack)-1]
+
+	// Call out-thunk
+	if _, err := applyCallable(outThunk, nil); err != nil {
+		return nil, err
+	}
+
+	if escaped {
+		// Re-panic to propagate the continuation escape
+		panic(escapePanic)
+	}
+
+	return result, bodyErr
+}
+
 // EvalStr evaluates one or more Scheme expressions and returns the string
 // representation of the last result.
 // handleCallCC implements call/cc. It captures the current continuation,
@@ -3091,14 +3188,19 @@ func handleCallCC(f Value) (Value, error) {
 	if state != nil {
 		topCopy := make([]Expr, len(state.topExprs)-state.curIdx)
 		copy(topCopy, state.topExprs[state.curIdx:])
+		windsCopy := make([]windEntry, len(currentWindStack))
+		copy(windsCopy, currentWindStack)
 		cont = &ContinuationVal{
 			topExprs:  topCopy,
 			topEnv:    state.topEnv,
 			bodyExprs: state.bodyExprs,
 			bodyEnv:   state.bodyEnv,
+			winds:     windsCopy,
 		}
 	} else {
-		cont = &ContinuationVal{}
+		windsCopy := make([]windEntry, len(currentWindStack))
+		copy(windsCopy, currentWindStack)
+		cont = &ContinuationVal{winds: windsCopy}
 	}
 
 	// Call f(cont) with panic/recover for escape continuations
@@ -3166,6 +3268,8 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	if len(exprs) == 0 {
 		return "", "", nil
 	}
+	// Reset wind stack for each top-level evaluation
+	currentWindStack = nil
 	var buf strings.Builder
 	env := makeGlobalEnv(&buf)
 	last, evalErr := evalTopLevel(exprs, env)
@@ -3218,6 +3322,9 @@ func evalTopLevel(exprs []Expr, env *Env) (Value, error) {
 			return nil, evalErr
 		}
 		if restart != nil {
+			// Reset wind stack — the re-evaluation of dynamic-wind forms
+			// will naturally rebuild it via in-thunk calls.
+			currentWindStack = nil
 			// A saved continuation was invoked. Set override and re-evaluate.
 			val := restart.value
 			state.callccOverride = &val

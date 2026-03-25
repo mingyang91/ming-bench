@@ -67,12 +67,19 @@ func (v *CallCCVal) String() string {
 	return "#<procedure call-with-current-continuation>"
 }
 
+// windEntry represents one dynamic-wind frame.
+type windEntry struct {
+	In  Value // in-thunk
+	Out Value // out-thunk
+}
+
 // ContinuationVal is a captured continuation from call/cc.
 type ContinuationVal struct {
 	topExprs  []Expr // top-level expressions from the capturing expression onward
 	topEnv    *Env   // top-level environment (shared, mutable)
 	bodyExprs []Expr // if non-nil, restart from these body expressions instead
 	bodyEnv   *Env   // environment for bodyExprs
+	winds     []windEntry // dynamic-wind stack at capture time
 }
 
 func (v *ContinuationVal) String() string {
