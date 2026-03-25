@@ -36,6 +36,13 @@ type stringExpr struct {
 
 func (e *stringExpr) pos() position { return e.at }
 
+type charExpr struct {
+	value rune
+	at    position
+}
+
+func (e *charExpr) pos() position { return e.at }
+
 type symbolExpr struct {
 	name string
 	at   position
@@ -60,6 +67,7 @@ const (
 	tokenInteger
 	tokenBoolean
 	tokenString
+	tokenChar
 	tokenSymbol
 )
 
@@ -68,6 +76,7 @@ type token struct {
 	text    string
 	number  int64
 	boolean bool
+	char    rune
 	at      position
 }
 
@@ -191,6 +200,14 @@ func (l *lexer) readAtom(start position) (token, error) {
 		return token{kind: tokenBoolean, boolean: false, text: text, at: start}, nil
 	}
 
+	if strings.HasPrefix(text, "#\\") {
+		ch, ok := parseCharLiteral(text)
+		if !ok {
+			return token{}, newEvalError(ErrSyntax, fmt.Sprintf("invalid character literal: %s", text), start)
+		}
+		return token{kind: tokenChar, char: ch, text: text, at: start}, nil
+	}
+
 	if isIntegerLiteral(text) {
 		value, err := strconv.ParseInt(text, 10, 64)
 		if err != nil {
@@ -251,6 +268,26 @@ func isIntegerLiteral(text string) bool {
 	return true
 }
 
+func parseCharLiteral(text string) (rune, bool) {
+	if !strings.HasPrefix(text, "#\\") {
+		return 0, false
+	}
+
+	name := text[2:]
+	switch name {
+	case "space":
+		return ' ', true
+	case "newline":
+		return '\n', true
+	}
+
+	runes := []rune(name)
+	if len(runes) != 1 {
+		return 0, false
+	}
+	return runes[0], true
+}
+
 type parser struct {
 	tokens []token
 	index  int
@@ -284,6 +321,9 @@ func (p *parser) parseExpr() (expr, error) {
 	case tokenString:
 		p.index++
 		return &stringExpr{value: tok.text, at: tok.at}, nil
+	case tokenChar:
+		p.index++
+		return &charExpr{value: tok.char, at: tok.at}, nil
 	case tokenSymbol:
 		p.index++
 		return &symbolExpr{name: tok.text, at: tok.at}, nil
@@ -350,6 +390,30 @@ type value interface{}
 type symbolValue string
 
 type charValue rune
+
+type stringValue struct {
+	chars   []rune
+	mutable bool
+}
+
+func newStringValue(text string) *stringValue {
+	return &stringValue{
+		chars:   []rune(text),
+		mutable: true,
+	}
+}
+
+func (s *stringValue) text() string {
+	return string(s.chars)
+}
+
+func (s *stringValue) copy(mutable bool) *stringValue {
+	chars := append([]rune(nil), s.chars...)
+	return &stringValue{
+		chars:   chars,
+		mutable: mutable,
+	}
+}
 
 type emptyListValue struct{}
 
@@ -435,6 +499,8 @@ func (it *interpreter) installBuiltins() {
 	it.global.define("display", &builtinProc{name: "display", fn: builtinDisplay})
 	it.global.define("write", &builtinProc{name: "write", fn: builtinWrite})
 	it.global.define("newline", &builtinProc{name: "newline", fn: builtinNewline})
+	it.global.define("string-copy", &builtinProc{name: "string-copy", fn: builtinStringCopy})
+	it.global.define("string-set!", &builtinProc{name: "string-set!", fn: builtinStringSet})
 	it.global.define("string-append", &builtinProc{name: "string-append", fn: builtinStringAppend})
 	it.global.define("string-length", &builtinProc{name: "string-length", fn: builtinStringLength})
 	it.global.define("substring", &builtinProc{name: "substring", fn: builtinSubstring})
@@ -473,7 +539,9 @@ func (it *interpreter) eval(node expr, scope *env) (value, error) {
 	case *boolExpr:
 		return expr.value, nil
 	case *stringExpr:
-		return expr.value, nil
+		return newStringValue(expr.value), nil
+	case *charExpr:
+		return charValue(expr.value), nil
 	case *symbolExpr:
 		value, ok := scope.lookup(expr.name)
 		if !ok {
@@ -824,7 +892,9 @@ func datumToValue(node expr) (value, error) {
 	case *boolExpr:
 		return expr.value, nil
 	case *stringExpr:
-		return expr.value, nil
+		return newStringValue(expr.value), nil
+	case *charExpr:
+		return charValue(expr.value), nil
 	case *symbolExpr:
 		return symbolValue(expr.name), nil
 	case *listExpr:
@@ -1057,7 +1127,7 @@ func builtinStringPred(_ *interpreter, args []value, callPos position) (value, e
 	if len(args) != 1 {
 		return nil, wrongArgCount(callPos, "string?", "expected exactly 1 argument")
 	}
-	_, ok := args[0].(string)
+	_, ok := args[0].(*stringValue)
 	return ok, nil
 }
 
@@ -1127,6 +1197,43 @@ func builtinNewline(it *interpreter, args []value, callPos position) (value, err
 	return voidValue{}, nil
 }
 
+func builtinStringCopy(_ *interpreter, args []value, callPos position) (value, error) {
+	if len(args) != 1 {
+		return nil, wrongArgCount(callPos, "string-copy", "expected exactly 1 argument")
+	}
+
+	s, err := expectString(args[0], callPos)
+	if err != nil {
+		return nil, err
+	}
+	return s.copy(true), nil
+}
+
+func builtinStringSet(_ *interpreter, args []value, callPos position) (value, error) {
+	if len(args) != 3 {
+		return nil, wrongArgCount(callPos, "string-set!", "expected exactly 3 arguments")
+	}
+
+	s, err := expectString(args[0], callPos)
+	if err != nil {
+		return nil, err
+	}
+	index, err := expectIndex(args[1], callPos)
+	if err != nil {
+		return nil, err
+	}
+	ch, err := expectChar(args[2], callPos)
+	if err != nil {
+		return nil, err
+	}
+
+	if index < 0 || index >= len(s.chars) {
+		return nil, newEvalError(ErrOutOfRange, "string-set!: index out of range", callPos)
+	}
+	s.chars[index] = rune(ch)
+	return voidValue{}, nil
+}
+
 func builtinStringAppend(_ *interpreter, args []value, callPos position) (value, error) {
 	var builder strings.Builder
 	for _, arg := range args {
@@ -1134,9 +1241,9 @@ func builtinStringAppend(_ *interpreter, args []value, callPos position) (value,
 		if err != nil {
 			return nil, err
 		}
-		builder.WriteString(s)
+		builder.WriteString(s.text())
 	}
-	return builder.String(), nil
+	return newStringValue(builder.String()), nil
 }
 
 func builtinStringLength(_ *interpreter, args []value, callPos position) (value, error) {
@@ -1148,7 +1255,7 @@ func builtinStringLength(_ *interpreter, args []value, callPos position) (value,
 	if err != nil {
 		return nil, err
 	}
-	return int64(len([]rune(s))), nil
+	return int64(len(s.chars)), nil
 }
 
 func builtinSubstring(_ *interpreter, args []value, callPos position) (value, error) {
@@ -1169,11 +1276,13 @@ func builtinSubstring(_ *interpreter, args []value, callPos position) (value, er
 		return nil, err
 	}
 
-	runes := []rune(s)
-	if start < 0 || end < start || end > len(runes) {
+	if start < 0 || end < start || end > len(s.chars) {
 		return nil, newEvalError(ErrOutOfRange, "substring: index out of range", callPos)
 	}
-	return string(runes[start:end]), nil
+	return &stringValue{
+		chars:   append([]rune(nil), s.chars[start:end]...),
+		mutable: true,
+	}, nil
 }
 
 func builtinStringToNumber(_ *interpreter, args []value, callPos position) (value, error) {
@@ -1186,7 +1295,7 @@ func builtinStringToNumber(_ *interpreter, args []value, callPos position) (valu
 		return nil, err
 	}
 
-	n, err := strconv.ParseInt(s, 10, 64)
+	n, err := strconv.ParseInt(s.text(), 10, 64)
 	if err != nil {
 		return false, nil
 	}
@@ -1202,7 +1311,7 @@ func builtinNumberToString(_ *interpreter, args []value, callPos position) (valu
 	if err != nil {
 		return nil, err
 	}
-	return strconv.FormatInt(n, 10), nil
+	return newStringValue(strconv.FormatInt(n, 10)), nil
 }
 
 func builtinSymbolToString(_ *interpreter, args []value, callPos position) (value, error) {
@@ -1214,7 +1323,7 @@ func builtinSymbolToString(_ *interpreter, args []value, callPos position) (valu
 	if err != nil {
 		return nil, err
 	}
-	return string(sym), nil
+	return newStringValue(string(sym)), nil
 }
 
 func builtinStringToSymbol(_ *interpreter, args []value, callPos position) (value, error) {
@@ -1226,7 +1335,7 @@ func builtinStringToSymbol(_ *interpreter, args []value, callPos position) (valu
 	if err != nil {
 		return nil, err
 	}
-	return symbolValue(s), nil
+	return symbolValue(s.text()), nil
 }
 
 func builtinStringRef(_ *interpreter, args []value, callPos position) (value, error) {
@@ -1243,11 +1352,10 @@ func builtinStringRef(_ *interpreter, args []value, callPos position) (value, er
 		return nil, err
 	}
 
-	runes := []rune(s)
-	if index < 0 || index >= len(runes) {
+	if index < 0 || index >= len(s.chars) {
 		return nil, newEvalError(ErrOutOfRange, "string-ref: index out of range", callPos)
 	}
-	return charValue(runes[index]), nil
+	return charValue(s.chars[index]), nil
 }
 
 func builtinCharPred(_ *interpreter, args []value, callPos position) (value, error) {
@@ -1266,10 +1374,10 @@ func expectInt(v value, pos position) (int64, error) {
 	return n, nil
 }
 
-func expectString(v value, pos position) (string, error) {
-	s, ok := v.(string)
+func expectString(v value, pos position) (*stringValue, error) {
+	s, ok := v.(*stringValue)
 	if !ok {
-		return "", newEvalError(ErrTypeMismatch, "expected string", pos)
+		return nil, newEvalError(ErrTypeMismatch, "expected string", pos)
 	}
 	return s, nil
 }
@@ -1280,6 +1388,14 @@ func expectSymbol(v value, pos position) (symbolValue, error) {
 		return "", newEvalError(ErrTypeMismatch, "expected symbol", pos)
 	}
 	return sym, nil
+}
+
+func expectChar(v value, pos position) (charValue, error) {
+	ch, ok := v.(charValue)
+	if !ok {
+		return 0, newEvalError(ErrTypeMismatch, "expected character", pos)
+	}
+	return ch, nil
 }
 
 func expectIndex(v value, pos position) (int, error) {
@@ -1340,8 +1456,8 @@ func formatValue(v value) (string, error) {
 			return "#t", nil
 		}
 		return "#f", nil
-	case string:
-		return strconv.Quote(value), nil
+	case *stringValue:
+		return strconv.Quote(value.text()), nil
 	case symbolValue:
 		return string(value), nil
 	case charValue:
@@ -1361,8 +1477,8 @@ func formatValue(v value) (string, error) {
 
 func formatDisplayValue(v value) (string, error) {
 	switch value := v.(type) {
-	case string:
-		return value, nil
+	case *stringValue:
+		return value.text(), nil
 	case charValue:
 		return string(rune(value)), nil
 	case *pairValue:
