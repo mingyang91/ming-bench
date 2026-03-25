@@ -7,6 +7,12 @@ import java.util.Map;
 
 public class Evaluator {
 
+    // --- Source position tracking ---
+
+    private record Token(Object value, int line, int col) {}
+
+    private record SourceExpr(Object expr, int line, int col) {}
+
     // --- Environment ---
 
     private static class Env {
@@ -127,7 +133,6 @@ public class Evaluator {
         globalEnv.define("append", (BuiltinProc) args -> {
             if (args.isEmpty()) return NIL;
             if (args.size() == 1) return args.get(0);
-            // append last arg onto reversed-copy of earlier args
             Object result = args.get(args.size() - 1);
             for (int i = args.size() - 2; i >= 0; i--) {
                 result = appendTwo(args.get(i), result);
@@ -148,11 +153,11 @@ public class Evaluator {
         if (a instanceof Pair p) {
             return new Pair(p.car, appendTwo(p.cdr, b));
         }
-        return b; // shouldn't happen for proper lists
+        return b;
     }
 
     public String evalStr(String input) throws EvalError {
-        List<Object> tokens = tokenize(input);
+        List<Token> tokens = tokenize(input);
         int[] pos = {0};
         Object lastResult = null;
         while (pos[0] < tokens.size()) {
@@ -174,31 +179,44 @@ public class Evaluator {
 
     // --- Tokenizer ---
 
-    private List<Object> tokenize(String input) throws EvalError {
-        List<Object> tokens = new ArrayList<>();
+    private List<Token> tokenize(String input) throws EvalError {
+        List<Token> tokens = new ArrayList<>();
         int i = 0;
         int len = input.length();
+        int line = 1;
+        int col = 1;
         while (i < len) {
             char c = input.charAt(i);
-            if (Character.isWhitespace(c)) {
+            if (c == '\n') {
                 i++;
+                line++;
+                col = 1;
+            } else if (Character.isWhitespace(c)) {
+                i++;
+                col++;
             } else if (c == ';') {
-                while (i < len && input.charAt(i) != '\n') i++;
+                while (i < len && input.charAt(i) != '\n') { i++; col++; }
             } else if (c == '\'') {
-                tokens.add("'");
+                tokens.add(new Token("'", line, col));
                 i++;
+                col++;
             } else if (c == '(') {
-                tokens.add("(");
+                tokens.add(new Token("(", line, col));
                 i++;
+                col++;
             } else if (c == ')') {
-                tokens.add(")");
+                tokens.add(new Token(")", line, col));
                 i++;
+                col++;
             } else if (c == '"') {
+                int startCol = col;
                 StringBuilder sb = new StringBuilder();
                 i++;
+                col++;
                 while (i < len && input.charAt(i) != '"') {
                     if (input.charAt(i) == '\\') {
                         i++;
+                        col++;
                         if (i < len) {
                             char esc = input.charAt(i);
                             switch (esc) {
@@ -210,29 +228,41 @@ public class Evaluator {
                             }
                         }
                     } else {
-                        sb.append(input.charAt(i));
+                        if (input.charAt(i) == '\n') {
+                            sb.append('\n');
+                            line++;
+                            col = 0;
+                        } else {
+                            sb.append(input.charAt(i));
+                        }
                     }
                     i++;
+                    col++;
                 }
-                if (i >= len) throw new EvalError("unterminated string");
+                if (i >= len) throw new EvalError("unterminated string at " + line + ":" + startCol);
                 i++;
-                tokens.add(new SchemeString(sb.toString()));
+                col++;
+                tokens.add(new Token(new SchemeString(sb.toString()), line, startCol));
             } else if (c == '#') {
+                int startCol = col;
                 if (i + 1 < len) {
                     char next = input.charAt(i + 1);
                     if (next == 't') {
-                        tokens.add(Boolean.TRUE);
+                        tokens.add(new Token(Boolean.TRUE, line, startCol));
                         i += 2;
+                        col += 2;
                     } else if (next == 'f') {
-                        tokens.add(Boolean.FALSE);
+                        tokens.add(new Token(Boolean.FALSE, line, startCol));
                         i += 2;
+                        col += 2;
                     } else {
-                        throw new EvalError("unexpected token: #" + next);
+                        throw new EvalError("unexpected token: #" + next + " at " + line + ":" + col);
                     }
                 } else {
-                    throw new EvalError("unexpected end after #");
+                    throw new EvalError("unexpected end after # at " + line + ":" + col);
                 }
             } else {
+                int startCol = col;
                 StringBuilder sb = new StringBuilder();
                 while (i < len && !Character.isWhitespace(input.charAt(i))
                         && input.charAt(i) != '(' && input.charAt(i) != ')'
@@ -240,12 +270,13 @@ public class Evaluator {
                         && input.charAt(i) != '\'') {
                     sb.append(input.charAt(i));
                     i++;
+                    col++;
                 }
                 String tok = sb.toString();
                 try {
-                    tokens.add(Long.parseLong(tok));
+                    tokens.add(new Token(Long.parseLong(tok), line, startCol));
                 } catch (NumberFormatException e) {
-                    tokens.add(tok); // symbol
+                    tokens.add(new Token(tok, line, startCol));
                 }
             }
         }
@@ -254,40 +285,43 @@ public class Evaluator {
 
     // --- Parser ---
 
-    private Object parse(List<Object> tokens, int[] pos) throws EvalError {
+    private Object parse(List<Token> tokens, int[] pos) throws EvalError {
         if (pos[0] >= tokens.size()) {
             throw new EvalError("unexpected end of input");
         }
-        Object token = tokens.get(pos[0]);
-        if ("'".equals(token)) {
+        Token token = tokens.get(pos[0]);
+        if ("'".equals(token.value)) {
             pos[0]++;
             Object quoted = parse(tokens, pos);
             List<Object> quoteExpr = new ArrayList<>();
             quoteExpr.add("quote");
             quoteExpr.add(quoted);
-            return quoteExpr;
+            return new SourceExpr(quoteExpr, token.line, token.col);
         }
-        if ("(".equals(token)) {
+        if ("(".equals(token.value)) {
             pos[0]++;
             List<Object> list = new ArrayList<>();
-            while (pos[0] < tokens.size() && !")".equals(tokens.get(pos[0]))) {
+            while (pos[0] < tokens.size() && !")".equals(tokens.get(pos[0]).value)) {
                 list.add(parse(tokens, pos));
             }
             if (pos[0] >= tokens.size()) {
-                throw new EvalError("missing closing parenthesis");
+                throw new EvalError("missing closing parenthesis at " + token.line + ":" + token.col);
             }
             pos[0]++;
-            return list;
-        } else if (")".equals(token)) {
-            throw new EvalError("unexpected )");
+            return new SourceExpr(list, token.line, token.col);
+        } else if (")".equals(token.value)) {
+            throw new EvalError("unexpected ) at " + token.line + ":" + token.col);
         } else {
             pos[0]++;
-            return token;
+            return new SourceExpr(token.value, token.line, token.col);
         }
     }
 
     // Convert parsed AST list to Scheme cons-cell list (for quote)
     private Object astToScheme(Object ast) {
+        if (ast instanceof SourceExpr se) {
+            return astToScheme(se.expr);
+        }
         if (ast instanceof List<?> list) {
             Object result = NIL;
             for (int i = list.size() - 1; i >= 0; i--) {
@@ -302,6 +336,18 @@ public class Evaluator {
 
     @SuppressWarnings("unchecked")
     private Object eval(Object expr, Env env) throws EvalError {
+        // Unwrap SourceExpr and add position to any errors
+        if (expr instanceof SourceExpr se) {
+            try {
+                return eval(se.expr, env);
+            } catch (EvalError e) {
+                if (!e.getMessage().matches(".*\\d+:\\d+.*")) {
+                    throw new EvalError(e.getMessage() + " at " + se.line + ":" + se.col);
+                }
+                throw e;
+            }
+        }
+
         if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString) {
             return expr;
         }
@@ -315,13 +361,21 @@ public class Evaluator {
             }
             Object head = list.get(0);
 
+            // Unwrap SourceExpr for head to check special forms
+            Object rawHead = head;
+            if (rawHead instanceof SourceExpr she) {
+                rawHead = she.expr;
+            }
+
             // Special forms
-            if (head instanceof String op) {
+            if (rawHead instanceof String op) {
                 switch (op) {
                     case "quote" -> {
+                        if (list.size() < 2) throw new EvalError("bad syntax: quote");
                         return astToScheme(list.get(1));
                     }
                     case "if" -> {
+                        if (list.size() < 3) throw new EvalError("bad syntax: if requires at least 2 parts");
                         Object cond = eval(list.get(1), env);
                         if (!isFalse(cond)) {
                             return eval(list.get(2), env);
@@ -331,64 +385,80 @@ public class Evaluator {
                         return VOID;
                     }
                     case "define" -> {
+                        if (list.size() < 2) throw new EvalError("bad syntax: define");
                         Object target = list.get(1);
+                        if (target instanceof SourceExpr se) target = se.expr;
                         if (target instanceof String name) {
+                            if (list.size() < 3) throw new EvalError("bad syntax: define");
                             env.define(name, eval(list.get(2), env));
                         } else if (target instanceof List<?> sig) {
-                            String name = (String) sig.get(0);
+                            if (sig.isEmpty()) throw new EvalError("bad syntax: define");
+                            Object nameObj = sig.get(0);
+                            if (nameObj instanceof SourceExpr se2) nameObj = se2.expr;
+                            String name = (String) nameObj;
                             List<String> params = new ArrayList<>();
                             for (int i = 1; i < sig.size(); i++) {
-                                params.add((String) sig.get(i));
+                                Object p = sig.get(i);
+                                if (p instanceof SourceExpr se2) p = se2.expr;
+                                params.add((String) p);
                             }
                             List<Object> body = new ArrayList<>(list.subList(2, list.size()));
                             env.define(name, new Lambda(params, body, env));
+                        } else {
+                            throw new EvalError("bad syntax: define");
                         }
                         return VOID;
                     }
                     case "lambda" -> {
-                        List<?> paramList = (List<?>) list.get(1);
+                        if (list.size() < 3) throw new EvalError("bad syntax: lambda");
+                        Object paramObj = list.get(1);
+                        if (paramObj instanceof SourceExpr se) paramObj = se.expr;
+                        List<?> paramList = (List<?>) paramObj;
                         List<String> params = new ArrayList<>();
                         for (Object p : paramList) {
+                            if (p instanceof SourceExpr se) p = se.expr;
                             params.add((String) p);
                         }
                         List<Object> body = new ArrayList<>(list.subList(2, list.size()));
                         return new Lambda(params, body, env);
                     }
                     case "let" -> {
-                        // Named let: (let name ((var init) ...) body...)
-                        // Regular let: (let ((var init) ...) body...)
                         int offset;
                         String loopName = null;
-                        if (list.get(1) instanceof String name) {
+                        Object second = list.get(1);
+                        if (second instanceof SourceExpr se) second = se.expr;
+                        if (second instanceof String name) {
                             loopName = name;
                             offset = 2;
                         } else {
                             offset = 1;
                         }
-                        List<?> bindings = (List<?>) list.get(offset);
+                        Object bindingsObj = list.get(offset);
+                        if (bindingsObj instanceof SourceExpr se) bindingsObj = se.expr;
+                        List<?> bindings = (List<?>) bindingsObj;
                         List<Object> body = new ArrayList<>(list.subList(offset + 1, list.size()));
 
                         List<String> params = new ArrayList<>();
                         List<Object> inits = new ArrayList<>();
                         for (Object b : bindings) {
+                            if (b instanceof SourceExpr se) b = se.expr;
                             List<?> binding = (List<?>) b;
-                            params.add((String) binding.get(0));
+                            Object pname = binding.get(0);
+                            if (pname instanceof SourceExpr se) pname = se.expr;
+                            params.add((String) pname);
                             inits.add(binding.get(1));
                         }
 
                         if (loopName != null) {
-                            // Named let: create a lambda and call it
                             Env letEnv = new Env(env);
                             Lambda loopLambda = new Lambda(params, body, letEnv);
                             letEnv.define(loopName, loopLambda);
-                            // Evaluate inits in outer env
                             List<Object> args = new ArrayList<>();
                             for (Object init : inits) {
                                 args.add(eval(init, env));
                             }
                             return applyLambda(loopLambda, args);
                         } else {
-                            // Regular let
                             Env letEnv = new Env(env);
                             for (int i = 0; i < params.size(); i++) {
                                 letEnv.define(params.get(i), eval(inits.get(i), env));
@@ -409,9 +479,13 @@ public class Evaluator {
                     }
                     case "cond" -> {
                         for (int i = 1; i < list.size(); i++) {
-                            List<Object> clause = (List<Object>) list.get(i);
+                            Object clauseObj = list.get(i);
+                            if (clauseObj instanceof SourceExpr se) clauseObj = se.expr;
+                            List<Object> clause = (List<Object>) clauseObj;
                             Object test = clause.get(0);
-                            if ("else".equals(test)) {
+                            Object rawTest = test;
+                            if (rawTest instanceof SourceExpr se) rawTest = se.expr;
+                            if ("else".equals(rawTest)) {
                                 Object result = VOID;
                                 for (int j = 1; j < clause.size(); j++) {
                                     result = eval(clause.get(j), env);
