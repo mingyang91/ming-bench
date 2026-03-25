@@ -28,7 +28,7 @@ public class Evaluator {
         beginElems.add(new SchemeValue.SymbolVal("begin"));
         beginElems.addAll(exprs);
         SchemeValue result = interp.eval(new SchemeValue.ListVal(beginElems));
-        String resultStr = result.display();
+        String resultStr = result.displayOutput();
         if (result instanceof SchemeValue.VoidVal) resultStr = "";
         return new EvalResult(resultStr, interp.getOutput());
     }

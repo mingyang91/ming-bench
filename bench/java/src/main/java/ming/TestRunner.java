@@ -34,6 +34,12 @@ public class TestRunner {
             return;
         }
 
+        // L28 is a standalone test (concurrency + perf stress) — delegate to its own runner
+        if (benchLevel == 28) {
+            L28Tests.main(new String[0]);
+            return;
+        }
+
         String testsJsonPath = System.getenv("TESTS_JSON");
         if (testsJsonPath == null || testsJsonPath.isEmpty()) {
             testsJsonPath = "../tests.json";
