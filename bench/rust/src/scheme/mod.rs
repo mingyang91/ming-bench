@@ -69,6 +69,7 @@ impl fmt::Display for Value {
 enum ExprKind {
     Integer(i64),
     Boolean(bool),
+    Char(char),
     Str(String),
     Symbol(String),
     List(Vec<Expr>),
@@ -103,6 +104,7 @@ enum TokenKind {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
@@ -161,6 +163,35 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                         'f' => {
                             tokens.push(Token { kind: TokenKind::Boolean(false), span: cur_span });
                             i += 2; col += 2;
+                        }
+                        '\\' => {
+                            // Character literal: #\x, #\newline, #\space
+                            i += 2; col += 2;
+                            if i >= chars.len() {
+                                return Err(EvalError::Parse(format!("unexpected end of input in character literal at {cur_span}")));
+                            }
+                            // Try to read a named character or single character
+                            let start = i;
+                            if chars[i].is_alphabetic() {
+                                while i < chars.len() && chars[i].is_alphabetic() {
+                                    i += 1; col += 1;
+                                }
+                                let name: String = chars[start..i].iter().collect();
+                                let ch = if name.len() == 1 {
+                                    name.chars().next().unwrap()
+                                } else {
+                                    match name.as_str() {
+                                        "newline" => '\n',
+                                        "space" => ' ',
+                                        "tab" => '\t',
+                                        _ => return Err(EvalError::Parse(format!("unknown character name: {name} at {cur_span}"))),
+                                    }
+                                };
+                                tokens.push(Token { kind: TokenKind::Char(ch), span: cur_span });
+                            } else {
+                                tokens.push(Token { kind: TokenKind::Char(chars[i]), span: cur_span });
+                                i += 1; col += 1;
+                            }
                         }
                         _ => return Err(EvalError::Parse(format!("unexpected #{} at {cur_span}", chars[i + 1]))),
                     }
@@ -249,6 +280,7 @@ fn parse(tokens: &[Token], pos: &mut usize) -> Result<Expr, EvalError> {
     match &tokens[*pos].kind {
         TokenKind::Integer(n) => { let n = *n; *pos += 1; Ok(Expr::new(ExprKind::Integer(n), span)) }
         TokenKind::Boolean(b) => { let b = *b; *pos += 1; Ok(Expr::new(ExprKind::Boolean(b), span)) }
+        TokenKind::Char(c) => { let c = *c; *pos += 1; Ok(Expr::new(ExprKind::Char(c), span)) }
         TokenKind::Str(s) => { let s = s.clone(); *pos += 1; Ok(Expr::new(ExprKind::Str(s), span)) }
         TokenKind::Symbol(s) => { let s = s.clone(); *pos += 1; Ok(Expr::new(ExprKind::Symbol(s), span)) }
         TokenKind::Quote => {
@@ -324,7 +356,7 @@ fn default_env() -> Env {
         "string-append", "string-length", "substring",
         "string->number", "number->string",
         "symbol->string", "string->symbol",
-        "string-ref",
+        "string-ref", "string-copy",
     ] {
         env.set(name.into(), Value::Builtin(name.into()));
     }
@@ -353,6 +385,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
     match &expr.kind {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Str(s) => Ok(Value::Str(s.clone())),
         ExprKind::Symbol(s) => {
             env.get(s).ok_or_else(|| EvalError::Unbound(format!("{s} at {span}")))
@@ -555,6 +588,37 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                                 _ => return Err(EvalError::Syntax(format!("cond: bad clause at {span}"))),
                             }
                         }
+                        return Ok(Value::Void);
+                    }
+                    "string-set!" => {
+                        if elems.len() != 4 {
+                            return Err(EvalError::Syntax(format!("string-set! requires 3 arguments at {span}")));
+                        }
+                        let var_name = match &elems[1].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Type(format!("string-set!: first argument must be a variable at {span}"))),
+                        };
+                        let idx_val = eval(&elems[2], env, output)?;
+                        let idx = match &idx_val {
+                            Value::Integer(n) => *n as usize,
+                            _ => return Err(EvalError::Type(format!("string-set!: index must be integer at {span}"))),
+                        };
+                        let char_val = eval(&elems[3], env, output)?;
+                        let ch = match &char_val {
+                            Value::Char(c) => *c,
+                            _ => return Err(EvalError::Type(format!("string-set!: third argument must be char at {span}"))),
+                        };
+                        let s = env.get(&var_name).ok_or_else(|| EvalError::Unbound(format!("{var_name} at {span}")))?;
+                        let mut chars: Vec<char> = match &s {
+                            Value::Str(st) => st.chars().collect(),
+                            _ => return Err(EvalError::Type(format!("string-set!: not a string at {span}"))),
+                        };
+                        if idx >= chars.len() {
+                            return Err(EvalError::Type(format!("string-set!: index out of range at {span}")));
+                        }
+                        chars[idx] = ch;
+                        let new_str: String = chars.into_iter().collect();
+                        env.set(var_name, Value::Str(new_str));
                         return Ok(Value::Void);
                     }
                     _ => {}
@@ -895,6 +959,13 @@ fn apply_builtin(name: &str, args: &[Value], call_span: Span, output: &mut Strin
             }
             Ok(Value::Char(chars[idx]))
         }
+        "string-copy" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("string-copy requires 1 argument at {call_span}"))); }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Str(s.clone())),
+                _ => Err(EvalError::Type(format!("string-copy: not a string at {call_span}"))),
+            }
+        }
         _ => Err(EvalError::Unbound(format!("{name} at {call_span}"))),
     }
 }
@@ -903,6 +974,7 @@ fn expr_to_value(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Integer(n) => Value::Integer(*n),
         ExprKind::Boolean(b) => Value::Boolean(*b),
+        ExprKind::Char(c) => Value::Char(*c),
         ExprKind::Str(s) => Value::Str(s.clone()),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
         ExprKind::List(elems) => Value::List(elems.iter().map(expr_to_value).collect()),
