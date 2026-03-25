@@ -10,12 +10,21 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-### eval (src/scheme/mod.rs:147) — Evaluate a positioned Scheme AST node and attach source positions to runtime errors.
-### parse_parameters_from_expr (src/scheme/mod.rs:454) — Normalize lambda parameter syntax into fixed/rest argument metadata.
-### apply (src/scheme/mod.rs:518) — Dispatch builtin and lambda procedure calls with call-site position tracking.
-### equal_values (src/scheme/mod.rs:1642) — Implement recursive Scheme equality for strings, pairs, and atomic values.
-### parse_program (src/scheme/mod.rs:2088) — Parse a full Scheme source string into a sequence of positioned expressions.
-### render_value (src/scheme/mod.rs:2347) — Render Scheme values for final results and display/write output modes.
+### eval (src/scheme/mod.rs:166) — Evaluate a positioned Scheme AST node and attach source positions to runtime errors.
+### eval_control (src/scheme/mod.rs:792) — Evaluate continuation-aware expressions with explicit continuations for `call/cc` and `dynamic-wind`.
+### eval_and_control (src/scheme/mod.rs:882) — Evaluate `and` with short-circuit behavior inside the continuation-aware interpreter path.
+### eval_or_control (src/scheme/mod.rs:933) — Evaluate `or` with short-circuit behavior inside the continuation-aware interpreter path.
+### eval_cond_control (src/scheme/mod.rs:984) — Evaluate `cond` clauses within control mode while preserving test-result return semantics.
+### eval_macro_invocation_control (src/scheme/mod.rs:1133) — Expand `syntax-rules` macros and evaluate the expansion under the continuation-aware evaluator.
+### expand_let_control (src/scheme/mod.rs:1195) — Rewrite plain and named `let` forms into lambda-based expressions consumable by control evaluation.
+### transfer_continuation_control (src/scheme/mod.rs:1755) — Reconcile dynamic-wind frames when invoking a captured continuation, including unwind and re-entry thunks.
+### builtin_apply_control (src/scheme/mod.rs:1611) — Execute `apply` through continuation-aware procedure dispatch so expanded calls still support continuations.
+### builtin_map_control (src/scheme/mod.rs:1662) — Run `map` using continuation-aware application for each element-wise invocation.
+### parse_parameters_from_expr (src/scheme/mod.rs:1888) — Normalize lambda parameter syntax into fixed/rest argument metadata.
+### apply (src/scheme/mod.rs:1952) — Dispatch builtin and lambda procedure calls with call-site position tracking.
+### equal_values (src/scheme/mod.rs:3296) — Implement recursive Scheme equality for strings, pairs, and atomic values.
+### parse_program (src/scheme/mod.rs:4304) — Parse a full Scheme source string into a sequence of positioned expressions.
+### render_value (src/scheme/mod.rs:4670) — Render Scheme values for final results and display/write output modes.
 
 ## Python Helpers (scripts/)
 

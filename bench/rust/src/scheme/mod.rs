@@ -2,9 +2,10 @@ pub mod error;
 
 pub use error::EvalError;
 
-use std::cmp::Ordering;
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::rc::Rc;
 
 /// Evaluate one or more Scheme expressions and return the string
@@ -63,6 +64,10 @@ impl Interpreter {
         }
 
         let global = self.create_global_environment();
+        if program_needs_control(&expressions) {
+            return self.eval_program_with_control(expressions, &global);
+        }
+
         let mut result = Value::Void;
         for expression in &expressions {
             result = self.eval(expression, &global)?;
@@ -88,6 +93,7 @@ impl Interpreter {
         self.install_builtin(&env, "list", Builtin::List);
         self.install_builtin(&env, "length", Builtin::Length);
         self.install_builtin(&env, "append", Builtin::Append);
+        self.install_builtin(&env, "reverse", Builtin::Reverse);
         self.install_builtin(&env, "display", Builtin::Display);
         self.install_builtin(&env, "write", Builtin::Write);
         self.install_builtin(&env, "newline", Builtin::Newline);
@@ -147,6 +153,8 @@ impl Interpreter {
         self.install_builtin(&env, "string-downcase", Builtin::StringDowncase);
         self.install_builtin(&env, "not", Builtin::Not);
         self.install_builtin(&env, "apply", Builtin::Apply);
+        self.install_builtin(&env, "call/cc", Builtin::CallCc);
+        self.install_builtin(&env, "call-with-current-continuation", Builtin::CallCc);
 
         env
     }
@@ -736,6 +744,1111 @@ impl Interpreter {
         Ok(result)
     }
 
+    fn eval_program_with_control(
+        &mut self,
+        expressions: Vec<Expr>,
+        env: &EnvRef,
+    ) -> Result<Value, EvalError> {
+        let mut runtime = ControlRuntime::default();
+        let cont: ControlCont = Rc::new(|value, _, _| Ok(value));
+        self.eval_sequence_control(Rc::new(expressions), 0, Rc::clone(env), cont, &mut runtime)
+    }
+
+    fn eval_sequence_control(
+        &mut self,
+        expressions: Rc<Vec<Expr>>,
+        index: usize,
+        env: EnvRef,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        if index >= expressions.len() {
+            return cont(Value::Void, self, runtime);
+        }
+
+        let expression = expressions[index].clone();
+        let next_cont: ControlCont = if index + 1 == expressions.len() {
+            cont
+        } else {
+            let expressions = Rc::clone(&expressions);
+            let env = Rc::clone(&env);
+            let cont = cont.clone();
+            Rc::new(
+                move |_, interpreter: &mut Interpreter, runtime: &mut ControlRuntime| {
+                    interpreter.eval_sequence_control(
+                        Rc::clone(&expressions),
+                        index + 1,
+                        Rc::clone(&env),
+                        cont.clone(),
+                        runtime,
+                    )
+                },
+            )
+        };
+
+        self.eval_control(&expression, &env, next_cont, runtime)
+    }
+
+    fn eval_control(
+        &mut self,
+        expression: &Expr,
+        env: &EnvRef,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        let result = match expression {
+            Expr::Number(number, _) => return cont(Value::Number(*number), self, runtime),
+            Expr::Bool(boolean, _) => return cont(Value::Bool(*boolean), self, runtime),
+            Expr::String(text, _) => return cont(Value::String(string_cell(text)), self, runtime),
+            Expr::Char(ch, _) => return cont(Value::Char(*ch), self, runtime),
+            Expr::Symbol(name, _) => {
+                let value = Environment::lookup(env, name)?;
+                return cont(value, self, runtime);
+            }
+            Expr::List(elements, list_pos) => {
+                if elements.is_empty() {
+                    Err(EvalError::new("cannot evaluate empty list"))
+                } else {
+                    match elements.first() {
+                        Some(Expr::Symbol(name, _)) => match name.as_str() {
+                            "and" => self.eval_and_control(&elements[1..], env, cont, runtime),
+                            "begin" => self.eval_sequence_control(
+                                Rc::new(elements[1..].to_vec()),
+                                0,
+                                Rc::clone(env),
+                                cont,
+                                runtime,
+                            ),
+                            "cond" => self.eval_cond_control(&elements[1..], env, cont, runtime),
+                            "define" => {
+                                self.eval_define_control(&elements[1..], env, cont, runtime)
+                            }
+                            "define-syntax" => {
+                                self.eval_define_syntax_control(&elements[1..], env, cont, runtime)
+                            }
+                            "dynamic-wind" => {
+                                self.eval_dynamic_wind_control(&elements[1..], env, cont, runtime)
+                            }
+                            "if" => self.eval_if_control(&elements[1..], env, cont, runtime),
+                            "let" => {
+                                self.eval_let_control(&elements[1..], *list_pos, env, cont, runtime)
+                            }
+                            "lambda" => {
+                                self.eval_lambda_control(&elements[1..], env, cont, runtime)
+                            }
+                            "or" => self.eval_or_control(&elements[1..], env, cont, runtime),
+                            "quote" => self.eval_quote_control(&elements[1..], cont, runtime),
+                            "set!" => self.eval_set_control(&elements[1..], env, cont, runtime),
+                            _ => {
+                                if let Some(macro_definition) = self.macros.get(name).cloned() {
+                                    self.eval_macro_invocation_control(
+                                        &macro_definition,
+                                        elements,
+                                        *list_pos,
+                                        env,
+                                        cont,
+                                        runtime,
+                                    )
+                                } else {
+                                    self.eval_application_control(
+                                        &elements[0],
+                                        &elements[1..],
+                                        env,
+                                        elements[0].pos(),
+                                        *list_pos,
+                                        cont,
+                                        runtime,
+                                    )
+                                }
+                            }
+                        },
+                        _ => self.eval_application_control(
+                            &elements[0],
+                            &elements[1..],
+                            env,
+                            elements[0].pos(),
+                            *list_pos,
+                            cont,
+                            runtime,
+                        ),
+                    }
+                }
+            }
+        };
+
+        result.map_err(|error| self.with_position(error, expression.pos()))
+    }
+
+    fn eval_and_control(
+        &mut self,
+        arguments: &[Expr],
+        env: &EnvRef,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        if arguments.is_empty() {
+            return cont(Value::Bool(true), self, runtime);
+        }
+
+        self.eval_and_control_step(
+            Rc::new(arguments.to_vec()),
+            0,
+            Rc::clone(env),
+            cont,
+            runtime,
+        )
+    }
+
+    fn eval_and_control_step(
+        &mut self,
+        arguments: Rc<Vec<Expr>>,
+        index: usize,
+        env: EnvRef,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        let argument_expr = arguments[index].clone();
+        let env_for_eval = Rc::clone(&env);
+        let env_for_next = Rc::clone(&env);
+        self.eval_control(
+            &argument_expr,
+            &env_for_eval,
+            Rc::new(move |value, interpreter, runtime| {
+                if !interpreter.is_truthy(&value) || index + 1 == arguments.len() {
+                    cont(value, interpreter, runtime)
+                } else {
+                    interpreter.eval_and_control_step(
+                        Rc::clone(&arguments),
+                        index + 1,
+                        Rc::clone(&env_for_next),
+                        cont.clone(),
+                        runtime,
+                    )
+                }
+            }),
+            runtime,
+        )
+    }
+
+    fn eval_or_control(
+        &mut self,
+        arguments: &[Expr],
+        env: &EnvRef,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        if arguments.is_empty() {
+            return cont(Value::Bool(false), self, runtime);
+        }
+
+        self.eval_or_control_step(
+            Rc::new(arguments.to_vec()),
+            0,
+            Rc::clone(env),
+            cont,
+            runtime,
+        )
+    }
+
+    fn eval_or_control_step(
+        &mut self,
+        arguments: Rc<Vec<Expr>>,
+        index: usize,
+        env: EnvRef,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        let argument_expr = arguments[index].clone();
+        let env_for_eval = Rc::clone(&env);
+        let env_for_next = Rc::clone(&env);
+        self.eval_control(
+            &argument_expr,
+            &env_for_eval,
+            Rc::new(move |value, interpreter, runtime| {
+                if interpreter.is_truthy(&value) || index + 1 == arguments.len() {
+                    cont(value, interpreter, runtime)
+                } else {
+                    interpreter.eval_or_control_step(
+                        Rc::clone(&arguments),
+                        index + 1,
+                        Rc::clone(&env_for_next),
+                        cont.clone(),
+                        runtime,
+                    )
+                }
+            }),
+            runtime,
+        )
+    }
+
+    fn eval_cond_control(
+        &mut self,
+        arguments: &[Expr],
+        env: &EnvRef,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        self.eval_cond_control_step(
+            Rc::new(arguments.to_vec()),
+            0,
+            Rc::clone(env),
+            cont,
+            runtime,
+        )
+    }
+
+    fn eval_cond_control_step(
+        &mut self,
+        clauses: Rc<Vec<Expr>>,
+        index: usize,
+        env: EnvRef,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        if index >= clauses.len() {
+            return cont(Value::Void, self, runtime);
+        }
+
+        let Expr::List(clause, _) = clauses[index].clone() else {
+            return Err(EvalError::new("invalid cond"));
+        };
+        if clause.is_empty() {
+            return Err(EvalError::new("invalid cond"));
+        }
+
+        let test_expr = clause[0].clone();
+        let consequents = Rc::new(clause[1..].to_vec());
+        let is_else_clause = matches!(&test_expr, Expr::Symbol(name, _) if name == "else");
+        if is_else_clause {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::new("invalid cond"));
+            }
+            return if consequents.is_empty() {
+                cont(Value::Bool(true), self, runtime)
+            } else {
+                self.eval_sequence_control(consequents, 0, env, cont, runtime)
+            };
+        }
+
+        let env_for_eval = Rc::clone(&env);
+        let env_for_clause = Rc::clone(&env);
+        self.eval_control(
+            &test_expr,
+            &env_for_eval,
+            Rc::new(move |test_value, interpreter, runtime| {
+                if interpreter.is_truthy(&test_value) {
+                    if consequents.is_empty() {
+                        cont(test_value, interpreter, runtime)
+                    } else {
+                        interpreter.eval_sequence_control(
+                            Rc::clone(&consequents),
+                            0,
+                            Rc::clone(&env_for_clause),
+                            cont.clone(),
+                            runtime,
+                        )
+                    }
+                } else {
+                    interpreter.eval_cond_control_step(
+                        Rc::clone(&clauses),
+                        index + 1,
+                        Rc::clone(&env_for_clause),
+                        cont.clone(),
+                        runtime,
+                    )
+                }
+            }),
+            runtime,
+        )
+    }
+
+    fn eval_define_control(
+        &mut self,
+        arguments: &[Expr],
+        env: &EnvRef,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        if arguments.is_empty() {
+            return Err(EvalError::new("invalid define"));
+        }
+
+        match &arguments[0] {
+            Expr::Symbol(name, _) => {
+                if arguments.len() != 2 {
+                    return Err(EvalError::new("invalid define"));
+                }
+
+                let name = name.clone();
+                let value_expr = arguments[1].clone();
+                let env_for_eval = Rc::clone(env);
+                let env_for_define = Rc::clone(env);
+                let cont = cont.clone();
+                self.eval_control(
+                    &value_expr,
+                    &env_for_eval,
+                    Rc::new(move |value, interpreter, runtime| {
+                        Environment::define(&env_for_define, name.clone(), value);
+                        cont(Value::Void, interpreter, runtime)
+                    }),
+                    runtime,
+                )
+            }
+            Expr::List(signature, _) => {
+                if signature.is_empty() {
+                    return Err(EvalError::new("invalid define"));
+                }
+                let Expr::Symbol(name, _) = &signature[0] else {
+                    return Err(EvalError::new("invalid define"));
+                };
+                if arguments.len() < 2 {
+                    return Err(EvalError::new("invalid define"));
+                }
+
+                let parameters = self.parse_parameters(&signature[1..])?;
+                let lambda = Value::Lambda(Rc::new(LambdaProcedure {
+                    name: Some(name.clone()),
+                    parameters,
+                    body: arguments[1..].to_vec(),
+                    closure: Rc::clone(env),
+                }));
+                Environment::define(env, name.clone(), lambda);
+                cont(Value::Void, self, runtime)
+            }
+            _ => Err(EvalError::new("invalid define")),
+        }
+    }
+
+    fn eval_define_syntax_control(
+        &mut self,
+        arguments: &[Expr],
+        env: &EnvRef,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        let result = self.eval_define_syntax(arguments, env)?;
+        cont(result, self, runtime)
+    }
+
+    fn eval_macro_invocation_control(
+        &mut self,
+        macro_definition: &MacroDefinition,
+        elements: &[Expr],
+        list_pos: SourcePos,
+        env: &EnvRef,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        let expansion =
+            self.expand_macro(macro_definition, &Expr::List(elements.to_vec(), list_pos))?;
+        let macro_env = Environment::new(Some(Rc::clone(env)));
+        for (name, value) in expansion.capture_bindings {
+            Environment::define(&macro_env, name, value);
+        }
+        self.eval_control(&expansion.expr, &macro_env, cont, runtime)
+    }
+
+    fn eval_if_control(
+        &mut self,
+        arguments: &[Expr],
+        env: &EnvRef,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        if arguments.len() < 2 || arguments.len() > 3 {
+            return Err(EvalError::new("wrong argument count for if"));
+        }
+
+        let condition_expr = arguments[0].clone();
+        let then_expr = arguments[1].clone();
+        let else_expr = arguments.get(2).cloned();
+        let env_for_eval = Rc::clone(env);
+        let env_for_branches = Rc::clone(env);
+        self.eval_control(
+            &condition_expr,
+            &env_for_eval,
+            Rc::new(move |condition, interpreter, runtime| {
+                if interpreter.is_truthy(&condition) {
+                    interpreter.eval_control(&then_expr, &env_for_branches, cont.clone(), runtime)
+                } else if let Some(else_expr) = &else_expr {
+                    interpreter.eval_control(else_expr, &env_for_branches, cont.clone(), runtime)
+                } else {
+                    cont(Value::Void, interpreter, runtime)
+                }
+            }),
+            runtime,
+        )
+    }
+
+    fn eval_let_control(
+        &mut self,
+        arguments: &[Expr],
+        let_pos: SourcePos,
+        env: &EnvRef,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        let expanded = self.expand_let_control(arguments, let_pos)?;
+        self.eval_control(&expanded, env, cont, runtime)
+    }
+
+    fn expand_let_control(
+        &self,
+        arguments: &[Expr],
+        let_pos: SourcePos,
+    ) -> Result<Expr, EvalError> {
+        if arguments.len() < 2 {
+            return Err(EvalError::new("invalid let"));
+        }
+
+        if let Expr::Symbol(name, name_pos) = &arguments[0] {
+            if arguments.len() < 3 {
+                return Err(EvalError::new("invalid let"));
+            }
+
+            let bindings = self.parse_bindings(&arguments[1])?;
+            let parameter_names = bindings
+                .iter()
+                .map(|binding| Expr::Symbol(binding.name.clone(), binding.value_expr.pos()))
+                .collect::<Vec<_>>();
+            let value_exprs = bindings
+                .iter()
+                .map(|binding| binding.value_expr.clone())
+                .collect::<Vec<_>>();
+            let lambda_expr = Expr::List(
+                std::iter::once(Expr::Symbol("lambda".to_owned(), let_pos))
+                    .chain(std::iter::once(Expr::List(
+                        parameter_names,
+                        arguments[1].pos(),
+                    )))
+                    .chain(arguments[2..].iter().cloned())
+                    .collect(),
+                let_pos,
+            );
+            let define_expr = Expr::List(
+                vec![
+                    Expr::Symbol("define".to_owned(), let_pos),
+                    Expr::Symbol(name.clone(), *name_pos),
+                    lambda_expr,
+                ],
+                let_pos,
+            );
+            let call_expr = Expr::List(
+                std::iter::once(Expr::Symbol(name.clone(), *name_pos))
+                    .chain(value_exprs)
+                    .collect(),
+                let_pos,
+            );
+            let wrapper = Expr::List(
+                vec![
+                    Expr::Symbol("lambda".to_owned(), let_pos),
+                    Expr::List(Vec::new(), let_pos),
+                    define_expr,
+                    call_expr,
+                ],
+                let_pos,
+            );
+            return Ok(Expr::List(vec![wrapper], let_pos));
+        }
+
+        let bindings = self.parse_bindings(&arguments[0])?;
+        let parameter_names = bindings
+            .iter()
+            .map(|binding| Expr::Symbol(binding.name.clone(), binding.value_expr.pos()))
+            .collect::<Vec<_>>();
+        let value_exprs = bindings
+            .iter()
+            .map(|binding| binding.value_expr.clone())
+            .collect::<Vec<_>>();
+        let lambda_expr = Expr::List(
+            std::iter::once(Expr::Symbol("lambda".to_owned(), let_pos))
+                .chain(std::iter::once(Expr::List(
+                    parameter_names,
+                    arguments[0].pos(),
+                )))
+                .chain(arguments[1..].iter().cloned())
+                .collect(),
+            let_pos,
+        );
+        Ok(Expr::List(
+            std::iter::once(lambda_expr).chain(value_exprs).collect(),
+            let_pos,
+        ))
+    }
+
+    fn eval_lambda_control(
+        &mut self,
+        arguments: &[Expr],
+        env: &EnvRef,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        if arguments.len() < 2 {
+            return Err(EvalError::new("invalid lambda"));
+        }
+
+        let parameters = self.parse_parameters_from_expr(&arguments[0])?;
+        cont(
+            Value::Lambda(Rc::new(LambdaProcedure {
+                name: None,
+                parameters,
+                body: arguments[1..].to_vec(),
+                closure: Rc::clone(env),
+            })),
+            self,
+            runtime,
+        )
+    }
+
+    fn eval_quote_control(
+        &mut self,
+        arguments: &[Expr],
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        if arguments.len() != 1 {
+            return Err(EvalError::new("wrong argument count for quote"));
+        }
+        cont(self.quote(&arguments[0]), self, runtime)
+    }
+
+    fn eval_set_control(
+        &mut self,
+        arguments: &[Expr],
+        env: &EnvRef,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        if arguments.len() != 2 {
+            return Err(EvalError::new("invalid set!"));
+        }
+        let Expr::Symbol(name, _) = &arguments[0] else {
+            return Err(EvalError::new("invalid set!"));
+        };
+
+        let name = name.clone();
+        let value_expr = arguments[1].clone();
+        let env_for_eval = Rc::clone(env);
+        let env_for_set = Rc::clone(env);
+        let cont = cont.clone();
+        self.eval_control(
+            &value_expr,
+            &env_for_eval,
+            Rc::new(move |value, interpreter, runtime| {
+                Environment::set(&env_for_set, &name, value)?;
+                cont(Value::Void, interpreter, runtime)
+            }),
+            runtime,
+        )
+    }
+
+    fn eval_dynamic_wind_control(
+        &mut self,
+        arguments: &[Expr],
+        env: &EnvRef,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        if arguments.len() != 3 {
+            return Err(EvalError::new("wrong argument count for dynamic-wind"));
+        }
+
+        let in_expr = arguments[0].clone();
+        let body_expr = arguments[1].clone();
+        let out_expr = arguments[2].clone();
+        let in_pos = in_expr.pos();
+        let body_pos = body_expr.pos();
+        let out_pos = out_expr.pos();
+        let env_for_in = Rc::clone(env);
+        let env_for_body = Rc::clone(env);
+        let env_for_out = Rc::clone(env);
+        self.eval_control(
+            &in_expr,
+            &env_for_in,
+            Rc::new(move |in_thunk, interpreter, runtime| {
+                let body_expr = body_expr.clone();
+                let out_expr = out_expr.clone();
+                let env_for_body = Rc::clone(&env_for_body);
+                let env_for_out = Rc::clone(&env_for_out);
+                let cont = cont.clone();
+                interpreter.eval_control(
+                    &body_expr,
+                    &env_for_body,
+                    Rc::new(move |body_thunk, interpreter, runtime| {
+                        let out_expr = out_expr.clone();
+                        let env_for_out = Rc::clone(&env_for_out);
+                        let cont = cont.clone();
+                        let in_thunk = in_thunk.clone();
+                        interpreter.eval_control(
+                            &out_expr,
+                            &env_for_out,
+                            Rc::new(move |out_thunk, interpreter, runtime| {
+                                interpreter.run_dynamic_wind_control(
+                                    in_thunk.clone(),
+                                    in_pos,
+                                    body_thunk.clone(),
+                                    body_pos,
+                                    out_thunk.clone(),
+                                    out_pos,
+                                    cont.clone(),
+                                    runtime,
+                                )
+                            }),
+                            runtime,
+                        )
+                    }),
+                    runtime,
+                )
+            }),
+            runtime,
+        )
+    }
+
+    fn run_dynamic_wind_control(
+        &mut self,
+        in_thunk: Value,
+        in_pos: SourcePos,
+        body_thunk: Value,
+        body_pos: SourcePos,
+        out_thunk: Value,
+        out_pos: SourcePos,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        let frame = WindFrame {
+            id: runtime.fresh_id(),
+            in_thunk: in_thunk.clone(),
+            in_pos,
+            out_thunk: out_thunk.clone(),
+            out_pos,
+        };
+        let frame_for_in = frame.clone();
+        let body_thunk_for_in = body_thunk.clone();
+        let out_thunk_for_body = out_thunk.clone();
+        let cont_for_body = cont.clone();
+        self.apply_control(
+            in_thunk,
+            in_pos,
+            Vec::new(),
+            in_pos,
+            Rc::new(move |_, interpreter, runtime| {
+                runtime.wind_stack.push(frame_for_in.clone());
+                let frame_for_body = frame_for_in.clone();
+                let out_thunk_for_body = out_thunk_for_body.clone();
+                let cont_for_body = cont_for_body.clone();
+                interpreter.apply_control(
+                    body_thunk_for_in.clone(),
+                    body_pos,
+                    Vec::new(),
+                    body_pos,
+                    Rc::new(move |body_value, interpreter, runtime| {
+                        if runtime.wind_stack.last().map(|frame| frame.id)
+                            == Some(frame_for_body.id)
+                        {
+                            runtime.wind_stack.pop();
+                        }
+
+                        let body_result = body_value.clone();
+                        let cont = cont_for_body.clone();
+                        interpreter.apply_control(
+                            out_thunk_for_body.clone(),
+                            out_pos,
+                            Vec::new(),
+                            out_pos,
+                            Rc::new(move |_, interpreter, runtime| {
+                                cont(body_result.clone(), interpreter, runtime)
+                            }),
+                            runtime,
+                        )
+                    }),
+                    runtime,
+                )
+            }),
+            runtime,
+        )
+    }
+
+    fn eval_application_control(
+        &mut self,
+        operator_expr: &Expr,
+        arguments: &[Expr],
+        env: &EnvRef,
+        operator_pos: SourcePos,
+        call_pos: SourcePos,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        let arguments = Rc::new(arguments.to_vec());
+        let env_for_arguments = Rc::clone(env);
+        self.eval_control(
+            operator_expr,
+            env,
+            Rc::new(move |operator, interpreter, runtime| {
+                interpreter.eval_arguments_control(
+                    operator,
+                    operator_pos,
+                    Rc::clone(&arguments),
+                    0,
+                    Vec::new(),
+                    Rc::clone(&env_for_arguments),
+                    call_pos,
+                    cont.clone(),
+                    runtime,
+                )
+            }),
+            runtime,
+        )
+    }
+
+    fn eval_arguments_control(
+        &mut self,
+        operator: Value,
+        operator_pos: SourcePos,
+        arguments: Rc<Vec<Expr>>,
+        index: usize,
+        evaluated: Vec<LocatedValue>,
+        env: EnvRef,
+        call_pos: SourcePos,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        if index >= arguments.len() {
+            return self.apply_control(operator, operator_pos, evaluated, call_pos, cont, runtime);
+        }
+
+        let argument_expr = arguments[index].clone();
+        let argument_pos = argument_expr.pos();
+        let env_for_eval = Rc::clone(&env);
+        let env_for_next = Rc::clone(&env);
+        self.eval_control(
+            &argument_expr,
+            &env_for_eval,
+            Rc::new(move |value, interpreter, runtime| {
+                let mut evaluated = evaluated.clone();
+                evaluated.push(LocatedValue {
+                    value,
+                    pos: argument_pos,
+                });
+                interpreter.eval_arguments_control(
+                    operator.clone(),
+                    operator_pos,
+                    Rc::clone(&arguments),
+                    index + 1,
+                    evaluated,
+                    Rc::clone(&env_for_next),
+                    call_pos,
+                    cont.clone(),
+                    runtime,
+                )
+            }),
+            runtime,
+        )
+    }
+
+    fn apply_control(
+        &mut self,
+        operator: Value,
+        operator_pos: SourcePos,
+        arguments: Vec<LocatedValue>,
+        call_pos: SourcePos,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        match operator {
+            Value::Builtin(Builtin::Apply) => {
+                self.builtin_apply_control(call_pos, &arguments, cont, runtime)
+            }
+            Value::Builtin(Builtin::CallCc) => {
+                self.builtin_call_cc_control(call_pos, &arguments, cont, runtime)
+            }
+            Value::Builtin(Builtin::Map) => {
+                self.builtin_map_control(call_pos, &arguments, cont, runtime)
+            }
+            Value::Builtin(builtin) => {
+                let result = builtin.apply(self, call_pos, &arguments)?;
+                cont(result, self, runtime)
+            }
+            Value::Lambda(lambda) => {
+                self.apply_lambda_control(&lambda, arguments, call_pos, cont, runtime)
+            }
+            Value::Continuation(continuation) => {
+                self.apply_continuation_control(&continuation, &arguments, call_pos, runtime)
+            }
+            _ => Err(self.error_at(operator_pos, "attempted to call non-procedure")),
+        }
+    }
+
+    fn apply_lambda_control(
+        &mut self,
+        lambda: &Rc<LambdaProcedure>,
+        arguments: Vec<LocatedValue>,
+        call_pos: SourcePos,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        if !lambda.parameters.accepts(arguments.len()) {
+            return Err(self.error_at(
+                call_pos,
+                format!("wrong argument count for {}", lambda.display_name()),
+            ));
+        }
+
+        let call_env = Environment::new(Some(Rc::clone(&lambda.closure)));
+        for (name, argument) in lambda.parameters.required.iter().zip(arguments.iter()) {
+            Environment::define(&call_env, name.clone(), argument.value.clone());
+        }
+        if let Some(rest) = &lambda.parameters.rest {
+            Environment::define(
+                &call_env,
+                rest.clone(),
+                self.build_list(&arguments, lambda.parameters.required.len()),
+            );
+        }
+
+        self.eval_sequence_control(Rc::new(lambda.body.clone()), 0, call_env, cont, runtime)
+    }
+
+    fn builtin_apply_control(
+        &mut self,
+        call_pos: SourcePos,
+        arguments: &[LocatedValue],
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        if arguments.len() < 2 {
+            return Err(self.error_at(call_pos, "wrong argument count for apply"));
+        }
+
+        let operator = arguments[0].clone();
+        let mut expanded_arguments = arguments[1..arguments.len() - 1].to_vec();
+        expanded_arguments.extend(self.expand_apply_arguments(arguments.last().unwrap())?);
+        self.apply_control(
+            operator.value.clone(),
+            operator.pos,
+            expanded_arguments,
+            call_pos,
+            cont,
+            runtime,
+        )
+    }
+
+    fn builtin_call_cc_control(
+        &mut self,
+        call_pos: SourcePos,
+        arguments: &[LocatedValue],
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        self.expect_argument_count(arguments, 1, "call/cc", call_pos)?;
+
+        let continuation = Value::Continuation(Rc::new(ContinuationValue {
+            id: runtime.fresh_id(),
+            winds: runtime.wind_stack.clone(),
+            cont: cont.clone(),
+        }));
+        self.apply_control(
+            arguments[0].value.clone(),
+            arguments[0].pos,
+            vec![LocatedValue {
+                value: continuation,
+                pos: call_pos,
+            }],
+            call_pos,
+            cont,
+            runtime,
+        )
+    }
+
+    fn builtin_map_control(
+        &mut self,
+        call_pos: SourcePos,
+        arguments: &[LocatedValue],
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        self.expect_minimum_argument_count(arguments, 2, "map", call_pos)?;
+
+        self.builtin_map_control_step(
+            arguments[0].clone(),
+            Rc::new(arguments[1..].to_vec()),
+            arguments[1..]
+                .iter()
+                .map(|argument| argument.value.clone())
+                .collect(),
+            Vec::new(),
+            call_pos,
+            cont,
+            runtime,
+        )
+    }
+
+    fn builtin_map_control_step(
+        &mut self,
+        procedure: LocatedValue,
+        list_arguments: Rc<Vec<LocatedValue>>,
+        cursors: Vec<Value>,
+        results: Vec<Value>,
+        call_pos: SourcePos,
+        cont: ControlCont,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        let mut mapped_arguments = Vec::with_capacity(list_arguments.len());
+        let mut next_cursors = Vec::with_capacity(list_arguments.len());
+        let mut reached_end = false;
+
+        for (cursor, list_argument) in cursors.iter().zip(list_arguments.iter()) {
+            if matches!(cursor, Value::EmptyList) {
+                reached_end = true;
+                break;
+            }
+            let Some((car, cdr)) = pair_parts(cursor) else {
+                return Err(self.error_at(list_argument.pos, "expected list for map"));
+            };
+            mapped_arguments.push(LocatedValue {
+                value: car,
+                pos: list_argument.pos,
+            });
+            next_cursors.push(cdr);
+        }
+
+        if reached_end {
+            return cont(self.list_from_values(results), self, runtime);
+        }
+
+        self.apply_control(
+            procedure.value.clone(),
+            procedure.pos,
+            mapped_arguments,
+            call_pos,
+            Rc::new(move |result, interpreter, runtime| {
+                let mut results = results.clone();
+                results.push(result);
+                interpreter.builtin_map_control_step(
+                    procedure.clone(),
+                    Rc::clone(&list_arguments),
+                    next_cursors.clone(),
+                    results,
+                    call_pos,
+                    cont.clone(),
+                    runtime,
+                )
+            }),
+            runtime,
+        )
+    }
+
+    fn apply_continuation_control(
+        &mut self,
+        continuation: &Rc<ContinuationValue>,
+        arguments: &[LocatedValue],
+        call_pos: SourcePos,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        self.expect_argument_count(arguments, 1, "continuation", call_pos)?;
+        self.transfer_continuation_control(
+            Rc::clone(continuation),
+            arguments[0].value.clone(),
+            runtime,
+        )
+    }
+
+    fn transfer_continuation_control(
+        &mut self,
+        continuation: Rc<ContinuationValue>,
+        value: Value,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        let shared = shared_wind_prefix(&runtime.wind_stack, &continuation.winds);
+        let exit_frames = Rc::new(
+            runtime.wind_stack[shared..]
+                .iter()
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let enter_frames = Rc::new(continuation.winds[shared..].to_vec());
+        self.run_exit_wind_frames_control(
+            exit_frames,
+            0,
+            enter_frames,
+            continuation,
+            value,
+            runtime,
+        )
+    }
+
+    fn run_exit_wind_frames_control(
+        &mut self,
+        exit_frames: Rc<Vec<WindFrame>>,
+        index: usize,
+        enter_frames: Rc<Vec<WindFrame>>,
+        continuation: Rc<ContinuationValue>,
+        value: Value,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        if index >= exit_frames.len() {
+            return self.run_enter_wind_frames_control(
+                enter_frames,
+                0,
+                continuation,
+                value,
+                runtime,
+            );
+        }
+
+        runtime.wind_stack.pop();
+        let frame = exit_frames[index].clone();
+        self.apply_control(
+            frame.out_thunk.clone(),
+            frame.out_pos,
+            Vec::new(),
+            frame.out_pos,
+            Rc::new(move |_, interpreter, runtime| {
+                interpreter.run_exit_wind_frames_control(
+                    Rc::clone(&exit_frames),
+                    index + 1,
+                    Rc::clone(&enter_frames),
+                    continuation.clone(),
+                    value.clone(),
+                    runtime,
+                )
+            }),
+            runtime,
+        )
+    }
+
+    fn run_enter_wind_frames_control(
+        &mut self,
+        enter_frames: Rc<Vec<WindFrame>>,
+        index: usize,
+        continuation: Rc<ContinuationValue>,
+        value: Value,
+        runtime: &mut ControlRuntime,
+    ) -> Result<Value, EvalError> {
+        if index >= enter_frames.len() {
+            return (continuation.cont)(value, self, runtime);
+        }
+
+        let frame = enter_frames[index].clone();
+        self.apply_control(
+            frame.in_thunk.clone(),
+            frame.in_pos,
+            Vec::new(),
+            frame.in_pos,
+            Rc::new(move |_, interpreter, runtime| {
+                runtime.wind_stack.push(frame.clone());
+                interpreter.run_enter_wind_frames_control(
+                    Rc::clone(&enter_frames),
+                    index + 1,
+                    continuation.clone(),
+                    value.clone(),
+                    runtime,
+                )
+            }),
+            runtime,
+        )
+    }
+
     fn parse_bindings(&self, bindings_expr: &Expr) -> Result<Vec<Binding>, EvalError> {
         let Expr::List(bindings, _) = bindings_expr else {
             return Err(EvalError::new("invalid let"));
@@ -965,6 +2078,26 @@ impl Interpreter {
         Ok(result)
     }
 
+    fn builtin_reverse(
+        &mut self,
+        call_pos: SourcePos,
+        arguments: &[LocatedValue],
+    ) -> Result<Value, EvalError> {
+        self.expect_argument_count(arguments, 1, "reverse", call_pos)?;
+
+        let mut elements = Vec::new();
+        let mut current = arguments[0].value.clone();
+        while let Some((car, cdr)) = pair_parts(&current) {
+            elements.push(car);
+            current = cdr;
+        }
+        if !matches!(current, Value::EmptyList) {
+            return Err(self.error_at(arguments[0].pos, "expected list for reverse"));
+        }
+
+        Ok(self.list_from_values(elements.into_iter().rev()))
+    }
+
     fn builtin_display(
         &mut self,
         call_pos: SourcePos,
@@ -1092,7 +2225,9 @@ impl Interpreter {
     ) -> Result<Value, EvalError> {
         self.expect_argument_count(arguments, 1, "number->string", call_pos)?;
         Ok(Value::String(string_cell(
-            &self.require_number(&arguments[0], "number->string")?.render(),
+            &self
+                .require_number(&arguments[0], "number->string")?
+                .render(),
         )))
     }
 
@@ -1145,7 +2280,9 @@ impl Interpreter {
         arguments: &[LocatedValue],
     ) -> Result<Value, EvalError> {
         self.expect_argument_count(arguments, 1, "exact?", call_pos)?;
-        Ok(Value::Bool(matches!(arguments[0].value, Value::Number(number) if number.is_exact())))
+        Ok(Value::Bool(
+            matches!(arguments[0].value, Value::Number(number) if number.is_exact()),
+        ))
     }
 
     fn builtin_inexact_predicate(
@@ -1154,7 +2291,9 @@ impl Interpreter {
         arguments: &[LocatedValue],
     ) -> Result<Value, EvalError> {
         self.expect_argument_count(arguments, 1, "inexact?", call_pos)?;
-        Ok(Value::Bool(matches!(arguments[0].value, Value::Number(number) if number.is_inexact())))
+        Ok(Value::Bool(
+            matches!(arguments[0].value, Value::Number(number) if number.is_inexact()),
+        ))
     }
 
     fn builtin_integer_predicate(
@@ -1163,7 +2302,9 @@ impl Interpreter {
         arguments: &[LocatedValue],
     ) -> Result<Value, EvalError> {
         self.expect_argument_count(arguments, 1, "integer?", call_pos)?;
-        Ok(Value::Bool(matches!(arguments[0].value, Value::Number(number) if number.is_integer())))
+        Ok(Value::Bool(
+            matches!(arguments[0].value, Value::Number(number) if number.is_integer()),
+        ))
     }
 
     fn builtin_rational_predicate(
@@ -1172,7 +2313,9 @@ impl Interpreter {
         arguments: &[LocatedValue],
     ) -> Result<Value, EvalError> {
         self.expect_argument_count(arguments, 1, "rational?", call_pos)?;
-        Ok(Value::Bool(matches!(arguments[0].value, Value::Number(number) if number.is_rational())))
+        Ok(Value::Bool(
+            matches!(arguments[0].value, Value::Number(number) if number.is_rational()),
+        ))
     }
 
     fn builtin_exact_to_inexact(
@@ -1404,8 +2547,10 @@ impl Interpreter {
     ) -> Result<Value, EvalError> {
         self.expect_argument_count(arguments, 1, "positive?", call_pos)?;
         Ok(Value::Bool(
-            compare_numbers(self.require_number(&arguments[0], "positive?")?, Number::int(0))
-                == Ordering::Greater,
+            compare_numbers(
+                self.require_number(&arguments[0], "positive?")?,
+                Number::int(0),
+            ) == Ordering::Greater,
         ))
     }
 
@@ -1416,8 +2561,10 @@ impl Interpreter {
     ) -> Result<Value, EvalError> {
         self.expect_argument_count(arguments, 1, "negative?", call_pos)?;
         Ok(Value::Bool(
-            compare_numbers(self.require_number(&arguments[0], "negative?")?, Number::int(0))
-                == Ordering::Less,
+            compare_numbers(
+                self.require_number(&arguments[0], "negative?")?,
+                Number::int(0),
+            ) == Ordering::Less,
         ))
     }
 
@@ -1722,7 +2869,9 @@ impl Interpreter {
         arguments: &[LocatedValue],
     ) -> Result<Value, EvalError> {
         let any_inexact = arguments.iter().try_fold(false, |seen, argument| {
-            Ok::<_, EvalError>(seen || matches!(self.require_number(argument, "+")?, Number::Inexact(_)))
+            Ok::<_, EvalError>(
+                seen || matches!(self.require_number(argument, "+")?, Number::Inexact(_)),
+            )
         })?;
 
         if any_inexact {
@@ -1758,11 +2907,11 @@ impl Interpreter {
         }
 
         let any_inexact = matches!(first, Number::Inexact(_))
-            || arguments[1..]
-                .iter()
-                .try_fold(false, |seen, argument| {
-                    Ok::<_, EvalError>(seen || matches!(self.require_number(argument, "-")?, Number::Inexact(_)))
-                })?;
+            || arguments[1..].iter().try_fold(false, |seen, argument| {
+                Ok::<_, EvalError>(
+                    seen || matches!(self.require_number(argument, "-")?, Number::Inexact(_)),
+                )
+            })?;
 
         if any_inexact {
             let mut result = first.to_f64();
@@ -1785,7 +2934,9 @@ impl Interpreter {
         arguments: &[LocatedValue],
     ) -> Result<Value, EvalError> {
         let any_inexact = arguments.iter().try_fold(false, |seen, argument| {
-            Ok::<_, EvalError>(seen || matches!(self.require_number(argument, "*")?, Number::Inexact(_)))
+            Ok::<_, EvalError>(
+                seen || matches!(self.require_number(argument, "*")?, Number::Inexact(_)),
+            )
         })?;
 
         if any_inexact {
@@ -1814,11 +2965,11 @@ impl Interpreter {
 
         let first = self.require_number(&arguments[0], "/")?;
         let any_inexact = matches!(first, Number::Inexact(_))
-            || arguments[1..]
-                .iter()
-                .try_fold(false, |seen, argument| {
-                    Ok::<_, EvalError>(seen || matches!(self.require_number(argument, "/")?, Number::Inexact(_)))
-                })?;
+            || arguments[1..].iter().try_fold(false, |seen, argument| {
+                Ok::<_, EvalError>(
+                    seen || matches!(self.require_number(argument, "/")?, Number::Inexact(_)),
+                )
+            })?;
 
         if any_inexact {
             let mut result = first.to_f64();
@@ -1894,7 +3045,9 @@ impl Interpreter {
     fn require_int(&self, value: &LocatedValue, name: &str) -> Result<i64, EvalError> {
         match value.value {
             Value::Number(Number::Exact(number, 1)) => Ok(number),
-            Value::Number(_) => Err(self.error_at(value.pos, format!("expected integer for {name}"))),
+            Value::Number(_) => {
+                Err(self.error_at(value.pos, format!("expected integer for {name}")))
+            }
             _ => Err(self.error_at(value.pos, format!("expected number for {name}"))),
         }
     }
@@ -1913,7 +3066,9 @@ impl Interpreter {
     ) -> Result<(i64, i64), EvalError> {
         match self.require_number(value, name)? {
             Number::Exact(numerator, denominator) => Ok((numerator, denominator)),
-            Number::Inexact(_) => Err(self.error_at(value.pos, format!("expected exact number for {name}"))),
+            Number::Inexact(_) => {
+                Err(self.error_at(value.pos, format!("expected exact number for {name}")))
+            }
         }
     }
 
@@ -2131,6 +3286,7 @@ impl Interpreter {
             (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
             (Value::Builtin(left), Value::Builtin(right)) => left == right,
             (Value::Lambda(left), Value::Lambda(right)) => Rc::ptr_eq(left, right),
+            (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
             (Value::EmptyList, Value::EmptyList) => true,
             (Value::Void, Value::Void) => true,
             _ => false,
@@ -2207,6 +3363,56 @@ struct LocatedValue {
     pos: SourcePos,
 }
 
+type ControlCont =
+    Rc<dyn Fn(Value, &mut Interpreter, &mut ControlRuntime) -> Result<Value, EvalError>>;
+
+#[derive(Default)]
+struct ControlRuntime {
+    wind_stack: Vec<WindFrame>,
+    next_id: usize,
+}
+
+impl ControlRuntime {
+    fn fresh_id(&mut self) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+}
+
+#[derive(Clone)]
+struct WindFrame {
+    id: usize,
+    in_thunk: Value,
+    in_pos: SourcePos,
+    out_thunk: Value,
+    out_pos: SourcePos,
+}
+
+impl fmt::Debug for WindFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WindFrame")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+struct ContinuationValue {
+    id: usize,
+    winds: Vec<WindFrame>,
+    cont: ControlCont,
+}
+
+impl fmt::Debug for ContinuationValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContinuationValue")
+            .field("id", &self.id)
+            .field("winds", &self.winds)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Value {
     Number(Number),
@@ -2218,6 +3424,7 @@ enum Value {
     EmptyList,
     Builtin(Builtin),
     Lambda(Rc<LambdaProcedure>),
+    Continuation(Rc<ContinuationValue>),
     Void,
 }
 
@@ -2321,7 +3528,10 @@ fn compare_numbers(left: Number, right: Number) -> Ordering {
             let right_scaled = right_num as i128 * left_den as i128;
             left_scaled.cmp(&right_scaled)
         }
-        _ => left.to_f64().partial_cmp(&right.to_f64()).unwrap_or(Ordering::Equal),
+        _ => left
+            .to_f64()
+            .partial_cmp(&right.to_f64())
+            .unwrap_or(Ordering::Equal),
     }
 }
 
@@ -2574,6 +3784,7 @@ enum Builtin {
     List,
     Length,
     Append,
+    Reverse,
     Display,
     Write,
     Newline,
@@ -2633,6 +3844,7 @@ enum Builtin {
     StringDowncase,
     Not,
     Apply,
+    CallCc,
 }
 
 impl Builtin {
@@ -2653,6 +3865,7 @@ impl Builtin {
             Self::List => "list",
             Self::Length => "length",
             Self::Append => "append",
+            Self::Reverse => "reverse",
             Self::Display => "display",
             Self::Write => "write",
             Self::Newline => "newline",
@@ -2712,6 +3925,7 @@ impl Builtin {
             Self::StringDowncase => "string-downcase",
             Self::Not => "not",
             Self::Apply => "apply",
+            Self::CallCc => "call/cc",
         }
     }
 
@@ -2727,28 +3941,24 @@ impl Builtin {
             Self::Multiply => interpreter.builtin_multiply(call_pos, arguments),
             Self::Divide => interpreter.builtin_divide(call_pos, arguments),
             Self::LessThan => {
-                interpreter
-                    .builtin_numeric_comparison(call_pos, arguments, "<", |ordering| {
-                        matches!(ordering, Ordering::Less)
-                    })
+                interpreter.builtin_numeric_comparison(call_pos, arguments, "<", |ordering| {
+                    matches!(ordering, Ordering::Less)
+                })
             }
             Self::GreaterThan => {
-                interpreter
-                    .builtin_numeric_comparison(call_pos, arguments, ">", |ordering| {
-                        matches!(ordering, Ordering::Greater)
-                    })
+                interpreter.builtin_numeric_comparison(call_pos, arguments, ">", |ordering| {
+                    matches!(ordering, Ordering::Greater)
+                })
             }
             Self::EqualNumber => {
-                interpreter
-                    .builtin_numeric_comparison(call_pos, arguments, "=", |ordering| {
-                        matches!(ordering, Ordering::Equal)
-                    })
+                interpreter.builtin_numeric_comparison(call_pos, arguments, "=", |ordering| {
+                    matches!(ordering, Ordering::Equal)
+                })
             }
             Self::LessEqual => {
-                interpreter
-                    .builtin_numeric_comparison(call_pos, arguments, "<=", |ordering| {
-                        matches!(ordering, Ordering::Less | Ordering::Equal)
-                    })
+                interpreter.builtin_numeric_comparison(call_pos, arguments, "<=", |ordering| {
+                    matches!(ordering, Ordering::Less | Ordering::Equal)
+                })
             }
             Self::Cons => interpreter.builtin_cons(call_pos, arguments),
             Self::Car => interpreter.builtin_car(call_pos, arguments),
@@ -2757,6 +3967,7 @@ impl Builtin {
             Self::List => interpreter.builtin_list(call_pos, arguments),
             Self::Length => interpreter.builtin_length(call_pos, arguments),
             Self::Append => interpreter.builtin_append(call_pos, arguments),
+            Self::Reverse => interpreter.builtin_reverse(call_pos, arguments),
             Self::Display => interpreter.builtin_display(call_pos, arguments),
             Self::Write => interpreter.builtin_write(call_pos, arguments),
             Self::Newline => interpreter.builtin_newline(call_pos, arguments),
@@ -2822,6 +4033,9 @@ impl Builtin {
             Self::StringDowncase => interpreter.builtin_string_downcase(call_pos, arguments),
             Self::Not => interpreter.builtin_not(call_pos, arguments),
             Self::Apply => interpreter.builtin_apply(call_pos, arguments),
+            Self::CallCc => {
+                Err(interpreter.error_at(call_pos, "call/cc requires control evaluation"))
+            }
         }
     }
 }
@@ -2834,6 +4048,7 @@ fn is_special_form(name: &str) -> bool {
             | "cond"
             | "define"
             | "define-syntax"
+            | "dynamic-wind"
             | "else"
             | "if"
             | "lambda"
@@ -2843,6 +4058,29 @@ fn is_special_form(name: &str) -> bool {
             | "set!"
             | "syntax-rules"
     )
+}
+
+fn program_needs_control(expressions: &[Expr]) -> bool {
+    expressions.iter().any(expr_needs_control)
+}
+
+fn expr_needs_control(expr: &Expr) -> bool {
+    match expr {
+        Expr::Symbol(name, _) => matches!(
+            name.as_str(),
+            "call/cc" | "call-with-current-continuation" | "define-syntax" | "dynamic-wind"
+        ),
+        Expr::List(elements, _) => elements.iter().any(expr_needs_control),
+        Expr::Number(_, _) | Expr::Bool(_, _) | Expr::String(_, _) | Expr::Char(_, _) => false,
+    }
+}
+
+fn shared_wind_prefix(current: &[WindFrame], target: &[WindFrame]) -> usize {
+    current
+        .iter()
+        .zip(target.iter())
+        .take_while(|(left, right)| left.id == right.id)
+        .count()
 }
 
 fn is_ellipsis_expr(expr: &Expr) -> bool {
@@ -3386,7 +4624,11 @@ fn inexact_to_exact_number(number: f64) -> Number {
 }
 
 fn decimal_text_to_exact(text: &str) -> Number {
-    let sign = if text.starts_with('-') { -1_i128 } else { 1_i128 };
+    let sign = if text.starts_with('-') {
+        -1_i128
+    } else {
+        1_i128
+    };
     let digits = text.trim_start_matches(['+', '-']);
     let (whole, fractional) = digits.split_once('.').unwrap_or((digits, ""));
     let whole_value = if whole.is_empty() {
@@ -3450,6 +4692,7 @@ fn render_value(value: &Value, display_mode: bool) -> String {
         Value::EmptyList => "()".to_owned(),
         Value::Builtin(builtin) => format!("#<procedure {}>", builtin.name()),
         Value::Lambda(lambda) => format!("#<procedure {}>", lambda.display_name()),
+        Value::Continuation(_) => "#<procedure continuation>".to_owned(),
         Value::Void => String::new(),
     }
 }
