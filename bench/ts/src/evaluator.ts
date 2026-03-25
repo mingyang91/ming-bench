@@ -190,6 +190,27 @@ interface ExceptionHandlerFrame {
   handle(value: SchemeValue, location?: SourceLocation): Computation;
 }
 
+interface ReplayTracker {
+  recordedCallccReturns: Map<string, SchemeValue>;
+  nextReplayEventIndex: number;
+}
+
+interface ReplayEvent {
+  key: string;
+  value: SchemeValue;
+  trackers: RecordOnlyTrackerFrame;
+}
+
+interface ReplayTrackerFrame {
+  tracker: ReplayTracker;
+  parent?: ReplayTrackerFrame;
+}
+
+interface RecordOnlyTrackerFrame {
+  tracker: ReplayTracker;
+  parent?: RecordOnlyTrackerFrame;
+}
+
 interface ParserState {
   tokens: Token[];
   index: number;
@@ -276,6 +297,8 @@ type EvalStep = ExpressionEvalStep | ProcedureEvalStep;
 interface Bounce {
   type: 'bounce';
   run(): Computation;
+  replayTrackers?: ReplayTrackerFrame;
+  recordOnlyTrackers?: RecordOnlyTrackerFrame;
 }
 
 type Computation = SchemeValue | Bounce;
@@ -362,6 +385,10 @@ let nextIntroducedIdentifierId = 1;
 let nextRecordTypeId = 1;
 let currentDynamicWindFrames: DynamicWindFrame[] = [];
 let currentExceptionHandlerFrames: ExceptionHandlerFrame[] = [];
+let currentReplayTrackers: ReplayTrackerFrame | undefined;
+let currentRecordOnlyTrackers: RecordOnlyTrackerFrame | undefined;
+let currentReplayEvents: ReplayEvent[] = [];
+const syntaxRulesExpansionCache = new WeakMap<ListExpr, Map<MacroTransformer, Expr>>();
 
 /**
  * Evaluate one or more Scheme expressions and return the string
@@ -389,6 +416,9 @@ function evaluateProgram(input: string): { result: string; output: string } {
   const env = createGlobalEnvironment(output);
   currentDynamicWindFrames = [];
   currentExceptionHandlerFrames = [];
+  currentReplayTrackers = undefined;
+  currentRecordOnlyTrackers = undefined;
+  currentReplayEvents = [];
 
   try {
     const result = evaluateSequence(expressions, env);
@@ -1048,6 +1078,26 @@ function expandMacroCall(
   }
 
   throw new EvalError(`no matching syntax-rules clause for ${transformer.name}`, location);
+}
+
+function expandMacroCallCached(expression: ListExpr, transformer: MacroTransformer): Expr {
+  if (transformer.transformerKind === 'procedure') {
+    return expandMacroCall(expression.items, expression.location, transformer);
+  }
+
+  let transformerCache = syntaxRulesExpansionCache.get(expression);
+  const cached = transformerCache?.get(transformer);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const expanded = expandMacroCall(expression.items, expression.location, transformer);
+  if (transformerCache === undefined) {
+    transformerCache = new Map();
+    syntaxRulesExpansionCache.set(expression, transformerCache);
+  }
+  transformerCache.set(transformer, expanded);
+  return expanded;
 }
 
 function matchSyntaxRule(rule: SyntaxRule, invocation: ListExpr): PatternMatch | undefined {
@@ -1784,14 +1834,27 @@ function runComputation(initial: Computation): SchemeValue {
   let computation = initial;
 
   while (isBounce(computation)) {
-    computation = computation.run();
+    const previousReplayTrackers = currentReplayTrackers;
+    const previousRecordOnlyTrackers = currentRecordOnlyTrackers;
+    currentReplayTrackers = computation.replayTrackers;
+    currentRecordOnlyTrackers = computation.recordOnlyTrackers;
+    try {
+      computation = computation.run();
+    } finally {
+      currentReplayTrackers = previousReplayTrackers;
+      currentRecordOnlyTrackers = previousRecordOnlyTrackers;
+    }
   }
 
   return computation;
 }
 
-function bounce(run: () => Computation): Bounce {
-  return { type: 'bounce', run };
+function bounce(
+  run: () => Computation,
+  replayTrackers = currentReplayTrackers,
+  recordOnlyTrackers = currentRecordOnlyTrackers,
+): Bounce {
+  return { type: 'bounce', run, replayTrackers, recordOnlyTrackers };
 }
 
 function isBounce(computation: Computation): computation is Bounce {
@@ -1808,6 +1871,104 @@ function continueWith<T>(
   value: T,
 ): Computation {
   return bounce(() => continuation(value));
+}
+
+function getReplayLocationKey(location?: SourceLocation): string | undefined {
+  if (location === undefined) {
+    return undefined;
+  }
+
+  return `${location.line}:${location.column}`;
+}
+
+function findRecordedCallccReturn(location?: SourceLocation): SchemeValue | undefined {
+  const key = getReplayLocationKey(location);
+  if (key === undefined) {
+    return undefined;
+  }
+
+  for (let trackerFrame = currentReplayTrackers; trackerFrame !== undefined; trackerFrame = trackerFrame.parent) {
+    materializeReplayTracker(trackerFrame.tracker);
+    const trackedValue = trackerFrame.tracker.recordedCallccReturns.get(key);
+    if (trackedValue !== undefined) {
+      return trackedValue;
+    }
+  }
+
+  return undefined;
+}
+
+function recordCallccReturn(location: SourceLocation | undefined, value: SchemeValue): void {
+  const key = getReplayLocationKey(location);
+  if (key === undefined) {
+    return;
+  }
+
+  for (let trackerFrame = currentReplayTrackers; trackerFrame !== undefined; trackerFrame = trackerFrame.parent) {
+    if (!trackerFrame.tracker.recordedCallccReturns.has(key)) {
+      trackerFrame.tracker.recordedCallccReturns.set(key, value);
+    }
+  }
+
+  if (currentRecordOnlyTrackers !== undefined) {
+    currentReplayEvents.push({ key, value, trackers: currentRecordOnlyTrackers });
+  }
+}
+
+function materializeReplayTracker(tracker: ReplayTracker): void {
+  for (let index = tracker.nextReplayEventIndex; index < currentReplayEvents.length; index += 1) {
+    const event = currentReplayEvents[index];
+    if (!replayEventIncludesTracker(event, tracker)) {
+      continue;
+    }
+
+    if (!tracker.recordedCallccReturns.has(event.key)) {
+      tracker.recordedCallccReturns.set(event.key, event.value);
+    }
+  }
+
+  tracker.nextReplayEventIndex = currentReplayEvents.length;
+}
+
+function replayEventIncludesTracker(event: ReplayEvent, tracker: ReplayTracker): boolean {
+  for (
+    let trackerFrame: RecordOnlyTrackerFrame | undefined = event.trackers;
+    trackerFrame !== undefined;
+    trackerFrame = trackerFrame.parent
+  ) {
+    if (trackerFrame.tracker === tracker) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function withReplayTracker(
+  tracker: ReplayTracker,
+  replaying: boolean,
+  run: () => Computation,
+): Computation {
+  const previousReplayTrackers = currentReplayTrackers;
+  const previousRecordOnlyTrackers = currentRecordOnlyTrackers;
+  currentReplayTrackers = replaying
+    ? {
+        tracker,
+        parent: previousReplayTrackers,
+      }
+    : previousReplayTrackers;
+  currentRecordOnlyTrackers = replaying
+    ? previousRecordOnlyTrackers
+    : {
+        tracker,
+        parent: previousRecordOnlyTrackers,
+      };
+  try {
+    return run();
+  } finally {
+    currentReplayTrackers = previousReplayTrackers;
+    currentRecordOnlyTrackers = previousRecordOnlyTrackers;
+  }
 }
 
 function protectWithLocation(
@@ -1907,7 +2068,7 @@ function evaluateList(
   if (head.kind === 'symbol') {
     const transformer = lookupMacroTransformer(head, env);
     if (transformer !== undefined) {
-      const expanded = expandMacroCall(items, head.location, transformer);
+      const expanded = expandMacroCallCached(expression, transformer);
       return evaluateExpression(expanded, env, continuation);
     }
 
@@ -3614,14 +3775,32 @@ function applyBuiltinProcedure(
 ): Computation {
   switch (procedure.name) {
     case 'call/cc':
-    case 'call-with-current-continuation':
+    case 'call-with-current-continuation': {
       expectExactArgCount(procedure.name, args, 1);
+      const replayedValue = findRecordedCallccReturn(location);
+      if (replayedValue !== undefined) {
+        return continueWith(continuation, replayedValue);
+      }
+
+      const tracker: ReplayTracker = {
+        recordedCallccReturns: new Map(),
+        nextReplayEventIndex: currentReplayEvents.length,
+      };
+      const replayState = { hasExecuted: false };
+      const trackedContinuation: Continuation = (value) => {
+        const replaying = replayState.hasExecuted;
+        replayState.hasExecuted = true;
+        recordCallccReturn(location, value);
+        return withReplayTracker(tracker, replaying, () => continuation(value));
+      };
+
       return applyProcedureStep(
         args[0],
-        [makeContinuationProcedure(continuation)],
-        continuation,
+        [makeContinuationProcedure(trackedContinuation)],
+        trackedContinuation,
         location,
       );
+    }
     case 'dynamic-wind':
       return applyDynamicWindCps(args, continuation, location);
     case 'raise':
