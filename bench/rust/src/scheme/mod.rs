@@ -21,6 +21,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "call-with-current-continuation",
     "call/cc",
     "dynamic-wind",
+    "error",
     "raise",
     "with-exception-handler",
     "<",
@@ -275,6 +276,38 @@ impl Expr {
 
     fn list(items: Vec<Expr>, pos: SourcePos) -> Self {
         Self::new(ExprKind::List(items), pos)
+    }
+}
+
+fn is_dot_expr(expr: &Expr) -> bool {
+    matches!(&expr.kind, ExprKind::Symbol(name) if name == ".")
+}
+
+fn split_improper_list_items(items: &[Expr]) -> (&[Expr], Option<&Expr>) {
+    let Some((tail, rest)) = items.split_last() else {
+        return (items, None);
+    };
+
+    let Some((dot, prefix)) = rest.split_last() else {
+        return (items, None);
+    };
+
+    if is_dot_expr(dot) {
+        (prefix, Some(tail))
+    } else {
+        (items, None)
+    }
+}
+
+fn build_list_expr(items: Vec<Expr>, tail: Option<Expr>, position: SourcePos) -> Expr {
+    if let Some(tail) = tail {
+        let mut dotted_items = Vec::with_capacity(items.len() + 2);
+        dotted_items.extend(items);
+        dotted_items.push(Expr::symbol(".", position));
+        dotted_items.push(tail);
+        Expr::list(dotted_items, position)
+    } else {
+        Expr::list(items, position)
     }
 }
 
@@ -1973,6 +2006,12 @@ fn machine_eval_list(
             "set!" => machine_eval_set(tail, env, head.pos, cont),
             "if" => machine_eval_if(tail, env, head.pos, cont),
             "quote" => Ok(machine_value(eval_quote(tail, head.pos)?, cont)),
+            "quasiquote" => Ok(machine_value(eval_quasiquote(tail, env, head.pos)?, cont)),
+            "unquote" => Err(EvalError::syntax("unquote outside quasiquote", head.pos)),
+            "unquote-splicing" => Err(EvalError::syntax(
+                "unquote-splicing outside quasiquote",
+                head.pos,
+            )),
             "lambda" => Ok(machine_value(eval_lambda(tail, env, head.pos)?, cont)),
             "case-lambda" => Ok(machine_value(eval_case_lambda(tail, env, head.pos)?, cont)),
             "begin" => Ok(machine_start_sequence(tail, env, cont)),
@@ -2438,6 +2477,7 @@ fn machine_apply_builtin(
 
             machine_raise(args[0].value.clone(), args[0].position, env, cont)
         }
+        "error" => machine_raise(build_error_value(&args), position, env, cont),
         "with-exception-handler" => {
             if args.len() != 2 {
                 return Err(EvalError::wrong_arg_count(
@@ -2658,6 +2698,10 @@ fn build_quote_expr(datum: Expr, position: SourcePos) -> Expr {
     Expr::list(vec![Expr::symbol("quote", position), datum], position)
 }
 
+fn build_quasiquote_expr(datum: Expr, position: SourcePos) -> Expr {
+    Expr::list(vec![Expr::symbol("quasiquote", position), datum], position)
+}
+
 fn build_syntax_expr(template: Expr, position: SourcePos) -> Expr {
     Expr::list(vec![Expr::symbol("syntax", position), template], position)
 }
@@ -2821,26 +2865,46 @@ fn desugar_cond(exprs: &[Expr], position: SourcePos) -> Result<Expr, EvalError> 
     }
 
     let else_branch = desugar_cond(rest, position)?;
-    if body.is_empty() {
-        let temp = fresh_generated_symbol("cond");
-        let temp_expr = Expr::symbol(temp.clone(), test.pos);
-        Ok(build_plain_let_expr(
-            vec![(temp.clone(), test.clone())],
-            vec![build_if_expr(
-                temp_expr.clone(),
-                temp_expr,
-                else_branch,
+    match body {
+        [] => {
+            let temp = fresh_generated_symbol("cond");
+            let temp_expr = Expr::symbol(temp.clone(), test.pos);
+            Ok(build_plain_let_expr(
+                vec![(temp.clone(), test.clone())],
+                vec![build_if_expr(
+                    temp_expr.clone(),
+                    temp_expr,
+                    else_branch,
+                    clause.pos,
+                )],
                 clause.pos,
-            )],
-            clause.pos,
-        ))
-    } else {
-        Ok(build_if_expr(
+            ))
+        }
+        [arrow, proc]
+            if matches!(&arrow.kind, ExprKind::Symbol(name) if name == "=>") =>
+        {
+            let temp = fresh_generated_symbol("cond");
+            let temp_expr = Expr::symbol(temp.clone(), test.pos);
+            Ok(build_plain_let_expr(
+                vec![(temp.clone(), test.clone())],
+                vec![build_if_expr(
+                    temp_expr.clone(),
+                    build_call_expr(proc.clone(), vec![temp_expr], clause.pos),
+                    else_branch,
+                    clause.pos,
+                )],
+                clause.pos,
+            ))
+        }
+        [arrow, ..] if matches!(&arrow.kind, ExprKind::Symbol(name) if name == "=>") => Err(
+            EvalError::syntax("cond => clause must contain exactly one procedure", arrow.pos),
+        ),
+        _ => Ok(build_if_expr(
             test.clone(),
             build_begin_expr(body.to_vec(), clause.pos),
             else_branch,
             clause.pos,
-        ))
+        )),
     }
 }
 
@@ -3133,6 +3197,11 @@ fn eval_list(items: Vec<Expr>, env: EnvRef, position: SourcePos) -> Result<EvalS
             "set!" => Ok(EvalStep::Value(eval_set(tail, env, head.pos)?)),
             "if" => eval_if_step(tail, env, head.pos),
             "quote" => Ok(EvalStep::Value(eval_quote(tail, head.pos)?)),
+            "quasiquote" => Ok(EvalStep::Value(eval_quasiquote(tail, env, head.pos)?)),
+            "unquote" => Err(EvalError::syntax("unquote outside quasiquote", head.pos)),
+            "unquote-splicing" => {
+                Err(EvalError::syntax("unquote-splicing outside quasiquote", head.pos))
+            }
             "lambda" => Ok(EvalStep::Value(eval_lambda(tail, env, head.pos)?)),
             "case-lambda" => Ok(EvalStep::Value(eval_case_lambda(tail, env, head.pos)?)),
             "syntax" => Ok(EvalStep::Value(eval_syntax(tail, env, head.pos)?)),
@@ -3487,6 +3556,145 @@ fn eval_quote(exprs: &[Expr], position: SourcePos) -> Result<Value, EvalError> {
     Ok(quote_expr(expr))
 }
 
+enum QuasiquotePart {
+    Value(Value),
+    Splice(Vec<Value>),
+}
+
+fn eval_quasiquote(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+    let [expr] = exprs else {
+        return Err(EvalError::syntax(
+            "quasiquote requires exactly 1 expression",
+            position,
+        ));
+    };
+
+    eval_quasiquote_expr(expr, env, 0)
+}
+
+fn eval_quasiquote_expr(expr: &Expr, env: EnvRef, depth: usize) -> Result<Value, EvalError> {
+    let ExprKind::List(items) = &expr.kind else {
+        return Ok(quote_expr(expr));
+    };
+
+    if let Some(arg) = match_quasiquote_form(items, "unquote") {
+        return if depth == 0 {
+            eval(arg, env)
+        } else {
+            Ok(quasiquote_form_value(
+                "unquote",
+                eval_quasiquote_expr(arg, env, depth - 1)?,
+            ))
+        };
+    }
+
+    if let Some(arg) = match_quasiquote_form(items, "unquote-splicing") {
+        return if depth == 0 {
+            Err(EvalError::syntax(
+                "unquote-splicing is only valid within a list quasiquote",
+                expr.pos,
+            ))
+        } else {
+            Ok(quasiquote_form_value(
+                "unquote-splicing",
+                eval_quasiquote_expr(arg, env, depth - 1)?,
+            ))
+        };
+    }
+
+    if let Some(arg) = match_quasiquote_form(items, "quasiquote") {
+        return Ok(quasiquote_form_value(
+            "quasiquote",
+            eval_quasiquote_expr(arg, env, depth + 1)?,
+        ));
+    }
+
+    eval_quasiquote_list(items, env, depth, expr.pos)
+}
+
+fn eval_quasiquote_list(
+    items: &[Expr],
+    env: EnvRef,
+    depth: usize,
+    position: SourcePos,
+) -> Result<Value, EvalError> {
+    let (items, tail) = split_improper_list_items(items);
+    let mut values = Vec::new();
+
+    for item in items {
+        match eval_quasiquote_part(item, env.clone(), depth)? {
+            QuasiquotePart::Value(value) => values.push(value),
+            QuasiquotePart::Splice(spliced) => values.extend(spliced),
+        }
+    }
+
+    let mut result = match tail {
+        Some(tail_expr) => {
+            if matches!(match_quasiquote_form_items(tail_expr), Some(("unquote-splicing", _)))
+                && depth == 0
+            {
+                return Err(EvalError::syntax(
+                    "unquote-splicing cannot appear in dotted quasiquote tails",
+                    tail_expr.pos,
+                ));
+            }
+
+            eval_quasiquote_expr(tail_expr, env, depth)?
+        }
+        None => Value::EmptyList,
+    };
+
+    while let Some(value) = values.pop() {
+        result = Value::Pair(Rc::new(Pair::new(value, result)));
+    }
+
+    let _ = position;
+    Ok(result)
+}
+
+fn eval_quasiquote_part(expr: &Expr, env: EnvRef, depth: usize) -> Result<QuasiquotePart, EvalError> {
+    if depth == 0 {
+        if let Some(arg) = match_quasiquote_form_items(expr) {
+            if arg.0 == "unquote-splicing" {
+                let value = eval(arg.1, env)?;
+                let values = collect_proper_list(&value).ok_or_else(|| {
+                    EvalError::type_mismatch("list", value.type_name(), expr.pos)
+                })?;
+                return Ok(QuasiquotePart::Splice(values));
+            }
+        }
+    }
+
+    Ok(QuasiquotePart::Value(eval_quasiquote_expr(expr, env, depth)?))
+}
+
+fn match_quasiquote_form<'a>(items: &'a [Expr], name: &str) -> Option<&'a Expr> {
+    match items {
+        [head, arg] if matches!(&head.kind, ExprKind::Symbol(symbol) if symbol == name) => {
+            Some(arg)
+        }
+        _ => None,
+    }
+}
+
+fn match_quasiquote_form_items(expr: &Expr) -> Option<(&str, &Expr)> {
+    let ExprKind::List(items) = &expr.kind else {
+        return None;
+    };
+
+    match items.as_slice() {
+        [head, arg] => match &head.kind {
+            ExprKind::Symbol(name) => Some((name.as_str(), arg)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn quasiquote_form_value(name: &str, arg: Value) -> Value {
+    list_from_values([Value::Symbol(name.into()), arg])
+}
+
 fn eval_lambda(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
     let Some((params_expr, body)) = exprs.split_first() else {
         return Err(EvalError::syntax(
@@ -3794,8 +4002,19 @@ fn quote_expr(expr: &Expr) -> Value {
         ExprKind::Char(value) => Value::Char(*value),
         ExprKind::String(value) => Value::String(SchemeString::immutable(value)),
         ExprKind::Symbol(value) => Value::Symbol(value.clone()),
-        ExprKind::List(items) => list_from_values(items.iter().map(quote_expr)),
+        ExprKind::List(items) => quote_list_expr(items),
     }
+}
+
+fn quote_list_expr(items: &[Expr]) -> Value {
+    let (items, tail) = split_improper_list_items(items);
+    let mut list = tail.map_or(Value::EmptyList, quote_expr);
+
+    for item in items.iter().rev() {
+        list = Value::Pair(Rc::new(Pair::new(quote_expr(item), list)));
+    }
+
+    list
 }
 
 fn syntax_value_from_pattern_binding(binding: &PatternBinding, env: EnvRef) -> SyntaxValue {
@@ -3887,29 +4106,27 @@ fn syntax_value_to_datum(value: &SyntaxValue) -> Value {
     }
 }
 
-fn list_value_to_datum_exprs(value: &Value, position: SourcePos) -> Result<Vec<Expr>, EvalError> {
+fn pair_value_to_datum_expr(value: &Value, position: SourcePos) -> Result<Expr, EvalError> {
     let mut items = Vec::new();
     let mut current = value.clone();
     let mut visited = HashSet::new();
 
     loop {
         match current {
-            Value::EmptyList => return Ok(items),
+            Value::EmptyList => return Ok(build_list_expr(items, None, position)),
             Value::Pair(pair) => {
                 let ptr = Rc::as_ptr(&pair) as usize;
                 if !visited.insert(ptr) {
-                    return Err(EvalError::syntax(
-                        "datum->syntax requires a finite proper list",
-                        position,
-                    ));
+                    return Err(EvalError::syntax("datum->syntax requires a finite list", position));
                 }
 
                 items.push(value_to_datum_expr(&pair.car(), position)?);
                 current = pair.cdr();
             }
-            _ => {
-                return Err(EvalError::syntax(
-                    "datum->syntax only supports proper lists",
+            other => {
+                return Ok(build_list_expr(
+                    items,
+                    Some(value_to_datum_expr(&other, position)?),
                     position,
                 ))
             }
@@ -3930,7 +4147,7 @@ fn value_to_datum_expr(value: &Value, position: SourcePos) -> Result<Expr, EvalE
         )),
         Value::Symbol(value) => Ok(Expr::symbol(value.clone(), position)),
         Value::EmptyList => Ok(Expr::list(Vec::new(), position)),
-        Value::Pair(_) => Ok(Expr::list(list_value_to_datum_exprs(value, position)?, position)),
+        Value::Pair(_) => pair_value_to_datum_expr(value, position),
         other => Err(EvalError::type_mismatch(
             "datum",
             other.type_name(),
@@ -4054,37 +4271,7 @@ fn eval_begin(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
 }
 
 fn eval_cond_step(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<EvalStep, EvalError> {
-    for (index, clause) in exprs.iter().enumerate() {
-        let ExprKind::List(items) = &clause.kind else {
-            return Err(EvalError::syntax("cond clauses must be lists", clause.pos));
-        };
-
-        let Some((test, body)) = items.split_first() else {
-            return Err(EvalError::syntax(
-                "cond clauses cannot be empty",
-                clause.pos,
-            ));
-        };
-
-        if matches!(&test.kind, ExprKind::Symbol(name) if name == "else") {
-            if index + 1 != exprs.len() {
-                return Err(EvalError::syntax("cond else clause must be last", test.pos));
-            }
-            return eval_sequence_step(body, env);
-        }
-
-        let test_value = eval(test, env.clone())?;
-        if test_value.is_truthy() {
-            return if body.is_empty() {
-                Ok(EvalStep::Value(test_value))
-            } else {
-                eval_sequence_step(body, env)
-            };
-        }
-    }
-
-    let _ = position;
-    Ok(EvalStep::Value(Value::Void))
+    Ok(EvalStep::Expr(desugar_cond(exprs, position)?, env))
 }
 
 fn eval_cond(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
@@ -4659,8 +4846,16 @@ fn apply_builtin_step(
     match name {
         "apply" => apply_apply_step(args, position, env),
         "call-with-values" => apply_call_with_values_step(args, position, env),
+        "error" => apply_error_step(args, position),
         _ => Ok(EvalStep::Value(apply_builtin(name, args, position, env)?)),
     }
+}
+
+fn apply_error_step(args: &[LocatedValue], position: SourcePos) -> Result<EvalStep, EvalError> {
+    Err(EvalError::uncaught_exception(
+        build_error_value(args).to_scheme_string(),
+        position,
+    ))
 }
 
 fn apply_builtin(
@@ -5272,13 +5467,21 @@ fn apply_write(
 }
 
 fn apply_append(args: &[LocatedValue], _position: SourcePos) -> Result<Value, EvalError> {
-    let mut items = Vec::new();
+    let Some((tail_arg, prefix_args)) = args.split_last() else {
+        return Ok(Value::EmptyList);
+    };
 
-    for arg in args {
+    let mut items = Vec::new();
+    for arg in prefix_args {
         items.extend(expect_proper_list(arg)?);
     }
 
-    Ok(list_from_values(items))
+    let mut result = tail_arg.value.clone();
+    while let Some(value) = items.pop() {
+        result = Value::Pair(Rc::new(Pair::new(value, result)));
+    }
+
+    Ok(result)
 }
 
 fn apply_reverse(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
@@ -6408,6 +6611,13 @@ where
     list
 }
 
+fn build_error_value(args: &[LocatedValue]) -> Value {
+    let mut values = Vec::with_capacity(args.len() + 1);
+    values.push(Value::Symbol("error".into()));
+    values.extend(args.iter().map(|arg| arg.value.clone()));
+    list_from_values(values)
+}
+
 fn is_proper_list(value: &Value) -> bool {
     proper_list_length(value).is_some()
 }
@@ -6540,11 +6750,14 @@ fn is_core_syntax_keyword(name: &str) -> bool {
             | "letrec"
             | "letrec*"
             | "or"
+            | "quasiquote"
             | "quote"
             | "set!"
             | "syntax"
             | "syntax-case"
             | "syntax-rules"
+            | "unquote"
+            | "unquote-splicing"
             | "with-syntax"
     )
 }
@@ -6559,6 +6772,7 @@ fn is_pattern_variable(
     macro_name: Option<&str>,
 ) -> bool {
     name != "..."
+        && name != "."
         && name != "_"
         && macro_name.is_none_or(|macro_name| name != macro_name)
         && !literals.contains(name)
@@ -6767,9 +6981,13 @@ fn match_macro_rule(
         ExprKind::Symbol(name) if name == "_" || name == macro_name
     )
         .then_some(())
-        .and_then(|_| {
-            match_pattern_list(pattern_tail, invocation_tail, literals, Some(macro_name))
-        })
+        .and_then(|_| match_pattern_list(
+            pattern_tail,
+            invocation_tail,
+            literals,
+            Some(macro_name),
+            invocation.pos,
+        ))
 }
 
 fn match_pattern(
@@ -6792,7 +7010,7 @@ fn match_pattern(
         (ExprKind::Char(left), ExprKind::Char(right)) if left == right => Some(HashMap::new()),
         (ExprKind::String(left), ExprKind::String(right)) if left == right => Some(HashMap::new()),
         (ExprKind::List(pattern_items), ExprKind::List(input_items)) => {
-            match_pattern_list(pattern_items, input_items, literals, macro_name)
+            match_pattern_list(pattern_items, input_items, literals, macro_name, input.pos)
         }
         (ExprKind::Symbol(name), _) if name == "_" => Some(HashMap::new()),
         (ExprKind::Symbol(name), ExprKind::Symbol(input_name))
@@ -6812,9 +7030,42 @@ fn match_pattern_list(
     inputs: &[Expr],
     literals: &HashSet<String>,
     macro_name: Option<&str>,
+    input_position: SourcePos,
+) -> Option<PatternBindings> {
+    let (pattern_items, pattern_tail) = split_improper_list_items(patterns);
+    let (input_items, input_tail) = split_improper_list_items(inputs);
+    match_pattern_list_parts(
+        pattern_items,
+        pattern_tail,
+        input_items,
+        input_tail,
+        literals,
+        macro_name,
+        input_position,
+    )
+}
+
+fn match_pattern_list_parts(
+    patterns: &[Expr],
+    pattern_tail: Option<&Expr>,
+    inputs: &[Expr],
+    input_tail: Option<&Expr>,
+    literals: &HashSet<String>,
+    macro_name: Option<&str>,
+    input_position: SourcePos,
 ) -> Option<PatternBindings> {
     if patterns.is_empty() {
-        return inputs.is_empty().then(HashMap::new);
+        return match pattern_tail {
+            Some(tail_pattern) => {
+                let remainder = build_list_expr(
+                    inputs.to_vec(),
+                    input_tail.cloned(),
+                    input_position,
+                );
+                match_pattern(tail_pattern, &remainder, literals, macro_name)
+            }
+            None => (inputs.is_empty() && input_tail.is_none()).then(HashMap::new),
+        };
     }
 
     if patterns.len() >= 2 && is_ellipsis_expr(&patterns[1]) {
@@ -6852,9 +7103,15 @@ fn match_pattern_list(
             else {
                 continue;
             };
-            let Some(suffix_bindings) =
-                match_pattern_list(suffix, &inputs[repeat_count..], literals, macro_name)
-            else {
+            let Some(suffix_bindings) = match_pattern_list_parts(
+                suffix,
+                pattern_tail,
+                &inputs[repeat_count..],
+                input_tail,
+                literals,
+                macro_name,
+                input_position,
+            ) else {
                 continue;
             };
 
@@ -6871,7 +7128,15 @@ fn match_pattern_list(
     };
 
     let first_bindings = match_pattern(&patterns[0], first_input, literals, macro_name)?;
-    let rest_bindings = match_pattern_list(&patterns[1..], rest_inputs, literals, macro_name)?;
+    let rest_bindings = match_pattern_list_parts(
+        &patterns[1..],
+        pattern_tail,
+        rest_inputs,
+        input_tail,
+        literals,
+        macro_name,
+        input_position,
+    )?;
     merge_pattern_bindings(first_bindings, rest_bindings)
 }
 
@@ -6902,6 +7167,7 @@ fn collect_pattern_variables(
             vars.insert(name.clone());
         }
         ExprKind::List(items) => {
+            let (items, tail) = split_improper_list_items(items);
             let mut index = 0;
             while index < items.len() {
                 if index + 1 < items.len() && is_ellipsis_expr(&items[index + 1]) {
@@ -6911,6 +7177,9 @@ fn collect_pattern_variables(
                     collect_pattern_variables(&items[index], literals, macro_name, vars);
                     index += 1;
                 }
+            }
+            if let Some(tail) = tail {
+                collect_pattern_variables(tail, literals, macro_name, vars);
             }
         }
         _ => {}
@@ -7006,6 +7275,10 @@ fn expand_template_symbol(
         return Ok(template.clone());
     }
 
+    if name == "." {
+        return Ok(template.clone());
+    }
+
     if let Some(renamed) = state.lookup_bound_name(name) {
         return Ok(Expr::symbol(renamed.to_string(), template.pos));
     }
@@ -7083,10 +7356,14 @@ fn expand_template_list(
         }
     }
 
-    Ok(Expr::list(
-        expand_template_sequence(items, bindings, transformer, state, indices, quoted)?,
-        template.pos,
-    ))
+    let (items, tail) = split_improper_list_items(items);
+    let expanded_items =
+        expand_template_sequence(items, bindings, transformer, state, indices, quoted)?;
+    let expanded_tail = tail
+        .map(|tail| expand_template(tail, bindings, transformer, state, indices, quoted))
+        .transpose()?;
+
+    Ok(build_list_expr(expanded_items, expanded_tail, template.pos))
 }
 
 fn expand_quote_template(
@@ -7500,6 +7777,7 @@ fn collect_template_repeat_count(
             }
         }
         ExprKind::List(items) => {
+            let (items, tail) = split_improper_list_items(items);
             let mut index = 0;
             while index < items.len() {
                 if index + 1 < items.len() && is_ellipsis_expr(&items[index + 1]) {
@@ -7509,6 +7787,9 @@ fn collect_template_repeat_count(
                     collect_template_repeat_count(&items[index], bindings, indices, repeat_count)?;
                     index += 1;
                 }
+            }
+            if let Some(tail) = tail {
+                collect_template_repeat_count(tail, bindings, indices, repeat_count)?;
             }
             Ok(())
         }
@@ -7603,6 +7884,8 @@ impl Parser {
             Some('(') => self.parse_list(position),
             Some(')') => Err(EvalError::syntax("unexpected ')'", position)),
             Some('\'') => self.parse_quote_shorthand(position),
+            Some('`') => self.parse_quasiquote_shorthand(position),
+            Some(',') => self.parse_unquote_shorthand(position),
             Some('#') if self.peek_next() == Some('\'') => self.parse_syntax_shorthand(position),
             Some('"') => self.parse_string(position),
             Some(_) => self.parse_token_expr(position),
@@ -7631,6 +7914,26 @@ impl Parser {
     fn parse_quote_shorthand(&mut self, position: SourcePos) -> Result<Expr, EvalError> {
         self.expect('\'')?;
         Ok(build_quote_expr(self.parse_expr()?, position))
+    }
+
+    fn parse_quasiquote_shorthand(&mut self, position: SourcePos) -> Result<Expr, EvalError> {
+        self.expect('`')?;
+        Ok(build_quasiquote_expr(self.parse_expr()?, position))
+    }
+
+    fn parse_unquote_shorthand(&mut self, position: SourcePos) -> Result<Expr, EvalError> {
+        self.expect(',')?;
+        let name = if self.peek() == Some('@') {
+            self.expect('@')?;
+            "unquote-splicing"
+        } else {
+            "unquote"
+        };
+
+        Ok(Expr::list(
+            vec![Expr::symbol(name, position), self.parse_expr()?],
+            position,
+        ))
     }
 
     fn parse_syntax_shorthand(&mut self, position: SourcePos) -> Result<Expr, EvalError> {
