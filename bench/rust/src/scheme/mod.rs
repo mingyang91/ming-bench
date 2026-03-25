@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use builtins::OUTPUT_BUFFER;
 
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static RECORD_TYPE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn gensym(base: &str) -> String {
     let n = GENSYM_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -19,7 +20,7 @@ fn gensym(base: &str) -> String {
 }
 
 const SPECIAL_FORMS: &[&str] = &[
-    "define", "define-syntax", "syntax-rules", "if", "quote", "lambda",
+    "define", "define-syntax", "define-record-type", "syntax-rules", "if", "quote", "lambda",
     "begin", "let", "let*", "letrec", "letrec*", "cond", "case", "and", "or",
     "set!", "string-set!", "do", "delay", "quasiquote", "unquote",
 ];
@@ -708,6 +709,157 @@ fn eval_cond(clauses: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     Ok(Value::Void)
 }
 
+fn eval_define_record_type(elems: &[Expr], env: &EnvRef, span: Span) -> Result<Value, EvalError> {
+    // (define-record-type <name> (constructor field-names...) predicate (field accessor)...)
+    if elems.len() < 4 {
+        return Err(EvalError::Parse(format!("at {span}: define-record-type requires at least 3 arguments")));
+    }
+    let type_id = RECORD_TYPE_COUNTER.fetch_add(1, Ordering::SeqCst);
+
+    // Parse constructor: (make-foo field1 field2 ...)
+    let ExprKind::List(ctor_parts) = &elems[2].kind else {
+        return Err(EvalError::Parse(format!("at {span}: define-record-type: expected constructor spec")));
+    };
+    if ctor_parts.is_empty() {
+        return Err(EvalError::Parse(format!("at {span}: define-record-type: empty constructor")));
+    }
+    let ctor_name = match &ctor_parts[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Parse(format!("at {span}: define-record-type: expected constructor name"))),
+    };
+    let ctor_fields: Vec<String> = ctor_parts[1..].iter().map(|e| {
+        match &e.kind {
+            ExprKind::Symbol(s) => Ok(s.clone()),
+            _ => Err(EvalError::Parse(format!("at {span}: define-record-type: expected field name"))),
+        }
+    }).collect::<Result<_, _>>()?;
+
+    // Parse predicate name
+    let pred_name = match &elems[3].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Parse(format!("at {span}: define-record-type: expected predicate name"))),
+    };
+
+    // Parse field accessors: (field-name accessor-name) ...
+    let mut field_accessors: Vec<(String, String)> = Vec::new();
+    for field_spec in &elems[4..] {
+        let ExprKind::List(parts) = &field_spec.kind else {
+            return Err(EvalError::Parse(format!("at {span}: define-record-type: expected field spec")));
+        };
+        if parts.len() < 2 {
+            return Err(EvalError::Parse(format!("at {span}: define-record-type: field spec needs name and accessor")));
+        }
+        let field_name = match &parts[0].kind {
+            ExprKind::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Parse(format!("at {span}: define-record-type: expected field name"))),
+        };
+        let accessor_name = match &parts[1].kind {
+            ExprKind::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Parse(format!("at {span}: define-record-type: expected accessor name"))),
+        };
+        field_accessors.push((field_name, accessor_name));
+    }
+
+    // Build field index map: field_name -> index based on constructor order
+    let field_index: HashMap<String, usize> = ctor_fields.iter().enumerate()
+        .map(|(i, name)| (name.clone(), i))
+        .collect();
+
+    // Tagged list representation: Record = List([Integer(type_id), field1, ...])
+
+    // Constructor lambda
+    let ctor_params = ctor_fields.clone();
+    let ctor_body = {
+        // Build: (list TYPE_ID param1 param2 ...)
+        let mut list_elems = vec![
+            Expr { kind: ExprKind::Symbol("list".into()), span: Span::default() },
+            Expr { kind: ExprKind::Integer(type_id as i64), span: Span::default() },
+        ];
+        for p in &ctor_params {
+            list_elems.push(Expr { kind: ExprKind::Symbol(p.clone()), span: Span::default() });
+        }
+        Expr { kind: ExprKind::List(list_elems), span: Span::default() }
+    };
+    let ctor_lambda = Value::Lambda {
+        params: ctor_params,
+        rest_param: None,
+        body: vec![ctor_body],
+        env: env.clone(),
+    };
+    env.borrow_mut().set(ctor_name.clone(), ctor_lambda);
+
+    // Predicate lambda: checks if arg is a list with matching type_id at car
+    let pred_param = gensym("r");
+    let pred_body = {
+        let r = Expr { kind: ExprKind::Symbol(pred_param.clone()), span: Span::default() };
+        let type_id_expr = Expr { kind: ExprKind::Integer(type_id as i64), span: Span::default() };
+        // (if (list? r) (if (null? r) #f (equal? (car r) TYPE_ID)) #f)
+        Expr {
+            kind: ExprKind::List(vec![
+                Expr { kind: ExprKind::Symbol("if".into()), span: Span::default() },
+                Expr { kind: ExprKind::List(vec![
+                    Expr { kind: ExprKind::Symbol("list?".into()), span: Span::default() },
+                    r.clone(),
+                ]), span: Span::default() },
+                Expr {
+                    kind: ExprKind::List(vec![
+                        Expr { kind: ExprKind::Symbol("if".into()), span: Span::default() },
+                        Expr { kind: ExprKind::List(vec![
+                            Expr { kind: ExprKind::Symbol("null?".into()), span: Span::default() },
+                            r.clone(),
+                        ]), span: Span::default() },
+                        Expr { kind: ExprKind::Boolean(false), span: Span::default() },
+                        Expr { kind: ExprKind::List(vec![
+                            Expr { kind: ExprKind::Symbol("equal?".into()), span: Span::default() },
+                            Expr { kind: ExprKind::List(vec![
+                                Expr { kind: ExprKind::Symbol("car".into()), span: Span::default() },
+                                r.clone(),
+                            ]), span: Span::default() },
+                            type_id_expr,
+                        ]), span: Span::default() },
+                    ]),
+                    span: Span::default(),
+                },
+                Expr { kind: ExprKind::Boolean(false), span: Span::default() },
+            ]),
+            span: Span::default(),
+        }
+    };
+    let pred_lambda = Value::Lambda {
+        params: vec![pred_param],
+        rest_param: None,
+        body: vec![pred_body],
+        env: env.clone(),
+    };
+    env.borrow_mut().set(pred_name, pred_lambda);
+
+    // Field accessors
+    for (field_name, accessor_name) in &field_accessors {
+        let idx = field_index.get(field_name).ok_or_else(|| {
+            EvalError::Parse(format!("at {span}: define-record-type: unknown field {field_name}"))
+        })?;
+        // Accessor: (lambda (r) (list-ref r IDX+1))  -- +1 because index 0 is type_id
+        let acc_param = gensym("r");
+        let acc_body = Expr {
+            kind: ExprKind::List(vec![
+                Expr { kind: ExprKind::Symbol("list-ref".into()), span: Span::default() },
+                Expr { kind: ExprKind::Symbol(acc_param.clone()), span: Span::default() },
+                Expr { kind: ExprKind::Integer((*idx as i64) + 1), span: Span::default() },
+            ]),
+            span: Span::default(),
+        };
+        let acc_lambda = Value::Lambda {
+            params: vec![acc_param],
+            rest_param: None,
+            body: vec![acc_body],
+            env: env.clone(),
+        };
+        env.borrow_mut().set(accessor_name.clone(), acc_lambda);
+    }
+
+    Ok(Value::Void)
+}
+
 fn eval(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
     let span = expr.span;
     match &expr.kind {
@@ -930,6 +1082,7 @@ fn eval(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                         env.borrow_mut().set_existing(&var_name, Value::Str(s));
                         return Ok(Value::Void);
                     }
+                    "define-record-type" => return eval_define_record_type(elems, env, span),
                     "define-syntax" => {
                         if elems.len() != 3 {
                             return Err(EvalError::Parse(format!("at {span}: define-syntax requires name and transformer")));
