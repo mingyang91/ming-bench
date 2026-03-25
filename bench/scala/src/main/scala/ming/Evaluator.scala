@@ -1,5 +1,7 @@
 package ming
 
+import DynamicWind.Winder
+
 /** Scheme interpreter entry point — CPS-based with trampoline for call/cc support. */
 object Evaluator:
 
@@ -12,6 +14,9 @@ object Evaluator:
 
   /** Thrown when a continuation is invoked from a non-CPS context (e.g., inside a builtin). */
   class ContinuationThrown(val bounce: Bounce) extends Exception with scala.util.control.NoStackTrace
+
+  // --- dynamic-wind support ---
+  var winders: List[Winder] = Nil
 
   // --- Entry points ---
   def evalStr(input: String): String =
@@ -30,6 +35,7 @@ object Evaluator:
     (SchemeVal.display(result), output.toString)
 
   private def evalProgram(exprs: List[SchemeVal], env: Env): SchemeVal =
+    winders = Nil
     run(evalBodyK(exprs, env, v => Done(v)))
 
   // --- Trampoline (top-level, catches ContinuationThrown) ---
@@ -61,13 +67,16 @@ object Evaluator:
   /** Apply a procedure (non-CPS, called from builtins like map/for-each/apply). */
   def apply(proc: SchemeVal, args: List[SchemeVal]): SchemeVal =
     proc match
-      case SchemeVal.ContinuationVal(savedK) =>
-        val v = if args.isEmpty then SchemeVal.Void else args.head
-        throw new ContinuationThrown(savedK.asInstanceOf[Cont](v))
+      case SchemeVal.ContinuationVal(savedState) =>
+        val v                      = if args.isEmpty then SchemeVal.Void else args.head
+        val (savedK, savedWinders) = savedState.asInstanceOf[(Cont, List[Winder])]
+        val currentWinders         = winders
+        throw new ContinuationThrown(DynamicWind.doWindK(currentWinders, savedWinders, () => savedK(v)))
       case SchemeVal.CallCCVal() =>
         if args.size != 1 then throw new EvalError("call/cc: expected 1 argument")
+        val savedWinders = winders
         val localK: Cont = v => Done(v)
-        val kontVal      = SchemeVal.ContinuationVal(localK)
+        val kontVal      = SchemeVal.ContinuationVal((localK, savedWinders))
         apply(args.head, List(kontVal))
       case _ =>
         runInner(applyK(proc, args, v => Done(v)))
@@ -112,13 +121,14 @@ object Evaluator:
           case SchemeVal.Symbol("quote") =>
             if elems.tail.size != 1 then throw new EvalError("quote: expected 1 argument")
             k(elems.tail.head)
-          case SchemeVal.Symbol("lambda") => k(SpecialForms.evalLambda(elems.tail, env))
-          case SchemeVal.Symbol("and")    => SpecialForms.evalAndK(elems.tail, env, k)
-          case SchemeVal.Symbol("or")     => SpecialForms.evalOrK(elems.tail, env, k)
-          case SchemeVal.Symbol("begin")  => evalBodyK(elems.tail, env, k)
-          case SchemeVal.Symbol("let")    => BindingForms.evalLetK(elems.tail, env, k)
-          case SchemeVal.Symbol("cond")   => BindingForms.evalCondK(elems.tail, env, k)
-          case SchemeVal.Symbol("set!")   => SpecialForms.evalSetK(elems.tail, env, k)
+          case SchemeVal.Symbol("lambda")       => k(SpecialForms.evalLambda(elems.tail, env))
+          case SchemeVal.Symbol("and")          => SpecialForms.evalAndK(elems.tail, env, k)
+          case SchemeVal.Symbol("or")           => SpecialForms.evalOrK(elems.tail, env, k)
+          case SchemeVal.Symbol("begin")        => evalBodyK(elems.tail, env, k)
+          case SchemeVal.Symbol("dynamic-wind") => DynamicWind.evalDynamicWindK(elems.tail, env, k)
+          case SchemeVal.Symbol("let")          => BindingForms.evalLetK(elems.tail, env, k)
+          case SchemeVal.Symbol("cond")         => BindingForms.evalCondK(elems.tail, env, k)
+          case SchemeVal.Symbol("set!")         => SpecialForms.evalSetK(elems.tail, env, k)
           case SchemeVal.Symbol("define-syntax") =>
             SpecialForms.evalDefineSyntax(elems.tail, env)
             k(SchemeVal.Void)
@@ -169,13 +179,16 @@ object Evaluator:
   // --- CPS apply ---
   def applyK(proc: SchemeVal, args: List[SchemeVal], k: Cont): Bounce =
     proc match
-      case SchemeVal.ContinuationVal(savedK) =>
-        val v = if args.isEmpty then SchemeVal.Void else args.head
-        savedK.asInstanceOf[Cont](v)
+      case SchemeVal.ContinuationVal(savedState) =>
+        val v                      = if args.isEmpty then SchemeVal.Void else args.head
+        val (savedK, savedWinders) = savedState.asInstanceOf[(Cont, List[Winder])]
+        val currentWinders         = winders
+        DynamicWind.doWindK(currentWinders, savedWinders, () => savedK(v))
 
       case SchemeVal.CallCCVal() =>
         if args.size != 1 then throw new EvalError("call/cc: expected 1 argument")
-        val kontVal = SchemeVal.ContinuationVal(k)
+        val savedWinders = winders
+        val kontVal      = SchemeVal.ContinuationVal((k, savedWinders))
         More(() => applyK(args.head, List(kontVal), k))
 
       case SchemeVal.BuiltinProc(_, f) =>
