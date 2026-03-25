@@ -47,6 +47,7 @@ pub(crate) type PairRef = Rc<RefCell<PairCell>>;
 pub(crate) type VectorRef = Rc<RefCell<Vec<Value>>>;
 pub(crate) type RecordTypeRef = Rc<RecordType>;
 pub(crate) type RecordRef = Rc<RecordValue>;
+pub(crate) type WinderRef = Rc<DynamicWinder>;
 pub(crate) type EnvRef = Rc<RefCell<Environment>>;
 pub(crate) type BindingRef = Rc<RefCell<Value>>;
 pub(crate) type ExprsRef = Rc<[Expr]>;
@@ -92,6 +93,12 @@ pub(crate) struct RecordType {
 pub(crate) struct RecordValue {
     pub(crate) record_type: RecordTypeRef,
     pub(crate) fields: Vec<Value>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DynamicWinder {
+    pub(crate) before: Value,
+    pub(crate) after: Value,
 }
 
 #[derive(Clone)]
@@ -269,6 +276,7 @@ pub(crate) struct Runtime {
     output: String,
     macros: HashMap<String, MacroTransformer>,
     gensym_counter: usize,
+    winders: Vec<WinderRef>,
 }
 
 impl Runtime {
@@ -311,6 +319,22 @@ impl Runtime {
         };
 
         format!("__macro_{suffix}_{base}")
+    }
+
+    pub(crate) fn winders(&self) -> Vec<WinderRef> {
+        self.winders.clone()
+    }
+
+    pub(crate) fn push_winder(&mut self, winder: WinderRef) {
+        self.winders.push(winder);
+    }
+
+    pub(crate) fn pop_winder(&mut self) -> Option<WinderRef> {
+        self.winders.pop()
+    }
+
+    pub(crate) fn replace_winders(&mut self, winders: Vec<WinderRef>) {
+        self.winders = winders;
     }
 
     pub(crate) fn into_output(self) -> String {

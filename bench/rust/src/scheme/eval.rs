@@ -5,8 +5,9 @@ use super::builtins::default_env;
 use super::core::{
     list_from_vec, list_to_vec, make_case_lambda, make_lambda, make_record, make_record_accessor,
     make_record_constructor, make_record_predicate, make_record_type, quote_expr, BindingRef,
-    CaseLambdaProcedure, EnvRef, Environment, Expr, ExprsRef, LambdaProcedure, Position, Procedure,
-    RecordAccessorProcedure, RecordConstructorProcedure, RecordPredicateProcedure, Runtime, Value,
+    CaseLambdaProcedure, DynamicWinder, EnvRef, Environment, Expr, ExprsRef, LambdaProcedure,
+    Position, Procedure, RecordAccessorProcedure, RecordConstructorProcedure,
+    RecordPredicateProcedure, Runtime, Value, WinderRef,
 };
 use super::error::EvalError;
 use super::macros::{expand_macro_call, parse_macro_definition};
@@ -83,6 +84,7 @@ impl SpecialForm {
 #[derive(Clone)]
 struct CapturedContinuation {
     frames: Vec<MachineFrame>,
+    winders: Vec<WinderRef>,
 }
 
 #[derive(Clone)]
@@ -93,6 +95,16 @@ struct MapIteration {
     results: Vec<Value>,
     for_each: bool,
     pos: Position,
+}
+
+#[derive(Clone)]
+struct WindTransition {
+    exits: Vec<WinderRef>,
+    entries: Vec<WinderRef>,
+    target_frames: Vec<MachineFrame>,
+    target_winders: Vec<WinderRef>,
+    value: Value,
+    pos: Option<Position>,
 }
 
 #[derive(Clone)]
@@ -145,6 +157,20 @@ enum MachineFrame {
         index: usize,
     },
     MapContinue(MapIteration),
+    DynamicWindEnter {
+        winder: WinderRef,
+        body: Value,
+        pos: Option<Position>,
+    },
+    DynamicWindExit {
+        winder: WinderRef,
+        result: Option<Value>,
+        pos: Option<Position>,
+    },
+    WindTransition {
+        transition: WindTransition,
+        activate_winder: Option<WinderRef>,
+    },
 }
 
 enum MachineControl {
@@ -634,6 +660,41 @@ fn resume_machine_frame(
                 Ok(MachineControl::Value(list_from_vec(iteration.results)))
             }
         }
+        MachineFrame::DynamicWindEnter { winder, body, pos } => {
+            runtime.push_winder(winder.clone());
+            frames.push(MachineFrame::DynamicWindExit {
+                winder,
+                result: None,
+                pos,
+            });
+            apply_machine_value(body, Vec::new(), runtime, frames, pos)
+        }
+        MachineFrame::DynamicWindExit {
+            winder,
+            result,
+            pos,
+        } => {
+            if let Some(result) = result {
+                Ok(MachineControl::Value(result))
+            } else {
+                pop_expected_winder(runtime, &winder);
+                frames.push(MachineFrame::DynamicWindExit {
+                    winder: winder.clone(),
+                    result: Some(value),
+                    pos,
+                });
+                apply_machine_value(winder.after.clone(), Vec::new(), runtime, frames, pos)
+            }
+        }
+        MachineFrame::WindTransition {
+            transition,
+            activate_winder,
+        } => {
+            if let Some(winder) = activate_winder {
+                runtime.push_winder(winder);
+            }
+            step_wind_transition(transition, runtime, frames)
+        }
     }
 }
 
@@ -687,7 +748,7 @@ fn apply_machine_value(
                 apply_record_accessor(accessor, &args).map(MachineControl::Value)
             }
             Procedure::Continuation(captured) => {
-                apply_captured_continuation(captured.clone(), &args, frames)
+                apply_captured_continuation(captured.clone(), &args, runtime, frames, pos)
             }
         },
         Value::Bool(_)
@@ -719,6 +780,7 @@ fn apply_machine_builtin(
     pos: Option<Position>,
 ) -> Result<MachineControl, EvalError> {
     match builtin.name {
+        "dynamic-wind" => apply_dynamic_wind_builtin(&args, runtime, frames, pos),
         "call/cc" | "call-with-current-continuation" => {
             apply_call_cc_builtin(&args, runtime, frames, pos)
         }
@@ -727,6 +789,29 @@ fn apply_machine_builtin(
         "for-each" => apply_map_builtin(&args, runtime, frames, pos, true),
         _ => (builtin.func)(&args, runtime).map(MachineControl::Value),
     }
+}
+
+fn apply_dynamic_wind_builtin(
+    args: &[Value],
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+    pos: Option<Position>,
+) -> Result<MachineControl, EvalError> {
+    let [before, body, after] = args else {
+        return Err(wrong_arg_count("dynamic-wind", "exactly 3", args.len()));
+    };
+
+    let winder = Rc::new(DynamicWinder {
+        before: before.clone(),
+        after: after.clone(),
+    });
+
+    frames.push(MachineFrame::DynamicWindEnter {
+        winder,
+        body: body.clone(),
+        pos,
+    });
+    apply_machine_value(before.clone(), Vec::new(), runtime, frames, pos)
 }
 
 fn apply_call_cc_builtin(
@@ -739,7 +824,7 @@ fn apply_call_cc_builtin(
         return Err(wrong_arg_count("call/cc", "exactly 1", args.len()));
     };
 
-    let continuation = make_continuation_value(frames);
+    let continuation = make_continuation_value(frames, runtime);
     apply_machine_value(procedure.clone(), vec![continuation], runtime, frames, pos)
 }
 
@@ -828,10 +913,11 @@ fn apply_map_iteration(
     apply_machine_value(operator, call_args, runtime, frames, Some(pos))
 }
 
-fn make_continuation_value(frames: &[MachineFrame]) -> Value {
+fn make_continuation_value(frames: &[MachineFrame], runtime: &Runtime) -> Value {
     Value::Procedure(Rc::new(Procedure::Continuation(Rc::new(
         CapturedContinuation {
             frames: frames.to_vec(),
+            winders: runtime.winders(),
         },
     ))))
 }
@@ -839,7 +925,9 @@ fn make_continuation_value(frames: &[MachineFrame]) -> Value {
 fn apply_captured_continuation(
     captured: Rc<dyn std::any::Any>,
     args: &[Value],
+    runtime: &mut Runtime,
     frames: &mut Vec<MachineFrame>,
+    pos: Option<Position>,
 ) -> Result<MachineControl, EvalError> {
     let [value] = args else {
         return Err(wrong_arg_count("continuation", "exactly 1", args.len()));
@@ -849,8 +937,74 @@ fn apply_captured_continuation(
         Rc::downcast::<CapturedContinuation>(captured).map_err(|_| EvalError::SyntaxError {
             message: "internal error: invalid continuation payload".into(),
         })?;
-    *frames = captured.frames.clone();
-    Ok(MachineControl::Value(value.clone()))
+    let current_winders = runtime.winders();
+    let target_winders = captured.winders.clone();
+    let shared_prefix = common_winder_prefix_len(&current_winders, &target_winders);
+
+    step_wind_transition(
+        WindTransition {
+            exits: current_winders[shared_prefix..].to_vec(),
+            entries: target_winders[shared_prefix..]
+                .iter()
+                .rev()
+                .cloned()
+                .collect(),
+            target_frames: captured.frames.clone(),
+            target_winders,
+            value: value.clone(),
+            pos,
+        },
+        runtime,
+        frames,
+    )
+}
+
+fn common_winder_prefix_len(current: &[WinderRef], target: &[WinderRef]) -> usize {
+    current
+        .iter()
+        .zip(target.iter())
+        .take_while(|(current, target)| Rc::ptr_eq(current, target))
+        .count()
+}
+
+fn pop_expected_winder(runtime: &mut Runtime, expected: &WinderRef) {
+    let popped = runtime.pop_winder();
+    debug_assert!(
+        popped
+            .as_ref()
+            .map(|actual| Rc::ptr_eq(actual, expected))
+            .unwrap_or(false),
+        "dynamic-wind stack out of sync"
+    );
+}
+
+fn step_wind_transition(
+    mut transition: WindTransition,
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineControl, EvalError> {
+    if let Some(winder) = transition.exits.pop() {
+        let pos = transition.pos;
+        pop_expected_winder(runtime, &winder);
+        frames.push(MachineFrame::WindTransition {
+            transition,
+            activate_winder: None,
+        });
+        return apply_machine_value(winder.after.clone(), Vec::new(), runtime, frames, pos);
+    }
+
+    if let Some(winder) = transition.entries.pop() {
+        let pos = transition.pos;
+        frames.push(MachineFrame::WindTransition {
+            transition,
+            activate_winder: Some(winder.clone()),
+        });
+        return apply_machine_value(winder.before.clone(), Vec::new(), runtime, frames, pos);
+    }
+
+    runtime.replace_winders(transition.target_winders);
+    *frames = transition.target_frames;
+    Ok(MachineControl::Value(transition.value))
 }
 
 fn expect_list_argument(value: &Value, expected: &str) -> Result<Vec<Value>, EvalError> {

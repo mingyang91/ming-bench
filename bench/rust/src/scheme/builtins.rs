@@ -445,6 +445,10 @@ const BUILTINS: &[BuiltinProcedure] = &[
         func: builtin_is_even,
     },
     BuiltinProcedure {
+        name: "dynamic-wind",
+        func: builtin_dynamic_wind,
+    },
+    BuiltinProcedure {
         name: "call/cc",
         func: builtin_call_cc,
     },
@@ -1354,6 +1358,12 @@ fn builtin_is_even(args: &[Value], _runtime: &mut Runtime) -> Result<Value, Eval
 fn builtin_call_cc(_args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     Err(EvalError::SyntaxError {
         message: "internal error: call/cc should be handled by the evaluator".into(),
+    })
+}
+
+fn builtin_dynamic_wind(_args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    Err(EvalError::SyntaxError {
+        message: "internal error: dynamic-wind should be handled by the evaluator".into(),
     })
 }
 
