@@ -1423,7 +1423,7 @@ fn launch_codex(
         ""
     };
     let script_cmd = format!(
-        "cd '{}' && codex exec --full-auto{json_flag} '{}'",
+        "cd '{}' && codex exec --dangerously-bypass-approvals-and-sandbox{json_flag} '{}'",
         workdir.display(),
         prompt.replace('\'', "'\\''"),
     );
