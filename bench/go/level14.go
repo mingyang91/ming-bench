@@ -153,73 +153,73 @@ func builtinListToVector() builtinProc {
 	}
 }
 
-func evalCase(args []node, env *environment) (value, error) {
+func evalCase(args []node, env *environment) (value, *evalStep, error) {
 	if len(args) < 2 {
-		return nil, &EvalError{Message: "case expects a key and at least 1 clause"}
+		return nil, nil, &EvalError{Message: "case expects a key and at least 1 clause"}
 	}
 
 	key, err := eval(args[0], env)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	clauses := args[1:]
 	for i, clauseExpr := range clauses {
 		clause, ok := clauseExpr.(listNode)
 		if !ok || len(clause.elements) == 0 {
-			return nil, &EvalError{Message: "case clauses must be non-empty lists"}
+			return nil, nil, &EvalError{Message: "case clauses must be non-empty lists"}
 		}
 
 		if name, ok := symbolName(clause.elements[0]); ok && name == "else" {
 			if i != len(clauses)-1 {
-				return nil, &EvalError{Message: "else clause must be last"}
+				return nil, nil, &EvalError{Message: "else clause must be last"}
 			}
 			if len(clause.elements) == 1 {
-				return voidValue{}, nil
+				return voidValue{}, nil, nil
 			}
-			return evalSequence(clause.elements[1:], env)
+			return prepareSequence(clause.elements[1:], env)
 		}
 
 		datums, ok := clause.elements[0].(listNode)
 		if !ok {
-			return nil, &EvalError{Message: "case clause datums must be a list"}
+			return nil, nil, &EvalError{Message: "case clause datums must be a list"}
 		}
 
 		for _, datumExpr := range datums.elements {
 			datum, err := datumFromNode(datumExpr)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if eqValues(key, datum) {
 				if len(clause.elements) == 1 {
-					return voidValue{}, nil
+					return voidValue{}, nil, nil
 				}
-				return evalSequence(clause.elements[1:], env)
+				return prepareSequence(clause.elements[1:], env)
 			}
 		}
 	}
 
-	return voidValue{}, nil
+	return voidValue{}, nil, nil
 }
 
-func evalLetrec(args []node, env *environment, sequential bool) (value, error) {
+func evalLetrec(args []node, env *environment, sequential bool) (value, *evalStep, error) {
 	formName := "letrec"
 	if sequential {
 		formName = "letrec*"
 	}
 
 	if len(args) < 2 {
-		return nil, &EvalError{Message: fmt.Sprintf("%s expects bindings and a body", formName)}
+		return nil, nil, &EvalError{Message: fmt.Sprintf("%s expects bindings and a body", formName)}
 	}
 
 	bindingList, ok := args[0].(listNode)
 	if !ok {
-		return nil, &EvalError{Message: fmt.Sprintf("%s bindings must be a list", formName)}
+		return nil, nil, &EvalError{Message: fmt.Sprintf("%s bindings must be a list", formName)}
 	}
 
 	specs, err := parseNamedBindings(bindingList.elements, formName)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	letEnv := newEnvironment(env)
@@ -234,7 +234,7 @@ func evalLetrec(args []node, env *environment, sequential bool) (value, error) {
 		for i, spec := range specs {
 			val, err := eval(spec.expr, letEnv)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			cells[i].value = val
 		}
@@ -243,7 +243,7 @@ func evalLetrec(args []node, env *environment, sequential bool) (value, error) {
 		for i, spec := range specs {
 			val, err := eval(spec.expr, letEnv)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			values[i] = val
 		}
@@ -252,7 +252,7 @@ func evalLetrec(args []node, env *environment, sequential bool) (value, error) {
 		}
 	}
 
-	return evalSequence(args[1:], letEnv)
+	return prepareSequence(args[1:], letEnv)
 }
 
 func evalDo(args []node, env *environment) (value, error) {

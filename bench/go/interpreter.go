@@ -46,6 +46,11 @@ type evalContext struct {
 	output strings.Builder
 }
 
+type evalStep struct {
+	expr node
+	env  *environment
+}
+
 type builtinProc func(args []value) (value, error)
 
 type closureValue struct {
@@ -249,104 +254,118 @@ func (e *environment) set(name string, val value) bool {
 }
 
 func eval(expr node, env *environment) (value, error) {
-	expanded, err := expandMacros(expr, env)
-	if err != nil {
-		return nil, err
-	}
+	currentExpr := expr
+	currentEnv := env
 
-	expr = expanded
-	switch expr := expr.(type) {
-	case integerValue, rationalValue, inexactValue, booleanValue, stringValue, charValue:
-		return expr, nil
-	case vectorNode:
-		return datumFromNode(expr)
-	case symbolNode:
-		if expr.captured != nil {
-			return expr.captured.value, nil
+	for {
+		expanded, err := expandMacros(currentExpr, currentEnv)
+		if err != nil {
+			return nil, err
 		}
-		val, ok := env.lookup(expr.name)
-		if !ok {
-			return nil, errorAt(expr.pos, "unbound variable: %s", expr.name)
+
+		currentExpr = expanded
+		switch expr := currentExpr.(type) {
+		case integerValue, rationalValue, inexactValue, booleanValue, stringValue, charValue:
+			return expr, nil
+		case vectorNode:
+			return datumFromNode(expr)
+		case symbolNode:
+			if expr.captured != nil {
+				return expr.captured.value, nil
+			}
+			val, ok := currentEnv.lookup(expr.name)
+			if !ok {
+				return nil, errorAt(expr.pos, "unbound variable: %s", expr.name)
+			}
+			return val, nil
+		case listNode:
+			result, step, err := evalList(expr, currentEnv)
+			if err != nil {
+				return nil, err
+			}
+			if step == nil {
+				return result, nil
+			}
+			currentExpr = step.expr
+			currentEnv = step.env
+		default:
+			return nil, errorAt(nodePos(expr), "unknown expression")
 		}
-		return val, nil
-	case listNode:
-		return evalList(expr, env)
-	default:
-		return nil, errorAt(nodePos(expr), "unknown expression")
 	}
 }
 
-func evalList(list listNode, env *environment) (value, error) {
+func evalList(list listNode, env *environment) (value, *evalStep, error) {
 	if len(list.elements) == 0 {
-		return nil, errorAt(list.pos, "cannot evaluate empty list")
+		return nil, nil, errorAt(list.pos, "cannot evaluate empty list")
 	}
 
 	if name, ok := symbolName(list.elements[0]); ok {
 		switch name {
 		case "and":
-			result, err := evalAnd(list.elements[1:], env)
-			return result, withErrorPos(err, list.pos)
+			result, step, err := evalAnd(list.elements[1:], env)
+			return result, step, withErrorPos(err, list.pos)
 		case "or":
-			result, err := evalOr(list.elements[1:], env)
-			return result, withErrorPos(err, list.pos)
+			result, step, err := evalOr(list.elements[1:], env)
+			return result, step, withErrorPos(err, list.pos)
 		case "define":
 			result, err := evalDefine(list.elements[1:], env)
-			return result, withErrorPos(err, list.pos)
+			return result, nil, withErrorPos(err, list.pos)
 		case "define-syntax":
 			result, err := evalDefineSyntax(list.elements[1:], env)
-			return result, withErrorPos(err, list.pos)
+			return result, nil, withErrorPos(err, list.pos)
 		case "define-record-type":
 			result, err := evalDefineRecordType(list.elements[1:], env)
-			return result, withErrorPos(err, list.pos)
+			return result, nil, withErrorPos(err, list.pos)
 		case "set!":
 			result, err := evalSet(list.elements[1:], env)
-			return result, withErrorPos(err, list.pos)
+			return result, nil, withErrorPos(err, list.pos)
 		case "if":
-			result, err := evalIf(list.elements[1:], env)
-			return result, withErrorPos(err, list.pos)
+			result, step, err := evalIf(list.elements[1:], env)
+			return result, step, withErrorPos(err, list.pos)
 		case "quote":
 			result, err := evalQuote(list.elements[1:])
-			return result, withErrorPos(err, list.pos)
+			return result, nil, withErrorPos(err, list.pos)
 		case "lambda":
 			result, err := evalLambda(list.elements[1:], env)
-			return result, withErrorPos(err, list.pos)
+			return result, nil, withErrorPos(err, list.pos)
 		case "case-lambda":
 			result, err := evalCaseLambda(list.elements[1:], env)
-			return result, withErrorPos(err, list.pos)
+			return result, nil, withErrorPos(err, list.pos)
 		case "begin":
-			result, err := evalBegin(list.elements[1:], env)
-			return result, withErrorPos(err, list.pos)
+			result, step, err := evalBegin(list.elements[1:], env)
+			return result, step, withErrorPos(err, list.pos)
 		case "cond":
-			result, err := evalCond(list.elements[1:], env)
-			return result, withErrorPos(err, list.pos)
+			result, step, err := evalCond(list.elements[1:], env)
+			return result, step, withErrorPos(err, list.pos)
 		case "case":
-			result, err := evalCase(list.elements[1:], env)
-			return result, withErrorPos(err, list.pos)
+			result, step, err := evalCase(list.elements[1:], env)
+			return result, step, withErrorPos(err, list.pos)
 		case "let":
-			result, err := evalLet(list.elements[1:], env)
-			return result, withErrorPos(err, list.pos)
+			result, step, err := evalLet(list.elements[1:], env)
+			return result, step, withErrorPos(err, list.pos)
 		case "letrec":
-			result, err := evalLetrec(list.elements[1:], env, false)
-			return result, withErrorPos(err, list.pos)
+			result, step, err := evalLetrec(list.elements[1:], env, false)
+			return result, step, withErrorPos(err, list.pos)
 		case "letrec*":
-			result, err := evalLetrec(list.elements[1:], env, true)
-			return result, withErrorPos(err, list.pos)
+			result, step, err := evalLetrec(list.elements[1:], env, true)
+			return result, step, withErrorPos(err, list.pos)
 		case "do":
 			result, err := evalDo(list.elements[1:], env)
-			return result, withErrorPos(err, list.pos)
+			return result, nil, withErrorPos(err, list.pos)
 		}
 	}
 
 	operator, err := eval(list.elements[0], env)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	args, err := evalArgs(list.elements[1:], env)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return applyProcedure(operator, args, list.pos)
+	result, step, err := startProcedureCall(operator, args, list.pos)
+	return result, step, withErrorPos(err, list.pos)
 }
 
 func evalArgs(args []node, env *environment) ([]value, error) {
@@ -361,34 +380,40 @@ func evalArgs(args []node, env *environment) ([]value, error) {
 	return values, nil
 }
 
-func evalAnd(args []node, env *environment) (value, error) {
-	result := value(booleanValue(true))
-	for _, arg := range args {
+func evalAnd(args []node, env *environment) (value, *evalStep, error) {
+	if len(args) == 0 {
+		return booleanValue(true), nil, nil
+	}
+
+	for _, arg := range args[:len(args)-1] {
 		evaluated, err := eval(arg, env)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		result = evaluated
 		if !isTruthy(evaluated) {
-			return evaluated, nil
+			return evaluated, nil, nil
 		}
 	}
-	return result, nil
+
+	return nil, &evalStep{expr: args[len(args)-1], env: env}, nil
 }
 
-func evalOr(args []node, env *environment) (value, error) {
-	result := value(booleanValue(false))
-	for _, arg := range args {
+func evalOr(args []node, env *environment) (value, *evalStep, error) {
+	if len(args) == 0 {
+		return booleanValue(false), nil, nil
+	}
+
+	for _, arg := range args[:len(args)-1] {
 		evaluated, err := eval(arg, env)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		result = evaluated
 		if isTruthy(evaluated) {
-			return evaluated, nil
+			return evaluated, nil, nil
 		}
 	}
-	return result, nil
+
+	return nil, &evalStep{expr: args[len(args)-1], env: env}, nil
 }
 
 func evalDefine(args []node, env *environment) (value, error) {
@@ -454,22 +479,22 @@ func evalSet(args []node, env *environment) (value, error) {
 	return voidValue{}, nil
 }
 
-func evalIf(args []node, env *environment) (value, error) {
+func evalIf(args []node, env *environment) (value, *evalStep, error) {
 	if len(args) != 2 && len(args) != 3 {
-		return nil, &EvalError{Message: "if expects 2 or 3 arguments"}
+		return nil, nil, &EvalError{Message: "if expects 2 or 3 arguments"}
 	}
 
 	condition, err := eval(args[0], env)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if isTruthy(condition) {
-		return eval(args[1], env)
+		return nil, &evalStep{expr: args[1], env: env}, nil
 	}
 	if len(args) == 2 {
-		return voidValue{}, nil
+		return voidValue{}, nil, nil
 	}
-	return eval(args[2], env)
+	return nil, &evalStep{expr: args[2], env: env}, nil
 }
 
 func evalQuote(args []node) (value, error) {
@@ -513,48 +538,45 @@ func evalCaseLambda(args []node, env *environment) (value, error) {
 	return &caseClosureValue{clauses: clauses}, nil
 }
 
-func evalBegin(args []node, env *environment) (value, error) {
-	if len(args) == 0 {
-		return voidValue{}, nil
-	}
-	return evalSequence(args, env)
+func evalBegin(args []node, env *environment) (value, *evalStep, error) {
+	return prepareSequence(args, env)
 }
 
-func evalCond(args []node, env *environment) (value, error) {
+func evalCond(args []node, env *environment) (value, *evalStep, error) {
 	for i, clauseExpr := range args {
 		clause, ok := clauseExpr.(listNode)
 		if !ok || len(clause.elements) == 0 {
-			return nil, &EvalError{Message: "cond clauses must be non-empty lists"}
+			return nil, nil, &EvalError{Message: "cond clauses must be non-empty lists"}
 		}
 
 		if name, ok := symbolName(clause.elements[0]); ok && name == "else" {
 			if i != len(args)-1 {
-				return nil, &EvalError{Message: "else clause must be last"}
+				return nil, nil, &EvalError{Message: "else clause must be last"}
 			}
 			if len(clause.elements) == 1 {
-				return voidValue{}, nil
+				return voidValue{}, nil, nil
 			}
-			return evalSequence(clause.elements[1:], env)
+			return prepareSequence(clause.elements[1:], env)
 		}
 
 		testValue, err := eval(clause.elements[0], env)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if !isTruthy(testValue) {
 			continue
 		}
 		if len(clause.elements) == 1 {
-			return testValue, nil
+			return testValue, nil, nil
 		}
-		return evalSequence(clause.elements[1:], env)
+		return prepareSequence(clause.elements[1:], env)
 	}
-	return voidValue{}, nil
+	return voidValue{}, nil, nil
 }
 
-func evalLet(args []node, env *environment) (value, error) {
+func evalLet(args []node, env *environment) (value, *evalStep, error) {
 	if len(args) < 2 {
-		return nil, &EvalError{Message: "let expects bindings and a body"}
+		return nil, nil, &EvalError{Message: "let expects bindings and a body"}
 	}
 
 	if name, ok := symbolName(args[0]); ok {
@@ -563,34 +585,34 @@ func evalLet(args []node, env *environment) (value, error) {
 
 	bindingList, ok := args[0].(listNode)
 	if !ok {
-		return nil, &EvalError{Message: "let bindings must be a list"}
+		return nil, nil, &EvalError{Message: "let bindings must be a list"}
 	}
 
 	names, values, err := evalBindings(bindingList.elements, env)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	letEnv := newEnvironment(env)
 	for i, name := range names {
 		letEnv.define(name, values[i])
 	}
-	return evalSequence(args[1:], letEnv)
+	return prepareSequence(args[1:], letEnv)
 }
 
-func evalNamedLet(name string, args []node, env *environment) (value, error) {
+func evalNamedLet(name string, args []node, env *environment) (value, *evalStep, error) {
 	if len(args) < 2 {
-		return nil, &EvalError{Message: "named let expects bindings and a body"}
+		return nil, nil, &EvalError{Message: "named let expects bindings and a body"}
 	}
 
 	bindingList, ok := args[0].(listNode)
 	if !ok {
-		return nil, &EvalError{Message: "named let bindings must be a list"}
+		return nil, nil, &EvalError{Message: "named let bindings must be a list"}
 	}
 
 	names, values, err := evalBindings(bindingList.elements, env)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	letEnv := newEnvironment(env)
@@ -600,7 +622,7 @@ func evalNamedLet(name string, args []node, env *environment) (value, error) {
 		env:    letEnv,
 	}
 	letEnv.define(name, proc)
-	return applyProcedure(proc, values, sourcePos{})
+	return startClosureCall(proc, values, sourcePos{})
 }
 
 func evalBindings(bindingExprs []node, env *environment) ([]string, []value, error) {
@@ -699,21 +721,32 @@ func parseParamNames(paramExprs []node) ([]string, string, bool, error) {
 }
 
 func applyProcedure(proc value, args []value, pos sourcePos) (value, error) {
+	result, step, err := startProcedureCall(proc, args, pos)
+	if err != nil {
+		return nil, err
+	}
+	if step == nil {
+		return result, nil
+	}
+	return eval(step.expr, step.env)
+}
+
+func startProcedureCall(proc value, args []value, pos sourcePos) (value, *evalStep, error) {
 	switch proc := proc.(type) {
 	case builtinProc:
 		result, err := proc(args)
-		return result, withErrorPos(err, pos)
+		return result, nil, withErrorPos(err, pos)
 	case *closureValue:
-		return applyClosure(proc, args, pos)
+		return startClosureCall(proc, args, pos)
 	case *caseClosureValue:
 		for _, clause := range proc.clauses {
 			if closureAcceptsArgCount(clause, len(args)) {
-				return applyClosure(clause, args, pos)
+				return startClosureCall(clause, args, pos)
 			}
 		}
-		return nil, errorAt(pos, "no matching case-lambda clause for %d arguments", len(args))
+		return nil, nil, errorAt(pos, "no matching case-lambda clause for %d arguments", len(args))
 	default:
-		return nil, errorAt(pos, "not a procedure")
+		return nil, nil, errorAt(pos, "not a procedure")
 	}
 }
 
@@ -725,11 +758,22 @@ func closureAcceptsArgCount(proc *closureValue, argCount int) bool {
 }
 
 func applyClosure(proc *closureValue, args []value, pos sourcePos) (value, error) {
+	result, step, err := startClosureCall(proc, args, pos)
+	if err != nil {
+		return nil, err
+	}
+	if step == nil {
+		return result, nil
+	}
+	return eval(step.expr, step.env)
+}
+
+func startClosureCall(proc *closureValue, args []value, pos sourcePos) (value, *evalStep, error) {
 	if !proc.hasRest && len(args) != len(proc.params) {
-		return nil, errorAt(pos, "expected %d arguments, got %d", len(proc.params), len(args))
+		return nil, nil, errorAt(pos, "expected %d arguments, got %d", len(proc.params), len(args))
 	}
 	if proc.hasRest && len(args) < len(proc.params) {
-		return nil, errorAt(pos, "expected at least %d arguments, got %d", len(proc.params), len(args))
+		return nil, nil, errorAt(pos, "expected at least %d arguments, got %d", len(proc.params), len(args))
 	}
 
 	callEnv := newEnvironment(proc.env)
@@ -739,19 +783,32 @@ func applyClosure(proc *closureValue, args []value, pos sourcePos) (value, error
 	if proc.hasRest {
 		callEnv.define(proc.restParam, listValue{elements: copyValues(args[len(proc.params):])})
 	}
-	return evalSequence(proc.body, callEnv)
+	return prepareSequence(proc.body, callEnv)
 }
 
 func evalSequence(exprs []node, env *environment) (value, error) {
-	last := value(voidValue{})
-	for _, expr := range exprs {
-		var err error
-		last, err = eval(expr, env)
-		if err != nil {
-			return nil, err
+	result, step, err := prepareSequence(exprs, env)
+	if err != nil {
+		return nil, err
+	}
+	if step == nil {
+		return result, nil
+	}
+	return eval(step.expr, step.env)
+}
+
+func prepareSequence(exprs []node, env *environment) (value, *evalStep, error) {
+	if len(exprs) == 0 {
+		return voidValue{}, nil, nil
+	}
+
+	for _, expr := range exprs[:len(exprs)-1] {
+		if _, err := eval(expr, env); err != nil {
+			return nil, nil, err
 		}
 	}
-	return last, nil
+
+	return nil, &evalStep{expr: exprs[len(exprs)-1], env: env}, nil
 }
 
 func builtinNumericFold(name string) builtinProc {
