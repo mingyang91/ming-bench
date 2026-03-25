@@ -30,7 +30,7 @@ impl Provider {
     fn from_format(format: SessionFormat) -> Self {
         match format {
             SessionFormat::Claude => Self::Claude,
-            SessionFormat::Codex => Self::Codex,
+            SessionFormat::Codex | SessionFormat::CodexAgentOutput => Self::Codex,
         }
     }
 
@@ -457,7 +457,9 @@ fn build_run_summary(results_dir: &Path) -> Result<RunSummary> {
 
         let (requests, usage_rows) = match format {
             SessionFormat::Claude => parse_claude_session(session_path, session_label)?,
-            SessionFormat::Codex => parse_codex_session(session_path, session_label, &session_dir)?,
+            SessionFormat::Codex | SessionFormat::CodexAgentOutput => {
+                parse_codex_session(session_path, session_label, &session_dir)?
+            }
         };
 
         total_usage_rows += usage_rows;

@@ -5,6 +5,49 @@ Data sources: `cargo xtask results`, `cargo xtask tokens`, session narratives.
 
 ---
 
+## R27 — 2026-03-25
+
+**Framework:** `do` moved L26→L15, realworld fixtures re-leveled, 26 visible levels, Chez ground truth
+**Runs:** 12 agents (Claude + Codex, Rust/Go/Java/TS default + Rust/Scala QG)
+
+| Run | Agent | Lang | Strategy | Levels | Turns | Output | Cost | Session | Wall | Notes |
+|-----|-------|------|----------|--------|-------|--------|------|---------|------|-------|
+| cl-scala-qg-r27 | Claude | Scala | QG | **26/26** | **585** | 455K | **$170** | 2h47m | 5h03m | **Champion — $6.54/level, fewest turns** |
+| cl-java-def-r27 | Claude | Java | default | **26/26** | 705 | 404K | $172 | **2h34m** | **3h23m** | Fastest session+wall, close 2nd on cost |
+| cl-go-def-r27 | Claude | Go | default | **26/26** | 753 | 665K | $202 | 3h46m | 4h17m | L18: 1h11m (239K output), L24: 50m |
+| cl-qg-r27 | Claude | Rust | QG | **26/26** | 749 | 480K | $209 | 3h17m | 5h03m | Beat Rust default on every metric |
+| cl-def-r27 | Claude | Rust | default | **26/26** | 1036 | 584K | $270 | 3h52m | 4h53m | L22: 111 trn, L26: 140 trn |
+| cx-go-def-r27 | Codex | Go | default | **26/26** | **435** | 689K | **$28** | 3h02m | 3h32m | **Cheapest completer ever — $1.08/level** |
+| cx-java-def-r27 | Codex | Java | default | **26/26** | 514 | 783K | $44 | — | — | Full completion |
+| cx-def-r27 | Codex | Rust | default | **26/26** | 461 | 801K | $45 | 3h53m | 4h25m | Full completion, 6× cheaper than Claude Rust |
+| cx-qg-r27 | Codex | Rust | QG | 25/26 | 414 | 731K | $38 | — | — | Failed L26 realworld |
+| cx-ts-def-r27 | Codex | TS | default | 25/26 | 395 | 606K | $25 | 3h32m | 4h46m | L26: JS heap OOM on realworld fixtures |
+| cx-scala-qg-r27 | Codex | Scala | QG | 14/26 | 306 | 358K | $21 | 2h02m | 4h57m | Stopped L14: missing string builtins |
+| cl-ts-def-r27 | Claude | TS | default | 17/26 | 335 | 152K | $75 | 1h05m | 6h37m | Died at L18 (call/cc) |
+| cl-java-qg-r27 | Claude | Java | QG | 3/26 | — | — | — | — | — | Died L03 (infra?) |
+| cx-java-qg-r27 | Codex | Java | QG | 1/26 | — | — | — | — | — | Died L01 (infra?) |
+
+**Completers: 8/14** (5 Claude, 3 Codex). All completers cleared 26/26.
+
+### Compare: cl-def-r27 vs cl-qg-r27 — 2026-03-25
+**Winner:** QG — same levels, 22% cheaper, 35 min faster
+**Levels:** cl-def-r27 26/26 vs cl-qg-r27 26/26
+**Cost:** cl-def-r27 $270 vs cl-qg-r27 $209
+**Key insight:** Default's L26 realworld integration exploded to 140 turns — quasiquote + vector patterns + missing builtins required massive feature backfill. QG did it in 56 turns.
+**Verdict:** First round where QG decisively beat default on both cost and completion. Redesigned QG rules eliminated cosmetic friction (11 events vs 22 for default). Default struggled architecturally: L16 TCO (7 friction, 40 turns), L22 syntax-case (111 turns), L26 realworld (140 turns). Difficulty wall (L16-L18): default 170 turns/$257K vs QG 133 turns/$159K. L26: default 140 turns vs QG 56 turns — 2.5× gap.
+
+### Key R27 Findings
+- **Codex Go is the cheapest completer ever**: $28 for 26/26 ($1.08/level). Go's simplicity + Codex's 10× cheaper pricing = unbeatable value. 435 turns, 689K output, 3h02m.
+- **L26 realworld is the discriminator**: alexpander (1966 lines) + dynamic (2320 lines) require quasiquote, vector patterns, and many builtins not explicitly tested in prior levels. Codex QG, Codex TS, Claude TS all died here or before.
+- **Claude Scala QG is the Claude champion**: $170 for 26/26, fewest Claude turns (585). But Codex Go beats it 6× on cost.
+- **Codex is 6× cheaper than Claude per level**: $28-45 vs $170-270 for completers. Partly model pricing ($1.50/$6.00 vs $15/$75 per Mtok), partly fewer turns (435-514 vs 585-1036).
+- **QG hurts Codex**: Codex Rust QG (25/26) failed L26 while default (26/26) passed. QG adds overhead without benefit when the agent already writes clean-enough code.
+- **Go + Codex has no L18/L24 problem**: Unlike Claude Go (1h11m at L18), Codex Go did L18 in 14m25s. Codex doesn't overthink the CEK rewrite.
+- **TS memory ceiling**: Codex TS passed 25/26 but L26 OOM'd. Node's 1GB heap can't handle 2000-line programs. Not a correctness issue.
+- **Both Java QG runs died early (L01-L03)**: likely infrastructure issue, not agent capability.
+
+---
+
 ## R26 — 2026-03-24
 
 **Framework:** Post-difficulty-wall, two-pass QG, 1500-line limit, 26+2 levels

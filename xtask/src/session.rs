@@ -38,6 +38,8 @@ pub enum EventKind {
 pub enum SessionFormat {
     Claude,
     Codex,
+    /// Codex agent-output.txt (thread.started / item.completed / turn.completed)
+    CodexAgentOutput,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +93,8 @@ fn detect_session_format_content(content: &str) -> Option<SessionFormat> {
             "session_meta" | "event_msg" | "response_item" | "turn_context" => {
                 Some(SessionFormat::Codex)
             }
+            "thread.started" | "turn.started" | "turn.completed" | "item.started"
+            | "item.completed" => Some(SessionFormat::CodexAgentOutput),
             _ => None,
         };
     }
@@ -101,6 +105,7 @@ fn parse_session_content(content: &str, format: SessionFormat) -> Vec<SessionEve
     match format {
         SessionFormat::Claude => parse_claude_session(content),
         SessionFormat::Codex => parse_codex_session(content),
+        SessionFormat::CodexAgentOutput => parse_codex_agent_output(content),
     }
 }
 
@@ -186,6 +191,132 @@ fn parse_codex_session(content: &str) -> Vec<SessionEvent> {
     }
 
     events
+}
+
+fn parse_codex_agent_output(content: &str) -> Vec<SessionEvent> {
+    let mut events = Vec::new();
+    let mut index = 0;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with('{') {
+            continue;
+        }
+        let obj: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        let Some(event_type) = obj.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        let kind = match event_type {
+            "item.completed" => parse_codex_agent_output_item(&obj),
+            // Emit agent_message items as User events too, so turn counting works.
+            // Each agent_message represents a "turn" of agent reasoning.
+            _ => None,
+        };
+
+        let Some(kind) = kind else { continue };
+        events.push(SessionEvent {
+            index,
+            timestamp: None,
+            kind,
+        });
+        index += 1;
+    }
+
+    events
+}
+
+/// Extract output_tokens from a Codex agent-output.txt turn.completed event.
+pub fn codex_agent_output_tokens(path: &Path) -> u64 {
+    let Ok(content) = fs::read_to_string(path) else {
+        return 0;
+    };
+    for line in content.lines().rev() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if obj.get("type").and_then(|v| v.as_str()) == Some("turn.completed") {
+            return obj
+                .pointer("/usage/output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// Extract total usage from a Codex agent-output.txt turn.completed event.
+pub fn codex_agent_output_usage(path: &Path) -> Option<(u64, u64, u64)> {
+    let content = fs::read_to_string(path).ok()?;
+    for line in content.lines().rev() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let obj: serde_json::Value = serde_json::from_str(line).ok()?;
+        if obj.get("type").and_then(|v| v.as_str()) == Some("turn.completed") {
+            let usage = obj.get("usage")?;
+            let input = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cached = usage.get("cached_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let output = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            return Some((input, cached, output));
+        }
+    }
+    None
+}
+
+fn parse_codex_agent_output_item(obj: &serde_json::Value) -> Option<EventKind> {
+    let item = obj.get("item")?;
+    let item_type = item.get("type").and_then(|v| v.as_str())?;
+
+    match item_type {
+        "agent_message" => {
+            let text = item
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if text.is_empty() {
+                return None;
+            }
+            Some(EventKind::Assistant {
+                blocks: vec![ContentBlock::Text(text)],
+            })
+        }
+        "command_execution" => {
+            let command = item
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let output = item
+                .get("aggregated_output")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            // Only emit completed commands (with exit_code)
+            if item.get("exit_code").and_then(|v| v.as_i64()).is_none() {
+                return None;
+            }
+            let mut blocks = vec![ContentBlock::ToolUse {
+                name: "Bash".to_string(),
+                input_json: serde_json::json!({"command": command}).to_string(),
+            }];
+            if !output.is_empty() {
+                blocks.push(ContentBlock::ToolResult { content: output });
+            }
+            Some(EventKind::Assistant { blocks })
+        }
+        _ => None,
+    }
 }
 
 fn parse_claude_content_blocks(obj: &serde_json::Value) -> Vec<ContentBlock> {
@@ -463,7 +594,14 @@ fn supported_session_path(dir: &Path) -> Option<PathBuf> {
 
     let output_file = dir.join("agent-output.txt");
     if output_file.is_file() {
-        return codex::resolve_rollout_from_output_file(&output_file);
+        // Prefer rollout file (has token_count events) over agent-output.txt
+        if let Some(rollout) = codex::resolve_rollout_from_output_file(&output_file) {
+            return Some(rollout);
+        }
+        // Fall back to parsing agent-output.txt directly
+        if detect_session_format(&output_file).is_some() {
+            return Some(output_file);
+        }
     }
 
     None

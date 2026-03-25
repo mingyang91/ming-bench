@@ -118,13 +118,48 @@ fn analyze_level(
     is_codex: bool,
     totals: &mut RunTotals,
 ) -> Result<LevelAnalysis> {
+    let is_agent_output = path.file_name().and_then(|n| n.to_str()) == Some("agent-output.txt");
     let events = session::parse_session(path)?;
-    let turns = events
-        .iter()
-        .filter(|e| matches!(e.kind, EventKind::User { .. }))
-        .count() as u32;
-    let time_secs = compute_duration(&events);
-    let output_tokens = level_output_tokens(run_dir, label, path, is_codex, totals);
+
+    // For Codex agent-output.txt, count agent_message Text events as turns
+    // (each represents an agent reasoning step). For Claude/rollout, count User events.
+    let turns = if is_agent_output {
+        events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::Assistant { blocks }
+                if blocks.iter().any(|b| matches!(b, ContentBlock::Text(_)))))
+            .count() as u32
+    } else {
+        events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::User { .. }))
+            .count() as u32
+    };
+
+    // For agent-output.txt, get duration from meta.json level_times
+    let time_secs = if is_agent_output {
+        meta_level_duration(run_dir, label)
+    } else {
+        compute_duration(&events)
+    };
+
+    // For agent-output.txt, get output tokens from turn.completed usage
+    let output_tokens = if is_agent_output {
+        let ot = session::codex_agent_output_tokens(path);
+        if let Some((input, cached, output)) = session::codex_agent_output_usage(path) {
+            let usage = codex::Usage {
+                input_tokens: input,
+                cached_input_tokens: cached,
+                output_tokens: output,
+            };
+            // agent-output.txt has no model header; default to codex-mini-latest
+            totals.add_codex(&usage, Some("codex-mini-latest"));
+        }
+        ot
+    } else {
+        level_output_tokens(run_dir, label, path, is_codex, totals)
+    };
+
     let test_runs = count_test_runs(&events);
     let friction = count_friction(&events);
     let token_budget = parse_level_num(label)
@@ -140,6 +175,21 @@ fn analyze_level(
         test_runs,
         friction,
     })
+}
+
+fn meta_level_duration(run_dir: &Path, label: &str) -> u64 {
+    let meta_path = run_dir.join("meta.json");
+    let Ok(content) = std::fs::read_to_string(&meta_path) else {
+        return 0;
+    };
+    let Ok(obj) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return 0;
+    };
+    obj.get("level_times")
+        .and_then(|lt| lt.get(label))
+        .and_then(|entry| entry.get("duration_s"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
 }
 
 fn level_output_tokens(
