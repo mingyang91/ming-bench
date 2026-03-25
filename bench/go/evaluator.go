@@ -51,3 +51,28 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	}
 	return res, out.String(), nil
 }
+
+// EvalStrWithLimit evaluates Scheme expressions with a step budget.
+// Each eval dispatch counts as one step. Returns an error if the budget is exhausted.
+func EvalStrWithLimit(input string, maxSteps int) (string, error) {
+	exprs, err := parse(input)
+	if err != nil {
+		return "", &EvalError{Message: err.Error()}
+	}
+	if len(exprs) == 0 {
+		return "", &EvalError{Message: "no expressions"}
+	}
+
+	env := makeGlobalEnv(nil)
+	env.evalState = newEvalState()
+	env.evalState.stepLimit = int64(maxSteps)
+	lastVal, err := evalTopLevel(exprs, env)
+	if err != nil {
+		return "", err
+	}
+
+	if _, ok := lastVal.(*VoidVal); ok {
+		return "", nil
+	}
+	return lastVal.String(), nil
+}

@@ -38,6 +38,8 @@ type EvalState struct {
 	activeContIDs    map[int64]bool // cont IDs currently inside their f(k)
 	frameIDCounter   int64
 	callFrameStack   []int64 // stack of active lambda call frame IDs
+	stepCount        int64
+	stepLimit        int64 // 0 means unlimited
 }
 
 type letEnvEntry struct {

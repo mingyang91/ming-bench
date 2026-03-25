@@ -56,6 +56,12 @@ func eval(expr Expr, env *Env) (Value, error) {
 	}()
 
 	for {
+		if state := env.evalState; state != nil && state.stepLimit > 0 {
+			state.stepCount++
+			if state.stepCount > state.stepLimit {
+				return nil, &EvalError{Message: "step limit exceeded"}
+			}
+		}
 		val, err := evalInner(expr, env)
 		if err != nil {
 			return nil, err
