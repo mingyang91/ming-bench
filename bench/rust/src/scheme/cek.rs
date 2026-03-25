@@ -529,10 +529,11 @@ pub(crate) fn cek_apply_func(func: Value, args: Vec<Value>, kont: &mut Kont, win
             cek_apply_func(proc, vec![cont], kont, winders, output)
         }
         Value::Continuation(saved_kont, saved_winders) => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity("continuation requires exactly 1 argument".into()));
-            }
-            let val = args.into_iter().next().expect("arity checked above");
+            let val = if args.len() == 1 {
+                args.into_iter().next().expect("args verified non-empty")
+            } else {
+                Value::Values(args)
+            };
             let common = common_winder_prefix_len(winders, &saved_winders);
             if winders.len() == common && saved_winders.len() == common {
                 *kont = saved_kont;

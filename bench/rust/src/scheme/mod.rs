@@ -751,7 +751,8 @@ fn cek_eval_list(items: &[Ast], env: &Env, kont: &mut Kont, _output: &mut String
             }
             _ => {
                 // Check for macro invocation (get_if_macro avoids cloning non-macro values)
-                if let Some(mac) = env.borrow().get_if_macro(op) {
+                let mac = env.borrow().get_if_macro(op);
+                if let Some(mac) = mac {
                     match mac {
                         Value::Macro { literals, rules, def_env } => {
                             let (expanded, eval_env) = macros::expand_macro_form(&literals, &rules, &def_env, items, env)?;

@@ -19,6 +19,7 @@ pub(crate) fn is_special_form(name: &str) -> bool {
             | "define-syntax" | "syntax-rules" | "define-record-type" | "case-lambda"
             | "letrec" | "letrec*" | "case" | "do" | "when" | "unless"
             | "syntax-case" | "syntax" | "with-syntax"
+            | "guard" | "call/cc" | "call-with-current-continuation"
     )
 }
 
@@ -239,13 +240,14 @@ pub(crate) fn expand_macro_form(
             let expanded = expand_template(template, &bindings, &mut renames);
 
             if !renames.is_empty() {
-                let child_env = Environment::with_parent(use_env);
-                for (original, gensym_name) in &renames {
-                    if let Some(val) = def_env.borrow().get(original) {
-                        child_env.borrow_mut().set(gensym_name.clone(), val);
-                    }
+                let to_set: Vec<_> = renames.iter()
+                    .filter_map(|(original, gensym_name)| {
+                        def_env.borrow().get(original).map(|val| (gensym_name.clone(), val))
+                    })
+                    .collect();
+                for (gensym_name, val) in to_set {
+                    use_env.borrow_mut().set(gensym_name, val);
                 }
-                return Ok((expanded, child_env));
             }
 
             return Ok((expanded, Rc::clone(use_env)));
