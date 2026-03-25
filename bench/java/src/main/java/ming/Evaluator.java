@@ -332,6 +332,8 @@ public class Evaluator {
     private boolean cekEval;
     private int cekSrcLine = -1;
     private int cekSrcCol = -1;
+    private long stepLimit = -1; // -1 = no limit
+    private long stepCount = 0;
 
     public Evaluator() {
         // Arithmetic
@@ -1045,6 +1047,17 @@ public class Evaluator {
         return new EvalResult(result, outputBuffer.toString());
     }
 
+    public String evalStrWithLimit(String input, long maxSteps) throws EvalError {
+        stepLimit = maxSteps;
+        stepCount = 0;
+        try {
+            return evalStr(input);
+        } finally {
+            stepLimit = -1;
+            stepCount = 0;
+        }
+    }
+
     private Object evalForms(List<Object> forms, Env env) throws EvalError {
         if (forms.size() == 1) {
             return evalCEK(forms.get(0), env, new HaltK());
@@ -1342,6 +1355,9 @@ public class Evaluator {
 
         while (true) {
             try {
+                if (stepLimit >= 0 && ++stepCount > stepLimit) {
+                    throw new EvalError("step limit exceeded");
+                }
                 if (cekEval) {
                     cekEvalStep();
                 } else {
