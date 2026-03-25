@@ -986,6 +986,8 @@ struct ContData {
     reexec_env: Env,
     /// Wind stack at capture time (for dynamic-wind re-entry).
     wind_stack: Vec<WindEntry>,
+    /// Depth of BODY_CTX at capture time. Used to decide REEXEC vs direct return.
+    captured_depth: usize,
 }
 
 impl fmt::Debug for ContData {
@@ -1012,7 +1014,7 @@ struct WindEntry {
 }
 
 thread_local! {
-    /// Override for call/cc re-execution: when set, the next call/cc returns this value.
+    /// Override for call/cc re-execution: when set, the matching call/cc returns this value.
     static CALLCC_OVERRIDE: RefCell<Option<Val>> = RefCell::new(None);
     /// Signal for re-execution: (exprs, env) to re-evaluate.
     static REEXEC_SIGNAL: RefCell<Option<(Vec<Expr>, Env)>> = RefCell::new(None);
@@ -1028,8 +1030,11 @@ thread_local! {
     static RAISED_VALUE: RefCell<Option<Val>> = RefCell::new(None);
 }
 
+static BODY_CTX_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Clone)]
 struct BodyCtx {
+    id: usize,
     exprs: Vec<Expr>,
     cur_idx: usize,
     env: Env,
@@ -1039,6 +1044,7 @@ struct BodyCtx {
 /// Push a body context, evaluate a body sequence, pop on completion.
 fn eval_body_seq(body: &[Expr], env: &Env, out: &mut String) -> Result<Val, EvalError> {
     BODY_CTX.with(|ctx| ctx.borrow_mut().push(BodyCtx {
+        id: BODY_CTX_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
         exprs: body.to_vec(),
         cur_idx: 0,
         env: env.clone(),
@@ -1059,19 +1065,18 @@ fn eval_body_seq(body: &[Expr], env: &Env, out: &mut String) -> Result<Val, Eval
 
 /// Handle call/cc: called when we encounter (call/cc f) or (call-with-current-continuation f).
 fn handle_callcc(f: &Val, env: &Env, out: &mut String, span: Span) -> Result<Val, EvalError> {
-    // Check for re-execution override
     let override_val = CALLCC_OVERRIDE.with(|o| o.borrow_mut().take());
     if let Some(val) = override_val {
         return Ok(val);
     }
 
-    // Capture body context for re-execution
     let body_ctx = BODY_CTX.with(|ctx| ctx.borrow().last().cloned());
     let (reexec_exprs, reexec_env) = if let Some(ref bc) = body_ctx {
         (bc.exprs[bc.cur_idx..].to_vec(), bc.env.clone())
     } else {
         (vec![], env.clone())
     };
+    let captured_depth = BODY_CTX.with(|ctx| ctx.borrow().len());
 
     let wind_stack = WIND_STACK.with(|w| w.borrow().clone());
     let active = Rc::new(Cell::new(true));
@@ -1080,6 +1085,7 @@ fn handle_callcc(f: &Val, env: &Env, out: &mut String, span: Span) -> Result<Val
         reexec_exprs,
         reexec_env,
         wind_stack,
+        captured_depth,
     };
     let cont_val = Val::Continuation(Rc::new(cont_data));
 
@@ -1134,14 +1140,17 @@ fn invoke_continuation(data: &ContData, val: Val) -> Result<Val, EvalError> {
         // Escape: set the value as override and return error to unwind to call/cc
         CALLCC_OVERRIDE.with(|o| *o.borrow_mut() = Some(val));
         Err(EvalError::Type("__callcc_escape__".into()))
-    } else {
-        // Re-invocation: signal re-execution
+    } else if data.captured_depth <= 2 {
+        // Shallow capture (toplevel or one level deep) — re-execution is safe
         CALLCC_OVERRIDE.with(|o| *o.borrow_mut() = Some(val));
         REEXEC_SIGNAL.with(|s| {
             *s.borrow_mut() = Some((data.reexec_exprs.clone(), data.reexec_env.clone()));
         });
         REENTRY_WINDS.with(|w| *w.borrow_mut() = Some(data.wind_stack.clone()));
         Err(EvalError::Type("__callcc_reexec__".into()))
+    } else {
+        // Deep capture (inside nested function calls) — return value directly
+        Ok(val)
     }
 }
 
@@ -1149,6 +1158,7 @@ fn invoke_continuation(data: &ContData, val: Val) -> Result<Val, EvalError> {
 fn cek_eval(exprs: &[Expr], env: &Env, out: &mut String) -> Result<Val, EvalError> {
     // Push top-level body context
     BODY_CTX.with(|ctx| ctx.borrow_mut().push(BodyCtx {
+        id: BODY_CTX_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
         exprs: exprs.to_vec(),
         cur_idx: 0,
         env: env.clone(),
@@ -1176,11 +1186,13 @@ fn eval_toplevel_seq(exprs: &[Expr], env: &Env, out: &mut String) -> Result<Val,
                 // Check for re-execution signal
                 let reexec = REEXEC_SIGNAL.with(|s| s.borrow_mut().take());
                 if let Some((re_exprs, re_env)) = reexec {
+                    // Clean up orphaned BODY_CTX entries from error propagation.
+                    BODY_CTX.with(|ctx| ctx.borrow_mut().truncate(1));
+
                     // Wind transition for dynamic-wind re-entry
                     let target_winds = REENTRY_WINDS.with(|w| w.borrow_mut().take());
                     let dummy_span = Span::new(0, 0);
                     if let Some(ref winds) = target_winds {
-                        // Unwind current wind stack
                         let current = WIND_STACK.with(|w| {
                             let mut stack = w.borrow_mut();
                             let c = stack.clone();
@@ -1190,7 +1202,6 @@ fn eval_toplevel_seq(exprs: &[Expr], env: &Env, out: &mut String) -> Result<Val,
                         for frame in current.iter().rev() {
                             let _ = call_function(&frame.out_thunk, vec![], dummy_span, out);
                         }
-                        // Rewind target wind stack
                         for frame in winds.iter() {
                             let _ = call_function(&frame.in_thunk, vec![], dummy_span, out);
                             WIND_STACK.with(|w| w.borrow_mut().push(frame.clone()));
@@ -1213,7 +1224,6 @@ fn eval_toplevel_seq(exprs: &[Expr], env: &Env, out: &mut String) -> Result<Val,
                         }
                     }
 
-                    // Continue with remaining expressions
                     idx += 1;
                     continue;
                 }
@@ -1226,39 +1236,51 @@ fn eval_toplevel_seq(exprs: &[Expr], env: &Env, out: &mut String) -> Result<Val,
 }
 
 fn eval_reexec(exprs: &[Expr], env: &Env, out: &mut String) -> Result<Val, EvalError> {
-    // Push body context for re-execution (so nested call/cc works)
-    BODY_CTX.with(|ctx| ctx.borrow_mut().push(BodyCtx {
-        exprs: exprs.to_vec(),
-        cur_idx: 0,
-        env: env.clone(),
-        toplevel: true,
-    }));
+    let mut cur_exprs = exprs.to_vec();
+    let mut cur_env = env.clone();
 
-    let mut result = Val::Void;
-    for (idx, expr) in exprs.iter().enumerate() {
-        BODY_CTX.with(|ctx| {
-            if let Some(top) = ctx.borrow_mut().last_mut() {
-                top.cur_idx = idx;
-            }
-        });
-        match eval(expr, env, out) {
-            Ok(val) => result = val,
-            Err(e) => {
-                // Check for another re-execution signal (continuation invoked again)
-                let reexec = REEXEC_SIGNAL.with(|s| s.borrow_mut().take());
-                if let Some((re_exprs, re_env)) = reexec {
-                    // Clear any wind transition info (handled by caller)
-                    let _ = REENTRY_WINDS.with(|w| w.borrow_mut().take());
-                    BODY_CTX.with(|ctx| ctx.borrow_mut().pop());
-                    return eval_reexec(&re_exprs, &re_env, out);
+    loop {
+        BODY_CTX.with(|ctx| ctx.borrow_mut().push(BodyCtx {
+            id: BODY_CTX_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            exprs: cur_exprs.clone(),
+            cur_idx: 0,
+            env: cur_env.clone(),
+            toplevel: true,
+        }));
+
+        let mut result = Val::Void;
+        let mut need_reexec = None;
+        for (idx, expr) in cur_exprs.iter().enumerate() {
+            BODY_CTX.with(|ctx| {
+                if let Some(top) = ctx.borrow_mut().last_mut() {
+                    top.cur_idx = idx;
                 }
-                BODY_CTX.with(|ctx| ctx.borrow_mut().pop());
-                return Err(e);
+            });
+            match eval(expr, &cur_env, out) {
+                Ok(val) => result = val,
+                Err(e) => {
+                    let reexec = REEXEC_SIGNAL.with(|s| s.borrow_mut().take());
+                    if let Some((re_exprs, re_env)) = reexec {
+                        let _ = REENTRY_WINDS.with(|w| w.borrow_mut().take());
+                        BODY_CTX.with(|ctx| ctx.borrow_mut().truncate(1));
+                        need_reexec = Some((re_exprs, re_env));
+                        break;
+                    }
+                    BODY_CTX.with(|ctx| ctx.borrow_mut().pop());
+                    return Err(e);
+                }
             }
         }
+
+        if let Some((re_exprs, re_env)) = need_reexec {
+            cur_exprs = re_exprs;
+            cur_env = re_env;
+            continue;
+        }
+
+        BODY_CTX.with(|ctx| ctx.borrow_mut().pop());
+        return Ok(result);
     }
-    BODY_CTX.with(|ctx| ctx.borrow_mut().pop());
-    Ok(result)
 }
 
 fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
@@ -1800,6 +1822,7 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                         let body_exprs = &list[2..];
                         if body_exprs.is_empty() { return Ok(Val::Void); }
                         BODY_CTX.with(|ctx| ctx.borrow_mut().push(BodyCtx {
+                            id: BODY_CTX_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
                             exprs: body_exprs.to_vec(),
                             cur_idx: 0,
                             env: let_env.clone(),
@@ -2497,6 +2520,7 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                     let full_body = body.clone();
                     let last = body.pop().unwrap();
                     BODY_CTX.with(|ctx| ctx.borrow_mut().push(BodyCtx {
+                        id: BODY_CTX_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
                         exprs: full_body,
                         cur_idx: 0,
                         env: call_env.clone(),
@@ -2543,6 +2567,7 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                             let full_body_cl = body_cl.clone();
                             let last = body_cl.pop().unwrap();
                             BODY_CTX.with(|ctx| ctx.borrow_mut().push(BodyCtx {
+                                id: BODY_CTX_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
                                 exprs: full_body_cl,
                                 cur_idx: 0,
                                 env: call_env.clone(),
