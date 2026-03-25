@@ -870,13 +870,21 @@ fn builtin_for_each(args: &[Value], runtime: &mut Runtime) -> Result<Value, Eval
 }
 
 fn builtin_append(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
-    let mut combined = Vec::new();
+    let Some((tail, prefixes)) = args.split_last() else {
+        return Ok(list_from_vec(Vec::new()));
+    };
 
-    for arg in args {
+    let mut combined = Vec::new();
+    for arg in prefixes {
         combined.extend(expect_list(arg, "list")?);
     }
 
-    Ok(list_from_vec(combined))
+    let mut result = tail.clone();
+    while let Some(value) = combined.pop() {
+        result = make_pair(value, result);
+    }
+
+    Ok(result)
 }
 
 fn builtin_reverse(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {

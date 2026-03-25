@@ -47,6 +47,11 @@ impl<'a> Parser<'a> {
             Some('(') => self.parse_list(pos),
             Some('#') if self.peek_next_char() == Some('(') => self.parse_vector(pos),
             Some('\'') => self.parse_quote_shorthand(pos),
+            Some('`') => self.parse_reader_shorthand(pos, '`', "quasiquote"),
+            Some(',') if self.peek_next_char() == Some('@') => {
+                self.parse_reader_pair_shorthand(pos, ',', '@', "unquote-splicing")
+            }
+            Some(',') => self.parse_reader_shorthand(pos, ',', "unquote"),
             Some('#') if self.peek_next_char() == Some('\'') => self.parse_syntax_shorthand(pos),
             Some('"') => self.parse_string(pos),
             Some(')') => Err(syntax_error(pos, "unexpected ')'")),
@@ -85,12 +90,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_quote_shorthand(&mut self, pos: Position) -> Result<Expr, EvalError> {
-        self.expect_char('\'')?;
-        let quoted = self.parse_expr()?;
-        Ok(Expr::List(
-            vec![Expr::Symbol("quote".into(), pos), quoted],
-            pos,
-        ))
+        self.parse_reader_shorthand(pos, '\'', "quote")
     }
 
     fn parse_syntax_shorthand(&mut self, pos: Position) -> Result<Expr, EvalError> {
@@ -100,6 +100,36 @@ impl<'a> Parser<'a> {
         Ok(Expr::List(
             vec![Expr::Symbol("syntax".into(), pos), quoted],
             pos,
+        ))
+    }
+
+    fn parse_reader_shorthand(
+        &mut self,
+        marker: Position,
+        prefix: char,
+        form: &str,
+    ) -> Result<Expr, EvalError> {
+        self.expect_char(prefix)?;
+        let quoted = self.parse_expr()?;
+        Ok(Expr::List(
+            vec![Expr::Symbol(form.into(), marker), quoted],
+            marker,
+        ))
+    }
+
+    fn parse_reader_pair_shorthand(
+        &mut self,
+        marker: Position,
+        first: char,
+        second: char,
+        form: &str,
+    ) -> Result<Expr, EvalError> {
+        self.expect_char(first)?;
+        self.expect_char(second)?;
+        let quoted = self.parse_expr()?;
+        Ok(Expr::List(
+            vec![Expr::Symbol(form.into(), marker), quoted],
+            marker,
         ))
     }
 
@@ -253,7 +283,7 @@ fn syntax_error(pos: Position, message: impl Into<String>) -> EvalError {
 }
 
 fn is_delimiter(ch: char) -> bool {
-    ch.is_whitespace() || matches!(ch, '(' | ')' | ';')
+    ch.is_whitespace() || matches!(ch, '(' | ')' | ';' | '\'' | '`' | ',')
 }
 
 fn parse_char_literal(token: &str, pos: Position) -> Result<Expr, EvalError> {

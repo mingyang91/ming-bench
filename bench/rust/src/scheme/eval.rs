@@ -3,11 +3,12 @@ use std::rc::Rc;
 
 use super::builtins::default_env;
 use super::core::{
-    list_from_vec, list_to_vec, make_case_lambda, make_lambda, make_record, make_record_accessor,
-    make_record_constructor, make_record_predicate, make_record_type, quote_expr, BindingRef,
-    CaseLambdaProcedure, DynamicWinder, EnvRef, Environment, Expr, ExprsRef, LambdaProcedure,
-    Position, Procedure, RecordAccessorProcedure, RecordConstructorProcedure,
-    RecordPredicateProcedure, Runtime, Value, WinderRef,
+    list_from_vec, list_to_vec, make_case_lambda, make_lambda, make_pair, make_record,
+    make_record_accessor, make_record_constructor, make_record_predicate, make_record_type,
+    make_vector, quote_expr, BindingRef, CaseLambdaProcedure, DynamicWinder, EnvRef,
+    Environment, Expr, ExprsRef, LambdaProcedure, Position, Procedure,
+    RecordAccessorProcedure, RecordConstructorProcedure, RecordPredicateProcedure, Runtime, Value,
+    WinderRef,
 };
 use super::error::EvalError;
 use super::macros::{expand_macro_call, parse_macro_definition};
@@ -43,6 +44,7 @@ enum SpecialForm {
     Set,
     If,
     Quote,
+    Quasiquote,
     Lambda,
     CaseLambda,
     And,
@@ -67,6 +69,7 @@ impl SpecialForm {
             "set!" => Some(Self::Set),
             "if" => Some(Self::If),
             "quote" => Some(Self::Quote),
+            "quasiquote" => Some(Self::Quasiquote),
             "lambda" => Some(Self::Lambda),
             "case-lambda" => Some(Self::CaseLambda),
             "and" => Some(Self::And),
@@ -357,6 +360,15 @@ fn eval_machine_list(
     let (head, args) = items.split_first().ok_or_else(empty_list_error)?;
 
     if let Expr::Symbol(name, _) = head {
+        if name == "quasiquote" {
+            if let Some(transformer) = runtime.lookup_macro(name) {
+                let (expanded, expansion_env) = expand_macro_call(&transformer, items, env, runtime)?;
+                return Ok(MachineControl::Expr(Rc::new(expanded), expansion_env));
+            }
+
+            return eval_machine_special_form(SpecialForm::Quasiquote, args, pos, env, runtime, frames);
+        }
+
         if let Some(special_form) = SpecialForm::from_symbol(name) {
             return eval_machine_special_form(special_form, args, pos, env, runtime, frames);
         }
@@ -395,6 +407,8 @@ fn eval_machine_special_form(
         SpecialForm::Quote => {
             eval_quote(args).map(|value| MachineControl::Values(ProducedValues::single(value)))
         }
+        SpecialForm::Quasiquote => eval_quasiquote(args, env, runtime)
+            .map(|value| MachineControl::Values(ProducedValues::single(value))),
         SpecialForm::Lambda => eval_lambda(args, env)
             .map(|value| MachineControl::Values(ProducedValues::single(value))),
         SpecialForm::CaseLambda => eval_case_lambda(args, env)
@@ -1866,6 +1880,176 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
     };
 
     Ok(quote_expr(expr))
+}
+
+fn eval_quasiquote(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let [expr] = args else {
+        return Err(wrong_arg_count("quasiquote", "exactly 1", args.len()));
+    };
+
+    eval_quasiquote_template(expr, env, runtime, 1)
+}
+
+fn eval_quasiquote_template(
+    expr: &Expr,
+    env: &EnvRef,
+    runtime: &mut Runtime,
+    depth: usize,
+) -> Result<Value, EvalError> {
+    if let Some(args) = tagged_template_args(expr, "unquote") {
+        let [inner] = args else {
+            return Err(wrong_arg_count("unquote", "exactly 1", args.len()));
+        };
+
+        if depth == 1 {
+            return eval_embedded_quasiquote_expr(inner, env, runtime);
+        }
+
+        return Ok(make_tagged_quasiquote_value(
+            "unquote",
+            eval_quasiquote_template(inner, env, runtime, depth - 1)?,
+        ));
+    }
+
+    if let Some(args) = tagged_template_args(expr, "unquote-splicing") {
+        let [inner] = args else {
+            return Err(wrong_arg_count("unquote-splicing", "exactly 1", args.len()));
+        };
+
+        if depth == 1 {
+            return Err(expr.pos().attach(syntax_error(
+                "unquote-splicing is only valid within list and vector quasiquote templates",
+            )));
+        }
+
+        return Ok(make_tagged_quasiquote_value(
+            "unquote-splicing",
+            eval_quasiquote_template(inner, env, runtime, depth - 1)?,
+        ));
+    }
+
+    if let Some(args) = tagged_template_args(expr, "quasiquote") {
+        let [inner] = args else {
+            return Err(wrong_arg_count("quasiquote", "exactly 1", args.len()));
+        };
+
+        return Ok(make_tagged_quasiquote_value(
+            "quasiquote",
+            eval_quasiquote_template(inner, env, runtime, depth + 1)?,
+        ));
+    }
+
+    match expr {
+        Expr::Bool(_, _)
+        | Expr::Number(_, _)
+        | Expr::String(_, _)
+        | Expr::Char(_, _)
+        | Expr::Symbol(_, _) => Ok(quote_expr(expr)),
+        Expr::List(items, _) => eval_quasiquote_list(items, env, runtime, depth),
+        Expr::Vector(items, _) => eval_quasiquote_vector(items, env, runtime, depth),
+    }
+}
+
+fn eval_quasiquote_list(
+    items: &[Expr],
+    env: &EnvRef,
+    runtime: &mut Runtime,
+    depth: usize,
+) -> Result<Value, EvalError> {
+    let (head, tail) = split_quasiquote_list(items);
+    let mut values = Vec::new();
+
+    for item in head {
+        match eval_quasiquote_item(item, env, runtime, depth)? {
+            QuasiquoteItem::Value(value) => values.push(value),
+            QuasiquoteItem::Splice(spliced) => values.extend(spliced),
+        }
+    }
+
+    let mut result = match tail {
+        Some(tail) => eval_quasiquote_template(tail, env, runtime, depth)?,
+        None => list_from_vec(Vec::new()),
+    };
+
+    while let Some(value) = values.pop() {
+        result = make_pair(value, result);
+    }
+
+    Ok(result)
+}
+
+fn eval_quasiquote_vector(
+    items: &[Expr],
+    env: &EnvRef,
+    runtime: &mut Runtime,
+    depth: usize,
+) -> Result<Value, EvalError> {
+    let mut values = Vec::new();
+
+    for item in items {
+        match eval_quasiquote_item(item, env, runtime, depth)? {
+            QuasiquoteItem::Value(value) => values.push(value),
+            QuasiquoteItem::Splice(spliced) => values.extend(spliced),
+        }
+    }
+
+    Ok(make_vector(values))
+}
+
+fn eval_quasiquote_item(
+    expr: &Expr,
+    env: &EnvRef,
+    runtime: &mut Runtime,
+    depth: usize,
+) -> Result<QuasiquoteItem, EvalError> {
+    if let Some(args) = tagged_template_args(expr, "unquote-splicing") {
+        let [inner] = args else {
+            return Err(wrong_arg_count("unquote-splicing", "exactly 1", args.len()));
+        };
+
+        if depth == 1 {
+            let value = eval_embedded_quasiquote_expr(inner, env, runtime)?;
+            return expect_list_argument(&value, "list").map(QuasiquoteItem::Splice);
+        }
+    }
+
+    eval_quasiquote_template(expr, env, runtime, depth).map(QuasiquoteItem::Value)
+}
+
+fn eval_embedded_quasiquote_expr(
+    expr: &Expr,
+    env: &EnvRef,
+    runtime: &mut Runtime,
+) -> Result<Value, EvalError> {
+    machine_eval_sequence(std::slice::from_ref(expr), env, runtime).and_then(ProducedValues::into_single)
+}
+
+fn tagged_template_args<'a>(expr: &'a Expr, tag: &str) -> Option<&'a [Expr]> {
+    let Expr::List(items, _) = expr else {
+        return None;
+    };
+    let (head, args) = items.split_first()?;
+    matches!(head, Expr::Symbol(name, _) if name == tag).then_some(args)
+}
+
+fn make_tagged_quasiquote_value(tag: &str, value: Value) -> Value {
+    list_from_vec(vec![Value::Symbol(tag.into()), value])
+}
+
+enum QuasiquoteItem {
+    Value(Value),
+    Splice(Vec<Value>),
+}
+
+fn split_quasiquote_list(items: &[Expr]) -> (&[Expr], Option<&Expr>) {
+    match items.iter().position(is_dot_symbol_expr) {
+        Some(index) if index > 0 && index + 2 == items.len() => (&items[..index], Some(&items[index + 1])),
+        Some(_) | None => (items, None),
+    }
+}
+
+fn is_dot_symbol_expr(expr: &Expr) -> bool {
+    matches!(expr, Expr::Symbol(name, _) if name == ".")
 }
 
 fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
