@@ -44,6 +44,11 @@ object StringBuiltins:
     case other                      => throw new EvalError(s"$name: expected string, got ${SchemeVal.display(other)}")
 
   private def registerStringOps(env: Env): Unit =
+    registerStringCore(env)
+    registerStringConversion(env)
+    registerCharOps(env)
+
+  private def registerStringCore(env: Env): Unit =
     env.define(
       "string-append",
       SchemeVal.BuiltinProc(
@@ -74,31 +79,6 @@ object StringBuiltins:
             case (SchemeVal.StringVal(chars), SchemeVal.IntVal(start), SchemeVal.IntVal(end)) =>
               SchemeVal.str(new String(chars, start.toInt, end.toInt - start.toInt))
             case _ => throw new EvalError("substring: invalid arguments")
-      )
-    )
-    env.define(
-      "string->number",
-      SchemeVal.BuiltinProc(
-        "string->number",
-        args =>
-          if args.size != 1 then throw new EvalError("string->number: expected 1 argument")
-          args.head match
-            case SchemeVal.StringVal(chars) =>
-              val s = new String(chars)
-              try SchemeVal.IntVal(s.toLong)
-              catch case _: NumberFormatException => SchemeVal.BoolVal(false)
-            case other => throw new EvalError(s"string->number: expected string, got ${SchemeVal.display(other)}")
-      )
-    )
-    env.define(
-      "number->string",
-      SchemeVal.BuiltinProc(
-        "number->string",
-        args =>
-          if args.size != 1 then throw new EvalError("number->string: expected 1 argument")
-          args.head match
-            case SchemeVal.IntVal(n) => SchemeVal.str(n.toString)
-            case other => throw new EvalError(s"number->string: expected number, got ${SchemeVal.display(other)}")
       )
     )
     env.define(
@@ -138,6 +118,33 @@ object StringBuiltins:
             case _ => throw new EvalError("string-set!: invalid arguments")
       )
     )
+
+  private def registerStringConversion(env: Env): Unit =
+    env.define(
+      "string->number",
+      SchemeVal.BuiltinProc(
+        "string->number",
+        args =>
+          if args.size != 1 then throw new EvalError("string->number: expected 1 argument")
+          args.head match
+            case SchemeVal.StringVal(chars) =>
+              val s = new String(chars)
+              try SchemeVal.IntVal(s.toLong)
+              catch case _: NumberFormatException => SchemeVal.BoolVal(false)
+            case other => throw new EvalError(s"string->number: expected string, got ${SchemeVal.display(other)}")
+      )
+    )
+    env.define(
+      "number->string",
+      SchemeVal.BuiltinProc(
+        "number->string",
+        args =>
+          if args.size != 1 then throw new EvalError("number->string: expected 1 argument")
+          args.head match
+            case SchemeVal.IntVal(n) => SchemeVal.str(n.toString)
+            case other => throw new EvalError(s"number->string: expected number, got ${SchemeVal.display(other)}")
+      )
+    )
     env.define(
       "string->list",
       SchemeVal.BuiltinProc(
@@ -166,6 +173,8 @@ object StringBuiltins:
             case other => throw new EvalError(s"list->string: expected list, got ${SchemeVal.display(other)}")
       )
     )
+
+  private def registerCharOps(env: Env): Unit =
     env.define(
       "char->integer",
       SchemeVal.BuiltinProc(
