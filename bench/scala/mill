@@ -223,6 +223,12 @@ if [ -z "$MILL_MAIN_CLI" ] ; then
   MILL_MAIN_CLI="${0}"
 fi
 
+# Allow constrained environments to disable Mill's background server even
+# when the wrapper is invoked indirectly (for example via `cargo xtask`).
+if [ -n "${MILL_NO_DAEMON:-}" ] ; then
+  set -- --no-server "$@"
+fi
+
 MILL_FIRST_ARG=""
 if [ "$1" = "--bsp" ] || [ "$1" = "-i" ] || [ "$1" = "--interactive" ] || [ "$1" = "--no-server" ] || [ "$1" = "--repl" ] || [ "$1" = "--help" ] ; then
   # Need to preserve the first position of those listed options
