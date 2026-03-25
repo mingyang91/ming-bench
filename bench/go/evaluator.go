@@ -59,6 +59,11 @@ type contInvokePanic struct {
 	value Value
 }
 
+// raisePanic is panicked when raise is called.
+type raisePanic struct {
+	value Value
+}
+
 // evalState tracks top-level evaluation context for continuation support.
 type evalState struct {
 	topExprs       []Expr
@@ -146,6 +151,10 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 				return quoteExpr(e.Elems[1])
 			case "dynamic-wind":
 				return evalDynamicWind(e, env)
+			case "guard":
+				return evalGuard(e, env)
+			case "with-exception-handler":
+				return evalWithExceptionHandler(e, env)
 			case "begin":
 				if len(e.Elems) < 2 {
 					return &VoidVal{}, nil
@@ -1786,6 +1795,14 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 	env.set("call/cc", &CallCCVal{})
 	env.set("call-with-current-continuation", &CallCCVal{})
 
+	// raise — signal an exception
+	env.set("raise", &BuiltinFunc{Name: "raise", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "raise: need 1 argument"}
+		}
+		panic(raisePanic{value: args[0]})
+	}})
+
 	// eq? — identity/simple equality
 	env.set("eq?", &BuiltinFunc{Name: "eq?", Fn: func(args []Value) (Value, error) {
 		if len(args) != 2 {
@@ -3146,6 +3163,11 @@ func evalDynamicWind(e *ListExpr, env *Env) (Value, error) {
 					escapePanic = r
 					return
 				}
+				if _, ok := r.(raisePanic); ok {
+					escaped = true
+					escapePanic = r
+					return
+				}
 				panic(r)
 			}
 		}()
@@ -3166,6 +3188,134 @@ func evalDynamicWind(e *ListExpr, env *Env) (Value, error) {
 	}
 
 	return result, bodyErr
+}
+
+// evalGuard implements (guard (var clause ...) body ...).
+func evalGuard(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Elems) < 3 {
+		return nil, &EvalError{Message: "guard: need clauses and body"}
+	}
+	clauseList, ok := e.Elems[1].(*ListExpr)
+	if !ok || len(clauseList.Elems) < 2 {
+		return nil, &EvalError{Message: "guard: need variable and at least one clause"}
+	}
+	varSym, ok := clauseList.Elems[0].(*SymbolExpr)
+	if !ok {
+		return nil, &EvalError{Message: "guard: expected variable name"}
+	}
+	clauses := clauseList.Elems[1:]
+	body := e.Elems[2:]
+
+	var result Value
+	var bodyErr error
+	var raised *raisePanic
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if rp, ok := r.(raisePanic); ok {
+					raised = &rp
+					return
+				}
+				panic(r)
+			}
+		}()
+		for _, bodyExpr := range body[:len(body)-1] {
+			if _, err := evalExpr(bodyExpr, env); err != nil {
+				bodyErr = err
+				return
+			}
+		}
+		result, bodyErr = evalExpr(body[len(body)-1], env)
+	}()
+
+	if bodyErr != nil {
+		return nil, bodyErr
+	}
+	if raised == nil {
+		return result, nil
+	}
+
+	// Exception caught — evaluate cond-like clauses
+	guardEnv := newEnv(env)
+	guardEnv.set(varSym.Name, raised.value)
+
+	for _, clause := range clauses {
+		cl, ok := clause.(*ListExpr)
+		if !ok || len(cl.Elems) < 1 {
+			return nil, &EvalError{Message: "guard: bad clause"}
+		}
+		if sym, ok := cl.Elems[0].(*SymbolExpr); ok && sym.Name == "else" {
+			var res Value
+			for _, expr := range cl.Elems[1:] {
+				var err error
+				res, err = evalExpr(expr, guardEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return res, nil
+		}
+		test, err := evalExpr(cl.Elems[0], guardEnv)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(test) {
+			if len(cl.Elems) == 1 {
+				return test, nil
+			}
+			var res Value
+			for _, expr := range cl.Elems[1:] {
+				res, err = evalExpr(expr, guardEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return res, nil
+		}
+	}
+	// No clause matched — re-raise
+	panic(raisePanic{value: raised.value})
+}
+
+// evalWithExceptionHandler implements (with-exception-handler handler thunk).
+func evalWithExceptionHandler(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Elems) != 3 {
+		return nil, &EvalError{Message: "with-exception-handler: need 2 arguments"}
+	}
+	handler, err := evalExpr(e.Elems[1], env)
+	if err != nil {
+		return nil, err
+	}
+	thunk, err := evalExpr(e.Elems[2], env)
+	if err != nil {
+		return nil, err
+	}
+
+	var result Value
+	var thunkErr error
+	var raised *raisePanic
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if rp, ok := r.(raisePanic); ok {
+					raised = &rp
+					return
+				}
+				panic(r)
+			}
+		}()
+		result, thunkErr = applyCallable(thunk, nil)
+	}()
+
+	if thunkErr != nil {
+		return nil, thunkErr
+	}
+	if raised != nil {
+		return applyCallable(handler, []Value{raised.value})
+	}
+	return result, nil
 }
 
 // EvalStr evaluates one or more Scheme expressions and returns the string
