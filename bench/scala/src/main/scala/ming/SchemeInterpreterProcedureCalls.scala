@@ -39,6 +39,8 @@ private[ming] object SchemeInterpreterProcedureCalls:
     cont: Resume,
     evalSequenceState: EvalSequenceState
   ): EvalState =
+    val runtime = SchemeInterpreter.currentRuntime
+
     value match
       case Value.Builtin(_, impl) =>
         cont(impl(args, pos))
@@ -58,18 +60,40 @@ private[ming] object SchemeInterpreterProcedureCalls:
         val procedure = args.head
         val lists     = args.tail.map(asList(_, "for-each", pos))
         evalForEachState(procedure, lists, pos, cont, evalSequenceState)
+      case Value.DynamicWindBuiltin =>
+        SchemeDynamicWind.applyState(
+          args,
+          pos,
+          cont,
+          runtime,
+          (procedure, callArgs, callPos, callCont) =>
+            applyProcedureState(procedure, callArgs, callPos, callCont, evalSequenceState)
+        )
       case Value.CallWithCurrentContinuation =>
         requireExactly("call/cc", args, expected = 1, pos)
         args match
           case procedure :: Nil =>
-            applyProcedureState(procedure, List(Value.Continuation(cont)), pos, cont, evalSequenceState)
+            applyProcedureState(
+              procedure,
+              List(SchemeDynamicWind.captureContinuation(cont, runtime)),
+              pos,
+              cont,
+              evalSequenceState
+            )
           case _ =>
             throw new IllegalStateException("unreachable")
       case continuation: Value.Continuation =>
         requireExactly("continuation", args, expected = 1, pos)
         args match
-          case argument :: Nil => continuation.resume(argument)
-          case _               => throw new IllegalStateException("unreachable")
+          case argument :: Nil =>
+            SchemeDynamicWind.resumeContinuationState(
+              continuation,
+              argument,
+              runtime,
+              (procedure, callArgs, callPos, callCont) =>
+                applyProcedureState(procedure, callArgs, callPos, callCont, evalSequenceState)
+            )
+          case _ => throw new IllegalStateException("unreachable")
       case Value.Closure(params, body, closureEnv, closureMacros) =>
         val prepared = SchemeProcedures.prepareUserProcedure(
           params,

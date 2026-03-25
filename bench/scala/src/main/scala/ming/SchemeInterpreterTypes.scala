@@ -22,6 +22,17 @@ private[ming] trait SchemeInterpreterTypes:
 
   private[ming] type Resume = Value => EvalState
 
+  final class DynamicWindFrame private[ming] (
+    val before: Value,
+    val after: Value,
+    val pos: SourcePos
+  )
+
+  object DynamicWindFrame:
+
+    def apply(before: Value, after: Value, pos: SourcePos): DynamicWindFrame =
+      new DynamicWindFrame(before, after, pos)
+
   object EvalState:
 
     final case class EvaluateExpr(
@@ -137,13 +148,20 @@ private[ming] trait SchemeInterpreterTypes:
     case object MapProcedureBuiltin                                                 extends Procedure
     case object ForEachProcedureBuiltin                                             extends Procedure
     case object CallWithCurrentContinuation                                         extends Procedure
+    case object DynamicWindBuiltin                                                  extends Procedure
 
-    final class Continuation private[ming] (val resume: Resume) extends Procedure
+    final class Continuation private[ming] (
+      val resume: Resume,
+      val windStack: scala.collection.immutable.Vector[DynamicWindFrame]
+    ) extends Procedure
 
     object Continuation:
 
-      def apply(resume: Resume): Continuation =
-        new Continuation(resume)
+      def apply(
+        resume: Resume,
+        windStack: scala.collection.immutable.Vector[DynamicWindFrame]
+      ): Continuation =
+        new Continuation(resume, windStack)
 
     final case class Closure(
       params: LambdaParams,

@@ -1,8 +1,11 @@
 package ming
 
+import scala.util.DynamicVariable
+
 private[ming] object SchemeInterpreter extends SchemeInterpreterTypes:
 
   private val halt: Resume = value => EvalState.Done(value)
+  private val runtimeVar   = new DynamicVariable[Option[Runtime]](None)
 
   def evalProgram(input: String): Value =
     runProgram(input)._1
@@ -17,16 +20,41 @@ private[ming] object SchemeInterpreter extends SchemeInterpreterTypes:
   def renderDisplay(value: Value): String =
     SchemeRendering.renderDisplay(value)
 
+  private[ming] def currentRuntime: Runtime =
+    runtimeVar.value.getOrElse {
+      throw new IllegalStateException("no active runtime")
+    }
+
+  private def withRuntime[A](runtime: Runtime)(body: => A): A =
+    runtimeVar.withValue(Some(runtime))(body)
+
+  private def withCurrentRuntime[A](body: Runtime => A): A =
+    runtimeVar.value match
+      case Some(runtime) =>
+        body(runtime)
+      case None =>
+        val runtime = Runtime()
+        withRuntime(runtime) {
+          body(runtime)
+        }
+
   private def runProgram(input: String): (Value, Runtime) =
     val expressions = SchemeReader.readAll(input)
     if expressions.isEmpty then throw EvalError.at(SourcePos(1, 1), "empty input")
     val runtime    = Runtime()
     val env        = SchemeRuntimeSupport.initialEnv(runtime)
     val macroScope = MacroScope.root()
-    (evalSequence(expressions, env, macroScope), runtime)
+    (
+      withRuntime(runtime) {
+        evalSequence(expressions, env, macroScope)
+      },
+      runtime
+    )
 
   private[ming] def evalSequence(expressions: List[Expr], env: Env, macros: MacroScope): Value =
-    runState(evalSequenceState(expressions, env, macros, halt))
+    withCurrentRuntime { _ =>
+      runState(evalSequenceState(expressions, env, macros, halt))
+    }
 
   private def runState(initialState: EvalState): Value =
     var state = initialState
@@ -220,4 +248,6 @@ private[ming] object SchemeInterpreter extends SchemeInterpreterTypes:
     SchemeInterpreterProcedureCalls.applyProcedureState(value, args, pos, cont, evalSequenceState)
 
   private[ming] def applyProcedure(value: Value, args: List[Value], pos: SourcePos): Value =
-    runState(applyProcedureState(value, args, pos, halt))
+    withCurrentRuntime { _ =>
+      runState(applyProcedureState(value, args, pos, halt))
+    }
