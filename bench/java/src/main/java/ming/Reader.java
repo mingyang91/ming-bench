@@ -55,6 +55,20 @@ public class Reader {
             pos++;
             var quoted = readExpr();
             result = new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quote"), quoted));
+        } else if (c == '`') {
+            pos++;
+            var quoted = readExpr();
+            result = new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quasiquote"), quoted));
+        } else if (c == ',') {
+            pos++;
+            if (pos < input.length() && input.charAt(pos) == '@') {
+                pos++;
+                var quoted = readExpr();
+                result = new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("unquote-splicing"), quoted));
+            } else {
+                var quoted = readExpr();
+                result = new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("unquote"), quoted));
+            }
         } else {
             result = readAtom();
         }
@@ -130,6 +144,13 @@ public class Reader {
         } else if (next == 'f') {
             pos += 2;
             return new SchemeValue.BoolVal(false);
+        } else if (next == '(') {
+            pos++; // skip '#', readList will skip '('
+            var list = readList();
+            if (list instanceof SchemeValue.ListVal lv) {
+                return new SchemeValue.VectorVal(lv.elements().toArray(new SchemeValue[0]));
+            }
+            throw new EvalError("invalid vector literal");
         } else if (next == '\'') {
             pos += 2; // skip #'
             var expr = readExpr();

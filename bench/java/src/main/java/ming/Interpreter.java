@@ -1080,6 +1080,7 @@ public class Interpreter {
                 case "define-record-type" -> { cekReturn(evalDefineRecordType(list.elements(), env), k); return; }
                 case "if" -> { stepIf(list.elements(), env, k); return; }
                 case "quote" -> { cekReturn(evalQuote(list.elements()), k); return; }
+                case "quasiquote" -> { stepQuasiquote(list.elements(), env, k); return; }
                 case "lambda" -> { cekReturn(evalLambda(list.elements(), env), k); return; }
                 case "case-lambda" -> { cekReturn(evalCaseLambda(list.elements(), env), k); return; }
                 case "and" -> { stepAnd(list.elements(), 1, env, k); return; }
@@ -1407,10 +1408,22 @@ public class Interpreter {
             return;
         }
         var clauseBody = cl.elements().subList(1, cl.elements().size());
+        // Check for => syntax: (test => proc)
+        boolean hasArrow = clauseBody.size() == 2
+            && clauseBody.get(0) instanceof SchemeValue.SymbolVal arrow
+            && arrow.name().equals("=>");
         cekEval(test, env, new Cont.Frame(testVal -> {
             if (testVal.isTruthy()) {
-                if (clauseBody.isEmpty()) cekReturn(testVal, k);
-                else setupSequence(clauseBody, 0, env, k);
+                if (hasArrow) {
+                    // (test => proc): evaluate proc then apply it to test value
+                    cekEval(clauseBody.get(1), env, new Cont.Frame(proc -> {
+                        applyProcCek(proc, new SchemeValue[]{testVal}, k);
+                    }));
+                } else if (clauseBody.isEmpty()) {
+                    cekReturn(testVal, k);
+                } else {
+                    setupSequence(clauseBody, 0, env, k);
+                }
             } else {
                 stepCond(elements, index + 1, env, k);
             }
@@ -1860,6 +1873,111 @@ public class Interpreter {
     }
 
     // ---- Lambda/quote parsing (no sub-expression evaluation) ----
+
+    private void stepQuasiquote(List<SchemeValue> elements, Environment env, Cont k) throws EvalError {
+        if (elements.size() != 2) throw new EvalError("quasiquote: expected 1 argument");
+        var result = expandQuasiquote(elements.get(1), env, 0);
+        cekReturn(result, k);
+    }
+
+    private SchemeValue expandQuasiquote(SchemeValue template, Environment env, int depth) throws EvalError {
+        if (template instanceof SchemeValue.ListVal list) {
+            var elems = list.elements();
+            if (!elems.isEmpty() && elems.get(0) instanceof SchemeValue.SymbolVal sym) {
+                if (sym.name().equals("unquote")) {
+                    if (elems.size() != 2) throw new EvalError("unquote: expected 1 argument");
+                    if (depth == 0) {
+                        return eval(elems.get(1), env);
+                    } else {
+                        var expanded = expandQuasiquote(elems.get(1), env, depth - 1);
+                        return new SchemeValue.PairVal(
+                            new SchemeValue.SymbolVal("unquote"),
+                            new SchemeValue.PairVal(expanded, NIL));
+                    }
+                }
+                if (sym.name().equals("unquote-splicing")) {
+                    if (depth == 0) {
+                        throw new EvalError("unquote-splicing: not in list context");
+                    } else {
+                        if (elems.size() != 2) throw new EvalError("unquote-splicing: expected 1 argument");
+                        var expanded = expandQuasiquote(elems.get(1), env, depth - 1);
+                        return new SchemeValue.PairVal(
+                            new SchemeValue.SymbolVal("unquote-splicing"),
+                            new SchemeValue.PairVal(expanded, NIL));
+                    }
+                }
+                if (sym.name().equals("quasiquote")) {
+                    if (elems.size() != 2) throw new EvalError("quasiquote: expected 1 argument");
+                    var expanded = expandQuasiquote(elems.get(1), env, depth + 1);
+                    return new SchemeValue.PairVal(
+                        new SchemeValue.SymbolVal("quasiquote"),
+                        new SchemeValue.PairVal(expanded, NIL));
+                }
+            }
+            // Process list elements, handling unquote-splicing
+            return expandQuasiquoteList(elems, env, depth);
+        }
+        if (template instanceof SchemeValue.PairVal pair) {
+            // Check if car is (unquote x) at depth 0
+            var car = pair.car();
+            if (car instanceof SchemeValue.ListVal carList && !carList.elements().isEmpty()
+                && carList.elements().get(0) instanceof SchemeValue.SymbolVal sym
+                && sym.name().equals("unquote-splicing") && depth == 0) {
+                if (carList.elements().size() != 2) throw new EvalError("unquote-splicing: expected 1 argument");
+                var spliced = eval(carList.elements().get(1), env);
+                var cdrExpanded = expandQuasiquote(pair.cdr(), env, depth);
+                return appendValues(spliced, cdrExpanded);
+            }
+            var expandedCar = expandQuasiquote(car, env, depth);
+            var expandedCdr = expandQuasiquote(pair.cdr(), env, depth);
+            return new SchemeValue.PairVal(expandedCar, expandedCdr);
+        }
+        if (template instanceof SchemeValue.VectorVal vec) {
+            var resultElements = new ArrayList<SchemeValue>();
+            for (var elem : vec.elements()) {
+                if (elem instanceof SchemeValue.ListVal el && !el.elements().isEmpty()
+                    && el.elements().get(0) instanceof SchemeValue.SymbolVal sym
+                    && sym.name().equals("unquote-splicing") && depth == 0) {
+                    if (el.elements().size() != 2) throw new EvalError("unquote-splicing: expected 1 argument");
+                    var spliced = eval(el.elements().get(1), env);
+                    var cur = spliced;
+                    while (cur instanceof SchemeValue.PairVal p) {
+                        resultElements.add(p.car());
+                        cur = p.cdr();
+                    }
+                } else {
+                    resultElements.add(expandQuasiquote(elem, env, depth));
+                }
+            }
+            return new SchemeValue.VectorVal(resultElements.toArray(new SchemeValue[0]));
+        }
+        // Atoms are returned as-is (quoted)
+        return template;
+    }
+
+    private SchemeValue expandQuasiquoteList(List<SchemeValue> elems, Environment env, int depth) throws EvalError {
+        SchemeValue result = NIL;
+        for (int i = elems.size() - 1; i >= 0; i--) {
+            var elem = elems.get(i);
+            if (elem instanceof SchemeValue.ListVal el && !el.elements().isEmpty()
+                && el.elements().get(0) instanceof SchemeValue.SymbolVal sym
+                && sym.name().equals("unquote-splicing") && depth == 0) {
+                if (el.elements().size() != 2) throw new EvalError("unquote-splicing: expected 1 argument");
+                var spliced = eval(el.elements().get(1), env);
+                result = appendValues(spliced, result);
+            } else {
+                result = new SchemeValue.PairVal(expandQuasiquote(elem, env, depth), result);
+            }
+        }
+        return result;
+    }
+
+    private SchemeValue appendValues(SchemeValue list, SchemeValue tail) {
+        if (list instanceof SchemeValue.PairVal p) {
+            return new SchemeValue.PairVal(p.car(), appendValues(p.cdr(), tail));
+        }
+        return tail; // list is nil
+    }
 
     private SchemeValue evalQuote(List<SchemeValue> elements) throws EvalError {
         if (elements.size() != 2) throw new EvalError("quote: expected 1 argument");
