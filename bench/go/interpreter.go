@@ -89,14 +89,14 @@ const (
 )
 
 type token struct {
-	kind    tokenKind
-	text    string
-	number  int64
+	kind     tokenKind
+	text     string
+	number   int64
 	rational rationalValue
-	inexact inexactValue
-	boolean bool
-	char    rune
-	at      position
+	inexact  inexactValue
+	boolean  bool
+	char     rune
+	at       position
 }
 
 type lexer struct {
@@ -681,6 +681,13 @@ func (it *interpreter) installBuiltins() {
 	it.defineName(it.global, "list-tail", &builtinProc{name: "list-tail", fn: builtinListTail})
 	it.defineName(it.global, "assoc", &builtinProc{name: "assoc", fn: builtinAssoc})
 	it.defineName(it.global, "map", &builtinProc{name: "map", fn: builtinMap})
+	it.defineName(it.global, "vector", &builtinProc{name: "vector", fn: builtinVector})
+	it.defineName(it.global, "make-vector", &builtinProc{name: "make-vector", fn: builtinMakeVector})
+	it.defineName(it.global, "vector?", &builtinProc{name: "vector?", fn: builtinVectorPred})
+	it.defineName(it.global, "vector-length", &builtinProc{name: "vector-length", fn: builtinVectorLength})
+	it.defineName(it.global, "vector-ref", &builtinProc{name: "vector-ref", fn: builtinVectorRef})
+	it.defineName(it.global, "vector-set!", &builtinProc{name: "vector-set!", fn: builtinVectorSet})
+	it.defineName(it.global, "vector->list", &builtinProc{name: "vector->list", fn: builtinVectorToList})
 }
 
 func (it *interpreter) evalProgram(exprs []expr) (value, error) {
@@ -721,6 +728,9 @@ func (it *interpreter) eval(node expr, scope *env) (value, error) {
 		value, ok := it.lookupSymbol(scope, expr)
 		if !ok {
 			return nil, newEvalError(ErrUnboundVariable, fmt.Sprintf("unbound variable: %s", expr.name), expr.at)
+		}
+		if pending, ok := value.(*uninitializedValue); ok {
+			return nil, newEvalError(ErrUnboundVariable, fmt.Sprintf("uninitialized variable: %s", pending.name), expr.at)
 		}
 		if _, isMacro := value.(*syntaxRuleMacro); isMacro {
 			return nil, newEvalError(ErrSyntax, fmt.Sprintf("cannot use syntax as value: %s", expr.name), expr.at)
@@ -766,6 +776,14 @@ func (it *interpreter) evalList(list *listExpr, scope *env) (value, error) {
 			return it.evalCond(scope, list)
 		case "let":
 			return it.evalLet(scope, list)
+		case "letrec":
+			return it.evalLetRec(scope, list, false)
+		case "letrec*":
+			return it.evalLetRec(scope, list, true)
+		case "case":
+			return it.evalCase(scope, list)
+		case "do":
+			return it.evalDo(scope, list)
 		}
 
 		if expanded, ok, err := it.expandMacroCall(list, scope); ok || err != nil {
@@ -1789,6 +1807,8 @@ func formatValue(v value) (string, error) {
 		return "()", nil
 	case *pairValue:
 		return formatPair(value)
+	case *vectorValue:
+		return formatVector(value)
 	case *builtinProc, *closureProc, *caseLambdaProc:
 		return "#<procedure>", nil
 	case *recordValue:
@@ -1808,6 +1828,8 @@ func formatDisplayValue(v value) (string, error) {
 		return string(rune(value)), nil
 	case *pairValue:
 		return formatPairWith(value, formatDisplayValue)
+	case *vectorValue:
+		return formatVectorWith(value, formatDisplayValue)
 	default:
 		return formatValue(v)
 	}
@@ -1826,6 +1848,10 @@ func formatChar(ch rune) string {
 
 func formatPair(pair *pairValue) (string, error) {
 	return formatPairWith(pair, formatValue)
+}
+
+func formatVector(vec *vectorValue) (string, error) {
+	return formatVectorWith(vec, formatValue)
 }
 
 func formatPairWith(pair *pairValue, formatter func(value) (string, error)) (string, error) {
@@ -1851,4 +1877,16 @@ func formatPairWith(pair *pairValue, formatter func(value) (string, error)) (str
 			return "(" + strings.Join(parts, " ") + " . " + tail + ")", nil
 		}
 	}
+}
+
+func formatVectorWith(vec *vectorValue, formatter func(value) (string, error)) (string, error) {
+	parts := make([]string, 0, len(vec.elements))
+	for _, element := range vec.elements {
+		formatted, err := formatter(element)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, formatted)
+	}
+	return "#(" + strings.Join(parts, " ") + ")", nil
 }

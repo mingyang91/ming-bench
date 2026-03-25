@@ -503,6 +503,9 @@ func eqValue(left value, right value) bool {
 	case *recordValue:
 		right, ok := right.(*recordValue)
 		return ok && left == right
+	case *vectorValue:
+		right, ok := right.(*vectorValue)
+		return ok && left == right
 	case voidValue:
 		_, ok := right.(voidValue)
 		return ok
@@ -538,6 +541,17 @@ func deepEqual(left value, right value) bool {
 	case *pairValue:
 		right, ok := right.(*pairValue)
 		return ok && deepEqual(left.car, right.car) && deepEqual(left.cdr, right.cdr)
+	case *vectorValue:
+		right, ok := right.(*vectorValue)
+		if !ok || len(left.elements) != len(right.elements) {
+			return false
+		}
+		for i, element := range left.elements {
+			if !deepEqual(element, right.elements[i]) {
+				return false
+			}
+		}
+		return true
 	default:
 		return eqValue(left, right)
 	}
