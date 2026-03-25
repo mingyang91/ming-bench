@@ -81,231 +81,11 @@ public class Evaluator {
     private StringBuilder outputBuffer = new StringBuilder();
 
     public Evaluator() {
-        globalEnv.define("+", new Builtin("+", args -> {
-            long sum = 0;
-            for (Object a : args) sum += requireLong(a);
-            return sum;
-        }));
-        globalEnv.define("-", new Builtin("-", args -> {
-            if (args.isEmpty()) throw new EvalError("- requires at least 1 argument");
-            if (args.size() == 1) return -requireLong(args.get(0));
-            long result = requireLong(args.get(0));
-            for (int i = 1; i < args.size(); i++) result -= requireLong(args.get(i));
-            return result;
-        }));
-        globalEnv.define("*", new Builtin("*", args -> {
-            long product = 1;
-            for (Object a : args) product *= requireLong(a);
-            return product;
-        }));
-        globalEnv.define("/", new Builtin("/", args -> {
-            if (args.size() < 2) throw new EvalError("/ requires at least 2 arguments");
-            long result = requireLong(args.get(0));
-            for (int i = 1; i < args.size(); i++) {
-                long divisor = requireLong(args.get(i));
-                if (divisor == 0) throw new EvalError("division by zero");
-                result /= divisor;
-            }
-            return result;
-        }));
-        globalEnv.define("<", new Builtin("<", args -> {
-            requireArgCount(args, 2, "<");
-            return requireLong(args.get(0)) < requireLong(args.get(1));
-        }));
-        globalEnv.define(">", new Builtin(">", args -> {
-            requireArgCount(args, 2, ">");
-            return requireLong(args.get(0)) > requireLong(args.get(1));
-        }));
-        globalEnv.define("=", new Builtin("=", args -> {
-            requireArgCount(args, 2, "=");
-            return requireLong(args.get(0)) == requireLong(args.get(1));
-        }));
-        globalEnv.define("<=", new Builtin("<=", args -> {
-            requireArgCount(args, 2, "<=");
-            return requireLong(args.get(0)) <= requireLong(args.get(1));
-        }));
-        globalEnv.define(">=", new Builtin(">=", args -> {
-            requireArgCount(args, 2, ">=");
-            return requireLong(args.get(0)) >= requireLong(args.get(1));
-        }));
-        globalEnv.define("not", new Builtin("not", args -> {
-            requireArgCount(args, 1, "not");
-            return isFalse(args.get(0));
-        }));
-        globalEnv.define("cons", new Builtin("cons", args -> {
-            requireArgCount(args, 2, "cons");
-            return new Cons(args.get(0), args.get(1));
-        }));
-        globalEnv.define("car", new Builtin("car", args -> {
-            requireArgCount(args, 1, "car");
-            if (!(args.get(0) instanceof Cons c)) throw new EvalError("car: not a pair");
-            return c.car;
-        }));
-        globalEnv.define("cdr", new Builtin("cdr", args -> {
-            requireArgCount(args, 1, "cdr");
-            if (!(args.get(0) instanceof Cons c)) throw new EvalError("cdr: not a pair");
-            return c.cdr;
-        }));
-        globalEnv.define("null?", new Builtin("null?", args -> {
-            requireArgCount(args, 1, "null?");
-            return args.get(0) == NIL;
-        }));
-        globalEnv.define("list", new Builtin("list", args -> {
-            Object result = NIL;
-            for (int i = args.size() - 1; i >= 0; i--) {
-                result = new Cons(args.get(i), result);
-            }
-            return result;
-        }));
-        globalEnv.define("length", new Builtin("length", args -> {
-            requireArgCount(args, 1, "length");
-            long count = 0;
-            Object cur = args.get(0);
-            while (cur instanceof Cons c) {
-                count++;
-                cur = c.cdr;
-            }
-            if (cur != NIL) throw new EvalError("length: not a proper list");
-            return count;
-        }));
-        globalEnv.define("append", new Builtin("append", args -> {
-            if (args.isEmpty()) return NIL;
-            if (args.size() == 1) return args.get(0);
-            // Build result right-to-left
-            Object result = args.get(args.size() - 1);
-            for (int i = args.size() - 2; i >= 0; i--) {
-                Object lst = args.get(i);
-                // Collect elements of lst, then prepend to result
-                List<Object> elems = new ArrayList<>();
-                Object cur = lst;
-                while (cur instanceof Cons c) {
-                    elems.add(c.car);
-                    cur = c.cdr;
-                }
-                for (int j = elems.size() - 1; j >= 0; j--) {
-                    result = new Cons(elems.get(j), result);
-                }
-            }
-            return result;
-        }));
-        globalEnv.define("number?", new Builtin("number?", args -> {
-            requireArgCount(args, 1, "number?");
-            return args.get(0) instanceof Long;
-        }));
-        globalEnv.define("string?", new Builtin("string?", args -> {
-            requireArgCount(args, 1, "string?");
-            return args.get(0) instanceof SchemeString;
-        }));
-        globalEnv.define("boolean?", new Builtin("boolean?", args -> {
-            requireArgCount(args, 1, "boolean?");
-            return args.get(0) instanceof Boolean;
-        }));
-        globalEnv.define("pair?", new Builtin("pair?", args -> {
-            requireArgCount(args, 1, "pair?");
-            return args.get(0) instanceof Cons;
-        }));
-        globalEnv.define("symbol?", new Builtin("symbol?", args -> {
-            requireArgCount(args, 1, "symbol?");
-            return args.get(0) instanceof String;
-        }));
-        globalEnv.define("char?", new Builtin("char?", args -> {
-            requireArgCount(args, 1, "char?");
-            return args.get(0) instanceof SchemeChar;
-        }));
-        globalEnv.define("display", new Builtin("display", args -> {
-            requireArgCount(args, 1, "display");
-            outputBuffer.append(displayString(args.get(0)));
-            return VOID;
-        }));
-        globalEnv.define("write", new Builtin("write", args -> {
-            requireArgCount(args, 1, "write");
-            outputBuffer.append(schemeToString(args.get(0)));
-            return VOID;
-        }));
-        globalEnv.define("newline", new Builtin("newline", args -> {
-            requireArgCount(args, 0, "newline");
-            outputBuffer.append("\n");
-            return VOID;
-        }));
-        globalEnv.define("string-append", new Builtin("string-append", args -> {
-            StringBuilder sb = new StringBuilder();
-            for (Object a : args) {
-                if (!(a instanceof SchemeString s)) throw new EvalError("string-append: not a string");
-                sb.append(s.value());
-            }
-            return new SchemeString(sb.toString());
-        }));
-        globalEnv.define("string-length", new Builtin("string-length", args -> {
-            requireArgCount(args, 1, "string-length");
-            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-length: not a string");
-            return (long) s.value().length();
-        }));
-        globalEnv.define("substring", new Builtin("substring", args -> {
-            requireArgCount(args, 3, "substring");
-            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("substring: not a string");
-            int start = (int) requireLong(args.get(1));
-            int end = (int) requireLong(args.get(2));
-            return new SchemeString(s.value().substring(start, end));
-        }));
-        globalEnv.define("string->number", new Builtin("string->number", args -> {
-            requireArgCount(args, 1, "string->number");
-            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string->number: not a string");
-            try {
-                return Long.parseLong(s.value());
-            } catch (NumberFormatException e) {
-                return Boolean.FALSE;
-            }
-        }));
-        globalEnv.define("number->string", new Builtin("number->string", args -> {
-            requireArgCount(args, 1, "number->string");
-            return new SchemeString(String.valueOf(requireLong(args.get(0))));
-        }));
-        globalEnv.define("string-ref", new Builtin("string-ref", args -> {
-            requireArgCount(args, 2, "string-ref");
-            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-ref: not a string");
-            int idx = (int) requireLong(args.get(1));
-            return new SchemeChar(s.value().charAt(idx));
-        }));
-        globalEnv.define("symbol->string", new Builtin("symbol->string", args -> {
-            requireArgCount(args, 1, "symbol->string");
-            if (!(args.get(0) instanceof String s)) throw new EvalError("symbol->string: not a symbol");
-            return new SchemeString(s);
-        }));
-        globalEnv.define("string->symbol", new Builtin("string->symbol", args -> {
-            requireArgCount(args, 1, "string->symbol");
-            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string->symbol: not a string");
-            return s.value();
-        }));
-        globalEnv.define("string-copy", new Builtin("string-copy", args -> {
-            requireArgCount(args, 1, "string-copy");
-            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-copy: not a string");
-            return new SchemeString(s.value().toCharArray());
-        }));
-        globalEnv.define("string-set!", new Builtin("string-set!", args -> {
-            requireArgCount(args, 3, "string-set!");
-            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-set!: not a string");
-            int idx = (int) requireLong(args.get(1));
-            if (!(args.get(2) instanceof SchemeChar c)) throw new EvalError("string-set!: not a character");
-            s.setChar(idx, c.value());
-            return VOID;
-        }));
-        globalEnv.define("apply", new Builtin("apply", args -> {
-            if (args.size() < 2) throw new EvalError("apply requires at least 2 arguments");
-            Object proc = args.get(0);
-            // Last arg must be a list; prefix args are prepended
-            Object lastArg = args.get(args.size() - 1);
-            List<Object> callArgs = new ArrayList<>();
-            for (int i = 1; i < args.size() - 1; i++) {
-                callArgs.add(args.get(i));
-            }
-            // Unpack the last argument (a scheme list) into callArgs
-            Object cur = lastArg;
-            while (cur instanceof Cons c) {
-                callArgs.add(c.car);
-                cur = c.cdr;
-            }
-            return applyProc(proc, callArgs, null);
-        }));
+        new Builtins(globalEnv, this).registerAll();
+    }
+
+    void appendOutput(String s) {
+        outputBuffer.append(s);
     }
 
     public String evalStr(String input) throws EvalError {
@@ -717,11 +497,25 @@ public class Evaluator {
         throw new EvalError("cannot eval: " + expr);
     }
 
-    private boolean isFalse(Object val) {
+    boolean isFalse(Object val) {
         return val instanceof Boolean b && !b;
     }
 
-    private Object applyProc(Object proc, List<Object> args, Pos pos) throws EvalError {
+    boolean schemeEqual(Object a, Object b) {
+        if (a == b) return true;
+        if (a instanceof Long la && b instanceof Long lb) return la.equals(lb);
+        if (a instanceof Boolean ba && b instanceof Boolean bb) return ba.equals(bb);
+        if (a instanceof String sa && b instanceof String sb) return sa.equals(sb);
+        if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
+        if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
+        if (a == NIL && b == NIL) return true;
+        if (a instanceof Cons ca && b instanceof Cons cb) {
+            return schemeEqual(ca.car, cb.car) && schemeEqual(ca.cdr, cb.cdr);
+        }
+        return false;
+    }
+
+    Object applyProc(Object proc, List<Object> args, Pos pos) throws EvalError {
         if (proc instanceof Builtin b) {
             try {
                 return b.apply(args);
@@ -762,12 +556,12 @@ public class Evaluator {
         throw new EvalError("not a procedure: " + schemeToString(proc) + posStr(pos));
     }
 
-    private long requireLong(Object val) throws EvalError {
+    long requireLong(Object val) throws EvalError {
         if (val instanceof Long l) return l;
         throw new EvalError("expected number, got: " + schemeToString(val));
     }
 
-    private void requireArgCount(List<Object> args, int n, String name) throws EvalError {
+    void requireArgCount(List<Object> args, int n, String name) throws EvalError {
         if (args.size() != n) {
             throw new EvalError(name + " requires " + n + " arguments, got " + args.size());
         }
@@ -789,12 +583,12 @@ public class Evaluator {
 
     // --- Output formatting ---
 
-    private String displayString(Object val) {
+    String displayString(Object val) {
         if (val instanceof SchemeString s) return s.value();
         return schemeToString(val);
     }
 
-    private String schemeToString(Object val) {
+    String schemeToString(Object val) {
         if (val == NIL) return "()";
         if (val instanceof Long l) return l.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
