@@ -16,8 +16,9 @@ type listNode struct {
 }
 
 type symbolNode struct {
-	name string
-	pos  sourcePos
+	name     string
+	pos      sourcePos
+	captured *binding
 }
 
 type value interface{}
@@ -62,6 +63,7 @@ type binding struct {
 type environment struct {
 	parent *environment
 	values map[string]*binding
+	macros map[string]*syntaxRulesMacro
 }
 
 func evalString(input string) (string, error) {
@@ -185,6 +187,7 @@ func newEnvironment(parent *environment) *environment {
 	return &environment{
 		parent: parent,
 		values: map[string]*binding{},
+		macros: map[string]*syntaxRulesMacro{},
 	}
 }
 
@@ -220,10 +223,19 @@ func (e *environment) set(name string, val value) bool {
 }
 
 func eval(expr node, env *environment) (value, error) {
+	expanded, err := expandMacros(expr, env)
+	if err != nil {
+		return nil, err
+	}
+
+	expr = expanded
 	switch expr := expr.(type) {
 	case integerValue, booleanValue, stringValue, charValue:
 		return expr, nil
 	case symbolNode:
+		if expr.captured != nil {
+			return expr.captured.value, nil
+		}
 		val, ok := env.lookup(expr.name)
 		if !ok {
 			return nil, errorAt(expr.pos, "unbound variable: %s", expr.name)
@@ -251,6 +263,9 @@ func evalList(list listNode, env *environment) (value, error) {
 			return result, withErrorPos(err, list.pos)
 		case "define":
 			result, err := evalDefine(list.elements[1:], env)
+			return result, withErrorPos(err, list.pos)
+		case "define-syntax":
+			result, err := evalDefineSyntax(list.elements[1:], env)
 			return result, withErrorPos(err, list.pos)
 		case "set!":
 			result, err := evalSet(list.elements[1:], env)
@@ -380,6 +395,11 @@ func evalSet(args []node, env *environment) (value, error) {
 	val, err := eval(args[1], env)
 	if err != nil {
 		return nil, err
+	}
+
+	if target.captured != nil {
+		target.captured.value = val
+		return voidValue{}, nil
 	}
 
 	if !env.set(target.name, val) {
