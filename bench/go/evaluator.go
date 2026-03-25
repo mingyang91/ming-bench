@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // Env is a variable environment with lexical scoping.
@@ -895,6 +896,498 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 		return &BoolVal{Val: ok}, nil
 	}})
 
+	// eq? — identity/simple equality
+	env.set("eq?", &BuiltinFunc{Name: "eq?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "eq?: need 2 arguments"}
+		}
+		return &BoolVal{Val: schemeEq(args[0], args[1])}, nil
+	}})
+
+	// equal? — deep structural equality
+	env.set("equal?", &BuiltinFunc{Name: "equal?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "equal?: need 2 arguments"}
+		}
+		return &BoolVal{Val: schemeEqual(args[0], args[1])}, nil
+	}})
+
+	// Numeric utilities
+	env.set("abs", &BuiltinFunc{Name: "abs", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "abs: need 1 argument"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "abs: not a number"}
+		}
+		v := n.Val
+		if v < 0 {
+			v = -v
+		}
+		return &IntVal{Val: v}, nil
+	}})
+
+	env.set("modulo", &BuiltinFunc{Name: "modulo", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "modulo: need 2 arguments"}
+		}
+		a, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "modulo: not a number"}
+		}
+		b, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "modulo: not a number"}
+		}
+		if b.Val == 0 {
+			return nil, &EvalError{Message: "modulo: division by zero"}
+		}
+		r := a.Val % b.Val
+		if r != 0 && (r > 0) != (b.Val > 0) {
+			r += b.Val
+		}
+		return &IntVal{Val: r}, nil
+	}})
+
+	env.set("remainder", &BuiltinFunc{Name: "remainder", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "remainder: need 2 arguments"}
+		}
+		a, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "remainder: not a number"}
+		}
+		b, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "remainder: not a number"}
+		}
+		if b.Val == 0 {
+			return nil, &EvalError{Message: "remainder: division by zero"}
+		}
+		return &IntVal{Val: a.Val % b.Val}, nil
+	}})
+
+	env.set("quotient", &BuiltinFunc{Name: "quotient", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "quotient: need 2 arguments"}
+		}
+		a, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "quotient: not a number"}
+		}
+		b, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "quotient: not a number"}
+		}
+		if b.Val == 0 {
+			return nil, &EvalError{Message: "quotient: division by zero"}
+		}
+		return &IntVal{Val: a.Val / b.Val}, nil
+	}})
+
+	env.set("min", &BuiltinFunc{Name: "min", Fn: func(args []Value) (Value, error) {
+		if len(args) == 0 {
+			return nil, &EvalError{Message: "min: need at least 1 argument"}
+		}
+		first, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "min: not a number"}
+		}
+		result := first.Val
+		for _, a := range args[1:] {
+			n, ok := a.(*IntVal)
+			if !ok {
+				return nil, &EvalError{Message: "min: not a number"}
+			}
+			if n.Val < result {
+				result = n.Val
+			}
+		}
+		return &IntVal{Val: result}, nil
+	}})
+
+	env.set("max", &BuiltinFunc{Name: "max", Fn: func(args []Value) (Value, error) {
+		if len(args) == 0 {
+			return nil, &EvalError{Message: "max: need at least 1 argument"}
+		}
+		first, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "max: not a number"}
+		}
+		result := first.Val
+		for _, a := range args[1:] {
+			n, ok := a.(*IntVal)
+			if !ok {
+				return nil, &EvalError{Message: "max: not a number"}
+			}
+			if n.Val > result {
+				result = n.Val
+			}
+		}
+		return &IntVal{Val: result}, nil
+	}})
+
+	env.set("expt", &BuiltinFunc{Name: "expt", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "expt: need 2 arguments"}
+		}
+		base, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "expt: not a number"}
+		}
+		exp, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "expt: not a number"}
+		}
+		var result int64 = 1
+		b := base.Val
+		e := exp.Val
+		if e < 0 {
+			return &IntVal{Val: 0}, nil
+		}
+		for e > 0 {
+			if e%2 == 1 {
+				result *= b
+			}
+			b *= b
+			e /= 2
+		}
+		return &IntVal{Val: result}, nil
+	}})
+
+	env.set("zero?", &BuiltinFunc{Name: "zero?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "zero?: need 1 argument"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "zero?: not a number"}
+		}
+		return &BoolVal{Val: n.Val == 0}, nil
+	}})
+
+	env.set("positive?", &BuiltinFunc{Name: "positive?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "positive?: need 1 argument"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "positive?: not a number"}
+		}
+		return &BoolVal{Val: n.Val > 0}, nil
+	}})
+
+	env.set("negative?", &BuiltinFunc{Name: "negative?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "negative?: need 1 argument"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "negative?: not a number"}
+		}
+		return &BoolVal{Val: n.Val < 0}, nil
+	}})
+
+	env.set("odd?", &BuiltinFunc{Name: "odd?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "odd?: need 1 argument"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "odd?: not a number"}
+		}
+		return &BoolVal{Val: n.Val%2 != 0}, nil
+	}})
+
+	env.set("even?", &BuiltinFunc{Name: "even?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "even?: need 1 argument"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "even?: not a number"}
+		}
+		return &BoolVal{Val: n.Val%2 == 0}, nil
+	}})
+
+	// List utilities
+	env.set("list-ref", &BuiltinFunc{Name: "list-ref", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "list-ref: need 2 arguments"}
+		}
+		idx, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "list-ref: index not a number"}
+		}
+		cur := args[0]
+		for i := int64(0); i < idx.Val; i++ {
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "list-ref: index out of range"}
+			}
+			cur = p.Cdr
+		}
+		p, ok := cur.(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "list-ref: index out of range"}
+		}
+		return p.Car, nil
+	}})
+
+	env.set("list-tail", &BuiltinFunc{Name: "list-tail", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "list-tail: need 2 arguments"}
+		}
+		idx, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "list-tail: index not a number"}
+		}
+		cur := args[0]
+		for i := int64(0); i < idx.Val; i++ {
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "list-tail: index out of range"}
+			}
+			cur = p.Cdr
+		}
+		return cur, nil
+	}})
+
+	env.set("list?", &BuiltinFunc{Name: "list?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "list?: need 1 argument"}
+		}
+		cur := args[0]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				return &BoolVal{Val: true}, nil
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return &BoolVal{Val: false}, nil
+			}
+			cur = p.Cdr
+		}
+	}})
+
+	env.set("assoc", &BuiltinFunc{Name: "assoc", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "assoc: need 2 arguments"}
+		}
+		key := args[0]
+		cur := args[1]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				return &BoolVal{Val: false}, nil
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "assoc: not a proper list"}
+			}
+			entry, ok := p.Car.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "assoc: entry is not a pair"}
+			}
+			if schemeEqual(key, entry.Car) {
+				return p.Car, nil
+			}
+			cur = p.Cdr
+		}
+	}})
+
+	// Built-in map with multiple list support
+	env.set("map", &BuiltinFunc{Name: "map", Fn: func(args []Value) (Value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: "map: need at least 2 arguments"}
+		}
+		fn := args[0]
+		lists := args[1:]
+		var result []Value
+		for {
+			// Check if any list is exhausted
+			callArgs := make([]Value, len(lists))
+			done := false
+			for i, l := range lists {
+				if _, ok := l.(*NilVal); ok {
+					done = true
+					break
+				}
+				p, ok := l.(*PairVal)
+				if !ok {
+					return nil, &EvalError{Message: "map: not a proper list"}
+				}
+				callArgs[i] = p.Car
+				lists[i] = p.Cdr
+			}
+			if done {
+				break
+			}
+			var val Value
+			var err error
+			switch f := fn.(type) {
+			case *BuiltinFunc:
+				val, err = f.Fn(callArgs)
+			case *LambdaVal:
+				val, err = applyLambda(f, callArgs)
+			default:
+				return nil, &EvalError{Message: "map: first argument must be a procedure"}
+			}
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, val)
+		}
+		var list Value = &NilVal{}
+		for i := len(result) - 1; i >= 0; i-- {
+			list = &PairVal{Car: result[i], Cdr: list}
+		}
+		return list, nil
+	}})
+
+	// Character operations
+	env.set("char-alphabetic?", &BuiltinFunc{Name: "char-alphabetic?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "char-alphabetic?: need 1 argument"}
+		}
+		c, ok := args[0].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char-alphabetic?: not a character"}
+		}
+		return &BoolVal{Val: unicode.IsLetter(c.Val)}, nil
+	}})
+
+	env.set("char-numeric?", &BuiltinFunc{Name: "char-numeric?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "char-numeric?: need 1 argument"}
+		}
+		c, ok := args[0].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char-numeric?: not a character"}
+		}
+		return &BoolVal{Val: unicode.IsDigit(c.Val)}, nil
+	}})
+
+	env.set("char-upcase", &BuiltinFunc{Name: "char-upcase", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "char-upcase: need 1 argument"}
+		}
+		c, ok := args[0].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char-upcase: not a character"}
+		}
+		return &CharVal{Val: unicode.ToUpper(c.Val)}, nil
+	}})
+
+	env.set("char-downcase", &BuiltinFunc{Name: "char-downcase", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "char-downcase: need 1 argument"}
+		}
+		c, ok := args[0].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char-downcase: not a character"}
+		}
+		return &CharVal{Val: unicode.ToLower(c.Val)}, nil
+	}})
+
+	env.set("char=?", &BuiltinFunc{Name: "char=?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "char=?: need 2 arguments"}
+		}
+		a, ok := args[0].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char=?: not a character"}
+		}
+		b, ok := args[1].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char=?: not a character"}
+		}
+		return &BoolVal{Val: a.Val == b.Val}, nil
+	}})
+
+	env.set("char<?", &BuiltinFunc{Name: "char<?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "char<?: need 2 arguments"}
+		}
+		a, ok := args[0].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char<?: not a character"}
+		}
+		b, ok := args[1].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char<?: not a character"}
+		}
+		return &BoolVal{Val: a.Val < b.Val}, nil
+	}})
+
+	// String comparison operations
+	env.set("string=?", &BuiltinFunc{Name: "string=?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "string=?: need 2 arguments"}
+		}
+		a, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string=?: not a string"}
+		}
+		b, ok := args[1].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string=?: not a string"}
+		}
+		return &BoolVal{Val: a.Val == b.Val}, nil
+	}})
+
+	env.set("string<?", &BuiltinFunc{Name: "string<?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "string<?: need 2 arguments"}
+		}
+		a, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string<?: not a string"}
+		}
+		b, ok := args[1].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string<?: not a string"}
+		}
+		return &BoolVal{Val: a.Val < b.Val}, nil
+	}})
+
+	env.set("string-ci=?", &BuiltinFunc{Name: "string-ci=?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "string-ci=?: need 2 arguments"}
+		}
+		a, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-ci=?: not a string"}
+		}
+		b, ok := args[1].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-ci=?: not a string"}
+		}
+		return &BoolVal{Val: strings.EqualFold(a.Val, b.Val)}, nil
+	}})
+
+	env.set("string-upcase", &BuiltinFunc{Name: "string-upcase", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string-upcase: need 1 argument"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-upcase: not a string"}
+		}
+		return &StringVal{Val: strings.ToUpper(s.Val)}, nil
+	}})
+
+	env.set("string-downcase", &BuiltinFunc{Name: "string-downcase", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string-downcase: need 1 argument"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-downcase: not a string"}
+		}
+		return &StringVal{Val: strings.ToLower(s.Val)}, nil
+	}})
+
 	return env
 }
 
@@ -917,6 +1410,57 @@ func makeCompare(name string, op func(int64, int64) bool) func([]Value) (Value, 
 			}
 		}
 		return &BoolVal{Val: true}, nil
+	}
+}
+
+func schemeEq(a, b Value) bool {
+	switch av := a.(type) {
+	case *IntVal:
+		if bv, ok := b.(*IntVal); ok {
+			return av.Val == bv.Val
+		}
+	case *BoolVal:
+		if bv, ok := b.(*BoolVal); ok {
+			return av.Val == bv.Val
+		}
+	case *SymbolVal:
+		if bv, ok := b.(*SymbolVal); ok {
+			return av.Val == bv.Val
+		}
+	case *CharVal:
+		if bv, ok := b.(*CharVal); ok {
+			return av.Val == bv.Val
+		}
+	case *NilVal:
+		_, ok := b.(*NilVal)
+		return ok
+	case *StringVal:
+		if bv, ok := b.(*StringVal); ok {
+			return av == bv // pointer identity
+		}
+	case *PairVal:
+		return a == b // pointer identity
+	}
+	return false
+}
+
+func schemeEqual(a, b Value) bool {
+	switch av := a.(type) {
+	case *PairVal:
+		if bv, ok := b.(*PairVal); ok {
+			return schemeEqual(av.Car, bv.Car) && schemeEqual(av.Cdr, bv.Cdr)
+		}
+		return false
+	case *StringVal:
+		if bv, ok := b.(*StringVal); ok {
+			return av.Val == bv.Val
+		}
+		return false
+	case *NilVal:
+		_, ok := b.(*NilVal)
+		return ok
+	default:
+		return schemeEq(a, b)
 	}
 }
 
