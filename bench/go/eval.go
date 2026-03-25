@@ -70,7 +70,7 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 
 	// Call builtin
 	if fn.Type == TypeSymbol && len(fn.StrVal) > 8 && fn.StrVal[:8] == "builtin:" {
-		return callBuiltin(fn.StrVal, args, expr.Line, expr.Col)
+		return callBuiltin(fn.StrVal, args, env, expr.Line, expr.Col)
 	}
 
 	// Call lambda

@@ -1,10 +1,16 @@
 package ming
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+)
 
 type Env struct {
 	bindings map[string]*Value
 	parent   *Env
+	output   *strings.Builder
 }
 
 func NewEnv(parent *Env) *Env {
@@ -23,6 +29,16 @@ func (e *Env) Get(name string) (*Value, bool) {
 
 func (e *Env) Set(name string, val *Value) {
 	e.bindings[name] = val
+}
+
+func (e *Env) GetOutput() *strings.Builder {
+	if e.output != nil {
+		return e.output
+	}
+	if e.parent != nil {
+		return e.parent.GetOutput()
+	}
+	return nil
 }
 
 func makeGlobalEnv() *Env {
@@ -62,10 +78,26 @@ func makeGlobalEnv() *Env {
 	// Comparison
 	env.Set(">=", &Value{Type: TypeSymbol, StrVal: "builtin:>="})
 
+	// I/O
+	env.Set("display", &Value{Type: TypeSymbol, StrVal: "builtin:display"})
+	env.Set("write", &Value{Type: TypeSymbol, StrVal: "builtin:write"})
+	env.Set("newline", &Value{Type: TypeSymbol, StrVal: "builtin:newline"})
+
+	// String operations
+	env.Set("string-append", &Value{Type: TypeSymbol, StrVal: "builtin:string-append"})
+	env.Set("string-length", &Value{Type: TypeSymbol, StrVal: "builtin:string-length"})
+	env.Set("substring", &Value{Type: TypeSymbol, StrVal: "builtin:substring"})
+	env.Set("string->number", &Value{Type: TypeSymbol, StrVal: "builtin:string->number"})
+	env.Set("number->string", &Value{Type: TypeSymbol, StrVal: "builtin:number->string"})
+	env.Set("symbol->string", &Value{Type: TypeSymbol, StrVal: "builtin:symbol->string"})
+	env.Set("string->symbol", &Value{Type: TypeSymbol, StrVal: "builtin:string->symbol"})
+	env.Set("string-ref", &Value{Type: TypeSymbol, StrVal: "builtin:string-ref"})
+	env.Set("char?", &Value{Type: TypeSymbol, StrVal: "builtin:char?"})
+
 	return env
 }
 
-func callBuiltin(name string, args []*Value, line, col int) (*Value, error) {
+func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, error) {
 	switch name {
 	case "builtin:+":
 		var sum int64
@@ -262,7 +294,7 @@ func callBuiltin(name string, args []*Value, line, col int) (*Value, error) {
 		for i := len(args) - 2; i >= 0; i-- {
 			twoArgs := []*Value{args[i], result}
 			var err error
-			result, err = callBuiltin("builtin:append", twoArgs, line, col)
+			result, err = callBuiltin("builtin:append", twoArgs, env, line, col)
 			if err != nil {
 				return nil, err
 			}
@@ -274,6 +306,105 @@ func callBuiltin(name string, args []*Value, line, col int) (*Value, error) {
 			return nil, fmt.Errorf("%d:%d: 'symbol?' expects 1 argument", line, col)
 		}
 		return BoolValue(args[0].Type == TypeSymbol), nil
+
+	case "builtin:display":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("%d:%d: 'display' expects 1 argument", line, col)
+		}
+		if out := env.GetOutput(); out != nil {
+			out.WriteString(args[0].DisplayStr())
+		}
+		return Void, nil
+
+	case "builtin:write":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("%d:%d: 'write' expects 1 argument", line, col)
+		}
+		if out := env.GetOutput(); out != nil {
+			out.WriteString(args[0].WriteRepr())
+		}
+		return Void, nil
+
+	case "builtin:newline":
+		if len(args) != 0 {
+			return nil, fmt.Errorf("%d:%d: 'newline' expects 0 arguments", line, col)
+		}
+		if out := env.GetOutput(); out != nil {
+			out.WriteByte('\n')
+		}
+		return Void, nil
+
+	case "builtin:string-append":
+		var sb strings.Builder
+		for _, a := range args {
+			if a.Type != TypeString {
+				return nil, fmt.Errorf("%d:%d: 'string-append' expects strings", line, col)
+			}
+			sb.WriteString(a.StrVal)
+		}
+		return StringValue(sb.String()), nil
+
+	case "builtin:string-length":
+		if len(args) != 1 || args[0].Type != TypeString {
+			return nil, fmt.Errorf("%d:%d: 'string-length' expects a string", line, col)
+		}
+		return IntValue(int64(utf8.RuneCountInString(args[0].StrVal))), nil
+
+	case "builtin:substring":
+		if len(args) != 3 || args[0].Type != TypeString || args[1].Type != TypeInteger || args[2].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'substring' expects string, start, end", line, col)
+		}
+		runes := []rune(args[0].StrVal)
+		start, end := int(args[1].IntVal), int(args[2].IntVal)
+		if start < 0 || end < start || end > len(runes) {
+			return nil, fmt.Errorf("%d:%d: 'substring' index out of range", line, col)
+		}
+		return StringValue(string(runes[start:end])), nil
+
+	case "builtin:string->number":
+		if len(args) != 1 || args[0].Type != TypeString {
+			return nil, fmt.Errorf("%d:%d: 'string->number' expects a string", line, col)
+		}
+		n, err := strconv.ParseInt(args[0].StrVal, 10, 64)
+		if err != nil {
+			return False, nil
+		}
+		return IntValue(n), nil
+
+	case "builtin:number->string":
+		if len(args) != 1 || args[0].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'number->string' expects a number", line, col)
+		}
+		return StringValue(strconv.FormatInt(args[0].IntVal, 10)), nil
+
+	case "builtin:symbol->string":
+		if len(args) != 1 || args[0].Type != TypeSymbol {
+			return nil, fmt.Errorf("%d:%d: 'symbol->string' expects a symbol", line, col)
+		}
+		return StringValue(args[0].StrVal), nil
+
+	case "builtin:string->symbol":
+		if len(args) != 1 || args[0].Type != TypeString {
+			return nil, fmt.Errorf("%d:%d: 'string->symbol' expects a string", line, col)
+		}
+		return SymbolValue(args[0].StrVal), nil
+
+	case "builtin:string-ref":
+		if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'string-ref' expects string and index", line, col)
+		}
+		runes := []rune(args[0].StrVal)
+		idx := int(args[1].IntVal)
+		if idx < 0 || idx >= len(runes) {
+			return nil, fmt.Errorf("%d:%d: 'string-ref' index out of range", line, col)
+		}
+		return CharValue(runes[idx]), nil
+
+	case "builtin:char?":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("%d:%d: 'char?' expects 1 argument", line, col)
+		}
+		return BoolValue(args[0].Type == TypeChar), nil
 	}
 
 	return nil, fmt.Errorf("%d:%d: unknown builtin %s", line, col, name)

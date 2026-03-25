@@ -16,6 +16,7 @@ const (
 	TypeNull
 	TypeVoid
 	TypeLambda
+	TypeChar
 )
 
 type Value struct {
@@ -25,6 +26,7 @@ type Value struct {
 	StrVal  string
 	Car     *Value
 	Cdr     *Value
+	CharVal rune
 	// Lambda fields
 	Params []string
 	Body   []*Expr
@@ -55,6 +57,10 @@ func SymbolValue(s string) *Value {
 	return &Value{Type: TypeSymbol, StrVal: s}
 }
 
+func CharValue(c rune) *Value {
+	return &Value{Type: TypeChar, CharVal: c}
+}
+
 func PairValue(car, cdr *Value) *Value {
 	return &Value{Type: TypePair, Car: car, Cdr: cdr}
 }
@@ -80,8 +86,76 @@ func (v *Value) Display() string {
 		return displayList(v)
 	case TypeLambda:
 		return "#<procedure>"
+	case TypeChar:
+		return fmt.Sprintf("#\\%c", v.CharVal)
 	}
 	return ""
+}
+
+// WriteRepr returns the write representation (strings quoted, chars with #\).
+func (v *Value) WriteRepr() string {
+	switch v.Type {
+	case TypeString:
+		return fmt.Sprintf("%q", v.StrVal)
+	case TypePair:
+		return writeList(v)
+	default:
+		return v.Display()
+	}
+}
+
+// DisplayStr returns the display representation (strings unquoted).
+func (v *Value) DisplayStr() string {
+	switch v.Type {
+	case TypeString:
+		return v.StrVal
+	case TypePair:
+		return displayListUnquoted(v)
+	default:
+		return v.Display()
+	}
+}
+
+func displayListUnquoted(v *Value) string {
+	var sb strings.Builder
+	sb.WriteByte('(')
+	cur := v
+	first := true
+	for cur.Type == TypePair {
+		if !first {
+			sb.WriteByte(' ')
+		}
+		first = false
+		sb.WriteString(cur.Car.DisplayStr())
+		cur = cur.Cdr
+	}
+	if cur.Type != TypeNull {
+		sb.WriteString(" . ")
+		sb.WriteString(cur.DisplayStr())
+	}
+	sb.WriteByte(')')
+	return sb.String()
+}
+
+func writeList(v *Value) string {
+	var sb strings.Builder
+	sb.WriteByte('(')
+	cur := v
+	first := true
+	for cur.Type == TypePair {
+		if !first {
+			sb.WriteByte(' ')
+		}
+		first = false
+		sb.WriteString(cur.Car.WriteRepr())
+		cur = cur.Cdr
+	}
+	if cur.Type != TypeNull {
+		sb.WriteString(" . ")
+		sb.WriteString(cur.WriteRepr())
+	}
+	sb.WriteByte(')')
+	return sb.String()
 }
 
 func displayList(v *Value) string {
