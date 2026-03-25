@@ -145,6 +145,89 @@ func builtinMember(_ *interpreter, args []value, callPos position) (value, error
 	}
 }
 
+func builtinMemq(_ *interpreter, args []value, callPos position) (value, error) {
+	if len(args) != 2 {
+		return nil, wrongArgCount(callPos, "memq", "expected exactly 2 arguments")
+	}
+
+	current := args[1]
+	seen := map[*pairValue]struct{}{}
+	for {
+		switch list := current.(type) {
+		case emptyListValue:
+			return false, nil
+		case *pairValue:
+			if _, ok := seen[list]; ok {
+				return false, nil
+			}
+			seen[list] = struct{}{}
+			if eqValue(args[0], list.car) {
+				return current, nil
+			}
+			current = list.cdr
+		default:
+			return nil, newEvalError(ErrTypeMismatch, "memq: expected list", callPos)
+		}
+	}
+}
+
+func builtinMemv(_ *interpreter, args []value, callPos position) (value, error) {
+	if len(args) != 2 {
+		return nil, wrongArgCount(callPos, "memv", "expected exactly 2 arguments")
+	}
+
+	current := args[1]
+	seen := map[*pairValue]struct{}{}
+	for {
+		switch list := current.(type) {
+		case emptyListValue:
+			return false, nil
+		case *pairValue:
+			if _, ok := seen[list]; ok {
+				return false, nil
+			}
+			seen[list] = struct{}{}
+			if caseDatumEqual(args[0], list.car) {
+				return current, nil
+			}
+			current = list.cdr
+		default:
+			return nil, newEvalError(ErrTypeMismatch, "memv: expected list", callPos)
+		}
+	}
+}
+
+func builtinAssq(_ *interpreter, args []value, callPos position) (value, error) {
+	if len(args) != 2 {
+		return nil, wrongArgCount(callPos, "assq", "expected exactly 2 arguments")
+	}
+
+	current := args[1]
+	seen := map[*pairValue]struct{}{}
+	for {
+		switch list := current.(type) {
+		case emptyListValue:
+			return false, nil
+		case *pairValue:
+			if _, ok := seen[list]; ok {
+				return false, nil
+			}
+			seen[list] = struct{}{}
+
+			entry, ok := list.car.(*pairValue)
+			if !ok {
+				return nil, newEvalError(ErrTypeMismatch, "assq: expected list of pairs", callPos)
+			}
+			if eqValue(args[0], entry.car) {
+				return list.car, nil
+			}
+			current = list.cdr
+		default:
+			return nil, newEvalError(ErrTypeMismatch, "assq: expected list", callPos)
+		}
+	}
+}
+
 func builtinAssv(_ *interpreter, args []value, callPos position) (value, error) {
 	if len(args) != 2 {
 		return nil, wrongArgCount(callPos, "assv", "expected exactly 2 arguments")

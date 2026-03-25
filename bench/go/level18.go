@@ -259,6 +259,14 @@ func (it *interpreter) evalWithContinuations(node expr, scope *env, k evalContin
 					return doneError(err)
 				}
 				return continueEval(k, result)
+			case "quasiquote":
+				expanded, err := expandQuasiquoteForm(current)
+				if err != nil {
+					return doneError(err)
+				}
+				return callEval(func() evalResult {
+					return it.evalWithContinuations(expanded, scope, k)
+				})
 			case "lambda":
 				result, err := it.evalLambda(scope, current)
 				if err != nil {
@@ -473,11 +481,25 @@ func (it *interpreter) evalCondWithContinuations(scope *env, list *listExpr, k e
 			})
 		}
 
+		recipient, hasArrow, err := condArrowRecipient(clause)
+		if err != nil {
+			return doneError(err)
+		}
+
 		return callEval(func() evalResult {
 			return it.evalWithContinuations(clause.elements[0], scope, singleValueContinuation(clause.elements[0].pos(), func(test value) evalResult {
 				if !isTruthy(test) {
 					return callEval(func() evalResult {
 						return evalClause(index + 1)
+					})
+				}
+				if hasArrow {
+					return callEval(func() evalResult {
+						return it.evalWithContinuations(recipient, scope, singleValueContinuation(recipient.pos(), func(proc value) evalResult {
+							return callEval(func() evalResult {
+								return it.applyProcedureWithContinuations(proc, []value{test}, clause.at, k)
+							})
+						}))
 					})
 				}
 				if len(clause.elements) == 1 {

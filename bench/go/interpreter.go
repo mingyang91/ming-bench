@@ -81,6 +81,9 @@ const (
 	tokenRParen
 	tokenQuote
 	tokenSyntaxQuote
+	tokenQuasiquote
+	tokenUnquote
+	tokenUnquoteSplicing
 	tokenInteger
 	tokenRational
 	tokenInexact
@@ -147,6 +150,16 @@ func (l *lexer) nextToken() (token, error) {
 	case '\'':
 		l.advance()
 		return token{kind: tokenQuote, text: "'", at: start}, nil
+	case '`':
+		l.advance()
+		return token{kind: tokenQuasiquote, text: "`", at: start}, nil
+	case ',':
+		l.advance()
+		if l.index < len(l.input) && l.peek() == '@' {
+			l.advance()
+			return token{kind: tokenUnquoteSplicing, text: ",@", at: start}, nil
+		}
+		return token{kind: tokenUnquote, text: ",", at: start}, nil
 	case '#':
 		if l.index+1 < len(l.input) && l.input[l.index+1] == '\'' {
 			l.advance()
@@ -165,7 +178,7 @@ func (l *lexer) skipIgnored() {
 	for {
 		for l.index < len(l.input) {
 			ch := l.peek()
-			if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' {
+			if isWhitespace(ch) {
 				l.advance()
 				continue
 			}
@@ -283,7 +296,16 @@ func (l *lexer) advance() byte {
 
 func isDelimiter(ch byte) bool {
 	switch ch {
-	case ' ', '\t', '\r', '\n', '(', ')', ';':
+	case '(', ')', ';':
+		return true
+	default:
+		return isWhitespace(ch)
+	}
+}
+
+func isWhitespace(ch byte) bool {
+	switch ch {
+	case ' ', '\t', '\r', '\n', '\v', '\f':
 		return true
 	default:
 		return false
@@ -379,6 +401,12 @@ func (p *parser) parseExpr() (expr, error) {
 		return p.parseQuoted()
 	case tokenSyntaxQuote:
 		return p.parseSyntaxQuoted()
+	case tokenQuasiquote:
+		return p.parseQuasiquoted()
+	case tokenUnquote:
+		return p.parseUnquoted()
+	case tokenUnquoteSplicing:
+		return p.parseUnquoteSplicing()
 	case tokenLParen:
 		return p.parseList()
 	case tokenRParen:
@@ -391,24 +419,26 @@ func (p *parser) parseExpr() (expr, error) {
 }
 
 func (p *parser) parseQuoted() (expr, error) {
-	tok := p.peek()
-	p.index++
-
-	quoted, err := p.parseExpr()
-	if err != nil {
-		return nil, err
-	}
-
-	return &listExpr{
-		elements: []expr{
-			&symbolExpr{name: "quote", at: tok.at},
-			quoted,
-		},
-		at: tok.at,
-	}, nil
+	return p.parsePrefixedForm("quote")
 }
 
 func (p *parser) parseSyntaxQuoted() (expr, error) {
+	return p.parsePrefixedForm("syntax")
+}
+
+func (p *parser) parseQuasiquoted() (expr, error) {
+	return p.parsePrefixedForm("quasiquote")
+}
+
+func (p *parser) parseUnquoted() (expr, error) {
+	return p.parsePrefixedForm("unquote")
+}
+
+func (p *parser) parseUnquoteSplicing() (expr, error) {
+	return p.parsePrefixedForm("unquote-splicing")
+}
+
+func (p *parser) parsePrefixedForm(name string) (expr, error) {
 	tok := p.peek()
 	p.index++
 
@@ -419,7 +449,7 @@ func (p *parser) parseSyntaxQuoted() (expr, error) {
 
 	return &listExpr{
 		elements: []expr{
-			&symbolExpr{name: "syntax", at: tok.at},
+			&symbolExpr{name: name, at: tok.at},
 			quoted,
 		},
 		at: tok.at,
@@ -511,6 +541,34 @@ type emptyListValue struct{}
 type pairValue struct {
 	car value
 	cdr value
+}
+
+func splitDottedListElements(elements []expr) ([]expr, expr, bool, error) {
+	for i, element := range elements {
+		sym, ok := element.(*symbolExpr)
+		if !ok || sym.name != "." {
+			continue
+		}
+		if i == 0 || i+2 != len(elements) {
+			return nil, nil, false, newEvalError(ErrSyntax, "invalid dotted list", sym.at)
+		}
+		return elements[:i], elements[i+1], true, nil
+	}
+	return elements, nil, false, nil
+}
+
+func buildDottedExprList(elements []expr, tail expr, at position) *listExpr {
+	if tail == nil {
+		return &listExpr{
+			elements: append([]expr(nil), elements...),
+			at:       at,
+		}
+	}
+
+	result := make([]expr, 0, len(elements)+2)
+	result = append(result, elements...)
+	result = append(result, &symbolExpr{name: ".", at: at}, tail)
+	return &listExpr{elements: result, at: at}
 }
 
 type voidValue struct{}
@@ -764,7 +822,10 @@ func (it *interpreter) installBuiltins() {
 	it.defineName(it.global, "list-ref", &builtinProc{name: "list-ref", fn: builtinListRef})
 	it.defineName(it.global, "list-tail", &builtinProc{name: "list-tail", fn: builtinListTail})
 	it.defineName(it.global, "assoc", &builtinProc{name: "assoc", fn: builtinAssoc})
+	it.defineName(it.global, "assq", &builtinProc{name: "assq", fn: builtinAssq})
 	it.defineName(it.global, "assv", &builtinProc{name: "assv", fn: builtinAssv})
+	it.defineName(it.global, "memq", &builtinProc{name: "memq", fn: builtinMemq})
+	it.defineName(it.global, "memv", &builtinProc{name: "memv", fn: builtinMemv})
 	it.defineName(it.global, "member", &builtinProc{name: "member", fn: builtinMember})
 	it.defineName(it.global, "map", &builtinProc{name: "map", fn: builtinMap})
 	it.defineName(it.global, "for-each", &builtinProc{name: "for-each", fn: builtinForEach})
@@ -905,6 +966,13 @@ func (it *interpreter) eval(node expr, scope *env) (value, error) {
 					return voidValue{}, nil
 				case "quote":
 					return it.evalQuote(expr)
+				case "quasiquote":
+					expanded, err := expandQuasiquoteForm(expr)
+					if err != nil {
+						return nil, err
+					}
+					node = expanded
+					continue
 				case "syntax":
 					return it.evalSyntax(scope, expr)
 				case "lambda":
@@ -1031,11 +1099,23 @@ func (it *interpreter) prepareTailCond(scope *env, list *listExpr) (evalStep, er
 			return it.prepareTailSequence(scope, clause.elements[1:])
 		}
 
+		recipient, hasArrow, err := condArrowRecipient(clause)
+		if err != nil {
+			return evalStep{}, err
+		}
+
 		test, err := it.eval(clause.elements[0], scope)
 		if err != nil {
 			return evalStep{}, err
 		}
 		if isTruthy(test) {
+			if hasArrow {
+				proc, err := it.eval(recipient, scope)
+				if err != nil {
+					return evalStep{}, err
+				}
+				return it.applyProcedureTail(proc, []value{test}, clause.at)
+			}
 			if len(clause.elements) == 1 {
 				return doneEvalStep(test), nil
 			}
@@ -1177,6 +1257,12 @@ func (it *interpreter) evalList(list *listExpr, scope *env) (value, error) {
 			return it.evalIf(scope, list)
 		case "quote":
 			return it.evalQuote(list)
+		case "quasiquote":
+			expanded, err := expandQuasiquoteForm(list)
+			if err != nil {
+				return nil, err
+			}
+			return it.eval(expanded, scope)
 		case "lambda":
 			return it.evalLambda(scope, list)
 		case "case-lambda":
@@ -1365,11 +1451,23 @@ func (it *interpreter) evalCond(scope *env, list *listExpr) (value, error) {
 			return it.evalSequence(scope, clause.elements[1:])
 		}
 
+		recipient, hasArrow, err := condArrowRecipient(clause)
+		if err != nil {
+			return nil, err
+		}
+
 		test, err := it.eval(clause.elements[0], scope)
 		if err != nil {
 			return nil, err
 		}
 		if isTruthy(test) {
+			if hasArrow {
+				proc, err := it.eval(recipient, scope)
+				if err != nil {
+					return nil, err
+				}
+				return it.applyProcedure(proc, []value{test}, clause.at)
+			}
 			if len(clause.elements) == 1 {
 				return test, nil
 			}
@@ -1378,6 +1476,21 @@ func (it *interpreter) evalCond(scope *env, list *listExpr) (value, error) {
 	}
 
 	return voidValue{}, nil
+}
+
+func condArrowRecipient(clause *listExpr) (expr, bool, error) {
+	if len(clause.elements) < 2 {
+		return nil, false, nil
+	}
+
+	sym, ok := clause.elements[1].(*symbolExpr)
+	if !ok || sym.name != "=>" {
+		return nil, false, nil
+	}
+	if len(clause.elements) != 3 {
+		return nil, false, newEvalError(ErrSyntax, "cond: => clause must contain exactly one recipient expression", clause.at)
+	}
+	return clause.elements[2], true, nil
 }
 
 type letBinding struct {
@@ -1667,15 +1780,28 @@ func datumToValue(node expr) (value, error) {
 	case *symbolExpr:
 		return symbolValue(expr.name), nil
 	case *listExpr:
-		values := make([]value, 0, len(expr.elements))
-		for _, element := range expr.elements {
-			item, err := datumToValue(element)
+		elements, tailExpr, hasTail, err := splitDottedListElements(expr.elements)
+		if err != nil {
+			return nil, err
+		}
+
+		tail := value(emptyListValue{})
+		if hasTail {
+			tail, err = datumToValue(tailExpr)
 			if err != nil {
 				return nil, err
 			}
-			values = append(values, item)
 		}
-		return buildList(values), nil
+
+		result := tail
+		for i := len(elements) - 1; i >= 0; i-- {
+			item, err := datumToValue(elements[i])
+			if err != nil {
+				return nil, err
+			}
+			result = &pairValue{car: item, cdr: result}
+		}
+		return result, nil
 	default:
 		return nil, newEvalError(ErrSyntax, "invalid quoted datum", node.pos())
 	}

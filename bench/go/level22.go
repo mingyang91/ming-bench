@@ -83,20 +83,33 @@ func datumValueToExpr(v value, at position) (expr, error) {
 	case emptyListValue:
 		return &listExpr{at: at}, nil
 	case *pairValue:
-		items, err := listToSlice(current, at)
-		if err != nil {
-			return nil, newEvalError(ErrTypeMismatch, "datum->syntax: expected datum", at)
-		}
+		elements := []expr{}
+		seen := map[*pairValue]struct{}{}
+		rest := value(current)
+		for {
+			switch pair := rest.(type) {
+			case *pairValue:
+				if _, ok := seen[pair]; ok {
+					return nil, newEvalError(ErrTypeMismatch, "datum->syntax: expected datum", at)
+				}
+				seen[pair] = struct{}{}
 
-		elements := make([]expr, 0, len(items))
-		for _, item := range items {
-			element, err := datumValueToExpr(item, at)
-			if err != nil {
-				return nil, err
+				element, err := datumValueToExpr(pair.car, at)
+				if err != nil {
+					return nil, err
+				}
+				elements = append(elements, element)
+				rest = pair.cdr
+			case emptyListValue:
+				return buildDottedExprList(elements, nil, at), nil
+			default:
+				tail, err := datumValueToExpr(rest, at)
+				if err != nil {
+					return nil, err
+				}
+				return buildDottedExprList(elements, tail, at), nil
 			}
-			elements = append(elements, element)
 		}
-		return &listExpr{elements: elements, at: at}, nil
 	default:
 		return nil, newEvalError(ErrTypeMismatch, "datum->syntax: expected datum", at)
 	}
