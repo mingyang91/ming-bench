@@ -34,12 +34,16 @@ final private[ming] class InterpreterForms(
 
   def evalIf(args: List[Expr], pos: SourcePos): Value =
     args match
+      case condition :: thenBranch :: Nil =>
+        if Value.isTruthy(eval(condition)) then eval(thenBranch)
+        else Value.VoidVal
+
       case condition :: thenBranch :: elseBranch :: Nil =>
         if Value.isTruthy(eval(condition)) then eval(thenBranch)
         else eval(elseBranch)
 
       case _ =>
-        throw EvalError.at(pos, "if expects exactly 3 arguments")
+        throw EvalError.at(pos, "if expects 2 or 3 arguments")
 
   def evalQuote(args: List[Expr], pos: SourcePos): Value =
     args match
@@ -89,6 +93,30 @@ final private[ming] class InterpreterForms(
       case _ =>
         throw EvalError.at(pos, "let expects bindings and a body")
 
+  def evalLetrec(args: List[Expr], pos: SourcePos, sequential: Boolean): Value =
+    args match
+      case Expr.ListExpr(bindings, bindingsPos) :: body if body.nonEmpty =>
+        val parsedBindings = parseBindings(bindings, bindingsPos)
+        val scope          = Env.child(env)
+        val cells = parsedBindings.map { case (name, _) =>
+          val cell = Cell(Value.UninitializedVal(name))
+          scope.defineAlias(name, cell)
+          cell
+        }
+
+        if sequential then
+          parsedBindings.zip(cells).foreach { case ((_, valueExpr), cell) =>
+            cell.set(evalIn(valueExpr, scope))
+          }
+        else
+          val values = parsedBindings.map { case (_, valueExpr) => evalIn(valueExpr, scope) }
+          cells.zip(values).foreach { case (cell, value) => cell.set(value) }
+
+        evaluateAll(body, scope)
+
+      case _ =>
+        throw EvalError.at(pos, "letrec expects bindings and a body")
+
   def evalCond(clauses: List[Expr], pos: SourcePos): Value =
     clauses match
       case Nil =>
@@ -109,6 +137,53 @@ final private[ming] class InterpreterForms(
 
       case other :: _ =>
         throw EvalError.at(pos, s"invalid cond clause: ${other}")
+
+  def evalCase(args: List[Expr], pos: SourcePos): Value =
+    args match
+      case selector :: clauses if clauses.nonEmpty =>
+        evalCaseClauses(eval(selector), clauses, pos)
+
+      case _ =>
+        throw EvalError.at(pos, "case expects a key and at least 1 clause")
+
+  def evalDo(args: List[Expr], pos: SourcePos): Value =
+    args match
+      case Expr.ListExpr(bindings, bindingsPos) :: Expr.ListExpr(testExpr :: resultExprs, _) :: body =>
+        val parsedBindings = parseDoBindings(bindings, bindingsPos)
+        val initialValues  = parsedBindings.map { case (_, initExpr, _) => eval(initExpr) }
+        val loopEnv        = Env.child(env)
+        val cells = parsedBindings.zip(initialValues).map { case ((name, _, _), value) =>
+          val cell = Cell(value)
+          loopEnv.defineAlias(name, cell)
+          cell
+        }
+
+        @tailrec
+        def loop(): Value =
+          if Value.isTruthy(evalIn(testExpr, loopEnv)) then
+            if resultExprs.isEmpty then Value.VoidVal
+            else evaluateAll(resultExprs, loopEnv)
+          else
+            if body.nonEmpty then evaluateAll(body, loopEnv)
+
+            val nextValues = parsedBindings.zip(cells).map {
+              case ((_, _, Some(stepExpr)), _) =>
+                evalIn(stepExpr, loopEnv)
+
+              case ((_, _, None), cell) =>
+                cell.get
+            }
+
+            cells.zip(nextValues).foreach { case (cell, value) => cell.set(value) }
+            loop()
+
+        loop()
+
+      case Expr.ListExpr(_, _) :: Expr.ListExpr(Nil, testPos) :: _ =>
+        throw EvalError.at(testPos, "do test clause must contain a test expression")
+
+      case _ =>
+        throw EvalError.at(pos, "do expects bindings, a test clause, and an optional body")
 
   @tailrec
   final def evalAnd(args: List[Expr], result: Value = Value.BoolVal(true)): Value =
@@ -150,6 +225,28 @@ final private[ming] class InterpreterForms(
     loopEnv.define(name, closure)
     call(closure, values, pos)
 
+  private def evalCaseClauses(key: Value, clauses: List[Expr], pos: SourcePos): Value =
+    clauses match
+      case Nil =>
+        Value.VoidVal
+
+      case Expr.ListExpr(Nil, clausePos) :: _ =>
+        throw EvalError.at(clausePos, "case clause cannot be empty")
+
+      case Expr.ListExpr(Expr.Symbol("else", _) :: body, clausePos) :: rest =>
+        if rest.nonEmpty then throw EvalError.at(clausePos, "else must be the last case clause")
+        else if body.isEmpty then Value.VoidVal
+        else evaluateAll(body)
+
+      case Expr.ListExpr(Expr.ListExpr(datums, _) :: body, _) :: rest =>
+        if datums.exists(datum => Value.eqv(key, Value.fromQuotedExpr(datum))) then
+          if body.isEmpty then Value.VoidVal
+          else evaluateAll(body)
+        else evalCaseClauses(key, rest, pos)
+
+      case other :: _ =>
+        throw EvalError.at(pos, s"invalid case clause: ${other}")
+
   private def parseBindings(bindings: List[Expr], pos: SourcePos): List[(String, Expr)] =
     bindings.map {
       case Expr.ListExpr(Expr.Symbol(name, _) :: valueExpr :: Nil, _) =>
@@ -160,6 +257,21 @@ final private[ming] class InterpreterForms(
 
       case _ =>
         throw EvalError.at(pos, "bindings must be lists")
+    }
+
+  private def parseDoBindings(bindings: List[Expr], pos: SourcePos): List[(String, Expr, Option[Expr])] =
+    bindings.map {
+      case Expr.ListExpr(Expr.Symbol(name, _) :: initExpr :: stepExpr :: Nil, _) =>
+        (name, initExpr, Some(stepExpr))
+
+      case Expr.ListExpr(Expr.Symbol(name, _) :: initExpr :: Nil, _) =>
+        (name, initExpr, None)
+
+      case Expr.ListExpr(_, bindingPos) =>
+        throw EvalError.at(bindingPos, "do binding must contain a name, init expression, and optional step")
+
+      case _ =>
+        throw EvalError.at(pos, "do bindings must be lists")
     }
 
   private def parseParameters(params: List[Expr], pos: SourcePos): (List[String], Option[String]) =
@@ -190,6 +302,9 @@ final private[ming] class InterpreterForms(
 
   private def eval(expr: Expr): Value =
     evalExpr(expr)
+
+  private def evalIn(expr: Expr, scope: Env): Value =
+    evalSequenceIn(List(expr), scope)
 
   private def evaluateAll(expressions: List[Expr], scope: Env = env): Value =
     evalSequenceIn(expressions, scope)

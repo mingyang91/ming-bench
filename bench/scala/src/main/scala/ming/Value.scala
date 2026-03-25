@@ -13,10 +13,12 @@ private[ming] enum Value:
   case SymbolVal(name: String)
   case EmptyList
   case PairVal(car: Value, cdr: Value)
+  case VectorVal(elements: Array[Value])
   case RecordVal(recordType: RecordType, fields: Array[Value])
   case Closure(params: List[String], restParam: Option[String], body: List[Expr], env: Env)
   case CaseClosure(clauses: List[ProcedureClause], env: Env)
   case Builtin(name: String, fn: (List[Value], SourcePos) => Value)
+  case UninitializedVal(name: String)
   case VoidVal
 
   def render: String =
@@ -48,11 +50,17 @@ private[ming] enum Value:
       case Value.PairVal(_, _) =>
         "pair"
 
+      case Value.VectorVal(_) =>
+        "vector"
+
       case Value.RecordVal(_, _) =>
         "record"
 
       case Value.Closure(_, _, _, _) | Value.CaseClosure(_, _) | Value.Builtin(_, _) =>
         "procedure"
+
+      case Value.UninitializedVal(_) =>
+        "uninitialized"
 
       case Value.VoidVal =>
         "void"
@@ -121,6 +129,9 @@ private[ming] object Value:
       case (Value.PairVal(leftCar, leftCdr), Value.PairVal(rightCar, rightCdr)) =>
         equal(leftCar, rightCar) && equal(leftCdr, rightCdr)
 
+      case (Value.VectorVal(leftElements), Value.VectorVal(rightElements)) =>
+        arraysEqual(leftElements, rightElements)
+
       case _ =>
         eqv(left, right)
 
@@ -177,6 +188,9 @@ private[ming] object Value:
       case Value.PairVal(_, _) =>
         renderPair(value, displayMode)
 
+      case Value.VectorVal(elements) =>
+        renderVector(elements, displayMode)
+
       case Value.RecordVal(recordType, _) =>
         s"#<record:${recordType.displayName}>"
 
@@ -185,6 +199,9 @@ private[ming] object Value:
 
       case Value.Builtin(name, _) =>
         s"#<procedure:$name>"
+
+      case Value.UninitializedVal(name) =>
+        s"#<uninitialized:$name>"
 
       case Value.VoidVal =>
         "#<void>"
@@ -239,6 +256,19 @@ private[ming] object Value:
 
       case other =>
         s"#\\$other"
+
+  private def arraysEqual(left: Array[Value], right: Array[Value]): Boolean =
+    left.length == right.length && left.indices.forall(index => equal(left(index), right(index)))
+
+  private def renderVector(elements: Array[Value], displayMode: Boolean): String =
+    val builder = new StringBuilder
+    builder.append("#(")
+    elements.zipWithIndex.foreach { case (element, index) =>
+      if index > 0 then builder.append(' ')
+      builder.append(renderValue(element, displayMode))
+    }
+    builder.append(')')
+    builder.toString
 
   private def renderPair(value: Value, displayMode: Boolean): String =
     val builder = new StringBuilder

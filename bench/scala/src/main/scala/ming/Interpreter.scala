@@ -83,14 +83,26 @@ private[ming] object Interpreter:
       case Expr.ListExpr(Expr.Symbol("let", _) :: args, pos) =>
         forms.evalLet(args, pos)
 
+      case Expr.ListExpr(Expr.Symbol("letrec", _) :: args, pos) =>
+        forms.evalLetrec(args, pos, sequential = false)
+
+      case Expr.ListExpr(Expr.Symbol("letrec*", _) :: args, pos) =>
+        forms.evalLetrec(args, pos, sequential = true)
+
       case Expr.ListExpr(Expr.Symbol("cond", _) :: args, pos) =>
         forms.evalCond(args, pos)
+
+      case Expr.ListExpr(Expr.Symbol("case", _) :: args, pos) =>
+        forms.evalCase(args, pos)
 
       case Expr.ListExpr(Expr.Symbol("and", _) :: args, _) =>
         forms.evalAnd(args)
 
       case Expr.ListExpr(Expr.Symbol("or", _) :: args, _) =>
         forms.evalOr(args)
+
+      case Expr.ListExpr(Expr.Symbol("do", _) :: args, pos) =>
+        forms.evalDo(args, pos)
 
       case Expr.ListExpr(head :: args, pos) =>
         applyProcedure(eval(head, env, macros), args.map(arg => eval(arg, env, macros)), pos, macros)

@@ -3,11 +3,12 @@ package ming
 private[ming] object PredicateBuiltins extends BuiltinSupport:
 
   val entries: Map[String, Value] = Map(
-    "not"    -> Value.Builtin("not", negate),
-    "eq?"    -> Value.Builtin("eq?", eqv),
-    "equal?" -> Value.Builtin("equal?", equal),
-    "null?"  -> predicate("null?", _ == Value.EmptyList),
-    "list?"  -> predicate("list?", Value.isProperList),
+    "not"       -> Value.Builtin("not", negate),
+    "eq?"       -> Value.Builtin("eq?", eqv("eq?")),
+    "eqv?"      -> Value.Builtin("eqv?", eqv("eqv?")),
+    "equal?"    -> Value.Builtin("equal?", equal),
+    "null?"     -> predicate("null?", _ == Value.EmptyList),
+    "list?"     -> predicate("list?", Value.isProperList),
     "procedure?" -> predicate(
       "procedure?",
       Value.isCallable
@@ -65,8 +66,8 @@ private[ming] object PredicateBuiltins extends BuiltinSupport:
       case _ =>
         throw EvalError.at(pos, "not expects exactly 1 argument")
 
-  private def eqv(args: List[Value], pos: SourcePos): Value =
-    val (left, right) = expectTwoArgs(args, pos, "eq?")
+  private def eqv(name: String)(args: List[Value], pos: SourcePos): Value =
+    val (left, right) = expectTwoArgs(args, pos, name)
     Value.BoolVal(Value.eqv(left, right))
 
   private def equal(args: List[Value], pos: SourcePos): Value =

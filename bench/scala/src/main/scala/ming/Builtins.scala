@@ -6,4 +6,5 @@ private[ming] object Builtins:
     NumericBuiltins.entries ++
       PredicateBuiltins.entries ++
       ListBuiltins.entries(macros) ++
+      VectorBuiltins.entries ++
       TextBuiltins.entries(runtime)

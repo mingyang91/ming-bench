@@ -29,6 +29,13 @@ final private[ming] class Env private (
   def lookup(name: String, pos: SourcePos): Value =
     resolve(name)
       .map(_.get)
+      .map {
+        case Value.UninitializedVal(_) =>
+          throw EvalError.at(pos, s"uninitialized variable: $name")
+
+        case value =>
+          value
+      }
       .getOrElse(throw EvalError.at(pos, s"unbound variable: $name"))
 
   def set(name: String, value: Value, pos: SourcePos): Unit =
