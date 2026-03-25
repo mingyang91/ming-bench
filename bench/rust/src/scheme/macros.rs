@@ -125,7 +125,7 @@ fn match_pattern(
     bindings: &mut HashMap<String, PatternBinding>,
 ) -> Result<bool, EvalError> {
     match (&pattern.kind, &input.kind) {
-        (ExprKind::Integer(left), ExprKind::Integer(right)) => Ok(left == right),
+        (ExprKind::Number(left), ExprKind::Number(right)) => Ok(left == right),
         (ExprKind::Boolean(left), ExprKind::Boolean(right)) => Ok(left == right),
         (ExprKind::Character(left), ExprKind::Character(right)) => Ok(left == right),
         (ExprKind::String(left), ExprKind::String(right)) => Ok(left == right),
@@ -666,7 +666,7 @@ fn collect_template_repetition_count(
 
 fn expr_equal(left: &Expr, right: &Expr) -> bool {
     match (&left.kind, &right.kind) {
-        (ExprKind::Integer(left), ExprKind::Integer(right)) => left == right,
+        (ExprKind::Number(left), ExprKind::Number(right)) => left == right,
         (ExprKind::Boolean(left), ExprKind::Boolean(right)) => left == right,
         (ExprKind::Character(left), ExprKind::Character(right)) => left == right,
         (ExprKind::String(left), ExprKind::String(right)) => left == right,

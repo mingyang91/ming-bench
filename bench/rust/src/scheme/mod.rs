@@ -1,11 +1,13 @@
 mod builtins;
 pub mod error;
 mod macros;
+mod number;
 mod parser;
 
 pub use error::{EvalError, SourcePos};
 
 use self::macros::{expand_macro_call, parse_syntax_rules};
+use self::number::{parse_number_literal, Number, NumberError};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
@@ -20,7 +22,7 @@ struct Expr {
 
 #[derive(Debug, Clone)]
 enum ExprKind {
-    Integer(i64),
+    Number(Number),
     Boolean(bool),
     Character(char),
     String(String),
@@ -50,7 +52,7 @@ impl Expr {
 
 #[derive(Debug, Clone)]
 enum Value {
-    Integer(i64),
+    Number(Number),
     Boolean(bool),
     Character(char),
     String(StringRef),
@@ -142,7 +144,7 @@ impl Value {
 
     fn type_name(&self) -> &'static str {
         match self {
-            Self::Integer(_) => "number",
+            Self::Number(_) => "number",
             Self::Boolean(_) => "boolean",
             Self::Character(_) => "char",
             Self::String(_) => "string",
@@ -165,7 +167,7 @@ impl Value {
 
     fn render_with_mode(&self, mode: RenderMode) -> String {
         match self {
-            Self::Integer(value) => value.to_string(),
+            Self::Number(value) => value.render(),
             Self::Boolean(true) => "#t".into(),
             Self::Boolean(false) => "#f".into(),
             Self::Character(value) => render_char(*value, mode),
@@ -252,6 +254,18 @@ fn invalid_argument(
     }
 }
 
+fn number_error(pos: SourcePos, name: &str, error: NumberError) -> EvalError {
+    match error {
+        NumberError::DivisionByZero => EvalError::DivisionByZero { pos },
+        NumberError::Overflow => invalid_argument(pos, name, "numeric overflow"),
+        NumberError::NonFinite => invalid_argument(
+            pos,
+            name,
+            "cannot convert a non-finite inexact number to exact",
+        ),
+    }
+}
+
 fn make_string_value(value: impl Into<String>) -> Value {
     Value::String(Rc::new(RefCell::new(value.into())))
 }
@@ -299,7 +313,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
 
 fn eval_expr(expr: &Expr, env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
     match &expr.kind {
-        ExprKind::Integer(value) => Ok(Value::Integer(*value)),
+        ExprKind::Number(value) => Ok(Value::Number(*value)),
         ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
         ExprKind::Character(value) => Ok(Value::Character(*value)),
         ExprKind::String(value) => Ok(make_string_value(value.clone())),
@@ -425,9 +439,14 @@ fn builtin_name(name: &str) -> Option<&'static str> {
         "cons" => Some("cons"),
         "display" => Some("display"),
         "eq?" => Some("eq?"),
+        "exact?" => Some("exact?"),
+        "exact->inexact" => Some("exact->inexact"),
         "equal?" => Some("equal?"),
         "even?" => Some("even?"),
         "expt" => Some("expt"),
+        "inexact?" => Some("inexact?"),
+        "inexact->exact" => Some("inexact->exact"),
+        "integer?" => Some("integer?"),
         "length" => Some("length"),
         "list" => Some("list"),
         "list-ref" => Some("list-ref"),
@@ -447,6 +466,7 @@ fn builtin_name(name: &str) -> Option<&'static str> {
         "pair?" => Some("pair?"),
         "positive?" => Some("positive?"),
         "quotient" => Some("quotient"),
+        "rational?" => Some("rational?"),
         "remainder" => Some("remainder"),
         "string-ci=?" => Some("string-ci=?"),
         "string-downcase" => Some("string-downcase"),
@@ -464,6 +484,8 @@ fn builtin_name(name: &str) -> Option<&'static str> {
         "substring" => Some("substring"),
         "symbol->string" => Some("symbol->string"),
         "symbol?" => Some("symbol?"),
+        "numerator" => Some("numerator"),
+        "denominator" => Some("denominator"),
         "write" => Some("write"),
         "zero?" => Some("zero?"),
         _ => None,
@@ -828,7 +850,7 @@ fn eval_quote(args: &[Expr], pos: SourcePos) -> Result<Value, EvalError> {
 
 fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
     match &expr.kind {
-        ExprKind::Integer(value) => Ok(Value::Integer(*value)),
+        ExprKind::Number(value) => Ok(Value::Number(*value)),
         ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
         ExprKind::Character(value) => Ok(Value::Character(*value)),
         ExprKind::String(value) => Ok(make_string_value(value.clone())),
@@ -974,10 +996,10 @@ fn number_predicate<F>(
     test: F,
 ) -> Result<Value, EvalError>
 where
-    F: Fn(i64) -> bool,
+    F: Fn(&Number) -> Result<bool, EvalError>,
 {
     match args {
-        [value] => Ok(Value::Boolean(test(expect_number(name, value, pos)?))),
+        [value] => Ok(Value::Boolean(test(&expect_number(name, value, pos)?)?)),
         _ => Err(wrong_arg_count(pos, name, "exactly 1 argument", args.len())),
     }
 }
@@ -994,7 +1016,7 @@ where
 
 fn compare<F>(name: &str, args: &[Value], pos: SourcePos, predicate: F) -> Result<Value, EvalError>
 where
-    F: Fn(i64, i64) -> bool,
+    F: Fn(&Number, &Number) -> bool,
 {
     let values = expect_numbers(name, args, pos)?;
     if values.len() < 2 {
@@ -1006,7 +1028,9 @@ where
         ));
     }
 
-    let result = values.windows(2).all(|pair| predicate(pair[0], pair[1]));
+    let result = values
+        .windows(2)
+        .all(|pair| predicate(&pair[0], &pair[1]));
     Ok(Value::Boolean(result))
 }
 
@@ -1058,20 +1082,24 @@ where
     Ok(Value::Boolean(result))
 }
 
-fn expect_number(name: &str, value: &Value, pos: SourcePos) -> Result<i64, EvalError> {
+fn expect_number(name: &str, value: &Value, pos: SourcePos) -> Result<Number, EvalError> {
     match value {
-        Value::Integer(number) => Ok(*number),
+        Value::Number(number) => Ok(*number),
         other => Err(type_mismatch(pos, name, "number", other.type_name())),
     }
 }
 
-fn expect_numbers(name: &str, args: &[Value], pos: SourcePos) -> Result<Vec<i64>, EvalError> {
+fn expect_numbers(name: &str, args: &[Value], pos: SourcePos) -> Result<Vec<Number>, EvalError> {
     args.iter()
         .map(|value| expect_number(name, value, pos))
         .collect()
 }
 
-fn expect_two_numbers(name: &str, args: &[Value], pos: SourcePos) -> Result<(i64, i64), EvalError> {
+fn expect_two_numbers(
+    name: &str,
+    args: &[Value],
+    pos: SourcePos,
+) -> Result<(Number, Number), EvalError> {
     match args {
         [left, right] => Ok((
             expect_number(name, left, pos)?,
@@ -1130,13 +1158,16 @@ fn expect_non_negative_integer(
     label: &str,
 ) -> Result<usize, EvalError> {
     match value {
-        Value::Integer(number) if *number >= 0 => Ok(*number as usize),
-        Value::Integer(number) => Err(invalid_argument(
-            pos,
-            name,
-            format!("{label} must be non-negative, got {number}"),
-        )),
-        other => Err(type_mismatch(pos, name, "number", other.type_name())),
+        Value::Number(number) => match number.exact_integer_value() {
+            Some(number) if number >= 0 => Ok(number as usize),
+            Some(number) => Err(invalid_argument(
+                pos,
+                name,
+                format!("{label} must be non-negative, got {number}"),
+            )),
+            None => Err(type_mismatch(pos, name, "exact integer", "number")),
+        },
+        other => Err(type_mismatch(pos, name, "exact integer", other.type_name())),
     }
 }
 
@@ -1149,7 +1180,7 @@ fn expect_list<'a>(name: &str, value: &'a Value, pos: SourcePos) -> Result<&'a [
 
 fn equal_value(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left == right,
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
         (Value::Character(left), Value::Character(right)) => left == right,
         (Value::String(left), Value::String(right)) => *left.borrow() == *right.borrow(),

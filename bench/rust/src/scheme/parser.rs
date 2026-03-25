@@ -1,4 +1,4 @@
-use super::{syntax_error, EvalError, Expr, ExprKind, SourcePos};
+use super::{parse_number_literal, syntax_error, EvalError, Expr, ExprKind, SourcePos};
 
 pub(super) fn parse_program(input: &str) -> Result<Vec<Expr>, EvalError> {
     Parser::new(input).parse_program()
@@ -172,12 +172,49 @@ impl<'a> Parser<'a> {
             return Err(syntax_error(pos, "invalid number literal"));
         }
 
+        match self.peek_char() {
+            Some('.') => {
+                self.bump();
+
+                let mut saw_fraction_digit = false;
+                while matches!(self.peek_char(), Some(ch) if ch.is_ascii_digit()) {
+                    saw_fraction_digit = true;
+                    self.bump();
+                }
+
+                if !saw_fraction_digit {
+                    return Err(syntax_error(pos, "invalid number literal"));
+                }
+            }
+            Some('/') => {
+                self.bump();
+
+                if matches!(self.peek_char(), Some('+') | Some('-')) {
+                    self.bump();
+                }
+
+                let mut saw_denominator_digit = false;
+                while matches!(self.peek_char(), Some(ch) if ch.is_ascii_digit()) {
+                    saw_denominator_digit = true;
+                    self.bump();
+                }
+
+                if !saw_denominator_digit {
+                    return Err(syntax_error(pos, "invalid number literal"));
+                }
+            }
+            _ => {}
+        }
+
+        if self.peek_char().is_some_and(|ch| !is_delimiter(ch)) {
+            return Err(syntax_error(pos, "invalid number literal"));
+        }
+
         let token = &self.input[start..self.offset];
-        let value = token
-            .parse::<i64>()
+        let value = parse_number_literal(token)
             .map_err(|_| syntax_error(pos, format!("invalid number literal: {token}")))?;
 
-        Ok(Expr::new(pos, ExprKind::Integer(value)))
+        Ok(Expr::new(pos, ExprKind::Number(value)))
     }
 
     fn parse_symbol(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
