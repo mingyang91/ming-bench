@@ -21,6 +21,7 @@ private[ming] object SchemeInterpreter:
     final case class Number(value: BigInt)                                          extends Value
     final case class Bool(value: Boolean)                                           extends Value
     final case class StringLit(value: String)                                       extends Value
+    final case class Character(value: Char)                                         extends Value
     final case class Symbol(name: String)                                           extends Value
     final case class ListValue(items: List[Value])                                  extends Value
     final case class Builtin(name: String, impl: (List[Value], SourcePos) => Value) extends Procedure
@@ -28,13 +29,11 @@ private[ming] object SchemeInterpreter:
     case object Void                                                                extends Value
 
   def evalProgram(input: String): Value =
-    val expressions = SchemeReader.readAll(input)
-    if expressions.isEmpty then throw EvalError.at(SourcePos(1, 1), "empty input")
-    val env = initialEnv()
-    evalSequence(expressions, env)
+    runProgram(input)._1
 
   def evalProgramWithOutput(input: String): (Value, String) =
-    (evalProgram(input), "")
+    val (result, runtime) = runProgram(input)
+    (result, runtime.capturedOutput)
 
   def render(value: Value): String =
     value match
@@ -42,10 +41,25 @@ private[ming] object SchemeInterpreter:
       case Value.Bool(true)       => "#t"
       case Value.Bool(false)      => "#f"
       case Value.StringLit(value) => "\"" + escapeString(value) + "\""
+      case Value.Character(value) => renderCharacter(value)
       case Value.Symbol(name)     => name
       case Value.ListValue(items) => items.map(render).mkString("(", " ", ")")
       case _: Procedure           => "#<procedure>"
       case Value.Void             => "#<void>"
+
+  def renderDisplay(value: Value): String =
+    value match
+      case Value.StringLit(value) => value
+      case Value.Character(value) => value.toString
+      case Value.ListValue(items) => items.map(renderDisplay).mkString("(", " ", ")")
+      case other                  => render(other)
+
+  private def runProgram(input: String): (Value, Runtime) =
+    val expressions = SchemeReader.readAll(input)
+    if expressions.isEmpty then throw EvalError.at(SourcePos(1, 1), "empty input")
+    val runtime = Runtime()
+    val env     = initialEnv(runtime)
+    (evalSequence(expressions, env), runtime)
 
   private def evalSequence(expressions: List[Expr], env: Env): Value =
     expressions.foldLeft[Value](Value.Void) { (_, expr) =>
@@ -168,9 +182,9 @@ private[ming] object SchemeInterpreter:
       case other =>
         throw EvalError.at(pos, s"not a procedure: ${render(other)}")
 
-  private def initialEnv(): Env =
+  private def initialEnv(runtime: Runtime): Env =
     val env = Env.root()
-    SchemeBuiltins.all.foreach { builtin =>
+    SchemeBuiltins.all(runtime.emit).foreach { builtin =>
       env.define(builtin.name, builtin)
     }
     env
@@ -242,3 +256,21 @@ private[ming] object SchemeInterpreter:
       case ch   => builder.append(ch)
     }
     builder.result()
+
+  private def renderCharacter(value: Char): String =
+    value match
+      case ' '  => "#\\space"
+      case '\n' => "#\\newline"
+      case ch   => s"#\\$ch"
+
+  final class Runtime private ():
+    private val output = new StringBuilder
+
+    def emit(text: String): Unit =
+      output.append(text)
+
+    def capturedOutput: String =
+      output.toString
+
+  private object Runtime:
+    def apply(): Runtime = new Runtime()
