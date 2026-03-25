@@ -18,16 +18,17 @@ pub(crate) fn is_special_form(name: &str) -> bool {
             | "cond" | "and" | "or" | "set!" | "string-set!"
             | "define-syntax" | "syntax-rules" | "define-record-type" | "case-lambda"
             | "letrec" | "letrec*" | "case" | "do" | "when" | "unless"
+            | "syntax-case" | "syntax" | "with-syntax"
     )
 }
 
 #[derive(Debug, Clone)]
-enum PatternBinding {
+pub(crate) enum PatternBinding {
     Single(Ast),
     Ellipsis(Vec<Ast>),
 }
 
-fn match_pattern(
+pub(crate) fn match_pattern(
     pattern: &[Ast],
     form: &[Ast],
     literals: &[String],
@@ -316,4 +317,106 @@ pub(crate) fn eval_define_syntax(args: &[Ast], env: &Env) -> Result<Value, EvalE
         },
     );
     Ok(Value::Void)
+}
+
+// ---- syntax-case template expansion ----
+
+pub(crate) fn expand_syntax_form(
+    template: &Ast,
+    env: &Env,
+) -> (Ast, Vec<(String, String)>) {
+    let mut renames = HashMap::new();
+    let expanded = expand_syntax_tmpl(template, env, &mut renames);
+    let rename_pairs: Vec<(String, String)> = renames.into_iter().collect();
+    (expanded, rename_pairs)
+}
+
+fn expand_syntax_tmpl(
+    template: &Ast,
+    env: &Env,
+    renames: &mut HashMap<String, String>,
+) -> Ast {
+    match &template.kind {
+        AstKind::Symbol(name) => {
+            // Check if bound to a Syntax value (pattern variable)
+            match env.borrow().get(name) {
+                Some(Value::Syntax { ast, .. }) => return ast,
+                Some(Value::SyntaxEllipsis(_)) => return template.clone(),
+                _ => {}
+            }
+            if is_special_form(name) || name == "..." {
+                template.clone()
+            } else {
+                let gensym_name = renames
+                    .entry(name.clone())
+                    .or_insert_with(|| gensym(name))
+                    .clone();
+                Ast {
+                    kind: AstKind::Symbol(gensym_name),
+                    line: template.line,
+                    col: template.col,
+                }
+            }
+        }
+        AstKind::List(elements) => {
+            // Don't expand inside quote
+            if matches!(elements.first(), Some(Ast { kind: AstKind::Symbol(s), .. }) if s == "quote") {
+                return template.clone();
+            }
+            let mut expanded = Vec::new();
+            let mut i = 0;
+            while i < elements.len() {
+                if matches!(&elements[i].kind, AstKind::Symbol(s) if s == "...") {
+                    i += 1;
+                    continue;
+                }
+                let is_ellipsis = i + 1 < elements.len()
+                    && matches!(&elements[i + 1].kind, AstKind::Symbol(s) if s == "...");
+
+                if is_ellipsis {
+                    if let Some((var_name, asts)) = find_syntax_ellipsis_var(&elements[i], env) {
+                        for ast in &asts {
+                            let tmp_env = Environment::with_parent(env);
+                            tmp_env.borrow_mut().set(
+                                var_name.clone(),
+                                Value::Syntax { ast: ast.clone(), renames: vec![], source_env: None },
+                            );
+                            expanded.push(expand_syntax_tmpl(&elements[i], &tmp_env, renames));
+                        }
+                    }
+                    i += 2;
+                } else {
+                    expanded.push(expand_syntax_tmpl(&elements[i], env, renames));
+                    i += 1;
+                }
+            }
+            Ast {
+                kind: AstKind::List(expanded),
+                line: template.line,
+                col: template.col,
+            }
+        }
+        _ => template.clone(),
+    }
+}
+
+fn find_syntax_ellipsis_var(template: &Ast, env: &Env) -> Option<(String, Vec<Ast>)> {
+    match &template.kind {
+        AstKind::Symbol(name) => {
+            if let Some(Value::SyntaxEllipsis(asts)) = env.borrow().get(name) {
+                Some((name.clone(), asts))
+            } else {
+                None
+            }
+        }
+        AstKind::List(elements) => {
+            for elem in elements {
+                if let result @ Some(_) = find_syntax_ellipsis_var(elem, env) {
+                    return result;
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }

@@ -1,7 +1,9 @@
 use std::rc::Rc;
 
+use std::collections::HashMap;
+
 use super::{
-    ast_to_value, cek_eval_cond, common_winder_prefix_len, eqv, vec_to_list, Ast, AstKind,
+    ast_to_value, cek_eval_cond, common_winder_prefix_len, eqv, macros, vec_to_list, Ast, AstKind,
     CekState, Environment, Env, EvalError, Frame, Kont, Value, Winders,
 };
 
@@ -315,37 +317,143 @@ pub(crate) fn cek_apply_frame(frame: Frame, val: Value, kont: &mut Kont, winders
             };
             cek_apply_func(consumer, args, kont, winders, output)
         }
-        Frame::ContinuationWind { mut out_thunks, in_entries, saved_kont, saved_winders, val } => {
-            if !out_thunks.is_empty() {
-                let thunk = out_thunks.remove(0);
-                winders.pop();
-                kont.push(Frame::ContinuationWind {
-                    out_thunks,
-                    in_entries,
-                    saved_kont,
-                    saved_winders,
-                    val,
-                });
-                cek_apply_func(thunk, vec![], kont, winders, output)
-            } else if !in_entries.is_empty() {
-                let entry = in_entries[0].clone();
-                let remaining = in_entries[1..].to_vec();
-                let in_thunk = entry.0.clone();
-                winders.push(entry);
-                kont.push(Frame::ContinuationWind {
-                    out_thunks: vec![],
-                    in_entries: remaining,
-                    saved_kont,
-                    saved_winders,
-                    val,
-                });
-                cek_apply_func(in_thunk, vec![], kont, winders, output)
+        Frame::SyntaxCaseMatch { literals, clauses, env } => {
+            apply_syntax_case_match(val, literals, clauses, env, kont)
+        }
+        Frame::MacroResult { use_env } => {
+            apply_macro_result(val, use_env)
+        }
+        Frame::WithSyntaxBind { name, remaining, body, bind_env, eval_env } => {
+            bind_env.borrow_mut().set(name, val);
+            if remaining.is_empty() {
+                cek_eval_body(body, bind_env, kont)
             } else {
-                *kont = saved_kont;
-                *winders = saved_winders;
-                Ok(CekState::Apply(val))
+                let next = remaining[0].clone();
+                kont.push(Frame::WithSyntaxBind {
+                    name: next.0,
+                    remaining: remaining[1..].to_vec(),
+                    body,
+                    bind_env,
+                    eval_env: eval_env.clone(),
+                });
+                Ok(CekState::Eval(next.1, eval_env))
             }
         }
+        Frame::ContinuationWind { out_thunks, in_entries, saved_kont, saved_winders, val } => {
+            apply_continuation_wind(
+                ContinuationWindState { out_thunks, in_entries, saved_kont, saved_winders, val },
+                kont, winders, output,
+            )
+        }
+    }
+}
+
+fn apply_syntax_case_match(
+    val: Value,
+    literals: Vec<String>,
+    clauses: Vec<Ast>,
+    env: Env,
+    kont: &mut Kont,
+) -> Result<CekState, EvalError> {
+    let ast = match &val {
+        Value::Syntax { ast, .. } => ast.clone(),
+        _ => return Err(EvalError::Type("syntax-case: expected syntax object".into())),
+    };
+    let form_elements = match &ast.kind {
+        AstKind::List(items) => items.as_slice(),
+        _ => return Err(EvalError::Type("syntax-case: expected list form".into())),
+    };
+    for clause in &clauses {
+        let clause_items = match &clause.kind {
+            AstKind::List(items) if items.len() >= 2 => items,
+            _ => return Err(EvalError::Type("syntax-case: invalid clause".into())),
+        };
+        let pattern = &clause_items[0];
+        let body = &clause_items[clause_items.len() - 1];
+        let pattern_elements = match &pattern.kind {
+            AstKind::List(items) => items,
+            _ => continue,
+        };
+        let mut bindings = HashMap::new();
+        if macros::match_pattern(pattern_elements, form_elements, &literals, &mut bindings) {
+            let child_env = Environment::with_parent(&env);
+            for (name, binding) in bindings {
+                match binding {
+                    macros::PatternBinding::Single(bound_ast) => {
+                        child_env.borrow_mut().set(name, Value::Syntax {
+                            ast: bound_ast,
+                            renames: vec![],
+                            source_env: None,
+                        });
+                    }
+                    macros::PatternBinding::Ellipsis(asts) => {
+                        child_env.borrow_mut().set(name, Value::SyntaxEllipsis(asts));
+                    }
+                }
+            }
+            return cek_eval_body(vec![body.clone()], child_env, kont);
+        }
+    }
+    Err(EvalError::Type("syntax-case: no matching pattern".into()))
+}
+
+fn apply_macro_result(val: Value, use_env: Env) -> Result<CekState, EvalError> {
+    let Value::Syntax { ast, renames, source_env } = val else {
+        return Err(EvalError::Type("macro transformer must return a syntax object".into()));
+    };
+    // Add gensym bindings directly to use_env so defines are visible
+    if let Some(src) = source_env {
+        for (orig, gensym_name) in &renames {
+            if let Some(v) = src.borrow().get(orig) {
+                use_env.borrow_mut().set(gensym_name.clone(), v);
+            }
+        }
+    }
+    Ok(CekState::Eval(ast, use_env))
+}
+
+struct ContinuationWindState {
+    out_thunks: Vec<Value>,
+    in_entries: Winders,
+    saved_kont: Kont,
+    saved_winders: Winders,
+    val: Value,
+}
+
+fn apply_continuation_wind(
+    mut state: ContinuationWindState,
+    kont: &mut Kont,
+    winders: &mut Winders,
+    output: &mut String,
+) -> Result<CekState, EvalError> {
+    if !state.out_thunks.is_empty() {
+        let thunk = state.out_thunks.remove(0);
+        winders.pop();
+        kont.push(Frame::ContinuationWind {
+            out_thunks: state.out_thunks,
+            in_entries: state.in_entries,
+            saved_kont: state.saved_kont,
+            saved_winders: state.saved_winders,
+            val: state.val,
+        });
+        cek_apply_func(thunk, vec![], kont, winders, output)
+    } else if !state.in_entries.is_empty() {
+        let entry = state.in_entries[0].clone();
+        let remaining = state.in_entries[1..].to_vec();
+        let in_thunk = entry.0.clone();
+        winders.push(entry);
+        kont.push(Frame::ContinuationWind {
+            out_thunks: vec![],
+            in_entries: remaining,
+            saved_kont: state.saved_kont,
+            saved_winders: state.saved_winders,
+            val: state.val,
+        });
+        cek_apply_func(in_thunk, vec![], kont, winders, output)
+    } else {
+        *kont = state.saved_kont;
+        *winders = state.saved_winders;
+        Ok(CekState::Apply(state.val))
     }
 }
 

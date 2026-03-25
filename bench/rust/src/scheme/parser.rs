@@ -131,6 +131,19 @@ impl Parser {
                 }
             }
         }
+        if let Some('\'') = self.peek() {
+            // Syntax quote #'expr -> (syntax expr)
+            self.next_char(); // consume '\''
+            let expr = self.parse_expr()?;
+            return Ok(Ast {
+                kind: AstKind::List(vec![
+                    Ast { kind: AstKind::Symbol("syntax".into()), line, col },
+                    expr,
+                ]),
+                line,
+                col,
+            });
+        }
         match self.next_char() {
             Some('t') => {
                 if self.peek().is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '-' && c != '!' && c != '?') {

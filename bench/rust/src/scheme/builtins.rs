@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use super::{apply, eqv, make_pair, make_rational, value_to_vec, vec_to_list, Environment, Env, Value, EvalError};
+use super::{apply, ast_to_value, eqv, make_pair, make_rational, value_to_ast, value_to_vec, vec_to_list, Environment, Env, Value, EvalError};
 
 /// Extract numerator/denominator pair from a numeric value (exact representation).
 fn to_rational(v: &Value) -> Result<(i64, i64), EvalError> {
@@ -1198,6 +1198,30 @@ fn builtin_round(args: &[Value], _output: &mut String) -> Result<Value, EvalErro
     }
 }
 
+fn builtin_syntax_to_datum(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("syntax->datum: expected 1 argument".into()));
+    }
+    match &args[0] {
+        Value::Syntax { ast, .. } => Ok(ast_to_value(ast)),
+        _ => Err(EvalError::Type("syntax->datum: expected syntax object".into())),
+    }
+}
+
+fn builtin_datum_to_syntax(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity("datum->syntax: expected 2 arguments".into()));
+    }
+    // First arg: template-id (syntax object for lexical context - we use it for context but don't need it for our impl)
+    let datum = &args[1];
+    let ast = value_to_ast(datum)?;
+    Ok(Value::Syntax {
+        ast,
+        renames: vec![],
+        source_env: None,
+    })
+}
+
 pub(crate) fn make_global_env() -> Env {
     let env = Environment::new();
     {
@@ -1363,6 +1387,9 @@ pub(crate) fn make_global_env() -> Env {
         e.set("string>=?".into(), Value::Builtin(builtin_string_ge));
         e.set("truncate".into(), Value::Builtin(builtin_truncate));
         e.set("round".into(), Value::Builtin(builtin_round));
+        // L22: syntax-case support
+        e.set("syntax->datum".into(), Value::Builtin(builtin_syntax_to_datum));
+        e.set("datum->syntax".into(), Value::Builtin(builtin_datum_to_syntax));
     }
     env
 }

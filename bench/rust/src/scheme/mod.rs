@@ -92,6 +92,15 @@ pub(crate) enum Value {
     WithExceptionHandler,
     Values(Vec<Value>),
     CallWithValues,
+    Syntax {
+        ast: Ast,
+        renames: Vec<(String, String)>,
+        source_env: Option<Env>,
+    },
+    SyntaxEllipsis(Vec<Ast>),
+    SyntaxCaseMacro {
+        transformer: Box<Value>,
+    },
 }
 
 // ---- CEK Machine continuation frames ----
@@ -124,6 +133,9 @@ pub(crate) enum Frame {
     GuardHandler { var: String, clauses: Vec<Ast>, env: Env },
     RaiseUnwind { raised_val: Value },
     CallWithValues { consumer: Value },
+    SyntaxCaseMatch { literals: Vec<String>, clauses: Vec<Ast>, env: Env },
+    MacroResult { use_env: Env },
+    WithSyntaxBind { name: String, remaining: Vec<(String, Ast)>, body: Vec<Ast>, bind_env: Env, eval_env: Env },
 }
 
 pub(crate) enum CekState {
@@ -320,7 +332,8 @@ impl Value {
                 let inner: Vec<String> = items.iter().map(|v| v.display_value()).collect();
                 format!("#({})", inner.join(" "))
             }
-            Value::Macro { .. } => "#<macro>".into(),
+            Value::Macro { .. } | Value::SyntaxCaseMacro { .. } => "#<macro>".into(),
+            Value::Syntax { .. } | Value::SyntaxEllipsis(_) => "#<syntax>".into(),
             Value::Record { type_name, fields, .. } => {
                 let inner: Vec<String> = fields.iter().map(|(k, v)| format!("{}: {}", k, v.display_value())).collect();
                 format!("#<{} {}>", type_name, inner.join(", "))
@@ -399,6 +412,23 @@ pub(crate) fn ast_to_value(ast: &Ast) -> Value {
         AstKind::Char(c) => Value::Char(*c),
         AstKind::Symbol(s) => Value::Symbol(s.clone()),
         AstKind::List(items) => Value::List(items.iter().map(ast_to_value).collect()),
+    }
+}
+
+pub(crate) fn value_to_ast(val: &Value) -> Result<Ast, EvalError> {
+    match val {
+        Value::Integer(n) => Ok(Ast { kind: AstKind::Integer(*n), line: 0, col: 0 }),
+        Value::Rational(n, d) => Ok(Ast { kind: AstKind::Rational(*n, *d), line: 0, col: 0 }),
+        Value::Float(f) => Ok(Ast { kind: AstKind::Float(*f), line: 0, col: 0 }),
+        Value::Boolean(b) => Ok(Ast { kind: AstKind::Boolean(*b), line: 0, col: 0 }),
+        Value::Str(s) => Ok(Ast { kind: AstKind::Str(s.clone()), line: 0, col: 0 }),
+        Value::Char(c) => Ok(Ast { kind: AstKind::Char(*c), line: 0, col: 0 }),
+        Value::Symbol(s) => Ok(Ast { kind: AstKind::Symbol(s.clone()), line: 0, col: 0 }),
+        Value::List(items) => {
+            let ast_items: Result<Vec<Ast>, _> = items.iter().map(value_to_ast).collect();
+            Ok(Ast { kind: AstKind::List(ast_items?), line: 0, col: 0 })
+        }
+        _ => Err(EvalError::Type(format!("cannot convert to syntax: {}", val.display_value()))),
     }
 }
 
@@ -560,8 +590,102 @@ fn cek_eval_list(items: &[Ast], env: &Env, kont: &mut Kont, _output: &mut String
             }
             "string-set!" => cek_eval_string_set(&items[1..], env, kont),
             "define-syntax" => {
+                if items.len() != 3 {
+                    return Err(EvalError::Arity("define-syntax requires 2 arguments".into()));
+                }
+                let ds_name = match &items[1].kind {
+                    AstKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Type("define-syntax: expected symbol".into())),
+                };
+                // Check if body is a lambda (syntax-case transformer)
+                if let AstKind::List(body_items) = &items[2].kind {
+                    if !body_items.is_empty()
+                        && matches!(&body_items[0].kind, AstKind::Symbol(s) if s == "lambda") {
+                            let proc = eval_lambda(&body_items[1..], env)?;
+                            env.borrow_mut().set(ds_name, Value::SyntaxCaseMacro {
+                                transformer: Box::new(proc),
+                            });
+                            return Ok(CekState::Apply(Value::Void));
+                        }
+                }
                 let result = eval_define_syntax(&items[1..], env)?;
                 Ok(CekState::Apply(result))
+            }
+            "syntax-case" => {
+                // (syntax-case expr (literals...) clause ...)
+                if items.len() < 4 {
+                    return Err(EvalError::Arity("syntax-case requires expr, literals, and clauses".into()));
+                }
+                let literals = match &items[2].kind {
+                    AstKind::List(lits) => lits.iter().map(|l| match &l.kind {
+                        AstKind::Symbol(s) => Ok(s.clone()),
+                        _ => Err(EvalError::Type("syntax-case: expected symbol in literals".into())),
+                    }).collect::<Result<Vec<_>, _>>()?,
+                    _ => return Err(EvalError::Type("syntax-case: expected literals list".into())),
+                };
+                let clauses = items[3..].to_vec();
+                kont.push(Frame::SyntaxCaseMatch { literals, clauses, env: Rc::clone(env) });
+                Ok(CekState::Eval(items[1].clone(), Rc::clone(env)))
+            }
+            "syntax" => {
+                if items.len() != 2 {
+                    return Err(EvalError::Arity("syntax requires exactly 1 argument".into()));
+                }
+                let template = &items[1];
+                // Simple case: single symbol bound to a Syntax value
+                if let AstKind::Symbol(name) = &template.kind {
+                    let val = env.borrow().get(name);
+                    if let Some(v @ Value::Syntax { .. }) = val {
+                        return Ok(CekState::Apply(v));
+                    }
+                    if let Some(v @ Value::SyntaxEllipsis(_)) = val {
+                        return Ok(CekState::Apply(v));
+                    }
+                }
+                // Full template expansion
+                let (expanded, renames) = macros::expand_syntax_form(template, env);
+                Ok(CekState::Apply(Value::Syntax {
+                    ast: expanded,
+                    renames,
+                    source_env: Some(Rc::clone(env)),
+                }))
+            }
+            "with-syntax" => {
+                // (with-syntax ((pat expr) ...) body ...)
+                if items.len() < 3 {
+                    return Err(EvalError::Arity("with-syntax requires bindings and body".into()));
+                }
+                let bindings_list = match &items[1].kind {
+                    AstKind::List(b) => b,
+                    _ => return Err(EvalError::Type("with-syntax: expected bindings list".into())),
+                };
+                let body = items[2..].to_vec();
+                let mut bindings = Vec::new();
+                for b in bindings_list {
+                    match &b.kind {
+                        AstKind::List(pair) if pair.len() == 2 => {
+                            let bname = match &pair[0].kind {
+                                AstKind::Symbol(s) => s.clone(),
+                                _ => return Err(EvalError::Type("with-syntax: expected symbol in binding".into())),
+                            };
+                            bindings.push((bname, pair[1].clone()));
+                        }
+                        _ => return Err(EvalError::Type("with-syntax: invalid binding".into())),
+                    }
+                }
+                let child_env = Environment::with_parent(env);
+                if bindings.is_empty() {
+                    return cek_eval_body(body, child_env, kont);
+                }
+                let first = bindings.remove(0);
+                kont.push(Frame::WithSyntaxBind {
+                    name: first.0,
+                    remaining: bindings,
+                    body,
+                    bind_env: child_env,
+                    eval_env: Rc::clone(env),
+                });
+                Ok(CekState::Eval(first.1, Rc::clone(env)))
             }
             "define-record-type" => {
                 let result = eval_define_record_type(&items[1..], env)?;
@@ -612,10 +736,19 @@ fn cek_eval_list(items: &[Ast], env: &Env, kont: &mut Kont, _output: &mut String
             }
             _ => {
                 // Check for macro invocation
-                let maybe_macro = env.borrow().get(op);
-                if let Some(Value::Macro { literals, rules, def_env }) = maybe_macro {
-                    let (expanded, eval_env) = macros::expand_macro_form(&literals, &rules, &def_env, items, env)?;
-                    return Ok(CekState::Eval(expanded, eval_env));
+                match env.borrow().get(op) {
+                    Some(Value::Macro { literals, rules, def_env }) => {
+                        let (expanded, eval_env) = macros::expand_macro_form(&literals, &rules, &def_env, items, env)?;
+                        return Ok(CekState::Eval(expanded, eval_env));
+                    }
+                    Some(Value::SyntaxCaseMacro { transformer, .. }) => {
+                        let form_ast = ast_list(items.to_vec());
+                        let stx = Value::Syntax { ast: form_ast, renames: vec![], source_env: None };
+                        kont.push(Frame::MacroResult { use_env: Rc::clone(env) });
+                        kont.push(Frame::Args { func: *transformer, done: vec![], remaining: vec![], env: Rc::clone(env) });
+                        return Ok(CekState::Apply(stx));
+                    }
+                    _ => {}
                 }
                 // Function application
                 cek_eval_application(items, env, kont)
