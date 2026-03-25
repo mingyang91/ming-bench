@@ -83,9 +83,29 @@ public class Evaluator {
         ResolvedValue(Object value) { this.value = value; }
     }
 
+    // --- Record types (define-record-type) ---
+
+    private static class RecordType {
+        final String name;
+        final List<String> fieldNames;
+        RecordType(String name, List<String> fieldNames) {
+            this.name = name;
+            this.fieldNames = fieldNames;
+        }
+    }
+
+    private static class RecordInstance {
+        final RecordType type;
+        final Object[] fields;
+        RecordInstance(RecordType type, Object[] fields) {
+            this.type = type;
+            this.fields = fields;
+        }
+    }
+
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "quote", "if", "define", "lambda", "let", "set!", "begin", "cond",
-        "and", "or", "define-syntax", "syntax-rules", "else"
+        "and", "or", "define-syntax", "syntax-rules", "else", "define-record-type"
     );
 
     // Sentinel for empty list '()
@@ -926,6 +946,82 @@ public class Evaluator {
                             rules.add(new Object[]{rule.get(0), rule.get(1)});
                         }
                         env.define(macroName, new SyntaxRulesMacro(lits, rules, env));
+                        return VOID;
+                    }
+                    case "define-record-type" -> {
+                        // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+                        // list.get(1) = type name (e.g. <point>)
+                        // list.get(2) = (constructor-name field-names...)
+                        // list.get(3) = predicate name
+                        // list.get(4..) = (field-name accessor-name)
+                        Object typeNameObj = list.get(1);
+                        if (typeNameObj instanceof SourceExpr se) typeNameObj = se.expr;
+
+                        Object ctorListObj = list.get(2);
+                        if (ctorListObj instanceof SourceExpr se) ctorListObj = se.expr;
+                        @SuppressWarnings("unchecked")
+                        List<Object> ctorList = (List<Object>) ctorListObj;
+                        Object ctorNameObj = ctorList.get(0);
+                        if (ctorNameObj instanceof SourceExpr se) ctorNameObj = se.expr;
+                        String ctorName = (String) ctorNameObj;
+                        List<String> ctorFields = new ArrayList<>();
+                        for (int i = 1; i < ctorList.size(); i++) {
+                            Object f = ctorList.get(i);
+                            if (f instanceof SourceExpr se) f = se.expr;
+                            ctorFields.add((String) f);
+                        }
+
+                        Object predNameObj = list.get(3);
+                        if (predNameObj instanceof SourceExpr se) predNameObj = se.expr;
+                        String predName = (String) predNameObj;
+
+                        // Collect field specs
+                        List<String> fieldNames = new ArrayList<>();
+                        List<String> accessorNames = new ArrayList<>();
+                        for (int i = 4; i < list.size(); i++) {
+                            Object fieldSpec = list.get(i);
+                            if (fieldSpec instanceof SourceExpr se) fieldSpec = se.expr;
+                            @SuppressWarnings("unchecked")
+                            List<Object> spec = (List<Object>) fieldSpec;
+                            Object fn = spec.get(0);
+                            if (fn instanceof SourceExpr se) fn = se.expr;
+                            fieldNames.add((String) fn);
+                            Object an = spec.get(1);
+                            if (an instanceof SourceExpr se) an = se.expr;
+                            accessorNames.add((String) an);
+                        }
+
+                        RecordType recordType = new RecordType((String) typeNameObj, fieldNames);
+
+                        // Define constructor
+                        env.define(ctorName, (BuiltinProc) args -> {
+                            if (args.size() != ctorFields.size()) {
+                                throw new EvalError(ctorName + ": expected " + ctorFields.size() + " arguments");
+                            }
+                            Object[] fields = new Object[fieldNames.size()];
+                            for (int i = 0; i < ctorFields.size(); i++) {
+                                int idx = fieldNames.indexOf(ctorFields.get(i));
+                                fields[idx] = args.get(i);
+                            }
+                            return new RecordInstance(recordType, fields);
+                        });
+
+                        // Define predicate
+                        env.define(predName, (BuiltinProc) args -> {
+                            return args.get(0) instanceof RecordInstance ri && ri.type == recordType;
+                        });
+
+                        // Define accessors
+                        for (int i = 0; i < fieldNames.size(); i++) {
+                            final int idx = i;
+                            env.define(accessorNames.get(i), (BuiltinProc) args -> {
+                                if (!(args.get(0) instanceof RecordInstance ri) || ri.type != recordType) {
+                                    throw new EvalError(accessorNames.get(idx) + ": not a " + recordType.name);
+                                }
+                                return ri.fields[idx];
+                            });
+                        }
+
                         return VOID;
                     }
                 }
