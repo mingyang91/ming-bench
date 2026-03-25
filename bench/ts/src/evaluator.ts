@@ -16,7 +16,7 @@ type SchemeVal =
   | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal; pos?: Pos }
   | { tag: 'nil'; pos?: Pos }
   | { tag: 'void'; pos?: Pos }
-  | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env; pos?: Pos }
+  | { tag: 'lambda'; params: string[]; rest?: string; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'builtin'; name: string; fn: BuiltinFn; pos?: Pos };
 
 function posStr(pos?: Pos): string {
@@ -315,6 +315,42 @@ function makeGlobalEnv(): Env {
     return { tag: 'symbol', value: args[0].value };
   });
 
+  defBuiltin('apply', (args) => {
+    if (args.length < 2) throw new EvalError('apply: expected at least 2 arguments');
+    const func = args[0];
+    const lastArg = args[args.length - 1];
+    const prefixArgs = args.slice(1, args.length - 1);
+    const tailArgs = pairToArray(lastArg);
+    const allArgs = [...prefixArgs, ...tailArgs];
+    if (func.tag === 'lambda') {
+      if (func.rest) {
+        if (allArgs.length < func.params.length) {
+          throw new EvalError(`lambda: expected at least ${func.params.length} arguments, got ${allArgs.length}`);
+        }
+      } else {
+        if (allArgs.length !== func.params.length) {
+          throw new EvalError(`lambda: expected ${func.params.length} arguments, got ${allArgs.length}`);
+        }
+      }
+      const callEnv = new Env(func.env);
+      for (let i = 0; i < func.params.length; i++) {
+        callEnv.define(func.params[i], allArgs[i]);
+      }
+      if (func.rest) {
+        callEnv.define(func.rest, makeList(allArgs.slice(func.params.length)));
+      }
+      let result: SchemeVal = { tag: 'void' };
+      for (const bodyExpr of func.body) {
+        result = evalExpr(bodyExpr, callEnv);
+      }
+      return result;
+    }
+    if (func.tag === 'builtin') {
+      return func.fn(allArgs);
+    }
+    throw new EvalError(`apply: not a procedure: ${displayVal(func)}`);
+  });
+
   return env;
 }
 
@@ -431,6 +467,24 @@ function quoteSyntaxToValue(expr: SchemeVal): SchemeVal {
   return expr;
 }
 
+// ── Parameter parsing ─────────────────────────────────────────────
+
+function parseParams(paramList: SchemeVal[], pos?: Pos): { params: string[]; rest?: string } {
+  const params: string[] = [];
+  for (let i = 0; i < paramList.length; i++) {
+    const p = paramList[i];
+    if (p.tag === 'symbol' && p.value === '.') {
+      if (i !== paramList.length - 2) throw errAt('bad dot syntax in parameter list', pos);
+      const restParam = paramList[i + 1];
+      if (restParam.tag !== 'symbol') throw errAt('rest parameter must be a symbol', pos);
+      return { params, rest: restParam.value };
+    }
+    if (p.tag !== 'symbol') throw errAt('parameter must be a symbol', pos);
+    params.push(p.value);
+  }
+  return { params };
+}
+
 // ── Evaluator ──────────────────────────────────────────────────────
 
 function isTruthy(val: SchemeVal): boolean {
@@ -481,12 +535,9 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
         }
         if (target.tag === 'list' && target.elements.length > 0 && target.elements[0].tag === 'symbol') {
           const name = target.elements[0].value;
-          const params = target.elements.slice(1).map(p => {
-            if (p.tag !== 'symbol') throw errAt('define: parameter must be a symbol', epos);
-            return p.value;
-          });
+          const { params, rest } = parseParams(target.elements.slice(1), epos);
           const body = elems.slice(2);
-          const lambda: SchemeVal = { tag: 'lambda', params, body, env };
+          const lambda: SchemeVal = { tag: 'lambda', params, rest, body, env };
           env.define(name, lambda);
           return { tag: 'void' };
         }
@@ -496,13 +547,15 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
       if (op === 'lambda') {
         if (elems.length < 3) throw errAt('lambda: bad syntax', epos);
         const paramList = elems[1];
+        // (lambda args body) — single symbol catches all args
+        if (paramList.tag === 'symbol') {
+          const body = elems.slice(2);
+          return { tag: 'lambda', params: [], rest: paramList.value, body, env };
+        }
         if (paramList.tag !== 'list') throw errAt('lambda: parameters must be a list', epos);
-        const params = paramList.elements.map(p => {
-          if (p.tag !== 'symbol') throw errAt('lambda: parameter must be a symbol', epos);
-          return p.value;
-        });
+        const { params, rest } = parseParams(paramList.elements, epos);
         const body = elems.slice(2);
-        return { tag: 'lambda', params, body, env };
+        return { tag: 'lambda', params, rest, body, env };
       }
 
       if (op === 'set!') {
@@ -626,12 +679,21 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
     const args = elems.slice(1).map(e => evalExpr(e, env));
 
     if (func.tag === 'lambda') {
-      if (args.length !== func.params.length) {
-        throw errAt(`lambda: expected ${func.params.length} arguments, got ${args.length}`, epos);
+      if (func.rest) {
+        if (args.length < func.params.length) {
+          throw errAt(`lambda: expected at least ${func.params.length} arguments, got ${args.length}`, epos);
+        }
+      } else {
+        if (args.length !== func.params.length) {
+          throw errAt(`lambda: expected ${func.params.length} arguments, got ${args.length}`, epos);
+        }
       }
       const callEnv = new Env(func.env);
       for (let i = 0; i < func.params.length; i++) {
         callEnv.define(func.params[i], args[i]);
+      }
+      if (func.rest) {
+        callEnv.define(func.rest, makeList(args.slice(func.params.length)));
       }
       let result: SchemeVal = { tag: 'void' };
       for (const bodyExpr of func.body) {
