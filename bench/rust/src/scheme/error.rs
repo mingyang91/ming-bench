@@ -18,4 +18,7 @@ pub enum EvalError {
 
     #[error("{0} at {1}:{2}")]
     WithPosition(Box<EvalError>, usize, usize),
+
+    #[error("step limit exceeded")]
+    StepLimitExceeded,
 }

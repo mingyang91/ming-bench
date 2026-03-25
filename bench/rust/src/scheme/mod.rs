@@ -500,10 +500,25 @@ fn wrap_err(e: EvalError, pos: (usize, usize)) -> EvalError {
 }
 
 fn cek_run(mut state: CekState, kont: &mut Kont, winders: &mut Winders, output: &mut String) -> Result<Value, EvalError> {
+    cek_run_impl(state, kont, winders, output, None)
+}
+
+fn cek_run_limited(mut state: CekState, kont: &mut Kont, winders: &mut Winders, output: &mut String, max_steps: u64) -> Result<Value, EvalError> {
+    cek_run_impl(state, kont, winders, output, Some(max_steps))
+}
+
+fn cek_run_impl(mut state: CekState, kont: &mut Kont, winders: &mut Winders, output: &mut String, max_steps: Option<u64>) -> Result<Value, EvalError> {
     let mut last_pos = (0usize, 0usize);
+    let mut steps: u64 = 0;
     loop {
         if let CekState::Eval(ref ast, _) = state {
             last_pos = (ast.line, ast.col);
+        }
+        if let Some(limit) = max_steps {
+            steps += 1;
+            if steps > limit {
+                return Err(EvalError::StepLimitExceeded);
+            }
         }
         state = match state {
             CekState::Eval(ast, env) => {
@@ -1481,6 +1496,24 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
+pub fn eval_str_with_limit(input: &str, max_steps: u64) -> Result<String, EvalError> {
+    let mut parser = Parser::new(input);
+    let exprs = parser.parse_all()?;
+    let env = builtins::make_global_env();
+    let mut output = String::new();
+    if exprs.is_empty() {
+        return Ok(Value::Void.display_value());
+    }
+    let mut kont: Kont = Vec::new();
+    let mut winders: Winders = Vec::new();
+    if exprs.len() > 1 {
+        kont.push(Frame::Seq { remaining: exprs[1..].to_vec(), env: Rc::clone(&env) });
+    }
+    let state = CekState::Eval(exprs[0].clone(), Rc::clone(&env));
+    let result = cek_run_limited(state, &mut kont, &mut winders, &mut output, max_steps)?;
+    Ok(result.display_value())
+}
+
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let mut parser = Parser::new(input);
     let exprs = parser.parse_all()?;
