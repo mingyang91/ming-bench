@@ -26,19 +26,20 @@ type templateContext struct {
 }
 
 var macroKeywordNames = map[string]struct{}{
-	"and":           {},
-	"begin":         {},
-	"cond":          {},
-	"define":        {},
+	"and":                {},
+	"begin":              {},
+	"cond":               {},
+	"case-lambda":        {},
+	"define":             {},
 	"define-record-type": {},
-	"define-syntax": {},
-	"if":            {},
-	"lambda":        {},
-	"let":           {},
-	"or":            {},
-	"quote":         {},
-	"set!":          {},
-	"syntax-rules":  {},
+	"define-syntax":      {},
+	"if":                 {},
+	"lambda":             {},
+	"let":                {},
+	"or":                 {},
+	"quote":              {},
+	"set!":               {},
+	"syntax-rules":       {},
 }
 
 var macroGensymCounter int

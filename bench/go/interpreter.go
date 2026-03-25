@@ -56,6 +56,10 @@ type closureValue struct {
 	env       *environment
 }
 
+type caseClosureValue struct {
+	clauses []*closureValue
+}
+
 type binding struct {
 	value value
 }
@@ -134,6 +138,7 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("apply", builtinApply())
 	env.define("map", builtinMap())
 	env.define("assoc", builtinAssoc())
+	env.define("procedure?", builtinProcedurePredicate())
 	env.define("string?", builtinPredicate(func(v value) bool {
 		return isStringValue(v)
 	}))
@@ -288,6 +293,9 @@ func evalList(list listNode, env *environment) (value, error) {
 			return result, withErrorPos(err, list.pos)
 		case "lambda":
 			result, err := evalLambda(list.elements[1:], env)
+			return result, withErrorPos(err, list.pos)
+		case "case-lambda":
+			result, err := evalCaseLambda(list.elements[1:], env)
 			return result, withErrorPos(err, list.pos)
 		case "begin":
 			result, err := evalBegin(list.elements[1:], env)
@@ -452,6 +460,28 @@ func evalLambda(args []node, env *environment) (value, error) {
 	return makeClosure(params.elements, args[1:], env)
 }
 
+func evalCaseLambda(args []node, env *environment) (value, error) {
+	if len(args) == 0 {
+		return nil, &EvalError{Message: "case-lambda expects at least 1 clause"}
+	}
+
+	clauses := make([]*closureValue, 0, len(args))
+	for _, clauseExpr := range args {
+		clause, ok := clauseExpr.(listNode)
+		if !ok || len(clause.elements) < 2 {
+			return nil, &EvalError{Message: "case-lambda clauses must contain formals and a body"}
+		}
+
+		proc, err := makeClosureFromFormals(clause.elements[0], clause.elements[1:], env)
+		if err != nil {
+			return nil, err
+		}
+		clauses = append(clauses, proc)
+	}
+
+	return &caseClosureValue{clauses: clauses}, nil
+}
+
 func evalBegin(args []node, env *environment) (value, error) {
 	if len(args) == 0 {
 		return voidValue{}, nil
@@ -568,6 +598,32 @@ func evalBindings(bindingExprs []node, env *environment) ([]string, []value, err
 }
 
 func makeClosure(paramExprs []node, body []node, env *environment) (*closureValue, error) {
+	return makeClosureWithParams(paramExprs, body, env)
+}
+
+func makeClosureFromFormals(formals node, body []node, env *environment) (*closureValue, error) {
+	switch formals := formals.(type) {
+	case listNode:
+		return makeClosureWithParams(formals.elements, body, env)
+	case symbolNode:
+		if formals.name == "." {
+			return nil, &EvalError{Message: "parameter list must contain only symbols"}
+		}
+		if len(body) == 0 {
+			return nil, &EvalError{Message: "lambda requires a body"}
+		}
+		return &closureValue{
+			restParam: formals.name,
+			hasRest:   true,
+			body:      body,
+			env:       env,
+		}, nil
+	default:
+		return nil, &EvalError{Message: "lambda parameters must be a list or symbol"}
+	}
+}
+
+func makeClosureWithParams(paramExprs []node, body []node, env *environment) (*closureValue, error) {
 	if len(body) == 0 {
 		return nil, &EvalError{Message: "lambda requires a body"}
 	}
@@ -617,24 +673,42 @@ func applyProcedure(proc value, args []value, pos sourcePos) (value, error) {
 		result, err := proc(args)
 		return result, withErrorPos(err, pos)
 	case *closureValue:
-		if !proc.hasRest && len(args) != len(proc.params) {
-			return nil, errorAt(pos, "expected %d arguments, got %d", len(proc.params), len(args))
+		return applyClosure(proc, args, pos)
+	case *caseClosureValue:
+		for _, clause := range proc.clauses {
+			if closureAcceptsArgCount(clause, len(args)) {
+				return applyClosure(clause, args, pos)
+			}
 		}
-		if proc.hasRest && len(args) < len(proc.params) {
-			return nil, errorAt(pos, "expected at least %d arguments, got %d", len(proc.params), len(args))
-		}
-
-		callEnv := newEnvironment(proc.env)
-		for i, name := range proc.params {
-			callEnv.define(name, args[i])
-		}
-		if proc.hasRest {
-			callEnv.define(proc.restParam, listValue{elements: copyValues(args[len(proc.params):])})
-		}
-		return evalSequence(proc.body, callEnv)
+		return nil, errorAt(pos, "no matching case-lambda clause for %d arguments", len(args))
 	default:
 		return nil, errorAt(pos, "not a procedure")
 	}
+}
+
+func closureAcceptsArgCount(proc *closureValue, argCount int) bool {
+	if proc.hasRest {
+		return argCount >= len(proc.params)
+	}
+	return argCount == len(proc.params)
+}
+
+func applyClosure(proc *closureValue, args []value, pos sourcePos) (value, error) {
+	if !proc.hasRest && len(args) != len(proc.params) {
+		return nil, errorAt(pos, "expected %d arguments, got %d", len(proc.params), len(args))
+	}
+	if proc.hasRest && len(args) < len(proc.params) {
+		return nil, errorAt(pos, "expected at least %d arguments, got %d", len(proc.params), len(args))
+	}
+
+	callEnv := newEnvironment(proc.env)
+	for i, name := range proc.params {
+		callEnv.define(name, args[i])
+	}
+	if proc.hasRest {
+		callEnv.define(proc.restParam, listValue{elements: copyValues(args[len(proc.params):])})
+	}
+	return evalSequence(proc.body, callEnv)
 }
 
 func evalSequence(exprs []node, env *environment) (value, error) {
@@ -973,6 +1047,15 @@ func builtinEqual() builtinProc {
 			return nil, &EvalError{Message: "equal? expects exactly 2 arguments"}
 		}
 		return booleanValue(equalValues(args[0], args[1])), nil
+	}
+}
+
+func builtinProcedurePredicate() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "procedure? expects exactly 1 argument"}
+		}
+		return booleanValue(isProcedureValue(args[0])), nil
 	}
 }
 
@@ -1713,6 +1796,8 @@ func formatValue(v value) (string, error) {
 		return formatChar(v), nil
 	case *recordValue:
 		return "#<record " + v.recordType.name + ">", nil
+	case builtinProc, *closureValue, *caseClosureValue:
+		return "#<procedure>", nil
 	case *pairValue:
 		return formatPair(v, formatValue)
 	case listValue:
@@ -1829,6 +1914,15 @@ func isPairValue(v value) bool {
 	}
 }
 
+func isProcedureValue(v value) bool {
+	switch v.(type) {
+	case builtinProc, *closureValue, *caseClosureValue:
+		return true
+	default:
+		return false
+	}
+}
+
 func expectIntegerPair(name string, args []value) (int, int, error) {
 	if len(args) != 2 {
 		return 0, 0, &EvalError{Message: fmt.Sprintf("%s expects exactly 2 arguments", name)}
@@ -1921,6 +2015,9 @@ func eqValues(left, right value) bool {
 		return ok && left == right
 	case *closureValue:
 		right, ok := right.(*closureValue)
+		return ok && left == right
+	case *caseClosureValue:
+		right, ok := right.(*caseClosureValue)
 		return ok && left == right
 	case *recordValue:
 		right, ok := right.(*recordValue)
