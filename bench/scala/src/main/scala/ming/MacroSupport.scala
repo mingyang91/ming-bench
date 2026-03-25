@@ -64,6 +64,7 @@ private[ming] object MacroSupport:
     "begin",
     "cond",
     "define",
+    "define-record-type",
     "define-syntax",
     "else",
     "if",

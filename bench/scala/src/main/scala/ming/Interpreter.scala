@@ -51,6 +51,9 @@ private[ming] object Interpreter:
       case Expr.ListExpr(Expr.Symbol("define", _) :: args, pos) =>
         evalDefine(args, env, macros, pos)
 
+      case Expr.ListExpr(Expr.Symbol("define-record-type", _) :: args, pos) =>
+        RecordSupport.define(args, env, pos)
+
       case Expr.ListExpr(Expr.Symbol("define-syntax", _) :: args, pos) =>
         MacroExpander.define(args, env, macros, pos)
 
