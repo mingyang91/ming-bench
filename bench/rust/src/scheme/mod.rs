@@ -691,8 +691,35 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                 }
             }
 
-            // Function application: handle apply specially (needs out), then builtins, then lambdas
+            // Function application: handle map/apply specially (needs out), then builtins, then lambdas
             if let ExprKind::Symbol(op) = &list[0].kind {
+                if op == "map" {
+                    if list.len() < 3 {
+                        return Err(err_at(span, EvalError::Arity("map: need at least 2 arguments".into())));
+                    }
+                    let func = eval(&list[1], env, out)?;
+                    let mut lists: Vec<Vec<Val>> = Vec::new();
+                    for a in &list[2..] {
+                        let v = eval(a, env, out)?;
+                        lists.push(val_list_to_vec(&v)?);
+                    }
+                    let len = lists[0].len();
+                    for l in &lists {
+                        if l.len() != len {
+                            return Err(err_at(span, EvalError::Type("map: lists must have same length".into())));
+                        }
+                    }
+                    let mut result = Val::Nil;
+                    let mut results = Vec::new();
+                    for i in 0..len {
+                        let call_args: Vec<Val> = lists.iter().map(|l| l[i].clone()).collect();
+                        results.push(call_function(&func, call_args, span, out)?);
+                    }
+                    for r in results.into_iter().rev() {
+                        result = Val::Pair(Box::new(r), Box::new(result));
+                    }
+                    return Ok(result);
+                }
                 if op == "apply" {
                     let mut args = Vec::new();
                     for a in &list[1..] {
@@ -726,7 +753,15 @@ fn is_builtin(op: &str) -> bool {
         | "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
         | "string-append" | "string-length" | "substring" | "string->number"
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
-        | "string-copy" | "apply")
+        | "string-copy" | "apply"
+        | "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt"
+        | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
+        | "list-ref" | "list-tail" | "list?" | "assoc" | "equal?" | "eq?"
+        | "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase"
+        | "char=?" | "char<?"
+        | "string=?" | "string<?" | "string-ci=?"
+        | "string-upcase" | "string-downcase"
+        | "map")
 }
 
 /// Parse a parameter list that may contain dot notation for rest params.
@@ -827,6 +862,32 @@ fn do_apply(args: &[Val], span: Span, out: &mut String) -> Result<Val, EvalError
     let tail = val_list_to_vec(last)?;
     call_args.extend(tail);
     call_function(func, call_args, span, out)
+}
+
+/// Deep structural equality (equal?)
+fn val_equal(a: &Val, b: &Val) -> bool {
+    match (a, b) {
+        (Val::Int(x), Val::Int(y)) => x == y,
+        (Val::Bool(x), Val::Bool(y)) => x == y,
+        (Val::Char(x), Val::Char(y)) => x == y,
+        (Val::Str(x), Val::Str(y)) => x == y,
+        (Val::Symbol(x), Val::Symbol(y)) => x == y,
+        (Val::Nil, Val::Nil) => true,
+        (Val::Pair(a1, a2), Val::Pair(b1, b2)) => val_equal(a1, b1) && val_equal(a2, b2),
+        _ => false,
+    }
+}
+
+/// Identity/shallow equality (eq?)
+fn val_eq(a: &Val, b: &Val) -> bool {
+    match (a, b) {
+        (Val::Int(x), Val::Int(y)) => x == y,
+        (Val::Bool(x), Val::Bool(y)) => x == y,
+        (Val::Char(x), Val::Char(y)) => x == y,
+        (Val::Symbol(x), Val::Symbol(y)) => x == y,
+        (Val::Nil, Val::Nil) => true,
+        _ => false,
+    }
 }
 
 fn apply_builtin(op: &str, args: &[Val]) -> Result<Val, EvalError> {
@@ -1099,6 +1160,212 @@ fn apply_builtin(op: &str, args: &[Val]) -> Result<Val, EvalError> {
             match &args[0] {
                 Val::Str(s) => Ok(Val::Str(s.clone())),
                 _ => Err(EvalError::Type("string-copy: expected string".into())),
+            }
+        }
+        "abs" => {
+            if args.len() != 1 { return Err(EvalError::Arity("abs: need 1 argument".into())); }
+            Ok(Val::Int(as_int(&args[0], "abs")?.abs()))
+        }
+        "modulo" => {
+            if args.len() != 2 { return Err(EvalError::Arity("modulo: need 2 arguments".into())); }
+            let a = as_int(&args[0], "modulo")?;
+            let b = as_int(&args[1], "modulo")?;
+            if b == 0 { return Err(EvalError::Type("modulo: division by zero".into())); }
+            Ok(Val::Int(((a % b) + b) % b))
+        }
+        "remainder" => {
+            if args.len() != 2 { return Err(EvalError::Arity("remainder: need 2 arguments".into())); }
+            let a = as_int(&args[0], "remainder")?;
+            let b = as_int(&args[1], "remainder")?;
+            if b == 0 { return Err(EvalError::Type("remainder: division by zero".into())); }
+            Ok(Val::Int(a % b))
+        }
+        "quotient" => {
+            if args.len() != 2 { return Err(EvalError::Arity("quotient: need 2 arguments".into())); }
+            let a = as_int(&args[0], "quotient")?;
+            let b = as_int(&args[1], "quotient")?;
+            if b == 0 { return Err(EvalError::Type("quotient: division by zero".into())); }
+            Ok(Val::Int(a / b))
+        }
+        "min" => {
+            if args.is_empty() { return Err(EvalError::Arity("min: need at least 1 argument".into())); }
+            let mut m = as_int(&args[0], "min")?;
+            for a in &args[1..] { m = m.min(as_int(a, "min")?); }
+            Ok(Val::Int(m))
+        }
+        "max" => {
+            if args.is_empty() { return Err(EvalError::Arity("max: need at least 1 argument".into())); }
+            let mut m = as_int(&args[0], "max")?;
+            for a in &args[1..] { m = m.max(as_int(a, "max")?); }
+            Ok(Val::Int(m))
+        }
+        "expt" => {
+            if args.len() != 2 { return Err(EvalError::Arity("expt: need 2 arguments".into())); }
+            let base = as_int(&args[0], "expt")?;
+            let exp = as_int(&args[1], "expt")?;
+            if exp < 0 { return Ok(Val::Int(0)); }
+            Ok(Val::Int(base.pow(exp as u32)))
+        }
+        "zero?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("zero?: need 1 argument".into())); }
+            Ok(Val::Bool(as_int(&args[0], "zero?")? == 0))
+        }
+        "positive?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("positive?: need 1 argument".into())); }
+            Ok(Val::Bool(as_int(&args[0], "positive?")? > 0))
+        }
+        "negative?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("negative?: need 1 argument".into())); }
+            Ok(Val::Bool(as_int(&args[0], "negative?")? < 0))
+        }
+        "odd?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("odd?: need 1 argument".into())); }
+            Ok(Val::Bool(as_int(&args[0], "odd?")? % 2 != 0))
+        }
+        "even?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("even?: need 1 argument".into())); }
+            Ok(Val::Bool(as_int(&args[0], "even?")? % 2 == 0))
+        }
+        "list-ref" => {
+            if args.len() != 2 { return Err(EvalError::Arity("list-ref: need 2 arguments".into())); }
+            let idx = as_int(&args[1], "list-ref")? as usize;
+            let mut cur = &args[0];
+            for _ in 0..idx {
+                match cur {
+                    Val::Pair(_, cdr) => cur = cdr,
+                    _ => return Err(EvalError::Type("list-ref: index out of range".into())),
+                }
+            }
+            match cur {
+                Val::Pair(car, _) => Ok(*car.clone()),
+                _ => Err(EvalError::Type("list-ref: index out of range".into())),
+            }
+        }
+        "list-tail" => {
+            if args.len() != 2 { return Err(EvalError::Arity("list-tail: need 2 arguments".into())); }
+            let idx = as_int(&args[1], "list-tail")? as usize;
+            let mut cur = args[0].clone();
+            for _ in 0..idx {
+                match cur {
+                    Val::Pair(_, cdr) => cur = *cdr,
+                    _ => return Err(EvalError::Type("list-tail: index out of range".into())),
+                }
+            }
+            Ok(cur)
+        }
+        "list?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("list?: need 1 argument".into())); }
+            let mut cur = &args[0];
+            loop {
+                match cur {
+                    Val::Nil => return Ok(Val::Bool(true)),
+                    Val::Pair(_, cdr) => cur = cdr,
+                    _ => return Ok(Val::Bool(false)),
+                }
+            }
+        }
+        "assoc" => {
+            if args.len() != 2 { return Err(EvalError::Arity("assoc: need 2 arguments".into())); }
+            let key = &args[0];
+            let mut cur = &args[1];
+            loop {
+                match cur {
+                    Val::Nil => return Ok(Val::Bool(false)),
+                    Val::Pair(car, cdr) => {
+                        if let Val::Pair(k, _) = car.as_ref() {
+                            if val_equal(k, key) {
+                                return Ok(*car.clone());
+                            }
+                        }
+                        cur = cdr;
+                    }
+                    _ => return Err(EvalError::Type("assoc: expected list".into())),
+                }
+            }
+        }
+        "equal?" => {
+            if args.len() != 2 { return Err(EvalError::Arity("equal?: need 2 arguments".into())); }
+            Ok(Val::Bool(val_equal(&args[0], &args[1])))
+        }
+        "eq?" => {
+            if args.len() != 2 { return Err(EvalError::Arity("eq?: need 2 arguments".into())); }
+            Ok(Val::Bool(val_eq(&args[0], &args[1])))
+        }
+        "char-alphabetic?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("char-alphabetic?: need 1 argument".into())); }
+            match &args[0] {
+                Val::Char(c) => Ok(Val::Bool(c.is_alphabetic())),
+                _ => Err(EvalError::Type("char-alphabetic?: expected char".into())),
+            }
+        }
+        "char-numeric?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("char-numeric?: need 1 argument".into())); }
+            match &args[0] {
+                Val::Char(c) => Ok(Val::Bool(c.is_ascii_digit())),
+                _ => Err(EvalError::Type("char-numeric?: expected char".into())),
+            }
+        }
+        "char-upcase" => {
+            if args.len() != 1 { return Err(EvalError::Arity("char-upcase: need 1 argument".into())); }
+            match &args[0] {
+                Val::Char(c) => Ok(Val::Char(c.to_ascii_uppercase())),
+                _ => Err(EvalError::Type("char-upcase: expected char".into())),
+            }
+        }
+        "char-downcase" => {
+            if args.len() != 1 { return Err(EvalError::Arity("char-downcase: need 1 argument".into())); }
+            match &args[0] {
+                Val::Char(c) => Ok(Val::Char(c.to_ascii_lowercase())),
+                _ => Err(EvalError::Type("char-downcase: expected char".into())),
+            }
+        }
+        "char=?" => {
+            if args.len() != 2 { return Err(EvalError::Arity("char=?: need 2 arguments".into())); }
+            match (&args[0], &args[1]) {
+                (Val::Char(a), Val::Char(b)) => Ok(Val::Bool(a == b)),
+                _ => Err(EvalError::Type("char=?: expected chars".into())),
+            }
+        }
+        "char<?" => {
+            if args.len() != 2 { return Err(EvalError::Arity("char<?: need 2 arguments".into())); }
+            match (&args[0], &args[1]) {
+                (Val::Char(a), Val::Char(b)) => Ok(Val::Bool(a < b)),
+                _ => Err(EvalError::Type("char<?: expected chars".into())),
+            }
+        }
+        "string=?" => {
+            if args.len() != 2 { return Err(EvalError::Arity("string=?: need 2 arguments".into())); }
+            match (&args[0], &args[1]) {
+                (Val::Str(a), Val::Str(b)) => Ok(Val::Bool(a == b)),
+                _ => Err(EvalError::Type("string=?: expected strings".into())),
+            }
+        }
+        "string<?" => {
+            if args.len() != 2 { return Err(EvalError::Arity("string<?: need 2 arguments".into())); }
+            match (&args[0], &args[1]) {
+                (Val::Str(a), Val::Str(b)) => Ok(Val::Bool(a < b)),
+                _ => Err(EvalError::Type("string<?: expected strings".into())),
+            }
+        }
+        "string-ci=?" => {
+            if args.len() != 2 { return Err(EvalError::Arity("string-ci=?: need 2 arguments".into())); }
+            match (&args[0], &args[1]) {
+                (Val::Str(a), Val::Str(b)) => Ok(Val::Bool(a.to_lowercase() == b.to_lowercase())),
+                _ => Err(EvalError::Type("string-ci=?: expected strings".into())),
+            }
+        }
+        "string-upcase" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string-upcase: need 1 argument".into())); }
+            match &args[0] {
+                Val::Str(s) => Ok(Val::Str(s.to_uppercase())),
+                _ => Err(EvalError::Type("string-upcase: expected string".into())),
+            }
+        }
+        "string-downcase" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string-downcase: need 1 argument".into())); }
+            match &args[0] {
+                Val::Str(s) => Ok(Val::Str(s.to_lowercase())),
+                _ => Err(EvalError::Type("string-downcase: expected string".into())),
             }
         }
         _ => Err(EvalError::UnboundVariable(op.into())),
