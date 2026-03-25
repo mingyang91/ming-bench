@@ -4,7 +4,7 @@ private[ming] object SchemeInterpreterControlCalls:
 
   import BuiltinSupport.{singleArg, twoArgs}
   import SchemeInterpreter.{EvalState, Expr, Resume, Value}
-  import SchemeValues.unpack
+  import SchemeValues.{pack, unpack}
 
   private type ApplyProcedureState =
     (Value, List[Value], SourcePos, Resume) => EvalState
@@ -45,10 +45,9 @@ private[ming] object SchemeInterpreterControlCalls:
     runtime: Runtime,
     recursiveApply: ApplyProcedureState
   ): EvalState =
-    val argument = singleArg("continuation", args, pos)
     SchemeDynamicWind.resumeContinuationState(
       continuation,
-      argument,
+      pack(args),
       runtime,
       recursiveApply
     )
