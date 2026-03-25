@@ -23,6 +23,9 @@ final private[ming] class Env private (
   def define(name: String, value: Value): Unit =
     bindings.update(name, Cell(value))
 
+  def defineAlias(name: String, cell: Cell): Unit =
+    bindings.update(name, cell)
+
   def lookup(name: String, pos: SourcePos): Value =
     resolve(name)
       .map(_.get)
@@ -39,6 +42,9 @@ final private[ming] class Env private (
       child.define(name, value)
     }
     child
+
+  def resolveCell(name: String): Option[Cell] =
+    resolve(name)
 
   private def resolve(name: String): Option[Cell] =
     bindings.get(name).orElse(parent.flatMap(_.resolve(name)))

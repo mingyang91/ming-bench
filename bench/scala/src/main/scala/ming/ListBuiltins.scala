@@ -2,7 +2,7 @@ package ming
 
 private[ming] object ListBuiltins extends BuiltinSupport:
 
-  val entries: Map[String, Value] = Map(
+  def entries(macros: MacroState): Map[String, Value] = Map(
     "cons"      -> Value.Builtin("cons", cons),
     "car"       -> Value.Builtin("car", car),
     "cdr"       -> Value.Builtin("cdr", cdr),
@@ -12,8 +12,8 @@ private[ming] object ListBuiltins extends BuiltinSupport:
     "length"    -> Value.Builtin("length", length),
     "append"    -> Value.Builtin("append", append),
     "assoc"     -> Value.Builtin("assoc", assoc),
-    "map"       -> Value.Builtin("map", mapBuiltin),
-    "apply"     -> Value.Builtin("apply", applyBuiltin)
+    "map"       -> Value.Builtin("map", mapBuiltin(macros)),
+    "apply"     -> Value.Builtin("apply", applyBuiltin(macros))
   )
 
   private def cons(args: List[Value], pos: SourcePos): Value =
@@ -91,24 +91,24 @@ private[ming] object ListBuiltins extends BuiltinSupport:
 
     loop(alist)
 
-  private def mapBuiltin(args: List[Value], pos: SourcePos): Value =
+  private def mapBuiltin(macros: MacroState)(args: List[Value], pos: SourcePos): Value =
     args match
       case proc :: listArgs if listArgs.nonEmpty =>
         val lists   = listArgs.map(arg => asProperList(arg, pos, "map"))
         val lengths = lists.map(_.length).distinct
         if lengths.lengthCompare(1) > 0 then throw EvalError.at(pos, "map expects lists of the same length")
 
-        Value.list(lists.transpose.map(row => Interpreter.applyProcedure(proc, row, pos)))
+        Value.list(lists.transpose.map(row => Interpreter.applyProcedure(proc, row, pos, macros)))
 
       case _ =>
         throw EvalError.at(pos, "map expects a procedure and at least 1 list")
 
-  private def applyBuiltin(args: List[Value], pos: SourcePos): Value =
+  private def applyBuiltin(macros: MacroState)(args: List[Value], pos: SourcePos): Value =
     args match
       case proc :: appliedArgs if appliedArgs.nonEmpty =>
         val prefixArgs = appliedArgs.dropRight(1)
         val listArgs   = asProperList(appliedArgs.last, pos, "apply")
-        Interpreter.applyProcedure(proc, prefixArgs ++ listArgs, pos)
+        Interpreter.applyProcedure(proc, prefixArgs ++ listArgs, pos, macros)
 
       case _ =>
         throw EvalError.at(pos, "apply expects at least 2 arguments")

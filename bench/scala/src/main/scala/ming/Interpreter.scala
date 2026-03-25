@@ -9,11 +9,20 @@ private[ming] object Interpreter:
     if expressions.isEmpty then throw new EvalError("1:1: expected expression")
 
     val runtime = RuntimeContext()
-    val env     = Env.root(Builtins.globalEnv(runtime))
-    val result  = evalSequence(expressions, env)
+    val macros  = MacroState()
+    val env     = Env.root(Builtins.globalEnv(runtime, macros))
+    val result  = evalSequence(expressions, env, macros)
     (result, runtime.capturedOutput)
 
-  private def eval(expr: Expr, env: Env): Value =
+  private def eval(expr: Expr, env: Env, macros: MacroState): Value =
+    MacroExpander.expand(expr, macros) match
+      case expanded if expanded != expr =>
+        eval(expanded, env, macros)
+
+      case current =>
+        evalExpanded(current, env, macros)
+
+  private def evalExpanded(expr: Expr, env: Env, macros: MacroState): Value =
     expr match
       case Expr.IntAtom(value, _) =>
         Value.IntVal(value)
@@ -34,13 +43,16 @@ private[ming] object Interpreter:
         throw EvalError.at(pos, "cannot evaluate an empty list")
 
       case Expr.ListExpr(Expr.Symbol("define", _) :: args, pos) =>
-        evalDefine(args, env, pos)
+        evalDefine(args, env, macros, pos)
+
+      case Expr.ListExpr(Expr.Symbol("define-syntax", _) :: args, pos) =>
+        MacroExpander.define(args, env, macros, pos)
 
       case Expr.ListExpr(Expr.Symbol("set!", _) :: args, pos) =>
-        evalSet(args, env, pos)
+        evalSet(args, env, macros, pos)
 
       case Expr.ListExpr(Expr.Symbol("if", _) :: args, pos) =>
-        evalIf(args, env, pos)
+        evalIf(args, env, macros, pos)
 
       case Expr.ListExpr(Expr.Symbol("quote", _) :: args, pos) =>
         evalQuote(args, pos)
@@ -49,32 +61,32 @@ private[ming] object Interpreter:
         evalLambda(args, env, pos)
 
       case Expr.ListExpr(Expr.Symbol("begin", _) :: args, _) =>
-        evalBegin(args, env)
+        evalBegin(args, env, macros)
 
       case Expr.ListExpr(Expr.Symbol("let", _) :: args, pos) =>
-        evalLet(args, env, pos)
+        evalLet(args, env, macros, pos)
 
       case Expr.ListExpr(Expr.Symbol("cond", _) :: args, pos) =>
-        evalCond(args, env, pos)
+        evalCond(args, env, macros, pos)
 
       case Expr.ListExpr(Expr.Symbol("and", _) :: args, _) =>
-        evalAnd(args, env)
+        evalAnd(args, env, macros)
 
       case Expr.ListExpr(Expr.Symbol("or", _) :: args, _) =>
-        evalOr(args, env)
+        evalOr(args, env, macros)
 
       case Expr.ListExpr(head :: args, pos) =>
-        applyProcedure(eval(head, env), args.map(arg => eval(arg, env)), pos)
+        applyProcedure(eval(head, env, macros), args.map(arg => eval(arg, env, macros)), pos, macros)
 
-  private def evalSequence(expressions: List[Expr], env: Env): Value =
+  private def evalSequence(expressions: List[Expr], env: Env, macros: MacroState): Value =
     expressions.foldLeft[Value](Value.VoidVal) { (_, expr) =>
-      eval(expr, env)
+      eval(expr, env, macros)
     }
 
-  private def evalDefine(args: List[Expr], env: Env, pos: SourcePos): Value =
+  private def evalDefine(args: List[Expr], env: Env, macros: MacroState, pos: SourcePos): Value =
     args match
       case Expr.Symbol(name, _) :: valueExpr :: Nil =>
-        env.define(name, eval(valueExpr, env))
+        env.define(name, eval(valueExpr, env, macros))
         Value.VoidVal
 
       case Expr.ListExpr(Expr.Symbol(name, _) :: params, signaturePos) :: body if body.nonEmpty =>
@@ -85,20 +97,20 @@ private[ming] object Interpreter:
       case _ =>
         throw EvalError.at(pos, "define expects a name and expression")
 
-  private def evalSet(args: List[Expr], env: Env, pos: SourcePos): Value =
+  private def evalSet(args: List[Expr], env: Env, macros: MacroState, pos: SourcePos): Value =
     args match
       case Expr.Symbol(name, _) :: valueExpr :: Nil =>
-        env.set(name, eval(valueExpr, env), pos)
+        env.set(name, eval(valueExpr, env, macros), pos)
         Value.VoidVal
 
       case _ =>
         throw EvalError.at(pos, "set! expects a name and expression")
 
-  private def evalIf(args: List[Expr], env: Env, pos: SourcePos): Value =
+  private def evalIf(args: List[Expr], env: Env, macros: MacroState, pos: SourcePos): Value =
     args match
       case condition :: thenBranch :: elseBranch :: Nil =>
-        if Value.isTruthy(eval(condition, env)) then eval(thenBranch, env)
-        else eval(elseBranch, env)
+        if Value.isTruthy(eval(condition, env, macros)) then eval(thenBranch, env, macros)
+        else eval(elseBranch, env, macros)
 
       case _ =>
         throw EvalError.at(pos, "if expects exactly 3 arguments")
@@ -120,19 +132,19 @@ private[ming] object Interpreter:
       case _ =>
         throw EvalError.at(pos, "lambda expects a parameter list and body")
 
-  private def evalBegin(args: List[Expr], env: Env): Value =
-    evalSequence(args, env)
+  private def evalBegin(args: List[Expr], env: Env, macros: MacroState): Value =
+    evalSequence(args, env, macros)
 
-  private def evalLet(args: List[Expr], env: Env, pos: SourcePos): Value =
+  private def evalLet(args: List[Expr], env: Env, macros: MacroState, pos: SourcePos): Value =
     args match
       case Expr.Symbol(name, _) :: Expr.ListExpr(bindings, bindingsPos) :: body if body.nonEmpty =>
-        evalNamedLet(name, bindings, body, env, bindingsPos, pos)
+        evalNamedLet(name, bindings, body, env, macros, bindingsPos, pos)
 
       case Expr.ListExpr(bindings, bindingsPos) :: body if body.nonEmpty =>
         val parsedBindings = parseBindings(bindings, bindingsPos)
         val names          = parsedBindings.map(_._1)
-        val values         = parsedBindings.map { case (_, valueExpr) => eval(valueExpr, env) }
-        evalSequence(body, env.extend(names, values))
+        val values         = parsedBindings.map { case (_, valueExpr) => eval(valueExpr, env, macros) }
+        evalSequence(body, env.extend(names, values), macros)
 
       case _ =>
         throw EvalError.at(pos, "let expects bindings and a body")
@@ -142,19 +154,20 @@ private[ming] object Interpreter:
     bindings: List[Expr],
     body: List[Expr],
     env: Env,
+    macros: MacroState,
     bindingsPos: SourcePos,
     pos: SourcePos
   ): Value =
     val parsedBindings = parseBindings(bindings, bindingsPos)
     val names          = parsedBindings.map(_._1)
-    val values         = parsedBindings.map { case (_, valueExpr) => eval(valueExpr, env) }
+    val values         = parsedBindings.map { case (_, valueExpr) => eval(valueExpr, env, macros) }
     val loopEnv        = Env.child(env)
     val closure        = Value.Closure(names, None, body, loopEnv)
 
     loopEnv.define(name, closure)
-    applyProcedure(closure, values, pos)
+    applyProcedure(closure, values, pos, macros)
 
-  private def evalCond(clauses: List[Expr], env: Env, pos: SourcePos): Value =
+  private def evalCond(clauses: List[Expr], env: Env, macros: MacroState, pos: SourcePos): Value =
     clauses match
       case Nil =>
         Value.VoidVal
@@ -165,12 +178,12 @@ private[ming] object Interpreter:
       case Expr.ListExpr(Expr.Symbol("else", _) :: body, clausePos) :: rest =>
         if rest.nonEmpty then throw EvalError.at(clausePos, "else must be the last cond clause")
         else if body.isEmpty then Value.VoidVal
-        else evalSequence(body, env)
+        else evalSequence(body, env, macros)
 
       case Expr.ListExpr(test :: body, _) :: rest =>
-        val testValue = eval(test, env)
-        if Value.isTruthy(testValue) then if body.isEmpty then testValue else evalSequence(body, env)
-        else evalCond(rest, env, pos)
+        val testValue = eval(test, env, macros)
+        if Value.isTruthy(testValue) then if body.isEmpty then testValue else evalSequence(body, env, macros)
+        else evalCond(rest, env, macros, pos)
 
       case other :: _ =>
         throw EvalError.at(pos, s"invalid cond clause: ${other}")
@@ -217,6 +230,7 @@ private[ming] object Interpreter:
   private def evalAnd(
     args: List[Expr],
     env: Env,
+    macros: MacroState,
     result: Value = Value.BoolVal(true)
   ): Value =
     args match
@@ -227,12 +241,13 @@ private[ming] object Interpreter:
         result
 
       case expr :: rest =>
-        evalAnd(rest, env, eval(expr, env))
+        evalAnd(rest, env, macros, eval(expr, env, macros))
 
   @tailrec
   private def evalOr(
     args: List[Expr],
     env: Env,
+    macros: MacroState,
     result: Value = Value.BoolVal(false)
   ): Value =
     args match
@@ -243,9 +258,9 @@ private[ming] object Interpreter:
         result
 
       case expr :: rest =>
-        evalOr(rest, env, eval(expr, env))
+        evalOr(rest, env, macros, eval(expr, env, macros))
 
-  private[ming] def applyProcedure(proc: Value, args: List[Value], pos: SourcePos): Value =
+  private[ming] def applyProcedure(proc: Value, args: List[Value], pos: SourcePos, macros: MacroState): Value =
     proc match
       case Value.Builtin(_, fn) =>
         fn(args, pos)
@@ -256,7 +271,7 @@ private[ming] object Interpreter:
             if params.length != args.length then
               throw EvalError.at(pos, s"expected ${params.length} arguments, got ${args.length}")
 
-            evalSequence(body, closureEnv.extend(params, args))
+            evalSequence(body, closureEnv.extend(params, args), macros)
 
           case Some(restName) =>
             if args.length < params.length then
@@ -264,7 +279,7 @@ private[ming] object Interpreter:
 
             val fixedArgs = args.take(params.length)
             val restArgs  = Value.list(args.drop(params.length))
-            evalSequence(body, closureEnv.extend(params :+ restName, fixedArgs :+ restArgs))
+            evalSequence(body, closureEnv.extend(params :+ restName, fixedArgs :+ restArgs), macros)
 
       case other =>
         throw EvalError.at(pos, s"attempted to call a ${other.typeName} value")
