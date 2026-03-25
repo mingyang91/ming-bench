@@ -5,7 +5,7 @@ import scala.collection.mutable
 private[ming] enum Expr:
   case Num(value: Long)
   case Bool(value: Boolean)
-  case Str(value: String)
+  case Str(chars: Array[Char])
   case Chr(value: Char)
   case Sym(name: String)
   case Lst(elems: List[Expr])

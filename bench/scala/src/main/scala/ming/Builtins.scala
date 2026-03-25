@@ -51,49 +51,67 @@ private[ming] object Builtins:
       val buf = outputBuffer.get()
       if buf != null then buf.append("\n")
       Expr.Bool(false)
+    case "string-append" | "string-length" | "string-set!" | "string-copy" | "substring" | "string->number" |
+        "number->string" | "symbol->string" | "string->symbol" | "string-ref" | "char?" =>
+      applyStringBuiltin(name, args)
+    case _ => throw EvalError(s"unknown procedure: $name")
+
+  private def applyStringBuiltin(name: String, args: List[Expr]): Expr = name match
     case "string-append" =>
       val strs = args.map {
-        case Expr.Str(s) => s
+        case Expr.Str(s) => new String(s)
         case other       => throw EvalError(s"string-append: not a string: ${display(other)}")
       }
-      Expr.Str(strs.mkString)
+      Expr.Str(strs.mkString.toCharArray)
     case "string-length" =>
       unary(name, args) {
         case Expr.Str(s) => Expr.Num(s.length.toLong)
         case other       => throw EvalError(s"string-length: not a string: ${display(other)}")
       }
+    case "string-set!" =>
+      if args.length != 3 then throw EvalError("string-set!: need exactly 3 arguments")
+      args match
+        case List(Expr.Str(s), Expr.Num(idx), Expr.Chr(c)) =>
+          s(idx.toInt) = c
+          Expr.Bool(false)
+        case _ => throw EvalError("string-set!: invalid arguments")
+    case "string-copy" =>
+      unary(name, args) {
+        case Expr.Str(s) => Expr.Str(s.clone())
+        case other       => throw EvalError(s"string-copy: not a string: ${display(other)}")
+      }
     case "substring" =>
       if args.length != 3 then throw EvalError("substring: need exactly 3 arguments")
       args match
         case List(Expr.Str(s), Expr.Num(start), Expr.Num(end)) =>
-          Expr.Str(s.substring(start.toInt, end.toInt))
+          Expr.Str(new String(s).substring(start.toInt, end.toInt).toCharArray)
         case _ => throw EvalError("substring: invalid arguments")
     case "string->number" =>
       unary(name, args) {
         case Expr.Str(s) =>
-          try Expr.Num(s.toLong)
+          try Expr.Num(new String(s).toLong)
           catch case _: NumberFormatException => Expr.Bool(false)
         case other => throw EvalError(s"string->number: not a string: ${display(other)}")
       }
     case "number->string" =>
       unary(name, args) {
-        case Expr.Num(n) => Expr.Str(n.toString)
+        case Expr.Num(n) => Expr.Str(n.toString.toCharArray)
         case other       => throw EvalError(s"number->string: not a number: ${display(other)}")
       }
     case "symbol->string" =>
       unary(name, args) {
-        case Expr.Sym(s) => Expr.Str(s)
+        case Expr.Sym(s) => Expr.Str(s.toCharArray)
         case other       => throw EvalError(s"symbol->string: not a symbol: ${display(other)}")
       }
     case "string->symbol" =>
       unary(name, args) {
-        case Expr.Str(s) => Expr.Sym(s)
+        case Expr.Str(s) => Expr.Sym(new String(s))
         case other       => throw EvalError(s"string->symbol: not a string: ${display(other)}")
       }
     case "string-ref" =>
       if args.length != 2 then throw EvalError("string-ref: need exactly 2 arguments")
       args match
-        case List(Expr.Str(s), Expr.Num(idx)) => Expr.Chr(s.charAt(idx.toInt))
+        case List(Expr.Str(s), Expr.Num(idx)) => Expr.Chr(s(idx.toInt))
         case _                                => throw EvalError("string-ref: invalid arguments")
     case "char?" =>
       unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Chr]))
@@ -162,14 +180,14 @@ private[ming] object Builtins:
     case Expr.Num(n)          => n.toString
     case Expr.Bool(true)      => "#t"
     case Expr.Bool(false)     => "#f"
-    case Expr.Str(s)          => "\"" + s + "\""
+    case Expr.Str(s)          => "\"" + new String(s) + "\""
     case Expr.Chr(c)          => s"#\\$c"
     case Expr.Sym(name)       => name
     case Expr.Lst(elems)      => "(" + elems.map(display).mkString(" ") + ")"
     case Expr.Lambda(_, _, _) => "#<procedure>"
 
   private def displayOutput(e: Expr): String = e match
-    case Expr.Str(s) => s
+    case Expr.Str(s) => new String(s)
     case other       => display(other)
 
   val builtinNames: List[String] = List(
@@ -206,6 +224,8 @@ private[ming] object Builtins:
     "symbol->string",
     "string->symbol",
     "string-ref",
+    "string-set!",
+    "string-copy",
     "char?"
   )
 

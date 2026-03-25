@@ -79,7 +79,7 @@ private[ming] class SchemeParser(input: String):
       else sb.append(c)
     if pos >= input.length then throw EvalError("unterminated string")
     advance() // skip closing "
-    Expr.Str(sb.result())
+    Expr.Str(sb.result().toCharArray)
 
   private def parseHash(): Expr =
     advance() // skip '#'
@@ -92,6 +92,19 @@ private[ming] class SchemeParser(input: String):
       case 'f' =>
         if pos < input.length && !isDelimiter(peek) then throw EvalError(s"unexpected character after #f")
         Expr.Bool(false)
+      case '\\' =>
+        if pos >= input.length then throw EvalError("unexpected end after #\\")
+        // Read the character name or single character
+        val start = pos
+        while pos < input.length && !isDelimiter(peek) do pos += 1
+        val token = input.substring(start, pos)
+        if token.isEmpty then throw EvalError("unexpected end after #\\")
+        token match
+          case "space"            => Expr.Chr(' ')
+          case "newline"          => Expr.Chr('\n')
+          case "tab"              => Expr.Chr('\t')
+          case s if s.length == 1 => Expr.Chr(s.charAt(0))
+          case _                  => throw EvalError(s"unknown character name: $token")
       case _ => throw EvalError(s"unexpected #$c")
 
   private def isDelimiter(c: Char): Boolean =
