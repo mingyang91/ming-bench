@@ -10,6 +10,9 @@ func Eval(expr *Expr, env *Env) (*Value, error) {
 		return BoolValue(expr.BoolVal), nil
 	case ExprString:
 		return StringValue(expr.StrVal), nil
+	case ExprChar:
+		runes := []rune(expr.StrVal)
+		return CharValue(runes[0]), nil
 	case ExprSymbol:
 		val, ok := env.Get(expr.StrVal)
 		if !ok {

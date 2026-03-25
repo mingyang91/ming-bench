@@ -94,6 +94,10 @@ func makeGlobalEnv() *Env {
 	env.Set("string-ref", &Value{Type: TypeSymbol, StrVal: "builtin:string-ref"})
 	env.Set("char?", &Value{Type: TypeSymbol, StrVal: "builtin:char?"})
 
+	// Mutable strings (L06)
+	env.Set("string-set!", &Value{Type: TypeSymbol, StrVal: "builtin:string-set!"})
+	env.Set("string-copy", &Value{Type: TypeSymbol, StrVal: "builtin:string-copy"})
+
 	return env
 }
 
@@ -405,6 +409,25 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 			return nil, fmt.Errorf("%d:%d: 'char?' expects 1 argument", line, col)
 		}
 		return BoolValue(args[0].Type == TypeChar), nil
+
+	case "builtin:string-set!":
+		if len(args) != 3 || args[0].Type != TypeString || args[1].Type != TypeInteger || args[2].Type != TypeChar {
+			return nil, fmt.Errorf("%d:%d: 'string-set!' expects string, index, char", line, col)
+		}
+		runes := []rune(args[0].StrVal)
+		idx := int(args[1].IntVal)
+		if idx < 0 || idx >= len(runes) {
+			return nil, fmt.Errorf("%d:%d: 'string-set!' index out of range", line, col)
+		}
+		runes[idx] = args[2].CharVal
+		args[0].StrVal = string(runes)
+		return Void, nil
+
+	case "builtin:string-copy":
+		if len(args) != 1 || args[0].Type != TypeString {
+			return nil, fmt.Errorf("%d:%d: 'string-copy' expects a string", line, col)
+		}
+		return StringValue(args[0].StrVal), nil
 	}
 
 	return nil, fmt.Errorf("%d:%d: unknown builtin %s", line, col, name)

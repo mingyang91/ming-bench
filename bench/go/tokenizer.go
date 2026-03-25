@@ -12,6 +12,7 @@ const (
 	TokenString
 	TokenSymbol
 	TokenQuote
+	TokenChar
 	TokenEOF
 )
 
@@ -146,6 +147,34 @@ func (t *Tokenizer) readHash(line, col int) (Token, error) {
 		return Token{Type: TokenBoolean, StrVal: "t", Line: line, Col: col}, nil
 	case 'f':
 		return Token{Type: TokenBoolean, StrVal: "f", Line: line, Col: col}, nil
+	case '\\':
+		if t.pos >= len(t.input) {
+			return Token{}, fmt.Errorf("%d:%d: unexpected end after #\\", line, col)
+		}
+		// Read character name or single char
+		var name []rune
+		for t.pos < len(t.input) && isSymbolChar(t.peek()) {
+			name = append(name, t.advance())
+		}
+		if len(name) == 0 {
+			// Could be space or other non-symbol char
+			c := t.advance()
+			return Token{Type: TokenChar, StrVal: string(c), Line: line, Col: col}, nil
+		}
+		if len(name) == 1 {
+			return Token{Type: TokenChar, StrVal: string(name), Line: line, Col: col}, nil
+		}
+		// Named characters
+		switch string(name) {
+		case "space":
+			return Token{Type: TokenChar, StrVal: " ", Line: line, Col: col}, nil
+		case "newline":
+			return Token{Type: TokenChar, StrVal: "\n", Line: line, Col: col}, nil
+		case "tab":
+			return Token{Type: TokenChar, StrVal: "\t", Line: line, Col: col}, nil
+		default:
+			return Token{}, fmt.Errorf("%d:%d: unknown character name #\\%s", line, col, string(name))
+		}
 	default:
 		return Token{}, fmt.Errorf("%d:%d: unknown hash literal #%c", line, col, ch)
 	}

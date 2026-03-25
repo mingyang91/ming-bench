@@ -22,6 +22,7 @@ const (
 	ExprString
 	ExprSymbol
 	ExprList
+	ExprChar
 )
 
 type Parser struct {
@@ -70,6 +71,8 @@ func (p *Parser) ParseExpr() (*Expr, error) {
 		return &Expr{Type: ExprString, StrVal: tok.StrVal, Line: tok.Line, Col: tok.Col}, nil
 	case TokenSymbol:
 		return &Expr{Type: ExprSymbol, StrVal: tok.StrVal, Line: tok.Line, Col: tok.Col}, nil
+	case TokenChar:
+		return &Expr{Type: ExprChar, StrVal: tok.StrVal, Line: tok.Line, Col: tok.Col}, nil
 	case TokenLParen:
 		return p.parseList(tok.Line, tok.Col)
 	case TokenQuote:
