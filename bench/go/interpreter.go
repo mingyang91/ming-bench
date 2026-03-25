@@ -49,9 +49,13 @@ type closureValue struct {
 	env    *environment
 }
 
+type binding struct {
+	value value
+}
+
 type environment struct {
 	parent *environment
-	values map[string]value
+	values map[string]*binding
 }
 
 func evalString(input string) (string, error) {
@@ -144,22 +148,39 @@ func baseEnv(ctx *evalContext) *environment {
 func newEnvironment(parent *environment) *environment {
 	return &environment{
 		parent: parent,
-		values: map[string]value{},
+		values: map[string]*binding{},
 	}
 }
 
 func (e *environment) define(name string, val value) {
-	e.values[name] = val
+	e.values[name] = &binding{value: val}
 }
 
-func (e *environment) lookup(name string) (value, bool) {
+func (e *environment) lookupBinding(name string) (*binding, bool) {
 	for current := e; current != nil; current = current.parent {
-		val, ok := current.values[name]
+		cell, ok := current.values[name]
 		if ok {
-			return val, true
+			return cell, true
 		}
 	}
 	return nil, false
+}
+
+func (e *environment) lookup(name string) (value, bool) {
+	cell, ok := e.lookupBinding(name)
+	if !ok {
+		return nil, false
+	}
+	return cell.value, true
+}
+
+func (e *environment) set(name string, val value) bool {
+	cell, ok := e.lookupBinding(name)
+	if !ok {
+		return false
+	}
+	cell.value = val
+	return true
 }
 
 func eval(expr node, env *environment) (value, error) {
@@ -194,6 +215,9 @@ func evalList(list listNode, env *environment) (value, error) {
 			return result, withErrorPos(err, list.pos)
 		case "define":
 			result, err := evalDefine(list.elements[1:], env)
+			return result, withErrorPos(err, list.pos)
+		case "set!":
+			result, err := evalSet(list.elements[1:], env)
 			return result, withErrorPos(err, list.pos)
 		case "if":
 			result, err := evalIf(list.elements[1:], env)
@@ -305,6 +329,27 @@ func evalDefine(args []node, env *environment) (value, error) {
 	default:
 		return nil, &EvalError{Message: "define requires a symbol"}
 	}
+}
+
+func evalSet(args []node, env *environment) (value, error) {
+	if len(args) != 2 {
+		return nil, &EvalError{Message: "set! expects exactly 2 arguments"}
+	}
+
+	target, ok := args[0].(symbolNode)
+	if !ok {
+		return nil, &EvalError{Message: "set! requires a symbol"}
+	}
+
+	val, err := eval(args[1], env)
+	if err != nil {
+		return nil, err
+	}
+
+	if !env.set(target.name, val) {
+		return nil, errorAt(target.pos, "unbound variable: %s", target.name)
+	}
+	return voidValue{}, nil
 }
 
 func evalIf(args []node, env *environment) (value, error) {
