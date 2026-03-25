@@ -81,6 +81,9 @@ pub enum EvalError {
     #[error("{position}: invalid length: {length}")]
     InvalidLength { length: i64, position: SourcePos },
 
+    #[error("{position}: invalid character code point: {value}")]
+    InvalidCharacterCodePoint { value: i64, position: SourcePos },
+
     #[error("{position}: cannot mutate immutable string")]
     ImmutableString { position: SourcePos },
 }
@@ -167,6 +170,10 @@ impl EvalError {
 
     pub fn invalid_length(length: i64, position: SourcePos) -> Self {
         Self::InvalidLength { length, position }
+    }
+
+    pub fn invalid_character_code_point(value: i64, position: SourcePos) -> Self {
+        Self::InvalidCharacterCodePoint { value, position }
     }
 
     pub fn immutable_string(position: SourcePos) -> Self {

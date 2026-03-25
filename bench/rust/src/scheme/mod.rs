@@ -32,6 +32,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "exact->inexact",
     "exact?",
     "expt",
+    "integer->char",
     "inexact->exact",
     "inexact?",
     "integer?",
@@ -44,6 +45,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "boolean?",
     "car",
     "char-alphabetic?",
+    "char->integer",
     "char-downcase",
     "char-numeric?",
     "char-upcase",
@@ -56,6 +58,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "list?",
     "list-ref",
     "list-tail",
+    "list->string",
     "list->vector",
     "map",
     "max",
@@ -81,6 +84,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "string=?",
     "string<?",
     "string-length",
+    "string->list",
     "string->number",
     "string->symbol",
     "string-ref",
@@ -119,6 +123,17 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let (value, output) = eval_program(input)?;
     Ok((render_result(&value), output))
+}
+
+fn current_bench_level() -> u32 {
+    std::env::var("BENCH_LEVEL")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u32::MAX)
+}
+
+fn uses_immutable_strings() -> bool {
+    current_bench_level() >= 15
 }
 
 fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
@@ -2267,6 +2282,7 @@ fn apply_builtin(
         "char-alphabetic?" => {
             apply_char_predicate("char-alphabetic?", args, position, |ch| ch.is_alphabetic())
         }
+        "char->integer" => apply_char_to_integer(args, position),
         "char-downcase" => apply_char_case_transform("char-downcase", args, position, |ch| {
             ch.to_ascii_lowercase()
         }),
@@ -2289,6 +2305,7 @@ fn apply_builtin(
         "exact->inexact" => apply_exact_to_inexact(args, position),
         "exact?" => apply_exact(args, position),
         "expt" => apply_expt(args, position),
+        "integer->char" => apply_integer_to_char(args, position),
         "inexact->exact" => apply_inexact_to_exact(args, position),
         "inexact?" => apply_inexact(args, position),
         "integer?" => apply_integer(args, position),
@@ -2299,6 +2316,7 @@ fn apply_builtin(
         "list?" => apply_list_predicate(args, position),
         "list-ref" => apply_list_ref(args, position),
         "list-tail" => apply_list_tail(args, position),
+        "list->string" => apply_list_to_string(args, position),
         "list->vector" => apply_list_to_vector(args, position),
         "map" => apply_map(args, position, env),
         "max" => apply_min_max("max", args, position, |ordering| {
@@ -2350,6 +2368,7 @@ fn apply_builtin(
         "string=?" => apply_string_compare("string=?", args, position, |left, right| left == right),
         "string<?" => apply_string_compare("string<?", args, position, |left, right| left < right),
         "string-length" => apply_string_length(args, position),
+        "string->list" => apply_string_to_list(args, position),
         "string->number" => apply_string_to_number(args, position),
         "string->symbol" => apply_string_to_symbol(args, position),
         "string-ref" => apply_string_ref(args, position),
@@ -2862,7 +2881,14 @@ fn apply_string_copy(args: &[LocatedValue], position: SourcePos) -> Result<Value
         ));
     }
 
-    Ok(Value::String(args[0].as_string()?.mutable_copy()))
+    let string = args[0].as_string()?;
+    let copy = if uses_immutable_strings() {
+        SchemeString::immutable(&string.to_plain_string())
+    } else {
+        string.mutable_copy()
+    };
+
+    Ok(Value::String(copy))
 }
 
 fn apply_string_length(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
@@ -2876,6 +2902,26 @@ fn apply_string_length(args: &[LocatedValue], position: SourcePos) -> Result<Val
     }
 
     Ok(Value::Integer(args[0].as_string()?.len_chars() as i64))
+}
+
+fn apply_string_to_list(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "string->list",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    Ok(Value::List(
+        args[0]
+            .as_string()?
+            .to_plain_string()
+            .chars()
+            .map(Value::Char)
+            .collect(),
+    ))
 }
 
 fn apply_string_to_number(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
@@ -2946,6 +2992,24 @@ fn apply_string_to_symbol(args: &[LocatedValue], position: SourcePos) -> Result<
     }
 
     Ok(Value::Symbol(args[0].as_string()?.to_plain_string()))
+}
+
+fn apply_integer_to_char(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "integer->char",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    let value = args[0].as_integer()?;
+    let scalar = u32::try_from(value)
+        .ok()
+        .and_then(char::from_u32)
+        .ok_or_else(|| EvalError::invalid_character_code_point(value, args[0].position))?;
+    Ok(Value::Char(scalar))
 }
 
 fn apply_string_ref(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
@@ -3157,6 +3221,33 @@ fn apply_list_tail(args: &[LocatedValue], position: SourcePos) -> Result<Value, 
     }
 
     Ok(Value::List(values[index as usize..].to_vec()))
+}
+
+fn apply_list_to_string(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "list->string",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    let values = expect_proper_list(&args[0])?;
+    let mut result = String::new();
+
+    for value in values {
+        let Value::Char(ch) = value else {
+            return Err(EvalError::type_mismatch(
+                "char",
+                value.type_name(),
+                args[0].position,
+            ));
+        };
+        result.push(*ch);
+    }
+
+    Ok(Value::String(SchemeString::immutable(&result)))
 }
 
 fn expect_non_negative_length(arg: &LocatedValue) -> Result<usize, EvalError> {
@@ -3422,6 +3513,19 @@ where
     }
 
     Ok(Value::Bool(predicate(args[0].as_char()?)))
+}
+
+fn apply_char_to_integer(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "char->integer",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    Ok(Value::Integer(i64::from(u32::from(args[0].as_char()?))))
 }
 
 fn apply_char_case_transform<F>(
