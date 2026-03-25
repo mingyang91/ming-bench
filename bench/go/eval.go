@@ -43,6 +43,12 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalQuote(expr)
 		case "lambda":
 			return evalLambda(expr, env)
+		case "let":
+			return evalLet(expr, env)
+		case "begin":
+			return evalBegin(expr, env)
+		case "cond":
+			return evalCond(expr, env)
 		}
 	}
 
@@ -231,4 +237,121 @@ func evalOr(expr *Expr, env *Env) (*Value, error) {
 		}
 	}
 	return False, nil
+}
+
+func evalLet(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.Elements) < 3 {
+		return nil, fmt.Errorf("%d:%d: 'let' requires bindings and body", expr.Line, expr.Col)
+	}
+
+	bindingsIdx := 1
+	// Named let: (let name ((var init) ...) body ...)
+	var loopName string
+	if expr.Elements[1].Type == ExprSymbol {
+		loopName = expr.Elements[1].StrVal
+		bindingsIdx = 2
+		if len(expr.Elements) < 4 {
+			return nil, fmt.Errorf("%d:%d: named 'let' requires bindings and body", expr.Line, expr.Col)
+		}
+	}
+
+	bindingsExpr := expr.Elements[bindingsIdx]
+	if bindingsExpr.Type != ExprList {
+		return nil, fmt.Errorf("%d:%d: 'let' bindings must be a list", expr.Line, expr.Col)
+	}
+
+	names := make([]string, len(bindingsExpr.Elements))
+	vals := make([]*Value, len(bindingsExpr.Elements))
+	for i, binding := range bindingsExpr.Elements {
+		if binding.Type != ExprList || len(binding.Elements) != 2 {
+			return nil, fmt.Errorf("%d:%d: invalid let binding", expr.Line, expr.Col)
+		}
+		if binding.Elements[0].Type != ExprSymbol {
+			return nil, fmt.Errorf("%d:%d: let binding name must be a symbol", expr.Line, expr.Col)
+		}
+		names[i] = binding.Elements[0].StrVal
+		val, err := Eval(binding.Elements[1], env)
+		if err != nil {
+			return nil, err
+		}
+		vals[i] = val
+	}
+
+	letEnv := NewEnv(env)
+	for i, name := range names {
+		letEnv.Set(name, vals[i])
+	}
+
+	body := expr.Elements[bindingsIdx+1:]
+
+	if loopName != "" {
+		// Named let: bind the loop name to a lambda that re-enters
+		lambda := &Value{
+			Type:       TypeLambda,
+			Params:     names,
+			Body:       body,
+			ClosureEnv: letEnv,
+		}
+		letEnv.Set(loopName, lambda)
+	}
+
+	var result *Value
+	for _, bodyExpr := range body {
+		var err error
+		result, err = Eval(bodyExpr, letEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalBegin(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.Elements) < 2 {
+		return Void, nil
+	}
+	var result *Value
+	for _, e := range expr.Elements[1:] {
+		var err error
+		result, err = Eval(e, env)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalCond(expr *Expr, env *Env) (*Value, error) {
+	for _, clause := range expr.Elements[1:] {
+		if clause.Type != ExprList || len(clause.Elements) < 2 {
+			return nil, fmt.Errorf("%d:%d: invalid cond clause", expr.Line, expr.Col)
+		}
+		// Check for else clause
+		if clause.Elements[0].Type == ExprSymbol && clause.Elements[0].StrVal == "else" {
+			var result *Value
+			for _, e := range clause.Elements[1:] {
+				var err error
+				result, err = Eval(e, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		test, err := Eval(clause.Elements[0], env)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(test) {
+			var result *Value
+			for _, e := range clause.Elements[1:] {
+				result, err = Eval(e, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+	}
+	return Void, nil
 }
