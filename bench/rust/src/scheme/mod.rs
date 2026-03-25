@@ -56,6 +56,7 @@ enum Value {
         name: Option<String>,
         clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>, Env)>,
     },
+    Continuation(Rc<Cont>),
     Vector(Rc<RefCell<Vec<Value>>>),
     Record {
         type_id: u64,
@@ -250,6 +251,7 @@ impl fmt::Display for Value {
             }
             Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::CaseLambda { .. } => write!(f, "#<procedure>"),
+            Value::Continuation(_) => write!(f, "#<continuation>"),
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
             Value::Void => write!(f, "#<void>"),
@@ -623,6 +625,7 @@ fn default_env() -> Env {
         "string>?", "string<=?", "string>=?",
         "member", "reverse",
         "error",
+        "call/cc", "call-with-current-continuation",
     ] {
         env.set(name.into(), Value::Builtin(name.into()));
     }
@@ -860,50 +863,267 @@ fn setup_lambda_env(
     Ok((local_env, define_count))
 }
 
-fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
-    let mut cur_expr = expr.clone();
-    let mut cur_env = env.clone();
+// --- CEK machine types for first-class continuations ---
 
-    'tco: loop {
-        let span = cur_expr.span;
-        match cur_expr.kind {
-            ExprKind::Integer(n) => return Ok(Value::Integer(n)),
-            ExprKind::Float(f) => return Ok(Value::Float(f)),
-            ExprKind::Rational(n, d) => return Ok(make_rational(n, d)),
-            ExprKind::Boolean(b) => return Ok(Value::Boolean(b)),
-            ExprKind::Char(c) => return Ok(Value::Char(c)),
-            ExprKind::Str(s) => return Ok(Value::Str(s, false)),
-            ExprKind::Symbol(s) => {
-                return cur_env.get(&s).ok_or_else(|| EvalError::Unbound(format!("{s} at {span}")));
+type K = Rc<Cont>;
+
+#[derive(Clone)]
+enum Cont {
+    Halt,
+    Seq(Vec<Expr>, Env, K),
+    Def(String, Env, K),
+    SetK(String, Env, Span, K),
+    IfK(Expr, Option<Expr>, Env, K),
+    EvOp(Vec<Expr>, Env, Span, K),
+    EvArg(Value, Vec<Value>, Vec<Expr>, Env, Span, K),
+    AndK(Vec<Expr>, Env, K),
+    OrK(Vec<Expr>, Env, K),
+    LetBind {
+        rest: Vec<(String, Expr)>,
+        names: Vec<String>,
+        vals: Vec<Value>,
+        body: Vec<Expr>,
+        named: Option<String>,
+        outer_env: Env,
+        next: K,
+    },
+    LetStarBind(String, Vec<(String, Expr)>, Vec<Expr>, Env, K),
+    LetrecBind {
+        rest_inits: Vec<Expr>,
+        done_vals: Vec<Value>,
+        names: Vec<String>,
+        body: Vec<Expr>,
+        env: Env,
+        next: K,
+    },
+    LetrecStarBind(String, Vec<(String, Expr)>, Vec<Expr>, Env, K),
+    CaseK(Vec<Expr>, Env, Span, K),
+    CondK {
+        body: Vec<Expr>,
+        remaining: Vec<Expr>,
+        env: Env,
+        span: Span,
+        next: K,
+    },
+    StrSetIdxK(String, Expr, Env, Span, K),
+    StrSetCharK(String, usize, Env, Span, K),
+    CallCCK(K),
+}
+
+impl fmt::Debug for Cont {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<cont>")
+    }
+}
+
+enum CekState {
+    Eval(Expr, Env),
+    Ret(Value),
+}
+
+fn setup_lambda_env_basic(
+    func: &Value,
+    name: &Option<String>,
+    params: &[String],
+    rest_param: &Option<String>,
+    closure_env: &Env,
+    args: &[Value],
+    call_span: Span,
+) -> Result<Env, EvalError> {
+    if rest_param.is_some() {
+        if args.len() < params.len() {
+            return Err(EvalError::Arity(format!(
+                "expected at least {} arguments, got {} at {call_span}", params.len(), args.len()
+            )));
+        }
+    } else if args.len() != params.len() {
+        return Err(EvalError::Arity(format!(
+            "expected {} arguments, got {} at {call_span}", params.len(), args.len()
+        )));
+    }
+    let mut local_env = Env::with_parent(closure_env.clone());
+    if let Some(n) = name {
+        local_env.set(n.clone(), func.clone());
+    }
+    for (p, a) in params.iter().zip(args.iter()) {
+        local_env.set(p.clone(), a.clone());
+    }
+    if let Some(rp) = rest_param {
+        local_env.set(rp.clone(), make_list(args[params.len()..].to_vec()));
+    }
+    Ok(local_env)
+}
+
+fn cek_apply_func(
+    func: &Value, args: &[Value], span: Span,
+    st: &mut CekState, k: &mut K, output: &mut String,
+) -> Result<(), EvalError> {
+    match func {
+        Value::Lambda { name, params, rest_param, body, env: closure_env } => {
+            let local_env = setup_lambda_env_basic(func, name, params, rest_param, closure_env, args, span)?;
+            if body.is_empty() {
+                *st = CekState::Ret(Value::Void);
+            } else if body.len() == 1 {
+                *st = CekState::Eval(body[0].clone(), local_env);
+            } else {
+                *k = Rc::new(Cont::Seq(body[1..].to_vec(), local_env.clone(), k.clone()));
+                *st = CekState::Eval(body[0].clone(), local_env);
             }
-            ExprKind::List(elems) => {
-                if elems.is_empty() {
-                    return Err(EvalError::Syntax(format!("empty application at {span}")));
+            Ok(())
+        }
+        Value::CaseLambda { name, clauses } => {
+            for (params, rest_param, body, clause_env) in clauses {
+                let matches = if rest_param.is_some() {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    let lambda = Value::Lambda {
+                        name: name.clone(),
+                        params: params.clone(),
+                        rest_param: rest_param.clone(),
+                        body: body.clone(),
+                        env: clause_env.clone(),
+                    };
+                    return cek_apply_func(&lambda, args, span, st, k, output);
                 }
+            }
+            Err(EvalError::Arity(format!(
+                "no matching clause for {} arguments at {span}", args.len()
+            )))
+        }
+        Value::Builtin(ref bname) if bname == "apply" => {
+            if args.len() < 2 {
+                return Err(EvalError::Arity(format!("apply requires at least 2 arguments at {span}")));
+            }
+            let f = &args[0];
+            let last = &args[args.len() - 1];
+            let tail = value_to_vec(last).ok_or_else(|| EvalError::Type(format!("apply: last argument must be a list at {span}")))?;
+            let mut combined: Vec<Value> = args[1..args.len() - 1].to_vec();
+            combined.extend(tail);
+            cek_apply_func(f, &combined, span, st, k, output)
+        }
+        Value::Builtin(ref bname) if bname == "call/cc" || bname == "call-with-current-continuation" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("call/cc requires 1 argument at {span}")));
+            }
+            let continuation_val = Value::Continuation(k.clone());
+            cek_apply_func(&args[0], &[continuation_val], span, st, k, output)
+        }
+        Value::Builtin(ref bname) => {
+            let result = apply_builtin(bname, args, span, output)?;
+            *st = CekState::Ret(result);
+            Ok(())
+        }
+        Value::Continuation(saved_k) => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("continuation requires 1 argument at {span}")));
+            }
+            *k = saved_k.clone();
+            *st = CekState::Ret(args[0].clone());
+            Ok(())
+        }
+        _ => Err(EvalError::Type(format!("not a procedure: {func} at {span}"))),
+    }
+}
 
-                // Check for special forms
-                if let ExprKind::Symbol(ref head) = elems[0].kind {
-                    match head.as_str() {
+fn desugar_do(elems: &[Expr], span: Span) -> Result<Expr, EvalError> {
+    if elems.len() < 3 {
+        return Err(EvalError::Syntax(format!("do requires var-clauses and test at {span}")));
+    }
+    let var_clauses = match &elems[1].kind {
+        ExprKind::List(cs) => cs,
+        _ => return Err(EvalError::Syntax(format!("do: expected var clauses at {span}"))),
+    };
+    let test_clause = match &elems[2].kind {
+        ExprKind::List(tc) if !tc.is_empty() => tc,
+        _ => return Err(EvalError::Syntax(format!("do: expected test clause at {span}"))),
+    };
+    let body = &elems[3..];
+    let loop_name = "__do_loop";
+    let mut bindings = Vec::new();
+    let mut step_exprs = Vec::new();
+    for vc in var_clauses {
+        match &vc.kind {
+            ExprKind::List(parts) if parts.len() >= 2 => {
+                let var = parts[0].clone();
+                let init = parts[1].clone();
+                let step = if parts.len() >= 3 { parts[2].clone() } else { var.clone() };
+                bindings.push(Expr::new(ExprKind::List(vec![var, init]), span));
+                step_exprs.push(step);
+            }
+            _ => return Err(EvalError::Syntax(format!("do: bad var clause at {span}"))),
+        }
+    }
+    let then_branch = if test_clause.len() > 1 {
+        let mut v = vec![Expr::new(ExprKind::Symbol("begin".into()), span)];
+        v.extend(test_clause[1..].iter().cloned());
+        Expr::new(ExprKind::List(v), span)
+    } else {
+        Expr::new(ExprKind::List(vec![Expr::new(ExprKind::Symbol("begin".into()), span)]), span)
+    };
+    let mut loop_call = vec![Expr::new(ExprKind::Symbol(loop_name.into()), span)];
+    loop_call.extend(step_exprs);
+    let loop_expr = Expr::new(ExprKind::List(loop_call), span);
+    let else_branch = {
+        let mut v = vec![Expr::new(ExprKind::Symbol("begin".into()), span)];
+        v.extend(body.iter().cloned());
+        v.push(loop_expr);
+        Expr::new(ExprKind::List(v), span)
+    };
+    let if_expr = Expr::new(ExprKind::List(vec![
+        Expr::new(ExprKind::Symbol("if".into()), span),
+        test_clause[0].clone(),
+        then_branch,
+        else_branch,
+    ]), span);
+    Ok(Expr::new(ExprKind::List(vec![
+        Expr::new(ExprKind::Symbol("let".into()), span),
+        Expr::new(ExprKind::Symbol(loop_name.into()), span),
+        Expr::new(ExprKind::List(bindings), span),
+        if_expr,
+    ]), span))
+}
+
+fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
+    let mut st = CekState::Eval(expr.clone(), env.clone());
+    let mut k: K = Rc::new(Cont::Halt);
+
+    loop {
+        let cur_st = std::mem::replace(&mut st, CekState::Ret(Value::Void));
+        match cur_st {
+            CekState::Eval(e, mut cur_env) => {
+                let span = e.span;
+                match e.kind {
+                    ExprKind::Integer(n) => { st = CekState::Ret(Value::Integer(n)); }
+                    ExprKind::Float(f) => { st = CekState::Ret(Value::Float(f)); }
+                    ExprKind::Rational(n, d) => { st = CekState::Ret(make_rational(n, d)); }
+                    ExprKind::Boolean(b) => { st = CekState::Ret(Value::Boolean(b)); }
+                    ExprKind::Char(c) => { st = CekState::Ret(Value::Char(c)); }
+                    ExprKind::Str(s) => { st = CekState::Ret(Value::Str(s, false)); }
+                    ExprKind::Symbol(s) => {
+                        let val = cur_env.get(&s).ok_or_else(|| EvalError::Unbound(format!("{s} at {span}")))?;
+                        st = CekState::Ret(val);
+                    }
+                    ExprKind::List(elems) => {
+                        if elems.is_empty() {
+                            return Err(EvalError::Syntax(format!("empty application at {span}")));
+                        }
+                        if let ExprKind::Symbol(ref head) = elems[0].kind {
+                            match head.as_str() {
                     "quote" => {
                         if elems.len() != 2 {
                             return Err(EvalError::Syntax(format!("quote requires 1 argument at {span}")));
                         }
-                        return Ok(expr_to_value(&elems[1]));
+                        st = CekState::Ret(expr_to_value(&elems[1]));
                     }
                     "if" => {
                         if elems.len() < 3 || elems.len() > 4 {
                             return Err(EvalError::Syntax(format!("if requires 2 or 3 arguments at {span}")));
                         }
-                        let cond = eval(&elems[1], &mut cur_env, output)?;
-                        if is_truthy(&cond) {
-                            cur_expr = elems[2].clone();
-                            continue 'tco;
-                        } else if elems.len() == 4 {
-                            cur_expr = elems[3].clone();
-                            continue 'tco;
-                        } else {
-                            return Ok(Value::Void);
-                        }
+                        k = Rc::new(Cont::IfK(elems[2].clone(), elems.get(3).cloned(), cur_env.clone(), k));
+                        st = CekState::Eval(elems[1].clone(), cur_env);
                     }
                     "define" => {
                         if elems.len() < 3 {
@@ -911,9 +1131,8 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                         }
                         match &elems[1].kind {
                             ExprKind::Symbol(name) => {
-                                let val = eval(&elems[2], &mut cur_env, output)?;
-                                cur_env.set(name.clone(), val);
-                                return Ok(Value::Void);
+                                k = Rc::new(Cont::Def(name.clone(), cur_env.clone(), k));
+                                st = CekState::Eval(elems[2].clone(), cur_env);
                             }
                             ExprKind::List(sig) => {
                                 if sig.is_empty() {
@@ -933,7 +1152,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                                     env: cur_env.clone(),
                                 };
                                 cur_env.set(name, lambda);
-                                return Ok(Value::Void);
+                                st = CekState::Ret(Value::Void);
                             }
                             _ => return Err(EvalError::Syntax(format!("define: expected symbol or list at {span}"))),
                         }
@@ -944,13 +1163,11 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                         }
                         let (params, rest_param) = match &elems[1].kind {
                             ExprKind::List(ps) => parse_params(ps, span)?,
-                            ExprKind::Symbol(s) => {
-                                (vec![], Some(s.clone()))
-                            }
+                            ExprKind::Symbol(s) => (vec![], Some(s.clone())),
                             _ => return Err(EvalError::Syntax(format!("lambda: expected parameter list at {span}"))),
                         };
                         let body = elems[2..].to_vec();
-                        return Ok(Value::Lambda {
+                        st = CekState::Ret(Value::Lambda {
                             name: None,
                             params,
                             rest_param,
@@ -979,44 +1196,33 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                                 return Err(EvalError::Syntax(format!("case-lambda: expected clause list at {span}")));
                             }
                         }
-                        return Ok(Value::CaseLambda {
-                            name: None,
-                            clauses,
-                        });
+                        st = CekState::Ret(Value::CaseLambda { name: None, clauses });
                     }
                     "and" => {
                         if elems.len() == 1 {
-                            return Ok(Value::Boolean(true));
+                            st = CekState::Ret(Value::Boolean(true));
+                        } else if elems.len() == 2 {
+                            st = CekState::Eval(elems[1].clone(), cur_env);
+                        } else {
+                            k = Rc::new(Cont::AndK(elems[2..].to_vec(), cur_env.clone(), k));
+                            st = CekState::Eval(elems[1].clone(), cur_env);
                         }
-                        for a in &elems[1..elems.len()-1] {
-                            let result = eval(a, &mut cur_env, output)?;
-                            if !is_truthy(&result) {
-                                return Ok(result);
-                            }
-                        }
-                        // Last expression is tail position
-                        cur_expr = elems.last().unwrap().clone();
-                        continue 'tco;
                     }
                     "or" => {
                         if elems.len() == 1 {
-                            return Ok(Value::Boolean(false));
+                            st = CekState::Ret(Value::Boolean(false));
+                        } else if elems.len() == 2 {
+                            st = CekState::Eval(elems[1].clone(), cur_env);
+                        } else {
+                            k = Rc::new(Cont::OrK(elems[2..].to_vec(), cur_env.clone(), k));
+                            st = CekState::Eval(elems[1].clone(), cur_env);
                         }
-                        for a in &elems[1..elems.len()-1] {
-                            let result = eval(a, &mut cur_env, output)?;
-                            if is_truthy(&result) {
-                                return Ok(result);
-                            }
-                        }
-                        // Last expression is tail position
-                        cur_expr = elems.last().unwrap().clone();
-                        continue 'tco;
                     }
                     "let" => {
                         if elems.len() < 3 {
                             return Err(EvalError::Syntax(format!("let requires bindings and body at {span}")));
                         }
-                        let (name, bindings_expr, body_start) = match &elems[1].kind {
+                        let (named, bindings_expr, body_start) = match &elems[1].kind {
                             ExprKind::Symbol(n) => {
                                 if elems.len() < 4 {
                                     return Err(EvalError::Syntax(format!("named let requires bindings and body at {span}")));
@@ -1030,15 +1236,13 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                             ExprKind::List(bs) => bs,
                             _ => return Err(EvalError::Syntax(format!("let: expected bindings list at {span}"))),
                         };
-                        let mut params = Vec::new();
-                        let mut init_vals = Vec::new();
+                        let mut binding_pairs: Vec<(String, Expr)> = Vec::new();
                         for b in bindings_list {
                             match &b.kind {
                                 ExprKind::List(pair) if pair.len() == 2 => {
                                     match &pair[0].kind {
                                         ExprKind::Symbol(s) => {
-                                            params.push(s.clone());
-                                            init_vals.push(eval(&pair[1], &mut cur_env, output)?);
+                                            binding_pairs.push((s.clone(), pair[1].clone()));
                                         }
                                         _ => return Err(EvalError::Syntax(format!("let: expected variable name at {span}"))),
                                     }
@@ -1047,36 +1251,42 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                             }
                         }
                         let body = elems[body_start..].to_vec();
-                        if let Some(loop_name) = name {
-                            // Named let: create lambda and apply with TCO
-                            let lambda = Value::Lambda {
-                                name: Some(loop_name.clone()),
-                                params: params.clone(),
-                                rest_param: None,
-                                body: body.clone(),
-                                env: cur_env.clone(),
+                        if binding_pairs.is_empty() {
+                            // No bindings — just evaluate body
+                            let local_env = if named.is_some() {
+                                let le = Env::with_parent(cur_env.clone());
+                                if let Some(ref ln) = named {
+                                    let lambda = Value::Lambda {
+                                        name: Some(ln.clone()), params: vec![], rest_param: None,
+                                        body: body.clone(), env: le.clone(),
+                                    };
+                                    le.set(ln.clone(), lambda);
+                                }
+                                le
+                            } else {
+                                Env::with_parent(cur_env)
                             };
-                            let (mut local_env, skip) = setup_lambda_env(&lambda, &Some(loop_name), &params, &None, &body, &cur_env, &init_vals, span, output)?;
-                            let rest = &body[skip..];
-                            if rest.is_empty() { return Ok(Value::Void); }
-                            for e in &rest[..rest.len()-1] {
-                                eval(e, &mut local_env, output)?;
+                            if body.is_empty() { st = CekState::Ret(Value::Void); }
+                            else if body.len() == 1 { st = CekState::Eval(body[0].clone(), local_env); }
+                            else {
+                                k = Rc::new(Cont::Seq(body[1..].to_vec(), local_env.clone(), k));
+                                st = CekState::Eval(body[0].clone(), local_env);
                             }
-                            cur_expr = rest.last().unwrap().clone();
-                            cur_env = local_env;
-                            continue 'tco;
+                        } else {
+                            let first_expr = binding_pairs[0].1.clone();
+                            let first_name = binding_pairs[0].0.clone();
+                            let rest = binding_pairs[1..].to_vec();
+                            k = Rc::new(Cont::LetBind {
+                                rest,
+                                names: vec![first_name],
+                                vals: vec![],
+                                body,
+                                named,
+                                outer_env: cur_env.clone(),
+                                next: k,
+                            });
+                            st = CekState::Eval(first_expr, cur_env);
                         }
-                        let mut local_env = Env::with_parent(cur_env.clone());
-                        for (p, v) in params.iter().zip(init_vals.iter()) {
-                            local_env.set(p.clone(), v.clone());
-                        }
-                        if body.is_empty() { return Ok(Value::Void); }
-                        for expr in &body[..body.len()-1] {
-                            eval(expr, &mut local_env, output)?;
-                        }
-                        cur_expr = body.last().unwrap().clone();
-                        cur_env = local_env;
-                        continue 'tco;
                     }
                     "let*" => {
                         if elems.len() < 3 {
@@ -1086,66 +1296,74 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                             ExprKind::List(bs) => bs,
                             _ => return Err(EvalError::Syntax(format!("let*: expected bindings list at {span}"))),
                         };
-                        let mut local_env = Env::with_parent(cur_env.clone());
+                        let mut binding_pairs: Vec<(String, Expr)> = Vec::new();
                         for b in bindings_list {
                             match &b.kind {
                                 ExprKind::List(pair) if pair.len() == 2 => {
                                     match &pair[0].kind {
-                                        ExprKind::Symbol(s) => {
-                                            let val = eval(&pair[1], &mut local_env, output)?;
-                                            local_env.set(s.clone(), val);
-                                        }
+                                        ExprKind::Symbol(s) => binding_pairs.push((s.clone(), pair[1].clone())),
                                         _ => return Err(EvalError::Syntax(format!("let*: expected variable name at {span}"))),
                                     }
                                 }
                                 _ => return Err(EvalError::Syntax(format!("let*: bad binding at {span}"))),
                             }
                         }
-                        let body = &elems[2..];
-                        if body.is_empty() { return Ok(Value::Void); }
-                        for expr in &body[..body.len()-1] {
-                            eval(expr, &mut local_env, output)?;
+                        let body = elems[2..].to_vec();
+                        let local_env = Env::with_parent(cur_env.clone());
+                        if binding_pairs.is_empty() {
+                            if body.is_empty() { st = CekState::Ret(Value::Void); }
+                            else if body.len() == 1 { st = CekState::Eval(body[0].clone(), local_env); }
+                            else {
+                                k = Rc::new(Cont::Seq(body[1..].to_vec(), local_env.clone(), k));
+                                st = CekState::Eval(body[0].clone(), local_env);
+                            }
+                        } else {
+                            let first_name = binding_pairs[0].0.clone();
+                            let first_expr = binding_pairs[0].1.clone();
+                            let rest = binding_pairs[1..].to_vec();
+                            k = Rc::new(Cont::LetStarBind(first_name, rest, body, local_env.clone(), k));
+                            st = CekState::Eval(first_expr, local_env);
                         }
-                        cur_expr = body.last().unwrap().clone();
-                        cur_env = local_env;
-                        continue 'tco;
                     }
                     "begin" => {
-                        if elems.len() <= 1 { return Ok(Value::Void); }
-                        for expr in &elems[1..elems.len()-1] {
-                            eval(expr, &mut cur_env, output)?;
+                        if elems.len() <= 1 { st = CekState::Ret(Value::Void); }
+                        else if elems.len() == 2 { st = CekState::Eval(elems[1].clone(), cur_env); }
+                        else {
+                            k = Rc::new(Cont::Seq(elems[2..].to_vec(), cur_env.clone(), k));
+                            st = CekState::Eval(elems[1].clone(), cur_env);
                         }
-                        cur_expr = elems.last().unwrap().clone();
-                        continue 'tco;
                     }
                     "cond" => {
-                        for clause in &elems[1..] {
+                        let clauses = &elems[1..];
+                        if clauses.is_empty() {
+                            st = CekState::Ret(Value::Void);
+                        } else {
+                            let clause = &clauses[0];
                             match &clause.kind {
                                 ExprKind::List(parts) if !parts.is_empty() => {
                                     if let ExprKind::Symbol(s) = &parts[0].kind {
                                         if s == "else" {
-                                            if parts.len() <= 1 { return Ok(Value::Void); }
-                                            for expr in &parts[1..parts.len()-1] {
-                                                eval(expr, &mut cur_env, output)?;
+                                            if parts.len() <= 1 { st = CekState::Ret(Value::Void); }
+                                            else if parts.len() == 2 { st = CekState::Eval(parts[1].clone(), cur_env); }
+                                            else {
+                                                k = Rc::new(Cont::Seq(parts[2..].to_vec(), cur_env.clone(), k));
+                                                st = CekState::Eval(parts[1].clone(), cur_env);
                                             }
-                                            cur_expr = parts.last().unwrap().clone();
-                                            continue 'tco;
+                                            continue;
                                         }
                                     }
-                                    let test = eval(&parts[0], &mut cur_env, output)?;
-                                    if is_truthy(&test) {
-                                        if parts.len() <= 1 { return Ok(test); }
-                                        for expr in &parts[1..parts.len()-1] {
-                                            eval(expr, &mut cur_env, output)?;
-                                        }
-                                        cur_expr = parts.last().unwrap().clone();
-                                        continue 'tco;
-                                    }
+                                    k = Rc::new(Cont::CondK {
+                                        body: parts[1..].to_vec(),
+                                        remaining: clauses[1..].to_vec(),
+                                        env: cur_env.clone(),
+                                        span,
+                                        next: k,
+                                    });
+                                    st = CekState::Eval(parts[0].clone(), cur_env);
                                 }
                                 _ => return Err(EvalError::Syntax(format!("cond: bad clause at {span}"))),
                             }
                         }
-                        return Ok(Value::Void);
                     }
                     "set!" => {
                         if elems.len() != 3 {
@@ -1155,11 +1373,8 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                             ExprKind::Symbol(s) => s.clone(),
                             _ => return Err(EvalError::Syntax(format!("set!: expected variable name at {span}"))),
                         };
-                        let val = eval(&elems[2], &mut cur_env, output)?;
-                        if !cur_env.set_existing(&var_name, val) {
-                            return Err(EvalError::Unbound(format!("{var_name} at {span}")));
-                        }
-                        return Ok(Value::Void);
+                        k = Rc::new(Cont::SetK(var_name, cur_env.clone(), span, k));
+                        st = CekState::Eval(elems[2].clone(), cur_env);
                     }
                     "string-set!" => {
                         if elems.len() != 4 {
@@ -1169,31 +1384,8 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                             ExprKind::Symbol(s) => s.clone(),
                             _ => return Err(EvalError::Type(format!("string-set!: strings are immutable at {span}"))),
                         };
-                        let idx = match eval(&elems[2], &mut cur_env, output)? {
-                            Value::Integer(n) => n as usize,
-                            _ => return Err(EvalError::Type(format!("string-set!: expected integer index at {span}"))),
-                        };
-                        let ch = match eval(&elems[3], &mut cur_env, output)? {
-                            Value::Char(c) => c,
-                            _ => return Err(EvalError::Type(format!("string-set!: expected char at {span}"))),
-                        };
-                        let current = cur_env.get(&var_name).ok_or_else(|| EvalError::Unbound(format!("{var_name} at {span}")))?;
-                        match current {
-                            Value::Str(s, true) => {
-                                let mut chars: Vec<char> = s.chars().collect();
-                                if idx >= chars.len() {
-                                    return Err(EvalError::Type(format!("string-set!: index out of range at {span}")));
-                                }
-                                chars[idx] = ch;
-                                let new_s: String = chars.into_iter().collect();
-                                cur_env.set_existing(&var_name, Value::Str(new_s, true));
-                                return Ok(Value::Void);
-                            }
-                            Value::Str(_, false) => {
-                                return Err(EvalError::Type(format!("string-set!: strings are immutable at {span}")));
-                            }
-                            _ => return Err(EvalError::Type(format!("string-set!: not a string at {span}"))),
-                        }
+                        k = Rc::new(Cont::StrSetIdxK(var_name, elems[3].clone(), cur_env.clone(), span, k));
+                        st = CekState::Eval(elems[2].clone(), cur_env);
                     }
                     "define-record-type" => {
                         if elems.len() < 4 {
@@ -1248,7 +1440,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                             let acc_builtin = format!("__racc_{}_{}", type_id, field_name);
                             cur_env.set(accessor_name.clone(), Value::Builtin(acc_builtin));
                         }
-                        return Ok(Value::Void);
+                        st = CekState::Ret(Value::Void);
                     }
                     "letrec" => {
                         if elems.len() < 3 {
@@ -1258,7 +1450,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                             ExprKind::List(bs) => bs,
                             _ => return Err(EvalError::Syntax(format!("letrec: expected bindings list at {span}"))),
                         };
-                        let mut local_env = Env::with_parent(cur_env.clone());
+                        let mut local_env = Env::with_parent(cur_env);
                         let mut names = Vec::new();
                         let mut init_exprs = Vec::new();
                         for b in bindings_list {
@@ -1267,7 +1459,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                                     match &pair[0].kind {
                                         ExprKind::Symbol(s) => {
                                             names.push(s.clone());
-                                            init_exprs.push(&pair[1]);
+                                            init_exprs.push(pair[1].clone());
                                             local_env.set(s.clone(), Value::Void);
                                         }
                                         _ => return Err(EvalError::Syntax(format!("letrec: expected variable name at {span}"))),
@@ -1276,20 +1468,27 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                                 _ => return Err(EvalError::Syntax(format!("letrec: bad binding at {span}"))),
                             }
                         }
-                        let vals: Vec<Value> = init_exprs.iter()
-                            .map(|e| eval(e, &mut local_env, output))
-                            .collect::<Result<_, _>>()?;
-                        for (name, val) in names.iter().zip(vals.iter()) {
-                            local_env.set(name.clone(), val.clone());
+                        let body = elems[2..].to_vec();
+                        if init_exprs.is_empty() {
+                            if body.is_empty() { st = CekState::Ret(Value::Void); }
+                            else if body.len() == 1 { st = CekState::Eval(body[0].clone(), local_env); }
+                            else {
+                                k = Rc::new(Cont::Seq(body[1..].to_vec(), local_env.clone(), k));
+                                st = CekState::Eval(body[0].clone(), local_env);
+                            }
+                        } else {
+                            let first = init_exprs[0].clone();
+                            let rest = init_exprs[1..].to_vec();
+                            k = Rc::new(Cont::LetrecBind {
+                                rest_inits: rest,
+                                done_vals: vec![],
+                                names,
+                                body,
+                                env: local_env.clone(),
+                                next: k,
+                            });
+                            st = CekState::Eval(first, local_env);
                         }
-                        let body = &elems[2..];
-                        if body.is_empty() { return Ok(Value::Void); }
-                        for expr in &body[..body.len()-1] {
-                            eval(expr, &mut local_env, output)?;
-                        }
-                        cur_expr = body.last().unwrap().clone();
-                        cur_env = local_env;
-                        continue 'tco;
                     }
                     "letrec*" => {
                         if elems.len() < 3 {
@@ -1299,125 +1498,45 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                             ExprKind::List(bs) => bs,
                             _ => return Err(EvalError::Syntax(format!("letrec*: expected bindings list at {span}"))),
                         };
-                        let mut local_env = Env::with_parent(cur_env.clone());
+                        let mut binding_pairs: Vec<(String, Expr)> = Vec::new();
                         for b in bindings_list {
                             match &b.kind {
                                 ExprKind::List(pair) if pair.len() == 2 => {
                                     match &pair[0].kind {
-                                        ExprKind::Symbol(s) => {
-                                            let val = eval(&pair[1], &mut local_env, output)?;
-                                            local_env.set(s.clone(), val);
-                                        }
+                                        ExprKind::Symbol(s) => binding_pairs.push((s.clone(), pair[1].clone())),
                                         _ => return Err(EvalError::Syntax(format!("letrec*: expected variable name at {span}"))),
                                     }
                                 }
                                 _ => return Err(EvalError::Syntax(format!("letrec*: bad binding at {span}"))),
                             }
                         }
-                        let body = &elems[2..];
-                        if body.is_empty() { return Ok(Value::Void); }
-                        for expr in &body[..body.len()-1] {
-                            eval(expr, &mut local_env, output)?;
+                        let body = elems[2..].to_vec();
+                        let local_env = Env::with_parent(cur_env);
+                        if binding_pairs.is_empty() {
+                            if body.is_empty() { st = CekState::Ret(Value::Void); }
+                            else if body.len() == 1 { st = CekState::Eval(body[0].clone(), local_env); }
+                            else {
+                                k = Rc::new(Cont::Seq(body[1..].to_vec(), local_env.clone(), k));
+                                st = CekState::Eval(body[0].clone(), local_env);
+                            }
+                        } else {
+                            let first_name = binding_pairs[0].0.clone();
+                            let first = binding_pairs[0].1.clone();
+                            let rest = binding_pairs[1..].to_vec();
+                            k = Rc::new(Cont::LetrecStarBind(first_name, rest, body, local_env.clone(), k));
+                            st = CekState::Eval(first, local_env);
                         }
-                        cur_expr = body.last().unwrap().clone();
-                        cur_env = local_env;
-                        continue 'tco;
                     }
                     "case" => {
                         if elems.len() < 2 {
                             return Err(EvalError::Syntax(format!("case requires key and clauses at {span}")));
                         }
-                        let key = eval(&elems[1], &mut cur_env, output)?;
-                        for clause in &elems[2..] {
-                            match &clause.kind {
-                                ExprKind::List(parts) if !parts.is_empty() => {
-                                    if let ExprKind::Symbol(s) = &parts[0].kind {
-                                        if s == "else" {
-                                            let mut result = Value::Void;
-                                            for expr in &parts[1..] {
-                                                result = eval(expr, &mut cur_env, output)?;
-                                            }
-                                            return Ok(result);
-                                        }
-                                    }
-                                    let datums = match &parts[0].kind {
-                                        ExprKind::List(ds) => ds,
-                                        _ => return Err(EvalError::Syntax(format!("case: expected datum list at {span}"))),
-                                    };
-                                    let matched = datums.iter().any(|d| {
-                                        let datum_val = expr_to_value(d);
-                                        scheme_eqv(&key, &datum_val)
-                                    });
-                                    if matched {
-                                        let mut result = Value::Void;
-                                        for expr in &parts[1..] {
-                                            result = eval(expr, &mut cur_env, output)?;
-                                        }
-                                        return Ok(result);
-                                    }
-                                }
-                                _ => return Err(EvalError::Syntax(format!("case: bad clause at {span}"))),
-                            }
-                        }
-                        return Ok(Value::Void);
+                        k = Rc::new(Cont::CaseK(elems[2..].to_vec(), cur_env.clone(), span, k));
+                        st = CekState::Eval(elems[1].clone(), cur_env);
                     }
                     "do" => {
-                        if elems.len() < 3 {
-                            return Err(EvalError::Syntax(format!("do requires var-clauses and test at {span}")));
-                        }
-                        let var_clauses = match &elems[1].kind {
-                            ExprKind::List(cs) => cs,
-                            _ => return Err(EvalError::Syntax(format!("do: expected var clauses at {span}"))),
-                        };
-                        let test_clause = match &elems[2].kind {
-                            ExprKind::List(tc) if !tc.is_empty() => tc,
-                            _ => return Err(EvalError::Syntax(format!("do: expected test clause at {span}"))),
-                        };
-                        let mut var_names = Vec::new();
-                        let mut step_exprs: Vec<Option<&Expr>> = Vec::new();
-                        let mut local_env = Env::with_parent(cur_env.clone());
-                        for vc in var_clauses {
-                            match &vc.kind {
-                                ExprKind::List(parts) if parts.len() >= 2 => {
-                                    let name = match &parts[0].kind {
-                                        ExprKind::Symbol(s) => s.clone(),
-                                        _ => return Err(EvalError::Syntax(format!("do: expected variable name at {span}"))),
-                                    };
-                                    let init = eval(&parts[1], &mut cur_env, output)?;
-                                    local_env.set(name.clone(), init);
-                                    var_names.push(name);
-                                    step_exprs.push(if parts.len() >= 3 { Some(&parts[2]) } else { None });
-                                }
-                                _ => return Err(EvalError::Syntax(format!("do: bad var clause at {span}"))),
-                            }
-                        }
-                        let body = &elems[3..];
-                        loop {
-                            let test_result = eval(&test_clause[0], &mut local_env, output)?;
-                            if is_truthy(&test_result) {
-                                let mut result = Value::Void;
-                                for expr in &test_clause[1..] {
-                                    result = eval(expr, &mut local_env, output)?;
-                                }
-                                return Ok(result);
-                            }
-                            for expr in body {
-                                eval(expr, &mut local_env, output)?;
-                            }
-                            let new_vals: Vec<Option<Value>> = step_exprs.iter()
-                                .map(|step| {
-                                    match step {
-                                        Some(expr) => Ok(Some(eval(expr, &mut local_env, output)?)),
-                                        None => Ok(None),
-                                    }
-                                })
-                                .collect::<Result<_, EvalError>>()?;
-                            for (name, new_val) in var_names.iter().zip(new_vals.into_iter()) {
-                                if let Some(v) = new_val {
-                                    local_env.set(name.clone(), v);
-                                }
-                            }
-                        }
+                        let desugared = desugar_do(&elems, span)?;
+                        st = CekState::Eval(desugared, cur_env);
                     }
                     "define-syntax" => {
                         if elems.len() != 3 {
@@ -1455,12 +1574,20 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                         }
                         let macro_val = Value::Macro { literals: lits, rules, def_env: cur_env.clone() };
                         cur_env.set(macro_name, macro_val);
-                        return Ok(Value::Void);
+                        st = CekState::Ret(Value::Void);
+                    }
+                    "call/cc" | "call-with-current-continuation" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Syntax(format!("call/cc requires 1 argument at {span}")));
+                        }
+                        k = Rc::new(Cont::CallCCK(k));
+                        st = CekState::Eval(elems[1].clone(), cur_env);
                     }
                     _ => {
                         // Check for macro invocation
                         if let Some(Value::Macro { literals: mac_lits, rules: mac_rules, def_env: mac_def_env }) = cur_env.get(head) {
                             let input_elems = &elems[1..];
+                            let mut expanded_result = None;
                             for (pattern, template) in &mac_rules {
                                 let mut bindings = HashMap::new();
                                 if match_syntax_pattern(pattern, input_elems, &mac_lits, &mut bindings) {
@@ -1473,66 +1600,345 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                                             cur_env.set(renamed.clone(), val);
                                         }
                                     }
-                                    cur_expr = expanded;
-                                    continue 'tco;
+                                    expanded_result = Some(expanded);
+                                    break;
                                 }
                             }
-                            return Err(EvalError::Syntax(format!("no matching pattern for macro {head} at {span}")));
-                        }
-                    }
-                    }
-                }
-
-                // Function application
-                let func = eval(&elems[0], &mut cur_env, output)?;
-                let args: Vec<Value> = elems[1..].iter()
-                    .map(|a| eval(a, &mut cur_env, output))
-                    .collect::<Result<_, _>>()?;
-
-                // TCO: inline lambda application for tail calls
-                if let Value::Lambda { ref name, ref params, ref rest_param, ref body, env: ref closure_env } = func {
-                    let (mut local_env, skip) = setup_lambda_env(&func, name, params, rest_param, body, closure_env, &args, span, output)?;
-                    let rest = &body[skip..];
-                    if rest.is_empty() { return Ok(Value::Void); }
-                    for e in &rest[..rest.len()-1] {
-                        eval(e, &mut local_env, output)?;
-                    }
-                    cur_expr = rest.last().unwrap().clone();
-                    cur_env = local_env;
-                    continue 'tco;
-                }
-                if let Value::CaseLambda { ref name, ref clauses } = func {
-                    for (params, rest_param, body, clause_env) in clauses {
-                        let matches = if rest_param.is_some() {
-                            args.len() >= params.len()
-                        } else {
-                            args.len() == params.len()
-                        };
-                        if matches {
-                            let lambda = Value::Lambda {
-                                name: name.clone(),
-                                params: params.clone(),
-                                rest_param: rest_param.clone(),
-                                body: body.clone(),
-                                env: clause_env.clone(),
-                            };
-                            let (mut local_env, skip) = setup_lambda_env(&lambda, name, params, rest_param, body, clause_env, &args, span, output)?;
-                            let rest = &body[skip..];
-                            if rest.is_empty() { return Ok(Value::Void); }
-                            for e in &rest[..rest.len()-1] {
-                                eval(e, &mut local_env, output)?;
+                            if let Some(expanded) = expanded_result {
+                                st = CekState::Eval(expanded, cur_env);
+                            } else {
+                                return Err(EvalError::Syntax(format!("no matching pattern for macro {head} at {span}")));
                             }
-                            cur_expr = rest.last().unwrap().clone();
-                            cur_env = local_env;
-                            continue 'tco;
+                        } else {
+                            // Not a macro — function application (right-to-left arg eval)
+                            let mut rev_args = elems[1..].to_vec();
+                            rev_args.reverse();
+                            k = Rc::new(Cont::EvOp(rev_args, cur_env.clone(), span, k));
+                            st = CekState::Eval(elems[0].clone(), cur_env);
                         }
                     }
-                    return Err(EvalError::Arity(format!(
-                        "no matching clause for {} arguments at {span}", args.len()
-                    )));
+                            }
+                        } else {
+                            // Head is not a symbol — function application (right-to-left arg eval)
+                            let mut rev_args = elems[1..].to_vec();
+                            rev_args.reverse();
+                            k = Rc::new(Cont::EvOp(rev_args, cur_env.clone(), span, k));
+                            st = CekState::Eval(elems[0].clone(), cur_env);
+                        }
+                    }
                 }
-
-                return apply_func(&func, &args, span, output);
+            }
+            CekState::Ret(val) => {
+                let frame = match Rc::try_unwrap(k) {
+                    Ok(c) => c,
+                    Err(rc) => (*rc).clone(),
+                };
+                match frame {
+                    Cont::Halt => return Ok(val),
+                    Cont::Seq(rest, env, next) => {
+                        if rest.len() == 1 {
+                            k = next;
+                            st = CekState::Eval(rest[0].clone(), env);
+                        } else {
+                            k = Rc::new(Cont::Seq(rest[1..].to_vec(), env.clone(), next));
+                            st = CekState::Eval(rest[0].clone(), env);
+                        }
+                    }
+                    Cont::Def(name, env, next) => {
+                        env.set(name, val);
+                        k = next;
+                        st = CekState::Ret(Value::Void);
+                    }
+                    Cont::SetK(name, env, span, next) => {
+                        if !env.set_existing(&name, val) {
+                            return Err(EvalError::Unbound(format!("{name} at {span}")));
+                        }
+                        k = next;
+                        st = CekState::Ret(Value::Void);
+                    }
+                    Cont::IfK(then_e, else_e, env, next) => {
+                        k = next;
+                        if is_truthy(&val) {
+                            st = CekState::Eval(then_e, env);
+                        } else if let Some(ee) = else_e {
+                            st = CekState::Eval(ee, env);
+                        } else {
+                            st = CekState::Ret(Value::Void);
+                        }
+                    }
+                    Cont::EvOp(rev_arg_exprs, env, span, next) => {
+                        // rev_arg_exprs is reversed: we evaluate rightmost argument first
+                        if rev_arg_exprs.is_empty() {
+                            k = next;
+                            cek_apply_func(&val, &[], span, &mut st, &mut k, output)?;
+                        } else {
+                            k = Rc::new(Cont::EvArg(val, vec![], rev_arg_exprs[1..].to_vec(), env.clone(), span, next));
+                            st = CekState::Eval(rev_arg_exprs[0].clone(), env);
+                        }
+                    }
+                    Cont::EvArg(func, mut done, rest, env, span, next) => {
+                        done.push(val);
+                        if rest.is_empty() {
+                            // done is in reverse order (rightmost first), reverse to get original order
+                            done.reverse();
+                            k = next;
+                            cek_apply_func(&func, &done, span, &mut st, &mut k, output)?;
+                        } else {
+                            k = Rc::new(Cont::EvArg(func, done, rest[1..].to_vec(), env.clone(), span, next));
+                            st = CekState::Eval(rest[0].clone(), env);
+                        }
+                    }
+                    Cont::AndK(rest, env, next) => {
+                        if !is_truthy(&val) {
+                            k = next;
+                            st = CekState::Ret(val);
+                        } else if rest.len() == 1 {
+                            k = next;
+                            st = CekState::Eval(rest[0].clone(), env);
+                        } else {
+                            k = Rc::new(Cont::AndK(rest[1..].to_vec(), env.clone(), next));
+                            st = CekState::Eval(rest[0].clone(), env);
+                        }
+                    }
+                    Cont::OrK(rest, env, next) => {
+                        if is_truthy(&val) {
+                            k = next;
+                            st = CekState::Ret(val);
+                        } else if rest.len() == 1 {
+                            k = next;
+                            st = CekState::Eval(rest[0].clone(), env);
+                        } else {
+                            k = Rc::new(Cont::OrK(rest[1..].to_vec(), env.clone(), next));
+                            st = CekState::Eval(rest[0].clone(), env);
+                        }
+                    }
+                    Cont::LetBind { rest, mut names, mut vals, body, named, outer_env, next } => {
+                        vals.push(val);
+                        if rest.is_empty() {
+                            // All bindings evaluated
+                            if let Some(loop_name) = named {
+                                let lambda = Value::Lambda {
+                                    name: Some(loop_name.clone()),
+                                    params: names.clone(),
+                                    rest_param: None,
+                                    body: body.clone(),
+                                    env: outer_env.clone(),
+                                };
+                                let local_env = setup_lambda_env_basic(&lambda, &Some(loop_name), &names, &None, &outer_env, &vals, Span::default())?;
+                                if body.is_empty() { k = next; st = CekState::Ret(Value::Void); }
+                                else if body.len() == 1 { k = next; st = CekState::Eval(body[0].clone(), local_env); }
+                                else {
+                                    k = Rc::new(Cont::Seq(body[1..].to_vec(), local_env.clone(), next));
+                                    st = CekState::Eval(body[0].clone(), local_env);
+                                }
+                            } else {
+                                let local_env = Env::with_parent(outer_env);
+                                for (n, v) in names.iter().zip(vals.iter()) {
+                                    local_env.set(n.clone(), v.clone());
+                                }
+                                if body.is_empty() { k = next; st = CekState::Ret(Value::Void); }
+                                else if body.len() == 1 { k = next; st = CekState::Eval(body[0].clone(), local_env); }
+                                else {
+                                    k = Rc::new(Cont::Seq(body[1..].to_vec(), local_env.clone(), next));
+                                    st = CekState::Eval(body[0].clone(), local_env);
+                                }
+                            }
+                        } else {
+                            names.push(rest[0].0.clone());
+                            let next_expr = rest[0].1.clone();
+                            k = Rc::new(Cont::LetBind {
+                                rest: rest[1..].to_vec(),
+                                names,
+                                vals,
+                                body,
+                                named,
+                                outer_env: outer_env.clone(),
+                                next,
+                            });
+                            st = CekState::Eval(next_expr, outer_env);
+                        }
+                    }
+                    Cont::LetStarBind(cur_name, rest, body, env, next) => {
+                        env.set(cur_name, val);
+                        if rest.is_empty() {
+                            if body.is_empty() { k = next; st = CekState::Ret(Value::Void); }
+                            else if body.len() == 1 { k = next; st = CekState::Eval(body[0].clone(), env); }
+                            else {
+                                k = Rc::new(Cont::Seq(body[1..].to_vec(), env.clone(), next));
+                                st = CekState::Eval(body[0].clone(), env);
+                            }
+                        } else {
+                            let next_name = rest[0].0.clone();
+                            let next_expr = rest[0].1.clone();
+                            k = Rc::new(Cont::LetStarBind(next_name, rest[1..].to_vec(), body, env.clone(), next));
+                            st = CekState::Eval(next_expr, env);
+                        }
+                    }
+                    Cont::LetrecBind { rest_inits, mut done_vals, names, body, env, next } => {
+                        done_vals.push(val);
+                        if rest_inits.is_empty() {
+                            for (name, v) in names.iter().zip(done_vals.iter()) {
+                                env.set(name.clone(), v.clone());
+                            }
+                            if body.is_empty() { k = next; st = CekState::Ret(Value::Void); }
+                            else if body.len() == 1 { k = next; st = CekState::Eval(body[0].clone(), env); }
+                            else {
+                                k = Rc::new(Cont::Seq(body[1..].to_vec(), env.clone(), next));
+                                st = CekState::Eval(body[0].clone(), env);
+                            }
+                        } else {
+                            let next_init = rest_inits[0].clone();
+                            k = Rc::new(Cont::LetrecBind {
+                                rest_inits: rest_inits[1..].to_vec(),
+                                done_vals,
+                                names,
+                                body,
+                                env: env.clone(),
+                                next,
+                            });
+                            st = CekState::Eval(next_init, env);
+                        }
+                    }
+                    Cont::LetrecStarBind(cur_name, rest, body, env, next) => {
+                        env.set(cur_name, val);
+                        if rest.is_empty() {
+                            if body.is_empty() { k = next; st = CekState::Ret(Value::Void); }
+                            else if body.len() == 1 { k = next; st = CekState::Eval(body[0].clone(), env); }
+                            else {
+                                k = Rc::new(Cont::Seq(body[1..].to_vec(), env.clone(), next));
+                                st = CekState::Eval(body[0].clone(), env);
+                            }
+                        } else {
+                            let next_name = rest[0].0.clone();
+                            let next_expr = rest[0].1.clone();
+                            k = Rc::new(Cont::LetrecStarBind(next_name, rest[1..].to_vec(), body, env.clone(), next));
+                            st = CekState::Eval(next_expr, env);
+                        }
+                    }
+                    Cont::CaseK(clauses, env, span, next) => {
+                        k = next;
+                        let key = val;
+                        let mut found = false;
+                        for clause in &clauses {
+                            match &clause.kind {
+                                ExprKind::List(parts) if !parts.is_empty() => {
+                                    if let ExprKind::Symbol(s) = &parts[0].kind {
+                                        if s == "else" {
+                                            if parts.len() <= 1 { st = CekState::Ret(Value::Void); }
+                                            else if parts.len() == 2 { st = CekState::Eval(parts[1].clone(), env.clone()); }
+                                            else {
+                                                k = Rc::new(Cont::Seq(parts[2..].to_vec(), env.clone(), k));
+                                                st = CekState::Eval(parts[1].clone(), env.clone());
+                                            }
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                    let datums = match &parts[0].kind {
+                                        ExprKind::List(ds) => ds,
+                                        _ => return Err(EvalError::Syntax(format!("case: expected datum list at {span}"))),
+                                    };
+                                    let matched = datums.iter().any(|d| {
+                                        let datum_val = expr_to_value(d);
+                                        scheme_eqv(&key, &datum_val)
+                                    });
+                                    if matched {
+                                        if parts.len() <= 1 { st = CekState::Ret(Value::Void); }
+                                        else if parts.len() == 2 { st = CekState::Eval(parts[1].clone(), env.clone()); }
+                                        else {
+                                            k = Rc::new(Cont::Seq(parts[2..].to_vec(), env.clone(), k));
+                                            st = CekState::Eval(parts[1].clone(), env.clone());
+                                        }
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                _ => return Err(EvalError::Syntax(format!("case: bad clause at {span}"))),
+                            }
+                        }
+                        if !found {
+                            st = CekState::Ret(Value::Void);
+                        }
+                    }
+                    Cont::CondK { body, remaining, env, span, next } => {
+                        if is_truthy(&val) {
+                            k = next;
+                            if body.is_empty() {
+                                st = CekState::Ret(val);
+                            } else if body.len() == 1 {
+                                st = CekState::Eval(body[0].clone(), env);
+                            } else {
+                                k = Rc::new(Cont::Seq(body[1..].to_vec(), env.clone(), k));
+                                st = CekState::Eval(body[0].clone(), env);
+                            }
+                        } else if remaining.is_empty() {
+                            k = next;
+                            st = CekState::Ret(Value::Void);
+                        } else {
+                            let clause = &remaining[0];
+                            match &clause.kind {
+                                ExprKind::List(parts) if !parts.is_empty() => {
+                                    if let ExprKind::Symbol(s) = &parts[0].kind {
+                                        if s == "else" {
+                                            k = next;
+                                            if parts.len() <= 1 { st = CekState::Ret(Value::Void); }
+                                            else if parts.len() == 2 { st = CekState::Eval(parts[1].clone(), env); }
+                                            else {
+                                                k = Rc::new(Cont::Seq(parts[2..].to_vec(), env.clone(), k));
+                                                st = CekState::Eval(parts[1].clone(), env);
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                    k = Rc::new(Cont::CondK {
+                                        body: parts[1..].to_vec(),
+                                        remaining: remaining[1..].to_vec(),
+                                        env: env.clone(),
+                                        span,
+                                        next,
+                                    });
+                                    st = CekState::Eval(parts[0].clone(), env);
+                                }
+                                _ => return Err(EvalError::Syntax(format!("cond: bad clause at {span}"))),
+                            }
+                        }
+                    }
+                    Cont::StrSetIdxK(var_name, char_expr, env, span, next) => {
+                        let idx = match val {
+                            Value::Integer(n) => n as usize,
+                            _ => return Err(EvalError::Type(format!("string-set!: expected integer index at {span}"))),
+                        };
+                        k = Rc::new(Cont::StrSetCharK(var_name, idx, env.clone(), span, next));
+                        st = CekState::Eval(char_expr, env);
+                    }
+                    Cont::StrSetCharK(var_name, idx, env, span, next) => {
+                        let ch = match val {
+                            Value::Char(c) => c,
+                            _ => return Err(EvalError::Type(format!("string-set!: expected char at {span}"))),
+                        };
+                        let current = env.get(&var_name).ok_or_else(|| EvalError::Unbound(format!("{var_name} at {span}")))?;
+                        match current {
+                            Value::Str(s, true) => {
+                                let mut chars: Vec<char> = s.chars().collect();
+                                if idx >= chars.len() {
+                                    return Err(EvalError::Type(format!("string-set!: index out of range at {span}")));
+                                }
+                                chars[idx] = ch;
+                                let new_s: String = chars.into_iter().collect();
+                                env.set_existing(&var_name, Value::Str(new_s, true));
+                                k = next;
+                                st = CekState::Ret(Value::Void);
+                            }
+                            Value::Str(_, false) => return Err(EvalError::Type(format!("string-set!: strings are immutable at {span}"))),
+                            _ => return Err(EvalError::Type(format!("string-set!: not a string at {span}"))),
+                        }
+                    }
+                    Cont::CallCCK(next) => {
+                        let continuation_val = Value::Continuation(next.clone());
+                        k = next;
+                        cek_apply_func(&val, &[continuation_val], Span::default(), &mut st, &mut k, output)?;
+                    }
+                }
             }
         }
     }
@@ -1542,10 +1948,9 @@ fn apply_func(func: &Value, args: &[Value], call_span: Span, output: &mut String
     match func {
         Value::Builtin(name) => apply_builtin(name, args, call_span, output),
         Value::Lambda { name, params, rest_param, body, env } => {
-            let (mut local_env, skip) = setup_lambda_env(func, name, params, rest_param, body, env, args, call_span, output)?;
-            let rest = &body[skip..];
+            let mut local_env = setup_lambda_env_basic(func, name, params, rest_param, env, args, call_span)?;
             let mut result = Value::Void;
-            for e in rest {
+            for e in body {
                 result = eval(e, &mut local_env, output)?;
             }
             Ok(result)
@@ -1904,7 +2309,7 @@ fn apply_builtin(name: &str, args: &[Value], call_span: Span, output: &mut Strin
         }
         "procedure?" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("procedure? requires 1 argument at {call_span}"))); }
-            Ok(Value::Boolean(matches!(&args[0], Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Builtin(_))))
+            Ok(Value::Boolean(matches!(&args[0], Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Builtin(_) | Value::Continuation(_))))
         }
         "display" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("display requires 1 argument at {call_span}"))); }
@@ -2874,10 +3279,17 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     }
     let mut env = default_env();
     let mut output = String::new();
-    let mut result = Value::Void;
-    for expr in &exprs {
-        result = eval(expr, &mut env, &mut output)?;
-    }
+    // Evaluate all top-level expressions as a single sequence so that
+    // continuations captured by call/cc span across top-level expressions.
+    let top = if exprs.len() == 1 {
+        exprs.into_iter().next().unwrap()
+    } else {
+        let span = exprs[0].span;
+        let mut elems = vec![Expr::new(ExprKind::Symbol("begin".into()), span)];
+        elems.extend(exprs);
+        Expr::new(ExprKind::List(elems), span)
+    };
+    let result = eval(&top, &mut env, &mut output)?;
     Ok(result.to_string())
 }
 
@@ -2890,10 +3302,15 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     }
     let mut env = default_env();
     let mut output = String::new();
-    let mut result = Value::Void;
-    for expr in &exprs {
-        result = eval(expr, &mut env, &mut output)?;
-    }
+    let top = if exprs.len() == 1 {
+        exprs.into_iter().next().unwrap()
+    } else {
+        let span = exprs[0].span;
+        let mut elems = vec![Expr::new(ExprKind::Symbol("begin".into()), span)];
+        elems.extend(exprs);
+        Expr::new(ExprKind::List(elems), span)
+    };
+    let result = eval(&top, &mut env, &mut output)?;
     Ok((result.to_string(), output))
 }
 
