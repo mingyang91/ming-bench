@@ -9,7 +9,7 @@ private[ming] object SchemeInterpreter:
     def pos: SourcePos
 
   object Expr:
-    final case class Number(value: BigInt, pos: SourcePos)       extends Expr
+    final case class Number(value: SchemeNumber, pos: SourcePos) extends Expr
     final case class Bool(value: Boolean, pos: SourcePos)        extends Expr
     final case class StringLit(value: String, pos: SourcePos)    extends Expr
     final case class Character(value: Char, pos: SourcePos)      extends Expr
@@ -20,9 +20,9 @@ private[ming] object SchemeInterpreter:
   sealed trait Procedure extends Value
 
   object Value:
-    final case class Number(value: BigInt)    extends Value
-    final case class Bool(value: Boolean)     extends Value
-    final case class StringLit(value: String) extends Value
+    final case class Number(value: SchemeNumber) extends Value
+    final case class Bool(value: Boolean)        extends Value
+    final case class StringLit(value: String)    extends Value
 
     final class MutableString private (private val chars: mutable.ArrayBuffer[Char]) extends Value:
 

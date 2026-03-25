@@ -9,7 +9,7 @@ private[ming] object BuiltinSupport:
     name: String,
     args: List[Value],
     pos: SourcePos
-  )(predicate: (BigInt, BigInt) => Boolean): Boolean =
+  )(predicate: (SchemeNumber, SchemeNumber) => Boolean): Boolean =
     val numbers = numbersAtLeast(name, args, expected = 2, pos)
     numbers.zip(numbers.tail).forall { case (left, right) =>
       predicate(left, right)
@@ -20,7 +20,7 @@ private[ming] object BuiltinSupport:
     args: List[Value],
     expected: Int,
     pos: SourcePos
-  ): List[BigInt] =
+  ): List[SchemeNumber] =
     requireAtLeast(name, args, expected, pos)
     args.map(asNumber(_, name, pos))
 
@@ -60,13 +60,23 @@ private[ming] object BuiltinSupport:
           s"$context expected pair, got ${SchemeInterpreter.render(other)}"
         )
 
-  def asNumber(value: Value, context: String, pos: SourcePos): BigInt =
+  def asNumber(value: Value, context: String, pos: SourcePos): SchemeNumber =
     value match
       case Value.Number(number) => number
       case other =>
         fail(
           pos,
           s"$context expected number, got ${SchemeInterpreter.render(other)}"
+        )
+
+  def asExactInteger(value: Value, context: String, pos: SourcePos): BigInt =
+    asNumber(value, context, pos) match
+      case SchemeNumber.Exact(number, denominator) if denominator == 1 =>
+        number
+      case other =>
+        fail(
+          pos,
+          s"$context expected exact integer, got ${SchemeInterpreter.render(Value.Number(other))}"
         )
 
   def asString(value: Value, context: String, pos: SourcePos): String =
@@ -122,13 +132,18 @@ private[ming] object BuiltinSupport:
     toScalaList(value).isDefined
 
   def asIndex(value: Value, context: String, pos: SourcePos): Int =
-    val number = asNumber(value, context, pos)
+    val number = asExactInteger(value, context, pos)
     if number < 0 || !number.isValidInt then fail(pos, s"$context expected non-negative integer index, got $number")
     number.toInt
 
-  def divide(left: BigInt, right: BigInt, context: String, pos: SourcePos): BigInt =
-    if right == 0 then fail(pos, s"$context division by zero")
-    left / right
+  def divide(
+    left: SchemeNumber,
+    right: SchemeNumber,
+    context: String,
+    pos: SourcePos
+  ): SchemeNumber =
+    if SchemeNumber.isZero(right) then fail(pos, s"$context division by zero")
+    SchemeNumber.divide(left, right)
 
   def requireExactly(
     name: String,

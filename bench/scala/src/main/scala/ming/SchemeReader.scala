@@ -116,8 +116,9 @@ private[ming] object SchemeReader:
       while index < input.length && !isDelimiter(input.charAt(index)) do advance()
 
       val token = input.substring(start, index)
-      if isIntegerToken(token) then Expr.Number(BigInt(token), startPos)
-      else Expr.Symbol(token, startPos)
+      SchemeNumber.parseToken(token) match
+        case Some(number) => Expr.Number(number, startPos)
+        case None         => Expr.Symbol(token, startPos)
 
     private def skipTrivia(): Unit =
       var keepSkipping = true
@@ -136,11 +137,6 @@ private[ming] object SchemeReader:
 
     private def isDelimiter(ch: Char): Boolean =
       ch.isWhitespace || ch == '\'' || ch == '(' || ch == ')' || ch == '"' || ch == ';'
-
-    private def isIntegerToken(token: String): Boolean =
-      token.nonEmpty &&
-        (token.forall(_.isDigit) ||
-          (token.head == '-' && token.length > 1 && token.tail.forall(_.isDigit)))
 
     private def advance(): Char =
       val ch = input.charAt(index)

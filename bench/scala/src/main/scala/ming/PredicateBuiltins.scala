@@ -16,6 +16,22 @@ private[ming] object PredicateBuiltins:
         case Value.Number(_) => true
         case _               => false
       },
+      predicateBuiltin("integer?") {
+        case Value.Number(number) => number.isInteger
+        case _                    => false
+      },
+      predicateBuiltin("rational?") {
+        case Value.Number(_) => true
+        case _               => false
+      },
+      predicateBuiltin("exact?") {
+        case Value.Number(number) => number.isExact
+        case _                    => false
+      },
+      predicateBuiltin("inexact?") {
+        case Value.Number(number) => number.isInexact
+        case _                    => false
+      },
       predicateBuiltin("boolean?") {
         case Value.Bool(_) => true
         case _             => false

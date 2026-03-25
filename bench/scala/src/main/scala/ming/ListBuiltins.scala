@@ -61,7 +61,7 @@ private[ming] object ListBuiltins:
       "length",
       (args, pos) =>
         val items = asList(singleArg("length", args, pos), "length", pos)
-        Value.Number(BigInt(items.length))
+        Value.Number(SchemeNumber.exact(BigInt(items.length)))
     )
 
   private val appendBuiltin: Value.Builtin =

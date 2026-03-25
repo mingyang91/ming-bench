@@ -1,7 +1,6 @@
 package ming
 
 import java.util.Locale
-import scala.util.{Failure, Success, Try}
 
 private[ming] object StringBuiltins:
 
@@ -38,7 +37,7 @@ private[ming] object StringBuiltins:
       "string-length",
       (args, pos) =>
         val value = asString(singleArg("string-length", args, pos), "string-length", pos)
-        Value.Number(BigInt(value.length))
+        Value.Number(SchemeNumber.exact(BigInt(value.length)))
     )
 
   private val substringBuiltin: Value.Builtin =
@@ -58,7 +57,7 @@ private[ming] object StringBuiltins:
       "string->number",
       (args, pos) =>
         val text = asString(singleArg("string->number", args, pos), "string->number", pos)
-        parseInteger(text)
+        parseNumber(text)
     )
 
   private val numberToStringBuiltin: Value.Builtin =
@@ -66,7 +65,7 @@ private[ming] object StringBuiltins:
       "number->string",
       (args, pos) =>
         val value = asNumber(singleArg("number->string", args, pos), "number->string", pos)
-        Value.StringLit(value.toString)
+        Value.StringLit(value.render)
     )
 
   private val symbolToStringBuiltin: Value.Builtin =
@@ -116,10 +115,10 @@ private[ming] object StringBuiltins:
         Value.Void
     )
 
-  private def parseInteger(value: String): Value =
-    Try(BigInt(value)) match
-      case Success(number) => Value.Number(number)
-      case Failure(_)      => Value.Bool(false)
+  private def parseNumber(value: String): Value =
+    SchemeNumber.parseToken(value) match
+      case Some(number) => Value.Number(number)
+      case None         => Value.Bool(false)
 
   private val stringEqualsBuiltin: Value.Builtin =
     stringComparisonBuiltin("string=?")(_ == _)

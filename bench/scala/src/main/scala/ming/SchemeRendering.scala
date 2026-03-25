@@ -7,7 +7,7 @@ private[ming] object SchemeRendering:
 
   def render(value: Value): String =
     value match
-      case Value.Number(number)  => number.toString
+      case Value.Number(number)  => number.render
       case Value.Bool(true)      => "#t"
       case Value.Bool(false)     => "#f"
       case Value.StringLit(text) => "\"" + escapeString(text) + "\""
@@ -31,7 +31,7 @@ private[ming] object SchemeRendering:
 
   def renderExpr(expr: Expr): String =
     expr match
-      case Expr.Number(number, _)       => number.toString
+      case Expr.Number(number, _)       => number.render
       case Expr.Bool(true, _)           => "#t"
       case Expr.Bool(false, _)          => "#f"
       case Expr.StringLit(text, _)      => "\"" + escapeString(text) + "\""

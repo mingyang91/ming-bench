@@ -10,7 +10,7 @@ private[ming] object EqualityBuiltins:
 
   def equalValues(left: Value, right: Value): Boolean =
     (left, right) match
-      case (Value.Number(a), Value.Number(b))               => a == b
+      case (Value.Number(a), Value.Number(b))               => SchemeNumber.areEqual(a, b)
       case (Value.Bool(a), Value.Bool(b))                   => a == b
       case (Value.Character(a), Value.Character(b))         => a == b
       case (Value.Symbol(a), Value.Symbol(b))               => a == b

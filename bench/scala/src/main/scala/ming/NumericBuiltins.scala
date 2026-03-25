@@ -23,18 +23,22 @@ private[ming] object NumericBuiltins:
       negativeBuiltin,
       oddBuiltin,
       evenBuiltin,
-      comparisonBuiltin("<")(_ < _),
-      comparisonBuiltin(">")(_ > _),
-      comparisonBuiltin("=")(_ == _),
-      comparisonBuiltin("<=")(_ <= _)
+      exactToInexactBuiltin,
+      inexactToExactBuiltin,
+      numeratorBuiltin,
+      denominatorBuiltin,
+      comparisonBuiltin("<")(SchemeNumber.compare(_, _) < 0),
+      comparisonBuiltin(">")(SchemeNumber.compare(_, _) > 0),
+      comparisonBuiltin("=")(SchemeNumber.areEqual),
+      comparisonBuiltin("<=")(SchemeNumber.compare(_, _) <= 0)
     )
 
   private val additionBuiltin: Value.Builtin =
     Value.Builtin(
       "+",
       (args, pos) =>
-        Value.Number(args.foldLeft(BigInt(0)) { (acc, value) =>
-          acc + asNumber(value, "+", pos)
+        Value.Number(args.foldLeft(SchemeNumber.Zero) { (acc, value) =>
+          SchemeNumber.add(acc, asNumber(value, "+", pos))
         })
     )
 
@@ -43,8 +47,8 @@ private[ming] object NumericBuiltins:
       "-",
       (args, pos) =>
         numbersAtLeast("-", args, expected = 1, pos) match
-          case value :: Nil  => Value.Number(-value)
-          case value :: rest => Value.Number(rest.foldLeft(value)(_ - _))
+          case value :: Nil  => Value.Number(SchemeNumber.negate(value))
+          case value :: rest => Value.Number(rest.foldLeft(value)(SchemeNumber.subtract))
           case Nil           => unreachable()
     )
 
@@ -52,8 +56,8 @@ private[ming] object NumericBuiltins:
     Value.Builtin(
       "*",
       (args, pos) =>
-        Value.Number(args.foldLeft(BigInt(1)) { (acc, value) =>
-          acc * asNumber(value, "*", pos)
+        Value.Number(args.foldLeft(SchemeNumber.One) { (acc, value) =>
+          SchemeNumber.multiply(acc, asNumber(value, "*", pos))
         })
     )
 
@@ -70,7 +74,7 @@ private[ming] object NumericBuiltins:
 
   private def comparisonBuiltin(
     name: String
-  )(predicate: (BigInt, BigInt) => Boolean): Value.Builtin =
+  )(predicate: (SchemeNumber, SchemeNumber) => Boolean): Value.Builtin =
     Value.Builtin(
       name,
       (args, pos) => Value.Bool(compareAdjacent(name, args, pos)(predicate))
@@ -79,7 +83,7 @@ private[ming] object NumericBuiltins:
   private val absBuiltin: Value.Builtin =
     Value.Builtin(
       "abs",
-      (args, pos) => Value.Number(asNumber(singleArg("abs", args, pos), "abs", pos).abs)
+      (args, pos) => Value.Number(SchemeNumber.abs(asNumber(singleArg("abs", args, pos), "abs", pos)))
     )
 
   private val moduloBuiltin: Value.Builtin =
@@ -87,14 +91,14 @@ private[ming] object NumericBuiltins:
       "modulo",
       (args, pos) =>
         val (leftValue, rightValue) = twoArgs("modulo", args, pos)
-        val left                    = asNumber(leftValue, "modulo", pos)
-        val right                   = asNumber(rightValue, "modulo", pos)
+        val left                    = asExactInteger(leftValue, "modulo", pos)
+        val right                   = asExactInteger(rightValue, "modulo", pos)
         if right == 0 then fail(pos, "modulo division by zero")
         val remainder = left % right
         val adjusted =
           if remainder != 0 && remainder.signum != right.signum then remainder + right
           else remainder
-        Value.Number(adjusted)
+        Value.Number(SchemeNumber.exact(adjusted))
     )
 
   private val remainderBuiltin: Value.Builtin =
@@ -102,10 +106,10 @@ private[ming] object NumericBuiltins:
       "remainder",
       (args, pos) =>
         val (leftValue, rightValue) = twoArgs("remainder", args, pos)
-        val left                    = asNumber(leftValue, "remainder", pos)
-        val right                   = asNumber(rightValue, "remainder", pos)
+        val left                    = asExactInteger(leftValue, "remainder", pos)
+        val right                   = asExactInteger(rightValue, "remainder", pos)
         if right == 0 then fail(pos, "remainder division by zero")
-        Value.Number(left % right)
+        Value.Number(SchemeNumber.exact(left % right))
     )
 
   private val quotientBuiltin: Value.Builtin =
@@ -113,22 +117,22 @@ private[ming] object NumericBuiltins:
       "quotient",
       (args, pos) =>
         val (leftValue, rightValue) = twoArgs("quotient", args, pos)
-        val left                    = asNumber(leftValue, "quotient", pos)
-        val right                   = asNumber(rightValue, "quotient", pos)
+        val left                    = asExactInteger(leftValue, "quotient", pos)
+        val right                   = asExactInteger(rightValue, "quotient", pos)
         if right == 0 then fail(pos, "quotient division by zero")
-        Value.Number(left / right)
+        Value.Number(SchemeNumber.exact(left / right))
     )
 
   private val minBuiltin: Value.Builtin =
     Value.Builtin(
       "min",
-      (args, pos) => Value.Number(numbersAtLeast("min", args, expected = 1, pos).min)
+      (args, pos) => Value.Number(numbersAtLeast("min", args, expected = 1, pos).reduceLeft(SchemeNumber.min))
     )
 
   private val maxBuiltin: Value.Builtin =
     Value.Builtin(
       "max",
-      (args, pos) => Value.Number(numbersAtLeast("max", args, expected = 1, pos).max)
+      (args, pos) => Value.Number(numbersAtLeast("max", args, expected = 1, pos).reduceLeft(SchemeNumber.max))
     )
 
   private val exptBuiltin: Value.Builtin =
@@ -137,42 +141,82 @@ private[ming] object NumericBuiltins:
       (args, pos) =>
         val (baseValue, exponentValue) = twoArgs("expt", args, pos)
         val base                       = asNumber(baseValue, "expt", pos)
-        val exponent                   = asNumber(exponentValue, "expt", pos)
+        val exponent                   = asExactInteger(exponentValue, "expt", pos)
         if exponent < 0 then fail(pos, s"expt expected non-negative exponent, got $exponent")
-        Value.Number(pow(base, exponent))
+        Value.Number(SchemeNumber.pow(base, exponent))
     )
 
   private val zeroBuiltin: Value.Builtin =
-    numericPredicateBuiltin("zero?")(_ == 0)
+    numericPredicateBuiltin("zero?")(SchemeNumber.isZero)
 
   private val positiveBuiltin: Value.Builtin =
-    numericPredicateBuiltin("positive?")(_ > 0)
+    numericPredicateBuiltin("positive?")(SchemeNumber.isPositive)
 
   private val negativeBuiltin: Value.Builtin =
-    numericPredicateBuiltin("negative?")(_ < 0)
+    numericPredicateBuiltin("negative?")(SchemeNumber.isNegative)
 
   private val oddBuiltin: Value.Builtin =
-    numericPredicateBuiltin("odd?")(_ % 2 != 0)
+    integerPredicateBuiltin("odd?")(_ % 2 != 0)
 
   private val evenBuiltin: Value.Builtin =
-    numericPredicateBuiltin("even?")(_ % 2 == 0)
+    integerPredicateBuiltin("even?")(_ % 2 == 0)
+
+  private val exactToInexactBuiltin: Value.Builtin =
+    Value.Builtin(
+      "exact->inexact",
+      (args, pos) =>
+        val value = asNumber(singleArg("exact->inexact", args, pos), "exact->inexact", pos)
+        Value.Number(SchemeNumber.toInexact(value))
+    )
+
+  private val inexactToExactBuiltin: Value.Builtin =
+    Value.Builtin(
+      "inexact->exact",
+      (args, pos) =>
+        val value = asNumber(singleArg("inexact->exact", args, pos), "inexact->exact", pos)
+        Value.Number(SchemeNumber.toExact(value))
+    )
+
+  private val numeratorBuiltin: Value.Builtin =
+    Value.Builtin(
+      "numerator",
+      (args, pos) =>
+        asNumber(singleArg("numerator", args, pos), "numerator", pos) match
+          case SchemeNumber.Exact(numerator, _) =>
+            Value.Number(SchemeNumber.exact(numerator))
+          case other =>
+            fail(
+              pos,
+              s"numerator expected exact number, got ${SchemeInterpreter.render(Value.Number(other))}"
+            )
+    )
+
+  private val denominatorBuiltin: Value.Builtin =
+    Value.Builtin(
+      "denominator",
+      (args, pos) =>
+        asNumber(singleArg("denominator", args, pos), "denominator", pos) match
+          case SchemeNumber.Exact(_, denominator) =>
+            Value.Number(SchemeNumber.exact(denominator))
+          case other =>
+            fail(
+              pos,
+              s"denominator expected exact number, got ${SchemeInterpreter.render(Value.Number(other))}"
+            )
+    )
 
   private def numericPredicateBuiltin(
     name: String
-  )(predicate: BigInt => Boolean): Value.Builtin =
+  )(predicate: SchemeNumber => Boolean): Value.Builtin =
     Value.Builtin(
       name,
       (args, pos) => Value.Bool(predicate(asNumber(singleArg(name, args, pos), name, pos)))
     )
 
-  private def pow(base: BigInt, exponent: BigInt): BigInt =
-    var result = BigInt(1)
-    var factor = base
-    var power  = exponent
-
-    while power > 0 do
-      if (power & 1) == 1 then result *= factor
-      factor *= factor
-      power /= 2
-
-    result
+  private def integerPredicateBuiltin(
+    name: String
+  )(predicate: BigInt => Boolean): Value.Builtin =
+    Value.Builtin(
+      name,
+      (args, pos) => Value.Bool(predicate(asExactInteger(singleArg(name, args, pos), name, pos)))
+    )
