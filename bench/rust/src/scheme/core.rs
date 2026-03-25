@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -162,6 +163,7 @@ pub(crate) enum Procedure {
     RecordConstructor(RecordConstructorProcedure),
     RecordPredicate(RecordPredicateProcedure),
     RecordAccessor(RecordAccessorProcedure),
+    Continuation(Rc<dyn Any>),
 }
 
 #[derive(Clone, Copy)]
@@ -578,12 +580,7 @@ fn render_pair(
             Value::List(values) => {
                 for value in values {
                     rendered.push(' ');
-                    rendered.push_str(&render_value_inner(
-                        &value,
-                        mode,
-                        seen_pairs,
-                        seen_vectors,
-                    ));
+                    rendered.push_str(&render_value_inner(&value, mode, seen_pairs, seen_vectors));
                 }
 
                 rendered.push(')');
@@ -612,12 +609,7 @@ fn render_pair(
             }
             other => {
                 rendered.push_str(" . ");
-                rendered.push_str(&render_value_inner(
-                    &other,
-                    mode,
-                    seen_pairs,
-                    seen_vectors,
-                ));
+                rendered.push_str(&render_value_inner(&other, mode, seen_pairs, seen_vectors));
                 rendered.push(')');
                 break;
             }

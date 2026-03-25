@@ -3,9 +3,9 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use super::core::{
-    is_proper_list, list_from_vec, list_to_vec, make_pair, make_string, make_vector,
-    make_immutable_string, value_equal, BuiltinProcedure, EnvRef, Environment, PairRef, Runtime,
-    StringRef, Value, VectorRef,
+    is_proper_list, list_from_vec, list_to_vec, make_immutable_string, make_pair, make_string,
+    make_vector, value_equal, BuiltinProcedure, EnvRef, Environment, PairRef, Runtime, StringRef,
+    Value, VectorRef,
 };
 use super::error::EvalError;
 use super::eval::apply_procedure;
@@ -443,6 +443,14 @@ const BUILTINS: &[BuiltinProcedure] = &[
     BuiltinProcedure {
         name: "even?",
         func: builtin_is_even,
+    },
+    BuiltinProcedure {
+        name: "call/cc",
+        func: builtin_call_cc,
+    },
+    BuiltinProcedure {
+        name: "call-with-current-continuation",
+        func: builtin_call_cc,
     },
     BuiltinProcedure {
         name: "apply",
@@ -1044,7 +1052,9 @@ fn builtin_make_string(args: &[Value], _runtime: &mut Runtime) -> Result<Value, 
         _ => return Err(wrong_arg_count("make-string", "exactly 1 or 2", args.len())),
     };
 
-    Ok(make_immutable_string(std::iter::repeat_n(fill, len).collect::<String>()))
+    Ok(make_immutable_string(
+        std::iter::repeat_n(fill, len).collect::<String>(),
+    ))
 }
 
 fn builtin_string(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
@@ -1339,6 +1349,12 @@ fn builtin_is_odd(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalE
 fn builtin_is_even(args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     let value = expect_exact_integer(expect_single_arg("even?", args)?)?;
     Ok(Value::Bool(value % 2 == 0))
+}
+
+fn builtin_call_cc(_args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    Err(EvalError::SyntaxError {
+        message: "internal error: call/cc should be handled by the evaluator".into(),
+    })
 }
 
 fn builtin_apply(args: &[Value], runtime: &mut Runtime) -> Result<Value, EvalError> {

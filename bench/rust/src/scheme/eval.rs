@@ -1,11 +1,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::builtins::{default_env, eqv_value};
+use super::builtins::default_env;
 use super::core::{
-    list_from_vec, make_case_lambda, make_lambda, make_record, make_record_accessor,
+    list_from_vec, list_to_vec, make_case_lambda, make_lambda, make_record, make_record_accessor,
     make_record_constructor, make_record_predicate, make_record_type, quote_expr, BindingRef,
-    CaseLambdaProcedure, EnvRef, Environment, Expr, ExprsRef, LambdaProcedure, Procedure,
+    CaseLambdaProcedure, EnvRef, Environment, Expr, ExprsRef, LambdaProcedure, Position, Procedure,
     RecordAccessorProcedure, RecordConstructorProcedure, RecordPredicateProcedure, Runtime, Value,
 };
 use super::error::EvalError;
@@ -30,30 +30,6 @@ struct DoBindingSpec {
     name: String,
     init: Expr,
     step: Option<Expr>,
-}
-
-enum EvalTarget<'a> {
-    Expr(&'a Expr, EnvRef),
-    Sequence(&'a [Expr], EnvRef),
-    OwnedExpr(Rc<Expr>, EnvRef),
-    OwnedSequence(ExprsRef, EnvRef),
-}
-
-enum OwnedTarget {
-    Expr(Rc<Expr>, EnvRef),
-    Sequence(ExprsRef, EnvRef),
-}
-
-enum EvalResult {
-    Value(Value),
-    Next(OwnedTarget),
-}
-
-enum TailAction<'a> {
-    Value(Value),
-    Expr(&'a Expr, EnvRef),
-    Sequence(&'a [Expr], EnvRef),
-    Next(OwnedTarget),
 }
 
 #[derive(Clone, Copy)]
@@ -102,188 +78,1183 @@ impl SpecialForm {
             _ => None,
         }
     }
+}
 
-    fn eval<'a>(
-        self,
-        args: &'a [Expr],
-        env: &EnvRef,
-        runtime: &mut Runtime,
-    ) -> Result<TailAction<'a>, EvalError> {
-        match self {
-            Self::Define => eval_define(args, env, runtime).map(TailAction::Value),
-            Self::DefineRecordType => eval_define_record_type(args, env).map(TailAction::Value),
-            Self::DefineSyntax => eval_define_syntax(args, env, runtime).map(TailAction::Value),
-            Self::Set => eval_set(args, env, runtime).map(TailAction::Value),
-            Self::If => eval_if(args, env, runtime),
-            Self::Quote => eval_quote(args).map(TailAction::Value),
-            Self::Lambda => eval_lambda(args, env).map(TailAction::Value),
-            Self::CaseLambda => eval_case_lambda(args, env).map(TailAction::Value),
-            Self::And => eval_and(args, env, runtime),
-            Self::Or => eval_or(args, env, runtime),
-            Self::Let => eval_let(args, env, runtime),
-            Self::LetStar => eval_let_star(args, env, runtime),
-            Self::Letrec => eval_letrec(args, env, runtime),
-            Self::LetrecStar => eval_letrec_star(args, env, runtime),
-            Self::Begin => eval_begin(args, env, runtime),
-            Self::Cond => eval_cond(args, env, runtime),
-            Self::Case => eval_case(args, env, runtime),
-            Self::Do => eval_do(args, env, runtime).map(TailAction::Value),
+#[derive(Clone)]
+struct CapturedContinuation {
+    frames: Vec<MachineFrame>,
+}
+
+#[derive(Clone)]
+struct MapIteration {
+    operator: Value,
+    lists: Rc<Vec<Vec<Value>>>,
+    index: usize,
+    results: Vec<Value>,
+    for_each: bool,
+    pos: Position,
+}
+
+#[derive(Clone)]
+enum MachineFrame {
+    Sequence {
+        expressions: ExprsRef,
+        index: usize,
+        env: EnvRef,
+    },
+    Define {
+        name: String,
+        env: EnvRef,
+    },
+    Set {
+        name: String,
+        env: EnvRef,
+        pos: Position,
+    },
+    If {
+        consequent: Rc<Expr>,
+        alternate: Option<Rc<Expr>>,
+        env: EnvRef,
+    },
+    ApplyOperator {
+        args: ExprsRef,
+        env: EnvRef,
+        pos: Position,
+    },
+    ApplyArgument {
+        operator: Value,
+        args: ExprsRef,
+        index: usize,
+        values: Vec<Value>,
+        env: EnvRef,
+        pos: Position,
+    },
+    LetrecParallel {
+        bindings: Rc<Vec<(String, Expr)>>,
+        body: ExprsRef,
+        local_env: EnvRef,
+        cells: Vec<BindingRef>,
+        index: usize,
+        values: Vec<Value>,
+    },
+    LetrecSequential {
+        bindings: Rc<Vec<(String, Expr)>>,
+        body: ExprsRef,
+        local_env: EnvRef,
+        cells: Vec<BindingRef>,
+        index: usize,
+    },
+    MapContinue(MapIteration),
+}
+
+enum MachineControl {
+    Expr(Rc<Expr>, EnvRef),
+    Value(Value),
+}
+
+fn machine_eval_program(expressions: &[Expr], runtime: &mut Runtime) -> Result<Value, EvalError> {
+    if expressions.is_empty() {
+        return Err(EvalError::EmptyInput);
+    }
+
+    let env = default_env();
+    machine_eval_sequence(expressions, &env, runtime)
+}
+
+fn machine_eval_sequence(
+    expressions: &[Expr],
+    env: &EnvRef,
+    runtime: &mut Runtime,
+) -> Result<Value, EvalError> {
+    let mut frames = Vec::new();
+    let control = start_sequence_control(expressions.to_vec().into(), env.clone(), &mut frames);
+    run_machine(control, frames, runtime)
+}
+
+fn machine_apply_procedure(
+    operator: Value,
+    args: &[Value],
+    runtime: &mut Runtime,
+) -> Result<Value, EvalError> {
+    let mut frames = Vec::new();
+    let control = apply_machine_value(operator, args.to_vec(), runtime, &mut frames, None)?;
+    run_machine(control, frames, runtime)
+}
+
+fn run_machine(
+    mut control: MachineControl,
+    mut frames: Vec<MachineFrame>,
+    runtime: &mut Runtime,
+) -> Result<Value, EvalError> {
+    loop {
+        control = match control {
+            MachineControl::Expr(expr, env) => eval_machine_expr(expr, env, runtime, &mut frames)?,
+            MachineControl::Value(value) => match frames.pop() {
+                Some(frame) => resume_machine_frame(frame, value, runtime, &mut frames)?,
+                None => return Ok(value),
+            },
+        };
+    }
+}
+
+fn start_sequence_control(
+    expressions: ExprsRef,
+    env: EnvRef,
+    frames: &mut Vec<MachineFrame>,
+) -> MachineControl {
+    continue_sequence_control(expressions, 0, env, frames)
+}
+
+fn continue_sequence_control(
+    expressions: ExprsRef,
+    index: usize,
+    env: EnvRef,
+    frames: &mut Vec<MachineFrame>,
+) -> MachineControl {
+    if index >= expressions.len() {
+        return MachineControl::Value(Value::Void);
+    }
+
+    if index + 1 < expressions.len() {
+        frames.push(MachineFrame::Sequence {
+            expressions: expressions.clone(),
+            index: index + 1,
+            env: env.clone(),
+        });
+    }
+
+    MachineControl::Expr(Rc::new(expressions[index].clone()), env)
+}
+
+fn eval_machine_expr(
+    expr: Rc<Expr>,
+    env: EnvRef,
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineControl, EvalError> {
+    match expr.as_ref() {
+        Expr::Bool(value, _) => Ok(MachineControl::Value(Value::Bool(*value))),
+        Expr::Number(value, _) => Ok(MachineControl::Value(Value::Number(*value))),
+        Expr::String(value, _) => Ok(MachineControl::Value(super::core::make_immutable_string(
+            value.clone(),
+        ))),
+        Expr::Char(value, _) => Ok(MachineControl::Value(Value::Char(*value))),
+        Expr::Symbol(name, pos) => match Environment::lookup(&env, name) {
+            Some(Value::Uninitialized) => {
+                Err(pos.attach(EvalError::UninitializedBinding { name: name.clone() }))
+            }
+            Some(value) => Ok(MachineControl::Value(value)),
+            None => Err(pos.attach(EvalError::UnboundSymbol { name: name.clone() })),
+        },
+        Expr::List(items, pos) => {
+            eval_machine_list(items, *pos, &env, runtime, frames).map_err(|error| pos.attach(error))
         }
     }
+}
+
+fn eval_machine_list(
+    items: &[Expr],
+    pos: Position,
+    env: &EnvRef,
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineControl, EvalError> {
+    let (head, args) = items.split_first().ok_or_else(empty_list_error)?;
+
+    if let Expr::Symbol(name, _) = head {
+        if let Some(special_form) = SpecialForm::from_symbol(name) {
+            return eval_machine_special_form(special_form, args, pos, env, runtime, frames);
+        }
+
+        if let Some(transformer) = runtime.lookup_macro(name) {
+            let (expanded, expansion_env) = expand_macro_call(&transformer, items, env, runtime)?;
+            return Ok(MachineControl::Expr(Rc::new(expanded), expansion_env));
+        }
+    }
+
+    let arg_exprs: ExprsRef = args.to_vec().into();
+    frames.push(MachineFrame::ApplyOperator {
+        args: arg_exprs,
+        env: env.clone(),
+        pos,
+    });
+    Ok(MachineControl::Expr(Rc::new(head.clone()), env.clone()))
+}
+
+fn eval_machine_special_form(
+    special_form: SpecialForm,
+    args: &[Expr],
+    pos: Position,
+    env: &EnvRef,
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineControl, EvalError> {
+    match special_form {
+        SpecialForm::Define => eval_machine_define(args, env, runtime, frames),
+        SpecialForm::DefineRecordType => {
+            eval_define_record_type(args, env).map(MachineControl::Value)
+        }
+        SpecialForm::DefineSyntax => {
+            eval_define_syntax(args, env, runtime).map(MachineControl::Value)
+        }
+        SpecialForm::Set => eval_machine_set(args, env, runtime, frames),
+        SpecialForm::If => eval_machine_if(args, env, frames),
+        SpecialForm::Quote => eval_quote(args).map(MachineControl::Value),
+        SpecialForm::Lambda => eval_lambda(args, env).map(MachineControl::Value),
+        SpecialForm::CaseLambda => eval_case_lambda(args, env).map(MachineControl::Value),
+        SpecialForm::And => Ok(MachineControl::Expr(
+            Rc::new(expand_and_form(args, pos, runtime)?),
+            env.clone(),
+        )),
+        SpecialForm::Or => Ok(MachineControl::Expr(
+            Rc::new(expand_or_form(args, pos, runtime)?),
+            env.clone(),
+        )),
+        SpecialForm::Let => Ok(MachineControl::Expr(
+            Rc::new(expand_let_form(args, pos)?),
+            env.clone(),
+        )),
+        SpecialForm::LetStar => Ok(MachineControl::Expr(
+            Rc::new(expand_let_star_form(args, pos)?),
+            env.clone(),
+        )),
+        SpecialForm::Letrec => eval_machine_letrec(args, env, frames, false),
+        SpecialForm::LetrecStar => eval_machine_letrec(args, env, frames, true),
+        SpecialForm::Begin => Ok(start_sequence_control(
+            args.to_vec().into(),
+            env.clone(),
+            frames,
+        )),
+        SpecialForm::Cond => Ok(MachineControl::Expr(
+            Rc::new(expand_cond_form(args, pos, runtime)?),
+            env.clone(),
+        )),
+        SpecialForm::Case => Ok(MachineControl::Expr(
+            Rc::new(expand_case_form(args, pos, runtime)?),
+            env.clone(),
+        )),
+        SpecialForm::Do => Ok(MachineControl::Expr(
+            Rc::new(expand_do_form(args, pos, runtime)?),
+            env.clone(),
+        )),
+    }
+}
+
+fn eval_machine_define(
+    args: &[Expr],
+    env: &EnvRef,
+    _runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineControl, EvalError> {
+    let Some((target, rest)) = args.split_first() else {
+        return Err(wrong_arg_count("define", "at least 2", 0));
+    };
+
+    match target {
+        Expr::Symbol(name, _) => {
+            let [value_expr] = rest else {
+                return Err(wrong_arg_count("define", "exactly 2", args.len()));
+            };
+
+            frames.push(MachineFrame::Define {
+                name: name.clone(),
+                env: env.clone(),
+            });
+            Ok(MachineControl::Expr(
+                Rc::new(value_expr.clone()),
+                env.clone(),
+            ))
+        }
+        Expr::List(signature, _) => {
+            let value = eval_function_define(signature, rest, env, args.len())?;
+            Ok(MachineControl::Value(value))
+        }
+        Expr::Bool(_, _) | Expr::Number(_, _) | Expr::String(_, _) | Expr::Char(_, _) => Err(
+            positioned_syntax_error(target, "define requires a symbol or function signature"),
+        ),
+    }
+}
+
+fn eval_machine_set(
+    args: &[Expr],
+    env: &EnvRef,
+    _runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineControl, EvalError> {
+    let [target, value_expr] = args else {
+        return Err(wrong_arg_count("set!", "exactly 2", args.len()));
+    };
+
+    let name = match target {
+        Expr::Symbol(name, _) => name.clone(),
+        Expr::Bool(_, _)
+        | Expr::Number(_, _)
+        | Expr::String(_, _)
+        | Expr::Char(_, _)
+        | Expr::List(_, _) => {
+            return Err(positioned_syntax_error(
+                target,
+                "set! target must be a symbol",
+            ));
+        }
+    };
+
+    frames.push(MachineFrame::Set {
+        name,
+        env: env.clone(),
+        pos: target.pos(),
+    });
+    Ok(MachineControl::Expr(
+        Rc::new(value_expr.clone()),
+        env.clone(),
+    ))
+}
+
+fn eval_machine_if(
+    args: &[Expr],
+    env: &EnvRef,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineControl, EvalError> {
+    let (condition, consequent, alternate) = match args {
+        [condition, consequent] => (condition, consequent, None),
+        [condition, consequent, alternate] => (condition, consequent, Some(alternate)),
+        _ => return Err(wrong_arg_count("if", "exactly 2 or 3", args.len())),
+    };
+
+    frames.push(MachineFrame::If {
+        consequent: Rc::new(consequent.clone()),
+        alternate: alternate.cloned().map(Rc::new),
+        env: env.clone(),
+    });
+    Ok(MachineControl::Expr(
+        Rc::new(condition.clone()),
+        env.clone(),
+    ))
+}
+
+fn eval_machine_letrec(
+    args: &[Expr],
+    env: &EnvRef,
+    frames: &mut Vec<MachineFrame>,
+    sequential: bool,
+) -> Result<MachineControl, EvalError> {
+    let name = if sequential { "letrec*" } else { "letrec" };
+    let Some((bindings_expr, body)) = args.split_first() else {
+        return Err(wrong_arg_count(name, "at least 2", 0));
+    };
+
+    if body.is_empty() {
+        return Err(wrong_arg_count(name, "at least 2", 1));
+    }
+
+    let bindings = Rc::new(parse_let_bindings(bindings_expr)?);
+    let local_env = Environment::new(Some(env.clone()));
+    let cells = create_recursive_bindings(&local_env, bindings.as_ref());
+    let body_ref: ExprsRef = body.to_vec().into();
+
+    if bindings.is_empty() {
+        return Ok(start_sequence_control(body_ref, local_env, frames));
+    }
+
+    if sequential {
+        frames.push(MachineFrame::LetrecSequential {
+            bindings: bindings.clone(),
+            body: body_ref,
+            local_env: local_env.clone(),
+            cells,
+            index: 0,
+        });
+    } else {
+        frames.push(MachineFrame::LetrecParallel {
+            bindings: bindings.clone(),
+            body: body_ref,
+            local_env: local_env.clone(),
+            cells,
+            index: 0,
+            values: Vec::with_capacity(bindings.len()),
+        });
+    }
+
+    Ok(MachineControl::Expr(
+        Rc::new(bindings[0].1.clone()),
+        local_env,
+    ))
+}
+
+fn resume_machine_frame(
+    frame: MachineFrame,
+    value: Value,
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineControl, EvalError> {
+    match frame {
+        MachineFrame::Sequence {
+            expressions,
+            index,
+            env,
+        } => Ok(continue_sequence_control(expressions, index, env, frames)),
+        MachineFrame::Define { name, env } => {
+            Environment::define(&env, name, value);
+            Ok(MachineControl::Value(Value::Void))
+        }
+        MachineFrame::Set { name, env, pos } => {
+            if Environment::set(&env, &name, value) {
+                Ok(MachineControl::Value(Value::Void))
+            } else {
+                Err(pos.attach(EvalError::UnboundSymbol { name }))
+            }
+        }
+        MachineFrame::If {
+            consequent,
+            alternate,
+            env,
+        } => {
+            if value.is_truthy() {
+                Ok(MachineControl::Expr(consequent, env))
+            } else if let Some(alternate) = alternate {
+                Ok(MachineControl::Expr(alternate, env))
+            } else {
+                Ok(MachineControl::Value(Value::Void))
+            }
+        }
+        MachineFrame::ApplyOperator { args, env, pos } => {
+            if args.is_empty() {
+                apply_machine_value(value, Vec::new(), runtime, frames, Some(pos))
+            } else {
+                let index = args.len() - 1;
+                frames.push(MachineFrame::ApplyArgument {
+                    operator: value,
+                    args: args.clone(),
+                    index,
+                    values: Vec::with_capacity(args.len()),
+                    env: env.clone(),
+                    pos,
+                });
+                Ok(MachineControl::Expr(Rc::new(args[index].clone()), env))
+            }
+        }
+        MachineFrame::ApplyArgument {
+            operator,
+            args,
+            index,
+            mut values,
+            env,
+            pos,
+        } => {
+            values.push(value);
+            if index > 0 {
+                let next_index = index - 1;
+                frames.push(MachineFrame::ApplyArgument {
+                    operator,
+                    args: args.clone(),
+                    index: next_index,
+                    values,
+                    env: env.clone(),
+                    pos,
+                });
+                Ok(MachineControl::Expr(Rc::new(args[next_index].clone()), env))
+            } else {
+                values.reverse();
+                apply_machine_value(operator, values, runtime, frames, Some(pos))
+            }
+        }
+        MachineFrame::LetrecParallel {
+            bindings,
+            body,
+            local_env,
+            cells,
+            index,
+            mut values,
+        } => {
+            values.push(value);
+            if index + 1 < bindings.len() {
+                let next_index = index + 1;
+                frames.push(MachineFrame::LetrecParallel {
+                    bindings: bindings.clone(),
+                    body,
+                    local_env: local_env.clone(),
+                    cells,
+                    index: next_index,
+                    values,
+                });
+                Ok(MachineControl::Expr(
+                    Rc::new(bindings[next_index].1.clone()),
+                    local_env,
+                ))
+            } else {
+                for (cell, binding_value) in cells.iter().zip(values) {
+                    *cell.borrow_mut() = binding_value;
+                }
+                Ok(start_sequence_control(body, local_env, frames))
+            }
+        }
+        MachineFrame::LetrecSequential {
+            bindings,
+            body,
+            local_env,
+            cells,
+            index,
+        } => {
+            *cells[index].borrow_mut() = value;
+            if index + 1 < bindings.len() {
+                let next_index = index + 1;
+                frames.push(MachineFrame::LetrecSequential {
+                    bindings: bindings.clone(),
+                    body,
+                    local_env: local_env.clone(),
+                    cells,
+                    index: next_index,
+                });
+                Ok(MachineControl::Expr(
+                    Rc::new(bindings[next_index].1.clone()),
+                    local_env,
+                ))
+            } else {
+                Ok(start_sequence_control(body, local_env, frames))
+            }
+        }
+        MachineFrame::MapContinue(mut iteration) => {
+            if !iteration.for_each {
+                iteration.results.push(value);
+            }
+
+            iteration.index += 1;
+            if iteration.index
+                < iteration
+                    .lists
+                    .iter()
+                    .map(|list| list.len())
+                    .min()
+                    .unwrap_or(0)
+            {
+                apply_map_iteration(iteration, runtime, frames)
+            } else if iteration.for_each {
+                Ok(MachineControl::Value(Value::Void))
+            } else {
+                Ok(MachineControl::Value(list_from_vec(iteration.results)))
+            }
+        }
+    }
+}
+
+fn apply_machine_value(
+    operator: Value,
+    args: Vec<Value>,
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+    pos: Option<Position>,
+) -> Result<MachineControl, EvalError> {
+    let result = match operator {
+        Value::Procedure(procedure) => match procedure.as_ref() {
+            Procedure::Builtin(builtin) => {
+                apply_machine_builtin(*builtin, args, runtime, frames, pos)
+            }
+            Procedure::Lambda(lambda) => {
+                let call_env = prepare_lambda_call(lambda, &args)?;
+                Ok(start_sequence_control(
+                    lambda.body.clone(),
+                    call_env,
+                    frames,
+                ))
+            }
+            Procedure::CaseLambda(case_lambda) => {
+                let clause = case_lambda
+                    .clauses
+                    .iter()
+                    .find(|clause| lambda_accepts_arity(clause, args.len()))
+                    .ok_or_else(|| EvalError::WrongArgCount {
+                        name: case_lambda
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| "case-lambda".into()),
+                        expected: case_lambda_expected(case_lambda),
+                        actual: args.len(),
+                    })?;
+                let call_env = prepare_lambda_call(clause, &args)?;
+                Ok(start_sequence_control(
+                    clause.body.clone(),
+                    call_env,
+                    frames,
+                ))
+            }
+            Procedure::RecordConstructor(constructor) => {
+                apply_record_constructor(constructor, &args).map(MachineControl::Value)
+            }
+            Procedure::RecordPredicate(predicate) => {
+                apply_record_predicate(predicate, &args).map(MachineControl::Value)
+            }
+            Procedure::RecordAccessor(accessor) => {
+                apply_record_accessor(accessor, &args).map(MachineControl::Value)
+            }
+            Procedure::Continuation(captured) => {
+                apply_captured_continuation(captured.clone(), &args, frames)
+            }
+        },
+        Value::Bool(_)
+        | Value::Number(_)
+        | Value::String(_)
+        | Value::Symbol(_)
+        | Value::Char(_)
+        | Value::List(_)
+        | Value::Pair(_)
+        | Value::Vector(_)
+        | Value::Record(_)
+        | Value::Uninitialized
+        | Value::Void => Err(EvalError::NotAProcedure {
+            found: operator.render_for_error(),
+        }),
+    };
+
+    result.map_err(|error| match pos {
+        Some(pos) => pos.attach(error),
+        None => error,
+    })
+}
+
+fn apply_machine_builtin(
+    builtin: super::core::BuiltinProcedure,
+    args: Vec<Value>,
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+    pos: Option<Position>,
+) -> Result<MachineControl, EvalError> {
+    match builtin.name {
+        "call/cc" | "call-with-current-continuation" => {
+            apply_call_cc_builtin(&args, runtime, frames, pos)
+        }
+        "apply" => apply_apply_builtin(&args, runtime, frames, pos),
+        "map" => apply_map_builtin(&args, runtime, frames, pos, false),
+        "for-each" => apply_map_builtin(&args, runtime, frames, pos, true),
+        _ => (builtin.func)(&args, runtime).map(MachineControl::Value),
+    }
+}
+
+fn apply_call_cc_builtin(
+    args: &[Value],
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+    pos: Option<Position>,
+) -> Result<MachineControl, EvalError> {
+    let [procedure] = args else {
+        return Err(wrong_arg_count("call/cc", "exactly 1", args.len()));
+    };
+
+    let continuation = make_continuation_value(frames);
+    apply_machine_value(procedure.clone(), vec![continuation], runtime, frames, pos)
+}
+
+fn apply_apply_builtin(
+    args: &[Value],
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+    pos: Option<Position>,
+) -> Result<MachineControl, EvalError> {
+    let Some((operator, arg_parts)) = args.split_first() else {
+        return Err(wrong_arg_count("apply", "at least 2", 0));
+    };
+
+    let Some((list_arg, prefix_args)) = arg_parts.split_last() else {
+        return Err(wrong_arg_count("apply", "at least 2", 1));
+    };
+
+    let mut applied_args = prefix_args.to_vec();
+    applied_args.extend(expect_list_argument(list_arg, "list")?);
+    apply_machine_value(operator.clone(), applied_args, runtime, frames, pos)
+}
+
+fn apply_map_builtin(
+    args: &[Value],
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+    pos: Option<Position>,
+    for_each: bool,
+) -> Result<MachineControl, EvalError> {
+    let Some((operator, list_args)) = args.split_first() else {
+        let name = if for_each { "for-each" } else { "map" };
+        return Err(wrong_arg_count(name, "at least 2", 0));
+    };
+
+    if list_args.is_empty() {
+        let name = if for_each { "for-each" } else { "map" };
+        return Err(wrong_arg_count(name, "at least 2", 1));
+    }
+
+    let lists = Rc::new(
+        list_args
+            .iter()
+            .map(|list| expect_list_argument(list, "list"))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    let len = lists.iter().map(|list| list.len()).min().unwrap_or(0);
+
+    if len == 0 {
+        return Ok(MachineControl::Value(if for_each {
+            Value::Void
+        } else {
+            list_from_vec(Vec::new())
+        }));
+    }
+
+    let call_pos = pos.unwrap_or(Position { line: 1, col: 1 });
+    apply_map_iteration(
+        MapIteration {
+            operator: operator.clone(),
+            lists,
+            index: 0,
+            results: Vec::with_capacity(len),
+            for_each,
+            pos: call_pos,
+        },
+        runtime,
+        frames,
+    )
+}
+
+fn apply_map_iteration(
+    iteration: MapIteration,
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineControl, EvalError> {
+    let call_args = iteration
+        .lists
+        .iter()
+        .map(|list| list[iteration.index].clone())
+        .collect::<Vec<_>>();
+    let operator = iteration.operator.clone();
+    let pos = iteration.pos;
+
+    frames.push(MachineFrame::MapContinue(iteration));
+
+    apply_machine_value(operator, call_args, runtime, frames, Some(pos))
+}
+
+fn make_continuation_value(frames: &[MachineFrame]) -> Value {
+    Value::Procedure(Rc::new(Procedure::Continuation(Rc::new(
+        CapturedContinuation {
+            frames: frames.to_vec(),
+        },
+    ))))
+}
+
+fn apply_captured_continuation(
+    captured: Rc<dyn std::any::Any>,
+    args: &[Value],
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineControl, EvalError> {
+    let [value] = args else {
+        return Err(wrong_arg_count("continuation", "exactly 1", args.len()));
+    };
+
+    let captured =
+        Rc::downcast::<CapturedContinuation>(captured).map_err(|_| EvalError::SyntaxError {
+            message: "internal error: invalid continuation payload".into(),
+        })?;
+    *frames = captured.frames.clone();
+    Ok(MachineControl::Value(value.clone()))
+}
+
+fn expect_list_argument(value: &Value, expected: &str) -> Result<Vec<Value>, EvalError> {
+    list_to_vec(value).ok_or_else(|| EvalError::TypeMismatch {
+        expected: expected.into(),
+        found: value.type_name().into(),
+    })
+}
+
+fn expand_and_form(args: &[Expr], pos: Position, runtime: &mut Runtime) -> Result<Expr, EvalError> {
+    match args {
+        [] => Ok(Expr::Bool(true, pos)),
+        [expr] => Ok(expr.clone()),
+        [first, rest @ ..] => {
+            let temp = runtime.fresh_symbol("and");
+            let temp_expr = symbol_expr(&temp, pos);
+            Ok(build_single_binding_let(
+                &temp,
+                first.clone(),
+                build_if_expr(
+                    temp_expr.clone(),
+                    expand_and_form(rest, pos, runtime)?,
+                    temp_expr,
+                    pos,
+                ),
+                pos,
+            ))
+        }
+    }
+}
+
+fn expand_or_form(args: &[Expr], pos: Position, runtime: &mut Runtime) -> Result<Expr, EvalError> {
+    match args {
+        [] => Ok(Expr::Bool(false, pos)),
+        [expr] => Ok(expr.clone()),
+        [first, rest @ ..] => {
+            let temp = runtime.fresh_symbol("or");
+            let temp_expr = symbol_expr(&temp, pos);
+            Ok(build_single_binding_let(
+                &temp,
+                first.clone(),
+                build_if_expr(
+                    temp_expr.clone(),
+                    temp_expr,
+                    expand_or_form(rest, pos, runtime)?,
+                    pos,
+                ),
+                pos,
+            ))
+        }
+    }
+}
+
+fn expand_let_form(args: &[Expr], pos: Position) -> Result<Expr, EvalError> {
+    let Some((head, tail)) = args.split_first() else {
+        return Err(wrong_arg_count("let", "at least 2", 0));
+    };
+
+    match head {
+        Expr::Symbol(name, _) => {
+            let Some((bindings_expr, body)) = tail.split_first() else {
+                return Err(wrong_arg_count("let", "at least 3", args.len()));
+            };
+
+            if body.is_empty() {
+                return Err(wrong_arg_count("let", "at least 3", args.len()));
+            }
+
+            let bindings = parse_let_bindings(bindings_expr)?;
+            let params = bindings
+                .iter()
+                .map(|(binding_name, _)| binding_name.clone())
+                .collect::<Vec<_>>();
+            let lambda_expr = build_lambda_expr(&params, body, pos);
+            let binding_expr = build_binding_expr(name, lambda_expr, pos);
+            let call_expr = build_application_expr(
+                symbol_expr(name, pos),
+                bindings
+                    .iter()
+                    .map(|(_, value_expr)| value_expr.clone())
+                    .collect::<Vec<_>>(),
+                pos,
+            );
+            Ok(Expr::List(
+                vec![
+                    symbol_expr("letrec", pos),
+                    Expr::List(vec![binding_expr], pos),
+                    call_expr,
+                ],
+                pos,
+            ))
+        }
+        Expr::Bool(_, _)
+        | Expr::Number(_, _)
+        | Expr::String(_, _)
+        | Expr::Char(_, _)
+        | Expr::List(_, _) => {
+            let bindings = parse_let_bindings(head)?;
+            if tail.is_empty() {
+                return Err(wrong_arg_count("let", "at least 2", 1));
+            }
+            Ok(build_plain_let_expr(&bindings, tail, pos))
+        }
+    }
+}
+
+fn expand_let_star_form(args: &[Expr], pos: Position) -> Result<Expr, EvalError> {
+    let Some((bindings_expr, body)) = args.split_first() else {
+        return Err(wrong_arg_count("let*", "at least 2", 0));
+    };
+
+    if body.is_empty() {
+        return Err(wrong_arg_count("let*", "at least 2", 1));
+    }
+
+    let bindings = parse_let_bindings(bindings_expr)?;
+    Ok(build_let_star_expr(&bindings, body, pos))
+}
+
+fn expand_cond_form(
+    clauses: &[Expr],
+    pos: Position,
+    runtime: &mut Runtime,
+) -> Result<Expr, EvalError> {
+    expand_cond_clauses(clauses, pos, runtime)
+}
+
+fn expand_cond_clauses(
+    clauses: &[Expr],
+    pos: Position,
+    runtime: &mut Runtime,
+) -> Result<Expr, EvalError> {
+    let Some((clause, rest)) = clauses.split_first() else {
+        return Ok(build_begin_expr(&[], pos));
+    };
+
+    let parts = cond_clause_parts(clause)?;
+    if is_else_clause(parts) {
+        if !rest.is_empty() {
+            return Err(positioned_syntax_error(
+                clause,
+                "cond else clause must be last",
+            ));
+        }
+
+        return Ok(if parts.len() == 1 {
+            Expr::Bool(true, clause.pos())
+        } else {
+            build_begin_expr(&parts[1..], clause.pos())
+        });
+    }
+
+    let rest_expr = expand_cond_clauses(rest, pos, runtime)?;
+    if parts.len() == 1 {
+        let temp = runtime.fresh_symbol("cond");
+        let temp_expr = symbol_expr(&temp, clause.pos());
+        Ok(build_single_binding_let(
+            &temp,
+            parts[0].clone(),
+            build_if_expr(
+                temp_expr.clone(),
+                temp_expr.clone(),
+                rest_expr,
+                clause.pos(),
+            ),
+            clause.pos(),
+        ))
+    } else {
+        Ok(build_if_expr(
+            parts[0].clone(),
+            build_begin_expr(&parts[1..], clause.pos()),
+            rest_expr,
+            clause.pos(),
+        ))
+    }
+}
+
+fn expand_case_form(
+    args: &[Expr],
+    pos: Position,
+    runtime: &mut Runtime,
+) -> Result<Expr, EvalError> {
+    let Some((key_expr, clauses)) = args.split_first() else {
+        return Err(wrong_arg_count("case", "at least 2", 0));
+    };
+
+    if clauses.is_empty() {
+        return Err(wrong_arg_count("case", "at least 2", 1));
+    }
+
+    let key_name = runtime.fresh_symbol("case_key");
+    let key_ref = symbol_expr(&key_name, pos);
+    let mut cond_items = vec![symbol_expr("cond", pos)];
+
+    for (index, clause) in clauses.iter().enumerate() {
+        let parts = case_clause_parts(clause)?;
+        if is_else_clause(parts) {
+            validate_case_else_clause(clause, parts, index, clauses.len())?;
+            cond_items.push(Expr::List(parts.to_vec(), clause.pos()));
+            continue;
+        }
+
+        ensure_case_clause_has_body(clause, parts, "case clause must have a body")?;
+        let datums = case_clause_datums(&parts[0])?;
+        let comparisons = datums
+            .iter()
+            .map(|datum| {
+                build_application_expr(
+                    symbol_expr("eqv?", clause.pos()),
+                    vec![
+                        key_ref.clone(),
+                        build_quote_form_expr(datum.clone(), datum.pos()),
+                    ],
+                    clause.pos(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let test_expr = if comparisons.len() == 1 {
+            comparisons.into_iter().next().expect("single comparison")
+        } else {
+            let mut items = vec![symbol_expr("or", clause.pos())];
+            items.extend(comparisons);
+            Expr::List(items, clause.pos())
+        };
+        let mut clause_items = Vec::with_capacity(parts.len());
+        clause_items.push(test_expr);
+        clause_items.extend(parts[1..].iter().cloned());
+        cond_items.push(Expr::List(clause_items, clause.pos()));
+    }
+
+    Ok(build_single_binding_let(
+        &key_name,
+        key_expr.clone(),
+        Expr::List(cond_items, pos),
+        pos,
+    ))
+}
+
+fn expand_do_form(args: &[Expr], pos: Position, runtime: &mut Runtime) -> Result<Expr, EvalError> {
+    let Some((bindings_expr, tail)) = args.split_first() else {
+        return Err(wrong_arg_count("do", "at least 2", 0));
+    };
+
+    let Some((test_clause, body)) = tail.split_first() else {
+        return Err(wrong_arg_count("do", "at least 2", 1));
+    };
+
+    let bindings = parse_do_bindings(bindings_expr)?;
+    let test_parts = do_termination_clause_parts(test_clause)?;
+    let (test_expr, result_exprs) = test_parts
+        .split_first()
+        .expect("do termination clause must contain a test expression");
+    let loop_name = runtime.fresh_symbol("do_loop");
+
+    let binding_exprs = bindings
+        .iter()
+        .map(|binding| build_binding_expr(&binding.name, binding.init.clone(), pos))
+        .collect::<Vec<_>>();
+    let loop_call = build_application_expr(
+        symbol_expr(&loop_name, pos),
+        bindings
+            .iter()
+            .map(|binding| {
+                binding
+                    .step
+                    .clone()
+                    .unwrap_or_else(|| symbol_expr(&binding.name, pos))
+            })
+            .collect::<Vec<_>>(),
+        pos,
+    );
+
+    let mut alternate_body = body.to_vec();
+    alternate_body.push(loop_call);
+
+    Ok(Expr::List(
+        vec![
+            symbol_expr("let", pos),
+            symbol_expr(&loop_name, pos),
+            Expr::List(binding_exprs, pos),
+            build_if_expr(
+                test_expr.clone(),
+                build_begin_expr(result_exprs, pos),
+                build_begin_expr(&alternate_body, pos),
+                pos,
+            ),
+        ],
+        pos,
+    ))
+}
+
+fn build_plain_let_expr(bindings: &[(String, Expr)], body: &[Expr], pos: Position) -> Expr {
+    let lambda_expr = build_lambda_expr(
+        &bindings
+            .iter()
+            .map(|(binding_name, _)| binding_name.clone())
+            .collect::<Vec<_>>(),
+        body,
+        pos,
+    );
+    build_application_expr(
+        lambda_expr,
+        bindings
+            .iter()
+            .map(|(_, value_expr)| value_expr.clone())
+            .collect::<Vec<_>>(),
+        pos,
+    )
+}
+
+fn build_let_star_expr(bindings: &[(String, Expr)], body: &[Expr], pos: Position) -> Expr {
+    if let Some((first, rest)) = bindings.split_first() {
+        Expr::List(
+            vec![
+                symbol_expr("let", pos),
+                Expr::List(
+                    vec![build_binding_expr(&first.0, first.1.clone(), pos)],
+                    pos,
+                ),
+                build_let_star_expr(rest, body, pos),
+            ],
+            pos,
+        )
+    } else {
+        Expr::List(
+            {
+                let mut items = Vec::with_capacity(body.len() + 2);
+                items.push(symbol_expr("let", pos));
+                items.push(Expr::List(Vec::new(), pos));
+                items.extend(body.iter().cloned());
+                items
+            },
+            pos,
+        )
+    }
+}
+
+fn build_lambda_expr(params: &[String], body: &[Expr], pos: Position) -> Expr {
+    let mut items = Vec::with_capacity(body.len() + 2);
+    items.push(symbol_expr("lambda", pos));
+    items.push(Expr::List(
+        params
+            .iter()
+            .map(|param| symbol_expr(param, pos))
+            .collect::<Vec<_>>(),
+        pos,
+    ));
+    items.extend(body.iter().cloned());
+    Expr::List(items, pos)
+}
+
+fn build_single_binding_let(name: &str, value_expr: Expr, body_expr: Expr, pos: Position) -> Expr {
+    Expr::List(
+        vec![
+            symbol_expr("let", pos),
+            Expr::List(vec![build_binding_expr(name, value_expr, pos)], pos),
+            body_expr,
+        ],
+        pos,
+    )
+}
+
+fn build_binding_expr(name: &str, value_expr: Expr, pos: Position) -> Expr {
+    Expr::List(vec![symbol_expr(name, pos), value_expr], pos)
+}
+
+fn build_application_expr(operator: Expr, args: Vec<Expr>, pos: Position) -> Expr {
+    let mut items = Vec::with_capacity(args.len() + 1);
+    items.push(operator);
+    items.extend(args);
+    Expr::List(items, pos)
+}
+
+fn build_if_expr(condition: Expr, consequent: Expr, alternate: Expr, pos: Position) -> Expr {
+    Expr::List(
+        vec![symbol_expr("if", pos), condition, consequent, alternate],
+        pos,
+    )
+}
+
+fn build_begin_expr(body: &[Expr], pos: Position) -> Expr {
+    if let [single] = body {
+        single.clone()
+    } else {
+        let mut items = Vec::with_capacity(body.len() + 1);
+        items.push(symbol_expr("begin", pos));
+        items.extend(body.iter().cloned());
+        Expr::List(items, pos)
+    }
+}
+
+fn build_quote_form_expr(datum: Expr, pos: Position) -> Expr {
+    Expr::List(vec![symbol_expr("quote", pos), datum], pos)
+}
+
+fn symbol_expr(name: &str, pos: Position) -> Expr {
+    Expr::Symbol(name.into(), pos)
 }
 
 pub(crate) fn eval_program(
     expressions: &[Expr],
     runtime: &mut Runtime,
 ) -> Result<Value, EvalError> {
-    if expressions.is_empty() {
-        return Err(EvalError::EmptyInput);
-    }
-
-    let env = default_env();
-    eval_sequence(expressions, &env, runtime)
-}
-
-pub(crate) fn eval_sequence(
-    expressions: &[Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<Value, EvalError> {
-    eval_target(EvalTarget::Sequence(expressions, env.clone()), runtime)
-}
-
-fn eval_expr(expr: &Expr, env: &EnvRef, runtime: &mut Runtime) -> Result<Value, EvalError> {
-    eval_target(EvalTarget::Expr(expr, env.clone()), runtime)
-}
-
-fn eval_target<'a>(mut target: EvalTarget<'a>, runtime: &mut Runtime) -> Result<Value, EvalError> {
-    loop {
-        let result = match target {
-            EvalTarget::Expr(expr, env) => eval_expr_target(expr, env, runtime)?,
-            EvalTarget::Sequence(expressions, env) => {
-                eval_sequence_target(expressions, env, runtime)?
-            }
-            EvalTarget::OwnedExpr(expr, env) => eval_expr_target(expr.as_ref(), env, runtime)?,
-            EvalTarget::OwnedSequence(expressions, env) => {
-                eval_sequence_target(expressions.as_ref(), env, runtime)?
-            }
-        };
-
-        match result {
-            EvalResult::Value(value) => return Ok(value),
-            EvalResult::Next(next) => {
-                target = match next {
-                    OwnedTarget::Expr(expr, env) => EvalTarget::OwnedExpr(expr, env),
-                    OwnedTarget::Sequence(expressions, env) => {
-                        EvalTarget::OwnedSequence(expressions, env)
-                    }
-                };
-            }
-        }
-    }
-}
-
-fn eval_sequence_target(
-    expressions: &[Expr],
-    env: EnvRef,
-    runtime: &mut Runtime,
-) -> Result<EvalResult, EvalError> {
-    let Some((last, prefix)) = expressions.split_last() else {
-        return Ok(EvalResult::Value(Value::Void));
-    };
-
-    for expression in prefix {
-        eval_expr(expression, &env, runtime)?;
-    }
-
-    eval_expr_target(last, env, runtime)
-}
-
-fn eval_expr_target(
-    expr: &Expr,
-    env: EnvRef,
-    runtime: &mut Runtime,
-) -> Result<EvalResult, EvalError> {
-    let mut current_expr = expr;
-    let mut current_env = env;
-
-    loop {
-        match current_expr {
-            Expr::Bool(value, _) => return Ok(EvalResult::Value(Value::Bool(*value))),
-            Expr::Number(value, _) => return Ok(EvalResult::Value(Value::Number(*value))),
-            Expr::String(value, _) => {
-                return Ok(EvalResult::Value(super::core::make_immutable_string(
-                    value.clone(),
-                )));
-            }
-            Expr::Char(value, _) => return Ok(EvalResult::Value(Value::Char(*value))),
-            Expr::Symbol(name, pos) => {
-                return match Environment::lookup(&current_env, name) {
-                    Some(Value::Uninitialized) => {
-                        Err(pos.attach(EvalError::UninitializedBinding { name: name.clone() }))
-                    }
-                    Some(value) => Ok(EvalResult::Value(value)),
-                    None => Err(pos.attach(EvalError::UnboundSymbol { name: name.clone() })),
-                };
-            }
-            Expr::List(items, pos) => match eval_list_target(items, &current_env, runtime)
-                .map_err(|error| pos.attach(error))?
-            {
-                TailAction::Value(value) => return Ok(EvalResult::Value(value)),
-                TailAction::Expr(next_expr, next_env) => {
-                    current_expr = next_expr;
-                    current_env = next_env;
-                }
-                TailAction::Sequence(expressions, next_env) => {
-                    return eval_sequence_target(expressions, next_env, runtime);
-                }
-                TailAction::Next(next) => return Ok(EvalResult::Next(next)),
-            },
-        }
-    }
-}
-
-fn eval_list_target<'a>(
-    items: &'a [Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<TailAction<'a>, EvalError> {
-    let (head, args) = items.split_first().ok_or_else(empty_list_error)?;
-
-    if let Expr::Symbol(name, _) = head {
-        if let Some(special_form) = SpecialForm::from_symbol(name) {
-            return special_form.eval(args, env, runtime);
-        }
-
-        if let Some(transformer) = runtime.lookup_macro(name) {
-            let (expanded, expansion_env) = expand_macro_call(&transformer, items, env, runtime)?;
-            return Ok(TailAction::Next(OwnedTarget::Expr(
-                Rc::new(expanded),
-                expansion_env,
-            )));
-        }
-    }
-
-    let operator = eval_expr(head, env, runtime)?;
-    let values = args
-        .iter()
-        .map(|arg| eval_expr(arg, env, runtime))
-        .collect::<Result<Vec<_>, _>>()?;
-    apply_procedure_tail(operator, &values, runtime)
-}
-
-fn eval_define(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value, EvalError> {
-    let Some((target, rest)) = args.split_first() else {
-        return Err(wrong_arg_count("define", "at least 2", 0));
-    };
-
-    match target {
-        Expr::Symbol(name, _) => eval_variable_define(name, rest, env, runtime, args.len()),
-        Expr::List(signature, _) => eval_function_define(signature, rest, env, args.len()),
-        Expr::Bool(_, _) | Expr::Number(_, _) | Expr::String(_, _) | Expr::Char(_, _) => Err(
-            positioned_syntax_error(target, "define requires a symbol or function signature"),
-        ),
-    }
+    machine_eval_program(expressions, runtime)
 }
 
 fn eval_define_record_type(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
@@ -360,22 +1331,6 @@ fn eval_define_syntax(
     Ok(Value::Void)
 }
 
-fn eval_variable_define(
-    name: &str,
-    rest: &[Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-    actual: usize,
-) -> Result<Value, EvalError> {
-    let [value_expr] = rest else {
-        return Err(wrong_arg_count("define", "exactly 2", actual));
-    };
-
-    let value = eval_expr(value_expr, env, runtime)?;
-    Environment::define(env, name.to_string(), value);
-    Ok(Value::Void)
-}
-
 fn eval_function_define(
     signature: &[Expr],
     rest: &[Expr],
@@ -401,55 +1356,6 @@ fn eval_function_define(
     );
     Environment::define(env, name, lambda);
     Ok(Value::Void)
-}
-
-fn eval_if<'a>(
-    args: &'a [Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<TailAction<'a>, EvalError> {
-    let (condition, consequent, alternate) = match args {
-        [condition, consequent] => (condition, consequent, None),
-        [condition, consequent, alternate] => (condition, consequent, Some(alternate)),
-        _ => return Err(wrong_arg_count("if", "exactly 2 or 3", args.len())),
-    };
-
-    if eval_expr(condition, env, runtime)?.is_truthy() {
-        Ok(TailAction::Expr(consequent, env.clone()))
-    } else if let Some(alternate) = alternate {
-        Ok(TailAction::Expr(alternate, env.clone()))
-    } else {
-        Ok(TailAction::Value(Value::Void))
-    }
-}
-
-fn eval_set(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value, EvalError> {
-    let [target, value_expr] = args else {
-        return Err(wrong_arg_count("set!", "exactly 2", args.len()));
-    };
-
-    let name = match target {
-        Expr::Symbol(name, _) => name,
-        Expr::Bool(_, _)
-        | Expr::Number(_, _)
-        | Expr::String(_, _)
-        | Expr::Char(_, _)
-        | Expr::List(_, _) => {
-            return Err(positioned_syntax_error(
-                target,
-                "set! target must be a symbol",
-            ));
-        }
-    };
-
-    let value = eval_expr(value_expr, env, runtime)?;
-    if Environment::set(env, name, value) {
-        Ok(Value::Void)
-    } else {
-        Err(target
-            .pos()
-            .attach(EvalError::UnboundSymbol { name: name.clone() }))
-    }
 }
 
 fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
@@ -493,172 +1399,6 @@ fn eval_case_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     Ok(make_case_lambda(None, clauses))
 }
 
-fn eval_and<'a>(
-    args: &'a [Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<TailAction<'a>, EvalError> {
-    let Some((last, prefix)) = args.split_last() else {
-        return Ok(TailAction::Value(Value::Bool(true)));
-    };
-
-    for arg in prefix {
-        let value = eval_expr(arg, env, runtime)?;
-        if !value.is_truthy() {
-            return Ok(TailAction::Value(value));
-        }
-    }
-
-    Ok(TailAction::Expr(last, env.clone()))
-}
-
-fn eval_or<'a>(
-    args: &'a [Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<TailAction<'a>, EvalError> {
-    let Some((last, prefix)) = args.split_last() else {
-        return Ok(TailAction::Value(Value::Bool(false)));
-    };
-
-    for arg in prefix {
-        let value = eval_expr(arg, env, runtime)?;
-        if value.is_truthy() {
-            return Ok(TailAction::Value(value));
-        }
-    }
-
-    Ok(TailAction::Expr(last, env.clone()))
-}
-
-fn eval_begin<'a>(
-    args: &'a [Expr],
-    env: &EnvRef,
-    _runtime: &mut Runtime,
-) -> Result<TailAction<'a>, EvalError> {
-    if args.is_empty() {
-        Ok(TailAction::Value(Value::Void))
-    } else {
-        Ok(TailAction::Sequence(args, env.clone()))
-    }
-}
-
-fn eval_let<'a>(
-    args: &'a [Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<TailAction<'a>, EvalError> {
-    let Some((head, tail)) = args.split_first() else {
-        return Err(wrong_arg_count("let", "at least 2", 0));
-    };
-
-    match head {
-        Expr::Symbol(name, _) => eval_named_let_form(name, tail, env, runtime, args.len()),
-        Expr::Bool(_, _)
-        | Expr::Number(_, _)
-        | Expr::String(_, _)
-        | Expr::Char(_, _)
-        | Expr::List(_, _) => {
-            let bindings = parse_let_bindings(head)?;
-            eval_plain_let(&bindings, tail, env, runtime)
-        }
-    }
-}
-
-fn eval_named_let_form<'a>(
-    name: &str,
-    tail: &'a [Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-    actual: usize,
-) -> Result<TailAction<'a>, EvalError> {
-    let Some((bindings_expr, body)) = tail.split_first() else {
-        return Err(wrong_arg_count("let", "at least 3", actual));
-    };
-
-    let bindings = parse_let_bindings(bindings_expr)?;
-    eval_named_let(name, &bindings, body, env, runtime)
-}
-
-fn eval_plain_let<'a>(
-    bindings: &[(String, Expr)],
-    body: &'a [Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<TailAction<'a>, EvalError> {
-    if body.is_empty() {
-        return Err(wrong_arg_count("let", "at least 2", 1));
-    }
-
-    let values = bindings
-        .iter()
-        .map(|(_, expr)| eval_expr(expr, env, runtime))
-        .collect::<Result<Vec<_>, _>>()?;
-    let local_env = Environment::new(Some(env.clone()));
-
-    for ((name, _), value) in bindings.iter().zip(values) {
-        Environment::define(&local_env, name.clone(), value);
-    }
-
-    Ok(TailAction::Sequence(body, local_env))
-}
-
-fn eval_named_let<'a>(
-    name: &str,
-    bindings: &[(String, Expr)],
-    body: &'a [Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<TailAction<'a>, EvalError> {
-    if body.is_empty() {
-        return Err(wrong_arg_count("let", "at least 3", 2));
-    }
-
-    let values = bindings
-        .iter()
-        .map(|(_, expr)| eval_expr(expr, env, runtime))
-        .collect::<Result<Vec<_>, _>>()?;
-    let params = bindings
-        .iter()
-        .map(|(binding_name, _)| binding_name.clone())
-        .collect();
-    let recursive_env = Environment::new(Some(env.clone()));
-    let procedure = make_lambda(
-        Some(name.to_string()),
-        params,
-        None,
-        body.to_vec(),
-        &recursive_env,
-    );
-
-    Environment::define(&recursive_env, name.to_string(), procedure.clone());
-    apply_procedure_tail(procedure, &values, runtime)
-}
-
-fn eval_let_star<'a>(
-    args: &'a [Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<TailAction<'a>, EvalError> {
-    let Some((bindings_expr, body)) = args.split_first() else {
-        return Err(wrong_arg_count("let*", "at least 2", 0));
-    };
-
-    if body.is_empty() {
-        return Err(wrong_arg_count("let*", "at least 2", 1));
-    }
-
-    let bindings = parse_let_bindings(bindings_expr)?;
-    let local_env = Environment::new(Some(env.clone()));
-
-    for (name, expr) in bindings {
-        let value = eval_expr(&expr, &local_env, runtime)?;
-        Environment::define(&local_env, name, value);
-    }
-
-    Ok(TailAction::Sequence(body, local_env))
-}
-
 fn parse_let_bindings(bindings_expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
     let bindings = match bindings_expr {
         Expr::List(bindings, _) => bindings,
@@ -699,60 +1439,6 @@ fn parse_let_binding(binding: &Expr) -> Result<(String, Expr), EvalError> {
             "let binding must be a list",
         )),
     }
-}
-
-fn eval_letrec<'a>(
-    args: &'a [Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<TailAction<'a>, EvalError> {
-    eval_recursive_let("letrec", args, env, runtime, false)
-}
-
-fn eval_letrec_star<'a>(
-    args: &'a [Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<TailAction<'a>, EvalError> {
-    eval_recursive_let("letrec*", args, env, runtime, true)
-}
-
-fn eval_recursive_let<'a>(
-    name: &str,
-    args: &'a [Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-    sequential: bool,
-) -> Result<TailAction<'a>, EvalError> {
-    let Some((bindings_expr, body)) = args.split_first() else {
-        return Err(wrong_arg_count(name, "at least 2", 0));
-    };
-
-    if body.is_empty() {
-        return Err(wrong_arg_count(name, "at least 2", 1));
-    }
-
-    let bindings = parse_let_bindings(bindings_expr)?;
-    let local_env = Environment::new(Some(env.clone()));
-    let cells = create_recursive_bindings(&local_env, &bindings);
-
-    if sequential {
-        for ((_, expr), cell) in bindings.iter().zip(cells.iter()) {
-            let value = eval_expr(expr, &local_env, runtime)?;
-            *cell.borrow_mut() = value;
-        }
-    } else {
-        let values = bindings
-            .iter()
-            .map(|(_, expr)| eval_expr(expr, &local_env, runtime))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        for (cell, value) in cells.iter().zip(values) {
-            *cell.borrow_mut() = value;
-        }
-    }
-
-    Ok(TailAction::Sequence(body, local_env))
 }
 
 fn create_recursive_bindings(env: &EnvRef, bindings: &[(String, Expr)]) -> Vec<BindingRef> {
@@ -857,72 +1543,6 @@ fn parse_record_field_spec(expr: &Expr) -> Result<RecordFieldSpec, EvalError> {
     }
 }
 
-fn eval_cond<'a>(
-    args: &'a [Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<TailAction<'a>, EvalError> {
-    for clause in args {
-        let parts = cond_clause_parts(clause)?;
-
-        if is_else_clause(parts) {
-            return eval_cond_clause_body(&parts[1..], env, Value::Bool(true), runtime);
-        }
-
-        let test_value = eval_expr(&parts[0], env, runtime)?;
-        if test_value.is_truthy() {
-            return eval_cond_clause_body(&parts[1..], env, test_value, runtime);
-        }
-    }
-
-    Ok(TailAction::Value(Value::Void))
-}
-
-fn eval_case<'a>(
-    args: &'a [Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<TailAction<'a>, EvalError> {
-    let Some((key_expr, clauses)) = args.split_first() else {
-        return Err(wrong_arg_count("case", "at least 2", 0));
-    };
-
-    if clauses.is_empty() {
-        return Err(wrong_arg_count("case", "at least 2", 1));
-    }
-
-    let key = eval_expr(key_expr, env, runtime)?;
-
-    for (index, clause) in clauses.iter().enumerate() {
-        if let Some(action) = eval_case_clause(clause, index, clauses.len(), &key, env)? {
-            return Ok(action);
-        }
-    }
-
-    Ok(TailAction::Value(Value::Void))
-}
-
-fn eval_case_clause<'a>(
-    clause: &'a Expr,
-    index: usize,
-    clause_count: usize,
-    key: &Value,
-    env: &EnvRef,
-) -> Result<Option<TailAction<'a>>, EvalError> {
-    let parts = case_clause_parts(clause)?;
-    if is_else_clause(parts) {
-        validate_case_else_clause(clause, parts, index, clause_count)?;
-        return Ok(Some(TailAction::Sequence(&parts[1..], env.clone())));
-    }
-
-    ensure_case_clause_has_body(clause, parts, "case clause must have a body")?;
-    if !case_clause_matches_key(key, &parts[0])? {
-        return Ok(None);
-    }
-
-    Ok(Some(TailAction::Sequence(&parts[1..], env.clone())))
-}
-
 fn validate_case_else_clause(
     clause: &Expr,
     parts: &[Expr],
@@ -949,115 +1569,6 @@ fn ensure_case_clause_has_body(
     }
 
     Err(positioned_syntax_error(clause, message))
-}
-
-fn case_clause_matches_key(key: &Value, datums_expr: &Expr) -> Result<bool, EvalError> {
-    let datums = case_clause_datums(datums_expr)?;
-    Ok(datums
-        .iter()
-        .any(|datum| eqv_value(key, &quote_expr(datum))))
-}
-
-fn eval_do(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value, EvalError> {
-    let Some((bindings_expr, tail)) = args.split_first() else {
-        return Err(wrong_arg_count("do", "at least 2", 0));
-    };
-
-    let Some((test_clause, body)) = tail.split_first() else {
-        return Err(wrong_arg_count("do", "at least 2", 1));
-    };
-
-    let bindings = parse_do_bindings(bindings_expr)?;
-    let test_parts = do_termination_clause_parts(test_clause)?;
-    let (test_expr, result_exprs) = test_parts
-        .split_first()
-        .expect("do termination clause must contain a test expression");
-    let init_values = bindings
-        .iter()
-        .map(|binding| eval_expr(&binding.init, env, runtime))
-        .collect::<Result<Vec<_>, _>>()?;
-    let local_env = Environment::new(Some(env.clone()));
-
-    for (binding, value) in bindings.iter().zip(init_values) {
-        Environment::define(&local_env, binding.name.clone(), value);
-    }
-
-    loop {
-        if let Some(result) = eval_do_termination(test_expr, result_exprs, &local_env, runtime)? {
-            return Ok(result);
-        }
-
-        eval_do_body(body, &local_env, runtime)?;
-        let next_values = collect_do_next_values(&bindings, &local_env, runtime)?;
-        update_do_bindings(&bindings, &local_env, next_values);
-    }
-}
-
-fn eval_do_termination(
-    test_expr: &Expr,
-    result_exprs: &[Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<Option<Value>, EvalError> {
-    if !eval_expr(test_expr, env, runtime)?.is_truthy() {
-        return Ok(None);
-    }
-
-    Ok(Some(eval_do_result(result_exprs, env, runtime)?))
-}
-
-fn eval_do_result(
-    result_exprs: &[Expr],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<Value, EvalError> {
-    if result_exprs.is_empty() {
-        return Ok(Value::Void);
-    }
-
-    eval_sequence(result_exprs, env, runtime)
-}
-
-fn eval_do_body(body: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<(), EvalError> {
-    if body.is_empty() {
-        return Ok(());
-    }
-
-    eval_sequence(body, env, runtime).map(|_| ())
-}
-
-fn collect_do_next_values(
-    bindings: &[DoBindingSpec],
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<Vec<Value>, EvalError> {
-    bindings
-        .iter()
-        .map(|binding| eval_do_step(binding, env, runtime))
-        .collect()
-}
-
-fn eval_do_step(
-    binding: &DoBindingSpec,
-    env: &EnvRef,
-    runtime: &mut Runtime,
-) -> Result<Value, EvalError> {
-    match &binding.step {
-        Some(step) => eval_expr(step, env, runtime),
-        None => Ok(
-            Environment::lookup(env, &binding.name).expect("do binding should remain available")
-        ),
-    }
-}
-
-fn update_do_bindings(bindings: &[DoBindingSpec], env: &EnvRef, next_values: Vec<Value>) {
-    for (binding, value) in bindings.iter().zip(next_values) {
-        let updated = Environment::set(env, &binding.name, value);
-        debug_assert!(
-            updated,
-            "do binding should be mutable in its local environment"
-        );
-    }
 }
 
 fn cond_clause_parts(clause: &Expr) -> Result<&[Expr], EvalError> {
@@ -1134,19 +1645,6 @@ fn do_termination_clause_parts(clause: &Expr) -> Result<&[Expr], EvalError> {
 
 fn is_else_clause(parts: &[Expr]) -> bool {
     matches!(&parts[0], Expr::Symbol(symbol, _) if symbol == "else")
-}
-
-fn eval_cond_clause_body<'a>(
-    args: &'a [Expr],
-    env: &EnvRef,
-    fallback: Value,
-    _runtime: &mut Runtime,
-) -> Result<TailAction<'a>, EvalError> {
-    if args.is_empty() {
-        Ok(TailAction::Value(fallback))
-    } else {
-        Ok(TailAction::Sequence(args, env.clone()))
-    }
 }
 
 fn expect_symbol_expr(expr: &Expr, context: &str) -> Result<String, EvalError> {
@@ -1278,66 +1776,7 @@ pub(crate) fn apply_procedure(
     args: &[Value],
     runtime: &mut Runtime,
 ) -> Result<Value, EvalError> {
-    match apply_procedure_tail(operator, args, runtime)? {
-        TailAction::Value(value) => Ok(value),
-        TailAction::Expr(expr, env) => eval_target(EvalTarget::Expr(expr, env), runtime),
-        TailAction::Sequence(expressions, env) => {
-            eval_target(EvalTarget::Sequence(expressions, env), runtime)
-        }
-        TailAction::Next(next) => eval_target(
-            match next {
-                OwnedTarget::Expr(expr, env) => EvalTarget::OwnedExpr(expr, env),
-                OwnedTarget::Sequence(expressions, env) => {
-                    EvalTarget::OwnedSequence(expressions, env)
-                }
-            },
-            runtime,
-        ),
-    }
-}
-
-fn apply_procedure_tail<'a>(
-    operator: Value,
-    args: &[Value],
-    runtime: &mut Runtime,
-) -> Result<TailAction<'a>, EvalError> {
-    match operator {
-        Value::Procedure(procedure) => match procedure.as_ref() {
-            Procedure::Builtin(builtin) => (builtin.func)(args, runtime).map(TailAction::Value),
-            Procedure::Lambda(lambda) => apply_lambda(lambda, args),
-            Procedure::CaseLambda(case_lambda) => apply_case_lambda(case_lambda, args),
-            Procedure::RecordConstructor(constructor) => {
-                apply_record_constructor(constructor, args).map(TailAction::Value)
-            }
-            Procedure::RecordPredicate(predicate) => {
-                apply_record_predicate(predicate, args).map(TailAction::Value)
-            }
-            Procedure::RecordAccessor(accessor) => {
-                apply_record_accessor(accessor, args).map(TailAction::Value)
-            }
-        },
-        Value::Bool(_)
-        | Value::Number(_)
-        | Value::String(_)
-        | Value::Symbol(_)
-        | Value::Char(_)
-        | Value::List(_)
-        | Value::Pair(_)
-        | Value::Vector(_)
-        | Value::Record(_)
-        | Value::Uninitialized
-        | Value::Void => Err(EvalError::NotAProcedure {
-            found: operator.render_for_error(),
-        }),
-    }
-}
-
-fn apply_lambda<'a>(lambda: &LambdaProcedure, args: &[Value]) -> Result<TailAction<'a>, EvalError> {
-    let call_env = prepare_lambda_call(lambda, args)?;
-    Ok(TailAction::Next(OwnedTarget::Sequence(
-        lambda.body.clone(),
-        call_env,
-    )))
+    machine_apply_procedure(operator, args, runtime)
 }
 
 fn prepare_lambda_call(lambda: &LambdaProcedure, args: &[Value]) -> Result<EnvRef, EvalError> {
@@ -1367,28 +1806,6 @@ fn prepare_lambda_call(lambda: &LambdaProcedure, args: &[Value]) -> Result<EnvRe
     }
 
     Ok(call_env)
-}
-
-fn apply_case_lambda<'a>(
-    case_lambda: &CaseLambdaProcedure,
-    args: &[Value],
-) -> Result<TailAction<'a>, EvalError> {
-    if let Some(clause) = case_lambda
-        .clauses
-        .iter()
-        .find(|clause| lambda_accepts_arity(clause, args.len()))
-    {
-        return apply_lambda(clause, args);
-    }
-
-    Err(EvalError::WrongArgCount {
-        name: case_lambda
-            .name
-            .clone()
-            .unwrap_or_else(|| "case-lambda".into()),
-        expected: case_lambda_expected(case_lambda),
-        actual: args.len(),
-    })
 }
 
 fn lambda_accepts_arity(lambda: &LambdaProcedure, actual: usize) -> bool {
