@@ -28,7 +28,10 @@ pub enum EvalError {
     EmptyInput,
 
     #[error("{position}: syntax error: {message}")]
-    Syntax { message: String, position: SourcePos },
+    Syntax {
+        message: String,
+        position: SourcePos,
+    },
 
     #[error("{position}: unbound variable: {name}")]
     UnboundVariable { name: String, position: SourcePos },
