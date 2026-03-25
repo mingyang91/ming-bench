@@ -33,6 +33,7 @@ pub enum Value {
     Pair(Box<Value>, Box<Value>),
     Lambda(Rc<LambdaData>),
     Macro(Rc<MacroData>),
+    CaseLambda(Vec<Rc<LambdaData>>),   // multiple arity clauses
     Record(u64, Vec<Value>),           // type_id, field values
     RecordConstructor(u64, usize),     // type_id, num_fields
     RecordPredicate(u64),              // type_id
@@ -104,6 +105,7 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
+            (Value::CaseLambda(_), Value::CaseLambda(_)) => false,
             (Value::Macro(_), Value::Macro(_)) => false,
             (Value::Record(t1, f1), Value::Record(t2, f2)) => t1 == t2 && f1 == f2,
             (Value::Void, Value::Void) => true,
@@ -193,7 +195,7 @@ impl Value {
                 format!("({})", inner.join(" "))
             }
             Value::Pair(a, b) => format!("({} . {})", a.to_display_string(), b.to_display_string()),
-            Value::Lambda(_) => "#<procedure>".into(),
+            Value::Lambda(_) | Value::CaseLambda(_) => "#<procedure>".into(),
             Value::Macro(_) => "#<macro>".into(),
             Value::Record(..) => "#<record>".into(),
             Value::RecordConstructor(..) | Value::RecordPredicate(_) | Value::RecordAccessor(..) => "#<procedure>".into(),

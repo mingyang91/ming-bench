@@ -123,6 +123,20 @@ impl Evaluator {
                 "define-syntax" => return self.eval_define_syntax(&elems[1..], env, call_pos),
                 "define-record-type" => return self.eval_define_record_type(&elems[1..], env, call_pos),
                 "string-set!" => return self.eval_string_set(&elems[1..], env, call_pos),
+                "case-lambda" => return self.eval_case_lambda(&elems[1..], env, call_pos),
+                "procedure?" => {
+                    if elems.len() != 2 {
+                        return Err(EvalError::Arity(format!(
+                            "procedure?: expected 1 argument, got {} at {call_pos}",
+                            elems.len() - 1
+                        )));
+                    }
+                    let val = self.eval_in_env(&elems[1], env)?;
+                    return Ok(Value::Boolean(matches!(val,
+                        Value::Lambda(_) | Value::CaseLambda(_) |
+                        Value::RecordConstructor(..) | Value::RecordPredicate(_) | Value::RecordAccessor(..)
+                    )));
+                }
                 "not" => {
                     if elems.len() != 2 {
                         return Err(EvalError::Arity(format!(
@@ -153,6 +167,9 @@ impl Evaluator {
         match &op {
             Value::Lambda(data) => {
                 self.call_lambda(&data, args, call_pos)
+            }
+            Value::CaseLambda(clauses) => {
+                self.call_case_lambda(&clauses, args, call_pos)
             }
             Value::Symbol(name) => self.apply_builtin(name, &args, call_pos),
             Value::RecordConstructor(type_id, num_fields) => {
@@ -329,6 +346,50 @@ impl Evaluator {
             body,
             env: env.clone(),
         })))
+    }
+
+    fn eval_case_lambda(&self, args: &[Expr], env: &Env, pos: &str) -> Result<Value, EvalError> {
+        if args.is_empty() {
+            return Err(EvalError::Parse(format!("case-lambda: expected at least one clause at {pos}")));
+        }
+        let mut clauses = Vec::new();
+        for clause in args {
+            let clause_exprs = match &clause.kind {
+                ExprKind::List(elems) => elems,
+                _ => return Err(EvalError::Parse(format!("case-lambda: expected clause list at {pos}"))),
+            };
+            if clause_exprs.len() < 2 {
+                return Err(EvalError::Parse(format!("case-lambda: clause must have params and body at {pos}")));
+            }
+            let (params, rest_param) = match &clause_exprs[0].kind {
+                ExprKind::List(param_exprs) => Self::parse_params(param_exprs, "case-lambda", pos)?,
+                _ => return Err(EvalError::Parse(format!("case-lambda: expected parameter list at {pos}"))),
+            };
+            let body = clause_exprs[1..].to_vec();
+            clauses.push(Rc::new(LambdaData {
+                params,
+                rest_param,
+                body,
+                env: env.clone(),
+            }));
+        }
+        Ok(Value::CaseLambda(clauses))
+    }
+
+    fn call_case_lambda(&mut self, clauses: &[Rc<LambdaData>], args: Vec<Value>, pos: &str) -> Result<Value, EvalError> {
+        for clause in clauses {
+            if let Some(ref _rest) = clause.rest_param {
+                if args.len() >= clause.params.len() {
+                    return self.call_lambda(clause, args, pos);
+                }
+            } else if args.len() == clause.params.len() {
+                return self.call_lambda(clause, args, pos);
+            }
+        }
+        Err(EvalError::Arity(format!(
+            "case-lambda: no matching clause for {} arguments at {pos}",
+            args.len()
+        )))
     }
 
     fn eval_let(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<Value, EvalError> {
@@ -520,6 +581,7 @@ impl Evaluator {
     fn call_proc(&mut self, proc: &Value, args: Vec<Value>, pos: &str) -> Result<Value, EvalError> {
         match proc {
             Value::Lambda(data) => self.call_lambda(data, args, pos),
+            Value::CaseLambda(clauses) => self.call_case_lambda(clauses, args, pos),
             Value::Symbol(name) => self.apply_builtin(name, &args, pos),
             _ => Err(EvalError::Type(format!("apply: not a procedure: {} at {pos}", proc))),
         }
@@ -1231,7 +1293,7 @@ impl Evaluator {
     fn is_special_form(name: &str) -> bool {
         matches!(name, "define" | "if" | "quote" | "lambda" | "let" | "begin"
             | "cond" | "and" | "or" | "set!" | "string-set!" | "not"
-            | "define-syntax" | "syntax-rules")
+            | "define-syntax" | "syntax-rules" | "case-lambda" | "procedure?")
     }
 
     fn eval_define_syntax(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<Value, EvalError> {
