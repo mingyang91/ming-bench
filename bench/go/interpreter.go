@@ -27,6 +27,9 @@ type integerValue int
 type stringValue string
 type symbolValue string
 type charValue rune
+type mutableStringValue struct {
+	runes []rune
+}
 
 type listValue struct {
 	elements []value
@@ -100,8 +103,7 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("length", builtinLength())
 	env.define("append", builtinAppend())
 	env.define("string?", builtinPredicate(func(v value) bool {
-		_, ok := v.(stringValue)
-		return ok
+		return isStringValue(v)
 	}))
 	env.define("number?", builtinPredicate(func(v value) bool {
 		_, ok := v.(integerValue)
@@ -134,6 +136,8 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("symbol->string", builtinSymbolToString())
 	env.define("string->symbol", builtinStringToSymbol())
 	env.define("string-ref", builtinStringRef())
+	env.define("string-copy", builtinStringCopy())
+	env.define("string-set!", builtinStringSet())
 	return env
 }
 
@@ -160,7 +164,7 @@ func (e *environment) lookup(name string) (value, bool) {
 
 func eval(expr node, env *environment) (value, error) {
 	switch expr := expr.(type) {
-	case integerValue, booleanValue, stringValue:
+	case integerValue, booleanValue, stringValue, charValue:
 		return expr, nil
 	case symbolNode:
 		val, ok := env.lookup(expr.name)
@@ -937,6 +941,51 @@ func builtinStringRef() builtinProc {
 	}
 }
 
+func builtinStringCopy() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string-copy expects exactly 1 argument"}
+		}
+
+		runes, err := expectStringRunes(args[0])
+		if err != nil {
+			return nil, err
+		}
+
+		return &mutableStringValue{runes: copyRunes(runes)}, nil
+	}
+}
+
+func builtinStringSet() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) != 3 {
+			return nil, &EvalError{Message: "string-set! expects exactly 3 arguments"}
+		}
+
+		str, err := expectMutableStringValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+
+		index, err := expectIntegerValue(args[1])
+		if err != nil {
+			return nil, err
+		}
+
+		char, err := expectCharValue(args[2])
+		if err != nil {
+			return nil, err
+		}
+
+		if index < 0 || index >= len(str.runes) {
+			return nil, &EvalError{Message: "string-set! index out of range"}
+		}
+
+		str.runes[index] = rune(char)
+		return voidValue{}, nil
+	}
+}
+
 func expectIntegerValue(v value) (int, error) {
 	n, ok := v.(integerValue)
 	if !ok {
@@ -946,11 +995,14 @@ func expectIntegerValue(v value) (int, error) {
 }
 
 func expectStringValue(v value) (string, error) {
-	str, ok := v.(stringValue)
-	if !ok {
+	switch v := v.(type) {
+	case stringValue:
+		return string(v), nil
+	case *mutableStringValue:
+		return string(v.runes), nil
+	default:
 		return "", &EvalError{Message: "expected string"}
 	}
-	return string(str), nil
 }
 
 func expectSymbolValue(v value) (string, error) {
@@ -969,6 +1021,42 @@ func expectListValue(v value) (listValue, error) {
 	return list, nil
 }
 
+func expectStringRunes(v value) ([]rune, error) {
+	switch v := v.(type) {
+	case stringValue:
+		return []rune(string(v)), nil
+	case *mutableStringValue:
+		return copyRunes(v.runes), nil
+	default:
+		return nil, &EvalError{Message: "expected string"}
+	}
+}
+
+func expectMutableStringValue(v value) (*mutableStringValue, error) {
+	str, ok := v.(*mutableStringValue)
+	if !ok {
+		return nil, &EvalError{Message: "expected mutable string"}
+	}
+	return str, nil
+}
+
+func expectCharValue(v value) (charValue, error) {
+	char, ok := v.(charValue)
+	if !ok {
+		return 0, &EvalError{Message: "expected character"}
+	}
+	return char, nil
+}
+
+func isStringValue(v value) bool {
+	switch v.(type) {
+	case stringValue, *mutableStringValue:
+		return true
+	default:
+		return false
+	}
+}
+
 func copyValues(values []value) []value {
 	if len(values) == 0 {
 		return nil
@@ -979,9 +1067,19 @@ func copyValues(values []value) []value {
 	return copied
 }
 
+func copyRunes(runes []rune) []rune {
+	if len(runes) == 0 {
+		return nil
+	}
+
+	copied := make([]rune, len(runes))
+	copy(copied, runes)
+	return copied
+}
+
 func datumFromNode(expr node) (value, error) {
 	switch expr := expr.(type) {
-	case integerValue, booleanValue, stringValue:
+	case integerValue, booleanValue, stringValue, charValue:
 		return expr, nil
 	case symbolNode:
 		return symbolValue(expr.name), nil
@@ -1011,6 +1109,8 @@ func formatValue(v value) (string, error) {
 		return "#f", nil
 	case stringValue:
 		return strconv.Quote(string(v)), nil
+	case *mutableStringValue:
+		return strconv.Quote(string(v.runes)), nil
 	case symbolValue:
 		return string(v), nil
 	case charValue:
@@ -1040,6 +1140,8 @@ func formatDisplayValue(v value) (string, error) {
 	switch v := v.(type) {
 	case stringValue:
 		return string(v), nil
+	case *mutableStringValue:
+		return string(v.runes), nil
 	case charValue:
 		return string(rune(v)), nil
 	case listValue:
@@ -1226,6 +1328,10 @@ func (p *parser) parseAtom() (node, error) {
 		return booleanValue(false), nil
 	}
 
+	if strings.HasPrefix(token, "#\\") {
+		return parseCharLiteral(token, pos)
+	}
+
 	if isIntegerLiteral(token) {
 		n, err := strconv.Atoi(token)
 		if err != nil {
@@ -1235,6 +1341,23 @@ func (p *parser) parseAtom() (node, error) {
 	}
 
 	return symbolNode{name: token, pos: pos}, nil
+}
+
+func parseCharLiteral(token string, pos sourcePos) (node, error) {
+	literal := token[2:]
+	switch literal {
+	case "space":
+		return charValue(' '), nil
+	case "newline":
+		return charValue('\n'), nil
+	}
+
+	runes := []rune(literal)
+	if len(runes) != 1 {
+		return nil, errorAt(pos, "invalid character literal: %s", token)
+	}
+
+	return charValue(runes[0]), nil
 }
 
 func (p *parser) skipWhitespaceAndComments() {
