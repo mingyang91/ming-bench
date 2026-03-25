@@ -31,14 +31,23 @@ object CekApply:
             setupBody(s, body, localEnv, kk)
           case None =>
             throw EvalError(s"case-lambda: no matching clause for ${args.length} arguments")
-      case Expr.Cont(savedK) =>
+      case Expr.Cont(kontData) =>
         if args.length != 1 then throw EvalError("continuation: need exactly 1 argument")
-        s.value = args.head
-        s.k = savedK.asInstanceOf[Kont]
-        s.evaluating = false
+        val (savedK, savedWinds) = kontData.asInstanceOf[(Kont, List[WindEntry])]
+        val value                = args.head
+        val currentWinds         = s.windStack
+        val (toUnwind, toRewind) = computeWindTransfer(currentWinds, savedWinds)
+        if toUnwind.isEmpty && toRewind.isEmpty then
+          s.value = value
+          s.k = savedK
+          s.evaluating = false
+        else
+          val unwindOuts = toUnwind.map(_.outThunk)
+          s.k = DynWindTransferK(unwindOuts, toRewind, savedWinds, value, savedK)
+          s.evaluating = false
       case Expr.Sym(name) if name == "call/cc" || name == "call-with-current-continuation" =>
         if args.length != 1 then throw EvalError(s"$name: need exactly 1 argument")
-        val contValue = Expr.Cont(kk)
+        val contValue = Expr.Cont((kk, s.windStack))
         applyFunc(s, args.head, List(contValue), kk)
       case Expr.Sym("apply") =>
         if args.length < 2 then throw EvalError("apply: need at least 2 arguments")
@@ -54,6 +63,12 @@ object CekApply:
         s.value = applyForEachCek(args)
         s.k = kk
         s.evaluating = false
+      case Expr.Sym("dynamic-wind") =>
+        if args.length != 3 then throw EvalError("dynamic-wind: need exactly 3 arguments")
+        val (inThunk, bodyThunk, outThunk) = (args(0), args(1), args(2))
+        val entry                          = new WindEntry(inThunk, outThunk)
+        val afterInK                       = DynWindAfterInK(entry, bodyThunk, outThunk, kk)
+        applyFunc(s, inThunk, Nil, afterInK)
       case Expr.Sym(name) if name.startsWith("%%record-") =>
         s.value = RecordOps.applyRecordOp(name, args)
         s.k = kk
@@ -176,3 +191,19 @@ object CekApply:
       val argSlice = lists.map(_(i))
       Applier.applyProc(proc, argSlice)
     Expr.Bool(false)
+
+  def computeWindTransfer(
+    current: List[WindEntry],
+    target: List[WindEntry]
+  ): (List[WindEntry], List[WindEntry]) =
+    val cLen = current.length
+    val tLen = target.length
+    var c    = current; var t = target
+    if cLen > tLen then for _ <- 0 until (cLen - tLen) do c = c.tail
+    else for _ <- 0 until (tLen - cLen) do t = t.tail
+    while c.nonEmpty && !(c eq t) do
+      c = c.tail; t = t.tail
+    val commonLen = c.length
+    val toUnwind  = current.take(cLen - commonLen)        // innermost first
+    val toRewind  = target.take(tLen - commonLen).reverse // outermost first
+    (toUnwind, toRewind)

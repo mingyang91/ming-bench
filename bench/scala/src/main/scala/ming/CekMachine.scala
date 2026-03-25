@@ -212,7 +212,42 @@ object CekMachine:
       case CaseKeyK(clauses, e, kk) =>
         evalCaseClauses(s, s.value, clauses, e, kk)
 
+      case k: DynWindAfterInK   => stepDynWind(s, k)
+      case k: DynWindAfterBodyK => stepDynWind(s, k)
+      case k: DynWindAfterOutK  => stepDynWind(s, k)
+      case k: DynWindTransferK  => stepDynWind(s, k)
+
     null // signal: keep looping
+
+  private def stepDynWind(s: CekState, k: Kont): Unit = k match
+    case DynWindAfterInK(entry, bodyThunk, outThunk, kk) =>
+      s.windStack = entry :: s.windStack
+      applyFunc(s, bodyThunk, Nil, DynWindAfterBodyK(entry, outThunk, kk))
+
+    case DynWindAfterBodyK(entry, outThunk, kk) =>
+      val bodyValue = s.value
+      s.windStack = s.windStack.tail
+      applyFunc(s, outThunk, Nil, DynWindAfterOutK(bodyValue, kk))
+
+    case DynWindAfterOutK(bodyValue, kk) =>
+      s.value = bodyValue
+      s.k = kk
+
+    case DynWindTransferK(unwindOuts, rewindEntries, targetWinds, value, savedK) =>
+      if unwindOuts.nonEmpty then
+        s.windStack = s.windStack.tail
+        val nextK = DynWindTransferK(unwindOuts.tail, rewindEntries, targetWinds, value, savedK)
+        applyFunc(s, unwindOuts.head, Nil, nextK)
+      else if rewindEntries.nonEmpty then
+        s.windStack = rewindEntries.head :: s.windStack
+        val nextK = DynWindTransferK(Nil, rewindEntries.tail, targetWinds, value, savedK)
+        applyFunc(s, rewindEntries.head.inThunk, Nil, nextK)
+      else
+        s.value = value
+        s.k = savedK
+        s.evaluating = false
+
+    case _ => ()
 
   private def stepLogicalKont(
     s: CekState,

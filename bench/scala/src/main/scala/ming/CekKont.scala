@@ -40,10 +40,26 @@ private[ming] case class OrK(remaining: List[Expr], env: Env, k: Kont)          
 private[ming] case class CondK(body: List[Expr], remaining: List[Expr], env: Env, k: Kont) extends Kont
 private[ming] case class CaseKeyK(clauses: List[Expr], env: Env, k: Kont)                  extends Kont
 
+// dynamic-wind support
+private[ming] class WindEntry(val inThunk: Expr, val outThunk: Expr)
+
+private[ming] case class DynWindAfterInK(entry: WindEntry, bodyThunk: Expr, outThunk: Expr, k: Kont) extends Kont
+private[ming] case class DynWindAfterBodyK(entry: WindEntry, outThunk: Expr, k: Kont)                extends Kont
+private[ming] case class DynWindAfterOutK(bodyValue: Expr, k: Kont)                                  extends Kont
+
+private[ming] case class DynWindTransferK(
+  unwindOuts: List[Expr],
+  rewindEntries: List[WindEntry],
+  targetWinds: List[WindEntry],
+  value: Expr,
+  savedK: Kont
+) extends Kont
+
 private[ming] class CekState:
-  var expr: Expr          = null
-  var env: Env            = null
-  var k: Kont             = null
-  var value: Expr         = null
-  var evaluating: Boolean = true
-  var appPosExpr: Expr    = null
+  var expr: Expr                 = null
+  var env: Env                   = null
+  var k: Kont                    = null
+  var value: Expr                = null
+  var evaluating: Boolean        = true
+  var appPosExpr: Expr           = null
+  var windStack: List[WindEntry] = Nil
