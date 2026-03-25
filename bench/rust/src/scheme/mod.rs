@@ -2,16 +2,25 @@ pub mod error;
 
 pub use error::EvalError;
 
+mod parser;
+mod eval;
+mod value;
+
+use eval::Evaluator;
+
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
-///
-/// # Examples
-/// ```
-/// use ming::scheme::eval_str;
-/// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
-/// ```
-pub fn eval_str(_input: &str) -> Result<String, EvalError> {
-    todo!()
+pub fn eval_str(input: &str) -> Result<String, EvalError> {
+    let exprs = parser::parse(input)?;
+    let mut evaluator = Evaluator::new();
+    let mut result = value::Value::Void;
+    for expr in exprs {
+        result = evaluator.eval(&expr)?;
+    }
+    match result {
+        value::Value::Void => Ok("".into()),
+        _ => Ok(result.to_display_string()),
+    }
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
