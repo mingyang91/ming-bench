@@ -41,6 +41,15 @@ private[ming] object Interpreter:
       case Expr.ListExpr(Expr.Symbol("lambda", _) :: args, pos) =>
         evalLambda(args, env, pos)
 
+      case Expr.ListExpr(Expr.Symbol("begin", _) :: args, _) =>
+        evalBegin(args, env)
+
+      case Expr.ListExpr(Expr.Symbol("let", _) :: args, pos) =>
+        evalLet(args, env, pos)
+
+      case Expr.ListExpr(Expr.Symbol("cond", _) :: args, pos) =>
+        evalCond(args, env, pos)
+
       case Expr.ListExpr(Expr.Symbol("and", _) :: args, _) =>
         evalAnd(args, env)
 
@@ -92,6 +101,73 @@ private[ming] object Interpreter:
 
       case _ =>
         throw EvalError.at(pos, "lambda expects a parameter list and body")
+
+  private def evalBegin(args: List[Expr], env: Env): Value =
+    evalSequence(args, env)
+
+  private def evalLet(args: List[Expr], env: Env, pos: SourcePos): Value =
+    args match
+      case Expr.Symbol(name, _) :: Expr.ListExpr(bindings, bindingsPos) :: body if body.nonEmpty =>
+        evalNamedLet(name, bindings, body, env, bindingsPos, pos)
+
+      case Expr.ListExpr(bindings, bindingsPos) :: body if body.nonEmpty =>
+        val parsedBindings = parseBindings(bindings, bindingsPos)
+        val names          = parsedBindings.map(_._1)
+        val values         = parsedBindings.map { case (_, valueExpr) => eval(valueExpr, env) }
+        evalSequence(body, env.extend(names, values))
+
+      case _ =>
+        throw EvalError.at(pos, "let expects bindings and a body")
+
+  private def evalNamedLet(
+    name: String,
+    bindings: List[Expr],
+    body: List[Expr],
+    env: Env,
+    bindingsPos: SourcePos,
+    pos: SourcePos
+  ): Value =
+    val parsedBindings = parseBindings(bindings, bindingsPos)
+    val names          = parsedBindings.map(_._1)
+    val values         = parsedBindings.map { case (_, valueExpr) => eval(valueExpr, env) }
+    val loopEnv        = Env.child(env)
+    val closure        = Value.Closure(names, body, loopEnv)
+
+    loopEnv.define(name, closure)
+    applyProcedure(closure, values, pos)
+
+  private def evalCond(clauses: List[Expr], env: Env, pos: SourcePos): Value =
+    clauses match
+      case Nil =>
+        Value.VoidVal
+
+      case Expr.ListExpr(Nil, clausePos) :: _ =>
+        throw EvalError.at(clausePos, "cond clause cannot be empty")
+
+      case Expr.ListExpr(Expr.Symbol("else", _) :: body, clausePos) :: rest =>
+        if rest.nonEmpty then throw EvalError.at(clausePos, "else must be the last cond clause")
+        else if body.isEmpty then Value.VoidVal
+        else evalSequence(body, env)
+
+      case Expr.ListExpr(test :: body, _) :: rest =>
+        val testValue = eval(test, env)
+        if Value.isTruthy(testValue) then if body.isEmpty then testValue else evalSequence(body, env)
+        else evalCond(rest, env, pos)
+
+      case other :: _ =>
+        throw EvalError.at(pos, s"invalid cond clause: ${other}")
+
+  private def parseBindings(bindings: List[Expr], pos: SourcePos): List[(String, Expr)] =
+    bindings.map {
+      case Expr.ListExpr(Expr.Symbol(name, _) :: valueExpr :: Nil, _) =>
+        (name, valueExpr)
+
+      case Expr.ListExpr(_, bindingPos) =>
+        throw EvalError.at(bindingPos, "binding must contain exactly a name and expression")
+
+      case _ =>
+        throw EvalError.at(pos, "bindings must be lists")
+    }
 
   private def parseParameters(params: List[Expr], pos: SourcePos): List[String] =
     params.map {

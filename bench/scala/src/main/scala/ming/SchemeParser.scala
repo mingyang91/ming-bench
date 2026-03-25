@@ -24,6 +24,9 @@ private[ming] object SchemeParser:
 
     val start = trimmed.currentPos
     trimmed.currentChar match
+      case '\'' =>
+        parseQuote(start, trimmed.advance)
+
       case '(' =>
         parseList(start, trimmed.advance)
 
@@ -47,6 +50,10 @@ private[ming] object SchemeParser:
 
       case _ =>
         parseSymbol(start, trimmed)
+
+  private def parseQuote(start: SourcePos, state: ParserState): (Expr, ParserState) =
+    val (quoted, nextState) = parseExpr(state)
+    (Expr.ListExpr(List(Expr.Symbol("quote", start), quoted), start), nextState)
 
   private def parseList(start: SourcePos, state: ParserState): (Expr, ParserState) =
     val (items, nextState) = parseListItems(start, skipTrivia(state), Nil)
@@ -151,7 +158,7 @@ private[ming] object SchemeParser:
     state.peek(offset).forall(isDelimiter)
 
   private def isDelimiter(ch: Char): Boolean =
-    ch.isWhitespace || ch == '(' || ch == ')' || ch == '"' || ch == ';'
+    ch.isWhitespace || ch == '\'' || ch == '(' || ch == ')' || ch == '"' || ch == ';'
 
   private def decodeEscape(ch: Char): Char =
     ch match
