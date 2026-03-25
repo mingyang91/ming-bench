@@ -130,6 +130,10 @@ type SchemeValue =
   | CaseClosure
   | { type: 'void' };
 
+type EvalOutcome =
+  | { kind: 'value'; value: SchemeValue }
+  | { kind: 'tail'; expr: Expr; env: Environment };
+
 type ListValue = Extract<SchemeValue, { type: 'list' }>;
 type StringValue = Extract<SchemeValue, { type: 'string' }>;
 type VectorValue = Extract<SchemeValue, { type: 'vector' }>;
@@ -470,34 +474,50 @@ function tokenize(input: string): { tokens: Token[]; eofPosition: SourcePosition
 }
 
 function evaluate(expr: Expr, env: Environment): SchemeValue {
-  try {
-    switch (expr.type) {
-      case 'number':
-      case 'boolean':
-        return expr;
-      case 'string':
-        return stringValue(expr.value);
-      case 'char':
-        return charValue(expr.value, expr.position);
-      case 'symbol':
-        if (expr.capturedCell) {
-          return readBindingCell(expr.capturedCell, symbolKey(expr), expr.position);
-        }
+  let currentExpr = expr;
+  let currentEnv = env;
 
-        if (expr.capturedSyntax) {
-          throw new EvalError(`syntax identifier used as value: ${expr.name}`, expr.position);
-        }
+  while (true) {
+    try {
+      switch (currentExpr.type) {
+        case 'number':
+        case 'boolean':
+          return currentExpr;
+        case 'string':
+          return stringValue(currentExpr.value);
+        case 'char':
+          return charValue(currentExpr.value, currentExpr.position);
+        case 'symbol':
+          if (currentExpr.capturedCell) {
+            return readBindingCell(currentExpr.capturedCell, symbolKey(currentExpr), currentExpr.position);
+          }
 
-        return env.lookup(symbolKey(expr), expr.position);
-      case 'list':
-        return evaluateList(expr, env);
+          if (currentExpr.capturedSyntax) {
+            throw new EvalError(
+              `syntax identifier used as value: ${currentExpr.name}`,
+              currentExpr.position,
+            );
+          }
+
+          return currentEnv.lookup(symbolKey(currentExpr), currentExpr.position);
+        case 'list': {
+          const outcome = evaluateList(currentExpr, currentEnv);
+          if (outcome.kind === 'value') {
+            return outcome.value;
+          }
+
+          currentExpr = outcome.expr;
+          currentEnv = outcome.env;
+          continue;
+        }
+      }
+    } catch (error) {
+      throw attachPosition(error, currentExpr.position);
     }
-  } catch (error) {
-    throw attachPosition(error, expr.position);
   }
 }
 
-function evaluateList(expr: Extract<Expr, { type: 'list' }>, env: Environment): SchemeValue {
+function evaluateList(expr: Extract<Expr, { type: 'list' }>, env: Environment): EvalOutcome {
   if (expr.elements.length === 0) {
     throw new EvalError('cannot evaluate empty list', expr.position);
   }
@@ -508,21 +528,21 @@ function evaluateList(expr: Extract<Expr, { type: 'list' }>, env: Environment): 
   if (operator.type === 'symbol') {
     switch (operator.name) {
       case 'define':
-        return evaluateDefine(args, env, operator.position);
+        return valueOutcome(evaluateDefine(args, env, operator.position));
       case 'define-syntax':
-        return evaluateDefineSyntax(args, env, operator.position);
+        return valueOutcome(evaluateDefineSyntax(args, env, operator.position));
       case 'define-record-type':
-        return evaluateDefineRecordType(args, env, operator.position);
+        return valueOutcome(evaluateDefineRecordType(args, env, operator.position));
       case 'set!':
-        return evaluateSet(args, env, operator.position);
+        return valueOutcome(evaluateSet(args, env, operator.position));
       case 'if':
         return evaluateIf(args, env, operator.position);
       case 'quote':
-        return evaluateQuote(args, operator.position);
+        return valueOutcome(evaluateQuote(args, operator.position));
       case 'lambda':
-        return evaluateLambda(args, env, operator.position);
+        return valueOutcome(evaluateLambda(args, env, operator.position));
       case 'case-lambda':
-        return evaluateCaseLambda(args, env, operator.position);
+        return valueOutcome(evaluateCaseLambda(args, env, operator.position));
       case 'and':
         return evaluateAnd(args, env);
       case 'or':
@@ -545,13 +565,13 @@ function evaluateList(expr: Extract<Expr, { type: 'list' }>, env: Environment): 
 
     const macro = operator.capturedSyntax ?? env.tryLookupSyntax(symbolKey(operator));
     if (macro) {
-      return evaluate(expandMacroCall(macro, expr), env);
+      return tailOutcome(expandMacroCall(macro, expr), env);
     }
   }
 
   const procedure = evaluate(operator, env);
   const evaluatedArgs = args.map((arg) => ({ value: evaluate(arg, env), position: arg.position }));
-  return applyProcedure(procedure, evaluatedArgs, operator.position);
+  return applyProcedureOutcome(procedure, evaluatedArgs, operator.position);
 }
 
 function evaluateDefine(args: Expr[], env: Environment, position: SourcePosition): SchemeValue {
@@ -714,16 +734,16 @@ function evaluateSet(args: Expr[], env: Environment, position: SourcePosition): 
   return VOID_VALUE;
 }
 
-function evaluateIf(args: Expr[], env: Environment, position: SourcePosition): SchemeValue {
+function evaluateIf(args: Expr[], env: Environment, position: SourcePosition): EvalOutcome {
   if (args.length !== 2 && args.length !== 3) {
     throw new EvalError(`if: expected 2 or 3 argument(s), got ${args.length}`, position);
   }
 
   if (isTruthy(evaluate(args[0], env))) {
-    return evaluate(args[1], env);
+    return tailOutcome(args[1], env);
   }
 
-  return args[2] === undefined ? VOID_VALUE : evaluate(args[2], env);
+  return args[2] === undefined ? valueOutcome(VOID_VALUE) : tailOutcome(args[2], env);
 }
 
 function evaluateQuote(args: Expr[], position: SourcePosition): SchemeValue {
@@ -753,37 +773,41 @@ function evaluateCaseLambda(args: Expr[], env: Environment, position: SourcePosi
   };
 }
 
-function evaluateAnd(args: Expr[], env: Environment): SchemeValue {
-  let result: SchemeValue = booleanValue(true);
+function evaluateAnd(args: Expr[], env: Environment): EvalOutcome {
+  if (args.length === 0) {
+    return valueOutcome(booleanValue(true));
+  }
 
-  for (const arg of args) {
-    result = evaluate(arg, env);
+  for (let index = 0; index < args.length - 1; index += 1) {
+    const result = evaluate(args[index], env);
     if (!isTruthy(result)) {
-      return result;
+      return valueOutcome(result);
     }
   }
 
-  return result;
+  return tailOutcome(args[args.length - 1], env);
 }
 
-function evaluateOr(args: Expr[], env: Environment): SchemeValue {
-  let result: SchemeValue = booleanValue(false);
+function evaluateOr(args: Expr[], env: Environment): EvalOutcome {
+  if (args.length === 0) {
+    return valueOutcome(booleanValue(false));
+  }
 
-  for (const arg of args) {
-    result = evaluate(arg, env);
+  for (let index = 0; index < args.length - 1; index += 1) {
+    const result = evaluate(args[index], env);
     if (isTruthy(result)) {
-      return result;
+      return valueOutcome(result);
     }
   }
 
-  return result;
+  return tailOutcome(args[args.length - 1], env);
 }
 
-function evaluateBegin(args: Expr[], env: Environment): SchemeValue {
-  return evaluateSequence(args, env);
+function evaluateBegin(args: Expr[], env: Environment): EvalOutcome {
+  return evaluateSequenceOutcome(args, env);
 }
 
-function evaluateLet(args: Expr[], env: Environment, position: SourcePosition): SchemeValue {
+function evaluateLet(args: Expr[], env: Environment, position: SourcePosition): EvalOutcome {
   requireArgCountAtLeast('let', args.length, 2, position);
 
   const firstArg = args[0];
@@ -804,7 +828,7 @@ function evaluateLet(args: Expr[], env: Environment, position: SourcePosition): 
     };
 
     letEnv.define(symbolKey(firstArg), closure);
-    return applyProcedure(closure, values, firstArg.position);
+    return applyProcedureOutcome(closure, values, firstArg.position);
   }
 
   const bindings = parseLetBindings('let', firstArg);
@@ -814,10 +838,10 @@ function evaluateLet(args: Expr[], env: Environment, position: SourcePosition): 
     letEnv.define(symbolKey(binding.name), evaluate(binding.value, env));
   }
 
-  return evaluateSequence(args.slice(1), letEnv);
+  return evaluateSequenceOutcome(args.slice(1), letEnv);
 }
 
-function evaluateCond(args: Expr[], env: Environment): SchemeValue {
+function evaluateCond(args: Expr[], env: Environment): EvalOutcome {
   for (const clause of args) {
     if (clause.type !== 'list' || clause.elements.length === 0) {
       throw new EvalError('cond: expected non-empty clause', clause.position);
@@ -826,16 +850,16 @@ function evaluateCond(args: Expr[], env: Environment): SchemeValue {
     const [testExpr, ...body] = clause.elements;
 
     if (testExpr.type === 'symbol' && testExpr.name === 'else') {
-      return body.length === 0 ? VOID_VALUE : evaluateSequence(body, env);
+      return body.length === 0 ? valueOutcome(VOID_VALUE) : evaluateSequenceOutcome(body, env);
     }
 
     const testValue = evaluate(testExpr, env);
     if (isTruthy(testValue)) {
-      return body.length === 0 ? testValue : evaluateSequence(body, env);
+      return body.length === 0 ? valueOutcome(testValue) : evaluateSequenceOutcome(body, env);
     }
   }
 
-  return VOID_VALUE;
+  return valueOutcome(VOID_VALUE);
 }
 
 function evaluateLetrec(
@@ -843,7 +867,7 @@ function evaluateLetrec(
   env: Environment,
   position: SourcePosition,
   sequential: boolean,
-): SchemeValue {
+): EvalOutcome {
   const name = sequential ? 'letrec*' : 'letrec';
   requireArgCountAtLeast(name, args.length, 2, position);
 
@@ -869,10 +893,10 @@ function evaluateLetrec(
     }
   }
 
-  return evaluateSequence(args.slice(1), letrecEnv);
+  return evaluateSequenceOutcome(args.slice(1), letrecEnv);
 }
 
-function evaluateCase(args: Expr[], env: Environment, position: SourcePosition): SchemeValue {
+function evaluateCase(args: Expr[], env: Environment, position: SourcePosition): EvalOutcome {
   requireArgCountAtLeast('case', args.length, 2, position);
 
   const key = evaluate(args[0], env);
@@ -890,7 +914,7 @@ function evaluateCase(args: Expr[], env: Environment, position: SourcePosition):
         throw new EvalError('case: else clause must be last', head.position);
       }
 
-      return body.length === 0 ? VOID_VALUE : evaluateSequence(body, env);
+      return body.length === 0 ? valueOutcome(VOID_VALUE) : evaluateSequenceOutcome(body, env);
     }
 
     if (head.type !== 'list') {
@@ -898,14 +922,14 @@ function evaluateCase(args: Expr[], env: Environment, position: SourcePosition):
     }
 
     if (head.elements.some((datum) => eqvValues(key, quoteExpr(datum)))) {
-      return body.length === 0 ? VOID_VALUE : evaluateSequence(body, env);
+      return body.length === 0 ? valueOutcome(VOID_VALUE) : evaluateSequenceOutcome(body, env);
     }
   }
 
-  return VOID_VALUE;
+  return valueOutcome(VOID_VALUE);
 }
 
-function evaluateDo(args: Expr[], env: Environment, position: SourcePosition): SchemeValue {
+function evaluateDo(args: Expr[], env: Environment, position: SourcePosition): EvalOutcome {
   requireArgCountAtLeast('do', args.length, 2, position);
 
   const bindings = parseDoBindings(args[0]);
@@ -924,7 +948,7 @@ function evaluateDo(args: Expr[], env: Environment, position: SourcePosition): S
 
   while (true) {
     if (isTruthy(evaluate(testExpr, doEnv))) {
-      return resultExprs.length === 0 ? VOID_VALUE : evaluateSequence(resultExprs, doEnv);
+      return resultExprs.length === 0 ? valueOutcome(VOID_VALUE) : evaluateSequenceOutcome(resultExprs, doEnv);
     }
 
     evaluateSequence(body, doEnv);
@@ -1901,23 +1925,23 @@ function cloneExpr<T extends Expr>(expr: T): T {
   }
 }
 
-function applyProcedure(
+function applyProcedureOutcome(
   value: SchemeValue,
   args: EvaluatedArg[],
   callPosition: SourcePosition,
-): SchemeValue {
+): EvalOutcome {
   switch (value.type) {
     case 'builtin':
-      return value.invoke(args, callPosition);
+      return valueOutcome(value.invoke(args, callPosition));
     case 'closure':
-      return applyClosure(value, args, callPosition, 'lambda');
+      return applyClosureOutcome(value, args, callPosition, 'lambda');
     case 'case-closure': {
       const clause = value.clauses.find((candidate) => matchesArity(candidate, args.length));
       if (clause === undefined) {
         throw new EvalError('case-lambda: wrong number of arguments', callPosition);
       }
 
-      return applyClosure(
+      return applyClosureOutcome(
         { type: 'closure', env: value.env, ...clause },
         args,
         callPosition,
@@ -1929,12 +1953,20 @@ function applyProcedure(
   }
 }
 
-function applyClosure(
+function applyProcedure(
+  value: SchemeValue,
+  args: EvaluatedArg[],
+  callPosition: SourcePosition,
+): SchemeValue {
+  return resolveEvalOutcome(applyProcedureOutcome(value, args, callPosition));
+}
+
+function applyClosureOutcome(
   value: Closure,
   args: EvaluatedArg[],
   callPosition: SourcePosition,
   name: string,
-): SchemeValue {
+): EvalOutcome {
   if (value.restParam === undefined) {
     requireArgCount(name, args.length, value.params.length, callPosition);
   } else {
@@ -1953,7 +1985,7 @@ function applyClosure(
     });
   }
 
-  return evaluateSequence(value.body, callEnv);
+  return evaluateSequenceOutcome(value.body, callEnv);
 }
 
 function matchesArity(
@@ -1964,13 +1996,31 @@ function matchesArity(
 }
 
 function evaluateSequence(expressions: Expr[], env: Environment): SchemeValue {
-  let result: SchemeValue = VOID_VALUE;
+  return resolveEvalOutcome(evaluateSequenceOutcome(expressions, env));
+}
 
-  for (const expr of expressions) {
-    result = evaluate(expr, env);
+function evaluateSequenceOutcome(expressions: Expr[], env: Environment): EvalOutcome {
+  if (expressions.length === 0) {
+    return valueOutcome(VOID_VALUE);
   }
 
-  return result;
+  for (let index = 0; index < expressions.length - 1; index += 1) {
+    evaluate(expressions[index], env);
+  }
+
+  return tailOutcome(expressions[expressions.length - 1], env);
+}
+
+function resolveEvalOutcome(outcome: EvalOutcome): SchemeValue {
+  return outcome.kind === 'value' ? outcome.value : evaluate(outcome.expr, outcome.env);
+}
+
+function valueOutcome(value: SchemeValue): EvalOutcome {
+  return { kind: 'value', value };
+}
+
+function tailOutcome(expr: Expr, env: Environment): EvalOutcome {
+  return { kind: 'tail', expr, env };
 }
 
 function createGlobalEnv(context: EvaluationContext): Environment {
