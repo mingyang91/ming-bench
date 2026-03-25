@@ -52,6 +52,9 @@ pub enum EvalError {
     #[error("numeric overflow in {operation}")]
     NumericOverflow { operation: &'static str },
 
+    #[error("invalid number conversion for {value}")]
+    InvalidNumberConversion { value: String },
+
     #[error("negative exponent for expt: {value}")]
     NegativeExponent { value: i64 },
 

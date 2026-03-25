@@ -17,7 +17,7 @@ struct MacroRule {
 
 #[derive(Clone, PartialEq, Eq)]
 enum SyntaxExpr {
-    Integer(i64),
+    Number(Number),
     Boolean(bool),
     String(String),
     Char(char),
@@ -28,7 +28,7 @@ enum SyntaxExpr {
 impl SyntaxExpr {
     fn from_expr(expr: &Expr, origin: SyntaxOrigin) -> Self {
         match expr {
-            Expr::Integer(value) => Self::Integer(*value),
+            Expr::Number(value) => Self::Number(*value),
             Expr::Boolean(value) => Self::Boolean(*value),
             Expr::String(value) => Self::String(value.clone()),
             Expr::Char(value) => Self::Char(*value),
@@ -271,9 +271,7 @@ fn match_pattern(
     bindings: &mut PatternBindings,
 ) -> bool {
     match pattern {
-        Expr::Integer(expected) => {
-            matches!(value, SyntaxExpr::Integer(actual) if actual == expected)
-        }
+        Expr::Number(expected) => matches!(value, SyntaxExpr::Number(actual) if actual == expected),
         Expr::Boolean(expected) => {
             matches!(value, SyntaxExpr::Boolean(actual) if actual == expected)
         }
@@ -434,7 +432,7 @@ fn expand_template(
     macro_name: &str,
 ) -> Result<SyntaxExpr, EvalError> {
     match template {
-        Expr::Integer(value) => Ok(SyntaxExpr::Integer(*value)),
+        Expr::Number(value) => Ok(SyntaxExpr::Number(*value)),
         Expr::Boolean(value) => Ok(SyntaxExpr::Boolean(*value)),
         Expr::String(value) => Ok(SyntaxExpr::String(value.clone())),
         Expr::Char(value) => Ok(SyntaxExpr::Char(*value)),
@@ -550,7 +548,7 @@ fn hygienize_expr(
     prefer_macro: bool,
 ) -> Result<Expr, EvalError> {
     match expr {
-        SyntaxExpr::Integer(value) => Ok(Expr::Integer(*value)),
+        SyntaxExpr::Number(value) => Ok(Expr::Number(*value)),
         SyntaxExpr::Boolean(value) => Ok(Expr::Boolean(*value)),
         SyntaxExpr::String(value) => Ok(Expr::String(value.clone())),
         SyntaxExpr::Char(value) => Ok(Expr::Char(*value)),
@@ -977,7 +975,7 @@ fn lower_quoted_list(items: &[SyntaxExpr]) -> Expr {
 
 fn lower_datum(expr: &SyntaxExpr) -> Expr {
     match expr {
-        SyntaxExpr::Integer(value) => Expr::Integer(*value),
+        SyntaxExpr::Number(value) => Expr::Number(*value),
         SyntaxExpr::Boolean(value) => Expr::Boolean(*value),
         SyntaxExpr::String(value) => Expr::String(value.clone()),
         SyntaxExpr::Char(value) => Expr::Char(*value),
