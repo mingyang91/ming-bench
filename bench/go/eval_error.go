@@ -10,6 +10,7 @@ const (
 	ErrUnboundVariable EvalErrorKind = "unbound_variable"
 	ErrTypeMismatch    EvalErrorKind = "type_mismatch"
 	ErrWrongArgCount   EvalErrorKind = "wrong_arg_count"
+	ErrWrongValueCount EvalErrorKind = "wrong_value_count"
 	ErrDivisionByZero  EvalErrorKind = "division_by_zero"
 	ErrNotProcedure    EvalErrorKind = "not_a_procedure"
 	ErrOutOfRange      EvalErrorKind = "out_of_range"

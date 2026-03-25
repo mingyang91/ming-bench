@@ -4,13 +4,13 @@ import "fmt"
 
 type evalResult struct {
 	thunk  func() evalResult
-	value  value
+	values []value
 	err    error
 	raised *raisedSignal
 	done   bool
 }
 
-type evalContinuation func(value) evalResult
+type evalContinuation func([]value) evalResult
 
 type valueListContinuation func([]value) evalResult
 
@@ -20,16 +20,20 @@ type continuationProc struct {
 	handlers []*exceptionHandlerFrame
 }
 
-func doneEval(v value, err error) evalResult {
+func doneEval(values []value, err error) evalResult {
 	return evalResult{
-		value: v,
-		err:   err,
-		done:  true,
+		values: copyValueSlice(values),
+		err:    err,
+		done:   true,
 	}
 }
 
 func doneValue(v value) evalResult {
-	return doneEval(v, nil)
+	return doneEval([]value{v}, nil)
+}
+
+func doneValues(values []value) evalResult {
+	return doneEval(values, nil)
 }
 
 func doneError(err error) evalResult {
@@ -49,11 +53,18 @@ func callEval(fn func() evalResult) evalResult {
 
 func continueEval(k evalContinuation, v value) evalResult {
 	return callEval(func() evalResult {
-		return k(v)
+		return k([]value{v})
 	})
 }
 
-func (it *interpreter) runEval(result evalResult) (value, error) {
+func continueValues(k evalContinuation, values []value) evalResult {
+	copied := copyValueSlice(values)
+	return callEval(func() evalResult {
+		return k(copied)
+	})
+}
+
+func (it *interpreter) runEval(result evalResult) ([]value, error) {
 	for !result.done {
 		result = result.thunk()
 	}
@@ -63,7 +74,7 @@ func (it *interpreter) runEval(result evalResult) (value, error) {
 			result = result.thunk()
 		}
 	}
-	return result.value, result.err
+	return result.values, result.err
 }
 
 func programNeedsContinuationEvaluator(exprs []expr) bool {
@@ -95,7 +106,7 @@ func exprNeedsContinuationEvaluator(node expr) bool {
 }
 
 func isContinuationEvaluatorSymbol(name string) bool {
-	return isCallCCBuiltinName(name) || name == "guard" || name == "raise" || name == "with-exception-handler"
+	return isCallCCBuiltinName(name) || name == "guard" || name == "raise" || name == "with-exception-handler" || name == "values" || name == "call-with-values"
 }
 
 func isCallCCBuiltinName(name string) bool {
@@ -106,8 +117,8 @@ func builtinCallCC(_ *interpreter, _ []value, callPos position) (value, error) {
 	return nil, newEvalError(ErrSyntax, "call/cc requires continuation-aware evaluation", callPos)
 }
 
-func haltContinuation(v value) evalResult {
-	return doneValue(v)
+func haltContinuation(values []value) evalResult {
+	return doneValues(values)
 }
 
 func appendCopiedValue(values []value, v value) []value {
@@ -121,7 +132,12 @@ func (it *interpreter) evalProgramWithContinuations(exprs []expr) (value, error)
 	if len(exprs) == 0 {
 		return nil, newEvalError(ErrSyntax, "expected expression", position{line: 1, column: 1})
 	}
-	return it.runEval(it.evalSequenceWithContinuations(it.global, exprs, haltContinuation))
+
+	values, err := it.runEval(it.evalSequenceWithContinuations(it.global, exprs, haltContinuation))
+	if err != nil {
+		return nil, err
+	}
+	return expectSingleValue(values, exprs[len(exprs)-1].pos())
 }
 
 func (it *interpreter) evalSequenceWithContinuations(scope *env, exprs []expr, k evalContinuation) evalResult {
@@ -134,7 +150,7 @@ func (it *interpreter) evalSequenceWithContinuations(scope *env, exprs []expr, k
 		})
 	}
 	return callEval(func() evalResult {
-		return it.evalWithContinuations(exprs[0], scope, func(_ value) evalResult {
+		return it.evalWithContinuations(exprs[0], scope, func(_ []value) evalResult {
 			return callEval(func() evalResult {
 				return it.evalSequenceWithContinuations(scope, exprs[1:], k)
 			})
@@ -151,7 +167,7 @@ func (it *interpreter) evalExprListRightToLeftWithContinuations(exprs []expr, sc
 
 	last := exprs[len(exprs)-1]
 	return callEval(func() evalResult {
-		return it.evalWithContinuations(last, scope, func(lastValue value) evalResult {
+		return it.evalWithContinuations(last, scope, singleValueContinuation(last.pos(), func(lastValue value) evalResult {
 			return callEval(func() evalResult {
 				return it.evalExprListRightToLeftWithContinuations(exprs[:len(exprs)-1], scope, func(prefix []value) evalResult {
 					return callEval(func() evalResult {
@@ -159,7 +175,7 @@ func (it *interpreter) evalExprListRightToLeftWithContinuations(exprs []expr, sc
 					})
 				})
 			})
-		})
+		}))
 	})
 }
 
@@ -172,7 +188,7 @@ func (it *interpreter) evalBindingValuesWithContinuations(bindings []letBinding,
 
 	last := bindings[len(bindings)-1]
 	return callEval(func() evalResult {
-		return it.evalWithContinuations(last.init, scope, func(lastValue value) evalResult {
+		return it.evalWithContinuations(last.init, scope, singleValueContinuation(last.init.pos(), func(lastValue value) evalResult {
 			return callEval(func() evalResult {
 				return it.evalBindingValuesWithContinuations(bindings[:len(bindings)-1], scope, func(prefix []value) evalResult {
 					return callEval(func() evalResult {
@@ -180,7 +196,7 @@ func (it *interpreter) evalBindingValuesWithContinuations(bindings []letBinding,
 					})
 				})
 			})
-		})
+		}))
 	})
 }
 
@@ -288,7 +304,7 @@ func (it *interpreter) evalWithContinuations(node expr, scope *env, k evalContin
 		}
 
 		return callEval(func() evalResult {
-			return it.evalWithContinuations(current.elements[0], scope, func(operator value) evalResult {
+			return it.evalWithContinuations(current.elements[0], scope, singleValueContinuation(current.elements[0].pos(), func(operator value) evalResult {
 				return callEval(func() evalResult {
 					return it.evalExprListRightToLeftWithContinuations(current.elements[1:], scope, func(args []value) evalResult {
 						return callEval(func() evalResult {
@@ -296,7 +312,7 @@ func (it *interpreter) evalWithContinuations(node expr, scope *env, k evalContin
 						})
 					})
 				})
-			})
+			}))
 		})
 	default:
 		return doneError(newEvalError(ErrSyntax, "unknown expression", node.pos()))
@@ -313,14 +329,14 @@ func (it *interpreter) evalAndWithContinuations(scope *env, args []expr, k evalC
 		})
 	}
 	return callEval(func() evalResult {
-		return it.evalWithContinuations(args[0], scope, func(result value) evalResult {
+		return it.evalWithContinuations(args[0], scope, singleValueContinuation(args[0].pos(), func(result value) evalResult {
 			if !isTruthy(result) {
 				return continueEval(k, result)
 			}
 			return callEval(func() evalResult {
 				return it.evalAndWithContinuations(scope, args[1:], k)
 			})
-		})
+		}))
 	})
 }
 
@@ -329,14 +345,14 @@ func (it *interpreter) evalOrWithContinuations(scope *env, args []expr, k evalCo
 		return continueEval(k, false)
 	}
 	return callEval(func() evalResult {
-		return it.evalWithContinuations(args[0], scope, func(result value) evalResult {
+		return it.evalWithContinuations(args[0], scope, singleValueContinuation(args[0].pos(), func(result value) evalResult {
 			if isTruthy(result) {
 				return continueEval(k, result)
 			}
 			return callEval(func() evalResult {
 				return it.evalOrWithContinuations(scope, args[1:], k)
 			})
-		})
+		}))
 	})
 }
 
@@ -351,10 +367,10 @@ func (it *interpreter) evalDefineWithContinuations(scope *env, list *listExpr, k
 			return doneError(newEvalError(ErrSyntax, "define: expected exactly one value expression", list.at))
 		}
 		return callEval(func() evalResult {
-			return it.evalWithContinuations(list.elements[2], scope, func(result value) evalResult {
+			return it.evalWithContinuations(list.elements[2], scope, singleValueContinuation(list.elements[2].pos(), func(result value) evalResult {
 				it.defineSymbol(scope, target, result)
 				return continueEval(k, voidValue{})
-			})
+			}))
 		})
 	case *listExpr:
 		if len(target.elements) == 0 {
@@ -399,10 +415,10 @@ func (it *interpreter) evalSetWithContinuations(scope *env, list *listExpr, k ev
 	}
 
 	return callEval(func() evalResult {
-		return it.evalWithContinuations(list.elements[2], scope, func(result value) evalResult {
+		return it.evalWithContinuations(list.elements[2], scope, singleValueContinuation(list.elements[2].pos(), func(result value) evalResult {
 			binding.value = result
 			return continueEval(k, voidValue{})
-		})
+		}))
 	})
 }
 
@@ -412,7 +428,7 @@ func (it *interpreter) evalIfWithContinuations(scope *env, list *listExpr, k eva
 	}
 
 	return callEval(func() evalResult {
-		return it.evalWithContinuations(list.elements[1], scope, func(test value) evalResult {
+		return it.evalWithContinuations(list.elements[1], scope, singleValueContinuation(list.elements[1].pos(), func(test value) evalResult {
 			if isTruthy(test) {
 				return callEval(func() evalResult {
 					return it.evalWithContinuations(list.elements[2], scope, k)
@@ -424,7 +440,7 @@ func (it *interpreter) evalIfWithContinuations(scope *env, list *listExpr, k eva
 				})
 			}
 			return continueEval(k, voidValue{})
-		})
+		}))
 	})
 }
 
@@ -458,7 +474,7 @@ func (it *interpreter) evalCondWithContinuations(scope *env, list *listExpr, k e
 		}
 
 		return callEval(func() evalResult {
-			return it.evalWithContinuations(clause.elements[0], scope, func(test value) evalResult {
+			return it.evalWithContinuations(clause.elements[0], scope, singleValueContinuation(clause.elements[0].pos(), func(test value) evalResult {
 				if !isTruthy(test) {
 					return callEval(func() evalResult {
 						return evalClause(index + 1)
@@ -470,7 +486,7 @@ func (it *interpreter) evalCondWithContinuations(scope *env, list *listExpr, k e
 				return callEval(func() evalResult {
 					return it.evalSequenceWithContinuations(scope, clause.elements[1:], k)
 				})
-			})
+			}))
 		})
 	}
 
@@ -483,7 +499,7 @@ func (it *interpreter) evalCaseWithContinuations(scope *env, list *listExpr, k e
 	}
 
 	return callEval(func() evalResult {
-		return it.evalWithContinuations(list.elements[1], scope, func(key value) evalResult {
+		return it.evalWithContinuations(list.elements[1], scope, singleValueContinuation(list.elements[1].pos(), func(key value) evalResult {
 			clauses := list.elements[2:]
 			for idx, clauseExpr := range clauses {
 				clause, ok := clauseExpr.(*listExpr)
@@ -532,7 +548,7 @@ func (it *interpreter) evalCaseWithContinuations(scope *env, list *listExpr, k e
 			}
 
 			return continueEval(k, voidValue{})
-		})
+		}))
 	})
 }
 
@@ -629,12 +645,12 @@ func (it *interpreter) evalLetStarWithContinuations(scope *env, list *listExpr, 
 
 		binding := bindings[index]
 		return callEval(func() evalResult {
-			return it.evalWithContinuations(binding.init, letEnv, func(current value) evalResult {
+			return it.evalWithContinuations(binding.init, letEnv, singleValueContinuation(binding.init.pos(), func(current value) evalResult {
 				it.defineBindingName(letEnv, binding.name, current)
 				return callEval(func() evalResult {
 					return bind(index + 1)
 				})
-			})
+			}))
 		})
 	}
 
@@ -678,12 +694,12 @@ func (it *interpreter) evalLetRecWithContinuations(scope *env, list *listExpr, s
 
 			bindingSpec := bindings[index]
 			return callEval(func() evalResult {
-				return it.evalWithContinuations(bindingSpec.init, letEnv, func(current value) evalResult {
+				return it.evalWithContinuations(bindingSpec.init, letEnv, singleValueContinuation(bindingSpec.init.pos(), func(current value) evalResult {
 					defs[index].value = current
 					return callEval(func() evalResult {
 						return initialize(index + 1)
 					})
-				})
+				}))
 			})
 		}
 		return initialize(0)
@@ -720,7 +736,7 @@ func (it *interpreter) evalDoStepValuesWithContinuations(bindings []doBinding, d
 	}
 
 	return callEval(func() evalResult {
-		return it.evalWithContinuations(currentStep, scope, func(nextValue value) evalResult {
+		return it.evalWithContinuations(currentStep, scope, singleValueContinuation(currentStep.pos(), func(nextValue value) evalResult {
 			return callEval(func() evalResult {
 				return it.evalDoStepValuesWithContinuations(bindings, defs, scope, index-1, func(prefix []value) evalResult {
 					return callEval(func() evalResult {
@@ -728,7 +744,7 @@ func (it *interpreter) evalDoStepValuesWithContinuations(bindings []doBinding, d
 					})
 				})
 			})
-		})
+		}))
 	})
 }
 
@@ -769,7 +785,7 @@ func (it *interpreter) evalDoWithContinuations(scope *env, list *listExpr, k eva
 			var loop func() evalResult
 			loop = func() evalResult {
 				return callEval(func() evalResult {
-					return it.evalWithContinuations(testClause.elements[0], loopEnv, func(test value) evalResult {
+					return it.evalWithContinuations(testClause.elements[0], loopEnv, singleValueContinuation(testClause.elements[0].pos(), func(test value) evalResult {
 						if isTruthy(test) {
 							if len(testClause.elements) == 1 {
 								return continueEval(k, voidValue{})
@@ -780,7 +796,7 @@ func (it *interpreter) evalDoWithContinuations(scope *env, list *listExpr, k eva
 						}
 
 						return callEval(func() evalResult {
-							return it.evalSequenceWithContinuations(loopEnv, commands, func(_ value) evalResult {
+							return it.evalSequenceWithContinuations(loopEnv, commands, func(_ []value) evalResult {
 								return callEval(func() evalResult {
 									return it.evalDoStepValuesWithContinuations(bindings, defs, loopEnv, len(bindings)-1, func(nextValues []value) evalResult {
 										for i, next := range nextValues {
@@ -793,7 +809,7 @@ func (it *interpreter) evalDoWithContinuations(scope *env, list *listExpr, k eva
 								})
 							})
 						})
-					})
+					}))
 				})
 			}
 
@@ -832,6 +848,19 @@ func (it *interpreter) applyProcedureWithContinuations(proc value, args []value,
 			return it.applyRaiseWithContinuations(args, callPos)
 		case "with-exception-handler":
 			return it.applyWithExceptionHandlerWithContinuations(args, callPos, k)
+		case "values":
+			return continueValues(k, args)
+		case "call-with-values":
+			if len(args) != 2 {
+				return doneError(wrongArgCount(callPos, "call-with-values", "expected exactly 2 arguments"))
+			}
+			return callEval(func() evalResult {
+				return it.applyProcedureWithContinuations(args[0], nil, callPos, func(produced []value) evalResult {
+					return callEval(func() evalResult {
+						return it.applyProcedureWithContinuations(args[1], produced, callPos, k)
+					})
+				})
+			})
 		default:
 			if isCallCCBuiltinName(proc.name) {
 				if len(args) != 1 {
@@ -876,13 +905,10 @@ func (it *interpreter) applyProcedureWithContinuations(proc value, args []value,
 		}
 		return doneError(wrongArgCount(callPos, name, fmt.Sprintf("no matching clause for %d arguments", len(args))))
 	case *continuationProc:
-		if len(args) != 1 {
-			return doneError(wrongArgCount(callPos, "continuation", fmt.Sprintf("expected exactly 1 argument, got %d", len(args))))
-		}
 		targetHandlers := copyExceptionHandlerFrames(proc.handlers)
 		return it.switchDynamicWinds(proc.winds, func() evalResult {
 			it.exceptionHandlers = targetHandlers
-			return continueEval(proc.k, args[0])
+			return continueValues(proc.k, args)
 		})
 	default:
 		return doneError(newEvalError(ErrNotProcedure, "attempted to call a non-procedure", callPos))
@@ -920,11 +946,11 @@ func (it *interpreter) applyMapWithContinuations(args []value, callPos position,
 			callArgs[i] = items[index]
 		}
 		return callEval(func() evalResult {
-			return it.applyProcedureWithContinuations(args[0], callArgs, callPos, func(result value) evalResult {
+			return it.applyProcedureWithContinuations(args[0], callArgs, callPos, singleValueContinuation(callPos, func(result value) evalResult {
 				return callEval(func() evalResult {
 					return loop(index+1, appendCopiedValue(results, result))
 				})
-			})
+			}))
 		})
 	}
 
@@ -962,7 +988,7 @@ func (it *interpreter) applyForEachWithContinuations(args []value, callPos posit
 			callArgs[i] = items[index]
 		}
 		return callEval(func() evalResult {
-			return it.applyProcedureWithContinuations(args[0], callArgs, callPos, func(_ value) evalResult {
+			return it.applyProcedureWithContinuations(args[0], callArgs, callPos, func(_ []value) evalResult {
 				return callEval(func() evalResult {
 					return loop(index + 1)
 				})

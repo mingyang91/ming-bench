@@ -66,9 +66,9 @@ func (it *interpreter) applyWithExceptionHandlerWithContinuations(args []value, 
 	it.exceptionHandlers = append(it.exceptionHandlers, frame)
 
 	return callEval(func() evalResult {
-		return it.applyProcedureWithContinuations(args[1], nil, callPos, func(result value) evalResult {
+		return it.applyProcedureWithContinuations(args[1], nil, callPos, func(result []value) evalResult {
 			it.popExceptionHandlerFrame(frame)
-			return continueEval(k, result)
+			return continueValues(k, result)
 		})
 	})
 }
@@ -100,9 +100,9 @@ func (it *interpreter) evalGuardWithContinuations(scope *env, list *listExpr, k 
 	it.exceptionHandlers = append(it.exceptionHandlers, frame)
 
 	return callEval(func() evalResult {
-		return it.evalSequenceWithContinuations(scope, list.elements[2:], func(result value) evalResult {
+		return it.evalSequenceWithContinuations(scope, list.elements[2:], func(result []value) evalResult {
 			it.popExceptionHandlerFrame(frame)
-			return continueEval(k, result)
+			return continueValues(k, result)
 		})
 	})
 }
@@ -126,8 +126,8 @@ func (it *interpreter) dispatchRaised(sig *raisedSignal) evalResult {
 		switch frame.kind {
 		case exceptionHandlerProcedure:
 			return callEval(func() evalResult {
-				return it.applyProcedureWithContinuations(frame.handlerProc, []value{sig.value}, frame.callPos, func(result value) evalResult {
-					return continueEval(frame.k, result)
+				return it.applyProcedureWithContinuations(frame.handlerProc, []value{sig.value}, frame.callPos, func(result []value) evalResult {
+					return continueValues(frame.k, result)
 				})
 			})
 		case exceptionHandlerGuard:
@@ -170,7 +170,7 @@ func (it *interpreter) evalGuardClausesWithContinuations(scope *env, clauses []e
 		}
 
 		return callEval(func() evalResult {
-			return it.evalWithContinuations(clause.elements[0], scope, func(test value) evalResult {
+			return it.evalWithContinuations(clause.elements[0], scope, singleValueContinuation(clause.elements[0].pos(), func(test value) evalResult {
 				if !isTruthy(test) {
 					return callEval(func() evalResult {
 						return evalClause(index + 1)
@@ -182,7 +182,7 @@ func (it *interpreter) evalGuardClausesWithContinuations(scope *env, clauses []e
 				return callEval(func() evalResult {
 					return it.evalSequenceWithContinuations(scope, clause.elements[1:], k)
 				})
-			})
+			}))
 		})
 	}
 

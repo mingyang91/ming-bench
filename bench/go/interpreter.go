@@ -742,6 +742,8 @@ func (it *interpreter) installBuiltins() {
 	it.defineName(it.global, "for-each", &builtinProc{name: "for-each", fn: builtinForEach})
 	it.defineName(it.global, "call/cc", &builtinProc{name: "call/cc", fn: builtinCallCC})
 	it.defineName(it.global, "call-with-current-continuation", &builtinProc{name: "call-with-current-continuation", fn: builtinCallCC})
+	it.defineName(it.global, "values", &builtinProc{name: "values", fn: builtinValues})
+	it.defineName(it.global, "call-with-values", &builtinProc{name: "call-with-values", fn: builtinCallWithValues})
 	it.defineName(it.global, "dynamic-wind", &builtinProc{name: "dynamic-wind", fn: builtinDynamicWind})
 	it.defineName(it.global, "raise", &builtinProc{name: "raise", fn: builtinRaise})
 	it.defineName(it.global, "with-exception-handler", &builtinProc{name: "with-exception-handler", fn: builtinWithExceptionHandler})

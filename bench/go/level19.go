@@ -62,12 +62,12 @@ func (it *interpreter) applyDynamicWindWithContinuations(args []value, callPos p
 	}
 
 	return callEval(func() evalResult {
-		return it.applyProcedureWithContinuations(args[0], nil, callPos, func(_ value) evalResult {
+		return it.applyProcedureWithContinuations(args[0], nil, callPos, func(_ []value) evalResult {
 			it.dynamicWinds = append(it.dynamicWinds, frame)
 			return callEval(func() evalResult {
-				return it.applyProcedureWithContinuations(args[1], nil, callPos, func(result value) evalResult {
+				return it.applyProcedureWithContinuations(args[1], nil, callPos, func(result []value) evalResult {
 					return it.exitDynamicWindFrame(frame, func() evalResult {
-						return continueEval(k, result)
+						return continueValues(k, result)
 					})
 				})
 			})
@@ -82,7 +82,7 @@ func (it *interpreter) exitDynamicWindFrame(frame *dynamicWindFrame, next func()
 
 	it.dynamicWinds = it.dynamicWinds[:len(it.dynamicWinds)-1]
 	return callEval(func() evalResult {
-		return it.applyProcedureWithContinuations(frame.outProc, nil, frame.callPos, func(_ value) evalResult {
+		return it.applyProcedureWithContinuations(frame.outProc, nil, frame.callPos, func(_ []value) evalResult {
 			return callEval(next)
 		})
 	})
@@ -100,7 +100,7 @@ func (it *interpreter) unwindDynamicWinds(prefix int, target []*dynamicWindFrame
 	frame := it.dynamicWinds[len(it.dynamicWinds)-1]
 	it.dynamicWinds = it.dynamicWinds[:len(it.dynamicWinds)-1]
 	return callEval(func() evalResult {
-		return it.applyProcedureWithContinuations(frame.outProc, nil, frame.callPos, func(_ value) evalResult {
+		return it.applyProcedureWithContinuations(frame.outProc, nil, frame.callPos, func(_ []value) evalResult {
 			return callEval(func() evalResult {
 				return it.unwindDynamicWinds(prefix, target, next)
 			})
@@ -115,7 +115,7 @@ func (it *interpreter) rewindDynamicWinds(target []*dynamicWindFrame, index int,
 
 	frame := target[index]
 	return callEval(func() evalResult {
-		return it.applyProcedureWithContinuations(frame.inProc, nil, frame.callPos, func(_ value) evalResult {
+		return it.applyProcedureWithContinuations(frame.inProc, nil, frame.callPos, func(_ []value) evalResult {
 			it.dynamicWinds = append(it.dynamicWinds, frame)
 			return callEval(func() evalResult {
 				return it.rewindDynamicWinds(target, index+1, next)
