@@ -133,7 +133,7 @@ public class Evaluator {
         }
         String result = "";
         if (lastResult != null && lastResult != VOID) {
-            result = schemeToString(lastResult);
+            result = SchemeFormatter.display(lastResult);
         }
         return new EvalResult(result, outputBuffer.toString());
     }

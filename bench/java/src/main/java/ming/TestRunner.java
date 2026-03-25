@@ -28,11 +28,13 @@ public class TestRunner {
             }
         }
 
-        // L27 is a standalone test runner
+        // L27 and L28 are standalone test runners
         if (benchLevel == 27) {
             L27Tests.main(new String[0]);
             return;
         }
+        // L28 standalone concurrent tests run after fixture-based tests below
+        boolean runL28Standalone = (benchLevel == 28 || levelArg.equals("all"));
 
         String testsJsonPath = System.getenv("TESTS_JSON");
         if (testsJsonPath == null || testsJsonPath.isEmpty()) {
@@ -150,7 +152,31 @@ public class TestRunner {
             }
         }
 
-        System.out.println(passed + " passed, " + failed + " failed out of " + total + " tests");
+        // Run L28 standalone concurrent tests if applicable
+        if (runL28Standalone) {
+            try {
+                Class.forName("ming.L28Tests");
+                L28Tests.passed = 0;
+                L28Tests.failed = 0;
+                L28Tests.testSequentialStateLeak();
+                L28Tests.testSequentialOutputLeak();
+                L28Tests.testConcurrentIndependentEval();
+                L28Tests.testConcurrentOutputIsolation();
+                L28Tests.testConcurrentClosuresAndMutation();
+                L28Tests.testConcurrentStress();
+                L28Tests.testConcurrentCallccCollision();
+                L28Tests.testConcurrentMacroHygiene();
+                passed += L28Tests.passed;
+                failed += L28Tests.failed;
+            } catch (ClassNotFoundException e) {
+                // L28Tests not injected yet — skip
+            } catch (Exception e) {
+                System.out.println("FAIL l28_unexpected: " + e);
+                failed++;
+            }
+        }
+
+        System.out.println(passed + " passed, " + failed + " failed out of " + (passed + failed) + " tests");
         System.exit(failed > 0 ? 1 : 0);
     }
 }
