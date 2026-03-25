@@ -1931,6 +1931,36 @@ function evalCPS(expr, env, k) {
         }
         if (op === "case") {
           if (elems.length < 2) throw errAt("case: bad syntax", epos);
+          if (!callccActive && !exprMayCallCC(elems[1])) {
+            let key = evalCallDirect(elems[1], env);
+            if (key === null) key = runTrampoline(evalCPS(elems[1], env, identityCont));
+            if (!callccActive) {
+              for (let ci = 2; ci < elems.length; ci++) {
+                const clause = elems[ci];
+                if (clause.tag !== "list" || clause.elements.length < 2) throw errAt("case: bad clause", epos);
+                let matched = false;
+                if (clause.elements[0].tag === "symbol" && clause.elements[0].value === "else") {
+                  matched = true;
+                } else {
+                  if (clause.elements[0].tag !== "list") throw errAt("case: expected datum list", epos);
+                  for (const datum of clause.elements[0].elements) {
+                    if (schemeEqv(key, quoteSyntaxToValue(datum))) {
+                      matched = true;
+                      break;
+                    }
+                  }
+                }
+                if (matched) {
+                  for (let bi = 1; bi < clause.elements.length - 1; bi++) {
+                    runTrampoline(evalCPS(clause.elements[bi], env, identityCont));
+                  }
+                  expr = clause.elements[clause.elements.length - 1];
+                  continue tailLoop;
+                }
+              }
+              return k(VOID);
+            }
+          }
           return evalCPS(elems[1], env, (key) => {
             function evalCaseClauses(idx) {
               if (idx >= elems.length) return k(VOID);
@@ -2593,7 +2623,7 @@ function evalStrWithOutput(input) {
   pendingSyntaxRenames = [];
   const env = makeGlobalEnv();
   const result = runTrampoline(evalSeqCPS(exprs, 0, env, (v) => v));
-  return { result: displayVal(result), output: outputBuffer };
+  return { result: displayValUnquoted(result), output: outputBuffer };
 }
 function evalStrWithLimit(input, maxSteps) {
   const tokens = tokenize(input);
