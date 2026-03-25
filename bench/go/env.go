@@ -217,6 +217,10 @@ func makeGlobalEnv() *Env {
 	// Dynamic wind (L19)
 	env.Set("dynamic-wind", &Value{Type: TypeSymbol, StrVal: "builtin:dynamic-wind"})
 
+	// Exceptions (L20)
+	env.Set("raise", &Value{Type: TypeSymbol, StrVal: "builtin:raise"})
+	env.Set("with-exception-handler", &Value{Type: TypeSymbol, StrVal: "builtin:with-exception-handler"})
+
 	return env
 }
 

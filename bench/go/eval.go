@@ -35,6 +35,11 @@ const (
 	KDynWindOut
 	KDynWindTransition
 	KDynWindRestore
+	KExcHandler
+	KGuardHandler
+	KRaiseCallHandler
+	KRaiseGuardEval
+	KGuardTest
 )
 
 type KontFrame struct {
@@ -375,6 +380,36 @@ func cekEval(startExpr *Expr, startEnv *Env, startKont *KontFrame) (*Value, erro
 							Env: env, Line: expr.Line, Col: expr.Col, Next: kont,
 						}
 						expr = expr.Elements[1]
+						isSpecial = true
+
+					case "guard":
+						if len(expr.Elements) < 3 {
+							return nil, fmt.Errorf("%d:%d: 'guard' requires variable and body", expr.Line, expr.Col)
+						}
+						guardSpec := expr.Elements[1]
+						if guardSpec.Type != ExprList || len(guardSpec.Elements) < 1 {
+							return nil, fmt.Errorf("%d:%d: invalid guard specification", expr.Line, expr.Col)
+						}
+						if guardSpec.Elements[0].Type != ExprSymbol {
+							return nil, fmt.Errorf("%d:%d: guard variable must be a symbol", expr.Line, expr.Col)
+						}
+						guardVar := guardSpec.Elements[0].StrVal
+						guardClauses := guardSpec.Elements[1:]
+						guardBody := expr.Elements[2:]
+						guardKont := &KontFrame{
+							Tag:     KGuardHandler,
+							Name:    guardVar,
+							Clauses: guardClauses,
+							Env:     env,
+							Wind:    windStack,
+							Next:    kont,
+						}
+						if len(guardBody) > 1 {
+							kont = &KontFrame{Tag: KBody, Exprs: guardBody[1:], Env: env, Next: guardKont}
+						} else {
+							kont = guardKont
+						}
+						expr = guardBody[0]
 						isSpecial = true
 					}
 
@@ -751,6 +786,50 @@ func cekEval(startExpr *Expr, startEnv *Env, startKont *KontFrame) (*Value, erro
 				windStack = kont.Wind
 				kont = kont.Next
 
+			case KExcHandler:
+				// Thunk completed normally, pass through
+				kont = kont.Next
+
+			case KGuardHandler:
+				// Body completed normally, pass through
+				kont = kont.Next
+
+			case KRaiseCallHandler:
+				handler := kont.Fn
+				raisedVal := kont.Result
+				err := cekApplyFunction(handler, []*Value{raisedVal}, kont.Next, env, 0, 0,
+					&expr, &env, &kont, &val, &evaluating, &windStack)
+				if err != nil {
+					return nil, err
+				}
+
+			case KRaiseGuardEval:
+				guardEnv := NewEnv(kont.Env)
+				guardEnv.Set(kont.Name, kont.Result)
+				clauses := kont.Clauses
+				if len(clauses) == 0 {
+					return nil, fmt.Errorf("unhandled exception: %s", kont.Result.Display())
+				}
+				cekStartGuardClause(clauses[0], clauses[1:], guardEnv, kont.Result, kont.Next,
+					&expr, &env, &kont, &val, &evaluating)
+
+			case KGuardTest:
+				if isTruthy(val) {
+					body := kont.ClauseBody
+					if len(body) == 0 {
+						kont = kont.Next
+					} else {
+						cekEnterBody(body, kont.Env, kont.Next, &expr, &env, &kont, &val, &evaluating)
+					}
+				} else {
+					clauses := kont.Clauses
+					if len(clauses) == 0 {
+						return nil, fmt.Errorf("unhandled exception: %s", kont.Result.Display())
+					}
+					cekStartGuardClause(clauses[0], clauses[1:], kont.Env, kont.Result, kont.Next,
+						&expr, &env, &kont, &val, &evaluating)
+				}
+
 			default:
 				return nil, fmt.Errorf("unknown continuation tag: %d", kont.Tag)
 			}
@@ -969,6 +1048,58 @@ func cekApplyFunction(fn *Value, args []*Value, outerKont *KontFrame, env *Env, 
 				args = nil
 				outerKont = windKont
 				continue
+			case "builtin:raise":
+				if len(args) != 1 {
+					return fmt.Errorf("%d:%d: raise requires exactly 1 argument", line, col)
+				}
+				raisedVal := args[0]
+				// Search continuation stack for exception handler
+				k := outerKont
+				for k != nil {
+					if k.Tag == KExcHandler || k.Tag == KGuardHandler {
+						break
+					}
+					k = k.Next
+				}
+				if k == nil {
+					return fmt.Errorf("unhandled exception: %s", raisedVal.Display())
+				}
+				targetWind := k.Wind
+				currentWind := *windStackP
+				var finalK *KontFrame
+				if k.Tag == KExcHandler {
+					finalK = &KontFrame{
+						Tag: KRaiseCallHandler, Fn: k.Fn,
+						Result: raisedVal, Next: k.Next,
+					}
+				} else {
+					finalK = &KontFrame{
+						Tag: KRaiseGuardEval, Name: k.Name,
+						Clauses: k.Clauses, Env: k.Env,
+						Result: raisedVal, Next: k.Next,
+					}
+				}
+				if currentWind != targetWind {
+					finalK = buildWindTransitionChain(currentWind, targetWind, finalK)
+				}
+				*valP = Void
+				*kontP = finalK
+				*evaluatingP = false
+				return nil
+			case "builtin:with-exception-handler":
+				if len(args) != 2 {
+					return fmt.Errorf("%d:%d: with-exception-handler requires exactly 2 arguments", line, col)
+				}
+				handler := args[0]
+				thunk := args[1]
+				excKont := &KontFrame{
+					Tag: KExcHandler, Fn: handler,
+					Wind: *windStackP, Next: outerKont,
+				}
+				fn = thunk
+				args = nil
+				outerKont = excKont
+				continue
 			case "builtin:apply":
 				if len(args) < 2 {
 					return fmt.Errorf("%d:%d: 'apply' requires at least 2 arguments", line, col)
@@ -1132,6 +1263,58 @@ func windDepth(w *WindEntry) int {
 		w = w.Next
 	}
 	return n
+}
+
+func buildWindTransitionChain(currentWind, targetWind *WindEntry, finalKont *KontFrame) *KontFrame {
+	common := commonWindPrefix(currentWind, targetWind)
+	type windOp struct {
+		thunk   *Value
+		newWind *WindEntry
+	}
+	var ops []windOp
+	for w := currentWind; w != common; w = w.Next {
+		ops = append(ops, windOp{thunk: w.OutThunk, newWind: w.Next})
+	}
+	var rewindEntries []*WindEntry
+	for w := targetWind; w != common; w = w.Next {
+		rewindEntries = append(rewindEntries, w)
+	}
+	for i := len(rewindEntries) - 1; i >= 0; i-- {
+		ops = append(ops, windOp{thunk: rewindEntries[i].InThunk, newWind: rewindEntries[i]})
+	}
+	result := finalKont
+	for i := len(ops) - 1; i >= 0; i-- {
+		result = &KontFrame{
+			Tag:  KDynWindTransition,
+			Vals: []*Value{ops[i].thunk},
+			Wind: ops[i].newWind,
+			Next: result,
+		}
+	}
+	return result
+}
+
+func cekStartGuardClause(clause *Expr, remaining []*Expr, guardEnv *Env, raisedVal *Value, nextKont *KontFrame,
+	exprP **Expr, envP **Env, kontP **KontFrame, valP **Value, evaluatingP *bool) {
+	if clause.Type != ExprList || len(clause.Elements) < 1 {
+		*valP = Void
+		*kontP = nextKont
+		*evaluatingP = false
+		return
+	}
+	isElse := clause.Elements[0].Type == ExprSymbol && clause.Elements[0].StrVal == "else"
+	body := clause.Elements[1:]
+	if isElse {
+		cekEnterBody(body, guardEnv, nextKont, exprP, envP, kontP, valP, evaluatingP)
+		return
+	}
+	*kontP = &KontFrame{
+		Tag: KGuardTest, ClauseBody: body, Clauses: remaining,
+		Env: guardEnv, Result: raisedVal, Next: nextKont,
+	}
+	*exprP = clause.Elements[0]
+	*envP = guardEnv
+	*evaluatingP = true
 }
 
 // ===================== Legacy Call Helpers (for builtins) =====================
