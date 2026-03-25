@@ -87,6 +87,24 @@ public class Evaluator {
         }
     }
 
+    static class RecordType {
+        final String name;
+        final List<String> fieldNames;
+        RecordType(String name, List<String> fieldNames) {
+            this.name = name;
+            this.fieldNames = fieldNames;
+        }
+    }
+
+    static class SchemeRecord {
+        final RecordType type;
+        final Object[] fields;
+        SchemeRecord(RecordType type, Object[] fields) {
+            this.type = type;
+            this.fields = fields;
+        }
+    }
+
     static final Object NIL = new Object() {
         @Override public String toString() { return "()"; }
     };
@@ -114,7 +132,7 @@ public class Evaluator {
 
     private static final java.util.Set<String> SPECIAL_FORMS = java.util.Set.of(
         "quote", "if", "define", "lambda", "and", "or", "let", "set!", "begin", "cond",
-        "define-syntax", "syntax-rules", "else", "let*", "letrec"
+        "define-syntax", "syntax-rules", "else", "let*", "letrec", "define-record-type"
     );
 
     private int gensymCounter = 0;
@@ -582,6 +600,9 @@ public class Evaluator {
                         env.define(macroName, new SyntaxRules(literals, patterns, templates, env));
                         return VOID;
                     }
+                    case "define-record-type" -> {
+                        return evalDefineRecordType(list, env, pos);
+                    }
                 }
             }
 
@@ -604,6 +625,68 @@ public class Evaluator {
             return applyProc(proc, args, pos);
         }
         throw new EvalError("cannot eval: " + expr);
+    }
+
+    private Object evalDefineRecordType(List<?> list, Env env, Pos pos) throws EvalError {
+        // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+        if (list.size() < 4) throw new EvalError("define-record-type requires at least 3 arguments" + posStr(pos));
+        String typeName = unwrap(list.get(1)) instanceof String s ? s : null;
+        if (typeName == null) throw new EvalError("define-record-type: name must be a symbol" + posStr(pos));
+
+        Object ctorSpec = unwrap(list.get(2));
+        if (!(ctorSpec instanceof List<?> ctorList) || ctorList.size() < 1)
+            throw new EvalError("define-record-type: invalid constructor spec" + posStr(pos));
+        String ctorName = unwrap(ctorList.get(0)) instanceof String s ? s : null;
+        if (ctorName == null) throw new EvalError("define-record-type: constructor name must be a symbol" + posStr(pos));
+        List<String> ctorFields = new ArrayList<>();
+        for (int i = 1; i < ctorList.size(); i++) {
+            String f = unwrap(ctorList.get(i)) instanceof String s ? s : null;
+            if (f == null) throw new EvalError("define-record-type: field name must be a symbol" + posStr(pos));
+            ctorFields.add(f);
+        }
+
+        String predName = unwrap(list.get(3)) instanceof String s ? s : null;
+        if (predName == null) throw new EvalError("define-record-type: predicate must be a symbol" + posStr(pos));
+
+        RecordType rt = new RecordType(typeName, ctorFields);
+
+        Map<String, Integer> fieldIndex = new HashMap<>();
+        for (int i = 0; i < ctorFields.size(); i++) {
+            fieldIndex.put(ctorFields.get(i), i);
+        }
+
+        env.define(ctorName, new Builtin(ctorName, args -> {
+            if (args.size() != ctorFields.size())
+                throw new EvalError(ctorName + " requires " + ctorFields.size() + " arguments, got " + args.size());
+            return new SchemeRecord(rt, args.toArray());
+        }));
+
+        env.define(predName, new Builtin(predName, args -> {
+            if (args.size() != 1) throw new EvalError(predName + " requires 1 argument");
+            return args.get(0) instanceof SchemeRecord r && r.type == rt;
+        }));
+
+        for (int i = 4; i < list.size(); i++) {
+            Object fieldSpec = unwrap(list.get(i));
+            if (!(fieldSpec instanceof List<?> fList) || fList.size() < 2)
+                throw new EvalError("define-record-type: invalid field spec" + posStr(pos));
+            String fieldName = unwrap(fList.get(0)) instanceof String s ? s : null;
+            String accessorName = unwrap(fList.get(1)) instanceof String s2 ? s2 : null;
+            if (fieldName == null || accessorName == null)
+                throw new EvalError("define-record-type: field spec names must be symbols" + posStr(pos));
+            Integer idx = fieldIndex.get(fieldName);
+            if (idx == null)
+                throw new EvalError("define-record-type: unknown field " + fieldName + posStr(pos));
+            final int fi = idx;
+            env.define(accessorName, new Builtin(accessorName, args -> {
+                if (args.size() != 1) throw new EvalError(accessorName + " requires 1 argument");
+                if (!(args.get(0) instanceof SchemeRecord r) || r.type != rt)
+                    throw new EvalError(accessorName + ": not a " + typeName);
+                return r.fields[fi];
+            }));
+        }
+
+        return VOID;
     }
 
     boolean isFalse(Object val) {
@@ -848,6 +931,7 @@ public class Evaluator {
                 default -> "#\\" + c.value();
             };
         }
+        if (val instanceof SchemeRecord r) return "#<record " + r.type.name + ">";
         if (val instanceof Builtin b) return "#<procedure " + b.name() + ">";
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof Cons) {
