@@ -30,6 +30,7 @@ const SPECIAL_FORM_NAMES = new Set([
     'do',
 ]);
 let freshIdentifierCounter = 0;
+let activeStepBudget;
 function currentBenchLevel() {
     const rawLevel = globalThis.process?.env?.BENCH_LEVEL;
     if (rawLevel === undefined) {
@@ -108,6 +109,9 @@ class Environment {
 export function evalStr(input) {
     return formatValue(evaluateProgram(input).result);
 }
+export function evalStrWithLimit(input, maxSteps) {
+    return formatValue(evaluateProgram(input, maxSteps).result);
+}
 /**
  * Evaluate Scheme expressions and return both the result string
  * and any captured output from display/write/newline.
@@ -116,7 +120,7 @@ export function evalStrWithOutput(input) {
     const { result, output } = evaluateProgram(input);
     return { result: formatValue(result), output };
 }
-function evaluateProgram(input) {
+function evaluateProgram(input, maxSteps) {
     const expressions = parseProgram(input);
     if (expressions.length === 0) {
         throw new EvalError('empty input', START_POSITION);
@@ -127,8 +131,10 @@ function evaluateProgram(input) {
         exceptionHandlers: undefined,
     };
     const env = createGlobalEnv(context);
-    const result = runEvalStep(evaluateSequenceCps(expressions, env, completeEval));
-    return { result, output: context.output.join('') };
+    return withStepBudget(maxSteps, () => {
+        const result = runEvalStep(evaluateSequenceCps(expressions, env, completeEval));
+        return { result, output: context.output.join('') };
+    });
 }
 function parseProgram(input) {
     const { tokens, eofPosition } = tokenize(input);
@@ -371,6 +377,34 @@ function runEvalStep(step) {
     }
     return current.value;
 }
+function withStepBudget(maxSteps, callback) {
+    if (maxSteps === undefined) {
+        return callback();
+    }
+    const previousBudget = activeStepBudget;
+    activeStepBudget = createStepBudget(maxSteps);
+    try {
+        return callback();
+    }
+    finally {
+        activeStepBudget = previousBudget;
+    }
+}
+function createStepBudget(maxSteps) {
+    if (!Number.isSafeInteger(maxSteps) || maxSteps < 0) {
+        throw new EvalError('invalid step limit', START_POSITION);
+    }
+    return { remaining: maxSteps };
+}
+function consumeEvaluationStep(position) {
+    if (activeStepBudget === undefined) {
+        return;
+    }
+    if (activeStepBudget.remaining <= 0) {
+        throw new EvalError('step limit exceeded', position);
+    }
+    activeStepBudget.remaining -= 1;
+}
 function pushStack(stack, value) {
     return {
         value,
@@ -478,6 +512,7 @@ function raiseException(context, exception, raisePosition) {
 function evaluateCps(expr, env, continuation) {
     return suspendStep(() => {
         try {
+            consumeEvaluationStep(expr.position);
             switch (expr.type) {
                 case 'number':
                 case 'boolean':
@@ -952,6 +987,7 @@ function evaluate(expr, env) {
     let currentEnv = env;
     while (true) {
         try {
+            consumeEvaluationStep(currentExpr.position);
             switch (currentExpr.type) {
                 case 'number':
                 case 'boolean':

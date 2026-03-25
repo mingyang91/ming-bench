@@ -3,6 +3,7 @@
  * representation of the last result.
  */
 export declare function evalStr(input: string): string;
+export declare function evalStrWithLimit(input: string, maxSteps: number): string;
 /**
  * Evaluate Scheme expressions and return both the result string
  * and any captured output from display/write/newline.
