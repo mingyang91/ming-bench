@@ -217,6 +217,157 @@ public class Evaluator {
             s.setChar(idx, ch.value());
             return VOID;
         });
+        // --- Level 9 builtins ---
+
+        // Numeric utilities
+        globalEnv.define("abs", (BuiltinProc) args -> Math.abs(asLong(args.get(0))));
+        globalEnv.define("modulo", (BuiltinProc) args -> {
+            long a = asLong(args.get(0)), b = asLong(args.get(1));
+            return Math.floorMod(a, b);
+        });
+        globalEnv.define("remainder", (BuiltinProc) args -> {
+            long a = asLong(args.get(0)), b = asLong(args.get(1));
+            return a % b;
+        });
+        globalEnv.define("quotient", (BuiltinProc) args -> {
+            long a = asLong(args.get(0)), b = asLong(args.get(1));
+            // Truncate toward zero (Java default for /)
+            return a / b;
+        });
+        globalEnv.define("min", (BuiltinProc) args -> {
+            long result = asLong(args.get(0));
+            for (int i = 1; i < args.size(); i++) result = Math.min(result, asLong(args.get(i)));
+            return result;
+        });
+        globalEnv.define("max", (BuiltinProc) args -> {
+            long result = asLong(args.get(0));
+            for (int i = 1; i < args.size(); i++) result = Math.max(result, asLong(args.get(i)));
+            return result;
+        });
+        globalEnv.define("expt", (BuiltinProc) args -> {
+            long base = asLong(args.get(0)), exp = asLong(args.get(1));
+            long result = 1;
+            for (long i = 0; i < exp; i++) result *= base;
+            return result;
+        });
+        globalEnv.define("zero?", (BuiltinProc) args -> asLong(args.get(0)) == 0);
+        globalEnv.define("positive?", (BuiltinProc) args -> asLong(args.get(0)) > 0);
+        globalEnv.define("negative?", (BuiltinProc) args -> asLong(args.get(0)) < 0);
+        globalEnv.define("odd?", (BuiltinProc) args -> asLong(args.get(0)) % 2 != 0);
+        globalEnv.define("even?", (BuiltinProc) args -> asLong(args.get(0)) % 2 == 0);
+
+        // List utilities
+        globalEnv.define("list?", (BuiltinProc) args -> {
+            Object curr = args.get(0);
+            while (curr instanceof Pair p) curr = p.cdr;
+            return curr == NIL;
+        });
+        globalEnv.define("list-ref", (BuiltinProc) args -> {
+            Object curr = args.get(0);
+            long idx = asLong(args.get(1));
+            for (long i = 0; i < idx; i++) {
+                if (!(curr instanceof Pair p)) throw new EvalError("list-ref: index out of range");
+                curr = p.cdr;
+            }
+            if (!(curr instanceof Pair p)) throw new EvalError("list-ref: index out of range");
+            return p.car;
+        });
+        globalEnv.define("list-tail", (BuiltinProc) args -> {
+            Object curr = args.get(0);
+            long idx = asLong(args.get(1));
+            for (long i = 0; i < idx; i++) {
+                if (!(curr instanceof Pair p)) throw new EvalError("list-tail: index out of range");
+                curr = p.cdr;
+            }
+            return curr;
+        });
+        globalEnv.define("assoc", (BuiltinProc) args -> {
+            Object key = args.get(0);
+            Object alist = args.get(1);
+            while (alist instanceof Pair p) {
+                if (p.car instanceof Pair entry && schemeEqual(key, entry.car)) return entry;
+                alist = p.cdr;
+            }
+            return Boolean.FALSE;
+        });
+
+        // Equality
+        globalEnv.define("eq?", (BuiltinProc) args -> schemeEq(args.get(0), args.get(1)));
+        globalEnv.define("equal?", (BuiltinProc) args -> schemeEqual(args.get(0), args.get(1)));
+
+        // Built-in map (supports multiple lists)
+        globalEnv.define("map", (BuiltinProc) args -> {
+            if (args.size() < 2) throw new EvalError("map: requires at least 2 arguments");
+            Object proc = args.get(0);
+            int numLists = args.size() - 1;
+            // Convert all list args to arrays of Pair cursors
+            Object[] cursors = new Object[numLists];
+            for (int i = 0; i < numLists; i++) cursors[i] = args.get(i + 1);
+            List<Object> results = new ArrayList<>();
+            while (true) {
+                // Check if any list is exhausted
+                boolean done = false;
+                for (Object c : cursors) { if (!(c instanceof Pair)) { done = true; break; } }
+                if (done) break;
+                List<Object> callArgs = new ArrayList<>();
+                for (int i = 0; i < numLists; i++) {
+                    Pair p = (Pair) cursors[i];
+                    callArgs.add(p.car);
+                    cursors[i] = p.cdr;
+                }
+                if (proc instanceof BuiltinProc builtin) {
+                    results.add(builtin.apply(callArgs));
+                } else if (proc instanceof Lambda lambda) {
+                    results.add(applyLambda(lambda, callArgs));
+                } else {
+                    throw new EvalError("map: not a procedure");
+                }
+            }
+            Object result = NIL;
+            for (int i = results.size() - 1; i >= 0; i--) result = new Pair(results.get(i), result);
+            return result;
+        });
+
+        // Character utilities
+        globalEnv.define("char-alphabetic?", (BuiltinProc) args -> {
+            if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char-alphabetic?: expected char");
+            return Character.isLetter(c.value());
+        });
+        globalEnv.define("char-numeric?", (BuiltinProc) args -> {
+            if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char-numeric?: expected char");
+            return Character.isDigit(c.value());
+        });
+        globalEnv.define("char-upcase", (BuiltinProc) args -> {
+            if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char-upcase: expected char");
+            return new SchemeChar(Character.toUpperCase(c.value()));
+        });
+        globalEnv.define("char-downcase", (BuiltinProc) args -> {
+            if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char-downcase: expected char");
+            return new SchemeChar(Character.toLowerCase(c.value()));
+        });
+        globalEnv.define("char=?", (BuiltinProc) args -> {
+            if (!(args.get(0) instanceof SchemeChar a && args.get(1) instanceof SchemeChar b))
+                throw new EvalError("char=?: expected chars");
+            return a.value() == b.value();
+        });
+        globalEnv.define("char<?", (BuiltinProc) args -> {
+            if (!(args.get(0) instanceof SchemeChar a && args.get(1) instanceof SchemeChar b))
+                throw new EvalError("char<?: expected chars");
+            return a.value() < b.value();
+        });
+
+        // String comparison utilities
+        globalEnv.define("string=?", (BuiltinProc) args ->
+                asSchemeString(args.get(0)).value().equals(asSchemeString(args.get(1)).value()));
+        globalEnv.define("string<?", (BuiltinProc) args ->
+                asSchemeString(args.get(0)).value().compareTo(asSchemeString(args.get(1)).value()) < 0);
+        globalEnv.define("string-ci=?", (BuiltinProc) args ->
+                asSchemeString(args.get(0)).value().equalsIgnoreCase(asSchemeString(args.get(1)).value()));
+        globalEnv.define("string-upcase", (BuiltinProc) args ->
+                new SchemeString(asSchemeString(args.get(0)).value().toUpperCase()));
+        globalEnv.define("string-downcase", (BuiltinProc) args ->
+                new SchemeString(asSchemeString(args.get(0)).value().toLowerCase()));
+
         globalEnv.define("apply", (BuiltinProc) args -> {
             if (args.size() < 2) throw new EvalError("apply: requires at least 2 arguments");
             Object proc = args.get(0);
@@ -731,6 +882,27 @@ public class Evaluator {
         return result;
     }
 
+    private boolean schemeEq(Object a, Object b) {
+        if (a == b) return true;
+        if (a instanceof Long && b instanceof Long) return a.equals(b);
+        if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
+        if (a instanceof SchemeChar && b instanceof SchemeChar) return a.equals(b);
+        // Symbols (String) are interned-ish, but use equals for safety
+        if (a instanceof String && b instanceof String) return a.equals(b);
+        return false;
+    }
+
+    private boolean schemeEqual(Object a, Object b) {
+        if (schemeEq(a, b)) return true;
+        if (a instanceof Pair pa && b instanceof Pair pb) {
+            return schemeEqual(pa.car, pb.car) && schemeEqual(pa.cdr, pb.cdr);
+        }
+        if (a instanceof SchemeString sa && b instanceof SchemeString sb) {
+            return sa.value().equals(sb.value());
+        }
+        return false;
+    }
+
     private boolean isFalse(Object val) {
         return Boolean.FALSE.equals(val);
     }
@@ -757,7 +929,14 @@ public class Evaluator {
         if (val instanceof Long l) return l.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
-        if (val instanceof SchemeChar c) return "#\\" + c.value();
+        if (val instanceof SchemeChar c) {
+            return switch (c.value()) {
+                case ' ' -> "#\\space";
+                case '\n' -> "#\\newline";
+                case '\t' -> "#\\tab";
+                default -> "#\\" + c.value();
+            };
+        }
         if (val instanceof String s) return s;
         if (val == NIL) return "()";
         if (val instanceof Pair) {
