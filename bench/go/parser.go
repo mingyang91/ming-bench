@@ -19,6 +19,8 @@ const (
 	tokBool
 	tokSymbol
 	tokChar
+	tokFloat
+	tokRational
 	tokEOF
 )
 
@@ -190,6 +192,26 @@ func tokenize(input string) ([]token, error) {
 				continue
 			}
 
+			// try to parse as float (contains '.')
+			if strings.ContainsRune(text, '.') {
+				if _, err := strconv.ParseFloat(text, 64); err == nil {
+					tokens = append(tokens, token{tokFloat, text, line, startCol})
+					continue
+				}
+			}
+
+			// try to parse as rational (e.g. 1/3, -5/2)
+			if slashIdx := strings.Index(text, "/"); slashIdx > 0 && slashIdx < len(text)-1 {
+				numStr := text[:slashIdx]
+				denStr := text[slashIdx+1:]
+				if _, err := strconv.ParseInt(numStr, 10, 64); err == nil {
+					if _, err := strconv.ParseInt(denStr, 10, 64); err == nil {
+						tokens = append(tokens, token{tokRational, text, line, startCol})
+						continue
+					}
+				}
+			}
+
 			tokens = append(tokens, token{tokSymbol, text, line, startCol})
 			continue
 		}
@@ -255,12 +277,26 @@ type CharExpr struct {
 	Col  int
 }
 
-func (e *NumberExpr) pos() (int, int) { return e.Line, e.Col }
-func (e *StringExpr) pos() (int, int) { return e.Line, e.Col }
-func (e *BoolExpr) pos() (int, int)   { return e.Line, e.Col }
-func (e *SymbolExpr) pos() (int, int) { return e.Line, e.Col }
-func (e *ListExpr) pos() (int, int)   { return e.Line, e.Col }
-func (e *CharExpr) pos() (int, int)   { return e.Line, e.Col }
+type FloatExpr struct {
+	Val  float64
+	Line int
+	Col  int
+}
+
+type RationalExpr struct {
+	Num, Den int64
+	Line     int
+	Col      int
+}
+
+func (e *NumberExpr) pos() (int, int)   { return e.Line, e.Col }
+func (e *StringExpr) pos() (int, int)   { return e.Line, e.Col }
+func (e *BoolExpr) pos() (int, int)     { return e.Line, e.Col }
+func (e *SymbolExpr) pos() (int, int)   { return e.Line, e.Col }
+func (e *ListExpr) pos() (int, int)     { return e.Line, e.Col }
+func (e *CharExpr) pos() (int, int)     { return e.Line, e.Col }
+func (e *FloatExpr) pos() (int, int)    { return e.Line, e.Col }
+func (e *RationalExpr) pos() (int, int) { return e.Line, e.Col }
 
 type parser struct {
 	tokens []token
@@ -313,6 +349,16 @@ func (p *parser) parseExpr() (Expr, error) {
 	case tokChar:
 		p.next()
 		return &CharExpr{Val: rune(t.text[0]), Line: t.line, Col: t.col}, nil
+	case tokFloat:
+		p.next()
+		f, _ := strconv.ParseFloat(t.text, 64)
+		return &FloatExpr{Val: f, Line: t.line, Col: t.col}, nil
+	case tokRational:
+		p.next()
+		slashIdx := strings.Index(t.text, "/")
+		num, _ := strconv.ParseInt(t.text[:slashIdx], 10, 64)
+		den, _ := strconv.ParseInt(t.text[slashIdx+1:], 10, 64)
+		return &RationalExpr{Num: num, Den: den, Line: t.line, Col: t.col}, nil
 	case tokQuote:
 		p.next()
 		inner, err := p.parseExpr()

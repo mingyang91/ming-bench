@@ -56,6 +56,10 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 	switch e := expr.(type) {
 	case *NumberExpr:
 		return &IntVal{Val: e.Val}, nil
+	case *FloatExpr:
+		return &FloatVal{Val: e.Val}, nil
+	case *RationalExpr:
+		return makeRat(e.Num, e.Den), nil
 	case *StringExpr:
 		return &StringVal{Val: e.Val}, nil
 	case *BoolExpr:
@@ -318,6 +322,10 @@ func quoteExpr(expr Expr) (Value, error) {
 	switch e := expr.(type) {
 	case *NumberExpr:
 		return &IntVal{Val: e.Val}, nil
+	case *FloatExpr:
+		return &FloatVal{Val: e.Val}, nil
+	case *RationalExpr:
+		return makeRat(e.Num, e.Den), nil
 	case *StringExpr:
 		return &StringVal{Val: e.Val}, nil
 	case *BoolExpr:
@@ -497,80 +505,17 @@ func evalCond(e *ListExpr, env *Env) (Value, error) {
 func makeGlobalEnv(output *strings.Builder) *Env {
 	env := newEnv(nil)
 
-	env.set("+", &BuiltinFunc{Name: "+", Fn: func(args []Value) (Value, error) {
-		var sum int64
-		for _, a := range args {
-			n, ok := a.(*IntVal)
-			if !ok {
-				return nil, &EvalError{Message: "+: not a number"}
-			}
-			sum += n.Val
-		}
-		return &IntVal{Val: sum}, nil
-	}})
-
-	env.set("-", &BuiltinFunc{Name: "-", Fn: func(args []Value) (Value, error) {
-		if len(args) == 0 {
-			return nil, &EvalError{Message: "-: need at least 1 argument"}
-		}
-		first, ok := args[0].(*IntVal)
-		if !ok {
-			return nil, &EvalError{Message: "-: not a number"}
-		}
-		if len(args) == 1 {
-			return &IntVal{Val: -first.Val}, nil
-		}
-		result := first.Val
-		for _, a := range args[1:] {
-			n, ok := a.(*IntVal)
-			if !ok {
-				return nil, &EvalError{Message: "-: not a number"}
-			}
-			result -= n.Val
-		}
-		return &IntVal{Val: result}, nil
-	}})
-
-	env.set("*", &BuiltinFunc{Name: "*", Fn: func(args []Value) (Value, error) {
-		var product int64 = 1
-		for _, a := range args {
-			n, ok := a.(*IntVal)
-			if !ok {
-				return nil, &EvalError{Message: "*: not a number"}
-			}
-			product *= n.Val
-		}
-		return &IntVal{Val: product}, nil
-	}})
-
-	env.set("/", &BuiltinFunc{Name: "/", Fn: func(args []Value) (Value, error) {
-		if len(args) < 2 {
-			return nil, &EvalError{Message: "/: need at least 2 arguments"}
-		}
-		first, ok := args[0].(*IntVal)
-		if !ok {
-			return nil, &EvalError{Message: "/: not a number"}
-		}
-		result := first.Val
-		for _, a := range args[1:] {
-			n, ok := a.(*IntVal)
-			if !ok {
-				return nil, &EvalError{Message: "/: not a number"}
-			}
-			if n.Val == 0 {
-				return nil, &EvalError{Message: "/: division by zero"}
-			}
-			result /= n.Val
-		}
-		return &IntVal{Val: result}, nil
-	}})
+	env.set("+", &BuiltinFunc{Name: "+", Fn: numericAdd})
+	env.set("-", &BuiltinFunc{Name: "-", Fn: numericSub})
+	env.set("*", &BuiltinFunc{Name: "*", Fn: numericMul})
+	env.set("/", &BuiltinFunc{Name: "/", Fn: numericDiv})
 
 	// Comparisons
-	env.set("<", &BuiltinFunc{Name: "<", Fn: makeCompare("<", func(a, b int64) bool { return a < b })})
-	env.set(">", &BuiltinFunc{Name: ">", Fn: makeCompare(">", func(a, b int64) bool { return a > b })})
-	env.set("=", &BuiltinFunc{Name: "=", Fn: makeCompare("=", func(a, b int64) bool { return a == b })})
-	env.set("<=", &BuiltinFunc{Name: "<=", Fn: makeCompare("<=", func(a, b int64) bool { return a <= b })})
-	env.set(">=", &BuiltinFunc{Name: ">=", Fn: makeCompare(">=", func(a, b int64) bool { return a >= b })})
+	env.set("<", &BuiltinFunc{Name: "<", Fn: makeNumCompare("<", func(a, b float64) bool { return a < b })})
+	env.set(">", &BuiltinFunc{Name: ">", Fn: makeNumCompare(">", func(a, b float64) bool { return a > b })})
+	env.set("=", &BuiltinFunc{Name: "=", Fn: makeNumCompare("=", func(a, b float64) bool { return a == b })})
+	env.set("<=", &BuiltinFunc{Name: "<=", Fn: makeNumCompare("<=", func(a, b float64) bool { return a <= b })})
+	env.set(">=", &BuiltinFunc{Name: ">=", Fn: makeNumCompare(">=", func(a, b float64) bool { return a >= b })})
 
 	// List operations
 	env.set("cons", &BuiltinFunc{Name: "cons", Fn: func(args []Value) (Value, error) {
@@ -794,11 +739,10 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 		if len(args) != 1 {
 			return nil, &EvalError{Message: "number->string: need 1 argument"}
 		}
-		n, ok := args[0].(*IntVal)
-		if !ok {
+		if !isNumber(args[0]) {
 			return nil, &EvalError{Message: "number->string: not a number"}
 		}
-		return &StringVal{Val: strconv.FormatInt(n.Val, 10)}, nil
+		return &StringVal{Val: args[0].String()}, nil
 	}})
 
 	env.set("symbol->string", &BuiltinFunc{Name: "symbol->string", Fn: func(args []Value) (Value, error) {
@@ -890,8 +834,7 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 		if len(args) != 1 {
 			return nil, &EvalError{Message: "number?: need 1 argument"}
 		}
-		_, ok := args[0].(*IntVal)
-		return &BoolVal{Val: ok}, nil
+		return &BoolVal{Val: isNumber(args[0])}, nil
 	}})
 
 	env.set("string?", &BuiltinFunc{Name: "string?", Fn: func(args []Value) (Value, error) {
@@ -1139,6 +1082,98 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 			return nil, &EvalError{Message: "even?: not a number"}
 		}
 		return &BoolVal{Val: n.Val%2 == 0}, nil
+	}})
+
+	// Exact/inexact predicates and conversions (L11)
+	env.set("exact?", &BuiltinFunc{Name: "exact?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "exact?: need 1 argument"}
+		}
+		return &BoolVal{Val: isExact(args[0])}, nil
+	}})
+
+	env.set("inexact?", &BuiltinFunc{Name: "inexact?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "inexact?: need 1 argument"}
+		}
+		_, ok := args[0].(*FloatVal)
+		return &BoolVal{Val: ok}, nil
+	}})
+
+	env.set("integer?", &BuiltinFunc{Name: "integer?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "integer?: need 1 argument"}
+		}
+		switch v := args[0].(type) {
+		case *IntVal:
+			return &BoolVal{Val: true}, nil
+		case *RatVal:
+			// 4/2 simplifies to IntVal, so a RatVal is never an integer
+			_ = v
+			return &BoolVal{Val: false}, nil
+		case *FloatVal:
+			return &BoolVal{Val: v.Val == float64(int64(v.Val))}, nil
+		default:
+			return &BoolVal{Val: false}, nil
+		}
+	}})
+
+	env.set("rational?", &BuiltinFunc{Name: "rational?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "rational?: need 1 argument"}
+		}
+		return &BoolVal{Val: isExact(args[0])}, nil
+	}})
+
+	env.set("exact->inexact", &BuiltinFunc{Name: "exact->inexact", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "exact->inexact: need 1 argument"}
+		}
+		f, ok := toFloat64(args[0])
+		if !ok {
+			return nil, &EvalError{Message: "exact->inexact: not a number"}
+		}
+		return &FloatVal{Val: f}, nil
+	}})
+
+	env.set("inexact->exact", &BuiltinFunc{Name: "inexact->exact", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "inexact->exact: need 1 argument"}
+		}
+		switch v := args[0].(type) {
+		case *IntVal:
+			return v, nil
+		case *RatVal:
+			return v, nil
+		case *FloatVal:
+			// Convert float to exact rational via continued fraction or simple approach
+			// For 0.5 -> 1/2, etc. Use a simple denominator-finding approach.
+			return floatToExact(v.Val), nil
+		default:
+			return nil, &EvalError{Message: "inexact->exact: not a number"}
+		}
+	}})
+
+	env.set("numerator", &BuiltinFunc{Name: "numerator", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "numerator: need 1 argument"}
+		}
+		num, _, ok := toRational(args[0])
+		if !ok {
+			return nil, &EvalError{Message: "numerator: not an exact number"}
+		}
+		return &IntVal{Val: num}, nil
+	}})
+
+	env.set("denominator", &BuiltinFunc{Name: "denominator", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "denominator: need 1 argument"}
+		}
+		_, den, ok := toRational(args[0])
+		if !ok {
+			return nil, &EvalError{Message: "denominator: not an exact number"}
+		}
+		return &IntVal{Val: den}, nil
 	}})
 
 	// List utilities
@@ -1421,21 +1456,176 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 	return env
 }
 
-func makeCompare(name string, op func(int64, int64) bool) func([]Value) (Value, error) {
+// anyInexact returns true if any arg is a FloatVal.
+func anyInexact(args []Value) bool {
+	for _, a := range args {
+		if _, ok := a.(*FloatVal); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func numericAdd(args []Value) (Value, error) {
+	if anyInexact(args) {
+		var sum float64
+		for _, a := range args {
+			f, ok := toFloat64(a)
+			if !ok {
+				return nil, &EvalError{Message: "+: not a number"}
+			}
+			sum += f
+		}
+		return &FloatVal{Val: sum}, nil
+	}
+	// All exact
+	var rn, rd int64 = 0, 1
+	for _, a := range args {
+		an, ad, ok := toRational(a)
+		if !ok {
+			return nil, &EvalError{Message: "+: not a number"}
+		}
+		rn = rn*ad + an*rd
+		rd = rd * ad
+		g := gcd(rn, rd)
+		rn /= g
+		rd /= g
+	}
+	return makeRat(rn, rd), nil
+}
+
+func numericSub(args []Value) (Value, error) {
+	if len(args) == 0 {
+		return nil, &EvalError{Message: "-: need at least 1 argument"}
+	}
+	if len(args) == 1 {
+		switch v := args[0].(type) {
+		case *IntVal:
+			return &IntVal{Val: -v.Val}, nil
+		case *FloatVal:
+			return &FloatVal{Val: -v.Val}, nil
+		case *RatVal:
+			return &RatVal{Num: -v.Num, Den: v.Den}, nil
+		default:
+			return nil, &EvalError{Message: "-: not a number"}
+		}
+	}
+	if anyInexact(args) {
+		f0, ok := toFloat64(args[0])
+		if !ok {
+			return nil, &EvalError{Message: "-: not a number"}
+		}
+		for _, a := range args[1:] {
+			f, ok := toFloat64(a)
+			if !ok {
+				return nil, &EvalError{Message: "-: not a number"}
+			}
+			f0 -= f
+		}
+		return &FloatVal{Val: f0}, nil
+	}
+	rn, rd, ok := toRational(args[0])
+	if !ok {
+		return nil, &EvalError{Message: "-: not a number"}
+	}
+	for _, a := range args[1:] {
+		an, ad, ok := toRational(a)
+		if !ok {
+			return nil, &EvalError{Message: "-: not a number"}
+		}
+		rn = rn*ad - an*rd
+		rd = rd * ad
+		g := gcd(rn, rd)
+		rn /= g
+		rd /= g
+	}
+	return makeRat(rn, rd), nil
+}
+
+func numericMul(args []Value) (Value, error) {
+	if anyInexact(args) {
+		product := 1.0
+		for _, a := range args {
+			f, ok := toFloat64(a)
+			if !ok {
+				return nil, &EvalError{Message: "*: not a number"}
+			}
+			product *= f
+		}
+		return &FloatVal{Val: product}, nil
+	}
+	var rn, rd int64 = 1, 1
+	for _, a := range args {
+		an, ad, ok := toRational(a)
+		if !ok {
+			return nil, &EvalError{Message: "*: not a number"}
+		}
+		rn *= an
+		rd *= ad
+		g := gcd(rn, rd)
+		rn /= g
+		rd /= g
+	}
+	return makeRat(rn, rd), nil
+}
+
+func numericDiv(args []Value) (Value, error) {
+	if len(args) < 2 {
+		return nil, &EvalError{Message: "/: need at least 2 arguments"}
+	}
+	if anyInexact(args) {
+		f0, ok := toFloat64(args[0])
+		if !ok {
+			return nil, &EvalError{Message: "/: not a number"}
+		}
+		for _, a := range args[1:] {
+			f, ok := toFloat64(a)
+			if !ok {
+				return nil, &EvalError{Message: "/: not a number"}
+			}
+			if f == 0 {
+				return nil, &EvalError{Message: "/: division by zero"}
+			}
+			f0 /= f
+		}
+		return &FloatVal{Val: f0}, nil
+	}
+	rn, rd, ok := toRational(args[0])
+	if !ok {
+		return nil, &EvalError{Message: "/: not a number"}
+	}
+	for _, a := range args[1:] {
+		an, ad, ok := toRational(a)
+		if !ok {
+			return nil, &EvalError{Message: "/: not a number"}
+		}
+		if an == 0 {
+			return nil, &EvalError{Message: "/: division by zero"}
+		}
+		rn *= ad
+		rd *= an
+		g := gcd(rn, rd)
+		rn /= g
+		rd /= g
+	}
+	return makeRat(rn, rd), nil
+}
+
+func makeNumCompare(name string, op func(float64, float64) bool) func([]Value) (Value, error) {
 	return func(args []Value) (Value, error) {
 		if len(args) < 2 {
 			return nil, &EvalError{Message: fmt.Sprintf("%s: need at least 2 arguments", name)}
 		}
 		for i := 0; i < len(args)-1; i++ {
-			a, ok := args[i].(*IntVal)
+			a, ok := toFloat64(args[i])
 			if !ok {
 				return nil, &EvalError{Message: fmt.Sprintf("%s: not a number", name)}
 			}
-			b, ok := args[i+1].(*IntVal)
+			b, ok := toFloat64(args[i+1])
 			if !ok {
 				return nil, &EvalError{Message: fmt.Sprintf("%s: not a number", name)}
 			}
-			if !op(a.Val, b.Val) {
+			if !op(a, b) {
 				return &BoolVal{Val: false}, nil
 			}
 		}
@@ -1443,11 +1633,37 @@ func makeCompare(name string, op func(int64, int64) bool) func([]Value) (Value, 
 	}
 }
 
+// floatToExact converts a float64 to an exact rational.
+func floatToExact(f float64) Value {
+	if f == float64(int64(f)) {
+		return &IntVal{Val: int64(f)}
+	}
+	// Use a simple approach: multiply by increasing powers of 10 until we get an integer
+	num := f
+	den := int64(1)
+	for i := 0; i < 15; i++ {
+		if num == float64(int64(num)) {
+			break
+		}
+		num *= 10
+		den *= 10
+	}
+	return makeRat(int64(num), den)
+}
+
 func schemeEq(a, b Value) bool {
 	switch av := a.(type) {
 	case *IntVal:
 		if bv, ok := b.(*IntVal); ok {
 			return av.Val == bv.Val
+		}
+	case *FloatVal:
+		if bv, ok := b.(*FloatVal); ok {
+			return av.Val == bv.Val
+		}
+	case *RatVal:
+		if bv, ok := b.(*RatVal); ok {
+			return av.Num == bv.Num && av.Den == bv.Den
 		}
 	case *BoolVal:
 		if bv, ok := b.(*BoolVal); ok {

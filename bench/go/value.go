@@ -2,6 +2,7 @@ package ming
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -11,6 +12,8 @@ type Value interface {
 }
 
 type IntVal struct{ Val int64 }
+type FloatVal struct{ Val float64 }
+type RatVal struct{ Num, Den int64 } // always simplified, Den > 0
 type BoolVal struct{ Val bool }
 type StringVal struct{ Val string }
 type SymbolVal struct{ Val string }
@@ -33,6 +36,91 @@ func (v *LambdaVal) String() string {
 
 func (v *IntVal) String() string {
 	return fmt.Sprintf("%d", v.Val)
+}
+
+func (v *FloatVal) String() string {
+	s := strconv.FormatFloat(v.Val, 'f', -1, 64)
+	// Ensure there's a decimal point
+	if !strings.ContainsRune(s, '.') {
+		s += ".0"
+	}
+	return s
+}
+
+func (v *RatVal) String() string {
+	return fmt.Sprintf("%d/%d", v.Num, v.Den)
+}
+
+func gcd(a, b int64) int64 {
+	if a < 0 {
+		a = -a
+	}
+	if b < 0 {
+		b = -b
+	}
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+// makeRat creates a simplified rational. Returns IntVal if denominator is 1.
+func makeRat(num, den int64) Value {
+	if den == 0 {
+		panic("rational with zero denominator")
+	}
+	if den < 0 {
+		num, den = -num, -den
+	}
+	g := gcd(num, den)
+	num /= g
+	den /= g
+	if den == 1 {
+		return &IntVal{Val: num}
+	}
+	return &RatVal{Num: num, Den: den}
+}
+
+// isNumber checks if a value is any numeric type.
+func isNumber(v Value) bool {
+	switch v.(type) {
+	case *IntVal, *FloatVal, *RatVal:
+		return true
+	}
+	return false
+}
+
+// toFloat64 converts any number to float64.
+func toFloat64(v Value) (float64, bool) {
+	switch n := v.(type) {
+	case *IntVal:
+		return float64(n.Val), true
+	case *FloatVal:
+		return n.Val, true
+	case *RatVal:
+		return float64(n.Num) / float64(n.Den), true
+	}
+	return 0, false
+}
+
+// toRational converts any exact number to (num, den). Returns false for inexact.
+func toRational(v Value) (int64, int64, bool) {
+	switch n := v.(type) {
+	case *IntVal:
+		return n.Val, 1, true
+	case *RatVal:
+		return n.Num, n.Den, true
+	}
+	return 0, 0, false
+}
+
+// isExact returns true if the value is an exact number.
+func isExact(v Value) bool {
+	switch v.(type) {
+	case *IntVal, *RatVal:
+		return true
+	}
+	return false
 }
 
 func (v *BoolVal) String() string {
