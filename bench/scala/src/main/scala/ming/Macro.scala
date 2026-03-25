@@ -32,11 +32,23 @@ object Macro:
     "syntax-rules",
     "let*",
     "letrec",
+    "letrec*",
     "do",
     "case",
+    "case-lambda",
     "quasiquote",
     "unquote",
-    "unquote-splicing"
+    "unquote-splicing",
+    "guard",
+    "raise",
+    "dynamic-wind",
+    "with-exception-handler",
+    "call-with-values",
+    "values",
+    "define-record-type",
+    "syntax-case",
+    "syntax",
+    "with-syntax"
   )
 
   /** Match a full pattern against an input value (used by syntax-case). */
@@ -74,16 +86,28 @@ object Macro:
             defEnv.lookup(orig).map(v => (fresh, v))
           }.toList
           if defBindings.nonEmpty then
-            val letBindings = defBindings.map { case (name, value) =>
-              SchemeVal.SList(List(SchemeVal.Symbol(name), value))
-            }
-            SchemeVal.SList(
-              List(
-                SchemeVal.Symbol("let"),
-                SchemeVal.SList(letBindings),
-                expanded
+            val isTopLevelDefine = expanded match
+              case SchemeVal.SList(SchemeVal.Symbol("define") :: _)             => true
+              case SchemeVal.SList(SchemeVal.Symbol("define-record-type") :: _) => true
+              case SchemeVal.SList(SchemeVal.Symbol("define-syntax") :: _)      => true
+              case SchemeVal.SList(SchemeVal.Symbol("begin") :: _)              => true
+              case _                                                            => false
+            if isTopLevelDefine then
+              val preDefines = defBindings.map { case (name, value) =>
+                SchemeVal.SList(List(SchemeVal.Symbol("define"), SchemeVal.Symbol(name), value))
+              }
+              SchemeVal.SList(SchemeVal.Symbol("begin") :: preDefines ::: List(expanded))
+            else
+              val letBindings = defBindings.map { case (name, value) =>
+                SchemeVal.SList(List(SchemeVal.Symbol(name), value))
+              }
+              SchemeVal.SList(
+                List(
+                  SchemeVal.Symbol("let"),
+                  SchemeVal.SList(letBindings),
+                  expanded
+                )
               )
-            )
           else expanded
       }
       .getOrElse(throw new EvalError(s"no matching pattern for macro $macroName"))

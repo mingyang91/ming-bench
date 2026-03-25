@@ -41,7 +41,7 @@ object Guard:
       env,
       result =>
         Evaluator.exceptionHandlers = savedHandlers
-        guardK(result)
+        Evaluator.More(() => guardK(result))
     )
 
   /** Evaluate guard cond-like clauses. */

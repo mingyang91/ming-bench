@@ -74,7 +74,10 @@ object Evaluator:
   def apply(proc: SchemeVal, args: List[SchemeVal]): SchemeVal =
     proc match
       case SchemeVal.ContinuationVal(savedState) =>
-        val v                      = if args.isEmpty then SchemeVal.Void else args.head
+        val v =
+          if args.isEmpty then SchemeVal.Void
+          else if args.size == 1 then args.head
+          else SchemeVal.MultipleValues(args)
         val (savedK, savedWinders) = savedState.asInstanceOf[(Cont, List[Winder])]
         val currentWinders         = winders
         throw new ContinuationThrown(DynamicWind.doWindK(currentWinders, savedWinders, () => savedK(v)))
@@ -215,7 +218,10 @@ object Evaluator:
   def applyK(proc: SchemeVal, args: List[SchemeVal], k: Cont): Bounce =
     proc match
       case SchemeVal.ContinuationVal(savedState) =>
-        val v                      = if args.isEmpty then SchemeVal.Void else args.head
+        val v =
+          if args.isEmpty then SchemeVal.Void
+          else if args.size == 1 then args.head
+          else SchemeVal.MultipleValues(args)
         val (savedK, savedWinders) = savedState.asInstanceOf[(Cont, List[Winder])]
         val currentWinders         = winders
         DynamicWind.doWindK(currentWinders, savedWinders, () => savedK(v))
