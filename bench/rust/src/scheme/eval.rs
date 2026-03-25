@@ -1,16 +1,18 @@
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use crate::scheme::EvalError;
 use crate::scheme::parser::{Expr, ExprKind};
-use crate::scheme::value::{Env, LambdaData, Value};
+use crate::scheme::value::{Env, LambdaData, MacroData, Value};
 
 pub struct Evaluator {
     env: Env,
     output: String,
+    gensym_counter: u64,
 }
 
 impl Evaluator {
     pub fn new() -> Self {
-        Evaluator { env: Env::new(), output: String::new() }
+        Evaluator { env: Env::new(), output: String::new(), gensym_counter: 0 }
     }
 
     pub fn eval(&mut self, expr: &Expr) -> Result<Value, EvalError> {
@@ -81,6 +83,7 @@ impl Evaluator {
                 "and" => return self.eval_and(&elems[1..], env),
                 "or" => return self.eval_or(&elems[1..], env),
                 "set!" => return self.eval_set(&elems[1..], env, call_pos),
+                "define-syntax" => return self.eval_define_syntax(&elems[1..], env, call_pos),
                 "string-set!" => return self.eval_string_set(&elems[1..], env, call_pos),
                 "not" => {
                     if elems.len() != 2 {
@@ -92,7 +95,11 @@ impl Evaluator {
                     let val = self.eval_in_env(&elems[1], env)?;
                     return Ok(Value::Boolean(!val.is_truthy()));
                 }
-                _ => {}
+                _ => {
+                    if let Some(Value::Macro(macro_data)) = env.get(name) {
+                        return self.expand_and_eval_macro(&macro_data, elems, env, call_pos);
+                    }
+                }
             }
         }
 
@@ -960,6 +967,214 @@ impl Evaluator {
             _ => Err(EvalError::Type(format!(
                 "{context}: expected number, got {val} at {pos}"
             ))),
+        }
+    }
+
+    // ── Macro support ──────────────────────────────────────────────
+
+    fn gensym(&mut self, base: &str) -> String {
+        self.gensym_counter += 1;
+        format!("__{}_gs{}", base, self.gensym_counter)
+    }
+
+    fn is_special_form(name: &str) -> bool {
+        matches!(name, "define" | "if" | "quote" | "lambda" | "let" | "begin"
+            | "cond" | "and" | "or" | "set!" | "string-set!" | "not"
+            | "define-syntax" | "syntax-rules")
+    }
+
+    fn eval_define_syntax(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<Value, EvalError> {
+        if args.len() != 2 {
+            return Err(EvalError::Arity(format!("define-syntax: expected 2 arguments at {pos}")));
+        }
+        let name = match &args[0].kind {
+            ExprKind::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Parse(format!("define-syntax: expected symbol at {pos}"))),
+        };
+        let macro_data = self.parse_syntax_rules(&args[1], env, pos)?;
+        env.define(name, Value::Macro(Rc::new(macro_data)));
+        Ok(Value::Void)
+    }
+
+    fn parse_syntax_rules(&self, expr: &Expr, env: &Env, pos: &str) -> Result<MacroData, EvalError> {
+        let elems = match &expr.kind {
+            ExprKind::List(e) => e,
+            _ => return Err(EvalError::Parse(format!("define-syntax: expected syntax-rules at {pos}"))),
+        };
+        if elems.is_empty() || !matches!(&elems[0].kind, ExprKind::Symbol(s) if s == "syntax-rules") {
+            return Err(EvalError::Parse(format!("define-syntax: expected syntax-rules at {pos}")));
+        }
+        if elems.len() < 3 {
+            return Err(EvalError::Parse(format!("syntax-rules: need literals and rules at {pos}")));
+        }
+        let literals = match &elems[1].kind {
+            ExprKind::List(lits) => lits.iter().map(|e| match &e.kind {
+                ExprKind::Symbol(s) => Ok(s.clone()),
+                _ => Err(EvalError::Parse(format!("syntax-rules: expected symbol in literals at {pos}"))),
+            }).collect::<Result<Vec<_>, _>>()?,
+            _ => return Err(EvalError::Parse(format!("syntax-rules: expected literals list at {pos}"))),
+        };
+        let mut rules = Vec::new();
+        for rule_expr in &elems[2..] {
+            match &rule_expr.kind {
+                ExprKind::List(pair) if pair.len() == 2 => {
+                    rules.push((pair[0].clone(), pair[1].clone()));
+                }
+                _ => return Err(EvalError::Parse(format!("syntax-rules: expected (pattern template) at {pos}"))),
+            }
+        }
+        Ok(MacroData { literals, rules, def_env: env.clone() })
+    }
+
+    fn expand_and_eval_macro(
+        &mut self,
+        macro_data: &Rc<MacroData>,
+        input: &[Expr],
+        env: &mut Env,
+        pos: &str,
+    ) -> Result<Value, EvalError> {
+        let md = Rc::clone(macro_data);
+        for (pattern, template) in &md.rules {
+            if let Some(bindings) = Self::match_pattern(pattern, input, &md.literals) {
+                let pat_vars: HashSet<String> = bindings.keys().cloned().collect();
+                let mut gensym_map: HashMap<String, String> = HashMap::new();
+                let mut gensym_values: Vec<(String, Value)> = Vec::new();
+                self.build_gensym_map(template, &pat_vars, &md.def_env, &mut gensym_map, &mut gensym_values);
+                let expanded = Self::expand_template(template, &bindings, &gensym_map);
+                let mut eval_env = env.child();
+                for (gs, val) in gensym_values {
+                    eval_env.define(gs, val);
+                }
+                return self.eval_in_env(&expanded, &mut eval_env);
+            }
+        }
+        Err(EvalError::Parse(format!("no matching macro pattern at {pos}")))
+    }
+
+    fn match_pattern(
+        pattern: &Expr,
+        input: &[Expr],
+        literals: &[String],
+    ) -> Option<HashMap<String, Vec<Expr>>> {
+        // pattern is (macro-name p1 p2 ...), input is [macro-name, arg1, arg2, ...]
+        let pat_elems = match &pattern.kind {
+            ExprKind::List(e) => e,
+            _ => return None,
+        };
+        let pat_tail = &pat_elems[1..];
+        let inp_tail = &input[1..];
+        let mut bindings: HashMap<String, Vec<Expr>> = HashMap::new();
+        let mut pi = 0;
+        let mut ii = 0;
+        while pi < pat_tail.len() {
+            let has_ellipsis = pi + 1 < pat_tail.len()
+                && matches!(&pat_tail[pi + 1].kind, ExprKind::Symbol(s) if s == "...");
+            if has_ellipsis {
+                let var = match &pat_tail[pi].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return None,
+                };
+                let remaining_after = pat_tail.len() - pi - 2;
+                let available = inp_tail.len().checked_sub(ii + remaining_after)?;
+                bindings.insert(var, inp_tail[ii..ii + available].to_vec());
+                ii += available;
+                pi += 2;
+            } else {
+                if ii >= inp_tail.len() { return None; }
+                match &pat_tail[pi].kind {
+                    ExprKind::Symbol(s) if literals.contains(s) => {
+                        match &inp_tail[ii].kind {
+                            ExprKind::Symbol(is) if is == s => {}
+                            _ => return None,
+                        }
+                    }
+                    ExprKind::Symbol(s) => {
+                        bindings.insert(s.clone(), vec![inp_tail[ii].clone()]);
+                    }
+                    _ => return None,
+                }
+                pi += 1;
+                ii += 1;
+            }
+        }
+        if ii != inp_tail.len() { return None; }
+        Some(bindings)
+    }
+
+    fn build_gensym_map(
+        &mut self,
+        template: &Expr,
+        pat_vars: &HashSet<String>,
+        def_env: &Env,
+        gensym_map: &mut HashMap<String, String>,
+        gensym_values: &mut Vec<(String, Value)>,
+    ) {
+        match &template.kind {
+            ExprKind::Symbol(s) => {
+                if pat_vars.contains(s) || s == "..." || Self::is_special_form(s)
+                    || Self::is_builtin(s) || gensym_map.contains_key(s)
+                {
+                    return;
+                }
+                if let Some(val) = def_env.get(s) {
+                    if matches!(val, Value::Macro(_)) { return; }
+                    let gs = self.gensym(s);
+                    gensym_values.push((gs.clone(), val));
+                    gensym_map.insert(s.clone(), gs);
+                } else {
+                    let gs = self.gensym(s);
+                    gensym_map.insert(s.clone(), gs);
+                }
+            }
+            ExprKind::List(elems) => {
+                for e in elems {
+                    self.build_gensym_map(e, pat_vars, def_env, gensym_map, gensym_values);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn expand_template(
+        template: &Expr,
+        bindings: &HashMap<String, Vec<Expr>>,
+        gensym_map: &HashMap<String, String>,
+    ) -> Expr {
+        match &template.kind {
+            ExprKind::Symbol(s) => {
+                if let Some(exprs) = bindings.get(s) {
+                    if exprs.len() == 1 {
+                        return exprs[0].clone();
+                    }
+                }
+                if let Some(gs) = gensym_map.get(s) {
+                    return Expr { kind: ExprKind::Symbol(gs.clone()), line: 0, col: 0 };
+                }
+                template.clone()
+            }
+            ExprKind::List(elems) => {
+                let mut expanded = Vec::new();
+                let mut i = 0;
+                while i < elems.len() {
+                    let has_ellipsis = i + 1 < elems.len()
+                        && matches!(&elems[i + 1].kind, ExprKind::Symbol(s) if s == "...");
+                    if has_ellipsis {
+                        if let ExprKind::Symbol(s) = &elems[i].kind {
+                            if let Some(exprs) = bindings.get(s) {
+                                for e in exprs {
+                                    expanded.push(e.clone());
+                                }
+                            }
+                        }
+                        i += 2;
+                    } else {
+                        expanded.push(Self::expand_template(&elems[i], bindings, gensym_map));
+                        i += 1;
+                    }
+                }
+                Expr { kind: ExprKind::List(expanded), line: template.line, col: template.col }
+            }
+            _ => template.clone(),
         }
     }
 }

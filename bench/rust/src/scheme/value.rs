@@ -14,6 +14,13 @@ pub struct LambdaData {
 }
 
 #[derive(Debug, Clone)]
+pub struct MacroData {
+    pub literals: Vec<String>,
+    pub rules: Vec<(crate::scheme::parser::Expr, crate::scheme::parser::Expr)>,
+    pub def_env: Env,
+}
+
+#[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
     Boolean(bool),
@@ -23,6 +30,7 @@ pub enum Value {
     List(Vec<Value>),
     Pair(Box<Value>, Box<Value>),
     Lambda(Rc<LambdaData>),
+    Macro(Rc<MacroData>),
     Void,
 }
 
@@ -36,6 +44,7 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
+            (Value::Macro(_), Value::Macro(_)) => false,
             (Value::Void, Value::Void) => true,
             _ => false,
         }
@@ -116,6 +125,7 @@ impl Value {
             }
             Value::Pair(a, b) => format!("({} . {})", a.to_display_string(), b.to_display_string()),
             Value::Lambda(_) => "#<procedure>".into(),
+            Value::Macro(_) => "#<macro>".into(),
             Value::Void => "".into(),
         }
     }
