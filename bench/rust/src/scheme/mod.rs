@@ -20,6 +20,7 @@ enum AstKind {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
     Symbol(String),
     List(Vec<Ast>),
 }
@@ -79,6 +80,17 @@ impl Environment {
     fn set(&mut self, name: String, val: Value) {
         self.bindings.insert(name, val);
     }
+
+    fn set_existing(&mut self, name: &str, val: Value) -> bool {
+        if self.bindings.contains_key(name) {
+            self.bindings.insert(name.to_string(), val);
+            true
+        } else if let Some(ref parent) = self.parent {
+            parent.borrow_mut().set_existing(name, val)
+        } else {
+            false
+        }
+    }
 }
 
 impl Value {
@@ -135,6 +147,7 @@ fn ast_to_value(ast: &Ast) -> Value {
         AstKind::Integer(n) => Value::Integer(*n),
         AstKind::Boolean(b) => Value::Boolean(*b),
         AstKind::Str(s) => Value::Str(s.clone()),
+        AstKind::Char(c) => Value::Char(*c),
         AstKind::Symbol(s) => Value::Symbol(s.clone()),
         AstKind::List(items) => Value::List(items.iter().map(ast_to_value).collect()),
     }
@@ -269,6 +282,36 @@ impl Parser {
                     Err(EvalError::Parse("invalid boolean literal".into()))
                 }
             }
+            Some('\\') => {
+                // Character literal: #\x, #\space, #\newline, etc.
+                match self.next_char() {
+                    None => Err(EvalError::Parse("unexpected end of character literal".into())),
+                    Some(c) => {
+                        // Check for named characters
+                        let mut name = String::new();
+                        name.push(c);
+                        while let Some(nc) = self.peek() {
+                            if nc.is_alphabetic() {
+                                name.push(nc);
+                                self.next_char();
+                            } else {
+                                break;
+                            }
+                        }
+                        let ch = if name.len() == 1 {
+                            name.chars().next().expect("single-char name is non-empty")
+                        } else {
+                            match name.as_str() {
+                                "space" => ' ',
+                                "newline" => '\n',
+                                "tab" => '\t',
+                                _ => return Err(EvalError::Parse(format!("unknown character name: {}", name))),
+                            }
+                        };
+                        Ok(Ast { kind: AstKind::Char(ch), line, col })
+                    }
+                }
+            }
             _ => Err(EvalError::Parse("invalid hash literal".into())),
         }
     }
@@ -322,6 +365,7 @@ fn eval_inner(ast: &Ast, env: &Env, output: &mut String) -> Result<Value, EvalEr
         AstKind::Integer(n) => Ok(Value::Integer(*n)),
         AstKind::Boolean(b) => Ok(Value::Boolean(*b)),
         AstKind::Str(s) => Ok(Value::Str(s.clone())),
+        AstKind::Char(c) => Ok(Value::Char(*c)),
         AstKind::Symbol(name) => {
             env.borrow().get(name).ok_or_else(|| EvalError::UnboundVariable(name.clone()))
         }
@@ -362,6 +406,35 @@ fn eval_inner(ast: &Ast, env: &Env, output: &mut String) -> Result<Value, EvalEr
                             }
                         }
                         return Ok(result);
+                    }
+                    "string-set!" => {
+                        if items.len() != 4 {
+                            return Err(EvalError::Arity("string-set! requires 3 arguments".into()));
+                        }
+                        let var_name = match &items[1].kind {
+                            AstKind::Symbol(name) => name.clone(),
+                            _ => return Err(EvalError::Type("string-set!: first argument must be a variable".into())),
+                        };
+                        let idx = eval(&items[2], env, output)?.as_integer()? as usize;
+                        let ch = match eval(&items[3], env, output)? {
+                            Value::Char(c) => c,
+                            _ => return Err(EvalError::Type("string-set!: third argument must be a char".into())),
+                        };
+                        let s = env.borrow().get(&var_name)
+                            .ok_or_else(|| EvalError::UnboundVariable(var_name.clone()))?;
+                        match s {
+                            Value::Str(st) => {
+                                let mut chars: Vec<char> = st.chars().collect();
+                                if idx >= chars.len() {
+                                    return Err(EvalError::Type("string-set!: index out of bounds".into()));
+                                }
+                                chars[idx] = ch;
+                                let new_str: String = chars.into_iter().collect();
+                                env.borrow_mut().set_existing(&var_name, Value::Str(new_str));
+                                return Ok(Value::Void);
+                            }
+                            _ => return Err(EvalError::Type("string-set!: first argument must be a string".into())),
+                        }
                     }
                     "or" => {
                         if items.len() == 1 {
@@ -423,7 +496,7 @@ fn eval_define(args: &[Ast], env: &Env, output: &mut String) -> Result<Value, Ev
             env.borrow_mut().set(name, lambda);
             Ok(Value::Void)
         }
-        AstKind::Integer(_) | AstKind::Boolean(_) | AstKind::Str(_) => {
+        AstKind::Integer(_) | AstKind::Boolean(_) | AstKind::Str(_) | AstKind::Char(_) => {
             Err(EvalError::Type("define: expected symbol or list".into()))
         }
     }
@@ -796,6 +869,14 @@ fn builtin_string_ref(args: &[Value], _output: &mut String) -> Result<Value, Eva
     })?))
 }
 
+fn builtin_string_copy(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("string-copy requires 1 argument".into())); }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::Str(s.clone())),
+        _ => Err(EvalError::Type("string-copy: expected string".into())),
+    }
+}
+
 fn builtin_is_char(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("char? requires 1 argument".into())); }
     Ok(Value::Boolean(matches!(args[0], Value::Char(_))))
@@ -865,6 +946,7 @@ fn make_global_env() -> Env {
         e.set("symbol->string".into(), Value::Builtin(builtin_symbol_to_string));
         e.set("string->symbol".into(), Value::Builtin(builtin_string_to_symbol));
         e.set("string-ref".into(), Value::Builtin(builtin_string_ref));
+        e.set("string-copy".into(), Value::Builtin(builtin_string_copy));
     }
     env
 }
