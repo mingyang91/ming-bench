@@ -9,6 +9,7 @@ import ming.Evaluator.Env;
 import ming.Evaluator.SchemeChar;
 import ming.Evaluator.SchemeRational;
 import ming.Evaluator.SchemeString;
+import ming.Evaluator.SchemeVector;
 
 import static ming.Evaluator.NIL;
 import static ming.Evaluator.VOID;
@@ -40,6 +41,7 @@ final class Builtins {
         registerChars();
         registerStringComparison();
         registerRationals();
+        registerVectors();
     }
 
     // --- Numeric tower helpers ---
@@ -292,6 +294,10 @@ final class Builtins {
             if (a instanceof String sa && b instanceof String sb) return sa.equals(sb);
             return a == b;
         });
+        define("eqv?", args -> {
+            requireArgCount(args, 2, "eqv?");
+            return evaluator.schemeEqv(args.get(0), args.get(1));
+        });
         define("equal?", args -> {
             requireArgCount(args, 2, "equal?");
             return schemeEqual(args.get(0), args.get(1));
@@ -341,6 +347,7 @@ final class Builtins {
         define("pair?", args -> { requireArgCount(args, 1, "pair?"); return args.get(0) instanceof Cons; });
         define("symbol?", args -> { requireArgCount(args, 1, "symbol?"); return args.get(0) instanceof String; });
         define("char?", args -> { requireArgCount(args, 1, "char?"); return args.get(0) instanceof SchemeChar; });
+        define("vector?", args -> { requireArgCount(args, 1, "vector?"); return args.get(0) instanceof SchemeVector; });
         define("procedure?", args -> { requireArgCount(args, 1, "procedure?"); Object a = args.get(0); return a instanceof Evaluator.Lambda || a instanceof Evaluator.CaseLambda || a instanceof Evaluator.Builtin; });
     }
 
@@ -624,6 +631,58 @@ final class Builtins {
         define("rational?", args -> {
             requireArgCount(args, 1, "rational?");
             return isExact(args.get(0));
+        });
+    }
+
+    // --- Vectors (L14) ---
+
+    private void registerVectors() {
+        define("vector", args -> {
+            return new SchemeVector(args.toArray());
+        });
+        define("make-vector", args -> {
+            if (args.size() < 1 || args.size() > 2) throw new EvalError("make-vector requires 1 or 2 arguments");
+            int len = (int) requireLong(args.get(0));
+            Object fill = args.size() >= 2 ? args.get(1) : 0L;
+            Object[] data = new Object[len];
+            java.util.Arrays.fill(data, fill);
+            return new SchemeVector(data);
+        });
+        define("vector-ref", args -> {
+            requireArgCount(args, 2, "vector-ref");
+            if (!(args.get(0) instanceof SchemeVector v)) throw new EvalError("vector-ref: not a vector");
+            int idx = (int) requireLong(args.get(1));
+            if (idx < 0 || idx >= v.length()) throw new EvalError("vector-ref: index out of range");
+            return v.ref(idx);
+        });
+        define("vector-set!", args -> {
+            requireArgCount(args, 3, "vector-set!");
+            if (!(args.get(0) instanceof SchemeVector v)) throw new EvalError("vector-set!: not a vector");
+            int idx = (int) requireLong(args.get(1));
+            if (idx < 0 || idx >= v.length()) throw new EvalError("vector-set!: index out of range");
+            v.set(idx, args.get(2));
+            return VOID;
+        });
+        define("vector-length", args -> {
+            requireArgCount(args, 1, "vector-length");
+            if (!(args.get(0) instanceof SchemeVector v)) throw new EvalError("vector-length: not a vector");
+            return (long) v.length();
+        });
+        define("vector->list", args -> {
+            requireArgCount(args, 1, "vector->list");
+            if (!(args.get(0) instanceof SchemeVector v)) throw new EvalError("vector->list: not a vector");
+            Object result = NIL;
+            for (int i = v.length() - 1; i >= 0; i--) {
+                result = new Cons(v.data[i], result);
+            }
+            return result;
+        });
+        define("list->vector", args -> {
+            requireArgCount(args, 1, "list->vector");
+            List<Object> elems = new ArrayList<>();
+            Object cur = args.get(0);
+            while (cur instanceof Cons c) { elems.add(c.car); cur = c.cdr; }
+            return new SchemeVector(elems.toArray());
         });
     }
 }

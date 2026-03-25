@@ -107,6 +107,14 @@ public class Evaluator {
         }
     }
 
+    static class SchemeVector {
+        final Object[] data;
+        SchemeVector(Object[] data) { this.data = data; }
+        int length() { return data.length; }
+        Object ref(int i) { return data[i]; }
+        void set(int i, Object v) { data[i] = v; }
+    }
+
     static final Object NIL = new Object() {
         @Override public String toString() { return "()"; }
     };
@@ -134,7 +142,8 @@ public class Evaluator {
 
     private static final java.util.Set<String> SPECIAL_FORMS = java.util.Set.of(
         "quote", "if", "define", "lambda", "and", "or", "let", "set!", "begin", "cond",
-        "define-syntax", "syntax-rules", "else", "let*", "letrec", "define-record-type", "case-lambda"
+        "define-syntax", "syntax-rules", "else", "let*", "letrec", "letrec*", "case",
+        "do", "define-record-type", "case-lambda"
     );
 
     private int gensymCounter = 0;
@@ -389,7 +398,8 @@ public class Evaluator {
         Object raw = unwrap(expr);
         Pos pos = posOf(expr);
 
-        if (raw instanceof Long || raw instanceof Boolean || raw instanceof SchemeString || raw instanceof SchemeChar || raw instanceof SchemeRational || raw instanceof Double) {
+        if (raw instanceof Long || raw instanceof Boolean || raw instanceof SchemeString
+                || raw instanceof SchemeChar || raw instanceof SchemeRational || raw instanceof Double) {
             return raw;
         }
         if (raw instanceof String sym) {
@@ -400,9 +410,7 @@ public class Evaluator {
             }
         }
         if (raw instanceof List<?> list) {
-            if (list.isEmpty()) {
-                throw new EvalError("empty application" + posStr(pos));
-            }
+            if (list.isEmpty()) throw new EvalError("empty application" + posStr(pos));
             Object headExpr = list.get(0);
             Object head = unwrap(headExpr);
 
@@ -416,62 +424,9 @@ public class Evaluator {
                         if (list.size() < 3 || list.size() > 4)
                             throw new EvalError("if requires 2 or 3 arguments" + posStr(pos));
                         Object cond = eval(list.get(1), env);
-                        if (!isFalse(cond)) {
-                            return eval(list.get(2), env);
-                        } else if (list.size() == 4) {
-                            return eval(list.get(3), env);
-                        }
+                        if (!isFalse(cond)) return eval(list.get(2), env);
+                        if (list.size() == 4) return eval(list.get(3), env);
                         return VOID;
-                    }
-                    case "define" -> {
-                        if (list.size() < 3) throw new EvalError("define requires at least 2 arguments" + posStr(pos));
-                        Object target = unwrap(list.get(1));
-                        if (target instanceof String name) {
-                            Object val = eval(list.get(2), env);
-                            env.define(name, val);
-                            return VOID;
-                        } else if (target instanceof List<?> sig) {
-                            if (sig.isEmpty() || !(unwrap(sig.get(0)) instanceof String name))
-                                throw new EvalError("invalid define" + posStr(pos));
-                            List<String> params = new ArrayList<>();
-                            String restParam = null;
-                            for (int i = 1; i < sig.size(); i++) {
-                                String p = unwrap(sig.get(i)) instanceof String s ? s : null;
-                                if (p == null) throw new EvalError("parameter must be a symbol" + posStr(pos));
-                                if (".".equals(p)) {
-                                    if (i + 1 >= sig.size()) throw new EvalError("missing rest parameter after ." + posStr(pos));
-                                    restParam = unwrap(sig.get(i + 1)) instanceof String rp ? rp : null;
-                                    if (restParam == null) throw new EvalError("rest parameter must be a symbol" + posStr(pos));
-                                    break;
-                                }
-                                params.add(p);
-                            }
-                            List<Object> body = new ArrayList<>(list.subList(2, list.size()));
-                            env.define(name, new Lambda(params, restParam, body, env));
-                            return VOID;
-                        }
-                        throw new EvalError("invalid define" + posStr(pos));
-                    }
-                    case "lambda" -> {
-                        if (list.size() < 3) throw new EvalError("lambda requires params and body" + posStr(pos));
-                        Object paramSpec = unwrap(list.get(1));
-                        if (!(paramSpec instanceof List<?> paramList))
-                            throw new EvalError("lambda params must be a list" + posStr(pos));
-                        List<String> params = new ArrayList<>();
-                        String restParam = null;
-                        for (int pi = 0; pi < paramList.size(); pi++) {
-                            String s = unwrap(paramList.get(pi)) instanceof String str ? str : null;
-                            if (s == null) throw new EvalError("parameter must be a symbol" + posStr(pos));
-                            if (".".equals(s)) {
-                                if (pi + 1 >= paramList.size()) throw new EvalError("missing rest parameter after ." + posStr(pos));
-                                restParam = unwrap(paramList.get(pi + 1)) instanceof String rp ? rp : null;
-                                if (restParam == null) throw new EvalError("rest parameter must be a symbol" + posStr(pos));
-                                break;
-                            }
-                            params.add(s);
-                        }
-                        List<Object> body = new ArrayList<>(list.subList(2, list.size()));
-                        return new Lambda(params, restParam, body, env);
                     }
                     case "and" -> {
                         Object result = Boolean.TRUE;
@@ -489,149 +444,26 @@ public class Evaluator {
                         }
                         return result;
                     }
-                    case "let" -> {
-                        if (list.size() < 3) throw new EvalError("let requires bindings and body" + posStr(pos));
-                        Object second = unwrap(list.get(1));
-                        if (second instanceof String loopName) {
-                            if (list.size() < 4) throw new EvalError("named let requires bindings and body" + posStr(pos));
-                            Object bindingsRaw = unwrap(list.get(2));
-                            if (!(bindingsRaw instanceof List<?> bindings))
-                                throw new EvalError("let bindings must be a list" + posStr(pos));
-                            List<String> params = new ArrayList<>();
-                            List<Object> inits = new ArrayList<>();
-                            for (Object b : bindings) {
-                                Object bRaw = unwrap(b);
-                                if (!(bRaw instanceof List<?> binding) || binding.size() != 2)
-                                    throw new EvalError("invalid let binding" + posStr(pos));
-                                if (!(unwrap(binding.get(0)) instanceof String pname))
-                                    throw new EvalError("let binding name must be a symbol" + posStr(pos));
-                                params.add(pname);
-                                inits.add(eval(binding.get(1), env));
-                            }
-                            List<Object> body = new ArrayList<>(list.subList(3, list.size()));
-                            Env letEnv = new Env(env);
-                            Lambda loopFn = new Lambda(params, null, body, letEnv);
-                            letEnv.define(loopName, loopFn);
-                            return applyProc(loopFn, inits, pos);
-                        }
-                        if (!(second instanceof List<?> bindings))
-                            throw new EvalError("let bindings must be a list" + posStr(pos));
-                        Env letEnv = new Env(env);
-                        for (Object b : bindings) {
-                            Object bRaw = unwrap(b);
-                            if (!(bRaw instanceof List<?> binding) || binding.size() != 2)
-                                throw new EvalError("invalid let binding" + posStr(pos));
-                            if (!(unwrap(binding.get(0)) instanceof String name))
-                                throw new EvalError("let binding name must be a symbol" + posStr(pos));
-                            letEnv.define(name, eval(binding.get(1), env));
-                        }
-                        Object result = VOID;
-                        for (int i = 2; i < list.size(); i++) {
-                            result = eval(list.get(i), letEnv);
-                        }
-                        return result;
-                    }
                     case "set!" -> {
                         if (list.size() != 3) throw new EvalError("set! requires 2 arguments" + posStr(pos));
                         Object nameRaw = unwrap(list.get(1));
                         if (!(nameRaw instanceof String name))
                             throw new EvalError("set!: first argument must be a symbol" + posStr(pos));
-                        Object val = eval(list.get(2), env);
-                        env.set(name, val);
+                        env.set(name, eval(list.get(2), env));
                         return VOID;
                     }
-                    case "begin" -> {
-                        Object result = VOID;
-                        for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
-                        }
-                        return result;
-                    }
-                    case "cond" -> {
-                        for (int i = 1; i < list.size(); i++) {
-                            Object clauseRaw = unwrap(list.get(i));
-                            if (!(clauseRaw instanceof List<?> clause) || clause.isEmpty())
-                                throw new EvalError("invalid cond clause" + posStr(pos));
-                            if ("else".equals(unwrap(clause.get(0)))) {
-                                Object result = VOID;
-                                for (int j = 1; j < clause.size(); j++) {
-                                    result = eval(clause.get(j), env);
-                                }
-                                return result;
-                            }
-                            Object test = eval(clause.get(0), env);
-                            if (!isFalse(test)) {
-                                Object result = test;
-                                for (int j = 1; j < clause.size(); j++) {
-                                    result = eval(clause.get(j), env);
-                                }
-                                return result;
-                            }
-                        }
-                        return VOID;
-                    }
-                    case "define-syntax" -> {
-                        if (list.size() != 3) throw new EvalError("define-syntax requires 2 arguments" + posStr(pos));
-                        Object nameRaw = unwrap(list.get(1));
-                        if (!(nameRaw instanceof String macroName))
-                            throw new EvalError("define-syntax: name must be a symbol" + posStr(pos));
-                        Object rulesExpr = unwrap(list.get(2));
-                        if (!(rulesExpr instanceof List<?> rulesList) || rulesList.size() < 2 || !"syntax-rules".equals(unwrap(rulesList.get(0))))
-                            throw new EvalError("define-syntax: expected syntax-rules" + posStr(pos));
-                        Object literalsExpr = unwrap(rulesList.get(1));
-                        List<String> literals = new ArrayList<>();
-                        if (literalsExpr instanceof List<?> litList) {
-                            for (Object lit : litList) {
-                                if (unwrap(lit) instanceof String s) literals.add(s);
-                            }
-                        }
-                        List<List<Object>> patterns = new ArrayList<>();
-                        List<Object> templates = new ArrayList<>();
-                        for (int i = 2; i < rulesList.size(); i++) {
-                            Object rule = unwrap(rulesList.get(i));
-                            if (!(rule instanceof List<?> rulePair) || rulePair.size() != 2)
-                                throw new EvalError("syntax-rules: each rule must be (pattern template)" + posStr(pos));
-                            Object pat = unwrap(rulePair.get(0));
-                            if (!(pat instanceof List<?> patList))
-                                throw new EvalError("syntax-rules: pattern must be a list" + posStr(pos));
-                            @SuppressWarnings("unchecked")
-                            List<Object> patObjList = (List<Object>) patList;
-                            patterns.add(patObjList);
-                            templates.add(rulePair.get(1));
-                        }
-                        env.define(macroName, new SyntaxRules(literals, patterns, templates, env));
-                        return VOID;
-                    }
-                    case "define-record-type" -> {
-                        return evalDefineRecordType(list, env, pos);
-                    }
-                    case "case-lambda" -> {
-                        List<Lambda> clauses = new ArrayList<>();
-                        for (int i = 1; i < list.size(); i++) {
-                            Object clauseRaw = unwrap(list.get(i));
-                            if (!(clauseRaw instanceof List<?> clause) || clause.size() < 2)
-                                throw new EvalError("case-lambda: invalid clause" + posStr(pos));
-                            Object paramSpec = unwrap(clause.get(0));
-                            if (!(paramSpec instanceof List<?> paramList))
-                                throw new EvalError("case-lambda: params must be a list" + posStr(pos));
-                            List<String> params = new ArrayList<>();
-                            String restParam = null;
-                            for (int pi = 0; pi < paramList.size(); pi++) {
-                                String s = unwrap(paramList.get(pi)) instanceof String str ? str : null;
-                                if (s == null) throw new EvalError("parameter must be a symbol" + posStr(pos));
-                                if (".".equals(s)) {
-                                    if (pi + 1 >= paramList.size()) throw new EvalError("missing rest parameter after ." + posStr(pos));
-                                    restParam = unwrap(paramList.get(pi + 1)) instanceof String rp ? rp : null;
-                                    if (restParam == null) throw new EvalError("rest parameter must be a symbol" + posStr(pos));
-                                    break;
-                                }
-                                params.add(s);
-                            }
-                            List<Object> body = new ArrayList<>(clause.subList(1, clause.size()));
-                            clauses.add(new Lambda(params, restParam, body, env));
-                        }
-                        return new CaseLambda(clauses);
-                    }
+                    case "begin" -> { return evalBody(list, 1, env); }
+                    case "define" -> { return evalDefine(list, env, pos); }
+                    case "lambda" -> { return evalLambda(list, env, pos); }
+                    case "let" -> { return evalLet(list, env, pos); }
+                    case "cond" -> { return evalCond(list, env, pos); }
+                    case "define-syntax" -> { return evalDefineSyntax(list, env, pos); }
+                    case "define-record-type" -> { return evalDefineRecordType(list, env, pos); }
+                    case "case-lambda" -> { return evalCaseLambda(list, env, pos); }
+                    case "letrec" -> { return evalLetrec(list, env, pos); }
+                    case "letrec*" -> { return evalLetrecStar(list, env, pos); }
+                    case "case" -> { return evalCase(list, env, pos); }
+                    case "do" -> { return evalDo(list, env, pos); }
                 }
             }
 
@@ -654,6 +486,310 @@ public class Evaluator {
             return applyProc(proc, args, pos);
         }
         throw new EvalError("cannot eval: " + expr);
+    }
+
+    private Object evalDefine(List<?> list, Env env, Pos pos) throws EvalError {
+        if (list.size() < 3) throw new EvalError("define requires at least 2 arguments" + posStr(pos));
+        Object target = unwrap(list.get(1));
+        if (target instanceof String name) {
+            Object val = eval(list.get(2), env);
+            env.define(name, val);
+            return VOID;
+        }
+        if (target instanceof List<?> sig) {
+            if (sig.isEmpty() || !(unwrap(sig.get(0)) instanceof String name))
+                throw new EvalError("invalid define" + posStr(pos));
+            List<String> params = new ArrayList<>();
+            String restParam = parseParamList(sig, 1, pos);
+            for (int i = 1; i < sig.size(); i++) {
+                String p = unwrap(sig.get(i)) instanceof String s ? s : null;
+                if (p == null) throw new EvalError("parameter must be a symbol" + posStr(pos));
+                if (".".equals(p)) break;
+                params.add(p);
+            }
+            List<Object> body = new ArrayList<>(list.subList(2, list.size()));
+            env.define(name, new Lambda(params, restParam, body, env));
+            return VOID;
+        }
+        throw new EvalError("invalid define" + posStr(pos));
+    }
+
+    private Object evalLambda(List<?> list, Env env, Pos pos) throws EvalError {
+        if (list.size() < 3) throw new EvalError("lambda requires params and body" + posStr(pos));
+        Object paramSpec = unwrap(list.get(1));
+        if (!(paramSpec instanceof List<?> paramList))
+            throw new EvalError("lambda params must be a list" + posStr(pos));
+        List<String> params = new ArrayList<>();
+        String restParam = parseParamList(paramList, 0, pos);
+        for (int pi = 0; pi < paramList.size(); pi++) {
+            String s = unwrap(paramList.get(pi)) instanceof String str ? str : null;
+            if (s == null) throw new EvalError("parameter must be a symbol" + posStr(pos));
+            if (".".equals(s)) break;
+            params.add(s);
+        }
+        List<Object> body = new ArrayList<>(list.subList(2, list.size()));
+        return new Lambda(params, restParam, body, env);
+    }
+
+    /** Parses a param list starting at index start, returning the rest param name or null. */
+    private String parseParamList(List<?> paramList, int start, Pos pos) throws EvalError {
+        for (int i = start; i < paramList.size(); i++) {
+            String s = unwrap(paramList.get(i)) instanceof String str ? str : null;
+            if (s == null) throw new EvalError("parameter must be a symbol" + posStr(pos));
+            if (".".equals(s)) {
+                if (i + 1 >= paramList.size()) throw new EvalError("missing rest parameter after ." + posStr(pos));
+                String rp = unwrap(paramList.get(i + 1)) instanceof String r ? r : null;
+                if (rp == null) throw new EvalError("rest parameter must be a symbol" + posStr(pos));
+                return rp;
+            }
+        }
+        return null;
+    }
+
+    private Object evalLet(List<?> list, Env env, Pos pos) throws EvalError {
+        if (list.size() < 3) throw new EvalError("let requires bindings and body" + posStr(pos));
+        Object second = unwrap(list.get(1));
+        if (second instanceof String loopName) {
+            return evalNamedLet(loopName, list, env, pos);
+        }
+        if (!(second instanceof List<?> bindings))
+            throw new EvalError("let bindings must be a list" + posStr(pos));
+        Env letEnv = new Env(env);
+        for (Object b : bindings) {
+            Object bRaw = unwrap(b);
+            if (!(bRaw instanceof List<?> binding) || binding.size() != 2)
+                throw new EvalError("invalid let binding" + posStr(pos));
+            if (!(unwrap(binding.get(0)) instanceof String name))
+                throw new EvalError("let binding name must be a symbol" + posStr(pos));
+            letEnv.define(name, eval(binding.get(1), env));
+        }
+        return evalBody(list, 2, letEnv);
+    }
+
+    private Object evalNamedLet(String loopName, List<?> list, Env env, Pos pos) throws EvalError {
+        if (list.size() < 4) throw new EvalError("named let requires bindings and body" + posStr(pos));
+        Object bindingsRaw = unwrap(list.get(2));
+        if (!(bindingsRaw instanceof List<?> bindings))
+            throw new EvalError("let bindings must be a list" + posStr(pos));
+        List<String> params = new ArrayList<>();
+        List<Object> inits = new ArrayList<>();
+        for (Object b : bindings) {
+            Object bRaw = unwrap(b);
+            if (!(bRaw instanceof List<?> binding) || binding.size() != 2)
+                throw new EvalError("invalid let binding" + posStr(pos));
+            if (!(unwrap(binding.get(0)) instanceof String pname))
+                throw new EvalError("let binding name must be a symbol" + posStr(pos));
+            params.add(pname);
+            inits.add(eval(binding.get(1), env));
+        }
+        List<Object> body = new ArrayList<>(list.subList(3, list.size()));
+        Env letEnv = new Env(env);
+        Lambda loopFn = new Lambda(params, null, body, letEnv);
+        letEnv.define(loopName, loopFn);
+        return applyProc(loopFn, inits, pos);
+    }
+
+    private Object evalCond(List<?> list, Env env, Pos pos) throws EvalError {
+        for (int i = 1; i < list.size(); i++) {
+            Object clauseRaw = unwrap(list.get(i));
+            if (!(clauseRaw instanceof List<?> clause) || clause.isEmpty())
+                throw new EvalError("invalid cond clause" + posStr(pos));
+            if ("else".equals(unwrap(clause.get(0)))) {
+                return evalClauseBody(clause, 1, env);
+            }
+            Object test = eval(clause.get(0), env);
+            if (!isFalse(test)) {
+                if (clause.size() == 1) return test;
+                return evalClauseBody(clause, 1, env);
+            }
+        }
+        return VOID;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object evalDefineSyntax(List<?> list, Env env, Pos pos) throws EvalError {
+        if (list.size() != 3) throw new EvalError("define-syntax requires 2 arguments" + posStr(pos));
+        Object nameRaw = unwrap(list.get(1));
+        if (!(nameRaw instanceof String macroName))
+            throw new EvalError("define-syntax: name must be a symbol" + posStr(pos));
+        Object rulesExpr = unwrap(list.get(2));
+        if (!(rulesExpr instanceof List<?> rulesList) || rulesList.size() < 2
+                || !"syntax-rules".equals(unwrap(rulesList.get(0))))
+            throw new EvalError("define-syntax: expected syntax-rules" + posStr(pos));
+        Object literalsExpr = unwrap(rulesList.get(1));
+        List<String> literals = new ArrayList<>();
+        if (literalsExpr instanceof List<?> litList) {
+            for (Object lit : litList) {
+                if (unwrap(lit) instanceof String s) literals.add(s);
+            }
+        }
+        List<List<Object>> patterns = new ArrayList<>();
+        List<Object> templates = new ArrayList<>();
+        for (int i = 2; i < rulesList.size(); i++) {
+            Object rule = unwrap(rulesList.get(i));
+            if (!(rule instanceof List<?> rulePair) || rulePair.size() != 2)
+                throw new EvalError("syntax-rules: each rule must be (pattern template)" + posStr(pos));
+            Object pat = unwrap(rulePair.get(0));
+            if (!(pat instanceof List<?> patList))
+                throw new EvalError("syntax-rules: pattern must be a list" + posStr(pos));
+            patterns.add((List<Object>) patList);
+            templates.add(rulePair.get(1));
+        }
+        env.define(macroName, new SyntaxRules(literals, patterns, templates, env));
+        return VOID;
+    }
+
+    private Object evalCaseLambda(List<?> list, Env env, Pos pos) throws EvalError {
+        List<Lambda> clauses = new ArrayList<>();
+        for (int i = 1; i < list.size(); i++) {
+            Object clauseRaw = unwrap(list.get(i));
+            if (!(clauseRaw instanceof List<?> clause) || clause.size() < 2)
+                throw new EvalError("case-lambda: invalid clause" + posStr(pos));
+            Object paramSpec = unwrap(clause.get(0));
+            if (!(paramSpec instanceof List<?> paramList))
+                throw new EvalError("case-lambda: params must be a list" + posStr(pos));
+            List<String> params = new ArrayList<>();
+            String restParam = parseParamList(paramList, 0, pos);
+            for (int pi = 0; pi < paramList.size(); pi++) {
+                String s = unwrap(paramList.get(pi)) instanceof String str ? str : null;
+                if (s == null) throw new EvalError("parameter must be a symbol" + posStr(pos));
+                if (".".equals(s)) break;
+                params.add(s);
+            }
+            List<Object> body = new ArrayList<>(clause.subList(1, clause.size()));
+            clauses.add(new Lambda(params, restParam, body, env));
+        }
+        return new CaseLambda(clauses);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object evalLetrec(List<?> list, Env env, Pos pos) throws EvalError {
+        if (list.size() < 3) throw new EvalError("letrec requires bindings and body" + posStr(pos));
+        Object bindingsRaw = unwrap(list.get(1));
+        if (!(bindingsRaw instanceof List<?> bindings))
+            throw new EvalError("letrec bindings must be a list" + posStr(pos));
+        Env letEnv = new Env(env);
+        List<String> names = new ArrayList<>();
+        for (Object b : bindings) {
+            Object bRaw = unwrap(b);
+            if (!(bRaw instanceof List<?> binding) || binding.size() != 2)
+                throw new EvalError("invalid letrec binding" + posStr(pos));
+            if (!(unwrap(binding.get(0)) instanceof String name))
+                throw new EvalError("letrec binding name must be a symbol" + posStr(pos));
+            names.add(name);
+            letEnv.define(name, VOID);
+        }
+        for (int i = 0; i < names.size(); i++) {
+            Object bRaw = unwrap(((List<?>) bindings).get(i));
+            Object val = eval(((List<?>) bRaw).get(1), letEnv);
+            letEnv.define(names.get(i), val);
+        }
+        return evalBody(list, 2, letEnv);
+    }
+
+    private Object evalLetrecStar(List<?> list, Env env, Pos pos) throws EvalError {
+        if (list.size() < 3) throw new EvalError("letrec* requires bindings and body" + posStr(pos));
+        Object bindingsRaw = unwrap(list.get(1));
+        if (!(bindingsRaw instanceof List<?> bindings))
+            throw new EvalError("letrec* bindings must be a list" + posStr(pos));
+        Env letEnv = new Env(env);
+        for (Object b : bindings) {
+            Object bRaw = unwrap(b);
+            if (!(bRaw instanceof List<?> binding) || binding.size() != 2)
+                throw new EvalError("invalid letrec* binding" + posStr(pos));
+            if (!(unwrap(binding.get(0)) instanceof String name))
+                throw new EvalError("letrec* binding name must be a symbol" + posStr(pos));
+            Object val = eval(binding.get(1), letEnv);
+            letEnv.define(name, val);
+        }
+        return evalBody(list, 2, letEnv);
+    }
+
+    private Object evalCase(List<?> list, Env env, Pos pos) throws EvalError {
+        if (list.size() < 2) throw new EvalError("case requires at least a key" + posStr(pos));
+        Object key = eval(list.get(1), env);
+        for (int i = 2; i < list.size(); i++) {
+            Object clauseRaw = unwrap(list.get(i));
+            if (!(clauseRaw instanceof List<?> clause) || clause.isEmpty())
+                throw new EvalError("invalid case clause" + posStr(pos));
+            Object datums = unwrap(clause.get(0));
+            if ("else".equals(datums)) return evalClauseBody(clause, 1, env);
+            if (datums instanceof List<?> datumList && matchesCaseDatum(key, datumList)) {
+                return evalClauseBody(clause, 1, env);
+            }
+        }
+        return VOID;
+    }
+
+    private boolean matchesCaseDatum(Object key, List<?> datumList) {
+        for (Object d : datumList) {
+            Object dv = unwrap(d);
+            if (dv instanceof SchemeString || dv instanceof Long || dv instanceof Boolean
+                    || dv instanceof Double || dv instanceof SchemeRational || dv instanceof SchemeChar) {
+                if (schemeEqv(key, dv)) return true;
+            } else if (dv instanceof String dsym && key instanceof String ks && ks.equals(dsym)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Object evalDo(List<?> list, Env env, Pos pos) throws EvalError {
+        if (list.size() < 3) throw new EvalError("do requires bindings and test" + posStr(pos));
+        Object varsRaw = unwrap(list.get(1));
+        if (!(varsRaw instanceof List<?> varSpecs))
+            throw new EvalError("do: bindings must be a list" + posStr(pos));
+        Object testRaw = unwrap(list.get(2));
+        if (!(testRaw instanceof List<?> testClause) || testClause.isEmpty())
+            throw new EvalError("do: test must be a list" + posStr(pos));
+
+        int numVars = varSpecs.size();
+        String[] varNames = new String[numVars];
+        Object[] stepExprs = new Object[numVars];
+        boolean[] hasStep = new boolean[numVars];
+
+        Env doEnv = new Env(env);
+        for (int i = 0; i < numVars; i++) {
+            Object specRaw = unwrap(varSpecs.get(i));
+            if (!(specRaw instanceof List<?> spec) || spec.size() < 2)
+                throw new EvalError("do: invalid variable spec" + posStr(pos));
+            if (!(unwrap(spec.get(0)) instanceof String vname))
+                throw new EvalError("do: variable name must be a symbol" + posStr(pos));
+            varNames[i] = vname;
+            doEnv.define(vname, eval(spec.get(1), env));
+            if (spec.size() >= 3) { stepExprs[i] = spec.get(2); hasStep[i] = true; }
+        }
+
+        while (true) {
+            Object testResult = eval(testClause.get(0), doEnv);
+            if (!isFalse(testResult)) return evalClauseBody(testClause, 1, doEnv);
+            for (int j = 3; j < list.size(); j++) eval(list.get(j), doEnv);
+            Object[] newVals = new Object[numVars];
+            for (int i = 0; i < numVars; i++) {
+                if (hasStep[i]) newVals[i] = eval(stepExprs[i], doEnv);
+            }
+            for (int i = 0; i < numVars; i++) {
+                if (hasStep[i]) doEnv.define(varNames[i], newVals[i]);
+            }
+        }
+    }
+
+    /** Evaluate a sequence of body expressions, returning the last result. */
+    private Object evalBody(List<?> list, int start, Env env) throws EvalError {
+        Object result = VOID;
+        for (int i = start; i < list.size(); i++) {
+            result = eval(list.get(i), env);
+        }
+        return result;
+    }
+
+    /** Evaluate clause body expressions starting at given index. */
+    private Object evalClauseBody(List<?> clause, int start, Env env) throws EvalError {
+        Object result = VOID;
+        for (int j = start; j < clause.size(); j++) {
+            result = eval(clause.get(j), env);
+        }
+        return result;
     }
 
     private Object evalDefineRecordType(List<?> list, Env env, Pos pos) throws EvalError {
@@ -722,7 +858,7 @@ public class Evaluator {
         return val instanceof Boolean b && !b;
     }
 
-    boolean schemeEqual(Object a, Object b) {
+    boolean schemeEqv(Object a, Object b) {
         if (a == b) return true;
         if (a instanceof Long la && b instanceof Long lb) return la.equals(lb);
         if (a instanceof SchemeRational ra && b instanceof SchemeRational rb) return ra.equals(rb);
@@ -731,11 +867,24 @@ public class Evaluator {
         if (a instanceof Double da && b instanceof Double db) return da.equals(db);
         if (a instanceof Boolean ba && b instanceof Boolean bb) return ba.equals(bb);
         if (a instanceof String sa && b instanceof String sb) return sa.equals(sb);
-        if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
         if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
+        return false;
+    }
+
+    boolean schemeEqual(Object a, Object b) {
+        if (a == b) return true;
+        if (schemeEqv(a, b)) return true;
+        if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
         if (a == NIL && b == NIL) return true;
         if (a instanceof Cons ca && b instanceof Cons cb) {
             return schemeEqual(ca.car, cb.car) && schemeEqual(ca.cdr, cb.cdr);
+        }
+        if (a instanceof SchemeVector va && b instanceof SchemeVector vb) {
+            if (va.length() != vb.length()) return false;
+            for (int i = 0; i < va.length(); i++) {
+                if (!schemeEqual(va.data[i], vb.data[i])) return false;
+            }
+            return true;
         }
         return false;
     }
@@ -973,6 +1122,15 @@ public class Evaluator {
                 case '\t' -> "#\\tab";
                 default -> "#\\" + c.value();
             };
+        }
+        if (val instanceof SchemeVector v) {
+            StringBuilder sb = new StringBuilder("#(");
+            for (int i = 0; i < v.length(); i++) {
+                if (i > 0) sb.append(" ");
+                sb.append(schemeToString(v.data[i]));
+            }
+            sb.append(")");
+            return sb.toString();
         }
         if (val instanceof SchemeRecord r) return "#<record " + r.type.name + ">";
         if (val instanceof Builtin b) return "#<procedure " + b.name() + ">";
