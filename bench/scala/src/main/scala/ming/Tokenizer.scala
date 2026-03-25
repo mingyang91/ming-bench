@@ -3,6 +3,7 @@ package ming
 enum Token:
   case LParen(pos: (Int, Int))
   case RParen(pos: (Int, Int))
+  case VecLParen(pos: (Int, Int))
   case Str(value: String, pos: (Int, Int))
   case Atom(value: String, pos: (Int, Int))
 
@@ -47,6 +48,9 @@ object Tokenizer:
       case '\'' =>
         tokens += Token.Atom("quote-sugar", positions(pos))
         pos + 1
+      case '#' if pos + 1 < input.length && input(pos + 1) == '(' =>
+        tokens += Token.VecLParen(positions(pos))
+        pos + 2
       case _ =>
         val sb       = new StringBuilder
         val startPos = positions(pos)

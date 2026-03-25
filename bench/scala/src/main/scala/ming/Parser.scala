@@ -16,10 +16,11 @@ object Parser:
     exprs.toList
 
   private def tokenPos(t: Token): (Int, Int) = t match
-    case Token.LParen(p)  => p
-    case Token.RParen(p)  => p
-    case Token.Str(_, p)  => p
-    case Token.Atom(_, p) => p
+    case Token.LParen(p)    => p
+    case Token.RParen(p)    => p
+    case Token.VecLParen(p) => p
+    case Token.Str(_, p)    => p
+    case Token.Atom(_, p)   => p
 
   private def parseExpr(tokens: List[Token]): (SchemeVal, List[Token]) =
     tokens match
@@ -30,6 +31,9 @@ object Parser:
           case Some(tail) => SchemeVal.DottedList(elems, tail)
           case None       => SchemeVal.SList(elems)
         (withPos(sv, p), remaining)
+      case Token.VecLParen(p) :: rest =>
+        val (elems, _, remaining) = parseList(rest)
+        (withPos(SchemeVal.VectorVal(elems.toArray), p), remaining)
       case Token.RParen(_) :: _ =>
         throw new EvalError("unexpected )")
       case Token.Str(s, p) :: rest =>

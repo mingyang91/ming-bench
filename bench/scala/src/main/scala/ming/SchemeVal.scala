@@ -17,6 +17,7 @@ enum SchemeVal:
   case MacroVal(name: String, literals: List[String], rules: List[(SchemeVal, SchemeVal)], defEnv: Env)
   case CaseLambdaProc(clauses: List[(List[String], Option[String], List[SchemeVal])], closure: Env)
   case RecordVal(typeName: String, fields: scala.collection.mutable.Map[String, SchemeVal])
+  case VectorVal(elems: Array[SchemeVal])
 
 object SchemeVal:
 
@@ -69,6 +70,7 @@ object SchemeVal:
     case CaseLambdaProc(_, _)    => "#<procedure>"
     case MacroVal(name, _, _, _) => s"#<macro $name>"
     case RecordVal(typeName, _)  => s"#<$typeName>"
+    case VectorVal(elems)        => "#(" + elems.map(display).mkString(" ") + ")"
 
   /** display-style output (strings unquoted) */
   def displayOutput(v: SchemeVal): String = v match
@@ -77,6 +79,7 @@ object SchemeVal:
     case SList(elems)            => "(" + elems.map(displayOutput).mkString(" ") + ")"
     case DottedList(elems, tail) => "(" + elems.map(displayOutput).mkString(" ") + " . " + displayOutput(tail) + ")"
     case CaseLambdaProc(_, _)    => "#<procedure>"
+    case VectorVal(elems)        => "#(" + elems.map(displayOutput).mkString(" ") + ")"
     case other                   => display(other)
 
   def schemeEqual(a: SchemeVal, b: SchemeVal): Boolean = (a, b) match
@@ -90,6 +93,8 @@ object SchemeVal:
     case (SList(xs), SList(ys)) => xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b))
     case (DottedList(xs, xt), DottedList(ys, yt)) =>
       xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b)) && schemeEqual(xt, yt)
+    case (VectorVal(xs), VectorVal(ys)) =>
+      xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b))
     case (Void, Void) => true
     case _            => false
 

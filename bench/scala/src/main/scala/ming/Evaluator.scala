@@ -33,6 +33,7 @@ object Evaluator:
         case SchemeVal.LambdaProc(_, _, _, _) => expr
         case SchemeVal.CaseLambdaProc(_, _)   => expr
         case SchemeVal.MacroVal(_, _, _, _)   => expr
+        case SchemeVal.VectorVal(_)           => expr
         case SchemeVal.Symbol(name) =>
           env.lookup(name) match
             case Some(v) => v
@@ -50,11 +51,16 @@ object Evaluator:
             case SchemeVal.Symbol("and")           => evalAnd(elems.tail, env)
             case SchemeVal.Symbol("or")            => evalOr(elems.tail, env)
             case SchemeVal.Symbol("begin")         => evalBegin(elems.tail, env)
-            case SchemeVal.Symbol("let")           => evalLet(elems.tail, env)
-            case SchemeVal.Symbol("cond")          => evalCond(elems.tail, env)
+            case SchemeVal.Symbol("let")           => BindingForms.evalLet(elems.tail, env)
+            case SchemeVal.Symbol("cond")          => BindingForms.evalCond(elems.tail, env)
             case SchemeVal.Symbol("set!")          => evalSet(elems.tail, env)
             case SchemeVal.Symbol("define-syntax") => evalDefineSyntax(elems.tail, env)
             case SchemeVal.Symbol("case-lambda")   => evalCaseLambda(elems.tail, env)
+            case SchemeVal.Symbol("letrec")        => BindingForms.evalLetrec(elems.tail, env)
+            case SchemeVal.Symbol("letrec*")       => BindingForms.evalLetrecStar(elems.tail, env)
+            case SchemeVal.Symbol("case")          => BindingForms.evalCase(elems.tail, env)
+            case SchemeVal.Symbol("do")            => BindingForms.evalDo(elems.tail, env)
+            case SchemeVal.Symbol("let*")          => BindingForms.evalLetStar(elems.tail, env)
             case SchemeVal.Symbol("define-record-type") =>
               RecordType.evalDefineRecordType(elems.tail, env)
             case SchemeVal.Symbol(name) =>
@@ -169,53 +175,6 @@ object Evaluator:
     if exprs.isEmpty then SchemeVal.Void
     else exprs.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, env))
 
-  private def evalLet(args: List[SchemeVal], env: Env): SchemeVal =
-    args match
-      case SchemeVal.Symbol(name) :: SchemeVal.SList(bindings) :: body if body.nonEmpty =>
-        val (params, inits) = parseBindings(bindings, env)
-        val localEnv        = new Env(scala.collection.mutable.Map.empty, Some(env))
-        val proc            = SchemeVal.LambdaProc(params, body, localEnv)
-        localEnv.define(name, proc)
-        params.zip(inits).foreach((p, v) => localEnv.define(p, v))
-        body.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, localEnv))
-      case SchemeVal.SList(bindings) :: body if body.nonEmpty =>
-        val localEnv = new Env(scala.collection.mutable.Map.empty, Some(env))
-        for b <- bindings do
-          b match
-            case SchemeVal.SList(List(SchemeVal.Symbol(name), valueExpr)) =>
-              localEnv.define(name, eval(valueExpr, env))
-            case _ => throw new EvalError("let: bad binding syntax")
-        body.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, localEnv))
-      case _ => throw new EvalError("let: bad syntax")
-
-  private def parseBindings(
-    bindings: List[SchemeVal],
-    env: Env
-  ): (List[String], List[SchemeVal]) =
-    val pairs = bindings.map {
-      case SchemeVal.SList(List(SchemeVal.Symbol(p), valueExpr)) => (p, eval(valueExpr, env))
-      case _                                                     => throw new EvalError("let: bad binding syntax")
-    }
-    pairs.unzip
-
-  @tailrec
-  private def evalCond(clauses: List[SchemeVal], env: Env): SchemeVal =
-    clauses match
-      case Nil => SchemeVal.Void
-      case clause :: rest =>
-        clause match
-          case SchemeVal.SList(elems) if elems.nonEmpty =>
-            elems.head match
-              case SchemeVal.Symbol("else") =>
-                elems.tail.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, env))
-              case test =>
-                val testVal = eval(test, env)
-                if isTruthy(testVal) then
-                  if elems.tail.isEmpty then testVal
-                  else elems.tail.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, env))
-                else evalCond(rest, env)
-          case _ => throw new EvalError("cond: bad clause")
-
   private def evalDefineSyntax(args: List[SchemeVal], env: Env): SchemeVal =
     args match
       case SchemeVal.Symbol(name) :: SchemeVal.SList(srElems) :: Nil =>
@@ -264,7 +223,7 @@ object Evaluator:
         SchemeVal.Void
       case _ => throw new EvalError("set!: bad syntax")
 
-  private def isTruthy(v: SchemeVal): Boolean = v match
+  def isTruthy(v: SchemeVal): Boolean = v match
     case SchemeVal.BoolVal(false) => false
     case _                        => true
 
