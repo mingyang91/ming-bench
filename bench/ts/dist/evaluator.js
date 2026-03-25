@@ -15,7 +15,11 @@ const SPECIAL_FORM_NAMES = new Set([
     'or',
     'begin',
     'let',
+    'letrec',
+    'letrec*',
     'cond',
+    'case',
+    'do',
 ]);
 let freshIdentifierCounter = 0;
 class Environment {
@@ -26,13 +30,16 @@ class Environment {
         this.parent = parent;
     }
     define(name, value) {
-        this.bindings.set(name, { value });
+        this.bindings.set(name, { value, initialized: true });
+    }
+    defineUninitialized(name) {
+        this.bindings.set(name, { value: VOID_VALUE, initialized: false });
     }
     set(name, value, position) {
-        this.lookupCell(name, position).value = value;
+        writeBindingCell(this.lookupCell(name, position), value);
     }
     lookup(name, position) {
-        return this.lookupCell(name, position).value;
+        return readBindingCell(this.lookupCell(name, position), name, position);
     }
     lookupCell(name, position) {
         const cell = this.tryLookupCell(name);
@@ -258,7 +265,7 @@ function evaluate(expr, env) {
                 return charValue(expr.value, expr.position);
             case 'symbol':
                 if (expr.capturedCell) {
-                    return expr.capturedCell.value;
+                    return readBindingCell(expr.capturedCell, symbolKey(expr), expr.position);
                 }
                 if (expr.capturedSyntax) {
                     throw new EvalError(`syntax identifier used as value: ${expr.name}`, expr.position);
@@ -304,8 +311,16 @@ function evaluateList(expr, env) {
                 return evaluateBegin(args, env);
             case 'let':
                 return evaluateLet(args, env, operator.position);
+            case 'letrec':
+                return evaluateLetrec(args, env, operator.position, false);
+            case 'letrec*':
+                return evaluateLetrec(args, env, operator.position, true);
             case 'cond':
                 return evaluateCond(args, env);
+            case 'case':
+                return evaluateCase(args, env, operator.position);
+            case 'do':
+                return evaluateDo(args, env, operator.position);
         }
         const macro = operator.capturedSyntax ?? env.tryLookupSyntax(symbolKey(operator));
         if (macro) {
@@ -423,15 +438,20 @@ function evaluateSet(args, env, position) {
     }
     const value = evaluate(args[1], env);
     if (target.capturedCell) {
-        target.capturedCell.value = value;
+        writeBindingCell(target.capturedCell, value);
         return VOID_VALUE;
     }
     env.set(symbolKey(target), value, target.position);
     return VOID_VALUE;
 }
 function evaluateIf(args, env, position) {
-    requireArgCount('if', args.length, 3, position);
-    return isTruthy(evaluate(args[0], env)) ? evaluate(args[1], env) : evaluate(args[2], env);
+    if (args.length !== 2 && args.length !== 3) {
+        throw new EvalError(`if: expected 2 or 3 argument(s), got ${args.length}`, position);
+    }
+    if (isTruthy(evaluate(args[0], env))) {
+        return evaluate(args[1], env);
+    }
+    return args[2] === undefined ? VOID_VALUE : evaluate(args[2], env);
 }
 function evaluateQuote(args, position) {
     requireArgCount('quote', args.length, 1, position);
@@ -484,7 +504,7 @@ function evaluateLet(args, env, position) {
     const firstArg = args[0];
     if (firstArg.type === 'symbol') {
         requireArgCountAtLeast('let', args.length, 3, position);
-        const bindings = parseLetBindings(args[1]);
+        const bindings = parseLetBindings('let', args[1]);
         const values = bindings.map((binding) => ({
             value: evaluate(binding.value, env),
             position: binding.value.position,
@@ -499,7 +519,7 @@ function evaluateLet(args, env, position) {
         letEnv.define(symbolKey(firstArg), closure);
         return applyProcedure(closure, values, firstArg.position);
     }
-    const bindings = parseLetBindings(firstArg);
+    const bindings = parseLetBindings('let', firstArg);
     const letEnv = new Environment(env);
     for (const binding of bindings) {
         letEnv.define(symbolKey(binding.name), evaluate(binding.value, env));
@@ -521,6 +541,84 @@ function evaluateCond(args, env) {
         }
     }
     return VOID_VALUE;
+}
+function evaluateLetrec(args, env, position, sequential) {
+    const name = sequential ? 'letrec*' : 'letrec';
+    requireArgCountAtLeast(name, args.length, 2, position);
+    const bindings = parseLetBindings(name, args[0]);
+    const letrecEnv = new Environment(env);
+    for (const binding of bindings) {
+        letrecEnv.defineUninitialized(symbolKey(binding.name));
+    }
+    if (sequential) {
+        for (const binding of bindings) {
+            letrecEnv.set(symbolKey(binding.name), evaluate(binding.value, letrecEnv), binding.value.position);
+        }
+    }
+    else {
+        const values = bindings.map((binding) => evaluate(binding.value, letrecEnv));
+        for (let index = 0; index < bindings.length; index += 1) {
+            letrecEnv.set(symbolKey(bindings[index].name), values[index], bindings[index].value.position);
+        }
+    }
+    return evaluateSequence(args.slice(1), letrecEnv);
+}
+function evaluateCase(args, env, position) {
+    requireArgCountAtLeast('case', args.length, 2, position);
+    const key = evaluate(args[0], env);
+    const clauses = args.slice(1);
+    for (let index = 0; index < clauses.length; index += 1) {
+        const clause = clauses[index];
+        if (clause.type !== 'list' || clause.elements.length === 0) {
+            throw new EvalError('case: expected non-empty clause', clause.position);
+        }
+        const [head, ...body] = clause.elements;
+        if (head.type === 'symbol' && head.name === 'else') {
+            if (index !== clauses.length - 1) {
+                throw new EvalError('case: else clause must be last', head.position);
+            }
+            return body.length === 0 ? VOID_VALUE : evaluateSequence(body, env);
+        }
+        if (head.type !== 'list') {
+            throw new EvalError('case: expected datum list', head.position);
+        }
+        if (head.elements.some((datum) => eqvValues(key, quoteExpr(datum)))) {
+            return body.length === 0 ? VOID_VALUE : evaluateSequence(body, env);
+        }
+    }
+    return VOID_VALUE;
+}
+function evaluateDo(args, env, position) {
+    requireArgCountAtLeast('do', args.length, 2, position);
+    const bindings = parseDoBindings(args[0]);
+    const testClause = args[1];
+    if (testClause.type !== 'list' || testClause.elements.length === 0) {
+        throw new EvalError('do: expected termination clause', testClause.position);
+    }
+    const [testExpr, ...resultExprs] = testClause.elements;
+    const body = args.slice(2);
+    const doEnv = new Environment(env);
+    for (const binding of bindings) {
+        doEnv.define(symbolKey(binding.name), evaluate(binding.init, env));
+    }
+    while (true) {
+        if (isTruthy(evaluate(testExpr, doEnv))) {
+            return resultExprs.length === 0 ? VOID_VALUE : evaluateSequence(resultExprs, doEnv);
+        }
+        evaluateSequence(body, doEnv);
+        const nextValues = bindings.map((binding) => binding.step === undefined
+            ? undefined
+            : {
+                name: symbolKey(binding.name),
+                value: evaluate(binding.step, doEnv),
+                position: binding.step.position,
+            });
+        for (const nextValue of nextValues) {
+            if (nextValue !== undefined) {
+                doEnv.set(nextValue.name, nextValue.value, nextValue.position);
+            }
+        }
+    }
 }
 function quoteExpr(expr) {
     switch (expr.type) {
@@ -577,19 +675,35 @@ function parseCaseLambdaClause(clauseExpr) {
     const { params, restParam } = parseFormalParameters('case-lambda', paramsExpr);
     return { params, restParam, body };
 }
-function parseLetBindings(bindingsExpr) {
+function parseLetBindings(name, bindingsExpr) {
     if (bindingsExpr.type !== 'list') {
-        throw new EvalError('let: expected binding list', bindingsExpr.position);
+        throw new EvalError(`${name}: expected binding list`, bindingsExpr.position);
     }
     return bindingsExpr.elements.map((bindingExpr) => {
         if (bindingExpr.type !== 'list' || bindingExpr.elements.length !== 2) {
-            throw new EvalError('let: expected binding pair', bindingExpr.position);
+            throw new EvalError(`${name}: expected binding pair`, bindingExpr.position);
         }
         const [nameExpr, valueExpr] = bindingExpr.elements;
         if (nameExpr.type !== 'symbol') {
-            throw new EvalError('let: binding name must be a symbol', nameExpr.position);
+            throw new EvalError(`${name}: binding name must be a symbol`, nameExpr.position);
         }
         return { name: nameExpr, value: valueExpr };
+    });
+}
+function parseDoBindings(bindingsExpr) {
+    if (bindingsExpr.type !== 'list') {
+        throw new EvalError('do: expected binding list', bindingsExpr.position);
+    }
+    return bindingsExpr.elements.map((bindingExpr) => {
+        if (bindingExpr.type !== 'list' ||
+            (bindingExpr.elements.length !== 2 && bindingExpr.elements.length !== 3)) {
+            throw new EvalError('do: expected binding of form (name init step?)', bindingExpr.position);
+        }
+        const [nameExpr, initExpr, stepExpr] = bindingExpr.elements;
+        if (nameExpr.type !== 'symbol') {
+            throw new EvalError('do: binding name must be a symbol', nameExpr.position);
+        }
+        return { name: nameExpr, init: initExpr, step: stepExpr };
     });
 }
 function parseRecordConstructorSpec(bindingsExpr) {
@@ -1343,7 +1457,11 @@ function createGlobalEnv(context) {
     }));
     env.define('eq?', builtin('eq?', (args, callPosition) => {
         requireArgCount('eq?', args.length, 2, callPosition);
-        return booleanValue(equalValues(args[0].value, args[1].value));
+        return booleanValue(eqvValues(args[0].value, args[1].value));
+    }));
+    env.define('eqv?', builtin('eqv?', (args, callPosition) => {
+        requireArgCount('eqv?', args.length, 2, callPosition);
+        return booleanValue(eqvValues(args[0].value, args[1].value));
     }));
     env.define('equal?', builtin('equal?', (args, callPosition) => {
         requireArgCount('equal?', args.length, 2, callPosition);
@@ -1362,6 +1480,50 @@ function createGlobalEnv(context) {
         return cdrValue(expectPair('cdr', args[0]));
     }));
     env.define('list', builtin('list', (args) => listValue(args.map((arg) => arg.value))));
+    env.define('vector', builtin('vector', (args) => vectorValue(args.map((arg) => arg.value))));
+    env.define('make-vector', builtin('make-vector', (args, callPosition) => {
+        if (args.length !== 1 && args.length !== 2) {
+            throw new EvalError(`make-vector: expected 1 or 2 argument(s), got ${args.length}`, callPosition);
+        }
+        const length = expectNonNegativeInteger('make-vector', args[0]);
+        const fill = args[1]?.value ?? VOID_VALUE;
+        return vectorValue(Array(length).fill(fill));
+    }));
+    env.define('vector?', builtin('vector?', (args, callPosition) => {
+        requireArgCount('vector?', args.length, 1, callPosition);
+        return booleanValue(args[0].value.type === 'vector');
+    }));
+    env.define('vector-length', builtin('vector-length', (args, callPosition) => {
+        requireArgCount('vector-length', args.length, 1, callPosition);
+        return numberValue(expectVector('vector-length', args[0]).elements.length, callPosition);
+    }));
+    env.define('vector-ref', builtin('vector-ref', (args, callPosition) => {
+        requireArgCount('vector-ref', args.length, 2, callPosition);
+        const vector = expectVector('vector-ref', args[0]);
+        const index = expectNonNegativeInteger('vector-ref', args[1]);
+        if (index >= vector.elements.length) {
+            throw new EvalError('vector-ref: index out of range', args[1].position);
+        }
+        return vector.elements[index];
+    }));
+    env.define('vector-set!', builtin('vector-set!', (args, callPosition) => {
+        requireArgCount('vector-set!', args.length, 3, callPosition);
+        const vector = expectVector('vector-set!', args[0]);
+        const index = expectNonNegativeInteger('vector-set!', args[1]);
+        if (index >= vector.elements.length) {
+            throw new EvalError('vector-set!: index out of range', args[1].position);
+        }
+        vector.elements[index] = args[2].value;
+        return VOID_VALUE;
+    }));
+    env.define('vector->list', builtin('vector->list', (args, callPosition) => {
+        requireArgCount('vector->list', args.length, 1, callPosition);
+        return listValue([...expectVector('vector->list', args[0]).elements]);
+    }));
+    env.define('list->vector', builtin('list->vector', (args, callPosition) => {
+        requireArgCount('list->vector', args.length, 1, callPosition);
+        return vectorValue([...expectList('list->vector', args[0]).elements]);
+    }));
     env.define('length', builtin('length', (args, callPosition) => {
         requireArgCount('length', args.length, 1, callPosition);
         return numberValue(expectList('length', args[0]).elements.length, callPosition);
@@ -1652,6 +1814,16 @@ function requireArgCountAtLeast(name, actual, minimum, position) {
         throw new EvalError(`${name}: expected at least ${minimum} argument(s), got ${actual}`, position);
     }
 }
+function readBindingCell(cell, name, position) {
+    if (!cell.initialized) {
+        throw new EvalError(`uninitialized variable: ${name}`, position);
+    }
+    return cell.value;
+}
+function writeBindingCell(cell, value) {
+    cell.value = value;
+    cell.initialized = true;
+}
 function expectNumber(name, arg) {
     if (arg.value.type !== 'number') {
         throw new EvalError(`${name}: expected number`, arg.position);
@@ -1700,6 +1872,12 @@ function expectListValue(name, arg) {
     }
     return arg.value;
 }
+function expectVector(name, arg) {
+    if (arg.value.type !== 'vector') {
+        throw new EvalError(`${name}: expected vector`, arg.position);
+    }
+    return arg.value;
+}
 function expectPair(name, arg) {
     const list = expectListValue(name, arg);
     if (list.elements.length === 0) {
@@ -1722,6 +1900,9 @@ function expectRecord(name, arg, recordType) {
 function listValue(elements, tail) {
     return tail === undefined ? { type: 'list', elements } : { type: 'list', elements, tail };
 }
+function vectorValue(elements) {
+    return { type: 'vector', elements };
+}
 function isProperList(value) {
     return value.tail === undefined;
 }
@@ -1736,6 +1917,39 @@ function cdrValue(list) {
         return listValue(list.elements.slice(1), list.tail);
     }
     return list.tail ?? listValue([]);
+}
+function eqvValues(left, right) {
+    if (left === right) {
+        return true;
+    }
+    if (left.type !== right.type) {
+        return false;
+    }
+    switch (left.type) {
+        case 'number':
+            return compareNumbers(left.value, right.value) === 0;
+        case 'boolean':
+        case 'string':
+        case 'char':
+            return left.value === right.value;
+        case 'symbol':
+            return left.name === right.name;
+        case 'list': {
+            const rightList = right;
+            return (left.elements.length === 0 &&
+                rightList.elements.length === 0 &&
+                left.tail === undefined &&
+                rightList.tail === undefined);
+        }
+        case 'vector':
+        case 'record':
+        case 'builtin':
+        case 'closure':
+        case 'case-closure':
+            return false;
+        case 'void':
+            return true;
+    }
 }
 function equalValues(left, right) {
     if (left === right) {
@@ -1767,6 +1981,18 @@ function equalValues(left, right) {
                 return left.tail === undefined && rightList.tail === undefined;
             }
             return equalValues(left.tail, rightList.tail);
+        }
+        case 'vector': {
+            const rightVector = right;
+            if (left.elements.length !== rightVector.elements.length) {
+                return false;
+            }
+            for (let index = 0; index < left.elements.length; index += 1) {
+                if (!equalValues(left.elements[index], rightVector.elements[index])) {
+                    return false;
+                }
+            }
+            return true;
         }
         case 'record':
             return false;
@@ -1838,6 +2064,8 @@ function formatDisplayValue(value) {
             return value.value;
         case 'list':
             return formatListValue(value, formatDisplayValue);
+        case 'vector':
+            return formatVectorValue(value, formatDisplayValue);
         default:
             return formatValue(value);
     }
@@ -1856,6 +2084,8 @@ function formatValue(value) {
             return value.name;
         case 'list':
             return formatListValue(value, formatValue);
+        case 'vector':
+            return formatVectorValue(value, formatValue);
         case 'record':
             return `#<${value.recordType.displayName}>`;
         case 'builtin':
@@ -1875,6 +2105,9 @@ function formatListValue(value, formatter) {
         return `(${elements.join(' ')})`;
     }
     return `(${elements.join(' ')} . ${formatter(value.tail)})`;
+}
+function formatVectorValue(value, formatter) {
+    return `#(${value.elements.map(formatter).join(' ')})`;
 }
 function formatChar(value) {
     if (value === ' ') {
