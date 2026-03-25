@@ -22,6 +22,19 @@ type NilVal struct{}
 type VoidVal struct{}
 type CharVal struct{ Val rune }
 
+// RecordTypeTag is a unique identifier for a record type.
+type RecordTypeTag struct{ Name string }
+
+// RecordVal is an instance of a define-record-type.
+type RecordVal struct {
+	Type   *RecordTypeTag
+	Fields map[string]Value
+}
+
+func (v *RecordVal) String() string {
+	return fmt.Sprintf("#<record %s>", v.Type.Name)
+}
+
 // LambdaVal is a user-defined closure.
 type LambdaVal struct {
 	Params    []string

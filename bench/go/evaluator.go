@@ -133,6 +133,8 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 				return &BoolVal{Val: !isTruthy(v)}, nil
 			case "define-syntax":
 				return evalDefineSyntax(e, env)
+			case "define-record-type":
+				return evalDefineRecordType(e, env)
 			}
 			// Check if symbol is bound to a macro
 			if v, ok := env.get(sym.Name); ok {
@@ -1740,4 +1742,120 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 		return "", buf.String(), nil
 	}
 	return last.String(), buf.String(), nil
+}
+
+// evalDefineRecordType implements R7RS define-record-type.
+// (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+func evalDefineRecordType(e *ListExpr, env *Env) (Value, error) {
+	// Minimum: type-name, constructor, predicate, at least one field spec
+	if len(e.Elems) < 4 {
+		return nil, &EvalError{Message: "define-record-type: too few arguments"}
+	}
+
+	// 1. Type name (e.g., <point>)
+	typeSym, ok := e.Elems[1].(*SymbolExpr)
+	if !ok {
+		return nil, &EvalError{Message: "define-record-type: expected type name symbol"}
+	}
+	tag := &RecordTypeTag{Name: typeSym.Name}
+
+	// 2. Constructor spec: (make-point x y)
+	ctorList, ok := e.Elems[2].(*ListExpr)
+	if !ok || len(ctorList.Elems) < 1 {
+		return nil, &EvalError{Message: "define-record-type: expected constructor spec"}
+	}
+	ctorName, ok := ctorList.Elems[0].(*SymbolExpr)
+	if !ok {
+		return nil, &EvalError{Message: "define-record-type: expected constructor name"}
+	}
+	var ctorFields []string
+	for _, fe := range ctorList.Elems[1:] {
+		fs, ok := fe.(*SymbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: "define-record-type: expected field name in constructor"}
+		}
+		ctorFields = append(ctorFields, fs.Name)
+	}
+
+	// 3. Predicate name
+	predSym, ok := e.Elems[3].(*SymbolExpr)
+	if !ok {
+		return nil, &EvalError{Message: "define-record-type: expected predicate name"}
+	}
+
+	// 4. Field specs: (field-name accessor-name)
+	type fieldSpec struct {
+		fieldName    string
+		accessorName string
+	}
+	var fields []fieldSpec
+	for _, fe := range e.Elems[4:] {
+		fl, ok := fe.(*ListExpr)
+		if !ok || len(fl.Elems) < 2 {
+			return nil, &EvalError{Message: "define-record-type: expected field spec (field accessor)"}
+		}
+		fn, ok := fl.Elems[0].(*SymbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: "define-record-type: expected field name"}
+		}
+		an, ok := fl.Elems[1].(*SymbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: "define-record-type: expected accessor name"}
+		}
+		fields = append(fields, fieldSpec{fn.Name, an.Name})
+	}
+
+	// Define constructor
+	capturedTag := tag
+	capturedFields := ctorFields
+	env.set(ctorName.Name, &BuiltinFunc{
+		Name: ctorName.Name,
+		Fn: func(args []Value) (Value, error) {
+			if len(args) != len(capturedFields) {
+				return nil, &EvalError{Message: fmt.Sprintf("%s: expected %d arguments, got %d", ctorName.Name, len(capturedFields), len(args))}
+			}
+			rec := &RecordVal{Type: capturedTag, Fields: make(map[string]Value, len(capturedFields))}
+			for i, name := range capturedFields {
+				rec.Fields[name] = args[i]
+			}
+			return rec, nil
+		},
+	})
+
+	// Define predicate
+	env.set(predSym.Name, &BuiltinFunc{
+		Name: predSym.Name,
+		Fn: func(args []Value) (Value, error) {
+			if len(args) != 1 {
+				return nil, &EvalError{Message: fmt.Sprintf("%s: expected 1 argument", predSym.Name)}
+			}
+			rec, ok := args[0].(*RecordVal)
+			return &BoolVal{Val: ok && rec.Type == capturedTag}, nil
+		},
+	})
+
+	// Define accessors
+	for _, fs := range fields {
+		fname := fs.fieldName
+		aname := fs.accessorName
+		env.set(aname, &BuiltinFunc{
+			Name: aname,
+			Fn: func(args []Value) (Value, error) {
+				if len(args) != 1 {
+					return nil, &EvalError{Message: fmt.Sprintf("%s: expected 1 argument", aname)}
+				}
+				rec, ok := args[0].(*RecordVal)
+				if !ok || rec.Type != capturedTag {
+					return nil, &EvalError{Message: fmt.Sprintf("%s: not a %s record", aname, capturedTag.Name)}
+				}
+				v, ok := rec.Fields[fname]
+				if !ok {
+					return nil, &EvalError{Message: fmt.Sprintf("%s: field %s not found", aname, fname)}
+				}
+				return v, nil
+			},
+		})
+	}
+
+	return &VoidVal{}, nil
 }
