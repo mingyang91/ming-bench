@@ -19,6 +19,7 @@ public class Evaluator {
     private StringBuilder outputBuffer = new StringBuilder();
     private final Map<String, MacroDefinition> macros = new HashMap<>();
     private int nextHygieneId;
+    private boolean continuationsEnabled;
 
     /**
      * Evaluate one or more Scheme expressions and return the string
@@ -50,6 +51,8 @@ public class Evaluator {
     private Value evaluateProgram(String input) throws EvalError {
         macros.clear();
         nextHygieneId = 0;
+        continuationsEnabled = input.contains("call/cc")
+                || input.contains("call-with-current-continuation");
 
         List<Expr> expressions = new Parser(input).parseProgram();
         if (expressions.isEmpty()) {
@@ -57,11 +60,10 @@ public class Evaluator {
         }
 
         Environment global = createGlobalEnvironment();
-        Value result = VOID_VALUE;
-        for (Expr expression : expressions) {
-            result = eval(expression, global);
+        if (!continuationsEnabled) {
+            return evalSequence(expressions, global);
         }
-        return result;
+        return runWithContinuations(() -> evalSequence(expressions, global));
     }
 
     private Environment createGlobalEnvironment() {
@@ -144,6 +146,10 @@ public class Evaluator {
         installBuiltin(env, "char?", this::builtinCharPredicate);
         installBuiltin(env, "pair?", this::builtinPairPredicate);
         installBuiltin(env, "procedure?", this::builtinProcedurePredicate);
+        installBuiltin(env, "call/cc",
+                (callPos, args) -> builtinCallWithCurrentContinuation("call/cc", callPos, args));
+        installBuiltin(env, "call-with-current-continuation",
+                (callPos, args) -> builtinCallWithCurrentContinuation("call-with-current-continuation", callPos, args));
         installBuiltin(env, "symbol?", this::builtinSymbolPredicate);
         installBuiltin(env, "eq?", this::builtinEq);
         installBuiltin(env, "eqv?", this::builtinEqv);
@@ -250,6 +256,50 @@ public class Evaluator {
 
         Expr operatorExpr = elements.get(0);
         List<Expr> arguments = elements.subList(1, elements.size());
+        if (!continuationsEnabled) {
+            if (operatorExpr instanceof SymbolExpr symbolExpr) {
+                String name = symbolExpr.name();
+                return switch (name) {
+                    case "and" -> evalAnd(arguments, env, tailPosition);
+                    case "begin" -> evalBegin(arguments, env, tailPosition);
+                    case "case" -> evalCase(arguments, env, tailPosition);
+                    case "case-lambda" -> evalCaseLambda(arguments, env);
+                    case "cond" -> evalCond(arguments, env, tailPosition);
+                    case "do" -> evalDo(arguments, env, tailPosition);
+                    case "or" -> evalOr(arguments, env, tailPosition);
+                    case "define" -> evalDefine(arguments, env);
+                    case "define-record-type" -> evalDefineRecordType(arguments, env);
+                    case "define-syntax" -> evalDefineSyntax(arguments, env);
+                    case "if" -> evalIf(arguments, env, tailPosition);
+                    case "let" -> evalLet(arguments, env, tailPosition);
+                    case "let*" -> evalLetStar(arguments, env, tailPosition);
+                    case "letrec" -> evalLetrec(arguments, env, false, tailPosition);
+                    case "letrec*" -> evalLetrec(arguments, env, true, tailPosition);
+                    case "lambda" -> evalLambda(arguments, env);
+                    case "quote" -> evalQuote(arguments);
+                    case "set!" -> evalSet(arguments, env);
+                    default -> {
+                        MacroDefinition macroDefinition = macros.get(name);
+                        if (macroDefinition != null) {
+                            yield evalMacroInvocation(macroDefinition, elements, listExpr.pos(), env, tailPosition);
+                        }
+                        yield apply(
+                                eval(operatorExpr, env),
+                                operatorExpr.pos(),
+                                evalArguments(arguments, env),
+                                listExpr.pos(),
+                                tailPosition);
+                    }
+                };
+            }
+            return apply(
+                    eval(operatorExpr, env),
+                    operatorExpr.pos(),
+                    evalArguments(arguments, env),
+                    listExpr.pos(),
+                    tailPosition);
+        }
+
         if (operatorExpr instanceof SymbolExpr symbolExpr) {
             String name = symbolExpr.name();
             return switch (name) {
@@ -276,35 +326,117 @@ public class Evaluator {
                     if (macroDefinition != null) {
                         yield evalMacroInvocation(macroDefinition, elements, listExpr.pos(), env, tailPosition);
                     }
-                    yield apply(
-                            eval(operatorExpr, env),
-                            operatorExpr.pos(),
-                            evalArguments(arguments, env),
-                            listExpr.pos(),
-                            tailPosition);
+                    yield evalApplication(operatorExpr, arguments, env, listExpr.pos(), tailPosition);
                 }
             };
         }
-        return apply(
-                eval(operatorExpr, env),
-                operatorExpr.pos(),
-                evalArguments(arguments, env),
-                listExpr.pos(),
-                tailPosition);
+        return evalApplication(operatorExpr, arguments, env, listExpr.pos(), tailPosition);
+    }
+
+    private Value evalApplication(Expr operatorExpr, List<Expr> arguments, Environment env,
+                                  SourcePos callPos, boolean tailPosition) throws EvalError {
+        Value operator = expectValue(withCaptureFrame(
+                () -> eval(operatorExpr, env),
+                result -> continueApplication(operatorExpr.pos(), arguments, env, callPos, tailPosition, result)));
+        return applyEvaluatedOperator(operator, operatorExpr.pos(), arguments, env, callPos, tailPosition);
+    }
+
+    private Object continueApplication(SourcePos operatorPos, List<Expr> arguments, Environment env,
+                                       SourcePos callPos, boolean tailPosition, Object operatorResult)
+            throws EvalError {
+        if (operatorResult instanceof TailCallSignal) {
+            return operatorResult;
+        }
+        return applyEvaluatedOperator(expectValue(operatorResult), operatorPos, arguments, env, callPos, tailPosition);
+    }
+
+    private Value applyEvaluatedOperator(Value operator, SourcePos operatorPos, List<Expr> arguments,
+                                         Environment env, SourcePos callPos, boolean tailPosition)
+            throws EvalError {
+        List<LocatedValue> evaluatedArguments = expectLocatedValues(withCaptureFrame(
+                () -> evalArguments(arguments, env),
+                result -> continueApplyEvaluatedOperator(operator, operatorPos, callPos, tailPosition, result)));
+        return apply(operator, operatorPos, evaluatedArguments, callPos, tailPosition);
+    }
+
+    private Object continueApplyEvaluatedOperator(Value operator, SourcePos operatorPos,
+                                                  SourcePos callPos, boolean tailPosition,
+                                                  Object argumentResults)
+            throws EvalError {
+        if (argumentResults instanceof TailCallSignal) {
+            return argumentResults;
+        }
+        return apply(operator, operatorPos, expectLocatedValues(argumentResults), callPos, tailPosition);
     }
 
     private List<LocatedValue> evalArguments(List<Expr> arguments, Environment env) throws EvalError {
-        List<LocatedValue> values = new ArrayList<>(arguments.size());
-        for (Expr argument : arguments) {
-            values.add(new LocatedValue(eval(argument, env), argument.pos()));
+        if (!continuationsEnabled) {
+            List<LocatedValue> values = new ArrayList<>(arguments.size());
+            for (Expr argument : arguments) {
+                values.add(new LocatedValue(eval(argument, env), argument.pos()));
+            }
+            return values;
+        }
+
+        List<LocatedValue> values = List.of();
+        for (int i = arguments.size() - 1; i >= 0; i--) {
+            Expr argument = arguments.get(i);
+            int index = i;
+            List<LocatedValue> suffix = List.copyOf(values);
+            Value value = expectValue(withCaptureFrame(
+                    () -> eval(argument, env),
+                    result -> continueEvalArguments(arguments, env, index, suffix, result)));
+            List<LocatedValue> next = new ArrayList<>(suffix.size() + 1);
+            next.add(new LocatedValue(value, argument.pos()));
+            next.addAll(suffix);
+            values = next;
+        }
+        return values;
+    }
+
+    private Object continueEvalArguments(List<Expr> arguments, Environment env, int currentIndex,
+                                         List<LocatedValue> evaluatedSuffix, Object currentResult)
+            throws EvalError {
+        if (currentResult instanceof TailCallSignal) {
+            return currentResult;
+        }
+
+        List<LocatedValue> values = new ArrayList<>(evaluatedSuffix.size() + 1);
+        values.add(new LocatedValue(expectValue(currentResult), arguments.get(currentIndex).pos()));
+        values.addAll(evaluatedSuffix);
+        for (int i = currentIndex - 1; i >= 0; i--) {
+            Expr argument = arguments.get(i);
+            int index = i;
+            List<LocatedValue> suffix = List.copyOf(values);
+            Value value = expectValue(withCaptureFrame(
+                    () -> eval(argument, env),
+                    result -> continueEvalArguments(arguments, env, index, suffix, result)));
+            List<LocatedValue> next = new ArrayList<>(suffix.size() + 1);
+            next.add(new LocatedValue(value, argument.pos()));
+            next.addAll(suffix);
+            values = next;
         }
         return values;
     }
 
     private Value evalAnd(List<Expr> arguments, Environment env, boolean tailPosition) throws EvalError {
+        if (!continuationsEnabled) {
+            Value result = TRUE_VALUE;
+            for (int i = 0; i < arguments.size(); i++) {
+                result = eval(arguments.get(i), env, tailPosition && i == arguments.size() - 1);
+                if (!isTruthy(result)) {
+                    return result;
+                }
+            }
+            return result;
+        }
+
         Value result = TRUE_VALUE;
         for (int i = 0; i < arguments.size(); i++) {
-            result = eval(arguments.get(i), env, tailPosition && i == arguments.size() - 1);
+            int index = i;
+            result = expectValue(withCaptureFrame(
+                    () -> eval(arguments.get(index), env, tailPosition && index == arguments.size() - 1),
+                    value -> continueAnd(arguments, env, tailPosition, index, value)));
             if (!isTruthy(result)) {
                 return result;
             }
@@ -313,9 +445,23 @@ public class Evaluator {
     }
 
     private Value evalOr(List<Expr> arguments, Environment env, boolean tailPosition) throws EvalError {
+        if (!continuationsEnabled) {
+            Value result = FALSE_VALUE;
+            for (int i = 0; i < arguments.size(); i++) {
+                result = eval(arguments.get(i), env, tailPosition && i == arguments.size() - 1);
+                if (isTruthy(result)) {
+                    return result;
+                }
+            }
+            return result;
+        }
+
         Value result = FALSE_VALUE;
         for (int i = 0; i < arguments.size(); i++) {
-            result = eval(arguments.get(i), env, tailPosition && i == arguments.size() - 1);
+            int index = i;
+            result = expectValue(withCaptureFrame(
+                    () -> eval(arguments.get(index), env, tailPosition && index == arguments.size() - 1),
+                    value -> continueOr(arguments, env, tailPosition, index, value)));
             if (isTruthy(result)) {
                 return result;
             }
@@ -332,7 +478,19 @@ public class Evaluator {
             throw new EvalError("invalid case");
         }
 
-        Value key = eval(arguments.get(0), env);
+        if (!continuationsEnabled) {
+            Value key = eval(arguments.get(0), env);
+            return evalCaseWithKey(arguments, env, tailPosition, key);
+        }
+
+        Value key = expectValue(withCaptureFrame(
+                () -> eval(arguments.get(0), env),
+                result -> continueCase(arguments, env, tailPosition, result)));
+        return evalCaseWithKey(arguments, env, tailPosition, key);
+    }
+
+    private Value evalCaseWithKey(List<Expr> arguments, Environment env, boolean tailPosition, Value key)
+            throws EvalError {
         for (int i = 1; i < arguments.size(); i++) {
             Expr clauseExpr = arguments.get(i);
             if (!(clauseExpr instanceof ListExpr clauseExprList) || clauseExprList.elements().isEmpty()) {
@@ -366,7 +524,45 @@ public class Evaluator {
         return VOID_VALUE;
     }
 
+    private Object continueCase(List<Expr> arguments, Environment env, boolean tailPosition, Object keyResult)
+            throws EvalError {
+        if (keyResult instanceof TailCallSignal) {
+            return keyResult;
+        }
+        return evalCaseWithKey(arguments, env, tailPosition, expectValue(keyResult));
+    }
+
     private Value evalCond(List<Expr> arguments, Environment env, boolean tailPosition) throws EvalError {
+        if (!continuationsEnabled) {
+            for (int i = 0; i < arguments.size(); i++) {
+                Expr clauseExpr = arguments.get(i);
+                if (!(clauseExpr instanceof ListExpr clauseExprList) || clauseExprList.elements().isEmpty()) {
+                    throw new EvalError("invalid cond");
+                }
+                List<Expr> clause = clauseExprList.elements();
+
+                Expr testExpr = clause.get(0);
+                boolean isElseClause = testExpr instanceof SymbolExpr symbolExpr
+                        && symbolExpr.name().equals("else");
+                if (isElseClause) {
+                    if (i != arguments.size() - 1) {
+                        throw new EvalError("invalid cond");
+                    }
+                    return clause.size() == 1
+                            ? TRUE_VALUE
+                            : evalSequence(clause.subList(1, clause.size()), env, tailPosition);
+                }
+
+                Value testValue = eval(testExpr, env);
+                if (isTruthy(testValue)) {
+                    return clause.size() == 1
+                            ? testValue
+                            : evalSequence(clause.subList(1, clause.size()), env, tailPosition);
+                }
+            }
+            return VOID_VALUE;
+        }
+
         for (int i = 0; i < arguments.size(); i++) {
             Expr clauseExpr = arguments.get(i);
             if (!(clauseExpr instanceof ListExpr clauseExprList) || clauseExprList.elements().isEmpty()) {
@@ -386,12 +582,66 @@ public class Evaluator {
                         : evalSequence(clause.subList(1, clause.size()), env, tailPosition);
             }
 
-            Value testValue = eval(testExpr, env);
+            int clauseIndex = i;
+            Value testValue = expectValue(withCaptureFrame(
+                    () -> eval(testExpr, env),
+                    result -> continueCond(arguments, env, tailPosition, clauseIndex, result)));
             if (isTruthy(testValue)) {
                 return clause.size() == 1
                         ? testValue
                         : evalSequence(clause.subList(1, clause.size()), env, tailPosition);
             }
+        }
+        return VOID_VALUE;
+    }
+
+    private Object continueCond(List<Expr> arguments, Environment env, boolean tailPosition,
+                                int clauseIndex, Object testResult)
+            throws EvalError {
+        if (testResult instanceof TailCallSignal) {
+            return testResult;
+        }
+
+        Value currentTest = expectValue(testResult);
+        for (int i = clauseIndex; i < arguments.size(); i++) {
+            Expr clauseExpr = arguments.get(i);
+            if (!(clauseExpr instanceof ListExpr clauseExprList) || clauseExprList.elements().isEmpty()) {
+                throw new EvalError("invalid cond");
+            }
+            List<Expr> clause = clauseExprList.elements();
+
+            Expr testExpr = clause.get(0);
+            boolean isElseClause = testExpr instanceof SymbolExpr symbolExpr
+                    && symbolExpr.name().equals("else");
+            if (isElseClause) {
+                if (i != arguments.size() - 1) {
+                    throw new EvalError("invalid cond");
+                }
+                return clause.size() == 1
+                        ? TRUE_VALUE
+                        : evalSequence(clause.subList(1, clause.size()), env, tailPosition);
+            }
+
+            if (isTruthy(currentTest)) {
+                return clause.size() == 1
+                        ? currentTest
+                        : evalSequence(clause.subList(1, clause.size()), env, tailPosition);
+            }
+
+            if (i == arguments.size() - 1) {
+                return VOID_VALUE;
+            }
+
+            int nextClauseIndex = i + 1;
+            Expr nextClauseExpr = arguments.get(nextClauseIndex);
+            if (!(nextClauseExpr instanceof ListExpr nextClauseList) || nextClauseList.elements().isEmpty()) {
+                throw new EvalError("invalid cond");
+            }
+            List<Expr> nextClause = nextClauseList.elements();
+            Expr nextTestExpr = nextClause.get(0);
+            currentTest = expectValue(withCaptureFrame(
+                    () -> eval(nextTestExpr, env),
+                    result -> continueCond(arguments, env, tailPosition, nextClauseIndex, result)));
         }
         return VOID_VALUE;
     }
@@ -407,7 +657,13 @@ public class Evaluator {
             if (arguments.size() != 2) {
                 throw new EvalError("invalid define");
             }
-            env.define(name, eval(arguments.get(1), env));
+            if (!continuationsEnabled) {
+                env.define(name, eval(arguments.get(1), env));
+                return VOID_VALUE;
+            }
+            env.define(name, expectValue(withCaptureFrame(
+                    () -> eval(arguments.get(1), env),
+                    result -> continueDefineValue(env, name, result))));
             return VOID_VALUE;
         }
 
@@ -433,13 +689,247 @@ public class Evaluator {
             throw new EvalError("wrong argument count for if");
         }
 
-        if (isTruthy(eval(arguments.get(0), env))) {
+        if (!continuationsEnabled) {
+            if (isTruthy(eval(arguments.get(0), env))) {
+                return eval(arguments.get(1), env, tailPosition);
+            }
+            if (arguments.size() == 3) {
+                return eval(arguments.get(2), env, tailPosition);
+            }
+            return VOID_VALUE;
+        }
+
+        Value condition = expectValue(withCaptureFrame(
+                () -> eval(arguments.get(0), env),
+                result -> continueIf(arguments, env, tailPosition, result)));
+        if (isTruthy(condition)) {
             return eval(arguments.get(1), env, tailPosition);
         }
         if (arguments.size() == 3) {
             return eval(arguments.get(2), env, tailPosition);
         }
         return VOID_VALUE;
+    }
+
+    private Object continueAnd(List<Expr> arguments, Environment env, boolean tailPosition,
+                               int currentIndex, Object currentResult)
+            throws EvalError {
+        if (currentResult instanceof TailCallSignal) {
+            return currentResult;
+        }
+
+        Value result = expectValue(currentResult);
+        if (!isTruthy(result) || currentIndex == arguments.size() - 1) {
+            return result;
+        }
+        for (int i = currentIndex + 1; i < arguments.size(); i++) {
+            int index = i;
+            result = expectValue(withCaptureFrame(
+                    () -> eval(arguments.get(index), env, tailPosition && index == arguments.size() - 1),
+                    value -> continueAnd(arguments, env, tailPosition, index, value)));
+            if (!isTruthy(result)) {
+                return result;
+            }
+        }
+        return result;
+    }
+
+    private Object continueOr(List<Expr> arguments, Environment env, boolean tailPosition,
+                              int currentIndex, Object currentResult)
+            throws EvalError {
+        if (currentResult instanceof TailCallSignal) {
+            return currentResult;
+        }
+
+        Value result = expectValue(currentResult);
+        if (isTruthy(result) || currentIndex == arguments.size() - 1) {
+            return result;
+        }
+        for (int i = currentIndex + 1; i < arguments.size(); i++) {
+            int index = i;
+            result = expectValue(withCaptureFrame(
+                    () -> eval(arguments.get(index), env, tailPosition && index == arguments.size() - 1),
+                    value -> continueOr(arguments, env, tailPosition, index, value)));
+            if (isTruthy(result)) {
+                return result;
+            }
+        }
+        return result;
+    }
+
+    private Object continueDefineValue(Environment env, String name, Object valueResult) throws EvalError {
+        if (valueResult instanceof TailCallSignal) {
+            return valueResult;
+        }
+        env.define(name, expectValue(valueResult));
+        return VOID_VALUE;
+    }
+
+    private Object continueIf(List<Expr> arguments, Environment env, boolean tailPosition, Object testResult)
+            throws EvalError {
+        if (testResult instanceof TailCallSignal) {
+            return testResult;
+        }
+        Value condition = expectValue(testResult);
+        if (isTruthy(condition)) {
+            return eval(arguments.get(1), env, tailPosition);
+        }
+        if (arguments.size() == 3) {
+            return eval(arguments.get(2), env, tailPosition);
+        }
+        return VOID_VALUE;
+    }
+
+    private Value applyNamedLet(String name, List<Binding> bindings, List<Expr> body, Environment env,
+                                SourcePos callPos, boolean tailPosition, List<Value> values)
+            throws EvalError {
+        List<String> parameters = bindingNames(bindings);
+        Environment loopEnv = new Environment(env);
+        LambdaProcedure procedure = new LambdaProcedure(
+                name,
+                ParameterSpec.fixed(parameters),
+                copyExprs(body),
+                loopEnv);
+        loopEnv.define(name, procedure);
+
+        List<LocatedValue> locatedValues = new ArrayList<>(values.size());
+        for (int i = 0; i < values.size(); i++) {
+            locatedValues.add(new LocatedValue(values.get(i), bindings.get(i).valueExpr().pos()));
+        }
+        return applyLambda(procedure, locatedValues, callPos, tailPosition);
+    }
+
+    private Object continueNamedLetBindings(String name, List<Binding> bindings, List<Expr> body, Environment env,
+                                            SourcePos callPos, boolean tailPosition, Object valuesResult)
+            throws EvalError {
+        if (valuesResult instanceof TailCallSignal) {
+            return valuesResult;
+        }
+        return applyNamedLet(name, bindings, body, env, callPos, tailPosition, expectValues(valuesResult));
+    }
+
+    private Value applyLet(List<Binding> bindings, List<Expr> body, Environment env, boolean tailPosition,
+                           List<Value> values)
+            throws EvalError {
+        Environment letEnv = new Environment(env);
+        for (int i = 0; i < bindings.size(); i++) {
+            letEnv.define(bindings.get(i).name(), values.get(i));
+        }
+        return evalSequence(body, letEnv, tailPosition);
+    }
+
+    private Object continueLetBindings(List<Binding> bindings, List<Expr> body, Environment env,
+                                       boolean tailPosition, Object valuesResult)
+            throws EvalError {
+        if (valuesResult instanceof TailCallSignal) {
+            return valuesResult;
+        }
+        return applyLet(bindings, body, env, tailPosition, expectValues(valuesResult));
+    }
+
+    private Object continueLetStarBinding(List<Binding> bindings, List<Expr> body, Environment letStarEnv,
+                                          boolean tailPosition, int currentIndex, Object currentValue)
+            throws EvalError {
+        if (currentValue instanceof TailCallSignal) {
+            return currentValue;
+        }
+
+        letStarEnv.define(bindings.get(currentIndex).name(), expectValue(currentValue));
+        for (int i = currentIndex + 1; i < bindings.size(); i++) {
+            Binding binding = bindings.get(i);
+            int index = i;
+            Value value = expectValue(withCaptureFrame(
+                    () -> eval(binding.valueExpr(), letStarEnv),
+                    result -> continueLetStarBinding(bindings, body, letStarEnv, tailPosition, index, result)));
+            letStarEnv.define(binding.name(), value);
+        }
+        return evalSequence(body, letStarEnv, tailPosition);
+    }
+
+    private void initializeLetrecBindings(List<Binding> bindings, Environment letrecEnv, List<Value> values)
+            throws EvalError {
+        for (int i = 0; i < bindings.size(); i++) {
+            letrecEnv.set(bindings.get(i).name(), values.get(i));
+        }
+    }
+
+    private Object continueLetrecSequentialBinding(List<Binding> bindings, List<Expr> body, Environment letrecEnv,
+                                                   boolean tailPosition, int currentIndex, Object currentValue)
+            throws EvalError {
+        if (currentValue instanceof TailCallSignal) {
+            return currentValue;
+        }
+
+        letrecEnv.set(bindings.get(currentIndex).name(), expectValue(currentValue));
+        for (int i = currentIndex + 1; i < bindings.size(); i++) {
+            Binding binding = bindings.get(i);
+            int index = i;
+            Value value = expectValue(withCaptureFrame(
+                    () -> eval(binding.valueExpr(), letrecEnv),
+                    result -> continueLetrecSequentialBinding(bindings, body, letrecEnv, tailPosition,
+                            index, result)));
+            letrecEnv.set(binding.name(), value);
+        }
+        return evalSequence(body, letrecEnv, tailPosition);
+    }
+
+    private Object continueLetrecBindings(List<Binding> bindings, List<Expr> body, Environment letrecEnv,
+                                          boolean tailPosition, Object valuesResult)
+            throws EvalError {
+        if (valuesResult instanceof TailCallSignal) {
+            return valuesResult;
+        }
+        initializeLetrecBindings(bindings, letrecEnv, expectValues(valuesResult));
+        return evalSequence(body, letrecEnv, tailPosition);
+    }
+
+    private Object continueSetValue(Environment env, String name, Object valueResult) throws EvalError {
+        if (valueResult instanceof TailCallSignal) {
+            return valueResult;
+        }
+        env.set(name, expectValue(valueResult));
+        return VOID_VALUE;
+    }
+
+    private Object continueSequence(List<Expr> expressions, Environment env, boolean tailPosition,
+                                    int currentIndex, Object currentResult)
+            throws EvalError {
+        if (currentResult instanceof TailCallSignal) {
+            return currentResult;
+        }
+
+        Value result = expectValue(currentResult);
+        if (currentIndex == expressions.size() - 1) {
+            return result;
+        }
+        for (int i = currentIndex + 1; i < expressions.size(); i++) {
+            int index = i;
+            result = expectValue(withCaptureFrame(
+                    () -> eval(expressions.get(index), env, tailPosition && index == expressions.size() - 1),
+                    value -> continueSequence(expressions, env, tailPosition, index, value)));
+        }
+        return result;
+    }
+
+    private Object continueBindingValues(List<Binding> bindings, Environment env, int currentIndex,
+                                         List<Value> valuePrefix, Object currentValue)
+            throws EvalError {
+        if (currentValue instanceof TailCallSignal) {
+            return currentValue;
+        }
+
+        List<Value> values = new ArrayList<>(valuePrefix);
+        values.add(expectValue(currentValue));
+        for (int i = currentIndex + 1; i < bindings.size(); i++) {
+            Binding binding = bindings.get(i);
+            int index = i;
+            List<Value> prefix = List.copyOf(values);
+            Value value = expectValue(withCaptureFrame(
+                    () -> eval(binding.valueExpr(), env),
+                    result -> continueBindingValues(bindings, env, index, prefix, result)));
+            values.add(value);
+        }
+        return values;
     }
 
     private Value evalDefineSyntax(List<Expr> arguments, Environment env) throws EvalError {
@@ -816,36 +1306,59 @@ public class Evaluator {
             throw new EvalError("invalid let");
         }
 
+        if (!continuationsEnabled) {
+            if (arguments.get(0) instanceof SymbolExpr nameExpr) {
+                String name = nameExpr.name();
+                if (arguments.size() < 3) {
+                    throw new EvalError("invalid let");
+                }
+                List<Binding> bindings = parseBindings(arguments.get(1), "let");
+                List<Value> values = evalBindingValues(bindings, env);
+                List<String> parameters = bindingNames(bindings);
+
+                Environment loopEnv = new Environment(env);
+                LambdaProcedure procedure = new LambdaProcedure(
+                        name,
+                        ParameterSpec.fixed(parameters),
+                        copyExprs(arguments.subList(2, arguments.size())),
+                        loopEnv);
+                loopEnv.define(name, procedure);
+                List<LocatedValue> locatedValues = new ArrayList<>(values.size());
+                for (int i = 0; i < values.size(); i++) {
+                    locatedValues.add(new LocatedValue(values.get(i), bindings.get(i).valueExpr().pos()));
+                }
+                return applyLambda(procedure, locatedValues, arguments.get(1).pos(), tailPosition);
+            }
+
+            List<Binding> bindings = parseBindings(arguments.get(0), "let");
+            List<Value> values = evalBindingValues(bindings, env);
+            Environment letEnv = new Environment(env);
+            for (int i = 0; i < bindings.size(); i++) {
+                letEnv.define(bindings.get(i).name(), values.get(i));
+            }
+            return evalSequence(arguments.subList(1, arguments.size()), letEnv, tailPosition);
+        }
+
         if (arguments.get(0) instanceof SymbolExpr nameExpr) {
             String name = nameExpr.name();
             if (arguments.size() < 3) {
                 throw new EvalError("invalid let");
             }
             List<Binding> bindings = parseBindings(arguments.get(1), "let");
-            List<Value> values = evalBindingValues(bindings, env);
-            List<String> parameters = bindingNames(bindings);
-
-            Environment loopEnv = new Environment(env);
-            LambdaProcedure procedure = new LambdaProcedure(
-                    name,
-                    ParameterSpec.fixed(parameters),
-                    copyExprs(arguments.subList(2, arguments.size())),
-                    loopEnv);
-            loopEnv.define(name, procedure);
-            List<LocatedValue> locatedValues = new ArrayList<>(values.size());
-            for (int i = 0; i < values.size(); i++) {
-                locatedValues.add(new LocatedValue(values.get(i), bindings.get(i).valueExpr().pos()));
-            }
-            return applyLambda(procedure, locatedValues, arguments.get(1).pos(), tailPosition);
+            List<Expr> body = copyExprs(arguments.subList(2, arguments.size()));
+            List<Value> values = expectValues(withCaptureFrame(
+                    () -> evalBindingValues(bindings, env),
+                    result -> continueNamedLetBindings(name, bindings, body, env, arguments.get(1).pos(),
+                            tailPosition, result)));
+            return applyNamedLet(name, bindings, body, env, arguments.get(1).pos(), tailPosition, values);
         }
 
         List<Binding> bindings = parseBindings(arguments.get(0), "let");
-        List<Value> values = evalBindingValues(bindings, env);
-        Environment letEnv = new Environment(env);
-        for (int i = 0; i < bindings.size(); i++) {
-            letEnv.define(bindings.get(i).name(), values.get(i));
-        }
-        return evalSequence(arguments.subList(1, arguments.size()), letEnv, tailPosition);
+        List<Expr> body = copyExprs(arguments.subList(1, arguments.size()));
+        List<Value> values = expectValues(withCaptureFrame(
+                () -> evalBindingValues(bindings, env),
+                result -> continueLetBindings(bindings, body, env, tailPosition, result)));
+        return applyLet(bindings, body, env, tailPosition, values);
     }
 
     private Value evalLetStar(List<Expr> arguments, Environment env, boolean tailPosition) throws EvalError {
@@ -853,10 +1366,25 @@ public class Evaluator {
             throw new EvalError("invalid let*");
         }
 
+        if (!continuationsEnabled) {
+            List<Binding> bindings = parseBindings(arguments.get(0), "let*");
+            Environment letStarEnv = new Environment(env);
+            for (Binding binding : bindings) {
+                letStarEnv.define(binding.name(), eval(binding.valueExpr(), letStarEnv));
+            }
+            return evalSequence(arguments.subList(1, arguments.size()), letStarEnv, tailPosition);
+        }
+
         List<Binding> bindings = parseBindings(arguments.get(0), "let*");
         Environment letStarEnv = new Environment(env);
-        for (Binding binding : bindings) {
-            letStarEnv.define(binding.name(), eval(binding.valueExpr(), letStarEnv));
+        for (int i = 0; i < bindings.size(); i++) {
+            Binding binding = bindings.get(i);
+            int index = i;
+            Value value = expectValue(withCaptureFrame(
+                    () -> eval(binding.valueExpr(), letStarEnv),
+                    result -> continueLetStarBinding(bindings, arguments.subList(1, arguments.size()),
+                            letStarEnv, tailPosition, index, result)));
+            letStarEnv.define(binding.name(), value);
         }
         return evalSequence(arguments.subList(1, arguments.size()), letStarEnv, tailPosition);
     }
@@ -868,6 +1396,30 @@ public class Evaluator {
             throw new EvalError("invalid " + formName);
         }
 
+        if (!continuationsEnabled) {
+            List<Binding> bindings = parseBindings(arguments.get(0), formName);
+            Environment letrecEnv = new Environment(env);
+            for (Binding binding : bindings) {
+                letrecEnv.define(binding.name(), UNINITIALIZED_VALUE);
+            }
+
+            if (sequential) {
+                for (Binding binding : bindings) {
+                    letrecEnv.set(binding.name(), eval(binding.valueExpr(), letrecEnv));
+                }
+            } else {
+                List<Value> values = new ArrayList<>(bindings.size());
+                for (Binding binding : bindings) {
+                    values.add(eval(binding.valueExpr(), letrecEnv));
+                }
+                for (int i = 0; i < bindings.size(); i++) {
+                    letrecEnv.set(bindings.get(i).name(), values.get(i));
+                }
+            }
+
+            return evalSequence(arguments.subList(1, arguments.size()), letrecEnv, tailPosition);
+        }
+
         List<Binding> bindings = parseBindings(arguments.get(0), formName);
         Environment letrecEnv = new Environment(env);
         for (Binding binding : bindings) {
@@ -875,19 +1427,23 @@ public class Evaluator {
         }
 
         if (sequential) {
-            for (Binding binding : bindings) {
-                letrecEnv.set(binding.name(), eval(binding.valueExpr(), letrecEnv));
+            for (int i = 0; i < bindings.size(); i++) {
+                Binding binding = bindings.get(i);
+                int index = i;
+                Value value = expectValue(withCaptureFrame(
+                        () -> eval(binding.valueExpr(), letrecEnv),
+                        result -> continueLetrecSequentialBinding(bindings, arguments.subList(1, arguments.size()),
+                                letrecEnv, tailPosition, index, result)));
+                letrecEnv.set(binding.name(), value);
             }
         } else {
-            List<Value> values = new ArrayList<>(bindings.size());
-            for (Binding binding : bindings) {
-                values.add(eval(binding.valueExpr(), letrecEnv));
-            }
-            for (int i = 0; i < bindings.size(); i++) {
-                letrecEnv.set(bindings.get(i).name(), values.get(i));
-            }
+            List<Expr> body = copyExprs(arguments.subList(1, arguments.size()));
+            List<Value> values = expectValues(withCaptureFrame(
+                    () -> evalBindingValues(bindings, letrecEnv),
+                    result -> continueLetrecBindings(bindings, body, letrecEnv, tailPosition, result)));
+            initializeLetrecBindings(bindings, letrecEnv, values);
+            return evalSequence(body, letrecEnv, tailPosition);
         }
-
         return evalSequence(arguments.subList(1, arguments.size()), letrecEnv, tailPosition);
     }
 
@@ -903,7 +1459,14 @@ public class Evaluator {
             throw new EvalError("invalid set!");
         }
 
-        env.set(symbolExpr.name(), eval(arguments.get(1), env));
+        if (!continuationsEnabled) {
+            env.set(symbolExpr.name(), eval(arguments.get(1), env));
+            return VOID_VALUE;
+        }
+
+        env.set(symbolExpr.name(), expectValue(withCaptureFrame(
+                () -> eval(arguments.get(1), env),
+                result -> continueSetValue(env, symbolExpr.name(), result))));
         return VOID_VALUE;
     }
 
@@ -912,9 +1475,20 @@ public class Evaluator {
     }
 
     private Value evalSequence(List<Expr> expressions, Environment env, boolean tailPosition) throws EvalError {
+        if (!continuationsEnabled) {
+            Value result = VOID_VALUE;
+            for (int i = 0; i < expressions.size(); i++) {
+                result = eval(expressions.get(i), env, tailPosition && i == expressions.size() - 1);
+            }
+            return result;
+        }
+
         Value result = VOID_VALUE;
         for (int i = 0; i < expressions.size(); i++) {
-            result = eval(expressions.get(i), env, tailPosition && i == expressions.size() - 1);
+            int index = i;
+            result = expectValue(withCaptureFrame(
+                    () -> eval(expressions.get(index), env, tailPosition && index == expressions.size() - 1),
+                    value -> continueSequence(expressions, env, tailPosition, index, value)));
         }
         return result;
     }
@@ -966,9 +1540,23 @@ public class Evaluator {
     }
 
     private List<Value> evalBindingValues(List<Binding> bindings, Environment env) throws EvalError {
+        if (!continuationsEnabled) {
+            List<Value> values = new ArrayList<>(bindings.size());
+            for (Binding binding : bindings) {
+                values.add(eval(binding.valueExpr(), env));
+            }
+            return values;
+        }
+
         List<Value> values = new ArrayList<>(bindings.size());
-        for (Binding binding : bindings) {
-            values.add(eval(binding.valueExpr(), env));
+        for (int i = 0; i < bindings.size(); i++) {
+            Binding binding = bindings.get(i);
+            int index = i;
+            List<Value> prefix = List.copyOf(values);
+            Value value = expectValue(withCaptureFrame(
+                    () -> eval(binding.valueExpr(), env),
+                    result -> continueBindingValues(bindings, env, index, prefix, result)));
+            values.add(value);
         }
         return values;
     }
@@ -1099,6 +1687,12 @@ public class Evaluator {
         if (operator instanceof BuiltinProcedure builtin) {
             return builtin.apply(callPos, arguments);
         }
+        if (operator instanceof ContinuationValue continuation) {
+            if (arguments.size() != 1) {
+                throw errorAt(callPos, "wrong argument count for continuation");
+            }
+            throw new InvokeContinuationSignal(continuation, arguments.get(0).value());
+        }
         if (operator instanceof CaseLambdaProcedure caseLambda) {
             return applyCaseLambda(caseLambda, arguments, callPos, tailPosition);
         }
@@ -1161,21 +1755,146 @@ public class Evaluator {
         List<LocatedValue> arguments = initialArguments;
 
         while (true) {
-            ParameterSpec parameters = target.parameters();
-            Environment callEnv = new Environment(target.closure());
-            for (int i = 0; i < parameters.required().size(); i++) {
-                callEnv.define(parameters.required().get(i), arguments.get(i).value());
-            }
-            if (parameters.rest() != null) {
-                callEnv.define(parameters.rest(), buildList(arguments, parameters.required().size()));
-            }
-
             try {
-                return evalSequence(target.body(), callEnv, true);
+                return executeUserProcedureBody(target, arguments);
+            } catch (CaptureContinuationSignal signal) {
+                UserCallTarget capturedTarget = target;
+                List<LocatedValue> capturedArguments = List.copyOf(arguments);
+                signal.addFrame(result -> continueUserProcedure(capturedTarget, capturedArguments, result));
+                throw signal;
             } catch (TailCallSignal signal) {
                 target = signal.target();
                 arguments = signal.arguments();
             }
+        }
+    }
+
+    private Value executeUserProcedureBody(UserCallTarget target, List<LocatedValue> arguments) throws EvalError {
+        ParameterSpec parameters = target.parameters();
+        Environment callEnv = new Environment(target.closure());
+        for (int i = 0; i < parameters.required().size(); i++) {
+            callEnv.define(parameters.required().get(i), arguments.get(i).value());
+        }
+        if (parameters.rest() != null) {
+            callEnv.define(parameters.rest(), buildList(arguments, parameters.required().size()));
+        }
+        return evalSequence(target.body(), callEnv, true);
+    }
+
+    private Object continueUserProcedure(UserCallTarget initialTarget, List<LocatedValue> initialArguments,
+                                         Object bodyResult)
+            throws EvalError {
+        Object result = bodyResult;
+        UserCallTarget target = initialTarget;
+        List<LocatedValue> arguments = initialArguments;
+
+        while (true) {
+            if (!(result instanceof TailCallSignal signal)) {
+                return result;
+            }
+
+            target = signal.target();
+            arguments = signal.arguments();
+            try {
+                return executeUserProcedureBody(target, arguments);
+            } catch (CaptureContinuationSignal capture) {
+                UserCallTarget capturedTarget = target;
+                List<LocatedValue> capturedArguments = List.copyOf(arguments);
+                capture.addFrame(nextResult -> continueUserProcedure(capturedTarget, capturedArguments, nextResult));
+                throw capture;
+            } catch (TailCallSignal nextSignal) {
+                result = nextSignal;
+            }
+        }
+    }
+
+    private Value runWithContinuations(ContinuationComputation<Value> computation) throws EvalError {
+        ContinuationComputation<Value> current = computation;
+        while (true) {
+            try {
+                return current.run();
+            } catch (CaptureContinuationSignal signal) {
+                ContinuationValue continuation = new ContinuationValue(List.copyOf(signal.frames()));
+                LocatedValue procedure = signal.procedure();
+                SourcePos callPos = signal.callPos();
+                current = () -> applyCapturedContinuation(procedure, callPos, continuation);
+            } catch (InvokeContinuationSignal signal) {
+                ContinuationValue continuation = signal.continuation();
+                Object result = signal.value();
+                current = () -> expectValue(resumeContinuationFrames(continuation.frames(), 0, result));
+            }
+        }
+    }
+
+    private Value applyCapturedContinuation(LocatedValue procedure, SourcePos callPos,
+                                           ContinuationValue continuation) throws EvalError {
+        try {
+            Value result = apply(
+                    procedure.value(),
+                    procedure.pos(),
+                    List.of(new LocatedValue(continuation, callPos)),
+                    callPos);
+            return expectValue(resumeContinuationFrames(continuation.frames(), 0, result));
+        } catch (CaptureContinuationSignal signal) {
+            signal.addFrame(result -> resumeContinuationFrames(continuation.frames(), 0, result));
+            throw signal;
+        }
+    }
+
+    private Object resumeContinuationFrames(List<ContinuationFrame> frames, int startIndex, Object currentResult)
+            throws EvalError {
+        Object result = currentResult;
+        for (int i = startIndex; i < frames.size(); i++) {
+            ContinuationFrame frame = frames.get(i);
+            try {
+                result = frame.resume(result);
+            } catch (CaptureContinuationSignal signal) {
+                int nextIndex = i + 1;
+                signal.addFrame(nextResult -> resumeContinuationFrames(frames, nextIndex, nextResult));
+                throw signal;
+            } catch (TailCallSignal signal) {
+                result = signal;
+            }
+        }
+        return result;
+    }
+
+    private Value expectValue(Object result) {
+        if (result instanceof Value value) {
+            return value;
+        }
+        if (result instanceof TailCallSignal) {
+            throw new IllegalStateException("tail call escaped continuation handling");
+        }
+        throw new IllegalStateException("unexpected continuation result: " + result);
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<LocatedValue> expectLocatedValues(Object result) {
+        if (result instanceof TailCallSignal) {
+            throw new IllegalStateException("tail call escaped argument evaluation");
+        }
+        return (List<LocatedValue>) result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Value> expectValues(Object result) {
+        if (result instanceof TailCallSignal) {
+            throw new IllegalStateException("tail call escaped value collection");
+        }
+        return (List<Value>) result;
+    }
+
+    private <T> T withCaptureFrame(ContinuationComputation<T> computation, ContinuationFrame frame)
+            throws EvalError {
+        if (!continuationsEnabled) {
+            return computation.run();
+        }
+        try {
+            return computation.run();
+        } catch (CaptureContinuationSignal signal) {
+            signal.addFrame(frame);
+            throw signal;
         }
     }
 
@@ -1607,6 +2326,16 @@ public class Evaluator {
         return boolValue(isProcedureValue(arguments.get(0).value()));
     }
 
+    private Value builtinCallWithCurrentContinuation(String name, SourcePos callPos,
+                                                     List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, name, callPos);
+        if (!isProcedureValue(arguments.get(0).value())) {
+            throw errorAt(arguments.get(0).pos(), "attempted to call non-procedure");
+        }
+        throw new CaptureContinuationSignal(arguments.get(0), callPos);
+    }
+
     private Value builtinSymbolPredicate(SourcePos callPos, List<LocatedValue> arguments)
             throws EvalError {
         expectArgumentCount(arguments, 1, "symbol?", callPos);
@@ -1647,14 +2376,56 @@ public class Evaluator {
             throw errorAt(callPos, "wrong argument count for map");
         }
 
+        if (!continuationsEnabled) {
+            LocatedValue operator = arguments.get(0);
+            List<LocatedValue> listArguments = arguments.subList(1, arguments.size());
+            List<Value> cursors = new ArrayList<>(listArguments.size());
+            for (LocatedValue listArgument : listArguments) {
+                cursors.add(listArgument.value());
+            }
+
+            List<Value> results = new ArrayList<>();
+            while (true) {
+                int emptyCount = 0;
+                for (int i = 0; i < cursors.size(); i++) {
+                    Value current = cursors.get(i);
+                    if (current instanceof EmptyListValue) {
+                        emptyCount++;
+                        continue;
+                    }
+                    if (!(current instanceof PairValue)) {
+                        throw errorAt(listArguments.get(i).pos(), "expected list for map");
+                    }
+                }
+
+                if (emptyCount > 0) {
+                    if (emptyCount != cursors.size()) {
+                        throw errorAt(callPos, "expected lists of equal length for map");
+                    }
+                    return buildListFromValues(results);
+                }
+
+                List<LocatedValue> mappedArguments = new ArrayList<>(cursors.size());
+                for (int i = 0; i < cursors.size(); i++) {
+                    PairValue pair = (PairValue) cursors.get(i);
+                    mappedArguments.add(new LocatedValue(pair.car(), listArguments.get(i).pos()));
+                    cursors.set(i, pair.cdr());
+                }
+                results.add(apply(operator.value(), operator.pos(), mappedArguments, callPos));
+            }
+        }
+
         LocatedValue operator = arguments.get(0);
         List<LocatedValue> listArguments = arguments.subList(1, arguments.size());
         List<Value> cursors = new ArrayList<>(listArguments.size());
         for (LocatedValue listArgument : listArguments) {
             cursors.add(listArgument.value());
         }
+        return executeMap(operator, listArguments, callPos, cursors, new ArrayList<>());
+    }
 
-        List<Value> results = new ArrayList<>();
+    private Value executeMap(LocatedValue operator, List<LocatedValue> listArguments, SourcePos callPos,
+                             List<Value> cursors, List<Value> results) throws EvalError {
         while (true) {
             int emptyCount = 0;
             for (int i = 0; i < cursors.size(); i++) {
@@ -1681,13 +2452,68 @@ public class Evaluator {
                 mappedArguments.add(new LocatedValue(pair.car(), listArguments.get(i).pos()));
                 cursors.set(i, pair.cdr());
             }
-            results.add(apply(operator.value(), operator.pos(), mappedArguments, callPos));
+            List<Value> cursorSnapshot = List.copyOf(cursors);
+            List<Value> resultSnapshot = List.copyOf(results);
+            Value mapped = expectValue(withCaptureFrame(
+                    () -> apply(operator.value(), operator.pos(), mappedArguments, callPos),
+                    result -> continueMap(operator, listArguments, callPos, cursorSnapshot, resultSnapshot, result)));
+            results.add(mapped);
         }
+    }
+
+    private Object continueMap(LocatedValue operator, List<LocatedValue> listArguments, SourcePos callPos,
+                               List<Value> cursors, List<Value> results, Object currentResult)
+            throws EvalError {
+        if (currentResult instanceof TailCallSignal) {
+            return currentResult;
+        }
+
+        List<Value> resumedResults = new ArrayList<>(results);
+        resumedResults.add(expectValue(currentResult));
+        return executeMap(operator, listArguments, callPos, new ArrayList<>(cursors), resumedResults);
     }
 
     private Value builtinForEach(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
         if (arguments.size() < 2) {
             throw errorAt(callPos, "wrong argument count for for-each");
+        }
+
+        if (!continuationsEnabled) {
+            LocatedValue operator = arguments.get(0);
+            List<LocatedValue> listArguments = arguments.subList(1, arguments.size());
+            List<Value> cursors = new ArrayList<>(listArguments.size());
+            for (LocatedValue listArgument : listArguments) {
+                cursors.add(listArgument.value());
+            }
+
+            while (true) {
+                int emptyCount = 0;
+                for (int i = 0; i < cursors.size(); i++) {
+                    Value current = cursors.get(i);
+                    if (current instanceof EmptyListValue) {
+                        emptyCount++;
+                        continue;
+                    }
+                    if (!(current instanceof PairValue)) {
+                        throw errorAt(listArguments.get(i).pos(), "expected list for for-each");
+                    }
+                }
+
+                if (emptyCount > 0) {
+                    if (emptyCount != cursors.size()) {
+                        throw errorAt(callPos, "expected lists of equal length for for-each");
+                    }
+                    return VOID_VALUE;
+                }
+
+                List<LocatedValue> mappedArguments = new ArrayList<>(cursors.size());
+                for (int i = 0; i < cursors.size(); i++) {
+                    PairValue pair = (PairValue) cursors.get(i);
+                    mappedArguments.add(new LocatedValue(pair.car(), listArguments.get(i).pos()));
+                    cursors.set(i, pair.cdr());
+                }
+                apply(operator.value(), operator.pos(), mappedArguments, callPos);
+            }
         }
 
         LocatedValue operator = arguments.get(0);
@@ -1696,7 +2522,11 @@ public class Evaluator {
         for (LocatedValue listArgument : listArguments) {
             cursors.add(listArgument.value());
         }
+        return executeForEach(operator, listArguments, callPos, cursors);
+    }
 
+    private Value executeForEach(LocatedValue operator, List<LocatedValue> listArguments, SourcePos callPos,
+                                 List<Value> cursors) throws EvalError {
         while (true) {
             int emptyCount = 0;
             for (int i = 0; i < cursors.size(); i++) {
@@ -1723,8 +2553,22 @@ public class Evaluator {
                 mappedArguments.add(new LocatedValue(pair.car(), listArguments.get(i).pos()));
                 cursors.set(i, pair.cdr());
             }
-            apply(operator.value(), operator.pos(), mappedArguments, callPos);
+            List<Value> cursorSnapshot = List.copyOf(cursors);
+            expectValue(withCaptureFrame(
+                    () -> apply(operator.value(), operator.pos(), mappedArguments, callPos),
+                    result -> continueForEach(operator, listArguments, callPos, cursorSnapshot, result)));
         }
+    }
+
+    private Object continueForEach(LocatedValue operator, List<LocatedValue> listArguments, SourcePos callPos,
+                                   List<Value> cursors, Object currentResult)
+            throws EvalError {
+        if (currentResult instanceof TailCallSignal) {
+            return currentResult;
+        }
+
+        expectValue(currentResult);
+        return executeForEach(operator, listArguments, callPos, new ArrayList<>(cursors));
     }
 
     private Value builtinAdd(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
@@ -2774,6 +3618,53 @@ public class Evaluator {
         }
     }
 
+    private static final class CaptureContinuationSignal extends RuntimeException {
+        private final LocatedValue procedure;
+        private final SourcePos callPos;
+        private final List<ContinuationFrame> frames = new ArrayList<>();
+
+        private CaptureContinuationSignal(LocatedValue procedure, SourcePos callPos) {
+            super(null, null, false, false);
+            this.procedure = procedure;
+            this.callPos = callPos;
+        }
+
+        private LocatedValue procedure() {
+            return procedure;
+        }
+
+        private SourcePos callPos() {
+            return callPos;
+        }
+
+        private List<ContinuationFrame> frames() {
+            return frames;
+        }
+
+        private void addFrame(ContinuationFrame frame) {
+            frames.add(frame);
+        }
+    }
+
+    private static final class InvokeContinuationSignal extends RuntimeException {
+        private final ContinuationValue continuation;
+        private final Object value;
+
+        private InvokeContinuationSignal(ContinuationValue continuation, Object value) {
+            super(null, null, false, false);
+            this.continuation = continuation;
+            this.value = value;
+        }
+
+        private ContinuationValue continuation() {
+            return continuation;
+        }
+
+        private Object value() {
+            return value;
+        }
+    }
+
     private record ExactNumber(BigInteger numerator, BigInteger denominator) {
         private ExactNumber {
             if (denominator.signum() == 0) {
@@ -2793,7 +3684,7 @@ public class Evaluator {
 
     private sealed interface Value permits NumberValue, BoolValue, StringValue, SymbolValue,
             CharValue, PairValue, VectorValue, EmptyListValue, BuiltinProcedure, LambdaProcedure,
-            CaseLambdaProcedure, RecordValue, UninitializedValue, VoidValue {
+            CaseLambdaProcedure, ContinuationValue, RecordValue, UninitializedValue, VoidValue {
         String render();
     }
 
@@ -3003,6 +3894,13 @@ public class Evaluator {
         }
     }
 
+    private record ContinuationValue(List<ContinuationFrame> frames) implements Value {
+        @Override
+        public String render() {
+            return "#<procedure continuation>";
+        }
+    }
+
     private record LambdaProcedure(String name, ParameterSpec parameters, List<Expr> body,
                                    Environment closure) implements Value {
         private String displayName() {
@@ -3061,6 +3959,16 @@ public class Evaluator {
     @FunctionalInterface
     private interface Comparator {
         boolean test(int ordering);
+    }
+
+    @FunctionalInterface
+    private interface ContinuationComputation<T> {
+        T run() throws EvalError;
+    }
+
+    @FunctionalInterface
+    private interface ContinuationFrame {
+        Object resume(Object result) throws EvalError;
     }
 
     @FunctionalInterface
@@ -3209,7 +4117,8 @@ public class Evaluator {
     private static boolean isProcedureValue(Value value) {
         return value instanceof BuiltinProcedure
                 || value instanceof LambdaProcedure
-                || value instanceof CaseLambdaProcedure;
+                || value instanceof CaseLambdaProcedure
+                || value instanceof ContinuationValue;
     }
 
     private static boolean isEllipsisExpr(Expr expr) {
