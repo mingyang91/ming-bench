@@ -124,6 +124,13 @@ public class Evaluator {
         SchemeVector(Object[] elements) { this.elements = elements; }
     }
 
+    // --- Vector literal in AST (parsed from #(...)) ---
+
+    private static class VectorLiteral {
+        final List<Object> elements;
+        VectorLiteral(List<Object> elements) { this.elements = elements; }
+    }
+
     // --- Record types (define-record-type) ---
 
     private static class RecordType {
@@ -148,7 +155,7 @@ public class Evaluator {
         "quote", "if", "define", "lambda", "let", "let*", "set!", "begin", "cond",
         "and", "or", "define-syntax", "syntax-rules", "else", "define-record-type",
         "letrec", "letrec*", "case", "do", "guard", "case-lambda",
-        "syntax-case", "syntax", "with-syntax"
+        "syntax-case", "syntax", "with-syntax", "quasiquote", "unquote", "unquote-splicing"
     );
 
     // --- Continuation types for CEK machine ---
@@ -163,6 +170,7 @@ public class Evaluator {
     private record AndK(List<Object> exprs, int nextIdx, Env env, Kont k) implements Kont {}
     private record OrK(List<Object> exprs, int nextIdx, Env env, Kont k) implements Kont {}
     private record CondTestK(List<Object> clause, List<Object> fullList, int nextClauseIdx, Env env, Kont k) implements Kont {}
+    private record CondArrowK(Object testValue, Kont k) implements Kont {}
     private record LetBindK(List<String> params, List<Object> inits, int nextIdx, List<Object> evaluated, Env outerEnv, List<Object> body, String loopName, Kont k) implements Kont {}
     private record LetStarBindK(List<String> names, List<Object> inits, int nextIdx, Env letEnv, List<Object> body, Kont k) implements Kont {}
     private record LetrecBindK(List<String> names, List<Object> inits, int nextIdx, Env letEnv, List<Object> body, Kont k) implements Kont {}
@@ -987,6 +995,15 @@ public class Evaluator {
         // exception handling
         globalEnv.define("with-exception-handler", WITH_EXCEPTION_HANDLER_PROC);
         globalEnv.define("raise", RAISE_PROC);
+        globalEnv.define("error", (BuiltinProc) args -> {
+            if (args.isEmpty()) throw new EvalError("error requires at least one argument");
+            StringBuilder msg = new StringBuilder();
+            msg.append(args.get(0) instanceof SchemeString s ? s.value() : displayString(args.get(0)));
+            for (int ei = 1; ei < args.size(); ei++) {
+                msg.append(" ").append(schemeToString(args.get(ei)));
+            }
+            throw new EvalError(msg.toString());
+        });
 
         // Multiple values
         globalEnv.define("values", VALUES_PROC);
@@ -1059,6 +1076,20 @@ public class Evaluator {
                 tokens.add(new Token("'", line, col));
                 i++;
                 col++;
+            } else if (c == '`') {
+                tokens.add(new Token("`", line, col));
+                i++;
+                col++;
+            } else if (c == ',') {
+                if (i + 1 < len && input.charAt(i + 1) == '@') {
+                    tokens.add(new Token(",@", line, col));
+                    i += 2;
+                    col += 2;
+                } else {
+                    tokens.add(new Token(",", line, col));
+                    i++;
+                    col++;
+                }
             } else if (c == '(') {
                 tokens.add(new Token("(", line, col));
                 i++;
@@ -1106,7 +1137,12 @@ public class Evaluator {
                 int startCol = col;
                 if (i + 1 < len) {
                     char next = input.charAt(i + 1);
-                    if (next == '\'') {
+                    if (next == '(') {
+                        // #( = vector literal
+                        tokens.add(new Token("#(", line, startCol));
+                        i += 2;
+                        col += 2;
+                    } else if (next == '\'') {
                         // #' = syntax quote
                         tokens.add(new Token("#'", line, startCol));
                         i += 2;
@@ -1183,6 +1219,30 @@ public class Evaluator {
             quoteExpr.add(quoted);
             return new SourceExpr(quoteExpr, token.line, token.col);
         }
+        if ("`".equals(token.value)) {
+            pos[0]++;
+            Object body = parse(tokens, pos);
+            List<Object> qqExpr = new ArrayList<>();
+            qqExpr.add("quasiquote");
+            qqExpr.add(body);
+            return new SourceExpr(qqExpr, token.line, token.col);
+        }
+        if (",".equals(token.value)) {
+            pos[0]++;
+            Object body = parse(tokens, pos);
+            List<Object> uqExpr = new ArrayList<>();
+            uqExpr.add("unquote");
+            uqExpr.add(body);
+            return new SourceExpr(uqExpr, token.line, token.col);
+        }
+        if (",@".equals(token.value)) {
+            pos[0]++;
+            Object body = parse(tokens, pos);
+            List<Object> usExpr = new ArrayList<>();
+            usExpr.add("unquote-splicing");
+            usExpr.add(body);
+            return new SourceExpr(usExpr, token.line, token.col);
+        }
         if ("#'".equals(token.value)) {
             pos[0]++;
             Object syntaxed = parse(tokens, pos);
@@ -1190,6 +1250,18 @@ public class Evaluator {
             syntaxExpr.add("syntax");
             syntaxExpr.add(syntaxed);
             return new SourceExpr(syntaxExpr, token.line, token.col);
+        }
+        if ("#(".equals(token.value)) {
+            pos[0]++;
+            List<Object> elements = new ArrayList<>();
+            while (pos[0] < tokens.size() && !")".equals(tokens.get(pos[0]).value)) {
+                elements.add(parse(tokens, pos));
+            }
+            if (pos[0] >= tokens.size()) {
+                throw new EvalError("missing closing parenthesis for #( at " + token.line + ":" + token.col);
+            }
+            pos[0]++;
+            return new SourceExpr(new VectorLiteral(elements), token.line, token.col);
         }
         if ("(".equals(token.value)) {
             pos[0]++;
@@ -1215,7 +1287,29 @@ public class Evaluator {
         if (ast instanceof SourceExpr se) {
             return astToScheme(se.expr);
         }
+        if (ast instanceof VectorLiteral vl) {
+            Object[] elts = new Object[vl.elements.size()];
+            for (int i = 0; i < vl.elements.size(); i++) {
+                elts[i] = astToScheme(vl.elements.get(i));
+            }
+            return new SchemeVector(elts);
+        }
         if (ast instanceof List<?> list) {
+            // Check for dotted pair notation: (a b . c)
+            int dotIdx = -1;
+            for (int i = 0; i < list.size(); i++) {
+                Object e = list.get(i);
+                if (e instanceof SourceExpr se2) e = se2.expr;
+                if (".".equals(e)) { dotIdx = i; break; }
+            }
+            if (dotIdx >= 0 && dotIdx == list.size() - 2) {
+                // Dotted pair: elements before dot are consed, last element is cdr
+                Object result = astToScheme(list.get(list.size() - 1));
+                for (int i = dotIdx - 1; i >= 0; i--) {
+                    result = new Pair(astToScheme(list.get(i)), result);
+                }
+                return result;
+            }
             Object result = NIL;
             for (int i = list.size() - 1; i >= 0; i--) {
                 result = new Pair(astToScheme(list.get(i)), result);
@@ -1349,6 +1443,14 @@ public class Evaluator {
                 expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
                 cekValue = expr; cekEval = false; return;
             }
+            if (expr instanceof VectorLiteral vl) {
+                // #(...) is self-quoting - elements are not evaluated
+                Object[] elts = new Object[vl.elements.size()];
+                for (int i = 0; i < vl.elements.size(); i++) {
+                    elts[i] = astToScheme(vl.elements.get(i));
+                }
+                cekValue = new SchemeVector(elts); cekEval = false; return;
+            }
             if (expr instanceof String sym) {
                 cekValue = env.lookup(sym); cekEval = false; return;
             }
@@ -1365,6 +1467,10 @@ public class Evaluator {
                         case "quote" -> {
                             if (list.size() < 2) throw new EvalError("bad syntax: quote");
                             cekValue = astToScheme(list.get(1)); cekEval = false; return;
+                        }
+                        case "quasiquote" -> {
+                            if (list.size() < 2) throw new EvalError("bad syntax: quasiquote");
+                            cekValue = expandQuasiquote(list.get(1), env); cekEval = false; return;
                         }
                         case "if" -> {
                             if (list.size() < 3) throw new EvalError("bad syntax: if requires at least 2 parts");
@@ -1701,14 +1807,28 @@ public class Evaluator {
 
         if (k instanceof CondTestK ctk) {
             if (!isFalse(value)) {
-                // Test passed - evaluate clause body
+                // Test passed
                 if (ctk.clause.size() == 1) { cekK = ctk.k; return; /* return test value */ }
+                // Check for => arrow syntax: (test => proc)
+                Object second = ctk.clause.get(1);
+                if (second instanceof SourceExpr se) second = se.expr;
+                if ("=>".equals(second) && ctk.clause.size() == 3) {
+                    // Evaluate proc, then apply it to the test value
+                    cekK = new CondArrowK(value, ctk.k);
+                    cekExpr = ctk.clause.get(2); cekEnv = ctk.env; cekEval = true;
+                    return;
+                }
                 cekEnv = ctk.env; cekK = ctk.k;
                 evalBodyExprs(ctk.clause, 1, ctk.env);
                 return;
             }
             // Test failed - try next clause
             cekHandleCondFrom(ctk.fullList, ctk.nextClauseIdx, ctk.env, ctk.k); return;
+        }
+
+        if (k instanceof CondArrowK cak) {
+            // value is the proc; apply it to the test value
+            cekApplyProc(value, List.of(cak.testValue), cak.k); return;
         }
 
         if (k instanceof LetBindK lbk) {
@@ -2478,6 +2598,69 @@ public class Evaluator {
         return base + "__m" + (gensymCounter++);
     }
 
+    // --- Quasiquote expansion ---
+
+    private Object expandQuasiquote(Object template, Env env) throws EvalError {
+        template = unwrapSE(template);
+
+        if (template instanceof List<?> list) {
+            if (!list.isEmpty()) {
+                Object first = unwrapSE(list.get(0));
+                if ("unquote".equals(first) && list.size() == 2) {
+                    return eval(list.get(1), env);
+                }
+            }
+            // Check for dotted pair: (a b . c)
+            int dotIdx = -1;
+            for (int i = 0; i < list.size(); i++) {
+                Object e = list.get(i);
+                if (e instanceof SourceExpr se) e = se.expr;
+                if (".".equals(e)) { dotIdx = i; break; }
+            }
+            // Build result list, handling unquote-splicing
+            List<?> parts = dotIdx >= 0 ? list.subList(0, dotIdx) : list;
+            Object result;
+            if (dotIdx >= 0 && dotIdx == list.size() - 2) {
+                result = expandQuasiquote(list.get(list.size() - 1), env);
+            } else {
+                result = NIL;
+            }
+            for (int i = parts.size() - 1; i >= 0; i--) {
+                Object elt = unwrapSE(parts.get(i));
+                if (elt instanceof List<?> eltList && !eltList.isEmpty() && "unquote-splicing".equals(unwrapSE(eltList.get(0)))) {
+                    Object spliced = eval(eltList.get(1), env);
+                    result = appendTwo(spliced, result);
+                } else {
+                    result = new Pair(expandQuasiquote(parts.get(i), env), result);
+                }
+            }
+            return result;
+        }
+
+        if (template instanceof VectorLiteral vl) {
+            List<Object> elts = new ArrayList<>();
+            for (int i = 0; i < vl.elements.size(); i++) {
+                Object elt = unwrapSE(vl.elements.get(i));
+                if (elt instanceof List<?> eltList && !eltList.isEmpty() && "unquote-splicing".equals(unwrapSE(eltList.get(0)))) {
+                    Object spliced = eval(eltList.get(1), env);
+                    Object curr = spliced;
+                    while (curr instanceof Pair p) { elts.add(p.car); curr = p.cdr; }
+                } else {
+                    elts.add(expandQuasiquote(vl.elements.get(i), env));
+                }
+            }
+            return new SchemeVector(elts.toArray());
+        }
+
+        // Atom — treat like quote
+        return astToScheme(template);
+    }
+
+    private Object toSchemeList(Object val) {
+        // Already a Scheme list (Pair/NIL), return as-is
+        return val;
+    }
+
     @SuppressWarnings("unchecked")
     private Object expandMacro(SyntaxRulesMacro macro, List<Object> form) throws EvalError {
         for (Object[] rule : macro.rules) {
@@ -2500,6 +2683,28 @@ public class Evaluator {
     private boolean matchPatternList(List<?> patList, List<?> inList, int startIdx,
                                       List<String> literals, Map<String, Object> bindings,
                                       Set<String> patternVars, Set<String> ellipsisVars) {
+        // Check for dotted pair pattern: (a b . rest)
+        int dotIdx = -1;
+        for (int i = startIdx; i < patList.size(); i++) {
+            if (".".equals(unwrapSE(patList.get(i)))) { dotIdx = i; break; }
+        }
+        if (dotIdx >= 0 && dotIdx == patList.size() - 2) {
+            // Dotted pattern: match elements before dot, then match rest pattern against remaining
+            int fixedCount = dotIdx - startIdx;
+            if (inList.size() - startIdx < fixedCount) return false;
+            for (int i = startIdx; i < dotIdx; i++) {
+                if (!matchPattern(patList.get(i), inList.get(i), literals, bindings, patternVars, ellipsisVars))
+                    return false;
+            }
+            // Match the rest pattern against remaining input elements as a list
+            Object restPat = patList.get(dotIdx + 1);
+            List<Object> restInput = new ArrayList<>();
+            for (int i = dotIdx; i < inList.size(); i++) {
+                restInput.add(inList.get(i));
+            }
+            return matchPattern(restPat, restInput, literals, bindings, patternVars, ellipsisVars);
+        }
+
         int ellipsisIdx = -1;
         for (int i = startIdx; i < patList.size(); i++) {
             if ("...".equals(unwrapSE(patList.get(i)))) {
@@ -2568,6 +2773,17 @@ public class Evaluator {
             return true;
         }
 
+        if (pattern instanceof VectorLiteral vl) {
+            if (input instanceof VectorLiteral ivl) {
+                return matchPatternList(vl.elements, ivl.elements, 0, literals, bindings, patternVars, ellipsisVars);
+            }
+            if (input instanceof SchemeVector sv) {
+                List<Object> inputElts = new ArrayList<>(List.of(sv.elements));
+                return matchPatternList(vl.elements, inputElts, 0, literals, bindings, patternVars, ellipsisVars);
+            }
+            return false;
+        }
+
         if (pattern instanceof List<?> patList) {
             if (!(input instanceof List<?>)) return false;
             return matchPatternList(patList, (List<?>) input, 0, literals, bindings, patternVars, ellipsisVars);
@@ -2606,6 +2822,34 @@ public class Evaluator {
             }
         }
 
+        if (template instanceof VectorLiteral vl) {
+            // Expand vector template elements (same logic as list), then wrap in SchemeVector
+            List<Object> result = new ArrayList<>();
+            for (int i = 0; i < vl.elements.size(); i++) {
+                if ("...".equals(unwrapSE(vl.elements.get(i)))) continue;
+
+                if (i + 1 < vl.elements.size() && "...".equals(unwrapSE(vl.elements.get(i + 1)))) {
+                    Object subTmpl = vl.elements.get(i);
+                    Set<String> usedEVars = findEllipsisVars(subTmpl, ellipsisVars);
+                    if (!usedEVars.isEmpty()) {
+                        String evar = usedEVars.iterator().next();
+                        List<Object> eList = (List<Object>) bindings.get(evar);
+                        for (Object elt : eList) {
+                            Map<String, Object> newBindings = new HashMap<>(bindings);
+                            newBindings.put(evar, elt);
+                            Set<String> newEVars = new HashSet<>(ellipsisVars);
+                            newEVars.remove(evar);
+                            result.add(expandTemplate(subTmpl, newBindings, patternVars, newEVars, defEnv, renames));
+                        }
+                    }
+                    i++; // skip ...
+                } else {
+                    result.add(expandTemplate(vl.elements.get(i), bindings, patternVars, ellipsisVars, defEnv, renames));
+                }
+            }
+            return new SchemeVector(result.toArray());
+        }
+
         if (template instanceof List<?> tmplList) {
             List<Object> result = new ArrayList<>();
             for (int i = 0; i < tmplList.size(); i++) {
@@ -2641,6 +2885,8 @@ public class Evaluator {
         Set<String> found = new HashSet<>();
         if (template instanceof String sym && ellipsisVars.contains(sym)) {
             found.add(sym);
+        } else if (template instanceof VectorLiteral vl) {
+            for (Object elt : vl.elements) found.addAll(findEllipsisVars(elt, ellipsisVars));
         } else if (template instanceof List<?> list) {
             for (Object elt : list) found.addAll(findEllipsisVars(elt, ellipsisVars));
         }
@@ -2666,6 +2912,30 @@ public class Evaluator {
             }
             // Non-pattern-variable: return as-is (symbol)
             return sym;
+        }
+
+        if (template instanceof VectorLiteral vl) {
+            List<Object> result = new ArrayList<>();
+            for (int i = 0; i < vl.elements.size(); i++) {
+                if ("...".equals(unwrapSE(vl.elements.get(i)))) continue;
+
+                if (i + 1 < vl.elements.size() && "...".equals(unwrapSE(vl.elements.get(i + 1)))) {
+                    Object subTmpl = vl.elements.get(i);
+                    String evar = findSyntaxEllipsisVar(subTmpl, env);
+                    if (evar != null) {
+                        SyntaxEllipsis se = (SyntaxEllipsis) env.lookup(evar);
+                        for (Object elt : se.elements) {
+                            Env iterEnv = new Env(env);
+                            iterEnv.define(evar, new SyntaxObject(elt));
+                            result.add(expandSyntaxTemplate(subTmpl, iterEnv, renames));
+                        }
+                    }
+                    i++; // skip ...
+                } else {
+                    result.add(expandSyntaxTemplate(vl.elements.get(i), env, renames));
+                }
+            }
+            return new SchemeVector(result.toArray());
         }
 
         if (template instanceof List<?> tmplList) {
@@ -2704,6 +2974,12 @@ public class Evaluator {
                 if (val instanceof SyntaxEllipsis) return sym;
             } catch (EvalError e) { /* not bound */ }
             return null;
+        }
+        if (template instanceof VectorLiteral vl) {
+            for (Object elt : vl.elements) {
+                String found = findSyntaxEllipsisVar(elt, env);
+                if (found != null) return found;
+            }
         }
         if (template instanceof List<?> list) {
             for (Object elt : list) {
