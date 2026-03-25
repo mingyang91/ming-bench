@@ -563,6 +563,13 @@ type interpreter struct {
 	nextID int
 }
 
+type evalStep struct {
+	node  expr
+	scope *env
+	value value
+	done  bool
+}
+
 func newInterpreter() *interpreter {
 	it := &interpreter{
 		global: newEnv(nil),
@@ -728,48 +735,352 @@ func (it *interpreter) evalProgram(exprs []expr) (value, error) {
 }
 
 func (it *interpreter) evalSequence(scope *env, exprs []expr) (value, error) {
-	result := value(voidValue{})
-	for _, node := range exprs {
-		current, err := it.eval(node, scope)
-		if err != nil {
-			return nil, err
-		}
-		result = current
+	step, err := it.prepareTailSequence(scope, exprs)
+	if err != nil {
+		return nil, err
 	}
-	return result, nil
+	if step.done {
+		return step.value, nil
+	}
+	return it.eval(step.node, step.scope)
 }
 
 func (it *interpreter) eval(node expr, scope *env) (value, error) {
-	switch expr := node.(type) {
-	case *intExpr:
-		return expr.value, nil
-	case *rationalExpr:
-		return expr.value, nil
-	case *inexactExpr:
-		return expr.value, nil
-	case *boolExpr:
-		return expr.value, nil
-	case *stringExpr:
-		return newStringValue(expr.value), nil
-	case *charExpr:
-		return charValue(expr.value), nil
-	case *symbolExpr:
-		value, ok := it.lookupSymbol(scope, expr)
-		if !ok {
-			return nil, newEvalError(ErrUnboundVariable, fmt.Sprintf("unbound variable: %s", expr.name), expr.at)
+	for {
+		switch expr := node.(type) {
+		case *intExpr:
+			return expr.value, nil
+		case *rationalExpr:
+			return expr.value, nil
+		case *inexactExpr:
+			return expr.value, nil
+		case *boolExpr:
+			return expr.value, nil
+		case *stringExpr:
+			return newStringValue(expr.value), nil
+		case *charExpr:
+			return charValue(expr.value), nil
+		case *symbolExpr:
+			value, ok := it.lookupSymbol(scope, expr)
+			if !ok {
+				return nil, newEvalError(ErrUnboundVariable, fmt.Sprintf("unbound variable: %s", expr.name), expr.at)
+			}
+			if pending, ok := value.(*uninitializedValue); ok {
+				return nil, newEvalError(ErrUnboundVariable, fmt.Sprintf("uninitialized variable: %s", pending.name), expr.at)
+			}
+			if _, isMacro := value.(*syntaxRuleMacro); isMacro {
+				return nil, newEvalError(ErrSyntax, fmt.Sprintf("cannot use syntax as value: %s", expr.name), expr.at)
+			}
+			return value, nil
+		case *listExpr:
+			if len(expr.elements) == 0 {
+				return nil, newEvalError(ErrSyntax, "cannot evaluate empty list", expr.at)
+			}
+
+			if sym, ok := expr.elements[0].(*symbolExpr); ok {
+				var (
+					step evalStep
+					err  error
+				)
+
+				switch sym.name {
+				case "and":
+					if len(expr.elements) == 1 {
+						return true, nil
+					}
+					for _, arg := range expr.elements[1 : len(expr.elements)-1] {
+						current, err := it.eval(arg, scope)
+						if err != nil {
+							return nil, err
+						}
+						if !isTruthy(current) {
+							return current, nil
+						}
+					}
+					node = expr.elements[len(expr.elements)-1]
+					continue
+				case "or":
+					if len(expr.elements) == 1 {
+						return false, nil
+					}
+					for _, arg := range expr.elements[1 : len(expr.elements)-1] {
+						current, err := it.eval(arg, scope)
+						if err != nil {
+							return nil, err
+						}
+						if isTruthy(current) {
+							return current, nil
+						}
+					}
+					node = expr.elements[len(expr.elements)-1]
+					continue
+				case "define":
+					return it.evalDefine(scope, expr)
+				case "define-record-type":
+					return it.evalDefineRecordType(scope, expr)
+				case "define-syntax":
+					return it.evalDefineSyntax(scope, expr)
+				case "if":
+					if len(expr.elements) != 3 && len(expr.elements) != 4 {
+						return nil, newEvalError(ErrSyntax, "if: expected a test, consequent, and optional alternate", expr.at)
+					}
+
+					test, err := it.eval(expr.elements[1], scope)
+					if err != nil {
+						return nil, err
+					}
+					if isTruthy(test) {
+						node = expr.elements[2]
+						continue
+					}
+					if len(expr.elements) == 4 {
+						node = expr.elements[3]
+						continue
+					}
+					return voidValue{}, nil
+				case "quote":
+					return it.evalQuote(expr)
+				case "lambda":
+					return it.evalLambda(scope, expr)
+				case "case-lambda":
+					return it.evalCaseLambda(scope, expr)
+				case "set!":
+					return it.evalSet(scope, expr)
+				case "begin":
+					step, err = it.prepareTailSequence(scope, expr.elements[1:])
+				case "cond":
+					step, err = it.prepareTailCond(scope, expr)
+				case "let":
+					step, err = it.prepareTailLet(scope, expr)
+				case "letrec":
+					return it.evalLetRec(scope, expr, false)
+				case "letrec*":
+					return it.evalLetRec(scope, expr, true)
+				case "case":
+					step, err = it.prepareTailCase(scope, expr)
+				case "do":
+					return it.evalDo(scope, expr)
+				default:
+					if expanded, ok, err := it.expandMacroCall(expr, scope); ok || err != nil {
+						if err != nil {
+							return nil, err
+						}
+						node = expanded
+						continue
+					}
+				}
+
+				if err != nil {
+					return nil, err
+				}
+				if step.done {
+					return step.value, nil
+				}
+				if step.node != nil {
+					node = step.node
+					scope = step.scope
+					continue
+				}
+			}
+
+			operator, err := it.eval(expr.elements[0], scope)
+			if err != nil {
+				return nil, err
+			}
+
+			args := make([]value, 0, len(expr.elements)-1)
+			for _, argExpr := range expr.elements[1:] {
+				arg, err := it.eval(argExpr, scope)
+				if err != nil {
+					return nil, err
+				}
+				args = append(args, arg)
+			}
+
+			step, err := it.applyProcedureTail(operator, args, expr.at)
+			if err != nil {
+				return nil, err
+			}
+			if step.done {
+				return step.value, nil
+			}
+			node = step.node
+			scope = step.scope
+		default:
+			return nil, newEvalError(ErrSyntax, "unknown expression", node.pos())
 		}
-		if pending, ok := value.(*uninitializedValue); ok {
-			return nil, newEvalError(ErrUnboundVariable, fmt.Sprintf("uninitialized variable: %s", pending.name), expr.at)
-		}
-		if _, isMacro := value.(*syntaxRuleMacro); isMacro {
-			return nil, newEvalError(ErrSyntax, fmt.Sprintf("cannot use syntax as value: %s", expr.name), expr.at)
-		}
-		return value, nil
-	case *listExpr:
-		return it.evalList(expr, scope)
-	default:
-		return nil, newEvalError(ErrSyntax, "unknown expression", node.pos())
 	}
+}
+
+func doneEvalStep(v value) evalStep {
+	return evalStep{
+		value: v,
+		done:  true,
+	}
+}
+
+func nextEvalStep(node expr, scope *env) evalStep {
+	return evalStep{
+		node:  node,
+		scope: scope,
+	}
+}
+
+func (it *interpreter) prepareTailSequence(scope *env, exprs []expr) (evalStep, error) {
+	if len(exprs) == 0 {
+		return doneEvalStep(voidValue{}), nil
+	}
+
+	for _, current := range exprs[:len(exprs)-1] {
+		if _, err := it.eval(current, scope); err != nil {
+			return evalStep{}, err
+		}
+	}
+
+	return nextEvalStep(exprs[len(exprs)-1], scope), nil
+}
+
+func (it *interpreter) prepareTailCond(scope *env, list *listExpr) (evalStep, error) {
+	if len(list.elements) == 1 {
+		return doneEvalStep(voidValue{}), nil
+	}
+
+	for idx, clauseExpr := range list.elements[1:] {
+		clause, ok := clauseExpr.(*listExpr)
+		if !ok || len(clause.elements) == 0 {
+			return evalStep{}, newEvalError(ErrSyntax, "cond: expected non-empty clause", clauseExpr.pos())
+		}
+
+		if sym, ok := clause.elements[0].(*symbolExpr); ok && sym.name == "else" {
+			if idx != len(list.elements[1:])-1 {
+				return evalStep{}, newEvalError(ErrSyntax, "cond: else clause must be last", sym.at)
+			}
+			return it.prepareTailSequence(scope, clause.elements[1:])
+		}
+
+		test, err := it.eval(clause.elements[0], scope)
+		if err != nil {
+			return evalStep{}, err
+		}
+		if isTruthy(test) {
+			if len(clause.elements) == 1 {
+				return doneEvalStep(test), nil
+			}
+			return it.prepareTailSequence(scope, clause.elements[1:])
+		}
+	}
+
+	return doneEvalStep(voidValue{}), nil
+}
+
+func (it *interpreter) prepareTailLet(scope *env, list *listExpr) (evalStep, error) {
+	if len(list.elements) < 3 {
+		return evalStep{}, newEvalError(ErrSyntax, "let: expected bindings and body", list.at)
+	}
+
+	bindingIndex := 1
+	var name *symbolExpr
+	if sym, ok := list.elements[1].(*symbolExpr); ok {
+		name = sym
+		bindingIndex = 2
+		if len(list.elements) < 4 {
+			return evalStep{}, newEvalError(ErrSyntax, "let: expected named bindings and body", list.at)
+		}
+	}
+
+	bindingList, ok := list.elements[bindingIndex].(*listExpr)
+	if !ok {
+		return evalStep{}, newEvalError(ErrSyntax, "let: expected binding list", list.elements[bindingIndex].pos())
+	}
+
+	bindings, err := parseLetBindings(bindingList)
+	if err != nil {
+		return evalStep{}, err
+	}
+
+	body := list.elements[bindingIndex+1:]
+	if len(body) == 0 {
+		return evalStep{}, newEvalError(ErrSyntax, "let: expected body", list.at)
+	}
+
+	args := make([]value, 0, len(bindings))
+	params := make([]bindingName, 0, len(bindings))
+	for _, binding := range bindings {
+		current, err := it.eval(binding.init, scope)
+		if err != nil {
+			return evalStep{}, err
+		}
+		args = append(args, current)
+		params = append(params, binding.name)
+	}
+
+	if name == nil {
+		letEnv := newEnv(scope)
+		for i, param := range params {
+			it.defineBindingName(letEnv, param, args[i])
+		}
+		return it.prepareTailSequence(letEnv, body)
+	}
+
+	letEnv := newEnv(scope)
+	proc := &closureProc{
+		name:   name.name,
+		params: params,
+		body:   body,
+		env:    letEnv,
+	}
+	it.defineSymbol(letEnv, name, proc)
+	return it.applyProcedureTail(proc, args, list.at)
+}
+
+func (it *interpreter) prepareTailCase(scope *env, list *listExpr) (evalStep, error) {
+	if len(list.elements) < 2 {
+		return evalStep{}, newEvalError(ErrSyntax, "case: expected key and clauses", list.at)
+	}
+
+	key, err := it.eval(list.elements[1], scope)
+	if err != nil {
+		return evalStep{}, err
+	}
+
+	clauses := list.elements[2:]
+	for idx, clauseExpr := range clauses {
+		clause, ok := clauseExpr.(*listExpr)
+		if !ok || len(clause.elements) == 0 {
+			return evalStep{}, newEvalError(ErrSyntax, "case: expected non-empty clause", clauseExpr.pos())
+		}
+
+		if sym, ok := clause.elements[0].(*symbolExpr); ok && sym.name == "else" {
+			if idx != len(clauses)-1 {
+				return evalStep{}, newEvalError(ErrSyntax, "case: else clause must be last", sym.at)
+			}
+			return it.prepareTailSequence(scope, clause.elements[1:])
+		}
+
+		datums, ok := clause.elements[0].(*listExpr)
+		if !ok {
+			return evalStep{}, newEvalError(ErrSyntax, "case: expected datum list", clause.elements[0].pos())
+		}
+
+		matched := false
+		for _, datumExpr := range datums.elements {
+			datum, err := datumToValue(datumExpr)
+			if err != nil {
+				return evalStep{}, err
+			}
+			if caseDatumEqual(key, datum) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+
+		return it.prepareTailSequence(scope, clause.elements[1:])
+	}
+
+	return doneEvalStep(voidValue{}), nil
 }
 
 func (it *interpreter) evalList(list *listExpr, scope *env) (value, error) {
@@ -1072,18 +1383,97 @@ func (it *interpreter) applyProcedure(proc value, args []value, callPos position
 	}
 }
 
-func (it *interpreter) applyClosure(proc *closureProc, args []value, callPos position) (value, error) {
-	name := "lambda"
+func closureCallName(proc *closureProc) string {
 	if proc.name != "" {
-		name = proc.name
+		return proc.name
+	}
+	return "lambda"
+}
+
+func validateProcedureCall(callPos position, name string, params []bindingName, hasRest bool, args []value) error {
+	if hasRest {
+		if len(args) < len(params) {
+			return wrongArgCount(callPos, name, fmt.Sprintf("expected at least %d arguments, got %d", len(params), len(args)))
+		}
+		return nil
 	}
 
-	if proc.hasRest {
-		if len(args) < len(proc.params) {
-			return nil, wrongArgCount(callPos, name, fmt.Sprintf("expected at least %d arguments, got %d", len(proc.params), len(args)))
+	if len(args) != len(params) {
+		return wrongArgCount(callPos, name, fmt.Sprintf("expected %d arguments, got %d", len(params), len(args)))
+	}
+	return nil
+}
+
+func (it *interpreter) newProcedureCallEnv(scope *env, params []bindingName, rest bindingName, hasRest bool, args []value) *env {
+	callEnv := newEnv(scope)
+	for i, param := range params {
+		it.defineBindingName(callEnv, param, args[i])
+	}
+	if hasRest {
+		it.defineBindingName(callEnv, rest, buildList(args[len(params):]))
+	}
+	return callEnv
+}
+
+func (it *interpreter) applyProcedureTail(proc value, args []value, callPos position) (evalStep, error) {
+	currentProc := proc
+	currentArgs := args
+
+	for {
+		switch proc := currentProc.(type) {
+		case *builtinProc:
+			if proc.name == "apply" {
+				if len(currentArgs) < 2 {
+					return evalStep{}, wrongArgCount(callPos, "apply", "expected at least 2 arguments")
+				}
+
+				tailArgs, err := listToSlice(currentArgs[len(currentArgs)-1], callPos)
+				if err != nil {
+					return evalStep{}, err
+				}
+
+				appliedArgs := make([]value, 0, len(currentArgs)-2+len(tailArgs))
+				appliedArgs = append(appliedArgs, currentArgs[1:len(currentArgs)-1]...)
+				appliedArgs = append(appliedArgs, tailArgs...)
+				currentProc = currentArgs[0]
+				currentArgs = appliedArgs
+				continue
+			}
+
+			result, err := proc.fn(it, currentArgs, callPos)
+			if err != nil {
+				return evalStep{}, err
+			}
+			return doneEvalStep(result), nil
+		case *closureProc:
+			if err := validateProcedureCall(callPos, closureCallName(proc), proc.params, proc.hasRest, currentArgs); err != nil {
+				return evalStep{}, err
+			}
+
+			callEnv := it.newProcedureCallEnv(proc.env, proc.params, proc.rest, proc.hasRest, currentArgs)
+			return it.prepareTailSequence(callEnv, proc.body)
+		case *caseLambdaProc:
+			for _, clause := range proc.clauses {
+				if procedureArityMatches(len(clause.params), clause.hasRest, len(currentArgs)) {
+					callEnv := it.newProcedureCallEnv(proc.env, clause.params, clause.rest, clause.hasRest, currentArgs)
+					return it.prepareTailSequence(callEnv, clause.body)
+				}
+			}
+
+			name := proc.name
+			if name == "" {
+				name = "case-lambda"
+			}
+			return evalStep{}, wrongArgCount(callPos, name, fmt.Sprintf("no matching clause for %d arguments", len(currentArgs)))
+		default:
+			return evalStep{}, newEvalError(ErrNotProcedure, "attempted to call a non-procedure", callPos)
 		}
-	} else if len(args) != len(proc.params) {
-		return nil, wrongArgCount(callPos, name, fmt.Sprintf("expected %d arguments, got %d", len(proc.params), len(args)))
+	}
+}
+
+func (it *interpreter) applyClosure(proc *closureProc, args []value, callPos position) (value, error) {
+	if err := validateProcedureCall(callPos, closureCallName(proc), proc.params, proc.hasRest, args); err != nil {
+		return nil, err
 	}
 	return it.applyProcedureBody(proc.env, proc.params, proc.rest, proc.hasRest, proc.body, args)
 }
