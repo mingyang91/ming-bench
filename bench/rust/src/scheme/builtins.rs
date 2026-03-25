@@ -1,72 +1,143 @@
 use std::cell::RefCell;
 
-use super::{apply_function, Env, EnvRef, EvalError, Span, Value};
+use super::{apply_function, make_rational, Env, EnvRef, EvalError, Span, Value};
 
 thread_local! {
     pub(super) static OUTPUT_BUFFER: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
-fn builtin_add(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    let mut sum = 0i64;
-    for a in args {
-        match a {
-            Value::Integer(n) => sum += n,
-            _ => return Err(EvalError::Type(format!("at {span}: + expects numbers"))),
+/// Exact numeric representation for arithmetic.
+#[derive(Clone, Copy)]
+enum Num {
+    Int(i64),
+    Rat(i64, i64),
+    Flo(f64),
+}
+
+impl Num {
+    fn from_value(v: &Value, span: Span, op: &str) -> Result<Num, EvalError> {
+        match v {
+            Value::Integer(n) => Ok(Num::Int(*n)),
+            Value::Rational(n, d) => Ok(Num::Rat(*n, *d)),
+            Value::Float(x) => Ok(Num::Flo(*x)),
+            _ => Err(EvalError::Type(format!("at {span}: {op} expects numbers"))),
         }
     }
-    Ok(Value::Integer(sum))
+
+    fn to_value(self) -> Value {
+        match self {
+            Num::Int(n) => Value::Integer(n),
+            Num::Rat(n, d) => make_rational(n, d),
+            Num::Flo(x) => Value::Float(x),
+        }
+    }
+
+    fn to_f64(self) -> f64 {
+        match self {
+            Num::Int(n) => n as f64,
+            Num::Rat(n, d) => n as f64 / d as f64,
+            Num::Flo(x) => x,
+        }
+    }
+
+    fn add(self, other: Num) -> Num {
+        match (self, other) {
+            (Num::Flo(a), b) | (b, Num::Flo(a)) => Num::Flo(a + b.to_f64()),
+            (Num::Int(a), Num::Int(b)) => Num::Int(a + b),
+            (Num::Rat(an, ad), Num::Rat(bn, bd)) => Num::Rat(an * bd + bn * ad, ad * bd),
+            (Num::Int(a), Num::Rat(bn, bd)) | (Num::Rat(bn, bd), Num::Int(a)) => {
+                Num::Rat(a * bd + bn, bd)
+            }
+        }
+    }
+
+    fn sub(self, other: Num) -> Num {
+        match (self, other) {
+            (Num::Flo(a), b) => Num::Flo(a - b.to_f64()),
+            (a, Num::Flo(b)) => Num::Flo(a.to_f64() - b),
+            (Num::Int(a), Num::Int(b)) => Num::Int(a - b),
+            (Num::Rat(an, ad), Num::Rat(bn, bd)) => Num::Rat(an * bd - bn * ad, ad * bd),
+            (Num::Int(a), Num::Rat(bn, bd)) => Num::Rat(a * bd - bn, bd),
+            (Num::Rat(an, ad), Num::Int(b)) => Num::Rat(an - b * ad, ad),
+        }
+    }
+
+    fn mul(self, other: Num) -> Num {
+        match (self, other) {
+            (Num::Flo(a), b) | (b, Num::Flo(a)) => Num::Flo(a * b.to_f64()),
+            (Num::Int(a), Num::Int(b)) => Num::Int(a * b),
+            (Num::Rat(an, ad), Num::Rat(bn, bd)) => Num::Rat(an * bn, ad * bd),
+            (Num::Int(a), Num::Rat(bn, bd)) | (Num::Rat(bn, bd), Num::Int(a)) => {
+                Num::Rat(a * bn, bd)
+            }
+        }
+    }
+
+    fn div(self, other: Num, span: Span) -> Result<Num, EvalError> {
+        match (self, other) {
+            (Num::Flo(a), b) => Ok(Num::Flo(a / b.to_f64())),
+            (a, Num::Flo(b)) => Ok(Num::Flo(a.to_f64() / b)),
+            (_, Num::Int(0)) | (_, Num::Rat(0, _)) => Err(EvalError::DivisionByZero(span)),
+            (Num::Int(a), Num::Int(b)) => Ok(Num::Rat(a, b)),
+            (Num::Rat(an, ad), Num::Rat(bn, bd)) => Ok(Num::Rat(an * bd, ad * bn)),
+            (Num::Int(a), Num::Rat(bn, bd)) => Ok(Num::Rat(a * bd, bn)),
+            (Num::Rat(an, ad), Num::Int(b)) => Ok(Num::Rat(an, ad * b)),
+        }
+    }
+}
+
+fn builtin_add(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    let mut sum = Num::Int(0);
+    for a in args {
+        sum = sum.add(Num::from_value(a, span, "+")?);
+    }
+    Ok(sum.to_value())
 }
 
 fn builtin_sub(args: &[Value], span: Span) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity(format!("at {span}: - requires at least 1 argument")));
     }
-    match &args[0] {
-        Value::Integer(first) => {
-            if args.len() == 1 {
-                return Ok(Value::Integer(-first));
-            }
-            let mut result = *first;
-            for a in &args[1..] {
-                match a {
-                    Value::Integer(n) => result -= n,
-                    _ => return Err(EvalError::Type(format!("at {span}: - expects numbers"))),
-                }
-            }
-            Ok(Value::Integer(result))
-        }
-        _ => Err(EvalError::Type(format!("at {span}: - expects numbers"))),
+    let first = Num::from_value(&args[0], span, "-")?;
+    if args.len() == 1 {
+        return Ok(Num::Int(0).sub(first).to_value());
     }
+    let mut result = first;
+    for a in &args[1..] {
+        result = result.sub(Num::from_value(a, span, "-")?);
+    }
+    Ok(result.to_value())
 }
 
 fn builtin_mul(args: &[Value], span: Span) -> Result<Value, EvalError> {
-    let mut product = 1i64;
+    let mut product = Num::Int(1);
     for a in args {
-        match a {
-            Value::Integer(n) => product *= n,
-            _ => return Err(EvalError::Type(format!("at {span}: * expects numbers"))),
-        }
+        product = product.mul(Num::from_value(a, span, "*")?);
     }
-    Ok(Value::Integer(product))
+    Ok(product.to_value())
 }
 
 fn builtin_div(args: &[Value], span: Span) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity(format!("at {span}: / requires at least 2 arguments")));
     }
-    match &args[0] {
-        Value::Integer(first) => {
-            let mut result = *first;
-            for a in &args[1..] {
-                match a {
-                    Value::Integer(0) => return Err(EvalError::DivisionByZero(span)),
-                    Value::Integer(n) => result /= n,
-                    _ => return Err(EvalError::Type(format!("at {span}: / expects numbers"))),
-                }
-            }
-            Ok(Value::Integer(result))
-        }
-        _ => Err(EvalError::Type(format!("at {span}: / expects numbers"))),
+    let mut result = Num::from_value(&args[0], span, "/")?;
+    for a in &args[1..] {
+        result = result.div(Num::from_value(a, span, "/")?, span)?;
+    }
+    Ok(result.to_value())
+}
+
+fn num_cmp(a: &Value, b: &Value, span: Span, op: &str) -> Result<f64, EvalError> {
+    let an = Num::from_value(a, span, op)?;
+    let bn = Num::from_value(b, span, op)?;
+    // For exact-exact comparison, use cross-multiply to avoid float imprecision
+    match (an, bn) {
+        (Num::Int(a), Num::Int(b)) => Ok((a - b) as f64),
+        (Num::Rat(an, ad), Num::Rat(bn, bd)) => Ok((an * bd - bn * ad) as f64),
+        (Num::Int(a), Num::Rat(bn, bd)) => Ok((a * bd - bn) as f64),
+        (Num::Rat(an, ad), Num::Int(b)) => Ok((an - b * ad) as f64),
+        _ => Ok(an.to_f64() - bn.to_f64()),
     }
 }
 
@@ -74,40 +145,31 @@ fn builtin_lt(args: &[Value], span: Span) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::Arity(format!("at {span}: < requires 2 arguments")));
     }
-    match (&args[0], &args[1]) {
-        (Value::Integer(a), Value::Integer(b)) => Ok(Value::Boolean(a < b)),
-        _ => Err(EvalError::Type(format!("at {span}: < expects numbers"))),
-    }
+    Ok(Value::Boolean(num_cmp(&args[0], &args[1], span, "<")? < 0.0))
 }
 
 fn builtin_gt(args: &[Value], span: Span) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::Arity(format!("at {span}: > requires 2 arguments")));
     }
-    match (&args[0], &args[1]) {
-        (Value::Integer(a), Value::Integer(b)) => Ok(Value::Boolean(a > b)),
-        _ => Err(EvalError::Type(format!("at {span}: > expects numbers"))),
-    }
+    Ok(Value::Boolean(num_cmp(&args[0], &args[1], span, ">")? > 0.0))
 }
 
 fn builtin_eq(args: &[Value], span: Span) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::Arity(format!("at {span}: = requires 2 arguments")));
     }
-    match (&args[0], &args[1]) {
-        (Value::Integer(a), Value::Integer(b)) => Ok(Value::Boolean(a == b)),
-        _ => Err(EvalError::Type(format!("at {span}: = expects numbers"))),
-    }
+    let a = Num::from_value(&args[0], span, "=")?;
+    let b = Num::from_value(&args[1], span, "=")?;
+    let eq = a.to_f64() == b.to_f64();
+    Ok(Value::Boolean(eq))
 }
 
 fn builtin_le(args: &[Value], span: Span) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::Arity(format!("at {span}: <= requires 2 arguments")));
     }
-    match (&args[0], &args[1]) {
-        (Value::Integer(a), Value::Integer(b)) => Ok(Value::Boolean(a <= b)),
-        _ => Err(EvalError::Type(format!("at {span}: <= expects numbers"))),
-    }
+    Ok(Value::Boolean(num_cmp(&args[0], &args[1], span, "<=")? <= 0.0))
 }
 
 fn builtin_not(args: &[Value], span: Span) -> Result<Value, EvalError> {
@@ -193,7 +255,7 @@ fn builtin_number_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::Arity(format!("at {span}: number? requires 1 argument")));
     }
-    Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+    Ok(Value::Boolean(args[0].is_numeric()))
 }
 
 fn builtin_boolean_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
@@ -327,6 +389,8 @@ fn builtin_number_to_string(args: &[Value], span: Span) -> Result<Value, EvalErr
     }
     match &args[0] {
         Value::Integer(n) => Ok(Value::Str(n.to_string())),
+        Value::Float(x) => Ok(Value::Str(format!("{}", x))),
+        Value::Rational(n, d) => Ok(Value::Str(format!("{}/{}", n, d))),
         _ => Err(EvalError::Type(format!("at {span}: number->string expects a number"))),
     }
 }
@@ -386,10 +450,7 @@ fn builtin_ge(args: &[Value], span: Span) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::Arity(format!("at {span}: >= requires 2 arguments")));
     }
-    match (&args[0], &args[1]) {
-        (Value::Integer(a), Value::Integer(b)) => Ok(Value::Boolean(a >= b)),
-        _ => Err(EvalError::Type(format!("at {span}: >= expects numbers"))),
-    }
+    Ok(Value::Boolean(num_cmp(&args[0], &args[1], span, ">=")? >= 0.0))
 }
 
 // --- L09 Numeric ---
@@ -798,6 +859,99 @@ fn builtin_string_copy(args: &[Value], span: Span) -> Result<Value, EvalError> {
     }
 }
 
+// --- L11 Exact Arithmetic & Rationals ---
+
+fn builtin_exact_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("at {span}: exact? requires 1 argument")));
+    }
+    Ok(Value::Boolean(args[0].is_exact()))
+}
+
+fn builtin_inexact_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("at {span}: inexact? requires 1 argument")));
+    }
+    Ok(Value::Boolean(matches!(&args[0], Value::Float(_))))
+}
+
+fn builtin_exact_to_inexact(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("at {span}: exact->inexact requires 1 argument")));
+    }
+    match &args[0] {
+        Value::Integer(n) => Ok(Value::Float(*n as f64)),
+        Value::Rational(n, d) => Ok(Value::Float(*n as f64 / *d as f64)),
+        Value::Float(x) => Ok(Value::Float(*x)),
+        _ => Err(EvalError::Type(format!("at {span}: exact->inexact expects a number"))),
+    }
+}
+
+fn builtin_inexact_to_exact(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("at {span}: inexact->exact requires 1 argument")));
+    }
+    match &args[0] {
+        Value::Integer(n) => Ok(Value::Integer(*n)),
+        Value::Rational(n, d) => Ok(make_rational(*n, *d)),
+        Value::Float(x) => {
+            // Convert float to rational via continued fraction / power-of-2 approach
+            // Simple approach: multiply by large power of 2 and simplify
+            if x.fract() == 0.0 {
+                Ok(Value::Integer(*x as i64))
+            } else {
+                // Use ratio approximation: x = n/d
+                let denom = 1_i64 << 53; // 2^53
+                let numer = (*x * denom as f64).round() as i64;
+                Ok(make_rational(numer, denom))
+            }
+        }
+        _ => Err(EvalError::Type(format!("at {span}: inexact->exact expects a number"))),
+    }
+}
+
+fn builtin_numerator(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("at {span}: numerator requires 1 argument")));
+    }
+    match &args[0] {
+        Value::Integer(n) => Ok(Value::Integer(*n)),
+        Value::Rational(n, _) => Ok(Value::Integer(*n)),
+        _ => Err(EvalError::Type(format!("at {span}: numerator expects a rational number"))),
+    }
+}
+
+fn builtin_denominator(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("at {span}: denominator requires 1 argument")));
+    }
+    match &args[0] {
+        Value::Integer(_) => Ok(Value::Integer(1)),
+        Value::Rational(_, d) => Ok(Value::Integer(*d)),
+        _ => Err(EvalError::Type(format!("at {span}: denominator expects a rational number"))),
+    }
+}
+
+fn builtin_integer_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("at {span}: integer? requires 1 argument")));
+    }
+    let is_int = match &args[0] {
+        Value::Integer(_) => true,
+        Value::Rational(_, _) => false, // simplified rationals with denom=1 become Integer
+        Value::Float(x) => x.fract() == 0.0,
+        _ => false,
+    };
+    Ok(Value::Boolean(is_int))
+}
+
+fn builtin_rational_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("at {span}: rational? requires 1 argument")));
+    }
+    Ok(Value::Boolean(matches!(&args[0], Value::Integer(_) | Value::Rational(_, _))))
+}
+
 pub(super) fn builtin_apply(args: &[Value], span: Span) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity(format!("at {span}: apply requires at least 2 arguments")));
@@ -888,6 +1042,15 @@ pub(super) fn default_env() -> EnvRef {
         e.set("assoc".into(), Value::Builtin("assoc".into(), builtin_assoc));
         e.set("map".into(), Value::Builtin("map".into(), builtin_map));
         e.set("for-each".into(), Value::Builtin("for-each".into(), builtin_for_each));
+        // L11 exact arithmetic & rationals
+        e.set("exact?".into(), Value::Builtin("exact?".into(), builtin_exact_pred));
+        e.set("inexact?".into(), Value::Builtin("inexact?".into(), builtin_inexact_pred));
+        e.set("exact->inexact".into(), Value::Builtin("exact->inexact".into(), builtin_exact_to_inexact));
+        e.set("inexact->exact".into(), Value::Builtin("inexact->exact".into(), builtin_inexact_to_exact));
+        e.set("numerator".into(), Value::Builtin("numerator".into(), builtin_numerator));
+        e.set("denominator".into(), Value::Builtin("denominator".into(), builtin_denominator));
+        e.set("integer?".into(), Value::Builtin("integer?".into(), builtin_integer_pred));
+        e.set("rational?".into(), Value::Builtin("rational?".into(), builtin_rational_pred));
         // apply is handled specially in eval, but needs to be a value for (define f apply)
         e.set("apply".into(), Value::Builtin("apply".into(), |_args, _span| unreachable!()));
     }

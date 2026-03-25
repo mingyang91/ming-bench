@@ -45,6 +45,8 @@ impl fmt::Display for Span {
 #[derive(Debug, Clone)]
 enum Value {
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64), // numerator, denominator (always simplified, denom > 0)
     Boolean(bool),
     Char(char),
     Str(String),
@@ -67,10 +69,45 @@ enum Value {
     },
 }
 
+fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
+    a = a.abs();
+    b = b.abs();
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+/// Create a simplified rational or integer value.
+fn make_rational(n: i64, d: i64) -> Value {
+    assert!(d != 0, "division by zero in make_rational");
+    let sign = if d < 0 { -1 } else { 1 };
+    let n = n * sign;
+    let d = d * sign;
+    let g = gcd_i64(n, d);
+    let n = n / g;
+    let d = d / g;
+    if d == 1 {
+        Value::Integer(n)
+    } else {
+        Value::Rational(n, d)
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Integer(n) => write!(f, "{n}"),
+            Value::Float(x) => {
+                if x.fract() == 0.0 && x.is_finite() {
+                    write!(f, "{:.1}", x)
+                } else {
+                    write!(f, "{}", x)
+                }
+            }
+            Value::Rational(n, d) => write!(f, "{}/{}", n, d),
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
             Value::Char(c) => match c {
@@ -121,6 +158,14 @@ impl Value {
             }
             other => other.to_string(),
         }
+    }
+
+    fn is_exact(&self) -> bool {
+        matches!(self, Value::Integer(_) | Value::Rational(_, _))
+    }
+
+    fn is_numeric(&self) -> bool {
+        matches!(self, Value::Integer(_) | Value::Float(_) | Value::Rational(_, _))
     }
 }
 
@@ -237,6 +282,8 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Rational(an, ad), Value::Rational(bn, bd)) => an == bn && ad == bd,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
@@ -263,6 +310,8 @@ enum Token {
     RParen,
     Quote,
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64),
     Boolean(bool),
     Str(String),
     Symbol(String),
@@ -409,6 +458,19 @@ fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, EvalError> {
                 let word: String = chars[start..i].iter().collect();
                 if let Ok(n) = word.parse::<i64>() {
                     tokens.push((Token::Integer(n), span));
+                } else if let Ok(x) = word.parse::<f64>() {
+                    tokens.push((Token::Float(x), span));
+                } else if let Some(slash) = word.find('/') {
+                    let (num_s, den_s) = (&word[..slash], &word[slash + 1..]);
+                    if let (Ok(n), Ok(d)) = (num_s.parse::<i64>(), den_s.parse::<i64>()) {
+                        if d != 0 {
+                            tokens.push((Token::Rational(n, d), span));
+                        } else {
+                            tokens.push((Token::Symbol(word), span));
+                        }
+                    } else {
+                        tokens.push((Token::Symbol(word), span));
+                    }
                 } else {
                     tokens.push((Token::Symbol(word), span));
                 }
@@ -429,6 +491,8 @@ struct Expr {
 #[derive(Debug, Clone)]
 enum ExprKind {
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64),
     Boolean(bool),
     Char(char),
     Str(String),
@@ -453,6 +517,16 @@ fn parse_tokens(tokens: &[(Token, Span)], pos: &mut usize) -> Result<Expr, EvalE
             let n = *n;
             *pos += 1;
             Ok(Expr::new(ExprKind::Integer(n), span))
+        }
+        Token::Float(x) => {
+            let x = *x;
+            *pos += 1;
+            Ok(Expr::new(ExprKind::Float(x), span))
+        }
+        Token::Rational(n, d) => {
+            let (n, d) = (*n, *d);
+            *pos += 1;
+            Ok(Expr::new(ExprKind::Rational(n, d), span))
         }
         Token::Boolean(b) => {
             let b = *b;
@@ -560,6 +634,8 @@ impl Env {
 fn expr_to_value(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Integer(n) => Value::Integer(*n),
+        ExprKind::Float(x) => Value::Float(*x),
+        ExprKind::Rational(n, d) => make_rational(*n, *d),
         ExprKind::Boolean(b) => Value::Boolean(*b),
         ExprKind::Char(c) => Value::Char(*c),
         ExprKind::Str(s) => Value::Str(s.clone()),
@@ -636,6 +712,8 @@ fn eval(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
     let span = expr.span;
     match &expr.kind {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
+        ExprKind::Float(x) => Ok(Value::Float(*x)),
+        ExprKind::Rational(n, d) => Ok(make_rational(*n, *d)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Str(s) => Ok(Value::Str(s.clone())),
