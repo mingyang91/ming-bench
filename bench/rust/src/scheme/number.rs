@@ -170,7 +170,10 @@ impl Rational {
     }
 
     fn abs(self) -> Result<Self, NumberError> {
-        Self::from_parts_i128(i128::from(self.numerator).abs(), i128::from(self.denominator))
+        Self::from_parts_i128(
+            i128::from(self.numerator).abs(),
+            i128::from(self.denominator),
+        )
     }
 
     fn add(self, other: Self) -> Result<Self, NumberError> {

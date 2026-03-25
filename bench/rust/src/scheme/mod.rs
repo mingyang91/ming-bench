@@ -3,12 +3,14 @@ pub mod error;
 mod macros;
 mod number;
 mod parser;
+mod value_ops;
 
 pub use error::{EvalError, SourcePos};
 
 use self::builtins::builtin_name;
 use self::macros::{expand_macro_call, parse_syntax_rules};
 use self::number::{parse_number_literal, Number, NumberError};
+use self::value_ops::{render_char, render_list, render_pair, render_string, value_type_name};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
@@ -75,6 +77,7 @@ struct PairValue {
 enum Procedure {
     Builtin(&'static str),
     Lambda(Rc<Lambda>),
+    CaseLambda(Rc<CaseLambda>),
     RecordConstructor(Rc<RecordType>),
     RecordPredicate(Rc<RecordType>),
     RecordAccessor {
@@ -96,6 +99,11 @@ struct Lambda {
     params: LambdaParams,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+#[derive(Debug)]
+struct CaseLambda {
+    clauses: Vec<Rc<Lambda>>,
 }
 
 #[derive(Debug)]
@@ -155,6 +163,21 @@ impl LambdaParams {
         Self {
             required,
             rest: None,
+        }
+    }
+
+    fn matches_arg_count(&self, arg_count: usize) -> bool {
+        match self.rest {
+            Some(_) => arg_count >= self.required.len(),
+            None => arg_count == self.required.len(),
+        }
+    }
+
+    fn expected_arg_count(&self) -> String {
+        let required_len = self.required.len();
+        match self.rest {
+            Some(_) => format!("at least {required_len} arguments"),
+            None => format!("exactly {required_len} arguments"),
         }
     }
 }
@@ -450,6 +473,7 @@ fn eval_list(
         let form_pos = items[0].pos;
         match name {
             "begin" => return eval_begin(&items[1..], env, form_pos, context),
+            "case-lambda" => return eval_case_lambda(&items[1..], env, form_pos),
             "cond" => return eval_cond(&items[1..], env, context),
             "define" => return eval_define(&items[1..], env, form_pos, context),
             "define-record-type" => return eval_define_record_type(&items[1..], env, form_pos),
@@ -531,9 +555,12 @@ fn eval_define_record_type(
     pos: SourcePos,
 ) -> Result<Value, EvalError> {
     let (type_name_expr, constructor_expr, predicate_expr, field_exprs) = match args {
-        [type_name_expr, constructor_expr, predicate_expr, field_exprs @ ..] => {
-            (type_name_expr, constructor_expr, predicate_expr, field_exprs)
-        }
+        [type_name_expr, constructor_expr, predicate_expr, field_exprs @ ..] => (
+            type_name_expr,
+            constructor_expr,
+            predicate_expr,
+            field_exprs,
+        ),
         _ => return Err(syntax_error(pos, "invalid define-record-type form")),
     };
 
@@ -947,6 +974,55 @@ fn eval_lambda(
     make_lambda(name, params, body, env, pos)
 }
 
+fn eval_case_lambda(args: &[Expr], env: &EnvRef, pos: SourcePos) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(syntax_error(
+            pos,
+            "case-lambda requires at least one clause",
+        ));
+    }
+
+    let clauses = args
+        .iter()
+        .map(|clause| parse_case_lambda_clause(clause, env))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Value::Procedure(Procedure::CaseLambda(Rc::new(
+        CaseLambda { clauses },
+    ))))
+}
+
+fn parse_case_lambda_clause(clause: &Expr, env: &EnvRef) -> Result<Rc<Lambda>, EvalError> {
+    let items = clause
+        .list_items()
+        .ok_or_else(|| syntax_error(clause.pos, "case-lambda clauses must be lists"))?;
+    let (params_expr, body) = items
+        .split_first()
+        .ok_or_else(|| syntax_error(clause.pos, "case-lambda clause cannot be empty"))?;
+
+    if body.is_empty() {
+        return Err(syntax_error(
+            clause.pos,
+            "case-lambda clause requires a body",
+        ));
+    }
+
+    let params = params_expr.list_items().ok_or_else(|| {
+        syntax_error(
+            params_expr.pos,
+            "case-lambda clause parameters must be a list",
+        )
+    })?;
+    let params = parse_params(params)?;
+
+    Ok(Rc::new(Lambda {
+        name: None,
+        params,
+        body: body.to_vec(),
+        env: Rc::clone(env),
+    }))
+}
+
 fn make_lambda(
     name: Option<String>,
     params: LambdaParams,
@@ -1002,6 +1078,9 @@ fn apply(
             builtins::apply_builtin(name, args, pos, context)
         }
         Value::Procedure(Procedure::Lambda(lambda)) => apply_lambda(lambda, args, pos, context),
+        Value::Procedure(Procedure::CaseLambda(case_lambda)) => {
+            apply_case_lambda(case_lambda, args, pos, context)
+        }
         Value::Procedure(Procedure::RecordConstructor(record_type)) => {
             apply_record_constructor(record_type, args, pos)
         }
@@ -1026,26 +1105,16 @@ fn apply_lambda(
     pos: SourcePos,
     context: &mut EvalContext,
 ) -> Result<Value, EvalError> {
-    let required_len = lambda.params.required.len();
-    let wrong_arity = match lambda.params.rest {
-        Some(_) => args.len() < required_len,
-        None => args.len() != required_len,
-    };
-
-    if wrong_arity {
-        let expected = match lambda.params.rest {
-            Some(_) => format!("at least {required_len} arguments"),
-            None => format!("exactly {required_len} arguments"),
-        };
-
+    if !lambda.params.matches_arg_count(args.len()) {
         return Err(wrong_arg_count(
             pos,
             lambda.name.clone().unwrap_or_else(|| "lambda".into()),
-            expected,
+            lambda.params.expected_arg_count(),
             args.len(),
         ));
     }
 
+    let required_len = lambda.params.required.len();
     let call_env = Env::new_child(&lambda.env);
     for (param, value) in lambda.params.required.iter().zip(args.iter()) {
         env_define(&call_env, param.clone(), value.clone());
@@ -1060,6 +1129,35 @@ fn apply_lambda(
     }
 
     eval_sequence(&lambda.body, &call_env, pos, context)
+}
+
+fn apply_case_lambda(
+    case_lambda: Rc<CaseLambda>,
+    args: &[Value],
+    pos: SourcePos,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    if let Some(clause) = case_lambda
+        .clauses
+        .iter()
+        .find(|clause| clause.params.matches_arg_count(args.len()))
+    {
+        return apply_lambda(Rc::clone(clause), args, pos, context);
+    }
+
+    let expected = case_lambda
+        .clauses
+        .iter()
+        .map(|clause| clause.params.expected_arg_count())
+        .collect::<Vec<_>>()
+        .join(" or ");
+
+    Err(wrong_arg_count(
+        pos,
+        "case-lambda",
+        format!("one of {expected}"),
+        args.len(),
+    ))
 }
 
 fn apply_record_constructor(
@@ -1093,7 +1191,12 @@ fn apply_record_predicate(
             &record_type,
         ))),
         [_] => Ok(Value::Boolean(false)),
-        _ => Err(wrong_arg_count(pos, "record predicate", "exactly 1 argument", args.len())),
+        _ => Err(wrong_arg_count(
+            pos,
+            "record predicate",
+            "exactly 1 argument",
+            args.len(),
+        )),
     }
 }
 
@@ -1157,9 +1260,7 @@ where
         ));
     }
 
-    let result = values
-        .windows(2)
-        .all(|pair| predicate(&pair[0], &pair[1]));
+    let result = values.windows(2).all(|pair| predicate(&pair[0], &pair[1]));
     Ok(Value::Boolean(result))
 }
 
@@ -1304,152 +1405,6 @@ fn expect_list<'a>(name: &str, value: &'a Value, pos: SourcePos) -> Result<&'a [
     match value {
         Value::List(items) => Ok(items),
         other => Err(type_mismatch(pos, name, "list", other.type_name())),
-    }
-}
-
-fn value_type_name(value: &Value) -> String {
-    match value {
-        Value::Record(record) => record.record_type.type_name.clone(),
-        other => other.type_name().to_string(),
-    }
-}
-
-fn equal_value(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Number(left), Value::Number(right)) => left == right,
-        (Value::Boolean(left), Value::Boolean(right)) => left == right,
-        (Value::Character(left), Value::Character(right)) => left == right,
-        (Value::String(left), Value::String(right)) => *left.borrow() == *right.borrow(),
-        (Value::Symbol(left), Value::Symbol(right)) => left == right,
-        (Value::List(left), Value::List(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right.iter())
-                    .all(|(left, right)| equal_value(left, right))
-        }
-        (Value::Pair(left), Value::Pair(right)) => {
-            equal_value(&left.car, &right.car) && equal_value(&left.cdr, &right.cdr)
-        }
-        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
-        (Value::Void, Value::Void) => true,
-        (
-            Value::Procedure(Procedure::Builtin(left)),
-            Value::Procedure(Procedure::Builtin(right)),
-        ) => left == right,
-        (Value::Procedure(Procedure::Lambda(left)), Value::Procedure(Procedure::Lambda(right))) => {
-            Rc::ptr_eq(left, right)
-        }
-        (
-            Value::Procedure(Procedure::RecordConstructor(left)),
-            Value::Procedure(Procedure::RecordConstructor(right)),
-        ) => Rc::ptr_eq(left, right),
-        (
-            Value::Procedure(Procedure::RecordPredicate(left)),
-            Value::Procedure(Procedure::RecordPredicate(right)),
-        ) => Rc::ptr_eq(left, right),
-        (
-            Value::Procedure(Procedure::RecordAccessor {
-                record_type: left_record_type,
-                field_index: left_field_index,
-                name: left_name,
-            }),
-            Value::Procedure(Procedure::RecordAccessor {
-                record_type: right_record_type,
-                field_index: right_field_index,
-                name: right_name,
-            }),
-        ) => {
-            Rc::ptr_eq(left_record_type, right_record_type)
-                && left_field_index == right_field_index
-                && left_name == right_name
-        }
-        _ => false,
-    }
-}
-
-fn render_string(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() + 2);
-    out.push('"');
-
-    for ch in input.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(ch),
-        }
-    }
-
-    out.push('"');
-    out
-}
-
-fn render_char(ch: char, mode: RenderMode) -> String {
-    match mode {
-        RenderMode::Display => ch.to_string(),
-        RenderMode::Write => match ch {
-            ' ' => "#\\space".into(),
-            '\n' => "#\\newline".into(),
-            _ => format!("#\\{ch}"),
-        },
-    }
-}
-
-fn render_list(items: &[Value], mode: RenderMode) -> String {
-    let mut out = String::from("(");
-
-    for (index, value) in items.iter().enumerate() {
-        if index > 0 {
-            out.push(' ');
-        }
-        out.push_str(&value.render_with_mode(mode));
-    }
-
-    out.push(')');
-    out
-}
-
-fn render_pair(car: &Value, cdr: &Value, mode: RenderMode) -> String {
-    let mut out = String::from("(");
-    out.push_str(&car.render_with_mode(mode));
-
-    let mut tail = cdr;
-    loop {
-        match tail {
-            Value::Pair(pair) => {
-                out.push(' ');
-                out.push_str(&pair.car.render_with_mode(mode));
-                tail = &pair.cdr;
-            }
-            Value::List(items) => {
-                for value in items {
-                    out.push(' ');
-                    out.push_str(&value.render_with_mode(mode));
-                }
-                out.push(')');
-                return out;
-            }
-            other => {
-                out.push_str(" . ");
-                out.push_str(&other.render_with_mode(mode));
-                out.push(')');
-                return out;
-            }
-        }
-    }
-}
-
-fn byte_index_for_char(input: &str, char_index: usize) -> Option<usize> {
-    if char_index == input.chars().count() {
-        Some(input.len())
-    } else {
-        input
-            .char_indices()
-            .nth(char_index)
-            .map(|(byte_index, _)| byte_index)
     }
 }
 
