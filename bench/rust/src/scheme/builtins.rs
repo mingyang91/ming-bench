@@ -1,6 +1,7 @@
 use std::cell::RefCell;
+use std::rc::Rc;
 
-use super::{apply_function, make_rational, Env, EnvRef, EvalError, Span, Value};
+use super::{apply_function, eqv, make_rational, Env, EnvRef, EvalError, Span, Value};
 
 thread_local! {
     pub(super) static OUTPUT_BUFFER: RefCell<String> = const { RefCell::new(String::new()) };
@@ -974,6 +975,113 @@ fn builtin_procedure_pred(args: &[Value], span: Span) -> Result<Value, EvalError
     Ok(Value::Boolean(matches!(args[0], Value::Builtin(..) | Value::Lambda { .. } | Value::CaseLambda { .. })))
 }
 
+// --- L14 eqv? ---
+
+fn builtin_eqv_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity(format!("at {span}: eqv? requires 2 arguments")));
+    }
+    Ok(Value::Boolean(eqv(&args[0], &args[1])))
+}
+
+// --- L14 Vectors ---
+
+fn builtin_vector(args: &[Value], _span: Span) -> Result<Value, EvalError> {
+    Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec()))))
+}
+
+fn builtin_make_vector(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(EvalError::Arity(format!("at {span}: make-vector requires 1 or 2 arguments")));
+    }
+    let len = match &args[0] {
+        Value::Integer(n) => *n as usize,
+        _ => return Err(EvalError::Type(format!("at {span}: make-vector expects an integer"))),
+    };
+    let fill = if args.len() > 1 { args[1].clone() } else { Value::Integer(0) };
+    Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; len]))))
+}
+
+fn builtin_vector_ref(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity(format!("at {span}: vector-ref requires 2 arguments")));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Vector(v), Value::Integer(idx)) => {
+            let v = v.borrow();
+            let idx = *idx as usize;
+            if idx >= v.len() {
+                return Err(EvalError::Type(format!("at {span}: vector-ref: index out of range")));
+            }
+            Ok(v[idx].clone())
+        }
+        _ => Err(EvalError::Type(format!("at {span}: vector-ref expects (vector int)"))),
+    }
+}
+
+fn builtin_vector_set(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Arity(format!("at {span}: vector-set! requires 3 arguments")));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Vector(v), Value::Integer(idx)) => {
+            let mut v = v.borrow_mut();
+            let idx = *idx as usize;
+            if idx >= v.len() {
+                return Err(EvalError::Type(format!("at {span}: vector-set!: index out of range")));
+            }
+            v[idx] = args[2].clone();
+            Ok(Value::Void)
+        }
+        _ => Err(EvalError::Type(format!("at {span}: vector-set! expects (vector int value)"))),
+    }
+}
+
+fn builtin_vector_length(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("at {span}: vector-length requires 1 argument")));
+    }
+    match &args[0] {
+        Value::Vector(v) => Ok(Value::Integer(v.borrow().len() as i64)),
+        _ => Err(EvalError::Type(format!("at {span}: vector-length expects a vector"))),
+    }
+}
+
+fn builtin_vector_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("at {span}: vector? requires 1 argument")));
+    }
+    Ok(Value::Boolean(matches!(&args[0], Value::Vector(_))))
+}
+
+fn builtin_vector_to_list(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("at {span}: vector->list requires 1 argument")));
+    }
+    match &args[0] {
+        Value::Vector(v) => {
+            let elems = v.borrow().clone();
+            if elems.is_empty() {
+                Ok(Value::Nil)
+            } else {
+                Ok(Value::List(elems))
+            }
+        }
+        _ => Err(EvalError::Type(format!("at {span}: vector->list expects a vector"))),
+    }
+}
+
+fn builtin_list_to_vector(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("at {span}: list->vector requires 1 argument")));
+    }
+    match &args[0] {
+        Value::List(elems) => Ok(Value::Vector(Rc::new(RefCell::new(elems.clone())))),
+        Value::Nil => Ok(Value::Vector(Rc::new(RefCell::new(Vec::new())))),
+        _ => Err(EvalError::Type(format!("at {span}: list->vector expects a list"))),
+    }
+}
+
 pub(super) fn default_env() -> EnvRef {
     let env = Env::new(None);
     {
@@ -1062,6 +1170,16 @@ pub(super) fn default_env() -> EnvRef {
         e.set("procedure?".into(), Value::Builtin("procedure?".into(), builtin_procedure_pred));
         // apply is handled specially in eval, but needs to be a value for (define f apply)
         e.set("apply".into(), Value::Builtin("apply".into(), |_args, _span| unreachable!()));
+        // L14
+        e.set("eqv?".into(), Value::Builtin("eqv?".into(), builtin_eqv_pred));
+        e.set("vector".into(), Value::Builtin("vector".into(), builtin_vector));
+        e.set("make-vector".into(), Value::Builtin("make-vector".into(), builtin_make_vector));
+        e.set("vector-ref".into(), Value::Builtin("vector-ref".into(), builtin_vector_ref));
+        e.set("vector-set!".into(), Value::Builtin("vector-set!".into(), builtin_vector_set));
+        e.set("vector-length".into(), Value::Builtin("vector-length".into(), builtin_vector_length));
+        e.set("vector?".into(), Value::Builtin("vector?".into(), builtin_vector_pred));
+        e.set("vector->list".into(), Value::Builtin("vector->list".into(), builtin_vector_to_list));
+        e.set("list->vector".into(), Value::Builtin("list->vector".into(), builtin_list_to_vector));
     }
 
     env
