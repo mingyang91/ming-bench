@@ -12,20 +12,39 @@ type Token =
   | { kind: 'boolean'; value: boolean }
   | { kind: 'string'; value: string }
   | { kind: 'symbol'; value: string }
-  | { kind: 'paren'; value: '(' | ')' };
+  | { kind: 'paren'; value: '(' | ')' }
+  | { kind: 'quote' };
 
 type SchemeValue =
   | { kind: 'number'; value: number }
   | { kind: 'boolean'; value: boolean }
   | { kind: 'string'; value: string }
+  | { kind: 'symbol'; value: string }
+  | { kind: 'empty-list' }
+  | { kind: 'pair'; car: SchemeValue; cdr: SchemeValue }
+  | { kind: 'void' }
   | ProcedureValue;
 
-type Environment = ReadonlyMap<string, ProcedureValue>;
+type ProcedureValue = BuiltinProcedureValue | ClosureProcedureValue;
 
-interface ProcedureValue {
+interface BuiltinProcedureValue {
   kind: 'procedure';
+  procedureKind: 'builtin';
   name: string;
   apply(args: SchemeValue[]): SchemeValue;
+}
+
+interface ClosureProcedureValue {
+  kind: 'procedure';
+  procedureKind: 'closure';
+  name: string;
+  params: string[];
+  body: Expr[];
+  env: Environment;
+}
+
+interface Binding {
+  value: SchemeValue;
 }
 
 interface ParserState {
@@ -33,20 +52,38 @@ interface ParserState {
   index: number;
 }
 
+class Environment {
+  private readonly bindings = new Map<string, Binding>();
+
+  constructor(private readonly parent?: Environment) {}
+
+  define(name: string, value: SchemeValue): Binding {
+    const binding = { value };
+    this.bindings.set(name, binding);
+    return binding;
+  }
+
+  defineBinding(name: string, binding: Binding): void {
+    this.bindings.set(name, binding);
+  }
+
+  lookup(name: string): SchemeValue | undefined {
+    return this.lookupBinding(name)?.value;
+  }
+
+  child(): Environment {
+    return new Environment(this);
+  }
+
+  private lookupBinding(name: string): Binding | undefined {
+    return this.bindings.get(name) ?? this.parent?.lookupBinding(name);
+  }
+}
+
 const TRUE_VALUE: SchemeValue = { kind: 'boolean', value: true };
 const FALSE_VALUE: SchemeValue = { kind: 'boolean', value: false };
-
-const GLOBAL_ENV: Environment = new Map<string, ProcedureValue>([
-  ['+', makeProcedure('+', (args) => numberValue(sum(asNumbers(args, '+'))))],
-  ['-', makeProcedure('-', (args) => numberValue(subtract(asNumbers(args, '-'))))],
-  ['*', makeProcedure('*', (args) => numberValue(product(asNumbers(args, '*'))))],
-  ['/', makeProcedure('/', (args) => numberValue(divide(asNumbers(args, '/'))))],
-  ['<', makeProcedure('<', (args) => booleanValue(compareChain(asNumbers(args, '<'), (a, b) => a < b, '<')))],
-  ['>', makeProcedure('>', (args) => booleanValue(compareChain(asNumbers(args, '>'), (a, b) => a > b, '>')))],
-  ['=', makeProcedure('=', (args) => booleanValue(compareChain(asNumbers(args, '='), (a, b) => a === b, '=')))],
-  ['<=', makeProcedure('<=', (args) => booleanValue(compareChain(asNumbers(args, '<='), (a, b) => a <= b, '<=')))],
-  ['not', makeProcedure('not', (args) => applyNot(args))],
-]);
+const EMPTY_LIST_VALUE: SchemeValue = { kind: 'empty-list' };
+const VOID_VALUE: SchemeValue = { kind: 'void' };
 
 /**
  * Evaluate one or more Scheme expressions and return the string
@@ -58,9 +95,10 @@ export function evalStr(input: string): string {
     throw new EvalError('empty input');
   }
 
-  let result: SchemeValue = FALSE_VALUE;
+  const env = createGlobalEnvironment();
+  let result: SchemeValue = VOID_VALUE;
   for (const expression of expressions) {
-    result = evaluate(expression, GLOBAL_ENV);
+    result = evaluate(expression, env);
   }
 
   return formatValue(result);
@@ -72,6 +110,42 @@ export function evalStr(input: string): string {
  */
 export function evalStrWithOutput(input: string): { result: string; output: string } {
   return { result: evalStr(input), output: '' };
+}
+
+function createGlobalEnvironment(): Environment {
+  const env = new Environment();
+
+  env.define('+', makeBuiltinProcedure('+', (args) => numberValue(sum(asNumbers(args, '+')))));
+  env.define('-', makeBuiltinProcedure('-', (args) => numberValue(subtract(asNumbers(args, '-')))));
+  env.define('*', makeBuiltinProcedure('*', (args) => numberValue(product(asNumbers(args, '*')))));
+  env.define('/', makeBuiltinProcedure('/', (args) => numberValue(divide(asNumbers(args, '/')))));
+  env.define(
+    '<',
+    makeBuiltinProcedure('<', (args) =>
+      booleanValue(compareChain(asNumbers(args, '<'), (left, right) => left < right, '<')),
+    ),
+  );
+  env.define(
+    '>',
+    makeBuiltinProcedure('>', (args) =>
+      booleanValue(compareChain(asNumbers(args, '>'), (left, right) => left > right, '>')),
+    ),
+  );
+  env.define(
+    '=',
+    makeBuiltinProcedure('=', (args) =>
+      booleanValue(compareChain(asNumbers(args, '='), (left, right) => left === right, '=')),
+    ),
+  );
+  env.define(
+    '<=',
+    makeBuiltinProcedure('<=', (args) =>
+      booleanValue(compareChain(asNumbers(args, '<='), (left, right) => left <= right, '<=')),
+    ),
+  );
+  env.define('not', makeBuiltinProcedure('not', (args) => applyNot(args)));
+
+  return env;
 }
 
 function parseProgram(input: string): Expr[] {
@@ -112,6 +186,12 @@ function tokenize(input: string): Token[] {
       continue;
     }
 
+    if (char === "'") {
+      tokens.push({ kind: 'quote' });
+      index += 1;
+      continue;
+    }
+
     if (char === '"') {
       const parsed = readStringToken(input, index);
       tokens.push({ kind: 'string', value: parsed.value });
@@ -144,6 +224,11 @@ function parseExpression(state: ParserState): Expr {
       return { kind: 'string', value: token.value };
     case 'symbol':
       return { kind: 'symbol', value: token.value };
+    case 'quote':
+      return {
+        kind: 'list',
+        items: [{ kind: 'symbol', value: 'quote' }, parseExpression(state)],
+      };
     case 'paren':
       if (token.value === ')') {
         throw new EvalError('unexpected )');
@@ -180,7 +265,7 @@ function evaluate(expression: Expr, env: Environment): SchemeValue {
     case 'string':
       return stringValue(expression.value);
     case 'symbol': {
-      const value = env.get(expression.value);
+      const value = env.lookup(expression.value);
       if (value === undefined) {
         throw new EvalError(`unbound variable: ${expression.value}`);
       }
@@ -198,12 +283,19 @@ function evaluateList(items: Expr[], env: Environment): SchemeValue {
 
   const head = items[0];
   if (head.kind === 'symbol') {
-    if (head.value === 'and') {
-      return evaluateAnd(items.slice(1), env);
-    }
-
-    if (head.value === 'or') {
-      return evaluateOr(items.slice(1), env);
+    switch (head.value) {
+      case 'and':
+        return evaluateAnd(items.slice(1), env);
+      case 'or':
+        return evaluateOr(items.slice(1), env);
+      case 'define':
+        return evaluateDefine(items.slice(1), env);
+      case 'if':
+        return evaluateIf(items.slice(1), env);
+      case 'lambda':
+        return evaluateLambda(items.slice(1), env);
+      case 'quote':
+        return evaluateQuote(items.slice(1));
     }
   }
 
@@ -236,16 +328,175 @@ function evaluateOr(items: Expr[], env: Environment): SchemeValue {
   return result;
 }
 
+function evaluateDefine(items: Expr[], env: Environment): SchemeValue {
+  if (items.length < 2) {
+    throw new EvalError('define requires a name and value');
+  }
+
+  const target = items[0];
+  if (target.kind === 'symbol') {
+    if (items.length !== 2) {
+      throw new EvalError('define expected exactly 2 argument(s)');
+    }
+
+    return defineVariable(target.value, items[1], env);
+  }
+
+  if (target.kind !== 'list' || target.items.length === 0) {
+    throw new EvalError('define requires a symbol or parameter list');
+  }
+
+  const name = target.items[0];
+  if (name.kind !== 'symbol') {
+    throw new EvalError('function name must be a symbol');
+  }
+
+  const params = readParameterListItems(target.items.slice(1));
+  const body = items.slice(1);
+  if (body.length === 0) {
+    throw new EvalError('function definition requires a body');
+  }
+
+  const binding: Binding = { value: VOID_VALUE };
+  env.defineBinding(name.value, binding);
+  binding.value = makeClosure(name.value, params, body, env);
+  return VOID_VALUE;
+}
+
+function defineVariable(name: string, valueExpression: Expr, env: Environment): SchemeValue {
+  if (isLambdaExpression(valueExpression)) {
+    const binding: Binding = { value: VOID_VALUE };
+    env.defineBinding(name, binding);
+    binding.value = evaluateNamedLambda(valueExpression, env, name);
+    return VOID_VALUE;
+  }
+
+  env.define(name, evaluate(valueExpression, env));
+  return VOID_VALUE;
+}
+
+function isLambdaExpression(expression: Expr): expression is { kind: 'list'; items: Expr[] } {
+  return (
+    expression.kind === 'list' &&
+    expression.items.length > 0 &&
+    expression.items[0].kind === 'symbol' &&
+    expression.items[0].value === 'lambda'
+  );
+}
+
+function evaluateNamedLambda(expression: { kind: 'list'; items: Expr[] }, env: Environment, name: string): ClosureProcedureValue {
+  const { params, body } = parseLambdaParts(expression.items.slice(1));
+  return makeClosure(name, params, body, env);
+}
+
+function evaluateIf(items: Expr[], env: Environment): SchemeValue {
+  if (items.length < 2 || items.length > 3) {
+    throw new EvalError('if expected 2 or 3 argument(s)');
+  }
+
+  const condition = evaluate(items[0], env);
+  if (isTruthy(condition)) {
+    return evaluate(items[1], env);
+  }
+
+  if (items[2] === undefined) {
+    return VOID_VALUE;
+  }
+
+  return evaluate(items[2], env);
+}
+
+function evaluateLambda(items: Expr[], env: Environment): SchemeValue {
+  const { params, body } = parseLambdaParts(items);
+  return makeClosure('lambda', params, body, env);
+}
+
+function parseLambdaParts(items: Expr[]): { params: string[]; body: Expr[] } {
+  if (items.length < 2) {
+    throw new EvalError('lambda requires parameters and a body');
+  }
+
+  const params = readParameterList(items[0]);
+  const body = items.slice(1);
+  return { params, body };
+}
+
+function readParameterList(expression: Expr): string[] {
+  if (expression.kind !== 'list') {
+    throw new EvalError('lambda parameters must be a list');
+  }
+
+  return readParameterListItems(expression.items);
+}
+
+function readParameterListItems(items: Expr[]): string[] {
+  return items.map((item) => {
+    if (item.kind !== 'symbol') {
+      throw new EvalError('lambda parameters must be symbols');
+    }
+
+    return item.value;
+  });
+}
+
+function makeClosure(name: string, params: string[], body: Expr[], env: Environment): ClosureProcedureValue {
+  return { kind: 'procedure', procedureKind: 'closure', name, params, body, env };
+}
+
+function evaluateQuote(items: Expr[]): SchemeValue {
+  expectExactExprCount('quote', items, 1);
+  return quoteExpression(items[0]);
+}
+
+function quoteExpression(expression: Expr): SchemeValue {
+  switch (expression.kind) {
+    case 'number':
+      return numberValue(expression.value);
+    case 'boolean':
+      return booleanValue(expression.value);
+    case 'string':
+      return stringValue(expression.value);
+    case 'symbol':
+      return symbolValue(expression.value);
+    case 'list': {
+      let result: SchemeValue = EMPTY_LIST_VALUE;
+      for (let index = expression.items.length - 1; index >= 0; index -= 1) {
+        result = pairValue(quoteExpression(expression.items[index]), result);
+      }
+      return result;
+    }
+  }
+}
+
 function applyProcedure(value: SchemeValue, args: SchemeValue[]): SchemeValue {
   if (value.kind !== 'procedure') {
     throw new EvalError('attempted to call a non-procedure');
   }
 
-  return value.apply(args);
+  if (value.procedureKind === 'builtin') {
+    return value.apply(args);
+  }
+
+  expectExactArgCount(value.name, args, value.params.length);
+
+  const callEnv = value.env.child();
+  for (let index = 0; index < value.params.length; index += 1) {
+    callEnv.define(value.params[index], args[index]);
+  }
+
+  let result: SchemeValue = VOID_VALUE;
+  for (const expression of value.body) {
+    result = evaluate(expression, callEnv);
+  }
+
+  return result;
 }
 
-function makeProcedure(name: string, apply: (args: SchemeValue[]) => SchemeValue): ProcedureValue {
-  return { kind: 'procedure', name, apply };
+function makeBuiltinProcedure(
+  name: string,
+  apply: (args: SchemeValue[]) => SchemeValue,
+): BuiltinProcedureValue {
+  return { kind: 'procedure', procedureKind: 'builtin', name, apply };
 }
 
 function applyNot(args: SchemeValue[]): SchemeValue {
@@ -268,6 +519,12 @@ function expectNumber(value: SchemeValue, name: string): number {
 function expectExactArgCount(name: string, args: SchemeValue[], expected: number): void {
   if (args.length !== expected) {
     throw new EvalError(`${name} expected ${expected} argument(s), got ${args.length}`);
+  }
+}
+
+function expectExactExprCount(name: string, expressions: Expr[], expected: number): void {
+  if (expressions.length !== expected) {
+    throw new EvalError(`${name} expected ${expected} argument(s), got ${expressions.length}`);
   }
 }
 
@@ -341,9 +598,33 @@ function formatValue(value: SchemeValue): string {
       return value.value ? '#t' : '#f';
     case 'string':
       return JSON.stringify(value.value);
+    case 'symbol':
+      return value.value;
+    case 'empty-list':
+      return '()';
+    case 'pair':
+      return formatPair(value);
+    case 'void':
+      return '#<void>';
     case 'procedure':
       return `#<procedure:${value.name}>`;
   }
+}
+
+function formatPair(pair: { kind: 'pair'; car: SchemeValue; cdr: SchemeValue }): string {
+  const parts: string[] = [];
+  let current: SchemeValue = pair;
+
+  while (current.kind === 'pair') {
+    parts.push(formatValue(current.car));
+    current = current.cdr;
+  }
+
+  if (current.kind === 'empty-list') {
+    return `(${parts.join(' ')})`;
+  }
+
+  return `(${parts.join(' ')} . ${formatValue(current)})`;
 }
 
 function formatNumber(value: number): string {
@@ -368,6 +649,14 @@ function booleanValue(value: boolean): SchemeValue {
 
 function stringValue(value: string): SchemeValue {
   return { kind: 'string', value };
+}
+
+function symbolValue(value: string): SchemeValue {
+  return { kind: 'symbol', value };
+}
+
+function pairValue(car: SchemeValue, cdr: SchemeValue): SchemeValue {
+  return { kind: 'pair', car, cdr };
 }
 
 function isWhitespace(char: string): boolean {
@@ -443,7 +732,9 @@ function readAtomToken(input: string, startIndex: number): { token: Token; nextI
 }
 
 function isTokenBoundary(char: string | undefined): boolean {
-  return char === undefined || isWhitespace(char) || char === '(' || char === ')' || char === ';';
+  return (
+    char === undefined || isWhitespace(char) || char === '(' || char === ')' || char === "'" || char === ';'
+  );
 }
 
 function tokenFromAtom(raw: string): Token {
