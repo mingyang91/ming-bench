@@ -14,7 +14,8 @@ type evalContinuation func(value) evalResult
 type valueListContinuation func([]value) evalResult
 
 type continuationProc struct {
-	k evalContinuation
+	k     evalContinuation
+	winds []*dynamicWindFrame
 }
 
 func doneEval(v value, err error) evalResult {
@@ -804,13 +805,18 @@ func (it *interpreter) applyProcedureWithContinuations(proc value, args []value,
 			return it.applyMapWithContinuations(args, callPos, k)
 		case "for-each":
 			return it.applyForEachWithContinuations(args, callPos, k)
+		case "dynamic-wind":
+			return it.applyDynamicWindWithContinuations(args, callPos, k)
 		default:
 			if isCallCCBuiltinName(proc.name) {
 				if len(args) != 1 {
 					return doneError(wrongArgCount(callPos, proc.name, "expected exactly 1 argument"))
 				}
 				return callEval(func() evalResult {
-					return it.applyProcedureWithContinuations(args[0], []value{&continuationProc{k: k}}, callPos, k)
+					return it.applyProcedureWithContinuations(args[0], []value{&continuationProc{
+						k:     k,
+						winds: copyDynamicWindFrames(it.dynamicWinds),
+					}}, callPos, k)
 				})
 			}
 
@@ -847,7 +853,9 @@ func (it *interpreter) applyProcedureWithContinuations(proc value, args []value,
 		if len(args) != 1 {
 			return doneError(wrongArgCount(callPos, "continuation", fmt.Sprintf("expected exactly 1 argument, got %d", len(args))))
 		}
-		return continueEval(proc.k, args[0])
+		return it.switchDynamicWinds(proc.winds, func() evalResult {
+			return continueEval(proc.k, args[0])
+		})
 	default:
 		return doneError(newEvalError(ErrNotProcedure, "attempted to call a non-procedure", callPos))
 	}

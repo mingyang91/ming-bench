@@ -558,9 +558,10 @@ func (e *env) lookupBindingKey(key string) (*binding, bool) {
 }
 
 type interpreter struct {
-	global *env
-	output strings.Builder
-	nextID int
+	global       *env
+	output       strings.Builder
+	nextID       int
+	dynamicWinds []*dynamicWindFrame
 }
 
 type evalStep struct {
@@ -740,6 +741,7 @@ func (it *interpreter) installBuiltins() {
 	it.defineName(it.global, "for-each", &builtinProc{name: "for-each", fn: builtinForEach})
 	it.defineName(it.global, "call/cc", &builtinProc{name: "call/cc", fn: builtinCallCC})
 	it.defineName(it.global, "call-with-current-continuation", &builtinProc{name: "call-with-current-continuation", fn: builtinCallCC})
+	it.defineName(it.global, "dynamic-wind", &builtinProc{name: "dynamic-wind", fn: builtinDynamicWind})
 	it.defineName(it.global, "vector", &builtinProc{name: "vector", fn: builtinVector})
 	it.defineName(it.global, "make-vector", &builtinProc{name: "make-vector", fn: builtinMakeVector})
 	it.defineName(it.global, "vector?", &builtinProc{name: "vector?", fn: builtinVectorPred})
