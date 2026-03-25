@@ -33,6 +33,8 @@ struct DoBindingSpec {
     step: Option<Expr>,
 }
 
+type ExceptionHandlerRef = Rc<dyn std::any::Any>;
+
 #[derive(Clone, Copy)]
 enum SpecialForm {
     Define,
@@ -53,6 +55,7 @@ enum SpecialForm {
     Cond,
     Case,
     Do,
+    Guard,
 }
 
 impl SpecialForm {
@@ -76,6 +79,7 @@ impl SpecialForm {
             "cond" => Some(Self::Cond),
             "case" => Some(Self::Case),
             "do" => Some(Self::Do),
+            "guard" => Some(Self::Guard),
             _ => None,
         }
     }
@@ -85,6 +89,15 @@ impl SpecialForm {
 struct CapturedContinuation {
     frames: Vec<MachineFrame>,
     winders: Vec<WinderRef>,
+    handlers: Vec<ExceptionHandlerRef>,
+}
+
+#[derive(Clone)]
+struct CapturedExceptionHandler {
+    procedure: Value,
+    frames: Vec<MachineFrame>,
+    winders: Vec<WinderRef>,
+    handlers: Vec<ExceptionHandlerRef>,
 }
 
 #[derive(Clone)]
@@ -103,8 +116,19 @@ struct WindTransition {
     entries: Vec<WinderRef>,
     target_frames: Vec<MachineFrame>,
     target_winders: Vec<WinderRef>,
-    value: Value,
+    target_handlers: Vec<ExceptionHandlerRef>,
+    resume: WindResume,
     pos: Option<Position>,
+}
+
+#[derive(Clone)]
+enum WindResume {
+    Value(Value),
+    Apply {
+        operator: Value,
+        args: Vec<Value>,
+        pos: Option<Position>,
+    },
 }
 
 #[derive(Clone)]
@@ -166,6 +190,9 @@ enum MachineFrame {
         winder: WinderRef,
         result: Option<Value>,
         pos: Option<Position>,
+    },
+    ExceptionHandlerExit {
+        handler: ExceptionHandlerRef,
     },
     WindTransition {
         transition: WindTransition,
@@ -361,6 +388,10 @@ fn eval_machine_special_form(
         )),
         SpecialForm::Do => Ok(MachineControl::Expr(
             Rc::new(expand_do_form(args, pos, runtime)?),
+            env.clone(),
+        )),
+        SpecialForm::Guard => Ok(MachineControl::Expr(
+            Rc::new(expand_guard_form(args, pos)?),
             env.clone(),
         )),
     }
@@ -686,6 +717,10 @@ fn resume_machine_frame(
                 apply_machine_value(winder.after.clone(), Vec::new(), runtime, frames, pos)
             }
         }
+        MachineFrame::ExceptionHandlerExit { handler } => {
+            pop_expected_exception_handler(runtime, &handler);
+            Ok(MachineControl::Value(value))
+        }
         MachineFrame::WindTransition {
             transition,
             activate_winder,
@@ -781,6 +816,10 @@ fn apply_machine_builtin(
 ) -> Result<MachineControl, EvalError> {
     match builtin.name {
         "dynamic-wind" => apply_dynamic_wind_builtin(&args, runtime, frames, pos),
+        "raise" => apply_raise_builtin(&args, runtime, frames, pos),
+        "with-exception-handler" => {
+            apply_with_exception_handler_builtin(&args, runtime, frames, pos)
+        }
         "call/cc" | "call-with-current-continuation" => {
             apply_call_cc_builtin(&args, runtime, frames, pos)
         }
@@ -812,6 +851,80 @@ fn apply_dynamic_wind_builtin(
         pos,
     });
     apply_machine_value(before.clone(), Vec::new(), runtime, frames, pos)
+}
+
+fn apply_raise_builtin(
+    args: &[Value],
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+    pos: Option<Position>,
+) -> Result<MachineControl, EvalError> {
+    let [value] = args else {
+        return Err(wrong_arg_count("raise", "exactly 1", args.len()));
+    };
+
+    let Some(handler_ref) = runtime.exception_handlers().last().cloned() else {
+        return Err(EvalError::UncaughtException {
+            value: value.render_for_error(),
+        });
+    };
+
+    let handler = Rc::downcast::<CapturedExceptionHandler>(handler_ref).map_err(|_| {
+        EvalError::SyntaxError {
+            message: "internal error: invalid exception handler payload".into(),
+        }
+    })?;
+    let current_winders = runtime.winders();
+    let target_winders = handler.winders.clone();
+    let shared_prefix = common_winder_prefix_len(&current_winders, &target_winders);
+
+    step_wind_transition(
+        WindTransition {
+            exits: current_winders[shared_prefix..].to_vec(),
+            entries: target_winders[shared_prefix..]
+                .iter()
+                .rev()
+                .cloned()
+                .collect(),
+            target_frames: handler.frames.clone(),
+            target_winders,
+            target_handlers: handler.handlers.clone(),
+            resume: WindResume::Apply {
+                operator: handler.procedure.clone(),
+                args: vec![value.clone()],
+                pos,
+            },
+            pos,
+        },
+        runtime,
+        frames,
+    )
+}
+
+fn apply_with_exception_handler_builtin(
+    args: &[Value],
+    runtime: &mut Runtime,
+    frames: &mut Vec<MachineFrame>,
+    pos: Option<Position>,
+) -> Result<MachineControl, EvalError> {
+    let [handler, thunk] = args else {
+        return Err(wrong_arg_count(
+            "with-exception-handler",
+            "exactly 2",
+            args.len(),
+        ));
+    };
+
+    let captured: ExceptionHandlerRef = Rc::new(CapturedExceptionHandler {
+        procedure: handler.clone(),
+        frames: frames.to_vec(),
+        winders: runtime.winders(),
+        handlers: runtime.exception_handlers(),
+    });
+
+    runtime.push_exception_handler(captured.clone());
+    frames.push(MachineFrame::ExceptionHandlerExit { handler: captured });
+    apply_machine_value(thunk.clone(), Vec::new(), runtime, frames, pos)
 }
 
 fn apply_call_cc_builtin(
@@ -918,6 +1031,7 @@ fn make_continuation_value(frames: &[MachineFrame], runtime: &Runtime) -> Value 
         CapturedContinuation {
             frames: frames.to_vec(),
             winders: runtime.winders(),
+            handlers: runtime.exception_handlers(),
         },
     ))))
 }
@@ -951,7 +1065,8 @@ fn apply_captured_continuation(
                 .collect(),
             target_frames: captured.frames.clone(),
             target_winders,
-            value: value.clone(),
+            target_handlers: captured.handlers.clone(),
+            resume: WindResume::Value(value.clone()),
             pos,
         },
         runtime,
@@ -975,6 +1090,17 @@ fn pop_expected_winder(runtime: &mut Runtime, expected: &WinderRef) {
             .map(|actual| Rc::ptr_eq(actual, expected))
             .unwrap_or(false),
         "dynamic-wind stack out of sync"
+    );
+}
+
+fn pop_expected_exception_handler(runtime: &mut Runtime, expected: &ExceptionHandlerRef) {
+    let popped = runtime.pop_exception_handler();
+    debug_assert!(
+        popped
+            .as_ref()
+            .map(|actual| Rc::ptr_eq(actual, expected))
+            .unwrap_or(false),
+        "exception handler stack out of sync"
     );
 }
 
@@ -1003,8 +1129,16 @@ fn step_wind_transition(
     }
 
     runtime.replace_winders(transition.target_winders);
+    runtime.replace_exception_handlers(transition.target_handlers);
     *frames = transition.target_frames;
-    Ok(MachineControl::Value(transition.value))
+    match transition.resume {
+        WindResume::Value(value) => Ok(MachineControl::Value(value)),
+        WindResume::Apply {
+            operator,
+            args,
+            pos,
+        } => apply_machine_value(operator, args, runtime, frames, pos),
+    }
 }
 
 fn expect_list_argument(value: &Value, expected: &str) -> Result<Vec<Value>, EvalError> {
@@ -1292,6 +1426,45 @@ fn expand_do_form(args: &[Expr], pos: Position, runtime: &mut Runtime) -> Result
                 pos,
             ),
         ],
+        pos,
+    ))
+}
+
+fn expand_guard_form(args: &[Expr], pos: Position) -> Result<Expr, EvalError> {
+    let Some((spec, body)) = args.split_first() else {
+        return Err(wrong_arg_count("guard", "at least 2", 0));
+    };
+
+    if body.is_empty() {
+        return Err(wrong_arg_count("guard", "at least 2", 1));
+    }
+
+    let (name, clauses) = parse_guard_spec(spec)?;
+    let mut cond_items = Vec::with_capacity(clauses.len() + 2);
+    cond_items.push(symbol_expr("cond", pos));
+    cond_items.extend(clauses.iter().cloned());
+
+    if !guard_has_else_clause(clauses)? {
+        cond_items.push(Expr::List(
+            vec![
+                symbol_expr("else", pos),
+                build_application_expr(
+                    symbol_expr("raise", pos),
+                    vec![symbol_expr(&name, pos)],
+                    pos,
+                ),
+            ],
+            pos,
+        ));
+    }
+
+    let handler_body = Expr::List(cond_items, pos);
+    let handler = build_lambda_expr(std::slice::from_ref(&name), &[handler_body], pos);
+    let thunk = build_lambda_expr(&[], body, pos);
+
+    Ok(build_application_expr(
+        symbol_expr("with-exception-handler", pos),
+        vec![handler, thunk],
         pos,
     ))
 }
@@ -1797,8 +1970,33 @@ fn do_termination_clause_parts(clause: &Expr) -> Result<&[Expr], EvalError> {
     }
 }
 
+fn parse_guard_spec(spec: &Expr) -> Result<(String, &[Expr]), EvalError> {
+    match spec {
+        Expr::List(parts, _) if !parts.is_empty() => Ok((
+            expect_symbol_expr(&parts[0], "guard variable")?,
+            &parts[1..],
+        )),
+        Expr::List(_, _) => Err(positioned_syntax_error(
+            spec,
+            "guard requires a variable name",
+        )),
+        Expr::Bool(_, _)
+        | Expr::Number(_, _)
+        | Expr::String(_, _)
+        | Expr::Char(_, _)
+        | Expr::Symbol(_, _) => Err(positioned_syntax_error(spec, "guard spec must be a list")),
+    }
+}
+
 fn is_else_clause(parts: &[Expr]) -> bool {
     matches!(&parts[0], Expr::Symbol(symbol, _) if symbol == "else")
+}
+
+fn guard_has_else_clause(clauses: &[Expr]) -> Result<bool, EvalError> {
+    match clauses.last() {
+        Some(clause) => Ok(is_else_clause(cond_clause_parts(clause)?)),
+        None => Ok(false),
+    }
 }
 
 fn expect_symbol_expr(expr: &Expr, context: &str) -> Result<String, EvalError> {

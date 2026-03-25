@@ -277,6 +277,7 @@ pub(crate) struct Runtime {
     macros: HashMap<String, MacroTransformer>,
     gensym_counter: usize,
     winders: Vec<WinderRef>,
+    exception_handlers: Vec<Rc<dyn Any>>,
 }
 
 impl Runtime {
@@ -335,6 +336,22 @@ impl Runtime {
 
     pub(crate) fn replace_winders(&mut self, winders: Vec<WinderRef>) {
         self.winders = winders;
+    }
+
+    pub(crate) fn exception_handlers(&self) -> Vec<Rc<dyn Any>> {
+        self.exception_handlers.clone()
+    }
+
+    pub(crate) fn push_exception_handler(&mut self, handler: Rc<dyn Any>) {
+        self.exception_handlers.push(handler);
+    }
+
+    pub(crate) fn pop_exception_handler(&mut self) -> Option<Rc<dyn Any>> {
+        self.exception_handlers.pop()
+    }
+
+    pub(crate) fn replace_exception_handlers(&mut self, handlers: Vec<Rc<dyn Any>>) {
+        self.exception_handlers = handlers;
     }
 
     pub(crate) fn into_output(self) -> String {

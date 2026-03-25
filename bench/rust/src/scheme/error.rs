@@ -66,6 +66,9 @@ pub enum EvalError {
 
     #[error("cannot convert non-finite number to exact")]
     NonFiniteNumber,
+
+    #[error("uncaught exception: {value}")]
+    UncaughtException { value: String },
 }
 
 impl EvalError {

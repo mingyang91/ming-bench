@@ -449,6 +449,14 @@ const BUILTINS: &[BuiltinProcedure] = &[
         func: builtin_dynamic_wind,
     },
     BuiltinProcedure {
+        name: "raise",
+        func: builtin_raise,
+    },
+    BuiltinProcedure {
+        name: "with-exception-handler",
+        func: builtin_with_exception_handler,
+    },
+    BuiltinProcedure {
         name: "call/cc",
         func: builtin_call_cc,
     },
@@ -1364,6 +1372,21 @@ fn builtin_call_cc(_args: &[Value], _runtime: &mut Runtime) -> Result<Value, Eva
 fn builtin_dynamic_wind(_args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
     Err(EvalError::SyntaxError {
         message: "internal error: dynamic-wind should be handled by the evaluator".into(),
+    })
+}
+
+fn builtin_raise(_args: &[Value], _runtime: &mut Runtime) -> Result<Value, EvalError> {
+    Err(EvalError::SyntaxError {
+        message: "internal error: raise should be handled by the evaluator".into(),
+    })
+}
+
+fn builtin_with_exception_handler(
+    _args: &[Value],
+    _runtime: &mut Runtime,
+) -> Result<Value, EvalError> {
+    Err(EvalError::SyntaxError {
+        message: "internal error: with-exception-handler should be handled by the evaluator".into(),
     })
 }
 
