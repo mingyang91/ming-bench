@@ -2295,18 +2295,7 @@ fn machine_apply_value(
             apply_native_procedure(procedure, args, position)?,
             cont,
         )),
-        Value::Continuation(saved) => {
-            if args.len() != 1 {
-                return Err(EvalError::wrong_arg_count(
-                    "continuation",
-                    "exactly 1",
-                    args.len(),
-                    position,
-                ));
-            }
-
-            machine_resume_continuation(args[0].value.clone(), cont, saved, env)
-        }
+        Value::Continuation(saved) => machine_resume_continuation(pack_values(args), cont, saved, env),
         other => Err(EvalError::not_callable(other.type_name(), position)),
     }
 }
@@ -6543,6 +6532,7 @@ fn is_core_syntax_keyword(name: &str) -> bool {
             | "define-record-type"
             | "define-syntax"
             | "do"
+            | "guard"
             | "if"
             | "lambda"
             | "let"
@@ -6772,7 +6762,10 @@ fn match_macro_rule(
         return None;
     };
 
-    matches!(&pattern_head.kind, ExprKind::Symbol(name) if name == macro_name)
+    matches!(
+        &pattern_head.kind,
+        ExprKind::Symbol(name) if name == "_" || name == macro_name
+    )
         .then_some(())
         .and_then(|_| {
             match_pattern_list(pattern_tail, invocation_tail, literals, Some(macro_name))
