@@ -143,6 +143,7 @@ public class Evaluator {
                 case "let" -> evalLet(arguments, env);
                 case "lambda" -> evalLambda(arguments, env);
                 case "quote" -> evalQuote(arguments);
+                case "set!" -> evalSet(arguments, env);
                 default -> apply(
                         eval(operatorExpr, env),
                         operatorExpr.pos(),
@@ -317,6 +318,15 @@ public class Evaluator {
             throw new EvalError("wrong argument count for quote");
         }
         return quote(arguments.get(0));
+    }
+
+    private Value evalSet(List<Expr> arguments, Environment env) throws EvalError {
+        if (arguments.size() != 2 || !(arguments.get(0) instanceof SymbolExpr symbolExpr)) {
+            throw new EvalError("invalid set!");
+        }
+
+        env.set(symbolExpr.name(), eval(arguments.get(1), env));
+        return VOID_VALUE;
     }
 
     private Value evalSequence(List<Expr> expressions, Environment env) throws EvalError {
@@ -972,6 +982,18 @@ public class Evaluator {
             }
             if (parent != null) {
                 return parent.lookup(name);
+            }
+            throw new EvalError("unbound symbol: " + name);
+        }
+
+        private void set(String name, Value value) throws EvalError {
+            if (bindings.containsKey(name)) {
+                bindings.put(name, value);
+                return;
+            }
+            if (parent != null) {
+                parent.set(name, value);
+                return;
             }
             throw new EvalError("unbound symbol: " + name);
         }
