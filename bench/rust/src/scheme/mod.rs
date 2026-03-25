@@ -300,6 +300,7 @@ enum ExprKind {
     Str(String),
     Symbol(String),
     List(Vec<Expr>),
+    Vector(Vec<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -327,7 +328,11 @@ enum TokenKind {
     LParen,
     RParen,
     Quote,
+    Quasiquote,
+    Unquote,
+    UnquoteSplicing,
     SyntaxQuote, // #'
+    VecOpen,     // #(
     Symbol(String),
     Integer(i64),
     Float(f64),
@@ -348,7 +353,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
         let cur_span = Span { line, col };
         match chars[i] {
             '\n' => { line += 1; col = 1; i += 1; }
-            ' ' | '\t' | '\r' => { col += 1; i += 1; }
+            ' ' | '\t' | '\r' | '\x0C' => { col += 1; i += 1; }
             ';' => {
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;
@@ -358,6 +363,16 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
             '(' => { tokens.push(Token { kind: TokenKind::LParen, span: cur_span }); i += 1; col += 1; }
             ')' => { tokens.push(Token { kind: TokenKind::RParen, span: cur_span }); i += 1; col += 1; }
             '\'' => { tokens.push(Token { kind: TokenKind::Quote, span: cur_span }); i += 1; col += 1; }
+            '`' => { tokens.push(Token { kind: TokenKind::Quasiquote, span: cur_span }); i += 1; col += 1; }
+            ',' => {
+                if i + 1 < chars.len() && chars[i + 1] == '@' {
+                    tokens.push(Token { kind: TokenKind::UnquoteSplicing, span: cur_span });
+                    i += 2; col += 2;
+                } else {
+                    tokens.push(Token { kind: TokenKind::Unquote, span: cur_span });
+                    i += 1; col += 1;
+                }
+            }
             '"' => {
                 i += 1; col += 1;
                 let mut s = String::new();
@@ -425,6 +440,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                         }
                         '\'' => {
                             tokens.push(Token { kind: TokenKind::SyntaxQuote, span: cur_span });
+                            i += 2; col += 2;
+                        }
+                        '(' => {
+                            tokens.push(Token { kind: TokenKind::VecOpen, span: cur_span });
                             i += 2; col += 2;
                         }
                         _ => return Err(EvalError::Parse(format!("unexpected #{} at {cur_span}", chars[i + 1]))),
@@ -529,7 +548,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
 }
 
 fn is_symbol_start(c: char) -> bool {
-    c.is_alphabetic() || "!$%&*/<=>?^_~".contains(c)
+    c.is_alphabetic() || "!$%&*/<=>?^_~:".contains(c)
 }
 
 fn is_symbol_char(c: char) -> bool {
@@ -556,22 +575,72 @@ fn parse(tokens: &[Token], pos: &mut usize) -> Result<Expr, EvalError> {
             let inner = parse(tokens, pos)?;
             Ok(Expr::new(ExprKind::List(vec![Expr::new(ExprKind::Symbol("quote".into()), span), inner]), span))
         }
+        TokenKind::Quasiquote => {
+            *pos += 1;
+            let inner = parse(tokens, pos)?;
+            Ok(Expr::new(ExprKind::List(vec![Expr::new(ExprKind::Symbol("quasiquote".into()), span), inner]), span))
+        }
+        TokenKind::Unquote => {
+            *pos += 1;
+            let inner = parse(tokens, pos)?;
+            Ok(Expr::new(ExprKind::List(vec![Expr::new(ExprKind::Symbol("unquote".into()), span), inner]), span))
+        }
+        TokenKind::UnquoteSplicing => {
+            *pos += 1;
+            let inner = parse(tokens, pos)?;
+            Ok(Expr::new(ExprKind::List(vec![Expr::new(ExprKind::Symbol("unquote-splicing".into()), span), inner]), span))
+        }
         TokenKind::SyntaxQuote => {
             *pos += 1;
             let inner = parse(tokens, pos)?;
             Ok(Expr::new(ExprKind::List(vec![Expr::new(ExprKind::Symbol("syntax".into()), span), inner]), span))
         }
+        TokenKind::VecOpen => {
+            // #(x y z) => Vector([x, y, z])
+            *pos += 1;
+            let mut elems = Vec::new();
+            while *pos < tokens.len() && !matches!(tokens[*pos].kind, TokenKind::RParen) {
+                elems.push(parse(tokens, pos)?);
+            }
+            if *pos >= tokens.len() {
+                return Err(EvalError::Parse(format!("missing closing paren for #( at {span}")));
+            }
+            *pos += 1;
+            Ok(Expr::new(ExprKind::Vector(elems), span))
+        }
         TokenKind::LParen => {
             *pos += 1;
             let mut list = Vec::new();
+            let mut is_dotted = false;
+            let mut dotted_cdr = None;
             while *pos < tokens.len() && !matches!(tokens[*pos].kind, TokenKind::RParen) {
-                list.push(parse(tokens, pos)?);
+                let item = parse(tokens, pos)?;
+                if matches!(&item.kind, ExprKind::Symbol(s) if s == ".") && !list.is_empty() && !is_dotted {
+                    // Dot notation: (a b . c)
+                    if *pos >= tokens.len() || matches!(tokens[*pos].kind, TokenKind::RParen) {
+                        // Bare dot at end — treat as symbol
+                        list.push(item);
+                    } else {
+                        is_dotted = true;
+                        dotted_cdr = Some(parse(tokens, pos)?);
+                    }
+                } else {
+                    list.push(item);
+                }
             }
             if *pos >= tokens.len() {
                 return Err(EvalError::Parse(format!("missing closing paren at {span}")));
             }
             *pos += 1;
-            Ok(Expr::new(ExprKind::List(list), span))
+            if is_dotted {
+                // Build dotted pair: (a b . c) => List([a, b, ".", c])
+                // We keep the dot in the AST for pattern matching, but also mark it
+                list.push(Expr::new(ExprKind::Symbol(".".into()), span));
+                list.push(dotted_cdr.unwrap());
+                Ok(Expr::new(ExprKind::List(list), span))
+            } else {
+                Ok(Expr::new(ExprKind::List(list), span))
+            }
         }
         TokenKind::RParen => Err(EvalError::Parse(format!("unexpected ) at {span}"))),
     }
@@ -661,7 +730,7 @@ fn default_env() -> Env {
         "set-car!", "set-cdr!",
         "for-each",
         "caar", "cadr", "cdar", "cddr",
-        "assv", "gcd", "lcm", "truncate", "round",
+        "assq", "assv", "memq", "memv", "gcd", "lcm", "truncate", "round",
         "make-string", "string",
         "string>?", "string<=?", "string>=?",
         "member", "reverse",
@@ -950,6 +1019,7 @@ enum Cont {
         span: Span,
         next: K,
     },
+    CondArrow(Value, Span, K), // (test => proc): holds test result, waiting for proc
     StrSetIdxK(String, Expr, Env, Span, K),
     StrSetCharK(String, usize, Env, Span, K),
     CallCCK(K),
@@ -1319,6 +1389,12 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                     ExprKind::Boolean(b) => { st = CekState::Ret(Value::Boolean(b)); }
                     ExprKind::Char(c) => { st = CekState::Ret(Value::Char(c)); }
                     ExprKind::Str(s) => { st = CekState::Ret(Value::Str(s, false)); }
+                    ExprKind::Vector(elems) => {
+                        // Desugar #(e1 e2 ...) to (vector e1 e2 ...)
+                        let mut call = vec![Expr::new(ExprKind::Symbol("vector".into()), span)];
+                        call.extend(elems);
+                        st = CekState::Eval(Expr::new(ExprKind::List(call), span), cur_env);
+                    }
                     ExprKind::Symbol(s) => {
                         let val = cur_env.get(&s).ok_or_else(|| EvalError::Unbound(format!("{s} at {span}")))?;
                         st = CekState::Ret(val);
@@ -1334,6 +1410,13 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                             return Err(EvalError::Syntax(format!("quote requires 1 argument at {span}")));
                         }
                         st = CekState::Ret(expr_to_value(&elems[1]));
+                    }
+                    "quasiquote" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Syntax(format!("quasiquote requires 1 argument at {span}")));
+                        }
+                        let expanded = expand_quasiquote(&elems[1], span);
+                        st = CekState::Eval(expanded, cur_env.clone());
                     }
                     "if" => {
                         if elems.len() < 3 || elems.len() > 4 {
@@ -2197,7 +2280,11 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                     Cont::CondK { body, remaining, env, span, next } => {
                         if is_truthy(&val) {
                             k = next;
-                            if body.is_empty() {
+                            if body.len() == 2 && matches!(&body[0].kind, ExprKind::Symbol(ref s) if s == "=>") {
+                                // (test => proc) — evaluate proc, then apply to test result
+                                k = Rc::new(Cont::CondArrow(val, span, k));
+                                st = CekState::Eval(body[1].clone(), env);
+                            } else if body.is_empty() {
                                 st = CekState::Ret(val);
                             } else if body.len() == 1 {
                                 st = CekState::Eval(body[0].clone(), env);
@@ -2236,6 +2323,11 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                                 _ => return Err(EvalError::Syntax(format!("cond: bad clause at {span}"))),
                             }
                         }
+                    }
+                    Cont::CondArrow(test_val, call_span, next) => {
+                        // val is the procedure; apply it to test_val
+                        k = next;
+                        cek_apply_func(&val, &[test_val], call_span, &mut st, &mut k, &mut winders, &mut handlers, output)?;
                     }
                     Cont::StrSetIdxK(var_name, char_expr, env, span, next) => {
                         let idx = match val {
@@ -2896,6 +2988,20 @@ fn apply_builtin(name: &str, args: &[Value], call_span: Span, output: &mut Strin
             if args.len() != 1 { return Err(EvalError::Arity(format!("cddr requires 1 argument at {call_span}"))); }
             pair_cdr(&pair_cdr(&args[0], call_span)?, call_span)
         }
+        "assq" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("assq requires 2 arguments at {call_span}"))); }
+            let key = &args[0];
+            let elems = value_to_vec(&args[1]).ok_or_else(|| EvalError::Type(format!("assq: not a list at {call_span}")))?;
+            for entry in &elems {
+                if is_pair(entry) {
+                    let entry_car = pair_car(entry, call_span)?;
+                    if scheme_eq(key, &entry_car) {
+                        return Ok(entry.clone());
+                    }
+                }
+            }
+            Ok(Value::Boolean(false))
+        }
         "assv" => {
             if args.len() != 2 { return Err(EvalError::Arity(format!("assv requires 2 arguments at {call_span}"))); }
             let key = &args[0];
@@ -2909,6 +3015,64 @@ fn apply_builtin(name: &str, args: &[Value], call_span: Span, output: &mut Strin
                 }
             }
             Ok(Value::Boolean(false))
+        }
+        "memq" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("memq requires 2 arguments at {call_span}"))); }
+            let key = &args[0];
+            let mut current = args[1].clone();
+            loop {
+                match &current {
+                    Value::List(elems) if elems.is_empty() => return Ok(Value::Boolean(false)),
+                    Value::List(elems) => {
+                        for (i, e) in elems.iter().enumerate() {
+                            if scheme_eq(key, e) {
+                                return Ok(make_list(elems[i..].to_vec()));
+                            }
+                        }
+                        return Ok(Value::Boolean(false));
+                    }
+                    Value::Pair(p) => {
+                        let (car, cdr) = {
+                            let b = p.borrow();
+                            (b.0.clone(), b.1.clone())
+                        };
+                        if scheme_eq(key, &car) {
+                            return Ok(current.clone());
+                        }
+                        current = cdr;
+                    }
+                    _ => return Ok(Value::Boolean(false)),
+                }
+            }
+        }
+        "memv" => {
+            if args.len() != 2 { return Err(EvalError::Arity(format!("memv requires 2 arguments at {call_span}"))); }
+            let key = &args[0];
+            let mut current = args[1].clone();
+            loop {
+                match &current {
+                    Value::List(elems) if elems.is_empty() => return Ok(Value::Boolean(false)),
+                    Value::List(elems) => {
+                        for (i, e) in elems.iter().enumerate() {
+                            if scheme_eqv(key, e) {
+                                return Ok(make_list(elems[i..].to_vec()));
+                            }
+                        }
+                        return Ok(Value::Boolean(false));
+                    }
+                    Value::Pair(p) => {
+                        let (car, cdr) = {
+                            let b = p.borrow();
+                            (b.0.clone(), b.1.clone())
+                        };
+                        if scheme_eqv(key, &car) {
+                            return Ok(current.clone());
+                        }
+                        current = cdr;
+                    }
+                    _ => return Ok(Value::Boolean(false)),
+                }
+            }
         }
         "gcd" => {
             if args.is_empty() { return Ok(Value::Integer(0)); }
@@ -3524,6 +3688,112 @@ fn apply_builtin(name: &str, args: &[Value], call_span: Span, output: &mut Strin
     }
 }
 
+// Expand quasiquote template into an expression that builds the result at runtime.
+// `(quasiquote x)` where x has no unquotes => same as `(quote x)`
+// `(unquote e)` => e (evaluated)
+// `(unquote-splicing e)` => splice into enclosing list
+fn expand_quasiquote(expr: &Expr, span: Span) -> Expr {
+    match &expr.kind {
+        ExprKind::List(elems) if !elems.is_empty() => {
+            // Check for (unquote e)
+            if let ExprKind::Symbol(ref s) = elems[0].kind {
+                if s == "unquote" && elems.len() == 2 {
+                    return elems[1].clone();
+                }
+            }
+            // Check for dotted pair notation: (a b . c) => [..., ".", c]
+            let dot_pos = elems.iter().rposition(|e| matches!(&e.kind, ExprKind::Symbol(s) if s == "."));
+            let (proper_elems, dotted_tail) = if let Some(dp) = dot_pos {
+                if dp > 0 && dp == elems.len() - 2 {
+                    (&elems[..dp], Some(&elems[dp + 1]))
+                } else {
+                    (&elems[..], None)
+                }
+            } else {
+                (&elems[..], None)
+            };
+            // Check for splicing in the proper elements
+            let mut has_splicing = false;
+            for e in proper_elems.iter() {
+                if let ExprKind::List(inner) = &e.kind {
+                    if !inner.is_empty() {
+                        if let ExprKind::Symbol(ref s) = inner[0].kind {
+                            if s == "unquote-splicing" {
+                                has_splicing = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if has_splicing {
+                // Use append to combine segments
+                let mut segments = Vec::new();
+                for e in proper_elems.iter() {
+                    if let ExprKind::List(inner) = &e.kind {
+                        if !inner.is_empty() {
+                            if let ExprKind::Symbol(ref s) = inner[0].kind {
+                                if s == "unquote-splicing" && inner.len() == 2 {
+                                    segments.push(inner[1].clone());
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    // Wrap non-spliced element in (list <expanded>)
+                    let expanded = expand_quasiquote(e, span);
+                    segments.push(Expr::new(ExprKind::List(vec![
+                        Expr::new(ExprKind::Symbol("list".into()), span),
+                        expanded,
+                    ]), span));
+                }
+                if let Some(tail) = dotted_tail {
+                    segments.push(expand_quasiquote(tail, span));
+                }
+                // (append seg1 seg2 ...)
+                let mut result = Vec::new();
+                result.push(Expr::new(ExprKind::Symbol("append".into()), span));
+                result.extend(segments);
+                Expr::new(ExprKind::List(result), span)
+            } else if let Some(tail) = dotted_tail {
+                // Dotted pair without splicing: use cons*
+                // (a b . c) => (cons a (cons b c'))
+                let tail_expanded = expand_quasiquote(tail, span);
+                let mut result = tail_expanded;
+                for e in proper_elems.iter().rev() {
+                    let expanded = expand_quasiquote(e, span);
+                    result = Expr::new(ExprKind::List(vec![
+                        Expr::new(ExprKind::Symbol("cons".into()), span),
+                        expanded,
+                        result,
+                    ]), span);
+                }
+                result
+            } else {
+                // No splicing, no dots - use (list e1 e2 ...)
+                let mut result = Vec::new();
+                result.push(Expr::new(ExprKind::Symbol("list".into()), span));
+                for e in proper_elems.iter() {
+                    result.push(expand_quasiquote(e, span));
+                }
+                Expr::new(ExprKind::List(result), span)
+            }
+        }
+        ExprKind::Vector(elems) => {
+            let as_list = expand_quasiquote(&Expr::new(ExprKind::List(elems.clone()), span), span);
+            Expr::new(ExprKind::List(vec![
+                Expr::new(ExprKind::Symbol("list->vector".into()), span),
+                as_list,
+            ]), span)
+        }
+        // Atoms: quote them
+        _ => Expr::new(ExprKind::List(vec![
+            Expr::new(ExprKind::Symbol("quote".into()), span),
+            expr.clone(),
+        ]), span),
+    }
+}
+
 fn expr_to_value(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Integer(n) => Value::Integer(*n),
@@ -3533,7 +3803,24 @@ fn expr_to_value(expr: &Expr) -> Value {
         ExprKind::Char(c) => Value::Char(*c),
         ExprKind::Str(s) => Value::Str(s.clone(), false),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
-        ExprKind::List(elems) => make_list(elems.iter().map(expr_to_value).collect()),
+        ExprKind::List(elems) => {
+            // Check for dotted pair: (a b . c) represented as [a, b, ".", c]
+            let dot_pos = elems.iter().rposition(|e| matches!(&e.kind, ExprKind::Symbol(s) if s == "."));
+            if let Some(dp) = dot_pos {
+                if dp > 0 && dp == elems.len() - 2 {
+                    // Proper dotted pair notation
+                    let head: Vec<Value> = elems[..dp].iter().map(expr_to_value).collect();
+                    let tail = expr_to_value(&elems[dp + 1]);
+                    let mut result = tail;
+                    for item in head.into_iter().rev() {
+                        result = make_pair(item, result);
+                    }
+                    return result;
+                }
+            }
+            make_list(elems.iter().map(expr_to_value).collect())
+        }
+        ExprKind::Vector(elems) => Value::Vector(Rc::new(RefCell::new(elems.iter().map(expr_to_value).collect()))),
     }
 }
 
@@ -3577,6 +3864,10 @@ fn value_to_expr(val: &Value, span: Span) -> Expr {
                 }
             }
             Expr::new(ExprKind::List(items), span)
+        }
+        Value::Vector(v) => {
+            let elems = v.borrow();
+            Expr::new(ExprKind::Vector(elems.iter().map(|v| value_to_expr(v, span)).collect()), span)
         }
         Value::SyntaxObject(expr) => (**expr).clone(),
         _ => Expr::new(ExprKind::Symbol(format!("{val}")), span),
@@ -3863,6 +4154,13 @@ fn expand_syntax_template(template: &Expr, env: &Env, span: Span) -> Result<Valu
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Str(s) => Ok(Value::Str(s.clone(), false)),
+        ExprKind::Vector(elems) => {
+            let mut result = Vec::new();
+            for e in elems {
+                result.push(expand_syntax_template(e, env, span)?);
+            }
+            Ok(Value::Vector(Rc::new(RefCell::new(result))))
+        }
     }
 }
 
@@ -4011,6 +4309,15 @@ fn match_syntax_pattern(
                         return false;
                     }
                 }
+                ExprKind::Vector(sub_pat) => {
+                    if let ExprKind::Vector(ref sub_input) = input[ii].kind {
+                        if !match_syntax_pattern(sub_pat, sub_input, literals, bindings) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
                 _ => {}
             }
             pi += 1;
@@ -4042,7 +4349,7 @@ fn find_ellipsis_vars(template: &Expr, bindings: &HashMap<String, PatternBinding
                 vars.push(s.clone());
             }
         }
-        ExprKind::List(elems) => {
+        ExprKind::List(elems) | ExprKind::Vector(elems) => {
             for e in elems {
                 vars.extend(find_ellipsis_vars(e, bindings));
             }
@@ -4063,7 +4370,7 @@ fn collect_introduced_symbols(
                 renames.insert(s.clone(), gensym(s));
             }
         }
-        ExprKind::List(elems) => {
+        ExprKind::List(elems) | ExprKind::Vector(elems) => {
             for e in elems {
                 collect_introduced_symbols(e, pattern_vars, renames);
             }
@@ -4119,6 +4426,36 @@ fn expand_template(
                 }
             }
             Expr::new(ExprKind::List(result), template.span)
+        }
+        ExprKind::Vector(elems) => {
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                if i + 1 < elems.len() && matches!(&elems[i + 1].kind, ExprKind::Symbol(ref s) if s == "...") {
+                    let evars = find_ellipsis_vars(&elems[i], bindings);
+                    if let Some(first_var) = evars.first() {
+                        if let Some(PatternBinding::Ellipsis(items)) = bindings.get(first_var) {
+                            let count = items.len();
+                            for idx in 0..count {
+                                let mut local = bindings.clone();
+                                for evar in &evars {
+                                    if let Some(PatternBinding::Ellipsis(eitems)) = bindings.get(evar) {
+                                        if idx < eitems.len() {
+                                            local.insert(evar.clone(), PatternBinding::Single(eitems[idx].clone()));
+                                        }
+                                    }
+                                }
+                                result.push(expand_template(&elems[i], &local, renames));
+                            }
+                        }
+                    }
+                    i += 2;
+                } else {
+                    result.push(expand_template(&elems[i], bindings, renames));
+                    i += 1;
+                }
+            }
+            Expr::new(ExprKind::Vector(result), template.span)
         }
         _ => template.clone(),
     }
