@@ -521,6 +521,9 @@ func eqValue(left value, right value) bool {
 	case *caseLambdaProc:
 		right, ok := right.(*caseLambdaProc)
 		return ok && left == right
+	case *continuationProc:
+		right, ok := right.(*continuationProc)
+		return ok && left == right
 	case *recordValue:
 		right, ok := right.(*recordValue)
 		return ok && left == right

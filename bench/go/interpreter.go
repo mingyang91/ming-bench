@@ -738,6 +738,8 @@ func (it *interpreter) installBuiltins() {
 	it.defineName(it.global, "member", &builtinProc{name: "member", fn: builtinMember})
 	it.defineName(it.global, "map", &builtinProc{name: "map", fn: builtinMap})
 	it.defineName(it.global, "for-each", &builtinProc{name: "for-each", fn: builtinForEach})
+	it.defineName(it.global, "call/cc", &builtinProc{name: "call/cc", fn: builtinCallCC})
+	it.defineName(it.global, "call-with-current-continuation", &builtinProc{name: "call-with-current-continuation", fn: builtinCallCC})
 	it.defineName(it.global, "vector", &builtinProc{name: "vector", fn: builtinVector})
 	it.defineName(it.global, "make-vector", &builtinProc{name: "make-vector", fn: builtinMakeVector})
 	it.defineName(it.global, "vector?", &builtinProc{name: "vector?", fn: builtinVectorPred})
@@ -749,6 +751,10 @@ func (it *interpreter) installBuiltins() {
 }
 
 func (it *interpreter) evalProgram(exprs []expr) (value, error) {
+	if programNeedsContinuationEvaluator(exprs) {
+		return it.evalProgramWithContinuations(exprs)
+	}
+
 	if len(exprs) == 0 {
 		return nil, newEvalError(ErrSyntax, "expected expression", position{line: 1, column: 1})
 	}
@@ -2269,7 +2275,7 @@ func formatValue(v value) (string, error) {
 		return formatPair(value)
 	case *vectorValue:
 		return formatVector(value)
-	case *builtinProc, *closureProc, *caseLambdaProc:
+	case *builtinProc, *closureProc, *caseLambdaProc, *continuationProc:
 		return "#<procedure>", nil
 	case *recordValue:
 		return fmt.Sprintf("#<record %s>", value.typ.name), nil

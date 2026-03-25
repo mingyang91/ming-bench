@@ -80,7 +80,7 @@ func (it *interpreter) applyProcedureBody(scope *env, params []bindingName, rest
 
 func isProcedureValue(v value) bool {
 	switch v.(type) {
-	case *builtinProc, *closureProc, *caseLambdaProc:
+	case *builtinProc, *closureProc, *caseLambdaProc, *continuationProc:
 		return true
 	default:
 		return false
