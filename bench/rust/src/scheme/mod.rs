@@ -1372,15 +1372,26 @@ fn desugar_do(elems: &[Expr], span: Span) -> Result<Expr, EvalError> {
 }
 
 fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
+    eval_inner(expr, env, output, None)
+}
+
+fn eval_inner(expr: &Expr, env: &mut Env, output: &mut String, max_steps: Option<usize>) -> Result<Value, EvalError> {
     let mut st = CekState::Eval(expr.clone(), env.clone());
     let mut k: K = Rc::new(Cont::Halt);
     let mut winders: Vec<Winder> = Vec::new();
     let mut handlers: Vec<ExHandler> = Vec::new();
+    let mut steps: usize = 0;
 
     loop {
         let cur_st = std::mem::replace(&mut st, CekState::Ret(Value::Void));
         match cur_st {
             CekState::Eval(e, mut cur_env) => {
+                if let Some(limit) = max_steps {
+                    steps += 1;
+                    if steps > limit {
+                        return Err(EvalError::StepLimitExceeded);
+                    }
+                }
                 let span = e.span;
                 match e.kind {
                     ExprKind::Integer(n) => { st = CekState::Ret(Value::Integer(n)); }
@@ -4481,6 +4492,27 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         Expr::new(ExprKind::List(elems), span)
     };
     let result = eval(&top, &mut env, &mut output)?;
+    Ok(result.to_string())
+}
+
+/// Evaluate Scheme expressions with a step budget.
+/// Each eval dispatch counts as one step. Exceeding the budget returns an error.
+pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
+    let exprs = parse_all(input)?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse("empty input".into()));
+    }
+    let mut env = default_env();
+    let mut output = String::new();
+    let top = if exprs.len() == 1 {
+        exprs.into_iter().next().unwrap()
+    } else {
+        let span = exprs[0].span;
+        let mut elems = vec![Expr::new(ExprKind::Symbol("begin".into()), span)];
+        elems.extend(exprs);
+        Expr::new(ExprKind::List(elems), span)
+    };
+    let result = eval_inner(&top, &mut env, &mut output, Some(max_steps))?;
     Ok(result.to_string())
 }
 

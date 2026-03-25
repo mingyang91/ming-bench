@@ -14,6 +14,8 @@ pub enum EvalError {
     Arity(String),
     #[error("uncaught exception")]
     Raised(Box<super::Value>),
+    #[error("step limit exceeded")]
+    StepLimitExceeded,
 }
 
 impl PartialEq for EvalError {
@@ -26,6 +28,7 @@ impl PartialEq for EvalError {
             (Self::DivisionByZero(a), Self::DivisionByZero(b)) => a == b,
             (Self::Arity(a), Self::Arity(b)) => a == b,
             (Self::Raised(_), Self::Raised(_)) => false,
+            (Self::StepLimitExceeded, Self::StepLimitExceeded) => true,
             _ => false,
         }
     }
