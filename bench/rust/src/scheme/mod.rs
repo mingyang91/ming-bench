@@ -1195,10 +1195,11 @@ fn cek_apply_func(
             Ok(())
         }
         Value::Continuation(saved_k, saved_winders) => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("continuation requires 1 argument at {span}")));
-            }
-            let val = args[0].clone();
+            let val = if args.len() == 1 {
+                args[0].clone()
+            } else {
+                Value::Values(args.to_vec())
+            };
             // Compute common prefix of winders
             let common_len = winders.iter().zip(saved_winders.iter())
                 .take_while(|(a, b)| a.id == b.id)
@@ -3955,9 +3956,12 @@ enum PatternBinding {
 
 fn is_macro_special(s: &str) -> bool {
     matches!(s, "quote" | "if" | "define" | "lambda" | "case-lambda" | "and" | "or"
-        | "let" | "begin" | "cond" | "set!" | "string-set!" | "define-syntax" | "define-record-type"
+        | "let" | "let*" | "begin" | "cond" | "set!" | "string-set!" | "define-syntax" | "define-record-type"
         | "letrec" | "letrec*" | "case" | "do" | "..."
-        | "syntax-case" | "syntax" | "with-syntax")
+        | "syntax-case" | "syntax" | "with-syntax"
+        | "guard" | "call/cc" | "call-with-current-continuation"
+        | "call-with-values" | "values" | "with-exception-handler" | "dynamic-wind"
+        | "when" | "unless" | "raise" | "raise-continuable")
 }
 
 fn match_syntax_pattern(
