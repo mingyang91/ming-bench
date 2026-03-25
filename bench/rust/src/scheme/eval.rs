@@ -80,7 +80,8 @@ impl Evaluator {
             | "numerator" | "denominator" | "integer?" | "rational?"
             | "vector" | "make-vector" | "vector-ref" | "vector-set!"
             | "vector-length" | "vector?" | "vector->list" | "list->vector"
-            | "error" | "for-each" | "char->integer")
+            | "error" | "for-each" | "char->integer"
+            | "string->list" | "list->string" | "integer->char")
     }
 
     fn eval_in_env(&mut self, expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
@@ -91,7 +92,7 @@ impl Evaluator {
             ExprKind::Rational(n, d) => Ok(Value::make_rational(*n, *d)),
             ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
             ExprKind::Char(c) => Ok(Value::Char(*c)),
-            ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+            ExprKind::Str(s) => Ok(Value::Str(s.clone(), false)),  // literals are immutable
             ExprKind::Symbol(s) => {
                 if let Some(v) = env.get(s) {
                     return Ok(v);
@@ -307,7 +308,7 @@ impl Evaluator {
             ExprKind::Rational(n, d) => Value::make_rational(*n, *d),
             ExprKind::Boolean(b) => Value::Boolean(*b),
             ExprKind::Char(c) => Value::Char(*c),
-            ExprKind::Str(s) => Value::Str(s.clone()),
+            ExprKind::Str(s) => Value::Str(s.clone(), false),
             ExprKind::Symbol(s) => Value::Symbol(s.clone()),
             ExprKind::List(elems) => {
                 Value::List(elems.iter().map(Self::expr_to_value).collect())
@@ -485,29 +486,40 @@ impl Evaluator {
         if args.len() != 3 {
             return Err(EvalError::Arity(format!("string-set!: expected 3 arguments at {pos}")));
         }
-        let var_name = match &args[0].kind {
-            ExprKind::Symbol(s) => s.clone(),
-            _ => return Err(EvalError::Type(format!("string-set!: expected variable at {pos}"))),
+        let str_val = self.eval_in_env(&args[0], env)?;
+        let idx = match self.eval_in_env(&args[1], env)? {
+            Value::Integer(n) => n as usize,
+            _ => return Err(EvalError::Type(format!("string-set!: expected integer index at {pos}"))),
         };
-        let idx = self.eval_in_env(&args[1], env)?;
-        let idx = self.expect_integer(&idx, "string-set!", pos)? as usize;
-        let ch = self.eval_in_env(&args[2], env)?;
-        let ch = match ch {
+        let ch = match self.eval_in_env(&args[2], env)? {
             Value::Char(c) => c,
             _ => return Err(EvalError::Type(format!("string-set!: expected char at {pos}"))),
         };
-        let s = env.get(&var_name).ok_or_else(|| {
-            EvalError::UnboundVariable(format!("{var_name} at {pos}"))
-        })?;
-        match s {
-            Value::Str(mut string) => {
-                let mut chars: Vec<char> = string.chars().collect();
-                chars[idx] = ch;
-                string = chars.into_iter().collect();
-                env.set(&var_name, Value::Str(string));
-                Ok(Value::Void)
+        match &str_val {
+            Value::Str(_, false) => {
+                return Err(EvalError::Type(format!("string-set!: strings are immutable at {pos}")));
             }
-            _ => Err(EvalError::Type(format!("string-set!: expected string at {pos}"))),
+            Value::Str(_, true) => {}
+            _ => return Err(EvalError::Type(format!("string-set!: expected string at {pos}"))),
+        }
+        // Must be a variable — mutate in the environment
+        let var_name = match &args[0].kind {
+            ExprKind::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Type(format!("string-set!: first argument must be a variable at {pos}"))),
+        };
+        if let Some(Value::Str(s, true)) = env.get(&var_name) {
+            let mut chars: Vec<char> = s.chars().collect();
+            if idx >= chars.len() {
+                return Err(EvalError::Type(format!("string-set!: index out of bounds at {pos}")));
+            }
+            chars[idx] = ch;
+            let new_s: String = chars.into_iter().collect();
+            if !env.set(&var_name, Value::Str(new_s, true)) {
+                return Err(EvalError::UnboundVariable(format!("{var_name} at {pos}")));
+            }
+            Ok(Value::Void)
+        } else {
+            Err(EvalError::Type(format!("string-set!: strings are immutable at {pos}")))
         }
     }
 
@@ -947,7 +959,7 @@ impl Evaluator {
             }
             "string?" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("string?: expected 1 argument at {pos}"))); }
-                Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
+                Ok(Value::Boolean(matches!(&args[0], Value::Str(_, _))))
             }
             "pair?" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("pair?: expected 1 argument at {pos}"))); }
@@ -1139,35 +1151,35 @@ impl Evaluator {
             "string=?" => {
                 if args.len() != 2 { return Err(EvalError::Arity(format!("string=?: expected 2 arguments at {pos}"))); }
                 match (&args[0], &args[1]) {
-                    (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a == b)),
+                    (Value::Str(a, _), Value::Str(b, _)) => Ok(Value::Boolean(a == b)),
                     _ => Err(EvalError::Type(format!("string=?: expected strings at {pos}"))),
                 }
             }
             "string<?" => {
                 if args.len() != 2 { return Err(EvalError::Arity(format!("string<?: expected 2 arguments at {pos}"))); }
                 match (&args[0], &args[1]) {
-                    (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a < b)),
+                    (Value::Str(a, _), Value::Str(b, _)) => Ok(Value::Boolean(a < b)),
                     _ => Err(EvalError::Type(format!("string<?: expected strings at {pos}"))),
                 }
             }
             "string-ci=?" => {
                 if args.len() != 2 { return Err(EvalError::Arity(format!("string-ci=?: expected 2 arguments at {pos}"))); }
                 match (&args[0], &args[1]) {
-                    (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a.to_lowercase() == b.to_lowercase())),
+                    (Value::Str(a, _), Value::Str(b, _)) => Ok(Value::Boolean(a.to_lowercase() == b.to_lowercase())),
                     _ => Err(EvalError::Type(format!("string-ci=?: expected strings at {pos}"))),
                 }
             }
             "string-upcase" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("string-upcase: expected 1 argument at {pos}"))); }
                 match &args[0] {
-                    Value::Str(s) => Ok(Value::Str(s.to_uppercase())),
+                    Value::Str(s, _) => Ok(Value::Str(s.to_uppercase(), true)),
                     _ => Err(EvalError::Type(format!("string-upcase: expected string at {pos}"))),
                 }
             }
             "string-downcase" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("string-downcase: expected 1 argument at {pos}"))); }
                 match &args[0] {
-                    Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
+                    Value::Str(s, _) => Ok(Value::Str(s.to_lowercase(), true)),
                     _ => Err(EvalError::Type(format!("string-downcase: expected string at {pos}"))),
                 }
             }
@@ -1194,33 +1206,33 @@ impl Evaluator {
                 let mut result = String::new();
                 for arg in args {
                     match arg {
-                        Value::Str(s) => result.push_str(s),
+                        Value::Str(s, _) => result.push_str(s),
                         _ => return Err(EvalError::Type(format!("string-append: expected string at {pos}"))),
                     }
                 }
-                Ok(Value::Str(result))
+                Ok(Value::Str(result, true))
             }
             "string-length" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("string-length: expected 1 argument at {pos}"))); }
                 match &args[0] {
-                    Value::Str(s) => Ok(Value::Integer(s.len() as i64)),
+                    Value::Str(s, _) => Ok(Value::Integer(s.len() as i64)),
                     _ => Err(EvalError::Type(format!("string-length: expected string at {pos}"))),
                 }
             }
             "substring" => {
                 if args.len() != 3 { return Err(EvalError::Arity(format!("substring: expected 3 arguments at {pos}"))); }
                 let s = match &args[0] {
-                    Value::Str(s) => s,
+                    Value::Str(s, _) => s,
                     _ => return Err(EvalError::Type(format!("substring: expected string at {pos}"))),
                 };
                 let start = self.expect_integer(&args[1], "substring", pos)? as usize;
                 let end = self.expect_integer(&args[2], "substring", pos)? as usize;
-                Ok(Value::Str(s[start..end].to_string()))
+                Ok(Value::Str(s[start..end].to_string(), true))
             }
             "string->number" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("string->number: expected 1 argument at {pos}"))); }
                 match &args[0] {
-                    Value::Str(s) => {
+                    Value::Str(s, _) => {
                         if let Ok(n) = s.parse::<i64>() {
                             Ok(Value::Integer(n))
                         } else if let Ok(f) = s.parse::<f64>() {
@@ -1235,26 +1247,26 @@ impl Evaluator {
             "number->string" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("number->string: expected 1 argument at {pos}"))); }
                 self.expect_number(&args[0], "number->string", pos)?;
-                Ok(Value::Str(args[0].to_display_string()))
+                Ok(Value::Str(args[0].to_display_string(), true))
             }
             "symbol->string" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("symbol->string: expected 1 argument at {pos}"))); }
                 match &args[0] {
-                    Value::Symbol(s) => Ok(Value::Str(s.clone())),
+                    Value::Symbol(s) => Ok(Value::Str(s.clone(), false)),  // symbol->string returns immutable
                     _ => Err(EvalError::Type(format!("symbol->string: expected symbol at {pos}"))),
                 }
             }
             "string->symbol" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("string->symbol: expected 1 argument at {pos}"))); }
                 match &args[0] {
-                    Value::Str(s) => Ok(Value::Symbol(s.clone())),
+                    Value::Str(s, _) => Ok(Value::Symbol(s.clone())),
                     _ => Err(EvalError::Type(format!("string->symbol: expected string at {pos}"))),
                 }
             }
             "string-copy" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("string-copy: expected 1 argument at {pos}"))); }
                 match &args[0] {
-                    Value::Str(s) => Ok(Value::Str(s.clone())),
+                    Value::Str(s, _) => Ok(Value::Str(s.clone(), true)),  // copies are mutable
                     _ => Err(EvalError::Type(format!("string-copy: expected string at {pos}"))),
                 }
             }
@@ -1275,7 +1287,7 @@ impl Evaluator {
             "string-ref" => {
                 if args.len() != 2 { return Err(EvalError::Arity(format!("string-ref: expected 2 arguments at {pos}"))); }
                 let s = match &args[0] {
-                    Value::Str(s) => s,
+                    Value::Str(s, _) => s,
                     _ => return Err(EvalError::Type(format!("string-ref: expected string at {pos}"))),
                 };
                 let idx = self.expect_integer(&args[1], "string-ref", pos)? as usize;
@@ -1432,6 +1444,38 @@ impl Evaluator {
                 match &args[0] {
                     Value::Char(c) => Ok(Value::Integer(*c as i64)),
                     _ => Err(EvalError::Type(format!("char->integer: expected char at {pos}"))),
+                }
+            }
+            "integer->char" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("integer->char: expected 1 argument at {pos}"))); }
+                match &args[0] {
+                    Value::Integer(n) => {
+                        let c = char::from_u32(*n as u32).ok_or_else(|| {
+                            EvalError::Type(format!("integer->char: invalid code point {n} at {pos}"))
+                        })?;
+                        Ok(Value::Char(c))
+                    }
+                    _ => Err(EvalError::Type(format!("integer->char: expected integer at {pos}"))),
+                }
+            }
+            "string->list" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("string->list: expected 1 argument at {pos}"))); }
+                match &args[0] {
+                    Value::Str(s, _) => Ok(Value::List(s.chars().map(Value::Char).collect())),
+                    _ => Err(EvalError::Type(format!("string->list: expected string at {pos}"))),
+                }
+            }
+            "list->string" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("list->string: expected 1 argument at {pos}"))); }
+                match &args[0] {
+                    Value::List(elems) => {
+                        let s: Result<String, _> = elems.iter().map(|v| match v {
+                            Value::Char(c) => Ok(*c),
+                            _ => Err(EvalError::Type(format!("list->string: expected char in list at {pos}"))),
+                        }).collect();
+                        Ok(Value::Str(s?, true))
+                    }
+                    _ => Err(EvalError::Type(format!("list->string: expected list at {pos}"))),
                 }
             }
             _ => Err(EvalError::UnboundVariable(format!("{name} at {pos}"))),

@@ -28,7 +28,7 @@ pub enum Value {
     Rational(i64, i64), // numerator, denominator (always simplified, denom > 0)
     Boolean(bool),
     Char(char),
-    Str(String),
+    Str(String, bool),  // (content, mutable?)
     Symbol(String),
     List(Vec<Value>),
     Pair(Box<Value>, Box<Value>),
@@ -103,7 +103,7 @@ impl PartialEq for Value {
             (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
-            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Str(a, _), Value::Str(b, _)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
@@ -193,7 +193,7 @@ impl Value {
                 '\t' => "tab".to_string(),
                 c => c.to_string(),
             }),
-            Value::Str(s) => format!("\"{}\"", s),
+            Value::Str(s, _) => format!("\"{}\"", s),
             Value::Symbol(s) => s.clone(),
             Value::List(elems) => {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_display_string()).collect();
@@ -220,7 +220,7 @@ impl Value {
     /// Format for `display` — no quotes on strings, raw chars
     pub fn to_scheme_display(&self) -> String {
         match self {
-            Value::Str(s) => s.clone(),
+            Value::Str(s, _) => s.clone(),
             Value::Char(c) => c.to_string(),
             Value::Float(f) => {
                 if f.fract() == 0.0 && f.is_finite() {
