@@ -1,35 +1,59 @@
 import { EvalError } from './evalError.js';
 const START_POSITION = { line: 1, column: 1 };
 const VOID_VALUE = { type: 'void' };
+const SPECIAL_FORM_NAMES = new Set([
+    'define',
+    'define-syntax',
+    'set!',
+    'if',
+    'quote',
+    'lambda',
+    'and',
+    'or',
+    'begin',
+    'let',
+    'cond',
+]);
+let freshIdentifierCounter = 0;
 class Environment {
     parent;
     bindings = new Map();
+    syntaxBindings = new Map();
     constructor(parent) {
         this.parent = parent;
     }
     define(name, value) {
-        this.bindings.set(name, value);
+        this.bindings.set(name, { value });
     }
     set(name, value, position) {
-        if (this.bindings.has(name)) {
-            this.bindings.set(name, value);
-            return;
-        }
-        if (this.parent) {
-            this.parent.set(name, value, position);
-            return;
+        this.lookupCell(name, position).value = value;
+    }
+    lookup(name, position) {
+        return this.lookupCell(name, position).value;
+    }
+    lookupCell(name, position) {
+        const cell = this.tryLookupCell(name);
+        if (cell !== undefined) {
+            return cell;
         }
         throw new EvalError(`unbound variable: ${name}`, position);
     }
-    lookup(name, position) {
-        const value = this.bindings.get(name);
-        if (value !== undefined) {
-            return value;
+    tryLookupCell(name) {
+        const cell = this.bindings.get(name);
+        if (cell !== undefined) {
+            return cell;
         }
-        if (this.parent) {
-            return this.parent.lookup(name, position);
+        return this.parent?.tryLookupCell(name);
+    }
+    defineSyntax(name, macro) {
+        this.syntaxBindings.set(name, macro);
+    }
+    tryLookupSyntax(name) {
+        const macro = this.syntaxBindings.get(name);
+        if (macro !== undefined) {
+            return macro;
         }
-        throw new EvalError(`unbound variable: ${name}`, position);
+        return this.parent?.tryLookupSyntax(name);
     }
 }
 /**
@@ -229,7 +253,13 @@ function evaluate(expr, env) {
             case 'char':
                 return charValue(expr.value, expr.position);
             case 'symbol':
-                return env.lookup(expr.name, expr.position);
+                if (expr.capturedCell) {
+                    return expr.capturedCell.value;
+                }
+                if (expr.capturedSyntax) {
+                    throw new EvalError(`syntax identifier used as value: ${expr.name}`, expr.position);
+                }
+                return env.lookup(symbolKey(expr), expr.position);
             case 'list':
                 return evaluateList(expr, env);
         }
@@ -248,6 +278,8 @@ function evaluateList(expr, env) {
         switch (operator.name) {
             case 'define':
                 return evaluateDefine(args, env, operator.position);
+            case 'define-syntax':
+                return evaluateDefineSyntax(args, env, operator.position);
             case 'set!':
                 return evaluateSet(args, env, operator.position);
             case 'if':
@@ -267,6 +299,10 @@ function evaluateList(expr, env) {
             case 'cond':
                 return evaluateCond(args, env);
         }
+        const macro = operator.capturedSyntax ?? env.tryLookupSyntax(symbolKey(operator));
+        if (macro) {
+            return evaluate(expandMacroCall(macro, expr), env);
+        }
     }
     const procedure = evaluate(operator, env);
     const evaluatedArgs = args.map((arg) => ({ value: evaluate(arg, env), position: arg.position }));
@@ -280,7 +316,7 @@ function evaluateDefine(args, env, position) {
     if (target.type === 'symbol') {
         requireArgCount('define', args.length, 2, position);
         const value = evaluate(args[1], env);
-        env.define(target.name, value);
+        env.define(symbolKey(target), value);
         return VOID_VALUE;
     }
     if (target.type !== 'list' || target.elements.length === 0) {
@@ -293,7 +329,16 @@ function evaluateDefine(args, env, position) {
     const { params, restParam } = parseParameterList(target.elements.slice(1));
     const body = args.slice(1);
     const closure = { type: 'closure', params, restParam, body, env };
-    env.define(nameExpr.name, closure);
+    env.define(symbolKey(nameExpr), closure);
+    return VOID_VALUE;
+}
+function evaluateDefineSyntax(args, env, position) {
+    requireArgCount('define-syntax', args.length, 2, position);
+    const target = args[0];
+    if (target.type !== 'symbol') {
+        throw new EvalError('define-syntax: expected identifier', target.position);
+    }
+    env.defineSyntax(symbolKey(target), parseSyntaxRules(target.name, args[1], env));
     return VOID_VALUE;
 }
 function evaluateSet(args, env, position) {
@@ -302,7 +347,12 @@ function evaluateSet(args, env, position) {
     if (target.type !== 'symbol') {
         throw new EvalError('set!: invalid binding target', target.position);
     }
-    env.set(target.name, evaluate(args[1], env), target.position);
+    const value = evaluate(args[1], env);
+    if (target.capturedCell) {
+        target.capturedCell.value = value;
+        return VOID_VALUE;
+    }
+    env.set(symbolKey(target), value, target.position);
     return VOID_VALUE;
 }
 function evaluateIf(args, env, position) {
@@ -320,7 +370,7 @@ function evaluateLambda(args, env, position) {
         return {
             type: 'closure',
             params: [],
-            restParam: paramsExpr.name,
+            restParam: symbolKey(paramsExpr),
             body: args.slice(1),
             env,
         };
@@ -373,17 +423,17 @@ function evaluateLet(args, env, position) {
         const letEnv = new Environment(env);
         const closure = {
             type: 'closure',
-            params: bindings.map((binding) => binding.name),
+            params: bindings.map((binding) => symbolKey(binding.name)),
             body: args.slice(2),
             env: letEnv,
         };
-        letEnv.define(firstArg.name, closure);
+        letEnv.define(symbolKey(firstArg), closure);
         return applyProcedure(closure, values, firstArg.position);
     }
     const bindings = parseLetBindings(firstArg);
     const letEnv = new Environment(env);
     for (const binding of bindings) {
-        letEnv.define(binding.name, evaluate(binding.value, env));
+        letEnv.define(symbolKey(binding.name), evaluate(binding.value, env));
     }
     return evaluateSequence(args.slice(1), letEnv);
 }
@@ -427,7 +477,7 @@ function parseParameterList(params) {
             throw new EvalError('lambda: parameter names must be symbols', param.position);
         }
         if (param.name !== '.') {
-            names.push(param.name);
+            names.push(symbolKey(param));
             continue;
         }
         const restParam = params[index + 1];
@@ -437,7 +487,7 @@ function parseParameterList(params) {
             index + 2 !== params.length) {
             throw new EvalError('lambda: invalid rest parameter list', param.position);
         }
-        return { params: names, restParam: restParam.name };
+        return { params: names, restParam: symbolKey(restParam) };
     }
     return { params: names };
 }
@@ -453,8 +503,538 @@ function parseLetBindings(bindingsExpr) {
         if (nameExpr.type !== 'symbol') {
             throw new EvalError('let: binding name must be a symbol', nameExpr.position);
         }
-        return { name: nameExpr.name, value: valueExpr };
+        return { name: nameExpr, value: valueExpr };
     });
+}
+function symbolKey(symbol) {
+    return symbol.resolvedName ?? symbol.name;
+}
+function parseSyntaxRules(keywordName, transformerExpr, env) {
+    if (transformerExpr.type !== 'list' || transformerExpr.elements.length < 2) {
+        throw new EvalError('define-syntax: expected syntax-rules transformer', transformerExpr.position);
+    }
+    const [head, ...rest] = transformerExpr.elements;
+    if (head.type !== 'symbol' || head.name !== 'syntax-rules') {
+        throw new EvalError('define-syntax: expected syntax-rules transformer', transformerExpr.position);
+    }
+    let ellipsis = '...';
+    let literalsExpr;
+    let ruleExprs = [];
+    if (rest[0]?.type === 'symbol') {
+        ellipsis = rest[0].name;
+        literalsExpr = rest[1];
+        ruleExprs = rest.slice(2);
+    }
+    else {
+        literalsExpr = rest[0];
+        ruleExprs = rest.slice(1);
+    }
+    if (literalsExpr === undefined || literalsExpr.type !== 'list') {
+        throw new EvalError('syntax-rules: expected literal identifier list', transformerExpr.position);
+    }
+    if (ruleExprs.length === 0) {
+        throw new EvalError('syntax-rules: expected at least one rule', transformerExpr.position);
+    }
+    const literals = new Set([keywordName]);
+    for (const literal of literalsExpr.elements) {
+        if (literal.type !== 'symbol') {
+            throw new EvalError('syntax-rules: literal identifiers must be symbols', literal.position);
+        }
+        literals.add(literal.name);
+    }
+    const rules = ruleExprs.map((ruleExpr) => {
+        if (ruleExpr.type !== 'list' || ruleExpr.elements.length !== 2) {
+            throw new EvalError('syntax-rules: expected (pattern template) rule', ruleExpr.position);
+        }
+        const [pattern, template] = ruleExpr.elements;
+        return { pattern, template };
+    });
+    return {
+        type: 'syntax-rules',
+        name: keywordName,
+        ellipsis,
+        literals,
+        rules,
+        env,
+    };
+}
+function expandMacroCall(macro, expr) {
+    for (const rule of macro.rules) {
+        const bindings = matchPattern(rule.pattern, expr, macro, new Map(), []);
+        if (bindings === null) {
+            continue;
+        }
+        const expanded = expandTemplate(rule.template, bindings, macro, []);
+        return cloneExpr(hygienizeExpr(expanded, macro.env, new Map()));
+    }
+    throw new EvalError(`${macro.name}: no matching syntax-rules pattern`, expr.position);
+}
+function matchPattern(pattern, input, macro, bindings, path) {
+    switch (pattern.type) {
+        case 'number':
+        case 'boolean':
+        case 'string':
+        case 'char':
+            return exprSyntaxEqual(pattern, input) ? bindings : null;
+        case 'symbol':
+            if (macro.literals.has(pattern.name) || pattern.name === macro.ellipsis) {
+                return input.type === 'symbol' && input.name === pattern.name ? bindings : null;
+            }
+            return bindPatternVariable(bindings, pattern.name, path, input);
+        case 'list':
+            if (input.type !== 'list') {
+                return null;
+            }
+            return matchPatternSequence(pattern.elements, input.elements, macro, bindings, path, 0, 0);
+    }
+}
+function matchPatternSequence(patterns, inputs, macro, bindings, path, patternIndex, inputIndex) {
+    if (patternIndex === patterns.length) {
+        return inputIndex === inputs.length ? bindings : null;
+    }
+    const pattern = patterns[patternIndex];
+    if (patternIndex + 1 < patterns.length && isEllipsisExpr(patterns[patternIndex + 1], macro.ellipsis)) {
+        const seededBindings = seedRepeatedPatternBindings(bindings, pattern, macro, path);
+        const minimumRemainingLength = minimumPatternLength(patterns.slice(patternIndex + 2), macro);
+        const maxRepeatCount = inputs.length - inputIndex - minimumRemainingLength;
+        if (maxRepeatCount < 0) {
+            return null;
+        }
+        for (let repeatCount = 0; repeatCount <= maxRepeatCount; repeatCount += 1) {
+            let repeatedBindings = seededBindings;
+            let matched = true;
+            for (let repeatIndex = 0; repeatIndex < repeatCount; repeatIndex += 1) {
+                const nextBindings = matchPattern(pattern, inputs[inputIndex + repeatIndex], macro, repeatedBindings, [...path, repeatIndex]);
+                if (nextBindings === null) {
+                    matched = false;
+                    break;
+                }
+                repeatedBindings = nextBindings;
+            }
+            if (!matched) {
+                continue;
+            }
+            const remainingBindings = matchPatternSequence(patterns, inputs, macro, repeatedBindings, path, patternIndex + 2, inputIndex + repeatCount);
+            if (remainingBindings !== null) {
+                return remainingBindings;
+            }
+        }
+        return null;
+    }
+    if (inputIndex >= inputs.length) {
+        return null;
+    }
+    const nextBindings = matchPattern(pattern, inputs[inputIndex], macro, bindings, path);
+    if (nextBindings === null) {
+        return null;
+    }
+    return matchPatternSequence(patterns, inputs, macro, nextBindings, path, patternIndex + 1, inputIndex + 1);
+}
+function minimumPatternLength(patterns, macro) {
+    let length = 0;
+    for (let index = 0; index < patterns.length; index += 1) {
+        if (index + 1 < patterns.length && isEllipsisExpr(patterns[index + 1], macro.ellipsis)) {
+            index += 1;
+            continue;
+        }
+        length += 1;
+    }
+    return length;
+}
+function seedRepeatedPatternBindings(bindings, pattern, macro, path) {
+    const variableNames = collectPatternVariables(pattern, macro, new Set());
+    if (variableNames.size === 0) {
+        return bindings;
+    }
+    const nextBindings = new Map(bindings);
+    for (const name of variableNames) {
+        nextBindings.set(name, ensureArrayBinding(nextBindings.get(name), path));
+    }
+    return nextBindings;
+}
+function collectPatternVariables(pattern, macro, names) {
+    switch (pattern.type) {
+        case 'symbol':
+            if (!macro.literals.has(pattern.name) && pattern.name !== macro.ellipsis) {
+                names.add(pattern.name);
+            }
+            return names;
+        case 'list':
+            for (const element of pattern.elements) {
+                collectPatternVariables(element, macro, names);
+            }
+            return names;
+        default:
+            return names;
+    }
+}
+function ensureArrayBinding(binding, path) {
+    if (path.length === 0) {
+        return binding ?? [];
+    }
+    if (binding !== undefined && !Array.isArray(binding)) {
+        return binding;
+    }
+    const [index, ...rest] = path;
+    const values = binding === undefined ? [] : [...binding];
+    values[index] = ensureArrayBinding(values[index], rest);
+    return values;
+}
+function bindPatternVariable(bindings, name, path, input) {
+    const nextBinding = setMatchBinding(bindings.get(name), path, input);
+    if (nextBinding === null) {
+        return null;
+    }
+    const nextBindings = new Map(bindings);
+    nextBindings.set(name, nextBinding);
+    return nextBindings;
+}
+function setMatchBinding(binding, path, input) {
+    if (path.length === 0) {
+        if (binding === undefined) {
+            return input;
+        }
+        if (Array.isArray(binding)) {
+            return null;
+        }
+        return exprSyntaxEqual(binding, input) ? binding : null;
+    }
+    if (binding !== undefined && !Array.isArray(binding)) {
+        return null;
+    }
+    const [index, ...rest] = path;
+    const values = binding === undefined ? [] : [...binding];
+    const nextBinding = setMatchBinding(values[index], rest, input);
+    if (nextBinding === null) {
+        return null;
+    }
+    values[index] = nextBinding;
+    return values;
+}
+function getMatchBinding(binding, path) {
+    let current = binding;
+    for (const index of path) {
+        if (!Array.isArray(current)) {
+            return undefined;
+        }
+        current = current[index];
+    }
+    return current;
+}
+function expandTemplate(template, bindings, macro, path) {
+    switch (template.type) {
+        case 'number':
+        case 'boolean':
+        case 'string':
+        case 'char':
+            return { ...cloneExpr(template), introduced: true };
+        case 'symbol': {
+            if (template.name === macro.ellipsis) {
+                throw new EvalError('syntax-rules: invalid ellipsis in template', template.position);
+            }
+            const binding = bindings.get(template.name);
+            if (binding === undefined) {
+                return { ...cloneExpr(template), introduced: true };
+            }
+            const value = getMatchBinding(binding, path);
+            if (value === undefined || Array.isArray(value)) {
+                throw new EvalError('syntax-rules: invalid template ellipsis usage', template.position);
+            }
+            return cloneExpr(value);
+        }
+        case 'list': {
+            const elements = [];
+            for (let index = 0; index < template.elements.length; index += 1) {
+                const element = template.elements[index];
+                if (index + 1 < template.elements.length &&
+                    isEllipsisExpr(template.elements[index + 1], macro.ellipsis)) {
+                    const repeatCount = findTemplateRepeatCount(element, bindings, path);
+                    if (repeatCount === null) {
+                        throw new EvalError('syntax-rules: template ellipsis has no repeated variable', element.position);
+                    }
+                    for (let repeatIndex = 0; repeatIndex < repeatCount; repeatIndex += 1) {
+                        elements.push(expandTemplate(element, bindings, macro, [...path, repeatIndex]));
+                    }
+                    index += 1;
+                    continue;
+                }
+                elements.push(expandTemplate(element, bindings, macro, path));
+            }
+            return { type: 'list', elements, position: template.position, introduced: true };
+        }
+    }
+}
+function findTemplateRepeatCount(template, bindings, path) {
+    switch (template.type) {
+        case 'symbol': {
+            const binding = bindings.get(template.name);
+            if (binding === undefined) {
+                return null;
+            }
+            const value = getMatchBinding(binding, path);
+            return Array.isArray(value) ? value.length : null;
+        }
+        case 'list':
+            for (const element of template.elements) {
+                const repeatCount = findTemplateRepeatCount(element, bindings, path);
+                if (repeatCount !== null) {
+                    return repeatCount;
+                }
+            }
+            return null;
+        default:
+            return null;
+    }
+}
+function hygienizeExpr(expr, definitionEnv, scope) {
+    if (expr.type === 'symbol') {
+        return hygienizeSymbol(expr, definitionEnv, scope);
+    }
+    if (expr.type !== 'list' || !expr.introduced) {
+        return expr;
+    }
+    const operator = expr.elements[0];
+    if (operator?.type === 'symbol') {
+        switch (operator.name) {
+            case 'quote':
+                return expr;
+            case 'lambda':
+                return hygienizeLambdaExpr(expr, definitionEnv, scope);
+            case 'let':
+                return hygienizeLetExpr(expr, definitionEnv, scope);
+            case 'define':
+                return hygienizeDefineExpr(expr, definitionEnv, scope);
+        }
+    }
+    return {
+        ...expr,
+        elements: expr.elements.map((element) => hygienizeExpr(element, definitionEnv, scope)),
+    };
+}
+function hygienizeSymbol(expr, definitionEnv, scope) {
+    if (!expr.introduced) {
+        return expr;
+    }
+    const renamed = scope.get(expr.name);
+    if (renamed !== undefined) {
+        return { ...expr, resolvedName: renamed };
+    }
+    if (SPECIAL_FORM_NAMES.has(expr.name)) {
+        return expr;
+    }
+    const syntax = definitionEnv.tryLookupSyntax(expr.name);
+    if (syntax !== undefined) {
+        return { ...expr, capturedSyntax: syntax };
+    }
+    const cell = definitionEnv.tryLookupCell(expr.name);
+    if (cell !== undefined) {
+        return { ...expr, capturedCell: cell };
+    }
+    return expr;
+}
+function hygienizeLambdaExpr(expr, definitionEnv, scope) {
+    if (expr.elements.length < 2) {
+        return expr;
+    }
+    const transformedParams = hygienizeParameterSpec(expr.elements[1], scope);
+    return {
+        ...expr,
+        elements: [
+            expr.elements[0],
+            transformedParams.paramsExpr,
+            ...expr.elements
+                .slice(2)
+                .map((element) => hygienizeExpr(element, definitionEnv, transformedParams.scope)),
+        ],
+    };
+}
+function hygienizeLetExpr(expr, definitionEnv, scope) {
+    if (expr.elements.length < 3) {
+        return expr;
+    }
+    const [operator, firstArg] = expr.elements;
+    if (firstArg.type === 'symbol') {
+        let bodyScope = new Map(scope);
+        const renamedLet = freshenBinder(firstArg, bodyScope);
+        bodyScope = renamedLet.scope;
+        const transformedBindings = hygienizeLetBindings(expr.elements[2], definitionEnv, scope, bodyScope);
+        return {
+            ...expr,
+            elements: [
+                operator,
+                renamedLet.symbol,
+                transformedBindings.bindingsExpr,
+                ...expr.elements
+                    .slice(3)
+                    .map((element) => hygienizeExpr(element, definitionEnv, transformedBindings.scope)),
+            ],
+        };
+    }
+    const transformedBindings = hygienizeLetBindings(firstArg, definitionEnv, scope, new Map(scope));
+    return {
+        ...expr,
+        elements: [
+            operator,
+            transformedBindings.bindingsExpr,
+            ...expr.elements
+                .slice(2)
+                .map((element) => hygienizeExpr(element, definitionEnv, transformedBindings.scope)),
+        ],
+    };
+}
+function hygienizeDefineExpr(expr, definitionEnv, scope) {
+    if (expr.elements.length < 3) {
+        return expr;
+    }
+    const [operator, target, ...rest] = expr.elements;
+    if (target.type === 'symbol') {
+        return {
+            ...expr,
+            elements: [
+                operator,
+                freshenBinder(target, new Map(scope)).symbol,
+                ...rest.map((element) => hygienizeExpr(element, definitionEnv, scope)),
+            ],
+        };
+    }
+    if (target.type !== 'list' || target.elements.length === 0 || target.elements[0].type !== 'symbol') {
+        return {
+            ...expr,
+            elements: expr.elements.map((element) => hygienizeExpr(element, definitionEnv, scope)),
+        };
+    }
+    let bodyScope = new Map(scope);
+    const renamedTarget = freshenBinder(target.elements[0], bodyScope);
+    bodyScope = renamedTarget.scope;
+    const transformedParams = hygienizeParameterSpec({ type: 'list', elements: target.elements.slice(1), position: target.position, introduced: target.introduced }, bodyScope);
+    return {
+        ...expr,
+        elements: [
+            operator,
+            {
+                type: 'list',
+                position: target.position,
+                introduced: target.introduced,
+                elements: [renamedTarget.symbol, ...transformedParams.paramsExpr.elements],
+            },
+            ...rest.map((element) => hygienizeExpr(element, definitionEnv, transformedParams.scope)),
+        ],
+    };
+}
+function hygienizeParameterSpec(paramsExpr, scope) {
+    let nextScope = new Map(scope);
+    if (paramsExpr.type === 'symbol') {
+        const renamed = freshenBinder(paramsExpr, nextScope);
+        return { paramsExpr: renamed.symbol, scope: renamed.scope };
+    }
+    if (paramsExpr.type !== 'list') {
+        return { paramsExpr, scope: nextScope };
+    }
+    const params = [];
+    for (const param of paramsExpr.elements) {
+        if (param.type !== 'symbol' || param.name === '.') {
+            params.push(param);
+            continue;
+        }
+        const renamed = freshenBinder(param, nextScope);
+        params.push(renamed.symbol);
+        nextScope = renamed.scope;
+    }
+    return {
+        paramsExpr: { ...paramsExpr, elements: params },
+        scope: nextScope,
+    };
+}
+function hygienizeLetBindings(bindingsExpr, definitionEnv, valueScope, bodyScope) {
+    if (bindingsExpr.type !== 'list') {
+        return { bindingsExpr, scope: bodyScope };
+    }
+    let nextScope = new Map(bodyScope);
+    const bindings = bindingsExpr.elements.map((bindingExpr) => {
+        if (bindingExpr.type !== 'list' || bindingExpr.elements.length !== 2) {
+            return hygienizeExpr(bindingExpr, definitionEnv, valueScope);
+        }
+        const [nameExpr, valueExpr] = bindingExpr.elements;
+        const transformedValue = hygienizeExpr(valueExpr, definitionEnv, valueScope);
+        if (nameExpr.type !== 'symbol' || nameExpr.name === '.') {
+            return {
+                ...bindingExpr,
+                elements: [nameExpr, transformedValue],
+            };
+        }
+        const renamed = freshenBinder(nameExpr, nextScope);
+        nextScope = renamed.scope;
+        return {
+            ...bindingExpr,
+            elements: [renamed.symbol, transformedValue],
+        };
+    });
+    return {
+        bindingsExpr: { ...bindingsExpr, elements: bindings },
+        scope: nextScope,
+    };
+}
+function freshenBinder(symbol, scope) {
+    if (!symbol.introduced || symbol.name === '.') {
+        return { symbol, scope };
+    }
+    const freshName = freshResolvedName(symbol.name);
+    const nextScope = new Map(scope);
+    nextScope.set(symbol.name, freshName);
+    return {
+        symbol: { ...symbol, resolvedName: freshName },
+        scope: nextScope,
+    };
+}
+function freshResolvedName(name) {
+    freshIdentifierCounter += 1;
+    return `__macro_${freshIdentifierCounter}_${name}`;
+}
+function isEllipsisExpr(expr, ellipsis) {
+    return expr.type === 'symbol' && expr.name === ellipsis;
+}
+function exprSyntaxEqual(left, right) {
+    if (left.type !== right.type) {
+        return false;
+    }
+    switch (left.type) {
+        case 'number':
+        case 'boolean':
+        case 'string':
+        case 'char':
+            return left.value === right.value;
+        case 'symbol':
+            return left.name === right.name;
+        case 'list': {
+            const rightList = right;
+            if (left.elements.length !== rightList.elements.length) {
+                return false;
+            }
+            for (let index = 0; index < left.elements.length; index += 1) {
+                if (!exprSyntaxEqual(left.elements[index], rightList.elements[index])) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+}
+function cloneExpr(expr) {
+    switch (expr.type) {
+        case 'number':
+        case 'boolean':
+        case 'string':
+        case 'char':
+            return { ...expr, introduced: undefined };
+        case 'symbol':
+            return { ...expr, introduced: undefined };
+        case 'list':
+            return {
+                ...expr,
+                introduced: undefined,
+                elements: expr.elements.map((element) => cloneExpr(element)),
+            };
+    }
 }
 function applyProcedure(value, args, callPosition) {
     switch (value.type) {
