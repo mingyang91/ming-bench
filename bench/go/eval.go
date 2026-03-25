@@ -370,6 +370,9 @@ func makeGlobalEnv(out *strings.Builder) *Env {
 	env.set("string-copy", &BuiltinFunc{Name: "string-copy", Fn: builtinStringCopy})
 	env.set("string-set!", &BuiltinFunc{Name: "string-set!", Fn: builtinStringSet})
 
+	// L09 builtins
+	registerL09Builtins(env)
+
 	return env
 }
 
