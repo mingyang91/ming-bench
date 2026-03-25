@@ -65,6 +65,7 @@ enum Val {
     },
     Vector(Rc<RefCell<Vec<Val>>>),
     Continuation(Rc<ContData>),
+    Values(Vec<Val>),
 }
 
 fn make_pair(car: Val, cdr: Val) -> Val {
@@ -149,6 +150,13 @@ impl fmt::Display for Val {
                 write!(f, ")")
             }
             Val::Continuation(_) => write!(f, "#<continuation>"),
+            Val::Values(vals) => {
+                if vals.len() == 1 {
+                    write!(f, "{}", vals[0])
+                } else {
+                    write!(f, "#<values>")
+                }
+            }
         }
     }
 }
@@ -1873,6 +1881,33 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                 }
             }
 
+            // values handling
+            if let ExprKind::Symbol(op) = &list[0].kind {
+                if op == "values" {
+                    let mut vals = Vec::new();
+                    for a in &list[1..] {
+                        vals.push(eval(a, env, out)?);
+                    }
+                    if vals.len() == 1 {
+                        return Ok(vals.into_iter().next().unwrap());
+                    }
+                    return Ok(Val::Values(vals));
+                }
+                if op == "call-with-values" {
+                    if list.len() != 3 {
+                        return Err(err_at(span, EvalError::Arity("call-with-values: need 2 arguments".into())));
+                    }
+                    let producer = eval(&list[1], env, out)?;
+                    let consumer = eval(&list[2], env, out)?;
+                    let produced = call_function(&producer, vec![], span, out)?;
+                    let args = match produced {
+                        Val::Values(vals) => vals,
+                        other => vec![other],
+                    };
+                    return call_function(&consumer, args, span, out);
+                }
+            }
+
             // dynamic-wind handling
             if let ExprKind::Symbol(op) = &list[0].kind {
                 if op == "dynamic-wind" {
@@ -1996,6 +2031,29 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                     }
                     let f = eval(&list[1], env, out)?;
                     return handle_callcc(&f, env, out, span);
+                }
+                if name == "values" {
+                    let mut vals = Vec::new();
+                    for a in &list[1..] {
+                        vals.push(eval(a, env, out)?);
+                    }
+                    if vals.len() == 1 {
+                        return Ok(vals.into_iter().next().unwrap());
+                    }
+                    return Ok(Val::Values(vals));
+                }
+                if name == "call-with-values" {
+                    if list.len() != 3 {
+                        return Err(err_at(span, EvalError::Arity("call-with-values: need 2 arguments".into())));
+                    }
+                    let producer = eval(&list[1], env, out)?;
+                    let consumer = eval(&list[2], env, out)?;
+                    let produced = call_function(&producer, vec![], span, out)?;
+                    let args = match produced {
+                        Val::Values(vals) => vals,
+                        other => vec![other],
+                    };
+                    return call_function(&consumer, args, span, out);
                 }
             }
 
@@ -2135,7 +2193,8 @@ fn is_builtin(op: &str) -> bool {
         | "make-string" | "string" | "string>?" | "string<=?" | "string>=?"
         | "display" | "write" | "newline"
         | "call/cc" | "call-with-current-continuation"
-        | "dynamic-wind")
+        | "dynamic-wind"
+        | "values" | "call-with-values")
 }
 
 /// Parse a parameter list that may contain dot notation for rest params.
@@ -2247,6 +2306,24 @@ fn call_function(func: &Val, args: Vec<Val>, span: Span, out: &mut String) -> Re
                     return Err(err_at(span, EvalError::Arity("call/cc: need 1 argument".into())));
                 }
                 return handle_callcc(&args[0], &new_env(None), out, span);
+            } else if name == "values" {
+                if args.len() == 1 {
+                    return Ok(args.into_iter().next().unwrap());
+                }
+                return Ok(Val::Values(args));
+            } else if name == "call-with-values" {
+                if args.len() != 2 {
+                    return Err(err_at(span, EvalError::Arity("call-with-values: need 2 arguments".into())));
+                }
+                let mut args_iter = args.into_iter();
+                let producer = args_iter.next().unwrap();
+                let consumer = args_iter.next().unwrap();
+                let produced = call_function(&producer, vec![], span, out)?;
+                let cargs = match produced {
+                    Val::Values(vals) => vals,
+                    other => vec![other],
+                };
+                return call_function(&consumer, cargs, span, out);
             } else if name == "apply" {
                 do_apply(&args, span, out)
             } else if name.starts_with("__ctor_") {
