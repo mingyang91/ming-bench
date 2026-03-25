@@ -15,6 +15,7 @@ enum SchemeVal:
   case BuiltinProc(name: String, f: List[SchemeVal] => SchemeVal)
   case LambdaProc(params: List[String], body: List[SchemeVal], closure: Env, rest: Option[String] = None)
   case MacroVal(name: String, literals: List[String], rules: List[(SchemeVal, SchemeVal)], defEnv: Env)
+  case RecordVal(typeName: String, fields: scala.collection.mutable.Map[String, SchemeVal])
 
 object SchemeVal:
 
@@ -65,6 +66,7 @@ object SchemeVal:
     case BuiltinProc(name, _)    => s"#<procedure $name>"
     case LambdaProc(_, _, _, _)  => "#<procedure>"
     case MacroVal(name, _, _, _) => s"#<macro $name>"
+    case RecordVal(typeName, _)  => s"#<$typeName>"
 
   /** display-style output (strings unquoted) */
   def displayOutput(v: SchemeVal): String = v match

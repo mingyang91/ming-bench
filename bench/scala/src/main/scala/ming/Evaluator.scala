@@ -53,6 +53,8 @@ object Evaluator:
             case SchemeVal.Symbol("cond")          => evalCond(elems.tail, env)
             case SchemeVal.Symbol("set!")          => evalSet(elems.tail, env)
             case SchemeVal.Symbol("define-syntax") => evalDefineSyntax(elems.tail, env)
+            case SchemeVal.Symbol("define-record-type") =>
+              RecordType.evalDefineRecordType(elems.tail, env)
             case SchemeVal.Symbol(name) =>
               env.lookup(name) match
                 case Some(m: SchemeVal.MacroVal) =>
