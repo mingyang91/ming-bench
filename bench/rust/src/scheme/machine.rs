@@ -6,13 +6,13 @@ use super::records::{
 };
 use super::value_ops::eqv_value;
 use super::{
-    bind_lambda_call, env_define, env_lookup_macro, env_set, eval_case_lambda, eval_define_syntax,
-    eval_lambda, eval_quasiquote, eval_quote, eval_syntax, eval_syntax_case, eval_with_syntax,
-    lookup_symbol, make_immutable_string_value, make_lambda, make_vector_value,
-    parse_cond_consequent, parse_define_signature, parse_do_binding, parse_value_binding,
-    quote_expr, select_case_lambda_clause, syntax_error, wrong_arg_count, CondConsequent, Env,
-    EnvRef, EvalContext, EvalError, Expr, ExprKind, LambdaParams, Procedure, SourcePos, Value,
-    START_POS,
+    bind_lambda_call, build_local_syntax_env, env_define, env_lookup_macro, env_set,
+    eval_case_lambda, eval_define_syntax, eval_lambda, eval_quasiquote, eval_quote, eval_syntax,
+    eval_syntax_case, eval_with_syntax, lookup_symbol, make_immutable_string_value, make_lambda,
+    make_vector_value, parse_cond_consequent, parse_define_signature, parse_do_binding,
+    parse_local_syntax_form, parse_value_binding, quote_expr, select_case_lambda_clause,
+    syntax_error, wrong_arg_count, CondConsequent, Env, EnvRef, EvalContext, EvalError, Expr,
+    ExprKind, LambdaParams, Procedure, SourcePos, Value, START_POS,
 };
 use std::fmt;
 use std::rc::Rc;
@@ -378,6 +378,20 @@ fn eval_machine_list(
             }
             "letrec" => return start_letrec_state(&items[1..], env, form_pos, false, stack),
             "letrec*" => return start_letrec_state(&items[1..], env, form_pos, true, stack),
+            "let-syntax" => {
+                let (bindings_expr, body) =
+                    parse_local_syntax_form(&items[1..], form_pos, "let-syntax")?;
+                let local_env =
+                    build_local_syntax_env(bindings_expr, &env, context, false, "let-syntax")?;
+                return start_sequence_state(body, local_env, form_pos, stack);
+            }
+            "letrec-syntax" => {
+                let (bindings_expr, body) =
+                    parse_local_syntax_form(&items[1..], form_pos, "letrec-syntax")?;
+                let local_env =
+                    build_local_syntax_env(bindings_expr, &env, context, true, "letrec-syntax")?;
+                return start_sequence_state(body, local_env, form_pos, stack);
+            }
             "quasiquote" => {
                 return eval_quasiquote(&items[1..], &env, form_pos, context)
                     .map(MachineState::Value)

@@ -660,6 +660,12 @@ fn eval_list(
             "let*" => return eval_let_star(&items[1..], env, form_pos, context, tail),
             "letrec" => return eval_letrec(&items[1..], env, form_pos, context, false, tail),
             "letrec*" => return eval_letrec(&items[1..], env, form_pos, context, true, tail),
+            "let-syntax" => {
+                return eval_let_syntax(&items[1..], env, form_pos, context, false, tail)
+            }
+            "letrec-syntax" => {
+                return eval_let_syntax(&items[1..], env, form_pos, context, true, tail)
+            }
             "quasiquote" => {
                 return eval_quasiquote(&items[1..], env, form_pos, context).map(EvalOutcome::Value)
             }
@@ -749,29 +755,13 @@ fn eval_define_syntax(
                 .symbol_name()
                 .ok_or_else(|| syntax_error(name_expr.pos, "macro name must be a symbol"))?
                 .to_string();
-            let transformer = if transformer_expr
-                .list_items()
-                .and_then(|items| items.first())
-                .and_then(Expr::symbol_name)
-                == Some("syntax-rules")
-            {
-                parse_syntax_rules(&name, transformer_expr, env)?
-            } else {
-                let transformer = eval_expr(transformer_expr, env, context)?;
-                if !matches!(transformer, Value::Procedure(_)) {
-                    return Err(type_mismatch(
-                        transformer_expr.pos,
-                        "define-syntax",
-                        "procedure",
-                        transformer.type_name(),
-                    ));
-                }
-
-                Rc::new(MacroTransformer {
-                    name: name.clone(),
-                    kind: MacroKind::Procedure { transformer },
-                })
-            };
+            let transformer = eval_transformer_binding(
+                name.clone(),
+                transformer_expr,
+                env,
+                context,
+                "define-syntax",
+            )?;
             env_define_macro(env, name, transformer);
             Ok(Value::Void)
         }
@@ -782,6 +772,151 @@ fn eval_define_syntax(
             args.len(),
         )),
     }
+}
+
+fn eval_transformer_binding(
+    name: String,
+    transformer_expr: &Expr,
+    env: &EnvRef,
+    context: &mut EvalContext,
+    form_name: &str,
+) -> Result<MacroRef, EvalError> {
+    if transformer_expr
+        .list_items()
+        .and_then(|items| items.first())
+        .and_then(Expr::symbol_name)
+        == Some("syntax-rules")
+    {
+        return parse_syntax_rules(&name, transformer_expr, env);
+    }
+
+    let transformer = eval_expr(transformer_expr, env, context)?;
+    if !matches!(transformer, Value::Procedure(_)) {
+        return Err(type_mismatch(
+            transformer_expr.pos,
+            form_name,
+            "procedure",
+            transformer.type_name(),
+        ));
+    }
+
+    Ok(Rc::new(MacroTransformer {
+        name,
+        kind: MacroKind::Procedure { transformer },
+    }))
+}
+
+fn parse_local_syntax_form<'a>(
+    args: &'a [Expr],
+    pos: SourcePos,
+    form_name: &str,
+) -> Result<(&'a Expr, &'a [Expr]), EvalError> {
+    let (bindings_expr, body) = args
+        .split_first()
+        .ok_or_else(|| syntax_error(pos, format!("{form_name} requires bindings and a body")))?;
+
+    if body.is_empty() {
+        return Err(syntax_error(pos, format!("{form_name} requires a body")));
+    }
+
+    Ok((bindings_expr, body))
+}
+
+fn parse_local_syntax_bindings<'a>(
+    bindings_expr: &'a Expr,
+    form_name: &str,
+) -> Result<Vec<(String, &'a Expr)>, EvalError> {
+    let binding_exprs = bindings_expr.list_items().ok_or_else(|| {
+        syntax_error(
+            bindings_expr.pos,
+            format!("{form_name} bindings must be a list"),
+        )
+    })?;
+    let mut bindings = Vec::with_capacity(binding_exprs.len());
+
+    for binding in binding_exprs {
+        let items = binding.list_items().ok_or_else(|| {
+            syntax_error(binding.pos, format!("{form_name} bindings must be lists"))
+        })?;
+        let [name_expr, transformer_expr] = items else {
+            return Err(syntax_error(
+                binding.pos,
+                format!("each {form_name} binding must contain a name and transformer"),
+            ));
+        };
+
+        let name = name_expr
+            .symbol_name()
+            .ok_or_else(|| syntax_error(name_expr.pos, "macro name must be a symbol"))?;
+        bindings.push((name.to_string(), transformer_expr));
+    }
+
+    Ok(bindings)
+}
+
+fn build_local_syntax_env(
+    bindings_expr: &Expr,
+    env: &EnvRef,
+    context: &mut EvalContext,
+    recursive: bool,
+    form_name: &str,
+) -> Result<EnvRef, EvalError> {
+    let local_env = Env::new_child(env);
+    let bindings = parse_local_syntax_bindings(bindings_expr, form_name)?;
+
+    if recursive {
+        let mut deferred = Vec::new();
+        for (name, transformer_expr) in bindings {
+            if transformer_expr
+                .list_items()
+                .and_then(|items| items.first())
+                .and_then(Expr::symbol_name)
+                == Some("syntax-rules")
+            {
+                let transformer = parse_syntax_rules(&name, transformer_expr, &local_env)?;
+                env_define_macro(&local_env, name, transformer);
+            } else {
+                deferred.push((name, transformer_expr));
+            }
+        }
+
+        for (name, transformer_expr) in deferred {
+            let transformer = eval_transformer_binding(
+                name.clone(),
+                transformer_expr,
+                &local_env,
+                context,
+                form_name,
+            )?;
+            env_define_macro(&local_env, name, transformer);
+        }
+    } else {
+        for (name, transformer_expr) in bindings {
+            let transformer =
+                eval_transformer_binding(name.clone(), transformer_expr, env, context, form_name)?;
+            env_define_macro(&local_env, name, transformer);
+        }
+    }
+
+    Ok(local_env)
+}
+
+fn eval_let_syntax(
+    args: &[Expr],
+    env: &EnvRef,
+    pos: SourcePos,
+    context: &mut EvalContext,
+    recursive: bool,
+    tail: bool,
+) -> Result<EvalOutcome, EvalError> {
+    let form_name = if recursive {
+        "letrec-syntax"
+    } else {
+        "let-syntax"
+    };
+    let (bindings_expr, body) = parse_local_syntax_form(args, pos, form_name)?;
+    let local_env = build_local_syntax_env(bindings_expr, env, context, recursive, form_name)?;
+    eval_sequence_outcome(body, &local_env, pos, context, tail)
 }
 
 fn eval_syntax(

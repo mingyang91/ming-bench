@@ -1181,6 +1181,8 @@ fn is_core_syntax_keyword(name: &str) -> bool {
             | "let*"
             | "letrec"
             | "letrec*"
+            | "let-syntax"
+            | "letrec-syntax"
             | "or"
             | "quasiquote"
             | "quote"
