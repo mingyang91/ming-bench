@@ -63,27 +63,10 @@ private[ming] object SchemeInterpreter:
     (result, runtime.capturedOutput)
 
   def render(value: Value): String =
-    value match
-      case Value.Number(value)    => value.toString
-      case Value.Bool(true)       => "#t"
-      case Value.Bool(false)      => "#f"
-      case Value.StringLit(value) => "\"" + escapeString(value) + "\""
-      case Value.MutableString(value) =>
-        "\"" + escapeString(value) + "\""
-      case Value.Character(value) => renderCharacter(value)
-      case Value.Symbol(name)     => name
-      case Value.ListValue(items) => items.map(render).mkString("(", " ", ")")
-      case _: Procedure           => "#<procedure>"
-      case Value.Void             => "#<void>"
+    SchemeRendering.render(value)
 
   def renderDisplay(value: Value): String =
-    value match
-      case Value.StringLit(value) => value
-      case Value.MutableString(value) =>
-        value
-      case Value.Character(value) => value.toString
-      case Value.ListValue(items) => items.map(renderDisplay).mkString("(", " ", ")")
-      case other                  => render(other)
+    SchemeRendering.renderDisplay(value)
 
   private def runProgram(input: String): (Value, Runtime) =
     val expressions = SchemeReader.readAll(input)
@@ -108,6 +91,7 @@ private[ming] object SchemeInterpreter:
         items match
           case Nil                              => throw EvalError.at(pos, "cannot evaluate empty list")
           case Expr.Symbol("define", _) :: args => evalDefine(args, env, pos)
+          case Expr.Symbol("set!", _) :: args   => evalSet(args, env, pos)
           case Expr.Symbol("begin", _) :: args  => evalBegin(args, env)
           case Expr.Symbol("if", _) :: args     => evalIf(args, env, pos)
           case Expr.Symbol("let", _) :: args    => evalLet(args, env, pos)
@@ -131,6 +115,14 @@ private[ming] object SchemeInterpreter:
         Value.Void
       case _ =>
         throw EvalError.at(pos, "invalid define")
+
+  private def evalSet(args: List[Expr], env: Env, pos: SourcePos): Value =
+    args match
+      case Expr.Symbol(name, _) :: valueExpr :: Nil =>
+        env.assign(name, eval(valueExpr, env), pos)
+        Value.Void
+      case _ =>
+        throw EvalError.at(pos, "invalid set!")
 
   private def evalBegin(args: List[Expr], env: Env): Value =
     evalSequence(args, env)
@@ -247,19 +239,30 @@ private[ming] object SchemeInterpreter:
       case Value.Bool(false) => false
       case _                 => true
 
+  final private class Binding(var value: Value)
+
   final class Env private (parent: Option[Env]):
-    private val bindings = mutable.HashMap.empty[String, Value]
+    private val bindings = mutable.HashMap.empty[String, Binding]
 
     def define(name: String, value: Value): Unit =
-      bindings.update(name, value)
+      bindings.get(name) match
+        case Some(binding) => binding.value = value
+        case None          => bindings.update(name, Binding(value))
+
+    def assign(name: String, value: Value, pos: SourcePos): Unit =
+      resolve(name) match
+        case Some(binding) => binding.value = value
+        case None          => throw EvalError.at(pos, s"unbound variable: $name")
 
     def lookup(name: String, pos: SourcePos): Value =
+      resolve(name) match
+        case Some(binding) => binding.value
+        case None          => throw EvalError.at(pos, s"unbound variable: $name")
+
+    private def resolve(name: String): Option[Binding] =
       bindings.get(name) match
-        case Some(value) => value
-        case None =>
-          parent match
-            case Some(parentEnv) => parentEnv.lookup(name, pos)
-            case None            => throw EvalError.at(pos, s"unbound variable: $name")
+        case some @ Some(_) => some
+        case None           => parent.flatMap(_.resolve(name))
 
   private object Env:
     def root(): Env = new Env(None)
@@ -270,29 +273,4 @@ private[ming] object SchemeInterpreter:
       env
 
   private def renderExpr(expr: Expr): String =
-    expr match
-      case Expr.Number(value, _)    => value.toString
-      case Expr.Bool(true, _)       => "#t"
-      case Expr.Bool(false, _)      => "#f"
-      case Expr.StringLit(value, _) => "\"" + escapeString(value) + "\""
-      case Expr.Character(value, _) => renderCharacter(value)
-      case Expr.Symbol(name, _)     => name
-      case Expr.ListExpr(items, _) =>
-        items.map(renderExpr).mkString("(", " ", ")")
-
-  private def escapeString(value: String): String =
-    val builder = new StringBuilder
-    value.foreach {
-      case '"'  => builder.append("\\\"")
-      case '\\' => builder.append("\\\\")
-      case '\n' => builder.append("\\n")
-      case '\t' => builder.append("\\t")
-      case ch   => builder.append(ch)
-    }
-    builder.result()
-
-  private def renderCharacter(value: Char): String =
-    value match
-      case ' '  => "#\\space"
-      case '\n' => "#\\newline"
-      case ch   => s"#\\$ch"
+    SchemeRendering.renderExpr(expr)
