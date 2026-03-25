@@ -77,6 +77,8 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 			return evalSetBang(e, env)
 		case "define-syntax":
 			return evalDefineSyntax(e, env)
+		case "define-record-type":
+			return evalDefineRecordType(e, env)
 		}
 
 		// Check for macro application
