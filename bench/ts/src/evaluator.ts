@@ -35,6 +35,7 @@ function errAt(msg: string, pos?: Pos): EvalError {
 }
 
 const NIL: SchemeVal = { tag: 'nil' };
+let eqIdCounter = 0;
 
 // ── Rational helpers ────────────────────────────────────────────
 function gcd(a: number, b: number): number {
@@ -123,7 +124,10 @@ function makeList(items: SchemeVal[]): SchemeVal {
 function pairToArray(val: SchemeVal): SchemeVal[] {
   const result: SchemeVal[] = [];
   let cur = val;
+  const seen = new Set<SchemeVal>();
   while (cur.tag === 'pair') {
+    if (seen.has(cur)) throw new EvalError('not a proper list');
+    seen.add(cur);
     result.push(cur.car);
     cur = cur.cdr;
   }
@@ -174,7 +178,7 @@ function schemeEqv(a: SchemeVal, b: SchemeVal): boolean {
   return a === b;
 }
 
-function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
+function schemeEqual(a: SchemeVal, b: SchemeVal, seen?: Set<string>): boolean {
   if (isNumeric(a) && isNumeric(b)) return toFloat(a) === toFloat(b);
   if (a.tag !== b.tag) return false;
   if (a.tag === 'boolean' && b.tag === 'boolean') return a.value === b.value;
@@ -182,11 +186,21 @@ function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
   if (a.tag === 'symbol' && b.tag === 'symbol') return a.value === b.value;
   if (a.tag === 'char' && b.tag === 'char') return a.value === b.value;
   if (a.tag === 'nil' && b.tag === 'nil') return true;
-  if (a.tag === 'pair' && b.tag === 'pair') return schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr);
+  if (a.tag === 'pair' && b.tag === 'pair') {
+    if (a === b) return true;
+    if (!seen) seen = new Set();
+    // Use object identity pair as key to detect cycles
+    const idA = (a as any).__eqid ?? ((a as any).__eqid = ++eqIdCounter);
+    const idB = (b as any).__eqid ?? ((b as any).__eqid = ++eqIdCounter);
+    const key = `${idA}:${idB}`;
+    if (seen.has(key)) return true; // assume equal for cycles
+    seen.add(key);
+    return schemeEqual(a.car, b.car, seen) && schemeEqual(a.cdr, b.cdr, seen);
+  }
   if (a.tag === 'vector' && b.tag === 'vector') {
     if (a.elements.length !== b.elements.length) return false;
     for (let i = 0; i < a.elements.length; i++) {
-      if (!schemeEqual(a.elements[i], b.elements[i])) return false;
+      if (!schemeEqual(a.elements[i], b.elements[i], seen)) return false;
     }
     return true;
   }
@@ -287,9 +301,17 @@ function makeGlobalEnv(): Env {
   defBuiltin('length', (args) => {
     if (args.length !== 1) throw new EvalError('length: expected 1 argument');
     let count = 0;
-    let cur = args[0];
-    while (cur.tag === 'pair') { count++; cur = cur.cdr; }
-    if (cur.tag !== 'nil') throw new EvalError('length: expected proper list');
+    let slow = args[0], fast = args[0];
+    while (fast.tag === 'pair') {
+      count++;
+      slow = (slow as any).cdr;
+      fast = fast.cdr;
+      if (fast.tag !== 'pair') break;
+      count++;
+      fast = fast.cdr;
+      if (slow === fast) throw new EvalError('length: circular list');
+    }
+    if (fast.tag !== 'nil') throw new EvalError('length: expected proper list');
     return makeRat(count, 1);
   });
 
@@ -654,9 +676,17 @@ function makeGlobalEnv(): Env {
   // List utilities
   defBuiltin('list?', (args) => {
     if (args.length !== 1) throw new EvalError('list?: expected 1 argument');
-    let cur = args[0];
-    while (cur.tag === 'pair') cur = cur.cdr;
-    return { tag: 'boolean', value: cur.tag === 'nil' };
+    // Floyd's tortoise-and-hare cycle detection
+    let slow = args[0];
+    let fast = args[0];
+    while (fast.tag === 'pair') {
+      slow = (slow as any).cdr;
+      fast = fast.cdr;
+      if (fast.tag !== 'pair') break;
+      fast = fast.cdr;
+      if (slow === fast) return { tag: 'boolean', value: false }; // cycle detected
+    }
+    return { tag: 'boolean', value: fast.tag === 'nil' };
   });
 
   defBuiltin('list-ref', (args) => {
@@ -696,6 +726,236 @@ function makeGlobalEnv(): Env {
     if (args.length !== 1) throw new EvalError('procedure?: expected 1 argument');
     const v = args[0];
     return { tag: 'boolean', value: v.tag === 'lambda' || v.tag === 'builtin' || v.tag === 'case-lambda' };
+  });
+
+  // for-each
+  defBuiltin('for-each', (args) => {
+    if (args.length < 2) throw new EvalError('for-each: expected at least 2 arguments');
+    const func = args[0];
+    const lists = args.slice(1).map(a => pairToArray(a));
+    const len = lists[0].length;
+    for (let i = 0; i < len; i++) {
+      const callArgs = lists.map(l => l[i]);
+      if (func.tag === 'lambda') {
+        const callEnv = new Env(func.env);
+        for (let j = 0; j < func.params.length; j++) {
+          callEnv.define(func.params[j], callArgs[j]);
+        }
+        if (func.rest) {
+          callEnv.define(func.rest, makeList(callArgs.slice(func.params.length)));
+        }
+        for (const bodyExpr of func.body) evalExpr(bodyExpr, callEnv);
+      } else if (func.tag === 'builtin') {
+        func.fn(callArgs);
+      } else if (func.tag === 'case-lambda') {
+        applyCaseLambda(func, callArgs);
+      } else {
+        throw new EvalError('for-each: not a procedure');
+      }
+    }
+    return { tag: 'void' };
+  });
+
+  // cxr helpers — programmatic generation for all c[ad]{2,4}r
+  function cxrNav(val: SchemeVal, ops: string, name: string): SchemeVal {
+    let cur = val;
+    for (let i = ops.length - 1; i >= 0; i--) {
+      if (cur.tag !== 'pair') throw new EvalError(`${name}: expected pair`);
+      cur = ops[i] === 'a' ? cur.car : cur.cdr;
+    }
+    return cur;
+  }
+  for (const ops of [
+    'aa','ad','da','dd',
+    'aaa','aad','ada','add','daa','dad','dda','ddd',
+    'aaaa','aaad','aada','aadd','adaa','adad','adda','addd',
+    'daaa','daad','dada','dadd','ddaa','ddad','ddda','dddd',
+  ]) {
+    const name = `c${ops}r`;
+    defBuiltin(name, (args) => {
+      if (args.length !== 1) throw new EvalError(`${name}: expected 1 argument`);
+      return cxrNav(args[0], ops, name);
+    });
+  }
+
+  // memq (uses eq? identity)
+  defBuiltin('memq', (args) => {
+    if (args.length !== 2) throw new EvalError('memq: expected 2 arguments');
+    let cur = args[1];
+    while (cur.tag === 'pair') {
+      const a = args[0], b = cur.car;
+      if (a.tag === b.tag) {
+        if (a.tag === 'symbol' && b.tag === 'symbol' && a.value === b.value) return cur;
+        if (a.tag === 'number' && b.tag === 'number' && a.value === b.value) return cur;
+        if (a.tag === 'rational' && b.tag === 'rational' && a.num === b.num && a.den === b.den) return cur;
+        if (a.tag === 'boolean' && b.tag === 'boolean' && a.value === b.value) return cur;
+        if (a.tag === 'char' && b.tag === 'char' && a.value === b.value) return cur;
+        if (a.tag === 'nil' && b.tag === 'nil') return cur;
+        if (a === b) return cur;
+      }
+      cur = cur.cdr;
+    }
+    return { tag: 'boolean', value: false };
+  });
+
+  // memv (uses eqv?)
+  defBuiltin('memv', (args) => {
+    if (args.length !== 2) throw new EvalError('memv: expected 2 arguments');
+    let cur = args[1];
+    while (cur.tag === 'pair') {
+      if (schemeEqv(args[0], cur.car)) return cur;
+      cur = cur.cdr;
+    }
+    return { tag: 'boolean', value: false };
+  });
+
+  // assv (uses eqv?)
+  defBuiltin('assv', (args) => {
+    if (args.length !== 2) throw new EvalError('assv: expected 2 arguments');
+    const key = args[0];
+    let alist = args[1];
+    while (alist.tag === 'pair') {
+      const entry = alist.car;
+      if (entry.tag === 'pair' && schemeEqv(entry.car, key)) return entry;
+      alist = alist.cdr;
+    }
+    return { tag: 'boolean', value: false };
+  });
+
+  // member (uses equal?)
+  defBuiltin('member', (args) => {
+    if (args.length !== 2) throw new EvalError('member: expected 2 arguments');
+    let cur = args[1];
+    while (cur.tag === 'pair') {
+      if (schemeEqual(args[0], cur.car)) return cur;
+      cur = cur.cdr;
+    }
+    return { tag: 'boolean', value: false };
+  });
+
+  // reverse
+  defBuiltin('reverse', (args) => {
+    if (args.length !== 1) throw new EvalError('reverse: expected 1 argument');
+    let cur = args[0];
+    let result: SchemeVal = NIL;
+    while (cur.tag === 'pair') {
+      result = { tag: 'pair', car: cur.car, cdr: result };
+      cur = cur.cdr;
+    }
+    if (cur.tag !== 'nil') throw new EvalError('reverse: expected proper list');
+    return result;
+  });
+
+  // gcd
+  defBuiltin('gcd', (args) => {
+    if (args.length === 0) return makeRat(0, 1);
+    let result = Math.abs(expectNum(args[0], 'gcd'));
+    for (let i = 1; i < args.length; i++) {
+      let b = Math.abs(expectNum(args[i], 'gcd'));
+      while (b) { [result, b] = [b, result % b]; }
+    }
+    return makeRat(result, 1);
+  });
+
+  // lcm
+  defBuiltin('lcm', (args) => {
+    if (args.length === 0) return makeRat(1, 1);
+    let result = Math.abs(expectNum(args[0], 'lcm'));
+    for (let i = 1; i < args.length; i++) {
+      let b = Math.abs(expectNum(args[i], 'lcm'));
+      if (result === 0 && b === 0) { result = 0; continue; }
+      let a2 = result, b2 = b;
+      while (b2) { [a2, b2] = [b2, a2 % b2]; }
+      result = (result / a2) * b;
+    }
+    return makeRat(result, 1);
+  });
+
+  // truncate
+  defBuiltin('truncate', (args) => {
+    if (args.length !== 1) throw new EvalError('truncate: expected 1 argument');
+    assertNumeric(args[0], 'truncate');
+    return { tag: 'number', value: Math.trunc(toFloat(args[0])) };
+  });
+
+  // round
+  defBuiltin('round', (args) => {
+    if (args.length !== 1) throw new EvalError('round: expected 1 argument');
+    assertNumeric(args[0], 'round');
+    return { tag: 'number', value: Math.round(toFloat(args[0])) };
+  });
+
+  // floor
+  defBuiltin('floor', (args) => {
+    if (args.length !== 1) throw new EvalError('floor: expected 1 argument');
+    assertNumeric(args[0], 'floor');
+    return { tag: 'number', value: Math.floor(toFloat(args[0])) };
+  });
+
+  // ceiling
+  defBuiltin('ceiling', (args) => {
+    if (args.length !== 1) throw new EvalError('ceiling: expected 1 argument');
+    assertNumeric(args[0], 'ceiling');
+    return { tag: 'number', value: Math.ceil(toFloat(args[0])) };
+  });
+
+  // make-string
+  defBuiltin('make-string', (args) => {
+    if (args.length < 1 || args.length > 2) throw new EvalError('make-string: expected 1 or 2 arguments');
+    const len = expectNum(args[0], 'make-string');
+    const ch = args.length === 2 && args[1].tag === 'char' ? args[1].value : '\0';
+    return { tag: 'string', value: ch.repeat(len), mutable: true };
+  });
+
+  // string (from chars)
+  defBuiltin('string', (args) => {
+    let result = '';
+    for (const a of args) {
+      if (a.tag !== 'char') throw new EvalError('string: expected char arguments');
+      result += a.value;
+    }
+    return { tag: 'string', value: result };
+  });
+
+  // string comparison builtins
+  defBuiltin('string>?', (args) => {
+    if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string')
+      throw new EvalError('string>?: expected 2 strings');
+    return { tag: 'boolean', value: args[0].value > args[1].value };
+  });
+
+  defBuiltin('string<=?', (args) => {
+    if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string')
+      throw new EvalError('string<=?: expected 2 strings');
+    return { tag: 'boolean', value: args[0].value <= args[1].value };
+  });
+
+  defBuiltin('string>=?', (args) => {
+    if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string')
+      throw new EvalError('string>=?: expected 2 strings');
+    return { tag: 'boolean', value: args[0].value >= args[1].value };
+  });
+
+  // error
+  defBuiltin('error', (args) => {
+    if (args.length < 1) throw new EvalError('error: expected at least 1 argument');
+    const parts = args.map(a => a.tag === 'string' ? a.value : displayVal(a));
+    throw new EvalError(parts.join(' '));
+  });
+
+  // Pair mutation
+  defBuiltin('set-car!', (args) => {
+    if (args.length !== 2) throw new EvalError('set-car!: expected 2 arguments');
+    if (args[0].tag !== 'pair') throw new EvalError('set-car!: expected pair');
+    (args[0] as { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }).car = args[1];
+    return { tag: 'void' };
+  });
+
+  defBuiltin('set-cdr!', (args) => {
+    if (args.length !== 2) throw new EvalError('set-cdr!: expected 2 arguments');
+    if (args[0].tag !== 'pair') throw new EvalError('set-cdr!: expected pair');
+    (args[0] as { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }).cdr = args[1];
+    return { tag: 'void' };
   });
 
   // Map (supports multiple lists)
@@ -1324,6 +1584,23 @@ function evalExpr(initExpr: SchemeVal, initEnv: Env): SchemeVal {
         expr = elems[elems.length - 1]; env = letEnv2; continue trampoline; // TCO
       }
 
+      if (op === 'let*') {
+        if (elems.length < 3) throw errAt('let*: bad syntax', epos);
+        const bindings = elems[1];
+        if (bindings.tag !== 'list') throw errAt('let*: bad syntax', epos);
+        const letStarEnv = new Env(env);
+        for (const b of bindings.elements) {
+          if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
+            throw errAt('let*: bad binding', epos);
+          const val = evalExpr(b.elements[1], letStarEnv);
+          letStarEnv.define(b.elements[0].value, val);
+        }
+        for (let i = 2; i < elems.length - 1; i++) {
+          evalExpr(elems[i], letStarEnv);
+        }
+        expr = elems[elems.length - 1]; env = letStarEnv; continue trampoline; // TCO
+      }
+
       if (op === 'letrec') {
         if (elems.length < 3) throw errAt('letrec: bad syntax', epos);
         const bindings = elems[1];
@@ -1674,11 +1951,10 @@ function applyCaseLambda(func: Extract<SchemeVal, { tag: 'case-lambda' }>, args:
   throw new EvalError(`case-lambda: no matching clause for ${args.length} arguments`);
 }
 
-function displayVal(val: SchemeVal): string {
+function displayVal(val: SchemeVal, seen?: Set<SchemeVal>): string {
   switch (val.tag) {
     case 'number': {
       const s = String(val.value);
-      // Ensure inexact floats display with decimal point
       if (Number.isInteger(val.value) && !s.includes('.')) return s + '.0';
       return s;
     }
@@ -1687,19 +1963,24 @@ function displayVal(val: SchemeVal): string {
     case 'string': return `"${val.value}"`;
     case 'char': return `#\\${val.value}`;
     case 'symbol': return val.value;
-    case 'list': return `(${val.elements.map(displayVal).join(' ')})`;
+    case 'list': return `(${val.elements.map(e => displayVal(e, seen)).join(' ')})`;
     case 'nil': return '()';
     case 'pair': {
+      if (!seen) seen = new Set();
+      if (seen.has(val)) return '(...)';
+      seen.add(val);
       let parts: string[] = [];
       let cur: SchemeVal = val;
       while (cur.tag === 'pair') {
-        parts.push(displayVal(cur.car));
+        if (cur !== val && seen.has(cur)) { parts.push('...'); cur = NIL; break; }
+        seen.add(cur);
+        parts.push(displayVal(cur.car, seen));
         cur = cur.cdr;
       }
       if (cur.tag === 'nil') {
         return `(${parts.join(' ')})`;
       }
-      return `(${parts.join(' ')} . ${displayVal(cur)})`;
+      return `(${parts.join(' ')} . ${displayVal(cur, seen)})`;
     }
     case 'void': return '';
     case 'lambda': return '#<procedure>';
@@ -1707,7 +1988,7 @@ function displayVal(val: SchemeVal): string {
     case 'builtin': return `#<builtin:${val.name}>`;
     case 'macro': return '#<macro>';
     case 'record': return `#<record:${val.typeName}>`;
-    case 'vector': return `#(${val.elements.map(displayVal).join(' ')})`;
+    case 'vector': return `#(${val.elements.map(e => displayVal(e, seen)).join(' ')})`;
   }
 }
 
