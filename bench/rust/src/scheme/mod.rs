@@ -407,10 +407,17 @@ struct EvalContext {
     dynamic_winds: Vec<DynamicWindExtent>,
     dynamic_wind_counter: u64,
     pending_exception: Option<Value>,
+    step_budget: Option<StepBudget>,
+}
+
+#[derive(Clone, Copy)]
+struct StepBudget {
+    remaining: usize,
+    max_steps: usize,
 }
 
 impl EvalContext {
-    fn new(capture_output: bool) -> Self {
+    fn new(capture_output: bool, step_limit: Option<usize>) -> Self {
         Self {
             output: String::new(),
             capture_output,
@@ -418,6 +425,7 @@ impl EvalContext {
             dynamic_winds: Vec::new(),
             dynamic_wind_counter: 0,
             pending_exception: None,
+            step_budget: step_limit.map(StepBudget::new),
         }
     }
 
@@ -443,6 +451,34 @@ impl EvalContext {
             before,
             after,
         }
+    }
+
+    fn consume_eval_step(&mut self) -> Result<(), EvalError> {
+        if let Some(budget) = &mut self.step_budget {
+            budget.consume()?;
+        }
+
+        Ok(())
+    }
+}
+
+impl StepBudget {
+    fn new(max_steps: usize) -> Self {
+        Self {
+            remaining: max_steps,
+            max_steps,
+        }
+    }
+
+    fn consume(&mut self) -> Result<(), EvalError> {
+        if self.remaining == 0 {
+            return Err(EvalError::StepLimitExceeded {
+                max_steps: self.max_steps,
+            });
+        }
+
+        self.remaining -= 1;
+        Ok(())
     }
 }
 
@@ -1341,6 +1377,8 @@ fn eval_machine_expr(
     ctx: &mut EvalContext,
     frames: &mut Vec<MachineFrame>,
 ) -> Result<MachineState, EvalError> {
+    ctx.consume_eval_step()?;
+
     match expr {
         Expr::Number(value) => Ok(MachineState::Value(Value::Number(value))),
         Expr::Boolean(value) => Ok(MachineState::Value(Value::Boolean(value))),
@@ -2278,6 +2316,8 @@ fn eval_tail_sequence(
 }
 
 fn eval_expr(expr: &Expr, env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    ctx.consume_eval_step()?;
+
     match expr {
         Expr::Number(value) => Ok(Value::Number(*value)),
         Expr::Boolean(value) => Ok(Value::Boolean(*value)),
@@ -2293,6 +2333,8 @@ fn eval_tail_expr(expr: &Expr, env: EnvRef, ctx: &mut EvalContext) -> Result<Val
     let mut current_env = env;
 
     loop {
+        ctx.consume_eval_step()?;
+
         match current_expr {
             Expr::Number(value) => return Ok(Value::Number(value)),
             Expr::Boolean(value) => return Ok(Value::Boolean(value)),
@@ -2840,11 +2882,9 @@ fn quasiquote_expr(
     depth: usize,
 ) -> Result<Value, EvalError> {
     match expr {
-        Expr::Number(_)
-        | Expr::Boolean(_)
-        | Expr::String(_)
-        | Expr::Char(_)
-        | Expr::Symbol(_) => Ok(quote_expr(expr)),
+        Expr::Number(_) | Expr::Boolean(_) | Expr::String(_) | Expr::Char(_) | Expr::Symbol(_) => {
+            Ok(quote_expr(expr))
+        }
         Expr::List(items) => {
             if let Some(vector_items) = vector_literal_items(items) {
                 return quasiquote_vector_items(vector_items, env, ctx, depth);
@@ -5797,17 +5837,26 @@ fn is_special_form_name(name: &str) -> bool {
 /// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
 /// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
-    let (value, _) = eval_input(input, false)?;
+    let (value, _) = eval_input(input, false, None)?;
     Ok(value.render())
 }
 
-fn eval_input(input: &str, capture_output: bool) -> Result<(Value, String), EvalError> {
+pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
+    let (value, _) = eval_input(input, false, Some(max_steps))?;
+    Ok(value.render())
+}
+
+fn eval_input(
+    input: &str,
+    capture_output: bool,
+    step_limit: Option<usize>,
+) -> Result<(Value, String), EvalError> {
     let mut parser = Parser::new(input);
     let exprs = parser.parse_program().map_err(|error| {
         let (line, column) = line_col_at(input, parser.index);
         error.with_position(line, column)
     })?;
-    let mut ctx = EvalContext::new(capture_output);
+    let mut ctx = EvalContext::new(capture_output, step_limit);
     let value = eval_program(&exprs, &mut ctx).map_err(|error| error.with_position(1, 1))?;
     Ok((value, ctx.finish()))
 }
@@ -5815,7 +5864,7 @@ fn eval_input(input: &str, capture_output: bool) -> Result<(Value, String), Eval
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    let (value, output) = eval_input(input, true)?;
+    let (value, output) = eval_input(input, true, None)?;
     Ok((value.render(), output))
 }
 

@@ -232,9 +232,8 @@ fn parse_syntax_case_transformer(
 ) -> Result<Rc<MacroTransformer>, EvalError> {
     if items.len() != 3 {
         return Err(EvalError::SyntaxError {
-            message:
-                "syntax-case transformer lambdas must contain exactly one body expression"
-                    .to_string(),
+            message: "syntax-case transformer lambdas must contain exactly one body expression"
+                .to_string(),
         });
     }
 
@@ -333,9 +332,8 @@ fn parse_syntax_case_clause(expr: &Expr) -> Result<SyntaxCaseClause, EvalError> 
             body: parts[2].clone(),
         }),
         _ => Err(EvalError::SyntaxError {
-            message:
-                "syntax-case clauses must contain a pattern, an optional fender, and a body"
-                    .to_string(),
+            message: "syntax-case clauses must contain a pattern, an optional fender, and a body"
+                .to_string(),
         }),
     }
 }
@@ -523,7 +521,8 @@ fn match_list_pattern(
             else {
                 continue;
             };
-            if let Some(result) = match_list_pattern(rest, &value_items[count..], pattern_ctx, &trial)
+            if let Some(result) =
+                match_list_pattern(rest, &value_items[count..], pattern_ctx, &trial)
             {
                 return Some(result);
             }
@@ -808,10 +807,7 @@ fn eval_transformer_expr(
                             ));
                         }
                         return Ok(TransformerValue::Syntax(expand_template(
-                            &items[1],
-                            bindings,
-                            None,
-                            macro_name,
+                            &items[1], bindings, None, macro_name,
                         )?));
                     }
                     "with-syntax" => {
@@ -825,8 +821,7 @@ fn eval_transformer_expr(
                             ));
                         }
 
-                        let condition =
-                            eval_transformer_expr(&items[1], bindings, macro_name)?;
+                        let condition = eval_transformer_expr(&items[1], bindings, macro_name)?;
                         if condition.is_truthy() {
                             return eval_transformer_expr(&items[2], bindings, macro_name);
                         }
@@ -968,9 +963,9 @@ fn quote_transformer_datum(expr: &Expr) -> TransformerValue {
         Expr::String(value) => TransformerValue::String(value.clone()),
         Expr::Char(value) => TransformerValue::Char(*value),
         Expr::Symbol(name) => TransformerValue::Symbol(name.clone()),
-        Expr::List(items) => TransformerValue::List(
-            items.iter().map(quote_transformer_datum).collect(),
-        ),
+        Expr::List(items) => {
+            TransformerValue::List(items.iter().map(quote_transformer_datum).collect())
+        }
     }
 }
 
@@ -1124,9 +1119,7 @@ fn apply_transformer_builtin(
         "syntax->datum" => {
             expect_transformer_arity(name, args, 1, macro_name)?;
             Ok(syntax_to_datum(expect_transformer_syntax(
-                &args[0],
-                name,
-                macro_name,
+                &args[0], name, macro_name,
             )?))
         }
         "datum->syntax" => {
@@ -1240,15 +1233,19 @@ fn apply_transformer_builtin(
         "cons" => {
             expect_transformer_arity(name, args, 2, macro_name)?;
             let mut out = vec![args[0].clone()];
-            out.extend(expect_transformer_list(&args[1], name, macro_name)?.iter().cloned());
+            out.extend(
+                expect_transformer_list(&args[1], name, macro_name)?
+                    .iter()
+                    .cloned(),
+            );
             Ok(TransformerValue::List(out))
         }
         "car" => {
             expect_transformer_arity(name, args, 1, macro_name)?;
             let list = expect_transformer_list(&args[0], name, macro_name)?;
-            list.first().cloned().ok_or_else(|| {
-                macro_error(macro_name, "car expects a non-empty list")
-            })
+            list.first()
+                .cloned()
+                .ok_or_else(|| macro_error(macro_name, "car expects a non-empty list"))
         }
         "cdr" => {
             expect_transformer_arity(name, args, 1, macro_name)?;
@@ -1292,10 +1289,7 @@ fn apply_transformer_builtin(
         }
         "-" => {
             if args.is_empty() {
-                return Err(macro_error(
-                    macro_name,
-                    "- expects at least one argument",
-                ));
+                return Err(macro_error(macro_name, "- expects at least one argument"));
             }
 
             let mut total = expect_transformer_number(&args[0], name, macro_name)?;
@@ -1704,10 +1698,7 @@ fn collect_body_define_scope(
     renamed
 }
 
-fn body_define_rename(
-    expr: &SyntaxExpr,
-    ctx: &mut EvalContext,
-) -> Option<(String, String)> {
+fn body_define_rename(expr: &SyntaxExpr, ctx: &mut EvalContext) -> Option<(String, String)> {
     let SyntaxExpr::List(items) = expr else {
         return None;
     };
@@ -1722,17 +1713,14 @@ fn body_define_rename(
 
     match items.get(1) {
         Some(SyntaxExpr::Symbol(symbol)) => binding_rename_pair(symbol, ctx),
-        Some(SyntaxExpr::List(signature)) if !signature.is_empty() => {
-            signature[0].as_symbol().and_then(|symbol| binding_rename_pair(symbol, ctx))
-        }
+        Some(SyntaxExpr::List(signature)) if !signature.is_empty() => signature[0]
+            .as_symbol()
+            .and_then(|symbol| binding_rename_pair(symbol, ctx)),
         _ => None,
     }
 }
 
-fn binding_rename_pair(
-    symbol: &SyntaxSymbol,
-    ctx: &mut EvalContext,
-) -> Option<(String, String)> {
+fn binding_rename_pair(symbol: &SyntaxSymbol, ctx: &mut EvalContext) -> Option<(String, String)> {
     if symbol.origin == SyntaxOrigin::Template {
         Some((symbol.name.clone(), ctx.fresh_identifier(&symbol.name)))
     } else {

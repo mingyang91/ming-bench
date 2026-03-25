@@ -116,6 +116,9 @@ pub enum EvalError {
 
     #[error("unsupported radix for {name}: {radix}")]
     UnsupportedRadix { name: &'static str, radix: i64 },
+
+    #[error("step limit exceeded after {max_steps} steps")]
+    StepLimitExceeded { max_steps: usize },
 }
 
 impl EvalError {
