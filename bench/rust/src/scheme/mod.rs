@@ -407,6 +407,20 @@ fn eval_inner(ast: &Ast, env: &Env, output: &mut String) -> Result<Value, EvalEr
                         }
                         return Ok(result);
                     }
+                    "set!" => {
+                        if items.len() != 3 {
+                            return Err(EvalError::Arity("set! requires exactly 2 arguments".into()));
+                        }
+                        let var_name = match &items[1].kind {
+                            AstKind::Symbol(name) => name.clone(),
+                            _ => return Err(EvalError::Type("set!: first argument must be a symbol".into())),
+                        };
+                        let val = eval(&items[2], env, output)?;
+                        if !env.borrow_mut().set_existing(&var_name, val) {
+                            return Err(EvalError::UnboundVariable(var_name));
+                        }
+                        return Ok(Value::Void);
+                    }
                     "string-set!" => {
                         if items.len() != 4 {
                             return Err(EvalError::Arity("string-set! requires 3 arguments".into()));
