@@ -33,7 +33,7 @@ impl Evaluator {
             | "string-append" | "string-length" | "substring"
             | "string->number" | "number->string"
             | "symbol->string" | "string->symbol" | "string-ref"
-            | "string-copy")
+            | "string-copy" | "apply")
     }
 
     fn eval_in_env(&mut self, expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
@@ -100,22 +100,7 @@ impl Evaluator {
 
         match &op {
             Value::Lambda(data) => {
-                if data.params.len() != args.len() {
-                    return Err(EvalError::Arity(format!(
-                        "lambda: expected {} arguments, got {} at {call_pos}",
-                        data.params.len(),
-                        args.len()
-                    )));
-                }
-                let mut call_env = data.env.child();
-                for (p, a) in data.params.iter().zip(args.into_iter()) {
-                    call_env.define(p.clone(), a);
-                }
-                let mut result = Value::Void;
-                for expr in &*data.body {
-                    result = self.eval_in_env(expr, &mut call_env)?;
-                }
-                Ok(result)
+                self.call_lambda(&data, args, call_pos)
             }
             Value::Symbol(name) => self.apply_builtin(name, &args, call_pos),
             _ => {
@@ -163,22 +148,18 @@ impl Evaluator {
                     ExprKind::Symbol(s) => s.clone(),
                     _ => return Err(EvalError::Parse(format!("define: expected symbol as name at {pos}"))),
                 };
-                let params: Vec<String> = name_and_params[1..]
-                    .iter()
-                    .map(|e| match &e.kind {
-                        ExprKind::Symbol(s) => Ok(s.clone()),
-                        _ => Err(EvalError::Parse(format!("define: expected symbol as parameter at {pos}"))),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                let (params, rest_param) = Self::parse_params(&name_and_params[1..], "define", pos)?;
                 let body = args[1..].to_vec();
                 let lambda = Value::Lambda(Rc::new(LambdaData {
                     params: params.clone(),
+                    rest_param: rest_param.clone(),
                     body: body.clone(),
                     env: env.clone(),
                 }));
                 env.define(name.clone(), lambda);
                 let recursive_lambda = Value::Lambda(Rc::new(LambdaData {
                     params,
+                    rest_param,
                     body,
                     env: env.clone(),
                 }));
@@ -223,25 +204,42 @@ impl Evaluator {
         }
     }
 
+    fn parse_params(param_exprs: &[Expr], context: &str, pos: &str) -> Result<(Vec<String>, Option<String>), EvalError> {
+        let mut params = Vec::new();
+        let mut rest_param = None;
+        let mut i = 0;
+        while i < param_exprs.len() {
+            match &param_exprs[i].kind {
+                ExprKind::Symbol(s) if s == "." => {
+                    if i + 1 != param_exprs.len() - 1 {
+                        return Err(EvalError::Parse(format!("{context}: expected exactly one parameter after '.' at {pos}")));
+                    }
+                    match &param_exprs[i + 1].kind {
+                        ExprKind::Symbol(r) => rest_param = Some(r.clone()),
+                        _ => return Err(EvalError::Parse(format!("{context}: expected symbol after '.' at {pos}"))),
+                    }
+                    break;
+                }
+                ExprKind::Symbol(s) => params.push(s.clone()),
+                _ => return Err(EvalError::Parse(format!("{context}: expected symbol as parameter at {pos}"))),
+            }
+            i += 1;
+        }
+        Ok((params, rest_param))
+    }
+
     fn eval_lambda(&self, args: &[Expr], env: &Env, pos: &str) -> Result<Value, EvalError> {
         if args.len() < 2 {
             return Err(EvalError::Arity(format!("lambda: expected at least 2 arguments at {pos}")));
         }
-        let params = match &args[0].kind {
-            ExprKind::List(param_exprs) => {
-                param_exprs
-                    .iter()
-                    .map(|e| match &e.kind {
-                        ExprKind::Symbol(s) => Ok(s.clone()),
-                        _ => Err(EvalError::Parse(format!("lambda: expected symbol as parameter at {pos}"))),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
-            }
+        let (params, rest_param) = match &args[0].kind {
+            ExprKind::List(param_exprs) => Self::parse_params(param_exprs, "lambda", pos)?,
             _ => return Err(EvalError::Parse(format!("lambda: expected parameter list at {pos}"))),
         };
         let body = args[1..].to_vec();
         Ok(Value::Lambda(Rc::new(LambdaData {
             params,
+            rest_param,
             body,
             env: env.clone(),
         })))
@@ -279,12 +277,14 @@ impl Evaluator {
             let loop_env = env.child();
             let lambda = Value::Lambda(Rc::new(LambdaData {
                 params: params.clone(),
+                rest_param: None,
                 body: body.clone(),
                 env: loop_env.clone(),
             }));
             loop_env.define(name.clone(), lambda);
             let recursive_lambda = Value::Lambda(Rc::new(LambdaData {
                 params: params.clone(),
+                rest_param: None,
                 body: body.clone(),
                 env: loop_env.clone(),
             }));
@@ -390,6 +390,53 @@ impl Evaluator {
             }
         }
         Ok(Value::Void)
+    }
+
+    fn call_lambda(&mut self, data: &LambdaData, args: Vec<Value>, pos: &str) -> Result<Value, EvalError> {
+        if let Some(ref rest) = data.rest_param {
+            if args.len() < data.params.len() {
+                return Err(EvalError::Arity(format!(
+                    "lambda: expected at least {} arguments, got {} at {pos}",
+                    data.params.len(),
+                    args.len()
+                )));
+            }
+            let mut call_env = data.env.child();
+            for (p, a) in data.params.iter().zip(args.iter()) {
+                call_env.define(p.clone(), a.clone());
+            }
+            call_env.define(rest.clone(), Value::List(args[data.params.len()..].to_vec()));
+            let mut result = Value::Void;
+            for expr in &*data.body {
+                result = self.eval_in_env(expr, &mut call_env)?;
+            }
+            Ok(result)
+        } else {
+            if data.params.len() != args.len() {
+                return Err(EvalError::Arity(format!(
+                    "lambda: expected {} arguments, got {} at {pos}",
+                    data.params.len(),
+                    args.len()
+                )));
+            }
+            let mut call_env = data.env.child();
+            for (p, a) in data.params.iter().zip(args.into_iter()) {
+                call_env.define(p.clone(), a);
+            }
+            let mut result = Value::Void;
+            for expr in &*data.body {
+                result = self.eval_in_env(expr, &mut call_env)?;
+            }
+            Ok(result)
+        }
+    }
+
+    fn call_proc(&mut self, proc: &Value, args: Vec<Value>, pos: &str) -> Result<Value, EvalError> {
+        match proc {
+            Value::Lambda(data) => self.call_lambda(data, args, pos),
+            Value::Symbol(name) => self.apply_builtin(name, &args, pos),
+            _ => Err(EvalError::Type(format!("apply: not a procedure: {} at {pos}", proc))),
+        }
     }
 
     fn apply_builtin(&mut self, name: &str, args: &[Value], pos: &str) -> Result<Value, EvalError> {
@@ -617,6 +664,20 @@ impl Evaluator {
                     Value::Str(s) => Ok(Value::Str(s.clone())),
                     _ => Err(EvalError::Type(format!("string-copy: expected string at {pos}"))),
                 }
+            }
+            "apply" => {
+                if args.len() < 2 {
+                    return Err(EvalError::Arity(format!("apply: expected at least 2 arguments at {pos}")));
+                }
+                let proc = args[0].clone();
+                let last = &args[args.len() - 1];
+                let tail = match last {
+                    Value::List(elems) => elems.clone(),
+                    _ => return Err(EvalError::Type(format!("apply: last argument must be a list at {pos}"))),
+                };
+                let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+                all_args.extend(tail);
+                self.call_proc(&proc, all_args, pos)
             }
             "string-ref" => {
                 if args.len() != 2 { return Err(EvalError::Arity(format!("string-ref: expected 2 arguments at {pos}"))); }

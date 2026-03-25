@@ -8,6 +8,7 @@ type Frame = Rc<RefCell<HashMap<String, Value>>>;
 #[derive(Debug, Clone)]
 pub struct LambdaData {
     pub params: Vec<String>,
+    pub rest_param: Option<String>,
     pub body: Vec<crate::scheme::parser::Expr>,
     pub env: Env,
 }
