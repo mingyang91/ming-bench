@@ -59,6 +59,10 @@ enum Val {
         type_name: String,
         fields: Vec<(String, Val)>,
     },
+    CaseLambda {
+        clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>)>, // (params, rest_param, body)
+        env: Env,
+    },
 }
 
 static RECORD_TYPE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -115,6 +119,7 @@ impl fmt::Display for Val {
                 write!(f, ")")
             }
             Val::Lambda { .. } => write!(f, "#<procedure>"),
+            Val::CaseLambda { .. } => write!(f, "#<procedure>"),
             Val::Builtin(_) => write!(f, "#<procedure>"),
             Val::Void => write!(f, "#<void>"),
             Val::Macro { .. } => write!(f, "#<macro>"),
@@ -937,6 +942,30 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                             env: env.clone(),
                         });
                     }
+                    "case-lambda" => {
+                        if list.len() < 2 {
+                            return Err(err_at(span, EvalError::Parse("case-lambda: need at least one clause".into())));
+                        }
+                        let mut clauses = Vec::new();
+                        for clause_expr in &list[1..] {
+                            match &clause_expr.kind {
+                                ExprKind::List(clause) if clause.len() >= 2 => {
+                                    let (params, rest_param) = match &clause[0].kind {
+                                        ExprKind::List(param_list) => parse_params(param_list, span)?,
+                                        ExprKind::Symbol(s) => (vec![], Some(s.clone())),
+                                        _ => return Err(err_at(span, EvalError::Parse("case-lambda: expected parameter list".into()))),
+                                    };
+                                    let body = clause[1..].to_vec();
+                                    clauses.push((params, rest_param, body));
+                                }
+                                _ => return Err(err_at(span, EvalError::Parse("case-lambda: bad clause".into()))),
+                            }
+                        }
+                        return Ok(Val::CaseLambda {
+                            clauses,
+                            env: env.clone(),
+                        });
+                    }
                     "let" => {
                         if list.len() < 3 {
                             return Err(err_at(span, EvalError::Parse("let: bad syntax".into())));
@@ -1215,7 +1244,7 @@ fn is_builtin(op: &str) -> bool {
         | "char=?" | "char<?"
         | "string=?" | "string<?" | "string-ci=?"
         | "string-upcase" | "string-downcase"
-        | "map")
+        | "map" | "procedure?")
 }
 
 /// Parse a parameter list that may contain dot notation for rest params.
@@ -1293,6 +1322,38 @@ fn call_function(func: &Val, args: Vec<Val>, span: Span, out: &mut String) -> Re
                 result = eval(expr, &call_env, out)?;
             }
             Ok(result)
+        }
+        Val::CaseLambda { clauses, env: closure_env } => {
+            // Find matching clause by arity
+            for (params, rest_param, body) in clauses {
+                let matches = if rest_param.is_some() {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    let call_env = new_env(Some(closure_env.clone()));
+                    for (p, a) in params.iter().zip(args.iter()) {
+                        env_set(&call_env, p.clone(), a.clone());
+                    }
+                    if let Some(ref rp) = rest_param {
+                        let rest_args = &args[params.len()..];
+                        let mut rest_list = Val::Nil;
+                        for a in rest_args.iter().rev() {
+                            rest_list = Val::Pair(Box::new(a.clone()), Box::new(rest_list));
+                        }
+                        env_set(&call_env, rp.clone(), rest_list);
+                    }
+                    let mut result = Val::Void;
+                    for expr in body {
+                        result = eval(expr, &call_env, out)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            Err(err_at(span, EvalError::Arity(format!(
+                "case-lambda: no matching clause for {} arguments", args.len()
+            ))))
         }
         Val::Builtin(name) => {
             if name == "apply" {
@@ -1644,6 +1705,10 @@ fn apply_builtin(op: &str, args: &[Val]) -> Result<Val, EvalError> {
         "char?" => {
             if args.len() != 1 { return Err(EvalError::Arity("char?: need 1 argument".into())); }
             Ok(Val::Bool(matches!(args[0], Val::Char(_))))
+        }
+        "procedure?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("procedure?: need 1 argument".into())); }
+            Ok(Val::Bool(matches!(args[0], Val::Lambda { .. } | Val::CaseLambda { .. } | Val::Builtin(_))))
         }
         "string-append" => {
             let mut result = String::new();
