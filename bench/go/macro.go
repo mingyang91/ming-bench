@@ -239,6 +239,12 @@ func matchPattern(pattern expr, input expr, macro *syntaxRuleMacro, rule *syntax
 	case *intExpr:
 		other, ok := input.(*intExpr)
 		return ok && pat.value == other.value
+	case *rationalExpr:
+		other, ok := input.(*rationalExpr)
+		return ok && pat.value == other.value
+	case *inexactExpr:
+		other, ok := input.(*inexactExpr)
+		return ok && pat.value == other.value
 	case *boolExpr:
 		other, ok := input.(*boolExpr)
 		return ok && pat.value == other.value
@@ -311,7 +317,7 @@ func isEllipsisExpr(node expr) bool {
 
 func (it *interpreter) expandTemplate(node expr, macro *syntaxRuleMacro, rule *syntaxRule, match *syntaxMatch, locals map[string]string, repeatIndex *int) (expr, error) {
 	switch current := node.(type) {
-	case *intExpr, *boolExpr, *stringExpr, *charExpr:
+	case *intExpr, *rationalExpr, *inexactExpr, *boolExpr, *stringExpr, *charExpr:
 		return cloneExpr(current), nil
 	case *symbolExpr:
 		return it.expandTemplateSymbol(current, macro, rule, match, locals, repeatIndex)
@@ -616,7 +622,7 @@ func repeatedTemplateCount(node expr, rule *syntaxRule, match *syntaxMatch) (int
 
 func (it *interpreter) resolveSyntax(node expr, scope *env) (expr, error) {
 	switch current := node.(type) {
-	case *intExpr, *boolExpr, *stringExpr, *charExpr:
+	case *intExpr, *rationalExpr, *inexactExpr, *boolExpr, *stringExpr, *charExpr:
 		return cloneExpr(current), nil
 	case *symbolExpr:
 		resolved := &symbolExpr{name: current.name, key: current.key, at: current.at}
@@ -818,6 +824,10 @@ func cloneExpr(node expr) expr {
 	switch current := node.(type) {
 	case *intExpr:
 		return &intExpr{value: current.value, at: current.at}
+	case *rationalExpr:
+		return &rationalExpr{value: current.value, at: current.at}
+	case *inexactExpr:
+		return &inexactExpr{value: current.value, at: current.at}
 	case *boolExpr:
 		return &boolExpr{value: current.value, at: current.at}
 	case *stringExpr:
@@ -841,6 +851,12 @@ func syntaxExprEqual(left expr, right expr) bool {
 	switch leftExpr := left.(type) {
 	case *intExpr:
 		rightExpr, ok := right.(*intExpr)
+		return ok && leftExpr.value == rightExpr.value
+	case *rationalExpr:
+		rightExpr, ok := right.(*rationalExpr)
+		return ok && leftExpr.value == rightExpr.value
+	case *inexactExpr:
+		rightExpr, ok := right.(*inexactExpr)
 		return ok && leftExpr.value == rightExpr.value
 	case *boolExpr:
 		rightExpr, ok := right.(*boolExpr)

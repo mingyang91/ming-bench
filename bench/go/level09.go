@@ -467,6 +467,12 @@ func eqValue(left value, right value) bool {
 	case int64:
 		right, ok := right.(int64)
 		return ok && left == right
+	case rationalValue:
+		right, ok := right.(rationalValue)
+		return ok && left == right
+	case inexactValue:
+		right, ok := right.(inexactValue)
+		return ok && left == right
 	case bool:
 		right, ok := right.(bool)
 		return ok && left == right
@@ -500,6 +506,10 @@ func eqValue(left value, right value) bool {
 }
 
 func deepEqual(left value, right value) bool {
+	if isNumberValue(left) && isNumberValue(right) {
+		return numberEqual(left, right)
+	}
+
 	switch left := left.(type) {
 	case int64:
 		right, ok := right.(int64)

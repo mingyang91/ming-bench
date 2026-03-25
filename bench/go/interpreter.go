@@ -22,6 +22,20 @@ type intExpr struct {
 
 func (e *intExpr) pos() position { return e.at }
 
+type rationalExpr struct {
+	value rationalValue
+	at    position
+}
+
+func (e *rationalExpr) pos() position { return e.at }
+
+type inexactExpr struct {
+	value inexactValue
+	at    position
+}
+
+func (e *inexactExpr) pos() position { return e.at }
+
 type boolExpr struct {
 	value bool
 	at    position
@@ -66,6 +80,8 @@ const (
 	tokenRParen
 	tokenQuote
 	tokenInteger
+	tokenRational
+	tokenInexact
 	tokenBoolean
 	tokenString
 	tokenChar
@@ -76,6 +92,8 @@ type token struct {
 	kind    tokenKind
 	text    string
 	number  int64
+	rational rationalValue
+	inexact inexactValue
 	boolean bool
 	char    rune
 	at      position
@@ -217,6 +235,20 @@ func (l *lexer) readAtom(start position) (token, error) {
 		return token{kind: tokenInteger, number: value, text: text, at: start}, nil
 	}
 
+	if parsed, ok, err := parseNumberLiteral(text); ok || err != nil {
+		if err != nil {
+			return token{}, newEvalError(ErrSyntax, fmt.Sprintf("invalid numeric literal: %s", text), start)
+		}
+		switch number := parsed.(type) {
+		case int64:
+			return token{kind: tokenInteger, number: number, text: text, at: start}, nil
+		case rationalValue:
+			return token{kind: tokenRational, rational: number, text: text, at: start}, nil
+		case inexactValue:
+			return token{kind: tokenInexact, inexact: number, text: text, at: start}, nil
+		}
+	}
+
 	if text == "" {
 		return token{}, newEvalError(ErrSyntax, "unexpected token", start)
 	}
@@ -316,6 +348,12 @@ func (p *parser) parseExpr() (expr, error) {
 	case tokenInteger:
 		p.index++
 		return &intExpr{value: tok.number, at: tok.at}, nil
+	case tokenRational:
+		p.index++
+		return &rationalExpr{value: tok.rational, at: tok.at}, nil
+	case tokenInexact:
+		p.index++
+		return &inexactExpr{value: tok.inexact, at: tok.at}, nil
 	case tokenBoolean:
 		p.index++
 		return &boolExpr{value: tok.boolean, at: tok.at}, nil
@@ -586,6 +624,14 @@ func (it *interpreter) installBuiltins() {
 	it.defineName(it.global, "append", &builtinProc{name: "append", fn: builtinAppend})
 	it.defineName(it.global, "string?", &builtinProc{name: "string?", fn: builtinStringPred})
 	it.defineName(it.global, "number?", &builtinProc{name: "number?", fn: builtinNumberPred})
+	it.defineName(it.global, "exact?", &builtinProc{name: "exact?", fn: builtinExactPred})
+	it.defineName(it.global, "inexact?", &builtinProc{name: "inexact?", fn: builtinInexactPred})
+	it.defineName(it.global, "exact->inexact", &builtinProc{name: "exact->inexact", fn: builtinExactToInexact})
+	it.defineName(it.global, "inexact->exact", &builtinProc{name: "inexact->exact", fn: builtinInexactToExact})
+	it.defineName(it.global, "numerator", &builtinProc{name: "numerator", fn: builtinNumerator})
+	it.defineName(it.global, "denominator", &builtinProc{name: "denominator", fn: builtinDenominator})
+	it.defineName(it.global, "integer?", &builtinProc{name: "integer?", fn: builtinIntegerPred})
+	it.defineName(it.global, "rational?", &builtinProc{name: "rational?", fn: builtinRationalPred})
 	it.defineName(it.global, "boolean?", &builtinProc{name: "boolean?", fn: builtinBooleanPred})
 	it.defineName(it.global, "pair?", &builtinProc{name: "pair?", fn: builtinPairPred})
 	it.defineName(it.global, "symbol?", &builtinProc{name: "symbol?", fn: builtinSymbolPred})
@@ -659,6 +705,10 @@ func (it *interpreter) evalSequence(scope *env, exprs []expr) (value, error) {
 func (it *interpreter) eval(node expr, scope *env) (value, error) {
 	switch expr := node.(type) {
 	case *intExpr:
+		return expr.value, nil
+	case *rationalExpr:
+		return expr.value, nil
+	case *inexactExpr:
 		return expr.value, nil
 	case *boolExpr:
 		return expr.value, nil
@@ -1093,6 +1143,10 @@ func datumToValue(node expr) (value, error) {
 	switch expr := node.(type) {
 	case *intExpr:
 		return expr.value, nil
+	case *rationalExpr:
+		return expr.value, nil
+	case *inexactExpr:
+		return expr.value, nil
 	case *boolExpr:
 		return expr.value, nil
 	case *stringExpr:
@@ -1140,13 +1194,13 @@ func listToSlice(v value, pos position) ([]value, error) {
 }
 
 func builtinAdd(_ *interpreter, args []value, callPos position) (value, error) {
-	var total int64
+	total := value(int64(0))
 	for _, arg := range args {
-		n, err := expectInt(arg, callPos)
+		current, err := expectNumberValue(arg, callPos)
 		if err != nil {
 			return nil, err
 		}
-		total += n
+		total = addNumbers(total, current)
 	}
 	return total, nil
 }
@@ -1156,33 +1210,33 @@ func builtinSub(_ *interpreter, args []value, callPos position) (value, error) {
 		return nil, wrongArgCount(callPos, "-", "expected at least 1 argument")
 	}
 
-	first, err := expectInt(args[0], callPos)
+	first, err := expectNumberValue(args[0], callPos)
 	if err != nil {
 		return nil, err
 	}
 	if len(args) == 1 {
-		return -first, nil
+		return negateNumber(first), nil
 	}
 
 	total := first
 	for _, arg := range args[1:] {
-		n, err := expectInt(arg, callPos)
+		current, err := expectNumberValue(arg, callPos)
 		if err != nil {
 			return nil, err
 		}
-		total -= n
+		total = subNumbers(total, current)
 	}
 	return total, nil
 }
 
 func builtinMul(_ *interpreter, args []value, callPos position) (value, error) {
-	product := int64(1)
+	product := value(int64(1))
 	for _, arg := range args {
-		n, err := expectInt(arg, callPos)
+		current, err := expectNumberValue(arg, callPos)
 		if err != nil {
 			return nil, err
 		}
-		product *= n
+		product = mulNumbers(product, current)
 	}
 	return product, nil
 }
@@ -1192,54 +1246,97 @@ func builtinDiv(_ *interpreter, args []value, callPos position) (value, error) {
 		return nil, wrongArgCount(callPos, "/", "expected at least 2 arguments")
 	}
 
-	quotient, err := expectInt(args[0], callPos)
+	quotient, err := expectNumberValue(args[0], callPos)
 	if err != nil {
 		return nil, err
 	}
 	for _, arg := range args[1:] {
-		n, err := expectInt(arg, callPos)
+		current, err := expectNumberValue(arg, callPos)
 		if err != nil {
 			return nil, err
 		}
-		if n == 0 {
-			return nil, newEvalError(ErrDivisionByZero, "division by zero", callPos)
+		quotient, err = divNumbers(quotient, current, callPos)
+		if err != nil {
+			return nil, err
 		}
-		quotient /= n
 	}
 	return quotient, nil
 }
 
 func builtinLessThan(_ *interpreter, args []value, callPos position) (value, error) {
-	return compareNumbers(args, callPos, "<", func(left, right int64) bool { return left < right })
+	return compareNumbers(
+		args,
+		callPos,
+		"<",
+		func(left exactFraction, right exactFraction) bool {
+			return left.num*right.den < right.num*left.den
+		},
+		func(left float64, right float64) bool { return left < right },
+	)
 }
 
 func builtinGreaterThan(_ *interpreter, args []value, callPos position) (value, error) {
-	return compareNumbers(args, callPos, ">", func(left, right int64) bool { return left > right })
+	return compareNumbers(
+		args,
+		callPos,
+		">",
+		func(left exactFraction, right exactFraction) bool {
+			return left.num*right.den > right.num*left.den
+		},
+		func(left float64, right float64) bool { return left > right },
+	)
 }
 
 func builtinEqual(_ *interpreter, args []value, callPos position) (value, error) {
-	return compareNumbers(args, callPos, "=", func(left, right int64) bool { return left == right })
+	return compareNumbers(
+		args,
+		callPos,
+		"=",
+		func(left exactFraction, right exactFraction) bool {
+			return left.num*right.den == right.num*left.den
+		},
+		func(left float64, right float64) bool { return left == right },
+	)
 }
 
 func builtinLessEqual(_ *interpreter, args []value, callPos position) (value, error) {
-	return compareNumbers(args, callPos, "<=", func(left, right int64) bool { return left <= right })
+	return compareNumbers(
+		args,
+		callPos,
+		"<=",
+		func(left exactFraction, right exactFraction) bool {
+			return left.num*right.den <= right.num*left.den
+		},
+		func(left float64, right float64) bool { return left <= right },
+	)
 }
 
-func compareNumbers(args []value, callPos position, name string, cmp func(int64, int64) bool) (value, error) {
+func compareNumbers(
+	args []value,
+	callPos position,
+	name string,
+	exactCmp func(exactFraction, exactFraction) bool,
+	inexactCmp func(float64, float64) bool,
+) (value, error) {
 	if len(args) < 2 {
 		return nil, wrongArgCount(callPos, name, "expected at least 2 arguments")
 	}
 
-	prev, err := expectInt(args[0], callPos)
+	prev, err := expectNumberValue(args[0], callPos)
 	if err != nil {
 		return nil, err
 	}
 	for _, arg := range args[1:] {
-		current, err := expectInt(arg, callPos)
+		current, err := expectNumberValue(arg, callPos)
 		if err != nil {
 			return nil, err
 		}
-		if !cmp(prev, current) {
+		if !compareTwoNumbers(
+			prev,
+			current,
+			exactCmp,
+			inexactCmp,
+		) {
 			return false, nil
 		}
 		prev = current
@@ -1355,8 +1452,7 @@ func builtinNumberPred(_ *interpreter, args []value, callPos position) (value, e
 	if len(args) != 1 {
 		return nil, wrongArgCount(callPos, "number?", "expected exactly 1 argument")
 	}
-	_, ok := args[0].(int64)
-	return ok, nil
+	return isNumberValue(args[0]), nil
 }
 
 func builtinBooleanPred(_ *interpreter, args []value, callPos position) (value, error) {
@@ -1515,8 +1611,8 @@ func builtinStringToNumber(_ *interpreter, args []value, callPos position) (valu
 		return nil, err
 	}
 
-	n, err := strconv.ParseInt(s.text(), 10, 64)
-	if err != nil {
+	n, ok, err := parseNumberLiteral(s.text())
+	if err != nil || !ok {
 		return false, nil
 	}
 	return n, nil
@@ -1527,11 +1623,15 @@ func builtinNumberToString(_ *interpreter, args []value, callPos position) (valu
 		return nil, wrongArgCount(callPos, "number->string", "expected exactly 1 argument")
 	}
 
-	n, err := expectInt(args[0], callPos)
+	n, err := expectNumberValue(args[0], callPos)
 	if err != nil {
 		return nil, err
 	}
-	return newStringValue(strconv.FormatInt(n, 10)), nil
+	formatted, err := formatNumberValue(n)
+	if err != nil {
+		return nil, err
+	}
+	return newStringValue(formatted), nil
 }
 
 func builtinSymbolToString(_ *interpreter, args []value, callPos position) (value, error) {
@@ -1670,7 +1770,11 @@ func evalInput(input string) (value, string, error) {
 func formatValue(v value) (string, error) {
 	switch value := v.(type) {
 	case int64:
-		return strconv.FormatInt(value, 10), nil
+		return formatNumberValue(value)
+	case rationalValue:
+		return formatNumberValue(value)
+	case inexactValue:
+		return formatNumberValue(value)
 	case bool:
 		if value {
 			return "#t", nil
