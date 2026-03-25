@@ -17,6 +17,8 @@ const BUILTIN_NAMES: &[&str] = &[
     "-",
     "*",
     "/",
+    "call-with-current-continuation",
+    "call/cc",
     "<",
     "<=",
     "denominator",
@@ -185,13 +187,7 @@ fn uses_immutable_strings() -> bool {
 fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
     let exprs = Parser::new(input).parse_program()?;
     let env = Environment::global();
-    let mut last = None;
-
-    for expr in &exprs {
-        last = Some(eval(expr, env.clone())?);
-    }
-
-    let value = last.ok_or(EvalError::EmptyInput)?;
+    let value = machine_eval_program(&exprs, env.clone())?;
     Ok((value, Environment::captured_output(&env)))
 }
 
@@ -247,6 +243,7 @@ type EnvRef = Rc<RefCell<Environment>>;
 type BindingRef = Rc<RefCell<Value>>;
 type MacroRef = Rc<SyntaxRulesMacro>;
 type PairRef = Rc<Pair>;
+type ContinuationRef = Rc<ContinuationChain>;
 
 #[derive(Clone)]
 struct MacroRule {
@@ -806,6 +803,7 @@ enum Value {
     Builtin(&'static str),
     Procedure(Rc<UserProcedure>),
     NativeProcedure(Rc<NativeProcedure>),
+    Continuation(ContinuationRef),
     Uninitialized,
     Void,
 }
@@ -822,7 +820,10 @@ impl Value {
             Value::Pair(_) => "pair",
             Value::Vector(_) => "vector",
             Value::Record(_) => "record",
-            Value::Builtin(_) | Value::Procedure(_) | Value::NativeProcedure(_) => "procedure",
+            Value::Builtin(_)
+            | Value::Procedure(_)
+            | Value::NativeProcedure(_)
+            | Value::Continuation(_) => "procedure",
             Value::Uninitialized => "undefined",
             Value::Void => "void",
         }
@@ -997,7 +998,10 @@ fn format_value_inner(
         Value::Pair(pair) => format_pair(pair, active_pairs, active_vectors),
         Value::Vector(values) => format_vector(values, active_pairs, active_vectors),
         Value::Record(record) => format!("#<record {}>", record.record_type.name),
-        Value::Builtin(_) | Value::Procedure(_) | Value::NativeProcedure(_) => {
+        Value::Builtin(_)
+        | Value::Procedure(_)
+        | Value::NativeProcedure(_)
+        | Value::Continuation(_) => {
             "#<procedure>".into()
         }
         Value::Uninitialized => "#<uninitialized>".into(),
@@ -1282,6 +1286,7 @@ fn scheme_eq(left: &Value, right: &Value) -> bool {
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::NativeProcedure(left), Value::NativeProcedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,
     }
@@ -1342,6 +1347,7 @@ fn scheme_equal_inner(
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::NativeProcedure(left), Value::NativeProcedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,
     }
@@ -1357,6 +1363,878 @@ fn resolve_eval_step(step: EvalStep) -> Result<Value, EvalError> {
         EvalStep::Value(value) => Ok(value),
         EvalStep::Expr(expr, env) => eval(&expr, env),
     }
+}
+
+#[derive(Clone)]
+enum MachineControl {
+    Expr(Expr, EnvRef),
+    Value(Value),
+}
+
+#[derive(Clone)]
+enum MachineFrame {
+    Sequence {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    DefineValue {
+        name: String,
+        env: EnvRef,
+    },
+    SetValue {
+        binding: BindingRef,
+    },
+    If {
+        then_branch: Expr,
+        else_branch: Option<Expr>,
+        env: EnvRef,
+    },
+    ApplyOperator {
+        args: Vec<Expr>,
+        env: EnvRef,
+        position: SourcePos,
+    },
+    ApplyArgs {
+        callable: Value,
+        evaluated: Vec<LocatedValue>,
+        remaining: Vec<Expr>,
+        env: EnvRef,
+        position: SourcePos,
+        current_arg_position: SourcePos,
+    },
+}
+
+#[derive(Clone)]
+enum ContinuationChain {
+    Empty,
+    Frame(MachineFrame, ContinuationRef),
+}
+
+fn machine_value(value: Value, cont: ContinuationRef) -> (MachineControl, ContinuationRef) {
+    (MachineControl::Value(value), cont)
+}
+
+fn machine_expr(expr: Expr, env: EnvRef, cont: ContinuationRef) -> (MachineControl, ContinuationRef) {
+    (MachineControl::Expr(expr, env), cont)
+}
+
+fn empty_continuation() -> ContinuationRef {
+    Rc::new(ContinuationChain::Empty)
+}
+
+fn push_continuation(frame: MachineFrame, next: ContinuationRef) -> ContinuationRef {
+    Rc::new(ContinuationChain::Frame(frame, next))
+}
+
+fn machine_eval_program(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    if exprs.is_empty() {
+        return Err(EvalError::EmptyInput);
+    }
+
+    let (mut control, mut cont) = machine_start_sequence(exprs, env, empty_continuation());
+
+    loop {
+        let (next_control, next_cont) = match control {
+            MachineControl::Expr(expr, env) => machine_eval_expr(expr, env, cont)?,
+            MachineControl::Value(value) => match cont.as_ref() {
+                ContinuationChain::Empty => return Ok(value),
+                ContinuationChain::Frame(frame, next) => {
+                    machine_apply_frame(frame.clone(), value, next.clone())?
+                }
+            },
+        };
+
+        control = next_control;
+        cont = next_cont;
+    }
+}
+
+fn machine_start_sequence(
+    exprs: &[Expr],
+    env: EnvRef,
+    cont: ContinuationRef,
+) -> (MachineControl, ContinuationRef) {
+    let Some((first, rest)) = exprs.split_first() else {
+        return machine_value(Value::Void, cont);
+    };
+
+    if rest.is_empty() {
+        machine_expr(first.clone(), env, cont)
+    } else {
+        let next_cont = push_continuation(
+            MachineFrame::Sequence {
+                remaining: rest.to_vec(),
+                env: env.clone(),
+            },
+            cont,
+        );
+        machine_expr(first.clone(), env, next_cont)
+    }
+}
+
+fn machine_eval_expr(
+    expr: Expr,
+    env: EnvRef,
+    cont: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    let position = expr.pos;
+    match expr.kind {
+        ExprKind::Integer(value) => Ok(machine_value(Value::Integer(value), cont)),
+        ExprKind::Rational(value) => Ok(machine_value(
+            Value::from_number(Number::Rational(value)),
+            cont,
+        )),
+        ExprKind::Inexact(value) => Ok(machine_value(Value::Inexact(value), cont)),
+        ExprKind::Bool(value) => Ok(machine_value(Value::Bool(value), cont)),
+        ExprKind::Char(value) => Ok(machine_value(Value::Char(value), cont)),
+        ExprKind::String(value) => Ok(machine_value(
+            Value::String(SchemeString::immutable(&value)),
+            cont,
+        )),
+        ExprKind::Symbol(name) => {
+            let value = Environment::lookup(&env, &name, position)?
+                .ok_or_else(|| EvalError::unbound_variable(name, position))?;
+            Ok(machine_value(value, cont))
+        }
+        ExprKind::List(items) => machine_eval_list(items, env, position, cont),
+    }
+}
+
+fn machine_eval_list(
+    items: Vec<Expr>,
+    env: EnvRef,
+    position: SourcePos,
+    cont: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    let Some(head) = items.first() else {
+        return Err(EvalError::syntax("cannot evaluate empty list", position));
+    };
+    let tail = &items[1..];
+
+    if let ExprKind::Symbol(name) = &head.kind {
+        if name == "define-syntax" {
+            return Ok(machine_value(eval_define_syntax(tail, env, head.pos)?, cont));
+        }
+
+        if let Some(transformer) = Environment::lookup_macro(&env, name) {
+            let expanded = expand_macro_call(transformer, &items, env.clone(), position)?;
+            return Ok(machine_expr(expanded.expr, expanded.env, cont));
+        }
+
+        return match name.as_str() {
+            "define" => machine_eval_define(tail, env, head.pos, cont),
+            "define-record-type" => Ok(machine_value(
+                resolve_eval_step(eval_define_record_type(tail, env, head.pos)?)?,
+                cont,
+            )),
+            "set!" => machine_eval_set(tail, env, head.pos, cont),
+            "if" => machine_eval_if(tail, env, head.pos, cont),
+            "quote" => Ok(machine_value(eval_quote(tail, head.pos)?, cont)),
+            "lambda" => Ok(machine_value(eval_lambda(tail, env, head.pos)?, cont)),
+            "case-lambda" => Ok(machine_value(eval_case_lambda(tail, env, head.pos)?, cont)),
+            "begin" => Ok(machine_start_sequence(tail, env, cont)),
+            "and" => Ok(machine_expr(desugar_and(tail, head.pos)?, env, cont)),
+            "or" => Ok(machine_expr(desugar_or(tail, head.pos)?, env, cont)),
+            "cond" => Ok(machine_expr(desugar_cond(tail, head.pos)?, env, cont)),
+            "case" => Ok(machine_expr(desugar_case(tail, head.pos)?, env, cont)),
+            "do" => Ok(machine_expr(desugar_do(tail, head.pos)?, env, cont)),
+            "let" => Ok(machine_expr(desugar_let(tail, head.pos)?, env, cont)),
+            "let*" => Ok(machine_expr(desugar_let_star(tail, head.pos)?, env, cont)),
+            "letrec" => Ok(machine_value(eval_letrec(tail, env, head.pos, false)?, cont)),
+            "letrec*" => Ok(machine_value(eval_letrec(tail, env, head.pos, true)?, cont)),
+            _ => Ok(machine_start_call(head.clone(), tail.to_vec(), env, cont)),
+        };
+    }
+
+    Ok(machine_start_call(head.clone(), tail.to_vec(), env, cont))
+}
+
+fn machine_eval_define(
+    exprs: &[Expr],
+    env: EnvRef,
+    position: SourcePos,
+    cont: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    match exprs {
+        [signature_expr, body @ ..]
+            if !body.is_empty() && matches!(&signature_expr.kind, ExprKind::List(_)) =>
+        {
+            let ExprKind::List(signature) = &signature_expr.kind else {
+                return Err(EvalError::syntax("invalid define form", position));
+            };
+
+            let (name, params, rest_param) =
+                parse_function_signature(signature, signature_expr.pos)?;
+            let procedure = Value::Procedure(Rc::new(UserProcedure::single_clause(
+                Some(name.clone()),
+                params,
+                rest_param,
+                body.to_vec(),
+                env.clone(),
+            )));
+
+            Environment::define(&env, name, procedure);
+            Ok(machine_value(Value::Void, cont))
+        }
+        [name_expr, value_expr] if matches!(&name_expr.kind, ExprKind::Symbol(_)) => {
+            let ExprKind::Symbol(name) = &name_expr.kind else {
+                return Err(EvalError::syntax("invalid define form", position));
+            };
+
+            let next_cont = push_continuation(
+                MachineFrame::DefineValue {
+                    name: name.clone(),
+                    env: env.clone(),
+                },
+                cont,
+            );
+            Ok(machine_expr(value_expr.clone(), env, next_cont))
+        }
+        _ => Err(EvalError::syntax("invalid define form", position)),
+    }
+}
+
+fn machine_eval_set(
+    exprs: &[Expr],
+    env: EnvRef,
+    position: SourcePos,
+    cont: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    let [name_expr, value_expr] = exprs else {
+        return Err(EvalError::syntax(
+            "set! requires exactly 2 expressions",
+            position,
+        ));
+    };
+
+    let ExprKind::Symbol(name) = &name_expr.kind else {
+        return Err(EvalError::syntax(
+            "set! target must be a symbol",
+            name_expr.pos,
+        ));
+    };
+
+    let binding = Environment::lookup_binding(&env, name)
+        .ok_or_else(|| EvalError::unbound_variable(name.clone(), name_expr.pos))?;
+    let next_cont = push_continuation(MachineFrame::SetValue { binding }, cont);
+    Ok(machine_expr(value_expr.clone(), env, next_cont))
+}
+
+fn machine_eval_if(
+    exprs: &[Expr],
+    env: EnvRef,
+    position: SourcePos,
+    cont: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    match exprs {
+        [condition, then_branch] => {
+            let next_cont = push_continuation(
+                MachineFrame::If {
+                    then_branch: then_branch.clone(),
+                    else_branch: None,
+                    env: env.clone(),
+                },
+                cont,
+            );
+            Ok(machine_expr(condition.clone(), env, next_cont))
+        }
+        [condition, then_branch, else_branch] => {
+            let next_cont = push_continuation(
+                MachineFrame::If {
+                    then_branch: then_branch.clone(),
+                    else_branch: Some(else_branch.clone()),
+                    env: env.clone(),
+                },
+                cont,
+            );
+            Ok(machine_expr(condition.clone(), env, next_cont))
+        }
+        _ => Err(EvalError::syntax(
+            "if requires 2 or 3 expressions",
+            position,
+        )),
+    }
+}
+
+fn machine_start_call(
+    callable_expr: Expr,
+    args: Vec<Expr>,
+    env: EnvRef,
+    cont: ContinuationRef,
+) -> (MachineControl, ContinuationRef) {
+    let next_cont = push_continuation(
+        MachineFrame::ApplyOperator {
+            args,
+            env: env.clone(),
+            position: callable_expr.pos,
+        },
+        cont,
+    );
+    machine_expr(callable_expr, env, next_cont)
+}
+
+fn machine_apply_frame(
+    frame: MachineFrame,
+    value: Value,
+    cont: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    match frame {
+        MachineFrame::Sequence { remaining, env } => Ok(machine_start_sequence(&remaining, env, cont)),
+        MachineFrame::DefineValue { name, env } => {
+            Environment::define(&env, name, value);
+            Ok(machine_value(Value::Void, cont))
+        }
+        MachineFrame::SetValue { binding } => {
+            *binding.borrow_mut() = value;
+            Ok(machine_value(Value::Void, cont))
+        }
+        MachineFrame::If {
+            then_branch,
+            else_branch,
+            env,
+        } => {
+            if value.is_truthy() {
+                Ok(machine_expr(then_branch, env, cont))
+            } else {
+                match else_branch {
+                    Some(else_branch) => Ok(machine_expr(else_branch, env, cont)),
+                    None => Ok(machine_value(Value::Void, cont)),
+                }
+            }
+        }
+        MachineFrame::ApplyOperator { args, env, position } => {
+            if let Some((current_arg, rest)) = args.split_last() {
+                let next_cont = push_continuation(
+                    MachineFrame::ApplyArgs {
+                        callable: value,
+                        evaluated: Vec::new(),
+                        remaining: rest.to_vec(),
+                        env: env.clone(),
+                        position,
+                        current_arg_position: current_arg.pos,
+                    },
+                    cont,
+                );
+                Ok(machine_expr(current_arg.clone(), env, next_cont))
+            } else {
+                machine_apply_value(value, position, Vec::new(), env, cont)
+            }
+        }
+        MachineFrame::ApplyArgs {
+            callable,
+            mut evaluated,
+            remaining,
+            env,
+            position,
+            current_arg_position,
+        } => {
+            evaluated.insert(0, LocatedValue::new(value, current_arg_position));
+            if let Some((next_arg, rest)) = remaining.split_last() {
+                let next_cont = push_continuation(
+                    MachineFrame::ApplyArgs {
+                        callable,
+                        evaluated,
+                        remaining: rest.to_vec(),
+                        env: env.clone(),
+                        position,
+                        current_arg_position: next_arg.pos,
+                    },
+                    cont,
+                );
+                Ok(machine_expr(next_arg.clone(), env, next_cont))
+            } else {
+                machine_apply_value(callable, position, evaluated, env, cont)
+            }
+        }
+    }
+}
+
+fn machine_apply_value(
+    callable: Value,
+    position: SourcePos,
+    args: Vec<LocatedValue>,
+    env: EnvRef,
+    cont: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    match callable {
+        Value::Builtin(name) => machine_apply_builtin(name, args, position, env, cont),
+        Value::Procedure(procedure) => machine_apply_user_procedure(procedure, args, position, cont),
+        Value::NativeProcedure(procedure) => {
+            Ok(machine_value(apply_native_procedure(procedure, args, position)?, cont))
+        }
+        Value::Continuation(saved) => {
+            if args.len() != 1 {
+                return Err(EvalError::wrong_arg_count(
+                    "continuation",
+                    "exactly 1",
+                    args.len(),
+                    position,
+                ));
+            }
+
+            Ok(machine_value(args[0].value.clone(), saved))
+        }
+        other => Err(EvalError::not_callable(other.type_name(), position)),
+    }
+}
+
+fn machine_apply_user_procedure(
+    procedure: Rc<UserProcedure>,
+    args: Vec<LocatedValue>,
+    position: SourcePos,
+    cont: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    let Some(clause) = procedure.matching_clause(args.len()) else {
+        return Err(EvalError::wrong_arg_count(
+            procedure.display_name(),
+            procedure.expected_arity(),
+            args.len(),
+            position,
+        ));
+    };
+
+    let call_env = Environment::child(procedure.env.clone());
+    for (param, value) in clause.params.iter().cloned().zip(args.iter().cloned()) {
+        Environment::define(&call_env, param, value.value);
+    }
+
+    if let Some(rest_param) = &clause.rest_param {
+        let rest_values = args[clause.params.len()..]
+            .iter()
+            .map(|arg| arg.value.clone())
+            .collect::<Vec<_>>();
+        Environment::define(&call_env, rest_param.clone(), list_from_values(rest_values));
+    }
+
+    Ok(machine_start_sequence(&clause.body, call_env, cont))
+}
+
+fn machine_apply_builtin(
+    name: &'static str,
+    args: Vec<LocatedValue>,
+    position: SourcePos,
+    env: EnvRef,
+    cont: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    match name {
+        "call/cc" | "call-with-current-continuation" => {
+            if args.len() != 1 {
+                return Err(EvalError::wrong_arg_count(
+                    name,
+                    "exactly 1",
+                    args.len(),
+                    position,
+                ));
+            }
+
+            let continuation_arg = vec![LocatedValue::new(
+                Value::Continuation(cont.clone()),
+                position,
+            )];
+            machine_apply_value(args[0].value.clone(), args[0].position, continuation_arg, env, cont)
+        }
+        "apply" => {
+            if args.len() < 2 {
+                return Err(EvalError::wrong_arg_count(
+                    "apply",
+                    "at least 2",
+                    args.len(),
+                    position,
+                ));
+            }
+
+            let (callable, list_and_prefix_args) = args.split_first().expect("apply arity checked");
+            let (list_arg, prefix_args) = list_and_prefix_args
+                .split_last()
+                .expect("apply arity checked");
+
+            let list_values = expect_proper_list(list_arg)?;
+            let mut expanded_args = Vec::with_capacity(prefix_args.len() + list_values.len());
+            expanded_args.extend(prefix_args.iter().cloned());
+            expanded_args.extend(
+                list_values
+                    .into_iter()
+                    .map(|value| LocatedValue::new(value, list_arg.position)),
+            );
+
+            machine_apply_value(
+                callable.value.clone(),
+                callable.position,
+                expanded_args,
+                env,
+                cont,
+            )
+        }
+        _ => Ok(machine_value(apply_builtin(name, &args, position, env)?, cont)),
+    }
+}
+
+fn bool_expr(value: bool, position: SourcePos) -> Expr {
+    Expr::new(ExprKind::Bool(value), position)
+}
+
+fn build_begin_expr(exprs: Vec<Expr>, position: SourcePos) -> Expr {
+    let mut items = Vec::with_capacity(exprs.len() + 1);
+    items.push(Expr::symbol("begin", position));
+    items.extend(exprs);
+    Expr::list(items, position)
+}
+
+fn build_if_expr(test: Expr, then_branch: Expr, else_branch: Expr, position: SourcePos) -> Expr {
+    Expr::list(
+        vec![Expr::symbol("if", position), test, then_branch, else_branch],
+        position,
+    )
+}
+
+fn build_plain_let_expr(bindings: Vec<(String, Expr)>, body: Vec<Expr>, position: SourcePos) -> Expr {
+    let binding_exprs = bindings
+        .into_iter()
+        .map(|(name, value)| Expr::list(vec![Expr::symbol(name, position), value], position))
+        .collect::<Vec<_>>();
+    let mut items = Vec::with_capacity(body.len() + 2);
+    items.push(Expr::symbol("let", position));
+    items.push(Expr::list(binding_exprs, position));
+    items.extend(body);
+    Expr::list(items, position)
+}
+
+fn build_named_let_expr(
+    name: String,
+    bindings: Vec<(String, Expr)>,
+    body: Vec<Expr>,
+    position: SourcePos,
+) -> Expr {
+    let binding_exprs = bindings
+        .into_iter()
+        .map(|(binding_name, value)| {
+            Expr::list(vec![Expr::symbol(binding_name, position), value], position)
+        })
+        .collect::<Vec<_>>();
+    let mut items = Vec::with_capacity(body.len() + 3);
+    items.push(Expr::symbol("let", position));
+    items.push(Expr::symbol(name, position));
+    items.push(Expr::list(binding_exprs, position));
+    items.extend(body);
+    Expr::list(items, position)
+}
+
+fn build_quote_expr(datum: Expr, position: SourcePos) -> Expr {
+    Expr::list(vec![Expr::symbol("quote", position), datum], position)
+}
+
+fn desugar_and(exprs: &[Expr], position: SourcePos) -> Result<Expr, EvalError> {
+    match exprs {
+        [] => Ok(bool_expr(true, position)),
+        [expr] => Ok(expr.clone()),
+        [first, rest @ ..] => {
+            let temp = fresh_generated_symbol("and");
+            let temp_expr = Expr::symbol(temp.clone(), first.pos);
+            Ok(build_plain_let_expr(
+                vec![(temp.clone(), first.clone())],
+                vec![build_if_expr(
+                    temp_expr.clone(),
+                    desugar_and(rest, position)?,
+                    temp_expr,
+                    position,
+                )],
+                position,
+            ))
+        }
+    }
+}
+
+fn desugar_or(exprs: &[Expr], position: SourcePos) -> Result<Expr, EvalError> {
+    match exprs {
+        [] => Ok(bool_expr(false, position)),
+        [expr] => Ok(expr.clone()),
+        [first, rest @ ..] => {
+            let temp = fresh_generated_symbol("or");
+            let temp_expr = Expr::symbol(temp.clone(), first.pos);
+            Ok(build_plain_let_expr(
+                vec![(temp.clone(), first.clone())],
+                vec![build_if_expr(
+                    temp_expr.clone(),
+                    temp_expr,
+                    desugar_or(rest, position)?,
+                    position,
+                )],
+                position,
+            ))
+        }
+    }
+}
+
+fn desugar_cond(exprs: &[Expr], position: SourcePos) -> Result<Expr, EvalError> {
+    let Some((clause, rest)) = exprs.split_first() else {
+        return Ok(build_begin_expr(Vec::new(), position));
+    };
+
+    let ExprKind::List(items) = &clause.kind else {
+        return Err(EvalError::syntax("cond clauses must be lists", clause.pos));
+    };
+
+    let Some((test, body)) = items.split_first() else {
+        return Err(EvalError::syntax(
+            "cond clauses cannot be empty",
+            clause.pos,
+        ));
+    };
+
+    if matches!(&test.kind, ExprKind::Symbol(name) if name == "else") {
+        if !rest.is_empty() {
+            return Err(EvalError::syntax("cond else clause must be last", test.pos));
+        }
+        return Ok(build_begin_expr(body.to_vec(), clause.pos));
+    }
+
+    let else_branch = desugar_cond(rest, position)?;
+    if body.is_empty() {
+        let temp = fresh_generated_symbol("cond");
+        let temp_expr = Expr::symbol(temp.clone(), test.pos);
+        Ok(build_plain_let_expr(
+            vec![(temp.clone(), test.clone())],
+            vec![build_if_expr(
+                temp_expr.clone(),
+                temp_expr,
+                else_branch,
+                clause.pos,
+            )],
+            clause.pos,
+        ))
+    } else {
+        Ok(build_if_expr(
+            test.clone(),
+            build_begin_expr(body.to_vec(), clause.pos),
+            else_branch,
+            clause.pos,
+        ))
+    }
+}
+
+fn desugar_case(exprs: &[Expr], position: SourcePos) -> Result<Expr, EvalError> {
+    let Some((key_expr, clauses)) = exprs.split_first() else {
+        return Err(EvalError::syntax(
+            "case requires a key and at least 1 clause",
+            position,
+        ));
+    };
+
+    if clauses.is_empty() {
+        return Err(EvalError::syntax(
+            "case requires at least 1 clause",
+            position,
+        ));
+    }
+
+    let key_name = fresh_generated_symbol("case");
+    let key_expr_ref = Expr::symbol(key_name.clone(), key_expr.pos);
+    let body = vec![desugar_case_clauses(key_expr_ref, clauses, position)?];
+    Ok(build_plain_let_expr(
+        vec![(key_name, key_expr.clone())],
+        body,
+        position,
+    ))
+}
+
+fn desugar_case_clauses(
+    key_expr: Expr,
+    clauses: &[Expr],
+    position: SourcePos,
+) -> Result<Expr, EvalError> {
+    let Some((clause, rest)) = clauses.split_first() else {
+        return Ok(build_begin_expr(Vec::new(), position));
+    };
+
+    let ExprKind::List(items) = &clause.kind else {
+        return Err(EvalError::syntax("case clauses must be lists", clause.pos));
+    };
+
+    let Some((datums_expr, body)) = items.split_first() else {
+        return Err(EvalError::syntax(
+            "case clauses cannot be empty",
+            clause.pos,
+        ));
+    };
+
+    if matches!(&datums_expr.kind, ExprKind::Symbol(name) if name == "else") {
+        if !rest.is_empty() {
+            return Err(EvalError::syntax(
+                "case else clause must be last",
+                datums_expr.pos,
+            ));
+        }
+        return Ok(build_begin_expr(body.to_vec(), clause.pos));
+    }
+
+    let ExprKind::List(datums) = &datums_expr.kind else {
+        return Err(EvalError::syntax(
+            "case clause datums must be a list",
+            datums_expr.pos,
+        ));
+    };
+
+    let test_exprs = datums
+        .iter()
+        .map(|datum| {
+            Expr::list(
+                vec![
+                    Expr::symbol("eqv?", clause.pos),
+                    key_expr.clone(),
+                    build_quote_expr(datum.clone(), clause.pos),
+                ],
+                clause.pos,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    Ok(build_if_expr(
+        desugar_or(&test_exprs, clause.pos)?,
+        build_begin_expr(body.to_vec(), clause.pos),
+        desugar_case_clauses(key_expr, rest, position)?,
+        clause.pos,
+    ))
+}
+
+fn desugar_let(exprs: &[Expr], position: SourcePos) -> Result<Expr, EvalError> {
+    match exprs {
+        [name_expr, bindings_expr, body @ ..]
+            if !body.is_empty() && matches!(&name_expr.kind, ExprKind::Symbol(_)) =>
+        {
+            let ExprKind::Symbol(name) = &name_expr.kind else {
+                unreachable!("guard ensures named let symbol");
+            };
+
+            let bindings = parse_bindings(bindings_expr)?;
+            let params = bindings
+                .iter()
+                .map(|(param, _)| Expr::symbol(param.clone(), bindings_expr.pos))
+                .collect::<Vec<_>>();
+            let mut lambda_items = Vec::with_capacity(body.len() + 2);
+            lambda_items.push(Expr::symbol("lambda", position));
+            lambda_items.push(Expr::list(params, bindings_expr.pos));
+            lambda_items.extend(body.iter().cloned());
+            let lambda_expr = Expr::list(lambda_items, position);
+
+            let define_expr = Expr::list(
+                vec![
+                    Expr::symbol("define", position),
+                    Expr::symbol(name.clone(), name_expr.pos),
+                    lambda_expr,
+                ],
+                position,
+            );
+
+            let mut invoke_items = Vec::with_capacity(bindings.len() + 1);
+            invoke_items.push(Expr::symbol(name.clone(), name_expr.pos));
+            invoke_items.extend(bindings.iter().map(|(_, value)| value.clone()));
+            let invoke_expr = Expr::list(invoke_items, position);
+
+            let outer_lambda = Expr::list(
+                vec![
+                    Expr::symbol("lambda", position),
+                    Expr::list(Vec::new(), position),
+                    define_expr,
+                    invoke_expr,
+                ],
+                position,
+            );
+            Ok(Expr::list(vec![outer_lambda], position))
+        }
+        [bindings_expr, body @ ..] if !body.is_empty() => {
+            let bindings = parse_bindings(bindings_expr)?;
+            let params = bindings
+                .iter()
+                .map(|(param, _)| Expr::symbol(param.clone(), bindings_expr.pos))
+                .collect::<Vec<_>>();
+
+            let mut lambda_items = Vec::with_capacity(body.len() + 2);
+            lambda_items.push(Expr::symbol("lambda", position));
+            lambda_items.push(Expr::list(params, bindings_expr.pos));
+            lambda_items.extend(body.iter().cloned());
+            let lambda_expr = Expr::list(lambda_items, position);
+
+            let mut call_items = Vec::with_capacity(bindings.len() + 1);
+            call_items.push(lambda_expr);
+            call_items.extend(bindings.into_iter().map(|(_, value)| value));
+            Ok(Expr::list(call_items, position))
+        }
+        _ => Err(EvalError::syntax(
+            "let requires bindings and a body",
+            position,
+        )),
+    }
+}
+
+fn desugar_let_star(exprs: &[Expr], position: SourcePos) -> Result<Expr, EvalError> {
+    let Some((bindings_expr, body)) = exprs.split_first() else {
+        return Err(EvalError::syntax(
+            "let* requires bindings and a body",
+            position,
+        ));
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::syntax(
+            "let* requires bindings and a body",
+            position,
+        ));
+    }
+
+    let bindings = parse_bindings(bindings_expr)?;
+    let mut nested = build_plain_let_expr(Vec::new(), body.to_vec(), position);
+
+    for (name, value) in bindings.into_iter().rev() {
+        nested = build_plain_let_expr(vec![(name, value)], vec![nested], position);
+    }
+
+    Ok(nested)
+}
+
+fn desugar_do(exprs: &[Expr], position: SourcePos) -> Result<Expr, EvalError> {
+    let Some((bindings_expr, rest)) = exprs.split_first() else {
+        return Err(EvalError::syntax(
+            "do requires bindings and a termination clause",
+            position,
+        ));
+    };
+    let Some((termination_expr, body)) = rest.split_first() else {
+        return Err(EvalError::syntax(
+            "do requires a termination clause",
+            position,
+        ));
+    };
+
+    let bindings = parse_do_bindings(bindings_expr)?;
+    let (test_expr, result_exprs) = parse_do_termination_clause(termination_expr)?;
+    let loop_name = fresh_generated_symbol("do");
+    let loop_call = Expr::list(
+        std::iter::once(Expr::symbol(loop_name.clone(), position))
+            .chain(bindings.iter().map(|binding| {
+                binding
+                    .step
+                    .clone()
+                    .unwrap_or_else(|| Expr::symbol(binding.name.clone(), position))
+            }))
+            .collect(),
+        position,
+    );
+
+    let false_branch = build_begin_expr(
+        body.iter()
+            .cloned()
+            .chain(std::iter::once(loop_call))
+            .collect(),
+        position,
+    );
+    let true_branch = build_begin_expr(result_exprs, position);
+    let loop_body = vec![build_if_expr(test_expr, true_branch, false_branch, position)];
+    let loop_bindings = bindings
+        .into_iter()
+        .map(|binding| (binding.name, binding.init))
+        .collect::<Vec<_>>();
+
+    Ok(build_named_let_expr(loop_name, loop_bindings, loop_body, position))
 }
 
 fn eval(expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
@@ -2654,7 +3532,10 @@ fn apply_builtin(
         "procedure?" => apply_type_predicate("procedure?", args, position, |value| {
             matches!(
                 value,
-                Value::Builtin(_) | Value::Procedure(_) | Value::NativeProcedure(_)
+                Value::Builtin(_)
+                    | Value::Procedure(_)
+                    | Value::NativeProcedure(_)
+                    | Value::Continuation(_)
             )
         }),
         "numerator" => apply_numerator(args, position),
