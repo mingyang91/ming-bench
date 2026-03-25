@@ -130,7 +130,10 @@ object Builtins:
     "with-exception-handler",
     // L21
     "values",
-    "call-with-values"
+    "call-with-values",
+    // L22
+    "syntax->datum",
+    "datum->syntax"
   )
 
   private def isTruthy(v: SchemeVal): Boolean = v match
@@ -248,6 +251,12 @@ object Builtins:
       case "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length" | "vector?" | "vector->list" |
           "list->vector" =>
         VectorOps(name, args)
+      case "syntax->datum" =>
+        if args.length != 1 then throw new EvalError("syntax->datum: expected 1 argument")
+        args.head
+      case "datum->syntax" =>
+        if args.length != 2 then throw new EvalError("datum->syntax: expected 2 arguments")
+        args(1)
       case "error" =>
         if args.isEmpty then throw new EvalError("error")
         val msg = args.map(_.displayRepr).mkString(" ")

@@ -110,6 +110,22 @@ object Evaluator:
         State.Ko(BindingForms.evalDo(args, env), k)
       case SchemeVal.SSymbol("let*") :: args =>
         LetForms.evalLetStarStep(args, env, k)
+      case SchemeVal.SSymbol("syntax-case") :: args =>
+        args match
+          case stxExpr :: SchemeVal.SList(literals) :: clauses if clauses.nonEmpty =>
+            val stxVal   = eval(stxExpr, env)
+            val litNames = literals.collect { case SchemeVal.SSymbol(n) => n }.toSet
+            State.Ko(SyntaxCase.evalSyntaxCase(stxVal, litNames, clauses, env), k)
+          case _ => throw new EvalError("syntax-case: bad syntax")
+      case SchemeVal.SSymbol("syntax") :: args =>
+        args match
+          case template :: Nil => State.Ko(SyntaxCase.evalSyntax(template), k)
+          case _               => throw new EvalError("syntax: expected 1 argument")
+      case SchemeVal.SSymbol("with-syntax") :: args =>
+        args match
+          case SchemeVal.SList(bindings) :: body if body.nonEmpty =>
+            State.Ko(SyntaxCase.evalWithSyntax(bindings, body, env), k)
+          case _ => throw new EvalError("with-syntax: bad syntax")
       case SchemeVal.SSymbol("guard") :: args =>
         args match
           case SchemeVal.SList(SchemeVal.SSymbol(exnVar) :: clauses) :: body if body.nonEmpty =>
@@ -118,9 +134,28 @@ object Evaluator:
             evalBodyCek(body, env, Cont.WithHandlerK(k))
           case _ => throw new EvalError("guard: bad syntax")
       case SchemeVal.SSymbol(name) :: _ if env.lookup(name).exists(isMacro) =>
-        val macro_   = env.get(name).asMatchedMacro
-        val expanded = Macro.expand(macro_, SchemeVal.SList(elems))
-        State.Ev(expanded, env, k)
+        env.get(name) match
+          case macro_ : SchemeVal.SMacro =>
+            val expanded = Macro.expand(macro_, SchemeVal.SList(elems))
+            State.Ev(expanded, env, k)
+          case SchemeVal.STransformerMacro(transformer, defEnv, defBound) =>
+            val form  = SchemeVal.SList(elems)
+            val stack = SyntaxCase.contextStack.get()
+            val ctx   = SyntaxCase.Context(Map.empty, defEnv, defBound)
+            SyntaxCase.contextStack.set(ctx :: stack)
+            val expanded =
+              try
+                transformer match
+                  case SchemeVal.SLambda(params, rest, body, closure) =>
+                    val callEnv = Apply.setupCallEnv(params, rest, List(form), closure)
+                    evalBody(body, callEnv)
+                  case SchemeVal.SCaseLambda(clauses, closure) =>
+                    val (p, r, b) = Apply.findClause(clauses, List(form))
+                    val callEnv   = Apply.setupCallEnv(p, r, List(form), closure)
+                    evalBody(b, callEnv)
+                  case _ => throw new EvalError("transformer macro: not a procedure")
+              finally SyntaxCase.contextStack.set(stack)
+            State.Ev(expanded, env, k)
       case head :: args =>
         State.Ev(head, env, Cont.EvOpK(args, env, k))
 
@@ -150,14 +185,14 @@ object Evaluator:
       env.set(name, v)
       State.Ko(SchemeVal.SVoid, k2)
     case Cont.EvOpK(argExprs, env, k2) =>
-      if argExprs.isEmpty then performApply(v, Nil, k2)
+      if argExprs.isEmpty then Apply.performApply(v, Nil, k2)
       else
         // Right-to-left argument evaluation (matches Chez Scheme)
         val rev = argExprs.reverse
         State.Ev(rev.head, env, Cont.EvArgK(v, Nil, rev.tail, env, k2))
     case Cont.EvArgK(op, done, rest, env, k2) =>
       val newDone = v :: done // prepend; with reversed eval order, this builds correct order
-      if rest.isEmpty then performApply(op, newDone, k2)
+      if rest.isEmpty then Apply.performApply(op, newDone, k2)
       else State.Ev(rest.head, env, Cont.EvArgK(op, newDone, rest.tail, env, k2))
     case Cont.AndK(rest, env, k2) =>
       if !isTruthy(v) then State.Ko(v, k2)
@@ -182,22 +217,22 @@ object Evaluator:
     case Cont.DynWindAfterInK(bodyThunk, entry, k2) =>
       // in-thunk done; push entry onto wind stack, call body
       windStack.set(entry :: windStack.get())
-      performApply(bodyThunk, Nil, Cont.DynWindAfterBodyK(entry, k2))
+      Apply.performApply(bodyThunk, Nil, Cont.DynWindAfterBodyK(entry, k2))
     case Cont.DynWindAfterBodyK(entry, k2) =>
       // body done; pop entry from wind stack, call out-thunk
       val ws = windStack.get()
       if ws.nonEmpty && (ws.head eq entry) then windStack.set(ws.tail)
-      performApply(entry.outThunk, Nil, Cont.DynWindAfterOutK(v, k2))
+      Apply.performApply(entry.outThunk, Nil, Cont.DynWindAfterOutK(v, k2))
     case Cont.DynWindAfterOutK(bodyValue, k2) =>
       // out-thunk done; return body value
       State.Ko(bodyValue, k2)
     // continuation wind/unwind steps
     case Cont.WindContinueK(remaining, finalValue, targetK, targetWinds) =>
-      DynWind.startWindActions(remaining, finalValue, targetK, targetWinds)(performApply)
+      DynWind.startWindActions(remaining, finalValue, targetK, targetWinds)(Apply.performApply)
     case Cont.WindPushK(entry, remaining, finalValue, targetK, targetWinds) =>
       // in-thunk done during rewind; push entry onto wind stack
       windStack.set(entry :: windStack.get())
-      DynWind.startWindActions(remaining, finalValue, targetK, targetWinds)(performApply)
+      DynWind.startWindActions(remaining, finalValue, targetK, targetWinds)(Apply.performApply)
     // exception handling (L20)
     case Cont.WithHandlerK(k2) =>
       // Body/thunk completed normally — pop handler, return value
@@ -207,69 +242,22 @@ object Evaluator:
     case Cont.RaiseReturnErrorK =>
       throw new EvalError("handler returned from non-continuable exception")
     case Cont.GuardAfterWindK(clauses, exnValue, env, guardK) =>
-      ExceptionOps.evalGuardClauses(clauses, exnValue, env, guardK, performApply)
+      ExceptionOps.evalGuardClauses(clauses, exnValue, env, guardK, Apply.performApply)
     case Cont.GuardTestK(body, remaining, exnValue, env, guardK) =>
       if isTruthy(v) then
         if body.isEmpty then State.Ko(v, guardK)
         else evalBodyCek(body, env, guardK)
-      else ExceptionOps.evalGuardClauses(remaining, exnValue, env, guardK, performApply)
+      else ExceptionOps.evalGuardClauses(remaining, exnValue, env, guardK, Apply.performApply)
     // L21 — call-with-values
     case Cont.CallWithValuesK(consumer, k2) =>
       v match
-        case SchemeVal.SValues(vals) => performApply(consumer, vals, k2)
-        case single                  => performApply(consumer, List(single), k2)
-
-  private def performApply(op: SchemeVal, args: List[SchemeVal], k: Cont): State =
-    op match
-      case SchemeVal.SLambda(params, restParam, body, closure) =>
-        val callEnv = Apply.setupCallEnv(params, restParam, args, closure)
-        evalBodyCek(body, callEnv, k)
-      case SchemeVal.SCaseLambda(clauses, closure) =>
-        val (cparams, crest, cbody) = Apply.findClause(clauses, args)
-        val callEnv                 = Apply.setupCallEnv(cparams, crest, args, closure)
-        evalBodyCek(cbody, callEnv, k)
-      case SchemeVal.SContinuation(savedK, savedWinds) =>
-        if args.length != 1 then throw new EvalError("continuation: expected 1 argument")
-        val currentWinds = windStack.get()
-        val actions      = DynWind.computeWindActions(currentWinds, savedWinds)
-        if actions.isEmpty then State.Ko(args.head, savedK)
-        else DynWind.startWindActions(actions, args.head, savedK, savedWinds)(performApply)
-      case SchemeVal.SSymbol(name) if name == "call/cc" || name == "call-with-current-continuation" =>
-        if args.length != 1 then throw new EvalError("call/cc: expected 1 argument")
-        val contVal = SchemeVal.SContinuation(k, windStack.get())
-        performApply(args.head, List(contVal), k)
-      case SchemeVal.SSymbol("dynamic-wind") =>
-        if args.length != 3 then throw new EvalError("dynamic-wind: expected 3 arguments")
-        val (inThunk, bodyThunk, outThunk) = (args(0), args(1), args(2))
-        val entry                          = new WindEntry(inThunk, outThunk)
-        performApply(inThunk, Nil, Cont.DynWindAfterInK(bodyThunk, entry, k))
-      case SchemeVal.SSymbol("values") =>
-        if args.length == 1 then State.Ko(args.head, k)
-        else State.Ko(SchemeVal.SValues(args), k)
-      case SchemeVal.SSymbol("call-with-values") =>
-        if args.length != 2 then throw new EvalError("call-with-values: expected 2 arguments")
-        val (producer, consumer) = (args(0), args(1))
-        performApply(producer, Nil, Cont.CallWithValuesK(consumer, k))
-      case SchemeVal.SSymbol("raise") =>
-        if args.length != 1 then throw new EvalError("raise: expected 1 argument")
-        ExceptionOps.handleRaise(args.head, k, performApply)
-      case SchemeVal.SSymbol("with-exception-handler") =>
-        if args.length != 2 then throw new EvalError("with-exception-handler: expected 2 arguments")
-        val (handler, thunk) = (args(0), args(1))
-        handlerStack.set(ExceptionHandler.Proc(handler, windStack.get()) :: handlerStack.get())
-        performApply(thunk, Nil, Cont.WithHandlerK(k))
-      case SchemeVal.SSymbol(name)
-          if name.startsWith("__record-ctor__:") ||
-            name.startsWith("__record-pred__:") ||
-            name.startsWith("__record-acc__:") =>
-        State.Ko(RecordOps.applyRecordOp(name, args), k)
-      case SchemeVal.SSymbol(name) =>
-        State.Ko(Apply.applyBuiltinOrHOF(name, args), k)
-      case _ => throw new EvalError(s"not a procedure: ${op.display}")
+        case SchemeVal.SValues(vals) => Apply.performApply(consumer, vals, k2)
+        case single                  => Apply.performApply(consumer, List(single), k2)
 
   private def isMacro(v: SchemeVal): Boolean = v match
-    case _: SchemeVal.SMacro => true
-    case _                   => false
+    case _: SchemeVal.SMacro            => true
+    case _: SchemeVal.STransformerMacro => true
+    case _                              => false
 
   private def makeGlobalEnv(): Env =
     val env = Env()

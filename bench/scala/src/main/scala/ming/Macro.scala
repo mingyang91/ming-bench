@@ -21,11 +21,75 @@ object Macro:
     "cond",
     "quote",
     "define-syntax",
-    "syntax-rules"
+    "syntax-rules",
+    "syntax-case",
+    "syntax",
+    "with-syntax",
+    "let*",
+    "letrec",
+    "letrec*",
+    "case-lambda",
+    "define-record-type",
+    "case",
+    "do",
+    "guard"
   )
 
   /** Bindings from pattern matching: name -> Left(single value) or Right(ellipsis list) */
   type Bindings = Map[String, Either[SchemeVal, List[SchemeVal]]]
+
+  /** Match a pattern against an input value. Public API for syntax-case. */
+  def matchFull(pattern: SchemeVal, input: SchemeVal, literals: Set[String]): Option[Bindings] =
+    matchOne(pattern, input, literals)
+
+  /** Instantiate a template with bindings and hygiene. Public API for syntax-case. */
+  def expandTemplate(
+    template: SchemeVal,
+    bindings: Bindings,
+    defEnv: Env,
+    defBound: Set[String] = Set.empty
+  ): SchemeVal =
+    if defBound.isEmpty then instantiateWithHygiene(template, bindings, defEnv)
+    else
+      val patVars      = bindings.keySet
+      val freeSyms     = collectFreeSymbols(template, patVars)
+      val bindingNames = collectBindingNames(template, patVars)
+      val defValues    = mutable.HashMap[String, SchemeVal]()
+      val gensymMap    = mutable.HashMap[String, String]()
+      for sym <- freeSyms do
+        if !specialForms.contains(sym) && !Builtins.names.contains(sym) then
+          if defBound.contains(sym) then
+            defEnv.lookup(sym) match
+              case Some(_: SchemeVal.SMacro) => ()
+              case Some(v)                   => defValues(sym) = v
+              case None                      => ()
+          else if bindingNames.contains(sym) then gensymMap(sym) = gensym(sym)
+          // else: leave as-is for use-site resolution
+      instantiate(template, bindings, defValues.toMap, gensymMap.toMap)
+
+  /** Collect symbols that appear in binding positions (let/lambda) in a template. */
+  private def collectBindingNames(template: SchemeVal, patVars: Set[String]): Set[String] =
+    template match
+      case SchemeVal.SList(SchemeVal.SSymbol(form) :: SchemeVal.SList(bindings) :: body)
+          if Set("let", "let*", "letrec", "letrec*").contains(form) =>
+        val names = bindings.flatMap {
+          case SchemeVal.SList(SchemeVal.SSymbol(n) :: _) if !patVars.contains(n) => Some(n)
+          case _                                                                  => None
+        }.toSet
+        names ++ body.flatMap(collectBindingNames(_, patVars)).toSet ++
+          bindings.flatMap {
+            case SchemeVal.SList(_ :: v :: Nil) => collectBindingNames(v, patVars)
+            case _                              => Set.empty
+          }
+      case SchemeVal.SList(SchemeVal.SSymbol("lambda") :: SchemeVal.SList(params) :: body) =>
+        val names = params.collect {
+          case SchemeVal.SSymbol(n) if !patVars.contains(n) => n
+        }.toSet
+        names ++ body.flatMap(collectBindingNames(_, patVars)).toSet
+      case SchemeVal.SList(SchemeVal.SSymbol("quote") :: _) => Set.empty
+      case SchemeVal.SList(elems) =>
+        elems.flatMap(collectBindingNames(_, patVars)).toSet
+      case _ => Set.empty
 
   /** Expand a macro application. Tries each clause until one matches. */
   def expand(macro_ : SchemeVal.SMacro, form: SchemeVal): SchemeVal =
@@ -166,6 +230,8 @@ object Macro:
     template match
       case SchemeVal.SSymbol(name) if !patVars.contains(name) && name != "..." =>
         Set(name)
+      case SchemeVal.SList(SchemeVal.SSymbol("quote") :: _) =>
+        Set("quote") // quote is free but its contents are literal data
       case SchemeVal.SList(elems) =>
         elems.flatMap(collectFreeSymbols(_, patVars)).toSet
       case _ => Set.empty

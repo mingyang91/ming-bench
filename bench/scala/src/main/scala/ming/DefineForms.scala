@@ -66,4 +66,9 @@ object DefineForms:
         }
         env.define(name, SchemeVal.SMacro(litNames, parsedClauses, env))
         SchemeVal.SVoid
+      case SchemeVal.SSymbol(name) :: transformerExpr :: Nil =>
+        val bound       = env.definedNames
+        val transformer = Evaluator.eval(transformerExpr, env)
+        env.define(name, SchemeVal.STransformerMacro(transformer, env, bound))
+        SchemeVal.SVoid
       case _ => throw new EvalError("define-syntax: bad syntax")

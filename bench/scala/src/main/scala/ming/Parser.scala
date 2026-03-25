@@ -43,12 +43,16 @@ object Tokenizer:
             sb += '"'; i += 1; col += 1
           tokens += Token(sb.toString, line, startCol)
         case '#' =>
-          val startCol = col
-          val start    = i
-          i += 1; col += 1
-          while i < input.length && !input(i).isWhitespace && input(i) != '(' && input(i) != ')' do
+          if i + 1 < input.length && input(i + 1) == '\'' then
+            tokens += Token("#'", line, col)
+            i += 2; col += 2
+          else
+            val startCol = col
+            val start    = i
             i += 1; col += 1
-          tokens += Token(input.substring(start, i), line, startCol)
+            while i < input.length && !input(i).isWhitespace && input(i) != '(' && input(i) != ')' do
+              i += 1; col += 1
+            tokens += Token(input.substring(start, i), line, startCol)
         case _ =>
           val startCol = col
           val start    = i
@@ -83,6 +87,9 @@ object Parser:
       case t :: rest if t.text == "'" =>
         val (expr, r) = parse(rest)
         (withPos(SchemeVal.SList(List(SchemeVal.SSymbol("quote"), expr)), t), r)
+      case t :: rest if t.text == "#'" =>
+        val (expr, r) = parse(rest)
+        (withPos(SchemeVal.SList(List(SchemeVal.SSymbol("syntax"), expr)), t), r)
       case t :: rest =>
         (withPos(parseAtom(t.text), t), rest)
 

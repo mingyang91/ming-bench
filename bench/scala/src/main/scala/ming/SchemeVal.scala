@@ -48,6 +48,8 @@ enum SchemeVal:
 
   case SValues(values: List[SchemeVal])
 
+  case STransformerMacro(transformer: SchemeVal, defEnv: Env, defBound: Set[String])
+
   /** Safely cast to SMacro via pattern match. */
   def asMatchedMacro: SchemeVal.SMacro = this match
     case m: SchemeVal.SMacro => m
@@ -90,14 +92,15 @@ object SchemeVal:
     case SPair(cell) =>
       if !visited.add(cell) then "(...)"
       else "(" + pairTailImpl(cell, visited) + ")"
-    case SVoid               => ""
-    case SLambda(_, _, _, _) => "#<procedure>"
-    case SCaseLambda(_, _)   => "#<procedure>"
-    case SMacro(_, _, _)     => "#<macro>"
-    case SRecord(tn, _)      => s"#<record:$tn>"
-    case SVector(es)         => "#(" + es.map(displayImpl(_, visited)).mkString(" ") + ")"
-    case SContinuation(_, _) => "#<continuation>"
-    case SValues(vs)         => vs.map(displayImpl(_, visited)).mkString(" ")
+    case SVoid                      => ""
+    case SLambda(_, _, _, _)        => "#<procedure>"
+    case SCaseLambda(_, _)          => "#<procedure>"
+    case SMacro(_, _, _)            => "#<macro>"
+    case SRecord(tn, _)             => s"#<record:$tn>"
+    case SVector(es)                => "#(" + es.map(displayImpl(_, visited)).mkString(" ") + ")"
+    case SContinuation(_, _)        => "#<continuation>"
+    case SValues(vs)                => vs.map(displayImpl(_, visited)).mkString(" ")
+    case STransformerMacro(_, _, _) => "#<macro>"
 
   private def pairTailImpl(cell: MutableCell, visited: java.util.Set[MutableCell]): String =
     val carStr = displayImpl(cell.car, visited)

@@ -26,3 +26,8 @@ class Env(val parent: Option[Env] = None):
       parent match
         case Some(p) => p.set(name, value)
         case None    => throw new EvalError(s"unbound variable: $name")
+
+  /** Snapshot of all currently defined names (including parents). */
+  def definedNames: Set[String] =
+    val names = bindings.keySet.toSet
+    parent.map(p => names ++ p.definedNames).getOrElse(names)
