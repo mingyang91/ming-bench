@@ -105,9 +105,15 @@ func makeGlobalEnv() *Env {
 	env.Set("string-ref", &Value{Type: TypeSymbol, StrVal: "builtin:string-ref"})
 	env.Set("char?", &Value{Type: TypeSymbol, StrVal: "builtin:char?"})
 
-	// Mutable strings (L06)
+	// Mutable strings (L06) — string-set! now errors (L15 immutability)
 	env.Set("string-set!", &Value{Type: TypeSymbol, StrVal: "builtin:string-set!"})
 	env.Set("string-copy", &Value{Type: TypeSymbol, StrVal: "builtin:string-copy"})
+
+	// String/list/char conversions (L15)
+	env.Set("string->list", &Value{Type: TypeSymbol, StrVal: "builtin:string->list"})
+	env.Set("list->string", &Value{Type: TypeSymbol, StrVal: "builtin:list->string"})
+	env.Set("char->integer", &Value{Type: TypeSymbol, StrVal: "builtin:char->integer"})
+	env.Set("integer->char", &Value{Type: TypeSymbol, StrVal: "builtin:integer->char"})
 
 	// Apply (L08)
 	env.Set("apply", &Value{Type: TypeSymbol, StrVal: "builtin:apply"})
@@ -553,12 +559,15 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 
 	case "builtin:string-set!":
 		if len(args) != 3 || args[0].Type != TypeString || args[1].Type != TypeInteger || args[2].Type != TypeChar {
-			return nil, fmt.Errorf("%d:%d: 'string-set!' expects string, index, char", line, col)
+			return nil, fmt.Errorf("%d:%d: 'string-set!' expects a string, an integer, and a character", line, col)
+		}
+		if !args[0].Mutable {
+			return nil, fmt.Errorf("%d:%d: string is immutable", line, col)
 		}
 		runes := []rune(args[0].StrVal)
 		idx := int(args[1].IntVal)
 		if idx < 0 || idx >= len(runes) {
-			return nil, fmt.Errorf("%d:%d: 'string-set!' index out of range", line, col)
+			return nil, fmt.Errorf("%d:%d: string-set! index out of range", line, col)
 		}
 		runes[idx] = args[2].CharVal
 		args[0].StrVal = string(runes)
@@ -568,7 +577,47 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 		if len(args) != 1 || args[0].Type != TypeString {
 			return nil, fmt.Errorf("%d:%d: 'string-copy' expects a string", line, col)
 		}
-		return StringValue(args[0].StrVal), nil
+		v := StringValue(args[0].StrVal)
+		v.Mutable = true
+		return v, nil
+
+	case "builtin:string->list":
+		if len(args) != 1 || args[0].Type != TypeString {
+			return nil, fmt.Errorf("%d:%d: 'string->list' expects a string", line, col)
+		}
+		runes := []rune(args[0].StrVal)
+		result := Null
+		for i := len(runes) - 1; i >= 0; i-- {
+			result = PairValue(CharValue(runes[i]), result)
+		}
+		return result, nil
+
+	case "builtin:list->string":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("%d:%d: 'list->string' expects a list", line, col)
+		}
+		var runes []rune
+		cur := args[0]
+		for cur.Type == TypePair {
+			if cur.Car.Type != TypeChar {
+				return nil, fmt.Errorf("%d:%d: 'list->string' expects a list of chars", line, col)
+			}
+			runes = append(runes, cur.Car.CharVal)
+			cur = cur.Cdr
+		}
+		return StringValue(string(runes)), nil
+
+	case "builtin:char->integer":
+		if len(args) != 1 || args[0].Type != TypeChar {
+			return nil, fmt.Errorf("%d:%d: 'char->integer' expects a char", line, col)
+		}
+		return IntValue(int64(args[0].CharVal)), nil
+
+	case "builtin:integer->char":
+		if len(args) != 1 || args[0].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'integer->char' expects an integer", line, col)
+		}
+		return CharValue(rune(args[0].IntVal)), nil
 
 	case "builtin:apply":
 		if len(args) < 2 {

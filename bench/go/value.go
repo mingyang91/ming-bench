@@ -68,6 +68,8 @@ type Value struct {
 	CaseClauses []CaseLambdaClause
 	// Vector elements
 	VecElems []*Value
+	// String mutability (mutable strings from string-copy, make-string, etc.)
+	Mutable bool
 }
 
 var Void = &Value{Type: TypeVoid}
