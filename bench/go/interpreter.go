@@ -98,12 +98,9 @@ func evalStringWithOutput(input string) (string, string, error) {
 
 	ctx := &evalContext{}
 	env := baseEnv(ctx)
-	last := value(voidValue{})
-	for _, expr := range nodes {
-		last, err = eval(expr, env)
-		if err != nil {
-			return "", "", err
-		}
+	last, err := runEvalSequence(nodes, env)
+	if err != nil {
+		return "", "", err
 	}
 	result, err := formatValue(last)
 	if err != nil {
@@ -235,6 +232,8 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("char-downcase", builtinCharCase("downcase"))
 	env.define("char=?", builtinCharCompare("char=?"))
 	env.define("char<?", builtinCharCompare("char<?"))
+	env.define("call/cc", callCCBuiltin)
+	env.define("call-with-current-continuation", callCCBuiltin)
 	return env
 }
 
@@ -278,44 +277,7 @@ func (e *environment) set(name string, val value) bool {
 }
 
 func eval(expr node, env *environment) (value, error) {
-	currentExpr := expr
-	currentEnv := env
-
-	for {
-		expanded, err := expandMacros(currentExpr, currentEnv)
-		if err != nil {
-			return nil, err
-		}
-
-		currentExpr = expanded
-		switch expr := currentExpr.(type) {
-		case integerValue, rationalValue, inexactValue, booleanValue, stringValue, charValue:
-			return expr, nil
-		case vectorNode:
-			return datumFromNode(expr)
-		case symbolNode:
-			if expr.captured != nil {
-				return expr.captured.value, nil
-			}
-			val, ok := currentEnv.lookup(expr.name)
-			if !ok {
-				return nil, errorAt(expr.pos, "unbound variable: %s", expr.name)
-			}
-			return val, nil
-		case listNode:
-			result, step, err := evalList(expr, currentEnv)
-			if err != nil {
-				return nil, err
-			}
-			if step == nil {
-				return result, nil
-			}
-			currentExpr = step.expr
-			currentEnv = step.env
-		default:
-			return nil, errorAt(nodePos(expr), "unknown expression")
-		}
-	}
+	return runEval(expr, env)
 }
 
 func evalList(list listNode, env *environment) (value, *evalStep, error) {
@@ -780,14 +742,7 @@ func parseParamNames(paramExprs []node) ([]string, string, bool, error) {
 }
 
 func applyProcedure(proc value, args []value, pos sourcePos) (value, error) {
-	result, step, err := startProcedureCall(proc, args, pos)
-	if err != nil {
-		return nil, err
-	}
-	if step == nil {
-		return result, nil
-	}
-	return eval(step.expr, step.env)
+	return runProcedureCall(proc, args, pos)
 }
 
 func startProcedureCall(proc value, args []value, pos sourcePos) (value, *evalStep, error) {
@@ -846,14 +801,7 @@ func startClosureCall(proc *closureValue, args []value, pos sourcePos) (value, *
 }
 
 func evalSequence(exprs []node, env *environment) (value, error) {
-	result, step, err := prepareSequence(exprs, env)
-	if err != nil {
-		return nil, err
-	}
-	if step == nil {
-		return result, nil
-	}
-	return eval(step.expr, step.env)
+	return runEvalSequence(exprs, env)
 }
 
 func prepareSequence(exprs []node, env *environment) (value, *evalStep, error) {
@@ -2535,7 +2483,7 @@ func formatValue(v value) (string, error) {
 		return "#(" + strings.Join(parts, " ") + ")", nil
 	case *recordValue:
 		return "#<record " + v.recordType.name + ">", nil
-	case builtinProc, *closureValue, *caseClosureValue:
+	case builtinProc, *closureValue, *caseClosureValue, *continuationValue, *callCCProcValue:
 		return "#<procedure>", nil
 	case *pairValue:
 		return formatPair(v, formatValue)
@@ -2654,7 +2602,7 @@ func isPairValue(v value) bool {
 
 func isProcedureValue(v value) bool {
 	switch v.(type) {
-	case builtinProc, *closureValue, *caseClosureValue:
+	case builtinProc, *closureValue, *caseClosureValue, *continuationValue, *callCCProcValue:
 		return true
 	default:
 		return false
@@ -2759,6 +2707,12 @@ func eqValues(left, right value) bool {
 		return ok && left == right
 	case *caseClosureValue:
 		right, ok := right.(*caseClosureValue)
+		return ok && left == right
+	case *continuationValue:
+		right, ok := right.(*continuationValue)
+		return ok && left == right
+	case *callCCProcValue:
+		right, ok := right.(*callCCProcValue)
 		return ok && left == right
 	case *recordValue:
 		right, ok := right.(*recordValue)
