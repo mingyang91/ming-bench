@@ -32,9 +32,9 @@ object CekApply:
           case None =>
             throw EvalError(s"case-lambda: no matching clause for ${args.length} arguments")
       case Expr.Cont(kontData) =>
-        if args.length != 1 then throw EvalError("continuation: need exactly 1 argument")
+        if args.isEmpty then throw EvalError("continuation: need at least 1 argument")
         val (savedK, savedWinds) = kontData.asInstanceOf[(Kont, List[WindEntry])]
-        val value                = args.head
+        val value                = if args.length == 1 then args.head else Expr.Values(args)
         val currentWinds         = s.windStack
         val (toUnwind, toRewind) = computeWindTransfer(currentWinds, savedWinds)
         if toUnwind.isEmpty && toRewind.isEmpty then

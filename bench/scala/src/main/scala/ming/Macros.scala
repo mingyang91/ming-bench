@@ -29,7 +29,13 @@ private[ming] object Macros:
     "unless",
     "syntax-case",
     "syntax",
-    "with-syntax"
+    "with-syntax",
+    "guard",
+    "define-record-type",
+    "case-lambda",
+    "do",
+    "letrec*",
+    "case"
   )
 
   // --- Thread-local syntax-case context ---
@@ -81,9 +87,9 @@ private[ming] object Macros:
     useEnv: Env
   ): (Expr, Env) =
     val inputArgs = form.tail
-    for (pattern, template) <- rules do
-      matchPattern(pattern, inputArgs, literals) match
-        case Some(bindings) =>
+    rules.iterator
+      .flatMap { case (pattern, template) =>
+        matchPattern(pattern, inputArgs, literals).map { bindings =>
           val patVars  = collectPatternVars(pattern, literals)
           val freeSyms = collectFreeSymbols(template, patVars)
           val renames  = mutable.Map[String, String]()
@@ -94,15 +100,16 @@ private[ming] object Macros:
 
           val expanded = doExpand(template, bindings, renames.toMap)
 
-          val hygieneEnv = useEnv.child()
           for (original, renamed) <- renames do
             defEnv.lookupOpt(original) match
               case Some(_: Expr.Macro) | Some(_: Expr.TransformerMacro) => ()
-              case Some(value)                                          => hygieneEnv.define(renamed, value)
+              case Some(value)                                          => useEnv.define(renamed, value)
               case None                                                 => ()
-          return (expanded, hygieneEnv)
-        case None => ()
-    throw EvalError("syntax-rules: no matching pattern")
+          (expanded, useEnv)
+        }
+      }
+      .nextOption()
+      .getOrElse(throw EvalError("syntax-rules: no matching pattern"))
 
   /** Expand a syntax template using current syntax-case bindings. */
   def expandSyntaxTemplate(template: Expr, curEnv: Env): (Expr, Env) =
@@ -193,19 +200,23 @@ private[ming] object Macros:
       val ellipsisBindings = mutable.Map[String, List[Expr]]()
       for v <- ellipsisVars do ellipsisBindings(v) = Nil
 
-      for elem <- repeatedInputs do
+      val allRepeatsMatch = repeatedInputs.forall { elem =>
         val tempBindings = mutable.Map[String, Either[Expr, List[Expr]]]()
-        if !matchSingle(ellipsisPattern, elem, literals, tempBindings) then return false
-        for (k, v) <- tempBindings do
-          v match
-            case Left(expr) =>
-              ellipsisBindings(k) = ellipsisBindings.getOrElse(k, Nil) :+ expr
-            case _ => ()
+        val matched      = matchSingle(ellipsisPattern, elem, literals, tempBindings)
+        if matched then
+          for (k, v) <- tempBindings do
+            v match
+              case Left(expr) =>
+                ellipsisBindings(k) = ellipsisBindings.getOrElse(k, Nil) :+ expr
+              case _ => ()
+        matched
+      }
 
-      for (k, vs) <- ellipsisBindings do bindings(k) = Right(vs)
-
-      val afterInput = input.drop(beforeEllipsis.length + repeatCount)
-      afterEllipsis.zip(afterInput).forall((p, i) => matchSingle(p, i, literals, bindings))
+      if !allRepeatsMatch then false
+      else
+        for (k, vs) <- ellipsisBindings do bindings(k) = Right(vs)
+        val afterInput = input.drop(beforeEllipsis.length + repeatCount)
+        afterEllipsis.zip(afterInput).forall((p, i) => matchSingle(p, i, literals, bindings))
 
   private def collectSinglePatternVars(pattern: Expr, literals: List[String]): Set[String] = pattern match
     case Expr.Sym(name) if name != "..." && !literals.contains(name) && name != "_" => Set(name)
