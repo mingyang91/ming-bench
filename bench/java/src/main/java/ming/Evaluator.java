@@ -25,7 +25,7 @@ public class Evaluator {
         record Nil() implements Val {}
         record Void() implements Val {}
         record Builtin(String name, java.util.function.Function<List<Val>, Val> fn) implements Val {}
-        record Lambda(List<String> params, List<Val> body, Env closure) implements Val {}
+        record Lambda(List<String> params, String restParam, List<Val> body, Env closure) implements Val {}
     }
 
     // ── Token with position ─────────────────────────────────────
@@ -194,12 +194,18 @@ public class Evaluator {
         Token tok = tokens.get(idx[0]++);
         if (tok.text().equals("(")) {
             List<Val> elems = new ArrayList<>();
+            Val dotTail = null;
             while (idx[0] < tokens.size() && !tokens.get(idx[0]).text().equals(")")) {
+                if (tokens.get(idx[0]).text().equals(".")) {
+                    idx[0]++; // skip dot
+                    dotTail = parse(tokens, idx);
+                    break;
+                }
                 elems.add(parse(tokens, idx));
             }
             if (idx[0] >= tokens.size()) throw new EvalError(tok.line() + ":" + tok.col() + ": missing )");
             idx[0]++; // skip )
-            Val list = new Val.Nil();
+            Val list = (dotTail != null) ? dotTail : new Val.Nil();
             for (int i = elems.size() - 1; i >= 0; i--) {
                 Val pair = new Val.PairV(elems.get(i), list);
                 copyPos(elems.get(i), pair);
@@ -340,11 +346,24 @@ public class Evaluator {
             }
         }
         if (fn instanceof Val.Lambda lambda) {
-            if (args.size() != lambda.params().size())
-                throw posError(callSite, "expected " + lambda.params().size() + " arguments, got " + args.size());
+            int required = lambda.params().size();
+            if (lambda.restParam() != null) {
+                if (args.size() < required)
+                    throw posError(callSite, "expected at least " + required + " arguments, got " + args.size());
+            } else {
+                if (args.size() != required)
+                    throw posError(callSite, "expected " + required + " arguments, got " + args.size());
+            }
             Env callEnv = new Env(lambda.closure());
-            for (int i = 0; i < lambda.params().size(); i++) {
+            for (int i = 0; i < required; i++) {
                 callEnv.define(lambda.params().get(i), args.get(i));
+            }
+            if (lambda.restParam() != null) {
+                Val rest = new Val.Nil();
+                for (int i = args.size() - 1; i >= required; i--) {
+                    rest = new Val.PairV(args.get(i), rest);
+                }
+                callEnv.define(lambda.restParam(), rest);
             }
             return evalBody(lambda.body(), callEnv);
         }
@@ -381,6 +400,7 @@ public class Evaluator {
             if (!(namePair.car() instanceof Val.Sym fnName))
                 throw posError(form, "define: expected function name");
             List<String> params = new ArrayList<>();
+            String restParam = null;
             Val paramList = namePair.cdr();
             while (paramList instanceof Val.PairV pp) {
                 if (!(pp.car() instanceof Val.Sym paramSym))
@@ -388,9 +408,12 @@ public class Evaluator {
                 params.add(paramSym.name());
                 paramList = pp.cdr();
             }
+            if (paramList instanceof Val.Sym restSym) {
+                restParam = restSym.name();
+            }
             List<Val> body = collectList(p.cdr());
             if (body.isEmpty()) throw posError(form, "define: missing body");
-            Val.Lambda lambda = new Val.Lambda(params, body, env);
+            Val.Lambda lambda = new Val.Lambda(params, restParam, body, env);
             env.define(fnName.name(), lambda);
             return new Val.Void();
         }
@@ -400,6 +423,7 @@ public class Evaluator {
     private Val evalLambda(Val args, Env env, Val form) throws EvalError {
         if (!(args instanceof Val.PairV p)) throw posError(form, "lambda requires arguments");
         List<String> params = new ArrayList<>();
+        String restParam = null;
         Val paramList = p.car();
         while (paramList instanceof Val.PairV pp) {
             if (!(pp.car() instanceof Val.Sym paramSym))
@@ -407,9 +431,12 @@ public class Evaluator {
             params.add(paramSym.name());
             paramList = pp.cdr();
         }
+        if (paramList instanceof Val.Sym restSym) {
+            restParam = restSym.name();
+        }
         List<Val> body = collectList(p.cdr());
         if (body.isEmpty()) throw posError(form, "lambda: missing body");
-        return new Val.Lambda(params, body, env);
+        return new Val.Lambda(params, restParam, body, env);
     }
 
     private Val evalAnd(Val args, Env env) throws EvalError {
@@ -481,7 +508,7 @@ public class Evaluator {
             List<Val> body = collectList(rest.cdr());
             if (body.isEmpty()) throw posError(form, "let: missing body");
             Env letEnv = new Env(env);
-            Val.Lambda lambda = new Val.Lambda(params, body, letEnv);
+            Val.Lambda lambda = new Val.Lambda(params, null, body, letEnv);
             letEnv.define(nameSym.name(), lambda);
             return applyFn(lambda, inits, form);
         }
@@ -744,6 +771,26 @@ public class Evaluator {
             if (!(args.get(2) instanceof Val.Chr c)) throw new RuntimeException("string-set!: not a character");
             s.setChar(idx, c.value());
             return new Val.Void();
+        }));
+        // L08 — apply
+        env.define("apply", new Val.Builtin("apply", args -> {
+            if (args.size() < 2) throw new RuntimeException("apply requires at least 2 arguments");
+            Val fn = args.get(0);
+            Val lastArg = args.get(args.size() - 1);
+            List<Val> callArgs = new ArrayList<>();
+            for (int i = 1; i < args.size() - 1; i++) {
+                callArgs.add(args.get(i));
+            }
+            Val cur = lastArg;
+            while (cur instanceof Val.PairV p) {
+                callArgs.add(p.car());
+                cur = p.cdr();
+            }
+            try {
+                return applyFn(fn, callArgs, null);
+            } catch (EvalError e) {
+                throw new RuntimeException(e.getMessage());
+            }
         }));
         return env;
     }
