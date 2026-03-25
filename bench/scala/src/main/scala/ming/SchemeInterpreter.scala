@@ -52,7 +52,7 @@ private[ming] object SchemeInterpreter:
     final case class Symbol(name: String)                                           extends Value
     final case class ListValue(items: List[Value])                                  extends Value
     final case class Builtin(name: String, impl: (List[Value], SourcePos) => Value) extends Procedure
-    final case class Closure(params: List[String], body: List[Expr], env: Env)      extends Procedure
+    final case class Closure(params: LambdaParams, body: List[Expr], env: Env)      extends Procedure
     case object Void                                                                extends Value
 
   def evalProgram(input: String): Value =
@@ -111,7 +111,7 @@ private[ming] object SchemeInterpreter:
         env.define(name, eval(valueExpr, env))
         Value.Void
       case Expr.ListExpr(Expr.Symbol(name, _) :: params, _) :: body if body.nonEmpty =>
-        env.define(name, Value.Closure(readParams(params), body, env))
+        env.define(name, Value.Closure(readParamList(params), body, env))
         Value.Void
       case _ =>
         throw EvalError.at(pos, "invalid define")
@@ -146,7 +146,7 @@ private[ming] object SchemeInterpreter:
         val bindings = readBindings(bindingsExpr)
         val values   = bindings.map { case (_, valueExpr) => eval(valueExpr, env) }
         val letEnv   = Env.child(env, Nil)
-        val closure  = Value.Closure(bindings.map(_._1), body, letEnv)
+        val closure  = Value.Closure(LambdaParams.fixed(bindings.map(_._1)), body, letEnv)
         letEnv.define(name, closure)
         applyProcedure(closure, values, pos)
       case _ =>
@@ -173,8 +173,8 @@ private[ming] object SchemeInterpreter:
 
   private def evalLambda(args: List[Expr], env: Env, pos: SourcePos): Value =
     args match
-      case Expr.ListExpr(params, _) :: body if body.nonEmpty =>
-        Value.Closure(readParams(params), body, env)
+      case formals :: body if body.nonEmpty =>
+        Value.Closure(readParams(formals), body, env)
       case _ =>
         throw EvalError.at(pos, "invalid lambda")
 
@@ -199,9 +199,17 @@ private[ming] object SchemeInterpreter:
       case Value.Builtin(_, impl) =>
         impl(args, pos)
       case Value.Closure(params, body, closureEnv) =>
-        if args.length != params.length then
-          throw EvalError.at(pos, s"lambda expected ${params.length} arguments, got ${args.length}")
-        val callEnv = Env.child(closureEnv, params.zip(args))
+        val minimum = params.required.length
+        params.rest match
+          case None if args.length != minimum =>
+            throw EvalError.at(pos, s"lambda expected $minimum arguments, got ${args.length}")
+          case Some(_) if args.length < minimum =>
+            throw EvalError.at(pos, s"lambda expected at least $minimum arguments, got ${args.length}")
+          case _ =>
+        val bindings = params.required.zip(args.take(minimum)) ++ params.rest.map { restName =>
+          restName -> Value.ListValue(args.drop(minimum))
+        }
+        val callEnv = Env.child(closureEnv, bindings)
         evalSequence(body, callEnv)
       case other =>
         throw EvalError.at(pos, s"not a procedure: ${render(other)}")
@@ -211,13 +219,54 @@ private[ming] object SchemeInterpreter:
     SchemeBuiltins.all(runtime.emit).foreach { builtin =>
       env.define(builtin.name, builtin)
     }
+    env.define("apply", applyBuiltin)
     env
 
-  private def readParams(params: List[Expr]): List[String] =
-    params.map {
-      case Expr.Symbol(name, _) => name
-      case other                => throw EvalError.at(other.pos, s"invalid parameter: ${renderExpr(other)}")
+  private val applyBuiltin: Value.Builtin =
+    Value.Builtin(
+      "apply",
+      (args, pos) =>
+        BuiltinSupport.requireAtLeast("apply", args, expected = 2, pos)
+        val procedure = args.head
+        val prefix    = args.tail.dropRight(1)
+        val rest      = BuiltinSupport.asList(args.last, "apply", pos)
+        applyProcedure(procedure, prefix ++ rest, pos)
+    )
+
+  private def readParams(formals: Expr): LambdaParams =
+    formals match
+      case Expr.Symbol(name, _) if name != "." =>
+        LambdaParams(required = Nil, rest = Some(name))
+      case Expr.Symbol(_, _) =>
+        throw EvalError.at(formals.pos, s"invalid parameter list: ${renderExpr(formals)}")
+      case Expr.ListExpr(params, _) =>
+        readParamList(params)
+      case other =>
+        throw EvalError.at(other.pos, s"invalid parameter list: ${renderExpr(other)}")
+
+  private def readParamList(params: List[Expr]): LambdaParams =
+    val dotIndices = params.zipWithIndex.collect { case (Expr.Symbol(".", _), index) =>
+      index
     }
+
+    dotIndices match
+      case Nil =>
+        LambdaParams.fixed(params.map(readParamName))
+      case index :: Nil if index == params.length - 2 =>
+        val required = params.take(index).map(readParamName)
+        params(index + 1) match
+          case Expr.Symbol(name, _) if name != "." =>
+            LambdaParams(required, Some(name))
+          case other =>
+            throw EvalError.at(other.pos, s"invalid parameter: ${renderExpr(other)}")
+      case index :: _ =>
+        throw EvalError.at(params(index).pos, "invalid dotted parameter list")
+
+  private def readParamName(param: Expr): String =
+    param match
+      case Expr.Symbol(name, _) if name != "." => name
+      case other =>
+        throw EvalError.at(other.pos, s"invalid parameter: ${renderExpr(other)}")
 
   private def readBindings(bindings: List[Expr]): List[(String, Expr)] =
     bindings.map {
@@ -238,39 +287,6 @@ private[ming] object SchemeInterpreter:
     value match
       case Value.Bool(false) => false
       case _                 => true
-
-  final private class Binding(var value: Value)
-
-  final class Env private (parent: Option[Env]):
-    private val bindings = mutable.HashMap.empty[String, Binding]
-
-    def define(name: String, value: Value): Unit =
-      bindings.get(name) match
-        case Some(binding) => binding.value = value
-        case None          => bindings.update(name, Binding(value))
-
-    def assign(name: String, value: Value, pos: SourcePos): Unit =
-      resolve(name) match
-        case Some(binding) => binding.value = value
-        case None          => throw EvalError.at(pos, s"unbound variable: $name")
-
-    def lookup(name: String, pos: SourcePos): Value =
-      resolve(name) match
-        case Some(binding) => binding.value
-        case None          => throw EvalError.at(pos, s"unbound variable: $name")
-
-    private def resolve(name: String): Option[Binding] =
-      bindings.get(name) match
-        case some @ Some(_) => some
-        case None           => parent.flatMap(_.resolve(name))
-
-  private object Env:
-    def root(): Env = new Env(None)
-
-    def child(parent: Env, bindings: Iterable[(String, Value)]): Env =
-      val env = new Env(Some(parent))
-      bindings.foreach { case (name, value) => env.define(name, value) }
-      env
 
   private def renderExpr(expr: Expr): String =
     SchemeRendering.renderExpr(expr)
