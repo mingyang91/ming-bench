@@ -118,7 +118,11 @@ function evaluateProgram(input) {
     if (expressions.length === 0) {
         throw new EvalError('empty input', START_POSITION);
     }
-    const context = { output: [], dynamicWindStack: [], exceptionHandlers: [] };
+    const context = {
+        output: [],
+        dynamicWindStack: undefined,
+        exceptionHandlers: undefined,
+    };
     const env = createGlobalEnv(context);
     const result = runEvalStep(evaluateSequenceCps(expressions, env, completeEval));
     return { result, output: context.output.join('') };
@@ -317,76 +321,104 @@ function runEvalStep(step) {
     }
     return current.value;
 }
+function pushStack(stack, value) {
+    return {
+        value,
+        parent: stack,
+        depth: (stack?.depth ?? 0) + 1,
+    };
+}
 function continuationValue(context, windStack, handlerStack, resume) {
     return { type: 'continuation', context, windStack, handlerStack, resume };
 }
-function sharedDynamicWindDepth(left, right) {
-    let index = 0;
-    while (index < left.length && index < right.length && left[index] === right[index]) {
-        index += 1;
+function sharedStackAncestor(left, right) {
+    let leftCursor = left;
+    let rightCursor = right;
+    while ((leftCursor?.depth ?? 0) > (rightCursor?.depth ?? 0)) {
+        leftCursor = leftCursor?.parent;
     }
-    return index;
+    while ((rightCursor?.depth ?? 0) > (leftCursor?.depth ?? 0)) {
+        rightCursor = rightCursor?.parent;
+    }
+    while (leftCursor !== rightCursor) {
+        leftCursor = leftCursor?.parent;
+        rightCursor = rightCursor?.parent;
+    }
+    return leftCursor;
+}
+function stackPathFromAncestor(targetStack, ancestor) {
+    const path = [];
+    let cursor = targetStack;
+    while (cursor !== ancestor) {
+        if (cursor === undefined) {
+            throw new EvalError('internal stack mismatch');
+        }
+        path.push(cursor);
+        cursor = cursor.parent;
+    }
+    path.reverse();
+    return path;
 }
 function transitionDynamicWind(context, targetStack, callPosition, continuation, beforeRewind) {
     return suspendStep(() => {
         const currentStack = context.dynamicWindStack;
-        const sharedDepth = sharedDynamicWindDepth(currentStack, targetStack);
-        return unwindDynamicWindFrames(context, currentStack, targetStack, sharedDepth, callPosition, continuation, beforeRewind);
+        const sharedAncestor = sharedStackAncestor(currentStack, targetStack);
+        return unwindDynamicWindFrames(context, currentStack, targetStack, sharedAncestor, callPosition, continuation, beforeRewind);
     });
 }
-function unwindDynamicWindFrames(context, currentStack, targetStack, sharedDepth, callPosition, continuation, beforeRewind) {
+function unwindDynamicWindFrames(context, currentStack, targetStack, sharedAncestor, callPosition, continuation, beforeRewind) {
     return suspendStep(() => {
-        if (currentStack.length <= sharedDepth) {
+        if (currentStack === sharedAncestor) {
             beforeRewind?.();
-            return rewindDynamicWindFrames(context, targetStack, sharedDepth, callPosition, continuation);
+            return rewindDynamicWindFrames(context, targetStack, sharedAncestor, callPosition, continuation);
         }
-        const frameIndex = currentStack.length - 1;
-        const frame = currentStack[frameIndex];
-        const nextStack = currentStack.slice(0, frameIndex);
+        if (currentStack === undefined) {
+            throw new EvalError('dynamic-wind: internal error', callPosition);
+        }
+        const frame = currentStack.value;
+        const nextStack = currentStack.parent;
         context.dynamicWindStack = nextStack;
-        return applyProcedureCps(frame.outThunk, [], callPosition, () => unwindDynamicWindFrames(context, nextStack, targetStack, sharedDepth, callPosition, continuation, beforeRewind));
+        return applyProcedureCps(frame.outThunk, [], callPosition, () => unwindDynamicWindFrames(context, nextStack, targetStack, sharedAncestor, callPosition, continuation, beforeRewind));
     });
 }
-function rewindDynamicWindFrames(context, targetStack, index, callPosition, continuation) {
+function rewindDynamicWindFrames(context, targetStack, sharedAncestor, callPosition, continuation) {
+    return rewindDynamicWindFramesPath(context, targetStack, stackPathFromAncestor(targetStack, sharedAncestor), callPosition, continuation);
+}
+function rewindDynamicWindFramesPath(context, targetStack, path, callPosition, continuation, index = 0) {
     return suspendStep(() => {
-        if (index >= targetStack.length) {
+        if (index >= path.length) {
             context.dynamicWindStack = targetStack;
             return continuation();
         }
-        const frame = targetStack[index];
-        const currentStack = targetStack.slice(0, index);
-        context.dynamicWindStack = currentStack;
-        return applyProcedureCps(frame.inThunk, [], callPosition, () => {
-            context.dynamicWindStack = targetStack.slice(0, index + 1);
-            return rewindDynamicWindFrames(context, targetStack, index + 1, callPosition, continuation);
+        const nextStack = path[index];
+        context.dynamicWindStack = nextStack.parent;
+        return applyProcedureCps(nextStack.value.inThunk, [], callPosition, () => {
+            context.dynamicWindStack = nextStack;
+            return rewindDynamicWindFramesPath(context, targetStack, path, callPosition, continuation, index + 1);
         });
     });
 }
-function invokeContinuationValue(value, argument, callPosition) {
-    return transitionDynamicWind(value.context, value.windStack, callPosition, () => value.resume(argument), () => {
-        value.context.exceptionHandlers = [...value.handlerStack];
+function invokeContinuationValue(value, arguments_, callPosition) {
+    return transitionDynamicWind(value.context, value.windStack, callPosition, () => value.resume(arguments_), () => {
+        value.context.exceptionHandlers = value.handlerStack;
     });
 }
 function pushExceptionHandlerFrame(context, frame) {
-    context.exceptionHandlers = [...context.exceptionHandlers, frame];
+    context.exceptionHandlers = pushStack(context.exceptionHandlers, frame);
 }
 function removeExceptionHandlerFrame(context, frame) {
-    const index = context.exceptionHandlers.lastIndexOf(frame);
-    if (index < 0) {
+    if (context.exceptionHandlers?.value !== frame) {
         return;
     }
-    context.exceptionHandlers = [
-        ...context.exceptionHandlers.slice(0, index),
-        ...context.exceptionHandlers.slice(index + 1),
-    ];
+    context.exceptionHandlers = context.exceptionHandlers.parent;
 }
 function raiseException(context, exception, raisePosition) {
     return suspendStep(() => {
-        const handlerFrame = context.exceptionHandlers[context.exceptionHandlers.length - 1];
+        const handlerFrame = context.exceptionHandlers?.value;
         if (handlerFrame === undefined) {
             throw new EvalError(`uncaught exception: ${formatValue(exception)}`, raisePosition);
         }
-        const previousHandlers = context.exceptionHandlers.slice(0, -1);
+        const previousHandlers = context.exceptionHandlers?.parent;
         return transitionDynamicWind(context, handlerFrame.windStack, raisePosition, () => {
             context.exceptionHandlers = previousHandlers;
             return handlerFrame.handle(exception, raisePosition);
@@ -805,8 +837,7 @@ function applyProcedureCps(value, args, callPosition, continuation) {
                     return applyClosureCps({ type: 'closure', env: value.env, ...clause }, args, callPosition, 'case-lambda', continuation);
                 }
                 case 'continuation':
-                    requireArgCount('continuation', args.length, 1, callPosition);
-                    return invokeContinuationValue(value, args[0].value, callPosition);
+                    return invokeContinuationValue(value, args.map((arg) => arg.value), callPosition);
                 default:
                     throw new EvalError('attempted to call a non-procedure', callPosition);
             }
@@ -2237,7 +2268,7 @@ function createGlobalEnv(context) {
         requireArgCount(name, args.length, 1, callPosition);
         return applyProcedureCps(args[0].value, [
             {
-                value: continuationValue(context, [...context.dynamicWindStack], [...context.exceptionHandlers], (value) => continueWith(continuation, value)),
+                value: continuationValue(context, context.dynamicWindStack, context.exceptionHandlers, (values) => continueWith(continuation, multiValueResult(values))),
                 position: callPosition,
             },
         ], callPosition, continuation);
@@ -2246,12 +2277,12 @@ function createGlobalEnv(context) {
         throw new EvalError('dynamic-wind: internal error', callPosition);
     }, (args, callPosition, continuation) => {
         requireArgCount('dynamic-wind', args.length, 3, callPosition);
-        const baseStack = [...context.dynamicWindStack];
+        const baseStack = context.dynamicWindStack;
         const frame = {
             inThunk: args[0].value,
             outThunk: args[2].value,
         };
-        return transitionDynamicWind(context, [...baseStack, frame], callPosition, () => applyProcedureCps(args[1].value, [], callPosition, (bodyValue) => transitionDynamicWind(context, baseStack, callPosition, () => continueWith(continuation, bodyValue))));
+        return transitionDynamicWind(context, pushStack(baseStack, frame), callPosition, () => applyProcedureCps(args[1].value, [], callPosition, (bodyValue) => transitionDynamicWind(context, baseStack, callPosition, () => continueWith(continuation, bodyValue))));
     });
     const raiseBuiltin = builtin('raise', (_args, callPosition) => {
         throw new EvalError('raise: internal error', callPosition);
@@ -2264,7 +2295,7 @@ function createGlobalEnv(context) {
     }, (args, callPosition, continuation) => {
         requireArgCount('with-exception-handler', args.length, 2, callPosition);
         const frame = {
-            windStack: [...context.dynamicWindStack],
+            windStack: context.dynamicWindStack,
             handle: (exception, raisePosition) => applyProcedureCps(args[0].value, [{ value: exception, position: raisePosition }], raisePosition, () => {
                 throw new EvalError('raise: handler returned', raisePosition);
             }),
