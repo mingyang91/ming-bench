@@ -40,8 +40,7 @@ object Evaluator:
   private def evalExpr(expr: SchemeVal, env: Env): Step =
     expr match
       case SchemeVal.SInt(_) | SchemeVal.SFloat(_) | SchemeVal.SRational(_, _) | SchemeVal.SBool(_) |
-          SchemeVal.SString(_, _) | SchemeVal.SChar(_) | SchemeVal.SVoid | SchemeVal.SPair(_, _) |
-          SchemeVal.SVector(_) =>
+          SchemeVal.SString(_, _) | SchemeVal.SChar(_) | SchemeVal.SVoid | SchemeVal.SPair(_) | SchemeVal.SVector(_) =>
         Step.Ret(expr)
       case SchemeVal.SSymbol(name) => Step.Ret(env.get(name))
       case SchemeVal.SList(elems)  => dispatchList(elems, env)

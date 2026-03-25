@@ -7,6 +7,13 @@ object HigherOrder:
   val outputBuffer: ThreadLocal[StringBuilder] =
     ThreadLocal.withInitial(() => new StringBuilder())
 
+  private def toList(name: String, v: SchemeVal): List[SchemeVal] =
+    SchemeVal
+      .toScalaList(v)
+      .getOrElse(
+        throw new EvalError(s"$name: expected list, got ${v.display}")
+      )
+
   def apply(
     name: String,
     args: List[SchemeVal],
@@ -27,38 +34,26 @@ object HigherOrder:
         SchemeVal.SVoid
       case "apply" =>
         if args.length < 2 then throw new EvalError("apply: expected at least 2 arguments")
-        val proc = args.head
-        val lastArg = args.last match
-          case SchemeVal.SList(elems) => elems
-          case other =>
-            throw new EvalError(
-              s"apply: last argument must be a list, got ${other.display}"
-            )
+        val proc       = args.head
+        val lastArg    = toList("apply", args.last)
         val prefixArgs = args.slice(1, args.length - 1)
         applyProc(proc, prefixArgs ++ lastArg)
       case "map" =>
         if args.length < 2 then throw new EvalError("map: expected at least 2 arguments")
-        val proc = args.head
-        val lists = args.tail.map {
-          case SchemeVal.SList(elems) => elems
-          case other =>
-            throw new EvalError(s"map: expected list, got ${other.display}")
-        }
-        val len = lists.head.length
+        val proc  = args.head
+        val lists = args.tail.map(toList("map", _))
+        val len   = lists.head.length
         val result = (0 until len).map { i =>
           val mapArgs = lists.map(_(i))
           applyProc(proc, mapArgs)
         }.toList
-        SchemeVal.SList(result)
+        if result.isEmpty then SchemeVal.SList(Nil)
+        else SchemeVal.buildList(result)
       case "for-each" =>
         if args.length < 2 then throw new EvalError("for-each: expected at least 2 arguments")
-        val proc = args.head
-        val lists = args.tail.map {
-          case SchemeVal.SList(elems) => elems
-          case other =>
-            throw new EvalError(s"for-each: expected list, got ${other.display}")
-        }
-        val len = lists.head.length
+        val proc  = args.head
+        val lists = args.tail.map(toList("for-each", _))
+        val len   = lists.head.length
         (0 until len).foreach { i =>
           val feArgs = lists.map(_(i))
           applyProc(proc, feArgs)

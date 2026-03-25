@@ -124,19 +124,35 @@ object StringOps:
       case "string->list" =>
         requireOne("string->list", args) match
           case SchemeVal.SString(s, _) =>
-            SchemeVal.SList(s.toString.toList.map(SchemeVal.SChar(_)))
+            val chars = s.toString.toList.map(SchemeVal.SChar(_))
+            if chars.isEmpty then SchemeVal.SList(Nil)
+            else SchemeVal.buildList(chars)
           case other =>
             throw new EvalError(s"string->list: expected string, got ${other.display}")
       case "list->string" =>
-        requireOne("list->string", args) match
-          case SchemeVal.SList(elems) =>
-            val chars = elems.map {
-              case SchemeVal.SChar(c) => c
-              case other              => throw new EvalError(s"list->string: expected char, got ${other.display}")
-            }
-            SchemeVal.SString(new StringBuilder(chars.mkString), true)
-          case other =>
-            throw new EvalError(s"list->string: expected list, got ${other.display}")
+        val elems = SchemeVal
+          .toScalaList(requireOne("list->string", args))
+          .getOrElse(
+            throw new EvalError("list->string: expected list")
+          )
+        val chars = elems.map {
+          case SchemeVal.SChar(c) => c
+          case other              => throw new EvalError(s"list->string: expected char, got ${other.display}")
+        }
+        SchemeVal.SString(new StringBuilder(chars.mkString), true)
+      case "make-string" =>
+        args match
+          case SchemeVal.SInt(n) :: Nil =>
+            SchemeVal.SString(new StringBuilder(" " * n.toInt), true)
+          case SchemeVal.SInt(n) :: SchemeVal.SChar(c) :: Nil =>
+            SchemeVal.SString(new StringBuilder(c.toString * n.toInt), true)
+          case _ => throw new EvalError("make-string: expected (length) or (length char)")
+      case "string" =>
+        val chars = args.map {
+          case SchemeVal.SChar(c) => c
+          case other              => throw new EvalError(s"string: expected char, got ${other.display}")
+        }
+        SchemeVal.SString(new StringBuilder(chars.mkString), true)
       case _ => throw new EvalError(s"unknown string op: $name")
 
   private def applyCompareCase(name: String, args: List[SchemeVal]): SchemeVal =
@@ -147,6 +163,15 @@ object StringOps:
       case "string<?" =>
         val (a, b) = requireTwo(name, args)
         SchemeVal.SBool(asString(a).toString < asString(b).toString)
+      case "string>?" =>
+        val (a, b) = requireTwo(name, args)
+        SchemeVal.SBool(asString(a).toString > asString(b).toString)
+      case "string<=?" =>
+        val (a, b) = requireTwo(name, args)
+        SchemeVal.SBool(asString(a).toString <= asString(b).toString)
+      case "string>=?" =>
+        val (a, b) = requireTwo(name, args)
+        SchemeVal.SBool(asString(a).toString >= asString(b).toString)
       case "string-ci=?" =>
         val (a, b) = requireTwo(name, args)
         SchemeVal.SBool(

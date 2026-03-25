@@ -115,6 +115,33 @@ object NumericOps:
         val (a, b) = requireTwo("expt", args)
         val base   = asInt(a); val exp = asInt(b)
         SchemeVal.SInt(Math.pow(base.toDouble, exp.toDouble).toLong)
+      case "gcd" =>
+        if args.isEmpty then SchemeVal.SInt(0)
+        else
+          val ints                           = args.map(asInt)
+          def gcdTwo(a: Long, b: Long): Long = if b == 0 then a.abs else gcdTwo(b, a % b)
+          SchemeVal.SInt(ints.reduce((a, b) => gcdTwo(a, b)))
+      case "lcm" =>
+        if args.isEmpty then SchemeVal.SInt(1)
+        else
+          val ints                           = args.map(asInt)
+          def gcdTwo(a: Long, b: Long): Long = if b == 0 then a.abs else gcdTwo(b, a % b)
+          def lcmTwo(a: Long, b: Long): Long = if a == 0 && b == 0 then 0 else (a / gcdTwo(a, b) * b).abs
+          SchemeVal.SInt(ints.reduce(lcmTwo))
+      case "truncate" =>
+        val v = requireOne("truncate", args)
+        v match
+          case SchemeVal.SInt(_)         => v
+          case SchemeVal.SFloat(d)       => SchemeVal.SInt(d.toLong)
+          case SchemeVal.SRational(n, d) => SchemeVal.SInt(n / d)
+          case _                         => throw new EvalError(s"truncate: expected number, got ${v.display}")
+      case "round" =>
+        val v = requireOne("round", args)
+        v match
+          case SchemeVal.SInt(_)         => v
+          case SchemeVal.SFloat(d)       => SchemeVal.SInt(Math.round(d))
+          case SchemeVal.SRational(n, d) => SchemeVal.SInt(Math.round(n.toDouble / d.toDouble))
+          case _                         => throw new EvalError(s"round: expected number, got ${v.display}")
       case _ => throw new EvalError(s"unknown arithmetic op: $name")
 
   def applyComparison(name: String, args: List[SchemeVal]): SchemeVal =
