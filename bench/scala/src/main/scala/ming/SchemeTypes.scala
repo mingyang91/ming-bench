@@ -35,4 +35,11 @@ private[ming] class Env(
   def define(name: String, value: Expr): Unit =
     bindings(name) = value
 
+  def set(name: String, value: Expr): Unit =
+    if bindings.contains(name) then bindings(name) = value
+    else
+      parent match
+        case Some(p) => p.set(name, value)
+        case None    => throw EvalError(s"unbound variable: $name")
+
   def child(): Env = Env(mutable.Map.empty, Some(this))

@@ -16,6 +16,7 @@ object Evaluator:
           args.head
         case Expr.Lst(Expr.Sym("if") :: args)      => evalIf(args, env)
         case Expr.Lst(Expr.Sym("define") :: args)  => evalDefine(args, env)
+        case Expr.Lst(Expr.Sym("set!") :: args)    => evalSet(args, env)
         case Expr.Lst(Expr.Sym("lambda") :: args)  => evalLambda(args, env)
         case Expr.Lst(Expr.Sym("let") :: args)     => evalLet(args, env)
         case Expr.Lst(Expr.Sym("begin") :: args)   => evalBegin(args, env)
@@ -46,6 +47,12 @@ object Evaluator:
       env.define(name, Expr.Lambda(paramNames, body, env))
       Expr.Bool(false)
     case _ => throw EvalError("define: invalid syntax")
+
+  private def evalSet(args: List[Expr], env: Env): Expr = args match
+    case Expr.Sym(name) :: value :: Nil =>
+      env.set(name, eval(value, env))
+      Expr.Bool(false)
+    case _ => throw EvalError("set!: invalid syntax")
 
   private def evalLambda(args: List[Expr], env: Env): Expr = args match
     case Expr.Lst(params) :: body if body.nonEmpty =>
