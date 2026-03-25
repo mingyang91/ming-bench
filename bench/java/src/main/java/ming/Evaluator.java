@@ -48,7 +48,7 @@ public class Evaluator {
 
     // --- Lambda (closure) ---
 
-    private record Lambda(List<String> params, List<Object> body, Env closureEnv) {}
+    private record Lambda(List<String> params, String restParam, List<Object> body, Env closureEnv) {}
 
     // Sentinel for void (define returns this)
     private static final Object VOID = new Object() {
@@ -216,6 +216,29 @@ public class Evaluator {
             if (!(args.get(2) instanceof SchemeChar ch)) throw new EvalError("string-set!: expected char");
             s.setChar(idx, ch.value());
             return VOID;
+        });
+        globalEnv.define("apply", (BuiltinProc) args -> {
+            if (args.size() < 2) throw new EvalError("apply: requires at least 2 arguments");
+            Object proc = args.get(0);
+            // Last argument must be a list; preceding args are prepended
+            Object lastArg = args.get(args.size() - 1);
+            List<Object> callArgs = new ArrayList<>();
+            for (int i = 1; i < args.size() - 1; i++) {
+                callArgs.add(args.get(i));
+            }
+            // Convert last arg (scheme list) to java list
+            Object curr = lastArg;
+            while (curr instanceof Pair p) {
+                callArgs.add(p.car);
+                curr = p.cdr;
+            }
+            if (proc instanceof BuiltinProc builtin) {
+                return builtin.apply(callArgs);
+            }
+            if (proc instanceof Lambda lambda) {
+                return applyLambda(lambda, callArgs);
+            }
+            throw new EvalError("apply: not a procedure");
         });
     }
 
@@ -501,13 +524,21 @@ public class Evaluator {
                             if (nameObj instanceof SourceExpr se2) nameObj = se2.expr;
                             String name = (String) nameObj;
                             List<String> params = new ArrayList<>();
+                            String restParam = null;
                             for (int i = 1; i < sig.size(); i++) {
                                 Object p = sig.get(i);
                                 if (p instanceof SourceExpr se2) p = se2.expr;
+                                if (".".equals(p)) {
+                                    if (i + 1 >= sig.size()) throw new EvalError("bad syntax: define");
+                                    Object rp = sig.get(i + 1);
+                                    if (rp instanceof SourceExpr se3) rp = se3.expr;
+                                    restParam = (String) rp;
+                                    break;
+                                }
                                 params.add((String) p);
                             }
                             List<Object> body = new ArrayList<>(list.subList(2, list.size()));
-                            env.define(name, new Lambda(params, body, env));
+                            env.define(name, new Lambda(params, restParam, body, env));
                         } else {
                             throw new EvalError("bad syntax: define");
                         }
@@ -517,14 +548,27 @@ public class Evaluator {
                         if (list.size() < 3) throw new EvalError("bad syntax: lambda");
                         Object paramObj = list.get(1);
                         if (paramObj instanceof SourceExpr se) paramObj = se.expr;
+                        List<Object> body = new ArrayList<>(list.subList(2, list.size()));
+                        if (paramObj instanceof String restOnly) {
+                            // (lambda args body) - single rest param
+                            return new Lambda(List.of(), restOnly, body, env);
+                        }
                         List<?> paramList = (List<?>) paramObj;
                         List<String> params = new ArrayList<>();
-                        for (Object p : paramList) {
+                        String restParam = null;
+                        for (int i = 0; i < paramList.size(); i++) {
+                            Object p = paramList.get(i);
                             if (p instanceof SourceExpr se) p = se.expr;
+                            if (".".equals(p)) {
+                                if (i + 1 >= paramList.size()) throw new EvalError("bad syntax: lambda");
+                                Object rp = paramList.get(i + 1);
+                                if (rp instanceof SourceExpr se2) rp = se2.expr;
+                                restParam = (String) rp;
+                                break;
+                            }
                             params.add((String) p);
                         }
-                        List<Object> body = new ArrayList<>(list.subList(2, list.size()));
-                        return new Lambda(params, body, env);
+                        return new Lambda(params, restParam, body, env);
                     }
                     case "let" -> {
                         int offset;
@@ -555,7 +599,7 @@ public class Evaluator {
 
                         if (loopName != null) {
                             Env letEnv = new Env(env);
-                            Lambda loopLambda = new Lambda(params, body, letEnv);
+                            Lambda loopLambda = new Lambda(params, null, body, letEnv);
                             letEnv.define(loopName, loopLambda);
                             List<Object> args = new ArrayList<>();
                             for (Object init : inits) {
@@ -655,16 +699,34 @@ public class Evaluator {
     }
 
     private Object applyLambda(Lambda lambda, List<Object> args) throws EvalError {
-        if (args.size() != lambda.params.size()) {
-            throw new EvalError("wrong number of arguments: expected " + lambda.params.size() + ", got " + args.size());
+        int required = lambda.params.size();
+        if (lambda.restParam != null) {
+            if (args.size() < required) {
+                throw new EvalError("wrong number of arguments: expected at least " + required + ", got " + args.size());
+            }
+        } else {
+            if (args.size() != required) {
+                throw new EvalError("wrong number of arguments: expected " + required + ", got " + args.size());
+            }
         }
         Env callEnv = new Env(lambda.closureEnv);
-        for (int i = 0; i < lambda.params.size(); i++) {
+        for (int i = 0; i < required; i++) {
             callEnv.define(lambda.params.get(i), args.get(i));
+        }
+        if (lambda.restParam != null) {
+            callEnv.define(lambda.restParam, javaListToScheme(args.subList(required, args.size())));
         }
         Object result = VOID;
         for (Object bodyExpr : lambda.body) {
             result = eval(bodyExpr, callEnv);
+        }
+        return result;
+    }
+
+    private Object javaListToScheme(List<Object> items) {
+        Object result = NIL;
+        for (int i = items.size() - 1; i >= 0; i--) {
+            result = new Pair(items.get(i), result);
         }
         return result;
     }
