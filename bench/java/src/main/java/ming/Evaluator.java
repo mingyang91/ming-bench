@@ -30,7 +30,7 @@ public class Evaluator {
         Parser parser = new Parser(input);
         List<Expr> expressions = parser.parseProgram();
         if (expressions.isEmpty()) {
-            throw new EvalError("empty input");
+            throw new EvalError("empty input", 1, 1);
         }
 
         Environment environment = createGlobalEnvironment();
@@ -95,7 +95,8 @@ public class Evaluator {
         if (expression instanceof ListExpr listExpr) {
             return evalList(listExpr, environment);
         }
-        throw new EvalError("unsupported expression");
+        throw new EvalError("unsupported expression", expression.pos().line(),
+                expression.pos().column());
     }
 
     private Value evalList(ListExpr expression, Environment environment) throws EvalError {
@@ -594,7 +595,8 @@ public class Evaluator {
         if (expression instanceof ListExpr listExpr) {
             return quoteList(listExpr.elements());
         }
-        throw new EvalError("unsupported quoted expression");
+        throw new EvalError("unsupported quoted expression", expression.pos().line(),
+                expression.pos().column());
     }
 
     private Value quoteList(List<Expr> expressions) throws EvalError {
@@ -675,7 +677,7 @@ public class Evaluator {
     }
 
     private EvalError error(String message, SourcePos pos) {
-        return new EvalError(message + " at " + pos);
+        return new EvalError(message, pos.line(), pos.column());
     }
 
     private enum Comparison {
@@ -811,7 +813,7 @@ public class Evaluator {
             if (parent != null) {
                 return parent.lookup(name, pos);
             }
-            throw new EvalError("unbound variable: " + name + " at " + pos);
+            throw new EvalError("unbound variable: " + name, pos.line(), pos.column());
         }
     }
 
@@ -1032,7 +1034,7 @@ public class Evaluator {
         }
 
         private EvalError error(String message, SourcePos pos) {
-            return new EvalError(message + " at " + pos);
+            return new EvalError(message, pos.line(), pos.column());
         }
     }
 }
