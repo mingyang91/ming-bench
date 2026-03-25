@@ -26,7 +26,8 @@ type SchemeVal =
   | { tag: 'case-lambda'; clauses: { params: string[]; rest?: string; body: SchemeVal[] }[]; env: Env; pos?: Pos }
   | { tag: 'vector'; elements: SchemeVal[]; pos?: Pos }
   | { tag: 'continuation'; k: Cont; winds: WindEntry[]; pos?: Pos }
-  | { tag: 'values'; vals: SchemeVal[]; pos?: Pos };
+  | { tag: 'values'; vals: SchemeVal[]; pos?: Pos }
+  | { tag: 'syntax-case-macro'; transformer: SchemeVal; defEnv: Env; pos?: Pos };
 
 function posStr(pos?: Pos): string {
   return pos ? `${pos.line}:${pos.col}` : '?:?';
@@ -760,6 +761,17 @@ function makeGlobalEnv(): Env {
     return { tag: 'boolean', value: v.tag === 'lambda' || v.tag === 'builtin' || v.tag === 'case-lambda' || v.tag === 'continuation' };
   });
 
+  // syntax-case support
+  defBuiltin('syntax->datum', (args) => {
+    if (args.length !== 1) throw new EvalError('syntax->datum: expected 1 argument');
+    return args[0];
+  });
+
+  defBuiltin('datum->syntax', (args) => {
+    if (args.length !== 2) throw new EvalError('datum->syntax: expected 2 arguments');
+    return args[1];
+  });
+
   // for-each (uses applySync for CPS compatibility)
   defBuiltin('for-each', (args) => {
     if (args.length < 2) throw new EvalError('for-each: expected at least 2 arguments');
@@ -1159,6 +1171,10 @@ function tokenize(input: string): Token[] {
       continue;
     }
     if (ch === '#') {
+      if (input[i + 1] === '\'') {
+        advance(); advance();
+        tokens.push({ text: "#'", pos: startPos }); continue;
+      }
       if (input[i + 1] === 't' && (i + 2 >= input.length || /[\s()]/.test(input[i + 2]))) {
         advance(); advance();
         tokens.push({ text: '#t', pos: startPos }); continue;
@@ -1196,6 +1212,10 @@ function parse(tokens: Token[]): SchemeVal[] {
     if (tok.text === "'") {
       const inner = parseExpr();
       return { tag: 'list', elements: [{ tag: 'symbol', value: 'quote', pos: tok.pos }, inner], pos: tok.pos };
+    }
+    if (tok.text === "#'") {
+      const inner = parseExpr();
+      return { tag: 'list', elements: [{ tag: 'symbol', value: 'syntax', pos: tok.pos }, inner], pos: tok.pos };
     }
     return parseAtom(tok);
   }
@@ -1267,9 +1287,13 @@ function gensym(prefix: string): string {
 
 const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'lambda', 'case-lambda', 'set!', 'begin', 'let', 'let*', 'letrec', 'letrec*',
-  'cond', 'and', 'or', 'not', 'define-syntax', 'syntax-rules', 'case', 'do',
+  'cond', 'and', 'or', 'not', 'define-syntax', 'syntax-rules', 'syntax-case', 'syntax', 'with-syntax', 'case', 'do',
   'call/cc', 'call-with-current-continuation', 'guard',
 ]);
+
+// ── Syntax-case support ──────────────────────────────────────────
+let syntaxBindingsStack: Map<string, MatchBinding>[] = [];
+let pendingSyntaxRenames: Array<{ original: string; renamed: string; defEnv: Env }> = [];
 
 type MatchBinding =
   | { ellipsis: false; value: SchemeVal }
@@ -1318,6 +1342,8 @@ function collectIntroduced(template: SchemeVal, patVars: Set<string>, result: Se
       result.add(template.value);
     }
   } else if (template.tag === 'list') {
+    // Don't descend into quoted forms — quoted symbols are data, not identifiers
+    if (template.elements.length >= 1 && template.elements[0].tag === 'symbol' && template.elements[0].value === 'quote') return;
     for (const elem of template.elements) collectIntroduced(elem, patVars, result);
   }
 }
@@ -1347,6 +1373,10 @@ function expandTemplate(
     return template;
   }
   if (template.tag === 'list') {
+    // Don't expand inside quoted forms
+    if (template.elements.length >= 1 && template.elements[0].tag === 'symbol' && template.elements[0].value === 'quote') {
+      return template;
+    }
     const result: SchemeVal[] = [];
     for (let i = 0; i < template.elements.length; i++) {
       if (i + 1 < template.elements.length &&
@@ -1971,9 +2001,17 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
       if (elems[1].tag !== 'symbol') throw errAt('define-syntax: expected symbol', epos);
       const name = elems[1].value;
       const transformer = elems[2];
+      // Check if transformer is (lambda (stx) ...) for syntax-case macros
+      if (transformer.tag === 'list' && transformer.elements.length >= 3 &&
+          transformer.elements[0].tag === 'symbol' && transformer.elements[0].value === 'lambda') {
+        return evalCPS(transformer, env, (lambdaVal) => {
+          env.define(name, { tag: 'syntax-case-macro', transformer: lambdaVal, defEnv: env });
+          return k({ tag: 'void' });
+        });
+      }
       if (transformer.tag !== 'list' || transformer.elements.length < 2 ||
           transformer.elements[0].tag !== 'symbol' || transformer.elements[0].value !== 'syntax-rules') {
-        throw errAt('define-syntax: expected syntax-rules', epos);
+        throw errAt('define-syntax: expected syntax-rules or lambda', epos);
       }
       const srElems = transformer.elements;
       if (srElems[1].tag !== 'list') throw errAt('syntax-rules: expected literals list', epos);
@@ -2123,12 +2161,113 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
       });
     }
 
+    if (op === 'syntax-case') {
+      // (syntax-case expr (literals) clause ...)
+      if (elems.length < 4) throw errAt('syntax-case: bad syntax', epos);
+      return evalCPS(elems[1], env, (stxVal) => {
+        if (elems[2].tag !== 'list') throw errAt('syntax-case: expected literals list', epos);
+        const literals = elems[2].elements.map(e => {
+          if (e.tag !== 'symbol') throw errAt('syntax-case: literal must be symbol', epos);
+          return e.value;
+        });
+        const litSet = new Set(literals);
+        const inputElems = stxVal.tag === 'list' ? stxVal.elements : [stxVal];
+        for (let ci = 3; ci < elems.length; ci++) {
+          const clause = elems[ci];
+          if (clause.tag !== 'list' || clause.elements.length < 2)
+            throw errAt('syntax-case: bad clause', epos);
+          const pattern = clause.elements[0];
+          const patElems = pattern.tag === 'list' ? pattern.elements : [pattern];
+          const bindings = new Map<string, MatchBinding>();
+          if (matchPattern(patElems, inputElems, litSet, bindings)) {
+            // Merge with any outer syntax bindings
+            const merged = new Map<string, MatchBinding>();
+            if (syntaxBindingsStack.length > 0) {
+              const outer = syntaxBindingsStack[syntaxBindingsStack.length - 1];
+              for (const [k2, v] of outer) merged.set(k2, v);
+            }
+            for (const [k2, v] of bindings) merged.set(k2, v);
+            syntaxBindingsStack.push(merged);
+            // clause body: (pattern body) or (pattern fender body)
+            const body = clause.elements.length === 3 ? clause.elements[2] : clause.elements[1];
+            return evalCPS(body, env, (result) => {
+              syntaxBindingsStack.pop();
+              return k(result);
+            });
+          }
+        }
+        throw errAt('syntax-case: no matching pattern', epos);
+      });
+    }
+
+    if (op === 'syntax') {
+      if (elems.length !== 2) throw errAt('syntax: expected 1 argument', epos);
+      const template = elems[1];
+      if (syntaxBindingsStack.length === 0) throw errAt('syntax: not in syntax-case context', epos);
+      const bindings = syntaxBindingsStack[syntaxBindingsStack.length - 1];
+      const patVars = new Set(bindings.keys());
+      // For a single symbol that is a pattern variable, just return its value
+      if (template.tag === 'symbol' && bindings.has(template.value)) {
+        const b = bindings.get(template.value)!;
+        if (!b.ellipsis) return k(b.value);
+        throw errAt('syntax: ellipsis variable used outside ellipsis context', epos);
+      }
+      const introduced = new Set<string>();
+      collectIntroduced(template, patVars, introduced);
+      const renames = new Map<string, string>();
+      for (const sym of introduced) renames.set(sym, gensym(sym));
+      const expanded = expandTemplate(template, bindings, renames);
+      // Store renames for the macro invocation to apply hygiene
+      for (const [original, renamed] of renames) {
+        pendingSyntaxRenames.push({ original, renamed, defEnv: env });
+      }
+      return k(expanded);
+    }
+
+    if (op === 'with-syntax') {
+      // (with-syntax ((var expr) ...) body ...)
+      if (elems.length < 3) throw errAt('with-syntax: bad syntax', epos);
+      const bindSpecs = elems[1];
+      if (bindSpecs.tag !== 'list') throw errAt('with-syntax: expected binding list', epos);
+      const body = elems.slice(2);
+      function evalWithSyntaxBindings(idx: number): Bounce {
+        if (idx >= bindSpecs.elements.length) {
+          return evalSeqCPS(body, 0, env, k);
+        }
+        const spec = bindSpecs.elements[idx];
+        if (spec.tag !== 'list' || spec.elements.length !== 2 || spec.elements[0].tag !== 'symbol')
+          throw errAt('with-syntax: bad binding', epos);
+        const varName = spec.elements[0].value;
+        return evalCPS(spec.elements[1], env, (val) => {
+          // Add binding to syntax bindings stack
+          if (syntaxBindingsStack.length === 0) syntaxBindingsStack.push(new Map());
+          const current = syntaxBindingsStack[syntaxBindingsStack.length - 1];
+          current.set(varName, { ellipsis: false, value: val });
+          return evalWithSyntaxBindings(idx + 1);
+        });
+      }
+      return evalWithSyntaxBindings(0);
+    }
+
     // Check for macro application
     try {
       const macroVal = env.get(op);
       if (macroVal.tag === 'macro') {
         const expanded = expandMacro(macroVal, elems, env);
         return mkBounce(() => evalCPS(expanded, env, k));
+      }
+      if (macroVal.tag === 'syntax-case-macro') {
+        const formVal: SchemeVal = { tag: 'list', elements: elems };
+        pendingSyntaxRenames = [];
+        return applyCPS(macroVal.transformer, [formVal], epos, (expanded) => {
+          // Apply hygiene: copy renamed bindings from defEnv to useEnv
+          for (const { original, renamed, defEnv: dEnv } of pendingSyntaxRenames) {
+            try { env.define(renamed, dEnv.get(original)); }
+            catch { /* fresh introduced variable */ }
+          }
+          pendingSyntaxRenames = [];
+          return mkBounce(() => evalCPS(expanded, env, k));
+        });
       }
     } catch { /* not bound — fall through */ }
   }
@@ -2198,6 +2337,7 @@ function displayVal(val: SchemeVal, seen?: Set<SchemeVal>): string {
     case 'vector': return `#(${val.elements.map(e => displayVal(e, seen)).join(' ')})`;
     case 'continuation': return '#<continuation>';
     case 'values': return val.vals.map(v => displayVal(v, seen)).join('\n');
+    case 'syntax-case-macro': return '#<macro>';
   }
 }
 
@@ -2212,6 +2352,8 @@ export function evalStr(input: string): string {
   callccActive = false;
   windStack = [];
   exceptionHandlers = [];
+  syntaxBindingsStack = [];
+  pendingSyntaxRenames = [];
   const env = makeGlobalEnv();
   const result = runTrampoline(evalSeqCPS(exprs, 0, env, (v) => v));
   return displayVal(result);
@@ -2226,6 +2368,8 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   callccActive = false;
   windStack = [];
   exceptionHandlers = [];
+  syntaxBindingsStack = [];
+  pendingSyntaxRenames = [];
   const env = makeGlobalEnv();
   const result = runTrampoline(evalSeqCPS(exprs, 0, env, (v) => v));
   return { result: displayVal(result), output: outputBuffer };
