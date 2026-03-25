@@ -139,6 +139,7 @@ public class Evaluator {
             List<Expr> arguments = elements.subList(1, elements.size());
             return switch (symbolExpr.name()) {
                 case "define" -> evalDefine(arguments, environment, symbolExpr.pos());
+                case "set!" -> evalSet(arguments, environment, symbolExpr.pos());
                 case "if" -> evalIf(arguments, environment, symbolExpr.pos());
                 case "quote" -> evalQuote(arguments, symbolExpr.pos());
                 case "lambda" -> evalLambda(arguments, environment, symbolExpr.pos());
@@ -195,6 +196,20 @@ public class Evaluator {
         }
 
         throw error("'define' target must be a symbol or parameter list", target.pos());
+    }
+
+    private Value evalSet(List<Expr> arguments, Environment environment, SourcePos pos)
+            throws EvalError {
+        if (arguments.size() != 2) {
+            throw error("'set!' expects exactly 2 arguments", pos);
+        }
+        if (!(arguments.getFirst() instanceof SymbolExpr symbolExpr)) {
+            throw error("'set!' target must be a symbol", arguments.getFirst().pos());
+        }
+
+        Value value = eval(arguments.get(1), environment);
+        environment.assign(symbolExpr.name(), value, symbolExpr.pos());
+        return VoidValue.INSTANCE;
     }
 
     private Value evalIf(List<Expr> arguments, Environment environment, SourcePos pos)
@@ -1051,6 +1066,18 @@ public class Evaluator {
             }
             if (parent != null) {
                 return parent.lookup(name, pos);
+            }
+            throw new EvalError("unbound variable: " + name, pos.line(), pos.column());
+        }
+
+        private void assign(String name, Value value, SourcePos pos) throws EvalError {
+            if (bindings.containsKey(name)) {
+                bindings.put(name, value);
+                return;
+            }
+            if (parent != null) {
+                parent.assign(name, value, pos);
+                return;
             }
             throw new EvalError("unbound variable: " + name, pos.line(), pos.column());
         }
