@@ -30,6 +30,9 @@ pub enum EvalError {
     #[error("unsupported form: {name}")]
     UnsupportedForm { name: String },
 
+    #[error("continuations are not supported in this evaluation context")]
+    UnsupportedContinuationContext,
+
     #[error("macro error in {name}: {message}")]
     MacroError { name: String, message: String },
 

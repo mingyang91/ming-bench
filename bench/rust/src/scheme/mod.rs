@@ -450,11 +450,18 @@ enum Procedure {
     RecordConstructor(RecordConstructorProcedure),
     RecordPredicate(RecordPredicateProcedure),
     RecordAccessor(RecordAccessorProcedure),
+    CallCc(CallCcProcedure),
+    Continuation(ContinuationProcedure),
 }
 
 #[derive(Clone)]
 struct BuiltinProcedure {
     implementation: BuiltinFn,
+}
+
+#[derive(Clone)]
+struct CallCcProcedure {
+    name: String,
 }
 
 #[derive(Clone)]
@@ -508,6 +515,11 @@ struct RecordAccessorProcedure {
     name: String,
     record_type: RecordTypeRef,
     field_index: usize,
+}
+
+#[derive(Clone)]
+struct ContinuationProcedure {
+    frames: Vec<MachineFrame>,
 }
 
 #[derive(Clone)]
@@ -868,6 +880,8 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "vector?", builtin_vector_predicate);
     define_builtin(&env, "vector->list", builtin_vector_to_list);
     define_builtin(&env, "list->vector", builtin_list_to_vector);
+    define_callcc_builtin(&env, "call/cc");
+    define_callcc_builtin(&env, "call-with-current-continuation");
 
     env
 }
@@ -875,6 +889,13 @@ fn default_env() -> EnvRef {
 fn define_builtin(env: &EnvRef, name: &'static str, implementation: BuiltinFn) {
     let value = Value::Procedure(Rc::new(Procedure::Builtin(BuiltinProcedure {
         implementation,
+    })));
+    bind_value(env, name.to_string(), value);
+}
+
+fn define_callcc_builtin(env: &EnvRef, name: &'static str) {
+    let value = Value::Procedure(Rc::new(Procedure::CallCc(CallCcProcedure {
+        name: name.to_string(),
     })));
     bind_value(env, name.to_string(), value);
 }
@@ -947,9 +968,614 @@ enum TailOutcome {
     Next { expr: Expr, env: EnvRef },
 }
 
+#[derive(Clone)]
+enum MachineState {
+    Eval(Expr, EnvRef),
+    Value(Value),
+}
+
+#[derive(Clone)]
+enum CondMatchAction {
+    ReturnTestValue,
+    EvaluateBody(Vec<Expr>),
+}
+
+#[derive(Clone)]
+enum MachineFrame {
+    Sequence {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    DefineVar {
+        name: String,
+        env: EnvRef,
+    },
+    SetVar {
+        name: String,
+        env: EnvRef,
+    },
+    If {
+        consequent: Expr,
+        alternate: Option<Expr>,
+        env: EnvRef,
+    },
+    And {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    Or {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    Cond {
+        remaining_clauses: Vec<Expr>,
+        match_action: CondMatchAction,
+        env: EnvRef,
+    },
+    Let {
+        names: Vec<String>,
+        remaining_inits: Vec<Expr>,
+        values: Vec<Value>,
+        body: Vec<Expr>,
+        env: EnvRef,
+    },
+    CallOperator {
+        arg_exprs: Vec<Expr>,
+        env: EnvRef,
+    },
+    CallArg {
+        operator: Value,
+        evaluated: Vec<Value>,
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+}
+
 fn eval_program(exprs: &[Expr], ctx: &mut EvalContext) -> Result<Value, EvalError> {
     let env = default_env();
-    eval_tail_sequence(exprs, env, ctx)
+    eval_program_machine(exprs, env, ctx)
+}
+
+fn eval_program_machine(
+    exprs: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let mut frames = Vec::new();
+    let mut state = schedule_machine_sequence(exprs, env, &mut frames);
+
+    loop {
+        state = match state {
+            MachineState::Eval(expr, env) => eval_machine_expr(expr, env, ctx, &mut frames)?,
+            MachineState::Value(value) => match frames.pop() {
+                Some(frame) => resume_machine_frame(frame, value, ctx, &mut frames)?,
+                None => return Ok(value),
+            },
+        };
+    }
+}
+
+fn schedule_machine_sequence(
+    exprs: &[Expr],
+    env: EnvRef,
+    frames: &mut Vec<MachineFrame>,
+) -> MachineState {
+    let Some((first, rest)) = exprs.split_first() else {
+        return MachineState::Value(Value::Void);
+    };
+
+    if !rest.is_empty() {
+        frames.push(MachineFrame::Sequence {
+            remaining: rest.to_vec(),
+            env: env.clone(),
+        });
+    }
+
+    MachineState::Eval(first.clone(), env)
+}
+
+fn eval_machine_expr(
+    expr: Expr,
+    env: EnvRef,
+    ctx: &mut EvalContext,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    match expr {
+        Expr::Number(value) => Ok(MachineState::Value(Value::Number(value))),
+        Expr::Boolean(value) => Ok(MachineState::Value(Value::Boolean(value))),
+        Expr::String(value) => Ok(MachineState::Value(Value::String(SchemeString::new(value)))),
+        Expr::Char(value) => Ok(MachineState::Value(Value::Char(value))),
+        Expr::Symbol(name) => Ok(MachineState::Value(lookup(&env, &name)?)),
+        Expr::List(items) => eval_machine_list(items, env, ctx, frames),
+    }
+}
+
+fn eval_machine_list(
+    items: Vec<Expr>,
+    env: EnvRef,
+    ctx: &mut EvalContext,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    if items.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "cannot evaluate an empty list".to_string(),
+        });
+    }
+
+    if let Expr::Symbol(operator) = &items[0] {
+        let args = &items[1..];
+
+        match operator.as_str() {
+            "and" => return Ok(schedule_machine_and(args, env, frames)),
+            "or" => return Ok(schedule_machine_or(args, env, frames)),
+            "if" => return schedule_machine_if(args, env, frames),
+            "begin" => return Ok(schedule_machine_sequence(args, env, frames)),
+            "cond" => return schedule_machine_cond(args, env, frames),
+            "quote" => return Ok(MachineState::Value(eval_quote(args)?)),
+            "define" => return schedule_machine_define(args, env, ctx, frames),
+            "define-record-type" => {
+                return Ok(MachineState::Value(eval_define_record_type(args, env)?));
+            }
+            "define-syntax" => return Ok(MachineState::Value(eval_define_syntax(args, env)?)),
+            "set!" => return schedule_machine_set(args, env, frames),
+            "lambda" => return Ok(MachineState::Value(eval_lambda(args, env)?)),
+            "case-lambda" => return Ok(MachineState::Value(eval_case_lambda(args, env)?)),
+            "let" => return schedule_machine_let(args, env, ctx, frames),
+            _ => {}
+        }
+
+        if let Some(transformer) = lookup_macro(&env, operator) {
+            let (expanded, expansion_env) = expand_macro_call(transformer, &items, env, ctx)?;
+            return Ok(MachineState::Eval(expanded, expansion_env));
+        }
+
+        if is_special_form_name(operator) {
+            return Ok(MachineState::Value(eval_list(&items, env, ctx)?));
+        }
+    }
+
+    schedule_machine_application(items, env, frames)
+}
+
+fn schedule_machine_if(
+    args: &[Expr],
+    env: EnvRef,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    if !(2..=3).contains(&args.len()) {
+        return Err(EvalError::WrongArgumentCount {
+            name: "if".to_string(),
+            expected: "2 or 3".to_string(),
+            got: args.len(),
+        });
+    }
+
+    frames.push(MachineFrame::If {
+        consequent: args[1].clone(),
+        alternate: args.get(2).cloned(),
+        env: env.clone(),
+    });
+    Ok(MachineState::Eval(args[0].clone(), env))
+}
+
+fn schedule_machine_and(
+    args: &[Expr],
+    env: EnvRef,
+    frames: &mut Vec<MachineFrame>,
+) -> MachineState {
+    let Some((first, rest)) = args.split_first() else {
+        return MachineState::Value(Value::Boolean(true));
+    };
+
+    if !rest.is_empty() {
+        frames.push(MachineFrame::And {
+            remaining: rest.to_vec(),
+            env: env.clone(),
+        });
+    }
+
+    MachineState::Eval(first.clone(), env)
+}
+
+fn schedule_machine_or(args: &[Expr], env: EnvRef, frames: &mut Vec<MachineFrame>) -> MachineState {
+    let Some((first, rest)) = args.split_first() else {
+        return MachineState::Value(Value::Boolean(false));
+    };
+
+    if !rest.is_empty() {
+        frames.push(MachineFrame::Or {
+            remaining: rest.to_vec(),
+            env: env.clone(),
+        });
+    }
+
+    MachineState::Eval(first.clone(), env)
+}
+
+fn schedule_machine_cond(
+    clauses: &[Expr],
+    env: EnvRef,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    let Some((clause, remaining)) = clauses.split_first() else {
+        return Ok(MachineState::Value(Value::Void));
+    };
+
+    let Expr::List(items) = clause else {
+        return Err(EvalError::SyntaxError {
+            message: "cond clauses must be lists".to_string(),
+        });
+    };
+
+    if items.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "cond clauses cannot be empty".to_string(),
+        });
+    }
+
+    if let Expr::Symbol(symbol) = &items[0] {
+        if symbol == "else" {
+            if !remaining.is_empty() {
+                return Err(EvalError::SyntaxError {
+                    message: "cond else clause must be last".to_string(),
+                });
+            }
+
+            if items.len() == 1 {
+                return Ok(MachineState::Value(Value::Void));
+            }
+
+            return Ok(schedule_machine_sequence(&items[1..], env, frames));
+        }
+    }
+
+    let match_action = if items.len() == 1 {
+        CondMatchAction::ReturnTestValue
+    } else {
+        CondMatchAction::EvaluateBody(items[1..].to_vec())
+    };
+
+    frames.push(MachineFrame::Cond {
+        remaining_clauses: remaining.to_vec(),
+        match_action,
+        env: env.clone(),
+    });
+    Ok(MachineState::Eval(items[0].clone(), env))
+}
+
+fn schedule_machine_define(
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "define requires a binding target".to_string(),
+        });
+    }
+
+    match &args[0] {
+        Expr::Symbol(name) => {
+            expect_expr_arity("define", args, 2)?;
+            frames.push(MachineFrame::DefineVar {
+                name: name.clone(),
+                env: env.clone(),
+            });
+            Ok(MachineState::Eval(args[1].clone(), env))
+        }
+        Expr::List(signature) => {
+            if signature.is_empty() {
+                return Err(EvalError::SyntaxError {
+                    message: "define requires a function name".to_string(),
+                });
+            }
+
+            if args.len() < 2 {
+                return Err(EvalError::SyntaxError {
+                    message: "define requires a function body".to_string(),
+                });
+            }
+
+            let Expr::Symbol(name) = &signature[0] else {
+                return Err(EvalError::SyntaxError {
+                    message: "define function name must be a symbol".to_string(),
+                });
+            };
+
+            let params = parse_param_slice(&signature[1..])?;
+            let lambda = make_lambda(name.clone(), params, args[1..].to_vec(), env.clone());
+            bind_value(&env, name.clone(), lambda);
+            let _ = ctx;
+            Ok(MachineState::Value(Value::Void))
+        }
+        _ => Err(EvalError::SyntaxError {
+            message: "define requires a symbol or function signature".to_string(),
+        }),
+    }
+}
+
+fn schedule_machine_set(
+    args: &[Expr],
+    env: EnvRef,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    expect_expr_arity("set!", args, 2)?;
+
+    let Expr::Symbol(name) = &args[0] else {
+        return Err(EvalError::SyntaxError {
+            message: "set! requires a symbol target".to_string(),
+        });
+    };
+
+    frames.push(MachineFrame::SetVar {
+        name: name.clone(),
+        env: env.clone(),
+    });
+    Ok(MachineState::Eval(args[1].clone(), env))
+}
+
+fn schedule_machine_let(
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "let requires bindings".to_string(),
+        });
+    }
+
+    if matches!(args[0], Expr::Symbol(_)) {
+        return Ok(MachineState::Value(eval_let(args, env, ctx)?));
+    }
+
+    if args.len() < 2 {
+        return Err(EvalError::SyntaxError {
+            message: "let requires a body".to_string(),
+        });
+    }
+
+    let bindings = parse_let_bindings(&args[0])?;
+    let names = bindings
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let init_exprs = bindings
+        .into_iter()
+        .map(|(_, expr)| expr)
+        .collect::<Vec<_>>();
+
+    schedule_machine_let_bindings(names, init_exprs, args[1..].to_vec(), env, frames)
+}
+
+fn schedule_machine_let_bindings(
+    names: Vec<String>,
+    init_exprs: Vec<Expr>,
+    body: Vec<Expr>,
+    env: EnvRef,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    if body.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "let requires a body".to_string(),
+        });
+    }
+
+    let Some((first_init, rest_inits)) = init_exprs.split_first() else {
+        let let_env = Env::child(env);
+        return Ok(schedule_machine_sequence(&body, let_env, frames));
+    };
+
+    frames.push(MachineFrame::Let {
+        names,
+        remaining_inits: rest_inits.to_vec(),
+        values: Vec::new(),
+        body,
+        env: env.clone(),
+    });
+    Ok(MachineState::Eval(first_init.clone(), env))
+}
+
+fn schedule_machine_application(
+    items: Vec<Expr>,
+    env: EnvRef,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    frames.push(MachineFrame::CallOperator {
+        arg_exprs: items[1..].to_vec(),
+        env: env.clone(),
+    });
+    Ok(MachineState::Eval(items[0].clone(), env))
+}
+
+fn resume_machine_frame(
+    frame: MachineFrame,
+    value: Value,
+    ctx: &mut EvalContext,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    match frame {
+        MachineFrame::Sequence { remaining, env } => {
+            let _ = value;
+            Ok(schedule_machine_sequence(&remaining, env, frames))
+        }
+        MachineFrame::DefineVar { name, env } => {
+            bind_value(&env, name, value);
+            Ok(MachineState::Value(Value::Void))
+        }
+        MachineFrame::SetVar { name, env } => {
+            assign(&env, &name, value)?;
+            Ok(MachineState::Value(Value::Void))
+        }
+        MachineFrame::If {
+            consequent,
+            alternate,
+            env,
+        } => {
+            if value.is_truthy() {
+                Ok(MachineState::Eval(consequent, env))
+            } else if let Some(alternate) = alternate {
+                Ok(MachineState::Eval(alternate, env))
+            } else {
+                Ok(MachineState::Value(Value::Void))
+            }
+        }
+        MachineFrame::And { remaining, env } => {
+            if !value.is_truthy() {
+                Ok(MachineState::Value(value))
+            } else {
+                Ok(schedule_machine_and(&remaining, env, frames))
+            }
+        }
+        MachineFrame::Or { remaining, env } => {
+            if value.is_truthy() {
+                Ok(MachineState::Value(value))
+            } else {
+                Ok(schedule_machine_or(&remaining, env, frames))
+            }
+        }
+        MachineFrame::Cond {
+            remaining_clauses,
+            match_action,
+            env,
+        } => {
+            if value.is_truthy() {
+                match match_action {
+                    CondMatchAction::ReturnTestValue => Ok(MachineState::Value(value)),
+                    CondMatchAction::EvaluateBody(body) => {
+                        Ok(schedule_machine_sequence(&body, env, frames))
+                    }
+                }
+            } else {
+                schedule_machine_cond(&remaining_clauses, env, frames)
+            }
+        }
+        MachineFrame::Let {
+            names,
+            remaining_inits,
+            mut values,
+            body,
+            env,
+        } => {
+            values.push(value);
+
+            if let Some((next_init, rest_inits)) = remaining_inits.split_first() {
+                frames.push(MachineFrame::Let {
+                    names,
+                    remaining_inits: rest_inits.to_vec(),
+                    values,
+                    body,
+                    env: env.clone(),
+                });
+                Ok(MachineState::Eval(next_init.clone(), env))
+            } else {
+                let let_env = Env::child(env);
+                {
+                    let mut scope = let_env.borrow_mut();
+                    for (name, value) in names.into_iter().zip(values) {
+                        scope.bindings.insert(name, Rc::new(RefCell::new(value)));
+                    }
+                }
+                Ok(schedule_machine_sequence(&body, let_env, frames))
+            }
+        }
+        MachineFrame::CallOperator { arg_exprs, env } => {
+            if let Some((last_arg, rest_args)) = arg_exprs.split_last() {
+                frames.push(MachineFrame::CallArg {
+                    operator: value,
+                    evaluated: Vec::new(),
+                    remaining: rest_args.to_vec(),
+                    env: env.clone(),
+                });
+                Ok(MachineState::Eval(last_arg.clone(), env))
+            } else {
+                apply_machine_value(value, Vec::new(), ctx, frames)
+            }
+        }
+        MachineFrame::CallArg {
+            operator,
+            mut evaluated,
+            remaining,
+            env,
+        } => {
+            evaluated.push(value);
+
+            if let Some((next_arg, rest_args)) = remaining.split_last() {
+                frames.push(MachineFrame::CallArg {
+                    operator,
+                    evaluated,
+                    remaining: rest_args.to_vec(),
+                    env: env.clone(),
+                });
+                Ok(MachineState::Eval(next_arg.clone(), env))
+            } else {
+                evaluated.reverse();
+                apply_machine_value(operator, evaluated, ctx, frames)
+            }
+        }
+    }
+}
+
+fn apply_machine_value(
+    operator: Value,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    let Value::Procedure(procedure) = operator else {
+        return Err(EvalError::NotAProcedure);
+    };
+
+    match procedure.as_ref() {
+        Procedure::Builtin(builtin) => {
+            Ok(MachineState::Value((builtin.implementation)(&args, ctx)?))
+        }
+        Procedure::Lambda(lambda) => {
+            let call_env = bind_lambda_call_env(lambda, args)?;
+            Ok(schedule_machine_sequence(&lambda.body, call_env, frames))
+        }
+        Procedure::CaseLambda(case_lambda) => {
+            let Some(index) = case_lambda
+                .clauses
+                .iter()
+                .position(|clause| clause.params.accepts(args.len()))
+            else {
+                return Err(EvalError::WrongArgumentCount {
+                    name: case_lambda.name.clone(),
+                    expected: case_lambda.expected_arity(),
+                    got: args.len(),
+                });
+            };
+
+            let clause = &case_lambda.clauses[index];
+            let call_env = bind_lambda_call_env(clause, args)?;
+            Ok(schedule_machine_sequence(&clause.body, call_env, frames))
+        }
+        Procedure::RecordConstructor(constructor) => Ok(MachineState::Value(
+            apply_record_constructor(constructor, args)?,
+        )),
+        Procedure::RecordPredicate(predicate) => Ok(MachineState::Value(apply_record_predicate(
+            predicate, args,
+        )?)),
+        Procedure::RecordAccessor(accessor) => {
+            Ok(MachineState::Value(apply_record_accessor(accessor, args)?))
+        }
+        Procedure::CallCc(callcc) => {
+            expect_value_arity(&callcc.name, &args, 1)?;
+            let continuation =
+                Value::Procedure(Rc::new(Procedure::Continuation(ContinuationProcedure {
+                    frames: frames.clone(),
+                })));
+            apply_machine_value(args[0].clone(), vec![continuation], ctx, frames)
+        }
+        Procedure::Continuation(continuation) => {
+            expect_value_arity("continuation", &args, 1)?;
+            *frames = continuation.frames.clone();
+            Ok(MachineState::Value(args[0].clone()))
+        }
+    }
 }
 
 fn eval_sequence(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -2277,6 +2903,8 @@ fn apply_procedure(
         Procedure::RecordConstructor(constructor) => apply_record_constructor(constructor, args),
         Procedure::RecordPredicate(predicate) => apply_record_predicate(predicate, args),
         Procedure::RecordAccessor(accessor) => apply_record_accessor(accessor, args),
+        Procedure::CallCc(callcc) => apply_callcc(callcc, args, ctx),
+        Procedure::Continuation(continuation) => apply_continuation(continuation, args, ctx),
     }
 }
 
@@ -2300,6 +2928,12 @@ fn tail_apply_procedure(
         Procedure::RecordAccessor(accessor) => {
             Ok(TailOutcome::Value(apply_record_accessor(accessor, args)?))
         }
+        Procedure::CallCc(callcc) => Ok(TailOutcome::Value(apply_callcc(callcc, args, ctx)?)),
+        Procedure::Continuation(continuation) => Ok(TailOutcome::Value(apply_continuation(
+            continuation,
+            args,
+            ctx,
+        )?)),
     }
 }
 
@@ -2405,6 +3039,22 @@ fn tail_apply_case_lambda(
     };
 
     tail_apply_lambda(&case_lambda.clauses[index], args, ctx)
+}
+
+fn apply_callcc(
+    _callcc: &CallCcProcedure,
+    _args: Vec<Value>,
+    _ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    Err(EvalError::UnsupportedContinuationContext)
+}
+
+fn apply_continuation(
+    _continuation: &ContinuationProcedure,
+    _args: Vec<Value>,
+    _ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    Err(EvalError::UnsupportedContinuationContext)
 }
 
 fn apply_record_constructor(
