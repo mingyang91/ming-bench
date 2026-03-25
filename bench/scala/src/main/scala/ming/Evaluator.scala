@@ -11,18 +11,26 @@ enum SchemeVal:
   case SBool(value: Boolean)
   case SString(value: String)
   case SSymbol(name: String)
+  case SChar(value: Char)
   case SList(elems: List[SchemeVal])
   case SVoid
   case SLambda(params: List[String], body: List[SchemeVal], closure: Env)
 
+  /** Write representation (with quotes for strings). */
   def display: String = this match
     case SInt(v)          => v.toString
     case SBool(v)         => if v then "#t" else "#f"
     case SString(v)       => s""""$v""""
     case SSymbol(n)       => n
+    case SChar(c)         => s"#\\$c"
     case SList(es)        => "(" + es.map(_.display).mkString(" ") + ")"
     case SVoid            => ""
     case SLambda(_, _, _) => "#<procedure>"
+
+  /** Display representation (no quotes for strings). */
+  def displayRepr: String = this match
+    case SString(v) => v
+    case other      => other.display
 
 /** Environment with parent chain */
 class Env(val parent: Option[Env] = None):
@@ -49,6 +57,9 @@ class Env(val parent: Option[Env] = None):
 /** Scheme interpreter entry point. */
 object Evaluator:
 
+  /** Thread-local output buffer for display/write/newline. */
+  private val outputBuffer: ThreadLocal[StringBuilder] = ThreadLocal.withInitial(() => new StringBuilder())
+
   private def isTruthy(v: SchemeVal): Boolean = v match
     case SchemeVal.SBool(false) => false
     case _                      => true
@@ -59,8 +70,9 @@ object Evaluator:
   def eval(expr: SchemeVal, env: Env): SchemeVal =
     try
       expr match
-        case SchemeVal.SInt(_) | SchemeVal.SBool(_) | SchemeVal.SString(_) | SchemeVal.SVoid => expr
-        case SchemeVal.SSymbol(name)                                                         => env.get(name)
+        case SchemeVal.SInt(_) | SchemeVal.SBool(_) | SchemeVal.SString(_) | SchemeVal.SChar(_) | SchemeVal.SVoid =>
+          expr
+        case SchemeVal.SSymbol(name) => env.get(name)
         case SchemeVal.SList(elems) =>
           elems match
             case Nil => throw new EvalError("empty application")
@@ -186,8 +198,22 @@ object Evaluator:
         val callEnv = Env(Some(closure))
         params.zip(args).foreach((p, a) => callEnv.define(p, a))
         evalBody(body, callEnv)
-      case SchemeVal.SSymbol(name) => Builtins.applyBuiltin(name, args)
-      case _                       => throw new EvalError(s"not a procedure: ${op.display}")
+      case SchemeVal.SSymbol(name) =>
+        name match
+          case "display" =>
+            if args.length != 1 then throw new EvalError("display: expected 1 argument")
+            outputBuffer.get().append(args.head.displayRepr)
+            SchemeVal.SVoid
+          case "write" =>
+            if args.length != 1 then throw new EvalError("write: expected 1 argument")
+            outputBuffer.get().append(args.head.display)
+            SchemeVal.SVoid
+          case "newline" =>
+            if args.nonEmpty then throw new EvalError("newline: expected 0 arguments")
+            outputBuffer.get().append("\n")
+            SchemeVal.SVoid
+          case _ => Builtins.applyBuiltin(name, args)
+      case _ => throw new EvalError(s"not a procedure: ${op.display}")
 
   private def makeGlobalEnv(): Env =
     val env = Env()
@@ -203,4 +229,12 @@ object Evaluator:
 
   /** Evaluate Scheme expressions and return both the result string and any captured output. */
   def evalStrWithOutput(input: String): (String, String) =
-    (evalStr(input), "")
+    val buf = outputBuffer.get()
+    buf.clear()
+    val exprs = Parser.parseAll(input)
+    if exprs.isEmpty then throw new EvalError("empty input")
+    val env    = makeGlobalEnv()
+    val result = evalBody(exprs, env).display
+    val output = buf.toString
+    buf.clear()
+    (result, output)
