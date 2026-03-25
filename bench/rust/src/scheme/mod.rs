@@ -52,6 +52,10 @@ enum Value {
         rules: Vec<(Vec<Expr>, Expr)>,
         def_env: Env,
     },
+    CaseLambda {
+        name: Option<String>,
+        clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>, Env)>,
+    },
     Record {
         type_id: u64,
         type_name: String,
@@ -102,6 +106,7 @@ impl fmt::Display for Value {
                 write!(f, ">")
             }
             Value::Lambda { .. } => write!(f, "#<procedure>"),
+            Value::CaseLambda { .. } => write!(f, "#<procedure>"),
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
             Value::Void => write!(f, "#<void>"),
@@ -462,6 +467,7 @@ fn default_env() -> Env {
         "integer?", "rational?", "exact?", "inexact?",
         "exact->inexact", "inexact->exact",
         "numerator", "denominator",
+        "procedure?",
     ] {
         env.set(name.into(), Value::Builtin(name.into()));
     }
@@ -584,6 +590,32 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                             rest_param,
                             body,
                             env: env.clone(),
+                        });
+                    }
+                    "case-lambda" => {
+                        if elems.len() < 2 {
+                            return Err(EvalError::Syntax(format!("case-lambda requires at least one clause at {span}")));
+                        }
+                        let mut clauses = Vec::new();
+                        for clause_expr in &elems[1..] {
+                            if let ExprKind::List(clause_elems) = &clause_expr.kind {
+                                if clause_elems.len() < 2 {
+                                    return Err(EvalError::Syntax(format!("case-lambda: clause requires params and body at {span}")));
+                                }
+                                let (params, rest_param) = match &clause_elems[0].kind {
+                                    ExprKind::List(ps) => parse_params(ps, span)?,
+                                    ExprKind::Symbol(s) => (vec![], Some(s.clone())),
+                                    _ => return Err(EvalError::Syntax(format!("case-lambda: expected parameter list at {span}"))),
+                                };
+                                let body = clause_elems[1..].to_vec();
+                                clauses.push((params, rest_param, body, env.clone()));
+                            } else {
+                                return Err(EvalError::Syntax(format!("case-lambda: expected clause list at {span}")));
+                            }
+                        }
+                        return Ok(Value::CaseLambda {
+                            name: None,
+                            clauses,
                         });
                     }
                     "and" => {
@@ -971,6 +1003,28 @@ fn apply_func(func: &Value, args: &[Value], call_span: Span, output: &mut String
             }
             Ok(result)
         }
+        Value::CaseLambda { name, clauses } => {
+            for (params, rest_param, body, clause_env) in clauses {
+                let matches = if rest_param.is_some() {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    let lambda = Value::Lambda {
+                        name: name.clone(),
+                        params: params.clone(),
+                        rest_param: rest_param.clone(),
+                        body: body.clone(),
+                        env: clause_env.clone(),
+                    };
+                    return apply_func(&lambda, args, call_span, output);
+                }
+            }
+            Err(EvalError::Arity(format!(
+                "no matching clause for {} arguments at {call_span}", args.len()
+            )))
+        }
         _ => Err(EvalError::Type(format!("not a procedure: {func} at {call_span}"))),
     }
 }
@@ -1265,6 +1319,10 @@ fn apply_builtin(name: &str, args: &[Value], call_span: Span, output: &mut Strin
         "char?" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("char? requires 1 argument at {call_span}"))); }
             Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
+        }
+        "procedure?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(format!("procedure? requires 1 argument at {call_span}"))); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Builtin(_))))
         }
         "display" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("display requires 1 argument at {call_span}"))); }
@@ -1798,7 +1856,7 @@ enum PatternBinding {
 }
 
 fn is_macro_special(s: &str) -> bool {
-    matches!(s, "quote" | "if" | "define" | "lambda" | "and" | "or"
+    matches!(s, "quote" | "if" | "define" | "lambda" | "case-lambda" | "and" | "or"
         | "let" | "begin" | "cond" | "set!" | "string-set!" | "define-syntax" | "define-record-type" | "...")
 }
 
