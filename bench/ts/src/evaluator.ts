@@ -159,10 +159,16 @@ interface ContinuationProcedureValue {
   procedureKind: 'continuation';
   name: string;
   continuation: Continuation;
+  dynamicWindFrames: DynamicWindFrame[];
 }
 
 interface Binding {
   value: SchemeValue;
+}
+
+interface DynamicWindFrame {
+  inThunk: SchemeValue;
+  outThunk: SchemeValue;
 }
 
 interface ParserState {
@@ -322,6 +328,7 @@ const SPECIAL_FORM_NAMES = new Set([
 let nextTemplateId = 1;
 let nextIntroducedIdentifierId = 1;
 let nextRecordTypeId = 1;
+let currentDynamicWindFrames: DynamicWindFrame[] = [];
 
 /**
  * Evaluate one or more Scheme expressions and return the string
@@ -347,8 +354,14 @@ function evaluateProgram(input: string): { result: string; output: string } {
 
   const output: string[] = [];
   const env = createGlobalEnvironment(output);
-  const result = evaluateSequence(expressions, env);
-  return { result: formatValue(result), output: output.join('') };
+  currentDynamicWindFrames = [];
+
+  try {
+    const result = evaluateSequence(expressions, env);
+    return { result: formatValue(result), output: output.join('') };
+  } finally {
+    currentDynamicWindFrames = [];
+  }
 }
 
 function createGlobalEnvironment(output: string[]): Environment {
@@ -401,6 +414,12 @@ function createGlobalEnvironment(output: string[]): Environment {
       throw new EvalError(
         'internal error: call-with-current-continuation must be applied through the evaluator',
       );
+    }),
+  );
+  env.define(
+    'dynamic-wind',
+    makeBuiltinProcedure('dynamic-wind', () => {
+      throw new EvalError('internal error: dynamic-wind must be applied through the evaluator');
     }),
   );
   env.define('apply', makeBuiltinProcedure('apply', (args) => applyApply(args)));
@@ -2680,7 +2699,82 @@ function makeContinuationProcedure(continuation: Continuation): ContinuationProc
     procedureKind: 'continuation',
     name: 'continuation',
     continuation,
+    dynamicWindFrames: currentDynamicWindFrames.slice(),
   };
+}
+
+function transferDynamicWind(
+  targetFrames: DynamicWindFrame[],
+  next: () => Computation,
+  location?: SourceLocation,
+): Computation {
+  const sourceFrames = currentDynamicWindFrames.slice();
+
+  let sharedPrefixLength = 0;
+  while (
+    sharedPrefixLength < sourceFrames.length &&
+    sharedPrefixLength < targetFrames.length &&
+    sourceFrames[sharedPrefixLength] === targetFrames[sharedPrefixLength]
+  ) {
+    sharedPrefixLength += 1;
+  }
+
+  const framesToExit = sourceFrames.slice(sharedPrefixLength).reverse();
+  const framesToEnter = targetFrames.slice(sharedPrefixLength);
+
+  const runExits = (index: number): Computation => {
+    if (index >= framesToExit.length) {
+      return runEntries(0);
+    }
+
+    const frame = framesToExit[index];
+    return applyProcedureStep(
+      frame.outThunk,
+      [],
+      () => {
+        currentDynamicWindFrames = currentDynamicWindFrames.slice(0, -1);
+        return runExits(index + 1);
+      },
+      location,
+    );
+  };
+
+  const runEntries = (index: number): Computation => {
+    if (index >= framesToEnter.length) {
+      return bounce(() => next());
+    }
+
+    const frame = framesToEnter[index];
+    currentDynamicWindFrames = [...currentDynamicWindFrames, frame];
+    return applyProcedureStep(frame.inThunk, [], () => runEntries(index + 1), location);
+  };
+
+  return runExits(0);
+}
+
+function applyDynamicWindCps(
+  args: SchemeValue[],
+  continuation: Continuation,
+  location?: SourceLocation,
+): Computation {
+  expectExactArgCount('dynamic-wind', args, 3);
+
+  const [inThunk, bodyThunk, outThunk] = args;
+  const parentFrames = currentDynamicWindFrames.slice();
+  const frame: DynamicWindFrame = { inThunk, outThunk };
+  const bodyFrames = [...parentFrames, frame];
+
+  return transferDynamicWind(
+    bodyFrames,
+    () =>
+      applyProcedureStep(
+        bodyThunk,
+        [],
+        (value) => transferDynamicWind(parentFrames, () => continuation(value), location),
+        location,
+      ),
+    location,
+  );
 }
 
 function evaluateQuote(items: Expr[]): SchemeValue {
@@ -2755,7 +2849,11 @@ function applyProcedureStep(
 
       if (value.procedureKind === 'continuation') {
         expectExactArgCount(value.name, args, 1);
-        return value.continuation(args[0]);
+        return transferDynamicWind(
+          value.dynamicWindFrames,
+          () => value.continuation(args[0]),
+          location,
+        );
       }
 
       if (value.procedureKind === 'builtin') {
@@ -2810,6 +2908,8 @@ function applyBuiltinProcedure(
         continuation,
         location,
       );
+    case 'dynamic-wind':
+      return applyDynamicWindCps(args, continuation, location);
     case 'apply':
       return applyApplyCps(args, continuation, location);
     case 'map':
