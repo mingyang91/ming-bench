@@ -30,6 +30,7 @@ var macroKeywordNames = map[string]struct{}{
 	"begin":         {},
 	"cond":          {},
 	"define":        {},
+	"define-record-type": {},
 	"define-syntax": {},
 	"if":            {},
 	"lambda":        {},

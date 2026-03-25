@@ -274,6 +274,9 @@ func evalList(list listNode, env *environment) (value, error) {
 		case "define-syntax":
 			result, err := evalDefineSyntax(list.elements[1:], env)
 			return result, withErrorPos(err, list.pos)
+		case "define-record-type":
+			result, err := evalDefineRecordType(list.elements[1:], env)
+			return result, withErrorPos(err, list.pos)
 		case "set!":
 			result, err := evalSet(list.elements[1:], env)
 			return result, withErrorPos(err, list.pos)
@@ -1708,6 +1711,8 @@ func formatValue(v value) (string, error) {
 		return string(v), nil
 	case charValue:
 		return formatChar(v), nil
+	case *recordValue:
+		return "#<record " + v.recordType.name + ">", nil
 	case *pairValue:
 		return formatPair(v, formatValue)
 	case listValue:
@@ -1917,6 +1922,9 @@ func eqValues(left, right value) bool {
 	case *closureValue:
 		right, ok := right.(*closureValue)
 		return ok && left == right
+	case *recordValue:
+		right, ok := right.(*recordValue)
+		return ok && left == right
 	case voidValue:
 		_, ok := right.(voidValue)
 		return ok
@@ -1989,6 +1997,9 @@ func equalValues(left, right value) bool {
 	case *pairValue:
 		right, ok := right.(*pairValue)
 		return ok && equalValues(left.car, right.car) && equalValues(left.cdr, right.cdr)
+	case *recordValue:
+		right, ok := right.(*recordValue)
+		return ok && left == right
 	case voidValue:
 		_, ok := right.(voidValue)
 		return ok
