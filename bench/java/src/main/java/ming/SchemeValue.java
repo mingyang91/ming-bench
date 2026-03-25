@@ -19,6 +19,8 @@ public sealed interface SchemeValue {
     record LambdaVal(List<String> params, String restParam, List<SchemeValue> body, Environment env) implements SchemeValue {}
     record PairVal(SchemeValue car, SchemeValue cdr) implements SchemeValue {}
     record CharVal(char value) implements SchemeValue {}
+    record DoubleVal(double value) implements SchemeValue {}
+    record RationalVal(long num, long den) implements SchemeValue {} // always simplified, den > 0
     record BuiltinVal(String name, Builtin proc) implements SchemeValue {}
     record MacroVal(List<String> literals, List<SchemeValue> patterns, List<SchemeValue> templates, Environment defEnv) implements SchemeValue {}
 
@@ -61,6 +63,8 @@ public sealed interface SchemeValue {
                 yield sb.toString();
             }
             case CharVal v -> "#\\" + v.value();
+            case DoubleVal v -> Double.toString(v.value());
+            case RationalVal v -> v.num() + "/" + v.den();
             case VoidVal v -> "#<void>";
             case LambdaVal v -> "#<procedure>";
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";

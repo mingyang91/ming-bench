@@ -169,7 +169,36 @@ public class Reader {
             return new SchemeValue.IntVal(val);
         } catch (NumberFormatException ignored) {}
 
+        // Try rational literal (e.g. 1/3, -5/2)
+        int slashIdx = token.indexOf('/');
+        if (slashIdx > 0 && slashIdx < token.length() - 1) {
+            try {
+                long num = Long.parseLong(token.substring(0, slashIdx));
+                long den = Long.parseLong(token.substring(slashIdx + 1));
+                if (den != 0) return makeRational(num, den);
+            } catch (NumberFormatException ignored) {}
+        }
+
+        // Try float
+        try {
+            double val = Double.parseDouble(token);
+            return new SchemeValue.DoubleVal(val);
+        } catch (NumberFormatException ignored) {}
+
         return new SchemeValue.SymbolVal(token);
+    }
+
+    private static SchemeValue makeRational(long num, long den) {
+        if (den < 0) { num = -num; den = -den; }
+        long g = gcd(Math.abs(num), den);
+        num /= g; den /= g;
+        if (den == 1) return new SchemeValue.IntVal(num);
+        return new SchemeValue.RationalVal(num, den);
+    }
+
+    private static long gcd(long a, long b) {
+        while (b != 0) { long t = b; b = a % b; a = t; }
+        return a;
     }
 
     private void skipWhitespace() {
