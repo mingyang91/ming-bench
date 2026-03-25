@@ -15,34 +15,41 @@ object Evaluator:
   def evalStrWithOutput(input: String): (String, String) =
     throw new EvalError("not implemented")
 
-  def eval(expr: SchemeVal, env: Env): SchemeVal = expr match
-    case SchemeVal.IntVal(_)    => expr
-    case SchemeVal.BoolVal(_)   => expr
-    case SchemeVal.StringVal(_) => expr
-    case SchemeVal.Symbol(name) =>
-      env.lookup(name) match
-        case Some(v) => v
-        case None    => throw new EvalError(s"unbound variable: $name")
-    case SchemeVal.SList(elems) if elems.isEmpty =>
-      throw new EvalError("empty application")
-    case SchemeVal.SList(elems) =>
-      elems.head match
-        case SchemeVal.Symbol("define") => evalDefine(elems.tail, env)
-        case SchemeVal.Symbol("if")     => evalIf(elems.tail, env)
-        case SchemeVal.Symbol("quote") =>
-          if elems.tail.size != 1 then throw new EvalError("quote: expected 1 argument")
-          elems.tail.head
-        case SchemeVal.Symbol("lambda") => evalLambda(elems.tail, env)
-        case SchemeVal.Symbol("and")    => evalAnd(elems.tail, env)
-        case SchemeVal.Symbol("or")     => evalOr(elems.tail, env)
-        case SchemeVal.Symbol("begin")  => evalBegin(elems.tail, env)
-        case SchemeVal.Symbol("let")    => evalLet(elems.tail, env)
-        case SchemeVal.Symbol("cond")   => evalCond(elems.tail, env)
-        case head =>
-          val proc = eval(head, env)
-          val args = elems.tail.map(a => eval(a, env))
-          apply(proc, args)
-    case _ => throw new EvalError(s"cannot evaluate: $expr")
+  def eval(expr: SchemeVal, env: Env): SchemeVal =
+    try
+      expr match
+        case SchemeVal.IntVal(_)    => expr
+        case SchemeVal.BoolVal(_)   => expr
+        case SchemeVal.StringVal(_) => expr
+        case SchemeVal.Symbol(name) =>
+          env.lookup(name) match
+            case Some(v) => v
+            case None    => throw new EvalError(s"unbound variable: $name")
+        case SchemeVal.SList(elems) if elems.isEmpty =>
+          throw new EvalError("empty application")
+        case SchemeVal.SList(elems) =>
+          elems.head match
+            case SchemeVal.Symbol("define") => evalDefine(elems.tail, env)
+            case SchemeVal.Symbol("if")     => evalIf(elems.tail, env)
+            case SchemeVal.Symbol("quote") =>
+              if elems.tail.size != 1 then throw new EvalError("quote: expected 1 argument")
+              elems.tail.head
+            case SchemeVal.Symbol("lambda") => evalLambda(elems.tail, env)
+            case SchemeVal.Symbol("and")    => evalAnd(elems.tail, env)
+            case SchemeVal.Symbol("or")     => evalOr(elems.tail, env)
+            case SchemeVal.Symbol("begin")  => evalBegin(elems.tail, env)
+            case SchemeVal.Symbol("let")    => evalLet(elems.tail, env)
+            case SchemeVal.Symbol("cond")   => evalCond(elems.tail, env)
+            case head =>
+              val proc = eval(head, env)
+              val args = elems.tail.map(a => eval(a, env))
+              apply(proc, args)
+        case _ => throw new EvalError(s"cannot evaluate: $expr")
+    catch
+      case e: EvalError =>
+        val (line, col) = expr.pos
+        if line > 0 && !e.getMessage.matches(".*\\d+:\\d+.*") then throw new EvalError(s"$line:$col: ${e.getMessage}")
+        else throw e
 
   private def evalDefine(args: List[SchemeVal], env: Env): SchemeVal =
     args match

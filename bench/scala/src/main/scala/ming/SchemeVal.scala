@@ -1,6 +1,7 @@
 package ming
 
 enum SchemeVal:
+  var pos: (Int, Int) = (0, 0)
   case IntVal(n: Long)
   case BoolVal(b: Boolean)
   case StringVal(s: String)
