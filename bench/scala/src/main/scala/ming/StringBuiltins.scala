@@ -33,6 +33,70 @@ private[ming] object StringBuiltins:
         case List(Expr.Str(s, _), Expr.Num(start), Expr.Num(end)) =>
           Expr.Str(new String(s).substring(start.toInt, end.toInt).toCharArray)
         case _ => throw EvalError("substring: invalid arguments")
+    case "string-ref" =>
+      if args.length != 2 then throw EvalError("string-ref: need exactly 2 arguments")
+      args match
+        case List(Expr.Str(s, _), Expr.Num(idx)) => Expr.Chr(s(idx.toInt))
+        case _                                   => throw EvalError("string-ref: invalid arguments")
+    case "char?" =>
+      Builtins.unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Chr]))
+    case "string=?"    => strCmp(name, args, _ == _)
+    case "string<?"    => strCmp(name, args, _ < _)
+    case "string<=?"   => strCmp(name, args, _ <= _)
+    case "string>?"    => strCmp(name, args, _ > _)
+    case "string>=?"   => strCmp(name, args, _ >= _)
+    case "string-ci=?" => strCiCmp(name, args, _ == _)
+    case "string-upcase" =>
+      Builtins.unary(name, args) {
+        case Expr.Str(s, _) => Expr.Str(new String(s).toUpperCase.toCharArray)
+        case _              => throw EvalError("string-upcase: not a string")
+      }
+    case "string-downcase" =>
+      Builtins.unary(name, args) {
+        case Expr.Str(s, _) => Expr.Str(new String(s).toLowerCase.toCharArray)
+        case _              => throw EvalError("string-downcase: not a string")
+      }
+    case "string->list" | "list->string" | "string" | "make-string" =>
+      applyStringListOps(name, args)
+    case "string->number" | "number->string" | "symbol->string" | "string->symbol" =>
+      applyStringConversion(name, args)
+    case "char->integer" | "integer->char" => applyCharConversion(name, args)
+    case _                                 => throw EvalError(s"unknown procedure: $name")
+
+  private def applyStringListOps(name: String, args: List[Expr]): Expr = name match
+    case "string->list" =>
+      Builtins.unary(name, args) {
+        case Expr.Str(s, _) => PairOps.makeList(s.map(c => Expr.Chr(c)).toList)
+        case other          => throw EvalError(s"string->list: not a string: ${Builtins.display(other)}")
+      }
+    case "list->string" =>
+      Builtins.unary(name, args) { e =>
+        val elems = PairOps.toScalaList(e)
+        val chars = elems.map {
+          case Expr.Chr(c) => c
+          case other       => throw EvalError(s"list->string: not a character: ${Builtins.display(other)}")
+        }
+        Expr.Str(chars.toArray)
+      }
+    case "string" =>
+      val chars = args.map {
+        case Expr.Chr(c) => c
+        case other       => throw EvalError(s"string: not a character: ${Builtins.display(other)}")
+      }
+      Expr.Str(chars.toArray)
+    case "make-string" =>
+      if args.length < 1 || args.length > 2 then throw EvalError("make-string: need 1 or 2 arguments")
+      val len = Builtins.asNum(args.head).toInt
+      val ch =
+        if args.length == 2 then
+          args(1) match
+            case Expr.Chr(c) => c
+            case _           => throw EvalError("make-string: second argument must be a character")
+        else '\u0000'
+      Expr.Str(Array.fill(len)(ch))
+    case _ => throw EvalError(s"unknown procedure: $name")
+
+  private def applyStringConversion(name: String, args: List[Expr]): Expr = name match
     case "string->number" =>
       Builtins.unary(name, args) {
         case Expr.Str(s, _) =>
@@ -60,43 +124,7 @@ private[ming] object StringBuiltins:
         case Expr.Str(s, _) => Expr.Sym(new String(s))
         case other          => throw EvalError(s"string->symbol: not a string: ${Builtins.display(other)}")
       }
-    case "string-ref" =>
-      if args.length != 2 then throw EvalError("string-ref: need exactly 2 arguments")
-      args match
-        case List(Expr.Str(s, _), Expr.Num(idx)) => Expr.Chr(s(idx.toInt))
-        case _                                   => throw EvalError("string-ref: invalid arguments")
-    case "char?" =>
-      Builtins.unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Chr]))
-    case "string=?"    => strCmp(name, args, _ == _)
-    case "string<?"    => strCmp(name, args, _ < _)
-    case "string-ci=?" => strCiCmp(name, args, _ == _)
-    case "string-upcase" =>
-      Builtins.unary(name, args) {
-        case Expr.Str(s, _) => Expr.Str(new String(s).toUpperCase.toCharArray)
-        case _              => throw EvalError("string-upcase: not a string")
-      }
-    case "string-downcase" =>
-      Builtins.unary(name, args) {
-        case Expr.Str(s, _) => Expr.Str(new String(s).toLowerCase.toCharArray)
-        case _              => throw EvalError("string-downcase: not a string")
-      }
-    case "string->list" =>
-      Builtins.unary(name, args) {
-        case Expr.Str(s, _) => Expr.Lst(s.map(c => Expr.Chr(c)).toList)
-        case other          => throw EvalError(s"string->list: not a string: ${Builtins.display(other)}")
-      }
-    case "list->string" =>
-      Builtins.unary(name, args) {
-        case Expr.Lst(elems) =>
-          val chars = elems.map {
-            case Expr.Chr(c) => c
-            case other       => throw EvalError(s"list->string: not a character: ${Builtins.display(other)}")
-          }
-          Expr.Str(chars.toArray)
-        case other => throw EvalError(s"list->string: not a list: ${Builtins.display(other)}")
-      }
-    case "char->integer" | "integer->char" => applyCharConversion(name, args)
-    case _                                 => throw EvalError(s"unknown procedure: $name")
+    case _ => throw EvalError(s"unknown procedure: $name")
 
   def applyCharBuiltin(name: String, args: List[Expr]): Expr = name match
     case "char-alphabetic?" =>
@@ -115,9 +143,12 @@ private[ming] object StringBuiltins:
       Builtins.unary(name, args) {
         case Expr.Chr(c) => Expr.Chr(c.toLower); case _ => throw EvalError("char-downcase: not a char")
       }
-    case "char=?" => charCmp(name, args, _ == _)
-    case "char<?" => charCmp(name, args, _ < _)
-    case _        => throw EvalError(s"unknown char procedure: $name")
+    case "char=?"  => charCmp(name, args, _ == _)
+    case "char<?"  => charCmp(name, args, _ < _)
+    case "char<=?" => charCmp(name, args, _ <= _)
+    case "char>?"  => charCmp(name, args, _ > _)
+    case "char>=?" => charCmp(name, args, _ >= _)
+    case _         => throw EvalError(s"unknown char procedure: $name")
 
   private def applyCharConversion(name: String, args: List[Expr]): Expr = name match
     case "char->integer" =>

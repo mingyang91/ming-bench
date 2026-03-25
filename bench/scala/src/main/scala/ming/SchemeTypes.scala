@@ -2,6 +2,8 @@ package ming
 
 import scala.collection.mutable
 
+private[ming] class MutablePair(var car: Expr, var cdr: Expr)
+
 private[ming] enum Expr:
   case Num(value: Long)
   case Rational(num: Long, den: Long)
@@ -12,7 +14,7 @@ private[ming] enum Expr:
   case Sym(name: String)
   case Lst(elems: List[Expr])
   case Lambda(params: List[String], restParam: Option[String], body: List[Expr], closure: Env)
-  case Pair(car: Expr, cdr: Expr)
+  case Pair(cell: MutablePair)
   case Macro(literals: List[String], rules: List[(List[Expr], Expr)], defEnv: Env)
   case Record(typeName: String, typeId: Int, fields: Array[Expr], fieldNames: Array[String])
   case CaseLambda(clauses: List[(List[String], Option[String], List[Expr])], closure: Env)

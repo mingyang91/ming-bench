@@ -23,7 +23,7 @@ object Evaluator:
           throw EvalError(
             s"lambda: expected at least ${params.length} arguments, got ${args.length}"
           )
-        localEnv.define(rest, Expr.Lst(args.drop(params.length)))
+        localEnv.define(rest, PairOps.makeList(args.drop(params.length)))
     localEnv
 
   private def evalBodyTail(
@@ -53,7 +53,7 @@ object Evaluator:
       try
         expr match
           case Expr.Num(_) | Expr.Rational(_, _) | Expr.Real(_) | Expr.Bool(_) | Expr.Str(_, _) | Expr.Chr(_) |
-              Expr.Lambda(_, _, _, _) | Expr.Pair(_, _) | Expr.Macro(_, _, _) | Expr.Record(_, _, _, _) |
+              Expr.Lambda(_, _, _, _) | Expr.Pair(_) | Expr.Macro(_, _, _) | Expr.Record(_, _, _, _) |
               Expr.CaseLambda(_, _) | Expr.Vec(_) =>
             return expr
           case Expr.Sym(name) => return env.lookup(name)
@@ -99,6 +99,8 @@ object Evaluator:
             return RecordOps.evalDefineRecordType(args, env)
           case Expr.Lst(Expr.Sym("case-lambda") :: clauses) =>
             return SpecialForms.evalCaseLambda(clauses, env)
+          case Expr.Lst(Expr.Sym("let*") :: args) =>
+            evalLetStarTail(args, env, state)
           case Expr.Lst(Expr.Sym("letrec") :: args) =>
             evalLetrecTail(args, env, state)
           case Expr.Lst(Expr.Sym("letrec*") :: args) =>
@@ -172,32 +174,35 @@ object Evaluator:
             )
       case _ => Applier.applyProc(func, evaluatedArgs)
 
-  private def evalLetTail(
-    args: List[Expr],
-    env: Env,
-    state: TrampolineState
-  ): Unit = args match
+  private def parseBindingPairs(form: String, bindings: List[Expr]): List[(String, Expr)] =
+    bindings.map {
+      case Expr.Lst(List(Expr.Sym(name), valueExpr)) => (name, valueExpr)
+      case _                                         => throw EvalError(s"$form: invalid binding")
+    }
+
+  private def evalLetTail(args: List[Expr], env: Env, state: TrampolineState): Unit = args match
     case Expr.Sym(name) :: Expr.Lst(bindings) :: body if body.nonEmpty =>
       val letEnv   = env.child()
       val parsed   = parseBindingPairs("let", bindings)
       val pNames   = parsed.map(_._1)
       val initVals = parsed.map((_, v) => eval(v, env))
-      val lambda   = Expr.Lambda(pNames, None, body, letEnv)
-      letEnv.define(name, lambda)
+      letEnv.define(name, Expr.Lambda(pNames, None, body, letEnv))
       val localEnv = bindLambdaParams(pNames, None, initVals, letEnv)
       evalBodyTail(body, localEnv, state)
     case Expr.Lst(bindings) :: body if body.nonEmpty =>
       val letEnv = env.child()
-      val parsed = parseBindingPairs("let", bindings)
-      parsed.foreach((name, valueExpr) => letEnv.define(name, eval(valueExpr, env)))
+      parseBindingPairs("let", bindings).foreach((name, valueExpr) => letEnv.define(name, eval(valueExpr, env)))
       evalBodyTail(body, letEnv, state)
     case _ => throw EvalError("let: invalid syntax")
 
-  private def evalLetrecTail(
-    args: List[Expr],
-    env: Env,
-    state: TrampolineState
-  ): Unit = args match
+  private def evalLetStarTail(args: List[Expr], env: Env, state: TrampolineState): Unit = args match
+    case Expr.Lst(bindings) :: body if body.nonEmpty =>
+      val letEnv = env.child()
+      parseBindingPairs("let*", bindings).foreach((name, valueExpr) => letEnv.define(name, eval(valueExpr, letEnv)))
+      evalBodyTail(body, letEnv, state)
+    case _ => throw EvalError("let*: invalid syntax")
+
+  private def evalLetrecTail(args: List[Expr], env: Env, state: TrampolineState): Unit = args match
     case Expr.Lst(bindings) :: body if body.nonEmpty =>
       val letEnv = env.child()
       val parsed = parseBindingPairs("letrec", bindings)
@@ -206,27 +211,12 @@ object Evaluator:
       evalBodyTail(body, letEnv, state)
     case _ => throw EvalError("letrec: invalid syntax")
 
-  private def evalLetrecStarTail(
-    args: List[Expr],
-    env: Env,
-    state: TrampolineState
-  ): Unit = args match
+  private def evalLetrecStarTail(args: List[Expr], env: Env, state: TrampolineState): Unit = args match
     case Expr.Lst(bindings) :: body if body.nonEmpty =>
       val letEnv = env.child()
-      val parsed = parseBindingPairs("letrec*", bindings)
-      parsed.foreach((name, valueExpr) => letEnv.define(name, eval(valueExpr, letEnv)))
+      parseBindingPairs("letrec*", bindings).foreach((n, v) => letEnv.define(n, eval(v, letEnv)))
       evalBodyTail(body, letEnv, state)
     case _ => throw EvalError("letrec*: invalid syntax")
-
-  private def parseBindingPairs(
-    form: String,
-    bindings: List[Expr]
-  ): List[(String, Expr)] =
-    bindings.map {
-      case Expr.Lst(List(Expr.Sym(name), valueExpr)) =>
-        (name, valueExpr)
-      case _ => throw EvalError(s"$form: invalid binding")
-    }
 
   private def evalAndTail(
     args: List[Expr],
@@ -292,3 +282,7 @@ object Evaluator:
 
   private[ming] def evalBody(exprs: List[Expr], env: Env): Expr =
     exprs.foldLeft(Expr.Bool(false): Expr)((_, e) => eval(e, env))
+
+  def evalStr(input: String): String = SchemeEntry.evalStr(input)
+
+  def evalStrWithOutput(input: String): (String, String) = SchemeEntry.evalStrWithOutput(input)

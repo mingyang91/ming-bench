@@ -5,34 +5,32 @@ private[ming] object Builtins:
   val outputBuffer: ThreadLocal[StringBuilder] = new ThreadLocal[StringBuilder]
 
   def applyBuiltin(name: String, args: List[Expr]): Expr = name match
-    case "+"    => applyAdd(args)
-    case "-"    => applyMinus(args)
-    case "*"    => applyMul(args)
-    case "/"    => applyDiv(args)
-    case "<"    => numCmp(name, args, _ < _)
-    case ">"    => numCmp(name, args, _ > _)
-    case "="    => numCmp(name, args, _ == _)
-    case "<="   => numCmp(name, args, _ <= _)
-    case ">="   => numCmp(name, args, _ >= _)
-    case "not"  => unary(name, args)(e => Expr.Bool(isFalsy(e)))
-    case "cons" => applyCons(args)
-    case "car"  => unary(name, args)(carOf)
-    case "cdr"  => unary(name, args)(cdrOf)
-    case "null?" =>
-      unary(name, args)(e => Expr.Bool(e == Expr.Lst(Nil)))
-    case "list"     => Expr.Lst(args)
-    case "length"   => unary(name, args)(lengthOf)
+    case "+"        => applyAdd(args)
+    case "-"        => applyMinus(args)
+    case "*"        => applyMul(args)
+    case "/"        => applyDiv(args)
+    case "<"        => numCmp(name, args, _ < _)
+    case ">"        => numCmp(name, args, _ > _)
+    case "="        => numCmp(name, args, _ == _)
+    case "<="       => numCmp(name, args, _ <= _)
+    case ">="       => numCmp(name, args, _ >= _)
+    case "not"      => unary(name, args)(e => Expr.Bool(isFalsy(e)))
+    case "cons"     => applyCons(args)
+    case "car"      => unary(name, args)(PairOps.carOf)
+    case "cdr"      => unary(name, args)(PairOps.cdrOf)
+    case "caar"     => unary(name, args)(e => PairOps.carOf(PairOps.carOf(e)))
+    case "cadr"     => unary(name, args)(e => PairOps.carOf(PairOps.cdrOf(e)))
+    case "cdar"     => unary(name, args)(e => PairOps.cdrOf(PairOps.carOf(e)))
+    case "cddr"     => unary(name, args)(e => PairOps.cdrOf(PairOps.cdrOf(e)))
+    case "null?"    => unary(name, args)(e => Expr.Bool(PairOps.isNull(e)))
+    case "list"     => PairOps.makeList(args)
+    case "length"   => unary(name, args)(e => Expr.Num(PairOps.lengthOf(e)))
     case "number?"  => unary(name, args)(e => Expr.Bool(NumericUtils.isNumber(e)))
     case "string?"  => unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Str]))
     case "boolean?" => unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Bool]))
-    case "pair?" =>
-      unary(name, args) {
-        case Expr.Lst(_ :: _) => Expr.Bool(true)
-        case Expr.Pair(_, _)  => Expr.Bool(true)
-        case _                => Expr.Bool(false)
-      }
-    case "symbol?" => unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Sym]))
-    case "append"  => NumericListBuiltins.applyAppend(args)
+    case "pair?"    => unary(name, args)(e => Expr.Bool(PairOps.isPair(e)))
+    case "symbol?"  => unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Sym]))
+    case "append"   => NumericListBuiltins.applyAppend(args)
     case "display" =>
       unary(name, args) { e =>
         val buf = outputBuffer.get()
@@ -52,7 +50,7 @@ private[ming] object Builtins:
       Expr.Bool(false)
     case "string-append" | "string-length" | "string-set!" | "string-copy" | "substring" | "string->number" |
         "number->string" | "symbol->string" | "string->symbol" | "string-ref" | "char?" | "string->list" |
-        "list->string" | "char->integer" | "integer->char" =>
+        "list->string" | "char->integer" | "integer->char" | "make-string" | "string" =>
       StringBuiltins.applyStringBuiltin(name, args)
     case "abs" =>
       unary(name, args) {
@@ -69,38 +67,40 @@ private[ming] object Builtins:
     case "expt"      => NumericListBuiltins.applyExpt(args)
     case "zero?" | "positive?" | "negative?" | "odd?" | "even?" =>
       NumericListBuiltins.applyNumericPredicate(name, args)
-    case "list-ref"  => NumericListBuiltins.applyListRef(args)
-    case "list-tail" => NumericListBuiltins.applyListTail(args)
-    case "list?"     => unary(name, args)(e => Expr.Bool(NumericListBuiltins.isList(e)))
-    case "assoc"     => NumericListBuiltins.applyAssoc(args)
-    case "map"       => throw EvalError("map: should be handled by applyProc")
-    case "eq?" =>
-      if args.length != 2 then throw EvalError("eq?: need exactly 2 arguments")
-      Expr.Bool(EqualityOps.eqv(args(0), args(1)))
+    case "list-ref"     => NumericListBuiltins.applyListRef(args)
+    case "list-tail"    => NumericListBuiltins.applyListTail(args)
+    case "list?"        => unary(name, args)(e => Expr.Bool(PairOps.isList(e)))
+    case "assoc"        => NumericListBuiltins.applyAssoc(args)
+    case "map"          => throw EvalError("map: should be handled by applyProc")
+    case "for-each"     => throw EvalError("for-each: should be handled by applyProc")
+    case "eq?" | "eqv?" => applyEqv(name, args)
     case "equal?" =>
       if args.length != 2 then throw EvalError("equal?: need exactly 2 arguments")
       Expr.Bool(EqualityOps.schemeEqual(args(0), args(1)))
-    case "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?" | "char<?" =>
+    case "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?" | "char<?" | "char<=?" |
+        "char>=?" | "char>?" =>
       StringBuiltins.applyCharBuiltin(name, args)
-    case "string=?" | "string<?" | "string-ci=?" | "string-upcase" | "string-downcase" =>
+    case "string=?" | "string<?" | "string-ci=?" | "string-upcase" | "string-downcase" | "string<=?" | "string>=?" |
+        "string>?" =>
       StringBuiltins.applyStringBuiltin(name, args)
     case "exact?" | "inexact?" | "integer?" | "rational?" | "exact->inexact" | "inexact->exact" | "numerator" |
         "denominator" =>
       RationalBuiltins.applyRationalBuiltin(name, args)
-    case "procedure?" => unary(name, args)(isProcedure)
-    case "eqv?" =>
-      if args.length != 2 then throw EvalError("eqv?: need exactly 2 arguments")
-      Expr.Bool(EqualityOps.eqv(args(0), args(1)))
+    case "procedure?" => unary(name, args)(BuiltinRegistry.isProcedure)
     case "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length" | "vector?" | "vector->list" |
         "list->vector" =>
       VectorBuiltins.applyVectorBuiltin(name, args)
+    case "set-car!" => applySetCar(args)
+    case "set-cdr!" => applySetCdr(args)
+    case "reverse" =>
+      unary(name, args)(e => PairOps.makeList(PairOps.toScalaList(e).reverse))
+    case "member" | "memv" | "memq" | "assv" | "assq" =>
+      ListSearchBuiltins.applyListSearch(name, args)
+    case "gcd" | "lcm" | "floor" | "ceiling" | "truncate" | "round" | "sqrt" =>
+      MathBuiltins.applyMathBuiltin(name, args)
+    case "void"  => Expr.Bool(false)
     case "apply" => throw EvalError("apply: should be handled by applyProc")
     case _       => throw EvalError(s"unknown procedure: $name")
-
-  private def isProcedure(e: Expr): Expr = e match
-    case Expr.Lambda(_, _, _, _) | Expr.CaseLambda(_, _) => Expr.Bool(true)
-    case Expr.Sym(n) if builtinNames.contains(n)         => Expr.Bool(true)
-    case _                                               => Expr.Bool(false)
 
   private def applyAdd(args: List[Expr]): Expr =
     if args.isEmpty then return Expr.Num(0)
@@ -137,25 +137,29 @@ private[ming] object Builtins:
     case Expr.Num(_) | Expr.Rational(_, _) => e
     case _                                 => throw EvalError(s"expected number, got ${display(e)}")
 
+  private def applyEqv(name: String, args: List[Expr]): Expr =
+    if args.length != 2 then throw EvalError(s"$name: need exactly 2 arguments")
+    Expr.Bool(EqualityOps.eqv(args(0), args(1)))
+
   private def applyCons(args: List[Expr]): Expr =
     if args.length != 2 then throw EvalError("cons: need exactly 2 arguments")
-    args(1) match
-      case Expr.Lst(elems) => Expr.Lst(args(0) :: elems)
-      case _               => Expr.Pair(args(0), args(1))
+    PairOps.cons(args(0), args(1))
 
-  private def carOf(e: Expr): Expr = e match
-    case Expr.Lst(h :: _) => h
-    case Expr.Pair(a, _)  => a
-    case _                => throw EvalError("car: not a pair")
+  private def applySetCar(args: List[Expr]): Expr =
+    if args.length != 2 then throw EvalError("set-car!: need exactly 2 arguments")
+    args(0) match
+      case Expr.Pair(cell) =>
+        cell.car = args(1)
+        Expr.Bool(false)
+      case _ => throw EvalError("set-car!: not a mutable pair")
 
-  private def cdrOf(e: Expr): Expr = e match
-    case Expr.Lst(_ :: t) => Expr.Lst(t)
-    case Expr.Pair(_, d)  => d
-    case _                => throw EvalError("cdr: not a pair")
-
-  private def lengthOf(e: Expr): Expr = e match
-    case Expr.Lst(elems) => Expr.Num(elems.length.toLong)
-    case _               => throw EvalError("length: not a list")
+  private def applySetCdr(args: List[Expr]): Expr =
+    if args.length != 2 then throw EvalError("set-cdr!: need exactly 2 arguments")
+    args(0) match
+      case Expr.Pair(cell) =>
+        cell.cdr = args(1)
+        Expr.Bool(false)
+      case _ => throw EvalError("set-cdr!: not a mutable pair")
 
   def unary(name: String, args: List[Expr])(f: Expr => Expr): Expr =
     if args.length != 1 then throw EvalError(s"$name: need exactly 1 argument")
@@ -180,100 +184,3 @@ private[ming] object Builtins:
   def display(e: Expr): String = Display.display(e)
 
   private def displayOutput(e: Expr): String = Display.displayOutput(e)
-
-  val builtinNames: List[String] = List(
-    "+",
-    "-",
-    "*",
-    "/",
-    "<",
-    ">",
-    "=",
-    "<=",
-    ">=",
-    "not",
-    "cons",
-    "car",
-    "cdr",
-    "null?",
-    "list",
-    "length",
-    "number?",
-    "string?",
-    "boolean?",
-    "pair?",
-    "symbol?",
-    "append",
-    "display",
-    "write",
-    "newline",
-    "string-append",
-    "string-length",
-    "substring",
-    "string->number",
-    "number->string",
-    "symbol->string",
-    "string->symbol",
-    "string-ref",
-    "string-set!",
-    "string-copy",
-    "char?",
-    "apply",
-    "abs",
-    "modulo",
-    "remainder",
-    "quotient",
-    "min",
-    "max",
-    "expt",
-    "zero?",
-    "positive?",
-    "negative?",
-    "odd?",
-    "even?",
-    "list-ref",
-    "list-tail",
-    "list?",
-    "assoc",
-    "map",
-    "eq?",
-    "equal?",
-    "char-alphabetic?",
-    "char-numeric?",
-    "char-upcase",
-    "char-downcase",
-    "char=?",
-    "char<?",
-    "string=?",
-    "string<?",
-    "string-ci=?",
-    "string-upcase",
-    "string-downcase",
-    "exact?",
-    "inexact?",
-    "integer?",
-    "rational?",
-    "exact->inexact",
-    "inexact->exact",
-    "numerator",
-    "denominator",
-    "procedure?",
-    "eqv?",
-    "vector",
-    "make-vector",
-    "vector-ref",
-    "vector-set!",
-    "vector-length",
-    "vector?",
-    "vector->list",
-    "list->vector",
-    "string->list",
-    "list->string",
-    "char->integer",
-    "integer->char"
-  )
-
-  def makeTopLevelEnv(): Env =
-    val env = Env(scala.collection.mutable.Map.empty, None)
-    for name <- builtinNames do env.define(name, Expr.Sym(name))
-    env

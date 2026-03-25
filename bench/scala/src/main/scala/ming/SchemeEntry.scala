@@ -7,14 +7,14 @@ object SchemeEntry:
     val parser = SchemeParser(input)
     val exprs  = parser.parseAll()
     if exprs.isEmpty then throw EvalError("no expressions")
-    val env = Builtins.makeTopLevelEnv()
+    val env = BuiltinRegistry.makeTopLevelEnv()
     Display.display(exprs.foldLeft(Expr.Bool(false): Expr)((_, e) => Evaluator.eval(e, env)))
 
   def evalStrWithOutput(input: String): (String, String) =
     val parser = SchemeParser(input)
     val exprs  = parser.parseAll()
     if exprs.isEmpty then throw EvalError("no expressions")
-    val env = Builtins.makeTopLevelEnv()
+    val env = BuiltinRegistry.makeTopLevelEnv()
     val buf = new StringBuilder
     Builtins.outputBuffer.set(buf)
     try

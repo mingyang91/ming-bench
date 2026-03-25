@@ -12,12 +12,43 @@ private[ming] object Display:
     case Expr.Chr(c)                => s"#\\$c"
     case Expr.Sym(name)             => name
     case Expr.Lst(elems)            => "(" + elems.map(display).mkString(" ") + ")"
-    case Expr.Pair(a, d)            => s"(${display(a)} . ${display(d)})"
+    case Expr.Pair(cell)            => displayPair(cell)
     case Expr.Lambda(_, _, _, _)    => "#<procedure>"
     case Expr.CaseLambda(_, _)      => "#<procedure>"
     case Expr.Macro(_, _, _)        => "#<macro>"
     case Expr.Vec(elems)            => "#(" + elems.map(display).mkString(" ") + ")"
     case Expr.Record(name, _, _, _) => s"#<record:$name>"
+
+  private def displayPair(cell: MutablePair): String =
+    val visited = java.util.Collections.newSetFromMap(
+      new java.util.IdentityHashMap[MutablePair, java.lang.Boolean]()
+    )
+    val sb = new StringBuilder("(")
+    displayPairContents(cell, visited, sb)
+    sb.append(")")
+    sb.toString
+
+  private def displayPairContents(
+    cell: MutablePair,
+    visited: java.util.Set[MutablePair],
+    sb: StringBuilder
+  ): Unit =
+    if !visited.add(cell) then
+      sb.append("...")
+      return
+    sb.append(display(cell.car))
+    cell.cdr match
+      case Expr.Lst(Nil) => ()
+      case Expr.Pair(next) =>
+        sb.append(" ")
+        displayPairContents(next, visited, sb)
+      case Expr.Lst(elems) =>
+        for e <- elems do
+          sb.append(" ")
+          sb.append(display(e))
+      case other =>
+        sb.append(" . ")
+        sb.append(display(other))
 
   def displayOutput(e: Expr): String = e match
     case Expr.Str(s, _) => new String(s)

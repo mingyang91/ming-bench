@@ -15,13 +15,12 @@ private[ming] object VectorBuiltins:
     case "vector?" => Builtins.unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Vec]))
     case "vector->list" =>
       Builtins.unary(name, args) {
-        case Expr.Vec(elems) => Expr.Lst(elems.toList)
+        case Expr.Vec(elems) => PairOps.makeList(elems.toList)
         case _               => throw EvalError("vector->list: not a vector")
       }
     case "list->vector" =>
-      Builtins.unary(name, args) {
-        case Expr.Lst(elems) => Expr.Vec(elems.toArray)
-        case _               => throw EvalError("list->vector: not a list")
+      Builtins.unary(name, args) { e =>
+        Expr.Vec(PairOps.toScalaList(e).toArray)
       }
     case _ => throw EvalError(s"unknown vector procedure: $name")
 
