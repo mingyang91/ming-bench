@@ -21,7 +21,8 @@ const (
 	tokChar
 	tokFloat
 	tokRational
-	tokVecOpen // #(
+	tokVecOpen     // #(
+	tokSyntaxQuote // #'
 	tokEOF
 )
 
@@ -127,6 +128,12 @@ func tokenize(input string) ([]token, error) {
 		if ch == '#' {
 			if i+1 < len(input) {
 				next := input[i+1]
+				if next == '\'' {
+					tokens = append(tokens, token{tokSyntaxQuote, "#'", line, startCol})
+					i += 2
+					col += 2
+					continue
+				}
 				if next == '(' {
 					tokens = append(tokens, token{tokVecOpen, "#(", line, startCol})
 					i += 2
@@ -381,6 +388,17 @@ func (p *parser) parseExpr() (Expr, error) {
 		}
 		return &ListExpr{
 			Elems: []Expr{&SymbolExpr{Name: "quote", Line: t.line, Col: t.col}, inner},
+			Line:  t.line,
+			Col:   t.col,
+		}, nil
+	case tokSyntaxQuote:
+		p.next()
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ListExpr{
+			Elems: []Expr{&SymbolExpr{Name: "syntax", Line: t.line, Col: t.col}, inner},
 			Line:  t.line,
 			Col:   t.col,
 		}, nil

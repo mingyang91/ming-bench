@@ -398,6 +398,36 @@ func writeValue(v Value) string {
 	return v.String()
 }
 
+// SyntaxVal represents a syntax object (wrapped expression with lexical context).
+type SyntaxVal struct {
+	Expr Expr
+	Env  *Env
+}
+
+func (v *SyntaxVal) String() string {
+	return "#<syntax>"
+}
+
+// SyntaxListVal represents a list of syntax objects (from ellipsis pattern matching).
+type SyntaxListVal struct {
+	Elems []*SyntaxVal
+}
+
+func (v *SyntaxListVal) String() string {
+	return "#<syntax-list>"
+}
+
+// MacroTransformerVal is a procedural macro transformer (for syntax-case macros).
+type MacroTransformerVal struct {
+	Name   string
+	Proc   *LambdaVal
+	DefEnv *Env
+}
+
+func (v *MacroTransformerVal) String() string {
+	return fmt.Sprintf("#<macro %s>", v.Name)
+}
+
 func isTruthy(v Value) bool {
 	if b, ok := v.(*BoolVal); ok {
 		return b.Val

@@ -43,7 +43,8 @@ var specialForms = map[string]bool{
 	"set!": true, "not": true, "define-syntax": true,
 }
 
-// evalDefineSyntax handles (define-syntax name (syntax-rules ...)).
+// evalDefineSyntax handles (define-syntax name (syntax-rules ...)) and
+// (define-syntax name (lambda (stx) ...)) for syntax-case transformers.
 func evalDefineSyntax(e *ListExpr, env *Env) (Value, error) {
 	if len(e.Elems) != 3 {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax requires 2 arguments", e.Line, e.Col)}
@@ -52,49 +53,63 @@ func evalDefineSyntax(e *ListExpr, env *Env) (Value, error) {
 	if !ok {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected symbol", e.Line, e.Col)}
 	}
-	srExpr, ok := e.Elems[2].(*ListExpr)
-	if !ok || len(srExpr.Elems) < 2 {
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules", e.Line, e.Col)}
-	}
-	srHead, ok := srExpr.Elems[0].(*SymbolExpr)
-	if !ok || srHead.Name != "syntax-rules" {
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules", e.Line, e.Col)}
-	}
-	litList, ok := srExpr.Elems[1].(*ListExpr)
-	if !ok {
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-rules: expected literal list", e.Line, e.Col)}
-	}
-	var literals []string
-	for _, l := range litList.Elems {
-		ls, ok := l.(*SymbolExpr)
-		if !ok {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-rules: literal must be a symbol", e.Line, e.Col)}
+
+	// Check if it's a syntax-rules form
+	if srExpr, ok := e.Elems[2].(*ListExpr); ok && len(srExpr.Elems) >= 2 {
+		if srHead, ok := srExpr.Elems[0].(*SymbolExpr); ok && srHead.Name == "syntax-rules" {
+			litList, ok := srExpr.Elems[1].(*ListExpr)
+			if !ok {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-rules: expected literal list", e.Line, e.Col)}
+			}
+			var literals []string
+			for _, l := range litList.Elems {
+				ls, ok := l.(*SymbolExpr)
+				if !ok {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-rules: literal must be a symbol", e.Line, e.Col)}
+				}
+				literals = append(literals, ls.Name)
+			}
+			var rules []syntaxRule
+			for _, r := range srExpr.Elems[2:] {
+				rl, ok := r.(*ListExpr)
+				if !ok || len(rl.Elems) != 2 {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-rules: bad rule", e.Line, e.Col)}
+				}
+				patternExpr, ok := rl.Elems[0].(*ListExpr)
+				if !ok {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-rules: pattern must be a list", e.Line, e.Col)}
+				}
+				rules = append(rules, syntaxRule{
+					Pattern:  patternExpr.Elems[1:], // skip macro name in pattern
+					Template: rl.Elems[1],
+				})
+			}
+			macro := &SyntaxRulesVal{
+				Name:     nameSym.Name,
+				Literals: literals,
+				Rules:    rules,
+				DefEnv:   env,
+			}
+			env.set(nameSym.Name, macro)
+			return &VoidVal{}, nil
 		}
-		literals = append(literals, ls.Name)
 	}
-	var rules []syntaxRule
-	for _, r := range srExpr.Elems[2:] {
-		rl, ok := r.(*ListExpr)
-		if !ok || len(rl.Elems) != 2 {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-rules: bad rule", e.Line, e.Col)}
+
+	// Otherwise, evaluate as expression (supports lambda transformers for syntax-case)
+	val, err := evalExpr(e.Elems[2], env)
+	if err != nil {
+		return nil, err
+	}
+	if lambda, ok := val.(*LambdaVal); ok {
+		transformer := &MacroTransformerVal{
+			Name:   nameSym.Name,
+			Proc:   lambda,
+			DefEnv: env,
 		}
-		patternExpr, ok := rl.Elems[0].(*ListExpr)
-		if !ok {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-rules: pattern must be a list", e.Line, e.Col)}
-		}
-		rules = append(rules, syntaxRule{
-			Pattern:  patternExpr.Elems[1:], // skip macro name in pattern
-			Template: rl.Elems[1],
-		})
+		env.set(nameSym.Name, transformer)
+		return &VoidVal{}, nil
 	}
-	macro := &SyntaxRulesVal{
-		Name:     nameSym.Name,
-		Literals: literals,
-		Rules:    rules,
-		DefEnv:   env,
-	}
-	env.set(nameSym.Name, macro)
-	return &VoidVal{}, nil
+	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: transformer must be syntax-rules or procedure", e.Line, e.Col)}
 }
 
 // expandMacro expands a macro application.
@@ -335,4 +350,137 @@ func copyBindings(b map[string]interface{}) map[string]interface{} {
 		c[k] = v
 	}
 	return c
+}
+
+// instantiateSyntaxCaseTemplate replaces pattern variables (bound as SyntaxVal/SyntaxListVal
+// in env) within a template Expr. Non-pattern-variable symbols are left as-is.
+func instantiateSyntaxCaseTemplate(tmpl Expr, env *Env) Expr {
+	switch t := tmpl.(type) {
+	case *SymbolExpr:
+		if val, ok := env.get(t.Name); ok {
+			if sv, ok := val.(*SyntaxVal); ok {
+				return sv.Expr
+			}
+		}
+		return t
+	case *ListExpr:
+		var newElems []Expr
+		for i := 0; i < len(t.Elems); i++ {
+			// Check for ellipsis
+			if i+1 < len(t.Elems) {
+				if sym, ok := t.Elems[i+1].(*SymbolExpr); ok && sym.Name == "..." {
+					listVars := findSyntaxCaseListVars(t.Elems[i], env)
+					if len(listVars) > 0 {
+						firstListVal, _ := env.get(listVars[0])
+						firstList := firstListVal.(*SyntaxListVal)
+						count := len(firstList.Elems)
+						for j := 0; j < count; j++ {
+							subEnv := newEnv(env)
+							for _, lv := range listVars {
+								lvVal, _ := env.get(lv)
+								sl := lvVal.(*SyntaxListVal)
+								subEnv.set(lv, sl.Elems[j])
+							}
+							newElems = append(newElems, instantiateSyntaxCaseTemplate(t.Elems[i], subEnv))
+						}
+					}
+					i++ // skip ...
+					continue
+				}
+			}
+			newElems = append(newElems, instantiateSyntaxCaseTemplate(t.Elems[i], env))
+		}
+		return &ListExpr{Elems: newElems, Line: t.Line, Col: t.Col}
+	default:
+		return tmpl
+	}
+}
+
+func findSyntaxCaseListVars(tmpl Expr, env *Env) []string {
+	var vars []string
+	findSyntaxCaseListVarsHelper(tmpl, env, &vars)
+	return vars
+}
+
+func findSyntaxCaseListVarsHelper(tmpl Expr, env *Env, vars *[]string) {
+	switch t := tmpl.(type) {
+	case *SymbolExpr:
+		if val, ok := env.get(t.Name); ok {
+			if _, ok := val.(*SyntaxListVal); ok {
+				*vars = append(*vars, t.Name)
+			}
+		}
+	case *ListExpr:
+		for _, e := range t.Elems {
+			findSyntaxCaseListVarsHelper(e, env, vars)
+		}
+	}
+}
+
+// syntaxToDatum converts a parsed Expr to a Scheme Value.
+func syntaxToDatum(e Expr) (Value, error) {
+	switch ex := e.(type) {
+	case *NumberExpr:
+		return &IntVal{Val: ex.Val}, nil
+	case *FloatExpr:
+		return &FloatVal{Val: ex.Val}, nil
+	case *RationalExpr:
+		return makeRat(ex.Num, ex.Den), nil
+	case *StringExpr:
+		return &StringVal{Val: ex.Val}, nil
+	case *BoolExpr:
+		return &BoolVal{Val: ex.Val}, nil
+	case *CharExpr:
+		return &CharVal{Val: ex.Val}, nil
+	case *SymbolExpr:
+		return &SymbolVal{Val: ex.Name}, nil
+	case *ListExpr:
+		var result Value = &NilVal{}
+		for i := len(ex.Elems) - 1; i >= 0; i-- {
+			elem, err := syntaxToDatum(ex.Elems[i])
+			if err != nil {
+				return nil, err
+			}
+			result = &PairVal{Car: elem, Cdr: result}
+		}
+		return result, nil
+	case *EnvRefExpr:
+		return &SymbolVal{Val: ex.Name}, nil
+	default:
+		return &VoidVal{}, nil
+	}
+}
+
+// datumToExpr converts a Scheme Value to a parsed Expr.
+func datumToExpr(v Value) Expr {
+	switch val := v.(type) {
+	case *IntVal:
+		return &NumberExpr{Val: val.Val}
+	case *FloatVal:
+		return &FloatExpr{Val: val.Val}
+	case *BoolVal:
+		return &BoolExpr{Val: val.Val}
+	case *StringVal:
+		return &StringExpr{Val: val.Val}
+	case *CharVal:
+		return &CharExpr{Val: val.Val}
+	case *SymbolVal:
+		return &SymbolExpr{Name: val.Val}
+	case *PairVal:
+		var elems []Expr
+		cur := Value(val)
+		for {
+			if p, ok := cur.(*PairVal); ok {
+				elems = append(elems, datumToExpr(p.Car))
+				cur = p.Cdr
+			} else {
+				break
+			}
+		}
+		return &ListExpr{Elems: elems}
+	case *NilVal:
+		return &ListExpr{Elems: nil}
+	default:
+		return &SymbolExpr{Name: "#<unknown>"}
+	}
 }

@@ -457,11 +457,40 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 				return &VoidVal{}, nil
 			case "do":
 				return evalDo(e, env)
+			case "syntax-case":
+				result, scerr := evalSyntaxCase(e, env)
+				if scerr != nil {
+					return nil, scerr
+				}
+				return result, nil
+			case "syntax":
+				if len(e.Elems) != 2 {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax requires 1 argument", e.Line, e.Col)}
+				}
+				resultExpr := instantiateSyntaxCaseTemplate(e.Elems[1], env)
+				return &SyntaxVal{Expr: resultExpr}, nil
+			case "with-syntax":
+				result, wserr := evalWithSyntax(e, env)
+				if wserr != nil {
+					return nil, wserr
+				}
+				if wsStx, ok := result.(*SyntaxVal); ok {
+					_ = wsStx
+				}
+				return result, nil
 			}
 			// Check if symbol is bound to a macro
 			if v, ok := env.get(sym.Name); ok {
 				if macro, ok := v.(*SyntaxRulesVal); ok {
 					expanded, merr := expandMacro(macro, e)
+					if merr != nil {
+						return nil, merr
+					}
+					expr = expanded
+					continue
+				}
+				if transformer, ok := v.(*MacroTransformerVal); ok {
+					expanded, merr := expandSyntaxCaseMacro(transformer, e, env)
 					if merr != nil {
 						return nil, merr
 					}
@@ -475,6 +504,14 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 			if v, ok := ref.Env.get(ref.Name); ok {
 				if macro, ok := v.(*SyntaxRulesVal); ok {
 					expanded, merr := expandMacro(macro, e)
+					if merr != nil {
+						return nil, merr
+					}
+					expr = expanded
+					continue
+				}
+				if transformer, ok := v.(*MacroTransformerVal); ok {
+					expanded, merr := expandSyntaxCaseMacro(transformer, e, env)
 					if merr != nil {
 						return nil, merr
 					}
@@ -2822,6 +2859,30 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 		return &StringVal{Val: buf.String()}, nil
 	}})
 
+	// syntax->datum: convert syntax object to datum value
+	env.set("syntax->datum", &BuiltinFunc{Name: "syntax->datum", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "syntax->datum: need 1 argument"}
+		}
+		sv, ok := args[0].(*SyntaxVal)
+		if !ok {
+			return nil, &EvalError{Message: "syntax->datum: expected syntax object"}
+		}
+		return syntaxToDatum(sv.Expr)
+	}})
+
+	// datum->syntax: convert datum to syntax object with given lexical context
+	env.set("datum->syntax", &BuiltinFunc{Name: "datum->syntax", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "datum->syntax: need 2 arguments"}
+		}
+		var ctxEnv *Env
+		if ctxSv, ok := args[0].(*SyntaxVal); ok {
+			ctxEnv = ctxSv.Env
+		}
+		return &SyntaxVal{Expr: datumToExpr(args[1]), Env: ctxEnv}, nil
+	}})
+
 	return env
 }
 
@@ -3429,6 +3490,160 @@ func applyCallable(f Value, args []Value) (Value, error) {
 	default:
 		return nil, &EvalError{Message: "not a procedure"}
 	}
+}
+
+// expandSyntaxCaseMacro expands a syntax-case macro application.
+func expandSyntaxCaseMacro(transformer *MacroTransformerVal, form *ListExpr, useEnv *Env) (Expr, error) {
+	stx := &SyntaxVal{Expr: form, Env: useEnv}
+
+	// Call the transformer lambda with stx as argument
+	callEnv := newEnv(transformer.Proc.Env)
+	if len(transformer.Proc.Params) > 0 {
+		callEnv.set(transformer.Proc.Params[0], stx)
+	}
+
+	var result Value
+	var rerr error
+	for i, bodyExpr := range transformer.Proc.Body {
+		result, rerr = evalExpr(bodyExpr, callEnv)
+		if rerr != nil {
+			return nil, rerr
+		}
+		_ = i
+	}
+
+	// Result should be a SyntaxVal; unwrap to Expr
+	if sv, ok := result.(*SyntaxVal); ok {
+		return sv.Expr, nil
+	}
+	line, col := form.pos()
+	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: macro transformer must return syntax object", line, col)}
+}
+
+// evalSyntaxCase evaluates a syntax-case form.
+func evalSyntaxCase(e *ListExpr, env *Env) (Value, error) {
+	// (syntax-case stx-expr (literal ...) clause ...)
+	if len(e.Elems) < 4 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-case: bad form", e.Line, e.Col)}
+	}
+
+	// Evaluate the scrutinee
+	stxVal, err := evalExpr(e.Elems[1], env)
+	if err != nil {
+		return nil, err
+	}
+
+	var stxExpr Expr
+	if sv, ok := stxVal.(*SyntaxVal); ok {
+		stxExpr = sv.Expr
+	} else {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-case: expected syntax object", e.Line, e.Col)}
+	}
+
+	// Parse literals
+	litList, ok := e.Elems[2].(*ListExpr)
+	if !ok {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-case: expected literal list", e.Line, e.Col)}
+	}
+	var literals []string
+	for _, l := range litList.Elems {
+		ls, ok := l.(*SymbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-case: literal must be symbol", e.Line, e.Col)}
+		}
+		literals = append(literals, ls.Name)
+	}
+
+	// Try each clause
+	for _, clause := range e.Elems[3:] {
+		cl, ok := clause.(*ListExpr)
+		if !ok || len(cl.Elems) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-case: bad clause", e.Line, e.Col)}
+		}
+
+		pattern := cl.Elems[0]
+		var fender Expr
+		var bodyExpr Expr
+		if len(cl.Elems) == 2 {
+			bodyExpr = cl.Elems[1]
+		} else {
+			fender = cl.Elems[1]
+			bodyExpr = cl.Elems[2]
+		}
+
+		// Match pattern against stxExpr
+		bindings := make(map[string]interface{})
+		if matchSinglePattern(pattern, stxExpr, literals, bindings) {
+			// Create new env with pattern variable bindings as SyntaxVal
+			clauseEnv := newEnv(env)
+			for name, val := range bindings {
+				switch v := val.(type) {
+				case Expr:
+					clauseEnv.set(name, &SyntaxVal{Expr: v})
+				case []Expr:
+					elems := make([]*SyntaxVal, len(v))
+					for i, ex := range v {
+						elems[i] = &SyntaxVal{Expr: ex}
+					}
+					clauseEnv.set(name, &SyntaxListVal{Elems: elems})
+				}
+			}
+
+			// Evaluate fender if present
+			if fender != nil {
+				fVal, ferr := evalExpr(fender, clauseEnv)
+				if ferr != nil {
+					return nil, ferr
+				}
+				if !isTruthy(fVal) {
+					continue
+				}
+			}
+
+			// Evaluate body
+			return evalExpr(bodyExpr, clauseEnv)
+		}
+	}
+	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax-case: no matching pattern", e.Line, e.Col)}
+}
+
+// evalWithSyntax evaluates a with-syntax form.
+func evalWithSyntax(e *ListExpr, env *Env) (Value, error) {
+	// (with-syntax ((pattern expr) ...) body ...)
+	if len(e.Elems) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: with-syntax: bad form", e.Line, e.Col)}
+	}
+	bindingList, ok := e.Elems[1].(*ListExpr)
+	if !ok {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: with-syntax: expected binding list", e.Line, e.Col)}
+	}
+	wsEnv := newEnv(env)
+	for _, binding := range bindingList.Elems {
+		bl, ok := binding.(*ListExpr)
+		if !ok || len(bl.Elems) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: with-syntax: bad binding", e.Line, e.Col)}
+		}
+		val, verr := evalExpr(bl.Elems[1], env)
+		if verr != nil {
+			return nil, verr
+		}
+		if sym, ok := bl.Elems[0].(*SymbolExpr); ok {
+			wsEnv.set(sym.Name, val)
+		} else {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: with-syntax: expected symbol in binding", e.Line, e.Col)}
+		}
+	}
+	// Evaluate body
+	body := e.Elems[2:]
+	var result Value
+	var rerr error
+	for _, bodyExpr := range body {
+		result, rerr = evalExpr(bodyExpr, wsEnv)
+		if rerr != nil {
+			return nil, rerr
+		}
+	}
+	return result, nil
 }
 
 func EvalStr(input string) (string, error) {
