@@ -13,10 +13,7 @@ use eval::Evaluator;
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parser::parse(input)?;
     let mut evaluator = Evaluator::new();
-    let mut result = value::Value::Void;
-    for expr in &exprs {
-        result = evaluator.eval(expr)?;
-    }
+    let result = evaluator.eval_all(&exprs)?;
     match result {
         value::Value::Void => Ok("".into()),
         _ => Ok(result.to_display_string()),
@@ -28,10 +25,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let exprs = parser::parse(input)?;
     let mut evaluator = Evaluator::new();
-    let mut result = value::Value::Void;
-    for expr in &exprs {
-        result = evaluator.eval(expr)?;
-    }
+    let result = evaluator.eval_all(&exprs)?;
     let output = evaluator.take_output();
     let result_str = match result {
         value::Value::Void => "".into(),

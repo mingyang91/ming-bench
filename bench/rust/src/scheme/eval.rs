@@ -12,6 +12,34 @@ enum TailResult {
     TailCall { lambda: Rc<LambdaData>, args: Vec<Value>, pos: String },
 }
 
+// ===== CEK Machine for call/cc support =====
+// Uses Vec<Frame> stack for performance; captured continuations clone the vec.
+
+type CapturedKont = Vec<Frame>;
+
+#[derive(Clone)]
+enum Frame {
+    If { cons: Expr, alt: Option<Expr>, env: Env },
+    Seq { rest: Vec<Expr>, env: Env },
+    Def { name: String, env: Env },
+    Set { name: String, env: Env, pos: String },
+    /// Evaluate operator; args are unevaluated arg expressions
+    Op { args: Vec<Expr>, env: Env, pos: String },
+    /// Evaluating arguments right-to-left; done accumulates in reverse order
+    Arg { op: Value, done: Vec<Value>, rest: Vec<Expr>, env: Env, pos: String },
+    And { rest: Vec<Expr>, env: Env },
+    Or { rest: Vec<Expr>, env: Env },
+    LetBind { var: String, rest: Vec<(String, Expr)>, done: Vec<(String, Value)>, body: Vec<Expr>, env: Env, pos: String },
+    NamedLetBind { name: String, params: Vec<String>, rest: Vec<(String, Expr)>, done: Vec<Value>, body: Vec<Expr>, env: Env, pos: String },
+    ProcCheck,
+    NotCheck,
+}
+
+enum CekState {
+    Eval(Expr, Env),
+    Ret(Value),
+}
+
 /// Convert a float to an exact rational (numerator, denominator).
 fn float_to_rational(f: f64) -> (i64, i64) {
     if f == f.floor() {
@@ -49,11 +77,20 @@ pub struct Evaluator {
     output: String,
     gensym_counter: u64,
     record_type_counter: u64,
+    // call/cc support
+    continuations: HashMap<u64, CapturedKont>,
+    next_cont_id: u64,
+    pending_continuation: Option<(CapturedKont, Value)>,
 }
 
 impl Evaluator {
     pub fn new() -> Self {
-        Evaluator { env: Env::new(), output: String::new(), gensym_counter: 0, record_type_counter: 0 }
+        Evaluator {
+            env: Env::new(), output: String::new(),
+            gensym_counter: 0, record_type_counter: 0,
+            continuations: HashMap::new(), next_cont_id: 0,
+            pending_continuation: None,
+        }
     }
 
     pub fn eval(&mut self, expr: &Expr) -> Result<Value, EvalError> {
@@ -61,6 +98,443 @@ impl Evaluator {
         let result = self.eval_in_env(expr, &mut env);
         self.env = env;
         result
+    }
+
+    /// Evaluate all expressions in a single CEK run (needed for call/cc to capture
+    /// the continuation across multiple top-level expressions).
+    pub fn eval_all(&mut self, exprs: &[Expr]) -> Result<Value, EvalError> {
+        if exprs.is_empty() {
+            return Ok(Value::Void);
+        }
+        let env = self.env.clone();
+        let mut state = CekState::Eval(exprs[0].clone(), env.clone());
+        let mut kstack: Vec<Frame> = Vec::new();
+        if exprs.len() > 1 {
+            kstack.push(Frame::Seq { rest: exprs[1..].to_vec(), env });
+        }
+        self.run_cek(&mut state, &mut kstack)
+    }
+
+    // ===== CEK Machine =====
+
+    fn run_cek(&mut self, state: &mut CekState, kstack: &mut Vec<Frame>) -> Result<Value, EvalError> {
+        loop {
+            let step_result = self.cek_step(state, kstack);
+            match step_result {
+                Ok(Some(val)) => return Ok(val),
+                Ok(None) => {}
+                Err(EvalError::ContinuationInvoked) => {
+                    let (captured, val) = self.pending_continuation.take().unwrap();
+                    *kstack = captured;
+                    *state = CekState::Ret(val);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn cek_step(&mut self, state: &mut CekState, kstack: &mut Vec<Frame>) -> Result<Option<Value>, EvalError> {
+        match std::mem::replace(state, CekState::Ret(Value::Void)) {
+            CekState::Eval(expr, env) => {
+                self.cek_eval(expr, env, kstack, state)?;
+                Ok(None)
+            }
+            CekState::Ret(val) => {
+                if let Some(frame) = kstack.pop() {
+                    self.cek_ret(frame, val, kstack, state)?;
+                    Ok(None)
+                } else {
+                    Ok(Some(val))
+                }
+            }
+        }
+    }
+
+    fn cek_eval(&mut self, expr: Expr, env: Env, kstack: &mut Vec<Frame>, s: &mut CekState) -> Result<(), EvalError> {
+        let pos = expr.pos_str();
+        match &expr.kind {
+            ExprKind::Integer(n) => *s = CekState::Ret(Value::Integer(*n)),
+            ExprKind::Float(f) => *s = CekState::Ret(Value::Float(*f)),
+            ExprKind::Rational(n, d) => *s = CekState::Ret(Value::make_rational(*n, *d)),
+            ExprKind::Boolean(b) => *s = CekState::Ret(Value::Boolean(*b)),
+            ExprKind::Char(c) => *s = CekState::Ret(Value::Char(*c)),
+            ExprKind::Str(st) => *s = CekState::Ret(Value::Str(st.clone(), false)),
+            ExprKind::Symbol(name) => {
+                if let Some(v) = env.get(name) {
+                    *s = CekState::Ret(v);
+                } else if Self::is_builtin(name) || name == "call/cc" || name == "call-with-current-continuation" {
+                    *s = CekState::Ret(Value::Symbol(name.clone()));
+                } else {
+                    return Err(EvalError::UnboundVariable(format!("{name} at {pos}")));
+                }
+            }
+            ExprKind::List(elems) => {
+                if elems.is_empty() {
+                    *s = CekState::Ret(Value::Nil);
+                } else {
+                    self.cek_eval_list(elems, env, kstack, s, &pos)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cek_eval_list(&mut self, elems: &[Expr], env: Env, k: &mut Vec<Frame>, s: &mut CekState, pos: &str) -> Result<(), EvalError> {
+        if let ExprKind::Symbol(name) = &elems[0].kind {
+            match name.as_str() {
+                "if" => {
+                    let args = &elems[1..];
+                    if args.len() < 2 || args.len() > 3 {
+                        return Err(EvalError::Arity(format!("if: expected 2 or 3 arguments at {pos}")));
+                    }
+                    k.push(Frame::If { cons: args[1].clone(), alt: args.get(2).cloned(), env: env.clone() });
+                    *s = CekState::Eval(args[0].clone(), env);
+                    return Ok(());
+                }
+                "begin" => return self.cek_begin(&elems[1..], env, k, s),
+                "define" => return self.cek_define(&elems[1..], env, k, s, pos),
+                "set!" => {
+                    let args = &elems[1..];
+                    if args.len() != 2 { return Err(EvalError::Arity(format!("set!: expected 2 args at {pos}"))); }
+                    let nm = match &args[0].kind {
+                        ExprKind::Symbol(s) => s.clone(),
+                        _ => return Err(EvalError::Parse(format!("set!: expected symbol at {pos}"))),
+                    };
+                    k.push(Frame::Set { name: nm, env: env.clone(), pos: pos.to_string() });
+                    *s = CekState::Eval(args[1].clone(), env);
+                    return Ok(());
+                }
+                "let" => return self.cek_let(&elems[1..], env, k, s, pos),
+                "and" => {
+                    let args = &elems[1..];
+                    if args.is_empty() { *s = CekState::Ret(Value::Boolean(true)); }
+                    else if args.len() == 1 { *s = CekState::Eval(args[0].clone(), env); }
+                    else {
+                        k.push(Frame::And { rest: args[1..].to_vec(), env: env.clone() });
+                        *s = CekState::Eval(args[0].clone(), env);
+                    }
+                    return Ok(());
+                }
+                "or" => {
+                    let args = &elems[1..];
+                    if args.is_empty() { *s = CekState::Ret(Value::Boolean(false)); }
+                    else if args.len() == 1 { *s = CekState::Eval(args[0].clone(), env); }
+                    else {
+                        k.push(Frame::Or { rest: args[1..].to_vec(), env: env.clone() });
+                        *s = CekState::Eval(args[0].clone(), env);
+                    }
+                    return Ok(());
+                }
+                "quote" => {
+                    if elems.len() != 2 { return Err(EvalError::Arity(format!("quote: expected 1 argument at {pos}"))); }
+                    *s = CekState::Ret(Self::expr_to_value(&elems[1]));
+                    return Ok(());
+                }
+                "lambda" => { *s = CekState::Ret(self.eval_lambda(&elems[1..], &env, pos)?); return Ok(()); }
+                "case-lambda" => { *s = CekState::Ret(self.eval_case_lambda(&elems[1..], &env, pos)?); return Ok(()); }
+                "procedure?" => {
+                    if elems.len() != 2 { return Err(EvalError::Arity(format!("procedure?: expected 1 arg at {pos}"))); }
+                    k.push(Frame::ProcCheck);
+                    *s = CekState::Eval(elems[1].clone(), env);
+                    return Ok(());
+                }
+                "not" => {
+                    if elems.len() != 2 { return Err(EvalError::Arity(format!("not: expected 1 arg at {pos}"))); }
+                    k.push(Frame::NotCheck);
+                    *s = CekState::Eval(elems[1].clone(), env);
+                    return Ok(());
+                }
+                "cond" | "case" | "do" | "let*" | "letrec" | "letrec*" | "string-set!"
+                | "define-syntax" | "define-record-type" => {
+                    let mut env_mut = env;
+                    *s = CekState::Ret(self.tree_eval_form(name, elems, &mut env_mut, pos)?);
+                    return Ok(());
+                }
+                _ => {
+                    if let Some(Value::Macro(macro_data)) = env.get(name) {
+                        let (expanded, eval_env) = self.expand_macro_only(&macro_data, elems, &env, pos)?;
+                        *s = CekState::Eval(expanded, eval_env);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        // Function call: evaluate operator, then args right-to-left
+        k.push(Frame::Op { args: elems[1..].to_vec(), env: env.clone(), pos: pos.to_string() });
+        *s = CekState::Eval(elems[0].clone(), env);
+        Ok(())
+    }
+
+    fn cek_ret(&mut self, frame: Frame, val: Value, k: &mut Vec<Frame>, s: &mut CekState) -> Result<(), EvalError> {
+        match frame {
+            Frame::If { cons, alt, env } => {
+                if val.is_truthy() { *s = CekState::Eval(cons, env); }
+                else if let Some(alt) = alt { *s = CekState::Eval(alt, env); }
+                else { *s = CekState::Ret(Value::Void); }
+            }
+            Frame::Seq { rest, env } => { self.cek_begin(&rest, env, k, s)?; }
+            Frame::Def { name, env } => { env.define(name, val); *s = CekState::Ret(Value::Void); }
+            Frame::Set { name, env, pos } => {
+                if !env.set(&name, val) { return Err(EvalError::UnboundVariable(format!("{name} at {pos}"))); }
+                *s = CekState::Ret(Value::Void);
+            }
+            Frame::Op { args, env, pos } => {
+                if args.is_empty() {
+                    self.cek_apply(val, vec![], k, s, &pos)?;
+                } else {
+                    let last = args.len() - 1;
+                    k.push(Frame::Arg { op: val, done: vec![], rest: args[..last].to_vec(), env: env.clone(), pos });
+                    *s = CekState::Eval(args[last].clone(), env);
+                }
+            }
+            Frame::Arg { op, mut done, rest, env, pos } => {
+                done.push(val);
+                if rest.is_empty() {
+                    done.reverse();
+                    self.cek_apply(op, done, k, s, &pos)?;
+                } else {
+                    let last = rest.len() - 1;
+                    k.push(Frame::Arg { op, done, rest: rest[..last].to_vec(), env: env.clone(), pos });
+                    *s = CekState::Eval(rest[last].clone(), env);
+                }
+            }
+            Frame::And { rest, env } => {
+                if !val.is_truthy() { *s = CekState::Ret(val); }
+                else if rest.len() == 1 { *s = CekState::Eval(rest[0].clone(), env); }
+                else {
+                    k.push(Frame::And { rest: rest[1..].to_vec(), env: env.clone() });
+                    *s = CekState::Eval(rest[0].clone(), env);
+                }
+            }
+            Frame::Or { rest, env } => {
+                if val.is_truthy() { *s = CekState::Ret(val); }
+                else if rest.len() == 1 { *s = CekState::Eval(rest[0].clone(), env); }
+                else {
+                    k.push(Frame::Or { rest: rest[1..].to_vec(), env: env.clone() });
+                    *s = CekState::Eval(rest[0].clone(), env);
+                }
+            }
+            Frame::LetBind { var, rest, mut done, body, env, pos } => {
+                done.push((var, val));
+                if rest.is_empty() {
+                    let mut new_env = env.child();
+                    for (n, v) in done { new_env.define(n, v); }
+                    self.cek_begin(&body, new_env, k, s)?;
+                } else {
+                    let next = rest[0].clone();
+                    k.push(Frame::LetBind { var: next.0, rest: rest[1..].to_vec(), done, body, env: env.clone(), pos });
+                    *s = CekState::Eval(next.1, env);
+                }
+            }
+            Frame::NamedLetBind { name, params, rest, mut done, body, env, pos } => {
+                done.push(val);
+                if rest.is_empty() {
+                    let loop_env = env.child();
+                    let lambda = Rc::new(LambdaData { params: params.clone(), rest_param: None, body: body.clone(), env: loop_env.clone() });
+                    loop_env.define(name.clone(), Value::Lambda(lambda));
+                    let rec = Rc::new(LambdaData { params, rest_param: None, body, env: loop_env.clone() });
+                    loop_env.define(name, Value::Lambda(rec.clone()));
+                    self.cek_apply(Value::Lambda(rec), done, k, s, &pos)?;
+                } else {
+                    let next = rest[0].clone();
+                    k.push(Frame::NamedLetBind { name, params, rest: rest[1..].to_vec(), done, body, env: env.clone(), pos });
+                    *s = CekState::Eval(next.1, env);
+                }
+            }
+            Frame::ProcCheck => {
+                *s = CekState::Ret(Value::Boolean(matches!(val,
+                    Value::Lambda(_) | Value::CaseLambda(_) | Value::Continuation(_) |
+                    Value::RecordConstructor(..) | Value::RecordPredicate(_) | Value::RecordAccessor(..)
+                )));
+            }
+            Frame::NotCheck => { *s = CekState::Ret(Value::Boolean(!val.is_truthy())); }
+        }
+        Ok(())
+    }
+
+    fn cek_apply(&mut self, op: Value, args: Vec<Value>, k: &mut Vec<Frame>, s: &mut CekState, pos: &str) -> Result<(), EvalError> {
+        match &op {
+            Value::Lambda(data) => {
+                let call_env = Self::bind_lambda_args(data, args, pos)?;
+                self.cek_begin(&data.body, call_env, k, s)?;
+            }
+            Value::CaseLambda(clauses) => {
+                for clause in clauses {
+                    let m = if clause.rest_param.is_some() { args.len() >= clause.params.len() } else { args.len() == clause.params.len() };
+                    if m { return self.cek_apply(Value::Lambda(clause.clone()), args, k, s, pos); }
+                }
+                return Err(EvalError::Arity(format!("case-lambda: no clause for {} args at {pos}", args.len())));
+            }
+            Value::Continuation(id) => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("continuation: expected 1 arg at {pos}"))); }
+                let captured = self.continuations.get(id).cloned()
+                    .ok_or_else(|| EvalError::Custom(format!("invalid continuation at {pos}")))?;
+                *k = captured;
+                *s = CekState::Ret(args.into_iter().next().unwrap());
+            }
+            Value::Symbol(name) if name == "call/cc" || name == "call-with-current-continuation" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("call/cc: expected 1 arg at {pos}"))); }
+                let id = self.next_cont_id;
+                self.next_cont_id += 1;
+                self.continuations.insert(id, k.clone());
+                let cont_val = Value::Continuation(id);
+                let func = args.into_iter().next().unwrap();
+                self.cek_apply(func, vec![cont_val], k, s, pos)?;
+            }
+            Value::Symbol(name) if name == "apply" => {
+                if args.len() < 2 { return Err(EvalError::Arity(format!("apply: expected at least 2 args at {pos}"))); }
+                let proc = args[0].clone();
+                let last = &args[args.len() - 1];
+                let tail = last.to_vec().ok_or_else(|| EvalError::Type(format!("apply: last arg must be list at {pos}")))?;
+                let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+                all_args.extend(tail);
+                self.cek_apply(proc, all_args, k, s, pos)?;
+            }
+            Value::Symbol(name) => {
+                *s = CekState::Ret(self.apply_builtin(name, &args, pos)?);
+            }
+            Value::RecordConstructor(type_id, num_fields) => {
+                if args.len() != *num_fields { return Err(EvalError::Arity(format!("record constructor: expected {} args at {pos}", num_fields))); }
+                *s = CekState::Ret(Value::Record(*type_id, args));
+            }
+            Value::RecordPredicate(type_id) => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("record predicate: expected 1 arg at {pos}"))); }
+                *s = CekState::Ret(Value::Boolean(matches!(&args[0], Value::Record(tid, _) if tid == type_id)));
+            }
+            Value::RecordAccessor(type_id, field_idx) => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("record accessor: expected 1 arg at {pos}"))); }
+                match &args[0] {
+                    Value::Record(tid, fields) if tid == type_id => *s = CekState::Ret(fields[*field_idx].clone()),
+                    _ => return Err(EvalError::Type(format!("record accessor: wrong type at {pos}"))),
+                }
+            }
+            _ => return Err(EvalError::Type(format!("not a procedure: {} at {pos}", op))),
+        }
+        Ok(())
+    }
+
+    fn cek_begin(&mut self, exprs: &[Expr], env: Env, k: &mut Vec<Frame>, s: &mut CekState) -> Result<(), EvalError> {
+        if exprs.is_empty() { *s = CekState::Ret(Value::Void); }
+        else if exprs.len() == 1 { *s = CekState::Eval(exprs[0].clone(), env); }
+        else {
+            k.push(Frame::Seq { rest: exprs[1..].to_vec(), env: env.clone() });
+            *s = CekState::Eval(exprs[0].clone(), env);
+        }
+        Ok(())
+    }
+
+    fn cek_define(&mut self, args: &[Expr], env: Env, k: &mut Vec<Frame>, s: &mut CekState, pos: &str) -> Result<(), EvalError> {
+        if args.is_empty() { return Err(EvalError::Parse(format!("define: missing args at {pos}"))); }
+        match &args[0].kind {
+            ExprKind::Symbol(name) => {
+                if args.len() != 2 { return Err(EvalError::Arity(format!("define: expected 2 args at {pos}"))); }
+                k.push(Frame::Def { name: name.clone(), env: env.clone() });
+                *s = CekState::Eval(args[1].clone(), env);
+            }
+            ExprKind::List(name_and_params) => {
+                if name_and_params.is_empty() { return Err(EvalError::Parse(format!("define: empty name at {pos}"))); }
+                let name = match &name_and_params[0].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Parse(format!("define: expected symbol at {pos}"))),
+                };
+                let (params, rest_param) = Self::parse_params(&name_and_params[1..], "define", pos)?;
+                let body = args[1..].to_vec();
+                let lambda = Value::Lambda(Rc::new(LambdaData { params: params.clone(), rest_param: rest_param.clone(), body: body.clone(), env: env.clone() }));
+                env.define(name.clone(), lambda);
+                env.define(name, Value::Lambda(Rc::new(LambdaData { params, rest_param, body, env: env.clone() })));
+                *s = CekState::Ret(Value::Void);
+            }
+            _ => return Err(EvalError::Parse(format!("define: expected symbol or list at {pos}"))),
+        }
+        Ok(())
+    }
+
+    fn cek_let(&mut self, args: &[Expr], env: Env, k: &mut Vec<Frame>, s: &mut CekState, pos: &str) -> Result<(), EvalError> {
+        if args.is_empty() { return Err(EvalError::Parse(format!("let: missing args at {pos}"))); }
+        if let ExprKind::Symbol(name) = &args[0].kind {
+            if args.len() < 3 { return Err(EvalError::Parse(format!("named let: missing bindings at {pos}"))); }
+            let bindings = match &args[1].kind { ExprKind::List(b) => b, _ => return Err(EvalError::Parse(format!("named let: expected bindings at {pos}"))) };
+            let mut params = Vec::new();
+            let mut pairs = Vec::new();
+            for b in bindings {
+                match &b.kind {
+                    ExprKind::List(pair) if pair.len() == 2 => {
+                        if let ExprKind::Symbol(var) = &pair[0].kind { params.push(var.clone()); pairs.push((var.clone(), pair[1].clone())); }
+                        else { return Err(EvalError::Parse(format!("let: expected symbol at {pos}"))); }
+                    }
+                    _ => return Err(EvalError::Parse(format!("let: expected (var expr) at {pos}"))),
+                }
+            }
+            let body = args[2..].to_vec();
+            if pairs.is_empty() {
+                let le = env.child();
+                let ld = Rc::new(LambdaData { params: params.clone(), rest_param: None, body: body.clone(), env: le.clone() });
+                le.define(name.clone(), Value::Lambda(ld));
+                let rec = Rc::new(LambdaData { params, rest_param: None, body, env: le.clone() });
+                le.define(name.clone(), Value::Lambda(rec.clone()));
+                self.cek_apply(Value::Lambda(rec), vec![], k, s, pos)?;
+            } else {
+                let first = pairs[0].clone();
+                k.push(Frame::NamedLetBind { name: name.clone(), params, rest: pairs[1..].to_vec(), done: vec![], body, env: env.clone(), pos: pos.to_string() });
+                *s = CekState::Eval(first.1, env);
+            }
+            return Ok(());
+        }
+        let bindings = match &args[0].kind { ExprKind::List(b) => b, _ => return Err(EvalError::Parse(format!("let: expected bindings at {pos}"))) };
+        let mut pairs = Vec::new();
+        for b in bindings {
+            match &b.kind {
+                ExprKind::List(pair) if pair.len() == 2 => {
+                    if let ExprKind::Symbol(var) = &pair[0].kind { pairs.push((var.clone(), pair[1].clone())); }
+                    else { return Err(EvalError::Parse(format!("let: expected symbol at {pos}"))); }
+                }
+                _ => return Err(EvalError::Parse(format!("let: expected (var expr) at {pos}"))),
+            }
+        }
+        let body = args[1..].to_vec();
+        if pairs.is_empty() {
+            self.cek_begin(&body, env.child(), k, s)?;
+        } else {
+            let first = pairs[0].clone();
+            k.push(Frame::LetBind { var: first.0, rest: pairs[1..].to_vec(), done: vec![], body, env: env.clone(), pos: pos.to_string() });
+            *s = CekState::Eval(first.1, env);
+        }
+        Ok(())
+    }
+
+    fn tree_eval_form(&mut self, name: &str, elems: &[Expr], env: &mut Env, pos: &str) -> Result<Value, EvalError> {
+        match name {
+            "cond" => self.eval_cond(&elems[1..], env, pos),
+            "case" => self.eval_case(&elems[1..], env, pos),
+            "do" => self.eval_do(&elems[1..], env, pos),
+            "let*" => self.eval_let_star(&elems[1..], env, pos),
+            "letrec" => self.eval_letrec(&elems[1..], env, pos),
+            "letrec*" => self.eval_letrec_star(&elems[1..], env, pos),
+            "string-set!" => self.eval_string_set(&elems[1..], env, pos),
+            "define-syntax" => self.eval_define_syntax(&elems[1..], env, pos),
+            "define-record-type" => self.eval_define_record_type(&elems[1..], env, pos),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Expand a macro without evaluating the result. Returns (expanded_expr, eval_env).
+    fn expand_macro_only(&mut self, macro_data: &Rc<MacroData>, input: &[Expr], env: &Env, pos: &str) -> Result<(Expr, Env), EvalError> {
+        let md = Rc::clone(macro_data);
+        for (pattern, template) in &md.rules {
+            if let Some(bindings) = Self::match_pattern(pattern, input, &md.literals) {
+                let pat_vars: HashSet<String> = bindings.keys().cloned().collect();
+                let mut gensym_map: HashMap<String, String> = HashMap::new();
+                let mut gensym_values: Vec<(String, Value)> = Vec::new();
+                self.build_gensym_map(template, &pat_vars, &md.def_env, &mut gensym_map, &mut gensym_values);
+                let expanded = Self::expand_template(template, &bindings, &gensym_map);
+                let mut eval_env = env.child();
+                for (gs, val) in gensym_values {
+                    eval_env.define(gs, val);
+                }
+                return Ok((expanded, eval_env));
+            }
+        }
+        Err(EvalError::Parse(format!("no matching macro pattern at {pos}")))
     }
 
     pub fn take_output(&mut self) -> String {
@@ -98,7 +572,8 @@ impl Evaluator {
             | "cadadr" | "caddar" | "caaddr" | "caaaar" | "caaadr"
             | "caadar" | "cdaaar" | "cdaadr" | "cdadar" | "cdaddr"
             | "cddaar" | "cddadr" | "cdddar" | "cddddr"
-            | "cadar")
+            | "cadar"
+            | "call/cc" | "call-with-current-continuation")
     }
 
     fn eval_in_env(&mut self, expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
@@ -159,7 +634,7 @@ impl Evaluator {
                     }
                     let val = self.eval_in_env(&elems[1], env)?;
                     return Ok(Value::Boolean(matches!(val,
-                        Value::Lambda(_) | Value::CaseLambda(_) |
+                        Value::Lambda(_) | Value::CaseLambda(_) | Value::Continuation(_) |
                         Value::RecordConstructor(..) | Value::RecordPredicate(_) | Value::RecordAccessor(..)
                     )));
                 }
@@ -196,6 +671,15 @@ impl Evaluator {
             }
             Value::CaseLambda(clauses) => {
                 self.call_case_lambda(&clauses, args, call_pos)
+            }
+            Value::Continuation(id) => {
+                if args.len() != 1 {
+                    return Err(EvalError::Arity(format!("continuation: expected 1 argument at {call_pos}")));
+                }
+                let kont = self.continuations.get(id).cloned()
+                    .ok_or_else(|| EvalError::Custom(format!("invalid continuation at {call_pos}")))?;
+                self.pending_continuation = Some((kont, args.into_iter().next().unwrap()));
+                return Err(EvalError::ContinuationInvoked);
             }
             Value::Symbol(name) => self.apply_builtin(name, &args, call_pos),
             Value::RecordConstructor(type_id, num_fields) => {
@@ -952,6 +1436,15 @@ impl Evaluator {
                     args.len()
                 )))
             }
+            Value::Continuation(id) => {
+                if args.len() != 1 {
+                    return Err(EvalError::Arity(format!("continuation: expected 1 argument at {call_pos}")));
+                }
+                let kont = self.continuations.get(id).cloned()
+                    .ok_or_else(|| EvalError::Custom(format!("invalid continuation at {call_pos}")))?;
+                self.pending_continuation = Some((kont, args.into_iter().next().unwrap()));
+                return Err(EvalError::ContinuationInvoked);
+            }
             Value::Symbol(name) => {
                 Ok(TailResult::Value(self.apply_builtin(name, &args, call_pos)?))
             }
@@ -1182,6 +1675,15 @@ impl Evaluator {
         match proc {
             Value::Lambda(data) => self.call_lambda(data, args, pos),
             Value::CaseLambda(clauses) => self.call_case_lambda(clauses, args, pos),
+            Value::Continuation(id) => {
+                if args.len() != 1 {
+                    return Err(EvalError::Arity(format!("continuation: expected 1 argument at {pos}")));
+                }
+                let kont = self.continuations.get(id).cloned()
+                    .ok_or_else(|| EvalError::Custom(format!("invalid continuation at {pos}")))?;
+                self.pending_continuation = Some((kont, args.into_iter().next().unwrap()));
+                Err(EvalError::ContinuationInvoked)
+            }
             Value::Symbol(name) => self.apply_builtin(name, &args, pos),
             _ => Err(EvalError::Type(format!("apply: not a procedure: {} at {pos}", proc))),
         }
@@ -1974,9 +2476,45 @@ impl Evaluator {
             "procedure?" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("procedure?: expected 1 argument at {pos}"))); }
                 Ok(Value::Boolean(matches!(&args[0],
-                    Value::Lambda(_) | Value::CaseLambda(_) |
+                    Value::Lambda(_) | Value::CaseLambda(_) | Value::Continuation(_) |
                     Value::RecordConstructor(..) | Value::RecordPredicate(_) | Value::RecordAccessor(..)
                 )))
+            }
+            "call/cc" | "call-with-current-continuation" => {
+                // Fallback for tree-walker context: escape-only continuation
+                if args.len() != 1 {
+                    return Err(EvalError::Arity(format!("call/cc: expected 1 argument at {pos}")));
+                }
+                let id = self.next_cont_id;
+                self.next_cont_id += 1;
+                // Use an empty vec as marker for escape-only continuation
+                let marker: CapturedKont = vec![];
+                self.continuations.insert(id, marker);
+                let cont_val = Value::Continuation(id);
+                let func = args[0].clone();
+                match self.call_proc(&func, vec![cont_val], pos) {
+                    Ok(val) => {
+                        self.continuations.remove(&id);
+                        Ok(val)
+                    }
+                    Err(EvalError::ContinuationInvoked) => {
+                        if let Some((kont, val)) = self.pending_continuation.take() {
+                            if kont.is_empty() && self.continuations.get(&id).map_or(false, |k| k.is_empty()) {
+                                self.continuations.remove(&id);
+                                Ok(val)
+                            } else {
+                                self.pending_continuation = Some((kont, val));
+                                Err(EvalError::ContinuationInvoked)
+                            }
+                        } else {
+                            Err(EvalError::ContinuationInvoked)
+                        }
+                    }
+                    Err(e) => {
+                        self.continuations.remove(&id);
+                        Err(e)
+                    }
+                }
             }
             _ => {
                 // Handle c*r combinations (caar, cadr, cdar, cddr, etc.)

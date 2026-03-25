@@ -42,6 +42,7 @@ pub enum Value {
     RecordConstructor(u64, usize),     // type_id, num_fields
     RecordPredicate(u64),              // type_id
     RecordAccessor(u64, usize),        // type_id, field_index
+    Continuation(u64),                 // continuation id for call/cc
     Void,
 }
 
@@ -208,6 +209,7 @@ fn equal_with_cycle_check(a: &Value, b: &Value, seen: &mut HashSet<(usize, usize
         (Value::Vector(a), Value::Vector(b)) => {
             std::ptr::eq(a.as_ptr(), b.as_ptr()) || *a.borrow() == *b.borrow()
         }
+        (Value::Continuation(a), Value::Continuation(b)) => a == b,
         (Value::CaseLambda(_), Value::CaseLambda(_)) => false,
         (Value::Macro(_), Value::Macro(_)) => false,
         (Value::Record(t1, f1), Value::Record(t2, f2)) => t1 == t2 && f1 == f2,
@@ -326,7 +328,7 @@ impl Value {
             Value::Symbol(s) => s.clone(),
             Value::Nil => "()".into(),
             Value::Pair(cell) => fmt_pair(cell, &mut |v| v.to_display_string()),
-            Value::Lambda(_) | Value::CaseLambda(_) => "#<procedure>".into(),
+            Value::Lambda(_) | Value::CaseLambda(_) | Value::Continuation(_) => "#<procedure>".into(),
             Value::Macro(_) => "#<macro>".into(),
             Value::Vector(v) => {
                 let elems: Vec<String> = v.borrow().iter().map(|e| e.to_display_string()).collect();
