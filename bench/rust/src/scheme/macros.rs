@@ -1,5 +1,5 @@
 use super::{
-    builtin_name, env_define, env_define_alias, env_define_macro, env_lookup_cell,
+    builtins::builtin_name, env_define, env_define_alias, env_define_macro, env_lookup_cell,
     env_lookup_macro, syntax_error, EnvRef, EvalContext, EvalError, Expr, ExprKind, MacroRef,
     MacroRule, MacroTransformer, PatternBinding, Procedure, SourcePos, Value, START_POS,
 };

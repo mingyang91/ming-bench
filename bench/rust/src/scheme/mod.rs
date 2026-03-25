@@ -6,6 +6,7 @@ mod parser;
 
 pub use error::{EvalError, SourcePos};
 
+use self::builtins::builtin_name;
 use self::macros::{expand_macro_call, parse_syntax_rules};
 use self::number::{parse_number_literal, Number, NumberError};
 use std::cell::RefCell;
@@ -59,6 +60,7 @@ enum Value {
     Symbol(String),
     List(Vec<Value>),
     Pair(Box<PairValue>),
+    Record(Rc<RecordValue>),
     Procedure(Procedure),
     Void,
 }
@@ -73,6 +75,13 @@ struct PairValue {
 enum Procedure {
     Builtin(&'static str),
     Lambda(Rc<Lambda>),
+    RecordConstructor(Rc<RecordType>),
+    RecordPredicate(Rc<RecordType>),
+    RecordAccessor {
+        record_type: Rc<RecordType>,
+        field_index: usize,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +96,19 @@ struct Lambda {
     params: LambdaParams,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+#[derive(Debug)]
+struct RecordType {
+    type_name: String,
+    constructor_name: String,
+    field_count: usize,
+}
+
+#[derive(Debug)]
+struct RecordValue {
+    record_type: Rc<RecordType>,
+    fields: Vec<Value>,
 }
 
 type EnvRef = Rc<RefCell<Env>>;
@@ -152,6 +174,7 @@ impl Value {
             Self::List(items) if items.is_empty() => "null",
             Self::List(_) => "pair",
             Self::Pair(_) => "pair",
+            Self::Record(_) => "record",
             Self::Procedure(_) => "procedure",
             Self::Void => "void",
         }
@@ -181,6 +204,7 @@ impl Value {
             Self::Symbol(value) => value.clone(),
             Self::List(items) => render_list(items, mode),
             Self::Pair(pair) => render_pair(&pair.car, &pair.cdr, mode),
+            Self::Record(record) => format!("#<record {}>", record.record_type.type_name),
             Self::Procedure(_) => "#<procedure>".into(),
             Self::Void => "#<void>".into(),
         }
@@ -412,86 +436,6 @@ fn env_set(env: &EnvRef, name: &str, value: Value) -> bool {
     }
 }
 
-fn builtin_name(name: &str) -> Option<&'static str> {
-    match name {
-        "+" => Some("+"),
-        "-" => Some("-"),
-        "*" => Some("*"),
-        "/" => Some("/"),
-        "<" => Some("<"),
-        ">" => Some(">"),
-        "=" => Some("="),
-        "<=" => Some("<="),
-        "abs" => Some("abs"),
-        "apply" => Some("apply"),
-        "append" => Some("append"),
-        "assoc" => Some("assoc"),
-        "boolean?" => Some("boolean?"),
-        "char-alphabetic?" => Some("char-alphabetic?"),
-        "char-downcase" => Some("char-downcase"),
-        "char-numeric?" => Some("char-numeric?"),
-        "char-upcase" => Some("char-upcase"),
-        "char=?" => Some("char=?"),
-        "char<?" => Some("char<?"),
-        "char?" => Some("char?"),
-        "car" => Some("car"),
-        "cdr" => Some("cdr"),
-        "cons" => Some("cons"),
-        "display" => Some("display"),
-        "eq?" => Some("eq?"),
-        "exact?" => Some("exact?"),
-        "exact->inexact" => Some("exact->inexact"),
-        "equal?" => Some("equal?"),
-        "even?" => Some("even?"),
-        "expt" => Some("expt"),
-        "inexact?" => Some("inexact?"),
-        "inexact->exact" => Some("inexact->exact"),
-        "integer?" => Some("integer?"),
-        "length" => Some("length"),
-        "list" => Some("list"),
-        "list-ref" => Some("list-ref"),
-        "list-tail" => Some("list-tail"),
-        "list?" => Some("list?"),
-        "map" => Some("map"),
-        "max" => Some("max"),
-        "min" => Some("min"),
-        "modulo" => Some("modulo"),
-        "negative?" => Some("negative?"),
-        "newline" => Some("newline"),
-        "number->string" => Some("number->string"),
-        "not" => Some("not"),
-        "null?" => Some("null?"),
-        "number?" => Some("number?"),
-        "odd?" => Some("odd?"),
-        "pair?" => Some("pair?"),
-        "positive?" => Some("positive?"),
-        "quotient" => Some("quotient"),
-        "rational?" => Some("rational?"),
-        "remainder" => Some("remainder"),
-        "string-ci=?" => Some("string-ci=?"),
-        "string-downcase" => Some("string-downcase"),
-        "string->number" => Some("string->number"),
-        "string->symbol" => Some("string->symbol"),
-        "string-append" => Some("string-append"),
-        "string-copy" => Some("string-copy"),
-        "string-upcase" => Some("string-upcase"),
-        "string=?" => Some("string=?"),
-        "string<?" => Some("string<?"),
-        "string-length" => Some("string-length"),
-        "string-ref" => Some("string-ref"),
-        "string-set!" => Some("string-set!"),
-        "string?" => Some("string?"),
-        "substring" => Some("substring"),
-        "symbol->string" => Some("symbol->string"),
-        "symbol?" => Some("symbol?"),
-        "numerator" => Some("numerator"),
-        "denominator" => Some("denominator"),
-        "write" => Some("write"),
-        "zero?" => Some("zero?"),
-        _ => None,
-    }
-}
-
 fn eval_list(
     items: &[Expr],
     env: &EnvRef,
@@ -508,6 +452,7 @@ fn eval_list(
             "begin" => return eval_begin(&items[1..], env, form_pos, context),
             "cond" => return eval_cond(&items[1..], env, context),
             "define" => return eval_define(&items[1..], env, form_pos, context),
+            "define-record-type" => return eval_define_record_type(&items[1..], env, form_pos),
             "define-syntax" => return eval_define_syntax(&items[1..], env, form_pos),
             "if" => return eval_if(&items[1..], env, form_pos, context),
             "let" => return eval_let(&items[1..], env, form_pos, context),
@@ -578,6 +523,71 @@ fn eval_define_syntax(args: &[Expr], env: &EnvRef, pos: SourcePos) -> Result<Val
             args.len(),
         )),
     }
+}
+
+fn eval_define_record_type(
+    args: &[Expr],
+    env: &EnvRef,
+    pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let (type_name_expr, constructor_expr, predicate_expr, field_exprs) = match args {
+        [type_name_expr, constructor_expr, predicate_expr, field_exprs @ ..] => {
+            (type_name_expr, constructor_expr, predicate_expr, field_exprs)
+        }
+        _ => return Err(syntax_error(pos, "invalid define-record-type form")),
+    };
+
+    let type_name = type_name_expr
+        .symbol_name()
+        .ok_or_else(|| syntax_error(type_name_expr.pos, "record type name must be a symbol"))?
+        .to_string();
+    let (constructor_name, constructor_field_count) = parse_record_constructor(constructor_expr)?;
+    let predicate_name = predicate_expr
+        .symbol_name()
+        .ok_or_else(|| syntax_error(predicate_expr.pos, "record predicate name must be a symbol"))?
+        .to_string();
+    let accessor_names = field_exprs
+        .iter()
+        .map(parse_record_field)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if constructor_field_count != accessor_names.len() {
+        return Err(syntax_error(
+            constructor_expr.pos,
+            "record constructor arity must match field count",
+        ));
+    }
+
+    let record_type = Rc::new(RecordType {
+        type_name,
+        constructor_name: constructor_name.clone(),
+        field_count: accessor_names.len(),
+    });
+
+    env_define(
+        env,
+        constructor_name,
+        Value::Procedure(Procedure::RecordConstructor(Rc::clone(&record_type))),
+    );
+    env_define(
+        env,
+        predicate_name,
+        Value::Procedure(Procedure::RecordPredicate(Rc::clone(&record_type))),
+    );
+
+    for (field_index, accessor_name) in accessor_names.into_iter().enumerate() {
+        env_define(
+            env,
+            accessor_name.clone(),
+            Value::Procedure(Procedure::RecordAccessor {
+                record_type: Rc::clone(&record_type),
+                field_index,
+                name: accessor_name,
+            }),
+        );
+    }
+
+    Ok(Value::Void)
 }
 
 fn eval_begin(
@@ -669,6 +679,58 @@ fn parse_params(params: &[Expr]) -> Result<LambdaParams, EvalError> {
     }
 
     Ok(LambdaParams { required, rest })
+}
+
+fn parse_record_constructor(constructor: &Expr) -> Result<(String, usize), EvalError> {
+    let items = constructor
+        .list_items()
+        .ok_or_else(|| syntax_error(constructor.pos, "record constructor must be a list"))?;
+    let (name_expr, params) = items
+        .split_first()
+        .ok_or_else(|| syntax_error(constructor.pos, "record constructor cannot be empty"))?;
+    let name = name_expr
+        .symbol_name()
+        .ok_or_else(|| syntax_error(name_expr.pos, "record constructor name must be a symbol"))?
+        .to_string();
+
+    for param in params {
+        if param.symbol_name().is_none() {
+            return Err(syntax_error(
+                param.pos,
+                "record constructor parameter must be a symbol",
+            ));
+        }
+    }
+
+    Ok((name, params.len()))
+}
+
+fn parse_record_field(field: &Expr) -> Result<String, EvalError> {
+    let items = field
+        .list_items()
+        .ok_or_else(|| syntax_error(field.pos, "record field must be a list"))?;
+
+    match items {
+        [name_expr, accessor_expr] => {
+            if name_expr.symbol_name().is_none() {
+                return Err(syntax_error(
+                    name_expr.pos,
+                    "record field name must be a symbol",
+                ));
+            }
+
+            accessor_expr
+                .symbol_name()
+                .ok_or_else(|| {
+                    syntax_error(accessor_expr.pos, "record accessor name must be a symbol")
+                })
+                .map(str::to_string)
+        }
+        _ => Err(syntax_error(
+            field.pos,
+            "record field must contain a name and accessor",
+        )),
+    }
 }
 
 fn eval_cond(
@@ -940,6 +1002,17 @@ fn apply(
             builtins::apply_builtin(name, args, pos, context)
         }
         Value::Procedure(Procedure::Lambda(lambda)) => apply_lambda(lambda, args, pos, context),
+        Value::Procedure(Procedure::RecordConstructor(record_type)) => {
+            apply_record_constructor(record_type, args, pos)
+        }
+        Value::Procedure(Procedure::RecordPredicate(record_type)) => {
+            apply_record_predicate(record_type, args, pos)
+        }
+        Value::Procedure(Procedure::RecordAccessor {
+            record_type,
+            field_index,
+            name,
+        }) => apply_record_accessor(record_type, field_index, &name, args, pos),
         other => Err(EvalError::NotAProcedure {
             pos,
             found: other.render(),
@@ -987,6 +1060,62 @@ fn apply_lambda(
     }
 
     eval_sequence(&lambda.body, &call_env, pos, context)
+}
+
+fn apply_record_constructor(
+    record_type: Rc<RecordType>,
+    args: &[Value],
+    pos: SourcePos,
+) -> Result<Value, EvalError> {
+    if args.len() != record_type.field_count {
+        return Err(wrong_arg_count(
+            pos,
+            record_type.constructor_name.clone(),
+            format!("exactly {} arguments", record_type.field_count),
+            args.len(),
+        ));
+    }
+
+    Ok(Value::Record(Rc::new(RecordValue {
+        record_type,
+        fields: args.to_vec(),
+    })))
+}
+
+fn apply_record_predicate(
+    record_type: Rc<RecordType>,
+    args: &[Value],
+    pos: SourcePos,
+) -> Result<Value, EvalError> {
+    match args {
+        [Value::Record(record)] => Ok(Value::Boolean(Rc::ptr_eq(
+            &record.record_type,
+            &record_type,
+        ))),
+        [_] => Ok(Value::Boolean(false)),
+        _ => Err(wrong_arg_count(pos, "record predicate", "exactly 1 argument", args.len())),
+    }
+}
+
+fn apply_record_accessor(
+    record_type: Rc<RecordType>,
+    field_index: usize,
+    name: &str,
+    args: &[Value],
+    pos: SourcePos,
+) -> Result<Value, EvalError> {
+    match args {
+        [Value::Record(record)] if Rc::ptr_eq(&record.record_type, &record_type) => {
+            Ok(record.fields[field_index].clone())
+        }
+        [other] => Err(type_mismatch(
+            pos,
+            name,
+            record_type.type_name.clone(),
+            value_type_name(other),
+        )),
+        _ => Err(wrong_arg_count(pos, name, "exactly 1 argument", args.len())),
+    }
 }
 
 fn number_predicate<F>(
@@ -1178,6 +1307,13 @@ fn expect_list<'a>(name: &str, value: &'a Value, pos: SourcePos) -> Result<&'a [
     }
 }
 
+fn value_type_name(value: &Value) -> String {
+    match value {
+        Value::Record(record) => record.record_type.type_name.clone(),
+        other => other.type_name().to_string(),
+    }
+}
+
 fn equal_value(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => left == right,
@@ -1195,6 +1331,7 @@ fn equal_value(left: &Value, right: &Value) -> bool {
         (Value::Pair(left), Value::Pair(right)) => {
             equal_value(&left.car, &right.car) && equal_value(&left.cdr, &right.cdr)
         }
+        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         (
             Value::Procedure(Procedure::Builtin(left)),
@@ -1202,6 +1339,30 @@ fn equal_value(left: &Value, right: &Value) -> bool {
         ) => left == right,
         (Value::Procedure(Procedure::Lambda(left)), Value::Procedure(Procedure::Lambda(right))) => {
             Rc::ptr_eq(left, right)
+        }
+        (
+            Value::Procedure(Procedure::RecordConstructor(left)),
+            Value::Procedure(Procedure::RecordConstructor(right)),
+        ) => Rc::ptr_eq(left, right),
+        (
+            Value::Procedure(Procedure::RecordPredicate(left)),
+            Value::Procedure(Procedure::RecordPredicate(right)),
+        ) => Rc::ptr_eq(left, right),
+        (
+            Value::Procedure(Procedure::RecordAccessor {
+                record_type: left_record_type,
+                field_index: left_field_index,
+                name: left_name,
+            }),
+            Value::Procedure(Procedure::RecordAccessor {
+                record_type: right_record_type,
+                field_index: right_field_index,
+                name: right_name,
+            }),
+        ) => {
+            Rc::ptr_eq(left_record_type, right_record_type)
+                && left_field_index == right_field_index
+                && left_name == right_name
         }
         _ => false,
     }
