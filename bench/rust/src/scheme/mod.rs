@@ -4614,7 +4614,11 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let result = cek_eval(&exprs, &env, &mut out)?;
     let result_str = match result {
         Val::Void => String::new(),
-        other => other.to_string(),
+        other => {
+            let mut s = String::new();
+            display_val(&other, &mut s);
+            s
+        }
     };
     Ok((result_str, out))
 }
