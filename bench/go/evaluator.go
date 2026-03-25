@@ -2,6 +2,7 @@ package ming
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"unicode"
@@ -212,6 +213,39 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 				}
 				expr = rlBody[len(rlBody)-1]
 				env = rlEnv
+				continue
+			case "let*":
+				if len(e.Elems) < 3 {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let* requires bindings and body", e.Line, e.Col)}
+				}
+				lsBindList, ok := e.Elems[1].(*ListExpr)
+				if !ok {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: expected binding list", e.Line, e.Col)}
+				}
+				lsEnv := newEnv(env)
+				for _, b := range lsBindList.Elems {
+					pair, ok := b.(*ListExpr)
+					if !ok || len(pair.Elems) != 2 {
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: bad binding", e.Line, e.Col)}
+					}
+					ps, ok := pair.Elems[0].(*SymbolExpr)
+					if !ok {
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: expected symbol", e.Line, e.Col)}
+					}
+					v, verr := evalExpr(pair.Elems[1], lsEnv)
+					if verr != nil {
+						return nil, verr
+					}
+					lsEnv.set(ps.Name, v)
+				}
+				lsBody := e.Elems[2:]
+				for _, bodyExpr := range lsBody[:len(lsBody)-1] {
+					if _, berr := evalExpr(bodyExpr, lsEnv); berr != nil {
+						return nil, berr
+					}
+				}
+				expr = lsBody[len(lsBody)-1]
+				env = lsEnv
 				continue
 			case "cond":
 				condHandled := false
@@ -1192,6 +1226,155 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 		return p.Cdr, nil
 	}})
 
+	env.set("set-car!", &BuiltinFunc{Name: "set-car!", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "set-car!: need 2 arguments"}
+		}
+		p, ok := args[0].(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "set-car!: not a pair"}
+		}
+		p.Car = args[1]
+		return &VoidVal{}, nil
+	}})
+
+	env.set("set-cdr!", &BuiltinFunc{Name: "set-cdr!", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "set-cdr!: need 2 arguments"}
+		}
+		p, ok := args[0].(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "set-cdr!: not a pair"}
+		}
+		p.Cdr = args[1]
+		return &VoidVal{}, nil
+	}})
+
+	// reverse
+	env.set("reverse", &BuiltinFunc{Name: "reverse", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "reverse: need 1 argument"}
+		}
+		var result Value = &NilVal{}
+		cur := args[0]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				return result, nil
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "reverse: not a proper list"}
+			}
+			result = &PairVal{Car: p.Car, Cdr: result}
+			cur = p.Cdr
+		}
+	}})
+
+	// for-each
+	env.set("for-each", &BuiltinFunc{Name: "for-each", Fn: func(args []Value) (Value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: "for-each: need at least 2 arguments"}
+		}
+		fn := args[0]
+		if len(args) == 2 {
+			// Single-list case
+			cur := args[1]
+			for {
+				if _, ok := cur.(*NilVal); ok {
+					return &VoidVal{}, nil
+				}
+				p, ok := cur.(*PairVal)
+				if !ok {
+					return nil, &EvalError{Message: "for-each: not a proper list"}
+				}
+				var err error
+				switch f := fn.(type) {
+				case *BuiltinFunc:
+					_, err = f.Fn([]Value{p.Car})
+				case *LambdaVal:
+					_, err = applyLambda(f, []Value{p.Car})
+				case *CaseLambdaVal:
+					_, err = applyCaseLambda(f, []Value{p.Car})
+				default:
+					return nil, &EvalError{Message: "for-each: first argument must be a procedure"}
+				}
+				if err != nil {
+					return nil, err
+				}
+				cur = p.Cdr
+			}
+		}
+		// Multi-list case
+		lists := args[1:]
+		for {
+			callArgs := make([]Value, len(lists))
+			allDone := false
+			for i, l := range lists {
+				if _, ok := l.(*NilVal); ok {
+					allDone = true
+					break
+				}
+				p, ok := l.(*PairVal)
+				if !ok {
+					return nil, &EvalError{Message: "for-each: not a proper list"}
+				}
+				callArgs[i] = p.Car
+				lists[i] = p.Cdr
+			}
+			if allDone {
+				return &VoidVal{}, nil
+			}
+			var err error
+			switch f := fn.(type) {
+			case *BuiltinFunc:
+				_, err = f.Fn(callArgs)
+			case *LambdaVal:
+				_, err = applyLambda(f, callArgs)
+			case *CaseLambdaVal:
+				_, err = applyCaseLambda(f, callArgs)
+			default:
+				return nil, &EvalError{Message: "for-each: first argument must be a procedure"}
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+	}})
+
+	// Generic cxr combinations
+	cxrOps := func(name string) func([]Value) (Value, error) {
+		// name is like "caar", "cdaddr" etc.
+		// middle letters (between c and r) are 'a' or 'd' applied right-to-left
+		mid := name[1 : len(name)-1]
+		return func(args []Value) (Value, error) {
+			if len(args) != 1 {
+				return nil, &EvalError{Message: name + ": need 1 argument"}
+			}
+			v := args[0]
+			for i := len(mid) - 1; i >= 0; i-- {
+				p, ok := v.(*PairVal)
+				if !ok {
+					return nil, &EvalError{Message: name + ": not a pair"}
+				}
+				if mid[i] == 'a' {
+					v = p.Car
+				} else {
+					v = p.Cdr
+				}
+			}
+			return v, nil
+		}
+	}
+	for _, name := range []string{
+		"caar", "cadr", "cdar", "cddr",
+		"caaar", "caadr", "cadar", "caddr", "cdaar", "cdadr", "cddar", "cdddr",
+		"caaaar", "caaadr", "caadar", "caaddr", "cadaar", "cadadr", "caddar", "cadddr",
+		"cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr",
+	} {
+		n := name
+		env.set(n, &BuiltinFunc{Name: n, Fn: cxrOps(n)})
+	}
+
 	env.set("null?", &BuiltinFunc{Name: "null?", Fn: func(args []Value) (Value, error) {
 		if len(args) != 1 {
 			return nil, &EvalError{Message: "null?: need 1 argument"}
@@ -1947,16 +2130,33 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 		if len(args) != 1 {
 			return nil, &EvalError{Message: "list?: need 1 argument"}
 		}
-		cur := args[0]
+		// Floyd's tortoise-and-hare cycle detection
+		slow := args[0]
+		fast := args[0]
 		for {
-			if _, ok := cur.(*NilVal); ok {
-				return &BoolVal{Val: true}, nil
-			}
-			p, ok := cur.(*PairVal)
+			// Check fast (advance 2 steps)
+			fp, ok := fast.(*PairVal)
 			if !ok {
+				if _, ok := fast.(*NilVal); ok {
+					return &BoolVal{Val: true}, nil
+				}
 				return &BoolVal{Val: false}, nil
 			}
-			cur = p.Cdr
+			fast = fp.Cdr
+			fp2, ok := fast.(*PairVal)
+			if !ok {
+				if _, ok := fast.(*NilVal); ok {
+					return &BoolVal{Val: true}, nil
+				}
+				return &BoolVal{Val: false}, nil
+			}
+			fast = fp2.Cdr
+			// Advance slow 1 step
+			slow = slow.(*PairVal).Cdr
+			// If they meet, it's a cycle
+			if slow == fast {
+				return &BoolVal{Val: false}, nil
+			}
 		}
 	}})
 
@@ -1980,6 +2180,54 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 			}
 			if schemeEqual(key, entry.Car) {
 				return p.Car, nil
+			}
+			cur = p.Cdr
+		}
+	}})
+
+	// assv — like assoc but uses eqv?
+	env.set("assv", &BuiltinFunc{Name: "assv", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "assv: need 2 arguments"}
+		}
+		key := args[0]
+		cur := args[1]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				return &BoolVal{Val: false}, nil
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "assv: not a proper list"}
+			}
+			entry, ok := p.Car.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "assv: entry is not a pair"}
+			}
+			if schemeEqv(key, entry.Car) {
+				return p.Car, nil
+			}
+			cur = p.Cdr
+		}
+	}})
+
+	// member — uses equal?
+	env.set("member", &BuiltinFunc{Name: "member", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "member: need 2 arguments"}
+		}
+		key := args[0]
+		cur := args[1]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				return &BoolVal{Val: false}, nil
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "member: not a proper list"}
+			}
+			if schemeEqual(key, p.Car) {
+				return p, nil
 			}
 			cur = p.Cdr
 		}
@@ -2142,6 +2390,51 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 		return &BoolVal{Val: a.Val < b.Val}, nil
 	}})
 
+	env.set("string>?", &BuiltinFunc{Name: "string>?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "string>?: need 2 arguments"}
+		}
+		a, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string>?: not a string"}
+		}
+		b, ok := args[1].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string>?: not a string"}
+		}
+		return &BoolVal{Val: a.Val > b.Val}, nil
+	}})
+
+	env.set("string<=?", &BuiltinFunc{Name: "string<=?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "string<=?: need 2 arguments"}
+		}
+		a, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string<=?: not a string"}
+		}
+		b, ok := args[1].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string<=?: not a string"}
+		}
+		return &BoolVal{Val: a.Val <= b.Val}, nil
+	}})
+
+	env.set("string>=?", &BuiltinFunc{Name: "string>=?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "string>=?: need 2 arguments"}
+		}
+		a, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string>=?: not a string"}
+		}
+		b, ok := args[1].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string>=?: not a string"}
+		}
+		return &BoolVal{Val: a.Val >= b.Val}, nil
+	}})
+
 	env.set("string-ci=?", &BuiltinFunc{Name: "string-ci=?", Fn: func(args []Value) (Value, error) {
 		if len(args) != 2 {
 			return nil, &EvalError{Message: "string-ci=?: need 2 arguments"}
@@ -2302,6 +2595,187 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 				return nil, &EvalError{Message: "list->vector: not a proper list"}
 			}
 		}
+	}})
+
+	// gcd
+	env.set("gcd", &BuiltinFunc{Name: "gcd", Fn: func(args []Value) (Value, error) {
+		if len(args) == 0 {
+			return &IntVal{Val: 0}, nil
+		}
+		result := int64(0)
+		for _, a := range args {
+			n, ok := a.(*IntVal)
+			if !ok {
+				return nil, &EvalError{Message: "gcd: not an integer"}
+			}
+			result = gcd(result, n.Val)
+		}
+		if result < 0 {
+			result = -result
+		}
+		return &IntVal{Val: result}, nil
+	}})
+
+	// lcm
+	env.set("lcm", &BuiltinFunc{Name: "lcm", Fn: func(args []Value) (Value, error) {
+		if len(args) == 0 {
+			return &IntVal{Val: 1}, nil
+		}
+		result := int64(1)
+		for _, a := range args {
+			n, ok := a.(*IntVal)
+			if !ok {
+				return nil, &EvalError{Message: "lcm: not an integer"}
+			}
+			v := n.Val
+			if v < 0 {
+				v = -v
+			}
+			if v == 0 {
+				return &IntVal{Val: 0}, nil
+			}
+			result = result / gcd(result, v) * v
+		}
+		return &IntVal{Val: result}, nil
+	}})
+
+	// truncate — rounds toward zero
+	env.set("truncate", &BuiltinFunc{Name: "truncate", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "truncate: need 1 argument"}
+		}
+		switch n := args[0].(type) {
+		case *IntVal:
+			return n, nil
+		case *FloatVal:
+			v := n.Val
+			if v >= 0 {
+				return &FloatVal{Val: float64(int64(v))}, nil
+			}
+			return &FloatVal{Val: float64(int64(v))}, nil
+		default:
+			return nil, &EvalError{Message: "truncate: not a number"}
+		}
+	}})
+
+	// round — rounds to nearest even
+	env.set("round", &BuiltinFunc{Name: "round", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "round: need 1 argument"}
+		}
+		switch n := args[0].(type) {
+		case *IntVal:
+			return n, nil
+		case *FloatVal:
+			v := n.Val
+			rounded := math.RoundToEven(v)
+			return &FloatVal{Val: rounded}, nil
+		default:
+			return nil, &EvalError{Message: "round: not a number"}
+		}
+	}})
+
+	// memq — uses eq?
+	env.set("memq", &BuiltinFunc{Name: "memq", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "memq: need 2 arguments"}
+		}
+		key := args[0]
+		cur := args[1]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				return &BoolVal{Val: false}, nil
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "memq: not a proper list"}
+			}
+			if schemeEq(key, p.Car) {
+				return p, nil
+			}
+			cur = p.Cdr
+		}
+	}})
+
+	// memv — uses eqv?
+	env.set("memv", &BuiltinFunc{Name: "memv", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "memv: need 2 arguments"}
+		}
+		key := args[0]
+		cur := args[1]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				return &BoolVal{Val: false}, nil
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "memv: not a proper list"}
+			}
+			if schemeEqv(key, p.Car) {
+				return p, nil
+			}
+			cur = p.Cdr
+		}
+	}})
+
+	// assq — uses eq?
+	env.set("assq", &BuiltinFunc{Name: "assq", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "assq: need 2 arguments"}
+		}
+		key := args[0]
+		cur := args[1]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				return &BoolVal{Val: false}, nil
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "assq: not a proper list"}
+			}
+			entry, ok := p.Car.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "assq: entry is not a pair"}
+			}
+			if schemeEq(key, entry.Car) {
+				return p.Car, nil
+			}
+			cur = p.Cdr
+		}
+	}})
+
+	// make-string
+	env.set("make-string", &BuiltinFunc{Name: "make-string", Fn: func(args []Value) (Value, error) {
+		if len(args) < 1 || len(args) > 2 {
+			return nil, &EvalError{Message: "make-string: need 1 or 2 arguments"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "make-string: first argument must be integer"}
+		}
+		ch := rune(' ')
+		if len(args) == 2 {
+			c, ok := args[1].(*CharVal)
+			if !ok {
+				return nil, &EvalError{Message: "make-string: second argument must be char"}
+			}
+			ch = c.Val
+		}
+		return &StringVal{Val: strings.Repeat(string(ch), int(n.Val))}, nil
+	}})
+
+	// string — create string from chars
+	env.set("string", &BuiltinFunc{Name: "string", Fn: func(args []Value) (Value, error) {
+		var buf strings.Builder
+		for _, a := range args {
+			c, ok := a.(*CharVal)
+			if !ok {
+				return nil, &EvalError{Message: "string: argument must be char"}
+			}
+			buf.WriteRune(c.Val)
+		}
+		return &StringVal{Val: buf.String()}, nil
 	}})
 
 	return env
@@ -2552,36 +3026,53 @@ func schemeEqv(a, b Value) bool {
 }
 
 func schemeEqual(a, b Value) bool {
-	switch av := a.(type) {
-	case *PairVal:
-		if bv, ok := b.(*PairVal); ok {
-			return schemeEqual(av.Car, bv.Car) && schemeEqual(av.Cdr, bv.Cdr)
+	type pair struct{ a, b Value }
+	visited := make(map[pair]bool)
+	var eq func(a, b Value) bool
+	eq = func(a, b Value) bool {
+		// Short-circuit: same pointer
+		if a == b {
+			return true
 		}
-		return false
-	case *StringVal:
-		if bv, ok := b.(*StringVal); ok {
-			return av.Val == bv.Val
-		}
-		return false
-	case *VectorVal:
-		if bv, ok := b.(*VectorVal); ok {
+		switch av := a.(type) {
+		case *PairVal:
+			bv, ok := b.(*PairVal)
+			if !ok {
+				return false
+			}
+			k := pair{a, b}
+			if visited[k] {
+				return true // assume equal for cycles
+			}
+			visited[k] = true
+			return eq(av.Car, bv.Car) && eq(av.Cdr, bv.Cdr)
+		case *StringVal:
+			if bv, ok := b.(*StringVal); ok {
+				return av.Val == bv.Val
+			}
+			return false
+		case *VectorVal:
+			bv, ok := b.(*VectorVal)
+			if !ok {
+				return false
+			}
 			if len(av.Elems) != len(bv.Elems) {
 				return false
 			}
 			for i := range av.Elems {
-				if !schemeEqual(av.Elems[i], bv.Elems[i]) {
+				if !eq(av.Elems[i], bv.Elems[i]) {
 					return false
 				}
 			}
 			return true
+		case *NilVal:
+			_, ok := b.(*NilVal)
+			return ok
+		default:
+			return schemeEq(a, b)
 		}
-		return false
-	case *NilVal:
-		_, ok := b.(*NilVal)
-		return ok
-	default:
-		return schemeEq(a, b)
 	}
+	return eq(a, b)
 }
 
 // EvalStr evaluates one or more Scheme expressions and returns the string

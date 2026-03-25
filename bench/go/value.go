@@ -199,6 +199,11 @@ func (v *VectorVal) String() string {
 }
 
 func (v *PairVal) String() string {
+	return writePair(v, true)
+}
+
+func writePair(v *PairVal, useWrite bool) string {
+	visited := make(map[*PairVal]bool)
 	var buf strings.Builder
 	buf.WriteByte('(')
 	cur := Value(v)
@@ -208,28 +213,125 @@ func (v *PairVal) String() string {
 		if !ok {
 			break
 		}
+		if visited[p] {
+			if !first {
+				buf.WriteString(" ...")
+			}
+			break
+		}
+		visited[p] = true
 		if !first {
 			buf.WriteByte(' ')
 		}
-		buf.WriteString(p.Car.String())
+		if useWrite {
+			buf.WriteString(writeValueSafe(p.Car, visited))
+		} else {
+			buf.WriteString(displayValueSafe(p.Car, visited))
+		}
 		first = false
 		cur = p.Cdr
 	}
 	if _, ok := cur.(*NilVal); !ok {
-		buf.WriteString(" . ")
-		buf.WriteString(cur.String())
+		if p, ok := cur.(*PairVal); ok && visited[p] {
+			// already handled cycle above
+		} else {
+			buf.WriteString(" . ")
+			if useWrite {
+				buf.WriteString(writeValueSafe(cur, visited))
+			} else {
+				buf.WriteString(displayValueSafe(cur, visited))
+			}
+		}
 	}
 	buf.WriteByte(')')
 	return buf.String()
 }
 
-// displayValue returns the display representation (no quotes on strings).
-func displayValue(v Value) string {
+func writeValueSafe(v Value, visited map[*PairVal]bool) string {
+	if p, ok := v.(*PairVal); ok {
+		if visited[p] {
+			return "(...)"
+		}
+		visited[p] = true
+		var buf strings.Builder
+		buf.WriteByte('(')
+		cur := Value(p)
+		first := true
+		for {
+			pp, ok := cur.(*PairVal)
+			if !ok {
+				break
+			}
+			if !first && visited[pp] {
+				buf.WriteString(" ...")
+				cur = pp // mark as handled
+				break
+			}
+			visited[pp] = true
+			if !first {
+				buf.WriteByte(' ')
+			}
+			buf.WriteString(writeValueSafe(pp.Car, visited))
+			first = false
+			cur = pp.Cdr
+		}
+		if _, ok := cur.(*NilVal); !ok {
+			if pp, ok := cur.(*PairVal); ok && visited[pp] {
+				// cycle handled
+			} else {
+				buf.WriteString(" . ")
+				buf.WriteString(writeValueSafe(cur, visited))
+			}
+		}
+		buf.WriteByte(')')
+		return buf.String()
+	}
+	return v.String()
+}
+
+func displayValueSafe(v Value, visited map[*PairVal]bool) string {
 	switch val := v.(type) {
 	case *StringVal:
 		return val.Val
 	case *CharVal:
 		return string(val.Val)
+	case *PairVal:
+		if visited[val] {
+			return "(...)"
+		}
+		visited[val] = true
+		var buf strings.Builder
+		buf.WriteByte('(')
+		cur := Value(val)
+		first := true
+		for {
+			pp, ok := cur.(*PairVal)
+			if !ok {
+				break
+			}
+			if !first && visited[pp] {
+				buf.WriteString(" ...")
+				cur = pp
+				break
+			}
+			visited[pp] = true
+			if !first {
+				buf.WriteByte(' ')
+			}
+			buf.WriteString(displayValueSafe(pp.Car, visited))
+			first = false
+			cur = pp.Cdr
+		}
+		if _, ok := cur.(*NilVal); !ok {
+			if pp, ok := cur.(*PairVal); ok && visited[pp] {
+				// cycle
+			} else {
+				buf.WriteString(" . ")
+				buf.WriteString(displayValueSafe(cur, visited))
+			}
+		}
+		buf.WriteByte(')')
+		return buf.String()
 	case *VectorVal:
 		var buf strings.Builder
 		buf.WriteString("#(")
@@ -237,30 +339,7 @@ func displayValue(v Value) string {
 			if i > 0 {
 				buf.WriteByte(' ')
 			}
-			buf.WriteString(displayValue(e))
-		}
-		buf.WriteByte(')')
-		return buf.String()
-	case *PairVal:
-		var buf strings.Builder
-		buf.WriteByte('(')
-		cur := Value(val)
-		first := true
-		for {
-			p, ok := cur.(*PairVal)
-			if !ok {
-				break
-			}
-			if !first {
-				buf.WriteByte(' ')
-			}
-			buf.WriteString(displayValue(p.Car))
-			first = false
-			cur = p.Cdr
-		}
-		if _, ok := cur.(*NilVal); !ok {
-			buf.WriteString(" . ")
-			buf.WriteString(displayValue(cur))
+			buf.WriteString(displayValueSafe(e, visited))
 		}
 		buf.WriteByte(')')
 		return buf.String()
@@ -269,8 +348,17 @@ func displayValue(v Value) string {
 	}
 }
 
+// displayValue returns the display representation (no quotes on strings).
+func displayValue(v Value) string {
+	visited := make(map[*PairVal]bool)
+	return displayValueSafe(v, visited)
+}
+
 // writeValue returns the write representation (quotes on strings).
 func writeValue(v Value) string {
+	if p, ok := v.(*PairVal); ok {
+		return writePair(p, true)
+	}
 	return v.String()
 }
 
