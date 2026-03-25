@@ -161,16 +161,18 @@ final class Parser {
         };
     }
 
-    private Expr parseNumber() {
+    private Expr parseNumber() throws EvalError {
         SourcePos pos = currentPos();
         int start = index;
-        if (peek() == '+' || peek() == '-') {
+        while (!isAtEnd() && !isDelimiter(peek())) {
             advance();
         }
-        while (!isAtEnd() && Character.isDigit(peek())) {
-            advance();
+        String token = input.substring(start, index);
+        try {
+            return new NumberExpr(SchemeNumber.parseLiteral(token), pos);
+        } catch (NumberFormatException error) {
+            throw error("invalid number: " + token, pos);
         }
-        return new IntExpr(new BigInteger(input.substring(start, index)), pos);
     }
 
     private Expr parseSymbol() {

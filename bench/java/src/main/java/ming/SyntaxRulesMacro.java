@@ -454,8 +454,8 @@ final class SyntaxRulesMacro implements SyntaxMacro {
         if (left.getClass() != right.getClass()) {
             return false;
         }
-        if (left instanceof IntExpr leftInt && right instanceof IntExpr rightInt) {
-            return leftInt.value().equals(rightInt.value());
+        if (left instanceof NumberExpr leftNumber && right instanceof NumberExpr rightNumber) {
+            return leftNumber.value().equals(rightNumber.value());
         }
         if (left instanceof BoolExpr leftBool && right instanceof BoolExpr rightBool) {
             return leftBool.value() == rightBool.value();
@@ -574,8 +574,8 @@ final class SyntaxRulesMacro implements SyntaxMacro {
             if (left.getClass() != right.getClass()) {
                 return false;
             }
-            if (left instanceof IntExpr leftInt && right instanceof IntExpr rightInt) {
-                return leftInt.value().equals(rightInt.value());
+            if (left instanceof NumberExpr leftNumber && right instanceof NumberExpr rightNumber) {
+                return leftNumber.value().equals(rightNumber.value());
             }
             if (left instanceof BoolExpr leftBool && right instanceof BoolExpr rightBool) {
                 return leftBool.value() == rightBool.value();

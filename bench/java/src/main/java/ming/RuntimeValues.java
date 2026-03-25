@@ -3,8 +3,11 @@ package ming;
 import java.math.BigInteger;
 import java.util.List;
 
-sealed interface Value permits IntValue, BoolValue, StringValue, CharValue,
+sealed interface Value permits NumericValue, BoolValue, StringValue, CharValue,
         SymbolValue, EmptyListValue, PairValue, ProcedureValue, VoidValue {
+}
+
+sealed interface NumericValue extends Value permits IntValue, RationalValue, InexactValue {
 }
 
 sealed interface ProcedureValue extends Value permits BuiltinProcedure, ClosureProcedure {
@@ -15,7 +18,30 @@ interface BuiltinImplementation {
     Value apply(List<Value> arguments, SourcePos pos) throws EvalError;
 }
 
-record IntValue(BigInteger value) implements Value {
+record IntValue(BigInteger value) implements NumericValue {
+}
+
+record RationalValue(BigInteger numerator, BigInteger denominator) implements NumericValue {
+    RationalValue {
+        if (denominator.signum() == 0) {
+            throw new IllegalArgumentException("denominator cannot be zero");
+        }
+        if (numerator.signum() == 0) {
+            numerator = BigInteger.ZERO;
+            denominator = BigInteger.ONE;
+        } else {
+            if (denominator.signum() < 0) {
+                numerator = numerator.negate();
+                denominator = denominator.negate();
+            }
+            BigInteger gcd = numerator.gcd(denominator);
+            numerator = numerator.divide(gcd);
+            denominator = denominator.divide(gcd);
+        }
+    }
+}
+
+record InexactValue(double value) implements NumericValue {
 }
 
 record BoolValue(boolean value) implements Value {

@@ -95,15 +95,23 @@ public class Evaluator {
         environment.define("equal?", new BuiltinProcedure("equal?", (args, pos) ->
                 BoolValue.of(isEqual(args, pos))));
         environment.define("string?", new BuiltinProcedure("string?", (args, pos) ->
-                BoolValue.of(isType(args, pos, StringValue.class))));
+                BoolValue.of(isType(args, pos, "string?", StringValue.class))));
         environment.define("number?", new BuiltinProcedure("number?", (args, pos) ->
-                BoolValue.of(isType(args, pos, IntValue.class))));
+                BoolValue.of(isType(args, pos, "number?", NumericValue.class))));
+        environment.define("exact?", new BuiltinProcedure("exact?", (args, pos) ->
+                BoolValue.of(isExact(args, pos))));
+        environment.define("inexact?", new BuiltinProcedure("inexact?", (args, pos) ->
+                BoolValue.of(isInexact(args, pos))));
+        environment.define("integer?", new BuiltinProcedure("integer?", (args, pos) ->
+                BoolValue.of(isInteger(args, pos))));
+        environment.define("rational?", new BuiltinProcedure("rational?", (args, pos) ->
+                BoolValue.of(isRational(args, pos))));
         environment.define("boolean?", new BuiltinProcedure("boolean?", (args, pos) ->
-                BoolValue.of(isType(args, pos, BoolValue.class))));
+                BoolValue.of(isType(args, pos, "boolean?", BoolValue.class))));
         environment.define("pair?", new BuiltinProcedure("pair?", (args, pos) ->
-                BoolValue.of(isType(args, pos, PairValue.class))));
+                BoolValue.of(isType(args, pos, "pair?", PairValue.class))));
         environment.define("symbol?", new BuiltinProcedure("symbol?", (args, pos) ->
-                BoolValue.of(isType(args, pos, SymbolValue.class))));
+                BoolValue.of(isType(args, pos, "symbol?", SymbolValue.class))));
         environment.define("display", new BuiltinProcedure("display", (args, pos) ->
                 applyDisplay(args, pos, output)));
         environment.define("write", new BuiltinProcedure("write", (args, pos) ->
@@ -136,7 +144,14 @@ public class Evaluator {
         environment.define("string-downcase", new BuiltinProcedure("string-downcase",
                 this::applyStringDowncase));
         environment.define("char?", new BuiltinProcedure("char?", (args, pos) ->
-                BoolValue.of(isType(args, pos, CharValue.class))));
+                BoolValue.of(isType(args, pos, "char?", CharValue.class))));
+        environment.define("exact->inexact", new BuiltinProcedure("exact->inexact",
+                this::applyExactToInexact));
+        environment.define("inexact->exact", new BuiltinProcedure("inexact->exact",
+                this::applyInexactToExact));
+        environment.define("numerator", new BuiltinProcedure("numerator", this::applyNumerator));
+        environment.define("denominator", new BuiltinProcedure("denominator",
+                this::applyDenominator));
         environment.define("char-alphabetic?", new BuiltinProcedure("char-alphabetic?",
                 (args, pos) -> BoolValue.of(isCharAlphabetic(args, pos))));
         environment.define("char-numeric?", new BuiltinProcedure("char-numeric?",
@@ -153,8 +168,8 @@ public class Evaluator {
     }
 
     private Value eval(Expr expression, Environment environment) throws EvalError {
-        if (expression instanceof IntExpr intExpr) {
-            return new IntValue(intExpr.value());
+        if (expression instanceof NumberExpr numberExpr) {
+            return numberExpr.value().toValue();
         }
         if (expression instanceof BoolExpr boolExpr) {
             return BoolValue.of(boolExpr.value());
@@ -557,30 +572,30 @@ public class Evaluator {
     }
 
     private Value applyAdd(List<Value> arguments, SourcePos pos) throws EvalError {
-        return new IntValue(sum(arguments, pos));
+        return sum(arguments, pos).toValue();
     }
 
     private Value applySubtract(List<Value> arguments, SourcePos pos) throws EvalError {
-        return new IntValue(subtract(arguments, pos));
+        return subtract(arguments, pos).toValue();
     }
 
     private Value applyMultiply(List<Value> arguments, SourcePos pos) throws EvalError {
-        return new IntValue(product(arguments, pos));
+        return product(arguments, pos).toValue();
     }
 
     private Value applyDivide(List<Value> arguments, SourcePos pos) throws EvalError {
-        return new IntValue(divide(arguments, pos));
+        return divide(arguments, pos).toValue();
     }
 
     private Value applyAbs(List<Value> arguments, SourcePos pos) throws EvalError {
         requireArgCount(arguments, 1, "abs", pos);
-        return new IntValue(asNumber(arguments.getFirst(), "abs", pos).abs());
+        return asNumber(arguments.getFirst(), "abs", pos).abs().toValue();
     }
 
     private Value applyModulo(List<Value> arguments, SourcePos pos) throws EvalError {
         requireArgCount(arguments, 2, "modulo", pos);
-        BigInteger dividend = asNumber(arguments.get(0), "modulo", pos);
-        BigInteger divisor = nonZeroDivisor(arguments.get(1), "modulo", pos);
+        BigInteger dividend = asExactInteger(arguments.get(0), "modulo", pos);
+        BigInteger divisor = nonZeroExactInteger(arguments.get(1), "modulo", pos);
         BigInteger remainder = dividend.remainder(divisor);
         if (!BigInteger.ZERO.equals(remainder) && remainder.signum() != divisor.signum()) {
             remainder = remainder.add(divisor);
@@ -590,47 +605,53 @@ public class Evaluator {
 
     private Value applyRemainder(List<Value> arguments, SourcePos pos) throws EvalError {
         requireArgCount(arguments, 2, "remainder", pos);
-        BigInteger dividend = asNumber(arguments.get(0), "remainder", pos);
-        BigInteger divisor = nonZeroDivisor(arguments.get(1), "remainder", pos);
+        BigInteger dividend = asExactInteger(arguments.get(0), "remainder", pos);
+        BigInteger divisor = nonZeroExactInteger(arguments.get(1), "remainder", pos);
         return new IntValue(dividend.remainder(divisor));
     }
 
     private Value applyQuotient(List<Value> arguments, SourcePos pos) throws EvalError {
         requireArgCount(arguments, 2, "quotient", pos);
-        BigInteger dividend = asNumber(arguments.get(0), "quotient", pos);
-        BigInteger divisor = nonZeroDivisor(arguments.get(1), "quotient", pos);
+        BigInteger dividend = asExactInteger(arguments.get(0), "quotient", pos);
+        BigInteger divisor = nonZeroExactInteger(arguments.get(1), "quotient", pos);
         return new IntValue(dividend.divide(divisor));
     }
 
     private Value applyMin(List<Value> arguments, SourcePos pos) throws EvalError {
         requireAtLeastArgs(arguments, 1, "min", pos);
-        BigInteger result = asNumber(arguments.getFirst(), "min", pos);
+        SchemeNumber result = asNumber(arguments.getFirst(), "min", pos);
         for (int i = 1; i < arguments.size(); i++) {
-            result = result.min(asNumber(arguments.get(i), "min", pos));
+            SchemeNumber candidate = asNumber(arguments.get(i), "min", pos);
+            if (candidate.compareTo(result) < 0) {
+                result = candidate;
+            }
         }
-        return new IntValue(result);
+        return result.toValue();
     }
 
     private Value applyMax(List<Value> arguments, SourcePos pos) throws EvalError {
         requireAtLeastArgs(arguments, 1, "max", pos);
-        BigInteger result = asNumber(arguments.getFirst(), "max", pos);
+        SchemeNumber result = asNumber(arguments.getFirst(), "max", pos);
         for (int i = 1; i < arguments.size(); i++) {
-            result = result.max(asNumber(arguments.get(i), "max", pos));
+            SchemeNumber candidate = asNumber(arguments.get(i), "max", pos);
+            if (candidate.compareTo(result) > 0) {
+                result = candidate;
+            }
         }
-        return new IntValue(result);
+        return result.toValue();
     }
 
     private Value applyExpt(List<Value> arguments, SourcePos pos) throws EvalError {
         requireArgCount(arguments, 2, "expt", pos);
-        BigInteger base = asNumber(arguments.get(0), "expt", pos);
-        BigInteger exponent = asNumber(arguments.get(1), "expt", pos);
+        SchemeNumber base = asNumber(arguments.get(0), "expt", pos);
+        BigInteger exponent = asExactInteger(arguments.get(1), "expt", pos);
         if (exponent.signum() < 0) {
             throw error("'expt' expects a non-negative exponent", pos);
         }
         if (exponent.compareTo(BigInteger.valueOf(Integer.MAX_VALUE)) > 0) {
             throw error("'expt' exponent is too large", pos);
         }
-        return new IntValue(base.pow(exponent.intValue()));
+        return base.pow(exponent.intValue()).toValue();
     }
 
     private Value applyCons(List<Value> arguments, SourcePos pos) throws EvalError {
@@ -798,7 +819,7 @@ public class Evaluator {
         requireArgCount(arguments, 1, "string->number", pos);
         String value = asString(arguments.getFirst(), "string->number", pos);
         try {
-            return new IntValue(new BigInteger(value));
+            return SchemeNumber.parseLiteral(value).toValue();
         } catch (NumberFormatException ignored) {
             return BoolValue.FALSE;
         }
@@ -806,7 +827,7 @@ public class Evaluator {
 
     private Value applyNumberToString(List<Value> arguments, SourcePos pos) throws EvalError {
         requireArgCount(arguments, 1, "number->string", pos);
-        return new StringValue(asNumber(arguments.getFirst(), "number->string", pos).toString());
+        return new StringValue(asNumber(arguments.getFirst(), "number->string", pos).format());
     }
 
     private Value applyApply(List<Value> arguments, SourcePos pos) throws EvalError {
@@ -906,20 +927,41 @@ public class Evaluator {
                 asChar(arguments.getFirst(), "char-downcase", pos)));
     }
 
-    private BigInteger sum(List<Value> arguments, SourcePos pos) throws EvalError {
-        BigInteger result = BigInteger.ZERO;
+    private Value applyExactToInexact(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 1, "exact->inexact", pos);
+        return asNumber(arguments.getFirst(), "exact->inexact", pos).exactToInexact().toValue();
+    }
+
+    private Value applyInexactToExact(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 1, "inexact->exact", pos);
+        return asNumber(arguments.getFirst(), "inexact->exact", pos).inexactToExact().toValue();
+    }
+
+    private Value applyNumerator(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 1, "numerator", pos);
+        return new IntValue(asExactNumber(arguments.getFirst(), "numerator", pos).numeratorExact());
+    }
+
+    private Value applyDenominator(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 1, "denominator", pos);
+        return new IntValue(
+                asExactNumber(arguments.getFirst(), "denominator", pos).denominatorExact());
+    }
+
+    private SchemeNumber sum(List<Value> arguments, SourcePos pos) throws EvalError {
+        SchemeNumber result = SchemeNumber.exact(BigInteger.ZERO);
         for (Value argument : arguments) {
             result = result.add(asNumber(argument, "+", pos));
         }
         return result;
     }
 
-    private BigInteger subtract(List<Value> arguments, SourcePos pos) throws EvalError {
+    private SchemeNumber subtract(List<Value> arguments, SourcePos pos) throws EvalError {
         if (arguments.isEmpty()) {
             throw error("'-' expects at least 1 argument", pos);
         }
 
-        BigInteger result = asNumber(arguments.getFirst(), "-", pos);
+        SchemeNumber result = asNumber(arguments.getFirst(), "-", pos);
         if (arguments.size() == 1) {
             return result.negate();
         }
@@ -930,23 +972,23 @@ public class Evaluator {
         return result;
     }
 
-    private BigInteger product(List<Value> arguments, SourcePos pos) throws EvalError {
-        BigInteger result = BigInteger.ONE;
+    private SchemeNumber product(List<Value> arguments, SourcePos pos) throws EvalError {
+        SchemeNumber result = SchemeNumber.exact(BigInteger.ONE);
         for (Value argument : arguments) {
             result = result.multiply(asNumber(argument, "*", pos));
         }
         return result;
     }
 
-    private BigInteger divide(List<Value> arguments, SourcePos pos) throws EvalError {
+    private SchemeNumber divide(List<Value> arguments, SourcePos pos) throws EvalError {
         if (arguments.size() < 2) {
             throw error("'/' expects at least 2 arguments", pos);
         }
 
-        BigInteger result = asNumber(arguments.getFirst(), "/", pos);
+        SchemeNumber result = asNumber(arguments.getFirst(), "/", pos);
         for (int i = 1; i < arguments.size(); i++) {
-            BigInteger divisor = asNumber(arguments.get(i), "/", pos);
-            if (BigInteger.ZERO.equals(divisor)) {
+            SchemeNumber divisor = asNumber(arguments.get(i), "/", pos);
+            if (divisor.isZero()) {
                 throw error("division by zero", pos);
             }
             result = result.divide(divisor);
@@ -960,9 +1002,9 @@ public class Evaluator {
             throw error("comparison expects at least 2 arguments", pos);
         }
 
-        BigInteger left = asNumber(arguments.getFirst(), comparison.name, pos);
+        SchemeNumber left = asNumber(arguments.getFirst(), comparison.name, pos);
         for (int i = 1; i < arguments.size(); i++) {
-            BigInteger right = asNumber(arguments.get(i), comparison.name, pos);
+            SchemeNumber right = asNumber(arguments.get(i), comparison.name, pos);
             if (!comparison.matches(left.compareTo(right))) {
                 return false;
             }
@@ -988,7 +1030,7 @@ public class Evaluator {
 
     private boolean isZero(List<Value> arguments, SourcePos pos) throws EvalError {
         requireArgCount(arguments, 1, "zero?", pos);
-        return asNumber(arguments.getFirst(), "zero?", pos).signum() == 0;
+        return asNumber(arguments.getFirst(), "zero?", pos).isZero();
     }
 
     private boolean isPositive(List<Value> arguments, SourcePos pos) throws EvalError {
@@ -1003,14 +1045,38 @@ public class Evaluator {
 
     private boolean isOdd(List<Value> arguments, SourcePos pos) throws EvalError {
         requireArgCount(arguments, 1, "odd?", pos);
-        return !asNumber(arguments.getFirst(), "odd?", pos).mod(BigInteger.TWO)
+        return !asExactInteger(arguments.getFirst(), "odd?", pos).mod(BigInteger.TWO)
                 .equals(BigInteger.ZERO);
     }
 
     private boolean isEven(List<Value> arguments, SourcePos pos) throws EvalError {
         requireArgCount(arguments, 1, "even?", pos);
-        return asNumber(arguments.getFirst(), "even?", pos).mod(BigInteger.TWO)
+        return asExactInteger(arguments.getFirst(), "even?", pos).mod(BigInteger.TWO)
                 .equals(BigInteger.ZERO);
+    }
+
+    private boolean isExact(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 1, "exact?", pos);
+        SchemeNumber number = asMaybeNumber(arguments.getFirst());
+        return number != null && number.isExact();
+    }
+
+    private boolean isInexact(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 1, "inexact?", pos);
+        SchemeNumber number = asMaybeNumber(arguments.getFirst());
+        return number != null && !number.isExact();
+    }
+
+    private boolean isInteger(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 1, "integer?", pos);
+        SchemeNumber number = asMaybeNumber(arguments.getFirst());
+        return number != null && number.isInteger();
+    }
+
+    private boolean isRational(List<Value> arguments, SourcePos pos) throws EvalError {
+        requireArgCount(arguments, 1, "rational?", pos);
+        SchemeNumber number = asMaybeNumber(arguments.getFirst());
+        return number != null && number.isExact();
     }
 
     private boolean isEq(List<Value> arguments, SourcePos pos) throws EvalError {
@@ -1083,8 +1149,8 @@ public class Evaluator {
         if (left == right) {
             return true;
         }
-        if (left instanceof IntValue leftInt && right instanceof IntValue rightInt) {
-            return leftInt.value().equals(rightInt.value());
+        if (left instanceof NumericValue leftNumber && right instanceof NumericValue rightNumber) {
+            return SchemeNumber.fromValue(leftNumber).equals(SchemeNumber.fromValue(rightNumber));
         }
         if (left instanceof BoolValue leftBool && right instanceof BoolValue rightBool) {
             return leftBool.value() == rightBool.value();
@@ -1102,6 +1168,10 @@ public class Evaluator {
         if (eqValues(left, right)) {
             return true;
         }
+        if (left instanceof NumericValue leftNumber && right instanceof NumericValue rightNumber) {
+            return SchemeNumber.fromValue(leftNumber)
+                    .numericallyEquals(SchemeNumber.fromValue(rightNumber));
+        }
         if (left instanceof StringValue leftString && right instanceof StringValue rightString) {
             return leftString.value().equals(rightString.value());
         }
@@ -1112,9 +1182,9 @@ public class Evaluator {
         return false;
     }
 
-    private boolean isType(List<Value> arguments, SourcePos pos,
+    private boolean isType(List<Value> arguments, SourcePos pos, String name,
                            Class<? extends Value> expectedType) throws EvalError {
-        requireArgCount(arguments, 1, expectedType.getSimpleName(), pos);
+        requireArgCount(arguments, 1, name, pos);
         return expectedType.isInstance(arguments.getFirst());
     }
 
@@ -1134,20 +1204,45 @@ public class Evaluator {
         }
     }
 
-    private BigInteger nonZeroDivisor(Value value, String operator, SourcePos pos)
+    private BigInteger nonZeroExactInteger(Value value, String operator, SourcePos pos)
             throws EvalError {
-        BigInteger divisor = asNumber(value, operator, pos);
+        BigInteger divisor = asExactInteger(value, operator, pos);
         if (BigInteger.ZERO.equals(divisor)) {
             throw error("division by zero", pos);
         }
         return divisor;
     }
 
-    private BigInteger asNumber(Value value, String operator, SourcePos pos) throws EvalError {
-        if (value instanceof IntValue intValue) {
-            return intValue.value();
+    private SchemeNumber asNumber(Value value, String operator, SourcePos pos) throws EvalError {
+        if (value instanceof NumericValue numericValue) {
+            return SchemeNumber.fromValue(numericValue);
         }
         throw error("'" + operator + "' expects numeric arguments", pos);
+    }
+
+    private SchemeNumber asExactNumber(Value value, String operator, SourcePos pos)
+            throws EvalError {
+        SchemeNumber number = asNumber(value, operator, pos);
+        if (!number.isExact()) {
+            throw error("'" + operator + "' expects an exact number", pos);
+        }
+        return number;
+    }
+
+    private BigInteger asExactInteger(Value value, String operator, SourcePos pos)
+            throws EvalError {
+        SchemeNumber number = asNumber(value, operator, pos);
+        if (!number.isExact() || !number.isInteger()) {
+            throw error("'" + operator + "' expects an exact integer", pos);
+        }
+        return number.integerExact();
+    }
+
+    private SchemeNumber asMaybeNumber(Value value) {
+        if (value instanceof NumericValue numericValue) {
+            return SchemeNumber.fromValue(numericValue);
+        }
+        return null;
     }
 
     private PairValue asPair(Value value, String operator, SourcePos pos) throws EvalError {
@@ -1187,7 +1282,7 @@ public class Evaluator {
     }
 
     private int asIndex(Value value, String operator, SourcePos pos) throws EvalError {
-        BigInteger index = asNumber(value, operator, pos);
+        BigInteger index = asExactInteger(value, operator, pos);
         if (index.signum() < 0 || index.compareTo(BigInteger.valueOf(Integer.MAX_VALUE)) > 0) {
             throw error("'" + operator + "' expects a non-negative integer index", pos);
         }
@@ -1246,8 +1341,8 @@ public class Evaluator {
     }
 
     private Value quote(Expr expression) throws EvalError {
-        if (expression instanceof IntExpr intExpr) {
-            return new IntValue(intExpr.value());
+        if (expression instanceof NumberExpr numberExpr) {
+            return numberExpr.value().toValue();
         }
         if (expression instanceof BoolExpr boolExpr) {
             return BoolValue.of(boolExpr.value());
@@ -1289,8 +1384,8 @@ public class Evaluator {
     }
 
     private String format(Value value, boolean displayMode) {
-        if (value instanceof IntValue intValue) {
-            return intValue.value().toString();
+        if (value instanceof NumericValue numericValue) {
+            return SchemeNumber.fromValue(numericValue).format();
         }
         if (value instanceof BoolValue boolValue) {
             return boolValue.value() ? "#t" : "#f";

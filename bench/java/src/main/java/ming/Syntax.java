@@ -3,11 +3,11 @@ package ming;
 import java.math.BigInteger;
 import java.util.List;
 
-sealed interface Expr permits IntExpr, BoolExpr, StringExpr, CharExpr, SymbolExpr, ListExpr {
+sealed interface Expr permits NumberExpr, BoolExpr, StringExpr, CharExpr, SymbolExpr, ListExpr {
     SourcePos pos();
 }
 
-record IntExpr(BigInteger value, SourcePos pos) implements Expr {
+record NumberExpr(SchemeNumber value, SourcePos pos) implements Expr {
 }
 
 record BoolExpr(boolean value, SourcePos pos) implements Expr {
