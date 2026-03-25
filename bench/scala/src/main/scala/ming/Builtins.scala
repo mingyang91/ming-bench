@@ -12,6 +12,8 @@ object Builtins:
     CollectionBuiltins.register(env)
     CharBuiltins.register(env)
     StringBuiltins.register(env, output)
+    env.define("call/cc", SchemeVal.CallCCVal())
+    env.define("call-with-current-continuation", SchemeVal.CallCCVal())
 
   private def registerApply(env: Env): Unit =
     env.define(
@@ -186,6 +188,8 @@ object Builtins:
             case SchemeVal.BuiltinProc(_, _)      => SchemeVal.BoolVal(true)
             case SchemeVal.LambdaProc(_, _, _, _) => SchemeVal.BoolVal(true)
             case SchemeVal.CaseLambdaProc(_, _)   => SchemeVal.BoolVal(true)
+            case SchemeVal.ContinuationVal(_)     => SchemeVal.BoolVal(true)
+            case SchemeVal.CallCCVal()            => SchemeVal.BoolVal(true)
             case _                                => SchemeVal.BoolVal(false)
       )
     )
