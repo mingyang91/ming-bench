@@ -109,6 +109,7 @@ impl Env {
             ("symbol->string", builtin_symbol_to_string),
             ("string->symbol", builtin_string_to_symbol),
             ("string-ref", builtin_string_ref),
+            ("string-copy", builtin_string_copy),
         ];
         for &(name, f) in builtins {
             frame.borrow_mut().insert(name.to_string(), Val::Builtin(f));
@@ -127,6 +128,17 @@ impl Env {
 
     fn define(&self, name: String, val: Val) {
         self.frames.last().expect("env has no frames").borrow_mut().insert(name, val);
+    }
+
+    fn set(&self, name: &str, val: Val) -> Result<(), EvalError> {
+        for frame in self.frames.iter().rev() {
+            let mut f = frame.borrow_mut();
+            if f.contains_key(name) {
+                f.insert(name.to_string(), val);
+                return Ok(());
+            }
+        }
+        Err(EvalError::UnboundVariable(name.to_string()))
     }
 
     fn push(&self) -> Env {
@@ -169,6 +181,7 @@ enum ExprKind {
     Int(i64),
     Bool(bool),
     Str(String),
+    Char(char),
     Symbol(String),
     List(Vec<Expr>),
 }
@@ -280,6 +293,16 @@ fn parse(tokens: &[Token]) -> Result<(Expr, usize), EvalError> {
         Ok((Expr::new(ExprKind::Bool(true), span), 1))
     } else if tok.text == "#f" {
         Ok((Expr::new(ExprKind::Bool(false), span), 1))
+    } else if tok.text.starts_with("#\\") {
+        let rest = &tok.text[2..];
+        let ch = match rest {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            s if s.len() == 1 => s.chars().next().expect("single-char string is non-empty"),
+            _ => return Err(EvalError::Parse(format!("unknown character literal: {} at {span}", tok.text))),
+        };
+        Ok((Expr::new(ExprKind::Char(ch), span), 1))
     } else if let Ok(n) = tok.text.parse::<i64>() {
         Ok((Expr::new(ExprKind::Int(n), span), 1))
     } else {
@@ -329,6 +352,7 @@ fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
         ExprKind::Int(n) => Ok(Val::Int(*n)),
         ExprKind::Bool(b) => Ok(Val::Bool(*b)),
         ExprKind::Str(s) => Ok(Val::Str(s.clone())),
+        ExprKind::Char(c) => Ok(Val::Char(*c)),
         ExprKind::Symbol(name) => {
             env.get(name).ok_or_else(|| EvalError::UnboundVariable(format!("{name} at {span}")))
         }
@@ -348,6 +372,7 @@ fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
                     "begin" => return eval_begin(&elems[1..], env),
                     "let" => return eval_let(&elems[1..], env, span),
                     "cond" => return eval_cond(&elems[1..], env),
+                    "string-set!" => return eval_string_set(&elems[1..], env, span),
                     _ => {}
                 }
             }
@@ -447,6 +472,7 @@ fn expr_to_val(expr: &Expr) -> Result<Val, EvalError> {
         ExprKind::Int(n) => Ok(Val::Int(*n)),
         ExprKind::Bool(b) => Ok(Val::Bool(*b)),
         ExprKind::Str(s) => Ok(Val::Str(s.clone())),
+        ExprKind::Char(c) => Ok(Val::Char(*c)),
         ExprKind::Symbol(s) => Ok(Val::Symbol(s.clone())),
         ExprKind::List(elems) => {
             let vals: Vec<Val> = elems.iter().map(expr_to_val).collect::<Result<_, _>>()?;
@@ -884,6 +910,46 @@ fn builtin_string_ref(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
         return Err(EvalError::Runtime("string-ref: index out of range".into()));
     }
     Ok(Val::Char(chars[idx]))
+}
+
+fn eval_string_set(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Arity(format!("string-set!: expected 3 arguments at {span}")));
+    }
+    let target = eval(&args[0], env)?;
+    let idx = match eval(&args[1], env)? {
+        Val::Int(n) => n as usize,
+        _ => return Err(EvalError::Type("string-set!: expected integer index".into())),
+    };
+    let ch = match eval(&args[2], env)? {
+        Val::Char(c) => c,
+        _ => return Err(EvalError::Type("string-set!: expected char".into())),
+    };
+    let mut s = match target {
+        Val::Str(s) => s,
+        _ => return Err(EvalError::Type("string-set!: expected string".into())),
+    };
+    let mut chars: Vec<char> = s.chars().collect();
+    if idx >= chars.len() {
+        return Err(EvalError::Runtime("string-set!: index out of range".into()));
+    }
+    chars[idx] = ch;
+    s = chars.into_iter().collect();
+    // If the first argument is a variable, update it in the environment
+    if let ExprKind::Symbol(name) = &args[0].kind {
+        env.set(name, Val::Str(s))?;
+    }
+    Ok(Val::Void)
+}
+
+fn builtin_string_copy(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("string-copy: expected 1 argument".into()));
+    }
+    match &args[0] {
+        Val::Str(s) => Ok(Val::Str(s.clone())),
+        _ => Err(EvalError::Type("string-copy: expected string".into())),
+    }
 }
 
 /// Evaluate one or more Scheme expressions and return the string
