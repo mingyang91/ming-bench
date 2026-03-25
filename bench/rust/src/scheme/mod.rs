@@ -10,6 +10,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
 static RECORD_TYPE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static WINDER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug)]
+struct Winder {
+    id: u64,
+    in_thunk: Value,
+    out_thunk: Value,
+}
 
 fn gensym(base: &str) -> String {
     let n = GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -56,7 +64,7 @@ enum Value {
         name: Option<String>,
         clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>, Env)>,
     },
-    Continuation(Rc<Cont>),
+    Continuation(Rc<Cont>, Vec<Winder>),
     Vector(Rc<RefCell<Vec<Value>>>),
     Record {
         type_id: u64,
@@ -251,7 +259,7 @@ impl fmt::Display for Value {
             }
             Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::CaseLambda { .. } => write!(f, "#<procedure>"),
-            Value::Continuation(_) => write!(f, "#<continuation>"),
+            Value::Continuation(..) => write!(f, "#<continuation>"),
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
             Value::Void => write!(f, "#<void>"),
@@ -626,6 +634,7 @@ fn default_env() -> Env {
         "member", "reverse",
         "error",
         "call/cc", "call-with-current-continuation",
+        "dynamic-wind",
     ] {
         env.set(name.into(), Value::Builtin(name.into()));
     }
@@ -908,6 +917,22 @@ enum Cont {
     StrSetIdxK(String, Expr, Env, Span, K),
     StrSetCharK(String, usize, Env, Span, K),
     CallCCK(K),
+    DynWindBody(Value, Value, Value, K),  // (in_thunk, body_thunk, out_thunk, next)
+    DynWindOut(Value, Value, K),          // (body_result, out_thunk, next)
+    DynWindDone(Value, K),               // (body_result, next)
+    DynWindDoUnwind {
+        out_thunks: Vec<Value>,
+        rewind_winders: Vec<Winder>,
+        target_winders: Vec<Winder>,
+        val: Value,
+        saved_k: K,
+    },
+    DynWindDoRewind {
+        remaining: Vec<Winder>,
+        target_winders: Vec<Winder>,
+        val: Value,
+        saved_k: K,
+    },
 }
 
 impl fmt::Debug for Cont {
@@ -956,7 +981,7 @@ fn setup_lambda_env_basic(
 
 fn cek_apply_func(
     func: &Value, args: &[Value], span: Span,
-    st: &mut CekState, k: &mut K, output: &mut String,
+    st: &mut CekState, k: &mut K, winders: &mut Vec<Winder>, output: &mut String,
 ) -> Result<(), EvalError> {
     match func {
         Value::Lambda { name, params, rest_param, body, env: closure_env } => {
@@ -986,7 +1011,7 @@ fn cek_apply_func(
                         body: body.clone(),
                         env: clause_env.clone(),
                     };
-                    return cek_apply_func(&lambda, args, span, st, k, output);
+                    return cek_apply_func(&lambda, args, span, st, k, winders, output);
                 }
             }
             Err(EvalError::Arity(format!(
@@ -1002,26 +1027,70 @@ fn cek_apply_func(
             let tail = value_to_vec(last).ok_or_else(|| EvalError::Type(format!("apply: last argument must be a list at {span}")))?;
             let mut combined: Vec<Value> = args[1..args.len() - 1].to_vec();
             combined.extend(tail);
-            cek_apply_func(f, &combined, span, st, k, output)
+            cek_apply_func(f, &combined, span, st, k, winders, output)
         }
         Value::Builtin(ref bname) if bname == "call/cc" || bname == "call-with-current-continuation" => {
             if args.len() != 1 {
                 return Err(EvalError::Arity(format!("call/cc requires 1 argument at {span}")));
             }
-            let continuation_val = Value::Continuation(k.clone());
-            cek_apply_func(&args[0], &[continuation_val], span, st, k, output)
+            let continuation_val = Value::Continuation(k.clone(), winders.clone());
+            cek_apply_func(&args[0], &[continuation_val], span, st, k, winders, output)
+        }
+        Value::Builtin(ref bname) if bname == "dynamic-wind" => {
+            if args.len() != 3 {
+                return Err(EvalError::Arity(format!("dynamic-wind requires 3 arguments at {span}")));
+            }
+            let (in_thunk, body_thunk, out_thunk) = (args[0].clone(), args[1].clone(), args[2].clone());
+            *k = Rc::new(Cont::DynWindBody(in_thunk.clone(), body_thunk, out_thunk, k.clone()));
+            cek_apply_func(&in_thunk, &[], span, st, k, winders, output)
         }
         Value::Builtin(ref bname) => {
             let result = apply_builtin(bname, args, span, output)?;
             *st = CekState::Ret(result);
             Ok(())
         }
-        Value::Continuation(saved_k) => {
+        Value::Continuation(saved_k, saved_winders) => {
             if args.len() != 1 {
                 return Err(EvalError::Arity(format!("continuation requires 1 argument at {span}")));
             }
-            *k = saved_k.clone();
-            *st = CekState::Ret(args[0].clone());
+            let val = args[0].clone();
+            // Compute common prefix of winders
+            let common_len = winders.iter().zip(saved_winders.iter())
+                .take_while(|(a, b)| a.id == b.id)
+                .count();
+            // Out-thunks to call: current winders beyond common prefix, innermost first
+            let out_thunks: Vec<Value> = winders[common_len..].iter().rev()
+                .map(|w| w.out_thunk.clone()).collect();
+            // Winders to rewind: saved winders beyond common prefix, outermost first
+            let rewind_winders: Vec<Winder> = saved_winders[common_len..].to_vec();
+            let target_winders = saved_winders.clone();
+            if out_thunks.is_empty() && rewind_winders.is_empty() {
+                *k = saved_k.clone();
+                *st = CekState::Ret(val);
+            } else if !out_thunks.is_empty() {
+                // Start unwinding: pop current winders and call out-thunks
+                winders.truncate(common_len);
+                let first_out = out_thunks[0].clone();
+                *k = Rc::new(Cont::DynWindDoUnwind {
+                    out_thunks: out_thunks[1..].to_vec(),
+                    rewind_winders,
+                    target_winders,
+                    val,
+                    saved_k: saved_k.clone(),
+                });
+                cek_apply_func(&first_out, &[], span, st, k, winders, output)?;
+            } else {
+                // No unwinding needed, start rewinding
+                let first_winder = rewind_winders[0].clone();
+                winders.push(first_winder.clone());
+                *k = Rc::new(Cont::DynWindDoRewind {
+                    remaining: rewind_winders[1..].to_vec(),
+                    target_winders,
+                    val,
+                    saved_k: saved_k.clone(),
+                });
+                cek_apply_func(&first_winder.in_thunk, &[], span, st, k, winders, output)?;
+            }
             Ok(())
         }
         _ => Err(EvalError::Type(format!("not a procedure: {func} at {span}"))),
@@ -1089,6 +1158,7 @@ fn desugar_do(elems: &[Expr], span: Span) -> Result<Expr, EvalError> {
 fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     let mut st = CekState::Eval(expr.clone(), env.clone());
     let mut k: K = Rc::new(Cont::Halt);
+    let mut winders: Vec<Winder> = Vec::new();
 
     loop {
         let cur_st = std::mem::replace(&mut st, CekState::Ret(Value::Void));
@@ -1670,7 +1740,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                         // rev_arg_exprs is reversed: we evaluate rightmost argument first
                         if rev_arg_exprs.is_empty() {
                             k = next;
-                            cek_apply_func(&val, &[], span, &mut st, &mut k, output)?;
+                            cek_apply_func(&val, &[], span, &mut st, &mut k, &mut winders, output)?;
                         } else {
                             k = Rc::new(Cont::EvArg(val, vec![], rev_arg_exprs[1..].to_vec(), env.clone(), span, next));
                             st = CekState::Eval(rev_arg_exprs[0].clone(), env);
@@ -1682,7 +1752,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                             // done is in reverse order (rightmost first), reverse to get original order
                             done.reverse();
                             k = next;
-                            cek_apply_func(&func, &done, span, &mut st, &mut k, output)?;
+                            cek_apply_func(&func, &done, span, &mut st, &mut k, &mut winders, output)?;
                         } else {
                             k = Rc::new(Cont::EvArg(func, done, rest[1..].to_vec(), env.clone(), span, next));
                             st = CekState::Eval(rest[0].clone(), env);
@@ -1934,9 +2004,77 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                         }
                     }
                     Cont::CallCCK(next) => {
-                        let continuation_val = Value::Continuation(next.clone());
+                        let continuation_val = Value::Continuation(next.clone(), winders.clone());
                         k = next;
-                        cek_apply_func(&val, &[continuation_val], Span::default(), &mut st, &mut k, output)?;
+                        cek_apply_func(&val, &[continuation_val], Span::default(), &mut st, &mut k, &mut winders, output)?;
+                    }
+                    Cont::DynWindBody(in_thunk, body_thunk, out_thunk, next) => {
+                        // in-thunk finished, push winder, call body
+                        let winder_id = WINDER_COUNTER.fetch_add(1, Ordering::Relaxed);
+                        winders.push(Winder { id: winder_id, in_thunk, out_thunk: out_thunk.clone() });
+                        k = Rc::new(Cont::DynWindOut(val, out_thunk, next));
+                        cek_apply_func(&body_thunk, &[], Span::default(), &mut st, &mut k, &mut winders, output)?;
+                    }
+                    Cont::DynWindOut(_in_result, out_thunk, next) => {
+                        // body-thunk returned val; pop winder, call out-thunk
+                        winders.pop();
+                        k = Rc::new(Cont::DynWindDone(val, next));
+                        cek_apply_func(&out_thunk, &[], Span::default(), &mut st, &mut k, &mut winders, output)?;
+                    }
+                    Cont::DynWindDone(body_val, next) => {
+                        // out-thunk finished, return saved body value
+                        let _ = val; // out-thunk result, unused
+                        k = next;
+                        st = CekState::Ret(body_val);
+                    }
+                    Cont::DynWindDoUnwind { out_thunks, rewind_winders, target_winders, val: cont_val, saved_k } => {
+                        let _ = val; // out-thunk result, unused
+                        if !out_thunks.is_empty() {
+                            let first_out = out_thunks[0].clone();
+                            k = Rc::new(Cont::DynWindDoUnwind {
+                                out_thunks: out_thunks[1..].to_vec(),
+                                rewind_winders,
+                                target_winders,
+                                val: cont_val,
+                                saved_k,
+                            });
+                            cek_apply_func(&first_out, &[], Span::default(), &mut st, &mut k, &mut winders, output)?;
+                        } else if !rewind_winders.is_empty() {
+                            // Start rewinding
+                            let first_winder = rewind_winders[0].clone();
+                            winders.push(first_winder.clone());
+                            k = Rc::new(Cont::DynWindDoRewind {
+                                remaining: rewind_winders[1..].to_vec(),
+                                target_winders,
+                                val: cont_val,
+                                saved_k,
+                            });
+                            cek_apply_func(&first_winder.in_thunk, &[], Span::default(), &mut st, &mut k, &mut winders, output)?;
+                        } else {
+                            // Done unwinding, no rewinding needed
+                            winders = target_winders;
+                            k = saved_k;
+                            st = CekState::Ret(cont_val);
+                        }
+                    }
+                    Cont::DynWindDoRewind { remaining, target_winders, val: cont_val, saved_k } => {
+                        let _ = val; // in-thunk result, unused
+                        if !remaining.is_empty() {
+                            let next_winder = remaining[0].clone();
+                            winders.push(next_winder.clone());
+                            k = Rc::new(Cont::DynWindDoRewind {
+                                remaining: remaining[1..].to_vec(),
+                                target_winders,
+                                val: cont_val,
+                                saved_k,
+                            });
+                            cek_apply_func(&next_winder.in_thunk, &[], Span::default(), &mut st, &mut k, &mut winders, output)?;
+                        } else {
+                            // Done rewinding, restore continuation
+                            winders = target_winders;
+                            k = saved_k;
+                            st = CekState::Ret(cont_val);
+                        }
                     }
                 }
             }
@@ -2309,7 +2447,7 @@ fn apply_builtin(name: &str, args: &[Value], call_span: Span, output: &mut Strin
         }
         "procedure?" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("procedure? requires 1 argument at {call_span}"))); }
-            Ok(Value::Boolean(matches!(&args[0], Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Builtin(_) | Value::Continuation(_))))
+            Ok(Value::Boolean(matches!(&args[0], Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Builtin(_) | Value::Continuation(..))))
         }
         "display" => {
             if args.len() != 1 { return Err(EvalError::Arity(format!("display requires 1 argument at {call_span}"))); }
