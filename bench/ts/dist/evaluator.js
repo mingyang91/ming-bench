@@ -1,4 +1,25 @@
 import { EvalError } from './evalError.js';
+const VOID_VALUE = { type: 'void' };
+class Environment {
+    parent;
+    bindings = new Map();
+    constructor(parent) {
+        this.parent = parent;
+    }
+    define(name, value) {
+        this.bindings.set(name, value);
+    }
+    lookup(name) {
+        const value = this.bindings.get(name);
+        if (value !== undefined) {
+            return value;
+        }
+        if (this.parent) {
+            return this.parent.lookup(name);
+        }
+        throw new EvalError(`unbound variable: ${name}`);
+    }
+}
 /**
  * Evaluate one or more Scheme expressions and return the string
  * representation of the last result.
@@ -8,9 +29,10 @@ export function evalStr(input) {
     if (expressions.length === 0) {
         throw new EvalError('empty input');
     }
-    let result;
+    const env = createGlobalEnv();
+    let result = VOID_VALUE;
     for (const expr of expressions) {
-        result = evaluate(expr);
+        result = evaluate(expr, env);
     }
     return formatValue(result);
 }
@@ -147,95 +169,197 @@ function tokenize(input) {
     }
     return tokens;
 }
-function evaluate(expr) {
+function evaluate(expr, env) {
     switch (expr.type) {
         case 'number':
         case 'boolean':
         case 'string':
             return expr;
         case 'symbol':
-            throw new EvalError(`unbound variable: ${expr.name}`);
+            return env.lookup(expr.name);
         case 'list':
-            return evaluateList(expr.elements);
+            return evaluateList(expr.elements, env);
     }
 }
-function evaluateList(elements) {
+function evaluateList(elements, env) {
     if (elements.length === 0) {
         throw new EvalError('cannot evaluate empty list');
     }
     const operator = elements[0];
-    if (operator.type !== 'symbol') {
-        throw new EvalError('operator must be a symbol');
-    }
     const args = elements.slice(1);
-    switch (operator.name) {
-        case '+':
-            return numberValue(evaluateNumberArgs(args).reduce((sum, value) => sum + value, 0));
-        case '*':
-            return numberValue(evaluateNumberArgs(args).reduce((product, value) => product * value, 1));
-        case '-': {
-            const values = evaluateNumberArgs(args);
-            requireArgCountAtLeast('-', values.length, 1);
-            if (values.length === 1) {
-                return numberValue(-values[0]);
-            }
-            return numberValue(values.slice(1).reduce((result, value) => result - value, values[0]));
+    if (operator.type === 'symbol') {
+        switch (operator.name) {
+            case 'define':
+                return evaluateDefine(args, env);
+            case 'if':
+                return evaluateIf(args, env);
+            case 'quote':
+                return evaluateQuote(args);
+            case 'lambda':
+                return evaluateLambda(args, env);
+            case 'and':
+                return evaluateAnd(args, env);
+            case 'or':
+                return evaluateOr(args, env);
         }
-        case '/': {
-            const values = evaluateNumberArgs(args);
-            requireArgCountAtLeast('/', values.length, 1);
-            let result = values[0];
-            if (values.length === 1) {
-                if (result === 0) {
-                    throw new EvalError('division by zero');
-                }
-                return numberValue(1 / result);
-            }
-            for (const value of values.slice(1)) {
-                if (value === 0) {
-                    throw new EvalError('division by zero');
-                }
-                result /= value;
-            }
-            return numberValue(result);
-        }
-        case '<':
-            return booleanValue(compareNumberArgs('<', args, (left, right) => left < right));
-        case '>':
-            return booleanValue(compareNumberArgs('>', args, (left, right) => left > right));
-        case '=':
-            return booleanValue(compareNumberArgs('=', args, (left, right) => left === right));
-        case '<=':
-            return booleanValue(compareNumberArgs('<=', args, (left, right) => left <= right));
-        case 'not':
-            requireArgCount('not', args.length, 1);
-            return booleanValue(!isTruthy(evaluate(args[0])));
-        case 'and': {
-            let result = booleanValue(true);
-            for (const arg of args) {
-                result = evaluate(arg);
-                if (!isTruthy(result)) {
-                    return result;
-                }
-            }
+    }
+    const procedure = evaluate(operator, env);
+    const evaluatedArgs = args.map((arg) => evaluate(arg, env));
+    return applyProcedure(procedure, evaluatedArgs);
+}
+function evaluateDefine(args, env) {
+    if (args.length < 2) {
+        throw new EvalError(`define: expected at least 2 argument(s), got ${args.length}`);
+    }
+    const target = args[0];
+    if (target.type === 'symbol') {
+        requireArgCount('define', args.length, 2);
+        const value = evaluate(args[1], env);
+        env.define(target.name, value);
+        return VOID_VALUE;
+    }
+    if (target.type !== 'list' || target.elements.length === 0) {
+        throw new EvalError('define: invalid binding target');
+    }
+    const nameExpr = target.elements[0];
+    if (nameExpr.type !== 'symbol') {
+        throw new EvalError('define: invalid function name');
+    }
+    const params = parseParameterNames(target.elements.slice(1));
+    const body = args.slice(1);
+    const closure = { type: 'closure', params, body, env };
+    env.define(nameExpr.name, closure);
+    return VOID_VALUE;
+}
+function evaluateIf(args, env) {
+    requireArgCount('if', args.length, 3);
+    return isTruthy(evaluate(args[0], env)) ? evaluate(args[1], env) : evaluate(args[2], env);
+}
+function evaluateQuote(args) {
+    requireArgCount('quote', args.length, 1);
+    return quoteExpr(args[0]);
+}
+function evaluateLambda(args, env) {
+    requireArgCountAtLeast('lambda', args.length, 2);
+    const paramsExpr = args[0];
+    if (paramsExpr.type !== 'list') {
+        throw new EvalError('lambda: parameter list must be a list');
+    }
+    return {
+        type: 'closure',
+        params: parseParameterNames(paramsExpr.elements),
+        body: args.slice(1),
+        env,
+    };
+}
+function evaluateAnd(args, env) {
+    let result = booleanValue(true);
+    for (const arg of args) {
+        result = evaluate(arg, env);
+        if (!isTruthy(result)) {
             return result;
         }
-        case 'or': {
-            let result = booleanValue(false);
-            for (const arg of args) {
-                result = evaluate(arg);
-                if (isTruthy(result)) {
-                    return result;
-                }
-            }
+    }
+    return result;
+}
+function evaluateOr(args, env) {
+    let result = booleanValue(false);
+    for (const arg of args) {
+        result = evaluate(arg, env);
+        if (isTruthy(result)) {
             return result;
         }
-        default:
-            throw new EvalError(`unknown procedure: ${operator.name}`);
+    }
+    return result;
+}
+function quoteExpr(expr) {
+    switch (expr.type) {
+        case 'number':
+        case 'boolean':
+        case 'string':
+            return expr;
+        case 'symbol':
+            return { type: 'symbol', name: expr.name };
+        case 'list':
+            return { type: 'list', elements: expr.elements.map(quoteExpr) };
     }
 }
+function parseParameterNames(params) {
+    return params.map((param) => {
+        if (param.type !== 'symbol') {
+            throw new EvalError('lambda: parameter names must be symbols');
+        }
+        return param.name;
+    });
+}
+function applyProcedure(value, args) {
+    switch (value.type) {
+        case 'builtin':
+            return value.invoke(args);
+        case 'closure': {
+            requireArgCount('lambda', args.length, value.params.length);
+            const callEnv = new Environment(value.env);
+            for (let index = 0; index < value.params.length; index += 1) {
+                callEnv.define(value.params[index], args[index]);
+            }
+            return evaluateSequence(value.body, callEnv);
+        }
+        default:
+            throw new EvalError('attempted to call a non-procedure');
+    }
+}
+function evaluateSequence(expressions, env) {
+    let result = VOID_VALUE;
+    for (const expr of expressions) {
+        result = evaluate(expr, env);
+    }
+    return result;
+}
+function createGlobalEnv() {
+    const env = new Environment();
+    env.define('+', builtin('+', (args) => numberValue(evaluateNumberArgs(args).reduce((sum, value) => sum + value, 0))));
+    env.define('*', builtin('*', (args) => numberValue(evaluateNumberArgs(args).reduce((product, value) => product * value, 1))));
+    env.define('-', builtin('-', (args) => {
+        const values = evaluateNumberArgs(args);
+        requireArgCountAtLeast('-', values.length, 1);
+        if (values.length === 1) {
+            return numberValue(-values[0]);
+        }
+        return numberValue(values.slice(1).reduce((result, value) => result - value, values[0]));
+    }));
+    env.define('/', builtin('/', (args) => {
+        const values = evaluateNumberArgs(args);
+        requireArgCountAtLeast('/', values.length, 1);
+        let result = values[0];
+        if (values.length === 1) {
+            if (result === 0) {
+                throw new EvalError('division by zero');
+            }
+            return numberValue(1 / result);
+        }
+        for (const value of values.slice(1)) {
+            if (value === 0) {
+                throw new EvalError('division by zero');
+            }
+            result /= value;
+        }
+        return numberValue(result);
+    }));
+    env.define('<', builtin('<', (args) => booleanValue(compareNumberArgs('<', args, (a, b) => a < b))));
+    env.define('>', builtin('>', (args) => booleanValue(compareNumberArgs('>', args, (a, b) => a > b))));
+    env.define('=', builtin('=', (args) => booleanValue(compareNumberArgs('=', args, (a, b) => a === b))));
+    env.define('<=', builtin('<=', (args) => booleanValue(compareNumberArgs('<=', args, (a, b) => a <= b))));
+    env.define('not', builtin('not', (args) => {
+        requireArgCount('not', args.length, 1);
+        return booleanValue(!isTruthy(args[0]));
+    }));
+    return env;
+}
+function builtin(name, invoke) {
+    return { type: 'builtin', name, invoke };
+}
 function evaluateNumberArgs(args) {
-    return args.map((arg) => expectNumber(evaluate(arg)));
+    return args.map(expectNumber);
 }
 function compareNumberArgs(name, args, predicate) {
     const values = evaluateNumberArgs(args);
@@ -276,9 +400,6 @@ function booleanValue(value) {
     return { type: 'boolean', value };
 }
 function formatValue(value) {
-    if (!value) {
-        throw new EvalError('no result');
-    }
     switch (value.type) {
         case 'number':
             return String(value.value);
@@ -286,5 +407,14 @@ function formatValue(value) {
             return value.value ? '#t' : '#f';
         case 'string':
             return JSON.stringify(value.value);
+        case 'symbol':
+            return value.name;
+        case 'list':
+            return `(${value.elements.map(formatValue).join(' ')})`;
+        case 'builtin':
+        case 'closure':
+            return '#<procedure>';
+        case 'void':
+            return '#<void>';
     }
 }
