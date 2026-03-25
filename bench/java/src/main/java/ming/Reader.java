@@ -130,6 +130,10 @@ public class Reader {
         } else if (next == 'f') {
             pos += 2;
             return new SchemeValue.BoolVal(false);
+        } else if (next == '\'') {
+            pos += 2; // skip #'
+            var expr = readExpr();
+            return new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("syntax"), expr));
         } else if (next == '\\') {
             pos += 2; // skip #\
             if (pos >= input.length()) throw new EvalError("unexpected end of input after #\\");
