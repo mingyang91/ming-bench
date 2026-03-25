@@ -112,6 +112,37 @@ enum Frame {
     DynamicWindAfterOut {
         result: Value,
     },
+    ExceptionHandler {
+        handler: Value,
+        winds: Vec<WindRef>,
+    },
+    Guard {
+        variable: String,
+        clauses: Vec<Expr>,
+        env: EnvRef,
+        winds: Vec<WindRef>,
+    },
+    RaiseHandlerReturned {
+        pos: SourcePos,
+    },
+    RaiseInvokeHandler {
+        handler: Value,
+        pos: SourcePos,
+    },
+    GuardHandle {
+        variable: String,
+        clauses: Vec<Expr>,
+        env: EnvRef,
+        raise_pos: SourcePos,
+    },
+    GuardClause {
+        exception: Value,
+        body: Vec<Expr>,
+        remaining_clauses: Vec<Expr>,
+        env: EnvRef,
+        clause_pos: SourcePos,
+        raise_pos: SourcePos,
+    },
     WindTransitionAfterOut {
         transition: WindTransition,
     },
@@ -139,6 +170,21 @@ struct WindTransition {
     target_winds: Vec<WindRef>,
     value: Value,
     pos: SourcePos,
+}
+
+enum ExceptionHandlerTarget {
+    Handler {
+        handler: Value,
+        frames: Vec<Frame>,
+        winds: Vec<WindRef>,
+    },
+    Guard {
+        variable: String,
+        clauses: Vec<Expr>,
+        env: EnvRef,
+        frames: Vec<Frame>,
+        winds: Vec<WindRef>,
+    },
 }
 
 impl fmt::Debug for Continuation {
@@ -288,6 +334,7 @@ fn eval_machine_list(
                     env,
                 });
             }
+            "guard" => return start_guard_state(&items[1..], env, form_pos, stack, context),
             "if" => return start_if_state(&items[1..], env, form_pos, stack),
             "let" => return start_let_state(&items[1..], env, form_pos, stack, context),
             "let*" => {
@@ -415,6 +462,35 @@ fn resume_frame(
             resume_dynamic_wind_after_body(wind, pos, value, stack, context)
         }
         Frame::DynamicWindAfterOut { result } => Ok(MachineState::Value(result)),
+        Frame::ExceptionHandler { .. } | Frame::Guard { .. } => Ok(MachineState::Value(value)),
+        Frame::RaiseHandlerReturned { pos } => Err(EvalError::ExceptionHandlerReturned { pos }),
+        Frame::RaiseInvokeHandler { handler, pos } => {
+            apply_machine(handler, vec![value], pos, stack, context)
+        }
+        Frame::GuardHandle {
+            variable,
+            clauses,
+            env,
+            raise_pos,
+        } => resume_guard_handle_frame(variable, clauses, env, raise_pos, value, stack, context),
+        Frame::GuardClause {
+            exception,
+            body,
+            remaining_clauses,
+            env,
+            clause_pos,
+            raise_pos,
+        } => resume_guard_clause_frame(
+            exception,
+            body,
+            remaining_clauses,
+            env,
+            clause_pos,
+            raise_pos,
+            value,
+            stack,
+            context,
+        ),
         Frame::WindTransitionAfterOut { transition } => {
             continue_wind_transition(transition, stack, context)
         }
@@ -680,6 +756,43 @@ fn resume_dynamic_wind_after_body(
     apply_machine(wind.out_thunk.clone(), Vec::new(), pos, stack, context)
 }
 
+fn resume_guard_handle_frame(
+    variable: String,
+    clauses: Vec<Expr>,
+    env: EnvRef,
+    raise_pos: SourcePos,
+    exception: Value,
+    stack: &mut Vec<Frame>,
+    context: &mut EvalContext,
+) -> Result<MachineState, EvalError> {
+    let guard_env = Env::new_child(&env);
+    env_define(&guard_env, variable, exception.clone());
+    start_guard_clauses_owned(exception, clauses, guard_env, raise_pos, stack, context)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resume_guard_clause_frame(
+    exception: Value,
+    body: Vec<Expr>,
+    remaining_clauses: Vec<Expr>,
+    env: EnvRef,
+    clause_pos: SourcePos,
+    raise_pos: SourcePos,
+    test_value: Value,
+    stack: &mut Vec<Frame>,
+    context: &mut EvalContext,
+) -> Result<MachineState, EvalError> {
+    if test_value.is_truthy() {
+        return if body.is_empty() {
+            Ok(MachineState::Value(test_value))
+        } else {
+            start_sequence_state(&body, env, clause_pos, stack)
+        };
+    }
+
+    start_guard_clauses_owned(exception, remaining_clauses, env, raise_pos, stack, context)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resume_letrec_frame(
     current_index: usize,
@@ -934,6 +1047,86 @@ fn start_cond_owned(
     })
 }
 
+fn start_guard_state(
+    args: &[Expr],
+    env: EnvRef,
+    pos: SourcePos,
+    stack: &mut Vec<Frame>,
+    context: &mut EvalContext,
+) -> Result<MachineState, EvalError> {
+    let (spec, body) = args
+        .split_first()
+        .ok_or_else(|| syntax_error(pos, "guard requires a variable and a body"))?;
+
+    if body.is_empty() {
+        return Err(syntax_error(pos, "guard requires a body"));
+    }
+
+    let spec_items = spec
+        .list_items()
+        .ok_or_else(|| syntax_error(spec.pos, "guard variable and clauses must be a list"))?;
+    let (variable_expr, clauses) = spec_items
+        .split_first()
+        .ok_or_else(|| syntax_error(spec.pos, "guard requires a variable"))?;
+    let variable = variable_expr
+        .symbol_name()
+        .ok_or_else(|| syntax_error(variable_expr.pos, "guard variable must be a symbol"))?
+        .to_string();
+
+    stack.push(Frame::Guard {
+        variable,
+        clauses: clauses.to_vec(),
+        env: Rc::clone(&env),
+        winds: context.active_winds.clone(),
+    });
+    start_sequence_state(body, env, pos, stack)
+}
+
+fn start_guard_clauses_owned(
+    exception: Value,
+    clauses: Vec<Expr>,
+    env: EnvRef,
+    raise_pos: SourcePos,
+    stack: &mut Vec<Frame>,
+    context: &mut EvalContext,
+) -> Result<MachineState, EvalError> {
+    let Some((clause, remaining)) = clauses.split_first() else {
+        return start_raise_state(exception, raise_pos, stack, context);
+    };
+
+    let items = clause
+        .list_items()
+        .ok_or_else(|| syntax_error(clause.pos, "guard clauses must be lists"))?;
+    let (test, body) = items
+        .split_first()
+        .ok_or_else(|| syntax_error(clause.pos, "guard clause cannot be empty"))?;
+
+    if test.symbol_name() == Some("else") {
+        if !remaining.is_empty() {
+            return Err(syntax_error(test.pos, "else clause must be last"));
+        }
+
+        return if body.is_empty() {
+            Ok(MachineState::Value(Value::Void))
+        } else {
+            start_sequence_state(body, env, clause.pos, stack)
+        };
+    }
+
+    stack.push(Frame::GuardClause {
+        exception,
+        body: body.to_vec(),
+        remaining_clauses: remaining.to_vec(),
+        env: Rc::clone(&env),
+        clause_pos: clause.pos,
+        raise_pos,
+    });
+    Ok(MachineState::Eval {
+        expr: test.clone(),
+        env,
+    })
+}
+
 fn start_case_state(
     args: &[Expr],
     env: EnvRef,
@@ -1171,6 +1364,10 @@ fn apply_machine(
         Value::Procedure(Procedure::Builtin("dynamic-wind")) => {
             apply_dynamic_wind(args, pos, stack, context)
         }
+        Value::Procedure(Procedure::Builtin("raise")) => apply_raise(args, pos, stack, context),
+        Value::Procedure(Procedure::Builtin("with-exception-handler")) => {
+            apply_with_exception_handler(args, pos, stack, context)
+        }
         Value::Procedure(Procedure::Builtin(name)) => {
             builtins::apply_builtin(name, &args, pos, context).map(MachineState::Value)
         }
@@ -1255,6 +1452,46 @@ fn apply_dynamic_wind(
     apply_machine(in_thunk.clone(), Vec::new(), pos, stack, context)
 }
 
+fn apply_with_exception_handler(
+    args: Vec<Value>,
+    pos: SourcePos,
+    stack: &mut Vec<Frame>,
+    context: &mut EvalContext,
+) -> Result<MachineState, EvalError> {
+    let [handler, thunk] = args.as_slice() else {
+        return Err(wrong_arg_count(
+            pos,
+            "with-exception-handler",
+            "exactly 2 arguments",
+            args.len(),
+        ));
+    };
+
+    stack.push(Frame::ExceptionHandler {
+        handler: handler.clone(),
+        winds: context.active_winds.clone(),
+    });
+    apply_machine(thunk.clone(), Vec::new(), pos, stack, context)
+}
+
+fn apply_raise(
+    args: Vec<Value>,
+    pos: SourcePos,
+    stack: &mut Vec<Frame>,
+    context: &mut EvalContext,
+) -> Result<MachineState, EvalError> {
+    let [exception] = args.as_slice() else {
+        return Err(wrong_arg_count(
+            pos,
+            "raise",
+            "exactly 1 argument",
+            args.len(),
+        ));
+    };
+
+    start_raise_state(exception.clone(), pos, stack, context)
+}
+
 fn apply_continuation(
     continuation: Rc<Continuation>,
     args: Vec<Value>,
@@ -1291,6 +1528,101 @@ fn apply_continuation(
         stack,
         context,
     )
+}
+
+fn start_raise_state(
+    exception: Value,
+    pos: SourcePos,
+    stack: &mut Vec<Frame>,
+    context: &mut EvalContext,
+) -> Result<MachineState, EvalError> {
+    let Some(target) = find_exception_handler(stack) else {
+        return Err(EvalError::UncaughtException {
+            pos,
+            value: exception.render(),
+        });
+    };
+
+    let (mut target_frames, target_winds) = match target {
+        ExceptionHandlerTarget::Handler {
+            handler,
+            frames,
+            winds,
+        } => {
+            let mut frames = frames;
+            frames.push(Frame::RaiseHandlerReturned { pos });
+            frames.push(Frame::RaiseInvokeHandler { handler, pos });
+            (frames, winds)
+        }
+        ExceptionHandlerTarget::Guard {
+            variable,
+            clauses,
+            env,
+            frames,
+            winds,
+        } => {
+            let mut frames = frames;
+            frames.push(Frame::GuardHandle {
+                variable,
+                clauses,
+                env,
+                raise_pos: pos,
+            });
+            (frames, winds)
+        }
+    };
+
+    let shared_len = shared_wind_prefix_len(&context.active_winds, &target_winds);
+    let exiting = context.active_winds[shared_len..].to_vec();
+    let entering = target_winds[shared_len..]
+        .iter()
+        .cloned()
+        .rev()
+        .collect::<Vec<_>>();
+
+    continue_wind_transition(
+        WindTransition {
+            exiting,
+            entering,
+            target_frames: std::mem::take(&mut target_frames),
+            target_winds,
+            value: exception,
+            pos,
+        },
+        stack,
+        context,
+    )
+}
+
+fn find_exception_handler(stack: &[Frame]) -> Option<ExceptionHandlerTarget> {
+    for (index, frame) in stack.iter().enumerate().rev() {
+        match frame {
+            Frame::ExceptionHandler { handler, winds } => {
+                return Some(ExceptionHandlerTarget::Handler {
+                    handler: handler.clone(),
+                    frames: stack[..index].to_vec(),
+                    winds: winds.clone(),
+                });
+            }
+            Frame::Guard {
+                variable,
+                clauses,
+                env,
+                winds,
+            } => {
+                return Some(ExceptionHandlerTarget::Guard {
+                    variable: variable.clone(),
+                    clauses: clauses.clone(),
+                    env: Rc::clone(env),
+                    frames: stack[..index].to_vec(),
+                    winds: winds.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn continue_wind_transition(

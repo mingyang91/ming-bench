@@ -36,6 +36,12 @@ pub enum EvalError {
     #[error("{pos}: uninitialized binding: {name}")]
     UninitializedBinding { pos: SourcePos, name: String },
 
+    #[error("{pos}: uncaught exception: {value}")]
+    UncaughtException { pos: SourcePos, value: String },
+
+    #[error("{pos}: exception handler returned")]
+    ExceptionHandlerReturned { pos: SourcePos },
+
     #[error("{pos}: {found} is not a procedure")]
     NotAProcedure { pos: SourcePos, found: String },
 
