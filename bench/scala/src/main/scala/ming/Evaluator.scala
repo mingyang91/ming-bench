@@ -1,23 +1,24 @@
 package ming
 
+import scala.annotation.tailrec
+
 /** Scheme interpreter entry point. */
 object Evaluator:
 
   def evalStr(input: String): String =
-    val tokens            = Tokenizer.tokenize(input)
-    val exprs             = Parser.parseAll(tokens)
-    var result: SchemeVal = SchemeVal.Void
-    val env               = Env.default()
-    for expr <- exprs do result = eval(expr, env)
+    val tokens = Tokenizer.tokenize(input)
+    val exprs  = Parser.parseAll(tokens)
+    val env    = Env.default()
+    val result = exprs.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, env))
     SchemeVal.display(result)
 
   def evalStrWithOutput(input: String): (String, String) =
     throw new EvalError("not implemented")
 
   def eval(expr: SchemeVal, env: Env): SchemeVal = expr match
-    case SchemeVal.IntVal(n)    => expr
-    case SchemeVal.BoolVal(b)   => expr
-    case SchemeVal.StringVal(s) => expr
+    case SchemeVal.IntVal(_)    => expr
+    case SchemeVal.BoolVal(_)   => expr
+    case SchemeVal.StringVal(_) => expr
     case SchemeVal.Symbol(name) =>
       env.lookup(name) match
         case Some(v) => v
@@ -25,8 +26,7 @@ object Evaluator:
     case SchemeVal.SList(elems) if elems.isEmpty =>
       throw new EvalError("empty application")
     case SchemeVal.SList(elems) =>
-      val head = elems.head
-      head match
+      elems.head match
         case SchemeVal.Symbol("define") => evalDefine(elems.tail, env)
         case SchemeVal.Symbol("if")     => evalIf(elems.tail, env)
         case SchemeVal.Symbol("quote") =>
@@ -35,7 +35,10 @@ object Evaluator:
         case SchemeVal.Symbol("lambda") => evalLambda(elems.tail, env)
         case SchemeVal.Symbol("and")    => evalAnd(elems.tail, env)
         case SchemeVal.Symbol("or")     => evalOr(elems.tail, env)
-        case _ =>
+        case SchemeVal.Symbol("begin")  => evalBegin(elems.tail, env)
+        case SchemeVal.Symbol("let")    => evalLet(elems.tail, env)
+        case SchemeVal.Symbol("cond")   => evalCond(elems.tail, env)
+        case head =>
           val proc = eval(head, env)
           val args = elems.tail.map(a => eval(a, env))
           apply(proc, args)
@@ -47,7 +50,6 @@ object Evaluator:
         env.define(name, eval(value, env))
         SchemeVal.Void
       case SchemeVal.SList(elems) :: body if elems.nonEmpty && body.nonEmpty =>
-        // (define (f params...) body...)
         elems.head match
           case SchemeVal.Symbol(name) =>
             val params = elems.tail.map {
@@ -79,22 +81,74 @@ object Evaluator:
         SchemeVal.LambdaProc(params, body, env)
       case _ => throw new EvalError("lambda: bad syntax")
 
+  @tailrec
   private def evalAnd(exprs: List[SchemeVal], env: Env): SchemeVal =
-    if exprs.isEmpty then SchemeVal.BoolVal(true)
-    else
-      var result: SchemeVal = SchemeVal.BoolVal(true)
-      for e <- exprs do
-        result = eval(e, env)
-        if !isTruthy(result) then return result
-      result
+    exprs match
+      case Nil         => SchemeVal.BoolVal(true)
+      case last :: Nil => eval(last, env)
+      case head :: tail =>
+        val result = eval(head, env)
+        if !isTruthy(result) then result else evalAnd(tail, env)
 
+  @tailrec
   private def evalOr(exprs: List[SchemeVal], env: Env): SchemeVal =
-    if exprs.isEmpty then SchemeVal.BoolVal(false)
-    else
-      for e <- exprs do
-        val result = eval(e, env)
-        if isTruthy(result) then return result
-      SchemeVal.BoolVal(false)
+    exprs match
+      case Nil         => SchemeVal.BoolVal(false)
+      case last :: Nil => eval(last, env)
+      case head :: tail =>
+        val result = eval(head, env)
+        if isTruthy(result) then result else evalOr(tail, env)
+
+  private def evalBegin(exprs: List[SchemeVal], env: Env): SchemeVal =
+    if exprs.isEmpty then SchemeVal.Void
+    else exprs.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, env))
+
+  private def evalLet(args: List[SchemeVal], env: Env): SchemeVal =
+    args match
+      case SchemeVal.Symbol(name) :: SchemeVal.SList(bindings) :: body if body.nonEmpty =>
+        val (params, inits) = parseBindings(bindings, env)
+        val localEnv        = new Env(scala.collection.mutable.Map.empty, Some(env))
+        val proc            = SchemeVal.LambdaProc(params, body, localEnv)
+        localEnv.define(name, proc)
+        params.zip(inits).foreach((p, v) => localEnv.define(p, v))
+        body.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, localEnv))
+      case SchemeVal.SList(bindings) :: body if body.nonEmpty =>
+        val localEnv = new Env(scala.collection.mutable.Map.empty, Some(env))
+        for b <- bindings do
+          b match
+            case SchemeVal.SList(List(SchemeVal.Symbol(name), valueExpr)) =>
+              localEnv.define(name, eval(valueExpr, env))
+            case _ => throw new EvalError("let: bad binding syntax")
+        body.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, localEnv))
+      case _ => throw new EvalError("let: bad syntax")
+
+  private def parseBindings(
+    bindings: List[SchemeVal],
+    env: Env
+  ): (List[String], List[SchemeVal]) =
+    val pairs = bindings.map {
+      case SchemeVal.SList(List(SchemeVal.Symbol(p), valueExpr)) => (p, eval(valueExpr, env))
+      case _                                                     => throw new EvalError("let: bad binding syntax")
+    }
+    pairs.unzip
+
+  @tailrec
+  private def evalCond(clauses: List[SchemeVal], env: Env): SchemeVal =
+    clauses match
+      case Nil => SchemeVal.Void
+      case clause :: rest =>
+        clause match
+          case SchemeVal.SList(elems) if elems.nonEmpty =>
+            elems.head match
+              case SchemeVal.Symbol("else") =>
+                elems.tail.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, env))
+              case test =>
+                val testVal = eval(test, env)
+                if isTruthy(testVal) then
+                  if elems.tail.isEmpty then testVal
+                  else elems.tail.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, env))
+                else evalCond(rest, env)
+          case _ => throw new EvalError("cond: bad clause")
 
   private def isTruthy(v: SchemeVal): Boolean = v match
     case SchemeVal.BoolVal(false) => false
@@ -106,151 +160,5 @@ object Evaluator:
       if args.size != params.size then throw new EvalError(s"expected ${params.size} arguments, got ${args.size}")
       val localEnv = new Env(scala.collection.mutable.Map.empty, Some(closure))
       params.zip(args).foreach((p, a) => localEnv.define(p, a))
-      var result: SchemeVal = SchemeVal.Void
-      for expr <- body do result = eval(expr, localEnv)
-      result
+      body.foldLeft(SchemeVal.Void: SchemeVal)((_, e) => eval(e, localEnv))
     case _ => throw new EvalError(s"not a procedure: $proc")
-
-enum SchemeVal:
-  case IntVal(n: Long)
-  case BoolVal(b: Boolean)
-  case StringVal(s: String)
-  case Symbol(name: String)
-  case SList(elems: List[SchemeVal])
-  case Void
-  case BuiltinProc(name: String, f: List[SchemeVal] => SchemeVal)
-  case LambdaProc(params: List[String], body: List[SchemeVal], closure: Env)
-
-object SchemeVal:
-
-  def display(v: SchemeVal): String = v match
-    case IntVal(n)            => n.toString
-    case BoolVal(true)        => "#t"
-    case BoolVal(false)       => "#f"
-    case StringVal(s)         => s"\"$s\""
-    case Symbol(name)         => name
-    case SList(elems)         => "(" + elems.map(display).mkString(" ") + ")"
-    case Void                 => ""
-    case BuiltinProc(name, _) => s"#<procedure $name>"
-    case LambdaProc(_, _, _)  => "#<procedure>"
-
-class Env(private val bindings: scala.collection.mutable.Map[String, SchemeVal], private val parent: Option[Env]):
-
-  def lookup(name: String): Option[SchemeVal] =
-    bindings.get(name).orElse(parent.flatMap(_.lookup(name)))
-
-  def define(name: String, value: SchemeVal): Unit =
-    bindings(name) = value
-
-object Env:
-
-  def default(): Env =
-    val env = new Env(scala.collection.mutable.Map.empty, None)
-    Builtins.register(env)
-    env
-
-object Builtins:
-
-  private def requireNums(args: List[SchemeVal], name: String): List[Long] =
-    args.map {
-      case SchemeVal.IntVal(n) => n
-      case other               => throw new EvalError(s"$name: expected number, got ${SchemeVal.display(other)}")
-    }
-
-  def register(env: Env): Unit =
-    env.define(
-      "+",
-      SchemeVal.BuiltinProc(
-        "+",
-        args =>
-          val nums = requireNums(args, "+")
-          SchemeVal.IntVal(nums.sum)
-      )
-    )
-    env.define(
-      "-",
-      SchemeVal.BuiltinProc(
-        "-",
-        args =>
-          val nums = requireNums(args, "-")
-          if nums.isEmpty then throw new EvalError("-: expected at least 1 argument")
-          else if nums.size == 1 then SchemeVal.IntVal(-nums.head)
-          else SchemeVal.IntVal(nums.tail.foldLeft(nums.head)(_ - _))
-      )
-    )
-    env.define(
-      "*",
-      SchemeVal.BuiltinProc(
-        "*",
-        args =>
-          val nums = requireNums(args, "*")
-          SchemeVal.IntVal(nums.product)
-      )
-    )
-    env.define(
-      "/",
-      SchemeVal.BuiltinProc(
-        "/",
-        args =>
-          val nums = requireNums(args, "/")
-          if nums.size < 2 then throw new EvalError("/: expected at least 2 arguments")
-          if nums.tail.contains(0L) then throw new EvalError("division by zero")
-          SchemeVal.IntVal(nums.tail.foldLeft(nums.head)(_ / _))
-      )
-    )
-    env.define(
-      "<",
-      SchemeVal.BuiltinProc(
-        "<",
-        args =>
-          val nums = requireNums(args, "<")
-          SchemeVal.BoolVal(nums.zip(nums.tail).forall((a, b) => a < b))
-      )
-    )
-    env.define(
-      ">",
-      SchemeVal.BuiltinProc(
-        ">",
-        args =>
-          val nums = requireNums(args, ">")
-          SchemeVal.BoolVal(nums.zip(nums.tail).forall((a, b) => a > b))
-      )
-    )
-    env.define(
-      "=",
-      SchemeVal.BuiltinProc(
-        "=",
-        args =>
-          val nums = requireNums(args, "=")
-          SchemeVal.BoolVal(nums.zip(nums.tail).forall((a, b) => a == b))
-      )
-    )
-    env.define(
-      "<=",
-      SchemeVal.BuiltinProc(
-        "<=",
-        args =>
-          val nums = requireNums(args, "<=")
-          SchemeVal.BoolVal(nums.zip(nums.tail).forall((a, b) => a <= b))
-      )
-    )
-    env.define(
-      ">=",
-      SchemeVal.BuiltinProc(
-        ">=",
-        args =>
-          val nums = requireNums(args, ">=")
-          SchemeVal.BoolVal(nums.zip(nums.tail).forall((a, b) => a >= b))
-      )
-    )
-    env.define(
-      "not",
-      SchemeVal.BuiltinProc(
-        "not",
-        args =>
-          if args.size != 1 then throw new EvalError("not: expected 1 argument")
-          args.head match
-            case SchemeVal.BoolVal(false) => SchemeVal.BoolVal(true)
-            case _                        => SchemeVal.BoolVal(false)
-      )
-    )

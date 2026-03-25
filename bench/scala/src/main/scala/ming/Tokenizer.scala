@@ -33,6 +33,9 @@ object Tokenizer:
         tokens += Token.RParen
         pos + 1
       case '"' => readString(input, pos + 1, tokens)
+      case '\'' =>
+        tokens += Token.Atom("quote-sugar")
+        pos + 1
       case _ =>
         val sb = new StringBuilder
         var i  = pos

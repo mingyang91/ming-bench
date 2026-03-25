@@ -21,6 +21,9 @@ object Parser:
         throw new EvalError("unexpected )")
       case Token.Str(s) :: rest =>
         (SchemeVal.StringVal(s), rest)
+      case Token.Atom("quote-sugar") :: rest =>
+        val (expr, remaining) = parseExpr(rest)
+        (SchemeVal.SList(List(SchemeVal.Symbol("quote"), expr)), remaining)
       case Token.Atom(s) :: rest =>
         (parseAtom(s), rest)
 
