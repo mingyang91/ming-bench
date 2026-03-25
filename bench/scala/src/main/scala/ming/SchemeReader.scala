@@ -1,5 +1,7 @@
 package ming
 
+import scala.collection.mutable.ListBuffer
+
 private[ming] object SchemeReader:
   import SchemeInterpreter.Expr
 
@@ -31,6 +33,15 @@ private[ming] object SchemeReader:
         case '\'' =>
           advance()
           Expr.ListExpr(List(Expr.Symbol("quote", pos), readExpr()), pos)
+        case '`' =>
+          advance()
+          Expr.ListExpr(List(Expr.Symbol("quasiquote", pos), readExpr()), pos)
+        case ',' =>
+          advance()
+          if index < input.length && input.charAt(index) == '@' then
+            advance()
+            Expr.ListExpr(List(Expr.Symbol("unquote-splicing", pos), readExpr()), pos)
+          else Expr.ListExpr(List(Expr.Symbol("unquote", pos), readExpr()), pos)
         case '(' =>
           advance()
           readList(pos)
@@ -44,16 +55,35 @@ private[ming] object SchemeReader:
           readAtom(pos)
 
     private def readList(startPos: SourcePos): Expr =
-      val items = List.newBuilder[Expr]
+      val items                                 = ListBuffer.empty[Expr]
+      var dottedTail: Option[(SourcePos, Expr)] = None
       skipTrivia()
       while index < input.length && input.charAt(index) != ')' do
-        items += readExpr()
+        val item = readExpr()
+        item match
+          case Expr.Symbol(".", dotPos) =>
+            if items.isEmpty || dottedTail.nonEmpty then throw EvalError.at(dotPos, "invalid dotted list")
+            skipTrivia()
+            if index >= input.length || input.charAt(index) == ')' then
+              throw EvalError.at(dotPos, "invalid dotted list")
+            val tailExpr = readExpr()
+            dottedTail = Some((dotPos, tailExpr))
+            skipTrivia()
+            if index >= input.length || input.charAt(index) != ')' then
+              throw EvalError.at(dotPos, "invalid dotted list")
+          case other =>
+            if dottedTail.nonEmpty then throw EvalError.at(other.pos, "invalid dotted list")
+            items += other
         skipTrivia()
 
       if index >= input.length then throw EvalError.at(startPos, "unterminated list")
 
       advance()
-      Expr.ListExpr(items.result(), startPos)
+      dottedTail match
+        case Some((dotPos, tailExpr)) =>
+          Expr.ListExpr(items.toList :+ Expr.Symbol(".", dotPos) :+ tailExpr, startPos)
+        case None =>
+          Expr.ListExpr(items.toList, startPos)
 
     private def readString(startPos: SourcePos): Expr =
       advance()
@@ -88,6 +118,7 @@ private[ming] object SchemeReader:
         advance()
         advance()
         Expr.ListExpr(List(Expr.Symbol("syntax", startPos), readExpr()), startPos)
+      else if input.startsWith("#(", index) then readVector(startPos)
       else if startsWithToken("#t") then
         advance()
         advance()
@@ -115,6 +146,20 @@ private[ming] object SchemeReader:
 
       Expr.Character(value, startPos)
 
+    private def readVector(startPos: SourcePos): Expr =
+      advance()
+      advance()
+      val items = ListBuffer.empty[Expr]
+      skipTrivia()
+      while index < input.length && input.charAt(index) != ')' do
+        items += readExpr()
+        skipTrivia()
+
+      if index >= input.length then throw EvalError.at(startPos, "unterminated vector")
+
+      advance()
+      Expr.VectorExpr(items.toList, startPos)
+
     private def readAtom(startPos: SourcePos): Expr =
       val start = index
       while index < input.length && !isDelimiter(input.charAt(index)) do advance()
@@ -140,7 +185,7 @@ private[ming] object SchemeReader:
       }
 
     private def isDelimiter(ch: Char): Boolean =
-      ch.isWhitespace || ch == '\'' || ch == '(' || ch == ')' || ch == '"' || ch == ';'
+      ch.isWhitespace || ch == '\'' || ch == '`' || ch == ',' || ch == '(' || ch == ')' || ch == '"' || ch == ';'
 
     private def advance(): Char =
       val ch = input.charAt(index)

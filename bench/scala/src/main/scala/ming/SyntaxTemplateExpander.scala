@@ -50,6 +50,9 @@ final private[ming] class SyntaxTemplateExpander(
           case _ =>
             Expr.ListExpr(expandCallItems(items, bindings, scope, path), pos)
 
+      case Expr.VectorExpr(items, pos) =>
+        Expr.VectorExpr(expandItems(items, bindings, scope, path), pos)
+
       case _ =>
         expr
 

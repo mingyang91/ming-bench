@@ -8,12 +8,13 @@ private[ming] trait SchemeInterpreterTypes:
     def pos: SourcePos
 
   object Expr:
-    final case class Number(value: SchemeNumber, pos: SourcePos) extends Expr
-    final case class Bool(value: Boolean, pos: SourcePos)        extends Expr
-    final case class StringLit(value: String, pos: SourcePos)    extends Expr
-    final case class Character(value: Char, pos: SourcePos)      extends Expr
-    final case class Symbol(name: String, pos: SourcePos)        extends Expr
-    final case class ListExpr(items: List[Expr], pos: SourcePos) extends Expr
+    final case class Number(value: SchemeNumber, pos: SourcePos)   extends Expr
+    final case class Bool(value: Boolean, pos: SourcePos)          extends Expr
+    final case class StringLit(value: String, pos: SourcePos)      extends Expr
+    final case class Character(value: Char, pos: SourcePos)        extends Expr
+    final case class Symbol(name: String, pos: SourcePos)          extends Expr
+    final case class VectorExpr(items: List[Expr], pos: SourcePos) extends Expr
+    final case class ListExpr(items: List[Expr], pos: SourcePos)   extends Expr
 
   sealed trait Value
   sealed trait Procedure extends Value

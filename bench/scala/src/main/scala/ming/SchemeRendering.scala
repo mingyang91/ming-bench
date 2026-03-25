@@ -19,7 +19,8 @@ private[ming] object SchemeRendering:
       case Expr.StringLit(text, _)      => "\"" + escapeString(text) + "\""
       case Expr.Character(character, _) => renderCharacter(character)
       case Expr.Symbol(name, _)         => name
-      case Expr.ListExpr(items, _)      => items.map(renderExpr).mkString("(", " ", ")")
+      case Expr.VectorExpr(items, _)    => items.map(renderExpr).mkString("#(", " ", ")")
+      case Expr.ListExpr(items, _)      => renderExprList(items)
 
   private def escapeString(value: String): String =
     val builder = new StringBuilder
@@ -37,6 +38,13 @@ private[ming] object SchemeRendering:
       case ' '  => "#\\space"
       case '\n' => "#\\newline"
       case ch   => s"#\\$ch"
+
+  private def renderExprList(items: List[Expr]): String =
+    SchemeInterpreterSyntax.splitDottedItems(items) match
+      case Some((prefix, tail)) =>
+        (prefix.map(renderExpr) :+ "." :+ renderExpr(tail)).mkString("(", " ", ")")
+      case None =>
+        items.map(renderExpr).mkString("(", " ", ")")
 
   private def renderValue(value: Value, displayMode: Boolean, state: RenderState): String =
     value match

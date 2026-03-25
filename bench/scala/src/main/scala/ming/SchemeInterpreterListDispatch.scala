@@ -26,7 +26,7 @@ private[ming] object SchemeInterpreterListDispatch:
   ): Option[EvalState] =
     name match
       case "define-record-type" | "define-syntax" | "define" | "set!" | "begin" | "if" | "quote" | "syntax" |
-          "syntax-case" | "lambda" | "with-syntax" | "case-lambda" | "do" | "and" | "or" =>
+          "syntax-case" | "lambda" | "with-syntax" | "case-lambda" | "do" | "and" | "or" | "quasiquote" =>
         Some(evalCoreFormState(name, args, env, macros, pos, cont, evalExprState, evalSequenceState))
       case "let" | "let*" | "letrec" | "letrec*" =>
         Some(
@@ -43,7 +43,19 @@ private[ming] object SchemeInterpreterListDispatch:
           )
         )
       case "cond" | "guard" | "case" =>
-        Some(evalBranchingFormState(name, args, env, macros, pos, cont, evalExprState, evalSequenceState))
+        Some(
+          evalBranchingFormState(
+            name,
+            args,
+            env,
+            macros,
+            pos,
+            cont,
+            evalExprState,
+            evalSequenceState,
+            applyProcedureState
+          )
+        )
       case _ =>
         None
 
@@ -72,6 +84,8 @@ private[ming] object SchemeInterpreterListDispatch:
         SchemeInterpreterConditionalForms.evalIfState(args, env, macros, pos, cont, evalExprState)
       case "quote" =>
         SchemeInterpreterSpecialForms.evalQuoteState(args, pos, cont)
+      case "quasiquote" =>
+        SchemeInterpreterSpecialForms.evalQuasiquoteState(args, env, macros, pos, cont)
       case "syntax" =>
         SchemeInterpreterSpecialForms.evalSyntaxState(args, env, macros, pos, cont)
       case "syntax-case" =>
@@ -155,7 +169,8 @@ private[ming] object SchemeInterpreterListDispatch:
     pos: SourcePos,
     cont: Resume,
     evalExprState: EvalExprState,
-    evalSequenceState: EvalSequenceState
+    evalSequenceState: EvalSequenceState,
+    applyProcedureState: ApplyProcedureState
   ): EvalState =
     name match
       case "cond" =>
@@ -166,7 +181,8 @@ private[ming] object SchemeInterpreterListDispatch:
           pos,
           cont,
           evalExprState,
-          evalSequenceState
+          evalSequenceState,
+          applyProcedureState
         )
       case "guard" =>
         SchemeInterpreterConditionalForms.evalGuardState(

@@ -99,6 +99,8 @@ private[ming] object SchemeInterpreter extends SchemeInterpreterTypes:
       case Expr.StringLit(value, _) => cont(Value.StringLit(value))
       case Expr.Character(value, _) => cont(Value.Character(value))
       case Expr.Symbol(name, pos)   => cont(env.lookup(name, pos))
+      case Expr.VectorExpr(items, _) =>
+        cont(Value.Vector(items.map(SchemeInterpreterSyntax.quote)))
       case Expr.ListExpr(items, pos) =>
         evalListExpr(items, env, macros, pos, cont)
 

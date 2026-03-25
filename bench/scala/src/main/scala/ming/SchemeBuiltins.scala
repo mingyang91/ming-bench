@@ -8,6 +8,7 @@ private[ming] object SchemeBuiltins:
       NumericBuiltins.all,
       LogicalBuiltins.all,
       EqualityBuiltins.all,
+      RuntimeBuiltins.all,
       ListBuiltins.all,
       VectorBuiltins.all,
       CharBuiltins.all,

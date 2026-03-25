@@ -11,6 +11,9 @@ private[ming] object SchemeInterpreterConditionalForms:
   private type EvalSequenceState =
     (List[Expr], Env, MacroScope, Resume) => EvalState
 
+  private type ApplyProcedureState =
+    (Value, List[Value], SourcePos, Resume) => EvalState
+
   def evalIfState(
     args: List[Expr],
     env: Env,
@@ -48,7 +51,8 @@ private[ming] object SchemeInterpreterConditionalForms:
     pos: SourcePos,
     cont: Resume,
     evalExprState: EvalExprState,
-    evalSequenceState: EvalSequenceState
+    evalSequenceState: EvalSequenceState,
+    applyProcedureState: ApplyProcedureState
   ): EvalState =
     clauses match
       case Nil =>
@@ -57,6 +61,21 @@ private[ming] object SchemeInterpreterConditionalForms:
         if rest.nonEmpty then throw EvalError.at(clausePos, "cond else clause must be last")
         if body.isEmpty then throw EvalError.at(clausePos, "cond else clause requires a body")
         evalSequenceState(body, env, macros, cont)
+      case Expr.ListExpr(List(test, Expr.Symbol("=>", arrowPos), procedureExpr), _) :: rest =>
+        evalExprState(
+          test,
+          env,
+          macros,
+          value =>
+            if isTruthy(value) then
+              evalExprState(
+                procedureExpr,
+                env,
+                macros,
+                procedure => applyProcedureState(procedure, List(value), arrowPos, cont)
+              )
+            else evalCondState(rest, env, macros, pos, cont, evalExprState, evalSequenceState, applyProcedureState)
+        )
       case Expr.ListExpr(test :: body, _) :: rest =>
         evalExprState(
           test,
@@ -66,7 +85,7 @@ private[ming] object SchemeInterpreterConditionalForms:
             if isTruthy(value) then
               if body.isEmpty then cont(value)
               else evalSequenceState(body, env, macros, cont)
-            else evalCondState(rest, env, macros, pos, cont, evalExprState, evalSequenceState)
+            else evalCondState(rest, env, macros, pos, cont, evalExprState, evalSequenceState, applyProcedureState)
         )
       case _ =>
         throw EvalError.at(pos, "invalid cond clause")

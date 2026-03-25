@@ -74,6 +74,19 @@ private[ming] object SchemeInterpreterSpecialForms:
       case _ =>
         throw EvalError.at(pos, s"quote expected 1 argument, got ${args.length}")
 
+  def evalQuasiquoteState(
+    args: List[Expr],
+    env: Env,
+    macros: MacroScope,
+    pos: SourcePos,
+    cont: Resume
+  ): EvalState =
+    args match
+      case value :: Nil =>
+        cont(SchemeQuasiquote.eval(value, env, macros, pos))
+      case _ =>
+        throw EvalError.at(pos, s"quasiquote expected 1 argument, got ${args.length}")
+
   def evalSyntaxState(
     args: List[Expr],
     env: Env,

@@ -1,5 +1,7 @@
 package ming
 
+import java.util.IdentityHashMap
+
 private[ming] object SchemeInterpreterSyntax:
 
   import SchemeInterpreter.Expr
@@ -40,14 +42,34 @@ private[ming] object SchemeInterpreterSyntax:
       case other => throw EvalError.at(other.pos, s"invalid binding: ${renderExpr(other)}")
     }
 
+  def splitDottedItems(items: List[Expr]): Option[(List[Expr], Expr)] =
+    items match
+      case Nil =>
+        None
+      case _ =>
+        val dotIndices = items.zipWithIndex.collect { case (Expr.Symbol(".", _), index) => index }
+        dotIndices match
+          case Nil =>
+            None
+          case index :: Nil if index > 0 && index == items.length - 2 =>
+            Some((items.take(index), items.last))
+          case index :: _ =>
+            throw EvalError.at(items(index).pos, "invalid dotted list")
+
   def quote(expr: Expr): Value =
     expr match
-      case Expr.Number(value, _)    => Value.Number(value)
-      case Expr.Bool(value, _)      => Value.Bool(value)
-      case Expr.StringLit(value, _) => Value.StringLit(value)
-      case Expr.Character(value, _) => Value.Character(value)
-      case Expr.Symbol(name, _)     => Value.Symbol(name)
-      case Expr.ListExpr(items, _)  => Value.list(items.map(quote))
+      case Expr.Number(value, _)     => Value.Number(value)
+      case Expr.Bool(value, _)       => Value.Bool(value)
+      case Expr.StringLit(value, _)  => Value.StringLit(value)
+      case Expr.Character(value, _)  => Value.Character(value)
+      case Expr.Symbol(name, _)      => Value.Symbol(name)
+      case Expr.VectorExpr(items, _) => Value.Vector(items.map(quote))
+      case Expr.ListExpr(items, _) =>
+        splitDottedItems(items) match
+          case Some((prefix, tail)) =>
+            prefix.map(quote).foldRight(quote(tail))(Value.Pair(_, _))
+          case None =>
+            Value.list(items.map(quote))
 
   def datumToExpr(value: Value, pos: SourcePos, context: String): Expr =
     value match
@@ -58,8 +80,10 @@ private[ming] object SchemeInterpreterSyntax:
       case Value.Character(char)     => Expr.Character(char, pos)
       case Value.Symbol(name)        => Expr.Symbol(name, pos)
       case Value.EmptyList           => Expr.ListExpr(Nil, pos)
+      case vector: Value.Vector =>
+        Expr.VectorExpr(vector.toList.map(datumToExpr(_, pos, context)), pos)
       case pair: Value.Pair =>
-        Expr.ListExpr(BuiltinSupport.asList(pair, context, pos).map(datumToExpr(_, pos, context)), pos)
+        pairToExpr(pair, pos, context)
       case other =>
         throw EvalError.at(pos, s"$context expected datum, got ${SchemeInterpreter.render(other)}")
 
@@ -73,6 +97,26 @@ private[ming] object SchemeInterpreterSyntax:
       case Expr.Symbol(name, _) if name != "." => name
       case other =>
         throw EvalError.at(other.pos, s"invalid parameter: ${renderExpr(other)}")
+
+  private def pairToExpr(pair: Value.Pair, pos: SourcePos, context: String): Expr =
+    val items          = List.newBuilder[Expr]
+    val visited        = new IdentityHashMap[Value.Pair, java.lang.Boolean]()
+    var current: Value = pair
+
+    while true do
+      current match
+        case nextPair: Value.Pair =>
+          if visited.containsKey(nextPair) then
+            throw EvalError.at(pos, s"$context expected finite datum, got ${SchemeInterpreter.render(pair)}")
+          visited.put(nextPair, java.lang.Boolean.TRUE)
+          items += datumToExpr(nextPair.car, pos, context)
+          current = nextPair.cdr
+        case Value.EmptyList =>
+          return Expr.ListExpr(items.result(), pos)
+        case tail =>
+          return Expr.ListExpr(items.result() :+ Expr.Symbol(".", pos) :+ datumToExpr(tail, pos, context), pos)
+
+    throw new IllegalStateException("unreachable")
 
   private def renderExpr(expr: Expr): String =
     SchemeRendering.renderExpr(expr)

@@ -41,6 +41,11 @@ private[ming] object SyntaxPatternMatcher:
       case Expr.ListExpr(Expr.Symbol("quote", _) :: _, _) =>
         Set.empty
 
+      case Expr.VectorExpr(items, _) =>
+        items.foldLeft(Set.empty[String]) { (acc, item) =>
+          acc ++ collectTemplateVariables(item, patternVariables)
+        }
+
       case Expr.ListExpr(items, _) =>
         items.foldLeft(Set.empty[String]) { (acc, item) =>
           acc ++ collectTemplateVariables(item, patternVariables)
@@ -131,6 +136,11 @@ private[ming] object SyntaxPatternMatcher:
           case Expr.ListExpr(inputItems, _) => matchItems(patternItems, inputItems, literals)
           case _                            => None
 
+      case Expr.VectorExpr(patternItems, _) =>
+        input match
+          case Expr.VectorExpr(inputItems, _) => matchItems(patternItems, inputItems, literals)
+          case _                              => None
+
       case Expr.Number(value, _) =>
         input match
           case Expr.Number(other, _) if other == value => Some(Map.empty)
@@ -181,6 +191,11 @@ private[ming] object SyntaxPatternMatcher:
           acc ++ collectPatternVariables(item, literals)
         }
 
+      case Expr.VectorExpr(items, _) =>
+        items.foldLeft(Set.empty[String]) { (acc, item) =>
+          acc ++ collectPatternVariables(item, literals)
+        }
+
       case _ =>
         Set.empty
 
@@ -223,6 +238,10 @@ private[ming] object SyntaxPatternMatcher:
       case (Expr.Character(a, _), Expr.Character(b, _)) => a == b
       case (Expr.Symbol(a, _), Expr.Symbol(b, _))       => a == b
       case (Expr.ListExpr(a, _), Expr.ListExpr(b, _)) =>
+        a.length == b.length && a.zip(b).forall { case (leftItem, rightItem) =>
+          sameSyntax(leftItem, rightItem)
+        }
+      case (Expr.VectorExpr(a, _), Expr.VectorExpr(b, _)) =>
         a.length == b.length && a.zip(b).forall { case (leftItem, rightItem) =>
           sameSyntax(leftItem, rightItem)
         }

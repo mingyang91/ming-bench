@@ -15,14 +15,17 @@ private[ming] object ListBuiltins:
       cdrBuiltin,
       setCarBuiltin,
       setCdrBuiltin
-    ) ++ cxrBuiltins ++ List(
+    ) ++ CxrBuiltins.all ++ List(
       nullBuiltin,
       listBuiltin,
       lengthBuiltin,
       appendBuiltin,
       listRefBuiltin,
       listTailBuiltin,
+      memqBuiltin,
+      memvBuiltin,
       memberBuiltin,
+      assqBuiltin,
       assvBuiltin,
       assocBuiltin,
       reverseBuiltin,
@@ -96,7 +99,13 @@ private[ming] object ListBuiltins:
   private val appendBuiltin: Value.Builtin =
     Value.Builtin(
       "append",
-      (args, pos) => Value.list(args.flatMap(asList(_, "append", pos)))
+      (args, pos) =>
+        args match
+          case Nil =>
+            Value.EmptyList
+          case _ =>
+            val prefixItems = args.dropRight(1).flatMap(asList(_, "append", pos))
+            prefixItems.foldRight(args.last)(Value.Pair(_, _))
     )
 
   private val listRefBuiltin: Value.Builtin =
@@ -142,12 +151,36 @@ private[ming] object ListBuiltins:
         findListTail(value, listValue, "member", pos)(equalValues)
     )
 
+  private val memqBuiltin: Value.Builtin =
+    Value.Builtin(
+      "memq",
+      (args, pos) =>
+        val (value, listValue) = twoArgs("memq", args, pos)
+        findListTail(value, listValue, "memq", pos)(EqualityBuiltins.eqvValues)
+    )
+
+  private val memvBuiltin: Value.Builtin =
+    Value.Builtin(
+      "memv",
+      (args, pos) =>
+        val (value, listValue) = twoArgs("memv", args, pos)
+        findListTail(value, listValue, "memv", pos)(EqualityBuiltins.eqvValues)
+    )
+
   private val assvBuiltin: Value.Builtin =
     Value.Builtin(
       "assv",
       (args, pos) =>
         val (key, alistValue) = twoArgs("assv", args, pos)
         findAssocEntry(key, alistValue, "assv", pos)(EqualityBuiltins.eqvValues)
+    )
+
+  private val assqBuiltin: Value.Builtin =
+    Value.Builtin(
+      "assq",
+      (args, pos) =>
+        val (key, alistValue) = twoArgs("assq", args, pos)
+        findAssocEntry(key, alistValue, "assq", pos)(EqualityBuiltins.eqvValues)
     )
 
   private val reverseBuiltin: Value.Builtin =
@@ -196,29 +229,6 @@ private[ming] object ListBuiltins:
             loop(next)
 
         loop(lists)
-    )
-
-  private val cxrBuiltins: List[Value.Builtin] =
-    List(2, 3, 4).flatMap(generateCxrNames).map(cxrBuiltin)
-
-  private def generateCxrNames(depth: Int): List[String] =
-    def loop(remaining: Int, acc: String): List[String] =
-      if remaining == 0 then List(s"c${acc}r")
-      else loop(remaining - 1, acc + "a") ++ loop(remaining - 1, acc + "d")
-
-    loop(depth, "")
-
-  private def cxrBuiltin(name: String): Value.Builtin =
-    Value.Builtin(
-      name,
-      (args, pos) =>
-        name
-          .substring(1, name.length - 1)
-          .reverse
-          .foldLeft(singleArg(name, args, pos)) { (current, selector) =>
-            val (carValue, cdrValue) = asPair(current, name, pos)
-            if selector == 'a' then carValue else cdrValue
-          }
     )
 
   private def findListTail(
