@@ -12,7 +12,7 @@ type SchemeVal =
   | { tag: 'number'; value: number; pos?: Pos }
   | { tag: 'rational'; num: number; den: number; pos?: Pos }
   | { tag: 'boolean'; value: boolean; pos?: Pos }
-  | { tag: 'string'; value: string; pos?: Pos }
+  | { tag: 'string'; value: string; mutable?: boolean; pos?: Pos }
   | { tag: 'symbol'; value: string; pos?: Pos }
   | { tag: 'char'; value: string; pos?: Pos }
   | { tag: 'list'; elements: SchemeVal[]; pos?: Pos }  // syntax only (parsed S-expr)
@@ -465,17 +465,54 @@ function makeGlobalEnv(): Env {
   defBuiltin('string-copy', (args) => {
     if (args.length !== 1 || args[0].tag !== 'string')
       throw new EvalError('string-copy: expected 1 string argument');
-    return { tag: 'string', value: args[0].value };
+    return { tag: 'string', value: args[0].value, mutable: true };
   });
 
   defBuiltin('string-set!', (args) => {
-    if (args.length !== 3) throw new EvalError('string-set!: expected 3 arguments');
-    if (args[0].tag !== 'string') throw new EvalError('string-set!: expected string');
+    if (args.length !== 3 || args[0].tag !== 'string' || args[2].tag !== 'char')
+      throw new EvalError('string-set!: expected string, index, char');
+    const s = args[0];
+    if (!s.mutable) throw new EvalError('string-set!: strings are immutable');
     const idx = expectNum(args[1], 'string-set!');
-    if (args[2].tag !== 'char') throw new EvalError('string-set!: expected char');
-    const s = args[0].value;
-    (args[0] as any).value = s.substring(0, idx) + args[2].value + s.substring(idx + 1);
+    if (idx < 0 || idx >= s.value.length) throw new EvalError('string-set!: index out of range');
+    s.value = s.value.substring(0, idx) + args[2].value + s.value.substring(idx + 1);
     return { tag: 'void' };
+  });
+
+  defBuiltin('string->list', (args) => {
+    if (args.length !== 1 || args[0].tag !== 'string')
+      throw new EvalError('string->list: expected 1 string argument');
+    let result: SchemeVal = { tag: 'nil' };
+    const s = args[0].value;
+    for (let i = s.length - 1; i >= 0; i--) {
+      result = { tag: 'pair', car: { tag: 'char', value: s[i] }, cdr: result };
+    }
+    return result;
+  });
+
+  defBuiltin('list->string', (args) => {
+    if (args.length !== 1) throw new EvalError('list->string: expected 1 argument');
+    let result = '';
+    let cur = args[0];
+    while (cur.tag === 'pair') {
+      if (cur.car.tag !== 'char') throw new EvalError('list->string: expected list of characters');
+      result += cur.car.value;
+      cur = cur.cdr;
+    }
+    if (cur.tag !== 'nil') throw new EvalError('list->string: expected proper list');
+    return { tag: 'string', value: result };
+  });
+
+  defBuiltin('char->integer', (args) => {
+    if (args.length !== 1 || args[0].tag !== 'char')
+      throw new EvalError('char->integer: expected 1 char argument');
+    return { tag: 'number', value: args[0].value.charCodeAt(0) };
+  });
+
+  defBuiltin('integer->char', (args) => {
+    if (args.length !== 1 || args[0].tag !== 'number')
+      throw new EvalError('integer->char: expected 1 integer argument');
+    return { tag: 'char', value: String.fromCharCode(args[0].value) };
   });
 
   defBuiltin('symbol->string', (args) => {
