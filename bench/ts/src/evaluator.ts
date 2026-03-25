@@ -87,6 +87,18 @@ type SyntaxRulesMacro = {
   env: Environment;
 };
 
+type RecordTypeDescriptor = {
+  name: string;
+  displayName: string;
+  fieldTags: string[];
+};
+
+type RecordFieldSpec = {
+  tag: string;
+  accessorName: SymbolExpr;
+  mutatorName?: SymbolExpr;
+};
+
 type EvaluationContext = {
   output: string[];
 };
@@ -98,6 +110,7 @@ type SchemeValue =
   | { type: 'char'; value: string }
   | { type: 'symbol'; name: string }
   | { type: 'list'; elements: SchemeValue[]; tail?: SchemeValue }
+  | { type: 'record'; recordType: RecordTypeDescriptor; fields: SchemeValue[] }
   | BuiltinProcedure
   | Closure
   | { type: 'void' };
@@ -112,6 +125,7 @@ const VOID_VALUE: SchemeValue = { type: 'void' };
 const SPECIAL_FORM_NAMES = new Set([
   'define',
   'define-syntax',
+  'define-record-type',
   'set!',
   'if',
   'quote',
@@ -450,6 +464,8 @@ function evaluateList(expr: Extract<Expr, { type: 'list' }>, env: Environment): 
         return evaluateDefine(args, env, operator.position);
       case 'define-syntax':
         return evaluateDefineSyntax(args, env, operator.position);
+      case 'define-record-type':
+        return evaluateDefineRecordType(args, env, operator.position);
       case 'set!':
         return evaluateSet(args, env, operator.position);
       case 'if':
@@ -520,6 +536,106 @@ function evaluateDefineSyntax(args: Expr[], env: Environment, position: SourcePo
   }
 
   env.defineSyntax(symbolKey(target), parseSyntaxRules(target.name, args[1], env));
+  return VOID_VALUE;
+}
+
+function evaluateDefineRecordType(args: Expr[], env: Environment, position: SourcePosition): SchemeValue {
+  requireArgCountAtLeast('define-record-type', args.length, 3, position);
+
+  const typeNameExpr = args[0];
+  if (typeNameExpr.type !== 'symbol') {
+    throw new EvalError('define-record-type: expected record type name', typeNameExpr.position);
+  }
+
+  const { constructorName, constructorFieldTags } = parseRecordConstructorSpec(args[1]);
+  const predicateName = args[2];
+  if (predicateName.type !== 'symbol') {
+    throw new EvalError('define-record-type: expected predicate name', predicateName.position);
+  }
+
+  const fieldSpecs = args.slice(3).map(parseRecordFieldSpec);
+  const fieldIndexByTag = new Map<string, number>();
+  for (let index = 0; index < fieldSpecs.length; index += 1) {
+    const fieldSpec = fieldSpecs[index];
+    if (fieldIndexByTag.has(fieldSpec.tag)) {
+      throw new EvalError(
+        `define-record-type: duplicate field tag ${fieldSpec.tag}`,
+        fieldSpec.accessorName.position,
+      );
+    }
+
+    fieldIndexByTag.set(fieldSpec.tag, index);
+  }
+
+  const seenConstructorTags = new Set<string>();
+  const constructorFieldIndexes = constructorFieldTags.map((tag) => {
+    if (seenConstructorTags.has(tag)) {
+      throw new EvalError(`define-record-type: duplicate constructor field ${tag}`, args[1].position);
+    }
+
+    seenConstructorTags.add(tag);
+    const fieldIndex = fieldIndexByTag.get(tag);
+    if (fieldIndex === undefined) {
+      throw new EvalError(`define-record-type: unknown field tag ${tag}`, args[1].position);
+    }
+
+    return fieldIndex;
+  });
+
+  const recordType: RecordTypeDescriptor = {
+    name: typeNameExpr.name,
+    displayName: formatRecordTypeName(typeNameExpr.name),
+    fieldTags: fieldSpecs.map((fieldSpec) => fieldSpec.tag),
+  };
+
+  env.define(
+    symbolKey(constructorName),
+    builtin(constructorName.name, (callArgs, callPosition) => {
+      requireArgCount(constructorName.name, callArgs.length, constructorFieldIndexes.length, callPosition);
+
+      const fields = fieldSpecs.map(() => VOID_VALUE);
+      for (let index = 0; index < constructorFieldIndexes.length; index += 1) {
+        fields[constructorFieldIndexes[index]] = callArgs[index].value;
+      }
+
+      return { type: 'record', recordType, fields };
+    }),
+  );
+
+  env.define(
+    symbolKey(predicateName),
+    builtin(predicateName.name, (callArgs, callPosition) => {
+      requireArgCount(predicateName.name, callArgs.length, 1, callPosition);
+      return booleanValue(
+        callArgs[0].value.type === 'record' && callArgs[0].value.recordType === recordType,
+      );
+    }),
+  );
+
+  for (let index = 0; index < fieldSpecs.length; index += 1) {
+    const fieldSpec = fieldSpecs[index];
+
+    env.define(
+      symbolKey(fieldSpec.accessorName),
+      builtin(fieldSpec.accessorName.name, (callArgs, callPosition) => {
+        requireArgCount(fieldSpec.accessorName.name, callArgs.length, 1, callPosition);
+        return expectRecord(fieldSpec.accessorName.name, callArgs[0], recordType).fields[index];
+      }),
+    );
+
+    const mutatorName = fieldSpec.mutatorName;
+    if (mutatorName) {
+      env.define(
+        symbolKey(mutatorName),
+        builtin(mutatorName.name, (callArgs, callPosition) => {
+          requireArgCount(mutatorName.name, callArgs.length, 2, callPosition);
+          expectRecord(mutatorName.name, callArgs[0], recordType).fields[index] = callArgs[1].value;
+          return VOID_VALUE;
+        }),
+      );
+    }
+  }
+
   return VOID_VALUE;
 }
 
@@ -728,6 +844,67 @@ function parseLetBindings(bindingsExpr: Expr): Array<{ name: SymbolExpr; value: 
 
     return { name: nameExpr, value: valueExpr };
   });
+}
+
+function parseRecordConstructorSpec(bindingsExpr: Expr): {
+  constructorName: SymbolExpr;
+  constructorFieldTags: string[];
+} {
+  if (bindingsExpr.type !== 'list' || bindingsExpr.elements.length === 0) {
+    throw new EvalError(
+      'define-record-type: expected constructor specification',
+      bindingsExpr.position,
+    );
+  }
+
+  const constructorName = bindingsExpr.elements[0];
+  if (constructorName.type !== 'symbol') {
+    throw new EvalError(
+      'define-record-type: expected constructor name',
+      constructorName.position,
+    );
+  }
+
+  const constructorFieldTags = bindingsExpr.elements.slice(1).map((fieldExpr) => {
+    if (fieldExpr.type !== 'symbol') {
+      throw new EvalError(
+        'define-record-type: constructor field tags must be symbols',
+        fieldExpr.position,
+      );
+    }
+
+    return fieldExpr.name;
+  });
+
+  return { constructorName, constructorFieldTags };
+}
+
+function parseRecordFieldSpec(fieldExpr: Expr): RecordFieldSpec {
+  if (
+    fieldExpr.type !== 'list' ||
+    (fieldExpr.elements.length !== 2 && fieldExpr.elements.length !== 3)
+  ) {
+    throw new EvalError('define-record-type: expected field specification', fieldExpr.position);
+  }
+
+  const [tagExpr, accessorExpr, mutatorExpr] = fieldExpr.elements;
+  if (tagExpr.type !== 'symbol') {
+    throw new EvalError('define-record-type: field tag must be a symbol', tagExpr.position);
+  }
+
+  if (accessorExpr.type !== 'symbol') {
+    throw new EvalError('define-record-type: accessor name must be a symbol', accessorExpr.position);
+  }
+
+  if (mutatorExpr !== undefined && mutatorExpr.type !== 'symbol') {
+    throw new EvalError('define-record-type: mutator name must be a symbol', mutatorExpr.position);
+  }
+
+  return {
+    tag: tagExpr.name,
+    accessorName: accessorExpr,
+    mutatorName: mutatorExpr,
+  };
 }
 
 function symbolKey(symbol: SymbolExpr): string {
@@ -2413,6 +2590,18 @@ function expectChar(name: string, arg: EvaluatedArg): Extract<SchemeValue, { typ
   return arg.value;
 }
 
+function expectRecord(
+  name: string,
+  arg: EvaluatedArg,
+  recordType: RecordTypeDescriptor,
+): Extract<SchemeValue, { type: 'record' }> {
+  if (arg.value.type !== 'record' || arg.value.recordType !== recordType) {
+    throw new EvalError(`${name}: expected ${recordType.name}`, arg.position);
+  }
+
+  return arg.value;
+}
+
 function listValue(elements: SchemeValue[], tail?: SchemeValue): ListValue {
   return tail === undefined ? { type: 'list', elements } : { type: 'list', elements, tail };
 }
@@ -2473,6 +2662,8 @@ function equalValues(left: SchemeValue, right: SchemeValue): boolean {
 
       return equalValues(left.tail, rightList.tail);
     }
+    case 'record':
+      return false;
     case 'builtin':
     case 'closure':
       return left === right;
@@ -2575,6 +2766,8 @@ function formatValue(value: SchemeValue): string {
       return value.name;
     case 'list':
       return formatListValue(value, formatValue);
+    case 'record':
+      return `#<${value.recordType.displayName}>`;
     case 'builtin':
     case 'closure':
       return '#<procedure>';
@@ -2605,4 +2798,12 @@ function formatChar(value: string): string {
   }
 
   return `#\\${value}`;
+}
+
+function formatRecordTypeName(name: string): string {
+  if (name.startsWith('<') && name.endsWith('>') && name.length > 2) {
+    return name.slice(1, -1);
+  }
+
+  return name;
 }
