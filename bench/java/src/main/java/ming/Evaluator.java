@@ -11,8 +11,10 @@ import java.util.Set;
 public class Evaluator {
 
     // ── Value types ──────────────────────────────────────────────
-    private sealed interface Val permits Val.Int, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda, Val.Macro {
+    private sealed interface Val permits Val.Int, Val.Rat, Val.Flo, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda, Val.Macro {
         record Int(long value) implements Val {}
+        record Rat(long num, long den) implements Val {}
+        record Flo(double value) implements Val {}
         record Bool(boolean value) implements Val {}
         final class Str implements Val {
             private final char[] chars;
@@ -105,6 +107,8 @@ public class Evaluator {
     private static String writeVal(Val v) {
         return switch (v) {
             case Val.Int i -> String.valueOf(i.value());
+            case Val.Rat r -> r.num() + "/" + r.den();
+            case Val.Flo f -> String.valueOf(f.value());
             case Val.Bool b -> b.value() ? "#t" : "#f";
             case Val.Str s -> "\"" + s.value() + "\"";
             case Val.Sym s -> s.name();
@@ -170,6 +174,8 @@ public class Evaluator {
     private static boolean isEq(Val a, Val b) {
         if (a == b) return true;
         if (a instanceof Val.Int ai && b instanceof Val.Int bi) return ai.value() == bi.value();
+        if (a instanceof Val.Rat ar && b instanceof Val.Rat br) return ar.num() == br.num() && ar.den() == br.den();
+        if (a instanceof Val.Flo af && b instanceof Val.Flo bf) return af.value() == bf.value();
         if (a instanceof Val.Bool ab && b instanceof Val.Bool bb) return ab.value() == bb.value();
         if (a instanceof Val.Sym as && b instanceof Val.Sym bs) return as.name().equals(bs.name());
         if (a instanceof Val.Chr ac && b instanceof Val.Chr bc) return ac.value() == bc.value();
@@ -313,6 +319,21 @@ public class Evaluator {
         try {
             return new Val.Int(Long.parseLong(tok));
         } catch (NumberFormatException e) {
+            // Try rational literal: e.g. 3/4, -1/3
+            int slashIdx = tok.indexOf('/');
+            if (slashIdx > 0 && slashIdx < tok.length() - 1) {
+                try {
+                    long num = Long.parseLong(tok.substring(0, slashIdx));
+                    long den = Long.parseLong(tok.substring(slashIdx + 1));
+                    return makeRat(num, den);
+                } catch (NumberFormatException e2) { /* fall through */ }
+            }
+            // Try float literal
+            if (tok.contains(".")) {
+                try {
+                    return new Val.Flo(Double.parseDouble(tok));
+                } catch (NumberFormatException e2) { /* fall through */ }
+            }
             return new Val.Sym(tok);
         }
     }
@@ -321,6 +342,8 @@ public class Evaluator {
     private Val eval(Val expr, Env env) throws EvalError {
         return switch (expr) {
             case Val.Int i -> i;
+            case Val.Rat r -> r;
+            case Val.Flo f -> f;
             case Val.Bool b -> b;
             case Val.Str s -> s;
             case Val.Nil n -> n;
@@ -799,6 +822,83 @@ public class Evaluator {
         }
     }
 
+    // ── Numeric helpers ───────────────────────────────────────────
+    private static long gcd(long a, long b) {
+        a = Math.abs(a); b = Math.abs(b);
+        while (b != 0) { long t = b; b = a % b; a = t; }
+        return a;
+    }
+
+    private static Val makeRat(long num, long den) {
+        if (den == 0) throw new RuntimeException("division by zero");
+        if (num == 0) return new Val.Int(0);
+        if (den < 0) { num = -num; den = -den; }
+        long g = gcd(Math.abs(num), den);
+        num /= g; den /= g;
+        if (den == 1) return new Val.Int(num);
+        return new Val.Rat(num, den);
+    }
+
+    private static long[] toRat(Val v) {
+        if (v instanceof Val.Int i) return new long[]{i.value(), 1};
+        if (v instanceof Val.Rat r) return new long[]{r.num(), r.den()};
+        throw new RuntimeException("expected exact number, got: " + writeVal(v));
+    }
+
+    private static double toDouble(Val v) {
+        if (v instanceof Val.Int i) return (double) i.value();
+        if (v instanceof Val.Rat r) return (double) r.num() / r.den();
+        if (v instanceof Val.Flo f) return f.value();
+        throw new RuntimeException("expected number, got: " + writeVal(v));
+    }
+
+    private static boolean isNum(Val v) {
+        return v instanceof Val.Int || v instanceof Val.Rat || v instanceof Val.Flo;
+    }
+
+    private static boolean isInexact(Val v) {
+        return v instanceof Val.Flo;
+    }
+
+    private static Val numAdd(Val a, Val b) {
+        if (a instanceof Val.Flo || b instanceof Val.Flo)
+            return new Val.Flo(toDouble(a) + toDouble(b));
+        long[] ar = toRat(a), br = toRat(b);
+        return makeRat(ar[0] * br[1] + br[0] * ar[1], ar[1] * br[1]);
+    }
+
+    private static Val numSub(Val a, Val b) {
+        if (a instanceof Val.Flo || b instanceof Val.Flo)
+            return new Val.Flo(toDouble(a) - toDouble(b));
+        long[] ar = toRat(a), br = toRat(b);
+        return makeRat(ar[0] * br[1] - br[0] * ar[1], ar[1] * br[1]);
+    }
+
+    private static Val numMul(Val a, Val b) {
+        if (a instanceof Val.Flo || b instanceof Val.Flo)
+            return new Val.Flo(toDouble(a) * toDouble(b));
+        long[] ar = toRat(a), br = toRat(b);
+        return makeRat(ar[0] * br[0], ar[1] * br[1]);
+    }
+
+    private static Val numDiv(Val a, Val b) {
+        if (a instanceof Val.Flo || b instanceof Val.Flo) {
+            double bd = toDouble(b);
+            if (bd == 0) throw new RuntimeException("division by zero");
+            return new Val.Flo(toDouble(a) / bd);
+        }
+        long[] ar = toRat(a), br = toRat(b);
+        if (br[0] == 0) throw new RuntimeException("division by zero");
+        return makeRat(ar[0] * br[1], ar[1] * br[0]);
+    }
+
+    private static int numCompare(Val a, Val b) {
+        if (a instanceof Val.Flo || b instanceof Val.Flo)
+            return Double.compare(toDouble(a), toDouble(b));
+        long[] ar = toRat(a), br = toRat(b);
+        return Long.compare(ar[0] * br[1], br[0] * ar[1]);
+    }
+
     // ── Builtins ────────────────────────────────────────────────
     private static long asInt(Val v) {
         if (v instanceof Val.Int i) return i.value();
@@ -813,51 +913,47 @@ public class Evaluator {
     private Env createGlobalEnv() {
         Env env = new Env(null);
         env.define("+", new Val.Builtin("+", args -> {
-            long sum = 0;
-            for (Val a : args) sum += asInt(a);
-            return new Val.Int(sum);
+            Val result = new Val.Int(0);
+            for (Val a : args) result = numAdd(result, a);
+            return result;
         }));
         env.define("-", new Val.Builtin("-", args -> {
             if (args.isEmpty()) throw new RuntimeException("- requires at least 1 argument");
-            if (args.size() == 1) return new Val.Int(-asInt(args.get(0)));
-            long result = asInt(args.get(0));
-            for (int i = 1; i < args.size(); i++) result -= asInt(args.get(i));
-            return new Val.Int(result);
+            if (args.size() == 1) return numSub(new Val.Int(0), args.get(0));
+            Val result = args.get(0);
+            for (int i = 1; i < args.size(); i++) result = numSub(result, args.get(i));
+            return result;
         }));
         env.define("*", new Val.Builtin("*", args -> {
-            long product = 1;
-            for (Val a : args) product *= asInt(a);
-            return new Val.Int(product);
+            Val result = new Val.Int(1);
+            for (Val a : args) result = numMul(result, a);
+            return result;
         }));
         env.define("/", new Val.Builtin("/", args -> {
             if (args.size() < 2) throw new RuntimeException("/ requires at least 2 arguments");
-            long result = asInt(args.get(0));
-            for (int i = 1; i < args.size(); i++) {
-                long divisor = asInt(args.get(i));
-                if (divisor == 0) throw new RuntimeException("division by zero");
-                result /= divisor;
-            }
-            return new Val.Int(result);
+            Val result = args.get(0);
+            for (int i = 1; i < args.size(); i++) result = numDiv(result, args.get(i));
+            return result;
         }));
         env.define("<", new Val.Builtin("<", args -> {
             checkArgCount(args, 2, "<");
-            return new Val.Bool(asInt(args.get(0)) < asInt(args.get(1)));
+            return new Val.Bool(numCompare(args.get(0), args.get(1)) < 0);
         }));
         env.define(">", new Val.Builtin(">", args -> {
             checkArgCount(args, 2, ">");
-            return new Val.Bool(asInt(args.get(0)) > asInt(args.get(1)));
+            return new Val.Bool(numCompare(args.get(0), args.get(1)) > 0);
         }));
         env.define("=", new Val.Builtin("=", args -> {
             checkArgCount(args, 2, "=");
-            return new Val.Bool(asInt(args.get(0)) == asInt(args.get(1)));
+            return new Val.Bool(numCompare(args.get(0), args.get(1)) == 0);
         }));
         env.define("<=", new Val.Builtin("<=", args -> {
             checkArgCount(args, 2, "<=");
-            return new Val.Bool(asInt(args.get(0)) <= asInt(args.get(1)));
+            return new Val.Bool(numCompare(args.get(0), args.get(1)) <= 0);
         }));
         env.define(">=", new Val.Builtin(">=", args -> {
             checkArgCount(args, 2, ">=");
-            return new Val.Bool(asInt(args.get(0)) >= asInt(args.get(1)));
+            return new Val.Bool(numCompare(args.get(0), args.get(1)) >= 0);
         }));
         env.define("not", new Val.Builtin("not", args -> {
             checkArgCount(args, 1, "not");
@@ -912,7 +1008,66 @@ public class Evaluator {
         }));
         env.define("number?", new Val.Builtin("number?", args -> {
             checkArgCount(args, 1, "number?");
+            return new Val.Bool(isNum(args.get(0)));
+        }));
+        env.define("integer?", new Val.Builtin("integer?", args -> {
+            checkArgCount(args, 1, "integer?");
             return new Val.Bool(args.get(0) instanceof Val.Int);
+        }));
+        env.define("rational?", new Val.Builtin("rational?", args -> {
+            checkArgCount(args, 1, "rational?");
+            Val v = args.get(0);
+            return new Val.Bool(v instanceof Val.Int || v instanceof Val.Rat);
+        }));
+        env.define("exact?", new Val.Builtin("exact?", args -> {
+            checkArgCount(args, 1, "exact?");
+            Val v = args.get(0);
+            return new Val.Bool(v instanceof Val.Int || v instanceof Val.Rat);
+        }));
+        env.define("inexact?", new Val.Builtin("inexact?", args -> {
+            checkArgCount(args, 1, "inexact?");
+            return new Val.Bool(args.get(0) instanceof Val.Flo);
+        }));
+        env.define("exact->inexact", new Val.Builtin("exact->inexact", args -> {
+            checkArgCount(args, 1, "exact->inexact");
+            return new Val.Flo(toDouble(args.get(0)));
+        }));
+        env.define("inexact->exact", new Val.Builtin("inexact->exact", args -> {
+            checkArgCount(args, 1, "inexact->exact");
+            Val v = args.get(0);
+            if (v instanceof Val.Int || v instanceof Val.Rat) return v;
+            if (v instanceof Val.Flo f) {
+                // Convert double to exact rational
+                double d = f.value();
+                if (d == Math.floor(d) && !Double.isInfinite(d)) return new Val.Int((long) d);
+                // Use the rational approximation via bit representation
+                long bits = Double.doubleToLongBits(d);
+                long sign = (bits >> 63) == 0 ? 1 : -1;
+                int exp = (int)((bits >> 52) & 0x7ffL) - 1023;
+                long mantissa = (bits & 0x000fffffffffffffL) | 0x0010000000000000L;
+                // d = sign * mantissa * 2^(exp - 52)
+                int shift = exp - 52;
+                if (shift >= 0) {
+                    return new Val.Int(sign * mantissa * (1L << shift));
+                } else {
+                    return makeRat(sign * mantissa, 1L << (-shift));
+                }
+            }
+            throw new RuntimeException("inexact->exact: not a number");
+        }));
+        env.define("numerator", new Val.Builtin("numerator", args -> {
+            checkArgCount(args, 1, "numerator");
+            Val v = args.get(0);
+            if (v instanceof Val.Int i) return new Val.Int(i.value());
+            if (v instanceof Val.Rat r) return new Val.Int(r.num());
+            throw new RuntimeException("numerator: not a rational number");
+        }));
+        env.define("denominator", new Val.Builtin("denominator", args -> {
+            checkArgCount(args, 1, "denominator");
+            Val v = args.get(0);
+            if (v instanceof Val.Int) return new Val.Int(1);
+            if (v instanceof Val.Rat r) return new Val.Int(r.den());
+            throw new RuntimeException("denominator: not a rational number");
         }));
         env.define("string?", new Val.Builtin("string?", args -> {
             checkArgCount(args, 1, "string?");
