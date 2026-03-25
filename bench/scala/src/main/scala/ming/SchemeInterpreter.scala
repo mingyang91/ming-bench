@@ -79,6 +79,18 @@ private[ming] object SchemeInterpreter:
       env: Env,
       macros: MacroScope
     ) extends Procedure
+
+    final case class CaseLambdaClause(
+      params: LambdaParams,
+      body: List[Expr]
+    )
+
+    final case class CaseLambda(
+      clauses: List[CaseLambdaClause],
+      env: Env,
+      macros: MacroScope
+    ) extends Procedure
+
     case object Void extends Value
 
     def list(items: List[Value]): Value =
@@ -101,11 +113,11 @@ private[ming] object SchemeInterpreter:
     val expressions = SchemeReader.readAll(input)
     if expressions.isEmpty then throw EvalError.at(SourcePos(1, 1), "empty input")
     val runtime    = Runtime()
-    val env        = initialEnv(runtime)
+    val env        = SchemeRuntimeSupport.initialEnv(runtime)
     val macroScope = MacroScope.root()
     (evalSequence(expressions, env, macroScope), runtime)
 
-  private def evalSequence(expressions: List[Expr], env: Env, macros: MacroScope): Value =
+  private[ming] def evalSequence(expressions: List[Expr], env: Env, macros: MacroScope): Value =
     expressions.foldLeft[Value](Value.Void) { (_, expr) =>
       eval(expr, env, macros)
     }
@@ -130,6 +142,7 @@ private[ming] object SchemeInterpreter:
           case Expr.Symbol("cond", _) :: args               => evalCond(args, env, macros, pos)
           case Expr.Symbol("quote", _) :: args              => evalQuote(args, pos)
           case Expr.Symbol("lambda", _) :: args             => evalLambda(args, env, macros, pos)
+          case Expr.Symbol("case-lambda", _) :: args        => SchemeProcedures.evalCaseLambda(args, env, macros, pos)
           case Expr.Symbol("and", _) :: args                => evalAnd(args, env, macros)
           case Expr.Symbol("or", _) :: args                 => evalOr(args, env, macros)
           case (symbol @ Expr.Symbol(name, _)) :: args =>
@@ -250,37 +263,26 @@ private[ming] object SchemeInterpreter:
       case Value.Builtin(_, impl) =>
         impl(args, pos)
       case Value.Closure(params, body, closureEnv, closureMacros) =>
-        val minimum = params.required.length
-        params.rest match
-          case None if args.length != minimum =>
-            throw EvalError.at(pos, s"lambda expected $minimum arguments, got ${args.length}")
-          case Some(_) if args.length < minimum =>
-            throw EvalError.at(pos, s"lambda expected at least $minimum arguments, got ${args.length}")
-          case _ =>
-        val bindings = params.required.zip(args.take(minimum)) ++ params.rest.map { restName =>
-          restName -> Value.list(args.drop(minimum))
-        }
-        val callEnv    = Env.child(closureEnv, bindings)
-        val callMacros = MacroScope.child(closureMacros)
-        evalSequence(body, callEnv, callMacros)
+        SchemeProcedures.applyUserProcedure(
+          params,
+          body,
+          closureEnv,
+          closureMacros,
+          args,
+          pos,
+          "lambda"
+        )
+      case Value.CaseLambda(clauses, closureEnv, closureMacros) =>
+        val Value.CaseLambdaClause(params, body) =
+          SchemeProcedures.selectCaseLambdaClause(clauses, args.length, pos)
+        SchemeProcedures.applyUserProcedure(
+          params,
+          body,
+          closureEnv,
+          closureMacros,
+          args,
+          pos,
+          "case-lambda"
+        )
       case other =>
         throw EvalError.at(pos, s"not a procedure: ${render(other)}")
-
-  private def initialEnv(runtime: Runtime): Env =
-    val env = Env.root()
-    SchemeBuiltins.all(runtime.emit).foreach { builtin =>
-      env.define(builtin.name, builtin)
-    }
-    env.define("apply", applyBuiltin)
-    env
-
-  private val applyBuiltin: Value.Builtin =
-    Value.Builtin(
-      "apply",
-      (args, pos) =>
-        BuiltinSupport.requireAtLeast("apply", args, expected = 2, pos)
-        val procedure = args.head
-        val prefix    = args.tail.dropRight(1)
-        val rest      = BuiltinSupport.asList(args.last, "apply", pos)
-        applyProcedure(procedure, prefix ++ rest, pos)
-    )

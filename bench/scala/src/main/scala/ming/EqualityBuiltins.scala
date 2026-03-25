@@ -25,6 +25,8 @@ private[ming] object EqualityBuiltins:
         leftBuiltin eq rightBuiltin
       case (leftClosure: Value.Closure, rightClosure: Value.Closure) =>
         leftClosure eq rightClosure
+      case (leftCaseLambda: Value.CaseLambda, rightCaseLambda: Value.CaseLambda) =>
+        leftCaseLambda eq rightCaseLambda
       case (Value.Void, Value.Void) => true
       case _                        => false
 

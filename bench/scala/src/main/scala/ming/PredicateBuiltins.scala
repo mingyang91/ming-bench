@@ -3,7 +3,7 @@ package ming
 private[ming] object PredicateBuiltins:
 
   import BuiltinSupport.*
-  import SchemeInterpreter.Value
+  import SchemeInterpreter.{Procedure, Value}
 
   def all: List[Value.Builtin] =
     List(
@@ -47,6 +47,10 @@ private[ming] object PredicateBuiltins:
       predicateBuiltin("char?") {
         case Value.Character(_) => true
         case _                  => false
+      },
+      predicateBuiltin("procedure?") {
+        case _: Procedure => true
+        case _            => false
       },
       predicateBuiltin("list?") { case value =>
         isProperList(value)
