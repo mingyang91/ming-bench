@@ -51,6 +51,7 @@ enum Value {
     Vector(SchemeVector),
     Record(Rc<RecordInstance>),
     Procedure(Rc<Procedure>),
+    Values(Vec<Value>),
     Uninitialized,
     Void,
 }
@@ -245,6 +246,7 @@ impl Value {
             Self::Vector(_) => "vector",
             Self::Record(_) => "record",
             Self::Procedure(_) => "procedure",
+            Self::Values(_) => "values",
             Self::Uninitialized => "uninitialized",
             Self::Void => "void",
         }
@@ -292,9 +294,22 @@ fn render_value(value: &Value, mode: RenderMode, state: &mut RenderState) -> Str
         Value::Vector(vector) => render_vector(vector, mode, state),
         Value::Record(record) => format!("#<record {}>", record.record_type.name),
         Value::Procedure(_) => "#<procedure>".to_string(),
+        Value::Values(values) => render_values(values, mode, state),
         Value::Uninitialized => "#<uninitialized>".to_string(),
         Value::Void => "#<void>".to_string(),
     }
+}
+
+fn render_values(values: &[Value], mode: RenderMode, state: &mut RenderState) -> String {
+    let mut out = String::from("#<values");
+
+    for value in values {
+        out.push(' ');
+        out.push_str(&render_value(value, mode, state));
+    }
+
+    out.push('>');
+    out
 }
 
 fn render_pair(pair: &PairRef, mode: RenderMode, state: &mut RenderState) -> String {
@@ -467,6 +482,7 @@ enum Procedure {
     RecordAccessor(RecordAccessorProcedure),
     DynamicWind(DynamicWindProcedure),
     WithExceptionHandler(WithExceptionHandlerProcedure),
+    CallWithValues(CallWithValuesProcedure),
     CallCc(CallCcProcedure),
     Continuation(ContinuationProcedure),
 }
@@ -483,6 +499,11 @@ struct DynamicWindProcedure {
 
 #[derive(Clone)]
 struct WithExceptionHandlerProcedure {
+    name: String,
+}
+
+#[derive(Clone)]
+struct CallWithValuesProcedure {
     name: String,
 }
 
@@ -916,8 +937,10 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "vector->list", builtin_vector_to_list);
     define_builtin(&env, "list->vector", builtin_list_to_vector);
     define_builtin(&env, "raise", builtin_raise);
+    define_builtin(&env, "values", builtin_values);
     define_dynamic_wind_builtin(&env, "dynamic-wind");
     define_with_exception_handler_builtin(&env, "with-exception-handler");
+    define_call_with_values_builtin(&env, "call-with-values");
     define_callcc_builtin(&env, "call/cc");
     define_callcc_builtin(&env, "call-with-current-continuation");
 
@@ -941,6 +964,15 @@ fn define_dynamic_wind_builtin(env: &EnvRef, name: &'static str) {
 fn define_with_exception_handler_builtin(env: &EnvRef, name: &'static str) {
     let value = Value::Procedure(Rc::new(Procedure::WithExceptionHandler(
         WithExceptionHandlerProcedure {
+            name: name.to_string(),
+        },
+    )));
+    bind_value(env, name.to_string(), value);
+}
+
+fn define_call_with_values_builtin(env: &EnvRef, name: &'static str) {
+    let value = Value::Procedure(Rc::new(Procedure::CallWithValues(
+        CallWithValuesProcedure {
             name: name.to_string(),
         },
     )));
@@ -1098,6 +1130,9 @@ enum MachineFrame {
         evaluated: Vec<Value>,
         remaining: Vec<Expr>,
         env: EnvRef,
+    },
+    CallWithValuesConsumer {
+        consumer: Value,
     },
     GuardHandler {
         variable: String,
@@ -1708,6 +1743,9 @@ fn resume_machine_frame(
                 apply_machine_value(operator, evaluated, ctx, frames)
             }
         }
+        MachineFrame::CallWithValuesConsumer { consumer } => {
+            apply_machine_value(consumer, unpack_values(value), ctx, frames)
+        }
         MachineFrame::GuardHandler { .. } => Ok(MachineState::Value(value)),
         MachineFrame::GuardClause {
             remaining_clauses,
@@ -1835,6 +1873,9 @@ fn apply_machine_value(
         Procedure::WithExceptionHandler(with_exception_handler) => {
             apply_machine_with_exception_handler(with_exception_handler, args, ctx, frames)
         }
+        Procedure::CallWithValues(call_with_values) => {
+            apply_machine_call_with_values(call_with_values, args, ctx, frames)
+        }
         Procedure::CallCc(callcc) => {
             expect_value_arity(&callcc.name, &args, 1)?;
             let continuation =
@@ -1880,6 +1921,20 @@ fn apply_machine_with_exception_handler(
         target_winds: ctx.dynamic_winds.clone(),
     });
     apply_machine_value(args[1].clone(), Vec::new(), ctx, frames)
+}
+
+fn apply_machine_call_with_values(
+    call_with_values: &CallWithValuesProcedure,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    expect_value_arity(&call_with_values.name, &args, 2)?;
+
+    frames.push(MachineFrame::CallWithValuesConsumer {
+        consumer: args[1].clone(),
+    });
+    apply_machine_value(args[0].clone(), Vec::new(), ctx, frames)
 }
 
 fn apply_machine_continuation(
@@ -3366,6 +3421,9 @@ fn apply_procedure(
         Procedure::WithExceptionHandler(with_exception_handler) => {
             apply_with_exception_handler(with_exception_handler, args, ctx)
         }
+        Procedure::CallWithValues(call_with_values) => {
+            apply_call_with_values(call_with_values, args, ctx)
+        }
         Procedure::CallCc(callcc) => apply_callcc(callcc, args, ctx),
         Procedure::Continuation(continuation) => apply_continuation(continuation, args, ctx),
     }
@@ -3399,6 +3457,9 @@ fn tail_apply_procedure(
         Procedure::WithExceptionHandler(with_exception_handler) => Ok(TailOutcome::Value(
             apply_with_exception_handler(with_exception_handler, args, ctx)?,
         )),
+        Procedure::CallWithValues(call_with_values) => {
+            tail_apply_call_with_values(call_with_values, args, ctx)
+        }
         Procedure::CallCc(callcc) => Ok(TailOutcome::Value(apply_callcc(callcc, args, ctx)?)),
         Procedure::Continuation(continuation) => Ok(TailOutcome::Value(apply_continuation(
             continuation,
@@ -3443,6 +3504,26 @@ fn apply_with_exception_handler(
         }
         Err(error) => Err(error),
     }
+}
+
+fn apply_call_with_values(
+    call_with_values: &CallWithValuesProcedure,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    expect_value_arity(&call_with_values.name, &args, 2)?;
+    let produced = apply_evaluated(args[0].clone(), Vec::new(), ctx)?;
+    apply_evaluated(args[1].clone(), unpack_values(produced), ctx)
+}
+
+fn tail_apply_call_with_values(
+    call_with_values: &CallWithValuesProcedure,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    expect_value_arity(&call_with_values.name, &args, 2)?;
+    let produced = apply_evaluated(args[0].clone(), Vec::new(), ctx)?;
+    tail_apply_evaluated(args[1].clone(), unpack_values(produced), ctx)
 }
 
 fn eval_args(
@@ -3894,6 +3975,10 @@ fn builtin_raise(args: &[Value], ctx: &mut EvalContext) -> Result<Value, EvalErr
     expect_value_arity("raise", args, 1)?;
     ctx.pending_exception = Some(args[0].clone());
     Err(EvalError::ExceptionRaisedSignal)
+}
+
+fn builtin_values(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    Ok(pack_values(args.to_vec()))
 }
 
 fn builtin_write(args: &[Value], ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -4904,6 +4989,13 @@ fn equal_values_inner(left: &Value, right: &Value, state: &mut EqualityState) ->
         }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Values(left), Value::Values(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| equal_values_inner(left, right, state))
+        }
         (Value::Uninitialized, Value::Uninitialized) => true,
         (Value::Void, Value::Void) => true,
         _ => false,
@@ -4922,6 +5014,13 @@ fn eqv_values(left: &Value, right: &Value) -> bool {
         (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(&left.items, &right.items),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Values(left), Value::Values(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| eqv_values(left, right))
+        }
         (Value::Uninitialized, Value::Uninitialized) => true,
         (Value::Void, Value::Void) => true,
         _ => false,
@@ -4972,6 +5071,20 @@ fn list_from_values(values: Vec<Value>) -> Value {
         .into_iter()
         .rev()
         .fold(Value::EmptyList, |tail, value| make_pair(value, tail))
+}
+
+fn pack_values(values: Vec<Value>) -> Value {
+    match values.as_slice() {
+        [value] => value.clone(),
+        _ => Value::Values(values),
+    }
+}
+
+fn unpack_values(value: Value) -> Vec<Value> {
+    match value {
+        Value::Values(values) => values,
+        value => vec![value],
+    }
 }
 
 fn expect_list_values(value: &Value, name: &str) -> Result<Vec<Value>, EvalError> {
