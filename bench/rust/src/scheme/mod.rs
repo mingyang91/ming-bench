@@ -835,9 +835,14 @@ fn assign(env: &EnvRef, name: &str, value: Value) -> Result<(), EvalError> {
     Ok(())
 }
 
+enum TailOutcome {
+    Value(Value),
+    Next { expr: Expr, env: EnvRef },
+}
+
 fn eval_program(exprs: &[Expr], ctx: &mut EvalContext) -> Result<Value, EvalError> {
     let env = default_env();
-    eval_sequence(exprs, env, ctx)
+    eval_tail_sequence(exprs, env, ctx)
 }
 
 fn eval_sequence(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -850,6 +855,18 @@ fn eval_sequence(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<V
     Ok(last)
 }
 
+fn eval_tail_sequence(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    let Some((last, init)) = exprs.split_last() else {
+        return Ok(Value::Void);
+    };
+
+    for expr in init {
+        let _ = eval_expr(expr, env.clone(), ctx)?;
+    }
+
+    eval_tail_expr(last, env, ctx)
+}
+
 fn eval_expr(expr: &Expr, env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     match expr {
         Expr::Number(value) => Ok(Value::Number(*value)),
@@ -858,6 +875,28 @@ fn eval_expr(expr: &Expr, env: EnvRef, ctx: &mut EvalContext) -> Result<Value, E
         Expr::Char(value) => Ok(Value::Char(*value)),
         Expr::Symbol(name) => lookup(&env, name),
         Expr::List(items) => eval_list(items, env, ctx),
+    }
+}
+
+fn eval_tail_expr(expr: &Expr, env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    let mut current_expr = expr.clone();
+    let mut current_env = env;
+
+    loop {
+        match current_expr {
+            Expr::Number(value) => return Ok(Value::Number(value)),
+            Expr::Boolean(value) => return Ok(Value::Boolean(value)),
+            Expr::String(value) => return Ok(Value::String(SchemeString::new(value))),
+            Expr::Char(value) => return Ok(Value::Char(value)),
+            Expr::Symbol(name) => return lookup(&current_env, &name),
+            Expr::List(items) => match eval_tail_list(&items, current_env, ctx)? {
+                TailOutcome::Value(value) => return Ok(value),
+                TailOutcome::Next { expr, env } => {
+                    current_expr = expr;
+                    current_env = env;
+                }
+            },
+        }
     }
 }
 
@@ -902,6 +941,72 @@ fn eval_list(items: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value
     apply(operator, &items[1..], env, ctx)
 }
 
+fn eval_tail_list(items: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<TailOutcome, EvalError> {
+    if items.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "cannot evaluate an empty list".to_string(),
+        });
+    }
+
+    if let Expr::Symbol(operator) = &items[0] {
+        let args = &items[1..];
+
+        match operator.as_str() {
+            "and" => return eval_tail_and(args, env, ctx),
+            "or" => return eval_tail_or(args, env, ctx),
+            "if" => return eval_tail_if(args, env, ctx),
+            "begin" => return eval_tail_begin(args, env, ctx),
+            "cond" => return eval_tail_cond(args, env, ctx),
+            "case" => return eval_tail_case(args, env, ctx),
+            "quote" => return Ok(TailOutcome::Value(eval_quote(args)?)),
+            "define" => return Ok(TailOutcome::Value(eval_define(args, env, ctx)?)),
+            "define-record-type" => {
+                return Ok(TailOutcome::Value(eval_define_record_type(args, env)?));
+            }
+            "define-syntax" => return Ok(TailOutcome::Value(eval_define_syntax(args, env)?)),
+            "set!" => return Ok(TailOutcome::Value(eval_set(args, env, ctx)?)),
+            "lambda" => return Ok(TailOutcome::Value(eval_lambda(args, env)?)),
+            "case-lambda" => return Ok(TailOutcome::Value(eval_case_lambda(args, env)?)),
+            "let" => return eval_tail_let(args, env, ctx),
+            "letrec" => return eval_tail_letrec(args, env, ctx, false),
+            "letrec*" => return eval_tail_letrec(args, env, ctx, true),
+            "do" => return Ok(TailOutcome::Value(eval_do(args, env, ctx)?)),
+            _ => {}
+        }
+
+        if let Some(transformer) = lookup_macro(&env, operator) {
+            let (expanded, expansion_env) = expand_macro_call(transformer, items, env, ctx)?;
+            return Ok(TailOutcome::Next {
+                expr: expanded,
+                env: expansion_env,
+            });
+        }
+    }
+
+    let operator = eval_expr(&items[0], env.clone(), ctx)?;
+    let args = eval_args(&items[1..], env, ctx)?;
+    tail_apply_evaluated(operator, args, ctx)
+}
+
+fn prepare_tail_sequence(
+    exprs: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    let Some((last, init)) = exprs.split_last() else {
+        return Ok(TailOutcome::Value(Value::Void));
+    };
+
+    for expr in init {
+        let _ = eval_expr(expr, env.clone(), ctx)?;
+    }
+
+    Ok(TailOutcome::Next {
+        expr: last.clone(),
+        env,
+    })
+}
+
 fn eval_and(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     let mut last = Value::Boolean(true);
 
@@ -916,6 +1021,24 @@ fn eval_and(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, 
     Ok(last)
 }
 
+fn eval_tail_and(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<TailOutcome, EvalError> {
+    let Some((last, init)) = args.split_last() else {
+        return Ok(TailOutcome::Value(Value::Boolean(true)));
+    };
+
+    for expr in init {
+        let value = eval_expr(expr, env.clone(), ctx)?;
+        if !value.is_truthy() {
+            return Ok(TailOutcome::Value(value));
+        }
+    }
+
+    Ok(TailOutcome::Next {
+        expr: last.clone(),
+        env,
+    })
+}
+
 fn eval_or(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     for expr in args {
         let value = eval_expr(expr, env.clone(), ctx)?;
@@ -925,6 +1048,24 @@ fn eval_or(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, E
     }
 
     Ok(Value::Boolean(false))
+}
+
+fn eval_tail_or(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<TailOutcome, EvalError> {
+    let Some((last, init)) = args.split_last() else {
+        return Ok(TailOutcome::Value(Value::Boolean(false)));
+    };
+
+    for expr in init {
+        let value = eval_expr(expr, env.clone(), ctx)?;
+        if value.is_truthy() {
+            return Ok(TailOutcome::Value(value));
+        }
+    }
+
+    Ok(TailOutcome::Next {
+        expr: last.clone(),
+        env,
+    })
 }
 
 fn eval_if(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -946,8 +1087,41 @@ fn eval_if(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, E
     }
 }
 
+fn eval_tail_if(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<TailOutcome, EvalError> {
+    if !(2..=3).contains(&args.len()) {
+        return Err(EvalError::WrongArgumentCount {
+            name: "if".to_string(),
+            expected: "2 or 3".to_string(),
+            got: args.len(),
+        });
+    }
+
+    let condition = eval_expr(&args[0], env.clone(), ctx)?;
+    if condition.is_truthy() {
+        Ok(TailOutcome::Next {
+            expr: args[1].clone(),
+            env,
+        })
+    } else if args.len() == 3 {
+        Ok(TailOutcome::Next {
+            expr: args[2].clone(),
+            env,
+        })
+    } else {
+        Ok(TailOutcome::Value(Value::Void))
+    }
+}
+
 fn eval_begin(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     eval_sequence(args, env, ctx)
+}
+
+fn eval_tail_begin(
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    prepare_tail_sequence(args, env, ctx)
 }
 
 fn eval_cond(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -988,6 +1162,46 @@ fn eval_cond(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value,
     }
 
     Ok(Value::Void)
+}
+
+fn eval_tail_cond(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<TailOutcome, EvalError> {
+    for (index, clause) in args.iter().enumerate() {
+        let Expr::List(items) = clause else {
+            return Err(EvalError::SyntaxError {
+                message: "cond clauses must be lists".to_string(),
+            });
+        };
+
+        if items.is_empty() {
+            return Err(EvalError::SyntaxError {
+                message: "cond clauses cannot be empty".to_string(),
+            });
+        }
+
+        if let Expr::Symbol(symbol) = &items[0] {
+            if symbol == "else" {
+                if index + 1 != args.len() {
+                    return Err(EvalError::SyntaxError {
+                        message: "cond else clause must be last".to_string(),
+                    });
+                }
+                if items.len() == 1 {
+                    return Ok(TailOutcome::Value(Value::Void));
+                }
+                return prepare_tail_sequence(&items[1..], env, ctx);
+            }
+        }
+
+        let test_value = eval_expr(&items[0], env.clone(), ctx)?;
+        if test_value.is_truthy() {
+            if items.len() == 1 {
+                return Ok(TailOutcome::Value(test_value));
+            }
+            return prepare_tail_sequence(&items[1..], env, ctx);
+        }
+    }
+
+    Ok(TailOutcome::Value(Value::Void))
 }
 
 fn eval_case(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -1047,6 +1261,65 @@ fn eval_case(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value,
     }
 
     Ok(Value::Void)
+}
+
+fn eval_tail_case(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<TailOutcome, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "case requires a key expression".to_string(),
+        });
+    }
+
+    let key = eval_expr(&args[0], env.clone(), ctx)?;
+
+    for (index, clause) in args[1..].iter().enumerate() {
+        let Expr::List(items) = clause else {
+            return Err(EvalError::SyntaxError {
+                message: "case clauses must be lists".to_string(),
+            });
+        };
+
+        if items.is_empty() {
+            return Err(EvalError::SyntaxError {
+                message: "case clauses cannot be empty".to_string(),
+            });
+        }
+
+        if let Expr::Symbol(symbol) = &items[0] {
+            if symbol == "else" {
+                if index + 2 != args.len() {
+                    return Err(EvalError::SyntaxError {
+                        message: "case else clause must be last".to_string(),
+                    });
+                }
+
+                if items.len() == 1 {
+                    return Ok(TailOutcome::Value(Value::Void));
+                }
+
+                return prepare_tail_sequence(&items[1..], env, ctx);
+            }
+        }
+
+        let Expr::List(datums) = &items[0] else {
+            return Err(EvalError::SyntaxError {
+                message: "case clauses must start with a datum list or else".to_string(),
+            });
+        };
+
+        if datums
+            .iter()
+            .any(|datum| eqv_values(&key, &quote_expr(datum)))
+        {
+            if items.len() == 1 {
+                return Ok(TailOutcome::Value(Value::Void));
+            }
+
+            return prepare_tail_sequence(&items[1..], env, ctx);
+        }
+    }
+
+    Ok(TailOutcome::Value(Value::Void))
 }
 
 fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
@@ -1253,6 +1526,19 @@ fn eval_let(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, 
     }
 }
 
+fn eval_tail_let(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<TailOutcome, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "let requires bindings".to_string(),
+        });
+    }
+
+    match &args[0] {
+        Expr::Symbol(name) => eval_tail_named_let(name, &args[1..], env, ctx),
+        bindings => eval_tail_let_bindings(bindings, &args[1..], env, ctx),
+    }
+}
+
 fn eval_letrec(
     args: &[Expr],
     env: EnvRef,
@@ -1297,6 +1583,50 @@ fn eval_letrec(
     eval_sequence(&args[1..], letrec_env, ctx)
 }
 
+fn eval_tail_letrec(
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+    sequential: bool,
+) -> Result<TailOutcome, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::SyntaxError {
+            message: "letrec requires bindings and a body".to_string(),
+        });
+    }
+
+    let bindings = parse_let_bindings(&args[0])?;
+    let letrec_env = Env::child(env);
+    let mut binding_cells = Vec::with_capacity(bindings.len());
+
+    {
+        let mut scope = letrec_env.borrow_mut();
+        for (name, _) in &bindings {
+            let cell = Rc::new(RefCell::new(Value::Uninitialized));
+            scope.bindings.insert(name.clone(), cell.clone());
+            binding_cells.push(cell);
+        }
+    }
+
+    if sequential {
+        for ((_, expr), cell) in bindings.iter().zip(binding_cells.iter()) {
+            let value = eval_expr(expr, letrec_env.clone(), ctx)?;
+            *cell.borrow_mut() = value;
+        }
+    } else {
+        let mut values = Vec::with_capacity(bindings.len());
+        for (_, expr) in &bindings {
+            values.push(eval_expr(expr, letrec_env.clone(), ctx)?);
+        }
+
+        for (cell, value) in binding_cells.into_iter().zip(values) {
+            *cell.borrow_mut() = value;
+        }
+    }
+
+    prepare_tail_sequence(&args[1..], letrec_env, ctx)
+}
+
 fn eval_named_let(
     name: &str,
     args: &[Expr],
@@ -1329,6 +1659,38 @@ fn eval_named_let(
     apply_evaluated(lambda, values, ctx)
 }
 
+fn eval_tail_named_let(
+    name: &str,
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::SyntaxError {
+            message: "named let requires bindings and a body".to_string(),
+        });
+    }
+
+    let bindings = parse_let_bindings(&args[0])?;
+    let values = eval_let_values(&bindings, env.clone(), ctx)?;
+    let params = ParameterList {
+        required: bindings.iter().map(|(param, _)| param.clone()).collect(),
+        rest: None,
+    };
+    let named_env = Env::child(env);
+    let lambda = make_lambda(
+        name.to_string(),
+        params,
+        args[1..].to_vec(),
+        named_env.clone(),
+    );
+    named_env
+        .borrow_mut()
+        .bindings
+        .insert(name.to_string(), Rc::new(RefCell::new(lambda.clone())));
+    tail_apply_evaluated(lambda, values, ctx)
+}
+
 fn eval_let_bindings(
     bindings_expr: &Expr,
     body: &[Expr],
@@ -1351,6 +1713,30 @@ fn eval_let_bindings(
         }
     }
     eval_sequence(body, let_env, ctx)
+}
+
+fn eval_tail_let_bindings(
+    bindings_expr: &Expr,
+    body: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    if body.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "let requires a body".to_string(),
+        });
+    }
+
+    let bindings = parse_let_bindings(bindings_expr)?;
+    let values = eval_let_values(&bindings, env.clone(), ctx)?;
+    let let_env = Env::child(env);
+    {
+        let mut scope = let_env.borrow_mut();
+        for ((name, _), value) in bindings.into_iter().zip(values) {
+            scope.bindings.insert(name, Rc::new(RefCell::new(value)));
+        }
+    }
+    prepare_tail_sequence(body, let_env, ctx)
 }
 
 fn parse_let_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
@@ -1673,6 +2059,18 @@ fn apply_evaluated(
     apply_procedure(procedure, args, ctx)
 }
 
+fn tail_apply_evaluated(
+    operator: Value,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    let Value::Procedure(procedure) = operator else {
+        return Err(EvalError::NotAProcedure);
+    };
+
+    tail_apply_procedure(procedure, args, ctx)
+}
+
 fn apply_procedure(
     procedure: Rc<Procedure>,
     args: Vec<Value>,
@@ -1685,6 +2083,27 @@ fn apply_procedure(
         Procedure::RecordConstructor(constructor) => apply_record_constructor(constructor, args),
         Procedure::RecordPredicate(predicate) => apply_record_predicate(predicate, args),
         Procedure::RecordAccessor(accessor) => apply_record_accessor(accessor, args),
+    }
+}
+
+fn tail_apply_procedure(
+    procedure: Rc<Procedure>,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    match procedure.as_ref() {
+        Procedure::Builtin(builtin) => Ok(TailOutcome::Value((builtin.implementation)(&args, ctx)?)),
+        Procedure::Lambda(lambda) => tail_apply_lambda(lambda, args, ctx),
+        Procedure::CaseLambda(case_lambda) => tail_apply_case_lambda(case_lambda, args, ctx),
+        Procedure::RecordConstructor(constructor) => {
+            Ok(TailOutcome::Value(apply_record_constructor(constructor, args)?))
+        }
+        Procedure::RecordPredicate(predicate) => {
+            Ok(TailOutcome::Value(apply_record_predicate(predicate, args)?))
+        }
+        Procedure::RecordAccessor(accessor) => {
+            Ok(TailOutcome::Value(apply_record_accessor(accessor, args)?))
+        }
     }
 }
 
@@ -1702,11 +2121,7 @@ fn eval_args(
     Ok(args)
 }
 
-fn apply_lambda(
-    lambda: &LambdaProcedure,
-    args: Vec<Value>,
-    ctx: &mut EvalContext,
-) -> Result<Value, EvalError> {
+fn bind_lambda_call_env(lambda: &LambdaProcedure, args: Vec<Value>) -> Result<EnvRef, EvalError> {
     if !lambda.params.accepts(args.len()) {
         return Err(EvalError::WrongArgumentCount {
             name: lambda.name.clone(),
@@ -1735,7 +2150,25 @@ fn apply_lambda(
         }
     }
 
-    eval_sequence(&lambda.body, call_env, ctx)
+    Ok(call_env)
+}
+
+fn apply_lambda(
+    lambda: &LambdaProcedure,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let call_env = bind_lambda_call_env(lambda, args)?;
+    eval_tail_sequence(&lambda.body, call_env, ctx)
+}
+
+fn tail_apply_lambda(
+    lambda: &LambdaProcedure,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    let call_env = bind_lambda_call_env(lambda, args)?;
+    prepare_tail_sequence(&lambda.body, call_env, ctx)
 }
 
 fn apply_case_lambda(
@@ -1756,6 +2189,26 @@ fn apply_case_lambda(
     };
 
     apply_lambda(&case_lambda.clauses[index], args, ctx)
+}
+
+fn tail_apply_case_lambda(
+    case_lambda: &CaseLambdaProcedure,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    let Some(index) = case_lambda
+        .clauses
+        .iter()
+        .position(|clause| clause.params.accepts(args.len()))
+    else {
+        return Err(EvalError::WrongArgumentCount {
+            name: case_lambda.name.clone(),
+            expected: case_lambda.expected_arity(),
+            got: args.len(),
+        });
+    };
+
+    tail_apply_lambda(&case_lambda.clauses[index], args, ctx)
 }
 
 fn apply_record_constructor(
