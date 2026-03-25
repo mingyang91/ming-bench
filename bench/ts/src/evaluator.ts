@@ -300,18 +300,21 @@ function makeGlobalEnv(): Env {
 
   for (const op of ['<', '>', '=', '>=', '<='] as const) {
     defBuiltin(op, (args) => {
-      if (args.length !== 2) throw new EvalError(`${op}: expected 2 arguments`);
-      assertNumeric(args[0], op); assertNumeric(args[1], op);
-      const a = toFloat(args[0]), b = toFloat(args[1]);
-      let r: boolean;
-      switch (op) {
-        case '<': r = a < b; break;
-        case '>': r = a > b; break;
-        case '=': r = a === b; break;
-        case '>=': r = a >= b; break;
-        case '<=': r = a <= b; break;
+      if (args.length < 2) throw new EvalError(`${op}: expected at least 2 arguments`);
+      for (let i = 0; i < args.length; i++) assertNumeric(args[i], op);
+      for (let i = 0; i < args.length - 1; i++) {
+        const a = toFloat(args[i]), b = toFloat(args[i + 1]);
+        let r: boolean;
+        switch (op) {
+          case '<': r = a < b; break;
+          case '>': r = a > b; break;
+          case '=': r = a === b; break;
+          case '>=': r = a >= b; break;
+          case '<=': r = a <= b; break;
+        }
+        if (!r) return FALSE_VAL;
       }
-      return r ? TRUE_VAL : FALSE_VAL;
+      return TRUE_VAL;
     });
   }
 
@@ -1164,6 +1167,17 @@ function tokenize(input: string): Token[] {
     const startPos: Pos = { line, col };
     if (ch === '(' || ch === ')') { advance(); tokens.push({ text: ch, pos: startPos }); continue; }
     if (ch === '\'') { advance(); tokens.push({ text: "'", pos: startPos }); continue; }
+    if (ch === '`') { advance(); tokens.push({ text: "`", pos: startPos }); continue; }
+    if (ch === ',') {
+      advance();
+      if (i < input.length && input[i] === '@') {
+        advance();
+        tokens.push({ text: ",@", pos: startPos });
+      } else {
+        tokens.push({ text: ",", pos: startPos });
+      }
+      continue;
+    }
     if (ch === '"') {
       let s = '"';
       advance();
@@ -1223,6 +1237,18 @@ function parse(tokens: Token[]): SchemeVal[] {
       const inner = parseExpr();
       return { tag: 'list', elements: [{ tag: 'symbol', value: 'syntax', pos: tok.pos }, inner], pos: tok.pos };
     }
+    if (tok.text === '`') {
+      const inner = parseExpr();
+      return { tag: 'list', elements: [{ tag: 'symbol', value: 'quasiquote', pos: tok.pos }, inner], pos: tok.pos };
+    }
+    if (tok.text === ',') {
+      const inner = parseExpr();
+      return { tag: 'list', elements: [{ tag: 'symbol', value: 'unquote', pos: tok.pos }, inner], pos: tok.pos };
+    }
+    if (tok.text === ',@') {
+      const inner = parseExpr();
+      return { tag: 'list', elements: [{ tag: 'symbol', value: 'unquote-splicing', pos: tok.pos }, inner], pos: tok.pos };
+    }
     return parseAtom(tok);
   }
 
@@ -1260,7 +1286,19 @@ function parse(tokens: Token[]): SchemeVal[] {
 
 function quoteSyntaxToValue(expr: SchemeVal): SchemeVal {
   if (expr.tag === 'list') {
-    const items = expr.elements.map(quoteSyntaxToValue);
+    const elems = expr.elements;
+    // Handle dotted pair syntax: (a b . c) => improper list
+    const dotIdx = elems.findIndex(e => e.tag === 'symbol' && e.value === '.');
+    if (dotIdx >= 0 && dotIdx === elems.length - 2) {
+      // Build improper list: items before dot, then cdr is the last element
+      const tail = quoteSyntaxToValue(elems[elems.length - 1]);
+      let result = tail;
+      for (let i = dotIdx - 1; i >= 0; i--) {
+        result = { tag: 'pair', car: quoteSyntaxToValue(elems[i]), cdr: result };
+      }
+      return result;
+    }
+    const items = elems.map(quoteSyntaxToValue);
     return makeList(items);
   }
   return expr;
@@ -1292,7 +1330,7 @@ function gensym(prefix: string): string {
 }
 
 const SPECIAL_FORMS = new Set([
-  'quote', 'if', 'define', 'lambda', 'case-lambda', 'set!', 'begin', 'let', 'let*', 'letrec', 'letrec*',
+  'quote', 'quasiquote', 'if', 'define', 'lambda', 'case-lambda', 'set!', 'begin', 'let', 'let*', 'letrec', 'letrec*',
   'cond', 'and', 'or', 'not', 'define-syntax', 'syntax-rules', 'syntax-case', 'syntax', 'with-syntax', 'case', 'do',
   'call/cc', 'call-with-current-continuation', 'guard', 'define-record-type',
 ]);
@@ -1701,6 +1739,66 @@ function applyCPS(func: SchemeVal, args: SchemeVal[], pos: Pos | undefined, k: C
   throw errAt(`not a procedure: ${displayVal(func)}`, pos);
 }
 
+// ── Quasiquote evaluation ─────────────────────────────────────────
+function evalQuasiquote(tmpl: SchemeVal, env: Env, k: Cont): Bounce {
+  if (tmpl.tag === 'list') {
+    const elems = tmpl.elements;
+    if (elems.length === 2 && elems[0].tag === 'symbol' && elems[0].value === 'unquote') {
+      return evalCPS(elems[1], env, k);
+    }
+    // Check for dotted pair syntax with possible unquote in tail
+    const dotIdx = elems.findIndex(e => e.tag === 'symbol' && e.value === '.');
+    if (dotIdx >= 0 && dotIdx === elems.length - 2) {
+      // (a b . c) pattern in quasiquote — build improper list
+      return evalQQList(elems.slice(0, dotIdx), env, (headItems) => {
+        return evalQuasiquote(elems[elems.length - 1], env, (tail) => {
+          let result = tail;
+          for (let i = headItems.length - 1; i >= 0; i--) {
+            result = { tag: 'pair', car: headItems[i], cdr: result };
+          }
+          return k(result);
+        });
+      });
+    }
+    // Regular list — evaluate each element, handling unquote-splicing
+    return evalQQList(elems, env, (items) => {
+      return k(makeList(items));
+    });
+  }
+  // Atom — return as quoted
+  return k(quoteSyntaxToValue(tmpl));
+}
+
+// Evaluate a list of quasiquote elements, handling unquote-splicing
+function evalQQList(elems: SchemeVal[], env: Env, k: (items: SchemeVal[]) => Bounce): Bounce {
+  const result: SchemeVal[] = [];
+  function loop(i: number): Bounce {
+    if (i >= elems.length) return k(result);
+    const el = elems[i];
+    if (el.tag === 'list' && el.elements.length === 2 &&
+        el.elements[0].tag === 'symbol' && el.elements[0].value === 'unquote-splicing') {
+      return evalCPS(el.elements[1], env, (spliced) => {
+        // spliced should be a list — flatten it into result
+        let cur = spliced;
+        while (cur.tag === 'pair') {
+          result.push(cur.car);
+          cur = cur.cdr;
+        }
+        if (cur.tag === 'nil') { /* ok */ }
+        else if (cur.tag === 'list') {
+          for (const e of cur.elements) result.push(e);
+        }
+        return loop(i + 1);
+      });
+    }
+    return evalQuasiquote(el, env, (val) => {
+      result.push(val);
+      return loop(i + 1);
+    });
+  }
+  return loop(0);
+}
+
 function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
  tailLoop: while (true) {
   if (expr.tag === 'number' || expr.tag === 'rational' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') {
@@ -1758,6 +1856,11 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
     if (op === 'quote') {
       if (elems.length !== 2) throw errAt('quote: expected 1 argument', epos);
       return k(quoteSyntaxToValue(elems[1]));
+    }
+
+    if (op === 'quasiquote') {
+      if (elems.length !== 2) throw errAt('quasiquote: expected 1 argument', epos);
+      return evalQuasiquote(elems[1], env, k);
     }
 
     if (op === 'if') {
@@ -2103,6 +2206,12 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
           if (callccActive) break;
           if (isTruthy(test)) {
             if (clause.elements.length === 1) return k(test);
+            // Handle (test => proc) syntax
+            if (clause.elements.length === 3 && clause.elements[1].tag === 'symbol' && clause.elements[1].value === '=>') {
+              const proc = evalCallDirect(clause.elements[2], env) ?? runTrampoline(evalCPS(clause.elements[2], env, identityCont));
+              if (callccActive) break;
+              return applyCPS(proc, [test], epos, k);
+            }
             if (clause.elements.length === 2) { expr = clause.elements[1]; continue tailLoop; }
             for (let bi = 1; bi < clause.elements.length - 1; bi++) {
               runTrampoline(evalCPS(clause.elements[bi], env, identityCont));
@@ -2123,6 +2232,12 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
         return evalCPS(clause.elements[0], env, (test) => {
           if (isTruthy(test)) {
             if (clause.elements.length === 1) return k(test);
+            // Handle (test => proc) syntax
+            if (clause.elements.length === 3 && clause.elements[1].tag === 'symbol' && clause.elements[1].value === '=>') {
+              return evalCPS(clause.elements[2], env, (proc) => {
+                return applyCPS(proc, [test], epos, k);
+              });
+            }
             return evalSeqCPS(clause.elements, 1, env, k);
           }
           return evalCondClauses(idx + 1);
