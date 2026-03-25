@@ -23,6 +23,7 @@ type NilVal struct{}
 type SymbolVal struct{ Name string }
 type CharVal struct{ Val rune }
 type VoidVal struct{}
+type MultipleValues struct{ Vals []Value }
 type VectorVal struct{ Elems []Value }
 type LambdaVal struct {
 	Params   []string
@@ -98,6 +99,13 @@ func (v *CharVal) String() string {
 
 func (v *VoidVal) String() string {
 	return ""
+}
+
+func (v *MultipleValues) String() string {
+	if len(v.Vals) == 0 {
+		return ""
+	}
+	return v.Vals[0].String()
 }
 
 func (v *VectorVal) String() string {

@@ -335,6 +335,25 @@ func applyCaseLambda(cl *CaseLambdaVal, args []Value, ln, col int) (Value, error
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: no matching clause for %d arguments", ln, col, len(args))}
 }
 
+// applyCallable applies a callable value to arguments.
+func applyCallable(fn Value, args []Value, ln, cl int) (Value, error) {
+	switch f := fn.(type) {
+	case *BuiltinFunc:
+		return f.Fn(args)
+	case *LambdaVal:
+		return applyLambda(f, args, ln, cl)
+	case *CaseLambdaVal:
+		return applyCaseLambda(f, args, ln, cl)
+	case *ContinuationVal:
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "continuation: requires exactly 1 argument"}
+		}
+		panic(&continuationJump{cont: f, value: args[0]})
+	default:
+		return nil, &EvalError{Message: fmt.Sprintf("not a procedure: %s", fn.String())}
+	}
+}
+
 // parseDotParams extracts fixed params and optional rest param from a parameter list.
 // Handles dot notation: (x y . rest)
 func parseDotParams(items []Expr, ln, cl int, context string) ([]string, string, error) {
@@ -542,6 +561,43 @@ func makeGlobalEnv(out *strings.Builder) *Env {
 			return nil, &EvalError{Message: "raise: requires exactly 1 argument"}
 		}
 		panic(&exceptionRaise{value: args[0]})
+	}})
+
+	// L21: values & call-with-values
+	env.set("values", &BuiltinFunc{Name: "values", Fn: func(args []Value) (Value, error) {
+		if len(args) == 1 {
+			return args[0], nil
+		}
+		return &MultipleValues{Vals: args}, nil
+	}})
+	env.set("call-with-values", &BuiltinFunc{Name: "call-with-values", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "call-with-values: requires exactly 2 arguments"}
+		}
+		producer := args[0]
+		consumer := args[1]
+		// Call producer with no arguments
+		produced, err := applyCallable(producer, nil, 0, 0)
+		if err != nil {
+			return nil, err
+		}
+		produced, err = resolveTC(produced, nil)
+		if err != nil {
+			return nil, err
+		}
+		// Unwrap multiple values
+		var consumerArgs []Value
+		if mv, ok := produced.(*MultipleValues); ok {
+			consumerArgs = mv.Vals
+		} else {
+			consumerArgs = []Value{produced}
+		}
+		// Call consumer with the produced values
+		result, err := applyCallable(consumer, consumerArgs, 0, 0)
+		if err != nil {
+			return nil, err
+		}
+		return resolveTC(result, nil)
 	}})
 
 	return env
