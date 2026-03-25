@@ -22,9 +22,17 @@ const (
 	TypeFloat
 	TypeRecord
 	TypeGoFunc
+	TypeCaseLambda
 )
 
 type GoFunc func(args []*Value) (*Value, error)
+
+// CaseLambdaClause represents one clause in a case-lambda.
+type CaseLambdaClause struct {
+	Params    []string
+	RestParam string
+	Body      []*Expr
+}
 
 // RecordType describes a record type created by define-record-type.
 type RecordType struct {
@@ -55,6 +63,8 @@ type Value struct {
 	RecordFields []*Value
 	// Go native function
 	GoFunc GoFunc
+	// Case-lambda clauses
+	CaseClauses []CaseLambdaClause
 }
 
 var Void = &Value{Type: TypeVoid}
@@ -132,6 +142,8 @@ func (v *Value) Display() string {
 	case TypeRecord:
 		return fmt.Sprintf("#<%s>", v.RecordType.Name)
 	case TypeGoFunc:
+		return "#<procedure>"
+	case TypeCaseLambda:
 		return "#<procedure>"
 	}
 	return ""

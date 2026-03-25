@@ -64,6 +64,8 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalDefineSyntax(expr, env)
 		case "define-record-type":
 			return evalDefineRecordType(expr, env)
+		case "case-lambda":
+			return evalCaseLambda(expr, env)
 		}
 		// Check for macro application
 		if val, ok := env.Get(head.StrVal); ok && val.Type == TypeMacro {
@@ -104,6 +106,11 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 	// Call lambda
 	if fn.Type == TypeLambda {
 		return callLambda(fn, args, expr.Line, expr.Col)
+	}
+
+	// Call case-lambda
+	if fn.Type == TypeCaseLambda {
+		return callCaseLambda(fn, args, expr.Line, expr.Col)
 	}
 
 	// Macro from ExprLiteral
@@ -589,4 +596,74 @@ func evalCond(expr *Expr, env *Env) (*Value, error) {
 		}
 	}
 	return Void, nil
+}
+
+func evalCaseLambda(expr *Expr, env *Env) (*Value, error) {
+	// (case-lambda (formals body ...) ...)
+	clauses := make([]CaseLambdaClause, 0, len(expr.Elements)-1)
+	for _, clauseExpr := range expr.Elements[1:] {
+		if clauseExpr.Type != ExprList || len(clauseExpr.Elements) < 2 {
+			return nil, fmt.Errorf("%d:%d: invalid case-lambda clause", expr.Line, expr.Col)
+		}
+		formalsExpr := clauseExpr.Elements[0]
+		if formalsExpr.Type != ExprList {
+			return nil, fmt.Errorf("%d:%d: case-lambda clause formals must be a list", expr.Line, expr.Col)
+		}
+		params, restParam, err := parseParams(formalsExpr.Elements)
+		if err != nil {
+			return nil, err
+		}
+		clauses = append(clauses, CaseLambdaClause{
+			Params:    params,
+			RestParam: restParam,
+			Body:      clauseExpr.Elements[1:],
+		})
+	}
+	return &Value{
+		Type:        TypeCaseLambda,
+		CaseClauses: clauses,
+		ClosureEnv:  env,
+	}, nil
+}
+
+func callCaseLambda(fn *Value, args []*Value, line, col int) (*Value, error) {
+	for _, clause := range fn.CaseClauses {
+		if clause.RestParam != "" {
+			if len(args) >= len(clause.Params) {
+				callEnv := NewEnv(fn.ClosureEnv)
+				for i, param := range clause.Params {
+					callEnv.Set(param, args[i])
+				}
+				rest := Null
+				for i := len(args) - 1; i >= len(clause.Params); i-- {
+					rest = PairValue(args[i], rest)
+				}
+				callEnv.Set(clause.RestParam, rest)
+				var result *Value
+				for _, bodyExpr := range clause.Body {
+					var err error
+					result, err = Eval(bodyExpr, callEnv)
+					if err != nil {
+						return nil, err
+					}
+				}
+				return result, nil
+			}
+		} else if len(args) == len(clause.Params) {
+			callEnv := NewEnv(fn.ClosureEnv)
+			for i, param := range clause.Params {
+				callEnv.Set(param, args[i])
+			}
+			var result *Value
+			for _, bodyExpr := range clause.Body {
+				var err error
+				result, err = Eval(bodyExpr, callEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+	}
+	return nil, fmt.Errorf("%d:%d: no matching clause in case-lambda for %d arguments", line, col, len(args))
 }

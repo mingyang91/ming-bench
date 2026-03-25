@@ -159,6 +159,7 @@ func makeGlobalEnv() *Env {
 	env.Set("assoc", &Value{Type: TypeSymbol, StrVal: "builtin:assoc"})
 	env.Set("equal?", &Value{Type: TypeSymbol, StrVal: "builtin:equal?"})
 	env.Set("eq?", &Value{Type: TypeSymbol, StrVal: "builtin:eq?"})
+	env.Set("procedure?", &Value{Type: TypeSymbol, StrVal: "builtin:procedure?"})
 
 	return env
 }
@@ -583,6 +584,12 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 		if fn.Type == TypeLambda {
 			return callLambda(fn, allArgs, line, col)
 		}
+		if fn.Type == TypeCaseLambda {
+			return callCaseLambda(fn, allArgs, line, col)
+		}
+		if fn.Type == TypeGoFunc {
+			return fn.GoFunc(allArgs)
+		}
 		return nil, fmt.Errorf("%d:%d: 'apply' first argument must be a procedure", line, col)
 
 	// Numeric utilities (L09)
@@ -858,6 +865,10 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 				val, err = callBuiltin(fn.StrVal, callArgs, env, line, col)
 			} else if fn.Type == TypeLambda {
 				val, err = callLambda(fn, callArgs, line, col)
+			} else if fn.Type == TypeCaseLambda {
+				val, err = callCaseLambda(fn, callArgs, line, col)
+			} else if fn.Type == TypeGoFunc {
+				val, err = fn.GoFunc(callArgs)
 			} else {
 				return nil, fmt.Errorf("%d:%d: 'map' first argument must be a procedure", line, col)
 			}
@@ -972,6 +983,15 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 			return nil, fmt.Errorf("%d:%d: 'rational?' expects 1 argument", line, col)
 		}
 		return BoolValue(args[0].Type == TypeInteger || args[0].Type == TypeRational), nil
+
+	case "builtin:procedure?":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("%d:%d: 'procedure?' expects 1 argument", line, col)
+		}
+		t := args[0].Type
+		isProcedure := t == TypeLambda || t == TypeGoFunc || t == TypeCaseLambda ||
+			(t == TypeSymbol && len(args[0].StrVal) > 8 && args[0].StrVal[:8] == "builtin:")
+		return BoolValue(isProcedure), nil
 	}
 
 	return nil, fmt.Errorf("%d:%d: unknown builtin %s", line, col, name)
