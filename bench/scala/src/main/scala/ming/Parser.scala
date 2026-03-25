@@ -103,7 +103,25 @@ object Parser:
     else
       token.toLongOption match
         case Some(n) => SchemeVal.SInt(n)
-        case None    => SchemeVal.SSymbol(token)
+        case None    => parseNonInteger(token)
+
+  private def parseNonInteger(token: String): SchemeVal =
+    val slashIdx = token.indexOf('/')
+    if slashIdx > 0 && slashIdx < token.length - 1 then parseRationalOrFallback(token, slashIdx)
+    else
+      token.toDoubleOption match
+        case Some(d) if token.contains('.') => SchemeVal.SFloat(d)
+        case _                              => SchemeVal.SSymbol(token)
+
+  private def parseRationalOrFallback(token: String, slashIdx: Int): SchemeVal =
+    val numStr = token.substring(0, slashIdx)
+    val denStr = token.substring(slashIdx + 1)
+    (numStr.toLongOption, denStr.toLongOption) match
+      case (Some(n), Some(d)) if d != 0 => SchemeVal.makeRational(n, d)
+      case _ =>
+        token.toDoubleOption match
+          case Some(d) => SchemeVal.SFloat(d)
+          case None    => SchemeVal.SSymbol(token)
 
   private def unescapeString(s: String): String =
     val sb = new StringBuilder

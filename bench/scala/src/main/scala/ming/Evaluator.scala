@@ -13,8 +13,8 @@ object Evaluator:
   def eval(expr: SchemeVal, env: Env): SchemeVal =
     try
       expr match
-        case SchemeVal.SInt(_) | SchemeVal.SBool(_) | SchemeVal.SString(_) | SchemeVal.SChar(_) | SchemeVal.SVoid |
-            SchemeVal.SPair(_, _) =>
+        case SchemeVal.SInt(_) | SchemeVal.SFloat(_) | SchemeVal.SRational(_, _) | SchemeVal.SBool(_) |
+            SchemeVal.SString(_) | SchemeVal.SChar(_) | SchemeVal.SVoid | SchemeVal.SPair(_, _) =>
           expr
         case SchemeVal.SSymbol(name) => env.get(name)
         case SchemeVal.SList(elems) =>

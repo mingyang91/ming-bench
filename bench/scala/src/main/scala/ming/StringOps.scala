@@ -73,8 +73,11 @@ object StringOps:
               s"string->number: expected string, got ${other.display}"
             )
       case "number->string" =>
-        requireOne("number->string", args) match
-          case SchemeVal.SInt(n) => SchemeVal.SString(new StringBuilder(n.toString))
+        val arg = requireOne("number->string", args)
+        arg match
+          case SchemeVal.SInt(n)         => SchemeVal.SString(new StringBuilder(n.toString))
+          case SchemeVal.SFloat(d)       => SchemeVal.SString(new StringBuilder(arg.display))
+          case SchemeVal.SRational(n, d) => SchemeVal.SString(new StringBuilder(arg.display))
           case other =>
             throw new EvalError(
               s"number->string: expected number, got ${other.display}"
