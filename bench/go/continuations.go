@@ -80,6 +80,12 @@ type applicationArgCont struct {
 	next     continuation
 }
 
+type callWithValuesProducerCont struct {
+	consumer value
+	pos      sourcePos
+	next     continuation
+}
+
 type condTestCont struct {
 	clauses []node
 	index   int
@@ -473,12 +479,15 @@ func (m *evalMachine) stepContinue() error {
 		cont.index--
 		m.setEval(cont.operands[cont.index], cont.env, cont)
 		return nil
+	case *callWithValuesProducerCont:
+		return m.enterProcedure(cont.consumer, unpackValues(m.val), cont.pos, cont.next)
 	case *condTestCont:
 		clause, ok := cont.clauses[cont.index].(listNode)
 		if !ok || len(clause.elements) == 0 {
 			return errorAt(cont.pos, "cond clauses must be non-empty lists")
 		}
 		if !isTruthy(m.val) {
+			cont.index++
 			return m.advanceCond(cont)
 		}
 		if len(clause.elements) == 1 {
@@ -1057,10 +1066,7 @@ func (m *evalMachine) enterProcedure(proc value, args []value, pos sourcePos, ne
 		}
 		return errorAt(pos, "no matching case-lambda clause for %d arguments", len(args))
 	case *continuationValue:
-		if len(args) != 1 {
-			return errorAt(pos, "continuation expects exactly 1 argument")
-		}
-		return m.resumeContinuation(args[0], cloneContinuation(proc.cont), proc.wind, proc.handler, pos)
+		return m.resumeContinuation(packValues(args), cloneContinuation(proc.cont), proc.wind, proc.handler, pos)
 	case *callCCProcValue:
 		if len(args) != 1 {
 			return errorAt(pos, "call/cc expects exactly 1 argument")
@@ -1070,6 +1076,18 @@ func (m *evalMachine) enterProcedure(proc value, args []value, pos sourcePos, ne
 			wind:    m.wind,
 			handler: m.handler,
 		}}, pos, next)
+	case *callWithValuesProcValue:
+		if len(args) != 2 {
+			return errorAt(pos, "call-with-values expects exactly 2 arguments")
+		}
+		if !isProcedureValue(args[0]) || !isProcedureValue(args[1]) {
+			return errorAt(pos, "call-with-values expects 2 procedures")
+		}
+		return m.enterProcedure(args[0], nil, pos, &callWithValuesProducerCont{
+			consumer: args[1],
+			pos:      pos,
+			next:     next,
+		})
 	case *dynamicWindProcValue:
 		if len(args) != 3 {
 			return errorAt(pos, "dynamic-wind expects exactly 3 arguments")
@@ -1206,6 +1224,12 @@ func cloneContinuation(cont continuation) continuation {
 			index:    cont.index,
 			values:   append([]value(nil), cont.values...),
 			env:      cont.env,
+			pos:      cont.pos,
+			next:     cloneContinuation(cont.next),
+		}
+	case *callWithValuesProducerCont:
+		return &callWithValuesProducerCont{
+			consumer: cont.consumer,
 			pos:      cont.pos,
 			next:     cloneContinuation(cont.next),
 		}

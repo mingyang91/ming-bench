@@ -4,28 +4,18 @@ type multiValueValue struct {
 	values []value
 }
 
+type callWithValuesProcValue struct{}
+
+var callWithValuesBuiltin = &callWithValuesProcValue{}
+
 func builtinValues() builtinProc {
 	return func(args []value) (value, error) {
 		return packValues(args), nil
 	}
 }
 
-func builtinCallWithValues() builtinProc {
-	return func(args []value) (value, error) {
-		if len(args) != 2 {
-			return nil, &EvalError{Message: "call-with-values expects exactly 2 arguments"}
-		}
-		if !isProcedureValue(args[0]) || !isProcedureValue(args[1]) {
-			return nil, &EvalError{Message: "call-with-values expects 2 procedures"}
-		}
-
-		produced, err := applyProcedure(args[0], nil, sourcePos{})
-		if err != nil {
-			return nil, err
-		}
-
-		return applyProcedure(args[1], unpackValues(produced), sourcePos{})
-	}
+func builtinCallWithValues() value {
+	return callWithValuesBuiltin
 }
 
 func packValues(values []value) value {

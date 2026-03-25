@@ -950,6 +950,10 @@ func startProcedureCall(proc value, args []value, pos sourcePos) (value, *evalSt
 		}
 		return nil, nil, errorAt(pos, "no matching case-lambda clause for %d arguments", len(args))
 	default:
+		if isProcedureValue(proc) {
+			result, err := runProcedureCall(proc, args, pos)
+			return result, nil, err
+		}
 		return nil, nil, errorAt(pos, "not a procedure")
 	}
 }
@@ -2770,7 +2774,7 @@ func formatValue(v value) (string, error) {
 		return "", multiValueContextError(len(v.values))
 	case *recordValue:
 		return "#<record " + v.recordType.name + ">", nil
-	case builtinProc, *closureValue, *caseClosureValue, *continuationValue, *callCCProcValue, *dynamicWindProcValue, *raiseProcValue, *withExceptionHandlerProcValue:
+	case builtinProc, *closureValue, *caseClosureValue, *continuationValue, *callCCProcValue, *callWithValuesProcValue, *dynamicWindProcValue, *raiseProcValue, *withExceptionHandlerProcValue:
 		return "#<procedure>", nil
 	case *syntaxValue:
 		return "#<syntax>", nil
@@ -2895,7 +2899,7 @@ func isPairValue(v value) bool {
 
 func isProcedureValue(v value) bool {
 	switch v.(type) {
-	case builtinProc, *closureValue, *caseClosureValue, *continuationValue, *callCCProcValue, *dynamicWindProcValue, *raiseProcValue, *withExceptionHandlerProcValue:
+	case builtinProc, *closureValue, *caseClosureValue, *continuationValue, *callCCProcValue, *callWithValuesProcValue, *dynamicWindProcValue, *raiseProcValue, *withExceptionHandlerProcValue:
 		return true
 	default:
 		return false
@@ -3006,6 +3010,9 @@ func eqValues(left, right value) bool {
 		return ok && left == right
 	case *callCCProcValue:
 		right, ok := right.(*callCCProcValue)
+		return ok && left == right
+	case *callWithValuesProcValue:
+		right, ok := right.(*callWithValuesProcValue)
 		return ok && left == right
 	case *dynamicWindProcValue:
 		right, ok := right.(*dynamicWindProcValue)
