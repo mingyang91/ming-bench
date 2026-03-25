@@ -243,6 +243,21 @@ impl Environment {
         }
     }
 
+    /// Look up a name and return it only if it's a macro (Macro or SyntaxCaseMacro).
+    /// Avoids cloning non-macro values (e.g. Lambda) which is expensive in hot loops.
+    pub(crate) fn get_if_macro(&self, name: &str) -> Option<Value> {
+        if let Some(val) = self.bindings.get(name) {
+            match val {
+                Value::Macro { .. } | Value::SyntaxCaseMacro { .. } => Some(val.clone()),
+                _ => None,
+            }
+        } else if let Some(ref parent) = self.parent {
+            parent.borrow().get_if_macro(name)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn set(&mut self, name: String, val: Value) {
         self.bindings.insert(name, val);
     }
@@ -735,20 +750,22 @@ fn cek_eval_list(items: &[Ast], env: &Env, kont: &mut Kont, _output: &mut String
                 Ok(CekState::Eval(items[1].clone(), Rc::clone(env)))
             }
             _ => {
-                // Check for macro invocation
-                match env.borrow().get(op) {
-                    Some(Value::Macro { literals, rules, def_env }) => {
-                        let (expanded, eval_env) = macros::expand_macro_form(&literals, &rules, &def_env, items, env)?;
-                        return Ok(CekState::Eval(expanded, eval_env));
+                // Check for macro invocation (get_if_macro avoids cloning non-macro values)
+                if let Some(mac) = env.borrow().get_if_macro(op) {
+                    match mac {
+                        Value::Macro { literals, rules, def_env } => {
+                            let (expanded, eval_env) = macros::expand_macro_form(&literals, &rules, &def_env, items, env)?;
+                            return Ok(CekState::Eval(expanded, eval_env));
+                        }
+                        Value::SyntaxCaseMacro { transformer, .. } => {
+                            let form_ast = ast_list(items.to_vec());
+                            let stx = Value::Syntax { ast: form_ast, renames: vec![], source_env: None };
+                            kont.push(Frame::MacroResult { use_env: Rc::clone(env) });
+                            kont.push(Frame::Args { func: *transformer, done: vec![], remaining: vec![], env: Rc::clone(env) });
+                            return Ok(CekState::Apply(stx));
+                        }
+                        _ => unreachable!(),
                     }
-                    Some(Value::SyntaxCaseMacro { transformer, .. }) => {
-                        let form_ast = ast_list(items.to_vec());
-                        let stx = Value::Syntax { ast: form_ast, renames: vec![], source_env: None };
-                        kont.push(Frame::MacroResult { use_env: Rc::clone(env) });
-                        kont.push(Frame::Args { func: *transformer, done: vec![], remaining: vec![], env: Rc::clone(env) });
-                        return Ok(CekState::Apply(stx));
-                    }
-                    _ => {}
                 }
                 // Function application
                 cek_eval_application(items, env, kont)
