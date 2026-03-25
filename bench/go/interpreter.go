@@ -111,6 +111,7 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("=", builtinCompare("="))
 	env.define("<=", builtinCompare("<="))
 	env.define("eq?", builtinEq())
+	env.define("eqv?", builtinEqv())
 	env.define("equal?", builtinEqual())
 	env.define("not", builtinNot())
 	env.define("abs", builtinAbs())
@@ -130,7 +131,15 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("cdr", builtinCdr())
 	env.define("null?", builtinNull())
 	env.define("list", builtinList())
+	env.define("vector", builtinVector())
+	env.define("make-vector", builtinMakeVector())
+	env.define("vector-ref", builtinVectorRef())
+	env.define("vector-set!", builtinVectorSet())
+	env.define("vector-length", builtinVectorLength())
+	env.define("vector->list", builtinVectorToList())
+	env.define("list->vector", builtinListToVector())
 	env.define("list?", builtinPredicate(isListValue))
+	env.define("vector?", builtinPredicate(isVectorValue))
 	env.define("length", builtinLength())
 	env.define("list-ref", builtinListRef())
 	env.define("list-tail", builtinListTail())
@@ -244,6 +253,8 @@ func eval(expr node, env *environment) (value, error) {
 	switch expr := expr.(type) {
 	case integerValue, rationalValue, inexactValue, booleanValue, stringValue, charValue:
 		return expr, nil
+	case vectorNode:
+		return datumFromNode(expr)
 	case symbolNode:
 		if expr.captured != nil {
 			return expr.captured.value, nil
@@ -303,8 +314,20 @@ func evalList(list listNode, env *environment) (value, error) {
 		case "cond":
 			result, err := evalCond(list.elements[1:], env)
 			return result, withErrorPos(err, list.pos)
+		case "case":
+			result, err := evalCase(list.elements[1:], env)
+			return result, withErrorPos(err, list.pos)
 		case "let":
 			result, err := evalLet(list.elements[1:], env)
+			return result, withErrorPos(err, list.pos)
+		case "letrec":
+			result, err := evalLetrec(list.elements[1:], env, false)
+			return result, withErrorPos(err, list.pos)
+		case "letrec*":
+			result, err := evalLetrec(list.elements[1:], env, true)
+			return result, withErrorPos(err, list.pos)
+		case "do":
+			result, err := evalDo(list.elements[1:], env)
 			return result, withErrorPos(err, list.pos)
 		}
 	}
@@ -427,8 +450,8 @@ func evalSet(args []node, env *environment) (value, error) {
 }
 
 func evalIf(args []node, env *environment) (value, error) {
-	if len(args) != 3 {
-		return nil, &EvalError{Message: "if expects exactly 3 arguments"}
+	if len(args) != 2 && len(args) != 3 {
+		return nil, &EvalError{Message: "if expects 2 or 3 arguments"}
 	}
 
 	condition, err := eval(args[0], env)
@@ -437,6 +460,9 @@ func evalIf(args []node, env *environment) (value, error) {
 	}
 	if isTruthy(condition) {
 		return eval(args[1], env)
+	}
+	if len(args) == 2 {
+		return voidValue{}, nil
 	}
 	return eval(args[2], env)
 }
@@ -1760,6 +1786,16 @@ func datumFromNode(expr node) (value, error) {
 		return expr, nil
 	case symbolNode:
 		return symbolValue(expr.name), nil
+	case vectorNode:
+		elements := make([]value, len(expr.elements))
+		for i, element := range expr.elements {
+			datum, err := datumFromNode(element)
+			if err != nil {
+				return nil, err
+			}
+			elements[i] = datum
+		}
+		return &vectorValue{elements: elements}, nil
 	case listNode:
 		elements := make([]value, len(expr.elements))
 		for i, element := range expr.elements {
@@ -1794,6 +1830,16 @@ func formatValue(v value) (string, error) {
 		return string(v), nil
 	case charValue:
 		return formatChar(v), nil
+	case *vectorValue:
+		parts := make([]string, len(v.elements))
+		for i, element := range v.elements {
+			formatted, err := formatValue(element)
+			if err != nil {
+				return "", err
+			}
+			parts[i] = formatted
+		}
+		return "#(" + strings.Join(parts, " ") + ")", nil
 	case *recordValue:
 		return "#<record " + v.recordType.name + ">", nil
 	case builtinProc, *closureValue, *caseClosureValue:
@@ -2010,6 +2056,9 @@ func eqValues(left, right value) bool {
 	case listValue:
 		right, ok := right.(listValue)
 		return ok && len(left.elements) == 0 && len(right.elements) == 0
+	case *vectorValue:
+		right, ok := right.(*vectorValue)
+		return ok && left == right
 	case *pairValue:
 		right, ok := right.(*pairValue)
 		return ok && left == right
@@ -2069,8 +2118,14 @@ func equalValues(left, right value) bool {
 		right, ok := right.(booleanValue)
 		return ok && left == right
 	case stringValue:
-		right, ok := right.(stringValue)
-		return ok && left == right
+		switch right := right.(type) {
+		case stringValue:
+			return left == right
+		case *mutableStringValue:
+			return string(left) == string(right.runes)
+		default:
+			return false
+		}
 	case symbolValue:
 		right, ok := right.(symbolValue)
 		return ok && left == right
@@ -2078,10 +2133,27 @@ func equalValues(left, right value) bool {
 		right, ok := right.(charValue)
 		return ok && left == right
 	case *mutableStringValue:
-		right, ok := right.(*mutableStringValue)
-		return ok && string(left.runes) == string(right.runes)
+		switch right := right.(type) {
+		case stringValue:
+			return string(left.runes) == string(right)
+		case *mutableStringValue:
+			return string(left.runes) == string(right.runes)
+		default:
+			return false
+		}
 	case listValue:
 		right, ok := right.(listValue)
+		if !ok || len(left.elements) != len(right.elements) {
+			return false
+		}
+		for i, element := range left.elements {
+			if !equalValues(element, right.elements[i]) {
+				return false
+			}
+		}
+		return true
+	case *vectorValue:
+		right, ok := right.(*vectorValue)
 		if !ok || len(left.elements) != len(right.elements) {
 			return false
 		}
@@ -2116,6 +2188,8 @@ func symbolName(expr node) (string, bool) {
 func nodePos(expr node) sourcePos {
 	switch expr := expr.(type) {
 	case listNode:
+		return expr.pos
+	case vectorNode:
 		return expr.pos
 	case symbolNode:
 		return expr.pos
@@ -2160,6 +2234,11 @@ func (p *parser) parseExpr() (node, error) {
 		return p.parseString()
 	case ')':
 		return nil, errorAt(p.currentPos(), "unexpected )")
+	case '#':
+		if p.hasPrefix("#(") {
+			return p.parseVector()
+		}
+		return p.parseAtom()
 	default:
 		return p.parseAtom()
 	}
