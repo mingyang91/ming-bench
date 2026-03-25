@@ -100,3 +100,5 @@ private[ming] class CekState:
   var appPosExpr: Expr                   = null
   var windStack: List[WindEntry]         = Nil
   var exnHandlers: List[ExnHandlerEntry] = Nil
+  var stepLimit: Int                     = -1
+  var stepCount: Int                     = 0

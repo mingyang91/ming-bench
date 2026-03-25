@@ -12,6 +12,11 @@ object CekMachine:
     else if exprs.length == 1 then run(exprs.head, env, HaltK)
     else run(exprs.head, env, SeqK(exprs.tail, env, HaltK))
 
+  def evalBodyWithLimit(exprs: List[Expr], env: Env, maxSteps: Int): Expr =
+    if exprs.isEmpty then Expr.Bool(false)
+    else if exprs.length == 1 then runWithLimit(exprs.head, env, HaltK, maxSteps)
+    else runWithLimit(exprs.head, env, SeqK(exprs.tail, env, HaltK), maxSteps)
+
   private def stepEval(s: CekState): Unit =
     val curExpr = s.expr
     val curEnv  = s.env
@@ -246,6 +251,35 @@ object CekMachine:
     while true do
       try
         if s.evaluating then
+          posExpr = s.expr
+          stepEval(s)
+        else
+          val result = stepKont(s)
+          if result != null then return result
+      catch
+        case e: EvalError if !e.getMessage.matches(".*\\d+:\\d+.*") =>
+          val pe =
+            if s.evaluating && posExpr != null && posExpr.line > 0 then posExpr
+            else if s.appPosExpr != null && s.appPosExpr.line > 0 then s.appPosExpr
+            else null
+          if pe != null then throw EvalError(s"${pe.line}:${pe.col}: ${e.getMessage}")
+          else throw e
+    throw RuntimeException("unreachable")
+
+  private def runWithLimit(expr0: Expr, env0: Env, k0: Kont, maxSteps: Int): Expr =
+    val s = new CekState
+    s.expr = expr0
+    s.env = env0
+    s.k = k0
+    s.evaluating = true
+    s.stepLimit = maxSteps
+    var posExpr: Expr = null
+
+    while true do
+      try
+        if s.evaluating then
+          s.stepCount += 1
+          if s.stepCount > s.stepLimit then throw EvalError("step limit exceeded")
           posExpr = s.expr
           stepEval(s)
         else

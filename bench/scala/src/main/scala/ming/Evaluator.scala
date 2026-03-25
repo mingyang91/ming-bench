@@ -194,3 +194,10 @@ object Evaluator:
   def evalStr(input: String): String = SchemeEntry.evalStr(input)
 
   def evalStrWithOutput(input: String): (String, String) = SchemeEntry.evalStrWithOutput(input)
+
+  def evalStrWithLimit(input: String, maxSteps: Int): String =
+    val parser = SchemeParser(input)
+    val exprs  = parser.parseAll()
+    if exprs.isEmpty then throw EvalError("no expressions")
+    val env = BuiltinRegistry.makeTopLevelEnv()
+    Display.display(CekMachine.evalBodyWithLimit(exprs, env, maxSteps))
