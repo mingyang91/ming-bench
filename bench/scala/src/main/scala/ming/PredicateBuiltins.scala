@@ -8,6 +8,10 @@ private[ming] object PredicateBuiltins extends BuiltinSupport:
     "equal?" -> Value.Builtin("equal?", equal),
     "null?"  -> predicate("null?", _ == Value.EmptyList),
     "list?"  -> predicate("list?", Value.isProperList),
+    "procedure?" -> predicate(
+      "procedure?",
+      Value.isCallable
+    ),
     "string?" -> predicate(
       "string?",
       {

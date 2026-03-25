@@ -62,6 +62,7 @@ private[ming] object MacroSupport:
   val syntaxKeywords = Set(
     "and",
     "begin",
+    "case-lambda",
     "cond",
     "define",
     "define-record-type",

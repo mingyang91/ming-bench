@@ -26,6 +26,9 @@ private[ming] object MacroInstantiation:
           if body.nonEmpty =>
         instantiateLambda(lambdaPos, params, paramsPos, body, pos, bindings, macroDef, macros, scope, repetitionIndex)
 
+      case Expr.ListExpr(Expr.Symbol("case-lambda", caseLambdaPos) :: clauses, pos) =>
+        instantiateCaseLambda(caseLambdaPos, clauses, pos, bindings, macroDef, macros, scope, repetitionIndex)
+
       case Expr.ListExpr(Expr.Symbol("let", letPos) :: Expr.ListExpr(letBindings, bindingsPos) :: body, pos)
           if body.nonEmpty =>
         instantiateLet(letPos, letBindings, bindingsPos, body, pos, bindings, macroDef, macros, scope, repetitionIndex)
@@ -58,6 +61,37 @@ private[ming] object MacroInstantiation:
 
     Expr.ListExpr(
       Expr.Symbol("lambda", lambdaPos) :: Expr.ListExpr(expandedParams, paramsPos) :: expandedBody,
+      pos
+    )
+
+  private def instantiateCaseLambda(
+    caseLambdaPos: SourcePos,
+    clauses: List[Expr],
+    pos: SourcePos,
+    bindings: MatchBindings,
+    macroDef: SyntaxMacro,
+    macros: MacroState,
+    scope: Map[String, String],
+    repetitionIndex: Option[Int]
+  ): Expr =
+    val expandedClauses = clauses.map {
+      case Expr.ListExpr(Expr.ListExpr(params, paramsPos) :: body, clausePos) if body.nonEmpty =>
+        val (expandedParams, paramScope) =
+          instantiateBinderList(params, bindings, macroDef, macros, scope, repetitionIndex)
+
+        val clauseScope = scope ++ paramScope
+        val expandedBody = body.map { expr =>
+          instantiate(expr, bindings, macroDef, macros, clauseScope, repetitionIndex)
+        }
+
+        Expr.ListExpr(Expr.ListExpr(expandedParams, paramsPos) :: expandedBody, clausePos)
+
+      case other =>
+        instantiate(other, bindings, macroDef, macros, scope, repetitionIndex)
+    }
+
+    Expr.ListExpr(
+      Expr.Symbol("case-lambda", caseLambdaPos) :: expandedClauses,
       pos
     )
 

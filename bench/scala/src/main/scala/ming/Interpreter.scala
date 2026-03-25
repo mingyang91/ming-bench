@@ -69,6 +69,9 @@ private[ming] object Interpreter:
       case Expr.ListExpr(Expr.Symbol("lambda", _) :: args, pos) =>
         evalLambda(args, env, pos)
 
+      case Expr.ListExpr(Expr.Symbol("case-lambda", _) :: args, pos) =>
+        evalCaseLambda(args, env, pos)
+
       case Expr.ListExpr(Expr.Symbol("begin", _) :: args, _) =>
         evalBegin(args, env, macros)
 
@@ -140,6 +143,23 @@ private[ming] object Interpreter:
 
       case _ =>
         throw EvalError.at(pos, "lambda expects a parameter list and body")
+
+  private def evalCaseLambda(args: List[Expr], env: Env, pos: SourcePos): Value =
+    if args.isEmpty then throw EvalError.at(pos, "case-lambda expects at least 1 clause")
+
+    val clauses = args.map {
+      case Expr.ListExpr(Expr.ListExpr(params, paramsPos) :: body, _) if body.nonEmpty =>
+        val (fixedParams, restParam) = parseParameters(params, paramsPos)
+        ProcedureClause(fixedParams, restParam, body)
+
+      case Expr.ListExpr(_, clausePos) =>
+        throw EvalError.at(clausePos, "case-lambda clause expects a parameter list and body")
+
+      case other =>
+        throw EvalError.at(MacroSupport.exprPos(other), "case-lambda clauses must be lists")
+    }
+
+    Value.CaseClosure(clauses, env)
 
   private def evalBegin(args: List[Expr], env: Env, macros: MacroState): Value =
     evalSequence(args, env, macros)
@@ -275,20 +295,39 @@ private[ming] object Interpreter:
         fn(args, pos)
 
       case Value.Closure(params, restParam, body, closureEnv) =>
-        restParam match
+        applyClosure(params, restParam, body, closureEnv, args, pos, macros)
+
+      case Value.CaseClosure(clauses, closureEnv) =>
+        clauses.find(_.matchesArity(args.length)) match
+          case Some(ProcedureClause(params, restParam, body)) =>
+            applyClosure(params, restParam, body, closureEnv, args, pos, macros)
+
           case None =>
-            if params.length != args.length then
-              throw EvalError.at(pos, s"expected ${params.length} arguments, got ${args.length}")
-
-            evalSequence(body, closureEnv.extend(params, args), macros)
-
-          case Some(restName) =>
-            if args.length < params.length then
-              throw EvalError.at(pos, s"expected at least ${params.length} arguments, got ${args.length}")
-
-            val fixedArgs = args.take(params.length)
-            val restArgs  = Value.list(args.drop(params.length))
-            evalSequence(body, closureEnv.extend(params :+ restName, fixedArgs :+ restArgs), macros)
+            throw EvalError.at(pos, s"case-lambda has no matching clause for ${args.length} arguments")
 
       case other =>
         throw EvalError.at(pos, s"attempted to call a ${other.typeName} value")
+
+  private def applyClosure(
+    params: List[String],
+    restParam: Option[String],
+    body: List[Expr],
+    closureEnv: Env,
+    args: List[Value],
+    pos: SourcePos,
+    macros: MacroState
+  ): Value =
+    restParam match
+      case None =>
+        if params.length != args.length then
+          throw EvalError.at(pos, s"expected ${params.length} arguments, got ${args.length}")
+
+        evalSequence(body, closureEnv.extend(params, args), macros)
+
+      case Some(restName) =>
+        if args.length < params.length then
+          throw EvalError.at(pos, s"expected at least ${params.length} arguments, got ${args.length}")
+
+        val fixedArgs = args.take(params.length)
+        val restArgs  = Value.list(args.drop(params.length))
+        evalSequence(body, closureEnv.extend(params :+ restName, fixedArgs :+ restArgs), macros)

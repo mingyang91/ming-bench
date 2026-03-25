@@ -13,6 +13,17 @@ private[ming] enum Expr:
   case Symbol(name: String, pos: SourcePos)
   case ListExpr(items: List[Expr], pos: SourcePos)
 
+final private[ming] case class ProcedureClause(
+  params: List[String],
+  restParam: Option[String],
+  body: List[Expr]
+):
+
+  def matchesArity(argCount: Int): Boolean =
+    restParam match
+      case None    => params.length == argCount
+      case Some(_) => argCount >= params.length
+
 private[ming] enum Value:
 
   case IntVal(value: BigInt)
@@ -26,6 +37,7 @@ private[ming] enum Value:
   case PairVal(car: Value, cdr: Value)
   case RecordVal(recordType: RecordType, fields: Array[Value])
   case Closure(params: List[String], restParam: Option[String], body: List[Expr], env: Env)
+  case CaseClosure(clauses: List[ProcedureClause], env: Env)
   case Builtin(name: String, fn: (List[Value], SourcePos) => Value)
   case VoidVal
 
@@ -70,6 +82,9 @@ private[ming] enum Value:
       case Value.Closure(_, _, _, _) =>
         "procedure"
 
+      case Value.CaseClosure(_, _) =>
+        "procedure"
+
       case Value.Builtin(_, _) =>
         "procedure"
 
@@ -85,6 +100,13 @@ private[ming] object Value:
 
       case _ =>
         true
+
+  def isCallable(value: Value): Boolean =
+    value match
+      case Value.Closure(_, _, _, _) => true
+      case Value.CaseClosure(_, _)   => true
+      case Value.Builtin(_, _)       => true
+      case _                         => false
 
   def isProperList(value: Value): Boolean =
     @tailrec
@@ -195,6 +217,9 @@ private[ming] object Value:
         s"#<record:${recordType.displayName}>"
 
       case Value.Closure(_, _, _, _) =>
+        "#<procedure>"
+
+      case Value.CaseClosure(_, _) =>
         "#<procedure>"
 
       case Value.Builtin(name, _) =>

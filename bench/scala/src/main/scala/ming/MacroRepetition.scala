@@ -59,6 +59,19 @@ private[ming] object MacroRepetition:
           acc ++ collectRepeatedNames(expr, bindings, shadowedNames ++ introduced, repetitionIndex)
         }
 
+      case Expr.ListExpr(Expr.Symbol("case-lambda", _) :: clauses, _) =>
+        clauses.foldLeft(Set.empty[String]) { (acc, clause) =>
+          acc ++ (clause match
+            case Expr.ListExpr(Expr.ListExpr(params, _) :: body, _) if body.nonEmpty =>
+              val introduced = binderNames(params, bindings, repetitionIndex)
+              body.foldLeft(Set.empty[String]) { (bodyAcc, expr) =>
+                bodyAcc ++ collectRepeatedNames(expr, bindings, shadowedNames ++ introduced, repetitionIndex)
+              }
+
+            case other =>
+              collectRepeatedNames(other, bindings, shadowedNames, repetitionIndex))
+        }
+
       case Expr.ListExpr(Expr.Symbol("let", _) :: Expr.ListExpr(letBindings, _) :: body, _) if body.nonEmpty =>
         val introduced = letBindings.flatMap {
           case Expr.ListExpr(nameExpr :: _ :: Nil, _) =>
