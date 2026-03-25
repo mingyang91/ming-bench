@@ -9,11 +9,12 @@ import java.util.Map;
 public class Evaluator {
 
     // ── Value types ──────────────────────────────────────────────
-    private sealed interface Val permits Val.Int, Val.Bool, Val.Str, Val.Sym, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda {
+    private sealed interface Val permits Val.Int, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda {
         record Int(long value) implements Val {}
         record Bool(boolean value) implements Val {}
         record Str(String value) implements Val {}
         record Sym(String name) implements Val {}
+        record Chr(char value) implements Val {}
         record PairV(Val car, Val cdr) implements Val {}
         record Nil() implements Val {}
         record Void() implements Val {}
@@ -64,33 +65,64 @@ public class Evaluator {
         }
     }
 
-    // ── Display ──────────────────────────────────────────────────
-    private static String display(Val v) {
+    // ── Output capture ──────────────────────────────────────────
+    private StringBuilder output = new StringBuilder();
+
+    // ── Write representation (with quotes) ──────────────────────
+    private static String writeVal(Val v) {
         return switch (v) {
             case Val.Int i -> String.valueOf(i.value());
             case Val.Bool b -> b.value() ? "#t" : "#f";
             case Val.Str s -> "\"" + s.value() + "\"";
             case Val.Sym s -> s.name();
+            case Val.Chr c -> "#\\" + c.value();
             case Val.Nil ignored -> "()";
             case Val.Void ignored -> "#<void>";
-            case Val.PairV p -> displayPair(p);
+            case Val.PairV p -> writePair(p);
             case Val.Builtin b -> "#<procedure:" + b.name() + ">";
             case Val.Lambda ignored -> "#<procedure>";
         };
     }
 
-    private static String displayPair(Val.PairV p) {
+    private static String writePair(Val.PairV p) {
         StringBuilder sb = new StringBuilder("(");
         Val cur = p;
         boolean first = true;
         while (cur instanceof Val.PairV pair) {
             if (!first) sb.append(' ');
             first = false;
-            sb.append(display(pair.car()));
+            sb.append(writeVal(pair.car()));
             cur = pair.cdr();
         }
         if (!(cur instanceof Val.Nil)) {
-            sb.append(" . ").append(display(cur));
+            sb.append(" . ").append(writeVal(cur));
+        }
+        sb.append(')');
+        return sb.toString();
+    }
+
+    // ── Display representation (no quotes on strings) ───────────
+    private static String displayVal(Val v) {
+        return switch (v) {
+            case Val.Str s -> s.value();
+            case Val.Chr c -> String.valueOf(c.value());
+            case Val.PairV p -> displayPairVal(p);
+            default -> writeVal(v);
+        };
+    }
+
+    private static String displayPairVal(Val.PairV p) {
+        StringBuilder sb = new StringBuilder("(");
+        Val cur = p;
+        boolean first = true;
+        while (cur instanceof Val.PairV pair) {
+            if (!first) sb.append(' ');
+            first = false;
+            sb.append(displayVal(pair.car()));
+            cur = pair.cdr();
+        }
+        if (!(cur instanceof Val.Nil)) {
+            sb.append(" . ").append(displayVal(cur));
         }
         sb.append(')');
         return sb.toString();
@@ -188,7 +220,25 @@ public class Evaluator {
     private Val parseAtom(String tok) {
         if (tok.equals("#t")) return new Val.Bool(true);
         if (tok.equals("#f")) return new Val.Bool(false);
-        if (tok.startsWith("\"")) return new Val.Str(tok.substring(1, tok.length() - 1));
+        if (tok.startsWith("\"")) {
+            String raw = tok.substring(1, tok.length() - 1);
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < raw.length(); i++) {
+                if (raw.charAt(i) == '\\' && i + 1 < raw.length()) {
+                    char next = raw.charAt(++i);
+                    switch (next) {
+                        case 'n' -> sb.append('\n');
+                        case 't' -> sb.append('\t');
+                        case '\\' -> sb.append('\\');
+                        case '"' -> sb.append('"');
+                        default -> { sb.append('\\'); sb.append(next); }
+                    }
+                } else {
+                    sb.append(raw.charAt(i));
+                }
+            }
+            return new Val.Str(sb.toString());
+        }
         try {
             return new Val.Int(Long.parseLong(tok));
         } catch (NumberFormatException e) {
@@ -204,6 +254,7 @@ public class Evaluator {
             case Val.Str s -> s;
             case Val.Nil n -> n;
             case Val.Void v -> v;
+            case Val.Chr c -> c;
             case Val.Builtin b -> b;
             case Val.Lambda l -> l;
             case Val.Sym sym -> {
@@ -268,7 +319,7 @@ public class Evaluator {
             }
             return evalBody(lambda.body(), callEnv);
         }
-        throw posError(callSite, "not a procedure: " + display(fn));
+        throw posError(callSite, "not a procedure: " + writeVal(fn));
     }
 
     private Val evalIf(Val args, Env env, Val form) throws EvalError {
@@ -453,7 +504,7 @@ public class Evaluator {
     // ── Builtins ────────────────────────────────────────────────
     private static long asInt(Val v) {
         if (v instanceof Val.Int i) return i.value();
-        throw new RuntimeException("expected integer, got: " + display(v));
+        throw new RuntimeException("expected integer, got: " + writeVal(v));
     }
 
     private static void checkArgCount(List<Val> args, int expected, String name) {
@@ -581,12 +632,83 @@ public class Evaluator {
             checkArgCount(args, 1, "symbol?");
             return new Val.Bool(args.get(0) instanceof Val.Sym);
         }));
+        // L05 — display, write, newline
+        env.define("display", new Val.Builtin("display", args -> {
+            checkArgCount(args, 1, "display");
+            output.append(displayVal(args.get(0)));
+            return new Val.Void();
+        }));
+        env.define("write", new Val.Builtin("write", args -> {
+            checkArgCount(args, 1, "write");
+            output.append(writeVal(args.get(0)));
+            return new Val.Void();
+        }));
+        env.define("newline", new Val.Builtin("newline", args -> {
+            checkArgCount(args, 0, "newline");
+            output.append("\n");
+            return new Val.Void();
+        }));
+        // L05 — string operations
+        env.define("string-append", new Val.Builtin("string-append", args -> {
+            StringBuilder sb = new StringBuilder();
+            for (Val a : args) {
+                if (!(a instanceof Val.Str s)) throw new RuntimeException("string-append: not a string: " + writeVal(a));
+                sb.append(s.value());
+            }
+            return new Val.Str(sb.toString());
+        }));
+        env.define("string-length", new Val.Builtin("string-length", args -> {
+            checkArgCount(args, 1, "string-length");
+            if (!(args.get(0) instanceof Val.Str s)) throw new RuntimeException("string-length: not a string");
+            return new Val.Int(s.value().length());
+        }));
+        env.define("substring", new Val.Builtin("substring", args -> {
+            checkArgCount(args, 3, "substring");
+            if (!(args.get(0) instanceof Val.Str s)) throw new RuntimeException("substring: not a string");
+            int start = (int) asInt(args.get(1));
+            int end = (int) asInt(args.get(2));
+            return new Val.Str(s.value().substring(start, end));
+        }));
+        env.define("string->number", new Val.Builtin("string->number", args -> {
+            checkArgCount(args, 1, "string->number");
+            if (!(args.get(0) instanceof Val.Str s)) throw new RuntimeException("string->number: not a string");
+            try {
+                return new Val.Int(Long.parseLong(s.value()));
+            } catch (NumberFormatException e) {
+                return new Val.Bool(false);
+            }
+        }));
+        env.define("number->string", new Val.Builtin("number->string", args -> {
+            checkArgCount(args, 1, "number->string");
+            return new Val.Str(String.valueOf(asInt(args.get(0))));
+        }));
+        env.define("symbol->string", new Val.Builtin("symbol->string", args -> {
+            checkArgCount(args, 1, "symbol->string");
+            if (!(args.get(0) instanceof Val.Sym s)) throw new RuntimeException("symbol->string: not a symbol");
+            return new Val.Str(s.name());
+        }));
+        env.define("string->symbol", new Val.Builtin("string->symbol", args -> {
+            checkArgCount(args, 1, "string->symbol");
+            if (!(args.get(0) instanceof Val.Str s)) throw new RuntimeException("string->symbol: not a string");
+            return new Val.Sym(s.value());
+        }));
+        env.define("string-ref", new Val.Builtin("string-ref", args -> {
+            checkArgCount(args, 2, "string-ref");
+            if (!(args.get(0) instanceof Val.Str s)) throw new RuntimeException("string-ref: not a string");
+            int idx = (int) asInt(args.get(1));
+            return new Val.Chr(s.value().charAt(idx));
+        }));
+        env.define("char?", new Val.Builtin("char?", args -> {
+            checkArgCount(args, 1, "char?");
+            return new Val.Bool(args.get(0) instanceof Val.Chr);
+        }));
         return env;
     }
 
     // ── Public API ───────────────────────────────────────────────
     public String evalStr(String input) throws EvalError {
         positions.clear();
+        output = new StringBuilder();
         List<Token> tokens = tokenize(input);
         if (tokens.isEmpty()) throw new EvalError("empty input");
         int[] idx = {0};
@@ -597,11 +719,22 @@ public class Evaluator {
             result = eval(result, env);
         }
         if (result instanceof Val.Void) return "#<void>";
-        return display(result);
+        return writeVal(result);
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        String result = evalStr(input);
-        return new EvalResult(result, "");
+        positions.clear();
+        output = new StringBuilder();
+        List<Token> tokens = tokenize(input);
+        if (tokens.isEmpty()) throw new EvalError("empty input");
+        int[] idx = {0};
+        Env env = createGlobalEnv();
+        Val result = null;
+        while (idx[0] < tokens.size()) {
+            result = parse(tokens, idx);
+            result = eval(result, env);
+        }
+        String resultStr = (result instanceof Val.Void) ? "#<void>" : writeVal(result);
+        return new EvalResult(resultStr, output.toString());
     }
 }
