@@ -156,14 +156,19 @@ func parseSyntaxRules(keyword string, expr node, env *environment) (*syntaxRules
 }
 
 func (e *environment) defineMacro(name string, macro *syntaxRulesMacro) {
+	if e.macros == nil {
+		e.macros = map[string]*syntaxRulesMacro{}
+	}
 	e.macros[name] = macro
 }
 
 func (e *environment) lookupMacro(name string) (*syntaxRulesMacro, bool) {
 	for current := e; current != nil; current = current.parent {
-		transformer, ok := current.macros[name]
-		if ok {
-			return transformer, true
+		if current.macros != nil {
+			transformer, ok := current.macros[name]
+			if ok {
+				return transformer, true
+			}
 		}
 	}
 	return nil, false

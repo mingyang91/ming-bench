@@ -4,11 +4,22 @@ type continuation interface{}
 
 type continuationValue struct {
 	cont continuation
+	wind *windFrame
 }
 
 type callCCProcValue struct{}
 
 var callCCBuiltin = &callCCProcValue{}
+
+type dynamicWindProcValue struct{}
+
+var dynamicWindBuiltin = &dynamicWindProcValue{}
+
+type windFrame struct {
+	inProc  value
+	outProc value
+	parent  *windFrame
+}
 
 type sequenceCont struct {
 	rest []node
@@ -117,11 +128,40 @@ type letrecValueCont struct {
 	next       continuation
 }
 
+type dynamicWindAfterInCont struct {
+	frame    *windFrame
+	bodyProc value
+	pos      sourcePos
+	next     continuation
+}
+
+type dynamicWindAfterBodyCont struct {
+	frame *windFrame
+	pos   sourcePos
+	next  continuation
+}
+
+type dynamicWindAfterOutCont struct {
+	result value
+	next   continuation
+}
+
+type windTransitionCont struct {
+	leave      []*windFrame
+	enter      []*windFrame
+	setWind    *windFrame
+	value      value
+	targetCont continuation
+	targetWind *windFrame
+	pos        sourcePos
+}
+
 type evalMachine struct {
 	expr node
 	env  *environment
 	val  value
 	cont continuation
+	wind *windFrame
 	eval bool
 }
 
@@ -180,12 +220,20 @@ func (m *evalMachine) setValue(val value, cont continuation) {
 }
 
 func (m *evalMachine) stepEval() error {
-	expanded, err := expandMacros(m.expr, m.env)
-	if err != nil {
-		return err
+	switch expr := m.expr.(type) {
+	case listNode:
+		expanded, err := expandMacros(expr, m.env)
+		if err != nil {
+			return err
+		}
+		return m.stepEvalExpanded(expanded)
+	default:
+		return m.stepEvalExpanded(expr)
 	}
+}
 
-	switch expr := expanded.(type) {
+func (m *evalMachine) stepEvalExpanded(expr node) error {
+	switch expr := expr.(type) {
 	case integerValue, rationalValue, inexactValue, booleanValue, stringValue, charValue:
 		m.setValue(expr, m.cont)
 		return nil
@@ -476,6 +524,28 @@ func (m *evalMachine) stepContinue() error {
 			cell.value = values[i]
 		}
 		return m.startSequence(cont.body, cont.letEnv, cont.next)
+	case *dynamicWindAfterInCont:
+		m.wind = cont.frame
+		return m.enterProcedure(cont.bodyProc, nil, cont.pos, &dynamicWindAfterBodyCont{
+			frame: cont.frame,
+			pos:   cont.pos,
+			next:  cont.next,
+		})
+	case *dynamicWindAfterBodyCont:
+		result := m.val
+		m.wind = cont.frame.parent
+		return m.enterProcedure(cont.frame.outProc, nil, cont.pos, &dynamicWindAfterOutCont{
+			result: result,
+			next:   cont.next,
+		})
+	case *dynamicWindAfterOutCont:
+		m.setValue(cont.result, cont.next)
+		return nil
+	case *windTransitionCont:
+		if cont.setWind != nil {
+			m.wind = cont.setWind
+		}
+		return m.startWindTransition(cont.leave, cont.enter, cont.value, cont.targetCont, cont.targetWind, cont.pos)
 	default:
 		return &EvalError{Message: "invalid continuation"}
 	}
@@ -829,7 +899,7 @@ func (m *evalMachine) startLetrec(args []node, env *environment, pos sourcePos, 
 	cells := make([]*binding, len(specs))
 	for i, spec := range specs {
 		cell := &binding{value: voidValue{}}
-		letEnv.values[spec.name] = cell
+		letEnv.defineBinding(spec.name, cell)
 		cells[i] = cell
 	}
 
@@ -845,6 +915,57 @@ func (m *evalMachine) startLetrec(args []node, env *environment, pos sourcePos, 
 		body:       args[1:],
 		next:       next,
 	})
+	return nil
+}
+
+func (m *evalMachine) startDynamicWind(inProc value, bodyProc value, outProc value, pos sourcePos, next continuation) error {
+	frame := &windFrame{
+		inProc:  inProc,
+		outProc: outProc,
+		parent:  m.wind,
+	}
+	return m.enterProcedure(inProc, nil, pos, &dynamicWindAfterInCont{
+		frame:    frame,
+		bodyProc: bodyProc,
+		pos:      pos,
+		next:     next,
+	})
+}
+
+func (m *evalMachine) resumeContinuation(val value, targetCont continuation, targetWind *windFrame, pos sourcePos) error {
+	leave, enter := diffWindFrames(m.wind, targetWind)
+	return m.startWindTransition(leave, enter, val, targetCont, targetWind, pos)
+}
+
+func (m *evalMachine) startWindTransition(leave []*windFrame, enter []*windFrame, val value, targetCont continuation, targetWind *windFrame, pos sourcePos) error {
+	if len(leave) > 0 {
+		frame := leave[0]
+		m.wind = frame.parent
+		return m.enterProcedure(frame.outProc, nil, pos, &windTransitionCont{
+			leave:      leave[1:],
+			enter:      enter,
+			value:      val,
+			targetCont: targetCont,
+			targetWind: targetWind,
+			pos:        pos,
+		})
+	}
+
+	if len(enter) > 0 {
+		frame := enter[0]
+		return m.enterProcedure(frame.inProc, nil, pos, &windTransitionCont{
+			leave:      leave,
+			enter:      enter[1:],
+			setWind:    frame,
+			value:      val,
+			targetCont: targetCont,
+			targetWind: targetWind,
+			pos:        pos,
+		})
+	}
+
+	m.wind = targetWind
+	m.setValue(val, targetCont)
 	return nil
 }
 
@@ -870,13 +991,20 @@ func (m *evalMachine) enterProcedure(proc value, args []value, pos sourcePos, ne
 		if len(args) != 1 {
 			return errorAt(pos, "continuation expects exactly 1 argument")
 		}
-		m.setValue(args[0], proc.cont)
-		return nil
+		return m.resumeContinuation(args[0], proc.cont, proc.wind, pos)
 	case *callCCProcValue:
 		if len(args) != 1 {
 			return errorAt(pos, "call/cc expects exactly 1 argument")
 		}
-		return m.enterProcedure(args[0], []value{&continuationValue{cont: next}}, pos, next)
+		return m.enterProcedure(args[0], []value{&continuationValue{cont: next, wind: m.wind}}, pos, next)
+	case *dynamicWindProcValue:
+		if len(args) != 3 {
+			return errorAt(pos, "dynamic-wind expects exactly 3 arguments")
+		}
+		if !isProcedureValue(args[0]) || !isProcedureValue(args[1]) || !isProcedureValue(args[2]) {
+			return errorAt(pos, "dynamic-wind expects 3 procedures")
+		}
+		return m.startDynamicWind(args[0], args[1], args[2], pos, next)
 	default:
 		return errorAt(pos, "not a procedure")
 	}
@@ -912,6 +1040,38 @@ func reverseValues(values []value) []value {
 	result := make([]value, len(values))
 	for i, value := range values {
 		result[len(values)-1-i] = value
+	}
+	return result
+}
+
+func diffWindFrames(current *windFrame, target *windFrame) ([]*windFrame, []*windFrame) {
+	currentFrames := collectWindFrames(current)
+	targetFrames := collectWindFrames(target)
+
+	i := len(currentFrames) - 1
+	j := len(targetFrames) - 1
+	for i >= 0 && j >= 0 && currentFrames[i] == targetFrames[j] {
+		i--
+		j--
+	}
+
+	leave := currentFrames[:i+1]
+	enter := reverseWindFrames(targetFrames[:j+1])
+	return leave, enter
+}
+
+func collectWindFrames(frame *windFrame) []*windFrame {
+	var frames []*windFrame
+	for current := frame; current != nil; current = current.parent {
+		frames = append(frames, current)
+	}
+	return frames
+}
+
+func reverseWindFrames(frames []*windFrame) []*windFrame {
+	result := make([]*windFrame, len(frames))
+	for i, frame := range frames {
+		result[len(frames)-1-i] = frame
 	}
 	return result
 }

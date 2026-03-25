@@ -226,7 +226,7 @@ func evalLetrec(args []node, env *environment, sequential bool) (value, *evalSte
 	cells := make([]*binding, len(specs))
 	for i, spec := range specs {
 		cell := &binding{value: voidValue{}}
-		letEnv.values[spec.name] = cell
+		letEnv.defineBinding(spec.name, cell)
 		cells[i] = cell
 	}
 
@@ -288,7 +288,7 @@ func evalDo(args []node, env *environment) (value, error) {
 	cells := make([]*binding, len(bindings))
 	for i, spec := range bindings {
 		cell := &binding{value: initialValues[i]}
-		loopEnv.values[spec.name] = cell
+		loopEnv.defineBinding(spec.name, cell)
 		cells[i] = cell
 	}
 

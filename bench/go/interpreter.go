@@ -77,9 +77,12 @@ type binding struct {
 }
 
 type environment struct {
-	parent *environment
-	values map[string]*binding
-	macros map[string]*syntaxRulesMacro
+	parent      *environment
+	values      map[string]*binding
+	smallNames  [4]string
+	smallValues [4]*binding
+	smallCount  int
+	macros      map[string]*syntaxRulesMacro
 }
 
 func evalString(input string) (string, error) {
@@ -234,26 +237,63 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("char<?", builtinCharCompare("char<?"))
 	env.define("call/cc", callCCBuiltin)
 	env.define("call-with-current-continuation", callCCBuiltin)
+	env.define("dynamic-wind", dynamicWindBuiltin)
 	return env
 }
 
 func newEnvironment(parent *environment) *environment {
 	return &environment{
 		parent: parent,
-		values: map[string]*binding{},
-		macros: map[string]*syntaxRulesMacro{},
 	}
 }
 
 func (e *environment) define(name string, val value) {
-	e.values[name] = &binding{value: val}
+	e.defineBinding(name, &binding{value: val})
+}
+
+func (e *environment) defineBinding(name string, cell *binding) {
+	for i := 0; i < e.smallCount; i++ {
+		if e.smallNames[i] == name {
+			e.smallValues[i] = cell
+			return
+		}
+	}
+
+	if e.values != nil {
+		e.values[name] = cell
+		return
+	}
+
+	if e.smallCount < len(e.smallNames) {
+		e.smallNames[e.smallCount] = name
+		e.smallValues[e.smallCount] = cell
+		e.smallCount++
+		return
+	}
+
+	e.values = make(map[string]*binding, e.smallCount+1)
+	for i := 0; i < e.smallCount; i++ {
+		e.values[e.smallNames[i]] = e.smallValues[i]
+		e.smallNames[i] = ""
+		e.smallValues[i] = nil
+	}
+	e.smallCount = 0
+	e.values[name] = cell
 }
 
 func (e *environment) lookupBinding(name string) (*binding, bool) {
 	for current := e; current != nil; current = current.parent {
-		cell, ok := current.values[name]
-		if ok {
-			return cell, true
+		for i := 0; i < current.smallCount; i++ {
+			if current.smallNames[i] == name {
+				return current.smallValues[i], true
+			}
+		}
+
+		if current.values != nil {
+			cell, ok := current.values[name]
+			if ok {
+				return cell, true
+			}
 		}
 	}
 	return nil, false
@@ -2483,7 +2523,7 @@ func formatValue(v value) (string, error) {
 		return "#(" + strings.Join(parts, " ") + ")", nil
 	case *recordValue:
 		return "#<record " + v.recordType.name + ">", nil
-	case builtinProc, *closureValue, *caseClosureValue, *continuationValue, *callCCProcValue:
+	case builtinProc, *closureValue, *caseClosureValue, *continuationValue, *callCCProcValue, *dynamicWindProcValue:
 		return "#<procedure>", nil
 	case *pairValue:
 		return formatPair(v, formatValue)
@@ -2602,7 +2642,7 @@ func isPairValue(v value) bool {
 
 func isProcedureValue(v value) bool {
 	switch v.(type) {
-	case builtinProc, *closureValue, *caseClosureValue, *continuationValue, *callCCProcValue:
+	case builtinProc, *closureValue, *caseClosureValue, *continuationValue, *callCCProcValue, *dynamicWindProcValue:
 		return true
 	default:
 		return false
@@ -2713,6 +2753,9 @@ func eqValues(left, right value) bool {
 		return ok && left == right
 	case *callCCProcValue:
 		right, ok := right.(*callCCProcValue)
+		return ok && left == right
+	case *dynamicWindProcValue:
+		right, ok := right.(*dynamicWindProcValue)
 		return ok && left == right
 	case *recordValue:
 		right, ok := right.(*recordValue)
