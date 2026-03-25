@@ -15,6 +15,7 @@ private[ming] enum Value:
   case IntVal(value: BigInt)
   case BoolVal(value: Boolean)
   case StringVal(value: String)
+  case CharVal(value: Char)
   case SymbolVal(name: String)
   case EmptyList
   case PairVal(car: Value, cdr: Value)
@@ -23,33 +24,10 @@ private[ming] enum Value:
   case VoidVal
 
   def render: String =
-    this match
-      case Value.IntVal(value) =>
-        value.toString
+    Value.renderValue(this, displayMode = false)
 
-      case Value.BoolVal(value) =>
-        if value then "#t" else "#f"
-
-      case Value.StringVal(value) =>
-        "\"" + Value.escapeString(value) + "\""
-
-      case Value.SymbolVal(name) =>
-        name
-
-      case Value.EmptyList =>
-        "()"
-
-      case Value.PairVal(_, _) =>
-        Value.renderPair(this)
-
-      case Value.Closure(_, _, _) =>
-        "#<procedure>"
-
-      case Value.Builtin(name, _) =>
-        s"#<procedure:$name>"
-
-      case Value.VoidVal =>
-        "#<void>"
+  def renderDisplay: String =
+    Value.renderValue(this, displayMode = true)
 
   def typeName: String =
     this match
@@ -61,6 +39,9 @@ private[ming] enum Value:
 
       case Value.StringVal(_) =>
         "string"
+
+      case Value.CharVal(_) =>
+        "char"
 
       case Value.SymbolVal(_) =>
         "symbol"
@@ -113,6 +94,38 @@ private[ming] object Value:
     }
     builder.toString
 
+  def renderValue(value: Value, displayMode: Boolean): String =
+    value match
+      case Value.IntVal(number) =>
+        number.toString
+
+      case Value.BoolVal(boolean) =>
+        if boolean then "#t" else "#f"
+
+      case Value.StringVal(text) =>
+        if displayMode then text else "\"" + escapeString(text) + "\""
+
+      case Value.CharVal(ch) =>
+        if displayMode then ch.toString else renderChar(ch)
+
+      case Value.SymbolVal(name) =>
+        name
+
+      case Value.EmptyList =>
+        "()"
+
+      case Value.PairVal(_, _) =>
+        renderPair(value, displayMode)
+
+      case Value.Closure(_, _, _) =>
+        "#<procedure>"
+
+      case Value.Builtin(name, _) =>
+        s"#<procedure:$name>"
+
+      case Value.VoidVal =>
+        "#<void>"
+
   def fromQuotedExpr(expr: Expr): Value =
     expr match
       case Expr.IntAtom(value, _) =>
@@ -133,32 +146,47 @@ private[ming] object Value:
   def list(items: List[Value]): Value =
     items.foldRight[Value](Value.EmptyList)(Value.PairVal(_, _))
 
-  private def renderPair(value: Value): String =
+  private def renderChar(value: Char): String =
+    value match
+      case ' ' =>
+        "#\\space"
+
+      case '\n' =>
+        "#\\newline"
+
+      case other =>
+        s"#\\$other"
+
+  private def renderPair(value: Value, displayMode: Boolean): String =
     val builder = new StringBuilder
     builder.append('(')
-    appendPairContents(value, builder)
+    appendPairContents(value, builder, displayMode)
     builder.append(')')
     builder.toString
 
   @tailrec
-  private def appendPairContents(value: Value, builder: StringBuilder): Unit =
+  private def appendPairContents(
+    value: Value,
+    builder: StringBuilder,
+    displayMode: Boolean
+  ): Unit =
     value match
       case Value.PairVal(car, cdr) =>
-        builder.append(car.render)
+        builder.append(renderValue(car, displayMode))
         cdr match
           case Value.EmptyList =>
             ()
 
           case next @ Value.PairVal(_, _) =>
             builder.append(' ')
-            appendPairContents(next, builder)
+            appendPairContents(next, builder, displayMode)
 
           case other =>
             builder.append(" . ")
-            builder.append(other.render)
+            builder.append(renderValue(other, displayMode))
 
       case other =>
-        builder.append(other.render)
+        builder.append(renderValue(other, displayMode))
 
 final private[ming] case class SourcePos(line: Int, col: Int):
 

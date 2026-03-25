@@ -8,9 +8,10 @@ private[ming] object Interpreter:
     val expressions = SchemeParser.parseProgram(input)
     if expressions.isEmpty then throw new EvalError("1:1: expected expression")
 
-    val env    = Env.root(Builtins.globalEnv)
-    val result = evalSequence(expressions, env)
-    (result, "")
+    val runtime = RuntimeContext()
+    val env     = Env.root(Builtins.globalEnv(runtime))
+    val result  = evalSequence(expressions, env)
+    (result, runtime.capturedOutput)
 
   private def eval(expr: Expr, env: Env): Value =
     expr match
