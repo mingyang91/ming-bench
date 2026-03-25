@@ -1930,8 +1930,7 @@ fn apply_machine_value(
             apply_machine_value(args[0].clone(), vec![continuation], ctx, frames)
         }
         Procedure::Continuation(continuation) => {
-            expect_value_arity("continuation", &args, 1)?;
-            apply_machine_continuation(continuation, args[0].clone(), ctx, frames)
+            apply_machine_continuation(continuation, args, ctx, frames)
         }
     }
 }
@@ -2023,7 +2022,7 @@ fn apply_machine_call_with_values(
 
 fn apply_machine_continuation(
     continuation: &ContinuationProcedure,
-    value: Value,
+    args: Vec<Value>,
     ctx: &mut EvalContext,
     frames: &mut Vec<MachineFrame>,
 ) -> Result<MachineState, EvalError> {
@@ -2032,7 +2031,7 @@ fn apply_machine_continuation(
         steps,
         continuation.frames.clone(),
         continuation.wind_stack.clone(),
-        value,
+        pack_values(args),
         ctx,
         frames,
     )
