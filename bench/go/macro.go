@@ -42,7 +42,7 @@ var specialForms = map[string]bool{
 	"define": true, "if": true, "lambda": true, "begin": true,
 	"cond": true, "let": true, "set!": true, "quote": true,
 	"and": true, "or": true, "define-syntax": true, "syntax-rules": true,
-	"else": true,
+	"else": true, "syntax-case": true, "syntax": true, "with-syntax": true,
 }
 
 type patternBinding struct {
@@ -59,36 +59,42 @@ func evalDefineSyntax(e *ListExpr, env *Env) (Value, error) {
 	if !ok {
 		return nil, &EvalError{Message: "define-syntax: expected symbol"}
 	}
-	srExpr, ok := e.Items[2].(*ListExpr)
-	if !ok || len(srExpr.Items) < 3 {
-		return nil, &EvalError{Message: "define-syntax: expected syntax-rules"}
-	}
-	srSym, ok := srExpr.Items[0].(*SymbolExpr)
-	if !ok || srSym.Name != "syntax-rules" {
-		return nil, &EvalError{Message: "define-syntax: expected syntax-rules"}
-	}
-	litList, ok := srExpr.Items[1].(*ListExpr)
-	if !ok {
-		return nil, &EvalError{Message: "define-syntax: expected literals list"}
-	}
-	var literals []string
-	for _, l := range litList.Items {
-		ls, ok := l.(*SymbolExpr)
-		if !ok {
-			return nil, &EvalError{Message: "define-syntax: literal must be a symbol"}
+
+	// Check if it's (syntax-rules ...)
+	if srExpr, ok := e.Items[2].(*ListExpr); ok && len(srExpr.Items) >= 3 {
+		if srSym, ok := srExpr.Items[0].(*SymbolExpr); ok && srSym.Name == "syntax-rules" {
+			litList, ok := srExpr.Items[1].(*ListExpr)
+			if !ok {
+				return nil, &EvalError{Message: "define-syntax: expected literals list"}
+			}
+			var literals []string
+			for _, l := range litList.Items {
+				ls, ok := l.(*SymbolExpr)
+				if !ok {
+					return nil, &EvalError{Message: "define-syntax: literal must be a symbol"}
+				}
+				literals = append(literals, ls.Name)
+			}
+			var rules []macroRule
+			for _, r := range srExpr.Items[2:] {
+				rl, ok := r.(*ListExpr)
+				if !ok || len(rl.Items) != 2 {
+					return nil, &EvalError{Message: "define-syntax: bad rule"}
+				}
+				rules = append(rules, macroRule{Pattern: rl.Items[0], Template: rl.Items[1]})
+			}
+			macro := &MacroVal{Literals: literals, Rules: rules, DefEnv: env}
+			env.set(nameSym.Name, macro)
+			return &VoidVal{}, nil
 		}
-		literals = append(literals, ls.Name)
 	}
-	var rules []macroRule
-	for _, r := range srExpr.Items[2:] {
-		rl, ok := r.(*ListExpr)
-		if !ok || len(rl.Items) != 2 {
-			return nil, &EvalError{Message: "define-syntax: bad rule"}
-		}
-		rules = append(rules, macroRule{Pattern: rl.Items[0], Template: rl.Items[1]})
+
+	// Otherwise, evaluate as expression (e.g., lambda transformer)
+	val, err := eval(e.Items[2], env)
+	if err != nil {
+		return nil, err
 	}
-	macro := &MacroVal{Literals: literals, Rules: rules, DefEnv: env}
-	env.set(nameSym.Name, macro)
+	env.set(nameSym.Name, &MacroTransformerVal{Proc: val, DefNames: captureEnvNames(env)})
 	return &VoidVal{}, nil
 }
 

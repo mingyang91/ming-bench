@@ -21,6 +21,7 @@ const (
 	tokBool
 	tokChar
 	tokSymbol
+	tokSyntaxQuote
 	tokEOF
 )
 
@@ -110,6 +111,10 @@ func (t *tokenizer) nextToken() token {
 	case ch == '#':
 		t.advance()
 		next := t.peek()
+		if next == '\'' {
+			t.advance() // consume '
+			return token{kind: tokSyntaxQuote, text: "#'", line: line, col: col}
+		}
 		if next == '\\' {
 			// Character literal: #\x, #\space, #\newline
 			t.advance() // consume backslash
@@ -344,6 +349,19 @@ func (p *parser) parseExpr() (Expr, error) {
 		return &ListExpr{
 			Items: []Expr{
 				&SymbolExpr{Name: "quote", Ln: tok.line, Cl: tok.col},
+				inner,
+			},
+			Ln: tok.line, Cl: tok.col,
+		}, nil
+	case tokSyntaxQuote:
+		p.next()
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ListExpr{
+			Items: []Expr{
+				&SymbolExpr{Name: "syntax", Ln: tok.line, Cl: tok.col},
 				inner,
 			},
 			Ln: tok.line, Cl: tok.col,

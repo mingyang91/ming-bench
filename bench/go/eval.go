@@ -132,6 +132,12 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 			return evalGuard(e, env)
 		case "with-exception-handler":
 			return evalWithExceptionHandler(e, env)
+		case "syntax-case":
+			return evalSyntaxCase(e, env)
+		case "syntax":
+			return evalSyntax(e, env)
+		case "with-syntax":
+			return evalWithSyntax(e, env)
 		}
 
 		// Check for macro application
@@ -142,6 +148,30 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 					return nil, err
 				}
 				return &tailCallVal{expr: expanded, env: env}, nil
+			}
+			if transformer, ok := val.(*MacroTransformerVal); ok {
+				stx := &SyntaxVal{Expr: e, DefNames: transformer.DefNames}
+				var result Value
+				var tErr error
+				switch proc := transformer.Proc.(type) {
+				case *LambdaVal:
+					result, tErr = resolveTC(applyLambda(proc, []Value{stx}, e.Ln, e.Cl))
+				case *CaseLambdaVal:
+					result, tErr = resolveTC(applyCaseLambda(proc, []Value{stx}, e.Ln, e.Cl))
+				default:
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax transformer is not a procedure", e.Ln, e.Cl)}
+				}
+				if tErr != nil {
+					return nil, tErr
+				}
+				if sv, ok := result.(*SyntaxVal); ok {
+					// Inject gensym bindings into use-site env for hygiene
+					for name, val := range sv.Bindings {
+						env.set(name, val)
+					}
+					return &tailCallVal{expr: sv.Expr, env: env}, nil
+				}
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax transformer must return a syntax object", e.Ln, e.Cl)}
 			}
 		}
 	}
@@ -531,6 +561,8 @@ func makeGlobalEnv(out *strings.Builder) *Env {
 	env.set("number->string", &BuiltinFunc{Name: "number->string", Fn: builtinNumberToString})
 	env.set("symbol->string", &BuiltinFunc{Name: "symbol->string", Fn: builtinSymbolToString})
 	env.set("string->symbol", &BuiltinFunc{Name: "string->symbol", Fn: builtinStringToSymbol})
+	env.set("syntax->datum", &BuiltinFunc{Name: "syntax->datum", Fn: builtinSyntaxToDatum})
+	env.set("datum->syntax", &BuiltinFunc{Name: "datum->syntax", Fn: builtinDatumToSyntax})
 	env.set("string-ref", &BuiltinFunc{Name: "string-ref", Fn: builtinStringRef})
 	env.set("string-copy", &BuiltinFunc{Name: "string-copy", Fn: builtinStringCopy})
 	env.set("string-set!", &BuiltinFunc{Name: "string-set!", Fn: builtinStringSet})
