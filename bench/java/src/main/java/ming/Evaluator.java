@@ -70,6 +70,11 @@ public class Evaluator {
             throw new EvalError("unbound variable: " + name);
         }
         void define(String name, Object val) { bindings.put(name, val); }
+        void set(String name, Object val) throws EvalError {
+            if (bindings.containsKey(name)) { bindings.put(name, val); return; }
+            if (parent != null) { parent.set(name, val); return; }
+            throw new EvalError("set!: unbound variable: " + name);
+        }
     }
 
     private final Env globalEnv = new Env(null);
@@ -627,6 +632,15 @@ public class Evaluator {
                             result = eval(list.get(i), letEnv);
                         }
                         return result;
+                    }
+                    case "set!" -> {
+                        if (list.size() != 3) throw new EvalError("set! requires 2 arguments" + posStr(pos));
+                        Object nameRaw = unwrap(list.get(1));
+                        if (!(nameRaw instanceof String name))
+                            throw new EvalError("set!: first argument must be a symbol" + posStr(pos));
+                        Object val = eval(list.get(2), env);
+                        env.set(name, val);
+                        return VOID;
                     }
                     case "begin" -> {
                         Object result = VOID;
