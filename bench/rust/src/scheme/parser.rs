@@ -49,6 +49,7 @@ enum TokenKind {
     LParen,
     RParen,
     Quote,
+    SyntaxQuote, // #'
     Atom(String),
 }
 
@@ -130,6 +131,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
             '#' if i + 1 < chars.len() => {
                 let start_col = col;
                 match chars[i + 1] {
+                    '\'' => {
+                        tokens.push(Token { kind: TokenKind::SyntaxQuote, line, col: start_col });
+                        i += 2;
+                        col += 2;
+                    }
                     't' => {
                         tokens.push(Token { kind: TokenKind::Atom("#t".into()), line, col: start_col });
                         i += 2;
@@ -204,6 +210,17 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Expr, usize), EvalError> 
             Ok((Expr {
                 kind: ExprKind::List(vec![
                     Expr { kind: ExprKind::Symbol("quote".into()), line: tok.line, col: tok.col },
+                    inner,
+                ]),
+                line: tok.line,
+                col: tok.col,
+            }, next))
+        }
+        TokenKind::SyntaxQuote => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((Expr {
+                kind: ExprKind::List(vec![
+                    Expr { kind: ExprKind::Symbol("syntax".into()), line: tok.line, col: tok.col },
                     inner,
                 ]),
                 line: tok.line,

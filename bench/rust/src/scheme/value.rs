@@ -44,6 +44,8 @@ pub enum Value {
     RecordAccessor(u64, usize),        // type_id, field_index
     Continuation(u64),                 // continuation id for call/cc
     Values(Vec<Value>),                // multiple return values
+    Syntax(Box<(crate::scheme::parser::Expr, Vec<(String, Value)>)>),  // syntax object + hygiene bindings
+    TransformerMacro(Box<Value>, Env), // syntax-case macro: (transformer closure, def env)
     Void,
 }
 
@@ -213,6 +215,8 @@ fn equal_with_cycle_check(a: &Value, b: &Value, seen: &mut HashSet<(usize, usize
         (Value::Continuation(a), Value::Continuation(b)) => a == b,
         (Value::CaseLambda(_), Value::CaseLambda(_)) => false,
         (Value::Macro(_), Value::Macro(_)) => false,
+        (Value::TransformerMacro(_, _), Value::TransformerMacro(_, _)) => false,
+        (Value::Syntax(a), Value::Syntax(b)) => a.0 == b.0,
         (Value::Record(t1, f1), Value::Record(t2, f2)) => t1 == t2 && f1 == f2,
         (Value::Values(a), Value::Values(b)) => a == b,
         (Value::Void, Value::Void) => true,
@@ -331,7 +335,8 @@ impl Value {
             Value::Nil => "()".into(),
             Value::Pair(cell) => fmt_pair(cell, &mut |v| v.to_display_string()),
             Value::Lambda(_) | Value::CaseLambda(_) | Value::Continuation(_) => "#<procedure>".into(),
-            Value::Macro(_) => "#<macro>".into(),
+            Value::Macro(_) | Value::TransformerMacro(_, _) => "#<macro>".into(),
+            Value::Syntax(_) => "#<syntax>".into(),
             Value::Vector(v) => {
                 let elems: Vec<String> = v.borrow().iter().map(|e| e.to_display_string()).collect();
                 format!("#({})", elems.join(" "))
