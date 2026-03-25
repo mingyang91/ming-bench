@@ -138,8 +138,18 @@ fn run_gradle(level: &str, gate: bool) -> Result<()> {
     }
 
     if gate {
-        // Java quality gate: placeholder for future linter integration
-        println!("No quality gate configured for Java (skipping).");
+        println!("Running Java quality gate (Checkstyle)...");
+        let gate_exit = run_cmd(
+            "./gradlew",
+            &["qualityGate", "--no-daemon"],
+            &lang_dir,
+        )?;
+        if gate_exit != 0 {
+            return Err(Error::CommandFailed {
+                cmd: "gradlew qualityGate".to_string(),
+                exit_code: gate_exit,
+            });
+        }
     }
 
     run_jvm_container(&proj, &jar, level, "Java")
