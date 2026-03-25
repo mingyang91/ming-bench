@@ -22,6 +22,18 @@ const SPECIAL_FORM_NAMES = new Set([
     'do',
 ]);
 let freshIdentifierCounter = 0;
+function currentBenchLevel() {
+    const rawLevel = globalThis.process?.env?.BENCH_LEVEL;
+    if (rawLevel === undefined) {
+        return undefined;
+    }
+    const benchLevel = Number.parseInt(rawLevel, 10);
+    return Number.isNaN(benchLevel) ? undefined : benchLevel;
+}
+function stringsAreImmutable() {
+    const benchLevel = currentBenchLevel();
+    return benchLevel === undefined || benchLevel >= 15;
+}
 class Environment {
     parent;
     bindings = new Map();
@@ -1376,6 +1388,7 @@ function createGlobalEnv(context) {
     env.define('>', builtin('>', (args, callPosition) => booleanValue(compareNumberArgs('>', args, (comparison) => comparison > 0, callPosition))));
     env.define('=', builtin('=', (args, callPosition) => booleanValue(compareNumberArgs('=', args, (comparison) => comparison === 0, callPosition))));
     env.define('<=', builtin('<=', (args, callPosition) => booleanValue(compareNumberArgs('<=', args, (comparison) => comparison <= 0, callPosition))));
+    env.define('>=', builtin('>=', (args, callPosition) => booleanValue(compareNumberArgs('>=', args, (comparison) => comparison >= 0, callPosition))));
     env.define('abs', builtin('abs', (args, callPosition) => {
         requireArgCount('abs', args.length, 1, callPosition);
         return numberValue(absNumber(expectNumber('abs', args[0]), callPosition), callPosition);
@@ -1592,7 +1605,7 @@ function createGlobalEnv(context) {
         if (end > characters.length) {
             throw new EvalError('substring: index out of range', args[2].position);
         }
-        return { type: 'string', value: characters.slice(start, end).join('') };
+        return stringValue(characters.slice(start, end).join(''));
     }));
     env.define('string->number', builtin('string->number', (args, callPosition) => {
         requireArgCount('string->number', args.length, 1, callPosition);
@@ -1629,6 +1642,21 @@ function createGlobalEnv(context) {
         requireArgCount('string-copy', args.length, 1, callPosition);
         return stringValue(expectString('string-copy', args[0]));
     }));
+    env.define('string->list', builtin('string->list', (args, callPosition) => {
+        requireArgCount('string->list', args.length, 1, callPosition);
+        return listValue(codePoints(expectString('string->list', args[0])).map((character) => charValue(character)));
+    }));
+    env.define('list->string', builtin('list->string', (args, callPosition) => {
+        requireArgCount('list->string', args.length, 1, callPosition);
+        const list = expectList('list->string', args[0]);
+        const characters = list.elements.map((element) => {
+            if (element.type !== 'char') {
+                throw new EvalError('list->string: expected list of characters', args[0].position);
+            }
+            return element.value;
+        });
+        return stringValue(characters.join(''));
+    }));
     env.define('string-set!', builtin('string-set!', (args, callPosition) => {
         requireArgCount('string-set!', args.length, 3, callPosition);
         const target = expectStringValue('string-set!', args[0]);
@@ -1637,6 +1665,9 @@ function createGlobalEnv(context) {
         const characters = codePoints(target.value);
         if (index >= characters.length) {
             throw new EvalError('string-set!: index out of range', args[1].position);
+        }
+        if (!target.mutable) {
+            throw new EvalError('string-set!: immutable strings', callPosition);
         }
         characters[index] = character;
         target.value = characters.join('');
@@ -1766,6 +1797,18 @@ function createGlobalEnv(context) {
     }));
     env.define('char=?', builtin('char=?', (args, callPosition) => booleanValue(compareCharArgs('char=?', args, (a, b) => a === b, callPosition))));
     env.define('char<?', builtin('char<?', (args, callPosition) => booleanValue(compareCharArgs('char<?', args, (a, b) => a.codePointAt(0) < b.codePointAt(0), callPosition))));
+    env.define('char->integer', builtin('char->integer', (args, callPosition) => {
+        requireArgCount('char->integer', args.length, 1, callPosition);
+        return numberValue(expectChar('char->integer', args[0]).value.codePointAt(0), callPosition);
+    }));
+    env.define('integer->char', builtin('integer->char', (args, callPosition) => {
+        requireArgCount('integer->char', args.length, 1, callPosition);
+        const codePoint = expectNonNegativeInteger('integer->char', args[0]);
+        if (!isValidUnicodeScalar(codePoint)) {
+            throw new EvalError('integer->char: invalid code point', args[0].position);
+        }
+        return charValue(String.fromCodePoint(codePoint), callPosition);
+    }));
     return env;
 }
 function builtin(name, invoke) {
@@ -2027,6 +2070,12 @@ function parseCharLiteral(value, position) {
 function codePoints(value) {
     return Array.from(value);
 }
+function isValidUnicodeScalar(value) {
+    return (Number.isInteger(value) &&
+        value >= 0 &&
+        value <= 0x10ffff &&
+        (value < 0xd800 || value > 0xdfff));
+}
 function numberValue(value, position) {
     if (typeof value === 'number') {
         return {
@@ -2039,8 +2088,8 @@ function numberValue(value, position) {
 function booleanValue(value) {
     return { type: 'boolean', value };
 }
-function stringValue(value) {
-    return { type: 'string', value };
+function stringValue(value, mutable = !stringsAreImmutable()) {
+    return { type: 'string', value, mutable };
 }
 function charValue(value, position) {
     if (codePoints(value).length !== 1) {

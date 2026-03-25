@@ -119,7 +119,7 @@ type EvaluationContext = {
 type SchemeValue =
   | { type: 'number'; value: SchemeNumber }
   | { type: 'boolean'; value: boolean }
-  | { type: 'string'; value: string }
+  | { type: 'string'; value: string; mutable: boolean }
   | { type: 'char'; value: string }
   | { type: 'symbol'; name: string }
   | { type: 'list'; elements: SchemeValue[]; tail?: SchemeValue }
@@ -131,6 +131,7 @@ type SchemeValue =
   | { type: 'void' };
 
 type ListValue = Extract<SchemeValue, { type: 'list' }>;
+type StringValue = Extract<SchemeValue, { type: 'string' }>;
 type VectorValue = Extract<SchemeValue, { type: 'vector' }>;
 type SymbolExpr = Extract<Expr, { type: 'symbol' }>;
 type DoBinding = { name: SymbolExpr; init: Expr; step?: Expr };
@@ -160,6 +161,26 @@ const SPECIAL_FORM_NAMES = new Set([
 ]);
 
 let freshIdentifierCounter = 0;
+
+function currentBenchLevel(): number | undefined {
+  const rawLevel = (
+    globalThis as {
+      process?: { env?: { BENCH_LEVEL?: string } };
+    }
+  ).process?.env?.BENCH_LEVEL;
+
+  if (rawLevel === undefined) {
+    return undefined;
+  }
+
+  const benchLevel = Number.parseInt(rawLevel, 10);
+  return Number.isNaN(benchLevel) ? undefined : benchLevel;
+}
+
+function stringsAreImmutable(): boolean {
+  const benchLevel = currentBenchLevel();
+  return benchLevel === undefined || benchLevel >= 15;
+}
 
 class Environment {
   private readonly bindings = new Map<string, BindingCell>();
@@ -2024,6 +2045,12 @@ function createGlobalEnv(context: EvaluationContext): Environment {
       booleanValue(compareNumberArgs('<=', args, (comparison) => comparison <= 0, callPosition)),
     ),
   );
+  env.define(
+    '>=',
+    builtin('>=', (args, callPosition) =>
+      booleanValue(compareNumberArgs('>=', args, (comparison) => comparison >= 0, callPosition)),
+    ),
+  );
 
   env.define(
     'abs',
@@ -2412,7 +2439,7 @@ function createGlobalEnv(context: EvaluationContext): Environment {
         throw new EvalError('substring: index out of range', args[2].position);
       }
 
-      return { type: 'string', value: characters.slice(start, end).join('') };
+      return stringValue(characters.slice(start, end).join(''));
     }),
   );
 
@@ -2479,6 +2506,33 @@ function createGlobalEnv(context: EvaluationContext): Environment {
   );
 
   env.define(
+    'string->list',
+    builtin('string->list', (args, callPosition) => {
+      requireArgCount('string->list', args.length, 1, callPosition);
+      return listValue(
+        codePoints(expectString('string->list', args[0])).map((character) => charValue(character)),
+      );
+    }),
+  );
+
+  env.define(
+    'list->string',
+    builtin('list->string', (args, callPosition) => {
+      requireArgCount('list->string', args.length, 1, callPosition);
+      const list = expectList('list->string', args[0]);
+      const characters = list.elements.map((element) => {
+        if (element.type !== 'char') {
+          throw new EvalError('list->string: expected list of characters', args[0].position);
+        }
+
+        return element.value;
+      });
+
+      return stringValue(characters.join(''));
+    }),
+  );
+
+  env.define(
     'string-set!',
     builtin('string-set!', (args, callPosition) => {
       requireArgCount('string-set!', args.length, 3, callPosition);
@@ -2489,6 +2543,10 @@ function createGlobalEnv(context: EvaluationContext): Environment {
 
       if (index >= characters.length) {
         throw new EvalError('string-set!: index out of range', args[1].position);
+      }
+
+      if (!target.mutable) {
+        throw new EvalError('string-set!: immutable strings', callPosition);
       }
 
       characters[index] = character;
@@ -2771,6 +2829,27 @@ function createGlobalEnv(context: EvaluationContext): Environment {
     ),
   );
 
+  env.define(
+    'char->integer',
+    builtin('char->integer', (args, callPosition) => {
+      requireArgCount('char->integer', args.length, 1, callPosition);
+      return numberValue(expectChar('char->integer', args[0]).value.codePointAt(0)!, callPosition);
+    }),
+  );
+
+  env.define(
+    'integer->char',
+    builtin('integer->char', (args, callPosition) => {
+      requireArgCount('integer->char', args.length, 1, callPosition);
+      const codePoint = expectNonNegativeInteger('integer->char', args[0]);
+      if (!isValidUnicodeScalar(codePoint)) {
+        throw new EvalError('integer->char: invalid code point', args[0].position);
+      }
+
+      return charValue(String.fromCodePoint(codePoint), callPosition);
+    }),
+  );
+
   return env;
 }
 
@@ -2899,7 +2978,7 @@ function expectString(name: string, arg: EvaluatedArg): string {
   return expectStringValue(name, arg).value;
 }
 
-function expectStringValue(name: string, arg: EvaluatedArg): Extract<SchemeValue, { type: 'string' }> {
+function expectStringValue(name: string, arg: EvaluatedArg): StringValue {
   if (arg.value.type !== 'string') {
     throw new EvalError(`${name}: expected string`, arg.position);
   }
@@ -3134,6 +3213,15 @@ function codePoints(value: string): string[] {
   return Array.from(value);
 }
 
+function isValidUnicodeScalar(value: number): boolean {
+  return (
+    Number.isInteger(value) &&
+    value >= 0 &&
+    value <= 0x10ffff &&
+    (value < 0xd800 || value > 0xdfff)
+  );
+}
+
 function numberValue(value: number | SchemeNumber, position?: SourcePosition): SchemeValue {
   if (typeof value === 'number') {
     return {
@@ -3149,8 +3237,8 @@ function booleanValue(value: boolean): SchemeValue {
   return { type: 'boolean', value };
 }
 
-function stringValue(value: string): SchemeValue {
-  return { type: 'string', value };
+function stringValue(value: string, mutable = !stringsAreImmutable()): StringValue {
+  return { type: 'string', value, mutable };
 }
 
 function charValue(value: string, position?: SourcePosition): SchemeValue {
