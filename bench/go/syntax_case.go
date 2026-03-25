@@ -51,7 +51,7 @@ func runMacroTransformer(proc value, args []value, pos sourcePos, definitionEnv 
 		}
 		return nil, errorAt(pos, "no matching case-lambda clause for %d arguments", len(args))
 	default:
-		return runProcedureCall(proc, args, pos)
+		return runProcedureCall(proc, args, pos, definitionEnv.evalContext())
 	}
 }
 

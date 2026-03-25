@@ -50,7 +50,8 @@ type listValue struct {
 type voidValue struct{}
 
 type evalContext struct {
-	output strings.Builder
+	output     strings.Builder
+	stepBudget *stepBudget
 }
 
 type evalStep struct {
@@ -90,6 +91,7 @@ type environment struct {
 	macroState   *macroState
 	fastEval     bool
 	syntaxDefEnv *environment
+	ctx          *evalContext
 }
 
 func evalString(input string) (string, error) {
@@ -97,7 +99,16 @@ func evalString(input string) (string, error) {
 	return result, err
 }
 
+func evalStringWithLimit(input string, maxSteps int) (string, error) {
+	result, _, err := evalStringWithOutputLimit(input, &maxSteps)
+	return result, err
+}
+
 func evalStringWithOutput(input string) (string, string, error) {
+	return evalStringWithOutputLimit(input, nil)
+}
+
+func evalStringWithOutputLimit(input string, maxSteps *int) (string, string, error) {
 	nodes, err := parseProgram(input)
 	if err != nil {
 		return "", "", err
@@ -107,6 +118,12 @@ func evalStringWithOutput(input string) (string, string, error) {
 	}
 
 	ctx := &evalContext{}
+	if maxSteps != nil {
+		if *maxSteps < 0 {
+			return "", "", &EvalError{Message: "step limit must be non-negative"}
+		}
+		ctx.stepBudget = newStepBudget(*maxSteps)
+	}
 	env := baseEnv(ctx)
 	env.fastEval = canUseFastEval(nodes)
 
@@ -128,6 +145,7 @@ func evalStringWithOutput(input string) (string, string, error) {
 
 func baseEnv(ctx *evalContext) *environment {
 	env := newEnvironment(nil)
+	env.ctx = ctx
 	env.define("+", builtinNumericFold("+"))
 	env.define("-", builtinSub())
 	env.define("*", builtinNumericFold("*"))
@@ -179,11 +197,11 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("list-ref", builtinListRef())
 	env.define("list-tail", builtinListTail())
 	env.define("append", builtinAppend())
-	env.define("apply", builtinApply())
+	env.define("apply", builtinApply(ctx))
 	env.define("values", builtinValues())
 	env.define("call-with-values", builtinCallWithValues())
-	env.define("map", builtinMap())
-	env.define("for-each", builtinForEach())
+	env.define("map", builtinMap(ctx))
+	env.define("for-each", builtinForEach(ctx))
 	env.define("memq", builtinMemq())
 	env.define("memv", builtinMemv())
 	env.define("member", builtinMember())
@@ -274,10 +292,18 @@ func newEnvironment(parent *environment) *environment {
 		env.syntaxDefEnv = parent.syntaxDefEnv
 		env.macroState = parent.macroState
 		env.fastEval = parent.fastEval
+		env.ctx = parent.ctx
 	} else {
 		env.macroState = &macroState{}
 	}
 	return env
+}
+
+func (e *environment) evalContext() *evalContext {
+	if e == nil {
+		return nil
+	}
+	return e.ctx
 }
 
 func (e *environment) define(name string, val value) {
@@ -358,6 +384,10 @@ func eval(expr node, env *environment) (value, error) {
 
 func evalFast(expr node, env *environment) (value, error) {
 	for {
+		if err := consumeEvalStep(env.evalContext(), expr); err != nil {
+			return nil, err
+		}
+
 		switch current := expr.(type) {
 		case integerValue, rationalValue, inexactValue, booleanValue, stringValue, charValue:
 			return current, nil
@@ -518,7 +548,7 @@ func evalList(list listNode, env *environment) (value, *evalStep, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	result, step, err := startProcedureCall(operator, args, list.pos)
+	result, step, err := startProcedureCall(operator, args, list.pos, env.evalContext())
 	return result, step, withErrorPos(err, list.pos)
 }
 
@@ -730,7 +760,7 @@ func evalCond(args []node, env *environment) (value, *evalStep, error) {
 			if err != nil {
 				return nil, nil, err
 			}
-			return startProcedureCall(receiver, []value{testValue}, clause.pos)
+			return startProcedureCall(receiver, []value{testValue}, clause.pos, env.evalContext())
 		}
 		return prepareSequence(clause.elements[1:], env)
 	}
@@ -921,9 +951,9 @@ func parseParamNames(paramExprs []node) ([]string, string, bool, error) {
 	return params, "", false, nil
 }
 
-func applyProcedure(proc value, args []value, pos sourcePos) (value, error) {
+func applyProcedure(proc value, args []value, pos sourcePos, ctx *evalContext) (value, error) {
 	if procedureUsesFastEval(proc) {
-		result, step, err := startProcedureCall(proc, args, pos)
+		result, step, err := startProcedureCall(proc, args, pos, ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -932,7 +962,7 @@ func applyProcedure(proc value, args []value, pos sourcePos) (value, error) {
 		}
 		return eval(step.expr, step.env)
 	}
-	return runProcedureCall(proc, args, pos)
+	return runProcedureCall(proc, args, pos, ctx)
 }
 
 func procedureUsesFastEval(proc value) bool {
@@ -956,7 +986,7 @@ func procedureUsesFastEval(proc value) bool {
 	}
 }
 
-func startProcedureCall(proc value, args []value, pos sourcePos) (value, *evalStep, error) {
+func startProcedureCall(proc value, args []value, pos sourcePos, ctx *evalContext) (value, *evalStep, error) {
 	switch proc := proc.(type) {
 	case builtinProc:
 		result, err := proc(args)
@@ -972,7 +1002,7 @@ func startProcedureCall(proc value, args []value, pos sourcePos) (value, *evalSt
 		return nil, nil, errorAt(pos, "no matching case-lambda clause for %d arguments", len(args))
 	default:
 		if isProcedureValue(proc) {
-			result, err := runProcedureCall(proc, args, pos)
+			result, err := runProcedureCall(proc, args, pos, ctx)
 			return result, nil, err
 		}
 		return nil, nil, errorAt(pos, "not a procedure")
@@ -1390,7 +1420,7 @@ func builtinAppend() builtinProc {
 	}
 }
 
-func builtinApply() builtinProc {
+func builtinApply(ctx *evalContext) builtinProc {
 	return func(args []value) (value, error) {
 		if len(args) < 2 {
 			return nil, &EvalError{Message: "apply expects at least 2 arguments"}
@@ -1404,11 +1434,11 @@ func builtinApply() builtinProc {
 		combined := make([]value, 0, len(args)-2+len(last.elements))
 		combined = append(combined, args[1:len(args)-1]...)
 		combined = append(combined, last.elements...)
-		return applyProcedure(args[0], combined, sourcePos{})
+		return applyProcedure(args[0], combined, sourcePos{}, ctx)
 	}
 }
 
-func builtinMap() builtinProc {
+func builtinMap(ctx *evalContext) builtinProc {
 	return func(args []value) (value, error) {
 		if len(args) < 2 {
 			return nil, &EvalError{Message: "map expects a procedure and at least 1 list"}
@@ -1437,7 +1467,7 @@ func builtinMap() builtinProc {
 				callArgs[i] = element
 			}
 
-			result, err := applyProcedure(args[0], callArgs, sourcePos{})
+			result, err := applyProcedure(args[0], callArgs, sourcePos{}, ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -1454,7 +1484,7 @@ func builtinMap() builtinProc {
 	}
 }
 
-func builtinForEach() builtinProc {
+func builtinForEach(ctx *evalContext) builtinProc {
 	return func(args []value) (value, error) {
 		if len(args) < 2 {
 			return nil, &EvalError{Message: "for-each expects a procedure and at least 1 list"}
@@ -1477,7 +1507,7 @@ func builtinForEach() builtinProc {
 				}
 				callArgs[i] = element
 			}
-			if _, err := applyProcedure(args[0], callArgs, sourcePos{}); err != nil {
+			if _, err := applyProcedure(args[0], callArgs, sourcePos{}, ctx); err != nil {
 				return nil, err
 			}
 		}

@@ -223,6 +223,7 @@ func (e *environment) lookupMacro(name string) (macroTransformer, bool) {
 
 func snapshotEnvironment(env *environment) *environment {
 	snapshot := newEnvironment(nil)
+	snapshot.ctx = env.evalContext()
 	seenBindings := map[string]struct{}{}
 	seenMacros := map[string]struct{}{}
 

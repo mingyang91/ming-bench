@@ -20,9 +20,11 @@ func (p sourcePos) valid() bool {
 
 // EvalError represents a Scheme evaluation error.
 type EvalError struct {
-	Message string
-	Line    int
-	Col     int
+	Message   string
+	Line      int
+	Col       int
+	StepLimit bool
+	Limit     int
 }
 
 func (e *EvalError) Error() string {
@@ -42,6 +44,16 @@ func errorAt(pos sourcePos, format string, args ...interface{}) *EvalError {
 		Message: message,
 		Line:    pos.Line,
 		Col:     pos.Col,
+	}
+}
+
+func stepLimitExceededError(pos sourcePos, limit int) *EvalError {
+	return &EvalError{
+		Message:   fmt.Sprintf("step limit exceeded after %d steps", limit),
+		Line:      pos.Line,
+		Col:       pos.Col,
+		StepLimit: true,
+		Limit:     limit,
 	}
 }
 

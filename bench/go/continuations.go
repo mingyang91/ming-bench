@@ -6,6 +6,7 @@ type continuationValue struct {
 	cont    continuation
 	wind    *windFrame
 	handler *exceptionHandlerFrame
+	ctx     *evalContext
 }
 
 type callCCProcValue struct{}
@@ -182,24 +183,29 @@ type evalMachine struct {
 	wind    *windFrame
 	handler *exceptionHandlerFrame
 	eval    bool
+	ctx     *evalContext
 }
 
 func runEval(expr node, env *environment) (value, error) {
-	m := &evalMachine{}
+	m := &evalMachine{ctx: env.evalContext()}
 	m.setEval(expr, env, nil)
 	return m.run()
 }
 
 func runEvalSequence(exprs []node, env *environment) (value, error) {
-	m := &evalMachine{}
+	m := &evalMachine{ctx: env.evalContext()}
 	if err := m.startSequence(exprs, env, nil); err != nil {
 		return nil, err
 	}
 	return m.run()
 }
 
-func runProcedureCall(proc value, args []value, pos sourcePos) (value, error) {
-	m := &evalMachine{}
+func runProcedureCall(proc value, args []value, pos sourcePos, ctx *evalContext) (value, error) {
+	if ctx == nil {
+		ctx = procedureEvalContext(proc)
+	}
+
+	m := &evalMachine{ctx: ctx}
 	if err := m.enterProcedure(proc, args, pos, nil); err != nil {
 		return nil, err
 	}
@@ -209,6 +215,9 @@ func runProcedureCall(proc value, args []value, pos sourcePos) (value, error) {
 func (m *evalMachine) run() (value, error) {
 	for {
 		if m.eval {
+			if err := consumeEvalStep(m.ctx, m.expr); err != nil {
+				return nil, err
+			}
 			if err := m.stepEval(); err != nil {
 				return nil, err
 			}
@@ -1098,6 +1107,7 @@ func (m *evalMachine) enterProcedure(proc value, args []value, pos sourcePos, ne
 			cont:    cloneContinuation(next),
 			wind:    m.wind,
 			handler: m.handler,
+			ctx:     m.ctx,
 		}}, pos, next)
 	case *callWithValuesProcValue:
 		if len(args) != 2 {
