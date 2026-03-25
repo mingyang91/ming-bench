@@ -97,8 +97,14 @@ private[ming] object Builtins:
     case "exact?" | "inexact?" | "integer?" | "rational?" | "exact->inexact" | "inexact->exact" | "numerator" |
         "denominator" =>
       RationalBuiltins.applyRationalBuiltin(name, args)
-    case "apply" => throw EvalError("apply: should be handled by applyProc")
-    case _       => throw EvalError(s"unknown procedure: $name")
+    case "procedure?" => unary(name, args)(isProcedure)
+    case "apply"      => throw EvalError("apply: should be handled by applyProc")
+    case _            => throw EvalError(s"unknown procedure: $name")
+
+  private def isProcedure(e: Expr): Expr = e match
+    case Expr.Lambda(_, _, _, _) | Expr.CaseLambda(_, _) => Expr.Bool(true)
+    case Expr.Sym(n) if builtinNames.contains(n)         => Expr.Bool(true)
+    case _                                               => Expr.Bool(false)
 
   private def applyAdd(args: List[Expr]): Expr =
     if args.isEmpty then return Expr.Num(0)
@@ -192,6 +198,7 @@ private[ming] object Builtins:
     case Expr.Lst(elems)            => "(" + elems.map(display).mkString(" ") + ")"
     case Expr.Pair(a, d)            => s"(${display(a)} . ${display(d)})"
     case Expr.Lambda(_, _, _, _)    => "#<procedure>"
+    case Expr.CaseLambda(_, _)      => "#<procedure>"
     case Expr.Macro(_, _, _)        => "#<macro>"
     case Expr.Record(name, _, _, _) => s"#<record:$name>"
 
@@ -278,7 +285,8 @@ private[ming] object Builtins:
     "exact->inexact",
     "inexact->exact",
     "numerator",
-    "denominator"
+    "denominator",
+    "procedure?"
   )
 
   def makeTopLevelEnv(): Env =

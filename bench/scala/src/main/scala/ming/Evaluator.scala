@@ -8,7 +8,8 @@ object Evaluator:
     try
       expr match
         case Expr.Num(_) | Expr.Rational(_, _) | Expr.Real(_) | Expr.Bool(_) | Expr.Str(_) | Expr.Chr(_) |
-            Expr.Lambda(_, _, _, _) | Expr.Pair(_, _) | Expr.Macro(_, _, _) | Expr.Record(_, _, _, _) =>
+            Expr.Lambda(_, _, _, _) | Expr.Pair(_, _) | Expr.Macro(_, _, _) | Expr.Record(_, _, _, _) |
+            Expr.CaseLambda(_, _) =>
           expr
         case Expr.Sym(name) => env.lookup(name)
         case Expr.Lst(Nil)  => throw EvalError("empty application")
@@ -26,6 +27,7 @@ object Evaluator:
         case Expr.Lst(Expr.Sym("or") :: args)                 => evalOr(args, env)
         case Expr.Lst(Expr.Sym("define-syntax") :: args)      => evalDefineSyntax(args, env)
         case Expr.Lst(Expr.Sym("define-record-type") :: args) => RecordOps.evalDefineRecordType(args, env)
+        case Expr.Lst(Expr.Sym("case-lambda") :: clauses)     => evalCaseLambda(clauses, env)
         case Expr.Lst((head @ Expr.Sym(name)) :: _) if isMacro(name, env) =>
           val mac = env.lookup(name).asInstanceOf[Expr.Macro]
           val (expanded, hygieneEnv) =
@@ -139,6 +141,15 @@ object Evaluator:
       Expr.Bool(false)
     case _ => throw EvalError("define-syntax: invalid syntax")
 
+  private def evalCaseLambda(clauses: List[Expr], env: Env): Expr =
+    val parsed = clauses.map {
+      case Expr.Lst(Expr.Lst(params) :: body) if body.nonEmpty =>
+        val (paramNames, restParam) = extractParamsWithRest("case-lambda", params)
+        (paramNames, restParam, body)
+      case _ => throw EvalError("case-lambda: invalid clause")
+    }
+    Expr.CaseLambda(parsed, env)
+
   private def evalBody(exprs: List[Expr], env: Env): Expr =
     exprs.foldLeft(Expr.Bool(false): Expr)((_, e) => eval(e, env))
 
@@ -183,6 +194,20 @@ object Evaluator:
           params.zip(args).foreach((p, a) => localEnv.define(p, a))
           localEnv.define(rest, Expr.Lst(args.drop(params.length)))
           evalBody(body, localEnv)
+    case Expr.CaseLambda(clauses, closure) =>
+      val matched = clauses.find { case (params, restParam, _) =>
+        restParam match
+          case None    => args.length == params.length
+          case Some(_) => args.length >= params.length
+      }
+      matched match
+        case Some((params, restParam, body)) =>
+          val localEnv = closure.child()
+          params.zip(args).foreach((p, a) => localEnv.define(p, a))
+          restParam.foreach(rest => localEnv.define(rest, Expr.Lst(args.drop(params.length))))
+          evalBody(body, localEnv)
+        case None =>
+          throw EvalError(s"case-lambda: no matching clause for ${args.length} arguments")
     case _ => throw EvalError(s"not a procedure: ${display(func)}")
 
   private def applyMap(fn: Expr, args: List[Expr]): Expr =
