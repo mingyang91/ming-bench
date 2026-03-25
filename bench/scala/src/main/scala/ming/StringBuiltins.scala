@@ -39,17 +39,18 @@ object StringBuiltins:
       )
     )
 
+  private def asString(v: SchemeVal, name: String): String = v match
+    case SchemeVal.StringVal(chars) => new String(chars)
+    case other                      => throw new EvalError(s"$name: expected string, got ${SchemeVal.display(other)}")
+
   private def registerStringOps(env: Env): Unit =
     env.define(
       "string-append",
       SchemeVal.BuiltinProc(
         "string-append",
         args =>
-          val strs = args.map {
-            case SchemeVal.StringVal(s) => s
-            case other => throw new EvalError(s"string-append: expected string, got ${SchemeVal.display(other)}")
-          }
-          SchemeVal.StringVal(strs.mkString)
+          val strs = args.map(a => asString(a, "string-append"))
+          SchemeVal.str(strs.mkString)
       )
     )
     env.define(
@@ -59,7 +60,7 @@ object StringBuiltins:
         args =>
           if args.size != 1 then throw new EvalError("string-length: expected 1 argument")
           args.head match
-            case SchemeVal.StringVal(s) => SchemeVal.IntVal(s.length.toLong)
+            case SchemeVal.StringVal(chars) => SchemeVal.IntVal(chars.length.toLong)
             case other => throw new EvalError(s"string-length: expected string, got ${SchemeVal.display(other)}")
       )
     )
@@ -70,8 +71,8 @@ object StringBuiltins:
         args =>
           if args.size != 3 then throw new EvalError("substring: expected 3 arguments")
           (args(0), args(1), args(2)) match
-            case (SchemeVal.StringVal(s), SchemeVal.IntVal(start), SchemeVal.IntVal(end)) =>
-              SchemeVal.StringVal(s.substring(start.toInt, end.toInt))
+            case (SchemeVal.StringVal(chars), SchemeVal.IntVal(start), SchemeVal.IntVal(end)) =>
+              SchemeVal.str(new String(chars, start.toInt, end.toInt - start.toInt))
             case _ => throw new EvalError("substring: invalid arguments")
       )
     )
@@ -82,7 +83,8 @@ object StringBuiltins:
         args =>
           if args.size != 1 then throw new EvalError("string->number: expected 1 argument")
           args.head match
-            case SchemeVal.StringVal(s) =>
+            case SchemeVal.StringVal(chars) =>
+              val s = new String(chars)
               try SchemeVal.IntVal(s.toLong)
               catch case _: NumberFormatException => SchemeVal.BoolVal(false)
             case other => throw new EvalError(s"string->number: expected string, got ${SchemeVal.display(other)}")
@@ -95,7 +97,7 @@ object StringBuiltins:
         args =>
           if args.size != 1 then throw new EvalError("number->string: expected 1 argument")
           args.head match
-            case SchemeVal.IntVal(n) => SchemeVal.StringVal(n.toString)
+            case SchemeVal.IntVal(n) => SchemeVal.str(n.toString)
             case other => throw new EvalError(s"number->string: expected number, got ${SchemeVal.display(other)}")
       )
     )
@@ -106,9 +108,33 @@ object StringBuiltins:
         args =>
           if args.size != 2 then throw new EvalError("string-ref: expected 2 arguments")
           (args(0), args(1)) match
-            case (SchemeVal.StringVal(s), SchemeVal.IntVal(i)) =>
-              SchemeVal.CharVal(s.charAt(i.toInt))
+            case (SchemeVal.StringVal(chars), SchemeVal.IntVal(i)) =>
+              SchemeVal.CharVal(chars(i.toInt))
             case _ => throw new EvalError("string-ref: invalid arguments")
+      )
+    )
+    env.define(
+      "string-copy",
+      SchemeVal.BuiltinProc(
+        "string-copy",
+        args =>
+          if args.size != 1 then throw new EvalError("string-copy: expected 1 argument")
+          args.head match
+            case SchemeVal.StringVal(chars) => SchemeVal.StringVal(chars.clone())
+            case other => throw new EvalError(s"string-copy: expected string, got ${SchemeVal.display(other)}")
+      )
+    )
+    env.define(
+      "string-set!",
+      SchemeVal.BuiltinProc(
+        "string-set!",
+        args =>
+          if args.size != 3 then throw new EvalError("string-set!: expected 3 arguments")
+          (args(0), args(1), args(2)) match
+            case (SchemeVal.StringVal(chars), SchemeVal.IntVal(i), SchemeVal.CharVal(c)) =>
+              chars(i.toInt) = c
+              SchemeVal.Void
+            case _ => throw new EvalError("string-set!: invalid arguments")
       )
     )
 
@@ -120,7 +146,7 @@ object StringBuiltins:
         args =>
           if args.size != 1 then throw new EvalError("symbol->string: expected 1 argument")
           args.head match
-            case SchemeVal.Symbol(name) => SchemeVal.StringVal(name)
+            case SchemeVal.Symbol(name) => SchemeVal.str(name)
             case other => throw new EvalError(s"symbol->string: expected symbol, got ${SchemeVal.display(other)}")
       )
     )
@@ -131,7 +157,7 @@ object StringBuiltins:
         args =>
           if args.size != 1 then throw new EvalError("string->symbol: expected 1 argument")
           args.head match
-            case SchemeVal.StringVal(s) => SchemeVal.Symbol(s)
+            case SchemeVal.StringVal(chars) => SchemeVal.Symbol(new String(chars))
             case other => throw new EvalError(s"string->symbol: expected string, got ${SchemeVal.display(other)}")
       )
     )

@@ -30,7 +30,7 @@ object Parser:
       case Token.RParen(_) :: _ =>
         throw new EvalError("unexpected )")
       case Token.Str(s, p) :: rest =>
-        (withPos(SchemeVal.StringVal(s), p), rest)
+        (withPos(SchemeVal.str(s), p), rest)
       case Token.Atom("quote-sugar", p) :: rest =>
         val (expr, remaining) = parseExpr(rest)
         (withPos(SchemeVal.SList(List(withPos(SchemeVal.Symbol("quote"), p), expr)), p), remaining)
@@ -51,6 +51,14 @@ object Parser:
   private def parseAtom(s: String): SchemeVal =
     if s == "#t" then SchemeVal.BoolVal(true)
     else if s == "#f" then SchemeVal.BoolVal(false)
+    else if s.startsWith("#\\") then
+      val rest = s.substring(2)
+      rest match
+        case "space"            => SchemeVal.CharVal(' ')
+        case "newline"          => SchemeVal.CharVal('\n')
+        case "tab"              => SchemeVal.CharVal('\t')
+        case c if c.length == 1 => SchemeVal.CharVal(c.charAt(0))
+        case _                  => throw new EvalError(s"invalid character literal: $s")
     else
       s.toLongOption match
         case Some(n) => SchemeVal.IntVal(n)

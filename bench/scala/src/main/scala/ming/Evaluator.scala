@@ -26,6 +26,7 @@ object Evaluator:
         case SchemeVal.IntVal(_)    => expr
         case SchemeVal.BoolVal(_)   => expr
         case SchemeVal.StringVal(_) => expr
+        case SchemeVal.CharVal(_)   => expr
         case SchemeVal.Symbol(name) =>
           env.lookup(name) match
             case Some(v) => v

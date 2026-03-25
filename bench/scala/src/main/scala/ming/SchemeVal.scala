@@ -4,7 +4,7 @@ enum SchemeVal:
   var pos: (Int, Int) = (0, 0)
   case IntVal(n: Long)
   case BoolVal(b: Boolean)
-  case StringVal(s: String)
+  case StringVal(chars: Array[Char])
   case Symbol(name: String)
   case CharVal(c: Char)
   case SList(elems: List[SchemeVal])
@@ -14,12 +14,14 @@ enum SchemeVal:
 
 object SchemeVal:
 
+  def str(s: String): StringVal = StringVal(s.toCharArray)
+
   /** write-style display (strings quoted) */
   def display(v: SchemeVal): String = v match
     case IntVal(n)            => n.toString
     case BoolVal(true)        => "#t"
     case BoolVal(false)       => "#f"
-    case StringVal(s)         => s"\"$s\""
+    case StringVal(chars)     => s"\"${new String(chars)}\""
     case CharVal(c)           => s"#\\$c"
     case Symbol(name)         => name
     case SList(elems)         => "(" + elems.map(display).mkString(" ") + ")"
@@ -29,9 +31,9 @@ object SchemeVal:
 
   /** display-style output (strings unquoted) */
   def displayOutput(v: SchemeVal): String = v match
-    case StringVal(s) => s
-    case CharVal(c)   => c.toString
-    case other        => display(other)
+    case StringVal(chars) => new String(chars)
+    case CharVal(c)       => c.toString
+    case other            => display(other)
 
 class Env(
   private val bindings: scala.collection.mutable.Map[String, SchemeVal],
