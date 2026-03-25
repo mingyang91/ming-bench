@@ -32,7 +32,8 @@ impl Evaluator {
             | "display" | "write" | "newline" | "char?"
             | "string-append" | "string-length" | "substring"
             | "string->number" | "number->string"
-            | "symbol->string" | "string->symbol" | "string-ref")
+            | "symbol->string" | "string->symbol" | "string-ref"
+            | "string-copy")
     }
 
     fn eval_in_env(&mut self, expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
@@ -40,6 +41,7 @@ impl Evaluator {
         match &expr.kind {
             ExprKind::Integer(n) => Ok(Value::Integer(*n)),
             ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
+            ExprKind::Char(c) => Ok(Value::Char(*c)),
             ExprKind::Str(s) => Ok(Value::Str(s.clone())),
             ExprKind::Symbol(s) => {
                 if let Some(v) = env.get(s) {
@@ -71,6 +73,7 @@ impl Evaluator {
                 "cond" => return self.eval_cond(&elems[1..], env, call_pos),
                 "and" => return self.eval_and(&elems[1..], env),
                 "or" => return self.eval_or(&elems[1..], env),
+                "string-set!" => return self.eval_string_set(&elems[1..], env, call_pos),
                 "not" => {
                     if elems.len() != 2 {
                         return Err(EvalError::Arity(format!(
@@ -197,6 +200,7 @@ impl Evaluator {
         match &expr.kind {
             ExprKind::Integer(n) => Value::Integer(*n),
             ExprKind::Boolean(b) => Value::Boolean(*b),
+            ExprKind::Char(c) => Value::Char(*c),
             ExprKind::Str(s) => Value::Str(s.clone()),
             ExprKind::Symbol(s) => Value::Symbol(s.clone()),
             ExprKind::List(elems) => {
@@ -307,6 +311,36 @@ impl Evaluator {
             result = self.eval_in_env(expr, &mut new_env)?;
         }
         Ok(result)
+    }
+
+    fn eval_string_set(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<Value, EvalError> {
+        if args.len() != 3 {
+            return Err(EvalError::Arity(format!("string-set!: expected 3 arguments at {pos}")));
+        }
+        let var_name = match &args[0].kind {
+            ExprKind::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Type(format!("string-set!: expected variable at {pos}"))),
+        };
+        let idx = self.eval_in_env(&args[1], env)?;
+        let idx = self.expect_integer(&idx, "string-set!", pos)? as usize;
+        let ch = self.eval_in_env(&args[2], env)?;
+        let ch = match ch {
+            Value::Char(c) => c,
+            _ => return Err(EvalError::Type(format!("string-set!: expected char at {pos}"))),
+        };
+        let s = env.get(&var_name).ok_or_else(|| {
+            EvalError::UnboundVariable(format!("{var_name} at {pos}"))
+        })?.clone();
+        match s {
+            Value::Str(mut string) => {
+                let mut chars: Vec<char> = string.chars().collect();
+                chars[idx] = ch;
+                string = chars.into_iter().collect();
+                env.set(&var_name, Value::Str(string));
+                Ok(Value::Void)
+            }
+            _ => Err(EvalError::Type(format!("string-set!: expected string at {pos}"))),
+        }
     }
 
     fn eval_begin(&mut self, args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
@@ -562,6 +596,13 @@ impl Evaluator {
                 match &args[0] {
                     Value::Str(s) => Ok(Value::Symbol(s.clone())),
                     _ => Err(EvalError::Type(format!("string->symbol: expected string at {pos}"))),
+                }
+            }
+            "string-copy" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("string-copy: expected 1 argument at {pos}"))); }
+                match &args[0] {
+                    Value::Str(s) => Ok(Value::Str(s.clone())),
+                    _ => Err(EvalError::Type(format!("string-copy: expected string at {pos}"))),
                 }
             }
             "string-ref" => {

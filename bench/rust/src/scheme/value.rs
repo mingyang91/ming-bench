@@ -47,6 +47,17 @@ impl Env {
         self.frames.last_mut().unwrap().insert(name, val);
     }
 
+    /// Mutate an existing binding (searches from innermost frame outward).
+    pub fn set(&mut self, name: &str, val: Value) -> bool {
+        for frame in self.frames.iter_mut().rev() {
+            if frame.contains_key(name) {
+                frame.insert(name.to_string(), val);
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn push_frame(&mut self) {
         self.frames.push(HashMap::new());
     }

@@ -11,6 +11,7 @@ pub struct Expr {
 pub enum ExprKind {
     Integer(i64),
     Boolean(bool),
+    Char(char),
     Str(String),
     Symbol(String),
     List(Vec<Expr>),
@@ -216,6 +217,16 @@ fn parse_atom(s: &str) -> ExprKind {
         ExprKind::Boolean(true)
     } else if s == "#f" {
         ExprKind::Boolean(false)
+    } else if s.starts_with("#\\") {
+        let name = &s[2..];
+        let ch = match name {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            _ if name.len() == 1 => name.chars().next().unwrap(),
+            _ => return ExprKind::Symbol(s.to_string()),
+        };
+        ExprKind::Char(ch)
     } else if s.starts_with('"') && s.ends_with('"') {
         ExprKind::Str(s[1..s.len() - 1].to_string())
     } else if let Ok(n) = s.parse::<i64>() {
