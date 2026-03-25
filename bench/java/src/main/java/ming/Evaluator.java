@@ -11,7 +11,7 @@ import java.util.Set;
 public class Evaluator {
 
     // ── Value types ──────────────────────────────────────────────
-    private sealed interface Val permits Val.Int, Val.Rat, Val.Flo, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda, Val.CaseLambda, Val.Macro, Val.RecordInstance, Val.Vec, Val.ContVal, Val.CallccVal, Val.DynamicWindVal, Val.WithExceptionHandlerVal {
+    private sealed interface Val permits Val.Int, Val.Rat, Val.Flo, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda, Val.CaseLambda, Val.Macro, Val.RecordInstance, Val.Vec, Val.ContVal, Val.CallccVal, Val.DynamicWindVal, Val.WithExceptionHandlerVal, Val.CallWithValuesVal, Val.MultiVal {
         record Int(long value) implements Val {}
         record Rat(long num, long den) implements Val {}
         record Flo(double value) implements Val {}
@@ -79,6 +79,10 @@ public class Evaluator {
         final class DynamicWindVal implements Val {}
         // with-exception-handler as a first-class value
         final class WithExceptionHandlerVal implements Val {}
+        // call-with-values as a first-class value
+        final class CallWithValuesVal implements Val {}
+        // Multiple return values from (values ...)
+        record MultiVal(List<Val> values) implements Val {}
     }
 
     // ── Token with position ─────────────────────────────────────
@@ -176,6 +180,8 @@ public class Evaluator {
             case Val.CallccVal ignored -> "#<procedure:call/cc>";
             case Val.DynamicWindVal ignored -> "#<procedure:dynamic-wind>";
             case Val.WithExceptionHandlerVal ignored -> "#<procedure:with-exception-handler>";
+            case Val.CallWithValuesVal ignored -> "#<procedure:call-with-values>";
+            case Val.MultiVal mv -> mv.values().isEmpty() ? "#<void>" : writeVal(mv.values().get(0));
         };
     }
 
@@ -425,6 +431,7 @@ public class Evaluator {
         record GuardBodyK(Kont k) implements Kont {}
         record GuardClauseK(String varName, Val clauses, Env env, Kont k) implements Kont {}
         record RaiseErrorK() implements Kont {}
+        record CallWithValuesK(Val consumer, Kont k, Val form) implements Kont {}
     }
 
     // CEK step: either evaluate an expression or apply a continuation
@@ -619,6 +626,13 @@ public class Evaluator {
                     int last = wehArgs.size() - 1;
                     yield new Step.Eval(wehArgs.get(last), env,
                         new Kont.ArgK(fn, new ArrayList<>(), wehArgs, last - 1, env, k, form));
+                }
+                if (fn instanceof Val.CallWithValuesVal) {
+                    List<Val> cwvArgs = collectList(argsList);
+                    if (cwvArgs.size() != 2) throw posError(form, "call-with-values requires 2 arguments");
+                    int last = cwvArgs.size() - 1;
+                    yield new Step.Eval(cwvArgs.get(last), env,
+                        new Kont.ArgK(fn, new ArrayList<>(), cwvArgs, last - 1, env, k, form));
                 }
                 List<Val> argExprs = collectList(argsList);
                 if (argExprs.isEmpty()) {
@@ -828,6 +842,17 @@ public class Evaluator {
             case Kont.RaiseErrorK() -> {
                 throw new EvalError("raise: exception handler returned");
             }
+
+            case Kont.CallWithValuesK(var consumer, var k, var form) -> {
+                // value is the result of the producer thunk
+                List<Val> vals;
+                if (value instanceof Val.MultiVal mv) {
+                    vals = mv.values();
+                } else {
+                    vals = List.of(value);
+                }
+                yield applyFunctionStep(consumer, new ArrayList<>(vals), k, form);
+            }
         };
     }
 
@@ -856,6 +881,13 @@ public class Evaluator {
             // Call in-thunk first
             return applyFunctionStep(inThunk, new ArrayList<>(),
                 new Kont.DynWindCallInK(inThunk, bodyThunk, outThunk, k), form);
+        }
+        if (fn instanceof Val.CallWithValuesVal) {
+            if (args.size() != 2) throw posError(form, "call-with-values requires 2 arguments");
+            Val producer = args.get(0), consumer = args.get(1);
+            // Call producer thunk; CallWithValuesK will apply consumer to results
+            return applyFunctionStep(producer, new ArrayList<>(),
+                new Kont.CallWithValuesK(consumer, k, form), form);
         }
 
         Val.Lambda lambda = null;
@@ -1546,6 +1578,11 @@ public class Evaluator {
         env.define("call-with-current-continuation", new Val.CallccVal());
         env.define("dynamic-wind", new Val.DynamicWindVal());
         env.define("with-exception-handler", new Val.WithExceptionHandlerVal());
+        env.define("call-with-values", new Val.CallWithValuesVal());
+        env.define("values", new Val.Builtin("values", args -> {
+            if (args.size() == 1) return args.get(0); // single value transparency
+            return new Val.MultiVal(new ArrayList<>(args));
+        }));
         env.define("raise", new Val.Builtin("raise", args -> {
             checkArgCount(args, 1, "raise");
             throw new SchemeRaise(args.get(0));
