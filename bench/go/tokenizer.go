@@ -19,6 +19,7 @@ const (
 	TokenFloat
 	TokenRational
 	TokenEOF
+	TokenVecOpen // #(
 )
 
 type Token struct {
@@ -150,6 +151,8 @@ func (t *Tokenizer) readHash(line, col int) (Token, error) {
 	}
 	ch := t.advance()
 	switch ch {
+	case '(':
+		return Token{Type: TokenVecOpen, Line: line, Col: col}, nil
 	case 't':
 		return Token{Type: TokenBoolean, StrVal: "t", Line: line, Col: col}, nil
 	case 'f':

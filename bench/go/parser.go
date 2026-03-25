@@ -100,6 +100,8 @@ func (p *Parser) ParseExpr() (*Expr, error) {
 			Line: tok.Line,
 			Col:  tok.Col,
 		}, nil
+	case TokenVecOpen:
+		return p.parseVectorLiteral(tok.Line, tok.Col)
 	case TokenRParen:
 		return nil, fmt.Errorf("%d:%d: unexpected ')'", tok.Line, tok.Col)
 	case TokenEOF:
@@ -121,6 +123,28 @@ func (p *Parser) parseList(line, col int) (*Expr, error) {
 		}
 		if tok.Type == TokenEOF {
 			return nil, fmt.Errorf("%d:%d: unterminated list", line, col)
+		}
+		expr, err := p.ParseExpr()
+		if err != nil {
+			return nil, err
+		}
+		elements = append(elements, expr)
+	}
+}
+
+func (p *Parser) parseVectorLiteral(line, col int) (*Expr, error) {
+	elements := []*Expr{{Type: ExprSymbol, StrVal: "vector", Line: line, Col: col}}
+	for {
+		tok, err := p.peek()
+		if err != nil {
+			return nil, err
+		}
+		if tok.Type == TokenRParen {
+			p.next()
+			return &Expr{Type: ExprList, Elements: elements, Line: line, Col: col}, nil
+		}
+		if tok.Type == TokenEOF {
+			return nil, fmt.Errorf("%d:%d: unterminated vector literal", line, col)
 		}
 		expr, err := p.ParseExpr()
 		if err != nil {

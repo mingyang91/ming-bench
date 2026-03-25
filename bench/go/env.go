@@ -159,7 +159,18 @@ func makeGlobalEnv() *Env {
 	env.Set("assoc", &Value{Type: TypeSymbol, StrVal: "builtin:assoc"})
 	env.Set("equal?", &Value{Type: TypeSymbol, StrVal: "builtin:equal?"})
 	env.Set("eq?", &Value{Type: TypeSymbol, StrVal: "builtin:eq?"})
+	env.Set("eqv?", &Value{Type: TypeSymbol, StrVal: "builtin:eqv?"})
 	env.Set("procedure?", &Value{Type: TypeSymbol, StrVal: "builtin:procedure?"})
+
+	// Vectors (L14)
+	env.Set("vector", &Value{Type: TypeSymbol, StrVal: "builtin:vector"})
+	env.Set("make-vector", &Value{Type: TypeSymbol, StrVal: "builtin:make-vector"})
+	env.Set("vector-ref", &Value{Type: TypeSymbol, StrVal: "builtin:vector-ref"})
+	env.Set("vector-set!", &Value{Type: TypeSymbol, StrVal: "builtin:vector-set!"})
+	env.Set("vector-length", &Value{Type: TypeSymbol, StrVal: "builtin:vector-length"})
+	env.Set("vector?", &Value{Type: TypeSymbol, StrVal: "builtin:vector?"})
+	env.Set("vector->list", &Value{Type: TypeSymbol, StrVal: "builtin:vector->list"})
+	env.Set("list->vector", &Value{Type: TypeSymbol, StrVal: "builtin:list->vector"})
 
 	return env
 }
@@ -992,6 +1003,88 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 		isProcedure := t == TypeLambda || t == TypeGoFunc || t == TypeCaseLambda ||
 			(t == TypeSymbol && len(args[0].StrVal) > 8 && args[0].StrVal[:8] == "builtin:")
 		return BoolValue(isProcedure), nil
+
+	case "builtin:eqv?":
+		if len(args) != 2 {
+			return nil, fmt.Errorf("%d:%d: 'eqv?' expects 2 arguments", line, col)
+		}
+		return BoolValue(valuesEqv(args[0], args[1])), nil
+
+	// Vectors (L14)
+	case "builtin:vector":
+		elems := make([]*Value, len(args))
+		copy(elems, args)
+		return VectorVal(elems), nil
+
+	case "builtin:make-vector":
+		if len(args) < 1 || len(args) > 2 || args[0].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'make-vector' expects size and optional fill", line, col)
+		}
+		size := int(args[0].IntVal)
+		fill := IntValue(0)
+		if len(args) == 2 {
+			fill = args[1]
+		}
+		elems := make([]*Value, size)
+		for i := range elems {
+			elems[i] = fill
+		}
+		return VectorVal(elems), nil
+
+	case "builtin:vector-ref":
+		if len(args) != 2 || args[0].Type != TypeVector || args[1].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'vector-ref' expects vector and index", line, col)
+		}
+		idx := int(args[1].IntVal)
+		if idx < 0 || idx >= len(args[0].VecElems) {
+			return nil, fmt.Errorf("%d:%d: 'vector-ref' index out of range", line, col)
+		}
+		return args[0].VecElems[idx], nil
+
+	case "builtin:vector-set!":
+		if len(args) != 3 || args[0].Type != TypeVector || args[1].Type != TypeInteger {
+			return nil, fmt.Errorf("%d:%d: 'vector-set!' expects vector, index, value", line, col)
+		}
+		idx := int(args[1].IntVal)
+		if idx < 0 || idx >= len(args[0].VecElems) {
+			return nil, fmt.Errorf("%d:%d: 'vector-set!' index out of range", line, col)
+		}
+		args[0].VecElems[idx] = args[2]
+		return Void, nil
+
+	case "builtin:vector-length":
+		if len(args) != 1 || args[0].Type != TypeVector {
+			return nil, fmt.Errorf("%d:%d: 'vector-length' expects a vector", line, col)
+		}
+		return IntValue(int64(len(args[0].VecElems))), nil
+
+	case "builtin:vector?":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("%d:%d: 'vector?' expects 1 argument", line, col)
+		}
+		return BoolValue(args[0].Type == TypeVector), nil
+
+	case "builtin:vector->list":
+		if len(args) != 1 || args[0].Type != TypeVector {
+			return nil, fmt.Errorf("%d:%d: 'vector->list' expects a vector", line, col)
+		}
+		result := Null
+		for i := len(args[0].VecElems) - 1; i >= 0; i-- {
+			result = PairValue(args[0].VecElems[i], result)
+		}
+		return result, nil
+
+	case "builtin:list->vector":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("%d:%d: 'list->vector' expects a list", line, col)
+		}
+		var elems []*Value
+		cur := args[0]
+		for cur.Type == TypePair {
+			elems = append(elems, cur.Car)
+			cur = cur.Cdr
+		}
+		return VectorVal(elems), nil
 	}
 
 	return nil, fmt.Errorf("%d:%d: unknown builtin %s", line, col, name)
@@ -1018,8 +1111,41 @@ func valuesEqual(a, b *Value) bool {
 		return true
 	case TypePair:
 		return valuesEqual(a.Car, b.Car) && valuesEqual(a.Cdr, b.Cdr)
+	case TypeVector:
+		if len(a.VecElems) != len(b.VecElems) {
+			return false
+		}
+		for i := range a.VecElems {
+			if !valuesEqual(a.VecElems[i], b.VecElems[i]) {
+				return false
+			}
+		}
+		return true
 	}
 	return a == b
+}
+
+func valuesEqv(a, b *Value) bool {
+	if a == b {
+		return true
+	}
+	if isNumeric(a) && isNumeric(b) {
+		return numericEqual(a, b)
+	}
+	if a.Type != b.Type {
+		return false
+	}
+	switch a.Type {
+	case TypeBoolean:
+		return a.BoolVal == b.BoolVal
+	case TypeSymbol:
+		return a.StrVal == b.StrVal
+	case TypeChar:
+		return a.CharVal == b.CharVal
+	case TypeNull:
+		return true
+	}
+	return false
 }
 
 func valuesEq(a, b *Value) bool {

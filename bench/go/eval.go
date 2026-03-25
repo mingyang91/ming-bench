@@ -66,6 +66,14 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalDefineRecordType(expr, env)
 		case "case-lambda":
 			return evalCaseLambda(expr, env)
+		case "letrec":
+			return evalLetrec(expr, env)
+		case "letrec*":
+			return evalLetrecStar(expr, env)
+		case "case":
+			return evalCase(expr, env)
+		case "do":
+			return evalDo(expr, env)
 		}
 		// Check for macro application
 		if val, ok := env.Get(head.StrVal); ok && val.Type == TypeMacro {
@@ -666,4 +674,217 @@ func callCaseLambda(fn *Value, args []*Value, line, col int) (*Value, error) {
 		}
 	}
 	return nil, fmt.Errorf("%d:%d: no matching clause in case-lambda for %d arguments", line, col, len(args))
+}
+
+func evalLetrec(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.Elements) < 3 {
+		return nil, fmt.Errorf("%d:%d: 'letrec' requires bindings and body", expr.Line, expr.Col)
+	}
+	bindingsExpr := expr.Elements[1]
+	if bindingsExpr.Type != ExprList {
+		return nil, fmt.Errorf("%d:%d: 'letrec' bindings must be a list", expr.Line, expr.Col)
+	}
+	letEnv := NewEnv(env)
+	// First bind all names to undefined
+	names := make([]string, len(bindingsExpr.Elements))
+	for i, binding := range bindingsExpr.Elements {
+		if binding.Type != ExprList || len(binding.Elements) != 2 || binding.Elements[0].Type != ExprSymbol {
+			return nil, fmt.Errorf("%d:%d: invalid letrec binding", expr.Line, expr.Col)
+		}
+		names[i] = binding.Elements[0].StrVal
+		letEnv.Set(names[i], Void)
+	}
+	// Evaluate init expressions in the new env
+	for i, binding := range bindingsExpr.Elements {
+		val, err := Eval(binding.Elements[1], letEnv)
+		if err != nil {
+			return nil, err
+		}
+		letEnv.Set(names[i], val)
+	}
+	// Evaluate body
+	var result *Value
+	for _, bodyExpr := range expr.Elements[2:] {
+		var err error
+		result, err = Eval(bodyExpr, letEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalLetrecStar(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.Elements) < 3 {
+		return nil, fmt.Errorf("%d:%d: 'letrec*' requires bindings and body", expr.Line, expr.Col)
+	}
+	bindingsExpr := expr.Elements[1]
+	if bindingsExpr.Type != ExprList {
+		return nil, fmt.Errorf("%d:%d: 'letrec*' bindings must be a list", expr.Line, expr.Col)
+	}
+	letEnv := NewEnv(env)
+	for _, binding := range bindingsExpr.Elements {
+		if binding.Type != ExprList || len(binding.Elements) != 2 || binding.Elements[0].Type != ExprSymbol {
+			return nil, fmt.Errorf("%d:%d: invalid letrec* binding", expr.Line, expr.Col)
+		}
+		val, err := Eval(binding.Elements[1], letEnv)
+		if err != nil {
+			return nil, err
+		}
+		letEnv.Set(binding.Elements[0].StrVal, val)
+	}
+	var result *Value
+	for _, bodyExpr := range expr.Elements[2:] {
+		var err error
+		result, err = Eval(bodyExpr, letEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalCase(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.Elements) < 3 {
+		return nil, fmt.Errorf("%d:%d: 'case' requires key and clauses", expr.Line, expr.Col)
+	}
+	key, err := Eval(expr.Elements[1], env)
+	if err != nil {
+		return nil, err
+	}
+	for _, clause := range expr.Elements[2:] {
+		if clause.Type != ExprList || len(clause.Elements) < 2 {
+			return nil, fmt.Errorf("%d:%d: invalid case clause", expr.Line, expr.Col)
+		}
+		// else clause
+		if clause.Elements[0].Type == ExprSymbol && clause.Elements[0].StrVal == "else" {
+			var result *Value
+			for _, e := range clause.Elements[1:] {
+				result, err = Eval(e, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		// datum list: ((datum ...) expr ...)
+		datums := clause.Elements[0]
+		if datums.Type != ExprList {
+			return nil, fmt.Errorf("%d:%d: case clause datums must be a list", expr.Line, expr.Col)
+		}
+		matched := false
+		for _, d := range datums.Elements {
+			dv := exprToValue(d)
+			if valuesEqv(key, dv) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			var result *Value
+			for _, e := range clause.Elements[1:] {
+				result, err = Eval(e, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+	}
+	return Void, nil
+}
+
+func evalDo(expr *Expr, env *Env) (*Value, error) {
+	// (do ((var init step) ...) (test expr ...) body ...)
+	if len(expr.Elements) < 3 {
+		return nil, fmt.Errorf("%d:%d: 'do' requires variable bindings and test", expr.Line, expr.Col)
+	}
+	varsExpr := expr.Elements[1]
+	testExpr := expr.Elements[2]
+	bodyExprs := expr.Elements[3:]
+
+	if varsExpr.Type != ExprList {
+		return nil, fmt.Errorf("%d:%d: 'do' variable bindings must be a list", expr.Line, expr.Col)
+	}
+	if testExpr.Type != ExprList || len(testExpr.Elements) < 1 {
+		return nil, fmt.Errorf("%d:%d: 'do' test clause must be a list", expr.Line, expr.Col)
+	}
+
+	type doVar struct {
+		name    string
+		stepIdx int // index into varsExpr.Elements; -1 if no step
+	}
+
+	vars := make([]doVar, len(varsExpr.Elements))
+	doEnv := NewEnv(env)
+
+	// Initialize variables
+	for i, v := range varsExpr.Elements {
+		if v.Type != ExprList || len(v.Elements) < 2 || len(v.Elements) > 3 {
+			return nil, fmt.Errorf("%d:%d: invalid do variable spec", expr.Line, expr.Col)
+		}
+		if v.Elements[0].Type != ExprSymbol {
+			return nil, fmt.Errorf("%d:%d: do variable name must be a symbol", expr.Line, expr.Col)
+		}
+		vars[i].name = v.Elements[0].StrVal
+		if len(v.Elements) == 3 {
+			vars[i].stepIdx = i
+		} else {
+			vars[i].stepIdx = -1
+		}
+		initVal, err := Eval(v.Elements[1], env)
+		if err != nil {
+			return nil, err
+		}
+		doEnv.Set(vars[i].name, initVal)
+	}
+
+	// Iteration loop
+	for {
+		// Check test
+		testVal, err := Eval(testExpr.Elements[0], doEnv)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(testVal) {
+			// Evaluate result expressions
+			if len(testExpr.Elements) == 1 {
+				return Void, nil
+			}
+			var result *Value
+			for _, e := range testExpr.Elements[1:] {
+				result, err = Eval(e, doEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+
+		// Execute body
+		for _, b := range bodyExprs {
+			_, err := Eval(b, doEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// Compute step values (all using current env, parallel update)
+		newVals := make([]*Value, len(vars))
+		for i, v := range vars {
+			if v.stepIdx >= 0 {
+				stepExpr := varsExpr.Elements[i].Elements[2]
+				newVals[i], err = Eval(stepExpr, doEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		// Apply step values
+		for i, v := range vars {
+			if v.stepIdx >= 0 {
+				doEnv.Set(v.name, newVals[i])
+			}
+		}
+	}
 }

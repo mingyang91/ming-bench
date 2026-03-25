@@ -23,6 +23,7 @@ const (
 	TypeRecord
 	TypeGoFunc
 	TypeCaseLambda
+	TypeVector
 )
 
 type GoFunc func(args []*Value) (*Value, error)
@@ -65,6 +66,8 @@ type Value struct {
 	GoFunc GoFunc
 	// Case-lambda clauses
 	CaseClauses []CaseLambdaClause
+	// Vector elements
+	VecElems []*Value
 }
 
 var Void = &Value{Type: TypeVoid}
@@ -97,6 +100,10 @@ func CharValue(c rune) *Value {
 
 func PairValue(car, cdr *Value) *Value {
 	return &Value{Type: TypePair, Car: car, Cdr: cdr}
+}
+
+func VectorVal(elems []*Value) *Value {
+	return &Value{Type: TypeVector, VecElems: elems}
 }
 
 func makeGoFunc(fn GoFunc) *Value {
@@ -145,6 +152,17 @@ func (v *Value) Display() string {
 		return "#<procedure>"
 	case TypeCaseLambda:
 		return "#<procedure>"
+	case TypeVector:
+		var sb strings.Builder
+		sb.WriteString("#(")
+		for i, e := range v.VecElems {
+			if i > 0 {
+				sb.WriteByte(' ')
+			}
+			sb.WriteString(e.Display())
+		}
+		sb.WriteByte(')')
+		return sb.String()
 	}
 	return ""
 }
@@ -156,6 +174,17 @@ func (v *Value) WriteRepr() string {
 		return fmt.Sprintf("%q", v.StrVal)
 	case TypePair:
 		return writeList(v)
+	case TypeVector:
+		var sb strings.Builder
+		sb.WriteString("#(")
+		for i, e := range v.VecElems {
+			if i > 0 {
+				sb.WriteByte(' ')
+			}
+			sb.WriteString(e.WriteRepr())
+		}
+		sb.WriteByte(')')
+		return sb.String()
 	default:
 		return v.Display()
 	}
