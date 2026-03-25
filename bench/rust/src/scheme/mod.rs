@@ -117,6 +117,7 @@ impl Expr {
 }
 
 type EnvRef = Rc<RefCell<Environment>>;
+type BindingRef = Rc<RefCell<Value>>;
 
 #[derive(Clone)]
 struct UserProcedure {
@@ -135,7 +136,7 @@ impl UserProcedure {
 #[derive(Default)]
 struct Environment {
     parent: Option<EnvRef>,
-    bindings: HashMap<String, Value>,
+    bindings: HashMap<String, BindingRef>,
     output: Rc<RefCell<String>>,
 }
 
@@ -164,21 +165,22 @@ impl Environment {
     }
 
     fn define(env: &EnvRef, name: String, value: Value) {
-        env.borrow_mut().bindings.insert(name, value);
+        env.borrow_mut()
+            .bindings
+            .insert(name, Rc::new(RefCell::new(value)));
+    }
+
+    fn lookup_binding(env: &EnvRef, name: &str) -> Option<BindingRef> {
+        let (binding, parent) = {
+            let env = env.borrow();
+            (env.bindings.get(name).cloned(), env.parent.clone())
+        };
+
+        binding.or_else(|| parent.and_then(|parent| Self::lookup_binding(&parent, name)))
     }
 
     fn lookup(env: &EnvRef, name: &str) -> Option<Value> {
-        let parent = {
-            let env = env.borrow();
-
-            if let Some(value) = env.bindings.get(name) {
-                return Some(value.clone());
-            }
-
-            env.parent.clone()
-        };
-
-        parent.and_then(|parent| Self::lookup(&parent, name))
+        Self::lookup_binding(env, name).map(|binding| binding.borrow().clone())
     }
 
     fn append_output(env: &EnvRef, text: &str) {
@@ -407,6 +409,7 @@ fn eval_list(items: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, 
 
     match &head.kind {
         ExprKind::Symbol(name) if name == "define" => eval_define(tail, env, head.pos),
+        ExprKind::Symbol(name) if name == "set!" => eval_set(tail, env, head.pos),
         ExprKind::Symbol(name) if name == "if" => eval_if(tail, env, head.pos),
         ExprKind::Symbol(name) if name == "quote" => eval_quote(tail, head.pos),
         ExprKind::Symbol(name) if name == "lambda" => eval_lambda(tail, env, head.pos),
@@ -460,6 +463,25 @@ fn eval_define(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value
         }
         _ => Err(EvalError::syntax("invalid define form", position)),
     }
+}
+
+fn eval_set(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+    let [name_expr, value_expr] = exprs else {
+        return Err(EvalError::syntax(
+            "set! requires exactly 2 expressions",
+            position,
+        ));
+    };
+
+    let ExprKind::Symbol(name) = &name_expr.kind else {
+        return Err(EvalError::syntax("set! target must be a symbol", name_expr.pos));
+    };
+
+    let binding = Environment::lookup_binding(&env, name)
+        .ok_or_else(|| EvalError::unbound_variable(name.clone(), name_expr.pos))?;
+    let value = eval(value_expr, env)?;
+    *binding.borrow_mut() = value;
+    Ok(Value::Void)
 }
 
 fn eval_if(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
