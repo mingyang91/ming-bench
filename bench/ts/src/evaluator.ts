@@ -32,6 +32,11 @@ interface StringValue {
   value: string;
 }
 
+interface CharacterValue {
+  kind: 'char';
+  value: string;
+}
+
 interface SymbolValue {
   kind: 'symbol';
   value: string;
@@ -55,6 +60,7 @@ type SchemeValue =
   | NumberValue
   | BooleanValue
   | StringValue
+  | CharacterValue
   | SymbolValue
   | EmptyListValue
   | PairValue
@@ -137,14 +143,7 @@ const VOID_VALUE: VoidValue = { kind: 'void' };
  * representation of the last result.
  */
 export function evalStr(input: string): string {
-  const expressions = parseProgram(input);
-  if (expressions.length === 0) {
-    throw new EvalError('empty input', { line: 1, column: 1 });
-  }
-
-  const env = createGlobalEnvironment();
-  const result = evaluateSequence(expressions, env);
-  return formatValue(result);
+  return evaluateProgram(input).result;
 }
 
 /**
@@ -152,10 +151,22 @@ export function evalStr(input: string): string {
  * and any captured output from display/write/newline.
  */
 export function evalStrWithOutput(input: string): { result: string; output: string } {
-  return { result: evalStr(input), output: '' };
+  return evaluateProgram(input);
 }
 
-function createGlobalEnvironment(): Environment {
+function evaluateProgram(input: string): { result: string; output: string } {
+  const expressions = parseProgram(input);
+  if (expressions.length === 0) {
+    throw new EvalError('empty input', { line: 1, column: 1 });
+  }
+
+  const output: string[] = [];
+  const env = createGlobalEnvironment(output);
+  const result = evaluateSequence(expressions, env);
+  return { result: formatValue(result), output: output.join('') };
+}
+
+function createGlobalEnvironment(output: string[]): Environment {
   const env = new Environment();
 
   env.define('+', makeBuiltinProcedure('+', (args) => numberValue(sum(asNumbers(args, '+')))));
@@ -195,12 +206,24 @@ function createGlobalEnvironment(): Environment {
   env.define('list', makeBuiltinProcedure('list', (args) => arrayToList(args)));
   env.define('length', makeBuiltinProcedure('length', (args) => applyLength(args)));
   env.define('append', makeBuiltinProcedure('append', (args) => applyAppend(args)));
+  env.define('display', makeBuiltinProcedure('display', (args) => applyDisplay(args, output)));
+  env.define('write', makeBuiltinProcedure('write', (args) => applyWrite(args, output)));
+  env.define('newline', makeBuiltinProcedure('newline', (args) => applyNewline(args, output)));
+  env.define('string-append', makeBuiltinProcedure('string-append', (args) => applyStringAppend(args)));
+  env.define('string-length', makeBuiltinProcedure('string-length', (args) => applyStringLength(args)));
+  env.define('substring', makeBuiltinProcedure('substring', (args) => applySubstring(args)));
+  env.define('string->number', makeBuiltinProcedure('string->number', (args) => applyStringToNumber(args)));
+  env.define('number->string', makeBuiltinProcedure('number->string', (args) => applyNumberToString(args)));
+  env.define('symbol->string', makeBuiltinProcedure('symbol->string', (args) => applySymbolToString(args)));
+  env.define('string->symbol', makeBuiltinProcedure('string->symbol', (args) => applyStringToSymbol(args)));
+  env.define('string-ref', makeBuiltinProcedure('string-ref', (args) => applyStringRef(args)));
 
   env.define('string?', makePredicateProcedure('string?', (value) => value.kind === 'string'));
   env.define('number?', makePredicateProcedure('number?', (value) => value.kind === 'number'));
   env.define('boolean?', makePredicateProcedure('boolean?', (value) => value.kind === 'boolean'));
   env.define('pair?', makePredicateProcedure('pair?', (value) => value.kind === 'pair'));
   env.define('symbol?', makePredicateProcedure('symbol?', (value) => value.kind === 'symbol'));
+  env.define('char?', makePredicateProcedure('char?', (value) => value.kind === 'char'));
 
   return env;
 }
@@ -752,6 +775,84 @@ function applyAppend(args: SchemeValue[]): SchemeValue {
   return result;
 }
 
+function applyDisplay(args: SchemeValue[], output: string[]): SchemeValue {
+  expectExactArgCount('display', args, 1);
+  output.push(formatDisplayValue(args[0]));
+  return VOID_VALUE;
+}
+
+function applyWrite(args: SchemeValue[], output: string[]): SchemeValue {
+  expectExactArgCount('write', args, 1);
+  output.push(formatValue(args[0]));
+  return VOID_VALUE;
+}
+
+function applyNewline(args: SchemeValue[], output: string[]): SchemeValue {
+  expectExactArgCount('newline', args, 0);
+  output.push('\n');
+  return VOID_VALUE;
+}
+
+function applyStringAppend(args: SchemeValue[]): SchemeValue {
+  return stringValue(args.map((arg) => expectString(arg, 'string-append')).join(''));
+}
+
+function applyStringLength(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('string-length', args, 1);
+  return numberValue(readStringChars(expectString(args[0], 'string-length')).length);
+}
+
+function applySubstring(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('substring', args, 3);
+
+  const chars = readStringChars(expectString(args[0], 'substring'));
+  const start = expectIndex(args[1], 'substring');
+  const end = expectIndex(args[2], 'substring');
+  if (start > end || end > chars.length) {
+    throw new EvalError('substring index out of range');
+  }
+
+  return stringValue(chars.slice(start, end).join(''));
+}
+
+function applyStringToNumber(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('string->number', args, 1);
+
+  const parsed = parseStringToNumber(expectString(args[0], 'string->number'));
+  if (parsed === undefined) {
+    return FALSE_VALUE;
+  }
+
+  return numberValue(parsed);
+}
+
+function applyNumberToString(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('number->string', args, 1);
+  return stringValue(formatNumber(expectNumber(args[0], 'number->string')));
+}
+
+function applySymbolToString(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('symbol->string', args, 1);
+  return stringValue(expectSymbol(args[0], 'symbol->string'));
+}
+
+function applyStringToSymbol(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('string->symbol', args, 1);
+  return symbolValue(expectString(args[0], 'string->symbol'));
+}
+
+function applyStringRef(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('string-ref', args, 2);
+
+  const chars = readStringChars(expectString(args[0], 'string-ref'));
+  const index = expectIndex(args[1], 'string-ref');
+  if (index >= chars.length) {
+    throw new EvalError('string-ref index out of range');
+  }
+
+  return charValue(chars[index]);
+}
+
 function asNumbers(args: SchemeValue[], name: string): number[] {
   return args.map((arg) => expectNumber(arg, name));
 }
@@ -764,12 +865,37 @@ function expectNumber(value: SchemeValue, name: string): number {
   return value.value;
 }
 
+function expectString(value: SchemeValue, name: string): string {
+  if (value.kind !== 'string') {
+    throw new EvalError(`${name} expected a string`);
+  }
+
+  return value.value;
+}
+
+function expectSymbol(value: SchemeValue, name: string): string {
+  if (value.kind !== 'symbol') {
+    throw new EvalError(`${name} expected a symbol`);
+  }
+
+  return value.value;
+}
+
 function expectPair(value: SchemeValue, name: string): PairValue {
   if (value.kind !== 'pair') {
     throw new EvalError(`${name} expected a pair`);
   }
 
   return value;
+}
+
+function expectIndex(value: SchemeValue, name: string): number {
+  const number = expectNumber(value, name);
+  if (!Number.isInteger(number) || number < 0) {
+    throw new EvalError(`${name} expected a non-negative integer`);
+  }
+
+  return number;
 }
 
 function expectList(value: SchemeValue, name: string): SchemeValue[] {
@@ -878,6 +1004,8 @@ function formatValue(value: SchemeValue): string {
       return value.value ? '#t' : '#f';
     case 'string':
       return JSON.stringify(value.value);
+    case 'char':
+      return formatChar(value.value);
     case 'symbol':
       return value.value;
     case 'empty-list':
@@ -888,6 +1016,19 @@ function formatValue(value: SchemeValue): string {
       return '#<void>';
     case 'procedure':
       return `#<procedure:${value.name}>`;
+  }
+}
+
+function formatDisplayValue(value: SchemeValue): string {
+  switch (value.kind) {
+    case 'string':
+      return value.value;
+    case 'char':
+      return value.value;
+    case 'pair':
+      return formatDisplayPair(value);
+    default:
+      return formatValue(value);
   }
 }
 
@@ -907,12 +1048,40 @@ function formatPair(pair: PairValue): string {
   return `(${parts.join(' ')} . ${formatValue(current)})`;
 }
 
+function formatDisplayPair(pair: PairValue): string {
+  const parts: string[] = [];
+  let current: SchemeValue = pair;
+
+  while (current.kind === 'pair') {
+    parts.push(formatDisplayValue(current.car));
+    current = current.cdr;
+  }
+
+  if (current.kind === 'empty-list') {
+    return `(${parts.join(' ')})`;
+  }
+
+  return `(${parts.join(' ')} . ${formatDisplayValue(current)})`;
+}
+
 function formatNumber(value: number): string {
   if (Object.is(value, -0)) {
     return '0';
   }
 
   return Number.isInteger(value) ? String(Math.trunc(value)) : String(value);
+}
+
+function formatChar(value: string): string {
+  if (value === ' ') {
+    return '#\\space';
+  }
+
+  if (value === '\n') {
+    return '#\\newline';
+  }
+
+  return `#\\${value}`;
 }
 
 function isTruthy(value: SchemeValue): boolean {
@@ -929,6 +1098,10 @@ function booleanValue(value: boolean): BooleanValue {
 
 function stringValue(value: string): StringValue {
   return { kind: 'string', value };
+}
+
+function charValue(value: string): CharacterValue {
+  return { kind: 'char', value };
 }
 
 function symbolValue(value: string): SymbolValue {
@@ -1032,6 +1205,22 @@ function decodeEscape(char: string): string {
     default:
       return char;
   }
+}
+
+function readStringChars(value: string): string[] {
+  return Array.from(value);
+}
+
+function parseStringToNumber(value: string): number | undefined {
+  if (/^[+-]?\d+$/u.test(value)) {
+    return Number(value);
+  }
+
+  if (/^[+-]?(?:\d+\.\d*|\d*\.\d+)$/u.test(value)) {
+    return Number(value);
+  }
+
+  return undefined;
 }
 
 function readAtomToken(
