@@ -126,6 +126,8 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 			return evalCase(e, env)
 		case "do":
 			return evalDo(e, env)
+		case "dynamic-wind":
+			return evalDynamicWind(e, env)
 		}
 
 		// Check for macro application
@@ -1352,6 +1354,67 @@ func evalCase(e *ListExpr, env *Env) (Value, error) {
 		}
 	}
 	return &VoidVal{}, nil
+}
+
+func evalDynamicWind(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Items) != 4 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: dynamic-wind: requires exactly 3 arguments", e.Ln, e.Cl)}
+	}
+
+	// Evaluate the three thunk expressions
+	inThunk, err := eval(e.Items[1], env)
+	if err != nil {
+		return nil, err
+	}
+	bodyThunk, err := eval(e.Items[2], env)
+	if err != nil {
+		return nil, err
+	}
+	outThunk, err := eval(e.Items[3], env)
+	if err != nil {
+		return nil, err
+	}
+
+	// Call in-thunk
+	_, err = callProc(inThunk, nil, e.Ln, e.Cl)
+	if err != nil {
+		return nil, err
+	}
+
+	// Call body-thunk, catching any continuation jumps so we can run out-thunk
+	var bodyResult Value
+	var bodyErr error
+	var jump *continuationJump
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if j, ok := r.(*continuationJump); ok {
+					jump = j
+					return
+				}
+				panic(r)
+			}
+		}()
+		bodyResult, bodyErr = callProc(bodyThunk, nil, e.Ln, e.Cl)
+	}()
+
+	// Call out-thunk (always, even on non-local exit)
+	_, outErr := callProc(outThunk, nil, e.Ln, e.Cl)
+
+	// If there was a continuation jump, re-panic after out-thunk
+	if jump != nil {
+		panic(jump)
+	}
+
+	if bodyErr != nil {
+		return nil, bodyErr
+	}
+	if outErr != nil {
+		return nil, outErr
+	}
+
+	return bodyResult, nil
 }
 
 func evalDo(e *ListExpr, env *Env) (Value, error) {
