@@ -528,11 +528,18 @@ fn eval_sequence(
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let mut context = EvalContext::default();
     let result = eval_program(input, &mut context)?;
-    Ok((result.render(), context.output))
+    Ok((render_output_result(&result), context.output))
 }
 
 fn eval_expr(expr: &Expr, env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
     machine::eval_expr(expr, env, context)
+}
+
+fn render_output_result(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.borrow().clone(),
+        _ => value.render(),
+    }
 }
 
 fn resolve_outcome(
