@@ -79,6 +79,11 @@ interface PairValue {
   cdr: SchemeValue;
 }
 
+interface VectorValue {
+  kind: 'vector';
+  elements: SchemeValue[];
+}
+
 interface RecordTypeDefinition {
   id: number;
   name: string;
@@ -103,6 +108,7 @@ type SchemeValue =
   | SymbolValue
   | EmptyListValue
   | PairValue
+  | VectorValue
   | RecordValue
   | VoidValue
   | ProcedureValue;
@@ -156,6 +162,12 @@ interface ParserState {
 interface LetBindingSpec {
   name: SymbolExpr;
   valueExpression: Expr;
+}
+
+interface DoBindingSpec {
+  name: SymbolExpr;
+  initExpression: Expr;
+  stepExpression?: Expr;
 }
 
 interface RecordConstructorSpec {
@@ -245,6 +257,7 @@ const EMPTY_LIST_VALUE: EmptyListValue = { kind: 'empty-list' };
 const VOID_VALUE: VoidValue = { kind: 'void' };
 const SPECIAL_FORM_NAMES = new Set([
   'and',
+  'case',
   'or',
   'begin',
   'case-lambda',
@@ -252,9 +265,12 @@ const SPECIAL_FORM_NAMES = new Set([
   'define',
   'define-record-type',
   'define-syntax',
+  'do',
   'if',
   'lambda',
   'let',
+  'letrec',
+  'letrec*',
   'quote',
   'set!',
 ]);
@@ -325,6 +341,7 @@ function createGlobalEnvironment(output: string[]): Environment {
   env.define('not', makeBuiltinProcedure('not', (args) => applyNot(args)));
   env.define('apply', makeBuiltinProcedure('apply', (args) => applyApply(args)));
   env.define('eq?', makeBuiltinProcedure('eq?', (args) => applyEq(args)));
+  env.define('eqv?', makeBuiltinProcedure('eqv?', (args) => applyEqv(args)));
   env.define('equal?', makeBuiltinProcedure('equal?', (args) => applyEqual(args)));
   env.define(
     'procedure?',
@@ -362,6 +379,13 @@ function createGlobalEnvironment(output: string[]): Environment {
   env.define('append', makeBuiltinProcedure('append', (args) => applyAppend(args)));
   env.define('assoc', makeBuiltinProcedure('assoc', (args) => applyAssoc(args)));
   env.define('map', makeBuiltinProcedure('map', (args) => applyMap(args)));
+  env.define('vector', makeBuiltinProcedure('vector', (args) => applyVector(args)));
+  env.define('make-vector', makeBuiltinProcedure('make-vector', (args) => applyMakeVector(args)));
+  env.define('vector-ref', makeBuiltinProcedure('vector-ref', (args) => applyVectorRef(args)));
+  env.define('vector-set!', makeBuiltinProcedure('vector-set!', (args) => applyVectorSet(args)));
+  env.define('vector-length', makeBuiltinProcedure('vector-length', (args) => applyVectorLength(args)));
+  env.define('vector->list', makeBuiltinProcedure('vector->list', (args) => applyVectorToList(args)));
+  env.define('list->vector', makeBuiltinProcedure('list->vector', (args) => applyListToVector(args)));
   env.define('display', makeBuiltinProcedure('display', (args) => applyDisplay(args, output)));
   env.define('write', makeBuiltinProcedure('write', (args) => applyWrite(args, output)));
   env.define('newline', makeBuiltinProcedure('newline', (args) => applyNewline(args, output)));
@@ -416,6 +440,7 @@ function createGlobalEnvironment(output: string[]): Environment {
   env.define('pair?', makePredicateProcedure('pair?', (value) => value.kind === 'pair'));
   env.define('symbol?', makePredicateProcedure('symbol?', (value) => value.kind === 'symbol'));
   env.define('list?', makePredicateProcedure('list?', (value) => isProperList(value)));
+  env.define('vector?', makePredicateProcedure('vector?', (value) => value.kind === 'vector'));
   env.define('char?', makePredicateProcedure('char?', (value) => value.kind === 'char'));
   env.define(
     'exact->inexact',
@@ -1536,6 +1561,8 @@ function evaluateList(items: Expr[], env: Environment): SchemeValue {
     switch (head.value) {
       case 'and':
         return evaluateAnd(items.slice(1), env);
+      case 'case':
+        return evaluateCase(items.slice(1), env);
       case 'or':
         return evaluateOr(items.slice(1), env);
       case 'begin':
@@ -1548,6 +1575,8 @@ function evaluateList(items: Expr[], env: Environment): SchemeValue {
         return evaluateDefineRecordType(items.slice(1), env);
       case 'define-syntax':
         return evaluateDefineSyntax(items.slice(1), env);
+      case 'do':
+        return evaluateDo(items.slice(1), env);
       case 'if':
         return evaluateIf(items.slice(1), env);
       case 'case-lambda':
@@ -1556,6 +1585,10 @@ function evaluateList(items: Expr[], env: Environment): SchemeValue {
         return evaluateLambda(items.slice(1), env);
       case 'let':
         return evaluateLet(items.slice(1), env);
+      case 'letrec':
+        return evaluateLetrec(items.slice(1), env);
+      case 'letrec*':
+        return evaluateLetrecStar(items.slice(1), env);
       case 'quote':
         return evaluateQuote(items.slice(1));
       case 'set!':
@@ -1578,6 +1611,50 @@ function evaluateAnd(items: Expr[], env: Environment): SchemeValue {
   }
 
   return result;
+}
+
+function evaluateCase(items: Expr[], env: Environment): SchemeValue {
+  if (items.length < 1) {
+    throw new EvalError('case requires a key and at least one clause');
+  }
+
+  const key = evaluate(items[0], env);
+  const clauses = items.slice(1);
+
+  for (let index = 0; index < clauses.length; index += 1) {
+    const clause = clauses[index];
+    if (clause.kind !== 'list' || clause.items.length === 0) {
+      throw new EvalError('case clauses must be non-empty lists');
+    }
+
+    const [datumsExpression, ...body] = clause.items;
+    if (datumsExpression.kind === 'symbol' && datumsExpression.value === 'else') {
+      if (index !== clauses.length - 1) {
+        throw new EvalError('case else clause must be last');
+      }
+      return evaluateCaseClauseBody(body, env);
+    }
+
+    if (datumsExpression.kind !== 'list') {
+      throw new EvalError('case clauses must start with a datum list');
+    }
+
+    for (const datum of datumsExpression.items) {
+      if (schemeEqv(key, quoteExpression(datum))) {
+        return evaluateCaseClauseBody(body, env);
+      }
+    }
+  }
+
+  return VOID_VALUE;
+}
+
+function evaluateCaseClauseBody(body: Expr[], env: Environment): SchemeValue {
+  if (body.length === 0) {
+    return VOID_VALUE;
+  }
+
+  return evaluateSequence(body, env);
 }
 
 function evaluateOr(items: Expr[], env: Environment): SchemeValue {
@@ -1761,6 +1838,48 @@ function evaluateSet(items: Expr[], env: Environment): SchemeValue {
   return VOID_VALUE;
 }
 
+function evaluateDo(items: Expr[], env: Environment): SchemeValue {
+  if (items.length < 2) {
+    throw new EvalError('do requires bindings and a termination clause');
+  }
+
+  const bindings = parseDoBindings(items[0]);
+  const { testExpression, resultExpressions } = parseDoTerminationClause(items[1]);
+  const body = items.slice(2);
+
+  const loopEnv = env.child();
+  const runtimeBindings = bindings.map((bindingSpec) => {
+    const binding: Binding = { value: VOID_VALUE };
+    defineIdentifierBinding(bindingSpec.name, loopEnv, binding);
+    return binding;
+  });
+
+  const initValues = bindings.map((bindingSpec) => evaluate(bindingSpec.initExpression, env));
+  for (let index = 0; index < bindings.length; index += 1) {
+    runtimeBindings[index].value = initValues[index];
+  }
+
+  while (true) {
+    if (isTruthy(evaluate(testExpression, loopEnv))) {
+      return resultExpressions.length === 0 ? VOID_VALUE : evaluateSequence(resultExpressions, loopEnv);
+    }
+
+    for (const expression of body) {
+      evaluate(expression, loopEnv);
+    }
+
+    const nextValues = bindings.map((bindingSpec, index) =>
+      bindingSpec.stepExpression === undefined
+        ? runtimeBindings[index].value
+        : evaluate(bindingSpec.stepExpression, loopEnv),
+    );
+
+    for (let index = 0; index < bindings.length; index += 1) {
+      runtimeBindings[index].value = nextValues[index];
+    }
+  }
+}
+
 function evaluateLet(items: Expr[], env: Environment): SchemeValue {
   if (items.length < 2) {
     throw new EvalError('let requires bindings and a body');
@@ -1808,6 +1927,48 @@ function evaluateNamedLet(items: Expr[], env: Environment): SchemeValue {
   return applyProcedure(closure, args);
 }
 
+function evaluateLetrec(items: Expr[], env: Environment): SchemeValue {
+  return evaluateRecursiveLet('letrec', items, env, false);
+}
+
+function evaluateLetrecStar(items: Expr[], env: Environment): SchemeValue {
+  return evaluateRecursiveLet('letrec*', items, env, true);
+}
+
+function evaluateRecursiveLet(
+  name: 'letrec' | 'letrec*',
+  items: Expr[],
+  env: Environment,
+  sequential: boolean,
+): SchemeValue {
+  if (items.length < 2) {
+    throw new EvalError(`${name} requires bindings and a body`);
+  }
+
+  const bindings = parseLetBindings(items[0]);
+  const letrecEnv = env.child();
+
+  if (sequential) {
+    for (const bindingSpec of bindings) {
+      const binding: Binding = { value: VOID_VALUE };
+      defineIdentifierBinding(bindingSpec.name, letrecEnv, binding);
+      binding.value = evaluate(bindingSpec.valueExpression, letrecEnv);
+    }
+  } else {
+    const runtimeBindings = bindings.map((bindingSpec) => {
+      const binding: Binding = { value: VOID_VALUE };
+      defineIdentifierBinding(bindingSpec.name, letrecEnv, binding);
+      return binding;
+    });
+    const values = bindings.map((bindingSpec) => evaluate(bindingSpec.valueExpression, letrecEnv));
+    for (let index = 0; index < runtimeBindings.length; index += 1) {
+      runtimeBindings[index].value = values[index];
+    }
+  }
+
+  return evaluateSequence(items.slice(1), letrecEnv);
+}
+
 function parseLetBindings(expression: Expr): LetBindingSpec[] {
   if (expression.kind !== 'list') {
     throw new EvalError('let bindings must be a list');
@@ -1828,6 +1989,45 @@ function parseLetBindings(expression: Expr): LetBindingSpec[] {
       valueExpression: bindingExpression.items[1],
     };
   });
+}
+
+function parseDoBindings(expression: Expr): DoBindingSpec[] {
+  if (expression.kind !== 'list') {
+    throw new EvalError('do bindings must be a list');
+  }
+
+  return expression.items.map((bindingExpression) => {
+    if (
+      bindingExpression.kind !== 'list' ||
+      (bindingExpression.items.length !== 2 && bindingExpression.items.length !== 3)
+    ) {
+      throw new EvalError('do bindings must contain a name, init, and optional step');
+    }
+
+    const nameExpression = bindingExpression.items[0];
+    if (nameExpression.kind !== 'symbol') {
+      throw new EvalError('do binding names must be symbols');
+    }
+
+    return {
+      name: nameExpression,
+      initExpression: bindingExpression.items[1],
+      stepExpression: bindingExpression.items[2],
+    };
+  });
+}
+
+function parseDoTerminationClause(
+  expression: Expr,
+): { testExpression: Expr; resultExpressions: Expr[] } {
+  if (expression.kind !== 'list' || expression.items.length === 0) {
+    throw new EvalError('do termination clause must be a non-empty list');
+  }
+
+  return {
+    testExpression: expression.items[0],
+    resultExpressions: expression.items.slice(1),
+  };
 }
 
 function parseLambdaParts(items: Expr[]): { params: SymbolExpr[]; restParam?: SymbolExpr; body: Expr[] } {
@@ -2060,6 +2260,11 @@ function applyEq(args: SchemeValue[]): SchemeValue {
   return booleanValue(schemeEq(args[0], args[1]));
 }
 
+function applyEqv(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('eqv?', args, 2);
+  return booleanValue(schemeEqv(args[0], args[1]));
+}
+
 function applyEqual(args: SchemeValue[]): SchemeValue {
   expectExactArgCount('equal?', args, 2);
   return booleanValue(schemeEqual(args[0], args[1]));
@@ -2251,6 +2456,60 @@ function applyMap(args: SchemeValue[]): SchemeValue {
   }
 
   return arrayToList(results);
+}
+
+function applyVector(args: SchemeValue[]): SchemeValue {
+  return vectorValue([...args]);
+}
+
+function applyMakeVector(args: SchemeValue[]): SchemeValue {
+  if (args.length !== 1 && args.length !== 2) {
+    throw new EvalError(`make-vector expected 1 or 2 argument(s), got ${args.length}`);
+  }
+
+  const length = expectIndex(args[0], 'make-vector');
+  const fill = args[1] ?? VOID_VALUE;
+  return vectorValue(Array.from({ length }, () => fill));
+}
+
+function applyVectorRef(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('vector-ref', args, 2);
+
+  const vector = expectVector(args[0], 'vector-ref');
+  const index = expectIndex(args[1], 'vector-ref');
+  if (index >= vector.elements.length) {
+    throw new EvalError('vector-ref index out of range');
+  }
+
+  return vector.elements[index];
+}
+
+function applyVectorSet(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('vector-set!', args, 3);
+
+  const vector = expectVector(args[0], 'vector-set!');
+  const index = expectIndex(args[1], 'vector-set!');
+  if (index >= vector.elements.length) {
+    throw new EvalError('vector-set! index out of range');
+  }
+
+  vector.elements[index] = args[2];
+  return VOID_VALUE;
+}
+
+function applyVectorLength(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('vector-length', args, 1);
+  return exactIntegerValue(expectVector(args[0], 'vector-length').elements.length);
+}
+
+function applyVectorToList(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('vector->list', args, 1);
+  return arrayToList(expectVector(args[0], 'vector->list').elements);
+}
+
+function applyListToVector(args: SchemeValue[]): SchemeValue {
+  expectExactArgCount('list->vector', args, 1);
+  return vectorValue(expectList(args[0], 'list->vector'));
 }
 
 function applyDisplay(args: SchemeValue[], output: string[]): SchemeValue {
@@ -2512,6 +2771,14 @@ function expectPair(value: SchemeValue, name: string): PairValue {
   return value;
 }
 
+function expectVector(value: SchemeValue, name: string): VectorValue {
+  if (value.kind !== 'vector') {
+    throw new EvalError(`${name} expected a vector`);
+  }
+
+  return value;
+}
+
 function expectIndex(value: SchemeValue, name: string): number {
   const number = expectNumber(value, name);
   if (!isIntegerNumber(number) || compareNumbers(number, exactNumber(0)) < 0) {
@@ -2683,6 +2950,8 @@ function formatValue(value: SchemeValue): string {
       return '()';
     case 'pair':
       return formatPair(value);
+    case 'vector':
+      return formatVector(value);
     case 'record':
       return `#<record:${value.recordType.name}>`;
     case 'void':
@@ -2700,6 +2969,8 @@ function formatDisplayValue(value: SchemeValue): string {
       return value.value;
     case 'pair':
       return formatDisplayPair(value);
+    case 'vector':
+      return formatVector(value);
     default:
       return formatValue(value);
   }
@@ -2735,6 +3006,10 @@ function formatDisplayPair(pair: PairValue): string {
   }
 
   return `(${parts.join(' ')} . ${formatDisplayValue(current)})`;
+}
+
+function formatVector(vector: VectorValue): string {
+  return `#(${vector.elements.map((element) => formatValue(element)).join(' ')})`;
 }
 
 function formatNumber(value: SchemeNumber): string {
@@ -2788,6 +3063,10 @@ function isProperList(value: SchemeValue): boolean {
 }
 
 function schemeEq(left: SchemeValue, right: SchemeValue): boolean {
+  return schemeEqv(left, right);
+}
+
+function schemeEqv(left: SchemeValue, right: SchemeValue): boolean {
   if (left.kind !== right.kind) {
     return false;
   }
@@ -2804,6 +3083,7 @@ function schemeEq(left: SchemeValue, right: SchemeValue): boolean {
       return true;
     case 'string':
     case 'pair':
+    case 'vector':
     case 'record':
     case 'procedure':
       return left === right;
@@ -2832,6 +3112,13 @@ function schemeEqual(left: SchemeValue, right: SchemeValue): boolean {
         schemeEqual(left.car, (right as PairValue).car) &&
         schemeEqual(left.cdr, (right as PairValue).cdr)
       );
+    case 'vector': {
+      const rightVector = right as VectorValue;
+      return (
+        left.elements.length === rightVector.elements.length &&
+        left.elements.every((element, index) => schemeEqual(element, rightVector.elements[index]))
+      );
+    }
     case 'record':
     case 'procedure':
       return left === right;
@@ -2864,6 +3151,10 @@ function symbolValue(value: string): SymbolValue {
 
 function pairValue(car: SchemeValue, cdr: SchemeValue): PairValue {
   return { kind: 'pair', car, cdr };
+}
+
+function vectorValue(elements: SchemeValue[]): VectorValue {
+  return { kind: 'vector', elements };
 }
 
 function recordValue(recordType: RecordTypeDefinition, fields: SchemeValue[]): RecordValue {
