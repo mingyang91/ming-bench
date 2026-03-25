@@ -1,10 +1,10 @@
 use super::value_ops::eqv_value;
 use super::{
     apply_outcome, collect_list, env_define, env_lookup_cell, env_set, eval_expr,
-    eval_expr_outcome, eval_sequence, eval_sequence_outcome, is_proper_list,
-    make_immutable_string_value, make_list_value, syntax_error, type_mismatch, wrong_arg_count,
-    CaseLambda, Env, EnvRef, EvalContext, EvalError, EvalOutcome, Expr, ExprKind, Lambda,
-    LambdaParams, Procedure, SourcePos, Value,
+    eval_expr_outcome, eval_sequence, eval_sequence_outcome, make_immutable_string_value,
+    make_list_value, make_pair_value, make_vector_value, parse_cond_consequent, syntax_error,
+    type_mismatch, wrong_arg_count, CaseLambda, CondConsequent, Env, EnvRef, EvalContext,
+    EvalError, EvalOutcome, Expr, ExprKind, Lambda, LambdaParams, Procedure, SourcePos, Value,
 };
 use std::rc::Rc;
 
@@ -52,8 +52,8 @@ pub(super) fn eval_set(
 pub(super) fn parse_define_signature(
     signature: &Expr,
 ) -> Result<(String, LambdaParams), EvalError> {
-    let items = signature
-        .list_items()
+    let (items, tail) = signature
+        .list_parts()
         .ok_or_else(|| syntax_error(signature.pos, "invalid define form"))?;
 
     let (name_expr, params) = items
@@ -65,7 +65,7 @@ pub(super) fn parse_define_signature(
         .ok_or_else(|| syntax_error(name_expr.pos, "function name must be a symbol"))?
         .to_string();
 
-    let params = parse_params(params)?;
+    let params = parse_param_exprs(params, tail)?;
     Ok((name, params))
 }
 
@@ -102,6 +102,29 @@ fn parse_params(params: &[Expr]) -> Result<LambdaParams, EvalError> {
     Ok(LambdaParams { required, rest })
 }
 
+fn parse_param_exprs(params: &[Expr], tail: Option<&Expr>) -> Result<LambdaParams, EvalError> {
+    match tail {
+        Some(rest_expr) => parse_dotted_params(params, rest_expr),
+        None => parse_params(params),
+    }
+}
+
+fn parse_dotted_params(params: &[Expr], rest_expr: &Expr) -> Result<LambdaParams, EvalError> {
+    let required = params
+        .iter()
+        .map(parse_param_name)
+        .collect::<Result<Vec<_>, _>>()?;
+    let rest = Some(parse_param_name(rest_expr)?);
+    Ok(LambdaParams { required, rest })
+}
+
+fn parse_param_name(expr: &Expr) -> Result<String, EvalError> {
+    expr.symbol_name()
+        .filter(|name| *name != ".")
+        .map(ToString::to_string)
+        .ok_or_else(|| syntax_error(expr.pos, "parameter name must be a symbol"))
+}
+
 pub(super) fn eval_cond(
     clauses: &[Expr],
     env: &EnvRef,
@@ -126,15 +149,29 @@ pub(super) fn eval_cond(
 
         let test_value = eval_expr(test, env, context)?;
         if test_value.is_truthy() {
-            return if body.is_empty() {
-                Ok(EvalOutcome::Value(test_value))
-            } else {
-                eval_sequence_outcome(body, env, clause.pos, context, tail)
-            };
+            return eval_cond_consequent(body, clause.pos, env, context, tail, test_value);
         }
     }
 
     Ok(EvalOutcome::Value(Value::Void))
+}
+
+fn eval_cond_consequent(
+    consequent: &[Expr],
+    clause_pos: SourcePos,
+    env: &EnvRef,
+    context: &mut EvalContext,
+    tail: bool,
+    test_value: Value,
+) -> Result<EvalOutcome, EvalError> {
+    match parse_cond_consequent(consequent)? {
+        CondConsequent::Body(body) if body.is_empty() => Ok(EvalOutcome::Value(test_value)),
+        CondConsequent::Body(body) => eval_sequence_outcome(&body, env, clause_pos, context, tail),
+        CondConsequent::Arrow(procedure_expr) => {
+            let procedure = eval_expr(&procedure_expr, env, context)?;
+            apply_outcome(procedure, vec![test_value], clause_pos, context, tail)
+        }
+    }
 }
 
 pub(super) fn eval_case(
@@ -538,6 +575,23 @@ pub(super) fn eval_quote(args: &[Expr], pos: SourcePos) -> Result<Value, EvalErr
     }
 }
 
+pub(super) fn eval_quasiquote(
+    args: &[Expr],
+    env: &EnvRef,
+    pos: SourcePos,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    match args {
+        [expr] => eval_quasiquote_expr(expr, env, context, 1),
+        _ => Err(wrong_arg_count(
+            pos,
+            "quasiquote",
+            "exactly 1 argument",
+            args.len(),
+        )),
+    }
+}
+
 pub(super) fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Number(value) => Ok(Value::Number(*value)),
@@ -550,7 +604,195 @@ pub(super) fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
             .map(quote_expr)
             .collect::<Result<Vec<_>, _>>()
             .map(make_list_value),
+        ExprKind::DottedList(items, tail) => {
+            let tail = quote_expr(tail)?;
+            items.iter().rev().try_fold(tail, |cdr, item| {
+                let car = quote_expr(item)?;
+                Ok(make_pair_value(car, cdr))
+            })
+        }
+        ExprKind::Vector(items) => items
+            .iter()
+            .map(quote_expr)
+            .collect::<Result<Vec<_>, _>>()
+            .map(make_vector_value),
     }
+}
+
+fn eval_quasiquote_expr(
+    expr: &Expr,
+    env: &EnvRef,
+    context: &mut EvalContext,
+    depth: usize,
+) -> Result<Value, EvalError> {
+    match &expr.kind {
+        ExprKind::List(items) => eval_quasiquote_list(expr.pos, items, None, env, context, depth),
+        ExprKind::DottedList(items, tail) => {
+            eval_quasiquote_list(expr.pos, items, Some(tail), env, context, depth)
+        }
+        ExprKind::Vector(items) => eval_quasiquote_vector(items, env, context, depth),
+        _ => quote_expr(expr),
+    }
+}
+
+fn eval_quasiquote_list(
+    pos: SourcePos,
+    items: &[Expr],
+    tail: Option<&Expr>,
+    env: &EnvRef,
+    context: &mut EvalContext,
+    depth: usize,
+) -> Result<Value, EvalError> {
+    if tail.is_none() {
+        if let Some(value) = eval_quasiquote_special_form(pos, items, env, context, depth)? {
+            return Ok(value);
+        }
+    }
+
+    let mut result = match tail {
+        Some(tail_expr) => {
+            if depth == 1 && is_unquote_splicing_form(tail_expr) {
+                return Err(syntax_error(
+                    tail_expr.pos,
+                    "unquote-splicing cannot appear in a dotted list tail",
+                ));
+            }
+            eval_quasiquote_expr(tail_expr, env, context, depth)?
+        }
+        None => make_list_value(Vec::new()),
+    };
+
+    for item in items.iter().rev() {
+        if depth == 1 {
+            if let Some(values) = eval_quasiquote_splice(item, env, context)? {
+                for value in values.into_iter().rev() {
+                    result = make_pair_value(value, result);
+                }
+                continue;
+            }
+        }
+
+        let value = eval_quasiquote_expr(item, env, context, depth)?;
+        result = make_pair_value(value, result);
+    }
+
+    Ok(result)
+}
+
+fn eval_quasiquote_vector(
+    items: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+    depth: usize,
+) -> Result<Value, EvalError> {
+    let mut values = Vec::new();
+
+    for item in items {
+        if depth == 1 {
+            if let Some(spliced) = eval_quasiquote_splice(item, env, context)? {
+                values.extend(spliced);
+                continue;
+            }
+        }
+
+        values.push(eval_quasiquote_expr(item, env, context, depth)?);
+    }
+
+    Ok(make_vector_value(values))
+}
+
+fn eval_quasiquote_special_form(
+    pos: SourcePos,
+    items: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+    depth: usize,
+) -> Result<Option<Value>, EvalError> {
+    match items {
+        [head, expr] if head.symbol_name() == Some("quasiquote") => {
+            let value = eval_quasiquote_expr(expr, env, context, depth + 1)?;
+            Ok(Some(make_list_value(vec![
+                Value::Symbol("quasiquote".into()),
+                value,
+            ])))
+        }
+        [head, expr] if head.symbol_name() == Some("unquote") => {
+            if depth == 1 {
+                return eval_expr(expr, env, context).map(Some);
+            }
+
+            let value = eval_quasiquote_expr(expr, env, context, depth - 1)?;
+            Ok(Some(make_list_value(vec![
+                Value::Symbol("unquote".into()),
+                value,
+            ])))
+        }
+        [head, expr] if head.symbol_name() == Some("unquote-splicing") => {
+            if depth == 1 {
+                return Err(syntax_error(
+                    pos,
+                    "unquote-splicing must appear within a list or vector",
+                ));
+            }
+
+            let value = eval_quasiquote_expr(expr, env, context, depth - 1)?;
+            Ok(Some(make_list_value(vec![
+                Value::Symbol("unquote-splicing".into()),
+                value,
+            ])))
+        }
+        [head, ..]
+            if matches!(
+                head.symbol_name(),
+                Some("quasiquote" | "unquote" | "unquote-splicing")
+            ) =>
+        {
+            let name = head
+                .symbol_name()
+                .expect("matched quasiquote keyword must have a symbol name");
+            Err(wrong_arg_count(
+                pos,
+                name,
+                "exactly 1 argument",
+                items.len() - 1,
+            ))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn eval_quasiquote_splice(
+    expr: &Expr,
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Option<Vec<Value>>, EvalError> {
+    let Some(items) = expr.list_items() else {
+        return Ok(None);
+    };
+
+    match items {
+        [head, value_expr] if head.symbol_name() == Some("unquote-splicing") => {
+            let value = eval_expr(value_expr, env, context)?;
+            let values = collect_list(&value).ok_or_else(|| {
+                type_mismatch(expr.pos, "unquote-splicing", "list", value.type_name())
+            })?;
+            Ok(Some(values))
+        }
+        [head, ..] if head.symbol_name() == Some("unquote-splicing") => Err(wrong_arg_count(
+            expr.pos,
+            "unquote-splicing",
+            "exactly 1 argument",
+            items.len() - 1,
+        )),
+        _ => Ok(None),
+    }
+}
+
+fn is_unquote_splicing_form(expr: &Expr) -> bool {
+    matches!(
+        expr.list_items(),
+        Some([head, _]) if head.symbol_name() == Some("unquote-splicing")
+    )
 }
 
 pub(super) fn value_to_expr(value: &Value, pos: SourcePos) -> Result<Expr, EvalError> {
@@ -561,13 +803,14 @@ pub(super) fn value_to_expr(value: &Value, pos: SourcePos) -> Result<Expr, EvalE
         Value::String(string) => Ok(Expr::new(pos, ExprKind::String(string.borrow().clone()))),
         Value::Symbol(symbol) => Ok(Expr::new(pos, ExprKind::Symbol(symbol.clone()))),
         Value::Syntax(syntax) => Ok(syntax.expr.clone()),
-        value if is_proper_list(value) => {
-            let items = collect_list(value)
-                .expect("proper lists must produce their collected elements")
-                .into_iter()
-                .map(|item| value_to_expr(&item, pos))
+        Value::Pair(_) | Value::List(_) => pair_value_to_expr(value, pos),
+        Value::Vector(vector) => {
+            let items = vector
+                .borrow()
+                .iter()
+                .map(|item| value_to_expr(item, pos))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Expr::new(pos, ExprKind::List(items)))
+            Ok(Expr::new(pos, ExprKind::Vector(items)))
         }
         other => Err(type_mismatch(
             pos,
@@ -575,6 +818,33 @@ pub(super) fn value_to_expr(value: &Value, pos: SourcePos) -> Result<Expr, EvalE
             "datum",
             other.type_name(),
         )),
+    }
+}
+
+fn pair_value_to_expr(value: &Value, pos: SourcePos) -> Result<Expr, EvalError> {
+    let mut items = Vec::new();
+    let mut cursor = value.clone();
+
+    loop {
+        match cursor {
+            Value::List(tail_items) => {
+                let tail_items = tail_items
+                    .iter()
+                    .map(|item| value_to_expr(item, pos))
+                    .collect::<Result<Vec<_>, _>>()?;
+                items.extend(tail_items);
+                return Ok(Expr::new(pos, ExprKind::List(items)));
+            }
+            Value::Pair(pair) => {
+                let pair = pair.borrow();
+                items.push(value_to_expr(&pair.car, pos)?);
+                cursor = pair.cdr.clone();
+            }
+            tail => {
+                let tail = value_to_expr(&tail, pos)?;
+                return Ok(Expr::new(pos, ExprKind::DottedList(items, Box::new(tail))));
+            }
+        }
     }
 }
 
@@ -592,10 +862,10 @@ pub(super) fn eval_lambda(
         return Err(syntax_error(pos, "lambda requires a body"));
     }
 
-    let params = params_expr
-        .list_items()
+    let (params, tail) = params_expr
+        .list_parts()
         .ok_or_else(|| syntax_error(params_expr.pos, "lambda parameters must be a list"))?;
-    let params = parse_params(params)?;
+    let params = parse_param_exprs(params, tail)?;
 
     make_lambda(name, params, body, env, pos)
 }
@@ -637,13 +907,13 @@ fn parse_case_lambda_clause(clause: &Expr, env: &EnvRef) -> Result<Rc<Lambda>, E
         ));
     }
 
-    let params = params_expr.list_items().ok_or_else(|| {
+    let (params, tail) = params_expr.list_parts().ok_or_else(|| {
         syntax_error(
             params_expr.pos,
             "case-lambda clause parameters must be a list",
         )
     })?;
-    let params = parse_params(params)?;
+    let params = parse_param_exprs(params, tail)?;
 
     Ok(Rc::new(Lambda {
         name: None,

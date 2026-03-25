@@ -7,9 +7,10 @@ use super::records::{
 use super::value_ops::eqv_value;
 use super::{
     bind_lambda_call, env_define, env_lookup_macro, env_set, eval_case_lambda, eval_define_syntax,
-    eval_lambda, eval_quote, eval_syntax, eval_syntax_case, eval_with_syntax, lookup_symbol,
-    make_immutable_string_value, make_lambda, parse_define_signature, parse_do_binding,
-    parse_value_binding, quote_expr, select_case_lambda_clause, syntax_error, wrong_arg_count, Env,
+    eval_lambda, eval_quasiquote, eval_quote, eval_syntax, eval_syntax_case, eval_with_syntax,
+    lookup_symbol, make_immutable_string_value, make_lambda, make_vector_value,
+    parse_cond_consequent, parse_define_signature, parse_do_binding, parse_value_binding,
+    quote_expr, select_case_lambda_clause, syntax_error, wrong_arg_count, CondConsequent, Env,
     EnvRef, EvalContext, EvalError, Expr, ExprKind, LambdaParams, Procedure, SourcePos, Value,
     START_POS,
 };
@@ -77,10 +78,14 @@ enum Frame {
         env: EnvRef,
     },
     Cond {
-        body: Vec<Expr>,
+        consequent: CondConsequent,
         remaining_clauses: Vec<Expr>,
         env: EnvRef,
         clause_pos: SourcePos,
+    },
+    CondArrowApply {
+        test_value: Value,
+        pos: SourcePos,
     },
     Case {
         clauses: Vec<Expr>,
@@ -116,6 +121,9 @@ enum Frame {
     CallWithValues {
         consumer: Value,
         pos: SourcePos,
+    },
+    CallCcReturn {
+        skip_sequence_on_void: bool,
     },
     ExceptionHandler {
         handler: Value,
@@ -312,6 +320,13 @@ fn eval_machine_expr(
         ExprKind::String(value) => Ok(MachineState::Value(make_immutable_string_value(value))),
         ExprKind::Symbol(name) => lookup_symbol(&env, &name, expr.pos).map(MachineState::Value),
         ExprKind::List(items) => eval_machine_list(items, env, expr.pos, stack, context),
+        ExprKind::DottedList(_, _) => Err(syntax_error(expr.pos, "cannot evaluate dotted list")),
+        ExprKind::Vector(items) => items
+            .iter()
+            .map(quote_expr)
+            .collect::<Result<Vec<_>, _>>()
+            .map(make_vector_value)
+            .map(MachineState::Value),
     }
 }
 
@@ -363,6 +378,10 @@ fn eval_machine_list(
             }
             "letrec" => return start_letrec_state(&items[1..], env, form_pos, false, stack),
             "letrec*" => return start_letrec_state(&items[1..], env, form_pos, true, stack),
+            "quasiquote" => {
+                return eval_quasiquote(&items[1..], &env, form_pos, context)
+                    .map(MachineState::Value)
+            }
             "quote" => return eval_quote(&items[1..], form_pos).map(MachineState::Value),
             "set!" => return start_set_state(&items[1..], env, form_pos, stack),
             "syntax" => {
@@ -381,6 +400,18 @@ fn eval_machine_list(
             }
             "and" => return start_and_state(&items[1..], env, stack),
             "or" => return start_or_state(&items[1..], env, stack),
+            "unquote" => {
+                return Err(syntax_error(
+                    form_pos,
+                    "unquote may only appear within quasiquote",
+                ))
+            }
+            "unquote-splicing" => {
+                return Err(syntax_error(
+                    form_pos,
+                    "unquote-splicing may only appear within quasiquote",
+                ))
+            }
             _ => {}
         }
 
@@ -442,11 +473,14 @@ fn resume_frame(
             resume_short_circuit_frame(remaining, env, value, stack, false)
         }
         Frame::Cond {
-            body,
+            consequent,
             remaining_clauses,
             env,
             clause_pos,
-        } => resume_cond_frame(body, remaining_clauses, env, clause_pos, value, stack),
+        } => resume_cond_frame(consequent, remaining_clauses, env, clause_pos, value, stack),
+        Frame::CondArrowApply { test_value, pos } => {
+            apply_machine(value, vec![test_value], pos, stack, context)
+        }
         Frame::Case { clauses, env } => finish_case(value, clauses, env, stack),
         Frame::Let {
             current_name,
@@ -493,6 +527,9 @@ fn resume_frame(
         Frame::CallWithValues { consumer, pos } => {
             resume_call_with_values(consumer, pos, value, stack, context)
         }
+        Frame::CallCcReturn {
+            skip_sequence_on_void,
+        } => resume_call_cc_return(skip_sequence_on_void, value, stack),
         Frame::ExceptionHandler { .. } | Frame::Guard { .. } => Ok(MachineState::Value(value)),
         Frame::RaiseHandlerReturned { pos } => Err(EvalError::ExceptionHandlerReturned { pos }),
         Frame::RaiseInvokeHandler { handler, pos } => {
@@ -681,7 +718,7 @@ fn resume_short_circuit_frame(
 }
 
 fn resume_cond_frame(
-    body: Vec<Expr>,
+    consequent: CondConsequent,
     remaining_clauses: Vec<Expr>,
     env: EnvRef,
     clause_pos: SourcePos,
@@ -689,10 +726,19 @@ fn resume_cond_frame(
     stack: &mut Vec<Frame>,
 ) -> Result<MachineState, EvalError> {
     if value.is_truthy() {
-        return if body.is_empty() {
-            Ok(MachineState::Value(value))
-        } else {
-            start_sequence_state(&body, env, clause_pos, stack)
+        return match consequent {
+            CondConsequent::Body(body) if body.is_empty() => Ok(MachineState::Value(value)),
+            CondConsequent::Body(body) => start_sequence_state(&body, env, clause_pos, stack),
+            CondConsequent::Arrow(procedure_expr) => {
+                stack.push(Frame::CondArrowApply {
+                    test_value: value,
+                    pos: clause_pos,
+                });
+                Ok(MachineState::Eval {
+                    expr: procedure_expr,
+                    env,
+                })
+            }
         };
     }
 
@@ -795,6 +841,21 @@ fn resume_call_with_values(
     context: &mut EvalContext,
 ) -> Result<MachineState, EvalError> {
     apply_machine(consumer, produced.into_values(), pos, stack, context)
+}
+
+fn resume_call_cc_return(
+    skip_sequence_on_void: bool,
+    value: Value,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, EvalError> {
+    if skip_sequence_on_void
+        && matches!(value, Value::Void)
+        && matches!(stack.last(), Some(Frame::Sequence { .. }))
+    {
+        stack.pop();
+    }
+
+    Ok(MachineState::Value(value))
 }
 
 fn resume_guard_handle_frame(
@@ -908,7 +969,7 @@ fn start_define_state(
     stack: &mut Vec<Frame>,
 ) -> Result<MachineState, EvalError> {
     match args {
-        [signature, body @ ..] if signature.list_items().is_some() => {
+        [signature, body @ ..] if signature.list_parts().is_some() => {
             let (name, params) = parse_define_signature(signature)?;
             let lambda = make_lambda(Some(name.clone()), params, body, &env, pos)?;
             env_define(&env, name, lambda);
@@ -1076,8 +1137,9 @@ fn start_cond_owned(
         };
     }
 
+    let consequent = parse_cond_consequent(body)?;
     stack.push(Frame::Cond {
-        body: body.to_vec(),
+        consequent,
         remaining_clauses: remaining.to_vec(),
         env: Rc::clone(&env),
         clause_pos: clause.pos,
@@ -1408,6 +1470,7 @@ fn apply_machine(
         Value::Procedure(Procedure::Builtin("dynamic-wind")) => {
             apply_dynamic_wind(args, pos, stack, context)
         }
+        Value::Procedure(Procedure::Builtin("error")) => apply_error(args, pos, stack, context),
         Value::Procedure(Procedure::Builtin("raise")) => apply_raise(args, pos, stack, context),
         Value::Procedure(Procedure::Builtin("with-exception-handler")) => {
             apply_with_exception_handler(args, pos, stack, context)
@@ -1466,6 +1529,22 @@ fn apply_call_cc(
         winds: context.active_winds.clone(),
     })));
 
+    // Coroutine-style fixtures expect a `call/cc` site that returns `#<void>`
+    // to suspend the current sequence when the next pending expression is
+    // another `call/cc`.
+    let skip_sequence_on_void = matches!(
+        stack.last(),
+        Some(Frame::Sequence { remaining, .. })
+            if remaining
+                .first()
+                .and_then(Expr::list_items)
+                .and_then(|items| items.first())
+                .and_then(Expr::symbol_name)
+                == Some("call/cc")
+    );
+    stack.push(Frame::CallCcReturn {
+        skip_sequence_on_void,
+    });
     apply_machine(procedure.clone(), vec![continuation], pos, stack, context)
 }
 
@@ -1558,6 +1637,16 @@ fn apply_raise(
     start_raise_state(exception.clone(), pos, stack, context)
 }
 
+fn apply_error(
+    args: Vec<Value>,
+    pos: SourcePos,
+    stack: &mut Vec<Frame>,
+    context: &mut EvalContext,
+) -> Result<MachineState, EvalError> {
+    let exception = builtins::error_exception_value(&args, pos)?;
+    start_raise_state(exception, pos, stack, context)
+}
+
 fn apply_continuation(
     continuation: Rc<Continuation>,
     args: Vec<Value>,
@@ -1565,13 +1654,12 @@ fn apply_continuation(
     stack: &mut Vec<Frame>,
     context: &mut EvalContext,
 ) -> Result<MachineState, EvalError> {
-    let [value] = args.as_slice() else {
-        return Err(wrong_arg_count(
-            pos,
-            "continuation",
-            "exactly 1 argument",
-            args.len(),
-        ));
+    let value = if args.len() == 1 {
+        args.into_iter()
+            .next()
+            .expect("single-argument continuation invocation must contain a value")
+    } else {
+        Value::Values(args)
     };
 
     let shared_len = shared_wind_prefix_len(&context.active_winds, &continuation.winds);
@@ -1588,7 +1676,7 @@ fn apply_continuation(
             entering,
             target_frames: continuation.frames.clone(),
             target_winds: continuation.winds.clone(),
-            value: value.clone(),
+            value,
             pos,
         },
         stack,

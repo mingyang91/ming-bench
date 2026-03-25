@@ -43,7 +43,9 @@ impl<'a> Parser<'a> {
 
         match self.peek_char() {
             Some('(') => self.parse_list(pos),
-            Some('\'') => self.parse_quote_shorthand(pos),
+            Some('\'') => self.parse_reader_shorthand(pos, "quote"),
+            Some('`') => self.parse_reader_shorthand(pos, "quasiquote"),
+            Some(',') => self.parse_unquote_shorthand(pos),
             Some('"') => self.parse_string(pos),
             Some('#') => self.parse_hash_literal(pos),
             Some('+') | Some('-')
@@ -59,12 +61,27 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_quote_shorthand(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
+    fn parse_reader_shorthand(&mut self, pos: SourcePos, keyword: &str) -> Result<Expr, EvalError> {
         self.bump();
+        self.wrap_reader_form(pos, keyword)
+    }
+
+    fn parse_unquote_shorthand(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
+        self.bump();
+        let keyword = if self.peek_char() == Some('@') {
+            self.bump();
+            "unquote-splicing"
+        } else {
+            "unquote"
+        };
+        self.wrap_reader_form(pos, keyword)
+    }
+
+    fn wrap_reader_form(&mut self, pos: SourcePos, keyword: &str) -> Result<Expr, EvalError> {
         let expr = self.parse_expr()?;
         Ok(Expr::new(
             pos,
-            ExprKind::List(vec![Expr::new(pos, ExprKind::Symbol("quote".into())), expr]),
+            ExprKind::List(vec![Expr::new(pos, ExprKind::Symbol(keyword.into())), expr]),
         ))
     }
 
@@ -78,6 +95,26 @@ impl<'a> Parser<'a> {
                 Some(')') => {
                     self.bump();
                     return Ok(Expr::new(pos, ExprKind::List(items)));
+                }
+                Some('.') if self.is_dotted_list_marker() => {
+                    if items.is_empty() {
+                        return Err(syntax_error(self.current_pos(), "dot cannot start a list"));
+                    }
+
+                    self.bump();
+                    self.skip_ignored();
+                    let tail = self.parse_expr()?;
+                    self.skip_ignored();
+
+                    if self.peek_char() != Some(')') {
+                        return Err(syntax_error(
+                            self.current_pos(),
+                            "dotted list must end after its tail",
+                        ));
+                    }
+
+                    self.bump();
+                    return Ok(Expr::new(pos, ExprKind::DottedList(items, Box::new(tail))));
                 }
                 Some(_) => items.push(self.parse_expr()?),
                 None => return Err(unexpected_eof(self.current_pos())),
@@ -126,14 +163,11 @@ impl<'a> Parser<'a> {
         if self.remaining().starts_with("#'") {
             self.bump();
             self.bump();
-            let expr = self.parse_expr()?;
-            return Ok(Expr::new(
-                pos,
-                ExprKind::List(vec![
-                    Expr::new(pos, ExprKind::Symbol("syntax".into())),
-                    expr,
-                ]),
-            ));
+            return self.wrap_reader_form(pos, "syntax");
+        }
+
+        if self.remaining().starts_with("#(") {
+            return self.parse_vector(pos);
         }
 
         if self.remaining().starts_with("#\\") {
@@ -143,6 +177,24 @@ impl<'a> Parser<'a> {
         }
 
         self.parse_boolean(pos)
+    }
+
+    fn parse_vector(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
+        self.bump();
+        self.bump();
+        let mut items = Vec::new();
+
+        loop {
+            self.skip_ignored();
+            match self.peek_char() {
+                Some(')') => {
+                    self.bump();
+                    return Ok(Expr::new(pos, ExprKind::Vector(items)));
+                }
+                Some(_) => items.push(self.parse_expr()?),
+                None => return Err(unexpected_eof(self.current_pos())),
+            }
+        }
     }
 
     fn parse_character(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
@@ -305,6 +357,10 @@ impl<'a> Parser<'a> {
         chars.next()
     }
 
+    fn is_dotted_list_marker(&self) -> bool {
+        self.peek_char() == Some('.') && self.peek_second_char().is_none_or(is_delimiter)
+    }
+
     fn bump(&mut self) -> Option<char> {
         let ch = self.peek_char()?;
         self.offset += ch.len_utf8();
@@ -329,5 +385,5 @@ fn unexpected_eof(pos: SourcePos) -> EvalError {
 }
 
 fn is_delimiter(ch: char) -> bool {
-    ch.is_whitespace() || matches!(ch, '(' | ')' | ';')
+    ch.is_whitespace() || matches!(ch, '(' | ')' | ';' | '\'' | '`' | ',')
 }

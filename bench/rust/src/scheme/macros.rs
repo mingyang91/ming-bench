@@ -433,6 +433,28 @@ fn match_pattern(
         (ExprKind::List(pattern_items), ExprKind::List(input_items)) => {
             match_pattern_list(pattern_items, input_items, literals, head_literal, bindings)
         }
+        (ExprKind::List(_), ExprKind::DottedList(_, _))
+        | (ExprKind::DottedList(_, _), ExprKind::List(_))
+        | (ExprKind::DottedList(_, _), ExprKind::DottedList(_, _)) => {
+            let (pattern_items, pattern_tail) = pattern
+                .list_parts()
+                .expect("list-like pattern must provide list parts");
+            let (input_items, input_tail) = input
+                .list_parts()
+                .expect("list-like input must provide list parts");
+            match_pattern_pair_like(
+                pattern_items,
+                pattern_tail,
+                input_items,
+                input_tail,
+                literals,
+                head_literal,
+                bindings,
+            )
+        }
+        (ExprKind::Vector(pattern_items), ExprKind::Vector(input_items)) => {
+            match_pattern_list(pattern_items, input_items, literals, head_literal, bindings)
+        }
         _ => Ok(false),
     }
 }
@@ -532,6 +554,80 @@ fn match_pattern_list(
         repeated_name,
         &input_items[prefix.len()..],
     ))
+}
+
+fn match_pattern_pair_like(
+    pattern_items: &[Expr],
+    pattern_tail: Option<&Expr>,
+    input_items: &[Expr],
+    input_tail: Option<&Expr>,
+    literals: &HashSet<String>,
+    head_literal: Option<&str>,
+    bindings: &mut HashMap<String, PatternBinding>,
+) -> Result<bool, EvalError> {
+    if pattern_items.is_empty() {
+        return match pattern_tail {
+            Some(pattern_tail) => {
+                let input_expr = build_list_like_expr(input_items, input_tail);
+                match_pattern(pattern_tail, &input_expr, literals, head_literal, bindings)
+            }
+            None => Ok(input_items.is_empty() && input_tail.is_none()),
+        };
+    }
+
+    let Some((pattern_first, pattern_rest)) = pattern_items.split_first() else {
+        return Ok(false);
+    };
+    let Some((input_first, input_rest)) = input_items.split_first() else {
+        return match input_tail {
+            Some(input_tail) => {
+                let pattern_expr = build_list_like_expr(pattern_items, pattern_tail);
+                match_pattern(&pattern_expr, input_tail, literals, head_literal, bindings)
+            }
+            None => Ok(false),
+        };
+    };
+
+    if !match_pattern(pattern_first, input_first, literals, head_literal, bindings)? {
+        return Ok(false);
+    }
+
+    let pattern_rest_expr = build_list_like_expr(pattern_rest, pattern_tail);
+    let input_rest_expr = build_list_like_expr(input_rest, input_tail);
+    match_pattern(
+        &pattern_rest_expr,
+        &input_rest_expr,
+        literals,
+        head_literal,
+        bindings,
+    )
+}
+
+fn build_list_like_expr(items: &[Expr], tail: Option<&Expr>) -> Expr {
+    match (items, tail) {
+        ([], None) => Expr::new(START_POS, ExprKind::List(Vec::new())),
+        ([], Some(tail)) => tail.clone(),
+        (_, None) => Expr::new(START_POS, ExprKind::List(items.to_vec())),
+        (_, Some(tail)) => match tail.list_parts() {
+            Some((tail_items, None)) => {
+                let mut combined = items.to_vec();
+                combined.extend_from_slice(tail_items);
+                Expr::new(START_POS, ExprKind::List(combined))
+            }
+            Some((tail_items, Some(tail_tail))) => {
+                let mut combined = items.to_vec();
+                combined.extend_from_slice(tail_items);
+                Expr::new(
+                    START_POS,
+                    ExprKind::DottedList(combined, Box::new(tail_tail.clone())),
+                )
+            }
+            None => Expr::new(
+                START_POS,
+                ExprKind::DottedList(items.to_vec(), Box::new(tail.clone())),
+            ),
+        },
+    }
 }
 
 fn pattern_variable_name<'a>(
@@ -635,6 +731,19 @@ impl<'a> TemplateInstantiator<'a> {
             ExprKind::List(items) => {
                 self.instantiate_list_template(template.pos, items, scope_renames, repetition_index)
             }
+            ExprKind::DottedList(items, tail) => self.instantiate_dotted_list_template(
+                template.pos,
+                items,
+                tail,
+                scope_renames,
+                repetition_index,
+            ),
+            ExprKind::Vector(items) => self.instantiate_vector_template(
+                template.pos,
+                items,
+                scope_renames,
+                repetition_index,
+            ),
             _ => Ok(template.clone()),
         }
     }
@@ -706,6 +815,43 @@ impl<'a> TemplateInstantiator<'a> {
         scope_renames: &HashMap<String, String>,
         repetition_index: Option<usize>,
     ) -> Result<Expr, EvalError> {
+        self.instantiate_sequence_items(items, scope_renames, repetition_index)
+            .map(|expanded| Expr::new(pos, ExprKind::List(expanded)))
+    }
+
+    fn instantiate_vector_template(
+        &mut self,
+        pos: SourcePos,
+        items: &[Expr],
+        scope_renames: &HashMap<String, String>,
+        repetition_index: Option<usize>,
+    ) -> Result<Expr, EvalError> {
+        self.instantiate_sequence_items(items, scope_renames, repetition_index)
+            .map(|expanded| Expr::new(pos, ExprKind::Vector(expanded)))
+    }
+
+    fn instantiate_dotted_list_template(
+        &mut self,
+        pos: SourcePos,
+        items: &[Expr],
+        tail: &Expr,
+        scope_renames: &HashMap<String, String>,
+        repetition_index: Option<usize>,
+    ) -> Result<Expr, EvalError> {
+        let expanded_items =
+            self.instantiate_sequence_items(items, scope_renames, repetition_index)?;
+        let expanded_tail = self.instantiate(tail, scope_renames, repetition_index)?;
+        let mut expanded = build_list_like_expr(&expanded_items, Some(&expanded_tail));
+        expanded.pos = pos;
+        Ok(expanded)
+    }
+
+    fn instantiate_sequence_items(
+        &mut self,
+        items: &[Expr],
+        scope_renames: &HashMap<String, String>,
+        repetition_index: Option<usize>,
+    ) -> Result<Vec<Expr>, EvalError> {
         let mut expanded = Vec::new();
         let mut index = 0;
 
@@ -734,7 +880,7 @@ impl<'a> TemplateInstantiator<'a> {
             index += 1;
         }
 
-        Ok(Expr::new(pos, ExprKind::List(expanded)))
+        Ok(expanded)
     }
 
     fn instantiate_let_template(
@@ -796,7 +942,7 @@ impl<'a> TemplateInstantiator<'a> {
         scope_renames: &HashMap<String, String>,
         repetition_index: Option<usize>,
     ) -> Result<Expr, EvalError> {
-        let Some(params_items) = parse_params_template(items) else {
+        let Some((params_items, tail)) = parse_params_template(items) else {
             return self.instantiate_plain_list_template(
                 pos,
                 items,
@@ -821,9 +967,20 @@ impl<'a> TemplateInstantiator<'a> {
             )?);
         }
 
+        let params_expr = match tail {
+            Some(tail) => {
+                let expanded_tail =
+                    self.instantiate_binding_name(tail, &mut body_renames, repetition_index)?;
+                let mut expanded = build_list_like_expr(&expanded_params, Some(&expanded_tail));
+                expanded.pos = items[1].pos;
+                expanded
+            }
+            None => Expr::new(items[1].pos, ExprKind::List(expanded_params)),
+        };
+
         let mut expanded_items = Vec::with_capacity(items.len());
         expanded_items.push(Expr::new(items[0].pos, ExprKind::Symbol("lambda".into())));
-        expanded_items.push(Expr::new(items[1].pos, ExprKind::List(expanded_params)));
+        expanded_items.push(params_expr);
 
         for body_expr in &items[2..] {
             expanded_items.push(self.instantiate(body_expr, &body_renames, repetition_index)?);
@@ -900,10 +1057,10 @@ fn parse_bindings_template(items: &[Expr]) -> Option<&[Expr]> {
     bindings_expr.list_items()
 }
 
-fn parse_params_template(items: &[Expr]) -> Option<&[Expr]> {
+fn parse_params_template(items: &[Expr]) -> Option<(&[Expr], Option<&Expr>)> {
     let params_expr = items.get(1)?;
     items.get(2)?;
-    params_expr.list_items()
+    params_expr.list_parts()
 }
 
 fn push_binding_scope(context: &mut EvalContext, bindings: HashMap<String, PatternBinding>) {
@@ -1008,19 +1165,31 @@ fn is_core_syntax_keyword(name: &str) -> bool {
         name,
         "." | "and"
             | "begin"
+            | "case"
+            | "case-lambda"
             | "cond"
             | "define"
+            | "define-record-type"
             | "define-syntax"
+            | "do"
             | "else"
+            | "=>"
+            | "guard"
             | "if"
             | "lambda"
             | "let"
+            | "let*"
+            | "letrec"
+            | "letrec*"
             | "or"
+            | "quasiquote"
             | "quote"
             | "set!"
             | "syntax"
             | "syntax-case"
             | "syntax-rules"
+            | "unquote"
+            | "unquote-splicing"
             | "with-syntax"
     )
 }
@@ -1067,6 +1236,23 @@ fn collect_template_repetition_count(
                 collect_template_repetition_count(item, bindings, expected)?;
             }
         }
+        ExprKind::DottedList(items, tail) => {
+            for item in items {
+                if item.symbol_name() == Some("...") {
+                    continue;
+                }
+                collect_template_repetition_count(item, bindings, expected)?;
+            }
+            collect_template_repetition_count(tail, bindings, expected)?;
+        }
+        ExprKind::Vector(items) => {
+            for item in items {
+                if item.symbol_name() == Some("...") {
+                    continue;
+                }
+                collect_template_repetition_count(item, bindings, expected)?;
+            }
+        }
         _ => {}
     }
 
@@ -1087,6 +1273,55 @@ fn expr_equal(left: &Expr, right: &Expr) -> bool {
                     .zip(right.iter())
                     .all(|(left, right)| expr_equal(left, right))
         }
+        (ExprKind::List(_), ExprKind::DottedList(_, _))
+        | (ExprKind::DottedList(_, _), ExprKind::List(_))
+        | (ExprKind::DottedList(_, _), ExprKind::DottedList(_, _)) => {
+            let (left_items, left_tail) = left
+                .list_parts()
+                .expect("list-like expression must provide list parts");
+            let (right_items, right_tail) = right
+                .list_parts()
+                .expect("list-like expression must provide list parts");
+            list_like_expr_equal(left_items, left_tail, right_items, right_tail)
+        }
+        (ExprKind::Vector(left), ExprKind::Vector(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| expr_equal(left, right))
+        }
         _ => false,
     }
+}
+
+fn list_like_expr_equal(
+    left_items: &[Expr],
+    left_tail: Option<&Expr>,
+    right_items: &[Expr],
+    right_tail: Option<&Expr>,
+) -> bool {
+    if left_items.is_empty() {
+        return match left_tail {
+            Some(left_tail) => {
+                expr_equal(left_tail, &build_list_like_expr(right_items, right_tail))
+            }
+            None => right_items.is_empty() && right_tail.is_none(),
+        };
+    }
+
+    let Some((left_first, left_rest)) = left_items.split_first() else {
+        return false;
+    };
+    let Some((right_first, right_rest)) = right_items.split_first() else {
+        return match right_tail {
+            Some(right_tail) => {
+                expr_equal(&build_list_like_expr(left_items, left_tail), right_tail)
+            }
+            None => false,
+        };
+    };
+
+    expr_equal(left_first, right_first)
+        && list_like_expr_equal(left_rest, left_tail, right_rest, right_tail)
 }

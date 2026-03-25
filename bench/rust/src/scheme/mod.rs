@@ -15,8 +15,9 @@ pub use error::{EvalError, SourcePos};
 use self::builtins::builtin_name;
 use self::forms::{
     eval_and, eval_begin, eval_case, eval_case_lambda, eval_cond, eval_do, eval_if, eval_lambda,
-    eval_let, eval_let_star, eval_letrec, eval_or, eval_quote, eval_set, make_lambda,
-    parse_define_signature, parse_do_binding, parse_value_binding, quote_expr, value_to_expr,
+    eval_let, eval_let_star, eval_letrec, eval_or, eval_quasiquote, eval_quote, eval_set,
+    make_lambda, parse_define_signature, parse_do_binding, parse_value_binding, quote_expr,
+    value_to_expr,
 };
 use self::helpers::{
     invalid_argument, make_immutable_string_value, make_string_value, make_vector_value,
@@ -53,6 +54,14 @@ enum ExprKind {
     String(String),
     Symbol(String),
     List(Vec<Expr>),
+    DottedList(Vec<Expr>, Box<Expr>),
+    Vector(Vec<Expr>),
+}
+
+#[derive(Debug, Clone)]
+enum CondConsequent {
+    Body(Vec<Expr>),
+    Arrow(Expr),
 }
 
 impl Expr {
@@ -63,6 +72,14 @@ impl Expr {
     fn list_items(&self) -> Option<&[Expr]> {
         match &self.kind {
             ExprKind::List(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    fn list_parts(&self) -> Option<(&[Expr], Option<&Expr>)> {
+        match &self.kind {
+            ExprKind::List(items) => Some((items, None)),
+            ExprKind::DottedList(items, tail) => Some((items, Some(tail))),
             _ => None,
         }
     }
@@ -365,6 +382,19 @@ fn empty_list_value() -> Value {
     Value::List(Vec::new())
 }
 
+fn parse_cond_consequent(consequent: &[Expr]) -> Result<CondConsequent, EvalError> {
+    match consequent {
+        [arrow, procedure] if arrow.symbol_name() == Some("=>") => {
+            Ok(CondConsequent::Arrow(procedure.clone()))
+        }
+        [arrow, ..] if arrow.symbol_name() == Some("=>") => Err(syntax_error(
+            arrow.pos,
+            "cond => clause requires exactly one procedure",
+        )),
+        _ => Ok(CondConsequent::Body(consequent.to_vec())),
+    }
+}
+
 fn make_pair_value(car: Value, cdr: Value) -> Value {
     Value::Pair(Rc::new(RefCell::new(PairValue { car, cdr })))
 }
@@ -495,6 +525,8 @@ fn eval_expr_outcome(
         ))),
         ExprKind::Symbol(name) => lookup_symbol(env, name, expr.pos).map(EvalOutcome::Value),
         ExprKind::List(items) => eval_list(items, env, expr.pos, context, tail),
+        ExprKind::DottedList(_, _) => Err(syntax_error(expr.pos, "cannot evaluate dotted list")),
+        ExprKind::Vector(_) => quote_expr(expr).map(EvalOutcome::Value),
     }
 }
 
@@ -628,6 +660,9 @@ fn eval_list(
             "let*" => return eval_let_star(&items[1..], env, form_pos, context, tail),
             "letrec" => return eval_letrec(&items[1..], env, form_pos, context, false, tail),
             "letrec*" => return eval_letrec(&items[1..], env, form_pos, context, true, tail),
+            "quasiquote" => {
+                return eval_quasiquote(&items[1..], env, form_pos, context).map(EvalOutcome::Value)
+            }
             "quote" => return eval_quote(&items[1..], form_pos).map(EvalOutcome::Value),
             "set!" => return eval_set(&items[1..], env, form_pos, context).map(EvalOutcome::Value),
             "syntax" => {
@@ -646,6 +681,18 @@ fn eval_list(
             }
             "and" => return eval_and(&items[1..], env, context, tail),
             "or" => return eval_or(&items[1..], env, context, tail),
+            "unquote" => {
+                return Err(syntax_error(
+                    form_pos,
+                    "unquote may only appear within quasiquote",
+                ))
+            }
+            "unquote-splicing" => {
+                return Err(syntax_error(
+                    form_pos,
+                    "unquote-splicing may only appear within quasiquote",
+                ))
+            }
             _ => {}
         }
 
@@ -671,7 +718,7 @@ fn eval_define(
     context: &mut EvalContext,
 ) -> Result<Value, EvalError> {
     match args {
-        [signature, body @ ..] if signature.list_items().is_some() => {
+        [signature, body @ ..] if signature.list_parts().is_some() => {
             let (name, params) = parse_define_signature(signature)?;
             let lambda = make_lambda(Some(name.clone()), params, body, env, pos)?;
             env_define(env, name, lambda);

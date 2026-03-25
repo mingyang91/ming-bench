@@ -5,9 +5,9 @@ use super::builtin_helpers::{
 };
 use super::value_ops::{byte_index_for_char, eq_value, equal_value, eqv_value};
 use super::{
-    apply, invalid_argument, is_proper_list, make_list_value, make_pair_value, make_string_value,
-    make_vector_value, number_error, quote_expr, type_mismatch, value_to_expr, wrong_arg_count,
-    EvalContext, EvalError, Number, SourcePos, SyntaxObject, Value,
+    apply, invalid_argument, is_proper_list, make_immutable_string_value, make_list_value,
+    make_pair_value, make_string_value, make_vector_value, number_error, quote_expr, type_mismatch,
+    value_to_expr, wrong_arg_count, EvalContext, EvalError, Number, SourcePos, SyntaxObject, Value,
 };
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -27,6 +27,7 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "apply" => Some("apply"),
         "append" => Some("append"),
         "assoc" => Some("assoc"),
+        "assq" => Some("assq"),
         "assv" => Some("assv"),
         "boolean?" => Some("boolean?"),
         "call-with-current-continuation" => Some("call/cc"),
@@ -55,6 +56,7 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "exact?" => Some("exact?"),
         "exact->inexact" => Some("exact->inexact"),
         "equal?" => Some("equal?"),
+        "error" => Some("error"),
         "even?" => Some("even?"),
         "expt" => Some("expt"),
         "for-each" => Some("for-each"),
@@ -74,6 +76,8 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "max" => Some("max"),
         "make-string" => Some("make-string"),
         "make-vector" => Some("make-vector"),
+        "memq" => Some("memq"),
+        "memv" => Some("memv"),
         "member" => Some("member"),
         "min" => Some("min"),
         "modulo" => Some("modulo"),
@@ -155,6 +159,7 @@ pub(super) fn apply_builtin(
         "apply" => builtin_apply(args, pos, context),
         "append" => append(args, pos),
         "assoc" => assoc(args, pos),
+        "assq" => assq(args, pos),
         "assv" => assv(args, pos),
         "boolean?" => predicate(args, "boolean?", pos, |value| {
             matches!(value, Value::Boolean(_))
@@ -198,6 +203,13 @@ pub(super) fn apply_builtin(
         ),
         "exact->inexact" => exact_to_inexact(args, pos),
         "equal?" => equal_predicate(args, pos),
+        "error" => {
+            let exception = error_exception_value(args, pos)?;
+            Err(EvalError::UncaughtException {
+                pos,
+                value: exception.render(),
+            })
+        }
         "even?" => number_predicate(args, "even?", pos, |value| {
             Ok(expect_exact_integer_value("even?", *value, pos)? % 2 == 0)
         }),
@@ -230,6 +242,8 @@ pub(super) fn apply_builtin(
         "max" => max_value(args, pos),
         "make-string" => make_string_builtin(args, pos),
         "make-vector" => make_vector(args, pos),
+        "memq" => memq(args, pos),
+        "memv" => memv(args, pos),
         "member" => member(args, pos),
         "min" => min_value(args, pos),
         "modulo" => modulo(args, pos),
@@ -317,6 +331,19 @@ pub(super) fn apply_builtin(
         }),
         _ => unreachable!("unsupported builtin: {name}"),
     }
+}
+
+pub(super) fn error_exception_value(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(wrong_arg_count(pos, "error", "at least 1 argument", 0));
+    }
+
+    let message = args
+        .iter()
+        .map(Value::render_display)
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(make_immutable_string_value(message))
 }
 
 fn add(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
@@ -578,13 +605,24 @@ fn compound_pair_access(
 }
 
 fn append(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    let mut items = Vec::new();
+    let Some((tail, prefix_lists)) = args.split_last() else {
+        return Ok(make_list_value(Vec::new()));
+    };
 
-    for value in args {
-        items.extend(expect_list("append", value, pos)?);
+    let mut prefix_items = Vec::new();
+    for value in prefix_lists {
+        prefix_items.extend(expect_list("append", value, pos)?);
     }
 
-    Ok(make_list_value(items))
+    if is_proper_list(tail) {
+        prefix_items.extend(expect_list("append", tail, pos)?);
+        return Ok(make_list_value(prefix_items));
+    }
+
+    Ok(prefix_items
+        .into_iter()
+        .rev()
+        .fold(tail.clone(), |cdr, car| make_pair_value(car, cdr)))
 }
 
 fn builtin_apply(
@@ -787,6 +825,26 @@ fn reverse(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
 }
 
 fn member(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    member_with(args, pos, "member", equal_value)
+}
+
+fn memq(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    member_with(args, pos, "memq", eq_value)
+}
+
+fn memv(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    member_with(args, pos, "memv", eqv_value)
+}
+
+fn member_with<F>(
+    args: &[Value],
+    pos: SourcePos,
+    name: &str,
+    matches_item: F,
+) -> Result<Value, EvalError>
+where
+    F: Fn(&Value, &Value) -> bool,
+{
     match args {
         [target, list] => {
             let mut cursor = list.clone();
@@ -796,7 +854,7 @@ fn member(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
                 match cursor.clone() {
                     Value::List(items) => {
                         for (index, item) in items.iter().enumerate() {
-                            if equal_value(target, item) {
+                            if matches_item(target, item) {
                                 return Ok(make_list_value(items[index..].to_vec()));
                             }
                         }
@@ -809,18 +867,18 @@ fn member(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
                         }
 
                         let pair_ref = pair.borrow();
-                        if equal_value(target, &pair_ref.car) {
+                        if matches_item(target, &pair_ref.car) {
                             return Ok(cursor);
                         }
                         cursor = pair_ref.cdr.clone();
                     }
-                    _ => return Err(type_mismatch(pos, "member", "list", list.type_name())),
+                    _ => return Err(type_mismatch(pos, name, "list", list.type_name())),
                 }
             }
         }
         _ => Err(wrong_arg_count(
             pos,
-            "member",
+            name,
             "exactly 2 arguments",
             args.len(),
         )),
@@ -828,49 +886,38 @@ fn member(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
 }
 
 fn assoc(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    match args {
-        [key, alist] => {
-            let alist = expect_list("assoc", alist, pos)?;
+    assoc_with(args, pos, "assoc", equal_value)
+}
 
-            for entry in &alist {
-                let matches = match entry {
-                    Value::List(items) if !items.is_empty() => equal_value(key, &items[0]),
-                    Value::Pair(pair) => {
-                        let pair = pair.borrow();
-                        equal_value(key, &pair.car)
-                    }
-                    other => return Err(type_mismatch(pos, "assoc", "pair", other.type_name())),
-                };
-
-                if matches {
-                    return Ok(entry.clone());
-                }
-            }
-
-            Ok(Value::Boolean(false))
-        }
-        _ => Err(wrong_arg_count(
-            pos,
-            "assoc",
-            "exactly 2 arguments",
-            args.len(),
-        )),
-    }
+fn assq(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    assoc_with(args, pos, "assq", eq_value)
 }
 
 fn assv(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    assoc_with(args, pos, "assv", eqv_value)
+}
+
+fn assoc_with<F>(
+    args: &[Value],
+    pos: SourcePos,
+    name: &str,
+    matches_key: F,
+) -> Result<Value, EvalError>
+where
+    F: Fn(&Value, &Value) -> bool,
+{
     match args {
         [key, alist] => {
-            let alist = expect_list("assv", alist, pos)?;
+            let alist = expect_list(name, alist, pos)?;
 
             for entry in &alist {
                 let matches = match entry {
-                    Value::List(items) if !items.is_empty() => eqv_value(key, &items[0]),
+                    Value::List(items) if !items.is_empty() => matches_key(key, &items[0]),
                     Value::Pair(pair) => {
                         let pair = pair.borrow();
-                        eqv_value(key, &pair.car)
+                        matches_key(key, &pair.car)
                     }
-                    other => return Err(type_mismatch(pos, "assv", "pair", other.type_name())),
+                    other => return Err(type_mismatch(pos, name, "pair", other.type_name())),
                 };
 
                 if matches {
@@ -882,7 +929,7 @@ fn assv(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         }
         _ => Err(wrong_arg_count(
             pos,
-            "assv",
+            name,
             "exactly 2 arguments",
             args.len(),
         )),
