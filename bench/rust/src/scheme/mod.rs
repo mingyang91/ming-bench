@@ -65,6 +65,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "odd?",
     "pair?",
     "positive?",
+    "procedure?",
     "numerator",
     "quotient",
     "rational?",
@@ -266,17 +267,80 @@ impl ExpansionState {
 }
 
 #[derive(Clone)]
-struct UserProcedure {
-    name: Option<String>,
+struct ProcedureClause {
     params: Vec<String>,
     rest_param: Option<String>,
     body: Vec<Expr>,
+}
+
+impl ProcedureClause {
+    fn new(params: Vec<String>, rest_param: Option<String>, body: Vec<Expr>) -> Self {
+        Self {
+            params,
+            rest_param,
+            body,
+        }
+    }
+
+    fn matches_arity(&self, arg_count: usize) -> bool {
+        if self.rest_param.is_some() {
+            arg_count >= self.params.len()
+        } else {
+            arg_count == self.params.len()
+        }
+    }
+
+    fn expected_arity(&self) -> String {
+        if self.rest_param.is_some() {
+            format!("at least {}", self.params.len())
+        } else {
+            format!("exactly {}", self.params.len())
+        }
+    }
+}
+
+#[derive(Clone)]
+struct UserProcedure {
+    name: Option<String>,
+    clauses: Vec<ProcedureClause>,
     env: EnvRef,
 }
 
 impl UserProcedure {
+    fn new(name: Option<String>, clauses: Vec<ProcedureClause>, env: EnvRef) -> Self {
+        Self { name, clauses, env }
+    }
+
+    fn single_clause(
+        name: Option<String>,
+        params: Vec<String>,
+        rest_param: Option<String>,
+        body: Vec<Expr>,
+        env: EnvRef,
+    ) -> Self {
+        Self::new(
+            name,
+            vec![ProcedureClause::new(params, rest_param, body)],
+            env,
+        )
+    }
+
     fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or("lambda")
+    }
+
+    fn matching_clause(&self, arg_count: usize) -> Option<&ProcedureClause> {
+        self.clauses
+            .iter()
+            .find(|clause| clause.matches_arity(arg_count))
+    }
+
+    fn expected_arity(&self) -> String {
+        self.clauses
+            .iter()
+            .map(ProcedureClause::expected_arity)
+            .collect::<Vec<_>>()
+            .join(" or ")
     }
 }
 
@@ -1115,6 +1179,7 @@ fn eval_list(items: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, 
             "if" => eval_if(tail, env, head.pos),
             "quote" => eval_quote(tail, head.pos),
             "lambda" => eval_lambda(tail, env, head.pos),
+            "case-lambda" => eval_case_lambda(tail, env, head.pos),
             "and" => eval_and(tail, env),
             "or" => eval_or(tail, env),
             "begin" => eval_begin(tail, env),
@@ -1350,13 +1415,13 @@ fn eval_define(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value
 
             let (name, params, rest_param) =
                 parse_function_signature(signature, signature_expr.pos)?;
-            let procedure = Value::Procedure(Rc::new(UserProcedure {
-                name: Some(name.clone()),
+            let procedure = Value::Procedure(Rc::new(UserProcedure::single_clause(
+                Some(name.clone()),
                 params,
                 rest_param,
-                body: body.to_vec(),
-                env: env.clone(),
-            }));
+                body.to_vec(),
+                env.clone(),
+            )));
 
             Environment::define(&env, name, procedure);
             Ok(Value::Void)
@@ -1438,13 +1503,31 @@ fn eval_lambda(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value
 
     let (params, rest_param) = parse_parameters(params_expr)?;
 
-    Ok(Value::Procedure(Rc::new(UserProcedure {
-        name: None,
+    Ok(Value::Procedure(Rc::new(UserProcedure::single_clause(
+        None,
         params,
         rest_param,
-        body: body.to_vec(),
+        body.to_vec(),
         env,
-    })))
+    ))))
+}
+
+fn eval_case_lambda(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+    if exprs.is_empty() {
+        return Err(EvalError::syntax(
+            "case-lambda requires at least 1 clause",
+            position,
+        ));
+    }
+
+    let clauses = exprs
+        .iter()
+        .map(parse_case_lambda_clause)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Value::Procedure(Rc::new(UserProcedure::new(
+        None, clauses, env,
+    ))))
 }
 
 fn parse_function_signature(
@@ -1479,6 +1562,32 @@ fn parse_parameters(expr: &Expr) -> Result<(Vec<String>, Option<String>), EvalEr
     };
 
     parse_parameter_list(params)
+}
+
+fn parse_case_lambda_clause(clause_expr: &Expr) -> Result<ProcedureClause, EvalError> {
+    let ExprKind::List(items) = &clause_expr.kind else {
+        return Err(EvalError::syntax(
+            "case-lambda clauses must be lists",
+            clause_expr.pos,
+        ));
+    };
+
+    let Some((params_expr, body)) = items.split_first() else {
+        return Err(EvalError::syntax(
+            "case-lambda clauses cannot be empty",
+            clause_expr.pos,
+        ));
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::syntax(
+            "case-lambda clauses require at least 1 body expression",
+            clause_expr.pos,
+        ));
+    }
+
+    let (params, rest_param) = parse_parameters(params_expr)?;
+    Ok(ProcedureClause::new(params, rest_param, body.to_vec()))
 }
 
 fn parse_parameter_list(params: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
@@ -1643,13 +1752,13 @@ fn eval_named_let(
     let params = bindings.into_iter().map(|(param, _)| param).collect();
     let let_env = Environment::child(env);
 
-    let procedure = Value::Procedure(Rc::new(UserProcedure {
-        name: Some(name.into()),
+    let procedure = Value::Procedure(Rc::new(UserProcedure::single_clause(
+        Some(name.into()),
         params,
-        rest_param: None,
-        body: body.to_vec(),
-        env: let_env.clone(),
-    }));
+        None,
+        body.to_vec(),
+        let_env.clone(),
+    )));
 
     Environment::define(&let_env, name.into(), procedure.clone());
     apply(procedure, position, args, let_env)
@@ -1806,40 +1915,29 @@ fn apply_user_procedure(
     args: Vec<LocatedValue>,
     position: SourcePos,
 ) -> Result<Value, EvalError> {
-    let required = procedure.params.len();
-    let invalid_arity = if procedure.rest_param.is_some() {
-        args.len() < required
-    } else {
-        args.len() != required
-    };
-
-    if invalid_arity {
+    let Some(clause) = procedure.matching_clause(args.len()) else {
         return Err(EvalError::wrong_arg_count(
             procedure.display_name(),
-            if procedure.rest_param.is_some() {
-                format!("at least {required}")
-            } else {
-                format!("exactly {required}")
-            },
+            procedure.expected_arity(),
             args.len(),
             position,
         ));
-    }
+    };
 
     let call_env = Environment::child(procedure.env.clone());
-    for (param, value) in procedure.params.iter().cloned().zip(args.iter().cloned()) {
+    for (param, value) in clause.params.iter().cloned().zip(args.iter().cloned()) {
         Environment::define(&call_env, param, value.value);
     }
 
-    if let Some(rest_param) = &procedure.rest_param {
-        let rest_values = args[required..]
+    if let Some(rest_param) = &clause.rest_param {
+        let rest_values = args[clause.params.len()..]
             .iter()
             .map(|arg| arg.value.clone())
             .collect();
         Environment::define(&call_env, rest_param.clone(), Value::List(rest_values));
     }
 
-    eval_sequence(&procedure.body, call_env)
+    eval_sequence(&clause.body, call_env)
 }
 
 fn apply_builtin(
@@ -1930,6 +2028,12 @@ fn apply_builtin(
                 || matches!(value, Value::Pair(_))
         }),
         "positive?" => apply_number_predicate("positive?", args, position, Number::is_positive),
+        "procedure?" => apply_type_predicate("procedure?", args, position, |value| {
+            matches!(
+                value,
+                Value::Builtin(_) | Value::Procedure(_) | Value::NativeProcedure(_)
+            )
+        }),
         "numerator" => apply_numerator(args, position),
         "quotient" => apply_quotient(args, position),
         "rational?" => apply_rational(args, position),
@@ -3057,6 +3161,7 @@ fn is_core_syntax_keyword(name: &str) -> bool {
         name,
         "and"
             | "begin"
+            | "case-lambda"
             | "cond"
             | "define"
             | "define-record-type"
@@ -3538,6 +3643,16 @@ fn expand_template_list(
                             indices,
                         )
                     }
+                    "case-lambda" => {
+                        return expand_case_lambda_template(
+                            template.pos,
+                            items,
+                            bindings,
+                            transformer,
+                            state,
+                            indices,
+                        )
+                    }
                     _ => {}
                 }
             }
@@ -3702,6 +3817,78 @@ fn expand_lambda_template(
     }
 
     state.pop_scope();
+    Ok(Expr::list(expanded_items, position))
+}
+
+fn expand_case_lambda_template(
+    position: SourcePos,
+    items: &[Expr],
+    bindings: &PatternBindings,
+    transformer: &SyntaxRulesMacro,
+    state: &mut ExpansionState,
+    indices: &[usize],
+) -> Result<Expr, EvalError> {
+    let [head, clauses @ ..] = items else {
+        return Err(EvalError::syntax(
+            "case-lambda template requires at least 1 clause",
+            position,
+        ));
+    };
+
+    if clauses.is_empty() {
+        return Err(EvalError::syntax(
+            "case-lambda template requires at least 1 clause",
+            position,
+        ));
+    }
+
+    let mut expanded_items = Vec::with_capacity(items.len());
+    expanded_items.push(head.clone());
+
+    for clause in clauses {
+        let ExprKind::List(clause_items) = &clause.kind else {
+            return Err(EvalError::syntax(
+                "case-lambda template clauses must be lists",
+                clause.pos,
+            ));
+        };
+
+        let Some((params_expr, body)) = clause_items.split_first() else {
+            return Err(EvalError::syntax(
+                "case-lambda template clauses cannot be empty",
+                clause.pos,
+            ));
+        };
+
+        if body.is_empty() {
+            return Err(EvalError::syntax(
+                "case-lambda template clauses require at least 1 body expression",
+                clause.pos,
+            ));
+        }
+
+        let (expanded_params, scope) =
+            expand_lambda_parameters(params_expr, bindings, transformer, state, indices)?;
+
+        state.push_scope(scope);
+
+        let mut expanded_clause = Vec::with_capacity(clause_items.len());
+        expanded_clause.push(expanded_params);
+        for body_expr in body {
+            expanded_clause.push(expand_template(
+                body_expr,
+                bindings,
+                transformer,
+                state,
+                indices,
+                false,
+            )?);
+        }
+
+        state.pop_scope();
+        expanded_items.push(Expr::list(expanded_clause, clause.pos));
+    }
+
     Ok(Expr::list(expanded_items, position))
 }
 
