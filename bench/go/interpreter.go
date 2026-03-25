@@ -80,6 +80,7 @@ const (
 	tokenLParen
 	tokenRParen
 	tokenQuote
+	tokenSyntaxQuote
 	tokenInteger
 	tokenRational
 	tokenInexact
@@ -146,6 +147,13 @@ func (l *lexer) nextToken() (token, error) {
 	case '\'':
 		l.advance()
 		return token{kind: tokenQuote, text: "'", at: start}, nil
+	case '#':
+		if l.index+1 < len(l.input) && l.input[l.index+1] == '\'' {
+			l.advance()
+			l.advance()
+			return token{kind: tokenSyntaxQuote, text: "#'", at: start}, nil
+		}
+		return l.readAtom(start)
 	case '"':
 		return l.readString(start)
 	default:
@@ -369,6 +377,8 @@ func (p *parser) parseExpr() (expr, error) {
 		return &symbolExpr{name: tok.text, at: tok.at}, nil
 	case tokenQuote:
 		return p.parseQuoted()
+	case tokenSyntaxQuote:
+		return p.parseSyntaxQuoted()
 	case tokenLParen:
 		return p.parseList()
 	case tokenRParen:
@@ -392,6 +402,24 @@ func (p *parser) parseQuoted() (expr, error) {
 	return &listExpr{
 		elements: []expr{
 			&symbolExpr{name: "quote", at: tok.at},
+			quoted,
+		},
+		at: tok.at,
+	}, nil
+}
+
+func (p *parser) parseSyntaxQuoted() (expr, error) {
+	tok := p.peek()
+	p.index++
+
+	quoted, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	return &listExpr{
+		elements: []expr{
+			&symbolExpr{name: "syntax", at: tok.at},
 			quoted,
 		},
 		at: tok.at,
@@ -747,6 +775,8 @@ func (it *interpreter) installBuiltins() {
 	it.defineName(it.global, "dynamic-wind", &builtinProc{name: "dynamic-wind", fn: builtinDynamicWind})
 	it.defineName(it.global, "raise", &builtinProc{name: "raise", fn: builtinRaise})
 	it.defineName(it.global, "with-exception-handler", &builtinProc{name: "with-exception-handler", fn: builtinWithExceptionHandler})
+	it.defineName(it.global, "syntax->datum", &builtinProc{name: "syntax->datum", fn: builtinSyntaxToDatum})
+	it.defineName(it.global, "datum->syntax", &builtinProc{name: "datum->syntax", fn: builtinDatumToSyntax})
 	it.defineName(it.global, "vector", &builtinProc{name: "vector", fn: builtinVector})
 	it.defineName(it.global, "make-vector", &builtinProc{name: "make-vector", fn: builtinMakeVector})
 	it.defineName(it.global, "vector?", &builtinProc{name: "vector?", fn: builtinVectorPred})
@@ -803,7 +833,7 @@ func (it *interpreter) eval(node expr, scope *env) (value, error) {
 			if pending, ok := value.(*uninitializedValue); ok {
 				return nil, newEvalError(ErrUnboundVariable, fmt.Sprintf("uninitialized variable: %s", pending.name), expr.at)
 			}
-			if _, isMacro := value.(*syntaxRuleMacro); isMacro {
+			if isSyntaxTransformer(value) {
 				return nil, newEvalError(ErrSyntax, fmt.Sprintf("cannot use syntax as value: %s", expr.name), expr.at)
 			}
 			return value, nil
@@ -875,12 +905,18 @@ func (it *interpreter) eval(node expr, scope *env) (value, error) {
 					return voidValue{}, nil
 				case "quote":
 					return it.evalQuote(expr)
+				case "syntax":
+					return it.evalSyntax(scope, expr)
 				case "lambda":
 					return it.evalLambda(scope, expr)
 				case "case-lambda":
 					return it.evalCaseLambda(scope, expr)
 				case "set!":
 					return it.evalSet(scope, expr)
+				case "syntax-case":
+					return it.evalSyntaxCase(scope, expr)
+				case "with-syntax":
+					return it.evalWithSyntax(scope, expr)
 				case "begin":
 					step, err = it.prepareTailSequence(scope, expr.elements[1:])
 				case "cond":
@@ -2284,6 +2320,10 @@ func formatValue(v value) (string, error) {
 		return formatVector(value)
 	case *builtinProc, *closureProc, *caseLambdaProc, *continuationProc:
 		return "#<procedure>", nil
+	case *syntaxObject:
+		return "#<syntax>", nil
+	case *syntaxSequenceValue:
+		return "#<syntax-sequence>", nil
 	case *recordValue:
 		return fmt.Sprintf("#<record %s>", value.typ.name), nil
 	case voidValue:

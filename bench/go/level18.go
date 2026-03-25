@@ -222,7 +222,7 @@ func (it *interpreter) evalWithContinuations(node expr, scope *env, k evalContin
 		if pending, ok := resolved.(*uninitializedValue); ok {
 			return doneError(newEvalError(ErrUnboundVariable, fmt.Sprintf("uninitialized variable: %s", pending.name), current.at))
 		}
-		if _, isMacro := resolved.(*syntaxRuleMacro); isMacro {
+		if isSyntaxTransformer(resolved) {
 			return doneError(newEvalError(ErrSyntax, fmt.Sprintf("cannot use syntax as value: %s", current.name), current.at))
 		}
 		return continueEval(k, resolved)

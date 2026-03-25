@@ -80,13 +80,38 @@ func (it *interpreter) evalDefineSyntax(scope *env, list *listExpr) (value, erro
 	}
 
 	binding := it.defineSymbol(scope, name, nil)
-	macro, err := it.parseSyntaxRules(name.name, binding.key, list.elements[2], scope)
+	if syntaxRulesForm(list.elements[2]) {
+		macro, err := it.parseSyntaxRules(name.name, binding.key, list.elements[2], scope)
+		if err != nil {
+			return nil, err
+		}
+		binding.value = macro
+		return voidValue{}, nil
+	}
+
+	transformer, err := it.eval(list.elements[2], scope)
 	if err != nil {
 		return nil, err
 	}
+	if !isProcedureValue(transformer) {
+		return nil, newEvalError(ErrTypeMismatch, "define-syntax: expected transformer procedure", list.elements[2].pos())
+	}
 
-	binding.value = macro
+	binding.value = &transformerMacro{
+		name: name.name,
+		proc: transformer,
+	}
 	return voidValue{}, nil
+}
+
+func syntaxRulesForm(spec expr) bool {
+	form, ok := spec.(*listExpr)
+	if !ok || len(form.elements) == 0 {
+		return false
+	}
+
+	head, ok := form.elements[0].(*symbolExpr)
+	return ok && head.name == "syntax-rules"
 }
 
 func (it *interpreter) parseSyntaxRules(name string, key string, spec expr, scope *env) (*syntaxRuleMacro, error) {
@@ -152,6 +177,25 @@ func (it *interpreter) expandMacroCall(list *listExpr, scope *env) (expr, bool, 
 	}
 
 	macro, ok := binding.value.(*syntaxRuleMacro)
+	if ok {
+		resolved, err := it.resolveSyntax(list, scope)
+		if err != nil {
+			return nil, false, err
+		}
+
+		resolvedList, ok := resolved.(*listExpr)
+		if !ok {
+			return nil, false, newEvalError(ErrSyntax, "macro expansion expected list form", list.at)
+		}
+
+		expanded, err := it.expandSyntaxRulesMacro(macro, resolvedList)
+		if err != nil {
+			return nil, false, err
+		}
+		return expanded, true, nil
+	}
+
+	transformer, ok := binding.value.(*transformerMacro)
 	if !ok {
 		return nil, false, nil
 	}
@@ -161,16 +205,17 @@ func (it *interpreter) expandMacroCall(list *listExpr, scope *env) (expr, bool, 
 		return nil, false, err
 	}
 
-	resolvedList, ok := resolved.(*listExpr)
-	if !ok {
-		return nil, false, newEvalError(ErrSyntax, "macro expansion expected list form", list.at)
-	}
-
-	expanded, err := it.expandSyntaxRulesMacro(macro, resolvedList)
+	expanded, err := it.applyProcedure(transformer.proc, []value{&syntaxObject{datum: resolved}}, list.at)
 	if err != nil {
 		return nil, false, err
 	}
-	return expanded, true, nil
+
+	result, ok := expanded.(*syntaxObject)
+	if !ok {
+		return nil, false, newEvalError(ErrTypeMismatch, fmt.Sprintf("%s: transformer must return syntax object", transformer.name), list.at)
+	}
+
+	return cloneExpr(result.datum), true, nil
 }
 
 func (it *interpreter) expandSyntaxRulesMacro(macro *syntaxRuleMacro, form *listExpr) (expr, error) {
