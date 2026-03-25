@@ -579,29 +579,37 @@ fn eval_inner(ast: &Ast, env: &Env, output: &mut String) -> Result<Value, EvalEr
                         if items.len() != 4 {
                             return Err(EvalError::Arity("string-set! requires 3 arguments".into()));
                         }
+                        // Check if the first argument is a symbol (variable) — literal strings are immutable
                         let var_name = match &items[1].kind {
                             AstKind::Symbol(name) => name.clone(),
-                            _ => return Err(EvalError::Type("string-set!: first argument must be a variable".into())),
+                            AstKind::Str(_) => {
+                                return Err(EvalError::Type("string-set!: strings are immutable".into()));
+                            }
+                            _ => {
+                                return Err(EvalError::Type("string-set!: strings are immutable".into()));
+                            }
                         };
-                        let idx = eval(&items[2], env, output)?.as_integer()? as usize;
+                        let idx_val = eval(&items[2], env, output)?;
+                        let idx = idx_val.as_integer()? as usize;
                         let ch = match eval(&items[3], env, output)? {
                             Value::Char(c) => c,
-                            _ => return Err(EvalError::Type("string-set!: third argument must be a char".into())),
+                            _ => return Err(EvalError::Type("string-set!: expected char".into())),
                         };
-                        let s = env.borrow().get(&var_name)
+                        // Look up the variable and mutate the string in place
+                        let current = env.borrow().get(&var_name)
                             .ok_or_else(|| EvalError::UnboundVariable(var_name.clone()))?;
-                        match s {
-                            Value::Str(st) => {
-                                let mut chars: Vec<char> = st.chars().collect();
+                        match current {
+                            Value::Str(ref s) => {
+                                let mut chars: Vec<char> = s.chars().collect();
                                 if idx >= chars.len() {
                                     return Err(EvalError::Type("string-set!: index out of bounds".into()));
                                 }
                                 chars[idx] = ch;
-                                let new_str: String = chars.into_iter().collect();
-                                env.borrow_mut().set_existing(&var_name, Value::Str(new_str));
+                                let new_s: String = chars.into_iter().collect();
+                                env.borrow_mut().set_existing(&var_name, Value::Str(new_s));
                                 return Ok(Value::Void);
                             }
-                            _ => return Err(EvalError::Type("string-set!: first argument must be a string".into())),
+                            _ => return Err(EvalError::Type("string-set!: expected string".into())),
                         }
                     }
                     "or" => {
