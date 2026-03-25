@@ -3,10 +3,11 @@ package ming
 import "fmt"
 
 type evalResult struct {
-	thunk func() evalResult
-	value value
-	err   error
-	done  bool
+	thunk  func() evalResult
+	value  value
+	err    error
+	raised *raisedSignal
+	done   bool
 }
 
 type evalContinuation func(value) evalResult
@@ -14,8 +15,9 @@ type evalContinuation func(value) evalResult
 type valueListContinuation func([]value) evalResult
 
 type continuationProc struct {
-	k     evalContinuation
-	winds []*dynamicWindFrame
+	k        evalContinuation
+	winds    []*dynamicWindFrame
+	handlers []*exceptionHandlerFrame
 }
 
 func doneEval(v value, err error) evalResult {
@@ -34,6 +36,13 @@ func doneError(err error) evalResult {
 	return doneEval(nil, err)
 }
 
+func doneRaised(sig *raisedSignal) evalResult {
+	return evalResult{
+		raised: sig,
+		done:   true,
+	}
+}
+
 func callEval(fn func() evalResult) evalResult {
 	return evalResult{thunk: fn}
 }
@@ -44,9 +53,15 @@ func continueEval(k evalContinuation, v value) evalResult {
 	})
 }
 
-func runEval(result evalResult) (value, error) {
+func (it *interpreter) runEval(result evalResult) (value, error) {
 	for !result.done {
 		result = result.thunk()
+	}
+	for result.raised != nil {
+		result = it.dispatchRaised(result.raised)
+		for !result.done {
+			result = result.thunk()
+		}
 	}
 	return result.value, result.err
 }
@@ -63,7 +78,7 @@ func programNeedsContinuationEvaluator(exprs []expr) bool {
 func exprNeedsContinuationEvaluator(node expr) bool {
 	switch current := node.(type) {
 	case *symbolExpr:
-		return isCallCCBuiltinName(current.name)
+		return isContinuationEvaluatorSymbol(current.name)
 	case *listExpr:
 		if len(current.elements) == 2 {
 			if head, ok := current.elements[0].(*symbolExpr); ok && head.name == "quote" {
@@ -77,6 +92,10 @@ func exprNeedsContinuationEvaluator(node expr) bool {
 		}
 	}
 	return false
+}
+
+func isContinuationEvaluatorSymbol(name string) bool {
+	return isCallCCBuiltinName(name) || name == "guard" || name == "raise" || name == "with-exception-handler"
 }
 
 func isCallCCBuiltinName(name string) bool {
@@ -102,7 +121,7 @@ func (it *interpreter) evalProgramWithContinuations(exprs []expr) (value, error)
 	if len(exprs) == 0 {
 		return nil, newEvalError(ErrSyntax, "expected expression", position{line: 1, column: 1})
 	}
-	return runEval(it.evalSequenceWithContinuations(it.global, exprs, haltContinuation))
+	return it.runEval(it.evalSequenceWithContinuations(it.global, exprs, haltContinuation))
 }
 
 func (it *interpreter) evalSequenceWithContinuations(scope *env, exprs []expr, k evalContinuation) evalResult {
@@ -254,6 +273,8 @@ func (it *interpreter) evalWithContinuations(node expr, scope *env, k evalContin
 				return it.evalCaseWithContinuations(scope, current, k)
 			case "do":
 				return it.evalDoWithContinuations(scope, current, k)
+			case "guard":
+				return it.evalGuardWithContinuations(scope, current, k)
 			}
 
 			if expanded, ok, err := it.expandMacroCall(current, scope); ok || err != nil {
@@ -807,6 +828,10 @@ func (it *interpreter) applyProcedureWithContinuations(proc value, args []value,
 			return it.applyForEachWithContinuations(args, callPos, k)
 		case "dynamic-wind":
 			return it.applyDynamicWindWithContinuations(args, callPos, k)
+		case "raise":
+			return it.applyRaiseWithContinuations(args, callPos)
+		case "with-exception-handler":
+			return it.applyWithExceptionHandlerWithContinuations(args, callPos, k)
 		default:
 			if isCallCCBuiltinName(proc.name) {
 				if len(args) != 1 {
@@ -814,8 +839,9 @@ func (it *interpreter) applyProcedureWithContinuations(proc value, args []value,
 				}
 				return callEval(func() evalResult {
 					return it.applyProcedureWithContinuations(args[0], []value{&continuationProc{
-						k:     k,
-						winds: copyDynamicWindFrames(it.dynamicWinds),
+						k:        k,
+						winds:    copyDynamicWindFrames(it.dynamicWinds),
+						handlers: copyExceptionHandlerFrames(it.exceptionHandlers),
 					}}, callPos, k)
 				})
 			}
@@ -853,7 +879,9 @@ func (it *interpreter) applyProcedureWithContinuations(proc value, args []value,
 		if len(args) != 1 {
 			return doneError(wrongArgCount(callPos, "continuation", fmt.Sprintf("expected exactly 1 argument, got %d", len(args))))
 		}
+		targetHandlers := copyExceptionHandlerFrames(proc.handlers)
 		return it.switchDynamicWinds(proc.winds, func() evalResult {
+			it.exceptionHandlers = targetHandlers
 			return continueEval(proc.k, args[0])
 		})
 	default:
