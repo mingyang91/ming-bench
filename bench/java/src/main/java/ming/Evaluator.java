@@ -77,6 +77,10 @@ public class Evaluator {
     private Object mVal;
     private boolean mApply;
 
+    // Step-limit state
+    private long stepLimit = -1;
+    private long stepCount = 0;
+
     // dynamic-wind stack
     private List<WindEntry> windStack = new ArrayList<>();
 
@@ -102,6 +106,17 @@ public class Evaluator {
         Object result = cekRun(program, globalEnv);
         if (result == VOID) return "#<void>";
         return schemeToString(result);
+    }
+
+    public String evalStrWithLimit(String input, long maxSteps) throws EvalError {
+        stepLimit = maxSteps;
+        stepCount = 0;
+        try {
+            return evalStr(input);
+        } finally {
+            stepLimit = -1;
+            stepCount = 0;
+        }
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
@@ -146,6 +161,11 @@ public class Evaluator {
         mVal = null;
 
         while (true) {
+            if (stepLimit >= 0) {
+                if (++stepCount > stepLimit) {
+                    throw new EvalError("step limit exceeded");
+                }
+            }
             if (mApply) {
                 if (mK instanceof HaltK) return mVal;
                 applyStep();
