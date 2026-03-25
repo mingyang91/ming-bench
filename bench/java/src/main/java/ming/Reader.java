@@ -1,15 +1,21 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.List;
 
 public class Reader {
     private final String input;
     private int pos;
+    private final IdentityHashMap<SchemeValue, SourcePos> positions = new IdentityHashMap<>();
 
     public Reader(String input) {
         this.input = input;
         this.pos = 0;
+    }
+
+    public IdentityHashMap<SchemeValue, SourcePos> getPositions() {
+        return positions;
     }
 
     public List<SchemeValue> readAll() throws EvalError {
@@ -22,25 +28,38 @@ public class Reader {
         return exprs;
     }
 
+    private SourcePos offsetToPos(int offset) {
+        int line = 1, col = 1;
+        for (int i = 0; i < offset && i < input.length(); i++) {
+            if (input.charAt(i) == '\n') { line++; col = 1; }
+            else col++;
+        }
+        return new SourcePos(line, col);
+    }
+
     private SchemeValue readExpr() throws EvalError {
         skipWhitespace();
         if (pos >= input.length()) throw new EvalError("unexpected end of input");
 
+        int startOffset = pos;
         char c = input.charAt(pos);
+        SchemeValue result;
 
         if (c == '(') {
-            return readList();
+            result = readList();
         } else if (c == '"') {
-            return readString();
+            result = readString();
         } else if (c == '#') {
-            return readHash();
+            result = readHash();
         } else if (c == '\'') {
             pos++;
             var quoted = readExpr();
-            return new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quote"), quoted));
+            result = new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quote"), quoted));
         } else {
-            return readAtom();
+            result = readAtom();
         }
+        positions.put(result, offsetToPos(startOffset));
+        return result;
     }
 
     private SchemeValue readList() throws EvalError {

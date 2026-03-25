@@ -1,14 +1,20 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.List;
 
 public class Interpreter {
     private final Environment globals = new Environment();
     private static final SchemeValue NIL = new SchemeValue.ListVal(List.of());
+    private IdentityHashMap<SchemeValue, SourcePos> positions;
 
     public Interpreter() {
         registerBuiltins();
+    }
+
+    public void setPositions(IdentityHashMap<SchemeValue, SourcePos> positions) {
+        this.positions = positions;
     }
 
     private void registerBuiltins() {
@@ -128,17 +134,27 @@ public class Interpreter {
     }
 
     public SchemeValue eval(SchemeValue expr, Environment env) throws EvalError {
-        return switch (expr) {
-            case SchemeValue.IntVal v -> v;
-            case SchemeValue.BoolVal v -> v;
-            case SchemeValue.StringVal v -> v;
-            case SchemeValue.VoidVal v -> v;
-            case SchemeValue.LambdaVal v -> v;
-            case SchemeValue.BuiltinVal v -> v;
-            case SchemeValue.PairVal v -> v;
-            case SchemeValue.SymbolVal v -> env.get(v.name());
-            case SchemeValue.ListVal v -> evalList(v, env);
-        };
+        try {
+            return switch (expr) {
+                case SchemeValue.IntVal v -> v;
+                case SchemeValue.BoolVal v -> v;
+                case SchemeValue.StringVal v -> v;
+                case SchemeValue.VoidVal v -> v;
+                case SchemeValue.LambdaVal v -> v;
+                case SchemeValue.BuiltinVal v -> v;
+                case SchemeValue.PairVal v -> v;
+                case SchemeValue.SymbolVal v -> env.get(v.name());
+                case SchemeValue.ListVal v -> evalList(v, env);
+            };
+        } catch (EvalError e) {
+            if (positions != null && !e.getMessage().matches(".*\\d+:\\d+.*")) {
+                var pos = positions.get(expr);
+                if (pos != null) {
+                    throw new EvalError(pos + ": " + e.getMessage());
+                }
+            }
+            throw e;
+        }
     }
 
     private SchemeValue evalList(SchemeValue.ListVal list, Environment env) throws EvalError {

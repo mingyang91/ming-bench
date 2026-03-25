@@ -6,6 +6,7 @@ public class Evaluator {
         var exprs = reader.readAll();
         if (exprs.isEmpty()) throw new EvalError("no expressions");
         var interp = new Interpreter();
+        interp.setPositions(reader.getPositions());
         SchemeValue result = null;
         for (var expr : exprs) {
             result = interp.eval(expr);
