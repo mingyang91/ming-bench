@@ -77,7 +77,10 @@ impl Evaluator {
             | "string-upcase" | "string-downcase"
             | "eq?" | "equal?" | "eqv?"
             | "exact?" | "inexact?" | "exact->inexact" | "inexact->exact"
-            | "numerator" | "denominator" | "integer?" | "rational?")
+            | "numerator" | "denominator" | "integer?" | "rational?"
+            | "vector" | "make-vector" | "vector-ref" | "vector-set!"
+            | "vector-length" | "vector?" | "vector->list" | "list->vector"
+            | "error" | "for-each" | "char->integer")
     }
 
     fn eval_in_env(&mut self, expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
@@ -124,6 +127,11 @@ impl Evaluator {
                 "define-record-type" => return self.eval_define_record_type(&elems[1..], env, call_pos),
                 "string-set!" => return self.eval_string_set(&elems[1..], env, call_pos),
                 "case-lambda" => return self.eval_case_lambda(&elems[1..], env, call_pos),
+                "letrec" => return self.eval_letrec(&elems[1..], env, call_pos),
+                "letrec*" => return self.eval_letrec_star(&elems[1..], env, call_pos),
+                "case" => return self.eval_case(&elems[1..], env, call_pos),
+                "do" => return self.eval_do(&elems[1..], env, call_pos),
+                "let*" => return self.eval_let_star(&elems[1..], env, call_pos),
                 "procedure?" => {
                     if elems.len() != 2 {
                         return Err(EvalError::Arity(format!(
@@ -500,6 +508,234 @@ impl Evaluator {
                 Ok(Value::Void)
             }
             _ => Err(EvalError::Type(format!("string-set!: expected string at {pos}"))),
+        }
+    }
+
+    fn eval_let_star(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<Value, EvalError> {
+        if args.is_empty() {
+            return Err(EvalError::Parse(format!("let*: missing arguments at {pos}")));
+        }
+        let bindings = match &args[0].kind {
+            ExprKind::List(b) => b,
+            _ => return Err(EvalError::Parse(format!("let*: expected bindings list at {pos}"))),
+        };
+        let mut new_env = env.child();
+        for binding in bindings {
+            match &binding.kind {
+                ExprKind::List(pair) if pair.len() == 2 => {
+                    if let ExprKind::Symbol(var) = &pair[0].kind {
+                        let val = self.eval_in_env(&pair[1], &mut new_env)?;
+                        new_env.define(var.clone(), val);
+                    } else {
+                        return Err(EvalError::Parse(format!("let*: expected symbol in binding at {pos}")));
+                    }
+                }
+                _ => return Err(EvalError::Parse(format!("let*: expected (var expr) binding at {pos}"))),
+            }
+        }
+        let mut result = Value::Void;
+        for expr in &args[1..] {
+            result = self.eval_in_env(expr, &mut new_env)?;
+        }
+        Ok(result)
+    }
+
+    fn eval_letrec(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<Value, EvalError> {
+        if args.is_empty() {
+            return Err(EvalError::Parse(format!("letrec: missing arguments at {pos}")));
+        }
+        let bindings = match &args[0].kind {
+            ExprKind::List(b) => b,
+            _ => return Err(EvalError::Parse(format!("letrec: expected bindings list at {pos}"))),
+        };
+        let mut new_env = env.child();
+        // First define all variables as void
+        let mut names = Vec::new();
+        for binding in bindings {
+            match &binding.kind {
+                ExprKind::List(pair) if pair.len() == 2 => {
+                    if let ExprKind::Symbol(var) = &pair[0].kind {
+                        names.push(var.clone());
+                        new_env.define(var.clone(), Value::Void);
+                    } else {
+                        return Err(EvalError::Parse(format!("letrec: expected symbol in binding at {pos}")));
+                    }
+                }
+                _ => return Err(EvalError::Parse(format!("letrec: expected (var expr) binding at {pos}"))),
+            }
+        }
+        // Then evaluate init expressions in the new env and set
+        for (i, binding) in bindings.iter().enumerate() {
+            if let ExprKind::List(pair) = &binding.kind {
+                let val = self.eval_in_env(&pair[1], &mut new_env)?;
+                new_env.set(&names[i], val);
+            }
+        }
+        let mut result = Value::Void;
+        for expr in &args[1..] {
+            result = self.eval_in_env(expr, &mut new_env)?;
+        }
+        Ok(result)
+    }
+
+    fn eval_letrec_star(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<Value, EvalError> {
+        if args.is_empty() {
+            return Err(EvalError::Parse(format!("letrec*: missing arguments at {pos}")));
+        }
+        let bindings = match &args[0].kind {
+            ExprKind::List(b) => b,
+            _ => return Err(EvalError::Parse(format!("letrec*: expected bindings list at {pos}"))),
+        };
+        let mut new_env = env.child();
+        // Define all variables as void first
+        for binding in bindings {
+            if let ExprKind::List(pair) = &binding.kind {
+                if let ExprKind::Symbol(var) = &pair[0].kind {
+                    new_env.define(var.clone(), Value::Void);
+                }
+            }
+        }
+        // Evaluate and set sequentially
+        for binding in bindings {
+            if let ExprKind::List(pair) = &binding.kind {
+                if let ExprKind::Symbol(var) = &pair[0].kind {
+                    let val = self.eval_in_env(&pair[1], &mut new_env)?;
+                    new_env.set(var, val);
+                }
+            }
+        }
+        let mut result = Value::Void;
+        for expr in &args[1..] {
+            result = self.eval_in_env(expr, &mut new_env)?;
+        }
+        Ok(result)
+    }
+
+    fn eval_case(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<Value, EvalError> {
+        if args.is_empty() {
+            return Err(EvalError::Parse(format!("case: missing arguments at {pos}")));
+        }
+        let key = self.eval_in_env(&args[0], env)?;
+        for clause in &args[1..] {
+            let parts = match &clause.kind {
+                ExprKind::List(e) if !e.is_empty() => e,
+                _ => return Err(EvalError::Parse(format!("case: expected clause at {pos}"))),
+            };
+            // Check for else clause
+            if let ExprKind::Symbol(s) = &parts[0].kind {
+                if s == "else" {
+                    let mut result = Value::Void;
+                    for expr in &parts[1..] {
+                        result = self.eval_in_env(expr, env)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            // Check datums: ((datum ...) expr ...)
+            let datums = match &parts[0].kind {
+                ExprKind::List(d) => d,
+                _ => return Err(EvalError::Parse(format!("case: expected datum list at {pos}"))),
+            };
+            for datum in datums {
+                let datum_val = Self::expr_to_value(datum);
+                if self.eqv(&key, &datum_val) {
+                    let mut result = Value::Void;
+                    for expr in &parts[1..] {
+                        result = self.eval_in_env(expr, env)?;
+                    }
+                    return Ok(result);
+                }
+            }
+        }
+        Ok(Value::Void)
+    }
+
+    fn eqv(&self, a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Integer(x), Value::Integer(y)) => x == y,
+            (Value::Float(x), Value::Float(y)) => x == y,
+            (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
+            (Value::Boolean(x), Value::Boolean(y)) => x == y,
+            (Value::Char(x), Value::Char(y)) => x == y,
+            (Value::Symbol(x), Value::Symbol(y)) => x == y,
+            (Value::Void, Value::Void) => true,
+            _ => false,
+        }
+    }
+
+    fn eval_do(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<Value, EvalError> {
+        // (do ((var init step) ...) (test expr ...) body ...)
+        if args.len() < 2 {
+            return Err(EvalError::Parse(format!("do: expected at least 2 arguments at {pos}")));
+        }
+        let var_clauses = match &args[0].kind {
+            ExprKind::List(v) => v,
+            _ => return Err(EvalError::Parse(format!("do: expected variable clauses at {pos}"))),
+        };
+        let test_clause = match &args[1].kind {
+            ExprKind::List(t) if !t.is_empty() => t,
+            _ => return Err(EvalError::Parse(format!("do: expected test clause at {pos}"))),
+        };
+        let body = &args[2..];
+
+        // Parse variable clauses
+        let mut var_names = Vec::new();
+        let mut step_exprs: Vec<Option<Expr>> = Vec::new();
+        let mut do_env = env.child();
+
+        for vc in var_clauses {
+            let parts = match &vc.kind {
+                ExprKind::List(p) if p.len() >= 2 => p,
+                _ => return Err(EvalError::Parse(format!("do: expected (var init [step]) at {pos}"))),
+            };
+            let var_name = match &parts[0].kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Parse(format!("do: expected symbol at {pos}"))),
+            };
+            let init_val = self.eval_in_env(&parts[1], env)?;
+            do_env.define(var_name.clone(), init_val);
+            var_names.push(var_name);
+            if parts.len() >= 3 {
+                step_exprs.push(Some(parts[2].clone()));
+            } else {
+                step_exprs.push(None);
+            }
+        }
+
+        loop {
+            // Evaluate test
+            let test_result = self.eval_in_env(&test_clause[0], &mut do_env)?;
+            if test_result.is_truthy() {
+                // Evaluate result expressions
+                if test_clause.len() > 1 {
+                    let mut result = Value::Void;
+                    for expr in &test_clause[1..] {
+                        result = self.eval_in_env(expr, &mut do_env)?;
+                    }
+                    return Ok(result);
+                }
+                return Ok(Value::Void);
+            }
+
+            // Evaluate body
+            for expr in body {
+                self.eval_in_env(expr, &mut do_env)?;
+            }
+
+            // Evaluate step expressions with old values (parallel update)
+            let new_vals: Vec<Option<Value>> = step_exprs.iter().map(|step| {
+                match step {
+                    Some(expr) => Ok(Some(self.eval_in_env(expr, &mut do_env)?)),
+                    None => Ok(None),
+                }
+            }).collect::<Result<Vec<_>, EvalError>>()?;
+
+            // Update variables
+            for (i, new_val) in new_vals.into_iter().enumerate() {
+                if let Some(val) = new_val {
+                    do_env.set(&var_names[i], val);
+                }
+            }
         }
     }
 
@@ -1049,7 +1285,11 @@ impl Evaluator {
             }
             "eq?" | "eqv?" => {
                 if args.len() != 2 { return Err(EvalError::Arity(format!("{name}: expected 2 arguments at {pos}"))); }
-                Ok(Value::Boolean(args[0] == args[1]))
+                let result = match (&args[0], &args[1]) {
+                    (Value::Vector(a), Value::Vector(b)) => std::ptr::eq(a.as_ptr(), b.as_ptr()),
+                    _ => self.eqv(&args[0], &args[1]),
+                };
+                Ok(Value::Boolean(result))
             }
             "equal?" => {
                 if args.len() != 2 { return Err(EvalError::Arity(format!("equal?: expected 2 arguments at {pos}"))); }
@@ -1106,6 +1346,93 @@ impl Evaluator {
             "rational?" => {
                 if args.len() != 1 { return Err(EvalError::Arity(format!("rational?: expected 1 argument at {pos}"))); }
                 Ok(Value::Boolean(args[0].is_exact()))
+            }
+            "vector" => {
+                Ok(Value::Vector(Rc::new(std::cell::RefCell::new(args.to_vec()))))
+            }
+            "make-vector" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(EvalError::Arity(format!("make-vector: expected 1-2 arguments at {pos}")));
+                }
+                let len = self.expect_integer(&args[0], "make-vector", pos)? as usize;
+                let fill = if args.len() == 2 { args[1].clone() } else { Value::Integer(0) };
+                Ok(Value::Vector(Rc::new(std::cell::RefCell::new(vec![fill; len]))))
+            }
+            "vector-ref" => {
+                if args.len() != 2 { return Err(EvalError::Arity(format!("vector-ref: expected 2 arguments at {pos}"))); }
+                match &args[0] {
+                    Value::Vector(v) => {
+                        let idx = self.expect_integer(&args[1], "vector-ref", pos)? as usize;
+                        let v = v.borrow();
+                        v.get(idx).cloned().ok_or_else(|| EvalError::Type(format!("vector-ref: index out of bounds at {pos}")))
+                    }
+                    _ => Err(EvalError::Type(format!("vector-ref: expected vector at {pos}"))),
+                }
+            }
+            "vector-set!" => {
+                if args.len() != 3 { return Err(EvalError::Arity(format!("vector-set!: expected 3 arguments at {pos}"))); }
+                match &args[0] {
+                    Value::Vector(v) => {
+                        let idx = self.expect_integer(&args[1], "vector-set!", pos)? as usize;
+                        let mut v = v.borrow_mut();
+                        if idx >= v.len() {
+                            return Err(EvalError::Type(format!("vector-set!: index out of bounds at {pos}")));
+                        }
+                        v[idx] = args[2].clone();
+                        Ok(Value::Void)
+                    }
+                    _ => Err(EvalError::Type(format!("vector-set!: expected vector at {pos}"))),
+                }
+            }
+            "vector-length" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("vector-length: expected 1 argument at {pos}"))); }
+                match &args[0] {
+                    Value::Vector(v) => Ok(Value::Integer(v.borrow().len() as i64)),
+                    _ => Err(EvalError::Type(format!("vector-length: expected vector at {pos}"))),
+                }
+            }
+            "vector?" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("vector?: expected 1 argument at {pos}"))); }
+                Ok(Value::Boolean(matches!(&args[0], Value::Vector(_))))
+            }
+            "vector->list" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("vector->list: expected 1 argument at {pos}"))); }
+                match &args[0] {
+                    Value::Vector(v) => Ok(Value::List(v.borrow().clone())),
+                    _ => Err(EvalError::Type(format!("vector->list: expected vector at {pos}"))),
+                }
+            }
+            "list->vector" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("list->vector: expected 1 argument at {pos}"))); }
+                match &args[0] {
+                    Value::List(l) => Ok(Value::Vector(Rc::new(std::cell::RefCell::new(l.clone())))),
+                    _ => Err(EvalError::Type(format!("list->vector: expected list at {pos}"))),
+                }
+            }
+            "error" => {
+                let msg = args.iter().map(|a| a.to_scheme_display()).collect::<Vec<_>>().join("");
+                Err(EvalError::Custom(format!("error: {msg}")))
+            }
+            "for-each" => {
+                if args.len() < 2 { return Err(EvalError::Arity(format!("for-each: expected at least 2 arguments at {pos}"))); }
+                let proc = args[0].clone();
+                let lists: Vec<&Vec<Value>> = args[1..].iter().map(|a| match a {
+                    Value::List(e) => Ok(e),
+                    _ => Err(EvalError::Type(format!("for-each: expected list at {pos}"))),
+                }).collect::<Result<Vec<_>, _>>()?;
+                let len = lists[0].len();
+                for i in 0..len {
+                    let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+                    self.call_proc(&proc, call_args, pos)?;
+                }
+                Ok(Value::Void)
+            }
+            "char->integer" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("char->integer: expected 1 argument at {pos}"))); }
+                match &args[0] {
+                    Value::Char(c) => Ok(Value::Integer(*c as i64)),
+                    _ => Err(EvalError::Type(format!("char->integer: expected char at {pos}"))),
+                }
             }
             _ => Err(EvalError::UnboundVariable(format!("{name} at {pos}"))),
         }
@@ -1291,9 +1618,10 @@ impl Evaluator {
     }
 
     fn is_special_form(name: &str) -> bool {
-        matches!(name, "define" | "if" | "quote" | "lambda" | "let" | "begin"
+        matches!(name, "define" | "if" | "quote" | "lambda" | "let" | "let*" | "begin"
             | "cond" | "and" | "or" | "set!" | "string-set!" | "not"
-            | "define-syntax" | "syntax-rules" | "case-lambda" | "procedure?")
+            | "define-syntax" | "syntax-rules" | "case-lambda" | "procedure?"
+            | "letrec" | "letrec*" | "case" | "do")
     }
 
     fn eval_define_syntax(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<Value, EvalError> {

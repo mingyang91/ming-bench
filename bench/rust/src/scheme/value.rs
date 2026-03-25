@@ -1,6 +1,7 @@
 use std::fmt;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ptr;
 use std::rc::Rc;
 
 type Frame = Rc<RefCell<HashMap<String, Value>>>;
@@ -34,6 +35,7 @@ pub enum Value {
     Lambda(Rc<LambdaData>),
     Macro(Rc<MacroData>),
     CaseLambda(Vec<Rc<LambdaData>>),   // multiple arity clauses
+    Vector(Rc<RefCell<Vec<Value>>>),    // mutable fixed-size array
     Record(u64, Vec<Value>),           // type_id, field values
     RecordConstructor(u64, usize),     // type_id, num_fields
     RecordPredicate(u64),              // type_id
@@ -105,6 +107,9 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
+            (Value::Vector(a), Value::Vector(b)) => {
+                ptr::eq(a.as_ptr(), b.as_ptr()) || *a.borrow() == *b.borrow()
+            }
             (Value::CaseLambda(_), Value::CaseLambda(_)) => false,
             (Value::Macro(_), Value::Macro(_)) => false,
             (Value::Record(t1, f1), Value::Record(t2, f2)) => t1 == t2 && f1 == f2,
@@ -197,6 +202,10 @@ impl Value {
             Value::Pair(a, b) => format!("({} . {})", a.to_display_string(), b.to_display_string()),
             Value::Lambda(_) | Value::CaseLambda(_) => "#<procedure>".into(),
             Value::Macro(_) => "#<macro>".into(),
+            Value::Vector(v) => {
+                let elems: Vec<String> = v.borrow().iter().map(|e| e.to_display_string()).collect();
+                format!("#({})", elems.join(" "))
+            }
             Value::Record(..) => "#<record>".into(),
             Value::RecordConstructor(..) | Value::RecordPredicate(_) | Value::RecordAccessor(..) => "#<procedure>".into(),
             Value::Void => "".into(),
@@ -225,6 +234,10 @@ impl Value {
                 format!("({})", inner.join(" "))
             }
             Value::Pair(a, b) => format!("({} . {})", a.to_scheme_display(), b.to_scheme_display()),
+            Value::Vector(v) => {
+                let elems: Vec<String> = v.borrow().iter().map(|e| e.to_scheme_display()).collect();
+                format!("#({})", elems.join(" "))
+            }
             _ => self.to_display_string(),
         }
     }
