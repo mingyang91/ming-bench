@@ -79,6 +79,18 @@ interface PairValue {
   cdr: SchemeValue;
 }
 
+interface RecordTypeDefinition {
+  id: number;
+  name: string;
+  fieldNames: string[];
+}
+
+interface RecordValue {
+  kind: 'record';
+  recordType: RecordTypeDefinition;
+  fields: SchemeValue[];
+}
+
 interface VoidValue {
   kind: 'void';
 }
@@ -91,6 +103,7 @@ type SchemeValue =
   | SymbolValue
   | EmptyListValue
   | PairValue
+  | RecordValue
   | VoidValue
   | ProcedureValue;
 
@@ -126,6 +139,17 @@ interface ParserState {
 interface LetBindingSpec {
   name: SymbolExpr;
   valueExpression: Expr;
+}
+
+interface RecordConstructorSpec {
+  name: SymbolExpr;
+  fields: SymbolExpr[];
+}
+
+interface RecordFieldSpec {
+  name: SymbolExpr;
+  accessor: SymbolExpr;
+  mutator?: SymbolExpr;
 }
 
 interface TokenizationResult {
@@ -208,6 +232,7 @@ const SPECIAL_FORM_NAMES = new Set([
   'begin',
   'cond',
   'define',
+  'define-record-type',
   'define-syntax',
   'if',
   'lambda',
@@ -218,6 +243,7 @@ const SPECIAL_FORM_NAMES = new Set([
 
 let nextTemplateId = 1;
 let nextIntroducedIdentifierId = 1;
+let nextRecordTypeId = 1;
 
 /**
  * Evaluate one or more Scheme expressions and return the string
@@ -426,6 +452,181 @@ function evaluateDefineSyntax(items: Expr[], env: Environment): SchemeValue {
   const transformer = parseSyntaxRules(name, items[1], env);
   env.defineMacro(name.value, transformer);
   return VOID_VALUE;
+}
+
+function evaluateDefineRecordType(items: Expr[], env: Environment): SchemeValue {
+  expectAtLeastArgCount('define-record-type', items, 3);
+
+  const typeName = expectSymbolExpression(
+    items[0],
+    'define-record-type requires a symbol record name',
+  );
+  const constructor = parseRecordConstructorSpec(items[1]);
+  const predicate = expectSymbolExpression(
+    items[2],
+    'define-record-type requires a predicate name',
+  );
+  const fieldSpecs = items.slice(3).map((item) => parseRecordFieldSpec(item));
+  const fieldIndexes = buildRecordFieldIndexMap(fieldSpecs);
+  const constructorFieldIndexes = constructor.fields.map((field) => {
+    const fieldIndex = fieldIndexes.get(displayIdentifierName(field));
+    if (fieldIndex === undefined) {
+      throw new EvalError(
+        `constructor references unknown record field: ${displayIdentifierName(field)}`,
+        field.location,
+      );
+    }
+    return fieldIndex;
+  });
+
+  const recordType: RecordTypeDefinition = {
+    id: nextRecordTypeId,
+    name: displayIdentifierName(typeName),
+    fieldNames: fieldSpecs.map((field) => displayIdentifierName(field.name)),
+  };
+  nextRecordTypeId += 1;
+
+  defineIdentifier(
+    constructor.name,
+    env,
+    makeRecordConstructorProcedure(constructor, fieldSpecs.length, constructorFieldIndexes, recordType),
+  );
+  defineIdentifier(
+    predicate,
+    env,
+    makeRecordPredicateProcedure(predicate, recordType),
+  );
+
+  for (let index = 0; index < fieldSpecs.length; index += 1) {
+    const field = fieldSpecs[index];
+    defineIdentifier(field.accessor, env, makeRecordAccessorProcedure(field.accessor, recordType, index));
+
+    if (field.mutator !== undefined) {
+      defineIdentifier(field.mutator, env, makeRecordMutatorProcedure(field.mutator, recordType, index));
+    }
+  }
+
+  return VOID_VALUE;
+}
+
+function parseRecordConstructorSpec(expression: Expr): RecordConstructorSpec {
+  if (expression.kind !== 'list' || expression.items.length === 0) {
+    throw new EvalError('define-record-type constructor spec must be a non-empty list', expression.location);
+  }
+
+  return {
+    name: expectSymbolExpression(
+      expression.items[0],
+      'define-record-type constructor name must be a symbol',
+    ),
+    fields: expression.items
+      .slice(1)
+      .map((item) =>
+        expectSymbolExpression(item, 'define-record-type constructor fields must be symbols'),
+      ),
+  };
+}
+
+function parseRecordFieldSpec(expression: Expr): RecordFieldSpec {
+  if (
+    expression.kind !== 'list' ||
+    (expression.items.length !== 2 && expression.items.length !== 3)
+  ) {
+    throw new EvalError(
+      'define-record-type field specs must contain a field name, accessor, and optional mutator',
+      expression.location,
+    );
+  }
+
+  return {
+    name: expectSymbolExpression(
+      expression.items[0],
+      'define-record-type field names must be symbols',
+    ),
+    accessor: expectSymbolExpression(
+      expression.items[1],
+      'define-record-type accessor names must be symbols',
+    ),
+    mutator:
+      expression.items[2] === undefined
+        ? undefined
+        : expectSymbolExpression(
+            expression.items[2],
+            'define-record-type mutator names must be symbols',
+          ),
+  };
+}
+
+function buildRecordFieldIndexMap(fieldSpecs: RecordFieldSpec[]): Map<string, number> {
+  const fieldIndexes = new Map<string, number>();
+
+  for (let index = 0; index < fieldSpecs.length; index += 1) {
+    const fieldName = displayIdentifierName(fieldSpecs[index].name);
+    if (fieldIndexes.has(fieldName)) {
+      throw new EvalError(
+        `duplicate record field: ${fieldName}`,
+        fieldSpecs[index].name.location,
+      );
+    }
+    fieldIndexes.set(fieldName, index);
+  }
+
+  return fieldIndexes;
+}
+
+function makeRecordConstructorProcedure(
+  constructor: RecordConstructorSpec,
+  fieldCount: number,
+  constructorFieldIndexes: number[],
+  recordType: RecordTypeDefinition,
+): BuiltinProcedureValue {
+  const name = displayIdentifierName(constructor.name);
+  return makeBuiltinProcedure(name, (args) => {
+    expectExactArgCount(name, args, constructorFieldIndexes.length);
+
+    const fields = Array.from({ length: fieldCount }, () => VOID_VALUE as SchemeValue);
+    for (let index = 0; index < constructorFieldIndexes.length; index += 1) {
+      fields[constructorFieldIndexes[index]] = args[index];
+    }
+
+    return recordValue(recordType, fields);
+  });
+}
+
+function makeRecordPredicateProcedure(
+  predicate: SymbolExpr,
+  recordType: RecordTypeDefinition,
+): BuiltinProcedureValue {
+  const name = displayIdentifierName(predicate);
+  return makeBuiltinProcedure(name, (args) => {
+    expectExactArgCount(name, args, 1);
+    return booleanValue(args[0].kind === 'record' && args[0].recordType.id === recordType.id);
+  });
+}
+
+function makeRecordAccessorProcedure(
+  accessor: SymbolExpr,
+  recordType: RecordTypeDefinition,
+  fieldIndex: number,
+): BuiltinProcedureValue {
+  const name = displayIdentifierName(accessor);
+  return makeBuiltinProcedure(name, (args) => {
+    expectExactArgCount(name, args, 1);
+    return expectRecord(args[0], name, recordType).fields[fieldIndex];
+  });
+}
+
+function makeRecordMutatorProcedure(
+  mutator: SymbolExpr,
+  recordType: RecordTypeDefinition,
+  fieldIndex: number,
+): BuiltinProcedureValue {
+  const name = displayIdentifierName(mutator);
+  return makeBuiltinProcedure(name, (args) => {
+    expectExactArgCount(name, args, 2);
+    expectRecord(args[0], name, recordType).fields[fieldIndex] = args[1];
+    return VOID_VALUE;
+  });
 }
 
 function parseSyntaxRules(
@@ -1295,6 +1496,8 @@ function evaluateList(items: Expr[], env: Environment): SchemeValue {
         return evaluateCond(items.slice(1), env);
       case 'define':
         return evaluateDefine(items.slice(1), env);
+      case 'define-record-type':
+        return evaluateDefineRecordType(items.slice(1), env);
       case 'define-syntax':
         return evaluateDefineSyntax(items.slice(1), env);
       case 'if':
@@ -2127,6 +2330,18 @@ function expectChar(value: SchemeValue, name: string): string {
   return value.value;
 }
 
+function expectRecord(
+  value: SchemeValue,
+  name: string,
+  recordType: RecordTypeDefinition,
+): RecordValue {
+  if (value.kind !== 'record' || value.recordType.id !== recordType.id) {
+    throw new EvalError(`${name} expected a ${recordType.name} record`);
+  }
+
+  return value;
+}
+
 function expectSymbol(value: SchemeValue, name: string): string {
   if (value.kind !== 'symbol') {
     throw new EvalError(`${name} expected a symbol`);
@@ -2314,6 +2529,8 @@ function formatValue(value: SchemeValue): string {
       return '()';
     case 'pair':
       return formatPair(value);
+    case 'record':
+      return `#<record:${value.recordType.name}>`;
     case 'void':
       return '#<void>';
     case 'procedure':
@@ -2433,6 +2650,7 @@ function schemeEq(left: SchemeValue, right: SchemeValue): boolean {
       return true;
     case 'string':
     case 'pair':
+    case 'record':
     case 'procedure':
       return left === right;
   }
@@ -2460,6 +2678,7 @@ function schemeEqual(left: SchemeValue, right: SchemeValue): boolean {
         schemeEqual(left.car, (right as PairValue).car) &&
         schemeEqual(left.cdr, (right as PairValue).cdr)
       );
+    case 'record':
     case 'procedure':
       return left === right;
   }
@@ -2491,6 +2710,10 @@ function symbolValue(value: string): SymbolValue {
 
 function pairValue(car: SchemeValue, cdr: SchemeValue): PairValue {
   return { kind: 'pair', car, cdr };
+}
+
+function recordValue(recordType: RecordTypeDefinition, fields: SchemeValue[]): RecordValue {
+  return { kind: 'record', recordType, fields };
 }
 
 function isWhitespace(char: string): boolean {
@@ -2930,4 +3153,12 @@ function rethrowWithLocation(error: unknown, location: SourceLocation): never {
   }
 
   throw error;
+}
+
+function expectSymbolExpression(expression: Expr, message: string): SymbolExpr {
+  if (expression.kind !== 'symbol') {
+    throw new EvalError(message, expression.location);
+  }
+
+  return expression;
 }
