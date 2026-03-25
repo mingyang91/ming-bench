@@ -5865,7 +5865,11 @@ fn eval_input(
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let (value, output) = eval_input(input, true, None)?;
-    Ok((value.render(), output))
+    let rendered = match &value {
+        Value::String(_) => value.render_for_display(),
+        _ => value.render(),
+    };
+    Ok((rendered, output))
 }
 
 #[cfg(test)]
