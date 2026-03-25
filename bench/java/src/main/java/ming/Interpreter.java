@@ -17,7 +17,7 @@ public class Interpreter {
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "define", "if", "quote", "lambda", "and", "or", "let", "let*", "begin",
         "cond", "set!", "define-syntax", "syntax-rules", "define-record-type",
-        "letrec", "letrec*", "case", "do", "when", "unless"
+        "letrec", "letrec*", "case", "do", "when", "unless", "guard"
     );
 
     // Sentinel for call/cc — identity-checked in applyProcCek
@@ -27,6 +27,13 @@ public class Interpreter {
         new SchemeValue.BuiltinVal("apply", null);
     private static final SchemeValue.BuiltinVal DYNAMIC_WIND_MARKER =
         new SchemeValue.BuiltinVal("dynamic-wind", null);
+    private static final SchemeValue.BuiltinVal RAISE_MARKER =
+        new SchemeValue.BuiltinVal("raise", null);
+    private static final SchemeValue.BuiltinVal WITH_EXCEPTION_HANDLER_MARKER =
+        new SchemeValue.BuiltinVal("with-exception-handler", null);
+
+    // exception handler stack
+    private final List<SchemeValue> exceptionHandlers = new ArrayList<>();
 
     // dynamic-wind support
     private record WindEntry(SchemeValue inThunk, SchemeValue outThunk) {}
@@ -942,6 +949,10 @@ public class Interpreter {
 
         // L19: dynamic-wind
         globals.define("dynamic-wind", DYNAMIC_WIND_MARKER);
+
+        // L20: raise, with-exception-handler
+        globals.define("raise", RAISE_MARKER);
+        globals.define("with-exception-handler", WITH_EXCEPTION_HANDLER_MARKER);
     }
 
     // ---- CEK evaluation engine ----
@@ -1059,6 +1070,7 @@ public class Interpreter {
                 case "letrec*" -> { stepLetrecStar(list.elements(), env, k); return; }
                 case "case" -> { stepCase(list.elements(), env, k); return; }
                 case "do" -> { stepDo(list.elements(), env, k); return; }
+                case "guard" -> { stepGuard(list.elements(), env, k); return; }
                 default -> {
                     SchemeValue resolved = null;
                     try { resolved = env.get(sym.name()); } catch (EvalError e) { /* not bound */ }
@@ -1373,6 +1385,67 @@ public class Interpreter {
         }));
     }
 
+    private void stepGuard(List<SchemeValue> elements, Environment env, Cont k) throws EvalError {
+        // (guard (var clause1 clause2 ...) body ...)
+        if (elements.size() < 3) throw new EvalError("guard: bad syntax");
+        var spec = elements.get(1);
+        if (!(spec instanceof SchemeValue.ListVal cl) || cl.elements().size() < 2)
+            throw new EvalError("guard: bad syntax");
+        if (!(cl.elements().get(0) instanceof SchemeValue.SymbolVal varSym))
+            throw new EvalError("guard: expected variable name");
+
+        String varName = varSym.name();
+        var clauses = cl.elements().subList(1, cl.elements().size());
+        var bodyExprs = elements.subList(2, elements.size());
+
+        // Continuation that evaluates guard clauses after wind unwinding
+        var guardClauseK = new Cont.Frame(exnValue -> {
+            var clauseEnv = new Environment(env);
+            clauseEnv.define(varName, exnValue);
+            stepGuardClauses(clauses, 0, clauseEnv, k);
+        });
+
+        // Capture as a continuation value (enables wind transitions on raise)
+        var guardCont = new SchemeValue.ContinuationVal(
+            new CapturedContinuation(guardClauseK, new ArrayList<>(windStack)));
+
+        // Push as exception handler
+        exceptionHandlers.add(guardCont);
+
+        // Evaluate body; on normal completion remove handler and return result
+        setupSequence(bodyExprs, 0, env, new Cont.Frame(result -> {
+            exceptionHandlers.remove(exceptionHandlers.size() - 1);
+            cekReturn(result, k);
+        }));
+    }
+
+    private void stepGuardClauses(List<SchemeValue> clauses, int index,
+                                   Environment env, Cont k) throws EvalError {
+        if (index >= clauses.size()) {
+            // No clause matched, re-raise
+            SchemeValue exn = env.get(((SchemeValue.SymbolVal) clauses.get(0)).name());
+            applyProcCek(RAISE_MARKER, new SchemeValue[]{exn}, k);
+            return;
+        }
+        var clause = clauses.get(index);
+        if (!(clause instanceof SchemeValue.ListVal cl) || cl.elements().isEmpty())
+            throw new EvalError("guard: bad clause");
+        var test = cl.elements().get(0);
+        if (test instanceof SchemeValue.SymbolVal sym && sym.name().equals("else")) {
+            if (cl.elements().size() > 1) setupSequence(cl.elements(), 1, env, k);
+            else cekReturn(new SchemeValue.VoidVal(), k);
+            return;
+        }
+        cekEval(test, env, new Cont.Frame(testVal -> {
+            if (testVal.isTruthy()) {
+                if (cl.elements().size() > 1) setupSequence(cl.elements(), 1, env, k);
+                else cekReturn(testVal, k);
+            } else {
+                stepGuardClauses(clauses, index + 1, env, k);
+            }
+        }));
+    }
+
     private void stepCase(List<SchemeValue> elements, Environment env, Cont k) throws EvalError {
         if (elements.size() < 2) throw new EvalError("case: bad syntax");
         cekEval(elements.get(1), env, new Cont.Frame(key -> {
@@ -1542,6 +1615,34 @@ public class Interpreter {
                         cekReturn(bodyResult, k);
                     }));
                 }));
+            }));
+            return;
+        }
+
+        // raise
+        if (proc == RAISE_MARKER) {
+            if (args.length != 1) throw new EvalError("raise: expected 1 argument");
+            SchemeValue value = args[0];
+            if (exceptionHandlers.isEmpty()) {
+                throw new EvalError("raise: unhandled exception: " + value.display());
+            }
+            SchemeValue handler = exceptionHandlers.remove(exceptionHandlers.size() - 1);
+            // Apply handler; if it returns, that's an error
+            applyProcCek(handler, new SchemeValue[]{value}, new Cont.Frame(result -> {
+                throw new EvalError("raise: exception handler returned");
+            }));
+            return;
+        }
+
+        // with-exception-handler
+        if (proc == WITH_EXCEPTION_HANDLER_MARKER) {
+            if (args.length != 2) throw new EvalError("with-exception-handler: expected 2 arguments");
+            SchemeValue handler = args[0];
+            SchemeValue thunk = args[1];
+            exceptionHandlers.add(handler);
+            applyProcCek(thunk, new SchemeValue[0], new Cont.Frame(result -> {
+                exceptionHandlers.remove(exceptionHandlers.size() - 1);
+                cekReturn(result, k);
             }));
             return;
         }
