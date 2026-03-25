@@ -87,7 +87,12 @@ public class Evaluator {
             case Val.Bool b -> b.value() ? "#t" : "#f";
             case Val.Str s -> "\"" + s.value() + "\"";
             case Val.Sym s -> s.name();
-            case Val.Chr c -> "#\\" + c.value();
+            case Val.Chr c -> "#\\" + switch (c.value()) {
+                case ' ' -> "space";
+                case '\n' -> "newline";
+                case '\t' -> "tab";
+                default -> String.valueOf(c.value());
+            };
             case Val.Nil ignored -> "()";
             case Val.Void ignored -> "#<void>";
             case Val.PairV p -> writePair(p);
@@ -138,6 +143,24 @@ public class Evaluator {
         }
         sb.append(')');
         return sb.toString();
+    }
+
+    private static boolean isEq(Val a, Val b) {
+        if (a == b) return true;
+        if (a instanceof Val.Int ai && b instanceof Val.Int bi) return ai.value() == bi.value();
+        if (a instanceof Val.Bool ab && b instanceof Val.Bool bb) return ab.value() == bb.value();
+        if (a instanceof Val.Sym as && b instanceof Val.Sym bs) return as.name().equals(bs.name());
+        if (a instanceof Val.Chr ac && b instanceof Val.Chr bc) return ac.value() == bc.value();
+        if (a instanceof Val.Nil && b instanceof Val.Nil) return true;
+        return false;
+    }
+
+    private static boolean isEqual(Val a, Val b) {
+        if (a instanceof Val.PairV pa && b instanceof Val.PairV pb) {
+            return isEqual(pa.car(), pb.car()) && isEqual(pa.cdr(), pb.cdr());
+        }
+        if (a instanceof Val.Str sa && b instanceof Val.Str sb) return sa.value().equals(sb.value());
+        return isEq(a, b);
     }
 
     private static boolean isTruthy(Val v) {
@@ -771,6 +794,217 @@ public class Evaluator {
             if (!(args.get(2) instanceof Val.Chr c)) throw new RuntimeException("string-set!: not a character");
             s.setChar(idx, c.value());
             return new Val.Void();
+        }));
+        // L09 — numeric utilities
+        env.define("abs", new Val.Builtin("abs", args -> {
+            checkArgCount(args, 1, "abs");
+            return new Val.Int(Math.abs(asInt(args.get(0))));
+        }));
+        env.define("modulo", new Val.Builtin("modulo", args -> {
+            checkArgCount(args, 2, "modulo");
+            long a = asInt(args.get(0)), b = asInt(args.get(1));
+            if (b == 0) throw new RuntimeException("modulo: division by zero");
+            return new Val.Int(Math.floorMod(a, b));
+        }));
+        env.define("remainder", new Val.Builtin("remainder", args -> {
+            checkArgCount(args, 2, "remainder");
+            long a = asInt(args.get(0)), b = asInt(args.get(1));
+            if (b == 0) throw new RuntimeException("remainder: division by zero");
+            return new Val.Int(a % b);
+        }));
+        env.define("quotient", new Val.Builtin("quotient", args -> {
+            checkArgCount(args, 2, "quotient");
+            long a = asInt(args.get(0)), b = asInt(args.get(1));
+            if (b == 0) throw new RuntimeException("quotient: division by zero");
+            long q = a / b;
+            // truncate toward zero (Java default for long division)
+            return new Val.Int(q);
+        }));
+        env.define("min", new Val.Builtin("min", args -> {
+            if (args.isEmpty()) throw new RuntimeException("min requires at least 1 argument");
+            long result = asInt(args.get(0));
+            for (int i = 1; i < args.size(); i++) result = Math.min(result, asInt(args.get(i)));
+            return new Val.Int(result);
+        }));
+        env.define("max", new Val.Builtin("max", args -> {
+            if (args.isEmpty()) throw new RuntimeException("max requires at least 1 argument");
+            long result = asInt(args.get(0));
+            for (int i = 1; i < args.size(); i++) result = Math.max(result, asInt(args.get(i)));
+            return new Val.Int(result);
+        }));
+        env.define("expt", new Val.Builtin("expt", args -> {
+            checkArgCount(args, 2, "expt");
+            long base = asInt(args.get(0)), exp = asInt(args.get(1));
+            long result = 1;
+            boolean neg = exp < 0;
+            long e = Math.abs(exp);
+            for (long i = 0; i < e; i++) result *= base;
+            if (neg) return new Val.Int(0); // integer exponentiation truncates
+            return new Val.Int(result);
+        }));
+        env.define("zero?", new Val.Builtin("zero?", args -> {
+            checkArgCount(args, 1, "zero?");
+            return new Val.Bool(asInt(args.get(0)) == 0);
+        }));
+        env.define("positive?", new Val.Builtin("positive?", args -> {
+            checkArgCount(args, 1, "positive?");
+            return new Val.Bool(asInt(args.get(0)) > 0);
+        }));
+        env.define("negative?", new Val.Builtin("negative?", args -> {
+            checkArgCount(args, 1, "negative?");
+            return new Val.Bool(asInt(args.get(0)) < 0);
+        }));
+        env.define("odd?", new Val.Builtin("odd?", args -> {
+            checkArgCount(args, 1, "odd?");
+            return new Val.Bool(asInt(args.get(0)) % 2 != 0);
+        }));
+        env.define("even?", new Val.Builtin("even?", args -> {
+            checkArgCount(args, 1, "even?");
+            return new Val.Bool(asInt(args.get(0)) % 2 == 0);
+        }));
+        // L09 — list utilities
+        env.define("list-ref", new Val.Builtin("list-ref", args -> {
+            checkArgCount(args, 2, "list-ref");
+            Val cur = args.get(0);
+            long idx = asInt(args.get(1));
+            for (long i = 0; i < idx; i++) {
+                if (!(cur instanceof Val.PairV p)) throw new RuntimeException("list-ref: index out of range");
+                cur = p.cdr();
+            }
+            if (!(cur instanceof Val.PairV p)) throw new RuntimeException("list-ref: index out of range");
+            return p.car();
+        }));
+        env.define("list-tail", new Val.Builtin("list-tail", args -> {
+            checkArgCount(args, 2, "list-tail");
+            Val cur = args.get(0);
+            long idx = asInt(args.get(1));
+            for (long i = 0; i < idx; i++) {
+                if (!(cur instanceof Val.PairV p)) throw new RuntimeException("list-tail: index out of range");
+                cur = p.cdr();
+            }
+            return cur;
+        }));
+        env.define("list?", new Val.Builtin("list?", args -> {
+            checkArgCount(args, 1, "list?");
+            Val cur = args.get(0);
+            while (cur instanceof Val.PairV p) {
+                cur = p.cdr();
+            }
+            return new Val.Bool(cur instanceof Val.Nil);
+        }));
+        // L09 — equality
+        env.define("eq?", new Val.Builtin("eq?", args -> {
+            checkArgCount(args, 2, "eq?");
+            return new Val.Bool(isEq(args.get(0), args.get(1)));
+        }));
+        env.define("equal?", new Val.Builtin("equal?", args -> {
+            checkArgCount(args, 2, "equal?");
+            return new Val.Bool(isEqual(args.get(0), args.get(1)));
+        }));
+        // L09 — assoc
+        env.define("assoc", new Val.Builtin("assoc", args -> {
+            checkArgCount(args, 2, "assoc");
+            Val key = args.get(0);
+            Val lst = args.get(1);
+            while (lst instanceof Val.PairV p) {
+                if (p.car() instanceof Val.PairV entry && isEqual(entry.car(), key)) {
+                    return entry;
+                }
+                lst = p.cdr();
+            }
+            return new Val.Bool(false);
+        }));
+        // L09 — built-in map (supports multiple lists)
+        env.define("map", new Val.Builtin("map", args -> {
+            if (args.size() < 2) throw new RuntimeException("map requires at least 2 arguments");
+            Val fn = args.get(0);
+            int numLists = args.size() - 1;
+            Val[] cursors = new Val[numLists];
+            for (int i = 0; i < numLists; i++) cursors[i] = args.get(i + 1);
+            List<Val> results = new ArrayList<>();
+            while (true) {
+                // Check if any list is exhausted
+                boolean done = false;
+                for (Val c : cursors) {
+                    if (!(c instanceof Val.PairV)) { done = true; break; }
+                }
+                if (done) break;
+                List<Val> callArgs = new ArrayList<>();
+                for (int i = 0; i < numLists; i++) {
+                    callArgs.add(((Val.PairV) cursors[i]).car());
+                    cursors[i] = ((Val.PairV) cursors[i]).cdr();
+                }
+                try {
+                    results.add(applyFn(fn, callArgs, null));
+                } catch (EvalError e) {
+                    throw new RuntimeException(e.getMessage());
+                }
+            }
+            Val result = new Val.Nil();
+            for (int i = results.size() - 1; i >= 0; i--) result = new Val.PairV(results.get(i), result);
+            return result;
+        }));
+        // L09 — character utilities
+        env.define("char-alphabetic?", new Val.Builtin("char-alphabetic?", args -> {
+            checkArgCount(args, 1, "char-alphabetic?");
+            if (!(args.get(0) instanceof Val.Chr c)) throw new RuntimeException("char-alphabetic?: not a character");
+            return new Val.Bool(Character.isLetter(c.value()));
+        }));
+        env.define("char-numeric?", new Val.Builtin("char-numeric?", args -> {
+            checkArgCount(args, 1, "char-numeric?");
+            if (!(args.get(0) instanceof Val.Chr c)) throw new RuntimeException("char-numeric?: not a character");
+            return new Val.Bool(Character.isDigit(c.value()));
+        }));
+        env.define("char-upcase", new Val.Builtin("char-upcase", args -> {
+            checkArgCount(args, 1, "char-upcase");
+            if (!(args.get(0) instanceof Val.Chr c)) throw new RuntimeException("char-upcase: not a character");
+            return new Val.Chr(Character.toUpperCase(c.value()));
+        }));
+        env.define("char-downcase", new Val.Builtin("char-downcase", args -> {
+            checkArgCount(args, 1, "char-downcase");
+            if (!(args.get(0) instanceof Val.Chr c)) throw new RuntimeException("char-downcase: not a character");
+            return new Val.Chr(Character.toLowerCase(c.value()));
+        }));
+        env.define("char=?", new Val.Builtin("char=?", args -> {
+            checkArgCount(args, 2, "char=?");
+            if (!(args.get(0) instanceof Val.Chr a)) throw new RuntimeException("char=?: not a character");
+            if (!(args.get(1) instanceof Val.Chr b)) throw new RuntimeException("char=?: not a character");
+            return new Val.Bool(a.value() == b.value());
+        }));
+        env.define("char<?", new Val.Builtin("char<?", args -> {
+            checkArgCount(args, 2, "char<?");
+            if (!(args.get(0) instanceof Val.Chr a)) throw new RuntimeException("char<?: not a character");
+            if (!(args.get(1) instanceof Val.Chr b)) throw new RuntimeException("char<?: not a character");
+            return new Val.Bool(a.value() < b.value());
+        }));
+        // L09 — string comparison/case
+        env.define("string=?", new Val.Builtin("string=?", args -> {
+            checkArgCount(args, 2, "string=?");
+            if (!(args.get(0) instanceof Val.Str a)) throw new RuntimeException("string=?: not a string");
+            if (!(args.get(1) instanceof Val.Str b)) throw new RuntimeException("string=?: not a string");
+            return new Val.Bool(a.value().equals(b.value()));
+        }));
+        env.define("string<?", new Val.Builtin("string<?", args -> {
+            checkArgCount(args, 2, "string<?");
+            if (!(args.get(0) instanceof Val.Str a)) throw new RuntimeException("string<?: not a string");
+            if (!(args.get(1) instanceof Val.Str b)) throw new RuntimeException("string<?: not a string");
+            return new Val.Bool(a.value().compareTo(b.value()) < 0);
+        }));
+        env.define("string-ci=?", new Val.Builtin("string-ci=?", args -> {
+            checkArgCount(args, 2, "string-ci=?");
+            if (!(args.get(0) instanceof Val.Str a)) throw new RuntimeException("string-ci=?: not a string");
+            if (!(args.get(1) instanceof Val.Str b)) throw new RuntimeException("string-ci=?: not a string");
+            return new Val.Bool(a.value().equalsIgnoreCase(b.value()));
+        }));
+        env.define("string-upcase", new Val.Builtin("string-upcase", args -> {
+            checkArgCount(args, 1, "string-upcase");
+            if (!(args.get(0) instanceof Val.Str s)) throw new RuntimeException("string-upcase: not a string");
+            return new Val.Str(s.value().toUpperCase());
+        }));
+        env.define("string-downcase", new Val.Builtin("string-downcase", args -> {
+            checkArgCount(args, 1, "string-downcase");
+            if (!(args.get(0) instanceof Val.Str s)) throw new RuntimeException("string-downcase: not a string");
+            return new Val.Str(s.value().toLowerCase());
         }));
         // L08 — apply
         env.define("apply", new Val.Builtin("apply", args -> {
