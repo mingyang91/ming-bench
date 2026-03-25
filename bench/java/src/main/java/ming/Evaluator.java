@@ -11,7 +11,7 @@ import java.util.Set;
 public class Evaluator {
 
     // ── Value types ──────────────────────────────────────────────
-    private sealed interface Val permits Val.Int, Val.Rat, Val.Flo, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda, Val.CaseLambda, Val.Macro, Val.RecordInstance, Val.Vec, Val.ContVal, Val.CallccVal, Val.DynamicWindVal, Val.WithExceptionHandlerVal, Val.CallWithValuesVal, Val.MultiVal {
+    private sealed interface Val permits Val.Int, Val.Rat, Val.Flo, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda, Val.CaseLambda, Val.Macro, Val.TransformerMacro, Val.SyntaxMatch, Val.RecordInstance, Val.Vec, Val.ContVal, Val.CallccVal, Val.DynamicWindVal, Val.WithExceptionHandlerVal, Val.CallWithValuesVal, Val.MultiVal {
         record Int(long value) implements Val {}
         record Rat(long num, long den) implements Val {}
         record Flo(double value) implements Val {}
@@ -65,6 +65,21 @@ public class Evaluator {
             Macro(String name, List<String> literals, List<Val> patterns, List<Val> templates, Env defEnv) {
                 this.name = name; this.literals = literals; this.patterns = patterns;
                 this.templates = templates; this.defEnv = defEnv;
+            }
+        }
+        final class TransformerMacro implements Val {
+            final String name;
+            final Lambda lambda;
+            final Env defEnv;
+            TransformerMacro(String name, Lambda lambda, Env defEnv) {
+                this.name = name; this.lambda = lambda; this.defEnv = defEnv;
+            }
+        }
+        final class SyntaxMatch implements Val {
+            final MatchResult match;
+            final Env defEnv;
+            SyntaxMatch(MatchResult match, Env defEnv) {
+                this.match = match; this.defEnv = defEnv;
             }
         }
         // Continuation value (captured by call/cc)
@@ -143,7 +158,7 @@ public class Evaluator {
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "quote", "if", "define", "lambda", "set!", "begin", "let", "let*", "cond", "and", "or",
         "define-syntax", "define-record-type", "letrec", "letrec*", "case", "do", "case-lambda",
-        "guard"
+        "guard", "syntax-case", "syntax", "with-syntax"
     );
 
     // ── Write representation ────────────────────────────────────
@@ -167,6 +182,8 @@ public class Evaluator {
             case Val.CaseLambda ignored -> "#<procedure>";
             case Val.RecordInstance r -> "#<record:" + r.typeName + ">";
             case Val.Macro m -> "#<macro:" + m.name + ">";
+            case Val.TransformerMacro tm -> "#<macro:" + tm.name + ">";
+            case Val.SyntaxMatch ignored -> "#<syntax-match>";
             case Val.Vec vec -> {
                 StringBuilder sb = new StringBuilder("#(");
                 for (int i = 0; i < vec.elements.length; i++) {
@@ -288,6 +305,9 @@ public class Evaluator {
             if (c == '(') { tokens.add(new Token("(", line, col)); i++; col++; continue; }
             if (c == ')') { tokens.add(new Token(")", line, col)); i++; col++; continue; }
             if (c == '\'') { tokens.add(new Token("'", line, col)); i++; col++; continue; }
+            if (c == '#' && i + 1 < len && input.charAt(i + 1) == '\'') {
+                tokens.add(new Token("#'", line, col)); i += 2; col += 2; continue;
+            }
             if (c == '"') {
                 int startCol = col;
                 StringBuilder sb = new StringBuilder("\"");
@@ -347,6 +367,15 @@ public class Evaluator {
             Val quoteSym = new Val.Sym("quote");
             setPos(quoteSym, tok.line(), tok.col());
             Val result = new Val.PairV(quoteSym, inner);
+            setPos(result, tok.line(), tok.col());
+            return result;
+        }
+        if (tok.text().equals("#'")) {
+            Val syntaxed = parse(tokens, idx);
+            Val inner = new Val.PairV(syntaxed, new Val.Nil());
+            Val syntaxSym = new Val.Sym("syntax");
+            setPos(syntaxSym, tok.line(), tok.col());
+            Val result = new Val.PairV(syntaxSym, inner);
             setPos(result, tok.line(), tok.col());
             return result;
         }
@@ -432,6 +461,10 @@ public class Evaluator {
         record GuardClauseK(String varName, Val clauses, Env env, Kont k) implements Kont {}
         record RaiseErrorK() implements Kont {}
         record CallWithValuesK(Val consumer, Kont k, Val form) implements Kont {}
+        record TransformerExpandK(Env env, Kont k) implements Kont {}
+        record SyntaxCaseK(List<String> literals, List<Val> patterns, List<Val> bodies, Env env, Kont k, Val form) implements Kont {}
+        record DefineSyntaxK(String name, Env env, Kont k) implements Kont {}
+        record WithSyntaxK(Val pattern, Val remainingBindings, List<Val> body, Env env, Kont k, Val form) implements Kont {}
     }
 
     // CEK step: either evaluate an expression or apply a continuation
@@ -545,8 +578,17 @@ public class Evaluator {
                 yield new Step.Eval(cp.car(), env, new Kont.CaseK(cp.cdr(), env, k, pair));
             }
             case "define-syntax" -> {
-                Val result = evalDefineSyntax(pair, env);
-                yield new Step.Apply(result, k);
+                Val dsArgs = pair.cdr();
+                if (!(dsArgs instanceof Val.PairV dp)) throw posError(pair, "define-syntax: invalid syntax");
+                if (!(dp.car() instanceof Val.Sym dsMacroName)) throw posError(pair, "define-syntax: expected name");
+                if (!(dp.cdr() instanceof Val.PairV dp2)) throw posError(pair, "define-syntax: expected transformer");
+                Val transformerExpr = dp2.car();
+                if (transformerExpr instanceof Val.PairV srPair && srPair.car() instanceof Val.Sym srSym && srSym.name().equals("syntax-rules")) {
+                    Val result = evalDefineSyntax(pair, env);
+                    yield new Step.Apply(result, k);
+                } else {
+                    yield new Step.Eval(transformerExpr, env, new Kont.DefineSyntaxK(dsMacroName.name(), env, k));
+                }
             }
             case "define-record-type" -> {
                 Val result = evalDefineRecordType(pair.cdr(), env, pair);
@@ -568,6 +610,57 @@ public class Evaluator {
                 handlerStack.add(new HandlerEntry.GuardHandler(varName, clauses, env, k, new ArrayList<>(windStack)));
                 // Evaluate body; GuardBodyK pops handler on normal return
                 yield evalBodyStep(body, env, new Kont.GuardBodyK(k));
+            }
+            case "syntax-case" -> {
+                Val scArgs = pair.cdr();
+                if (!(scArgs instanceof Val.PairV p1)) throw posError(pair, "syntax-case: invalid syntax");
+                Val scExpr = p1.car();
+                Val scRest = p1.cdr();
+                if (!(scRest instanceof Val.PairV p2)) throw posError(pair, "syntax-case: expected literals list");
+                List<String> scLiterals = new ArrayList<>();
+                Val scLitList = p2.car();
+                while (scLitList instanceof Val.PairV lp) {
+                    if (lp.car() instanceof Val.Sym ls) scLiterals.add(ls.name());
+                    scLitList = lp.cdr();
+                }
+                List<Val> scPatterns = new ArrayList<>();
+                List<Val> scBodies = new ArrayList<>();
+                Val scClauses = p2.cdr();
+                while (scClauses instanceof Val.PairV cp) {
+                    if (!(cp.car() instanceof Val.PairV clause)) throw posError(pair, "syntax-case: invalid clause");
+                    scPatterns.add(clause.car());
+                    if (!(clause.cdr() instanceof Val.PairV bodyPair)) throw posError(pair, "syntax-case: missing body");
+                    scBodies.add(bodyPair.car());
+                    scClauses = cp.cdr();
+                }
+                yield new Step.Eval(scExpr, env, new Kont.SyntaxCaseK(scLiterals, scPatterns, scBodies, env, k, pair));
+            }
+            case "syntax" -> {
+                if (!(pair.cdr() instanceof Val.PairV sp)) throw posError(pair, "syntax: expected template");
+                Val template = sp.car();
+                Val matchInfo = null;
+                try { matchInfo = env.lookup("%syntax-match%"); } catch (EvalError e) { /* no match context */ }
+                if (matchInfo instanceof Val.SyntaxMatch sm) {
+                    Val expanded = expandTemplate(template, sm.match, new HashMap<>());
+                    yield new Step.Apply(expanded, k);
+                } else {
+                    yield new Step.Apply(template, k);
+                }
+            }
+            case "with-syntax" -> {
+                Val wsArgs = pair.cdr();
+                if (!(wsArgs instanceof Val.PairV wsp)) throw posError(pair, "with-syntax: invalid syntax");
+                Val wsBindings = wsp.car();
+                List<Val> wsBody = collectList(wsp.cdr());
+                if (!(wsBindings instanceof Val.PairV firstBp)) {
+                    yield evalBodyStep(wsBody, env, k);
+                } else {
+                    if (!(firstBp.car() instanceof Val.PairV bind)) throw posError(pair, "with-syntax: invalid binding");
+                    Val wsPattern = bind.car();
+                    if (!(bind.cdr() instanceof Val.PairV ep)) throw posError(pair, "with-syntax: missing expression");
+                    Val wsExpr = ep.car();
+                    yield new Step.Eval(wsExpr, env, new Kont.WithSyntaxK(wsPattern, firstBp.cdr(), wsBody, env, k, pair));
+                }
             }
             default -> throw posError(pair, "unknown special form: " + fn);
         };
@@ -605,6 +698,9 @@ public class Evaluator {
                 if (fn instanceof Val.Macro macro) {
                     Val expanded = expandMacro(macro, (Val.PairV) form, env);
                     yield new Step.Eval(expanded, env, k);
+                }
+                if (fn instanceof Val.TransformerMacro tm) {
+                    yield applyFunctionStep(tm.lambda, List.of(form), new Kont.TransformerExpandK(env, k), form);
                 }
                 if (fn instanceof Val.CallccVal) {
                     if (!(argsList instanceof Val.PairV ap)) throw posError(form, "call/cc requires 1 argument");
@@ -852,6 +948,58 @@ public class Evaluator {
                     vals = List.of(value);
                 }
                 yield applyFunctionStep(consumer, new ArrayList<>(vals), k, form);
+            }
+
+            case Kont.TransformerExpandK(var env, var k) -> {
+                yield new Step.Eval(value, env, k);
+            }
+
+            case Kont.DefineSyntaxK(var name, var env, var k) -> {
+                if (value instanceof Val.Lambda lambda) {
+                    env.define(name, new Val.TransformerMacro(name, lambda, env));
+                } else {
+                    throw new EvalError("define-syntax: transformer must be a procedure");
+                }
+                yield new Step.Apply(new Val.Void(), k);
+            }
+
+            case Kont.SyntaxCaseK(var literals, var patterns, var bodies, var env, var k, var form) -> {
+                for (int i = 0; i < patterns.size(); i++) {
+                    MatchResult match = new MatchResult();
+                    if (doMatch(patterns.get(i), value, literals, match)) {
+                        Env matchEnv = new Env(env);
+                        matchEnv.define("%syntax-match%", new Val.SyntaxMatch(match, env));
+                        yield new Step.Eval(bodies.get(i), matchEnv, k);
+                    }
+                }
+                throw posError(form, "syntax-case: no matching pattern");
+            }
+
+            case Kont.WithSyntaxK(var pattern, var remaining, var body, var env, var k, var form) -> {
+                MatchResult newMatch = new MatchResult();
+                if (!doMatch(pattern, value, List.of(), newMatch))
+                    throw posError(form, "with-syntax: pattern match failed");
+                Env newEnv = new Env(env);
+                MatchResult combined = new MatchResult();
+                Val existingMatch = null;
+                try { existingMatch = env.lookup("%syntax-match%"); } catch (EvalError e) { /* none */ }
+                if (existingMatch instanceof Val.SyntaxMatch sm) {
+                    combined.singles.putAll(sm.match.singles);
+                    combined.ellipsis.putAll(sm.match.ellipsis);
+                }
+                combined.singles.putAll(newMatch.singles);
+                combined.ellipsis.putAll(newMatch.ellipsis);
+                Env defEnv = (existingMatch instanceof Val.SyntaxMatch sm) ? sm.defEnv : env;
+                newEnv.define("%syntax-match%", new Val.SyntaxMatch(combined, defEnv));
+                if (remaining instanceof Val.PairV nextBp) {
+                    if (!(nextBp.car() instanceof Val.PairV bind)) throw posError(form, "with-syntax: invalid binding");
+                    Val nextPattern = bind.car();
+                    if (!(bind.cdr() instanceof Val.PairV ep)) throw posError(form, "with-syntax: missing expression");
+                    Val nextExpr = ep.car();
+                    yield new Step.Eval(nextExpr, newEnv, new Kont.WithSyntaxK(nextPattern, nextBp.cdr(), body, newEnv, k, form));
+                } else {
+                    yield evalBodyStep(body, newEnv, k);
+                }
             }
         };
     }
@@ -1836,6 +1984,9 @@ public class Evaluator {
         env.define("vector?", new Val.Builtin("vector?", args -> { checkArgCount(args, 1, "vector?"); return new Val.Bool(args.get(0) instanceof Val.Vec); }));
         env.define("vector->list", new Val.Builtin("vector->list", args -> { checkArgCount(args, 1, "vector->list"); if (!(args.get(0) instanceof Val.Vec v)) throw new RuntimeException("vector->list: not a vector"); Val r = new Val.Nil(); for (int i = v.elements.length - 1; i >= 0; i--) r = new Val.PairV(v.elements[i], r); return r; }));
         env.define("list->vector", new Val.Builtin("list->vector", args -> { checkArgCount(args, 1, "list->vector"); List<Val> elems = new ArrayList<>(); Val cur = args.get(0); while (cur instanceof Val.PairV p) { elems.add(p.car()); cur = p.cdr(); } return new Val.Vec(elems.toArray(new Val[0])); }));
+        // Syntax
+        env.define("syntax->datum", new Val.Builtin("syntax->datum", args -> { checkArgCount(args, 1, "syntax->datum"); return args.get(0); }));
+        env.define("datum->syntax", new Val.Builtin("datum->syntax", args -> { checkArgCount(args, 2, "datum->syntax"); return args.get(1); }));
         // Error
         env.define("error", new Val.Builtin("error", args -> { if (args.isEmpty()) throw new RuntimeException("error"); StringBuilder sb = new StringBuilder(); if (args.size() > 1) { for (int i = 1; i < args.size(); i++) sb.append(displayVal(args.get(i))); } else sb.append(displayVal(args.get(0))); throw new RuntimeException(sb.toString()); }));
         // Apply
