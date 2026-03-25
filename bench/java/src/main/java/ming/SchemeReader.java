@@ -3,12 +3,6 @@ package ming;
 import java.util.ArrayList;
 import java.util.List;
 
-import ming.Evaluator.Pos;
-import ming.Evaluator.SExpr;
-import ming.Evaluator.SchemeChar;
-import ming.Evaluator.SchemeRational;
-import ming.Evaluator.SchemeString;
-import ming.Evaluator.Token;
 
 /**
  * Tokenizer and parser for Scheme source text.

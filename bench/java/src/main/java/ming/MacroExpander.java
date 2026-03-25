@@ -9,12 +9,6 @@ import java.util.Set;
 
 import ming.Evaluator.Builtin;
 import ming.Evaluator.Env;
-import ming.Evaluator.Pos;
-import ming.Evaluator.RecordType;
-import ming.Evaluator.SExpr;
-import ming.Evaluator.SchemeRecord;
-import ming.Evaluator.SyntaxRules;
-import ming.Evaluator.Token;
 
 /**
  * Handles syntax-rules macro expansion, define-syntax, and define-record-type.

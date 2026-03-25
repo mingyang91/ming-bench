@@ -18,105 +18,9 @@ public class Evaluator {
         }
     }
 
-    static class SchemeString {
-        private final char[] chars;
-        private final boolean immutable;
-        SchemeString(String value) { this.chars = value.toCharArray(); this.immutable = false; }
-        SchemeString(String value, boolean immutable) { this.chars = value.toCharArray(); this.immutable = immutable; }
-        SchemeString(char[] chars) { this.chars = chars; this.immutable = false; }
-        String value() { return new String(chars); }
-        int length() { return chars.length; }
-        char charAt(int i) { return chars[i]; }
-        boolean isImmutable() { return immutable; }
-        void setChar(int i, char c) throws EvalError {
-            if (immutable) throw new EvalError("string-set!: strings are immutable");
-            chars[i] = c;
-        }
-    }
-
-    record SchemeChar(char value) {}
-
-    static class SchemeRational {
-        final long num;
-        final long den;
-        SchemeRational(long num, long den) {
-            if (den == 0) throw new ArithmeticException("division by zero");
-            if (den < 0) { num = -num; den = -den; }
-            long g = gcd(Math.abs(num), den);
-            this.num = num / g;
-            this.den = den / g;
-        }
-        boolean isInteger() { return den == 1; }
-        long toLong() { return num / den; }
-        double toDouble() { return (double) num / den; }
-        private static long gcd(long a, long b) { while (b != 0) { long t = b; b = a % b; a = t; } return a; }
-        @Override public boolean equals(Object o) {
-            if (this == o) return true;
-            if (!(o instanceof SchemeRational r)) return false;
-            return num == r.num && den == r.den;
-        }
-        @Override public int hashCode() { return Long.hashCode(num) * 31 + Long.hashCode(den); }
-    }
-
     record Lambda(List<String> params, String restParam, List<Object> body, Env env) {}
 
     record CaseLambda(List<Lambda> clauses) {}
-
-    record Pos(int line, int col) {
-        @Override public String toString() { return line + ":" + col; }
-    }
-
-    static class SExpr extends ArrayList<Object> {
-        final Pos pos;
-        SExpr(Pos pos) { super(); this.pos = pos; }
-    }
-
-    record Token(Object value, Pos pos) {}
-
-    static class Cons {
-        Object car;
-        Object cdr;
-        Cons(Object car, Object cdr) { this.car = car; this.cdr = cdr; }
-    }
-
-    static class SyntaxRules {
-        final List<String> literals;
-        final List<List<Object>> patterns;
-        final List<Object> templates;
-        final Env defEnv;
-        SyntaxRules(List<String> literals, List<List<Object>> patterns, List<Object> templates, Env defEnv) {
-            this.literals = literals;
-            this.patterns = patterns;
-            this.templates = templates;
-            this.defEnv = defEnv;
-        }
-    }
-
-    static class RecordType {
-        final String name;
-        final List<String> fieldNames;
-        RecordType(String name, List<String> fieldNames) {
-            this.name = name;
-            this.fieldNames = fieldNames;
-        }
-    }
-
-    static class SchemeRecord {
-        final RecordType type;
-        final Object[] fields;
-        SchemeRecord(RecordType type, Object[] fields) {
-            this.type = type;
-            this.fields = fields;
-        }
-    }
-
-    static class SchemeVector {
-        final Object[] data;
-        SchemeVector(Object[] data) { this.data = data; }
-        int length() { return data.length; }
-        Object ref(int i) { return data[i]; }
-        void set(int i, Object v) { data[i] = v; }
-    }
 
     static final Object NIL = new Object() {
         @Override public String toString() { return "()"; }
@@ -292,10 +196,48 @@ public class Evaluator {
         }
     }
 
+    // Wind entry for dynamic-wind
+    record WindEntry(Object inThunk, Object outThunk) {}
+
     // First-class continuation value
     static final class SchemeContinuation {
         final Kont k;
-        SchemeContinuation(Kont k) { this.k = k; }
+        final List<WindEntry> windStack;
+        SchemeContinuation(Kont k, List<WindEntry> windStack) { this.k = k; this.windStack = windStack; }
+    }
+
+    // dynamic-wind: after in-thunk, evaluate body
+    static final class DynWindBodyK extends Kont {
+        final Object bodyThunk; final Object outThunk; final WindEntry entry;
+        final Pos pos; final Kont k;
+        DynWindBodyK(Object bt, Object ot, WindEntry e, Pos p, Kont k) {
+            bodyThunk=bt; outThunk=ot; entry=e; pos=p; this.k=k;
+        }
+    }
+
+    // dynamic-wind: after body, run out-thunk
+    static final class DynWindOutK extends Kont {
+        final Object outThunk; final WindEntry entry;
+        final Object bodyVal; final Pos pos; final Kont k;
+        DynWindOutK(Object ot, WindEntry e, Object bv, Pos p, Kont k) {
+            outThunk=ot; entry=e; bodyVal=bv; pos=p; this.k=k;
+        }
+    }
+
+    // dynamic-wind: after out-thunk, return body value
+    static final class DynWindFinishK extends Kont {
+        final Object bodyVal; final WindEntry entry; final Kont k;
+        DynWindFinishK(Object bv, WindEntry e, Kont k) { bodyVal=bv; entry=e; this.k=k; }
+    }
+
+    // Wind transfer: run a sequence of thunks then continue
+    static final class WindTransferK extends Kont {
+        final List<Object> thunks; final int idx;
+        final List<WindEntry> targetStack;
+        final Object val; final Kont targetK;
+        WindTransferK(List<Object> t, int i, List<WindEntry> ts, Object v, Kont tk) {
+            thunks=t; idx=i; targetStack=ts; val=v; targetK=tk;
+        }
     }
 
     // ===== Constants =====
@@ -322,6 +264,9 @@ public class Evaluator {
     private Kont mK;
     private Object mVal;
     private boolean mApply;
+
+    // dynamic-wind stack
+    private List<WindEntry> windStack = new ArrayList<>();
 
     public Evaluator() {
         new Builtins(globalEnv, this).registerAll();
@@ -664,80 +609,8 @@ public class Evaluator {
             mVal = VOID; mK = ck.k; return;
         }
 
-        if (mK instanceof DoInitK dk) {
-            dk.doEnv.define(dk.varNames[dk.idx], mVal);
-            int next = dk.idx + 1;
-            if (next < dk.varNames.length) {
-                mK = new DoInitK(next, dk.varNames, dk.initExprs, dk.stepExprs, dk.hasStep, dk.doEnv, dk.testClause, dk.form, dk.outerEnv, dk.k);
-                mExpr = dk.initExprs[next]; mEnv = dk.outerEnv; mApply = false;
-            } else {
-                // All inits done, start loop
-                mK = new DoTestK(dk.varNames, dk.stepExprs, dk.hasStep, dk.testClause, dk.form, dk.doEnv, dk.k);
-                mExpr = dk.testClause.get(0); mEnv = dk.doEnv; mApply = false;
-            }
-            return;
-        }
-
-        if (mK instanceof DoTestK dt) {
-            if (!isFalse(mVal)) {
-                // Test passed, evaluate result body
-                mK = dt.k;
-                startBody(dt.testClause, 1, dt.doEnv, dt.k);
-            } else {
-                // Test failed, evaluate commands then step
-                int numCommands = dt.form.size() - 3;
-                DoStepStartK dss = new DoStepStartK(dt.varNames, dt.stepExprs, dt.hasStep, dt.testClause, dt.form, dt.doEnv, dt.k);
-                if (numCommands > 0) {
-                    mK = dss;
-                    if (numCommands == 1) {
-                        mExpr = dt.form.get(3); mEnv = dt.doEnv; mApply = false;
-                    } else {
-                        mK = new SeqK(dt.form, 4, dt.doEnv, dss);
-                        mExpr = dt.form.get(3); mEnv = dt.doEnv; mApply = false;
-                    }
-                } else {
-                    mK = dss;
-                    mVal = VOID; // trigger DoStepStartK immediately
-                }
-            }
-            return;
-        }
-
-        if (mK instanceof DoStepStartK ds) {
-            // Start evaluating step expressions
-            int firstStep = -1;
-            for (int i = 0; i < ds.varNames.length; i++) {
-                if (ds.hasStep[i]) { firstStep = i; break; }
-            }
-            if (firstStep == -1) {
-                // No step expressions, loop back to test
-                mK = new DoTestK(ds.varNames, ds.stepExprs, ds.hasStep, ds.testClause, ds.form, ds.doEnv, ds.k);
-                mExpr = ds.testClause.get(0); mEnv = ds.doEnv; mApply = false;
-            } else {
-                Object[] newVals = new Object[ds.varNames.length];
-                mK = new DoStepK(firstStep, newVals, ds.varNames, ds.stepExprs, ds.hasStep, ds.testClause, ds.form, ds.doEnv, ds.k);
-                mExpr = ds.stepExprs[firstStep]; mEnv = ds.doEnv; mApply = false;
-            }
-            return;
-        }
-
-        if (mK instanceof DoStepK dsk) {
-            dsk.newVals[dsk.idx] = mVal;
-            int nextStep = -1;
-            for (int i = dsk.idx + 1; i < dsk.varNames.length; i++) {
-                if (dsk.hasStep[i]) { nextStep = i; break; }
-            }
-            if (nextStep == -1) {
-                // All steps evaluated, update vars and loop
-                for (int i = 0; i < dsk.varNames.length; i++) {
-                    if (dsk.hasStep[i]) dsk.doEnv.define(dsk.varNames[i], dsk.newVals[i]);
-                }
-                mK = new DoTestK(dsk.varNames, dsk.stepExprs, dsk.hasStep, dsk.testClause, dsk.form, dsk.doEnv, dsk.k);
-                mExpr = dsk.testClause.get(0); mEnv = dsk.doEnv; mApply = false;
-            } else {
-                mK = new DoStepK(nextStep, dsk.newVals, dsk.varNames, dsk.stepExprs, dsk.hasStep, dsk.testClause, dsk.form, dsk.doEnv, dsk.k);
-                mExpr = dsk.stepExprs[nextStep]; mEnv = dsk.doEnv; mApply = false;
-            }
+        if (mK instanceof DoInitK || mK instanceof DoTestK || mK instanceof DoStepStartK || mK instanceof DoStepK) {
+            applyDoLoopStep();
             return;
         }
 
@@ -787,7 +660,119 @@ public class Evaluator {
             return;
         }
 
+        if (mK instanceof DynWindBodyK dwb) {
+            // in-thunk done, push wind entry and run body
+            windStack.add(dwb.entry);
+            mK = new DynWindOutK(dwb.outThunk, dwb.entry, null, dwb.pos, dwb.k);
+            cekApplyFun(dwb.bodyThunk, List.of(), dwb.pos);
+            return;
+        }
+
+        if (mK instanceof DynWindOutK dwo) {
+            // body done (or out-thunk collecting body val), run out-thunk
+            Object bodyVal = dwo.bodyVal != null ? dwo.bodyVal : mVal;
+            // Remove wind entry before running out-thunk
+            if (!windStack.isEmpty() && windStack.get(windStack.size() - 1) == dwo.entry) {
+                windStack.remove(windStack.size() - 1);
+            }
+            mK = new DynWindFinishK(bodyVal, dwo.entry, dwo.k);
+            cekApplyFun(dwo.outThunk, List.of(), dwo.pos);
+            return;
+        }
+
+        if (mK instanceof DynWindFinishK dwf) {
+            // out-thunk done, return body value
+            mVal = dwf.bodyVal;
+            mK = dwf.k;
+            return;
+        }
+
+        if (mK instanceof WindTransferK wt) {
+            int nextIdx = wt.idx + 1;
+            // Update wind stack as we go: if the thunk we just ran was an out-thunk, pop; if in-thunk, push
+            // We ran thunk at wt.idx. Figure out if it was unwind or rewind.
+            // Out-thunks are first (current.size()-commonLen of them), then in-thunks
+            if (nextIdx < wt.thunks.size()) {
+                mK = new WindTransferK(wt.thunks, nextIdx, wt.targetStack, wt.val, wt.targetK);
+                cekApplyFun(wt.thunks.get(nextIdx), List.of(), null);
+            } else {
+                windStack = new ArrayList<>(wt.targetStack);
+                mVal = wt.val;
+                mK = wt.targetK;
+            }
+            return;
+        }
+
         throw new EvalError("unknown continuation type: " + mK.getClass().getSimpleName());
+    }
+
+    private void applyDoLoopStep() throws EvalError {
+        if (mK instanceof DoInitK dk) {
+            dk.doEnv.define(dk.varNames[dk.idx], mVal);
+            int next = dk.idx + 1;
+            if (next < dk.varNames.length) {
+                mK = new DoInitK(next, dk.varNames, dk.initExprs, dk.stepExprs, dk.hasStep, dk.doEnv, dk.testClause, dk.form, dk.outerEnv, dk.k);
+                mExpr = dk.initExprs[next]; mEnv = dk.outerEnv; mApply = false;
+            } else {
+                mK = new DoTestK(dk.varNames, dk.stepExprs, dk.hasStep, dk.testClause, dk.form, dk.doEnv, dk.k);
+                mExpr = dk.testClause.get(0); mEnv = dk.doEnv; mApply = false;
+            }
+            return;
+        }
+        if (mK instanceof DoTestK dt) {
+            if (!isFalse(mVal)) {
+                mK = dt.k;
+                startBody(dt.testClause, 1, dt.doEnv, dt.k);
+            } else {
+                int numCommands = dt.form.size() - 3;
+                DoStepStartK dss = new DoStepStartK(dt.varNames, dt.stepExprs, dt.hasStep, dt.testClause, dt.form, dt.doEnv, dt.k);
+                if (numCommands > 0) {
+                    mK = dss;
+                    if (numCommands == 1) {
+                        mExpr = dt.form.get(3); mEnv = dt.doEnv; mApply = false;
+                    } else {
+                        mK = new SeqK(dt.form, 4, dt.doEnv, dss);
+                        mExpr = dt.form.get(3); mEnv = dt.doEnv; mApply = false;
+                    }
+                } else {
+                    mK = dss;
+                    mVal = VOID;
+                }
+            }
+            return;
+        }
+        if (mK instanceof DoStepStartK ds) {
+            int firstStep = -1;
+            for (int i = 0; i < ds.varNames.length; i++) {
+                if (ds.hasStep[i]) { firstStep = i; break; }
+            }
+            if (firstStep == -1) {
+                mK = new DoTestK(ds.varNames, ds.stepExprs, ds.hasStep, ds.testClause, ds.form, ds.doEnv, ds.k);
+                mExpr = ds.testClause.get(0); mEnv = ds.doEnv; mApply = false;
+            } else {
+                Object[] newVals = new Object[ds.varNames.length];
+                mK = new DoStepK(firstStep, newVals, ds.varNames, ds.stepExprs, ds.hasStep, ds.testClause, ds.form, ds.doEnv, ds.k);
+                mExpr = ds.stepExprs[firstStep]; mEnv = ds.doEnv; mApply = false;
+            }
+            return;
+        }
+        if (mK instanceof DoStepK dsk) {
+            dsk.newVals[dsk.idx] = mVal;
+            int nextStep = -1;
+            for (int i = dsk.idx + 1; i < dsk.varNames.length; i++) {
+                if (dsk.hasStep[i]) { nextStep = i; break; }
+            }
+            if (nextStep == -1) {
+                for (int i = 0; i < dsk.varNames.length; i++) {
+                    if (dsk.hasStep[i]) dsk.doEnv.define(dsk.varNames[i], dsk.newVals[i]);
+                }
+                mK = new DoTestK(dsk.varNames, dsk.stepExprs, dsk.hasStep, dsk.testClause, dsk.form, dsk.doEnv, dsk.k);
+                mExpr = dsk.testClause.get(0); mEnv = dsk.doEnv; mApply = false;
+            } else {
+                mK = new DoStepK(nextStep, dsk.newVals, dsk.varNames, dsk.stepExprs, dsk.hasStep, dsk.testClause, dsk.form, dsk.doEnv, dsk.k);
+                mExpr = dsk.stepExprs[nextStep]; mEnv = dsk.doEnv; mApply = false;
+            }
+        }
     }
 
     private void cekApplyFun(Object fun, List<Object> args, Pos pos) throws EvalError {
@@ -816,9 +801,34 @@ public class Evaluator {
 
         if (fun instanceof SchemeContinuation cont) {
             if (args.size() != 1) throw new EvalError("continuation requires exactly 1 argument" + posStr(pos));
-            mVal = args.get(0);
-            mK = cont.k;
-            mApply = true;
+            Object val = args.get(0);
+            // Compute wind transfer thunks
+            List<WindEntry> current = windStack;
+            List<WindEntry> target = cont.windStack;
+            int commonLen = 0;
+            int minLen = Math.min(current.size(), target.size());
+            for (int i = 0; i < minLen; i++) {
+                if (current.get(i) == target.get(i)) commonLen++;
+                else break;
+            }
+            List<Object> thunks = new ArrayList<>();
+            // Unwind: run out-thunks from current (innermost first)
+            for (int i = current.size() - 1; i >= commonLen; i--) {
+                thunks.add(current.get(i).outThunk());
+            }
+            // Rewind: run in-thunks for target (outermost first)
+            for (int i = commonLen; i < target.size(); i++) {
+                thunks.add(target.get(i).inThunk());
+            }
+            if (thunks.isEmpty()) {
+                mVal = val;
+                mK = cont.k;
+                windStack = new ArrayList<>(target);
+                mApply = true;
+            } else {
+                mK = new WindTransferK(thunks, 0, target, val, cont.k);
+                cekApplyFun(thunks.get(0), List.of(), pos);
+            }
             return;
         }
 
@@ -828,8 +838,19 @@ public class Evaluator {
             // call/cc
             if ("call/cc".equals(name) || "call-with-current-continuation".equals(name)) {
                 if (args.size() != 1) throw new EvalError("call/cc requires 1 argument" + posStr(pos));
-                SchemeContinuation captured = new SchemeContinuation(mK);
+                SchemeContinuation captured = new SchemeContinuation(mK, new ArrayList<>(windStack));
                 cekApplyFun(args.get(0), List.of(captured), pos);
+                return;
+            }
+
+            // dynamic-wind
+            if ("dynamic-wind".equals(name)) {
+                if (args.size() != 3) throw new EvalError("dynamic-wind requires 3 arguments" + posStr(pos));
+                Object inThunk = args.get(0), bodyThunk = args.get(1), outThunk = args.get(2);
+                WindEntry entry = new WindEntry(inThunk, outThunk);
+                // Run in-thunk first, then body, then out-thunk
+                mK = new DynWindBodyK(bodyThunk, outThunk, entry, pos, mK);
+                cekApplyFun(inThunk, List.of(), pos);
                 return;
             }
 

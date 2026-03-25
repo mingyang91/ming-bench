@@ -4,12 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import ming.Evaluator.Builtin;
-import ming.Evaluator.Cons;
 import ming.Evaluator.Env;
-import ming.Evaluator.SchemeChar;
-import ming.Evaluator.SchemeRational;
-import ming.Evaluator.SchemeString;
-import ming.Evaluator.SchemeVector;
 
 import static ming.Evaluator.NIL;
 import static ming.Evaluator.VOID;
@@ -790,6 +785,7 @@ final class Builtins {
         // call/cc and call-with-current-continuation are handled by the CEK machine
         define("call/cc", args -> { throw new EvalError("call/cc: should be handled by CEK machine"); });
         define("call-with-current-continuation", args -> { throw new EvalError("call-with-current-continuation: should be handled by CEK machine"); });
+        define("dynamic-wind", args -> { throw new EvalError("dynamic-wind: should be handled by CEK machine"); });
     }
 
     // --- Numeric utilities (L09) ---
