@@ -32,6 +32,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "exact->inexact",
     "exact?",
     "expt",
+    "for-each",
     "integer->char",
     "inexact->exact",
     "inexact?",
@@ -42,8 +43,30 @@ const BUILTIN_NAMES: &[&str] = &[
     "append",
     "apply",
     "assoc",
+    "assq",
+    "assv",
     "boolean?",
     "car",
+    "caaaar",
+    "caaadr",
+    "caaar",
+    "caadar",
+    "caaddr",
+    "caadr",
+    "caar",
+    "cadaar",
+    "cadadr",
+    "cadar",
+    "caddar",
+    "cadddr",
+    "caddr",
+    "cadr",
+    "cdaaar",
+    "cdaadr",
+    "cdaar",
+    "cdadar",
+    "cdaddr",
+    "cdadr",
     "char-alphabetic?",
     "char->integer",
     "char-downcase",
@@ -52,8 +75,18 @@ const BUILTIN_NAMES: &[&str] = &[
     "char=?",
     "char<?",
     "cdr",
+    "cddaar",
+    "cddadr",
+    "cdar",
+    "cddar",
+    "cdddar",
+    "cddddr",
+    "cdddr",
+    "cddr",
     "cons",
+    "gcd",
     "length",
+    "lcm",
     "list",
     "list?",
     "list-ref",
@@ -62,8 +95,12 @@ const BUILTIN_NAMES: &[&str] = &[
     "list->vector",
     "map",
     "max",
+    "make-string",
     "make-vector",
+    "member",
     "min",
+    "memq",
+    "memv",
     "modulo",
     "negative?",
     "null?",
@@ -76,12 +113,18 @@ const BUILTIN_NAMES: &[&str] = &[
     "quotient",
     "rational?",
     "remainder",
+    "reverse",
+    "round",
+    "string",
     "string-append",
     "string?",
     "string-ci=?",
     "string-copy",
     "string-downcase",
+    "string<=?",
     "string=?",
+    "string>=?",
+    "string>?",
     "string<?",
     "string-length",
     "string->list",
@@ -93,6 +136,9 @@ const BUILTIN_NAMES: &[&str] = &[
     "substring",
     "symbol?",
     "symbol->string",
+    "set-car!",
+    "set-cdr!",
+    "truncate",
     "vector",
     "vector->list",
     "vector-length",
@@ -200,6 +246,7 @@ impl Expr {
 type EnvRef = Rc<RefCell<Environment>>;
 type BindingRef = Rc<RefCell<Value>>;
 type MacroRef = Rc<SyntaxRulesMacro>;
+type PairRef = Rc<Pair>;
 
 #[derive(Clone)]
 struct MacroRule {
@@ -549,10 +596,34 @@ impl SchemeString {
     }
 }
 
-#[derive(Clone)]
 struct Pair {
-    car: Value,
-    cdr: Value,
+    car: RefCell<Value>,
+    cdr: RefCell<Value>,
+}
+
+impl Pair {
+    fn new(car: Value, cdr: Value) -> Self {
+        Self {
+            car: RefCell::new(car),
+            cdr: RefCell::new(cdr),
+        }
+    }
+
+    fn car(&self) -> Value {
+        self.car.borrow().clone()
+    }
+
+    fn cdr(&self) -> Value {
+        self.cdr.borrow().clone()
+    }
+
+    fn set_car(&self, value: Value) {
+        *self.car.borrow_mut() = value;
+    }
+
+    fn set_cdr(&self, value: Value) {
+        *self.cdr.borrow_mut() = value;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -728,8 +799,8 @@ enum Value {
     Char(char),
     String(SchemeString),
     Symbol(String),
-    List(Vec<Value>),
-    Pair(Rc<Pair>),
+    EmptyList,
+    Pair(PairRef),
     Vector(Rc<RefCell<Vec<Value>>>),
     Record(Rc<RecordInstance>),
     Builtin(&'static str),
@@ -747,7 +818,7 @@ impl Value {
             Value::Char(_) => "char",
             Value::String(_) => "string",
             Value::Symbol(_) => "symbol",
-            Value::List(_) => "list",
+            Value::EmptyList => "list",
             Value::Pair(_) => "pair",
             Value::Vector(_) => "vector",
             Value::Record(_) => "record",
@@ -798,41 +869,9 @@ impl Value {
     }
 
     fn to_scheme_string(&self) -> String {
-        match self {
-            Value::Integer(_) | Value::Rational(_) | Value::Inexact(_) => self
-                .number()
-                .expect("number variants must convert to Number")
-                .to_scheme_string(),
-            Value::Bool(true) => "#t".into(),
-            Value::Bool(false) => "#f".into(),
-            Value::Char(value) => format_char(*value),
-            Value::String(value) => format!("\"{}\"", escape_string(&value.to_plain_string())),
-            Value::Symbol(value) => value.clone(),
-            Value::List(values) => {
-                let items = values
-                    .iter()
-                    .map(Value::to_scheme_string)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                format!("({items})")
-            }
-            Value::Pair(pair) => format_pair(pair),
-            Value::Vector(values) => {
-                let items = values
-                    .borrow()
-                    .iter()
-                    .map(Value::to_scheme_string)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                format!("#({items})")
-            }
-            Value::Record(record) => format!("#<record {}>", record.record_type.name),
-            Value::Builtin(_) | Value::Procedure(_) | Value::NativeProcedure(_) => {
-                "#<procedure>".into()
-            }
-            Value::Uninitialized => "#<uninitialized>".into(),
-            Value::Void => "#<void>".into(),
-        }
+        let mut active_pairs = HashSet::new();
+        let mut active_vectors = HashSet::new();
+        format_value_inner(self, &mut active_pairs, &mut active_vectors)
     }
 
     fn to_display_string(&self) -> String {
@@ -939,33 +978,108 @@ fn format_char(ch: char) -> String {
     }
 }
 
-fn format_pair(pair: &Pair) -> String {
+fn format_value_inner(
+    value: &Value,
+    active_pairs: &mut HashSet<usize>,
+    active_vectors: &mut HashSet<usize>,
+) -> String {
+    match value {
+        Value::Integer(_) | Value::Rational(_) | Value::Inexact(_) => value
+            .number()
+            .expect("number variants must convert to Number")
+            .to_scheme_string(),
+        Value::Bool(true) => "#t".into(),
+        Value::Bool(false) => "#f".into(),
+        Value::Char(ch) => format_char(*ch),
+        Value::String(text) => format!("\"{}\"", escape_string(&text.to_plain_string())),
+        Value::Symbol(name) => name.clone(),
+        Value::EmptyList => "()".into(),
+        Value::Pair(pair) => format_pair(pair, active_pairs, active_vectors),
+        Value::Vector(values) => format_vector(values, active_pairs, active_vectors),
+        Value::Record(record) => format!("#<record {}>", record.record_type.name),
+        Value::Builtin(_) | Value::Procedure(_) | Value::NativeProcedure(_) => {
+            "#<procedure>".into()
+        }
+        Value::Uninitialized => "#<uninitialized>".into(),
+        Value::Void => "#<void>".into(),
+    }
+}
+
+fn format_pair(
+    pair: &PairRef,
+    active_pairs: &mut HashSet<usize>,
+    active_vectors: &mut HashSet<usize>,
+) -> String {
+    let start_ptr = Rc::as_ptr(pair) as usize;
+    if !active_pairs.insert(start_ptr) {
+        return "#<circular>".into();
+    }
+
+    let mut inserted = vec![start_ptr];
     let mut rendered = String::from("(");
-    write_pair_contents(pair, &mut rendered);
+    let mut current = pair.clone();
+    let mut first = true;
+
+    loop {
+        if !first {
+            rendered.push(' ');
+        }
+
+        let car = current.car();
+        rendered.push_str(&format_value_inner(&car, active_pairs, active_vectors));
+
+        match current.cdr() {
+            Value::EmptyList => break,
+            Value::Pair(next) => {
+                let next_ptr = Rc::as_ptr(&next) as usize;
+                if !active_pairs.insert(next_ptr) {
+                    rendered.push_str(" . #<circular>");
+                    break;
+                }
+
+                inserted.push(next_ptr);
+                current = next;
+                first = false;
+            }
+            other => {
+                rendered.push_str(" . ");
+                rendered.push_str(&format_value_inner(&other, active_pairs, active_vectors));
+                break;
+            }
+        }
+    }
+
     rendered.push(')');
+
+    for ptr in inserted {
+        active_pairs.remove(&ptr);
+    }
+
     rendered
 }
 
-fn write_pair_contents(pair: &Pair, rendered: &mut String) {
-    rendered.push_str(&pair.car.to_scheme_string());
-
-    match &pair.cdr {
-        Value::List(values) if values.is_empty() => {}
-        Value::List(values) => {
-            for value in values {
-                rendered.push(' ');
-                rendered.push_str(&value.to_scheme_string());
-            }
-        }
-        Value::Pair(next) => {
-            rendered.push(' ');
-            write_pair_contents(next, rendered);
-        }
-        other => {
-            rendered.push_str(" . ");
-            rendered.push_str(&other.to_scheme_string());
-        }
+fn format_vector(
+    values: &Rc<RefCell<Vec<Value>>>,
+    active_pairs: &mut HashSet<usize>,
+    active_vectors: &mut HashSet<usize>,
+) -> String {
+    let ptr = Rc::as_ptr(values) as usize;
+    if !active_vectors.insert(ptr) {
+        return "#<circular>".into();
     }
+
+    let rendered = {
+        let items = values
+            .borrow()
+            .iter()
+            .map(|value| format_value_inner(value, active_pairs, active_vectors))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("#({items})")
+    };
+
+    active_vectors.remove(&ptr);
+    rendered
 }
 
 fn format_inexact(value: f64) -> String {
@@ -1161,6 +1275,7 @@ fn scheme_eq(left: &Value, right: &Value) -> bool {
         (Value::Char(left), Value::Char(right)) => left == right,
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::String(left), Value::String(right)) => Rc::ptr_eq(&left.chars, &right.chars),
+        (Value::EmptyList, Value::EmptyList) => true,
         (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
         (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
@@ -1173,6 +1288,17 @@ fn scheme_eq(left: &Value, right: &Value) -> bool {
 }
 
 fn scheme_equal(left: &Value, right: &Value) -> bool {
+    let mut visited_pairs = HashSet::new();
+    let mut visited_vectors = HashSet::new();
+    scheme_equal_inner(left, right, &mut visited_pairs, &mut visited_vectors)
+}
+
+fn scheme_equal_inner(
+    left: &Value,
+    right: &Value,
+    visited_pairs: &mut HashSet<(usize, usize)>,
+    visited_vectors: &mut HashSet<(usize, usize)>,
+) -> bool {
     if let (Some(left), Some(right)) = (left.number(), right.number()) {
         return left.equal(right);
     }
@@ -1184,24 +1310,33 @@ fn scheme_equal(left: &Value, right: &Value) -> bool {
             left.to_plain_string() == right.to_plain_string()
         }
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
-        (Value::List(left), Value::List(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right.iter())
-                    .all(|(left, right)| scheme_equal(left, right))
-        }
+        (Value::EmptyList, Value::EmptyList) => true,
         (Value::Pair(left), Value::Pair(right)) => {
-            scheme_equal(&left.car, &right.car) && scheme_equal(&left.cdr, &right.cdr)
+            let key = (Rc::as_ptr(left) as usize, Rc::as_ptr(right) as usize);
+            if !visited_pairs.insert(key) {
+                return true;
+            }
+
+            let left_car = left.car();
+            let right_car = right.car();
+            let left_cdr = left.cdr();
+            let right_cdr = right.cdr();
+
+            scheme_equal_inner(&left_car, &right_car, visited_pairs, visited_vectors)
+                && scheme_equal_inner(&left_cdr, &right_cdr, visited_pairs, visited_vectors)
         }
         (Value::Vector(left), Value::Vector(right)) => {
+            let key = (Rc::as_ptr(left) as usize, Rc::as_ptr(right) as usize);
+            if !visited_vectors.insert(key) {
+                return true;
+            }
+
             let left = left.borrow();
             let right = right.borrow();
             left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right.iter())
-                    .all(|(left, right)| scheme_equal(left, right))
+                && left.iter().zip(right.iter()).all(|(left, right)| {
+                    scheme_equal_inner(left, right, visited_pairs, visited_vectors)
+                })
         }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
@@ -1287,6 +1422,7 @@ fn eval_list(items: Vec<Expr>, env: EnvRef, position: SourcePos) -> Result<EvalS
             "case" => eval_case_step(tail, env, head.pos),
             "do" => eval_do_step(tail, env, head.pos),
             "let" => eval_let_step(tail, env, head.pos),
+            "let*" => eval_let_star_step(tail, env, head.pos),
             "letrec" => eval_letrec_step(tail, env, head.pos, false),
             "letrec*" => eval_letrec_step(tail, env, head.pos, true),
             _ => {
@@ -1759,7 +1895,7 @@ fn quote_expr(expr: &Expr) -> Value {
         ExprKind::Char(value) => Value::Char(*value),
         ExprKind::String(value) => Value::String(SchemeString::immutable(value)),
         ExprKind::Symbol(value) => Value::Symbol(value.clone()),
-        ExprKind::List(items) => Value::List(items.iter().map(quote_expr).collect()),
+        ExprKind::List(items) => list_from_values(items.iter().map(quote_expr)),
     }
 }
 
@@ -1805,11 +1941,7 @@ fn eval_begin(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     resolve_eval_step(eval_sequence_step(exprs, env)?)
 }
 
-fn eval_cond_step(
-    exprs: &[Expr],
-    env: EnvRef,
-    position: SourcePos,
-) -> Result<EvalStep, EvalError> {
+fn eval_cond_step(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<EvalStep, EvalError> {
     for (index, clause) in exprs.iter().enumerate() {
         let ExprKind::List(items) = &clause.kind else {
             return Err(EvalError::syntax("cond clauses must be lists", clause.pos));
@@ -1847,11 +1979,7 @@ fn eval_cond(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, 
     resolve_eval_step(eval_cond_step(exprs, env, position)?)
 }
 
-fn eval_case_step(
-    exprs: &[Expr],
-    env: EnvRef,
-    position: SourcePos,
-) -> Result<EvalStep, EvalError> {
+fn eval_case_step(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<EvalStep, EvalError> {
     let Some((key_expr, clauses)) = exprs.split_first() else {
         return Err(EvalError::syntax(
             "case requires a key and at least 1 clause",
@@ -1933,12 +2061,38 @@ fn eval_let_step(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Eva
     }
 }
 
-fn eval_let(
+fn eval_let(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+    resolve_eval_step(eval_let_step(exprs, env, position)?)
+}
+
+fn eval_let_star_step(
     exprs: &[Expr],
     env: EnvRef,
     position: SourcePos,
-) -> Result<Value, EvalError> {
-    resolve_eval_step(eval_let_step(exprs, env, position)?)
+) -> Result<EvalStep, EvalError> {
+    let Some((bindings_expr, body)) = exprs.split_first() else {
+        return Err(EvalError::syntax(
+            "let* requires bindings and a body",
+            position,
+        ));
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::syntax(
+            "let* requires bindings and a body",
+            position,
+        ));
+    }
+
+    let bindings = parse_bindings(bindings_expr)?;
+    let let_env = Environment::child(env);
+
+    for (name, expr) in bindings {
+        let value = eval(&expr, let_env.clone())?;
+        Environment::define(&let_env, name, value);
+    }
+
+    eval_sequence_step(body, let_env)
 }
 
 fn eval_letrec_step(
@@ -2053,7 +2207,13 @@ fn eval_named_let(
     env: EnvRef,
     position: SourcePos,
 ) -> Result<Value, EvalError> {
-    resolve_eval_step(eval_named_let_step(name, bindings_expr, body, env, position)?)
+    resolve_eval_step(eval_named_let_step(
+        name,
+        bindings_expr,
+        body,
+        env,
+        position,
+    )?)
 }
 
 fn parse_bindings(bindings_expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
@@ -2255,9 +2415,9 @@ fn apply_step(
     match callable {
         Value::Builtin(name) => apply_builtin_step(name, &args, position, env),
         Value::Procedure(procedure) => apply_user_procedure_step(procedure, args, position),
-        Value::NativeProcedure(procedure) => {
-            Ok(EvalStep::Value(apply_native_procedure(procedure, args, position)?))
-        }
+        Value::NativeProcedure(procedure) => Ok(EvalStep::Value(apply_native_procedure(
+            procedure, args, position,
+        )?)),
         other => Err(EvalError::not_callable(other.type_name(), position)),
     }
 }
@@ -2360,11 +2520,11 @@ fn apply_user_procedure_step(
     }
 
     if let Some(rest_param) = &clause.rest_param {
-        let rest_values = args[clause.params.len()..]
+        let rest_values: Vec<_> = args[clause.params.len()..]
             .iter()
             .map(|arg| arg.value.clone())
             .collect();
-        Environment::define(&call_env, rest_param.clone(), Value::List(rest_values));
+        Environment::define(&call_env, rest_param.clone(), list_from_values(rest_values));
     }
 
     eval_sequence_step(&clause.body, call_env)
@@ -2414,10 +2574,13 @@ fn apply_builtin(
         ">=" => apply_compare(name, args, position, |ordering| ordering != Ordering::Less),
         "append" => apply_append(args, position),
         "apply" => apply_apply(args, position, env),
-        "assoc" => apply_assoc(args, position),
+        "assoc" => apply_association_search("assoc", args, position, scheme_equal),
+        "assq" => apply_association_search("assq", args, position, scheme_eq),
+        "assv" => apply_association_search("assv", args, position, scheme_eq),
         "boolean?" => apply_type_predicate("boolean?", args, position, |value| {
             matches!(value, Value::Bool(_))
         }),
+        name if is_composite_car_cdr_name(name) => apply_composite_car_cdr(name, args, position),
         "char?" => apply_type_predicate("char?", args, position, |value| {
             matches!(value, Value::Char(_))
         }),
@@ -2447,14 +2610,15 @@ fn apply_builtin(
         "exact->inexact" => apply_exact_to_inexact(args, position),
         "exact?" => apply_exact(args, position),
         "expt" => apply_expt(args, position),
+        "for-each" => apply_for_each(args, position, env),
+        "gcd" => apply_gcd(args, position),
         "integer->char" => apply_integer_to_char(args, position),
         "inexact->exact" => apply_inexact_to_exact(args, position),
         "inexact?" => apply_inexact(args, position),
         "integer?" => apply_integer(args, position),
         "length" => apply_length(args, position),
-        "list" => Ok(Value::List(
-            args.iter().map(|arg| arg.value.clone()).collect(),
-        )),
+        "lcm" => apply_lcm(args, position),
+        "list" => Ok(list_from_values(args.iter().map(|arg| arg.value.clone()))),
         "list?" => apply_list_predicate(args, position),
         "list-ref" => apply_list_ref(args, position),
         "list-tail" => apply_list_tail(args, position),
@@ -2464,8 +2628,12 @@ fn apply_builtin(
         "max" => apply_min_max("max", args, position, |ordering| {
             ordering == Ordering::Greater
         }),
+        "make-string" => apply_make_string(args, position),
         "make-vector" => apply_make_vector(args, position),
+        "member" => apply_member_search("member", args, position, scheme_equal),
         "min" => apply_min_max("min", args, position, |ordering| ordering == Ordering::Less),
+        "memq" => apply_member_search("memq", args, position, scheme_eq),
+        "memv" => apply_member_search("memv", args, position, scheme_eq),
         "modulo" => apply_modulo(args, position),
         "negative?" => apply_number_predicate("negative?", args, position, Number::is_negative),
         "newline" => apply_newline(args, position, env),
@@ -2480,8 +2648,7 @@ fn apply_builtin(
         }),
         "odd?" => apply_integer_predicate("odd?", args, position, |value| value % 2 != 0),
         "pair?" => apply_type_predicate("pair?", args, position, |value| {
-            matches!(value, Value::List(values) if !values.is_empty())
-                || matches!(value, Value::Pair(_))
+            matches!(value, Value::Pair(_))
         }),
         "positive?" => apply_number_predicate("positive?", args, position, Number::is_positive),
         "procedure?" => apply_type_predicate("procedure?", args, position, |value| {
@@ -2494,6 +2661,9 @@ fn apply_builtin(
         "quotient" => apply_quotient(args, position),
         "rational?" => apply_rational(args, position),
         "remainder" => apply_remainder(args, position),
+        "reverse" => apply_reverse(args, position),
+        "round" => apply_round(args, position),
+        "string" => apply_string(args, position),
         "string-append" => apply_string_append(args),
         "string?" => apply_type_predicate("string?", args, position, |value| {
             matches!(value, Value::String(_))
@@ -2507,7 +2677,14 @@ fn apply_builtin(
                 value.to_lowercase()
             })
         }
+        "string<=?" => {
+            apply_string_compare("string<=?", args, position, |left, right| left <= right)
+        }
         "string=?" => apply_string_compare("string=?", args, position, |left, right| left == right),
+        "string>=?" => {
+            apply_string_compare("string>=?", args, position, |left, right| left >= right)
+        }
+        "string>?" => apply_string_compare("string>?", args, position, |left, right| left > right),
         "string<?" => apply_string_compare("string<?", args, position, |left, right| left < right),
         "string-length" => apply_string_length(args, position),
         "string->list" => apply_string_to_list(args, position),
@@ -2523,6 +2700,9 @@ fn apply_builtin(
             matches!(value, Value::Symbol(_))
         }),
         "symbol->string" => apply_symbol_to_string(args, position),
+        "set-car!" => apply_set_car(args, position),
+        "set-cdr!" => apply_set_cdr(args, position),
+        "truncate" => apply_truncate(args, position),
         "vector" => Ok(Value::Vector(Rc::new(RefCell::new(
             args.iter().map(|arg| arg.value.clone()).collect(),
         )))),
@@ -2550,6 +2730,38 @@ fn apply_abs(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalEr
     }
 
     Ok(Value::from_number(args[0].as_number()?.abs(position)?))
+}
+
+fn apply_gcd(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    let mut result = 0_i128;
+
+    for arg in args {
+        result = gcd_i128(result, i128::from(arg.as_integer()?));
+    }
+
+    let result = i64::try_from(result).map_err(|_| EvalError::integer_overflow(position))?;
+    Ok(Value::Integer(result))
+}
+
+fn apply_lcm(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    let mut result = 1_i128;
+
+    for arg in args {
+        let value = i128::from(arg.as_integer()?);
+        if value == 0 || result == 0 {
+            result = 0;
+            continue;
+        }
+
+        let divisor = gcd_i128(result, value);
+        result = (result / divisor)
+            .checked_mul(value)
+            .ok_or_else(|| EvalError::integer_overflow(position))?
+            .abs();
+    }
+
+    let result = i64::try_from(result).map_err(|_| EvalError::integer_overflow(position))?;
+    Ok(Value::Integer(result))
 }
 
 fn apply_add(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
@@ -2944,10 +3156,25 @@ fn apply_append(args: &[LocatedValue], _position: SourcePos) -> Result<Value, Ev
     let mut items = Vec::new();
 
     for arg in args {
-        items.extend(expect_proper_list(arg)?.iter().cloned());
+        items.extend(expect_proper_list(arg)?);
     }
 
-    Ok(Value::List(items))
+    Ok(list_from_values(items))
+}
+
+fn apply_reverse(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "reverse",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    let mut values = expect_proper_list(&args[0])?;
+    values.reverse();
+    Ok(list_from_values(values))
 }
 
 fn apply_apply_step(
@@ -3011,6 +3238,94 @@ fn apply_number_to_string(args: &[LocatedValue], position: SourcePos) -> Result<
     )))
 }
 
+fn apply_truncate(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "truncate",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    Ok(Value::Integer(truncate_number(
+        args[0].as_number()?,
+        position,
+    )?))
+}
+
+fn apply_round(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "round",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    Ok(Value::Integer(round_number(
+        args[0].as_number()?,
+        position,
+    )?))
+}
+
+fn truncate_number(number: Number, position: SourcePos) -> Result<i64, EvalError> {
+    match number {
+        Number::Integer(value) => Ok(value),
+        Number::Rational(rational) => Ok(rational.numerator / rational.denominator),
+        Number::Inexact(value) => f64_to_i64(value.trunc(), position),
+    }
+}
+
+fn round_number(number: Number, position: SourcePos) -> Result<i64, EvalError> {
+    match number {
+        Number::Integer(value) => Ok(value),
+        Number::Rational(rational) => {
+            let rounded = (rational.numerator as f64 / rational.denominator as f64).round();
+            f64_to_i64(rounded, position)
+        }
+        Number::Inexact(value) => f64_to_i64(value.round(), position),
+    }
+}
+
+fn f64_to_i64(value: f64, position: SourcePos) -> Result<i64, EvalError> {
+    if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+        return Err(EvalError::integer_overflow(position));
+    }
+
+    Ok(value as i64)
+}
+
+fn apply_make_string(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if !(1..=2).contains(&args.len()) {
+        return Err(EvalError::wrong_arg_count(
+            "make-string",
+            "1 or 2",
+            args.len(),
+            position,
+        ));
+    }
+
+    let length = expect_non_negative_length(&args[0])?;
+    let fill = match args.get(1) {
+        Some(arg) => arg.as_char()?,
+        None => ' ',
+    };
+
+    let string = std::iter::repeat(fill).take(length).collect::<String>();
+    Ok(Value::String(SchemeString::immutable(&string)))
+}
+
+fn apply_string(args: &[LocatedValue], _position: SourcePos) -> Result<Value, EvalError> {
+    let mut string = String::with_capacity(args.len());
+    for arg in args {
+        string.push(arg.as_char()?);
+    }
+
+    Ok(Value::String(SchemeString::immutable(&string)))
+}
+
 fn apply_string_append(args: &[LocatedValue]) -> Result<Value, EvalError> {
     let mut result = String::new();
 
@@ -3064,13 +3379,12 @@ fn apply_string_to_list(args: &[LocatedValue], position: SourcePos) -> Result<Va
         ));
     }
 
-    Ok(Value::List(
+    Ok(list_from_values(
         args[0]
             .as_string()?
             .to_plain_string()
             .chars()
-            .map(Value::Char)
-            .collect(),
+            .map(Value::Char),
     ))
 }
 
@@ -3227,16 +3541,7 @@ fn apply_car(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalEr
         ));
     }
 
-    match &args[0].value {
-        Value::List(values) if !values.is_empty() => Ok(values[0].clone()),
-        Value::Pair(pair) => Ok(pair.car.clone()),
-        Value::List(_) => Err(EvalError::type_mismatch("pair", "list", args[0].position)),
-        other => Err(EvalError::type_mismatch(
-            "pair",
-            other.type_name(),
-            args[0].position,
-        )),
-    }
+    Ok(expect_pair(&args[0])?.car())
 }
 
 fn apply_cdr(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
@@ -3249,16 +3554,44 @@ fn apply_cdr(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalEr
         ));
     }
 
-    match &args[0].value {
-        Value::List(values) if !values.is_empty() => Ok(Value::List(values[1..].to_vec())),
-        Value::Pair(pair) => Ok(pair.cdr.clone()),
-        Value::List(_) => Err(EvalError::type_mismatch("pair", "list", args[0].position)),
-        other => Err(EvalError::type_mismatch(
-            "pair",
-            other.type_name(),
-            args[0].position,
-        )),
+    Ok(expect_pair(&args[0])?.cdr())
+}
+
+fn apply_composite_car_cdr(
+    name: &str,
+    args: &[LocatedValue],
+    position: SourcePos,
+) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            name,
+            "exactly 1",
+            args.len(),
+            position,
+        ));
     }
+
+    let mut value = args[0].value.clone();
+    for op in name[1..name.len() - 1].chars().rev() {
+        let pair = match value {
+            Value::Pair(pair) => pair,
+            other => {
+                return Err(EvalError::type_mismatch(
+                    "pair",
+                    other.type_name(),
+                    args[0].position,
+                ))
+            }
+        };
+
+        value = match op {
+            'a' => pair.car(),
+            'd' => pair.cdr(),
+            _ => unreachable!("composite car/cdr name already validated"),
+        };
+    }
+
+    Ok(value)
 }
 
 fn apply_cons(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
@@ -3271,18 +3604,10 @@ fn apply_cons(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalE
         ));
     }
 
-    match &args[1].value {
-        Value::List(rest) => {
-            let mut values = Vec::with_capacity(rest.len() + 1);
-            values.push(args[0].value.clone());
-            values.extend(rest.iter().cloned());
-            Ok(Value::List(values))
-        }
-        other => Ok(Value::Pair(Rc::new(Pair {
-            car: args[0].value.clone(),
-            cdr: other.clone(),
-        }))),
-    }
+    Ok(Value::Pair(Rc::new(Pair::new(
+        args[0].value.clone(),
+        args[1].value.clone(),
+    ))))
 }
 
 fn apply_length(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
@@ -3308,10 +3633,7 @@ fn apply_null(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalE
         ));
     }
 
-    Ok(Value::Bool(matches!(
-        &args[0].value,
-        Value::List(values) if values.is_empty()
-    )))
+    Ok(Value::Bool(matches!(&args[0].value, Value::EmptyList)))
 }
 
 fn apply_list_predicate(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
@@ -3324,7 +3646,7 @@ fn apply_list_predicate(args: &[LocatedValue], position: SourcePos) -> Result<Va
         ));
     }
 
-    Ok(Value::Bool(matches!(&args[0].value, Value::List(_))))
+    Ok(Value::Bool(is_proper_list(&args[0].value)))
 }
 
 fn apply_list_ref(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
@@ -3360,17 +3682,18 @@ fn apply_list_tail(args: &[LocatedValue], position: SourcePos) -> Result<Value, 
         ));
     }
 
-    let values = expect_proper_list(&args[0])?;
+    let length = expect_proper_list_length(&args[0])?;
     let index = args[1].as_integer()?;
-    if index < 0 || index as usize > values.len() {
+    if index < 0 || index as usize > length {
         return Err(EvalError::index_out_of_bounds(
             index,
-            values.len(),
+            length,
             args[1].position,
         ));
     }
 
-    Ok(Value::List(values[index as usize..].to_vec()))
+    Ok(list_tail_value(&args[0].value, index as usize)
+        .expect("list tail must exist after length check"))
 }
 
 fn apply_list_to_string(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
@@ -3394,7 +3717,7 @@ fn apply_list_to_string(args: &[LocatedValue], position: SourcePos) -> Result<Va
                 args[0].position,
             ));
         };
-        result.push(*ch);
+        result.push(ch);
     }
 
     Ok(Value::String(SchemeString::immutable(&result)))
@@ -3415,9 +3738,9 @@ fn apply_list_to_vector(args: &[LocatedValue], position: SourcePos) -> Result<Va
         ));
     }
 
-    Ok(Value::Vector(Rc::new(RefCell::new(
-        expect_proper_list(&args[0])?.to_vec(),
-    ))))
+    Ok(Value::Vector(Rc::new(RefCell::new(expect_proper_list(
+        &args[0],
+    )?))))
 }
 
 fn apply_make_vector(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
@@ -3445,7 +3768,9 @@ fn apply_vector_to_list(args: &[LocatedValue], position: SourcePos) -> Result<Va
         ));
     }
 
-    Ok(Value::List(args[0].as_vector()?.borrow().clone()))
+    Ok(list_from_values(
+        args[0].as_vector()?.borrow().iter().cloned(),
+    ))
 }
 
 fn apply_vector_length(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
@@ -3510,10 +3835,48 @@ fn apply_vector_set(args: &[LocatedValue], position: SourcePos) -> Result<Value,
     Ok(Value::Void)
 }
 
-fn apply_assoc(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+fn apply_member_search<F>(
+    name: &str,
+    args: &[LocatedValue],
+    position: SourcePos,
+    predicate: F,
+) -> Result<Value, EvalError>
+where
+    F: Fn(&Value, &Value) -> bool,
+{
     if args.len() != 2 {
         return Err(EvalError::wrong_arg_count(
-            "assoc",
+            name,
+            "exactly 2",
+            args.len(),
+            position,
+        ));
+    }
+
+    let list = expect_proper_list(&args[1])?;
+    for (index, entry) in list.iter().enumerate() {
+        if predicate(&args[0].value, entry) {
+            return Ok(
+                list_tail_value(&args[1].value, index).expect("member tail must exist for index")
+            );
+        }
+    }
+
+    Ok(Value::Bool(false))
+}
+
+fn apply_association_search<F>(
+    name: &str,
+    args: &[LocatedValue],
+    position: SourcePos,
+    predicate: F,
+) -> Result<Value, EvalError>
+where
+    F: Fn(&Value, &Value) -> bool,
+{
+    if args.len() != 2 {
+        return Err(EvalError::wrong_arg_count(
+            name,
             "exactly 2",
             args.len(),
             position,
@@ -3522,13 +3885,12 @@ fn apply_assoc(args: &[LocatedValue], position: SourcePos) -> Result<Value, Eval
 
     let alist = expect_proper_list(&args[1])?;
     for entry in alist {
-        let key = match entry {
-            Value::List(values) if !values.is_empty() => &values[0],
-            Value::Pair(pair) => &pair.car,
-            _ => continue,
+        let Value::Pair(pair) = &entry else {
+            continue;
         };
 
-        if scheme_equal(&args[0].value, key) {
+        let key = pair.car();
+        if predicate(&args[0].value, &key) {
             return Ok(entry.clone());
         }
     }
@@ -3553,7 +3915,7 @@ fn apply_map(args: &[LocatedValue], position: SourcePos, env: EnvRef) -> Result<
         .collect::<Result<Vec<_>, _>>()?;
 
     let Some(first_len) = lists.first().map(|values| values.len()) else {
-        return Ok(Value::List(Vec::new()));
+        return Ok(Value::EmptyList);
     };
 
     if lists.iter().any(|values| values.len() != first_len) {
@@ -3578,7 +3940,78 @@ fn apply_map(args: &[LocatedValue], position: SourcePos, env: EnvRef) -> Result<
         )?);
     }
 
-    Ok(Value::List(mapped))
+    Ok(list_from_values(mapped))
+}
+
+fn apply_for_each(
+    args: &[LocatedValue],
+    position: SourcePos,
+    env: EnvRef,
+) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::wrong_arg_count(
+            "for-each",
+            "at least 2",
+            args.len(),
+            position,
+        ));
+    }
+
+    let callable = args[0].value.clone();
+    let lists = args[1..]
+        .iter()
+        .map(expect_proper_list)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let Some(first_len) = lists.first().map(|values| values.len()) else {
+        return Ok(Value::Void);
+    };
+
+    if lists.iter().any(|values| values.len() != first_len) {
+        return Err(EvalError::syntax(
+            "for-each requires lists of equal length",
+            position,
+        ));
+    }
+
+    for index in 0..first_len {
+        let call_args = lists
+            .iter()
+            .zip(args[1..].iter())
+            .map(|(values, arg)| LocatedValue::new(values[index].clone(), arg.position))
+            .collect();
+        apply(callable.clone(), args[0].position, call_args, env.clone())?;
+    }
+
+    Ok(Value::Void)
+}
+
+fn apply_set_car(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::wrong_arg_count(
+            "set-car!",
+            "exactly 2",
+            args.len(),
+            position,
+        ));
+    }
+
+    expect_pair(&args[0])?.set_car(args[1].value.clone());
+    Ok(Value::Void)
+}
+
+fn apply_set_cdr(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::wrong_arg_count(
+            "set-cdr!",
+            "exactly 2",
+            args.len(),
+            position,
+        ));
+    }
+
+    expect_pair(&args[0])?.set_cdr(args[1].value.clone());
+    Ok(Value::Void)
 }
 
 fn apply_equality_predicate<F>(
@@ -3809,8 +4242,95 @@ where
     Ok(Value::Bool(predicate(&args[0].value)))
 }
 
-fn expect_proper_list<'a>(arg: &'a LocatedValue) -> Result<&'a [Value], EvalError> {
-    let Value::List(values) = &arg.value else {
+fn list_from_values<I>(values: I) -> Value
+where
+    I: IntoIterator<Item = Value>,
+{
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    let mut list = Value::EmptyList;
+
+    while let Some(value) = values.pop() {
+        list = Value::Pair(Rc::new(Pair::new(value, list)));
+    }
+
+    list
+}
+
+fn is_proper_list(value: &Value) -> bool {
+    proper_list_length(value).is_some()
+}
+
+fn proper_list_length(value: &Value) -> Option<usize> {
+    let mut current = value.clone();
+    let mut seen = HashSet::new();
+    let mut length = 0;
+
+    loop {
+        match current {
+            Value::EmptyList => return Some(length),
+            Value::Pair(pair) => {
+                let ptr = Rc::as_ptr(&pair) as usize;
+                if !seen.insert(ptr) {
+                    return None;
+                }
+
+                length += 1;
+                current = pair.cdr();
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn list_tail_value(value: &Value, index: usize) -> Option<Value> {
+    let mut current = value.clone();
+
+    for _ in 0..index {
+        let Value::Pair(pair) = current else {
+            return None;
+        };
+        current = pair.cdr();
+    }
+
+    Some(current)
+}
+
+fn collect_proper_list(value: &Value) -> Option<Vec<Value>> {
+    let mut current = value.clone();
+    let mut seen = HashSet::new();
+    let mut values = Vec::new();
+
+    loop {
+        match current {
+            Value::EmptyList => return Some(values),
+            Value::Pair(pair) => {
+                let ptr = Rc::as_ptr(&pair) as usize;
+                if !seen.insert(ptr) {
+                    return None;
+                }
+
+                values.push(pair.car());
+                current = pair.cdr();
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn expect_pair(arg: &LocatedValue) -> Result<PairRef, EvalError> {
+    let Value::Pair(pair) = &arg.value else {
+        return Err(EvalError::type_mismatch(
+            "pair",
+            arg.value.type_name(),
+            arg.position,
+        ));
+    };
+
+    Ok(pair.clone())
+}
+
+fn expect_proper_list(arg: &LocatedValue) -> Result<Vec<Value>, EvalError> {
+    let Some(values) = collect_proper_list(&arg.value) else {
         return Err(EvalError::type_mismatch(
             "list",
             arg.value.type_name(),
@@ -3821,9 +4341,31 @@ fn expect_proper_list<'a>(arg: &'a LocatedValue) -> Result<&'a [Value], EvalErro
     Ok(values)
 }
 
+fn expect_proper_list_length(arg: &LocatedValue) -> Result<usize, EvalError> {
+    let Some(length) = proper_list_length(&arg.value) else {
+        return Err(EvalError::type_mismatch(
+            "list",
+            arg.value.type_name(),
+            arg.position,
+        ));
+    };
+
+    Ok(length)
+}
+
 fn fresh_generated_symbol(kind: &str) -> String {
     let next = GENERATED_SYMBOL_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
     format!("__macro_{kind}_{next}")
+}
+
+fn is_composite_car_cdr_name(name: &str) -> bool {
+    name.len() >= 4
+        && name.len() <= 6
+        && name.starts_with('c')
+        && name.ends_with('r')
+        && name[1..name.len() - 1]
+            .chars()
+            .all(|ch| matches!(ch, 'a' | 'd'))
 }
 
 fn is_core_syntax_keyword(name: &str) -> bool {
@@ -3841,6 +4383,7 @@ fn is_core_syntax_keyword(name: &str) -> bool {
             | "if"
             | "lambda"
             | "let"
+            | "let*"
             | "letrec"
             | "letrec*"
             | "or"
