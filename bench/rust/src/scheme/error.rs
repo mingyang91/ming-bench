@@ -15,4 +15,6 @@ pub enum EvalError {
     Custom(String),
     #[error("continuation invoked")]
     ContinuationInvoked,
+    #[error("exception raised")]
+    ExceptionRaised,
 }

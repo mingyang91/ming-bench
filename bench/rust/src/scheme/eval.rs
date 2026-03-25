@@ -39,6 +39,8 @@ enum Frame {
     DynWindAfterBody { out: Value, wind_id: u64 },
     DynWindAfterOut { result: Value },
     DynWindTransition { outs: Vec<Value>, rewind_entries: WindStack, target_k: CapturedKont, target_val: Value, target_winds: WindStack },
+    PopExceptionHandler,
+    GuardClauses { var: String, clauses: Vec<Expr>, env: Env },
 }
 
 enum CekState {
@@ -78,6 +80,18 @@ fn float_to_rational(f: f64) -> (i64, i64) {
     (sign * p1, q1)
 }
 
+#[derive(Clone)]
+enum ExceptionHandlerEntry {
+    Procedure(Value),
+    Guard {
+        var: String,
+        clauses: Vec<Expr>,
+        env: Env,
+        kstack: CapturedKont,
+        winds: WindStack,
+    },
+}
+
 fn common_wind_prefix_len(a: &WindStack, b: &WindStack) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x.0 == y.0).count()
 }
@@ -95,6 +109,9 @@ pub struct Evaluator {
     wind_stack: WindStack,
     next_wind_id: u64,
     cont_winds: HashMap<u64, WindStack>,
+    // exception handling
+    exception_handlers: Vec<ExceptionHandlerEntry>,
+    pending_exception: Option<Value>,
 }
 
 impl Evaluator {
@@ -105,6 +122,7 @@ impl Evaluator {
             continuations: HashMap::new(), next_cont_id: 0,
             pending_continuation: None,
             wind_stack: Vec::new(), next_wind_id: 0, cont_winds: HashMap::new(),
+            exception_handlers: Vec::new(), pending_exception: None,
         }
     }
 
@@ -152,6 +170,42 @@ impl Evaluator {
                         kstack.clear();
                         kstack.push(Frame::DynWindTransition { outs, rewind_entries, target_k: captured_k, target_val: val, target_winds: captured_winds });
                         *state = CekState::Ret(Value::Void);
+                    }
+                }
+                Err(EvalError::ExceptionRaised) => {
+                    let exc = self.pending_exception.take().unwrap();
+                    if let Some(handler_entry) = self.exception_handlers.pop() {
+                        match handler_entry {
+                            ExceptionHandlerEntry::Procedure(handler) => {
+                                // Call handler in current dynamic context (no unwinding)
+                                self.cek_apply(handler, vec![exc], kstack, state, "raise")?;
+                            }
+                            ExceptionHandlerEntry::Guard { var, clauses, env, kstack: guard_k, winds: guard_winds } => {
+                                // Unwind to guard context, then eval clauses
+                                let common = common_wind_prefix_len(&self.wind_stack, &guard_winds);
+                                let outs: Vec<Value> = self.wind_stack[common..].iter().rev().map(|e| e.2.clone()).collect();
+                                let rewind_entries: WindStack = guard_winds[common..].to_vec();
+                                let mut target_k = guard_k;
+                                target_k.push(Frame::GuardClauses { var, clauses, env });
+                                if outs.is_empty() && rewind_entries.is_empty() {
+                                    *kstack = target_k;
+                                    self.wind_stack = guard_winds;
+                                    *state = CekState::Ret(exc);
+                                } else {
+                                    self.wind_stack.truncate(common);
+                                    kstack.clear();
+                                    kstack.push(Frame::DynWindTransition {
+                                        outs, rewind_entries,
+                                        target_k,
+                                        target_val: exc,
+                                        target_winds: guard_winds,
+                                    });
+                                    *state = CekState::Ret(Value::Void);
+                                }
+                            }
+                        }
+                    } else {
+                        return Err(EvalError::Custom(format!("unhandled exception: {}", exc)));
                     }
                 }
                 Err(e) => return Err(e),
@@ -268,6 +322,34 @@ impl Evaluator {
                     if elems.len() != 2 { return Err(EvalError::Arity(format!("not: expected 1 arg at {pos}"))); }
                     k.push(Frame::NotCheck);
                     *s = CekState::Eval(elems[1].clone(), env);
+                    return Ok(());
+                }
+                "guard" => {
+                    // (guard (var clause1 clause2 ...) body ...)
+                    if elems.len() < 3 { return Err(EvalError::Arity(format!("guard: expected at least 2 args at {pos}"))); }
+                    let var_and_clauses = match &elems[1].kind {
+                        ExprKind::List(l) if l.len() >= 1 => l,
+                        _ => return Err(EvalError::Parse(format!("guard: expected (var clause ...) at {pos}"))),
+                    };
+                    let var = match &var_and_clauses[0].kind {
+                        ExprKind::Symbol(s) => s.clone(),
+                        _ => return Err(EvalError::Parse(format!("guard: expected variable name at {pos}"))),
+                    };
+                    let clauses = var_and_clauses[1..].to_vec();
+                    let body = elems[2..].to_vec();
+                    // Save guard context
+                    let guard_k = k.clone();
+                    let guard_winds = self.wind_stack.clone();
+                    // Push exception handler
+                    self.exception_handlers.push(ExceptionHandlerEntry::Guard {
+                        var, clauses, env: env.clone(),
+                        kstack: guard_k,
+                        winds: guard_winds,
+                    });
+                    // Push cleanup frame for normal completion
+                    k.push(Frame::PopExceptionHandler);
+                    // Eval body
+                    self.cek_begin(&body, env, k, s)?;
                     return Ok(());
                 }
                 "cond" | "case" | "do" | "let*" | "letrec" | "letrec*" | "string-set!"
@@ -407,6 +489,47 @@ impl Evaluator {
                     *s = CekState::Ret(target_val);
                 }
             }
+            Frame::PopExceptionHandler => {
+                self.exception_handlers.pop();
+                *s = CekState::Ret(val);
+            }
+            Frame::GuardClauses { var, clauses, env } => {
+                // val is the exception value
+                let clause_env = env.child();
+                clause_env.define(var, val.clone());
+                let mut clause_env_mut = clause_env;
+                for clause in &clauses {
+                    match &clause.kind {
+                        ExprKind::List(parts) if !parts.is_empty() => {
+                            if let ExprKind::Symbol(sym) = &parts[0].kind {
+                                if sym == "else" {
+                                    if parts.len() == 1 {
+                                        *s = CekState::Ret(Value::Void);
+                                    } else {
+                                        let result = self.eval_begin(&parts[1..], &mut clause_env_mut)?;
+                                        *s = CekState::Ret(result);
+                                    }
+                                    return Ok(());
+                                }
+                            }
+                            let test = self.eval_in_env(&parts[0], &mut clause_env_mut)?;
+                            if test.is_truthy() {
+                                if parts.len() == 1 {
+                                    *s = CekState::Ret(test);
+                                } else {
+                                    let result = self.eval_begin(&parts[1..], &mut clause_env_mut)?;
+                                    *s = CekState::Ret(result);
+                                }
+                                return Ok(());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // No clause matched — re-raise
+                self.pending_exception = Some(val);
+                return Err(EvalError::ExceptionRaised);
+            }
         }
         Ok(())
     }
@@ -463,6 +586,19 @@ impl Evaluator {
                 self.next_wind_id += 1;
                 k.push(Frame::DynWindAfterIn { body, out, wind_id, in_thunk: in_thunk.clone() });
                 self.cek_apply(in_thunk, vec![], k, s, pos)?;
+            }
+            Value::Symbol(name) if name == "raise" => {
+                if args.len() != 1 { return Err(EvalError::Arity(format!("raise: expected 1 arg at {pos}"))); }
+                self.pending_exception = Some(args.into_iter().next().unwrap());
+                return Err(EvalError::ExceptionRaised);
+            }
+            Value::Symbol(name) if name == "with-exception-handler" => {
+                if args.len() != 2 { return Err(EvalError::Arity(format!("with-exception-handler: expected 2 args at {pos}"))); }
+                let handler = args[0].clone();
+                let thunk = args[1].clone();
+                self.exception_handlers.push(ExceptionHandlerEntry::Procedure(handler));
+                k.push(Frame::PopExceptionHandler);
+                self.cek_apply(thunk, vec![], k, s, pos)?;
             }
             Value::Symbol(name) if name == "apply" => {
                 if args.len() < 2 { return Err(EvalError::Arity(format!("apply: expected at least 2 args at {pos}"))); }
@@ -657,7 +793,8 @@ impl Evaluator {
             | "cddaar" | "cddadr" | "cdddar" | "cddddr"
             | "cadar"
             | "call/cc" | "call-with-current-continuation"
-            | "dynamic-wind")
+            | "dynamic-wind"
+            | "raise" | "with-exception-handler")
     }
 
     fn eval_in_env(&mut self, expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
@@ -2810,7 +2947,7 @@ impl Evaluator {
         matches!(name, "define" | "if" | "quote" | "lambda" | "let" | "let*" | "begin"
             | "cond" | "and" | "or" | "set!" | "string-set!" | "not"
             | "define-syntax" | "syntax-rules" | "case-lambda" | "procedure?"
-            | "letrec" | "letrec*" | "case" | "do")
+            | "letrec" | "letrec*" | "case" | "do" | "guard")
     }
 
     fn eval_define_syntax(&mut self, args: &[Expr], env: &mut Env, pos: &str) -> Result<Value, EvalError> {
