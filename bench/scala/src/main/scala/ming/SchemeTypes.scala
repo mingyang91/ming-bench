@@ -19,6 +19,7 @@ private[ming] enum Expr:
   case Record(typeName: String, typeId: Int, fields: Array[Expr], fieldNames: Array[String])
   case CaseLambda(clauses: List[(List[String], Option[String], List[Expr])], closure: Env)
   case Vec(elems: Array[Expr])
+  case Cont(kont: AnyRef)
 
   var line: Int = 0
   var col: Int  = 0

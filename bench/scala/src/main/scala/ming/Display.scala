@@ -18,6 +18,7 @@ private[ming] object Display:
     case Expr.Macro(_, _, _)        => "#<macro>"
     case Expr.Vec(elems)            => "#(" + elems.map(display).mkString(" ") + ")"
     case Expr.Record(name, _, _, _) => s"#<record:$name>"
+    case Expr.Cont(_)               => "#<continuation>"
 
   private def displayPair(cell: MutablePair): String =
     val visited = java.util.Collections.newSetFromMap(

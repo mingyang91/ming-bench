@@ -120,7 +120,9 @@ private[ming] object BuiltinRegistry:
     "string<=?",
     "string>=?",
     "string>?",
-    "void"
+    "void",
+    "call/cc",
+    "call-with-current-continuation"
   )
 
   def makeTopLevelEnv(): Env =
@@ -129,6 +131,6 @@ private[ming] object BuiltinRegistry:
     env
 
   def isProcedure(e: Expr): Expr = e match
-    case Expr.Lambda(_, _, _, _) | Expr.CaseLambda(_, _) => Expr.Bool(true)
-    case Expr.Sym(n) if builtinNames.contains(n)         => Expr.Bool(true)
-    case _                                               => Expr.Bool(false)
+    case Expr.Lambda(_, _, _, _) | Expr.CaseLambda(_, _) | Expr.Cont(_) => Expr.Bool(true)
+    case Expr.Sym(n) if builtinNames.contains(n)                        => Expr.Bool(true)
+    case _                                                              => Expr.Bool(false)

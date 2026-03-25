@@ -8,7 +8,7 @@ object SchemeEntry:
     val exprs  = parser.parseAll()
     if exprs.isEmpty then throw EvalError("no expressions")
     val env = BuiltinRegistry.makeTopLevelEnv()
-    Display.display(exprs.foldLeft(Expr.Bool(false): Expr)((_, e) => Evaluator.eval(e, env)))
+    Display.display(CekMachine.evalBody(exprs, env))
 
   def evalStrWithOutput(input: String): (String, String) =
     val parser = SchemeParser(input)
@@ -18,6 +18,6 @@ object SchemeEntry:
     val buf = new StringBuilder
     Builtins.outputBuffer.set(buf)
     try
-      val result = Display.display(exprs.foldLeft(Expr.Bool(false): Expr)((_, e) => Evaluator.eval(e, env)))
+      val result = Display.display(CekMachine.evalBody(exprs, env))
       (result, buf.toString)
     finally Builtins.outputBuffer.remove()
