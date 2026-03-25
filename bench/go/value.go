@@ -201,7 +201,7 @@ func (v *BoolVal) String() string {
 }
 
 func (v *StringVal) String() string {
-	return fmt.Sprintf("%q", v.Val)
+	return v.Val
 }
 
 func (v *SymbolVal) String() string {
@@ -292,6 +292,9 @@ func writePair(v *PairVal, useWrite bool) string {
 }
 
 func writeValueSafe(v Value, visited map[*PairVal]bool) string {
+	if s, ok := v.(*StringVal); ok {
+		return fmt.Sprintf("%q", s.Val)
+	}
 	if p, ok := v.(*PairVal); ok {
 		if visited[p] {
 			return "(...)"
@@ -400,6 +403,9 @@ func displayValue(v Value) string {
 
 // writeValue returns the write representation (quotes on strings).
 func writeValue(v Value) string {
+	if s, ok := v.(*StringVal); ok {
+		return fmt.Sprintf("%q", s.Val)
+	}
 	if p, ok := v.(*PairVal); ok {
 		return writePair(p, true)
 	}

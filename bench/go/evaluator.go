@@ -5,8 +5,11 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 )
+
+var evalMu sync.Mutex
 
 // Env is a variable environment with lexical scoping.
 type Env struct {
@@ -3956,15 +3959,50 @@ func EvalStr(input string) (string, error) {
 }
 
 func EvalStrWithLimit(input string, limit int) (string, error) {
+	exprs, parseErr := parse(input)
+	if parseErr != nil {
+		return "", &EvalError{Message: parseErr.Error()}
+	}
+	if len(exprs) == 0 {
+		return "", nil
+	}
+	evalMu.Lock()
+	defer evalMu.Unlock()
 	stepCounter = 0
 	stepLimit = limit
 	defer func() { stepLimit = 0 }()
-	return EvalStr(input)
+	currentWindStack = nil
+	contFrameStack = contFrameStack[:0]
+	nonBodyEvalDepth = 0
+	var buf strings.Builder
+	env := makeGlobalEnv(&buf)
+	var err error
+	defer func() {
+		if r := recover(); r != nil {
+			if rp, ok := r.(raisePanic); ok {
+				err = &EvalError{Message: fmt.Sprintf("unhandled exception: %s", displayValue(rp.value))}
+				return
+			}
+			panic(r)
+		}
+	}()
+	last, evalErr := evalTopLevel(exprs, env)
+	if evalErr != nil {
+		return "", evalErr
+	}
+	if _, ok := last.(*VoidVal); ok {
+		return "", nil
+	}
+	return last.String(), err
 }
 
 // EvalStrWithOutput evaluates Scheme expressions and returns both the result
 // string and any captured output from display/write/newline.
 func EvalStrWithOutput(input string) (result string, output string, err error) {
+	return evalStrInternal(input)
+}
+
+func evalStrInternal(input string) (result string, output string, err error) {
 	exprs, parseErr := parse(input)
 	if parseErr != nil {
 		return "", "", &EvalError{Message: parseErr.Error()}
@@ -3972,6 +4010,8 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	if len(exprs) == 0 {
 		return "", "", nil
 	}
+	evalMu.Lock()
+	defer evalMu.Unlock()
 	// Reset global state for each top-level evaluation
 	currentWindStack = nil
 	contFrameStack = contFrameStack[:0]
