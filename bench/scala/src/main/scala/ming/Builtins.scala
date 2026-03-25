@@ -37,6 +37,8 @@ object Builtins:
     "symbol->string",
     "string->symbol",
     "string-ref",
+    "string-copy",
+    "string-set!",
     "char?"
   )
 
@@ -132,10 +134,10 @@ object Builtins:
     name match
       case "string-append" =>
         val strs = args.map {
-          case SchemeVal.SString(s) => s
+          case SchemeVal.SString(s) => s.toString
           case other                => throw new EvalError(s"string-append: expected string, got ${other.display}")
         }
-        SchemeVal.SString(strs.mkString)
+        SchemeVal.SString(new StringBuilder(strs.mkString))
       case "string-length" =>
         requireOne("string-length", args) match
           case SchemeVal.SString(s) => SchemeVal.SInt(s.length.toLong)
@@ -144,32 +146,43 @@ object Builtins:
         if args.length != 3 then throw new EvalError("substring: expected 3 arguments")
         (args(0), args(1), args(2)) match
           case (SchemeVal.SString(s), SchemeVal.SInt(start), SchemeVal.SInt(end)) =>
-            SchemeVal.SString(s.substring(start.toInt, end.toInt))
+            SchemeVal.SString(new StringBuilder(s.toString.substring(start.toInt, end.toInt)))
           case _ => throw new EvalError("substring: expected string and two integers")
       case "string->number" =>
         requireOne("string->number", args) match
           case SchemeVal.SString(s) =>
-            s.toLongOption match
+            s.toString.toLongOption match
               case Some(n) => SchemeVal.SInt(n)
               case None    => SchemeVal.SBool(false)
           case other => throw new EvalError(s"string->number: expected string, got ${other.display}")
       case "number->string" =>
         requireOne("number->string", args) match
-          case SchemeVal.SInt(n) => SchemeVal.SString(n.toString)
+          case SchemeVal.SInt(n) => SchemeVal.SString(new StringBuilder(n.toString))
           case other             => throw new EvalError(s"number->string: expected number, got ${other.display}")
       case "symbol->string" =>
         requireOne("symbol->string", args) match
-          case SchemeVal.SSymbol(n) => SchemeVal.SString(n)
+          case SchemeVal.SSymbol(n) => SchemeVal.SString(new StringBuilder(n))
           case other                => throw new EvalError(s"symbol->string: expected symbol, got ${other.display}")
       case "string->symbol" =>
         requireOne("string->symbol", args) match
-          case SchemeVal.SString(s) => SchemeVal.SSymbol(s)
+          case SchemeVal.SString(s) => SchemeVal.SSymbol(s.toString)
           case other                => throw new EvalError(s"string->symbol: expected string, got ${other.display}")
       case "string-ref" =>
         if args.length != 2 then throw new EvalError("string-ref: expected 2 arguments")
         (args(0), args(1)) match
           case (SchemeVal.SString(s), SchemeVal.SInt(i)) => SchemeVal.SChar(s.charAt(i.toInt))
           case _ => throw new EvalError("string-ref: expected string and integer")
+      case "string-copy" =>
+        requireOne("string-copy", args) match
+          case SchemeVal.SString(s) => SchemeVal.SString(new StringBuilder(s.toString))
+          case other                => throw new EvalError(s"string-copy: expected string, got ${other.display}")
+      case "string-set!" =>
+        if args.length != 3 then throw new EvalError("string-set!: expected 3 arguments")
+        (args(0), args(1), args(2)) match
+          case (SchemeVal.SString(s), SchemeVal.SInt(i), SchemeVal.SChar(c)) =>
+            s.setCharAt(i.toInt, c)
+            SchemeVal.SVoid
+          case _ => throw new EvalError("string-set!: expected string, integer, and character")
       case _ => throw new EvalError(s"unknown string op: $name")
 
   def applyBuiltin(name: String, args: List[SchemeVal]): SchemeVal =
@@ -184,7 +197,7 @@ object Builtins:
       case "string?" | "number?" | "boolean?" | "symbol?" | "char?" =>
         applyTypePredicate(name, args)
       case "string-append" | "string-length" | "substring" | "string->number" | "number->string" | "symbol->string" |
-          "string->symbol" | "string-ref" =>
+          "string->symbol" | "string-ref" | "string-copy" | "string-set!" =>
         applyStringOp(name, args)
       case other =>
         throw new EvalError(s"unknown procedure: $other")

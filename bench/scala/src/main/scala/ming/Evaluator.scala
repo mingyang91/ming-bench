@@ -9,7 +9,7 @@ enum SchemeVal:
   var pos: Option[Pos] = None
   case SInt(value: Long)
   case SBool(value: Boolean)
-  case SString(value: String)
+  case SString(value: StringBuilder)
   case SSymbol(name: String)
   case SChar(value: Char)
   case SList(elems: List[SchemeVal])
@@ -20,7 +20,7 @@ enum SchemeVal:
   def display: String = this match
     case SInt(v)          => v.toString
     case SBool(v)         => if v then "#t" else "#f"
-    case SString(v)       => s""""$v""""
+    case SString(v)       => s""""${v.toString}""""
     case SSymbol(n)       => n
     case SChar(c)         => s"#\\$c"
     case SList(es)        => "(" + es.map(_.display).mkString(" ") + ")"
@@ -29,7 +29,7 @@ enum SchemeVal:
 
   /** Display representation (no quotes for strings). */
   def displayRepr: String = this match
-    case SString(v) => v
+    case SString(v) => v.toString
     case other      => other.display
 
 /** Environment with parent chain */
