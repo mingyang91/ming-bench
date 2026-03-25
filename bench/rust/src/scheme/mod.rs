@@ -37,6 +37,7 @@ enum Value {
     Symbol(String),
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Ast>,
         env: Env,
     },
@@ -497,13 +498,11 @@ fn eval_define(args: &[Ast], env: &Env, output: &mut String) -> Result<Value, Ev
                 AstKind::Symbol(s) => s.clone(),
                 _ => return Err(EvalError::Type("define: expected symbol for function name".into())),
             };
-            let params: Vec<String> = sig[1..].iter().map(|p| match &p.kind {
-                AstKind::Symbol(s) => Ok(s.clone()),
-                _ => Err(EvalError::Type("define: expected symbol for parameter".into())),
-            }).collect::<Result<_, _>>()?;
+            let (params, rest_param) = parse_params(&sig[1..])?;
             let body = args[1..].to_vec();
             let lambda = Value::Lambda {
                 params,
+                rest_param,
                 body,
                 env: Rc::clone(env),
             };
@@ -534,21 +533,44 @@ fn eval_lambda(args: &[Ast], env: &Env) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity("lambda requires at least 2 arguments".into()));
     }
-    let params = match &args[0].kind {
-        AstKind::List(ps) => {
-            ps.iter().map(|p| match &p.kind {
-                AstKind::Symbol(s) => Ok(s.clone()),
-                _ => Err(EvalError::Type("lambda: expected symbol for parameter".into())),
-            }).collect::<Result<Vec<_>, _>>()?
-        }
+    let (params, rest_param) = match &args[0].kind {
+        AstKind::List(ps) => parse_params(ps)?,
+        AstKind::Symbol(s) => (vec![], Some(s.clone())),
         _ => return Err(EvalError::Type("lambda: expected parameter list".into())),
     };
     let body = args[1..].to_vec();
     Ok(Value::Lambda {
         params,
+        rest_param,
         body,
         env: Rc::clone(env),
     })
+}
+
+/// Parse a parameter list, handling optional dot notation for rest params.
+/// E.g. `[x, y, ., rest]` -> `(["x", "y"], Some("rest"))`
+fn parse_params(items: &[Ast]) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut params = Vec::new();
+    let mut rest_param = None;
+    let mut i = 0;
+    while i < items.len() {
+        match &items[i].kind {
+            AstKind::Symbol(s) if s == "." => {
+                if i + 1 != items.len() - 1 {
+                    return Err(EvalError::Parse("malformed dotted parameter list".into()));
+                }
+                rest_param = Some(match &items[i + 1].kind {
+                    AstKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Type("expected symbol after dot in parameters".into())),
+                });
+                break;
+            }
+            AstKind::Symbol(s) => params.push(s.clone()),
+            _ => return Err(EvalError::Type("expected symbol for parameter".into())),
+        }
+        i += 1;
+    }
+    Ok((params, rest_param))
 }
 
 fn eval_let(args: &[Ast], env: &Env, output: &mut String) -> Result<Value, EvalError> {
@@ -582,6 +604,7 @@ fn eval_let(args: &[Ast], env: &Env, output: &mut String) -> Result<Value, EvalE
         let local_env = Environment::with_parent(env);
         let lambda = Value::Lambda {
             params: params.clone(),
+            rest_param: None,
             body: body.clone(),
             env: Rc::clone(&local_env),
         };
@@ -652,8 +675,14 @@ fn eval_cond(clauses: &[Ast], env: &Env, output: &mut String) -> Result<Value, E
 fn apply(func: &Value, args: &[Value], output: &mut String) -> Result<Value, EvalError> {
     match func {
         Value::Builtin(f) => f(args, output),
-        Value::Lambda { params, body, env } => {
-            if args.len() != params.len() {
+        Value::Lambda { params, rest_param, body, env } => {
+            if rest_param.is_some() {
+                if args.len() < params.len() {
+                    return Err(EvalError::Arity(format!(
+                        "expected at least {} arguments, got {}", params.len(), args.len()
+                    )));
+                }
+            } else if args.len() != params.len() {
                 return Err(EvalError::Arity(format!(
                     "expected {} arguments, got {}", params.len(), args.len()
                 )));
@@ -661,6 +690,10 @@ fn apply(func: &Value, args: &[Value], output: &mut String) -> Result<Value, Eva
             let local_env = Environment::with_parent(env);
             for (p, a) in params.iter().zip(args.iter()) {
                 local_env.borrow_mut().set(p.clone(), a.clone());
+            }
+            if let Some(rest) = rest_param {
+                let rest_args = args[params.len()..].to_vec();
+                local_env.borrow_mut().set(rest.clone(), Value::List(rest_args));
             }
             let mut result = Value::Void;
             for expr in body {
@@ -891,6 +924,21 @@ fn builtin_string_copy(args: &[Value], _output: &mut String) -> Result<Value, Ev
     }
 }
 
+fn builtin_apply(args: &[Value], output: &mut String) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity("apply requires at least 2 arguments".into()));
+    }
+    let func = &args[0];
+    let last = &args[args.len() - 1];
+    let tail = match last {
+        Value::List(items) => items.clone(),
+        _ => return Err(EvalError::Type("apply: last argument must be a list".into())),
+    };
+    let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+    all_args.extend(tail);
+    apply(func, &all_args, output)
+}
+
 fn builtin_is_char(args: &[Value], _output: &mut String) -> Result<Value, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("char? requires 1 argument".into())); }
     Ok(Value::Boolean(matches!(args[0], Value::Char(_))))
@@ -961,6 +1009,7 @@ fn make_global_env() -> Env {
         e.set("string->symbol".into(), Value::Builtin(builtin_string_to_symbol));
         e.set("string-ref".into(), Value::Builtin(builtin_string_ref));
         e.set("string-copy".into(), Value::Builtin(builtin_string_copy));
+        e.set("apply".into(), Value::Builtin(builtin_apply));
     }
     env
 }
