@@ -712,6 +712,7 @@ fn builtin_is_procedure(args: &[Value], _output: &mut String) -> Result<Value, E
         Value::Lambda { .. } | Value::Builtin(_) | Value::CaseLambda { .. }
         | Value::RecordConstructor { .. } | Value::RecordPredicate { .. } | Value::RecordAccessor { .. }
         | Value::CallCC | Value::DynamicWind | Value::Continuation(_, _)
+        | Value::Raise | Value::WithExceptionHandler
     )))
 }
 
@@ -1307,6 +1308,9 @@ pub(crate) fn make_global_env() -> Env {
         e.set("call-with-current-continuation".into(), Value::CallCC);
         // L19: dynamic-wind
         e.set("dynamic-wind".into(), Value::DynamicWind);
+        // L20: raise, guard, with-exception-handler
+        e.set("raise".into(), Value::Raise);
+        e.set("with-exception-handler".into(), Value::WithExceptionHandler);
         // c..r compositions (3-letter)
         e.set("caar".into(), Value::Builtin(builtin_caar));
         e.set("cadr".into(), Value::Builtin(builtin_cadr));

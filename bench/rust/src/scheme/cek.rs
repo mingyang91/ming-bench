@@ -5,6 +5,28 @@ use super::{
     CekState, Environment, Env, EvalError, Frame, Kont, Value, Winders,
 };
 
+pub(crate) fn handle_raise(raised_val: Value, kont: &mut Kont, winders: &mut Winders, output: &mut String) -> Result<CekState, EvalError> {
+    loop {
+        match kont.pop() {
+            None => return Err(EvalError::Type(format!("unhandled exception: {}", raised_val.display_value()))),
+            Some(Frame::ExceptionHandler { handler }) => {
+                return cek_apply_func(handler, vec![raised_val], kont, winders, output);
+            }
+            Some(Frame::GuardHandler { var, clauses, env }) => {
+                let guard_env = Environment::with_parent(&env);
+                guard_env.borrow_mut().set(var, raised_val);
+                return cek_eval_cond(&clauses, &guard_env, kont);
+            }
+            Some(Frame::DynWindAfterBody { out_thunk }) => {
+                winders.pop();
+                kont.push(Frame::RaiseUnwind { raised_val });
+                return cek_apply_func(out_thunk, vec![], kont, winders, output);
+            }
+            Some(_) => continue,
+        }
+    }
+}
+
 /// Helper: set up body evaluation in the CEK machine
 pub(crate) fn cek_eval_body(body: Vec<Ast>, env: Env, kont: &mut Kont) -> Result<CekState, EvalError> {
     if body.is_empty() {
@@ -292,6 +314,15 @@ pub(crate) fn cek_apply_frame(frame: Frame, val: Value, kont: &mut Kont, winders
         Frame::DynWindAfterOut { result } => {
             Ok(CekState::Apply(result))
         }
+        Frame::ExceptionHandler { .. } => {
+            Ok(CekState::Apply(val))
+        }
+        Frame::GuardHandler { .. } => {
+            Ok(CekState::Apply(val))
+        }
+        Frame::RaiseUnwind { raised_val } => {
+            handle_raise(raised_val, kont, winders, output)
+        }
         Frame::ContinuationWind { mut out_thunks, in_entries, saved_kont, saved_winders, val } => {
             if !out_thunks.is_empty() {
                 let thunk = out_thunks.remove(0);
@@ -401,6 +432,22 @@ pub(crate) fn cek_apply_func(func: Value, args: Vec<Value>, kont: &mut Kont, win
                 });
                 Ok(CekState::Apply(Value::Void))
             }
+        }
+        Value::Raise => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("raise requires exactly 1 argument".into()));
+            }
+            let raised_val = args.into_iter().next().expect("arity checked above");
+            handle_raise(raised_val, kont, winders, output)
+        }
+        Value::WithExceptionHandler => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("with-exception-handler requires exactly 2 arguments".into()));
+            }
+            let handler = args[0].clone();
+            let thunk = args[1].clone();
+            kont.push(Frame::ExceptionHandler { handler });
+            cek_apply_func(thunk, vec![], kont, winders, output)
         }
         Value::RecordConstructor { type_id, type_name, field_names } => {
             if args.len() != field_names.len() {

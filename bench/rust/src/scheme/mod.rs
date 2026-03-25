@@ -88,6 +88,8 @@ pub(crate) enum Value {
     CallCC,
     DynamicWind,
     Continuation(Kont, Winders),
+    Raise,
+    WithExceptionHandler,
 }
 
 // ---- CEK Machine continuation frames ----
@@ -116,6 +118,9 @@ pub(crate) enum Frame {
     DynWindAfterBody { out_thunk: Value },
     DynWindAfterOut { result: Value },
     ContinuationWind { out_thunks: Vec<Value>, in_entries: Winders, saved_kont: Kont, saved_winders: Winders, val: Value },
+    ExceptionHandler { handler: Value },
+    GuardHandler { var: String, clauses: Vec<Ast>, env: Env },
+    RaiseUnwind { raised_val: Value },
 }
 
 pub(crate) enum CekState {
@@ -303,7 +308,8 @@ impl Value {
             | Value::RecordConstructor { .. } | Value::RecordPredicate { .. }
             | Value::RecordAccessor { .. }
             | Value::CaseLambda { .. }
-            | Value::CallCC | Value::DynamicWind | Value::Continuation(_, _) => "#<procedure>".into(),
+            | Value::CallCC | Value::DynamicWind | Value::Continuation(_, _)
+            | Value::Raise | Value::WithExceptionHandler => "#<procedure>".into(),
             Value::Vector(v) => {
                 let items = v.borrow();
                 let inner: Vec<String> = items.iter().map(|v| v.display_value()).collect();
@@ -588,6 +594,9 @@ fn cek_eval_list(items: &[Ast], env: &Env, kont: &mut Kont, _output: &mut String
                     body,
                 ]);
                 Ok(CekState::Eval(desugared, Rc::clone(env)))
+            }
+            "guard" => {
+                cek_eval_guard(&items[1..], env, kont)
             }
             "call/cc" | "call-with-current-continuation" => {
                 if items.len() != 2 {
@@ -945,6 +954,24 @@ fn cek_eval_do(args: &[Ast], env: &Env) -> Result<CekState, EvalError> {
 }
 
 use cek::{cek_apply_frame, cek_eval_body};
+
+fn cek_eval_guard(args: &[Ast], env: &Env, kont: &mut Kont) -> Result<CekState, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity("guard requires a clause spec and body".into()));
+    }
+    let guard_spec = match &args[0].kind {
+        AstKind::List(items) if !items.is_empty() => items,
+        _ => return Err(EvalError::Type("guard: expected (var clause ...)".into())),
+    };
+    let var = match &guard_spec[0].kind {
+        AstKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type("guard: expected variable name".into())),
+    };
+    let clauses = guard_spec[1..].to_vec();
+    let body = args[1..].to_vec();
+    kont.push(Frame::GuardHandler { var, clauses, env: Rc::clone(env) });
+    cek_eval_body(body, Rc::clone(env), kont)
+}
 
 pub(crate) fn common_winder_prefix_len(a: &Winders, b: &Winders) -> usize {
     a.iter().zip(b.iter())
