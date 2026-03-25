@@ -106,6 +106,7 @@ public class Evaluator {
         installBuiltin(env, "boolean?", this::builtinBooleanPredicate);
         installBuiltin(env, "char?", this::builtinCharPredicate);
         installBuiltin(env, "pair?", this::builtinPairPredicate);
+        installBuiltin(env, "procedure?", this::builtinProcedurePredicate);
         installBuiltin(env, "symbol?", this::builtinSymbolPredicate);
         installBuiltin(env, "eq?", this::builtinEq);
         installBuiltin(env, "equal?", this::builtinEqual);
@@ -185,6 +186,7 @@ public class Evaluator {
             return switch (name) {
                 case "and" -> evalAnd(arguments, env);
                 case "begin" -> evalBegin(arguments, env);
+                case "case-lambda" -> evalCaseLambda(arguments, env);
                 case "cond" -> evalCond(arguments, env);
                 case "or" -> evalOr(arguments, env);
                 case "define" -> evalDefine(arguments, env);
@@ -609,6 +611,20 @@ public class Evaluator {
         return new LambdaProcedure(null, parameters, copyExprs(arguments.subList(1, arguments.size())), env);
     }
 
+    private Value evalCaseLambda(List<Expr> arguments, Environment env) throws EvalError {
+        List<CaseLambdaClause> clauses = new ArrayList<>(arguments.size());
+        for (Expr clauseExpr : arguments) {
+            if (!(clauseExpr instanceof ListExpr clauseList) || clauseList.elements().size() < 2) {
+                throw new EvalError("invalid case-lambda");
+            }
+            List<Expr> clause = clauseList.elements();
+            clauses.add(new CaseLambdaClause(
+                    parseParameters(clause.get(0)),
+                    copyExprs(clause.subList(1, clause.size()))));
+        }
+        return new CaseLambdaProcedure(null, List.copyOf(clauses), env);
+    }
+
     private Value evalLet(List<Expr> arguments, Environment env) throws EvalError {
         if (arguments.size() < 2) {
             throw new EvalError("invalid let");
@@ -812,6 +828,9 @@ public class Evaluator {
         if (operator instanceof BuiltinProcedure builtin) {
             return builtin.apply(callPos, arguments);
         }
+        if (operator instanceof CaseLambdaProcedure caseLambda) {
+            return applyCaseLambda(caseLambda, arguments, callPos);
+        }
         if (operator instanceof LambdaProcedure lambda) {
             return applyLambda(lambda, arguments, callPos);
         }
@@ -825,7 +844,22 @@ public class Evaluator {
             throw errorAt(callPos, "wrong argument count for " + lambda.displayName());
         }
 
-        Environment callEnv = new Environment(lambda.closure());
+        return applyUserProcedure(lambda.closure(), parameters, lambda.body(), arguments);
+    }
+
+    private Value applyCaseLambda(CaseLambdaProcedure caseLambda, List<LocatedValue> arguments,
+                                  SourcePos callPos) throws EvalError {
+        for (CaseLambdaClause clause : caseLambda.clauses()) {
+            if (clause.parameters().accepts(arguments.size())) {
+                return applyUserProcedure(caseLambda.closure(), clause.parameters(), clause.body(), arguments);
+            }
+        }
+        throw errorAt(callPos, "wrong argument count for " + caseLambda.displayName());
+    }
+
+    private Value applyUserProcedure(Environment closure, ParameterSpec parameters, List<Expr> body,
+                                     List<LocatedValue> arguments) throws EvalError {
+        Environment callEnv = new Environment(closure);
         for (int i = 0; i < parameters.required().size(); i++) {
             callEnv.define(parameters.required().get(i), arguments.get(i).value());
         }
@@ -834,7 +868,7 @@ public class Evaluator {
         }
 
         Value result = VOID_VALUE;
-        for (Expr bodyExpr : lambda.body()) {
+        for (Expr bodyExpr : body) {
             result = eval(bodyExpr, callEnv);
         }
         return result;
@@ -1087,6 +1121,12 @@ public class Evaluator {
             throws EvalError {
         expectArgumentCount(arguments, 1, "pair?", callPos);
         return boolValue(arguments.get(0).value() instanceof PairValue);
+    }
+
+    private Value builtinProcedurePredicate(SourcePos callPos, List<LocatedValue> arguments)
+            throws EvalError {
+        expectArgumentCount(arguments, 1, "procedure?", callPos);
+        return boolValue(isProcedureValue(arguments.get(0).value()));
     }
 
     private Value builtinSymbolPredicate(SourcePos callPos, List<LocatedValue> arguments)
@@ -2026,7 +2066,7 @@ public class Evaluator {
 
     private sealed interface Value permits NumberValue, BoolValue, StringValue, SymbolValue,
             CharValue, PairValue, EmptyListValue, BuiltinProcedure, LambdaProcedure,
-            RecordValue, VoidValue {
+            CaseLambdaProcedure, RecordValue, VoidValue {
         String render();
     }
 
@@ -2177,6 +2217,20 @@ public class Evaluator {
             return "#<procedure " + displayName() + ">";
         }
     }
+
+    private record CaseLambdaProcedure(String name, List<CaseLambdaClause> clauses,
+                                       Environment closure) implements Value {
+        private String displayName() {
+            return name == null ? "case-lambda" : name;
+        }
+
+        @Override
+        public String render() {
+            return "#<procedure " + displayName() + ">";
+        }
+    }
+
+    private record CaseLambdaClause(ParameterSpec parameters, List<Expr> body) {}
 
     private record ParameterSpec(List<String> required, String rest) {
         private static ParameterSpec fixed(List<String> required) {
@@ -2341,10 +2395,16 @@ public class Evaluator {
 
     private static boolean isSpecialForm(String name) {
         return switch (name) {
-            case "and", "begin", "cond", "define", "define-record-type", "define-syntax", "else", "if",
+            case "and", "begin", "case-lambda", "cond", "define", "define-record-type", "define-syntax", "else", "if",
                     "lambda", "let", "or", "quote", "set!", "syntax-rules" -> true;
             default -> false;
         };
+    }
+
+    private static boolean isProcedureValue(Value value) {
+        return value instanceof BuiltinProcedure
+                || value instanceof LambdaProcedure
+                || value instanceof CaseLambdaProcedure;
     }
 
     private static boolean isEllipsisExpr(Expr expr) {
