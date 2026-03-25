@@ -17,7 +17,7 @@ public class Evaluator {
         record Nil() implements Val {}
         record Void() implements Val {}
         record Builtin(String name, java.util.function.Function<List<Val>, Val> fn) implements Val {}
-        record Lambda(List<String> params, Val body, Env closure) implements Val {}
+        record Lambda(List<String> params, List<Val> body, Env closure) implements Val {}
     }
 
     // ── Environment ─────────────────────────────────────────────
@@ -181,6 +181,9 @@ public class Evaluator {
                 case "lambda" -> {
                     return evalLambda(pair.cdr(), env);
                 }
+                case "begin" -> { return evalBegin(pair.cdr(), env); }
+                case "let" -> { return evalLet(pair.cdr(), env); }
+                case "cond" -> { return evalCond(pair.cdr(), env); }
                 case "and" -> { return evalAnd(pair.cdr(), env); }
                 case "or" -> { return evalOr(pair.cdr(), env); }
             }
@@ -207,7 +210,7 @@ public class Evaluator {
             for (int i = 0; i < lambda.params().size(); i++) {
                 callEnv.define(lambda.params().get(i), args.get(i));
             }
-            return eval(lambda.body(), callEnv);
+            return evalBody(lambda.body(), callEnv);
         }
         throw new EvalError("not a procedure: " + display(fn));
     }
@@ -249,9 +252,8 @@ public class Evaluator {
                 params.add(paramSym.name());
                 paramList = pp.cdr();
             }
-            // body is a single expression for now
-            if (!(p.cdr() instanceof Val.PairV bodyPair)) throw new EvalError("define: missing body");
-            Val body = bodyPair.car();
+            List<Val> body = collectList(p.cdr());
+            if (body.isEmpty()) throw new EvalError("define: missing body");
             Val.Lambda lambda = new Val.Lambda(params, body, env);
             env.define(fnName.name(), lambda);
             return new Val.Void();
@@ -269,8 +271,8 @@ public class Evaluator {
             params.add(paramSym.name());
             paramList = pp.cdr();
         }
-        if (!(p.cdr() instanceof Val.PairV bodyPair)) throw new EvalError("lambda: missing body");
-        Val body = bodyPair.car();
+        List<Val> body = collectList(p.cdr());
+        if (body.isEmpty()) throw new EvalError("lambda: missing body");
         return new Val.Lambda(params, body, env);
     }
 
@@ -294,6 +296,93 @@ public class Evaluator {
             cur = p.cdr();
         }
         return result;
+    }
+
+    private Val evalBody(List<Val> body, Env env) throws EvalError {
+        Val result = new Val.Void();
+        for (Val expr : body) {
+            result = eval(expr, env);
+        }
+        return result;
+    }
+
+    private List<Val> collectList(Val v) {
+        List<Val> result = new ArrayList<>();
+        Val cur = v;
+        while (cur instanceof Val.PairV p) {
+            result.add(p.car());
+            cur = p.cdr();
+        }
+        return result;
+    }
+
+    private Val evalBegin(Val args, Env env) throws EvalError {
+        Val result = new Val.Void();
+        Val cur = args;
+        while (cur instanceof Val.PairV p) {
+            result = eval(p.car(), env);
+            cur = p.cdr();
+        }
+        return result;
+    }
+
+    private Val evalLet(Val args, Env env) throws EvalError {
+        if (!(args instanceof Val.PairV p)) throw new EvalError("let: invalid syntax");
+        // Named let: (let name ((var init) ...) body ...)
+        if (p.car() instanceof Val.Sym nameSym) {
+            if (!(p.cdr() instanceof Val.PairV rest)) throw new EvalError("let: invalid syntax");
+            List<String> params = new ArrayList<>();
+            List<Val> inits = new ArrayList<>();
+            Val bindings = rest.car();
+            while (bindings instanceof Val.PairV bp) {
+                if (!(bp.car() instanceof Val.PairV binding)) throw new EvalError("let: invalid binding");
+                if (!(binding.car() instanceof Val.Sym varSym)) throw new EvalError("let: expected variable name");
+                params.add(varSym.name());
+                if (!(binding.cdr() instanceof Val.PairV valPair)) throw new EvalError("let: missing init");
+                inits.add(eval(valPair.car(), env));
+                bindings = bp.cdr();
+            }
+            List<Val> body = collectList(rest.cdr());
+            if (body.isEmpty()) throw new EvalError("let: missing body");
+            // Create lambda and bind it in its own closure
+            Env letEnv = new Env(env);
+            Val.Lambda lambda = new Val.Lambda(params, body, letEnv);
+            letEnv.define(nameSym.name(), lambda);
+            return applyFn(lambda, inits);
+        }
+        // Regular let: (let ((var init) ...) body ...)
+        Env letEnv = new Env(env);
+        Val bindings = p.car();
+        while (bindings instanceof Val.PairV bp) {
+            if (!(bp.car() instanceof Val.PairV binding)) throw new EvalError("let: invalid binding");
+            if (!(binding.car() instanceof Val.Sym varSym)) throw new EvalError("let: expected variable name");
+            if (!(binding.cdr() instanceof Val.PairV valPair)) throw new EvalError("let: missing init");
+            Val val = eval(valPair.car(), env);
+            letEnv.define(varSym.name(), val);
+            bindings = bp.cdr();
+        }
+        List<Val> body = collectList(p.cdr());
+        if (body.isEmpty()) throw new EvalError("let: missing body");
+        return evalBody(body, letEnv);
+    }
+
+    private Val evalCond(Val args, Env env) throws EvalError {
+        Val cur = args;
+        while (cur instanceof Val.PairV p) {
+            Val clause = p.car();
+            if (!(clause instanceof Val.PairV cp)) throw new EvalError("cond: invalid clause");
+            // Check for else clause
+            if (cp.car() instanceof Val.Sym s && s.name().equals("else")) {
+                return evalBegin(cp.cdr(), env);
+            }
+            Val test = eval(cp.car(), env);
+            if (isTruthy(test)) {
+                if (cp.cdr() instanceof Val.Nil) return test;
+                return evalBegin(cp.cdr(), env);
+            }
+            cur = p.cdr();
+        }
+        return new Val.Void();
     }
 
     private List<Val> evalArgs(Val args, Env env) throws EvalError {
@@ -369,6 +458,73 @@ public class Evaluator {
         env.define("not", new Val.Builtin("not", args -> {
             checkArgCount(args, 1, "not");
             return new Val.Bool(!isTruthy(args.get(0)));
+        }));
+        env.define("cons", new Val.Builtin("cons", args -> {
+            checkArgCount(args, 2, "cons");
+            return new Val.PairV(args.get(0), args.get(1));
+        }));
+        env.define("car", new Val.Builtin("car", args -> {
+            checkArgCount(args, 1, "car");
+            if (!(args.get(0) instanceof Val.PairV p)) throw new RuntimeException("car: not a pair");
+            return p.car();
+        }));
+        env.define("cdr", new Val.Builtin("cdr", args -> {
+            checkArgCount(args, 1, "cdr");
+            if (!(args.get(0) instanceof Val.PairV p)) throw new RuntimeException("cdr: not a pair");
+            return p.cdr();
+        }));
+        env.define("null?", new Val.Builtin("null?", args -> {
+            checkArgCount(args, 1, "null?");
+            return new Val.Bool(args.get(0) instanceof Val.Nil);
+        }));
+        env.define("list", new Val.Builtin("list", args -> {
+            Val result = new Val.Nil();
+            for (int i = args.size() - 1; i >= 0; i--) {
+                result = new Val.PairV(args.get(i), result);
+            }
+            return result;
+        }));
+        env.define("length", new Val.Builtin("length", args -> {
+            checkArgCount(args, 1, "length");
+            long count = 0;
+            Val cur = args.get(0);
+            while (cur instanceof Val.PairV p) { count++; cur = p.cdr(); }
+            return new Val.Int(count);
+        }));
+        env.define("append", new Val.Builtin("append", args -> {
+            if (args.isEmpty()) return new Val.Nil();
+            Val result = args.get(args.size() - 1);
+            for (int i = args.size() - 2; i >= 0; i--) {
+                Val lst = args.get(i);
+                // Collect elements then prepend in reverse
+                List<Val> elems = new ArrayList<>();
+                Val cur = lst;
+                while (cur instanceof Val.PairV p) { elems.add(p.car()); cur = p.cdr(); }
+                for (int j = elems.size() - 1; j >= 0; j--) {
+                    result = new Val.PairV(elems.get(j), result);
+                }
+            }
+            return result;
+        }));
+        env.define("number?", new Val.Builtin("number?", args -> {
+            checkArgCount(args, 1, "number?");
+            return new Val.Bool(args.get(0) instanceof Val.Int);
+        }));
+        env.define("string?", new Val.Builtin("string?", args -> {
+            checkArgCount(args, 1, "string?");
+            return new Val.Bool(args.get(0) instanceof Val.Str);
+        }));
+        env.define("boolean?", new Val.Builtin("boolean?", args -> {
+            checkArgCount(args, 1, "boolean?");
+            return new Val.Bool(args.get(0) instanceof Val.Bool);
+        }));
+        env.define("pair?", new Val.Builtin("pair?", args -> {
+            checkArgCount(args, 1, "pair?");
+            return new Val.Bool(args.get(0) instanceof Val.PairV);
+        }));
+        env.define("symbol?", new Val.Builtin("symbol?", args -> {
+            checkArgCount(args, 1, "symbol?");
+            return new Val.Bool(args.get(0) instanceof Val.Sym);
         }));
         return env;
     }
