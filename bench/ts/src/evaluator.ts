@@ -315,6 +315,247 @@ function makeGlobalEnv(): Env {
     return { tag: 'symbol', value: args[0].value };
   });
 
+  // Equality
+  defBuiltin('eq?', (args) => {
+    if (args.length !== 2) throw new EvalError('eq?: expected 2 arguments');
+    const a = args[0], b = args[1];
+    if (a.tag !== b.tag) return { tag: 'boolean', value: false };
+    if (a.tag === 'symbol' && b.tag === 'symbol') return { tag: 'boolean', value: a.value === b.value };
+    if (a.tag === 'number' && b.tag === 'number') return { tag: 'boolean', value: a.value === b.value };
+    if (a.tag === 'boolean' && b.tag === 'boolean') return { tag: 'boolean', value: a.value === b.value };
+    if (a.tag === 'char' && b.tag === 'char') return { tag: 'boolean', value: a.value === b.value };
+    if (a.tag === 'string' && b.tag === 'string') return { tag: 'boolean', value: a === b };
+    if (a.tag === 'nil' && b.tag === 'nil') return { tag: 'boolean', value: true };
+    return { tag: 'boolean', value: a === b };
+  });
+
+  function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
+    if (a.tag !== b.tag) return false;
+    if (a.tag === 'number' && b.tag === 'number') return a.value === b.value;
+    if (a.tag === 'boolean' && b.tag === 'boolean') return a.value === b.value;
+    if (a.tag === 'string' && b.tag === 'string') return a.value === b.value;
+    if (a.tag === 'symbol' && b.tag === 'symbol') return a.value === b.value;
+    if (a.tag === 'char' && b.tag === 'char') return a.value === b.value;
+    if (a.tag === 'nil' && b.tag === 'nil') return true;
+    if (a.tag === 'pair' && b.tag === 'pair') return schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr);
+    return false;
+  }
+
+  defBuiltin('equal?', (args) => {
+    if (args.length !== 2) throw new EvalError('equal?: expected 2 arguments');
+    return { tag: 'boolean', value: schemeEqual(args[0], args[1]) };
+  });
+
+  // Numeric utilities
+  defBuiltin('abs', (args) => {
+    if (args.length !== 1) throw new EvalError('abs: expected 1 argument');
+    return { tag: 'number', value: Math.abs(expectNum(args[0], 'abs')) };
+  });
+
+  defBuiltin('modulo', (args) => {
+    if (args.length !== 2) throw new EvalError('modulo: expected 2 arguments');
+    const a = expectNum(args[0], 'modulo'), b = expectNum(args[1], 'modulo');
+    if (b === 0) throw new EvalError('modulo: division by zero');
+    return { tag: 'number', value: ((a % b) + b) % b };
+  });
+
+  defBuiltin('remainder', (args) => {
+    if (args.length !== 2) throw new EvalError('remainder: expected 2 arguments');
+    const a = expectNum(args[0], 'remainder'), b = expectNum(args[1], 'remainder');
+    if (b === 0) throw new EvalError('remainder: division by zero');
+    return { tag: 'number', value: a % b };
+  });
+
+  defBuiltin('quotient', (args) => {
+    if (args.length !== 2) throw new EvalError('quotient: expected 2 arguments');
+    const a = expectNum(args[0], 'quotient'), b = expectNum(args[1], 'quotient');
+    if (b === 0) throw new EvalError('quotient: division by zero');
+    return { tag: 'number', value: Math.trunc(a / b) };
+  });
+
+  defBuiltin('min', (args) => {
+    if (args.length < 1) throw new EvalError('min: expected at least 1 argument');
+    let result = expectNum(args[0], 'min');
+    for (let i = 1; i < args.length; i++) {
+      const n = expectNum(args[i], 'min');
+      if (n < result) result = n;
+    }
+    return { tag: 'number', value: result };
+  });
+
+  defBuiltin('max', (args) => {
+    if (args.length < 1) throw new EvalError('max: expected at least 1 argument');
+    let result = expectNum(args[0], 'max');
+    for (let i = 1; i < args.length; i++) {
+      const n = expectNum(args[i], 'max');
+      if (n > result) result = n;
+    }
+    return { tag: 'number', value: result };
+  });
+
+  defBuiltin('expt', (args) => {
+    if (args.length !== 2) throw new EvalError('expt: expected 2 arguments');
+    const base = expectNum(args[0], 'expt'), exp = expectNum(args[1], 'expt');
+    return { tag: 'number', value: Math.pow(base, exp) };
+  });
+
+  defBuiltin('zero?', (args) => {
+    if (args.length !== 1) throw new EvalError('zero?: expected 1 argument');
+    return { tag: 'boolean', value: expectNum(args[0], 'zero?') === 0 };
+  });
+
+  defBuiltin('positive?', (args) => {
+    if (args.length !== 1) throw new EvalError('positive?: expected 1 argument');
+    return { tag: 'boolean', value: expectNum(args[0], 'positive?') > 0 };
+  });
+
+  defBuiltin('negative?', (args) => {
+    if (args.length !== 1) throw new EvalError('negative?: expected 1 argument');
+    return { tag: 'boolean', value: expectNum(args[0], 'negative?') < 0 };
+  });
+
+  defBuiltin('odd?', (args) => {
+    if (args.length !== 1) throw new EvalError('odd?: expected 1 argument');
+    return { tag: 'boolean', value: Math.abs(expectNum(args[0], 'odd?')) % 2 === 1 };
+  });
+
+  defBuiltin('even?', (args) => {
+    if (args.length !== 1) throw new EvalError('even?: expected 1 argument');
+    return { tag: 'boolean', value: expectNum(args[0], 'even?') % 2 === 0 };
+  });
+
+  // List utilities
+  defBuiltin('list?', (args) => {
+    if (args.length !== 1) throw new EvalError('list?: expected 1 argument');
+    let cur = args[0];
+    while (cur.tag === 'pair') cur = cur.cdr;
+    return { tag: 'boolean', value: cur.tag === 'nil' };
+  });
+
+  defBuiltin('list-ref', (args) => {
+    if (args.length !== 2) throw new EvalError('list-ref: expected 2 arguments');
+    let cur = args[0];
+    let idx = expectNum(args[1], 'list-ref');
+    while (idx > 0 && cur.tag === 'pair') { cur = cur.cdr; idx--; }
+    if (cur.tag !== 'pair') throw new EvalError('list-ref: index out of range');
+    return cur.car;
+  });
+
+  defBuiltin('list-tail', (args) => {
+    if (args.length !== 2) throw new EvalError('list-tail: expected 2 arguments');
+    let cur = args[0];
+    let idx = expectNum(args[1], 'list-tail');
+    while (idx > 0) {
+      if (cur.tag !== 'pair') throw new EvalError('list-tail: index out of range');
+      cur = cur.cdr;
+      idx--;
+    }
+    return cur;
+  });
+
+  defBuiltin('assoc', (args) => {
+    if (args.length !== 2) throw new EvalError('assoc: expected 2 arguments');
+    const key = args[0];
+    let alist = args[1];
+    while (alist.tag === 'pair') {
+      const entry = alist.car;
+      if (entry.tag === 'pair' && schemeEqual(entry.car, key)) return entry;
+      alist = alist.cdr;
+    }
+    return { tag: 'boolean', value: false };
+  });
+
+  // Map (supports multiple lists)
+  defBuiltin('map', (args) => {
+    if (args.length < 2) throw new EvalError('map: expected at least 2 arguments');
+    const func = args[0];
+    const lists = args.slice(1).map(a => pairToArray(a));
+    const len = lists[0].length;
+    const result: SchemeVal[] = [];
+    for (let i = 0; i < len; i++) {
+      const callArgs = lists.map(l => l[i]);
+      if (func.tag === 'lambda') {
+        const callEnv = new Env(func.env);
+        for (let j = 0; j < func.params.length; j++) {
+          callEnv.define(func.params[j], callArgs[j]);
+        }
+        if (func.rest) {
+          callEnv.define(func.rest, makeList(callArgs.slice(func.params.length)));
+        }
+        let res: SchemeVal = { tag: 'void' };
+        for (const bodyExpr of func.body) res = evalExpr(bodyExpr, callEnv);
+        result.push(res);
+      } else if (func.tag === 'builtin') {
+        result.push(func.fn(callArgs));
+      } else {
+        throw new EvalError('map: not a procedure');
+      }
+    }
+    return makeList(result);
+  });
+
+  // Character utilities
+  defBuiltin('char=?', (args) => {
+    if (args.length !== 2) throw new EvalError('char=?: expected 2 arguments');
+    if (args[0].tag !== 'char' || args[1].tag !== 'char') throw new EvalError('char=?: expected chars');
+    return { tag: 'boolean', value: args[0].value === args[1].value };
+  });
+
+  defBuiltin('char<?', (args) => {
+    if (args.length !== 2) throw new EvalError('char<?: expected 2 arguments');
+    if (args[0].tag !== 'char' || args[1].tag !== 'char') throw new EvalError('char<?: expected chars');
+    return { tag: 'boolean', value: args[0].value < args[1].value };
+  });
+
+  defBuiltin('char-alphabetic?', (args) => {
+    if (args.length !== 1 || args[0].tag !== 'char') throw new EvalError('char-alphabetic?: expected 1 char');
+    return { tag: 'boolean', value: /^[a-zA-Z]$/.test(args[0].value) };
+  });
+
+  defBuiltin('char-numeric?', (args) => {
+    if (args.length !== 1 || args[0].tag !== 'char') throw new EvalError('char-numeric?: expected 1 char');
+    return { tag: 'boolean', value: /^[0-9]$/.test(args[0].value) };
+  });
+
+  defBuiltin('char-upcase', (args) => {
+    if (args.length !== 1 || args[0].tag !== 'char') throw new EvalError('char-upcase: expected 1 char');
+    return { tag: 'char', value: args[0].value.toUpperCase() };
+  });
+
+  defBuiltin('char-downcase', (args) => {
+    if (args.length !== 1 || args[0].tag !== 'char') throw new EvalError('char-downcase: expected 1 char');
+    return { tag: 'char', value: args[0].value.toLowerCase() };
+  });
+
+  // String comparison/case utilities
+  defBuiltin('string=?', (args) => {
+    if (args.length !== 2) throw new EvalError('string=?: expected 2 arguments');
+    if (args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError('string=?: expected strings');
+    return { tag: 'boolean', value: args[0].value === args[1].value };
+  });
+
+  defBuiltin('string<?', (args) => {
+    if (args.length !== 2) throw new EvalError('string<?: expected 2 arguments');
+    if (args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError('string<?: expected strings');
+    return { tag: 'boolean', value: args[0].value < args[1].value };
+  });
+
+  defBuiltin('string-ci=?', (args) => {
+    if (args.length !== 2) throw new EvalError('string-ci=?: expected 2 arguments');
+    if (args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError('string-ci=?: expected strings');
+    return { tag: 'boolean', value: args[0].value.toLowerCase() === args[1].value.toLowerCase() };
+  });
+
+  defBuiltin('string-upcase', (args) => {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string-upcase: expected 1 string');
+    return { tag: 'string', value: args[0].value.toUpperCase() };
+  });
+
+  defBuiltin('string-downcase', (args) => {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string-downcase: expected 1 string');
+    return { tag: 'string', value: args[0].value.toLowerCase() };
+  });
+
   defBuiltin('apply', (args) => {
     if (args.length < 2) throw new EvalError('apply: expected at least 2 arguments');
     const func = args[0];
