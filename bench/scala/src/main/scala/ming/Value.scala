@@ -2,28 +2,6 @@ package ming
 
 import scala.annotation.tailrec
 
-private[ming] enum Expr:
-
-  case IntAtom(value: BigInt, pos: SourcePos)
-  case RationalAtom(numerator: BigInt, denominator: BigInt, pos: SourcePos)
-  case InexactAtom(value: Double, pos: SourcePos)
-  case BoolAtom(value: Boolean, pos: SourcePos)
-  case StringAtom(value: String, pos: SourcePos)
-  case CharAtom(value: Char, pos: SourcePos)
-  case Symbol(name: String, pos: SourcePos)
-  case ListExpr(items: List[Expr], pos: SourcePos)
-
-final private[ming] case class ProcedureClause(
-  params: List[String],
-  restParam: Option[String],
-  body: List[Expr]
-):
-
-  def matchesArity(argCount: Int): Boolean =
-    restParam match
-      case None    => params.length == argCount
-      case Some(_) => argCount >= params.length
-
 private[ming] enum Value:
 
   case IntVal(value: BigInt)
@@ -49,13 +27,7 @@ private[ming] enum Value:
 
   def typeName: String =
     this match
-      case Value.IntVal(_) =>
-        "number"
-
-      case Value.RationalVal(_, _) =>
-        "number"
-
-      case Value.InexactVal(_) =>
+      case Value.IntVal(_) | Value.RationalVal(_, _) | Value.InexactVal(_) =>
         "number"
 
       case Value.BoolVal(_) =>
@@ -79,13 +51,7 @@ private[ming] enum Value:
       case Value.RecordVal(_, _) =>
         "record"
 
-      case Value.Closure(_, _, _, _) =>
-        "procedure"
-
-      case Value.CaseClosure(_, _) =>
-        "procedure"
-
-      case Value.Builtin(_, _) =>
+      case Value.Closure(_, _, _, _) | Value.CaseClosure(_, _) | Value.Builtin(_, _) =>
         "procedure"
 
       case Value.VoidVal =>
@@ -103,10 +69,11 @@ private[ming] object Value:
 
   def isCallable(value: Value): Boolean =
     value match
-      case Value.Closure(_, _, _, _) => true
-      case Value.CaseClosure(_, _)   => true
-      case Value.Builtin(_, _)       => true
-      case _                         => false
+      case Value.Closure(_, _, _, _) | Value.CaseClosure(_, _) | Value.Builtin(_, _) =>
+        true
+
+      case _ =>
+        false
 
   def isProperList(value: Value): Boolean =
     @tailrec
@@ -128,9 +95,6 @@ private[ming] object Value:
       case _ if isNumberValue(left) && isNumberValue(right) =>
         equalNumbers(left, right)
 
-      case (Value.IntVal(leftValue), Value.IntVal(rightValue)) =>
-        leftValue == rightValue
-
       case (Value.BoolVal(leftValue), Value.BoolVal(rightValue)) =>
         leftValue == rightValue
 
@@ -147,7 +111,7 @@ private[ming] object Value:
         leftValue eq rightValue
 
       case _ =>
-        left.asInstanceOf[AnyRef] eq right.asInstanceOf[AnyRef]
+        left eq right
 
   def equal(left: Value, right: Value): Boolean =
     (left, right) match
@@ -216,10 +180,7 @@ private[ming] object Value:
       case Value.RecordVal(recordType, _) =>
         s"#<record:${recordType.displayName}>"
 
-      case Value.Closure(_, _, _, _) =>
-        "#<procedure>"
-
-      case Value.CaseClosure(_, _) =>
+      case Value.Closure(_, _, _, _) | Value.CaseClosure(_, _) =>
         "#<procedure>"
 
       case Value.Builtin(name, _) =>
@@ -309,7 +270,3 @@ private[ming] object Value:
 
       case other =>
         builder.append(renderValue(other, displayMode))
-
-final private[ming] case class SourcePos(line: Int, col: Int):
-
-  override def toString: String = s"$line:$col"
