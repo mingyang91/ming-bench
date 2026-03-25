@@ -100,7 +100,7 @@ function evaluateProgram(input) {
     if (expressions.length === 0) {
         throw new EvalError('empty input', START_POSITION);
     }
-    const context = { output: [] };
+    const context = { output: [], dynamicWindStack: [] };
     const env = createGlobalEnv(context);
     const result = runEvalStep(evaluateSequenceCps(expressions, env, completeEval));
     return { result, output: context.output.join('') };
@@ -283,8 +283,52 @@ function runEvalStep(step) {
     }
     return current.value;
 }
-function continuationValue(resume) {
-    return { type: 'continuation', resume };
+function continuationValue(context, windStack, resume) {
+    return { type: 'continuation', context, windStack, resume };
+}
+function sharedDynamicWindDepth(left, right) {
+    let index = 0;
+    while (index < left.length && index < right.length && left[index] === right[index]) {
+        index += 1;
+    }
+    return index;
+}
+function transitionDynamicWind(context, targetStack, callPosition, continuation) {
+    return suspendStep(() => {
+        const currentStack = context.dynamicWindStack;
+        const sharedDepth = sharedDynamicWindDepth(currentStack, targetStack);
+        return unwindDynamicWindFrames(context, currentStack, targetStack, sharedDepth, callPosition, continuation);
+    });
+}
+function unwindDynamicWindFrames(context, currentStack, targetStack, sharedDepth, callPosition, continuation) {
+    return suspendStep(() => {
+        if (currentStack.length <= sharedDepth) {
+            return rewindDynamicWindFrames(context, targetStack, sharedDepth, callPosition, continuation);
+        }
+        const frameIndex = currentStack.length - 1;
+        const frame = currentStack[frameIndex];
+        const nextStack = currentStack.slice(0, frameIndex);
+        context.dynamicWindStack = nextStack;
+        return applyProcedureCps(frame.outThunk, [], callPosition, () => unwindDynamicWindFrames(context, nextStack, targetStack, sharedDepth, callPosition, continuation));
+    });
+}
+function rewindDynamicWindFrames(context, targetStack, index, callPosition, continuation) {
+    return suspendStep(() => {
+        if (index >= targetStack.length) {
+            context.dynamicWindStack = targetStack;
+            return continuation();
+        }
+        const frame = targetStack[index];
+        const currentStack = targetStack.slice(0, index);
+        context.dynamicWindStack = currentStack;
+        return applyProcedureCps(frame.inThunk, [], callPosition, () => {
+            context.dynamicWindStack = targetStack.slice(0, index + 1);
+            return rewindDynamicWindFrames(context, targetStack, index + 1, callPosition, continuation);
+        });
+    });
+}
+function invokeContinuationValue(value, argument, callPosition) {
+    return transitionDynamicWind(value.context, value.windStack, callPosition, () => value.resume(argument));
 }
 function evaluateCps(expr, env, continuation) {
     return suspendStep(() => {
@@ -686,7 +730,7 @@ function applyProcedureCps(value, args, callPosition, continuation) {
                 }
                 case 'continuation':
                     requireArgCount('continuation', args.length, 1, callPosition);
-                    return value.resume(args[0].value);
+                    return invokeContinuationValue(value, args[0].value, callPosition);
                 default:
                     throw new EvalError('attempted to call a non-procedure', callPosition);
             }
@@ -1883,10 +1927,21 @@ function createGlobalEnv(context) {
         requireArgCount(name, args.length, 1, callPosition);
         return applyProcedureCps(args[0].value, [
             {
-                value: continuationValue((value) => continueWith(continuation, value)),
+                value: continuationValue(context, [...context.dynamicWindStack], (value) => continueWith(continuation, value)),
                 position: callPosition,
             },
         ], callPosition, continuation);
+    });
+    const dynamicWindBuiltin = builtin('dynamic-wind', (_args, callPosition) => {
+        throw new EvalError('dynamic-wind: internal error', callPosition);
+    }, (args, callPosition, continuation) => {
+        requireArgCount('dynamic-wind', args.length, 3, callPosition);
+        const baseStack = [...context.dynamicWindStack];
+        const frame = {
+            inThunk: args[0].value,
+            outThunk: args[2].value,
+        };
+        return transitionDynamicWind(context, [...baseStack, frame], callPosition, () => applyProcedureCps(args[1].value, [], callPosition, (bodyValue) => transitionDynamicWind(context, baseStack, callPosition, () => continueWith(continuation, bodyValue))));
     });
     env.define('+', builtin('+', (args, callPosition) => numberValue(addNumbers(evaluateNumberArgs('+', args), callPosition), callPosition)));
     env.define('*', builtin('*', (args, callPosition) => numberValue(multiplyNumbers(evaluateNumberArgs('*', args), callPosition), callPosition)));
@@ -2156,6 +2211,7 @@ function createGlobalEnv(context) {
     }));
     env.define('call/cc', callWithCurrentContinuationBuiltin('call/cc'));
     env.define('call-with-current-continuation', callWithCurrentContinuationBuiltin('call-with-current-continuation'));
+    env.define('dynamic-wind', dynamicWindBuiltin);
     env.define('map', builtin('map', (args, callPosition) => {
         requireArgCountAtLeast('map', args.length, 2, callPosition);
         const procedure = args[0].value;
