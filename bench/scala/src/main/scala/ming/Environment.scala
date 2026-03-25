@@ -28,6 +28,11 @@ final private[ming] class Env private (
       .map(_.get)
       .getOrElse(throw EvalError.at(pos, s"unbound variable: $name"))
 
+  def set(name: String, value: Value, pos: SourcePos): Unit =
+    resolve(name)
+      .map(_.set(value))
+      .getOrElse(throw EvalError.at(pos, s"unbound variable: $name"))
+
   def extend(names: List[String], values: List[Value]): Env =
     val child = Env.child(this)
     names.zip(values).foreach { case (name, value) =>

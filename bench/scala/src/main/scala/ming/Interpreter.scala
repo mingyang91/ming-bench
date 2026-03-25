@@ -36,6 +36,9 @@ private[ming] object Interpreter:
       case Expr.ListExpr(Expr.Symbol("define", _) :: args, pos) =>
         evalDefine(args, env, pos)
 
+      case Expr.ListExpr(Expr.Symbol("set!", _) :: args, pos) =>
+        evalSet(args, env, pos)
+
       case Expr.ListExpr(Expr.Symbol("if", _) :: args, pos) =>
         evalIf(args, env, pos)
 
@@ -80,6 +83,15 @@ private[ming] object Interpreter:
 
       case _ =>
         throw EvalError.at(pos, "define expects a name and expression")
+
+  private def evalSet(args: List[Expr], env: Env, pos: SourcePos): Value =
+    args match
+      case Expr.Symbol(name, _) :: valueExpr :: Nil =>
+        env.set(name, eval(valueExpr, env), pos)
+        Value.VoidVal
+
+      case _ =>
+        throw EvalError.at(pos, "set! expects a name and expression")
 
   private def evalIf(args: List[Expr], env: Env, pos: SourcePos): Value =
     args match
