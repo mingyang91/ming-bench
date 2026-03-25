@@ -20,7 +20,15 @@ public sealed interface SchemeValue {
     record ListVal(List<SchemeValue> elements) implements SchemeValue {}
     record VoidVal() implements SchemeValue {}
     record LambdaVal(List<String> params, String restParam, List<SchemeValue> body, Environment env) implements SchemeValue {}
-    record PairVal(SchemeValue car, SchemeValue cdr) implements SchemeValue {}
+    final class PairVal implements SchemeValue {
+        private SchemeValue car;
+        private SchemeValue cdr;
+        public PairVal(SchemeValue car, SchemeValue cdr) { this.car = car; this.cdr = cdr; }
+        public SchemeValue car() { return car; }
+        public SchemeValue cdr() { return cdr; }
+        public void setCar(SchemeValue v) { this.car = v; }
+        public void setCdr(SchemeValue v) { this.cdr = v; }
+    }
     record CharVal(char value) implements SchemeValue {}
     record DoubleVal(double value) implements SchemeValue {}
     record RationalVal(long num, long den) implements SchemeValue {} // always simplified, den > 0
@@ -44,6 +52,10 @@ public sealed interface SchemeValue {
     }
 
     default String display() {
+        return displaySafe(java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
+    }
+
+    default String displaySafe(java.util.Set<Object> visited) {
         return switch (this) {
             case IntVal v -> Long.toString(v.value());
             case BoolVal v -> v.value() ? "#t" : "#f";
@@ -53,25 +65,29 @@ public sealed interface SchemeValue {
                 var sb = new StringBuilder("(");
                 for (int i = 0; i < v.elements().size(); i++) {
                     if (i > 0) sb.append(" ");
-                    sb.append(v.elements().get(i).display());
+                    sb.append(v.elements().get(i).displaySafe(visited));
                 }
                 sb.append(")");
                 yield sb.toString();
             }
             case PairVal v -> {
+                if (!visited.add(v)) yield "...";
                 var sb = new StringBuilder("(");
-                sb.append(v.car().display());
+                sb.append(v.car().displaySafe(visited));
                 SchemeValue rest = v.cdr();
                 while (rest instanceof PairVal p) {
+                    if (!visited.add(p)) { sb.append(" ..."); break; }
                     sb.append(" ");
-                    sb.append(p.car().display());
+                    sb.append(p.car().displaySafe(visited));
                     rest = p.cdr();
                 }
-                if (rest instanceof ListVal l && l.elements().isEmpty()) {
+                if (rest instanceof PairVal) {
+                    // cycle detected above, already appended "..."
+                } else if (rest instanceof ListVal l && l.elements().isEmpty()) {
                     // proper list, done
                 } else {
                     sb.append(" . ");
-                    sb.append(rest.display());
+                    sb.append(rest.displaySafe(visited));
                 }
                 sb.append(")");
                 yield sb.toString();
@@ -90,7 +106,7 @@ public sealed interface SchemeValue {
                 var sb = new StringBuilder("#(");
                 for (int i = 0; i < v.length(); i++) {
                     if (i > 0) sb.append(" ");
-                    sb.append(v.ref(i).display());
+                    sb.append(v.ref(i).displaySafe(visited));
                 }
                 sb.append(")");
                 yield sb.toString();
@@ -102,7 +118,13 @@ public sealed interface SchemeValue {
     default String displayOutput() {
         if (this instanceof StringVal s) return s.value();
         if (this instanceof CharVal c) return String.valueOf(c.value());
-        return display();
+        return displayOutputSafe(java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
+    }
+
+    default String displayOutputSafe(java.util.Set<Object> visited) {
+        if (this instanceof StringVal s) return s.value();
+        if (this instanceof CharVal c) return String.valueOf(c.value());
+        return displaySafe(visited);
     }
 
     default boolean isTruthy() {

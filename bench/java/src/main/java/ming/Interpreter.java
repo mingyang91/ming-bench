@@ -15,9 +15,9 @@ public class Interpreter {
     private final StringBuilder outputBuffer = new StringBuilder();
     private int gensymCounter = 0;
     private static final Set<String> SPECIAL_FORMS = Set.of(
-        "define", "if", "quote", "lambda", "and", "or", "let", "begin",
+        "define", "if", "quote", "lambda", "and", "or", "let", "let*", "begin",
         "cond", "set!", "define-syntax", "syntax-rules", "define-record-type",
-        "letrec", "letrec*", "case", "do"
+        "letrec", "letrec*", "case", "do", "when", "unless"
     );
 
     public Interpreter() {
@@ -81,6 +81,61 @@ public class Interpreter {
             if (args.length != 1) throw new EvalError("cdr: expected 1 argument");
             if (args[0] instanceof SchemeValue.PairVal p) return p.cdr();
             throw new EvalError("cdr: not a pair: " + args[0].display());
+        }));
+        globals.define("caar", new SchemeValue.BuiltinVal("caar", args -> {
+            if (args.length != 1) throw new EvalError("caar: expected 1 argument");
+            if (args[0] instanceof SchemeValue.PairVal p && p.car() instanceof SchemeValue.PairVal pp) return pp.car();
+            throw new EvalError("caar: not a pair");
+        }));
+        globals.define("cadr", new SchemeValue.BuiltinVal("cadr", args -> {
+            if (args.length != 1) throw new EvalError("cadr: expected 1 argument");
+            if (args[0] instanceof SchemeValue.PairVal p && p.cdr() instanceof SchemeValue.PairVal pp) return pp.car();
+            throw new EvalError("cadr: not a pair");
+        }));
+        globals.define("cdar", new SchemeValue.BuiltinVal("cdar", args -> {
+            if (args.length != 1) throw new EvalError("cdar: expected 1 argument");
+            if (args[0] instanceof SchemeValue.PairVal p && p.car() instanceof SchemeValue.PairVal pp) return pp.cdr();
+            throw new EvalError("cdar: not a pair");
+        }));
+        globals.define("cddr", new SchemeValue.BuiltinVal("cddr", args -> {
+            if (args.length != 1) throw new EvalError("cddr: expected 1 argument");
+            if (args[0] instanceof SchemeValue.PairVal p && p.cdr() instanceof SchemeValue.PairVal pp) return pp.cdr();
+            throw new EvalError("cddr: not a pair");
+        }));
+        globals.define("caaar", new SchemeValue.BuiltinVal("caaar", args -> {
+            if (args.length != 1) throw new EvalError("caaar: expected 1 argument");
+            if (args[0] instanceof SchemeValue.PairVal p && p.car() instanceof SchemeValue.PairVal p2 && p2.car() instanceof SchemeValue.PairVal p3) return p3.car();
+            throw new EvalError("caaar: not a pair");
+        }));
+        globals.define("caddar", new SchemeValue.BuiltinVal("caddar", args -> {
+            if (args.length != 1) throw new EvalError("caddar: expected 1 argument");
+            if (args[0] instanceof SchemeValue.PairVal p && p.car() instanceof SchemeValue.PairVal p2 && p2.cdr() instanceof SchemeValue.PairVal p3 && p3.cdr() instanceof SchemeValue.PairVal p4) return p4.car();
+            throw new EvalError("caddar: not a pair");
+        }));
+        globals.define("caddr", new SchemeValue.BuiltinVal("caddr", args -> {
+            if (args.length != 1) throw new EvalError("caddr: expected 1 argument");
+            if (args[0] instanceof SchemeValue.PairVal p && p.cdr() instanceof SchemeValue.PairVal p2 && p2.cdr() instanceof SchemeValue.PairVal p3) return p3.car();
+            throw new EvalError("caddr: not a pair");
+        }));
+        globals.define("cdddr", new SchemeValue.BuiltinVal("cdddr", args -> {
+            if (args.length != 1) throw new EvalError("cdddr: expected 1 argument");
+            if (args[0] instanceof SchemeValue.PairVal p && p.cdr() instanceof SchemeValue.PairVal p2 && p2.cdr() instanceof SchemeValue.PairVal p3) return p3.cdr();
+            throw new EvalError("cdddr: not a pair");
+        }));
+        globals.define("cadddr", new SchemeValue.BuiltinVal("cadddr", args -> {
+            if (args.length != 1) throw new EvalError("cadddr: expected 1 argument");
+            if (args[0] instanceof SchemeValue.PairVal p && p.cdr() instanceof SchemeValue.PairVal p2 && p2.cdr() instanceof SchemeValue.PairVal p3 && p3.cdr() instanceof SchemeValue.PairVal p4) return p4.car();
+            throw new EvalError("cadddr: not a pair");
+        }));
+        globals.define("reverse", new SchemeValue.BuiltinVal("reverse", args -> {
+            if (args.length != 1) throw new EvalError("reverse: expected 1 argument");
+            SchemeValue result = NIL;
+            SchemeValue cur = args[0];
+            while (cur instanceof SchemeValue.PairVal p) {
+                result = new SchemeValue.PairVal(p.car(), result);
+                cur = p.cdr();
+            }
+            return result;
         }));
         globals.define("null?", new SchemeValue.BuiltinVal("null?", args -> {
             if (args.length != 1) throw new EvalError("null?: expected 1 argument");
@@ -225,6 +280,23 @@ public class Interpreter {
         }));
 
         // L06 builtins
+        globals.define("make-string", new SchemeValue.BuiltinVal("make-string", args -> {
+            if (args.length < 1 || args.length > 2) throw new EvalError("make-string: expected 1-2 arguments");
+            if (!(args[0] instanceof SchemeValue.IntVal iv)) throw new EvalError("make-string: expected integer");
+            int len = (int) iv.value();
+            char c = args.length == 2 && args[1] instanceof SchemeValue.CharVal cv ? cv.value() : '\0';
+            char[] chars = new char[len];
+            java.util.Arrays.fill(chars, c);
+            return new SchemeValue.StringVal(new String(chars), true);
+        }));
+        globals.define("string", new SchemeValue.BuiltinVal("string", args -> {
+            var sb = new StringBuilder();
+            for (var arg : args) {
+                if (!(arg instanceof SchemeValue.CharVal c)) throw new EvalError("string: expected char");
+                sb.append(c.value());
+            }
+            return new SchemeValue.StringVal(sb.toString(), true);
+        }));
         globals.define("string-copy", new SchemeValue.BuiltinVal("string-copy", args -> {
             if (args.length != 1) throw new EvalError("string-copy: expected 1 argument");
             if (!(args[0] instanceof SchemeValue.StringVal s))
@@ -391,11 +463,20 @@ public class Interpreter {
         }));
         globals.define("list?", new SchemeValue.BuiltinVal("list?", args -> {
             if (args.length != 1) throw new EvalError("list?: expected 1 argument");
-            SchemeValue cur = args[0];
-            while (cur instanceof SchemeValue.PairVal p) {
-                cur = p.cdr();
+            // Tortoise-and-hare cycle detection
+            SchemeValue slow = args[0];
+            SchemeValue fast = args[0];
+            while (fast instanceof SchemeValue.PairVal fp) {
+                fast = fp.cdr();
+                if (fast instanceof SchemeValue.PairVal fp2) {
+                    fast = fp2.cdr();
+                } else {
+                    return new SchemeValue.BoolVal(fast instanceof SchemeValue.ListVal l && l.elements().isEmpty());
+                }
+                slow = ((SchemeValue.PairVal) slow).cdr();
+                if (slow == fast) return new SchemeValue.BoolVal(false); // cycle
             }
-            return new SchemeValue.BoolVal(cur instanceof SchemeValue.ListVal l && l.elements().isEmpty());
+            return new SchemeValue.BoolVal(fast instanceof SchemeValue.ListVal l && l.elements().isEmpty());
         }));
         globals.define("eq?", new SchemeValue.BuiltinVal("eq?", args -> {
             if (args.length != 2) throw new EvalError("eq?: expected 2 arguments");
@@ -475,6 +556,170 @@ public class Interpreter {
                 alist = p.cdr();
             }
             return new SchemeValue.BoolVal(false);
+        }));
+        globals.define("assq", new SchemeValue.BuiltinVal("assq", args -> {
+            if (args.length != 2) throw new EvalError("assq: expected 2 arguments");
+            SchemeValue key = args[0];
+            SchemeValue alist = args[1];
+            while (alist instanceof SchemeValue.PairVal p) {
+                if (p.car() instanceof SchemeValue.PairVal entry) {
+                    if (schemeEq(entry.car(), key)) return entry;
+                }
+                alist = p.cdr();
+            }
+            return new SchemeValue.BoolVal(false);
+        }));
+        globals.define("assv", new SchemeValue.BuiltinVal("assv", args -> {
+            if (args.length != 2) throw new EvalError("assv: expected 2 arguments");
+            SchemeValue key = args[0];
+            SchemeValue alist = args[1];
+            while (alist instanceof SchemeValue.PairVal p) {
+                if (p.car() instanceof SchemeValue.PairVal entry) {
+                    if (schemeEq(entry.car(), key)) return entry;
+                }
+                alist = p.cdr();
+            }
+            return new SchemeValue.BoolVal(false);
+        }));
+        globals.define("memv", new SchemeValue.BuiltinVal("memv", args -> {
+            if (args.length != 2) throw new EvalError("memv: expected 2 arguments");
+            SchemeValue key = args[0];
+            SchemeValue lst = args[1];
+            while (lst instanceof SchemeValue.PairVal p) {
+                if (schemeEq(p.car(), key)) return lst;
+                lst = p.cdr();
+            }
+            return new SchemeValue.BoolVal(false);
+        }));
+        globals.define("memq", new SchemeValue.BuiltinVal("memq", args -> {
+            if (args.length != 2) throw new EvalError("memq: expected 2 arguments");
+            SchemeValue key = args[0];
+            SchemeValue lst = args[1];
+            while (lst instanceof SchemeValue.PairVal p) {
+                if (schemeEq(p.car(), key)) return lst;
+                lst = p.cdr();
+            }
+            return new SchemeValue.BoolVal(false);
+        }));
+        globals.define("member", new SchemeValue.BuiltinVal("member", args -> {
+            if (args.length != 2) throw new EvalError("member: expected 2 arguments");
+            SchemeValue key = args[0];
+            SchemeValue lst = args[1];
+            while (lst instanceof SchemeValue.PairVal p) {
+                if (schemeEqual(p.car(), key)) return lst;
+                lst = p.cdr();
+            }
+            return new SchemeValue.BoolVal(false);
+        }));
+        globals.define("truncate", new SchemeValue.BuiltinVal("truncate", args -> {
+            if (args.length != 1) throw new EvalError("truncate: expected 1 argument");
+            if (args[0] instanceof SchemeValue.IntVal) return args[0];
+            if (args[0] instanceof SchemeValue.DoubleVal d)
+                return new SchemeValue.DoubleVal((double)(long)d.value());
+            if (args[0] instanceof SchemeValue.RationalVal r)
+                return new SchemeValue.IntVal(r.num() / r.den());
+            throw new EvalError("truncate: expected number");
+        }));
+        globals.define("floor", new SchemeValue.BuiltinVal("floor", args -> {
+            if (args.length != 1) throw new EvalError("floor: expected 1 argument");
+            if (args[0] instanceof SchemeValue.IntVal) return args[0];
+            if (args[0] instanceof SchemeValue.DoubleVal d)
+                return new SchemeValue.DoubleVal(Math.floor(d.value()));
+            if (args[0] instanceof SchemeValue.RationalVal r) {
+                long q = r.num() / r.den();
+                if (r.num() < 0 && r.num() % r.den() != 0) q--;
+                return new SchemeValue.IntVal(q);
+            }
+            throw new EvalError("floor: expected number");
+        }));
+        globals.define("ceiling", new SchemeValue.BuiltinVal("ceiling", args -> {
+            if (args.length != 1) throw new EvalError("ceiling: expected 1 argument");
+            if (args[0] instanceof SchemeValue.IntVal) return args[0];
+            if (args[0] instanceof SchemeValue.DoubleVal d)
+                return new SchemeValue.DoubleVal(Math.ceil(d.value()));
+            if (args[0] instanceof SchemeValue.RationalVal r) {
+                long q = r.num() / r.den();
+                if (r.num() > 0 && r.num() % r.den() != 0) q++;
+                return new SchemeValue.IntVal(q);
+            }
+            throw new EvalError("ceiling: expected number");
+        }));
+        globals.define("round", new SchemeValue.BuiltinVal("round", args -> {
+            if (args.length != 1) throw new EvalError("round: expected 1 argument");
+            if (args[0] instanceof SchemeValue.IntVal) return args[0];
+            if (args[0] instanceof SchemeValue.DoubleVal d)
+                return new SchemeValue.DoubleVal(Math.rint(d.value()));
+            throw new EvalError("round: expected number");
+        }));
+        globals.define("sqrt", new SchemeValue.BuiltinVal("sqrt", args -> {
+            if (args.length != 1) throw new EvalError("sqrt: expected 1 argument");
+            return new SchemeValue.DoubleVal(Math.sqrt(toDouble(args[0])));
+        }));
+        globals.define("gcd", new SchemeValue.BuiltinVal("gcd", args -> {
+            if (args.length == 0) return new SchemeValue.IntVal(0);
+            long result = asLong(args[0]);
+            if (result < 0) result = -result;
+            for (int i = 1; i < args.length; i++) {
+                long b = asLong(args[i]);
+                if (b < 0) b = -b;
+                result = gcd(result, b);
+            }
+            return new SchemeValue.IntVal(result);
+        }));
+        globals.define("lcm", new SchemeValue.BuiltinVal("lcm", args -> {
+            if (args.length == 0) return new SchemeValue.IntVal(1);
+            long result = asLong(args[0]);
+            if (result < 0) result = -result;
+            for (int i = 1; i < args.length; i++) {
+                long b = asLong(args[i]);
+                if (b < 0) b = -b;
+                if (result == 0 || b == 0) { result = 0; } else {
+                    result = result / gcd(result, b) * b;
+                }
+            }
+            return new SchemeValue.IntVal(result);
+        }));
+        globals.define("set-car!", new SchemeValue.BuiltinVal("set-car!", args -> {
+            if (args.length != 2) throw new EvalError("set-car!: expected 2 arguments");
+            if (!(args[0] instanceof SchemeValue.PairVal p))
+                throw new EvalError("set-car!: not a pair");
+            p.setCar(args[1]);
+            return new SchemeValue.VoidVal();
+        }));
+        globals.define("set-cdr!", new SchemeValue.BuiltinVal("set-cdr!", args -> {
+            if (args.length != 2) throw new EvalError("set-cdr!: expected 2 arguments");
+            if (!(args[0] instanceof SchemeValue.PairVal p))
+                throw new EvalError("set-cdr!: not a pair");
+            p.setCdr(args[1]);
+            return new SchemeValue.VoidVal();
+        }));
+        globals.define("for-each", new SchemeValue.BuiltinVal("for-each", args -> {
+            if (args.length < 2) throw new EvalError("for-each: expected at least 2 arguments");
+            var proc = args[0];
+            if (args.length == 2) {
+                SchemeValue cur = args[1];
+                while (cur instanceof SchemeValue.PairVal p) {
+                    callProc(proc, new SchemeValue[]{p.car()});
+                    cur = p.cdr();
+                }
+            } else {
+                SchemeValue[] lists = new SchemeValue[args.length - 1];
+                for (int i = 0; i < lists.length; i++) lists[i] = args[i + 1];
+                while (true) {
+                    boolean allPairs = true;
+                    for (var l : lists) {
+                        if (!(l instanceof SchemeValue.PairVal)) { allPairs = false; break; }
+                    }
+                    if (!allPairs) break;
+                    var callArgs = new SchemeValue[lists.length];
+                    for (int i = 0; i < lists.length; i++) {
+                        callArgs[i] = ((SchemeValue.PairVal) lists[i]).car();
+                        lists[i] = ((SchemeValue.PairVal) lists[i]).cdr();
+                    }
+                    callProc(proc, callArgs);
+                }
+            }
+            return new SchemeValue.VoidVal();
         }));
         globals.define("map", new SchemeValue.BuiltinVal("map", args -> {
             if (args.length < 2) throw new EvalError("map: expected at least 2 arguments");
@@ -561,6 +806,24 @@ public class Interpreter {
             if (!(args[0] instanceof SchemeValue.StringVal a) || !(args[1] instanceof SchemeValue.StringVal b))
                 throw new EvalError("string<?: expected strings");
             return new SchemeValue.BoolVal(a.value().compareTo(b.value()) < 0);
+        }));
+        globals.define("string>?", new SchemeValue.BuiltinVal("string>?", args -> {
+            if (args.length != 2) throw new EvalError("string>?: expected 2 arguments");
+            if (!(args[0] instanceof SchemeValue.StringVal a) || !(args[1] instanceof SchemeValue.StringVal b))
+                throw new EvalError("string>?: expected strings");
+            return new SchemeValue.BoolVal(a.value().compareTo(b.value()) > 0);
+        }));
+        globals.define("string<=?", new SchemeValue.BuiltinVal("string<=?", args -> {
+            if (args.length != 2) throw new EvalError("string<=?: expected 2 arguments");
+            if (!(args[0] instanceof SchemeValue.StringVal a) || !(args[1] instanceof SchemeValue.StringVal b))
+                throw new EvalError("string<=?: expected strings");
+            return new SchemeValue.BoolVal(a.value().compareTo(b.value()) <= 0);
+        }));
+        globals.define("string>=?", new SchemeValue.BuiltinVal("string>=?", args -> {
+            if (args.length != 2) throw new EvalError("string>=?: expected 2 arguments");
+            if (!(args[0] instanceof SchemeValue.StringVal a) || !(args[1] instanceof SchemeValue.StringVal b))
+                throw new EvalError("string>=?: expected strings");
+            return new SchemeValue.BoolVal(a.value().compareTo(b.value()) >= 0);
         }));
         globals.define("string-ci=?", new SchemeValue.BuiltinVal("string-ci=?", args -> {
             if (args.length != 2) throw new EvalError("string-ci=?: expected 2 arguments");
@@ -700,6 +963,9 @@ public class Interpreter {
                 case "and" -> evalAnd(list.elements(), env);
                 case "or" -> evalOr(list.elements(), env);
                 case "let" -> evalLet(list.elements(), env);
+                case "let*" -> evalLetStar(list.elements(), env);
+                case "when" -> evalWhen(list.elements(), env);
+                case "unless" -> evalUnless(list.elements(), env);
                 case "begin" -> evalBegin(list.elements(), env);
                 case "cond" -> evalCond(list.elements(), env);
                 case "set!" -> evalSet(list.elements(), env);
@@ -920,6 +1186,50 @@ public class Interpreter {
             eval(elements.get(i), letEnv);
         }
         return new SchemeValue.TailCall(elements.get(elements.size() - 1), letEnv);
+    }
+
+    private SchemeValue evalLetStar(List<SchemeValue> elements, Environment env) throws EvalError {
+        if (elements.size() < 3) throw new EvalError("let*: bad syntax");
+        var bindings = elements.get(1);
+        if (!(bindings instanceof SchemeValue.ListVal bl))
+            throw new EvalError("let*: expected bindings list");
+        var letEnv = new Environment(env);
+        for (var binding : bl.elements()) {
+            if (!(binding instanceof SchemeValue.ListVal b) || b.elements().size() != 2)
+                throw new EvalError("let*: bad binding");
+            if (!(b.elements().get(0) instanceof SchemeValue.SymbolVal name))
+                throw new EvalError("let*: expected symbol in binding");
+            var val = eval(b.elements().get(1), letEnv);
+            letEnv.define(name.name(), val);
+        }
+        for (int i = 2; i < elements.size() - 1; i++) {
+            eval(elements.get(i), letEnv);
+        }
+        return new SchemeValue.TailCall(elements.get(elements.size() - 1), letEnv);
+    }
+
+    private SchemeValue evalWhen(List<SchemeValue> elements, Environment env) throws EvalError {
+        if (elements.size() < 3) throw new EvalError("when: bad syntax");
+        var test = eval(elements.get(1), env);
+        if (test.isTruthy()) {
+            for (int i = 2; i < elements.size() - 1; i++) {
+                eval(elements.get(i), env);
+            }
+            return new SchemeValue.TailCall(elements.get(elements.size() - 1), env);
+        }
+        return new SchemeValue.VoidVal();
+    }
+
+    private SchemeValue evalUnless(List<SchemeValue> elements, Environment env) throws EvalError {
+        if (elements.size() < 3) throw new EvalError("unless: bad syntax");
+        var test = eval(elements.get(1), env);
+        if (!test.isTruthy()) {
+            for (int i = 2; i < elements.size() - 1; i++) {
+                eval(elements.get(i), env);
+            }
+            return new SchemeValue.TailCall(elements.get(elements.size() - 1), env);
+        }
+        return new SchemeValue.VoidVal();
     }
 
     private SchemeValue evalBegin(List<SchemeValue> elements, Environment env) throws EvalError {
@@ -1694,17 +2004,26 @@ public class Interpreter {
     }
 
     private static boolean schemeEqual(SchemeValue a, SchemeValue b) {
+        return schemeEqualSafe(a, b, java.util.Collections.newSetFromMap(new IdentityHashMap<>()));
+    }
+
+    private static boolean schemeEqualSafe(SchemeValue a, SchemeValue b, Set<Object> visited) {
         if (schemeEq(a, b)) return true;
         if (a instanceof SchemeValue.StringVal sa && b instanceof SchemeValue.StringVal sb)
             return sa.value().equals(sb.value());
-        if (a instanceof SchemeValue.PairVal pa && b instanceof SchemeValue.PairVal pb)
-            return schemeEqual(pa.car(), pb.car()) && schemeEqual(pa.cdr(), pb.cdr());
+        if (a instanceof SchemeValue.PairVal pa && b instanceof SchemeValue.PairVal pb) {
+            // Use a pair-key for visited tracking to avoid treating (a,b) same as (a,c)
+            long key = System.identityHashCode(pa) * 31L + System.identityHashCode(pb);
+            Long boxedKey = key;
+            if (!visited.add(boxedKey)) return true; // assume equal on cycle
+            return schemeEqualSafe(pa.car(), pb.car(), visited) && schemeEqualSafe(pa.cdr(), pb.cdr(), visited);
+        }
         if (a instanceof SchemeValue.ListVal la && b instanceof SchemeValue.ListVal lb)
             return la.elements().isEmpty() && lb.elements().isEmpty();
         if (a instanceof SchemeValue.VectorVal va && b instanceof SchemeValue.VectorVal vb) {
             if (va.length() != vb.length()) return false;
             for (int i = 0; i < va.length(); i++) {
-                if (!schemeEqual(va.ref(i), vb.ref(i))) return false;
+                if (!schemeEqualSafe(va.ref(i), vb.ref(i), visited)) return false;
             }
             return true;
         }
