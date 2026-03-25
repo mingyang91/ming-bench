@@ -436,26 +436,42 @@ type closureProc struct {
 	env    *env
 }
 
+type binding struct {
+	value value
+}
+
 type env struct {
 	parent *env
-	values map[string]value
+	values map[string]*binding
 }
 
 func newEnv(parent *env) *env {
 	return &env{
 		parent: parent,
-		values: map[string]value{},
+		values: map[string]*binding{},
 	}
 }
 
 func (e *env) define(name string, v value) {
-	e.values[name] = v
+	if existing, ok := e.values[name]; ok {
+		existing.value = v
+		return
+	}
+	e.values[name] = &binding{value: v}
 }
 
 func (e *env) lookup(name string) (value, bool) {
+	binding, ok := e.lookupBinding(name)
+	if !ok {
+		return nil, false
+	}
+	return binding.value, true
+}
+
+func (e *env) lookupBinding(name string) (*binding, bool) {
 	for current := e; current != nil; current = current.parent {
-		if v, ok := current.values[name]; ok {
-			return v, true
+		if binding, ok := current.values[name]; ok {
+			return binding, true
 		}
 	}
 	return nil, false
@@ -574,6 +590,8 @@ func (it *interpreter) evalList(list *listExpr, scope *env) (value, error) {
 			return it.evalQuote(list)
 		case "lambda":
 			return it.evalLambda(scope, list)
+		case "set!":
+			return it.evalSet(scope, list)
 		case "begin":
 			return it.evalBegin(scope, list)
 		case "cond":
@@ -646,6 +664,30 @@ func (it *interpreter) evalDefine(scope *env, list *listExpr) (value, error) {
 	default:
 		return nil, newEvalError(ErrSyntax, "define: expected a symbol or function signature", list.elements[1].pos())
 	}
+}
+
+func (it *interpreter) evalSet(scope *env, list *listExpr) (value, error) {
+	if len(list.elements) != 3 {
+		return nil, newEvalError(ErrSyntax, "set!: expected a name and value", list.at)
+	}
+
+	target, ok := list.elements[1].(*symbolExpr)
+	if !ok {
+		return nil, newEvalError(ErrSyntax, "set!: expected variable name", list.elements[1].pos())
+	}
+
+	binding, ok := scope.lookupBinding(target.name)
+	if !ok {
+		return nil, newEvalError(ErrUnboundVariable, fmt.Sprintf("set!: unbound variable: %s", target.name), target.at)
+	}
+
+	result, err := it.eval(list.elements[2], scope)
+	if err != nil {
+		return nil, err
+	}
+
+	binding.value = result
+	return voidValue{}, nil
 }
 
 func (it *interpreter) evalIf(scope *env, list *listExpr) (value, error) {
