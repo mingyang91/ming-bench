@@ -653,10 +653,10 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 			}
 			return handleCallCC(args[0])
 		case *ContinuationVal:
-			if len(args) != 1 {
-				return nil, &EvalError{Message: "continuation: need 1 argument"}
+			if len(args) == 1 {
+				panic(contInvokePanic{cont: f, value: args[0]})
 			}
-			panic(contInvokePanic{cont: f, value: args[0]})
+			panic(contInvokePanic{cont: f, value: &ValuesVal{Vals: args}})
 		default:
 			line, col := e.Elems[0].pos()
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", line, col)}
@@ -3608,10 +3608,10 @@ func applyCallable(f Value, args []Value) (Value, error) {
 	case *CaseLambdaVal:
 		return applyCaseLambda(fn, args)
 	case *ContinuationVal:
-		if len(args) != 1 {
-			return nil, &EvalError{Message: "continuation: need 1 argument"}
+		if len(args) == 1 {
+			panic(contInvokePanic{cont: fn, value: args[0]})
 		}
-		panic(contInvokePanic{cont: fn, value: args[0]})
+		panic(contInvokePanic{cont: fn, value: &ValuesVal{Vals: args}})
 	case *CallCCVal:
 		if len(args) != 1 {
 			return nil, &EvalError{Message: "call/cc: need 1 argument"}

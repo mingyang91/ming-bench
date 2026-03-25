@@ -41,6 +41,12 @@ var specialForms = map[string]bool{
 	"define": true, "if": true, "lambda": true, "quote": true,
 	"begin": true, "let": true, "cond": true, "and": true, "or": true,
 	"set!": true, "not": true, "define-syntax": true,
+	"guard": true, "raise": true, "dynamic-wind": true,
+	"with-exception-handler": true, "define-record-type": true,
+	"let*": true, "letrec": true, "letrec*": true, "do": true,
+	"case": true, "when": true, "unless": true, "syntax-rules": true,
+	"call/cc": true, "call-with-current-continuation": true,
+	"case-lambda": true, "quasiquote": true, "let-values": true,
 }
 
 // evalDefineSyntax handles (define-syntax name (syntax-rules ...)) and
