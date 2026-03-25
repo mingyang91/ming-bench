@@ -25,7 +25,7 @@ type SchemeVal =
   | { tag: 'record'; typeName: string; fields: Map<string, SchemeVal>; pos?: Pos }
   | { tag: 'case-lambda'; clauses: { params: string[]; rest?: string; body: SchemeVal[] }[]; env: Env; pos?: Pos }
   | { tag: 'vector'; elements: SchemeVal[]; pos?: Pos }
-  | { tag: 'continuation'; k: Cont; pos?: Pos };
+  | { tag: 'continuation'; k: Cont; winds: WindEntry[]; pos?: Pos };
 
 function posStr(pos?: Pos): string {
   return pos ? `${pos.line}:${pos.col}` : '?:?';
@@ -227,6 +227,13 @@ function runTrampoline(b: Bounce): SchemeVal {
 }
 
 let contReentry = false;
+
+// ── Dynamic Wind ──────────────────────────────────────────────────
+interface WindEntry {
+  inThunk: SchemeVal;
+  outThunk: SchemeVal;
+}
+let windStack: WindEntry[] = [];
 
 function applySync(func: SchemeVal, args: SchemeVal[], pos?: Pos): SchemeVal {
   return runTrampoline(applyCPS(func, args, pos, (v) => v));
@@ -1090,6 +1097,10 @@ function makeGlobalEnv(): Env {
     throw new EvalError('call-with-current-continuation: internal error');
   });
 
+  defBuiltin('dynamic-wind', (_args) => {
+    throw new EvalError('dynamic-wind: internal error - should be handled by CPS evaluator');
+  });
+
   return env;
 }
 
@@ -1379,7 +1390,7 @@ function isTruthy(val: SchemeVal): boolean {
 }
 
 function exprMayCallCC(expr: SchemeVal): boolean {
-  if (expr.tag === 'symbol') return expr.value === 'call/cc' || expr.value === 'call-with-current-continuation';
+  if (expr.tag === 'symbol') return expr.value === 'call/cc' || expr.value === 'call-with-current-continuation' || expr.value === 'dynamic-wind';
   if (expr.tag === 'list') return expr.elements.some(exprMayCallCC);
   return false;
 }
@@ -1413,7 +1424,31 @@ function applyCPS(func: SchemeVal, args: SchemeVal[], pos: Pos | undefined, k: C
   if (func.tag === 'continuation') {
     if (args.length !== 1) throw errAt('continuation: expected 1 argument', pos);
     contReentry = true;
-    return mkBounce(() => func.k(args[0]));
+    const targetWinds = func.winds;
+    const currentWinds = [...windStack];
+    // Find common prefix length
+    let commonLen = 0;
+    while (commonLen < currentWinds.length && commonLen < targetWinds.length &&
+           currentWinds[commonLen] === targetWinds[commonLen]) {
+      commonLen++;
+    }
+    // Unwind current extents (out-thunks, top to common prefix)
+    function unwind(idx: number): Bounce {
+      if (idx <= commonLen) return rewind(commonLen);
+      const entry = currentWinds[idx - 1];
+      windStack.pop();
+      return applyCPS(entry.outThunk, [], pos, (_) => unwind(idx - 1));
+    }
+    // Rewind target extents (in-thunks, common prefix to target)
+    function rewind(idx: number): Bounce {
+      if (idx >= targetWinds.length) return mkBounce(() => func.k(args[0]));
+      const entry = targetWinds[idx];
+      return applyCPS(entry.inThunk, [], pos, (_) => {
+        windStack.push(entry);
+        return rewind(idx + 1);
+      });
+    }
+    return unwind(currentWinds.length);
   }
 
   if (func.tag === 'lambda') {
@@ -1447,8 +1482,22 @@ function applyCPS(func: SchemeVal, args: SchemeVal[], pos: Pos | undefined, k: C
     // Special builtins that need CPS
     if (func.name === 'call/cc' || func.name === 'call-with-current-continuation') {
       if (args.length !== 1) throw errAt('call/cc: expected 1 argument', pos);
-      const contVal: SchemeVal = { tag: 'continuation', k };
+      const contVal: SchemeVal = { tag: 'continuation', k, winds: [...windStack] };
       return applyCPS(args[0], [contVal], pos, k);
+    }
+    if (func.name === 'dynamic-wind') {
+      if (args.length !== 3) throw errAt('dynamic-wind: expected 3 arguments', pos);
+      const [inThunk, bodyThunk, outThunk] = args;
+      const entry: WindEntry = { inThunk, outThunk };
+      return applyCPS(inThunk, [], pos, (_) => {
+        windStack.push(entry);
+        return applyCPS(bodyThunk, [], pos, (bodyVal) => {
+          windStack.pop();
+          return applyCPS(outThunk, [], pos, (_) => {
+            return k(bodyVal);
+          });
+        });
+      });
     }
     if (func.name === 'apply') {
       if (args.length < 2) throw new EvalError('apply: expected at least 2 arguments');
@@ -1924,7 +1973,7 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont): Bounce {
       if (elems.length !== 2) throw errAt('call/cc: expected 1 argument', epos);
       callccActive = true;
       return evalCPS(elems[1], env, (proc) => {
-        const contVal: SchemeVal = { tag: 'continuation', k };
+        const contVal: SchemeVal = { tag: 'continuation', k, winds: [...windStack] };
         return applyCPS(proc, [contVal], epos, k);
       });
     }
@@ -2015,6 +2064,7 @@ export function evalStr(input: string): string {
   outputBuffer = '';
   contReentry = false;
   callccActive = false;
+  windStack = [];
   const env = makeGlobalEnv();
   const result = runTrampoline(evalSeqCPS(exprs, 0, env, (v) => v));
   return displayVal(result);
@@ -2027,6 +2077,7 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   outputBuffer = '';
   contReentry = false;
   callccActive = false;
+  windStack = [];
   const env = makeGlobalEnv();
   const result = runTrampoline(evalSeqCPS(exprs, 0, env, (v) => v));
   return { result: displayVal(result), output: outputBuffer };
