@@ -1007,8 +1007,11 @@ public class Evaluator {
     // ── Apply Function ──────────────────────────────────────────
     private Step applyFunctionStep(Val fn, List<Val> args, Kont k, Val form) throws EvalError {
         if (fn instanceof Val.ContVal cont) {
-            if (args.size() != 1) throw posError(form, "continuation expects 1 argument, got " + args.size());
-            return windTransfer(args.get(0), cont.savedK, cont.savedWinds);
+            Val value;
+            if (args.size() == 1) value = args.get(0);
+            else if (args.isEmpty()) value = new Val.Void();
+            else value = new Val.MultiVal(args);
+            return windTransfer(value, cont.savedK, cont.savedWinds);
         }
         if (fn instanceof Val.CallccVal) {
             if (args.size() != 1) throw posError(form, "call/cc requires 1 argument");
@@ -1115,8 +1118,11 @@ public class Evaluator {
     // ── applyFn for builtins (runs mini-trampoline) ─────────────
     private Val applyFn(Val fn, List<Val> args, Val callSite) throws EvalError {
         if (fn instanceof Val.ContVal cont) {
-            if (args.size() != 1) throw posError(callSite, "continuation expects 1 argument");
-            throw new ContinuationInvoke(cont, args.get(0));
+            Val value;
+            if (args.size() == 1) value = args.get(0);
+            else if (args.isEmpty()) value = new Val.Void();
+            else value = new Val.MultiVal(args);
+            throw new ContinuationInvoke(cont, value);
         }
         Step step = applyFunctionStep(fn, args, new Kont.HaltK(), callSite);
         while (true) {
