@@ -25,6 +25,19 @@ pub(crate) fn gensym(prefix: &str) -> String {
     format!("#{}#{}", prefix, n)
 }
 
+/// Exception handler entry — installed by `guard` or `with-exception-handler`.
+#[derive(Clone)]
+pub(crate) enum ExcHandler {
+    Guard {
+        var: String,
+        clauses: Vec<Expr>,
+        env: Env,
+        saved_kont: Vec<KFrame>,
+        saved_winders: Vec<Winder>,
+    },
+    Handler(Val),
+}
+
 /// A dynamic-wind frame: tracks in/out thunks for a dynamic extent.
 #[derive(Clone)]
 pub(crate) struct Winder {
@@ -76,6 +89,10 @@ pub(crate) enum Val {
     CallCC,
     /// The dynamic-wind primitive as a first-class value.
     DynamicWind,
+    /// The raise primitive as a first-class value.
+    Raise,
+    /// The with-exception-handler primitive as a first-class value.
+    WithExcHandler,
     /// A captured continuation (clone of the CEK continuation stack + winders).
     Continuation(Rc<Vec<KFrame>>, Rc<Vec<Winder>>),
 }
@@ -158,6 +175,19 @@ pub(crate) enum KFrame {
         span: Span,
         env: Env,
     },
+    /// Pop the top exception handler on normal body completion.
+    PopExcHandler {
+        env: Env,
+    },
+    /// Evaluate guard cond-clauses after exception unwinding completes.
+    GuardClauses {
+        var: String,
+        obj: Box<Val>,
+        clauses: Vec<Expr>,
+        env: Env,
+    },
+    /// Sentinel: if a `raise` handler returns, this is an error.
+    RaiseGuard,
 }
 
 /// CEK machine state.
@@ -367,7 +397,8 @@ impl fmt::Display for Val {
                 write!(f, ")")
             }
             Val::Lambda { .. } | Val::CaseLambda { .. } | Val::Builtin(..) | Val::Macro { .. }
-            | Val::CallCC | Val::DynamicWind | Val::Continuation(..) => write!(f, "#<procedure>"),
+            | Val::CallCC | Val::DynamicWind | Val::Raise | Val::WithExcHandler
+            | Val::Continuation(..) => write!(f, "#<procedure>"),
             Val::Void => write!(f, "#<void>"),
         }
     }
@@ -382,6 +413,7 @@ pub(crate) struct Env {
     frames: Vec<Frame>,
     pub(crate) output: Rc<RefCell<String>>,
     winders: Rc<RefCell<Vec<Winder>>>,
+    exception_handlers: Rc<RefCell<Vec<ExcHandler>>>,
 }
 
 impl Env {
@@ -507,10 +539,12 @@ impl Env {
         frame.borrow_mut().insert("call/cc".to_string(), Val::CallCC);
         frame.borrow_mut().insert("call-with-current-continuation".to_string(), Val::CallCC);
         frame.borrow_mut().insert("dynamic-wind".to_string(), Val::DynamicWind);
+        frame.borrow_mut().insert("raise".to_string(), Val::Raise);
+        frame.borrow_mut().insert("with-exception-handler".to_string(), Val::WithExcHandler);
         for &(name, f) in builtins {
             frame.borrow_mut().insert(name.to_string(), Val::Builtin(f));
         }
-        let env = Env { frames: vec![frame], output: Rc::new(RefCell::new(String::new())), winders: Rc::new(RefCell::new(Vec::new())) };
+        let env = Env { frames: vec![frame], output: Rc::new(RefCell::new(String::new())), winders: Rc::new(RefCell::new(Vec::new())), exception_handlers: Rc::new(RefCell::new(Vec::new())) };
         // Load cxr helper definitions
         let prelude = "\
 (define (caar x) (car (car x)))
@@ -576,7 +610,7 @@ impl Env {
     pub(crate) fn push(&self) -> Env {
         let mut frames = self.frames.clone();
         frames.push(Rc::new(RefCell::new(HashMap::new())));
-        Env { frames, output: Rc::clone(&self.output), winders: Rc::clone(&self.winders) }
+        Env { frames, output: Rc::clone(&self.output), winders: Rc::clone(&self.winders), exception_handlers: Rc::clone(&self.exception_handlers) }
     }
 }
 
@@ -789,6 +823,32 @@ fn cek_step(expr: Expr, env: Env, kont: &mut Vec<KFrame>) -> Result<CekState, Ev
                     "letrec*" => return cek_letrec_star(&elems[1..], &env, span, kont),
                     "do" => return cek_do(&elems[1..], &env, span, kont),
                     "case" => return cek_case(&elems[1..], &env, span, kont),
+                    "guard" => {
+                        // (guard (var clause ...) body ...)
+                        if elems.len() < 3 {
+                            return Err(EvalError::Parse(format!("guard: expected at least 2 arguments at {span}")));
+                        }
+                        let guard_spec = match &elems[1].kind {
+                            ExprKind::List(parts) if !parts.is_empty() => parts,
+                            _ => return Err(EvalError::Parse(format!("guard: expected (var clause ...) at {span}"))),
+                        };
+                        let var = match &guard_spec[0].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Parse(format!("guard: expected variable name at {span}"))),
+                        };
+                        let clauses = guard_spec[1..].to_vec();
+                        let saved_kont = kont.clone();
+                        let saved_winders = env.winders.borrow().clone();
+                        env.exception_handlers.borrow_mut().push(ExcHandler::Guard {
+                            var,
+                            clauses,
+                            env: env.clone(),
+                            saved_kont,
+                            saved_winders,
+                        });
+                        kont.push(KFrame::PopExcHandler { env: env.clone() });
+                        return enter_body_cek(&elems[2..], &env, kont);
+                    }
                     "string-set!" => {
                         return Ok(CekState::ApplyK(eval_string_set(&elems[1..], &env, span)?));
                     }
@@ -916,6 +976,21 @@ fn apply_frame(frame: KFrame, val: Val, kont: &mut Vec<KFrame>) -> Result<CekSta
             // A wind/unwind thunk completed (val ignored). Continue with remaining actions.
             process_dw_actions(actions, *value, target_kont, kont, span, &env)
         }
+        KFrame::PopExcHandler { env } => {
+            // Normal body completion — pop the exception handler.
+            env.exception_handlers.borrow_mut().pop();
+            Ok(CekState::ApplyK(val))
+        }
+        KFrame::GuardClauses { var, obj, clauses, env } => {
+            // Exception unwinding complete — evaluate guard cond-clauses.
+            let clause_env = env.push();
+            clause_env.define(var, *obj);
+            eval_guard_clauses(&clauses, &clause_env, kont)
+        }
+        KFrame::RaiseGuard => {
+            // A with-exception-handler handler returned from raise — error.
+            Err(EvalError::Runtime("exception handler returned from raise".into()))
+        }
     }
 }
 
@@ -979,6 +1054,50 @@ fn apply_function_cek(
             kont.push(KFrame::DwAfterIn { body_thunk: Box::new(body_thunk), out_thunk: Box::new(out_thunk), winder, span, env: caller_env.clone() });
             // Call the in-thunk
             apply_function_cek(in_thunk, vec![], kont, span, caller_env)
+        }
+        Val::Raise => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("raise: expected 1 argument, got {} at {span}", args.len())));
+            }
+            let obj = args.into_iter().next().expect("arity checked");
+            let handler = caller_env.exception_handlers.borrow_mut().pop();
+            match handler {
+                Some(ExcHandler::Guard { var, clauses, env: guard_env, saved_kont, saved_winders }) => {
+                    let current_winders = caller_env.winders.borrow().clone();
+                    let actions = compute_wind_actions(&current_winders, &saved_winders);
+                    let mut target = saved_kont;
+                    target.push(KFrame::GuardClauses {
+                        var,
+                        obj: Box::new(obj),
+                        clauses,
+                        env: guard_env,
+                    });
+                    if actions.is_empty() {
+                        *kont = target;
+                        Ok(CekState::ApplyK(Val::Void))
+                    } else {
+                        process_dw_actions(actions, Val::Void, Rc::new(target), kont, span, caller_env)
+                    }
+                }
+                Some(ExcHandler::Handler(handler_fn)) => {
+                    kont.push(KFrame::RaiseGuard);
+                    apply_function_cek(handler_fn, vec![obj], kont, span, caller_env)
+                }
+                None => {
+                    Err(EvalError::Runtime(format!("unhandled exception: {obj}")))
+                }
+            }
+        }
+        Val::WithExcHandler => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("with-exception-handler: expected 2 arguments, got {} at {span}", args.len())));
+            }
+            let mut it = args.into_iter();
+            let handler = it.next().expect("arity checked");
+            let thunk = it.next().expect("arity checked");
+            caller_env.exception_handlers.borrow_mut().push(ExcHandler::Handler(handler));
+            kont.push(KFrame::PopExcHandler { env: caller_env.clone() });
+            apply_function_cek(thunk, vec![], kont, span, caller_env)
         }
         Val::Continuation(saved_kont, saved_winders) => {
             if args.len() != 1 {
@@ -1044,6 +1163,32 @@ fn process_dw_actions(
     // All actions done — restore target continuation and deliver value.
     *kont = (*target_kont).clone();
     Ok(CekState::ApplyK(value))
+}
+
+// ---------------------------------------------------------------------------
+//  Exception handling helpers
+// ---------------------------------------------------------------------------
+
+/// Evaluate guard cond-clauses with the exception variable already bound.
+fn eval_guard_clauses(clauses: &[Expr], env: &Env, kont: &mut Vec<KFrame>) -> Result<CekState, EvalError> {
+    for clause in clauses {
+        let parts = match &clause.kind {
+            ExprKind::List(parts) if !parts.is_empty() => parts,
+            _ => return Err(EvalError::Parse("guard: invalid clause".into())),
+        };
+        if matches!(&parts[0].kind, ExprKind::Symbol(s) if s == "else") {
+            return enter_body_cek(&parts[1..], env, kont);
+        }
+        let test = eval(&parts[0], env)?;
+        if test.is_truthy() {
+            if parts.len() <= 1 {
+                return Ok(CekState::ApplyK(test));
+            }
+            return enter_body_cek(&parts[1..], env, kont);
+        }
+    }
+    // No clause matched — re-raise
+    Err(EvalError::Runtime("guard: no matching clause and no else".into()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1452,6 +1597,18 @@ pub(crate) fn apply_val(func: &Val, args: &[Val], caller_env: &Env) -> Result<Va
             // This is a limitation — full support would require all evaluation
             // paths to go through the CEK machine.
             Err(EvalError::Runtime("continuation invoked outside CEK machine".into()))
+        }
+        Val::Raise => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("raise: expected 1 argument".into()));
+            }
+            Err(EvalError::Runtime(format!("unhandled exception: {}", args[0])))
+        }
+        Val::WithExcHandler => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("with-exception-handler: expected 2 arguments".into()));
+            }
+            apply_val(&args[1], &[], caller_env)
         }
         _ => Err(EvalError::Type("not a procedure".into())),
     }
