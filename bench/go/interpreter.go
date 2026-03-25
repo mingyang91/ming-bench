@@ -430,12 +430,12 @@ type builtinProc struct {
 }
 
 type closureProc struct {
-	name   string
-	params []string
-	rest   string
+	name    string
+	params  []string
+	rest    string
 	hasRest bool
-	body   []expr
-	env    *env
+	body    []expr
+	env     *env
 }
 
 type binding struct {
@@ -518,6 +518,18 @@ func (it *interpreter) installBuiltins() {
 	it.global.define("write", &builtinProc{name: "write", fn: builtinWrite})
 	it.global.define("newline", &builtinProc{name: "newline", fn: builtinNewline})
 	it.global.define("apply", &builtinProc{name: "apply", fn: builtinApply})
+	it.global.define("abs", &builtinProc{name: "abs", fn: builtinAbs})
+	it.global.define("modulo", &builtinProc{name: "modulo", fn: builtinModulo})
+	it.global.define("remainder", &builtinProc{name: "remainder", fn: builtinRemainder})
+	it.global.define("quotient", &builtinProc{name: "quotient", fn: builtinQuotient})
+	it.global.define("min", &builtinProc{name: "min", fn: builtinMin})
+	it.global.define("max", &builtinProc{name: "max", fn: builtinMax})
+	it.global.define("expt", &builtinProc{name: "expt", fn: builtinExpt})
+	it.global.define("zero?", &builtinProc{name: "zero?", fn: builtinZeroPred})
+	it.global.define("positive?", &builtinProc{name: "positive?", fn: builtinPositivePred})
+	it.global.define("negative?", &builtinProc{name: "negative?", fn: builtinNegativePred})
+	it.global.define("odd?", &builtinProc{name: "odd?", fn: builtinOddPred})
+	it.global.define("even?", &builtinProc{name: "even?", fn: builtinEvenPred})
 	it.global.define("string-copy", &builtinProc{name: "string-copy", fn: builtinStringCopy})
 	it.global.define("string-set!", &builtinProc{name: "string-set!", fn: builtinStringSet})
 	it.global.define("string-append", &builtinProc{name: "string-append", fn: builtinStringAppend})
@@ -528,7 +540,25 @@ func (it *interpreter) installBuiltins() {
 	it.global.define("symbol->string", &builtinProc{name: "symbol->string", fn: builtinSymbolToString})
 	it.global.define("string->symbol", &builtinProc{name: "string->symbol", fn: builtinStringToSymbol})
 	it.global.define("string-ref", &builtinProc{name: "string-ref", fn: builtinStringRef})
+	it.global.define("string=?", &builtinProc{name: "string=?", fn: builtinStringEqualPred})
+	it.global.define("string<?", &builtinProc{name: "string<?", fn: builtinStringLessPred})
+	it.global.define("string-ci=?", &builtinProc{name: "string-ci=?", fn: builtinStringCIEqualPred})
+	it.global.define("string-upcase", &builtinProc{name: "string-upcase", fn: builtinStringUpcase})
+	it.global.define("string-downcase", &builtinProc{name: "string-downcase", fn: builtinStringDowncase})
 	it.global.define("char?", &builtinProc{name: "char?", fn: builtinCharPred})
+	it.global.define("char-alphabetic?", &builtinProc{name: "char-alphabetic?", fn: builtinCharAlphabeticPred})
+	it.global.define("char-numeric?", &builtinProc{name: "char-numeric?", fn: builtinCharNumericPred})
+	it.global.define("char-upcase", &builtinProc{name: "char-upcase", fn: builtinCharUpcase})
+	it.global.define("char-downcase", &builtinProc{name: "char-downcase", fn: builtinCharDowncase})
+	it.global.define("char=?", &builtinProc{name: "char=?", fn: builtinCharEqualPred})
+	it.global.define("char<?", &builtinProc{name: "char<?", fn: builtinCharLessPred})
+	it.global.define("eq?", &builtinProc{name: "eq?", fn: builtinEqPred})
+	it.global.define("equal?", &builtinProc{name: "equal?", fn: builtinDeepEqualPred})
+	it.global.define("list?", &builtinProc{name: "list?", fn: builtinListPred})
+	it.global.define("list-ref", &builtinProc{name: "list-ref", fn: builtinListRef})
+	it.global.define("list-tail", &builtinProc{name: "list-tail", fn: builtinListTail})
+	it.global.define("assoc", &builtinProc{name: "assoc", fn: builtinAssoc})
+	it.global.define("map", &builtinProc{name: "map", fn: builtinMap})
 }
 
 func (it *interpreter) evalProgram(exprs []expr) (value, error) {
