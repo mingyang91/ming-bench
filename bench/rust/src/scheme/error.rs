@@ -33,6 +33,12 @@ pub enum EvalError {
     #[error("continuations are not supported in this evaluation context")]
     UnsupportedContinuationContext,
 
+    #[error("unhandled exception: {value}")]
+    UnhandledException { value: String },
+
+    #[error("exception raised")]
+    ExceptionRaisedSignal,
+
     #[error("interpreter invariant violated: {message}")]
     InvariantViolation { message: String },
 

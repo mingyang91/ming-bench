@@ -389,6 +389,7 @@ struct EvalContext {
     gensym_counter: u64,
     dynamic_winds: Vec<DynamicWindExtent>,
     dynamic_wind_counter: u64,
+    pending_exception: Option<Value>,
 }
 
 impl EvalContext {
@@ -399,6 +400,7 @@ impl EvalContext {
             gensym_counter: 0,
             dynamic_winds: Vec::new(),
             dynamic_wind_counter: 0,
+            pending_exception: None,
         }
     }
 
@@ -464,6 +466,7 @@ enum Procedure {
     RecordPredicate(RecordPredicateProcedure),
     RecordAccessor(RecordAccessorProcedure),
     DynamicWind(DynamicWindProcedure),
+    WithExceptionHandler(WithExceptionHandlerProcedure),
     CallCc(CallCcProcedure),
     Continuation(ContinuationProcedure),
 }
@@ -475,6 +478,11 @@ struct BuiltinProcedure {
 
 #[derive(Clone)]
 struct DynamicWindProcedure {
+    name: String,
+}
+
+#[derive(Clone)]
+struct WithExceptionHandlerProcedure {
     name: String,
 }
 
@@ -907,7 +915,9 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "vector?", builtin_vector_predicate);
     define_builtin(&env, "vector->list", builtin_vector_to_list);
     define_builtin(&env, "list->vector", builtin_list_to_vector);
+    define_builtin(&env, "raise", builtin_raise);
     define_dynamic_wind_builtin(&env, "dynamic-wind");
+    define_with_exception_handler_builtin(&env, "with-exception-handler");
     define_callcc_builtin(&env, "call/cc");
     define_callcc_builtin(&env, "call-with-current-continuation");
 
@@ -925,6 +935,15 @@ fn define_dynamic_wind_builtin(env: &EnvRef, name: &'static str) {
     let value = Value::Procedure(Rc::new(Procedure::DynamicWind(DynamicWindProcedure {
         name: name.to_string(),
     })));
+    bind_value(env, name.to_string(), value);
+}
+
+fn define_with_exception_handler_builtin(env: &EnvRef, name: &'static str) {
+    let value = Value::Procedure(Rc::new(Procedure::WithExceptionHandler(
+        WithExceptionHandlerProcedure {
+            name: name.to_string(),
+        },
+    )));
     bind_value(env, name.to_string(), value);
 }
 
@@ -1016,6 +1035,16 @@ enum CondMatchAction {
 }
 
 #[derive(Clone)]
+enum ExceptionHandlerKind {
+    Procedure(Value),
+    Guard {
+        variable: String,
+        clauses: Vec<Expr>,
+        env: EnvRef,
+    },
+}
+
+#[derive(Clone)]
 enum WindTransitionStep {
     Exit(DynamicWindExtent),
     Enter(DynamicWindExtent),
@@ -1070,6 +1099,26 @@ enum MachineFrame {
         remaining: Vec<Expr>,
         env: EnvRef,
     },
+    GuardHandler {
+        variable: String,
+        clauses: Vec<Expr>,
+        env: EnvRef,
+        target_winds: Vec<DynamicWindExtent>,
+    },
+    GuardClause {
+        remaining_clauses: Vec<Expr>,
+        match_action: CondMatchAction,
+        env: EnvRef,
+        exception: Value,
+    },
+    WithExceptionHandler {
+        handler: Value,
+        target_winds: Vec<DynamicWindExtent>,
+    },
+    RunExceptionHandler {
+        handler: ExceptionHandlerKind,
+        exception: Value,
+    },
     DynamicWindEnter {
         wind: DynamicWindExtent,
         thunk: Value,
@@ -1103,12 +1152,21 @@ fn eval_program_machine(
     let mut state = schedule_machine_sequence(exprs, env, &mut frames);
 
     loop {
-        state = match state {
-            MachineState::Eval(expr, env) => eval_machine_expr(expr, env, ctx, &mut frames)?,
+        let next = match state {
+            MachineState::Eval(expr, env) => eval_machine_expr(expr, env, ctx, &mut frames),
             MachineState::Value(value) => match frames.pop() {
-                Some(frame) => resume_machine_frame(frame, value, ctx, &mut frames)?,
+                Some(frame) => resume_machine_frame(frame, value, ctx, &mut frames),
                 None => return Ok(value),
             },
+        };
+
+        state = match next {
+            Ok(state) => state,
+            Err(EvalError::ExceptionRaisedSignal) => {
+                let exception = take_pending_exception(ctx)?;
+                handle_machine_exception(exception, ctx, &mut frames)?
+            }
+            Err(error) => return Err(error),
         };
     }
 }
@@ -1169,6 +1227,7 @@ fn eval_machine_list(
             "if" => return schedule_machine_if(args, env, frames),
             "begin" => return Ok(schedule_machine_sequence(args, env, frames)),
             "cond" => return schedule_machine_cond(args, env, frames),
+            "guard" => return schedule_machine_guard(args, env, ctx, frames),
             "quote" => return Ok(MachineState::Value(eval_quote(args)?)),
             "define" => return schedule_machine_define(args, env, ctx, frames),
             "define-record-type" => {
@@ -1351,6 +1410,82 @@ fn schedule_machine_define(
             message: "define requires a symbol or function signature".to_string(),
         }),
     }
+}
+
+fn schedule_machine_guard(
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::SyntaxError {
+            message: "guard requires a handler clause list and a body".to_string(),
+        });
+    }
+
+    let (variable, clauses) = parse_guard_spec(&args[0])?;
+    frames.push(MachineFrame::GuardHandler {
+        variable,
+        clauses,
+        env: env.clone(),
+        target_winds: ctx.dynamic_winds.clone(),
+    });
+    Ok(schedule_machine_sequence(&args[1..], env, frames))
+}
+
+fn schedule_machine_guard_clauses(
+    clauses: &[Expr],
+    env: EnvRef,
+    exception: Value,
+    ctx: &mut EvalContext,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    let Some((clause, remaining)) = clauses.split_first() else {
+        return signal_exception(exception, ctx);
+    };
+
+    let Expr::List(items) = clause else {
+        return Err(EvalError::SyntaxError {
+            message: "guard clauses must be lists".to_string(),
+        });
+    };
+
+    if items.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "guard clauses cannot be empty".to_string(),
+        });
+    }
+
+    if let Expr::Symbol(symbol) = &items[0] {
+        if symbol == "else" {
+            if !remaining.is_empty() {
+                return Err(EvalError::SyntaxError {
+                    message: "guard else clause must be last".to_string(),
+                });
+            }
+
+            if items.len() == 1 {
+                return Ok(MachineState::Value(Value::Void));
+            }
+
+            return Ok(schedule_machine_sequence(&items[1..], env, frames));
+        }
+    }
+
+    let match_action = if items.len() == 1 {
+        CondMatchAction::ReturnTestValue
+    } else {
+        CondMatchAction::EvaluateBody(items[1..].to_vec())
+    };
+
+    frames.push(MachineFrame::GuardClause {
+        remaining_clauses: remaining.to_vec(),
+        match_action,
+        env: env.clone(),
+        exception,
+    });
+    Ok(MachineState::Eval(items[0].clone(), env))
 }
 
 fn schedule_machine_set(
@@ -1573,6 +1708,43 @@ fn resume_machine_frame(
                 apply_machine_value(operator, evaluated, ctx, frames)
             }
         }
+        MachineFrame::GuardHandler { .. } => Ok(MachineState::Value(value)),
+        MachineFrame::GuardClause {
+            remaining_clauses,
+            match_action,
+            env,
+            exception,
+        } => {
+            if value.is_truthy() {
+                match match_action {
+                    CondMatchAction::ReturnTestValue => Ok(MachineState::Value(value)),
+                    CondMatchAction::EvaluateBody(body) => {
+                        Ok(schedule_machine_sequence(&body, env, frames))
+                    }
+                }
+            } else {
+                schedule_machine_guard_clauses(&remaining_clauses, env, exception, ctx, frames)
+            }
+        }
+        MachineFrame::WithExceptionHandler { .. } => Ok(MachineState::Value(value)),
+        MachineFrame::RunExceptionHandler { handler, exception } => {
+            let _ = value;
+
+            match handler {
+                ExceptionHandlerKind::Procedure(handler) => {
+                    apply_machine_value(handler, vec![exception], ctx, frames)
+                }
+                ExceptionHandlerKind::Guard {
+                    variable,
+                    clauses,
+                    env,
+                } => {
+                    let guard_env = Env::child(env);
+                    bind_value(&guard_env, variable, exception.clone());
+                    schedule_machine_guard_clauses(&clauses, guard_env, exception, ctx, frames)
+                }
+            }
+        }
         MachineFrame::DynamicWindEnter { wind, thunk } => {
             let _ = value;
             ctx.dynamic_winds.push(wind.clone());
@@ -1660,6 +1832,9 @@ fn apply_machine_value(
         Procedure::DynamicWind(dynamic_wind) => {
             apply_machine_dynamic_wind(dynamic_wind, args, ctx, frames)
         }
+        Procedure::WithExceptionHandler(with_exception_handler) => {
+            apply_machine_with_exception_handler(with_exception_handler, args, ctx, frames)
+        }
         Procedure::CallCc(callcc) => {
             expect_value_arity(&callcc.name, &args, 1)?;
             let continuation =
@@ -1690,6 +1865,21 @@ fn apply_machine_dynamic_wind(
         thunk: args[1].clone(),
     });
     apply_machine_value(args[0].clone(), Vec::new(), ctx, frames)
+}
+
+fn apply_machine_with_exception_handler(
+    with_exception_handler: &WithExceptionHandlerProcedure,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    expect_value_arity(&with_exception_handler.name, &args, 2)?;
+
+    frames.push(MachineFrame::WithExceptionHandler {
+        handler: args[0].clone(),
+        target_winds: ctx.dynamic_winds.clone(),
+    });
+    apply_machine_value(args[1].clone(), Vec::new(), ctx, frames)
 }
 
 fn apply_machine_continuation(
@@ -1731,14 +1921,72 @@ fn schedule_wind_transition(
         WindTransitionStep::Enter(wind) => (wind.before.clone(), Some(wind)),
     };
 
-    frames.push(MachineFrame::WindTransition {
+    let mut transition_frames = target_frames.clone();
+    transition_frames.push(MachineFrame::WindTransition {
         pending_install,
         remaining_steps: remaining_steps.to_vec(),
         target_frames,
         target_winds,
         result,
     });
+    *frames = transition_frames;
     apply_machine_value(thunk, Vec::new(), ctx, frames)
+}
+
+fn handle_machine_exception(
+    exception: Value,
+    ctx: &mut EvalContext,
+    frames: &mut Vec<MachineFrame>,
+) -> Result<MachineState, EvalError> {
+    let Some((index, handler, target_winds)) = find_machine_exception_handler(frames) else {
+        return Err(EvalError::UnhandledException {
+            value: exception.render(),
+        });
+    };
+
+    let mut target_frames = frames[..index].to_vec();
+    target_frames.push(MachineFrame::RunExceptionHandler { handler, exception });
+
+    let steps = build_wind_transition_steps(&ctx.dynamic_winds, &target_winds);
+    schedule_wind_transition(steps, target_frames, target_winds, Value::Void, ctx, frames)
+}
+
+fn find_machine_exception_handler(
+    frames: &[MachineFrame],
+) -> Option<(usize, ExceptionHandlerKind, Vec<DynamicWindExtent>)> {
+    for index in (0..frames.len()).rev() {
+        match &frames[index] {
+            MachineFrame::GuardHandler {
+                variable,
+                clauses,
+                env,
+                target_winds,
+            } => {
+                return Some((
+                    index,
+                    ExceptionHandlerKind::Guard {
+                        variable: variable.clone(),
+                        clauses: clauses.clone(),
+                        env: env.clone(),
+                    },
+                    target_winds.clone(),
+                ));
+            }
+            MachineFrame::WithExceptionHandler {
+                handler,
+                target_winds,
+            } => {
+                return Some((
+                    index,
+                    ExceptionHandlerKind::Procedure(handler.clone()),
+                    target_winds.clone(),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn build_wind_transition_steps(
@@ -3115,6 +3363,9 @@ fn apply_procedure(
         Procedure::RecordPredicate(predicate) => apply_record_predicate(predicate, args),
         Procedure::RecordAccessor(accessor) => apply_record_accessor(accessor, args),
         Procedure::DynamicWind(dynamic_wind) => apply_dynamic_wind(dynamic_wind, args, ctx),
+        Procedure::WithExceptionHandler(with_exception_handler) => {
+            apply_with_exception_handler(with_exception_handler, args, ctx)
+        }
         Procedure::CallCc(callcc) => apply_callcc(callcc, args, ctx),
         Procedure::Continuation(continuation) => apply_continuation(continuation, args, ctx),
     }
@@ -3145,6 +3396,9 @@ fn tail_apply_procedure(
             args,
             ctx,
         )?)),
+        Procedure::WithExceptionHandler(with_exception_handler) => Ok(TailOutcome::Value(
+            apply_with_exception_handler(with_exception_handler, args, ctx)?,
+        )),
         Procedure::CallCc(callcc) => Ok(TailOutcome::Value(apply_callcc(callcc, args, ctx)?)),
         Procedure::Continuation(continuation) => Ok(TailOutcome::Value(apply_continuation(
             continuation,
@@ -3172,6 +3426,23 @@ fn apply_dynamic_wind(
     pop_result?;
     let _ = out_result?;
     body_result
+}
+
+fn apply_with_exception_handler(
+    with_exception_handler: &WithExceptionHandlerProcedure,
+    args: Vec<Value>,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    expect_value_arity(&with_exception_handler.name, &args, 2)?;
+
+    match apply_evaluated(args[1].clone(), Vec::new(), ctx) {
+        Ok(value) => Ok(value),
+        Err(EvalError::ExceptionRaisedSignal) => {
+            let exception = take_pending_exception(ctx)?;
+            apply_evaluated(args[0].clone(), vec![exception], ctx)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn eval_args(
@@ -3617,6 +3888,12 @@ fn builtin_display(args: &[Value], ctx: &mut EvalContext) -> Result<Value, EvalE
     expect_value_arity("display", args, 1)?;
     ctx.emit(&args[0].render_for_display());
     Ok(Value::Void)
+}
+
+fn builtin_raise(args: &[Value], ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("raise", args, 1)?;
+    ctx.pending_exception = Some(args[0].clone());
+    Err(EvalError::ExceptionRaisedSignal)
 }
 
 fn builtin_write(args: &[Value], ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -4844,6 +5121,28 @@ fn expect_expr_arity(name: &str, args: &[Expr], expected: usize) -> Result<(), E
     Ok(())
 }
 
+fn parse_guard_spec(expr: &Expr) -> Result<(String, Vec<Expr>), EvalError> {
+    let Expr::List(items) = expr else {
+        return Err(EvalError::SyntaxError {
+            message: "guard requires a handler variable and clause list".to_string(),
+        });
+    };
+
+    let Some((variable, clauses)) = items.split_first() else {
+        return Err(EvalError::SyntaxError {
+            message: "guard requires a handler variable".to_string(),
+        });
+    };
+
+    let Expr::Symbol(variable) = variable else {
+        return Err(EvalError::SyntaxError {
+            message: "guard handler variable must be a symbol".to_string(),
+        });
+    };
+
+    Ok((variable.clone(), clauses.to_vec()))
+}
+
 fn expect_value_arity(name: &str, args: &[Value], expected: usize) -> Result<(), EvalError> {
     if args.len() != expected {
         return Err(EvalError::WrongArgumentCount {
@@ -4854,6 +5153,19 @@ fn expect_value_arity(name: &str, args: &[Value], expected: usize) -> Result<(),
     }
 
     Ok(())
+}
+
+fn signal_exception(value: Value, ctx: &mut EvalContext) -> Result<MachineState, EvalError> {
+    ctx.pending_exception = Some(value);
+    Err(EvalError::ExceptionRaisedSignal)
+}
+
+fn take_pending_exception(ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    ctx.pending_exception
+        .take()
+        .ok_or(EvalError::InvariantViolation {
+            message: "exception signal without a pending exception value".to_string(),
+        })
 }
 
 fn is_special_form_name(name: &str) -> bool {
