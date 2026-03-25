@@ -25,6 +25,7 @@ pub fn parse(input: &str) -> Result<Vec<Expr>, EvalError> {
 enum Token {
     LParen,
     RParen,
+    Quote,
     Atom(String),
 }
 
@@ -47,6 +48,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
             }
             ')' => {
                 tokens.push(Token::RParen);
+                i += 1;
+            }
+            '\'' => {
+                tokens.push(Token::Quote);
                 i += 1;
             }
             '"' => {
@@ -132,7 +137,7 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Expr, usize), EvalError> 
                 if i >= tokens.len() {
                     return Err(EvalError::Parse("unmatched opening parenthesis".into()));
                 }
-                if matches!(tokens[i], Token::RParen) {
+                if matches!(&tokens[i], Token::RParen) {
                     return Ok((Expr::List(elems), i + 1));
                 }
                 let (expr, next) = parse_expr(tokens, i)?;
@@ -141,6 +146,10 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Expr, usize), EvalError> 
             }
         }
         Token::RParen => Err(EvalError::Parse("unexpected ')'".into())),
+        Token::Quote => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((Expr::List(vec![Expr::Symbol("quote".into()), inner]), next))
+        }
         Token::Atom(s) => Ok((parse_atom(s), pos + 1)),
     }
 }

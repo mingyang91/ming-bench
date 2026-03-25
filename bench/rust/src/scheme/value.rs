@@ -67,6 +67,21 @@ impl Env {
             }
         }
     }
+
+    /// Merge all bindings from another env into ours (frame by frame).
+    /// For frames that exist in both, merge bindings. Extra frames from
+    /// `other` are appended.
+    pub fn merge_all(&mut self, other: &Env) {
+        for (i, other_frame) in other.frames.iter().enumerate() {
+            if i < self.frames.len() {
+                for (k, v) in other_frame {
+                    self.frames[i].insert(k.clone(), v.clone());
+                }
+            } else {
+                self.frames.push(other_frame.clone());
+            }
+        }
+    }
 }
 
 impl Value {

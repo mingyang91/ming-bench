@@ -22,7 +22,9 @@ impl Evaluator {
 
     fn is_builtin(name: &str) -> bool {
         matches!(name, "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">="
-            | "not")
+            | "not" | "cons" | "car" | "cdr" | "null?" | "list" | "length"
+            | "append" | "number?" | "boolean?" | "string?" | "pair?" | "symbol?"
+            | "zero?" | "modulo" | "remainder" | "abs")
     }
 
     fn eval_in_env(&mut self, expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
@@ -55,6 +57,9 @@ impl Evaluator {
                 "if" => return self.eval_if(&elems[1..], env),
                 "quote" => return self.eval_quote(&elems[1..]),
                 "lambda" => return self.eval_lambda(&elems[1..], env),
+                "let" => return self.eval_let(&elems[1..], env),
+                "begin" => return self.eval_begin(&elems[1..], env),
+                "cond" => return self.eval_cond(&elems[1..], env),
                 "and" => return self.eval_and(&elems[1..], env),
                 "or" => return self.eval_or(&elems[1..], env),
                 "not" => {
@@ -89,11 +94,9 @@ impl Evaluator {
                         args.len()
                     )));
                 }
-                // Start from closure env, overlay calling env's top-level defs
-                // (needed for recursion of define'd functions)
+                // Start from closure env, overlay calling env's defs
                 let mut call_env = closure_env.clone();
-                // Merge top-level bindings from calling env into closure env
-                call_env.merge_top_level(env);
+                call_env.merge_all(env);
                 call_env.push_frame();
                 for (p, a) in params.iter().zip(args.into_iter()) {
                     call_env.define(p.clone(), a);
@@ -102,6 +105,8 @@ impl Evaluator {
                 for expr in body {
                     result = self.eval_in_env(expr, &mut call_env)?;
                 }
+                // Propagate any defines back to the calling env
+                // (needed for internal defines that are used after lambda returns)
                 Ok(result)
             }
             Value::Symbol(name) => self.apply_builtin(name, &args),
@@ -223,6 +228,125 @@ impl Evaluator {
         })
     }
 
+    fn eval_let(&mut self, args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+        if args.is_empty() {
+            return Err(EvalError::Parse("let: missing arguments".into()));
+        }
+        // Named let: (let name ((var init) ...) body...)
+        if let Expr::Symbol(name) = &args[0] {
+            if args.len() < 3 {
+                return Err(EvalError::Parse("named let: missing bindings or body".into()));
+            }
+            let bindings = match &args[1] {
+                Expr::List(b) => b,
+                _ => return Err(EvalError::Parse("named let: expected bindings list".into())),
+            };
+            let mut params = Vec::new();
+            let mut init_vals = Vec::new();
+            for binding in bindings {
+                match binding {
+                    Expr::List(pair) if pair.len() == 2 => {
+                        if let Expr::Symbol(var) = &pair[0] {
+                            params.push(var.clone());
+                            init_vals.push(self.eval_in_env(&pair[1], env)?);
+                        } else {
+                            return Err(EvalError::Parse("let: expected symbol in binding".into()));
+                        }
+                    }
+                    _ => return Err(EvalError::Parse("let: expected (var expr) binding".into())),
+                }
+            }
+            let body = args[2..].to_vec();
+            // Create recursive lambda for the named let
+            let mut loop_env = env.clone();
+            let lambda = Value::Lambda {
+                params: params.clone(),
+                body: body.clone(),
+                env: loop_env.clone(),
+            };
+            loop_env.define(name.clone(), lambda);
+            let recursive_lambda = Value::Lambda {
+                params: params.clone(),
+                body: body.clone(),
+                env: loop_env.clone(),
+            };
+            loop_env.define(name.clone(), recursive_lambda);
+            // Call with initial values
+            let mut call_env = loop_env;
+            call_env.push_frame();
+            for (p, v) in params.iter().zip(init_vals.into_iter()) {
+                call_env.define(p.clone(), v);
+            }
+            let mut result = Value::Void;
+            for expr in &body {
+                result = self.eval_in_env(expr, &mut call_env)?;
+            }
+            return Ok(result);
+        }
+        // Regular let: (let ((var expr) ...) body...)
+        let bindings = match &args[0] {
+            Expr::List(b) => b,
+            _ => return Err(EvalError::Parse("let: expected bindings list".into())),
+        };
+        let mut new_env = env.clone();
+        new_env.push_frame();
+        for binding in bindings {
+            match binding {
+                Expr::List(pair) if pair.len() == 2 => {
+                    if let Expr::Symbol(var) = &pair[0] {
+                        let val = self.eval_in_env(&pair[1], env)?;
+                        new_env.define(var.clone(), val);
+                    } else {
+                        return Err(EvalError::Parse("let: expected symbol in binding".into()));
+                    }
+                }
+                _ => return Err(EvalError::Parse("let: expected (var expr) binding".into())),
+            }
+        }
+        let mut result = Value::Void;
+        for expr in &args[1..] {
+            result = self.eval_in_env(expr, &mut new_env)?;
+        }
+        Ok(result)
+    }
+
+    fn eval_begin(&mut self, args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+        let mut result = Value::Void;
+        for expr in args {
+            result = self.eval_in_env(expr, env)?;
+        }
+        Ok(result)
+    }
+
+    fn eval_cond(&mut self, clauses: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+        for clause in clauses {
+            match clause {
+                Expr::List(parts) if !parts.is_empty() => {
+                    // Check for else clause
+                    if let Expr::Symbol(s) = &parts[0] {
+                        if s == "else" {
+                            let mut result = Value::Void;
+                            for expr in &parts[1..] {
+                                result = self.eval_in_env(expr, env)?;
+                            }
+                            return Ok(result);
+                        }
+                    }
+                    let test = self.eval_in_env(&parts[0], env)?;
+                    if test.is_truthy() {
+                        let mut result = test;
+                        for expr in &parts[1..] {
+                            result = self.eval_in_env(expr, env)?;
+                        }
+                        return Ok(result);
+                    }
+                }
+                _ => return Err(EvalError::Parse("cond: expected clause".into())),
+            }
+        }
+        Ok(Value::Void)
+    }
+
     fn apply_builtin(&mut self, name: &str, args: &[Value]) -> Result<Value, EvalError> {
         match name {
             "+" => {
@@ -272,6 +396,102 @@ impl Evaluator {
             "=" => self.compare_numbers(args, "=", |a, b| a == b),
             "<=" => self.compare_numbers(args, "<=", |a, b| a <= b),
             ">=" => self.compare_numbers(args, ">=", |a, b| a >= b),
+            "cons" => {
+                if args.len() != 2 {
+                    return Err(EvalError::Arity("cons: expected 2 arguments".into()));
+                }
+                match &args[1] {
+                    Value::List(tail) => {
+                        let mut new_list = vec![args[0].clone()];
+                        new_list.extend(tail.iter().cloned());
+                        Ok(Value::List(new_list))
+                    }
+                    _ => {
+                        // Dotted pair - for now represent as list
+                        Ok(Value::List(vec![args[0].clone(), args[1].clone()]))
+                    }
+                }
+            }
+            "car" => {
+                if args.len() != 1 {
+                    return Err(EvalError::Arity("car: expected 1 argument".into()));
+                }
+                match &args[0] {
+                    Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
+                    _ => Err(EvalError::Type("car: expected non-empty list".into())),
+                }
+            }
+            "cdr" => {
+                if args.len() != 1 {
+                    return Err(EvalError::Arity("cdr: expected 1 argument".into()));
+                }
+                match &args[0] {
+                    Value::List(elems) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec())),
+                    _ => Err(EvalError::Type("cdr: expected non-empty list".into())),
+                }
+            }
+            "null?" => {
+                if args.len() != 1 {
+                    return Err(EvalError::Arity("null?: expected 1 argument".into()));
+                }
+                Ok(Value::Boolean(matches!(&args[0], Value::List(e) if e.is_empty())))
+            }
+            "list" => Ok(Value::List(args.to_vec())),
+            "length" => {
+                if args.len() != 1 {
+                    return Err(EvalError::Arity("length: expected 1 argument".into()));
+                }
+                match &args[0] {
+                    Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
+                    _ => Err(EvalError::Type("length: expected list".into())),
+                }
+            }
+            "append" => {
+                let mut result = Vec::new();
+                for arg in args {
+                    match arg {
+                        Value::List(elems) => result.extend(elems.iter().cloned()),
+                        _ => return Err(EvalError::Type("append: expected list".into())),
+                    }
+                }
+                Ok(Value::List(result))
+            }
+            "number?" => {
+                if args.len() != 1 { return Err(EvalError::Arity("number?: expected 1 argument".into())); }
+                Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+            }
+            "boolean?" => {
+                if args.len() != 1 { return Err(EvalError::Arity("boolean?: expected 1 argument".into())); }
+                Ok(Value::Boolean(matches!(&args[0], Value::Boolean(_))))
+            }
+            "string?" => {
+                if args.len() != 1 { return Err(EvalError::Arity("string?: expected 1 argument".into())); }
+                Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
+            }
+            "pair?" => {
+                if args.len() != 1 { return Err(EvalError::Arity("pair?: expected 1 argument".into())); }
+                Ok(Value::Boolean(matches!(&args[0], Value::List(e) if !e.is_empty())))
+            }
+            "symbol?" => {
+                if args.len() != 1 { return Err(EvalError::Arity("symbol?: expected 1 argument".into())); }
+                Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
+            }
+            "zero?" => {
+                if args.len() != 1 { return Err(EvalError::Arity("zero?: expected 1 argument".into())); }
+                Ok(Value::Boolean(matches!(&args[0], Value::Integer(0))))
+            }
+            "modulo" | "remainder" => {
+                if args.len() != 2 { return Err(EvalError::Arity(format!("{name}: expected 2 arguments"))); }
+                let a = self.expect_integer(&args[0], name)?;
+                let b = self.expect_integer(&args[1], name)?;
+                if b == 0 { return Err(EvalError::DivisionByZero); }
+                Ok(Value::Integer(a % b))
+            }
+            "abs" => {
+                if args.len() != 1 { return Err(EvalError::Arity("abs: expected 1 argument".into())); }
+                let n = self.expect_integer(&args[0], "abs")?;
+                Ok(Value::Integer(n.abs()))
+            }
             _ => Err(EvalError::UnboundVariable(name.into())),
         }
     }
