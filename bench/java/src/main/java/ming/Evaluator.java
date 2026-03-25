@@ -18,7 +18,15 @@ public class Evaluator {
         }
     }
 
-    record SchemeString(String value) {}
+    static class SchemeString {
+        private final char[] chars;
+        SchemeString(String value) { this.chars = value.toCharArray(); }
+        SchemeString(char[] chars) { this.chars = chars; }
+        String value() { return new String(chars); }
+        int length() { return chars.length; }
+        char charAt(int i) { return chars[i]; }
+        void setChar(int i, char c) { chars[i] = c; }
+    }
 
     record SchemeChar(char value) {}
 
@@ -263,6 +271,19 @@ public class Evaluator {
             if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string->symbol: not a string");
             return s.value();
         }));
+        globalEnv.define("string-copy", new Builtin("string-copy", args -> {
+            requireArgCount(args, 1, "string-copy");
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-copy: not a string");
+            return new SchemeString(s.value().toCharArray());
+        }));
+        globalEnv.define("string-set!", new Builtin("string-set!", args -> {
+            requireArgCount(args, 3, "string-set!");
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-set!: not a string");
+            int idx = (int) requireLong(args.get(1));
+            if (!(args.get(2) instanceof SchemeChar c)) throw new EvalError("string-set!: not a character");
+            s.setChar(idx, c.value());
+            return VOID;
+        }));
     }
 
     public String evalStr(String input) throws EvalError {
@@ -301,6 +322,10 @@ public class Evaluator {
     private int lineNum, colNum;
 
     private Pos posAt(int line, int col) { return new Pos(line, col); }
+
+    private boolean isDelimiter(char c) {
+        return Character.isWhitespace(c) || c == '(' || c == ')' || c == '"' || c == ';' || c == '\'';
+    }
 
     private List<Token> tokenize(String input) throws EvalError {
         List<Token> tokens = new ArrayList<>();
@@ -356,11 +381,41 @@ public class Evaluator {
                 if (i + 1 < input.length()) {
                     char next = input.charAt(i + 1);
                     if (next == 't') {
-                        tokens.add(new Token(Boolean.TRUE, hPos));
-                        i += 2; colNum += 2;
+                        // Check it's not followed by an identifier char
+                        if (i + 2 >= input.length() || isDelimiter(input.charAt(i + 2))) {
+                            tokens.add(new Token(Boolean.TRUE, hPos));
+                            i += 2; colNum += 2;
+                        } else {
+                            throw new EvalError("unexpected #" + next + " at " + hPos);
+                        }
                     } else if (next == 'f') {
-                        tokens.add(new Token(Boolean.FALSE, hPos));
+                        if (i + 2 >= input.length() || isDelimiter(input.charAt(i + 2))) {
+                            tokens.add(new Token(Boolean.FALSE, hPos));
+                            i += 2; colNum += 2;
+                        } else {
+                            throw new EvalError("unexpected #" + next + " at " + hPos);
+                        }
+                    } else if (next == '\\') {
+                        // Character literal
                         i += 2; colNum += 2;
+                        if (i >= input.length()) throw new EvalError("unexpected end after #\\ at " + hPos);
+                        // Try named characters first
+                        if (i + 4 < input.length() && input.substring(i, i + 5).equals("space") &&
+                                (i + 5 >= input.length() || isDelimiter(input.charAt(i + 5)))) {
+                            tokens.add(new Token(new SchemeChar(' '), hPos));
+                            i += 5; colNum += 5;
+                        } else if (i + 6 < input.length() && input.substring(i, i + 7).equals("newline") &&
+                                (i + 7 >= input.length() || isDelimiter(input.charAt(i + 7)))) {
+                            tokens.add(new Token(new SchemeChar('\n'), hPos));
+                            i += 7; colNum += 7;
+                        } else if (i + 2 < input.length() && input.substring(i, i + 3).equals("tab") &&
+                                (i + 3 >= input.length() || isDelimiter(input.charAt(i + 3)))) {
+                            tokens.add(new Token(new SchemeChar('\t'), hPos));
+                            i += 3; colNum += 3;
+                        } else {
+                            tokens.add(new Token(new SchemeChar(input.charAt(i)), hPos));
+                            i++; colNum++;
+                        }
                     } else {
                         throw new EvalError("unexpected #" + next + " at " + hPos);
                     }
@@ -445,7 +500,7 @@ public class Evaluator {
         Object raw = unwrap(expr);
         Pos pos = posOf(expr);
 
-        if (raw instanceof Long || raw instanceof Boolean || raw instanceof SchemeString) {
+        if (raw instanceof Long || raw instanceof Boolean || raw instanceof SchemeString || raw instanceof SchemeChar) {
             return raw;
         }
         if (raw instanceof String sym) {
@@ -688,7 +743,14 @@ public class Evaluator {
         if (val instanceof Long l) return l.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
-        if (val instanceof SchemeChar c) return "#\\" + c.value();
+        if (val instanceof SchemeChar c) {
+            return switch (c.value()) {
+                case ' ' -> "#\\space";
+                case '\n' -> "#\\newline";
+                case '\t' -> "#\\tab";
+                default -> "#\\" + c.value();
+            };
+        }
         if (val instanceof Builtin b) return "#<procedure " + b.name() + ">";
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof Cons) {
