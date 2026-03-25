@@ -208,6 +208,29 @@ interface PatternMatch {
   repeats: Map<string, Expr[]>;
 }
 
+interface TailCallRequest {
+  type: 'tail-call';
+  procedure: SchemeValue;
+  args: SchemeValue[];
+  location?: SourceLocation;
+}
+
+interface ExpressionEvalStep {
+  type: 'expression';
+  expression: Expr;
+  env: Environment;
+}
+
+interface ProcedureEvalStep {
+  type: 'procedure';
+  procedure: SchemeValue;
+  args: SchemeValue[];
+  location?: SourceLocation;
+}
+
+type EvalOutcome = SchemeValue | TailCallRequest;
+type EvalStep = ExpressionEvalStep | ProcedureEvalStep;
+
 class Environment {
   private readonly bindings = new Map<string, Binding>();
   private readonly macros = new Map<string, MacroTransformer>();
@@ -1535,6 +1558,37 @@ function parseList(state: ParserState, location: SourceLocation): Expr {
 }
 
 function evaluate(expression: Expr, env: Environment): SchemeValue {
+  return runEvaluationLoop({ type: 'expression', expression, env });
+}
+
+function runEvaluationLoop(initialStep: EvalStep): SchemeValue {
+  let step = initialStep;
+
+  while (true) {
+    const outcome =
+      step.type === 'expression'
+        ? evaluateExpression(step.expression, step.env, true)
+        : applyProcedureStep(step.procedure, step.args, step.location);
+
+    if (isTailCallRequest(outcome)) {
+      step = {
+        type: 'procedure',
+        procedure: outcome.procedure,
+        args: outcome.args,
+        location: outcome.location,
+      };
+      continue;
+    }
+
+    return outcome;
+  }
+}
+
+function evaluateExpression(
+  expression: Expr,
+  env: Environment,
+  tailPosition: boolean,
+): EvalOutcome {
   try {
     switch (expression.kind) {
       case 'number':
@@ -1553,14 +1607,27 @@ function evaluate(expression: Expr, env: Environment): SchemeValue {
         return value;
       }
       case 'list':
-        return evaluateList(expression.items, env);
+        return evaluateList(expression, env, tailPosition);
     }
   } catch (error) {
     rethrowWithLocation(error, expression.location);
   }
 }
 
-function evaluateList(items: Expr[], env: Environment): SchemeValue {
+function isTailCallRequest(outcome: EvalOutcome): outcome is TailCallRequest {
+  return 'type' in outcome && outcome.type === 'tail-call';
+}
+
+function makeTailCall(
+  procedure: SchemeValue,
+  args: SchemeValue[],
+  location?: SourceLocation,
+): TailCallRequest {
+  return { type: 'tail-call', procedure, args, location };
+}
+
+function evaluateList(expression: ListExpr, env: Environment, tailPosition: boolean): EvalOutcome {
+  const { items, location } = expression;
   if (items.length === 0) {
     throw new EvalError('cannot evaluate empty list');
   }
@@ -1569,20 +1636,21 @@ function evaluateList(items: Expr[], env: Environment): SchemeValue {
   if (head.kind === 'symbol') {
     const transformer = lookupMacroTransformer(head, env);
     if (transformer !== undefined) {
-      return evaluate(expandMacroCall(items, head.location, transformer), env);
+      const expanded = expandMacroCall(items, head.location, transformer);
+      return tailPosition ? evaluateExpression(expanded, env, true) : evaluate(expanded, env);
     }
 
     switch (head.value) {
       case 'and':
-        return evaluateAnd(items.slice(1), env);
+        return evaluateAnd(items.slice(1), env, tailPosition);
       case 'case':
-        return evaluateCase(items.slice(1), env);
+        return evaluateCase(items.slice(1), env, tailPosition);
       case 'or':
-        return evaluateOr(items.slice(1), env);
+        return evaluateOr(items.slice(1), env, tailPosition);
       case 'begin':
-        return evaluateBegin(items.slice(1), env);
+        return evaluateBegin(items.slice(1), env, tailPosition);
       case 'cond':
-        return evaluateCond(items.slice(1), env);
+        return evaluateCond(items.slice(1), env, tailPosition);
       case 'define':
         return evaluateDefine(items.slice(1), env);
       case 'define-record-type':
@@ -1590,19 +1658,19 @@ function evaluateList(items: Expr[], env: Environment): SchemeValue {
       case 'define-syntax':
         return evaluateDefineSyntax(items.slice(1), env);
       case 'do':
-        return evaluateDo(items.slice(1), env);
+        return evaluateDo(items.slice(1), env, tailPosition);
       case 'if':
-        return evaluateIf(items.slice(1), env);
+        return evaluateIf(items.slice(1), env, tailPosition);
       case 'case-lambda':
         return evaluateCaseLambda(items.slice(1), env);
       case 'lambda':
         return evaluateLambda(items.slice(1), env);
       case 'let':
-        return evaluateLet(items.slice(1), env);
+        return evaluateLet(items.slice(1), env, tailPosition, location);
       case 'letrec':
-        return evaluateLetrec(items.slice(1), env);
+        return evaluateLetrec(items.slice(1), env, tailPosition);
       case 'letrec*':
-        return evaluateLetrecStar(items.slice(1), env);
+        return evaluateLetrecStar(items.slice(1), env, tailPosition);
       case 'quote':
         return evaluateQuote(items.slice(1));
       case 'set!':
@@ -1612,22 +1680,34 @@ function evaluateList(items: Expr[], env: Environment): SchemeValue {
 
   const procedure = evaluate(head, env);
   const args = items.slice(1).map((item) => evaluate(item, env));
-  return applyProcedure(procedure, args);
+  if (tailPosition) {
+    return makeTailCall(procedure, args, location);
+  }
+
+  return applyProcedure(procedure, args, location);
 }
 
-function evaluateAnd(items: Expr[], env: Environment): SchemeValue {
-  let result: SchemeValue = TRUE_VALUE;
-  for (const item of items) {
-    result = evaluate(item, env);
+function evaluateAnd(items: Expr[], env: Environment, tailPosition: boolean): EvalOutcome {
+  if (items.length === 0) {
+    return TRUE_VALUE;
+  }
+
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    if (index === items.length - 1) {
+      return tailPosition ? evaluateExpression(item, env, true) : evaluate(item, env);
+    }
+
+    const result = evaluate(item, env);
     if (!isTruthy(result)) {
       return result;
     }
   }
 
-  return result;
+  return TRUE_VALUE;
 }
 
-function evaluateCase(items: Expr[], env: Environment): SchemeValue {
+function evaluateCase(items: Expr[], env: Environment, tailPosition: boolean): EvalOutcome {
   if (items.length < 1) {
     throw new EvalError('case requires a key and at least one clause');
   }
@@ -1646,7 +1726,7 @@ function evaluateCase(items: Expr[], env: Environment): SchemeValue {
       if (index !== clauses.length - 1) {
         throw new EvalError('case else clause must be last');
       }
-      return evaluateCaseClauseBody(body, env);
+      return evaluateCaseClauseBody(body, env, tailPosition);
     }
 
     if (datumsExpression.kind !== 'list') {
@@ -1655,7 +1735,7 @@ function evaluateCase(items: Expr[], env: Environment): SchemeValue {
 
     for (const datum of datumsExpression.items) {
       if (schemeEqv(key, quoteExpression(datum))) {
-        return evaluateCaseClauseBody(body, env);
+        return evaluateCaseClauseBody(body, env, tailPosition);
       }
     }
   }
@@ -1663,31 +1743,43 @@ function evaluateCase(items: Expr[], env: Environment): SchemeValue {
   return VOID_VALUE;
 }
 
-function evaluateCaseClauseBody(body: Expr[], env: Environment): SchemeValue {
+function evaluateCaseClauseBody(
+  body: Expr[],
+  env: Environment,
+  tailPosition: boolean,
+): EvalOutcome {
   if (body.length === 0) {
     return VOID_VALUE;
   }
 
-  return evaluateSequence(body, env);
+  return evaluateSequenceInternal(body, env, tailPosition);
 }
 
-function evaluateOr(items: Expr[], env: Environment): SchemeValue {
-  let result: SchemeValue = FALSE_VALUE;
-  for (const item of items) {
-    result = evaluate(item, env);
+function evaluateOr(items: Expr[], env: Environment, tailPosition: boolean): EvalOutcome {
+  if (items.length === 0) {
+    return FALSE_VALUE;
+  }
+
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    if (index === items.length - 1) {
+      return tailPosition ? evaluateExpression(item, env, true) : evaluate(item, env);
+    }
+
+    const result = evaluate(item, env);
     if (isTruthy(result)) {
       return result;
     }
   }
 
-  return result;
+  return FALSE_VALUE;
 }
 
-function evaluateBegin(items: Expr[], env: Environment): SchemeValue {
-  return evaluateSequence(items, env);
+function evaluateBegin(items: Expr[], env: Environment, tailPosition: boolean): EvalOutcome {
+  return evaluateSequenceInternal(items, env, tailPosition);
 }
 
-function evaluateCond(items: Expr[], env: Environment): SchemeValue {
+function evaluateCond(items: Expr[], env: Environment, tailPosition: boolean): EvalOutcome {
   for (let index = 0; index < items.length; index += 1) {
     const clause = items[index];
     if (clause.kind !== 'list' || clause.items.length === 0) {
@@ -1699,24 +1791,29 @@ function evaluateCond(items: Expr[], env: Environment): SchemeValue {
       if (index !== items.length - 1) {
         throw new EvalError('cond else clause must be last');
       }
-      return evaluateCondBody(body, TRUE_VALUE, env);
+      return evaluateCondBody(body, TRUE_VALUE, env, tailPosition);
     }
 
     const testValue = evaluate(testExpression, env);
     if (isTruthy(testValue)) {
-      return evaluateCondBody(body, testValue, env);
+      return evaluateCondBody(body, testValue, env, tailPosition);
     }
   }
 
   return VOID_VALUE;
 }
 
-function evaluateCondBody(body: Expr[], testValue: SchemeValue, env: Environment): SchemeValue {
+function evaluateCondBody(
+  body: Expr[],
+  testValue: SchemeValue,
+  env: Environment,
+  tailPosition: boolean,
+): EvalOutcome {
   if (body.length === 0) {
     return testValue;
   }
 
-  return evaluateSequence(body, env);
+  return evaluateSequenceInternal(body, env, tailPosition);
 }
 
 function evaluateDefine(items: Expr[], env: Environment): SchemeValue {
@@ -1808,21 +1905,21 @@ function evaluateNamedCaseLambda(
   return makeCaseLambda(name, parseCaseLambdaClauses(expression.items.slice(1)), env);
 }
 
-function evaluateIf(items: Expr[], env: Environment): SchemeValue {
+function evaluateIf(items: Expr[], env: Environment, tailPosition: boolean): EvalOutcome {
   if (items.length < 2 || items.length > 3) {
     throw new EvalError('if expected 2 or 3 argument(s)');
   }
 
   const condition = evaluate(items[0], env);
   if (isTruthy(condition)) {
-    return evaluate(items[1], env);
+    return tailPosition ? evaluateExpression(items[1], env, true) : evaluate(items[1], env);
   }
 
   if (items[2] === undefined) {
     return VOID_VALUE;
   }
 
-  return evaluate(items[2], env);
+  return tailPosition ? evaluateExpression(items[2], env, true) : evaluate(items[2], env);
 }
 
 function evaluateLambda(items: Expr[], env: Environment): SchemeValue {
@@ -1852,7 +1949,7 @@ function evaluateSet(items: Expr[], env: Environment): SchemeValue {
   return VOID_VALUE;
 }
 
-function evaluateDo(items: Expr[], env: Environment): SchemeValue {
+function evaluateDo(items: Expr[], env: Environment, tailPosition: boolean): EvalOutcome {
   if (items.length < 2) {
     throw new EvalError('do requires bindings and a termination clause');
   }
@@ -1875,7 +1972,9 @@ function evaluateDo(items: Expr[], env: Environment): SchemeValue {
 
   while (true) {
     if (isTruthy(evaluate(testExpression, loopEnv))) {
-      return resultExpressions.length === 0 ? VOID_VALUE : evaluateSequence(resultExpressions, loopEnv);
+      return resultExpressions.length === 0
+        ? VOID_VALUE
+        : evaluateSequenceInternal(resultExpressions, loopEnv, tailPosition);
     }
 
     for (const expression of body) {
@@ -1894,13 +1993,18 @@ function evaluateDo(items: Expr[], env: Environment): SchemeValue {
   }
 }
 
-function evaluateLet(items: Expr[], env: Environment): SchemeValue {
+function evaluateLet(
+  items: Expr[],
+  env: Environment,
+  tailPosition: boolean,
+  location?: SourceLocation,
+): EvalOutcome {
   if (items.length < 2) {
     throw new EvalError('let requires bindings and a body');
   }
 
   if (items[0].kind === 'symbol') {
-    return evaluateNamedLet(items, env);
+    return evaluateNamedLet(items, env, tailPosition, location);
   }
 
   const bindings = parseLetBindings(items[0]);
@@ -1911,10 +2015,15 @@ function evaluateLet(items: Expr[], env: Environment): SchemeValue {
     defineIdentifier(bindings[index].name, letEnv, values[index]);
   }
 
-  return evaluateSequence(items.slice(1), letEnv);
+  return evaluateSequenceInternal(items.slice(1), letEnv, tailPosition);
 }
 
-function evaluateNamedLet(items: Expr[], env: Environment): SchemeValue {
+function evaluateNamedLet(
+  items: Expr[],
+  env: Environment,
+  tailPosition: boolean,
+  location?: SourceLocation,
+): EvalOutcome {
   if (items.length < 3) {
     throw new EvalError('named let requires a name, bindings, and a body');
   }
@@ -1938,15 +2047,19 @@ function evaluateNamedLet(items: Expr[], env: Environment): SchemeValue {
   );
   binding.value = closure;
 
-  return applyProcedure(closure, args);
+  if (tailPosition) {
+    return makeTailCall(closure, args, location);
+  }
+
+  return applyProcedure(closure, args, location);
 }
 
-function evaluateLetrec(items: Expr[], env: Environment): SchemeValue {
-  return evaluateRecursiveLet('letrec', items, env, false);
+function evaluateLetrec(items: Expr[], env: Environment, tailPosition: boolean): EvalOutcome {
+  return evaluateRecursiveLet('letrec', items, env, false, tailPosition);
 }
 
-function evaluateLetrecStar(items: Expr[], env: Environment): SchemeValue {
-  return evaluateRecursiveLet('letrec*', items, env, true);
+function evaluateLetrecStar(items: Expr[], env: Environment, tailPosition: boolean): EvalOutcome {
+  return evaluateRecursiveLet('letrec*', items, env, true, tailPosition);
 }
 
 function evaluateRecursiveLet(
@@ -1954,7 +2067,8 @@ function evaluateRecursiveLet(
   items: Expr[],
   env: Environment,
   sequential: boolean,
-): SchemeValue {
+  tailPosition: boolean,
+): EvalOutcome {
   if (items.length < 2) {
     throw new EvalError(`${name} requires bindings and a body`);
   }
@@ -1980,7 +2094,7 @@ function evaluateRecursiveLet(
     }
   }
 
-  return evaluateSequence(items.slice(1), letrecEnv);
+  return evaluateSequenceInternal(items.slice(1), letrecEnv, tailPosition);
 }
 
 function parseLetBindings(expression: Expr): LetBindingSpec[] {
@@ -2152,36 +2266,77 @@ function quoteExpression(expression: Expr): SchemeValue {
   }
 }
 
+function resolveEvalOutcome(outcome: EvalOutcome): SchemeValue {
+  if (isTailCallRequest(outcome)) {
+    return applyProcedure(outcome.procedure, outcome.args, outcome.location);
+  }
+
+  return outcome;
+}
+
 function evaluateSequence(expressions: Expr[], env: Environment): SchemeValue {
+  return resolveEvalOutcome(evaluateSequenceInternal(expressions, env, true));
+}
+
+function evaluateSequenceInternal(
+  expressions: Expr[],
+  env: Environment,
+  tailPosition: boolean,
+): EvalOutcome {
   let result: SchemeValue = VOID_VALUE;
-  for (const expression of expressions) {
+  for (let index = 0; index < expressions.length; index += 1) {
+    const expression = expressions[index];
+    if (tailPosition && index === expressions.length - 1) {
+      return evaluateExpression(expression, env, true);
+    }
+
     result = evaluate(expression, env);
   }
   return result;
 }
 
-function applyProcedure(value: SchemeValue, args: SchemeValue[]): SchemeValue {
-  if (value.kind !== 'procedure') {
-    throw new EvalError('attempted to call a non-procedure');
-  }
+function applyProcedure(
+  value: SchemeValue,
+  args: SchemeValue[],
+  location?: SourceLocation,
+): SchemeValue {
+  return runEvaluationLoop({ type: 'procedure', procedure: value, args, location });
+}
 
-  if (value.procedureKind === 'builtin') {
-    return value.apply(args);
-  }
+function applyProcedureStep(
+  value: SchemeValue,
+  args: SchemeValue[],
+  location?: SourceLocation,
+): EvalOutcome {
+  try {
+    if (value.kind !== 'procedure') {
+      throw new EvalError('attempted to call a non-procedure');
+    }
 
-  if (value.procedureKind === 'case-lambda') {
-    const clause = selectCaseLambdaClause(value, args.length);
-    return applyUserProcedure(
-      value.name,
-      clause.params,
-      clause.body,
-      value.env,
-      args,
-      clause.restParam,
-    );
-  }
+    if (value.procedureKind === 'builtin') {
+      return value.apply(args);
+    }
 
-  return applyUserProcedure(value.name, value.params, value.body, value.env, args, value.restParam);
+    if (value.procedureKind === 'case-lambda') {
+      const clause = selectCaseLambdaClause(value, args.length);
+      return applyUserProcedure(
+        value.name,
+        clause.params,
+        clause.body,
+        value.env,
+        args,
+        clause.restParam,
+      );
+    }
+
+    return applyUserProcedure(value.name, value.params, value.body, value.env, args, value.restParam);
+  } catch (error) {
+    if (location !== undefined) {
+      rethrowWithLocation(error, location);
+    }
+
+    throw error;
+  }
 }
 
 function applyUserProcedure(
@@ -2191,7 +2346,7 @@ function applyUserProcedure(
   env: Environment,
   args: SchemeValue[],
   restParam?: SymbolExpr,
-): SchemeValue {
+): EvalOutcome {
   if (restParam === undefined) {
     expectExactArgCount(name, args, params.length);
   } else {
@@ -2207,7 +2362,7 @@ function applyUserProcedure(
     defineIdentifier(restParam, callEnv, arrayToList(args.slice(params.length)));
   }
 
-  return evaluateSequence(body, callEnv);
+  return evaluateSequenceInternal(body, callEnv, true);
 }
 
 function selectCaseLambdaClause(
