@@ -141,6 +141,16 @@ func makeGlobalEnv() *Env {
 	env.Set("string-upcase", &Value{Type: TypeSymbol, StrVal: "builtin:string-upcase"})
 	env.Set("string-downcase", &Value{Type: TypeSymbol, StrVal: "builtin:string-downcase"})
 
+	// Exact/inexact (L11)
+	env.Set("exact?", &Value{Type: TypeSymbol, StrVal: "builtin:exact?"})
+	env.Set("inexact?", &Value{Type: TypeSymbol, StrVal: "builtin:inexact?"})
+	env.Set("exact->inexact", &Value{Type: TypeSymbol, StrVal: "builtin:exact->inexact"})
+	env.Set("inexact->exact", &Value{Type: TypeSymbol, StrVal: "builtin:inexact->exact"})
+	env.Set("numerator", &Value{Type: TypeSymbol, StrVal: "builtin:numerator"})
+	env.Set("denominator", &Value{Type: TypeSymbol, StrVal: "builtin:denominator"})
+	env.Set("integer?", &Value{Type: TypeSymbol, StrVal: "builtin:integer?"})
+	env.Set("rational?", &Value{Type: TypeSymbol, StrVal: "builtin:rational?"})
+
 	// List operations (L09)
 	env.Set("list?", &Value{Type: TypeSymbol, StrVal: "builtin:list?"})
 	env.Set("list-ref", &Value{Type: TypeSymbol, StrVal: "builtin:list-ref"})
@@ -156,11 +166,28 @@ func makeGlobalEnv() *Env {
 func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, error) {
 	switch name {
 	case "builtin:+":
-		var sum int64
 		for _, a := range args {
-			if a.Type != TypeInteger {
+			if !isNumeric(a) {
 				return nil, fmt.Errorf("%d:%d: '+' expects numbers", line, col)
 			}
+		}
+		if hasFloat(args) {
+			var sum float64
+			for _, a := range args {
+				sum += toFloat64(a)
+			}
+			return FloatValue(sum), nil
+		}
+		if hasRational(args) {
+			var rn, rd int64 = 0, 1
+			for _, a := range args {
+				an, ad := toRational(a)
+				rn, rd = addRat(rn, rd, an, ad)
+			}
+			return RationalValue(rn, rd), nil
+		}
+		var sum int64
+		for _, a := range args {
 			sum += a.IntVal
 		}
 		return IntValue(sum), nil
@@ -169,27 +196,65 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 		if len(args) == 0 {
 			return nil, fmt.Errorf("%d:%d: '-' requires at least one argument", line, col)
 		}
-		if args[0].Type != TypeInteger {
-			return nil, fmt.Errorf("%d:%d: '-' expects numbers", line, col)
+		for _, a := range args {
+			if !isNumeric(a) {
+				return nil, fmt.Errorf("%d:%d: '-' expects numbers", line, col)
+			}
 		}
 		if len(args) == 1 {
-			return IntValue(-args[0].IntVal), nil
+			switch args[0].Type {
+			case TypeFloat:
+				return FloatValue(-args[0].FloatVal), nil
+			case TypeRational:
+				return RationalValue(-args[0].Num, args[0].Den), nil
+			default:
+				return IntValue(-args[0].IntVal), nil
+			}
+		}
+		if hasFloat(args) {
+			result := toFloat64(args[0])
+			for _, a := range args[1:] {
+				result -= toFloat64(a)
+			}
+			return FloatValue(result), nil
+		}
+		if hasRational(args) {
+			rn, rd := toRational(args[0])
+			for _, a := range args[1:] {
+				an, ad := toRational(a)
+				rn, rd = subRat(rn, rd, an, ad)
+			}
+			return RationalValue(rn, rd), nil
 		}
 		result := args[0].IntVal
 		for _, a := range args[1:] {
-			if a.Type != TypeInteger {
-				return nil, fmt.Errorf("%d:%d: '-' expects numbers", line, col)
-			}
 			result -= a.IntVal
 		}
 		return IntValue(result), nil
 
 	case "builtin:*":
-		var product int64 = 1
 		for _, a := range args {
-			if a.Type != TypeInteger {
+			if !isNumeric(a) {
 				return nil, fmt.Errorf("%d:%d: '*' expects numbers", line, col)
 			}
+		}
+		if hasFloat(args) {
+			var product float64 = 1
+			for _, a := range args {
+				product *= toFloat64(a)
+			}
+			return FloatValue(product), nil
+		}
+		if hasRational(args) {
+			var rn, rd int64 = 1, 1
+			for _, a := range args {
+				an, ad := toRational(a)
+				rn, rd = mulRat(rn, rd, an, ad)
+			}
+			return RationalValue(rn, rd), nil
+		}
+		var product int64 = 1
+		for _, a := range args {
 			product *= a.IntVal
 		}
 		return IntValue(product), nil
@@ -198,44 +263,56 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 		if len(args) < 2 {
 			return nil, fmt.Errorf("%d:%d: '/' requires at least two arguments", line, col)
 		}
-		if args[0].Type != TypeInteger {
-			return nil, fmt.Errorf("%d:%d: '/' expects numbers", line, col)
-		}
-		result := args[0].IntVal
-		for _, a := range args[1:] {
-			if a.Type != TypeInteger {
+		for _, a := range args {
+			if !isNumeric(a) {
 				return nil, fmt.Errorf("%d:%d: '/' expects numbers", line, col)
 			}
-			if a.IntVal == 0 {
+		}
+		if hasFloat(args) {
+			result := toFloat64(args[0])
+			for _, a := range args[1:] {
+				f := toFloat64(a)
+				if f == 0 {
+					return nil, fmt.Errorf("%d:%d: division by zero", line, col)
+				}
+				result /= f
+			}
+			return FloatValue(result), nil
+		}
+		// Exact division: use rationals
+		rn, rd := toRational(args[0])
+		for _, a := range args[1:] {
+			an, ad := toRational(a)
+			if an == 0 {
 				return nil, fmt.Errorf("%d:%d: division by zero", line, col)
 			}
-			result /= a.IntVal
+			rn, rd = divRat(rn, rd, an, ad)
 		}
-		return IntValue(result), nil
+		return RationalValue(rn, rd), nil
 
 	case "builtin:<":
-		if len(args) != 2 || args[0].Type != TypeInteger || args[1].Type != TypeInteger {
+		if len(args) != 2 || !isNumeric(args[0]) || !isNumeric(args[1]) {
 			return nil, fmt.Errorf("%d:%d: '<' expects two numbers", line, col)
 		}
-		return BoolValue(args[0].IntVal < args[1].IntVal), nil
+		return BoolValue(numericLess(args[0], args[1])), nil
 
 	case "builtin:>":
-		if len(args) != 2 || args[0].Type != TypeInteger || args[1].Type != TypeInteger {
+		if len(args) != 2 || !isNumeric(args[0]) || !isNumeric(args[1]) {
 			return nil, fmt.Errorf("%d:%d: '>' expects two numbers", line, col)
 		}
-		return BoolValue(args[0].IntVal > args[1].IntVal), nil
+		return BoolValue(numericLess(args[1], args[0])), nil
 
 	case "builtin:=":
-		if len(args) != 2 || args[0].Type != TypeInteger || args[1].Type != TypeInteger {
+		if len(args) != 2 || !isNumeric(args[0]) || !isNumeric(args[1]) {
 			return nil, fmt.Errorf("%d:%d: '=' expects two numbers", line, col)
 		}
-		return BoolValue(args[0].IntVal == args[1].IntVal), nil
+		return BoolValue(numericEqual(args[0], args[1])), nil
 
 	case "builtin:<=":
-		if len(args) != 2 || args[0].Type != TypeInteger || args[1].Type != TypeInteger {
+		if len(args) != 2 || !isNumeric(args[0]) || !isNumeric(args[1]) {
 			return nil, fmt.Errorf("%d:%d: '<=' expects two numbers", line, col)
 		}
-		return BoolValue(args[0].IntVal <= args[1].IntVal), nil
+		return BoolValue(!numericLess(args[1], args[0])), nil
 
 	case "builtin:not":
 		if len(args) != 1 {
@@ -244,10 +321,10 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 		return BoolValue(!isTruthy(args[0])), nil
 
 	case "builtin:>=":
-		if len(args) != 2 || args[0].Type != TypeInteger || args[1].Type != TypeInteger {
+		if len(args) != 2 || !isNumeric(args[0]) || !isNumeric(args[1]) {
 			return nil, fmt.Errorf("%d:%d: '>=' expects two numbers", line, col)
 		}
-		return BoolValue(args[0].IntVal >= args[1].IntVal), nil
+		return BoolValue(!numericLess(args[0], args[1])), nil
 
 	case "builtin:cons":
 		if len(args) != 2 {
@@ -311,7 +388,7 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 		if len(args) != 1 {
 			return nil, fmt.Errorf("%d:%d: 'number?' expects 1 argument", line, col)
 		}
-		return BoolValue(args[0].Type == TypeInteger), nil
+		return BoolValue(isNumeric(args[0])), nil
 
 	case "builtin:string?":
 		if len(args) != 1 {
@@ -428,10 +505,10 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 		return IntValue(n), nil
 
 	case "builtin:number->string":
-		if len(args) != 1 || args[0].Type != TypeInteger {
+		if len(args) != 1 || !isNumeric(args[0]) {
 			return nil, fmt.Errorf("%d:%d: 'number->string' expects a number", line, col)
 		}
-		return StringValue(strconv.FormatInt(args[0].IntVal, 10)), nil
+		return StringValue(args[0].Display()), nil
 
 	case "builtin:symbol->string":
 		if len(args) != 1 || args[0].Type != TypeSymbol {
@@ -828,18 +905,87 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 			return nil, fmt.Errorf("%d:%d: 'eq?' expects 2 arguments", line, col)
 		}
 		return BoolValue(valuesEq(args[0], args[1])), nil
+
+	// L11: Exact arithmetic & rationals
+	case "builtin:exact?":
+		if len(args) != 1 || !isNumeric(args[0]) {
+			return nil, fmt.Errorf("%d:%d: 'exact?' expects a number", line, col)
+		}
+		return BoolValue(args[0].Type == TypeInteger || args[0].Type == TypeRational), nil
+
+	case "builtin:inexact?":
+		if len(args) != 1 || !isNumeric(args[0]) {
+			return nil, fmt.Errorf("%d:%d: 'inexact?' expects a number", line, col)
+		}
+		return BoolValue(args[0].Type == TypeFloat), nil
+
+	case "builtin:exact->inexact":
+		if len(args) != 1 || !isNumeric(args[0]) {
+			return nil, fmt.Errorf("%d:%d: 'exact->inexact' expects a number", line, col)
+		}
+		return FloatValue(toFloat64(args[0])), nil
+
+	case "builtin:inexact->exact":
+		if len(args) != 1 || !isNumeric(args[0]) {
+			return nil, fmt.Errorf("%d:%d: 'inexact->exact' expects a number", line, col)
+		}
+		if args[0].Type == TypeInteger || args[0].Type == TypeRational {
+			return args[0], nil // already exact
+		}
+		num, den := floatToRational(args[0].FloatVal)
+		return RationalValue(num, den), nil
+
+	case "builtin:numerator":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("%d:%d: 'numerator' expects 1 argument", line, col)
+		}
+		switch args[0].Type {
+		case TypeInteger:
+			return args[0], nil
+		case TypeRational:
+			return IntValue(args[0].Num), nil
+		default:
+			return nil, fmt.Errorf("%d:%d: 'numerator' expects an exact number", line, col)
+		}
+
+	case "builtin:denominator":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("%d:%d: 'denominator' expects 1 argument", line, col)
+		}
+		switch args[0].Type {
+		case TypeInteger:
+			return IntValue(1), nil
+		case TypeRational:
+			return IntValue(args[0].Den), nil
+		default:
+			return nil, fmt.Errorf("%d:%d: 'denominator' expects an exact number", line, col)
+		}
+
+	case "builtin:integer?":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("%d:%d: 'integer?' expects 1 argument", line, col)
+		}
+		return BoolValue(args[0].Type == TypeInteger), nil
+
+	case "builtin:rational?":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("%d:%d: 'rational?' expects 1 argument", line, col)
+		}
+		return BoolValue(args[0].Type == TypeInteger || args[0].Type == TypeRational), nil
 	}
 
 	return nil, fmt.Errorf("%d:%d: unknown builtin %s", line, col, name)
 }
 
 func valuesEqual(a, b *Value) bool {
+	// Numeric cross-type comparison
+	if isNumeric(a) && isNumeric(b) {
+		return numericEqual(a, b)
+	}
 	if a.Type != b.Type {
 		return false
 	}
 	switch a.Type {
-	case TypeInteger:
-		return a.IntVal == b.IntVal
 	case TypeBoolean:
 		return a.BoolVal == b.BoolVal
 	case TypeString:
@@ -866,6 +1012,10 @@ func valuesEq(a, b *Value) bool {
 	switch a.Type {
 	case TypeInteger:
 		return a.IntVal == b.IntVal
+	case TypeRational:
+		return a.Num == b.Num && a.Den == b.Den
+	case TypeFloat:
+		return a.FloatVal == b.FloatVal
 	case TypeBoolean:
 		return a.BoolVal == b.BoolVal
 	case TypeSymbol:

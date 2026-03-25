@@ -1,6 +1,9 @@
 package ming
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+)
 
 type TokenType int
 
@@ -13,12 +16,16 @@ const (
 	TokenSymbol
 	TokenQuote
 	TokenChar
+	TokenFloat
+	TokenRational
 	TokenEOF
 )
 
 type Token struct {
 	Type   TokenType
-	IntVal int64
+	IntVal   int64
+	FloatVal float64
+	Num, Den int64
 	StrVal string
 	Line   int
 	Col    int
@@ -193,6 +200,16 @@ func (t *Tokenizer) readSymbolOrNumber(line, col int) (Token, error) {
 		return Token{Type: TokenInteger, IntVal: n, Line: line, Col: col}, nil
 	}
 
+	// Try to parse as rational (e.g. 1/3, -5/2)
+	if num, den, ok := parseRational(str); ok {
+		return Token{Type: TokenRational, Num: num, Den: den, Line: line, Col: col}, nil
+	}
+
+	// Try to parse as float (e.g. 1.5, -0.3)
+	if f, ok := parseFloat(str); ok {
+		return Token{Type: TokenFloat, FloatVal: f, Line: line, Col: col}, nil
+	}
+
 	return Token{Type: TokenSymbol, StrVal: str, Line: line, Col: col}, nil
 }
 
@@ -220,4 +237,65 @@ func parseInt(s string) (int64, bool) {
 		n = -n
 	}
 	return n, true
+}
+
+func parseRational(s string) (int64, int64, bool) {
+	// Find the slash
+	slashIdx := -1
+	for i := 1; i < len(s); i++ { // start at 1 to skip possible leading sign
+		if s[i] == '/' {
+			slashIdx = i
+			break
+		}
+	}
+	if slashIdx < 0 {
+		return 0, 0, false
+	}
+	num, ok1 := parseInt(s[:slashIdx])
+	den, ok2 := parseInt(s[slashIdx+1:])
+	if !ok1 || !ok2 || den <= 0 {
+		return 0, 0, false
+	}
+	return num, den, true
+}
+
+func parseFloat(s string) (float64, bool) {
+	if len(s) == 0 {
+		return 0, false
+	}
+	// Must contain a dot
+	hasDot := false
+	for _, c := range s {
+		if c == '.' {
+			hasDot = true
+			break
+		}
+	}
+	if !hasDot {
+		return 0, false
+	}
+	// Validate: optional sign, digits, dot, digits
+	start := 0
+	if s[0] == '-' || s[0] == '+' {
+		start = 1
+		if len(s) == 1 {
+			return 0, false
+		}
+	}
+	dotSeen := false
+	for i := start; i < len(s); i++ {
+		if s[i] == '.' {
+			if dotSeen {
+				return 0, false
+			}
+			dotSeen = true
+		} else if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+	}
+	val, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, false
+	}
+	return val, true
 }

@@ -4,10 +4,12 @@ import "fmt"
 
 // Expr represents a parsed Scheme expression.
 type Expr struct {
-	Type    ExprType
-	IntVal  int64
-	BoolVal bool
-	StrVal  string
+	Type     ExprType
+	IntVal   int64
+	FloatVal float64
+	Num, Den int64
+	BoolVal  bool
+	StrVal   string
 	// For list expressions (function calls, special forms)
 	Elements []*Expr
 	Line     int
@@ -25,6 +27,8 @@ const (
 	ExprSymbol
 	ExprList
 	ExprChar
+	ExprFloat
+	ExprRational
 	ExprLiteral
 )
 
@@ -76,6 +80,10 @@ func (p *Parser) ParseExpr() (*Expr, error) {
 		return &Expr{Type: ExprSymbol, StrVal: tok.StrVal, Line: tok.Line, Col: tok.Col}, nil
 	case TokenChar:
 		return &Expr{Type: ExprChar, StrVal: tok.StrVal, Line: tok.Line, Col: tok.Col}, nil
+	case TokenFloat:
+		return &Expr{Type: ExprFloat, FloatVal: tok.FloatVal, Line: tok.Line, Col: tok.Col}, nil
+	case TokenRational:
+		return &Expr{Type: ExprRational, Num: tok.Num, Den: tok.Den, Line: tok.Line, Col: tok.Col}, nil
 	case TokenLParen:
 		return p.parseList(tok.Line, tok.Col)
 	case TokenQuote:

@@ -13,6 +13,10 @@ func Eval(expr *Expr, env *Env) (*Value, error) {
 	case ExprChar:
 		runes := []rune(expr.StrVal)
 		return CharValue(runes[0]), nil
+	case ExprFloat:
+		return FloatValue(expr.FloatVal), nil
+	case ExprRational:
+		return RationalValue(expr.Num, expr.Den), nil
 	case ExprSymbol:
 		val, ok := env.Get(expr.StrVal)
 		if !ok {
@@ -178,6 +182,10 @@ func exprToValue(expr *Expr) *Value {
 		return StringValue(expr.StrVal)
 	case ExprSymbol:
 		return SymbolValue(expr.StrVal)
+	case ExprFloat:
+		return FloatValue(expr.FloatVal)
+	case ExprRational:
+		return RationalValue(expr.Num, expr.Den)
 	case ExprList:
 		if len(expr.Elements) == 0 {
 			return Null

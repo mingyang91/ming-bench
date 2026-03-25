@@ -18,6 +18,8 @@ const (
 	TypeLambda
 	TypeChar
 	TypeMacro
+	TypeRational
+	TypeFloat
 )
 
 type Value struct {
@@ -27,7 +29,10 @@ type Value struct {
 	StrVal  string
 	Car     *Value
 	Cdr     *Value
-	CharVal rune
+	CharVal  rune
+	FloatVal float64
+	Num      int64 // rational numerator
+	Den      int64 // rational denominator
 	// Lambda fields
 	Params    []string
 	RestParam string // variadic rest parameter (empty if none)
@@ -101,6 +106,10 @@ func (v *Value) Display() string {
 		default:
 			return fmt.Sprintf("#\\%c", v.CharVal)
 		}
+	case TypeRational:
+		return fmt.Sprintf("%d/%d", v.Num, v.Den)
+	case TypeFloat:
+		return formatFloat(v.FloatVal)
 	}
 	return ""
 }
