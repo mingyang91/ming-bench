@@ -3,6 +3,10 @@ package ming
 /** Scheme interpreter — CEK machine with first-class continuations. */
 object Evaluator:
 
+  /** Thread-local dynamic-wind stack (head = innermost extent). */
+  private[ming] val windStack: ThreadLocal[List[WindEntry]] =
+    ThreadLocal.withInitial(() => Nil)
+
   private[ming] enum State:
     case Ev(expr: SchemeVal, env: Env, k: Cont)
     case Ko(value: SchemeVal, k: Cont)
@@ -163,92 +167,59 @@ object Evaluator:
         if body.isEmpty then State.Ko(v, k2)
         else evalBodyCek(body, env, k2)
       else LetForms.evalCondStep(remaining, env, k2)
+    // dynamic-wind normal flow
+    case Cont.DynWindAfterInK(bodyThunk, entry, k2) =>
+      // in-thunk done; push entry onto wind stack, call body
+      windStack.set(entry :: windStack.get())
+      performApply(bodyThunk, Nil, Cont.DynWindAfterBodyK(entry, k2))
+    case Cont.DynWindAfterBodyK(entry, k2) =>
+      // body done; pop entry from wind stack, call out-thunk
+      val ws = windStack.get()
+      if ws.nonEmpty && (ws.head eq entry) then windStack.set(ws.tail)
+      performApply(entry.outThunk, Nil, Cont.DynWindAfterOutK(v, k2))
+    case Cont.DynWindAfterOutK(bodyValue, k2) =>
+      // out-thunk done; return body value
+      State.Ko(bodyValue, k2)
+    // continuation wind/unwind steps
+    case Cont.WindContinueK(remaining, finalValue, targetK, targetWinds) =>
+      DynWind.startWindActions(remaining, finalValue, targetK, targetWinds)(performApply)
+    case Cont.WindPushK(entry, remaining, finalValue, targetK, targetWinds) =>
+      // in-thunk done during rewind; push entry onto wind stack
+      windStack.set(entry :: windStack.get())
+      DynWind.startWindActions(remaining, finalValue, targetK, targetWinds)(performApply)
 
   private def performApply(op: SchemeVal, args: List[SchemeVal], k: Cont): State =
     op match
       case SchemeVal.SLambda(params, restParam, body, closure) =>
-        val callEnv = setupCallEnv(params, restParam, args, closure)
+        val callEnv = Apply.setupCallEnv(params, restParam, args, closure)
         evalBodyCek(body, callEnv, k)
       case SchemeVal.SCaseLambda(clauses, closure) =>
-        val (cparams, crest, cbody) = findClause(clauses, args)
-        val callEnv                 = setupCallEnv(cparams, crest, args, closure)
+        val (cparams, crest, cbody) = Apply.findClause(clauses, args)
+        val callEnv                 = Apply.setupCallEnv(cparams, crest, args, closure)
         evalBodyCek(cbody, callEnv, k)
-      case SchemeVal.SContinuation(savedK) =>
+      case SchemeVal.SContinuation(savedK, savedWinds) =>
         if args.length != 1 then throw new EvalError("continuation: expected 1 argument")
-        State.Ko(args.head, savedK)
+        val currentWinds = windStack.get()
+        val actions      = DynWind.computeWindActions(currentWinds, savedWinds)
+        if actions.isEmpty then State.Ko(args.head, savedK)
+        else DynWind.startWindActions(actions, args.head, savedK, savedWinds)(performApply)
       case SchemeVal.SSymbol(name) if name == "call/cc" || name == "call-with-current-continuation" =>
         if args.length != 1 then throw new EvalError("call/cc: expected 1 argument")
-        val contVal = SchemeVal.SContinuation(k)
+        val contVal = SchemeVal.SContinuation(k, windStack.get())
         performApply(args.head, List(contVal), k)
+      case SchemeVal.SSymbol("dynamic-wind") =>
+        if args.length != 3 then throw new EvalError("dynamic-wind: expected 3 arguments")
+        val (inThunk, bodyThunk, outThunk) = (args(0), args(1), args(2))
+        val entry                          = new WindEntry(inThunk, outThunk)
+        performApply(inThunk, Nil, Cont.DynWindAfterInK(bodyThunk, entry, k))
       case SchemeVal.SSymbol(name)
           if name.startsWith("__record-ctor__:") ||
             name.startsWith("__record-pred__:") ||
             name.startsWith("__record-acc__:") =>
         State.Ko(RecordOps.applyRecordOp(name, args), k)
       case SchemeVal.SSymbol(name) =>
-        State.Ko(applyBuiltinOrHOF(name, args), k)
+        State.Ko(Apply.applyBuiltinOrHOF(name, args), k)
       case _ => throw new EvalError(s"not a procedure: ${op.display}")
-
-  /** Non-CPS apply — used by HigherOrder (map, for-each, apply). */
-  private[ming] def applyProc(op: SchemeVal, args: List[SchemeVal]): SchemeVal =
-    op match
-      case SchemeVal.SLambda(params, restParam, body, closure) =>
-        val callEnv = setupCallEnv(params, restParam, args, closure)
-        evalBody(body, callEnv)
-      case SchemeVal.SCaseLambda(clauses, closure) =>
-        val (cparams, crest, cbody) = findClause(clauses, args)
-        val callEnv                 = setupCallEnv(cparams, crest, args, closure)
-        evalBody(cbody, callEnv)
-      case SchemeVal.SSymbol(name)
-          if name.startsWith("__record-ctor__:") ||
-            name.startsWith("__record-pred__:") ||
-            name.startsWith("__record-acc__:") =>
-        RecordOps.applyRecordOp(name, args)
-      case SchemeVal.SSymbol(name) =>
-        applyBuiltinOrHOF(name, args)
-      case _ => throw new EvalError(s"not a procedure: ${op.display}")
-
-  private def applyBuiltinOrHOF(
-    name: String,
-    args: List[SchemeVal]
-  ): SchemeVal =
-    name match
-      case "display" | "write" | "newline" | "apply" | "map" | "for-each" =>
-        HigherOrder(name, args, applyProc)
-      case _ => Builtins.applyBuiltin(name, args)
-
-  private def setupCallEnv(
-    params: List[String],
-    restParam: Option[String],
-    args: List[SchemeVal],
-    closure: Env
-  ): Env =
-    restParam match
-      case None =>
-        if params.length != args.length then
-          throw new EvalError(s"expected ${params.length} arguments, got ${args.length}")
-        val callEnv = Env(Some(closure))
-        params.zip(args).foreach((p, a) => callEnv.define(p, a))
-        callEnv
-      case Some(rest) =>
-        if args.length < params.length then
-          throw new EvalError(s"expected at least ${params.length} arguments, got ${args.length}")
-        val callEnv = Env(Some(closure))
-        params.zip(args).foreach((p, a) => callEnv.define(p, a))
-        callEnv.define(rest, SchemeVal.SList(args.drop(params.length)))
-        callEnv
-
-  private def findClause(
-    clauses: List[(List[String], Option[String], List[SchemeVal])],
-    args: List[SchemeVal]
-  ): (List[String], Option[String], List[SchemeVal]) =
-    clauses
-      .find { case (params, restParam, _) =>
-        restParam match
-          case None    => args.length == params.length
-          case Some(_) => args.length >= params.length
-      }
-      .getOrElse(throw new EvalError(s"no matching clause for ${args.length} arguments"))
 
   private def isMacro(v: SchemeVal): Boolean = v match
     case _: SchemeVal.SMacro => true
@@ -260,12 +231,14 @@ object Evaluator:
     env
 
   def evalStr(input: String): String =
+    windStack.set(Nil)
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw new EvalError("empty input")
     val env = makeGlobalEnv()
     evalBody(exprs, env).display
 
   def evalStrWithOutput(input: String): (String, String) =
+    windStack.set(Nil)
     val buf = HigherOrder.outputBuffer.get()
     buf.clear()
     val exprs = Parser.parseAll(input)

@@ -122,7 +122,9 @@ object Builtins:
     "string>=?",
     // L18
     "call/cc",
-    "call-with-current-continuation"
+    "call-with-current-continuation",
+    // L19
+    "dynamic-wind"
   )
 
   private def isTruthy(v: SchemeVal): Boolean = v match
