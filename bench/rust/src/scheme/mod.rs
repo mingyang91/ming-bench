@@ -58,18 +58,26 @@ enum RenderMode {
 #[derive(Clone)]
 struct SchemeString {
     chars: Rc<RefCell<Vec<char>>>,
+    mutable: bool,
 }
 
 impl SchemeString {
     fn new(value: impl AsRef<str>) -> Self {
-        Self {
-            chars: Rc::new(RefCell::new(value.as_ref().chars().collect())),
-        }
+        Self::from_chars(value.as_ref().chars().collect())
     }
 
     fn from_chars(chars: Vec<char>) -> Self {
+        Self::from_chars_with_mutability(chars, false)
+    }
+
+    fn from_mutable_chars(chars: Vec<char>) -> Self {
+        Self::from_chars_with_mutability(chars, true)
+    }
+
+    fn from_chars_with_mutability(chars: Vec<char>, mutable: bool) -> Self {
         Self {
             chars: Rc::new(RefCell::new(chars)),
+            mutable,
         }
     }
 
@@ -77,12 +85,16 @@ impl SchemeString {
         self.chars.borrow().iter().collect()
     }
 
+    fn to_chars(&self) -> Vec<char> {
+        self.chars.borrow().clone()
+    }
+
     fn len(&self) -> usize {
         self.chars.borrow().len()
     }
 
     fn deep_copy(&self) -> Self {
-        Self::from_chars(self.chars.borrow().clone())
+        Self::from_mutable_chars(self.to_chars())
     }
 
     fn substring(&self, start: usize, end: usize) -> Result<Self, EvalError> {
@@ -114,6 +126,12 @@ impl SchemeString {
     }
 
     fn set(&self, index: usize, value: char, kind: &'static str) -> Result<(), EvalError> {
+        if !self.mutable {
+            return Err(EvalError::ImmutableString {
+                name: kind.to_string(),
+            });
+        }
+
         let mut chars = self.chars.borrow_mut();
         let length = chars.len();
         let slot = chars.get_mut(index).ok_or(EvalError::IndexOutOfBounds {
@@ -660,6 +678,7 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "/", builtin_div);
     define_builtin(&env, "<", builtin_less_than);
     define_builtin(&env, ">", builtin_greater_than);
+    define_builtin(&env, ">=", builtin_greater_equal);
     define_builtin(&env, "=", builtin_equal_numbers);
     define_builtin(&env, "<=", builtin_less_equal);
     define_builtin(&env, "eq?", builtin_eq);
@@ -700,8 +719,12 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "string->symbol", builtin_string_to_symbol);
     define_builtin(&env, "string-ref", builtin_string_ref);
     define_builtin(&env, "string-copy", builtin_string_copy);
+    define_builtin(&env, "string->list", builtin_string_to_list);
+    define_builtin(&env, "list->string", builtin_list_to_string);
     define_builtin(&env, "string-set!", builtin_string_set);
     define_builtin(&env, "char?", builtin_char_predicate);
+    define_builtin(&env, "char->integer", builtin_char_to_integer);
+    define_builtin(&env, "integer->char", builtin_integer_to_char);
     define_builtin(&env, "abs", builtin_abs);
     define_builtin(&env, "modulo", builtin_modulo);
     define_builtin(&env, "remainder", builtin_remainder);
@@ -2062,6 +2085,23 @@ fn builtin_string_copy(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, 
     Ok(Value::String(expect_string(&args[0])?.deep_copy()))
 }
 
+fn builtin_string_to_list(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("string->list", args, 1)?;
+    let chars = expect_string(&args[0])?.to_chars();
+    Ok(list_from_values(
+        chars.into_iter().map(Value::Char).collect(),
+    ))
+}
+
+fn builtin_list_to_string(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("list->string", args, 1)?;
+    let chars = expect_list_values(&args[0])?
+        .into_iter()
+        .map(|value| expect_char(&value))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Value::String(SchemeString::from_chars(chars)))
+}
+
 fn builtin_string_set(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     expect_value_arity("string-set!", args, 3)?;
     let string = expect_string(&args[0])?;
@@ -2290,6 +2330,23 @@ fn builtin_char_upcase(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, 
     Ok(Value::Char(ch.to_uppercase().next().unwrap_or(ch)))
 }
 
+fn builtin_char_to_integer(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("char->integer", args, 1)?;
+    Ok(Value::Number(Number::integer(i64::from(u32::from(
+        expect_char(&args[0])?,
+    )))))
+}
+
+fn builtin_integer_to_char(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    expect_value_arity("integer->char", args, 1)?;
+    let value = expect_exact_integer(&args[0], "integer->char")?;
+    let code_point =
+        u32::try_from(value).map_err(|_| EvalError::InvalidCharacterCodePoint { value })?;
+    let ch = char::from_u32(code_point)
+        .ok_or(EvalError::InvalidCharacterCodePoint { value })?;
+    Ok(Value::Char(ch))
+}
+
 fn builtin_char_downcase(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     expect_value_arity("char-downcase", args, 1)?;
     let ch = expect_char(&args[0])?;
@@ -2471,6 +2528,10 @@ fn builtin_less_than(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, Ev
 
 fn builtin_greater_than(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
     builtin_compare(">", args, |left, right| left.compare(right).is_gt())
+}
+
+fn builtin_greater_equal(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    builtin_compare(">=", args, |left, right| !left.compare(right).is_lt())
 }
 
 fn builtin_equal_numbers(args: &[Value], _ctx: &mut EvalContext) -> Result<Value, EvalError> {

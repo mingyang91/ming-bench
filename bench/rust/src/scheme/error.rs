@@ -75,6 +75,9 @@ pub enum EvalError {
         got: usize,
     },
 
+    #[error("cannot mutate immutable string in {name}")]
+    ImmutableString { name: String },
+
     #[error("expected non-negative integer for {kind}, got {value}")]
     NegativeIndex { kind: &'static str, value: i64 },
 
@@ -92,6 +95,9 @@ pub enum EvalError {
         end: usize,
         length: usize,
     },
+
+    #[error("invalid character code point: {value}")]
+    InvalidCharacterCodePoint { value: i64 },
 }
 
 impl EvalError {
