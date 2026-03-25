@@ -74,6 +74,12 @@ class Env {
     throw errAt(`unbound variable: ${name}`, pos);
   }
 
+  set(name: string, val: SchemeVal, pos?: Pos): void {
+    if (this.bindings.has(name)) { this.bindings.set(name, val); return; }
+    if (this.parent) { this.parent.set(name, val, pos); return; }
+    throw errAt(`set!: unbound variable: ${name}`, pos);
+  }
+
   define(name: string, val: SchemeVal): void {
     this.bindings.set(name, val);
   }
@@ -497,6 +503,14 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
         });
         const body = elems.slice(2);
         return { tag: 'lambda', params, body, env };
+      }
+
+      if (op === 'set!') {
+        if (elems.length !== 3) throw errAt('set!: bad syntax', epos);
+        if (elems[1].tag !== 'symbol') throw errAt('set!: expected symbol', epos);
+        const val = evalExpr(elems[2], env);
+        env.set(elems[1].value, val, epos);
+        return { tag: 'void' };
       }
 
       if (op === 'begin') {
