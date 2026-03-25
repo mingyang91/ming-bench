@@ -12,7 +12,8 @@ pub(crate) enum MacroBinding {
 
 pub(super) const SPECIAL_FORMS: &[&str] = &[
     "define", "if", "quote", "lambda", "and", "or", "begin",
-    "let", "let*", "cond", "set!", "string-set!", "define-syntax", "syntax-rules",
+    "let", "let*", "cond", "set!", "string-set!", "set-car!", "set-cdr!",
+    "define-syntax", "syntax-rules",
     "define-record-type", "case-lambda", "letrec", "letrec*", "case", "do",
 ];
 

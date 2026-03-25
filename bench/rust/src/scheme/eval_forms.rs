@@ -3,7 +3,7 @@
 //! Each function returns `Tco::Tail(expr, env)` when the caller should
 //! continue the trampoline, or `Tco::Done(val)` for an immediate result.
 
-use super::{eval, Env, EvalError, Expr, ExprKind, Span, Val};
+use super::{eval, vec_to_cons, Env, EvalError, Expr, ExprKind, Span, Val};
 
 /// Signals whether the eval trampoline should continue or return.
 pub(crate) enum Tco {
@@ -305,7 +305,7 @@ pub(crate) fn bind_lambda_args(
         new_env.define(p.clone(), a.clone());
     }
     if let Some(rest) = rest_param {
-        new_env.define(rest.clone(), Val::List(args[params.len()..].to_vec()));
+        new_env.define(rest.clone(), vec_to_cons(args[params.len()..].to_vec()));
     }
     Ok(new_env)
 }

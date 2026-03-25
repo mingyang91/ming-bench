@@ -2,10 +2,12 @@ pub mod error;
 mod builtins;
 mod eval_forms;
 mod macros;
+mod parser;
 
 pub use error::EvalError;
 use builtins::*;
 use macros::eval_macro_call;
+use parser::parse_all;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -32,7 +34,7 @@ pub(crate) enum Val {
     Char(char),
     Symbol(String),
     List(Vec<Val>),
-    Pair(Box<Val>, Box<Val>),
+    Pair(Rc<RefCell<(Val, Val)>>),
     Lambda {
         params: Vec<String>,
         rest_param: Option<String>,
@@ -53,7 +55,7 @@ pub(crate) enum Val {
     Void,
 }
 
-fn gcd(mut a: i64, mut b: i64) -> i64 {
+pub(crate) fn gcd(mut a: i64, mut b: i64) -> i64 {
     a = a.abs();
     b = b.abs();
     while b != 0 {
@@ -75,6 +77,93 @@ pub(crate) fn make_rational(n: i64, d: i64) -> Val {
     let n = n / g;
     let d = d / g;
     if d == 1 { Val::Int(n) } else { Val::Rational(n, d) }
+}
+
+pub(crate) fn make_pair(car: Val, cdr: Val) -> Val {
+    Val::Pair(Rc::new(RefCell::new((car, cdr))))
+}
+
+pub(crate) fn vec_to_cons(items: Vec<Val>) -> Val {
+    let mut result = Val::List(vec![]);
+    for item in items.into_iter().rev() {
+        result = make_pair(item, result);
+    }
+    result
+}
+
+/// Collect elements from a proper list (either Val::List or cons chain) into a Vec.
+pub(crate) fn collect_list(v: &Val) -> Result<Vec<Val>, EvalError> {
+    match v {
+        Val::List(elems) => Ok(elems.clone()),
+        Val::Pair(_) => {
+            let mut items = Vec::new();
+            let mut cur = v.clone();
+            loop {
+                match &cur {
+                    Val::List(elems) if elems.is_empty() => return Ok(items),
+                    Val::Pair(rc) => {
+                        let (car, cdr) = {
+                            let pair = rc.borrow();
+                            (pair.0.clone(), pair.1.clone())
+                        };
+                        items.push(car);
+                        cur = cdr;
+                    }
+                    _ => return Err(EvalError::Type("expected proper list".into())),
+                }
+            }
+        }
+        _ => Err(EvalError::Type("expected list".into())),
+    }
+}
+
+fn pair_cdr(v: &Val) -> Option<Val> {
+    match v {
+        Val::Pair(rc) => Some(rc.borrow().1.clone()),
+        _ => None,
+    }
+}
+
+fn pair_ptr(v: &Val) -> Option<usize> {
+    match v {
+        Val::Pair(rc) => Some(Rc::as_ptr(rc) as usize),
+        _ => None,
+    }
+}
+
+/// Check if a value is a proper list (nil-terminated), with cycle detection.
+pub(crate) fn is_proper_list(v: &Val) -> bool {
+    match v {
+        Val::List(elems) => elems.is_empty(),
+        Val::Pair(_) => {
+            let mut tortoise = v.clone();
+            let mut hare = v.clone();
+            loop {
+                // hare moves two steps
+                for _ in 0..2 {
+                    match pair_cdr(&hare) {
+                        Some(next) => hare = next,
+                        None => {
+                            return matches!(hare, Val::List(ref e) if e.is_empty());
+                        }
+                    }
+                }
+                // tortoise moves one step
+                if let Some(next) = pair_cdr(&tortoise) {
+                    tortoise = next;
+                } else {
+                    return true;
+                }
+                // check cycle by Rc pointer
+                if let (Some(tp), Some(hp)) = (pair_ptr(&tortoise), pair_ptr(&hare)) {
+                    if tp == hp {
+                        return false;
+                    }
+                }
+            }
+        }
+        _ => false,
+    }
 }
 
 impl Val {
@@ -114,17 +203,43 @@ impl fmt::Display for Val {
                 }
                 write!(f, ")")
             }
-            Val::Pair(a, b) => {
-                write!(f, "({a}")?;
-                let mut cur = b.as_ref();
+            Val::Pair(rc) => {
+                use std::collections::HashSet;
+                let mut seen = HashSet::new();
+                seen.insert(Rc::as_ptr(rc) as usize);
+                let (car, cdr) = {
+                    let pair = rc.borrow();
+                    (format!("{}", pair.0), pair.1.clone())
+                };
+                write!(f, "({car}")?;
+                let mut cur = cdr;
                 loop {
-                    match cur {
-                        Val::Pair(ca, cb) => {
-                            write!(f, " {ca}")?;
-                            cur = cb.as_ref();
-                        }
+                    match &cur {
                         Val::List(v) if v.is_empty() => break,
-                        other => { write!(f, " . {other}")?; break; }
+                        Val::List(v) => {
+                            // Non-empty quoted list as tail: print elements inline
+                            for e in v {
+                                write!(f, " {e}")?;
+                            }
+                            break;
+                        }
+                        Val::Pair(rc2) => {
+                            let ptr = Rc::as_ptr(rc2) as usize;
+                            if !seen.insert(ptr) {
+                                write!(f, " ...")?;
+                                break;
+                            }
+                            let (car2, cdr2) = {
+                                let p = rc2.borrow();
+                                (format!("{}", p.0), p.1.clone())
+                            };
+                            write!(f, " {car2}")?;
+                            cur = cdr2;
+                        }
+                        other => {
+                            write!(f, " . {other}")?;
+                            break;
+                        }
                     }
                 }
                 write!(f, ")")
@@ -246,11 +361,73 @@ impl Env {
             ("vector?", builtin_is_vector),
             ("vector->list", builtin_vector_to_list),
             ("list->vector", builtin_list_to_vector),
+            ("for-each", builtin_for_each),
+            ("assq", builtin_assq),
+            ("assv", builtin_assv),
+            ("memq", builtin_memq),
+            ("memv", builtin_memv),
+            ("member", builtin_member),
+            ("reverse", builtin_reverse),
+            ("gcd", builtin_gcd),
+            ("lcm", builtin_lcm),
+            ("truncate", builtin_truncate),
+            ("round", builtin_round),
+            ("floor", builtin_floor),
+            ("ceiling", builtin_ceiling),
+            ("make-string", builtin_make_string),
+            ("string", builtin_string),
+            ("string>?", builtin_string_gt),
+            ("string<=?", builtin_string_le),
+            ("string>=?", builtin_string_ge),
+            ("error", builtin_error),
+            ("null-environment", builtin_null_environment),
+            ("char>?", builtin_char_gt),
+            ("char<=?", builtin_char_le),
+            ("char>=?", builtin_char_ge),
+            ("vector-fill!", builtin_vector_fill),
+            ("set-car!", builtin_set_car),
+            ("set-cdr!", builtin_set_cdr),
         ];
         for &(name, f) in builtins {
             frame.borrow_mut().insert(name.to_string(), Val::Builtin(f));
         }
-        Env { frames: vec![frame], output: Rc::new(RefCell::new(String::new())) }
+        let env = Env { frames: vec![frame], output: Rc::new(RefCell::new(String::new())) };
+        // Load cxr helper definitions
+        let prelude = "\
+(define (caar x) (car (car x)))
+(define (cadr x) (car (cdr x)))
+(define (cdar x) (cdr (car x)))
+(define (cddr x) (cdr (cdr x)))
+(define (caaar x) (car (car (car x))))
+(define (caadr x) (car (car (cdr x))))
+(define (cadar x) (car (cdr (car x))))
+(define (caddr x) (car (cdr (cdr x))))
+(define (cdaar x) (cdr (car (car x))))
+(define (cdadr x) (cdr (car (cdr x))))
+(define (cddar x) (cdr (cdr (car x))))
+(define (cdddr x) (cdr (cdr (cdr x))))
+(define (caaaar x) (car (car (car (car x)))))
+(define (caaadr x) (car (car (car (cdr x)))))
+(define (caadar x) (car (car (cdr (car x)))))
+(define (caaddr x) (car (car (cdr (cdr x)))))
+(define (cadaar x) (car (cdr (car (car x)))))
+(define (cadadr x) (car (cdr (car (cdr x)))))
+(define (caddar x) (car (cdr (cdr (car x)))))
+(define (cadddr x) (car (cdr (cdr (cdr x)))))
+(define (cdaaar x) (cdr (car (car (car x)))))
+(define (cdaadr x) (cdr (car (car (cdr x)))))
+(define (cdadar x) (cdr (car (cdr (car x)))))
+(define (cdaddr x) (cdr (car (cdr (cdr x)))))
+(define (cddaar x) (cdr (cdr (car (car x)))))
+(define (cddadr x) (cdr (cdr (car (cdr x)))))
+(define (cdddar x) (cdr (cdr (cdr (car x)))))
+(define (cddddr x) (cdr (cdr (cdr (cdr x)))))
+";
+        let exprs = parse_all(prelude).expect("prelude must parse");
+        for expr in &exprs {
+            eval(expr, &env).expect("prelude must eval");
+        }
+        env
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<Val> {
@@ -330,162 +507,6 @@ impl Expr {
     }
 }
 
-struct Token {
-    text: String,
-    span: Span,
-}
-
-fn tokenize(input: &str) -> Vec<Token> {
-    let mut tokens = Vec::new();
-    let mut chars = input.chars().peekable();
-    let mut line = 1usize;
-    let mut col = 1usize;
-    while let Some(&c) = chars.peek() {
-        match c {
-            '\n' => { chars.next(); line += 1; col = 1; }
-            ' ' | '\t' | '\r' => { chars.next(); col += 1; }
-            ';' => {
-                while let Some(&c2) = chars.peek() {
-                    chars.next();
-                    col += 1;
-                    if c2 == '\n' { line += 1; col = 1; break; }
-                }
-            }
-            '(' => { tokens.push(Token { text: "(".into(), span: Span::new(line, col) }); chars.next(); col += 1; }
-            ')' => { tokens.push(Token { text: ")".into(), span: Span::new(line, col) }); chars.next(); col += 1; }
-            '\'' => { tokens.push(Token { text: "'".into(), span: Span::new(line, col) }); chars.next(); col += 1; }
-            '"' => {
-                let start_span = Span::new(line, col);
-                chars.next();
-                col += 1;
-                let mut s = String::new();
-                loop {
-                    match chars.next() {
-                        Some('\\') => {
-                            col += 1;
-                            match chars.next() {
-                                Some('n') => { s.push('\n'); col += 1; }
-                                Some('t') => { s.push('\t'); col += 1; }
-                                Some('"') => { s.push('"'); col += 1; }
-                                Some('\\') => { s.push('\\'); col += 1; }
-                                Some(other) => { s.push('\\'); s.push(other); col += 1; }
-                                None => break,
-                            }
-                        }
-                        Some('"') => { col += 1; break; }
-                        Some('\n') => { s.push('\n'); line += 1; col = 1; }
-                        Some(c2) => { s.push(c2); col += 1; }
-                        None => break,
-                    }
-                }
-                tokens.push(Token { text: format!("\"{}\"", s), span: start_span });
-            }
-            _ => {
-                let start_span = Span::new(line, col);
-                let mut tok = String::new();
-                while let Some(&c2) = chars.peek() {
-                    if c2 == '(' || c2 == ')' || c2 == ' ' || c2 == '\t' || c2 == '\n' || c2 == '\r' || c2 == ';' || c2 == '\'' {
-                        break;
-                    }
-                    tok.push(c2);
-                    chars.next();
-                    col += 1;
-                }
-                tokens.push(Token { text: tok, span: start_span });
-            }
-        }
-    }
-    tokens
-}
-
-fn parse(tokens: &[Token]) -> Result<(Expr, usize), EvalError> {
-    if tokens.is_empty() {
-        return Err(EvalError::Parse("unexpected end of input".into()));
-    }
-    let tok = &tokens[0];
-    let span = tok.span;
-    if tok.text == "'" {
-        let (inner, consumed) = parse(&tokens[1..])?;
-        Ok((Expr::new(ExprKind::List(vec![
-            Expr::new(ExprKind::Symbol("quote".into()), span),
-            inner,
-        ]), span), 1 + consumed))
-    } else if tok.text == "(" {
-        let mut elems = Vec::new();
-        let mut i = 1;
-        while i < tokens.len() && tokens[i].text != ")" {
-            let (expr, consumed) = parse(&tokens[i..])?;
-            elems.push(expr);
-            i += consumed;
-        }
-        if i >= tokens.len() {
-            return Err(EvalError::Parse(format!("missing closing paren at {span}")));
-        }
-        Ok((Expr::new(ExprKind::List(elems), span), i + 1))
-    } else if tok.text == ")" {
-        Err(EvalError::Parse(format!("unexpected ) at {span}")))
-    } else if tok.text.starts_with('"') {
-        let s = tok.text[1..tok.text.len()-1].to_string();
-        Ok((Expr::new(ExprKind::Str(s), span), 1))
-    } else if tok.text == "#t" {
-        Ok((Expr::new(ExprKind::Bool(true), span), 1))
-    } else if tok.text == "#f" {
-        Ok((Expr::new(ExprKind::Bool(false), span), 1))
-    } else if tok.text.starts_with("#\\") {
-        let rest = &tok.text[2..];
-        let ch = match rest {
-            "space" => ' ',
-            "newline" => '\n',
-            "tab" => '\t',
-            s if s.len() == 1 => s.chars().next().expect("single-char string is non-empty"),
-            _ => return Err(EvalError::Parse(format!("unknown character literal: {} at {span}", tok.text))),
-        };
-        Ok((Expr::new(ExprKind::Char(ch), span), 1))
-    } else if let Ok(n) = tok.text.parse::<i64>() {
-        Ok((Expr::new(ExprKind::Int(n), span), 1))
-    } else if let Some(pos) = tok.text.find('/') {
-        // Try rational literal n/d
-        let num_part = &tok.text[..pos];
-        let den_part = &tok.text[pos+1..];
-        if let (Ok(n), Ok(d)) = (num_part.parse::<i64>(), den_part.parse::<i64>()) {
-            if d != 0 {
-                // Simplify the rational
-                let sign = if d < 0 { -1 } else { 1 };
-                let nn = n * sign;
-                let dd = d * sign;
-                let g = gcd(nn.abs(), dd);
-                let nn = nn / g;
-                let dd = dd / g;
-                if dd == 1 {
-                    Ok((Expr::new(ExprKind::Int(nn), span), 1))
-                } else {
-                    Ok((Expr::new(ExprKind::Rational(nn, dd), span), 1))
-                }
-            } else {
-                Ok((Expr::new(ExprKind::Symbol(tok.text.clone()), span), 1))
-            }
-        } else {
-            Ok((Expr::new(ExprKind::Symbol(tok.text.clone()), span), 1))
-        }
-    } else if let Ok(x) = tok.text.parse::<f64>() {
-        Ok((Expr::new(ExprKind::Float(x), span), 1))
-    } else {
-        Ok((Expr::new(ExprKind::Symbol(tok.text.clone()), span), 1))
-    }
-}
-
-fn parse_all(input: &str) -> Result<Vec<Expr>, EvalError> {
-    let tokens = tokenize(input);
-    let mut exprs = Vec::new();
-    let mut i = 0;
-    while i < tokens.len() {
-        let (expr, consumed) = parse(&tokens[i..])?;
-        exprs.push(expr);
-        i += consumed;
-    }
-    Ok(exprs)
-}
-
 // --- Evaluator ---
 
 fn span_err(span: Span, err: EvalError) -> EvalError {
@@ -546,6 +567,8 @@ pub(crate) fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
                         "lambda" => return eval_lambda(&elems[1..], &cur_env, span),
                         "set!" => return eval_set_bang(&elems[1..], &cur_env, span),
                         "string-set!" => return eval_string_set(&elems[1..], &cur_env, span),
+                        "set-car!" => return eval_set_car(&elems[1..], &cur_env, span),
+                        "set-cdr!" => return eval_set_cdr(&elems[1..], &cur_env, span),
                         "define-syntax" => return eval_define_syntax(&elems[1..], &cur_env, span),
                         "define-record-type" => return eval_define_record_type(&elems[1..], &cur_env, span),
                         "case-lambda" => return eval_case_lambda(&elems[1..], &cur_env, span),
@@ -637,7 +660,7 @@ pub(crate) fn apply_val(func: &Val, args: &[Val], caller_env: &Env) -> Result<Va
                 for (p, a) in params.iter().zip(args.iter()) {
                     new_env.define(p.clone(), a.clone());
                 }
-                new_env.define(rest.clone(), Val::List(args[params.len()..].to_vec()));
+                new_env.define(rest.clone(), vec_to_cons(args[params.len()..].to_vec()));
                 let mut result = Val::Void;
                 for expr in body {
                     result = eval(expr, &new_env)?;
@@ -673,7 +696,7 @@ pub(crate) fn apply_val(func: &Val, args: &[Val], caller_env: &Env) -> Result<Va
                         new_env.define(p.clone(), a.clone());
                     }
                     if let Some(rest) = rest_param {
-                        new_env.define(rest.clone(), Val::List(args[params.len()..].to_vec()));
+                        new_env.define(rest.clone(), vec_to_cons(args[params.len()..].to_vec()));
                     }
                     let mut result = Val::Void;
                     for expr in body {
@@ -1067,6 +1090,36 @@ fn eval_string_set(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalErro
             Ok(Val::Void)
         }
         _ => Err(EvalError::Type("string-set!: expected string".into())),
+    }
+}
+
+fn eval_set_car(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity(format!("set-car!: expected 2 arguments at {span}")));
+    }
+    let pair_val = eval(&args[0], env)?;
+    let new_car = eval(&args[1], env)?;
+    match pair_val {
+        Val::Pair(rc) => {
+            rc.borrow_mut().0 = new_car;
+            Ok(Val::Void)
+        }
+        _ => Err(EvalError::Type("set-car!: expected pair".into())),
+    }
+}
+
+fn eval_set_cdr(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity(format!("set-cdr!: expected 2 arguments at {span}")));
+    }
+    let pair_val = eval(&args[0], env)?;
+    let new_cdr = eval(&args[1], env)?;
+    match pair_val {
+        Val::Pair(rc) => {
+            rc.borrow_mut().1 = new_cdr;
+            Ok(Val::Void)
+        }
+        _ => Err(EvalError::Type("set-cdr!: expected pair".into())),
     }
 }
 
