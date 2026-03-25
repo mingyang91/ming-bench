@@ -135,6 +135,20 @@ impl Environment {
         drop(borrowed);
         parent.and_then(|parent| Self::lookup(&parent, name))
     }
+
+    pub(crate) fn set(env: &EnvRef, name: &str, value: Value) -> bool {
+        let mut borrowed = env.borrow_mut();
+        if let Some(slot) = borrowed.bindings.get_mut(name) {
+            *slot = value;
+            return true;
+        }
+
+        let parent = borrowed.parent.clone();
+        drop(borrowed);
+        parent
+            .map(|parent| Self::set(&parent, name, value))
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Default)]

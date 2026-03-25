@@ -7,6 +7,7 @@ use super::error::EvalError;
 #[derive(Clone, Copy)]
 enum SpecialForm {
     Define,
+    Set,
     If,
     Quote,
     Lambda,
@@ -21,6 +22,7 @@ impl SpecialForm {
     fn from_symbol(symbol: &str) -> Option<Self> {
         match symbol {
             "define" => Some(Self::Define),
+            "set!" => Some(Self::Set),
             "if" => Some(Self::If),
             "quote" => Some(Self::Quote),
             "lambda" => Some(Self::Lambda),
@@ -36,6 +38,7 @@ impl SpecialForm {
     fn eval(self, args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value, EvalError> {
         match self {
             Self::Define => eval_define(args, env, runtime),
+            Self::Set => eval_set(args, env, runtime),
             Self::If => eval_if(args, env, runtime),
             Self::Quote => eval_quote(args),
             Self::Lambda => eval_lambda(args, env),
@@ -163,6 +166,35 @@ fn eval_if(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value, 
         eval_expr(consequent, env, runtime)
     } else {
         eval_expr(alternate, env, runtime)
+    }
+}
+
+fn eval_set(args: &[Expr], env: &EnvRef, runtime: &mut Runtime) -> Result<Value, EvalError> {
+    let [target, value_expr] = args else {
+        return Err(wrong_arg_count("set!", "exactly 2", args.len()));
+    };
+
+    let name = match target {
+        Expr::Symbol(name, _) => name,
+        Expr::Bool(_, _)
+        | Expr::Int(_, _)
+        | Expr::String(_, _)
+        | Expr::Char(_, _)
+        | Expr::List(_, _) => {
+            return Err(positioned_syntax_error(
+                target,
+                "set! target must be a symbol",
+            ));
+        }
+    };
+
+    let value = eval_expr(value_expr, env, runtime)?;
+    if Environment::set(env, name, value) {
+        Ok(Value::Void)
+    } else {
+        Err(target
+            .pos()
+            .attach(EvalError::UnboundSymbol { name: name.clone() }))
     }
 }
 
