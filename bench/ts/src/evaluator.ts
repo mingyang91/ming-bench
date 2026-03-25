@@ -127,6 +127,16 @@ class Environment {
     return this.lookupBinding(name)?.value;
   }
 
+  set(name: string, value: SchemeValue): boolean {
+    const binding = this.lookupBinding(name);
+    if (binding === undefined) {
+      return false;
+    }
+
+    binding.value = value;
+    return true;
+  }
+
   child(): Environment {
     return new Environment(this);
   }
@@ -413,6 +423,8 @@ function evaluateList(items: Expr[], env: Environment): SchemeValue {
         return evaluateLet(items.slice(1), env);
       case 'quote':
         return evaluateQuote(items.slice(1));
+      case 'set!':
+        return evaluateSet(items.slice(1), env);
     }
   }
 
@@ -566,6 +578,24 @@ function evaluateIf(items: Expr[], env: Environment): SchemeValue {
 function evaluateLambda(items: Expr[], env: Environment): SchemeValue {
   const { params, body } = parseLambdaParts(items);
   return makeClosure('lambda', params, body, env);
+}
+
+function evaluateSet(items: Expr[], env: Environment): SchemeValue {
+  if (items.length !== 2) {
+    throw new EvalError(`set! expected 2 argument(s), got ${items.length}`);
+  }
+
+  const target = items[0];
+  if (target.kind !== 'symbol') {
+    throw new EvalError('set! requires a symbol');
+  }
+
+  const value = evaluate(items[1], env);
+  if (!env.set(target.value, value)) {
+    throw new EvalError(`unbound variable: ${target.value}`);
+  }
+
+  return VOID_VALUE;
 }
 
 function evaluateLet(items: Expr[], env: Environment): SchemeValue {
