@@ -158,7 +158,7 @@ public class Evaluator {
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "quote", "if", "define", "lambda", "set!", "begin", "let", "let*", "cond", "and", "or",
         "define-syntax", "define-record-type", "letrec", "letrec*", "case", "do", "case-lambda",
-        "guard", "syntax-case", "syntax", "with-syntax"
+        "guard", "syntax-case", "syntax", "with-syntax", "quasiquote"
     );
 
     // ── Write representation ────────────────────────────────────
@@ -305,6 +305,14 @@ public class Evaluator {
             if (c == '(') { tokens.add(new Token("(", line, col)); i++; col++; continue; }
             if (c == ')') { tokens.add(new Token(")", line, col)); i++; col++; continue; }
             if (c == '\'') { tokens.add(new Token("'", line, col)); i++; col++; continue; }
+            if (c == '`') { tokens.add(new Token("`", line, col)); i++; col++; continue; }
+            if (c == ',' && i + 1 < len && input.charAt(i + 1) == '@') {
+                tokens.add(new Token(",@", line, col)); i += 2; col += 2; continue;
+            }
+            if (c == ',') { tokens.add(new Token(",", line, col)); i++; col++; continue; }
+            if (c == '#' && i + 1 < len && input.charAt(i + 1) == '(') {
+                tokens.add(new Token("#(", line, col)); i += 2; col += 2; continue;
+            }
             if (c == '#' && i + 1 < len && input.charAt(i + 1) == '\'') {
                 tokens.add(new Token("#'", line, col)); i += 2; col += 2; continue;
             }
@@ -369,6 +377,44 @@ public class Evaluator {
             Val result = new Val.PairV(quoteSym, inner);
             setPos(result, tok.line(), tok.col());
             return result;
+        }
+        if (tok.text().equals("`")) {
+            Val quoted = parse(tokens, idx);
+            Val inner = new Val.PairV(quoted, new Val.Nil());
+            Val qqSym = new Val.Sym("quasiquote");
+            setPos(qqSym, tok.line(), tok.col());
+            Val result = new Val.PairV(qqSym, inner);
+            setPos(result, tok.line(), tok.col());
+            return result;
+        }
+        if (tok.text().equals(",")) {
+            Val unquoted = parse(tokens, idx);
+            Val inner = new Val.PairV(unquoted, new Val.Nil());
+            Val uqSym = new Val.Sym("unquote");
+            setPos(uqSym, tok.line(), tok.col());
+            Val result = new Val.PairV(uqSym, inner);
+            setPos(result, tok.line(), tok.col());
+            return result;
+        }
+        if (tok.text().equals(",@")) {
+            Val spliced = parse(tokens, idx);
+            Val inner = new Val.PairV(spliced, new Val.Nil());
+            Val usSym = new Val.Sym("unquote-splicing");
+            setPos(usSym, tok.line(), tok.col());
+            Val result = new Val.PairV(usSym, inner);
+            setPos(result, tok.line(), tok.col());
+            return result;
+        }
+        if (tok.text().equals("#(")) {
+            List<Val> elems = new ArrayList<>();
+            while (idx[0] < tokens.size() && !tokens.get(idx[0]).text().equals(")")) {
+                elems.add(parse(tokens, idx));
+            }
+            if (idx[0] >= tokens.size()) throw new EvalError(tok.line() + ":" + tok.col() + ": missing ) for vector");
+            idx[0]++;
+            Val vec = new Val.Vec(elems.toArray(new Val[0]));
+            setPos(vec, tok.line(), tok.col());
+            return vec;
         }
         if (tok.text().equals("#'")) {
             Val syntaxed = parse(tokens, idx);
@@ -442,6 +488,7 @@ public class Evaluator {
         record AndK(Val remaining, Env env, Kont k) implements Kont {}
         record OrK(Val remaining, Env env, Kont k) implements Kont {}
         record CondK(Val clauseBody, Val remaining, Env env, Kont k) implements Kont {}
+        record CondArrowK(Val testValue, Kont k) implements Kont {}
         record CaseK(Val clauses, Env env, Kont k, Val form) implements Kont {}
         record LetK(List<String> names, int idx, List<Val> initExprs, List<Val> initVals, Env evalEnv, Env letEnv, List<Val> body, Kont k) implements Kont {}
         record LetStarK(String varName, Val remainingBindings, Env letEnv, List<Val> body, Kont k, Val form) implements Kont {}
@@ -647,6 +694,11 @@ public class Evaluator {
                     yield new Step.Apply(template, k);
                 }
             }
+            case "quasiquote" -> {
+                if (!(pair.cdr() instanceof Val.PairV qp)) throw posError(pair, "quasiquote: expected 1 argument");
+                Val expanded = expandQQ(qp.car());
+                yield new Step.Eval(expanded, env, k);
+            }
             case "with-syntax" -> {
                 Val wsArgs = pair.cdr();
                 if (!(wsArgs instanceof Val.PairV wsp)) throw posError(pair, "with-syntax: invalid syntax");
@@ -664,6 +716,46 @@ public class Evaluator {
             }
             default -> throw posError(pair, "unknown special form: " + fn);
         };
+    }
+
+    // ── Quasiquote expansion ─────────────────────────────────────
+    // Expands quasiquote template into equivalent Scheme code (cons/append/quote calls)
+    private Val expandQQ(Val template) {
+        if (template instanceof Val.PairV p) {
+            // (unquote x) → x
+            if (p.car() instanceof Val.Sym s && s.name().equals("unquote")) {
+                if (p.cdr() instanceof Val.PairV p2) return p2.car();
+            }
+            // (unquote-splicing x) at top → error
+            if (p.car() instanceof Val.Sym s2 && s2.name().equals("unquote-splicing")) {
+                throw new RuntimeException("unquote-splicing in non-list context");
+            }
+            // car is (unquote-splicing x) → (append x expandQQ(cdr))
+            if (p.car() instanceof Val.PairV carP && carP.car() instanceof Val.Sym cs && cs.name().equals("unquote-splicing")) {
+                if (carP.cdr() instanceof Val.PairV usp) {
+                    Val splicedExpr = usp.car();
+                    Val restExpr = expandQQ(p.cdr());
+                    return qqList(new Val.Sym("append"), splicedExpr, restExpr);
+                }
+            }
+            // Regular pair: (cons expandQQ(car) expandQQ(cdr))
+            return qqList(new Val.Sym("cons"), expandQQ(p.car()), expandQQ(p.cdr()));
+        }
+        if (template instanceof Val.Vec vec) {
+            Val listForm = new Val.Nil();
+            for (int i = vec.elements.length - 1; i >= 0; i--) {
+                listForm = new Val.PairV(vec.elements[i], listForm);
+            }
+            return qqList(new Val.Sym("list->vector"), expandQQ(listForm));
+        }
+        // Atom: (quote x)
+        return qqList(new Val.Sym("quote"), template);
+    }
+
+    private static Val qqList(Val... elems) {
+        Val r = new Val.Nil();
+        for (int i = elems.length - 1; i >= 0; i--) r = new Val.PairV(elems[i], r);
+        return r;
     }
 
     // ── Apply Continuation ──────────────────────────────────────
@@ -769,9 +861,18 @@ public class Evaluator {
             case Kont.CondK(var clauseBody, var remaining, var env, var k) -> {
                 if (isTruthy(value)) {
                     if (clauseBody instanceof Val.Nil) yield new Step.Apply(value, k);
+                    // Check for => syntax: (=> proc)
+                    if (clauseBody instanceof Val.PairV cb && cb.car() instanceof Val.Sym s && s.name().equals("=>")) {
+                        if (!(cb.cdr() instanceof Val.PairV procPair)) throw new EvalError("cond: => requires a procedure");
+                        yield new Step.Eval(procPair.car(), env, new Kont.CondArrowK(value, k));
+                    }
                     yield evalBeginStep(clauseBody, env, k);
                 }
                 yield evalCondStep(remaining, env, k);
+            }
+
+            case Kont.CondArrowK(var testValue, var k) -> {
+                yield applyFunctionStep(value, List.of(testValue), k, null);
             }
 
             case Kont.CaseK(var clauses, var env, var k, var form) -> {
@@ -1765,11 +1866,11 @@ public class Evaluator {
             for (int i = 1; i < args.size(); i++) result = numDiv(result, args.get(i));
             return result;
         }));
-        env.define("<", new Val.Builtin("<", args -> { checkArgCount(args, 2, "<"); return new Val.Bool(numCompare(args.get(0), args.get(1)) < 0); }));
-        env.define(">", new Val.Builtin(">", args -> { checkArgCount(args, 2, ">"); return new Val.Bool(numCompare(args.get(0), args.get(1)) > 0); }));
-        env.define("=", new Val.Builtin("=", args -> { checkArgCount(args, 2, "="); return new Val.Bool(numCompare(args.get(0), args.get(1)) == 0); }));
-        env.define("<=", new Val.Builtin("<=", args -> { checkArgCount(args, 2, "<="); return new Val.Bool(numCompare(args.get(0), args.get(1)) <= 0); }));
-        env.define(">=", new Val.Builtin(">=", args -> { checkArgCount(args, 2, ">="); return new Val.Bool(numCompare(args.get(0), args.get(1)) >= 0); }));
+        env.define("<", new Val.Builtin("<", args -> { if (args.size() < 2) throw new RuntimeException("< requires at least 2 arguments"); for (int i = 0; i < args.size() - 1; i++) { if (numCompare(args.get(i), args.get(i+1)) >= 0) return new Val.Bool(false); } return new Val.Bool(true); }));
+        env.define(">", new Val.Builtin(">", args -> { if (args.size() < 2) throw new RuntimeException("> requires at least 2 arguments"); for (int i = 0; i < args.size() - 1; i++) { if (numCompare(args.get(i), args.get(i+1)) <= 0) return new Val.Bool(false); } return new Val.Bool(true); }));
+        env.define("=", new Val.Builtin("=", args -> { if (args.size() < 2) throw new RuntimeException("= requires at least 2 arguments"); for (int i = 0; i < args.size() - 1; i++) { if (numCompare(args.get(i), args.get(i+1)) != 0) return new Val.Bool(false); } return new Val.Bool(true); }));
+        env.define("<=", new Val.Builtin("<=", args -> { if (args.size() < 2) throw new RuntimeException("<= requires at least 2 arguments"); for (int i = 0; i < args.size() - 1; i++) { if (numCompare(args.get(i), args.get(i+1)) > 0) return new Val.Bool(false); } return new Val.Bool(true); }));
+        env.define(">=", new Val.Builtin(">=", args -> { if (args.size() < 2) throw new RuntimeException(">= requires at least 2 arguments"); for (int i = 0; i < args.size() - 1; i++) { if (numCompare(args.get(i), args.get(i+1)) < 0) return new Val.Bool(false); } return new Val.Bool(true); }));
         env.define("not", new Val.Builtin("not", args -> { checkArgCount(args, 1, "not"); return new Val.Bool(!isTruthy(args.get(0))); }));
         // Pairs & lists
         env.define("cons", new Val.Builtin("cons", args -> { checkArgCount(args, 2, "cons"); return new Val.PairV(args.get(0), args.get(1)); }));
@@ -1797,6 +1898,24 @@ public class Evaluator {
             checkArgCount(args, 2, "member");
             Val key = args.get(0), lst = args.get(1);
             while (lst instanceof Val.PairV p) { if (isEqual(p.car(), key)) return p; lst = p.cdr(); }
+            return new Val.Bool(false);
+        }));
+        env.define("memq", new Val.Builtin("memq", args -> {
+            checkArgCount(args, 2, "memq");
+            Val key = args.get(0), lst = args.get(1);
+            while (lst instanceof Val.PairV p) { if (isEq(p.car(), key)) return p; lst = p.cdr(); }
+            return new Val.Bool(false);
+        }));
+        env.define("memv", new Val.Builtin("memv", args -> {
+            checkArgCount(args, 2, "memv");
+            Val key = args.get(0), lst = args.get(1);
+            while (lst instanceof Val.PairV p) { if (isEqv(p.car(), key)) return p; lst = p.cdr(); }
+            return new Val.Bool(false);
+        }));
+        env.define("assq", new Val.Builtin("assq", args -> {
+            checkArgCount(args, 2, "assq");
+            Val key = args.get(0), lst = args.get(1);
+            while (lst instanceof Val.PairV p) { if (p.car() instanceof Val.PairV entry && isEq(entry.car(), key)) return entry; lst = p.cdr(); }
             return new Val.Bool(false);
         }));
         env.define("null?", new Val.Builtin("null?", args -> { checkArgCount(args, 1, "null?"); return new Val.Bool(args.get(0) instanceof Val.Nil); }));
