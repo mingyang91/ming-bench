@@ -23,7 +23,17 @@ func EvalStr(input string) (string, error) {
 	if _, ok := lastVal.(*VoidVal); ok {
 		return "", nil
 	}
-	return lastVal.String(), nil
+	return formatResult(lastVal), nil
+}
+
+// formatResult formats a value for EvalStr output.
+// Top-level strings are returned without quotes (display format);
+// all other values use their standard String() (write format).
+func formatResult(v Value) string {
+	if s, ok := v.(*StringVal); ok {
+		return s.Val
+	}
+	return v.String()
 }
 
 // EvalStrWithOutput evaluates Scheme expressions and returns both the result
@@ -47,7 +57,7 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 
 	res := ""
 	if _, ok := lastVal.(*VoidVal); !ok {
-		res = lastVal.String()
+		res = formatResult(lastVal)
 	}
 	return res, out.String(), nil
 }
@@ -74,5 +84,5 @@ func EvalStrWithLimit(input string, maxSteps int) (string, error) {
 	if _, ok := lastVal.(*VoidVal); ok {
 		return "", nil
 	}
-	return lastVal.String(), nil
+	return formatResult(lastVal), nil
 }
