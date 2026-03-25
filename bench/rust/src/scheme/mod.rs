@@ -87,6 +87,14 @@ enum Value {
     Values(Vec<Value>),
 }
 
+// SAFETY: Value uses Rc<RefCell<...>> internally, which is !Send and !Sync.
+// However, Values never cross thread boundaries during evaluation — each eval_str
+// call creates and consumes all Values within a single thread. The only path for
+// a Value to cross threads is EvalError::Raised(Box<Value>), which happens after
+// eval completes and all Rc clones have been dropped (refcount == 1).
+unsafe impl Send for Value {}
+unsafe impl Sync for Value {}
+
 fn make_pair(car: Value, cdr: Value) -> Value {
     Value::Pair(Rc::new(RefCell::new((car, cdr))))
 }
@@ -663,6 +671,10 @@ struct Env {
     bindings: Rc<RefCell<HashMap<String, Value>>>,
     parent: Option<Rc<Env>>,
 }
+
+// SAFETY: Same reasoning as Value — Env is never shared across threads.
+unsafe impl Send for Env {}
+unsafe impl Sync for Env {}
 
 impl Env {
     fn new() -> Self {
@@ -4534,7 +4546,9 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
         Expr::new(ExprKind::List(elems), span)
     };
     let result = eval(&top, &mut env, &mut output)?;
-    Ok((result.to_string(), output))
+    let mut result_str = String::new();
+    display_value(&result, &mut result_str);
+    Ok((result_str, output))
 }
 
 #[cfg(test)]
