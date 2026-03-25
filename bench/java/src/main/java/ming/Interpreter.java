@@ -641,6 +641,18 @@ public class Interpreter {
     }
 
     public SchemeValue eval(SchemeValue expr, Environment env) throws EvalError {
+        while (true) {
+            SchemeValue result = evalStep(expr, env);
+            if (result instanceof SchemeValue.TailCall tc) {
+                expr = tc.expr();
+                env = tc.env();
+            } else {
+                return result;
+            }
+        }
+    }
+
+    private SchemeValue evalStep(SchemeValue expr, Environment env) throws EvalError {
         try {
             return switch (expr) {
                 case SchemeValue.IntVal v -> v;
@@ -657,6 +669,7 @@ public class Interpreter {
                 case SchemeValue.RecordVal v -> v;
                 case SchemeValue.CaseLambdaVal v -> v;
                 case SchemeValue.VectorVal v -> v;
+                case SchemeValue.TailCall tc -> tc;
                 case SchemeValue.SymbolVal v -> env.get(v.name());
                 case SchemeValue.ListVal v -> evalList(v, env);
             };
@@ -759,9 +772,9 @@ public class Interpreter {
         if (elements.size() < 3) throw new EvalError("if: bad syntax");
         var cond = eval(elements.get(1), env);
         if (cond.isTruthy()) {
-            return eval(elements.get(2), env);
+            return new SchemeValue.TailCall(elements.get(2), env);
         } else if (elements.size() > 3) {
-            return eval(elements.get(3), env);
+            return new SchemeValue.TailCall(elements.get(3), env);
         }
         return new SchemeValue.VoidVal();
     }
@@ -841,21 +854,20 @@ public class Interpreter {
 
     private SchemeValue evalAnd(List<SchemeValue> elements, Environment env) throws EvalError {
         if (elements.size() == 1) return new SchemeValue.BoolVal(true);
-        SchemeValue result = new SchemeValue.BoolVal(true);
-        for (int i = 1; i < elements.size(); i++) {
-            result = eval(elements.get(i), env);
+        for (int i = 1; i < elements.size() - 1; i++) {
+            var result = eval(elements.get(i), env);
             if (!result.isTruthy()) return result;
         }
-        return result;
+        return new SchemeValue.TailCall(elements.get(elements.size() - 1), env);
     }
 
     private SchemeValue evalOr(List<SchemeValue> elements, Environment env) throws EvalError {
         if (elements.size() == 1) return new SchemeValue.BoolVal(false);
-        for (int i = 1; i < elements.size(); i++) {
+        for (int i = 1; i < elements.size() - 1; i++) {
             var result = eval(elements.get(i), env);
             if (result.isTruthy()) return result;
         }
-        return new SchemeValue.BoolVal(false);
+        return new SchemeValue.TailCall(elements.get(elements.size() - 1), env);
     }
 
     private SchemeValue evalLet(List<SchemeValue> elements, Environment env) throws EvalError {
@@ -885,11 +897,10 @@ public class Interpreter {
             for (int i = 0; i < params.size(); i++) {
                 callEnv.define(params.get(i), initVals.get(i));
             }
-            SchemeValue result = new SchemeValue.VoidVal();
-            for (var bodyExpr : body) {
-                result = eval(bodyExpr, callEnv);
+            for (int i = 0; i < body.size() - 1; i++) {
+                eval(body.get(i), callEnv);
             }
-            return result;
+            return new SchemeValue.TailCall(body.get(body.size() - 1), callEnv);
         }
 
         // Regular let: (let ((var init) ...) body ...)
@@ -905,19 +916,18 @@ public class Interpreter {
             var val = eval(b.elements().get(1), env);
             letEnv.define(name.name(), val);
         }
-        SchemeValue result = new SchemeValue.VoidVal();
-        for (int i = 2; i < elements.size(); i++) {
-            result = eval(elements.get(i), letEnv);
+        for (int i = 2; i < elements.size() - 1; i++) {
+            eval(elements.get(i), letEnv);
         }
-        return result;
+        return new SchemeValue.TailCall(elements.get(elements.size() - 1), letEnv);
     }
 
     private SchemeValue evalBegin(List<SchemeValue> elements, Environment env) throws EvalError {
-        SchemeValue result = new SchemeValue.VoidVal();
-        for (int i = 1; i < elements.size(); i++) {
-            result = eval(elements.get(i), env);
+        if (elements.size() == 1) return new SchemeValue.VoidVal();
+        for (int i = 1; i < elements.size() - 1; i++) {
+            eval(elements.get(i), env);
         }
-        return result;
+        return new SchemeValue.TailCall(elements.get(elements.size() - 1), env);
     }
 
     private SchemeValue evalCond(List<SchemeValue> elements, Environment env) throws EvalError {
@@ -927,19 +937,21 @@ public class Interpreter {
                 throw new EvalError("cond: bad clause");
             var test = cl.elements().get(0);
             if (test instanceof SchemeValue.SymbolVal sym && sym.name().equals("else")) {
-                SchemeValue result = new SchemeValue.VoidVal();
-                for (int j = 1; j < cl.elements().size(); j++) {
-                    result = eval(cl.elements().get(j), env);
+                for (int j = 1; j < cl.elements().size() - 1; j++) {
+                    eval(cl.elements().get(j), env);
                 }
-                return result;
+                if (cl.elements().size() > 1) {
+                    return new SchemeValue.TailCall(cl.elements().get(cl.elements().size() - 1), env);
+                }
+                return new SchemeValue.VoidVal();
             }
             var testVal = eval(test, env);
             if (testVal.isTruthy()) {
-                SchemeValue result = testVal;
-                for (int j = 1; j < cl.elements().size(); j++) {
-                    result = eval(cl.elements().get(j), env);
+                if (cl.elements().size() == 1) return testVal;
+                for (int j = 1; j < cl.elements().size() - 1; j++) {
+                    eval(cl.elements().get(j), env);
                 }
-                return result;
+                return new SchemeValue.TailCall(cl.elements().get(cl.elements().size() - 1), env);
             }
         }
         return new SchemeValue.VoidVal();
@@ -975,11 +987,10 @@ public class Interpreter {
             var val = eval(b.elements().get(1), letEnv);
             letEnv.set(names.get(i), val);
         }
-        SchemeValue result = new SchemeValue.VoidVal();
-        for (int i = 2; i < elements.size(); i++) {
-            result = eval(elements.get(i), letEnv);
+        for (int i = 2; i < elements.size() - 1; i++) {
+            eval(elements.get(i), letEnv);
         }
-        return result;
+        return new SchemeValue.TailCall(elements.get(elements.size() - 1), letEnv);
     }
 
     private SchemeValue evalLetrecStar(List<SchemeValue> elements, Environment env) throws EvalError {
@@ -1002,11 +1013,10 @@ public class Interpreter {
             var val = eval(b.elements().get(1), letEnv);
             letEnv.set(name, val);
         }
-        SchemeValue result = new SchemeValue.VoidVal();
-        for (int i = 2; i < elements.size(); i++) {
-            result = eval(elements.get(i), letEnv);
+        for (int i = 2; i < elements.size() - 1; i++) {
+            eval(elements.get(i), letEnv);
         }
-        return result;
+        return new SchemeValue.TailCall(elements.get(elements.size() - 1), letEnv);
     }
 
     private SchemeValue evalCase(List<SchemeValue> elements, Environment env) throws EvalError {
@@ -1018,11 +1028,13 @@ public class Interpreter {
             var datums = clause.elements().get(0);
             // else clause
             if (datums instanceof SchemeValue.SymbolVal sym && sym.name().equals("else")) {
-                SchemeValue result = new SchemeValue.VoidVal();
-                for (int j = 1; j < clause.elements().size(); j++) {
-                    result = eval(clause.elements().get(j), env);
+                for (int j = 1; j < clause.elements().size() - 1; j++) {
+                    eval(clause.elements().get(j), env);
                 }
-                return result;
+                if (clause.elements().size() > 1) {
+                    return new SchemeValue.TailCall(clause.elements().get(clause.elements().size() - 1), env);
+                }
+                return new SchemeValue.VoidVal();
             }
             // Normal clause: ((datum ...) expr ...)
             if (!(datums instanceof SchemeValue.ListVal dl))
@@ -1030,11 +1042,13 @@ public class Interpreter {
             for (var datum : dl.elements()) {
                 var qd = quoteDatum(datum);
                 if (schemeEq(key, qd)) {
-                    SchemeValue result = new SchemeValue.VoidVal();
-                    for (int j = 1; j < clause.elements().size(); j++) {
-                        result = eval(clause.elements().get(j), env);
+                    for (int j = 1; j < clause.elements().size() - 1; j++) {
+                        eval(clause.elements().get(j), env);
                     }
-                    return result;
+                    if (clause.elements().size() > 1) {
+                        return new SchemeValue.TailCall(clause.elements().get(clause.elements().size() - 1), env);
+                    }
+                    return new SchemeValue.VoidVal();
                 }
             }
         }
@@ -1071,11 +1085,11 @@ public class Interpreter {
             var testVal = eval(testClause.elements().get(0), doEnv);
             if (testVal.isTruthy()) {
                 // Evaluate result expressions
-                SchemeValue result = new SchemeValue.VoidVal();
-                for (int i = 1; i < testClause.elements().size(); i++) {
-                    result = eval(testClause.elements().get(i), doEnv);
+                if (testClause.elements().size() == 1) return new SchemeValue.VoidVal();
+                for (int i = 1; i < testClause.elements().size() - 1; i++) {
+                    eval(testClause.elements().get(i), doEnv);
                 }
-                return result;
+                return new SchemeValue.TailCall(testClause.elements().get(testClause.elements().size() - 1), doEnv);
             }
 
             // Execute body
@@ -1104,7 +1118,56 @@ public class Interpreter {
         for (int i = 1; i < elements.size(); i++) {
             args[i - 1] = eval(elements.get(i), env);
         }
-        return callProc(proc, args);
+        return applyTail(proc, args);
+    }
+
+    private SchemeValue applyTail(SchemeValue proc, SchemeValue[] args) throws EvalError {
+        if (proc instanceof SchemeValue.LambdaVal lambda) {
+            var callEnv = bindLambdaArgs(lambda, args);
+            for (int i = 0; i < lambda.body().size() - 1; i++) {
+                eval(lambda.body().get(i), callEnv);
+            }
+            return new SchemeValue.TailCall(lambda.body().get(lambda.body().size() - 1), callEnv);
+        }
+
+        if (proc instanceof SchemeValue.CaseLambdaVal cl) {
+            for (var clause : cl.clauses()) {
+                boolean matches = clause.restParam() != null
+                    ? args.length >= clause.params().size()
+                    : args.length == clause.params().size();
+                if (matches) return applyTail(clause, args);
+            }
+            throw new EvalError("case-lambda: no matching clause for " + args.length + " arguments");
+        }
+
+        if (proc instanceof SchemeValue.BuiltinVal builtin) {
+            return builtin.proc().apply(args);
+        }
+
+        throw new EvalError("not a procedure: " + proc.display());
+    }
+
+    private Environment bindLambdaArgs(SchemeValue.LambdaVal lambda, SchemeValue[] args) throws EvalError {
+        var callEnv = new Environment(lambda.env());
+        if (lambda.restParam() != null) {
+            if (args.length < lambda.params().size())
+                throw new EvalError("wrong number of arguments: expected at least " + lambda.params().size() + ", got " + args.length);
+            for (int i = 0; i < lambda.params().size(); i++) {
+                callEnv.define(lambda.params().get(i), args[i]);
+            }
+            SchemeValue rest = NIL;
+            for (int i = args.length - 1; i >= lambda.params().size(); i--) {
+                rest = new SchemeValue.PairVal(args[i], rest);
+            }
+            callEnv.define(lambda.restParam(), rest);
+        } else {
+            if (args.length != lambda.params().size())
+                throw new EvalError("wrong number of arguments: expected " + lambda.params().size() + ", got " + args.length);
+            for (int i = 0; i < lambda.params().size(); i++) {
+                callEnv.define(lambda.params().get(i), args[i]);
+            }
+        }
+        return callEnv;
     }
 
     private SchemeValue callProc(SchemeValue proc, SchemeValue[] args) throws EvalError {
