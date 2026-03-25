@@ -54,4 +54,11 @@ pub enum EvalError {
 
     #[error("{pos}: division by zero")]
     DivisionByZero { pos: SourcePos },
+
+    #[error("{pos}: {name}: {message}")]
+    InvalidArgument {
+        pos: SourcePos,
+        name: String,
+        message: String,
+    },
 }
