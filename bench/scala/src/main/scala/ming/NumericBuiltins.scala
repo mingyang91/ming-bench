@@ -23,10 +23,10 @@ private[ming] object NumericBuiltins extends BuiltinSupport:
     "="              -> comparison("=", SchemeNumber.equal),
     "<="             -> comparison("<=", (left, right) => SchemeNumber.compare(left, right) <= 0),
     "zero?"          -> numberPredicate("zero?", SchemeNumber.isZero),
-    "positive?"      -> numberPredicate("positive?", number => SchemeNumber.compare(number, SchemeNumber.integer(0)) > 0),
-    "negative?"      -> numberPredicate("negative?", number => SchemeNumber.compare(number, SchemeNumber.integer(0)) < 0),
-    "odd?"           -> integerPredicate("odd?", _ % 2 != 0),
-    "even?"          -> integerPredicate("even?", _ % 2 == 0)
+    "positive?" -> numberPredicate("positive?", number => SchemeNumber.compare(number, SchemeNumber.integer(0)) > 0),
+    "negative?" -> numberPredicate("negative?", number => SchemeNumber.compare(number, SchemeNumber.integer(0)) < 0),
+    "odd?"      -> integerPredicate("odd?", _ % 2 != 0),
+    "even?"     -> integerPredicate("even?", _ % 2 == 0)
   )
 
   private def add(args: List[Value], pos: SourcePos): Value =
@@ -118,10 +118,15 @@ private[ming] object NumericBuiltins extends BuiltinSupport:
     Value.IntVal(integerPower(base, exponent))
 
   private def exactToInexact(args: List[Value], pos: SourcePos): Value =
-    SchemeNumber.toValue(SchemeNumber.exactToInexact(expectNumeric(expectSingleArg(args, pos, "exact->inexact"), pos, "exact->inexact")))
+    SchemeNumber.toValue(
+      SchemeNumber.exactToInexact(expectNumeric(expectSingleArg(args, pos, "exact->inexact"), pos, "exact->inexact"))
+    )
 
   private def inexactToExact(args: List[Value], pos: SourcePos): Value =
-    try SchemeNumber.toValue(SchemeNumber.inexactToExact(expectNumeric(expectSingleArg(args, pos, "inexact->exact"), pos, "inexact->exact")))
+    try
+      SchemeNumber.toValue(
+        SchemeNumber.inexactToExact(expectNumeric(expectSingleArg(args, pos, "inexact->exact"), pos, "inexact->exact"))
+      )
     catch
       case _: ArithmeticException =>
         throw EvalError.at(pos, "inexact->exact cannot convert a non-finite number")

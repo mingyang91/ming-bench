@@ -57,8 +57,10 @@ private[ming] object MacroPatternMatcher:
       case (Expr.IntAtom(left, _), Expr.IntAtom(right, _)) if left == right =>
         Some(MatchBindings())
 
-      case (Expr.RationalAtom(leftNumerator, leftDenominator, _), Expr.RationalAtom(rightNumerator, rightDenominator, _))
-          if leftNumerator == rightNumerator && leftDenominator == rightDenominator =>
+      case (
+            Expr.RationalAtom(leftNumerator, leftDenominator, _),
+            Expr.RationalAtom(rightNumerator, rightDenominator, _)
+          ) if leftNumerator == rightNumerator && leftDenominator == rightDenominator =>
         Some(MatchBindings())
 
       case (Expr.InexactAtom(left, _), Expr.InexactAtom(right, _)) if left == right =>

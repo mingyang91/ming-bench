@@ -3,11 +3,11 @@ package ming
 private[ming] object PredicateBuiltins extends BuiltinSupport:
 
   val entries: Map[String, Value] = Map(
-    "not"   -> Value.Builtin("not", negate),
-    "eq?"   -> Value.Builtin("eq?", eqv),
+    "not"    -> Value.Builtin("not", negate),
+    "eq?"    -> Value.Builtin("eq?", eqv),
     "equal?" -> Value.Builtin("equal?", equal),
-    "null?" -> predicate("null?", _ == Value.EmptyList),
-    "list?" -> predicate("list?", Value.isProperList),
+    "null?"  -> predicate("null?", _ == Value.EmptyList),
+    "list?"  -> predicate("list?", Value.isProperList),
     "string?" -> predicate(
       "string?",
       {

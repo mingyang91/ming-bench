@@ -179,7 +179,7 @@ private[ming] object SchemeParser:
     state.currentChar match
       case '+' | '-' =>
         state.peek(1).exists(_.isDigit) ||
-          (state.peek(1).contains('.') && state.peek(2).exists(_.isDigit))
+        (state.peek(1).contains('.') && state.peek(2).exists(_.isDigit))
 
       case '.' =>
         state.peek(1).exists(_.isDigit)
