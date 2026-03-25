@@ -111,6 +111,9 @@ object Builtins:
     "reverse",
     "member",
     "assv",
+    "assq",
+    "memq",
+    "memv",
     "gcd",
     "lcm",
     "truncate",
@@ -205,7 +208,7 @@ object Builtins:
         SchemeVal.SBool(!isTruthy(args.head))
       case "cons" | "car" | "cdr" | "null?" | "list" | "length" | "append" | "pair?" | "list-ref" | "list-tail" |
           "list?" | "assoc" | "set-car!" | "set-cdr!" | "caar" | "cadr" | "cdar" | "cddr" | "caddr" | "reverse" |
-          "member" | "assv" =>
+          "member" | "assv" | "assq" | "memq" | "memv" =>
         ListOps(name, args)
       case "string?" | "number?" | "boolean?" | "symbol?" | "char?" | "integer?" | "rational?" =>
         NumericOps.applyTypePredicate(name, args)

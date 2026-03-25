@@ -12,38 +12,69 @@ object DefineForms:
         val (paramNames, restParam) = parseParams(params)
         env.define(name, SchemeVal.SLambda(paramNames, restParam, body, env))
         SchemeVal.SVoid
+      case (nameAndParams @ SchemeVal.SPair(_)) :: body if body.nonEmpty =>
+        val (name, paramNames, restParam) = parseNameAndParams(nameAndParams)
+        env.define(name, SchemeVal.SLambda(paramNames, restParam, body, env))
+        SchemeVal.SVoid
       case _ => throw new EvalError("define: bad syntax")
+
+  /** Extract (name, paramNames, restParam) from a dotted-pair name+params form like SPair(f, SPair(a, rest)). */
+  def parseNameAndParams(v: SchemeVal): (String, List[String], Option[String]) =
+    val (elems, tail) = flattenDottedList(v)
+    elems match
+      case SchemeVal.SSymbol(name) :: params =>
+        val paramNames = params.map {
+          case SchemeVal.SSymbol(n) => n
+          case other => throw new EvalError(s"expected parameter name, got ${other.display}")
+        }
+        val restParam = tail.map {
+          case SchemeVal.SSymbol(n) => n
+          case other => throw new EvalError(s"expected parameter name, got ${other.display}")
+        }
+        (name, paramNames, restParam)
+      case _ => throw new EvalError("define: bad syntax")
+
+  /** Flatten a potentially dotted list into (proper elements, optional tail). */
+  private[ming] def flattenDottedList(v: SchemeVal): (List[SchemeVal], Option[SchemeVal]) =
+    v match
+      case SchemeVal.SList(elems) => (elems, None)
+      case SchemeVal.SPair(cell) =>
+        val (rest, tail) = flattenDottedList(cell.cdr)
+        (cell.car :: rest, tail)
+      case other => (Nil, Some(other))
 
   def parseParams(
     params: List[SchemeVal]
   ): (List[String], Option[String]) =
-    val dotIdx = params.indexWhere(_ == SchemeVal.SSymbol("."))
-    if dotIdx >= 0 then
-      if dotIdx != params.length - 2 then throw new EvalError("bad dot syntax in parameter list")
-      val fixed = params.take(dotIdx).map {
-        case SchemeVal.SSymbol(n) => n
-        case other =>
-          throw new EvalError(s"expected parameter name, got ${other.display}")
-      }
-      params(dotIdx + 1) match
-        case SchemeVal.SSymbol(rest) => (fixed, Some(rest))
-        case other =>
-          throw new EvalError(s"expected parameter name, got ${other.display}")
-    else
-      val names = params.map {
-        case SchemeVal.SSymbol(n) => n
-        case other =>
-          throw new EvalError(s"expected parameter name, got ${other.display}")
-      }
-      (names, None)
+    val names = params.map {
+      case SchemeVal.SSymbol(n) => n
+      case other =>
+        throw new EvalError(s"expected parameter name, got ${other.display}")
+    }
+    (names, None)
+
+  /** Parse params from either a proper list (SList) or a dotted pair (SPair). */
+  def parseParamsFromVal(v: SchemeVal): (List[String], Option[String]) =
+    v match
+      case SchemeVal.SList(params) => parseParams(params)
+      case SchemeVal.SSymbol(rest) => (Nil, Some(rest))
+      case _ =>
+        val (elems, tail) = flattenDottedList(v)
+        val paramNames = elems.map {
+          case SchemeVal.SSymbol(n) => n
+          case other => throw new EvalError(s"expected parameter name, got ${other.display}")
+        }
+        val restParam = tail.map {
+          case SchemeVal.SSymbol(n) => n
+          case other => throw new EvalError(s"expected parameter name, got ${other.display}")
+        }
+        (paramNames, restParam)
 
   def evalLambda(args: List[SchemeVal], env: Env): SchemeVal =
     args match
-      case SchemeVal.SList(params) :: body if body.nonEmpty =>
-        val (paramNames, restParam) = parseParams(params)
+      case paramSpec :: body if body.nonEmpty =>
+        val (paramNames, restParam) = parseParamsFromVal(paramSpec)
         SchemeVal.SLambda(paramNames, restParam, body, env)
-      case SchemeVal.SSymbol(rest) :: body if body.nonEmpty =>
-        SchemeVal.SLambda(Nil, Some(rest), body, env)
       case _ => throw new EvalError("lambda: bad syntax")
 
   def evalSet(args: List[SchemeVal], env: Env): SchemeVal =

@@ -53,19 +53,30 @@ object ListOps:
       case "caddr"                 => SchemeVal.pairCar(SchemeVal.pairCdr(SchemeVal.pairCdr(requireOne("caddr", args))))
       case "member"                => applyMember(args)
       case "assv"                  => applyAssv(args)
+      case "assq"                  => applyAssq(args)
+      case "memq"                  => applyMemq(args)
+      case "memv"                  => applyMemv(args)
       case "reverse"               => applyReverse(args)
       case _                       => throw new EvalError(s"unknown list op: $name")
 
   private def applyAppend(args: List[SchemeVal]): SchemeVal =
     if args.isEmpty then SchemeVal.SList(Nil)
+    else if args.length == 1 then args.head
     else
-      val allElems = args.flatMap { v =>
+      // All but the last must be proper lists; the last can be any value
+      val init = args.init
+      val last = args.last
+      val allElems = init.flatMap { v =>
         SchemeVal
           .toScalaList(v)
           .getOrElse(throw new EvalError(s"append: expected list, got ${v.display}"))
       }
-      if allElems.isEmpty then SchemeVal.SList(Nil)
-      else SchemeVal.buildList(allElems)
+      if allElems.isEmpty then last
+      else
+        // Build a chain ending with last
+        allElems.foldRight(last) { (elem, acc) =>
+          SchemeVal.SPair(new MutableCell(elem, acc))
+        }
 
   private def applyListRef(args: List[SchemeVal]): SchemeVal =
     val (lst, idx) = requireTwo("list-ref", args)
@@ -134,6 +145,49 @@ object ListOps:
         case e if SchemeVal.isPairLike(e) && Builtins.schemeEqv(SchemeVal.pairCar(e), key) => e
       }
       .getOrElse(SchemeVal.SBool(false))
+
+  private def applyAssq(args: List[SchemeVal]): SchemeVal =
+    val (key, lst) = requireTwo("assq", args)
+    val elems = SchemeVal
+      .toScalaList(lst)
+      .getOrElse(throw new EvalError("assq: expected list"))
+    elems
+      .collectFirst {
+        case e if SchemeVal.isPairLike(e) && Builtins.schemeEq(SchemeVal.pairCar(e), key) => e
+      }
+      .getOrElse(SchemeVal.SBool(false))
+
+  private def applyMemq(args: List[SchemeVal]): SchemeVal =
+    val (key, lst) = requireTwo("memq", args)
+    val elems = SchemeVal
+      .toScalaList(lst)
+      .getOrElse(throw new EvalError("memq: expected list"))
+    import scala.util.boundary, boundary.break
+    boundary:
+      var remaining = lst
+      for e <- elems do
+        if Builtins.schemeEq(e, key) then break(remaining)
+        remaining = remaining match
+          case SchemeVal.SPair(c)      => c.cdr
+          case SchemeVal.SList(_ :: t) => SchemeVal.SList(t)
+          case _                       => SchemeVal.SList(Nil)
+      SchemeVal.SBool(false)
+
+  private def applyMemv(args: List[SchemeVal]): SchemeVal =
+    val (key, lst) = requireTwo("memv", args)
+    val elems = SchemeVal
+      .toScalaList(lst)
+      .getOrElse(throw new EvalError("memv: expected list"))
+    import scala.util.boundary, boundary.break
+    boundary:
+      var remaining = lst
+      for e <- elems do
+        if Builtins.schemeEqv(e, key) then break(remaining)
+        remaining = remaining match
+          case SchemeVal.SPair(c)      => c.cdr
+          case SchemeVal.SList(_ :: t) => SchemeVal.SList(t)
+          case _                       => SchemeVal.SList(Nil)
+      SchemeVal.SBool(false)
 
   private def applyReverse(args: List[SchemeVal]): SchemeVal =
     val elems = SchemeVal

@@ -68,6 +68,9 @@ object Evaluator:
       case SchemeVal.SSymbol("quote") :: args =>
         if args.length != 1 then throw new EvalError("quote: expected 1 argument")
         State.Ko(args.head, k)
+      case SchemeVal.SSymbol("quasiquote") :: args =>
+        if args.length != 1 then throw new EvalError("quasiquote: expected 1 argument")
+        State.Ko(expandQuasiquote(args.head, env), k)
       case SchemeVal.SSymbol("if") :: args =>
         if args.length < 2 || args.length > 3 then throw new EvalError("if: expected 2 or 3 arguments")
         State.Ev(args(0), env, Cont.IfK(args(1), args.lift(2), env, k))
@@ -210,10 +213,59 @@ object Evaluator:
           case Nil          => State.Ko(v, k2)
     case Cont.CondK(body, remaining, env, k2) =>
       if isTruthy(v) then
-        if body.isEmpty then State.Ko(v, k2)
-        else evalBodyCek(body, env, k2)
+        body match
+          case SchemeVal.SSymbol("=>") :: proc :: Nil =>
+            // (cond (test => proc)) — evaluate proc, then apply to test result
+            State.Ev(proc, env, Cont.CondArrowK(v, env, k2))
+          case _ =>
+            if body.isEmpty then State.Ko(v, k2)
+            else evalBodyCek(body, env, k2)
       else LetForms.evalCondStep(remaining, env, k2)
+    case Cont.CondArrowK(testValue, env, k2) =>
+      // proc has been evaluated to v; apply it to testValue
+      Apply.performApply(v, List(testValue), k2)
     case other => KontOps.step(v, other)
+
+  /** Expand quasiquote template, evaluating unquote and unquote-splicing. */
+  private def expandQuasiquote(tmpl: SchemeVal, env: Env): SchemeVal =
+    tmpl match
+      case SchemeVal.SList(SchemeVal.SSymbol("unquote") :: expr :: Nil) =>
+        eval(expr, env)
+      case SchemeVal.SList(elems) =>
+        expandQuasiquoteList(elems, env)
+      case SchemeVal.SPair(cell) =>
+        cell.car match
+          case SchemeVal.SSymbol("unquote") =>
+            // (unquote expr) as pair — eval the cdr's car
+            val expr = SchemeVal.pairCar(cell.cdr)
+            eval(expr, env)
+          case _ =>
+            val newCar = expandQuasiquote(cell.car, env)
+            val newCdr = expandQuasiquote(cell.cdr, env)
+            SchemeVal.SPair(new MutableCell(newCar, newCdr))
+      case SchemeVal.SVector(elems) =>
+        SchemeVal.SVector(elems.map(expandQuasiquote(_, env)))
+      case _ => tmpl
+
+  /** Expand quasiquote for list elements, handling unquote-splicing. */
+  private def expandQuasiquoteList(elems: List[SchemeVal], env: Env): SchemeVal =
+    val result = scala.collection.mutable.ListBuffer[SchemeVal]()
+    var tail: SchemeVal = SchemeVal.SList(Nil)
+    var i = 0
+    while i < elems.length do
+      elems(i) match
+        case SchemeVal.SList(SchemeVal.SSymbol("unquote-splicing") :: expr :: Nil) =>
+          val spliced = eval(expr, env)
+          SchemeVal.toScalaList(spliced) match
+            case Some(items) => result ++= items
+            case None        => throw new EvalError(s"unquote-splicing: expected list, got ${spliced.display}")
+        case SchemeVal.SList(SchemeVal.SSymbol("unquote") :: expr :: Nil) =>
+          result += eval(expr, env)
+        case other =>
+          result += expandQuasiquote(other, env)
+      i += 1
+    if result.isEmpty then SchemeVal.SList(Nil)
+    else SchemeVal.buildList(result.toList)
 
   private def isMacro(v: SchemeVal): Boolean = v match
     case _: SchemeVal.SMacro            => true

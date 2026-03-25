@@ -26,6 +26,7 @@ object Cont:
   case class AndK(rest: List[SchemeVal], env: Env, k: Cont)                                         extends Cont
   case class OrK(rest: List[SchemeVal], env: Env, k: Cont)                                          extends Cont
   case class CondK(body: List[SchemeVal], remaining: List[SchemeVal], env: Env, k: Cont)            extends Cont
+  case class CondArrowK(testValue: SchemeVal, env: Env, k: Cont)                                   extends Cont
   // dynamic-wind normal flow
   case class DynWindAfterInK(bodyThunk: SchemeVal, entry: WindEntry, k: Cont) extends Cont
   case class DynWindAfterBodyK(entry: WindEntry, k: Cont)                     extends Cont

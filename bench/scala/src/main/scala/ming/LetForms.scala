@@ -13,6 +13,10 @@ object LetForms:
         val (paramNames, restParam) = DefineForms.parseParams(params)
         env.define(name, SchemeVal.SLambda(paramNames, restParam, body, env))
         State.Ko(SchemeVal.SVoid, k)
+      case (nameAndParams @ SchemeVal.SPair(_)) :: body if body.nonEmpty =>
+        val (name, paramNames, restParam) = DefineForms.parseNameAndParams(nameAndParams)
+        env.define(name, SchemeVal.SLambda(paramNames, restParam, body, env))
+        State.Ko(SchemeVal.SVoid, k)
       case _ => throw new EvalError("define: bad syntax")
 
   def evalCondStep(clauses: List[SchemeVal], env: Env, k: Cont): State =

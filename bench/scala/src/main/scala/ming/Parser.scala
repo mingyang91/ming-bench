@@ -28,6 +28,13 @@ object Tokenizer:
           tokens += Token(")", line, col); i += 1; col += 1
         case '\'' =>
           tokens += Token("'", line, col); i += 1; col += 1
+        case '`' =>
+          tokens += Token("`", line, col); i += 1; col += 1
+        case ',' =>
+          if i + 1 < input.length && input(i + 1) == '@' then
+            tokens += Token(",@", line, col); i += 2; col += 2
+          else
+            tokens += Token(",", line, col); i += 1; col += 1
         case '"' =>
           val startCol = col
           val sb       = new StringBuilder("\"")
@@ -77,12 +84,28 @@ object Parser:
       case t :: rest if t.text == "(" =>
         val elems     = ListBuffer[SchemeVal]()
         var remaining = rest
+        var dotTail: Option[SchemeVal] = None
         while remaining.nonEmpty && remaining.head.text != ")" do
-          val (expr, r) = parse(remaining)
-          elems += expr
-          remaining = r
+          if remaining.head.text == "." then
+            // dotted pair: consume the dot, parse the tail
+            remaining = remaining.tail
+            val (tail, r) = parse(remaining)
+            dotTail = Some(tail)
+            remaining = r
+          else
+            val (expr, r) = parse(remaining)
+            elems += expr
+            remaining = r
         if remaining.isEmpty then throw new EvalError("missing closing parenthesis")
-        (withPos(SchemeVal.SList(elems.toList), t), remaining.tail)
+        val result = dotTail match
+          case Some(tail) =>
+            // Build improper list: (a b . c) => SPair(a, SPair(b, c))
+            elems.toList.foldRight(tail) { (elem, acc) =>
+              SchemeVal.SPair(new MutableCell(elem, acc))
+            }
+          case None =>
+            SchemeVal.SList(elems.toList)
+        (withPos(result, t), remaining.tail)
       case t :: _ if t.text == ")" => throw new EvalError("unexpected )")
       case t :: rest if t.text == "'" =>
         val (expr, r) = parse(rest)
@@ -90,6 +113,15 @@ object Parser:
       case t :: rest if t.text == "#'" =>
         val (expr, r) = parse(rest)
         (withPos(SchemeVal.SList(List(SchemeVal.SSymbol("syntax"), expr)), t), r)
+      case t :: rest if t.text == "`" =>
+        val (expr, r) = parse(rest)
+        (withPos(SchemeVal.SList(List(SchemeVal.SSymbol("quasiquote"), expr)), t), r)
+      case t :: rest if t.text == "," =>
+        val (expr, r) = parse(rest)
+        (withPos(SchemeVal.SList(List(SchemeVal.SSymbol("unquote"), expr)), t), r)
+      case t :: rest if t.text == ",@" =>
+        val (expr, r) = parse(rest)
+        (withPos(SchemeVal.SList(List(SchemeVal.SSymbol("unquote-splicing"), expr)), t), r)
       case t :: rest =>
         (withPos(parseAtom(t.text), t), rest)
 

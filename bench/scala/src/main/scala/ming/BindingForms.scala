@@ -80,13 +80,9 @@ object BindingForms:
 
   def evalCaseLambda(args: List[SchemeVal], env: Env): SchemeVal =
     val clauses = args.map {
-      case SchemeVal.SList(SchemeVal.SList(params) :: body) if body.nonEmpty =>
-        val (paramNames, restParam) = DefineForms.parseParams(params)
+      case SchemeVal.SList(paramSpec :: body) if body.nonEmpty =>
+        val (paramNames, restParam) = DefineForms.parseParamsFromVal(paramSpec)
         (paramNames, restParam, body)
-      case SchemeVal.SList(SchemeVal.SSymbol(rest) :: body) if body.nonEmpty =>
-        (Nil, Some(rest), body)
-      case SchemeVal.SList(SchemeVal.SList(Nil) :: body) if body.nonEmpty =>
-        (Nil, None, body)
       case _ => throw new EvalError("case-lambda: bad clause")
     }
     SchemeVal.SCaseLambda(clauses, env)
