@@ -1,4 +1,4 @@
-#[derive(Debug, PartialEq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum EvalError {
     #[error("parse error: {0}")]
     Parse(String),
@@ -12,4 +12,21 @@ pub enum EvalError {
     DivisionByZero(String),
     #[error("wrong number of arguments: {0}")]
     Arity(String),
+    #[error("uncaught exception")]
+    Raised(Box<super::Value>),
+}
+
+impl PartialEq for EvalError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Parse(a), Self::Parse(b)) => a == b,
+            (Self::Type(a), Self::Type(b)) => a == b,
+            (Self::Unbound(a), Self::Unbound(b)) => a == b,
+            (Self::Syntax(a), Self::Syntax(b)) => a == b,
+            (Self::DivisionByZero(a), Self::DivisionByZero(b)) => a == b,
+            (Self::Arity(a), Self::Arity(b)) => a == b,
+            (Self::Raised(_), Self::Raised(_)) => false,
+            _ => false,
+        }
+    }
 }

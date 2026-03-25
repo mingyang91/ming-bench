@@ -19,6 +19,16 @@ struct Winder {
     out_thunk: Value,
 }
 
+#[derive(Clone, Debug)]
+struct ExHandler {
+    handler: Value,
+    guard_k: Option<K>,          // Some for guard handlers (return continuation)
+    guard_winders: Option<Vec<Winder>>, // winder state at guard site
+    guard_var: Option<String>,    // variable name for guard
+    guard_clauses: Option<Vec<(Expr, Vec<Expr>)>>, // (test, body) pairs
+    guard_env: Option<Env>,       // environment for guard clauses
+}
+
 fn gensym(base: &str) -> String {
     let n = GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{}.__{}", base, n)
@@ -635,6 +645,7 @@ fn default_env() -> Env {
         "error",
         "call/cc", "call-with-current-continuation",
         "dynamic-wind",
+        "raise", "with-exception-handler",
     ] {
         env.set(name.into(), Value::Builtin(name.into()));
     }
@@ -917,6 +928,23 @@ enum Cont {
     StrSetIdxK(String, Expr, Env, Span, K),
     StrSetCharK(String, usize, Env, Span, K),
     CallCCK(K),
+    WithExHandlerBody(K),  // body returned; pop handler, continue
+    GuardBody(K),          // guard body returned normally; pop handler, continue
+    GuardEvalClause {
+        var: String,
+        exn: Value,
+        clauses: Vec<(Expr, Vec<Expr>)>, // remaining (test, body) pairs
+        env: Env,
+        next: K,
+    },
+    GuardTestResult {
+        var: String,
+        exn: Value,
+        body: Vec<Expr>,             // body of current clause
+        remaining: Vec<(Expr, Vec<Expr>)>, // remaining clauses
+        env: Env,
+        next: K,
+    },
     DynWindBody(Value, Value, Value, K),  // (in_thunk, body_thunk, out_thunk, next)
     DynWindOut(Value, Value, K),          // (body_result, out_thunk, next)
     DynWindDone(Value, K),               // (body_result, next)
@@ -981,7 +1009,7 @@ fn setup_lambda_env_basic(
 
 fn cek_apply_func(
     func: &Value, args: &[Value], span: Span,
-    st: &mut CekState, k: &mut K, winders: &mut Vec<Winder>, output: &mut String,
+    st: &mut CekState, k: &mut K, winders: &mut Vec<Winder>, handlers: &mut Vec<ExHandler>, output: &mut String,
 ) -> Result<(), EvalError> {
     match func {
         Value::Lambda { name, params, rest_param, body, env: closure_env } => {
@@ -1011,7 +1039,7 @@ fn cek_apply_func(
                         body: body.clone(),
                         env: clause_env.clone(),
                     };
-                    return cek_apply_func(&lambda, args, span, st, k, winders, output);
+                    return cek_apply_func(&lambda, args, span, st, k, winders, handlers, output);
                 }
             }
             Err(EvalError::Arity(format!(
@@ -1027,14 +1055,84 @@ fn cek_apply_func(
             let tail = value_to_vec(last).ok_or_else(|| EvalError::Type(format!("apply: last argument must be a list at {span}")))?;
             let mut combined: Vec<Value> = args[1..args.len() - 1].to_vec();
             combined.extend(tail);
-            cek_apply_func(f, &combined, span, st, k, winders, output)
+            cek_apply_func(f, &combined, span, st, k, winders, handlers, output)
         }
         Value::Builtin(ref bname) if bname == "call/cc" || bname == "call-with-current-continuation" => {
             if args.len() != 1 {
                 return Err(EvalError::Arity(format!("call/cc requires 1 argument at {span}")));
             }
             let continuation_val = Value::Continuation(k.clone(), winders.clone());
-            cek_apply_func(&args[0], &[continuation_val], span, st, k, winders, output)
+            cek_apply_func(&args[0], &[continuation_val], span, st, k, winders, handlers, output)
+        }
+        Value::Builtin(ref bname) if bname == "raise" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("raise requires 1 argument at {span}")));
+            }
+            let exn = args[0].clone();
+            if let Some(handler) = handlers.pop() {
+                if let Some(guard_k) = handler.guard_k {
+                    // Guard handler: unwind to guard site, then evaluate clauses
+                    let guard_winders = handler.guard_winders.unwrap();
+                    let guard_var = handler.guard_var.unwrap();
+                    let guard_clauses = handler.guard_clauses.unwrap();
+                    let guard_env = handler.guard_env.unwrap();
+                    // Unwind dynamic-wind to guard's winder state
+                    let common_len = winders.iter().zip(guard_winders.iter())
+                        .take_while(|(a, b)| a.id == b.id)
+                        .count();
+                    let out_thunks: Vec<Value> = winders[common_len..].iter().rev()
+                        .map(|w| w.out_thunk.clone()).collect();
+                    winders.truncate(common_len);
+                    // After unwinding, evaluate guard clauses
+                    let clause_k = Rc::new(Cont::GuardEvalClause {
+                        var: guard_var,
+                        exn: exn.clone(),
+                        clauses: guard_clauses,
+                        env: guard_env,
+                        next: guard_k,
+                    });
+                    if !out_thunks.is_empty() {
+                        // Need to unwind first
+                        *k = Rc::new(Cont::DynWindDoUnwind {
+                            out_thunks: out_thunks[1..].to_vec(),
+                            rewind_winders: vec![],
+                            target_winders: guard_winders,
+                            val: exn,
+                            saved_k: clause_k,
+                        });
+                        cek_apply_func(&out_thunks[0], &[], span, st, k, winders, handlers, output)
+                    } else {
+                        *winders = guard_winders;
+                        *k = clause_k;
+                        // Trigger clause evaluation by returning a dummy value
+                        *st = CekState::Ret(Value::Void);
+                        Ok(())
+                    }
+                } else {
+                    // with-exception-handler: invoke handler procedure with exn
+                    let handler_fn = handler.handler;
+                    cek_apply_func(&handler_fn, &[exn], span, st, k, winders, handlers, output)
+                }
+            } else {
+                Err(EvalError::Raised(Box::new(exn)))
+            }
+        }
+        Value::Builtin(ref bname) if bname == "with-exception-handler" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("with-exception-handler requires 2 arguments at {span}")));
+            }
+            let handler_fn = args[0].clone();
+            let body_thunk = args[1].clone();
+            handlers.push(ExHandler {
+                handler: handler_fn,
+                guard_k: None,
+                guard_winders: None,
+                guard_var: None,
+                guard_clauses: None,
+                guard_env: None,
+            });
+            *k = Rc::new(Cont::WithExHandlerBody(k.clone()));
+            cek_apply_func(&body_thunk, &[], span, st, k, winders, handlers, output)
         }
         Value::Builtin(ref bname) if bname == "dynamic-wind" => {
             if args.len() != 3 {
@@ -1042,7 +1140,7 @@ fn cek_apply_func(
             }
             let (in_thunk, body_thunk, out_thunk) = (args[0].clone(), args[1].clone(), args[2].clone());
             *k = Rc::new(Cont::DynWindBody(in_thunk.clone(), body_thunk, out_thunk, k.clone()));
-            cek_apply_func(&in_thunk, &[], span, st, k, winders, output)
+            cek_apply_func(&in_thunk, &[], span, st, k, winders, handlers, output)
         }
         Value::Builtin(ref bname) => {
             let result = apply_builtin(bname, args, span, output)?;
@@ -1078,7 +1176,7 @@ fn cek_apply_func(
                     val,
                     saved_k: saved_k.clone(),
                 });
-                cek_apply_func(&first_out, &[], span, st, k, winders, output)?;
+                cek_apply_func(&first_out, &[], span, st, k, winders, handlers, output)?;
             } else {
                 // No unwinding needed, start rewinding
                 let first_winder = rewind_winders[0].clone();
@@ -1089,7 +1187,7 @@ fn cek_apply_func(
                     val,
                     saved_k: saved_k.clone(),
                 });
-                cek_apply_func(&first_winder.in_thunk, &[], span, st, k, winders, output)?;
+                cek_apply_func(&first_winder.in_thunk, &[], span, st, k, winders, handlers, output)?;
             }
             Ok(())
         }
@@ -1159,6 +1257,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
     let mut st = CekState::Eval(expr.clone(), env.clone());
     let mut k: K = Rc::new(Cont::Halt);
     let mut winders: Vec<Winder> = Vec::new();
+    let mut handlers: Vec<ExHandler> = Vec::new();
 
     loop {
         let cur_st = std::mem::replace(&mut st, CekState::Ret(Value::Void));
@@ -1646,6 +1745,50 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                         cur_env.set(macro_name, macro_val);
                         st = CekState::Ret(Value::Void);
                     }
+                    "guard" => {
+                        // (guard (var clause ...) body ...)
+                        if elems.len() < 3 {
+                            return Err(EvalError::Syntax(format!("guard requires variable and clauses at {span}")));
+                        }
+                        let clause_list = match &elems[1].kind {
+                            ExprKind::List(v) if v.len() >= 1 => v,
+                            _ => return Err(EvalError::Syntax(format!("guard: bad clause list at {span}"))),
+                        };
+                        let var_name = match &clause_list[0].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Syntax(format!("guard: expected variable at {span}"))),
+                        };
+                        // Parse clauses: each is (test body ...) or (else body ...)
+                        let mut clauses: Vec<(Expr, Vec<Expr>)> = Vec::new();
+                        for clause in &clause_list[1..] {
+                            match &clause.kind {
+                                ExprKind::List(parts) if !parts.is_empty() => {
+                                    let test = parts[0].clone();
+                                    let body = parts[1..].to_vec();
+                                    clauses.push((test, body));
+                                }
+                                _ => return Err(EvalError::Syntax(format!("guard: bad clause at {span}"))),
+                            }
+                        }
+                        // Push guard handler
+                        handlers.push(ExHandler {
+                            handler: Value::Void, // not used for guard
+                            guard_k: Some(k.clone()),
+                            guard_winders: Some(winders.clone()),
+                            guard_var: Some(var_name),
+                            guard_clauses: Some(clauses),
+                            guard_env: Some(cur_env.clone()),
+                        });
+                        // Evaluate body with guard handler active
+                        k = Rc::new(Cont::GuardBody(k));
+                        let body = &elems[2..];
+                        if body.len() == 1 {
+                            st = CekState::Eval(body[0].clone(), cur_env);
+                        } else {
+                            k = Rc::new(Cont::Seq(body[1..].to_vec(), cur_env.clone(), k));
+                            st = CekState::Eval(body[0].clone(), cur_env);
+                        }
+                    }
                     "call/cc" | "call-with-current-continuation" => {
                         if elems.len() != 2 {
                             return Err(EvalError::Syntax(format!("call/cc requires 1 argument at {span}")));
@@ -1740,7 +1883,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                         // rev_arg_exprs is reversed: we evaluate rightmost argument first
                         if rev_arg_exprs.is_empty() {
                             k = next;
-                            cek_apply_func(&val, &[], span, &mut st, &mut k, &mut winders, output)?;
+                            cek_apply_func(&val, &[], span, &mut st, &mut k, &mut winders, &mut handlers, output)?;
                         } else {
                             k = Rc::new(Cont::EvArg(val, vec![], rev_arg_exprs[1..].to_vec(), env.clone(), span, next));
                             st = CekState::Eval(rev_arg_exprs[0].clone(), env);
@@ -1752,7 +1895,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                             // done is in reverse order (rightmost first), reverse to get original order
                             done.reverse();
                             k = next;
-                            cek_apply_func(&func, &done, span, &mut st, &mut k, &mut winders, output)?;
+                            cek_apply_func(&func, &done, span, &mut st, &mut k, &mut winders, &mut handlers, output)?;
                         } else {
                             k = Rc::new(Cont::EvArg(func, done, rest[1..].to_vec(), env.clone(), span, next));
                             st = CekState::Eval(rest[0].clone(), env);
@@ -2006,20 +2149,20 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                     Cont::CallCCK(next) => {
                         let continuation_val = Value::Continuation(next.clone(), winders.clone());
                         k = next;
-                        cek_apply_func(&val, &[continuation_val], Span::default(), &mut st, &mut k, &mut winders, output)?;
+                        cek_apply_func(&val, &[continuation_val], Span::default(), &mut st, &mut k, &mut winders, &mut handlers, output)?;
                     }
                     Cont::DynWindBody(in_thunk, body_thunk, out_thunk, next) => {
                         // in-thunk finished, push winder, call body
                         let winder_id = WINDER_COUNTER.fetch_add(1, Ordering::Relaxed);
                         winders.push(Winder { id: winder_id, in_thunk, out_thunk: out_thunk.clone() });
                         k = Rc::new(Cont::DynWindOut(val, out_thunk, next));
-                        cek_apply_func(&body_thunk, &[], Span::default(), &mut st, &mut k, &mut winders, output)?;
+                        cek_apply_func(&body_thunk, &[], Span::default(), &mut st, &mut k, &mut winders, &mut handlers, output)?;
                     }
                     Cont::DynWindOut(_in_result, out_thunk, next) => {
                         // body-thunk returned val; pop winder, call out-thunk
                         winders.pop();
                         k = Rc::new(Cont::DynWindDone(val, next));
-                        cek_apply_func(&out_thunk, &[], Span::default(), &mut st, &mut k, &mut winders, output)?;
+                        cek_apply_func(&out_thunk, &[], Span::default(), &mut st, &mut k, &mut winders, &mut handlers, output)?;
                     }
                     Cont::DynWindDone(body_val, next) => {
                         // out-thunk finished, return saved body value
@@ -2038,7 +2181,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                                 val: cont_val,
                                 saved_k,
                             });
-                            cek_apply_func(&first_out, &[], Span::default(), &mut st, &mut k, &mut winders, output)?;
+                            cek_apply_func(&first_out, &[], Span::default(), &mut st, &mut k, &mut winders, &mut handlers, output)?;
                         } else if !rewind_winders.is_empty() {
                             // Start rewinding
                             let first_winder = rewind_winders[0].clone();
@@ -2049,7 +2192,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                                 val: cont_val,
                                 saved_k,
                             });
-                            cek_apply_func(&first_winder.in_thunk, &[], Span::default(), &mut st, &mut k, &mut winders, output)?;
+                            cek_apply_func(&first_winder.in_thunk, &[], Span::default(), &mut st, &mut k, &mut winders, &mut handlers, output)?;
                         } else {
                             // Done unwinding, no rewinding needed
                             winders = target_winders;
@@ -2068,12 +2211,109 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                                 val: cont_val,
                                 saved_k,
                             });
-                            cek_apply_func(&next_winder.in_thunk, &[], Span::default(), &mut st, &mut k, &mut winders, output)?;
+                            cek_apply_func(&next_winder.in_thunk, &[], Span::default(), &mut st, &mut k, &mut winders, &mut handlers, output)?;
                         } else {
                             // Done rewinding, restore continuation
                             winders = target_winders;
                             k = saved_k;
                             st = CekState::Ret(cont_val);
+                        }
+                    }
+                    Cont::WithExHandlerBody(next) => {
+                        // Body of with-exception-handler returned normally; pop handler
+                        handlers.pop();
+                        k = next;
+                        st = CekState::Ret(val);
+                    }
+                    Cont::GuardBody(next) => {
+                        // Guard body returned normally; pop handler, return value
+                        handlers.pop();
+                        k = next;
+                        st = CekState::Ret(val);
+                    }
+                    Cont::GuardEvalClause { var, exn, clauses, env, next } => {
+                        // We arrive here after unwinding (val is ignored).
+                        // Bind var to exn and start evaluating clauses.
+                        let _ = val;
+                        let mut clause_env = env.clone();
+                        clause_env.set(var.clone(), exn.clone());
+                        if clauses.is_empty() {
+                            // No clauses — re-raise
+                            return Err(EvalError::Raised(Box::new(exn)));
+                        }
+                        let (test, body) = &clauses[0];
+                        let remaining = clauses[1..].to_vec();
+                        if matches!(&test.kind, ExprKind::Symbol(s) if s == "else") {
+                            if body.is_empty() {
+                                k = next;
+                                st = CekState::Ret(Value::Void);
+                            } else if body.len() == 1 {
+                                k = next;
+                                st = CekState::Eval(body[0].clone(), clause_env);
+                            } else {
+                                k = Rc::new(Cont::Seq(body[1..].to_vec(), clause_env.clone(), next));
+                                st = CekState::Eval(body[0].clone(), clause_env);
+                            }
+                        } else {
+                            k = Rc::new(Cont::GuardTestResult {
+                                var,
+                                exn,
+                                body: body.clone(),
+                                remaining,
+                                env,
+                                next,
+                            });
+                            st = CekState::Eval(test.clone(), clause_env);
+                        }
+                    }
+                    Cont::GuardTestResult { var, exn, body, remaining, env, next } => {
+                        // val = result of evaluating test expression
+                        if is_truthy(&val) {
+                            // Clause matched — evaluate body
+                            let mut clause_env = env.clone();
+                            clause_env.set(var, exn);
+                            if body.is_empty() {
+                                // No body — return test value
+                                k = next;
+                                st = CekState::Ret(val);
+                            } else if body.len() == 1 {
+                                k = next;
+                                st = CekState::Eval(body[0].clone(), clause_env);
+                            } else {
+                                k = Rc::new(Cont::Seq(body[1..].to_vec(), clause_env.clone(), next));
+                                st = CekState::Eval(body[0].clone(), clause_env);
+                            }
+                        } else {
+                            // Clause didn't match — try remaining
+                            if remaining.is_empty() {
+                                return Err(EvalError::Raised(Box::new(exn)));
+                            }
+                            let mut clause_env = env.clone();
+                            clause_env.set(var.clone(), exn.clone());
+                            let (test, body) = &remaining[0];
+                            let rest = remaining[1..].to_vec();
+                            if matches!(&test.kind, ExprKind::Symbol(s) if s == "else") {
+                                if body.is_empty() {
+                                    k = next;
+                                    st = CekState::Ret(Value::Void);
+                                } else if body.len() == 1 {
+                                    k = next;
+                                    st = CekState::Eval(body[0].clone(), clause_env);
+                                } else {
+                                    k = Rc::new(Cont::Seq(body[1..].to_vec(), clause_env.clone(), next));
+                                    st = CekState::Eval(body[0].clone(), clause_env);
+                                }
+                            } else {
+                                k = Rc::new(Cont::GuardTestResult {
+                                    var,
+                                    exn,
+                                    body: body.clone(),
+                                    remaining: rest,
+                                    env,
+                                    next,
+                                });
+                                st = CekState::Eval(test.clone(), clause_env);
+                            }
                         }
                     }
                 }
