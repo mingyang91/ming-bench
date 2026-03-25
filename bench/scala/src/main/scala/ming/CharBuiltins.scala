@@ -112,6 +112,42 @@ object CharBuiltins:
       )
     )
     env.define(
+      "string>?",
+      SchemeVal.BuiltinProc(
+        "string>?",
+        args =>
+          if args.size != 2 then throw new EvalError("string>?: expected 2 arguments")
+          (args(0), args(1)) match
+            case (SchemeVal.StringVal(a), SchemeVal.StringVal(b)) =>
+              SchemeVal.BoolVal(new String(a).compareTo(new String(b)) > 0)
+            case _ => throw new EvalError("string>?: expected strings")
+      )
+    )
+    env.define(
+      "string<=?",
+      SchemeVal.BuiltinProc(
+        "string<=?",
+        args =>
+          if args.size != 2 then throw new EvalError("string<=?: expected 2 arguments")
+          (args(0), args(1)) match
+            case (SchemeVal.StringVal(a), SchemeVal.StringVal(b)) =>
+              SchemeVal.BoolVal(new String(a).compareTo(new String(b)) <= 0)
+            case _ => throw new EvalError("string<=?: expected strings")
+      )
+    )
+    env.define(
+      "string>=?",
+      SchemeVal.BuiltinProc(
+        "string>=?",
+        args =>
+          if args.size != 2 then throw new EvalError("string>=?: expected 2 arguments")
+          (args(0), args(1)) match
+            case (SchemeVal.StringVal(a), SchemeVal.StringVal(b)) =>
+              SchemeVal.BoolVal(new String(a).compareTo(new String(b)) >= 0)
+            case _ => throw new EvalError("string>=?: expected strings")
+      )
+    )
+    env.define(
       "string-ci=?",
       SchemeVal.BuiltinProc(
         "string-ci=?",

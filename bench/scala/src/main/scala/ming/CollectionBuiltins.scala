@@ -15,13 +15,9 @@ object CollectionBuiltins:
         "map",
         args =>
           if args.size < 2 then throw new EvalError("map: expected at least 2 arguments")
-          val proc = args.head
-          val lists = args.tail.map {
-            case SchemeVal.SList(elems) => elems
-            case other =>
-              throw new EvalError(s"map: expected list, got ${SchemeVal.display(other)}")
-          }
-          val len = lists.head.size
+          val proc  = args.head
+          val lists = args.tail.map(a => SchemeVal.toScalaList(a))
+          val len   = lists.head.size
           val result = (0 until len).map { i =>
             val mapArgs = lists.map(_(i))
             Evaluator.apply(proc, mapArgs)
@@ -51,6 +47,7 @@ object CollectionBuiltins:
             case (SchemeVal.IntVal(a), SchemeVal.IntVal(b))   => SchemeVal.BoolVal(a == b)
             case (SchemeVal.BoolVal(a), SchemeVal.BoolVal(b)) => SchemeVal.BoolVal(a == b)
             case (SchemeVal.CharVal(a), SchemeVal.CharVal(b)) => SchemeVal.BoolVal(a == b)
+            case (SchemeVal.Pair(a), SchemeVal.Pair(b))       => SchemeVal.BoolVal(a eq b)
             case (a, b)                                       => SchemeVal.BoolVal(a eq b)
       )
     )
@@ -70,6 +67,7 @@ object CollectionBuiltins:
             case (SchemeVal.CharVal(a), SchemeVal.CharVal(b))     => SchemeVal.BoolVal(a == b)
             case (SchemeVal.StringVal(a), SchemeVal.StringVal(b)) => SchemeVal.BoolVal(a eq b)
             case (SchemeVal.SList(Nil), SchemeVal.SList(Nil))     => SchemeVal.BoolVal(true)
+            case (SchemeVal.Pair(a), SchemeVal.Pair(b))           => SchemeVal.BoolVal(a eq b)
             case (a, b)                                           => SchemeVal.BoolVal(a eq b)
       )
     )
@@ -157,6 +155,7 @@ object CollectionBuiltins:
           if args.size != 1 then throw new EvalError("list->vector: expected 1 argument")
           args.head match
             case SchemeVal.SList(elems) => SchemeVal.VectorVal(elems.toArray)
+            case SchemeVal.Pair(_)      => SchemeVal.VectorVal(SchemeVal.toScalaList(args.head).toArray)
             case _                      => throw new EvalError("list->vector: expected list")
       )
     )

@@ -14,7 +14,6 @@ object NumericBuiltins:
       if !SchemeVal.isNumeric(v) then throw new EvalError(s"$name: expected number, got ${SchemeVal.display(v)}")
     }
 
-  // Convert any numeric SchemeVal to (numerator, denominator) for exact arithmetic
   private def toRational(v: SchemeVal): (Long, Long) = v match
     case SchemeVal.IntVal(n)         => (n, 1L)
     case SchemeVal.RationalVal(n, d) => (n, d)
@@ -48,7 +47,7 @@ object NumericBuiltins:
     registerArithmetic(env)
     registerComparison(env)
     registerMathOps(env)
-    registerNumericPredicates(env)
+    NumericPredicateBuiltins.register(env)
     RationalBuiltins.register(env)
 
   private def registerArithmetic(env: Env): Unit =
@@ -199,73 +198,5 @@ object NumericBuiltins:
           val nums = requireNums(args, "expt")
           if nums.size != 2 then throw new EvalError("expt: expected 2 arguments")
           SchemeVal.IntVal(math.pow(nums(0).toDouble, nums(1).toDouble).toLong)
-      )
-    )
-
-  private def registerNumericPredicates(env: Env): Unit =
-    env.define(
-      "zero?",
-      SchemeVal.BuiltinProc(
-        "zero?",
-        args =>
-          if args.size != 1 then throw new EvalError("zero?: expected 1 argument")
-          args.head match
-            case SchemeVal.IntVal(n)         => SchemeVal.BoolVal(n == 0)
-            case SchemeVal.FloatVal(d)       => SchemeVal.BoolVal(d == 0.0)
-            case SchemeVal.RationalVal(n, _) => SchemeVal.BoolVal(n == 0)
-            case other =>
-              throw new EvalError(s"zero?: expected number, got ${SchemeVal.display(other)}")
-      )
-    )
-    env.define(
-      "positive?",
-      SchemeVal.BuiltinProc(
-        "positive?",
-        args =>
-          if args.size != 1 then throw new EvalError("positive?: expected 1 argument")
-          args.head match
-            case SchemeVal.IntVal(n)         => SchemeVal.BoolVal(n > 0)
-            case SchemeVal.FloatVal(d)       => SchemeVal.BoolVal(d > 0)
-            case SchemeVal.RationalVal(n, _) => SchemeVal.BoolVal(n > 0)
-            case other =>
-              throw new EvalError(s"positive?: expected number, got ${SchemeVal.display(other)}")
-      )
-    )
-    env.define(
-      "negative?",
-      SchemeVal.BuiltinProc(
-        "negative?",
-        args =>
-          if args.size != 1 then throw new EvalError("negative?: expected 1 argument")
-          args.head match
-            case SchemeVal.IntVal(n)         => SchemeVal.BoolVal(n < 0)
-            case SchemeVal.FloatVal(d)       => SchemeVal.BoolVal(d < 0)
-            case SchemeVal.RationalVal(n, _) => SchemeVal.BoolVal(n < 0)
-            case other =>
-              throw new EvalError(s"negative?: expected number, got ${SchemeVal.display(other)}")
-      )
-    )
-    env.define(
-      "odd?",
-      SchemeVal.BuiltinProc(
-        "odd?",
-        args =>
-          if args.size != 1 then throw new EvalError("odd?: expected 1 argument")
-          args.head match
-            case SchemeVal.IntVal(n) => SchemeVal.BoolVal(n % 2 != 0)
-            case other =>
-              throw new EvalError(s"odd?: expected number, got ${SchemeVal.display(other)}")
-      )
-    )
-    env.define(
-      "even?",
-      SchemeVal.BuiltinProc(
-        "even?",
-        args =>
-          if args.size != 1 then throw new EvalError("even?: expected 1 argument")
-          args.head match
-            case SchemeVal.IntVal(n) => SchemeVal.BoolVal(n % 2 == 0)
-            case other =>
-              throw new EvalError(s"even?: expected number, got ${SchemeVal.display(other)}")
       )
     )

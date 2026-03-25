@@ -50,6 +50,36 @@ object StringBuiltins:
 
   private def registerStringCore(env: Env): Unit =
     env.define(
+      "make-string",
+      SchemeVal.BuiltinProc(
+        "make-string",
+        args =>
+          if args.isEmpty || args.size > 2 then throw new EvalError("make-string: expected 1-2 arguments")
+          val k = args(0) match
+            case SchemeVal.IntVal(n) => n.toInt
+            case _                   => throw new EvalError("make-string: expected integer")
+          val fill =
+            if args.size == 2 then
+              args(1) match
+                case SchemeVal.CharVal(c) => c
+                case _                    => throw new EvalError("make-string: expected character")
+            else '\u0000'
+          SchemeVal.StringVal(Array.fill(k)(fill))
+      )
+    )
+    env.define(
+      "string",
+      SchemeVal.BuiltinProc(
+        "string",
+        args =>
+          val chars = args.map {
+            case SchemeVal.CharVal(c) => c
+            case other => throw new EvalError(s"string: expected character, got ${SchemeVal.display(other)}")
+          }
+          SchemeVal.StringVal(chars.toArray)
+      )
+    )
+    env.define(
       "string-append",
       SchemeVal.BuiltinProc(
         "string-append",
@@ -163,14 +193,15 @@ object StringBuiltins:
         "list->string",
         args =>
           if args.size != 1 then throw new EvalError("list->string: expected 1 argument")
-          args.head match
-            case SchemeVal.SList(elems) =>
-              val chars = elems.map {
-                case SchemeVal.CharVal(c) => c
-                case other => throw new EvalError(s"list->string: expected character, got ${SchemeVal.display(other)}")
-              }
-              SchemeVal.StringVal(chars.toArray)
+          val elems = args.head match
+            case SchemeVal.SList(elems) => elems
+            case SchemeVal.Pair(_)      => SchemeVal.toScalaList(args.head)
             case other => throw new EvalError(s"list->string: expected list, got ${SchemeVal.display(other)}")
+          val chars = elems.map {
+            case SchemeVal.CharVal(c) => c
+            case other => throw new EvalError(s"list->string: expected character, got ${SchemeVal.display(other)}")
+          }
+          SchemeVal.StringVal(chars.toArray)
       )
     )
 

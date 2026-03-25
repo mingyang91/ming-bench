@@ -7,7 +7,8 @@ object Builtins:
     registerListOps(env)
     registerPredicates(env)
     registerApply(env)
-    registerListUtils(env)
+    ListBuiltins.register(env)
+    registerCxr(env)
     CollectionBuiltins.register(env)
     CharBuiltins.register(env)
     StringBuiltins.register(env, output)
@@ -19,13 +20,8 @@ object Builtins:
         "apply",
         args =>
           if args.size < 2 then throw new EvalError("apply: expected at least 2 arguments")
-          val proc = args.head
-          val lastArg = args.last match
-            case SchemeVal.SList(elems) => elems
-            case other =>
-              throw new EvalError(
-                s"apply: last argument must be a list, got ${SchemeVal.display(other)}"
-              )
+          val proc       = args.head
+          val lastArg    = SchemeVal.toScalaList(args.last)
           val prefixArgs = args.slice(1, args.size - 1)
           Evaluator.apply(proc, prefixArgs ++ lastArg)
       )
@@ -38,10 +34,7 @@ object Builtins:
         "cons",
         args =>
           if args.size != 2 then throw new EvalError("cons: expected 2 arguments")
-          args(1) match
-            case SchemeVal.SList(elems)            => SchemeVal.SList(args(0) :: elems)
-            case SchemeVal.DottedList(elems, tail) => SchemeVal.DottedList(args(0) :: elems, tail)
-            case _                                 => SchemeVal.DottedList(List(args(0)), args(1))
+          SchemeVal.makePair(args(0), args(1))
       )
     )
     env.define(
@@ -51,6 +44,7 @@ object Builtins:
         args =>
           if args.size != 1 then throw new EvalError("car: expected 1 argument")
           args.head match
+            case SchemeVal.Pair(cell)                             => cell.car
             case SchemeVal.SList(elems) if elems.nonEmpty         => elems.head
             case SchemeVal.DottedList(elems, _) if elems.nonEmpty => elems.head
             case _                                                => throw new EvalError("car: expected pair")
@@ -63,14 +57,24 @@ object Builtins:
         args =>
           if args.size != 1 then throw new EvalError("cdr: expected 1 argument")
           args.head match
-            case SchemeVal.SList(elems) if elems.nonEmpty => SchemeVal.SList(elems.tail)
+            case SchemeVal.Pair(cell) => cell.cdr
+            case SchemeVal.SList(elems) if elems.nonEmpty =>
+              SchemeVal.SList(elems.tail)
             case SchemeVal.DottedList(elems, tail) if elems.nonEmpty =>
               if elems.tail.isEmpty then tail
               else SchemeVal.DottedList(elems.tail, tail)
             case _ => throw new EvalError("cdr: expected pair")
       )
     )
-    env.define("list", SchemeVal.BuiltinProc("list", args => SchemeVal.SList(args)))
+    env.define(
+      "list",
+      SchemeVal.BuiltinProc(
+        "list",
+        args =>
+          if args.isEmpty then SchemeVal.SList(Nil)
+          else args.foldRight(SchemeVal.SList(Nil): SchemeVal)((a, acc) => SchemeVal.makePair(a, acc))
+      )
+    )
     env.define(
       "length",
       SchemeVal.BuiltinProc(
@@ -79,7 +83,9 @@ object Builtins:
           if args.size != 1 then throw new EvalError("length: expected 1 argument")
           args.head match
             case SchemeVal.SList(elems) => SchemeVal.IntVal(elems.size.toLong)
-            case _                      => throw new EvalError("length: expected list")
+            case SchemeVal.Pair(_) =>
+              SchemeVal.IntVal(SchemeVal.toScalaList(args.head).size.toLong)
+            case _ => throw new EvalError("length: expected list")
       )
     )
     env.define(
@@ -99,13 +105,18 @@ object Builtins:
         "append",
         args =>
           if args.isEmpty then SchemeVal.SList(Nil)
+          else if args.size == 1 then args.head
           else
-            val lists = args.map {
-              case SchemeVal.SList(elems) => elems
-              case other =>
-                throw new EvalError(s"append: expected list, got ${SchemeVal.display(other)}")
-            }
-            SchemeVal.SList(lists.flatten)
+            val lists = args.init.map(a => SchemeVal.toScalaList(a))
+            val last  = args.last
+            val flat  = lists.flatten
+            if flat.isEmpty then last
+            else
+              last match
+                case SchemeVal.SList(Nil) =>
+                  flat.foldRight(SchemeVal.SList(Nil): SchemeVal)((a, acc) => SchemeVal.makePair(a, acc))
+                case _ =>
+                  flat.foldRight(last)((a, acc) => SchemeVal.makePair(a, acc))
       )
     )
 
@@ -148,6 +159,7 @@ object Builtins:
         args =>
           if args.size != 1 then throw new EvalError("pair?: expected 1 argument")
           args.head match
+            case SchemeVal.Pair(_)          => SchemeVal.BoolVal(true)
             case SchemeVal.SList(elems)     => SchemeVal.BoolVal(elems.nonEmpty)
             case SchemeVal.DottedList(_, _) => SchemeVal.BoolVal(true)
             case _                          => SchemeVal.BoolVal(false)
@@ -200,63 +212,72 @@ object Builtins:
       )
     )
 
-  private def registerListUtils(env: Env): Unit =
+  private def registerCxr(env: Env): Unit =
     env.define(
-      "list-ref",
+      "caar",
       SchemeVal.BuiltinProc(
-        "list-ref",
+        "caar",
         args =>
-          if args.size != 2 then throw new EvalError("list-ref: expected 2 arguments")
-          (args(0), args(1)) match
-            case (SchemeVal.SList(elems), SchemeVal.IntVal(i)) =>
-              if i < 0 || i >= elems.size then throw new EvalError("list-ref: index out of bounds")
-              elems(i.toInt)
-            case _ => throw new EvalError("list-ref: expected list and integer")
+          if args.size != 1 then throw new EvalError("caar: expected 1 argument")
+          pairCar(pairCar(args.head))
       )
     )
     env.define(
-      "list-tail",
+      "cadr",
       SchemeVal.BuiltinProc(
-        "list-tail",
+        "cadr",
         args =>
-          if args.size != 2 then throw new EvalError("list-tail: expected 2 arguments")
-          (args(0), args(1)) match
-            case (SchemeVal.SList(elems), SchemeVal.IntVal(i)) =>
-              if i < 0 || i > elems.size then throw new EvalError("list-tail: index out of bounds")
-              SchemeVal.SList(elems.drop(i.toInt))
-            case _ => throw new EvalError("list-tail: expected list and integer")
+          if args.size != 1 then throw new EvalError("cadr: expected 1 argument")
+          pairCar(pairCdr(args.head))
       )
     )
     env.define(
-      "list?",
+      "cdar",
       SchemeVal.BuiltinProc(
-        "list?",
+        "cdar",
         args =>
-          if args.size != 1 then throw new EvalError("list?: expected 1 argument")
-          args.head match
-            case SchemeVal.SList(_) => SchemeVal.BoolVal(true)
-            case _                  => SchemeVal.BoolVal(false)
+          if args.size != 1 then throw new EvalError("cdar: expected 1 argument")
+          pairCdr(pairCar(args.head))
       )
     )
     env.define(
-      "assoc",
+      "cddr",
       SchemeVal.BuiltinProc(
-        "assoc",
+        "cddr",
         args =>
-          if args.size != 2 then throw new EvalError("assoc: expected 2 arguments")
-          val key = args(0)
-          args(1) match
-            case SchemeVal.SList(elems) =>
-              elems
-                .collectFirst {
-                  case found @ SchemeVal.SList(pair)
-                      if pair.nonEmpty && SchemeVal.schemeEqual(
-                        pair.head,
-                        key
-                      ) =>
-                    found
-                }
-                .getOrElse(SchemeVal.BoolVal(false))
-            case _ => throw new EvalError("assoc: expected list")
+          if args.size != 1 then throw new EvalError("cddr: expected 1 argument")
+          pairCdr(pairCdr(args.head))
       )
     )
+    env.define(
+      "caddr",
+      SchemeVal.BuiltinProc(
+        "caddr",
+        args =>
+          if args.size != 1 then throw new EvalError("caddr: expected 1 argument")
+          pairCar(pairCdr(pairCdr(args.head)))
+      )
+    )
+    env.define(
+      "cadddr",
+      SchemeVal.BuiltinProc(
+        "cadddr",
+        args =>
+          if args.size != 1 then throw new EvalError("cadddr: expected 1 argument")
+          pairCar(pairCdr(pairCdr(pairCdr(args.head))))
+      )
+    )
+
+  private def pairCar(v: SchemeVal): SchemeVal = v match
+    case SchemeVal.Pair(c)                                => c.car
+    case SchemeVal.SList(elems) if elems.nonEmpty         => elems.head
+    case SchemeVal.DottedList(elems, _) if elems.nonEmpty => elems.head
+    case _                                                => throw new EvalError("car: not a pair")
+
+  private def pairCdr(v: SchemeVal): SchemeVal = v match
+    case SchemeVal.Pair(c) => c.cdr
+    case SchemeVal.SList(elems) if elems.nonEmpty =>
+      SchemeVal.SList(elems.tail)
+    case SchemeVal.DottedList(elems, tail) if elems.nonEmpty =>
+      if elems.tail.isEmpty then tail else SchemeVal.DottedList(elems.tail, tail)
+    case _ => throw new EvalError("cdr: not a pair")
