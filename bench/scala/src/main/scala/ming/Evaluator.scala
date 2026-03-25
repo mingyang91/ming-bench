@@ -28,6 +28,10 @@ object Evaluator:
   def eval(initExpr: SchemeVal, initEnv: Env): SchemeVal =
     run(State.Ev(initExpr, initEnv, Cont.Halt))
 
+  /** Thread-local step limit: None = unlimited, Some(n) = n steps remaining. */
+  private[ming] val stepLimit: ThreadLocal[Option[Int]] =
+    ThreadLocal.withInitial(() => None)
+
   private def run(initState: State): SchemeVal =
     var state                = initState
     var lastPos: Option[Pos] = None
@@ -35,6 +39,13 @@ object Evaluator:
       state match
         case State.Ko(v, Cont.Halt) => return v
         case _                      =>
+          // Check step limit
+          stepLimit.get() match
+            case Some(n) if n <= 0 =>
+              throw new EvalError("step limit exceeded")
+            case Some(n) =>
+              stepLimit.set(Some(n - 1))
+            case None => ()
           // Track position from the most recent compound expression
           state match
             case State.Ev(expr @ SchemeVal.SList(_), _, _) if expr.pos.isDefined =>
@@ -284,6 +295,17 @@ object Evaluator:
     if exprs.isEmpty then throw new EvalError("empty input")
     val env = makeGlobalEnv()
     evalBody(exprs, env).display
+
+  def evalStrWithLimit(input: String, limit: Int): String =
+    windStack.set(Nil)
+    handlerStack.set(Nil)
+    stepLimit.set(Some(limit))
+    try
+      val exprs = Parser.parseAll(input)
+      if exprs.isEmpty then throw new EvalError("empty input")
+      val env = makeGlobalEnv()
+      evalBody(exprs, env).display
+    finally stepLimit.set(None)
 
   def evalStrWithOutput(input: String): (String, String) =
     windStack.set(Nil)
