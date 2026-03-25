@@ -19,9 +19,10 @@ type SymbolVal struct{ Name string }
 type CharVal struct{ Val rune }
 type VoidVal struct{}
 type LambdaVal struct {
-	Params []string
-	Body   []Expr
-	Env    *Env
+	Params   []string
+	Rest     string // rest parameter name (dot notation), empty if none
+	Body     []Expr
+	Env      *Env
 }
 
 func (v *LambdaVal) String() string {

@@ -151,7 +151,7 @@ func evalDefine(e *ListExpr, env *Env) (Value, error) {
 		env.set(target.Name, val)
 		return &VoidVal{}, nil
 	case *ListExpr:
-		// (define (f params...) body...)
+		// (define (f params...) body...) or (define (f x . rest) body...)
 		if len(target.Items) == 0 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: empty name list", e.Ln, e.Cl)}
 		}
@@ -159,15 +159,11 @@ func evalDefine(e *ListExpr, env *Env) (Value, error) {
 		if !ok {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol", e.Ln, e.Cl)}
 		}
-		params := make([]string, 0, len(target.Items)-1)
-		for _, p := range target.Items[1:] {
-			ps, ok := p.(*SymbolExpr)
-			if !ok {
-				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: expected symbol in params", e.Ln, e.Cl)}
-			}
-			params = append(params, ps.Name)
+		params, rest, err := parseDotParams(target.Items[1:], e.Ln, e.Cl, "define")
+		if err != nil {
+			return nil, err
 		}
-		lambda := &LambdaVal{Params: params, Body: e.Items[2:], Env: env}
+		lambda := &LambdaVal{Params: params, Rest: rest, Body: e.Items[2:], Env: env}
 		env.set(nameSym.Name, lambda)
 		return &VoidVal{}, nil
 	default:
@@ -196,28 +192,69 @@ func evalLambda(e *ListExpr, env *Env) (Value, error) {
 	if len(e.Items) < 3 {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: requires params and body", e.Ln, e.Cl)}
 	}
+	// (lambda args body) — single symbol means all args collected as rest
+	if sym, ok := e.Items[1].(*SymbolExpr); ok {
+		return &LambdaVal{Rest: sym.Name, Body: e.Items[2:], Env: env}, nil
+	}
 	paramList, ok := e.Items[1].(*ListExpr)
 	if !ok {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected parameter list", e.Ln, e.Cl)}
 	}
-	params := make([]string, 0, len(paramList.Items))
-	for _, p := range paramList.Items {
+	params, rest, err := parseDotParams(paramList.Items, e.Ln, e.Cl, "lambda")
+	if err != nil {
+		return nil, err
+	}
+	return &LambdaVal{Params: params, Rest: rest, Body: e.Items[2:], Env: env}, nil
+}
+
+// parseDotParams extracts fixed params and optional rest param from a parameter list.
+// Handles dot notation: (x y . rest)
+func parseDotParams(items []Expr, ln, cl int, context string) ([]string, string, error) {
+	var params []string
+	var rest string
+	for i, p := range items {
 		ps, ok := p.(*SymbolExpr)
 		if !ok {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: expected symbol in params", e.Ln, e.Cl)}
+			return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected symbol in params", ln, cl, context)}
+		}
+		if ps.Name == "." {
+			// Next must be the rest param, and it must be the last
+			if i+2 != len(items) {
+				return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: %s: bad dot syntax in params", ln, cl, context)}
+			}
+			restSym, ok := items[i+1].(*SymbolExpr)
+			if !ok {
+				return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected symbol after dot", ln, cl, context)}
+			}
+			rest = restSym.Name
+			return params, rest, nil
 		}
 		params = append(params, ps.Name)
 	}
-	return &LambdaVal{Params: params, Body: e.Items[2:], Env: env}, nil
+	return params, rest, nil
 }
 
 func applyLambda(fn *LambdaVal, args []Value, ln, cl int) (Value, error) {
-	if len(args) != len(fn.Params) {
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected %d, got %d", ln, cl, len(fn.Params), len(args))}
+	if fn.Rest == "" {
+		if len(args) != len(fn.Params) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected %d, got %d", ln, cl, len(fn.Params), len(args))}
+		}
+	} else {
+		if len(args) < len(fn.Params) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected at least %d, got %d", ln, cl, len(fn.Params), len(args))}
+		}
 	}
 	childEnv := newEnv(fn.Env)
 	for i, p := range fn.Params {
 		childEnv.set(p, args[i])
+	}
+	if fn.Rest != "" {
+		// Collect remaining args into a list
+		rest := Value(&NilVal{})
+		for i := len(args) - 1; i >= len(fn.Params); i-- {
+			rest = &PairVal{Car: args[i], Cdr: rest}
+		}
+		childEnv.set(fn.Rest, rest)
 	}
 	var result Value
 	var err error
@@ -317,6 +354,9 @@ func makeGlobalEnv(out *strings.Builder) *Env {
 		}
 		return &VoidVal{}, nil
 	}})
+
+	// Apply
+	env.set("apply", &BuiltinFunc{Name: "apply", Fn: builtinApply})
 
 	// String operations
 	env.set("string-append", &BuiltinFunc{Name: "string-append", Fn: builtinStringAppend})
@@ -851,6 +891,41 @@ func builtinStringSet(args []Value) (Value, error) {
 	runes[idx.Val] = ch.Val
 	s.Val = string(runes)
 	return &VoidVal{}, nil
+}
+
+func builtinApply(args []Value) (Value, error) {
+	if len(args) < 2 {
+		return nil, &EvalError{Message: "apply: requires at least 2 arguments"}
+	}
+	fn := args[0]
+	// Last arg must be a list; prefix args are prepended
+	lastArg := args[len(args)-1]
+	// Collect prefix args
+	var callArgs []Value
+	for _, a := range args[1 : len(args)-1] {
+		callArgs = append(callArgs, a)
+	}
+	// Unpack the last argument (a list)
+	cur := lastArg
+	for {
+		if _, ok := cur.(*NilVal); ok {
+			break
+		}
+		p, ok := cur.(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "apply: last argument must be a list"}
+		}
+		callArgs = append(callArgs, p.Car)
+		cur = p.Cdr
+	}
+	switch f := fn.(type) {
+	case *BuiltinFunc:
+		return f.Fn(callArgs)
+	case *LambdaVal:
+		return applyLambda(f, callArgs, 0, 0)
+	default:
+		return nil, &EvalError{Message: fmt.Sprintf("apply: not a procedure: %s", fn.String())}
+	}
 }
 
 func builtinStringRef(args []Value) (Value, error) {
