@@ -216,13 +216,23 @@ pub(crate) struct RecordAccessorProcedure {
 pub(crate) struct Environment {
     bindings: HashMap<String, BindingRef>,
     parent: Option<EnvRef>,
+    transparent: bool,
 }
 
 impl Environment {
     pub(crate) fn new(parent: Option<EnvRef>) -> EnvRef {
+        Self::new_with_mode(parent, false)
+    }
+
+    pub(crate) fn new_transparent(parent: Option<EnvRef>) -> EnvRef {
+        Self::new_with_mode(parent, true)
+    }
+
+    fn new_with_mode(parent: Option<EnvRef>, transparent: bool) -> EnvRef {
         Rc::new(RefCell::new(Self {
             bindings: HashMap::new(),
             parent,
+            transparent,
         }))
     }
 
@@ -231,6 +241,16 @@ impl Environment {
         if let Some(binding) = borrowed.bindings.get(&name).cloned() {
             drop(borrowed);
             *binding.borrow_mut() = value;
+        } else if borrowed.transparent {
+            let parent = borrowed.parent.clone();
+            drop(borrowed);
+            if let Some(parent) = parent {
+                Self::define(&parent, name, value);
+            } else {
+                env.borrow_mut()
+                    .bindings
+                    .insert(name, Rc::new(RefCell::new(value)));
+            }
         } else {
             borrowed.bindings.insert(name, Rc::new(RefCell::new(value)));
         }

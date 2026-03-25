@@ -46,6 +46,7 @@ impl<'a> Parser<'a> {
         match self.peek_char() {
             Some('(') => self.parse_list(pos),
             Some('\'') => self.parse_quote_shorthand(pos),
+            Some('#') if self.peek_next_char() == Some('\'') => self.parse_syntax_shorthand(pos),
             Some('"') => self.parse_string(pos),
             Some(')') => Err(syntax_error(pos, "unexpected ')'")),
             Some(_) => self.parse_atom(pos),
@@ -72,6 +73,16 @@ impl<'a> Parser<'a> {
         let quoted = self.parse_expr()?;
         Ok(Expr::List(
             vec![Expr::Symbol("quote".into(), pos), quoted],
+            pos,
+        ))
+    }
+
+    fn parse_syntax_shorthand(&mut self, pos: Position) -> Result<Expr, EvalError> {
+        self.expect_char('#')?;
+        self.expect_char('\'')?;
+        let quoted = self.parse_expr()?;
+        Ok(Expr::List(
+            vec![Expr::Symbol("syntax".into(), pos), quoted],
             pos,
         ))
     }
@@ -189,6 +200,12 @@ impl<'a> Parser<'a> {
 
     fn peek_char(&self) -> Option<char> {
         self.input[self.cursor..].chars().next()
+    }
+
+    fn peek_next_char(&self) -> Option<char> {
+        let mut chars = self.input[self.cursor..].chars();
+        chars.next()?;
+        chars.next()
     }
 
     fn bump_char(&mut self) -> Option<char> {

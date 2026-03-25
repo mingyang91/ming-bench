@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use super::core::{EnvRef, Environment, Expr, Position, Runtime};
+use super::core::{list_to_vec, quote_expr, EnvRef, Environment, Expr, Position, Runtime, Value};
 use super::error::EvalError;
+use super::eval::apply_procedure;
 
 const ELLIPSIS: &str = "...";
 const PROTECTED_IDENTIFIERS: &[&str] = &[
@@ -18,14 +19,30 @@ const PROTECTED_IDENTIFIERS: &[&str] = &[
     "or",
     "quote",
     "set!",
+    "syntax",
+    "syntax-case",
     "syntax-rules",
+    "with-syntax",
 ];
 
 #[derive(Clone)]
-pub(crate) struct MacroTransformer {
+pub(crate) enum MacroTransformer {
+    SyntaxRules(SyntaxRulesTransformer),
+    Procedure(ProcedureTransformer),
+}
+
+#[derive(Clone)]
+pub(crate) struct SyntaxRulesTransformer {
     name: String,
     literals: HashSet<String>,
     rules: Vec<SyntaxRule>,
+    definition_env: EnvRef,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProcedureTransformer {
+    param: String,
+    body: Vec<Expr>,
     definition_env: EnvRef,
 }
 
@@ -43,6 +60,18 @@ enum BindingMatch {
 }
 
 type Bindings = HashMap<String, BindingMatch>;
+type TransformerEnv = HashMap<String, TransformerBinding>;
+
+#[derive(Clone)]
+enum TransformerBinding {
+    Syntax(BindingMatch),
+}
+
+#[derive(Clone)]
+enum TransformerValue {
+    Scheme(Value),
+    Syntax(Expr),
+}
 
 struct ListMatchContext<'a> {
     patterns: &'a [Expr],
@@ -59,8 +88,15 @@ struct ExpansionState<'a> {
     pattern_vars: &'a HashSet<String>,
     definition_env: &'a EnvRef,
     expansion_env: EnvRef,
-    captured_aliases: HashMap<String, String>,
+    captured_aliases: &'a mut HashMap<String, String>,
     protected_identifiers: HashSet<String>,
+    runtime: &'a mut Runtime,
+}
+
+struct ProcedureExpansionState<'a> {
+    definition_env: &'a EnvRef,
+    expansion_env: EnvRef,
+    captured_aliases: HashMap<String, String>,
     runtime: &'a mut Runtime,
 }
 
@@ -72,27 +108,37 @@ pub(crate) fn parse_macro_definition(
     let Expr::List(items, _) = spec else {
         return Err(positioned_syntax_error(
             spec,
-            "define-syntax requires a syntax-rules transformer",
+            "define-syntax requires a syntax-rules or lambda transformer",
         ));
     };
 
     let Some((head, rest)) = items.split_first() else {
         return Err(positioned_syntax_error(
             spec,
-            "define-syntax requires a syntax-rules transformer",
+            "define-syntax requires a syntax-rules or lambda transformer",
         ));
     };
 
     match head {
-        Expr::Symbol(symbol, _) if symbol == "syntax-rules" => {}
-        _ => {
-            return Err(positioned_syntax_error(
-                head,
-                "define-syntax requires a syntax-rules transformer",
-            ));
+        Expr::Symbol(symbol, _) if symbol == "syntax-rules" => {
+            parse_syntax_rules_definition(name, rest, spec, env).map(MacroTransformer::SyntaxRules)
         }
+        Expr::Symbol(symbol, _) if symbol == "lambda" => {
+            parse_procedure_macro_definition(name, rest, spec, env).map(MacroTransformer::Procedure)
+        }
+        _ => Err(positioned_syntax_error(
+            head,
+            "define-syntax requires a syntax-rules or lambda transformer",
+        )),
     }
+}
 
+fn parse_syntax_rules_definition(
+    name: &str,
+    rest: &[Expr],
+    spec: &Expr,
+    env: &EnvRef,
+) -> Result<SyntaxRulesTransformer, EvalError> {
     let Some((literals_expr, rules)) = rest.split_first() else {
         return Err(positioned_syntax_error(
             spec,
@@ -113,7 +159,7 @@ pub(crate) fn parse_macro_definition(
         .map(|rule| parse_syntax_rule(rule, name, &literals))
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(MacroTransformer {
+    Ok(SyntaxRulesTransformer {
         name: name.to_string(),
         literals,
         rules: parsed_rules,
@@ -121,8 +167,72 @@ pub(crate) fn parse_macro_definition(
     })
 }
 
+fn parse_procedure_macro_definition(
+    _name: &str,
+    rest: &[Expr],
+    spec: &Expr,
+    env: &EnvRef,
+) -> Result<ProcedureTransformer, EvalError> {
+    let Some((params_expr, body)) = rest.split_first() else {
+        return Err(positioned_syntax_error(
+            spec,
+            "macro transformer lambda requires a parameter list and body",
+        ));
+    };
+
+    if body.is_empty() {
+        return Err(positioned_syntax_error(
+            spec,
+            "macro transformer lambda requires a body",
+        ));
+    }
+
+    let Expr::List(params, _) = params_expr else {
+        return Err(positioned_syntax_error(
+            params_expr,
+            "macro transformer lambda must have exactly one parameter",
+        ));
+    };
+
+    let [param_expr] = params.as_slice() else {
+        return Err(positioned_syntax_error(
+            params_expr,
+            "macro transformer lambda must have exactly one parameter",
+        ));
+    };
+
+    let Expr::Symbol(param, _) = param_expr else {
+        return Err(positioned_syntax_error(
+            param_expr,
+            "macro transformer parameter must be an identifier",
+        ));
+    };
+
+    Ok(ProcedureTransformer {
+        param: param.clone(),
+        body: body.to_vec(),
+        definition_env: env.clone(),
+    })
+}
+
 pub(crate) fn expand_macro_call(
     transformer: &MacroTransformer,
+    call: &[Expr],
+    env: &EnvRef,
+    runtime: &mut Runtime,
+) -> Result<(Expr, EnvRef), EvalError> {
+    match transformer {
+        MacroTransformer::SyntaxRules(transformer) => {
+            expand_syntax_rules_call(transformer, call, env, runtime)
+        }
+        MacroTransformer::Procedure(transformer) => {
+            expand_procedure_macro_call(transformer, call, env, runtime)
+        }
+    }
+}
+
+fn expand_syntax_rules_call(
+    transformer: &SyntaxRulesTransformer,
     call: &[Expr],
     env: &EnvRef,
     runtime: &mut Runtime,
@@ -146,13 +256,14 @@ pub(crate) fn expand_macro_call(
         };
 
         let protected_identifiers = build_protected_identifiers(runtime);
-        let expansion_env = Environment::new(Some(env.clone()));
+        let expansion_env = Environment::new_transparent(Some(env.clone()));
+        let mut captured_aliases = HashMap::new();
         let mut state = ExpansionState {
             bindings: &bindings,
             pattern_vars: &rule.pattern_vars,
             definition_env: &transformer.definition_env,
             expansion_env: expansion_env.clone(),
-            captured_aliases: HashMap::new(),
+            captured_aliases: &mut captured_aliases,
             protected_identifiers,
             runtime,
         };
@@ -166,7 +277,40 @@ pub(crate) fn expand_macro_call(
     ))))
 }
 
-impl MacroTransformer {
+fn expand_procedure_macro_call(
+    transformer: &ProcedureTransformer,
+    call: &[Expr],
+    env: &EnvRef,
+    runtime: &mut Runtime,
+) -> Result<(Expr, EnvRef), EvalError> {
+    let Some(first) = call.first() else {
+        return Err(syntax_error("macro call cannot be empty"));
+    };
+    let call_expr = Expr::List(call.to_vec(), first.pos());
+    let expansion_env = Environment::new_transparent(Some(env.clone()));
+    let mut transformer_env = TransformerEnv::new();
+    transformer_env.insert(
+        transformer.param.clone(),
+        TransformerBinding::Syntax(BindingMatch::Scalar(call_expr)),
+    );
+
+    let mut state = ProcedureExpansionState {
+        definition_env: &transformer.definition_env,
+        expansion_env: expansion_env.clone(),
+        captured_aliases: HashMap::new(),
+        runtime,
+    };
+    let result = eval_transformer_sequence(&transformer.body, &transformer_env, &mut state)?;
+    match result {
+        TransformerValue::Syntax(expanded) => Ok((expanded, expansion_env)),
+        TransformerValue::Scheme(value) => Err(first.pos().attach(EvalError::TypeMismatch {
+            expected: "syntax object".into(),
+            found: value.render_for_error(),
+        })),
+    }
+}
+
+impl SyntaxRulesTransformer {
     fn match_literals(&self) -> HashSet<String> {
         let mut literals = self.literals.clone();
         literals.insert(self.name.clone());
@@ -267,13 +411,369 @@ fn parse_syntax_rule(
     })
 }
 
+fn eval_transformer_sequence(
+    body: &[Expr],
+    env: &TransformerEnv,
+    state: &mut ProcedureExpansionState<'_>,
+) -> Result<TransformerValue, EvalError> {
+    let Some((last, prefix)) = body.split_last() else {
+        return Err(syntax_error("macro transformer body cannot be empty"));
+    };
+
+    for expr in prefix {
+        let _ = eval_transformer_expr(expr, env, state)?;
+    }
+
+    eval_transformer_expr(last, env, state)
+}
+
+fn eval_transformer_expr(
+    expr: &Expr,
+    env: &TransformerEnv,
+    state: &mut ProcedureExpansionState<'_>,
+) -> Result<TransformerValue, EvalError> {
+    match expr {
+        Expr::Bool(value, _) => Ok(TransformerValue::Scheme(Value::Bool(*value))),
+        Expr::Number(value, _) => Ok(TransformerValue::Scheme(Value::Number(*value))),
+        Expr::String(value, _) => Ok(TransformerValue::Scheme(Value::String(std::rc::Rc::new(
+            super::core::SchemeString::new(value.clone(), false),
+        )))),
+        Expr::Char(value, _) => Ok(TransformerValue::Scheme(Value::Char(*value))),
+        Expr::Symbol(name, pos) => eval_transformer_symbol(name, *pos, env, state),
+        Expr::List(items, pos) => eval_transformer_list(items, *pos, env, state),
+    }
+}
+
+fn eval_transformer_symbol(
+    name: &str,
+    pos: Position,
+    env: &TransformerEnv,
+    state: &ProcedureExpansionState<'_>,
+) -> Result<TransformerValue, EvalError> {
+    match env.get(name) {
+        Some(TransformerBinding::Syntax(BindingMatch::Scalar(expr))) => {
+            Ok(TransformerValue::Syntax(expr.clone()))
+        }
+        Some(TransformerBinding::Syntax(BindingMatch::Repeated(_))) => {
+            Err(pos.attach(syntax_error(format!(
+                "pattern variable '{name}' requires ellipsis in a syntax template"
+            ))))
+        }
+        None => Environment::lookup(state.definition_env, name)
+            .map(TransformerValue::Scheme)
+            .ok_or_else(|| pos.attach(EvalError::UnboundSymbol { name: name.into() })),
+    }
+}
+
+fn eval_transformer_list(
+    items: &[Expr],
+    pos: Position,
+    env: &TransformerEnv,
+    state: &mut ProcedureExpansionState<'_>,
+) -> Result<TransformerValue, EvalError> {
+    let Some((head, args)) = items.split_first() else {
+        return Err(pos.attach(syntax_error("empty application")));
+    };
+
+    if let Expr::Symbol(name, _) = head {
+        match name.as_str() {
+            "quote" => return eval_transformer_quote(args),
+            "if" => return eval_transformer_if(args, env, state),
+            "begin" => return eval_transformer_sequence(args, env, state),
+            "syntax" => return eval_transformer_syntax(args, env, state),
+            "with-syntax" => return eval_transformer_with_syntax(args, env, state),
+            "syntax-case" => return eval_transformer_syntax_case(args, env, state),
+            "syntax->datum" => return eval_transformer_syntax_to_datum(args, env, state),
+            "datum->syntax" => return eval_transformer_datum_to_syntax(args, env, state),
+            _ => {}
+        }
+    }
+
+    let operator = expect_scheme_value(eval_transformer_expr(head, env, state)?, "procedure")?;
+    let args = args
+        .iter()
+        .map(|arg| eval_transformer_expr(arg, env, state))
+        .map(|result| result.and_then(|value| expect_scheme_value(value, "value")))
+        .collect::<Result<Vec<_>, _>>()?;
+    apply_procedure(operator, &args, state.runtime).map(TransformerValue::Scheme)
+}
+
+fn eval_transformer_quote(args: &[Expr]) -> Result<TransformerValue, EvalError> {
+    let [expr] = args else {
+        return Err(wrong_arg_count("quote", "exactly 1", args.len()));
+    };
+    Ok(TransformerValue::Scheme(quote_expr(expr)))
+}
+
+fn eval_transformer_if(
+    args: &[Expr],
+    env: &TransformerEnv,
+    state: &mut ProcedureExpansionState<'_>,
+) -> Result<TransformerValue, EvalError> {
+    let [test, consequent] = args else {
+        if let [test, consequent, alternate] = args {
+            let test_value = eval_transformer_expr(test, env, state)?;
+            if transformer_value_is_truthy(&test_value) {
+                return eval_transformer_expr(consequent, env, state);
+            }
+            return eval_transformer_expr(alternate, env, state);
+        }
+        return Err(wrong_arg_count("if", "exactly 2 or 3", args.len()));
+    };
+
+    let test_value = eval_transformer_expr(test, env, state)?;
+    if transformer_value_is_truthy(&test_value) {
+        eval_transformer_expr(consequent, env, state)
+    } else {
+        Ok(TransformerValue::Scheme(Value::Void))
+    }
+}
+
+fn eval_transformer_syntax(
+    args: &[Expr],
+    env: &TransformerEnv,
+    state: &mut ProcedureExpansionState<'_>,
+) -> Result<TransformerValue, EvalError> {
+    let [template] = args else {
+        return Err(wrong_arg_count("syntax", "exactly 1", args.len()));
+    };
+
+    let (bindings, pattern_vars) = collect_transformer_syntax_bindings(env);
+    let protected_identifiers = build_protected_identifiers(state.runtime);
+    let mut expansion_state = ExpansionState {
+        bindings: &bindings,
+        pattern_vars: &pattern_vars,
+        definition_env: state.definition_env,
+        expansion_env: state.expansion_env.clone(),
+        captured_aliases: &mut state.captured_aliases,
+        protected_identifiers,
+        runtime: state.runtime,
+    };
+    expand_template(template, &mut expansion_state, None, &HashMap::new())
+        .map(TransformerValue::Syntax)
+}
+
+fn eval_transformer_with_syntax(
+    args: &[Expr],
+    env: &TransformerEnv,
+    state: &mut ProcedureExpansionState<'_>,
+) -> Result<TransformerValue, EvalError> {
+    let Some((bindings_expr, body)) = args.split_first() else {
+        return Err(wrong_arg_count("with-syntax", "at least 2", 0));
+    };
+    if body.is_empty() {
+        return Err(wrong_arg_count("with-syntax", "at least 2", 1));
+    }
+
+    let Expr::List(bindings, _) = bindings_expr else {
+        return Err(positioned_syntax_error(
+            bindings_expr,
+            "with-syntax bindings must be a list",
+        ));
+    };
+
+    let mut additions = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let Expr::List(parts, _) = binding else {
+            return Err(positioned_syntax_error(
+                binding,
+                "with-syntax bindings must be (name expr) pairs",
+            ));
+        };
+        let [name_expr, value_expr] = parts.as_slice() else {
+            return Err(positioned_syntax_error(
+                binding,
+                "with-syntax bindings must be (name expr) pairs",
+            ));
+        };
+        let Expr::Symbol(name, _) = name_expr else {
+            return Err(positioned_syntax_error(
+                name_expr,
+                "with-syntax binding names must be identifiers",
+            ));
+        };
+        let value = eval_transformer_expr(value_expr, env, state)?;
+        let syntax = expect_syntax_value(value)?;
+        additions.push((name.clone(), syntax));
+    }
+
+    let mut local_env = env.clone();
+    for (name, syntax) in additions {
+        local_env.insert(
+            name,
+            TransformerBinding::Syntax(BindingMatch::Scalar(syntax)),
+        );
+    }
+
+    eval_transformer_sequence(body, &local_env, state)
+}
+
+fn eval_transformer_syntax_case(
+    args: &[Expr],
+    env: &TransformerEnv,
+    state: &mut ProcedureExpansionState<'_>,
+) -> Result<TransformerValue, EvalError> {
+    let Some((target_expr, rest)) = args.split_first() else {
+        return Err(wrong_arg_count("syntax-case", "at least 3", 0));
+    };
+    let Some((literals_expr, clauses)) = rest.split_first() else {
+        return Err(wrong_arg_count("syntax-case", "at least 3", 1));
+    };
+    if clauses.is_empty() {
+        return Err(wrong_arg_count("syntax-case", "at least 3", 2));
+    }
+
+    let target = expect_syntax_value(eval_transformer_expr(target_expr, env, state)?)?;
+    let literals = parse_literal_identifiers(literals_expr)?;
+
+    for clause in clauses {
+        let Expr::List(parts, _) = clause else {
+            return Err(positioned_syntax_error(
+                clause,
+                "syntax-case clauses must be (pattern expr) or (pattern fender expr)",
+            ));
+        };
+
+        let (pattern, fender, template) = match parts.as_slice() {
+            [pattern, template] => (pattern, None, template),
+            [pattern, fender, template] => (pattern, Some(fender), template),
+            _ => {
+                return Err(positioned_syntax_error(
+                    clause,
+                    "syntax-case clauses must be (pattern expr) or (pattern fender expr)",
+                ))
+            }
+        };
+
+        let Some(bindings) = match_pattern(pattern, &target, &literals, 0, &Bindings::new())?
+        else {
+            continue;
+        };
+
+        let mut local_env = env.clone();
+        for (name, binding) in &bindings {
+            local_env.insert(name.clone(), TransformerBinding::Syntax(binding.clone()));
+        }
+
+        if let Some(fender_expr) = fender {
+            let fender_value = eval_transformer_expr(fender_expr, &local_env, state)?;
+            if !transformer_value_is_truthy(&fender_value) {
+                continue;
+            }
+        }
+
+        return eval_transformer_expr(template, &local_env, state);
+    }
+
+    Err(target_expr
+        .pos()
+        .attach(syntax_error("no syntax-case clause matched")))
+}
+
+fn eval_transformer_syntax_to_datum(
+    args: &[Expr],
+    env: &TransformerEnv,
+    state: &mut ProcedureExpansionState<'_>,
+) -> Result<TransformerValue, EvalError> {
+    let [expr] = args else {
+        return Err(wrong_arg_count("syntax->datum", "exactly 1", args.len()));
+    };
+    let syntax = expect_syntax_value(eval_transformer_expr(expr, env, state)?)?;
+    Ok(TransformerValue::Scheme(quote_expr(&syntax)))
+}
+
+fn eval_transformer_datum_to_syntax(
+    args: &[Expr],
+    env: &TransformerEnv,
+    state: &mut ProcedureExpansionState<'_>,
+) -> Result<TransformerValue, EvalError> {
+    let [context_expr, datum_expr] = args else {
+        return Err(wrong_arg_count("datum->syntax", "exactly 2", args.len()));
+    };
+    let context = expect_syntax_value(eval_transformer_expr(context_expr, env, state)?)?;
+    let datum = expect_scheme_value(eval_transformer_expr(datum_expr, env, state)?, "datum")?;
+    datum_value_to_expr(&datum, context.pos()).map(TransformerValue::Syntax)
+}
+
+fn collect_transformer_syntax_bindings(env: &TransformerEnv) -> (Bindings, HashSet<String>) {
+    let mut bindings = Bindings::new();
+    let mut pattern_vars = HashSet::new();
+
+    for (name, binding) in env {
+        let TransformerBinding::Syntax(binding) = binding;
+        bindings.insert(name.clone(), binding.clone());
+        if name != "_" {
+            pattern_vars.insert(name.clone());
+        }
+    }
+
+    (bindings, pattern_vars)
+}
+
+fn expect_scheme_value(value: TransformerValue, expected: &str) -> Result<Value, EvalError> {
+    match value {
+        TransformerValue::Scheme(value) => Ok(value),
+        TransformerValue::Syntax(_) => Err(EvalError::TypeMismatch {
+            expected: expected.into(),
+            found: "syntax object".into(),
+        }),
+    }
+}
+
+fn expect_syntax_value(value: TransformerValue) -> Result<Expr, EvalError> {
+    match value {
+        TransformerValue::Syntax(expr) => Ok(expr),
+        TransformerValue::Scheme(value) => Err(EvalError::TypeMismatch {
+            expected: "syntax object".into(),
+            found: value.render_for_error(),
+        }),
+    }
+}
+
+fn transformer_value_is_truthy(value: &TransformerValue) -> bool {
+    match value {
+        TransformerValue::Scheme(value) => value.is_truthy(),
+        TransformerValue::Syntax(_) => true,
+    }
+}
+
+fn datum_value_to_expr(value: &Value, pos: Position) -> Result<Expr, EvalError> {
+    match value {
+        Value::Bool(value) => Ok(Expr::Bool(*value, pos)),
+        Value::Number(value) => Ok(Expr::Number(*value, pos)),
+        Value::String(value) => Ok(Expr::String(value.borrow().clone(), pos)),
+        Value::Symbol(value) => Ok(Expr::Symbol(value.clone(), pos)),
+        Value::Char(value) => Ok(Expr::Char(*value, pos)),
+        Value::List(_) | Value::Pair(_) => list_to_vec(value)
+            .ok_or_else(|| EvalError::TypeMismatch {
+                expected: "datum".into(),
+                found: value.render_for_error(),
+            })
+            .and_then(|items| {
+                items
+                    .into_iter()
+                    .map(|item| datum_value_to_expr(&item, pos))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|items| Expr::List(items, pos))
+            }),
+        Value::Vector(_)
+        | Value::Record(_)
+        | Value::Procedure(_)
+        | Value::Uninitialized
+        | Value::Void => Err(EvalError::TypeMismatch {
+            expected: "datum".into(),
+            found: value.render_for_error(),
+        }),
+    }
+}
+
 fn collect_pattern_variables(
     expr: &Expr,
     literals: &HashSet<String>,
     pattern_vars: &mut HashSet<String>,
 ) {
     match expr {
-        Expr::Symbol(name, _) if name != ELLIPSIS && !literals.contains(name) => {
+        Expr::Symbol(name, _) if name != ELLIPSIS && name != "_" && !literals.contains(name) => {
             pattern_vars.insert(name.clone());
         }
         Expr::List(items, _) => {
@@ -312,6 +812,7 @@ fn match_pattern(
         Expr::Symbol(name, _) if name == ELLIPSIS => {
             Err(syntax_error("misplaced ellipsis in macro pattern"))
         }
+        Expr::Symbol(name, _) if name == "_" => Ok(Some(bindings.clone())),
         Expr::Symbol(name, _) if literals.contains(name) => Ok(match input {
             Expr::Symbol(other, _) if name == other => Some(bindings.clone()),
             _ => None,
@@ -556,7 +1057,7 @@ fn ensure_empty_repeated_bindings(
     }
 
     match pattern {
-        Expr::Symbol(name, _) if name != ELLIPSIS && !literals.contains(name) => {
+        Expr::Symbol(name, _) if name != ELLIPSIS && name != "_" && !literals.contains(name) => {
             if ellipsis_depth == 1 {
                 bindings
                     .entry(name.clone())
@@ -1149,4 +1650,12 @@ fn syntax_error(message: impl Into<String>) -> EvalError {
 
 fn positioned_syntax_error(expr: &Expr, message: impl Into<String>) -> EvalError {
     expr.pos().attach(syntax_error(message))
+}
+
+fn wrong_arg_count(name: &str, expected: impl Into<String>, actual: usize) -> EvalError {
+    EvalError::WrongArgCount {
+        name: name.into(),
+        expected: expected.into(),
+        actual,
+    }
 }
