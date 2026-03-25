@@ -26,6 +26,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "char?",
     "display",
     "eq?",
+    "eqv?",
     "equal?",
     "even?",
     "exact->inexact",
@@ -55,8 +56,10 @@ const BUILTIN_NAMES: &[&str] = &[
     "list?",
     "list-ref",
     "list-tail",
+    "list->vector",
     "map",
     "max",
+    "make-vector",
     "min",
     "modulo",
     "negative?",
@@ -86,6 +89,12 @@ const BUILTIN_NAMES: &[&str] = &[
     "substring",
     "symbol?",
     "symbol->string",
+    "vector",
+    "vector->list",
+    "vector-length",
+    "vector-ref",
+    "vector-set!",
+    "vector?",
     "write",
     "zero?",
 ];
@@ -439,8 +448,18 @@ impl Environment {
         binding.or_else(|| parent.and_then(|parent| Self::lookup_binding(&parent, name)))
     }
 
-    fn lookup(env: &EnvRef, name: &str) -> Option<Value> {
-        Self::lookup_binding(env, name).map(|binding| binding.borrow().clone())
+    fn lookup(env: &EnvRef, name: &str, position: SourcePos) -> Result<Option<Value>, EvalError> {
+        match Self::lookup_binding(env, name) {
+            Some(binding) => {
+                let value = binding.borrow().clone();
+                if matches!(value, Value::Uninitialized) {
+                    Err(EvalError::uninitialized_variable(name, position))
+                } else {
+                    Ok(Some(value))
+                }
+            }
+            None => Ok(None),
+        }
     }
 
     fn lookup_macro(env: &EnvRef, name: &str) -> Option<MacroRef> {
@@ -696,10 +715,12 @@ enum Value {
     Symbol(String),
     List(Vec<Value>),
     Pair(Rc<Pair>),
+    Vector(Rc<RefCell<Vec<Value>>>),
     Record(Rc<RecordInstance>),
     Builtin(&'static str),
     Procedure(Rc<UserProcedure>),
     NativeProcedure(Rc<NativeProcedure>),
+    Uninitialized,
     Void,
 }
 
@@ -713,8 +734,10 @@ impl Value {
             Value::Symbol(_) => "symbol",
             Value::List(_) => "list",
             Value::Pair(_) => "pair",
+            Value::Vector(_) => "vector",
             Value::Record(_) => "record",
             Value::Builtin(_) | Value::Procedure(_) | Value::NativeProcedure(_) => "procedure",
+            Value::Uninitialized => "undefined",
             Value::Void => "void",
         }
     }
@@ -779,10 +802,20 @@ impl Value {
                 format!("({items})")
             }
             Value::Pair(pair) => format_pair(pair),
+            Value::Vector(values) => {
+                let items = values
+                    .borrow()
+                    .iter()
+                    .map(Value::to_scheme_string)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("#({items})")
+            }
             Value::Record(record) => format!("#<record {}>", record.record_type.name),
             Value::Builtin(_) | Value::Procedure(_) | Value::NativeProcedure(_) => {
                 "#<procedure>".into()
             }
+            Value::Uninitialized => "#<uninitialized>".into(),
             Value::Void => "#<void>".into(),
         }
     }
@@ -842,6 +875,17 @@ impl LocatedValue {
             Value::Symbol(value) => Ok(value.as_str()),
             other => Err(EvalError::type_mismatch(
                 "symbol",
+                other.type_name(),
+                self.position,
+            )),
+        }
+    }
+
+    fn as_vector(&self) -> Result<Rc<RefCell<Vec<Value>>>, EvalError> {
+        match &self.value {
+            Value::Vector(values) => Ok(values.clone()),
+            other => Err(EvalError::type_mismatch(
+                "vector",
                 other.type_name(),
                 self.position,
             )),
@@ -1103,6 +1147,7 @@ fn scheme_eq(left: &Value, right: &Value) -> bool {
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::String(left), Value::String(right)) => Rc::ptr_eq(&left.chars, &right.chars),
         (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
+        (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
@@ -1134,6 +1179,15 @@ fn scheme_equal(left: &Value, right: &Value) -> bool {
         (Value::Pair(left), Value::Pair(right)) => {
             scheme_equal(&left.car, &right.car) && scheme_equal(&left.cdr, &right.cdr)
         }
+        (Value::Vector(left), Value::Vector(right)) => {
+            let left = left.borrow();
+            let right = right.borrow();
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| scheme_equal(left, right))
+        }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
@@ -1151,7 +1205,7 @@ fn eval(expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
         ExprKind::Bool(value) => Ok(Value::Bool(*value)),
         ExprKind::Char(value) => Ok(Value::Char(*value)),
         ExprKind::String(value) => Ok(Value::String(SchemeString::immutable(value))),
-        ExprKind::Symbol(name) => Environment::lookup(&env, name)
+        ExprKind::Symbol(name) => Environment::lookup(&env, name, expr.pos)?
             .ok_or_else(|| EvalError::unbound_variable(name.clone(), expr.pos)),
         ExprKind::List(items) => eval_list(items, env, expr.pos),
     }
@@ -1184,7 +1238,11 @@ fn eval_list(items: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, 
             "or" => eval_or(tail, env),
             "begin" => eval_begin(tail, env),
             "cond" => eval_cond(tail, env, head.pos),
+            "case" => eval_case(tail, env, head.pos),
+            "do" => eval_do(tail, env, head.pos),
             "let" => eval_let(tail, env, head.pos),
+            "letrec" => eval_letrec(tail, env, head.pos, false),
+            "letrec*" => eval_letrec(tail, env, head.pos, true),
             _ => {
                 let callable = eval(head, env.clone())?;
                 let args = eval_all(tail, env.clone())?;
@@ -1461,17 +1519,25 @@ fn eval_set(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, E
 }
 
 fn eval_if(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
-    let [condition, then_branch, else_branch] = exprs else {
-        return Err(EvalError::syntax(
-            "if requires exactly 3 expressions",
+    match exprs {
+        [condition, then_branch] => {
+            if eval(condition, env.clone())?.is_truthy() {
+                eval(then_branch, env)
+            } else {
+                Ok(Value::Void)
+            }
+        }
+        [condition, then_branch, else_branch] => {
+            if eval(condition, env.clone())?.is_truthy() {
+                eval(then_branch, env)
+            } else {
+                eval(else_branch, env)
+            }
+        }
+        _ => Err(EvalError::syntax(
+            "if requires 2 or 3 expressions",
             position,
-        ));
-    };
-
-    if eval(condition, env.clone())?.is_truthy() {
-        eval(then_branch, env)
-    } else {
-        eval(else_branch, env)
+        )),
     }
 }
 
@@ -1710,6 +1776,64 @@ fn eval_cond(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, 
     Ok(Value::Void)
 }
 
+fn eval_case(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+    let Some((key_expr, clauses)) = exprs.split_first() else {
+        return Err(EvalError::syntax(
+            "case requires a key and at least 1 clause",
+            position,
+        ));
+    };
+
+    if clauses.is_empty() {
+        return Err(EvalError::syntax(
+            "case requires at least 1 clause",
+            position,
+        ));
+    }
+
+    let key = eval(key_expr, env.clone())?;
+
+    for (index, clause) in clauses.iter().enumerate() {
+        let ExprKind::List(items) = &clause.kind else {
+            return Err(EvalError::syntax("case clauses must be lists", clause.pos));
+        };
+
+        let Some((datums_expr, body)) = items.split_first() else {
+            return Err(EvalError::syntax(
+                "case clauses cannot be empty",
+                clause.pos,
+            ));
+        };
+
+        if matches!(&datums_expr.kind, ExprKind::Symbol(name) if name == "else") {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::syntax(
+                    "case else clause must be last",
+                    datums_expr.pos,
+                ));
+            }
+
+            return eval_sequence(body, env);
+        }
+
+        let ExprKind::List(datums) = &datums_expr.kind else {
+            return Err(EvalError::syntax(
+                "case clause datums must be a list",
+                datums_expr.pos,
+            ));
+        };
+
+        if datums
+            .iter()
+            .any(|datum| scheme_eq(&key, &quote_expr(datum)))
+        {
+            return eval_sequence(body, env);
+        }
+    }
+
+    Ok(Value::Void)
+}
+
 fn eval_let(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
     match exprs {
         [first, bindings_expr, body @ ..]
@@ -1726,6 +1850,58 @@ fn eval_let(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, E
             position,
         )),
     }
+}
+
+fn eval_letrec(
+    exprs: &[Expr],
+    env: EnvRef,
+    position: SourcePos,
+    sequential: bool,
+) -> Result<Value, EvalError> {
+    let Some((bindings_expr, body)) = exprs.split_first() else {
+        let name = if sequential { "letrec*" } else { "letrec" };
+        return Err(EvalError::syntax(
+            format!("{name} requires bindings and a body"),
+            position,
+        ));
+    };
+
+    if body.is_empty() {
+        let name = if sequential { "letrec*" } else { "letrec" };
+        return Err(EvalError::syntax(
+            format!("{name} requires bindings and a body"),
+            position,
+        ));
+    }
+
+    let bindings = parse_bindings(bindings_expr)?;
+    let let_env = Environment::child(env);
+    let slots = bindings
+        .iter()
+        .map(|(name, _)| {
+            let binding = Rc::new(RefCell::new(Value::Uninitialized));
+            Environment::define_existing(&let_env, name.clone(), binding.clone());
+            binding
+        })
+        .collect::<Vec<_>>();
+
+    if sequential {
+        for ((_, expr), slot) in bindings.iter().zip(slots.iter()) {
+            let value = eval(expr, let_env.clone())?;
+            *slot.borrow_mut() = value;
+        }
+    } else {
+        let values = bindings
+            .iter()
+            .map(|(_, expr)| eval(expr, let_env.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (slot, value) in slots.iter().zip(values) {
+            *slot.borrow_mut() = value;
+        }
+    }
+
+    eval_sequence(body, let_env)
 }
 
 fn eval_plain_let(bindings_expr: &Expr, body: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
@@ -1798,6 +1974,66 @@ fn parse_bindings(bindings_expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError
     Ok(parsed)
 }
 
+fn parse_do_bindings(bindings_expr: &Expr) -> Result<Vec<DoBinding>, EvalError> {
+    let ExprKind::List(bindings) = &bindings_expr.kind else {
+        return Err(EvalError::syntax(
+            "do bindings must be a list",
+            bindings_expr.pos,
+        ));
+    };
+
+    let mut parsed = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let ExprKind::List(items) = &binding.kind else {
+            return Err(EvalError::syntax("do binding must be a list", binding.pos));
+        };
+
+        let (name_expr, init_expr, step) = match items.as_slice() {
+            [name_expr, init_expr] => (name_expr, init_expr, None),
+            [name_expr, init_expr, step_expr] => (name_expr, init_expr, Some(step_expr.clone())),
+            _ => {
+                return Err(EvalError::syntax(
+                    "do binding must contain a name, init, and optional step",
+                    binding.pos,
+                ))
+            }
+        };
+
+        let ExprKind::Symbol(name) = &name_expr.kind else {
+            return Err(EvalError::syntax(
+                "do binding name must be a symbol",
+                name_expr.pos,
+            ));
+        };
+
+        parsed.push(DoBinding {
+            name: name.clone(),
+            init: init_expr.clone(),
+            step,
+        });
+    }
+
+    Ok(parsed)
+}
+
+fn parse_do_termination_clause(expr: &Expr) -> Result<(Expr, Vec<Expr>), EvalError> {
+    let ExprKind::List(items) = &expr.kind else {
+        return Err(EvalError::syntax(
+            "do termination clause must be a list",
+            expr.pos,
+        ));
+    };
+
+    let Some((test, result_exprs)) = items.split_first() else {
+        return Err(EvalError::syntax(
+            "do termination clause cannot be empty",
+            expr.pos,
+        ));
+    };
+
+    Ok((test.clone(), result_exprs.to_vec()))
+}
+
 fn eval_binding_values(
     bindings: &[(String, Expr)],
     env: EnvRef,
@@ -1816,6 +2052,63 @@ fn eval_sequence(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     }
 
     Ok(last)
+}
+
+#[derive(Clone)]
+struct DoBinding {
+    name: String,
+    init: Expr,
+    step: Option<Expr>,
+}
+
+fn eval_do(exprs: &[Expr], env: EnvRef, position: SourcePos) -> Result<Value, EvalError> {
+    let Some((bindings_expr, rest)) = exprs.split_first() else {
+        return Err(EvalError::syntax(
+            "do requires bindings and a termination clause",
+            position,
+        ));
+    };
+    let Some((termination_expr, body)) = rest.split_first() else {
+        return Err(EvalError::syntax(
+            "do requires a termination clause",
+            position,
+        ));
+    };
+
+    let bindings = parse_do_bindings(bindings_expr)?;
+    let (test_expr, result_exprs) = parse_do_termination_clause(termination_expr)?;
+    let do_env = Environment::child(env.clone());
+    let mut slots = Vec::with_capacity(bindings.len());
+
+    for binding in &bindings {
+        let initial_value = eval(&binding.init, env.clone())?;
+        let slot = Rc::new(RefCell::new(initial_value));
+        Environment::define_existing(&do_env, binding.name.clone(), slot.clone());
+        slots.push(slot);
+    }
+
+    loop {
+        if eval(&test_expr, do_env.clone())?.is_truthy() {
+            return eval_sequence(&result_exprs, do_env);
+        }
+
+        if !body.is_empty() {
+            let _ = eval_sequence(body, do_env.clone())?;
+        }
+
+        let next_values = bindings
+            .iter()
+            .zip(slots.iter())
+            .map(|(binding, slot)| match &binding.step {
+                Some(step) => eval(step, do_env.clone()),
+                None => Ok(slot.borrow().clone()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (slot, value) in slots.iter().zip(next_values) {
+            *slot.borrow_mut() = value;
+        }
+    }
 }
 
 fn apply(
@@ -1990,6 +2283,7 @@ fn apply_builtin(
         "cons" => apply_cons(args, position),
         "display" => apply_display(args, position, env),
         "eq?" => apply_equality_predicate("eq?", args, position, scheme_eq),
+        "eqv?" => apply_equality_predicate("eqv?", args, position, scheme_eq),
         "equal?" => apply_equality_predicate("equal?", args, position, scheme_equal),
         "even?" => apply_integer_predicate("even?", args, position, |value| value % 2 == 0),
         "exact->inexact" => apply_exact_to_inexact(args, position),
@@ -2005,10 +2299,12 @@ fn apply_builtin(
         "list?" => apply_list_predicate(args, position),
         "list-ref" => apply_list_ref(args, position),
         "list-tail" => apply_list_tail(args, position),
+        "list->vector" => apply_list_to_vector(args, position),
         "map" => apply_map(args, position, env),
         "max" => apply_min_max("max", args, position, |ordering| {
             ordering == Ordering::Greater
         }),
+        "make-vector" => apply_make_vector(args, position),
         "min" => apply_min_max("min", args, position, |ordering| ordering == Ordering::Less),
         "modulo" => apply_modulo(args, position),
         "negative?" => apply_number_predicate("negative?", args, position, Number::is_negative),
@@ -2066,6 +2362,16 @@ fn apply_builtin(
             matches!(value, Value::Symbol(_))
         }),
         "symbol->string" => apply_symbol_to_string(args, position),
+        "vector" => Ok(Value::Vector(Rc::new(RefCell::new(
+            args.iter().map(|arg| arg.value.clone()).collect(),
+        )))),
+        "vector->list" => apply_vector_to_list(args, position),
+        "vector-length" => apply_vector_length(args, position),
+        "vector-ref" => apply_vector_ref(args, position),
+        "vector-set!" => apply_vector_set(args, position),
+        "vector?" => apply_type_predicate("vector?", args, position, |value| {
+            matches!(value, Value::Vector(_))
+        }),
         "write" => apply_write(args, position, env),
         "zero?" => apply_number_predicate("zero?", args, position, Number::is_zero),
         _ => Err(EvalError::unbound_variable(name, position)),
@@ -2853,6 +3159,116 @@ fn apply_list_tail(args: &[LocatedValue], position: SourcePos) -> Result<Value, 
     Ok(Value::List(values[index as usize..].to_vec()))
 }
 
+fn expect_non_negative_length(arg: &LocatedValue) -> Result<usize, EvalError> {
+    let length = arg.as_integer()?;
+    usize::try_from(length).map_err(|_| EvalError::invalid_length(length, arg.position))
+}
+
+fn apply_list_to_vector(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "list->vector",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    Ok(Value::Vector(Rc::new(RefCell::new(
+        expect_proper_list(&args[0])?.to_vec(),
+    ))))
+}
+
+fn apply_make_vector(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if !(1..=2).contains(&args.len()) {
+        return Err(EvalError::wrong_arg_count(
+            "make-vector",
+            "1 or 2",
+            args.len(),
+            position,
+        ));
+    }
+
+    let length = expect_non_negative_length(&args[0])?;
+    let fill = args.get(1).map_or(Value::Void, |arg| arg.value.clone());
+    Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; length]))))
+}
+
+fn apply_vector_to_list(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "vector->list",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    Ok(Value::List(args[0].as_vector()?.borrow().clone()))
+}
+
+fn apply_vector_length(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::wrong_arg_count(
+            "vector-length",
+            "exactly 1",
+            args.len(),
+            position,
+        ));
+    }
+
+    Ok(Value::Integer(args[0].as_vector()?.borrow().len() as i64))
+}
+
+fn apply_vector_ref(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::wrong_arg_count(
+            "vector-ref",
+            "exactly 2",
+            args.len(),
+            position,
+        ));
+    }
+
+    let vector = args[0].as_vector()?;
+    let index = args[1].as_integer()?;
+    let values = vector.borrow();
+    if index < 0 || index as usize >= values.len() {
+        return Err(EvalError::index_out_of_bounds(
+            index,
+            values.len(),
+            args[1].position,
+        ));
+    }
+
+    Ok(values[index as usize].clone())
+}
+
+fn apply_vector_set(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::wrong_arg_count(
+            "vector-set!",
+            "exactly 3",
+            args.len(),
+            position,
+        ));
+    }
+
+    let vector = args[0].as_vector()?;
+    let index = args[1].as_integer()?;
+    let mut values = vector.borrow_mut();
+    if index < 0 || index as usize >= values.len() {
+        return Err(EvalError::index_out_of_bounds(
+            index,
+            values.len(),
+            args[1].position,
+        ));
+    }
+
+    values[index as usize] = args[2].value.clone();
+    Ok(Value::Void)
+}
+
 fn apply_assoc(args: &[LocatedValue], position: SourcePos) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::wrong_arg_count(
@@ -3161,14 +3577,18 @@ fn is_core_syntax_keyword(name: &str) -> bool {
         name,
         "and"
             | "begin"
+            | "case"
             | "case-lambda"
             | "cond"
             | "define"
             | "define-record-type"
             | "define-syntax"
+            | "do"
             | "if"
             | "lambda"
             | "let"
+            | "letrec"
+            | "letrec*"
             | "or"
             | "quote"
             | "set!"

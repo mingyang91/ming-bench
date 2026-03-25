@@ -36,6 +36,9 @@ pub enum EvalError {
     #[error("{position}: unbound variable: {name}")]
     UnboundVariable { name: String, position: SourcePos },
 
+    #[error("{position}: uninitialized variable: {name}")]
+    UninitializedVariable { name: String, position: SourcePos },
+
     #[error("{position}: wrong argument count for {name}: expected {expected}, got {got}")]
     WrongArgCount {
         name: String,
@@ -75,6 +78,9 @@ pub enum EvalError {
         position: SourcePos,
     },
 
+    #[error("{position}: invalid length: {length}")]
+    InvalidLength { length: i64, position: SourcePos },
+
     #[error("{position}: cannot mutate immutable string")]
     ImmutableString { position: SourcePos },
 }
@@ -89,6 +95,13 @@ impl EvalError {
 
     pub fn unbound_variable(name: impl Into<String>, position: SourcePos) -> Self {
         Self::UnboundVariable {
+            name: name.into(),
+            position,
+        }
+    }
+
+    pub fn uninitialized_variable(name: impl Into<String>, position: SourcePos) -> Self {
+        Self::UninitializedVariable {
             name: name.into(),
             position,
         }
@@ -150,6 +163,10 @@ impl EvalError {
             length,
             position,
         }
+    }
+
+    pub fn invalid_length(length: i64, position: SourcePos) -> Self {
+        Self::InvalidLength { length, position }
     }
 
     pub fn immutable_string(position: SourcePos) -> Self {
