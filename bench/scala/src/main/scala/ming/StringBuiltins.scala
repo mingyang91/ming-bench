@@ -1,5 +1,6 @@
 package ming
 
+import java.util.Locale
 import scala.util.{Failure, Success, Try}
 
 private[ming] object StringBuiltins:
@@ -18,7 +19,12 @@ private[ming] object StringBuiltins:
       stringToSymbolBuiltin,
       stringRefBuiltin,
       stringCopyBuiltin,
-      stringSetBuiltin
+      stringSetBuiltin,
+      stringEqualsBuiltin,
+      stringLessBuiltin,
+      stringCiEqualsBuiltin,
+      stringUpcaseBuiltin,
+      stringDowncaseBuiltin
     )
 
   private val stringAppendBuiltin: Value.Builtin =
@@ -114,3 +120,53 @@ private[ming] object StringBuiltins:
     Try(BigInt(value)) match
       case Success(number) => Value.Number(number)
       case Failure(_)      => Value.Bool(false)
+
+  private val stringEqualsBuiltin: Value.Builtin =
+    stringComparisonBuiltin("string=?")(_ == _)
+
+  private val stringLessBuiltin: Value.Builtin =
+    stringComparisonBuiltin("string<?")(_ < _)
+
+  private val stringCiEqualsBuiltin: Value.Builtin =
+    Value.Builtin(
+      "string-ci=?",
+      (args, pos) =>
+        Value.Bool(compareStrings("string-ci=?", args, pos) { (left, right) =>
+          left.toLowerCase(Locale.ROOT) == right.toLowerCase(Locale.ROOT)
+        })
+    )
+
+  private val stringUpcaseBuiltin: Value.Builtin =
+    Value.Builtin(
+      "string-upcase",
+      (args, pos) =>
+        val text = asString(singleArg("string-upcase", args, pos), "string-upcase", pos)
+        Value.StringLit(text.toUpperCase(Locale.ROOT))
+    )
+
+  private val stringDowncaseBuiltin: Value.Builtin =
+    Value.Builtin(
+      "string-downcase",
+      (args, pos) =>
+        val text = asString(singleArg("string-downcase", args, pos), "string-downcase", pos)
+        Value.StringLit(text.toLowerCase(Locale.ROOT))
+    )
+
+  private def stringComparisonBuiltin(
+    name: String
+  )(predicate: (String, String) => Boolean): Value.Builtin =
+    Value.Builtin(
+      name,
+      (args, pos) => Value.Bool(compareStrings(name, args, pos)(predicate))
+    )
+
+  private def compareStrings(
+    name: String,
+    args: List[Value],
+    pos: SourcePos
+  )(predicate: (String, String) => Boolean): Boolean =
+    requireAtLeast(name, args, expected = 2, pos)
+    val strings = args.map(asString(_, name, pos))
+    strings.zip(strings.tail).forall { case (left, right) =>
+      predicate(left, right)
+    }

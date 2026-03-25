@@ -7,7 +7,9 @@ private[ming] object SchemeBuiltins:
     List.concat(
       NumericBuiltins.all,
       LogicalBuiltins.all,
+      EqualityBuiltins.all,
       ListBuiltins.all,
+      CharBuiltins.all,
       StringBuiltins.all,
       IoBuiltins.all(writeOutput),
       PredicateBuiltins.all

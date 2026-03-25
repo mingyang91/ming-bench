@@ -1,5 +1,7 @@
 package ming
 
+import scala.annotation.tailrec
+
 private[ming] object SchemeRendering:
   import SchemeInterpreter.{Expr, Procedure, Value}
 
@@ -13,7 +15,8 @@ private[ming] object SchemeRendering:
         "\"" + escapeString(text) + "\""
       case Value.Character(character) => renderCharacter(character)
       case Value.Symbol(name)         => name
-      case Value.ListValue(items)     => items.map(render).mkString("(", " ", ")")
+      case Value.EmptyList            => "()"
+      case pair: Value.Pair           => renderPair(pair, render)
       case _: Procedure               => "#<procedure>"
       case Value.Void                 => "#<void>"
 
@@ -22,7 +25,8 @@ private[ming] object SchemeRendering:
       case Value.StringLit(text)     => text
       case Value.MutableString(text) => text
       case Value.Character(value)    => value.toString
-      case Value.ListValue(items)    => items.map(renderDisplay).mkString("(", " ", ")")
+      case Value.EmptyList           => "()"
+      case pair: Value.Pair          => renderPair(pair, renderDisplay)
       case other                     => render(other)
 
   def renderExpr(expr: Expr): String =
@@ -51,3 +55,30 @@ private[ming] object SchemeRendering:
       case ' '  => "#\\space"
       case '\n' => "#\\newline"
       case ch   => s"#\\$ch"
+
+  private def renderPair(
+    value: Value.Pair,
+    renderValue: Value => String
+  ): String =
+    val builder = new StringBuilder("(")
+
+    @tailrec
+    def loop(current: Value, first: Boolean): Unit =
+      current match
+        case Value.Pair(car, cdr) =>
+          if !first then builder.append(" ")
+          builder.append(renderValue(car))
+          cdr match
+            case Value.EmptyList =>
+              ()
+            case next: Value.Pair =>
+              loop(next, first = false)
+            case other =>
+              builder.append(" . ")
+              builder.append(renderValue(other))
+        case _ =>
+          ()
+
+    loop(value, first = true)
+    builder.append(")")
+    builder.result()

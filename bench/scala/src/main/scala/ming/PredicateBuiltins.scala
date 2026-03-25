@@ -21,8 +21,8 @@ private[ming] object PredicateBuiltins:
         case _             => false
       },
       predicateBuiltin("pair?") {
-        case Value.ListValue(_ :: _) => true
-        case _                       => false
+        case Value.Pair(_, _) => true
+        case _                => false
       },
       predicateBuiltin("symbol?") {
         case Value.Symbol(_) => true
@@ -31,6 +31,9 @@ private[ming] object PredicateBuiltins:
       predicateBuiltin("char?") {
         case Value.Character(_) => true
         case _                  => false
+      },
+      predicateBuiltin("list?") { case value =>
+        isProperList(value)
       }
     )
 

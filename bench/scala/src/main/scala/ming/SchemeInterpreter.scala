@@ -50,10 +50,14 @@ private[ming] object SchemeInterpreter:
 
     final case class Character(value: Char)                                         extends Value
     final case class Symbol(name: String)                                           extends Value
-    final case class ListValue(items: List[Value])                                  extends Value
+    case object EmptyList                                                           extends Value
+    final case class Pair(car: Value, cdr: Value)                                   extends Value
     final case class Builtin(name: String, impl: (List[Value], SourcePos) => Value) extends Procedure
     final case class Closure(params: LambdaParams, body: List[Expr], env: Env)      extends Procedure
     case object Void                                                                extends Value
+
+    def list(items: List[Value]): Value =
+      items.foldRight[Value](EmptyList)(Pair(_, _))
 
   def evalProgram(input: String): Value =
     runProgram(input)._1
@@ -194,7 +198,7 @@ private[ming] object SchemeInterpreter:
         if isTruthy(value) || tail.isEmpty then value
         else evalOr(tail, env)
 
-  private def applyProcedure(value: Value, args: List[Value], pos: SourcePos): Value =
+  private[ming] def applyProcedure(value: Value, args: List[Value], pos: SourcePos): Value =
     value match
       case Value.Builtin(_, impl) =>
         impl(args, pos)
@@ -207,7 +211,7 @@ private[ming] object SchemeInterpreter:
             throw EvalError.at(pos, s"lambda expected at least $minimum arguments, got ${args.length}")
           case _ =>
         val bindings = params.required.zip(args.take(minimum)) ++ params.rest.map { restName =>
-          restName -> Value.ListValue(args.drop(minimum))
+          restName -> Value.list(args.drop(minimum))
         }
         val callEnv = Env.child(closureEnv, bindings)
         evalSequence(body, callEnv)
@@ -281,7 +285,7 @@ private[ming] object SchemeInterpreter:
       case Expr.StringLit(value, _) => Value.StringLit(value)
       case Expr.Character(value, _) => Value.Character(value)
       case Expr.Symbol(name, _)     => Value.Symbol(name)
-      case Expr.ListExpr(items, _)  => Value.ListValue(items.map(quote))
+      case Expr.ListExpr(items, _)  => Value.list(items.map(quote))
 
   private def isTruthy(value: Value): Boolean =
     value match

@@ -1,5 +1,7 @@
 package ming
 
+import scala.annotation.tailrec
+
 private[ming] object BuiltinSupport:
   import SchemeInterpreter.Value
 
@@ -48,6 +50,15 @@ private[ming] object BuiltinSupport:
     asList(singleArg(name, args, pos), name, pos) match
       case head :: tail => (head, tail)
       case Nil          => fail(pos, s"$name expected non-empty list")
+
+  def asPair(value: Value, context: String, pos: SourcePos): (Value, Value) =
+    value match
+      case Value.Pair(car, cdr) => (car, cdr)
+      case other =>
+        fail(
+          pos,
+          s"$context expected pair, got ${SchemeInterpreter.render(other)}"
+        )
 
   def asNumber(value: Value, context: String, pos: SourcePos): BigInt =
     value match
@@ -100,13 +111,15 @@ private[ming] object BuiltinSupport:
         )
 
   def asList(value: Value, context: String, pos: SourcePos): List[Value] =
-    value match
-      case Value.ListValue(items) => items
-      case other =>
-        fail(
-          pos,
-          s"$context expected list, got ${SchemeInterpreter.render(other)}"
-        )
+    toScalaList(value).getOrElse {
+      fail(
+        pos,
+        s"$context expected list, got ${SchemeInterpreter.render(value)}"
+      )
+    }
+
+  def isProperList(value: Value): Boolean =
+    toScalaList(value).isDefined
 
   def asIndex(value: Value, context: String, pos: SourcePos): Int =
     val number = asNumber(value, context, pos)
@@ -143,3 +156,13 @@ private[ming] object BuiltinSupport:
 
   def unreachable(): Nothing =
     throw IllegalStateException("unreachable")
+
+  @tailrec
+  private def toScalaList(
+    value: Value,
+    acc: List[Value] = Nil
+  ): Option[List[Value]] =
+    value match
+      case Value.EmptyList      => Some(acc.reverse)
+      case Value.Pair(car, cdr) => toScalaList(cdr, car :: acc)
+      case _                    => None
