@@ -123,6 +123,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_hash_literal(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
+        if self.remaining().starts_with("#'") {
+            self.bump();
+            self.bump();
+            let expr = self.parse_expr()?;
+            return Ok(Expr::new(
+                pos,
+                ExprKind::List(vec![
+                    Expr::new(pos, ExprKind::Symbol("syntax".into())),
+                    expr,
+                ]),
+            ));
+        }
+
         if self.remaining().starts_with("#\\") {
             self.bump();
             self.bump();

@@ -1,9 +1,11 @@
 use super::{
     builtins::builtin_name, env_define, env_define_alias, env_define_macro, env_lookup_cell,
-    env_lookup_macro, syntax_error, EnvRef, EvalContext, EvalError, Expr, ExprKind, MacroRef,
-    MacroRule, MacroTransformer, PatternBinding, Procedure, SourcePos, Value, START_POS,
+    env_lookup_macro, machine, make_list_value, syntax_error, type_mismatch, wrong_arg_count, Env,
+    EnvRef, EnvWeak, EvalContext, EvalError, Expr, ExprKind, MacroKind, MacroRef, MacroRule,
+    MacroTransformer, PatternBinding, Procedure, SourcePos, SyntaxObject, Value, START_POS,
 };
 use std::collections::{HashMap, HashSet};
+use std::mem;
 use std::rc::Rc;
 
 pub(super) fn parse_syntax_rules(
@@ -80,9 +82,11 @@ pub(super) fn parse_syntax_rules(
 
     Ok(Rc::new(MacroTransformer {
         name: name.to_string(),
-        literals,
-        rules: parsed_rules,
-        env: Rc::downgrade(env),
+        kind: MacroKind::SyntaxRules {
+            literals,
+            rules: parsed_rules,
+            env: Rc::downgrade(env),
+        },
     }))
 }
 
@@ -93,35 +97,329 @@ pub(super) fn expand_macro_call(
     env: &EnvRef,
     context: &mut EvalContext,
 ) -> Result<Expr, EvalError> {
-    let mut normalized_items = items.to_vec();
-    if let Some(head) = normalized_items.first_mut() {
-        *head = Expr::new(head.pos, ExprKind::Symbol(transformer.name.clone()));
+    match &transformer.kind {
+        MacroKind::SyntaxRules {
+            literals,
+            rules,
+            env: definition_env,
+        } => SyntaxRulesExpander::new(&transformer.name, literals, rules, definition_env, env)
+            .expand(items, pos, context),
+        MacroKind::Procedure { transformer } => {
+            expand_procedure_macro(transformer, items, pos, env, context)
+        }
     }
-    let call_expr = Expr::new(pos, ExprKind::List(normalized_items));
+}
 
-    for rule in &transformer.rules {
+pub(super) fn eval_syntax(
+    args: &[Expr],
+    _env: &EnvRef,
+    pos: SourcePos,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let [template] = args else {
+        return Err(wrong_arg_count(
+            pos,
+            "syntax",
+            "exactly 1 argument",
+            args.len(),
+        ));
+    };
+
+    if context.macro_expansions.is_empty() {
+        return Ok(Value::Syntax(SyntaxObject::new(template.clone())));
+    }
+
+    let (definition_env, use_env, bindings, mut free_renames) = {
+        let expansion = context
+            .macro_expansions
+            .last_mut()
+            .expect("checked for active macro expansion");
+        (
+            Rc::clone(&expansion.definition_env),
+            Rc::clone(&expansion.use_env),
+            merged_pattern_bindings(&expansion.binding_scopes),
+            mem::take(&mut expansion.free_renames),
+        )
+    };
+
+    let expanded = instantiate_template(
+        template,
+        &definition_env,
+        &use_env,
+        &bindings,
+        &mut free_renames,
+        context,
+    );
+
+    context
+        .macro_expansions
+        .last_mut()
+        .expect("active macro expansion must still exist")
+        .free_renames = free_renames;
+
+    expanded.map(|expr| Value::Syntax(SyntaxObject::new(expr)))
+}
+
+pub(super) fn eval_syntax_case(
+    args: &[Expr],
+    env: &EnvRef,
+    pos: SourcePos,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let (target_expr, rest) = args.split_first().ok_or_else(|| {
+        syntax_error(pos, "syntax-case requires a target and at least one clause")
+    })?;
+    let (literals_expr, clauses) = rest.split_first().ok_or_else(|| {
+        syntax_error(
+            pos,
+            "syntax-case requires a literals list and at least one clause",
+        )
+    })?;
+
+    if clauses.is_empty() {
+        return Err(syntax_error(
+            pos,
+            "syntax-case requires at least one clause",
+        ));
+    }
+
+    let target = machine::eval_expr(target_expr, env, context)?;
+    let target = expect_syntax("syntax-case", &target, target_expr.pos)?;
+
+    let literal_items = literals_expr
+        .list_items()
+        .ok_or_else(|| syntax_error(literals_expr.pos, "syntax-case literals must be a list"))?;
+    let mut literals = HashSet::new();
+    for literal in literal_items {
+        let literal_name = literal
+            .symbol_name()
+            .ok_or_else(|| syntax_error(literal.pos, "syntax-case literals must be symbols"))?;
+        literals.insert(literal_name.to_string());
+    }
+
+    for clause in clauses {
+        let items = clause
+            .list_items()
+            .ok_or_else(|| syntax_error(clause.pos, "syntax-case clauses must be lists"))?;
+
+        let (pattern, fender, body) =
+            match items {
+                [pattern, body] => (pattern, None, body),
+                [pattern, fender, body] => (pattern, Some(fender), body),
+                _ => return Err(syntax_error(
+                    clause.pos,
+                    "syntax-case clauses must contain a pattern, an optional fender, and a body",
+                )),
+            };
+
         let mut bindings = HashMap::new();
-        if !match_pattern(&rule.pattern, &call_expr, transformer, &mut bindings)? {
+        if !match_pattern(pattern, &target.expr, &literals, None, &mut bindings)? {
             continue;
         }
 
-        let scope_renames = HashMap::new();
-        let mut free_renames = HashMap::new();
-        let mut instantiator =
-            TemplateInstantiator::new(transformer, env, &bindings, &mut free_renames, context);
-        return instantiator.instantiate(&rule.template, &scope_renames, None);
+        let clause_env = Env::new_child(env);
+        bind_pattern_values(&clause_env, &bindings);
+        push_binding_scope(context, bindings);
+
+        let matched = match fender {
+            Some(fender) => machine::eval_expr(fender, &clause_env, context)?.is_truthy(),
+            None => true,
+        };
+
+        if matched {
+            let result = machine::eval_expr(body, &clause_env, context);
+            pop_binding_scope(context);
+            return result;
+        }
+
+        pop_binding_scope(context);
     }
 
-    Err(syntax_error(
+    Err(syntax_error(pos, "no matching syntax-case clause"))
+}
+
+pub(super) fn eval_with_syntax(
+    args: &[Expr],
+    env: &EnvRef,
+    pos: SourcePos,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let (bindings_expr, body) = args
+        .split_first()
+        .ok_or_else(|| syntax_error(pos, "with-syntax requires bindings and a body"))?;
+
+    if body.is_empty() {
+        return Err(syntax_error(pos, "with-syntax requires a body"));
+    }
+
+    let binding_specs = bindings_expr
+        .list_items()
+        .ok_or_else(|| syntax_error(bindings_expr.pos, "with-syntax bindings must be a list"))?;
+    let with_env = Env::new_child(env);
+    let mut all_bindings = HashMap::new();
+
+    for binding in binding_specs {
+        let items = binding
+            .list_items()
+            .ok_or_else(|| syntax_error(binding.pos, "with-syntax bindings must be lists"))?;
+
+        let [pattern, value_expr] = items else {
+            return Err(syntax_error(
+                binding.pos,
+                "each with-syntax binding must contain a pattern and a value",
+            ));
+        };
+
+        let value = machine::eval_expr(value_expr, &with_env, context)?;
+        let value = expect_syntax("with-syntax", &value, value_expr.pos)?;
+
+        let mut bindings = HashMap::new();
+        if !match_pattern(pattern, &value.expr, &HashSet::new(), None, &mut bindings)? {
+            return Err(syntax_error(
+                pattern.pos,
+                "with-syntax pattern did not match the provided syntax object",
+            ));
+        }
+
+        merge_binding_maps(&mut all_bindings, bindings.clone(), binding.pos)?;
+        bind_pattern_values(&with_env, &bindings);
+    }
+
+    push_binding_scope(context, all_bindings);
+    let result = machine::eval_sequence(body, &with_env, pos, context);
+    pop_binding_scope(context);
+    result
+}
+
+fn expand_procedure_macro(
+    transformer: &Value,
+    items: &[Expr],
+    pos: SourcePos,
+    use_env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Expr, EvalError> {
+    let call_expr = Expr::new(pos, ExprKind::List(items.to_vec()));
+    let definition_env = transformer_definition_env(transformer, use_env);
+    context.macro_expansions.push(super::MacroExpansion {
+        definition_env,
+        use_env: Rc::clone(use_env),
+        binding_scopes: Vec::new(),
+        free_renames: HashMap::new(),
+    });
+
+    let result = machine::apply_value(
+        transformer.clone(),
+        vec![Value::Syntax(SyntaxObject::new(call_expr))],
         pos,
-        format!("no matching syntax-rules pattern for {}", transformer.name),
-    ))
+        context,
+    );
+
+    context
+        .macro_expansions
+        .pop()
+        .expect("macro expansion stack should not be empty");
+
+    match result? {
+        Value::Syntax(syntax) => Ok(syntax.expr.clone()),
+        other => Err(type_mismatch(
+            pos,
+            "define-syntax",
+            "syntax",
+            other.type_name(),
+        )),
+    }
+}
+
+fn transformer_definition_env(transformer: &Value, fallback: &EnvRef) -> EnvRef {
+    match transformer {
+        Value::Procedure(Procedure::Lambda(lambda)) => Rc::clone(&lambda.env),
+        Value::Procedure(Procedure::CaseLambda(case_lambda)) => case_lambda
+            .clauses
+            .first()
+            .map(|clause| Rc::clone(&clause.env))
+            .unwrap_or_else(|| Rc::clone(fallback)),
+        _ => Rc::clone(fallback),
+    }
+}
+
+struct SyntaxRulesExpander<'a> {
+    name: &'a str,
+    literals: &'a HashSet<String>,
+    rules: &'a [MacroRule],
+    definition_env: EnvRef,
+    use_env: &'a EnvRef,
+}
+
+impl<'a> SyntaxRulesExpander<'a> {
+    fn new(
+        name: &'a str,
+        literals: &'a HashSet<String>,
+        rules: &'a [MacroRule],
+        definition_env: &EnvWeak,
+        use_env: &'a EnvRef,
+    ) -> Self {
+        Self {
+            name,
+            literals,
+            rules,
+            definition_env: definition_env
+                .upgrade()
+                .expect("macro definition environment should still exist"),
+            use_env,
+        }
+    }
+
+    fn expand(
+        &self,
+        items: &[Expr],
+        pos: SourcePos,
+        context: &mut EvalContext,
+    ) -> Result<Expr, EvalError> {
+        let call_expr = self.normalize_call(items, pos);
+
+        for rule in self.rules {
+            let mut bindings = HashMap::new();
+            if !match_pattern(
+                &rule.pattern,
+                &call_expr,
+                self.literals,
+                Some(self.name),
+                &mut bindings,
+            )? {
+                continue;
+            }
+
+            let mut free_renames = HashMap::new();
+            return instantiate_template(
+                &rule.template,
+                &self.definition_env,
+                self.use_env,
+                &bindings,
+                &mut free_renames,
+                context,
+            );
+        }
+
+        Err(syntax_error(
+            pos,
+            format!("no matching syntax-rules pattern for {}", self.name),
+        ))
+    }
+
+    fn normalize_call(&self, items: &[Expr], pos: SourcePos) -> Expr {
+        let mut normalized_items = items.to_vec();
+        if let Some(head) = normalized_items.first_mut() {
+            *head = Expr::new(head.pos, ExprKind::Symbol(self.name.to_string()));
+        }
+        Expr::new(pos, ExprKind::List(normalized_items))
+    }
 }
 
 fn match_pattern(
     pattern: &Expr,
     input: &Expr,
-    transformer: &MacroTransformer,
+    literals: &HashSet<String>,
+    head_literal: Option<&str>,
     bindings: &mut HashMap<String, PatternBinding>,
 ) -> Result<bool, EvalError> {
     match (&pattern.kind, &input.kind) {
@@ -130,10 +428,10 @@ fn match_pattern(
         (ExprKind::Character(left), ExprKind::Character(right)) => Ok(left == right),
         (ExprKind::String(left), ExprKind::String(right)) => Ok(left == right),
         (ExprKind::Symbol(name), _) => {
-            match_pattern_symbol(name, pattern.pos, input, transformer, bindings)
+            match_pattern_symbol(name, pattern.pos, input, literals, head_literal, bindings)
         }
         (ExprKind::List(pattern_items), ExprKind::List(input_items)) => {
-            match_pattern_list(pattern_items, input_items, transformer, bindings)
+            match_pattern_list(pattern_items, input_items, literals, head_literal, bindings)
         }
         _ => Ok(false),
     }
@@ -143,7 +441,8 @@ fn match_pattern_symbol(
     name: &str,
     pos: SourcePos,
     input: &Expr,
-    transformer: &MacroTransformer,
+    literals: &HashSet<String>,
+    head_literal: Option<&str>,
     bindings: &mut HashMap<String, PatternBinding>,
 ) -> Result<bool, EvalError> {
     if name == "..." {
@@ -153,7 +452,7 @@ fn match_pattern_symbol(
         ));
     }
 
-    if name == transformer.name || transformer.literals.contains(name) {
+    if head_literal == Some(name) || literals.contains(name) {
         return Ok(input.symbol_name() == Some(name));
     }
 
@@ -163,7 +462,8 @@ fn match_pattern_symbol(
 fn match_pattern_list(
     pattern_items: &[Expr],
     input_items: &[Expr],
-    transformer: &MacroTransformer,
+    literals: &HashSet<String>,
+    head_literal: Option<&str>,
     bindings: &mut HashMap<String, PatternBinding>,
 ) -> Result<bool, EvalError> {
     let ellipsis_count = pattern_items
@@ -177,7 +477,7 @@ fn match_pattern_list(
         }
 
         for (pattern, input) in pattern_items.iter().zip(input_items.iter()) {
-            if !match_pattern(pattern, input, transformer, bindings)? {
+            if !match_pattern(pattern, input, literals, head_literal, bindings)? {
                 return Ok(false);
             }
         }
@@ -191,7 +491,7 @@ fn match_pattern_list(
                 .iter()
                 .find(|expr| expr.symbol_name() == Some("..."))
                 .map_or(START_POS, |expr| expr.pos),
-            "only one ellipsis is supported in a syntax-rules pattern",
+            "only one ellipsis is supported in a pattern",
         ));
     }
 
@@ -213,18 +513,19 @@ fn match_pattern_list(
     }
 
     for (pattern, input) in prefix.iter().zip(input_items.iter()) {
-        if !match_pattern(pattern, input, transformer, bindings)? {
+        if !match_pattern(pattern, input, literals, head_literal, bindings)? {
             return Ok(false);
         }
     }
 
     let repeated_pattern = &pattern_items[ellipsis_index - 1];
-    let repeated_name = pattern_variable_name(repeated_pattern, transformer).ok_or_else(|| {
-        syntax_error(
-            repeated_pattern.pos,
-            "only symbol ellipsis patterns are supported",
-        )
-    })?;
+    let repeated_name = pattern_variable_name(repeated_pattern, literals, head_literal)
+        .ok_or_else(|| {
+            syntax_error(
+                repeated_pattern.pos,
+                "only symbol ellipsis patterns are supported",
+            )
+        })?;
 
     Ok(bind_repeated_pattern(
         bindings,
@@ -233,9 +534,13 @@ fn match_pattern_list(
     ))
 }
 
-fn pattern_variable_name<'a>(pattern: &'a Expr, transformer: &MacroTransformer) -> Option<&'a str> {
+fn pattern_variable_name<'a>(
+    pattern: &'a Expr,
+    literals: &HashSet<String>,
+    head_literal: Option<&str>,
+) -> Option<&'a str> {
     let name = pattern.symbol_name()?;
-    if name == "..." || name == transformer.name || transformer.literals.contains(name) {
+    if name == "..." || head_literal == Some(name) || literals.contains(name) {
         None
     } else {
         Some(name)
@@ -278,9 +583,23 @@ fn bind_repeated_pattern(
     }
 }
 
+fn instantiate_template(
+    template: &Expr,
+    definition_env: &EnvRef,
+    use_env: &EnvRef,
+    bindings: &HashMap<String, PatternBinding>,
+    free_renames: &mut HashMap<String, String>,
+    context: &mut EvalContext,
+) -> Result<Expr, EvalError> {
+    let scope_renames = HashMap::new();
+    let mut instantiator =
+        TemplateInstantiator::new(definition_env, use_env, bindings, free_renames, context);
+    instantiator.instantiate(template, &scope_renames, None)
+}
+
 struct TemplateInstantiator<'a> {
-    transformer: &'a MacroTransformer,
-    env: &'a EnvRef,
+    definition_env: &'a EnvRef,
+    use_env: &'a EnvRef,
     bindings: &'a HashMap<String, PatternBinding>,
     free_renames: &'a mut HashMap<String, String>,
     context: &'a mut EvalContext,
@@ -288,15 +607,15 @@ struct TemplateInstantiator<'a> {
 
 impl<'a> TemplateInstantiator<'a> {
     fn new(
-        transformer: &'a MacroTransformer,
-        env: &'a EnvRef,
+        definition_env: &'a EnvRef,
+        use_env: &'a EnvRef,
         bindings: &'a HashMap<String, PatternBinding>,
         free_renames: &'a mut HashMap<String, String>,
         context: &'a mut EvalContext,
     ) -> Self {
         Self {
-            transformer,
-            env,
+            definition_env,
+            use_env,
             bindings,
             free_renames,
             context,
@@ -363,6 +682,7 @@ impl<'a> TemplateInstantiator<'a> {
             .filter(|name| !self.bindings.contains_key(*name))
         {
             return match head_name {
+                "quote" => Ok(Expr::new(pos, ExprKind::List(items.to_vec()))),
                 "let" => self.instantiate_let_template(pos, items, scope_renames, repetition_index),
                 "lambda" => {
                     self.instantiate_lambda_template(pos, items, scope_renames, repetition_index)
@@ -537,19 +857,14 @@ impl<'a> TemplateInstantiator<'a> {
         }
 
         let fresh = fresh_identifier(self.context, name);
-        let definition_env = self
-            .transformer
-            .env
-            .upgrade()
-            .expect("macro definition environment should still exist");
 
-        if let Some(cell) = env_lookup_cell(&definition_env, name) {
-            env_define_alias(self.env, fresh.clone(), cell);
-        } else if let Some(mac) = env_lookup_macro(&definition_env, name) {
-            env_define_macro(self.env, fresh.clone(), mac);
+        if let Some(cell) = env_lookup_cell(self.definition_env, name) {
+            env_define_alias(self.use_env, fresh.clone(), cell);
+        } else if let Some(mac) = env_lookup_macro(self.definition_env, name) {
+            env_define_macro(self.use_env, fresh.clone(), mac);
         } else if let Some(builtin) = builtin_name(name) {
             env_define(
-                self.env,
+                self.use_env,
                 fresh.clone(),
                 Value::Procedure(Procedure::Builtin(builtin)),
             );
@@ -591,6 +906,97 @@ fn parse_params_template(items: &[Expr]) -> Option<&[Expr]> {
     params_expr.list_items()
 }
 
+fn push_binding_scope(context: &mut EvalContext, bindings: HashMap<String, PatternBinding>) {
+    context
+        .macro_expansions
+        .last_mut()
+        .expect("syntax bindings require an active macro expansion")
+        .binding_scopes
+        .push(bindings);
+}
+
+fn pop_binding_scope(context: &mut EvalContext) {
+    context
+        .macro_expansions
+        .last_mut()
+        .expect("syntax bindings require an active macro expansion")
+        .binding_scopes
+        .pop()
+        .expect("syntax binding stack should not be empty");
+}
+
+fn merged_pattern_bindings(
+    scopes: &[HashMap<String, PatternBinding>],
+) -> HashMap<String, PatternBinding> {
+    let mut merged = HashMap::new();
+    for scope in scopes {
+        for (name, binding) in scope {
+            merged.insert(name.clone(), binding.clone());
+        }
+    }
+    merged
+}
+
+fn bind_pattern_values(env: &EnvRef, bindings: &HashMap<String, PatternBinding>) {
+    for (name, binding) in bindings {
+        let value = match binding {
+            PatternBinding::Single(expr) => Value::Syntax(SyntaxObject::new(expr.clone())),
+            PatternBinding::Repeated(exprs) => make_list_value(
+                exprs
+                    .iter()
+                    .cloned()
+                    .map(SyntaxObject::new)
+                    .map(Value::Syntax)
+                    .collect(),
+            ),
+        };
+        env_define(env, name.clone(), value);
+    }
+}
+
+fn merge_binding_maps(
+    target: &mut HashMap<String, PatternBinding>,
+    bindings: HashMap<String, PatternBinding>,
+    pos: SourcePos,
+) -> Result<(), EvalError> {
+    for (name, binding) in bindings {
+        match target.get(&name) {
+            Some(existing) if !pattern_binding_equal(existing, &binding) => {
+                return Err(syntax_error(
+                    pos,
+                    format!("conflicting pattern binding for {name}"),
+                ))
+            }
+            Some(_) => {}
+            None => {
+                target.insert(name, binding);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pattern_binding_equal(left: &PatternBinding, right: &PatternBinding) -> bool {
+    match (left, right) {
+        (PatternBinding::Single(left), PatternBinding::Single(right)) => expr_equal(left, right),
+        (PatternBinding::Repeated(left), PatternBinding::Repeated(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| expr_equal(left, right))
+        }
+        _ => false,
+    }
+}
+
+fn expect_syntax(name: &str, value: &Value, pos: SourcePos) -> Result<Rc<SyntaxObject>, EvalError> {
+    match value {
+        Value::Syntax(syntax) => Ok(Rc::clone(syntax)),
+        other => Err(type_mismatch(pos, name, "syntax", other.type_name())),
+    }
+}
+
 fn fresh_identifier(context: &mut EvalContext, hint: &str) -> String {
     let id = context.next_fresh;
     context.next_fresh += 1;
@@ -612,7 +1018,10 @@ fn is_core_syntax_keyword(name: &str) -> bool {
             | "or"
             | "quote"
             | "set!"
+            | "syntax"
+            | "syntax-case"
             | "syntax-rules"
+            | "with-syntax"
     )
 }
 

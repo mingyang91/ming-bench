@@ -7,10 +7,11 @@ use super::records::{
 use super::value_ops::eqv_value;
 use super::{
     bind_lambda_call, env_define, env_lookup_macro, env_set, eval_case_lambda, eval_define_syntax,
-    eval_lambda, eval_quote, lookup_symbol, make_immutable_string_value, make_lambda,
-    parse_define_signature, parse_do_binding, parse_value_binding, quote_expr,
-    select_case_lambda_clause, syntax_error, wrong_arg_count, Env, EnvRef, EvalContext, EvalError,
-    Expr, ExprKind, LambdaParams, Procedure, SourcePos, Value, START_POS,
+    eval_lambda, eval_quote, eval_syntax, eval_syntax_case, eval_with_syntax, lookup_symbol,
+    make_immutable_string_value, make_lambda, parse_define_signature, parse_do_binding,
+    parse_value_binding, quote_expr, select_case_lambda_clause, syntax_error, wrong_arg_count, Env,
+    EnvRef, EvalContext, EvalError, Expr, ExprKind, LambdaParams, Procedure, SourcePos, Value,
+    START_POS,
 };
 use std::fmt;
 use std::rc::Rc;
@@ -223,6 +224,17 @@ pub(super) fn eval_expr(
     )
 }
 
+pub(super) fn apply_value(
+    operator: Value,
+    args: Vec<Value>,
+    pos: SourcePos,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let mut stack = Vec::new();
+    let state = apply_machine(operator, args, pos, &mut stack, context)?;
+    run_machine(state, stack, context)
+}
+
 fn run_machine(
     mut state: MachineState,
     mut stack: Vec<Frame>,
@@ -329,7 +341,8 @@ fn eval_machine_list(
                     .map(MachineState::Value);
             }
             "define-syntax" => {
-                return eval_define_syntax(&items[1..], &env, form_pos).map(MachineState::Value);
+                return eval_define_syntax(&items[1..], &env, form_pos, context)
+                    .map(MachineState::Value);
             }
             "do" => {
                 let expanded = expand_do(&items[1..], form_pos)?;
@@ -352,8 +365,19 @@ fn eval_machine_list(
             "letrec*" => return start_letrec_state(&items[1..], env, form_pos, true, stack),
             "quote" => return eval_quote(&items[1..], form_pos).map(MachineState::Value),
             "set!" => return start_set_state(&items[1..], env, form_pos, stack),
+            "syntax" => {
+                return eval_syntax(&items[1..], &env, form_pos, context).map(MachineState::Value)
+            }
+            "syntax-case" => {
+                return eval_syntax_case(&items[1..], &env, form_pos, context)
+                    .map(MachineState::Value)
+            }
             "lambda" => {
                 return eval_lambda(None, &items[1..], &env, form_pos).map(MachineState::Value);
+            }
+            "with-syntax" => {
+                return eval_with_syntax(&items[1..], &env, form_pos, context)
+                    .map(MachineState::Value)
             }
             "and" => return start_and_state(&items[1..], env, stack),
             "or" => return start_or_state(&items[1..], env, stack),

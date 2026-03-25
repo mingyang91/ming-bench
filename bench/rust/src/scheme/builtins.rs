@@ -6,8 +6,8 @@ use super::builtin_helpers::{
 use super::value_ops::{byte_index_for_char, eq_value, equal_value, eqv_value};
 use super::{
     apply, invalid_argument, is_proper_list, make_list_value, make_pair_value, make_string_value,
-    make_vector_value, number_error, type_mismatch, wrong_arg_count, EvalContext, EvalError,
-    Number, SourcePos, Value,
+    make_vector_value, number_error, quote_expr, type_mismatch, value_to_expr, wrong_arg_count,
+    EvalContext, EvalError, Number, SourcePos, SyntaxObject, Value,
 };
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -113,7 +113,9 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "string-set!" => Some("string-set!"),
         "string?" => Some("string?"),
         "substring" => Some("substring"),
+        "syntax->datum" => Some("syntax->datum"),
         "truncate" => Some("truncate"),
+        "datum->syntax" => Some("datum->syntax"),
         "symbol->string" => Some("symbol->string"),
         "symbol?" => Some("symbol?"),
         "numerator" => Some("numerator"),
@@ -293,7 +295,9 @@ pub(super) fn apply_builtin(
             matches!(value, Value::String(_))
         }),
         "substring" => substring(args, pos),
+        "syntax->datum" => syntax_to_datum(args, pos),
         "truncate" => truncate_value(args, pos),
+        "datum->syntax" => datum_to_syntax(args, pos),
         "symbol->string" => symbol_to_string(args, pos),
         "symbol?" => predicate(args, "symbol?", pos, |value| {
             matches!(value, Value::Symbol(_))
@@ -608,6 +612,44 @@ fn values(args: &[Value]) -> Result<Value, EvalError> {
         [value] => value.clone(),
         _ => Value::Values(args.to_vec()),
     })
+}
+
+fn syntax_to_datum(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [Value::Syntax(syntax)] => quote_expr(&syntax.expr),
+        [other] => Err(type_mismatch(
+            pos,
+            "syntax->datum",
+            "syntax",
+            other.type_name(),
+        )),
+        _ => Err(wrong_arg_count(
+            pos,
+            "syntax->datum",
+            "exactly 1 argument",
+            args.len(),
+        )),
+    }
+}
+
+fn datum_to_syntax(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    match args {
+        [Value::Syntax(_), datum] => {
+            Ok(Value::Syntax(SyntaxObject::new(value_to_expr(datum, pos)?)))
+        }
+        [other, _] => Err(type_mismatch(
+            pos,
+            "datum->syntax",
+            "syntax",
+            other.type_name(),
+        )),
+        _ => Err(wrong_arg_count(
+            pos,
+            "datum->syntax",
+            "exactly 2 arguments",
+            args.len(),
+        )),
+    }
 }
 
 fn length(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
