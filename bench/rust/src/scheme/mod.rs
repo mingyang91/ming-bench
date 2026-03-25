@@ -17,10 +17,27 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static WINDER_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) fn gensym(prefix: &str) -> String {
     let n = GENSYM_COUNTER.fetch_add(1, Ordering::SeqCst);
     format!("#{}#{}", prefix, n)
+}
+
+/// A dynamic-wind frame: tracks in/out thunks for a dynamic extent.
+#[derive(Clone)]
+pub(crate) struct Winder {
+    id: usize,
+    in_thunk: Box<Val>,
+    out_thunk: Box<Val>,
+}
+
+/// Actions to perform during continuation wind/unwind.
+#[derive(Clone)]
+pub(crate) enum DwAction {
+    CallThunk(Box<Val>),
+    PopWinder(usize),
+    PushWinder(Winder),
 }
 
 pub(crate) type BuiltinFn = fn(&[Val], &Env) -> Result<Val, EvalError>;
@@ -56,8 +73,10 @@ pub(crate) enum Val {
     Void,
     /// The call/cc primitive as a first-class value.
     CallCC,
-    /// A captured continuation (clone of the CEK continuation stack).
-    Continuation(Rc<Vec<KFrame>>),
+    /// The dynamic-wind primitive as a first-class value.
+    DynamicWind,
+    /// A captured continuation (clone of the CEK continuation stack + winders).
+    Continuation(Rc<Vec<KFrame>>, Rc<Vec<Winder>>),
 }
 
 // --- CEK Machine Types ---
@@ -109,6 +128,33 @@ pub(crate) enum KFrame {
     /// `or` — short-circuit evaluation.
     Or {
         rest: Vec<Expr>,
+        env: Env,
+    },
+    /// dynamic-wind: in-thunk done, push winder, call body-thunk.
+    DwAfterIn {
+        body_thunk: Box<Val>,
+        out_thunk: Box<Val>,
+        winder: Winder,
+        span: Span,
+        env: Env,
+    },
+    /// dynamic-wind: body done, pop winder, call out-thunk, save result.
+    DwAfterBody {
+        out_thunk: Box<Val>,
+        winder_id: usize,
+        span: Span,
+        env: Env,
+    },
+    /// dynamic-wind: out-thunk done, return saved body result.
+    DwAfterOut {
+        result: Box<Val>,
+    },
+    /// Continuation switch: run wind/unwind thunks then restore kont.
+    DwSwitch {
+        actions: Vec<DwAction>,
+        value: Box<Val>,
+        target_kont: Rc<Vec<KFrame>>,
+        span: Span,
         env: Env,
     },
 }
@@ -320,7 +366,7 @@ impl fmt::Display for Val {
                 write!(f, ")")
             }
             Val::Lambda { .. } | Val::CaseLambda { .. } | Val::Builtin(..) | Val::Macro { .. }
-            | Val::CallCC | Val::Continuation(_) => write!(f, "#<procedure>"),
+            | Val::CallCC | Val::DynamicWind | Val::Continuation(..) => write!(f, "#<procedure>"),
             Val::Void => write!(f, "#<void>"),
         }
     }
@@ -334,6 +380,7 @@ type Frame = Rc<RefCell<HashMap<String, Val>>>;
 pub(crate) struct Env {
     frames: Vec<Frame>,
     pub(crate) output: Rc<RefCell<String>>,
+    winders: Rc<RefCell<Vec<Winder>>>,
 }
 
 impl Env {
@@ -458,10 +505,11 @@ impl Env {
         // call/cc as a first-class value
         frame.borrow_mut().insert("call/cc".to_string(), Val::CallCC);
         frame.borrow_mut().insert("call-with-current-continuation".to_string(), Val::CallCC);
+        frame.borrow_mut().insert("dynamic-wind".to_string(), Val::DynamicWind);
         for &(name, f) in builtins {
             frame.borrow_mut().insert(name.to_string(), Val::Builtin(f));
         }
-        let env = Env { frames: vec![frame], output: Rc::new(RefCell::new(String::new())) };
+        let env = Env { frames: vec![frame], output: Rc::new(RefCell::new(String::new())), winders: Rc::new(RefCell::new(Vec::new())) };
         // Load cxr helper definitions
         let prelude = "\
 (define (caar x) (car (car x)))
@@ -527,7 +575,7 @@ impl Env {
     pub(crate) fn push(&self) -> Env {
         let mut frames = self.frames.clone();
         frames.push(Rc::new(RefCell::new(HashMap::new())));
-        Env { frames, output: Rc::clone(&self.output) }
+        Env { frames, output: Rc::clone(&self.output), winders: Rc::clone(&self.winders) }
     }
 }
 
@@ -841,6 +889,32 @@ fn apply_frame(frame: KFrame, val: Val, kont: &mut Vec<KFrame>) -> Result<CekSta
                 Ok(CekState::Eval(rest[0].clone(), env))
             }
         }
+        KFrame::DwAfterIn { body_thunk, out_thunk, winder, span, env } => {
+            // in-thunk completed (val ignored). Push winder, call body.
+            let winder_id = winder.id;
+            env.winders.borrow_mut().push(winder);
+            kont.push(KFrame::DwAfterBody { out_thunk, winder_id, span, env: env.clone() });
+            apply_function_cek(*body_thunk, vec![], kont, span, &env)
+        }
+        KFrame::DwAfterBody { out_thunk, winder_id, span, env } => {
+            // body completed, val = body result. Pop winder, call out-thunk.
+            {
+                let mut w = env.winders.borrow_mut();
+                if let Some(pos) = w.iter().rposition(|x| x.id == winder_id) {
+                    w.remove(pos);
+                }
+            }
+            kont.push(KFrame::DwAfterOut { result: Box::new(val) });
+            apply_function_cek(*out_thunk, vec![], kont, span, &env)
+        }
+        KFrame::DwAfterOut { result } => {
+            // out-thunk completed (val ignored). Return saved body result.
+            Ok(CekState::ApplyK(*result))
+        }
+        KFrame::DwSwitch { actions, value, target_kont, span, env } => {
+            // A wind/unwind thunk completed (val ignored). Continue with remaining actions.
+            process_dw_actions(actions, *value, target_kont, kont, span, &env)
+        }
     }
 }
 
@@ -884,22 +958,112 @@ fn apply_function_cek(
                 return Err(EvalError::Arity(format!("call/cc: expected 1 argument, got {} at {span}", args.len())));
             }
             let saved_kont = kont.clone();
-            let cont_val = Val::Continuation(Rc::new(saved_kont));
+            let saved_winders = caller_env.winders.borrow().clone();
+            let cont_val = Val::Continuation(Rc::new(saved_kont), Rc::new(saved_winders));
             // Apply the procedure argument to [continuation]
             apply_function_cek(args.into_iter().next().expect("args len verified == 1"), vec![cont_val], kont, span, caller_env)
         }
-        Val::Continuation(saved_kont) => {
+        Val::DynamicWind => {
+            // (dynamic-wind in-thunk body-thunk out-thunk)
+            if args.len() != 3 {
+                return Err(EvalError::Arity(format!("dynamic-wind: expected 3 arguments, got {} at {span}", args.len())));
+            }
+            let mut it = args.into_iter();
+            let in_thunk = it.next().unwrap();
+            let body_thunk = it.next().unwrap();
+            let out_thunk = it.next().unwrap();
+            let winder_id = WINDER_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let winder = Winder { id: winder_id, in_thunk: Box::new(in_thunk.clone()), out_thunk: Box::new(out_thunk.clone()) };
+            // Push frame to handle what happens after in-thunk completes
+            kont.push(KFrame::DwAfterIn { body_thunk: Box::new(body_thunk), out_thunk: Box::new(out_thunk), winder, span, env: caller_env.clone() });
+            // Call the in-thunk
+            apply_function_cek(in_thunk, vec![], kont, span, caller_env)
+        }
+        Val::Continuation(saved_kont, saved_winders) => {
             if args.len() != 1 {
                 return Err(EvalError::Arity(format!(
                     "continuation: expected 1 argument, got {} at {span}", args.len()
                 )));
             }
-            // Replace current continuation with the saved one
-            *kont = (*saved_kont).clone();
-            Ok(CekState::ApplyK(args.into_iter().next().expect("args len verified == 1")))
+            let value = args.into_iter().next().expect("args len verified == 1");
+            let current_winders = caller_env.winders.borrow().clone();
+            let actions = compute_wind_actions(&current_winders, &saved_winders);
+            if actions.is_empty() {
+                *kont = (*saved_kont).clone();
+                Ok(CekState::ApplyK(value))
+            } else {
+                process_dw_actions(actions, value, saved_kont, kont, span, caller_env)
+            }
         }
         _ => Err(EvalError::Type(format!("not a procedure at {span}"))),
     }
+}
+
+// ---------------------------------------------------------------------------
+//  dynamic-wind helpers
+// ---------------------------------------------------------------------------
+
+/// Compute the sequence of wind/unwind actions needed to switch from
+/// `current` winders to `target` winders.
+fn compute_wind_actions(current: &[Winder], target: &[Winder]) -> Vec<DwAction> {
+    // Find common prefix by winder id.
+    let common = current.iter().zip(target.iter())
+        .take_while(|(a, b)| a.id == b.id)
+        .count();
+
+    let mut actions = Vec::new();
+
+    // Unwind: run out-thunks from innermost to outermost (reverse of current[common..])
+    for w in current[common..].iter().rev() {
+        actions.push(DwAction::PopWinder(w.id));
+        actions.push(DwAction::CallThunk(w.out_thunk.clone()));
+    }
+
+    // Rewind: run in-thunks from outermost to innermost (target[common..] in order)
+    for w in &target[common..] {
+        actions.push(DwAction::CallThunk(w.in_thunk.clone()));
+        actions.push(DwAction::PushWinder(w.clone()));
+    }
+
+    actions
+}
+
+/// Process a list of wind/unwind actions. Non-thunk actions (push/pop winder)
+/// are executed immediately; thunk calls push a DwSwitch frame and return.
+fn process_dw_actions(
+    mut actions: Vec<DwAction>,
+    value: Val,
+    target_kont: Rc<Vec<KFrame>>,
+    kont: &mut Vec<KFrame>,
+    span: Span,
+    env: &Env,
+) -> Result<CekState, EvalError> {
+    while !actions.is_empty() {
+        match actions.remove(0) {
+            DwAction::CallThunk(thunk) => {
+                kont.push(KFrame::DwSwitch {
+                    actions,
+                    value: Box::new(value),
+                    target_kont,
+                    span,
+                    env: env.clone(),
+                });
+                return apply_function_cek(*thunk, vec![], kont, span, env);
+            }
+            DwAction::PopWinder(id) => {
+                let mut w = env.winders.borrow_mut();
+                if let Some(pos) = w.iter().rposition(|x| x.id == id) {
+                    w.remove(pos);
+                }
+            }
+            DwAction::PushWinder(winder) => {
+                env.winders.borrow_mut().push(winder);
+            }
+        }
+    }
+    // All actions done — restore target continuation and deliver value.
+    *kont = (*target_kont).clone();
+    Ok(CekState::ApplyK(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -1290,10 +1454,20 @@ pub(crate) fn apply_val(func: &Val, args: &[Val], caller_env: &Env) -> Result<Va
             }
             // No CEK kont to capture here; just call the proc with a dummy continuation
             // that raises an error if invoked.
-            let cont = Val::Continuation(Rc::new(vec![]));
+            let cont = Val::Continuation(Rc::new(vec![]), Rc::new(vec![]));
             apply_val(&args[0], &[cont], caller_env)
         }
-        Val::Continuation(_) => {
+        Val::DynamicWind => {
+            // dynamic-wind invoked outside CEK machine
+            if args.len() != 3 {
+                return Err(EvalError::Arity("dynamic-wind: expected 3 arguments".into()));
+            }
+            apply_val(&args[0], &[], caller_env)?;
+            let result = apply_val(&args[1], &[], caller_env)?;
+            apply_val(&args[2], &[], caller_env)?;
+            Ok(result)
+        }
+        Val::Continuation(..) => {
             // Continuation invoked from outside the CEK machine (e.g. inside map).
             // This is a limitation — full support would require all evaluation
             // paths to go through the CEK machine.

@@ -15,7 +15,7 @@ pub(super) const SPECIAL_FORMS: &[&str] = &[
     "let", "let*", "cond", "set!", "string-set!", "set-car!", "set-cdr!",
     "define-syntax", "syntax-rules",
     "define-record-type", "case-lambda", "letrec", "letrec*", "case", "do",
-    "call/cc", "call-with-current-continuation",
+    "call/cc", "call-with-current-continuation", "dynamic-wind",
 ];
 
 pub(super) fn is_ellipsis(expr: &Expr) -> bool {
