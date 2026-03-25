@@ -618,30 +618,8 @@ final class Builtins {
             }
             return Boolean.FALSE;
         });
-        define("map", args -> {
-            if (args.size() < 2) throw new EvalError("map requires at least 2 arguments");
-            Object proc = args.get(0);
-            int numLists = args.size() - 1;
-            Object[] cursors = new Object[numLists];
-            for (int i = 0; i < numLists; i++) cursors[i] = args.get(i + 1);
-            List<Object> results = new ArrayList<>();
-            while (true) {
-                boolean done = false;
-                for (int i = 0; i < numLists; i++) {
-                    if (!(cursors[i] instanceof Cons)) { done = true; break; }
-                }
-                if (done) break;
-                List<Object> callArgs = new ArrayList<>();
-                for (int i = 0; i < numLists; i++) {
-                    callArgs.add(((Cons) cursors[i]).car);
-                    cursors[i] = ((Cons) cursors[i]).cdr;
-                }
-                results.add(applyProc(proc, callArgs));
-            }
-            Object result = NIL;
-            for (int i = results.size() - 1; i >= 0; i--) result = new Cons(results.get(i), result);
-            return result;
-        });
+        // map is intercepted by the CEK machine
+        define("map", args -> { throw new EvalError("map: should be handled by CEK machine"); });
         define("reverse", args -> {
             requireArgCount(args, 1, "reverse");
             Object result = NIL;
@@ -649,27 +627,8 @@ final class Builtins {
             while (cur instanceof Cons c) { result = new Cons(c.car, result); cur = c.cdr; }
             return result;
         });
-        define("for-each", args -> {
-            if (args.size() < 2) throw new EvalError("for-each requires at least 2 arguments");
-            Object proc = args.get(0);
-            int numLists = args.size() - 1;
-            Object[] cursors = new Object[numLists];
-            for (int i = 0; i < numLists; i++) cursors[i] = args.get(i + 1);
-            while (true) {
-                boolean done = false;
-                for (int i = 0; i < numLists; i++) {
-                    if (!(cursors[i] instanceof Cons)) { done = true; break; }
-                }
-                if (done) break;
-                List<Object> callArgs = new ArrayList<>();
-                for (int i = 0; i < numLists; i++) {
-                    callArgs.add(((Cons) cursors[i]).car);
-                    cursors[i] = ((Cons) cursors[i]).cdr;
-                }
-                applyProc(proc, callArgs);
-            }
-            return VOID;
-        });
+        // for-each is intercepted by the CEK machine
+        define("for-each", args -> { throw new EvalError("for-each: should be handled by CEK machine"); });
     }
 
     // --- Type predicates ---
@@ -682,7 +641,7 @@ final class Builtins {
         define("symbol?", args -> { requireArgCount(args, 1, "symbol?"); return args.get(0) instanceof String; });
         define("char?", args -> { requireArgCount(args, 1, "char?"); return args.get(0) instanceof SchemeChar; });
         define("vector?", args -> { requireArgCount(args, 1, "vector?"); return args.get(0) instanceof SchemeVector; });
-        define("procedure?", args -> { requireArgCount(args, 1, "procedure?"); Object a = args.get(0); return a instanceof Evaluator.Lambda || a instanceof Evaluator.CaseLambda || a instanceof Evaluator.Builtin; });
+        define("procedure?", args -> { requireArgCount(args, 1, "procedure?"); Object a = args.get(0); return a instanceof Evaluator.Lambda || a instanceof Evaluator.CaseLambda || a instanceof Evaluator.Builtin || a instanceof Evaluator.SchemeContinuation; });
     }
 
     // --- I/O ---
@@ -823,19 +782,14 @@ final class Builtins {
         });
     }
 
-    // --- Apply ---
+    // --- Apply & call/cc ---
 
     private void registerApply() {
-        define("apply", args -> {
-            if (args.size() < 2) throw new EvalError("apply requires at least 2 arguments");
-            Object proc = args.get(0);
-            Object lastArg = args.get(args.size() - 1);
-            List<Object> callArgs = new ArrayList<>();
-            for (int i = 1; i < args.size() - 1; i++) callArgs.add(args.get(i));
-            Object cur = lastArg;
-            while (cur instanceof Cons c) { callArgs.add(c.car); cur = c.cdr; }
-            return applyProc(proc, callArgs);
-        });
+        // apply, map, for-each are intercepted by the CEK machine but need to be registered as builtins
+        define("apply", args -> { throw new EvalError("apply: should be handled by CEK machine"); });
+        // call/cc and call-with-current-continuation are handled by the CEK machine
+        define("call/cc", args -> { throw new EvalError("call/cc: should be handled by CEK machine"); });
+        define("call-with-current-continuation", args -> { throw new EvalError("call-with-current-continuation: should be handled by CEK machine"); });
     }
 
     // --- Numeric utilities (L09) ---
