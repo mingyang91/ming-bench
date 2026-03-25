@@ -109,10 +109,19 @@ public class Evaluator {
         installBuiltin(env, "procedure?", this::builtinProcedurePredicate);
         installBuiltin(env, "symbol?", this::builtinSymbolPredicate);
         installBuiltin(env, "eq?", this::builtinEq);
+        installBuiltin(env, "eqv?", this::builtinEqv);
         installBuiltin(env, "equal?", this::builtinEqual);
         installBuiltin(env, "not", this::builtinNot);
         installBuiltin(env, "apply", this::builtinApply);
         installBuiltin(env, "map", this::builtinMap);
+        installBuiltin(env, "vector", this::builtinVector);
+        installBuiltin(env, "make-vector", this::builtinMakeVector);
+        installBuiltin(env, "vector-ref", this::builtinVectorRef);
+        installBuiltin(env, "vector-set!", this::builtinVectorSet);
+        installBuiltin(env, "vector-length", this::builtinVectorLength);
+        installBuiltin(env, "vector?", this::builtinVectorPredicate);
+        installBuiltin(env, "vector->list", this::builtinVectorToList);
+        installBuiltin(env, "list->vector", this::builtinListToVector);
         installBuiltin(env, "abs", this::builtinAbs);
         installBuiltin(env, "modulo", this::builtinModulo);
         installBuiltin(env, "remainder", this::builtinRemainder);
@@ -161,6 +170,9 @@ public class Evaluator {
             if (expression instanceof CharExpr charExpr) {
                 return new CharValue(charExpr.value());
             }
+            if (expression instanceof VectorExpr vectorExpr) {
+                return quoteVector(vectorExpr.elements());
+            }
             if (expression instanceof SymbolExpr symbolExpr) {
                 return env.lookup(symbolExpr.name());
             }
@@ -186,14 +198,18 @@ public class Evaluator {
             return switch (name) {
                 case "and" -> evalAnd(arguments, env);
                 case "begin" -> evalBegin(arguments, env);
+                case "case" -> evalCase(arguments, env);
                 case "case-lambda" -> evalCaseLambda(arguments, env);
                 case "cond" -> evalCond(arguments, env);
+                case "do" -> evalDo(arguments, env);
                 case "or" -> evalOr(arguments, env);
                 case "define" -> evalDefine(arguments, env);
                 case "define-record-type" -> evalDefineRecordType(arguments, env);
                 case "define-syntax" -> evalDefineSyntax(arguments, env);
                 case "if" -> evalIf(arguments, env);
                 case "let" -> evalLet(arguments, env);
+                case "letrec" -> evalLetrec(arguments, env, false);
+                case "letrec*" -> evalLetrec(arguments, env, true);
                 case "lambda" -> evalLambda(arguments, env);
                 case "quote" -> evalQuote(arguments);
                 case "set!" -> evalSet(arguments, env);
@@ -249,6 +265,45 @@ public class Evaluator {
 
     private Value evalBegin(List<Expr> arguments, Environment env) throws EvalError {
         return evalSequence(arguments, env);
+    }
+
+    private Value evalCase(List<Expr> arguments, Environment env) throws EvalError {
+        if (arguments.isEmpty()) {
+            throw new EvalError("invalid case");
+        }
+
+        Value key = eval(arguments.get(0), env);
+        for (int i = 1; i < arguments.size(); i++) {
+            Expr clauseExpr = arguments.get(i);
+            if (!(clauseExpr instanceof ListExpr clauseExprList) || clauseExprList.elements().isEmpty()) {
+                throw new EvalError("invalid case");
+            }
+            List<Expr> clause = clauseExprList.elements();
+
+            Expr selectorExpr = clause.get(0);
+            boolean isElseClause = selectorExpr instanceof SymbolExpr symbolExpr
+                    && symbolExpr.name().equals("else");
+            if (isElseClause) {
+                if (i != arguments.size() - 1) {
+                    throw new EvalError("invalid case");
+                }
+                return clause.size() == 1
+                        ? VOID_VALUE
+                        : evalSequence(clause.subList(1, clause.size()), env);
+            }
+            if (!(selectorExpr instanceof ListExpr datumExprs)) {
+                throw new EvalError("invalid case");
+            }
+
+            for (Expr datumExpr : datumExprs.elements()) {
+                if (eqvValues(key, quote(datumExpr))) {
+                    return clause.size() == 1
+                            ? VOID_VALUE
+                            : evalSequence(clause.subList(1, clause.size()), env);
+                }
+            }
+        }
+        return VOID_VALUE;
     }
 
     private Value evalCond(List<Expr> arguments, Environment env) throws EvalError {
@@ -492,6 +547,18 @@ public class Evaluator {
             }
         }
 
+        if (template instanceof VectorExpr vectorExpr) {
+            return new VectorExpr(
+                    expandTemplateElements(
+                            vectorExpr.elements(),
+                            macroDefinition,
+                            bindings,
+                            renameEnv,
+                            state,
+                            repeatIndex),
+                    vectorExpr.pos());
+        }
+
         ListExpr listExpr = (ListExpr) template;
         Expr letExpansion = expandLetTemplate(
                 listExpr.elements(),
@@ -505,8 +572,22 @@ public class Evaluator {
             return letExpansion;
         }
 
+        return new ListExpr(
+                expandTemplateElements(
+                        listExpr.elements(),
+                        macroDefinition,
+                        bindings,
+                        renameEnv,
+                        state,
+                        repeatIndex),
+                listExpr.pos());
+    }
+
+    private List<Expr> expandTemplateElements(List<Expr> elements, MacroDefinition macroDefinition,
+                                              MacroBindings bindings, Map<String, String> renameEnv,
+                                              MacroExpansionState state, Integer repeatIndex)
+            throws EvalError {
         List<Expr> expandedElements = new ArrayList<>();
-        List<Expr> elements = listExpr.elements();
         for (int index = 0; index < elements.size(); ) {
             if (index + 1 < elements.size() && isEllipsisExpr(elements.get(index + 1))) {
                 int repeatCount = repetitionCountForTemplate(elements.get(index), bindings);
@@ -528,11 +609,11 @@ public class Evaluator {
                     macroDefinition,
                     bindings,
                     renameEnv,
-                    state,
-                    repeatIndex));
+                            state,
+                            repeatIndex));
             index++;
         }
-        return new ListExpr(expandedElements, listExpr.pos());
+        return expandedElements;
     }
 
     private Expr expandLetTemplate(List<Expr> elements, SourcePos pos, MacroDefinition macroDefinition,
@@ -625,6 +706,51 @@ public class Evaluator {
         return new CaseLambdaProcedure(null, List.copyOf(clauses), env);
     }
 
+    private Value evalDo(List<Expr> arguments, Environment env) throws EvalError {
+        if (arguments.size() < 2) {
+            throw new EvalError("invalid do");
+        }
+
+        List<DoBinding> bindings = parseDoBindings(arguments.get(0));
+        if (!(arguments.get(1) instanceof ListExpr testExpr) || testExpr.elements().isEmpty()) {
+            throw new EvalError("invalid do");
+        }
+
+        List<Value> initialValues = new ArrayList<>(bindings.size());
+        for (DoBinding binding : bindings) {
+            initialValues.add(eval(binding.initExpr(), env));
+        }
+
+        Environment loopEnv = new Environment(env);
+        for (int i = 0; i < bindings.size(); i++) {
+            loopEnv.define(bindings.get(i).name(), initialValues.get(i));
+        }
+
+        List<Expr> terminationClause = testExpr.elements();
+        List<Expr> body = arguments.subList(2, arguments.size());
+        while (true) {
+            if (isTruthy(eval(terminationClause.get(0), loopEnv))) {
+                return terminationClause.size() == 1
+                        ? VOID_VALUE
+                        : evalSequence(terminationClause.subList(1, terminationClause.size()), loopEnv);
+            }
+
+            evalSequence(body, loopEnv);
+
+            List<Value> nextValues = new ArrayList<>(bindings.size());
+            for (DoBinding binding : bindings) {
+                if (binding.stepExpr() == null) {
+                    nextValues.add(loopEnv.lookup(binding.name()));
+                } else {
+                    nextValues.add(eval(binding.stepExpr(), loopEnv));
+                }
+            }
+            for (int i = 0; i < bindings.size(); i++) {
+                loopEnv.set(bindings.get(i).name(), nextValues.get(i));
+            }
+        }
+    }
+
     private Value evalLet(List<Expr> arguments, Environment env) throws EvalError {
         if (arguments.size() < 2) {
             throw new EvalError("invalid let");
@@ -635,7 +761,7 @@ public class Evaluator {
             if (arguments.size() < 3) {
                 throw new EvalError("invalid let");
             }
-            List<Binding> bindings = parseBindings(arguments.get(1));
+            List<Binding> bindings = parseBindings(arguments.get(1), "let");
             List<Value> values = evalBindingValues(bindings, env);
             List<String> parameters = bindingNames(bindings);
 
@@ -653,13 +779,42 @@ public class Evaluator {
             return applyLambda(procedure, locatedValues, arguments.get(1).pos());
         }
 
-        List<Binding> bindings = parseBindings(arguments.get(0));
+        List<Binding> bindings = parseBindings(arguments.get(0), "let");
         List<Value> values = evalBindingValues(bindings, env);
         Environment letEnv = new Environment(env);
         for (int i = 0; i < bindings.size(); i++) {
             letEnv.define(bindings.get(i).name(), values.get(i));
         }
         return evalSequence(arguments.subList(1, arguments.size()), letEnv);
+    }
+
+    private Value evalLetrec(List<Expr> arguments, Environment env, boolean sequential) throws EvalError {
+        String formName = sequential ? "letrec*" : "letrec";
+        if (arguments.size() < 2) {
+            throw new EvalError("invalid " + formName);
+        }
+
+        List<Binding> bindings = parseBindings(arguments.get(0), formName);
+        Environment letrecEnv = new Environment(env);
+        for (Binding binding : bindings) {
+            letrecEnv.define(binding.name(), UNINITIALIZED_VALUE);
+        }
+
+        if (sequential) {
+            for (Binding binding : bindings) {
+                letrecEnv.set(binding.name(), eval(binding.valueExpr(), letrecEnv));
+            }
+        } else {
+            List<Value> values = new ArrayList<>(bindings.size());
+            for (Binding binding : bindings) {
+                values.add(eval(binding.valueExpr(), letrecEnv));
+            }
+            for (int i = 0; i < bindings.size(); i++) {
+                letrecEnv.set(bindings.get(i).name(), values.get(i));
+            }
+        }
+
+        return evalSequence(arguments.subList(1, arguments.size()), letrecEnv);
     }
 
     private Value evalQuote(List<Expr> arguments) throws EvalError {
@@ -690,22 +845,44 @@ public class Evaluator {
         return new ArrayList<>(expressions);
     }
 
-    private List<Binding> parseBindings(Expr bindingsExpr) throws EvalError {
+    private List<Binding> parseBindings(Expr bindingsExpr, String formName) throws EvalError {
         if (!(bindingsExpr instanceof ListExpr bindingsList)) {
-            throw new EvalError("invalid let");
+            throw new EvalError("invalid " + formName);
         }
         List<Expr> bindings = bindingsList.elements();
 
         List<Binding> parsed = new ArrayList<>(bindings.size());
         for (Expr bindingExpr : bindings) {
             if (!(bindingExpr instanceof ListExpr bindingList)) {
-                throw new EvalError("invalid let");
+                throw new EvalError("invalid " + formName);
             }
             List<Expr> binding = bindingList.elements();
             if (binding.size() != 2 || !(binding.get(0) instanceof SymbolExpr nameExpr)) {
-                throw new EvalError("invalid let");
+                throw new EvalError("invalid " + formName);
             }
             parsed.add(new Binding(nameExpr.name(), binding.get(1)));
+        }
+        return parsed;
+    }
+
+    private List<DoBinding> parseDoBindings(Expr bindingsExpr) throws EvalError {
+        if (!(bindingsExpr instanceof ListExpr bindingsList)) {
+            throw new EvalError("invalid do");
+        }
+
+        List<DoBinding> parsed = new ArrayList<>(bindingsList.elements().size());
+        for (Expr bindingExpr : bindingsList.elements()) {
+            if (!(bindingExpr instanceof ListExpr bindingList)) {
+                throw new EvalError("invalid do");
+            }
+            List<Expr> binding = bindingList.elements();
+            if (binding.size() < 2 || binding.size() > 3 || !(binding.get(0) instanceof SymbolExpr nameExpr)) {
+                throw new EvalError("invalid do");
+            }
+            parsed.add(new DoBinding(
+                    nameExpr.name(),
+                    binding.get(1),
+                    binding.size() == 3 ? binding.get(2) : null));
         }
         return parsed;
     }
@@ -806,6 +983,9 @@ public class Evaluator {
         if (expression instanceof CharExpr charExpr) {
             return new CharValue(charExpr.value());
         }
+        if (expression instanceof VectorExpr vectorExpr) {
+            return quoteVector(vectorExpr.elements());
+        }
         if (expression instanceof SymbolExpr symbolExpr) {
             return new SymbolValue(symbolExpr.name());
         }
@@ -821,6 +1001,14 @@ public class Evaluator {
             value = new PairValue(quote(elements.get(i)), value);
         }
         return value;
+    }
+
+    private Value quoteVector(List<Expr> elements) {
+        List<Value> values = new ArrayList<>(elements.size());
+        for (Expr element : elements) {
+            values.add(quote(element));
+        }
+        return new VectorValue(values);
     }
 
     private Value apply(Value operator, SourcePos operatorPos, List<LocatedValue> arguments,
@@ -905,6 +1093,63 @@ public class Evaluator {
             result = new PairValue(arguments.get(i).value(), result);
         }
         return result;
+    }
+
+    private Value builtinVector(SourcePos callPos, List<LocatedValue> arguments) {
+        List<Value> values = new ArrayList<>(arguments.size());
+        for (LocatedValue argument : arguments) {
+            values.add(argument.value());
+        }
+        return new VectorValue(values);
+    }
+
+    private Value builtinMakeVector(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        if (arguments.size() < 1 || arguments.size() > 2) {
+            throw errorAt(callPos, "wrong argument count for make-vector");
+        }
+
+        int length = requireNonNegativeIndex(arguments.get(0), "make-vector");
+        Value fill = arguments.size() == 2 ? arguments.get(1).value() : VOID_VALUE;
+        List<Value> values = new ArrayList<>(length);
+        for (int i = 0; i < length; i++) {
+            values.add(fill);
+        }
+        return new VectorValue(values);
+    }
+
+    private Value builtinVectorRef(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 2, "vector-ref", callPos);
+        VectorValue vector = requireVector(arguments.get(0), "vector-ref");
+        return vector.element(requireVectorIndex(arguments.get(1), "vector-ref", vector.length()));
+    }
+
+    private Value builtinVectorSet(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 3, "vector-set!", callPos);
+        VectorValue vector = requireVector(arguments.get(0), "vector-set!");
+        vector.setElement(
+                requireVectorIndex(arguments.get(1), "vector-set!", vector.length()),
+                arguments.get(2).value());
+        return VOID_VALUE;
+    }
+
+    private Value builtinVectorLength(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 1, "vector-length", callPos);
+        return new IntValue(requireVector(arguments.get(0), "vector-length").length());
+    }
+
+    private Value builtinVectorPredicate(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 1, "vector?", callPos);
+        return boolValue(arguments.get(0).value() instanceof VectorValue);
+    }
+
+    private Value builtinVectorToList(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 1, "vector->list", callPos);
+        return buildListFromValues(requireVector(arguments.get(0), "vector->list").elements());
+    }
+
+    private Value builtinListToVector(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 1, "list->vector", callPos);
+        return new VectorValue(requireProperListElements(arguments.get(0), "list->vector"));
     }
 
     private Value builtinLength(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
@@ -1138,6 +1383,11 @@ public class Evaluator {
     private Value builtinEq(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
         expectArgumentCount(arguments, 2, "eq?", callPos);
         return boolValue(eqValues(arguments.get(0).value(), arguments.get(1).value()));
+    }
+
+    private Value builtinEqv(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
+        expectArgumentCount(arguments, 2, "eqv?", callPos);
+        return boolValue(eqvValues(arguments.get(0).value(), arguments.get(1).value()));
     }
 
     private Value builtinEqual(SourcePos callPos, List<LocatedValue> arguments) throws EvalError {
@@ -1898,12 +2148,32 @@ public class Evaluator {
         throw errorAt(value.pos(), "expected pair for " + name);
     }
 
+    private VectorValue requireVector(LocatedValue value, String name) throws EvalError {
+        if (value.value() instanceof VectorValue vector) {
+            return vector;
+        }
+        throw errorAt(value.pos(), "expected vector for " + name);
+    }
+
     private RecordValue requireRecord(LocatedValue value, String name, RecordType recordType)
             throws EvalError {
         if (value.value() instanceof RecordValue recordValue && recordValue.type() == recordType) {
             return recordValue;
         }
         throw errorAt(value.pos(), "expected " + recordType.name() + " for " + name);
+    }
+
+    private List<Value> requireProperListElements(LocatedValue value, String name) throws EvalError {
+        List<Value> elements = new ArrayList<>();
+        Value current = value.value();
+        while (current instanceof PairValue(Value car, Value cdr)) {
+            elements.add(car);
+            current = cdr;
+        }
+        if (current instanceof EmptyListValue) {
+            return elements;
+        }
+        throw errorAt(value.pos(), "expected list for " + name);
     }
 
     private long requireProperListLength(LocatedValue value, String name) throws EvalError {
@@ -1953,6 +2223,14 @@ public class Evaluator {
         return result;
     }
 
+    private int requireVectorIndex(LocatedValue value, String name, int length) throws EvalError {
+        long index = requireInt(value, name);
+        if (index < 0 || index >= length) {
+            throw errorAt(value.pos(), "index out of range for " + name);
+        }
+        return (int) index;
+    }
+
     private List<LocatedValue> expandApplyArguments(LocatedValue list) throws EvalError {
         List<LocatedValue> values = new ArrayList<>();
         Value current = list.value();
@@ -1979,6 +2257,10 @@ public class Evaluator {
     }
 
     private boolean eqValues(Value left, Value right) {
+        return eqvValues(left, right);
+    }
+
+    private boolean eqvValues(Value left, Value right) {
         if (left == right) {
             return true;
         }
@@ -1998,7 +2280,7 @@ public class Evaluator {
     }
 
     private boolean equalValues(Value left, Value right) {
-        if (eqValues(left, right)) {
+        if (eqvValues(left, right)) {
             return true;
         }
         if (left instanceof StringValue leftString && right instanceof StringValue rightString) {
@@ -2007,6 +2289,17 @@ public class Evaluator {
         if (left instanceof PairValue(Value leftCar, Value leftCdr)
                 && right instanceof PairValue(Value rightCar, Value rightCdr)) {
             return equalValues(leftCar, rightCar) && equalValues(leftCdr, rightCdr);
+        }
+        if (left instanceof VectorValue leftVector && right instanceof VectorValue rightVector) {
+            if (leftVector.length() != rightVector.length()) {
+                return false;
+            }
+            for (int i = 0; i < leftVector.length(); i++) {
+                if (!equalValues(leftVector.element(i), rightVector.element(i))) {
+                    return false;
+                }
+            }
+            return true;
         }
         return false;
     }
@@ -2027,7 +2320,7 @@ public class Evaluator {
         return error.hasPosition() ? error : error.withPosition(pos.line(), pos.column());
     }
 
-    private sealed interface Expr permits NumberExpr, BoolExpr, StringExpr, CharExpr, SymbolExpr, ListExpr {
+    private sealed interface Expr permits NumberExpr, BoolExpr, StringExpr, CharExpr, VectorExpr, SymbolExpr, ListExpr {
         SourcePos pos();
     }
 
@@ -2040,6 +2333,8 @@ public class Evaluator {
     private record StringExpr(String value, SourcePos pos) implements Expr {}
 
     private record CharExpr(char value, SourcePos pos) implements Expr {}
+
+    private record VectorExpr(List<Expr> elements, SourcePos pos) implements Expr {}
 
     private record SymbolExpr(String name, SourcePos pos) implements Expr {}
 
@@ -2065,8 +2360,8 @@ public class Evaluator {
     }
 
     private sealed interface Value permits NumberValue, BoolValue, StringValue, SymbolValue,
-            CharValue, PairValue, EmptyListValue, BuiltinProcedure, LambdaProcedure,
-            CaseLambdaProcedure, RecordValue, VoidValue {
+            CharValue, PairValue, VectorValue, EmptyListValue, BuiltinProcedure, LambdaProcedure,
+            CaseLambdaProcedure, RecordValue, UninitializedValue, VoidValue {
         String render();
     }
 
@@ -2150,6 +2445,35 @@ public class Evaluator {
         }
     }
 
+    private static final class VectorValue implements Value {
+        private final List<Value> elements;
+
+        private VectorValue(List<Value> elements) {
+            this.elements = new ArrayList<>(elements);
+        }
+
+        private int length() {
+            return elements.size();
+        }
+
+        private Value element(int index) {
+            return elements.get(index);
+        }
+
+        private void setElement(int index, Value value) {
+            elements.set(index, value);
+        }
+
+        private List<Value> elements() {
+            return List.copyOf(elements);
+        }
+
+        @Override
+        public String render() {
+            return renderVector(this, false);
+        }
+    }
+
     private record EmptyListValue() implements Value {
         @Override
         public String render() {
@@ -2184,6 +2508,13 @@ public class Evaluator {
         @Override
         public String render() {
             return "";
+        }
+    }
+
+    private record UninitializedValue() implements Value {
+        @Override
+        public String render() {
+            return "#<uninitialized>";
         }
     }
 
@@ -2271,6 +2602,8 @@ public class Evaluator {
     }
 
     private record Binding(String name, Expr valueExpr) {}
+
+    private record DoBinding(String name, Expr initExpr, Expr stepExpr) {}
 
     private record RecordConstructorSpec(String name, List<String> fields) {}
 
@@ -2372,7 +2705,11 @@ public class Evaluator {
 
         private Value lookup(String name) throws EvalError {
             if (bindings.containsKey(name)) {
-                return bindings.get(name);
+                Value value = bindings.get(name);
+                if (value instanceof UninitializedValue) {
+                    throw new EvalError("uninitialized binding: " + name);
+                }
+                return value;
             }
             if (parent != null) {
                 return parent.lookup(name);
@@ -2395,8 +2732,9 @@ public class Evaluator {
 
     private static boolean isSpecialForm(String name) {
         return switch (name) {
-            case "and", "begin", "case-lambda", "cond", "define", "define-record-type", "define-syntax", "else", "if",
-                    "lambda", "let", "or", "quote", "set!", "syntax-rules" -> true;
+            case "and", "begin", "case", "case-lambda", "cond", "define", "define-record-type", "define-syntax",
+                    "do", "else", "if", "lambda", "let", "letrec", "letrec*", "or", "quote", "set!",
+                    "syntax-rules" -> true;
             default -> false;
         };
     }
@@ -2439,6 +2777,15 @@ public class Evaluator {
         if (pattern instanceof NumberExpr || pattern instanceof BoolExpr
                 || pattern instanceof StringExpr || pattern instanceof CharExpr) {
             return exprSyntaxEq(pattern, input);
+        }
+
+        if (pattern instanceof VectorExpr vectorPattern && input instanceof VectorExpr vectorInput) {
+            return matchListPattern(
+                    vectorPattern.elements(),
+                    vectorInput.elements(),
+                    macroName,
+                    literals,
+                    bindings);
         }
 
         if (pattern instanceof ListExpr listPattern && input instanceof ListExpr listInput) {
@@ -2526,6 +2873,12 @@ public class Evaluator {
             for (Expr element : listPattern.elements()) {
                 initializeRepeatedBindings(element, macroName, literals, bindings);
             }
+            return;
+        }
+        if (pattern instanceof VectorExpr vectorPattern) {
+            for (Expr element : vectorPattern.elements()) {
+                initializeRepeatedBindings(element, macroName, literals, bindings);
+            }
         }
     }
 
@@ -2555,6 +2908,12 @@ public class Evaluator {
             for (Expr element : listExpr.elements()) {
                 collectRepetitionCount(element, bindings, count);
             }
+            return;
+        }
+        if (template instanceof VectorExpr vectorExpr) {
+            for (Expr element : vectorExpr.elements()) {
+                collectRepetitionCount(element, bindings, count);
+            }
         }
     }
 
@@ -2570,6 +2929,17 @@ public class Evaluator {
         }
         if (left instanceof CharExpr leftChar && right instanceof CharExpr rightChar) {
             return leftChar.value() == rightChar.value();
+        }
+        if (left instanceof VectorExpr leftVector && right instanceof VectorExpr rightVector) {
+            if (leftVector.elements().size() != rightVector.elements().size()) {
+                return false;
+            }
+            for (int i = 0; i < leftVector.elements().size(); i++) {
+                if (!exprSyntaxEq(leftVector.elements().get(i), rightVector.elements().get(i))) {
+                    return false;
+                }
+            }
+            return true;
         }
         if (left instanceof SymbolExpr leftSymbol && right instanceof SymbolExpr rightSymbol) {
             return leftSymbol.name().equals(rightSymbol.name());
@@ -2595,11 +2965,15 @@ public class Evaluator {
     private static final BoolValue TRUE_VALUE = new BoolValue(true);
     private static final BoolValue FALSE_VALUE = new BoolValue(false);
     private static final EmptyListValue EMPTY_LIST = new EmptyListValue();
+    private static final UninitializedValue UNINITIALIZED_VALUE = new UninitializedValue();
     private static final VoidValue VOID_VALUE = new VoidValue();
 
     private static String renderValue(Value value, boolean displayMode) {
         if (value instanceof PairValue pair) {
             return renderPair(pair, displayMode);
+        }
+        if (value instanceof VectorValue vector) {
+            return renderVector(vector, displayMode);
         }
         if (displayMode) {
             if (value instanceof StringValue stringValue) {
@@ -2632,6 +3006,18 @@ public class Evaluator {
         }
 
         builder.append(" . ").append(renderValue(current, displayMode)).append(')');
+        return builder.toString();
+    }
+
+    private static String renderVector(VectorValue vector, boolean displayMode) {
+        StringBuilder builder = new StringBuilder("#(");
+        for (int i = 0; i < vector.length(); i++) {
+            if (i > 0) {
+                builder.append(' ');
+            }
+            builder.append(renderValue(vector.element(i), displayMode));
+        }
+        builder.append(')');
         return builder.toString();
     }
 
@@ -2757,10 +3143,31 @@ public class Evaluator {
                 index += 2;
                 return new BoolExpr(false, pos);
             }
+            if (input.startsWith("#(", index)) {
+                return parseVectorLiteral(pos);
+            }
             if (input.startsWith("#\\", index)) {
                 return parseCharacter(pos);
             }
             throw errorAt(pos, "invalid boolean literal");
+        }
+
+        private Expr parseVectorLiteral(SourcePos pos) throws EvalError {
+            index += 2;
+            List<Expr> elements = new ArrayList<>();
+            skipWhitespace();
+
+            while (true) {
+                if (isAtEnd()) {
+                    throw errorAt(pos, "unterminated vector");
+                }
+                if (input.charAt(index) == ')') {
+                    index++;
+                    return new VectorExpr(elements, pos);
+                }
+                elements.add(parseExpr());
+                skipWhitespace();
+            }
         }
 
         private Expr parseCharacter(SourcePos pos) throws EvalError {
