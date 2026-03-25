@@ -93,6 +93,7 @@ struct Expr {
 enum ExprKind {
     Int(i64),
     Bool(bool),
+    Char(char),
     Str(String),
     Symbol(String),
     List(Vec<Expr>),
@@ -240,6 +241,17 @@ fn parse(tokens: &[Token], pos: &mut usize) -> Result<Expr, EvalError> {
             }
         }
         Ok(Expr { kind: ExprKind::Str(s), span })
+    } else if tok.text.starts_with("#\\") {
+        *pos += 1;
+        let rest = &tok.text[2..];
+        let ch = match rest {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            s if s.chars().count() == 1 => s.chars().next().unwrap(),
+            _ => return Err(EvalError::Parse(format!("invalid character literal: {}", tok.text))),
+        };
+        Ok(Expr { kind: ExprKind::Char(ch), span })
     } else if let Ok(n) = tok.text.parse::<i64>() {
         *pos += 1;
         Ok(Expr { kind: ExprKind::Int(n), span })
@@ -339,6 +351,7 @@ fn quote_expr(expr: &Expr) -> Val {
     match &expr.kind {
         ExprKind::Int(n) => Val::Int(*n),
         ExprKind::Bool(b) => Val::Bool(*b),
+        ExprKind::Char(c) => Val::Char(*c),
         ExprKind::Str(s) => Val::Str(s.clone()),
         ExprKind::Symbol(s) => Val::Symbol(s.clone()),
         ExprKind::List(items) => {
@@ -366,6 +379,7 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
     match &expr.kind {
         ExprKind::Int(n) => Ok(Val::Int(*n)),
         ExprKind::Bool(b) => Ok(Val::Bool(*b)),
+        ExprKind::Char(c) => Ok(Val::Char(*c)),
         ExprKind::Str(s) => Ok(Val::Str(s.clone())),
         ExprKind::Symbol(name) => {
             env_get(env, name)
@@ -615,6 +629,38 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Val, EvalError> {
                         out.push('\n');
                         return Ok(Val::Void);
                     }
+                    "string-set!" => {
+                        if list.len() != 4 {
+                            return Err(err_at(span, EvalError::Arity("string-set!: need 3 arguments".into())));
+                        }
+                        let var_name = match &list[1].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(err_at(span, EvalError::Type("string-set!: first argument must be a variable".into()))),
+                        };
+                        let idx_val = eval(&list[2], env, out)?;
+                        let idx = match &idx_val {
+                            Val::Int(n) => *n as usize,
+                            _ => return Err(err_at(span, EvalError::Type("string-set!: expected integer index".into()))),
+                        };
+                        let char_val = eval(&list[3], env, out)?;
+                        let ch = match &char_val {
+                            Val::Char(c) => *c,
+                            _ => return Err(err_at(span, EvalError::Type("string-set!: expected char".into()))),
+                        };
+                        let mut s = match env_get(env, &var_name) {
+                            Some(Val::Str(s)) => s,
+                            Some(_) => return Err(err_at(span, EvalError::Type("string-set!: expected string".into()))),
+                            None => return Err(err_at(span, EvalError::UnboundVariable(var_name.clone()))),
+                        };
+                        let mut chars: Vec<char> = s.chars().collect();
+                        if idx >= chars.len() {
+                            return Err(err_at(span, EvalError::Type("string-set!: index out of range".into())));
+                        }
+                        chars[idx] = ch;
+                        s = chars.into_iter().collect();
+                        env_set(env, var_name, Val::Str(s));
+                        return Ok(Val::Void);
+                    }
                     _ => {}
                 }
             }
@@ -664,7 +710,8 @@ fn is_builtin(op: &str) -> bool {
         | "cons" | "car" | "cdr" | "null?" | "list" | "length" | "append"
         | "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
         | "string-append" | "string-length" | "substring" | "string->number"
-        | "number->string" | "symbol->string" | "string->symbol" | "string-ref")
+        | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
+        | "string-copy")
 }
 
 fn apply_builtin(op: &str, args: &[Val]) -> Result<Val, EvalError> {
@@ -931,6 +978,13 @@ fn apply_builtin(op: &str, args: &[Val]) -> Result<Val, EvalError> {
                 return Err(EvalError::Type("string-ref: index out of range".into()));
             }
             Ok(Val::Char(chars[idx]))
+        }
+        "string-copy" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string-copy: need 1 argument".into())); }
+            match &args[0] {
+                Val::Str(s) => Ok(Val::Str(s.clone())),
+                _ => Err(EvalError::Type("string-copy: expected string".into())),
+            }
         }
         _ => Err(EvalError::UnboundVariable(op.into())),
     }
