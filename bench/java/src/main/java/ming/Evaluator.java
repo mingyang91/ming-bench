@@ -2053,8 +2053,9 @@ public class Evaluator {
             evalBodyExprs(lambda.body, 0, callEnv); return;
         }
         if (proc instanceof SchemeContinuation sc) {
-            if (args.isEmpty()) throw new EvalError("continuation requires 1 argument");
-            throw new ContinuationReturn(sc.k, args.get(0), sc.savedWind);
+            if (args.isEmpty()) throw new EvalError("continuation requires at least 1 argument");
+            Object val = args.size() == 1 ? args.get(0) : new MultipleValues(args);
+            throw new ContinuationReturn(sc.k, val, sc.savedWind);
         }
         if (proc == CALLCC_PROC) {
             if (args.size() != 1) throw new EvalError("call/cc requires 1 argument");
