@@ -2159,7 +2159,7 @@ public class Evaluator {
         List<Val> exprs = new ArrayList<>();
         while (idx[0] < tokens.size()) exprs.add(parse(tokens, idx));
         Val result = run(evalBodyStep(exprs, env, new Kont.HaltK()));
-        String resultStr = (result instanceof Val.Void) ? "#<void>" : writeVal(result);
+        String resultStr = (result instanceof Val.Void) ? "#<void>" : displayVal(result);
         return new EvalResult(resultStr, output.toString());
     }
 

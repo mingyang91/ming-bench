@@ -24,6 +24,10 @@ public class TestRunner {
             L27Tests.main(args);
             return;
         }
+        if (levelArg.equals("28")) {
+            L28Tests.main(args);
+            return;
+        }
 
         int benchLevel = 0;
         if (!levelArg.equals("all")) {
