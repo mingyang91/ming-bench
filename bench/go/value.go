@@ -20,6 +20,7 @@ type NilVal struct{}
 type SymbolVal struct{ Name string }
 type CharVal struct{ Val rune }
 type VoidVal struct{}
+type VectorVal struct{ Elems []Value }
 type LambdaVal struct {
 	Params   []string
 	Rest     string // rest parameter name (dot notation), empty if none
@@ -96,6 +97,19 @@ func (v *VoidVal) String() string {
 	return ""
 }
 
+func (v *VectorVal) String() string {
+	var buf strings.Builder
+	buf.WriteString("#(")
+	for i, e := range v.Elems {
+		if i > 0 {
+			buf.WriteByte(' ')
+		}
+		buf.WriteString(e.String())
+	}
+	buf.WriteByte(')')
+	return buf.String()
+}
+
 // displayValue formats a value for display (no quotes on strings, raw chars).
 func displayValue(v Value) string {
 	switch val := v.(type) {
@@ -123,6 +137,17 @@ func displayValue(v Value) string {
 		if _, ok := cur.(*NilVal); !ok {
 			buf.WriteString(" . ")
 			buf.WriteString(displayValue(cur))
+		}
+		buf.WriteByte(')')
+		return buf.String()
+	case *VectorVal:
+		var buf strings.Builder
+		buf.WriteString("#(")
+		for i, e := range val.Elems {
+			if i > 0 {
+				buf.WriteByte(' ')
+			}
+			buf.WriteString(displayValue(e))
 		}
 		buf.WriteByte(')')
 		return buf.String()

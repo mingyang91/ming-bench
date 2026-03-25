@@ -81,6 +81,14 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 			return evalDefineRecordType(e, env)
 		case "case-lambda":
 			return evalCaseLambda(e, env)
+		case "letrec":
+			return evalLetrec(e, env)
+		case "letrec*":
+			return evalLetrecStar(e, env)
+		case "case":
+			return evalCase(e, env)
+		case "do":
+			return evalDo(e, env)
 		}
 
 		// Check for macro application
@@ -451,6 +459,9 @@ func makeGlobalEnv(out *strings.Builder) *Env {
 
 	// L11 builtins
 	registerL11Builtins(env)
+
+	// L14 builtins
+	registerL14Builtins(env)
 
 	return env
 }
@@ -955,4 +966,259 @@ func builtinStringRef(args []Value) (Value, error) {
 		return nil, &EvalError{Message: "string-ref: index out of range"}
 	}
 	return &CharVal{Val: runes[idx.Val]}, nil
+}
+
+func evalLetrec(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Items) < 3 {
+		return nil, &EvalError{Message: "letrec: requires bindings and body"}
+	}
+	bindings, ok := e.Items[1].(*ListExpr)
+	if !ok {
+		return nil, &EvalError{Message: "letrec: expected bindings list"}
+	}
+	childEnv := newEnv(env)
+	// First pass: bind all names to undefined
+	names := make([]string, 0, len(bindings.Items))
+	initExprs := make([]Expr, 0, len(bindings.Items))
+	for _, b := range bindings.Items {
+		bl, ok := b.(*ListExpr)
+		if !ok || len(bl.Items) != 2 {
+			return nil, &EvalError{Message: "letrec: bad binding"}
+		}
+		sym, ok := bl.Items[0].(*SymbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: "letrec: expected symbol in binding"}
+		}
+		names = append(names, sym.Name)
+		initExprs = append(initExprs, bl.Items[1])
+		childEnv.set(sym.Name, &VoidVal{})
+	}
+	// Second pass: evaluate init exprs in childEnv and assign
+	for i, expr := range initExprs {
+		val, err := eval(expr, childEnv)
+		if err != nil {
+			return nil, err
+		}
+		childEnv.set(names[i], val)
+	}
+	var result Value
+	var err error
+	for _, bodyExpr := range e.Items[2:] {
+		result, err = eval(bodyExpr, childEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalLetrecStar(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Items) < 3 {
+		return nil, &EvalError{Message: "letrec*: requires bindings and body"}
+	}
+	bindings, ok := e.Items[1].(*ListExpr)
+	if !ok {
+		return nil, &EvalError{Message: "letrec*: expected bindings list"}
+	}
+	childEnv := newEnv(env)
+	for _, b := range bindings.Items {
+		bl, ok := b.(*ListExpr)
+		if !ok || len(bl.Items) != 2 {
+			return nil, &EvalError{Message: "letrec*: bad binding"}
+		}
+		sym, ok := bl.Items[0].(*SymbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: "letrec*: expected symbol in binding"}
+		}
+		val, err := eval(bl.Items[1], childEnv)
+		if err != nil {
+			return nil, err
+		}
+		childEnv.set(sym.Name, val)
+	}
+	var result Value
+	var err error
+	for _, bodyExpr := range e.Items[2:] {
+		result, err = eval(bodyExpr, childEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func eqvCompare(a, b Value) bool {
+	switch av := a.(type) {
+	case *BoolVal:
+		if bv, ok := b.(*BoolVal); ok {
+			return av.Val == bv.Val
+		}
+	case *IntVal:
+		if bv, ok := b.(*IntVal); ok {
+			return av.Val == bv.Val
+		}
+	case *FloatVal:
+		if bv, ok := b.(*FloatVal); ok {
+			return av.Val == bv.Val
+		}
+	case *RationalVal:
+		if bv, ok := b.(*RationalVal); ok {
+			return av.Num == bv.Num && av.Den == bv.Den
+		}
+	case *SymbolVal:
+		if bv, ok := b.(*SymbolVal); ok {
+			return av.Name == bv.Name
+		}
+	case *CharVal:
+		if bv, ok := b.(*CharVal); ok {
+			return av.Val == bv.Val
+		}
+	case *StringVal:
+		if bv, ok := b.(*StringVal); ok {
+			return av.Val == bv.Val
+		}
+	case *NilVal:
+		_, ok := b.(*NilVal)
+		return ok
+	}
+	return a == b
+}
+
+func evalCase(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Items) < 3 {
+		return nil, &EvalError{Message: "case: requires key and clauses"}
+	}
+	key, err := eval(e.Items[1], env)
+	if err != nil {
+		return nil, err
+	}
+	for _, clause := range e.Items[2:] {
+		cl, ok := clause.(*ListExpr)
+		if !ok || len(cl.Items) < 2 {
+			return nil, &EvalError{Message: "case: bad clause"}
+		}
+		// Check for else
+		if sym, ok := cl.Items[0].(*SymbolExpr); ok && sym.Name == "else" {
+			var result Value
+			for _, expr := range cl.Items[1:] {
+				result, err = eval(expr, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		// Datum list
+		datums, ok := cl.Items[0].(*ListExpr)
+		if !ok {
+			return nil, &EvalError{Message: "case: expected datum list"}
+		}
+		for _, d := range datums.Items {
+			datum := quoteExpr(d)
+			if eqvCompare(key, datum) {
+				var result Value
+				for _, expr := range cl.Items[1:] {
+					result, err = eval(expr, env)
+					if err != nil {
+						return nil, err
+					}
+				}
+				return result, nil
+			}
+		}
+	}
+	return &VoidVal{}, nil
+}
+
+func evalDo(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Items) < 3 {
+		return nil, &EvalError{Message: "do: requires variables, test, and body"}
+	}
+	varList, ok := e.Items[1].(*ListExpr)
+	if !ok {
+		return nil, &EvalError{Message: "do: expected variable list"}
+	}
+	testClause, ok := e.Items[2].(*ListExpr)
+	if !ok || len(testClause.Items) < 1 {
+		return nil, &EvalError{Message: "do: expected test clause"}
+	}
+
+	type doVar struct {
+		name    string
+		step    Expr // nil if no step
+	}
+
+	vars := make([]doVar, 0, len(varList.Items))
+	doEnv := newEnv(env)
+
+	// Initialize variables
+	for _, v := range varList.Items {
+		vl, ok := v.(*ListExpr)
+		if !ok || len(vl.Items) < 2 || len(vl.Items) > 3 {
+			return nil, &EvalError{Message: "do: bad variable clause"}
+		}
+		sym, ok := vl.Items[0].(*SymbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: "do: expected symbol in variable"}
+		}
+		initVal, err := eval(vl.Items[1], env)
+		if err != nil {
+			return nil, err
+		}
+		doEnv.set(sym.Name, initVal)
+		dv := doVar{name: sym.Name}
+		if len(vl.Items) == 3 {
+			dv.step = vl.Items[2]
+		}
+		vars = append(vars, dv)
+	}
+
+	body := e.Items[3:]
+
+	for {
+		// Test
+		testVal, err := eval(testClause.Items[0], doEnv)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(testVal) {
+			// Evaluate result expressions
+			if len(testClause.Items) > 1 {
+				var result Value
+				for _, expr := range testClause.Items[1:] {
+					result, err = eval(expr, doEnv)
+					if err != nil {
+						return nil, err
+					}
+				}
+				return result, nil
+			}
+			return &VoidVal{}, nil
+		}
+
+		// Execute body
+		for _, bodyExpr := range body {
+			_, err = eval(bodyExpr, doEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// Step: evaluate all step exprs with current values, then update
+		newVals := make([]Value, len(vars))
+		for i, v := range vars {
+			if v.step != nil {
+				val, err := eval(v.step, doEnv)
+				if err != nil {
+					return nil, err
+				}
+				newVals[i] = val
+			}
+		}
+		for i, v := range vars {
+			if v.step != nil {
+				doEnv.set(v.name, newVals[i])
+			}
+		}
+	}
 }

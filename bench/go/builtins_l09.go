@@ -306,6 +306,21 @@ func valuesEqual(a, b Value) bool {
 		if bv, ok := b.(*PairVal); ok {
 			return valuesEqual(av.Car, bv.Car) && valuesEqual(av.Cdr, bv.Cdr)
 		}
+	case *VectorVal:
+		if bv, ok := b.(*VectorVal); ok {
+			if len(av.Elems) != len(bv.Elems) {
+				return false
+			}
+			for i := range av.Elems {
+				if !valuesEqual(av.Elems[i], bv.Elems[i]) {
+					return false
+				}
+			}
+			return true
+		}
+	case *VoidVal:
+		_, ok := b.(*VoidVal)
+		return ok
 	}
 	return a == b
 }
@@ -342,6 +357,53 @@ func builtinEqQ(args []Value) (Value, error) {
 		}
 	case *NilVal:
 		_, ok := b.(*NilVal)
+		return &BoolVal{Val: ok}, nil
+	case *VoidVal:
+		_, ok := b.(*VoidVal)
+		return &BoolVal{Val: ok}, nil
+	}
+	return &BoolVal{Val: a == b}, nil
+}
+
+func builtinEqvQ(args []Value) (Value, error) {
+	if len(args) != 2 {
+		return nil, &EvalError{Message: "eqv?: requires exactly 2 arguments"}
+	}
+	a, b := args[0], args[1]
+	switch av := a.(type) {
+	case *BoolVal:
+		if bv, ok := b.(*BoolVal); ok {
+			return &BoolVal{Val: av.Val == bv.Val}, nil
+		}
+	case *IntVal:
+		if bv, ok := b.(*IntVal); ok {
+			return &BoolVal{Val: av.Val == bv.Val}, nil
+		}
+	case *FloatVal:
+		if bv, ok := b.(*FloatVal); ok {
+			return &BoolVal{Val: av.Val == bv.Val}, nil
+		}
+	case *RationalVal:
+		if bv, ok := b.(*RationalVal); ok {
+			return &BoolVal{Val: av.Num == bv.Num && av.Den == bv.Den}, nil
+		}
+	case *SymbolVal:
+		if bv, ok := b.(*SymbolVal); ok {
+			return &BoolVal{Val: av.Name == bv.Name}, nil
+		}
+	case *CharVal:
+		if bv, ok := b.(*CharVal); ok {
+			return &BoolVal{Val: av.Val == bv.Val}, nil
+		}
+	case *StringVal:
+		if bv, ok := b.(*StringVal); ok {
+			return &BoolVal{Val: av.Val == bv.Val}, nil
+		}
+	case *NilVal:
+		_, ok := b.(*NilVal)
+		return &BoolVal{Val: ok}, nil
+	case *VoidVal:
+		_, ok := b.(*VoidVal)
 		return &BoolVal{Val: ok}, nil
 	}
 	return &BoolVal{Val: a == b}, nil
@@ -597,6 +659,7 @@ func registerL09Builtins(env *Env) {
 	env.set("assoc", &BuiltinFunc{Name: "assoc", Fn: builtinAssoc})
 	env.set("map", &BuiltinFunc{Name: "map", Fn: builtinMap})
 	env.set("eq?", &BuiltinFunc{Name: "eq?", Fn: builtinEqQ})
+	env.set("eqv?", &BuiltinFunc{Name: "eqv?", Fn: builtinEqvQ})
 	env.set("equal?", &BuiltinFunc{Name: "equal?", Fn: builtinEqualQ})
 
 	// Character builtins
