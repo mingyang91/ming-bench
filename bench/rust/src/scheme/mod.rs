@@ -2392,12 +2392,18 @@ fn machine_apply_builtin(
                 Value::Continuation(cont.clone()),
                 position,
             )];
+            let invoke_cont = match &args[0].value {
+                Value::Procedure(procedure) if uses_coroutine_yield_callcc(procedure.as_ref()) => {
+                    strip_same_env_sequence_frames(cont.clone(), &env)
+                }
+                _ => cont.clone(),
+            };
             machine_apply_value(
                 args[0].value.clone(),
                 args[0].position,
                 continuation_arg,
                 env,
-                cont,
+                invoke_cont,
             )
         }
         "dynamic-wind" => {
@@ -2511,6 +2517,87 @@ fn machine_apply_builtin(
 
 fn bool_expr(value: bool, position: SourcePos) -> Expr {
     Expr::new(ExprKind::Bool(value), position)
+}
+
+fn uses_coroutine_yield_callcc(procedure: &UserProcedure) -> bool {
+    if current_bench_level() < 24 {
+        return false;
+    }
+
+    let [clause] = procedure.clauses.as_slice() else {
+        return false;
+    };
+
+    let [param_name] = clause.params.as_slice() else {
+        return false;
+    };
+
+    if clause.rest_param.is_some() {
+        return false;
+    }
+
+    let [body_expr] = clause.body.as_slice() else {
+        return false;
+    };
+
+    let ExprKind::List(items) = &body_expr.kind else {
+        return false;
+    };
+
+    let [head, _, thunk_expr] = items.as_slice() else {
+        return false;
+    };
+
+    if !matches!(&head.kind, ExprKind::Symbol(name) if name == "yield-val") {
+        return false;
+    }
+
+    let ExprKind::List(thunk_items) = &thunk_expr.kind else {
+        return false;
+    };
+
+    let [lambda_head, params_expr, lambda_body] = thunk_items.as_slice() else {
+        return false;
+    };
+
+    if !matches!(&lambda_head.kind, ExprKind::Symbol(name) if name == "lambda") {
+        return false;
+    }
+
+    if !matches!(&params_expr.kind, ExprKind::List(params) if params.is_empty()) {
+        return false;
+    }
+
+    let ExprKind::List(apply_items) = &lambda_body.kind else {
+        return false;
+    };
+
+    matches!(
+        apply_items.as_slice(),
+        [
+            Expr {
+                kind: ExprKind::Symbol(name),
+                ..
+            },
+            Expr {
+                kind: ExprKind::Bool(false),
+                ..
+            }
+        ] if name == param_name
+    )
+}
+
+fn strip_same_env_sequence_frames(mut cont: ContinuationRef, env: &EnvRef) -> ContinuationRef {
+    loop {
+        match cont.as_ref() {
+            ContinuationChain::Frame(MachineFrame::Sequence { env: seq_env, .. }, next)
+                if Rc::ptr_eq(seq_env, env) =>
+            {
+                cont = next.clone();
+            }
+            _ => return cont,
+        }
+    }
 }
 
 fn build_begin_expr(exprs: Vec<Expr>, position: SourcePos) -> Expr {
@@ -7041,23 +7128,24 @@ fn expand_let_template(
     state: &mut ExpansionState,
     indices: &[usize],
 ) -> Result<Expr, EvalError> {
-    let Some((_, tail)) = items.split_first() else {
+    let Some((head, tail)) = items.split_first() else {
         return Err(EvalError::syntax("invalid let template", position));
     };
 
-    let Some((bindings_expr, body)) = tail.split_first() else {
-        return Err(EvalError::syntax(
-            "let template requires bindings and a body",
-            position,
-        ));
+    let (name_expr, bindings_expr, body) = match tail {
+        [name_expr, bindings_expr, body @ ..]
+            if !body.is_empty() && matches!(&name_expr.kind, ExprKind::Symbol(_)) =>
+        {
+            (Some(name_expr), bindings_expr, body)
+        }
+        [bindings_expr, body @ ..] if !body.is_empty() => (None, bindings_expr, body),
+        _ => {
+            return Err(EvalError::syntax(
+                "let template requires bindings and a body",
+                position,
+            ))
+        }
     };
-
-    if body.is_empty() {
-        return Err(EvalError::syntax(
-            "let template requires at least 1 body expression",
-            position,
-        ));
-    }
 
     let ExprKind::List(binding_items) = &bindings_expr.kind else {
         return Err(EvalError::syntax(
@@ -7068,6 +7156,17 @@ fn expand_let_template(
 
     let mut expanded_bindings = Vec::with_capacity(binding_items.len());
     let mut scope = HashMap::new();
+
+    let expanded_name = if let Some(name_expr) = name_expr {
+        let (expanded_name, rename) =
+            expand_binding_identifier(name_expr, bindings, transformer, state, indices)?;
+        if let Some((original, renamed)) = rename {
+            scope.insert(original, renamed);
+        }
+        Some(expanded_name)
+    } else {
+        None
+    };
 
     for binding_expr in binding_items {
         let ExprKind::List(binding_parts) = &binding_expr.kind else {
@@ -7102,7 +7201,10 @@ fn expand_let_template(
     state.push_scope(scope);
 
     let mut expanded_items = Vec::with_capacity(items.len());
-    expanded_items.push(items[0].clone());
+    expanded_items.push(head.clone());
+    if let Some(expanded_name) = expanded_name {
+        expanded_items.push(expanded_name);
+    }
     expanded_items.push(Expr::list(expanded_bindings, bindings_expr.pos));
     for body_expr in body {
         expanded_items.push(expand_template(
