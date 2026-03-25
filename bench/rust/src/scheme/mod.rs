@@ -1,6 +1,7 @@
 mod builtin_helpers;
 mod builtins;
 pub mod error;
+mod helpers;
 mod macros;
 mod number;
 mod parser;
@@ -9,6 +10,10 @@ mod value_ops;
 pub use error::{EvalError, SourcePos};
 
 use self::builtins::builtin_name;
+use self::helpers::{
+    invalid_argument, make_immutable_string_value, make_string_value, make_vector_value,
+    number_error, syntax_error, type_mismatch, wrong_arg_count,
+};
 use self::macros::{expand_macro_call, parse_syntax_rules};
 use self::number::{parse_number_literal, Number, NumberError};
 use self::value_ops::{
@@ -295,81 +300,6 @@ impl Env {
             syntax_bindings: HashMap::new(),
         }))
     }
-}
-
-fn syntax_error(pos: SourcePos, message: impl Into<String>) -> EvalError {
-    EvalError::Syntax {
-        pos,
-        message: message.into(),
-    }
-}
-
-fn wrong_arg_count(
-    pos: SourcePos,
-    name: impl Into<String>,
-    expected: impl Into<String>,
-    got: usize,
-) -> EvalError {
-    EvalError::WrongArgCount {
-        pos,
-        name: name.into(),
-        expected: expected.into(),
-        got,
-    }
-}
-
-fn type_mismatch(
-    pos: SourcePos,
-    name: impl Into<String>,
-    expected: impl Into<String>,
-    found: impl Into<String>,
-) -> EvalError {
-    EvalError::TypeMismatch {
-        pos,
-        name: name.into(),
-        expected: expected.into(),
-        found: found.into(),
-    }
-}
-
-fn invalid_argument(
-    pos: SourcePos,
-    name: impl Into<String>,
-    message: impl Into<String>,
-) -> EvalError {
-    EvalError::InvalidArgument {
-        pos,
-        name: name.into(),
-        message: message.into(),
-    }
-}
-
-fn number_error(pos: SourcePos, name: &str, error: NumberError) -> EvalError {
-    match error {
-        NumberError::DivisionByZero => EvalError::DivisionByZero { pos },
-        NumberError::Overflow => invalid_argument(pos, name, "numeric overflow"),
-        NumberError::NonFinite => invalid_argument(
-            pos,
-            name,
-            "cannot convert a non-finite inexact number to exact",
-        ),
-    }
-}
-
-fn make_string_value(value: impl Into<String>) -> Value {
-    make_mutable_string_value(value)
-}
-
-fn make_mutable_string_value(value: impl Into<String>) -> Value {
-    Value::String(StringRef::new(value, true))
-}
-
-fn make_immutable_string_value(value: impl Into<String>) -> Value {
-    Value::String(StringRef::new(value, false))
-}
-
-fn make_vector_value(values: Vec<Value>) -> Value {
-    Value::Vector(Rc::new(RefCell::new(values)))
 }
 
 /// Evaluate one or more Scheme expressions and return the string
