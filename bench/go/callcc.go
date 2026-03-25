@@ -158,15 +158,21 @@ func callProc(fn Value, args []Value, ln, cl int) (Value, error) {
 	case *CaseLambdaVal:
 		return resolveTC(applyCaseLambda(f, args, ln, cl))
 	case *ContinuationVal:
-		if len(args) != 1 {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: requires exactly 1 argument", ln, cl)}
+		if len(args) == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: requires at least 1 argument", ln, cl)}
+		}
+		var val Value
+		if len(args) == 1 {
+			val = args[0]
+		} else {
+			val = &MultipleValues{Vals: args}
 		}
 		if f.evalState != nil && !f.evalState.activeContIDs[f.id] &&
 			f.captureFrameID != 0 && !isFrameActive(f.evalState, f.captureFrameID) &&
 			f.evalState.currentExprIdx == f.exprIdx {
-			return args[0], nil
+			return val, nil
 		}
-		panic(&continuationJump{cont: f, value: args[0]})
+		panic(&continuationJump{cont: f, value: val})
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure: %s", ln, cl, fn.String())}
 	}

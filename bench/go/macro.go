@@ -43,6 +43,10 @@ var specialForms = map[string]bool{
 	"cond": true, "let": true, "set!": true, "quote": true,
 	"and": true, "or": true, "define-syntax": true, "syntax-rules": true,
 	"else": true, "syntax-case": true, "syntax": true, "with-syntax": true,
+	"let*": true, "letrec": true, "letrec*": true, "case": true,
+	"do": true, "dynamic-wind": true, "guard": true,
+	"with-exception-handler": true, "define-record-type": true,
+	"case-lambda": true, "quasiquote": true,
 }
 
 type patternBinding struct {

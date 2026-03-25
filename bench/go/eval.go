@@ -247,8 +247,14 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 		}
 		return handleCallCC(args[0], e.Ln, e.Cl, env)
 	case *ContinuationVal:
-		if len(args) != 1 {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: requires exactly 1 argument", e.Ln, e.Cl)}
+		if len(args) == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: requires at least 1 argument", e.Ln, e.Cl)}
+		}
+		var val Value
+		if len(args) == 1 {
+			val = args[0]
+		} else {
+			val = &MultipleValues{Vals: args}
 		}
 		// If the continuation's enclosing lambda has returned (frame no longer
 		// active), and we're in the same top-level expression, invoking it
@@ -256,9 +262,9 @@ func evalList(e *ListExpr, env *Env) (Value, error) {
 		if f.evalState != nil && !f.evalState.activeContIDs[f.id] &&
 			f.captureFrameID != 0 && !isFrameActive(f.evalState, f.captureFrameID) &&
 			f.evalState.currentExprIdx == f.exprIdx {
-			return args[0], nil
+			return val, nil
 		}
-		panic(&continuationJump{cont: f, value: args[0]})
+		panic(&continuationJump{cont: f, value: val})
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure: %s", e.Ln, e.Cl, fn.String())}
 	}
@@ -416,10 +422,13 @@ func applyCallable(fn Value, args []Value, ln, cl int) (Value, error) {
 	case *CaseLambdaVal:
 		return applyCaseLambda(f, args, ln, cl)
 	case *ContinuationVal:
-		if len(args) != 1 {
-			return nil, &EvalError{Message: "continuation: requires exactly 1 argument"}
+		if len(args) == 0 {
+			return nil, &EvalError{Message: "continuation: requires at least 1 argument"}
 		}
-		panic(&continuationJump{cont: f, value: args[0]})
+		if len(args) == 1 {
+			panic(&continuationJump{cont: f, value: args[0]})
+		}
+		panic(&continuationJump{cont: f, value: &MultipleValues{Vals: args}})
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("not a procedure: %s", fn.String())}
 	}
@@ -1337,10 +1346,13 @@ func builtinApply(args []Value) (Value, error) {
 	case *CaseLambdaVal:
 		return resolveTC(applyCaseLambda(f, callArgs, 0, 0))
 	case *ContinuationVal:
-		if len(callArgs) != 1 {
-			return nil, &EvalError{Message: "continuation: requires exactly 1 argument"}
+		if len(callArgs) == 0 {
+			return nil, &EvalError{Message: "continuation: requires at least 1 argument"}
 		}
-		panic(&continuationJump{cont: f, value: callArgs[0]})
+		if len(callArgs) == 1 {
+			panic(&continuationJump{cont: f, value: callArgs[0]})
+		}
+		panic(&continuationJump{cont: f, value: &MultipleValues{Vals: callArgs}})
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("apply: not a procedure: %s", fn.String())}
 	}
