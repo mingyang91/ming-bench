@@ -66,11 +66,12 @@ object Apply:
         val callEnv                 = setupCallEnv(cparams, crest, args, closure)
         Evaluator.evalBodyCek(cbody, callEnv, k)
       case SchemeVal.SContinuation(savedK, savedWinds) =>
-        if args.length != 1 then throw new EvalError("continuation: expected 1 argument")
+        if args.isEmpty then throw new EvalError("continuation: expected at least 1 argument")
+        val value        = if args.length == 1 then args.head else SchemeVal.SValues(args)
         val currentWinds = Evaluator.windStack.get()
         val actions      = DynWind.computeWindActions(currentWinds, savedWinds)
-        if actions.isEmpty then Evaluator.State.Ko(args.head, savedK)
-        else DynWind.startWindActions(actions, args.head, savedK, savedWinds)(performApply)
+        if actions.isEmpty then Evaluator.State.Ko(value, savedK)
+        else DynWind.startWindActions(actions, value, savedK, savedWinds)(performApply)
       case SchemeVal.SSymbol(name) if name == "call/cc" || name == "call-with-current-continuation" =>
         if args.length != 1 then throw new EvalError("call/cc: expected 1 argument")
         val contVal = SchemeVal.SContinuation(k, Evaluator.windStack.get())

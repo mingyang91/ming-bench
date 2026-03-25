@@ -60,9 +60,10 @@ object Macro:
         if !specialForms.contains(sym) && !Builtins.names.contains(sym) then
           if defBound.contains(sym) then
             defEnv.lookup(sym) match
-              case Some(_: SchemeVal.SMacro) => ()
-              case Some(v)                   => defValues(sym) = v
-              case None                      => ()
+              case Some(_: SchemeVal.SMacro)                               => ()
+              case Some(SchemeVal.SSymbol(n)) if n.startsWith("__record-") => ()
+              case Some(v)                                                 => defValues(sym) = v
+              case None                                                    => ()
           else if bindingNames.contains(sym) then gensymMap(sym) = gensym(sym)
           // else: leave as-is for use-site resolution
       instantiate(template, bindings, defValues.toMap, gensymMap.toMap)
@@ -220,8 +221,9 @@ object Macro:
       if !specialForms.contains(sym) && !Builtins.names.contains(sym) then
         defEnv.lookup(sym) match
           case Some(_: SchemeVal.SMacro) => () // don't inline macros; let normal eval find them
-          case Some(v)                   => defValues(sym) = v
-          case None                      => gensymMap(sym) = gensym(sym)
+          case Some(SchemeVal.SSymbol(n)) if n.startsWith("__record-") => () // don't inline record sentinels
+          case Some(v)                                                 => defValues(sym) = v
+          case None                                                    => gensymMap(sym) = gensym(sym)
 
     instantiate(template, bindings, defValues.toMap, gensymMap.toMap)
 
