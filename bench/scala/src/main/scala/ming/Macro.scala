@@ -40,7 +40,7 @@ object Macro:
 
   /** Match a pattern against an input value. Public API for syntax-case. */
   def matchFull(pattern: SchemeVal, input: SchemeVal, literals: Set[String]): Option[Bindings] =
-    matchOne(pattern, input, literals)
+    MacroMatch.matchOne(pattern, input, literals)
 
   /** Instantiate a template with bindings and hygiene. Public API for syntax-case. */
   def expandTemplate(
@@ -94,172 +94,16 @@ object Macro:
         collectBindingNames(cell.car, patVars) ++ collectBindingNames(cell.cdr, patVars)
       case _ => Set.empty
 
-  /** Flatten a value into (list-elements, optional-tail). */
-  private def flattenVal(v: SchemeVal): (List[SchemeVal], Option[SchemeVal]) =
-    v match
-      case SchemeVal.SList(elems) => (elems, None)
-      case SchemeVal.SPair(cell) =>
-        val (rest, tail) = flattenVal(cell.cdr)
-        (cell.car :: rest, tail)
-      case other => (Nil, Some(other))
-
   /** Expand a macro application. Tries each clause until one matches. */
   def expand(macro_ : SchemeVal.SMacro, form: SchemeVal): SchemeVal =
-    val (formElems, _) = flattenVal(form)
+    val (formElems, _) = MacroMatch.flattenVal(form)
     for (pattern, template) <- macro_.clauses do
-      val (patElems, patTail) = flattenVal(pattern)
-      tryMatchDotted(patElems.tail, patTail, formElems.tail, None, macro_.literals) match
+      val (patElems, patTail) = MacroMatch.flattenVal(pattern)
+      MacroMatch.tryMatchDotted(patElems.tail, patTail, formElems.tail, None, macro_.literals) match
         case Some(bindings) =>
           return instantiateWithHygiene(template, bindings, macro_.defEnv)
         case None => ()
     throw new EvalError("no matching clause in syntax-rules")
-
-  /** Try to match input elements against pattern elements, with optional dotted tail. */
-  private def tryMatchDotted(
-    patElems: List[SchemeVal],
-    patTail: Option[SchemeVal],
-    inElems: List[SchemeVal],
-    inTail: Option[SchemeVal],
-    literals: Set[String]
-  ): Option[Bindings] =
-    val ellipsisIdx = patElems.indexWhere {
-      case SchemeVal.SSymbol("...") => true
-      case _                        => false
-    }
-
-    if ellipsisIdx < 0 then
-      // No ellipsis — match elements and optional tail
-      if patTail.isDefined then
-        // Dotted pattern: match as many elements as we have, then match rest against tail pattern
-        if inElems.length < patElems.length then return None
-        val bindings = mutable.HashMap[String, Either[SchemeVal, List[SchemeVal]]]()
-        for (p, i) <- patElems.zip(inElems) do
-          matchOne(p, i, literals) match
-            case Some(b) => bindings ++= b
-            case None    => return None
-        // Remaining input elements become the cdr to match against patTail
-        val remaining = inElems.drop(patElems.length)
-        val restVal = inTail match
-          case Some(t) if remaining.isEmpty => t
-          case None if remaining.isEmpty    => SchemeVal.SList(Nil)
-          case _ =>
-            // Rebuild the remaining as a list
-            val tail = inTail.getOrElse(SchemeVal.SList(Nil))
-            remaining.foldRight(tail) { (e, acc) =>
-              SchemeVal.SPair(new MutableCell(e, acc))
-            }
-        patTail.get match
-          case SchemeVal.SSymbol(name) if !literals.contains(name) && name != "_" =>
-            bindings(name) = Left(restVal)
-            Some(bindings.toMap)
-          case _ =>
-            matchOne(patTail.get, restVal, literals) match
-              case Some(b) => Some(bindings.toMap ++ b)
-              case None    => None
-      else
-        if patElems.length != inElems.length || inTail.isDefined then return None
-        val bindings = mutable.HashMap[String, Either[SchemeVal, List[SchemeVal]]]()
-        for (p, i) <- patElems.zip(inElems) do
-          matchOne(p, i, literals) match
-            case Some(b) => bindings ++= b
-            case None    => return None
-        Some(bindings.toMap)
-    else
-      if ellipsisIdx == 0 then return None
-      val fixedBefore = patElems.take(ellipsisIdx - 1)
-      val ellipsisPat = patElems(ellipsisIdx - 1)
-      val fixedAfter  = patElems.drop(ellipsisIdx + 1)
-      val minRequired = fixedBefore.length + fixedAfter.length
-      if inElems.length < minRequired then return None
-
-      val bindings = mutable.HashMap[String, Either[SchemeVal, List[SchemeVal]]]()
-
-      // Match fixed elements before ellipsis
-      for (p, i) <- fixedBefore.zip(inElems) do
-        matchOne(p, i, literals) match
-          case Some(b) => bindings ++= b
-          case None    => return None
-
-      // Match ellipsis elements
-      val ellipsisInputs = inElems.slice(fixedBefore.length, inElems.length - fixedAfter.length)
-      val ellipsisVars   = collectPatternVars(ellipsisPat, literals)
-      val accum          = mutable.HashMap[String, mutable.ListBuffer[SchemeVal]]()
-      for v <- ellipsisVars do accum(v) = mutable.ListBuffer()
-
-      for inp <- ellipsisInputs do
-        matchOne(ellipsisPat, inp, literals) match
-          case Some(b) =>
-            for (name, value) <- b do
-              value match
-                case Left(v) => accum.getOrElseUpdate(name, mutable.ListBuffer()) += v
-                case _       => ()
-          case None => return None
-
-      for (name, values) <- accum do bindings(name) = Right(values.toList)
-
-      // Match fixed elements after ellipsis
-      for (p, i) <- fixedAfter.zip(inElems.takeRight(fixedAfter.length)) do
-        matchOne(p, i, literals) match
-          case Some(b) => bindings ++= b
-          case None    => return None
-
-      // Handle dotted tail after ellipsis
-      if patTail.isDefined then
-        val restVal = inTail.getOrElse(SchemeVal.SList(Nil))
-        matchOne(patTail.get, restVal, literals) match
-          case Some(b) => bindings ++= b
-          case None    => return None
-
-      Some(bindings.toMap)
-
-  /** Backward-compatible wrapper for proper list matching. */
-  private def tryMatch(
-    patElems: List[SchemeVal],
-    inElems: List[SchemeVal],
-    literals: Set[String]
-  ): Option[Bindings] =
-    tryMatchDotted(patElems, None, inElems, None, literals)
-
-  /** Match a single pattern element against a single input element. */
-  private def matchOne(
-    pattern: SchemeVal,
-    input: SchemeVal,
-    literals: Set[String]
-  ): Option[Bindings] =
-    pattern match
-      case SchemeVal.SSymbol("_") => Some(Map.empty)
-      case SchemeVal.SSymbol(name) if literals.contains(name) =>
-        input match
-          case SchemeVal.SSymbol(n) if n == name => Some(Map.empty)
-          case _                                 => None
-      case SchemeVal.SSymbol(name) =>
-        Some(Map(name -> Left(input)))
-      case SchemeVal.SList(pElems) =>
-        val (iElems, iTail) = flattenVal(input)
-        tryMatchDotted(pElems, None, iElems, iTail, literals)
-      case SchemeVal.SPair(_) =>
-        val (pElems, pTail) = flattenVal(pattern)
-        val (iElems, iTail) = flattenVal(input)
-        tryMatchDotted(pElems, pTail, iElems, iTail, literals)
-      case SchemeVal.SBool(a) =>
-        input match
-          case SchemeVal.SBool(b) if a == b => Some(Map.empty)
-          case _                            => None
-      case SchemeVal.SInt(a) =>
-        input match
-          case SchemeVal.SInt(b) if a == b => Some(Map.empty)
-          case _                           => None
-      case _ => None
-
-  /** Collect all pattern variable names from a pattern element. */
-  private def collectPatternVars(pattern: SchemeVal, literals: Set[String]): Set[String] =
-    pattern match
-      case SchemeVal.SSymbol(name) if name != "_" && name != "..." && !literals.contains(name) =>
-        Set(name)
-      case SchemeVal.SList(elems) => elems.flatMap(collectPatternVars(_, literals)).toSet
-      case SchemeVal.SPair(cell) =>
-        collectPatternVars(cell.car, literals) ++ collectPatternVars(cell.cdr, literals)
-      case _ => Set.empty
 
   /** Instantiate template with bindings and hygiene (definition-site binding preservation). */
   private def instantiateWithHygiene(
@@ -270,16 +114,14 @@ object Macro:
     val patVars  = bindings.keySet
     val freeSyms = collectFreeSymbols(template, patVars)
 
-    // For free symbols in def env that are not builtins/special forms, capture their values
     val defValues = mutable.HashMap[String, SchemeVal]()
-    // For free symbols NOT in def env, rename with gensym for hygiene
     val gensymMap = mutable.HashMap[String, String]()
 
     for sym <- freeSyms do
       if !specialForms.contains(sym) && !Builtins.names.contains(sym) then
         defEnv.lookup(sym) match
-          case Some(_: SchemeVal.SMacro) => () // don't inline macros; let normal eval find them
-          case Some(SchemeVal.SSymbol(n)) if n.startsWith("__record-") => () // don't inline record sentinels
+          case Some(_: SchemeVal.SMacro)                               => ()
+          case Some(SchemeVal.SSymbol(n)) if n.startsWith("__record-") => ()
           case Some(v)                                                 => defValues(sym) = v
           case None                                                    => gensymMap(sym) = gensym(sym)
 
@@ -291,7 +133,7 @@ object Macro:
       case SchemeVal.SSymbol(name) if !patVars.contains(name) && name != "..." =>
         Set(name)
       case SchemeVal.SList(SchemeVal.SSymbol("quote") :: _) =>
-        Set("quote") // quote is free but its contents are literal data
+        Set("quote")
       case SchemeVal.SList(elems) =>
         elems.flatMap(collectFreeSymbols(_, patVars)).toSet
       case SchemeVal.SPair(cell) =>

@@ -25,11 +25,11 @@ object DefineForms:
       case SchemeVal.SSymbol(name) :: params =>
         val paramNames = params.map {
           case SchemeVal.SSymbol(n) => n
-          case other => throw new EvalError(s"expected parameter name, got ${other.display}")
+          case other                => throw new EvalError(s"expected parameter name, got ${other.display}")
         }
         val restParam = tail.map {
           case SchemeVal.SSymbol(n) => n
-          case other => throw new EvalError(s"expected parameter name, got ${other.display}")
+          case other                => throw new EvalError(s"expected parameter name, got ${other.display}")
         }
         (name, paramNames, restParam)
       case _ => throw new EvalError("define: bad syntax")
@@ -62,11 +62,11 @@ object DefineForms:
         val (elems, tail) = flattenDottedList(v)
         val paramNames = elems.map {
           case SchemeVal.SSymbol(n) => n
-          case other => throw new EvalError(s"expected parameter name, got ${other.display}")
+          case other                => throw new EvalError(s"expected parameter name, got ${other.display}")
         }
         val restParam = tail.map {
           case SchemeVal.SSymbol(n) => n
-          case other => throw new EvalError(s"expected parameter name, got ${other.display}")
+          case other                => throw new EvalError(s"expected parameter name, got ${other.display}")
         }
         (paramNames, restParam)
 

@@ -82,8 +82,8 @@ object Parser:
     tokens match
       case Nil => throw new EvalError("unexpected end of input")
       case t :: rest if t.text == "(" =>
-        val elems     = ListBuffer[SchemeVal]()
-        var remaining = rest
+        val elems                      = ListBuffer[SchemeVal]()
+        var remaining                  = rest
         var dotTail: Option[SchemeVal] = None
         while remaining.nonEmpty && remaining.head.text != ")" do
           if remaining.head.text == "." then

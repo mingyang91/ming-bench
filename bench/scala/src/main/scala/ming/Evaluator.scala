@@ -249,9 +249,9 @@ object Evaluator:
 
   /** Expand quasiquote for list elements, handling unquote-splicing. */
   private def expandQuasiquoteList(elems: List[SchemeVal], env: Env): SchemeVal =
-    val result = scala.collection.mutable.ListBuffer[SchemeVal]()
+    val result          = scala.collection.mutable.ListBuffer[SchemeVal]()
     var tail: SchemeVal = SchemeVal.SList(Nil)
-    var i = 0
+    var i               = 0
     while i < elems.length do
       elems(i) match
         case SchemeVal.SList(SchemeVal.SSymbol("unquote-splicing") :: expr :: Nil) =>
