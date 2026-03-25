@@ -1,7 +1,7 @@
 use std::fmt;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ptr;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 type Frame = Rc<RefCell<HashMap<String, Value>>>;
@@ -21,6 +21,8 @@ pub struct MacroData {
     pub def_env: Env,
 }
 
+pub type ConsCell = Rc<RefCell<(Value, Value)>>;
+
 #[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
@@ -30,8 +32,8 @@ pub enum Value {
     Char(char),
     Str(String, bool),  // (content, mutable?)
     Symbol(String),
-    List(Vec<Value>),
-    Pair(Box<Value>, Box<Value>),
+    Nil,                // empty list ()
+    Pair(ConsCell),     // mutable shared cons cell
     Lambda(Rc<LambdaData>),
     Macro(Rc<MacroData>),
     CaseLambda(Vec<Rc<LambdaData>>),   // multiple arity clauses
@@ -72,6 +74,85 @@ impl Value {
         }
     }
 
+    pub fn cons(car: Value, cdr: Value) -> Value {
+        Value::Pair(Rc::new(RefCell::new((car, cdr))))
+    }
+
+    pub fn from_vec(v: Vec<Value>) -> Value {
+        let mut result = Value::Nil;
+        for val in v.into_iter().rev() {
+            result = Value::cons(val, result);
+        }
+        result
+    }
+
+    /// Convert a proper list (pair chain ending in Nil) to a Vec.
+    /// Returns None for improper lists or non-lists.
+    pub fn to_vec(&self) -> Option<Vec<Value>> {
+        let mut result = Vec::new();
+        let mut current = self.clone();
+        let mut seen = HashSet::new();
+        loop {
+            match current {
+                Value::Nil => return Some(result),
+                Value::Pair(cell) => {
+                    let ptr = Rc::as_ptr(&cell) as usize;
+                    if !seen.insert(ptr) {
+                        return None; // cycle detected
+                    }
+                    let (car, cdr) = {
+                        let borrowed = cell.borrow();
+                        (borrowed.0.clone(), borrowed.1.clone())
+                    };
+                    result.push(car);
+                    current = cdr;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Check if this is a proper list (pair chain ending in Nil), with cycle detection.
+    pub fn is_proper_list(&self) -> bool {
+        fn advance(v: &Value) -> Option<Value> {
+            match v {
+                Value::Pair(cell) => Some(cell.borrow().1.clone()),
+                _ => None,
+            }
+        }
+        // Tortoise and hare algorithm
+        let mut slow = self.clone();
+        let mut fast = self.clone();
+        loop {
+            // Advance fast by one
+            match &fast {
+                Value::Nil => return true,
+                Value::Pair(_) => {}
+                _ => return false,
+            }
+            fast = advance(&fast).unwrap();
+            // Advance fast by another one
+            match &fast {
+                Value::Nil => return true,
+                Value::Pair(_) => {}
+                _ => return false,
+            }
+            fast = advance(&fast).unwrap();
+            // Advance slow by one
+            match &slow {
+                Value::Pair(_) => {}
+                _ => return false,
+            }
+            slow = advance(&slow).unwrap();
+            // Check if slow and fast point to the same cell
+            if let (Value::Pair(s), Value::Pair(f)) = (&slow, &fast) {
+                if Rc::ptr_eq(s, f) {
+                    return false; // cycle
+                }
+            }
+        }
+    }
+
     /// Convert to f64 for cross-type arithmetic
     pub fn to_f64(&self) -> Option<f64> {
         match self {
@@ -97,25 +178,41 @@ impl Value {
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::Integer(a), Value::Integer(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => a == b,
-            (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
-            (Value::Boolean(a), Value::Boolean(b)) => a == b,
-            (Value::Char(a), Value::Char(b)) => a == b,
-            (Value::Str(a, _), Value::Str(b, _)) => a == b,
-            (Value::Symbol(a), Value::Symbol(b)) => a == b,
-            (Value::List(a), Value::List(b)) => a == b,
-            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
-            (Value::Vector(a), Value::Vector(b)) => {
-                ptr::eq(a.as_ptr(), b.as_ptr()) || *a.borrow() == *b.borrow()
+        equal_with_cycle_check(self, other, &mut HashSet::new())
+    }
+}
+
+fn equal_with_cycle_check(a: &Value, b: &Value, seen: &mut HashSet<(usize, usize)>) -> bool {
+    match (a, b) {
+        (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
+        (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
+        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+        (Value::Char(a), Value::Char(b)) => a == b,
+        (Value::Str(a, _), Value::Str(b, _)) => a == b,
+        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+        (Value::Nil, Value::Nil) => true,
+        (Value::Pair(a), Value::Pair(b)) => {
+            if Rc::ptr_eq(a, b) {
+                return true;
             }
-            (Value::CaseLambda(_), Value::CaseLambda(_)) => false,
-            (Value::Macro(_), Value::Macro(_)) => false,
-            (Value::Record(t1, f1), Value::Record(t2, f2)) => t1 == t2 && f1 == f2,
-            (Value::Void, Value::Void) => true,
-            _ => false,
+            let key = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
+            if !seen.insert(key) {
+                return true; // already comparing these — assume equal to break cycle
+            }
+            let ab = a.borrow();
+            let bb = b.borrow();
+            equal_with_cycle_check(&ab.0, &bb.0, seen)
+                && equal_with_cycle_check(&ab.1, &bb.1, seen)
         }
+        (Value::Vector(a), Value::Vector(b)) => {
+            std::ptr::eq(a.as_ptr(), b.as_ptr()) || *a.borrow() == *b.borrow()
+        }
+        (Value::CaseLambda(_), Value::CaseLambda(_)) => false,
+        (Value::Macro(_), Value::Macro(_)) => false,
+        (Value::Record(t1, f1), Value::Record(t2, f2)) => t1 == t2 && f1 == f2,
+        (Value::Void, Value::Void) => true,
+        _ => false,
     }
 }
 
@@ -173,6 +270,38 @@ impl Env {
     }
 }
 
+/// Format a value as a pair/list, with cycle detection.
+fn fmt_pair(cell: &ConsCell, f: &mut dyn FnMut(&Value) -> String) -> String {
+    let mut parts = Vec::new();
+    let mut current = Value::Pair(cell.clone());
+    let mut seen = HashSet::new();
+
+    loop {
+        match current {
+            Value::Pair(c) => {
+                let ptr = Rc::as_ptr(&c) as usize;
+                if !seen.insert(ptr) {
+                    parts.push("...".to_string());
+                    break;
+                }
+                let (car, cdr) = {
+                    let borrowed = c.borrow();
+                    (borrowed.0.clone(), borrowed.1.clone())
+                };
+                parts.push(f(&car));
+                current = cdr;
+            }
+            Value::Nil => break,
+            other => {
+                let last = parts.pop().unwrap();
+                parts.push(format!("{} . {}", last, f(&other)));
+                break;
+            }
+        }
+    }
+    format!("({})", parts.join(" "))
+}
+
 impl Value {
     pub fn to_display_string(&self) -> String {
         match self {
@@ -195,11 +324,8 @@ impl Value {
             }),
             Value::Str(s, _) => format!("\"{}\"", s),
             Value::Symbol(s) => s.clone(),
-            Value::List(elems) => {
-                let inner: Vec<String> = elems.iter().map(|v| v.to_display_string()).collect();
-                format!("({})", inner.join(" "))
-            }
-            Value::Pair(a, b) => format!("({} . {})", a.to_display_string(), b.to_display_string()),
+            Value::Nil => "()".into(),
+            Value::Pair(cell) => fmt_pair(cell, &mut |v| v.to_display_string()),
             Value::Lambda(_) | Value::CaseLambda(_) => "#<procedure>".into(),
             Value::Macro(_) => "#<macro>".into(),
             Value::Vector(v) => {
@@ -212,7 +338,7 @@ impl Value {
         }
     }
 
-    /// Format for `display` — no quotes on strings, raw chars
+    /// Format for `write` — with quotes on strings, etc.
     pub fn to_write_string(&self) -> String {
         self.to_display_string()
     }
@@ -229,11 +355,8 @@ impl Value {
                     format!("{}", f)
                 }
             }
-            Value::List(elems) => {
-                let inner: Vec<String> = elems.iter().map(|v| v.to_scheme_display()).collect();
-                format!("({})", inner.join(" "))
-            }
-            Value::Pair(a, b) => format!("({} . {})", a.to_scheme_display(), b.to_scheme_display()),
+            Value::Nil => "()".into(),
+            Value::Pair(cell) => fmt_pair(cell, &mut |v| v.to_scheme_display()),
             Value::Vector(v) => {
                 let elems: Vec<String> = v.borrow().iter().map(|e| e.to_scheme_display()).collect();
                 format!("#({})", elems.join(" "))
