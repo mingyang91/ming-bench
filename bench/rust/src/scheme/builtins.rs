@@ -341,6 +341,11 @@ pub fn builtin_is_char(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
     Ok(Val::Bool(matches!(args[0], Val::Char(_))))
 }
 
+pub fn builtin_is_procedure(args: &[Val], _env: &Env) -> Result<Val, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("procedure?: expected 1 argument".into())); }
+    Ok(Val::Bool(matches!(args[0], Val::Lambda { .. } | Val::CaseLambda { .. } | Val::Builtin(_))))
+}
+
 fn display_format(val: &Val) -> String {
     match val {
         Val::Str(s) => s.clone(),

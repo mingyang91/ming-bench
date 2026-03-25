@@ -36,6 +36,10 @@ pub(crate) enum Val {
         body: Vec<Expr>,
         env: Env,
     },
+    CaseLambda {
+        clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>)>,
+        env: Env,
+    },
     Builtin(BuiltinFn),
     Macro {
         literals: Vec<String>,
@@ -121,7 +125,7 @@ impl fmt::Display for Val {
                 }
                 write!(f, ")")
             }
-            Val::Lambda { .. } | Val::Builtin(..) | Val::Macro { .. } => write!(f, "#<procedure>"),
+            Val::Lambda { .. } | Val::CaseLambda { .. } | Val::Builtin(..) | Val::Macro { .. } => write!(f, "#<procedure>"),
             Val::Void => write!(f, "#<void>"),
         }
     }
@@ -215,6 +219,7 @@ impl Env {
             ("inexact->exact", builtin_inexact_to_exact),
             ("numerator", builtin_numerator),
             ("denominator", builtin_denominator),
+            ("procedure?", builtin_is_procedure),
         ];
         for &(name, f) in builtins {
             frame.borrow_mut().insert(name.to_string(), Val::Builtin(f));
@@ -511,6 +516,7 @@ fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
                     "string-set!" => return eval_string_set(&elems[1..], env, span),
                     "define-syntax" => return eval_define_syntax(&elems[1..], env, span),
                     "define-record-type" => return eval_define_record_type(&elems[1..], env, span),
+                    "case-lambda" => return eval_case_lambda(&elems[1..], env, span),
                     _ => {
                         if let Some(Val::Macro { literals, rules, def_env }) = env.get(op) {
                             return eval_macro_call(elems, &literals, &rules, &def_env, env, span);
@@ -561,6 +567,32 @@ pub(crate) fn apply_val(func: &Val, args: &[Val], caller_env: &Env) -> Result<Va
                 }
                 Ok(result)
             }
+        }
+        Val::CaseLambda { clauses, env } => {
+            for (params, rest_param, body) in clauses {
+                let matches = if let Some(_rest) = rest_param {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    let new_env = env.push();
+                    for (p, a) in params.iter().zip(args.iter()) {
+                        new_env.define(p.clone(), a.clone());
+                    }
+                    if let Some(rest) = rest_param {
+                        new_env.define(rest.clone(), Val::List(args[params.len()..].to_vec()));
+                    }
+                    let mut result = Val::Void;
+                    for expr in body {
+                        result = eval(expr, &new_env)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            Err(EvalError::Arity(format!(
+                "no matching clause for {} arguments", args.len()
+            )))
         }
         Val::Builtin(f) => f(args, caller_env),
         _ => Err(EvalError::Type("not a procedure".into())),
@@ -1124,6 +1156,28 @@ fn eval_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
         body,
         env: env.clone(),
     })
+}
+
+fn eval_case_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Val, EvalError> {
+    let mut clauses = Vec::new();
+    for clause in args {
+        match &clause.kind {
+            ExprKind::List(elems) => {
+                if elems.is_empty() {
+                    return Err(EvalError::Parse(format!("case-lambda: empty clause at {span}")));
+                }
+                let (params, rest_param) = match &elems[0].kind {
+                    ExprKind::List(param_exprs) => parse_params(param_exprs, span)?,
+                    ExprKind::Symbol(s) => (vec![], Some(s.clone())),
+                    _ => return Err(EvalError::Parse(format!("case-lambda: expected parameter list at {span}"))),
+                };
+                let body = elems[1..].to_vec();
+                clauses.push((params, rest_param, body));
+            }
+            _ => return Err(EvalError::Parse(format!("case-lambda: expected clause at {span}"))),
+        }
+    }
+    Ok(Val::CaseLambda { clauses, env: env.clone() })
 }
 
 fn eval_and(exprs: &[Expr], env: &Env) -> Result<Val, EvalError> {
