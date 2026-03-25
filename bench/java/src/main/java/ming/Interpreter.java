@@ -203,11 +203,29 @@ public class Interpreter {
             if (!(args[0] instanceof SchemeValue.StringVal s))
                 throw new EvalError("string-ref: expected string");
             int idx = (int) asLong(args[1]);
-            return new SchemeValue.CharVal(s.value().charAt(idx));
+            return new SchemeValue.CharVal(s.charAt(idx));
         }));
         globals.define("char?", new SchemeValue.BuiltinVal("char?", args -> {
             if (args.length != 1) throw new EvalError("char?: expected 1 argument");
             return new SchemeValue.BoolVal(args[0] instanceof SchemeValue.CharVal);
+        }));
+
+        // L06 builtins
+        globals.define("string-copy", new SchemeValue.BuiltinVal("string-copy", args -> {
+            if (args.length != 1) throw new EvalError("string-copy: expected 1 argument");
+            if (!(args[0] instanceof SchemeValue.StringVal s))
+                throw new EvalError("string-copy: expected string");
+            return new SchemeValue.StringVal(s.value());
+        }));
+        globals.define("string-set!", new SchemeValue.BuiltinVal("string-set!", args -> {
+            if (args.length != 3) throw new EvalError("string-set!: expected 3 arguments");
+            if (!(args[0] instanceof SchemeValue.StringVal s))
+                throw new EvalError("string-set!: expected string");
+            int idx = (int) asLong(args[1]);
+            if (!(args[2] instanceof SchemeValue.CharVal c))
+                throw new EvalError("string-set!: expected char");
+            s.setCharAt(idx, c.value());
+            return new SchemeValue.VoidVal();
         }));
     }
 

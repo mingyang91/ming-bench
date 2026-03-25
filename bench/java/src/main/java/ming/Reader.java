@@ -113,6 +113,25 @@ public class Reader {
         } else if (next == 'f') {
             pos += 2;
             return new SchemeValue.BoolVal(false);
+        } else if (next == '\\') {
+            pos += 2; // skip #\
+            if (pos >= input.length()) throw new EvalError("unexpected end of input after #\\");
+            // Check for named characters
+            int start = pos;
+            while (pos < input.length() && !Character.isWhitespace(input.charAt(pos))
+                    && input.charAt(pos) != ')' && input.charAt(pos) != '(') {
+                pos++;
+            }
+            String name = input.substring(start, pos);
+            if (name.length() == 1) {
+                return new SchemeValue.CharVal(name.charAt(0));
+            }
+            return switch (name.toLowerCase()) {
+                case "space" -> new SchemeValue.CharVal(' ');
+                case "newline" -> new SchemeValue.CharVal('\n');
+                case "tab" -> new SchemeValue.CharVal('\t');
+                default -> throw new EvalError("unknown character name: " + name);
+            };
         }
         throw new EvalError("unknown hash literal: #" + next);
     }
