@@ -124,6 +124,7 @@ enum Token {
     Boolean(bool),
     Str(String),
     Symbol(String),
+    Char(char),
 }
 
 fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, EvalError> {
@@ -215,6 +216,35 @@ fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, EvalError> {
                             i += 2;
                             col += 2;
                         }
+                        '\\' => {
+                            // Character literal: #\x or #\space, #\newline, etc.
+                            if i + 2 >= chars.len() {
+                                return Err(EvalError::Parse(format!("at {span}: incomplete character literal")));
+                            }
+                            // Read the character name
+                            let start = i + 2;
+                            let mut end = start;
+                            while end < chars.len()
+                                && !matches!(chars[end], ' ' | '\t' | '\n' | '\r' | '(' | ')' | ';' | '"')
+                            {
+                                end += 1;
+                            }
+                            let name: String = chars[start..end].iter().collect();
+                            let c = if name.len() == 1 {
+                                name.chars().next().expect("non-empty name guaranteed by len check")
+                            } else {
+                                match name.as_str() {
+                                    "space" => ' ',
+                                    "newline" => '\n',
+                                    "tab" => '\t',
+                                    _ => return Err(EvalError::Parse(format!("at {span}: unknown character name: {name}"))),
+                                }
+                            };
+                            tokens.push((Token::Char(c), span));
+                            let consumed = end - i;
+                            col += consumed;
+                            i = end;
+                        }
                         _ => {
                             return Err(EvalError::Parse(format!(
                                 "at {span}: unexpected character after #: {}",
@@ -258,6 +288,7 @@ struct Expr {
 enum ExprKind {
     Integer(i64),
     Boolean(bool),
+    Char(char),
     Str(String),
     Symbol(String),
     List(Vec<Expr>),
@@ -285,6 +316,11 @@ fn parse_tokens(tokens: &[(Token, Span)], pos: &mut usize) -> Result<Expr, EvalE
             let b = *b;
             *pos += 1;
             Ok(Expr::new(ExprKind::Boolean(b), span))
+        }
+        Token::Char(c) => {
+            let c = *c;
+            *pos += 1;
+            Ok(Expr::new(ExprKind::Char(c), span))
         }
         Token::Str(s) => {
             let s = s.clone();
@@ -363,6 +399,17 @@ impl Env {
 
     fn set(&mut self, name: String, val: Value) {
         self.bindings.insert(name, val);
+    }
+
+    fn set_existing(&mut self, name: &str, val: Value) -> bool {
+        if self.bindings.contains_key(name) {
+            self.bindings.insert(name.to_string(), val);
+            true
+        } else if let Some(parent) = &self.parent {
+            parent.borrow_mut().set_existing(name, val)
+        } else {
+            false
+        }
     }
 }
 
@@ -737,6 +784,16 @@ fn builtin_char_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
     Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
 }
 
+fn builtin_string_copy(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("at {span}: string-copy requires 1 argument")));
+    }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::Str(s.clone())),
+        _ => Err(EvalError::Type(format!("at {span}: string-copy expects a string"))),
+    }
+}
+
 fn default_env() -> EnvRef {
     let env = Env::new(None);
     {
@@ -774,6 +831,7 @@ fn default_env() -> EnvRef {
         e.set("string->symbol".into(), Value::Builtin("string->symbol".into(), builtin_string_to_symbol));
         e.set("string-ref".into(), Value::Builtin("string-ref".into(), builtin_string_ref));
         e.set("char?".into(), Value::Builtin("char?".into(), builtin_char_pred));
+        e.set("string-copy".into(), Value::Builtin("string-copy".into(), builtin_string_copy));
     }
 
     env
@@ -785,6 +843,7 @@ fn expr_to_value(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Integer(n) => Value::Integer(*n),
         ExprKind::Boolean(b) => Value::Boolean(*b),
+        ExprKind::Char(c) => Value::Char(*c),
         ExprKind::Str(s) => Value::Str(s.clone()),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
         ExprKind::List(elems) => {
@@ -832,6 +891,7 @@ fn eval(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Str(s) => Ok(Value::Str(s.clone())),
         ExprKind::Symbol(name) => env
             .borrow()
@@ -1008,6 +1068,34 @@ fn eval(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                             }
                         }
                         return Ok(result);
+                    }
+                    "string-set!" => {
+                        if elems.len() != 4 {
+                            return Err(EvalError::Arity(format!("at {span}: string-set! requires 3 arguments")));
+                        }
+                        let var_name = match &elems[1].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Type(format!("at {span}: string-set! expects a variable name"))),
+                        };
+                        let idx = eval(&elems[2], env)?;
+                        let ch = eval(&elems[3], env)?;
+                        let (Value::Integer(i), Value::Char(c)) = (&idx, &ch) else {
+                            return Err(EvalError::Type(format!("at {span}: string-set! expects (string int char)")));
+                        };
+                        let i = *i as usize;
+                        let current = env.borrow().get(&var_name)
+                            .ok_or_else(|| EvalError::UnboundVariable(format!("at {span}: {var_name}")))?;
+                        let Value::Str(mut s) = current else {
+                            return Err(EvalError::Type(format!("at {span}: string-set! expects a string")));
+                        };
+                        let mut chars: Vec<char> = s.chars().collect();
+                        if i >= chars.len() {
+                            return Err(EvalError::Type(format!("at {span}: string-set!: index out of range")));
+                        }
+                        chars[i] = *c;
+                        s = chars.into_iter().collect();
+                        env.borrow_mut().set_existing(&var_name, Value::Str(s));
+                        return Ok(Value::Void);
                     }
                     _ => {}
                 }
