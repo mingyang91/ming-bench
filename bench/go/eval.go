@@ -2,7 +2,53 @@ package ming
 
 import "fmt"
 
-// bindLambdaEnv creates a new environment binding lambda parameters to arguments.
+// ===================== CEK Machine Continuation Frames =====================
+
+type KTag int
+
+const (
+	KHalt           KTag = iota
+	KTopLevel
+	KBody
+	KDefine
+	KSetBang
+	KIfTest
+	KEvFun
+	KEvArgs
+	KAnd
+	KOr
+	KCondClauses
+	KLetBind
+	KLetStarBind
+	KLetrecBind
+	KLetrecStarBind
+	KCaseKey
+)
+
+type KontFrame struct {
+	Tag  KTag
+	Next *KontFrame
+
+	Env        *Env
+	Exprs      []*Expr
+	Name       string
+	Names      []string
+	Vals       []*Value
+	Fn         *Value
+	Conseq     *Expr
+	Alt        *Expr
+	Line, Col  int
+	OrigExpr   *Expr
+	BodyExprs  []*Expr
+	LetEnv     *Env
+	NamedLet   string
+	Clauses    []*Expr
+	ClauseBody []*Expr
+	Result     *Value
+}
+
+// ===================== Lambda/CaseLambda Binding =====================
+
 func bindLambdaEnv(fn *Value, args []*Value, line, col int) (*Env, error) {
 	if fn.RestParam != "" {
 		if len(args) < len(fn.Params) {
@@ -29,7 +75,6 @@ func bindLambdaEnv(fn *Value, args []*Value, line, col int) (*Env, error) {
 	return callEnv, nil
 }
 
-// bindCaseLambdaEnv finds the matching clause and creates the call environment.
 func bindCaseLambdaEnv(fn *Value, args []*Value, line, col int) (*Env, []*Expr, error) {
 	for _, clause := range fn.CaseClauses {
 		if clause.RestParam != "" {
@@ -56,517 +101,917 @@ func bindCaseLambdaEnv(fn *Value, args []*Value, line, col int) (*Env, []*Expr, 
 	return nil, nil, fmt.Errorf("%d:%d: no matching clause in case-lambda for %d arguments", line, col, len(args))
 }
 
-// Eval evaluates an expression in the given environment.
-// Uses a trampoline loop for tail-call optimization.
+// ===================== Entry Points =====================
+
 func Eval(expr *Expr, env *Env) (*Value, error) {
+	return cekEval(expr, env, &KontFrame{Tag: KHalt})
+}
+
+func cekEvalAll(exprs []*Expr, env *Env) (*Value, error) {
+	if len(exprs) == 0 {
+		return Void, nil
+	}
+	kont := &KontFrame{Tag: KHalt}
+	if len(exprs) > 1 {
+		kont = &KontFrame{Tag: KTopLevel, Exprs: exprs[1:], Env: env, Next: &KontFrame{Tag: KHalt}}
+	}
+	return cekEval(exprs[0], env, kont)
+}
+
+// ===================== Main CEK Loop =====================
+
+func cekEval(startExpr *Expr, startEnv *Env, startKont *KontFrame) (*Value, error) {
+	expr := startExpr
+	env := startEnv
+	kont := startKont
+	var val *Value
+	evaluating := true
+
 	for {
-		switch expr.Type {
-		case ExprInteger:
-			return IntValue(expr.IntVal), nil
-		case ExprBoolean:
-			return BoolValue(expr.BoolVal), nil
-		case ExprString:
-			return StringValue(expr.StrVal), nil
-		case ExprChar:
-			runes := []rune(expr.StrVal)
-			return CharValue(runes[0]), nil
-		case ExprFloat:
-			return FloatValue(expr.FloatVal), nil
-		case ExprRational:
-			return RationalValue(expr.Num, expr.Den), nil
-		case ExprSymbol:
-			val, ok := env.Get(expr.StrVal)
-			if !ok {
-				return nil, fmt.Errorf("%d:%d: unbound variable '%s'", expr.Line, expr.Col, expr.StrVal)
-			}
-			return val, nil
-		case ExprLiteral:
-			return expr.LitVal, nil
-		case ExprList:
-			if len(expr.Elements) == 0 {
-				return nil, fmt.Errorf("%d:%d: empty application", expr.Line, expr.Col)
-			}
+		if evaluating {
+			// ==================== EVAL MODE ====================
+			switch expr.Type {
+			case ExprInteger:
+				val = IntValue(expr.IntVal)
+				evaluating = false
+			case ExprBoolean:
+				val = BoolValue(expr.BoolVal)
+				evaluating = false
+			case ExprString:
+				val = StringValue(expr.StrVal)
+				evaluating = false
+			case ExprChar:
+				val = CharValue([]rune(expr.StrVal)[0])
+				evaluating = false
+			case ExprFloat:
+				val = FloatValue(expr.FloatVal)
+				evaluating = false
+			case ExprRational:
+				val = RationalValue(expr.Num, expr.Den)
+				evaluating = false
+			case ExprLiteral:
+				val = expr.LitVal
+				evaluating = false
+			case ExprSymbol:
+				v, ok := env.Get(expr.StrVal)
+				if !ok {
+					return nil, fmt.Errorf("%d:%d: unbound variable '%s'", expr.Line, expr.Col, expr.StrVal)
+				}
+				val = v
+				evaluating = false
 
-			head := expr.Elements[0]
-			if head.Type == ExprSymbol {
-				switch head.StrVal {
-				// Non-tail forms — return directly
-				case "define":
-					return evalDefine(expr, env)
-				case "set!":
-					return evalSetBang(expr, env)
-				case "quote":
-					return evalQuote(expr)
-				case "lambda":
-					return evalLambda(expr, env)
-				case "case-lambda":
-					return evalCaseLambda(expr, env)
-				case "define-syntax":
-					return evalDefineSyntax(expr, env)
-				case "define-record-type":
-					return evalDefineRecordType(expr, env)
-				case "do":
-					return evalDo(expr, env)
+			case ExprList:
+				if len(expr.Elements) == 0 {
+					return nil, fmt.Errorf("%d:%d: empty application", expr.Line, expr.Col)
+				}
+				head := expr.Elements[0]
 
-				// Tail forms — update expr/env and continue trampoline
-				case "if":
-					if len(expr.Elements) < 3 || len(expr.Elements) > 4 {
-						return nil, fmt.Errorf("%d:%d: 'if' requires 2 or 3 arguments", expr.Line, expr.Col)
-					}
-					cond, err := Eval(expr.Elements[1], env)
-					if err != nil {
-						return nil, err
-					}
-					if isTruthy(cond) {
+				isSpecial := false
+				if head.Type == ExprSymbol {
+					switch head.StrVal {
+					case "quote":
+						v, err := evalQuote(expr)
+						if err != nil {
+							return nil, err
+						}
+						val = v
+						evaluating = false
+						isSpecial = true
+
+					case "lambda":
+						v, err := evalLambda(expr, env)
+						if err != nil {
+							return nil, err
+						}
+						val = v
+						evaluating = false
+						isSpecial = true
+
+					case "case-lambda":
+						v, err := evalCaseLambda(expr, env)
+						if err != nil {
+							return nil, err
+						}
+						val = v
+						evaluating = false
+						isSpecial = true
+
+					case "define-syntax":
+						v, err := evalDefineSyntax(expr, env)
+						if err != nil {
+							return nil, err
+						}
+						val = v
+						evaluating = false
+						isSpecial = true
+
+					case "define-record-type":
+						v, err := evalDefineRecordType(expr, env)
+						if err != nil {
+							return nil, err
+						}
+						val = v
+						evaluating = false
+						isSpecial = true
+
+					case "do":
+						v, err := evalDo(expr, env)
+						if err != nil {
+							return nil, err
+						}
+						val = v
+						evaluating = false
+						isSpecial = true
+
+					case "define":
+						if len(expr.Elements) < 3 {
+							return nil, fmt.Errorf("%d:%d: 'define' requires at least 2 arguments", expr.Line, expr.Col)
+						}
+						target := expr.Elements[1]
+						if target.Type == ExprList && len(target.Elements) > 0 {
+							fname := target.Elements[0]
+							if fname.Type != ExprSymbol {
+								return nil, fmt.Errorf("%d:%d: expected symbol in define", expr.Line, expr.Col)
+							}
+							params, restParam, err := parseParams(target.Elements[1:])
+							if err != nil {
+								return nil, err
+							}
+							env.Set(fname.StrVal, &Value{
+								Type: TypeLambda, Params: params, RestParam: restParam,
+								Body: expr.Elements[2:], ClosureEnv: env,
+							})
+							val = Void
+							evaluating = false
+						} else {
+							if target.Type != ExprSymbol {
+								return nil, fmt.Errorf("%d:%d: expected symbol after define", expr.Line, expr.Col)
+							}
+							kont = &KontFrame{Tag: KDefine, Name: target.StrVal, Env: env, Next: kont}
+							expr = expr.Elements[2]
+						}
+						isSpecial = true
+
+					case "set!":
+						if len(expr.Elements) != 3 {
+							return nil, fmt.Errorf("%d:%d: 'set!' requires exactly 2 arguments", expr.Line, expr.Col)
+						}
+						target := expr.Elements[1]
+						if target.Type != ExprSymbol {
+							return nil, fmt.Errorf("%d:%d: 'set!' expects a symbol", expr.Line, expr.Col)
+						}
+						kont = &KontFrame{Tag: KSetBang, Name: target.StrVal, Env: env, Line: expr.Line, Col: expr.Col, Next: kont}
 						expr = expr.Elements[2]
+						isSpecial = true
+
+					case "if":
+						if len(expr.Elements) < 3 || len(expr.Elements) > 4 {
+							return nil, fmt.Errorf("%d:%d: 'if' requires 2 or 3 arguments", expr.Line, expr.Col)
+						}
+						var alt *Expr
+						if len(expr.Elements) == 4 {
+							alt = expr.Elements[3]
+						}
+						kont = &KontFrame{Tag: KIfTest, Conseq: expr.Elements[2], Alt: alt, Env: env, Next: kont}
+						expr = expr.Elements[1]
+						isSpecial = true
+
+					case "begin":
+						if len(expr.Elements) < 2 {
+							val = Void
+							evaluating = false
+						} else {
+							body := expr.Elements[1:]
+							if len(body) > 1 {
+								kont = &KontFrame{Tag: KBody, Exprs: body[1:], Env: env, Next: kont}
+							}
+							expr = body[0]
+						}
+						isSpecial = true
+
+					case "and":
+						if len(expr.Elements) == 1 {
+							val = True
+							evaluating = false
+						} else if len(expr.Elements) == 2 {
+							expr = expr.Elements[1]
+						} else {
+							kont = &KontFrame{Tag: KAnd, Exprs: expr.Elements[2:], Env: env, Next: kont}
+							expr = expr.Elements[1]
+						}
+						isSpecial = true
+
+					case "or":
+						if len(expr.Elements) == 1 {
+							val = False
+							evaluating = false
+						} else if len(expr.Elements) == 2 {
+							expr = expr.Elements[1]
+						} else {
+							kont = &KontFrame{Tag: KOr, Exprs: expr.Elements[2:], Env: env, Next: kont}
+							expr = expr.Elements[1]
+						}
+						isSpecial = true
+
+					case "cond":
+						clauses := expr.Elements[1:]
+						if len(clauses) == 0 {
+							val = Void
+							evaluating = false
+						} else {
+							cekStartCondClause(clauses[0], clauses[1:], env, kont,
+								&expr, &env, &kont, &val, &evaluating)
+						}
+						isSpecial = true
+
+					case "let":
+						err := cekStartLet(expr, env, kont, &expr, &env, &kont, &val, &evaluating)
+						if err != nil {
+							return nil, err
+						}
+						isSpecial = true
+
+					case "let*":
+						err := cekStartLetStar(expr, env, kont, &expr, &env, &kont, &val, &evaluating)
+						if err != nil {
+							return nil, err
+						}
+						isSpecial = true
+
+					case "letrec":
+						err := cekStartLetrec(expr, env, kont, false, &expr, &env, &kont, &val, &evaluating)
+						if err != nil {
+							return nil, err
+						}
+						isSpecial = true
+
+					case "letrec*":
+						err := cekStartLetrec(expr, env, kont, true, &expr, &env, &kont, &val, &evaluating)
+						if err != nil {
+							return nil, err
+						}
+						isSpecial = true
+
+					case "case":
+						if len(expr.Elements) < 3 {
+							return nil, fmt.Errorf("%d:%d: 'case' requires key and clauses", expr.Line, expr.Col)
+						}
+						kont = &KontFrame{
+							Tag: KCaseKey, Clauses: expr.Elements[2:],
+							Env: env, Line: expr.Line, Col: expr.Col, Next: kont,
+						}
+						expr = expr.Elements[1]
+						isSpecial = true
+					}
+
+					if isSpecial {
 						continue
 					}
-					if len(expr.Elements) == 4 {
-						expr = expr.Elements[3]
+
+					// Not a special form — check for macro
+					if macroVal, ok := env.Get(head.StrVal); ok && macroVal.Type == TypeMacro {
+						expanded, err := expandMacro(macroVal.Macro, expr)
+						if err != nil {
+							return nil, err
+						}
+						expr = expanded
 						continue
 					}
-					return Void, nil
-
-				case "begin":
-					if len(expr.Elements) < 2 {
-						return Void, nil
-					}
-					for _, e := range expr.Elements[1 : len(expr.Elements)-1] {
-						_, err := Eval(e, env)
-						if err != nil {
-							return nil, err
-						}
-					}
-					expr = expr.Elements[len(expr.Elements)-1]
-					continue
-
-				case "and":
-					if len(expr.Elements) == 1 {
-						return True, nil
-					}
-					for _, e := range expr.Elements[1 : len(expr.Elements)-1] {
-						val, err := Eval(e, env)
-						if err != nil {
-							return nil, err
-						}
-						if !isTruthy(val) {
-							return val, nil
-						}
-					}
-					expr = expr.Elements[len(expr.Elements)-1]
-					continue
-
-				case "or":
-					if len(expr.Elements) == 1 {
-						return False, nil
-					}
-					for _, e := range expr.Elements[1 : len(expr.Elements)-1] {
-						val, err := Eval(e, env)
-						if err != nil {
-							return nil, err
-						}
-						if isTruthy(val) {
-							return val, nil
-						}
-					}
-					expr = expr.Elements[len(expr.Elements)-1]
-					continue
-
-				case "cond":
-					found := false
-					for _, clause := range expr.Elements[1:] {
-						if clause.Type != ExprList || len(clause.Elements) < 1 {
-							return nil, fmt.Errorf("%d:%d: invalid cond clause", expr.Line, expr.Col)
-						}
-						isElse := clause.Elements[0].Type == ExprSymbol && clause.Elements[0].StrVal == "else"
-						if !isElse {
-							test, err := Eval(clause.Elements[0], env)
-							if err != nil {
-								return nil, err
-							}
-							if !isTruthy(test) {
-								continue
-							}
-							if len(clause.Elements) == 1 {
-								return test, nil
-							}
-						}
-						// Matched — evaluate body with TCO on last
-						body := clause.Elements[1:]
-						for _, e := range body[:len(body)-1] {
-							_, err := Eval(e, env)
-							if err != nil {
-								return nil, err
-							}
-						}
-						expr = body[len(body)-1]
-						found = true
-						break
-					}
-					if found {
-						continue
-					}
-					return Void, nil
-
-				case "let":
-					if len(expr.Elements) < 3 {
-						return nil, fmt.Errorf("%d:%d: 'let' requires bindings and body", expr.Line, expr.Col)
-					}
-					bindingsIdx := 1
-					var loopName string
-					if expr.Elements[1].Type == ExprSymbol {
-						loopName = expr.Elements[1].StrVal
-						bindingsIdx = 2
-						if len(expr.Elements) < 4 {
-							return nil, fmt.Errorf("%d:%d: named 'let' requires bindings and body", expr.Line, expr.Col)
-						}
-					}
-					bindingsExpr := expr.Elements[bindingsIdx]
-					if bindingsExpr.Type != ExprList {
-						return nil, fmt.Errorf("%d:%d: 'let' bindings must be a list", expr.Line, expr.Col)
-					}
-					names := make([]string, len(bindingsExpr.Elements))
-					vals := make([]*Value, len(bindingsExpr.Elements))
-					for i, binding := range bindingsExpr.Elements {
-						if binding.Type != ExprList || len(binding.Elements) != 2 {
-							return nil, fmt.Errorf("%d:%d: invalid let binding", expr.Line, expr.Col)
-						}
-						if binding.Elements[0].Type != ExprSymbol {
-							return nil, fmt.Errorf("%d:%d: let binding name must be a symbol", expr.Line, expr.Col)
-						}
-						names[i] = binding.Elements[0].StrVal
-						val, err := Eval(binding.Elements[1], env)
-						if err != nil {
-							return nil, err
-						}
-						vals[i] = val
-					}
-					letEnv := NewEnv(env)
-					for i, name := range names {
-						letEnv.Set(name, vals[i])
-					}
-					body := expr.Elements[bindingsIdx+1:]
-					if loopName != "" {
-						lambda := &Value{
-							Type:       TypeLambda,
-							Params:     names,
-							Body:       body,
-							ClosureEnv: letEnv,
-						}
-						letEnv.Set(loopName, lambda)
-					}
-					for _, bodyExpr := range body[:len(body)-1] {
-						_, err := Eval(bodyExpr, letEnv)
-						if err != nil {
-							return nil, err
-						}
-					}
-					expr = body[len(body)-1]
-					env = letEnv
-					continue
-
-
-			case "let*":
-				if len(expr.Elements) < 3 {
-					return nil, fmt.Errorf("%d:%d: 'let*' requires bindings and body", expr.Line, expr.Col)
-				}
-				bindingsExpr := expr.Elements[1]
-				if bindingsExpr.Type != ExprList {
-					return nil, fmt.Errorf("%d:%d: 'let*' bindings must be a list", expr.Line, expr.Col)
-				}
-				letEnv := NewEnv(env)
-				for _, binding := range bindingsExpr.Elements {
-					if binding.Type != ExprList || len(binding.Elements) != 2 {
-						return nil, fmt.Errorf("%d:%d: invalid let* binding", expr.Line, expr.Col)
-					}
-					if binding.Elements[0].Type != ExprSymbol {
-						return nil, fmt.Errorf("%d:%d: let* binding name must be a symbol", expr.Line, expr.Col)
-					}
-					val, err := Eval(binding.Elements[1], letEnv)
-					if err != nil {
-						return nil, err
-					}
-					letEnv.Set(binding.Elements[0].StrVal, val)
-				}
-				body := expr.Elements[2:]
-				for _, bodyExpr := range body[:len(body)-1] {
-					_, err := Eval(bodyExpr, letEnv)
-					if err != nil {
-						return nil, err
-					}
-				}
-				expr = body[len(body)-1]
-				env = letEnv
-				continue
-
-				case "letrec":
-					if len(expr.Elements) < 3 {
-						return nil, fmt.Errorf("%d:%d: 'letrec' requires bindings and body", expr.Line, expr.Col)
-					}
-					bindingsExpr := expr.Elements[1]
-					if bindingsExpr.Type != ExprList {
-						return nil, fmt.Errorf("%d:%d: 'letrec' bindings must be a list", expr.Line, expr.Col)
-					}
-					letEnv := NewEnv(env)
-					names := make([]string, len(bindingsExpr.Elements))
-					for i, binding := range bindingsExpr.Elements {
-						if binding.Type != ExprList || len(binding.Elements) != 2 || binding.Elements[0].Type != ExprSymbol {
-							return nil, fmt.Errorf("%d:%d: invalid letrec binding", expr.Line, expr.Col)
-						}
-						names[i] = binding.Elements[0].StrVal
-						letEnv.Set(names[i], Void)
-					}
-					for i, binding := range bindingsExpr.Elements {
-						val, err := Eval(binding.Elements[1], letEnv)
-						if err != nil {
-							return nil, err
-						}
-						letEnv.Set(names[i], val)
-					}
-					body := expr.Elements[2:]
-					for _, bodyExpr := range body[:len(body)-1] {
-						_, err := Eval(bodyExpr, letEnv)
-						if err != nil {
-							return nil, err
-						}
-					}
-					expr = body[len(body)-1]
-					env = letEnv
-					continue
-
-				case "letrec*":
-					if len(expr.Elements) < 3 {
-						return nil, fmt.Errorf("%d:%d: 'letrec*' requires bindings and body", expr.Line, expr.Col)
-					}
-					bindingsExpr := expr.Elements[1]
-					if bindingsExpr.Type != ExprList {
-						return nil, fmt.Errorf("%d:%d: 'letrec*' bindings must be a list", expr.Line, expr.Col)
-					}
-					letEnv := NewEnv(env)
-					for _, binding := range bindingsExpr.Elements {
-						if binding.Type != ExprList || len(binding.Elements) != 2 || binding.Elements[0].Type != ExprSymbol {
-							return nil, fmt.Errorf("%d:%d: invalid letrec* binding", expr.Line, expr.Col)
-						}
-						val, err := Eval(binding.Elements[1], letEnv)
-						if err != nil {
-							return nil, err
-						}
-						letEnv.Set(binding.Elements[0].StrVal, val)
-					}
-					body := expr.Elements[2:]
-					for _, bodyExpr := range body[:len(body)-1] {
-						_, err := Eval(bodyExpr, letEnv)
-						if err != nil {
-							return nil, err
-						}
-					}
-					expr = body[len(body)-1]
-					env = letEnv
-					continue
-
-				case "case":
-					if len(expr.Elements) < 3 {
-						return nil, fmt.Errorf("%d:%d: 'case' requires key and clauses", expr.Line, expr.Col)
-					}
-					key, err := Eval(expr.Elements[1], env)
-					if err != nil {
-						return nil, err
-					}
-					found := false
-					for _, clause := range expr.Elements[2:] {
-						if clause.Type != ExprList || len(clause.Elements) < 2 {
-							return nil, fmt.Errorf("%d:%d: invalid case clause", expr.Line, expr.Col)
-						}
-						isElse := clause.Elements[0].Type == ExprSymbol && clause.Elements[0].StrVal == "else"
-						matched := isElse
-						if !isElse {
-							datums := clause.Elements[0]
-							if datums.Type != ExprList {
-								return nil, fmt.Errorf("%d:%d: case clause datums must be a list", expr.Line, expr.Col)
-							}
-							for _, d := range datums.Elements {
-								dv := exprToValue(d)
-								if valuesEqv(key, dv) {
-									matched = true
-									break
-								}
-							}
-						}
-						if matched {
-							body := clause.Elements[1:]
-							for _, e := range body[:len(body)-1] {
-								_, err = Eval(e, env)
-								if err != nil {
-									return nil, err
-								}
-							}
-							expr = body[len(body)-1]
-							found = true
-							break
-						}
-					}
-					if found {
-						continue
-					}
-					return Void, nil
 				}
 
-				// Check for macro application
-				if val, ok := env.Get(head.StrVal); ok && val.Type == TypeMacro {
-					expanded, err := expandMacro(val.Macro, expr)
+				// Function application: push KEvFun, evaluate operator
+				kont = &KontFrame{
+					Tag: KEvFun, Exprs: expr.Elements[1:], Env: env,
+					Line: expr.Line, Col: expr.Col, OrigExpr: expr, Next: kont,
+				}
+				expr = head
+
+			default:
+				return nil, fmt.Errorf("%d:%d: unknown expression type", expr.Line, expr.Col)
+			}
+		} else {
+			// ==================== APPLY CONTINUATION MODE ====================
+			switch kont.Tag {
+			case KHalt:
+				return val, nil
+
+			case KTopLevel:
+				result := kont.Result
+				if val.Type != TypeVoid {
+					result = val
+				}
+				if len(kont.Exprs) == 0 {
+					if result != nil {
+						val = result
+					}
+					kont = kont.Next
+					continue
+				}
+				nextExpr := kont.Exprs[0]
+				topEnv := kont.Env
+				kont = &KontFrame{
+					Tag: KTopLevel, Exprs: kont.Exprs[1:], Env: topEnv,
+					Result: result, Next: kont.Next,
+				}
+				expr = nextExpr
+				env = topEnv
+				evaluating = true
+
+			case KBody:
+				if len(kont.Exprs) == 1 {
+					expr = kont.Exprs[0]
+					env = kont.Env
+					kont = kont.Next
+					evaluating = true
+				} else {
+					nextExpr := kont.Exprs[0]
+					kont = &KontFrame{Tag: KBody, Exprs: kont.Exprs[1:], Env: kont.Env, Next: kont.Next}
+					expr = nextExpr
+					env = kont.Env
+					evaluating = true
+				}
+
+			case KDefine:
+				kont.Env.Set(kont.Name, val)
+				val = Void
+				kont = kont.Next
+
+			case KSetBang:
+				if !kont.Env.Update(kont.Name, val) {
+					return nil, fmt.Errorf("%d:%d: unbound variable '%s'", kont.Line, kont.Col, kont.Name)
+				}
+				val = Void
+				kont = kont.Next
+
+			case KIfTest:
+				if isTruthy(val) {
+					expr = kont.Conseq
+				} else if kont.Alt != nil {
+					expr = kont.Alt
+				} else {
+					val = Void
+					kont = kont.Next
+					continue
+				}
+				env = kont.Env
+				kont = kont.Next
+				evaluating = true
+
+			case KEvFun:
+				if val.Type == TypeMacro {
+					expanded, err := expandMacro(val.Macro, kont.OrigExpr)
 					if err != nil {
 						return nil, err
 					}
 					expr = expanded
+					env = kont.Env
+					kont = kont.Next
+					evaluating = true
 					continue
 				}
-			}
-
-			// Function application
-			fn, err := Eval(head, env)
-			if err != nil {
-				return nil, err
-			}
-
-			// Evaluate arguments
-			args := make([]*Value, len(expr.Elements)-1)
-			for i, argExpr := range expr.Elements[1:] {
-				val, err := Eval(argExpr, env)
-				if err != nil {
-					return nil, err
-				}
-				args[i] = val
-			}
-
-			// Call builtin
-			if fn.Type == TypeSymbol && len(fn.StrVal) > 8 && fn.StrVal[:8] == "builtin:" {
-				return callBuiltin(fn.StrVal, args, env, expr.Line, expr.Col)
-			}
-
-			// Call Go native function
-			if fn.Type == TypeGoFunc {
-				return fn.GoFunc(args)
-			}
-
-			// Call lambda (TCO)
-			if fn.Type == TypeLambda {
-				callEnv, err := bindLambdaEnv(fn, args, expr.Line, expr.Col)
-				if err != nil {
-					return nil, err
-				}
-				for _, bodyExpr := range fn.Body[:len(fn.Body)-1] {
-					_, err = Eval(bodyExpr, callEnv)
+				argExprs := kont.Exprs
+				if len(argExprs) == 0 {
+					err := cekApplyFunction(val, nil, kont.Next, kont.Env, kont.Line, kont.Col,
+						&expr, &env, &kont, &val, &evaluating)
 					if err != nil {
 						return nil, err
 					}
+				} else {
+					lastIdx := len(argExprs) - 1
+					nextExpr := argExprs[lastIdx]
+					evEnv := kont.Env
+					kont = &KontFrame{
+						Tag: KEvArgs, Fn: val, Exprs: argExprs[:lastIdx],
+						Env: evEnv, Line: kont.Line, Col: kont.Col, Next: kont.Next,
+					}
+					expr = nextExpr
+					env = evEnv
+					evaluating = true
 				}
-				expr = fn.Body[len(fn.Body)-1]
-				env = callEnv
-				continue
-			}
 
-			// Call case-lambda (TCO)
-			if fn.Type == TypeCaseLambda {
-				callEnv, body, err := bindCaseLambdaEnv(fn, args, expr.Line, expr.Col)
-				if err != nil {
-					return nil, err
-				}
-				for _, bodyExpr := range body[:len(body)-1] {
-					_, err = Eval(bodyExpr, callEnv)
+			case KEvArgs:
+				newVals := make([]*Value, len(kont.Vals)+1)
+				newVals[0] = val
+				copy(newVals[1:], kont.Vals)
+				if len(kont.Exprs) == 0 {
+					err := cekApplyFunction(kont.Fn, newVals, kont.Next, kont.Env, kont.Line, kont.Col,
+						&expr, &env, &kont, &val, &evaluating)
 					if err != nil {
 						return nil, err
 					}
+				} else {
+					lastIdx := len(kont.Exprs) - 1
+					nextExpr := kont.Exprs[lastIdx]
+					evEnv := kont.Env
+					kont = &KontFrame{
+						Tag: KEvArgs, Fn: kont.Fn, Vals: newVals, Exprs: kont.Exprs[:lastIdx],
+						Env: evEnv, Line: kont.Line, Col: kont.Col, Next: kont.Next,
+					}
+					expr = nextExpr
+					env = evEnv
+					evaluating = true
 				}
-				expr = body[len(body)-1]
-				env = callEnv
-				continue
-			}
 
-			// Macro from ExprLiteral
-			if fn.Type == TypeMacro {
-				expanded, err := expandMacro(fn.Macro, expr)
-				if err != nil {
-					return nil, err
+			case KAnd:
+				if !isTruthy(val) {
+					kont = kont.Next
+				} else if len(kont.Exprs) == 1 {
+					expr = kont.Exprs[0]
+					env = kont.Env
+					kont = kont.Next
+					evaluating = true
+				} else {
+					nextExpr := kont.Exprs[0]
+					kont = &KontFrame{Tag: KAnd, Exprs: kont.Exprs[1:], Env: kont.Env, Next: kont.Next}
+					expr = nextExpr
+					env = kont.Env
+					evaluating = true
 				}
-				expr = expanded
-				continue
-			}
 
-			return nil, fmt.Errorf("%d:%d: not a procedure", expr.Line, expr.Col)
-		default:
-			return nil, fmt.Errorf("%d:%d: unknown expression type", expr.Line, expr.Col)
+			case KOr:
+				if isTruthy(val) {
+					kont = kont.Next
+				} else if len(kont.Exprs) == 1 {
+					expr = kont.Exprs[0]
+					env = kont.Env
+					kont = kont.Next
+					evaluating = true
+				} else {
+					nextExpr := kont.Exprs[0]
+					kont = &KontFrame{Tag: KOr, Exprs: kont.Exprs[1:], Env: kont.Env, Next: kont.Next}
+					expr = nextExpr
+					env = kont.Env
+					evaluating = true
+				}
+
+			case KCondClauses:
+				if isTruthy(val) {
+					body := kont.ClauseBody
+					if len(body) == 0 {
+						kont = kont.Next
+					} else {
+						cekEnterBody(body, kont.Env, kont.Next, &expr, &env, &kont, &val, &evaluating)
+					}
+				} else {
+					clauses := kont.Clauses
+					if len(clauses) == 0 {
+						val = Void
+						kont = kont.Next
+					} else {
+						cekStartCondClause(clauses[0], clauses[1:], kont.Env, kont.Next,
+							&expr, &env, &kont, &val, &evaluating)
+					}
+				}
+
+			case KLetBind:
+				newVals := append(append([]*Value{}, kont.Vals...), val)
+				if len(kont.Exprs) > 0 {
+					nextExpr := kont.Exprs[0]
+					kont = &KontFrame{
+						Tag: KLetBind, Names: kont.Names, Vals: newVals,
+						Exprs: kont.Exprs[1:], BodyExprs: kont.BodyExprs,
+						Env: kont.Env, NamedLet: kont.NamedLet, Next: kont.Next,
+					}
+					expr = nextExpr
+					env = kont.Env
+					evaluating = true
+				} else {
+					letEnv := NewEnv(kont.Env)
+					for i, name := range kont.Names {
+						letEnv.Set(name, newVals[i])
+					}
+					if kont.NamedLet != "" {
+						letEnv.Set(kont.NamedLet, &Value{
+							Type: TypeLambda, Params: kont.Names,
+							Body: kont.BodyExprs, ClosureEnv: letEnv,
+						})
+					}
+					cekEnterBody(kont.BodyExprs, letEnv, kont.Next, &expr, &env, &kont, &val, &evaluating)
+				}
+
+			case KLetStarBind:
+				kont.LetEnv.Set(kont.Name, val)
+				if len(kont.Exprs) > 0 {
+					nextBinding := kont.Exprs[0]
+					if nextBinding.Type != ExprList || len(nextBinding.Elements) != 2 || nextBinding.Elements[0].Type != ExprSymbol {
+						return nil, fmt.Errorf("invalid let* binding")
+					}
+					letEnv := kont.LetEnv
+					kont = &KontFrame{
+						Tag: KLetStarBind, Name: nextBinding.Elements[0].StrVal,
+						Exprs: kont.Exprs[1:], BodyExprs: kont.BodyExprs,
+						LetEnv: letEnv, Next: kont.Next,
+					}
+					expr = nextBinding.Elements[1]
+					env = letEnv
+					evaluating = true
+				} else {
+					cekEnterBody(kont.BodyExprs, kont.LetEnv, kont.Next, &expr, &env, &kont, &val, &evaluating)
+				}
+
+			case KLetrecBind:
+				newVals := append(append([]*Value{}, kont.Vals...), val)
+				if len(kont.Exprs) > 0 {
+					nextExpr := kont.Exprs[0]
+					kont = &KontFrame{
+						Tag: KLetrecBind, Names: kont.Names, Vals: newVals,
+						Exprs: kont.Exprs[1:], BodyExprs: kont.BodyExprs,
+						LetEnv: kont.LetEnv, Next: kont.Next,
+					}
+					expr = nextExpr
+					env = kont.LetEnv
+					evaluating = true
+				} else {
+					for i, name := range kont.Names {
+						kont.LetEnv.Set(name, newVals[i])
+					}
+					cekEnterBody(kont.BodyExprs, kont.LetEnv, kont.Next, &expr, &env, &kont, &val, &evaluating)
+				}
+
+			case KLetrecStarBind:
+				kont.LetEnv.Set(kont.Name, val)
+				if len(kont.Exprs) > 0 {
+					nextBinding := kont.Exprs[0]
+					if nextBinding.Type != ExprList || len(nextBinding.Elements) != 2 || nextBinding.Elements[0].Type != ExprSymbol {
+						return nil, fmt.Errorf("invalid letrec* binding")
+					}
+					letEnv := kont.LetEnv
+					kont = &KontFrame{
+						Tag: KLetrecStarBind, Name: nextBinding.Elements[0].StrVal,
+						Exprs: kont.Exprs[1:], BodyExprs: kont.BodyExprs,
+						LetEnv: letEnv, Next: kont.Next,
+					}
+					expr = nextBinding.Elements[1]
+					env = letEnv
+					evaluating = true
+				} else {
+					cekEnterBody(kont.BodyExprs, kont.LetEnv, kont.Next, &expr, &env, &kont, &val, &evaluating)
+				}
+
+			case KCaseKey:
+				key := val
+				matched := false
+				for _, clause := range kont.Clauses {
+					if clause.Type != ExprList || len(clause.Elements) < 2 {
+						return nil, fmt.Errorf("%d:%d: invalid case clause", kont.Line, kont.Col)
+					}
+					isElse := clause.Elements[0].Type == ExprSymbol && clause.Elements[0].StrVal == "else"
+					match := isElse
+					if !isElse {
+						datums := clause.Elements[0]
+						if datums.Type != ExprList {
+							return nil, fmt.Errorf("%d:%d: case clause datums must be a list", kont.Line, kont.Col)
+						}
+						for _, d := range datums.Elements {
+							if valuesEqv(key, exprToValue(d)) {
+								match = true
+								break
+							}
+						}
+					}
+					if match {
+						body := clause.Elements[1:]
+						cekEnterBody(body, kont.Env, kont.Next, &expr, &env, &kont, &val, &evaluating)
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					val = Void
+					kont = kont.Next
+				}
+
+			default:
+				return nil, fmt.Errorf("unknown continuation tag: %d", kont.Tag)
+			}
 		}
 	}
 }
 
-// callLambda is used by builtins (apply, map, etc.) that call lambdas outside the trampoline.
+// ===================== Let Family Helpers =====================
+
+func cekStartLet(expr *Expr, env *Env, kont *KontFrame,
+	exprP **Expr, envP **Env, kontP **KontFrame, valP **Value, evaluatingP *bool) error {
+	if len(expr.Elements) < 3 {
+		return fmt.Errorf("%d:%d: 'let' requires bindings and body", expr.Line, expr.Col)
+	}
+	bindingsIdx := 1
+	var loopName string
+	if expr.Elements[1].Type == ExprSymbol {
+		loopName = expr.Elements[1].StrVal
+		bindingsIdx = 2
+		if len(expr.Elements) < 4 {
+			return fmt.Errorf("%d:%d: named 'let' requires bindings and body", expr.Line, expr.Col)
+		}
+	}
+	bindingsExpr := expr.Elements[bindingsIdx]
+	if bindingsExpr.Type != ExprList {
+		return fmt.Errorf("%d:%d: 'let' bindings must be a list", expr.Line, expr.Col)
+	}
+	body := expr.Elements[bindingsIdx+1:]
+	if len(bindingsExpr.Elements) == 0 {
+		// No bindings — just evaluate body
+		letEnv := NewEnv(env)
+		if loopName != "" {
+			letEnv.Set(loopName, &Value{Type: TypeLambda, Body: body, ClosureEnv: letEnv})
+		}
+		cekEnterBody(body, letEnv, kont, exprP, envP, kontP, valP, evaluatingP)
+		return nil
+	}
+	// Parse binding names and init expressions
+	names := make([]string, len(bindingsExpr.Elements))
+	initExprs := make([]*Expr, len(bindingsExpr.Elements))
+	for i, binding := range bindingsExpr.Elements {
+		if binding.Type != ExprList || len(binding.Elements) != 2 {
+			return fmt.Errorf("%d:%d: invalid let binding", expr.Line, expr.Col)
+		}
+		if binding.Elements[0].Type != ExprSymbol {
+			return fmt.Errorf("%d:%d: let binding name must be a symbol", expr.Line, expr.Col)
+		}
+		names[i] = binding.Elements[0].StrVal
+		initExprs[i] = binding.Elements[1]
+	}
+	// Push KLetBind, eval first init
+	*kontP = &KontFrame{
+		Tag: KLetBind, Names: names, Exprs: initExprs[1:],
+		BodyExprs: body, Env: env, NamedLet: loopName, Next: kont,
+	}
+	*exprP = initExprs[0]
+	*envP = env
+	*evaluatingP = true
+	return nil
+}
+
+func cekStartLetStar(expr *Expr, env *Env, kont *KontFrame,
+	exprP **Expr, envP **Env, kontP **KontFrame, valP **Value, evaluatingP *bool) error {
+	if len(expr.Elements) < 3 {
+		return fmt.Errorf("%d:%d: 'let*' requires bindings and body", expr.Line, expr.Col)
+	}
+	bindingsExpr := expr.Elements[1]
+	if bindingsExpr.Type != ExprList {
+		return fmt.Errorf("%d:%d: 'let*' bindings must be a list", expr.Line, expr.Col)
+	}
+	body := expr.Elements[2:]
+	letEnv := NewEnv(env)
+	if len(bindingsExpr.Elements) == 0 {
+		cekEnterBody(body, letEnv, kont, exprP, envP, kontP, valP, evaluatingP)
+		return nil
+	}
+	first := bindingsExpr.Elements[0]
+	if first.Type != ExprList || len(first.Elements) != 2 || first.Elements[0].Type != ExprSymbol {
+		return fmt.Errorf("%d:%d: invalid let* binding", expr.Line, expr.Col)
+	}
+	*kontP = &KontFrame{
+		Tag: KLetStarBind, Name: first.Elements[0].StrVal,
+		Exprs: bindingsExpr.Elements[1:], BodyExprs: body,
+		LetEnv: letEnv, Next: kont,
+	}
+	*exprP = first.Elements[1]
+	*envP = letEnv
+	*evaluatingP = true
+	return nil
+}
+
+func cekStartLetrec(expr *Expr, env *Env, kont *KontFrame, isStar bool,
+	exprP **Expr, envP **Env, kontP **KontFrame, valP **Value, evaluatingP *bool) error {
+	keyword := "letrec"
+	if isStar {
+		keyword = "letrec*"
+	}
+	if len(expr.Elements) < 3 {
+		return fmt.Errorf("%d:%d: '%s' requires bindings and body", expr.Line, expr.Col, keyword)
+	}
+	bindingsExpr := expr.Elements[1]
+	if bindingsExpr.Type != ExprList {
+		return fmt.Errorf("%d:%d: '%s' bindings must be a list", expr.Line, expr.Col, keyword)
+	}
+	body := expr.Elements[2:]
+	letEnv := NewEnv(env)
+
+	if len(bindingsExpr.Elements) == 0 {
+		cekEnterBody(body, letEnv, kont, exprP, envP, kontP, valP, evaluatingP)
+		return nil
+	}
+
+	// Pre-set all bindings to void
+	for _, binding := range bindingsExpr.Elements {
+		if binding.Type != ExprList || len(binding.Elements) != 2 || binding.Elements[0].Type != ExprSymbol {
+			return fmt.Errorf("%d:%d: invalid %s binding", expr.Line, expr.Col, keyword)
+		}
+		letEnv.Set(binding.Elements[0].StrVal, Void)
+	}
+
+	if isStar {
+		first := bindingsExpr.Elements[0]
+		*kontP = &KontFrame{
+			Tag: KLetrecStarBind, Name: first.Elements[0].StrVal,
+			Exprs: bindingsExpr.Elements[1:], BodyExprs: body,
+			LetEnv: letEnv, Next: kont,
+		}
+		*exprP = first.Elements[1]
+	} else {
+		names := make([]string, len(bindingsExpr.Elements))
+		initExprs := make([]*Expr, len(bindingsExpr.Elements))
+		for i, binding := range bindingsExpr.Elements {
+			names[i] = binding.Elements[0].StrVal
+			initExprs[i] = binding.Elements[1]
+		}
+		*kontP = &KontFrame{
+			Tag: KLetrecBind, Names: names, Exprs: initExprs[1:],
+			BodyExprs: body, LetEnv: letEnv, Next: kont,
+		}
+		*exprP = initExprs[0]
+	}
+	*envP = letEnv
+	*evaluatingP = true
+	return nil
+}
+
+// ===================== Helpers =====================
+
+func cekEnterBody(body []*Expr, bodyEnv *Env, nextKont *KontFrame,
+	exprP **Expr, envP **Env, kontP **KontFrame, valP **Value, evaluatingP *bool) {
+	if len(body) == 0 {
+		*valP = Void
+		*kontP = nextKont
+		*evaluatingP = false
+		return
+	}
+	k := nextKont
+	if len(body) > 1 {
+		k = &KontFrame{Tag: KBody, Exprs: body[1:], Env: bodyEnv, Next: nextKont}
+	}
+	*exprP = body[0]
+	*envP = bodyEnv
+	*kontP = k
+	*evaluatingP = true
+}
+
+func cekStartCondClause(clause *Expr, remaining []*Expr, condEnv *Env, nextKont *KontFrame,
+	exprP **Expr, envP **Env, kontP **KontFrame, valP **Value, evaluatingP *bool) {
+	if clause.Type != ExprList || len(clause.Elements) < 1 {
+		*valP = Void
+		*kontP = nextKont
+		*evaluatingP = false
+		return
+	}
+	isElse := clause.Elements[0].Type == ExprSymbol && clause.Elements[0].StrVal == "else"
+	body := clause.Elements[1:]
+	if isElse {
+		cekEnterBody(body, condEnv, nextKont, exprP, envP, kontP, valP, evaluatingP)
+		return
+	}
+	*kontP = &KontFrame{
+		Tag: KCondClauses, ClauseBody: body, Clauses: remaining,
+		Env: condEnv, Next: nextKont,
+	}
+	*exprP = clause.Elements[0]
+	*envP = condEnv
+	*evaluatingP = true
+}
+
+// cekApplyFunction handles applying a function to arguments within the CEK machine.
+func cekApplyFunction(fn *Value, args []*Value, outerKont *KontFrame, env *Env, line, col int,
+	exprP **Expr, envP **Env, kontP **KontFrame, valP **Value, evaluatingP *bool) error {
+	for {
+		if fn.Type == TypeSymbol && len(fn.StrVal) > 8 && fn.StrVal[:8] == "builtin:" {
+			switch fn.StrVal {
+			case "builtin:call/cc":
+				if len(args) != 1 {
+					return fmt.Errorf("%d:%d: call/cc requires exactly 1 argument", line, col)
+				}
+				contVal := &Value{Type: TypeContinuation, ContKont: outerKont}
+				fn = args[0]
+				args = []*Value{contVal}
+				continue
+			case "builtin:apply":
+				if len(args) < 2 {
+					return fmt.Errorf("%d:%d: 'apply' requires at least 2 arguments", line, col)
+				}
+				applyFn := args[0]
+				lastArg := args[len(args)-1]
+				var fullArgs []*Value
+				for _, a := range args[1 : len(args)-1] {
+					fullArgs = append(fullArgs, a)
+				}
+				cur := lastArg
+				for cur.Type == TypePair {
+					fullArgs = append(fullArgs, cur.Car)
+					cur = cur.Cdr
+				}
+				fn = applyFn
+				args = fullArgs
+				continue
+			default:
+				result, err := callBuiltin(fn.StrVal, args, env, line, col)
+				if err != nil {
+					return err
+				}
+				*valP = result
+				*kontP = outerKont
+				*evaluatingP = false
+				return nil
+			}
+		}
+		break
+	}
+	if fn.Type == TypeGoFunc {
+		result, err := fn.GoFunc(args)
+		if err != nil {
+			return err
+		}
+		*valP = result
+		*kontP = outerKont
+		*evaluatingP = false
+		return nil
+	}
+	if fn.Type == TypeLambda {
+		callEnv, err := bindLambdaEnv(fn, args, line, col)
+		if err != nil {
+			return err
+		}
+		if len(fn.Body) == 0 {
+			*valP = Void
+			*kontP = outerKont
+			*evaluatingP = false
+			return nil
+		}
+		k := outerKont
+		if len(fn.Body) > 1 {
+			k = &KontFrame{Tag: KBody, Exprs: fn.Body[1:], Env: callEnv, Next: outerKont}
+		}
+		*exprP = fn.Body[0]
+		*envP = callEnv
+		*kontP = k
+		*evaluatingP = true
+		return nil
+	}
+	if fn.Type == TypeCaseLambda {
+		callEnv, body, err := bindCaseLambdaEnv(fn, args, line, col)
+		if err != nil {
+			return err
+		}
+		if len(body) == 0 {
+			*valP = Void
+			*kontP = outerKont
+			*evaluatingP = false
+			return nil
+		}
+		k := outerKont
+		if len(body) > 1 {
+			k = &KontFrame{Tag: KBody, Exprs: body[1:], Env: callEnv, Next: outerKont}
+		}
+		*exprP = body[0]
+		*envP = callEnv
+		*kontP = k
+		*evaluatingP = true
+		return nil
+	}
+	if fn.Type == TypeContinuation {
+		if len(args) != 1 {
+			return fmt.Errorf("%d:%d: continuation expects exactly 1 argument", line, col)
+		}
+		*valP = args[0]
+		*kontP = fn.ContKont
+		*evaluatingP = false
+		return nil
+	}
+	return fmt.Errorf("%d:%d: not a procedure", line, col)
+}
+
+// ===================== Legacy Call Helpers (for builtins) =====================
+
 func callLambda(fn *Value, args []*Value, line, col int) (*Value, error) {
 	callEnv, err := bindLambdaEnv(fn, args, line, col)
 	if err != nil {
 		return nil, err
 	}
-	var result *Value
-	for _, bodyExpr := range fn.Body {
-		result, err = Eval(bodyExpr, callEnv)
-		if err != nil {
-			return nil, err
-		}
+	if len(fn.Body) == 0 {
+		return Void, nil
 	}
-	return result, nil
+	kont := &KontFrame{Tag: KHalt}
+	if len(fn.Body) > 1 {
+		kont = &KontFrame{Tag: KBody, Exprs: fn.Body[1:], Env: callEnv, Next: kont}
+	}
+	return cekEval(fn.Body[0], callEnv, kont)
 }
 
-// callCaseLambda is used by builtins that call case-lambdas outside the trampoline.
 func callCaseLambda(fn *Value, args []*Value, line, col int) (*Value, error) {
 	callEnv, body, err := bindCaseLambdaEnv(fn, args, line, col)
 	if err != nil {
 		return nil, err
 	}
-	var result *Value
-	for _, bodyExpr := range body {
-		result, err = Eval(bodyExpr, callEnv)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
-}
-
-func evalDefine(expr *Expr, env *Env) (*Value, error) {
-	if len(expr.Elements) < 3 {
-		return nil, fmt.Errorf("%d:%d: 'define' requires at least 2 arguments", expr.Line, expr.Col)
-	}
-	target := expr.Elements[1]
-	// Shorthand: (define (f x) body) => (define f (lambda (x) body))
-	if target.Type == ExprList && len(target.Elements) > 0 {
-		name := target.Elements[0]
-		if name.Type != ExprSymbol {
-			return nil, fmt.Errorf("%d:%d: expected symbol in define", expr.Line, expr.Col)
-		}
-		params, restParam, err := parseParams(target.Elements[1:])
-		if err != nil {
-			return nil, err
-		}
-		lambda := &Value{
-			Type:       TypeLambda,
-			Params:     params,
-			RestParam:  restParam,
-			Body:       expr.Elements[2:],
-			ClosureEnv: env,
-		}
-		env.Set(name.StrVal, lambda)
+	if len(body) == 0 {
 		return Void, nil
 	}
-	// Simple: (define x expr)
-	if target.Type != ExprSymbol {
-		return nil, fmt.Errorf("%d:%d: expected symbol after define", expr.Line, expr.Col)
+	kont := &KontFrame{Tag: KHalt}
+	if len(body) > 1 {
+		kont = &KontFrame{Tag: KBody, Exprs: body[1:], Env: callEnv, Next: kont}
 	}
-	val, err := Eval(expr.Elements[2], env)
-	if err != nil {
-		return nil, err
-	}
-	env.Set(target.StrVal, val)
-	return Void, nil
+	return cekEval(body[0], callEnv, kont)
 }
+
+// ===================== Expression Helpers =====================
 
 func evalQuote(expr *Expr) (*Value, error) {
 	if len(expr.Elements) != 2 {
@@ -627,13 +1072,10 @@ func evalLambda(expr *Expr, env *Env) (*Value, error) {
 		return nil, fmt.Errorf("%d:%d: 'lambda' requires parameters and body", expr.Line, expr.Col)
 	}
 	paramExpr := expr.Elements[1]
-	// (lambda args body) — single symbol means all args go to rest
 	if paramExpr.Type == ExprSymbol {
 		return &Value{
-			Type:       TypeLambda,
-			RestParam:  paramExpr.StrVal,
-			Body:       expr.Elements[2:],
-			ClosureEnv: env,
+			Type: TypeLambda, RestParam: paramExpr.StrVal,
+			Body: expr.Elements[2:], ClosureEnv: env,
 		}, nil
 	}
 	if paramExpr.Type != ExprList {
@@ -644,45 +1086,41 @@ func evalLambda(expr *Expr, env *Env) (*Value, error) {
 		return nil, err
 	}
 	return &Value{
-		Type:       TypeLambda,
-		Params:     params,
-		RestParam:  restParam,
-		Body:       expr.Elements[2:],
-		ClosureEnv: env,
+		Type: TypeLambda, Params: params, RestParam: restParam,
+		Body: expr.Elements[2:], ClosureEnv: env,
 	}, nil
 }
 
-func evalSetBang(expr *Expr, env *Env) (*Value, error) {
-	if len(expr.Elements) != 3 {
-		return nil, fmt.Errorf("%d:%d: 'set!' requires exactly 2 arguments", expr.Line, expr.Col)
+func evalCaseLambda(expr *Expr, env *Env) (*Value, error) {
+	clauses := make([]CaseLambdaClause, 0, len(expr.Elements)-1)
+	for _, clauseExpr := range expr.Elements[1:] {
+		if clauseExpr.Type != ExprList || len(clauseExpr.Elements) < 2 {
+			return nil, fmt.Errorf("%d:%d: invalid case-lambda clause", expr.Line, expr.Col)
+		}
+		formalsExpr := clauseExpr.Elements[0]
+		if formalsExpr.Type != ExprList {
+			return nil, fmt.Errorf("%d:%d: case-lambda clause formals must be a list", expr.Line, expr.Col)
+		}
+		params, restParam, err := parseParams(formalsExpr.Elements)
+		if err != nil {
+			return nil, err
+		}
+		clauses = append(clauses, CaseLambdaClause{
+			Params: params, RestParam: restParam,
+			Body: clauseExpr.Elements[1:],
+		})
 	}
-	target := expr.Elements[1]
-	if target.Type != ExprSymbol {
-		return nil, fmt.Errorf("%d:%d: 'set!' expects a symbol", expr.Line, expr.Col)
-	}
-	val, err := Eval(expr.Elements[2], env)
-	if err != nil {
-		return nil, err
-	}
-	if !env.Update(target.StrVal, val) {
-		return nil, fmt.Errorf("%d:%d: unbound variable '%s'", expr.Line, expr.Col, target.StrVal)
-	}
-	return Void, nil
+	return &Value{Type: TypeCaseLambda, CaseClauses: clauses, ClosureEnv: env}, nil
 }
 
 func evalDefineRecordType(expr *Expr, env *Env) (*Value, error) {
-	// (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
 	if len(expr.Elements) < 5 {
 		return nil, fmt.Errorf("%d:%d: define-record-type requires type name, constructor, predicate, and fields", expr.Line, expr.Col)
 	}
-
-	// Type name
 	typeName := expr.Elements[1]
 	if typeName.Type != ExprSymbol {
 		return nil, fmt.Errorf("%d:%d: expected symbol for record type name", expr.Line, expr.Col)
 	}
-
-	// Constructor: (make-foo field1 field2 ...)
 	ctorExpr := expr.Elements[2]
 	if ctorExpr.Type != ExprList || len(ctorExpr.Elements) < 1 {
 		return nil, fmt.Errorf("%d:%d: expected constructor specification", expr.Line, expr.Col)
@@ -698,16 +1136,12 @@ func evalDefineRecordType(expr *Expr, env *Env) (*Value, error) {
 		}
 		ctorFields[i] = f.StrVal
 	}
-
-	// Predicate
 	predExpr := expr.Elements[3]
 	if predExpr.Type != ExprSymbol {
 		return nil, fmt.Errorf("%d:%d: expected symbol for predicate name", expr.Line, expr.Col)
 	}
-
-	// Field specs: (field-name accessor-name) ...
-	fieldNames := make([]string, 0)
-	accessorMap := make(map[string]int) // accessor-name -> field index
+	var fieldNames []string
+	accessorMap := make(map[string]int)
 	for _, fieldSpec := range expr.Elements[4:] {
 		if fieldSpec.Type != ExprList || len(fieldSpec.Elements) < 2 {
 			return nil, fmt.Errorf("%d:%d: expected (field accessor) specification", expr.Line, expr.Col)
@@ -720,8 +1154,6 @@ func evalDefineRecordType(expr *Expr, env *Env) (*Value, error) {
 		fieldNames = append(fieldNames, fieldName.StrVal)
 		accessorMap[accessor.StrVal] = len(fieldNames) - 1
 	}
-
-	// Build field index mapping: ctorField -> index in fieldNames
 	ctorFieldIdx := make([]int, len(ctorFields))
 	for i, cf := range ctorFields {
 		found := false
@@ -736,107 +1168,62 @@ func evalDefineRecordType(expr *Expr, env *Env) (*Value, error) {
 			return nil, fmt.Errorf("%d:%d: constructor field '%s' not in field specs", expr.Line, expr.Col, cf)
 		}
 	}
-
 	rt := &RecordType{Name: typeName.StrVal, Fields: fieldNames}
-
-	// Define constructor
-	numFields := len(fieldNames)
-	rtCopy := rt
-	ctorIdxCopy := ctorFieldIdx
-	nf := numFields
+	nf := len(fieldNames)
 	env.Set(ctorName.StrVal, makeGoFunc(func(args []*Value) (*Value, error) {
-		if len(args) != len(ctorIdxCopy) {
+		if len(args) != len(ctorFieldIdx) {
 			return nil, fmt.Errorf("wrong number of arguments to constructor %s", ctorName.StrVal)
 		}
 		fields := make([]*Value, nf)
-		for i, idx := range ctorIdxCopy {
+		for i, idx := range ctorFieldIdx {
 			fields[idx] = args[i]
 		}
-		return &Value{Type: TypeRecord, RecordType: rtCopy, RecordFields: fields}, nil
+		return &Value{Type: TypeRecord, RecordType: rt, RecordFields: fields}, nil
 	}))
-
-	// Define predicate
 	env.Set(predExpr.StrVal, makeGoFunc(func(args []*Value) (*Value, error) {
 		if len(args) != 1 {
 			return nil, fmt.Errorf("wrong number of arguments to predicate %s", predExpr.StrVal)
 		}
-		if args[0].Type == TypeRecord && args[0].RecordType == rtCopy {
+		if args[0].Type == TypeRecord && args[0].RecordType == rt {
 			return True, nil
 		}
 		return False, nil
 	}))
-
-	// Define accessors
 	for accessorName, fieldIdx := range accessorMap {
-		idx := fieldIdx // capture
+		idx := fieldIdx
 		aName := accessorName
 		env.Set(aName, makeGoFunc(func(args []*Value) (*Value, error) {
 			if len(args) != 1 {
 				return nil, fmt.Errorf("wrong number of arguments to accessor %s", aName)
 			}
-			if args[0].Type != TypeRecord || args[0].RecordType != rtCopy {
+			if args[0].Type != TypeRecord || args[0].RecordType != rt {
 				return nil, fmt.Errorf("accessor %s applied to wrong type", aName)
 			}
 			return args[0].RecordFields[idx], nil
 		}))
 	}
-
 	return Void, nil
 }
 
-func evalCaseLambda(expr *Expr, env *Env) (*Value, error) {
-	// (case-lambda (formals body ...) ...)
-	clauses := make([]CaseLambdaClause, 0, len(expr.Elements)-1)
-	for _, clauseExpr := range expr.Elements[1:] {
-		if clauseExpr.Type != ExprList || len(clauseExpr.Elements) < 2 {
-			return nil, fmt.Errorf("%d:%d: invalid case-lambda clause", expr.Line, expr.Col)
-		}
-		formalsExpr := clauseExpr.Elements[0]
-		if formalsExpr.Type != ExprList {
-			return nil, fmt.Errorf("%d:%d: case-lambda clause formals must be a list", expr.Line, expr.Col)
-		}
-		params, restParam, err := parseParams(formalsExpr.Elements)
-		if err != nil {
-			return nil, err
-		}
-		clauses = append(clauses, CaseLambdaClause{
-			Params:    params,
-			RestParam: restParam,
-			Body:      clauseExpr.Elements[1:],
-		})
-	}
-	return &Value{
-		Type:        TypeCaseLambda,
-		CaseClauses: clauses,
-		ClosureEnv:  env,
-	}, nil
-}
-
 func evalDo(expr *Expr, env *Env) (*Value, error) {
-	// (do ((var init step) ...) (test expr ...) body ...)
 	if len(expr.Elements) < 3 {
 		return nil, fmt.Errorf("%d:%d: 'do' requires variable bindings and test", expr.Line, expr.Col)
 	}
 	varsExpr := expr.Elements[1]
 	testExpr := expr.Elements[2]
 	bodyExprs := expr.Elements[3:]
-
 	if varsExpr.Type != ExprList {
 		return nil, fmt.Errorf("%d:%d: 'do' variable bindings must be a list", expr.Line, expr.Col)
 	}
 	if testExpr.Type != ExprList || len(testExpr.Elements) < 1 {
 		return nil, fmt.Errorf("%d:%d: 'do' test clause must be a list", expr.Line, expr.Col)
 	}
-
 	type doVar struct {
 		name    string
-		stepIdx int // index into varsExpr.Elements; -1 if no step
+		stepIdx int
 	}
-
 	vars := make([]doVar, len(varsExpr.Elements))
 	doEnv := NewEnv(env)
-
-	// Initialize variables
 	for i, v := range varsExpr.Elements {
 		if v.Type != ExprList || len(v.Elements) < 2 || len(v.Elements) > 3 {
 			return nil, fmt.Errorf("%d:%d: invalid do variable spec", expr.Line, expr.Col)
@@ -856,16 +1243,12 @@ func evalDo(expr *Expr, env *Env) (*Value, error) {
 		}
 		doEnv.Set(vars[i].name, initVal)
 	}
-
-	// Iteration loop
 	for {
-		// Check test
 		testVal, err := Eval(testExpr.Elements[0], doEnv)
 		if err != nil {
 			return nil, err
 		}
 		if isTruthy(testVal) {
-			// Evaluate result expressions
 			if len(testExpr.Elements) == 1 {
 				return Void, nil
 			}
@@ -878,16 +1261,12 @@ func evalDo(expr *Expr, env *Env) (*Value, error) {
 			}
 			return result, nil
 		}
-
-		// Execute body
 		for _, b := range bodyExprs {
 			_, err := Eval(b, doEnv)
 			if err != nil {
 				return nil, err
 			}
 		}
-
-		// Compute step values (all using current env, parallel update)
 		newVals := make([]*Value, len(vars))
 		for i, v := range vars {
 			if v.stepIdx >= 0 {
@@ -898,7 +1277,6 @@ func evalDo(expr *Expr, env *Env) (*Value, error) {
 				}
 			}
 		}
-		// Apply step values
 		for i, v := range vars {
 			if v.stepIdx >= 0 {
 				doEnv.Set(v.name, newVals[i])
@@ -906,4 +1284,3 @@ func evalDo(expr *Expr, env *Env) (*Value, error) {
 		}
 	}
 }
-

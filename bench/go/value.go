@@ -24,6 +24,7 @@ const (
 	TypeGoFunc
 	TypeCaseLambda
 	TypeVector
+	TypeContinuation
 )
 
 type GoFunc func(args []*Value) (*Value, error)
@@ -70,6 +71,8 @@ type Value struct {
 	VecElems []*Value
 	// String mutability (mutable strings from string-copy, make-string, etc.)
 	Mutable bool
+	// Continuation (for TypeContinuation)
+	ContKont *KontFrame
 }
 
 var Void = &Value{Type: TypeVoid}
@@ -154,6 +157,8 @@ func (v *Value) Display() string {
 		return "#<procedure>"
 	case TypeCaseLambda:
 		return "#<procedure>"
+	case TypeContinuation:
+		return "#<continuation>"
 	case TypeVector:
 		var sb strings.Builder
 		sb.WriteString("#(")

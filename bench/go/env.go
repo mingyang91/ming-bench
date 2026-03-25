@@ -210,6 +210,10 @@ func makeGlobalEnv() *Env {
 	env.Set("string<=?", &Value{Type: TypeSymbol, StrVal: "builtin:string<=?"})
 	env.Set("string>=?", &Value{Type: TypeSymbol, StrVal: "builtin:string>=?"})
 
+	// First-class continuations (L18)
+	env.Set("call/cc", &Value{Type: TypeSymbol, StrVal: "builtin:call/cc"})
+	env.Set("call-with-current-continuation", &Value{Type: TypeSymbol, StrVal: "builtin:call/cc"})
+
 	return env
 }
 
@@ -1099,7 +1103,7 @@ func callBuiltin(name string, args []*Value, env *Env, line, col int) (*Value, e
 			return nil, fmt.Errorf("%d:%d: 'procedure?' expects 1 argument", line, col)
 		}
 		t := args[0].Type
-		isProcedure := t == TypeLambda || t == TypeGoFunc || t == TypeCaseLambda ||
+		isProcedure := t == TypeLambda || t == TypeGoFunc || t == TypeCaseLambda || t == TypeContinuation ||
 			(t == TypeSymbol && len(args[0].StrVal) > 8 && args[0].StrVal[:8] == "builtin:")
 		return BoolValue(isProcedure), nil
 

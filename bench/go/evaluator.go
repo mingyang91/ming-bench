@@ -15,17 +15,11 @@ func EvalStr(input string) (string, error) {
 	}
 
 	env := makeGlobalEnv()
-	var result *Value
-	for _, expr := range exprs {
-		val, err := Eval(expr, env)
-		if err != nil {
-			return "", &EvalError{Message: err.Error()}
-		}
-		if val.Type != TypeVoid {
-			result = val
-		}
+	result, err := cekEvalAll(exprs, env)
+	if err != nil {
+		return "", &EvalError{Message: err.Error()}
 	}
-	if result == nil {
+	if result == nil || result.Type == TypeVoid {
 		return "", nil
 	}
 	return result.Display(), nil
@@ -47,18 +41,12 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	var buf strings.Builder
 	env.output = &buf
 
-	var res *Value
-	for _, expr := range exprs {
-		val, evalErr := Eval(expr, env)
-		if evalErr != nil {
-			return "", "", &EvalError{Message: evalErr.Error()}
-		}
-		if val.Type != TypeVoid {
-			res = val
-		}
+	res, evalErr := cekEvalAll(exprs, env)
+	if evalErr != nil {
+		return "", "", &EvalError{Message: evalErr.Error()}
 	}
 	resultStr := ""
-	if res != nil {
+	if res != nil && res.Type != TypeVoid {
 		resultStr = res.Display()
 	}
 	return resultStr, buf.String(), nil
