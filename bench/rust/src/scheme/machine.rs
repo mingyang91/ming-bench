@@ -18,6 +18,15 @@ use std::rc::Rc;
 #[derive(Clone)]
 pub(super) struct Continuation {
     frames: Vec<Frame>,
+    winds: Vec<WindRef>,
+}
+
+pub(super) type WindRef = Rc<DynamicWind>;
+
+#[derive(Debug, Clone)]
+pub(super) struct DynamicWind {
+    in_thunk: Value,
+    out_thunk: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +100,25 @@ enum Frame {
         env: EnvRef,
         pos: SourcePos,
     },
+    DynamicWindAfterIn {
+        wind: WindRef,
+        body_thunk: Value,
+        pos: SourcePos,
+    },
+    DynamicWindAfterBody {
+        wind: WindRef,
+        pos: SourcePos,
+    },
+    DynamicWindAfterOut {
+        result: Value,
+    },
+    WindTransitionAfterOut {
+        transition: WindTransition,
+    },
+    WindTransitionAfterIn {
+        wind: WindRef,
+        transition: WindTransition,
+    },
     Letrec {
         current_index: usize,
         names: Vec<String>,
@@ -101,6 +129,16 @@ enum Frame {
         body: Vec<Expr>,
         pos: SourcePos,
     },
+}
+
+#[derive(Debug, Clone)]
+struct WindTransition {
+    exiting: Vec<WindRef>,
+    entering: Vec<WindRef>,
+    target_frames: Vec<Frame>,
+    target_winds: Vec<WindRef>,
+    value: Value,
+    pos: SourcePos,
 }
 
 impl fmt::Debug for Continuation {
@@ -368,6 +406,22 @@ fn resume_frame(
             stack,
             context,
         ),
+        Frame::DynamicWindAfterIn {
+            wind,
+            body_thunk,
+            pos,
+        } => resume_dynamic_wind_after_in(wind, body_thunk, pos, stack, context),
+        Frame::DynamicWindAfterBody { wind, pos } => {
+            resume_dynamic_wind_after_body(wind, pos, value, stack, context)
+        }
+        Frame::DynamicWindAfterOut { result } => Ok(MachineState::Value(result)),
+        Frame::WindTransitionAfterOut { transition } => {
+            continue_wind_transition(transition, stack, context)
+        }
+        Frame::WindTransitionAfterIn { wind, transition } => {
+            context.active_winds.push(wind);
+            continue_wind_transition(transition, stack, context)
+        }
         Frame::Letrec {
             current_index,
             names,
@@ -600,6 +654,30 @@ fn resume_named_let_frame(
         pos,
     });
     Ok(MachineState::Eval { expr: first, env })
+}
+
+fn resume_dynamic_wind_after_in(
+    wind: WindRef,
+    body_thunk: Value,
+    pos: SourcePos,
+    stack: &mut Vec<Frame>,
+    context: &mut EvalContext,
+) -> Result<MachineState, EvalError> {
+    context.active_winds.push(Rc::clone(&wind));
+    stack.push(Frame::DynamicWindAfterBody { wind, pos });
+    apply_machine(body_thunk, Vec::new(), pos, stack, context)
+}
+
+fn resume_dynamic_wind_after_body(
+    wind: WindRef,
+    pos: SourcePos,
+    result: Value,
+    stack: &mut Vec<Frame>,
+    context: &mut EvalContext,
+) -> Result<MachineState, EvalError> {
+    pop_active_wind(&mut context.active_winds, &wind);
+    stack.push(Frame::DynamicWindAfterOut { result });
+    apply_machine(wind.out_thunk.clone(), Vec::new(), pos, stack, context)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1090,6 +1168,9 @@ fn apply_machine(
 ) -> Result<MachineState, EvalError> {
     match operator {
         Value::Procedure(Procedure::Builtin("call/cc")) => apply_call_cc(args, pos, stack, context),
+        Value::Procedure(Procedure::Builtin("dynamic-wind")) => {
+            apply_dynamic_wind(args, pos, stack, context)
+        }
         Value::Procedure(Procedure::Builtin(name)) => {
             builtins::apply_builtin(name, &args, pos, context).map(MachineState::Value)
         }
@@ -1103,7 +1184,7 @@ fn apply_machine(
             start_sequence_state(&lambda.body, call_env, pos, stack)
         }
         Value::Procedure(Procedure::Continuation(continuation)) => {
-            apply_continuation(continuation, args, pos, stack)
+            apply_continuation(continuation, args, pos, stack, context)
         }
         Value::Procedure(Procedure::RecordConstructor(record_type)) => {
             apply_record_constructor(record_type, &args, pos).map(MachineState::Value)
@@ -1141,9 +1222,37 @@ fn apply_call_cc(
 
     let continuation = Value::Procedure(Procedure::Continuation(Rc::new(Continuation {
         frames: stack.clone(),
+        winds: context.active_winds.clone(),
     })));
 
     apply_machine(procedure.clone(), vec![continuation], pos, stack, context)
+}
+
+fn apply_dynamic_wind(
+    args: Vec<Value>,
+    pos: SourcePos,
+    stack: &mut Vec<Frame>,
+    context: &mut EvalContext,
+) -> Result<MachineState, EvalError> {
+    let [in_thunk, body_thunk, out_thunk] = args.as_slice() else {
+        return Err(wrong_arg_count(
+            pos,
+            "dynamic-wind",
+            "exactly 3 arguments",
+            args.len(),
+        ));
+    };
+
+    let wind = Rc::new(DynamicWind {
+        in_thunk: in_thunk.clone(),
+        out_thunk: out_thunk.clone(),
+    });
+    stack.push(Frame::DynamicWindAfterIn {
+        wind,
+        body_thunk: body_thunk.clone(),
+        pos,
+    });
+    apply_machine(in_thunk.clone(), Vec::new(), pos, stack, context)
 }
 
 fn apply_continuation(
@@ -1151,6 +1260,7 @@ fn apply_continuation(
     args: Vec<Value>,
     pos: SourcePos,
     stack: &mut Vec<Frame>,
+    context: &mut EvalContext,
 ) -> Result<MachineState, EvalError> {
     let [value] = args.as_slice() else {
         return Err(wrong_arg_count(
@@ -1161,8 +1271,70 @@ fn apply_continuation(
         ));
     };
 
-    *stack = continuation.frames.clone();
-    Ok(MachineState::Value(value.clone()))
+    let shared_len = shared_wind_prefix_len(&context.active_winds, &continuation.winds);
+    let exiting = context.active_winds[shared_len..].to_vec();
+    let entering = continuation.winds[shared_len..]
+        .iter()
+        .cloned()
+        .rev()
+        .collect::<Vec<_>>();
+
+    continue_wind_transition(
+        WindTransition {
+            exiting,
+            entering,
+            target_frames: continuation.frames.clone(),
+            target_winds: continuation.winds.clone(),
+            value: value.clone(),
+            pos,
+        },
+        stack,
+        context,
+    )
+}
+
+fn continue_wind_transition(
+    mut transition: WindTransition,
+    stack: &mut Vec<Frame>,
+    context: &mut EvalContext,
+) -> Result<MachineState, EvalError> {
+    if let Some(wind) = transition.exiting.pop() {
+        pop_active_wind(&mut context.active_winds, &wind);
+        let pos = transition.pos;
+        stack.push(Frame::WindTransitionAfterOut { transition });
+        return apply_machine(wind.out_thunk.clone(), Vec::new(), pos, stack, context);
+    }
+
+    if let Some(wind) = transition.entering.pop() {
+        let pos = transition.pos;
+        stack.push(Frame::WindTransitionAfterIn {
+            wind: Rc::clone(&wind),
+            transition,
+        });
+        return apply_machine(wind.in_thunk.clone(), Vec::new(), pos, stack, context);
+    }
+
+    context.active_winds = transition.target_winds;
+    *stack = transition.target_frames;
+    Ok(MachineState::Value(transition.value))
+}
+
+fn shared_wind_prefix_len(current: &[WindRef], target: &[WindRef]) -> usize {
+    current
+        .iter()
+        .zip(target.iter())
+        .take_while(|(left, right)| Rc::ptr_eq(left, right))
+        .count()
+}
+
+fn pop_active_wind(active_winds: &mut Vec<WindRef>, expected: &WindRef) {
+    let current = active_winds
+        .pop()
+        .expect("dynamic-wind stack must not be empty");
+    assert!(
+        Rc::ptr_eq(&current, expected),
+        "dynamic-wind stack out of sync"
+    );
 }
 
 fn expand_let_star(args: &[Expr], pos: SourcePos) -> Result<Expr, EvalError> {

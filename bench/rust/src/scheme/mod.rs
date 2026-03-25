@@ -16,7 +16,7 @@ use self::helpers::{
     invalid_argument, make_immutable_string_value, make_string_value, make_vector_value,
     number_error, syntax_error, type_mismatch, wrong_arg_count,
 };
-use self::machine::Continuation;
+use self::machine::{Continuation, WindRef};
 use self::macros::{expand_macro_call, parse_syntax_rules};
 use self::number::{parse_number_literal, Number, NumberError};
 use self::records::{
@@ -182,6 +182,7 @@ struct Env {
 struct EvalContext {
     output: String,
     next_fresh: usize,
+    active_winds: Vec<WindRef>,
 }
 
 #[derive(Debug)]

@@ -31,6 +31,7 @@ pub(super) fn builtin_name(name: &str) -> Option<&'static str> {
         "boolean?" => Some("boolean?"),
         "call-with-current-continuation" => Some("call/cc"),
         "call/cc" => Some("call/cc"),
+        "dynamic-wind" => Some("dynamic-wind"),
         "char-alphabetic?" => Some("char-alphabetic?"),
         "char->integer" => Some("char->integer"),
         "char-downcase" => Some("char-downcase"),
