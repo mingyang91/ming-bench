@@ -18,6 +18,13 @@ public class TestRunner {
         }
 
         String levelArg = args[0];
+
+        // Surprise levels have standalone test runners
+        if (levelArg.equals("27")) {
+            L27Tests.main(args);
+            return;
+        }
+
         int benchLevel = 0;
         if (!levelArg.equals("all")) {
             try {

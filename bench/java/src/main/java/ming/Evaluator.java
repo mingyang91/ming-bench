@@ -532,10 +532,16 @@ public class Evaluator {
     }
 
     // ── Trampoline ──────────────────────────────────────────────
+    private int stepLimit = -1; // -1 = unlimited
+
     private Val run(Step step) throws EvalError {
+        int steps = 0;
         while (true) {
             if (step instanceof Step.Apply a && a.k() instanceof Kont.HaltK) {
                 return a.value();
+            }
+            if (stepLimit >= 0 && ++steps > stepLimit) {
+                throw new EvalError("step limit exceeded");
             }
             try {
                 step = advance(step);
@@ -2155,5 +2161,24 @@ public class Evaluator {
         Val result = run(evalBodyStep(exprs, env, new Kont.HaltK()));
         String resultStr = (result instanceof Val.Void) ? "#<void>" : writeVal(result);
         return new EvalResult(resultStr, output.toString());
+    }
+
+    public String evalStrWithLimit(String input, int maxSteps) throws EvalError {
+        positions.clear();
+        output = new StringBuilder();
+        stepLimit = maxSteps;
+        try {
+            List<Token> tokens = tokenize(input);
+            if (tokens.isEmpty()) throw new EvalError("empty input");
+            int[] idx = {0};
+            Env env = createGlobalEnv();
+            List<Val> exprs = new ArrayList<>();
+            while (idx[0] < tokens.size()) exprs.add(parse(tokens, idx));
+            Val result = run(evalBodyStep(exprs, env, new Kont.HaltK()));
+            if (result instanceof Val.Void) return "#<void>";
+            return writeVal(result);
+        } finally {
+            stepLimit = -1;
+        }
     }
 }
