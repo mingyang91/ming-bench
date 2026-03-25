@@ -31,6 +31,10 @@ public class Interpreter {
         new SchemeValue.BuiltinVal("raise", null);
     private static final SchemeValue.BuiltinVal WITH_EXCEPTION_HANDLER_MARKER =
         new SchemeValue.BuiltinVal("with-exception-handler", null);
+    private static final SchemeValue.BuiltinVal VALUES_MARKER =
+        new SchemeValue.BuiltinVal("values", null);
+    private static final SchemeValue.BuiltinVal CALL_WITH_VALUES_MARKER =
+        new SchemeValue.BuiltinVal("call-with-values", null);
 
     // exception handler stack
     private final List<SchemeValue> exceptionHandlers = new ArrayList<>();
@@ -953,6 +957,10 @@ public class Interpreter {
         // L20: raise, with-exception-handler
         globals.define("raise", RAISE_MARKER);
         globals.define("with-exception-handler", WITH_EXCEPTION_HANDLER_MARKER);
+
+        // L21: values, call-with-values
+        globals.define("values", VALUES_MARKER);
+        globals.define("call-with-values", CALL_WITH_VALUES_MARKER);
     }
 
     // ---- CEK evaluation engine ----
@@ -1030,6 +1038,7 @@ public class Interpreter {
                 case SchemeValue.CaseLambdaVal v -> cekReturn(v, k);
                 case SchemeValue.VectorVal v -> cekReturn(v, k);
                 case SchemeValue.ContinuationVal v -> cekReturn(v, k);
+                case SchemeValue.ValuesVal v -> cekReturn(v, k);
                 case SchemeValue.TailCall tc -> cekEval(tc.expr(), tc.env(), k);
                 case SchemeValue.SymbolVal v -> cekReturn(env.get(v.name()), k);
                 case SchemeValue.ListVal v -> stepList(v, env, k);
@@ -1643,6 +1652,33 @@ public class Interpreter {
             applyProcCek(thunk, new SchemeValue[0], new Cont.Frame(result -> {
                 exceptionHandlers.remove(exceptionHandlers.size() - 1);
                 cekReturn(result, k);
+            }));
+            return;
+        }
+
+        // values
+        if (proc == VALUES_MARKER) {
+            if (args.length == 1) {
+                cekReturn(args[0], k);
+            } else {
+                cekReturn(new SchemeValue.ValuesVal(args), k);
+            }
+            return;
+        }
+
+        // call-with-values
+        if (proc == CALL_WITH_VALUES_MARKER) {
+            if (args.length != 2) throw new EvalError("call-with-values: expected 2 arguments");
+            var producer = args[0];
+            var consumer = args[1];
+            applyProcCek(producer, new SchemeValue[0], new Cont.Frame(result -> {
+                SchemeValue[] consumerArgs;
+                if (result instanceof SchemeValue.ValuesVal mv) {
+                    consumerArgs = mv.values();
+                } else {
+                    consumerArgs = new SchemeValue[]{result};
+                }
+                applyProcCek(consumer, consumerArgs, k);
             }));
             return;
         }
