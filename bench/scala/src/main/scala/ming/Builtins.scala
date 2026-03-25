@@ -39,7 +39,8 @@ object Builtins:
     "string-ref",
     "string-copy",
     "string-set!",
-    "char?"
+    "char?",
+    "apply"
   )
 
   private def isTruthy(v: SchemeVal): Boolean = v match
