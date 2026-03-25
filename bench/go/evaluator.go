@@ -53,6 +53,24 @@ func (b *BuiltinFunc) String() string {
 	return fmt.Sprintf("#<procedure %s>", b.Name)
 }
 
+// contInvokePanic is panicked when a continuation is invoked.
+type contInvokePanic struct {
+	cont  *ContinuationVal
+	value Value
+}
+
+// evalState tracks top-level evaluation context for continuation support.
+type evalState struct {
+	topExprs       []Expr
+	topEnv         *Env
+	curIdx         int
+	callccOverride *Value // non-nil when a continuation restart needs call/cc to return this value
+	bodyExprs      []Expr // current innermost body sequence (for body-level continuation capture)
+	bodyEnv        *Env   // environment for bodyExprs
+}
+
+var currentEvalState *evalState
+
 func evalExpr(expr Expr, env *Env) (Value, error) {
 	for {
 	switch e := expr.(type) {
@@ -206,6 +224,10 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 					rlEnv.set(ps.Name, v)
 				}
 				rlBody := e.Elems[2:]
+				if state := currentEvalState; state != nil {
+					state.bodyExprs = rlBody
+					state.bodyEnv = rlEnv
+				}
 				for _, bodyExpr := range rlBody[:len(rlBody)-1] {
 					if _, berr := evalExpr(bodyExpr, rlEnv); berr != nil {
 						return nil, berr
@@ -500,6 +522,16 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 			expr = clause.Body[len(clause.Body)-1]
 			env = clEnv
 			continue
+		case *CallCCVal:
+			if len(args) != 1 {
+				return nil, &EvalError{Message: "call/cc: need 1 argument"}
+			}
+			return handleCallCC(args[0])
+		case *ContinuationVal:
+			if len(args) != 1 {
+				return nil, &EvalError{Message: "continuation: need 1 argument"}
+			}
+			panic(contInvokePanic{cont: f, value: args[0]})
 		default:
 			line, col := e.Elems[0].pos()
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", line, col)}
@@ -1287,17 +1319,7 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 				if !ok {
 					return nil, &EvalError{Message: "for-each: not a proper list"}
 				}
-				var err error
-				switch f := fn.(type) {
-				case *BuiltinFunc:
-					_, err = f.Fn([]Value{p.Car})
-				case *LambdaVal:
-					_, err = applyLambda(f, []Value{p.Car})
-				case *CaseLambdaVal:
-					_, err = applyCaseLambda(f, []Value{p.Car})
-				default:
-					return nil, &EvalError{Message: "for-each: first argument must be a procedure"}
-				}
+				_, err := applyCallable(fn, []Value{p.Car})
 				if err != nil {
 					return nil, err
 				}
@@ -1324,17 +1346,7 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 			if allDone {
 				return &VoidVal{}, nil
 			}
-			var err error
-			switch f := fn.(type) {
-			case *BuiltinFunc:
-				_, err = f.Fn(callArgs)
-			case *LambdaVal:
-				_, err = applyLambda(f, callArgs)
-			case *CaseLambdaVal:
-				_, err = applyCaseLambda(f, callArgs)
-			default:
-				return nil, &EvalError{Message: "for-each: first argument must be a procedure"}
-			}
+			_, err := applyCallable(fn, callArgs)
 			if err != nil {
 				return nil, err
 			}
@@ -1416,16 +1428,7 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 			callArgs = append(callArgs, p.Car)
 			cur = p.Cdr
 		}
-		switch f := fn.(type) {
-		case *BuiltinFunc:
-			return f.Fn(callArgs)
-		case *LambdaVal:
-			return applyLambda(f, callArgs)
-		case *CaseLambdaVal:
-			return applyCaseLambda(f, callArgs)
-		default:
-			return nil, &EvalError{Message: "apply: first argument must be a procedure"}
-		}
+		return applyCallable(fn, callArgs)
 	}})
 
 	env.set("length", &BuiltinFunc{Name: "length", Fn: func(args []Value) (Value, error) {
@@ -1769,12 +1772,16 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 			return nil, &EvalError{Message: "procedure?: need 1 argument"}
 		}
 		switch args[0].(type) {
-		case *LambdaVal, *BuiltinFunc, *CaseLambdaVal:
+		case *LambdaVal, *BuiltinFunc, *CaseLambdaVal, *ContinuationVal, *CallCCVal:
 			return &BoolVal{Val: true}, nil
 		default:
 			return &BoolVal{Val: false}, nil
 		}
 	}})
+
+	// First-class continuations
+	env.set("call/cc", &CallCCVal{})
+	env.set("call-with-current-continuation", &CallCCVal{})
 
 	// eq? — identity/simple equality
 	env.set("eq?", &BuiltinFunc{Name: "eq?", Fn: func(args []Value) (Value, error) {
@@ -2260,18 +2267,7 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 			if done {
 				break
 			}
-			var val Value
-			var err error
-			switch f := fn.(type) {
-			case *BuiltinFunc:
-				val, err = f.Fn(callArgs)
-			case *LambdaVal:
-				val, err = applyLambda(f, callArgs)
-			case *CaseLambdaVal:
-				val, err = applyCaseLambda(f, callArgs)
-			default:
-				return nil, &EvalError{Message: "map: first argument must be a procedure"}
-			}
+			val, err := applyCallable(fn, callArgs)
 			if err != nil {
 				return nil, err
 			}
@@ -3077,6 +3073,84 @@ func schemeEqual(a, b Value) bool {
 
 // EvalStr evaluates one or more Scheme expressions and returns the string
 // representation of the last result.
+// handleCallCC implements call/cc. It captures the current continuation,
+// calls f with it, and handles both escape and reentrant invocations.
+func handleCallCC(f Value) (Value, error) {
+	state := currentEvalState
+
+	// Check for override (re-entry case: a saved continuation was invoked)
+	if state != nil && state.callccOverride != nil {
+		val := *state.callccOverride
+		state.callccOverride = nil
+		return val, nil
+	}
+
+	// Capture continuation: save the top-level expressions from the current
+	// expression onward and the environment, plus any body context
+	var cont *ContinuationVal
+	if state != nil {
+		topCopy := make([]Expr, len(state.topExprs)-state.curIdx)
+		copy(topCopy, state.topExprs[state.curIdx:])
+		cont = &ContinuationVal{
+			topExprs:  topCopy,
+			topEnv:    state.topEnv,
+			bodyExprs: state.bodyExprs,
+			bodyEnv:   state.bodyEnv,
+		}
+	} else {
+		cont = &ContinuationVal{}
+	}
+
+	// Call f(cont) with panic/recover for escape continuations
+	var result Value
+	var err error
+	escaped := false
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if ci, ok := r.(contInvokePanic); ok && ci.cont == cont {
+					// Escape: continuation invoked during f's execution
+					result = ci.value
+					escaped = true
+					return
+				}
+				panic(r) // re-panic for other continuations or real panics
+			}
+		}()
+		result, err = applyCallable(f, []Value{cont})
+	}()
+
+	if escaped {
+		return result, nil
+	}
+	return result, err
+}
+
+// applyCallable calls any callable value with the given arguments.
+func applyCallable(f Value, args []Value) (Value, error) {
+	switch fn := f.(type) {
+	case *LambdaVal:
+		return applyLambda(fn, args)
+	case *BuiltinFunc:
+		return fn.Fn(args)
+	case *CaseLambdaVal:
+		return applyCaseLambda(fn, args)
+	case *ContinuationVal:
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "continuation: need 1 argument"}
+		}
+		panic(contInvokePanic{cont: fn, value: args[0]})
+	case *CallCCVal:
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "call/cc: need 1 argument"}
+		}
+		return handleCallCC(args[0])
+	default:
+		return nil, &EvalError{Message: "not a procedure"}
+	}
+}
+
 func EvalStr(input string) (string, error) {
 	r, _, err := EvalStrWithOutput(input)
 	return r, err
@@ -3094,17 +3168,78 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	}
 	var buf strings.Builder
 	env := makeGlobalEnv(&buf)
-	var last Value
-	for _, expr := range exprs {
-		last, err = evalExpr(expr, env)
-		if err != nil {
-			return "", "", err
-		}
+	last, evalErr := evalTopLevel(exprs, env)
+	if evalErr != nil {
+		return "", "", evalErr
 	}
 	if _, ok := last.(*VoidVal); ok {
 		return "", buf.String(), nil
 	}
 	return last.String(), buf.String(), nil
+}
+
+// evalTopLevel evaluates a sequence of top-level expressions, handling
+// continuation restarts when a saved continuation is invoked.
+func evalTopLevel(exprs []Expr, env *Env) (Value, error) {
+	state := &evalState{
+		topExprs: exprs,
+		topEnv:   env,
+	}
+	prevState := currentEvalState
+	currentEvalState = state
+	defer func() { currentEvalState = prevState }()
+
+	for {
+		var last Value
+		var evalErr error
+		var restart *contInvokePanic
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if ci, ok := r.(contInvokePanic); ok {
+						restart = &ci
+						return
+					}
+					panic(r)
+				}
+			}()
+
+			for i := 0; i < len(state.topExprs); i++ {
+				state.curIdx = i
+				last, evalErr = evalExpr(state.topExprs[i], state.topEnv)
+				if evalErr != nil {
+					return
+				}
+			}
+		}()
+
+		if evalErr != nil {
+			return nil, evalErr
+		}
+		if restart != nil {
+			// A saved continuation was invoked. Set override and re-evaluate.
+			val := restart.value
+			state.callccOverride = &val
+			if restart.cont.bodyExprs != nil {
+				// Continuation was captured inside a body sequence (e.g., let body).
+				// Restart from the body expressions in the captured environment
+				// to preserve mutated bindings.
+				state.topExprs = restart.cont.bodyExprs
+				state.topEnv = restart.cont.bodyEnv
+			} else {
+				// Restart from the top-level expressions.
+				state.topExprs = restart.cont.topExprs
+				state.topEnv = restart.cont.topEnv
+			}
+			state.bodyExprs = nil
+			state.bodyEnv = nil
+			state.curIdx = 0
+			continue
+		}
+
+		return last, nil
+	}
 }
 
 // evalDefineRecordType implements R7RS define-record-type.

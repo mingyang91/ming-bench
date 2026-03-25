@@ -60,6 +60,25 @@ func (v *CaseLambdaVal) String() string {
 	return "#<procedure>"
 }
 
+// CallCCVal is the call/cc primitive, stored as a first-class value.
+type CallCCVal struct{}
+
+func (v *CallCCVal) String() string {
+	return "#<procedure call-with-current-continuation>"
+}
+
+// ContinuationVal is a captured continuation from call/cc.
+type ContinuationVal struct {
+	topExprs  []Expr // top-level expressions from the capturing expression onward
+	topEnv    *Env   // top-level environment (shared, mutable)
+	bodyExprs []Expr // if non-nil, restart from these body expressions instead
+	bodyEnv   *Env   // environment for bodyExprs
+}
+
+func (v *ContinuationVal) String() string {
+	return "#<continuation>"
+}
+
 func (v *IntVal) String() string {
 	return fmt.Sprintf("%d", v.Val)
 }
