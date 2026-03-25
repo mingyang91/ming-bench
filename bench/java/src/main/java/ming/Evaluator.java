@@ -11,7 +11,7 @@ import java.util.Set;
 public class Evaluator {
 
     // ── Value types ──────────────────────────────────────────────
-    private sealed interface Val permits Val.Int, Val.Rat, Val.Flo, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda, Val.Macro, Val.RecordInstance {
+    private sealed interface Val permits Val.Int, Val.Rat, Val.Flo, Val.Bool, Val.Str, Val.Sym, Val.Chr, Val.PairV, Val.Nil, Val.Void, Val.Builtin, Val.Lambda, Val.CaseLambda, Val.Macro, Val.RecordInstance {
         record Int(long value) implements Val {}
         record Rat(long num, long den) implements Val {}
         record Flo(double value) implements Val {}
@@ -30,6 +30,7 @@ public class Evaluator {
         record Void() implements Val {}
         record Builtin(String name, java.util.function.Function<List<Val>, Val> fn) implements Val {}
         record Lambda(List<String> params, String restParam, List<Val> body, Env closure) implements Val {}
+        record CaseLambda(List<Lambda> clauses) implements Val {}
         final class RecordInstance implements Val {
             final Object tag; // identity object for type distinction
             final String typeName;
@@ -132,6 +133,7 @@ public class Evaluator {
             case Val.PairV p -> writePair(p);
             case Val.Builtin b -> "#<procedure:" + b.name() + ">";
             case Val.Lambda ignored -> "#<procedure>";
+            case Val.CaseLambda ignored -> "#<procedure>";
             case Val.RecordInstance r -> "#<record:" + r.typeName + ">";
             case Val.Macro m -> "#<macro:" + m.name + ">";
         };
@@ -361,6 +363,7 @@ public class Evaluator {
             case Val.Chr c -> c;
             case Val.Builtin b -> b;
             case Val.Lambda l -> l;
+            case Val.CaseLambda cl -> cl;
             case Val.Macro m -> m;
             case Val.RecordInstance r -> r;
             case Val.Sym sym -> {
@@ -410,6 +413,7 @@ public class Evaluator {
                 case "or" -> { return evalOr(pair.cdr(), env); }
                 case "define-syntax" -> { return evalDefineSyntax(pair, env); }
                 case "define-record-type" -> { return evalDefineRecordType(pair.cdr(), env, pair); }
+                case "case-lambda" -> { return evalCaseLambda(pair.cdr(), env, pair); }
             }
         }
 
@@ -429,6 +433,17 @@ public class Evaluator {
             } catch (RuntimeException e) {
                 throw posError(callSite, e.getMessage());
             }
+        }
+        if (fn instanceof Val.CaseLambda cl) {
+            for (Val.Lambda clause : cl.clauses()) {
+                int required = clause.params().size();
+                if (clause.restParam() != null) {
+                    if (args.size() >= required) return applyFn(clause, args, callSite);
+                } else {
+                    if (args.size() == required) return applyFn(clause, args, callSite);
+                }
+            }
+            throw posError(callSite, "no matching clause for " + args.size() + " arguments");
         }
         if (fn instanceof Val.Lambda lambda) {
             int required = lambda.params().size();
@@ -522,6 +537,34 @@ public class Evaluator {
         List<Val> body = collectList(p.cdr());
         if (body.isEmpty()) throw posError(form, "lambda: missing body");
         return new Val.Lambda(params, restParam, body, env);
+    }
+
+    private Val evalCaseLambda(Val args, Env env, Val form) throws EvalError {
+        List<Val.Lambda> clauses = new ArrayList<>();
+        Val cur = args;
+        while (cur instanceof Val.PairV p) {
+            Val clauseVal = p.car();
+            if (!(clauseVal instanceof Val.PairV clause))
+                throw posError(form, "case-lambda: invalid clause");
+            List<String> params = new ArrayList<>();
+            String restParam = null;
+            Val paramList = clause.car();
+            while (paramList instanceof Val.PairV pp) {
+                if (!(pp.car() instanceof Val.Sym paramSym))
+                    throw posError(form, "case-lambda: expected parameter name");
+                params.add(paramSym.name());
+                paramList = pp.cdr();
+            }
+            if (paramList instanceof Val.Sym restSym) {
+                restParam = restSym.name();
+            }
+            List<Val> body = collectList(clause.cdr());
+            if (body.isEmpty()) throw posError(form, "case-lambda: clause missing body");
+            clauses.add(new Val.Lambda(params, restParam, body, env));
+            cur = p.cdr();
+        }
+        if (clauses.isEmpty()) throw posError(form, "case-lambda: no clauses");
+        return new Val.CaseLambda(clauses);
     }
 
     private Val evalAnd(Val args, Env env) throws EvalError {
@@ -1082,6 +1125,11 @@ public class Evaluator {
         env.define("null?", new Val.Builtin("null?", args -> {
             checkArgCount(args, 1, "null?");
             return new Val.Bool(args.get(0) instanceof Val.Nil);
+        }));
+        env.define("procedure?", new Val.Builtin("procedure?", args -> {
+            checkArgCount(args, 1, "procedure?");
+            Val v = args.get(0);
+            return new Val.Bool(v instanceof Val.Lambda || v instanceof Val.CaseLambda || v instanceof Val.Builtin);
         }));
         env.define("list", new Val.Builtin("list", args -> {
             Val result = new Val.Nil();
