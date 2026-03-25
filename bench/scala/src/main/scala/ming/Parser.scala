@@ -99,7 +99,7 @@ object Parser:
         case _                  => throw new EvalError(s"unknown character literal: $token")
       SchemeVal.SChar(c)
     else if token.startsWith("\"") && token.endsWith("\"") then
-      SchemeVal.SString(new StringBuilder(unescapeString(token.substring(1, token.length - 1))))
+      SchemeVal.SString(new StringBuilder(unescapeString(token.substring(1, token.length - 1))), false)
     else
       token.toLongOption match
         case Some(n) => SchemeVal.SInt(n)

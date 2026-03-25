@@ -14,7 +14,7 @@ object Evaluator:
     try
       expr match
         case SchemeVal.SInt(_) | SchemeVal.SFloat(_) | SchemeVal.SRational(_, _) | SchemeVal.SBool(_) |
-            SchemeVal.SString(_) | SchemeVal.SChar(_) | SchemeVal.SVoid | SchemeVal.SPair(_, _) |
+            SchemeVal.SString(_, _) | SchemeVal.SChar(_) | SchemeVal.SVoid | SchemeVal.SPair(_, _) |
             SchemeVal.SVector(_) =>
           expr
         case SchemeVal.SSymbol(name) => env.get(name)

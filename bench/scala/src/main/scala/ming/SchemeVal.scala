@@ -9,7 +9,7 @@ enum SchemeVal:
   case SFloat(value: Double)
   case SRational(num: Long, den: Long)
   case SBool(value: Boolean)
-  case SString(value: StringBuilder)
+  case SString(value: StringBuilder, mutable: Boolean)
   case SSymbol(name: String)
   case SChar(value: Char)
   case SList(elems: List[SchemeVal])
@@ -55,7 +55,7 @@ enum SchemeVal:
     case SRational(n, d) =>
       if d == 1 then n.toString else s"$n/$d"
     case SBool(v)   => if v then "#t" else "#f"
-    case SString(v) => s""""${v.toString}""""
+    case SString(v, _) => s""""${v.toString}""""
     case SSymbol(n) => n
     case SChar(c) =>
       c match
@@ -80,7 +80,7 @@ enum SchemeVal:
 
   /** Display representation (no quotes for strings). */
   def displayRepr: String = this match
-    case SString(v) => v.toString
+    case SString(v, _) => v.toString
     case SChar(c)   => c.toString
     case other      => other.display
 

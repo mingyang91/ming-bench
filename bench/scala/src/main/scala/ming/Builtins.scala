@@ -93,7 +93,12 @@ object Builtins:
     "vector-length",
     "vector?",
     "vector->list",
-    "list->vector"
+    "list->vector",
+    // L15
+    "string->list",
+    "list->string",
+    "char->integer",
+    "integer->char"
   )
 
   private def isTruthy(v: SchemeVal): Boolean = v match
@@ -120,7 +125,7 @@ object Builtins:
     case (SchemeVal.SRational(n1, d1), SchemeVal.SRational(n2, d2)) => n1 == n2 && d1 == d2
     case _ if isNumeric(a) && isNumeric(b)                          => toDouble(a) == toDouble(b)
     case (SchemeVal.SBool(x), SchemeVal.SBool(y))                   => x == y
-    case (SchemeVal.SString(x), SchemeVal.SString(y))               => x.toString == y.toString
+    case (SchemeVal.SString(x, _), SchemeVal.SString(y, _))         => x.toString == y.toString
     case (SchemeVal.SSymbol(x), SchemeVal.SSymbol(y))               => x == y
     case (SchemeVal.SChar(x), SchemeVal.SChar(y))                   => x == y
     case (SchemeVal.SList(xs), SchemeVal.SList(ys)) =>
@@ -180,8 +185,18 @@ object Builtins:
         NumericOps.applyCharOp(name, args)
       case "string-append" | "string-length" | "substring" | "string->number" | "number->string" | "symbol->string" |
           "string->symbol" | "string-ref" | "string-copy" | "string-set!" | "string=?" | "string<?" | "string-ci=?" |
-          "string-upcase" | "string-downcase" =>
+          "string-upcase" | "string-downcase" | "string->list" | "list->string" =>
         StringOps(name, args)
+      case "char->integer" =>
+        if args.length != 1 then throw new EvalError("char->integer: expected 1 argument")
+        args.head match
+          case SchemeVal.SChar(c) => SchemeVal.SInt(c.toLong)
+          case other              => throw new EvalError(s"char->integer: expected char, got ${other.display}")
+      case "integer->char" =>
+        if args.length != 1 then throw new EvalError("integer->char: expected 1 argument")
+        args.head match
+          case SchemeVal.SInt(n) => SchemeVal.SChar(n.toChar)
+          case other             => throw new EvalError(s"integer->char: expected integer, got ${other.display}")
       case "eq?" =>
         val (a, b) = requireTwo("eq?", args)
         SchemeVal.SBool(schemeEq(a, b))
