@@ -30,6 +30,17 @@ func (e *Env) set(name string, val Value) {
 	e.bindings[name] = val
 }
 
+func (e *Env) setExisting(name string, val Value) bool {
+	if _, ok := e.bindings[name]; ok {
+		e.bindings[name] = val
+		return true
+	}
+	if e.parent != nil {
+		return e.parent.setExisting(name, val)
+	}
+	return false
+}
+
 // BuiltinFunc is a built-in procedure.
 type BuiltinFunc struct {
 	Name string
@@ -84,6 +95,22 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 				return evalAnd(e.Elems[1:], env)
 			case "or":
 				return evalOr(e.Elems[1:], env)
+			case "set!":
+				if len(e.Elems) != 3 {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set! requires 2 arguments", sym.Line, sym.Col)}
+				}
+				target, ok := e.Elems[1].(*SymbolExpr)
+				if !ok {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: expected symbol", sym.Line, sym.Col)}
+				}
+				val, err := evalExpr(e.Elems[2], env)
+				if err != nil {
+					return nil, err
+				}
+				if !env.setExisting(target.Name, val) {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: unbound variable: %s", target.Line, target.Col, target.Name)}
+				}
+				return &VoidVal{}, nil
 			case "not":
 				if len(e.Elems) != 2 {
 					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not requires 1 argument", sym.Line, sym.Col)}
