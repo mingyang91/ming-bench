@@ -78,6 +78,16 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", e.Line, e.Col, e.Name)}
 		}
 		return v, nil
+	case *VectorExpr:
+		elems := make([]Value, len(e.Elems))
+		for i, elem := range e.Elems {
+			v, err := evalExpr(elem, env)
+			if err != nil {
+				return nil, err
+			}
+			elems[i] = v
+		}
+		return &VectorVal{Elems: elems}, nil
 	case *ListExpr:
 		if len(e.Elems) == 0 {
 			return &NilVal{}, nil
@@ -137,6 +147,14 @@ func evalExpr(expr Expr, env *Env) (Value, error) {
 				return evalDefineSyntax(e, env)
 			case "define-record-type":
 				return evalDefineRecordType(e, env)
+			case "letrec":
+				return evalLetrec(e, env, false)
+			case "letrec*":
+				return evalLetrec(e, env, true)
+			case "case":
+				return evalCase(e, env)
+			case "do":
+				return evalDo(e, env)
 			}
 			// Check if symbol is bound to a macro
 			if v, ok := env.get(sym.Name); ok {
@@ -395,6 +413,16 @@ func quoteExpr(expr Expr) (Value, error) {
 			result = &PairVal{Car: car, Cdr: result}
 		}
 		return result, nil
+	case *VectorExpr:
+		elems := make([]Value, len(e.Elems))
+		for i, elem := range e.Elems {
+			v, err := quoteExpr(elem)
+			if err != nil {
+				return nil, err
+			}
+			elems[i] = v
+		}
+		return &VectorVal{Elems: elems}, nil
 	}
 	return nil, &EvalError{Message: "quote: unsupported expression type"}
 }
@@ -523,6 +551,215 @@ func evalLet(e *ListExpr, env *Env) (Value, error) {
 		}
 	}
 	return result, nil
+}
+
+func evalLetrec(e *ListExpr, env *Env, star bool) (Value, error) {
+	if len(e.Elems) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: letrec requires bindings and body", e.Line, e.Col)}
+	}
+	bindList, ok := e.Elems[1].(*ListExpr)
+	if !ok {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: expected binding list", e.Line, e.Col)}
+	}
+	letEnv := newEnv(env)
+	// Initialize all bindings to void
+	names := make([]string, len(bindList.Elems))
+	for i, b := range bindList.Elems {
+		pair, ok := b.(*ListExpr)
+		if !ok || len(pair.Elems) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: bad binding", e.Line, e.Col)}
+		}
+		ps, ok := pair.Elems[0].(*SymbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: expected symbol", e.Line, e.Col)}
+		}
+		names[i] = ps.Name
+		letEnv.set(ps.Name, &VoidVal{})
+	}
+	if star {
+		// letrec*: evaluate each init in letEnv sequentially
+		for i, b := range bindList.Elems {
+			pair := b.(*ListExpr)
+			v, err := evalExpr(pair.Elems[1], letEnv)
+			if err != nil {
+				return nil, err
+			}
+			letEnv.set(names[i], v)
+		}
+	} else {
+		// letrec: evaluate all inits in letEnv, then assign
+		vals := make([]Value, len(bindList.Elems))
+		for i, b := range bindList.Elems {
+			pair := b.(*ListExpr)
+			v, err := evalExpr(pair.Elems[1], letEnv)
+			if err != nil {
+				return nil, err
+			}
+			vals[i] = v
+		}
+		for i, name := range names {
+			letEnv.set(name, vals[i])
+		}
+	}
+	var result Value
+	for _, bodyExpr := range e.Elems[2:] {
+		var err error
+		result, err = evalExpr(bodyExpr, letEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalCase(e *ListExpr, env *Env) (Value, error) {
+	if len(e.Elems) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case requires key and clauses", e.Line, e.Col)}
+	}
+	key, err := evalExpr(e.Elems[1], env)
+	if err != nil {
+		return nil, err
+	}
+	for _, clause := range e.Elems[2:] {
+		cl, ok := clause.(*ListExpr)
+		if !ok || len(cl.Elems) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case: bad clause", e.Line, e.Col)}
+		}
+		// Check for else clause
+		if sym, ok := cl.Elems[0].(*SymbolExpr); ok && sym.Name == "else" {
+			var result Value
+			for _, bodyExpr := range cl.Elems[1:] {
+				result, err = evalExpr(bodyExpr, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		// Datum list
+		datums, ok := cl.Elems[0].(*ListExpr)
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case: expected datum list", e.Line, e.Col)}
+		}
+		matched := false
+		for _, d := range datums.Elems {
+			dv, err := quoteExpr(d)
+			if err != nil {
+				return nil, err
+			}
+			if schemeEqv(key, dv) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			var result Value
+			for _, bodyExpr := range cl.Elems[1:] {
+				result, err = evalExpr(bodyExpr, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+	}
+	// No match, no else — return void
+	return &VoidVal{}, nil
+}
+
+func evalDo(e *ListExpr, env *Env) (Value, error) {
+	// (do ((var init step) ...) (test expr ...) body ...)
+	if len(e.Elems) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: do requires bindings and test", e.Line, e.Col)}
+	}
+	bindList, ok := e.Elems[1].(*ListExpr)
+	if !ok {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: do: expected binding list", e.Line, e.Col)}
+	}
+	testClause, ok := e.Elems[2].(*ListExpr)
+	if !ok || len(testClause.Elems) == 0 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: do: expected test clause", e.Line, e.Col)}
+	}
+	body := e.Elems[3:]
+
+	type doVar struct {
+		name string
+		step Expr // nil if no step
+	}
+
+	vars := make([]doVar, len(bindList.Elems))
+	doEnv := newEnv(env)
+
+	// Initialize variables
+	for i, b := range bindList.Elems {
+		binding, ok := b.(*ListExpr)
+		if !ok || len(binding.Elems) < 2 || len(binding.Elems) > 3 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: do: bad variable spec", e.Line, e.Col)}
+		}
+		sym, ok := binding.Elems[0].(*SymbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: do: expected symbol", e.Line, e.Col)}
+		}
+		initVal, err := evalExpr(binding.Elems[1], env)
+		if err != nil {
+			return nil, err
+		}
+		vars[i].name = sym.Name
+		if len(binding.Elems) == 3 {
+			vars[i].step = binding.Elems[2]
+		}
+		doEnv.set(sym.Name, initVal)
+	}
+
+	// Iteration loop
+	for {
+		// Evaluate test
+		testVal, err := evalExpr(testClause.Elems[0], doEnv)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(testVal) {
+			// Test is true — evaluate result expressions
+			if len(testClause.Elems) == 1 {
+				return &VoidVal{}, nil
+			}
+			var result Value
+			for _, expr := range testClause.Elems[1:] {
+				result, err = evalExpr(expr, doEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+
+		// Evaluate body
+		for _, bodyExpr := range body {
+			_, err := evalExpr(bodyExpr, doEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// Evaluate step expressions using PREVIOUS values (parallel update)
+		newVals := make([]Value, len(vars))
+		for i, v := range vars {
+			if v.step != nil {
+				val, err := evalExpr(v.step, doEnv)
+				if err != nil {
+					return nil, err
+				}
+				newVals[i] = val
+			} else {
+				val, _ := doEnv.get(v.name)
+				newVals[i] = val
+			}
+		}
+		// Update all at once
+		for i, v := range vars {
+			doEnv.set(v.name, newVals[i])
+		}
+	}
 }
 
 func evalCond(e *ListExpr, env *Env) (Value, error) {
@@ -1516,6 +1753,131 @@ func makeGlobalEnv(output *strings.Builder) *Env {
 		return &StringVal{Val: strings.ToLower(s.Val)}, nil
 	}})
 
+	// eqv?
+	env.set("eqv?", &BuiltinFunc{Name: "eqv?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "eqv?: need 2 arguments"}
+		}
+		return &BoolVal{Val: schemeEqv(args[0], args[1])}, nil
+	}})
+
+	// Vector operations
+	env.set("vector", &BuiltinFunc{Name: "vector", Fn: func(args []Value) (Value, error) {
+		elems := make([]Value, len(args))
+		copy(elems, args)
+		return &VectorVal{Elems: elems}, nil
+	}})
+
+	env.set("make-vector", &BuiltinFunc{Name: "make-vector", Fn: func(args []Value) (Value, error) {
+		if len(args) < 1 || len(args) > 2 {
+			return nil, &EvalError{Message: "make-vector: need 1 or 2 arguments"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "make-vector: first argument must be integer"}
+		}
+		var fill Value = &IntVal{Val: 0}
+		if len(args) == 2 {
+			fill = args[1]
+		}
+		elems := make([]Value, n.Val)
+		for i := range elems {
+			elems[i] = fill
+		}
+		return &VectorVal{Elems: elems}, nil
+	}})
+
+	env.set("vector-ref", &BuiltinFunc{Name: "vector-ref", Fn: func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "vector-ref: need 2 arguments"}
+		}
+		vec, ok := args[0].(*VectorVal)
+		if !ok {
+			return nil, &EvalError{Message: "vector-ref: not a vector"}
+		}
+		idx, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "vector-ref: index must be integer"}
+		}
+		if idx.Val < 0 || idx.Val >= int64(len(vec.Elems)) {
+			return nil, &EvalError{Message: "vector-ref: index out of range"}
+		}
+		return vec.Elems[idx.Val], nil
+	}})
+
+	env.set("vector-set!", &BuiltinFunc{Name: "vector-set!", Fn: func(args []Value) (Value, error) {
+		if len(args) != 3 {
+			return nil, &EvalError{Message: "vector-set!: need 3 arguments"}
+		}
+		vec, ok := args[0].(*VectorVal)
+		if !ok {
+			return nil, &EvalError{Message: "vector-set!: not a vector"}
+		}
+		idx, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "vector-set!: index must be integer"}
+		}
+		if idx.Val < 0 || idx.Val >= int64(len(vec.Elems)) {
+			return nil, &EvalError{Message: "vector-set!: index out of range"}
+		}
+		vec.Elems[idx.Val] = args[2]
+		return &VoidVal{}, nil
+	}})
+
+	env.set("vector-length", &BuiltinFunc{Name: "vector-length", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "vector-length: need 1 argument"}
+		}
+		vec, ok := args[0].(*VectorVal)
+		if !ok {
+			return nil, &EvalError{Message: "vector-length: not a vector"}
+		}
+		return &IntVal{Val: int64(len(vec.Elems))}, nil
+	}})
+
+	env.set("vector?", &BuiltinFunc{Name: "vector?", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "vector?: need 1 argument"}
+		}
+		_, ok := args[0].(*VectorVal)
+		return &BoolVal{Val: ok}, nil
+	}})
+
+	env.set("vector->list", &BuiltinFunc{Name: "vector->list", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "vector->list: need 1 argument"}
+		}
+		vec, ok := args[0].(*VectorVal)
+		if !ok {
+			return nil, &EvalError{Message: "vector->list: not a vector"}
+		}
+		var result Value = &NilVal{}
+		for i := len(vec.Elems) - 1; i >= 0; i-- {
+			result = &PairVal{Car: vec.Elems[i], Cdr: result}
+		}
+		return result, nil
+	}})
+
+	env.set("list->vector", &BuiltinFunc{Name: "list->vector", Fn: func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "list->vector: need 1 argument"}
+		}
+		var elems []Value
+		cur := args[0]
+		for {
+			switch v := cur.(type) {
+			case *PairVal:
+				elems = append(elems, v.Car)
+				cur = v.Cdr
+				continue
+			case *NilVal:
+				return &VectorVal{Elems: elems}, nil
+			default:
+				return nil, &EvalError{Message: "list->vector: not a proper list"}
+			}
+		}
+	}})
+
 	return env
 }
 
@@ -1749,8 +2111,18 @@ func schemeEq(a, b Value) bool {
 		}
 	case *PairVal:
 		return a == b // pointer identity
+	case *VoidVal:
+		_, ok := b.(*VoidVal)
+		return ok
+	case *VectorVal:
+		return a == b // pointer identity
 	}
 	return false
+}
+
+// schemeEqv is like eq? but compares numbers by value and characters by value.
+func schemeEqv(a, b Value) bool {
+	return schemeEq(a, b)
 }
 
 func schemeEqual(a, b Value) bool {
@@ -1763,6 +2135,19 @@ func schemeEqual(a, b Value) bool {
 	case *StringVal:
 		if bv, ok := b.(*StringVal); ok {
 			return av.Val == bv.Val
+		}
+		return false
+	case *VectorVal:
+		if bv, ok := b.(*VectorVal); ok {
+			if len(av.Elems) != len(bv.Elems) {
+				return false
+			}
+			for i := range av.Elems {
+				if !schemeEqual(av.Elems[i], bv.Elems[i]) {
+					return false
+				}
+			}
+			return true
 		}
 		return false
 	case *NilVal:

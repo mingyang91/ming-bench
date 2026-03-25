@@ -21,6 +21,7 @@ const (
 	tokChar
 	tokFloat
 	tokRational
+	tokVecOpen // #(
 	tokEOF
 )
 
@@ -126,6 +127,12 @@ func tokenize(input string) ([]token, error) {
 		if ch == '#' {
 			if i+1 < len(input) {
 				next := input[i+1]
+				if next == '(' {
+					tokens = append(tokens, token{tokVecOpen, "#(", line, startCol})
+					i += 2
+					col += 2
+					continue
+				}
 				if next == 't' && (i+2 >= len(input) || isDelimiter(input[i+2])) {
 					tokens = append(tokens, token{tokBool, "#t", line, startCol})
 					i += 2
@@ -271,6 +278,12 @@ type ListExpr struct {
 	Col   int
 }
 
+type VectorExpr struct {
+	Elems []Expr
+	Line  int
+	Col   int
+}
+
 type CharExpr struct {
 	Val  rune
 	Line int
@@ -297,6 +310,7 @@ func (e *ListExpr) pos() (int, int)     { return e.Line, e.Col }
 func (e *CharExpr) pos() (int, int)     { return e.Line, e.Col }
 func (e *FloatExpr) pos() (int, int)    { return e.Line, e.Col }
 func (e *RationalExpr) pos() (int, int) { return e.Line, e.Col }
+func (e *VectorExpr) pos() (int, int)   { return e.Line, e.Col }
 
 type parser struct {
 	tokens []token
@@ -370,6 +384,21 @@ func (p *parser) parseExpr() (Expr, error) {
 			Line:  t.line,
 			Col:   t.col,
 		}, nil
+	case tokVecOpen:
+		p.next()
+		var elems []Expr
+		for p.peek().kind != tokRParen {
+			if p.peek().kind == tokEOF {
+				return nil, fmt.Errorf("%d:%d: unexpected end of input in vector", t.line, t.col)
+			}
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, e)
+		}
+		p.next() // consume )
+		return &VectorExpr{Elems: elems, Line: t.line, Col: t.col}, nil
 	case tokLParen:
 		p.next()
 		var elems []Expr

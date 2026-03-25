@@ -21,6 +21,7 @@ type PairVal struct{ Car, Cdr Value }
 type NilVal struct{}
 type VoidVal struct{}
 type CharVal struct{ Val rune }
+type VectorVal struct{ Elems []Value }
 
 // RecordTypeTag is a unique identifier for a record type.
 type RecordTypeTag struct{ Name string }
@@ -181,6 +182,19 @@ func (v *CharVal) String() string {
 	}
 }
 
+func (v *VectorVal) String() string {
+	var buf strings.Builder
+	buf.WriteString("#(")
+	for i, e := range v.Elems {
+		if i > 0 {
+			buf.WriteByte(' ')
+		}
+		buf.WriteString(e.String())
+	}
+	buf.WriteByte(')')
+	return buf.String()
+}
+
 func (v *PairVal) String() string {
 	var buf strings.Builder
 	buf.WriteByte('(')
@@ -213,6 +227,17 @@ func displayValue(v Value) string {
 		return val.Val
 	case *CharVal:
 		return string(val.Val)
+	case *VectorVal:
+		var buf strings.Builder
+		buf.WriteString("#(")
+		for i, e := range val.Elems {
+			if i > 0 {
+				buf.WriteByte(' ')
+			}
+			buf.WriteString(displayValue(e))
+		}
+		buf.WriteByte(')')
+		return buf.String()
 	case *PairVal:
 		var buf strings.Builder
 		buf.WriteByte('(')
