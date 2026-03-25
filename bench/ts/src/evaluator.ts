@@ -160,6 +160,7 @@ interface ContinuationProcedureValue {
   name: string;
   continuation: Continuation;
   dynamicWindFrames: DynamicWindFrame[];
+  exceptionHandlerFrames: ExceptionHandlerFrame[];
 }
 
 interface Binding {
@@ -169,6 +170,11 @@ interface Binding {
 interface DynamicWindFrame {
   inThunk: SchemeValue;
   outThunk: SchemeValue;
+}
+
+interface ExceptionHandlerFrame {
+  dynamicWindFrames: DynamicWindFrame[];
+  handle(value: SchemeValue, location?: SourceLocation): Computation;
 }
 
 interface ParserState {
@@ -315,6 +321,7 @@ const SPECIAL_FORM_NAMES = new Set([
   'define-record-type',
   'define-syntax',
   'do',
+  'guard',
   'if',
   'lambda',
   'let',
@@ -329,6 +336,7 @@ let nextTemplateId = 1;
 let nextIntroducedIdentifierId = 1;
 let nextRecordTypeId = 1;
 let currentDynamicWindFrames: DynamicWindFrame[] = [];
+let currentExceptionHandlerFrames: ExceptionHandlerFrame[] = [];
 
 /**
  * Evaluate one or more Scheme expressions and return the string
@@ -355,12 +363,14 @@ function evaluateProgram(input: string): { result: string; output: string } {
   const output: string[] = [];
   const env = createGlobalEnvironment(output);
   currentDynamicWindFrames = [];
+  currentExceptionHandlerFrames = [];
 
   try {
     const result = evaluateSequence(expressions, env);
     return { result: formatValue(result), output: output.join('') };
   } finally {
     currentDynamicWindFrames = [];
+    currentExceptionHandlerFrames = [];
   }
 }
 
@@ -420,6 +430,20 @@ function createGlobalEnvironment(output: string[]): Environment {
     'dynamic-wind',
     makeBuiltinProcedure('dynamic-wind', () => {
       throw new EvalError('internal error: dynamic-wind must be applied through the evaluator');
+    }),
+  );
+  env.define(
+    'raise',
+    makeBuiltinProcedure('raise', () => {
+      throw new EvalError('internal error: raise must be applied through the evaluator');
+    }),
+  );
+  env.define(
+    'with-exception-handler',
+    makeBuiltinProcedure('with-exception-handler', () => {
+      throw new EvalError(
+        'internal error: with-exception-handler must be applied through the evaluator',
+      );
     }),
   );
   env.define('apply', makeBuiltinProcedure('apply', (args) => applyApply(args)));
@@ -1796,6 +1820,8 @@ function evaluateList(
         return continueWith(continuation, evaluateDefineSyntax(items.slice(1), env));
       case 'do':
         return evaluateDo(items.slice(1), env, continuation, location);
+      case 'guard':
+        return evaluateGuard(items.slice(1), env, continuation, location);
       case 'if':
         return evaluateIf(items.slice(1), env, continuation, location);
       case 'case-lambda':
@@ -2159,6 +2185,92 @@ function evaluateSet(
 
       return continueWith(continuation, VOID_VALUE);
     }),
+  );
+}
+
+function evaluateGuard(
+  items: Expr[],
+  env: Environment,
+  continuation: Continuation,
+  location: SourceLocation,
+): Computation {
+  if (items.length < 2) {
+    throw new EvalError('guard requires a clause specification and a body');
+  }
+
+  const specification = items[0];
+  if (specification.kind !== 'list' || specification.items.length === 0) {
+    throw new EvalError('guard requires a non-empty clause specification list');
+  }
+
+  const variable = expectSymbolExpression(
+    specification.items[0],
+    'guard requires a symbol exception variable',
+  );
+  const clauses = specification.items.slice(1);
+  const body = items.slice(1);
+  const parentExceptionHandlerFrames = currentExceptionHandlerFrames.slice();
+  const frame: ExceptionHandlerFrame = {
+    dynamicWindFrames: currentDynamicWindFrames.slice(),
+    handle: (value, raiseLocation) => {
+      const guardEnv = env.child();
+      defineIdentifier(variable, guardEnv, value);
+      return evaluateGuardClauses(
+        clauses,
+        guardEnv,
+        continuation,
+        value,
+        raiseLocation ?? location,
+      );
+    },
+  };
+
+  currentExceptionHandlerFrames = [...parentExceptionHandlerFrames, frame];
+  return evaluateSequenceInternal(body, env, (value) => {
+    currentExceptionHandlerFrames = parentExceptionHandlerFrames;
+    return continuation(value);
+  });
+}
+
+function evaluateGuardClauses(
+  clauses: Expr[],
+  env: Environment,
+  continuation: Continuation,
+  exceptionValue: SchemeValue,
+  location: SourceLocation,
+  index = 0,
+): Computation {
+  if (index >= clauses.length) {
+    return raiseException(exceptionValue, location);
+  }
+
+  const clause = clauses[index];
+  if (clause.kind !== 'list' || clause.items.length === 0) {
+    throw new EvalError('guard clauses must be non-empty lists');
+  }
+
+  const [testExpression, ...body] = clause.items;
+  if (testExpression.kind === 'symbol' && testExpression.value === 'else') {
+    if (index !== clauses.length - 1) {
+      throw new EvalError('guard else clause must be last');
+    }
+
+    return evaluateCondBody(body, TRUE_VALUE, env, continuation);
+  }
+
+  return evaluateExpression(testExpression, env, (testValue) =>
+    protectWithLocation(location, () =>
+      isTruthy(testValue)
+        ? evaluateCondBody(body, testValue, env, continuation)
+        : evaluateGuardClauses(
+            clauses,
+            env,
+            continuation,
+            exceptionValue,
+            location,
+            index + 1,
+          ),
+    ),
   );
 }
 
@@ -2700,6 +2812,7 @@ function makeContinuationProcedure(continuation: Continuation): ContinuationProc
     name: 'continuation',
     continuation,
     dynamicWindFrames: currentDynamicWindFrames.slice(),
+    exceptionHandlerFrames: currentExceptionHandlerFrames.slice(),
   };
 }
 
@@ -2773,6 +2886,57 @@ function applyDynamicWindCps(
         (value) => transferDynamicWind(parentFrames, () => continuation(value), location),
         location,
       ),
+    location,
+  );
+}
+
+function applyRaiseCps(args: SchemeValue[], location?: SourceLocation): Computation {
+  expectExactArgCount('raise', args, 1);
+  return raiseException(args[0], location);
+}
+
+function raiseException(value: SchemeValue, location?: SourceLocation): Computation {
+  const frame = currentExceptionHandlerFrames[currentExceptionHandlerFrames.length - 1];
+  if (frame === undefined) {
+    throw new EvalError(`uncaught exception: ${formatValue(value)}`, location);
+  }
+
+  currentExceptionHandlerFrames = currentExceptionHandlerFrames.slice(0, -1);
+  return transferDynamicWind(
+    frame.dynamicWindFrames,
+    () => frame.handle(value, location),
+    location,
+  );
+}
+
+function applyWithExceptionHandlerCps(
+  args: SchemeValue[],
+  continuation: Continuation,
+  location?: SourceLocation,
+): Computation {
+  expectExactArgCount('with-exception-handler', args, 2);
+
+  const [handler, thunk] = args;
+  const parentExceptionHandlerFrames = currentExceptionHandlerFrames.slice();
+  const frame: ExceptionHandlerFrame = {
+    dynamicWindFrames: currentDynamicWindFrames.slice(),
+    handle: (value, raiseLocation) =>
+      applyProcedureStep(
+        handler,
+        [value],
+        () => raiseException(value, raiseLocation ?? location),
+        location,
+      ),
+  };
+
+  currentExceptionHandlerFrames = [...parentExceptionHandlerFrames, frame];
+  return applyProcedureStep(
+    thunk,
+    [],
+    (value) => {
+      currentExceptionHandlerFrames = parentExceptionHandlerFrames;
+      return continuation(value);
+    },
     location,
   );
 }
@@ -2851,7 +3015,10 @@ function applyProcedureStep(
         expectExactArgCount(value.name, args, 1);
         return transferDynamicWind(
           value.dynamicWindFrames,
-          () => value.continuation(args[0]),
+          () => {
+            currentExceptionHandlerFrames = value.exceptionHandlerFrames.slice();
+            return value.continuation(args[0]);
+          },
           location,
         );
       }
@@ -2910,6 +3077,10 @@ function applyBuiltinProcedure(
       );
     case 'dynamic-wind':
       return applyDynamicWindCps(args, continuation, location);
+    case 'raise':
+      return applyRaiseCps(args, location);
+    case 'with-exception-handler':
+      return applyWithExceptionHandlerCps(args, continuation, location);
     case 'apply':
       return applyApplyCps(args, continuation, location);
     case 'map':
