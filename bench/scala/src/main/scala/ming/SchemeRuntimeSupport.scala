@@ -8,16 +8,9 @@ private[ming] object SchemeRuntimeSupport:
     SchemeBuiltins.all(runtime.emit).foreach { builtin =>
       env.define(builtin.name, builtin)
     }
-    env.define("apply", applyBuiltin)
+    env.define("apply", Value.ApplyProcedureBuiltin)
+    env.define("map", Value.MapProcedureBuiltin)
+    env.define("for-each", Value.ForEachProcedureBuiltin)
+    env.define("call/cc", Value.CallWithCurrentContinuation)
+    env.define("call-with-current-continuation", Value.CallWithCurrentContinuation)
     env
-
-  private val applyBuiltin: Value.Builtin =
-    Value.Builtin(
-      "apply",
-      (args, pos) =>
-        BuiltinSupport.requireAtLeast("apply", args, expected = 2, pos)
-        val procedure = args.head
-        val prefix    = args.tail.dropRight(1)
-        val rest      = BuiltinSupport.asList(args.last, "apply", pos)
-        SchemeInterpreter.applyProcedure(procedure, prefix ++ rest, pos)
-    )

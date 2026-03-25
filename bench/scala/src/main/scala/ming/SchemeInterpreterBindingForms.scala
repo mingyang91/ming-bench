@@ -2,64 +2,87 @@ package ming
 
 private[ming] object SchemeInterpreterBindingForms:
 
-  import SchemeInterpreter.{continueSequence, EvalStep, Expr, Value}
+  import SchemeInterpreter.{EvalState, Expr, Resume, Value}
   import SchemeInterpreterSyntax.*
 
-  private type EvalExpr       = (Expr, Env, MacroScope) => Value
-  private type ApplyProcedure = (Value, List[Value], SourcePos) => EvalStep
+  private type EvalExprState =
+    (Expr, Env, MacroScope, Resume) => EvalState
 
-  def evalLet(
+  private type EvalSequenceState =
+    (List[Expr], Env, MacroScope, Resume) => EvalState
+
+  private type ApplyProcedureState =
+    (Value, List[Value], SourcePos, Resume) => EvalState
+
+  def evalLetState(
     args: List[Expr],
     env: Env,
     macros: MacroScope,
     pos: SourcePos,
-    evalExpr: EvalExpr,
-    applyProcedure: ApplyProcedure
-  ): EvalStep =
+    cont: Resume,
+    evalExprState: EvalExprState,
+    evalSequenceState: EvalSequenceState,
+    applyProcedureState: ApplyProcedureState
+  ): EvalState =
     args match
       case Expr.ListExpr(bindingsExpr, _) :: body if body.nonEmpty =>
-        val (bindings, values) = evaluateBindings(bindingsExpr, env, macros, evalExpr)
-        val letEnv             = Env.child(env, bindingNames(bindings).zip(values))
-        val letMacros          = MacroScope.child(macros)
-        continueSequence(body, letEnv, letMacros)
+        val bindings = readBindings(bindingsExpr)
+        evalParallelBindingsState(
+          bindings,
+          env,
+          macros,
+          values =>
+            val letEnv    = Env.child(env, bindings.map(_._1).zip(values))
+            val letMacros = MacroScope.child(macros)
+            evalSequenceState(body, letEnv, letMacros, cont)
+          ,
+          evalExprState
+        )
       case Expr.Symbol(name, _) :: Expr.ListExpr(bindingsExpr, _) :: body if body.nonEmpty =>
-        val (bindings, values) = evaluateBindings(bindingsExpr, env, macros, evalExpr)
-        val letEnv             = Env.child(env, Nil)
-        val letMacros          = MacroScope.child(macros)
-        val closure            = Value.Closure(LambdaParams.fixed(bindingNames(bindings)), body, letEnv, letMacros)
-        letEnv.define(name, closure)
-        applyProcedure(closure, values, pos)
+        val bindings = readBindings(bindingsExpr)
+        evalParallelBindingsState(
+          bindings,
+          env,
+          macros,
+          values =>
+            val letEnv    = Env.child(env, Nil)
+            val letMacros = MacroScope.child(macros)
+            val closure   = Value.Closure(LambdaParams.fixed(bindings.map(_._1)), body, letEnv, letMacros)
+            letEnv.define(name, closure)
+            applyProcedureState(closure, values, pos, cont)
+          ,
+          evalExprState
+        )
       case _ =>
         throw EvalError.at(pos, "invalid let")
 
-  def evalLetStar(
+  def evalLetStarState(
     args: List[Expr],
     env: Env,
     macros: MacroScope,
     pos: SourcePos,
-    evalExpr: EvalExpr
-  ): EvalStep =
+    cont: Resume,
+    evalExprState: EvalExprState,
+    evalSequenceState: EvalSequenceState
+  ): EvalState =
     args match
       case Expr.ListExpr(bindingsExpr, _) :: body if body.nonEmpty =>
         val bindings      = readBindings(bindingsExpr)
         val letStarEnv    = Env.child(env, Nil)
         val letStarMacros = MacroScope.child(macros)
-
-        bindings.foreach { case (name, valueExpr) =>
-          letStarEnv.define(name, evalExpr(valueExpr, letStarEnv, letStarMacros))
-        }
-
-        continueSequence(body, letStarEnv, letStarMacros)
+        evalLetStarBindingsState(bindings, letStarEnv, letStarMacros, body, cont, evalExprState, evalSequenceState)
       case _ =>
         throw EvalError.at(pos, "invalid let*")
 
-  def evalLetrec(
+  def evalLetrecState(
     args: List[Expr],
     env: Env,
     macros: MacroScope,
     pos: SourcePos,
-    evalExpr: EvalExpr
-  ): EvalStep =
+    cont: Resume,
+    evalExprState: EvalExprState,
+    evalSequenceState: EvalSequenceState
+  ): EvalState =
     args match
       case Expr.ListExpr(bindingsExpr, _) :: body if body.nonEmpty =>
         val bindings     = readBindings(bindingsExpr)
@@ -70,51 +93,108 @@ private[ming] object SchemeInterpreterBindingForms:
           letrecEnv.define(name, Value.Void)
         }
 
-        val values = bindings.map { case (_, valueExpr) =>
-          evalExpr(valueExpr, letrecEnv, letrecMacros)
-        }
-
-        bindings.zip(values).foreach { case ((name, _), value) =>
-          letrecEnv.assign(name, value, pos)
-        }
-
-        continueSequence(body, letrecEnv, letrecMacros)
+        evalParallelBindingsState(
+          bindings,
+          letrecEnv,
+          letrecMacros,
+          values =>
+            bindings.zip(values).foreach { case ((name, _), value) =>
+              letrecEnv.assign(name, value, pos)
+            }
+            evalSequenceState(body, letrecEnv, letrecMacros, cont)
+          ,
+          evalExprState
+        )
       case _ =>
         throw EvalError.at(pos, "invalid letrec")
 
-  def evalLetrecStar(
+  def evalLetrecStarState(
     args: List[Expr],
     env: Env,
     macros: MacroScope,
     pos: SourcePos,
-    evalExpr: EvalExpr
-  ): EvalStep =
+    cont: Resume,
+    evalExprState: EvalExprState,
+    evalSequenceState: EvalSequenceState
+  ): EvalState =
     args match
       case Expr.ListExpr(bindingsExpr, _) :: body if body.nonEmpty =>
         val bindings     = readBindings(bindingsExpr)
         val letrecEnv    = Env.child(env, Nil)
         val letrecMacros = MacroScope.child(macros)
-
-        bindings.foreach { case (name, valueExpr) =>
-          letrecEnv.define(name, Value.Void)
-          letrecEnv.assign(name, evalExpr(valueExpr, letrecEnv, letrecMacros), valueExpr.pos)
-        }
-
-        continueSequence(body, letrecEnv, letrecMacros)
+        evalLetrecStarBindingsState(bindings, letrecEnv, letrecMacros, body, cont, evalExprState, evalSequenceState)
       case _ =>
         throw EvalError.at(pos, "invalid letrec*")
 
-  private def evaluateBindings(
-    bindingsExpr: List[Expr],
+  private def evalLetStarBindingsState(
+    bindings: List[(String, Expr)],
     env: Env,
     macros: MacroScope,
-    evalExpr: EvalExpr
-  ): (List[(String, Expr)], List[Value]) =
-    val bindings = readBindings(bindingsExpr)
-    val values = bindings.map { case (_, valueExpr) =>
-      evalExpr(valueExpr, env, macros)
-    }
-    (bindings, values)
+    body: List[Expr],
+    cont: Resume,
+    evalExprState: EvalExprState,
+    evalSequenceState: EvalSequenceState
+  ): EvalState =
+    bindings match
+      case Nil =>
+        evalSequenceState(body, env, macros, cont)
+      case (name, valueExpr) :: rest =>
+        evalExprState(
+          valueExpr,
+          env,
+          macros,
+          value =>
+            env.define(name, value)
+            evalLetStarBindingsState(rest, env, macros, body, cont, evalExprState, evalSequenceState)
+        )
 
-  private def bindingNames(bindings: List[(String, Expr)]): List[String] =
-    bindings.map(_._1)
+  private def evalLetrecStarBindingsState(
+    bindings: List[(String, Expr)],
+    env: Env,
+    macros: MacroScope,
+    body: List[Expr],
+    cont: Resume,
+    evalExprState: EvalExprState,
+    evalSequenceState: EvalSequenceState
+  ): EvalState =
+    bindings match
+      case Nil =>
+        evalSequenceState(body, env, macros, cont)
+      case (name, valueExpr) :: rest =>
+        env.define(name, Value.Void)
+        evalExprState(
+          valueExpr,
+          env,
+          macros,
+          value =>
+            env.assign(name, value, valueExpr.pos)
+            evalLetrecStarBindingsState(rest, env, macros, body, cont, evalExprState, evalSequenceState)
+        )
+
+  private def evalParallelBindingsState(
+    bindings: List[(String, Expr)],
+    env: Env,
+    macros: MacroScope,
+    onComplete: List[Value] => EvalState,
+    evalExprState: EvalExprState
+  ): EvalState =
+    evalParallelBindingsReversedState(bindings.reverse, env, macros, Nil, onComplete, evalExprState)
+
+  private def evalParallelBindingsReversedState(
+    remaining: List[(String, Expr)],
+    env: Env,
+    macros: MacroScope,
+    values: List[Value],
+    onComplete: List[Value] => EvalState,
+    evalExprState: EvalExprState
+  ): EvalState =
+    remaining match
+      case Nil =>
+        onComplete(values)
+      case (_, valueExpr) :: rest =>
+        evalExprState(
+          valueExpr,
+          env,
+          macros,
+          value => evalParallelBindingsReversedState(rest, env, macros, value :: values, onComplete, evalExprState)
+        )

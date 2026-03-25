@@ -5,7 +5,7 @@ import java.util.IdentityHashMap
 private[ming] object EqualityBuiltins:
 
   import BuiltinSupport.*
-  import SchemeInterpreter.Value
+  import SchemeInterpreter.{Procedure, Value}
 
   def all: List[Value.Builtin] =
     List(eqBuiltin, eqvBuiltin, equalBuiltin)
@@ -24,12 +24,8 @@ private[ming] object EqualityBuiltins:
         leftVector eq rightVector
       case (leftRecord: Value.Record, rightRecord: Value.Record) =>
         leftRecord eq rightRecord
-      case (leftBuiltin: Value.Builtin, rightBuiltin: Value.Builtin) =>
-        leftBuiltin eq rightBuiltin
-      case (leftClosure: Value.Closure, rightClosure: Value.Closure) =>
-        leftClosure eq rightClosure
-      case (leftCaseLambda: Value.CaseLambda, rightCaseLambda: Value.CaseLambda) =>
-        leftCaseLambda eq rightCaseLambda
+      case (leftProcedure: Procedure, rightProcedure: Procedure) =>
+        leftProcedure eq rightProcedure
       case (Value.Void, Value.Void) => true
       case _                        => false
 
@@ -65,12 +61,8 @@ private[ming] object EqualityBuiltins:
           }
       case (leftRecord: Value.Record, rightRecord: Value.Record) =>
         leftRecord eq rightRecord
-      case (leftBuiltin: Value.Builtin, rightBuiltin: Value.Builtin) =>
-        leftBuiltin eq rightBuiltin
-      case (leftClosure: Value.Closure, rightClosure: Value.Closure) =>
-        leftClosure eq rightClosure
-      case (leftCaseLambda: Value.CaseLambda, rightCaseLambda: Value.CaseLambda) =>
-        leftCaseLambda eq rightCaseLambda
+      case (leftProcedure: Procedure, rightProcedure: Procedure) =>
+        leftProcedure eq rightProcedure
       case (Value.Void, Value.Void) => true
       case _                        => false
 

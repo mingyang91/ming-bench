@@ -18,6 +18,28 @@ private[ming] trait SchemeInterpreterTypes:
   sealed trait Value
   sealed trait Procedure extends Value
 
+  sealed private[ming] trait EvalState
+
+  private[ming] type Resume = Value => EvalState
+
+  object EvalState:
+
+    final case class EvaluateExpr(
+      expr: Expr,
+      env: Env,
+      macros: MacroScope,
+      cont: Resume
+    ) extends EvalState
+
+    final case class EvaluateSequence(
+      expressions: List[Expr],
+      env: Env,
+      macros: MacroScope,
+      cont: Resume
+    ) extends EvalState
+
+    final case class Done(value: Value) extends EvalState
+
   object Value:
     final case class Number(value: SchemeNumber) extends Value
     final case class Bool(value: Boolean)        extends Value
@@ -111,6 +133,17 @@ private[ming] trait SchemeInterpreterTypes:
         fields(index) = value
 
     final case class Builtin(name: String, impl: (List[Value], SourcePos) => Value) extends Procedure
+    case object ApplyProcedureBuiltin                                               extends Procedure
+    case object MapProcedureBuiltin                                                 extends Procedure
+    case object ForEachProcedureBuiltin                                             extends Procedure
+    case object CallWithCurrentContinuation                                         extends Procedure
+
+    final class Continuation private[ming] (val resume: Resume) extends Procedure
+
+    object Continuation:
+
+      def apply(resume: Resume): Continuation =
+        new Continuation(resume)
 
     final case class Closure(
       params: LambdaParams,

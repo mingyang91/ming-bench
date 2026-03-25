@@ -1,10 +1,10 @@
 package ming
 
+import java.util.concurrent.atomic.AtomicLong
+
 private[ming] object SchemeInterpreterDoSupport:
 
-  import SchemeInterpreter.{Expr, Value}
-
-  import SchemeInterpreterSyntax.isTruthy
+  import SchemeInterpreter.Expr
 
   final private case class DoBinding(
     name: String,
@@ -13,38 +13,30 @@ private[ming] object SchemeInterpreterDoSupport:
     pos: SourcePos
   )
 
-  def eval(
-    args: List[Expr],
-    env: Env,
-    macros: MacroScope,
-    pos: SourcePos,
-    evalExpr: (Expr, Env, MacroScope) => Value,
-    evalSequenceExprs: (List[Expr], Env, MacroScope) => Value
-  ): Value =
+  private val generatedNameCounter = new AtomicLong(0L)
+
+  def expand(args: List[Expr], pos: SourcePos): Expr =
     args match
       case Expr.ListExpr(bindingExprs, _) :: Expr.ListExpr(testExpr :: resultExprs, _) :: body =>
         val bindings   = readDoBindings(bindingExprs)
-        val initValues = bindings.map(binding => evalExpr(binding.initExpr, env, macros))
-        val doEnv      = Env.child(env, bindings.map(_.name).zip(initValues))
-        val doMacros   = MacroScope.child(macros)
-
-        while true do
-          if isTruthy(evalExpr(testExpr, doEnv, doMacros)) then
-            return if resultExprs.isEmpty then Value.Void else evalSequenceExprs(resultExprs, doEnv, doMacros)
-
-          evalSequenceExprs(body, doEnv, doMacros)
-
-          val nextValues = bindings.map { binding =>
-            binding.stepExpr match
-              case Some(stepExpr) => evalExpr(stepExpr, doEnv, doMacros)
-              case None           => doEnv.lookup(binding.name, binding.pos)
-          }
-
-          bindings.zip(nextValues).foreach { case (binding, value) =>
-            doEnv.assign(binding.name, value, binding.pos)
-          }
-
-        Value.Void
+        val loopSymbol = Expr.Symbol(freshGeneratedName(), pos)
+        val initBindings = bindings.map(binding =>
+          Expr.ListExpr(List(Expr.Symbol(binding.name, binding.pos), binding.initExpr), binding.pos)
+        )
+        val nextArgs     = bindings.map(nextArgument)
+        val recurExpr    = Expr.ListExpr(loopSymbol :: nextArgs, pos)
+        val resultBranch = Expr.ListExpr(Expr.Symbol("begin", pos) :: resultExprs, pos)
+        val bodyBranch   = Expr.ListExpr(Expr.Symbol("begin", pos) :: (body :+ recurExpr), pos)
+        val ifExpr       = Expr.ListExpr(List(Expr.Symbol("if", pos), testExpr, resultBranch, bodyBranch), pos)
+        Expr.ListExpr(
+          List(
+            Expr.Symbol("let", pos),
+            loopSymbol,
+            Expr.ListExpr(initBindings, pos),
+            ifExpr
+          ),
+          pos
+        )
       case _ =>
         throw EvalError.at(pos, "invalid do")
 
@@ -57,3 +49,9 @@ private[ming] object SchemeInterpreterDoSupport:
       case other =>
         throw EvalError.at(other.pos, s"invalid do binding: ${SchemeRendering.renderExpr(other)}")
     }
+
+  private def nextArgument(binding: DoBinding): Expr =
+    binding.stepExpr.getOrElse(Expr.Symbol(binding.name, binding.pos))
+
+  private def freshGeneratedName(): String =
+    s"__ming_do_${generatedNameCounter.incrementAndGet()}"
