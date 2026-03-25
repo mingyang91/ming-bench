@@ -46,6 +46,15 @@ object Parser:
       case Token.Atom("syntax-sugar", p) :: rest =>
         val (expr, remaining) = parseExpr(rest)
         (withPos(SchemeVal.SList(List(withPos(SchemeVal.Symbol("syntax"), p), expr)), p), remaining)
+      case Token.Atom("quasiquote-sugar", p) :: rest =>
+        val (expr, remaining) = parseExpr(rest)
+        (withPos(SchemeVal.SList(List(withPos(SchemeVal.Symbol("quasiquote"), p), expr)), p), remaining)
+      case Token.Atom("unquote-sugar", p) :: rest =>
+        val (expr, remaining) = parseExpr(rest)
+        (withPos(SchemeVal.SList(List(withPos(SchemeVal.Symbol("unquote"), p), expr)), p), remaining)
+      case Token.Atom("unquote-splicing-sugar", p) :: rest =>
+        val (expr, remaining) = parseExpr(rest)
+        (withPos(SchemeVal.SList(List(withPos(SchemeVal.Symbol("unquote-splicing"), p), expr)), p), remaining)
       case Token.Atom(s, p) :: rest =>
         (withPos(parseAtom(s), p), rest)
 

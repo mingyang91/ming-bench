@@ -139,7 +139,10 @@ object ListBuiltins:
     else
       cur match
         case SchemeVal.Pair(c) => pairListTail(c.cdr, idx - 1)
-        case _                 => throw new EvalError("list-tail: index out of bounds")
+        case SchemeVal.SList(elems) =>
+          if idx > elems.size then throw new EvalError("list-tail: index out of bounds")
+          SchemeVal.SList(elems.drop(idx))
+        case _ => throw new EvalError("list-tail: index out of bounds")
 
   private def registerMembership(env: Env): Unit =
     env.define(

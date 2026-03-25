@@ -113,8 +113,13 @@ object BindingForms:
                     env,
                     testVal =>
                       if Evaluator.isTruthy(testVal) then
-                        if elems.tail.isEmpty then k(testVal)
-                        else Evaluator.evalBodyK(elems.tail, env, k)
+                        elems.tail match
+                          case List(SchemeVal.Symbol("=>"), proc) =>
+                            More(() =>
+                              Evaluator.evalK(proc, env, procVal => Evaluator.applyK(procVal, List(testVal), k))
+                            )
+                          case Nil  => k(testVal)
+                          case body => Evaluator.evalBodyK(body, env, k)
                       else More(() => evalCondK(rest, env, k))
                   )
                 )

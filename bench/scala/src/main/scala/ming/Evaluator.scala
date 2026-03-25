@@ -137,6 +137,9 @@ object Evaluator:
           case SchemeVal.Symbol("quote") =>
             if elems.tail.size != 1 then throw new EvalError("quote: expected 1 argument")
             k(elems.tail.head)
+          case SchemeVal.Symbol("quasiquote") =>
+            if elems.tail.size != 1 then throw new EvalError("quasiquote: expected 1 argument")
+            Quasiquote.expandQuasiquoteK(elems.tail.head, env, k)
           case SchemeVal.Symbol("lambda")       => k(SpecialForms.evalLambda(elems.tail, env))
           case SchemeVal.Symbol("and")          => SpecialForms.evalAndK(elems.tail, env, k)
           case SchemeVal.Symbol("or")           => SpecialForms.evalOrK(elems.tail, env, k)

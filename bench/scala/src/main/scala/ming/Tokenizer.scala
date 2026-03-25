@@ -48,6 +48,16 @@ object Tokenizer:
       case '\'' =>
         tokens += Token.Atom("quote-sugar", positions(pos))
         pos + 1
+      case '`' =>
+        tokens += Token.Atom("quasiquote-sugar", positions(pos))
+        pos + 1
+      case ',' =>
+        if pos + 1 < input.length && input(pos + 1) == '@' then
+          tokens += Token.Atom("unquote-splicing-sugar", positions(pos))
+          pos + 2
+        else
+          tokens += Token.Atom("unquote-sugar", positions(pos))
+          pos + 1
       case '#' if pos + 1 < input.length && input(pos + 1) == '(' =>
         tokens += Token.VecLParen(positions(pos))
         pos + 2
