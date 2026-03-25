@@ -44,6 +44,8 @@ enum SchemeVal:
 
   case SVector(elems: Array[SchemeVal])
 
+  case SContinuation(k: Cont)
+
   /** Safely cast to SMacro via pattern match. */
   def asMatchedMacro: SchemeVal.SMacro = this match
     case m: SchemeVal.SMacro => m
@@ -92,6 +94,7 @@ object SchemeVal:
     case SMacro(_, _, _)     => "#<macro>"
     case SRecord(tn, _)      => s"#<record:$tn>"
     case SVector(es)         => "#(" + es.map(displayImpl(_, visited)).mkString(" ") + ")"
+    case SContinuation(_)    => "#<continuation>"
 
   private def pairTailImpl(cell: MutableCell, visited: java.util.Set[MutableCell]): String =
     val carStr = displayImpl(cell.car, visited)

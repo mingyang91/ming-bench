@@ -119,7 +119,10 @@ object Builtins:
     "string",
     "string>?",
     "string<=?",
-    "string>=?"
+    "string>=?",
+    // L18
+    "call/cc",
+    "call-with-current-continuation"
   )
 
   private def isTruthy(v: SchemeVal): Boolean = v match
@@ -198,10 +201,11 @@ object Builtins:
       case "procedure?" =>
         if args.length != 1 then throw new EvalError("procedure?: expected 1 argument")
         val isProcedure = args.head match
-          case _: SchemeVal.SLambda     => true
-          case _: SchemeVal.SCaseLambda => true
-          case SchemeVal.SSymbol(n)     => names.contains(n) || n.startsWith("__record-")
-          case _                        => false
+          case _: SchemeVal.SLambda       => true
+          case _: SchemeVal.SCaseLambda   => true
+          case _: SchemeVal.SContinuation => true
+          case SchemeVal.SSymbol(n)       => names.contains(n) || n.startsWith("__record-")
+          case _                          => false
         SchemeVal.SBool(isProcedure)
       case "zero?" | "positive?" | "negative?" | "odd?" | "even?" =>
         NumericOps.applyNumericPredicate(name, args)
