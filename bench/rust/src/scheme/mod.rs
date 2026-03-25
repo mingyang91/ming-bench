@@ -788,6 +788,8 @@ struct ContData {
     reexec_exprs: Vec<Expr>,
     /// Environment for re-evaluation.
     reexec_env: Env,
+    /// Wind stack at capture time (for dynamic-wind re-entry).
+    wind_stack: Vec<WindEntry>,
 }
 
 impl fmt::Debug for ContData {
@@ -806,6 +808,13 @@ impl fmt::Debug for Kont {
     }
 }
 
+/// A dynamic-wind frame on the wind stack.
+#[derive(Clone)]
+struct WindEntry {
+    in_thunk: Val,
+    out_thunk: Val,
+}
+
 thread_local! {
     /// Override for call/cc re-execution: when set, the next call/cc returns this value.
     static CALLCC_OVERRIDE: RefCell<Option<Val>> = RefCell::new(None);
@@ -813,6 +822,10 @@ thread_local! {
     static REEXEC_SIGNAL: RefCell<Option<(Vec<Expr>, Env)>> = RefCell::new(None);
     /// Stack of body contexts for call/cc capture.
     static BODY_CTX: RefCell<Vec<BodyCtx>> = RefCell::new(Vec::new());
+    /// Current dynamic-wind stack.
+    static WIND_STACK: RefCell<Vec<WindEntry>> = RefCell::new(Vec::new());
+    /// Target wind stack for continuation re-entry.
+    static REENTRY_WINDS: RefCell<Option<Vec<WindEntry>>> = RefCell::new(None);
 }
 
 #[derive(Clone)]
@@ -820,6 +833,7 @@ struct BodyCtx {
     exprs: Vec<Expr>,
     cur_idx: usize,
     env: Env,
+    toplevel: bool,
 }
 
 /// Push a body context, evaluate a body sequence, pop on completion.
@@ -828,6 +842,7 @@ fn eval_body_seq(body: &[Expr], env: &Env, out: &mut String) -> Result<Val, Eval
         exprs: body.to_vec(),
         cur_idx: 0,
         env: env.clone(),
+        toplevel: false,
     }));
     let mut result = Val::Void;
     for (idx, expr) in body.iter().enumerate() {
@@ -858,11 +873,13 @@ fn handle_callcc(f: &Val, env: &Env, out: &mut String, span: Span) -> Result<Val
         (vec![], env.clone())
     };
 
+    let wind_stack = WIND_STACK.with(|w| w.borrow().clone());
     let active = Rc::new(Cell::new(true));
     let cont_data = ContData {
         active: active.clone(),
         reexec_exprs,
         reexec_env,
+        wind_stack,
     };
     let cont_val = Val::Continuation(Rc::new(cont_data));
 
@@ -895,6 +912,14 @@ fn handle_callcc(f: &Val, env: &Env, out: &mut String, span: Span) -> Result<Val
     }
 }
 
+/// Check if an error is a call/cc signal (escape or reexec).
+fn is_callcc_signal(e: &EvalError) -> bool {
+    match e {
+        EvalError::Type(s) => s.contains("__callcc_escape__") || s.contains("__callcc_reexec__"),
+        _ => false,
+    }
+}
+
 /// Invoke a continuation value with a given argument.
 fn invoke_continuation(data: &ContData, val: Val) -> Result<Val, EvalError> {
     if data.active.get() {
@@ -907,6 +932,7 @@ fn invoke_continuation(data: &ContData, val: Val) -> Result<Val, EvalError> {
         REEXEC_SIGNAL.with(|s| {
             *s.borrow_mut() = Some((data.reexec_exprs.clone(), data.reexec_env.clone()));
         });
+        REENTRY_WINDS.with(|w| *w.borrow_mut() = Some(data.wind_stack.clone()));
         Err(EvalError::Type("__callcc_reexec__".into()))
     }
 }
@@ -918,6 +944,7 @@ fn cek_eval(exprs: &[Expr], env: &Env, out: &mut String) -> Result<Val, EvalErro
         exprs: exprs.to_vec(),
         cur_idx: 0,
         env: env.clone(),
+        toplevel: true,
     }));
 
     let result = eval_toplevel_seq(exprs, env, out);
@@ -928,24 +955,64 @@ fn cek_eval(exprs: &[Expr], env: &Env, out: &mut String) -> Result<Val, EvalErro
 
 fn eval_toplevel_seq(exprs: &[Expr], env: &Env, out: &mut String) -> Result<Val, EvalError> {
     let mut result = Val::Void;
-    for (idx, expr) in exprs.iter().enumerate() {
+    let mut idx = 0;
+    while idx < exprs.len() {
         BODY_CTX.with(|ctx| {
             if let Some(top) = ctx.borrow_mut().last_mut() {
                 top.cur_idx = idx;
             }
         });
-        match eval(expr, env, out) {
+        match eval(&exprs[idx], env, out) {
             Ok(val) => result = val,
             Err(e) => {
                 // Check for re-execution signal
                 let reexec = REEXEC_SIGNAL.with(|s| s.borrow_mut().take());
                 if let Some((re_exprs, re_env)) = reexec {
+                    // Wind transition for dynamic-wind re-entry
+                    let target_winds = REENTRY_WINDS.with(|w| w.borrow_mut().take());
+                    let dummy_span = Span::new(0, 0);
+                    if let Some(ref winds) = target_winds {
+                        // Unwind current wind stack
+                        let current = WIND_STACK.with(|w| {
+                            let mut stack = w.borrow_mut();
+                            let c = stack.clone();
+                            stack.clear();
+                            c
+                        });
+                        for frame in current.iter().rev() {
+                            let _ = call_function(&frame.out_thunk, vec![], dummy_span, out);
+                        }
+                        // Rewind target wind stack
+                        for frame in winds.iter() {
+                            let _ = call_function(&frame.in_thunk, vec![], dummy_span, out);
+                            WIND_STACK.with(|w| w.borrow_mut().push(frame.clone()));
+                        }
+                    }
+
                     // Re-evaluate the captured expressions
-                    return eval_reexec(&re_exprs, &re_env, out);
+                    result = eval_reexec(&re_exprs, &re_env, out)?;
+
+                    // Unwind wind stack after re-execution
+                    if target_winds.is_some() {
+                        let winds = WIND_STACK.with(|w| {
+                            let mut stack = w.borrow_mut();
+                            let c = stack.clone();
+                            stack.clear();
+                            c
+                        });
+                        for frame in winds.iter().rev() {
+                            let _ = call_function(&frame.out_thunk, vec![], dummy_span, out);
+                        }
+                    }
+
+                    // Continue with remaining expressions
+                    idx += 1;
+                    continue;
                 }
                 return Err(e);
             }
         }
+        idx += 1;
     }
     Ok(result)
 }
@@ -956,6 +1023,7 @@ fn eval_reexec(exprs: &[Expr], env: &Env, out: &mut String) -> Result<Val, EvalE
         exprs: exprs.to_vec(),
         cur_idx: 0,
         env: env.clone(),
+        toplevel: true,
     }));
 
     let mut result = Val::Void;
@@ -971,6 +1039,8 @@ fn eval_reexec(exprs: &[Expr], env: &Env, out: &mut String) -> Result<Val, EvalE
                 // Check for another re-execution signal (continuation invoked again)
                 let reexec = REEXEC_SIGNAL.with(|s| s.borrow_mut().take());
                 if let Some((re_exprs, re_env)) = reexec {
+                    // Clear any wind transition info (handled by caller)
+                    let _ = REENTRY_WINDS.with(|w| w.borrow_mut().take());
                     BODY_CTX.with(|ctx| ctx.borrow_mut().pop());
                     return eval_reexec(&re_exprs, &re_env, out);
                 }
@@ -1308,6 +1378,7 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                             exprs: body_exprs.to_vec(),
                             cur_idx: 0,
                             env: let_env.clone(),
+                            toplevel: false,
                         }));
                         for i in 0..body_exprs.len() - 1 {
                             BODY_CTX.with(|ctx| {
@@ -1674,6 +1745,46 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                 }
             }
 
+            // dynamic-wind handling
+            if let ExprKind::Symbol(op) = &list[0].kind {
+                if op == "dynamic-wind" {
+                    if list.len() != 4 {
+                        return Err(err_at(span, EvalError::Arity("dynamic-wind: need 3 arguments".into())));
+                    }
+                    let in_thunk = eval(&list[1], env, out)?;
+                    let body_thunk = eval(&list[2], env, out)?;
+                    let out_thunk = eval(&list[3], env, out)?;
+                    // Call in-thunk
+                    call_function(&in_thunk, vec![], span, out)?;
+                    // Push wind entry
+                    WIND_STACK.with(|w| w.borrow_mut().push(WindEntry {
+                        in_thunk: in_thunk.clone(),
+                        out_thunk: out_thunk.clone(),
+                    }));
+                    // Call body-thunk, catching callcc signals to run out-thunk
+                    let body_result = call_function(&body_thunk, vec![], span, out);
+                    // Pop wind entry
+                    WIND_STACK.with(|w| w.borrow_mut().pop());
+                    match body_result {
+                        Ok(val) => {
+                            // Normal exit: call out-thunk, return body value
+                            call_function(&out_thunk, vec![], span, out)?;
+                            return Ok(val);
+                        }
+                        Err(ref e) if is_callcc_signal(e) => {
+                            // Non-local exit: call out-thunk, then re-throw
+                            let _ = call_function(&out_thunk, vec![], span, out);
+                            return body_result;
+                        }
+                        Err(_) => {
+                            // Other error: call out-thunk, then re-throw
+                            let _ = call_function(&out_thunk, vec![], span, out);
+                            return body_result;
+                        }
+                    }
+                }
+            }
+
             // call/cc handling
             if let ExprKind::Symbol(op) = &list[0].kind {
                 if op == "call/cc" || op == "call-with-current-continuation" {
@@ -1798,6 +1909,7 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                         exprs: full_body,
                         cur_idx: 0,
                         env: call_env.clone(),
+                        toplevel: false,
                     }));
                     for (idx, e) in body.iter().enumerate() {
                         BODY_CTX.with(|ctx| {
@@ -1843,6 +1955,7 @@ fn eval_body(expr: &Expr, env: &Env, out: &mut String, tco: &mut Option<(Expr, E
                                 exprs: full_body_cl,
                                 cur_idx: 0,
                                 env: call_env.clone(),
+                                toplevel: false,
                             }));
                             for (idx, e) in body_cl.iter().enumerate() {
                                 BODY_CTX.with(|ctx| {
@@ -1893,7 +2006,8 @@ fn is_builtin(op: &str) -> bool {
         | "error" | "gcd" | "lcm" | "truncate" | "round"
         | "make-string" | "string" | "string>?" | "string<=?" | "string>=?"
         | "display" | "write" | "newline"
-        | "call/cc" | "call-with-current-continuation")
+        | "call/cc" | "call-with-current-continuation"
+        | "dynamic-wind")
 }
 
 /// Parse a parameter list that may contain dot notation for rest params.
