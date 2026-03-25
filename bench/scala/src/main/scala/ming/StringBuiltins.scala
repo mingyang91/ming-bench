@@ -95,17 +95,8 @@ private[ming] object StringBuiltins:
           Expr.Str(chars.toArray)
         case other => throw EvalError(s"list->string: not a list: ${Builtins.display(other)}")
       }
-    case "char->integer" =>
-      Builtins.unary(name, args) {
-        case Expr.Chr(c) => Expr.Num(c.toLong)
-        case other       => throw EvalError(s"char->integer: not a character: ${Builtins.display(other)}")
-      }
-    case "integer->char" =>
-      Builtins.unary(name, args) {
-        case Expr.Num(n) => Expr.Chr(n.toChar)
-        case other       => throw EvalError(s"integer->char: not an integer: ${Builtins.display(other)}")
-      }
-    case _ => throw EvalError(s"unknown procedure: $name")
+    case "char->integer" | "integer->char" => applyCharConversion(name, args)
+    case _                                 => throw EvalError(s"unknown procedure: $name")
 
   def applyCharBuiltin(name: String, args: List[Expr]): Expr = name match
     case "char-alphabetic?" =>
@@ -127,6 +118,19 @@ private[ming] object StringBuiltins:
     case "char=?" => charCmp(name, args, _ == _)
     case "char<?" => charCmp(name, args, _ < _)
     case _        => throw EvalError(s"unknown char procedure: $name")
+
+  private def applyCharConversion(name: String, args: List[Expr]): Expr = name match
+    case "char->integer" =>
+      Builtins.unary(name, args) {
+        case Expr.Chr(c) => Expr.Num(c.toLong)
+        case other       => throw EvalError(s"char->integer: not a character: ${Builtins.display(other)}")
+      }
+    case "integer->char" =>
+      Builtins.unary(name, args) {
+        case Expr.Num(n) => Expr.Chr(n.toChar)
+        case other       => throw EvalError(s"integer->char: not an integer: ${Builtins.display(other)}")
+      }
+    case _ => throw EvalError(s"unknown procedure: $name")
 
   def charCmp(name: String, args: List[Expr], op: (Char, Char) => Boolean): Expr =
     if args.length != 2 then throw EvalError(s"$name: need exactly 2 arguments")

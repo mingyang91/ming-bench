@@ -21,7 +21,7 @@ private[ming] object Display:
 
   def displayOutput(e: Expr): String = e match
     case Expr.Str(s, _) => new String(s)
-    case other       => display(other)
+    case other          => display(other)
 
   private def formatReal(v: Double): String =
     if v == v.floor && !v.isInfinite && !v.isNaN then
