@@ -44,9 +44,11 @@ type evalContext struct {
 type builtinProc func(args []value) (value, error)
 
 type closureValue struct {
-	params []string
-	body   []node
-	env    *environment
+	params    []string
+	restParam string
+	hasRest   bool
+	body      []node
+	env       *environment
 }
 
 type binding struct {
@@ -106,6 +108,7 @@ func baseEnv(ctx *evalContext) *environment {
 	env.define("list", builtinList())
 	env.define("length", builtinLength())
 	env.define("append", builtinAppend())
+	env.define("apply", builtinApply())
 	env.define("string?", builtinPredicate(func(v value) bool {
 		return isStringValue(v)
 	}))
@@ -249,7 +252,7 @@ func evalList(list listNode, env *environment) (value, error) {
 	if err != nil {
 		return nil, err
 	}
-	return apply(operator, args, list.pos)
+	return applyProcedure(operator, args, list.pos)
 }
 
 func evalArgs(args []node, env *environment) ([]value, error) {
@@ -473,7 +476,7 @@ func evalNamedLet(name string, args []node, env *environment) (value, error) {
 		env:    letEnv,
 	}
 	letEnv.define(name, proc)
-	return apply(proc, values, sourcePos{})
+	return applyProcedure(proc, values, sourcePos{})
 }
 
 func evalBindings(bindingExprs []node, env *environment) ([]string, []value, error) {
@@ -506,43 +509,64 @@ func makeClosure(paramExprs []node, body []node, env *environment) (*closureValu
 		return nil, &EvalError{Message: "lambda requires a body"}
 	}
 
-	params, err := parseParamNames(paramExprs)
+	params, restParam, hasRest, err := parseParamNames(paramExprs)
 	if err != nil {
 		return nil, err
 	}
 
 	return &closureValue{
-		params: params,
-		body:   body,
-		env:    env,
+		params:    params,
+		restParam: restParam,
+		hasRest:   hasRest,
+		body:      body,
+		env:       env,
 	}, nil
 }
 
-func parseParamNames(paramExprs []node) ([]string, error) {
-	params := make([]string, len(paramExprs))
+func parseParamNames(paramExprs []node) ([]string, string, bool, error) {
+	params := make([]string, 0, len(paramExprs))
 	for i, expr := range paramExprs {
 		name, ok := symbolName(expr)
 		if !ok {
-			return nil, &EvalError{Message: "parameter list must contain only symbols"}
+			return nil, "", false, &EvalError{Message: "parameter list must contain only symbols"}
 		}
-		params[i] = name
+
+		if name == "." {
+			if i != len(paramExprs)-2 {
+				return nil, "", false, &EvalError{Message: "invalid dotted parameter list"}
+			}
+
+			restName, ok := symbolName(paramExprs[i+1])
+			if !ok || restName == "." {
+				return nil, "", false, &EvalError{Message: "parameter list must contain only symbols"}
+			}
+			return params, restName, true, nil
+		}
+
+		params = append(params, name)
 	}
-	return params, nil
+	return params, "", false, nil
 }
 
-func apply(proc value, args []value, pos sourcePos) (value, error) {
+func applyProcedure(proc value, args []value, pos sourcePos) (value, error) {
 	switch proc := proc.(type) {
 	case builtinProc:
 		result, err := proc(args)
 		return result, withErrorPos(err, pos)
 	case *closureValue:
-		if len(args) != len(proc.params) {
+		if !proc.hasRest && len(args) != len(proc.params) {
 			return nil, errorAt(pos, "expected %d arguments, got %d", len(proc.params), len(args))
+		}
+		if proc.hasRest && len(args) < len(proc.params) {
+			return nil, errorAt(pos, "expected at least %d arguments, got %d", len(proc.params), len(args))
 		}
 
 		callEnv := newEnvironment(proc.env)
 		for i, name := range proc.params {
 			callEnv.define(name, args[i])
+		}
+		if proc.hasRest {
+			callEnv.define(proc.restParam, listValue{elements: copyValues(args[len(proc.params):])})
 		}
 		return evalSequence(proc.body, callEnv)
 	default:
@@ -792,6 +816,24 @@ func builtinAppend() builtinProc {
 			combined = append(combined, list.elements...)
 		}
 		return listValue{elements: copyValues(combined)}, nil
+	}
+}
+
+func builtinApply() builtinProc {
+	return func(args []value) (value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: "apply expects at least 2 arguments"}
+		}
+
+		last, err := expectListValue(args[len(args)-1])
+		if err != nil {
+			return nil, err
+		}
+
+		combined := make([]value, 0, len(args)-2+len(last.elements))
+		combined = append(combined, args[1:len(args)-1]...)
+		combined = append(combined, last.elements...)
+		return applyProcedure(args[0], combined, sourcePos{})
 	}
 }
 
