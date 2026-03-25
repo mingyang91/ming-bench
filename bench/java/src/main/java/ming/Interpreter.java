@@ -273,6 +273,7 @@ public class Interpreter {
                 case "let" -> evalLet(list.elements(), env);
                 case "begin" -> evalBegin(list.elements(), env);
                 case "cond" -> evalCond(list.elements(), env);
+                case "set!" -> evalSet(list.elements(), env);
                 default -> evalApplication(list.elements(), env);
             };
         }
@@ -452,6 +453,15 @@ public class Interpreter {
                 return result;
             }
         }
+        return new SchemeValue.VoidVal();
+    }
+
+    private SchemeValue evalSet(List<SchemeValue> elements, Environment env) throws EvalError {
+        if (elements.size() != 3) throw new EvalError("set!: bad syntax");
+        if (!(elements.get(1) instanceof SchemeValue.SymbolVal sym))
+            throw new EvalError("set!: expected symbol");
+        var val = eval(elements.get(2), env);
+        env.set(sym.name(), val);
         return new SchemeValue.VoidVal();
     }
 
