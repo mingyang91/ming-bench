@@ -22,7 +22,8 @@ type SchemeVal =
   | { tag: 'lambda'; params: string[]; rest?: string; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'builtin'; name: string; fn: BuiltinFn; pos?: Pos }
   | { tag: 'macro'; literals: string[]; clauses: MacroClause[]; defEnv: Env; pos?: Pos }
-  | { tag: 'record'; typeName: string; fields: Map<string, SchemeVal>; pos?: Pos };
+  | { tag: 'record'; typeName: string; fields: Map<string, SchemeVal>; pos?: Pos }
+  | { tag: 'case-lambda'; clauses: { params: string[]; rest?: string; body: SchemeVal[] }[]; env: Env; pos?: Pos };
 
 function posStr(pos?: Pos): string {
   return pos ? `${pos.line}:${pos.col}` : '?:?';
@@ -630,6 +631,12 @@ function makeGlobalEnv(): Env {
     return { tag: 'boolean', value: false };
   });
 
+  defBuiltin('procedure?', (args) => {
+    if (args.length !== 1) throw new EvalError('procedure?: expected 1 argument');
+    const v = args[0];
+    return { tag: 'boolean', value: v.tag === 'lambda' || v.tag === 'builtin' || v.tag === 'case-lambda' };
+  });
+
   // Map (supports multiple lists)
   defBuiltin('map', (args) => {
     if (args.length < 2) throw new EvalError('map: expected at least 2 arguments');
@@ -652,6 +659,8 @@ function makeGlobalEnv(): Env {
         result.push(res);
       } else if (func.tag === 'builtin') {
         result.push(func.fn(callArgs));
+      } else if (func.tag === 'case-lambda') {
+        result.push(applyCaseLambda(func, callArgs));
       } else {
         throw new EvalError('map: not a procedure');
       }
@@ -753,6 +762,9 @@ function makeGlobalEnv(): Env {
     }
     if (func.tag === 'builtin') {
       return func.fn(allArgs);
+    }
+    if (func.tag === 'case-lambda') {
+      return applyCaseLambda(func, allArgs);
     }
     throw new EvalError(`apply: not a procedure: ${displayVal(func)}`);
   });
@@ -909,7 +921,7 @@ function gensym(prefix: string): string {
 }
 
 const SPECIAL_FORMS = new Set([
-  'quote', 'if', 'define', 'lambda', 'set!', 'begin', 'let', 'let*', 'letrec',
+  'quote', 'if', 'define', 'lambda', 'case-lambda', 'set!', 'begin', 'let', 'let*', 'letrec',
   'cond', 'and', 'or', 'not', 'define-syntax', 'syntax-rules',
 ]);
 
@@ -1113,6 +1125,21 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
         const { params, rest } = parseParams(paramList.elements, epos);
         const body = elems.slice(2);
         return { tag: 'lambda', params, rest, body, env };
+      }
+
+      if (op === 'case-lambda') {
+        if (elems.length < 2) throw errAt('case-lambda: bad syntax', epos);
+        const clauses: { params: string[]; rest?: string; body: SchemeVal[] }[] = [];
+        for (let i = 1; i < elems.length; i++) {
+          const clause = elems[i];
+          if (clause.tag !== 'list' || clause.elements.length < 2) throw errAt('case-lambda: bad clause', epos);
+          const paramList = clause.elements[0];
+          if (paramList.tag !== 'list') throw errAt('case-lambda: parameters must be a list', epos);
+          const { params, rest } = parseParams(paramList.elements, epos);
+          const body = clause.elements.slice(1);
+          clauses.push({ params, rest, body });
+        }
+        return { tag: 'case-lambda', clauses, env };
       }
 
       if (op === 'set!') {
@@ -1356,10 +1383,42 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
       }
     }
 
+    if (func.tag === 'case-lambda') {
+      return applyCaseLambda(func, args);
+    }
+
     throw errAt(`not a procedure: ${displayVal(func)}`, epos);
   }
 
   throw errAt('cannot evaluate', expr.pos);
+}
+
+function applyCaseLambda(func: Extract<SchemeVal, { tag: 'case-lambda' }>, args: SchemeVal[]): SchemeVal {
+  for (const clause of func.clauses) {
+    if (clause.rest) {
+      if (args.length >= clause.params.length) {
+        const callEnv = new Env(func.env);
+        for (let i = 0; i < clause.params.length; i++) {
+          callEnv.define(clause.params[i], args[i]);
+        }
+        callEnv.define(clause.rest, makeList(args.slice(clause.params.length)));
+        let result: SchemeVal = { tag: 'void' };
+        for (const bodyExpr of clause.body) result = evalExpr(bodyExpr, callEnv);
+        return result;
+      }
+    } else {
+      if (args.length === clause.params.length) {
+        const callEnv = new Env(func.env);
+        for (let i = 0; i < clause.params.length; i++) {
+          callEnv.define(clause.params[i], args[i]);
+        }
+        let result: SchemeVal = { tag: 'void' };
+        for (const bodyExpr of clause.body) result = evalExpr(bodyExpr, callEnv);
+        return result;
+      }
+    }
+  }
+  throw new EvalError(`case-lambda: no matching clause for ${args.length} arguments`);
 }
 
 function displayVal(val: SchemeVal): string {
@@ -1391,6 +1450,7 @@ function displayVal(val: SchemeVal): string {
     }
     case 'void': return '';
     case 'lambda': return '#<procedure>';
+    case 'case-lambda': return '#<procedure>';
     case 'builtin': return `#<builtin:${val.name}>`;
     case 'macro': return '#<macro>';
     case 'record': return `#<record:${val.typeName}>`;
