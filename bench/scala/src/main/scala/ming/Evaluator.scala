@@ -7,22 +7,29 @@ object Evaluator:
   private def eval(expr: Expr, env: Env): Expr =
     try
       expr match
-        case Expr.Num(_) | Expr.Bool(_) | Expr.Str(_) | Expr.Chr(_) | Expr.Lambda(_, _, _, _) | Expr.Pair(_, _) =>
+        case Expr.Num(_) | Expr.Bool(_) | Expr.Str(_) | Expr.Chr(_) | Expr.Lambda(_, _, _, _) | Expr.Pair(_, _) |
+            Expr.Macro(_, _, _) =>
           expr
         case Expr.Sym(name) => env.lookup(name)
         case Expr.Lst(Nil)  => throw EvalError("empty application")
         case Expr.Lst(Expr.Sym("quote") :: args) =>
           if args.length != 1 then throw EvalError("quote: need exactly 1 argument")
           args.head
-        case Expr.Lst(Expr.Sym("if") :: args)      => evalIf(args, env)
-        case Expr.Lst(Expr.Sym("define") :: args)  => evalDefine(args, env)
-        case Expr.Lst(Expr.Sym("set!") :: args)    => evalSet(args, env)
-        case Expr.Lst(Expr.Sym("lambda") :: args)  => evalLambda(args, env)
-        case Expr.Lst(Expr.Sym("let") :: args)     => evalLet(args, env)
-        case Expr.Lst(Expr.Sym("begin") :: args)   => evalBegin(args, env)
-        case Expr.Lst(Expr.Sym("cond") :: clauses) => evalCond(clauses, env)
-        case Expr.Lst(Expr.Sym("and") :: args)     => evalAnd(args, env)
-        case Expr.Lst(Expr.Sym("or") :: args)      => evalOr(args, env)
+        case Expr.Lst(Expr.Sym("if") :: args)            => evalIf(args, env)
+        case Expr.Lst(Expr.Sym("define") :: args)        => evalDefine(args, env)
+        case Expr.Lst(Expr.Sym("set!") :: args)          => evalSet(args, env)
+        case Expr.Lst(Expr.Sym("lambda") :: args)        => evalLambda(args, env)
+        case Expr.Lst(Expr.Sym("let") :: args)           => evalLet(args, env)
+        case Expr.Lst(Expr.Sym("begin") :: args)         => evalBegin(args, env)
+        case Expr.Lst(Expr.Sym("cond") :: clauses)       => evalCond(clauses, env)
+        case Expr.Lst(Expr.Sym("and") :: args)           => evalAnd(args, env)
+        case Expr.Lst(Expr.Sym("or") :: args)            => evalOr(args, env)
+        case Expr.Lst(Expr.Sym("define-syntax") :: args) => evalDefineSyntax(args, env)
+        case Expr.Lst((head @ Expr.Sym(name)) :: _) if isMacro(name, env) =>
+          val mac = env.lookup(name).asInstanceOf[Expr.Macro]
+          val (expanded, hygieneEnv) =
+            Macros.expandMacro(mac.literals, mac.rules, expr.asInstanceOf[Expr.Lst].elems, mac.defEnv, env)
+          eval(expanded, hygieneEnv)
         case Expr.Lst(op :: args) =>
           val func          = eval(op, env)
           val evaluatedArgs = args.map(a => eval(a, env))
@@ -112,6 +119,24 @@ object Evaluator:
       if !isFalsy(v) then if body.isEmpty then v else evalBody(body, env)
       else evalCond(rest, env)
     case _ => throw EvalError("cond: invalid clause")
+
+  private def isMacro(name: String, env: Env): Boolean =
+    env.lookupOpt(name).exists(_.isInstanceOf[Expr.Macro])
+
+  private def evalDefineSyntax(args: List[Expr], env: Env): Expr = args match
+    case Expr.Sym(name) :: Expr.Lst(Expr.Sym("syntax-rules") :: Expr.Lst(literals) :: rules) :: Nil =>
+      val litNames = literals.map {
+        case Expr.Sym(s) => s
+        case _           => throw EvalError("define-syntax: literals must be symbols")
+      }
+      val rulesList = rules.map {
+        case Expr.Lst(List(Expr.Lst(_ :: patternArgs), template)) =>
+          (patternArgs, template)
+        case _ => throw EvalError("define-syntax: invalid rule")
+      }
+      env.define(name, Expr.Macro(litNames, rulesList, env))
+      Expr.Bool(false)
+    case _ => throw EvalError("define-syntax: invalid syntax")
 
   private def evalBody(exprs: List[Expr], env: Env): Expr =
     exprs.foldLeft(Expr.Bool(false): Expr)((_, e) => eval(e, env))

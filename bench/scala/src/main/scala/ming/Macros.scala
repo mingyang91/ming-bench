@@ -1,0 +1,209 @@
+package ming
+
+import scala.collection.mutable
+
+private[ming] object Macros:
+
+  private var gensymCounter = 0L
+
+  private def gensym(base: String): String =
+    gensymCounter += 1
+    s"${base}__hyg_${gensymCounter}"
+
+  private val specialForms = Set(
+    "if",
+    "begin",
+    "let",
+    "set!",
+    "define",
+    "lambda",
+    "cond",
+    "and",
+    "or",
+    "quote",
+    "define-syntax",
+    "syntax-rules",
+    "let*",
+    "letrec",
+    "when",
+    "unless"
+  )
+
+  /** Expand a macro call. Returns (expanded expr, env to evaluate it in). */
+  def expandMacro(
+    literals: List[String],
+    rules: List[(List[Expr], Expr)],
+    form: List[Expr],
+    defEnv: Env,
+    useEnv: Env
+  ): (Expr, Env) =
+    val inputArgs = form.tail
+    for (pattern, template) <- rules do
+      matchPattern(pattern, inputArgs, literals) match
+        case Some(bindings) =>
+          val patVars  = collectPatternVars(pattern, literals)
+          val freeSyms = collectFreeSymbols(template, patVars)
+          val renames  = mutable.Map[String, String]()
+          for sym <- freeSyms if !specialForms.contains(sym) do
+            // Don't rename macro names — they need normal resolution for recursive expansion
+            val isMacroRef = defEnv.lookupOpt(sym).exists(_.isInstanceOf[Expr.Macro])
+            if !isMacroRef then renames(sym) = gensym(sym)
+
+          val expanded = doExpand(template, bindings, renames.toMap)
+
+          val hygieneEnv = useEnv.child()
+          for (original, renamed) <- renames do
+            defEnv.lookupOpt(original) match
+              case Some(_: Expr.Macro) => () // let macros resolve via normal lookup
+              case Some(value)         => hygieneEnv.define(renamed, value)
+              case None                => () // template-introduced name, no injection
+          return (expanded, hygieneEnv)
+        case None => ()
+    throw EvalError("syntax-rules: no matching pattern")
+
+  private def collectPatternVars(pattern: List[Expr], literals: List[String]): Set[String] =
+    val vars = Set.newBuilder[String]
+    def collect(p: Expr): Unit = p match
+      case Expr.Sym(name) if name != "..." && !literals.contains(name) && name != "_" =>
+        vars += name
+      case Expr.Lst(elems) => elems.foreach(collect)
+      case _               => ()
+    pattern.foreach(collect)
+    vars.result()
+
+  private def collectFreeSymbols(template: Expr, patVars: Set[String]): Set[String] = template match
+    case Expr.Sym(name) if !patVars.contains(name) && name != "..." => Set(name)
+    case Expr.Lst(Expr.Sym("quote") :: _)                           => Set.empty
+    case Expr.Lst(elems) => elems.flatMap(e => collectFreeSymbols(e, patVars)).toSet
+    case _               => Set.empty
+
+  // --- Pattern matching ---
+
+  private def matchPattern(
+    pattern: List[Expr],
+    input: List[Expr],
+    literals: List[String]
+  ): Option[Map[String, Either[Expr, List[Expr]]]] =
+    val bindings = mutable.Map[String, Either[Expr, List[Expr]]]()
+    if matchElems(pattern, input, literals, bindings) then Some(bindings.toMap)
+    else None
+
+  private def matchElems(
+    pattern: List[Expr],
+    input: List[Expr],
+    literals: List[String],
+    bindings: mutable.Map[String, Either[Expr, List[Expr]]]
+  ): Boolean =
+    val ellipsisIdx = pattern.indexWhere(_ == Expr.Sym("..."))
+    if ellipsisIdx < 0 then
+      if pattern.length != input.length then return false
+      pattern.zip(input).forall((p, i) => matchSingle(p, i, literals, bindings))
+    else
+      if ellipsisIdx == 0 then return false
+      val beforeEllipsis  = pattern.take(ellipsisIdx - 1)
+      val ellipsisPattern = pattern(ellipsisIdx - 1)
+      val afterEllipsis   = pattern.drop(ellipsisIdx + 1)
+      val minRequired     = beforeEllipsis.length + afterEllipsis.length
+      if input.length < minRequired then return false
+      val repeatCount = input.length - minRequired
+
+      if !beforeEllipsis.zip(input.take(beforeEllipsis.length)).forall((p, i) => matchSingle(p, i, literals, bindings))
+      then return false
+
+      val repeatedInputs   = input.slice(beforeEllipsis.length, beforeEllipsis.length + repeatCount)
+      val ellipsisVars     = collectSinglePatternVars(ellipsisPattern, literals)
+      val ellipsisBindings = mutable.Map[String, List[Expr]]()
+      for v <- ellipsisVars do ellipsisBindings(v) = Nil
+
+      for elem <- repeatedInputs do
+        val tempBindings = mutable.Map[String, Either[Expr, List[Expr]]]()
+        if !matchSingle(ellipsisPattern, elem, literals, tempBindings) then return false
+        for (k, v) <- tempBindings do
+          v match
+            case Left(expr) =>
+              ellipsisBindings(k) = ellipsisBindings.getOrElse(k, Nil) :+ expr
+            case _ => ()
+
+      for (k, vs) <- ellipsisBindings do bindings(k) = Right(vs)
+
+      val afterInput = input.drop(beforeEllipsis.length + repeatCount)
+      afterEllipsis.zip(afterInput).forall((p, i) => matchSingle(p, i, literals, bindings))
+
+  private def collectSinglePatternVars(pattern: Expr, literals: List[String]): Set[String] = pattern match
+    case Expr.Sym(name) if name != "..." && !literals.contains(name) && name != "_" => Set(name)
+    case Expr.Lst(elems) => elems.flatMap(e => collectSinglePatternVars(e, literals)).toSet
+    case _               => Set.empty
+
+  private def matchSingle(
+    pattern: Expr,
+    input: Expr,
+    literals: List[String],
+    bindings: mutable.Map[String, Either[Expr, List[Expr]]]
+  ): Boolean = pattern match
+    case Expr.Sym("_") => true
+    case Expr.Sym(name) if literals.contains(name) =>
+      input match
+        case Expr.Sym(n) => n == name
+        case _           => false
+    case Expr.Sym(name) if name != "..." =>
+      bindings(name) = Left(input)
+      true
+    case Expr.Lst(pelems) =>
+      input match
+        case Expr.Lst(ielems) => matchElems(pelems, ielems, literals, bindings)
+        case _                => false
+    case _ => false
+
+  // --- Template expansion ---
+
+  private def doExpand(
+    template: Expr,
+    bindings: Map[String, Either[Expr, List[Expr]]],
+    renames: Map[String, String]
+  ): Expr = template match
+    case Expr.Sym(name) if bindings.contains(name) =>
+      bindings(name) match
+        case Left(v)  => v
+        case Right(_) => throw EvalError(s"syntax-rules: ellipsis variable $name used without ellipsis")
+    case Expr.Sym(name) if renames.contains(name) =>
+      Expr.Sym(renames(name))
+    case Expr.Sym(_) => template
+    case Expr.Lst(elems) =>
+      Expr.Lst(expandList(elems, bindings, renames))
+    case _ => template
+
+  private def expandList(
+    elems: List[Expr],
+    bindings: Map[String, Either[Expr, List[Expr]]],
+    renames: Map[String, String]
+  ): List[Expr] =
+    val result = List.newBuilder[Expr]
+    var i      = 0
+    while i < elems.length do
+      if i + 1 < elems.length && elems(i + 1) == Expr.Sym("...") then
+        val elem     = elems(i)
+        val usedVars = findEllipsisVars(elem, bindings)
+        if usedVars.isEmpty then throw EvalError("syntax-rules: no ellipsis variable in repeated template")
+        val count = bindings(usedVars.head) match
+          case Right(vs) => vs.length
+          case _         => throw EvalError("syntax-rules: not an ellipsis binding")
+        for j <- 0 until count do
+          val iterBindings = bindings.map { case (k, v) =>
+            if usedVars.contains(k) then
+              v match
+                case Right(vs) => (k, Left(vs(j)))
+                case other     => (k, other)
+            else (k, v)
+          }
+          result += doExpand(elem, iterBindings, renames)
+        i += 2
+      else
+        result += doExpand(elems(i), bindings, renames)
+        i += 1
+    result.result()
+
+  private def findEllipsisVars(template: Expr, bindings: Map[String, Either[Expr, List[Expr]]]): Set[String] =
+    template match
+      case Expr.Sym(name) if bindings.get(name).exists(_.isRight) => Set(name)
+      case Expr.Lst(elems) => elems.flatMap(e => findEllipsisVars(e, bindings)).toSet
+      case _               => Set.empty

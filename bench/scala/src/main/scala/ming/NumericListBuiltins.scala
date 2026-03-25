@@ -2,6 +2,19 @@ package ming
 
 private[ming] object NumericListBuiltins:
 
+  def applyNumericPredicate(name: String, args: List[Expr]): Expr =
+    Builtins.unary(name, args) {
+      case Expr.Num(n) =>
+        name match
+          case "zero?"     => Expr.Bool(n == 0)
+          case "positive?" => Expr.Bool(n > 0)
+          case "negative?" => Expr.Bool(n < 0)
+          case "odd?"      => Expr.Bool(n % 2 != 0)
+          case "even?"     => Expr.Bool(n % 2 == 0)
+          case _           => throw EvalError(s"$name: unknown predicate")
+      case _ => throw EvalError(s"$name: not a number")
+    }
+
   def applyModulo(args: List[Expr]): Expr =
     if args.length != 2 then throw EvalError("modulo: need exactly 2 arguments")
     val (a, b) = (Builtins.asNum(args(0)), Builtins.asNum(args(1)))

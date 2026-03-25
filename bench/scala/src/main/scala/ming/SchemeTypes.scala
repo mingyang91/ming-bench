@@ -11,6 +11,7 @@ private[ming] enum Expr:
   case Lst(elems: List[Expr])
   case Lambda(params: List[String], restParam: Option[String], body: List[Expr], closure: Env)
   case Pair(car: Expr, cdr: Expr)
+  case Macro(literals: List[String], rules: List[(List[Expr], Expr)], defEnv: Env)
 
   var line: Int = 0
   var col: Int  = 0
@@ -42,5 +43,8 @@ private[ming] class Env(
       parent match
         case Some(p) => p.set(name, value)
         case None    => throw EvalError(s"unbound variable: $name")
+
+  def lookupOpt(name: String): Option[Expr] =
+    bindings.get(name).orElse(parent.flatMap(_.lookupOpt(name)))
 
   def child(): Env = Env(mutable.Map.empty, Some(this))

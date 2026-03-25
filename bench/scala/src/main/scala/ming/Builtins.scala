@@ -63,16 +63,8 @@ private[ming] object Builtins:
     case "min"       => NumericListBuiltins.applyMinMax(name, args, _ < _)
     case "max"       => NumericListBuiltins.applyMinMax(name, args, _ > _)
     case "expt"      => NumericListBuiltins.applyExpt(args)
-    case "zero?" =>
-      unary(name, args) { case Expr.Num(n) => Expr.Bool(n == 0); case _ => throw EvalError("zero?: not a number") }
-    case "positive?" =>
-      unary(name, args) { case Expr.Num(n) => Expr.Bool(n > 0); case _ => throw EvalError("positive?: not a number") }
-    case "negative?" =>
-      unary(name, args) { case Expr.Num(n) => Expr.Bool(n < 0); case _ => throw EvalError("negative?: not a number") }
-    case "odd?" =>
-      unary(name, args) { case Expr.Num(n) => Expr.Bool(n % 2 != 0); case _ => throw EvalError("odd?: not a number") }
-    case "even?" =>
-      unary(name, args) { case Expr.Num(n) => Expr.Bool(n % 2 == 0); case _ => throw EvalError("even?: not a number") }
+    case "zero?" | "positive?" | "negative?" | "odd?" | "even?" =>
+      NumericListBuiltins.applyNumericPredicate(name, args)
     case "list-ref"  => NumericListBuiltins.applyListRef(args)
     case "list-tail" => NumericListBuiltins.applyListTail(args)
     case "list?"     => unary(name, args)(e => Expr.Bool(NumericListBuiltins.isList(e)))
@@ -83,24 +75,8 @@ private[ming] object Builtins:
     case "equal?" =>
       if args.length != 2 then throw EvalError("equal?: need exactly 2 arguments");
       Expr.Bool(schemeEqual(args(0), args(1)))
-    case "char-alphabetic?" =>
-      unary(name, args) {
-        case Expr.Chr(c) => Expr.Bool(c.isLetter); case _ => throw EvalError("char-alphabetic?: not a char")
-      }
-    case "char-numeric?" =>
-      unary(name, args) {
-        case Expr.Chr(c) => Expr.Bool(c.isDigit); case _ => throw EvalError("char-numeric?: not a char")
-      }
-    case "char-upcase" =>
-      unary(name, args) {
-        case Expr.Chr(c) => Expr.Chr(c.toUpper); case _ => throw EvalError("char-upcase: not a char")
-      }
-    case "char-downcase" =>
-      unary(name, args) {
-        case Expr.Chr(c) => Expr.Chr(c.toLower); case _ => throw EvalError("char-downcase: not a char")
-      }
-    case "char=?"      => StringBuiltins.charCmp(name, args, _ == _)
-    case "char<?"      => StringBuiltins.charCmp(name, args, _ < _)
+    case "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?" | "char<?" =>
+      StringBuiltins.applyCharBuiltin(name, args)
     case "string=?"    => StringBuiltins.strCmp(name, args, _ == _)
     case "string<?"    => StringBuiltins.strCmp(name, args, _ < _)
     case "string-ci=?" => StringBuiltins.strCiCmp(name, args, _ == _)
@@ -179,6 +155,7 @@ private[ming] object Builtins:
     case Expr.Lst(elems)         => "(" + elems.map(display).mkString(" ") + ")"
     case Expr.Pair(a, d)         => s"(${display(a)} . ${display(d)})"
     case Expr.Lambda(_, _, _, _) => "#<procedure>"
+    case Expr.Macro(_, _, _)     => "#<macro>"
 
   private def displayOutput(e: Expr): String = e match
     case Expr.Str(s) => new String(s)

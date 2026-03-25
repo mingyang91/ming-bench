@@ -63,6 +63,27 @@ private[ming] object StringBuiltins:
       Builtins.unary(name, args)(e => Expr.Bool(e.isInstanceOf[Expr.Chr]))
     case _ => throw EvalError(s"unknown procedure: $name")
 
+  def applyCharBuiltin(name: String, args: List[Expr]): Expr = name match
+    case "char-alphabetic?" =>
+      Builtins.unary(name, args) {
+        case Expr.Chr(c) => Expr.Bool(c.isLetter); case _ => throw EvalError("char-alphabetic?: not a char")
+      }
+    case "char-numeric?" =>
+      Builtins.unary(name, args) {
+        case Expr.Chr(c) => Expr.Bool(c.isDigit); case _ => throw EvalError("char-numeric?: not a char")
+      }
+    case "char-upcase" =>
+      Builtins.unary(name, args) {
+        case Expr.Chr(c) => Expr.Chr(c.toUpper); case _ => throw EvalError("char-upcase: not a char")
+      }
+    case "char-downcase" =>
+      Builtins.unary(name, args) {
+        case Expr.Chr(c) => Expr.Chr(c.toLower); case _ => throw EvalError("char-downcase: not a char")
+      }
+    case "char=?" => charCmp(name, args, _ == _)
+    case "char<?" => charCmp(name, args, _ < _)
+    case _        => throw EvalError(s"unknown char procedure: $name")
+
   def charCmp(name: String, args: List[Expr], op: (Char, Char) => Boolean): Expr =
     if args.length != 2 then throw EvalError(s"$name: need exactly 2 arguments")
     (args(0), args(1)) match
