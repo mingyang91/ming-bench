@@ -20,7 +20,17 @@ const (
 	TypeMacro
 	TypeRational
 	TypeFloat
+	TypeRecord
+	TypeGoFunc
 )
+
+type GoFunc func(args []*Value) (*Value, error)
+
+// RecordType describes a record type created by define-record-type.
+type RecordType struct {
+	Name   string
+	Fields []string
+}
 
 type Value struct {
 	Type    ValueType
@@ -40,6 +50,11 @@ type Value struct {
 	ClosureEnv *Env
 	// Macro fields
 	Macro *SyntaxRulesMacro
+	// Record fields
+	RecordType   *RecordType
+	RecordFields []*Value
+	// Go native function
+	GoFunc GoFunc
 }
 
 var Void = &Value{Type: TypeVoid}
@@ -72,6 +87,10 @@ func CharValue(c rune) *Value {
 
 func PairValue(car, cdr *Value) *Value {
 	return &Value{Type: TypePair, Car: car, Cdr: cdr}
+}
+
+func makeGoFunc(fn GoFunc) *Value {
+	return &Value{Type: TypeGoFunc, GoFunc: fn}
 }
 
 func (v *Value) Display() string {
@@ -110,6 +129,10 @@ func (v *Value) Display() string {
 		return fmt.Sprintf("%d/%d", v.Num, v.Den)
 	case TypeFloat:
 		return formatFloat(v.FloatVal)
+	case TypeRecord:
+		return fmt.Sprintf("#<%s>", v.RecordType.Name)
+	case TypeGoFunc:
+		return "#<procedure>"
 	}
 	return ""
 }

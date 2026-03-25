@@ -62,6 +62,8 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalSetBang(expr, env)
 		case "define-syntax":
 			return evalDefineSyntax(expr, env)
+		case "define-record-type":
+			return evalDefineRecordType(expr, env)
 		}
 		// Check for macro application
 		if val, ok := env.Get(head.StrVal); ok && val.Type == TypeMacro {
@@ -92,6 +94,11 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 	// Call builtin
 	if fn.Type == TypeSymbol && len(fn.StrVal) > 8 && fn.StrVal[:8] == "builtin:" {
 		return callBuiltin(fn.StrVal, args, env, expr.Line, expr.Col)
+	}
+
+	// Call Go native function
+	if fn.Type == TypeGoFunc {
+		return fn.GoFunc(args)
 	}
 
 	// Call lambda
@@ -424,6 +431,129 @@ func callLambda(fn *Value, args []*Value, line, col int) (*Value, error) {
 		}
 	}
 	return result, nil
+}
+
+func evalDefineRecordType(expr *Expr, env *Env) (*Value, error) {
+	// (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+	if len(expr.Elements) < 5 {
+		return nil, fmt.Errorf("%d:%d: define-record-type requires type name, constructor, predicate, and fields", expr.Line, expr.Col)
+	}
+
+	// Type name
+	typeName := expr.Elements[1]
+	if typeName.Type != ExprSymbol {
+		return nil, fmt.Errorf("%d:%d: expected symbol for record type name", expr.Line, expr.Col)
+	}
+
+	// Constructor: (make-foo field1 field2 ...)
+	ctorExpr := expr.Elements[2]
+	if ctorExpr.Type != ExprList || len(ctorExpr.Elements) < 1 {
+		return nil, fmt.Errorf("%d:%d: expected constructor specification", expr.Line, expr.Col)
+	}
+	ctorName := ctorExpr.Elements[0]
+	if ctorName.Type != ExprSymbol {
+		return nil, fmt.Errorf("%d:%d: expected symbol for constructor name", expr.Line, expr.Col)
+	}
+	ctorFields := make([]string, len(ctorExpr.Elements)-1)
+	for i, f := range ctorExpr.Elements[1:] {
+		if f.Type != ExprSymbol {
+			return nil, fmt.Errorf("%d:%d: expected symbol for constructor field", expr.Line, expr.Col)
+		}
+		ctorFields[i] = f.StrVal
+	}
+
+	// Predicate
+	predExpr := expr.Elements[3]
+	if predExpr.Type != ExprSymbol {
+		return nil, fmt.Errorf("%d:%d: expected symbol for predicate name", expr.Line, expr.Col)
+	}
+
+	// Field specs: (field-name accessor-name) ...
+	fieldNames := make([]string, 0)
+	accessorMap := make(map[string]int) // accessor-name -> field index
+	for _, fieldSpec := range expr.Elements[4:] {
+		if fieldSpec.Type != ExprList || len(fieldSpec.Elements) < 2 {
+			return nil, fmt.Errorf("%d:%d: expected (field accessor) specification", expr.Line, expr.Col)
+		}
+		fieldName := fieldSpec.Elements[0]
+		accessor := fieldSpec.Elements[1]
+		if fieldName.Type != ExprSymbol || accessor.Type != ExprSymbol {
+			return nil, fmt.Errorf("%d:%d: expected symbols in field specification", expr.Line, expr.Col)
+		}
+		fieldNames = append(fieldNames, fieldName.StrVal)
+		accessorMap[accessor.StrVal] = len(fieldNames) - 1
+	}
+
+	// Build field index mapping: ctorField -> index in fieldNames
+	ctorFieldIdx := make([]int, len(ctorFields))
+	for i, cf := range ctorFields {
+		found := false
+		for j, fn := range fieldNames {
+			if cf == fn {
+				ctorFieldIdx[i] = j
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("%d:%d: constructor field '%s' not in field specs", expr.Line, expr.Col, cf)
+		}
+	}
+
+	rt := &RecordType{Name: typeName.StrVal, Fields: fieldNames}
+
+	// Define constructor
+	numFields := len(fieldNames)
+	constructor := &Value{
+		Type: TypeLambda,
+		Params: ctorFields,
+		Body: nil, // handled specially via BuiltinFunc
+		ClosureEnv: env,
+	}
+	// We'll use a Go-native approach: bind the constructor as a lambda that creates records
+	// Instead, let's define it as a builtin-like closure
+	rtCopy := rt
+	ctorIdxCopy := ctorFieldIdx
+	nf := numFields
+	env.Set(ctorName.StrVal, makeGoFunc(func(args []*Value) (*Value, error) {
+		if len(args) != len(ctorIdxCopy) {
+			return nil, fmt.Errorf("wrong number of arguments to constructor %s", ctorName.StrVal)
+		}
+		fields := make([]*Value, nf)
+		for i, idx := range ctorIdxCopy {
+			fields[idx] = args[i]
+		}
+		return &Value{Type: TypeRecord, RecordType: rtCopy, RecordFields: fields}, nil
+	}))
+	_ = constructor
+
+	// Define predicate
+	env.Set(predExpr.StrVal, makeGoFunc(func(args []*Value) (*Value, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments to predicate %s", predExpr.StrVal)
+		}
+		if args[0].Type == TypeRecord && args[0].RecordType == rtCopy {
+			return True, nil
+		}
+		return False, nil
+	}))
+
+	// Define accessors
+	for accessorName, fieldIdx := range accessorMap {
+		idx := fieldIdx // capture
+		aName := accessorName
+		env.Set(aName, makeGoFunc(func(args []*Value) (*Value, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("wrong number of arguments to accessor %s", aName)
+			}
+			if args[0].Type != TypeRecord || args[0].RecordType != rtCopy {
+				return nil, fmt.Errorf("accessor %s applied to wrong type", aName)
+			}
+			return args[0].RecordFields[idx], nil
+		}))
+	}
+
+	return Void, nil
 }
 
 func evalCond(expr *Expr, env *Env) (*Value, error) {
