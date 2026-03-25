@@ -37,6 +37,7 @@ enum Value {
     Builtin(String, fn(&[Value], Span) -> Result<Value, EvalError>),
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Expr>,
         env: EnvRef,
     },
@@ -832,6 +833,8 @@ fn default_env() -> EnvRef {
         e.set("string-ref".into(), Value::Builtin("string-ref".into(), builtin_string_ref));
         e.set("char?".into(), Value::Builtin("char?".into(), builtin_char_pred));
         e.set("string-copy".into(), Value::Builtin("string-copy".into(), builtin_string_copy));
+        // apply is handled specially in eval, but needs to be a value for (define f apply)
+        e.set("apply".into(), Value::Builtin("apply".into(), |_args, _span| unreachable!()));
     }
 
     env
@@ -854,6 +857,34 @@ fn expr_to_value(expr: &Expr) -> Value {
             }
         }
     }
+}
+
+/// Parse parameter list, handling dot notation for rest params.
+/// e.g. `(x y . rest)` -> (vec!["x", "y"], Some("rest"))
+fn parse_params(param_exprs: &[Expr], span: Span) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut params = Vec::new();
+    let mut rest_param = None;
+    let mut i = 0;
+    while i < param_exprs.len() {
+        match &param_exprs[i].kind {
+            ExprKind::Symbol(s) if s == "." => {
+                if i + 1 >= param_exprs.len() {
+                    return Err(EvalError::Parse(format!("at {span}: expected parameter after .")));
+                }
+                rest_param = Some(match &param_exprs[i + 1].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Parse(format!("at {span}: expected symbol after ."))),
+                });
+                break;
+            }
+            ExprKind::Symbol(s) => {
+                params.push(s.clone());
+                i += 1;
+            }
+            _ => return Err(EvalError::Parse(format!("at {}: expected parameter name", param_exprs[i].span))),
+        }
+    }
+    Ok((params, rest_param))
 }
 
 /// Evaluate a `cond` expression given its clauses.
@@ -925,16 +956,11 @@ fn eval(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                                     ExprKind::Symbol(s) => s.clone(),
                                     _ => return Err(EvalError::Parse(format!("at {span}: define: expected symbol"))),
                                 };
-                                let params: Vec<String> = name_and_params[1..]
-                                    .iter()
-                                    .map(|e| match &e.kind {
-                                        ExprKind::Symbol(s) => Ok(s.clone()),
-                                        _ => Err(EvalError::Parse(format!("at {}: define: expected parameter name", e.span))),
-                                    })
-                                    .collect::<Result<_, _>>()?;
+                                let (params, rest_param) = parse_params(&name_and_params[1..], span)?;
                                 let body = elems[2..].to_vec();
                                 let lambda = Value::Lambda {
                                     params,
+                                    rest_param,
                                     body,
                                     env: env.clone(),
                                 };
@@ -967,21 +993,20 @@ fn eval(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                         if elems.len() < 3 {
                             return Err(EvalError::Parse(format!("at {span}: lambda requires params and body")));
                         }
-                        let params = match &elems[1].kind {
+                        let (params, rest_param) = match &elems[1].kind {
                             ExprKind::List(param_exprs) => {
-                                param_exprs
-                                    .iter()
-                                    .map(|e| match &e.kind {
-                                        ExprKind::Symbol(s) => Ok(s.clone()),
-                                        _ => Err(EvalError::Parse(format!("at {}: lambda: expected parameter name", e.span))),
-                                    })
-                                    .collect::<Result<Vec<_>, _>>()?
+                                parse_params(param_exprs, span)?
+                            }
+                            ExprKind::Symbol(s) => {
+                                // (lambda args body) — single rest param
+                                (vec![], Some(s.clone()))
                             }
                             _ => return Err(EvalError::Parse(format!("at {span}: lambda: expected parameter list"))),
                         };
                         let body = elems[2..].to_vec();
                         return Ok(Value::Lambda {
                             params,
+                            rest_param,
                             body,
                             env: env.clone(),
                         });
@@ -1031,6 +1056,7 @@ fn eval(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                             let body = elems[body_start..].to_vec();
                             let lambda = Value::Lambda {
                                 params: param_names.clone(),
+                                rest_param: None,
                                 body,
                                 env: local_env.clone(),
                             };
@@ -1121,16 +1147,45 @@ fn eval(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
             for arg in &elems[1..] {
                 args.push(eval(arg, env)?);
             }
+
+            // Handle apply specially
+            if matches!(&func, Value::Builtin(name, _) if name == "apply") {
+                return builtin_apply(&args, span);
+            }
+
             apply_function(&func, &args, span)
         }
     }
 }
 
+fn builtin_apply(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity(format!("at {span}: apply requires at least 2 arguments")));
+    }
+    let func = &args[0];
+    let last = &args[args.len() - 1];
+    let mut call_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+    match last {
+        Value::List(elems) => call_args.extend(elems.iter().cloned()),
+        Value::Nil => {}
+        _ => return Err(EvalError::Type(format!("at {span}: apply: last argument must be a list"))),
+    }
+    apply_function(func, &call_args, span)
+}
+
 fn apply_function(func: &Value, args: &[Value], span: Span) -> Result<Value, EvalError> {
     match func {
         Value::Builtin(_, f) => f(args, span),
-        Value::Lambda { params, body, env } => {
-            if args.len() != params.len() {
+        Value::Lambda { params, rest_param, body, env } => {
+            if let Some(_rest) = rest_param {
+                if args.len() < params.len() {
+                    return Err(EvalError::Arity(format!(
+                        "at {span}: expected at least {} arguments, got {}",
+                        params.len(),
+                        args.len()
+                    )));
+                }
+            } else if args.len() != params.len() {
                 return Err(EvalError::Arity(format!(
                     "at {span}: expected {} arguments, got {}",
                     params.len(),
@@ -1142,6 +1197,15 @@ fn apply_function(func: &Value, args: &[Value], span: Span) -> Result<Value, Eva
                 let mut e = local_env.borrow_mut();
                 for (param, arg) in params.iter().zip(args.iter()) {
                     e.set(param.clone(), arg.clone());
+                }
+                if let Some(rest) = rest_param {
+                    let rest_args = &args[params.len()..];
+                    let rest_val = if rest_args.is_empty() {
+                        Value::Nil
+                    } else {
+                        Value::List(rest_args.to_vec())
+                    };
+                    e.set(rest.clone(), rest_val);
                 }
             }
             let mut result = Value::Void;
