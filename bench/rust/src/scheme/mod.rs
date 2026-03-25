@@ -934,26 +934,34 @@ fn cek_step(expr: Expr, env: Env, kont: &mut Vec<KFrame>) -> Result<CekState, Ev
                     }
 
                     _ => {
-                        // Check for macro
-                        if let Some(Val::Macro { literals, rules, def_env }) = env.get(op) {
-                            let (expanded, eval_env) = expand_macro(
-                                &elems, &literals, &rules, &def_env, &env, span,
-                            )?;
-                            return Ok(CekState::Eval(expanded, eval_env));
+                        // Single lookup: check for macro or reuse value for application
+                        match env.get(op) {
+                            Some(Val::Macro { literals, rules, def_env }) => {
+                                let (expanded, eval_env) = expand_macro(
+                                    &elems, &literals, &rules, &def_env, &env, span,
+                                )?;
+                                return Ok(CekState::Eval(expanded, eval_env));
+                            }
+                            Some(Val::SyntaxCaseMacro { transformer, def_env }) => {
+                                let call_expr = Expr::new(ExprKind::List(elems.clone()), span);
+                                let stx_obj = Val::SyntaxObject(Box::new(call_expr));
+                                kont.push(KFrame::SyntaxCaseExpand { use_env: env.clone(), def_env });
+                                return apply_function_cek(*transformer, vec![stx_obj], kont, span, &env);
+                            }
+                            Some(resolved) => {
+                                // Reuse the looked-up value directly for function application
+                                kont.push(KFrame::CallOp { args: elems[1..].to_vec(), env: env.clone(), span });
+                                return Ok(CekState::ApplyK(resolved));
+                            }
+                            None => {
+                                return Err(EvalError::UnboundVariable(format!("{op} at {span}")));
+                            }
                         }
-                        // Check for syntax-case macro
-                        if let Some(Val::SyntaxCaseMacro { transformer, def_env }) = env.get(op) {
-                            let call_expr = Expr::new(ExprKind::List(elems.clone()), span);
-                            let stx_obj = Val::SyntaxObject(Box::new(call_expr));
-                            kont.push(KFrame::SyntaxCaseExpand { use_env: env.clone(), def_env });
-                            return apply_function_cek(*transformer, vec![stx_obj], kont, span, &env);
-                        }
-                        // Fall through to function application
                     }
                 }
             }
 
-            // --- Function application ---
+            // --- Function application (non-symbol operator) ---
             // Push CallOp frame; evaluate the operator first
             kont.push(KFrame::CallOp { args: elems[1..].to_vec(), env: env.clone(), span });
             Ok(CekState::Eval(elems[0].clone(), env))
