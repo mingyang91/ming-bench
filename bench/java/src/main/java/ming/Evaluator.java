@@ -30,6 +30,28 @@ public class Evaluator {
 
     record SchemeChar(char value) {}
 
+    static class SchemeRational {
+        final long num;
+        final long den;
+        SchemeRational(long num, long den) {
+            if (den == 0) throw new ArithmeticException("division by zero");
+            if (den < 0) { num = -num; den = -den; }
+            long g = gcd(Math.abs(num), den);
+            this.num = num / g;
+            this.den = den / g;
+        }
+        boolean isInteger() { return den == 1; }
+        long toLong() { return num / den; }
+        double toDouble() { return (double) num / den; }
+        private static long gcd(long a, long b) { while (b != 0) { long t = b; b = a % b; a = t; } return a; }
+        @Override public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof SchemeRational r)) return false;
+            return num == r.num && den == r.den;
+        }
+        @Override public int hashCode() { return Long.hashCode(num) * 31 + Long.hashCode(den); }
+    }
+
     record Lambda(List<String> params, String restParam, List<Object> body, Env env) {}
 
     // Source position tracking
@@ -257,14 +279,36 @@ public class Evaluator {
                     i++; colNum++;
                 }
                 String tok = sb.toString();
-                try {
-                    tokens.add(new Token(Long.parseLong(tok), tokPos));
-                } catch (NumberFormatException e) {
+                Object parsed = parseNumber(tok);
+                if (parsed != null) {
+                    tokens.add(new Token(parsed, tokPos));
+                } else {
                     tokens.add(new Token(tok, tokPos));
                 }
             }
         }
         return tokens;
+    }
+
+    private Object parseNumber(String tok) {
+        // Try integer
+        try { return Long.parseLong(tok); } catch (NumberFormatException ignored) {}
+        // Try rational n/d
+        int slash = tok.indexOf('/');
+        if (slash > 0 && slash < tok.length() - 1) {
+            try {
+                long num = Long.parseLong(tok.substring(0, slash));
+                long den = Long.parseLong(tok.substring(slash + 1));
+                if (den == 0) return null;
+                return new SchemeRational(num, den);
+            } catch (NumberFormatException ignored) {}
+        }
+        // Try decimal (inexact)
+        try {
+            double d = Double.parseDouble(tok);
+            if (!Double.isInfinite(d) && !Double.isNaN(d)) return d;
+        } catch (NumberFormatException ignored) {}
+        return null;
     }
 
     // --- Parser ---
@@ -325,7 +369,7 @@ public class Evaluator {
         Object raw = unwrap(expr);
         Pos pos = posOf(expr);
 
-        if (raw instanceof Long || raw instanceof Boolean || raw instanceof SchemeString || raw instanceof SchemeChar) {
+        if (raw instanceof Long || raw instanceof Boolean || raw instanceof SchemeString || raw instanceof SchemeChar || raw instanceof SchemeRational || raw instanceof Double) {
             return raw;
         }
         if (raw instanceof String sym) {
@@ -569,6 +613,10 @@ public class Evaluator {
     boolean schemeEqual(Object a, Object b) {
         if (a == b) return true;
         if (a instanceof Long la && b instanceof Long lb) return la.equals(lb);
+        if (a instanceof SchemeRational ra && b instanceof SchemeRational rb) return ra.equals(rb);
+        if (a instanceof Long la && b instanceof SchemeRational rb) return new SchemeRational(la, 1).equals(rb);
+        if (a instanceof SchemeRational ra && b instanceof Long lb) return ra.equals(new SchemeRational(lb, 1));
+        if (a instanceof Double da && b instanceof Double db) return da.equals(db);
         if (a instanceof Boolean ba && b instanceof Boolean bb) return ba.equals(bb);
         if (a instanceof String sa && b instanceof String sb) return sa.equals(sb);
         if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
@@ -785,6 +833,11 @@ public class Evaluator {
     String schemeToString(Object val) {
         if (val == NIL) return "()";
         if (val instanceof Long l) return l.toString();
+        if (val instanceof SchemeRational r) return r.isInteger() ? String.valueOf(r.toLong()) : r.num + "/" + r.den;
+        if (val instanceof Double d) {
+            if (d == Math.floor(d) && !Double.isInfinite(d)) return String.valueOf(d);
+            return String.valueOf(d);
+        }
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
         if (val instanceof SchemeChar c) {

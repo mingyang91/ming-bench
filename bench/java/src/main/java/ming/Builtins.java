@@ -7,6 +7,7 @@ import ming.Evaluator.Builtin;
 import ming.Evaluator.Cons;
 import ming.Evaluator.Env;
 import ming.Evaluator.SchemeChar;
+import ming.Evaluator.SchemeRational;
 import ming.Evaluator.SchemeString;
 
 import static ming.Evaluator.NIL;
@@ -38,6 +39,72 @@ final class Builtins {
         registerNumericUtils();
         registerChars();
         registerStringComparison();
+        registerRationals();
+    }
+
+    // --- Numeric tower helpers ---
+
+    private boolean isNumber(Object v) {
+        return v instanceof Long || v instanceof SchemeRational || v instanceof Double;
+    }
+
+    private boolean isExact(Object v) {
+        return v instanceof Long || v instanceof SchemeRational;
+    }
+
+    private double toDouble(Object v) throws EvalError {
+        if (v instanceof Long l) return l;
+        if (v instanceof SchemeRational r) return r.toDouble();
+        if (v instanceof Double d) return d;
+        throw new EvalError("expected number, got: " + schemeToString(v));
+    }
+
+    private SchemeRational toRational(Object v) throws EvalError {
+        if (v instanceof Long l) return new SchemeRational(l, 1);
+        if (v instanceof SchemeRational r) return r;
+        throw new EvalError("expected exact number, got: " + schemeToString(v));
+    }
+
+    private boolean hasInexact(List<Object> args) {
+        for (Object a : args) if (a instanceof Double) return true;
+        return false;
+    }
+
+    private Object normalizeRational(SchemeRational r) {
+        return r.isInteger() ? r.toLong() : r;
+    }
+
+    private Object addTwo(Object a, Object b) throws EvalError {
+        if (a instanceof Double || b instanceof Double) return toDouble(a) + toDouble(b);
+        SchemeRational ra = toRational(a), rb = toRational(b);
+        return normalizeRational(new SchemeRational(ra.num * rb.den + rb.num * ra.den, ra.den * rb.den));
+    }
+
+    private Object subTwo(Object a, Object b) throws EvalError {
+        if (a instanceof Double || b instanceof Double) return toDouble(a) - toDouble(b);
+        SchemeRational ra = toRational(a), rb = toRational(b);
+        return normalizeRational(new SchemeRational(ra.num * rb.den - rb.num * ra.den, ra.den * rb.den));
+    }
+
+    private Object mulTwo(Object a, Object b) throws EvalError {
+        if (a instanceof Double || b instanceof Double) return toDouble(a) * toDouble(b);
+        SchemeRational ra = toRational(a), rb = toRational(b);
+        return normalizeRational(new SchemeRational(ra.num * rb.num, ra.den * rb.den));
+    }
+
+    private Object divTwo(Object a, Object b) throws EvalError {
+        if (a instanceof Double || b instanceof Double) {
+            double db = toDouble(b);
+            if (db == 0) throw new EvalError("division by zero");
+            return toDouble(a) / db;
+        }
+        SchemeRational ra = toRational(a), rb = toRational(b);
+        if (rb.num == 0) throw new EvalError("division by zero");
+        return normalizeRational(new SchemeRational(ra.num * rb.den, ra.den * rb.num));
+    }
+
+    private void requireNumber(Object v) throws EvalError {
+        if (!isNumber(v)) throw new EvalError("expected number, got: " + schemeToString(v));
     }
 
     private void define(String name, Evaluator.BuiltinFn fn) {
@@ -76,57 +143,54 @@ final class Builtins {
 
     private void registerArithmetic() {
         define("+", args -> {
-            long sum = 0;
-            for (Object a : args) sum += requireLong(a);
-            return sum;
+            Object result = 0L;
+            for (Object a : args) { requireNumber(a); result = addTwo(result, a); }
+            return result;
         });
         define("-", args -> {
             if (args.isEmpty()) throw new EvalError("- requires at least 1 argument");
-            if (args.size() == 1) return -requireLong(args.get(0));
-            long result = requireLong(args.get(0));
-            for (int i = 1; i < args.size(); i++) result -= requireLong(args.get(i));
+            requireNumber(args.get(0));
+            if (args.size() == 1) return subTwo(0L, args.get(0));
+            Object result = args.get(0);
+            for (int i = 1; i < args.size(); i++) { requireNumber(args.get(i)); result = subTwo(result, args.get(i)); }
             return result;
         });
         define("*", args -> {
-            long product = 1;
-            for (Object a : args) product *= requireLong(a);
-            return product;
+            Object result = 1L;
+            for (Object a : args) { requireNumber(a); result = mulTwo(result, a); }
+            return result;
         });
         define("/", args -> {
             if (args.size() < 2) throw new EvalError("/ requires at least 2 arguments");
-            long result = requireLong(args.get(0));
-            for (int i = 1; i < args.size(); i++) {
-                long divisor = requireLong(args.get(i));
-                if (divisor == 0) throw new EvalError("division by zero");
-                result /= divisor;
-            }
+            requireNumber(args.get(0));
+            Object result = args.get(0);
+            for (int i = 1; i < args.size(); i++) { requireNumber(args.get(i)); result = divTwo(result, args.get(i)); }
             return result;
         });
     }
 
     // --- Comparison ---
 
+    private int numCompare(Object a, Object b) throws EvalError {
+        requireNumber(a); requireNumber(b);
+        if (a instanceof Double || b instanceof Double) return Double.compare(toDouble(a), toDouble(b));
+        SchemeRational ra = toRational(a), rb = toRational(b);
+        return Long.compare(ra.num * rb.den, rb.num * ra.den);
+    }
+
+    private boolean numEquals(Object a, Object b) throws EvalError {
+        requireNumber(a); requireNumber(b);
+        if (a instanceof Double || b instanceof Double) return toDouble(a) == toDouble(b);
+        SchemeRational ra = toRational(a), rb = toRational(b);
+        return ra.num * rb.den == rb.num * ra.den;
+    }
+
     private void registerComparison() {
-        define("<", args -> {
-            requireArgCount(args, 2, "<");
-            return requireLong(args.get(0)) < requireLong(args.get(1));
-        });
-        define(">", args -> {
-            requireArgCount(args, 2, ">");
-            return requireLong(args.get(0)) > requireLong(args.get(1));
-        });
-        define("=", args -> {
-            requireArgCount(args, 2, "=");
-            return requireLong(args.get(0)) == requireLong(args.get(1));
-        });
-        define("<=", args -> {
-            requireArgCount(args, 2, "<=");
-            return requireLong(args.get(0)) <= requireLong(args.get(1));
-        });
-        define(">=", args -> {
-            requireArgCount(args, 2, ">=");
-            return requireLong(args.get(0)) >= requireLong(args.get(1));
-        });
+        define("<", args -> { requireArgCount(args, 2, "<"); return numCompare(args.get(0), args.get(1)) < 0; });
+        define(">", args -> { requireArgCount(args, 2, ">"); return numCompare(args.get(0), args.get(1)) > 0; });
+        define("=", args -> { requireArgCount(args, 2, "="); return numEquals(args.get(0), args.get(1)); });
+        define("<=", args -> { requireArgCount(args, 2, "<="); return numCompare(args.get(0), args.get(1)) <= 0; });
+        define(">=", args -> { requireArgCount(args, 2, ">="); return numCompare(args.get(0), args.get(1)) >= 0; });
     }
 
     // --- Logic ---
@@ -271,7 +335,7 @@ final class Builtins {
     // --- Type predicates ---
 
     private void registerTypePredicates() {
-        define("number?", args -> { requireArgCount(args, 1, "number?"); return args.get(0) instanceof Long; });
+        define("number?", args -> { requireArgCount(args, 1, "number?"); return isNumber(args.get(0)); });
         define("string?", args -> { requireArgCount(args, 1, "string?"); return args.get(0) instanceof SchemeString; });
         define("boolean?", args -> { requireArgCount(args, 1, "boolean?"); return args.get(0) instanceof Boolean; });
         define("pair?", args -> { requireArgCount(args, 1, "pair?"); return args.get(0) instanceof Cons; });
@@ -330,7 +394,11 @@ final class Builtins {
         });
         define("number->string", args -> {
             requireArgCount(args, 1, "number->string");
-            return new SchemeString(String.valueOf(requireLong(args.get(0))));
+            Object v = args.get(0);
+            if (v instanceof Long l) return new SchemeString(l.toString());
+            if (v instanceof SchemeRational r) return new SchemeString(r.isInteger() ? String.valueOf(r.toLong()) : r.num + "/" + r.den);
+            if (v instanceof Double d) return new SchemeString(String.valueOf(d));
+            throw new EvalError("number->string: expected number");
         });
         define("string-ref", args -> {
             requireArgCount(args, 2, "string-ref");
@@ -381,7 +449,14 @@ final class Builtins {
     // --- Numeric utilities (L09) ---
 
     private void registerNumericUtils() {
-        define("abs", args -> { requireArgCount(args, 1, "abs"); return Math.abs(requireLong(args.get(0))); });
+        define("abs", args -> {
+            requireArgCount(args, 1, "abs");
+            Object v = args.get(0);
+            if (v instanceof Long l) return Math.abs(l);
+            if (v instanceof SchemeRational r) return normalizeRational(new SchemeRational(Math.abs(r.num), r.den));
+            if (v instanceof Double d) return Math.abs(d);
+            throw new EvalError("abs: expected number");
+        });
         define("modulo", args -> {
             requireArgCount(args, 2, "modulo");
             long a = requireLong(args.get(0)), b = requireLong(args.get(1));
@@ -402,14 +477,14 @@ final class Builtins {
         });
         define("min", args -> {
             if (args.isEmpty()) throw new EvalError("min requires at least 1 argument");
-            long result = requireLong(args.get(0));
-            for (int i = 1; i < args.size(); i++) result = Math.min(result, requireLong(args.get(i)));
+            Object result = args.get(0); requireNumber(result);
+            for (int i = 1; i < args.size(); i++) { requireNumber(args.get(i)); if (numCompare(args.get(i), result) < 0) result = args.get(i); }
             return result;
         });
         define("max", args -> {
             if (args.isEmpty()) throw new EvalError("max requires at least 1 argument");
-            long result = requireLong(args.get(0));
-            for (int i = 1; i < args.size(); i++) result = Math.max(result, requireLong(args.get(i)));
+            Object result = args.get(0); requireNumber(result);
+            for (int i = 1; i < args.size(); i++) { requireNumber(args.get(i)); if (numCompare(args.get(i), result) > 0) result = args.get(i); }
             return result;
         });
         define("expt", args -> {
@@ -419,9 +494,9 @@ final class Builtins {
             for (long i = 0; i < exp; i++) result *= base;
             return result;
         });
-        define("zero?", args -> { requireArgCount(args, 1, "zero?"); return requireLong(args.get(0)) == 0; });
-        define("positive?", args -> { requireArgCount(args, 1, "positive?"); return requireLong(args.get(0)) > 0; });
-        define("negative?", args -> { requireArgCount(args, 1, "negative?"); return requireLong(args.get(0)) < 0; });
+        define("zero?", args -> { requireArgCount(args, 1, "zero?"); requireNumber(args.get(0)); return numEquals(args.get(0), 0L); });
+        define("positive?", args -> { requireArgCount(args, 1, "positive?"); requireNumber(args.get(0)); return numCompare(args.get(0), 0L) > 0; });
+        define("negative?", args -> { requireArgCount(args, 1, "negative?"); requireNumber(args.get(0)); return numCompare(args.get(0), 0L) < 0; });
         define("odd?", args -> { requireArgCount(args, 1, "odd?"); return requireLong(args.get(0)) % 2 != 0; });
         define("even?", args -> { requireArgCount(args, 1, "even?"); return requireLong(args.get(0)) % 2 == 0; });
     }
@@ -493,6 +568,61 @@ final class Builtins {
             requireArgCount(args, 1, "string-downcase");
             if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-downcase: not a string");
             return new SchemeString(s.value().toLowerCase());
+        });
+    }
+
+    // --- Rationals (L11) ---
+
+    private void registerRationals() {
+        define("exact?", args -> { requireArgCount(args, 1, "exact?"); return isExact(args.get(0)); });
+        define("inexact?", args -> { requireArgCount(args, 1, "inexact?"); return args.get(0) instanceof Double; });
+        define("exact->inexact", args -> {
+            requireArgCount(args, 1, "exact->inexact");
+            return toDouble(args.get(0));
+        });
+        define("inexact->exact", args -> {
+            requireArgCount(args, 1, "inexact->exact");
+            Object v = args.get(0);
+            if (v instanceof Long) return v;
+            if (v instanceof SchemeRational) return v;
+            if (v instanceof Double d) {
+                // Convert double to rational
+                if (d == Math.floor(d) && !Double.isInfinite(d)) return (long)(double) d;
+                // Use fraction approximation: multiply to remove decimal
+                long bits = Double.doubleToLongBits(d);
+                int exp = (int)((bits >> 52) & 0x7FFL) - 1023 - 52;
+                long mantissa = (bits & 0x000FFFFFFFFFFFFFL) | 0x0010000000000000L;
+                if ((bits >> 63) != 0) mantissa = -mantissa;
+                if (exp >= 0) return mantissa * (1L << exp);
+                return normalizeRational(new SchemeRational(mantissa, 1L << (-exp)));
+            }
+            throw new EvalError("inexact->exact: expected number");
+        });
+        define("numerator", args -> {
+            requireArgCount(args, 1, "numerator");
+            Object v = args.get(0);
+            if (v instanceof Long l) return l;
+            if (v instanceof SchemeRational r) return r.num;
+            throw new EvalError("numerator: expected exact number");
+        });
+        define("denominator", args -> {
+            requireArgCount(args, 1, "denominator");
+            Object v = args.get(0);
+            if (v instanceof Long) return 1L;
+            if (v instanceof SchemeRational r) return r.den;
+            throw new EvalError("denominator: expected exact number");
+        });
+        define("integer?", args -> {
+            requireArgCount(args, 1, "integer?");
+            Object v = args.get(0);
+            if (v instanceof Long) return true;
+            if (v instanceof SchemeRational r) return r.isInteger();
+            if (v instanceof Double d) return d == Math.floor(d) && !Double.isInfinite(d);
+            return false;
+        });
+        define("rational?", args -> {
+            requireArgCount(args, 1, "rational?");
+            return isExact(args.get(0));
         });
     }
 }
