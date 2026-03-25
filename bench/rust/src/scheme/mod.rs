@@ -22,7 +22,7 @@ fn gensym(base: &str) -> String {
 const SPECIAL_FORMS: &[&str] = &[
     "define", "define-syntax", "define-record-type", "syntax-rules", "if", "quote", "lambda",
     "begin", "let", "let*", "letrec", "letrec*", "cond", "case", "and", "or",
-    "set!", "string-set!", "do", "delay", "quasiquote", "unquote",
+    "set!", "string-set!", "do", "delay", "quasiquote", "unquote", "case-lambda",
 ];
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -60,6 +60,10 @@ enum Value {
         params: Vec<String>,
         rest_param: Option<String>,
         body: Vec<Expr>,
+        env: EnvRef,
+    },
+    CaseLambda {
+        clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>)>, // (params, rest_param, body)
         env: EnvRef,
     },
     Void,
@@ -133,6 +137,7 @@ impl fmt::Display for Value {
             }
             Value::Builtin(name, _) => write!(f, "#<procedure {name}>"),
             Value::Lambda { .. } => write!(f, "#<procedure>"),
+            Value::CaseLambda { .. } => write!(f, "#<procedure>"),
             Value::Void => write!(f, "#<void>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
         }
@@ -956,6 +961,28 @@ fn eval(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                             env: env.clone(),
                         });
                     }
+                    "case-lambda" => {
+                        if elems.len() < 2 {
+                            return Err(EvalError::Parse(format!("at {span}: case-lambda requires at least one clause")));
+                        }
+                        let mut clauses = Vec::new();
+                        for clause in &elems[1..] {
+                            let ExprKind::List(parts) = &clause.kind else {
+                                return Err(EvalError::Parse(format!("at {}: case-lambda: expected clause", clause.span)));
+                            };
+                            if parts.len() < 2 {
+                                return Err(EvalError::Parse(format!("at {}: case-lambda: clause needs params and body", clause.span)));
+                            }
+                            let (params, rest_param) = match &parts[0].kind {
+                                ExprKind::List(param_exprs) => parse_params(param_exprs, span)?,
+                                ExprKind::Symbol(s) => (vec![], Some(s.clone())),
+                                _ => return Err(EvalError::Parse(format!("at {}: case-lambda: expected parameter list", parts[0].span))),
+                            };
+                            let body = parts[1..].to_vec();
+                            clauses.push((params, rest_param, body));
+                        }
+                        return Ok(Value::CaseLambda { clauses, env: env.clone() });
+                    }
                     "begin" => {
                         let mut result = Value::Void;
                         for arg in &elems[1..] {
@@ -1185,6 +1212,14 @@ fn expand_macro_invocation(
     Err(EvalError::Parse(format!("at {span}: no matching macro pattern for {head}")))
 }
 
+fn args_to_list(args: &[Value]) -> Value {
+    if args.is_empty() {
+        Value::Nil
+    } else {
+        Value::List(args.to_vec())
+    }
+}
+
 fn apply_function(func: &Value, args: &[Value], span: Span) -> Result<Value, EvalError> {
     match func {
         Value::Builtin(_, f) => f(args, span),
@@ -1212,12 +1247,7 @@ fn apply_function(func: &Value, args: &[Value], span: Span) -> Result<Value, Eva
                 }
                 if let Some(rest) = rest_param {
                     let rest_args = &args[params.len()..];
-                    let rest_val = if rest_args.is_empty() {
-                        Value::Nil
-                    } else {
-                        Value::List(rest_args.to_vec())
-                    };
-                    e.set(rest.clone(), rest_val);
+                    e.set(rest.clone(), args_to_list(rest_args));
                 }
             }
             let mut result = Value::Void;
@@ -1225,6 +1255,37 @@ fn apply_function(func: &Value, args: &[Value], span: Span) -> Result<Value, Eva
                 result = eval(expr, &local_env)?;
             }
             Ok(result)
+        }
+        Value::CaseLambda { clauses, env } => {
+            for (params, rest_param, body) in clauses {
+                let matches = if rest_param.is_some() {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if !matches {
+                    continue;
+                }
+                let local_env = Env::new(Some(env.clone()));
+                let mut e = local_env.borrow_mut();
+                for (param, arg) in params.iter().zip(args.iter()) {
+                    e.set(param.clone(), arg.clone());
+                }
+                if let Some(rest) = rest_param {
+                    let rest_args = &args[params.len()..];
+                    let rest_val = args_to_list(rest_args);
+                    e.set(rest.clone(), rest_val);
+                }
+                drop(e);
+                let mut result = Value::Void;
+                for expr in body {
+                    result = eval(expr, &local_env)?;
+                }
+                return Ok(result);
+            }
+            Err(EvalError::Arity(format!(
+                "at {span}: case-lambda: no matching clause for {} arguments", args.len()
+            )))
         }
         _ => Err(EvalError::Type(format!("at {span}: not a procedure: {func}"))),
     }

@@ -967,6 +967,13 @@ pub(super) fn builtin_apply(args: &[Value], span: Span) -> Result<Value, EvalErr
     apply_function(func, &call_args, span)
 }
 
+fn builtin_procedure_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("at {span}: procedure? expects 1 argument")));
+    }
+    Ok(Value::Boolean(matches!(args[0], Value::Builtin(..) | Value::Lambda { .. } | Value::CaseLambda { .. })))
+}
+
 pub(super) fn default_env() -> EnvRef {
     let env = Env::new(None);
     {
@@ -1051,6 +1058,8 @@ pub(super) fn default_env() -> EnvRef {
         e.set("denominator".into(), Value::Builtin("denominator".into(), builtin_denominator));
         e.set("integer?".into(), Value::Builtin("integer?".into(), builtin_integer_pred));
         e.set("rational?".into(), Value::Builtin("rational?".into(), builtin_rational_pred));
+        // L13 case-lambda
+        e.set("procedure?".into(), Value::Builtin("procedure?".into(), builtin_procedure_pred));
         // apply is handled specially in eval, but needs to be a value for (define f apply)
         e.set("apply".into(), Value::Builtin("apply".into(), |_args, _span| unreachable!()));
     }
