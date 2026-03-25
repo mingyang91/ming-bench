@@ -2,18 +2,15 @@ package ming
 
 object Builtins:
 
-  private def requireNums(args: List[SchemeVal], name: String): List[Long] =
-    args.map {
-      case SchemeVal.IntVal(n) => n
-      case other               => throw new EvalError(s"$name: expected number, got ${SchemeVal.display(other)}")
-    }
-
   def register(env: Env, output: StringBuilder = new StringBuilder): Unit =
-    registerArithmetic(env)
-    registerComparison(env)
+    NumericBuiltins.register(env)
     registerListOps(env)
     registerPredicates(env)
     registerApply(env)
+    registerListUtils(env)
+    registerMapBuiltin(env)
+    registerEquality(env)
+    CharBuiltins.register(env)
     StringBuiltins.register(env, output)
 
   private def registerApply(env: Env): Unit =
@@ -26,98 +23,12 @@ object Builtins:
           val proc = args.head
           val lastArg = args.last match
             case SchemeVal.SList(elems) => elems
-            case other => throw new EvalError(s"apply: last argument must be a list, got ${SchemeVal.display(other)}")
+            case other =>
+              throw new EvalError(
+                s"apply: last argument must be a list, got ${SchemeVal.display(other)}"
+              )
           val prefixArgs = args.slice(1, args.size - 1)
           Evaluator.apply(proc, prefixArgs ++ lastArg)
-      )
-    )
-
-  private def registerArithmetic(env: Env): Unit =
-    env.define(
-      "+",
-      SchemeVal.BuiltinProc(
-        "+",
-        args =>
-          val nums = requireNums(args, "+")
-          SchemeVal.IntVal(nums.sum)
-      )
-    )
-    env.define(
-      "-",
-      SchemeVal.BuiltinProc(
-        "-",
-        args =>
-          val nums = requireNums(args, "-")
-          if nums.isEmpty then throw new EvalError("-: expected at least 1 argument")
-          else if nums.size == 1 then SchemeVal.IntVal(-nums.head)
-          else SchemeVal.IntVal(nums.tail.foldLeft(nums.head)(_ - _))
-      )
-    )
-    env.define(
-      "*",
-      SchemeVal.BuiltinProc(
-        "*",
-        args =>
-          val nums = requireNums(args, "*")
-          SchemeVal.IntVal(nums.product)
-      )
-    )
-    env.define(
-      "/",
-      SchemeVal.BuiltinProc(
-        "/",
-        args =>
-          val nums = requireNums(args, "/")
-          if nums.size < 2 then throw new EvalError("/: expected at least 2 arguments")
-          if nums.tail.contains(0L) then throw new EvalError("division by zero")
-          SchemeVal.IntVal(nums.tail.foldLeft(nums.head)(_ / _))
-      )
-    )
-
-  private def registerComparison(env: Env): Unit =
-    env.define(
-      "<",
-      SchemeVal.BuiltinProc(
-        "<",
-        args =>
-          val nums = requireNums(args, "<")
-          SchemeVal.BoolVal(nums.zip(nums.tail).forall((a, b) => a < b))
-      )
-    )
-    env.define(
-      ">",
-      SchemeVal.BuiltinProc(
-        ">",
-        args =>
-          val nums = requireNums(args, ">")
-          SchemeVal.BoolVal(nums.zip(nums.tail).forall((a, b) => a > b))
-      )
-    )
-    env.define(
-      "=",
-      SchemeVal.BuiltinProc(
-        "=",
-        args =>
-          val nums = requireNums(args, "=")
-          SchemeVal.BoolVal(nums.zip(nums.tail).forall((a, b) => a == b))
-      )
-    )
-    env.define(
-      "<=",
-      SchemeVal.BuiltinProc(
-        "<=",
-        args =>
-          val nums = requireNums(args, "<=")
-          SchemeVal.BoolVal(nums.zip(nums.tail).forall((a, b) => a <= b))
-      )
-    )
-    env.define(
-      ">=",
-      SchemeVal.BuiltinProc(
-        ">=",
-        args =>
-          val nums = requireNums(args, ">=")
-          SchemeVal.BoolVal(nums.zip(nums.tail).forall((a, b) => a >= b))
       )
     )
 
@@ -129,8 +40,9 @@ object Builtins:
         args =>
           if args.size != 2 then throw new EvalError("cons: expected 2 arguments")
           args(1) match
-            case SchemeVal.SList(elems) => SchemeVal.SList(args(0) :: elems)
-            case _                      => SchemeVal.SList(List(args(0), args(1)))
+            case SchemeVal.SList(elems)            => SchemeVal.SList(args(0) :: elems)
+            case SchemeVal.DottedList(elems, tail) => SchemeVal.DottedList(args(0) :: elems, tail)
+            case _                                 => SchemeVal.DottedList(List(args(0)), args(1))
       )
     )
     env.define(
@@ -140,8 +52,9 @@ object Builtins:
         args =>
           if args.size != 1 then throw new EvalError("car: expected 1 argument")
           args.head match
-            case SchemeVal.SList(elems) if elems.nonEmpty => elems.head
-            case _                                        => throw new EvalError("car: expected pair")
+            case SchemeVal.SList(elems) if elems.nonEmpty         => elems.head
+            case SchemeVal.DottedList(elems, _) if elems.nonEmpty => elems.head
+            case _                                                => throw new EvalError("car: expected pair")
       )
     )
     env.define(
@@ -152,7 +65,10 @@ object Builtins:
           if args.size != 1 then throw new EvalError("cdr: expected 1 argument")
           args.head match
             case SchemeVal.SList(elems) if elems.nonEmpty => SchemeVal.SList(elems.tail)
-            case _                                        => throw new EvalError("cdr: expected pair")
+            case SchemeVal.DottedList(elems, tail) if elems.nonEmpty =>
+              if elems.tail.isEmpty then tail
+              else SchemeVal.DottedList(elems.tail, tail)
+            case _ => throw new EvalError("cdr: expected pair")
       )
     )
     env.define("list", SchemeVal.BuiltinProc("list", args => SchemeVal.SList(args)))
@@ -235,8 +151,9 @@ object Builtins:
         args =>
           if args.size != 1 then throw new EvalError("pair?: expected 1 argument")
           args.head match
-            case SchemeVal.SList(elems) => SchemeVal.BoolVal(elems.nonEmpty)
-            case _                      => SchemeVal.BoolVal(false)
+            case SchemeVal.SList(elems)     => SchemeVal.BoolVal(elems.nonEmpty)
+            case SchemeVal.DottedList(_, _) => SchemeVal.BoolVal(true)
+            case _                          => SchemeVal.BoolVal(false)
       )
     )
     env.define(
@@ -270,5 +187,113 @@ object Builtins:
           args.head match
             case SchemeVal.CharVal(_) => SchemeVal.BoolVal(true)
             case _                    => SchemeVal.BoolVal(false)
+      )
+    )
+
+  private def registerListUtils(env: Env): Unit =
+    env.define(
+      "list-ref",
+      SchemeVal.BuiltinProc(
+        "list-ref",
+        args =>
+          if args.size != 2 then throw new EvalError("list-ref: expected 2 arguments")
+          (args(0), args(1)) match
+            case (SchemeVal.SList(elems), SchemeVal.IntVal(i)) =>
+              if i < 0 || i >= elems.size then throw new EvalError("list-ref: index out of bounds")
+              elems(i.toInt)
+            case _ => throw new EvalError("list-ref: expected list and integer")
+      )
+    )
+    env.define(
+      "list-tail",
+      SchemeVal.BuiltinProc(
+        "list-tail",
+        args =>
+          if args.size != 2 then throw new EvalError("list-tail: expected 2 arguments")
+          (args(0), args(1)) match
+            case (SchemeVal.SList(elems), SchemeVal.IntVal(i)) =>
+              if i < 0 || i > elems.size then throw new EvalError("list-tail: index out of bounds")
+              SchemeVal.SList(elems.drop(i.toInt))
+            case _ => throw new EvalError("list-tail: expected list and integer")
+      )
+    )
+    env.define(
+      "list?",
+      SchemeVal.BuiltinProc(
+        "list?",
+        args =>
+          if args.size != 1 then throw new EvalError("list?: expected 1 argument")
+          args.head match
+            case SchemeVal.SList(_) => SchemeVal.BoolVal(true)
+            case _                  => SchemeVal.BoolVal(false)
+      )
+    )
+    env.define(
+      "assoc",
+      SchemeVal.BuiltinProc(
+        "assoc",
+        args =>
+          if args.size != 2 then throw new EvalError("assoc: expected 2 arguments")
+          val key = args(0)
+          args(1) match
+            case SchemeVal.SList(elems) =>
+              elems
+                .collectFirst {
+                  case found @ SchemeVal.SList(pair)
+                      if pair.nonEmpty && SchemeVal.schemeEqual(
+                        pair.head,
+                        key
+                      ) =>
+                    found
+                }
+                .getOrElse(SchemeVal.BoolVal(false))
+            case _ => throw new EvalError("assoc: expected list")
+      )
+    )
+
+  private def registerMapBuiltin(env: Env): Unit =
+    env.define(
+      "map",
+      SchemeVal.BuiltinProc(
+        "map",
+        args =>
+          if args.size < 2 then throw new EvalError("map: expected at least 2 arguments")
+          val proc = args.head
+          val lists = args.tail.map {
+            case SchemeVal.SList(elems) => elems
+            case other =>
+              throw new EvalError(s"map: expected list, got ${SchemeVal.display(other)}")
+          }
+          val len = lists.head.size
+          val result = (0 until len).map { i =>
+            val mapArgs = lists.map(_(i))
+            Evaluator.apply(proc, mapArgs)
+          }.toList
+          SchemeVal.SList(result)
+      )
+    )
+
+  private def registerEquality(env: Env): Unit =
+    env.define(
+      "equal?",
+      SchemeVal.BuiltinProc(
+        "equal?",
+        args =>
+          if args.size != 2 then throw new EvalError("equal?: expected 2 arguments")
+          SchemeVal.BoolVal(SchemeVal.schemeEqual(args(0), args(1)))
+      )
+    )
+    env.define(
+      "eq?",
+      SchemeVal.BuiltinProc(
+        "eq?",
+        args =>
+          if args.size != 2 then throw new EvalError("eq?: expected 2 arguments")
+          (args(0), args(1)) match
+            case (SchemeVal.Symbol(a), SchemeVal.Symbol(b))   => SchemeVal.BoolVal(a == b)
+            case (SchemeVal.IntVal(a), SchemeVal.IntVal(b))   => SchemeVal.BoolVal(a == b)
+            case (SchemeVal.BoolVal(a), SchemeVal.BoolVal(b)) => SchemeVal.BoolVal(a == b)
+            case (SchemeVal.CharVal(a), SchemeVal.CharVal(b)) => SchemeVal.BoolVal(a == b)
+            case (a, b)                                       => SchemeVal.BoolVal(a eq b)
       )
     )

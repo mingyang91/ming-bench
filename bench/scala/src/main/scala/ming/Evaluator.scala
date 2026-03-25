@@ -51,7 +51,8 @@ object Evaluator:
               val proc = eval(head, env)
               val args = elems.tail.map(a => eval(a, env))
               apply(proc, args)
-        case _ => throw new EvalError(s"cannot evaluate: $expr")
+        case SchemeVal.DottedList(_, _) => throw new EvalError(s"cannot evaluate dotted list: $expr")
+        case _                          => throw new EvalError(s"cannot evaluate: $expr")
     catch
       case e: EvalError =>
         val (line, col) = expr.pos
@@ -68,6 +69,16 @@ object Evaluator:
           case SchemeVal.Symbol(name) =>
             val (params, rest) = parseParams(elems.tail)
             env.define(name, SchemeVal.LambdaProc(params, body, env, rest))
+            SchemeVal.Void
+          case other => throw new EvalError(s"define: expected name, got $other")
+      case SchemeVal.DottedList(elems, SchemeVal.Symbol(restParam)) :: body if elems.nonEmpty && body.nonEmpty =>
+        elems.head match
+          case SchemeVal.Symbol(name) =>
+            val params = elems.tail.map {
+              case SchemeVal.Symbol(p) => p
+              case other               => throw new EvalError(s"expected parameter name, got $other")
+            }
+            env.define(name, SchemeVal.LambdaProc(params, body, env, Some(restParam)))
             SchemeVal.Void
           case other => throw new EvalError(s"define: expected name, got $other")
       case _ => throw new EvalError("define: bad syntax")
@@ -107,6 +118,14 @@ object Evaluator:
       case SchemeVal.SList(paramList) :: body if body.nonEmpty =>
         val (params, rest) = parseParams(paramList)
         SchemeVal.LambdaProc(params, body, env, rest)
+      case SchemeVal.DottedList(paramList, SchemeVal.Symbol(restParam)) :: body if body.nonEmpty =>
+        val params = paramList.map {
+          case SchemeVal.Symbol(p) => p
+          case other               => throw new EvalError(s"expected parameter name, got $other")
+        }
+        SchemeVal.LambdaProc(params, body, env, Some(restParam))
+      case SchemeVal.Symbol(restParam) :: body if body.nonEmpty =>
+        SchemeVal.LambdaProc(Nil, body, env, Some(restParam))
       case _ => throw new EvalError("lambda: bad syntax")
 
   @tailrec

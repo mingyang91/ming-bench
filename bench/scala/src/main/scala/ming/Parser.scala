@@ -25,8 +25,11 @@ object Parser:
     tokens match
       case Nil => throw new EvalError("unexpected end of input")
       case Token.LParen(p) :: rest =>
-        val (elems, remaining) = parseList(rest)
-        (withPos(SchemeVal.SList(elems), p), remaining)
+        val (elems, dotTail, remaining) = parseList(rest)
+        val sv = dotTail match
+          case Some(tail) => SchemeVal.DottedList(elems, tail)
+          case None       => SchemeVal.SList(elems)
+        (withPos(sv, p), remaining)
       case Token.RParen(_) :: _ =>
         throw new EvalError("unexpected )")
       case Token.Str(s, p) :: rest =>
@@ -37,24 +40,23 @@ object Parser:
       case Token.Atom(s, p) :: rest =>
         (withPos(parseAtom(s), p), rest)
 
-  private def parseList(tokens: List[Token]): (List[SchemeVal], List[Token]) =
-    val elems     = scala.collection.mutable.ListBuffer[SchemeVal]()
-    var remaining = tokens
+  private def parseList(tokens: List[Token]): (List[SchemeVal], Option[SchemeVal], List[Token]) =
+    val elems                      = scala.collection.mutable.ListBuffer[SchemeVal]()
+    var remaining                  = tokens
+    var dotTail: Option[SchemeVal] = None
     while remaining.nonEmpty && !remaining.head.isInstanceOf[Token.RParen] do
       remaining match
         case Token.Atom(".", _) :: rest =>
-          // Dotted pair: place a dot marker, then the rest element
           remaining = rest
           val (expr, rest2) = parseExpr(remaining)
-          elems += SchemeVal.Symbol(".")
-          elems += expr
+          dotTail = Some(expr)
           remaining = rest2
         case _ =>
           val (expr, rest) = parseExpr(remaining)
           elems += expr
           remaining = rest
     remaining match
-      case Token.RParen(_) :: rest => (elems.toList, rest)
+      case Token.RParen(_) :: rest => (elems.toList, dotTail, rest)
       case _                       => throw new EvalError("missing )")
 
   private def parseAtom(s: String): SchemeVal =
