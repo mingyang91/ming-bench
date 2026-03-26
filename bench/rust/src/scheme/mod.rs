@@ -257,6 +257,7 @@ enum Value {
     Builtin(Builtin),
     NativeProcedure(NativeProcedure),
     Procedure(Rc<Closure>),
+    CaseProcedure(Rc<CaseClosure>),
     Record(Rc<RecordValue>),
     Void,
 }
@@ -327,7 +328,10 @@ impl Value {
             Self::Symbol(_) => "symbol",
             Self::List(_) => "list",
             Self::Pair(_, _) => "pair",
-            Self::Builtin(_) | Self::NativeProcedure(_) | Self::Procedure(_) => "procedure",
+            Self::Builtin(_)
+            | Self::NativeProcedure(_)
+            | Self::Procedure(_)
+            | Self::CaseProcedure(_) => "procedure",
             Self::Record(_) => "record",
             Self::Void => "void",
         }
@@ -357,9 +361,10 @@ impl Value {
             Self::Symbol(name) => name.clone(),
             Self::List(items) => render_list(items, mode),
             Self::Pair(head, tail) => render_pair(head, tail, mode),
-            Self::Builtin(_) | Self::NativeProcedure(_) | Self::Procedure(_) => {
-                "#<procedure>".into()
-            }
+            Self::Builtin(_)
+            | Self::NativeProcedure(_)
+            | Self::Procedure(_)
+            | Self::CaseProcedure(_) => "#<procedure>".into(),
             Self::Record(record) => format!("#<record {}>", record.record_type.name),
             Self::Void => "#<void>".into(),
         }
@@ -633,6 +638,7 @@ enum Builtin {
     BooleanPred,
     PairPred,
     SymbolPred,
+    ProcedurePred,
     Display,
     Write,
     Newline,
@@ -712,6 +718,7 @@ impl Builtin {
             Self::BooleanPred => "boolean?",
             Self::PairPred => "pair?",
             Self::SymbolPred => "symbol?",
+            Self::ProcedurePred => "procedure?",
             Self::Display => "display",
             Self::Write => "write",
             Self::Newline => "newline",
@@ -756,6 +763,10 @@ struct Closure {
     params: ParameterSpec,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+struct CaseClosure {
+    clauses: Vec<Rc<Closure>>,
 }
 
 type EnvRef = Rc<Env>;
@@ -821,6 +832,7 @@ impl Env {
             ("boolean?", Builtin::BooleanPred),
             ("pair?", Builtin::PairPred),
             ("symbol?", Builtin::SymbolPred),
+            ("procedure?", Builtin::ProcedurePred),
             ("display", Builtin::Display),
             ("write", Builtin::Write),
             ("newline", Builtin::Newline),
@@ -1203,6 +1215,7 @@ fn eval_application(list_pos: SourcePos, items: &[Expr], env: &EnvRef) -> Result
             "if" => return eval_if(operator.pos, arguments, env),
             "quote" => return eval_quote(operator.pos, arguments),
             "lambda" => return eval_lambda(operator.pos, arguments, env),
+            "case-lambda" => return eval_case_lambda(arguments, env),
             "and" => return eval_and(arguments, env),
             "or" => return eval_or(arguments, env),
             "begin" => return eval_begin(arguments, env),
@@ -1240,6 +1253,7 @@ fn apply_value(
             apply_native_procedure(&procedure, arguments, env, call_pos)
         }
         Value::Procedure(closure) => apply_closure(closure, arguments, env, call_pos),
+        Value::CaseProcedure(closure) => apply_case_closure(closure, arguments, env, call_pos),
         other => Err(EvalError::NotAProcedure {
             found: other.kind().into(),
         }
@@ -1438,6 +1452,9 @@ fn eval_builtin(
         Builtin::SymbolPred => eval_type_predicate(arguments, env, "symbol?", call_pos, |value| {
             matches!(value, Value::Symbol(_))
         }),
+        Builtin::ProcedurePred => {
+            eval_type_predicate(arguments, env, "procedure?", call_pos, is_callable)
+        }
         Builtin::Display => eval_display(arguments, env, call_pos),
         Builtin::Write => eval_write(arguments, env, call_pos),
         Builtin::Newline => eval_newline(arguments, env, call_pos),
@@ -1525,6 +1542,16 @@ fn apply_closure(
     apply_closure_values(closure, argument_values, call_pos)
 }
 
+fn apply_case_closure(
+    closure: Rc<CaseClosure>,
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let argument_values = eval_args(arguments, env)?;
+    apply_case_closure_values(closure, argument_values, call_pos)
+}
+
 fn apply_closure_values(
     closure: Rc<Closure>,
     argument_values: Vec<Value>,
@@ -1563,6 +1590,28 @@ fn apply_closure_values(
     }
 
     eval_sequence(&closure.body, &call_env)
+}
+
+fn apply_case_closure_values(
+    closure: Rc<CaseClosure>,
+    argument_values: Vec<Value>,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let argument_count = argument_values.len();
+    let Some(clause) = closure
+        .clauses
+        .iter()
+        .find(|clause| parameter_spec_accepts(&clause.params, argument_count))
+    else {
+        return Err(EvalError::WrongArgCount {
+            name: "procedure".into(),
+            expected: format_case_lambda_arity(&closure),
+            got: argument_count,
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    apply_closure_values(clause.clone(), argument_values, call_pos)
 }
 
 fn eval_args(arguments: &[Expr], env: &EnvRef) -> Result<Vec<Value>, EvalError> {
@@ -2196,6 +2245,15 @@ fn expand_template_list(
             "lambda" => {
                 return expand_lambda_template(pos, items, state, bound_renames, repetition_index)
             }
+            "case-lambda" => {
+                return expand_case_lambda_template(
+                    pos,
+                    items,
+                    state,
+                    bound_renames,
+                    repetition_index,
+                )
+            }
             _ => {}
         }
     }
@@ -2324,6 +2382,46 @@ fn expand_lambda_template(
             &body_scope,
             repetition_index,
         )?);
+    }
+
+    Ok(Expr::new(ExprKind::List(expanded), pos))
+}
+
+fn expand_case_lambda_template(
+    pos: SourcePos,
+    items: &[Expr],
+    state: &mut ExpandState<'_>,
+    bound_renames: &HashMap<String, String>,
+    repetition_index: Option<usize>,
+) -> Result<Expr, EvalError> {
+    let Some((_, clause_exprs)) = items.split_first() else {
+        return expand_plain_template_list(pos, items, state, bound_renames, repetition_index);
+    };
+
+    let mut expanded = vec![Expr::symbol("case-lambda", items[0].pos)];
+    for clause_expr in clause_exprs {
+        let ExprKind::List(clause_items) = &clause_expr.kind else {
+            return expand_plain_template_list(pos, items, state, bound_renames, repetition_index);
+        };
+
+        let Some((params_expr, body)) = clause_items.split_first() else {
+            return expand_plain_template_list(pos, items, state, bound_renames, repetition_index);
+        };
+
+        let mut body_scope = bound_renames.clone();
+        let params = expand_lambda_params(params_expr, state, &mut body_scope, repetition_index)?;
+        let mut expanded_clause = vec![params];
+
+        for body_expr in body {
+            expanded_clause.push(expand_template(
+                body_expr,
+                state,
+                &body_scope,
+                repetition_index,
+            )?);
+        }
+
+        expanded.push(Expr::new(ExprKind::List(expanded_clause), clause_expr.pos));
     }
 
     Ok(Expr::new(ExprKind::List(expanded), pos))
@@ -2474,6 +2572,7 @@ fn is_reserved_template_identifier(name: &str) -> bool {
             | "if"
             | "quote"
             | "lambda"
+            | "case-lambda"
             | "and"
             | "or"
             | "begin"
@@ -2575,6 +2674,41 @@ fn eval_lambda(pos: SourcePos, arguments: &[Expr], env: &EnvRef) -> Result<Value
         body: body.to_vec(),
         env: env.clone(),
     })))
+}
+
+fn eval_case_lambda(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let mut clauses = Vec::with_capacity(arguments.len());
+
+    for clause_expr in arguments {
+        let ExprKind::List(items) = &clause_expr.kind else {
+            return Err(EvalError::InvalidSyntax {
+                message: "case-lambda: clauses must be lists".into(),
+            }
+            .with_offset(clause_expr.pos.offset));
+        };
+
+        let Some((params_expr, body)) = items.split_first() else {
+            return Err(EvalError::InvalidSyntax {
+                message: "case-lambda: each clause must include parameters and body".into(),
+            }
+            .with_offset(clause_expr.pos.offset));
+        };
+
+        if body.is_empty() {
+            return Err(EvalError::InvalidSyntax {
+                message: "case-lambda: each clause must include parameters and body".into(),
+            }
+            .with_offset(clause_expr.pos.offset));
+        }
+
+        clauses.push(Rc::new(Closure {
+            params: parse_param_list(params_expr)?,
+            body: body.to_vec(),
+            env: env.clone(),
+        }));
+    }
+
+    Ok(Value::CaseProcedure(Rc::new(CaseClosure { clauses })))
 }
 
 fn eval_begin(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
@@ -2801,6 +2935,36 @@ fn parse_params(params: &[Expr]) -> Result<ParameterSpec, EvalError> {
     })
 }
 
+fn parameter_spec_accepts(params: &ParameterSpec, argument_count: usize) -> bool {
+    if params.rest.is_some() {
+        argument_count >= params.required.len()
+    } else {
+        argument_count == params.required.len()
+    }
+}
+
+fn format_case_lambda_arity(closure: &CaseClosure) -> String {
+    let mut parts = Vec::<String>::new();
+
+    for clause in &closure.clauses {
+        let description = if clause.params.rest.is_some() {
+            format!("at least {}", clause.params.required.len())
+        } else {
+            format!("exactly {}", clause.params.required.len())
+        };
+
+        if !parts.contains(&description) {
+            parts.push(description);
+        }
+    }
+
+    if parts.is_empty() {
+        "no matching clauses".into()
+    } else {
+        parts.join(" or ")
+    }
+}
+
 fn eval_apply_builtin(
     arguments: &[Expr],
     env: &EnvRef,
@@ -2851,7 +3015,10 @@ fn apply_value_with_values(
     call_pos: SourcePos,
 ) -> Result<Value, EvalError> {
     match value {
-        Value::Builtin(_) | Value::NativeProcedure(_) | Value::Procedure(_) => {
+        Value::Builtin(_)
+        | Value::NativeProcedure(_)
+        | Value::Procedure(_)
+        | Value::CaseProcedure(_) => {
             let apply_env = Env::child(env);
             let procedure_name = "__apply_procedure".to_string();
             apply_env.define(procedure_name.clone(), value);
@@ -3944,6 +4111,16 @@ fn eval_type_predicate(
     Ok(Value::Boolean(predicate(&value)))
 }
 
+fn is_callable(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Builtin(_)
+            | Value::NativeProcedure(_)
+            | Value::Procedure(_)
+            | Value::CaseProcedure(_)
+    )
+}
+
 fn eval_and(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     let mut last_value = Value::Boolean(true);
 
@@ -4160,6 +4337,7 @@ fn value_equal(left: &Value, right: &Value) -> bool {
                 }
         }
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::CaseProcedure(left), Value::CaseProcedure(right)) => Rc::ptr_eq(left, right),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,
