@@ -10,6 +10,7 @@ use super::{
 enum MachineState {
     Eval(Expr, EnvRef, Vec<ContinuationFrame>),
     Return(Value, Vec<ContinuationFrame>),
+    Raise(usize, String, Vec<ContinuationFrame>),
 }
 
 pub(super) fn program_uses_first_class_continuations(exprs: &[Expr]) -> bool {
@@ -42,6 +43,7 @@ pub(super) fn eval_program_with_continuations(
                 Some(frame) => continue_with_frame(frame, value, frames, ctx)?,
                 None => return Ok(value),
             },
+            MachineState::Raise(id, value, frames) => handle_raise(id, value, frames, ctx)?,
         };
     }
 }
@@ -517,6 +519,7 @@ fn continue_with_frame(
                 Ok(MachineState::Eval(first.clone(), env, next_frames))
             }
         }
+        ContinuationFrame::ExceptionHandler { .. } => Ok(MachineState::Return(value, frames)),
         ContinuationFrame::DynamicWindStart { context } => {
             let mut next_frames = frames;
             next_frames.push(ContinuationFrame::DynamicWindMarker {
@@ -580,6 +583,44 @@ fn continue_with_frame(
                 remaining: rest.to_vec(),
                 final_value,
                 target_frames,
+            });
+            apply_value(next.clone(), Vec::new(), None, next_frames, ctx)
+        }
+        ContinuationFrame::TransitionApply {
+            remaining,
+            procedure,
+            args,
+            pos,
+            target_frames,
+        } => {
+            let Some((next, rest)) = remaining.split_first() else {
+                return apply_value(procedure, args, pos, target_frames, ctx);
+            };
+
+            let mut next_frames = frames;
+            next_frames.push(ContinuationFrame::TransitionApply {
+                remaining: rest.to_vec(),
+                procedure,
+                args,
+                pos,
+                target_frames,
+            });
+            apply_value(next.clone(), Vec::new(), None, next_frames, ctx)
+        }
+        ContinuationFrame::TransitionRaise {
+            remaining,
+            id,
+            value,
+        } => {
+            let Some((next, rest)) = remaining.split_first() else {
+                return Err(EvalError::Raised { id, value });
+            };
+
+            let mut next_frames = frames;
+            next_frames.push(ContinuationFrame::TransitionRaise {
+                remaining: rest.to_vec(),
+                id,
+                value,
             });
             apply_value(next.clone(), Vec::new(), None, next_frames, ctx)
         }
@@ -681,6 +722,42 @@ fn apply_value(
             next_frames.push(ContinuationFrame::DynamicWindStart { context });
             apply_value(args[0].clone(), Vec::new(), pos, next_frames, ctx)
         }
+        Value::ControlProc(ControlProc::Raise) => {
+            if args.len() != 1 {
+                return Err(attach_call_position(
+                    EvalError::WrongArgCount {
+                        name: "raise",
+                        expected: "exactly 1",
+                        got: args.len(),
+                    },
+                    pos,
+                ));
+            }
+
+            let EvalError::Raised { id, value } = ctx.raise(args[0].clone()) else {
+                unreachable!("EvalContext::raise must create a raised exception");
+            };
+            Ok(MachineState::Raise(id, value, frames))
+        }
+        Value::ControlProc(ControlProc::WithExceptionHandler) => {
+            if args.len() != 2 {
+                return Err(attach_call_position(
+                    EvalError::WrongArgCount {
+                        name: "with-exception-handler",
+                        expected: "exactly 2",
+                        got: args.len(),
+                    },
+                    pos,
+                ));
+            }
+
+            let mut next_frames = frames;
+            next_frames.push(ContinuationFrame::ExceptionHandler {
+                handler: args[0].clone(),
+                pos,
+            });
+            apply_value(args[1].clone(), Vec::new(), pos, next_frames, ctx)
+        }
         Value::ControlProc(ControlProc::CallCc) => {
             if args.len() != 1 {
                 return Err(attach_call_position(
@@ -744,32 +821,45 @@ fn apply_value(
     }
 }
 
+fn handle_raise(
+    id: usize,
+    value: String,
+    frames: Vec<ContinuationFrame>,
+    ctx: &EvalContext,
+) -> Result<MachineState, EvalError> {
+    if let Some(index) = frames.iter().rposition(|frame| {
+        matches!(frame, ContinuationFrame::ExceptionHandler { .. })
+    }) {
+        let ContinuationFrame::ExceptionHandler { handler, pos } = frames[index].clone() else {
+            unreachable!("matched above");
+        };
+        let target_frames = frames[..index].to_vec();
+        let Some(exception) = ctx.take_exception(id) else {
+            return Err(EvalError::InvalidSyntax {
+                message: "internal missing exception payload".to_string(),
+            });
+        };
+
+        return start_transition_apply(
+            frames,
+            target_frames,
+            handler,
+            vec![exception],
+            pos,
+            ctx,
+        );
+    }
+
+    start_transition_raise(frames, id, value, ctx)
+}
+
 fn start_dynamic_wind_transition(
     final_value: Value,
     current_frames: Vec<ContinuationFrame>,
     target_frames: Vec<ContinuationFrame>,
     ctx: &EvalContext,
 ) -> Result<MachineState, EvalError> {
-    let current_winders = active_dynamic_winders(&current_frames);
-    let target_winders = active_dynamic_winders(&target_frames);
-
-    let shared_prefix = current_winders
-        .iter()
-        .zip(target_winders.iter())
-        .take_while(|(current, target)| Rc::ptr_eq(current, target))
-        .count();
-
-    let mut steps = current_winders[shared_prefix..]
-        .iter()
-        .rev()
-        .map(|context| context.out_thunk.clone())
-        .collect::<Vec<_>>();
-    steps.extend(
-        target_winders[shared_prefix..]
-            .iter()
-            .map(|context| context.in_thunk.clone()),
-    );
-
+    let steps = dynamic_wind_steps(&current_frames, &target_frames);
     start_transition_steps(steps, final_value, target_frames, ctx)
 }
 
@@ -791,6 +881,48 @@ fn start_transition_steps(
     apply_value(first.clone(), Vec::new(), None, frames, ctx)
 }
 
+fn start_transition_apply(
+    current_frames: Vec<ContinuationFrame>,
+    target_frames: Vec<ContinuationFrame>,
+    procedure: Value,
+    args: Vec<Value>,
+    pos: Option<SourcePos>,
+    ctx: &EvalContext,
+) -> Result<MachineState, EvalError> {
+    let steps = dynamic_wind_steps(&current_frames, &target_frames);
+    let Some((first, rest)) = steps.split_first() else {
+        return apply_value(procedure, args, pos, target_frames, ctx);
+    };
+
+    let frames = vec![ContinuationFrame::TransitionApply {
+        remaining: rest.to_vec(),
+        procedure,
+        args,
+        pos,
+        target_frames,
+    }];
+    apply_value(first.clone(), Vec::new(), None, frames, ctx)
+}
+
+fn start_transition_raise(
+    current_frames: Vec<ContinuationFrame>,
+    id: usize,
+    value: String,
+    ctx: &EvalContext,
+) -> Result<MachineState, EvalError> {
+    let steps = dynamic_wind_steps(&current_frames, &[]);
+    let Some((first, rest)) = steps.split_first() else {
+        return Err(EvalError::Raised { id, value });
+    };
+
+    let frames = vec![ContinuationFrame::TransitionRaise {
+        remaining: rest.to_vec(),
+        id,
+        value,
+    }];
+    apply_value(first.clone(), Vec::new(), None, frames, ctx)
+}
+
 fn active_dynamic_winders(frames: &[ContinuationFrame]) -> Vec<DynamicWindRef> {
     frames
         .iter()
@@ -799,6 +931,32 @@ fn active_dynamic_winders(frames: &[ContinuationFrame]) -> Vec<DynamicWindRef> {
             _ => None,
         })
         .collect()
+}
+
+fn dynamic_wind_steps(
+    current_frames: &[ContinuationFrame],
+    target_frames: &[ContinuationFrame],
+) -> Vec<Value> {
+    let current_winders = active_dynamic_winders(current_frames);
+    let target_winders = active_dynamic_winders(target_frames);
+
+    let shared_prefix = current_winders
+        .iter()
+        .zip(target_winders.iter())
+        .take_while(|(current, target)| Rc::ptr_eq(current, target))
+        .count();
+
+    let mut steps = current_winders[shared_prefix..]
+        .iter()
+        .rev()
+        .map(|context| context.out_thunk.clone())
+        .collect::<Vec<_>>();
+    steps.extend(
+        target_winders[shared_prefix..]
+            .iter()
+            .map(|context| context.in_thunk.clone()),
+    );
+    steps
 }
 
 fn require_body(form_name: &str, body: &[Expr]) -> Result<(), EvalError> {

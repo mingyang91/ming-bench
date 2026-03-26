@@ -120,6 +120,9 @@ pub enum EvalError {
     #[error("{name}: invalid character code: {value}")]
     InvalidCharCode { name: &'static str, value: i64 },
 
+    #[error("uncaught exception: {value}")]
+    Raised { id: usize, value: String },
+
     #[error("division by zero")]
     DivisionByZero,
 }
@@ -127,7 +130,7 @@ pub enum EvalError {
 impl EvalError {
     pub(crate) fn with_position(self, pos: SourcePos) -> Self {
         match self {
-            Self::WithPosition { .. } => self,
+            Self::WithPosition { .. } | Self::Raised { .. } => self,
             other => Self::WithPosition {
                 pos,
                 source: Box::new(other),

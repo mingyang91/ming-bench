@@ -52,6 +52,7 @@ pub(super) fn eval_special_form(
         "and" => Some(eval_and(args, env, ctx)),
         "or" => Some(eval_or(args, env, ctx)),
         "begin" => Some(eval_begin(args, env, ctx)),
+        "guard" => Some(eval_guard(args, env, ctx)),
         "cond" => Some(eval_cond(args, env, ctx)),
         "let" => Some(eval_let(args, env, ctx)),
         "let*" => Some(eval_let_star(args, env, ctx)),
@@ -81,6 +82,7 @@ pub(super) fn eval_special_form_tail(
         "and" => Some(eval_and_tail(args, env, ctx)),
         "or" => Some(eval_or_tail(args, env, ctx)),
         "begin" => Some(eval_begin_tail(args, env, ctx)),
+        "guard" => Some(eval_guard_tail(args, env, ctx)),
         "cond" => Some(eval_cond_tail(args, env, ctx)),
         "let" => Some(eval_let_tail(args, env, ctx)),
         "let*" => Some(eval_let_star_tail(args, env, ctx)),
@@ -445,6 +447,72 @@ fn eval_begin_tail(
     eval_sequence_tco(args, env, ctx)
 }
 
+fn eval_guard(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
+    let Some((spec, body)) = args.split_first() else {
+        return Err(EvalError::InvalidSyntax {
+            message: "guard requires a variable, clauses, and a body".to_string(),
+        });
+    };
+
+    require_body("guard", body)?;
+    let (name, clauses) = parse_guard_spec(spec)?;
+
+    match eval_sequence(body, env.clone(), ctx) {
+        Ok(value) => Ok(value),
+        Err(EvalError::Raised { id, value }) => {
+            let Some(exception) = ctx.take_exception(id) else {
+                return Err(EvalError::InvalidSyntax {
+                    message: "internal missing exception payload".to_string(),
+                });
+            };
+
+            match eval_guard_clauses(&name, &clauses, exception.clone(), env, ctx)? {
+                Some(result) => Ok(result),
+                None => {
+                    ctx.restore_exception(id, exception);
+                    Err(EvalError::Raised { id, value })
+                }
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn eval_guard_tail(
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    let Some((spec, body)) = args.split_first() else {
+        return Err(EvalError::InvalidSyntax {
+            message: "guard requires a variable, clauses, and a body".to_string(),
+        });
+    };
+
+    require_body("guard", body)?;
+    let (name, clauses) = parse_guard_spec(spec)?;
+
+    match eval_sequence_tco(body, env.clone(), ctx) {
+        Ok(result) => Ok(result),
+        Err(EvalError::Raised { id, value }) => {
+            let Some(exception) = ctx.take_exception(id) else {
+                return Err(EvalError::InvalidSyntax {
+                    message: "internal missing exception payload".to_string(),
+                });
+            };
+
+            match eval_guard_clauses_tail(&name, &clauses, exception.clone(), env, ctx)? {
+                Some(result) => Ok(result),
+                None => {
+                    ctx.restore_exception(id, exception);
+                    Err(EvalError::Raised { id, value })
+                }
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn eval_cond(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
     for (index, clause) in args.iter().enumerate() {
         let ExprKind::List(items) = &clause.kind else {
@@ -515,6 +583,117 @@ fn eval_cond_tail(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<TailO
     }
 
     Ok(TailOutcome::Value(Value::Void))
+}
+
+fn parse_guard_spec(expr: &Expr) -> Result<(String, Vec<Expr>), EvalError> {
+    let ExprKind::List(items) = &expr.kind else {
+        return Err(EvalError::InvalidSyntax {
+            message: "guard requires a variable and clause list".to_string(),
+        });
+    };
+
+    let Some((name_expr, clauses)) = items.split_first() else {
+        return Err(EvalError::InvalidSyntax {
+            message: "guard requires a variable and at least zero clauses".to_string(),
+        });
+    };
+    let Some(name) = expr_plain_symbol_name(name_expr) else {
+        return Err(EvalError::InvalidSyntax {
+            message: "guard variable must be a symbol".to_string(),
+        });
+    };
+
+    Ok((name.to_string(), clauses.to_vec()))
+}
+
+fn eval_guard_clauses(
+    name: &str,
+    clauses: &[Expr],
+    exception: Value,
+    env: EnvRef,
+    ctx: &EvalContext,
+) -> Result<Option<Value>, EvalError> {
+    let frame = Env::new(Some(env));
+    frame.define(name.to_string(), exception);
+
+    for (index, clause) in clauses.iter().enumerate() {
+        let ExprKind::List(items) = &clause.kind else {
+            return Err(EvalError::InvalidSyntax {
+                message: "guard clauses must be lists".to_string(),
+            });
+        };
+
+        let (test, body) = items
+            .split_first()
+            .ok_or_else(|| EvalError::InvalidSyntax {
+                message: "guard clauses cannot be empty".to_string(),
+            })?;
+
+        if expr_symbol_name(test).is_some_and(|symbol| symbol == "else") {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::InvalidSyntax {
+                    message: "guard else clause must be last".to_string(),
+                });
+            }
+            return eval_sequence(body, frame, ctx).map(Some);
+        }
+
+        let test_value = eval(test, frame.clone(), ctx)?;
+        if test_value.is_truthy() {
+            return if body.is_empty() {
+                Ok(Some(test_value))
+            } else {
+                eval_sequence(body, frame, ctx).map(Some)
+            };
+        }
+    }
+
+    Ok(None)
+}
+
+fn eval_guard_clauses_tail(
+    name: &str,
+    clauses: &[Expr],
+    exception: Value,
+    env: EnvRef,
+    ctx: &EvalContext,
+) -> Result<Option<TailOutcome>, EvalError> {
+    let frame = Env::new(Some(env));
+    frame.define(name.to_string(), exception);
+
+    for (index, clause) in clauses.iter().enumerate() {
+        let ExprKind::List(items) = &clause.kind else {
+            return Err(EvalError::InvalidSyntax {
+                message: "guard clauses must be lists".to_string(),
+            });
+        };
+
+        let (test, body) = items
+            .split_first()
+            .ok_or_else(|| EvalError::InvalidSyntax {
+                message: "guard clauses cannot be empty".to_string(),
+            })?;
+
+        if expr_symbol_name(test).is_some_and(|symbol| symbol == "else") {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::InvalidSyntax {
+                    message: "guard else clause must be last".to_string(),
+                });
+            }
+            return eval_sequence_tco(body, frame, ctx).map(Some);
+        }
+
+        let test_value = eval(test, frame.clone(), ctx)?;
+        if test_value.is_truthy() {
+            return if body.is_empty() {
+                Ok(Some(TailOutcome::Value(test_value)))
+            } else {
+                eval_sequence_tco(body, frame, ctx).map(Some)
+            };
+        }
+    }
+
+    Ok(None)
 }
 
 fn eval_case(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {

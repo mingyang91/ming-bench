@@ -135,6 +135,11 @@ pub(super) fn default_env() -> EnvRef {
         "dynamic-wind".to_string(),
         Value::ControlProc(ControlProc::DynamicWind),
     );
+    env.define("raise".to_string(), Value::ControlProc(ControlProc::Raise));
+    env.define(
+        "with-exception-handler".to_string(),
+        Value::ControlProc(ControlProc::WithExceptionHandler),
+    );
     env
 }
 

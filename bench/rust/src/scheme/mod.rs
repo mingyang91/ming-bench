@@ -91,6 +91,8 @@ enum RecordProcedureKind {
 enum ControlProc {
     CallCc,
     DynamicWind,
+    Raise,
+    WithExceptionHandler,
 }
 
 impl ControlProc {
@@ -98,6 +100,8 @@ impl ControlProc {
         match self {
             Self::CallCc => "call/cc",
             Self::DynamicWind => "dynamic-wind",
+            Self::Raise => "raise",
+            Self::WithExceptionHandler => "with-exception-handler",
         }
     }
 }
@@ -105,6 +109,8 @@ impl ControlProc {
 struct EvalContext {
     output: RefCell<String>,
     gensym_counter: RefCell<usize>,
+    exception_counter: RefCell<usize>,
+    exceptions: RefCell<HashMap<usize, Value>>,
 }
 
 impl EvalContext {
@@ -112,6 +118,8 @@ impl EvalContext {
         Self {
             output: RefCell::new(String::new()),
             gensym_counter: RefCell::new(0),
+            exception_counter: RefCell::new(0),
+            exceptions: RefCell::new(HashMap::new()),
         }
     }
 
@@ -128,6 +136,26 @@ impl EvalContext {
         let name = format!("__ming_macro_{}_{}", base, *counter);
         *counter += 1;
         name
+    }
+
+    fn raise(&self, value: Value) -> EvalError {
+        let rendered = value.render();
+        let mut counter = self.exception_counter.borrow_mut();
+        let id = *counter;
+        *counter += 1;
+        self.exceptions.borrow_mut().insert(id, value);
+        EvalError::Raised {
+            id,
+            value: rendered,
+        }
+    }
+
+    fn take_exception(&self, id: usize) -> Option<Value> {
+        self.exceptions.borrow_mut().remove(&id)
+    }
+
+    fn restore_exception(&self, id: usize, value: Value) {
+        self.exceptions.borrow_mut().insert(id, value);
     }
 }
 
@@ -237,6 +265,10 @@ enum ContinuationFrame {
         rest: Vec<Expr>,
         env: EnvRef,
     },
+    ExceptionHandler {
+        handler: Value,
+        pos: Option<SourcePos>,
+    },
     DynamicWindStart {
         context: DynamicWindRef,
     },
@@ -254,6 +286,18 @@ enum ContinuationFrame {
         remaining: Vec<Value>,
         final_value: Value,
         target_frames: Vec<ContinuationFrame>,
+    },
+    TransitionApply {
+        remaining: Vec<Value>,
+        procedure: Value,
+        args: Vec<Value>,
+        pos: Option<SourcePos>,
+        target_frames: Vec<ContinuationFrame>,
+    },
+    TransitionRaise {
+        remaining: Vec<Value>,
+        id: usize,
+        value: String,
     },
 }
 
@@ -816,16 +860,88 @@ fn apply_call(mut call: CallRequest, ctx: &EvalContext) -> Result<Value, EvalErr
                         pos,
                     },
                     ctx,
-                )?;
-                apply_call(
+                );
+
+                match result {
+                    Ok(result) => {
+                        apply_call(
+                            CallRequest {
+                                procedure: args[2].clone(),
+                                args: Vec::new(),
+                                pos,
+                            },
+                            ctx,
+                        )?;
+                        return Ok(result);
+                    }
+                    Err(body_err) => {
+                        apply_call(
+                            CallRequest {
+                                procedure: args[2].clone(),
+                                args: Vec::new(),
+                                pos,
+                            },
+                            ctx,
+                        )?;
+                        return Err(body_err);
+                    }
+                }
+            }
+            Value::ControlProc(ControlProc::Raise) => {
+                if args.len() != 1 {
+                    return Err(attach_call_position(
+                        EvalError::WrongArgCount {
+                            name: "raise",
+                            expected: "exactly 1",
+                            got: args.len(),
+                        },
+                        pos,
+                    ));
+                }
+
+                return Err(ctx.raise(args[0].clone()));
+            }
+            Value::ControlProc(ControlProc::WithExceptionHandler) => {
+                if args.len() != 2 {
+                    return Err(attach_call_position(
+                        EvalError::WrongArgCount {
+                            name: "with-exception-handler",
+                            expected: "exactly 2",
+                            got: args.len(),
+                        },
+                        pos,
+                    ));
+                }
+
+                let handler = args[0].clone();
+                let thunk = args[1].clone();
+                match apply_call(
                     CallRequest {
-                        procedure: args[2].clone(),
+                        procedure: thunk,
                         args: Vec::new(),
                         pos,
                     },
                     ctx,
-                )?;
-                return Ok(result);
+                ) {
+                    Ok(value) => return Ok(value),
+                    Err(EvalError::Raised { id, .. }) => {
+                        let Some(exception) = ctx.take_exception(id) else {
+                            return Err(EvalError::InvalidSyntax {
+                                message: "internal missing exception payload".to_string(),
+                            });
+                        };
+
+                        return apply_call(
+                            CallRequest {
+                                procedure: handler,
+                                args: vec![exception],
+                                pos,
+                            },
+                            ctx,
+                        );
+                    }
+                    Err(err) => return Err(err),
+                }
             }
             Value::ControlProc(ControlProc::CallCc) | Value::Continuation(_) => {
                 return Err(attach_call_position(
