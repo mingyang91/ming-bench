@@ -12,11 +12,20 @@ object MacroExpander:
     "and",
     "or",
     "let",
+    "let*",
+    "letrec",
+    "letrec*",
     "begin",
     "cond",
+    "case",
+    "do",
     "set!",
     "define-syntax",
     "syntax-rules",
+    "syntax-case",
+    "guard",
+    "define-record-type",
+    "case-lambda",
     "else"
   )
 

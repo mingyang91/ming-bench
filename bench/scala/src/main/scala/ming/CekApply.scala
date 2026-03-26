@@ -74,16 +74,17 @@ object CekApply:
         .getOrElse(throw errAt(pos, "wrong number of arguments"))
 
     case Value.VContinuation(savedK, savedWindStack) =>
-      if args.length != 1 then throw errAt(pos, "continuation requires 1 argument")
+      if args.isEmpty then throw errAt(pos, "continuation requires at least 1 argument")
+      val result   = if args.length == 1 then args.head else Value.VValues(args)
       val common   = Evaluator.commonTail(Evaluator.windStack, savedWindStack)
       val toUnwind = Evaluator.windStack.take(Evaluator.windStack.length - common.length)
       val toRewind = savedWindStack.take(savedWindStack.length - common.length).reverse
       val ops      = toUnwind.map(e => (false, e)) ++ toRewind.map(e => (true, e))
-      if ops.isEmpty then CekState.ApplyK(args.head, savedK)
+      if ops.isEmpty then CekState.ApplyK(result, savedK)
       else
         CekState.ApplyK(
           Value.VVoid,
-          Kont.DynWindTransition(ops, args.head, savedK, env, pos)
+          Kont.DynWindTransition(ops, result, savedK, env, pos)
         )
 
     case _ => throw errAt(pos, "not a procedure")

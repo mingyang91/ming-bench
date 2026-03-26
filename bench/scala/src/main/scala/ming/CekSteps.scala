@@ -270,11 +270,8 @@ object CekSteps:
                 val result = MacroExpander.expand(m, Expr.SList(head :: args, pos), pos)
                 macroCache.put(originalExpr, (m, result._1, result._2))
                 result
-            if injections.isEmpty then CekState.Eval(expanded, env, k)
-            else
-              val macroEnv = env.child()
-              injections.foreach((key, v) => macroEnv.define(key, v))
-              CekState.Eval(expanded, macroEnv, k)
+            injections.foreach((key, v) => env.define(key, v))
+            CekState.Eval(expanded, env, k)
           case Some(Value.VMacroTransformer(proc, defEnv)) =>
             val inputSyntax = Value.VSyntax(Expr.SList(head :: args, pos))
             val afterK      = Kont.MacroTransformerResult(env, defEnv, pos, k)
