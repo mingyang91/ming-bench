@@ -6,6 +6,7 @@ interface Pos { line: number; col: number }
 
 type SchemeVal =
   | { tag: 'number'; value: number; pos?: Pos }
+  | { tag: 'rational'; num: number; den: number; pos?: Pos }
   | { tag: 'boolean'; value: boolean; pos?: Pos }
   | { tag: 'string'; value: string; pos?: Pos }
   | { tag: 'symbol'; value: string; pos?: Pos }
@@ -54,6 +55,36 @@ function quoteDatum(val: SchemeVal): SchemeVal {
     return arrayToSchemeList(val.value.map(quoteDatum));
   }
   return val;
+}
+
+// ── Rational helpers ──────────────────────────────────────────────
+
+function gcd(a: number, b: number): number {
+  a = Math.abs(a); b = Math.abs(b);
+  while (b !== 0) { [a, b] = [b, a % b]; }
+  return a;
+}
+
+function makeRational(num: number, den: number, pos?: Pos): SchemeVal {
+  if (den === 0) throw new EvalError(`${posStr(pos)}division by zero`);
+  if (num === 0) return { tag: 'rational', num: 0, den: 1, pos };
+  if (den < 0) { num = -num; den = -den; }
+  const g = gcd(Math.abs(num), den);
+  return { tag: 'rational', num: num / g, den: den / g, pos };
+}
+
+function isNumeric(v: SchemeVal): boolean {
+  return v.tag === 'number' || v.tag === 'rational';
+}
+
+function toFloat(v: SchemeVal): number {
+  if (v.tag === 'number') return v.value;
+  if (v.tag === 'rational') return v.num / v.den;
+  throw new Error('not numeric');
+}
+
+function makeExactInt(n: number, pos?: Pos): SchemeVal {
+  return { tag: 'rational', num: n, den: 1, pos };
 }
 
 // ── Environment ───────────────────────────────────────────────────
@@ -174,8 +205,17 @@ function parse(tokens: Token[]): SchemeVal[] {
       else throw new EvalError(`${tok.pos.line}:${tok.pos.col}: unknown character name: ${charName}`);
       return { tag: 'char', value: ch, pos: tok.pos };
     }
+    // Rational literal: N/M
+    const ratMatch = /^(-?\d+)\/(\d+)$/.exec(tok.text);
+    if (ratMatch) {
+      return makeRational(parseInt(ratMatch[1], 10), parseInt(ratMatch[2], 10), tok.pos);
+    }
     const num = Number(tok.text);
-    if (!isNaN(num) && tok.text !== '') return { tag: 'number', value: num, pos: tok.pos };
+    if (!isNaN(num) && tok.text !== '') {
+      // Integer literals are exact (rational with den=1), floats are inexact
+      if (/^-?\d+$/.test(tok.text)) return { tag: 'rational', num: num, den: 1, pos: tok.pos };
+      return { tag: 'number', value: num, pos: tok.pos };
+    }
     return { tag: 'symbol', value: tok.text, pos: tok.pos };
   }
 
@@ -281,6 +321,7 @@ function matchSyntaxPattern(
     return true;
   }
   if (pattern.tag === 'number' && input.tag === 'number') return pattern.value === input.value;
+  if (pattern.tag === 'rational' && input.tag === 'rational') return pattern.num === input.num && pattern.den === input.den;
   if (pattern.tag === 'boolean' && input.tag === 'boolean') return pattern.value === input.value;
   return false;
 }
@@ -395,14 +436,15 @@ function isTruthy(v: SchemeVal): boolean {
 }
 
 function toNumber(v: SchemeVal, op: string, callPos?: Pos): number {
-  if (v.tag !== 'number') throw new EvalError(`${posStr(callPos)}${op}: expected number`);
-  return v.value;
+  if (v.tag === 'number') return v.value;
+  if (v.tag === 'rational') return v.num / v.den;
+  throw new EvalError(`${posStr(callPos)}${op}: expected number`);
 }
 
 function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
+  if (isNumeric(a) && isNumeric(b)) return toFloat(a) === toFloat(b);
   if (a.tag !== b.tag) return false;
   switch (a.tag) {
-    case 'number': return a.value === (b as typeof a).value;
     case 'boolean': return a.value === (b as typeof a).value;
     case 'string': return a.value === (b as typeof a).value;
     case 'symbol': return a.value === (b as typeof a).value;
@@ -414,9 +456,9 @@ function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
 }
 
 function schemeEq(a: SchemeVal, b: SchemeVal): boolean {
+  if (isNumeric(a) && isNumeric(b)) return toFloat(a) === toFloat(b);
   if (a.tag !== b.tag) return false;
   switch (a.tag) {
-    case 'number': return a.value === (b as typeof a).value;
     case 'boolean': return a.value === (b as typeof a).value;
     case 'symbol': return a.value === (b as typeof a).value;
     case 'char': return a.value === (b as typeof a).value;
@@ -430,51 +472,101 @@ let _outputBuf: string[] = [];
 function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal {
   switch (name) {
     case '+': {
+      const allExact = args.every(a => a.tag === 'rational');
+      if (allExact) {
+        let rn = 0, rd = 1;
+        for (const a of args) {
+          if (a.tag !== 'rational') throw new EvalError(`${posStr(callPos)}+: expected number`);
+          rn = rn * a.den + a.num * rd;
+          rd = rd * a.den;
+          const g = gcd(Math.abs(rn), rd);
+          rn /= g; rd /= g;
+        }
+        return makeRational(rn, rd, callPos);
+      }
       let sum = 0;
       for (const a of args) sum += toNumber(a, '+', callPos);
       return { tag: 'number', value: sum };
     }
     case '-': {
       if (args.length === 0) throw new EvalError(`${posStr(callPos)}-: need at least 1 argument`);
+      const allExact = args.every(a => a.tag === 'rational');
+      if (allExact) {
+        const first = args[0] as SchemeVal & { tag: 'rational' };
+        if (args.length === 1) return makeRational(-first.num, first.den, callPos);
+        let rn = first.num, rd = first.den;
+        for (let i = 1; i < args.length; i++) {
+          const a = args[i] as SchemeVal & { tag: 'rational' };
+          rn = rn * a.den - a.num * rd;
+          rd = rd * a.den;
+          const g = gcd(Math.abs(rn), rd);
+          rn /= g; rd /= g;
+        }
+        return makeRational(rn, rd, callPos);
+      }
       if (args.length === 1) return { tag: 'number', value: -toNumber(args[0], '-', callPos) };
       let result = toNumber(args[0], '-', callPos);
       for (let i = 1; i < args.length; i++) result -= toNumber(args[i], '-', callPos);
       return { tag: 'number', value: result };
     }
     case '*': {
+      const allExact = args.every(a => a.tag === 'rational');
+      if (allExact) {
+        let rn = 1, rd = 1;
+        for (const a of args) {
+          if (a.tag !== 'rational') throw new EvalError(`${posStr(callPos)}*: expected number`);
+          rn *= a.num;
+          rd *= a.den;
+          const g = gcd(Math.abs(rn), rd);
+          rn /= g; rd /= g;
+        }
+        return makeRational(rn, rd, callPos);
+      }
       let prod = 1;
       for (const a of args) prod *= toNumber(a, '*', callPos);
       return { tag: 'number', value: prod };
     }
     case '/': {
       if (args.length < 2) throw new EvalError(`${posStr(callPos)}/: need at least 2 arguments`);
+      const allExact = args.every(a => a.tag === 'rational');
+      if (allExact) {
+        const first = args[0] as SchemeVal & { tag: 'rational' };
+        let rn = first.num, rd = first.den;
+        for (let i = 1; i < args.length; i++) {
+          const a = args[i] as SchemeVal & { tag: 'rational' };
+          if (a.num === 0) throw new EvalError(`${posStr(callPos)}division by zero`);
+          rn *= a.den;
+          rd *= a.num;
+        }
+        return makeRational(rn, rd, callPos);
+      }
       let result = toNumber(args[0], '/', callPos);
       for (let i = 1; i < args.length; i++) {
         const d = toNumber(args[i], '/', callPos);
         if (d === 0) throw new EvalError(`${posStr(callPos)}division by zero`);
-        result = Math.trunc(result / d);
+        result /= d;
       }
       return { tag: 'number', value: result };
     }
     case '<': {
       if (args.length !== 2) throw new EvalError(`${posStr(callPos)}<: need 2 arguments`);
-      return { tag: 'boolean', value: toNumber(args[0], '<', callPos) < toNumber(args[1], '<', callPos) };
+      return { tag: 'boolean', value: toFloat(args[0]) < toFloat(args[1]) };
     }
     case '>': {
       if (args.length !== 2) throw new EvalError(`${posStr(callPos)}>: need 2 arguments`);
-      return { tag: 'boolean', value: toNumber(args[0], '>', callPos) > toNumber(args[1], '>', callPos) };
+      return { tag: 'boolean', value: toFloat(args[0]) > toFloat(args[1]) };
     }
     case '=': {
       if (args.length !== 2) throw new EvalError(`${posStr(callPos)}=: need 2 arguments`);
-      return { tag: 'boolean', value: toNumber(args[0], '=', callPos) === toNumber(args[1], '=', callPos) };
+      return { tag: 'boolean', value: toFloat(args[0]) === toFloat(args[1]) };
     }
     case '<=': {
       if (args.length !== 2) throw new EvalError(`${posStr(callPos)}<=: need 2 arguments`);
-      return { tag: 'boolean', value: toNumber(args[0], '<=', callPos) <= toNumber(args[1], '<=', callPos) };
+      return { tag: 'boolean', value: toFloat(args[0]) <= toFloat(args[1]) };
     }
     case '>=': {
       if (args.length !== 2) throw new EvalError(`${posStr(callPos)}>=: need 2 arguments`);
-      return { tag: 'boolean', value: toNumber(args[0], '>=', callPos) >= toNumber(args[1], '>=', callPos) };
+      return { tag: 'boolean', value: toFloat(args[0]) >= toFloat(args[1]) };
     }
     case 'cons': {
       if (args.length !== 2) throw new EvalError(`${posStr(callPos)}cons: need 2 arguments`);
@@ -504,7 +596,7 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
     case 'length': {
       if (args.length !== 1) throw new EvalError(`${posStr(callPos)}length: need 1 argument`);
       const arr = schemeListToArray(args[0]);
-      return { tag: 'number', value: arr.length };
+      return makeExactInt(arr.length);
     }
     case 'append': {
       if (args.length === 0) return NIL;
@@ -520,7 +612,7 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
     }
     case 'number?': {
       if (args.length !== 1) throw new EvalError(`${posStr(callPos)}number?: need 1 argument`);
-      return { tag: 'boolean', value: args[0].tag === 'number' };
+      return { tag: 'boolean', value: isNumeric(args[0]) };
     }
     case 'boolean?': {
       if (args.length !== 1) throw new EvalError(`${posStr(callPos)}boolean?: need 1 argument`);
@@ -564,7 +656,7 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
     case 'string-length': {
       if (args.length !== 1) throw new EvalError(`${posStr(callPos)}string-length: need 1 argument`);
       if (args[0].tag !== 'string') throw new EvalError(`${posStr(callPos)}string-length: expected string`);
-      return { tag: 'number', value: args[0].value.length };
+      return makeExactInt(args[0].value.length);
     }
     case 'substring': {
       if (args.length !== 3) throw new EvalError(`${posStr(callPos)}substring: need 3 arguments`);
@@ -578,10 +670,12 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
       if (args[0].tag !== 'string') throw new EvalError(`${posStr(callPos)}string->number: expected string`);
       const n = Number(args[0].value);
       if (isNaN(n)) return { tag: 'boolean', value: false };
+      if (Number.isInteger(n)) return makeExactInt(n);
       return { tag: 'number', value: n };
     }
     case 'number->string': {
       if (args.length !== 1) throw new EvalError(`${posStr(callPos)}number->string: need 1 argument`);
+      if (args[0].tag === 'rational') return { tag: 'string', value: writeVal(args[0]) };
       if (args[0].tag !== 'number') throw new EvalError(`${posStr(callPos)}number->string: expected number`);
       return { tag: 'string', value: String(args[0].value) };
     }
@@ -623,6 +717,7 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
     // ── L09: Numeric utilities ──
     case 'abs': {
       if (args.length !== 1) throw new EvalError(`${posStr(callPos)}abs: need 1 argument`);
+      if (args[0].tag === 'rational') return makeRational(Math.abs(args[0].num), args[0].den, callPos);
       return { tag: 'number', value: Math.abs(toNumber(args[0], 'abs', callPos)) };
     }
     case 'modulo': {
@@ -630,43 +725,53 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
       const a = toNumber(args[0], 'modulo', callPos);
       const b = toNumber(args[1], 'modulo', callPos);
       if (b === 0) throw new EvalError(`${posStr(callPos)}modulo: division by zero`);
-      return { tag: 'number', value: a - b * Math.floor(a / b) };
+      const r = a - b * Math.floor(a / b);
+      if (args[0].tag === 'rational' && args[1].tag === 'rational') return makeExactInt(r);
+      return { tag: 'number', value: r };
     }
     case 'remainder': {
       if (args.length !== 2) throw new EvalError(`${posStr(callPos)}remainder: need 2 arguments`);
       const a = toNumber(args[0], 'remainder', callPos);
       const b = toNumber(args[1], 'remainder', callPos);
       if (b === 0) throw new EvalError(`${posStr(callPos)}remainder: division by zero`);
-      return { tag: 'number', value: a - b * Math.trunc(a / b) };
+      const r = a - b * Math.trunc(a / b);
+      if (args[0].tag === 'rational' && args[1].tag === 'rational') return makeExactInt(r);
+      return { tag: 'number', value: r };
     }
     case 'quotient': {
       if (args.length !== 2) throw new EvalError(`${posStr(callPos)}quotient: need 2 arguments`);
       const a = toNumber(args[0], 'quotient', callPos);
       const b = toNumber(args[1], 'quotient', callPos);
       if (b === 0) throw new EvalError(`${posStr(callPos)}quotient: division by zero`);
-      return { tag: 'number', value: Math.trunc(a / b) };
+      const r = Math.trunc(a / b);
+      if (args[0].tag === 'rational' && args[1].tag === 'rational') return makeExactInt(r);
+      return { tag: 'number', value: r };
     }
     case 'min': {
       if (args.length === 0) throw new EvalError(`${posStr(callPos)}min: need at least 1 argument`);
-      let result = toNumber(args[0], 'min', callPos);
+      let bestIdx = 0;
+      let bestVal = toNumber(args[0], 'min', callPos);
       for (let i = 1; i < args.length; i++) {
         const v = toNumber(args[i], 'min', callPos);
-        if (v < result) result = v;
+        if (v < bestVal) { bestVal = v; bestIdx = i; }
       }
-      return { tag: 'number', value: result };
+      return args[bestIdx];
     }
     case 'max': {
       if (args.length === 0) throw new EvalError(`${posStr(callPos)}max: need at least 1 argument`);
-      let result = toNumber(args[0], 'max', callPos);
+      let bestIdx = 0;
+      let bestVal = toNumber(args[0], 'max', callPos);
       for (let i = 1; i < args.length; i++) {
         const v = toNumber(args[i], 'max', callPos);
-        if (v > result) result = v;
+        if (v > bestVal) { bestVal = v; bestIdx = i; }
       }
-      return { tag: 'number', value: result };
+      return args[bestIdx];
     }
     case 'expt': {
       if (args.length !== 2) throw new EvalError(`${posStr(callPos)}expt: need 2 arguments`);
-      return { tag: 'number', value: Math.pow(toNumber(args[0], 'expt', callPos), toNumber(args[1], 'expt', callPos)) };
+      const r = Math.pow(toNumber(args[0], 'expt', callPos), toNumber(args[1], 'expt', callPos));
+      if (args[0].tag === 'rational' && args[1].tag === 'rational' && Number.isInteger(r)) return makeExactInt(r);
+      return { tag: 'number', value: r };
     }
     case 'zero?': {
       if (args.length !== 1) throw new EvalError(`${posStr(callPos)}zero?: need 1 argument`);
@@ -802,6 +907,65 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
       if (args[0].tag !== 'string') throw new EvalError(`${posStr(callPos)}string-downcase: expected string`);
       return { tag: 'string', value: args[0].value.toLowerCase() };
     }
+    // ── L11: Exact arithmetic & rationals ──
+    case 'exact?': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}exact?: need 1 argument`);
+      return { tag: 'boolean', value: args[0].tag === 'rational' };
+    }
+    case 'inexact?': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}inexact?: need 1 argument`);
+      return { tag: 'boolean', value: args[0].tag === 'number' };
+    }
+    case 'integer?': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}integer?: need 1 argument`);
+      if (args[0].tag === 'rational') return { tag: 'boolean', value: args[0].den === 1 };
+      if (args[0].tag === 'number') return { tag: 'boolean', value: Number.isInteger(args[0].value) };
+      return { tag: 'boolean', value: false };
+    }
+    case 'rational?': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}rational?: need 1 argument`);
+      return { tag: 'boolean', value: args[0].tag === 'rational' };
+    }
+    case 'exact->inexact': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}exact->inexact: need 1 argument`);
+      return { tag: 'number', value: toNumber(args[0], 'exact->inexact', callPos) };
+    }
+    case 'inexact->exact': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}inexact->exact: need 1 argument`);
+      if (args[0].tag === 'rational') return args[0];
+      const v = toNumber(args[0], 'inexact->exact', callPos);
+      // Convert float to rational via fraction approximation
+      if (Number.isInteger(v)) return makeRational(v, 1, callPos);
+      // Use continued fraction to find best rational approximation
+      const sign = v < 0 ? -1 : 1;
+      const absV = Math.abs(v);
+      let num0 = 0, den0 = 1, num1 = 1, den1 = 0;
+      let x = absV;
+      for (let i = 0; i < 64; i++) {
+        const a = Math.floor(x);
+        const num2 = a * num1 + num0;
+        const den2 = a * den1 + den0;
+        if (Math.abs(num2 / den2 - absV) < 1e-15) {
+          return makeRational(sign * num2, den2, callPos);
+        }
+        num0 = num1; den0 = den1;
+        num1 = num2; den1 = den2;
+        const rem = x - a;
+        if (rem < 1e-15) break;
+        x = 1 / rem;
+      }
+      return makeRational(sign * num1, den1, callPos);
+    }
+    case 'numerator': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}numerator: need 1 argument`);
+      if (args[0].tag === 'rational') return makeRational(args[0].num, 1, callPos);
+      throw new EvalError(`${posStr(callPos)}numerator: expected rational`);
+    }
+    case 'denominator': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}denominator: need 1 argument`);
+      if (args[0].tag === 'rational') return makeRational(args[0].den, 1, callPos);
+      throw new EvalError(`${posStr(callPos)}denominator: expected rational`);
+    }
     case 'apply': {
       if (args.length < 2) throw new EvalError(`${posStr(callPos)}apply: need at least 2 arguments`);
       const fn = args[0];
@@ -839,6 +1003,10 @@ const BUILTIN_NAMES = new Set([
   'list-ref', 'list-tail', 'list?', 'assoc', 'map', 'equal?', 'eq?',
   'char-alphabetic?', 'char-numeric?', 'char-upcase', 'char-downcase', 'char=?', 'char<?',
   'string=?', 'string<?', 'string-ci=?', 'string-upcase', 'string-downcase',
+  // L11
+  'exact?', 'inexact?', 'integer?', 'rational?',
+  'exact->inexact', 'inexact->exact',
+  'numerator', 'denominator',
 ]);
 
 function applyLambda(proc: SchemeVal & { tag: 'lambda' }, args: SchemeVal[], callPos?: Pos): SchemeVal {
@@ -866,7 +1034,7 @@ function applyLambda(proc: SchemeVal & { tag: 'lambda' }, args: SchemeVal[], cal
 }
 
 function evaluate(expr: SchemeVal, env: Env): SchemeVal {
-  if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') return expr;
+  if (expr.tag === 'number' || expr.tag === 'rational' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') return expr;
   if (expr.tag === 'nil' || expr.tag === 'pair') return expr;
 
   if (expr.tag === 'symbol') {
@@ -1083,7 +1251,13 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
 // writeVal: like Scheme's `write` — strings get quotes
 function writeVal(val: SchemeVal): string {
   switch (val.tag) {
-    case 'number': return String(val.value);
+    case 'number': {
+      const s = String(val.value);
+      // Inexact numbers should always show decimal point
+      if (Number.isFinite(val.value) && !s.includes('.') && !s.includes('e')) return s + '.0';
+      return s;
+    }
+    case 'rational': return val.den === 1 ? String(val.num) : `${val.num}/${val.den}`;
     case 'boolean': return val.value ? '#t' : '#f';
     case 'string': return `"${val.value}"`;
     case 'char': return `#\\${val.value}`;
