@@ -41,6 +41,18 @@ struct SchemeStringInner {
     mutable: bool,
 }
 
+#[derive(Debug)]
+struct RecordType {
+    name: String,
+    field_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RecordValue {
+    record_type: Rc<RecordType>,
+    fields: Vec<Value>,
+}
+
 impl SchemeString {
     fn new_immutable(value: impl AsRef<str>) -> Self {
         Self::from_chars(value.as_ref().chars().collect(), false)
@@ -98,6 +110,7 @@ enum Value {
     Char(char),
     List(Vec<Value>),
     Pair(Box<Value>, Box<Value>),
+    Record(Rc<RecordValue>),
     Procedure(Rc<Procedure>),
     Void,
 }
@@ -106,6 +119,20 @@ enum Value {
 enum Procedure {
     Builtin {
         name: &'static str,
+    },
+    RecordConstructor {
+        name: String,
+        record_type: Rc<RecordType>,
+        field_indices: Vec<usize>,
+    },
+    RecordPredicate {
+        name: String,
+        record_type: Rc<RecordType>,
+    },
+    RecordAccessor {
+        name: String,
+        record_type: Rc<RecordType>,
+        field_index: usize,
     },
     Lambda {
         params: LambdaParams,
@@ -118,6 +145,18 @@ enum Procedure {
 struct LambdaParams {
     required: Vec<String>,
     rest: Option<String>,
+}
+
+#[derive(Debug)]
+struct RecordConstructorSpec {
+    name: String,
+    fields: Vec<String>,
+}
+
+#[derive(Debug)]
+struct RecordFieldSpec {
+    name: String,
+    accessor: String,
 }
 
 impl LambdaParams {
@@ -192,6 +231,72 @@ impl Procedure {
     fn call(&self, args: Vec<Value>, context: &mut EvalContext) -> Result<Value, EvalError> {
         match self {
             Self::Builtin { name } => apply_builtin(name, &args, context),
+            Self::RecordConstructor {
+                name,
+                record_type,
+                field_indices,
+            } => {
+                if args.len() != field_indices.len() {
+                    return Err(EvalError::WrongArgCountDynamic {
+                        name: name.clone(),
+                        expected: format!("exactly {} arguments", field_indices.len()),
+                        got: args.len(),
+                    });
+                }
+
+                let mut fields = vec![Value::Void; record_type.field_count];
+                for (value, index) in args.into_iter().zip(field_indices.iter().copied()) {
+                    fields[index] = value;
+                }
+
+                Ok(Value::Record(Rc::new(RecordValue {
+                    record_type: record_type.clone(),
+                    fields,
+                })))
+            }
+            Self::RecordPredicate { name, record_type } => {
+                if args.len() != 1 {
+                    return Err(EvalError::WrongArgCountDynamic {
+                        name: name.clone(),
+                        expected: "exactly 1 argument".into(),
+                        got: args.len(),
+                    });
+                }
+
+                Ok(Value::Boolean(matches!(
+                    &args[0],
+                    Value::Record(record) if Rc::ptr_eq(&record.record_type, record_type)
+                )))
+            }
+            Self::RecordAccessor {
+                name,
+                record_type,
+                field_index,
+            } => {
+                if args.len() != 1 {
+                    return Err(EvalError::WrongArgCountDynamic {
+                        name: name.clone(),
+                        expected: "exactly 1 argument".into(),
+                        got: args.len(),
+                    });
+                }
+
+                match &args[0] {
+                    Value::Record(record) if Rc::ptr_eq(&record.record_type, record_type) => {
+                        Ok(record.fields[*field_index].clone())
+                    }
+                    Value::Record(record) => Err(EvalError::ExpectedRecordType {
+                        name: name.clone(),
+                        expected: record_type.name.clone(),
+                        found: record.record_type.name.clone(),
+                    }),
+                    other => Err(EvalError::ExpectedRecordType {
+                        name: name.clone(),
+                        expected: record_type.name.clone(),
+                        found: other.type_name().into(),
+                    }),
+                }
+            }
             Self::Lambda { params, body, env } => {
                 if args.len() < params.required.len()
                     || (params.rest.is_none() && args.len() != params.required.len())
@@ -241,6 +346,7 @@ impl Value {
             Self::Char(_) => "character",
             Self::List(_) => "list",
             Self::Pair(_, _) => "pair",
+            Self::Record(_) => "record",
             Self::Procedure(_) => "procedure",
             Self::Void => "void",
         }
@@ -277,6 +383,7 @@ impl Value {
                 format!("({rendered})")
             }
             Self::Pair(car, cdr) => render_pair(car, cdr, false),
+            Self::Record(record) => format!("#<record {}>", record.record_type.name),
             Self::Procedure(_) => "#<procedure>".into(),
             Self::Void => "#<void>".into(),
         }
@@ -589,6 +696,7 @@ fn eval_application(
             "begin" => return eval_begin(tail, env, context),
             "cond" => return eval_cond(tail, env, context),
             "define" => return eval_define(tail, env, context),
+            "define-record-type" => return eval_define_record_type(tail, env),
             "if" => return eval_if(tail, env, context),
             "lambda" => return eval_lambda(tail, env),
             "let" => return eval_let(tail, env, context),
@@ -757,6 +865,98 @@ fn eval_define(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result
     }
 }
 
+fn eval_define_record_type(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    if args.len() < 3 {
+        return Err(EvalError::WrongArgCount {
+            name: "define-record-type",
+            expected: "a record name, constructor, predicate, and field specifications",
+            got: args.len(),
+        });
+    }
+
+    let Expr::Symbol(record_name) = &args[0] else {
+        return Err(EvalError::InvalidForm {
+            name: "define-record-type",
+            message: "expected a record type name",
+        });
+    };
+
+    let constructor = parse_record_constructor(&args[1])?;
+
+    let Expr::Symbol(predicate_name) = &args[2] else {
+        return Err(EvalError::InvalidForm {
+            name: "define-record-type",
+            message: "expected a predicate name",
+        });
+    };
+
+    let field_specs = args[3..]
+        .iter()
+        .map(parse_record_field_spec)
+        .collect::<Result<Vec<_>, EvalError>>()?;
+
+    let mut field_indices = HashMap::new();
+    for (index, field_spec) in field_specs.iter().enumerate() {
+        if field_indices
+            .insert(field_spec.name.clone(), index)
+            .is_some()
+        {
+            return Err(EvalError::InvalidForm {
+                name: "define-record-type",
+                message: "expected unique field names",
+            });
+        }
+    }
+
+    let constructor_field_indices = constructor
+        .fields
+        .iter()
+        .map(|field_name| {
+            field_indices
+                .get(field_name)
+                .copied()
+                .ok_or(EvalError::InvalidForm {
+                    name: "define-record-type",
+                    message: "constructor fields must match the declared record fields",
+                })
+        })
+        .collect::<Result<Vec<_>, EvalError>>()?;
+
+    let record_type = Rc::new(RecordType {
+        name: record_name.clone(),
+        field_count: field_specs.len(),
+    });
+
+    env.define(
+        constructor.name.clone(),
+        Value::Procedure(Rc::new(Procedure::RecordConstructor {
+            name: constructor.name,
+            record_type: record_type.clone(),
+            field_indices: constructor_field_indices,
+        })),
+    );
+    env.define(
+        predicate_name.clone(),
+        Value::Procedure(Rc::new(Procedure::RecordPredicate {
+            name: predicate_name.clone(),
+            record_type: record_type.clone(),
+        })),
+    );
+
+    for (index, field_spec) in field_specs.iter().enumerate() {
+        env.define(
+            field_spec.accessor.clone(),
+            Value::Procedure(Rc::new(Procedure::RecordAccessor {
+                name: field_spec.accessor.clone(),
+                record_type: record_type.clone(),
+                field_index: index,
+            })),
+        );
+    }
+
+    Ok(Value::Void)
+}
+
 fn eval_if(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
     if args.len() != 3 {
         return Err(EvalError::WrongArgCount {
@@ -918,6 +1118,80 @@ fn parse_params(expr: &Expr, name: &'static str) -> Result<LambdaParams, EvalErr
             message: "expected a parameter list",
         }),
     }
+}
+
+fn parse_record_constructor(expr: &Expr) -> Result<RecordConstructorSpec, EvalError> {
+    let Expr::List(items) = expr else {
+        return Err(EvalError::InvalidForm {
+            name: "define-record-type",
+            message: "expected a constructor specification",
+        });
+    };
+
+    let Some((name_expr, field_exprs)) = items.split_first() else {
+        return Err(EvalError::InvalidForm {
+            name: "define-record-type",
+            message: "expected a constructor name",
+        });
+    };
+
+    let Expr::Symbol(name) = name_expr else {
+        return Err(EvalError::InvalidForm {
+            name: "define-record-type",
+            message: "expected a constructor name",
+        });
+    };
+
+    let fields = field_exprs
+        .iter()
+        .map(|expr| match expr {
+            Expr::Symbol(field_name) => Ok(field_name.clone()),
+            _ => Err(EvalError::InvalidForm {
+                name: "define-record-type",
+                message: "expected constructor fields to be symbols",
+            }),
+        })
+        .collect::<Result<Vec<_>, EvalError>>()?;
+
+    Ok(RecordConstructorSpec {
+        name: name.clone(),
+        fields,
+    })
+}
+
+fn parse_record_field_spec(expr: &Expr) -> Result<RecordFieldSpec, EvalError> {
+    let Expr::List(items) = expr else {
+        return Err(EvalError::InvalidForm {
+            name: "define-record-type",
+            message: "expected each field specification to be a list",
+        });
+    };
+
+    if items.len() != 2 {
+        return Err(EvalError::InvalidForm {
+            name: "define-record-type",
+            message: "expected each field specification to contain a field and accessor name",
+        });
+    }
+
+    let Expr::Symbol(name) = &items[0] else {
+        return Err(EvalError::InvalidForm {
+            name: "define-record-type",
+            message: "expected field names to be symbols",
+        });
+    };
+
+    let Expr::Symbol(accessor) = &items[1] else {
+        return Err(EvalError::InvalidForm {
+            name: "define-record-type",
+            message: "expected accessor names to be symbols",
+        });
+    };
+
+    Ok(RecordFieldSpec {
+        name: name.clone(),
+        accessor: accessor.clone(),
+    })
 }
 
 fn parse_let_bindings(expr: &Expr, name: &'static str) -> Result<Vec<(String, Expr)>, EvalError> {
@@ -2037,6 +2311,7 @@ fn eq_values(left: &Value, right: &Value) -> bool {
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::Char(left), Value::Char(right)) => left == right,
         (Value::String(left), Value::String(right)) => Rc::ptr_eq(&left.inner, &right.inner),
+        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::List(left), Value::List(right)) => left.is_empty() && right.is_empty(),
         (Value::Void, Value::Void) => true,
@@ -2063,6 +2338,7 @@ fn equal_values(left: &Value, right: &Value) -> bool {
         (Value::Pair(left_car, left_cdr), Value::Pair(right_car, right_cdr)) => {
             equal_values(left_car, right_car) && equal_values(left_cdr, right_cdr)
         }
+        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,

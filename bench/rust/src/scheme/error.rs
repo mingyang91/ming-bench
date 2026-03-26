@@ -61,6 +61,13 @@ pub enum EvalError {
         got: usize,
     },
 
+    #[error("{name} expected {expected}, got {got}")]
+    WrongArgCountDynamic {
+        name: String,
+        expected: String,
+        got: usize,
+    },
+
     #[error("{name} expected a number, got {found}")]
     ExpectedNumber {
         name: &'static str,
@@ -95,6 +102,13 @@ pub enum EvalError {
     ExpectedPair {
         name: &'static str,
         found: &'static str,
+    },
+
+    #[error("{name} expected a {expected} record, got {found}")]
+    ExpectedRecordType {
+        name: String,
+        expected: String,
+        found: String,
     },
 
     #[error("{name} invalid argument: {message}")]
