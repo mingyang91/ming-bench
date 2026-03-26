@@ -210,6 +210,7 @@ final class PredicateBuiltins {
             case ">" -> comparison > 0;
             case "=" -> comparison == 0;
             case "<=" -> comparison <= 0;
+            case ">=" -> comparison >= 0;
             default -> throw new EvalError("unknown comparison operator: " + operator);
         };
     }

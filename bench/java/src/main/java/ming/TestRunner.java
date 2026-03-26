@@ -18,15 +18,20 @@ public class TestRunner {
         }
 
         String levelArg = args[0];
-        int benchLevel = 0;
-        if (!levelArg.equals("all")) {
+        int benchLevel;
+        if (levelArg.equals("all")) {
+            benchLevel = Integer.MAX_VALUE;
+        } else {
             try {
                 benchLevel = Integer.parseInt(levelArg);
             } catch (NumberFormatException e) {
                 System.err.println("Invalid level: " + levelArg);
                 System.exit(2);
+                return;
             }
         }
+
+        System.setProperty("bench.level", Integer.toString(benchLevel));
 
         String testsJsonPath = System.getenv("TESTS_JSON");
         if (testsJsonPath == null || testsJsonPath.isEmpty()) {

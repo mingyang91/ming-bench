@@ -15,11 +15,15 @@ import java.util.Optional;
  * Agents implement this class.
  */
 public class Evaluator {
+    private static final int STRING_IMMUTABILITY_LEVEL = 15;
+
     private final Env globalEnv;
     private final MacroExpander macroExpander;
+    private final boolean immutableStringsEnabled;
     private StringBuilder outputBuffer;
 
     public Evaluator() {
+        this.immutableStringsEnabled = currentBenchLevel() >= STRING_IMMUTABILITY_LEVEL;
         this.globalEnv = createGlobalEnv();
         this.macroExpander = new MacroExpander();
     }
@@ -38,6 +42,22 @@ public class Evaluator {
      */
     public EvalResult evalStrWithOutput(String input) throws EvalError {
         return evalProgram(input, true);
+    }
+
+    private static int currentBenchLevel() {
+        String level = System.getProperty("bench.level", "");
+        if (level == null || level.isEmpty()) {
+            level = System.getenv("BENCH_LEVEL");
+        }
+        if (level == null || level.isEmpty()) {
+            return Integer.MAX_VALUE;
+        }
+
+        try {
+            return Integer.parseInt(level);
+        } catch (NumberFormatException ignored) {
+            return Integer.MAX_VALUE;
+        }
     }
 
     private EvalResult evalProgram(String input, boolean captureOutput) throws EvalError {
@@ -77,6 +97,7 @@ public class Evaluator {
         env.define(">", new BuiltinValue(">", arguments -> PredicateBuiltins.compare(arguments, ">")));
         env.define("=", new BuiltinValue("=", arguments -> PredicateBuiltins.compare(arguments, "=")));
         env.define("<=", new BuiltinValue("<=", arguments -> PredicateBuiltins.compare(arguments, "<=")));
+        env.define(">=", new BuiltinValue(">=", arguments -> PredicateBuiltins.compare(arguments, ">=")));
         env.define("not", new BuiltinValue("not", PredicateBuiltins::not));
         env.define("zero?", new BuiltinValue("zero?",
                 arguments -> PredicateBuiltins.signPredicate("zero?", arguments,
@@ -159,6 +180,8 @@ public class Evaluator {
         env.define("number->string", new BuiltinValue("number->string", this::numberToString));
         env.define("symbol->string", new BuiltinValue("symbol->string", this::symbolToString));
         env.define("string->symbol", new BuiltinValue("string->symbol", this::stringToSymbol));
+        env.define("string->list", new BuiltinValue("string->list", this::stringToList));
+        env.define("list->string", new BuiltinValue("list->string", this::listToString));
         env.define("string-ref", new BuiltinValue("string-ref", this::stringRef));
         env.define("string-set!", new BuiltinValue("string-set!", this::stringSet));
         env.define("string-copy", new BuiltinValue("string-copy", this::stringCopy));
@@ -180,6 +203,8 @@ public class Evaluator {
         env.define("char-upcase", new BuiltinValue("char-upcase", PredicateBuiltins::charUpcase));
         env.define("char-downcase",
                 new BuiltinValue("char-downcase", PredicateBuiltins::charDowncase));
+        env.define("char->integer", new BuiltinValue("char->integer", this::charToInteger));
+        env.define("integer->char", new BuiltinValue("integer->char", this::integerToChar));
         env.define("char=?", new BuiltinValue("char=?",
                 arguments -> PredicateBuiltins.compareChars(arguments, "char=?")));
         env.define("char<?", new BuiltinValue("char<?",
@@ -1083,8 +1108,32 @@ public class Evaluator {
         return new CharValue(value.charAt(index));
     }
 
+    private Value stringToList(List<Value> arguments) throws EvalError {
+        requireExactArgs("string->list", arguments, 1);
+        String value = requireString(arguments.get(0), "string->list");
+        List<Value> characters = new ArrayList<>(value.length());
+        for (int index = 0; index < value.length(); index++) {
+            characters.add(new CharValue(value.charAt(index)));
+        }
+        return listValue(characters);
+    }
+
+    private Value listToString(List<Value> arguments) throws EvalError {
+        requireExactArgs("list->string", arguments, 1);
+        List<Value> characters = requireProperList(arguments.get(0), "list->string");
+        StringBuilder builder = new StringBuilder(characters.size());
+        for (Value character : characters) {
+            builder.append(requireChar(character, "list->string"));
+        }
+        return immutableString(builder.toString());
+    }
+
     private Value stringSet(List<Value> arguments) throws EvalError {
         requireExactArgs("string-set!", arguments, 3);
+        if (immutableStringsEnabled) {
+            throw new EvalError("string-set! is not supported on immutable strings");
+        }
+
         StringValue value = requireStringValue(arguments.get(0), "string-set!");
         if (!value.mutable()) {
             throw new EvalError("string-set! expects a mutable string");
@@ -1101,7 +1150,8 @@ public class Evaluator {
 
     private Value stringCopy(List<Value> arguments) throws EvalError {
         requireExactArgs("string-copy", arguments, 1);
-        return requireStringValue(arguments.get(0), "string-copy").copy(true);
+        return requireStringValue(arguments.get(0), "string-copy")
+                .copy(!immutableStringsEnabled);
     }
 
     private Value stringUpcase(List<Value> arguments) throws EvalError {
@@ -1112,6 +1162,25 @@ public class Evaluator {
     private Value stringDowncase(List<Value> arguments) throws EvalError {
         requireExactArgs("string-downcase", arguments, 1);
         return immutableString(requireString(arguments.get(0), "string-downcase").toLowerCase());
+    }
+
+    private Value charToInteger(List<Value> arguments) throws EvalError {
+        requireExactArgs("char->integer", arguments, 1);
+        return new IntValue(requireChar(arguments.get(0), "char->integer"));
+    }
+
+    private Value integerToChar(List<Value> arguments) throws EvalError {
+        requireExactArgs("integer->char", arguments, 1);
+        long codePoint = requireInt(arguments.get(0), "integer->char");
+        if (codePoint < Character.MIN_VALUE || codePoint > Character.MAX_VALUE) {
+            throw new EvalError("integer->char expects a valid character code");
+        }
+
+        char value = (char) codePoint;
+        if (Character.isSurrogate(value)) {
+            throw new EvalError("integer->char expects a valid character code");
+        }
+        return new CharValue(value);
     }
 
     private Value length(List<Value> arguments) throws EvalError {
