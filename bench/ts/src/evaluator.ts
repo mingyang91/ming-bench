@@ -14,6 +14,7 @@ import {
   isIntegerNumber,
   isRationalNumber,
   makeExactInteger,
+  makeInexact,
   maxNumbers,
   minNumbers,
   multiplyNumbers,
@@ -147,6 +148,10 @@ const BUILTIN_NAMES = [
   'min',
   'max',
   'expt',
+  'gcd',
+  'lcm',
+  'truncate',
+  'round',
   '<',
   '>',
   '=',
@@ -161,16 +166,31 @@ const BUILTIN_NAMES = [
   'cons',
   'car',
   'cdr',
+  'caar',
+  'cadr',
+  'cdar',
+  'cddr',
+  'set-car!',
+  'set-cdr!',
   'null?',
   'list',
   'append',
+  'reverse',
   'length',
   'list-ref',
   'list-tail',
   'list?',
+  'memq',
+  'memv',
+  'member',
+  'assq',
+  'assv',
   'assoc',
   'map',
+  'for-each',
   'string?',
+  'make-string',
+  'string',
   'number?',
   'exact?',
   'inexact?',
@@ -204,6 +224,9 @@ const BUILTIN_NAMES = [
   'list->string',
   'string=?',
   'string<?',
+  'string>?',
+  'string<=?',
+  'string>=?',
   'string-ci=?',
   'string-upcase',
   'string-downcase',
@@ -225,6 +248,7 @@ const BUILTIN_NAMES = [
   'vector->list',
   'list->vector',
   'apply',
+  'error',
 ] as const;
 type BuiltinName = (typeof BUILTIN_NAMES)[number];
 
@@ -687,6 +711,8 @@ function evaluateListAction(expr: ListExpr, env: Environment, context: EvalConte
         return evaluateBeginAction(argExprs, env);
       case 'let':
         return evaluateLetAction(argExprs, env, context);
+      case 'let*':
+        return evaluateLetStarAction(argExprs, env, context);
       case 'letrec':
         return evaluateLetrecAction(argExprs, env, context, false);
       case 'letrec*':
@@ -2071,6 +2097,26 @@ function evaluateLetAction(argExprs: Expr[], env: Environment, context: EvalCont
   return applyClosureAction(procedure, values);
 }
 
+function evaluateLetStarAction(
+  argExprs: Expr[],
+  env: Environment,
+  context: EvalContext,
+): EvalAction {
+  if (argExprs.length < 2) {
+    throw new EvalError('let* expects bindings and a body');
+  }
+
+  const bindings = readLetBindings(argExprs[0]);
+  const body = argExprs.slice(1);
+  const letEnv = new Environment(env);
+
+  for (let index = 0; index < bindings.names.length; index += 1) {
+    letEnv.define(bindings.names[index], evaluateExpr(bindings.initExprs[index], letEnv, context));
+  }
+
+  return { kind: 'sequence', exprs: body, env: letEnv };
+}
+
 function readLetBindings(bindingsExpr: Expr): { names: string[]; initExprs: Expr[] } {
   if (bindingsExpr.kind !== 'list') {
     throw new EvalError('let bindings must be a list');
@@ -2458,6 +2504,14 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
       return applyMinMax(args, 'max');
     case 'expt':
       return applyExpt(args);
+    case 'gcd':
+      return applyGcd(args);
+    case 'lcm':
+      return applyLcm(args);
+    case 'truncate':
+      return applyTruncate(args);
+    case 'round':
+      return applyRound(args);
     case '<':
       return applyComparison(args, '<', (comparison) => comparison < 0);
     case '>':
@@ -2509,6 +2563,15 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
         throw new EvalError('cdr expects exactly 1 argument');
       }
       return expectPair(args[0], 'cdr').cdr;
+    case 'caar':
+    case 'cadr':
+    case 'cdar':
+    case 'cddr':
+      return applyCxr(args, name);
+    case 'set-car!':
+      return applySetPairField(args, 'set-car!', 'car');
+    case 'set-cdr!':
+      return applySetPairField(args, 'set-cdr!', 'cdr');
     case 'null?':
       if (args.length !== 1) {
         throw new EvalError('null? expects exactly 1 argument');
@@ -2518,6 +2581,8 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
       return buildList(args);
     case 'append':
       return applyAppend(args);
+    case 'reverse':
+      return applyReverse(args);
     case 'length':
       if (args.length !== 1) {
         throw new EvalError('length expects exactly 1 argument');
@@ -2529,12 +2594,28 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
       return applyListTail(args);
     case 'list?':
       return applyTypePredicate(args, 'list?', (value) => isProperList(value));
+    case 'memq':
+      return applyMember(args, 'memq', eqValues);
+    case 'memv':
+      return applyMember(args, 'memv', eqValues);
+    case 'member':
+      return applyMember(args, 'member', equalValues);
+    case 'assq':
+      return applyAssocWith(args, 'assq', eqValues);
+    case 'assv':
+      return applyAssocWith(args, 'assv', eqValues);
     case 'assoc':
       return applyAssoc(args);
     case 'map':
       return applyMap(args, context);
+    case 'for-each':
+      return applyForEach(args, context);
     case 'string?':
       return applyTypePredicate(args, 'string?', (value) => value.kind === 'string');
+    case 'make-string':
+      return applyMakeString(args);
+    case 'string':
+      return applyString(args);
     case 'number?':
       return applyTypePredicate(args, 'number?', (value) => value.kind === 'number');
     case 'exact?':
@@ -2652,6 +2733,12 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
       return applyStringComparison(args, 'string=?', (value) => value, (left, right) => left === right);
     case 'string<?':
       return applyStringComparison(args, 'string<?', (value) => value, (left, right) => left < right);
+    case 'string>?':
+      return applyStringComparison(args, 'string>?', (value) => value, (left, right) => left > right);
+    case 'string<=?':
+      return applyStringComparison(args, 'string<=?', (value) => value, (left, right) => left <= right);
+    case 'string>=?':
+      return applyStringComparison(args, 'string>=?', (value) => value, (left, right) => left >= right);
     case 'string-ci=?':
       return applyStringComparison(
         args,
@@ -2714,7 +2801,39 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
       return { kind: 'vector', elements: listToArray(args[0], 'list->vector') };
     case 'apply':
       return applyApply(args, context);
+    case 'error':
+      return applyError(args);
   }
+}
+
+function applyCxr(args: RuntimeValue[], name: 'caar' | 'cadr' | 'cdar' | 'cddr'): RuntimeValue {
+  if (args.length !== 1) {
+    throw new EvalError(`${name} expects exactly 1 argument`);
+  }
+
+  let current = args[0];
+  const operations = name.slice(1, -1);
+
+  for (let index = operations.length - 1; index >= 0; index -= 1) {
+    const pair = expectPair(current, name);
+    current = operations[index] === 'a' ? pair.car : pair.cdr;
+  }
+
+  return current;
+}
+
+function applySetPairField(
+  args: RuntimeValue[],
+  name: 'set-car!' | 'set-cdr!',
+  field: 'car' | 'cdr',
+): RuntimeValue {
+  if (args.length !== 2) {
+    throw new EvalError(`${name} expects exactly 2 arguments`);
+  }
+
+  const pair = expectPair(args[0], name);
+  pair[field] = args[1];
+  return VOID_VALUE;
 }
 
 function applyMakeVector(args: RuntimeValue[]): RuntimeValue {
@@ -2809,6 +2928,75 @@ function applyExpt(args: RuntimeValue[]): RuntimeValue {
   return makeNumber(exptNumber(base, exponent));
 }
 
+function applyGcd(args: RuntimeValue[]): RuntimeValue {
+  if (args.length === 0) {
+    return makeNumber(makeExactInteger(0));
+  }
+
+  const values = args.map((arg) => expectInteger(arg, 'gcd'));
+  if (values.every((value) => value.exact)) {
+    let result = 0n;
+    for (const value of values) {
+      result = bigintGcd(result, bigintAbs(value.numerator));
+    }
+    return makeNumber(makeExactInteger(result));
+  }
+
+  let result = 0;
+  for (const value of values) {
+    result = jsGcd(result, Math.abs(numberToJsNumber(value)));
+  }
+  return makeNumber(makeInexact(result));
+}
+
+function applyLcm(args: RuntimeValue[]): RuntimeValue {
+  if (args.length === 0) {
+    return makeNumber(makeExactInteger(1));
+  }
+
+  const values = args.map((arg) => expectInteger(arg, 'lcm'));
+  if (values.every((value) => value.exact)) {
+    let result = 1n;
+    for (const value of values) {
+      const current = bigintAbs(value.numerator);
+      result = bigintLcm(result, current);
+    }
+    return makeNumber(makeExactInteger(result));
+  }
+
+  let result = 1;
+  for (const value of values) {
+    result = jsLcm(result, Math.abs(numberToJsNumber(value)));
+  }
+  return makeNumber(makeInexact(result));
+}
+
+function applyTruncate(args: RuntimeValue[]): RuntimeValue {
+  if (args.length !== 1) {
+    throw new EvalError('truncate expects exactly 1 argument');
+  }
+
+  const value = expectNumber(args[0], 'truncate');
+  if (value.exact) {
+    return makeNumber(makeExactInteger(value.numerator / value.denominator));
+  }
+
+  return makeNumber(makeInexact(Math.trunc(value.value)));
+}
+
+function applyRound(args: RuntimeValue[]): RuntimeValue {
+  if (args.length !== 1) {
+    throw new EvalError('round expects exactly 1 argument');
+  }
+
+  const value = expectNumber(args[0], 'round');
+  if (value.exact) {
+    return makeNumber(makeExactInteger(roundExactRational(value.numerator, value.denominator)));
+  }
+
+  return makeNumber(makeInexact(roundToEven(value.value)));
+}
+
 function applyNumericPredicate(
   args: RuntimeValue[],
   name: string,
@@ -2893,9 +3081,44 @@ function applyListTail(args: RuntimeValue[]): RuntimeValue {
   return getListTail(args[0], expectIndex(args[1], 'list-tail'), 'list-tail');
 }
 
-function applyAssoc(args: RuntimeValue[]): RuntimeValue {
+function applyMember(
+  args: RuntimeValue[],
+  name: 'memq' | 'memv' | 'member',
+  matches: (left: RuntimeValue, right: RuntimeValue) => boolean,
+): RuntimeValue {
   if (args.length !== 2) {
-    throw new EvalError('assoc expects exactly 2 arguments');
+    throw new EvalError(`${name} expects exactly 2 arguments`);
+  }
+
+  const [target, list] = args;
+  let current = list;
+
+  while (current.kind === 'pair') {
+    if (matches(target, current.car)) {
+      return current;
+    }
+
+    current = current.cdr;
+  }
+
+  if (current.kind !== 'nil') {
+    throw new EvalError(`${name} expects a proper list`);
+  }
+
+  return makeBoolean(false);
+}
+
+function applyAssoc(args: RuntimeValue[]): RuntimeValue {
+  return applyAssocWith(args, 'assoc', equalValues);
+}
+
+function applyAssocWith(
+  args: RuntimeValue[],
+  name: 'assq' | 'assv' | 'assoc',
+  matches: (left: RuntimeValue, right: RuntimeValue) => boolean,
+): RuntimeValue {
+  if (args.length !== 2) {
+    throw new EvalError(`${name} expects exactly 2 arguments`);
   }
 
   const [key, alist] = args;
@@ -2904,10 +3127,10 @@ function applyAssoc(args: RuntimeValue[]): RuntimeValue {
   while (current.kind === 'pair') {
     const entry = current.car;
     if (entry.kind !== 'pair') {
-      throw new EvalError('assoc expects an association list');
+      throw new EvalError(`${name} expects an association list`);
     }
 
-    if (equalValues(key, entry.car)) {
+    if (matches(key, entry.car)) {
       return entry;
     }
 
@@ -2915,7 +3138,7 @@ function applyAssoc(args: RuntimeValue[]): RuntimeValue {
   }
 
   if (current.kind !== 'nil') {
-    throw new EvalError('assoc expects a proper list');
+    throw new EvalError(`${name} expects a proper list`);
   }
 
   return makeBoolean(false);
@@ -2942,6 +3165,42 @@ function applyMap(args: RuntimeValue[], context: EvalContext): RuntimeValue {
   }
 
   return buildList(results);
+}
+
+function applyForEach(args: RuntimeValue[], context: EvalContext): RuntimeValue {
+  if (args.length < 2) {
+    throw new EvalError('for-each expects at least 2 arguments');
+  }
+
+  const [procedure, ...listArgs] = args;
+  const lists = listArgs.map((listArg) => listToArray(listArg, 'for-each'));
+  const resultLength = lists[0].length;
+
+  for (const list of lists) {
+    if (list.length !== resultLength) {
+      throw new EvalError('for-each expects lists of equal length');
+    }
+  }
+
+  for (let index = 0; index < resultLength; index += 1) {
+    applyProcedure(procedure, lists.map((list) => list[index]), context);
+  }
+
+  return VOID_VALUE;
+}
+
+function applyMakeString(args: RuntimeValue[]): RuntimeValue {
+  if (args.length !== 1 && args.length !== 2) {
+    throw new EvalError('make-string expects 1 or 2 arguments');
+  }
+
+  const length = expectIndex(args[0], 'make-string');
+  const fill = args[1] === undefined ? ' ' : expectChar(args[1], 'make-string').value;
+  return makeString(Array.from({ length }, () => fill).join(''));
+}
+
+function applyString(args: RuntimeValue[]): RuntimeValue {
+  return makeString(args.map((arg) => expectChar(arg, 'string').value).join(''));
 }
 
 function applySubstring(args: RuntimeValue[]): RuntimeValue {
@@ -3216,6 +3475,14 @@ function applyAppend(args: RuntimeValue[]): RuntimeValue {
   return result;
 }
 
+function applyReverse(args: RuntimeValue[]): RuntimeValue {
+  if (args.length !== 1) {
+    throw new EvalError('reverse expects exactly 1 argument');
+  }
+
+  return buildList(listToArray(args[0], 'reverse').reverse());
+}
+
 function listLength(value: RuntimeValue): number {
   return listToArray(value, 'length').length;
 }
@@ -3442,6 +3709,14 @@ function formatDisplayValue(value: RuntimeValue): string {
 }
 
 function formatValueWithMode(value: RuntimeValue, mode: 'write' | 'display'): string {
+  return formatValueWithModeInternal(value, mode, new Set<object>());
+}
+
+function formatValueWithModeInternal(
+  value: RuntimeValue,
+  mode: 'write' | 'display',
+  seen: Set<object>,
+): string {
   switch (value.kind) {
     case 'number':
       return formatSchemeNumber(value.value);
@@ -3456,9 +3731,9 @@ function formatValueWithMode(value: RuntimeValue, mode: 'write' | 'display'): st
     case 'nil':
       return '()';
     case 'pair':
-      return formatPair(value, mode);
+      return formatPair(value, mode, seen);
     case 'vector':
-      return formatVector(value, mode);
+      return formatVector(value, mode, seen);
     case 'record':
       return `#<record ${value.recordType.name}>`;
     case 'builtin':
@@ -3491,24 +3766,58 @@ function isDelimiter(char: string): boolean {
   return isWhitespace(char) || char === '(' || char === ')' || char === "'" || char === ';';
 }
 
-function formatPair(value: PairValue, mode: 'write' | 'display'): string {
+function formatPair(value: PairValue, mode: 'write' | 'display', seen: Set<object>): string {
+  if (seen.has(value)) {
+    return '#<cycle>';
+  }
+
+  const added: PairValue[] = [value];
   const parts: string[] = [];
   let current: RuntimeValue = value;
+  seen.add(value);
 
-  while (current.kind === 'pair') {
-    parts.push(formatValueWithMode(current.car, mode));
-    current = current.cdr;
+  try {
+    while (current.kind === 'pair') {
+      parts.push(formatValueWithModeInternal(current.car, mode, seen));
+      const next: RuntimeValue = current.cdr;
+
+      if (next.kind === 'pair') {
+        if (seen.has(next)) {
+          return `(${parts.join(' ')} . #<cycle>)`;
+        }
+
+        seen.add(next);
+        added.push(next);
+      }
+
+      current = next;
+    }
+
+    if (current.kind === 'nil') {
+      return `(${parts.join(' ')})`;
+    }
+
+    return `(${parts.join(' ')} . ${formatValueWithModeInternal(current, mode, seen)})`;
+  } finally {
+    for (let index = added.length - 1; index >= 0; index -= 1) {
+      seen.delete(added[index]);
+    }
   }
-
-  if (current.kind === 'nil') {
-    return `(${parts.join(' ')})`;
-  }
-
-  return `(${parts.join(' ')} . ${formatValueWithMode(current, mode)})`;
 }
 
-function formatVector(value: VectorValue, mode: 'write' | 'display'): string {
-  return `#(${value.elements.map((element) => formatValueWithMode(element, mode)).join(' ')})`;
+function formatVector(value: VectorValue, mode: 'write' | 'display', seen: Set<object>): string {
+  if (seen.has(value)) {
+    return '#<cycle>';
+  }
+
+  seen.add(value);
+  try {
+    return `#(${value.elements
+      .map((element) => formatValueWithModeInternal(element, mode, seen))
+      .join(' ')})`;
+  } finally {
+    seen.delete(value);
+  }
 }
 
 function formatChar(value: string): string {
@@ -3560,6 +3869,106 @@ function parseNumberString(value: string): RuntimeValue {
   }
 
   return makeBoolean(false);
+}
+
+function bigintAbs(value: bigint): bigint {
+  return value < 0n ? -value : value;
+}
+
+function bigintGcd(left: bigint, right: bigint): bigint {
+  let a = bigintAbs(left);
+  let b = bigintAbs(right);
+
+  while (b !== 0n) {
+    const next = a % b;
+    a = b;
+    b = next;
+  }
+
+  return a;
+}
+
+function bigintLcm(left: bigint, right: bigint): bigint {
+  if (left === 0n || right === 0n) {
+    return 0n;
+  }
+
+  return (bigintAbs(left) / bigintGcd(left, right)) * bigintAbs(right);
+}
+
+function jsGcd(left: number, right: number): number {
+  let a = Math.abs(Math.trunc(left));
+  let b = Math.abs(Math.trunc(right));
+
+  while (b !== 0) {
+    const next = a % b;
+    a = b;
+    b = next;
+  }
+
+  return a;
+}
+
+function jsLcm(left: number, right: number): number {
+  const a = Math.abs(Math.trunc(left));
+  const b = Math.abs(Math.trunc(right));
+
+  if (a === 0 || b === 0) {
+    return 0;
+  }
+
+  return (a / jsGcd(a, b)) * b;
+}
+
+function roundExactRational(numerator: bigint, denominator: bigint): bigint {
+  const quotient = numerator / denominator;
+  const remainder = numerator % denominator;
+  const doubledRemainder = bigintAbs(remainder) * 2n;
+
+  if (doubledRemainder < denominator) {
+    return quotient;
+  }
+
+  if (doubledRemainder > denominator) {
+    return quotient + (numerator >= 0n ? 1n : -1n);
+  }
+
+  if (quotient % 2n === 0n) {
+    return quotient;
+  }
+
+  return quotient + (numerator >= 0n ? 1n : -1n);
+}
+
+function roundToEven(value: number): number {
+  if (!Number.isFinite(value)) {
+    return value;
+  }
+
+  const truncated = Math.trunc(value);
+  const fractional = Math.abs(value - truncated);
+
+  if (fractional < 0.5) {
+    return truncated;
+  }
+
+  if (fractional > 0.5) {
+    return truncated + (value >= 0 ? 1 : -1);
+  }
+
+  if (truncated % 2 === 0) {
+    return truncated;
+  }
+
+  return truncated + (value >= 0 ? 1 : -1);
+}
+
+function applyError(args: RuntimeValue[]): never {
+  if (args.length === 0) {
+    throw new EvalError('error');
+  }
+
+  throw new EvalError(args.map((arg) => formatDisplayValue(arg)).join(' '));
 }
 
 function attachPosition(error: unknown, pos: SourcePos): EvalError {
