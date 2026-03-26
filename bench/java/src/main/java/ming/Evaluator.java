@@ -123,11 +123,26 @@ public class Evaluator {
                 case "cond" -> {
                     return evalCond(list, env);
                 }
+                case "define-syntax" -> {
+                    if (list.size() != 3) throw new EvalError("define-syntax: bad syntax");
+                    if (!(list.get(1) instanceof String name) || name.startsWith("\""))
+                        throw new EvalError("define-syntax: expected name");
+                    Object transformer = list.get(2);
+                    if (!(transformer instanceof List<?> trList) || trList.isEmpty()
+                            || !"syntax-rules".equals(trList.get(0)))
+                        throw new EvalError("define-syntax: expected syntax-rules");
+                    SyntaxRules sr = SyntaxRules.parse(trList, env);
+                    env.define(name, sr);
+                    return null;
+                }
             }
         }
 
-        // Function application
+        // Function application (or macro expansion)
         Object func = eval(first, env);
+        if (func instanceof SyntaxRules sr) {
+            return sr.expand(list, env);
+        }
         List<Object> args = new ArrayList<>();
         for (int i = 1; i < list.size(); i++) {
             args.add(eval(list.get(i), env));
