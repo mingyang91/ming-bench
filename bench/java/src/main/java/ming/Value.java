@@ -8,7 +8,8 @@ import java.util.Map;
 
 sealed interface Value permits IntValue, RationalValue, InexactValue,
         BoolValue, StringValue, CharValue, SymbolValue,
-        PairValue, RecordValue, EmptyListValue, VoidValue, ProcedureValue {
+        PairValue, VectorValue, RecordValue, EmptyListValue, VoidValue,
+        UninitializedValue, ProcedureValue {
     String render();
 }
 
@@ -141,6 +142,39 @@ record PairValue(Value car, Value cdr) implements Value {
     }
 }
 
+final class VectorValue implements Value {
+    private final List<Value> elements;
+
+    VectorValue(List<Value> elements) {
+        this.elements = new ArrayList<>(elements);
+    }
+
+    int length() {
+        return elements.size();
+    }
+
+    Value element(int index) {
+        return elements.get(index);
+    }
+
+    void setElement(int index, Value value) {
+        elements.set(index, value);
+    }
+
+    List<Value> elements() {
+        return List.copyOf(elements);
+    }
+
+    @Override
+    public String render() {
+        StringBuilder builder = new StringBuilder();
+        builder.append("#(");
+        ValueFormatting.appendVectorContents(builder, elements);
+        builder.append(')');
+        return builder.toString();
+    }
+}
+
 final class RecordType {
     private final String name;
     private final List<String> fieldNames;
@@ -217,6 +251,15 @@ enum VoidValue implements Value {
     @Override
     public String render() {
         return "#<void>";
+    }
+}
+
+enum UninitializedValue implements Value {
+    INSTANCE;
+
+    @Override
+    public String render() {
+        return "#<uninitialized>";
     }
 }
 
@@ -351,5 +394,14 @@ final class ValueFormatting {
             }
         }
         return builder.toString();
+    }
+
+    static void appendVectorContents(StringBuilder builder, List<Value> elements) {
+        for (int index = 0; index < elements.size(); index++) {
+            if (index > 0) {
+                builder.append(' ');
+            }
+            builder.append(elements.get(index).render());
+        }
     }
 }

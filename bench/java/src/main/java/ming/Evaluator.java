@@ -3,7 +3,6 @@ package ming;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 
 /**
  * Scheme interpreter entry point.
@@ -26,7 +25,7 @@ public class Evaluator {
     };
 
     public Evaluator() {
-        globalEnv = createGlobalEnv();
+        globalEnv = GlobalEnvironmentFactory.create(this);
     }
 
     /**
@@ -69,246 +68,17 @@ public class Evaluator {
         return new EvalResult(result.render(), output.toString());
     }
 
-    private Environment createGlobalEnv() {
-        Environment env = new Environment(null);
-
-        env.define("+", builtin("+", this::addNumbers));
-        env.define("-", builtin("-", this::subtractNumbers));
-        env.define("*", builtin("*", this::multiplyNumbers));
-        env.define("/", builtin("/", this::divideNumbers));
-        env.define("abs", builtin("abs", this::absBuiltin));
-        env.define("quotient", builtin("quotient", args -> new IntValue(quotient(args))));
-        env.define("remainder", builtin("remainder", args -> new IntValue(remainder(args))));
-        env.define("modulo", builtin("modulo", args -> new IntValue(modulo(args))));
-        env.define("min", builtin("min", this::minBuiltin));
-        env.define("max", builtin("max", this::maxBuiltin));
-        env.define("expt", builtin("expt", args -> new IntValue(expt(args))));
-        env.define("<", builtin("<",
-                args -> BoolValue.of(compareIncreasing(args, Comparison.STRICTLY_LESS))));
-        env.define(">", builtin(">",
-                args -> BoolValue.of(compareIncreasing(args, Comparison.STRICTLY_GREATER))));
-        env.define("=", builtin("=",
-                args -> BoolValue.of(compareIncreasing(args, Comparison.EQUAL))));
-        env.define("<=", builtin("<=",
-                args -> BoolValue.of(compareIncreasing(args, Comparison.LESS_OR_EQUAL))));
-        env.define("not", builtin("not", args -> {
-            requireArity("not", args.size(), 1);
-            return BoolValue.of(!isTruthy(args.getFirst()));
-        }));
-        env.define("cons", builtin("cons", args -> {
-            requireArity("cons", args.size(), 2);
-            return new PairValue(args.get(0), args.get(1));
-        }));
-        env.define("car", builtin("car", args -> {
-            requireArity("car", args.size(), 1);
-            return expectPair(args.getFirst()).car();
-        }));
-        env.define("cdr", builtin("cdr", args -> {
-            requireArity("cdr", args.size(), 1);
-            return expectPair(args.getFirst()).cdr();
-        }));
-        env.define("null?", builtin("null?", args -> {
-            requireArity("null?", args.size(), 1);
-            return BoolValue.of(args.getFirst() instanceof EmptyListValue);
-        }));
-        env.define("zero?", builtin("zero?", args -> signPredicate("zero?", args, 0)));
-        env.define("positive?", builtin("positive?", args -> signPredicate("positive?", args, 1)));
-        env.define("negative?", builtin("negative?", args -> signPredicate("negative?", args, -1)));
-        env.define("odd?", builtin("odd?", args -> {
-            requireArity("odd?", args.size(), 1);
-            return BoolValue.of(expectInt(args.getFirst()) % 2 != 0);
-        }));
-        env.define("even?", builtin("even?", args -> {
-            requireArity("even?", args.size(), 1);
-            return BoolValue.of(expectInt(args.getFirst()) % 2 == 0);
-        }));
-        env.define("list", builtin("list", this::makeList));
-        env.define("length", builtin("length", args -> {
-            requireArity("length", args.size(), 1);
-            return new IntValue(lengthOfList(args.getFirst()));
-        }));
-        env.define("list-ref", builtin("list-ref", this::listRef));
-        env.define("list-tail", builtin("list-tail", this::listTailBuiltin));
-        env.define("list?", builtin("list?", args -> {
-            requireArity("list?", args.size(), 1);
-            return BoolValue.of(isProperList(args.getFirst()));
-        }));
-        env.define("append", builtin("append", this::appendLists));
-        env.define("apply", builtin("apply", this::applyBuiltin));
-        env.define("map", builtin("map", this::mapBuiltin));
-        env.define("eq?", builtin("eq?", args -> {
-            requireArity("eq?", args.size(), 2);
-            return BoolValue.of(isEq(args.get(0), args.get(1)));
-        }));
-        env.define("equal?", builtin("equal?", args -> {
-            requireArity("equal?", args.size(), 2);
-            return BoolValue.of(isEqual(args.get(0), args.get(1)));
-        }));
-        env.define("assoc", builtin("assoc", this::assocBuiltin));
-        env.define("string?", builtin("string?",
-                args -> typePredicate("string?", args, value -> value instanceof StringValue)));
-        env.define("number?", builtin("number?",
-                args -> typePredicate("number?", args, NumericSupport::isNumber)));
-        env.define("boolean?", builtin("boolean?",
-                args -> typePredicate("boolean?", args, value -> value instanceof BoolValue)));
-        env.define("pair?", builtin("pair?",
-                args -> typePredicate("pair?", args, value -> value instanceof PairValue)));
-        env.define("symbol?", builtin("symbol?",
-                args -> typePredicate("symbol?", args, value -> value instanceof SymbolValue)));
-        env.define("procedure?", builtin("procedure?", args -> {
-            requireArity("procedure?", args.size(), 1);
-            return BoolValue.of(args.getFirst() instanceof ProcedureValue);
-        }));
-        env.define("integer?", builtin("integer?",
-                args -> typePredicate("integer?", args, NumericSupport::isInteger)));
-        env.define("rational?", builtin("rational?",
-                args -> typePredicate("rational?", args, NumericSupport::isRational)));
-        env.define("exact?", builtin("exact?",
-                args -> typePredicate("exact?", args, NumericSupport::isExact)));
-        env.define("inexact?", builtin("inexact?",
-                args -> typePredicate("inexact?", args, NumericSupport::isInexact)));
-        env.define("display", builtin("display", args -> {
-            requireArity("display", args.size(), 1);
-            appendOutput(renderForDisplay(args.getFirst()));
-            return VoidValue.INSTANCE;
-        }));
-        env.define("write", builtin("write", args -> {
-            requireArity("write", args.size(), 1);
-            appendOutput(args.getFirst().render());
-            return VoidValue.INSTANCE;
-        }));
-        env.define("newline", builtin("newline", args -> {
-            requireArity("newline", args.size(), 0);
-            appendOutput("\n");
-            return VoidValue.INSTANCE;
-        }));
-        env.define("string-append", builtin("string-append",
-                args -> new StringValue(stringAppend(args))));
-        env.define("string-length", builtin("string-length", args -> {
-            requireArity("string-length", args.size(), 1);
-            return new IntValue(expectString(args.getFirst()).length());
-        }));
-        env.define("substring", builtin("substring", args -> {
-            requireArity("substring", args.size(), 3);
-            String value = expectString(args.get(0));
-            int start = expectIndex(args.get(1), "substring");
-            int end = expectIndex(args.get(2), "substring");
-            if (start > end || end > value.length()) {
-                throw new EvalError("substring indices out of range");
-            }
-            return new StringValue(value.substring(start, end));
-        }));
-        env.define("string->number", builtin("string->number", args -> {
-            requireArity("string->number", args.size(), 1);
-            return stringToNumber(expectString(args.getFirst()));
-        }));
-        env.define("number->string", builtin("number->string", args -> {
-            requireArity("number->string", args.size(), 1);
-            return new StringValue(expectNumber(args.getFirst()).render());
-        }));
-        env.define("symbol->string", builtin("symbol->string", args -> {
-            requireArity("symbol->string", args.size(), 1);
-            return new StringValue(expectSymbol(args.getFirst()));
-        }));
-        env.define("string->symbol", builtin("string->symbol", args -> {
-            requireArity("string->symbol", args.size(), 1);
-            return new SymbolValue(expectString(args.getFirst()));
-        }));
-        env.define("string-ref", builtin("string-ref", args -> {
-            requireArity("string-ref", args.size(), 2);
-            StringValue value = expectStringValue(args.get(0));
-            int index = expectIndex(args.get(1), "string-ref");
-            if (index >= value.length()) {
-                throw new EvalError("string-ref index out of range");
-            }
-            return new CharValue(value.charAt(index));
-        }));
-        env.define("string-copy", builtin("string-copy", args -> {
-            requireArity("string-copy", args.size(), 1);
-            return expectStringValue(args.getFirst()).copy(true);
-        }));
-        env.define("string=?", builtin("string=?",
-                args -> BoolValue.of(compareStrings(args, "string=?", StringComparison.EQUAL))));
-        env.define("string<?", builtin("string<?",
-                args -> BoolValue.of(compareStrings(args, "string<?", StringComparison.LESS))));
-        env.define("string-ci=?", builtin("string-ci=?", args -> {
-            requireAtLeast("string-ci=?", args.size(), 2);
-
-            String previous = expectString(args.getFirst());
-            for (int index = 1; index < args.size(); index++) {
-                String current = expectString(args.get(index));
-                if (!previous.equalsIgnoreCase(current)) {
-                    return BoolValue.FALSE;
-                }
-                previous = current;
-            }
-            return BoolValue.TRUE;
-        }));
-        env.define("string-upcase", builtin("string-upcase", args -> {
-            requireArity("string-upcase", args.size(), 1);
-            return new StringValue(expectString(args.getFirst()).toUpperCase(Locale.ROOT));
-        }));
-        env.define("string-downcase", builtin("string-downcase", args -> {
-            requireArity("string-downcase", args.size(), 1);
-            return new StringValue(expectString(args.getFirst()).toLowerCase(Locale.ROOT));
-        }));
-        env.define("string-set!", builtin("string-set!", args -> {
-            requireArity("string-set!", args.size(), 3);
-            StringValue value = expectStringValue(args.get(0));
-            int index = expectIndex(args.get(1), "string-set!");
-            if (index >= value.length()) {
-                throw new EvalError("string-set! index out of range");
-            }
-            value.setCharAt(index, expectChar(args.get(2)));
-            return VoidValue.INSTANCE;
-        }));
-        env.define("char?", builtin("char?",
-                args -> typePredicate("char?", args, value -> value instanceof CharValue)));
-        env.define("char-alphabetic?", builtin("char-alphabetic?", args -> {
-            requireArity("char-alphabetic?", args.size(), 1);
-            return BoolValue.of(Character.isLetter(expectChar(args.getFirst())));
-        }));
-        env.define("char-numeric?", builtin("char-numeric?", args -> {
-            requireArity("char-numeric?", args.size(), 1);
-            return BoolValue.of(Character.isDigit(expectChar(args.getFirst())));
-        }));
-        env.define("char-upcase", builtin("char-upcase", args -> {
-            requireArity("char-upcase", args.size(), 1);
-            return new CharValue(Character.toUpperCase(expectChar(args.getFirst())));
-        }));
-        env.define("char-downcase", builtin("char-downcase", args -> {
-            requireArity("char-downcase", args.size(), 1);
-            return new CharValue(Character.toLowerCase(expectChar(args.getFirst())));
-        }));
-        env.define("char=?", builtin("char=?",
-                args -> BoolValue.of(compareChars(args, "char=?", CharComparison.EQUAL))));
-        env.define("char<?", builtin("char<?",
-                args -> BoolValue.of(compareChars(args, "char<?", CharComparison.LESS))));
-        env.define("exact->inexact", builtin("exact->inexact", args -> {
-            requireArity("exact->inexact", args.size(), 1);
-            return exactToInexact(expectNumber(args.getFirst()));
-        }));
-        env.define("inexact->exact", builtin("inexact->exact", args -> {
-            requireArity("inexact->exact", args.size(), 1);
-            return NumericSupport.inexactToExact(args.getFirst());
-        }));
-        env.define("numerator", builtin("numerator", this::numeratorBuiltin));
-        env.define("denominator", builtin("denominator", this::denominatorBuiltin));
-
-        return env;
-    }
-
-    private ProcedureValue builtin(String name, BuiltinAction action) {
+    ProcedureValue builtin(String name, BuiltinAction action) {
         return new BuiltinProcedure(name, action);
     }
 
-    private void appendOutput(String text) {
+    void appendOutput(String text) {
         if (activeOutput != null) {
             activeOutput.append(text);
         }
     }
 
-    private String renderForDisplay(Value value) {
+    String renderForDisplay(Value value) {
         if (value instanceof StringValue stringValue) {
             return stringValue.value();
         }
@@ -357,9 +127,13 @@ public class Evaluator {
                 case "case-lambda" -> evalCaseLambda(argExprs, env);
                 case "begin" -> evalBegin(argExprs, env);
                 case "let" -> evalLet(argExprs, env);
+                case "letrec" -> evalLetrec(argExprs, env, false);
+                case "letrec*" -> evalLetrec(argExprs, env, true);
                 case "cond" -> evalCond(argExprs, env);
+                case "case" -> evalCase(argExprs, env);
                 case "and" -> evalAnd(argExprs, env);
                 case "or" -> evalOr(argExprs, env);
+                case "do" -> evalDo(argExprs, env);
                 default -> {
                     MacroBinding macro = env.lookupSyntax(symbolExpr.name());
                     if (macro != null) {
@@ -418,10 +192,16 @@ public class Evaluator {
     }
 
     private Value evalIf(List<Expr> argExprs, Environment env) throws EvalError {
-        requireArity("if", argExprs.size(), 3);
+        if (argExprs.size() < 2 || argExprs.size() > 3) {
+            throw new EvalError(
+                    "wrong number of arguments for if: expected 2 or 3, got " + argExprs.size());
+        }
         Value condition = eval(argExprs.get(0), env);
         if (isTruthy(condition)) {
             return eval(argExprs.get(1), env);
+        }
+        if (argExprs.size() == 2) {
+            return VoidValue.INSTANCE;
         }
         return eval(argExprs.get(2), env);
     }
@@ -540,6 +320,44 @@ public class Evaluator {
         return evalSimpleLet(bindings, body, env);
     }
 
+    private Value evalLetrec(List<Expr> argExprs, Environment env, boolean sequential)
+            throws EvalError {
+        String formName = sequential ? "letrec*" : "letrec";
+        if (argExprs.isEmpty()) {
+            throw new EvalError(formName + " requires bindings and a body");
+        }
+        if (!(argExprs.getFirst() instanceof ListExpr bindingsExpr)) {
+            throw new EvalError(formName + " bindings must be a list");
+        }
+
+        List<LetBinding> bindings = parseBindings(bindingsExpr.elements());
+        List<Expr> body = parseBody(formName, argExprs.subList(1, argExprs.size()));
+
+        Environment letrecEnv = new Environment(env);
+        List<Cell> bindingCells = new ArrayList<>(bindings.size());
+        for (LetBinding binding : bindings) {
+            Cell cell = new Cell(UninitializedValue.INSTANCE);
+            letrecEnv.defineAlias(binding.name(), cell);
+            bindingCells.add(cell);
+        }
+
+        if (sequential) {
+            for (int index = 0; index < bindings.size(); index++) {
+                bindingCells.get(index).set(eval(bindings.get(index).valueExpr(), letrecEnv));
+            }
+        } else {
+            List<Value> values = new ArrayList<>(bindings.size());
+            for (LetBinding binding : bindings) {
+                values.add(eval(binding.valueExpr(), letrecEnv));
+            }
+            for (int index = 0; index < values.size(); index++) {
+                bindingCells.get(index).set(values.get(index));
+            }
+        }
+
+        return evalSequence(body, letrecEnv);
+    }
+
     private Value evalSimpleLet(List<LetBinding> bindings, List<Expr> body, Environment env)
             throws EvalError {
         Environment letEnv = new Environment(env);
@@ -563,6 +381,94 @@ public class Evaluator {
                 new ParameterSpec(parameterNames, null), body, letEnv);
         letEnv.define(name, procedure);
         return procedure.apply(arguments);
+    }
+
+    private Value evalCase(List<Expr> argExprs, Environment env) throws EvalError {
+        if (argExprs.isEmpty()) {
+            throw new EvalError("case requires a key and at least zero clauses");
+        }
+
+        Value key = eval(argExprs.getFirst(), env);
+        for (int index = 1; index < argExprs.size(); index++) {
+            Expr clauseExpr = argExprs.get(index);
+            if (!(clauseExpr instanceof ListExpr clauseList)) {
+                throw new EvalError("case clause must be a list");
+            }
+
+            List<Expr> clause = clauseList.elements();
+            if (clause.isEmpty()) {
+                throw new EvalError("case clause cannot be empty");
+            }
+
+            Expr head = clause.getFirst();
+            if (head instanceof SymbolExpr symbolExpr && symbolExpr.name().equals("else")) {
+                if (index != argExprs.size() - 1) {
+                    throw new EvalError("case else clause must be last");
+                }
+                return evalSequenceOrVoid(clause.subList(1, clause.size()), env);
+            }
+
+            if (!(head instanceof ListExpr datumList)) {
+                throw new EvalError("case clause datums must be a list");
+            }
+
+            for (Expr datumExpr : datumList.elements()) {
+                if (isEqv(key, quoteToValue(datumExpr))) {
+                    return evalSequenceOrVoid(clause.subList(1, clause.size()), env);
+                }
+            }
+        }
+
+        return VoidValue.INSTANCE;
+    }
+
+    private Value evalDo(List<Expr> argExprs, Environment env) throws EvalError {
+        if (argExprs.size() < 2) {
+            throw new EvalError("do requires bindings and a termination clause");
+        }
+        if (!(argExprs.get(0) instanceof ListExpr bindingList)) {
+            throw new EvalError("do bindings must be a list");
+        }
+        if (!(argExprs.get(1) instanceof ListExpr terminationClause)) {
+            throw new EvalError("do termination clause must be a list");
+        }
+
+        List<DoBinding> bindings = parseDoBindings(bindingList.elements());
+        List<Expr> terminationParts = terminationClause.elements();
+        if (terminationParts.isEmpty()) {
+            throw new EvalError("do termination clause requires a test");
+        }
+
+        Environment loopEnv = new Environment(env);
+        List<Cell> bindingCells = new ArrayList<>(bindings.size());
+        for (DoBinding binding : bindings) {
+            Cell cell = new Cell(eval(binding.initExpr(), env));
+            loopEnv.defineAlias(binding.name(), cell);
+            bindingCells.add(cell);
+        }
+
+        List<Expr> body = argExprs.subList(2, argExprs.size());
+        while (true) {
+            if (isTruthy(eval(terminationParts.getFirst(), loopEnv))) {
+                return evalSequenceOrVoid(terminationParts.subList(1, terminationParts.size()),
+                        loopEnv);
+            }
+
+            evalSequenceOrVoid(body, loopEnv);
+
+            List<Value> nextValues = new ArrayList<>(bindings.size());
+            for (int index = 0; index < bindings.size(); index++) {
+                Expr stepExpr = bindings.get(index).stepExpr();
+                if (stepExpr == null) {
+                    nextValues.add(bindingCells.get(index).value());
+                } else {
+                    nextValues.add(eval(stepExpr, loopEnv));
+                }
+            }
+            for (int index = 0; index < nextValues.size(); index++) {
+                bindingCells.get(index).set(nextValues.get(index));
+            }
+        }
     }
 
     private Value evalCond(List<Expr> argExprs, Environment env) throws EvalError {
@@ -679,6 +585,27 @@ public class Evaluator {
             bindings.add(new LetBinding(symbolExpr.name(), parts.get(1)));
         }
         return bindings;
+    }
+
+    private List<DoBinding> parseDoBindings(List<Expr> bindingExprs) throws EvalError {
+        List<DoBinding> bindings = new ArrayList<>(bindingExprs.size());
+        for (Expr bindingExpr : bindingExprs) {
+            if (!(bindingExpr instanceof ListExpr bindingList)) {
+                throw new EvalError("do binding must be a list");
+            }
+
+            List<Expr> parts = bindingList.elements();
+            if (parts.size() < 2 || parts.size() > 3) {
+                throw new EvalError("do binding must contain a name, init, and optional step");
+            }
+            if (!(parts.getFirst() instanceof SymbolExpr symbolExpr)) {
+                throw new EvalError("do binding name must be a symbol");
+            }
+
+            Expr stepExpr = parts.size() == 3 ? parts.get(2) : null;
+            bindings.add(new DoBinding(symbolExpr.name(), parts.get(1), stepExpr));
+        }
+        return List.copyOf(bindings);
     }
 
     private RecordConstructorSpec parseRecordConstructorSpec(Expr constructorExpr)
@@ -812,6 +739,13 @@ public class Evaluator {
         return result;
     }
 
+    private Value evalSequenceOrVoid(List<Expr> exprs, Environment env) throws EvalError {
+        if (exprs.isEmpty()) {
+            return VoidValue.INSTANCE;
+        }
+        return evalSequence(exprs, env);
+    }
+
     Value applyUserProcedure(String displayName, ParameterSpec parameters,
                              List<Expr> body, Environment closureEnv, List<Value> args)
             throws EvalError {
@@ -890,7 +824,7 @@ public class Evaluator {
         return result;
     }
 
-    private Value addNumbers(List<Value> args) throws EvalError {
+    Value addNumbers(List<Value> args) throws EvalError {
         if (containsInexact(args)) {
             double total = 0.0;
             for (Value arg : args) {
@@ -906,7 +840,7 @@ public class Evaluator {
         return NumericSupport.exactToValue(total);
     }
 
-    private Value subtractNumbers(List<Value> args) throws EvalError {
+    Value subtractNumbers(List<Value> args) throws EvalError {
         requireAtLeast("-", args.size(), 1);
 
         if (containsInexact(args)) {
@@ -932,7 +866,7 @@ public class Evaluator {
         return NumericSupport.exactToValue(result);
     }
 
-    private Value multiplyNumbers(List<Value> args) throws EvalError {
+    Value multiplyNumbers(List<Value> args) throws EvalError {
         if (containsInexact(args)) {
             double total = 1.0;
             for (Value arg : args) {
@@ -948,7 +882,7 @@ public class Evaluator {
         return NumericSupport.exactToValue(total);
     }
 
-    private Value divideNumbers(List<Value> args) throws EvalError {
+    Value divideNumbers(List<Value> args) throws EvalError {
         requireAtLeast("/", args.size(), 2);
 
         if (containsInexact(args)) {
@@ -970,7 +904,7 @@ public class Evaluator {
         return NumericSupport.exactToValue(result);
     }
 
-    private Value absBuiltin(List<Value> args) throws EvalError {
+    Value absBuiltin(List<Value> args) throws EvalError {
         requireArity("abs", args.size(), 1);
 
         Value value = expectNumber(args.getFirst());
@@ -985,7 +919,7 @@ public class Evaluator {
         return NumericSupport.exactToValue(fraction);
     }
 
-    private int quotient(List<Value> args) throws EvalError {
+    int quotient(List<Value> args) throws EvalError {
         requireArity("quotient", args.size(), 2);
 
         int dividend = expectInt(args.get(0));
@@ -996,7 +930,7 @@ public class Evaluator {
         return dividend / divisor;
     }
 
-    private int remainder(List<Value> args) throws EvalError {
+    int remainder(List<Value> args) throws EvalError {
         requireArity("remainder", args.size(), 2);
 
         int dividend = expectInt(args.get(0));
@@ -1007,7 +941,7 @@ public class Evaluator {
         return dividend % divisor;
     }
 
-    private int modulo(List<Value> args) throws EvalError {
+    int modulo(List<Value> args) throws EvalError {
         requireArity("modulo", args.size(), 2);
 
         int dividend = expectInt(args.get(0));
@@ -1018,7 +952,7 @@ public class Evaluator {
         return Math.floorMod(dividend, divisor);
     }
 
-    private Value minBuiltin(List<Value> args) throws EvalError {
+    Value minBuiltin(List<Value> args) throws EvalError {
         requireAtLeast("min", args.size(), 1);
 
         Value result = expectNumber(args.getFirst());
@@ -1036,7 +970,7 @@ public class Evaluator {
         return result;
     }
 
-    private Value maxBuiltin(List<Value> args) throws EvalError {
+    Value maxBuiltin(List<Value> args) throws EvalError {
         requireAtLeast("max", args.size(), 1);
 
         Value result = expectNumber(args.getFirst());
@@ -1054,7 +988,7 @@ public class Evaluator {
         return result;
     }
 
-    private int expt(List<Value> args) throws EvalError {
+    int expt(List<Value> args) throws EvalError {
         requireArity("expt", args.size(), 2);
 
         int base = expectInt(args.get(0));
@@ -1070,7 +1004,7 @@ public class Evaluator {
         return result;
     }
 
-    private boolean compareIncreasing(List<Value> args, Comparison comparison)
+    boolean compareIncreasing(List<Value> args, Comparison comparison)
             throws EvalError {
         requireAtLeast(comparison.symbol(), args.size(), 2);
 
@@ -1095,14 +1029,14 @@ public class Evaluator {
         return false;
     }
 
-    private Value expectNumber(Value value) throws EvalError {
+    Value expectNumber(Value value) throws EvalError {
         if (NumericSupport.isNumber(value)) {
             return value;
         }
         throw new EvalError("expected number");
     }
 
-    private int expectInt(Value value) throws EvalError {
+    int expectInt(Value value) throws EvalError {
         BigInteger integer = NumericSupport.expectExactInteger(value);
         try {
             return integer.intValueExact();
@@ -1111,7 +1045,7 @@ public class Evaluator {
         }
     }
 
-    private int expectIndex(Value value, String operationName) throws EvalError {
+    int expectIndex(Value value, String operationName) throws EvalError {
         int index = expectInt(value);
         if (index < 0) {
             throw new EvalError(operationName + " index out of range");
@@ -1119,36 +1053,43 @@ public class Evaluator {
         return index;
     }
 
-    private String expectString(Value value) throws EvalError {
+    String expectString(Value value) throws EvalError {
         return expectStringValue(value).value();
     }
 
-    private StringValue expectStringValue(Value value) throws EvalError {
+    StringValue expectStringValue(Value value) throws EvalError {
         if (value instanceof StringValue stringValue) {
             return stringValue;
         }
         throw new EvalError("expected string");
     }
 
-    private char expectChar(Value value) throws EvalError {
+    char expectChar(Value value) throws EvalError {
         if (value instanceof CharValue charValue) {
             return charValue.value();
         }
         throw new EvalError("expected character");
     }
 
-    private String expectSymbol(Value value) throws EvalError {
+    String expectSymbol(Value value) throws EvalError {
         if (value instanceof SymbolValue symbolValue) {
             return symbolValue.name();
         }
         throw new EvalError("expected symbol");
     }
 
-    private PairValue expectPair(Value value) throws EvalError {
+    PairValue expectPair(Value value) throws EvalError {
         if (value instanceof PairValue pairValue) {
             return pairValue;
         }
         throw new EvalError("expected pair");
+    }
+
+    VectorValue expectVectorValue(Value value) throws EvalError {
+        if (value instanceof VectorValue vectorValue) {
+            return vectorValue;
+        }
+        throw new EvalError("expected vector");
     }
 
     private RecordValue expectRecord(Value value, RecordType recordType) throws EvalError {
@@ -1158,7 +1099,7 @@ public class Evaluator {
         throw new EvalError("expected record of type " + recordType.name());
     }
 
-    private int lengthOfList(Value value) throws EvalError {
+    int lengthOfList(Value value) throws EvalError {
         int length = 0;
         Value current = value;
         while (current instanceof PairValue pairValue) {
@@ -1171,7 +1112,7 @@ public class Evaluator {
         throw new EvalError("expected list");
     }
 
-    private List<Value> listElements(Value value) throws EvalError {
+    List<Value> listElements(Value value) throws EvalError {
         List<Value> elements = new ArrayList<>();
         Value current = value;
         while (current instanceof PairValue pairValue) {
@@ -1184,7 +1125,7 @@ public class Evaluator {
         throw new EvalError("expected list");
     }
 
-    private Value listRef(List<Value> args) throws EvalError {
+    Value listRef(List<Value> args) throws EvalError {
         requireArity("list-ref", args.size(), 2);
 
         int index = expectIndex(args.get(1), "list-ref");
@@ -1202,7 +1143,7 @@ public class Evaluator {
         throw new EvalError("list-ref index out of range");
     }
 
-    private Value listTailBuiltin(List<Value> args) throws EvalError {
+    Value listTailBuiltin(List<Value> args) throws EvalError {
         requireArity("list-tail", args.size(), 2);
         return listTail(args.getFirst(), expectIndex(args.get(1), "list-tail"));
     }
@@ -1221,7 +1162,7 @@ public class Evaluator {
         throw new EvalError("list-tail index out of range");
     }
 
-    private boolean isProperList(Value value) {
+    boolean isProperList(Value value) {
         Value current = value;
         while (current instanceof PairValue pairValue) {
             current = pairValue.cdr();
@@ -1229,7 +1170,45 @@ public class Evaluator {
         return current instanceof EmptyListValue;
     }
 
-    private Value appendLists(List<Value> args) throws EvalError {
+    Value makeVectorBuiltin(List<Value> args) throws EvalError {
+        if (args.size() < 1 || args.size() > 2) {
+            throw new EvalError("wrong number of arguments for make-vector: expected 1 or 2, got "
+                    + args.size());
+        }
+
+        int length = expectIndex(args.getFirst(), "make-vector");
+        Value fill = args.size() == 2 ? args.get(1) : VoidValue.INSTANCE;
+        List<Value> elements = new ArrayList<>(length);
+        for (int index = 0; index < length; index++) {
+            elements.add(fill);
+        }
+        return new VectorValue(elements);
+    }
+
+    Value vectorRefBuiltin(List<Value> args) throws EvalError {
+        requireArity("vector-ref", args.size(), 2);
+
+        VectorValue vector = expectVectorValue(args.getFirst());
+        int index = expectIndex(args.get(1), "vector-ref");
+        if (index >= vector.length()) {
+            throw new EvalError("vector-ref index out of range");
+        }
+        return vector.element(index);
+    }
+
+    Value vectorSetBuiltin(List<Value> args) throws EvalError {
+        requireArity("vector-set!", args.size(), 3);
+
+        VectorValue vector = expectVectorValue(args.getFirst());
+        int index = expectIndex(args.get(1), "vector-set!");
+        if (index >= vector.length()) {
+            throw new EvalError("vector-set! index out of range");
+        }
+        vector.setElement(index, args.get(2));
+        return VoidValue.INSTANCE;
+    }
+
+    Value appendLists(List<Value> args) throws EvalError {
         if (args.isEmpty()) {
             return EmptyListValue.INSTANCE;
         }
@@ -1244,7 +1223,7 @@ public class Evaluator {
         return result;
     }
 
-    private Value applyBuiltin(List<Value> args) throws EvalError {
+    Value applyBuiltin(List<Value> args) throws EvalError {
         requireAtLeast("apply", args.size(), 2);
 
         List<Value> expandedArgs = new ArrayList<>();
@@ -1256,7 +1235,7 @@ public class Evaluator {
         return applyProcedure(args.getFirst(), expandedArgs);
     }
 
-    private Value mapBuiltin(List<Value> args) throws EvalError {
+    Value mapBuiltin(List<Value> args) throws EvalError {
         requireAtLeast("map", args.size(), 2);
 
         Value procedure = args.getFirst();
@@ -1284,7 +1263,7 @@ public class Evaluator {
         return makeList(results);
     }
 
-    private Value assocBuiltin(List<Value> args) throws EvalError {
+    Value assocBuiltin(List<Value> args) throws EvalError {
         requireArity("assoc", args.size(), 2);
 
         Value key = args.get(0);
@@ -1303,7 +1282,7 @@ public class Evaluator {
         throw new EvalError("expected list");
     }
 
-    private String stringAppend(List<Value> args) throws EvalError {
+    String stringAppend(List<Value> args) throws EvalError {
         StringBuilder builder = new StringBuilder();
         for (Value arg : args) {
             builder.append(expectString(arg));
@@ -1311,7 +1290,7 @@ public class Evaluator {
         return builder.toString();
     }
 
-    private Value stringToNumber(String token) {
+    Value stringToNumber(String token) {
         ParsedNumber parsedNumber;
         try {
             parsedNumber = NumericSupport.parseLiteral(token);
@@ -1334,23 +1313,23 @@ public class Evaluator {
         };
     }
 
-    private Value exactToInexact(Value value) throws EvalError {
+    Value exactToInexact(Value value) throws EvalError {
         return new InexactValue(NumericSupport.toDouble(value));
     }
 
-    private Value numeratorBuiltin(List<Value> args) throws EvalError {
+    Value numeratorBuiltin(List<Value> args) throws EvalError {
         requireArity("numerator", args.size(), 1);
         ExactFraction fraction = NumericSupport.toExactFraction(args.getFirst());
         return NumericSupport.integerToValue(fraction.numerator());
     }
 
-    private Value denominatorBuiltin(List<Value> args) throws EvalError {
+    Value denominatorBuiltin(List<Value> args) throws EvalError {
         requireArity("denominator", args.size(), 1);
         ExactFraction fraction = NumericSupport.toExactFraction(args.getFirst());
         return NumericSupport.integerToValue(fraction.denominator());
     }
 
-    private BoolValue signPredicate(String name, List<Value> args, int expectedSign)
+    BoolValue signPredicate(String name, List<Value> args, int expectedSign)
             throws EvalError {
         requireArity(name, args.size(), 1);
 
@@ -1365,7 +1344,7 @@ public class Evaluator {
                 || (expectedSign == -1 && sign < 0));
     }
 
-    private boolean compareChars(List<Value> args, String name, CharComparison comparison)
+    boolean compareChars(List<Value> args, String name, CharComparison comparison)
             throws EvalError {
         requireAtLeast(name, args.size(), 2);
 
@@ -1380,7 +1359,7 @@ public class Evaluator {
         return true;
     }
 
-    private boolean compareStrings(List<Value> args, String name, StringComparison comparison)
+    boolean compareStrings(List<Value> args, String name, StringComparison comparison)
             throws EvalError {
         requireAtLeast(name, args.size(), 2);
 
@@ -1395,7 +1374,7 @@ public class Evaluator {
         return true;
     }
 
-    private boolean isEq(Value left, Value right) throws EvalError {
+    boolean isEq(Value left, Value right) throws EvalError {
         if (left == right) {
             return true;
         }
@@ -1414,7 +1393,11 @@ public class Evaluator {
         return false;
     }
 
-    private boolean isEqual(Value left, Value right) throws EvalError {
+    boolean isEqv(Value left, Value right) throws EvalError {
+        return isEq(left, right);
+    }
+
+    boolean isEqual(Value left, Value right) throws EvalError {
         if (left == right) {
             return true;
         }
@@ -1437,10 +1420,21 @@ public class Evaluator {
             return isEqual(leftPair.car(), rightPair.car())
                     && isEqual(leftPair.cdr(), rightPair.cdr());
         }
+        if (left instanceof VectorValue leftVector && right instanceof VectorValue rightVector) {
+            if (leftVector.length() != rightVector.length()) {
+                return false;
+            }
+            for (int index = 0; index < leftVector.length(); index++) {
+                if (!isEqual(leftVector.element(index), rightVector.element(index))) {
+                    return false;
+                }
+            }
+            return true;
+        }
         return false;
     }
 
-    private Value makeList(List<Value> args) {
+    Value makeList(List<Value> args) {
         Value result = EmptyListValue.INSTANCE;
         for (int index = args.size() - 1; index >= 0; index--) {
             result = new PairValue(args.get(index), result);
@@ -1448,13 +1442,13 @@ public class Evaluator {
         return result;
     }
 
-    private BoolValue typePredicate(String name, List<Value> args, ValuePredicate predicate)
+    BoolValue typePredicate(String name, List<Value> args, ValuePredicate predicate)
             throws EvalError {
         requireArity(name, args.size(), 1);
         return BoolValue.of(predicate.matches(args.getFirst()));
     }
 
-    private void requireArity(String name, int actual, int expected)
+    void requireArity(String name, int actual, int expected)
             throws EvalError {
         if (actual != expected) {
             throw new EvalError(
@@ -1464,7 +1458,7 @@ public class Evaluator {
         }
     }
 
-    private void requireAtLeast(String name, int actual, int minimum)
+    void requireAtLeast(String name, int actual, int minimum)
             throws EvalError {
         if (actual < minimum) {
             throw new EvalError(
@@ -1474,8 +1468,11 @@ public class Evaluator {
         }
     }
 
-    private boolean isTruthy(Value value) {
+    boolean isTruthy(Value value) {
         return !(value instanceof BoolValue boolValue) || boolValue.value();
+    }
+
+    private record DoBinding(String name, Expr initExpr, Expr stepExpr) {
     }
 
 }

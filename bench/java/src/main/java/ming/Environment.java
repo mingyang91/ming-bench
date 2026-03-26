@@ -29,7 +29,11 @@ final class Environment {
     }
 
     Value lookup(String name) throws EvalError {
-        return lookupCell(name).value();
+        Value value = lookupCell(name).value();
+        if (value instanceof UninitializedValue) {
+            throw new EvalError("uninitialized variable: " + name);
+        }
+        return value;
     }
 
     void set(String name, Value value) throws EvalError {

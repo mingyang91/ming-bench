@@ -569,8 +569,9 @@ final class SyntaxRulesMacro implements MacroBinding {
 
     private static boolean isCoreSyntax(String name) {
         return switch (name) {
-            case "define", "define-syntax", "set!", "if", "quote", "lambda", "begin", "let",
-                    "cond", "and", "or", "syntax-rules" -> true;
+            case "define", "define-syntax", "define-record-type", "set!", "if", "quote",
+                    "lambda", "case-lambda", "begin", "let", "letrec", "letrec*", "cond",
+                    "case", "and", "or", "do", "syntax-rules" -> true;
             default -> false;
         };
     }
