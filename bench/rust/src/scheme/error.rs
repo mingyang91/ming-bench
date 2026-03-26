@@ -11,4 +11,6 @@ pub enum EvalError {
     Arity(String),
     #[error("runtime error: {0}")]
     Runtime(String),
+    #[error("step limit exceeded after {0} steps")]
+    StepLimitExceeded(usize),
 }

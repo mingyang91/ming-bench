@@ -642,6 +642,7 @@ fn span_err(span: Span, err: EvalError) -> EvalError {
         EvalError::UnboundVariable(m) => EvalError::UnboundVariable(format!("{m} at {span}")),
         EvalError::Arity(m) => EvalError::Arity(format!("{m} at {span}")),
         EvalError::Runtime(m) => EvalError::Runtime(format!("{m} at {span}")),
+        EvalError::StepLimitExceeded(_) => err,
     }
 }
 
@@ -654,6 +655,10 @@ pub(crate) fn eval(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
 /// last value.  All expressions share one continuation stack, which is
 /// essential for `call/cc` to capture continuations across top-level forms.
 pub(crate) fn eval_seq(exprs: &[Expr], env: &Env) -> Result<Val, EvalError> {
+    eval_seq_limited(exprs, env, None)
+}
+
+fn eval_seq_limited(exprs: &[Expr], env: &Env, max_steps: Option<usize>) -> Result<Val, EvalError> {
     if exprs.is_empty() {
         return Ok(Val::Void);
     }
@@ -662,8 +667,15 @@ pub(crate) fn eval_seq(exprs: &[Expr], env: &Env) -> Result<Val, EvalError> {
         kont.push(KFrame::Seq { rest: exprs[1..].to_vec(), env: env.clone() });
     }
     let mut state = CekState::Eval(exprs[0].clone(), env.clone());
+    let mut steps: usize = 0;
 
     loop {
+        if let Some(limit) = max_steps {
+            if steps >= limit {
+                return Err(EvalError::StepLimitExceeded(steps));
+            }
+        }
+        steps += 1;
         match state {
             CekState::Eval(expr, env) => {
                 state = cek_step(expr, env, &mut kont)?;
@@ -1440,6 +1452,18 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     }
     let env = Env::new();
     let last = eval_seq(&exprs, &env)?;
+    Ok(last.to_string())
+}
+
+/// Evaluate Scheme expressions with a step budget. Each CEK dispatch counts
+/// as one step. Returns an error if the budget is exhausted.
+pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
+    let exprs = parse_all(input)?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse("empty input".into()));
+    }
+    let env = Env::new();
+    let last = eval_seq_limited(&exprs, &env, Some(max_steps))?;
     Ok(last.to_string())
 }
 
