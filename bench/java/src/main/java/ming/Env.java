@@ -2,6 +2,7 @@ package ming;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -108,6 +109,44 @@ class Env {
                 throw new EvalError("cdr: expected pair, got: " + SchemeValue.toStr(args.get(0)));
             return p.cdr;
         }));
+        env.define("set-car!", Builtin.named("set-car!", args -> {
+            requireArgCount("set-car!", args, 2);
+            if (!(args.get(0) instanceof Pair p))
+                throw new EvalError("set-car!: expected pair, got: " + SchemeValue.toStr(args.get(0)));
+            p.car = args.get(1);
+            return null;
+        }));
+        env.define("set-cdr!", Builtin.named("set-cdr!", args -> {
+            requireArgCount("set-cdr!", args, 2);
+            if (!(args.get(0) instanceof Pair p))
+                throw new EvalError("set-cdr!: expected pair, got: " + SchemeValue.toStr(args.get(0)));
+            p.cdr = args.get(1);
+            return null;
+        }));
+        env.define("caar", Builtin.named("caar", args -> {
+            requireArgCount("caar", args, 1);
+            if (!(args.get(0) instanceof Pair p) || !(p.car instanceof Pair pp))
+                throw new EvalError("caar: expected pair of pairs");
+            return pp.car;
+        }));
+        env.define("cadr", Builtin.named("cadr", args -> {
+            requireArgCount("cadr", args, 1);
+            if (!(args.get(0) instanceof Pair p) || !(p.cdr instanceof Pair pp))
+                throw new EvalError("cadr: expected pair");
+            return pp.car;
+        }));
+        env.define("cdar", Builtin.named("cdar", args -> {
+            requireArgCount("cdar", args, 1);
+            if (!(args.get(0) instanceof Pair p) || !(p.car instanceof Pair pp))
+                throw new EvalError("cdar: expected pair of pairs");
+            return pp.cdr;
+        }));
+        env.define("cddr", Builtin.named("cddr", args -> {
+            requireArgCount("cddr", args, 1);
+            if (!(args.get(0) instanceof Pair p) || !(p.cdr instanceof Pair pp))
+                throw new EvalError("cddr: expected pair");
+            return pp.cdr;
+        }));
         env.define("null?", Builtin.named("null?", args -> {
             requireArgCount("null?", args, 1);
             return args.get(0) == SchemeValue.NIL;
@@ -147,6 +186,27 @@ class Env {
             return result;
         }));
 
+        env.define("member", Builtin.named("member", args -> {
+            requireArgCount("member", args, 2);
+            Object key = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof Pair p) {
+                if (schemeEqual(key, p.car)) return lst;
+                lst = p.cdr;
+            }
+            return Boolean.FALSE;
+        }));
+        env.define("reverse", Builtin.named("reverse", args -> {
+            requireArgCount("reverse", args, 1);
+            Object result = SchemeValue.NIL;
+            Object cur = args.get(0);
+            while (cur instanceof Pair p) {
+                result = new Pair(p.car, result);
+                cur = p.cdr;
+            }
+            return result;
+        }));
+
         // apply
         env.define("apply", Builtin.named("apply", args -> {
             if (args.size() < 2) throw new EvalError("apply: need at least 2 arguments");
@@ -162,6 +222,16 @@ class Env {
                 cur = p.cdr;
             }
             return Evaluator.applyProc(func, callArgs);
+        }));
+
+        env.define("error", Builtin.named("error", args -> {
+            if (args.isEmpty()) throw new EvalError("error");
+            StringBuilder sb = new StringBuilder();
+            sb.append(displayStr(args.get(0)));
+            for (int i = 1; i < args.size(); i++) {
+                sb.append(" ").append(SchemeValue.toStr(args.get(i)));
+            }
+            throw new EvalError(sb.toString());
         }));
 
         // Type predicates
@@ -420,11 +490,19 @@ class Env {
         }));
         env.define("list?", Builtin.named("list?", args -> {
             requireArgCount("list?", args, 1);
-            Object cur = args.get(0);
-            while (cur instanceof Pair p) {
-                cur = p.cdr;
+            // Tortoise-and-hare cycle detection
+            Object slow = args.get(0);
+            Object fast = args.get(0);
+            while (fast instanceof Pair fp) {
+                fast = fp.cdr;
+                if (!(fast instanceof Pair fp2)) {
+                    return fast == SchemeValue.NIL;
+                }
+                fast = fp2.cdr;
+                slow = ((Pair) slow).cdr;
+                if (slow == fast) return Boolean.FALSE; // cycle detected
             }
-            return cur == SchemeValue.NIL;
+            return fast == SchemeValue.NIL;
         }));
 
         // L09 — eq? and equal?
@@ -449,6 +527,70 @@ class Env {
                 alist = p.cdr;
             }
             return Boolean.FALSE;
+        }));
+
+        env.define("assv", Builtin.named("assv", args -> {
+            requireArgCount("assv", args, 2);
+            Object key = args.get(0);
+            Object alist = args.get(1);
+            while (alist instanceof Pair p) {
+                if (p.car instanceof Pair entry) {
+                    if (schemeEqv(key, entry.car)) return entry;
+                }
+                alist = p.cdr;
+            }
+            return Boolean.FALSE;
+        }));
+
+        env.define("gcd", Builtin.named("gcd", args -> {
+            if (args.isEmpty()) return 0L;
+            long result = Math.abs(requireLong("gcd", args.get(0)));
+            for (int i = 1; i < args.size(); i++) {
+                result = Rational.gcd(result, Math.abs(requireLong("gcd", args.get(i))));
+            }
+            return result;
+        }));
+        env.define("lcm", Builtin.named("lcm", args -> {
+            if (args.isEmpty()) return 1L;
+            long result = Math.abs(requireLong("lcm", args.get(0)));
+            for (int i = 1; i < args.size(); i++) {
+                long b = Math.abs(requireLong("lcm", args.get(i)));
+                if (result == 0 || b == 0) { result = 0; } else {
+                    result = result / Rational.gcd(result, b) * b;
+                }
+            }
+            return result;
+        }));
+        env.define("truncate", Builtin.named("truncate", args -> {
+            requireArgCount("truncate", args, 1);
+            Object n = requireNumber("truncate", args.get(0));
+            if (n instanceof Long) return n;
+            if (n instanceof Double d) return (Long) ((long) d.doubleValue());
+            if (n instanceof Rational r) return r.num / r.den;
+            return n;
+        }));
+        env.define("round", Builtin.named("round", args -> {
+            requireArgCount("round", args, 1);
+            Object n = requireNumber("round", args.get(0));
+            if (n instanceof Long) return n;
+            if (n instanceof Double d) return Math.round(d);
+            if (n instanceof Rational r) return Math.round(r.toDouble());
+            return n;
+        }));
+        env.define("make-string", Builtin.named("make-string", args -> {
+            if (args.isEmpty() || args.size() > 2) throw new EvalError("make-string: expected 1-2 arguments");
+            int len = (int) requireLong("make-string", args.get(0));
+            char fill = args.size() == 2 ? requireChar("make-string", args.get(1)) : ' ';
+            char[] chars = new char[len];
+            java.util.Arrays.fill(chars, fill);
+            return new MutableString(chars);
+        }));
+        env.define("string", Builtin.named("string", args -> {
+            char[] chars = new char[args.size()];
+            for (int i = 0; i < args.size(); i++) {
+                chars[i] = requireChar("string", args.get(i));
+            }
+            return new MutableString(chars);
         }));
 
         // L09 — Built-in map (multi-list)
@@ -478,6 +620,29 @@ class Env {
                 result = new Pair(results.get(i), result);
             }
             return result;
+        }));
+
+        env.define("for-each", Builtin.named("for-each", args -> {
+            if (args.size() < 2) throw new EvalError("for-each: need at least 2 arguments");
+            Object func = args.get(0);
+            int numLists = args.size() - 1;
+            Object[] cursors = new Object[numLists];
+            for (int i = 0; i < numLists; i++) cursors[i] = args.get(i + 1);
+            while (true) {
+                boolean allPairs = true;
+                for (int i = 0; i < numLists; i++) {
+                    if (!(cursors[i] instanceof Pair)) { allPairs = false; break; }
+                }
+                if (!allPairs) break;
+                List<Object> callArgs = new ArrayList<>();
+                for (int i = 0; i < numLists; i++) {
+                    Pair p = (Pair) cursors[i];
+                    callArgs.add(p.car);
+                    cursors[i] = p.cdr;
+                }
+                Evaluator.applyProc(func, callArgs);
+            }
+            return null;
         }));
 
         // L09 — Character operations
@@ -514,6 +679,18 @@ class Env {
         env.define("string<?", Builtin.named("string<?", args -> {
             requireArgCount("string<?", args, 2);
             return requireString("string<?", args.get(0)).compareTo(requireString("string<?", args.get(1))) < 0;
+        }));
+        env.define("string>?", Builtin.named("string>?", args -> {
+            requireArgCount("string>?", args, 2);
+            return requireString("string>?", args.get(0)).compareTo(requireString("string>?", args.get(1))) > 0;
+        }));
+        env.define("string<=?", Builtin.named("string<=?", args -> {
+            requireArgCount("string<=?", args, 2);
+            return requireString("string<=?", args.get(0)).compareTo(requireString("string<=?", args.get(1))) <= 0;
+        }));
+        env.define("string>=?", Builtin.named("string>=?", args -> {
+            requireArgCount("string>=?", args, 2);
+            return requireString("string>=?", args.get(0)).compareTo(requireString("string>=?", args.get(1))) >= 0;
         }));
         env.define("string-ci=?", Builtin.named("string-ci=?", args -> {
             requireArgCount("string-ci=?", args, 2);
@@ -769,14 +946,21 @@ class Env {
     }
 
     static boolean schemeEqual(Object a, Object b) {
+        return schemeEqualRec(a, b, new IdentityHashMap<>());
+    }
+
+    private static boolean schemeEqualRec(Object a, Object b, IdentityHashMap<Object, Object> seen) {
         if (schemeEq(a, b)) return true;
         if (a instanceof Pair pa && b instanceof Pair pb) {
-            return schemeEqual(pa.car, pb.car) && schemeEqual(pa.cdr, pb.cdr);
+            // Use pair identity of 'a' mapped to 'b' to detect cycles
+            if (seen.get(pa) == pb) return true;
+            seen.put(pa, pb);
+            return schemeEqualRec(pa.car, pb.car, seen) && schemeEqualRec(pa.cdr, pb.cdr, seen);
         }
         if (a instanceof SchemeVector va && b instanceof SchemeVector vb) {
             if (va.data.length != vb.data.length) return false;
             for (int i = 0; i < va.data.length; i++) {
-                if (!schemeEqual(va.data[i], vb.data[i])) return false;
+                if (!schemeEqualRec(va.data[i], vb.data[i], seen)) return false;
             }
             return true;
         }

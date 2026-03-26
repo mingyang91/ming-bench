@@ -179,6 +179,23 @@ public class Evaluator {
                             expr = body.get(body.size() - 1); env = letEnv; continue;
                         }
                     }
+                    case "let*" -> {
+                        if (list.size() < 3) throw new EvalError("let*: bad syntax");
+                        if (!(list.get(1) instanceof List<?> bindings))
+                            throw new EvalError("let*: bindings must be a list");
+                        Env letStarEnv = new Env(env);
+                        for (Object b : bindings) {
+                            if (!(b instanceof List<?> binding) || binding.size() != 2)
+                                throw new EvalError("let*: bad binding");
+                            if (!(binding.get(0) instanceof String name))
+                                throw new EvalError("let*: binding name must be symbol");
+                            letStarEnv.define(name, eval(binding.get(1), letStarEnv));
+                        }
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            eval(list.get(i), letStarEnv);
+                        }
+                        expr = list.get(list.size() - 1); env = letStarEnv; continue;
+                    }
                     case "cond" -> {
                         Object condResult = null;
                         boolean matched = false;
