@@ -16,6 +16,15 @@ function trampoline(b: Bounce): SchemeVal {
   return b.value;
 }
 
+function trampolineWithLimit(b: Bounce, maxSteps: number): SchemeVal {
+  let steps = 0;
+  while (b.tag === 'bounce') {
+    if (++steps > maxSteps) throw new EvalError('step limit exceeded');
+    b = b.fn();
+  }
+  return b.value;
+}
+
 type SchemeVal =
   | { tag: 'number'; value: number; exact?: boolean; pos?: Pos }
   | { tag: 'rational'; num: number; den: number; pos?: Pos }
@@ -2472,6 +2481,18 @@ export function evalStr(input: string): string {
   syntaxBindingsStack = [];
   const env = makeGlobalEnv();
   const result = trampoline(evalBeginK(exprs, env, (v) => done(v)));
+  return display(result);
+}
+
+export function evalStrWithLimit(input: string, maxSteps: number): string {
+  const tokens = tokenize(input);
+  const exprs = parse(tokens);
+  if (exprs.length === 0) throw new EvalError('no expressions');
+  windStack = [];
+  exceptionHandlers = [];
+  syntaxBindingsStack = [];
+  const env = makeGlobalEnv();
+  const result = trampolineWithLimit(evalBeginK(exprs, env, (v) => done(v)), maxSteps);
   return display(result);
 }
 
