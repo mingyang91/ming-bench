@@ -1,3 +1,23 @@
+use std::fmt;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourcePos {
+    pub line: usize,
+    pub col: usize,
+}
+
+impl SourcePos {
+    pub const fn new(line: usize, col: usize) -> Self {
+        Self { line, col }
+    }
+}
+
+impl fmt::Display for SourcePos {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.line, self.col)
+    }
+}
+
 /// Evaluation error type for the Scheme interpreter.
 ///
 /// Agents must add domain-specific variants here. Using `String` as the
@@ -40,4 +60,22 @@ pub enum EvalError {
 
     #[error("integer overflow")]
     IntegerOverflow,
+
+    #[error("{inner} at {position}")]
+    WithPosition {
+        inner: Box<EvalError>,
+        position: SourcePos,
+    },
+}
+
+impl EvalError {
+    pub fn with_position(self, position: SourcePos) -> Self {
+        match self {
+            Self::WithPosition { .. } => self,
+            other => Self::WithPosition {
+                inner: Box::new(other),
+                position,
+            },
+        }
+    }
 }

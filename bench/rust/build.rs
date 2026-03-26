@@ -4,6 +4,7 @@
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::env;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -69,6 +70,36 @@ enum BuildError {
         path: PathBuf,
         source: std::io::Error,
     },
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingEnvVar { name, source } => {
+                write!(f, "missing environment variable {name}: {source}")
+            }
+            Self::ReadTestsJson { path, source } => {
+                write!(f, "failed to read {}: {source}", path.display())
+            }
+            Self::ParseTestsJson { path, source } => {
+                write!(f, "failed to parse {}: {source}", path.display())
+            }
+            Self::ResolveFixturesDir { path, source } => {
+                write!(
+                    f,
+                    "failed to resolve fixtures directory {}: {source}",
+                    path.display()
+                )
+            }
+            Self::WriteGeneratedTests { path, source } => {
+                write!(
+                    f,
+                    "failed to write generated tests {}: {source}",
+                    path.display()
+                )
+            }
+        }
+    }
 }
 
 struct BuildPaths {
