@@ -118,6 +118,7 @@ pub enum Value {
     Lambda(Vec<String>, Option<String>, Vec<Expr>, Env),
     Builtin(String),
     Macro(SyntaxRulesMacro),
+    CaseLambda(Vec<(Vec<String>, Option<String>, Vec<Expr>, Env)>), // clauses: (params, rest, body, env)
     Record(usize, Vec<Value>), // type_id, field values
     Void,
 }
@@ -195,6 +196,7 @@ impl fmt::Display for Value {
                 write!(f, ")")
             }
             Value::Lambda(..) => write!(f, "#<procedure>"),
+            Value::CaseLambda(..) => write!(f, "#<procedure>"),
             Value::Builtin(..) => write!(f, "#<procedure>"),
             Value::Record(_, _) => write!(f, "#<record>"),
             Value::Macro(_) => write!(f, "#<macro>"),
@@ -497,6 +499,36 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         let body = items[2..].to_vec();
                         return Ok(Value::Lambda(params, rest, body, env.clone()));
                     }
+                    "case-lambda" => {
+                        if items.len() < 2 {
+                            return Err(EvalError::Arity("case-lambda requires at least one clause".into()));
+                        }
+                        let mut clauses = Vec::new();
+                        for clause in &items[1..] {
+                            if let ExprKind::List(clause_items) = &clause.kind {
+                                if clause_items.len() < 2 {
+                                    return Err(EvalError::Parse("case-lambda clause requires params and body".into()));
+                                }
+                                let (params, rest) = match &clause_items[0].kind {
+                                    ExprKind::List(ps) => parse_params(ps)?,
+                                    ExprKind::Symbol(s) => (vec![], Some(s.clone())),
+                                    _ => return Err(EvalError::Parse("case-lambda clause params must be a list or symbol".into())),
+                                };
+                                let body = clause_items[1..].to_vec();
+                                clauses.push((params, rest, body, env.clone()));
+                            } else {
+                                return Err(EvalError::Parse("case-lambda clause must be a list".into()));
+                            }
+                        }
+                        return Ok(Value::CaseLambda(clauses));
+                    }
+                    "procedure?" => {
+                        if items.len() != 2 {
+                            return Err(EvalError::Arity("procedure? requires exactly 1 argument".into()));
+                        }
+                        let val = eval(&items[1], env)?;
+                        return Ok(Value::Boolean(matches!(val, Value::Lambda(..) | Value::CaseLambda(..) | Value::Builtin(..))));
+                    }
                     "+" => return eval_add(&items[1..], env),
                     "-" => return eval_sub(&items[1..], env),
                     "*" => return eval_mul(&items[1..], env),
@@ -621,6 +653,31 @@ fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
                 result = eval(expr, &call_env)?;
             }
             Ok(result)
+        }
+        Value::CaseLambda(clauses) => {
+            for (params, rest, body, closure_env) in clauses {
+                let matches = if rest.is_some() {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    let call_env = Env::with_parent(closure_env);
+                    for (p, a) in params.iter().zip(args) {
+                        call_env.set(p.clone(), a.clone());
+                    }
+                    if let Some(rest_name) = rest {
+                        let rest_args = args[params.len()..].to_vec();
+                        call_env.set(rest_name.clone(), Value::List(rest_args));
+                    }
+                    let mut result = Value::Void;
+                    for expr in body {
+                        result = eval(expr, &call_env)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            Err(EvalError::Arity(format!("no matching case-lambda clause for {} args", args.len())))
         }
         Value::Builtin(name) => apply_builtin(name, args),
         other => Err(EvalError::Type(format!("not a procedure: {}", other))),
