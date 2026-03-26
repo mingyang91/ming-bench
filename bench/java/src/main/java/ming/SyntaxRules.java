@@ -50,6 +50,11 @@ class SyntaxRules {
     }
 
     Object expand(List<?> form, Env callEnv) throws EvalError {
+        Object[] result = expandToForm(form, callEnv);
+        return Evaluator.eval(result[0], (Env) result[1]);
+    }
+
+    Object[] expandToForm(List<?> form, Env callEnv) throws EvalError {
         for (Rule rule : rules) {
             Map<String, Object> bindings = new HashMap<>();
             Map<String, List<Object>> ellipsisBindings = new HashMap<>();
@@ -67,7 +72,7 @@ class SyntaxRules {
                     } catch (EvalError e) { /* not bound at def site, skip */ }
                 }
 
-                return Evaluator.eval(expanded, expandEnv);
+                return new Object[] { expanded, expandEnv };
             }
         }
         throw new EvalError("syntax-rules: no matching pattern for " + SchemeValue.toStr(form));
