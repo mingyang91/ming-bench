@@ -1,5 +1,6 @@
 package ming;
 
+import java.util.ArrayList;
 import java.util.List;
 
 interface SchemeValue {
@@ -212,6 +213,56 @@ final class VoidValue implements SchemeValue {
     @Override
     public String render() {
         return "#<void>";
+    }
+}
+
+final class UninitializedValue implements SchemeValue {
+    static final UninitializedValue INSTANCE = new UninitializedValue();
+
+    private UninitializedValue() {
+    }
+
+    @Override
+    public String render() {
+        return "#<uninitialized>";
+    }
+}
+
+final class VectorValue implements SchemeValue {
+    private final List<SchemeValue> elements;
+
+    VectorValue(List<SchemeValue> elements) {
+        this.elements = new ArrayList<>(elements);
+    }
+
+    int length() {
+        return elements.size();
+    }
+
+    SchemeValue ref(int index) {
+        return elements.get(index);
+    }
+
+    void set(int index, SchemeValue value) {
+        elements.set(index, value);
+    }
+
+    List<SchemeValue> elements() {
+        return List.copyOf(elements);
+    }
+
+    @Override
+    public String render() {
+        StringBuilder builder = new StringBuilder();
+        builder.append("#(");
+        for (int index = 0; index < elements.size(); index++) {
+            if (index > 0) {
+                builder.append(' ');
+            }
+            builder.append(elements.get(index).render());
+        }
+        builder.append(')');
+        return builder.toString();
     }
 }
 

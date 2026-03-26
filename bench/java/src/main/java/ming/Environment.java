@@ -21,6 +21,10 @@ final class Environment {
         bindings.put(name, new ValueCell(value));
     }
 
+    void defineUninitialized(String name) {
+        bindings.put(name, new ValueCell(UninitializedValue.INSTANCE));
+    }
+
     void defineMacro(String name, SyntaxRulesMacro macro) {
         MacroCell cell = macros.get(name);
         if (cell != null) {
@@ -54,7 +58,11 @@ final class Environment {
     SchemeValue lookup(String name) throws EvalError {
         ValueCell cell = findValueCell(name);
         if (cell != null) {
-            return cell.get();
+            SchemeValue value = cell.get();
+            if (value instanceof UninitializedValue) {
+                throw new EvalError("uninitialized variable: " + name);
+            }
+            return value;
         }
         throw new EvalError("unbound variable: " + name);
     }

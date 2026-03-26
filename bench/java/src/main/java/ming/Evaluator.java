@@ -109,14 +109,26 @@ public class Evaluator {
             if ("let".equals(name)) {
                 return evalLet(elements, environment);
             }
+            if ("letrec".equals(name)) {
+                return evalLetrec(elements, environment, false);
+            }
+            if ("letrec*".equals(name)) {
+                return evalLetrec(elements, environment, true);
+            }
             if ("quote".equals(name)) {
                 return evalQuote(elements);
+            }
+            if ("case".equals(name)) {
+                return evalCase(elements, environment);
             }
             if ("lambda".equals(name)) {
                 return evalLambda(elements, environment);
             }
             if ("case-lambda".equals(name)) {
                 return evalCaseLambda(elements, environment);
+            }
+            if ("do".equals(name)) {
+                return evalDo(elements, environment);
             }
 
             SyntaxRulesMacro macro = environment.lookupMacro(name);
@@ -399,7 +411,17 @@ public class Evaluator {
         builtins.put("list?", new BuiltinProcedure("list?", Evaluator::applyListPredicate));
         builtins.put("assoc", new BuiltinProcedure("assoc", Evaluator::applyAssoc));
         builtins.put("eq?", new BuiltinProcedure("eq?", Evaluator::applyEq));
+        builtins.put("eqv?", new BuiltinProcedure("eqv?", Evaluator::applyEqv));
         builtins.put("equal?", new BuiltinProcedure("equal?", Evaluator::applyEqual));
+        builtins.put("vector", new BuiltinProcedure("vector", Evaluator::applyVector));
+        builtins.put("make-vector", new BuiltinProcedure("make-vector", Evaluator::applyMakeVector));
+        builtins.put("vector-ref", new BuiltinProcedure("vector-ref", Evaluator::applyVectorRef));
+        builtins.put("vector-set!", new BuiltinProcedure("vector-set!", Evaluator::applyVectorSet));
+        builtins.put("vector-length", new BuiltinProcedure("vector-length", Evaluator::applyVectorLength));
+        builtins.put("vector?", new BuiltinProcedure("vector?", args -> applyPredicate(args, "vector?",
+                value -> value instanceof VectorValue)));
+        builtins.put("vector->list", new BuiltinProcedure("vector->list", Evaluator::applyVectorToList));
+        builtins.put("list->vector", new BuiltinProcedure("list->vector", Evaluator::applyListToVector));
         return Map.copyOf(builtins);
     }
 
@@ -515,6 +537,44 @@ public class Evaluator {
         return evalSequence(body, letEnvironment);
     }
 
+    private SchemeValue evalLetrec(List<SchemeExpression> elements, Environment environment, boolean sequential)
+            throws EvalError {
+        String formName = sequential ? "letrec*" : "letrec";
+        if (elements.size() < 3) {
+            throw new EvalError(formName + ": expected bindings and body");
+        }
+        if (!(elements.get(1) instanceof ListExpression bindingsExpression)) {
+            throw new EvalError(formName + ": expected bindings");
+        }
+
+        List<SchemeExpression> body = elements.subList(2, elements.size());
+        if (body.isEmpty()) {
+            throw new EvalError(formName + ": expected body");
+        }
+
+        List<Binding> bindings = parseBindings(bindingsExpression.elements(), formName);
+        Environment letrecEnvironment = new Environment(environment);
+        for (Binding binding : bindings) {
+            letrecEnvironment.defineUninitialized(binding.name());
+        }
+
+        if (sequential) {
+            for (Binding binding : bindings) {
+                letrecEnvironment.set(binding.name(), eval(binding.valueExpression(), letrecEnvironment));
+            }
+        } else {
+            List<SchemeValue> values = new ArrayList<>(bindings.size());
+            for (Binding binding : bindings) {
+                values.add(eval(binding.valueExpression(), letrecEnvironment));
+            }
+            for (int index = 0; index < bindings.size(); index++) {
+                letrecEnvironment.set(bindings.get(index).name(), values.get(index));
+            }
+        }
+
+        return evalSequence(body, letrecEnvironment);
+    }
+
     private SchemeValue evalNamedLet(String name, List<SchemeExpression> elements, Environment environment)
             throws EvalError {
         if (elements.size() < 4) {
@@ -544,6 +604,43 @@ public class Evaluator {
         return applyLambda(procedure, arguments);
     }
 
+    private SchemeValue evalCase(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() < 3) {
+            throw new EvalError("case: expected key and clauses");
+        }
+
+        SchemeValue key = eval(elements.get(1), environment);
+        for (int index = 2; index < elements.size(); index++) {
+            if (!(elements.get(index) instanceof ListExpression clauseExpression)) {
+                throw new EvalError("case: expected clause");
+            }
+
+            List<SchemeExpression> clause = clauseExpression.elements();
+            if (clause.isEmpty()) {
+                throw new EvalError("case: expected non-empty clause");
+            }
+
+            SchemeExpression head = clause.getFirst();
+            if (head instanceof SymbolExpression symbol && "else".equals(symbol.name())) {
+                if (index != elements.size() - 1) {
+                    throw new EvalError("case: else clause must be last");
+                }
+                return evalClauseBody(clause.subList(1, clause.size()), environment, VoidValue.INSTANCE);
+            }
+
+            if (!(head instanceof ListExpression datumList)) {
+                throw new EvalError("case: expected datum list");
+            }
+
+            for (SchemeExpression datumExpression : datumList.elements()) {
+                if (eqvValues(key, quote(datumExpression))) {
+                    return evalClauseBody(clause.subList(1, clause.size()), environment, VoidValue.INSTANCE);
+                }
+            }
+        }
+        return VoidValue.INSTANCE;
+    }
+
     private SchemeValue evalQuote(List<SchemeExpression> elements) throws EvalError {
         if (elements.size() != 2) {
             throw new EvalError("quote: expected 1 argument");
@@ -564,6 +661,56 @@ public class Evaluator {
                 body,
                 environment
         );
+    }
+
+    private SchemeValue evalDo(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() < 3) {
+            throw new EvalError("do: expected bindings and test clause");
+        }
+        if (!(elements.get(1) instanceof ListExpression bindingsExpression)) {
+            throw new EvalError("do: expected binding list");
+        }
+        if (!(elements.get(2) instanceof ListExpression testClause)) {
+            throw new EvalError("do: expected test clause");
+        }
+        if (testClause.elements().isEmpty()) {
+            throw new EvalError("do: expected non-empty test clause");
+        }
+
+        List<DoBinding> bindings = parseDoBindings(bindingsExpression.elements());
+        List<SchemeValue> initialValues = new ArrayList<>(bindings.size());
+        for (DoBinding binding : bindings) {
+            initialValues.add(eval(binding.initExpression(), environment));
+        }
+
+        Environment doEnvironment = new Environment(environment);
+        for (int index = 0; index < bindings.size(); index++) {
+            doEnvironment.define(bindings.get(index).name(), initialValues.get(index));
+        }
+
+        List<SchemeExpression> terminationClause = testClause.elements();
+        List<SchemeExpression> body = elements.subList(3, elements.size());
+
+        while (true) {
+            if (isTruthy(eval(terminationClause.getFirst(), doEnvironment))) {
+                return evalClauseBody(terminationClause.subList(1, terminationClause.size()),
+                        doEnvironment, VoidValue.INSTANCE);
+            }
+
+            evalSequence(body, doEnvironment);
+
+            List<SchemeValue> nextValues = new ArrayList<>(bindings.size());
+            for (DoBinding binding : bindings) {
+                if (binding.stepExpression() == null) {
+                    nextValues.add(doEnvironment.lookup(binding.name()));
+                } else {
+                    nextValues.add(eval(binding.stepExpression(), doEnvironment));
+                }
+            }
+            for (int index = 0; index < bindings.size(); index++) {
+                doEnvironment.set(bindings.get(index).name(), nextValues.get(index));
+            }
+        }
     }
 
     private SchemeValue evalCaseLambda(List<SchemeExpression> elements, Environment environment) throws EvalError {
@@ -789,6 +936,30 @@ public class Evaluator {
                 throw new EvalError(formName + ": expected binding name");
             }
             bindings.add(new Binding(symbol.name(), binding.get(1)));
+        }
+        return bindings;
+    }
+
+    private List<DoBinding> parseDoBindings(List<SchemeExpression> bindingExpressions) throws EvalError {
+        List<DoBinding> bindings = new ArrayList<>(bindingExpressions.size());
+        for (SchemeExpression bindingExpression : bindingExpressions) {
+            if (!(bindingExpression instanceof ListExpression bindingList)) {
+                throw new EvalError("do: expected binding");
+            }
+
+            List<SchemeExpression> binding = bindingList.elements();
+            if (binding.size() != 2 && binding.size() != 3) {
+                throw new EvalError("do: expected binding with init and optional step");
+            }
+            if (!(binding.getFirst() instanceof SymbolExpression symbol)) {
+                throw new EvalError("do: expected binding name");
+            }
+
+            SchemeExpression stepExpression = null;
+            if (binding.size() == 3) {
+                stepExpression = binding.get(2);
+            }
+            bindings.add(new DoBinding(symbol.name(), binding.get(1), stepExpression));
         }
         return bindings;
     }
@@ -1197,9 +1368,72 @@ public class Evaluator {
         return SchemeValue.booleanValue(eqValues(arguments.get(0), arguments.get(1)));
     }
 
+    private static SchemeValue applyEqv(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 2, "eqv?");
+        return SchemeValue.booleanValue(eqvValues(arguments.get(0), arguments.get(1)));
+    }
+
     private static SchemeValue applyEqual(List<SchemeValue> arguments) throws EvalError {
         requireArgumentCount(arguments, 2, "equal?");
         return SchemeValue.booleanValue(equalValues(arguments.get(0), arguments.get(1)));
+    }
+
+    private static SchemeValue applyVector(List<SchemeValue> arguments) {
+        return new VectorValue(arguments);
+    }
+
+    private static SchemeValue applyMakeVector(List<SchemeValue> arguments) throws EvalError {
+        if (arguments.size() != 1 && arguments.size() != 2) {
+            throw new EvalError("make-vector: expected 1 or 2 arguments");
+        }
+
+        long length = requireIndex(arguments.getFirst(), "make-vector");
+        if (length > Integer.MAX_VALUE) {
+            throw new EvalError("make-vector: length too large");
+        }
+
+        SchemeValue fill = arguments.size() == 2 ? arguments.get(1) : VoidValue.INSTANCE;
+        List<SchemeValue> elements = new ArrayList<>((int) length);
+        for (int index = 0; index < length; index++) {
+            elements.add(fill);
+        }
+        return new VectorValue(elements);
+    }
+
+    private static SchemeValue applyVectorRef(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 2, "vector-ref");
+        VectorValue vector = requireVector(arguments.getFirst(), "vector-ref");
+        long index = requireIndex(arguments.get(1), "vector-ref");
+        if (index >= vector.length()) {
+            throw new EvalError("vector-ref: index out of bounds");
+        }
+        return vector.ref((int) index);
+    }
+
+    private static SchemeValue applyVectorSet(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 3, "vector-set!");
+        VectorValue vector = requireVector(arguments.get(0), "vector-set!");
+        long index = requireIndex(arguments.get(1), "vector-set!");
+        if (index >= vector.length()) {
+            throw new EvalError("vector-set!: index out of bounds");
+        }
+        vector.set((int) index, arguments.get(2));
+        return VoidValue.INSTANCE;
+    }
+
+    private static SchemeValue applyVectorLength(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "vector-length");
+        return new IntValue(requireVector(arguments.getFirst(), "vector-length").length());
+    }
+
+    private static SchemeValue applyVectorToList(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "vector->list");
+        return buildList(requireVector(arguments.getFirst(), "vector->list").elements());
+    }
+
+    private static SchemeValue applyListToVector(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "list->vector");
+        return new VectorValue(requireProperList(arguments.getFirst(), "list->vector"));
     }
 
     private static SchemeValue applyRecordConstructor(
@@ -1361,6 +1595,13 @@ public class Evaluator {
         throw new EvalError(procedure + ": expected pair");
     }
 
+    private static VectorValue requireVector(SchemeValue value, String procedure) throws EvalError {
+        if (value instanceof VectorValue vectorValue) {
+            return vectorValue;
+        }
+        throw new EvalError(procedure + ": expected vector");
+    }
+
     private static long requireIndex(SchemeValue value, String procedure) throws EvalError {
         long index = requireInteger(value, procedure);
         if (index < 0L) {
@@ -1450,12 +1691,27 @@ public class Evaluator {
         return false;
     }
 
+    private static boolean eqvValues(SchemeValue left, SchemeValue right) {
+        return eqValues(left, right);
+    }
+
     private static boolean equalValues(SchemeValue left, SchemeValue right) {
-        if (eqValues(left, right)) {
+        if (eqvValues(left, right)) {
             return true;
         }
         if (left instanceof StringValue leftString && right instanceof StringValue rightString) {
             return leftString.value().equals(rightString.value());
+        }
+        if (left instanceof VectorValue leftVector && right instanceof VectorValue rightVector) {
+            if (leftVector.length() != rightVector.length()) {
+                return false;
+            }
+            for (int index = 0; index < leftVector.length(); index++) {
+                if (!equalValues(leftVector.ref(index), rightVector.ref(index))) {
+                    return false;
+                }
+            }
+            return true;
         }
         if (left instanceof PairValue leftPair && right instanceof PairValue rightPair) {
             return equalValues(leftPair.car(), rightPair.car())
@@ -1504,6 +1760,9 @@ public class Evaluator {
     }
 
     private record Binding(String name, SchemeExpression valueExpression) {
+    }
+
+    private record DoBinding(String name, SchemeExpression initExpression, SchemeExpression stepExpression) {
     }
 
     private record ParameterSpec(List<String> fixedParameters, String restParameter) {
