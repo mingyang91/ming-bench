@@ -1006,6 +1006,30 @@ public class Evaluator {
             if (args.get(0) instanceof SchemePair p) return p.cdr;
             throw new EvalError("cdr: not a pair: " + schemeToString(args.get(0)));
         }));
+        env.define("caar", new BuiltinProc("caar", args -> {
+            requireArgCount("caar", args, 1);
+            if (!(args.get(0) instanceof SchemePair p1)) throw new EvalError("caar: not a pair");
+            if (!(p1.car instanceof SchemePair p2)) throw new EvalError("caar: not a pair");
+            return p2.car;
+        }));
+        env.define("cadr", new BuiltinProc("cadr", args -> {
+            requireArgCount("cadr", args, 1);
+            if (!(args.get(0) instanceof SchemePair p1)) throw new EvalError("cadr: not a pair");
+            if (!(p1.cdr instanceof SchemePair p2)) throw new EvalError("cadr: not a pair");
+            return p2.car;
+        }));
+        env.define("cdar", new BuiltinProc("cdar", args -> {
+            requireArgCount("cdar", args, 1);
+            if (!(args.get(0) instanceof SchemePair p1)) throw new EvalError("cdar: not a pair");
+            if (!(p1.car instanceof SchemePair p2)) throw new EvalError("cdar: not a pair");
+            return p2.cdr;
+        }));
+        env.define("cddr", new BuiltinProc("cddr", args -> {
+            requireArgCount("cddr", args, 1);
+            if (!(args.get(0) instanceof SchemePair p1)) throw new EvalError("cddr: not a pair");
+            if (!(p1.cdr instanceof SchemePair p2)) throw new EvalError("cddr: not a pair");
+            return p2.cdr;
+        }));
         env.define("null?", new BuiltinProc("null?", args -> {
             requireArgCount("null?", args, 1);
             return args.get(0) == NIL;
@@ -1325,6 +1349,45 @@ public class Evaluator {
             return result;
         }));
 
+        // L17: Pair mutation
+        env.define("set-car!", new BuiltinProc("set-car!", args -> {
+            requireArgCount("set-car!", args, 2);
+            if (!(args.get(0) instanceof SchemePair p)) throw new EvalError("set-car!: not a pair: " + schemeToString(args.get(0)));
+            p.car = args.get(1);
+            return null; // void
+        }));
+        env.define("set-cdr!", new BuiltinProc("set-cdr!", args -> {
+            requireArgCount("set-cdr!", args, 2);
+            if (!(args.get(0) instanceof SchemePair p)) throw new EvalError("set-cdr!: not a pair: " + schemeToString(args.get(0)));
+            p.cdr = args.get(1);
+            return null; // void
+        }));
+
+        // L17: for-each
+        env.define("for-each", new BuiltinProc("for-each", args -> {
+            if (args.size() < 2) throw new EvalError("for-each: expected at least 2 arguments");
+            Object proc = args.get(0);
+            List<Object> lists = new ArrayList<>();
+            for (int i = 1; i < args.size(); i++) lists.add(args.get(i));
+            while (true) {
+                boolean done = false;
+                for (Object lst : lists) {
+                    if (!(lst instanceof SchemePair)) { done = true; break; }
+                }
+                if (done) break;
+                List<Object> callArgs = new ArrayList<>();
+                List<Object> newLists = new ArrayList<>();
+                for (Object lst : lists) {
+                    SchemePair p = (SchemePair) lst;
+                    callArgs.add(p.car);
+                    newLists.add(p.cdr);
+                }
+                apply(proc, callArgs);
+                lists = newLists;
+            }
+            return null; // void
+        }));
+
         // L09: Numeric utilities
         env.define("abs", new BuiltinProc("abs", args -> {
             requireArgCount("abs", args, 1);
@@ -1422,11 +1485,36 @@ public class Evaluator {
         }));
         env.define("list?", new BuiltinProc("list?", args -> {
             requireArgCount("list?", args, 1);
-            Object lst = args.get(0);
+            Object slow = args.get(0);
+            Object fast = args.get(0);
+            while (fast instanceof SchemePair pf) {
+                fast = pf.cdr;
+                if (!(fast instanceof SchemePair pf2)) break;
+                fast = pf2.cdr;
+                slow = ((SchemePair) slow).cdr;
+                if (slow == fast) return false; // cycle detected
+            }
+            return fast == NIL;
+        }));
+        env.define("member", new BuiltinProc("member", args -> {
+            requireArgCount("member", args, 2);
+            Object key = args.get(0);
+            Object lst = args.get(1);
             while (lst instanceof SchemePair p) {
+                if (schemeEqual(key, p.car)) return lst;
                 lst = p.cdr;
             }
-            return lst == NIL;
+            return false;
+        }));
+        env.define("reverse", new BuiltinProc("reverse", args -> {
+            requireArgCount("reverse", args, 1);
+            Object result = NIL;
+            Object lst = args.get(0);
+            while (lst instanceof SchemePair p) {
+                result = new SchemePair(p.car, result);
+                lst = p.cdr;
+            }
+            return result;
         }));
         env.define("assoc", new BuiltinProc("assoc", args -> {
             requireArgCount("assoc", args, 2);
@@ -1440,6 +1528,154 @@ public class Evaluator {
             }
             return false;
         }));
+
+        // L17: assq, assv, memq, memv (eq?/eqv?-based variants)
+        env.define("assq", new BuiltinProc("assq", args -> {
+            requireArgCount("assq", args, 2);
+            Object key = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof SchemePair p) {
+                if (p.car instanceof SchemePair entry) {
+                    if (schemeEqv(key, entry.car)) return entry;
+                }
+                lst = p.cdr;
+            }
+            return false;
+        }));
+        env.define("assv", new BuiltinProc("assv", args -> {
+            requireArgCount("assv", args, 2);
+            Object key = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof SchemePair p) {
+                if (p.car instanceof SchemePair entry) {
+                    if (schemeEqv(key, entry.car)) return entry;
+                }
+                lst = p.cdr;
+            }
+            return false;
+        }));
+        env.define("memq", new BuiltinProc("memq", args -> {
+            requireArgCount("memq", args, 2);
+            Object key = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof SchemePair p) {
+                if (schemeEqv(key, p.car)) return lst;
+                lst = p.cdr;
+            }
+            return false;
+        }));
+        env.define("memv", new BuiltinProc("memv", args -> {
+            requireArgCount("memv", args, 2);
+            Object key = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof SchemePair p) {
+                if (schemeEqv(key, p.car)) return lst;
+                lst = p.cdr;
+            }
+            return false;
+        }));
+
+        // L17: Additional numeric builtins
+        env.define("gcd", new BuiltinProc("gcd", args -> {
+            if (args.isEmpty()) return 0L;
+            long result = Math.abs(requireLong(args.get(0), "gcd"));
+            for (int i = 1; i < args.size(); i++) {
+                long b = Math.abs(requireLong(args.get(i), "gcd"));
+                while (b != 0) { long t = b; b = result % b; result = t; }
+            }
+            return result;
+        }));
+        env.define("lcm", new BuiltinProc("lcm", args -> {
+            if (args.isEmpty()) return 1L;
+            long result = Math.abs(requireLong(args.get(0), "lcm"));
+            for (int i = 1; i < args.size(); i++) {
+                long b = Math.abs(requireLong(args.get(i), "lcm"));
+                if (result == 0 || b == 0) { result = 0; } else {
+                    long g = result; long t = b;
+                    while (t != 0) { long tmp = t; t = g % t; g = tmp; }
+                    result = (result / g) * b;
+                }
+            }
+            return result;
+        }));
+        env.define("truncate", new BuiltinProc("truncate", args -> {
+            requireArgCount("truncate", args, 1);
+            Object n = args.get(0);
+            if (n instanceof Long) return n;
+            if (n instanceof SchemeInexact d) return new SchemeInexact((double)(long) d.value);
+            if (n instanceof SchemeRational r) return r.num / r.den;
+            throw new EvalError("truncate: not a number");
+        }));
+        env.define("round", new BuiltinProc("round", args -> {
+            requireArgCount("round", args, 1);
+            Object n = args.get(0);
+            if (n instanceof Long) return n;
+            if (n instanceof SchemeInexact d) return new SchemeInexact((double) Math.round(d.value));
+            if (n instanceof SchemeRational r) return (long) Math.round((double) r.num / r.den);
+            throw new EvalError("round: not a number");
+        }));
+
+        // L17: Additional string builtins
+        env.define("make-string", new BuiltinProc("make-string", args -> {
+            if (args.size() < 1 || args.size() > 2) throw new EvalError("make-string: expected 1 or 2 arguments");
+            int len = (int) requireLong(args.get(0), "make-string");
+            char c = args.size() > 1 && args.get(1) instanceof SchemeChar sc ? sc.value : '\0';
+            StringBuilder sb = new StringBuilder(len);
+            for (int i = 0; i < len; i++) sb.append(c);
+            return new SchemeString(sb.toString(), true);
+        }));
+        env.define("string", new BuiltinProc("string", args -> {
+            StringBuilder sb = new StringBuilder();
+            for (Object a : args) {
+                if (!(a instanceof SchemeChar c)) throw new EvalError("string: not a character");
+                sb.append(c.value);
+            }
+            return new SchemeString(sb.toString(), true);
+        }));
+        env.define("string>?", new BuiltinProc("string>?", args -> {
+            requireArgCount("string>?", args, 2);
+            if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b))
+                throw new EvalError("string>?: not a string");
+            return a.value.compareTo(b.value) > 0;
+        }));
+        env.define("string<=?", new BuiltinProc("string<=?", args -> {
+            requireArgCount("string<=?", args, 2);
+            if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b))
+                throw new EvalError("string<=?: not a string");
+            return a.value.compareTo(b.value) <= 0;
+        }));
+        env.define("string>=?", new BuiltinProc("string>=?", args -> {
+            requireArgCount("string>=?", args, 2);
+            if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b))
+                throw new EvalError("string>=?: not a string");
+            return a.value.compareTo(b.value) >= 0;
+        }));
+
+        // L17: Deep cXXXr operations
+        env.define("caaar", new BuiltinProc("caaar", args -> { requireArgCount("caaar",args,1); return cxr(args.get(0),"caaar","aaa"); }));
+        env.define("caadr", new BuiltinProc("caadr", args -> { requireArgCount("caadr",args,1); return cxr(args.get(0),"caadr","daa"); }));
+        env.define("cadar", new BuiltinProc("cadar", args -> { requireArgCount("cadar",args,1); return cxr(args.get(0),"cadar","ada"); }));
+        env.define("caddr", new BuiltinProc("caddr", args -> { requireArgCount("caddr",args,1); return cxr(args.get(0),"caddr","dda"); }));
+        env.define("cdaar", new BuiltinProc("cdaar", args -> { requireArgCount("cdaar",args,1); return cxr(args.get(0),"cdaar","aad"); }));
+        env.define("cdadr", new BuiltinProc("cdadr", args -> { requireArgCount("cdadr",args,1); return cxr(args.get(0),"cdadr","dad"); }));
+        env.define("cddar", new BuiltinProc("cddar", args -> { requireArgCount("cddar",args,1); return cxr(args.get(0),"cddar","add"); }));
+        env.define("cdddr", new BuiltinProc("cdddr", args -> { requireArgCount("cdddr",args,1); return cxr(args.get(0),"cdddr","ddd"); }));
+        env.define("caaaar", new BuiltinProc("caaaar", args -> { requireArgCount("caaaar",args,1); return cxr(args.get(0),"caaaar","aaaa"); }));
+        env.define("caaadr", new BuiltinProc("caaadr", args -> { requireArgCount("caaadr",args,1); return cxr(args.get(0),"caaadr","daaa"); }));
+        env.define("caadar", new BuiltinProc("caadar", args -> { requireArgCount("caadar",args,1); return cxr(args.get(0),"caadar","adaa"); }));
+        env.define("caaddr", new BuiltinProc("caaddr", args -> { requireArgCount("caaddr",args,1); return cxr(args.get(0),"caaddr","ddaa"); }));
+        env.define("cadaar", new BuiltinProc("cadaar", args -> { requireArgCount("cadaar",args,1); return cxr(args.get(0),"cadaar","aada"); }));
+        env.define("cadadr", new BuiltinProc("cadadr", args -> { requireArgCount("cadadr",args,1); return cxr(args.get(0),"cadadr","dada"); }));
+        env.define("caddar", new BuiltinProc("caddar", args -> { requireArgCount("caddar",args,1); return cxr(args.get(0),"caddar","adda"); }));
+        env.define("cadddr", new BuiltinProc("cadddr", args -> { requireArgCount("cadddr",args,1); return cxr(args.get(0),"cadddr","ddda"); }));
+        env.define("cdaaar", new BuiltinProc("cdaaar", args -> { requireArgCount("cdaaar",args,1); return cxr(args.get(0),"cdaaar","aaad"); }));
+        env.define("cdaadr", new BuiltinProc("cdaadr", args -> { requireArgCount("cdaadr",args,1); return cxr(args.get(0),"cdaadr","daad"); }));
+        env.define("cdadar", new BuiltinProc("cdadar", args -> { requireArgCount("cdadar",args,1); return cxr(args.get(0),"cdadar","adad"); }));
+        env.define("cdaddr", new BuiltinProc("cdaddr", args -> { requireArgCount("cdaddr",args,1); return cxr(args.get(0),"cdaddr","ddad"); }));
+        env.define("cddaar", new BuiltinProc("cddaar", args -> { requireArgCount("cddaar",args,1); return cxr(args.get(0),"cddaar","aadd"); }));
+        env.define("cddadr", new BuiltinProc("cddadr", args -> { requireArgCount("cddadr",args,1); return cxr(args.get(0),"cddadr","dadd"); }));
+        env.define("cdddar", new BuiltinProc("cdddar", args -> { requireArgCount("cdddar",args,1); return cxr(args.get(0),"cdddar","addd"); }));
+        env.define("cddddr", new BuiltinProc("cddddr", args -> { requireArgCount("cddddr",args,1); return cxr(args.get(0),"cddddr","dddd"); }));
 
         // L09: Character operations
         env.define("char-alphabetic?", new BuiltinProc("char-alphabetic?", args -> {
@@ -1827,6 +2063,15 @@ public class Evaluator {
         }
     }
 
+    private Object cxr(Object val, String name, String ops) throws EvalError {
+        Object cur = val;
+        for (int i = 0; i < ops.length(); i++) {
+            if (!(cur instanceof SchemePair p)) throw new EvalError(name + ": not a pair");
+            cur = ops.charAt(i) == 'a' ? p.car : p.cdr;
+        }
+        return cur;
+    }
+
     private boolean schemeEqual(Object a, Object b) {
         if (a == b) return true;
         if (a == null || b == null) return a == b;
@@ -1863,6 +2108,10 @@ public class Evaluator {
     // --- Output ---
 
     private String schemeToString(Object val) {
+        return schemeToString(val, java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
+    }
+
+    private String schemeToString(Object val, java.util.Set<Object> seen) {
         if (val == null) return "void";
         if (val == NIL) return "()";
         if (val instanceof Long l) return l.toString();
@@ -1876,18 +2125,22 @@ public class Evaluator {
         if (val instanceof SchemeString s) return "\"" + s.value + "\"";
         if (val instanceof SchemeSymbol s) return s.name;
         if (val instanceof SchemePair) {
+            if (!seen.add(val)) return "(...)";
             StringBuilder sb = new StringBuilder("(");
             Object cur = val;
             boolean first = true;
             while (cur instanceof SchemePair p) {
-                if (!first) sb.append(" ");
+                if (!first) {
+                    if (!seen.add(cur)) { sb.append(" ..."); break; }
+                    sb.append(" ");
+                }
                 first = false;
-                sb.append(schemeToString(p.car));
+                sb.append(schemeToString(p.car, seen));
                 cur = p.cdr;
             }
-            if (cur != NIL) {
+            if (cur != NIL && !(cur instanceof SchemePair)) {
                 sb.append(" . ");
-                sb.append(schemeToString(cur));
+                sb.append(schemeToString(cur, seen));
             }
             sb.append(")");
             return sb.toString();
@@ -1896,7 +2149,7 @@ public class Evaluator {
             StringBuilder sb = new StringBuilder("(");
             for (int i = 0; i < list.elems.size(); i++) {
                 if (i > 0) sb.append(" ");
-                sb.append(schemeToString(list.elems.get(i)));
+                sb.append(schemeToString(list.elems.get(i), seen));
             }
             sb.append(")");
             return sb.toString();
@@ -1913,10 +2166,11 @@ public class Evaluator {
         if (val instanceof CaseLambda) return "#<procedure>";
         if (val instanceof BuiltinProc) return "#<procedure>";
         if (val instanceof SchemeVector v) {
+            if (!seen.add(v)) return "#(...)";
             StringBuilder sb = new StringBuilder("#(");
             for (int i = 0; i < v.elems.length; i++) {
                 if (i > 0) sb.append(" ");
-                sb.append(schemeToString(v.elems[i]));
+                sb.append(schemeToString(v.elems[i], seen));
             }
             sb.append(")");
             return sb.toString();
@@ -1926,37 +2180,46 @@ public class Evaluator {
     }
 
     private String displayValue(Object val) {
+        return displayValue(val, java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
+    }
+
+    private String displayValue(Object val, java.util.Set<Object> seen) {
         if (val == null) return "void";
         if (val == NIL) return "()";
         if (val instanceof SchemeString s) return s.value;
         if (val instanceof SchemeChar c) return String.valueOf(c.value);
         if (val instanceof SchemePair) {
+            if (!seen.add(val)) return "(...)";
             StringBuilder sb = new StringBuilder("(");
             Object cur = val;
             boolean first = true;
             while (cur instanceof SchemePair p) {
-                if (!first) sb.append(" ");
+                if (!first) {
+                    if (!seen.add(cur)) { sb.append(" ..."); break; }
+                    sb.append(" ");
+                }
                 first = false;
-                sb.append(displayValue(p.car));
+                sb.append(displayValue(p.car, seen));
                 cur = p.cdr;
             }
-            if (cur != NIL) {
+            if (cur != NIL && !(cur instanceof SchemePair)) {
                 sb.append(" . ");
-                sb.append(displayValue(cur));
+                sb.append(displayValue(cur, seen));
             }
             sb.append(")");
             return sb.toString();
         }
         if (val instanceof SchemeVector v) {
+            if (!seen.add(v)) return "#(...)";
             StringBuilder sb = new StringBuilder("#(");
             for (int i = 0; i < v.elems.length; i++) {
                 if (i > 0) sb.append(" ");
-                sb.append(displayValue(v.elems[i]));
+                sb.append(displayValue(v.elems[i], seen));
             }
             sb.append(")");
             return sb.toString();
         }
-        return schemeToString(val);
+        return schemeToString(val, seen);
     }
 
     // --- Data types ---
