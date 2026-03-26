@@ -110,6 +110,14 @@ func (s *mutableString) String() string {
 	return string(s.runes)
 }
 
+type vectorValue struct {
+	elements []any
+}
+
+func newVectorValue(elements []any) *vectorValue {
+	return &vectorValue{elements: append([]any(nil), elements...)}
+}
+
 type pairValue struct {
 	car any
 	cdr any
@@ -247,7 +255,11 @@ func newEnvironment(parent *environment) *environment {
 }
 
 func (e *environment) define(name string, value any) {
-	e.values[name] = &binding{value: value}
+	e.defineBinding(name, &binding{value: value})
+}
+
+func (e *environment) defineBinding(name string, binding *binding) {
+	e.values[name] = binding
 }
 
 func (e *environment) lookupBinding(name string) (*binding, bool) {
@@ -324,6 +336,7 @@ func installBuiltins(env *environment) {
 	for _, name := range []string{
 		"+", "-", "*", "/", "<", ">", "=", "<=", "not",
 		"cons", "car", "cdr", "null?", "list", "length", "append",
+		"vector", "make-vector", "vector?", "vector-length", "vector-ref", "vector-set!", "vector->list",
 		"string?", "number?", "integer?", "rational?", "exact?", "inexact?", "boolean?", "pair?", "symbol?", "procedure?",
 		"apply", "eq?", "equal?",
 		"display", "write", "newline",
@@ -426,12 +439,20 @@ func (i *interpreter) evalList(list *listExpr, env *environment) (any, error) {
 				return i.evalIf(list.elements[1:], operator.pos, env)
 			case "cond":
 				return i.evalCond(list.elements[1:], operator.pos, env)
+			case "case":
+				return i.evalCase(list.elements[1:], operator.pos, env)
+			case "do":
+				return i.evalDo(list.elements[1:], operator.pos, env)
 			case "define":
 				return i.evalDefine(list.elements[1:], operator.pos, env)
 			case "set!":
 				return i.evalSet(list.elements[1:], operator.pos, env)
 			case "let":
 				return i.evalLet(list.elements[1:], operator.pos, env)
+			case "letrec":
+				return i.evalLetRec(list.elements[1:], operator.pos, env, false, "letrec")
+			case "letrec*":
+				return i.evalLetRec(list.elements[1:], operator.pos, env, true, "letrec*")
 			case "quote":
 				return i.evalQuote(list.elements[1:], operator.pos)
 			case "lambda":
@@ -557,6 +578,128 @@ func (i *interpreter) evalCond(args []expr, pos position, env *environment) (any
 	}
 
 	return voidValue{}, nil
+}
+
+func (i *interpreter) evalCase(args []expr, pos position, env *environment) (any, error) {
+	if len(args) == 0 {
+		return nil, newEvalError(pos, "case expects a key and at least 1 clause")
+	}
+
+	key, err := i.eval(args[0], env)
+	if err != nil {
+		return nil, err
+	}
+
+	clauses := args[1:]
+	for index, clauseExpr := range clauses {
+		clause, ok := clauseExpr.(*listExpr)
+		if !ok || len(clause.elements) == 0 {
+			return nil, newEvalError(clauseExpr.exprPos(), "case clauses must be non-empty lists")
+		}
+
+		if symbol, ok := clause.elements[0].(*symbolExpr); ok && symbol.value == "else" {
+			if index != len(clauses)-1 {
+				return nil, newEvalError(symbol.pos, "case else clause must be last")
+			}
+			if len(clause.elements) == 1 {
+				return voidValue{}, nil
+			}
+			return i.evalSequence(clause.elements[1:], env)
+		}
+
+		datumList, ok := clause.elements[0].(*listExpr)
+		if !ok {
+			return nil, newEvalError(clause.elements[0].exprPos(), "case clause datums must be a list")
+		}
+
+		matched := false
+		for _, datumExpr := range datumList.elements {
+			datum, err := datumFromExpr(datumExpr)
+			if err != nil {
+				return nil, err
+			}
+			if eqValues(key, datum) {
+				matched = true
+				break
+			}
+		}
+
+		if matched {
+			if len(clause.elements) == 1 {
+				return voidValue{}, nil
+			}
+			return i.evalSequence(clause.elements[1:], env)
+		}
+	}
+
+	return voidValue{}, nil
+}
+
+func (i *interpreter) evalDo(args []expr, pos position, env *environment) (any, error) {
+	if len(args) < 2 {
+		return nil, newEvalError(pos, "do expects bindings, a termination clause, and an optional body")
+	}
+
+	bindings, err := parseDoBindings(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	termination, ok := args[1].(*listExpr)
+	if !ok || len(termination.elements) == 0 {
+		return nil, newEvalError(args[1].exprPos(), "do termination clause must be a non-empty list")
+	}
+
+	initialValues := make([]any, len(bindings))
+	for index, binding := range bindings {
+		value, err := i.eval(binding.initExpr, env)
+		if err != nil {
+			return nil, err
+		}
+		initialValues[index] = value
+	}
+
+	loopEnv := newEnvironment(env)
+	slots := make([]*binding, len(bindings))
+	for index, spec := range bindings {
+		slot := &binding{value: initialValues[index]}
+		loopEnv.defineBinding(spec.name, slot)
+		slots[index] = slot
+	}
+
+	for {
+		shouldStop, err := i.eval(termination.elements[0], loopEnv)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(shouldStop) {
+			if len(termination.elements) == 1 {
+				return voidValue{}, nil
+			}
+			return i.evalSequence(termination.elements[1:], loopEnv)
+		}
+
+		if _, err := i.evalSequence(args[2:], loopEnv); err != nil {
+			return nil, err
+		}
+
+		nextValues := make([]any, len(bindings))
+		for index, spec := range bindings {
+			if spec.stepExpr == nil {
+				nextValues[index] = slots[index].value
+				continue
+			}
+			value, err := i.eval(spec.stepExpr, loopEnv)
+			if err != nil {
+				return nil, err
+			}
+			nextValues[index] = value
+		}
+
+		for index, value := range nextValues {
+			slots[index].value = value
+		}
+	}
 }
 
 func (i *interpreter) evalDefine(args []expr, pos position, env *environment) (any, error) {
@@ -697,6 +840,49 @@ func (i *interpreter) evalPlainLet(args []expr, _ position, env *environment) (a
 			return nil, err
 		}
 		letEnv.define(binding.name, value)
+	}
+
+	return i.evalSequence(args[1:], letEnv)
+}
+
+func (i *interpreter) evalLetRec(args []expr, pos position, env *environment, sequential bool, formName string) (any, error) {
+	if len(args) < 2 {
+		return nil, newEvalError(pos, "%s expects bindings and a body", formName)
+	}
+
+	bindings, err := parseLetBindings(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	letEnv := newEnvironment(env)
+	slots := make([]*binding, len(bindings))
+	for index, spec := range bindings {
+		slot := &binding{}
+		letEnv.defineBinding(spec.name, slot)
+		slots[index] = slot
+	}
+
+	if sequential {
+		for index, spec := range bindings {
+			value, err := i.eval(spec.valueExpr, letEnv)
+			if err != nil {
+				return nil, err
+			}
+			slots[index].value = value
+		}
+	} else {
+		values := make([]any, len(bindings))
+		for index, spec := range bindings {
+			value, err := i.eval(spec.valueExpr, letEnv)
+			if err != nil {
+				return nil, err
+			}
+			values[index] = value
+		}
+		for index, value := range values {
+			slots[index].value = value
+		}
 	}
 
 	return i.evalSequence(args[1:], letEnv)
@@ -847,6 +1033,12 @@ type letBinding struct {
 	valueExpr expr
 }
 
+type doBinding struct {
+	name     string
+	initExpr expr
+	stepExpr expr
+}
+
 type parameterSpec struct {
 	required []string
 	restName string
@@ -874,6 +1066,39 @@ func parseLetBindings(expression expr) ([]letBinding, error) {
 		bindings = append(bindings, letBinding{
 			name:      name.value,
 			valueExpr: binding.elements[1],
+		})
+	}
+
+	return bindings, nil
+}
+
+func parseDoBindings(expression expr) ([]doBinding, error) {
+	bindingsList, ok := expression.(*listExpr)
+	if !ok {
+		return nil, newEvalError(expression.exprPos(), "do bindings must be a list")
+	}
+
+	bindings := make([]doBinding, 0, len(bindingsList.elements))
+	for _, bindingExpr := range bindingsList.elements {
+		binding, ok := bindingExpr.(*listExpr)
+		if !ok || len(binding.elements) < 2 || len(binding.elements) > 3 {
+			return nil, newEvalError(bindingExpr.exprPos(), "do bindings must contain a name, init, and optional step")
+		}
+
+		name, ok := binding.elements[0].(*symbolExpr)
+		if !ok {
+			return nil, newEvalError(binding.elements[0].exprPos(), "do binding name must be a symbol")
+		}
+
+		var step expr
+		if len(binding.elements) == 3 {
+			step = binding.elements[2]
+		}
+
+		bindings = append(bindings, doBinding{
+			name:     name.value,
+			initExpr: binding.elements[1],
+			stepExpr: step,
 		})
 	}
 
@@ -1422,6 +1647,92 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		}
 		return buildList(results), nil
 
+	case "vector":
+		return newVectorValue(args), nil
+
+	case "make-vector":
+		if len(args) < 1 || len(args) > 2 {
+			return nil, newEvalError(pos, "%s expects 1 or 2 arguments", name)
+		}
+		length, err := expectInt(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		if length < 0 {
+			return nil, newEvalError(pos, "%s expects a non-negative length", name)
+		}
+		fill := any(voidValue{})
+		if len(args) == 2 {
+			fill = args[1]
+		}
+		elements := make([]any, length)
+		for index := range elements {
+			elements[index] = fill
+		}
+		return &vectorValue{elements: elements}, nil
+
+	case "vector?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		_, ok := args[0].(*vectorValue)
+		return ok, nil
+
+	case "vector-length":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		vector, err := expectVector(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return len(vector.elements), nil
+
+	case "vector-ref":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		vector, err := expectVector(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		index, err := expectInt(args[1], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		if index < 0 || index >= len(vector.elements) {
+			return nil, newEvalError(pos, "%s index out of range", name)
+		}
+		return vector.elements[index], nil
+
+	case "vector-set!":
+		if len(args) != 3 {
+			return nil, newEvalError(pos, "%s expects exactly 3 arguments", name)
+		}
+		vector, err := expectVector(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		index, err := expectInt(args[1], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		if index < 0 || index >= len(vector.elements) {
+			return nil, newEvalError(pos, "%s index out of range", name)
+		}
+		vector.elements[index] = args[2]
+		return voidValue{}, nil
+
+	case "vector->list":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		vector, err := expectVector(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return buildList(vector.elements), nil
+
 	case "string?":
 		if len(args) != 1 {
 			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
@@ -1947,11 +2258,17 @@ func eqValues(left, right any) bool {
 	case charValue:
 		r, ok := right.(charValue)
 		return ok && l == r
+	case voidValue:
+		_, ok := right.(voidValue)
+		return ok
 	case emptyList:
 		_, ok := right.(emptyList)
 		return ok
 	case *mutableString:
 		r, ok := right.(*mutableString)
+		return ok && l == r
+	case *vectorValue:
+		r, ok := right.(*vectorValue)
 		return ok && l == r
 	case *pairValue:
 		r, ok := right.(*pairValue)
@@ -2010,12 +2327,26 @@ func equalValues(left, right any) bool {
 	case charValue:
 		r, ok := right.(charValue)
 		return ok && l == r
+	case voidValue:
+		_, ok := right.(voidValue)
+		return ok
 	case emptyList:
 		_, ok := right.(emptyList)
 		return ok
 	case *pairValue:
 		r, ok := right.(*pairValue)
 		return ok && equalValues(l.car, r.car) && equalValues(l.cdr, r.cdr)
+	case *vectorValue:
+		r, ok := right.(*vectorValue)
+		if !ok || len(l.elements) != len(r.elements) {
+			return false
+		}
+		for index := range l.elements {
+			if !equalValues(l.elements[index], r.elements[index]) {
+				return false
+			}
+		}
+		return true
 	case *recordValue:
 		r, ok := right.(*recordValue)
 		return ok && l == r
@@ -2084,6 +2415,14 @@ func expectPair(value any, pos position, procedure string) (*pairValue, error) {
 	return pair, nil
 }
 
+func expectVector(value any, pos position, procedure string) (*vectorValue, error) {
+	vector, ok := value.(*vectorValue)
+	if !ok {
+		return nil, newEvalError(pos, "%s expects a vector", procedure)
+	}
+	return vector, nil
+}
+
 func listElements(value any, pos position, procedure string) ([]any, error) {
 	elements := []any{}
 	for {
@@ -2137,6 +2476,8 @@ func formatValue(value any) string {
 		return formatCharLiteral(rune(v))
 	case emptyList:
 		return "()"
+	case *vectorValue:
+		return formatVector(v)
 	case *pairValue:
 		return formatPair(v)
 	case *recordValue:
@@ -2194,6 +2535,21 @@ func formatPair(pair *pairValue) string {
 			return builder.String()
 		}
 	}
+}
+
+func formatVector(vector *vectorValue) string {
+	var builder strings.Builder
+	builder.WriteString("#(")
+
+	for index, element := range vector.elements {
+		if index > 0 {
+			builder.WriteByte(' ')
+		}
+		builder.WriteString(formatValue(element))
+	}
+
+	builder.WriteByte(')')
+	return builder.String()
 }
 
 func newEvalError(pos position, format string, args ...any) *EvalError {
