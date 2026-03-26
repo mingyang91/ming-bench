@@ -1,6 +1,8 @@
 package ming
 
 import scala.collection.mutable
+import scala.util.boundary
+import scala.util.boundary.break
 
 object Evaluator:
 
@@ -16,63 +18,9 @@ object Evaluator:
   def evalStrWithOutput(input: String): (String, String) =
     throw new EvalError("not implemented")
 
-  private def asLong(v: SchemeVal, op: String): Long = v match
-    case SchemeInt(n) => n
-    case _            => throw new EvalError(s"$op: expected number, got ${v.display}")
-
   private def makeGlobalEnv(): Env =
     val env = new Env(mutable.Map.empty, None)
-
-    env.set("+", SchemeBuiltin("+", args => SchemeInt(args.map(a => asLong(a, "+")).sum)))
-    env.set(
-      "-",
-      SchemeBuiltin(
-        "-",
-        args =>
-          if args.isEmpty then throw new EvalError("-: expected at least 1 argument")
-          else if args.size == 1 then SchemeInt(-asLong(args.head, "-"))
-          else SchemeInt(args.map(a => asLong(a, "-")).reduce(_ - _))
-      )
-    )
-    env.set("*", SchemeBuiltin("*", args => SchemeInt(args.map(a => asLong(a, "*")).product)))
-    env.set(
-      "/",
-      SchemeBuiltin(
-        "/",
-        args =>
-          if args.size < 2 then throw new EvalError("/: expected at least 2 arguments")
-          else
-            val nums = args.map(a => asLong(a, "/"))
-            if nums.tail.exists(_ == 0) then throw new EvalError("/: division by zero")
-            SchemeInt(nums.reduce(_ / _))
-      )
-    )
-
-    def cmp(name: String, op: (Long, Long) => Boolean): SchemeBuiltin =
-      SchemeBuiltin(
-        name,
-        args =>
-          if args.size < 2 then throw new EvalError(s"$name: expected at least 2 arguments")
-          val nums = args.map(a => asLong(a, name))
-          SchemeBool(nums.sliding(2).forall(w => op(w(0), w(1))))
-      )
-
-    env.set("<", cmp("<", _ < _))
-    env.set(">", cmp(">", _ > _))
-    env.set("=", cmp("=", _ == _))
-    env.set("<=", cmp("<=", _ <= _))
-    env.set(">=", cmp(">=", _ >= _))
-
-    env.set(
-      "not",
-      SchemeBuiltin(
-        "not",
-        args =>
-          if args.size != 1 then throw new EvalError("not: expected 1 argument")
-          SchemeBool(isFalsy(args.head))
-      )
-    )
-
+    Builtins.install(env)
     env
 
   private def isFalsy(v: SchemeVal): Boolean = v match
@@ -96,6 +44,9 @@ object Evaluator:
       case Symbol("if")     => evalIf(elems.tail, env)
       case Symbol("quote")  => evalQuote(elems.tail)
       case Symbol("lambda") => evalLambda(elems.tail, env)
+      case Symbol("begin")  => evalBegin(elems.tail, env)
+      case Symbol("let")    => evalLet(elems.tail, env)
+      case Symbol("cond")   => evalCond(elems.tail, env)
       case _ =>
         val op   = eval(elems.head, env)
         val args = elems.tail.map(e => eval(e, env))
@@ -175,3 +126,56 @@ object Evaluator:
         }
         SchemeLambda(params, body, env)
       case _ => throw new EvalError("lambda: bad syntax")
+
+  private def evalBegin(exprs: List[Expr], env: Env): SchemeVal =
+    if exprs.isEmpty then SchemeVoid
+    else
+      var result: SchemeVal = SchemeVoid
+      for expr <- exprs do result = eval(expr, env)
+      result
+
+  private def evalLet(args: List[Expr], env: Env): SchemeVal =
+    args match
+      case Symbol(name) :: SList(bindings) :: body if body.nonEmpty =>
+        val parsed   = parseBindings(bindings, env)
+        val localEnv = new Env(mutable.Map.empty, Some(env))
+        val lambda   = SchemeLambda(parsed.map(_._1), body, localEnv)
+        localEnv.set(name, lambda)
+        applyProc(lambda, parsed.map(_._2))
+      case SList(bindings) :: body if body.nonEmpty =>
+        val localEnv = new Env(mutable.Map.empty, Some(env))
+        for b <- bindings do
+          b match
+            case SList(Symbol(n) :: initExpr :: Nil) =>
+              localEnv.set(n, eval(initExpr, env))
+            case _ => throw new EvalError("let: bad binding")
+        var result: SchemeVal = SchemeVoid
+        for expr <- body do result = eval(expr, localEnv)
+        result
+      case _ => throw new EvalError("let: bad syntax")
+
+  private def parseBindings(
+    bindings: List[Expr],
+    env: Env
+  ): List[(String, SchemeVal)] =
+    bindings.map {
+      case SList(Symbol(n) :: initExpr :: Nil) => (n, eval(initExpr, env))
+      case _                                   => throw new EvalError("let: bad binding")
+    }
+
+  private def evalCond(clauses: List[Expr], env: Env): SchemeVal =
+    boundary:
+      for clause <- clauses do
+        clause match
+          case SList(Symbol("else") :: body) =>
+            break(evalBody(body, env))
+          case SList(test :: body) =>
+            val testVal = eval(test, env)
+            if !isFalsy(testVal) then break(if body.isEmpty then testVal else evalBody(body, env))
+          case _ => throw new EvalError("cond: bad clause")
+      SchemeVoid
+
+  private def evalBody(exprs: List[Expr], env: Env): SchemeVal =
+    var result: SchemeVal = SchemeVoid
+    for expr <- exprs do result = eval(expr, env)
+    result

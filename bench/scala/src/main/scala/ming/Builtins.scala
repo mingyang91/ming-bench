@@ -1,0 +1,161 @@
+package ming
+
+import scala.collection.mutable
+
+private[ming] object Builtins:
+
+  private def asLong(v: SchemeVal, op: String): Long = v match
+    case SchemeInt(n) => n
+    case _            => throw new EvalError(s"$op: expected number, got ${v.display}")
+
+  private def cmp(name: String, op: (Long, Long) => Boolean): SchemeBuiltin =
+    SchemeBuiltin(
+      name,
+      args =>
+        if args.size < 2 then throw new EvalError(s"$name: expected at least 2 arguments")
+        val nums = args.map(a => asLong(a, name))
+        SchemeBool(nums.sliding(2).forall(w => op(w(0), w(1))))
+    )
+
+  private def typeCheck(name: String)(pred: SchemeVal => Boolean): SchemeBuiltin =
+    SchemeBuiltin(
+      name,
+      args =>
+        if args.size != 1 then throw new EvalError(s"$name: expected 1 argument")
+        SchemeBool(pred(args.head))
+    )
+
+  def install(env: Env): Unit =
+    env.set("+", SchemeBuiltin("+", args => SchemeInt(args.map(a => asLong(a, "+")).sum)))
+    env.set(
+      "-",
+      SchemeBuiltin(
+        "-",
+        args =>
+          if args.isEmpty then throw new EvalError("-: expected at least 1 argument")
+          else if args.size == 1 then SchemeInt(-asLong(args.head, "-"))
+          else SchemeInt(args.map(a => asLong(a, "-")).reduce(_ - _))
+      )
+    )
+    env.set("*", SchemeBuiltin("*", args => SchemeInt(args.map(a => asLong(a, "*")).product)))
+    env.set(
+      "/",
+      SchemeBuiltin(
+        "/",
+        args =>
+          if args.size < 2 then throw new EvalError("/: expected at least 2 arguments")
+          else
+            val nums = args.map(a => asLong(a, "/"))
+            if nums.tail.exists(_ == 0) then throw new EvalError("/: division by zero")
+            SchemeInt(nums.reduce(_ / _))
+      )
+    )
+
+    env.set("<", cmp("<", _ < _))
+    env.set(">", cmp(">", _ > _))
+    env.set("=", cmp("=", _ == _))
+    env.set("<=", cmp("<=", _ <= _))
+    env.set(">=", cmp(">=", _ >= _))
+
+    env.set(
+      "not",
+      SchemeBuiltin(
+        "not",
+        args =>
+          if args.size != 1 then throw new EvalError("not: expected 1 argument")
+          SchemeBool(args.head match
+            case SchemeBool(false) => true
+            case _                 => false)
+      )
+    )
+
+    installList(env)
+    installPredicates(env)
+
+  private def installList(env: Env): Unit =
+    env.set(
+      "cons",
+      SchemeBuiltin(
+        "cons",
+        args =>
+          if args.size != 2 then throw new EvalError("cons: expected 2 arguments")
+          args(1) match
+            case SchemeList(elems) => SchemeList(args(0) :: elems)
+            case _                 => throw new EvalError("cons: second argument must be a list")
+      )
+    )
+
+    env.set(
+      "car",
+      SchemeBuiltin(
+        "car",
+        args =>
+          if args.size != 1 then throw new EvalError("car: expected 1 argument")
+          args.head match
+            case SchemeList(h :: _) => h
+            case SchemeList(Nil)    => throw new EvalError("car: empty list")
+            case _                  => throw new EvalError("car: expected pair")
+      )
+    )
+
+    env.set(
+      "cdr",
+      SchemeBuiltin(
+        "cdr",
+        args =>
+          if args.size != 1 then throw new EvalError("cdr: expected 1 argument")
+          args.head match
+            case SchemeList(_ :: t) => SchemeList(t)
+            case SchemeList(Nil)    => throw new EvalError("cdr: empty list")
+            case _                  => throw new EvalError("cdr: expected pair")
+      )
+    )
+
+    env.set(
+      "null?",
+      typeCheck("null?") {
+        case SchemeList(Nil) => true
+        case _               => false
+      }
+    )
+
+    env.set("list", SchemeBuiltin("list", args => SchemeList(args)))
+
+    env.set(
+      "length",
+      SchemeBuiltin(
+        "length",
+        args =>
+          if args.size != 1 then throw new EvalError("length: expected 1 argument")
+          args.head match
+            case SchemeList(elems) => SchemeInt(elems.size.toLong)
+            case _                 => throw new EvalError("length: expected list")
+      )
+    )
+
+    env.set(
+      "append",
+      SchemeBuiltin(
+        "append",
+        args =>
+          val result = args.foldLeft(List.empty[SchemeVal]) { (acc, v) =>
+            v match
+              case SchemeList(elems) => acc ++ elems
+              case _                 => throw new EvalError("append: expected list")
+          }
+          SchemeList(result)
+      )
+    )
+
+  private def installPredicates(env: Env): Unit =
+    env.set("number?", typeCheck("number?") { case _: SchemeInt => true; case _ => false })
+    env.set("string?", typeCheck("string?") { case _: SchemeString => true; case _ => false })
+    env.set("boolean?", typeCheck("boolean?") { case _: SchemeBool => true; case _ => false })
+    env.set(
+      "pair?",
+      typeCheck("pair?") {
+        case SchemeList(_ :: _) => true
+        case _                  => false
+      }
+    )
+    env.set("symbol?", typeCheck("symbol?") { case _: SchemeSymbol => true; case _ => false })

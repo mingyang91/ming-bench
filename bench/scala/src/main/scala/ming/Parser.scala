@@ -9,6 +9,7 @@ private[ming] object Tokenizer:
   case class TClose()             extends Token
   case class TStr(value: String)  extends Token
   case class TAtom(value: String) extends Token
+  case class TQuote()             extends Token
 
   private def readString(input: String, start: Int): (String, Int) =
     var i  = start
@@ -49,8 +50,9 @@ private[ming] object Tokenizer:
         case c if c.isWhitespace => i += 1
         case ';' =>
           while i < input.length && input(i) != '\n' do i += 1
-        case '(' => tokens += TOpen(); i += 1
-        case ')' => tokens += TClose(); i += 1
+        case '('  => tokens += TOpen(); i += 1
+        case ')'  => tokens += TClose(); i += 1
+        case '\'' => tokens += TQuote(); i += 1
         case '"' =>
           val (str, end) = readString(input, i + 1)
           tokens += TStr(str)
@@ -79,6 +81,9 @@ private[ming] object Parser:
       case TOpen() :: rest =>
         val (elems, remaining) = parseList(rest)
         (SList(elems), remaining)
+      case TQuote() :: rest =>
+        val (expr, remaining) = parseExpr(rest)
+        (SList(List(Symbol("quote"), expr)), remaining)
       case TStr(v) :: rest =>
         (StringLit(v), rest)
       case TAtom(v) :: rest =>
