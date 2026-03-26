@@ -61,11 +61,21 @@ pub enum EvalError {
     #[error("integer overflow")]
     IntegerOverflow,
 
+    #[error("expected non-negative exponent, got {value}")]
+    NegativeExponent { value: i64 },
+
     #[error("expected non-negative integer, got {value}")]
     NegativeIndex { value: i64 },
 
     #[error("index out of bounds: index {index}, length {len}")]
     IndexOutOfBounds { index: usize, len: usize },
+
+    #[error("{name} expected lists of equal length, got {expected} and {got}")]
+    LengthMismatch {
+        name: String,
+        expected: usize,
+        got: usize,
+    },
 
     #[error("invalid substring range: start {start}, end {end}, length {len}")]
     InvalidRange {

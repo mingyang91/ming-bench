@@ -43,6 +43,7 @@ enum Value {
     Symbol(String),
     Char(char),
     List(Vec<Value>),
+    ImproperList(Vec<Value>, Box<Value>),
     Procedure(Rc<Procedure>),
     Builtin(Builtin),
     Void,
@@ -80,6 +81,9 @@ enum BuiltinKind {
     Length,
     Append,
     Apply,
+    EqPred,
+    EqualPred,
+    Map,
     StringPred,
     NumberPred,
     BooleanPred,
@@ -99,6 +103,33 @@ enum BuiltinKind {
     StringCopy,
     StringSet,
     CharPred,
+    Abs,
+    Modulo,
+    Remainder,
+    Quotient,
+    Min,
+    Max,
+    Expt,
+    ZeroPred,
+    PositivePred,
+    NegativePred,
+    OddPred,
+    EvenPred,
+    ListRef,
+    ListTail,
+    ListPred,
+    Assoc,
+    CharAlphabeticPred,
+    CharNumericPred,
+    CharUpcase,
+    CharDowncase,
+    CharEqual,
+    CharLessThan,
+    StringEqual,
+    StringLessThan,
+    StringCiEqual,
+    StringUpcase,
+    StringDowncase,
 }
 
 struct Environment {
@@ -119,6 +150,7 @@ impl Value {
             Self::Symbol(_) => "symbol",
             Self::Char(_) => "character",
             Self::List(_) => "list",
+            Self::ImproperList(_, _) => "pair",
             Self::Procedure(_) | Self::Builtin(_) => "procedure",
             Self::Void => "void",
         }
@@ -175,6 +207,7 @@ impl Value {
             Self::Symbol(value) => value.clone(),
             Self::Char(value) => render_char(*value),
             Self::List(items) => render_list(items),
+            Self::ImproperList(items, tail) => render_improper_list(items, tail),
             Self::Procedure(_) | Self::Builtin(_) => "#<procedure>".into(),
             Self::Void => "#<void>".into(),
         }
@@ -186,6 +219,7 @@ impl Value {
             Self::MutableString(value) => value.borrow().iter().collect(),
             Self::Char(value) => value.to_string(),
             Self::List(items) => render_display_list(items),
+            Self::ImproperList(items, tail) => render_display_improper_list(items, tail),
             _ => self.render(),
         }
     }
@@ -221,6 +255,9 @@ impl BuiltinKind {
             Self::Length => "length",
             Self::Append => "append",
             Self::Apply => "apply",
+            Self::EqPred => "eq?",
+            Self::EqualPred => "equal?",
+            Self::Map => "map",
             Self::StringPred => "string?",
             Self::NumberPred => "number?",
             Self::BooleanPred => "boolean?",
@@ -240,6 +277,33 @@ impl BuiltinKind {
             Self::StringCopy => "string-copy",
             Self::StringSet => "string-set!",
             Self::CharPred => "char?",
+            Self::Abs => "abs",
+            Self::Modulo => "modulo",
+            Self::Remainder => "remainder",
+            Self::Quotient => "quotient",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Expt => "expt",
+            Self::ZeroPred => "zero?",
+            Self::PositivePred => "positive?",
+            Self::NegativePred => "negative?",
+            Self::OddPred => "odd?",
+            Self::EvenPred => "even?",
+            Self::ListRef => "list-ref",
+            Self::ListTail => "list-tail",
+            Self::ListPred => "list?",
+            Self::Assoc => "assoc",
+            Self::CharAlphabeticPred => "char-alphabetic?",
+            Self::CharNumericPred => "char-numeric?",
+            Self::CharUpcase => "char-upcase",
+            Self::CharDowncase => "char-downcase",
+            Self::CharEqual => "char=?",
+            Self::CharLessThan => "char<?",
+            Self::StringEqual => "string=?",
+            Self::StringLessThan => "string<?",
+            Self::StringCiEqual => "string-ci=?",
+            Self::StringUpcase => "string-upcase",
+            Self::StringDowncase => "string-downcase",
         }
     }
 }
@@ -525,11 +589,77 @@ fn render_display_list(items: &[Value]) -> String {
     format!("({rendered_items})")
 }
 
+fn render_improper_list(items: &[Value], tail: &Value) -> String {
+    render_dotted_list(items, tail, false)
+}
+
+fn render_display_improper_list(items: &[Value], tail: &Value) -> String {
+    render_dotted_list(items, tail, true)
+}
+
+fn render_dotted_list(items: &[Value], tail: &Value, display: bool) -> String {
+    let mut rendered = String::from("(");
+
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            rendered.push(' ');
+        }
+        rendered.push_str(&render_value(item, display));
+    }
+
+    if !items.is_empty() {
+        rendered.push_str(" . ");
+    }
+    rendered.push_str(&render_value(tail, display));
+    rendered.push(')');
+    rendered
+}
+
+fn render_value(value: &Value, display: bool) -> String {
+    if display {
+        value.render_display()
+    } else {
+        value.render()
+    }
+}
+
 fn render_char(value: char) -> String {
     match value {
         ' ' => "#\\space".into(),
         '\n' => "#\\newline".into(),
         other => format!("#\\{other}"),
+    }
+}
+
+fn values_equal(lhs: &Value, rhs: &Value) -> bool {
+    match (lhs, rhs) {
+        (Value::Integer(lhs), Value::Integer(rhs)) => lhs == rhs,
+        (Value::Boolean(lhs), Value::Boolean(rhs)) => lhs == rhs,
+        (Value::String(lhs), Value::String(rhs)) => lhs == rhs,
+        (Value::String(lhs), Value::MutableString(rhs))
+        | (Value::MutableString(rhs), Value::String(lhs)) => {
+            lhs.chars().eq(rhs.borrow().iter().copied())
+        }
+        (Value::MutableString(lhs), Value::MutableString(rhs)) => *lhs.borrow() == *rhs.borrow(),
+        (Value::Symbol(lhs), Value::Symbol(rhs)) => lhs == rhs,
+        (Value::Char(lhs), Value::Char(rhs)) => lhs == rhs,
+        (Value::List(lhs), Value::List(rhs)) => {
+            lhs.len() == rhs.len()
+                && lhs
+                    .iter()
+                    .zip(rhs.iter())
+                    .all(|(lhs, rhs)| values_equal(lhs, rhs))
+        }
+        (Value::ImproperList(lhs_items, lhs_tail), Value::ImproperList(rhs_items, rhs_tail)) => {
+            lhs_items.len() == rhs_items.len()
+                && lhs_items
+                    .iter()
+                    .zip(rhs_items.iter())
+                    .all(|(lhs, rhs)| values_equal(lhs, rhs))
+                && values_equal(lhs_tail, rhs_tail)
+        }
+        (Value::Void, Value::Void) => true,
+        _ => false,
     }
 }
 
@@ -881,7 +1011,11 @@ fn apply_procedure(procedure: &Procedure, args: &[Value]) -> Result<Value, EvalE
         env_define(&call_env, param.clone(), arg.clone());
     }
     if let Some(rest_param) = &procedure.rest_param {
-        env_define(&call_env, rest_param.clone(), Value::List(args[required..].to_vec()));
+        env_define(
+            &call_env,
+            rest_param.clone(),
+            Value::List(args[required..].to_vec()),
+        );
     }
 
     eval_sequence(&procedure.body, &call_env)
