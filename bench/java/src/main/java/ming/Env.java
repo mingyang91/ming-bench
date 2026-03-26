@@ -18,6 +18,18 @@ class Env {
         bindings.put(name, value);
     }
 
+    void set(String name, Object value) throws EvalError {
+        if (bindings.containsKey(name)) {
+            bindings.put(name, value);
+            return;
+        }
+        if (parent != null) {
+            parent.set(name, value);
+            return;
+        }
+        throw new EvalError("set!: unbound variable: " + name);
+    }
+
     Object lookup(String name) throws EvalError {
         if (bindings.containsKey(name)) return bindings.get(name);
         if (parent != null) return parent.lookup(name);

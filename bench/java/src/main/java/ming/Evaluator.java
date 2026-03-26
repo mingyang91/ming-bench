@@ -85,6 +85,15 @@ public class Evaluator {
                 case "lambda" -> {
                     return evalLambda(list, env);
                 }
+                case "set!" -> {
+                    if (list.size() != 3) throw new EvalError("set!: bad syntax");
+                    Object target = list.get(1);
+                    if (!(target instanceof String name) || name.startsWith("\""))
+                        throw new EvalError("set!: expected variable name");
+                    Object val = eval(list.get(2), env);
+                    env.set(name, val);
+                    return null; // void
+                }
                 case "and" -> {
                     Object result = Boolean.TRUE;
                     for (int i = 1; i < list.size(); i++) {
