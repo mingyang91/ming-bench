@@ -1130,17 +1130,49 @@ public class Evaluator {
         env.define("string-copy", new BuiltinProc("string-copy", args -> {
             requireArgCount("string-copy", args, 1);
             if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-copy: not a string");
-            return new SchemeString(s.value);
+            return new SchemeString(s.value, true);
         }));
         env.define("string-set!", new BuiltinProc("string-set!", args -> {
-            if (args.size() != 3) throw new EvalError("string-set!: expected 3 arguments, got " + args.size());
+            requireArgCount("string-set!", args, 3);
             if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-set!: not a string");
+            if (!s.mutable) throw new EvalError("string-set!: string is immutable");
             int idx = (int) requireLong(args.get(1), "string-set!");
             if (!(args.get(2) instanceof SchemeChar c)) throw new EvalError("string-set!: not a character");
+            if (idx < 0 || idx >= s.value.length()) throw new EvalError("string-set!: index out of range");
             char[] chars = s.value.toCharArray();
             chars[idx] = c.value;
             s.value = new String(chars);
             return null; // void
+        }));
+        env.define("string->list", new BuiltinProc("string->list", args -> {
+            requireArgCount("string->list", args, 1);
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string->list: not a string");
+            Object result = NIL;
+            for (int i = s.value.length() - 1; i >= 0; i--) {
+                result = new SchemePair(new SchemeChar(s.value.charAt(i)), result);
+            }
+            return result;
+        }));
+        env.define("list->string", new BuiltinProc("list->string", args -> {
+            requireArgCount("list->string", args, 1);
+            StringBuilder sb = new StringBuilder();
+            Object cur = args.get(0);
+            while (cur instanceof SchemePair p) {
+                if (!(p.car instanceof SchemeChar c)) throw new EvalError("list->string: not a character");
+                sb.append(c.value);
+                cur = p.cdr;
+            }
+            return new SchemeString(sb.toString());
+        }));
+        env.define("char->integer", new BuiltinProc("char->integer", args -> {
+            requireArgCount("char->integer", args, 1);
+            if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char->integer: not a character");
+            return (long) c.value;
+        }));
+        env.define("integer->char", new BuiltinProc("integer->char", args -> {
+            requireArgCount("integer->char", args, 1);
+            long n = requireLong(args.get(0), "integer->char");
+            return new SchemeChar((char) n);
         }));
         env.define("char?", new BuiltinProc("char?", args -> {
             requireArgCount("char?", args, 1);
@@ -1859,7 +1891,9 @@ public class Evaluator {
     record SchemeSymbol(String name, int line, int col) {}
     static class SchemeString {
         String value;
-        SchemeString(String value) { this.value = value; }
+        boolean mutable;
+        SchemeString(String value) { this.value = value; this.mutable = false; }
+        SchemeString(String value, boolean mutable) { this.value = value; this.mutable = mutable; }
         @Override public boolean equals(Object o) { return o instanceof SchemeString s && value.equals(s.value); }
         @Override public int hashCode() { return value.hashCode(); }
     }
