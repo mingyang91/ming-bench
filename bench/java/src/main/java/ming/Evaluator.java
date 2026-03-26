@@ -53,6 +53,7 @@ public class Evaluator {
             } catch (RaisedException raised) {
                 throw new EvalError("uncaught exception: " + raised.value().render());
             }
+            result = requireSingleValue(result);
             String output = outputBuffer == null ? "" : outputBuffer.toString();
             return new EvalResult(result.render(), output);
         } finally {
@@ -88,15 +89,15 @@ public class Evaluator {
 
     private SchemeValue evalNonTail(SchemeExpression expression, Environment environment) throws EvalError {
         try {
+            SchemeValue value;
             if (expression instanceof LiteralExpression literal) {
-                return literal.value();
+                value = literal.value();
+            } else if (expression instanceof SymbolExpression symbol) {
+                value = environment.lookup(symbol.name());
+            } else {
+                value = evalListNonTail((ListExpression) expression, environment);
             }
-
-            if (expression instanceof SymbolExpression symbol) {
-                return environment.lookup(symbol.name());
-            }
-
-            return evalListNonTail((ListExpression) expression, environment);
+            return requireSingleValue(value);
         } catch (EvalError error) {
             throw error.withPosition(expression.position());
         }
@@ -145,7 +146,10 @@ public class Evaluator {
             ContinuationFrame frame
     ) throws EvalError {
         ContinuationContext savedContinuation = currentContinuation;
-        currentContinuation = new ContinuationContext(frame, savedContinuation);
+        currentContinuation = new ContinuationContext(
+                value -> frame.resume(requireSingleValue(value)),
+                savedContinuation
+        );
         try {
             return evalNonTail(expression, environment);
         } finally {
@@ -693,6 +697,8 @@ public class Evaluator {
         builtins.put("apply", new BuiltinProcedure("apply", this::applyApply));
         builtins.put("map", new BuiltinProcedure("map", this::applyMap));
         builtins.put("for-each", new BuiltinProcedure("for-each", this::applyForEach));
+        builtins.put("values", new BuiltinProcedure("values", Evaluator::applyValues));
+        builtins.put("call-with-values", new BuiltinProcedure("call-with-values", this::applyCallWithValues));
         BuiltinProcedure callWithCurrentContinuation = new BuiltinProcedure(
                 "call/cc",
                 this::applyCallWithCurrentContinuation
@@ -1968,6 +1974,17 @@ public class Evaluator {
         return applyProcedure(thunk, List.of());
     }
 
+    private static SchemeValue applyValues(List<SchemeValue> arguments) {
+        return packValues(arguments);
+    }
+
+    private SchemeValue applyCallWithValues(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 2, "call-with-values");
+
+        SchemeValue produced = applyThunk(arguments.getFirst());
+        return applyProcedure(arguments.get(1), unpackValues(produced));
+    }
+
     private SchemeValue applyCallWithCurrentContinuation(List<SchemeValue> arguments) throws EvalError {
         requireArgumentCount(arguments, 1, "call/cc");
         return applyProcedure(
@@ -2906,6 +2923,27 @@ public class Evaluator {
             return actualCount == requiredCount;
         }
         return actualCount >= requiredCount;
+    }
+
+    private static SchemeValue packValues(List<SchemeValue> values) {
+        if (values.size() == 1) {
+            return values.getFirst();
+        }
+        return new MultiValueValue(values);
+    }
+
+    private static List<SchemeValue> unpackValues(SchemeValue value) {
+        if (value instanceof MultiValueValue multiValue) {
+            return multiValue.values();
+        }
+        return List.of(value);
+    }
+
+    private static SchemeValue requireSingleValue(SchemeValue value) throws EvalError {
+        if (value instanceof MultiValueValue multiValue) {
+            throw new EvalError("expected 1 value, got " + multiValue.values().size());
+        }
+        return value;
     }
 
     private void emit(String text) {

@@ -309,6 +309,23 @@ final class VectorValue implements SchemeValue {
     }
 }
 
+final class MultiValueValue implements SchemeValue {
+    private final List<SchemeValue> values;
+
+    MultiValueValue(List<SchemeValue> values) {
+        this.values = List.copyOf(values);
+    }
+
+    List<SchemeValue> values() {
+        return values;
+    }
+
+    @Override
+    public String render() {
+        return "#<values>";
+    }
+}
+
 @FunctionalInterface
 interface BuiltinImplementation {
     SchemeValue apply(List<SchemeValue> arguments) throws EvalError;
