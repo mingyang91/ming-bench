@@ -94,16 +94,16 @@ type DynamicWindContext = {
 };
 type ExceptionHandlerContext = {
   procedure: RuntimeValue;
-  stack: ContinuationFrame[];
+  stack: StackSnapshot;
   winds: DynamicWindContext[];
-  handlers: ExceptionHandlerContext[];
+  previous: ExceptionHandlerContext | undefined;
   pos: SourcePos;
 };
 type ContinuationProcedure = {
   kind: 'continuation';
-  stack: ContinuationFrame[];
+  stack: StackSnapshot;
   winds: DynamicWindContext[];
-  handlers: ExceptionHandlerContext[];
+  handlers: ExceptionHandlerContext | undefined;
 };
 type MultipleValuesValue = {
   kind: 'multiple-values';
@@ -292,9 +292,9 @@ type DynamicWindAfterFrame = {
   pos: SourcePos;
 };
 type WindTransferTarget = {
-  stack: ContinuationFrame[];
+  stack: StackSnapshot;
   winds: DynamicWindContext[];
-  handlers: ExceptionHandlerContext[];
+  handlers: ExceptionHandlerContext | undefined;
 };
 type WindTransferCompletion =
   | {
@@ -344,6 +344,19 @@ type ContinuationFrame =
   | DynamicWindAfterFrame
   | WindTransferAfterFrame
   | WindTransferBeforeFrame;
+
+type StackSnapshot = {
+  frames: ContinuationFrame[];
+  handlerTargetDepths: number[];
+};
+
+type ContinuationStack = ContinuationFrame[] & {
+  handlerTargetDepths?: number[];
+};
+
+type HandlerState = {
+  current: ExceptionHandlerContext | undefined;
+};
 
 type Token =
   | { kind: 'paren'; value: '(' | ')'; pos: SourcePos }
@@ -909,9 +922,9 @@ function evaluateExprSingle(expr: Expr, env: Environment, context: EvalContext):
 
 function runEvaluation(initialAction: EvalAction, context: EvalContext): RuntimeValue {
   let action = initialAction;
-  const stack: ContinuationFrame[] = [];
+  const stack = createContinuationStack();
   const winds: DynamicWindContext[] = [];
-  const handlers: ExceptionHandlerContext[] = [];
+  const handlerState: HandlerState = { current: undefined };
 
   while (true) {
     let errorPos: SourcePos | undefined;
@@ -924,18 +937,18 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
           }
 
           {
-            const frame = stack.pop();
+            const frame = popStackFrame(stack);
             if (frame === undefined) {
               return action.value;
             }
 
             errorPos = frame.pos;
-            action = continueWithFrame(frame, action.value, stack, winds, handlers);
+            action = continueWithFrame(frame, action.value, stack, winds, handlerState);
           }
           break;
         case 'expr':
           errorPos = action.expr.pos;
-          action = evaluateExprAction(action.expr, action.env, context, stack, winds, handlers);
+          action = evaluateExprAction(action.expr, action.env, context, stack, winds, handlerState);
           break;
         case 'sequence':
           errorPos = action.pos ?? action.exprs[0]?.pos;
@@ -964,9 +977,9 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
               args: [
                 {
                   kind: 'continuation',
-                  stack: stack.slice(),
+                  stack: captureStackSnapshot(stack),
                   winds: winds.slice(),
-                  handlers: handlers.slice(),
+                  handlers: handlerState.current,
                 },
               ],
               pos: action.pos,
@@ -980,7 +993,7 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
             }
 
             const [producer, consumer] = action.args;
-            stack.push({
+            pushStackFrame(stack, {
               kind: 'call-with-values',
               consumer,
               pos: action.pos ?? DEFAULT_SOURCE_POS,
@@ -1000,7 +1013,7 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
             }
 
             const [beforeThunk, bodyThunk, afterThunk] = action.args;
-            stack.push({
+            pushStackFrame(stack, {
               kind: 'dynamic-wind-enter',
               wind: {
                 before: beforeThunk,
@@ -1029,17 +1042,17 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
             const [handlerProcedure, thunk] = action.args;
             const handlerContext: ExceptionHandlerContext = {
               procedure: handlerProcedure,
-              stack: stack.slice(),
+              stack: captureHandlerTargetStackSnapshot(stack),
               winds: winds.slice(),
-              handlers: handlers.slice(),
+              previous: handlerState.current,
               pos: action.pos ?? DEFAULT_SOURCE_POS,
             };
-            stack.push({
+            pushStackFrame(stack, {
               kind: 'exception-handler-return',
               handler: handlerContext,
               pos: handlerContext.pos,
             });
-            handlers.push(handlerContext);
+            handlerState.current = handlerContext;
             action = {
               kind: 'apply',
               procedure: thunk,
@@ -1050,10 +1063,6 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
           }
 
           if (action.procedure.kind === 'continuation') {
-            if (action.args.length !== 1) {
-              throw new EvalError('continuation expects exactly 1 argument');
-            }
-
             const sharedPrefixLength = sharedDynamicWindPrefixLength(winds, action.procedure.winds);
             const exiting = winds.slice(sharedPrefixLength).reverse();
             const entering = action.procedure.winds.slice(sharedPrefixLength);
@@ -1063,7 +1072,7 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
               entering,
               {
                 kind: 'value',
-                value: action.args[0],
+                value: makeValuesResult(action.args),
                 target: {
                   stack: action.procedure.stack,
                   winds: action.procedure.winds,
@@ -1072,7 +1081,7 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
               },
               stack,
               winds,
-              handlers,
+              handlerState,
               action.pos ?? DEFAULT_SOURCE_POS,
             );
             break;
@@ -1087,12 +1096,12 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
           error.pos = errorPos;
         }
 
-        const handlerContext = handlers[handlers.length - 1];
+        const handlerContext = handlerState.current;
         if (handlerContext === undefined) {
           throw new EvalError(`uncaught exception: ${formatValue(error.value)}`, error.pos);
         }
 
-        replaceArrayContents(handlers, handlerContext.handlers);
+        handlerState.current = handlerContext.previous;
 
         const sharedPrefixLength = sharedDynamicWindPrefixLength(winds, handlerContext.winds);
         const exiting = winds.slice(sharedPrefixLength).reverse();
@@ -1108,13 +1117,13 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
             target: {
               stack: handlerContext.stack,
               winds: handlerContext.winds,
-              handlers: handlerContext.handlers,
+              handlers: handlerContext.previous,
             },
             pos: handlerContext.pos,
           },
           stack,
           winds,
-          handlers,
+          handlerState,
           handlerContext.pos,
         );
         continue;
@@ -1132,7 +1141,7 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
 function startSequenceAction(
   exprs: Expr[],
   env: Environment,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   pos: SourcePos,
 ): EvalAction {
   if (exprs.length === 0) {
@@ -1140,7 +1149,7 @@ function startSequenceAction(
   }
 
   if (exprs.length > 1) {
-    stack.push({
+    pushStackFrame(stack, {
       kind: 'sequence',
       remainingExprs: exprs.slice(1),
       env,
@@ -1154,9 +1163,9 @@ function startSequenceAction(
 function continueWithFrame(
   frame: ContinuationFrame,
   value: RuntimeValue,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   winds: DynamicWindContext[],
-  handlers: ExceptionHandlerContext[],
+  handlerState: HandlerState,
 ): EvalAction {
   switch (frame.kind) {
     case 'sequence':
@@ -1173,7 +1182,7 @@ function continueWithFrame(
         };
       }
 
-      stack.push({
+      pushStackFrame(stack, {
         kind: 'call-argument',
         procedure: value,
         evaluatedArgs: [],
@@ -1194,7 +1203,7 @@ function continueWithFrame(
         };
       }
 
-      stack.push({
+      pushStackFrame(stack, {
         kind: 'call-argument',
         procedure: frame.procedure,
         evaluatedArgs: args,
@@ -1264,7 +1273,7 @@ function continueWithFrame(
       };
     case 'call-cc-procedure':
       value = expectSingleValue(value, frame.pos);
-      stack.push({
+      pushStackFrame(stack, {
         kind: 'call-cc-return',
         state: frame.state,
         pos: frame.pos,
@@ -1275,9 +1284,9 @@ function continueWithFrame(
         args: [
           {
             kind: 'continuation',
-            stack: stack.slice(),
+            stack: captureStackSnapshot(stack),
             winds: winds.slice(),
-            handlers: handlers.slice(),
+            handlers: handlerState.current,
           },
         ],
         pos: frame.pos,
@@ -1287,17 +1296,18 @@ function continueWithFrame(
       frame.state.value = value;
       return { kind: 'value', value };
     case 'exception-handler-return': {
-      const currentHandler = handlers.pop();
+      const currentHandler = handlerState.current;
       if (currentHandler !== frame.handler) {
         throw new EvalError('internal error: exception handler stack mismatch');
       }
 
+      handlerState.current = frame.handler.previous;
       return { kind: 'value', value };
     }
     case 'dynamic-wind-enter':
       expectSingleValue(value, frame.pos);
       winds.push(frame.wind);
-      stack.push({
+      pushStackFrame(stack, {
         kind: 'dynamic-wind-body',
         wind: frame.wind,
         pos: frame.pos,
@@ -1314,7 +1324,7 @@ function continueWithFrame(
         throw new EvalError('internal error: dynamic-wind stack mismatch');
       }
 
-      stack.push({
+      pushStackFrame(stack, {
         kind: 'dynamic-wind-after',
         result: value,
         pos: frame.pos,
@@ -1337,7 +1347,7 @@ function continueWithFrame(
         frame.completion,
         stack,
         winds,
-        handlers,
+        handlerState,
         frame.pos,
       );
     case 'wind-transfer-before':
@@ -1349,7 +1359,7 @@ function continueWithFrame(
         frame.completion,
         stack,
         winds,
-        handlers,
+        handlerState,
         frame.pos,
       );
   }
@@ -1358,6 +1368,61 @@ function continueWithFrame(
 function replaceArrayContents<T>(target: T[], source: readonly T[]): void {
   target.length = 0;
   target.push(...source);
+}
+
+function createContinuationStack(): ContinuationStack {
+  const stack = [] as ContinuationStack;
+  stack.handlerTargetDepths = [];
+  return stack;
+}
+
+function getHandlerTargetDepths(stack: ContinuationStack): number[] {
+  if (stack.handlerTargetDepths === undefined) {
+    stack.handlerTargetDepths = [];
+  }
+
+  return stack.handlerTargetDepths;
+}
+
+function pushStackFrame(stack: ContinuationStack, frame: ContinuationFrame): void {
+  const handlerTargetDepths = getHandlerTargetDepths(stack);
+  const previousDepth =
+    handlerTargetDepths.length === 0 ? 0 : handlerTargetDepths[handlerTargetDepths.length - 1];
+
+  stack.push(frame);
+  handlerTargetDepths.push(frame.kind === 'exception-handler-return' ? previousDepth : stack.length);
+}
+
+function popStackFrame(stack: ContinuationStack): ContinuationFrame | undefined {
+  const frame = stack.pop();
+  if (frame !== undefined) {
+    getHandlerTargetDepths(stack).pop();
+  }
+
+  return frame;
+}
+
+function captureStackSnapshot(stack: ContinuationStack): StackSnapshot {
+  return {
+    frames: stack.slice(),
+    handlerTargetDepths: [...getHandlerTargetDepths(stack)],
+  };
+}
+
+function captureHandlerTargetStackSnapshot(stack: ContinuationStack): StackSnapshot {
+  const handlerTargetDepths = getHandlerTargetDepths(stack);
+  const depth =
+    handlerTargetDepths.length === 0 ? 0 : handlerTargetDepths[handlerTargetDepths.length - 1];
+
+  return {
+    frames: stack.slice(0, depth),
+    handlerTargetDepths: handlerTargetDepths.slice(0, depth),
+  };
+}
+
+function restoreStackSnapshot(stack: ContinuationStack, snapshot: StackSnapshot): void {
+  replaceArrayContents(stack, snapshot.frames);
+  replaceArrayContents(getHandlerTargetDepths(stack), snapshot.handlerTargetDepths);
 }
 
 function sharedDynamicWindPrefixLength(
@@ -1377,9 +1442,9 @@ function startWindTransferAction(
   exiting: DynamicWindContext[],
   entering: DynamicWindContext[],
   completion: WindTransferCompletion,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   winds: DynamicWindContext[],
-  handlers: ExceptionHandlerContext[],
+  handlerState: HandlerState,
   pos: SourcePos,
 ): EvalAction {
   if (exiting.length > 0) {
@@ -1389,7 +1454,7 @@ function startWindTransferAction(
       throw new EvalError('internal error: dynamic-wind stack mismatch');
     }
 
-    stack.push({
+    pushStackFrame(stack, {
       kind: 'wind-transfer-after',
       exiting: remainingExits,
       entering,
@@ -1406,7 +1471,7 @@ function startWindTransferAction(
 
   if (entering.length > 0) {
     const [wind, ...remainingEntries] = entering;
-    stack.push({
+    pushStackFrame(stack, {
       kind: 'wind-transfer-before',
       wind,
       entering: remainingEntries,
@@ -1421,9 +1486,9 @@ function startWindTransferAction(
     };
   }
 
-  replaceArrayContents(stack, completion.target.stack);
+  restoreStackSnapshot(stack, completion.target.stack);
   replaceArrayContents(winds, completion.target.winds);
-  replaceArrayContents(handlers, completion.target.handlers);
+  handlerState.current = completion.target.handlers;
   if (completion.kind === 'value') {
     return { kind: 'value', value: completion.value };
   }
@@ -1440,7 +1505,7 @@ function startShortCircuitAction(
   kind: 'and' | 'or',
   exprs: Expr[],
   env: Environment,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   pos: SourcePos,
 ): EvalAction {
   if (exprs.length === 0) {
@@ -1451,7 +1516,7 @@ function startShortCircuitAction(
     return { kind: 'expr', expr: exprs[0], env };
   }
 
-  stack.push({
+  pushStackFrame(stack, {
     kind,
     remainingExprs: exprs.slice(1),
     env,
@@ -1463,10 +1528,10 @@ function startShortCircuitAction(
 function startApplicationAction(
   expr: ListExpr,
   env: Environment,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
 ): EvalAction {
   const [head, ...argExprs] = expr.elements;
-  stack.push({
+  pushStackFrame(stack, {
     kind: 'call-operator',
     argExprs,
     env,
@@ -1479,9 +1544,9 @@ function evaluateExprAction(
   expr: Expr,
   env: Environment,
   context: EvalContext,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   winds: DynamicWindContext[],
-  handlers: ExceptionHandlerContext[],
+  handlerState: HandlerState,
 ): EvalAction {
   switch (expr.kind) {
     case 'number':
@@ -1494,7 +1559,7 @@ function evaluateExprAction(
     case 'symbol':
       return { kind: 'value', value: env.lookup(expr.name) };
     case 'list':
-      return evaluateListAction(expr, env, context, stack, winds, handlers);
+      return evaluateListAction(expr, env, context, stack, winds, handlerState);
   }
 }
 
@@ -1502,9 +1567,9 @@ function evaluateListAction(
   expr: ListExpr,
   env: Environment,
   context: EvalContext,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   winds: DynamicWindContext[],
-  handlers: ExceptionHandlerContext[],
+  handlerState: HandlerState,
 ): EvalAction {
   if (expr.elements.length === 0) {
     throw new EvalError('cannot evaluate empty list');
@@ -1556,7 +1621,7 @@ function evaluateListAction(
       case 'call-with-current-continuation':
         return evaluateDirectCallCcAction(expr, argExprs, env, stack);
       case 'guard':
-        return evaluateGuardAction(argExprs, env, stack, winds, handlers, expr.pos);
+        return evaluateGuardAction(argExprs, env, stack, winds, handlerState, expr.pos);
       case 'syntax-case':
         return { kind: 'value', value: evaluateSyntaxCase(argExprs, env, context) };
       case 'with-syntax':
@@ -1577,7 +1642,7 @@ function evaluateDirectCallCcAction(
   expr: ListExpr,
   argExprs: Expr[],
   env: Environment,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
 ): EvalAction {
   if (argExprs.length !== 1) {
     throw new EvalError('call/cc expects exactly 1 argument');
@@ -1593,7 +1658,7 @@ function evaluateDirectCallCcAction(
     env.defineCallCcState(expr, state);
   }
 
-  stack.push({
+  pushStackFrame(stack, {
     kind: 'call-cc-procedure',
     state,
     pos: expr.pos,
@@ -1604,7 +1669,7 @@ function evaluateDirectCallCcAction(
 function evaluateDefine(
   argExprs: Expr[],
   env: Environment,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   pos: SourcePos,
 ): EvalAction {
   if (argExprs.length < 2) {
@@ -1618,7 +1683,7 @@ function evaluateDefine(
       throw new EvalError('define variable form expects exactly 1 value expression');
     }
 
-    stack.push({
+    pushStackFrame(stack, {
       kind: 'define-value',
       name: target.name,
       env,
@@ -1770,7 +1835,7 @@ function evaluateDefineRecordType(argExprs: Expr[], env: Environment): RuntimeVa
 function evaluateSet(
   argExprs: Expr[],
   env: Environment,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   pos: SourcePos,
 ): EvalAction {
   if (argExprs.length !== 2) {
@@ -1782,7 +1847,7 @@ function evaluateSet(
     throw new EvalError('set! expects a symbol target');
   }
 
-  stack.push({
+  pushStackFrame(stack, {
     kind: 'set-value',
     name: target.name,
     env,
@@ -1794,14 +1859,14 @@ function evaluateSet(
 function evaluateIfAction(
   argExprs: Expr[],
   env: Environment,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   pos: SourcePos,
 ): EvalAction {
   if (argExprs.length !== 2 && argExprs.length !== 3) {
     throw new EvalError('if expects exactly 2 or 3 arguments');
   }
 
-  stack.push({
+  pushStackFrame(stack, {
     kind: 'if',
     consequent: argExprs[1],
     alternate: argExprs[2],
@@ -3274,7 +3339,7 @@ function freshMacroIdentifier(name: string): string {
 function evaluateAndAction(
   argExprs: Expr[],
   env: Environment,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   pos: SourcePos,
 ): EvalAction {
   return startShortCircuitAction('and', argExprs, env, stack, pos);
@@ -3283,7 +3348,7 @@ function evaluateAndAction(
 function evaluateOrAction(
   argExprs: Expr[],
   env: Environment,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   pos: SourcePos,
 ): EvalAction {
   return startShortCircuitAction('or', argExprs, env, stack, pos);
@@ -3292,7 +3357,7 @@ function evaluateOrAction(
 function evaluateBeginAction(
   argExprs: Expr[],
   env: Environment,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   pos: SourcePos,
 ): EvalAction {
   return startSequenceAction(argExprs, env, stack, pos);
@@ -3301,7 +3366,7 @@ function evaluateBeginAction(
 function evaluateLetAction(
   argExprs: Expr[],
   env: Environment,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   pos: SourcePos,
 ): EvalAction {
   if (argExprs.length < 2) {
@@ -3330,7 +3395,7 @@ function evaluateLetAction(
     return finishLetAction(name, bindings.names, [], body, env, stack, pos);
   }
 
-  stack.push({
+  pushStackFrame(stack, {
     kind: 'let-init',
     name,
     bindingNames: bindings.names,
@@ -3346,12 +3411,12 @@ function evaluateLetAction(
 function continueLetInitAction(
   frame: LetInitFrame,
   value: RuntimeValue,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
 ): EvalAction {
   const values = [...frame.collectedValues, value];
 
   if (frame.remainingInitExprs.length > 0) {
-    stack.push({
+    pushStackFrame(stack, {
       kind: 'let-init',
       name: frame.name,
       bindingNames: frame.bindingNames,
@@ -3373,7 +3438,7 @@ function finishLetAction(
   values: RuntimeValue[],
   body: Expr[],
   env: Environment,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   pos: SourcePos,
 ): EvalAction {
   if (name === undefined) {
@@ -3481,7 +3546,7 @@ function evaluateLetrecAction(
 function evaluateCondAction(
   argExprs: Expr[],
   env: Environment,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   pos: SourcePos,
 ): EvalAction {
   return startCondAction(argExprs, env, stack, pos);
@@ -3490,7 +3555,7 @@ function evaluateCondAction(
 function startCondAction(
   clauses: Expr[],
   env: Environment,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   pos: SourcePos,
 ): EvalAction {
   if (clauses.length === 0) {
@@ -3515,7 +3580,7 @@ function startCondAction(
     return startSequenceAction(body, env, stack, pos);
   }
 
-  stack.push({
+  pushStackFrame(stack, {
     kind: 'cond-test',
     body,
     remainingClauses: clauses.slice(1),
@@ -3621,9 +3686,9 @@ function evaluateDoAction(argExprs: Expr[], env: Environment, context: EvalConte
 function evaluateGuardAction(
   argExprs: Expr[],
   env: Environment,
-  stack: ContinuationFrame[],
+  stack: ContinuationStack,
   winds: DynamicWindContext[],
-  handlers: ExceptionHandlerContext[],
+  handlerState: HandlerState,
   pos: SourcePos,
 ): EvalAction {
   if (argExprs.length < 2) {
@@ -3647,18 +3712,18 @@ function evaluateGuardAction(
       clauses,
       env,
     },
-    stack: stack.slice(),
+    stack: captureHandlerTargetStackSnapshot(stack),
     winds: winds.slice(),
-    handlers: handlers.slice(),
+    previous: handlerState.current,
     pos,
   };
 
-  stack.push({
+  pushStackFrame(stack, {
     kind: 'exception-handler-return',
     handler: handlerContext,
     pos,
   });
-  handlers.push(handlerContext);
+  handlerState.current = handlerContext;
   return startSequenceAction(argExprs.slice(1), env, stack, pos);
 }
 

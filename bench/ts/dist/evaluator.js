@@ -471,9 +471,9 @@ function evaluateExprSingle(expr, env, context) {
 }
 function runEvaluation(initialAction, context) {
     let action = initialAction;
-    const stack = [];
+    const stack = createContinuationStack();
     const winds = [];
-    const handlers = [];
+    const handlerState = { current: undefined };
     while (true) {
         let errorPos;
         try {
@@ -483,17 +483,17 @@ function runEvaluation(initialAction, context) {
                         return action.value;
                     }
                     {
-                        const frame = stack.pop();
+                        const frame = popStackFrame(stack);
                         if (frame === undefined) {
                             return action.value;
                         }
                         errorPos = frame.pos;
-                        action = continueWithFrame(frame, action.value, stack, winds, handlers);
+                        action = continueWithFrame(frame, action.value, stack, winds, handlerState);
                     }
                     break;
                 case 'expr':
                     errorPos = action.expr.pos;
-                    action = evaluateExprAction(action.expr, action.env, context, stack, winds, handlers);
+                    action = evaluateExprAction(action.expr, action.env, context, stack, winds, handlerState);
                     break;
                 case 'sequence':
                     errorPos = action.pos ?? action.exprs[0]?.pos;
@@ -513,9 +513,9 @@ function runEvaluation(initialAction, context) {
                             args: [
                                 {
                                     kind: 'continuation',
-                                    stack: stack.slice(),
+                                    stack: captureStackSnapshot(stack),
                                     winds: winds.slice(),
-                                    handlers: handlers.slice(),
+                                    handlers: handlerState.current,
                                 },
                             ],
                             pos: action.pos,
@@ -527,7 +527,7 @@ function runEvaluation(initialAction, context) {
                             throw new EvalError('call-with-values expects exactly 2 arguments');
                         }
                         const [producer, consumer] = action.args;
-                        stack.push({
+                        pushStackFrame(stack, {
                             kind: 'call-with-values',
                             consumer,
                             pos: action.pos ?? DEFAULT_SOURCE_POS,
@@ -545,7 +545,7 @@ function runEvaluation(initialAction, context) {
                             throw new EvalError('dynamic-wind expects exactly 3 arguments');
                         }
                         const [beforeThunk, bodyThunk, afterThunk] = action.args;
-                        stack.push({
+                        pushStackFrame(stack, {
                             kind: 'dynamic-wind-enter',
                             wind: {
                                 before: beforeThunk,
@@ -570,17 +570,17 @@ function runEvaluation(initialAction, context) {
                         const [handlerProcedure, thunk] = action.args;
                         const handlerContext = {
                             procedure: handlerProcedure,
-                            stack: stack.slice(),
+                            stack: captureHandlerTargetStackSnapshot(stack),
                             winds: winds.slice(),
-                            handlers: handlers.slice(),
+                            previous: handlerState.current,
                             pos: action.pos ?? DEFAULT_SOURCE_POS,
                         };
-                        stack.push({
+                        pushStackFrame(stack, {
                             kind: 'exception-handler-return',
                             handler: handlerContext,
                             pos: handlerContext.pos,
                         });
-                        handlers.push(handlerContext);
+                        handlerState.current = handlerContext;
                         action = {
                             kind: 'apply',
                             procedure: thunk,
@@ -590,21 +590,18 @@ function runEvaluation(initialAction, context) {
                         break;
                     }
                     if (action.procedure.kind === 'continuation') {
-                        if (action.args.length !== 1) {
-                            throw new EvalError('continuation expects exactly 1 argument');
-                        }
                         const sharedPrefixLength = sharedDynamicWindPrefixLength(winds, action.procedure.winds);
                         const exiting = winds.slice(sharedPrefixLength).reverse();
                         const entering = action.procedure.winds.slice(sharedPrefixLength);
                         action = startWindTransferAction(exiting, entering, {
                             kind: 'value',
-                            value: action.args[0],
+                            value: makeValuesResult(action.args),
                             target: {
                                 stack: action.procedure.stack,
                                 winds: action.procedure.winds,
                                 handlers: action.procedure.handlers,
                             },
-                        }, stack, winds, handlers, action.pos ?? DEFAULT_SOURCE_POS);
+                        }, stack, winds, handlerState, action.pos ?? DEFAULT_SOURCE_POS);
                         break;
                     }
                     action = applyProcedureAction(action.procedure, action.args, context);
@@ -616,11 +613,11 @@ function runEvaluation(initialAction, context) {
                 if (error.pos === undefined) {
                     error.pos = errorPos;
                 }
-                const handlerContext = handlers[handlers.length - 1];
+                const handlerContext = handlerState.current;
                 if (handlerContext === undefined) {
                     throw new EvalError(`uncaught exception: ${formatValue(error.value)}`, error.pos);
                 }
-                replaceArrayContents(handlers, handlerContext.handlers);
+                handlerState.current = handlerContext.previous;
                 const sharedPrefixLength = sharedDynamicWindPrefixLength(winds, handlerContext.winds);
                 const exiting = winds.slice(sharedPrefixLength).reverse();
                 const entering = handlerContext.winds.slice(sharedPrefixLength);
@@ -631,10 +628,10 @@ function runEvaluation(initialAction, context) {
                     target: {
                         stack: handlerContext.stack,
                         winds: handlerContext.winds,
-                        handlers: handlerContext.handlers,
+                        handlers: handlerContext.previous,
                     },
                     pos: handlerContext.pos,
-                }, stack, winds, handlers, handlerContext.pos);
+                }, stack, winds, handlerState, handlerContext.pos);
                 continue;
             }
             if (errorPos !== undefined) {
@@ -649,7 +646,7 @@ function startSequenceAction(exprs, env, stack, pos) {
         return { kind: 'value', value: VOID_VALUE };
     }
     if (exprs.length > 1) {
-        stack.push({
+        pushStackFrame(stack, {
             kind: 'sequence',
             remainingExprs: exprs.slice(1),
             env,
@@ -658,7 +655,7 @@ function startSequenceAction(exprs, env, stack, pos) {
     }
     return { kind: 'expr', expr: exprs[0], env };
 }
-function continueWithFrame(frame, value, stack, winds, handlers) {
+function continueWithFrame(frame, value, stack, winds, handlerState) {
     switch (frame.kind) {
         case 'sequence':
             expectSingleValue(value, frame.pos);
@@ -673,7 +670,7 @@ function continueWithFrame(frame, value, stack, winds, handlers) {
                     pos: frame.pos,
                 };
             }
-            stack.push({
+            pushStackFrame(stack, {
                 kind: 'call-argument',
                 procedure: value,
                 evaluatedArgs: [],
@@ -693,7 +690,7 @@ function continueWithFrame(frame, value, stack, winds, handlers) {
                     pos: frame.pos,
                 };
             }
-            stack.push({
+            pushStackFrame(stack, {
                 kind: 'call-argument',
                 procedure: frame.procedure,
                 evaluatedArgs: args,
@@ -757,7 +754,7 @@ function continueWithFrame(frame, value, stack, winds, handlers) {
             };
         case 'call-cc-procedure':
             value = expectSingleValue(value, frame.pos);
-            stack.push({
+            pushStackFrame(stack, {
                 kind: 'call-cc-return',
                 state: frame.state,
                 pos: frame.pos,
@@ -768,9 +765,9 @@ function continueWithFrame(frame, value, stack, winds, handlers) {
                 args: [
                     {
                         kind: 'continuation',
-                        stack: stack.slice(),
+                        stack: captureStackSnapshot(stack),
                         winds: winds.slice(),
-                        handlers: handlers.slice(),
+                        handlers: handlerState.current,
                     },
                 ],
                 pos: frame.pos,
@@ -780,16 +777,17 @@ function continueWithFrame(frame, value, stack, winds, handlers) {
             frame.state.value = value;
             return { kind: 'value', value };
         case 'exception-handler-return': {
-            const currentHandler = handlers.pop();
+            const currentHandler = handlerState.current;
             if (currentHandler !== frame.handler) {
                 throw new EvalError('internal error: exception handler stack mismatch');
             }
+            handlerState.current = frame.handler.previous;
             return { kind: 'value', value };
         }
         case 'dynamic-wind-enter':
             expectSingleValue(value, frame.pos);
             winds.push(frame.wind);
-            stack.push({
+            pushStackFrame(stack, {
                 kind: 'dynamic-wind-body',
                 wind: frame.wind,
                 pos: frame.pos,
@@ -805,7 +803,7 @@ function continueWithFrame(frame, value, stack, winds, handlers) {
             if (currentWind !== frame.wind) {
                 throw new EvalError('internal error: dynamic-wind stack mismatch');
             }
-            stack.push({
+            pushStackFrame(stack, {
                 kind: 'dynamic-wind-after',
                 result: value,
                 pos: frame.pos,
@@ -822,16 +820,58 @@ function continueWithFrame(frame, value, stack, winds, handlers) {
             return { kind: 'value', value: frame.result };
         case 'wind-transfer-after':
             expectSingleValue(value, frame.pos);
-            return startWindTransferAction(frame.exiting, frame.entering, frame.completion, stack, winds, handlers, frame.pos);
+            return startWindTransferAction(frame.exiting, frame.entering, frame.completion, stack, winds, handlerState, frame.pos);
         case 'wind-transfer-before':
             expectSingleValue(value, frame.pos);
             winds.push(frame.wind);
-            return startWindTransferAction([], frame.entering, frame.completion, stack, winds, handlers, frame.pos);
+            return startWindTransferAction([], frame.entering, frame.completion, stack, winds, handlerState, frame.pos);
     }
 }
 function replaceArrayContents(target, source) {
     target.length = 0;
     target.push(...source);
+}
+function createContinuationStack() {
+    const stack = [];
+    stack.handlerTargetDepths = [];
+    return stack;
+}
+function getHandlerTargetDepths(stack) {
+    if (stack.handlerTargetDepths === undefined) {
+        stack.handlerTargetDepths = [];
+    }
+    return stack.handlerTargetDepths;
+}
+function pushStackFrame(stack, frame) {
+    const handlerTargetDepths = getHandlerTargetDepths(stack);
+    const previousDepth = handlerTargetDepths.length === 0 ? 0 : handlerTargetDepths[handlerTargetDepths.length - 1];
+    stack.push(frame);
+    handlerTargetDepths.push(frame.kind === 'exception-handler-return' ? previousDepth : stack.length);
+}
+function popStackFrame(stack) {
+    const frame = stack.pop();
+    if (frame !== undefined) {
+        getHandlerTargetDepths(stack).pop();
+    }
+    return frame;
+}
+function captureStackSnapshot(stack) {
+    return {
+        frames: stack.slice(),
+        handlerTargetDepths: [...getHandlerTargetDepths(stack)],
+    };
+}
+function captureHandlerTargetStackSnapshot(stack) {
+    const handlerTargetDepths = getHandlerTargetDepths(stack);
+    const depth = handlerTargetDepths.length === 0 ? 0 : handlerTargetDepths[handlerTargetDepths.length - 1];
+    return {
+        frames: stack.slice(0, depth),
+        handlerTargetDepths: handlerTargetDepths.slice(0, depth),
+    };
+}
+function restoreStackSnapshot(stack, snapshot) {
+    replaceArrayContents(stack, snapshot.frames);
+    replaceArrayContents(getHandlerTargetDepths(stack), snapshot.handlerTargetDepths);
 }
 function sharedDynamicWindPrefixLength(left, right) {
     let index = 0;
@@ -840,14 +880,14 @@ function sharedDynamicWindPrefixLength(left, right) {
     }
     return index;
 }
-function startWindTransferAction(exiting, entering, completion, stack, winds, handlers, pos) {
+function startWindTransferAction(exiting, entering, completion, stack, winds, handlerState, pos) {
     if (exiting.length > 0) {
         const [wind, ...remainingExits] = exiting;
         const currentWind = winds.pop();
         if (currentWind !== wind) {
             throw new EvalError('internal error: dynamic-wind stack mismatch');
         }
-        stack.push({
+        pushStackFrame(stack, {
             kind: 'wind-transfer-after',
             exiting: remainingExits,
             entering,
@@ -863,7 +903,7 @@ function startWindTransferAction(exiting, entering, completion, stack, winds, ha
     }
     if (entering.length > 0) {
         const [wind, ...remainingEntries] = entering;
-        stack.push({
+        pushStackFrame(stack, {
             kind: 'wind-transfer-before',
             wind,
             entering: remainingEntries,
@@ -877,9 +917,9 @@ function startWindTransferAction(exiting, entering, completion, stack, winds, ha
             pos,
         };
     }
-    replaceArrayContents(stack, completion.target.stack);
+    restoreStackSnapshot(stack, completion.target.stack);
     replaceArrayContents(winds, completion.target.winds);
-    replaceArrayContents(handlers, completion.target.handlers);
+    handlerState.current = completion.target.handlers;
     if (completion.kind === 'value') {
         return { kind: 'value', value: completion.value };
     }
@@ -897,7 +937,7 @@ function startShortCircuitAction(kind, exprs, env, stack, pos) {
     if (exprs.length === 1) {
         return { kind: 'expr', expr: exprs[0], env };
     }
-    stack.push({
+    pushStackFrame(stack, {
         kind,
         remainingExprs: exprs.slice(1),
         env,
@@ -907,7 +947,7 @@ function startShortCircuitAction(kind, exprs, env, stack, pos) {
 }
 function startApplicationAction(expr, env, stack) {
     const [head, ...argExprs] = expr.elements;
-    stack.push({
+    pushStackFrame(stack, {
         kind: 'call-operator',
         argExprs,
         env,
@@ -915,7 +955,7 @@ function startApplicationAction(expr, env, stack) {
     });
     return { kind: 'expr', expr: head, env };
 }
-function evaluateExprAction(expr, env, context, stack, winds, handlers) {
+function evaluateExprAction(expr, env, context, stack, winds, handlerState) {
     switch (expr.kind) {
         case 'number':
         case 'boolean':
@@ -927,10 +967,10 @@ function evaluateExprAction(expr, env, context, stack, winds, handlers) {
         case 'symbol':
             return { kind: 'value', value: env.lookup(expr.name) };
         case 'list':
-            return evaluateListAction(expr, env, context, stack, winds, handlers);
+            return evaluateListAction(expr, env, context, stack, winds, handlerState);
     }
 }
-function evaluateListAction(expr, env, context, stack, winds, handlers) {
+function evaluateListAction(expr, env, context, stack, winds, handlerState) {
     if (expr.elements.length === 0) {
         throw new EvalError('cannot evaluate empty list');
     }
@@ -979,7 +1019,7 @@ function evaluateListAction(expr, env, context, stack, winds, handlers) {
             case 'call-with-current-continuation':
                 return evaluateDirectCallCcAction(expr, argExprs, env, stack);
             case 'guard':
-                return evaluateGuardAction(argExprs, env, stack, winds, handlers, expr.pos);
+                return evaluateGuardAction(argExprs, env, stack, winds, handlerState, expr.pos);
             case 'syntax-case':
                 return { kind: 'value', value: evaluateSyntaxCase(argExprs, env, context) };
             case 'with-syntax':
@@ -1005,7 +1045,7 @@ function evaluateDirectCallCcAction(expr, argExprs, env, stack) {
     if (savedState === undefined) {
         env.defineCallCcState(expr, state);
     }
-    stack.push({
+    pushStackFrame(stack, {
         kind: 'call-cc-procedure',
         state,
         pos: expr.pos,
@@ -1021,7 +1061,7 @@ function evaluateDefine(argExprs, env, stack, pos) {
         if (body.length !== 1) {
             throw new EvalError('define variable form expects exactly 1 value expression');
         }
-        stack.push({
+        pushStackFrame(stack, {
             kind: 'define-value',
             name: target.name,
             env,
@@ -1145,7 +1185,7 @@ function evaluateSet(argExprs, env, stack, pos) {
     if (target.kind !== 'symbol') {
         throw new EvalError('set! expects a symbol target');
     }
-    stack.push({
+    pushStackFrame(stack, {
         kind: 'set-value',
         name: target.name,
         env,
@@ -1157,7 +1197,7 @@ function evaluateIfAction(argExprs, env, stack, pos) {
     if (argExprs.length !== 2 && argExprs.length !== 3) {
         throw new EvalError('if expects exactly 2 or 3 arguments');
     }
-    stack.push({
+    pushStackFrame(stack, {
         kind: 'if',
         consequent: argExprs[1],
         alternate: argExprs[2],
@@ -2071,7 +2111,7 @@ function evaluateLetAction(argExprs, env, stack, pos) {
     if (bindings.initExprs.length === 0) {
         return finishLetAction(name, bindings.names, [], body, env, stack, pos);
     }
-    stack.push({
+    pushStackFrame(stack, {
         kind: 'let-init',
         name,
         bindingNames: bindings.names,
@@ -2086,7 +2126,7 @@ function evaluateLetAction(argExprs, env, stack, pos) {
 function continueLetInitAction(frame, value, stack) {
     const values = [...frame.collectedValues, value];
     if (frame.remainingInitExprs.length > 0) {
-        stack.push({
+        pushStackFrame(stack, {
             kind: 'let-init',
             name: frame.name,
             bindingNames: frame.bindingNames,
@@ -2196,7 +2236,7 @@ function startCondAction(clauses, env, stack, pos) {
         }
         return startSequenceAction(body, env, stack, pos);
     }
-    stack.push({
+    pushStackFrame(stack, {
         kind: 'cond-test',
         body,
         remainingClauses: clauses.slice(1),
@@ -2276,7 +2316,7 @@ function evaluateDoAction(argExprs, env, context) {
         }
     }
 }
-function evaluateGuardAction(argExprs, env, stack, winds, handlers, pos) {
+function evaluateGuardAction(argExprs, env, stack, winds, handlerState, pos) {
     if (argExprs.length < 2) {
         throw new EvalError('guard expects a clause list and a body');
     }
@@ -2295,17 +2335,17 @@ function evaluateGuardAction(argExprs, env, stack, winds, handlers, pos) {
             clauses,
             env,
         },
-        stack: stack.slice(),
+        stack: captureHandlerTargetStackSnapshot(stack),
         winds: winds.slice(),
-        handlers: handlers.slice(),
+        previous: handlerState.current,
         pos,
     };
-    stack.push({
+    pushStackFrame(stack, {
         kind: 'exception-handler-return',
         handler: handlerContext,
         pos,
     });
-    handlers.push(handlerContext);
+    handlerState.current = handlerContext;
     return startSequenceAction(argExprs.slice(1), env, stack, pos);
 }
 function readDoBindings(bindingsExpr) {
