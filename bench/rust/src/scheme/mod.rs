@@ -152,6 +152,7 @@ struct NativeProcedure {
 #[derive(Clone)]
 struct ContinuationProcedure {
     continuation: ContinuationRef,
+    winders: Winders,
 }
 
 #[derive(Clone)]
@@ -160,6 +161,7 @@ enum NativeProcedureKind {
     Apply,
     ForEach,
     CallCc,
+    DynamicWind,
     RecordConstructor(Rc<RecordType>),
     RecordPredicate(Rc<RecordType>),
     RecordAccessor {
@@ -195,6 +197,17 @@ enum Value {
 }
 
 type BindingCell = Rc<RefCell<Value>>;
+
+type Winders = Option<WindFrameRef>;
+type WindFrameRef = Rc<WindFrame>;
+
+#[derive(Clone)]
+struct WindFrame {
+    id: u64,
+    in_thunk: Value,
+    out_thunk: Value,
+    parent: Winders,
+}
 
 #[derive(Clone)]
 struct EvaluatedArg {
@@ -292,6 +305,30 @@ enum ContinuationFrame {
         lists: Rc<Vec<Vec<Value>>>,
         next_index: usize,
         operator_loc: SourceLoc,
+    },
+    DynamicWindEnter {
+        body_thunk: Value,
+        wind_frame: WindFrameRef,
+        body_loc: SourceLoc,
+        out_loc: SourceLoc,
+    },
+    DynamicWindBody {
+        wind_frame: WindFrameRef,
+        out_loc: SourceLoc,
+    },
+    DynamicWindExit {
+        result: Value,
+    },
+    WindTransition {
+        value: Value,
+        target_continuation: ContinuationRef,
+        target_winders: Winders,
+        outs: Rc<Vec<WindFrameRef>>,
+        next_out: usize,
+        ins: Rc<Vec<WindFrameRef>>,
+        next_in: usize,
+        enter_after_return: Winders,
+        loc: SourceLoc,
     },
 }
 
@@ -732,6 +769,10 @@ fn create_global_env() -> Environment {
             NativeProcedureKind::CallCc,
         ),
     );
+    env.define(
+        "dynamic-wind",
+        native("dynamic-wind", NativeProcedureKind::DynamicWind),
+    );
     env.define("eq?", builtin("eq?", builtin_eq));
     env.define("eqv?", builtin("eqv?", builtin_eqv));
     env.define("equal?", builtin("equal?", builtin_equal));
@@ -739,10 +780,19 @@ fn create_global_env() -> Environment {
     env.define("make-vector", builtin("make-vector", builtin_make_vector));
     env.define("vector-ref", builtin("vector-ref", builtin_vector_ref));
     env.define("vector-set!", builtin("vector-set!", builtin_vector_set));
-    env.define("vector-length", builtin("vector-length", builtin_vector_length));
+    env.define(
+        "vector-length",
+        builtin("vector-length", builtin_vector_length),
+    );
     env.define("vector?", builtin("vector?", builtin_vector_pred));
-    env.define("vector->list", builtin("vector->list", builtin_vector_to_list));
-    env.define("list->vector", builtin("list->vector", builtin_list_to_vector));
+    env.define(
+        "vector->list",
+        builtin("vector->list", builtin_vector_to_list),
+    );
+    env.define(
+        "list->vector",
+        builtin("list->vector", builtin_list_to_vector),
+    );
 
     env.define("string?", builtin("string?", builtin_string_pred));
     env.define("number?", builtin("number?", builtin_number_pred));
@@ -751,9 +801,18 @@ fn create_global_env() -> Environment {
     env.define("pair?", builtin("pair?", builtin_pair_pred));
     env.define("symbol?", builtin("symbol?", builtin_symbol_pred));
     env.define("procedure?", builtin("procedure?", builtin_procedure_pred));
-    env.define("symbol->string", builtin("symbol->string", builtin_symbol_to_string));
-    env.define("string->symbol", builtin("string->symbol", builtin_string_to_symbol));
-    env.define("string-length", builtin("string-length", builtin_string_length));
+    env.define(
+        "symbol->string",
+        builtin("symbol->string", builtin_symbol_to_string),
+    );
+    env.define(
+        "string->symbol",
+        builtin("string->symbol", builtin_string_to_symbol),
+    );
+    env.define(
+        "string-length",
+        builtin("string-length", builtin_string_length),
+    );
     env.define("make-string", builtin("make-string", builtin_make_string));
     env.define("string", builtin("string", builtin_string));
     env.define("string-ref", builtin("string-ref", builtin_string_ref));
@@ -763,9 +822,18 @@ fn create_global_env() -> Environment {
     env.define("string<=?", builtin("string<=?", builtin_string_lte));
     env.define("string>=?", builtin("string>=?", builtin_string_gte));
     env.define("substring", builtin("substring", builtin_substring));
-    env.define("string-append", builtin("string-append", builtin_string_append));
-    env.define("number->string", builtin("number->string", builtin_number_to_string));
-    env.define("string->number", builtin("string->number", builtin_string_to_number));
+    env.define(
+        "string-append",
+        builtin("string-append", builtin_string_append),
+    );
+    env.define(
+        "number->string",
+        builtin("number->string", builtin_number_to_string),
+    );
+    env.define(
+        "string->number",
+        builtin("string->number", builtin_string_to_number),
+    );
 
     env
 }
@@ -802,10 +870,7 @@ fn done_continuation() -> ContinuationRef {
     Rc::new(Continuation::Done)
 }
 
-fn push_continuation(
-    continuation: &ContinuationRef,
-    frame: ContinuationFrame,
-) -> ContinuationRef {
+fn push_continuation(continuation: &ContinuationRef, frame: ContinuationFrame) -> ContinuationRef {
     Rc::new(Continuation::Frame(frame, continuation.clone()))
 }
 
@@ -831,7 +896,122 @@ fn start_sequence(
         continuation
     };
 
-    (MachineControl::Expr(first.clone(), env.clone()), continuation)
+    (
+        MachineControl::Expr(first.clone(), env.clone()),
+        continuation,
+    )
+}
+
+fn compute_wind_transition(
+    current: &Winders,
+    target: &Winders,
+) -> (Vec<WindFrameRef>, Vec<WindFrameRef>) {
+    let mut target_ids = HashSet::new();
+    let mut cursor = target.clone();
+    while let Some(wind_frame) = cursor {
+        target_ids.insert(wind_frame.id);
+        cursor = wind_frame.parent.clone();
+    }
+
+    let mut outs = Vec::new();
+    let mut shared_id = None;
+    let mut cursor = current.clone();
+    while let Some(wind_frame) = cursor {
+        if target_ids.contains(&wind_frame.id) {
+            shared_id = Some(wind_frame.id);
+            break;
+        }
+
+        outs.push(wind_frame.clone());
+        cursor = wind_frame.parent.clone();
+    }
+
+    let mut ins = Vec::new();
+    let mut cursor = target.clone();
+    while let Some(wind_frame) = cursor {
+        if Some(wind_frame.id) == shared_id {
+            break;
+        }
+
+        ins.push(wind_frame.clone());
+        cursor = wind_frame.parent.clone();
+    }
+    ins.reverse();
+
+    (outs, ins)
+}
+
+fn continue_wind_transition(
+    value: Value,
+    target_continuation: ContinuationRef,
+    target_winders: Winders,
+    outs: Rc<Vec<WindFrameRef>>,
+    next_out: usize,
+    ins: Rc<Vec<WindFrameRef>>,
+    next_in: usize,
+    current_winders: &mut Winders,
+    loc: SourceLoc,
+    state: &mut EvalState,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    if next_out < outs.len() {
+        let wind_frame = outs[next_out].clone();
+        *current_winders = wind_frame.parent.clone();
+
+        let transition = push_continuation(
+            &done_continuation(),
+            ContinuationFrame::WindTransition {
+                value,
+                target_continuation,
+                target_winders,
+                outs,
+                next_out: next_out + 1,
+                ins,
+                next_in,
+                enter_after_return: None,
+                loc,
+            },
+        );
+
+        return continue_with_application(
+            wind_frame.out_thunk.clone(),
+            Vec::new(),
+            loc,
+            transition,
+            current_winders,
+            state,
+        );
+    }
+
+    if next_in < ins.len() {
+        let wind_frame = ins[next_in].clone();
+
+        let transition = push_continuation(
+            &done_continuation(),
+            ContinuationFrame::WindTransition {
+                value,
+                target_continuation,
+                target_winders,
+                outs,
+                next_out,
+                ins,
+                next_in: next_in + 1,
+                enter_after_return: Some(wind_frame.clone()),
+                loc,
+            },
+        );
+
+        return continue_with_application(
+            wind_frame.in_thunk.clone(),
+            Vec::new(),
+            loc,
+            transition,
+            current_winders,
+            state,
+        );
+    }
+
+    *current_winders = target_winders.clone();
+    Ok((MachineControl::Value(value), target_continuation))
 }
 
 fn run_machine(
@@ -839,6 +1019,8 @@ fn run_machine(
     mut continuation: ContinuationRef,
     state: &mut EvalState,
 ) -> Result<Value, EvalError> {
+    let mut current_winders: Winders = None;
+
     loop {
         match control {
             MachineControl::Expr(expr, env) => match &expr.kind {
@@ -864,9 +1046,8 @@ fn run_machine(
 
                     if let Some(symbol) = expr_plain_symbol(head) {
                         if symbol == "define-syntax" {
-                            control = MachineControl::Value(eval_define_syntax(
-                                args, head, &env, state,
-                            )?);
+                            control =
+                                MachineControl::Value(eval_define_syntax(args, head, &env, state)?);
                             continue;
                         }
 
@@ -909,16 +1090,12 @@ fn run_machine(
                                             env: env.clone(),
                                         },
                                     );
-                                    control = MachineControl::Expr(
-                                        args[1].clone(),
-                                        env,
-                                    );
+                                    control = MachineControl::Expr(args[1].clone(), env);
                                     continue;
                                 }
 
-                                control = MachineControl::Value(eval_define(
-                                    args, head, &env, state,
-                                )?);
+                                control =
+                                    MachineControl::Value(eval_define(args, head, &env, state)?);
                                 continue;
                             }
                             "set!" => {
@@ -931,10 +1108,7 @@ fn run_machine(
 
                                 let target = &args[0];
                                 let Some(identifier) = expr_identifier(target) else {
-                                    return Err(err_at(
-                                        target.loc,
-                                        "set! target must be a symbol",
-                                    ));
+                                    return Err(err_at(target.loc, "set! target must be a symbol"));
                                 };
 
                                 continuation = push_continuation(
@@ -976,8 +1150,7 @@ fn run_machine(
                                 continue;
                             }
                             "begin" => {
-                                (control, continuation) =
-                                    start_sequence(args, &env, continuation);
+                                (control, continuation) = start_sequence(args, &env, continuation);
                                 continue;
                             }
                             _ => {
@@ -1054,13 +1227,18 @@ fn run_machine(
                             control = MachineControl::Value(Value::Void);
                         }
                     }
-                    ContinuationFrame::ApplyOperator { arg_exprs, env, loc } => {
+                    ContinuationFrame::ApplyOperator {
+                        arg_exprs,
+                        env,
+                        loc,
+                    } => {
                         if arg_exprs.is_empty() {
                             (control, continuation) = continue_with_application(
                                 value,
                                 Vec::new(),
                                 loc,
                                 continuation,
+                                &mut current_winders,
                                 state,
                             )?;
                             continue;
@@ -1077,10 +1255,7 @@ fn run_machine(
                                 loc,
                             },
                         );
-                        control = MachineControl::Expr(
-                            arg_exprs[arg_exprs.len() - 1].clone(),
-                            env,
-                        );
+                        control = MachineControl::Expr(arg_exprs[arg_exprs.len() - 1].clone(), env);
                     }
                     ContinuationFrame::ApplyArgument {
                         operator,
@@ -1090,10 +1265,13 @@ fn run_machine(
                         env,
                         loc,
                     } => {
-                        evaluated.insert(0, EvaluatedArg {
-                            expr: arg_exprs[current_index].clone(),
-                            value,
-                        });
+                        evaluated.insert(
+                            0,
+                            EvaluatedArg {
+                                expr: arg_exprs[current_index].clone(),
+                                value,
+                            },
+                        );
 
                         if current_index > 0 {
                             let next_index = current_index - 1;
@@ -1108,8 +1286,7 @@ fn run_machine(
                                     loc,
                                 },
                             );
-                            control =
-                                MachineControl::Expr(arg_exprs[next_index].clone(), env);
+                            control = MachineControl::Expr(arg_exprs[next_index].clone(), env);
                             continue;
                         }
 
@@ -1118,6 +1295,7 @@ fn run_machine(
                             evaluated,
                             loc,
                             continuation,
+                            &mut current_winders,
                             state,
                         )?;
                     }
@@ -1152,6 +1330,7 @@ fn run_machine(
                             build_indexed_args(&list_arg_exprs, &lists, next_index),
                             operator_loc,
                             next_continuation,
+                            &mut current_winders,
                             state,
                         )?;
                     }
@@ -1182,6 +1361,79 @@ fn run_machine(
                             build_indexed_args(&list_arg_exprs, &lists, next_index),
                             operator_loc,
                             next_continuation,
+                            &mut current_winders,
+                            state,
+                        )?;
+                    }
+                    ContinuationFrame::DynamicWindEnter {
+                        body_thunk,
+                        wind_frame,
+                        body_loc,
+                        out_loc,
+                    } => {
+                        current_winders = Some(wind_frame.clone());
+                        let next_continuation = push_continuation(
+                            &continuation,
+                            ContinuationFrame::DynamicWindBody {
+                                wind_frame,
+                                out_loc,
+                            },
+                        );
+                        (control, continuation) = continue_with_application(
+                            body_thunk,
+                            Vec::new(),
+                            body_loc,
+                            next_continuation,
+                            &mut current_winders,
+                            state,
+                        )?;
+                    }
+                    ContinuationFrame::DynamicWindBody {
+                        wind_frame,
+                        out_loc,
+                    } => {
+                        current_winders = wind_frame.parent.clone();
+                        let next_continuation = push_continuation(
+                            &continuation,
+                            ContinuationFrame::DynamicWindExit { result: value },
+                        );
+                        (control, continuation) = continue_with_application(
+                            wind_frame.out_thunk.clone(),
+                            Vec::new(),
+                            out_loc,
+                            next_continuation,
+                            &mut current_winders,
+                            state,
+                        )?;
+                    }
+                    ContinuationFrame::DynamicWindExit { result } => {
+                        control = MachineControl::Value(result);
+                    }
+                    ContinuationFrame::WindTransition {
+                        value,
+                        target_continuation,
+                        target_winders,
+                        outs,
+                        next_out,
+                        ins,
+                        next_in,
+                        enter_after_return,
+                        loc,
+                    } => {
+                        if let Some(wind_frame) = enter_after_return {
+                            current_winders = Some(wind_frame);
+                        }
+
+                        (control, continuation) = continue_wind_transition(
+                            value,
+                            target_continuation,
+                            target_winders,
+                            outs,
+                            next_out,
+                            ins,
+                            next_in,
+                            &mut current_winders,
+                            loc,
                             state,
                         )?;
                     }
@@ -1196,6 +1448,7 @@ fn continue_with_application(
     args: Vec<EvaluatedArg>,
     loc: SourceLoc,
     continuation: ContinuationRef,
+    current_winders: &mut Winders,
     state: &mut EvalState,
 ) -> Result<(MachineControl, ContinuationRef), EvalError> {
     let Value::Procedure(procedure) = operator else {
@@ -1211,15 +1464,29 @@ fn continue_with_application(
             let call_env = bind_closure_arguments(&procedure, &args, loc)?;
             Ok(start_sequence(&procedure.body, &call_env, continuation))
         }
-        ProcedureValue::Native(procedure) => {
-            continue_with_native_procedure(&procedure, args, loc, continuation, state)
-        }
+        ProcedureValue::Native(procedure) => continue_with_native_procedure(
+            &procedure,
+            args,
+            loc,
+            continuation,
+            current_winders,
+            state,
+        ),
         ProcedureValue::Continuation(procedure) => {
             expect_exact_args("continuation", &args, loc, 1)?;
-            Ok((
-                MachineControl::Value(args[0].value.clone()),
+            let (outs, ins) = compute_wind_transition(current_winders, &procedure.winders);
+            continue_wind_transition(
+                args[0].value.clone(),
                 procedure.continuation.clone(),
-            ))
+                procedure.winders.clone(),
+                Rc::new(outs),
+                0,
+                Rc::new(ins),
+                0,
+                current_winders,
+                loc,
+                state,
+            )
         }
     }
 }
@@ -1229,15 +1496,13 @@ fn continue_with_native_procedure(
     args: Vec<EvaluatedArg>,
     loc: SourceLoc,
     continuation: ContinuationRef,
+    current_winders: &mut Winders,
     state: &mut EvalState,
 ) -> Result<(MachineControl, ContinuationRef), EvalError> {
     match &procedure.kind {
         NativeProcedureKind::Map => {
             if args.len() < 2 {
-                return Err(err_at(
-                    loc,
-                    "map expects a procedure and at least 1 list",
-                ));
+                return Err(err_at(loc, "map expects a procedure and at least 1 list"));
             }
 
             let operator = args[0].value.clone();
@@ -1285,6 +1550,7 @@ fn continue_with_native_procedure(
                 build_indexed_args(&list_arg_exprs, &lists, 0),
                 args[0].expr.loc,
                 next_continuation,
+                current_winders,
                 state,
             )
         }
@@ -1298,10 +1564,8 @@ fn continue_with_native_procedure(
 
             let operator = args[0].value.clone();
             let mut applied_args = args[1..args.len() - 1].to_vec();
-            let tail_list = expect_proper_list(
-                &args[args.len() - 1].value,
-                args[args.len() - 1].expr.loc,
-            )?;
+            let tail_list =
+                expect_proper_list(&args[args.len() - 1].value, args[args.len() - 1].expr.loc)?;
             applied_args.extend(tail_list.into_iter().map(|value| EvaluatedArg {
                 expr: args[args.len() - 1].expr.clone(),
                 value,
@@ -1312,6 +1576,7 @@ fn continue_with_native_procedure(
                 applied_args,
                 args[0].expr.loc,
                 continuation,
+                current_winders,
                 state,
             )
         }
@@ -1367,18 +1632,19 @@ fn continue_with_native_procedure(
                 build_indexed_args(&list_arg_exprs, &lists, 0),
                 args[0].expr.loc,
                 next_continuation,
+                current_winders,
                 state,
             )
         }
         NativeProcedureKind::CallCc => {
             expect_exact_args(&procedure.name, &args, loc, 1)?;
 
-            let continuation_value =
-                Value::Procedure(ProcedureValue::Continuation(Rc::new(
-                    ContinuationProcedure {
-                        continuation: continuation.clone(),
-                    },
-                )));
+            let continuation_value = Value::Procedure(ProcedureValue::Continuation(Rc::new(
+                ContinuationProcedure {
+                    continuation: continuation.clone(),
+                    winders: current_winders.clone(),
+                },
+            )));
 
             continue_with_application(
                 args[0].value.clone(),
@@ -1388,6 +1654,36 @@ fn continue_with_native_procedure(
                 }],
                 args[0].expr.loc,
                 continuation,
+                current_winders,
+                state,
+            )
+        }
+        NativeProcedureKind::DynamicWind => {
+            expect_exact_args(&procedure.name, &args, loc, 3)?;
+
+            let wind_frame = Rc::new(WindFrame {
+                id: state.fresh_unique_id(),
+                in_thunk: args[0].value.clone(),
+                out_thunk: args[2].value.clone(),
+                parent: current_winders.clone(),
+            });
+
+            let next_continuation = push_continuation(
+                &continuation,
+                ContinuationFrame::DynamicWindEnter {
+                    body_thunk: args[1].value.clone(),
+                    wind_frame,
+                    body_loc: args[1].expr.loc,
+                    out_loc: args[2].expr.loc,
+                },
+            );
+
+            continue_with_application(
+                args[0].value.clone(),
+                Vec::new(),
+                args[0].expr.loc,
+                next_continuation,
+                current_winders,
                 state,
             )
         }
@@ -1396,9 +1692,7 @@ fn continue_with_native_procedure(
             Ok((
                 MachineControl::Value(Value::Record(Rc::new(RecordValue {
                     type_info: type_info.clone(),
-                    fields: RefCell::new(
-                        args.iter().map(|arg| arg.value.clone()).collect(),
-                    ),
+                    fields: RefCell::new(args.iter().map(|arg| arg.value.clone()).collect()),
                 }))),
                 continuation,
             ))
@@ -1568,10 +1862,7 @@ fn desugar_cond_clauses(
 
     if is_else_clause {
         if !rest.is_empty() {
-            return Err(err_at(
-                test_expr.loc,
-                "else must be the last cond clause",
-            ));
+            return Err(err_at(test_expr.loc, "else must be the last cond clause"));
         }
 
         return Ok(begin_expr(body.to_vec(), clause.loc));
@@ -1658,16 +1949,15 @@ fn desugar_named_let(args: &[Expr], head_loc: SourceLoc) -> Result<Expr, EvalErr
     let mut lambda = vec![plain_symbol_expr("lambda", head_loc), params];
     lambda.extend(args[2..].to_vec());
     let binding = list_expr(
-        vec![identifier_expr(name.clone(), name_expr.loc), list_expr(lambda, head_loc)],
+        vec![
+            identifier_expr(name.clone(), name_expr.loc),
+            list_expr(lambda, head_loc),
+        ],
         head_loc,
     );
 
     let mut call = vec![identifier_expr(name.clone(), name_expr.loc)];
-    call.extend(
-        bindings
-            .iter()
-            .map(|binding| binding.value_expr.clone()),
-    );
+    call.extend(bindings.iter().map(|binding| binding.value_expr.clone()));
 
     Ok(list_expr(
         vec![
@@ -1785,11 +2075,7 @@ fn desugar_letrec(
         inner_lambda.extend(inner_body);
 
         let mut inner_application = vec![list_expr(inner_lambda, head_loc)];
-        inner_application.extend(
-            bindings
-                .iter()
-                .map(|binding| binding.value_expr.clone()),
-        );
+        inner_application.extend(bindings.iter().map(|binding| binding.value_expr.clone()));
         outer_body.push(list_expr(inner_application, head_loc));
     }
 
@@ -1797,11 +2083,7 @@ fn desugar_letrec(
     outer_lambda.extend(outer_body);
 
     let mut outer_application = vec![list_expr(outer_lambda, head_loc)];
-    outer_application.extend(
-        bindings
-            .iter()
-            .map(|_| boolean_expr(false, head_loc)),
-    );
+    outer_application.extend(bindings.iter().map(|_| boolean_expr(false, head_loc)));
     Ok(list_expr(outer_application, head_loc))
 }
 
@@ -1811,10 +2093,7 @@ fn desugar_case(
     state: &mut EvalState,
 ) -> Result<Expr, EvalError> {
     if args.is_empty() {
-        return Err(err_at(
-            head_loc,
-            "case expects a key and at least 1 clause",
-        ));
+        return Err(err_at(head_loc, "case expects a key and at least 1 clause"));
     }
 
     let key = state.fresh_identifier("case-key");
@@ -1834,10 +2113,7 @@ fn desugar_case(
 
         if matches!(expr_plain_symbol(datums_expr), Some("else")) {
             if index != args.len() - 2 {
-                return Err(err_at(
-                    datums_expr.loc,
-                    "else must be the last case clause",
-                ));
+                return Err(err_at(datums_expr.loc, "else must be the last case clause"));
             }
 
             let mut clause_expr = vec![plain_symbol_expr("else", datums_expr.loc)];
@@ -1847,10 +2123,7 @@ fn desugar_case(
         }
 
         let Some(datums) = expr_list(datums_expr) else {
-            return Err(err_at(
-                datums_expr.loc,
-                "case clause datums must be a list",
-            ));
+            return Err(err_at(datums_expr.loc, "case clause datums must be a list"));
         };
 
         let tests = datums
@@ -2116,19 +2389,17 @@ fn evaluate_tail(
                             expr = args[args.len() - 1].clone();
                             continue;
                         }
-                        "begin" => {
-                            match prepare_tail_sequence(args, &env, state)? {
-                                TailAction::Return(value) => return Ok(value),
-                                TailAction::Continue {
-                                    expr: next_expr,
-                                    env: next_env,
-                                } => {
-                                    expr = next_expr;
-                                    env = next_env;
-                                    continue;
-                                }
+                        "begin" => match prepare_tail_sequence(args, &env, state)? {
+                            TailAction::Return(value) => return Ok(value),
+                            TailAction::Continue {
+                                expr: next_expr,
+                                env: next_env,
+                            } => {
+                                expr = next_expr;
+                                env = next_env;
+                                continue;
                             }
-                        }
+                        },
                         "cond" => {
                             let mut matched = false;
 
@@ -2273,7 +2544,11 @@ fn evaluate_tail(
                                 .collect::<Result<Vec<_>, EvalError>>()?;
 
                             for (binding, value) in bindings.iter().zip(values) {
-                                let_env.set_identifier(&binding.name, value, binding.value_expr.loc)?;
+                                let_env.set_identifier(
+                                    &binding.name,
+                                    value,
+                                    binding.value_expr.loc,
+                                )?;
                             }
 
                             match prepare_tail_sequence(&args[1..], &let_env, state)? {
@@ -2305,7 +2580,11 @@ fn evaluate_tail(
 
                             for binding in &bindings {
                                 let value = evaluate(&binding.value_expr, &let_env, state)?;
-                                let_env.set_identifier(&binding.name, value, binding.value_expr.loc)?;
+                                let_env.set_identifier(
+                                    &binding.name,
+                                    value,
+                                    binding.value_expr.loc,
+                                )?;
                             }
 
                             match prepare_tail_sequence(&args[1..], &let_env, state)? {
@@ -2891,10 +3170,7 @@ fn eval_case(
             return Err(err_at(datums_expr.loc, "case clause datums must be a list"));
         };
 
-        if datums
-            .iter()
-            .any(|datum| is_eqv(&key, &quote_expr(datum)))
-        {
+        if datums.iter().any(|datum| is_eqv(&key, &quote_expr(datum))) {
             return evaluate_sequence(body, env, state);
         }
     }
@@ -2980,7 +3256,10 @@ fn eval_do(
 
     loop {
         if is_truthy(&evaluate(test_expr, &loop_env, state)?) {
-            return apply_tail_action(prepare_tail_sequence(result_exprs, &loop_env, state)?, state);
+            return apply_tail_action(
+                prepare_tail_sequence(result_exprs, &loop_env, state)?,
+                state,
+            );
         }
 
         evaluate_sequence(body, &loop_env, state)?;
@@ -3008,11 +3287,13 @@ fn apply_procedure(
     loc: SourceLoc,
     state: &mut EvalState,
 ) -> Result<Value, EvalError> {
+    let mut current_winders: Winders = None;
     let (control, continuation) = continue_with_application(
         operator,
         args.to_vec(),
         loc,
         done_continuation(),
+        &mut current_winders,
         state,
     )?;
     run_machine(control, continuation, state)
@@ -3096,12 +3377,16 @@ fn apply_native_procedure(
         }
         NativeProcedureKind::Apply => {
             if args.len() < 2 {
-                return Err(err_at(loc, "apply expects a procedure and an argument list"));
+                return Err(err_at(
+                    loc,
+                    "apply expects a procedure and an argument list",
+                ));
             }
 
             let operator = args[0].value.clone();
             let mut applied_args = args[1..args.len() - 1].to_vec();
-            let tail_list = expect_proper_list(&args[args.len() - 1].value, args[args.len() - 1].expr.loc)?;
+            let tail_list =
+                expect_proper_list(&args[args.len() - 1].value, args[args.len() - 1].expr.loc)?;
             applied_args.extend(tail_list.into_iter().map(|value| EvaluatedArg {
                 expr: args[args.len() - 1].expr.clone(),
                 value,
@@ -3159,12 +3444,21 @@ fn apply_native_procedure(
                     value: Value::Procedure(ProcedureValue::Continuation(Rc::new(
                         ContinuationProcedure {
                             continuation: done_continuation(),
+                            winders: None,
                         },
                     ))),
                 }],
                 args[0].expr.loc,
                 state,
             )
+        }
+        NativeProcedureKind::DynamicWind => {
+            expect_exact_args(&procedure.name, args, loc, 3)?;
+
+            apply_procedure(args[0].value.clone(), &[], args[0].expr.loc, state)?;
+            let result = apply_procedure(args[1].value.clone(), &[], args[1].expr.loc, state)?;
+            apply_procedure(args[2].value.clone(), &[], args[2].expr.loc, state)?;
+            Ok(result)
         }
         NativeProcedureKind::RecordConstructor(type_info) => {
             expect_exact_args(&procedure.name, args, loc, type_info.field_count)?;
@@ -3338,14 +3632,22 @@ fn parse_parameter_list(
 
             let identifier = expr_identifier(&params[index + 1])
                 .ok_or_else(|| err_at(params[index + 1].loc, message))?;
-            rest = Some(expect_non_dot_identifier(identifier, params[index + 1].loc, message)?);
+            rest = Some(expect_non_dot_identifier(
+                identifier,
+                params[index + 1].loc,
+                message,
+            )?);
             index += 2;
             break;
         }
 
-        let identifier = expr_identifier(&params[index])
-            .ok_or_else(|| err_at(params[index].loc, message))?;
-        required.push(expect_non_dot_identifier(identifier, params[index].loc, message)?);
+        let identifier =
+            expr_identifier(&params[index]).ok_or_else(|| err_at(params[index].loc, message))?;
+        required.push(expect_non_dot_identifier(
+            identifier,
+            params[index].loc,
+            message,
+        )?);
         index += 1;
     }
 
@@ -3975,7 +4277,8 @@ fn hygienize_list(
     }
 
     if matches!(head_name, Some("do")) && elements.len() >= 3 {
-        if let (Some(bindings), Some(test_clause)) = (expr_list(&elements[1]), expr_list(&elements[2]))
+        if let (Some(bindings), Some(test_clause)) =
+            (expr_list(&elements[1]), expr_list(&elements[2]))
         {
             let mut body_scope = scope.clone();
             let mut hygienic_bindings = Vec::new();
@@ -3995,7 +4298,12 @@ fn hygienize_list(
                 ];
 
                 if parts.len() == 3 {
-                    hygienic_parts.push(hygienize_expr(&parts[2], &body_scope, definition_env, state));
+                    hygienic_parts.push(hygienize_expr(
+                        &parts[2],
+                        &body_scope,
+                        definition_env,
+                        state,
+                    ));
                 }
 
                 hygienic_bindings.push(Expr {
@@ -4808,7 +5116,9 @@ fn builtin_string_to_symbol(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Val
 
 fn builtin_string_length(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Value, EvalError> {
     expect_exact_args("string-length", args, loc, 1)?;
-    Ok(Value::Number(expect_string_arg(&args[0])?.chars().count() as f64))
+    Ok(Value::Number(
+        expect_string_arg(&args[0])?.chars().count() as f64
+    ))
 }
 
 fn builtin_make_string(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Value, EvalError> {

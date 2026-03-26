@@ -144,6 +144,13 @@ interface ProcedureClause extends ParsedParameters {
 
 type Continuation = (value: Value) => MachineAction;
 
+interface WindFrame {
+  inThunk: ProcedureValue;
+  inLoc: SourceLoc;
+  outThunk: ProcedureValue;
+  outLoc: SourceLoc;
+}
+
 interface PureBuiltinProcedure {
   kind: 'procedure';
   name: string;
@@ -193,6 +200,7 @@ interface ContinuationProcedure {
   kind: 'procedure';
   name: 'continuation';
   resume: Continuation;
+  windStack: WindFrame[];
 }
 
 type BuiltinProcedure = PureBuiltinProcedure | ControlBuiltinProcedure;
@@ -247,6 +255,7 @@ class Runtime {
   private readonly output: string[] = [];
   private readonly syntaxRules = new Map<string, MacroTransformer>();
   private nextUnique = 1;
+  private windStack: WindFrame[] = [];
 
   write(value: string): void {
     this.output.push(value);
@@ -272,6 +281,24 @@ class Runtime {
     const unique = this.nextUnique;
     this.nextUnique += 1;
     return `#${unique}:${name}`;
+  }
+
+  snapshotWindStack(): WindFrame[] {
+    return [...this.windStack];
+  }
+
+  pushWindFrame(frame: WindFrame): void {
+    this.windStack = [...this.windStack, frame];
+  }
+
+  popWindFrame(): WindFrame | undefined {
+    const popped = this.windStack[this.windStack.length - 1];
+    this.windStack = this.windStack.slice(0, -1);
+    return popped;
+  }
+
+  setWindStack(stack: WindFrame[]): void {
+    this.windStack = [...stack];
   }
 }
 
@@ -1215,6 +1242,7 @@ function createGlobalEnv(runtime: Runtime): Environment {
         kind: 'procedure',
         name: 'continuation',
         resume: cont,
+        windStack: runtime.snapshotWindStack(),
       };
 
       return applyProcedure(
@@ -1229,6 +1257,28 @@ function createGlobalEnv(runtime: Runtime): Environment {
 
   defineCallCcBuiltin('call/cc');
   defineCallCcBuiltin('call-with-current-continuation');
+
+  env.define('dynamic-wind', controlBuiltin('dynamic-wind', (args, loc, runtime, cont) => {
+    if (args.length !== 3) {
+      throw new EvalError(`${loc.line}:${loc.col}: dynamic-wind expects exactly 3 arguments`);
+    }
+
+    const frame: WindFrame = {
+      inThunk: expectProcedureArg(args[0]),
+      inLoc: args[0].expr,
+      outThunk: expectProcedureArg(args[2]),
+      outLoc: args[2].expr,
+    };
+    const bodyThunk = expectProcedureArg(args[1]);
+
+    return invokeThunk(frame.inThunk, frame.inLoc, runtime, (_ignored) => {
+      runtime.pushWindFrame(frame);
+      return invokeThunk(bodyThunk, args[1].expr, runtime, (value) => {
+        runtime.popWindFrame();
+        return invokeThunk(frame.outThunk, frame.outLoc, runtime, (_ignoredOut) => cont(value));
+      });
+    });
+  }));
 
   env.define('string?', predicateBuiltin('string?', isSchemeStringValue));
   env.define('number?', predicateBuiltin('number?', isNumberValue));
@@ -2487,7 +2537,7 @@ function applyProcedure(
       throw new EvalError(`${loc.line}:${loc.col}: continuation expects exactly 1 argument`);
     }
 
-    return operator.resume(args[0].value);
+    return resumeContinuation(operator, args[0].value, runtime);
   }
 
   if (isControlBuiltinProcedure(operator)) {
@@ -2671,6 +2721,81 @@ function evaluateExpressions(
   return makeEvalAction(expr, env, (value) => (
     evaluateExpressions(exprs, env, cont, index + 1, [...values, value])
   ));
+}
+
+function invokeThunk(
+  thunk: ProcedureValue,
+  loc: SourceLoc,
+  runtime: Runtime,
+  cont: Continuation,
+): MachineAction {
+  return applyProcedure(thunk, [], loc, runtime, cont);
+}
+
+function resumeContinuation(
+  continuation: ContinuationProcedure,
+  value: Value,
+  runtime: Runtime,
+): MachineAction {
+  const currentStack = runtime.snapshotWindStack();
+  const targetStack = continuation.windStack;
+  const sharedLength = sharedWindPrefixLength(currentStack, targetStack);
+
+  return unwindWindFrames(currentStack, sharedLength, runtime, () => (
+    rewindWindFrames(targetStack, sharedLength, runtime, () => {
+      runtime.setWindStack(targetStack);
+      return continuation.resume(value);
+    })
+  ));
+}
+
+function sharedWindPrefixLength(left: WindFrame[], right: WindFrame[]): number {
+  let index = 0;
+
+  while (index < left.length && index < right.length && left[index] === right[index]) {
+    index += 1;
+  }
+
+  return index;
+}
+
+function unwindWindFrames(
+  currentStack: WindFrame[],
+  sharedLength: number,
+  runtime: Runtime,
+  cont: () => MachineAction,
+  index = currentStack.length - 1,
+): MachineAction {
+  if (index < sharedLength) {
+    runtime.setWindStack(currentStack.slice(0, sharedLength));
+    return cont();
+  }
+
+  const frame = currentStack[index];
+  runtime.setWindStack(currentStack.slice(0, index));
+  return invokeThunk(frame.outThunk, frame.outLoc, runtime, (_ignored) => (
+    unwindWindFrames(currentStack, sharedLength, runtime, cont, index - 1)
+  ));
+}
+
+function rewindWindFrames(
+  targetStack: WindFrame[],
+  sharedLength: number,
+  runtime: Runtime,
+  cont: () => MachineAction,
+  index = sharedLength,
+): MachineAction {
+  if (index >= targetStack.length) {
+    runtime.setWindStack(targetStack);
+    return cont();
+  }
+
+  const frame = targetStack[index];
+  runtime.setWindStack(targetStack.slice(0, index));
+  return invokeThunk(frame.inThunk, frame.inLoc, runtime, (_ignored) => {
+    runtime.setWindStack(targetStack.slice(0, index + 1));
+    return rewindWindFrames(targetStack, sharedLength, runtime, cont, index + 1);
+  });
 }
 
 function runMachine(initial: MachineAction, runtime: Runtime): Value {
@@ -3528,6 +3653,14 @@ function expectCharArg(arg: EvaluatedArg): SchemeChar {
 function expectVectorArg(arg: EvaluatedArg): VectorValue {
   if (!isVectorValue(arg.value)) {
     throw new EvalError(`${arg.expr.line}:${arg.expr.col}: expected vector`);
+  }
+
+  return arg.value;
+}
+
+function expectProcedureArg(arg: EvaluatedArg): ProcedureValue {
+  if (!isProcedure(arg.value)) {
+    throw new EvalError(`${arg.expr.line}:${arg.expr.col}: not a procedure`);
   }
 
   return arg.value;
