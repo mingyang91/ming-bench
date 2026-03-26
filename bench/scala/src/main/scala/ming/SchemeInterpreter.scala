@@ -1,6 +1,7 @@
 package ming
 
 import SchemeModel.*
+import SchemeRuntime.*
 
 object SchemeInterpreter:
 
@@ -35,8 +36,14 @@ object SchemeInterpreter:
         evalAnd(rest, env)
       case Expr.ListExpr(Expr.Symbol("or") :: rest) =>
         evalOr(rest, env)
+      case Expr.ListExpr(Expr.Symbol("begin") :: rest) =>
+        evalBegin(rest, env)
+      case Expr.ListExpr(Expr.Symbol("cond") :: rest) =>
+        evalCond(rest, env)
+      case Expr.ListExpr(Expr.Symbol("let") :: rest) =>
+        evalLet(rest, env)
       case Expr.ListExpr(operator :: args) =>
-        apply(eval(operator, env), args.map(eval(_, env)))
+        apply(eval(operator, env), args.map(arg => eval(arg, env)))
 
   private def evalQuote(args: List[Expr]): Value =
     args match
@@ -70,6 +77,79 @@ object SchemeInterpreter:
       case _ =>
         throw new EvalError("invalid lambda form")
 
+  private def evalBegin(args: List[Expr], env: Env): Value =
+    evalSequence(args, env)
+
+  private def evalCond(clauses: List[Expr], env: Env): Value =
+    @annotation.tailrec
+    def loop(remaining: List[Expr]): Value =
+      remaining match
+        case Nil =>
+          Value.VoidValue
+        case Expr.ListExpr(Nil) :: _ =>
+          throw new EvalError("cond clauses must be non-empty lists")
+        case Expr.ListExpr(Expr.Symbol("else") :: expressions) :: tail =>
+          if tail.nonEmpty then throw new EvalError("cond else clause must be last")
+          evalSequence(expressions, env)
+        case Expr.ListExpr(testExpr :: expressions) :: tail =>
+          val testValue = eval(testExpr, env)
+          if isTruthy(testValue) then if expressions.isEmpty then testValue else evalSequence(expressions, env)
+          else loop(tail)
+        case _ =>
+          throw new EvalError("cond clauses must be non-empty lists")
+
+    loop(clauses)
+
+  private def evalLet(args: List[Expr], env: Env): Value =
+    args match
+      case Expr.Symbol(name) :: bindingsExpr :: body if body.nonEmpty =>
+        evalNamedLet(name, bindingsExpr, body, env)
+      case bindingsExpr :: body if body.nonEmpty =>
+        evalPlainLet(bindingsExpr, body, env)
+      case _ =>
+        throw new EvalError("invalid let form")
+
+  private def evalPlainLet(bindingsExpr: Expr, body: List[Expr], env: Env): Value =
+    val bindings = parseBindings(bindingsExpr)
+    val values = bindings.map { case (_, valueExpr) =>
+      eval(valueExpr, env)
+    }
+    val letEnv = new Env(Some(env))
+
+    bindings.zip(values).foreach { case ((name, _), value) =>
+      letEnv.define(name, value)
+    }
+
+    evalSequence(body, letEnv)
+
+  private def evalNamedLet(name: String, bindingsExpr: Expr, body: List[Expr], env: Env): Value =
+    val bindings = parseBindings(bindingsExpr)
+    val params   = bindings.map(_._1)
+    val args = bindings.map { case (_, valueExpr) =>
+      eval(valueExpr, env)
+    }
+    val letEnv                 = new Env(Some(env))
+    val closure: Value.Closure = Value.Closure(Some(name), params, body, letEnv)
+
+    letEnv.define(name, closure)
+    applyClosure(closure, args)
+
+  private def parseBindings(bindingsExpr: Expr): List[(String, Expr)] =
+    bindingsExpr match
+      case Expr.ListExpr(bindings) =>
+        val parsed = bindings.map {
+          case Expr.ListExpr(List(Expr.Symbol(name), valueExpr)) =>
+            (name, valueExpr)
+          case Expr.ListExpr(List(_, _)) =>
+            throw new EvalError("let bindings must have symbol names")
+          case _ =>
+            throw new EvalError("let bindings must contain (name value) pairs")
+        }
+        ensureDistinct(parsed.map(_._1), "let bindings")
+        parsed
+      case _ =>
+        throw new EvalError("let bindings must be a list")
+
   private def buildClosure(
     paramsExpr: List[Expr],
     body: List[Expr],
@@ -80,7 +160,7 @@ object SchemeInterpreter:
       case Expr.Symbol(paramName) => paramName
       case _                      => throw new EvalError("lambda parameters must be symbols")
     }
-    if params.distinct.length != params.length then throw new EvalError("lambda parameters must be distinct")
+    ensureDistinct(params, "lambda parameters")
     Value.Closure(name, params, body, env)
 
   private def quoteExpr(expr: Expr): Value =
@@ -90,25 +170,31 @@ object SchemeInterpreter:
       case Expr.StringLiteral(value)  => Value.StringValue(value)
       case Expr.Symbol(name)          => Value.SymbolValue(name)
       case Expr.ListExpr(items) =>
-        items.foldRight(Value.NilValue: Value) { (item, rest) =>
-          Value.PairValue(quoteExpr(item), rest)
-        }
+        makeList(items.map(quoteExpr))
 
   private def evalAnd(args: List[Expr], env: Env): Value =
-    var result: Value = Value.BooleanValue(true)
-    val iterator      = args.iterator
-    while iterator.hasNext do
-      result = eval(iterator.next(), env)
-      if !isTruthy(result) then return result
-    result
+    @annotation.tailrec
+    def loop(remaining: List[Expr], result: Value): Value =
+      remaining match
+        case Nil =>
+          result
+        case head :: tail =>
+          val next = eval(head, env)
+          if isTruthy(next) then loop(tail, next) else next
+
+    loop(args, Value.BooleanValue(true))
 
   private def evalOr(args: List[Expr], env: Env): Value =
-    var result: Value = Value.BooleanValue(false)
-    val iterator      = args.iterator
-    while iterator.hasNext do
-      result = eval(iterator.next(), env)
-      if isTruthy(result) then return result
-    result
+    @annotation.tailrec
+    def loop(remaining: List[Expr], result: Value): Value =
+      remaining match
+        case Nil =>
+          result
+        case head :: tail =>
+          val next = eval(head, env)
+          if isTruthy(next) then next else loop(tail, next)
+
+    loop(args, Value.BooleanValue(false))
 
   private def apply(procedure: Value, args: List[Value]): Value =
     procedure match
@@ -126,133 +212,6 @@ object SchemeInterpreter:
     evalSequence(closure.body, callEnv)
 
   private def evalSequence(expressions: List[Expr], env: Env): Value =
-    var result: Value = Value.VoidValue
-    expressions.foreach(expr => result = eval(expr, env))
-    result
-
-  private def isTruthy(value: Value): Boolean =
-    value match
-      case Value.BooleanValue(false) => false
-      case _                         => true
-
-  private def render(value: Value): String =
-    value match
-      case Value.IntegerValue(number) => number.toString
-      case Value.BooleanValue(flag)   => if flag then "#t" else "#f"
-      case Value.StringValue(text)    => s""""${escapeString(text)}""""
-      case Value.SymbolValue(name)    => name
-      case Value.NilValue             => "()"
-      case pair: Value.PairValue      => renderPair(pair)
-      case Value.Builtin(name, _)     => s"#<procedure:$name>"
-      case Value.Closure(Some(name), _, _, _) =>
-        s"#<procedure:$name>"
-      case Value.Closure(None, _, _, _) =>
-        "#<procedure>"
-      case Value.VoidValue =>
-        "#<void>"
-
-  private def renderPair(pair: Value.PairValue): String =
-    val builder        = new StringBuilder("(")
-    var current: Value = pair
-    var first          = true
-
-    while true do
-      current match
-        case Value.PairValue(car, cdr) =>
-          if !first then builder.append(" ")
-          builder.append(render(car))
-          current = cdr
-          first = false
-        case Value.NilValue =>
-          builder.append(")")
-          return builder.result()
-        case other =>
-          builder.append(" . ")
-          builder.append(render(other))
-          builder.append(")")
-          return builder.result()
-
-    builder.result()
-
-  private def escapeString(text: String): String =
-    text.flatMap {
-      case '"'  => "\\\""
-      case '\\' => "\\\\"
-      case '\n' => "\\n"
-      case '\r' => "\\r"
-      case '\t' => "\\t"
-      case c    => c.toString
+    expressions.foldLeft(Value.VoidValue: Value) { (_, expr) =>
+      eval(expr, env)
     }
-
-  private def requireArgCount(name: String, args: List[Value], exact: Int): Unit =
-    if args.length != exact then throw new EvalError(s"$name expected $exact argument(s), got ${args.length}")
-
-  private def requireMinArgCount(name: String, args: List[Value], minimum: Int): Unit =
-    if args.length < minimum then
-      throw new EvalError(s"$name expected at least $minimum argument(s), got ${args.length}")
-
-  private def numericArgs(name: String, args: List[Value]): List[BigInt] =
-    args.map {
-      case Value.IntegerValue(number) => number
-      case other =>
-        throw new EvalError(s"$name expected a number, got ${render(other)}")
-    }
-
-  private def numericComparator(name: String)(predicate: (BigInt, BigInt) => Boolean): Value =
-    Value.Builtin(
-      name,
-      args =>
-        val numbers = numericArgs(name, args)
-        requireMinArgCount(name, args, 2)
-        Value.BooleanValue(numbers.zip(numbers.tail).forall(predicate.tupled))
-    )
-
-  private def baseEnv(): Env =
-    val env = new Env(None)
-    builtinBindings.foreach { case (name, value) =>
-      env.define(name, value)
-    }
-
-    env
-
-  private val builtinBindings: List[(String, Value)] = List(
-    "+" -> Value.Builtin(
-      "+",
-      args => Value.IntegerValue(numericArgs("+", args).foldLeft(BigInt(0))(_ + _))
-    ),
-    "-" -> Value.Builtin(
-      "-",
-      args =>
-        val numbers = numericArgs("-", args)
-        requireMinArgCount("-", args, 1)
-        val result =
-          if numbers.length == 1 then -numbers.head
-          else numbers.tail.foldLeft(numbers.head)(_ - _)
-        Value.IntegerValue(result)
-    ),
-    "*" -> Value.Builtin(
-      "*",
-      args => Value.IntegerValue(numericArgs("*", args).foldLeft(BigInt(1))(_ * _))
-    ),
-    "/" -> Value.Builtin(
-      "/",
-      args =>
-        val numbers = numericArgs("/", args)
-        requireMinArgCount("/", args, 2)
-        val result = numbers.tail.foldLeft(numbers.head) { (left, right) =>
-          if right == 0 then throw new EvalError("division by zero")
-          left / right
-        }
-        Value.IntegerValue(result)
-    ),
-    "<"  -> numericComparator("<")(_ < _),
-    ">"  -> numericComparator(">")(_ > _),
-    "="  -> numericComparator("=")(_ == _),
-    "<=" -> numericComparator("<=")(_ <= _),
-    "not" -> Value.Builtin(
-      "not",
-      args =>
-        requireArgCount("not", args, 1)
-        Value.BooleanValue(!isTruthy(args.head))
-    )
-  )
