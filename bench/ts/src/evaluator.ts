@@ -21,9 +21,11 @@ type SchemeVal =
   | { tag: 'record'; type: symbol; fields: Map<string, SchemeVal>; pos?: Pos }
   | { tag: 'case-lambda'; clauses: { params: string[]; rest?: string; body: SchemeVal[] }[]; env: Env; pos?: Pos }
   | { tag: 'vector'; value: SchemeVal[]; pos?: Pos }
-  | { tag: 'continuation'; k: Kont; pos?: Pos };
+  | { tag: 'continuation'; k: Kont; winders: Winder[]; pos?: Pos };
 
 type DoVar = { name: string; step?: SchemeVal };
+
+type Winder = { inThunk: SchemeVal; outThunk: SchemeVal };
 
 type Kont =
   | { tag: 'halt' }
@@ -43,7 +45,11 @@ type Kont =
   | { tag: 'cond'; cl: SchemeVal[]; ci: number; env: Env; k: Kont }
   | { tag: 'do-init'; vars: DoVar[]; done: SchemeVal[]; todo: SchemeVal[]; oEnv: Env; test: SchemeVal; body: SchemeVal[]; k: Kont }
   | { tag: 'do-test'; vars: DoVar[]; dEnv: Env; test: SchemeVal; body: SchemeVal[]; k: Kont }
-  | { tag: 'do-step'; vars: DoVar[]; nv: (SchemeVal | undefined)[]; si: number; dEnv: Env; test: SchemeVal; body: SchemeVal[]; k: Kont };
+  | { tag: 'do-step'; vars: DoVar[]; nv: (SchemeVal | undefined)[]; si: number; dEnv: Env; test: SchemeVal; body: SchemeVal[]; k: Kont }
+  | { tag: 'dw-pre'; bodyThunk: SchemeVal; outThunk: SchemeVal; winder: Winder; k: Kont }
+  | { tag: 'dw-body'; outThunk: SchemeVal; k: Kont }
+  | { tag: 'dw-post'; bodyVal: SchemeVal; k: Kont }
+  | { tag: 'dw-wind'; ops: { thunk: SchemeVal; ws: Winder[] }[]; targetK: Kont; targetVal: SchemeVal };
 
 function posStr(pos?: Pos): string {
   return pos ? `${pos.line}:${pos.col}: ` : '';
@@ -1327,6 +1333,7 @@ const BUILTIN_NAMES = new Set([
   'vector->list', 'list->vector',
   // L18
   'call/cc', 'call-with-current-continuation',
+  'dynamic-wind',
 ]);
 
 function bindLambdaArgs(proc: { params: string[]; rest?: string; body: SchemeVal[] }, args: SchemeVal[], procEnv: Env, callPos?: Pos): Env {
@@ -1355,14 +1362,23 @@ function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'ha
   let k: Kont = startK;
   let val: SchemeVal = NIL;
   let isEval = true;
+  const winders: Winder[] = [];
 
   function doApply(proc: SchemeVal, args: SchemeVal[], pos?: Pos, kk?: Kont): void {
     const kCont = kk!;
     if (proc.tag === 'builtin') {
       if (proc.name === 'call/cc' || proc.name === 'call-with-current-continuation') {
         if (args.length !== 1) throw new EvalError(`${posStr(pos)}call/cc: expected 1 argument, got ${args.length}`);
-        const contVal: SchemeVal = { tag: 'continuation', k: kCont };
+        const contVal: SchemeVal = { tag: 'continuation', k: kCont, winders: [...winders] };
         doApply(args[0], [contVal], pos, kCont);
+        return;
+      }
+      if (proc.name === 'dynamic-wind') {
+        if (args.length !== 3) throw new EvalError(`${posStr(pos)}dynamic-wind: expected 3 arguments, got ${args.length}`);
+        const [inThunk, bodyThunk, outThunk] = args;
+        const winder: Winder = { inThunk, outThunk };
+        const dwK: Kont = { tag: 'dw-pre', bodyThunk, outThunk, winder, k: kCont };
+        doApply(inThunk, [], pos, dwK);
         return;
       }
       if (proc.name === 'apply') {
@@ -1401,8 +1417,31 @@ function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'ha
       throw new EvalError(`${posStr(pos)}case-lambda: no matching clause for ${args.length} arguments`);
     }
     if (proc.tag === 'continuation') {
-      val = args.length > 0 ? args[0] : { tag: 'void' };
-      k = proc.k; isEval = false;
+      const targetVal: SchemeVal = args.length > 0 ? args[0] : { tag: 'void' };
+      const targetWinders = proc.winders;
+      const targetK = proc.k;
+
+      // Find common prefix
+      let cp = 0;
+      while (cp < winders.length && cp < targetWinders.length && winders[cp] === targetWinders[cp]) cp++;
+
+      // Build wind operations: unwind then rewind
+      const ops: { thunk: SchemeVal; ws: Winder[] }[] = [];
+      for (let i = winders.length - 1; i >= cp; i--) {
+        ops.push({ thunk: winders[i].outThunk, ws: winders.slice(0, i) });
+      }
+      for (let i = cp; i < targetWinders.length; i++) {
+        ops.push({ thunk: targetWinders[i].inThunk, ws: targetWinders.slice(0, i + 1) });
+      }
+
+      if (ops.length === 0) {
+        val = targetVal; k = targetK; isEval = false;
+      } else {
+        const [first, ...rest] = ops;
+        winders.length = 0; winders.push(...first.ws);
+        const windK: Kont = { tag: 'dw-wind', ops: rest, targetK, targetVal };
+        doApply(first.thunk, [], pos, windK);
+      }
       return;
     }
     throw new EvalError(`${posStr(pos)}not a procedure`);
@@ -1646,6 +1685,41 @@ function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'ha
           expr = k.vars[nextSi].step!; env = k.dEnv;
           k = { tag: 'do-step', vars: k.vars, nv, si: nextSi, dEnv: k.dEnv, test: k.test, body: k.body, k: k.k };
           isEval = true; break;
+        }
+
+        case 'dw-pre': {
+          // in-thunk completed, push winder and call body-thunk
+          winders.push(k.winder);
+          const dwK: Kont = { tag: 'dw-body', outThunk: k.outThunk, k: k.k };
+          doApply(k.bodyThunk, [], undefined, dwK);
+          break;
+        }
+
+        case 'dw-body': {
+          // body-thunk completed, pop winder, save value, call out-thunk
+          winders.pop();
+          const savedVal = val;
+          const dwK: Kont = { tag: 'dw-post', bodyVal: savedVal, k: k.k };
+          doApply(k.outThunk, [], undefined, dwK);
+          break;
+        }
+
+        case 'dw-post': {
+          // out-thunk completed, return saved body value
+          val = k.bodyVal; k = k.k; break;
+        }
+
+        case 'dw-wind': {
+          // Wind operation thunk completed
+          if (k.ops.length === 0) {
+            val = k.targetVal; k = k.targetK;
+          } else {
+            const [next, ...rest] = k.ops;
+            winders.length = 0; winders.push(...next.ws);
+            const windK: Kont = { tag: 'dw-wind', ops: rest, targetK: k.targetK, targetVal: k.targetVal };
+            doApply(next.thunk, [], undefined, windK);
+          }
+          break;
         }
       }
       continue;
