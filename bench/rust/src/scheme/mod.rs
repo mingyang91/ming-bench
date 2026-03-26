@@ -30,6 +30,7 @@ enum Value {
     Pair(Box<Value>, Box<Value>),
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Expr>,
         env: Env,
     },
@@ -406,6 +407,7 @@ fn is_builtin(name: &str) -> bool {
             | "symbol->string" | "string->symbol"
             | "string-ref"
             | "string-copy"
+            | "apply"
     )
 }
 
@@ -459,15 +461,36 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                 .iter()
                 .map(|e| eval(e, env))
                 .collect::<Result<_, _>>()?;
-            apply(&func, &args, p)
+            apply_value(&func, &args, p)
         }
     }
 }
 
-fn apply(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, EvalError> {
+fn apply_value(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, EvalError> {
     match func {
         Value::Symbol(op) => apply_builtin(op, args, call_pos),
-        Value::Lambda { params, body, env } => {
+        Value::Lambda { params, rest_param, body, env } => {
+            if let Some(ref rest) = rest_param {
+                if args.len() < params.len() {
+                    return Err(EvalError::Arity(format!(
+                        "expected at least {} arguments, got {} at {}",
+                        params.len(),
+                        args.len(),
+                        call_pos
+                    )));
+                }
+                let local_env = new_env(Some(env.clone()));
+                for (p, a) in params.iter().zip(args.iter()) {
+                    env_set(&local_env, p.clone(), a.clone());
+                }
+                let rest_list = vec_to_list(args[params.len()..].to_vec());
+                env_set(&local_env, rest.clone(), rest_list);
+                let mut result = Value::Boolean(false);
+                for expr in body {
+                    result = eval(expr, &local_env)?;
+                }
+                return Ok(result);
+            }
             if args.len() != params.len() {
                 return Err(EvalError::Arity(format!(
                     "expected {} arguments, got {} at {}",
@@ -491,6 +514,38 @@ fn apply(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, EvalError
             func, call_pos
         ))),
     }
+}
+
+/// Parse a parameter list, detecting dot notation for rest params.
+/// e.g. `(x y . rest)` → (["x", "y"], Some("rest"))
+fn parse_params(param_exprs: &[Expr], p: Pos) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut params = Vec::new();
+    let mut rest_param = None;
+    let mut i = 0;
+    while i < param_exprs.len() {
+        match &param_exprs[i] {
+            Expr::Symbol(s, _) if s == "." => {
+                if i + 1 >= param_exprs.len() || i + 2 != param_exprs.len() {
+                    return Err(EvalError::Parse(format!(
+                        "invalid dot notation in parameter list at {}", p
+                    )));
+                }
+                match &param_exprs[i + 1] {
+                    Expr::Symbol(rest, _) => rest_param = Some(rest.clone()),
+                    _ => return Err(EvalError::Type(format!(
+                        "expected symbol after dot in parameter list at {}", p
+                    ))),
+                }
+                break;
+            }
+            Expr::Symbol(s, _) => params.push(s.clone()),
+            _ => return Err(EvalError::Type(format!(
+                "expected symbol as parameter at {}", p
+            ))),
+        }
+        i += 1;
+    }
+    Ok((params, rest_param))
 }
 
 fn eval_define(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
@@ -525,19 +580,11 @@ fn eval_define(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
                     )))
                 }
             };
-            let params: Vec<String> = name_and_params[1..]
-                .iter()
-                .map(|e| match e {
-                    Expr::Symbol(s, _) => Ok(s.clone()),
-                    _ => Err(EvalError::Type(format!(
-                        "define: expected symbol as parameter at {}",
-                        p
-                    ))),
-                })
-                .collect::<Result<_, _>>()?;
+            let (params, rest_param) = parse_params(&name_and_params[1..], p)?;
             let body = args[1..].to_vec();
             let lambda = Value::Lambda {
                 params,
+                rest_param,
                 body,
                 env: env.clone(),
             };
@@ -575,17 +622,12 @@ fn eval_lambda(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
             p
         )));
     }
-    let params = match &args[0] {
-        Expr::List(param_exprs, _) => param_exprs
-            .iter()
-            .map(|e| match e {
-                Expr::Symbol(s, _) => Ok(s.clone()),
-                _ => Err(EvalError::Type(format!(
-                    "lambda: expected symbol as parameter at {}",
-                    p
-                ))),
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+    let (params, rest_param) = match &args[0] {
+        Expr::List(param_exprs, _) => parse_params(param_exprs, p)?,
+        Expr::Symbol(s, _) => {
+            // (lambda args body) — single symbol captures all args
+            (vec![], Some(s.clone()))
+        }
         _ => {
             return Err(EvalError::Type(format!(
                 "lambda: expected parameter list at {}",
@@ -596,6 +638,7 @@ fn eval_lambda(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
     let body = args[1..].to_vec();
     Ok(Value::Lambda {
         params,
+        rest_param,
         body,
         env: env.clone(),
     })
@@ -698,6 +741,7 @@ fn eval_let(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
         let loop_env = new_env(Some(env.clone()));
         let lambda = Value::Lambda {
             params: param_names,
+            rest_param: None,
             body,
             env: loop_env.clone(),
         };
@@ -709,7 +753,7 @@ fn eval_let(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
             .collect::<Result<_, _>>()?;
         // Call the loop function
         let func = env_get(&loop_env, name).unwrap();
-        return apply(&func, &init_vals, p);
+        return apply_value(&func, &init_vals, p);
     }
     // Regular let: (let ((var init) ...) body ...)
     let bindings_expr = match &args[0] {
@@ -1142,6 +1186,32 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
             ensure_args(op, args, 1, p)?;
             let s = args[0].as_string_at(p)?;
             Ok(Value::Str(s.to_string()))
+        }
+        "apply" => {
+            if args.len() < 2 {
+                return Err(EvalError::Arity(format!(
+                    "apply requires at least 2 arguments at {}", p
+                )));
+            }
+            let func = &args[0];
+            // Last argument must be a list; prefix args come before it
+            let last = &args[args.len() - 1];
+            let mut call_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+            // Flatten the last argument (a list) into call_args
+            let mut cur = last;
+            loop {
+                match cur {
+                    Value::Nil => break,
+                    Value::Pair(car, cdr) => {
+                        call_args.push(*car.clone());
+                        cur = cdr;
+                    }
+                    _ => return Err(EvalError::Type(format!(
+                        "apply: last argument must be a list at {}", p
+                    ))),
+                }
+            }
+            apply_value(func, &call_args, p)
         }
         _ => Err(EvalError::UnboundVariable(format!("{} at {}", op, p))),
     }
