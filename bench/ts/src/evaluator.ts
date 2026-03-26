@@ -27,6 +27,10 @@ type DoVar = { name: string; step?: SchemeVal };
 
 type Winder = { inThunk: SchemeVal; outThunk: SchemeVal };
 
+type ExnHandler =
+  | { tag: 'proc'; handler: SchemeVal }
+  | { tag: 'guard'; gVar: string; clauses: SchemeVal[]; gEnv: Env; guardK: Kont; ws: Winder[] };
+
 type Kont =
   | { tag: 'halt' }
   | { tag: 'seq'; rest: SchemeVal[]; env: Env; k: Kont }
@@ -49,7 +53,12 @@ type Kont =
   | { tag: 'dw-pre'; bodyThunk: SchemeVal; outThunk: SchemeVal; winder: Winder; k: Kont }
   | { tag: 'dw-body'; outThunk: SchemeVal; k: Kont }
   | { tag: 'dw-post'; bodyVal: SchemeVal; k: Kont }
-  | { tag: 'dw-wind'; ops: { thunk: SchemeVal; ws: Winder[] }[]; targetK: Kont; targetVal: SchemeVal };
+  | { tag: 'dw-wind'; ops: { thunk: SchemeVal; ws: Winder[] }[]; targetK: Kont; targetVal: SchemeVal }
+  | { tag: 'weh'; k: Kont }
+  | { tag: 'guard-body'; k: Kont }
+  | { tag: 'guard-start'; gVar: string; clauses: SchemeVal[]; exnVal: SchemeVal; gEnv: Env; k: Kont }
+  | { tag: 'guard-test'; gVar: string; clauses: SchemeVal[]; ci: number; exnVal: SchemeVal; gEnv: Env; k: Kont }
+  | { tag: 'raise-err'; k: Kont };
 
 function posStr(pos?: Pos): string {
   return pos ? `${pos.line}:${pos.col}: ` : '';
@@ -1334,6 +1343,8 @@ const BUILTIN_NAMES = new Set([
   // L18
   'call/cc', 'call-with-current-continuation',
   'dynamic-wind',
+  // L20
+  'raise', 'with-exception-handler',
 ]);
 
 function bindLambdaArgs(proc: { params: string[]; rest?: string; body: SchemeVal[] }, args: SchemeVal[], procEnv: Env, callPos?: Pos): Env {
@@ -1363,6 +1374,7 @@ function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'ha
   let val: SchemeVal = NIL;
   let isEval = true;
   const winders: Winder[] = [];
+  const exnHandlers: ExnHandler[] = [];
 
   function doApply(proc: SchemeVal, args: SchemeVal[], pos?: Pos, kk?: Kont): void {
     const kCont = kk!;
@@ -1379,6 +1391,46 @@ function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'ha
         const winder: Winder = { inThunk, outThunk };
         const dwK: Kont = { tag: 'dw-pre', bodyThunk, outThunk, winder, k: kCont };
         doApply(inThunk, [], pos, dwK);
+        return;
+      }
+      if (proc.name === 'raise') {
+        if (args.length !== 1) throw new EvalError(`${posStr(pos)}raise: expected 1 argument, got ${args.length}`);
+        const exnVal = args[0];
+        if (exnHandlers.length === 0) throw new EvalError(`unhandled exception: ${writeVal(exnVal)}`);
+        const handler = exnHandlers.pop()!;
+        if (handler.tag === 'proc') {
+          const errK: Kont = { tag: 'raise-err', k: kCont };
+          doApply(handler.handler, [exnVal], pos, errK);
+          return;
+        }
+        // guard handler: unwind winders to guard's state, then evaluate clauses
+        const targetWinders = handler.ws;
+        const clauseStartK: Kont = { tag: 'guard-start', gVar: handler.gVar, clauses: handler.clauses, exnVal, gEnv: handler.gEnv, k: handler.guardK };
+        let cp = 0;
+        while (cp < winders.length && cp < targetWinders.length && winders[cp] === targetWinders[cp]) cp++;
+        const ops: { thunk: SchemeVal; ws: Winder[] }[] = [];
+        for (let i = winders.length - 1; i >= cp; i--) {
+          ops.push({ thunk: winders[i].outThunk, ws: winders.slice(0, i) });
+        }
+        for (let i = cp; i < targetWinders.length; i++) {
+          ops.push({ thunk: targetWinders[i].inThunk, ws: targetWinders.slice(0, i + 1) });
+        }
+        if (ops.length === 0) {
+          val = exnVal; k = clauseStartK; isEval = false;
+        } else {
+          const [first, ...rest] = ops;
+          winders.length = 0; winders.push(...first.ws);
+          const windK: Kont = { tag: 'dw-wind', ops: rest, targetK: clauseStartK, targetVal: exnVal };
+          doApply(first.thunk, [], pos, windK);
+        }
+        return;
+      }
+      if (proc.name === 'with-exception-handler') {
+        if (args.length !== 2) throw new EvalError(`${posStr(pos)}with-exception-handler: expected 2 arguments, got ${args.length}`);
+        const [handler, thunk] = args;
+        exnHandlers.push({ tag: 'proc', handler });
+        const wehK: Kont = { tag: 'weh', k: kCont };
+        doApply(thunk, [], pos, wehK);
         return;
       }
       if (proc.name === 'apply') {
@@ -1721,6 +1773,69 @@ function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'ha
           }
           break;
         }
+
+        case 'weh': {
+          exnHandlers.pop();
+          k = k.k;
+          break;
+        }
+
+        case 'guard-body': {
+          exnHandlers.pop();
+          k = k.k;
+          break;
+        }
+
+        case 'guard-start': {
+          const clauseEnv = new Env(k.gEnv);
+          clauseEnv.set(k.gVar, k.exnVal);
+          if (k.clauses.length === 0) throw new EvalError(`unhandled exception: ${writeVal(k.exnVal)}`);
+          const firstClause = k.clauses[0];
+          if (firstClause.tag !== 'list' || firstClause.value.length < 1) throw new EvalError('guard: invalid clause');
+          if (firstClause.value[0].tag === 'symbol' && firstClause.value[0].value === 'else') {
+            evalBody(firstClause.value.slice(1), clauseEnv, k.k);
+            break;
+          }
+          k = { tag: 'guard-test', gVar: k.gVar, clauses: k.clauses, ci: 0, exnVal: k.exnVal, gEnv: k.gEnv, k: k.k };
+          expr = firstClause.value[0]; env = clauseEnv;
+          isEval = true; break;
+        }
+
+        case 'guard-test': {
+          if (val.tag !== 'boolean' || val.value !== false) {
+            // Test passed — evaluate clause body
+            const clause = k.clauses[k.ci];
+            if (clause.tag !== 'list') throw new EvalError('guard: invalid clause');
+            const clauseEnv = new Env(k.gEnv);
+            clauseEnv.set(k.gVar, k.exnVal);
+            if (clause.value.length > 1) {
+              evalBody((clause.value as SchemeVal[]).slice(1), clauseEnv, k.k);
+            } else {
+              k = k.k; // no body, return test value
+            }
+            break;
+          }
+          // Test failed — try next clause
+          const nextCi = k.ci + 1;
+          if (nextCi >= k.clauses.length) {
+            throw new EvalError(`unhandled exception: ${writeVal(k.exnVal)}`);
+          }
+          const nextClause = k.clauses[nextCi];
+          if (nextClause.tag !== 'list' || nextClause.value.length < 1) throw new EvalError('guard: invalid clause');
+          const clauseEnv = new Env(k.gEnv);
+          clauseEnv.set(k.gVar, k.exnVal);
+          if (nextClause.value[0].tag === 'symbol' && nextClause.value[0].value === 'else') {
+            evalBody(nextClause.value.slice(1), clauseEnv, k.k);
+            break;
+          }
+          k = { tag: 'guard-test', gVar: k.gVar, clauses: k.clauses, ci: nextCi, exnVal: k.exnVal, gEnv: k.gEnv, k: k.k };
+          expr = nextClause.value[0]; env = clauseEnv;
+          isEval = true; break;
+        }
+
+        case 'raise-err': {
+          throw new EvalError('exception handler returned from raise');
+        }
       }
       continue;
     }
@@ -2038,6 +2153,19 @@ function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'ha
           }
           env.set(name.value, { tag: 'syntax', rules, literals, defEnv: env, pos: expr.pos });
           val = { tag: 'void' }; isEval = false; continue;
+        }
+        case 'guard': {
+          // (guard (var clause ...) body ...)
+          const spec = elems[1];
+          if (spec.tag !== 'list' || spec.value.length < 1) throw new EvalError(`${posStr(expr.pos)}guard: invalid syntax`);
+          const varSym = spec.value[0];
+          if (varSym.tag !== 'symbol') throw new EvalError(`${posStr(expr.pos)}guard: variable must be a symbol`);
+          const clauses = spec.value.slice(1);
+          const body = elems.slice(2);
+          exnHandlers.push({ tag: 'guard', gVar: varSym.value, clauses, gEnv: env, guardK: k, ws: [...winders] });
+          const gk: Kont = { tag: 'guard-body', k };
+          evalBody(body, env, gk);
+          continue;
         }
       }
 
