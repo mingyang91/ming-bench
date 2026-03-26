@@ -94,7 +94,8 @@ pub enum Value {
     Symbol(String),
     Char(char),
     List(Vec<Value>),
-    Lambda(Vec<String>, Vec<Expr>, Env),
+    Lambda(Vec<String>, Option<String>, Vec<Expr>, Env),
+    Builtin(String),
     Void,
 }
 
@@ -131,6 +132,7 @@ impl fmt::Display for Value {
                 write!(f, ")")
             }
             Value::Lambda(..) => write!(f, "#<procedure>"),
+            Value::Builtin(..) => write!(f, "#<procedure>"),
             Value::Void => Ok(()),
         }
     }
@@ -396,21 +398,13 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         if items.len() < 3 {
                             return Err(EvalError::Arity("lambda requires params and body".into()));
                         }
-                        let params = match &items[1].kind {
-                            ExprKind::List(ps) => {
-                                let mut names = Vec::new();
-                                for p in ps {
-                                    match &p.kind {
-                                        ExprKind::Symbol(s) => names.push(s.clone()),
-                                        _ => return Err(EvalError::Parse("lambda param must be symbol".into())),
-                                    }
-                                }
-                                names
-                            }
-                            _ => return Err(EvalError::Parse("lambda params must be a list".into())),
+                        let (params, rest) = match &items[1].kind {
+                            ExprKind::List(ps) => parse_params(ps)?,
+                            ExprKind::Symbol(s) => (vec![], Some(s.clone())),
+                            _ => return Err(EvalError::Parse("lambda params must be a list or symbol".into())),
                         };
                         let body = items[2..].to_vec();
-                        return Ok(Value::Lambda(params, body, env.clone()));
+                        return Ok(Value::Lambda(params, rest, body, env.clone()));
                     }
                     "+" => return eval_add(&items[1..], env),
                     "-" => return eval_sub(&items[1..], env),
@@ -466,10 +460,40 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
     }
 }
 
+fn parse_params(exprs: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let dot_pos = exprs.iter().position(|e| matches!(&e.kind, ExprKind::Symbol(s) if s == "."));
+    if let Some(pos) = dot_pos {
+        let fixed: Vec<String> = exprs[..pos].iter().map(|e| match &e.kind {
+            ExprKind::Symbol(s) => Ok(s.clone()),
+            _ => Err(EvalError::Parse("param must be symbol".into())),
+        }).collect::<Result<_, _>>()?;
+        if pos + 2 != exprs.len() {
+            return Err(EvalError::Parse("expected exactly one symbol after dot".into()));
+        }
+        let rest = match &exprs[pos + 1].kind {
+            ExprKind::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Parse("rest param must be symbol".into())),
+        };
+        Ok((fixed, Some(rest)))
+    } else {
+        let params: Vec<String> = exprs.iter().map(|e| match &e.kind {
+            ExprKind::Symbol(s) => Ok(s.clone()),
+            _ => Err(EvalError::Parse("param must be symbol".into())),
+        }).collect::<Result<_, _>>()?;
+        Ok((params, None))
+    }
+}
+
 fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
     match func {
-        Value::Lambda(params, body, closure_env) => {
-            if args.len() != params.len() {
+        Value::Lambda(params, rest, body, closure_env) => {
+            if let Some(rest_name) = rest {
+                if args.len() < params.len() {
+                    return Err(EvalError::Arity(format!(
+                        "expected at least {} args, got {}", params.len(), args.len()
+                    )));
+                }
+            } else if args.len() != params.len() {
                 return Err(EvalError::Arity(format!(
                     "expected {} args, got {}", params.len(), args.len()
                 )));
@@ -478,13 +502,198 @@ fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
             for (p, a) in params.iter().zip(args) {
                 call_env.set(p.clone(), a.clone());
             }
+            if let Some(rest_name) = rest {
+                let rest_args = args[params.len()..].to_vec();
+                call_env.set(rest_name.clone(), Value::List(rest_args));
+            }
             let mut result = Value::Void;
             for expr in body {
                 result = eval(expr, &call_env)?;
             }
             Ok(result)
         }
+        Value::Builtin(name) => apply_builtin(name, args),
         other => Err(EvalError::Type(format!("not a procedure: {}", other))),
+    }
+}
+
+fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
+        "+" => {
+            let mut sum = 0i64;
+            for a in args { sum += require_int(a)?; }
+            Ok(Value::Integer(sum))
+        }
+        "-" => {
+            if args.is_empty() { return Err(EvalError::Arity("- requires at least 1 argument".into())); }
+            let first = require_int(&args[0])?;
+            if args.len() == 1 { return Ok(Value::Integer(-first)); }
+            let mut result = first;
+            for a in &args[1..] { result -= require_int(a)?; }
+            Ok(Value::Integer(result))
+        }
+        "*" => {
+            let mut product = 1i64;
+            for a in args { product *= require_int(a)?; }
+            Ok(Value::Integer(product))
+        }
+        "/" => {
+            if args.is_empty() { return Err(EvalError::Arity("/ requires at least 1 argument".into())); }
+            let first = require_int(&args[0])?;
+            if args.len() == 1 {
+                if first == 0 { return Err(EvalError::DivisionByZero); }
+                return Ok(Value::Integer(1 / first));
+            }
+            let mut result = first;
+            for a in &args[1..] {
+                let d = require_int(a)?;
+                if d == 0 { return Err(EvalError::DivisionByZero); }
+                result /= d;
+            }
+            Ok(Value::Integer(result))
+        }
+        "=" => {
+            if args.len() < 2 { return Err(EvalError::Arity("= requires at least 2 arguments".into())); }
+            let mut prev = require_int(&args[0])?;
+            for a in &args[1..] { let c = require_int(a)?; if prev != c { return Ok(Value::Boolean(false)); } prev = c; }
+            Ok(Value::Boolean(true))
+        }
+        "<" => {
+            if args.len() < 2 { return Err(EvalError::Arity("< requires at least 2 arguments".into())); }
+            let mut prev = require_int(&args[0])?;
+            for a in &args[1..] { let c = require_int(a)?; if !(prev < c) { return Ok(Value::Boolean(false)); } prev = c; }
+            Ok(Value::Boolean(true))
+        }
+        ">" => {
+            if args.len() < 2 { return Err(EvalError::Arity("> requires at least 2 arguments".into())); }
+            let mut prev = require_int(&args[0])?;
+            for a in &args[1..] { let c = require_int(a)?; if !(prev > c) { return Ok(Value::Boolean(false)); } prev = c; }
+            Ok(Value::Boolean(true))
+        }
+        "<=" => {
+            if args.len() < 2 { return Err(EvalError::Arity("<= requires at least 2 arguments".into())); }
+            let mut prev = require_int(&args[0])?;
+            for a in &args[1..] { let c = require_int(a)?; if !(prev <= c) { return Ok(Value::Boolean(false)); } prev = c; }
+            Ok(Value::Boolean(true))
+        }
+        ">=" => {
+            if args.len() < 2 { return Err(EvalError::Arity(">= requires at least 2 arguments".into())); }
+            let mut prev = require_int(&args[0])?;
+            for a in &args[1..] { let c = require_int(a)?; if !(prev >= c) { return Ok(Value::Boolean(false)); } prev = c; }
+            Ok(Value::Boolean(true))
+        }
+        "not" => {
+            if args.len() != 1 { return Err(EvalError::Arity("not requires exactly 1 argument".into())); }
+            Ok(Value::Boolean(!is_truthy(&args[0])))
+        }
+        "cons" => {
+            if args.len() != 2 { return Err(EvalError::Arity("cons requires exactly 2 arguments".into())); }
+            match &args[1] {
+                Value::List(items) => {
+                    let mut new = vec![args[0].clone()];
+                    new.extend(items.iter().cloned());
+                    Ok(Value::List(new))
+                }
+                _ => Err(EvalError::Type("cons: second argument must be a list".into())),
+            }
+        }
+        "car" => {
+            if args.len() != 1 { return Err(EvalError::Arity("car requires exactly 1 argument".into())); }
+            match &args[0] {
+                Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
+                Value::List(_) => Err(EvalError::Type("car: empty list".into())),
+                _ => Err(EvalError::Type("car: not a pair".into())),
+            }
+        }
+        "cdr" => {
+            if args.len() != 1 { return Err(EvalError::Arity("cdr requires exactly 1 argument".into())); }
+            match &args[0] {
+                Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
+                Value::List(_) => Err(EvalError::Type("cdr: empty list".into())),
+                _ => Err(EvalError::Type("cdr: not a pair".into())),
+            }
+        }
+        "null?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("null? requires exactly 1 argument".into())); }
+            Ok(Value::Boolean(matches!(&args[0], Value::List(items) if items.is_empty())))
+        }
+        "list" => Ok(Value::List(args.to_vec())),
+        "length" => {
+            if args.len() != 1 { return Err(EvalError::Arity("length requires exactly 1 argument".into())); }
+            match &args[0] {
+                Value::List(items) => Ok(Value::Integer(items.len() as i64)),
+                _ => Err(EvalError::Type("length: not a list".into())),
+            }
+        }
+        "append" => {
+            let mut result = Vec::new();
+            for a in args {
+                match a {
+                    Value::List(items) => result.extend(items.iter().cloned()),
+                    _ => return Err(EvalError::Type("append: not a list".into())),
+                }
+            }
+            Ok(Value::List(result))
+        }
+        "display" => {
+            if args.len() != 1 { return Err(EvalError::Arity("display requires exactly 1 argument".into())); }
+            output_write(&display_value(&args[0]));
+            Ok(Value::Void)
+        }
+        "write" => {
+            if args.len() != 1 { return Err(EvalError::Arity("write requires exactly 1 argument".into())); }
+            output_write(&args[0].to_string());
+            Ok(Value::Void)
+        }
+        "newline" => {
+            if !args.is_empty() { return Err(EvalError::Arity("newline takes no arguments".into())); }
+            output_write("\n");
+            Ok(Value::Void)
+        }
+        "apply" => {
+            if args.len() < 2 {
+                return Err(EvalError::Arity("apply requires at least 2 arguments".into()));
+            }
+            let proc = &args[0];
+            let last = &args[args.len() - 1];
+            let tail = match last {
+                Value::List(items) => items.clone(),
+                _ => return Err(EvalError::Type("apply: last argument must be a list".into())),
+            };
+            let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+            all_args.extend(tail);
+            apply(proc, &all_args)
+        }
+        "number?" => { if args.len() != 1 { return Err(EvalError::Arity("number? requires 1 argument".into())); } Ok(Value::Boolean(matches!(args[0], Value::Integer(_)))) }
+        "string?" => { if args.len() != 1 { return Err(EvalError::Arity("string? requires 1 argument".into())); } Ok(Value::Boolean(matches!(args[0], Value::Str(_)))) }
+        "boolean?" => { if args.len() != 1 { return Err(EvalError::Arity("boolean? requires 1 argument".into())); } Ok(Value::Boolean(matches!(args[0], Value::Boolean(_)))) }
+        "pair?" => { if args.len() != 1 { return Err(EvalError::Arity("pair? requires 1 argument".into())); } Ok(Value::Boolean(matches!(&args[0], Value::List(items) if !items.is_empty()))) }
+        "symbol?" => { if args.len() != 1 { return Err(EvalError::Arity("symbol? requires 1 argument".into())); } Ok(Value::Boolean(matches!(args[0], Value::Symbol(_)))) }
+        "char?" => { if args.len() != 1 { return Err(EvalError::Arity("char? requires 1 argument".into())); } Ok(Value::Boolean(matches!(args[0], Value::Char(_)))) }
+        "string-append" => {
+            let mut result = String::new();
+            for a in args {
+                match a { Value::Str(s) => result.push_str(s), other => return Err(EvalError::Type(format!("string-append: expected string, got {}", other))) }
+            }
+            Ok(Value::Str(result))
+        }
+        "string-length" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string-length requires 1 argument".into())); }
+            match &args[0] { Value::Str(s) => Ok(Value::Integer(s.len() as i64)), other => Err(EvalError::Type(format!("string-length: expected string, got {}", other))) }
+        }
+        "number->string" => {
+            if args.len() != 1 { return Err(EvalError::Arity("number->string requires 1 argument".into())); }
+            Ok(Value::Str(require_int(&args[0])?.to_string()))
+        }
+        "symbol->string" => {
+            if args.len() != 1 { return Err(EvalError::Arity("symbol->string requires 1 argument".into())); }
+            match &args[0] { Value::Symbol(s) => Ok(Value::Str(s.clone())), other => Err(EvalError::Type(format!("symbol->string: expected symbol, got {}", other))) }
+        }
+        "string->symbol" => {
+            if args.len() != 1 { return Err(EvalError::Arity("string->symbol requires 1 argument".into())); }
+            match &args[0] { Value::Str(s) => Ok(Value::Symbol(s.clone())), other => Err(EvalError::Type(format!("string->symbol: expected string, got {}", other))) }
+        }
+        _ => Err(EvalError::Generic(format!("unknown builtin: {}", name))),
     }
 }
 
@@ -503,6 +712,7 @@ fn eval_define(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         }
         ExprKind::List(parts) => {
             // (define (f x y) body...) => (define f (lambda (x y) body...))
+            // (define (f x . rest) body...) => (define f (lambda (x . rest) body...))
             if parts.is_empty() {
                 return Err(EvalError::Parse("define: empty name list".into()));
             }
@@ -510,14 +720,9 @@ fn eval_define(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
                 ExprKind::Symbol(s) => s.clone(),
                 _ => return Err(EvalError::Parse("define: name must be symbol".into())),
             };
-            let params: Vec<String> = parts[1..].iter().map(|p| {
-                match &p.kind {
-                    ExprKind::Symbol(s) => Ok(s.clone()),
-                    _ => Err(EvalError::Parse("define: param must be symbol".into())),
-                }
-            }).collect::<Result<_, _>>()?;
+            let (params, rest) = parse_params(&parts[1..])?;
             let body = args[1..].to_vec();
-            let lambda = Value::Lambda(params, body, env.clone());
+            let lambda = Value::Lambda(params, rest, body, env.clone());
             env.set(name, lambda);
             Ok(Value::Void)
         }
@@ -727,12 +932,12 @@ fn eval_let(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
             }
         }
         let body = args[2..].to_vec();
-        let lambda = Value::Lambda(params.clone(), body, env.clone());
+        let lambda = Value::Lambda(params.clone(), None, body, env.clone());
         let let_env = Env::with_parent(env);
         let_env.set(name.clone(), lambda.clone());
         // Re-create lambda with let_env so it can see itself
-        let body2 = match &lambda { Value::Lambda(_, b, _) => b.clone(), _ => unreachable!() };
-        let lambda2 = Value::Lambda(params, body2, let_env.clone());
+        let body2 = match &lambda { Value::Lambda(_, _, b, _) => b.clone(), _ => unreachable!() };
+        let lambda2 = Value::Lambda(params, None, body2, let_env.clone());
         let_env.set(name.clone(), lambda2.clone());
         let init_vals: Result<Vec<Value>, _> = inits.iter().map(|e| eval(e, env)).collect();
         return apply(&lambda2, &init_vals?);
@@ -1026,6 +1231,19 @@ fn eval_string_set(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     Ok(Value::Void)
 }
 
+fn seed_builtins(env: &Env) {
+    for name in &[
+        "+", "-", "*", "/", "<", ">", "=", "<=", ">=",
+        "not", "cons", "car", "cdr", "null?", "list", "length", "append",
+        "number?", "string?", "boolean?", "pair?", "symbol?", "char?",
+        "display", "write", "newline", "apply",
+        "string-append", "string-length", "number->string",
+        "symbol->string", "string->symbol",
+    ] {
+        env.set(name.to_string(), Value::Builtin(name.to_string()));
+    }
+}
+
 // ── Public API ──────────────────────────────────────────────────────
 
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
@@ -1036,6 +1254,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
         return Err(EvalError::Parse("no expressions".into()));
     }
     let env = Env::new();
+    seed_builtins(&env);
     let mut last = Value::Void;
     for expr in &exprs {
         last = eval(expr, &env)?;
@@ -1051,6 +1270,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         return Err(EvalError::Parse("no expressions".into()));
     }
     let env = Env::new();
+    seed_builtins(&env);
     let mut last = Value::Void;
     for expr in &exprs {
         last = eval(expr, &env)?;
