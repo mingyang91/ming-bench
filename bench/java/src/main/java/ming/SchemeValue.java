@@ -89,6 +89,14 @@ class SchemeValue {
             }
             return result;
         }
+        if (val instanceof Pair p) {
+            return new Pair(quotedToScheme(p.car), quotedToScheme(p.cdr));
+        }
+        if (val instanceof SchemeVector v) {
+            Object[] data = new Object[v.data.length];
+            for (int i = 0; i < v.data.length; i++) data[i] = quotedToScheme(v.data[i]);
+            return new SchemeVector(data);
+        }
         return val;
     }
 }

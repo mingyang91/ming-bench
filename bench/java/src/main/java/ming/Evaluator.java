@@ -516,6 +516,11 @@ public class Evaluator {
                         val = SchemeValue.quotedToScheme(list.get(1));
                         ev = false; continue mainLoop;
                     }
+                    case "quasiquote" -> {
+                        if (list.size() != 2) throw new EvalError("quasiquote: expected 1 argument");
+                        val = evalQuasiquote(list.get(1), env, 0);
+                        ev = false; continue mainLoop;
+                    }
                     case "lambda" -> {
                         val = evalLambda(list, env);
                         ev = false; continue mainLoop;
@@ -526,7 +531,7 @@ public class Evaluator {
                         if (tgt instanceof String name) {
                             ctrl = list.get(2); k = new Kont.Def(name, env, k); continue mainLoop;
                         }
-                        if (tgt instanceof List<?>) {
+                        if (tgt instanceof List<?> || tgt instanceof Pair) {
                             evalDefine(list, env); val = null; ev = false; continue mainLoop;
                         }
                         throw new EvalError("define: bad syntax");
@@ -801,6 +806,16 @@ public class Evaluator {
                 case Kont.CondTest(var clause, var nextCI, var form, var e, var next) -> {
                     if (!isFalse(val)) {
                         if (clause.size() == 1) { k = next; /* return test value */ }
+                        else if (clause.size() == 3 && clause.get(1) instanceof String s && s.equals("=>")) {
+                            // (test => proc) — apply proc to test result
+                            Object testVal = val;
+                            List<Object> quoted = new ArrayList<>();
+                            quoted.add("quote");
+                            quoted.add(testVal);
+                            ctrl = clause.get(2);
+                            k = new Kont.Arg(new ArrayList<>(), List.of(quoted), null, e, next);
+                            env = e; ev = true;
+                        }
                         else {
                             ctrl = clause.get(1);
                             if (clause.size() > 2) {
@@ -978,6 +993,10 @@ public class Evaluator {
                         if (list.size() != 2) throw new EvalError("quote: expected 1 argument");
                         return SchemeValue.quotedToScheme(list.get(1));
                     }
+                    case "quasiquote" -> {
+                        if (list.size() != 2) throw new EvalError("quasiquote: expected 1 argument");
+                        return evalQuasiquote(list.get(1), env, 0);
+                    }
                     case "lambda" -> { return evalLambda(list, env); }
                     case "set!" -> {
                         if (list.size() != 3) throw new EvalError("set!: bad syntax");
@@ -1093,6 +1112,10 @@ public class Evaluator {
                             Object val = eval(test, env);
                             if (!isFalse(val)) {
                                 if (c.size() == 1) return val;
+                                if (c.size() == 3 && c.get(1) instanceof String s && s.equals("=>")) {
+                                    Object proc = eval(c.get(2), env);
+                                    return applyProc(proc, List.of(val));
+                                }
                                 for (int j = 1; j < c.size() - 1; j++) eval(c.get(j), env);
                                 expr = c.get(c.size() - 1); matched = true; break;
                             }
@@ -1392,45 +1415,153 @@ public class Evaluator {
             env.define(name, val);
             return null;
         }
+        // Function shorthand: (define (name params...) body) or (define (name . rest) body)
+        String name = null;
+        Object paramSpec = null;
         if (target instanceof List<?> sig) {
-            if (sig.isEmpty() || !(sig.get(0) instanceof String name))
+            if (sig.isEmpty() || !(sig.get(0) instanceof String n))
                 throw new EvalError("define: bad syntax");
-            List<String> params = new ArrayList<>();
-            String restParam = null;
-            for (int i = 1; i < sig.size(); i++) {
-                if (!(sig.get(i) instanceof String p)) throw new EvalError("define: parameter must be symbol");
-                if (p.equals(".")) {
-                    if (i + 2 != sig.size()) throw new EvalError("define: bad dot syntax");
-                    if (!(sig.get(i + 1) instanceof String rp)) throw new EvalError("define: parameter must be symbol");
+            name = n;
+            // Build param spec from remaining elements
+            List<Object> plist = new ArrayList<>();
+            for (int i = 1; i < sig.size(); i++) plist.add(sig.get(i));
+            paramSpec = plist;
+        } else if (target instanceof Pair p) {
+            if (!(p.car instanceof String n)) throw new EvalError("define: bad syntax");
+            name = n;
+            paramSpec = p.cdr;
+        } else {
+            throw new EvalError("define: bad syntax");
+        }
+        String[] parsed = parseParamSpec(paramSpec, "define");
+        String restParam = parsed[0].isEmpty() ? null : parsed[0];
+        List<String> params = new ArrayList<>();
+        for (int i = 1; i < parsed.length; i++) params.add(parsed[i]);
+        List<Object> body = new ArrayList<>();
+        for (int i = 2; i < list.size(); i++) body.add(list.get(i));
+        Lambda lambda = new Lambda(params, restParam, body, env);
+        env.define(name, lambda);
+        return null;
+    }
+
+    // Extract params and restParam from a parameter spec (List or Pair chain)
+    private static String[] parseParamSpec(Object paramSpec, String context) throws EvalError {
+        List<String> params = new ArrayList<>();
+        String restParam = null;
+        if (paramSpec instanceof List<?> paramList) {
+            for (int j = 0; j < paramList.size(); j++) {
+                if (!(paramList.get(j) instanceof String s)) throw new EvalError(context + ": parameter must be symbol");
+                if (s.equals(".")) {
+                    if (j + 2 != paramList.size()) throw new EvalError(context + ": bad dot syntax");
+                    if (!(paramList.get(j + 1) instanceof String rp)) throw new EvalError(context + ": parameter must be symbol");
                     restParam = rp; break;
                 }
-                params.add(p);
+                params.add(s);
             }
-            List<Object> body = new ArrayList<>();
-            for (int i = 2; i < list.size(); i++) body.add(list.get(i));
-            Lambda lambda = new Lambda(params, restParam, body, env);
-            env.define(name, lambda);
-            return null;
+        } else if (paramSpec instanceof Pair) {
+            Object cur = paramSpec;
+            while (cur instanceof Pair p) {
+                if (!(p.car instanceof String s)) throw new EvalError(context + ": parameter must be symbol");
+                params.add(s);
+                cur = p.cdr;
+            }
+            if (cur != SchemeValue.NIL && cur != null) {
+                if (!(cur instanceof String s)) throw new EvalError(context + ": rest parameter must be symbol");
+                restParam = s;
+            }
+        } else if (paramSpec instanceof String s && !s.startsWith("\"")) {
+            // (lambda args body) — single symbol matches all args
+            restParam = s;
+        } else {
+            throw new EvalError(context + ": parameters must be a list");
         }
-        throw new EvalError("define: bad syntax");
+        // Encode as: [restParam, param1, param2, ...] where restParam may be ""
+        String[] result = new String[params.size() + 1];
+        result[0] = restParam != null ? restParam : "";
+        for (int i = 0; i < params.size(); i++) result[i + 1] = params.get(i);
+        return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object evalQuasiquote(Object tmpl, Env env, int depth) throws EvalError {
+        if (tmpl instanceof List<?> list) {
+            if (!list.isEmpty() && list.get(0) instanceof String s) {
+                if ("unquote".equals(s)) {
+                    if (depth == 0) return eval(list.get(1), env);
+                    // Nested unquote — decrease depth
+                    List<Object> r = new ArrayList<>();
+                    r.add("unquote");
+                    r.add(evalQuasiquote(list.get(1), env, depth - 1));
+                    return SchemeValue.quotedToScheme(r);
+                }
+                if ("quasiquote".equals(s)) {
+                    List<Object> r = new ArrayList<>();
+                    r.add("quasiquote");
+                    r.add(evalQuasiquote(list.get(1), env, depth + 1));
+                    return SchemeValue.quotedToScheme(r);
+                }
+            }
+            // Process each element, handling unquote-splicing
+            List<Object> result = new ArrayList<>();
+            for (int i = 0; i < list.size(); i++) {
+                Object elem = list.get(i);
+                if (elem instanceof List<?> el && el.size() == 2 && "unquote-splicing".equals(el.get(0))) {
+                    if (depth == 0) {
+                        Object spliced = eval(el.get(1), env);
+                        // Splice the result into the list
+                        Object cur = spliced;
+                        while (cur instanceof Pair p) {
+                            result.add(p.car);
+                            cur = p.cdr;
+                        }
+                    } else {
+                        List<Object> r = new ArrayList<>();
+                        r.add("unquote-splicing");
+                        r.add(evalQuasiquote(el.get(1), env, depth - 1));
+                        result.add(SchemeValue.quotedToScheme(r));
+                    }
+                } else {
+                    result.add(evalQuasiquote(elem, env, depth));
+                }
+            }
+            // Convert to Scheme list (Pair chain)
+            Object schemeList = SchemeValue.NIL;
+            for (int i = result.size() - 1; i >= 0; i--) {
+                schemeList = new Pair(result.get(i), schemeList);
+            }
+            return schemeList;
+        }
+        if (tmpl instanceof Pair p) {
+            // Dotted pair in quasiquote template
+            if (p.car instanceof String s && "unquote".equals(s) && p.cdr instanceof Pair pc && pc.cdr == SchemeValue.NIL) {
+                if (depth == 0) return eval(pc.car, env);
+            }
+            Object car = evalQuasiquote(p.car, env, depth);
+            Object cdr = evalQuasiquote(p.cdr, env, depth);
+            // Handle unquote-splicing in car position
+            if (p.car instanceof List<?> el && el.size() == 2 && "unquote-splicing".equals(el.get(0)) && depth == 0) {
+                Object spliced = eval(el.get(1), env);
+                // Append spliced list with cdr
+                if (spliced == SchemeValue.NIL) return cdr;
+                // Find tail of spliced and attach cdr
+                Object result = spliced;
+                Object tail = spliced;
+                while (tail instanceof Pair tp && tp.cdr instanceof Pair) tail = tp.cdr;
+                if (tail instanceof Pair tp) tp.cdr = cdr;
+                return result;
+            }
+            return new Pair(car, cdr);
+        }
+        // Atom — return as Scheme value
+        return SchemeValue.quotedToScheme(tmpl);
     }
 
     private static Object evalLambda(List<?> list, Env env) throws EvalError {
         if (list.size() < 3) throw new EvalError("lambda: bad syntax");
-        Object paramSpec = list.get(1);
-        if (!(paramSpec instanceof List<?> paramList))
-            throw new EvalError("lambda: parameters must be a list");
+        String[] parsed = parseParamSpec(list.get(1), "lambda");
+        String restParam = parsed[0].isEmpty() ? null : parsed[0];
         List<String> params = new ArrayList<>();
-        String restParam = null;
-        for (int j = 0; j < paramList.size(); j++) {
-            if (!(paramList.get(j) instanceof String s)) throw new EvalError("lambda: parameter must be symbol");
-            if (s.equals(".")) {
-                if (j + 2 != paramList.size()) throw new EvalError("lambda: bad dot syntax");
-                if (!(paramList.get(j + 1) instanceof String rp)) throw new EvalError("lambda: parameter must be symbol");
-                restParam = rp; break;
-            }
-            params.add(s);
-        }
+        for (int i = 1; i < parsed.length; i++) params.add(parsed[i]);
         List<Object> body = new ArrayList<>();
         for (int i = 2; i < list.size(); i++) body.add(list.get(i));
         return new Lambda(params, restParam, body, env);
@@ -1486,22 +1617,10 @@ public class Evaluator {
         for (int i = 1; i < list.size(); i++) {
             if (!(list.get(i) instanceof List<?> clause) || clause.size() < 2)
                 throw new EvalError("case-lambda: bad clause");
-            Object paramSpec = clause.get(0);
-            if (!(paramSpec instanceof List<?> paramList))
-                throw new EvalError("case-lambda: parameters must be a list");
+            String[] parsed = parseParamSpec(clause.get(0), "case-lambda");
+            String restParam = parsed[0].isEmpty() ? null : parsed[0];
             List<String> params = new ArrayList<>();
-            String restParam = null;
-            for (int j = 0; j < paramList.size(); j++) {
-                if (!(paramList.get(j) instanceof String s))
-                    throw new EvalError("case-lambda: parameter must be symbol");
-                if (s.equals(".")) {
-                    if (j + 2 != paramList.size()) throw new EvalError("case-lambda: bad dot syntax");
-                    if (!(paramList.get(j + 1) instanceof String rp))
-                        throw new EvalError("case-lambda: parameter must be symbol");
-                    restParam = rp; break;
-                }
-                params.add(s);
-            }
+            for (int j = 1; j < parsed.length; j++) params.add(parsed[j]);
             List<Object> body = new ArrayList<>();
             for (int j = 1; j < clause.size(); j++) body.add(clause.get(j));
             clauses.add(new Lambda(params, restParam, body, env));

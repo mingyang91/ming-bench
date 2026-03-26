@@ -69,10 +69,36 @@ class Parser {
             q.add(quoted);
             return q;
         }
+        if (c == '`') {
+            int qLine = line, qCol = col;
+            advance();
+            Object quoted = readExpr();
+            SourceList q = new SourceList(qLine, qCol);
+            q.add("quasiquote");
+            q.add(quoted);
+            return q;
+        }
+        if (c == ',') {
+            int qLine = line, qCol = col;
+            advance();
+            if (pos < input.length() && input.charAt(pos) == '@') {
+                advance();
+                Object expr = readExpr();
+                SourceList q = new SourceList(qLine, qCol);
+                q.add("unquote-splicing");
+                q.add(expr);
+                return q;
+            }
+            Object expr = readExpr();
+            SourceList q = new SourceList(qLine, qCol);
+            q.add("unquote");
+            q.add(expr);
+            return q;
+        }
         return readAtom();
     }
 
-    private SourceList readList() throws EvalError {
+    private Object readList() throws EvalError {
         int startLine = line, startCol = col;
         advance(); // skip '('
         SourceList list = new SourceList(startLine, startCol);
@@ -82,6 +108,26 @@ class Parser {
             if (input.charAt(pos) == ')') {
                 advance();
                 return list;
+            }
+            // Check for dotted pair notation: (a b . c)
+            if (input.charAt(pos) == '.' && pos + 1 < input.length()) {
+                char next = input.charAt(pos + 1);
+                if (next == ' ' || next == '\t' || next == '\n' || next == '\r' || next == ')') {
+                    advance(); // skip '.'
+                    skipWhitespace();
+                    Object cdr = readExpr();
+                    skipWhitespace();
+                    if (pos >= input.length() || input.charAt(pos) != ')')
+                        throw new EvalError("expected ) after dotted pair at " + line + ":" + col +
+                            (pos < input.length() ? " got '" + input.charAt(pos) + "'" : " got EOF"));
+                    advance(); // skip ')'
+                    // Build Pair chain: (a b . c) => Pair(a, Pair(b, c))
+                    Object result = cdr;
+                    for (int i = list.size() - 1; i >= 0; i--) {
+                        result = new Pair(list.get(i), result);
+                    }
+                    return result;
+                }
             }
             list.add(readExpr());
         }
@@ -151,6 +197,19 @@ class Parser {
             char ch = input.charAt(pos);
             advance();
             return ch;
+        }
+        if (c == '(') {
+            // Vector literal #(...)
+            advance(); // skip '('
+            List<Object> elems = new java.util.ArrayList<>();
+            skipWhitespace();
+            while (pos < input.length() && input.charAt(pos) != ')') {
+                elems.add(readExpr());
+                skipWhitespace();
+            }
+            if (pos >= input.length()) throw new EvalError("unterminated vector literal");
+            advance(); // skip ')'
+            return new SchemeVector(elems.toArray());
         }
         throw new EvalError("unknown # literal: #" + c);
     }

@@ -66,26 +66,36 @@ class Env {
             return r;
         }));
 
-        // Comparisons
+        // Comparisons (chained: (< a b c) means a<b and b<c)
         env.define("<", Builtin.named("<", args -> {
-            requireArgCount("<", args, 2);
-            return numCompare(requireNumber("<", args.get(0)), requireNumber("<", args.get(1))) < 0;
+            if (args.size() < 2) throw new EvalError("<: expected at least 2 arguments");
+            for (int i = 0; i < args.size() - 1; i++)
+                if (numCompare(requireNumber("<", args.get(i)), requireNumber("<", args.get(i+1))) >= 0) return false;
+            return true;
         }));
         env.define(">", Builtin.named(">", args -> {
-            requireArgCount(">", args, 2);
-            return numCompare(requireNumber(">", args.get(0)), requireNumber(">", args.get(1))) > 0;
+            if (args.size() < 2) throw new EvalError(">: expected at least 2 arguments");
+            for (int i = 0; i < args.size() - 1; i++)
+                if (numCompare(requireNumber(">", args.get(i)), requireNumber(">", args.get(i+1))) <= 0) return false;
+            return true;
         }));
         env.define("=", Builtin.named("=", args -> {
-            requireArgCount("=", args, 2);
-            return numCompare(requireNumber("=", args.get(0)), requireNumber("=", args.get(1))) == 0;
+            if (args.size() < 2) throw new EvalError("=: expected at least 2 arguments");
+            for (int i = 0; i < args.size() - 1; i++)
+                if (numCompare(requireNumber("=", args.get(i)), requireNumber("=", args.get(i+1))) != 0) return false;
+            return true;
         }));
         env.define("<=", Builtin.named("<=", args -> {
-            requireArgCount("<=", args, 2);
-            return numCompare(requireNumber("<=", args.get(0)), requireNumber("<=", args.get(1))) <= 0;
+            if (args.size() < 2) throw new EvalError("<=: expected at least 2 arguments");
+            for (int i = 0; i < args.size() - 1; i++)
+                if (numCompare(requireNumber("<=", args.get(i)), requireNumber("<=", args.get(i+1))) > 0) return false;
+            return true;
         }));
         env.define(">=", Builtin.named(">=", args -> {
-            requireArgCount(">=", args, 2);
-            return numCompare(requireNumber(">=", args.get(0)), requireNumber(">=", args.get(1))) >= 0;
+            if (args.size() < 2) throw new EvalError(">=: expected at least 2 arguments");
+            for (int i = 0; i < args.size() - 1; i++)
+                if (numCompare(requireNumber(">=", args.get(i)), requireNumber(">=", args.get(i+1))) < 0) return false;
+            return true;
         }));
         env.define("not", Builtin.named("not", args -> {
             requireArgCount("not", args, 1);
@@ -186,6 +196,26 @@ class Env {
             return result;
         }));
 
+        env.define("memq", Builtin.named("memq", args -> {
+            requireArgCount("memq", args, 2);
+            Object key = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof Pair p) {
+                if (schemeEq(key, p.car)) return lst;
+                lst = p.cdr;
+            }
+            return Boolean.FALSE;
+        }));
+        env.define("memv", Builtin.named("memv", args -> {
+            requireArgCount("memv", args, 2);
+            Object key = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof Pair p) {
+                if (schemeEqv(key, p.car)) return lst;
+                lst = p.cdr;
+            }
+            return Boolean.FALSE;
+        }));
         env.define("member", Builtin.named("member", args -> {
             requireArgCount("member", args, 2);
             Object key = args.get(0);
