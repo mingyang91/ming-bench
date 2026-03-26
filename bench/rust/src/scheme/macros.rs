@@ -197,8 +197,8 @@ fn match_pattern(
     literals: &HashSet<String>,
 ) -> Result<Option<MatchEnv>, EvalError> {
     match pattern {
-        Expr::Integer(pattern_value, _) => Ok(match expr {
-            Expr::Integer(value, _) if value == pattern_value => Some(HashMap::new()),
+        Expr::Number(pattern_value, _) => Ok(match expr {
+            Expr::Number(value, _) if value == pattern_value => Some(HashMap::new()),
             _ => None,
         }),
         Expr::Boolean(pattern_value, _) => Ok(match expr {
@@ -375,7 +375,7 @@ fn match_values_equal(left: &MatchValue, right: &MatchValue) -> bool {
 
 fn expr_datum_equal(left: &Expr, right: &Expr) -> bool {
     match (left, right) {
-        (Expr::Integer(left, _), Expr::Integer(right, _)) => left == right,
+        (Expr::Number(left, _), Expr::Number(right, _)) => left == right,
         (Expr::Boolean(left, _), Expr::Boolean(right, _)) => left == right,
         (Expr::String(left, _), Expr::String(right, _)) => left == right,
         (Expr::Char(left, _), Expr::Char(right, _)) => left == right,
@@ -427,7 +427,7 @@ fn expand_template(
         Expr::Symbol(name, position) => {
             expand_template_symbol(name, *position, bindings, repetition_indices)
         }
-        Expr::Integer(_, _)
+        Expr::Number(_, _)
         | Expr::Boolean(_, _)
         | Expr::String(_, _)
         | Expr::Char(_, _)

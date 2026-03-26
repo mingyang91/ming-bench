@@ -1,6 +1,8 @@
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::rc::Rc;
 
+use super::number::{parse_number_string, Number};
 use super::{env_define, Builtin, BuiltinKind, EnvRef, Environment, EvalError, OutputRef, Value};
 
 pub(super) fn default_env(output: OutputRef) -> EnvRef {
@@ -29,6 +31,10 @@ pub(super) fn default_env(output: OutputRef) -> EnvRef {
         BuiltinKind::Map,
         BuiltinKind::StringPred,
         BuiltinKind::NumberPred,
+        BuiltinKind::IntegerPred,
+        BuiltinKind::RationalPred,
+        BuiltinKind::ExactPred,
+        BuiltinKind::InexactPred,
         BuiltinKind::BooleanPred,
         BuiltinKind::PairPred,
         BuiltinKind::SymbolPred,
@@ -40,6 +46,10 @@ pub(super) fn default_env(output: OutputRef) -> EnvRef {
         BuiltinKind::Substring,
         BuiltinKind::StringToNumber,
         BuiltinKind::NumberToString,
+        BuiltinKind::ExactToInexact,
+        BuiltinKind::InexactToExact,
+        BuiltinKind::Numerator,
+        BuiltinKind::Denominator,
         BuiltinKind::SymbolToString,
         BuiltinKind::StringToSymbol,
         BuiltinKind::StringRef,
@@ -94,10 +104,18 @@ pub(super) fn apply_builtin(
         BuiltinKind::Sub => eval_sub(args),
         BuiltinKind::Mul => eval_mul(args),
         BuiltinKind::Div => eval_div(args),
-        BuiltinKind::LessThan => eval_compare(kind.name(), args, |lhs, rhs| lhs < rhs),
-        BuiltinKind::GreaterThan => eval_compare(kind.name(), args, |lhs, rhs| lhs > rhs),
-        BuiltinKind::Equal => eval_compare(kind.name(), args, |lhs, rhs| lhs == rhs),
-        BuiltinKind::LessThanOrEqual => eval_compare(kind.name(), args, |lhs, rhs| lhs <= rhs),
+        BuiltinKind::LessThan => {
+            eval_compare(kind.name(), args, |ordering| ordering == Ordering::Less)
+        }
+        BuiltinKind::GreaterThan => {
+            eval_compare(kind.name(), args, |ordering| ordering == Ordering::Greater)
+        }
+        BuiltinKind::Equal => {
+            eval_compare(kind.name(), args, |ordering| ordering == Ordering::Equal)
+        }
+        BuiltinKind::LessThanOrEqual => {
+            eval_compare(kind.name(), args, |ordering| ordering != Ordering::Greater)
+        }
         BuiltinKind::Not => eval_not(args),
         BuiltinKind::Cons => eval_cons(args),
         BuiltinKind::Car => eval_car(args),
@@ -114,8 +132,28 @@ pub(super) fn apply_builtin(
             matches!(value, Value::String(_) | Value::MutableString(_))
         }),
         BuiltinKind::NumberPred => {
-            eval_predicate("number?", args, |value| matches!(value, Value::Integer(_)))
+            eval_predicate("number?", args, |value| matches!(value, Value::Number(_)))
         }
+        BuiltinKind::IntegerPred => eval_predicate(
+            "integer?",
+            args,
+            |value| matches!(value, Value::Number(number) if number.is_integer()),
+        ),
+        BuiltinKind::RationalPred => eval_predicate(
+            "rational?",
+            args,
+            |value| matches!(value, Value::Number(number) if number.is_rational()),
+        ),
+        BuiltinKind::ExactPred => eval_predicate(
+            "exact?",
+            args,
+            |value| matches!(value, Value::Number(number) if number.is_exact()),
+        ),
+        BuiltinKind::InexactPred => eval_predicate(
+            "inexact?",
+            args,
+            |value| matches!(value, Value::Number(number) if number.is_inexact()),
+        ),
         BuiltinKind::BooleanPred => {
             eval_predicate("boolean?", args, |value| matches!(value, Value::Boolean(_)))
         }
@@ -131,6 +169,10 @@ pub(super) fn apply_builtin(
         BuiltinKind::Substring => eval_substring(args),
         BuiltinKind::StringToNumber => eval_string_to_number(args),
         BuiltinKind::NumberToString => eval_number_to_string(args),
+        BuiltinKind::ExactToInexact => eval_exact_to_inexact(args),
+        BuiltinKind::InexactToExact => eval_inexact_to_exact(args),
+        BuiltinKind::Numerator => eval_numerator(args),
+        BuiltinKind::Denominator => eval_denominator(args),
         BuiltinKind::SymbolToString => eval_symbol_to_string(args),
         BuiltinKind::StringToSymbol => eval_string_to_symbol(args),
         BuiltinKind::StringRef => eval_string_ref(args),
@@ -146,9 +188,15 @@ pub(super) fn apply_builtin(
         BuiltinKind::Min => eval_min(args),
         BuiltinKind::Max => eval_max(args),
         BuiltinKind::Expt => eval_expt(args),
-        BuiltinKind::ZeroPred => eval_integer_predicate("zero?", args, |value| value == 0),
-        BuiltinKind::PositivePred => eval_integer_predicate("positive?", args, |value| value > 0),
-        BuiltinKind::NegativePred => eval_integer_predicate("negative?", args, |value| value < 0),
+        BuiltinKind::ZeroPred => {
+            eval_numeric_order_predicate("zero?", args, |ordering| ordering == Ordering::Equal)
+        }
+        BuiltinKind::PositivePred => eval_numeric_order_predicate("positive?", args, |ordering| {
+            ordering == Ordering::Greater
+        }),
+        BuiltinKind::NegativePred => {
+            eval_numeric_order_predicate("negative?", args, |ordering| ordering == Ordering::Less)
+        }
         BuiltinKind::OddPred => eval_integer_predicate("odd?", args, |value| value % 2 != 0),
         BuiltinKind::EvenPred => eval_integer_predicate("even?", args, |value| value % 2 == 0),
         BuiltinKind::ListRef => eval_list_ref(args),
@@ -185,14 +233,16 @@ pub(super) fn apply_builtin(
     }
 }
 
+fn integer_value(value: i64) -> Value {
+    Value::Number(Number::Integer(value))
+}
+
 fn eval_add(args: &[Value]) -> Result<Value, EvalError> {
-    let mut total = 0_i64;
-    for arg in args {
-        total = total
-            .checked_add(arg.as_integer()?)
-            .ok_or(EvalError::IntegerOverflow)?;
+    let mut total = Number::zero();
+    for arg in numeric_args(args)? {
+        total = total.add(arg)?;
     }
-    Ok(Value::Integer(total))
+    Ok(Value::Number(total))
 }
 
 fn eval_sub(args: &[Value]) -> Result<Value, EvalError> {
@@ -206,28 +256,24 @@ fn eval_sub(args: &[Value]) -> Result<Value, EvalError> {
         })?;
 
     let result = if rest.is_empty() {
-        first.checked_neg().ok_or(EvalError::IntegerOverflow)?
+        first.negate()?
     } else {
         let mut total = *first;
         for value in rest {
-            total = total
-                .checked_sub(*value)
-                .ok_or(EvalError::IntegerOverflow)?;
+            total = total.sub(*value)?;
         }
         total
     };
 
-    Ok(Value::Integer(result))
+    Ok(Value::Number(result))
 }
 
 fn eval_mul(args: &[Value]) -> Result<Value, EvalError> {
-    let mut total = 1_i64;
-    for arg in args {
-        total = total
-            .checked_mul(arg.as_integer()?)
-            .ok_or(EvalError::IntegerOverflow)?;
+    let mut total = Number::one();
+    for arg in numeric_args(args)? {
+        total = total.mul(arg)?;
     }
-    Ok(Value::Integer(total))
+    Ok(Value::Number(total))
 }
 
 fn eval_div(args: &[Value]) -> Result<Value, EvalError> {
@@ -250,20 +296,15 @@ fn eval_div(args: &[Value]) -> Result<Value, EvalError> {
 
     let mut total = *first;
     for value in rest {
-        if *value == 0 {
-            return Err(EvalError::DivisionByZero);
-        }
-        total = total
-            .checked_div(*value)
-            .ok_or(EvalError::IntegerOverflow)?;
+        total = total.div(*value)?;
     }
 
-    Ok(Value::Integer(total))
+    Ok(Value::Number(total))
 }
 
 fn eval_compare<F>(name: &str, args: &[Value], compare: F) -> Result<Value, EvalError>
 where
-    F: Fn(i64, i64) -> bool,
+    F: Fn(Ordering) -> bool,
 {
     let values = numeric_args(args)?;
     if values.len() < 2 {
@@ -275,7 +316,7 @@ where
     }
 
     for pair in values.windows(2) {
-        if !compare(pair[0], pair[1]) {
+        if !compare(pair[0].compare(pair[1])?) {
             return Ok(Value::Boolean(false));
         }
     }
@@ -413,7 +454,7 @@ fn eval_length(args: &[Value]) -> Result<Value, EvalError> {
         });
     };
 
-    Ok(Value::Integer(items.len() as i64))
+    Ok(integer_value(items.len() as i64))
 }
 
 fn eval_append(args: &[Value]) -> Result<Value, EvalError> {
@@ -566,7 +607,7 @@ fn eval_string_length(args: &[Value]) -> Result<Value, EvalError> {
         });
     };
 
-    Ok(Value::Integer(value.as_string()?.chars().count() as i64))
+    Ok(integer_value(value.as_string()?.chars().count() as i64))
 }
 
 fn eval_substring(args: &[Value]) -> Result<Value, EvalError> {
@@ -603,10 +644,10 @@ fn eval_string_to_number(args: &[Value]) -> Result<Value, EvalError> {
         });
     };
 
-    match value.as_string()?.parse::<i64>() {
-        Ok(number) => Ok(Value::Integer(number)),
-        Err(_) => Ok(Value::Boolean(false)),
-    }
+    Ok(match parse_number_string(&value.as_string()?) {
+        Some(number) => Value::Number(number),
+        None => Value::Boolean(false),
+    })
 }
 
 fn eval_number_to_string(args: &[Value]) -> Result<Value, EvalError> {
@@ -618,7 +659,57 @@ fn eval_number_to_string(args: &[Value]) -> Result<Value, EvalError> {
         });
     };
 
-    Ok(Value::String(value.as_integer()?.to_string()))
+    Ok(Value::String(value.as_number()?.render()))
+}
+
+fn eval_exact_to_inexact(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "exact->inexact".into(),
+            expected: "exactly 1 argument".into(),
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Number(Number::from_inexact(
+        value.as_number()?.to_f64(),
+    )?))
+}
+
+fn eval_inexact_to_exact(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "inexact->exact".into(),
+            expected: "exactly 1 argument".into(),
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Number(value.as_number()?.to_exact()?))
+}
+
+fn eval_numerator(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "numerator".into(),
+            expected: "exactly 1 argument".into(),
+            got: args.len(),
+        });
+    };
+
+    Ok(integer_value(value.as_number()?.to_exact()?.numerator()?))
+}
+
+fn eval_denominator(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "denominator".into(),
+            expected: "exactly 1 argument".into(),
+            got: args.len(),
+        });
+    };
+
+    Ok(integer_value(value.as_number()?.to_exact()?.denominator()?))
 }
 
 fn eval_symbol_to_string(args: &[Value]) -> Result<Value, EvalError> {
@@ -723,12 +814,7 @@ fn eval_abs(args: &[Value]) -> Result<Value, EvalError> {
         });
     };
 
-    Ok(Value::Integer(
-        value
-            .as_integer()?
-            .checked_abs()
-            .ok_or(EvalError::IntegerOverflow)?,
-    ))
+    Ok(Value::Number(value.as_number()?.abs()?))
 }
 
 fn eval_modulo(args: &[Value]) -> Result<Value, EvalError> {
@@ -743,12 +829,12 @@ fn eval_modulo(args: &[Value]) -> Result<Value, EvalError> {
     } else {
         remainder
     };
-    Ok(Value::Integer(result))
+    Ok(integer_value(result))
 }
 
 fn eval_remainder(args: &[Value]) -> Result<Value, EvalError> {
     let (dividend, divisor) = binary_numeric_args("remainder", args)?;
-    Ok(Value::Integer(
+    Ok(integer_value(
         dividend
             .checked_rem(divisor)
             .ok_or(EvalError::IntegerOverflow)?,
@@ -757,7 +843,7 @@ fn eval_remainder(args: &[Value]) -> Result<Value, EvalError> {
 
 fn eval_quotient(args: &[Value]) -> Result<Value, EvalError> {
     let (dividend, divisor) = binary_numeric_args("quotient", args)?;
-    Ok(Value::Integer(
+    Ok(integer_value(
         dividend
             .checked_div(divisor)
             .ok_or(EvalError::IntegerOverflow)?,
@@ -766,16 +852,24 @@ fn eval_quotient(args: &[Value]) -> Result<Value, EvalError> {
 
 fn eval_min(args: &[Value]) -> Result<Value, EvalError> {
     let values = at_least_one_numeric_arg("min", args)?;
-    Ok(Value::Integer(
-        *values.iter().min().expect("at least one value"),
-    ))
+    let mut best = *values.first().expect("at least one value");
+    for value in values.into_iter().skip(1) {
+        if value.compare(best)? == Ordering::Less {
+            best = value;
+        }
+    }
+    Ok(Value::Number(best))
 }
 
 fn eval_max(args: &[Value]) -> Result<Value, EvalError> {
     let values = at_least_one_numeric_arg("max", args)?;
-    Ok(Value::Integer(
-        *values.iter().max().expect("at least one value"),
-    ))
+    let mut best = *values.first().expect("at least one value");
+    for value in values.into_iter().skip(1) {
+        if value.compare(best)? == Ordering::Greater {
+            best = value;
+        }
+    }
+    Ok(Value::Number(best))
 }
 
 fn eval_expt(args: &[Value]) -> Result<Value, EvalError> {
@@ -811,7 +905,7 @@ fn eval_expt(args: &[Value]) -> Result<Value, EvalError> {
         }
     }
 
-    Ok(Value::Integer(result))
+    Ok(integer_value(result))
 }
 
 fn eval_list_ref(args: &[Value]) -> Result<Value, EvalError> {
@@ -913,11 +1007,11 @@ fn eval_pair_pred(args: &[Value]) -> Result<Value, EvalError> {
     ))
 }
 
-fn numeric_args(args: &[Value]) -> Result<Vec<i64>, EvalError> {
-    args.iter().map(Value::as_integer).collect()
+fn numeric_args(args: &[Value]) -> Result<Vec<Number>, EvalError> {
+    args.iter().map(Value::as_number).collect()
 }
 
-fn at_least_one_numeric_arg(name: &str, args: &[Value]) -> Result<Vec<i64>, EvalError> {
+fn at_least_one_numeric_arg(name: &str, args: &[Value]) -> Result<Vec<Number>, EvalError> {
     let values = numeric_args(args)?;
     if values.is_empty() {
         return Err(EvalError::WrongArgCount {
@@ -959,6 +1053,27 @@ where
     };
 
     Ok(Value::Boolean(predicate(value.as_integer()?)))
+}
+
+fn eval_numeric_order_predicate<F>(
+    name: &str,
+    args: &[Value],
+    predicate: F,
+) -> Result<Value, EvalError>
+where
+    F: FnOnce(Ordering) -> bool,
+{
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: name.into(),
+            expected: "exactly 1 argument".into(),
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Boolean(predicate(
+        value.as_number()?.compare(Number::zero())?,
+    )))
 }
 
 fn list_items(value: &Value) -> Result<&[Value], EvalError> {

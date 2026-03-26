@@ -1,9 +1,11 @@
 mod builtins;
 pub mod error;
 mod macros;
+mod number;
 
 pub use error::{EvalError, SourcePos};
 use macros::{MacroEnvRef, MacroEnvironment};
+use number::{parse_number_token, Number};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -11,7 +13,7 @@ use std::rc::Rc;
 
 #[derive(Clone)]
 enum Expr {
-    Integer(i64, SourcePos),
+    Number(Number, SourcePos),
     Boolean(bool, SourcePos),
     String(String, SourcePos),
     Char(char, SourcePos),
@@ -23,7 +25,7 @@ enum Expr {
 impl Expr {
     fn position(&self) -> SourcePos {
         match self {
-            Self::Integer(_, position)
+            Self::Number(_, position)
             | Self::Boolean(_, position)
             | Self::String(_, position)
             | Self::Char(_, position)
@@ -40,7 +42,7 @@ type BindingRef = Rc<RefCell<Value>>;
 
 #[derive(Clone)]
 enum Value {
-    Integer(i64),
+    Number(Number),
     Boolean(bool),
     String(String),
     MutableString(Rc<RefCell<Vec<char>>>),
@@ -91,6 +93,10 @@ enum BuiltinKind {
     Map,
     StringPred,
     NumberPred,
+    IntegerPred,
+    RationalPred,
+    ExactPred,
+    InexactPred,
     BooleanPred,
     PairPred,
     SymbolPred,
@@ -102,6 +108,10 @@ enum BuiltinKind {
     Substring,
     StringToNumber,
     NumberToString,
+    ExactToInexact,
+    InexactToExact,
+    Numerator,
+    Denominator,
     SymbolToString,
     StringToSymbol,
     StringRef,
@@ -149,7 +159,8 @@ impl Value {
 
     fn type_name(&self) -> &'static str {
         match self {
-            Self::Integer(_) => "integer",
+            Self::Number(number) if number.as_exact_integer().is_some() => "integer",
+            Self::Number(_) => "number",
             Self::Boolean(_) => "boolean",
             Self::String(_) | Self::MutableString(_) => "string",
             Self::Symbol(_) => "symbol",
@@ -163,9 +174,22 @@ impl Value {
 
     fn as_integer(&self) -> Result<i64, EvalError> {
         match self {
-            Self::Integer(value) => Ok(*value),
+            Self::Number(number) => number.as_exact_integer().ok_or(EvalError::TypeMismatch {
+                expected: "integer",
+                found: self.type_name().into(),
+            }),
             other => Err(EvalError::TypeMismatch {
                 expected: "integer",
+                found: other.type_name().into(),
+            }),
+        }
+    }
+
+    fn as_number(&self) -> Result<Number, EvalError> {
+        match self {
+            Self::Number(number) => Ok(*number),
+            other => Err(EvalError::TypeMismatch {
+                expected: "number",
                 found: other.type_name().into(),
             }),
         }
@@ -204,7 +228,7 @@ impl Value {
 
     fn render(&self) -> String {
         match self {
-            Self::Integer(value) => value.to_string(),
+            Self::Number(number) => number.render(),
             Self::Boolean(true) => "#t".into(),
             Self::Boolean(false) => "#f".into(),
             Self::String(value) => render_string(value),
@@ -265,6 +289,10 @@ impl BuiltinKind {
             Self::Map => "map",
             Self::StringPred => "string?",
             Self::NumberPred => "number?",
+            Self::IntegerPred => "integer?",
+            Self::RationalPred => "rational?",
+            Self::ExactPred => "exact?",
+            Self::InexactPred => "inexact?",
             Self::BooleanPred => "boolean?",
             Self::PairPred => "pair?",
             Self::SymbolPred => "symbol?",
@@ -276,6 +304,10 @@ impl BuiltinKind {
             Self::Substring => "substring",
             Self::StringToNumber => "string->number",
             Self::NumberToString => "number->string",
+            Self::ExactToInexact => "exact->inexact",
+            Self::InexactToExact => "inexact->exact",
+            Self::Numerator => "numerator",
+            Self::Denominator => "denominator",
             Self::SymbolToString => "symbol->string",
             Self::StringToSymbol => "string->symbol",
             Self::StringRef => "string-ref",
@@ -442,16 +474,14 @@ impl<'a> Parser<'a> {
                 })?;
                 Ok(Expr::Char(value, position))
             }
-            _ if is_integer_token(token) => {
-                let value = token.parse().map_err(|_| {
-                    EvalError::SyntaxError {
-                        message: format!("invalid integer literal: {token}"),
-                    }
-                    .with_position(position)
-                })?;
-                Ok(Expr::Integer(value, position))
-            }
-            _ => Ok(Expr::Symbol(token.to_string(), position)),
+            _ => match parse_number_token(token) {
+                Some(Ok(number)) => Ok(Expr::Number(number, position)),
+                Some(Err(error)) => Err(EvalError::SyntaxError {
+                    message: error.message(),
+                }
+                .with_position(position)),
+                None => Ok(Expr::Symbol(token.to_string(), position)),
+            },
         }
     }
 
@@ -521,17 +551,6 @@ impl<'a> Parser<'a> {
         }
         Some(ch)
     }
-}
-
-fn is_integer_token(token: &str) -> bool {
-    if token.chars().all(|ch| ch.is_ascii_digit()) {
-        return true;
-    }
-
-    let mut chars = token.chars();
-    matches!(chars.next(), Some('-'))
-        && chars.clone().next().is_some()
-        && chars.all(|ch| ch.is_ascii_digit())
 }
 
 fn parse_char_literal(token: &str) -> Option<char> {
@@ -638,7 +657,7 @@ fn render_char(value: char) -> String {
 
 fn values_equal(lhs: &Value, rhs: &Value) -> bool {
     match (lhs, rhs) {
-        (Value::Integer(lhs), Value::Integer(rhs)) => lhs == rhs,
+        (Value::Number(lhs), Value::Number(rhs)) => lhs.equals(*rhs).unwrap_or(false),
         (Value::Boolean(lhs), Value::Boolean(rhs)) => lhs == rhs,
         (Value::String(lhs), Value::String(rhs)) => lhs == rhs,
         (Value::String(lhs), Value::MutableString(rhs))
@@ -735,7 +754,7 @@ fn eval_sequence(
 
 fn eval_expr(expr: &Expr, env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
     match expr {
-        Expr::Integer(value, _) => Ok(Value::Integer(*value)),
+        Expr::Number(value, _) => Ok(Value::Number(*value)),
         Expr::Boolean(value, _) => Ok(Value::Boolean(*value)),
         Expr::String(value, _) => Ok(Value::String(value.clone())),
         Expr::Char(value, _) => Ok(Value::Char(*value)),
@@ -908,7 +927,7 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
 
 fn quote_to_value(expr: &Expr) -> Result<Value, EvalError> {
     match expr {
-        Expr::Integer(value, _) => Ok(Value::Integer(*value)),
+        Expr::Number(value, _) => Ok(Value::Number(*value)),
         Expr::Boolean(value, _) => Ok(Value::Boolean(*value)),
         Expr::String(value, _) => Ok(Value::String(value.clone())),
         Expr::Char(value, _) => Ok(Value::Char(*value)),
