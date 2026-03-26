@@ -101,6 +101,9 @@ object CekSteps:
       guardEnv.define(variable, v)
       stepCond(clauses, guardEnv, next)
 
+    case Kont.CaseKey(clauses, env, next) =>
+      stepCaseMatch(v, clauses, env, next)
+
     case Kont.RaiseReturn(_) =>
       throw EvalError("handler returned from raise")
 
@@ -261,8 +264,30 @@ object CekSteps:
         CekState.Eval(test, env, Kont.CondTest(body, rest, env, k))
       case e :: _ => throw errAt(posOf(e), "invalid cond")
 
+  // ── Case step helpers ─────────────────────────────────────────────
+  private[ming] def stepCase(rest: List[Expr], env: Env, pos: Pos, k: Kont): CekState =
+    rest match
+      case keyExpr :: clauses =>
+        CekState.Eval(keyExpr, env, Kont.CaseKey(clauses, env, k))
+      case _ => throw errAt(pos, "invalid case")
+
+  private def stepCaseMatch(key: Value, clauses: List[Expr], env: Env, k: Kont): CekState =
+    clauses match
+      case Nil => CekState.ApplyK(Value.VVoid, k)
+      case Expr.SList(Expr.Symbol("else", _) :: body, _) :: _ =>
+        bodyToCek(body, env, k)
+      case Expr.SList(Expr.SList(datums, _) :: body, _) :: rest =>
+        val matched = datums.exists { d =>
+          ListUtilBuiltins.eqvCheck(key, EvalForms.quoteToValue(d))
+        }
+        if matched then bodyToCek(body, env, k)
+        else stepCaseMatch(key, rest, env, k)
+      case e :: _ => throw errAt(posOf(e), "invalid case clause")
+
   // Macro expansion cache: keyed by (SList identity, macro identity) → (expanded, injections)
-  private val macroCache = new java.util.IdentityHashMap[Expr, (Value.VMacro, Expr, Map[String, Value])]()
+  // Thread-local for concurrency safety
+  private val macroCache: ThreadLocal[java.util.IdentityHashMap[Expr, (Value.VMacro, Expr, Map[String, Value])]] =
+    ThreadLocal.withInitial(() => new java.util.IdentityHashMap())
 
   private[ming] def stepApp(
     originalExpr: Expr,
@@ -276,12 +301,13 @@ object CekSteps:
       case Expr.Symbol(name, _) =>
         env.lookupOpt(name) match
           case Some(m: Value.VMacro) =>
-            val cached = macroCache.get(originalExpr)
+            val cache = macroCache.get()
+            val cached = cache.get(originalExpr)
             val (expanded, injections) =
               if cached != null && (cached._1 eq m) then (cached._2, cached._3)
               else
                 val result = MacroExpander.expand(m, Expr.SList(head :: args, pos), pos)
-                macroCache.put(originalExpr, (m, result._1, result._2))
+                cache.put(originalExpr, (m, result._1, result._2))
                 result
             injections.foreach((key, v) => env.define(key, v))
             CekState.Eval(expanded, env, k)

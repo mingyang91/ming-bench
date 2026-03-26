@@ -6,11 +6,17 @@ import CekSteps.{bodyToCek, posOf}
 
 object Evaluator:
 
-  // ── Dynamic-wind stack ────────────────────────────────────────────────
-  private[ming] var windStack: List[WindEntry] = Nil
+  // ── Dynamic-wind stack (thread-local for concurrency safety) ─────────
+  private val _windStack: ThreadLocal[List[WindEntry]] =
+    ThreadLocal.withInitial(() => Nil)
+  private[ming] def windStack: List[WindEntry] = _windStack.get()
+  private[ming] def windStack_=(v: List[WindEntry]): Unit = _windStack.set(v)
 
-  // ── Exception handler stack ─────────────────────────────────────────
-  private[ming] var exceptionHandlers: List[ExceptionHandler] = Nil
+  // ── Exception handler stack (thread-local for concurrency safety) ───
+  private val _exceptionHandlers: ThreadLocal[List[ExceptionHandler]] =
+    ThreadLocal.withInitial(() => Nil)
+  private[ming] def exceptionHandlers: List[ExceptionHandler] = _exceptionHandlers.get()
+  private[ming] def exceptionHandlers_=(v: List[ExceptionHandler]): Unit = _exceptionHandlers.set(v)
 
   private[ming] def commonTail(a: List[WindEntry], b: List[WindEntry]): List[WindEntry] =
     val aLen                = a.length
@@ -138,7 +144,7 @@ object Evaluator:
         CekState.ApplyK(EvalCompound.evalLetrecStar(rest, env, p, evalExpr, evalBody), k)
 
       case Expr.SList(Expr.Symbol("case", _) :: rest, p) =>
-        CekState.ApplyK(EvalCompound.evalCase(rest, env, p, evalExpr, evalBody, posOf), k)
+        CekSteps.stepCase(rest, env, p, k)
 
       case Expr.SList(Expr.Symbol("do", _) :: rest, p) =>
         CekState.ApplyK(EvalCompound.evalDo(rest, env, p, evalExpr, evalBody, posOf), k)

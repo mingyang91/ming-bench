@@ -85,6 +85,7 @@ enum Kont:
   case PopHandler(next: Kont)
   case GuardTest(variable: String, clauses: List[Expr], env: Env, next: Kont)
   case RaiseReturn(next: Kont)
+  case CaseKey(clauses: List[Expr], env: Env, next: Kont)
   case CallWithValues(consumer: Value, env: Env, pos: Pos, next: Kont)
   case MacroTransformerResult(callEnv: Env, defEnv: Env, pos: Pos, next: Kont)
 
