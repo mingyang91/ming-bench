@@ -389,6 +389,26 @@ public class Evaluator {
         record Letrec(List<String> names, int idx, List<Object> inits, List<Object> body, Env letEnv, Kont next) implements Kont {}
         record DynWindBody(Object inThunk, Object outThunk, Kont next) implements Kont {}
         record CallWithValues(Object consumer, Kont next) implements Kont {}
+        record Guard(String varName, List<List<?>> clauses, Env env, Kont next) implements Kont {}
+    }
+
+    private static Kont nextKont(Kont k) {
+        return switch (k) {
+            case Kont.Halt h -> null;
+            case Kont.Seq s -> s.next();
+            case Kont.Def d -> d.next();
+            case Kont.Set s -> s.next();
+            case Kont.If i -> i.next();
+            case Kont.Arg a -> a.next();
+            case Kont.And a -> a.next();
+            case Kont.Or o -> o.next();
+            case Kont.CondTest c -> c.next();
+            case Kont.LetStar l -> l.next();
+            case Kont.Letrec l -> l.next();
+            case Kont.DynWindBody d -> d.next();
+            case Kont.CallWithValues c -> c.next();
+            case Kont.Guard g -> g.next();
+        };
     }
 
     // ===== CEK Machine =====
@@ -407,12 +427,14 @@ public class Evaluator {
         List<Object> fa = null;
         SourceList lastSrc = null;
 
-        try { mainLoop: while (true) {
+        try { mainLoop: while (true) { try {
 
             // ---- function application ----
             if (fn != null) {
                 if (fn instanceof ContinuationObj co) {
-                    val = (fa == null || fa.isEmpty()) ? null : fa.get(0);
+                    if (fa == null || fa.isEmpty()) { val = null; }
+                    else if (fa.size() == 1) { val = fa.get(0); }
+                    else { val = new MultipleValues(new ArrayList<>(fa)); }
                     windTo(co.windStack);
                     k = co.kont; fn = null; fa = null; ev = false; continue;
                 }
@@ -675,9 +697,27 @@ public class Evaluator {
                         ev = false; continue mainLoop;
                     }
                     case "guard" -> {
-                        try { val = evalGuard(list, env); }
-                        catch (ContinuationReturn cr) { val = cr.value; k = cr.kont; }
-                        ev = false; continue mainLoop;
+                        if (list.size() < 3) throw new EvalError("guard: bad syntax");
+                        if (!(list.get(1) instanceof List<?> guardSpec) || guardSpec.isEmpty())
+                            throw new EvalError("guard: bad syntax");
+                        if (!(guardSpec.get(0) instanceof String gVarName))
+                            throw new EvalError("guard: expected variable name");
+                        List<List<?>> gClauses = new ArrayList<>();
+                        for (int gi = 1; gi < guardSpec.size(); gi++) {
+                            if (!(guardSpec.get(gi) instanceof List<?> gClause))
+                                throw new EvalError("guard: bad clause");
+                            gClauses.add(gClause);
+                        }
+                        List<Object> gBody = new ArrayList<>();
+                        for (int gi = 2; gi < list.size(); gi++) gBody.add(list.get(gi));
+                        Kont guardK = new Kont.Guard(gVarName, gClauses, env, k);
+                        if (gBody.size() > 1) {
+                            k = new Kont.Seq(gBody, 1, env, guardK);
+                        } else {
+                            k = guardK;
+                        }
+                        ctrl = gBody.get(0);
+                        ev = true; continue mainLoop;
                     }
                     default -> { /* fall through to application */ }
                 }}
@@ -840,11 +880,68 @@ public class Evaluator {
                         fn = consumer; fa = List.of(val); k = next;
                     }
                 }
+
+                case Kont.Guard(var vn, var cl, var ge, var next) -> {
+                    // Body completed normally — skip through consecutive Guard frames
+                    k = next;
+                    while (k instanceof Kont.Guard g2) k = g2.next();
+                }
             }
 
-        }} catch (SchemeException se) {
+        } catch (SchemeException se) {
+            // Search continuation chain for nearest Guard frame
+            Kont searchK = k;
+            boolean guardHandled = false;
+            while (searchK != null) {
+                if (searchK instanceof Kont.Guard g) {
+                    // Unwind DynWindBody frames between k and this guard
+                    Kont uw = k;
+                    while (uw != g) {
+                        if (uw instanceof Kont.DynWindBody dwb) {
+                            var ws = WIND_STACK.get();
+                            if (!ws.isEmpty()) ws.remove(ws.size() - 1);
+                            applyProc(dwb.outThunk(), List.of());
+                        }
+                        uw = nextKont(uw);
+                    }
+                    // Evaluate guard clauses
+                    Env guardEnv = new Env(g.env());
+                    guardEnv.define(g.varName(), se.value);
+                    boolean matched = false;
+                    for (List<?> clause : g.clauses()) {
+                        if (clause.isEmpty()) throw new EvalError("guard: bad clause");
+                        Object test = clause.get(0);
+                        if (test instanceof String cs && cs.equals("else")) {
+                            if (clause.size() == 1) { val = null; }
+                            else {
+                                Object result = null;
+                                for (int j = 1; j < clause.size(); j++) result = eval(clause.get(j), guardEnv);
+                                val = result;
+                            }
+                            matched = true; break;
+                        }
+                        Object testVal = eval(test, guardEnv);
+                        if (!isFalse(testVal)) {
+                            if (clause.size() == 1) { val = testVal; }
+                            else {
+                                Object result = null;
+                                for (int j = 1; j < clause.size(); j++) result = eval(clause.get(j), guardEnv);
+                                val = result;
+                            }
+                            matched = true; break;
+                        }
+                    }
+                    if (!matched) { searchK = nextKont(searchK); continue; }
+                    k = g.next(); fn = null; fa = null; ev = false;
+                    guardHandled = true; break;
+                }
+                searchK = nextKont(searchK);
+            }
+            if (guardHandled) continue mainLoop;
             throw new EvalError("unhandled exception: " + SchemeValue.toStr(se.value));
-        } catch (EvalError e) {
+        }
+
+        }} catch (EvalError e) {
             if (lastSrc != null && !e.getMessage().matches(".*\\d+:\\d+.*"))
                 throw new EvalError(e.getMessage() + " [" + lastSrc.line + ":" + lastSrc.col + "]");
             throw e;

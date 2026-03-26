@@ -12,7 +12,11 @@ class SyntaxRules {
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "define", "if", "quote", "lambda", "set!", "and", "or", "begin",
-        "let", "cond", "define-syntax", "syntax-rules"
+        "let", "let*", "letrec", "letrec*", "cond", "case",
+        "define-syntax", "syntax-rules", "syntax-case", "syntax", "with-syntax",
+        "define-record-type", "case-lambda", "do", "guard",
+        "when", "unless", "raise", "values", "call-with-values",
+        "call/cc", "call-with-current-continuation", "dynamic-wind"
     );
 
     SyntaxRules(List<String> literals, List<Rule> rules, Env defEnv) {
@@ -64,15 +68,14 @@ class SyntaxRules {
                 Map<String, String> renames = new HashMap<>();
                 Object expanded = expandTemplate(rule.template, bindings, ellipsisBindings, patternVars, renames);
 
-                Env expandEnv = new Env(callEnv);
                 for (var entry : renames.entrySet()) {
                     try {
                         Object val = defEnv.lookup(entry.getKey());
-                        expandEnv.define(entry.getValue(), val);
+                        callEnv.define(entry.getValue(), val);
                     } catch (EvalError e) { /* not bound at def site, skip */ }
                 }
 
-                return new Object[] { expanded, expandEnv };
+                return new Object[] { expanded, callEnv };
             }
         }
         throw new EvalError("syntax-rules: no matching pattern for " + SchemeValue.toStr(form));
