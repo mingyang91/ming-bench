@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static RECORD_TYPE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn gensym(base: &str) -> String {
     let n = GENSYM_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -117,6 +118,7 @@ pub enum Value {
     Lambda(Vec<String>, Option<String>, Vec<Expr>, Env),
     Builtin(String),
     Macro(SyntaxRulesMacro),
+    Record(usize, Vec<Value>), // type_id, field values
     Void,
 }
 
@@ -153,6 +155,7 @@ impl PartialEq for Value {
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
+            (Value::Record(id1, f1), Value::Record(id2, f2)) => id1 == id2 && f1 == f2,
             (Value::Void, Value::Void) => true,
             (Value::Macro(_), Value::Macro(_)) => false,
             _ => false,
@@ -193,6 +196,7 @@ impl fmt::Display for Value {
             }
             Value::Lambda(..) => write!(f, "#<procedure>"),
             Value::Builtin(..) => write!(f, "#<procedure>"),
+            Value::Record(_, _) => write!(f, "#<record>"),
             Value::Macro(_) => write!(f, "#<macro>"),
             Value::Void => Ok(()),
         }
@@ -536,6 +540,7 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "string-set!" => return eval_string_set(&items[1..], env),
                     "set!" => return eval_set(&items[1..], env),
                     "define-syntax" => return eval_define_syntax(&items[1..], env),
+                    "define-record-type" => return eval_define_record_type(&items[1..], env),
                     "eq?" | "equal?" | "abs" | "modulo" | "remainder" | "quotient"
                     | "min" | "max" | "expt" | "zero?" | "positive?" | "negative?"
                     | "odd?" | "even?" | "list-ref" | "list-tail" | "list?" | "assoc"
@@ -1034,6 +1039,40 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "string-downcase" => {
             if args.len() != 1 { return Err(EvalError::Arity("string-downcase requires 1 argument".into())); }
             Ok(Value::Str(require_str(&args[0])?.to_lowercase()))
+        }
+        _ if name.starts_with("__record-construct-") => {
+            // __record-construct-{type_id}-{nfields}
+            let rest = &name["__record-construct-".len()..];
+            let dash = rest.find('-').unwrap();
+            let type_id: usize = rest[..dash].parse().unwrap();
+            let nfields: usize = rest[dash+1..].parse().unwrap();
+            if args.len() != nfields {
+                return Err(EvalError::Arity(format!("record constructor expects {} args, got {}", nfields, args.len())));
+            }
+            Ok(Value::Record(type_id, args.to_vec()))
+        }
+        _ if name.starts_with("__record-predicate-") => {
+            let type_id: usize = name["__record-predicate-".len()..].parse().unwrap();
+            if args.len() != 1 {
+                return Err(EvalError::Arity("record predicate requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Record(id, _) if *id == type_id)))
+        }
+        _ if name.starts_with("__record-accessor-") => {
+            // __record-accessor-{type_id}-{field_idx}
+            let rest = &name["__record-accessor-".len()..];
+            let dash = rest.find('-').unwrap();
+            let type_id: usize = rest[..dash].parse().unwrap();
+            let field_idx: usize = rest[dash+1..].parse().unwrap();
+            if args.len() != 1 {
+                return Err(EvalError::Arity("record accessor requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Record(id, fields) if *id == type_id => {
+                    Ok(fields[field_idx].clone())
+                }
+                _ => Err(EvalError::Type("record accessor: wrong type".into())),
+            }
         }
         _ => Err(EvalError::Generic(format!("unknown builtin: {}", name))),
     }
@@ -1747,6 +1786,73 @@ fn eval_string_set(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
 }
 
 // ── Macros (define-syntax / syntax-rules) ───────────────────────────
+
+fn eval_define_record_type(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    // (define-record-type <name> (constructor field-names...) predicate (field accessor)...)
+    if args.len() < 3 {
+        return Err(EvalError::Arity("define-record-type requires at least 3 arguments".into()));
+    }
+    // Parse type name (ignored for runtime, but we need it for error messages)
+    let _type_name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Parse("define-record-type: first arg must be a symbol".into())),
+    };
+
+    // Parse constructor: (constructor-name field-name ...)
+    let (constructor_name, constructor_fields) = match &args[1].kind {
+        ExprKind::List(items) if !items.is_empty() => {
+            let cname = match &items[0].kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Parse("define-record-type: constructor name must be a symbol".into())),
+            };
+            let fields: Vec<String> = items[1..].iter().map(|e| match &e.kind {
+                ExprKind::Symbol(s) => Ok(s.clone()),
+                _ => Err(EvalError::Parse("define-record-type: field name must be a symbol".into())),
+            }).collect::<Result<_, _>>()?;
+            (cname, fields)
+        }
+        _ => return Err(EvalError::Parse("define-record-type: constructor must be a list".into())),
+    };
+
+    // Parse predicate name
+    let predicate_name = match &args[2].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Parse("define-record-type: predicate must be a symbol".into())),
+    };
+
+    // Allocate a unique type ID
+    let type_id = RECORD_TYPE_COUNTER.fetch_add(1, Ordering::SeqCst);
+
+    // Define constructor
+    let nfields = constructor_fields.len();
+    env.set(constructor_name, Value::Builtin(format!("__record-construct-{}-{}", type_id, nfields)));
+
+    // Define predicate
+    env.set(predicate_name, Value::Builtin(format!("__record-predicate-{}", type_id)));
+
+    // Parse field specs: (field-name accessor-name)
+    for field_spec in &args[3..] {
+        match &field_spec.kind {
+            ExprKind::List(items) if items.len() == 2 => {
+                let field_name = match &items[0].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Parse("define-record-type: field name must be a symbol".into())),
+                };
+                let accessor_name = match &items[1].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Parse("define-record-type: accessor name must be a symbol".into())),
+                };
+                // Find the field index in the constructor fields
+                let field_idx = constructor_fields.iter().position(|f| f == &field_name)
+                    .ok_or_else(|| EvalError::Parse(format!("define-record-type: field '{}' not in constructor", field_name)))?;
+                env.set(accessor_name, Value::Builtin(format!("__record-accessor-{}-{}", type_id, field_idx)));
+            }
+            _ => return Err(EvalError::Parse("define-record-type: field spec must be (name accessor)".into())),
+        }
+    }
+
+    Ok(Value::Void)
+}
 
 fn eval_define_syntax(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if args.len() != 2 {
