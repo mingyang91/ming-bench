@@ -35,4 +35,7 @@ pub enum EvalError {
 
     #[error("not a procedure: {0}")]
     NotAProcedure(String),
+
+    #[error("step limit exceeded after {max_steps} steps")]
+    StepLimitExceeded { max_steps: usize },
 }
