@@ -3,12 +3,13 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use super::builtins::{apply_builtin, error_exception_value};
-use super::error::{ContinuationJumpData, EvalError};
+use super::error::{ContinuationJumpData, EvalError, SourcePos};
 use super::evaluator::wrong_arg_count;
 use super::model::{
     list_from_values, Builtin, ContinuationProc, Env, EnvRef, Expr, Procedure, Value,
 };
 use super::records::apply_record_procedure;
+use super::step_limit::StepBudgetRef;
 use super::{eval_cps, eval_sequence_cps};
 
 type Continuation = ContinuationProc;
@@ -30,15 +31,19 @@ struct ExceptionHandlerFrame {
 
 pub(super) type CpsRuntimeRef = Rc<CpsRuntime>;
 
-#[derive(Default)]
 pub(super) struct CpsRuntime {
     winders: RefCell<Vec<WindFrameRef>>,
     handlers: RefCell<Vec<ExceptionHandlerFrameRef>>,
+    steps: StepBudgetRef,
 }
 
 impl CpsRuntime {
-    pub(super) fn new() -> CpsRuntimeRef {
-        Rc::new(Self::default())
+    pub(super) fn new(steps: StepBudgetRef) -> CpsRuntimeRef {
+        Rc::new(Self {
+            winders: RefCell::new(Vec::new()),
+            handlers: RefCell::new(Vec::new()),
+            steps,
+        })
     }
 
     pub(super) fn reset_winders(&self) {
@@ -47,6 +52,14 @@ impl CpsRuntime {
 
     pub(super) fn reset_handlers(&self) {
         self.handlers.borrow_mut().clear();
+    }
+
+    pub(super) fn step(&self, position: SourcePos) -> Result<(), EvalError> {
+        self.steps.step(position)
+    }
+
+    pub(super) fn steps(&self) -> &StepBudgetRef {
+        &self.steps
     }
 
     fn current_winders(&self) -> Vec<WindFrameRef> {
@@ -274,9 +287,8 @@ pub(super) fn apply_cps(
         Value::Builtin(Builtin::Apply) => apply_apply_cps(args, output, k, runtime),
         Value::Builtin(Builtin::Map) => apply_map_cps(args, output, k, runtime),
         Value::Builtin(Builtin::ForEach) => apply_for_each_cps(args, output, k, runtime),
-        Value::Builtin(builtin) => {
-            apply_builtin(builtin, &args, output).and_then(|value| k(value, output))
-        }
+        Value::Builtin(builtin) => apply_builtin(builtin, &args, output, runtime.steps())
+            .and_then(|value| k(value, output)),
         Value::Procedure(procedure) => apply_procedure_cps(&procedure, args, output, k, runtime),
         Value::Continuation(continuation) => Err(EvalError::ContinuationJump {
             jump: ContinuationJumpData::new(continuation, Value::from_values(args)),

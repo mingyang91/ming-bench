@@ -3,11 +3,12 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use super::{
-    apply,
+    apply_with_steps,
     model::{
         is_proper_list, list_from_values, Builtin, SchemePair, SchemeString, SchemeVector, Value,
     },
     number::Number,
+    step_limit::StepBudgetRef,
     wrong_arg_count, EvalError,
 };
 
@@ -15,6 +16,7 @@ pub(super) fn apply_builtin(
     builtin: Builtin,
     args: &[Value],
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<Value, EvalError> {
     match builtin {
         Builtin::Add => builtin_add(args),
@@ -110,8 +112,8 @@ pub(super) fn apply_builtin(
         Builtin::Assq => builtin_assq(args),
         Builtin::Assoc => builtin_assoc(args),
         Builtin::Assv => builtin_assv(args),
-        Builtin::Map => builtin_map(args, output),
-        Builtin::ForEach => builtin_for_each(args, output),
+        Builtin::Map => builtin_map(args, output, steps),
+        Builtin::ForEach => builtin_for_each(args, output, steps),
         Builtin::MakeString => builtin_make_string(args),
         Builtin::String => builtin_string(args),
         Builtin::StringAppend => builtin_string_append(args),
@@ -193,25 +195,33 @@ pub(super) fn apply_builtin(
             message: "dynamic-wind requires continuation-aware evaluation".into(),
         }),
         Builtin::Values => Ok(Value::from_values(args.to_vec())),
-        Builtin::CallWithValues => builtin_call_with_values(args, output),
-        Builtin::Apply => builtin_apply(args, output),
+        Builtin::CallWithValues => builtin_call_with_values(args, output, steps),
+        Builtin::Apply => builtin_apply(args, output, steps),
         Builtin::CallCc => Err(EvalError::Syntax {
             message: "call/cc requires continuation-aware evaluation".into(),
         }),
     }
 }
 
-fn builtin_call_with_values(args: &[Value], output: &mut String) -> Result<Value, EvalError> {
+fn builtin_call_with_values(
+    args: &[Value],
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     let [producer, consumer] = args else {
         return Err(wrong_arg_count("call-with-values", "2", args.len()));
     };
 
-    let produced = apply(producer.clone(), &[], output)?;
+    let produced = apply_with_steps(producer.clone(), &[], output, steps)?;
     let consumer_args = produced.into_values();
-    apply(consumer.clone(), &consumer_args, output)
+    apply_with_steps(consumer.clone(), &consumer_args, output, steps)
 }
 
-fn builtin_apply(args: &[Value], output: &mut String) -> Result<Value, EvalError> {
+fn builtin_apply(
+    args: &[Value],
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     let [callable, prefix_and_list @ ..] = args else {
         return Err(wrong_arg_count("apply", "at least 2", 0));
     };
@@ -228,7 +238,7 @@ fn builtin_apply(args: &[Value], output: &mut String) -> Result<Value, EvalError
     let mut applied_args = Vec::with_capacity(prefix_args.len() + list_items.len());
     applied_args.extend(prefix_args.iter().cloned());
     applied_args.extend(list_items);
-    apply(callable.clone(), &applied_args, output)
+    apply_with_steps(callable.clone(), &applied_args, output, steps)
 }
 
 pub(super) fn error_exception_value(args: &[Value]) -> Value {
@@ -815,9 +825,7 @@ where
                     Value::EmptyList => return Ok(Value::Boolean(false)),
                     Value::Pair(pair) => {
                         if !seen.insert(pair.id()) {
-                            return Err(EvalError::CircularList {
-                                name: name.into(),
-                            });
+                            return Err(EvalError::CircularList { name: name.into() });
                         }
 
                         if matches(key, &pair.car()) {
@@ -839,7 +847,11 @@ where
     }
 }
 
-fn builtin_map(args: &[Value], output: &mut String) -> Result<Value, EvalError> {
+fn builtin_map(
+    args: &[Value],
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     let [callable, list_args @ ..] = args else {
         return Err(wrong_arg_count("map", "at least 2", 0));
     };
@@ -861,13 +873,22 @@ fn builtin_map(args: &[Value], output: &mut String) -> Result<Value, EvalError> 
         for list in &lists {
             mapped_args.push(list[index].clone());
         }
-        results.push(apply(callable.clone(), &mapped_args, output)?);
+        results.push(apply_with_steps(
+            callable.clone(),
+            &mapped_args,
+            output,
+            steps,
+        )?);
     }
 
     Ok(list_from_values(results))
 }
 
-fn builtin_for_each(args: &[Value], output: &mut String) -> Result<Value, EvalError> {
+fn builtin_for_each(
+    args: &[Value],
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     let [callable, list_args @ ..] = args else {
         return Err(wrong_arg_count("for-each", "at least 2", 0));
     };
@@ -887,7 +908,7 @@ fn builtin_for_each(args: &[Value], output: &mut String) -> Result<Value, EvalEr
         for list in &lists {
             call_args.push(list[index].clone());
         }
-        apply(callable.clone(), &call_args, output)?;
+        apply_with_steps(callable.clone(), &call_args, output, steps)?;
     }
 
     Ok(Value::Void)

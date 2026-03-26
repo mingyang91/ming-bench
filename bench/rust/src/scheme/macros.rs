@@ -4,8 +4,8 @@ use std::rc::Rc;
 use super::error::{EvalError, SourcePos};
 use super::evaluator::{apply, quote_expr};
 use super::model::{
-    dotted_list_parts, expr_datum_eq, fresh_identifier, is_core_syntax, is_ellipsis, Env,
-    EnvRef, ExpansionState, Expr, MacroExpansion, MacroRef, MacroTransformer, PatternBindings,
+    dotted_list_parts, expr_datum_eq, fresh_identifier, is_core_syntax, is_ellipsis, Env, EnvRef,
+    ExpansionState, Expr, MacroExpansion, MacroRef, MacroTransformer, PatternBindings,
     SchemeString, SyntaxCaseClause, SyntaxRule, Value,
 };
 

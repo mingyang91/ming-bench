@@ -10,6 +10,7 @@ mod model;
 mod number;
 mod parser;
 mod records;
+mod step_limit;
 
 use builtins::eqv_values;
 use continuation_runtime::{
@@ -18,16 +19,17 @@ use continuation_runtime::{
 pub use error::EvalError;
 use error::SourcePos;
 use evaluator::{
-    apply, build_case_lambda, build_lambda, case_lambda_clauses, classify_cond_clause_body,
-    eval_define_syntax, eval_quote, eval_sequence, expand_quasiquote_expr, lambda_parts,
-    new_procedure, parse_do_bindings, parse_do_test_clause, parse_let_bindings, parse_param_list,
-    quote_expr, wrong_arg_count, CondClauseBody, DoLoopState,
+    apply_with_steps, build_case_lambda, build_lambda, case_lambda_clauses,
+    classify_cond_clause_body, eval_define_syntax, eval_quote, eval_sequence,
+    expand_quasiquote_expr, lambda_parts, new_procedure, parse_do_bindings, parse_do_test_clause,
+    parse_let_bindings, parse_param_list, quote_expr, wrong_arg_count, CondClauseBody, DoLoopState,
 };
 use macros::{env_with_expansion_aliases, expand_macro_call};
 use model::{fresh_identifier, ContinuationProc, Env, EnvRef, Expr, Params, SchemeString, Value};
 use number::Number;
 use parser::Parser;
 use records::eval_define_record_type;
+use step_limit::{StepBudget, StepBudgetRef};
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
@@ -38,18 +40,24 @@ use records::eval_define_record_type;
 /// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
 /// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
-    let (value, _) = eval_program(input)?;
+    let (value, _) = eval_program(input, StepBudget::unlimited())?;
     Ok(value.render())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    let (value, output) = eval_program(input)?;
+    let (value, output) = eval_program(input, StepBudget::unlimited())?;
     Ok((value.render(), output))
 }
 
-fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
+/// Evaluate Scheme expressions with a maximum number of eval dispatches.
+pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
+    let (value, _) = eval_program(input, StepBudget::limited(max_steps))?;
+    Ok(value.render())
+}
+
+fn eval_program(input: &str, steps: StepBudgetRef) -> Result<(Value, String), EvalError> {
     if matches_l24_coroutine_scheduler_fixture(input) {
         // This benchmark fixture expects 4, even though standard Scheme call/cc
         // semantics replay the second yield and produce 6.
@@ -61,9 +69,9 @@ fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
     let env = environment::initial_env();
     let mut output = String::new();
     let value = if program_uses_continuations(&exprs) {
-        run_cps_program(exprs.clone(), env.clone(), &mut output)?
+        run_cps_program(exprs.clone(), env.clone(), &mut output, steps)?
     } else {
-        eval_sequence(&exprs, &env, &mut output)?
+        eval_sequence(&exprs, &env, &mut output, &steps)?
     };
     Ok((value, output))
 }
@@ -100,8 +108,13 @@ fn terminal_continuation() -> Continuation {
     Rc::new(|value, _output| Ok(value))
 }
 
-fn run_cps_program(exprs: Vec<Expr>, env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
-    let runtime = CpsRuntime::new();
+fn run_cps_program(
+    exprs: Vec<Expr>,
+    env: EnvRef,
+    output: &mut String,
+    steps: StepBudgetRef,
+) -> Result<Value, EvalError> {
+    let runtime = CpsRuntime::new(steps);
     runtime.reset_winders();
     runtime.reset_handlers();
 
@@ -253,6 +266,9 @@ fn eval_cps(
     k: Continuation,
     runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
+    let pos = expr.pos();
+    runtime.step(pos)?;
+
     match expr {
         Expr::Number(value, _) => k(Value::Number(value), output),
         Expr::Boolean(value, _) => k(Value::Boolean(value), output),
@@ -771,7 +787,13 @@ fn eval_quasiquote_cps(
     runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     match args.as_slice() {
-        [template] => eval_cps(expand_quasiquote_expr(template, 1)?, env, output, k, runtime),
+        [template] => eval_cps(
+            expand_quasiquote_expr(template, 1)?,
+            env,
+            output,
+            k,
+            runtime,
+        ),
         _ => Err(wrong_arg_count("quasiquote", "1", args.len())),
     }
 }

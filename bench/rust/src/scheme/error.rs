@@ -132,6 +132,9 @@ pub enum EvalError {
     #[error("application: expected procedure, got {got}")]
     NotAProcedure { got: String },
 
+    #[error("step limit exceeded after {max_steps} steps")]
+    StepLimitExceeded { max_steps: usize },
+
     #[error("uncaught exception: {value}")]
     UncaughtException { value: String },
 
@@ -258,6 +261,14 @@ impl PartialEq for EvalError {
             (Self::NotAProcedure { got: left }, Self::NotAProcedure { got: right }) => {
                 left == right
             }
+            (
+                Self::StepLimitExceeded {
+                    max_steps: left_max_steps,
+                },
+                Self::StepLimitExceeded {
+                    max_steps: right_max_steps,
+                },
+            ) => left_max_steps == right_max_steps,
             (Self::UncaughtException { value: left }, Self::UncaughtException { value: right }) => {
                 left == right
             }

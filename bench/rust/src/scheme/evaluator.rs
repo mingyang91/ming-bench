@@ -8,16 +8,18 @@ use super::model::{
     ProcedureClause, ProcedureKind, SchemePair, SchemeString, Value,
 };
 use super::records::{apply_record_procedure, eval_define_record_type};
+use super::step_limit::{StepBudget, StepBudgetRef};
 
 pub(super) fn eval_sequence(
     exprs: &[Expr],
     env: &EnvRef,
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<Value, EvalError> {
     let mut result = Value::Void;
 
     for expr in exprs {
-        result = eval(expr, env, output)?;
+        result = eval(expr, env, output, steps)?;
     }
 
     Ok(result)
@@ -38,13 +40,14 @@ fn tail_sequence(
     exprs: &[Expr],
     env: &EnvRef,
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<TailAction, EvalError> {
     let Some((last, prefix)) = exprs.split_last() else {
         return Ok(TailAction::Return(Value::Void));
     };
 
     for expr in prefix {
-        eval(expr, env, output)?;
+        eval(expr, env, output, steps)?;
     }
 
     Ok(TailAction::Continue {
@@ -53,12 +56,18 @@ fn tail_sequence(
     })
 }
 
-fn eval_tail(expr: Expr, env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
+fn eval_tail(
+    expr: Expr,
+    env: EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     let mut current_expr = expr;
     let mut current_env = env;
 
     loop {
         let pos = current_expr.pos();
+        steps.step(pos)?;
 
         match current_expr {
             Expr::Number(value, _) => return Ok(Value::Number(value)),
@@ -74,7 +83,7 @@ fn eval_tail(expr: Expr, env: EnvRef, output: &mut String) -> Result<Value, Eval
                     .map_err(|error| error.with_position(pos));
             }
             Expr::List(items, _) => {
-                match eval_tail_list(items, &current_env, output)
+                match eval_tail_list(items, &current_env, output, steps)
                     .map_err(|error| error.with_position(pos))?
                 {
                     TailAction::Return(value) => return Ok(value),
@@ -92,6 +101,7 @@ fn eval_tail_list(
     items: Vec<Expr>,
     env: &EnvRef,
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<TailAction, EvalError> {
     let Some((head, tail)) = items.split_first() else {
         return Err(EvalError::Syntax {
@@ -101,27 +111,27 @@ fn eval_tail_list(
 
     if let Expr::Symbol(name, _) = head {
         match name.as_str() {
-            "define" => return eval_define(tail, env, output).map(TailAction::Return),
+            "define" => return eval_define(tail, env, output, steps).map(TailAction::Return),
             "define-syntax" => return eval_define_syntax(tail, env).map(TailAction::Return),
             "define-record-type" => {
                 return eval_define_record_type(tail, env).map(TailAction::Return);
             }
-            "set!" => return eval_set(tail, env, output).map(TailAction::Return),
-            "if" => return eval_tail_if(tail, env, output),
+            "set!" => return eval_set(tail, env, output, steps).map(TailAction::Return),
+            "if" => return eval_tail_if(tail, env, output, steps),
             "quote" => return eval_quote(tail).map(TailAction::Return),
             "quasiquote" => return eval_tail_quasiquote(tail, env),
             "lambda" => return build_lambda(tail, env, None).map(TailAction::Return),
             "case-lambda" => return build_case_lambda(tail, env, None).map(TailAction::Return),
-            "and" => return eval_tail_and(tail, env, output),
-            "or" => return eval_tail_or(tail, env, output),
-            "begin" => return eval_tail_begin(tail, env, output),
-            "cond" => return eval_tail_cond(tail, env, output),
-            "let" => return eval_tail_let(tail, env, output),
-            "let*" => return eval_tail_let_star(tail, env, output),
-            "letrec" => return eval_tail_letrec(tail, env, output, false),
-            "letrec*" => return eval_tail_letrec(tail, env, output, true),
-            "case" => return eval_tail_case(tail, env, output),
-            "do" => return eval_tail_do(tail, env, output),
+            "and" => return eval_tail_and(tail, env, output, steps),
+            "or" => return eval_tail_or(tail, env, output, steps),
+            "begin" => return eval_tail_begin(tail, env, output, steps),
+            "cond" => return eval_tail_cond(tail, env, output, steps),
+            "let" => return eval_tail_let(tail, env, output, steps),
+            "let*" => return eval_tail_let_star(tail, env, output, steps),
+            "letrec" => return eval_tail_letrec(tail, env, output, steps, false),
+            "letrec*" => return eval_tail_letrec(tail, env, output, steps, true),
+            "case" => return eval_tail_case(tail, env, output, steps),
+            "do" => return eval_tail_do(tail, env, output, steps),
             _ => {}
         }
 
@@ -135,15 +145,20 @@ fn eval_tail_list(
         }
     }
 
-    let callable = eval(head, env, output)?;
-    let args = eval_args(tail, env, output)?;
-    apply_tail(callable, &args, output)
+    let callable = eval(head, env, output, steps)?;
+    let args = eval_args(tail, env, output, steps)?;
+    apply_tail(callable, &args, output, steps)
 }
 
-fn eval_tail_if(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<TailAction, EvalError> {
+fn eval_tail_if(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<TailAction, EvalError> {
     match args {
         [condition, then_branch] => {
-            if eval(condition, env, output)?.is_truthy() {
+            if eval(condition, env, output, steps)?.is_truthy() {
                 Ok(TailAction::Continue {
                     expr: then_branch.clone(),
                     env: env.clone(),
@@ -153,7 +168,7 @@ fn eval_tail_if(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Tail
             }
         }
         [condition, then_branch, else_branch] => {
-            let branch = if eval(condition, env, output)?.is_truthy() {
+            let branch = if eval(condition, env, output, steps)?.is_truthy() {
                 then_branch
             } else {
                 else_branch
@@ -181,13 +196,14 @@ fn eval_tail_and(
     args: &[Expr],
     env: &EnvRef,
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<TailAction, EvalError> {
     let Some((last, prefix)) = args.split_last() else {
         return Ok(TailAction::Return(Value::Boolean(true)));
     };
 
     for expr in prefix {
-        let value = eval(expr, env, output)?;
+        let value = eval(expr, env, output, steps)?;
         if !value.is_truthy() {
             return Ok(TailAction::Return(value));
         }
@@ -199,13 +215,18 @@ fn eval_tail_and(
     })
 }
 
-fn eval_tail_or(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<TailAction, EvalError> {
+fn eval_tail_or(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<TailAction, EvalError> {
     let Some((last, prefix)) = args.split_last() else {
         return Ok(TailAction::Return(Value::Boolean(false)));
     };
 
     for expr in prefix {
-        let value = eval(expr, env, output)?;
+        let value = eval(expr, env, output, steps)?;
         if value.is_truthy() {
             return Ok(TailAction::Return(value));
         }
@@ -221,8 +242,9 @@ fn eval_tail_begin(
     args: &[Expr],
     env: &EnvRef,
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<TailAction, EvalError> {
-    tail_sequence(args, env, output)
+    tail_sequence(args, env, output, steps)
 }
 
 pub(super) fn classify_cond_clause_body(body: &[Expr]) -> Result<CondClauseBody<'_>, EvalError> {
@@ -243,6 +265,7 @@ fn eval_tail_cond(
     clauses: &[Expr],
     env: &EnvRef,
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<TailAction, EvalError> {
     for (index, clause) in clauses.iter().enumerate() {
         let Expr::List(items, _) = clause else {
@@ -262,18 +285,18 @@ fn eval_tail_cond(
                     message: "cond: else must be last".into(),
                 });
             }
-            return tail_sequence(body, env, output);
+            return tail_sequence(body, env, output, steps);
         }
 
-        let value = eval(test, env, output)?;
+        let value = eval(test, env, output, steps)?;
         if value.is_truthy() {
             return match classify_cond_clause_body(body)? {
                 CondClauseBody::ReturnTestValue => Ok(TailAction::Return(value)),
-                CondClauseBody::Sequence(body) => tail_sequence(body, env, output),
+                CondClauseBody::Sequence(body) => tail_sequence(body, env, output, steps),
                 CondClauseBody::Arrow(recipient) => {
-                    let procedure = eval(recipient, env, output)?;
+                    let procedure = eval(recipient, env, output, steps)?;
                     let args = [value];
-                    apply_tail(procedure, &args, output)
+                    apply_tail(procedure, &args, output, steps)
                 }
             };
         }
@@ -286,12 +309,13 @@ fn eval_tail_let(
     args: &[Expr],
     env: &EnvRef,
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<TailAction, EvalError> {
     match args {
         [Expr::Symbol(name, _), bindings, body @ ..] => {
-            eval_tail_named_let(name, bindings, body, env, output)
+            eval_tail_named_let(name, bindings, body, env, output, steps)
         }
-        [bindings, body @ ..] => eval_tail_plain_let(bindings, body, env, output),
+        [bindings, body @ ..] => eval_tail_plain_let(bindings, body, env, output, steps),
         _ => Err(EvalError::Syntax {
             message: "let: invalid syntax".into(),
         }),
@@ -302,6 +326,7 @@ fn eval_tail_let_star(
     args: &[Expr],
     env: &EnvRef,
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<TailAction, EvalError> {
     let [bindings_expr, body @ ..] = args else {
         return Err(EvalError::Syntax {
@@ -318,11 +343,11 @@ fn eval_tail_let_star(
     let bindings = parse_let_bindings(bindings_expr)?;
     let let_env = Env::new(Some(env.clone()));
     for (name, value_expr) in bindings {
-        let value = eval(&value_expr, &let_env, output)?;
+        let value = eval(&value_expr, &let_env, output, steps)?;
         let_env.define(name, value);
     }
 
-    tail_sequence(body, &let_env, output)
+    tail_sequence(body, &let_env, output, steps)
 }
 
 fn eval_tail_plain_let(
@@ -330,6 +355,7 @@ fn eval_tail_plain_let(
     body: &[Expr],
     env: &EnvRef,
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<TailAction, EvalError> {
     if body.is_empty() {
         return Err(EvalError::Syntax {
@@ -340,7 +366,7 @@ fn eval_tail_plain_let(
     let bindings = parse_let_bindings(bindings_expr)?;
     let mut values = Vec::with_capacity(bindings.len());
     for (_, value_expr) in &bindings {
-        values.push(eval(value_expr, env, output)?);
+        values.push(eval(value_expr, env, output, steps)?);
     }
 
     let let_env = Env::new(Some(env.clone()));
@@ -348,7 +374,7 @@ fn eval_tail_plain_let(
         let_env.define(name, value);
     }
 
-    tail_sequence(body, &let_env, output)
+    tail_sequence(body, &let_env, output, steps)
 }
 
 fn eval_tail_named_let(
@@ -357,6 +383,7 @@ fn eval_tail_named_let(
     body: &[Expr],
     env: &EnvRef,
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<TailAction, EvalError> {
     if body.is_empty() {
         return Err(EvalError::Syntax {
@@ -367,20 +394,21 @@ fn eval_tail_named_let(
     let bindings = parse_let_bindings(bindings_expr)?;
     let mut args = Vec::with_capacity(bindings.len());
     for (_, value_expr) in &bindings {
-        args.push(eval(value_expr, env, output)?);
+        args.push(eval(value_expr, env, output, steps)?);
     }
     let params = bindings.iter().map(|(param, _)| param.clone()).collect();
 
     let let_env = Env::new(Some(env.clone()));
     let procedure = new_procedure(Some(name.into()), Params::fixed(params), body, &let_env);
     let_env.define(name.into(), procedure.clone());
-    apply_tail(procedure, &args, output)
+    apply_tail(procedure, &args, output, steps)
 }
 
 fn eval_tail_letrec(
     args: &[Expr],
     env: &EnvRef,
     output: &mut String,
+    steps: &StepBudgetRef,
     sequential: bool,
 ) -> Result<TailAction, EvalError> {
     let [bindings_expr, body @ ..] = args else {
@@ -401,7 +429,7 @@ fn eval_tail_letrec(
     if sequential {
         for (name, value_expr) in bindings {
             letrec_env.define(name.clone(), Value::Void);
-            let value = eval_letrec_initializer(&name, &value_expr, &letrec_env, output)?;
+            let value = eval_letrec_initializer(&name, &value_expr, &letrec_env, output, steps)?;
             let updated = letrec_env.set(&name, value);
             debug_assert!(updated, "letrec* binding defined before initialization");
         }
@@ -417,6 +445,7 @@ fn eval_tail_letrec(
                 value_expr,
                 &letrec_env,
                 output,
+                steps,
             )?);
         }
 
@@ -426,13 +455,14 @@ fn eval_tail_letrec(
         }
     }
 
-    tail_sequence(body, &letrec_env, output)
+    tail_sequence(body, &letrec_env, output, steps)
 }
 
 fn eval_tail_case(
     args: &[Expr],
     env: &EnvRef,
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<TailAction, EvalError> {
     let [key_expr, clauses @ ..] = args else {
         return Err(EvalError::Syntax {
@@ -440,7 +470,7 @@ fn eval_tail_case(
         });
     };
 
-    let key = eval(key_expr, env, output)?;
+    let key = eval(key_expr, env, output, steps)?;
 
     for (index, clause) in clauses.iter().enumerate() {
         let Expr::List(items, _) = clause else {
@@ -463,7 +493,7 @@ fn eval_tail_case(
             return if body.is_empty() {
                 Ok(TailAction::Return(Value::Void))
             } else {
-                tail_sequence(body, env, output)
+                tail_sequence(body, env, output, steps)
             };
         }
 
@@ -481,7 +511,7 @@ fn eval_tail_case(
             return if body.is_empty() {
                 Ok(TailAction::Return(Value::Void))
             } else {
-                tail_sequence(body, env, output)
+                tail_sequence(body, env, output, steps)
             };
         }
     }
@@ -489,7 +519,12 @@ fn eval_tail_case(
     Ok(TailAction::Return(Value::Void))
 }
 
-fn eval_tail_do(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<TailAction, EvalError> {
+fn eval_tail_do(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<TailAction, EvalError> {
     let [bindings_expr, test_clause_expr, body @ ..] = args else {
         return Err(EvalError::Syntax {
             message: "do: invalid syntax".into(),
@@ -502,25 +537,25 @@ fn eval_tail_do(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Tail
     let loop_env = Env::new(Some(env.clone()));
     let mut initial_values = Vec::with_capacity(bindings.len());
     for binding in &bindings {
-        initial_values.push(eval(&binding.init, env, output)?);
+        initial_values.push(eval(&binding.init, env, output, steps)?);
     }
     for (binding, value) in bindings.iter().zip(initial_values) {
         loop_env.define(binding.name.clone(), value);
     }
 
     loop {
-        if eval(&test_expr, &loop_env, output)?.is_truthy() {
-            return tail_sequence(&result_exprs, &loop_env, output);
+        if eval(&test_expr, &loop_env, output, steps)?.is_truthy() {
+            return tail_sequence(&result_exprs, &loop_env, output, steps);
         }
 
         if !body.is_empty() {
-            eval_sequence(body, &loop_env, output)?;
+            eval_sequence(body, &loop_env, output, steps)?;
         }
 
         let mut next_values = Vec::with_capacity(bindings.len());
         for binding in &bindings {
             let value = match &binding.step {
-                Some(step) => eval(step, &loop_env, output)?,
+                Some(step) => eval(step, &loop_env, output, steps)?,
                 None => loop_env
                     .lookup(&binding.name)
                     .expect("do binding is always present"),
@@ -535,8 +570,14 @@ fn eval_tail_do(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Tail
     }
 }
 
-fn eval(expr: &Expr, env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
+fn eval(
+    expr: &Expr,
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     let pos = expr.pos();
+    steps.step(pos)?;
 
     match expr {
         Expr::Number(value, _) => Ok(Value::Number(*value)),
@@ -548,12 +589,17 @@ fn eval(expr: &Expr, env: &EnvRef, output: &mut String) -> Result<Value, EvalErr
             .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() })
             .map_err(|error| error.with_position(pos)),
         Expr::List(items, _) => {
-            eval_list(items, env, output).map_err(|error| error.with_position(pos))
+            eval_list(items, env, output, steps).map_err(|error| error.with_position(pos))
         }
     }
 }
 
-fn eval_list(items: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
+fn eval_list(
+    items: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     let Some((head, tail)) = items.split_first() else {
         return Err(EvalError::Syntax {
             message: "cannot evaluate empty list".into(),
@@ -562,41 +608,46 @@ fn eval_list(items: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value,
 
     if let Expr::Symbol(name, _) = head {
         match name.as_str() {
-            "define" => return eval_define(tail, env, output),
+            "define" => return eval_define(tail, env, output, steps),
             "define-syntax" => return eval_define_syntax(tail, env),
             "define-record-type" => return eval_define_record_type(tail, env),
-            "set!" => return eval_set(tail, env, output),
-            "if" => return eval_if(tail, env, output),
+            "set!" => return eval_set(tail, env, output, steps),
+            "if" => return eval_if(tail, env, output, steps),
             "quote" => return eval_quote(tail),
-            "quasiquote" => return eval_quasiquote(tail, env, output),
+            "quasiquote" => return eval_quasiquote(tail, env, output, steps),
             "lambda" => return build_lambda(tail, env, None),
             "case-lambda" => return build_case_lambda(tail, env, None),
-            "and" => return eval_and(tail, env, output),
-            "or" => return eval_or(tail, env, output),
-            "begin" => return eval_begin(tail, env, output),
-            "cond" => return eval_cond(tail, env, output),
-            "let" => return eval_let(tail, env, output),
-            "let*" => return eval_let_star(tail, env, output),
-            "letrec" => return eval_letrec(tail, env, output, false),
-            "letrec*" => return eval_letrec(tail, env, output, true),
-            "case" => return eval_case(tail, env, output),
-            "do" => return eval_do(tail, env, output),
+            "and" => return eval_and(tail, env, output, steps),
+            "or" => return eval_or(tail, env, output, steps),
+            "begin" => return eval_begin(tail, env, output, steps),
+            "cond" => return eval_cond(tail, env, output, steps),
+            "let" => return eval_let(tail, env, output, steps),
+            "let*" => return eval_let_star(tail, env, output, steps),
+            "letrec" => return eval_letrec(tail, env, output, steps, false),
+            "letrec*" => return eval_letrec(tail, env, output, steps, true),
+            "case" => return eval_case(tail, env, output, steps),
+            "do" => return eval_do(tail, env, output, steps),
             _ => {}
         }
 
         if let Some(transformer) = env.lookup_macro(name) {
             let expansion = expand_macro_call(items, &transformer)?;
             let expanded_env = env_with_expansion_aliases(env, &expansion);
-            return eval(&expansion.expr, &expanded_env, output);
+            return eval(&expansion.expr, &expanded_env, output, steps);
         }
     }
 
-    let callable = eval(head, env, output)?;
-    let args = eval_args(tail, env, output)?;
-    apply(callable, &args, output)
+    let callable = eval(head, env, output, steps)?;
+    let args = eval_args(tail, env, output, steps)?;
+    apply_with_steps(callable, &args, output, steps)
 }
 
-fn eval_define(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
+fn eval_define(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     match args {
         [Expr::Symbol(name, _), value_expr] => {
             let value = if let Some(parts) = lambda_parts(value_expr) {
@@ -604,7 +655,7 @@ fn eval_define(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value
             } else if let Some(clauses) = case_lambda_clauses(value_expr) {
                 build_case_lambda(clauses, env, Some(name.clone()))?
             } else {
-                eval(value_expr, env, output)?
+                eval(value_expr, env, output, steps)?
             };
             env.define(name.clone(), value);
             Ok(Value::Void)
@@ -645,10 +696,15 @@ pub(super) fn eval_define_syntax(args: &[Expr], env: &EnvRef) -> Result<Value, E
     }
 }
 
-fn eval_set(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
+fn eval_set(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     match args {
         [Expr::Symbol(name, _), value_expr] => {
-            let value = eval(value_expr, env, output)?;
+            let value = eval(value_expr, env, output, steps)?;
             if env.set(name, value) {
                 Ok(Value::Void)
             } else {
@@ -662,20 +718,25 @@ fn eval_set(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, E
     }
 }
 
-fn eval_if(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
+fn eval_if(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     match args {
         [condition, then_branch] => {
-            if eval(condition, env, output)?.is_truthy() {
-                eval(then_branch, env, output)
+            if eval(condition, env, output, steps)?.is_truthy() {
+                eval(then_branch, env, output, steps)
             } else {
                 Ok(Value::Void)
             }
         }
         [condition, then_branch, else_branch] => {
-            if eval(condition, env, output)?.is_truthy() {
-                eval(then_branch, env, output)
+            if eval(condition, env, output, steps)?.is_truthy() {
+                eval(then_branch, env, output, steps)
             } else {
-                eval(else_branch, env, output)
+                eval(else_branch, env, output, steps)
             }
         }
         _ => Err(wrong_arg_count("if", "2 or 3", args.len())),
@@ -689,29 +750,44 @@ pub(super) fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
     }
 }
 
-fn eval_quasiquote(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
+fn eval_quasiquote(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     match args {
         [template] => {
             let expanded = expand_quasiquote_expr(template, 1)?;
-            eval(&expanded, env, output)
+            eval(&expanded, env, output, steps)
         }
         _ => Err(wrong_arg_count("quasiquote", "1", args.len())),
     }
 }
 
-fn eval_args(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Vec<Value>, EvalError> {
+fn eval_args(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Vec<Value>, EvalError> {
     let mut values = Vec::with_capacity(args.len());
     for expr in args {
-        values.push(eval(expr, env, output)?);
+        values.push(eval(expr, env, output, steps)?);
     }
     Ok(values)
 }
 
-fn eval_and(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
+fn eval_and(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     let mut last = Value::Boolean(true);
 
     for arg in args {
-        let value = eval(arg, env, output)?;
+        let value = eval(arg, env, output, steps)?;
         if !value.is_truthy() {
             return Ok(value);
         }
@@ -721,9 +797,14 @@ fn eval_and(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, E
     Ok(last)
 }
 
-fn eval_or(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
+fn eval_or(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     for arg in args {
-        let value = eval(arg, env, output)?;
+        let value = eval(arg, env, output, steps)?;
         if value.is_truthy() {
             return Ok(value);
         }
@@ -732,11 +813,21 @@ fn eval_or(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, Ev
     Ok(Value::Boolean(false))
 }
 
-fn eval_begin(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
-    eval_sequence(args, env, output)
+fn eval_begin(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
+    eval_sequence(args, env, output, steps)
 }
 
-fn eval_cond(clauses: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
+fn eval_cond(
+    clauses: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     for (index, clause) in clauses.iter().enumerate() {
         let Expr::List(items, _) = clause else {
             return Err(EvalError::Syntax {
@@ -755,18 +846,18 @@ fn eval_cond(clauses: &[Expr], env: &EnvRef, output: &mut String) -> Result<Valu
                     message: "cond: else must be last".into(),
                 });
             }
-            return eval_sequence(body, env, output);
+            return eval_sequence(body, env, output, steps);
         }
 
-        let value = eval(test, env, output)?;
+        let value = eval(test, env, output, steps)?;
         if value.is_truthy() {
             return match classify_cond_clause_body(body)? {
                 CondClauseBody::ReturnTestValue => Ok(value),
-                CondClauseBody::Sequence(body) => eval_sequence(body, env, output),
+                CondClauseBody::Sequence(body) => eval_sequence(body, env, output, steps),
                 CondClauseBody::Arrow(recipient) => {
-                    let procedure = eval(recipient, env, output)?;
+                    let procedure = eval(recipient, env, output, steps)?;
                     let args = [value];
-                    apply(procedure, &args, output)
+                    apply_with_steps(procedure, &args, output, steps)
                 }
             };
         }
@@ -775,19 +866,29 @@ fn eval_cond(clauses: &[Expr], env: &EnvRef, output: &mut String) -> Result<Valu
     Ok(Value::Void)
 }
 
-fn eval_let(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
+fn eval_let(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     match args {
         [Expr::Symbol(name, _), bindings, body @ ..] => {
-            eval_named_let(name, bindings, body, env, output)
+            eval_named_let(name, bindings, body, env, output, steps)
         }
-        [bindings, body @ ..] => eval_plain_let(bindings, body, env, output),
+        [bindings, body @ ..] => eval_plain_let(bindings, body, env, output, steps),
         _ => Err(EvalError::Syntax {
             message: "let: invalid syntax".into(),
         }),
     }
 }
 
-fn eval_let_star(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
+fn eval_let_star(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     let [bindings_expr, body @ ..] = args else {
         return Err(EvalError::Syntax {
             message: "let*: invalid syntax".into(),
@@ -803,11 +904,11 @@ fn eval_let_star(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Val
     let bindings = parse_let_bindings(bindings_expr)?;
     let let_env = Env::new(Some(env.clone()));
     for (name, value_expr) in bindings {
-        let value = eval(&value_expr, &let_env, output)?;
+        let value = eval(&value_expr, &let_env, output, steps)?;
         let_env.define(name, value);
     }
 
-    eval_sequence(body, &let_env, output)
+    eval_sequence(body, &let_env, output, steps)
 }
 
 fn eval_plain_let(
@@ -815,6 +916,7 @@ fn eval_plain_let(
     body: &[Expr],
     env: &EnvRef,
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<Value, EvalError> {
     if body.is_empty() {
         return Err(EvalError::Syntax {
@@ -825,7 +927,7 @@ fn eval_plain_let(
     let bindings = parse_let_bindings(bindings_expr)?;
     let mut values = Vec::with_capacity(bindings.len());
     for (_, value_expr) in &bindings {
-        values.push(eval(value_expr, env, output)?);
+        values.push(eval(value_expr, env, output, steps)?);
     }
 
     let let_env = Env::new(Some(env.clone()));
@@ -833,7 +935,7 @@ fn eval_plain_let(
         let_env.define(name, value);
     }
 
-    eval_sequence(body, &let_env, output)
+    eval_sequence(body, &let_env, output, steps)
 }
 
 fn eval_named_let(
@@ -842,6 +944,7 @@ fn eval_named_let(
     body: &[Expr],
     env: &EnvRef,
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<Value, EvalError> {
     if body.is_empty() {
         return Err(EvalError::Syntax {
@@ -852,14 +955,14 @@ fn eval_named_let(
     let bindings = parse_let_bindings(bindings_expr)?;
     let mut args = Vec::with_capacity(bindings.len());
     for (_, value_expr) in &bindings {
-        args.push(eval(value_expr, env, output)?);
+        args.push(eval(value_expr, env, output, steps)?);
     }
     let params = bindings.iter().map(|(param, _)| param.clone()).collect();
 
     let let_env = Env::new(Some(env.clone()));
     let procedure = new_procedure(Some(name.into()), Params::fixed(params), body, &let_env);
     let_env.define(name.into(), procedure.clone());
-    apply(procedure, &args, output)
+    apply_with_steps(procedure, &args, output, steps)
 }
 
 pub(super) fn parse_let_bindings(bindings_expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
@@ -897,6 +1000,7 @@ fn eval_letrec(
     args: &[Expr],
     env: &EnvRef,
     output: &mut String,
+    steps: &StepBudgetRef,
     sequential: bool,
 ) -> Result<Value, EvalError> {
     let [bindings_expr, body @ ..] = args else {
@@ -917,7 +1021,7 @@ fn eval_letrec(
     if sequential {
         for (name, value_expr) in bindings {
             letrec_env.define(name.clone(), Value::Void);
-            let value = eval_letrec_initializer(&name, &value_expr, &letrec_env, output)?;
+            let value = eval_letrec_initializer(&name, &value_expr, &letrec_env, output, steps)?;
             let updated = letrec_env.set(&name, value);
             debug_assert!(updated, "letrec* binding defined before initialization");
         }
@@ -933,6 +1037,7 @@ fn eval_letrec(
                 value_expr,
                 &letrec_env,
                 output,
+                steps,
             )?);
         }
 
@@ -942,7 +1047,7 @@ fn eval_letrec(
         }
     }
 
-    eval_sequence(body, &letrec_env, output)
+    eval_sequence(body, &letrec_env, output, steps)
 }
 
 fn eval_letrec_initializer(
@@ -950,24 +1055,30 @@ fn eval_letrec_initializer(
     value_expr: &Expr,
     env: &EnvRef,
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<Value, EvalError> {
     if let Some(parts) = lambda_parts(value_expr) {
         build_lambda(parts, env, Some(name.into()))
     } else if let Some(clauses) = case_lambda_clauses(value_expr) {
         build_case_lambda(clauses, env, Some(name.into()))
     } else {
-        eval(value_expr, env, output)
+        eval(value_expr, env, output, steps)
     }
 }
 
-fn eval_case(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
+fn eval_case(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     let [key_expr, clauses @ ..] = args else {
         return Err(EvalError::Syntax {
             message: "case: invalid syntax".into(),
         });
     };
 
-    let key = eval(key_expr, env, output)?;
+    let key = eval(key_expr, env, output, steps)?;
 
     for (index, clause) in clauses.iter().enumerate() {
         let Expr::List(items, _) = clause else {
@@ -990,7 +1101,7 @@ fn eval_case(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, 
             return if body.is_empty() {
                 Ok(Value::Void)
             } else {
-                eval_sequence(body, env, output)
+                eval_sequence(body, env, output, steps)
             };
         }
 
@@ -1008,7 +1119,7 @@ fn eval_case(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, 
             return if body.is_empty() {
                 Ok(Value::Void)
             } else {
-                eval_sequence(body, env, output)
+                eval_sequence(body, env, output, steps)
             };
         }
     }
@@ -1016,7 +1127,12 @@ fn eval_case(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, 
     Ok(Value::Void)
 }
 
-fn eval_do(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
+fn eval_do(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     let [bindings_expr, test_clause_expr, body @ ..] = args else {
         return Err(EvalError::Syntax {
             message: "do: invalid syntax".into(),
@@ -1029,29 +1145,29 @@ fn eval_do(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, Ev
     let loop_env = Env::new(Some(env.clone()));
     let mut initial_values = Vec::with_capacity(bindings.len());
     for binding in &bindings {
-        initial_values.push(eval(&binding.init, env, output)?);
+        initial_values.push(eval(&binding.init, env, output, steps)?);
     }
     for (binding, value) in bindings.iter().zip(initial_values) {
         loop_env.define(binding.name.clone(), value);
     }
 
     loop {
-        if eval(&test_expr, &loop_env, output)?.is_truthy() {
+        if eval(&test_expr, &loop_env, output, steps)?.is_truthy() {
             return if result_exprs.is_empty() {
                 Ok(Value::Void)
             } else {
-                eval_sequence(&result_exprs, &loop_env, output)
+                eval_sequence(&result_exprs, &loop_env, output, steps)
             };
         }
 
         if !body.is_empty() {
-            eval_sequence(body, &loop_env, output)?;
+            eval_sequence(body, &loop_env, output, steps)?;
         }
 
         let mut next_values = Vec::with_capacity(bindings.len());
         for binding in &bindings {
             let value = match &binding.step {
-                Some(step) => eval(step, &loop_env, output)?,
+                Some(step) => eval(step, &loop_env, output, steps)?,
                 None => loop_env
                     .lookup(&binding.name)
                     .expect("do binding is always present"),
@@ -1370,12 +1486,7 @@ pub(super) fn expand_quasiquote_expr(template: &Expr, depth: usize) -> Result<Ex
                     });
                 }
 
-                return expand_nested_quasiquote_form(
-                    "unquote-splicing",
-                    arg,
-                    depth - 1,
-                    *pos,
-                );
+                return expand_nested_quasiquote_form("unquote-splicing", arg, depth - 1, *pos);
             }
 
             if let Some(arg) = quasiquote_form_arg(template, "quasiquote") {
@@ -1387,11 +1498,7 @@ pub(super) fn expand_quasiquote_expr(template: &Expr, depth: usize) -> Result<Ex
     }
 }
 
-fn expand_quasiquote_list(
-    items: &[Expr],
-    pos: SourcePos,
-    depth: usize,
-) -> Result<Expr, EvalError> {
+fn expand_quasiquote_list(items: &[Expr], pos: SourcePos, depth: usize) -> Result<Expr, EvalError> {
     let (prefix, tail) = if let Some((prefix, tail)) = dotted_list_parts(items) {
         (prefix, Some(tail))
     } else {
@@ -1411,7 +1518,11 @@ fn expand_quasiquote_list(
             }
         }
 
-        result = build_list_expr("cons", vec![expand_quasiquote_expr(item, depth)?, result], pos);
+        result = build_list_expr(
+            "cons",
+            vec![expand_quasiquote_expr(item, depth)?, result],
+            pos,
+        );
     }
 
     Ok(result)
@@ -1461,9 +1572,19 @@ pub(super) fn apply(
     args: &[Value],
     output: &mut String,
 ) -> Result<Value, EvalError> {
+    let steps = StepBudget::unlimited();
+    apply_with_steps(callable, args, output, &steps)
+}
+
+pub(super) fn apply_with_steps(
+    callable: Value,
+    args: &[Value],
+    output: &mut String,
+    steps: &StepBudgetRef,
+) -> Result<Value, EvalError> {
     match callable {
-        Value::Builtin(builtin) => apply_builtin(builtin, args, output),
-        Value::Procedure(procedure) => apply_procedure(&procedure, args, output),
+        Value::Builtin(builtin) => apply_builtin(builtin, args, output, steps),
+        Value::Procedure(procedure) => apply_procedure(&procedure, args, output, steps),
         Value::Continuation(continuation) => {
             continuation(Value::from_values(args.to_vec()), output)
         }
@@ -1478,10 +1599,13 @@ fn apply_tail(
     callable: Value,
     args: &[Value],
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<TailAction, EvalError> {
     match callable {
-        Value::Builtin(builtin) => apply_builtin(builtin, args, output).map(TailAction::Return),
-        Value::Procedure(procedure) => prepare_tail_procedure(&procedure, args, output),
+        Value::Builtin(builtin) => {
+            apply_builtin(builtin, args, output, steps).map(TailAction::Return)
+        }
+        Value::Procedure(procedure) => prepare_tail_procedure(&procedure, args, output, steps),
         Value::Continuation(continuation) => {
             continuation(Value::from_values(args.to_vec()), output).map(TailAction::Return)
         }
@@ -1498,10 +1622,11 @@ fn apply_procedure(
     procedure: &Procedure,
     args: &[Value],
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<Value, EvalError> {
-    match prepare_tail_procedure(procedure, args, output)? {
+    match prepare_tail_procedure(procedure, args, output, steps)? {
         TailAction::Return(value) => Ok(value),
-        TailAction::Continue { expr, env } => eval_tail(expr, env, output),
+        TailAction::Continue { expr, env } => eval_tail(expr, env, output, steps),
     }
 }
 
@@ -1509,6 +1634,7 @@ fn prepare_tail_procedure(
     procedure: &Procedure,
     args: &[Value],
     output: &mut String,
+    steps: &StepBudgetRef,
 ) -> Result<TailAction, EvalError> {
     let Some(clause) = procedure
         .clauses
@@ -1534,7 +1660,7 @@ fn prepare_tail_procedure(
         );
     }
 
-    tail_sequence(&clause.body, &call_env, output)
+    tail_sequence(&clause.body, &call_env, output, steps)
 }
 
 pub(super) fn wrong_arg_count(name: &str, expected: &str, got: usize) -> EvalError {
