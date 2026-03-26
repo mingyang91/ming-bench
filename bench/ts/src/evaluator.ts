@@ -128,6 +128,20 @@ class Environment {
     this.bindings.set(name, value);
   }
 
+  assign(name: string, value: Value, loc: SourceLoc): void {
+    if (this.bindings.has(name)) {
+      this.bindings.set(name, value);
+      return;
+    }
+
+    if (this.parent !== undefined) {
+      this.parent.assign(name, value, loc);
+      return;
+    }
+
+    throw new EvalError(`${loc.line}:${loc.col}: unbound variable ${name}`);
+  }
+
   lookup(name: string, loc: SourceLoc): Value {
     if (this.bindings.has(name)) {
       return this.bindings.get(name) as Value;
@@ -731,6 +745,8 @@ function evaluateList(expr: ListExpr, env: Environment): Value {
     switch (head.value) {
       case 'define':
         return evalDefine(args, head, env);
+      case 'set!':
+        return evalSet(args, head, env);
       case 'if':
         return evalIf(args, head, env);
       case 'quote':
@@ -791,6 +807,20 @@ function evalDefine(args: Expr[], head: SymbolExpr, env: Environment): Value {
   };
 
   env.define(nameExpr.value, proc);
+  return VOID_VALUE;
+}
+
+function evalSet(args: Expr[], head: SymbolExpr, env: Environment): Value {
+  if (args.length !== 2) {
+    throw new EvalError(`${head.line}:${head.col}: set! expects exactly 2 arguments`);
+  }
+
+  const target = args[0];
+  if (target.type !== 'symbol') {
+    throw new EvalError(`${target.line}:${target.col}: set! target must be a symbol`);
+  }
+
+  env.assign(target.value, evaluate(args[1], env), target);
   return VOID_VALUE;
 }
 
