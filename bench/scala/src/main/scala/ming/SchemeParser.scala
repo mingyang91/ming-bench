@@ -46,9 +46,13 @@ private[ming] object SchemeParser:
         case '"' =>
           parseString(pos)
         case '#' =>
-          parseBoolean(pos)
+          parseHashLiteral(pos)
         case _ =>
           parseAtom(pos)
+
+    private def parseHashLiteral(pos: SourcePos): Expr =
+      if startsWith("#\\") then parseChar(pos)
+      else parseBoolean(pos)
 
     private def parseList(pos: SourcePos): Expr =
       val items = ListBuffer.empty[Expr]
@@ -94,6 +98,26 @@ private[ming] object SchemeParser:
         index += 2
         Expr.BooleanLiteral(false, pos)
       else parseError("invalid boolean literal")
+
+    private def parseChar(pos: SourcePos): Expr =
+      index += 2
+      if isAtEnd || isDelimiter(input.charAt(index)) then parseError("invalid character literal")
+
+      val start = index
+      while !isAtEnd && !isDelimiter(input.charAt(index)) do index += 1
+
+      val token      = input.substring(start, index)
+      val normalized = token.toLowerCase(java.util.Locale.ROOT)
+      val codePoint =
+        normalized match
+          case "space"   => 32
+          case "newline" => 10
+          case _ if token.codePointCount(0, token.length) == 1 =>
+            token.codePointAt(0)
+          case _ =>
+            parseError("invalid character literal")
+
+      Expr.CharLiteral(codePoint, pos)
 
     private def parseAtom(pos: SourcePos): Expr =
       val start = index

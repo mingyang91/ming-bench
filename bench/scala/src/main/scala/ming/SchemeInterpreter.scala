@@ -24,7 +24,8 @@ object SchemeInterpreter:
       expr match
         case Expr.IntegerLiteral(value, _) => Value.IntegerValue(value)
         case Expr.BooleanLiteral(value, _) => Value.BooleanValue(value)
-        case Expr.StringLiteral(value, _)  => Value.StringValue(value)
+        case Expr.StringLiteral(value, _)  => Value.StringValue(SchemeString.fromText(value))
+        case Expr.CharLiteral(value, _)    => Value.CharValue(value)
         case Expr.Symbol(name, _)          => env.lookup(name)
         case Expr.ListExpr(Nil, _) =>
           throw new EvalError("cannot evaluate an empty list")
@@ -178,7 +179,8 @@ object SchemeInterpreter:
     expr match
       case Expr.IntegerLiteral(value, _) => Value.IntegerValue(value)
       case Expr.BooleanLiteral(value, _) => Value.BooleanValue(value)
-      case Expr.StringLiteral(value, _)  => Value.StringValue(value)
+      case Expr.StringLiteral(value, _)  => Value.StringValue(SchemeString.fromText(value))
+      case Expr.CharLiteral(value, _)    => Value.CharValue(value)
       case Expr.Symbol(name, _)          => Value.SymbolValue(name)
       case Expr.ListExpr(items, _) =>
         makeList(items.map(quoteExpr))

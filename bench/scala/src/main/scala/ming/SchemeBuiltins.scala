@@ -121,10 +121,13 @@ private[ming] object SchemeBuiltins:
   private val stringBindings: List[(String, Value)] = List(
     "string-append" -> Value.Builtin(
       "string-append",
-      args => Value.StringValue(args.map(arg => requireString("string-append", arg)).mkString)
+      args =>
+        Value.StringValue(
+          SchemeString.fromText(args.map(arg => requireString("string-append", arg).text).mkString)
+        )
     ),
     "string-length" -> unaryStringBuiltin("string-length") { text =>
-      Value.IntegerValue(BigInt(stringCodePoints(text).length))
+      Value.IntegerValue(BigInt(text.length))
     },
     "substring" -> Value.Builtin(
       "substring",
@@ -140,28 +143,42 @@ private[ming] object SchemeBuiltins:
       "number->string",
       args =>
         requireArgCount("number->string", args, 1)
-        Value.StringValue(requireInteger("number->string", args.head).toString)
+        Value.StringValue(SchemeString.fromText(requireInteger("number->string", args.head).toString))
     ),
     "symbol->string" -> Value.Builtin(
       "symbol->string",
       args =>
         requireArgCount("symbol->string", args, 1)
-        Value.StringValue(requireSymbol("symbol->string", args.head))
+        Value.StringValue(SchemeString.fromText(requireSymbol("symbol->string", args.head)))
     ),
     "string->symbol" -> Value.Builtin(
       "string->symbol",
       args =>
         requireArgCount("string->symbol", args, 1)
-        Value.SymbolValue(requireString("string->symbol", args.head))
+        Value.SymbolValue(requireString("string->symbol", args.head).text)
     ),
     "string-ref" -> Value.Builtin(
       "string-ref",
       args =>
         requireArgCount("string-ref", args, 2)
-        val text       = requireString("string-ref", args.head)
-        val codePoints = stringCodePoints(text)
-        val index      = requireIndex("string-ref", args(1), codePoints.length)
-        Value.CharValue(codePoints(index))
+        val text  = requireString("string-ref", args.head)
+        val index = requireIndex("string-ref", args(1), text.length)
+        Value.CharValue(text.codePointAt(index))
+    ),
+    "string-set!" -> Value.Builtin(
+      "string-set!",
+      args =>
+        requireArgCount("string-set!", args, 3)
+        val text  = requireString("string-set!", args.head)
+        val index = requireIndex("string-set!", args(1), text.length)
+        text.setCodePoint(index, requireChar("string-set!", args(2)))
+        Value.VoidValue
+    ),
+    "string-copy" -> Value.Builtin(
+      "string-copy",
+      args =>
+        requireArgCount("string-copy", args, 1)
+        Value.StringValue(requireString("string-copy", args.head).copyString())
     )
   )
 

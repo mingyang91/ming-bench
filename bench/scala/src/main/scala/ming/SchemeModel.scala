@@ -8,6 +8,7 @@ private[ming] object SchemeModel:
     case IntegerLiteral(value: BigInt, pos: SourcePos)
     case BooleanLiteral(value: Boolean, pos: SourcePos)
     case StringLiteral(value: String, pos: SourcePos)
+    case CharLiteral(value: Int, pos: SourcePos)
     case Symbol(name: String, pos: SourcePos)
     case ListExpr(items: List[Expr], pos: SourcePos)
 
@@ -18,13 +19,45 @@ private[ming] object SchemeModel:
         case Expr.IntegerLiteral(_, pos) => pos
         case Expr.BooleanLiteral(_, pos) => pos
         case Expr.StringLiteral(_, pos)  => pos
+        case Expr.CharLiteral(_, pos)    => pos
         case Expr.Symbol(_, pos)         => pos
         case Expr.ListExpr(_, pos)       => pos
+
+  final class SchemeString private (private val codePoints: Array[Int]):
+
+    def text: String =
+      new String(codePoints, 0, codePoints.length)
+
+    def length: Int =
+      codePoints.length
+
+    def copyString(): SchemeString =
+      SchemeString.fromCodePoints(codePoints)
+
+    def slice(start: Int, end: Int): SchemeString =
+      SchemeString.fromCodePoints(codePoints.slice(start, end))
+
+    def codePointAt(index: Int): Int =
+      codePoints(index)
+
+    def setCodePoint(index: Int, value: Int): Unit =
+      codePoints(index) = value
+
+    def codePointsArray: Array[Int] =
+      codePoints.clone()
+
+  object SchemeString:
+
+    def fromText(text: String): SchemeString =
+      new SchemeString(text.codePoints().toArray)
+
+    def fromCodePoints(codePoints: Array[Int]): SchemeString =
+      new SchemeString(codePoints.clone())
 
   enum Value:
     case IntegerValue(value: BigInt)
     case BooleanValue(value: Boolean)
-    case StringValue(value: String)
+    case StringValue(value: SchemeString)
     case CharValue(codePoint: Int)
     case SymbolValue(name: String)
     case NilValue

@@ -25,11 +25,17 @@ private[ming] object SchemeBuiltinSupport:
       case other =>
         throw new EvalError(s"$name expected a number, got ${render(other)}")
 
-  def requireString(name: String, value: Value): String =
+  def requireString(name: String, value: Value): SchemeString =
     value match
       case Value.StringValue(text) => text
       case other =>
         throw new EvalError(s"$name expected a string, got ${render(other)}")
+
+  def requireChar(name: String, value: Value): Int =
+    value match
+      case Value.CharValue(codePoint) => codePoint
+      case other =>
+        throw new EvalError(s"$name expected a character, got ${render(other)}")
 
   def requireSymbol(name: String, value: Value): String =
     value match
@@ -60,8 +66,8 @@ private[ming] object SchemeBuiltinSupport:
     if !isValid then throw new EvalError(s"$name index out of range")
     intIndex
 
-  def stringCodePoints(text: String): Array[Int] =
-    text.codePoints().toArray
+  def stringCodePoints(text: SchemeString): Array[Int] =
+    text.codePointsArray
 
   def properListLength(name: String, value: Value): Int =
     @tailrec
@@ -106,7 +112,7 @@ private[ming] object SchemeBuiltinSupport:
         Value.BooleanValue(predicate(args.head))
     )
 
-  def unaryStringBuiltin(name: String)(implementation: String => Value): Value =
+  def unaryStringBuiltin(name: String)(implementation: SchemeString => Value): Value =
     Value.Builtin(
       name,
       args =>
@@ -125,16 +131,16 @@ private[ming] object SchemeBuiltinSupport:
           }
         }
 
-  def buildSubstring(text: String, startArg: Value, endArg: Value): Value =
+  def buildSubstring(text: SchemeString, startArg: Value, endArg: Value): Value =
     val codePoints = stringCodePoints(text)
     val start =
       requireIndex("substring", startArg, codePoints.length, inclusiveUpperBound = true)
     val end =
       requireIndex("substring", endArg, codePoints.length, inclusiveUpperBound = true)
     if start > end then throw new EvalError("substring start index must not exceed end index")
-    Value.StringValue(new String(codePoints.slice(start, end), 0, end - start))
+    Value.StringValue(text.slice(start, end))
 
-  def parseInteger(text: String): Value =
-    Try(BigInt(text)) match
+  def parseInteger(text: SchemeString): Value =
+    Try(BigInt(text.text)) match
       case Success(number) => Value.IntegerValue(number)
       case Failure(_)      => Value.BooleanValue(false)

@@ -22,7 +22,7 @@ private[ming] object SchemeRuntime:
     value match
       case Value.IntegerValue(number) => number.toString
       case Value.BooleanValue(flag)   => if flag then "#t" else "#f"
-      case Value.StringValue(text)    => s""""${escapeString(text)}""""
+      case Value.StringValue(text)    => s""""${escapeString(text.text)}""""
       case Value.CharValue(codePoint) => renderChar(codePoint)
       case Value.SymbolValue(name)    => name
       case Value.NilValue             => "()"
@@ -37,7 +37,7 @@ private[ming] object SchemeRuntime:
 
   def renderForDisplay(value: Value): String =
     value match
-      case Value.StringValue(text)    => text
+      case Value.StringValue(text)    => text.text
       case Value.CharValue(codePoint) => codePointToString(codePoint)
       case pair: Value.PairValue      => renderPair(pair, renderForDisplay)
       case other                      => render(other)
