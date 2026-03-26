@@ -8,7 +8,7 @@ type SchemeVal =
   | { tag: 'number'; value: number; pos?: Pos }
   | { tag: 'rational'; num: number; den: number; pos?: Pos }
   | { tag: 'boolean'; value: boolean; pos?: Pos }
-  | { tag: 'string'; value: string; pos?: Pos }
+  | { tag: 'string'; value: string; mutable?: boolean; pos?: Pos }
   | { tag: 'symbol'; value: string; pos?: Pos }
   | { tag: 'char'; value: string; pos?: Pos }
   | { tag: 'list'; value: SchemeVal[]; pos?: Pos }
@@ -744,16 +744,49 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
     case 'string-copy': {
       if (args.length !== 1) throw new EvalError(`${posStr(callPos)}string-copy: need 1 argument`);
       if (args[0].tag !== 'string') throw new EvalError(`${posStr(callPos)}string-copy: expected string`);
-      return { tag: 'string', value: args[0].value };
+      return { tag: 'string', value: args[0].value, mutable: true };
     }
     case 'string-set!': {
       if (args.length !== 3) throw new EvalError(`${posStr(callPos)}string-set!: need 3 arguments`);
       if (args[0].tag !== 'string') throw new EvalError(`${posStr(callPos)}string-set!: expected string`);
-      const idx = toNumber(args[1], 'string-set!', callPos);
+      if (!args[0].mutable) throw new EvalError(`${posStr(callPos)}string-set!: strings are immutable`);
       if (args[2].tag !== 'char') throw new EvalError(`${posStr(callPos)}string-set!: expected char`);
-      if (idx < 0 || idx >= args[0].value.length) throw new EvalError(`${posStr(callPos)}string-set!: index out of range`);
-      (args[0] as any).value = args[0].value.substring(0, idx) + args[2].value + args[0].value.substring(idx + 1);
+      const si = toNumber(args[1], 'string-set!', callPos);
+      if (si < 0 || si >= args[0].value.length) throw new EvalError(`${posStr(callPos)}string-set!: index out of range`);
+      args[0].value = args[0].value.substring(0, si) + args[2].value + args[0].value.substring(si + 1);
       return { tag: 'void' };
+    }
+    // ── L15: String immutability, list/string conversion, char/integer conversion ──
+    case 'string->list': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}string->list: need 1 argument`);
+      if (args[0].tag !== 'string') throw new EvalError(`${posStr(callPos)}string->list: expected string`);
+      let result: SchemeVal = { tag: 'nil' };
+      const s = args[0].value;
+      for (let i = s.length - 1; i >= 0; i--) {
+        result = { tag: 'pair', car: { tag: 'char', value: s[i] }, cdr: result };
+      }
+      return result;
+    }
+    case 'list->string': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}list->string: need 1 argument`);
+      let chars = '';
+      let lst = args[0];
+      while (lst.tag === 'pair') {
+        if (lst.car.tag !== 'char') throw new EvalError(`${posStr(callPos)}list->string: expected list of chars`);
+        chars += lst.car.value;
+        lst = lst.cdr;
+      }
+      return { tag: 'string', value: chars };
+    }
+    case 'char->integer': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}char->integer: need 1 argument`);
+      if (args[0].tag !== 'char') throw new EvalError(`${posStr(callPos)}char->integer: expected char`);
+      return { tag: 'number', value: args[0].value.charCodeAt(0) };
+    }
+    case 'integer->char': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}integer->char: need 1 argument`);
+      const code = toNumber(args[0], 'integer->char', callPos);
+      return { tag: 'char', value: String.fromCharCode(code) };
     }
     // ── L09: Numeric utilities ──
     case 'abs': {
@@ -1093,6 +1126,8 @@ const BUILTIN_NAMES = new Set([
   'symbol->string', 'string->symbol',
   'string-ref', 'char?',
   'string-copy', 'string-set!',
+  // L15
+  'string->list', 'list->string', 'char->integer', 'integer->char',
   'apply',
   // L09
   'abs', 'modulo', 'remainder', 'quotient', 'min', 'max', 'expt',
