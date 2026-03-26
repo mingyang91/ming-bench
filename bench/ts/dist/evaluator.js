@@ -389,76 +389,103 @@ function parseCharLiteral(token) {
     throw new EvalError('invalid character literal', token.pos);
 }
 function evaluateExpr(expr, env, context) {
-    try {
-        switch (expr.kind) {
-            case 'number':
-            case 'boolean':
-                return expr;
-            case 'string':
-                return makeString(expr.value);
-            case 'char':
-                return makeChar(expr.value);
-            case 'symbol':
-                return env.lookup(expr.name);
-            case 'list':
-                return evaluateList(expr.elements, env, context);
+    return runEvaluation({ kind: 'expr', expr, env }, context);
+}
+function runEvaluation(initialAction, context) {
+    let action = initialAction;
+    while (true) {
+        try {
+            switch (action.kind) {
+                case 'value':
+                    return action.value;
+                case 'expr':
+                    action = evaluateExprAction(action.expr, action.env, context);
+                    break;
+                case 'sequence':
+                    action = evaluateSequenceAction(action.exprs, action.env, context);
+                    break;
+                case 'apply':
+                    action = applyProcedureAction(action.procedure, action.args, context);
+                    break;
+            }
+        }
+        catch (error) {
+            if (action.kind === 'expr') {
+                throw attachPosition(error, action.expr.pos);
+            }
+            if (action.kind === 'apply' && action.pos !== undefined) {
+                throw attachPosition(error, action.pos);
+            }
+            throw error;
         }
     }
-    catch (error) {
-        throw attachPosition(error, expr.pos);
+}
+function evaluateExprAction(expr, env, context) {
+    switch (expr.kind) {
+        case 'number':
+        case 'boolean':
+            return { kind: 'value', value: expr };
+        case 'string':
+            return { kind: 'value', value: makeString(expr.value) };
+        case 'char':
+            return { kind: 'value', value: makeChar(expr.value) };
+        case 'symbol':
+            return { kind: 'value', value: env.lookup(expr.name) };
+        case 'list':
+            return evaluateListAction(expr, env, context);
     }
 }
-function evaluateList(elements, env, context) {
-    if (elements.length === 0) {
+function evaluateListAction(expr, env, context) {
+    if (expr.elements.length === 0) {
         throw new EvalError('cannot evaluate empty list');
     }
-    const [head, ...argExprs] = elements;
+    const [head, ...argExprs] = expr.elements;
     if (head.kind === 'symbol') {
         switch (head.name) {
             case 'define-syntax':
-                return evaluateDefineSyntax(argExprs, env);
+                return { kind: 'value', value: evaluateDefineSyntax(argExprs, env) };
             case 'define':
-                return evaluateDefine(argExprs, env, context);
+                return { kind: 'value', value: evaluateDefine(argExprs, env, context) };
             case 'define-record-type':
-                return evaluateDefineRecordType(argExprs, env);
+                return { kind: 'value', value: evaluateDefineRecordType(argExprs, env) };
             case 'set!':
-                return evaluateSet(argExprs, env, context);
+                return { kind: 'value', value: evaluateSet(argExprs, env, context) };
             case 'if':
-                return evaluateIf(argExprs, env, context);
+                return evaluateIfAction(argExprs, env, context);
             case 'quote':
-                return evaluateQuote(argExprs);
+                return { kind: 'value', value: evaluateQuote(argExprs) };
             case 'lambda':
-                return evaluateLambda(argExprs, env);
+                return { kind: 'value', value: evaluateLambda(argExprs, env) };
             case 'case-lambda':
-                return evaluateCaseLambda(argExprs, env);
+                return { kind: 'value', value: evaluateCaseLambda(argExprs, env) };
             case 'and':
-                return evaluateAnd(argExprs, env, context);
+                return evaluateAndAction(argExprs, env, context);
             case 'or':
-                return evaluateOr(argExprs, env, context);
+                return evaluateOrAction(argExprs, env, context);
             case 'begin':
-                return evaluateBegin(argExprs, env, context);
+                return evaluateBeginAction(argExprs, env);
             case 'let':
-                return evaluateLet(argExprs, env, context);
+                return evaluateLetAction(argExprs, env, context);
             case 'letrec':
-                return evaluateLetrec(argExprs, env, context, false);
+                return evaluateLetrecAction(argExprs, env, context, false);
             case 'letrec*':
-                return evaluateLetrec(argExprs, env, context, true);
+                return evaluateLetrecAction(argExprs, env, context, true);
             case 'cond':
-                return evaluateCond(argExprs, env, context);
+                return evaluateCondAction(argExprs, env, context);
             case 'case':
-                return evaluateCase(argExprs, env, context);
+                return evaluateCaseAction(argExprs, env, context);
             case 'do':
-                return evaluateDo(argExprs, env, context);
+                return evaluateDoAction(argExprs, env, context);
         }
         const macroRules = env.lookupMacro(head.name);
         if (macroRules !== undefined) {
-            const expanded = expandMacroInvocation(elements, macroRules, env);
-            return evaluateExpr(expanded.expr, expanded.env, context);
+            const expanded = expandMacroInvocation(expr.elements, macroRules, env);
+            return { kind: 'expr', expr: expanded.expr, env: expanded.env };
         }
     }
     const procedure = evaluateExpr(head, env, context);
-    const args = argExprs.map((expr) => evaluateExpr(expr, env, context));
-    return applyProcedure(procedure, args, context);
+    const args = argExprs.map((argExpr) => evaluateExpr(argExpr, env, context));
+    return { kind: 'apply', procedure, args, pos: expr.pos };
 }
 function evaluateDefine(argExprs, env, context) {
     if (argExprs.length < 2) {
@@ -593,18 +620,18 @@ function evaluateSet(argExprs, env, context) {
     env.assign(target.name, value);
     return VOID_VALUE;
 }
-function evaluateIf(argExprs, env, context) {
+function evaluateIfAction(argExprs, env, context) {
     if (argExprs.length !== 2 && argExprs.length !== 3) {
         throw new EvalError('if expects exactly 2 or 3 arguments');
     }
     const condition = evaluateExpr(argExprs[0], env, context);
     if (isTruthy(condition)) {
-        return evaluateExpr(argExprs[1], env, context);
+        return { kind: 'expr', expr: argExprs[1], env };
     }
     if (argExprs[2] === undefined) {
-        return VOID_VALUE;
+        return { kind: 'value', value: VOID_VALUE };
     }
-    return evaluateExpr(argExprs[2], env, context);
+    return { kind: 'expr', expr: argExprs[2], env };
 }
 function evaluateQuote(argExprs) {
     if (argExprs.length !== 1) {
@@ -1252,29 +1279,34 @@ function freshMacroIdentifier(name) {
         .join('');
     return `__macro_${counter}_${sanitized || 'id'}`;
 }
-function evaluateAnd(argExprs, env, context) {
-    let lastValue = makeBoolean(true);
-    for (const expr of argExprs) {
-        lastValue = evaluateExpr(expr, env, context);
-        if (!isTruthy(lastValue)) {
-            return lastValue;
+function evaluateAndAction(argExprs, env, context) {
+    if (argExprs.length === 0) {
+        return { kind: 'value', value: makeBoolean(true) };
+    }
+    for (let index = 0; index < argExprs.length - 1; index += 1) {
+        const value = evaluateExpr(argExprs[index], env, context);
+        if (!isTruthy(value)) {
+            return { kind: 'value', value };
         }
     }
-    return lastValue;
+    return { kind: 'expr', expr: argExprs[argExprs.length - 1], env };
 }
-function evaluateOr(argExprs, env, context) {
-    for (const expr of argExprs) {
-        const value = evaluateExpr(expr, env, context);
+function evaluateOrAction(argExprs, env, context) {
+    if (argExprs.length === 0) {
+        return { kind: 'value', value: makeBoolean(false) };
+    }
+    for (let index = 0; index < argExprs.length - 1; index += 1) {
+        const value = evaluateExpr(argExprs[index], env, context);
         if (isTruthy(value)) {
-            return value;
+            return { kind: 'value', value };
         }
     }
-    return makeBoolean(false);
+    return { kind: 'expr', expr: argExprs[argExprs.length - 1], env };
 }
-function evaluateBegin(argExprs, env, context) {
-    return evaluateSequence(argExprs, env, context);
+function evaluateBeginAction(argExprs, env) {
+    return { kind: 'sequence', exprs: argExprs, env };
 }
-function evaluateLet(argExprs, env, context) {
+function evaluateLetAction(argExprs, env, context) {
     if (argExprs.length < 2) {
         throw new EvalError('let expects bindings and a body');
     }
@@ -1300,7 +1332,7 @@ function evaluateLet(argExprs, env, context) {
         for (let index = 0; index < bindings.names.length; index += 1) {
             letEnv.define(bindings.names[index], values[index]);
         }
-        return evaluateSequence(body, letEnv, context);
+        return { kind: 'sequence', exprs: body, env: letEnv };
     }
     const letEnv = new Environment(env);
     const procedure = {
@@ -1310,7 +1342,7 @@ function evaluateLet(argExprs, env, context) {
         env: letEnv,
     };
     letEnv.define(name, procedure);
-    return applyClosure(procedure, values, context);
+    return applyClosureAction(procedure, values);
 }
 function readLetBindings(bindingsExpr) {
     if (bindingsExpr.kind !== 'list') {
@@ -1331,7 +1363,7 @@ function readLetBindings(bindingsExpr) {
     }
     return { names, initExprs };
 }
-function evaluateLetrec(argExprs, env, context, sequential) {
+function evaluateLetrecAction(argExprs, env, context, sequential) {
     if (argExprs.length < 2) {
         throw new EvalError(`${sequential ? 'letrec*' : 'letrec'} expects bindings and a body`);
     }
@@ -1354,9 +1386,9 @@ function evaluateLetrec(argExprs, env, context, sequential) {
             letEnv.assign(bindings.names[index], values[index]);
         }
     }
-    return evaluateSequence(body, letEnv, context);
+    return { kind: 'sequence', exprs: body, env: letEnv };
 }
-function evaluateCond(argExprs, env, context) {
+function evaluateCondAction(argExprs, env, context) {
     for (let index = 0; index < argExprs.length; index += 1) {
         const clauseExpr = argExprs[index];
         if (clauseExpr.kind !== 'list' || clauseExpr.elements.length === 0) {
@@ -1371,20 +1403,20 @@ function evaluateCond(argExprs, env, context) {
             if (body.length === 0) {
                 throw new EvalError('cond else clause expects at least 1 expression');
             }
-            return evaluateSequence(body, env, context);
+            return { kind: 'sequence', exprs: body, env };
         }
         const testValue = evaluateExpr(testExpr, env, context);
         if (!isTruthy(testValue)) {
             continue;
         }
         if (body.length === 0) {
-            return testValue;
+            return { kind: 'value', value: testValue };
         }
-        return evaluateSequence(body, env, context);
+        return { kind: 'sequence', exprs: body, env };
     }
-    return VOID_VALUE;
+    return { kind: 'value', value: VOID_VALUE };
 }
-function evaluateCase(argExprs, env, context) {
+function evaluateCaseAction(argExprs, env, context) {
     if (argExprs.length < 1) {
         throw new EvalError('case expects a key and at least 1 clause');
     }
@@ -1407,20 +1439,22 @@ function evaluateCase(argExprs, env, context) {
             if (body.length === 0) {
                 throw new EvalError('case else clause expects at least 1 expression');
             }
-            return evaluateSequence(body, env, context);
+            return { kind: 'sequence', exprs: body, env };
         }
         if (datumExpr.kind !== 'list') {
             throw new EvalError('case clauses must start with a datum list or else');
         }
         for (const datum of datumExpr.elements) {
             if (eqValues(key, quoteExpr(datum))) {
-                return body.length === 0 ? VOID_VALUE : evaluateSequence(body, env, context);
+                return body.length === 0
+                    ? { kind: 'value', value: VOID_VALUE }
+                    : { kind: 'sequence', exprs: body, env };
             }
         }
     }
-    return VOID_VALUE;
+    return { kind: 'value', value: VOID_VALUE };
 }
-function evaluateDo(argExprs, env, context) {
+function evaluateDoAction(argExprs, env, context) {
     if (argExprs.length < 2) {
         throw new EvalError('do expects bindings, a termination clause, and optional body expressions');
     }
@@ -1438,7 +1472,9 @@ function evaluateDo(argExprs, env, context) {
     }
     while (true) {
         if (isTruthy(evaluateExpr(testExpr, doEnv, context))) {
-            return resultExprs.length === 0 ? VOID_VALUE : evaluateSequence(resultExprs, doEnv, context);
+            return resultExprs.length === 0
+                ? { kind: 'value', value: VOID_VALUE }
+                : { kind: 'sequence', exprs: resultExprs, env: doEnv };
         }
         if (body.length > 0) {
             evaluateSequence(body, doEnv, context);
@@ -1470,22 +1506,25 @@ function readDoBindings(bindingsExpr) {
         };
     });
 }
-function applyProcedure(procedure, args, context) {
+function applyProcedure(procedure, args, context, pos) {
+    return runEvaluation({ kind: 'apply', procedure, args, pos }, context);
+}
+function applyProcedureAction(procedure, args, context) {
     switch (procedure.kind) {
         case 'builtin':
-            return applyBuiltin(procedure.name, args, context);
+            return { kind: 'value', value: applyBuiltin(procedure.name, args, context) };
         case 'closure':
-            return applyClosure(procedure, args, context);
+            return applyClosureAction(procedure, args);
         case 'case-lambda':
-            return applyCaseLambda(procedure, args, context);
+            return applyCaseLambdaAction(procedure, args);
         case 'record-constructor':
-            return applyRecordConstructor(procedure, args);
+            return { kind: 'value', value: applyRecordConstructor(procedure, args) };
         case 'record-predicate':
-            return applyRecordPredicate(procedure, args);
+            return { kind: 'value', value: applyRecordPredicate(procedure, args) };
         case 'record-accessor':
-            return applyRecordAccessor(procedure, args);
+            return { kind: 'value', value: applyRecordAccessor(procedure, args) };
         case 'record-mutator':
-            return applyRecordMutator(procedure, args);
+            return { kind: 'value', value: applyRecordMutator(procedure, args) };
         default:
             throw new EvalError('attempted to call a non-procedure');
     }
@@ -1523,7 +1562,7 @@ function applyRecordMutator(procedure, args) {
     expectRecord(args[0], procedure.name, procedure.recordType).fields[procedure.fieldIndex] = args[1];
     return VOID_VALUE;
 }
-function applyClosure(procedure, args, context) {
+function applyClosureAction(procedure, args) {
     if (procedure.restParam === undefined && args.length !== procedure.params.length) {
         throw new EvalError(`expected ${procedure.params.length} arguments, got ${args.length}`);
     }
@@ -1537,12 +1576,12 @@ function applyClosure(procedure, args, context) {
     if (procedure.restParam !== undefined) {
         callEnv.define(procedure.restParam, buildList(args.slice(procedure.params.length)));
     }
-    return evaluateSequence(procedure.body, callEnv, context);
+    return { kind: 'sequence', exprs: procedure.body, env: callEnv };
 }
-function applyCaseLambda(procedure, args, context) {
+function applyCaseLambdaAction(procedure, args) {
     for (const clause of procedure.clauses) {
         if (matchesArity(clause, args.length)) {
-            return applyClosure(clause, args, context);
+            return applyClosureAction(clause, args);
         }
     }
     throw new EvalError(`case-lambda: no matching clause for ${args.length} arguments`);
@@ -1553,11 +1592,16 @@ function matchesArity(procedure, argCount) {
         : argCount >= procedure.params.length;
 }
 function evaluateSequence(exprs, env, context) {
-    let result = VOID_VALUE;
-    for (const expr of exprs) {
-        result = evaluateExpr(expr, env, context);
+    return runEvaluation({ kind: 'sequence', exprs, env }, context);
+}
+function evaluateSequenceAction(exprs, env, context) {
+    if (exprs.length === 0) {
+        return { kind: 'value', value: VOID_VALUE };
     }
-    return result;
+    for (let index = 0; index < exprs.length - 1; index += 1) {
+        evaluateExpr(exprs[index], env, context);
+    }
+    return { kind: 'expr', expr: exprs[exprs.length - 1], env };
 }
 function applyBuiltin(name, args, context) {
     switch (name) {
