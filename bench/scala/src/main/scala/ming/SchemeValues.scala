@@ -2,6 +2,7 @@ package ming
 
 sealed private[ming] trait Value:
   def render: String
+  def renderDisplay: String = render
 
 final private[ming] case class IntValue(value: BigInt) extends Value:
   override def render: String = value.toString
@@ -20,6 +21,18 @@ final private[ming] case class StringValue(value: String) extends Value:
       case '\t' => "\\t"
       case ch   => ch.toString
     s"\"$escaped\""
+
+  override def renderDisplay: String = value
+
+final private[ming] case class CharValue(value: Char) extends Value:
+
+  override def render: String =
+    value match
+      case ' '  => "#\\space"
+      case '\n' => "#\\newline"
+      case ch   => s"#\\$ch"
+
+  override def renderDisplay: String = value.toString
 
 final private[ming] case class SymbolValue(name: String) extends Value:
   override def render: String = name

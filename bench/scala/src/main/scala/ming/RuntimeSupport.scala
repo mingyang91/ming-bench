@@ -50,11 +50,30 @@ private[ming] object RuntimeSupport:
       case other =>
         SchemeFailure.raise(s"$name expected a number, got ${typeName(other)}", position)
 
+  def expectString(value: Value, name: String, position: Position): String =
+    value match
+      case StringValue(text) => text
+      case other =>
+        SchemeFailure.raise(s"$name expected a string, got ${typeName(other)}", position)
+
+  def expectSymbol(value: Value, name: String, position: Position): String =
+    value match
+      case SymbolValue(symbol) => symbol
+      case other =>
+        SchemeFailure.raise(s"$name expected a symbol, got ${typeName(other)}", position)
+
   def expectPair(value: Value, name: String, position: Position): PairValue =
     value match
       case pair: PairValue => pair
       case other =>
         SchemeFailure.raise(s"$name expected a pair, got ${typeName(other)}", position)
+
+  def expectIndex(value: Value, name: String, position: Position): Int =
+    val number = expectNumber(value, name, position)
+    if number < 0 || !number.isValidInt then
+      SchemeFailure.raise(s"$name expected a non-negative integer index", position)
+
+    number.toInt
 
   @tailrec
   def expectProperList(
@@ -82,6 +101,7 @@ private[ming] object RuntimeSupport:
       case BoolValue(_)       => "boolean"
       case StringValue(_)     => "string"
       case SymbolValue(_)     => "symbol"
+      case CharValue(_)       => "char"
       case EmptyListValue     => "list"
       case PairValue(_, _)    => "pair"
       case BuiltinValue(_, _) => "procedure"

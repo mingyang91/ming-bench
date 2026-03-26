@@ -4,27 +4,39 @@ private[ming] object Level1Builtins:
   import RuntimeSupport.*
 
   val values: Map[String, Value] = Map(
-    "+"        -> BuiltinValue("+", add),
-    "-"        -> BuiltinValue("-", subtract),
-    "*"        -> BuiltinValue("*", multiply),
-    "/"        -> BuiltinValue("/", divide),
-    "<"        -> BuiltinValue("<", compareNumbers("<")(_ < _)),
-    ">"        -> BuiltinValue(">", compareNumbers(">")(_ > _)),
-    "="        -> BuiltinValue("=", compareNumbers("=")(_ == _)),
-    "<="       -> BuiltinValue("<=", compareNumbers("<=")(_ <= _)),
-    "not"      -> BuiltinValue("not", logicalNot),
-    "cons"     -> BuiltinValue("cons", cons),
-    "car"      -> BuiltinValue("car", car),
-    "cdr"      -> BuiltinValue("cdr", cdr),
-    "null?"    -> BuiltinValue("null?", unaryPredicate("null?")(_ == EmptyListValue)),
-    "list"     -> BuiltinValue("list", list),
-    "length"   -> BuiltinValue("length", length),
-    "append"   -> BuiltinValue("append", append),
-    "string?"  -> BuiltinValue("string?", unaryPredicate("string?")(isString)),
-    "number?"  -> BuiltinValue("number?", unaryPredicate("number?")(isNumber)),
-    "boolean?" -> BuiltinValue("boolean?", unaryPredicate("boolean?")(isBoolean)),
-    "pair?"    -> BuiltinValue("pair?", unaryPredicate("pair?")(isPair)),
-    "symbol?"  -> BuiltinValue("symbol?", unaryPredicate("symbol?")(isSymbol))
+    "+"              -> BuiltinValue("+", add),
+    "-"              -> BuiltinValue("-", subtract),
+    "*"              -> BuiltinValue("*", multiply),
+    "/"              -> BuiltinValue("/", divide),
+    "<"              -> BuiltinValue("<", compareNumbers("<")(_ < _)),
+    ">"              -> BuiltinValue(">", compareNumbers(">")(_ > _)),
+    "="              -> BuiltinValue("=", compareNumbers("=")(_ == _)),
+    "<="             -> BuiltinValue("<=", compareNumbers("<=")(_ <= _)),
+    "not"            -> BuiltinValue("not", logicalNot),
+    "cons"           -> BuiltinValue("cons", cons),
+    "car"            -> BuiltinValue("car", car),
+    "cdr"            -> BuiltinValue("cdr", cdr),
+    "null?"          -> BuiltinValue("null?", unaryPredicate("null?")(_ == EmptyListValue)),
+    "list"           -> BuiltinValue("list", list),
+    "length"         -> BuiltinValue("length", length),
+    "append"         -> BuiltinValue("append", append),
+    "display"        -> BuiltinValue("display", display),
+    "write"          -> BuiltinValue("write", write),
+    "newline"        -> BuiltinValue("newline", newline),
+    "string-append"  -> BuiltinValue("string-append", stringAppend),
+    "string-length"  -> BuiltinValue("string-length", stringLength),
+    "substring"      -> BuiltinValue("substring", substring),
+    "string->number" -> BuiltinValue("string->number", stringToNumber),
+    "number->string" -> BuiltinValue("number->string", numberToString),
+    "symbol->string" -> BuiltinValue("symbol->string", symbolToString),
+    "string->symbol" -> BuiltinValue("string->symbol", stringToSymbol),
+    "string-ref"     -> BuiltinValue("string-ref", stringRef),
+    "string?"        -> BuiltinValue("string?", unaryPredicate("string?")(isString)),
+    "number?"        -> BuiltinValue("number?", unaryPredicate("number?")(isNumber)),
+    "boolean?"       -> BuiltinValue("boolean?", unaryPredicate("boolean?")(isBoolean)),
+    "pair?"          -> BuiltinValue("pair?", unaryPredicate("pair?")(isPair)),
+    "symbol?"        -> BuiltinValue("symbol?", unaryPredicate("symbol?")(isSymbol)),
+    "char?"          -> BuiltinValue("char?", unaryPredicate("char?")(isChar))
   )
 
   private def add(arguments: List[Value], position: Position): Value =
@@ -98,6 +110,69 @@ private[ming] object Level1Builtins:
     val elements = arguments.flatMap(argument => expectProperList(argument, "append", position))
     buildList(elements)
 
+  private def display(arguments: List[Value], position: Position): Value =
+    val value = expectSingleArgument(arguments, "display", position)
+    OutputCapture.append(value.renderDisplay)
+    VoidValue
+
+  private def write(arguments: List[Value], position: Position): Value =
+    val value = expectSingleArgument(arguments, "write", position)
+    OutputCapture.append(value.render)
+    VoidValue
+
+  private def newline(arguments: List[Value], position: Position): Value =
+    expectExact(arguments, 0, "newline", position)
+    OutputCapture.append("\n")
+    VoidValue
+
+  private def stringAppend(arguments: List[Value], position: Position): Value =
+    StringValue(arguments.map(expectString(_, "string-append", position)).mkString)
+
+  private def stringLength(arguments: List[Value], position: Position): Value =
+    val value = expectSingleArgument(arguments, "string-length", position)
+    IntValue(expectString(value, "string-length", position).length)
+
+  private def substring(arguments: List[Value], position: Position): Value =
+    expectExact(arguments, 3, "substring", position) match
+      case stringValue :: startValue :: endValue :: Nil =>
+        val text  = expectString(stringValue, "substring", position)
+        val start = expectIndex(startValue, "substring", position)
+        val end   = expectIndex(endValue, "substring", position)
+        if start > end || end > text.length then SchemeFailure.raise("substring indices out of bounds", position)
+
+        StringValue(text.substring(start, end))
+      case _ =>
+        throw new IllegalStateException("validated three-argument list")
+
+  private def stringToNumber(arguments: List[Value], position: Position): Value =
+    val value = expectSingleArgument(arguments, "string->number", position)
+    val text  = expectString(value, "string->number", position)
+    if text.matches("[+-]?\\d+") then IntValue(BigInt(text))
+    else BoolValue(false)
+
+  private def numberToString(arguments: List[Value], position: Position): Value =
+    val value = expectSingleArgument(arguments, "number->string", position)
+    StringValue(expectNumber(value, "number->string", position).toString)
+
+  private def symbolToString(arguments: List[Value], position: Position): Value =
+    val value = expectSingleArgument(arguments, "symbol->string", position)
+    StringValue(expectSymbol(value, "symbol->string", position))
+
+  private def stringToSymbol(arguments: List[Value], position: Position): Value =
+    val value = expectSingleArgument(arguments, "string->symbol", position)
+    SymbolValue(expectString(value, "string->symbol", position))
+
+  private def stringRef(arguments: List[Value], position: Position): Value =
+    expectExact(arguments, 2, "string-ref", position) match
+      case stringValue :: indexValue :: Nil =>
+        val text  = expectString(stringValue, "string-ref", position)
+        val index = expectIndex(indexValue, "string-ref", position)
+        if index >= text.length then SchemeFailure.raise("string-ref index out of bounds", position)
+
+        CharValue(text.charAt(index))
+      case _ =>
+        throw new IllegalStateException("validated two-argument list")
+
   private def numericArguments(
     arguments: List[Value],
     name: String,
@@ -142,3 +217,8 @@ private[ming] object Level1Builtins:
     value match
       case SymbolValue(_) => true
       case _              => false
+
+  private def isChar(value: Value): Boolean =
+    value match
+      case CharValue(_) => true
+      case _            => false
