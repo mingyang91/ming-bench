@@ -4267,13 +4267,7 @@ where
                 )?))
             }
             "cond" => return eval_cond_control(arguments, env, make_sequence_target),
-            "case" => {
-                return Ok(TailControl::Return(eval_case(
-                    operator.pos,
-                    arguments,
-                    env,
-                )?))
-            }
+            "case" => return eval_case_control(operator.pos, arguments, env, make_sequence_target),
             "do" => return Ok(TailControl::Return(eval_do(operator.pos, arguments, env)?)),
             _ => {}
         }
@@ -4828,6 +4822,94 @@ fn apply_value(
         }
         .with_offset(call_pos.offset)),
     }
+}
+
+fn eval_case_control<'a, F>(
+    pos: SourcePos,
+    arguments: &'a [Expr],
+    env: &EnvRef,
+    make_sequence_target: F,
+) -> Result<TailControl<'a>, EvalError>
+where
+    F: Copy + Fn(&'a [Expr]) -> TailTarget<'a>,
+{
+    let Some((key_expr, clauses)) = arguments.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: "case".into(),
+            expected: "at least 2".into(),
+            got: 0,
+        }
+        .with_offset(pos.offset));
+    };
+
+    if clauses.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "case".into(),
+            expected: "at least 2".into(),
+            got: 1,
+        }
+        .with_offset(pos.offset));
+    }
+
+    let key = eval_expr(key_expr, env)?;
+
+    for (index, clause) in clauses.iter().enumerate() {
+        let ExprKind::List(items) = &clause.kind else {
+            return Err(EvalError::InvalidSyntax {
+                message: "case: clauses must be lists".into(),
+            }
+            .with_offset(clause.pos.offset));
+        };
+
+        let Some((datum_expr, body)) = items.split_first() else {
+            return Err(EvalError::InvalidSyntax {
+                message: "case: clauses cannot be empty".into(),
+            }
+            .with_offset(clause.pos.offset));
+        };
+
+        if matches!(&datum_expr.kind, ExprKind::Symbol(name) if name == "else") {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::InvalidSyntax {
+                    message: "case: else clause must be last".into(),
+                }
+                .with_offset(datum_expr.pos.offset));
+            }
+
+            return if body.is_empty() {
+                Ok(TailControl::Return(Value::Void))
+            } else {
+                Ok(TailControl::Continue {
+                    target: make_sequence_target(body),
+                    env: env.clone(),
+                })
+            };
+        }
+
+        let ExprKind::List(datums) = &datum_expr.kind else {
+            return Err(EvalError::InvalidSyntax {
+                message: "case: expected datum list or else".into(),
+            }
+            .with_offset(datum_expr.pos.offset));
+        };
+
+        if datums
+            .iter()
+            .map(quote_expr)
+            .any(|datum| value_eqv(&key, &datum))
+        {
+            return if body.is_empty() {
+                Ok(TailControl::Return(Value::Void))
+            } else {
+                Ok(TailControl::Continue {
+                    target: make_sequence_target(body),
+                    env: env.clone(),
+                })
+            };
+        }
+    }
+
+    Ok(TailControl::Return(Value::Boolean(false)))
 }
 
 fn apply_native_procedure(
@@ -7175,80 +7257,6 @@ fn eval_letrec(
     }
 
     eval_sequence(body, &letrec_env)
-}
-
-fn eval_case(pos: SourcePos, arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
-    let Some((key_expr, clauses)) = arguments.split_first() else {
-        return Err(EvalError::WrongArgCount {
-            name: "case".into(),
-            expected: "at least 2".into(),
-            got: 0,
-        }
-        .with_offset(pos.offset));
-    };
-
-    if clauses.is_empty() {
-        return Err(EvalError::WrongArgCount {
-            name: "case".into(),
-            expected: "at least 2".into(),
-            got: 1,
-        }
-        .with_offset(pos.offset));
-    }
-
-    let key = eval_expr(key_expr, env)?;
-
-    for (index, clause) in clauses.iter().enumerate() {
-        let ExprKind::List(items) = &clause.kind else {
-            return Err(EvalError::InvalidSyntax {
-                message: "case: clauses must be lists".into(),
-            }
-            .with_offset(clause.pos.offset));
-        };
-
-        let Some((datum_expr, body)) = items.split_first() else {
-            return Err(EvalError::InvalidSyntax {
-                message: "case: clauses cannot be empty".into(),
-            }
-            .with_offset(clause.pos.offset));
-        };
-
-        if matches!(&datum_expr.kind, ExprKind::Symbol(name) if name == "else") {
-            if index + 1 != clauses.len() {
-                return Err(EvalError::InvalidSyntax {
-                    message: "case: else clause must be last".into(),
-                }
-                .with_offset(datum_expr.pos.offset));
-            }
-
-            return if body.is_empty() {
-                Ok(Value::Void)
-            } else {
-                eval_sequence(body, env)
-            };
-        }
-
-        let ExprKind::List(datums) = &datum_expr.kind else {
-            return Err(EvalError::InvalidSyntax {
-                message: "case: expected datum list or else".into(),
-            }
-            .with_offset(datum_expr.pos.offset));
-        };
-
-        if datums
-            .iter()
-            .map(quote_expr)
-            .any(|datum| value_eqv(&key, &datum))
-        {
-            return if body.is_empty() {
-                Ok(Value::Void)
-            } else {
-                eval_sequence(body, env)
-            };
-        }
-    }
-
-    Ok(Value::Boolean(false))
 }
 
 #[derive(Clone)]
@@ -9981,6 +9989,13 @@ pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, Eval
     Ok(value.render())
 }
 
+fn render_eval_output_result(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.as_string(),
+        _ => value.render(),
+    }
+}
+
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
@@ -9988,13 +10003,13 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
         .parse_program()
         .map_err(|err| err.resolve_positions(input))?;
     if let Some(value) = try_eval_coroutine_scheduler_benchmark(&expressions) {
-        return Ok((value.render(), String::new()));
+        return Ok((render_eval_output_result(&value), String::new()));
     }
     let output = Rc::new(RefCell::new(String::new()));
     let value =
         eval_program(&expressions, output.clone()).map_err(|err| err.resolve_positions(input))?;
     let captured_output = output.borrow().clone();
-    Ok((value.render(), captured_output))
+    Ok((render_eval_output_result(&value), captured_output))
 }
 
 #[cfg(test)]
