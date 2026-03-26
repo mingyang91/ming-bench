@@ -1,5 +1,6 @@
 package ming
 
+import java.util.Arrays
 import scala.collection.mutable.ListBuffer
 
 import SchemeModel.*
@@ -11,6 +12,14 @@ private[ming] object SchemeParser:
 
   final private class Parser(input: String):
     private var index = 0
+
+    private val lineStarts: Array[Int] =
+      val starts = ListBuffer(0)
+      var offset = 0
+      while offset < input.length do
+        if input.charAt(offset) == '\n' then starts += offset + 1
+        offset += 1
+      starts.toArray
 
     def parseProgram(): List[Expr] =
       val expressions = ListBuffer.empty[Expr]
@@ -24,23 +33,24 @@ private[ming] object SchemeParser:
       skipTrivia()
       if isAtEnd then parseError("unexpected end of input")
 
+      val pos = positionFor(index)
       input.charAt(index) match
         case '(' =>
           index += 1
-          parseList()
+          parseList(pos)
         case '\'' =>
           index += 1
-          Expr.ListExpr(List(Expr.Symbol("quote"), parseExpr()))
+          Expr.ListExpr(List(Expr.Symbol("quote", pos), parseExpr()), pos)
         case ')' =>
           parseError("unexpected ')'")
         case '"' =>
-          parseString()
+          parseString(pos)
         case '#' =>
-          parseBoolean()
+          parseBoolean(pos)
         case _ =>
-          parseAtom()
+          parseAtom(pos)
 
-    private def parseList(): Expr =
+    private def parseList(pos: SourcePos): Expr =
       val items = ListBuffer.empty[Expr]
       skipTrivia()
       while !isAtEnd && input.charAt(index) != ')' do
@@ -49,9 +59,9 @@ private[ming] object SchemeParser:
 
       if isAtEnd then parseError("unterminated list")
       index += 1
-      Expr.ListExpr(items.toList)
+      Expr.ListExpr(items.toList, pos)
 
-    private def parseString(): Expr =
+    private def parseString(pos: SourcePos): Expr =
       index += 1
       val builder = new StringBuilder
 
@@ -74,24 +84,24 @@ private[ming] object SchemeParser:
 
       if isAtEnd then parseError("unterminated string literal")
       index += 1
-      Expr.StringLiteral(builder.result())
+      Expr.StringLiteral(builder.result(), pos)
 
-    private def parseBoolean(): Expr =
+    private def parseBoolean(pos: SourcePos): Expr =
       if startsWith("#t") && tokenBoundary(index + 2) then
         index += 2
-        Expr.BooleanLiteral(true)
+        Expr.BooleanLiteral(true, pos)
       else if startsWith("#f") && tokenBoundary(index + 2) then
         index += 2
-        Expr.BooleanLiteral(false)
+        Expr.BooleanLiteral(false, pos)
       else parseError("invalid boolean literal")
 
-    private def parseAtom(): Expr =
+    private def parseAtom(pos: SourcePos): Expr =
       val start = index
       while !isAtEnd && !isDelimiter(input.charAt(index)) do index += 1
 
       val token = input.substring(start, index)
-      if token.matches("-?\\d+") then Expr.IntegerLiteral(BigInt(token))
-      else Expr.Symbol(token)
+      if token.matches("-?\\d+") then Expr.IntegerLiteral(BigInt(token), pos)
+      else Expr.Symbol(token, pos)
 
     private def skipTrivia(): Unit =
       var keepSkipping = true
@@ -113,5 +123,12 @@ private[ming] object SchemeParser:
     private def isAtEnd: Boolean =
       index >= input.length
 
+    private def positionFor(offset: Int): SourcePos =
+      val indexInLineStarts = Arrays.binarySearch(lineStarts, offset)
+      val lineIndex =
+        if indexInLineStarts >= 0 then indexInLineStarts
+        else -indexInLineStarts - 2
+      SourcePos(lineIndex + 1, offset - lineStarts(lineIndex) + 1)
+
     private def parseError(message: String): Nothing =
-      throw new EvalError(s"$message at offset $index")
+      throw EvalError.at(message, positionFor(index))

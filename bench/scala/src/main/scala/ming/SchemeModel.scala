@@ -5,11 +5,21 @@ import scala.collection.mutable
 private[ming] object SchemeModel:
 
   enum Expr:
-    case IntegerLiteral(value: BigInt)
-    case BooleanLiteral(value: Boolean)
-    case StringLiteral(value: String)
-    case Symbol(name: String)
-    case ListExpr(items: List[Expr])
+    case IntegerLiteral(value: BigInt, pos: SourcePos)
+    case BooleanLiteral(value: Boolean, pos: SourcePos)
+    case StringLiteral(value: String, pos: SourcePos)
+    case Symbol(name: String, pos: SourcePos)
+    case ListExpr(items: List[Expr], pos: SourcePos)
+
+  extension (expr: Expr)
+
+    def pos: SourcePos =
+      expr match
+        case Expr.IntegerLiteral(_, pos) => pos
+        case Expr.BooleanLiteral(_, pos) => pos
+        case Expr.StringLiteral(_, pos)  => pos
+        case Expr.Symbol(_, pos)         => pos
+        case Expr.ListExpr(_, pos)       => pos
 
   enum Value:
     case IntegerValue(value: BigInt)

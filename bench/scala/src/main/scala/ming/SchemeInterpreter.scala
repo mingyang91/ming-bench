@@ -17,33 +17,41 @@ object SchemeInterpreter:
     evalSequence(expressions, baseEnv())
 
   private def eval(expr: Expr, env: Env): Value =
-    expr match
-      case Expr.IntegerLiteral(value) => Value.IntegerValue(value)
-      case Expr.BooleanLiteral(value) => Value.BooleanValue(value)
-      case Expr.StringLiteral(value)  => Value.StringValue(value)
-      case Expr.Symbol(name)          => env.lookup(name)
-      case Expr.ListExpr(Nil) =>
-        throw new EvalError("cannot evaluate an empty list")
-      case Expr.ListExpr(Expr.Symbol("quote") :: args) =>
-        evalQuote(args)
-      case Expr.ListExpr(Expr.Symbol("if") :: args) =>
-        evalIf(args, env)
-      case Expr.ListExpr(Expr.Symbol("define") :: args) =>
-        evalDefine(args, env)
-      case Expr.ListExpr(Expr.Symbol("lambda") :: args) =>
-        evalLambda(args, env)
-      case Expr.ListExpr(Expr.Symbol("and") :: rest) =>
-        evalAnd(rest, env)
-      case Expr.ListExpr(Expr.Symbol("or") :: rest) =>
-        evalOr(rest, env)
-      case Expr.ListExpr(Expr.Symbol("begin") :: rest) =>
-        evalBegin(rest, env)
-      case Expr.ListExpr(Expr.Symbol("cond") :: rest) =>
-        evalCond(rest, env)
-      case Expr.ListExpr(Expr.Symbol("let") :: rest) =>
-        evalLet(rest, env)
-      case Expr.ListExpr(operator :: args) =>
-        apply(eval(operator, env), args.map(arg => eval(arg, env)))
+    withErrorContext(expr.pos) {
+      expr match
+        case Expr.IntegerLiteral(value, _) => Value.IntegerValue(value)
+        case Expr.BooleanLiteral(value, _) => Value.BooleanValue(value)
+        case Expr.StringLiteral(value, _)  => Value.StringValue(value)
+        case Expr.Symbol(name, _)          => env.lookup(name)
+        case Expr.ListExpr(Nil, _) =>
+          throw new EvalError("cannot evaluate an empty list")
+        case Expr.ListExpr(Expr.Symbol("quote", _) :: args, _) =>
+          evalQuote(args)
+        case Expr.ListExpr(Expr.Symbol("if", _) :: args, _) =>
+          evalIf(args, env)
+        case Expr.ListExpr(Expr.Symbol("define", _) :: args, _) =>
+          evalDefine(args, env)
+        case Expr.ListExpr(Expr.Symbol("lambda", _) :: args, _) =>
+          evalLambda(args, env)
+        case Expr.ListExpr(Expr.Symbol("and", _) :: rest, _) =>
+          evalAnd(rest, env)
+        case Expr.ListExpr(Expr.Symbol("or", _) :: rest, _) =>
+          evalOr(rest, env)
+        case Expr.ListExpr(Expr.Symbol("begin", _) :: rest, _) =>
+          evalBegin(rest, env)
+        case Expr.ListExpr(Expr.Symbol("cond", _) :: rest, _) =>
+          evalCond(rest, env)
+        case Expr.ListExpr(Expr.Symbol("let", _) :: rest, _) =>
+          evalLet(rest, env)
+        case Expr.ListExpr(operator :: args, _) =>
+          apply(eval(operator, env), args.map(arg => eval(arg, env)))
+    }
+
+  private def withErrorContext[T](pos: SourcePos)(thunk: => T): T =
+    try thunk
+    catch
+      case error: EvalError if error.position.isEmpty =>
+        throw error.withPosition(pos)
 
   private def evalQuote(args: List[Expr]): Value =
     args match
@@ -61,10 +69,10 @@ object SchemeInterpreter:
 
   private def evalDefine(args: List[Expr], env: Env): Value =
     args match
-      case Expr.Symbol(name) :: valueExpr :: Nil =>
+      case Expr.Symbol(name, _) :: valueExpr :: Nil =>
         env.define(name, eval(valueExpr, env))
         Value.VoidValue
-      case Expr.ListExpr(Expr.Symbol(name) :: params) :: body if body.nonEmpty =>
+      case Expr.ListExpr(Expr.Symbol(name, _) :: params, _) :: body if body.nonEmpty =>
         env.define(name, buildClosure(params, body, env, Some(name)))
         Value.VoidValue
       case _ =>
@@ -72,7 +80,7 @@ object SchemeInterpreter:
 
   private def evalLambda(args: List[Expr], env: Env): Value =
     args match
-      case Expr.ListExpr(params) :: body if body.nonEmpty =>
+      case Expr.ListExpr(params, _) :: body if body.nonEmpty =>
         buildClosure(params, body, env, None)
       case _ =>
         throw new EvalError("invalid lambda form")
@@ -86,12 +94,12 @@ object SchemeInterpreter:
       remaining match
         case Nil =>
           Value.VoidValue
-        case Expr.ListExpr(Nil) :: _ =>
+        case Expr.ListExpr(Nil, _) :: _ =>
           throw new EvalError("cond clauses must be non-empty lists")
-        case Expr.ListExpr(Expr.Symbol("else") :: expressions) :: tail =>
+        case Expr.ListExpr(Expr.Symbol("else", _) :: expressions, _) :: tail =>
           if tail.nonEmpty then throw new EvalError("cond else clause must be last")
           evalSequence(expressions, env)
-        case Expr.ListExpr(testExpr :: expressions) :: tail =>
+        case Expr.ListExpr(testExpr :: expressions, _) :: tail =>
           val testValue = eval(testExpr, env)
           if isTruthy(testValue) then if expressions.isEmpty then testValue else evalSequence(expressions, env)
           else loop(tail)
@@ -102,7 +110,7 @@ object SchemeInterpreter:
 
   private def evalLet(args: List[Expr], env: Env): Value =
     args match
-      case Expr.Symbol(name) :: bindingsExpr :: body if body.nonEmpty =>
+      case Expr.Symbol(name, _) :: bindingsExpr :: body if body.nonEmpty =>
         evalNamedLet(name, bindingsExpr, body, env)
       case bindingsExpr :: body if body.nonEmpty =>
         evalPlainLet(bindingsExpr, body, env)
@@ -136,11 +144,11 @@ object SchemeInterpreter:
 
   private def parseBindings(bindingsExpr: Expr): List[(String, Expr)] =
     bindingsExpr match
-      case Expr.ListExpr(bindings) =>
+      case Expr.ListExpr(bindings, _) =>
         val parsed = bindings.map {
-          case Expr.ListExpr(List(Expr.Symbol(name), valueExpr)) =>
+          case Expr.ListExpr(List(Expr.Symbol(name, _), valueExpr), _) =>
             (name, valueExpr)
-          case Expr.ListExpr(List(_, _)) =>
+          case Expr.ListExpr(List(_, _), _) =>
             throw new EvalError("let bindings must have symbol names")
           case _ =>
             throw new EvalError("let bindings must contain (name value) pairs")
@@ -157,19 +165,19 @@ object SchemeInterpreter:
     name: Option[String]
   ): Value =
     val params = paramsExpr.map {
-      case Expr.Symbol(paramName) => paramName
-      case _                      => throw new EvalError("lambda parameters must be symbols")
+      case Expr.Symbol(paramName, _) => paramName
+      case _                         => throw new EvalError("lambda parameters must be symbols")
     }
     ensureDistinct(params, "lambda parameters")
     Value.Closure(name, params, body, env)
 
   private def quoteExpr(expr: Expr): Value =
     expr match
-      case Expr.IntegerLiteral(value) => Value.IntegerValue(value)
-      case Expr.BooleanLiteral(value) => Value.BooleanValue(value)
-      case Expr.StringLiteral(value)  => Value.StringValue(value)
-      case Expr.Symbol(name)          => Value.SymbolValue(name)
-      case Expr.ListExpr(items) =>
+      case Expr.IntegerLiteral(value, _) => Value.IntegerValue(value)
+      case Expr.BooleanLiteral(value, _) => Value.BooleanValue(value)
+      case Expr.StringLiteral(value, _)  => Value.StringValue(value)
+      case Expr.Symbol(name, _)          => Value.SymbolValue(name)
+      case Expr.ListExpr(items, _) =>
         makeList(items.map(quoteExpr))
 
   private def evalAnd(args: List[Expr], env: Env): Value =
