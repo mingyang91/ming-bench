@@ -91,6 +91,12 @@ pub enum EvalError {
         found: &'static str,
     },
 
+    #[error("{name} invalid argument: {message}")]
+    InvalidArgument {
+        name: &'static str,
+        message: &'static str,
+    },
+
     #[error("{name} index out of bounds: {index}")]
     IndexOutOfBounds { name: &'static str, index: i64 },
 
