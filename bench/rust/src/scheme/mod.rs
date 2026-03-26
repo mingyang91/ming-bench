@@ -453,6 +453,7 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "string-ref" => return eval_string_ref(&items[1..], env),
                     "string-copy" => return eval_string_copy(&items[1..], env),
                     "string-set!" => return eval_string_set(&items[1..], env),
+                    "set!" => return eval_set(&items[1..], env),
                     _ => {}
                 }
             }
@@ -522,6 +523,21 @@ fn eval_define(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         }
         _ => Err(EvalError::Parse("define: first argument must be symbol or list".into())),
     }
+}
+
+fn eval_set(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity("set! requires exactly 2 arguments".into()));
+    }
+    let name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Parse("set!: first argument must be a symbol".into())),
+    };
+    let val = eval(&args[1], env)?;
+    if !env.set_existing(&name, val) {
+        return Err(EvalError::UnboundVariable(name));
+    }
+    Ok(Value::Void)
 }
 
 fn eval_if(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
