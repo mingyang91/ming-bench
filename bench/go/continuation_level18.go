@@ -168,6 +168,14 @@ func (m *level18Machine) evalSequence(environment *env, forms []expr, cont level
 	}
 }
 
+func (m *level18Machine) continueStep(step evalStep, cont level18Cont) {
+	if step.tail {
+		m.eval(step.nextEnv, step.nextForm, cont)
+		return
+	}
+	m.returnValue(step.value, cont)
+}
+
 func (m *level18Machine) returnValue(value expr, cont level18Cont) {
 	m.evaluating = false
 	m.value = value
@@ -430,6 +438,13 @@ func (m *level18Machine) stepList(items listExpr) error {
 		switch operator.name {
 		case "define":
 			return m.stepDefine(environment, items.items[1:], operator.pos)
+		case "define-record-type":
+			value, err := evalDefineRecordType(environment, items.items[1:])
+			if err != nil {
+				return attachPos(err, operator.pos)
+			}
+			m.returnValue(value, m.cont)
+			return nil
 		case "define-syntax":
 			value, err := evalDefineSyntax(environment, items.items[1:])
 			if err != nil {
@@ -454,6 +469,20 @@ func (m *level18Machine) stepList(items listExpr) error {
 				return attachPos(err, operator.pos)
 			}
 			m.eval(environment, expanded, m.cont)
+			return nil
+		case "do":
+			step, err := evalDo(environment, items.items[1:])
+			if err != nil {
+				return attachPos(err, operator.pos)
+			}
+			m.continueStep(step, m.cont)
+			return nil
+		case "case":
+			step, err := evalCase(environment, items.items[1:])
+			if err != nil {
+				return attachPos(err, operator.pos)
+			}
+			m.continueStep(step, m.cont)
 			return nil
 		case "guard":
 			if currentBenchLevel() >= 20 {
@@ -484,11 +513,7 @@ func (m *level18Machine) stepList(items listExpr) error {
 			if err != nil {
 				return attachPos(err, operator.pos)
 			}
-			if step.tail {
-				m.eval(step.nextEnv, step.nextForm, m.cont)
-			} else {
-				m.returnValue(step.value, m.cont)
-			}
+			m.continueStep(step, m.cont)
 			return nil
 		case "lambda":
 			value, err := evalLambda(environment, items.items[1:])
@@ -521,6 +546,27 @@ func (m *level18Machine) stepList(items listExpr) error {
 				return err
 			}
 			m.returnValue(value, m.cont)
+			return nil
+		case "let*":
+			step, err := evalLetStar(environment, items.items[1:])
+			if err != nil {
+				return attachPos(err, operator.pos)
+			}
+			m.continueStep(step, m.cont)
+			return nil
+		case "letrec":
+			step, err := evalLetrec(environment, items.items[1:], false)
+			if err != nil {
+				return attachPos(err, operator.pos)
+			}
+			m.continueStep(step, m.cont)
+			return nil
+		case "letrec*":
+			step, err := evalLetrec(environment, items.items[1:], true)
+			if err != nil {
+				return attachPos(err, operator.pos)
+			}
+			m.continueStep(step, m.cont)
 			return nil
 		}
 
@@ -816,10 +862,7 @@ applyLoop:
 				return nil
 			}
 		case *continuationExpr:
-			if len(args) != 1 {
-				return &EvalError{Message: "continuation expects exactly 1 argument"}
-			}
-			return m.invokeContinuation(callable, args[0])
+			return m.invokeContinuation(callable, makeValuesExpr(args))
 		case closureExpr:
 			if !callable.variadic && len(args) != len(callable.params) {
 				return &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(callable.params), len(args))}

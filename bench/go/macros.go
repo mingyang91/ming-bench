@@ -116,9 +116,8 @@ func compileSyntaxRules(environment *env, macroName string, form expr) (macroExp
 			return macroExpr{}, &EvalError{Message: "syntax-rules patterns must be non-empty lists"}
 		}
 
-		patternHead, ok := pattern.items[0].(symbolExpr)
-		if !ok || patternHead.name != macroName {
-			return macroExpr{}, &EvalError{Message: "syntax-rules pattern must start with the macro name"}
+		if _, ok := pattern.items[0].(symbolExpr); !ok {
+			return macroExpr{}, &EvalError{Message: "syntax-rules pattern must start with an identifier"}
 		}
 
 		rules = append(rules, macroRule{
@@ -265,13 +264,11 @@ func matchMacroPattern(pattern listExpr, call listExpr, literals map[string]stru
 		return false
 	}
 
-	patternHead, ok := pattern.items[0].(symbolExpr)
-	if !ok {
+	if _, ok := pattern.items[0].(symbolExpr); !ok {
 		return false
 	}
 
-	callHead, ok := call.items[0].(symbolExpr)
-	if !ok || callHead.name != patternHead.name {
+	if _, ok := call.items[0].(symbolExpr); !ok {
 		return false
 	}
 
@@ -438,6 +435,9 @@ func expandIntroducedBindingForm(list listExpr, ctx templateContext, repeatIndex
 	if expanded, handled, err := expandIntroducedLet(list, ctx, repeatIndex); handled || err != nil {
 		return expanded, handled, err
 	}
+	if expanded, handled, err := expandIntroducedGuard(list, ctx, repeatIndex); handled || err != nil {
+		return expanded, handled, err
+	}
 	return nil, false, nil
 }
 
@@ -548,6 +548,49 @@ func expandIntroducedLet(list listExpr, ctx templateContext, repeatIndex *int) (
 	}
 	items = append(items, body...)
 
+	return listExpr{items: items, pos: list.pos}, true, nil
+}
+
+func expandIntroducedGuard(list listExpr, ctx templateContext, repeatIndex *int) (expr, bool, error) {
+	if len(list.items) < 3 || !isPlainTemplateIdentifier(list.items[0], "guard", ctx.bindings) {
+		return nil, false, nil
+	}
+
+	head, err := expandTemplate(list.items[0], ctx, repeatIndex)
+	if err != nil {
+		return nil, true, err
+	}
+
+	rawHeader, ok := list.items[1].(listExpr)
+	if !ok || len(rawHeader.items) == 0 {
+		return nil, true, &EvalError{Message: "macro-generated guard header must be a non-empty list"}
+	}
+
+	renamed := copyRenameMap(ctx.renamed)
+	name, err := expandBindingIdentifier(rawHeader.items[0], ctx, repeatIndex, renamed)
+	if err != nil {
+		return nil, true, err
+	}
+
+	clauseCtx := ctxWithRenamed(ctx, renamed)
+	headerItems := make([]expr, 0, len(rawHeader.items))
+	headerItems = append(headerItems, name)
+	for _, rawClause := range rawHeader.items[1:] {
+		clause, err := expandTemplate(rawClause, clauseCtx, repeatIndex)
+		if err != nil {
+			return nil, true, err
+		}
+		headerItems = append(headerItems, clause)
+	}
+
+	body, err := expandBodyForms(list.items[2:], ctx, repeatIndex)
+	if err != nil {
+		return nil, true, err
+	}
+
+	items := make([]expr, 0, len(body)+2)
+	items = append(items, head, listExpr{items: headerItems, pos: rawHeader.pos})
+	items = append(items, body...)
 	return listExpr{items: items, pos: list.pos}, true, nil
 }
 
