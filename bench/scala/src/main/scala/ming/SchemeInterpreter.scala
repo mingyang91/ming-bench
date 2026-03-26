@@ -1,5 +1,6 @@
 package ming
 
+import SchemeBuiltinSupport.*
 import SchemeModel.*
 import SchemeRuntime.*
 
@@ -50,7 +51,7 @@ object SchemeInterpreter:
         case Expr.ListExpr(Expr.Symbol("let", _) :: rest, _) =>
           evalLet(rest, env)
         case Expr.ListExpr(operator :: args, _) =>
-          apply(eval(operator, env), args.map(arg => eval(arg, env)))
+          applyProcedure(eval(operator, env), args.map(arg => eval(arg, env)))
     }
 
   private def withErrorContext[T](pos: SourcePos)(thunk: => T): T =
@@ -151,7 +152,7 @@ object SchemeInterpreter:
       eval(valueExpr, env)
     }
     val letEnv                 = new Env(Some(env))
-    val closure: Value.Closure = Value.Closure(Some(name), params, body, letEnv)
+    val closure: Value.Closure = Value.Closure(Some(name), params, None, body, letEnv)
 
     letEnv.define(name, closure)
     applyClosure(closure, args)
@@ -178,12 +179,29 @@ object SchemeInterpreter:
     env: Env,
     name: Option[String]
   ): Value =
-    val params = paramsExpr.map {
-      case Expr.Symbol(paramName, _) => paramName
-      case _                         => throw new EvalError("lambda parameters must be symbols")
+    val (fixedParams, restParam) = parseClosureParams(paramsExpr)
+    ensureDistinct(fixedParams ++ restParam.toList, "lambda parameters")
+    Value.Closure(name, fixedParams, restParam, body, env)
+
+  private def parseClosureParams(paramsExpr: List[Expr]): (List[String], Option[String]) =
+    val dotIndex = paramsExpr.indexWhere {
+      case Expr.Symbol(".", _) => true
+      case _                   => false
     }
-    ensureDistinct(params, "lambda parameters")
-    Value.Closure(name, params, body, env)
+
+    if dotIndex < 0 then (paramsExpr.map(requireParamName), None)
+    else
+      val fixedParams = paramsExpr.take(dotIndex).map(requireParamName)
+      paramsExpr.drop(dotIndex) match
+        case Expr.Symbol(".", _) :: Expr.Symbol(restName, _) :: Nil if restName != "." =>
+          (fixedParams, Some(restName))
+        case _ =>
+          throw new EvalError("invalid lambda parameter list")
+
+  private def requireParamName(expr: Expr): String =
+    expr match
+      case Expr.Symbol(name, _) if name != "." => name
+      case _                                   => throw new EvalError("lambda parameters must be symbols")
 
   private def quoteExpr(expr: Expr): Value =
     expr match
@@ -219,7 +237,7 @@ object SchemeInterpreter:
 
     loop(args, Value.BooleanValue(false))
 
-  private def apply(procedure: Value, args: List[Value]): Value =
+  private[ming] def applyProcedure(procedure: Value, args: List[Value]): Value =
     procedure match
       case Value.Builtin(_, implementation) => implementation(args)
       case closure: Value.Closure           => applyClosure(closure, args)
@@ -227,10 +245,19 @@ object SchemeInterpreter:
         throw new EvalError(s"not a procedure: ${render(other)}")
 
   private def applyClosure(closure: Value.Closure, args: List[Value]): Value =
-    requireArgCount(closure.name.getOrElse("lambda"), args, closure.params.length)
+    val name = closure.name.getOrElse("lambda")
+    closure.restParam match
+      case Some(_) =>
+        requireMinArgCount(name, args, closure.fixedParams.length)
+      case None =>
+        requireArgCount(name, args, closure.fixedParams.length)
+
     val callEnv = new Env(Some(closure.env))
-    closure.params.zip(args).foreach { case (name, value) =>
+    closure.fixedParams.zip(args).foreach { case (name, value) =>
       callEnv.define(name, value)
+    }
+    closure.restParam.foreach { restName =>
+      callEnv.define(restName, makeList(args.drop(closure.fixedParams.length)))
     }
     evalSequence(closure.body, callEnv)
 

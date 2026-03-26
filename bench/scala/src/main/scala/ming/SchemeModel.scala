@@ -63,7 +63,14 @@ private[ming] object SchemeModel:
     case NilValue
     case PairValue(car: Value, cdr: Value)
     case Builtin(name: String, implementation: List[Value] => Value)
-    case Closure(name: Option[String], params: List[String], body: List[Expr], env: Env)
+
+    case Closure(
+      name: Option[String],
+      fixedParams: List[String],
+      restParam: Option[String],
+      body: List[Expr],
+      env: Env
+    )
     case VoidValue
 
   final class Env(parent: Option[Env]):

@@ -28,9 +28,9 @@ private[ming] object SchemeRuntime:
       case Value.NilValue             => "()"
       case pair: Value.PairValue      => renderPair(pair, render)
       case Value.Builtin(name, _)     => s"#<procedure:$name>"
-      case Value.Closure(Some(name), _, _, _) =>
+      case Value.Closure(Some(name), _, _, _, _) =>
         s"#<procedure:$name>"
-      case Value.Closure(None, _, _, _) =>
+      case Value.Closure(None, _, _, _, _) =>
         "#<procedure>"
       case Value.VoidValue =>
         "#<void>"

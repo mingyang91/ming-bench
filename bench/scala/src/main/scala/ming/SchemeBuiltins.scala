@@ -91,6 +91,15 @@ private[ming] object SchemeBuiltins:
     "append" -> Value.Builtin(
       "append",
       args => appendValues(args)
+    ),
+    "apply" -> Value.Builtin(
+      "apply",
+      args =>
+        requireMinArgCount("apply", args, 2)
+        val procedure  = args.head
+        val prefixArgs = args.slice(1, args.length - 1)
+        val listArgs   = properListElements("apply", args.last)
+        SchemeInterpreter.applyProcedure(procedure, prefixArgs ++ listArgs)
     )
   )
 
