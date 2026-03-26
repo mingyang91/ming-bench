@@ -71,6 +71,12 @@ class Env {
   set(name: string, val: SchemeVal): void {
     this.bindings.set(name, val);
   }
+
+  update(name: string, val: SchemeVal, pos?: Pos): void {
+    if (this.bindings.has(name)) { this.bindings.set(name, val); return; }
+    if (this.parent) { this.parent.update(name, val, pos); return; }
+    throw new EvalError(`${posStr(pos)}unbound variable: ${name}`);
+  }
 }
 
 // ── Tokenizer ──────────────────────────────────────────────────────
@@ -455,6 +461,14 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         });
         const body = elems.slice(2);
         return { tag: 'lambda', params, body, env };
+      }
+      case 'set!': {
+        if (elems.length !== 3) throw new EvalError(`${posStr(expr.pos)}set!: wrong number of arguments`);
+        const target = elems[1];
+        if (target.tag !== 'symbol') throw new EvalError(`${posStr(expr.pos)}set!: target must be a symbol`);
+        const val = evaluate(elems[2], env);
+        env.update(target.value, val, expr.pos);
+        return { tag: 'void' };
       }
       case 'begin': {
         if (elems.length < 2) throw new EvalError(`${posStr(expr.pos)}begin: need at least 1 expression`);
