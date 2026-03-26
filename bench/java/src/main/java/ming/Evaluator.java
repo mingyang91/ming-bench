@@ -20,7 +20,7 @@ public class Evaluator {
     static final Object NIL = new Object() {
         @Override public String toString() { return "()"; }
     };
-    record Lambda(List<String> params, List<Object> body, Env closure) {}
+    record Lambda(List<String> params, String restParam, List<Object> body, Env closure) {}
     record SchemeChar(char value) {}
     record Builtin(String name) {}
     record Token(Object value, int line, int col) {}
@@ -52,7 +52,8 @@ public class Evaluator {
         "string-append", "string-length", "substring",
         "string->number", "number->string",
         "symbol->string", "string->symbol",
-        "string-ref", "string-set!", "string-copy"
+        "string-ref", "string-set!", "string-copy",
+        "apply"
     };
 
     private final Env globalEnv;
@@ -282,21 +283,28 @@ public class Evaluator {
                             env.define(name, val);
                             return val;
                         } else if (target instanceof List<?> sig) {
-                            // (define (f params...) body...)
+                            // (define (f params...) body...) or (define (f params... . rest) body...)
                             Object rawFirst = sig.getFirst();
                             if (rawFirst instanceof Located lf) rawFirst = lf.expr();
                             String name = (String) rawFirst;
                             List<String> params = new ArrayList<>();
+                            String restParam = null;
                             for (int i = 1; i < sig.size(); i++) {
                                 Object p = sig.get(i);
                                 if (p instanceof Located lp) p = lp.expr();
+                                if (".".equals(p)) {
+                                    Object rp = sig.get(i + 1);
+                                    if (rp instanceof Located lrp) rp = lrp.expr();
+                                    restParam = (String) rp;
+                                    break;
+                                }
                                 params.add((String) p);
                             }
                             List<Object> body = new ArrayList<>();
                             for (int i = 2; i < list.size(); i++) {
                                 body.add(list.get(i));
                             }
-                            Lambda lambda = new Lambda(params, body, env);
+                            Lambda lambda = new Lambda(params, restParam, body, env);
                             env.define(name, lambda);
                             return lambda;
                         }
@@ -330,11 +338,22 @@ public class Evaluator {
                         Object paramSpec = list.get(1);
                         if (paramSpec instanceof Located lp) paramSpec = lp.expr();
                         List<String> params = new ArrayList<>();
+                        String restParam = null;
                         if (paramSpec instanceof List<?> plist) {
-                            for (Object p : plist) {
+                            for (int pi = 0; pi < plist.size(); pi++) {
+                                Object p = plist.get(pi);
                                 if (p instanceof Located lpp) p = lpp.expr();
+                                if (".".equals(p)) {
+                                    Object rp = plist.get(pi + 1);
+                                    if (rp instanceof Located lrp) rp = lrp.expr();
+                                    restParam = (String) rp;
+                                    break;
+                                }
                                 params.add((String) p);
                             }
+                        } else if (paramSpec instanceof String singleRest) {
+                            // (lambda args body) - single rest param
+                            restParam = singleRest;
                         } else {
                             throw new EvalError("lambda: bad parameter list");
                         }
@@ -342,7 +361,7 @@ public class Evaluator {
                         for (int i = 2; i < list.size(); i++) {
                             body.add(list.get(i));
                         }
-                        return new Lambda(params, body, env);
+                        return new Lambda(params, restParam, body, env);
                     }
                     case "and" -> {
                         Object result = Boolean.TRUE;
@@ -390,7 +409,7 @@ public class Evaluator {
                             List<Object> body = new ArrayList<>();
                             for (int i = 3; i < list.size(); i++) body.add(list.get(i));
                             Env letEnv = new Env(env);
-                            Lambda loopLambda = new Lambda(params, body, letEnv);
+                            Lambda loopLambda = new Lambda(params, null, body, letEnv);
                             letEnv.define(loopName, loopLambda);
                             return apply(loopLambda, inits);
                         }
@@ -450,12 +469,26 @@ public class Evaluator {
 
     private Object apply(Object proc, List<Object> args) throws EvalError {
         if (proc instanceof Lambda lambda) {
-            if (args.size() != lambda.params().size()) {
-                throw new EvalError("wrong number of arguments: expected " + lambda.params().size() + ", got " + args.size());
+            int nParams = lambda.params().size();
+            if (lambda.restParam() != null) {
+                if (args.size() < nParams) {
+                    throw new EvalError("wrong number of arguments: expected at least " + nParams + ", got " + args.size());
+                }
+            } else {
+                if (args.size() != nParams) {
+                    throw new EvalError("wrong number of arguments: expected " + nParams + ", got " + args.size());
+                }
             }
             Env callEnv = new Env(lambda.closure());
-            for (int i = 0; i < lambda.params().size(); i++) {
+            for (int i = 0; i < nParams; i++) {
                 callEnv.define(lambda.params().get(i), args.get(i));
+            }
+            if (lambda.restParam() != null) {
+                Object rest = NIL;
+                for (int i = args.size() - 1; i >= nParams; i--) {
+                    rest = new Pair(args.get(i), rest);
+                }
+                callEnv.define(lambda.restParam(), rest);
             }
             Object result = null;
             for (Object bodyExpr : lambda.body()) {
@@ -697,6 +730,23 @@ public class Evaluator {
                     yield new SchemeString(ss.value());
                 }
                 throw new EvalError("string-copy: not a string");
+            }
+            case "apply" -> {
+                if (args.size() < 2) throw new EvalError("apply: need at least two arguments");
+                Object proc = args.get(0);
+                // Last argument must be a list; prefix args are prepended
+                Object lastArg = args.get(args.size() - 1);
+                List<Object> callArgs = new ArrayList<>();
+                for (int i = 1; i < args.size() - 1; i++) {
+                    callArgs.add(args.get(i));
+                }
+                // Unpack the last argument (a list)
+                Object cur = lastArg;
+                while (cur instanceof Pair p) {
+                    callArgs.add(p.car());
+                    cur = p.cdr();
+                }
+                yield apply(proc, callArgs);
             }
             default -> throw new EvalError("unbound variable: " + op);
         };
