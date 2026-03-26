@@ -1,5 +1,7 @@
 package ming
 
+import scala.annotation.tailrec
+
 import SchemeBuiltinSupport.*
 import SchemeEvaluatorState.*
 import SchemeModel.*
@@ -14,10 +16,10 @@ private[ming] object SchemeEvaluator
   private val finalContinuation: Continuation = value => done(value)
 
   def evalSequence(expressions: List[Expr], env: Env): Value =
-    run(evalSequence(expressions, env, finalContinuation))
+    withFreshDynamicContext(run(evalSequence(expressions, env, finalContinuation)))
 
   def applyProcedure(procedure: Value, args: List[Value]): Value =
-    run(applyProcedure(procedure, args, finalContinuation, None))
+    withFreshDynamicContext(run(applyProcedure(procedure, args, finalContinuation, None)))
 
   override protected def eval(expr: Expr, env: Env, continuation: Continuation): Computation =
     evalExpr(expr, env, continuation)
@@ -43,17 +45,18 @@ private[ming] object SchemeEvaluator
       case error: EvalError if error.position.isEmpty =>
         throw error.withPosition(pos)
 
-  private def run(initial: Computation): Value =
-    var current = initial
+  private def withFreshDynamicContext(runEvaluation: => Value): Value =
+    resetDynamicContext()
+    try runEvaluation
+    finally resetDynamicContext()
 
-    while true do
-      current match
-        case Computation.Done(value) =>
-          return value
-        case Computation.Suspend(step) =>
-          current = step()
-
-    throw new IllegalStateException("unreachable")
+  @tailrec
+  private def run(current: Computation): Value =
+    current match
+      case Computation.Done(value) =>
+        value
+      case Computation.Suspend(step) =>
+        run(step())
 
   private def evalExpr(expr: Expr, env: Env, continuation: Continuation): Computation =
     suspend {
@@ -106,22 +109,7 @@ private[ming] object SchemeEvaluator
       withOptionalErrorContext(pos) {
         procedure match
           case builtin @ Value.Builtin(name, implementation) =>
-            capturedContinuation(builtin) match
-              case Some(saved) =>
-                requireArgCount(name, args, 1)
-                suspend(saved(args.head))
-              case None =>
-                name match
-                  case "call/cc" | "call-with-current-continuation" =>
-                    applyCallWithCurrentContinuation(name, args, continuation, pos)
-                  case "apply" =>
-                    applyBuiltinApply(args, continuation, pos)
-                  case "map" =>
-                    applyBuiltinMap(args, continuation, pos)
-                  case "for-each" =>
-                    applyBuiltinForEach(args, continuation, pos)
-                  case _ =>
-                    resume(continuation, implementation(args))
+            applyBuiltinProcedure(builtin, name, implementation, args, continuation, pos)
           case closure: Value.Closure =>
             applyClosure(
               closure.name.getOrElse("lambda"),
@@ -149,6 +137,41 @@ private[ming] object SchemeEvaluator
             throw new EvalError(s"not a procedure: ${SchemeRuntime.render(other)}")
       }
     }
+
+  private def applyBuiltinProcedure(
+    builtin: Value.Builtin,
+    name: String,
+    implementation: List[Value] => Value,
+    args: List[Value],
+    continuation: Continuation,
+    pos: Option[SourcePos]
+  ): Computation =
+    capturedContinuation(builtin) match
+      case Some(saved) =>
+        applyCapturedContinuation(name, saved, args, pos)
+      case None =>
+        applyBuiltinImplementation(name, implementation, args, continuation, pos)
+
+  private def applyBuiltinImplementation(
+    name: String,
+    implementation: List[Value] => Value,
+    args: List[Value],
+    continuation: Continuation,
+    pos: Option[SourcePos]
+  ): Computation =
+    name match
+      case "call/cc" | "call-with-current-continuation" =>
+        applyCallWithCurrentContinuation(name, args, continuation, pos)
+      case "dynamic-wind" =>
+        applyDynamicWind(args, continuation, pos)
+      case "apply" =>
+        applyBuiltinApply(args, continuation, pos)
+      case "map" =>
+        applyBuiltinMap(args, continuation, pos)
+      case "for-each" =>
+        applyBuiltinForEach(args, continuation, pos)
+      case _ =>
+        resume(continuation, implementation(args))
 
   private def evalCompoundExpression(
     list: Expr.ListExpr,

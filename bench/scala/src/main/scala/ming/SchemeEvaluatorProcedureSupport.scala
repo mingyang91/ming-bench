@@ -4,6 +4,7 @@ import java.util.WeakHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 import SchemeBuiltinSupport.*
+import SchemeDynamicContext.*
 import SchemeEvaluatorState.*
 import SchemeModel.*
 import SchemeRuntime.*
@@ -21,12 +22,71 @@ private[ming] trait SchemeEvaluatorProcedureSupport:
     case Complete
     case Step(callArgs: List[Value], nextCursors: List[Value])
 
-  private val capturedContinuations = new WeakHashMap[Value.Builtin, Continuation]()
+  private val capturedContinuations = new WeakHashMap[Value.Builtin, CapturedContinuation]()
 
   private val capturedContinuationImpl: List[Value] => Value =
     _ => throw new IllegalStateException("captured continuation should be handled by the evaluator")
 
   private val nextContinuationId = new AtomicLong()
+
+  final protected def resetDynamicContext(): Unit =
+    SchemeDynamicContext.reset()
+
+  final protected def applyDynamicWind(
+    args: List[Value],
+    continuation: Continuation,
+    pos: Option[SourcePos]
+  ): Computation =
+    requireArgCount("dynamic-wind", args, 3)
+    val List(inThunk, bodyThunk, outThunk) = args
+    val parentContext                      = current
+    val frame                              = newFrame(inThunk, outThunk)
+
+    applyProcedure(
+      inThunk,
+      Nil,
+      _ =>
+        evaluateDynamicWindBody(
+          parentContext,
+          frame,
+          bodyThunk,
+          outThunk,
+          continuation,
+          pos
+        ),
+      pos
+    )
+
+  private def evaluateDynamicWindBody(
+    parentContext: Vector[WindFrame],
+    frame: WindFrame,
+    bodyThunk: Value,
+    outThunk: Value,
+    continuation: Continuation,
+    pos: Option[SourcePos]
+  ): Computation =
+    replace(parentContext :+ frame)
+    applyProcedure(
+      bodyThunk,
+      Nil,
+      bodyValue => exitDynamicWind(parentContext, outThunk, bodyValue, continuation, pos),
+      pos
+    )
+
+  private def exitDynamicWind(
+    parentContext: Vector[WindFrame],
+    outThunk: Value,
+    bodyValue: Value,
+    continuation: Continuation,
+    pos: Option[SourcePos]
+  ): Computation =
+    replace(parentContext)
+    applyProcedure(
+      outThunk,
+      Nil,
+      _ => resume(continuation, bodyValue),
+      pos
+    )
 
   final protected def applyCallWithCurrentContinuation(
     name: String,
@@ -92,7 +152,21 @@ private[ming] trait SchemeEvaluatorProcedureSupport:
 
     loop(args.tail)
 
-  final protected def capturedContinuation(builtin: Value.Builtin): Option[Continuation] =
+  final protected def applyCapturedContinuation(
+    name: String,
+    captured: CapturedContinuation,
+    args: List[Value],
+    pos: Option[SourcePos]
+  ): Computation =
+    requireArgCount(name, args, 1)
+    val List(argument) = args
+    transitionDynamicContext(captured.dynamicContext, pos) {
+      suspend(captured.continuation(argument))
+    }
+
+  final protected def capturedContinuation(
+    builtin: Value.Builtin
+  ): Option[CapturedContinuation] =
     Option(capturedContinuations.get(builtin))
 
   private def nextCursorState(name: String, cursors: List[Value]): CursorState =
@@ -110,5 +184,46 @@ private[ming] trait SchemeEvaluatorProcedureSupport:
       s"continuation:${nextContinuationId.incrementAndGet()}",
       capturedContinuationImpl
     )
-    capturedContinuations.put(builtin, continuation)
+    capturedContinuations.put(
+      builtin,
+      CapturedContinuation(continuation, current)
+    )
     builtin
+
+  private def transitionDynamicContext(
+    targetContext: Vector[WindFrame],
+    pos: Option[SourcePos]
+  )(next: => Computation): Computation =
+    val sourceContext = current
+    val sharedLength  = commonPrefixLength(sourceContext, targetContext)
+
+    def exitFrames(sourceLength: Int): Computation =
+      if sourceLength == sharedLength then enterFrames(sharedLength)
+      else
+        val frame = sourceContext(sourceLength - 1)
+        replace(sourceContext.take(sourceLength - 1))
+        applyProcedure(
+          frame.outThunk,
+          Nil,
+          _ => suspend(exitFrames(sourceLength - 1)),
+          pos
+        )
+
+    def enterFrames(targetIndex: Int): Computation =
+      if targetIndex == targetContext.length then
+        replace(targetContext)
+        next
+      else
+        val frame = targetContext(targetIndex)
+        replace(targetContext.take(targetIndex))
+        applyProcedure(
+          frame.inThunk,
+          Nil,
+          _ =>
+            replace(targetContext.take(targetIndex + 1))
+            suspend(enterFrames(targetIndex + 1))
+          ,
+          pos
+        )
+
+    exitFrames(sourceContext.length)
