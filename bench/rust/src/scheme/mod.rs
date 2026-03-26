@@ -531,6 +531,13 @@ struct EvalContext {
     dynamic_winds: Rc<RefCell<Vec<DynamicWindRef>>>,
     exception_handlers: Rc<RefCell<Vec<ExceptionHandlerRef>>>,
     position: Rc<RefCell<Option<Position>>>,
+    step_budget: Option<StepBudget>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StepBudget {
+    remaining: usize,
+    limit: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -568,7 +575,34 @@ impl Default for EvalContext {
             dynamic_winds: Rc::new(RefCell::new(Vec::new())),
             exception_handlers: Rc::new(RefCell::new(Vec::new())),
             position: Rc::new(RefCell::new(None)),
+            step_budget: None,
         }
+    }
+}
+
+impl EvalContext {
+    fn with_step_limit(max_steps: usize) -> Self {
+        let mut context = Self::default();
+        context.step_budget = Some(StepBudget {
+            remaining: max_steps,
+            limit: max_steps,
+        });
+        context
+    }
+
+    fn consume_eval_step(&mut self) -> Result<(), EvalError> {
+        let Some(budget) = self.step_budget.as_mut() else {
+            return Ok(());
+        };
+
+        if budget.remaining == 0 {
+            return Err(EvalError::StepLimitExceeded {
+                limit: budget.limit,
+            });
+        }
+
+        budget.remaining -= 1;
+        Ok(())
     }
 }
 
@@ -2447,6 +2481,8 @@ fn eval_expr_step(
     env: EnvRef,
     context: &mut EvalContext,
 ) -> Result<EvalStep, EvalError> {
+    context.consume_eval_step()?;
+
     match expr {
         Expr::Number(value) => Ok(EvalStep::Value(Value::Number(value))),
         Expr::Boolean(value) => Ok(EvalStep::Value(Value::Boolean(value))),
@@ -6381,7 +6417,7 @@ fn apply_for_each(args: &[Value], context: &mut EvalContext) -> Result<Value, Ev
     apply_for_each_from_index(args[0].clone(), &lists, 0, context)
 }
 
-fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
+fn eval_program_in_context(input: &str, context: &mut EvalContext) -> Result<Value, EvalError> {
     let mut parser = Parser::new(input);
     let program = parser.parse_program()?;
     if program.is_empty() {
@@ -6389,18 +6425,27 @@ fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
     }
 
     let env = root_env();
-    let mut context = EvalContext::default();
-    let last_value = run_eval_action(
+    run_eval_action(
         EvalAction::Program(TopLevelState {
             remaining: program,
             env: env.clone(),
             macros: MacroEnv::default(),
             expander: MacroExpander::default(),
         }),
-        &mut context,
-    )?;
+        context,
+    )
+}
 
-    Ok((last_value, context.output))
+fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
+    let mut context = EvalContext::default();
+    let value = eval_program_in_context(input, &mut context)?;
+    Ok((value, context.output))
+}
+
+fn eval_program_with_limit(input: &str, max_steps: usize) -> Result<(Value, String), EvalError> {
+    let mut context = EvalContext::with_step_limit(max_steps);
+    let value = eval_program_in_context(input, &mut context)?;
+    Ok((value, context.output))
 }
 
 /// Evaluate one or more Scheme expressions and return the string
@@ -6413,6 +6458,12 @@ fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
 /// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let (value, _) = eval_program(input)?;
+    Ok(value.render())
+}
+
+/// Evaluate Scheme expressions with a fixed expression-dispatch budget.
+pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
+    let (value, _) = eval_program_with_limit(input, max_steps)?;
     Ok(value.render())
 }
 

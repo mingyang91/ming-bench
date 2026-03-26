@@ -157,6 +157,9 @@ pub enum EvalError {
     #[error("expected a single value, got {got}")]
     WrongValueCount { got: usize },
 
+    #[error("step limit exceeded after {limit} steps")]
+    StepLimitExceeded { limit: usize },
+
     #[error("division by zero")]
     DivisionByZero,
 }
