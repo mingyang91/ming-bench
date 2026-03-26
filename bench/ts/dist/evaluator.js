@@ -57,6 +57,17 @@ class Environment {
         }
         throw new EvalError(`unbound symbol: ${name}`);
     }
+    assign(name, value) {
+        if (this.bindings.has(name)) {
+            this.bindings.set(name, value);
+            return;
+        }
+        if (this.parent !== undefined) {
+            this.parent.assign(name, value);
+            return;
+        }
+        throw new EvalError(`unbound symbol: ${name}`);
+    }
 }
 /**
  * Evaluate one or more Scheme expressions and return the string
@@ -321,6 +332,8 @@ function evaluateList(elements, env, context) {
         switch (head.name) {
             case 'define':
                 return evaluateDefine(argExprs, env, context);
+            case 'set!':
+                return evaluateSet(argExprs, env, context);
             case 'if':
                 return evaluateIf(argExprs, env, context);
             case 'quote':
@@ -372,6 +385,18 @@ function evaluateDefine(argExprs, env, context) {
         return VOID_VALUE;
     }
     throw new EvalError('invalid define form');
+}
+function evaluateSet(argExprs, env, context) {
+    if (argExprs.length !== 2) {
+        throw new EvalError('set! expects exactly 2 arguments');
+    }
+    const [target, valueExpr] = argExprs;
+    if (target.kind !== 'symbol') {
+        throw new EvalError('set! expects a symbol target');
+    }
+    const value = evaluateExpr(valueExpr, env, context);
+    env.assign(target.name, value);
+    return VOID_VALUE;
 }
 function evaluateIf(argExprs, env, context) {
     if (argExprs.length !== 3) {

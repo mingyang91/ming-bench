@@ -105,6 +105,20 @@ class Environment {
 
     throw new EvalError(`unbound symbol: ${name}`);
   }
+
+  assign(name: string, value: RuntimeValue): void {
+    if (this.bindings.has(name)) {
+      this.bindings.set(name, value);
+      return;
+    }
+
+    if (this.parent !== undefined) {
+      this.parent.assign(name, value);
+      return;
+    }
+
+    throw new EvalError(`unbound symbol: ${name}`);
+  }
 }
 
 /**
@@ -429,6 +443,8 @@ function evaluateList(elements: Expr[], env: Environment, context: EvalContext):
     switch (head.name) {
       case 'define':
         return evaluateDefine(argExprs, env, context);
+      case 'set!':
+        return evaluateSet(argExprs, env, context);
       case 'if':
         return evaluateIf(argExprs, env, context);
       case 'quote':
@@ -489,6 +505,21 @@ function evaluateDefine(argExprs: Expr[], env: Environment, context: EvalContext
   }
 
   throw new EvalError('invalid define form');
+}
+
+function evaluateSet(argExprs: Expr[], env: Environment, context: EvalContext): RuntimeValue {
+  if (argExprs.length !== 2) {
+    throw new EvalError('set! expects exactly 2 arguments');
+  }
+
+  const [target, valueExpr] = argExprs;
+  if (target.kind !== 'symbol') {
+    throw new EvalError('set! expects a symbol target');
+  }
+
+  const value = evaluateExpr(valueExpr, env, context);
+  env.assign(target.name, value);
+  return VOID_VALUE;
 }
 
 function evaluateIf(argExprs: Expr[], env: Environment, context: EvalContext): RuntimeValue {
