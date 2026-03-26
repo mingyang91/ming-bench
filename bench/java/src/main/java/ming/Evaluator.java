@@ -11,25 +11,15 @@ import java.util.function.Predicate;
  * Agents implement this class.
  */
 public class Evaluator {
-    private static final Map<String, BuiltinProcedure> BUILTINS = createBuiltins();
+    private final Map<String, BuiltinProcedure> builtins = createBuiltins();
+    private StringBuilder outputBuffer;
 
     /**
      * Evaluate one or more Scheme expressions and return the string
      * representation of the last result.
      */
     public String evalStr(String input) throws EvalError {
-        List<SchemeExpression> expressions = new SchemeParser(input).parseProgram();
-        if (expressions.isEmpty()) {
-            throw new EvalError("empty input");
-        }
-
-        Environment environment = createTopLevelEnvironment();
-        SchemeValue result = VoidValue.INSTANCE;
-        for (SchemeExpression expression : expressions) {
-            result = eval(expression, environment);
-        }
-
-        return result.render();
+        return evaluateProgram(input, false).result();
     }
 
     /**
@@ -37,7 +27,28 @@ public class Evaluator {
      * and any captured output from display/write/newline.
      */
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        return new EvalResult(evalStr(input), "");
+        return evaluateProgram(input, true);
+    }
+
+    private EvalResult evaluateProgram(String input, boolean captureOutput) throws EvalError {
+        List<SchemeExpression> expressions = new SchemeParser(input).parseProgram();
+        if (expressions.isEmpty()) {
+            throw new EvalError("empty input");
+        }
+
+        StringBuilder previousOutputBuffer = outputBuffer;
+        outputBuffer = captureOutput ? new StringBuilder() : null;
+        try {
+            Environment environment = createTopLevelEnvironment();
+            SchemeValue result = VoidValue.INSTANCE;
+            for (SchemeExpression expression : expressions) {
+                result = eval(expression, environment);
+            }
+            String output = outputBuffer == null ? "" : outputBuffer.toString();
+            return new EvalResult(result.render(), output);
+        } finally {
+            outputBuffer = previousOutputBuffer;
+        }
     }
 
     private SchemeValue eval(SchemeExpression expression, Environment environment) throws EvalError {
@@ -151,7 +162,7 @@ public class Evaluator {
         throw new EvalError("define: invalid definition target");
     }
 
-    private static Map<String, BuiltinProcedure> createBuiltins() {
+    private Map<String, BuiltinProcedure> createBuiltins() {
         Map<String, BuiltinProcedure> builtins = new HashMap<>();
         builtins.put("+", new BuiltinProcedure("+", Evaluator::applyAdd));
         builtins.put("-", new BuiltinProcedure("-", Evaluator::applySubtract));
@@ -174,6 +185,17 @@ public class Evaluator {
         builtins.put("list", new BuiltinProcedure("list", Evaluator::applyList));
         builtins.put("length", new BuiltinProcedure("length", Evaluator::applyLength));
         builtins.put("append", new BuiltinProcedure("append", Evaluator::applyAppend));
+        builtins.put("display", new BuiltinProcedure("display", this::applyDisplay));
+        builtins.put("write", new BuiltinProcedure("write", this::applyWrite));
+        builtins.put("newline", new BuiltinProcedure("newline", this::applyNewline));
+        builtins.put("string-append", new BuiltinProcedure("string-append", Evaluator::applyStringAppend));
+        builtins.put("string-length", new BuiltinProcedure("string-length", Evaluator::applyStringLength));
+        builtins.put("substring", new BuiltinProcedure("substring", Evaluator::applySubstring));
+        builtins.put("string->number", new BuiltinProcedure("string->number", Evaluator::applyStringToNumber));
+        builtins.put("number->string", new BuiltinProcedure("number->string", Evaluator::applyNumberToString));
+        builtins.put("symbol->string", new BuiltinProcedure("symbol->string", Evaluator::applySymbolToString));
+        builtins.put("string->symbol", new BuiltinProcedure("string->symbol", Evaluator::applyStringToSymbol));
+        builtins.put("string-ref", new BuiltinProcedure("string-ref", Evaluator::applyStringRef));
         builtins.put("string?", new BuiltinProcedure("string?", args -> applyPredicate(args, "string?",
                 value -> value instanceof StringValue)));
         builtins.put("number?", new BuiltinProcedure("number?", args -> applyPredicate(args, "number?",
@@ -184,12 +206,14 @@ public class Evaluator {
                 value -> value instanceof PairValue)));
         builtins.put("symbol?", new BuiltinProcedure("symbol?", args -> applyPredicate(args, "symbol?",
                 value -> value instanceof SymbolValue)));
+        builtins.put("char?", new BuiltinProcedure("char?", args -> applyPredicate(args, "char?",
+                value -> value instanceof CharValue)));
         return Map.copyOf(builtins);
     }
 
-    private static Environment createTopLevelEnvironment() {
+    private Environment createTopLevelEnvironment() {
         Environment environment = new Environment(null);
-        for (Map.Entry<String, BuiltinProcedure> entry : BUILTINS.entrySet()) {
+        for (Map.Entry<String, BuiltinProcedure> entry : builtins.entrySet()) {
             environment.define(entry.getKey(), entry.getValue());
         }
         return environment;
@@ -538,6 +562,83 @@ public class Evaluator {
         return result;
     }
 
+    private SchemeValue applyDisplay(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "display");
+        emit(arguments.getFirst().display());
+        return VoidValue.INSTANCE;
+    }
+
+    private SchemeValue applyWrite(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "write");
+        emit(arguments.getFirst().render());
+        return VoidValue.INSTANCE;
+    }
+
+    private SchemeValue applyNewline(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 0, "newline");
+        emit("\n");
+        return VoidValue.INSTANCE;
+    }
+
+    private static SchemeValue applyStringAppend(List<SchemeValue> arguments) throws EvalError {
+        StringBuilder builder = new StringBuilder();
+        for (SchemeValue argument : arguments) {
+            builder.append(requireString(argument, "string-append"));
+        }
+        return new StringValue(builder.toString());
+    }
+
+    private static SchemeValue applyStringLength(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "string-length");
+        return new IntValue(requireString(arguments.getFirst(), "string-length").length());
+    }
+
+    private static SchemeValue applySubstring(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 3, "substring");
+        String value = requireString(arguments.get(0), "substring");
+        long start = requireInteger(arguments.get(1), "substring");
+        long end = requireInteger(arguments.get(2), "substring");
+        if (start < 0 || end < start || end > value.length()) {
+            throw new EvalError("substring: index out of bounds");
+        }
+        return new StringValue(value.substring((int) start, (int) end));
+    }
+
+    private static SchemeValue applyStringToNumber(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "string->number");
+        String value = requireString(arguments.getFirst(), "string->number");
+        try {
+            return new IntValue(Long.parseLong(value));
+        } catch (NumberFormatException error) {
+            return BoolValue.FALSE;
+        }
+    }
+
+    private static SchemeValue applyNumberToString(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "number->string");
+        return new StringValue(Long.toString(requireInteger(arguments.getFirst(), "number->string")));
+    }
+
+    private static SchemeValue applySymbolToString(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "symbol->string");
+        return new StringValue(requireSymbol(arguments.getFirst(), "symbol->string"));
+    }
+
+    private static SchemeValue applyStringToSymbol(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "string->symbol");
+        return new SymbolValue(requireString(arguments.getFirst(), "string->symbol"));
+    }
+
+    private static SchemeValue applyStringRef(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 2, "string-ref");
+        String value = requireString(arguments.getFirst(), "string-ref");
+        long index = requireInteger(arguments.get(1), "string-ref");
+        if (index < 0 || index >= value.length()) {
+            throw new EvalError("string-ref: index out of bounds");
+        }
+        return new CharValue(value.charAt((int) index));
+    }
+
     private static SchemeValue applyPredicate(
             List<SchemeValue> arguments,
             String name,
@@ -573,6 +674,20 @@ public class Evaluator {
         }
 
         throw new EvalError(procedure + ": expected integer");
+    }
+
+    private static String requireString(SchemeValue value, String procedure) throws EvalError {
+        if (value instanceof StringValue stringValue) {
+            return stringValue.value();
+        }
+        throw new EvalError(procedure + ": expected string");
+    }
+
+    private static String requireSymbol(SchemeValue value, String procedure) throws EvalError {
+        if (value instanceof SymbolValue symbolValue) {
+            return symbolValue.name();
+        }
+        throw new EvalError(procedure + ": expected symbol");
     }
 
     private static PairValue requirePair(SchemeValue value, String procedure) throws EvalError {
@@ -615,6 +730,12 @@ public class Evaluator {
             return boolValue.value();
         }
         return true;
+    }
+
+    private void emit(String text) {
+        if (outputBuffer != null) {
+            outputBuffer.append(text);
+        }
     }
 
     private record Binding(String name, SchemeExpression valueExpression) {

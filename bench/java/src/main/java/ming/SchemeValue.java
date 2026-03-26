@@ -5,6 +5,10 @@ import java.util.List;
 interface SchemeValue {
     String render();
 
+    default String display() {
+        return render();
+    }
+
     static BoolValue booleanValue(boolean value) {
         if (value) {
             return BoolValue.TRUE;
@@ -55,6 +59,11 @@ record StringValue(String value) implements SchemeValue {
         return builder.toString();
     }
 
+    @Override
+    public String display() {
+        return value;
+    }
+
     private void appendEscaped(StringBuilder builder, char current) {
         switch (current) {
             case '\n' -> builder.append("\\n");
@@ -64,6 +73,22 @@ record StringValue(String value) implements SchemeValue {
             case '\\' -> builder.append("\\\\");
             default -> builder.append(current);
         }
+    }
+}
+
+record CharValue(char value) implements SchemeValue {
+    @Override
+    public String render() {
+        return switch (value) {
+            case ' ' -> "#\\space";
+            case '\n' -> "#\\newline";
+            default -> "#\\" + value;
+        };
+    }
+
+    @Override
+    public String display() {
+        return String.valueOf(value);
     }
 }
 
@@ -89,14 +114,23 @@ final class EmptyListValue implements SchemeValue {
 record PairValue(SchemeValue car, SchemeValue cdr) implements SchemeValue {
     @Override
     public String render() {
+        return format(false);
+    }
+
+    @Override
+    public String display() {
+        return format(true);
+    }
+
+    private String format(boolean useDisplay) {
         StringBuilder builder = new StringBuilder();
         builder.append('(');
-        appendContents(builder, this);
+        appendContents(builder, this, useDisplay);
         builder.append(')');
         return builder.toString();
     }
 
-    private static void appendContents(StringBuilder builder, SchemeValue value) {
+    private static void appendContents(StringBuilder builder, SchemeValue value, boolean useDisplay) {
         SchemeValue current = value;
         boolean first = true;
 
@@ -104,15 +138,22 @@ record PairValue(SchemeValue car, SchemeValue cdr) implements SchemeValue {
             if (!first) {
                 builder.append(' ');
             }
-            builder.append(pair.car().render());
+            builder.append(renderValue(pair.car(), useDisplay));
             current = pair.cdr();
             first = false;
         }
 
         if (!(current instanceof EmptyListValue)) {
             builder.append(" . ");
-            builder.append(current.render());
+            builder.append(renderValue(current, useDisplay));
         }
+    }
+
+    private static String renderValue(SchemeValue value, boolean useDisplay) {
+        if (useDisplay) {
+            return value.display();
+        }
+        return value.render();
     }
 }
 
