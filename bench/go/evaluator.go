@@ -38,9 +38,71 @@ type listExpr struct {
 	elements []any
 }
 
+type voidValue struct{}
+
 type parser struct {
 	input string
 	pos   int
+}
+
+type env struct {
+	parent   *env
+	bindings map[string]any
+}
+
+type builtinFunc func(args []any) (any, error)
+
+type builtinProc struct {
+	name string
+	fn   builtinFunc
+}
+
+type closure struct {
+	params []string
+	body   []any
+	env    *env
+}
+
+func newEnv(parent *env) *env {
+	return &env{
+		parent:   parent,
+		bindings: map[string]any{},
+	}
+}
+
+func (e *env) define(name string, value any) {
+	e.bindings[name] = value
+}
+
+func (e *env) lookup(name string) (any, bool) {
+	for scope := e; scope != nil; scope = scope.parent {
+		if value, ok := scope.bindings[name]; ok {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
+func newGlobalEnv() *env {
+	scope := newEnv(nil)
+	scope.define("+", builtinProc{name: "+", fn: builtinAdd})
+	scope.define("-", builtinProc{name: "-", fn: builtinSub})
+	scope.define("*", builtinProc{name: "*", fn: builtinMul})
+	scope.define("/", builtinProc{name: "/", fn: builtinDiv})
+	scope.define("<", builtinProc{name: "<", fn: func(args []any) (any, error) {
+		return builtinCompare(args, func(a, b int64) bool { return a < b })
+	}})
+	scope.define(">", builtinProc{name: ">", fn: func(args []any) (any, error) {
+		return builtinCompare(args, func(a, b int64) bool { return a > b })
+	}})
+	scope.define("=", builtinProc{name: "=", fn: func(args []any) (any, error) {
+		return builtinCompare(args, func(a, b int64) bool { return a == b })
+	}})
+	scope.define("<=", builtinProc{name: "<=", fn: func(args []any) (any, error) {
+		return builtinCompare(args, func(a, b int64) bool { return a <= b })
+	}})
+	scope.define("not", builtinProc{name: "not", fn: builtinNot})
+	return scope
 }
 
 func evalStrInternal(input string) (any, string, error) {
@@ -53,9 +115,10 @@ func evalStrInternal(input string) (any, string, error) {
 		return nil, "", &EvalError{Message: "empty input"}
 	}
 
-	var result any
+	scope := newGlobalEnv()
+	result := any(voidValue{})
 	for _, expr := range exprs {
-		result, err = eval(expr)
+		result, err = eval(scope, expr)
 		if err != nil {
 			return nil, "", err
 		}
@@ -218,7 +281,7 @@ func isDelimiter(ch byte) bool {
 	}
 }
 
-func eval(expr any) (any, error) {
+func eval(scope *env, expr any) (any, error) {
 	switch node := expr.(type) {
 	case int64:
 		return node, nil
@@ -227,57 +290,159 @@ func eval(expr any) (any, error) {
 	case stringExpr:
 		return node.value, nil
 	case symbolExpr:
-		return nil, &EvalError{Message: fmt.Sprintf("unbound variable: %s", node.name)}
+		value, ok := scope.lookup(node.name)
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("unbound variable: %s", node.name)}
+		}
+		return value, nil
 	case listExpr:
-		return evalList(node)
+		return evalList(scope, node)
+	case string:
+		return node, nil
+	case builtinProc:
+		return node, nil
+	case closure:
+		return node, nil
+	case voidValue:
+		return node, nil
 	default:
 		return nil, &EvalError{Message: "unsupported expression"}
 	}
 }
 
-func evalList(expr listExpr) (any, error) {
+func evalList(scope *env, expr listExpr) (any, error) {
 	if len(expr.elements) == 0 {
 		return nil, &EvalError{Message: "cannot evaluate empty list"}
 	}
 
-	head, ok := expr.elements[0].(symbolExpr)
-	if !ok {
-		return nil, &EvalError{Message: "first list element must be a procedure name"}
+	if head, ok := expr.elements[0].(symbolExpr); ok {
+		args := expr.elements[1:]
+		switch head.name {
+		case "define":
+			return evalDefine(scope, args)
+		case "if":
+			return evalIf(scope, args)
+		case "quote":
+			return evalQuote(args)
+		case "lambda":
+			return evalLambda(scope, args)
+		case "and":
+			return evalAnd(scope, args)
+		case "or":
+			return evalOr(scope, args)
+		}
 	}
 
-	args := expr.elements[1:]
-	switch head.name {
-	case "and":
-		return evalAnd(args)
-	case "or":
-		return evalOr(args)
-	case "not":
-		return evalNot(args)
-	case "+":
-		return evalAdd(args)
-	case "-":
-		return evalSub(args)
-	case "*":
-		return evalMul(args)
-	case "/":
-		return evalDiv(args)
-	case "<":
-		return evalCompare(args, func(a, b int64) bool { return a < b })
-	case ">":
-		return evalCompare(args, func(a, b int64) bool { return a > b })
-	case "=":
-		return evalCompare(args, func(a, b int64) bool { return a == b })
-	case "<=":
-		return evalCompare(args, func(a, b int64) bool { return a <= b })
+	proc, err := eval(scope, expr.elements[0])
+	if err != nil {
+		return nil, err
+	}
+
+	args := make([]any, 0, len(expr.elements)-1)
+	for _, argExpr := range expr.elements[1:] {
+		arg, err := eval(scope, argExpr)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, arg)
+	}
+
+	return applyProcedure(proc, args)
+}
+
+func evalDefine(scope *env, args []any) (any, error) {
+	if len(args) < 2 {
+		return nil, &EvalError{Message: "define expects a name and value"}
+	}
+
+	switch target := args[0].(type) {
+	case symbolExpr:
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "define variable form expects exactly 2 arguments"}
+		}
+
+		value, err := eval(scope, args[1])
+		if err != nil {
+			return nil, err
+		}
+		scope.define(target.name, value)
+		return voidValue{}, nil
+	case listExpr:
+		if len(target.elements) == 0 {
+			return nil, &EvalError{Message: "define function form requires a name"}
+		}
+
+		name, ok := target.elements[0].(symbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: "define function name must be a symbol"}
+		}
+
+		params, err := parseParams(target.elements[1:])
+		if err != nil {
+			return nil, err
+		}
+
+		proc := closure{
+			params: params,
+			body:   args[1:],
+			env:    scope,
+		}
+		scope.define(name.name, proc)
+		return voidValue{}, nil
 	default:
-		return nil, &EvalError{Message: fmt.Sprintf("unknown procedure: %s", head.name)}
+		return nil, &EvalError{Message: "define requires a symbol or function signature"}
 	}
 }
 
-func evalAnd(args []any) (any, error) {
+func evalIf(scope *env, args []any) (any, error) {
+	if len(args) != 3 {
+		return nil, &EvalError{Message: "if expects exactly 3 arguments"}
+	}
+
+	cond, err := eval(scope, args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	if isTruthy(cond) {
+		return eval(scope, args[1])
+	}
+	return eval(scope, args[2])
+}
+
+func evalQuote(args []any) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "quote expects exactly 1 argument"}
+	}
+	return quoteDatum(args[0]), nil
+}
+
+func evalLambda(scope *env, args []any) (any, error) {
+	if len(args) < 2 {
+		return nil, &EvalError{Message: "lambda expects parameters and a body"}
+	}
+
+	paramsExpr, ok := args[0].(listExpr)
+	if !ok {
+		return nil, &EvalError{Message: "lambda parameters must be a list"}
+	}
+
+	params, err := parseParams(paramsExpr.elements)
+	if err != nil {
+		return nil, err
+	}
+
+	return closure{
+		params: params,
+		body:   args[1:],
+		env:    scope,
+	}, nil
+}
+
+func evalAnd(scope *env, args []any) (any, error) {
 	result := any(true)
 	for _, arg := range args {
-		value, err := eval(arg)
+		value, err := eval(scope, arg)
 		if err != nil {
 			return nil, err
 		}
@@ -289,10 +454,10 @@ func evalAnd(args []any) (any, error) {
 	return result, nil
 }
 
-func evalOr(args []any) (any, error) {
+func evalOr(scope *env, args []any) (any, error) {
 	result := any(false)
 	for _, arg := range args {
-		value, err := eval(arg)
+		value, err := eval(scope, arg)
 		if err != nil {
 			return nil, err
 		}
@@ -304,22 +469,61 @@ func evalOr(args []any) (any, error) {
 	return result, nil
 }
 
-func evalNot(args []any) (any, error) {
+func parseParams(params []any) ([]string, error) {
+	names := make([]string, 0, len(params))
+	for _, param := range params {
+		name, ok := param.(symbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: "parameter names must be symbols"}
+		}
+		names = append(names, name.name)
+	}
+	return names, nil
+}
+
+func applyProcedure(proc any, args []any) (any, error) {
+	switch callable := proc.(type) {
+	case builtinProc:
+		return callable.fn(args)
+	case closure:
+		if len(args) != len(callable.params) {
+			return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(callable.params), len(args))}
+		}
+
+		callScope := newEnv(callable.env)
+		for i, param := range callable.params {
+			callScope.define(param, args[i])
+		}
+
+		return evalSequence(callScope, callable.body)
+	default:
+		return nil, &EvalError{Message: fmt.Sprintf("expected procedure, got %s", typeName(proc))}
+	}
+}
+
+func evalSequence(scope *env, exprs []any) (any, error) {
+	result := any(voidValue{})
+	for _, expr := range exprs {
+		value, err := eval(scope, expr)
+		if err != nil {
+			return nil, err
+		}
+		result = value
+	}
+	return result, nil
+}
+
+func builtinNot(args []any) (any, error) {
 	if len(args) != 1 {
 		return nil, &EvalError{Message: "not expects exactly 1 argument"}
 	}
-
-	value, err := eval(args[0])
-	if err != nil {
-		return nil, err
-	}
-	return !isTruthy(value), nil
+	return !isTruthy(args[0]), nil
 }
 
-func evalAdd(args []any) (any, error) {
+func builtinAdd(args []any) (any, error) {
 	var sum int64
-	for _, value := range args {
-		n, err := evalInt(value)
+	for _, arg := range args {
+		n, err := expectInt(arg)
 		if err != nil {
 			return nil, err
 		}
@@ -328,12 +532,12 @@ func evalAdd(args []any) (any, error) {
 	return sum, nil
 }
 
-func evalSub(args []any) (any, error) {
+func builtinSub(args []any) (any, error) {
 	if len(args) == 0 {
 		return nil, &EvalError{Message: "- expects at least 1 argument"}
 	}
 
-	first, err := evalInt(args[0])
+	first, err := expectInt(args[0])
 	if err != nil {
 		return nil, err
 	}
@@ -343,8 +547,8 @@ func evalSub(args []any) (any, error) {
 	}
 
 	result := first
-	for _, value := range args[1:] {
-		n, err := evalInt(value)
+	for _, arg := range args[1:] {
+		n, err := expectInt(arg)
 		if err != nil {
 			return nil, err
 		}
@@ -353,10 +557,10 @@ func evalSub(args []any) (any, error) {
 	return result, nil
 }
 
-func evalMul(args []any) (any, error) {
+func builtinMul(args []any) (any, error) {
 	result := int64(1)
-	for _, value := range args {
-		n, err := evalInt(value)
+	for _, arg := range args {
+		n, err := expectInt(arg)
 		if err != nil {
 			return nil, err
 		}
@@ -365,18 +569,18 @@ func evalMul(args []any) (any, error) {
 	return result, nil
 }
 
-func evalDiv(args []any) (any, error) {
+func builtinDiv(args []any) (any, error) {
 	if len(args) < 2 {
 		return nil, &EvalError{Message: "/ expects at least 2 arguments"}
 	}
 
-	result, err := evalInt(args[0])
+	result, err := expectInt(args[0])
 	if err != nil {
 		return nil, err
 	}
 
-	for _, value := range args[1:] {
-		n, err := evalInt(value)
+	for _, arg := range args[1:] {
+		n, err := expectInt(arg)
 		if err != nil {
 			return nil, err
 		}
@@ -389,18 +593,18 @@ func evalDiv(args []any) (any, error) {
 	return result, nil
 }
 
-func evalCompare(args []any, cmp func(a, b int64) bool) (any, error) {
+func builtinCompare(args []any, cmp func(a, b int64) bool) (any, error) {
 	if len(args) < 2 {
 		return nil, &EvalError{Message: "comparison expects at least 2 arguments"}
 	}
 
-	prev, err := evalInt(args[0])
+	prev, err := expectInt(args[0])
 	if err != nil {
 		return nil, err
 	}
 
-	for _, value := range args[1:] {
-		next, err := evalInt(value)
+	for _, arg := range args[1:] {
+		next, err := expectInt(arg)
 		if err != nil {
 			return nil, err
 		}
@@ -413,17 +617,33 @@ func evalCompare(args []any, cmp func(a, b int64) bool) (any, error) {
 	return true, nil
 }
 
-func evalInt(expr any) (int64, error) {
-	value, err := eval(expr)
-	if err != nil {
-		return 0, err
-	}
-
+func expectInt(value any) (int64, error) {
 	n, ok := value.(int64)
 	if !ok {
 		return 0, &EvalError{Message: fmt.Sprintf("expected number, got %s", typeName(value))}
 	}
 	return n, nil
+}
+
+func quoteDatum(expr any) any {
+	switch node := expr.(type) {
+	case int64:
+		return node
+	case bool:
+		return node
+	case stringExpr:
+		return node.value
+	case symbolExpr:
+		return node
+	case listExpr:
+		elements := make([]any, len(node.elements))
+		for i, elem := range node.elements {
+			elements[i] = quoteDatum(elem)
+		}
+		return listExpr{elements: elements}
+	default:
+		return expr
+	}
 }
 
 func isTruthy(value any) bool {
@@ -441,6 +661,14 @@ func typeName(value any) string {
 		return "boolean"
 	case string:
 		return "string"
+	case symbolExpr:
+		return "symbol"
+	case listExpr:
+		return "list"
+	case builtinProc, closure:
+		return "procedure"
+	case voidValue:
+		return "void"
 	default:
 		return "value"
 	}
@@ -448,6 +676,8 @@ func typeName(value any) string {
 
 func formatValue(value any) string {
 	switch v := value.(type) {
+	case voidValue:
+		return ""
 	case int64:
 		return strconv.FormatInt(v, 10)
 	case bool:
@@ -457,6 +687,18 @@ func formatValue(value any) string {
 		return "#f"
 	case string:
 		return strconv.Quote(v)
+	case symbolExpr:
+		return v.name
+	case listExpr:
+		if len(v.elements) == 0 {
+			return "()"
+		}
+
+		parts := make([]string, len(v.elements))
+		for i, elem := range v.elements {
+			parts[i] = formatValue(elem)
+		}
+		return "(" + strings.Join(parts, " ") + ")"
 	default:
 		return ""
 	}
